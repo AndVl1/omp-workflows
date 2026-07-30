@@ -1,0 +1,109 @@
+{
+  "name": "full-feature",
+  "title": "Full 7-Phase Feature Development",
+  "description": "COMPLEX features. Parallel exploration, mandatory clarifying questions, parallel architecture options, scoped implementation, parallel review.",
+  "match": { "type": ["FEATURE", "REFACTOR"], "complexity": ["COMPLEX"] },
+  "stages": [
+    {
+      "id": "discovery",
+      "title": "Discovery",
+      "type": "orchestrator",
+      "gate": "branch_created",
+      "checkpoint": "confirm_understanding",
+      "autonomous": "log confirmed understanding, continue",
+      "produces": ["discovery", "feature_spec"]
+    },
+    {
+      "id": "exploration",
+      "title": "Codebase Exploration",
+      "type": "consilium",
+      "roles": ["analyst", "tech-researcher", "analyst"],
+      "parallel": true,
+      "consumes": ["discovery"],
+      "produces": ["exploration", "dod"]
+    },
+    {
+      "id": "clarify",
+      "title": "Clarifying Questions",
+      "type": "orchestrator",
+      "consumes": ["discovery", "exploration"],
+      "checkpoint": "user_answers",
+      "autonomous": "abort needs-human if confidence LOW; else resolve with documented defaults",
+      "produces": "clarifications"
+    },
+    {
+      "id": "architecture",
+      "title": "Architecture Design",
+      "type": "consilium",
+      "roles": ["architect_minimal", "architect_clean", "architect_pragmatic"],
+      "parallel": true,
+      "consumes": ["exploration", "clarifications"],
+      "checkpoint": "user_choice",
+      "autonomous": "pick option #1, record rationale",
+      "produces": "architecture"
+    },
+    {
+      "id": "implementation",
+      "title": "Implementation",
+      "type": "single",
+      "role": "${scope.dev_agent}",
+      "consumes": ["architecture", "exploration"],
+      "checkpoint": "approve_implementation",
+      "autonomous": "proceed",
+      "produces": "implementation"
+    },
+    {
+      "id": "code_review",
+      "title": "Code Review",
+      "type": "consilium",
+      "roles": ["code-reviewer"],
+      "parallel": true,
+      "conditional": [
+        { "if": "scope.has_security", "add": "security-tester" },
+        { "if": "scope.has_infra", "add": "devops" }
+      ],
+      "consumes": ["implementation", "architecture"],
+      "gate": "verdict != reject",
+      "checkpoint": "fix_decision",
+      "autonomous": "fix CRITICAL+HIGH, then continue",
+      "produces": "review"
+    },
+    {
+      "id": "review_fixes",
+      "title": "Review Fixes",
+      "type": "single",
+      "role": "${scope.dev_agent}",
+      "consumes": ["review"],
+      "checkpoint": "fix_selection",
+      "autonomous": "fix CRITICAL+HIGH, defer the rest",
+      "skip_if": "review.findings == []"
+    },
+    {
+      "id": "manual_qa",
+      "title": "Manual QA (fixed code)",
+      "type": "single",
+      "role": "manual-qa",
+      "consumes": ["review", "implementation", "architecture", "feature_spec"],
+      "skip_if": "!scope.has_runtime",
+      "gate": "manual_qa.verdict != FAIL",
+      "produces": "manual_qa"
+    },
+    {
+      "id": "qa_tests",
+      "title": "Automated Tests",
+      "type": "single",
+      "role": "qa",
+      "consumes": ["manual_qa", "implementation", "architecture"],
+      "gate": "manual_qa.verdict == PASS || !scope.has_runtime",
+      "produces": "qa_tests"
+    },
+    {
+      "id": "summary",
+      "title": "Summary",
+      "type": "orchestrator",
+      "consumes": ["implementation", "review", "manual_qa", "qa_tests", "dod"],
+      "gate": "dod_complete",
+      "produces": "summary"
+    }
+  ]
+}

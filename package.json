@@ -1,0 +1,23 @@
+{
+  "name": "omp-workflows",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Profile-driven multi-stage workflow engine for omp — monorepo: core + fullstack bundle.",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "build:core": "npm run build -w @omp-workflows/core",
+    "build:fullstack": "npm run build -w @omp-workflows/fullstack",
+    "typecheck": "npm run typecheck --workspaces",
+    "test": "npm run test -w @omp-workflows/core",
+    "test:core": "npm run test -w @omp-workflows/core",
+    "clean": "rm -rf packages/*/dist"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

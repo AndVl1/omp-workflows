@@ -1,0 +1,31 @@
+/**
+ * @omp-workflows/fullstack — default omp-workflows bundle.
+ *
+ * This is the thin extension entry for kotlinx/spring/react/kmp/telegram-bot
+ * projects. It pulls @omp-workflows/core, registers the engine with the
+ * fullstack role/model/scope defaults, and ships agents/ + skills/ as
+ * bundle content (omp's discovery picks them up automatically).
+ *
+ * For a custom bundle (e.g. Rust, Go-only, or any non-fullstack stack),
+ * write your own package that calls `registerTeamWorkflow(pi, { roles: ..., ... })`
+ * with your own role mapping. Do not depend on this package.
+ */
+
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import {
+  registerTeamWorkflow,
+  defaultFullstackRoles,
+  defaultFullstackModels,
+  defaultFullstackScopeMap,
+  defaultFullstackFlags,
+} from "@omp-workflows/core";
+
+export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
+  registerTeamWorkflow(pi, {
+    label: "omp-workflows-fullstack",
+    roles: defaultFullstackRoles,
+    models: defaultFullstackModels,
+    scopeMap: defaultFullstackScopeMap,
+    flags: defaultFullstackFlags,
+  });
+}

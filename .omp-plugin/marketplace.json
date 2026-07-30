@@ -1,0 +1,34 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "omp-workflows",
+  "owner": {
+    "name": "AndVl1"
+  },
+  "metadata": {
+    "description": "Declarative multi-stage workflow engine for omp — 15 specialized agents, 8 declarative JSON profiles, role-driven DoD gate, profile-driven workflow engine. Native omp plugin (no Claude Code hooks).",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "omp-workflows",
+      "description": "Profile-driven workflow engine for omp. /team runs a deterministic 7-phase feature pipeline, /pulse is the read-only project steward, /team-yolo is the autonomous night loop. 15 agents, 8 JSON profiles, typed DoD artifact with backstop gate.",
+      "source": "./",
+      "category": "development",
+      "keywords": [
+        "workflow",
+        "multi-agent",
+        "team",
+        "kotlin",
+        "spring",
+        "go",
+        "react",
+        "kmp",
+        "omp",
+        "native"
+      ],
+      "homepage": "https://github.com/AndVl1/omp-workflows",
+      "repository": "https://github.com/AndVl1/omp-workflows",
+      "license": "MIT"
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "name": "lightweight",
+  "title": "Lightweight Quick Task",
+  "description": "QUICK features. No parallel exploration or architecture options. Implement + quick review.",
+  "match": { "type": ["FEATURE", "REFACTOR", "OPS"], "complexity": ["QUICK"] },
+  "stages": [
+    {
+      "id": "discovery",
+      "title": "Quick Discovery",
+      "type": "orchestrator",
+      "gate": "branch_created",
+      "produces": ["discovery", "dod"]
+    },
+    {
+      "id": "implementation",
+      "title": "Implementation",
+      "type": "single",
+      "role": "${scope.dev_agent}",
+      "consumes": ["discovery"],
+      "checkpoint": "approve_implementation",
+      "autonomous": "proceed",
+      "produces": "implementation"
+    },
+    {
+      "id": "code_review",
+      "title": "Quick Code Review",
+      "type": "single",
+      "role": "code-reviewer",
+      "consumes": ["implementation"],
+      "gate": "verdict != reject",
+      "checkpoint": "fix_decision",
+      "autonomous": "fix CRITICAL+HIGH, then continue",
+      "produces": "review"
+    },
+    {
+      "id": "review_fixes",
+      "title": "Review Fixes",
+      "type": "single",
+      "role": "${scope.dev_agent}",
+      "consumes": ["review"],
+      "skip_if": "review.findings == []"
+    },
+    {
+      "id": "qa_tests",
+      "title": "Automated Tests",
+      "type": "single",
+      "role": "qa",
+      "consumes": ["implementation", "review"],
+      "produces": "qa_tests"
+    },
+    {
+      "id": "summary",
+      "title": "Summary",
+      "type": "orchestrator",
+      "consumes": ["implementation", "review", "qa_tests", "dod"],
+      "gate": "dod_complete",
+      "produces": "summary"
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "_comment": "Copy this to your PROJECT's .claude/team.config.json and adjust. These values ARE the built-in defaults — the interpreter behaves identically when the file is absent. Per-project config exists so role→agent/model/scope resolution is deterministic and explicit instead of inferred at runtime (P6).",
+
+  "_custom_agents": "roles values are passed verbatim to Task subagent_type. Use a bare name for a project (.claude/agents/) or user (~/.claude/agents/) agent, or 'plugin:agent' for another plugin's agent. Examples below: 'backend' could be a project agent 'my-go-backend', 'security-tester' could be 'acme-sec:pentester'.",
+
+  "roles": {
+    "analyst": "analyst",
+    "tech-researcher": "tech-researcher",
+    "diagnostics": "diagnostics",
+    "architect": "architect",
+    "architect_minimal": "architect",
+    "architect_clean": "architect",
+    "architect_pragmatic": "architect",
+    "backend-kotlin": "developer-kotlin",
+    "go": "developer-go",
+    "frontend": "frontend-developer",
+    "mobile": "developer-mobile",
+    "qa": "qa",
+    "manual-qa": "manual-qa",
+    "code-reviewer": "code-reviewer",
+    "security-tester": "security-tester",
+    "devops": "devops"
+  },
+
+  "_roster_overrides_example": "Add/replace agents on a stage without editing workflows/*.json. Applied after the profile's conditional[] rules. Uncomment and adapt:",
+  "roster_overrides": {
+    "review": { "add": [] },
+    "architecture": { "add": [] }
+  },
+
+  "models": {
+    "architect": "opus",
+    "code-reviewer": "opus",
+    "security-tester": "opus",
+    "tech-researcher": "haiku",
+    "*": "sonnet"
+  },
+
+  "_scope_map_order": "Evaluated TOP-TO-BOTTOM, FIRST matching glob wins. Order specific paths above generic extensions. `mobile` MUST stay above `backend-kotlin`: a KMP source file (e.g. shared/src/commonMain/Foo.kt) matches both **/commonMain/** (mobile) and **/*.kt (backend-kotlin) — mobile wins only because it is listed first. So **/*.kt routes to backend-kotlin only when NOT under a mobile source set (e.g. a Spring src/main/kotlin).",
+  "scope_map": [
+    { "glob": ["**/iosApp/**", "**/composeApp/**", "**/commonMain/**", "**/androidMain/**"], "scope": "mobile", "dev_agent": "developer-mobile" },
+    { "glob": ["**/*.tsx", "**/*.jsx", "**/*.vue", "**/*.ts", "**/src/jsMain/**", "**/miniapp/**", "**/frontend/**"], "scope": "frontend", "dev_agent": "frontend-developer" },
+    { "glob": ["**/*.go", "**/go.mod", "**/go.sum"], "scope": "go", "dev_agent": "developer-go" },
+    { "glob": ["**/Dockerfile", "**/*.yaml", "**/*.yml", "**/helm/**", "**/.github/**", "**/k8s/**"], "scope": "devops", "dev_agent": "devops" },
+    { "glob": ["**/*.kt", "**/*.java", "**/src/main/**"], "scope": "backend-kotlin", "dev_agent": "developer-kotlin" }
+  ],
+
+  "_has_ui_note": "There is deliberately NO flags.has_ui / flags.has_runtime here. Both are interpreter built-ins: has_ui = (scope ∩ {frontend, mobile} ≠ ∅); has_runtime = the task touches any executable/deployable code scope (false only for docs/config-only). has_runtime GATES the manual_qa stage (so backend/CLI runtime checks run too); has_ui SELECTS the mode within it (ui vs runtime). A project MAY override via flags.has_ui / flags.has_runtime (schema allows it via additionalProperties), but that creates a second source of truth — prefer the built-ins.",
+  "flags": {
+    "has_security": ["**/auth/**", "**/security/**", "**/*crypto*", "**/*Secret*", "**/*Token*"],
+    "has_infra": ["**/Dockerfile", "**/helm/**", "**/k8s/**", "**/.github/workflows/**"]
+  },
+
+  "design_system": null
+}
