@@ -102,8 +102,7 @@ jobs:
         run: |
           npm publish \
             --registry https://npm.pkg.github.com \
-            --access public \
-            --tag "${{ steps.version.outputs.tag }}"
+            --access public
 
       - name: Publish @omp-workflows/fullstack
         working-directory: packages/fullstack
@@ -112,5 +111,4 @@ jobs:
         run: |
           npm publish \
             --registry https://npm.pkg.github.com \
-            --access public \
-            --tag "${{ steps.version.outputs.tag }}"
+            --access public
