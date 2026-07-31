@@ -77,15 +77,15 @@ jobs:
         # packages/{core,fullstack}/package.json. We don't rewrite package.json
         # at publish time: `npm version` fails on workspaces whose internal
         # dependencies don't yet exist in any registry (it tries to validate
-        # devDependencies against the default registry → 404). Pin a step
-        # that fails loudly if a maintainer forgot to bump versions.
+        # devDependencies against the default registry → 404). This guard
+        # fails loudly if a maintainer forgot to bump versions.
         run: |
           WANTED="${{ steps.version.outputs.version }}"
           for pkg in packages/core packages/fullstack; do
-            ACTUAL="$(node -e 'console.log(require("./package.json").version)' -e "process.chdir('$pkg')")"
+            ACTUAL="$(grep -E '"version"' "$pkg/package.json" | head -1 | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
             if [ "$ACTUAL" != "$WANTED" ]; then
               echo "::error::$pkg/package.json version is $ACTUAL, but tag is v$WANTED."
-              echo "::error::Bump with: cd $pkg && npm version $WANTED --no-git-tag-version --allow-same-version -m '$pkg: bump version to %s' && cd ../.. && git add $pkg/package.json && git commit -m 'chore(release): prepare $pkg v$WANTED' && git push"
+              echo "::error::Bump with: cd $pkg && npm version $WANTED --no-git-tag-version --allow-same-version && cd ../.. && git add $pkg/package.json && git commit -m 'chore(release): bump $pkg to v$WANTED' && git push"
               exit 1
             fi
           done
