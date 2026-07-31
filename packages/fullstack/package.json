@@ -27,7 +27,6 @@
     "@oh-my-pi/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@omp-workflows/core": "0.1.0",
     "typescript": "^5.6.0",
     "@types/node": "^22.0.0"
   },
