@@ -6,10 +6,20 @@
 #
 # Auth: GITHUB_TOKEN is sufficient when publishing into the same GitHub
 # organisation's Packages namespace. The `AndVl1/omp-workflows` repo is public,
-# so packages are published as `--access public` with provenance attestation
-# (requires `id-token: write`).
+# so packages are published as `--access public`.
 #
-# Local trigger for testing: `gh workflow run release.yml`.
+# Version handling: this workflow does NOT rewrite package.json. The tag
+# (v*.*.*) must match the version already in packages/{core,fullstack}/
+# package.json. A guard step fails loudly if not, and prints the bump +
+# commit + push commands to fix it. The "npm version" approach fails on the
+# first release because devDependencies/internal workspace packages are
+# not yet in any registry.
+#
+# Workspace install: `npm ci` (used by default CI caching) 404s on the first
+# release because npm tries to resolve the workspace's internal
+# devDependencies against the default registry. We use `npm install`
+# (honours workspace symlinks via package-lock.json) until both packages
+# are published.
 
 name: release
 
@@ -64,7 +74,7 @@ jobs:
           echo "Resolved release tag: $TAG (version=$VERSION)"
 
       - name: Install workspace dependencies
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Build, typecheck, test
         run: |
@@ -73,12 +83,6 @@ jobs:
           npm test
 
       - name: Verify version matches tag
-        # The workflow expects the pushed tag (v*.*.*) to match the version in
-        # packages/{core,fullstack}/package.json. We don't rewrite package.json
-        # at publish time: `npm version` fails on workspaces whose internal
-        # dependencies don't yet exist in any registry (it tries to validate
-        # devDependencies against the default registry → 404). This guard
-        # fails loudly if a maintainer forgot to bump versions.
         run: |
           WANTED="${{ steps.version.outputs.version }}"
           for pkg in packages/core packages/fullstack; do
