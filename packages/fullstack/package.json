@@ -1,6 +1,6 @@
 {
   "name": "@omp-workflows/fullstack",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Default team agents and skills for omp-workflows: 15 specialized agents, 32 domain skills. Pulls @omp-workflows/core as peer.",
   "type": "module",
   "license": "MIT",

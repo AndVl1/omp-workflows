@@ -1,6 +1,6 @@
 {
   "name": "@omp-workflows/core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Workflow engine + gates + slash commands for omp. No agents, no skills — dependency-free runtime core.",
   "type": "module",
   "license": "MIT",
