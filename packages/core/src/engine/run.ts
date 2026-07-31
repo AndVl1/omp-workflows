@@ -15,11 +15,11 @@
 
 import { readFileSync } from "node:fs";
 import { loadAllProfiles, resolveWorkflow, selectProfile } from "./profile.js";
-import { resolveConfig, resolveAgentForRole, resolveModelForAgent } from "./config.js";
+import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope } from "./scope.js";
 import { writeState, setStageStatus, setPause, resolveState } from "./state.js";
 import { classify } from "./classify.js";
-import { walkProfile, type StageContext, type TaskCaller, type TaskResult } from "./stage.js";
+import { walkProfile, type StageContext, type TaskCaller } from "./stage.js";
 import type { Classification, Profile, TeamState } from "./types.js";
 
 export interface RunOptions {
@@ -100,7 +100,6 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     state: initialState,
     artifactsDir: artifactsDir ?? `${opts.cwd}/.work-state/artifacts`,
     flags,
-    model: (agent) => resolveModelForAgent(agent, config),
     agent: (role) => resolveAgentForRole(role, config),
     task: opts.taskTool,
     pause: opts.pause ?? (async () => undefined),

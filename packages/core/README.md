@@ -18,7 +18,6 @@ export default function (pi: ExtensionAPI) {
   registerTeamWorkflow(pi, {
     label: "my-extension",
     roles: { /* role -> agent name */ },
-    models: { /* agent -> model spec */ },
     scopeMap: [/* glob -> scope rules */],
     flags: { /* glob -> flag */ },
     commands: ["team", "pulse", "init-team"], // subset
@@ -32,14 +31,12 @@ Or use the built-in defaults for fullstack projects:
 import {
   registerTeamWorkflow,
   defaultFullstackRoles,
-  defaultFullstackModels,
   defaultFullstackScopeMap,
   defaultFullstackFlags,
 } from "@andvl1/omp-workflows-core";
 
 registerTeamWorkflow(pi, {
   roles: defaultFullstackRoles,
-  models: defaultFullstackModels,
   scopeMap: defaultFullstackScopeMap,
   flags: defaultFullstackFlags,
 });

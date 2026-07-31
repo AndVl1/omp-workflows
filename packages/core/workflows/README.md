@@ -32,7 +32,7 @@ Borrowed from harnest. Every stage is exactly one of:
 | type | meaning |
 |------|---------|
 | `orchestrator` | Main context performs it directly (no subagent). E.g. discovery, summary, clarifying questions. |
-| `single` | Exactly one subagent. Role resolved via `.claude/team.config.json` or file scope. |
+| `single` | Exactly one subagent. Role resolved via `.omp/team.config.json` (fallback: legacy `.claude/team.config.json`) or file scope. |
 | `consilium` | N subagents in parallel (`roles[]`). E.g. exploration, architecture options, review. |
 | `bash` | Deterministic shell step, no model. |
 | `none` | Placeholder / skip. |
@@ -87,8 +87,7 @@ launching agents if `team-state.json`'s `workflow` does not match its `classific
    - **run** per `type`: orchestrator (inline), single (one Task), consilium (parallel Tasks),
      bash (shell), none (skip). For `consilium`, apply `conditional[]` against scope flags to
      adjust the roster.
-   - **resolve roles → agents → model** via `.claude/team.config.json` (P6), falling back to
-     built-in defaults.
+   - **resolve roles → agents**: agent name from `.omp/team.config.json` `roles` (P6), falling back to built-in defaults and legacy `.claude/team.config.json`. Model capability is set by agent frontmatter and OMP policy — low-tier agents use `@smol` + `thinkingLevel: medium`, middle-tier use `@task` + `thinkingLevel: auto`, high-tier use `@slow` + `thinkingLevel: high`. Concrete models are configured via OMP `modelRoles` or `task.agentModelOverrides`, not in workflow config.
    - **checkpoint**: interactive → stop and wait; autonomous → apply `autonomous` decision + log.
    - **gate**: do not mark the stage `done` until the gate condition holds.
    - **write** the `produces` artifact to `.work-state/artifacts/<id>.json`.
@@ -121,11 +120,7 @@ omit the `dod`/`dod_complete` stages.
 
 ## Scope flags (used by `conditional` and `${scope.*}`)
 
-Resolved from touched/planned files against `.claude/team.config.json` `scope_map`. Run
-**`/init-team`** to generate that file for your project — it detects the stacks and maps each to
-the best available agent, including agents from other installed plugins (e.g. `rust-agents` for a
-Rust repo). This is the former P3. Without a config, the interpreter falls back to inferring
-scope from file globs using the built-in defaults below:
+Resolved from touched/planned files against `.omp/team.config.json` `scope_map` (fallback: legacy `.claude/team.config.json`). Run **`/init-team`** to generate that file for your project — it detects the stacks and maps each to the best available agent, including agents from other installed plugins (e.g. `rust-agents` for a Rust repo). This is the former P3. Without a config, the interpreter falls back to inferring scope from file globs using the built-in defaults below:
 
 > **`scope_map` precedence — first match wins.** Entries are evaluated top-to-bottom; the first
 > glob that matches a file decides its scope. Order specific paths above generic extensions. In
@@ -152,29 +147,26 @@ scope from file globs using the built-in defaults below:
 >
 > **`has_runtime` gates the `manual_qa` stage** (`skip_if: "!scope.has_runtime"`) — so manual
 > runtime verification runs for backend/CLI work too, not only UI. **`has_ui` selects the *mode***
-> inside that stage: `ui` (drive agent-browser for web / claude-in-mobile for the app) when `has_ui`,
-> else `runtime` (run the app, hit
-> endpoints, read logs).
+> inside that stage: `ui` (native OMP `browser` for web; configured device automation for apps)
+> when `has_ui`, else `runtime` (run the app, hit endpoints, read logs).
 
 ## Custom agents (project / user / other plugins)
 
-A role resolves to a concrete agent via `.claude/team.config.json` `roles` (then the built-in
-default). The resolved value is passed verbatim as the Task `subagent_type`, so it can be **any
+A role resolves to a concrete agent via `.omp/team.config.json` `roles` (then the built-in
+default). The resolved value is passed verbatim as the Task `agent`, so it can be **any
 registered agent**:
 
-- project agent `.claude/agents/<name>` → bare `<name>`
-- user agent `~/.claude/agents/<name>` → bare `<name>`
-- another plugin's agent → `<plugin>:<name>`
-- this plugin's agent → `fullstack-team:<name>` or the bare default
+- project agent `.omp/agents/<name>` → bare `<name>`
+- user agent `~/.omp/agent/agents/<name>` → bare `<name>`
+- enabled extension-package agent → its registered bare `<name>` (OMP registry is flat)
 
 ```jsonc
-// .claude/team.config.json
+// .omp/team.config.json  (legacy fallback: .claude/team.config.json)
 {
   "roles": {
     "backend-kotlin": "my-jvm-backend",   // project agent
     "security-tester": "acme-sec:pentester"  // another plugin's agent
   },
-  "models": { "my-go-backend": "opus" },
   "roster_overrides": {                  // add agents to a stage without forking a profile
     "review": { "add": ["my-a11y-agent"] }
   }
@@ -186,6 +178,19 @@ registered agent**:
 New role keys beyond the built-in set are allowed — reference them from a custom profile or a
 roster override. Note: a hook cannot verify an agent exists, so a wrong name fails at the Task
 call (not at a gate).
+
+## Agent capability tiers
+
+Every bundled agent carries a capability tier in its frontmatter. OMP resolves the concrete
+model per-session from `modelRoles` / `task.agentModelOverrides`; the workflow config does not
+set models — it only names agents.
+
+| tier | model role | thinkingLevel | examples |
+|------|-----------|---------------|---------|
+| high | `@slow` | `high` | architect, code-reviewer, security-tester, coordinator, coordinator-yolo |
+| middle | `@task` | `auto` | developer-kotlin, developer-go, frontend-developer, qa, … |
+| low | `@smol` | `medium` | tech-researcher |
+
 
 ## Adding a custom profile
 

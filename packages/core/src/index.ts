@@ -36,7 +36,6 @@ import type { RoleConfig } from "./engine/types.js";
 export interface RegisterOptions {
   label?: string;
   roles?: RoleConfig["roles"];
-  models?: RoleConfig["models"];
   rosterOverrides?: RoleConfig["roster_overrides"];
   scopeMap?: RoleConfig["scope_map"];
   flags?: RoleConfig["flags"];
@@ -66,13 +65,6 @@ export const defaultFullstackRoles: RoleConfig["roles"] = {
   devops: "devops",
 };
 
-export const defaultFullstackModels: RoleConfig["models"] = {
-  architect: "opus",
-  "code-reviewer": "opus",
-  "security-tester": "opus",
-  "tech-researcher": "haiku",
-  "*": "sonnet",
-};
 
 export const defaultFullstackScopeMap: RoleConfig["scope_map"] = [
   { glob: ["**/iosApp/**", "**/composeApp/**", "**/commonMain/**", "**/androidMain/**"], scope: "mobile", dev_agent: "developer-mobile" },
@@ -90,8 +82,7 @@ export const defaultFullstackFlags: RoleConfig["flags"] = {
 /**
  * Wire the engine into omp's ExtensionAPI. Bundles call this from their
  * default export. The engine consults `.omp/team.config.json` (or the
- * `roles`/`models`/`scopeMap` overrides) at runtime to resolve role →
- * agent + model.
+ * `roles`/`scopeMap` overrides) at runtime to resolve workflow roles to agents.
  */
 export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {}): void {
   const label = opts.label ?? "omp-workflows";
@@ -178,7 +169,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 }
 
 function writeRuntimeConfig(opts: RegisterOptions): void {
-  const hasOverride = opts.roles || opts.models || opts.scopeMap || opts.flags || opts.rosterOverrides;
+  const hasOverride = opts.roles || opts.scopeMap || opts.flags || opts.rosterOverrides;
   if (!hasOverride) return;
   try {
     const { resolveRuntimeConfigPath, writeConfig } = require("./runtime-config.js") as typeof import("./runtime-config.js");
@@ -186,7 +177,6 @@ function writeRuntimeConfig(opts: RegisterOptions): void {
     if (!path) return;
     writeConfig(path, {
       roles: opts.roles ?? {},
-      models: opts.models ?? {},
       roster_overrides: opts.rosterOverrides ?? {},
       scope_map: opts.scopeMap ?? [],
       flags: opts.flags ?? {},

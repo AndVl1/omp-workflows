@@ -6,8 +6,8 @@
 
 ---
 
-**🚫 Delegate, don't DIY.** Your first action for this stage is the Task call to the `manual-qa`
-agent. Do NOT drive the app / Chrome / device yourself.
+**Delegate, don't DIY.** Your first action for this stage is an OMP `task` call with
+`agent: "manual-qa"`. Do not drive the app or device yourself.
 
 ### PHASE 6.7: MANUAL QA — sequenced, on the FIXED code
 
@@ -16,7 +16,7 @@ The mode depends on scope:
 
 | scope | mode | how manual-qa verifies |
 |-------|------|------------------------|
-| `scope.has_ui` (frontend/mobile) | **ui** | drive the real UI via agent-browser (web) / claude-in-mobile (app); screenshot + console + network |
+| `scope.has_ui` (frontend/mobile) | **ui** | drive the real UI via OMP `browser` (web) or configured device automation (app); screenshot + console + network |
 | backend / CLI / service (no UI) | **runtime** | run the app/binary, hit endpoints (`curl`), read logs/output, check exit codes |
 
 **Skip when**: `!scope.has_runtime` — i.e. there is nothing to run (pure docs/config/research
@@ -31,9 +31,9 @@ durable automated tests.
 
 **Actions**:
 
-1. Launch the manual-qa agent:
+1. Launch OMP `task` with `agent: "manual-qa"`:
    ```
-   Agent (manual-qa):
+   manual-qa:
    "Manually verify the shipped change at RUNTIME against the acceptance criteria.
 
     Inputs:
@@ -41,7 +41,7 @@ durable automated tests.
     - architecture + implementation — what changed and where
 
     Pick the mode from scope:
-    - UI (has_ui): drive the real UI (agent-browser for web / claude-in-mobile for the app);
+    - UI (has_ui): use OMP `browser` for web or configured device automation for the app;
       screenshot each criterion and state WHAT IS VISIBLE; check console + network.
     - RUNTIME (no UI): run the app/binary; hit the affected endpoints/commands
       (curl, CLI invocation); capture the actual responses/exit codes and the

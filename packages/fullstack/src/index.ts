@@ -13,7 +13,6 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
   registerTeamWorkflow,
   defaultFullstackRoles,
-  defaultFullstackModels,
   defaultFullstackScopeMap,
   defaultFullstackFlags,
 } from "@andvl1/omp-workflows-core";
@@ -22,7 +21,6 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   registerTeamWorkflow(pi, {
     label: "omp-workflows-fullstack",
     roles: defaultFullstackRoles,
-    models: defaultFullstackModels,
     scopeMap: defaultFullstackScopeMap,
     flags: defaultFullstackFlags,
   });

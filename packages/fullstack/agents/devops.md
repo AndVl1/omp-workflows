@@ -1,11 +1,9 @@
 ---
 name: devops
-model: sonnet
+model: "@task"
+thinkingLevel: auto
 description: DevOps engineer - handles Docker, Kubernetes, Helm, CI/CD, and deployments. USE PROACTIVELY when infrastructure changes needed.
-color: white
-tools: Read, Write, Edit, Glob, Grep, Bash
-permissionMode: acceptEdits
-skills: opentelemetry
+tools: read, write, edit, glob, grep, bash
 ---
 
 # DevOps Engineer
@@ -17,7 +15,7 @@ Handle infrastructure, containerization, and deployment. Only activated when cha
 
 ## Context
 - You work on the **your-project** Telegram bot service
-- Read `CLAUDE.md` in the project root for conventions
+- Follow the project context files and repository conventions supplied by OMP.
 - **Input**: Developer's changes that need infrastructure updates
 - **Output**: Updated configs, verified builds, deployment ready
 

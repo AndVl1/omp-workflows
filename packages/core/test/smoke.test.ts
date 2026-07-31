@@ -9,15 +9,18 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   registerTeamWorkflow,
   defaultFullstackRoles,
-  defaultFullstackModels,
   loadAllProfiles,
   resolveWorkflow,
   selectProfile,
 } from "@andvl1/omp-workflows-core";
+import { runStage } from "../src/engine/stage.js";
 
 test("core: loadAllProfiles returns 8 profiles", async () => {
   const profiles = await loadAllProfiles();
@@ -57,11 +60,6 @@ test("core: defaultFullstackRoles has 16 slots (15 dev + 3 architect variants)",
   assert.equal(defaultFullstackRoles["frontend"], "frontend-developer");
   assert.equal(defaultFullstackRoles["mobile"], "developer-mobile");
 });
-test("core: defaultFullstackModels has expected model assignments", () => {
-  assert.equal(defaultFullstackModels["architect"], "opus");
-  assert.equal(defaultFullstackModels["tech-researcher"], "haiku");
-  assert.equal(defaultFullstackModels["*"], "sonnet");
-});
 
 test("core: registerTeamWorkflow registers gates + commands", () => {
   const calls: Array<{ kind: string; key: string }> = [];
@@ -73,8 +71,8 @@ test("core: registerTeamWorkflow registers gates + commands", () => {
   registerTeamWorkflow(fakePi as unknown as Parameters<typeof registerTeamWorkflow>[0], {
     label: "smoke-test",
     roles: defaultFullstackRoles,
-    models: defaultFullstackModels,
   });
+
   assert.ok(calls.some((c) => c.kind === "on" && c.key === "before_agent_start"));
   assert.ok(calls.some((c) => c.kind === "on" && c.key === "session_stop"));
   assert.ok(calls.some((c) => c.kind === "on" && c.key === "tool_call"));
@@ -82,6 +80,150 @@ test("core: registerTeamWorkflow registers gates + commands", () => {
     assert.ok(calls.some((c) => c.kind === "registerCommand" && c.key === cmd), `missing ${cmd}`);
   }
 });
+test("core: workflow dispatch leaves model selection to OMP", async () => {
+  const calls: Array<{ agent: string; task: string }> = [];
+  const state = {
+    schema: 1 as const,
+    branch: "feat/role-routing",
+    classification: { type: "FEATURE" as const, complexity: "QUICK" as const, confidence: "HIGH" as const, workflow: "lightweight" as const },
+    task: "exercise role routing",
+    autonomous: false,
+    workflow_override: false,
+    issue: null,
+    stage_cursor: "implementation",
+    stages: [{ id: "implementation", status: "in_progress" as const }],
+    artifacts: {},
+    pause: { kind: "none" as const, reason: "" },
+    updated_at: new Date(0).toISOString(),
+  };
+  const outcome = await runStage(
+    { id: "implementation", title: "Implementation", type: "single", role: "backend-kotlin" },
+    {
+      cwd: process.cwd(),
+      state,
+      artifactsDir: `${process.cwd()}/.work-state/artifacts`,
+      flags: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
+      agent: (role) => role === "backend-kotlin" ? "developer-kotlin" : role,
+      task: {
+        call: async (opts) => {
+          calls.push(opts);
+          return { id: "result", output: "ok", artifacts: {}, exitCode: 0 };
+        },
+        batch: async () => [],
+      },
+      pause: async () => undefined,
+      log: () => undefined,
+      resolveDevAgent: () => "developer-kotlin",
+    },
+  );
+  assert.equal(outcome.status, "done");
+  assert.match(calls[0]?.task ?? "", /Workflow role: backend-kotlin/);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(Object.keys(calls[0] ?? {}).sort(), ["agent", "task"]);
+  assert.equal(calls[0]?.agent, "developer-kotlin");
+});
+
+test("fullstack: agent frontmatter uses OMP capability roles", () => {
+  const agentsDir = join(dirname(fileURLToPath(import.meta.url)), "../../fullstack/agents");
+  const expected: Record<string, { model: string; thinkingLevel: string }> = {
+    analyst: { model: "@task", thinkingLevel: "auto" },
+    architect: { model: "@slow", thinkingLevel: "high" },
+    "code-reviewer": { model: "@slow", thinkingLevel: "high" },
+    "coordinator-yolo": { model: "@slow", thinkingLevel: "high" },
+    coordinator: { model: "@slow", thinkingLevel: "high" },
+    "developer-go": { model: "@task", thinkingLevel: "auto" },
+    "developer-kotlin": { model: "@task", thinkingLevel: "auto" },
+    "developer-mobile": { model: "@task", thinkingLevel: "auto" },
+    devops: { model: "@task", thinkingLevel: "auto" },
+    diagnostics: { model: "@task", thinkingLevel: "auto" },
+    discovery: { model: "@task", thinkingLevel: "auto" },
+    "frontend-developer": { model: "@task", thinkingLevel: "auto" },
+    "init-mobile": { model: "@task", thinkingLevel: "auto" },
+    "manual-qa": { model: "@task", thinkingLevel: "auto" },
+    qa: { model: "@task", thinkingLevel: "auto" },
+    "security-tester": { model: "@slow", thinkingLevel: "high" },
+    "tech-researcher": { model: "@smol", thinkingLevel: "medium" },
+  };
+  const supportedFields: Record<string, true> = {
+    name: true,
+    description: true,
+    tools: true,
+    spawns: true,
+    model: true,
+    thinkingLevel: true,
+    output: true,
+    autoloadSkills: true,
+    readSummarize: true,
+    blocking: true,
+    prewalk: true,
+  };
+  const files = readdirSync(agentsDir).filter((name) => name.endsWith(".md"));
+  assert.equal(files.length, Object.keys(expected).length);
+  for (const file of files) {
+    const content = readFileSync(join(agentsDir, file), "utf8");
+    const frontmatter = content.match(/^---\n([\s\S]*?)\n---/)?.[1];
+    assert.ok(frontmatter, `${file}: missing frontmatter`);
+    const fields = Object.fromEntries(
+      frontmatter.split("\n").flatMap((line) => {
+        const match = line.match(/^([A-Za-z][A-Za-z0-9]*):\s*(.*)$/);
+        return match?.[1] ? [[match[1], match[2] ?? ""]] : [];
+      }),
+    );
+    for (const field of Object.keys(fields)) assert.ok(supportedFields[field], `${file}: unsupported ${field}`);
+    const name = fields.name;
+    assert.ok(name && expected[name], `${file}: unexpected agent name ${name}`);
+    assert.equal(fields.model?.replaceAll('"', ""), expected[name].model, `${name}: model role`);
+    assert.equal(fields.thinkingLevel, expected[name].thinkingLevel, `${name}: reasoning level`);
+    const tools = (fields.tools ?? "").split(",").map((tool) => tool.trim()).filter(Boolean);
+    assert.ok(tools.every((tool) => tool === tool.toLowerCase()), `${name}: tool ids must be lowercase`);
+  }
+});
+
+test("core: consilium preserves role variants without pinning models", async () => {
+  let dispatched: Array<{ name: string; agent: string; task: string }> = [];
+  const state = {
+    schema: 1 as const,
+    branch: "feat/role-routing",
+    classification: { type: "FEATURE" as const, complexity: "COMPLEX" as const, confidence: "HIGH" as const, workflow: "full-feature" as const },
+    task: "compare architecture variants",
+    autonomous: false,
+    workflow_override: false,
+    issue: null,
+    stage_cursor: "architecture",
+    stages: [{ id: "architecture", status: "in_progress" as const }],
+    artifacts: {},
+    pause: { kind: "none" as const, reason: "" },
+    updated_at: new Date(0).toISOString(),
+  };
+  const roles = ["architect_minimal", "architect_clean", "architect_pragmatic"];
+  const outcome = await runStage(
+    { id: "architecture", title: "Architecture", type: "consilium", roles },
+    {
+      cwd: process.cwd(),
+      state,
+      artifactsDir: `${process.cwd()}/.work-state/artifacts`,
+      flags: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null },
+      agent: () => "architect",
+      task: {
+        call: async () => ({ id: "unused", output: "", artifacts: {}, exitCode: 0 }),
+        batch: async ({ tasks }) => {
+          dispatched = tasks;
+          return tasks.map((_, index) => ({ id: String(index), output: "ok", artifacts: {}, exitCode: 0 }));
+        },
+      },
+      pause: async () => undefined,
+      log: () => undefined,
+      resolveDevAgent: () => null,
+    },
+  );
+  assert.equal(outcome.status, "done");
+  assert.deepEqual(dispatched.map(({ name, agent }) => ({ name, agent })), roles.map((role) => ({ name: `architecture-${role}`, agent: "architect" })));
+  for (const [index, task] of dispatched.entries()) {
+    assert.deepEqual(Object.keys(task).sort(), ["agent", "name", "task"]);
+    assert.match(task.task, new RegExp(`Workflow role: ${roles[index]}`));
+  }
+});
+
 
 test("core: registerTeamWorkflow respects commands subset", () => {
   const calls: string[] = [];

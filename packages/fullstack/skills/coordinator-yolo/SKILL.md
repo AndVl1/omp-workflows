@@ -36,10 +36,8 @@ needs-human, crash, abandoned sub-task) instead of racing the in-flight work.
 4. **Run the interval loop** — each tick = one task via `coordinator-yolo`, which runs the regular
    `/team`:
    ```
-   /loop <interval> Task(subagent_type: "coordinator-yolo",
-     prompt: "one autonomous yolo tick in yolo/<slug>-<ts>: pick the single highest-leverage
-              task from vision/backlog, run the regular /team on it (autonomous), validate
-              build+tests, commit to the yolo branch or roll back")
+   task({ agent: "coordinator-yolo",
+     task: "one autonomous yolo tick in yolo/<slug>-<ts>: pick the single highest-leverage task from vision/backlog, run the regular /team on it (autonomous), validate build+tests, commit to the yolo branch or roll back" })
    ```
 5. Tell the user: started, branch name, interval, how to stop (`/coordinator-yolo-stop`).
 
@@ -47,7 +45,7 @@ needs-human, crash, abandoned sub-task) instead of racing the in-flight work.
 
 - yolo branch off main only. Never: main, merge, push, force, prod-deploy, destructive git.
 - One task per tick; each validated (build+test) before an atomic commit; red → rollback + log.
-- No `AskUserQuestion` — decisions autonomous, logged with "why".
+- No OMP `ask` calls — decisions autonomous, logged with "why".
 - Respect `vision.md` anti-scope. DoD still applies (each task runs the normal `/team`).
 
 ## Stop

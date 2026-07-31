@@ -5,7 +5,7 @@
 
 ---
 
-**🚫 Delegate, don't DIY.** Your first action for this stage is the Task call(s). Do NOT read code / run git / grep yourself "to give the agent context" — the agent gathers its own context. Recon-before-delegate is how the orchestrator absorbs the task and the subagent never runs.
+**Delegate, don't DIY.** Your first action for this stage is an OMP `task` call. The diagnostics agent gathers its own context.
 
 Launch the **diagnostics** agent to find the root cause before any code change.
 
@@ -25,8 +25,8 @@ Agent (diagnostics):
 - Write `diagnosis.root_cause` to `.work-state/artifacts/diagnosis.json`: **what** the root
   cause is and **why** the proposed fix closes it rather than masking the symptom.
 - Do at least **2 iterations** of repro/log evidence before proposing the fix.
-- This directly answers the "опять мимо" (fix-the-symptom) failure mode. A PreToolUse(Edit)
-  reminder nudges this for BUG_FIX tasks.
+- This directly answers the "опять мимо" (fix-the-symptom) failure mode. The workflow's
+  root-cause gate blocks implementation until the evidence is recorded.
 
 **Produces**: `diagnosis` (root_cause, evidence, proposed_fix, verification_checklist) and
 `dod` (the Definition of Done — for a bug, minimum items: root cause named; repro-before

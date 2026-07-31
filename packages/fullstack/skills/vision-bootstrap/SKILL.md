@@ -1,6 +1,6 @@
 ---
 name: vision-bootstrap
-description: Derive the project's vision.md (north star) from existing context - README, CLAUDE.md, git history, coordinator memory, and a short interview. Triggers on "bootstrap vision", "create vision.md", "set the project vision", "no vision.md yet", "define the general line". Run once, then the coordinator keeps it.
+description: Derive the project's vision.md (north star) from repository context, git history, coordinator memory, and a short interview. Triggers on "bootstrap vision", "create vision.md", "set the project vision", "no vision.md yet", "define the general line". Run once, then the coordinator keeps it.
 ---
 
 # Vision Bootstrap
@@ -10,7 +10,7 @@ yolo executor steer by. Run once when it's missing; afterwards it is maintained,
 
 ## Procedure
 
-1. Gather context (read-only): project `README.md`, `CLAUDE.md`, recent `git log`, existing
+1. Gather context (read-only): project context files, `README.md`, recent `git log`, and existing
    `.work-state/coordinator/<slug>/` memory (`backlog.md`, `decisions.md`, `pulse-log.md`).
 2. Draft a vision from what the project already tells you — do not invent goals the evidence
    doesn't support.

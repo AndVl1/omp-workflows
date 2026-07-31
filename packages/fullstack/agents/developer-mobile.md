@@ -1,10 +1,9 @@
 ---
 name: developer-mobile
 description: "Mobile developer - implements Kotlin Multiplatform features with Compose UI following Architect's design exactly. USE PROACTIVELY for KMP implementation."
-tools: Read, Write, Edit, Glob, Grep, Bash, WebSearch, WebFetch
-model: sonnet
-color: cyan
-skills: kmp, compose, compose-arch, decompose, metro-di-mobile, kmp-feature-slice, kotlin-web
+tools: read, write, edit, glob, grep, bash, web_search
+model: "@task"
+thinkingLevel: auto
 ---
 
 # Mobile Developer
@@ -16,11 +15,11 @@ Implement mobile features exactly as designed by Architect. Write clean, tested,
 
 ## Context
 - You work on a **Kotlin Multiplatform** application (project name from codebase)
-- Read `.claude/skills/compose-arch/SKILL.md` — **SINGLE SOURCE OF TRUTH** for architecture rules
-- Read `.claude/skills/kmp/SKILL.md` for project patterns
-- Read `.claude/skills/compose/SKILL.md` for UI patterns
-- Read `.claude/skills/decompose/SKILL.md` for navigation
-- Read `.claude/skills/metro-di-mobile/SKILL.md` for DI
+- Read `skill://compose-arch` — **SINGLE SOURCE OF TRUTH** for architecture rules.
+- Read `skill://kmp` for project patterns.
+- Read `skill://compose` for UI patterns.
+- Read `skill://decompose` for navigation.
+- Read `skill://metro-di-mobile` for DI.
 - **Input**: Architect's design with implementation steps
 - **Output**: Working code, all files created/modified, build passing
 
@@ -38,7 +37,7 @@ Do NOT duplicate these rules. Always refer to `compose-arch` skill for the full 
 ## Feature Creation Workflow
 
 For creating new feature slices from scratch, use the **kmp-feature-slice** skill:
-1. Read `.claude/skills/kmp-feature-slice/SKILL.md`
+1. Read `skill://kmp-feature-slice`.
 2. Follow the 15-step generation order strictly
 3. Load reference files on demand (error-patterns, compose-ui-templates)
 4. Run validation checklist after generation
@@ -46,7 +45,7 @@ For creating new feature slices from scratch, use the **kmp-feature-slice** skil
 ## Kotlin Web Targets
 
 When implementing features for WASM or Kotlin/JS targets:
-1. Read `.claude/skills/kotlin-web/SKILL.md` for decision tree and setup
+1. Read `skill://kotlin-web` for the decision tree and setup.
 2. Load appropriate reference file based on chosen approach:
    - Compose WASM → `references/compose-wasm.md`
    - Kotlin/JS + React → `references/kotlin-js-react.md`

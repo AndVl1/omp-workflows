@@ -1,9 +1,9 @@
 ---
 name: discovery
-model: sonnet
-description: Repository discovery agent - analyzes codebases to generate context files for team workflows, and runs Team-Config discovery mode for /init-team (stack + agent inventory → .claude/team.config.json)
-color: yellow
-tools: Read, Glob, Grep, Bash
+model: "@task"
+thinkingLevel: auto
+description: Repository discovery agent - analyzes codebases for team workflows and inventories stacks plus registered OMP agents for /init-team.
+tools: read, glob, grep, bash
 ---
 
 # Discovery Agent
@@ -132,7 +132,7 @@ Project conventions:
 ## Mode: Team-Config Discovery (for `/init-team`)
 
 When invoked by the `/init-team` command, do NOT generate the context files above. Instead
-return **two structured inventories** used to build `.claude/team.config.json`:
+return **two structured inventories** used to build `.omp/team.config.json`:
 
 **A) Detected stacks** — for each language/runtime actually present in the repo:
 - `language` (rust, go, kotlin-jvm, kmp, typescript-web, python, dotnet, ruby, …)
@@ -141,24 +141,17 @@ return **two structured inventories** used to build `.claude/team.config.json`:
 - `proposed_scope` + `globs` (e.g. rust → `["**/*.rs", "**/Cargo.toml"]`)
 - `dominant` (boolean)
 
-**B) Available agents** — scan EVERY agent source and read each agent's frontmatter:
-- this plugin: `${CLAUDE_PLUGIN_ROOT}/agents/*.md`
-- other installed plugins: `~/.claude/plugins/**/agents/*.md` (under `marketplaces/*/<plugin>/`
-  and `cache/*/<plugin>/<version>/`)
-- project agents: `.claude/agents/*.md`; user agents: `~/.claude/agents/*.md`
+**B) Available agents** — inventory every OMP-native agent source visible to the current installation:
+- this enabled extension package's `agents/*.md`;
+- other enabled OMP extension packages' `agents/*.md` directories;
+- project agents in `.omp/agents/*.md`;
+- user agents in `~/.omp/agent/agents/*.md`.
 
-For each agent return `{ invoke_name, agent_name, namespace, specialty, source_path }`.
+For each agent return `{ agent, specialty, source_path }`.
 
-> **CRITICAL — invoke_name** (the string that goes into `Task subagent_type`):
-> - bare `<name>` for project (`.claude/agents`) and user (`~/.claude/agents`) agents;
-> - `"<plugin>:<name>"` for a plugin agent, where `<plugin>` is the **`name` field in that
->   plugin's `plugin.json`** (`.claude-plugin/plugin.json` or `plugin.json` one level above
->   `agents/`) — **NOT the directory name**. Read that file to get it right. E.g. the dir
->   `claude-rust-agents/rust-code/` has `plugin.json` name `rust-agents`, so the invoke_name is
->   `rust-agents:rust-developer`.
->
-> Infer `specialty` from the agent name + description: its language and its role
-> (dev / architect / reviewer / qa / security / devops / diagnostics).
+> **CRITICAL — agent** is the registered bare name passed to OMP Task `agent`. The OMP registry
+> is flat; do not invent plugin namespaces. Infer `specialty` from the agent name and description:
+> language plus role (developer / architect / reviewer / qa / security / devops / diagnostics).
 
 Output both inventories as readable structured lists (the orchestrator maps stacks→agents and
 writes the config). List only agents that actually exist; do not invent names.

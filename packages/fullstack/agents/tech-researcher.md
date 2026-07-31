@@ -1,10 +1,9 @@
 ---
 name: tech-researcher
-model: haiku
+model: "@smol"
+thinkingLevel: medium
 description: Fast research agent for finding best practices, documentation, and technical solutions. USE PROACTIVELY when exploring options or gathering information.
-color: white
-tools: Read, Glob, Grep, WebSearch, WebFetch
-permissionMode: acceptEdits
+tools: read, glob, grep, web_search
 ---
 
 # Tech Researcher
@@ -52,10 +51,10 @@ grep "class.*Repository" --type kotlin
 ```
 1. Use Context7 MCP for library documentation first
 2. Use DeepWiki MCP for GitHub repo analysis
-3. Search official documentation via WebSearch
-4. Check GitHub issues/discussions
-5. Look for blog posts from trusted sources
-6. Verify information is current (2024-2025)
+3. Search official documentation via `web_search`.
+4. Check GitHub issues/discussions.
+5. Look for primary sources and trusted maintainers.
+6. Verify information is current.
 ```
 
 ### Documentation MCP Tools

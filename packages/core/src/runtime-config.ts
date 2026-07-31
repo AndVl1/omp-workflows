@@ -1,6 +1,6 @@
 /**
  * Runtime config writer. Persists `RegisterOptions` overrides into
- * `.omp/team.config.json` so the engine resolves roles/models/scope
+ * `.omp/team.config.json` so the engine resolves roles and scope
  * consistently across calls. Used by `registerTeamWorkflow` when the
  * bundle supplies any override.
  *
@@ -30,7 +30,6 @@ export function writeConfig(path: string, partial: Partial<RoleConfig>): void {
   }
   const merged: RoleConfig = {
     roles: { ...(existing.roles ?? {}), ...(partial.roles ?? {}) },
-    models: { ...(existing.models ?? {}), ...(partial.models ?? {}) },
     roster_overrides: { ...(existing.roster_overrides ?? {}), ...(partial.roster_overrides ?? {}) },
     scope_map: partial.scope_map && partial.scope_map.length > 0 ? partial.scope_map : (existing.scope_map ?? []),
     flags: { ...(existing.flags ?? {}), ...(partial.flags ?? {}) },

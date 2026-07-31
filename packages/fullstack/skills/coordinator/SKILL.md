@@ -11,7 +11,7 @@ executes and is never the agent `/team` hands work to.
 
 ## Procedure
 
-1. Launch the `coordinator` agent (`subagent_type: coordinator`) — it is read-only.
+1. Launch the read-only `coordinator` agent through OMP `task` with `agent: "coordinator"`.
 2. It gathers git status, active `/team` state (classification, stage cursor, open DoD items),
    `.work-state/queue.json`, and coordinator memory in
    `.work-state/coordinator/<project-slug>/` (`vision.md`, `backlog.md`, `decisions.md`,
