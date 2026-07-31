@@ -23,7 +23,7 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@andvl1/omp-workflows-core": "0.1.x",
+    "@andvl1/omp-workflows-core": "*",
     "@oh-my-pi/pi-coding-agent": "*"
   },
   "devDependencies": {
