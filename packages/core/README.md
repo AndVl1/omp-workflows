@@ -4,7 +4,12 @@ Profile-driven multi-stage workflow engine for omp. No agents, no skills — pur
 
 ## Install
 
+Published to **GitHub Packages**. Configure npm once:
+
 ```bash
+echo "@omp-workflows:registry=https://npm.pkg.github.com" >> ~/.npmrc
+echo "//npm.pkg.github.com/:_authToken=ghp_xxx" >> ~/.npmrc
+
 npm install @omp-workflows/core
 ```
 

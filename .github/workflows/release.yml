@@ -1,0 +1,125 @@
+# Release workflow for omp-workflows.
+#
+# Triggered on a semver tag push (e.g. v0.2.0, v0.2.0-rc.1) or manual dispatch.
+# Builds the workspace and publishes the publishable packages
+# (@omp-workflows/core, then @omp-workflows/fullstack) to GitHub Packages.
+#
+# @omp-workflows/content is a private workspace package — it is the source of
+# truth for agent/skill markdown but is NOT published; fullstack materialises
+# its files at publish time via prepack.
+#
+# Auth: GITHUB_TOKEN is sufficient for publishing into the same GitHub
+# organisation's Packages namespace. Provenance is enabled when the runner
+# has `id-token: write` (default for GH-hosted runners in public repos).
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (must already exist on the default branch)"
+        required: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  publish:
+    name: publish to GitHub Packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: https://npm.pkg.github.com
+
+      - name: Resolve version from tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            # workflow_dispatch: fall back to the latest semver tag if user
+            # didn't pass one.
+            TAG="$(git describe --tags --abbrev=0 --match='v[0-9]*' 2>/dev/null || true)"
+            if [ -z "$TAG" ]; then
+              echo "No semver tag exists; trigger via push to a v* tag instead." >&2
+              exit 1
+            fi
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: $TAG (version=$VERSION)"
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Build, typecheck, test
+        run: |
+          npm run build
+          npm run typecheck
+          npm test
+
+      - name: Stamp versions
+        working-directory: packages/core
+        run: |
+          npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Stamp fullstack version
+        working-directory: packages/fullstack
+        run: |
+          npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Sync content into fullstack (prepack)
+        working-directory: packages/fullstack
+        run: npm run sync-content
+
+      - name: Publish @omp-workflows/core
+        working-directory: packages/core
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm publish \
+            --registry https://npm.pkg.github.com \
+            --access public \
+            --provenance \
+            --tag "${{ steps.version.outputs.tag }}"
+          # Restore manifest version-bump artefacts on the working tree.
+          cd ..
+          git checkout -- packages/core/package.json 2>/dev/null || true
+
+      - name: Publish @omp-workflows/fullstack
+        working-directory: packages/fullstack
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm publish \
+            --registry https://npm.pkg.github.com \
+            --access public \
+            --provenance \
+            --tag "${{ steps.version.outputs.tag }}"
+
+      - name: Restore fullstack content (postpack)
+        if: always()
+        working-directory: packages/fullstack
+        run: |
+          npm run sync-content -- --restore || true

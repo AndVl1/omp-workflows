@@ -1,9 +1,14 @@
 {
   "name": "@omp-workflows/fullstack",
   "version": "0.1.0",
-  "description": "Default team agents and skills for omp-workflows: 15 specialized agents, 32 domain skills. Pulls @omp-workflows/core as peer.",
+  "description": "Default team bundle for omp-workflows: imports @omp-workflows/core, exports registerTeamWorkflow with fullstack defaults. Ships 17 agents + 31 skills bundled at publish time from @omp-workflows/content (../content) via the prepack script.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AndVl1/omp-workflows.git",
+    "directory": "packages/fullstack"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "omp": {
@@ -20,7 +25,10 @@
   ],
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "sync-content": "node ./scripts/sync-content.mjs",
+    "prepack": "node ./scripts/sync-content.mjs",
+    "postpack": "node ./scripts/sync-content.mjs --restore"
   },
   "peerDependencies": {
     "@omp-workflows/core": "0.1.x",
