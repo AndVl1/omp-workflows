@@ -72,19 +72,24 @@ jobs:
           npm run typecheck
           npm test
 
-      - name: Stamp @omp-workflows/core version
-        working-directory: packages/core
+      - name: Verify version matches tag
+        # The workflow expects the pushed tag (v*.*.*) to match the version in
+        # packages/{core,fullstack}/package.json. We don't rewrite package.json
+        # at publish time: `npm version` fails on workspaces whose internal
+        # dependencies don't yet exist in any registry (it tries to validate
+        # devDependencies against the default registry → 404). Pin a step
+        # that fails loudly if a maintainer forgot to bump versions.
         run: |
-          npm version "${{ steps.version.outputs.version }}" \
-            --no-git-tag-version \
-            --allow-same-version
-
-      - name: Stamp @omp-workflows/fullstack version
-        working-directory: packages/fullstack
-        run: |
-          npm version "${{ steps.version.outputs.version }}" \
-            --no-git-tag-version \
-            --allow-same-version
+          WANTED="${{ steps.version.outputs.version }}"
+          for pkg in packages/core packages/fullstack; do
+            ACTUAL="$(node -e 'console.log(require("./package.json").version)' -e "process.chdir('$pkg')")"
+            if [ "$ACTUAL" != "$WANTED" ]; then
+              echo "::error::$pkg/package.json version is $ACTUAL, but tag is v$WANTED."
+              echo "::error::Bump with: cd $pkg && npm version $WANTED --no-git-tag-version --allow-same-version -m '$pkg: bump version to %s' && cd ../.. && git add $pkg/package.json && git commit -m 'chore(release): prepare $pkg v$WANTED' && git push"
+              exit 1
+            fi
+          done
+          echo "Verified: both packages report version $WANTED."
 
       - name: Publish @omp-workflows/core
         working-directory: packages/core
