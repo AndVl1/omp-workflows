@@ -112,18 +112,24 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
   const enabled = new Set<CommandId>(
     opts.commands ?? ["team", "team-next", "team-yolo", "pulse", "init-team", "interview", "coordinator-stats"],
   );
-  const wrap = (fn: CommandHandler) => async (args: string, ctx: unknown) => {
-    const c = ctx as unknown as {
-      cwd: string;
-      ui: { notify: (msg: string, kind?: string) => void };
-      callTask: import("./engine/stage.js").TaskCaller;
+  // OMP extension commands receive an ExtensionContext that intentionally omits
+  // `ctx.task` — subagent dispatch is owned by the main OMP agent via its `task`
+  // tool. Workflow commands therefore return a user-visible prompt string that
+  // drives the main agent to invoke the right specialist. `ctx.ui` and `ctx.cwd`
+  // are the only OMP-provided affordances commands can use directly.
+  interface CommandRuntime {
+    args: string;
+    cwd: string;
+    ui: { notify: (msg: string, kind?: string) => void };
+  }
+  const wrap = (fn: (input: CommandRuntime) => Promise<string> | string) =>
+    async (args: string, ctx: unknown) => {
+      const c = ctx as unknown as CommandRuntime;
+      const result = await fn({ args, cwd: c.cwd, ui: c.ui });
+      if (typeof result === "string" && result.length > 0) {
+        c.ui.notify(result, "info");
+      }
     };
-    const result = await fn({ args, cwd: c.cwd, ui: c.ui, callTask: c.callTask });
-    if (typeof result === "string" && result.length > 0) {
-      c.ui.notify(result, "info");
-    }
-  };
-
   if (enabled.has("team")) {
     pi.registerCommand("team", {
       description: "Run a workflow via the profile-driven /team interpreter. /team <task>.",
