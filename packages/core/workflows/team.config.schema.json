@@ -2,14 +2,14 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "fullstack-team/workflows/team.config.schema.json",
   "title": "Per-project team configuration",
-  "description": "Project-level config read by the /team interpreter from `.claude/team.config.json`. Makes role→agent, model, and scope resolution deterministic and per-project instead of inferred at runtime. All fields optional — absent values fall back to built-in defaults (see workflows/team.config.example.json for the defaults).",
+  "description": "Project-level config read by the /team interpreter from `.omp/team.config.json` (fallback: `.claude/team.config.json` for legacy projects). Makes role→agent and scope resolution deterministic and per-project instead of inferred at runtime. All fields optional — absent values fall back to built-in defaults (see workflows/team.config.example.json for the defaults).",
   "type": "object",
   "additionalProperties": false,
   "patternProperties": { "^_": {} },
   "properties": {
     "roles": {
       "type": "object",
-      "description": "Maps a workflow role (used in profile stages) to a concrete agent name passed verbatim as Task `subagent_type`. The agent may be ANY registered agent: a project agent in .claude/agents/<name> (bare name), a user agent in ~/.claude/agents/<name> (bare name), this plugin's agent (fullstack-team:<name>), or another plugin's agent (<plugin>:<name>). Unmapped roles fall back to the built-in default agent of the same name. New role keys (beyond the built-in set) are allowed — reference them from a custom profile or via roster_overrides.",
+      "description": "Maps a workflow role (used in profile stages) to a concrete agent name passed verbatim as Task `agent`. The agent may be ANY registered OMP agent: a project agent in .omp/agents/<name>, a user agent in ~/.omp/agent/agents/<name>, or an enabled extension-package agent. All use their registered bare name because the OMP registry is flat. Unmapped roles fall back to the built-in default agent of the same name. New role keys (beyond the built-in set) are allowed — reference them from a custom profile or via roster_overrides.",
       "additionalProperties": { "type": "string" }
     },
     "roster_overrides": {
@@ -24,11 +24,6 @@
           "replace": { "type": "array", "items": { "type": "string" }, "description": "Replace the entire roster with exactly these agents." }
         }
       }
-    },
-    "models": {
-      "type": "object",
-      "description": "Maps a role to a model override (opus|sonnet|haiku). The wildcard key '*' sets the default. Priority: explicit role > '*' > agent's own frontmatter.",
-      "additionalProperties": { "enum": ["opus", "sonnet", "haiku"] }
     },
     "scope_map": {
       "type": "array",
@@ -51,7 +46,7 @@
     },
     "design_system": {
       "type": ["string", "null"],
-      "description": "Design system name; the `ui` review role reads ~/.claude/design-systems/<name>.md."
+      "description": "Optional design-system identifier passed to UI review roles; its lookup is owned by the consuming OMP agent or extension."
     }
   }
 }

@@ -1,11 +1,9 @@
 ---
 name: frontend-developer
-model: sonnet
+model: "@task"
+thinkingLevel: auto
 description: Frontend developer - implements DOM-based web UIs across stacks (React/TS, Telegram Mini App, Kotlin/JS + React/Vue) following Architect's design exactly. USE PROACTIVELY for frontend implementation. (Compose WASM is the Mobile Developer's zone.)
-color: yellow
-tools: Read, Write, Edit, Glob, Grep, Bash, WebSearch, WebFetch
-permissionMode: acceptEdits
-skills: react-vite, telegram-mini-apps, kotlin-web
+tools: read, write, edit, glob, grep, bash, web_search
 ---
 
 # Frontend Developer

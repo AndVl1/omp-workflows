@@ -28,11 +28,77 @@ omp plugin install @andvl1/omp-workflows-core
 
 # Plain npm (works the same — npm respects the registry scoping in ~/.npmrc)
 npm install @andvl1/omp-workflows-fullstack
+
+> **Использование одновременно с Claude Code-плагинами.** Этот пакет и слаг `claude-plugin` (legacy Claude Code-плагин) ставят пересекающийся набор агентов и скиллов. Если вы ставили `claude-plugin` через `claude plugin install`, в omp он подгружается через discovery-provider `claude-plugins` (то же, что `ast-index@ast-index-marketplace`, `figma@claude-plugins-official`, и т. д.). Чтобы не дублировать агентов — отключите provider в `~/.omp/agent/config.yml` одним из способов ниже.
+
+## Отключение дублирующих плагинов
+
+`omp plugin disable` управляет только записями в `~/.omp/plugins/` (omp-marketplace, npm-install, link). Claude Code-плагины, установленные через `claude plugin install` (то есть лежащие в `~/.claude/plugins/`), он не адресует — это отдельный runtime. Для их индексации в omp используется discovery-provider `claude-plugins`, и его можно отключить через `disabledProviders`:
+
+```yaml
+# ~/.omp/agent/config.yml — отключить ВСЕ Claude Code-плагины
+disabledProviders:
+  - claude-plugins
 ```
 
-> **Note on duplicates.** If you also have the sibling `claude-plugin` installed (it ships overlapping agent + skill markdown for Claude Code), disable it in omp to avoid duplicate commands and agents: `omp plugin disable claude-plugin`. The filters live in omp core; `@andvl1/omp-workflows-fullstack` does not and cannot control other plugins from inside its own extension runtime.
+Или через CLI:
+
+```bash
+omp config set disabledProviders '["claude-plugins"]'
+```
+
+Что выключает эта настройка:
+
+- **Agents** — `claude-plugin` больше не индексирует агентов в `/agents` (gate стоит на `isProviderEnabled("claude-plugins")` ДО `listClaudePluginRoots()`, см. `task-agent-discovery.md`).
+- **Skills** — скиллы из `claude-plugin` (и всех других Claude Code-плагинов) не попадают в system prompt и не видны через `skill://`.
+- **Commands** — slash-команды плагинов не регистрируются.
+- **Hooks, MCP, LSP** — от тех же источников тоже отключаются.
+
+Что НЕ отключается:
+
+- omp-runtime плагины (`@andvl1/omp-workflows-*`, `loom` и т. д.) — у них свой provider.
+- Bundled-агенты omp (`scout`, `reviewer`, `designer`, `librarian`, `task`, `sonic`).
+- Проектные агенты из `<cwd>/.omp/agents/` и пользовательские из `~/.omp/agent/agents/`.
+
+### Точечное отключение — только конкретный плагин
+
+Per-plugin `disabledProviders` не поддерживает — там только id провайдера. Если нужно вырубить только `claude-plugin`, оставив `ast-index`, `figma` и `apple-skills`:
+
+```yaml
+# ~/.omp/agent/config.yml
+skills:
+  ignoredSkills:
+    - "claude-plugin"
+    - "claude-plugin/**"
+
+task:
+  disabledAgents:
+    - analyst
+    - architect
+    - code-reviewer
+    - coordinator
+    - developer-kotlin
+    # ... полный список агентов из claude-plugin
+```
+
+Имена агентов — плоские (без префикса marketplace), смотрите содержимое `~/.claude/plugins/cache/<marketplace>/claude-plugin/<version>/agents/`.
+
+### Вернуть обратно
+
+```bash
+omp config reset disabledProviders
+```
+
+или точечно:
+
+```bash
+omp config set disabledProviders '[]'
+```
+
+Настройка читается на старте сессии; после изменения перезапустите omp или выполните `/reload`.
 
 ## Architecture
+
 
 ```
 omp-workflows-monorepo/

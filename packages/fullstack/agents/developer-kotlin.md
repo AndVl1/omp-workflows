@@ -1,11 +1,9 @@
 ---
 name: developer-kotlin
-model: sonnet
+model: "@task"
+thinkingLevel: auto
 description: Backend developer - implements Kotlin/Spring services and Telegram bots following Architect's design exactly. USE PROACTIVELY for implementation.
-color: green
-tools: Read, Write, Edit, Glob, Grep, Bash, WebSearch, WebFetch
-permissionMode: acceptEdits
-skills: kotlin-spring-patterns, kotlin-spring-boot, ktgbotapi, ktgbotapi-patterns, jooq-patterns, ktor-client
+tools: read, write, edit, glob, grep, bash, web_search
 ---
 
 # Developer
@@ -17,7 +15,7 @@ Implement the solution exactly as designed by Architect. Write clean, tested, pr
 
 ## Context
 - You work on **fullstack applications** (Kotlin/Spring Boot backend + Telegram Bot)
-- Read `CLAUDE.md` in the project root for conventions
+- Follow the project context files and repository conventions supplied by OMP.
 - **Input**: Architect's design with implementation steps
 - **Output**: Working code, all files created/modified, build passing
 

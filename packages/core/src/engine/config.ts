@@ -12,7 +12,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   DEFAULT_FLAGS,
-  DEFAULT_MODELS,
   DEFAULT_ROLES,
   DEFAULT_SCOPE_MAP,
   type RoleConfig,
@@ -36,7 +35,6 @@ export function resolveConfig(cwd: string): RoleConfig {
   }
   return {
     roles: { ...DEFAULT_ROLES, ...(override.roles ?? {}) },
-    models: { ...DEFAULT_MODELS, ...(override.models ?? {}) },
     roster_overrides: { ...(override.roster_overrides ?? {}) },
     scope_map: override.scope_map && override.scope_map.length > 0 ? override.scope_map : DEFAULT_SCOPE_MAP,
     flags: { ...DEFAULT_FLAGS, ...(override.flags ?? {}) },
@@ -46,8 +44,4 @@ export function resolveConfig(cwd: string): RoleConfig {
 
 export function resolveAgentForRole(role: string, config: RoleConfig): string {
   return config.roles[role] ?? role;
-}
-
-export function resolveModelForAgent(agent: string, config: RoleConfig): string {
-  return config.models[agent] ?? config.models["*"] ?? "sonnet";
 }

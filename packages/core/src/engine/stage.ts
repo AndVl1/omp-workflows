@@ -14,7 +14,7 @@
 
 import { execSync } from "node:child_process";
 import { readArtifact } from "./artifacts.js";
-import { resolveConfig, resolveAgentForRole, resolveModelForAgent } from "./config.js";
+import { resolveConfig } from "./config.js";
 import { resolveScope, applyConditional, shouldSkip, type ScopeFlags } from "./scope.js";
 import type { Profile, StageDef, TeamState } from "./types.js";
 
@@ -23,7 +23,6 @@ export interface StageContext {
   state: TeamState;
   artifactsDir: string;
   flags: ScopeFlags;
-  model: (agent: string) => string;
   agent: (role: string) => string;
   /** Run a single task subagent. The engine owns the `task` tool reference. */
   task: TaskCaller;
@@ -43,7 +42,6 @@ export interface TaskCaller {
   call(opts: {
     agent: string;
     task: string;
-    model?: string;
     effort?: "lo" | "med" | "hi";
     isolated?: boolean;
   }): Promise<TaskResult>;
@@ -55,7 +53,6 @@ export interface TaskCaller {
       name: string;
       agent: string;
       task: string;
-      model?: string;
       effort?: "lo" | "med" | "hi";
     }>;
   }): Promise<TaskResult[]>;
@@ -124,11 +121,10 @@ async function runSingle(stage: StageDef, ctx: StageContext, produces: string[])
     return { stageId: stage.id, status: "failed", note: "single stage missing role", artifacts: [] };
   }
   const agent = ctx.agent(role);
-  const model = ctx.model(agent);
-  const task = buildStagePrompt(stage, ctx);
+  const task = buildStagePrompt(stage, ctx, role);
 
-  ctx.log(`  single: ${agent} (role=${role}, model=${model})`);
-  const result = await ctx.task.call({ agent, task, model });
+  ctx.log(`  single: ${agent} (role=${role})`);
+  const result = await ctx.task.call({ agent, task });
 
   return {
     stageId: stage.id,
@@ -145,12 +141,10 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
 
   ctx.log(`  consilium: ${overridden.join(", ")}`);
 
-  const prompt = buildStagePrompt(stage, ctx);
-  const tasks = overridden.map((role, idx) => ({
+  const tasks = overridden.map((role) => ({
     name: `${stage.id}-${role}`,
     agent: ctx.agent(role),
-    task: prompt,
-    model: ctx.model(ctx.agent(role)),
+    task: buildStagePrompt(stage, ctx, role),
   }));
 
   const results = await ctx.task.batch({
@@ -183,7 +177,7 @@ async function runBash(stage: StageDef, ctx: StageContext, produces: string[]): 
   }
 }
 
-function buildStagePrompt(stage: StageDef, ctx: StageContext): string {
+function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string): string {
   const consumes = stage.consumes ?? [];
   const reads = consumes
     .map((id) => {
@@ -199,6 +193,9 @@ ${stage.description ?? ""}
 
 Branch: ${ctx.state.branch}
 Classification: ${ctx.state.classification.type}/${ctx.state.classification.complexity} (workflow=${ctx.state.classification.workflow})
+Workflow role: ${role}
+
+Follow the responsibility and perspective of this workflow role. For named variants such as architect_minimal, architect_clean, and architect_pragmatic, make that variant the explicit design focus.
 
 ### Task
 ${ctx.state.task}

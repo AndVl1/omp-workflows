@@ -13,7 +13,7 @@
 **When to Run**: There are findings in the `review` artifact (skipped when `review.findings == []`).
 
 **Numbered-issue picker (checkpoint `fix_selection`).** Present the findings from `code_review`
-as a numbered list and let the user choose which to fix, via `AskUserQuestion` **multi-select**:
+as a numbered list and let the user choose which to fix via OMP `ask` with `multi: true`:
 
 - One option per finding, labeled `#N — <title> (SEVERITY, file:line)`.
 - **Default preselection: all CRITICAL + HIGH findings.** MEDIUM is opt-in.

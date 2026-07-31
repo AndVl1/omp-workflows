@@ -1,11 +1,9 @@
 ---
 name: code-reviewer
-model: opus
+model: "@slow"
+thinkingLevel: high
 description: Expert code reviewer. USE PROACTIVELY after any code changes to ensure quality, security, and maintainability.
-color: magenta
-tools: Read, Glob, Grep, Bash
-permissionMode: acceptEdits
-skills: kotlin-spring-patterns, api-design, ktgbotapi-patterns, react-vite, telegram-mini-apps, kmp, compose, compose-arch, decompose
+tools: read, glob, grep, bash
 ---
 
 # Code Reviewer
@@ -20,8 +18,8 @@ Review code changes for quality, security vulnerabilities, and adherence to best
 - **Backend**: Kotlin/Spring Boot, JOOQ, PostgreSQL, ktgbotapi
 - **Mini App Frontend**: React 18+, TypeScript, Vite, @telegram-apps/sdk
 - **Mobile App**: Kotlin Multiplatform, Compose Multiplatform, Decompose navigation
-- Read `CLAUDE.md` in the project root for conventions
-- Read `.claude/skills/compose-arch/SKILL.md` for mobile architecture rules
+- Follow the project context files and repository conventions supplied by OMP.
+- For mobile architecture review, read `skill://compose-arch`.
 - **Input**: Recent code changes (git diff or specific files)
 - **Output**: Structured review with findings and recommendations
 

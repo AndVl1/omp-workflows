@@ -1,7 +1,7 @@
 {
-  "_comment": "Copy this to your PROJECT's .claude/team.config.json and adjust. These values ARE the built-in defaults — the interpreter behaves identically when the file is absent. Per-project config exists so role→agent/model/scope resolution is deterministic and explicit instead of inferred at runtime (P6).",
+  "_comment": "Copy this to your PROJECT's .omp/team.config.json (fallback: .claude/team.config.json for legacy projects) and adjust. These values ARE the built-in defaults — the interpreter behaves identically when the file is absent. Per-project config exists so role→agent/scope resolution is deterministic and explicit instead of inferred at runtime.",
 
-  "_custom_agents": "roles values are passed verbatim to Task subagent_type. Use a bare name for a project (.claude/agents/) or user (~/.claude/agents/) agent, or 'plugin:agent' for another plugin's agent. Examples below: 'backend' could be a project agent 'my-go-backend', 'security-tester' could be 'acme-sec:pentester'.",
+  "_custom_agents": "roles values are passed verbatim to Task `agent`. Use the registered bare name of a project (.omp/agents/), user (~/.omp/agent/agents/), or enabled extension-package agent; the OMP agent registry is flat. Examples: 'backend' could map to 'my-go-backend', and 'security-tester' to 'pentester'.",
 
   "roles": {
     "analyst": "analyst",
@@ -26,14 +26,6 @@
   "roster_overrides": {
     "review": { "add": [] },
     "architecture": { "add": [] }
-  },
-
-  "models": {
-    "architect": "opus",
-    "code-reviewer": "opus",
-    "security-tester": "opus",
-    "tech-researcher": "haiku",
-    "*": "sonnet"
   },
 
   "_scope_map_order": "Evaluated TOP-TO-BOTTOM, FIRST matching glob wins. Order specific paths above generic extensions. `mobile` MUST stay above `backend-kotlin`: a KMP source file (e.g. shared/src/commonMain/Foo.kt) matches both **/commonMain/** (mobile) and **/*.kt (backend-kotlin) — mobile wins only because it is listed first. So **/*.kt routes to backend-kotlin only when NOT under a mobile source set (e.g. a Spring src/main/kotlin).",

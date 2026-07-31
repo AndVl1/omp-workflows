@@ -102,8 +102,6 @@ export interface TeamState {
 export interface RoleConfig {
   /** role -> agent name (passed verbatim to `task` tool) */
   roles: Record<string, string>;
-  /** agent -> model spec */
-  models: Record<string, string>;
   /** stage -> { replace | add | remove } of roles */
   roster_overrides: Record<string, { replace?: string[]; add?: string[]; remove?: string[] }>;
   /** glob list -> scope id + dev agent */
@@ -131,14 +129,6 @@ export const DEFAULT_ROLES: RoleConfig["roles"] = {
   "code-reviewer": "code-reviewer",
   "security-tester": "security-tester",
   devops: "devops",
-};
-
-export const DEFAULT_MODELS: RoleConfig["models"] = {
-  architect: "opus",
-  "code-reviewer": "opus",
-  "security-tester": "opus",
-  "tech-researcher": "haiku",
-  "*": "sonnet",
 };
 
 export const DEFAULT_SCOPE_MAP: RoleConfig["scope_map"] = [

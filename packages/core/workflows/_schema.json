@@ -51,7 +51,7 @@
         "roles": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "For consilium: list of roles to launch in parallel. Role names resolve to agents via .claude/team.config.json `roles` (falling back to built-in defaults). A role may repeat (e.g. architect x3 for design options)."
+          "description": "For consilium: list of roles to launch in parallel. Role names resolve to agents via .omp/team.config.json `roles` (falling back to built-in defaults, then the legacy .claude config). A role may repeat (e.g. architect x3 for design options)."
         },
         "role": {
           "type": "string",

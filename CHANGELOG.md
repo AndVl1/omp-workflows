@@ -2,25 +2,28 @@
 
 All notable changes to `omp-workflows` are documented here.
 
-## [Unreleased]
+## [0.3.0] - 2026-08-01
 
 ### Added
 
 - Workspace monorepo with two npm packages:
   - `@omp-workflows/core` — engine, gates, slash commands, profiles, artifact schemas.
-  - `@omp-workflows/fullstack` — default bundle: 15 agents + 32 skills, pulls core as peer.
+  - `@omp-workflows/fullstack` — default bundle: 17 agents + 31 skills, pulls core as peer.
 - Public API: `registerTeamWorkflow(pi, opts)` for bundles to wire the engine.
-- Built-in default role/model/scope/flag presets exported as `defaultFullstackRoles`, `defaultFullstackModels`, `defaultFullstackScopeMap`, `defaultFullstackFlags`.
+- Built-in role/scope/flag presets exported as `defaultFullstackRoles`, `defaultFullstackScopeMap`, `defaultFullstackFlags`.
 - Slash commands: `/team`, `/pulse`, `/init-team`, `/team-next`, `/team-yolo`, `/interview`, `/coordinator-stats`. Subset-selectable via `commands:` option.
 - Gates as event handlers: `before_agent_start` (classification + monotonic), `session_stop` (DoD backstop), `tool_call` (safety).
 - 8 declarative JSON profiles (`full-feature`, `standard`, `lightweight`, `debug-cycle`, `bug-fix`, `emergency`, `research`, `review`) and typed artifact schemas.
-- 15 agents and 32 domain skills in the fullstack bundle.
-- Smoke tests for the package split (9 tests, all passing).
+- 17 agents and 31 domain skills in the fullstack bundle.
+- Smoke tests for the package split and OMP-native role dispatch.
+- Pull-request CI for reproducible install, build, typecheck, and tests.
 
 ### Changed
 
 - Replaced the single-package layout with a workspace split. The legacy `commands/team.md` (830-line prose interpreter) is now TypeScript in `core/src/`. The bash hooks (`validate-state.sh`, `dod-gate.sh`, `safety-guard.sh`) are now event handlers in `core/src/gates/`.
 - `DoD artifact shape` extended: `dod.items.length === 0` now blocks done-claim (previously passed).
+- Migrated subagent selection to OMP-native roles: workflows now resolve only role → agent, while agent frontmatter selects `@smol` / `@task` / `@slow` and native reasoning levels.
+- Removed the workflow-level `models` map and Claude-specific `haiku` / `sonnet` / `opus` routing; concrete model assignment now belongs to OMP `modelRoles` or `task.agentModelOverrides`.
 
 ### Migration notes
 

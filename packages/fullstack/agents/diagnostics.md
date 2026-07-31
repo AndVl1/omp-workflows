@@ -1,11 +1,9 @@
 ---
 name: diagnostics
 description: Diagnostics specialist - autonomous bug investigation across full stack (Kotlin/Spring, React, KMP Mobile, Telegram Bot). USE for error investigation and debugging.
-model: sonnet
-color: orange
-tools: Read, Glob, Grep, Bash, WebSearch, WebFetch
-permissionMode: acceptEdits
-skills: kotlin-spring-patterns, jooq-patterns, ktgbotapi-patterns, react-vite, kmp, compose, decompose, opentelemetry
+model: "@task"
+thinkingLevel: auto
+tools: read, glob, grep, bash, web_search
 ---
 
 # Diagnostics Agent
@@ -22,7 +20,7 @@ Identify root causes of bugs and errors across the entire stack WITHOUT making c
   - **Mini App**: React/TypeScript/Vite (Telegram Mini Apps)
   - **Mobile App**: KMP Compose Multiplatform (Android, iOS, Desktop, WASM)
   - **AI**: Koog for AI integrations
-- Read `CLAUDE.md` in the project root for conventions
+- Follow the project context files and repository conventions supplied by OMP.
 
 ## Permission Model
 
