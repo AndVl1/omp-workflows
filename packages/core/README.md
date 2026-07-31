@@ -1,17 +1,17 @@
-# @omp-workflows/core
+# @andvl1/omp-workflows-core
 
 Profile-driven multi-stage workflow engine for omp. No agents, no skills — pure runtime.
 
 ## Install
 
 ```bash
-npm install @omp-workflows/core
+npm install @andvl1/omp-workflows-core
 ```
 
 ## Public API
 
 ```typescript
-import { registerTeamWorkflow } from "@omp-workflows/core";
+import { registerTeamWorkflow } from "@andvl1/omp-workflows-core";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
@@ -35,7 +35,7 @@ import {
   defaultFullstackModels,
   defaultFullstackScopeMap,
   defaultFullstackFlags,
-} from "@omp-workflows/core";
+} from "@andvl1/omp-workflows-core";
 
 registerTeamWorkflow(pi, {
   roles: defaultFullstackRoles,

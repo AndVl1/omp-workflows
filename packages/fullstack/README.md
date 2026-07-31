@@ -1,16 +1,16 @@
-# @omp-workflows/fullstack
+# @andvl1/omp-workflows-fullstack
 
-Default fullstack bundle for `@omp-workflows/core`. Ships 15 specialized agents and 32 domain skills for Spring/Kotlin/React/KMP/Telegram-bot projects.
+Default fullstack bundle for `@andvl1/omp-workflows-core`. Ships 15 specialized agents and 32 domain skills for Spring/Kotlin/React/KMP/Telegram-bot projects.
 
 ## Install
 
 ```bash
-npm install @omp-workflows/fullstack @omp-workflows/core
+npm install @andvl1/omp-workflows-fullstack @andvl1/omp-workflows-core
 ```
 
 ## What it does
 
-`@omp-workflows/fullstack` is a thin wrapper that calls `registerTeamWorkflow(pi, opts)` with the fullstack defaults:
+`@andvl1/omp-workflows-fullstack` is a thin wrapper that calls `registerTeamWorkflow(pi, opts)` with the fullstack defaults:
 
 ```typescript
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -20,7 +20,7 @@ import {
   defaultFullstackModels,
   defaultFullstackScopeMap,
   defaultFullstackFlags,
-} from "@omp-workflows/core";
+} from "@andvl1/omp-workflows-core";
 
 export default function (pi: ExtensionAPI) {
   registerTeamWorkflow(pi, {

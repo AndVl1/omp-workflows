@@ -2,8 +2,8 @@
  * Smoke test for the package split.
  *
  * Verifies:
- *   1. @omp-workflows/core resolves and exports the public API.
- *   2. @omp-workflows/fullstack can import core and call registerTeamWorkflow.
+ *   1. @andvl1/omp-workflows-core resolves and exports the public API.
+ *   2. @andvl1/omp-workflows-fullstack can import core and call registerTeamWorkflow.
  *   3. The public API surface (8 profiles) is reachable end-to-end.
  */
 
@@ -17,7 +17,7 @@ import {
   loadAllProfiles,
   resolveWorkflow,
   selectProfile,
-} from "@omp-workflows/core";
+} from "@andvl1/omp-workflows-core";
 
 test("core: loadAllProfiles returns 8 profiles", async () => {
   const profiles = await loadAllProfiles();
@@ -97,7 +97,7 @@ test("core: registerTeamWorkflow respects commands subset", () => {
 });
 
 test("fullstack: bundle imports core and registers engine", async () => {
-  const core = await import("@omp-workflows/core");
+  const core = await import("@andvl1/omp-workflows-core");
   assert.equal(typeof core.registerTeamWorkflow, "function");
   assert.equal(typeof core.defaultFullstackRoles, "object");
   assert.equal(Object.keys(core.defaultFullstackRoles).length, 16);

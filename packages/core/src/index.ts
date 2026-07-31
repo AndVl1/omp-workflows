@@ -1,5 +1,5 @@
 /**
- * @omp-workflows/core — public API surface.
+ * @andvl1/omp-workflows-core — public API surface.
  *
  * Workflow engine: 7 slash commands, 4 event handlers, 8 declarative
  * JSON profiles, typed artifact schemas, state machine, role/scope
@@ -7,7 +7,7 @@
  *
  * Example minimal bundle:
  *
- *   import { registerTeamWorkflow, defaultFullstackRoles } from "@omp-workflows/core";
+ *   import { registerTeamWorkflow, defaultFullstackRoles } from "@andvl1/omp-workflows-core";
  *   export default function (pi: ExtensionAPI) {
  *     registerTeamWorkflow(pi, {
  *       label: "omp-workflows-fullstack",

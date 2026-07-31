@@ -10,11 +10,11 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "build:core": "npm run build -w @omp-workflows/core",
-    "build:fullstack": "npm run build -w @omp-workflows/fullstack",
+    "build:core": "npm run build -w @andvl1/omp-workflows-core",
+    "build:fullstack": "npm run build -w @andvl1/omp-workflows-fullstack",
     "typecheck": "npm run typecheck --workspaces",
-    "test": "npm run test -w @omp-workflows/core",
-    "test:core": "npm run test -w @omp-workflows/core",
+    "test": "npm run test -w @andvl1/omp-workflows-core",
+    "test:core": "npm run test -w @andvl1/omp-workflows-core",
     "clean": "rm -rf packages/*/dist"
   },
   "engines": {

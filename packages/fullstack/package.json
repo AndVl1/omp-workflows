@@ -1,7 +1,7 @@
 {
-  "name": "@omp-workflows/fullstack",
+  "name": "@andvl1/omp-workflows-fullstack",
   "version": "0.1.1",
-  "description": "Default team agents and skills for omp-workflows: 15 specialized agents, 32 domain skills. Pulls @omp-workflows/core as peer.",
+  "description": "Default team agents and skills for omp-workflows: 17 specialized agents, 31 domain skills. Pulls @andvl1/omp-workflows-core as peer.",
   "type": "module",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -23,7 +23,7 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@omp-workflows/core": "0.1.x",
+    "@andvl1/omp-workflows-core": "0.1.x",
     "@oh-my-pi/pi-coding-agent": "*"
   },
   "devDependencies": {
