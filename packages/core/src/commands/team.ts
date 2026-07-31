@@ -1,13 +1,23 @@
 /**
- * /team slash command — the workflow interpreter.
+ * /team slash command — workflow interpreter (stub for v0.3.x).
  *
  * Accepts: `[task description]`
- * Detects autonomous mode (`[AUTONOMOUS ...]` prefix) and routes to the
- * `run(opts)` engine.
+ * Detects autonomous mode (`[AUTONOMOUS ...]` prefix) and records the envelope.
+ *
+ * ### Why a stub
+ * OMP extension commands do not expose a subagent-dispatch affordance. The
+ * underlying `task` tool lives on the main OMP agent, which an extension
+ * command cannot drive from `ExtensionCommandContext`. Until workflow
+ * commands ship as OMP custom-TS commands (see
+ * `.work-state/plans/omp-workflow-rewrite.md`), `/team` validates the task
+ * envelope and posts it back as a user-visible digest.
+ *
+ * The profile-driven engine (`packages/core/src/engine/`) and the 17 role-mapped
+ * agents in `packages/fullstack/agents/` are still consumed by the upcoming
+ * custom-TS command.
  */
 
 import { execSync } from "node:child_process";
-import { run } from "../engine/run.js";
 import type { CommandContext } from "./types.js";
 export type { CommandContext } from "./types.js";
 
@@ -16,72 +26,46 @@ const AUTONOMOUS_PREFIX = "[AUTONOMOUS";
 export async function teamCommand(ctx: CommandContext): Promise<string> {
   const args = ctx.args.trim();
   if (!args) {
-    return "Usage: /team [AUTONOMOUS] [issue=#N] [task description]";
+    return [
+      "Usage: /team [task description] [issue=#N] [AUTONOMOUS]",
+      "",
+      "Workflow dispatch via /team is temporarily a stub. The main OMP agent",
+      "is expected to take the returned envelope and run the profile-driven",
+      "workflow through its own task tool. See plan:",
+      ".work-state/plans/omp-workflow-rewrite.md",
+    ].join("\n");
   }
 
   const autonomous = args.startsWith(AUTONOMOUS_PREFIX);
-  const task = stripPrefix(args, AUTONOMOUS_PREFIX);
-  const { issue, task: cleanedTask } = parseIssue(task);
+  const withoutPrefix = autonomous ? args.slice(AUTONOMOUS_PREFIX.length).trimStart() : args;
+  const cleanedTask = withoutPrefix.startsWith("]") ? withoutPrefix.slice(1).trimStart() : withoutPrefix;
+  const issueMatch = cleanedTask.match(/issue=#(\d+)/);
+  const issue = issueMatch ? Number(issueMatch[1]) : null;
+  const finalTask = issueMatch ? cleanedTask.replace(issueMatch[0], "").trim() : cleanedTask;
 
-  const branch = currentBranch(ctx.cwd);
+  let branch: string | null = null;
+  try {
+    branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: ctx.cwd, encoding: "utf8" }).trim();
+  } catch {
+    branch = null;
+  }
   if (!branch) {
     return "ERROR: not inside a git work tree.";
   }
 
-  const result = await run({
-    task: cleanedTask,
-    cwd: ctx.cwd,
-    branch,
-    autonomous,
-    issue: issue ? { number: issue } : null,
-    taskTool: ctx.callTask,
-    pause: async (reason: string) => {
-      ctx.ui.notify(`paused: ${reason}`, "info");
-    },
-    log: (line: string) => ctx.ui.notify(line, "info"),
-  });
-
-  return formatResult(result);
-}
-
-function stripPrefix(text: string, prefix: string): string {
-  if (!text.startsWith(prefix)) return text;
-  const rest = text.slice(prefix.length).trimStart();
-  // allow `]` or ` issue=#N url=...` token after the prefix
-  if (rest.startsWith("]")) return rest.slice(1).trimStart();
-  return rest;
-}
-
-function parseIssue(text: string): { issue: number | null; task: string } {
-  const m = text.match(/issue=#(\d+)/);
-  if (!m) return { issue: null, task: text };
-  return { issue: Number(m[1]), task: text.replace(m[0], "").trim() };
-}
-
-function currentBranch(cwd: string): string | null {
-  try {
-    return execSync("git rev-parse --abbrev-ref HEAD", { cwd, encoding: "utf8" }).trim();
-  } catch {
-    return null;
-  }
-}
-
-function formatResult(r: {
-  classification: { type: string; complexity: string; workflow: string };
-  profile: { name: string; stages: Array<{ id: string }> };
-  outcomes: Array<{ stageId: string; status: string; note: string }>;
-  statePath: string | null;
-}): string {
-  const lines: string[] = [];
-  lines.push(`## /team run finished`);
-  lines.push("");
-  lines.push(`- classification: ${r.classification.type}/${r.classification.complexity} -> ${r.classification.workflow}`);
-  lines.push(`- profile: ${r.profile.name} (${r.profile.stages.length} stages)`);
-  lines.push(`- state: ${r.statePath ?? "(none)"}`);
-  lines.push("");
-  lines.push("### Outcomes");
-  for (const o of r.outcomes) {
-    lines.push(`- ${o.stageId}: ${o.status} (${o.note})`);
-  }
+  const lines: string[] = [
+    "## /team envelope (v0.3 stub)",
+    "",
+    `- task: ${finalTask}`,
+    `- autonomous: ${autonomous}`,
+    `- issue: ${issue ?? "(none)"}`,
+    `- branch: ${branch}`,
+    `- cwd: ${ctx.cwd}`,
+    "",
+    "The main OMP agent should now drive the role-mapped workflow:",
+    "discovery → architecture → implementation → review → manual-qa → qa-tests.",
+    "Until the custom-TS command lands, this command only records the envelope.",
+  ];
+  ctx.ui.notify(`team envelope recorded: ${finalTask.slice(0, 60)}`, "info");
   return lines.join("\n");
 }

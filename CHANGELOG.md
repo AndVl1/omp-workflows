@@ -2,6 +2,19 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.3.1] - 2026-08-01
+
+### Fixed
+
+- `/team` no longer crashes with `undefined is not an object (evaluating 'ctx.task.batch')`.
+  Extension commands in OMP do not expose a subagent-dispatch affordance; the
+  `callTask` API surface was non-existent. `/team` is now an envelope-recording
+  stub that returns the task, autonomous flag, branch, and `issue=#N` for the
+  main OMP agent to drive through its own `task` tool. Workflow re-implementation
+  via OMP custom-TS commands is tracked in
+  `.work-state/plans/omp-workflow-rewrite.md`.
+
+
 ## [0.3.0] - 2026-08-01
 
 ### Added
