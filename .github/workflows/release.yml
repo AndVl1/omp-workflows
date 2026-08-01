@@ -1,12 +1,15 @@
 # Release workflow for omp-workflows.
 #
 # Triggered by pushing a semver tag (v0.2.0, v0.2.0-rc.1). Builds the
-# workspace and publishes both publishable packages
-# (@omp-workflows/core, then @omp-workflows/fullstack) to GitHub Packages.
+# workspace, publishes both publishable packages
+# (@andvl1/omp-workflows-core, then @andvl1/omp-workflows-fullstack) to
+# GitHub Packages, and finally creates a GitHub Release on the /releases
+# page sourced from CHANGELOG.md.
 #
 # Auth: GITHUB_TOKEN is sufficient when publishing into the same GitHub
-# organisation's Packages namespace. The `AndVl1/omp-workflows` repo is public,
-# so packages are published as `--access public`.
+# organisation's Packages namespace and when creating Releases on the same
+# repository's API. The `AndVl1/omp-workflows` repo is public, so packages
+# are published as `--access public`.
 #
 # Version handling: this workflow does NOT rewrite package.json. The tag
 # (v*.*.*) must match the version already in packages/{core,fullstack}/
@@ -20,6 +23,11 @@
 # devDependencies against the default registry. We use `npm install`
 # (honours workspace symlinks via package-lock.json) until both packages
 # are published.
+#
+# Release notes: extracted from CHANGELOG.md. The first heading matching
+# `## [<version>]` (Keep-a-Changelog style) is used as the body. The
+# Release step fails loudly if no matching section is found rather than
+# publishing an empty release.
 
 name: release
 
@@ -35,7 +43,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   packages: write
   id-token: write
 
@@ -95,7 +103,7 @@ jobs:
           done
           echo "Verified: both packages report version $WANTED."
 
-      - name: Publish @omp-workflows/core
+      - name: Publish @andvl1/omp-workflows-core
         working-directory: packages/core
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -104,7 +112,7 @@ jobs:
             --registry https://npm.pkg.github.com \
             --access public
 
-      - name: Publish @omp-workflows/fullstack
+      - name: Publish @andvl1/omp-workflows-fullstack
         working-directory: packages/fullstack
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -112,3 +120,58 @@ jobs:
           npm publish \
             --registry https://npm.pkg.github.com \
             --access public
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          CHANGELOG="CHANGELOG.md"
+          if [ ! -f "$CHANGELOG" ]; then
+            echo "::error::$CHANGELOG not found at repo root." >&2
+            exit 1
+          fi
+          # Match the FIRST heading equal to "## [<version>]" (Keep-a-Changelog
+          # style). Stop at the next "## " heading (any second-level section)
+          # so trailing unrelated blocks like an [Unreleased] section don't
+          # leak into the release body.
+          BODY="$(awk -v ver="$VERSION" '
+            BEGIN { capture = 0; found = 0 }
+            /^## \[/ {
+              if (capture) { exit }
+              match($0, /^## \[([^]]+)\]/)
+              if (RSTART && substr($0, RSTART, RLENGTH) == "## [" ver "]") {
+                capture = 1; found = 1
+                print
+                next
+              }
+            }
+            /^## / { if (capture) exit }
+            capture { print }
+            END { if (!found) exit 2 }
+          ' "$CHANGELOG")" || {
+            echo "::error::No '## [$VERSION]' section in $CHANGELOG." >&2
+            echo "::error::Add a release notes section before pushing the tag." >&2
+            exit 1
+          }
+          if [ -z "$BODY" ]; then
+            echo "::error::Empty notes extracted for version $VERSION." >&2
+            exit 1
+          fi
+          {
+            echo "body<<EOF"
+            echo "$BODY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Extracted release notes for $VERSION ($(printf '%s' "$BODY" | wc -l) lines)."
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "v${{ steps.version.outputs.version }}"
+          body: ${{ steps.notes.outputs.body }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.tag, '-') }}
+          fail_on_unmatched_files: false
