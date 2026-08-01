@@ -59,7 +59,7 @@ function buildDigest(cwd: string): string {
 	const lines: string[] = ["## Pulse", ""];
 	const state = readTeamState(cwd);
 	if (!state) {
-		lines.push("No .work-state/team-state.json — run /team first to bootstrap.");
+		lines.push("No .work-state/team-state.json — run /do-work first to bootstrap.");
 		lines.push("");
 	}
 	const branch = safeExec("git branch --show-current", cwd);
@@ -102,7 +102,7 @@ function buildDigest(cwd: string): string {
 	}
 
 	lines.push("### next actions");
-	lines.push("- /team <feature>");
+	lines.push("- /do-work <feature>  (alias: /team)");
 	lines.push("- /team-next (run next queued task)");
 	lines.push("- /init-team (if .omp/team.config.json missing)");
 	lines.push("- /coordinator-stats");

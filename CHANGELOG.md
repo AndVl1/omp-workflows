@@ -2,10 +2,16 @@
 
 All notable changes to `omp-workflows` are documented here.
 
-## [0.4.0] - 2026-08-01
-
+## [Unreleased]
 ### Added
+- **`postinstall` hook** in `@andvl1/omp-workflows-fullstack`: copies slash commands into the consuming project's `.omp/commands/` automatically after `npm install`. Manual `npm run copy-commands` is no longer required.
+- **`/do-work` command** alongside `/team` (alias). `/team` now ships as a thin alias for backwards compatibility; new code should use `/do-work`.
+- **Graceful fallback when not inside a git work tree**: the workflow prompt now renders `Branch: (no git work tree)` instead of erroring out, so the command is usable in fresh sandboxes.
 
+### Changed
+- none yet
+
+## Unreleased [legacy] — initial release notes
 - **OMP custom-TS slash commands** shipped from the fullstack bundle:
   `/team`, `/pulse`, `/team-next`, `/team-yolo`, `/init-team`, `/interview`,
   `/coordinator-stats`. Each lives in `packages/fullstack/commands/<name>/index.ts`

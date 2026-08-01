@@ -31,7 +31,7 @@ const factory = (_api: CustomCommandAPI): CustomCommand => ({
 				"   - Risk surface (security, scale, compliance).",
 				"   - Acceptance criteria in concrete terms.",
 				"   - Definition-of-done items the team should commit to.",
-				"3. Synthesize the answers into an expanded task description that the next /team call can act on.",
+			"3. Synthesize the answers into an expanded task description that the next /do-work call can act on.",
 			].join("\n"),
 		].join("\n");
 	},
