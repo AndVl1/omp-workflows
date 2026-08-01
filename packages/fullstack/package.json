@@ -1,6 +1,6 @@
 {
 	"name": "@andvl1/omp-workflows-fullstack",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"description": "Default team agents and skills for omp-workflows: 17 specialized agents, 31 domain skills, 8 custom-TS slash commands. Pulls @andvl1/omp-workflows-core as peer.",
 	"type": "module",
 	"license": "MIT",

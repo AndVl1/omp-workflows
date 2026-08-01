@@ -2,14 +2,17 @@
 
 All notable changes to `omp-workflows` are documented here.
 
-## [Unreleased]
+## [0.5.0] — 2026-08-01
 ### Added
+- **`/do-work` command** alongside `/team` (alias). `/team` is now a thin alias for backwards compatibility; new code should use `/do-work`. Both commands share one implementation — `commands/team/index.ts` delegates to `commands/do-work/index.ts`.
 - **`postinstall` hook** in `@andvl1/omp-workflows-fullstack`: copies slash commands into the consuming project's `.omp/commands/` automatically after `npm install`. Manual `npm run copy-commands` is no longer required.
-- **`/do-work` command** alongside `/team` (alias). `/team` now ships as a thin alias for backwards compatibility; new code should use `/do-work`.
-- **Graceful fallback when not inside a git work tree**: the workflow prompt now renders `Branch: (no git work tree)` instead of erroring out, so the command is usable in fresh sandboxes.
+- **`fullstack: parseEnvelope falls back to branch=null outside a git work tree`** unit test (mkdtempSync under `os.tmpdir()`). New fullstack coverage: 6/6 tests including alias delegation and the no-git fallback.
+- **Fix CI verification** on `fullstack` — added the missing `"test"` npm script so `npm test` resolves from the workspace root.
 
 ### Changed
-- none yet
+- **Graceful fallback when not inside a git work tree**: the workflow prompt renders `Branch: (no git work tree)` instead of erroring out, so `/do-work` works in fresh sandboxes and unrelated projects.
+- Help copy in `pulse`, `team-next`, `team-yolo`, `interview`, `coordinator-stats` points at `/do-work`; `/team` is mentioned as an alias.
+
 
 ## Unreleased [legacy] — initial release notes
 - **OMP custom-TS slash commands** shipped from the fullstack bundle:
