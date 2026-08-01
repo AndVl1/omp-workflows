@@ -17,12 +17,12 @@
 		"forceConsistentCasingInFileNames": true,
 		"isolatedModules": true,
 		"verbatimModuleSyntax": false,
-		"outDir": "./dist",
-		"rootDir": "./src",
-		"declaration": true,
-		"sourceMap": true,
+		"noEmit": true,
+		"rootDir": "./commands",
+		"declaration": false,
+		"sourceMap": false,
 		"removeComments": false
 	},
-	"include": ["src/**/*"],
-	"exclude": ["node_modules", "dist", "**/*.test.ts", "commands/**/*"]
+	"include": ["commands/**/*"],
+	"exclude": ["node_modules", "dist", "**/*.test.ts", "scripts/**/*"]
 }

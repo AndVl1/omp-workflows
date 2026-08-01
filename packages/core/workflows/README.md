@@ -10,6 +10,12 @@ mechanically. Same classification → same stage sequence.
 > different runs. Profiles turn the workflow into **data** (harnest-style stage taxonomy).
 > See `vibe-report/determinism-research-2026-06-06.md` for the rationale (P1).
 
+> **v0.4.0+ shipping model.** The `/team` command lives as an OMP custom-TS command in
+> `packages/fullstack/commands/team/index.ts`. It parses the envelope, classifies the task,
+> and returns a prompt the main OMP agent runs through its own `task` tool. The custom-TS
+> command does NOT drive subagent dispatch itself — that surface is owned by the main agent
+> in OMP 17.x. The interpreter loop in `engine/{stage,run}.ts` is invoked by the main agent
+> via `createTaskCaller(TaskTool)` for every `single` / `consilium` stage.
 ## Files
 
 | File | Purpose |
