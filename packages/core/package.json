@@ -12,7 +12,11 @@
       "import": "./dist/index.js"
     },
     "./workflows": "./workflows/",
-    "./workflows/*": "./workflows/*"
+    "./workflows/*": "./workflows/*",
+    "./model-overrides": {
+      "types": "./dist/model-overrides/index.d.ts",
+      "import": "./dist/model-overrides/index.js"
+    }
   },
   "files": [
     "dist",

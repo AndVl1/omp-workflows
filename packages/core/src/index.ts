@@ -222,6 +222,26 @@ export {
 	type ObservabilityRollup,
 	type EventKind,
 } from "./observability/index.js";
+export {
+	CORE_OVERRIDABLE_ROLES,
+	ModelsJsonError,
+	defaultBundledAgentsDir,
+	defaultModelEntries,
+	nodeFsAdapter,
+	noopUi,
+	patchAgentFrontmatter,
+	runModelOverrides,
+	validateModelsJson,
+	type CoreOverridableRole,
+	type FsAdapter,
+	type ModelEntry,
+	type ModelsJson,
+	type OverrideEntry,
+	type RunModelOverridesInput,
+	type RunModelOverridesResult,
+	type UiAdapter,
+} from "./model-overrides/index.js";
+
 
 /**
  * Marker exported so custom-TS commands can detect that the engine was

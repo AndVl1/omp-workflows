@@ -106,6 +106,66 @@ omp config set disabledProviders '[]'
 
 Настройка читается на старте сессии; после изменения перезапустите omp или выполните `/reload`.
 
+## Per-project model overrides (v0.9.0+)
+
+Override which model runs each agent role in your project, without forking the agents or changing the workflow. After configuration, `omp` auto-discovers the per-project agents and dispatches to them instead of the bundled ones.
+
+### Setup
+
+```bash
+# 1. Initialise (writes .omp/models.json with defaults + empty overrides)
+/omp-model-overrides --force
+
+# 2. Edit .omp/models.json — declare your models and pick a model per role:
+#    {
+#      "schema_version": 1,
+#      "models": [
+#        { "id": "minimax-m3",   "label": "Minimax-M3",  "provider": "minimax", "model_id": "MiniMax/M3" },
+#        { "id": "deepseek-flash", "label": "DeepSeek Flash", "provider": "deepseek", "model_id": "deepseek-flash" }
+#      ],
+#      "overrides": {
+#        "architect":     { "model_id": "deepseek-flash", "agent_slug": "architect-deepseek-flash" },
+#        "code-reviewer": { "model_id": "deepseek-flash", "agent_slug": "code-reviewer-deepseek-flash" }
+#      }
+#    }
+
+# 3. Generate per-role agent .md files
+/omp-model-overrides
+```
+
+After step 3, `.omp/agents/<role>-<model>/<role>-<model>.md` is created for each override. The next time you run `/team`, the orchestrator dispatches to these per-project agents automatically.
+
+### Overridable roles
+
+`CORE_OVERRIDABLE_ROLES = ['architect', 'analyst', 'code-reviewer', 'developer', 'qa']` — hardcoded in core for security/audit reasons. Roles like `security-tester`, `manual-qa`, and `devops` cannot be overridden.
+
+### Source priority
+
+For each role the generator looks for a source agent in this order:
+
+1. `<cwd>/.omp/agents/<role>.md` — your project-level override (compatible with `init-team`'s agent layout).
+2. Bundled agents in `@andvl1/omp-workflows-fullstack/agents/<role>.md` (architect.md, analyst.md, ...).
+
+If neither exists the override is skipped with a `no source agent` reason.
+
+### Cache invalidation
+
+`.omp/agents/<role>-<model>/.source-hash` stores `sha256(.omp/models.json + source .md)`. The agent file is regenerated only when this hash changes, so re-runs are idempotent and cheap.
+
+### Programmatic API
+
+```ts
+import { runModelOverrides } from "@andvl1/omp-workflows-core/model-overrides";
+
+const result = runModelOverrides({
+  cwd: process.cwd(),
+  presetOverrides: {
+    architect: { model_id: "deepseek-flash", agent_slug: "architect-deepseek-flash" },
+  },
+  force: false, // when false, noop if .omp/models.json is missing
+});
+```
+
 ## Architecture
 
 
