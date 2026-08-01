@@ -132,6 +132,16 @@ export function buildPrompt(envelope: ParsedEnvelope, cwd: string): string {
 			"- Do NOT mark a stage done when its `artifacts` are empty.",
 		].join("\n"),
 		"",
+		"### Subagent validation contract (machine-checked, v0.7.0+)",
+		"For any stage that produces a code-bearing artifact (`implementation`, `review_fixes`), the engine inspects the produced JSON before handing it to the next stage. Required: `ready: true`, `validation_run: \"true\"` (string), and non-empty `validation_evidence` containing verbatim build/test output. A subagent that returns `ready: true` without these is rejected — the stage is marked `failed` and you re-spawn the developer. There is NO escape hatch: phrases like \"orchestrator owns validation\", \"subagent skips tests\", `validation_run: \"false\"` do not exist in the engine. If a subagent's task is genuinely unvalidatable, mark the stage `failed` and have the developer fix it.",
+		"",
+		"### Orchestrator discipline (you are the dispatcher, not the coder)",
+		"- You do NOT edit source code. If a subagent's output is wrong, re-spawn with a sharper task. Do not patch their artifact by hand.",
+		"- You do NOT second-guess build/test output by re-running it. The subagent owns the validation evidence; you trust it or re-spawn.",
+		"- You do NOT skip stages to \"save time\". The profile order is the contract.",
+		"- You do NOT mark a stage done to unblock downstream work. If the gate rejected, surface the rejection and re-spawn.",
+		"- When a stage fails validation, your only job is to call the same agent again with the gate's reason as the new task. The reason is in the stage outcome's `note` field — copy it verbatim into the re-spawn prompt so the subagent can fix the gap.",
+		"",
 		"Begin with the first stage of the resolved workflow now.",
 	].join("\n");
 }

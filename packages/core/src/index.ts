@@ -229,4 +229,4 @@ export {
  * a derivative that calls `registerTeamWorkflow`). Used by the bundled
  * commands to short-circuit when no engine is present.
  */
-export const CORE_ENGINE_MARKER = "omp-workflows-core/0.7.0";
+export const CORE_ENGINE_MARKER = "omp-workflows-core/0.8.0";

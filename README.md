@@ -286,6 +286,55 @@ Disable per-bundle via `registerTeamWorkflow(pi, { observability: false })`.
 Pre-observability features yield an absent `TeamState.observability` field
 (no migration needed).
 
+## Subagent validation contract (v0.8.0+)
+
+Stages that produce a code-bearing artifact (`implementation`,
+`review_fixes`) go through a machine-checked validation gate after the
+subagent returns. The handoff is blocked unless the artifact contains:
+
+- `ready: "true"`
+- `validation_run: "true"` (the string, not the boolean)
+- `validation_evidence`: the verbatim stdout/stderr of the project's
+  build + test commands — not a summary, not "ok", the actual output.
+
+A subagent that returns `ready: true` without these is **rejected** with
+a precise reason. The stage is marked `failed` and the orchestrator must
+re-spawn the developer with the gate's reason as the new task. The
+orchestrator is forbidden from patching the artifact by hand, from
+editing source code, or from re-running the subagent's build to "double
+check".
+
+Why: in production we observed subagents returning
+`ready: true, validation_run: "false", validation_note: "Per assignment,
+orchestrator owns validation"`. The "per assignment" was an LLM
+hallucination — the assignment said no such thing. There is no
+escape hatch in the engine. The gate is the source of truth.
+
+Profiles that re-use the `implementation` or `review_fixes` produce keys
+for non-code stages must either rename the produces key or include the
+validation fields; otherwise the stage will be marked `failed`.
+
+## Orchestrator discipline
+
+The orchestrator (the main agent driving the workflow) is a
+**dispatcher**, not a coder:
+
+- It does not edit source code. If a subagent's output is wrong, the
+  orchestrator re-spawns the same agent with a sharper task. It does
+  not patch the subagent's artifact.
+- It does not second-guess build/test output by re-running it. The
+  subagent owns the validation evidence; the orchestrator either trusts
+  it or re-spawns.
+- It does not skip stages to "save time". The profile order is the
+  contract.
+- On a validation-gate failure, the orchestrator's only job is to call
+  the same agent again with the gate's reason (the stage outcome's
+  `note` field) as the new task, copied verbatim.
+
+These rules are documented in the `/do-work` command prompt and injected
+into the stage prompt for every executor via `buildStagePrompt`.
+</input>
+
 ## Migration from `claude-plugin`
 </input>
 

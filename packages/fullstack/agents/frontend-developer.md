@@ -164,3 +164,21 @@ you personally verified (it compiles, lints pass, smoke test works), set `status
 write concrete `evidence` (build/test output). Reference items by `id`, bump `updated_at`, and
 only **append** a new item (with `source` + unique `id`) if you introduced a criterion nobody
 else captured. Never renumber existing items. See `commands/team.md` § Multi-source fan-in.
+
+## Validation contract (machine-checked, v0.7.0+)
+
+The engine inspects your produced artifact (`implementation.json` /
+`review_fixes.json`) before handing it to the next stage. A `ready: true`
+without `validation_run: true` + non-empty `validation_evidence` is
+**rejected** — the stage is marked failed and the orchestrator re-spawns
+you. The engine is the source of truth, not this document.
+
+Required fields in the artifact JSON:
+
+- `ready`: "true" only if the build actually passes.
+- `validation_run`: the string `"true"`. Anything else (including `"false"`) is rejected.
+- `validation_evidence`: the verbatim stdout/stderr of the build + lint + test commands. Not a summary. Not "ok". The actual output.
+
+There is no "orchestrator owns validation" escape hatch. That contract does
+not exist in the engine. If you cannot run validation (e.g. failing
+upstream), mark the stage `failed` instead of `ready: true`.

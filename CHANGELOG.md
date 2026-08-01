@@ -2,6 +2,19 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.8.0] — 2026-08-01
+### Added
+- **Validation gate (P6)** in `@andvl1/omp-workflows-core`. Stages that produce a code-bearing artifact (`implementation`, `review_fixes`) are now inspected by the engine after the subagent returns. The handoff is blocked unless the artifact contains `ready: true`, `validation_run: "true"`, and non-empty `validation_evidence` with verbatim build/test output. A subagent that returns `ready: true, validation_run: "false"` (or any other escape hatch) is **rejected** with a precise reason; the stage is marked `failed` and the orchestrator must re-spawn the developer rather than patch the artifact by hand. See `gates/validation.ts` for the full contract and `test/validation-gate.test.ts` for the 16 test cases.
+- **Subagent validation contract** documented in the `/do-work` command prompt and in every developer agent frontmatter (`developer-go`, `developer-kotlin`, `developer-mobile`, `frontend-developer`). The contract is a *machine-checked* contract: the engine, not the agent, decides whether validation was actually run. Phrases like "orchestrator owns validation" and `validation_run: "false"` are explicitly listed as not-existing in the engine.
+- **Orchestrator discipline** documented in the `/do-work` command prompt and in `buildStagePrompt` (`packages/core/src/engine/stage.ts`). The orchestrator is a dispatcher, not a coder: it does not edit source, does not second-guess build/test output by re-running it, and on gate failure re-spawns the same agent with the gate's reason as the new task. The reason is in the stage outcome's `note` field — copied verbatim into the re-spawn prompt.
+
+### Changed
+- `runSingle` and `runConsilium` in `packages/core/src/engine/stage.ts` now run the validation gate after the subagent returns. The gate is keyed on the stage's `produces` list (so custom profiles that re-use the `implementation` id for a non-code stage are unaffected).
+- `buildStagePrompt` injects a role-specific role-hint block: orchestrator roles (`coordinator`, `coordinator-yolo`, `discovery`) get a "DISPATCHER, not coder" hint; everything else gets an "EXECUTOR — validation evidence required" hint with explicit "no `validation_run: false` escape hatch" wording.
+
+### Migration
+- No code-level migration needed. Custom profiles that re-use the `implementation` or `review_fixes` produce keys for non-code stages will be inspected by the gate; either rename the produces key or include the validation fields. Test count: 49 in core (was 33), 11 in fullstack. All pass with `npm test`.
+
 ## [0.7.0] — 2026-08-01
 ### Added
 - **Runtime observability layer** in `@andvl1/omp-workflows-core`. When the engine wires up via `registerTeamWorkflow`, it now subscribes to seven OMP extension events (`before_agent_start`, `agent_start`, `agent_end`, `tool_call`, `tool_result`, `session_start`, `session_stop`) and writes a per-feature append-only event log to `.work-state/features/<slug>/observability/events.jsonl`. A rollup (agent invocations, per-tool counts, per-subagent counts, per-skill counts, error counts, wall-clock duration) is computed from the log and embedded in `TeamState.observability` on every `writeState`. The rollup is mirrored in `team-state.md` under a new `## Observability` section so `/pulse` and any other consumer can read the cheap summary without touching the jsonl.

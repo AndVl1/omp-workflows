@@ -10,12 +10,20 @@
  *
  * The orchestrator hands every `task` call its `consumes` artifact content;
  * the agent gathers its own context outside this layer.
+ *
+ * v0.7.0: stages that ship code (currently `implementation` and
+ * `review_fixes`) go through the `validationGate` after the subagent
+ * returns. A subagent that claims `ready: true` without `validation_run:
+ * true` + non-empty `validation_evidence` is rejected with a precise
+ * reason so the orchestrator re-spawns the developer instead of editing
+ * the artifact. See `gates/validation.ts` for the full contract.
  */
 
 import { execSync } from "node:child_process";
 import { readArtifact } from "./artifacts.js";
 import { resolveConfig } from "./config.js";
 import { resolveScope, applyConditional, shouldSkip, type ScopeFlags } from "./scope.js";
+import { checkArtifact as validationCheckArtifact, validationGate } from "../gates/validation.js";
 import type { Profile, StageDef, TeamState } from "./types.js";
 
 export interface StageContext {
@@ -248,12 +256,15 @@ async function runSingle(stage: StageDef, ctx: StageContext, produces: string[])
   ctx.log(`  single: ${agent} (role=${role})`);
   const result = await ctx.task.call({ agent, task });
 
-  return {
-    stageId: stage.id,
-    status: result.exitCode === 0 ? "done" : "failed",
-    note: result.error ?? `${agent} returned exit ${result.exitCode}`,
-    artifacts: produces,
-  };
+  if (result.exitCode !== 0) {
+    return {
+      stageId: stage.id,
+      status: "failed",
+      note: result.error ?? `${agent} returned exit ${result.exitCode}`,
+      artifacts: produces,
+    };
+  }
+  return validateProduced(stage, ctx, produces, `${agent} returned exit 0`);
 }
 
 async function runConsilium(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
@@ -275,12 +286,20 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
   });
 
   const failed = results.filter((r) => r.exitCode !== 0);
-  return {
-    stageId: stage.id,
-    status: failed.length === 0 ? "done" : "failed",
-    note: failed.length === 0 ? `${tasks.length} agents in parallel` : `${failed.length}/${tasks.length} failed`,
-    artifacts: produces,
-  };
+  if (failed.length > 0) {
+    return {
+      stageId: stage.id,
+      status: "failed",
+      note: `${failed.length}/${tasks.length} failed`,
+      artifacts: produces,
+    };
+  }
+  return validateProduced(
+    stage,
+    ctx,
+    produces,
+    `${tasks.length} agents in parallel`,
+  );
 }
 
 async function runBash(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
@@ -299,6 +318,59 @@ async function runBash(stage: StageDef, ctx: StageContext, produces: string[]): 
   }
 }
 
+/**
+ * Inspect produced artifacts for the stage and run the validation gate
+ * when the stage is in the validation-required list. Returns `done` when
+ * the gate passes or when the stage is not in the list; `failed` with the
+ * gate's reason otherwise.
+ *
+ * The gate is what prevents the failure mode from session 019fbd62:
+ * a subagent that returns `ready: true, validation_run: false` is
+ * rejected with a clear, actionable reason that the orchestrator can
+ * read and re-spawn with.
+ */
+function validateProduced(
+  stage: StageDef,
+  ctx: StageContext,
+  produces: string[],
+  successNote: string,
+): StageOutcome {
+  // The gate is keyed on the *produces* list, not the stage id, so a
+  // test or a custom profile that reuses the "implementation" id for a
+  // non-code stage (no produces) is not penalised. The semantic
+  // invariant is: a stage that produces a code-bearing artifact
+  // (`implementation` or `review_fixes`) MUST include validation
+  // evidence; everything else is unconstrained.
+  const validatedIds = new Set(["implementation", "review_fixes"]);
+  const gated = produces.filter((p) => validatedIds.has(p));
+  if (gated.length === 0) {
+    return { stageId: stage.id, status: "done", note: successNote, artifacts: produces };
+  }
+  for (const id of gated) {
+    const data = readArtifact(ctx.artifactsDir, id);
+    if (!data) {
+      return {
+        stageId: stage.id,
+        status: "failed",
+        note: `produced artifact "${id}.json" not found at ${ctx.artifactsDir}/${id}.json — subagent claimed done without writing its artifact. Re-spawn.`,
+        artifacts: produces,
+      };
+    }
+    const result = validationCheckArtifact(id, data as Record<string, unknown>);
+    if (!result.ok) {
+      ctx.log(`  validation: REJECTED for ${id} — ${result.reason}`);
+      return {
+        stageId: stage.id,
+        status: "failed",
+        note: result.reason,
+        artifacts: produces,
+      };
+    }
+  }
+  ctx.log(`  validation: PASSED for ${stage.id}`);
+  return { stageId: stage.id, status: "done", note: successNote, artifacts: produces };
+}
+
 function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string): string {
   const consumes = stage.consumes ?? [];
   const reads = consumes
@@ -310,6 +382,9 @@ function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string): str
 
   const readsBlock = reads.length > 0 ? `\n\n## Reads from prior stages\n${reads.join("\n\n")}` : "";
   const produces = Array.isArray(stage.produces) ? stage.produces.join(", ") : stage.produces ?? "(none)";
+  const roleHint = isOrchestratorRole(role)
+    ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
+    : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
   return `## Stage: ${stage.id} — ${stage.title}
 ${stage.description ?? ""}
 
@@ -317,7 +392,7 @@ Branch: ${ctx.state.branch}
 Classification: ${ctx.state.classification.type}/${ctx.state.classification.complexity} (workflow=${ctx.state.classification.workflow})
 Workflow role: ${role}
 
-Follow the responsibility and perspective of this workflow role. For named variants such as architect_minimal, architect_clean, and architect_pragmatic, make that variant the explicit design focus.
+${roleHint}
 
 ### Task
 ${ctx.state.task}
@@ -328,8 +403,17 @@ Execute this stage. Write your typed artifact to .work-state/artifacts/<id>.json
 Produces: ${produces}${readsBlock}
 
 ### Rule
-You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself.
+${roleHint}
 `;
+}
+
+function isOrchestratorRole(role: string): boolean {
+  // Orchestrator roles are the ones the engine marks as "inline" — they
+  // are read-only dispatchers. The agent frontmatter for these roles
+  // (`coordinator`, `coordinator-yolo`, `discovery`) already frames them
+  // this way, but we duplicate the hint at the prompt level so a
+  // sub-spawned agent cannot drift into code edits.
+  return role === "coordinator" || role === "coordinator-yolo" || role === "discovery";
 }
 
 function expandRole(role: string, ctx: StageContext): string {
@@ -385,3 +469,6 @@ async function runLoop(stage: StageDef, ctx: StageContext): Promise<StageOutcome
   }
   return outcomes;
 }
+
+// Re-export so callers (tests, /pulse) can read the gate cheaply.
+export { validationGate };
