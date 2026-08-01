@@ -110,6 +110,7 @@ export function buildPrompt(envelope: ParsedEnvelope, cwd: string): string {
 		`- Complexity: ${classification.complexity}`,
 		`- Confidence: ${classification.confidence}`,
 		`- Workflow: \`${workflow}\``,
+		`- Workflow profile: \`packages/core/workflows/${workflow}.json\` (read this file for the stage list, gates, checkpoints, produces/consumes)`,
 		"",
 		"### Role mapping (from .omp/team.config.json)",
 		"| Role | Agent |",
