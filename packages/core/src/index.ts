@@ -3,7 +3,8 @@
  *
  * Workflow engine: 7 slash commands, 4 event handlers, 8 declarative
  * JSON profiles, typed artifact schemas, state machine, role/scope
- * resolution, DoD lifecycle. No agents, no skills — bundles ship those.
+ * resolution, DoD lifecycle, plus runtime observability (event log +
+ * rollup). No agents, no skills — bundles ship those.
  *
  * Example minimal bundle:
  *
@@ -21,6 +22,7 @@ import { classificationGate } from "./gates/classification.js";
 import { monotonicGate } from "./gates/monotonic.js";
 import { dodBackstop } from "./gates/dod-backstop.js";
 import { safetyGuard } from "./gates/safety.js";
+import { registerObservabilityHooks } from "./observability/index.js";
 import type { RoleConfig } from "./engine/types.js";
 
 export interface RegisterOptions {
@@ -31,6 +33,11 @@ export interface RegisterOptions {
   flags?: RoleConfig["flags"];
   designSystem?: string | null;
   commands?: Array<CommandId>;
+  /**
+   * Telemetry opt-in. Default: true (always on). Set to `false` to disable
+   * the recorder for bundles that don't want per-session event logs.
+   */
+  observability?: boolean;
 }
 
 export type CommandId =
@@ -77,6 +84,7 @@ export const defaultFullstackFlags: RoleConfig["flags"] = {
  * Extension-side responsibilities:
  * - Register gates (classification, monotonic, dod-backstop, safety).
  * - Write runtime config (roles, scope, flags) for custom-TS commands.
+ * - Register observability hooks (event log + rollup in `.work-state/features/<slug>/observability/`).
  *
  * Slash commands are NOT registered here. Since OMP 17.x, the `task` tool
  * lives on the main agent only — `ExtensionCommandContext` exposes no
@@ -110,6 +118,12 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 		const c = ctx as { cwd: string };
 		return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
 	});
+
+	// ── Observability ────────────────────────────────────────────────────────
+	// Wire telemetry hooks AFTER gates so a blocked agent_start still emits
+	// the event (operators want to see *why* the gate fired). The recorder
+	// is best-effort; never throws.
+	registerObservabilityHooks(pi, { enabled: opts.observability });
 }
 
 function writeRuntimeConfig(opts: RegisterOptions): void {
@@ -198,6 +212,16 @@ export type {
 	DoD,
 	DoDItem,
 } from "./engine/types.js";
+export {
+	EventRecorder,
+	rollupFromEvents,
+	readObservabilityPointer,
+	extractSkills,
+	type ObservabilityEvent,
+	type ObservabilityPointer,
+	type ObservabilityRollup,
+	type EventKind,
+} from "./observability/index.js";
 
 /**
  * Marker exported so custom-TS commands can detect that the engine was
@@ -205,4 +229,4 @@ export type {
  * a derivative that calls `registerTeamWorkflow`). Used by the bundled
  * commands to short-circuit when no engine is present.
  */
-export const CORE_ENGINE_MARKER = "omp-workflows-core/0.6.0";
+export const CORE_ENGINE_MARKER = "omp-workflows-core/0.7.0";

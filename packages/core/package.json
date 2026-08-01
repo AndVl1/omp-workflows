@@ -1,7 +1,7 @@
 {
   "name": "@andvl1/omp-workflows-core",
-	"version": "0.6.0",
-  "description": "Workflow engine + gates + custom-TS command helpers for omp. No agents, no skills — dependency-free runtime core.",
+	"version": "0.7.0",
+	"description": "Workflow engine + gates + custom-TS command helpers + runtime observability for omp. No agents, no skills — bundles ship those.",
   "type": "module",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -23,7 +23,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --import tsx test/*.test.ts"
+    "test": "node --test --import tsx 'test/**/*.test.ts'"
   },
   "peerDependencies": {
     "@oh-my-pi/pi-coding-agent": "*"

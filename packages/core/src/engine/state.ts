@@ -23,6 +23,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { readObservabilityPointer } from "../observability/recorder.js";
 import type { PauseKind, StageStatus, TeamState } from "./types.js";
 
 const WORK_STATE_DIR = ".work-state";
@@ -107,6 +108,17 @@ export function writeState(
   mkdirSync(artifactsDir, { recursive: true });
 
   const stamped: TeamState = { ...state, updated_at: new Date().toISOString() };
+  // Embed the observability pointer (best-effort: a missing event log is
+  // fine for pre-observability features). The recorder file lives under
+  // `<featureDir>/observability/events.jsonl`; we read it synchronously
+  // here because `writeState` is itself sync and the file is bounded by
+  // session length.
+  const obsPointer = readObservabilityPointerSafe(cwd, featureSlug);
+  if (obsPointer) {
+    stamped.observability = obsPointer;
+  } else {
+    delete stamped.observability;
+  }
   writeFileSync(statePath, JSON.stringify(stamped, null, 2) + "\n", "utf8");
   writeStateMd(stateDir, stamped);
 
@@ -115,6 +127,14 @@ export function writeState(
   }
 
   return { statePath, artifactsDir };
+}
+
+function readObservabilityPointerSafe(cwd: string, featureSlug: string) {
+  try {
+    return readObservabilityPointer(cwd, featureSlug);
+  } catch {
+    return null;
+  }
 }
 
 export function writeStateMd(stateDir: string, state: TeamState): void {
@@ -144,8 +164,35 @@ export function writeStateMd(stateDir: string, state: TeamState): void {
   lines.push(state.branch);
   lines.push("");
   lines.push("## Last update");
-  lines.push(state.updated_at);
+  lines.push(`- ${state.updated_at}`);
   lines.push("");
+  if (state.observability) {
+    const r = state.observability.rollup;
+    lines.push("## Observability");
+    lines.push(`- events: ${state.observability.eventsPath} (last id: ${state.observability.lastEventId || "none"})`);
+    lines.push(`- agent invocations: ${r.agentInvocations}`);
+    const subagentEntries = Object.entries(r.subagents).sort((a, b) => b[1] - a[1]);
+    if (subagentEntries.length > 0) {
+      lines.push("- subagents:");
+      for (const [name, count] of subagentEntries) {
+        lines.push(`  - ${name}: ${count}`);
+      }
+    }
+    const skillEntries = Object.entries(r.skills).sort((a, b) => b[1] - a[1]);
+    if (skillEntries.length > 0) {
+      lines.push("- skills:");
+      for (const [name, count] of skillEntries) {
+        lines.push(`  - ${name}: ${count}`);
+      }
+    }
+    if (r.totalToolCalls > 0) {
+      lines.push(`- tool calls: ${r.totalToolCalls} (errors: ${r.totalToolErrors})`);
+    }
+    if (r.durationMs > 0) {
+      lines.push(`- duration: ${r.durationMs}ms (${r.firstEventAt} → ${r.lastEventAt})`);
+    }
+    lines.push("");
+  }
 
   writeFileSync(join(stateDir, STATE_MD), lines.join("\n"), "utf8");
 }

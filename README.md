@@ -248,6 +248,66 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
+## Observability (v0.7.0+)
+
+When the engine is wired in via `registerTeamWorkflow`, it subscribes to seven OMP extension events
+(`before_agent_start`, `agent_start`, `agent_end`, `tool_call`, `tool_result`,
+`session_start`, `session_stop`) and writes a per-feature append-only event log
+to `.work-state/features/<slug>/observability/events.jsonl`. A rollup
+is computed from the log and embedded in `TeamState.observability` on
+every `writeState`.
+
+The rollup is mirrored in `team-state.md` under a new `## Observability` section:
+
+```markdown
+## Observability
+- events: observability/events.jsonl (last id: evt-l8v3kf72-1b)
+- agent invocations: 4
+- subagents:
+  - developer-go: 1
+  - code-reviewer: 1
+  - qa: 1
+- skills:
+  - ast-index: 3
+  - omp-workflows: 2
+- tool calls: 47 (errors: 2)
+- duration: 1842000ms (2026-08-01T13:00:00Z → 2026-08-01T13:30:42Z)
+```
+
+This is the source of truth for:
+- **Which subagents ran** (and how long their parent calls blocked on the
+  result) — without parsing the OMP session jsonl.
+- **Which skills were active** during each agent loop — scanned from the
+  system prompt via `skill://<name>` URIs.
+- **Tool-level failure rates** — useful for catching a subagent that emits
+  broken code (compile errors surface as `tool_result.isError`).
+
+Disable per-bundle via `registerTeamWorkflow(pi, { observability: false })`.
+Pre-observability features yield an absent `TeamState.observability` field
+(no migration needed).
+
+## Migration from `claude-plugin`
+</input>
+
+```typescript
+// your-package/src/index.ts
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { registerTeamWorkflow } from "@andvl1/omp-workflows-core";
+
+const MY_ROLES = {
+  architect: "my-architect",
+  backend: "my-go-backend",
+  tester: "my-qa",
+};
+
+export default function (pi: ExtensionAPI) {
+  registerTeamWorkflow(pi, {
+    label: "my-team",
+    roles: MY_ROLES,
+  });
+}
+```
+
 ## Migration from `claude-plugin`
 
 Same data (JSON profiles, typed artifacts, agent names, skill names) — same `.work-state/` files. The interpretive prose (`commands/team.md`, 830 lines) is now TypeScript in `core/src/`. The bash hooks (`validate-state.sh`, `dod-gate.sh`, `safety-guard.sh`) are now event handlers in `core/src/gates/`. Documented in `vibe-report/omp-workflows-migration-2026-07-31.md`.

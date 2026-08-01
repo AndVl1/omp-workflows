@@ -97,6 +97,13 @@ export interface TeamState {
   artifacts: Record<string, string>;
   pause: { kind: PauseKind; reason: string };
   updated_at: string;
+  /**
+   * Observability pointer. Absent on features created before telemetry
+   * landed; readers should treat absence as "no telemetry available"
+   * rather than an error. The engine writes this on every `writeState`
+   * by re-reading the jsonl event log.
+   */
+  observability?: import("../observability/events.js").ObservabilityPointer;
 }
 
 export interface RoleConfig {
