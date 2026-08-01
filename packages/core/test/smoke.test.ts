@@ -61,24 +61,35 @@ test("core: defaultFullstackRoles has 16 slots (15 dev + 3 architect variants)",
   assert.equal(defaultFullstackRoles["mobile"], "developer-mobile");
 });
 
-test("core: registerTeamWorkflow registers gates + commands", () => {
-  const calls: Array<{ kind: string; key: string }> = [];
-  const fakePi = {
-    setLabel: (label: string) => { calls.push({ kind: "setLabel", key: label }); },
-    on: (event: string) => { calls.push({ kind: "on", key: event }); return undefined; },
-    registerCommand: (name: string) => { calls.push({ kind: "registerCommand", key: name }); },
-  };
-  registerTeamWorkflow(fakePi as unknown as Parameters<typeof registerTeamWorkflow>[0], {
-    label: "smoke-test",
-    roles: defaultFullstackRoles,
-  });
+test("core: registerTeamWorkflow registers gates but NOT commands", () => {
+	const calls: Array<{ kind: string; key: string }> = [];
+	const fakePi = {
+		setLabel: (label: string) => {
+			calls.push({ kind: "setLabel", key: label });
+		},
+		on: (event: string) => {
+			calls.push({ kind: "on", key: event });
+			return undefined;
+		},
+		registerCommand: (name: string) => {
+			calls.push({ kind: "registerCommand", key: name });
+		},
+	};
+	registerTeamWorkflow(fakePi as unknown as Parameters<typeof registerTeamWorkflow>[0], {
+		label: "smoke-test",
+		roles: defaultFullstackRoles,
+	});
 
-  assert.ok(calls.some((c) => c.kind === "on" && c.key === "before_agent_start"));
-  assert.ok(calls.some((c) => c.kind === "on" && c.key === "session_stop"));
-  assert.ok(calls.some((c) => c.kind === "on" && c.key === "tool_call"));
-  for (const cmd of ["team", "team-next", "team-yolo", "pulse", "init-team", "interview", "coordinator-stats"]) {
-    assert.ok(calls.some((c) => c.kind === "registerCommand" && c.key === cmd), `missing ${cmd}`);
-  }
+	assert.ok(calls.some((c) => c.kind === "on" && c.key === "before_agent_start"));
+	assert.ok(calls.some((c) => c.kind === "on" && c.key === "session_stop"));
+	assert.ok(calls.some((c) => c.kind === "on" && c.key === "tool_call"));
+	// Slash commands now ship as OMP custom-TS commands in the bundle;
+	// the extension must not call registerCommand for any of them.
+	assert.equal(
+		calls.filter((c) => c.kind === "registerCommand").length,
+		0,
+		"extension must not register slash commands",
+	);
 });
 test("core: workflow dispatch leaves model selection to OMP", async () => {
   const calls: Array<{ agent: string; task: string }> = [];
@@ -225,17 +236,25 @@ test("core: consilium preserves role variants without pinning models", async () 
 });
 
 
-test("core: registerTeamWorkflow respects commands subset", () => {
-  const calls: string[] = [];
-  const fakePi = {
-    setLabel: () => undefined,
-    on: () => undefined,
-    registerCommand: (name: string) => { calls.push(name); },
-  };
-  registerTeamWorkflow(fakePi as unknown as Parameters<typeof registerTeamWorkflow>[0], {
-    commands: ["team", "pulse"],
-  });
-  assert.deepEqual(calls.sort(), ["pulse", "team"]);
+test("core: registerTeamWorkflow accepts commands subset (legacy option, no-op)", () => {
+	const calls: string[] = [];
+	const fakePi = {
+		setLabel: () => undefined,
+		on: () => undefined,
+		registerCommand: (name: string) => {
+			calls.push(name);
+		},
+	};
+	// The `commands:` option is preserved for backward compatibility with
+	// bundles that pre-date v0.4.0. It no longer drives registration because
+	// slash commands ship as OMP custom-TS commands in the bundle; the
+	// extension only registers gates.
+	assert.doesNotThrow(() =>
+		registerTeamWorkflow(fakePi as unknown as Parameters<typeof registerTeamWorkflow>[0], {
+			commands: ["team", "pulse"],
+		}),
+	);
+	assert.equal(calls.length, 0, "extension must not register slash commands");
 });
 
 test("fullstack: bundle imports core and registers engine", async () => {

@@ -2,19 +2,50 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.4.0] - 2026-08-01
+
+### Added
+
+- **OMP custom-TS slash commands** shipped from the fullstack bundle:
+  `/team`, `/pulse`, `/team-next`, `/team-yolo`, `/init-team`, `/interview`,
+  `/coordinator-stats`. Each lives in `packages/fullstack/commands/<name>/index.ts`
+  and is loaded by OMP from `.omp/commands/<name>/index.ts` after install.
+- `copy-commands.mjs` (also exposed as the `omp-workflows-copy-commands`
+  binary) — copies the bundled commands into `.omp/commands/` of the
+  consuming project. Run once after install.
+- `createTaskCaller(tool: TaskToolLike)` exported from
+  `@andvl1/omp-workflows-core` — wraps the real OMP `TaskTool`
+  (`@oh-my-pi/pi-coding-agent/task`) and exposes the `call`/`batch` API
+  the engine consumes. Tests cover the wire contract.
+- Test suite: 15 core + 5 fullstack tests (was 11); new coverage for
+  `createTaskCaller` and the `/team` command envelope.
+
+### Changed
+
+- **Breaking**: `registerTeamWorkflow(pi, opts)` no longer calls
+  `pi.registerCommand` for any of the 7 slash commands. The extension
+  side only registers gates (`before_agent_start`, `session_stop`,
+  `tool_call`) and writes runtime config. Slash commands ship as OMP
+  custom-TS commands.
+- `TaskCaller` interface now mirrors the real OMP `TaskTool` wire shape:
+  `call({ agent, task, name?, effort? })` and `batch({ context, tasks[] })`.
+  Old in-house `TaskCaller` shape is gone.
+- `CORE_ENGINE_MARKER` exported for downstream bundles to detect that
+  the engine was wired in.
+- `tasks` enumerated in `packages/fullstack/package.json#files` so the
+  commands and `copy-commands.mjs` script are published to npm.
+
+### Migration notes
+
+- Run `npm run --prefix node_modules/@andvl1/omp-workflows-fullstack copy-commands`
+  (or `npx omp-workflows-copy-commands`) after install to bootstrap the
+  slash commands into `.omp/commands/`. Without this step, the extension
+  still wires gates, but the slash commands are missing.
+- `commands:` option on `registerTeamWorkflow` is preserved for backward
+  compatibility but is now a no-op (the extension doesn't register
+  commands anyway). Remove it from your bundle config.
+
 ## [0.3.1] - 2026-08-01
-
-### Fixed
-
-- `/team` no longer crashes with `undefined is not an object (evaluating 'ctx.task.batch')`.
-  Extension commands in OMP do not expose a subagent-dispatch affordance; the
-  `callTask` API surface was non-existent. `/team` is now an envelope-recording
-  stub that returns the task, autonomous flag, branch, and `issue=#N` for the
-  main OMP agent to drive through its own `task` tool. Workflow re-implementation
-  via OMP custom-TS commands is tracked in
-  `.work-state/plans/omp-workflow-rewrite.md`.
-
-
 ## [0.3.0] - 2026-08-01
 
 ### Added

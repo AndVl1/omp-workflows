@@ -108,7 +108,7 @@ omp-workflows-monorepo/
 │   │   ├── src/
 │   │   │   ├── engine/       # state, profile, stage, classify, scope, config, dod
 │   │   │   ├── gates/        # classification, monotonic, dod-backstop, safety
-│   │   │   ├── commands/     # team, pulse, team-next, team-yolo, init-team, ...
+│   │   │   ├── commands/     # team.ts (legacy envelope), shortcuts.ts
 │   │   │   ├── runtime-config.ts
 │   │   │   └── index.ts      # public API: registerTeamWorkflow(pi, opts)
 │   │   ├── workflows/        # 8 declarative JSON profiles + schemas
@@ -117,6 +117,15 @@ omp-workflows-monorepo/
 │   └── fullstack/            # @andvl1/omp-workflows-fullstack
 │       ├── src/
 │       │   └── index.ts      # default export: registerTeamWorkflow(pi, defaultFullstackRoles, ...)
+│       ├── commands/         # 7 OMP custom-TS slash commands (team, pulse, ...)
+│       │   ├── team/         # orchestrates /team: classify → resolve → return prompt
+│       │   ├── pulse/        # read-only project digest
+│       │   ├── team-next/    # pop next queued task
+│       │   ├── team-yolo/    # [AUTONOMOUS] wrapper
+│       │   ├── init-team/    # write .omp/team.config.json
+│       │   ├── interview/    # analyst-driven clarification
+│       │   └── coordinator-stats/  # profile-usage rollup
+│       ├── scripts/          # copy-commands.mjs — installs commands into .omp/commands/
 │       ├── agents/           # 17 agent markdown files
 │       ├── skills/           # 31 domain skills
 │       └── package.json
@@ -124,6 +133,28 @@ omp-workflows-monorepo/
 │   └── release.yml           # tag-driven publish to GitHub Packages
 └── vibe-report/              # migration notes, walk reports
 ```
+
+### How slash commands ship (v0.4.0+)
+
+OMP 17.x exposes the `task` tool only to the main agent — neither
+extension commands nor custom-TS commands can drive subagent dispatch
+directly. So as of v0.4.0, the workflow engine splits cleanly:
+
+- **Extension** (`packages/fullstack/src/index.ts`) registers gates and
+  writes the runtime config. It does **not** register slash commands.
+- **Custom-TS commands** (`packages/fullstack/commands/<name>/index.ts`)
+  ship as OMP custom-TS commands. Each parses the envelope, reads
+  `.omp/team.config.json`, and returns a prompt the main agent runs
+  through its own `task` tool.
+- **`copy-commands.mjs`** (run after install) copies the bundled commands
+  into `<project>/.omp/commands/` so OMP can discover them.
+
+Custom-TS commands receive `HookCommandContext` (ui, cwd, sessionManager,
+modelRegistry) — they can NOT call `task` directly. They either:
+
+1. Return a string prompt (the main agent runs the workflow through its own `task` tool), or
+2. Inspect filesystem state and return a digest (the LLM or user acts on it).
+
 
 ## Usage
 
@@ -134,8 +165,6 @@ omp-workflows-monorepo/
 /pulse
 /init-team
 /team-yolo
-```
-
 ## How it works
 
 `/team <task>` walks:
@@ -154,7 +183,34 @@ omp-workflows-monorepo/
 7. **Loop** if `loop: { back_to, until, max_iterations }` is set.
 8. **Mirror** progress into `team-state.md`.
 
-Gates run as `before_agent_start` (classification + monotonic), `session_stop` (DoD backstop), and `tool_call` (safety). Workflow data is the same JSON files as the legacy `claude-plugin` (v3.0.x). The interpreter moves from markdown prose into TypeScript.
+Concretely, in v0.4.0+:
+
+- The `/team` custom-TS command parses the envelope and returns a prompt
+  to the main agent with the resolved `Workflow:` name and the role
+  mapping table.
+- The main agent then runs the `task` tool with the resolved agent for
+  each stage. The engine is the *grammar* of the workflow; the main
+  agent owns the *runtime*.
+
+Gates run as `before_agent_start` (classification + monotonic), `session_stop`
+(DoD backstop), and `tool_call` (safety). Workflow data is the same JSON
+files as the legacy `claude-plugin` (v3.0.x). The interpreter moves from
+markdown prose into TypeScript.
+
+### Bootstrap custom-TS commands into your project
+
+```bash
+# After `npm install @andvl1/omp-workflows-fullstack`:
+npm run --prefix node_modules/@andvl1/omp-workflows-fullstack copy-commands
+# Or:
+npx omp-workflows-copy-commands
+```
+
+Either command copies the 7 slash commands into `.omp/commands/` of the
+current directory. OMP will discover them on the next session start.
+
+If you don't run this, the extension still wires gates/roles — only the
+slash commands are missing.
 
 ## Release
 

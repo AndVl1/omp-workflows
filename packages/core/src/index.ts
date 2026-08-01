@@ -17,16 +17,6 @@
  */
 
 import type { ExtensionAPI, BeforeAgentStartEvent, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
-import { teamCommand } from "./commands/team.js";
-import {
-  teamNextCommand,
-  teamYoloCommand,
-  pulseCommand,
-  initTeamCommand,
-  interviewCommand,
-  coordinatorStatsCommand,
-} from "./commands/shortcuts.js";
-import type { CommandContext, CommandHandler } from "./commands/types.js";
 import { classificationGate } from "./gates/classification.js";
 import { monotonicGate } from "./gates/monotonic.js";
 import { dodBackstop } from "./gates/dod-backstop.js";
@@ -83,95 +73,43 @@ export const defaultFullstackFlags: RoleConfig["flags"] = {
  * Wire the engine into omp's ExtensionAPI. Bundles call this from their
  * default export. The engine consults `.omp/team.config.json` (or the
  * `roles`/`scopeMap` overrides) at runtime to resolve workflow roles to agents.
+ *
+ * Extension-side responsibilities:
+ * - Register gates (classification, monotonic, dod-backstop, safety).
+ * - Write runtime config (roles, scope, flags) for custom-TS commands.
+ *
+ * Slash commands are NOT registered here. Since OMP 17.x, the `task` tool
+ * lives on the main agent only — `ExtensionCommandContext` exposes no
+ * subagent-dispatch affordance. Workflow commands ship as OMP custom-TS
+ * commands in `packages/fullstack/commands/<name>/index.ts`; they receive
+ * a `HookCommandContext` that can read `cwd`, `ui`, `sessionManager`, and
+ * `modelRegistry`, and rely on `ctx.sendUserMessage(prompt)` to hand the
+ * profile-driven workflow to the main agent's own `task` tool.
  */
 export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {}): void {
-  const label = opts.label ?? "omp-workflows";
-  pi.setLabel(label);
+	const label = opts.label ?? "omp-workflows";
+	pi.setLabel(label);
 
-  writeRuntimeConfig(opts);
+	writeRuntimeConfig(opts);
 
-  // ── Gates ────────────────────────────────────────────────────────────────
-  // @ts-expect-error -- ExtensionAPI.on(string, handler) overload is enough at runtime; we type the handler explicitly.
-  pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string };
-    const r1 = classificationGate(event as unknown as Parameters<typeof classificationGate>[0], c);
-    if (r1?.block) return r1;
-    const r2 = monotonicGate(event, c);
-    if (r2?.block) return r2;
-  });
-  pi.on("session_stop", (event: SessionStopEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string };
-    return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], c);
-  });
+	// ── Gates ────────────────────────────────────────────────────────────────
+	// @ts-expect-error -- ExtensionAPI.on(string, handler) overload is enough at runtime; we type the handler explicitly.
+	pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx: unknown) => {
+		const c = ctx as { cwd: string };
+		const r1 = classificationGate(event as unknown as Parameters<typeof classificationGate>[0], c);
+		if (r1?.block) return r1;
+		const r2 = monotonicGate(event, c);
+		if (r2?.block) return r2;
+	});
+	pi.on("session_stop", (event: SessionStopEvent, ctx: unknown) => {
+		const c = ctx as { cwd: string };
+		return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], c);
+	});
 
-  pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string };
-    return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
-  });
-  // ── Slash commands ───────────────────────────────────────────────────────
-  const enabled = new Set<CommandId>(
-    opts.commands ?? ["team", "team-next", "team-yolo", "pulse", "init-team", "interview", "coordinator-stats"],
-  );
-  // OMP extension commands receive an ExtensionContext that intentionally omits
-  // `ctx.task` — subagent dispatch is owned by the main OMP agent via its `task`
-  // tool. Workflow commands therefore return a user-visible prompt string that
-  // drives the main agent to invoke the right specialist. `ctx.ui` and `ctx.cwd`
-  // are the only OMP-provided affordances commands can use directly.
-  interface CommandRuntime {
-    args: string;
-    cwd: string;
-    ui: { notify: (msg: string, kind?: string) => void };
-  }
-  const wrap = (fn: (input: CommandRuntime) => Promise<string> | string) =>
-    async (args: string, ctx: unknown) => {
-      const c = ctx as unknown as CommandRuntime;
-      const result = await fn({ args, cwd: c.cwd, ui: c.ui });
-      if (typeof result === "string" && result.length > 0) {
-        c.ui.notify(result, "info");
-      }
-    };
-  if (enabled.has("team")) {
-    pi.registerCommand("team", {
-      description: "Run a workflow via the profile-driven /team interpreter. /team <task>.",
-      handler: wrap(teamCommand),
-    });
-  }
-  if (enabled.has("team-next")) {
-    pi.registerCommand("team-next", {
-      description: "Run the next task from the queue.",
-      handler: wrap(teamNextCommand),
-    });
-  }
-  if (enabled.has("team-yolo")) {
-    pi.registerCommand("team-yolo", {
-      description: "Autonomous yolo loop: one task per tick through /team.",
-      handler: wrap(teamYoloCommand),
-    });
-  }
-  if (enabled.has("pulse")) {
-    pi.registerCommand("pulse", {
-      description: "Read-only project steward: digest + next-action menu.",
-      handler: wrap(pulseCommand),
-    });
-  }
-  if (enabled.has("init-team")) {
-    pi.registerCommand("init-team", {
-      description: "Detect stacks and emit .omp/team.config.json.",
-      handler: wrap(initTeamCommand),
-    });
-  }
-  if (enabled.has("interview")) {
-    pi.registerCommand("interview", {
-      description: "Deep interview to clarify ideas before implementation.",
-      handler: wrap(interviewCommand),
-    });
-  }
-  if (enabled.has("coordinator-stats")) {
-    pi.registerCommand("coordinator-stats", {
-      description: "Rollup profile-usage and propose new profiles.",
-      handler: wrap(coordinatorStatsCommand),
-    });
-  }
+	pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
+		const c = ctx as { cwd: string };
+		return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
+	});
 }
 
 function writeRuntimeConfig(opts: RegisterOptions): void {
@@ -192,48 +130,79 @@ function writeRuntimeConfig(opts: RegisterOptions): void {
     // best-effort
   }
 }
-
 export { teamCommand } from "./commands/team.js";
+export {
+	teamNextCommand,
+	teamYoloCommand,
+	pulseCommand,
+	initTeamCommand,
+	interviewCommand,
+	coordinatorStatsCommand,
+} from "./commands/shortcuts.js";
 export type { CommandContext } from "./commands/types.js";
 export {
-  loadAllProfiles,
-  loadProfile,
-  resolveWorkflow,
-  selectProfile,
+	loadAllProfiles,
+	loadProfile,
+	resolveWorkflow,
+	selectProfile,
 } from "./engine/profile.js";
 export { resolveConfig } from "./engine/config.js";
 export { resolveScope, applyConditional, shouldSkip } from "./engine/scope.js";
 export {
-  writeState,
-  setStageStatus,
-  setPause,
-  checkMonotonic,
-  resolveState,
+	writeState,
+	setStageStatus,
+	setPause,
+	checkMonotonic,
+	resolveState,
 } from "./engine/state.js";
 export {
-  writeArtifact,
-  readArtifact,
+	writeArtifact,
+	readArtifact,
 } from "./engine/artifacts.js";
 export {
-  appendDoDItem,
-  closeDoDItem,
-  readDoD,
-  isDoDComplete,
-  isRootCauseDocumented,
+	appendDoDItem,
+	closeDoDItem,
+	readDoD,
+	isDoDComplete,
+	isRootCauseDocumented,
 } from "./engine/dod.js";
+export {
+	run,
+	type RunOptions,
+	type RunResult,
+} from "./engine/run.js";
+export {
+	walkProfile,
+	runStage,
+	createTaskCaller,
+	spawnLabel,
+	type TaskCaller,
+	type TaskResult,
+	type TaskToolLike,
+	type StageContext,
+	type StageOutcome,
+} from "./engine/stage.js";
 export type {
-  Profile,
-  StageDef,
-  StageType,
-  StageStatus,
-  PauseKind,
-  TaskType,
-  Complexity,
-  Confidence,
-  WorkflowName,
-  Classification,
-  TeamState,
-  RoleConfig,
-  DoD,
-  DoDItem,
+	Profile,
+	StageDef,
+	StageType,
+	StageStatus,
+	PauseKind,
+	TaskType,
+	Complexity,
+	Confidence,
+	WorkflowName,
+	Classification,
+	TeamState,
+	RoleConfig,
+	DoD,
+	DoDItem,
 } from "./engine/types.js";
+
+/**
+ * Marker exported so custom-TS commands can detect that the engine was
+ * wired in this package (i.e. the bundle is `omp-workflows-fullstack` or
+ * a derivative that calls `registerTeamWorkflow`). Used by the bundled
+ * commands to short-circuit when no engine is present.
+ */
+export const CORE_ENGINE_MARKER = "omp-workflows-core/0.4.0";

@@ -33,38 +33,160 @@ export interface StageContext {
   /** Resolve ${scope.dev_agent} -> string. */
   resolveDevAgent: () => string | null;
 }
+/**
+ * Minimum shape we depend on from the real OMP `TaskTool`. `TaskTool` is
+ * exported from `@oh-my-pi/pi-coding-agent/task` but the surface is
+ * intentionally not pulled into the engine module — the adapter is built at
+ * the call site (see `packages/fullstack/commands/team/index.ts`). The
+ * structural shape below is the only contract the engine depends on.
+ */
+export interface TaskToolLike {
+	execute(
+		toolCallId: string,
+		params: Record<string, unknown>,
+		signal?: AbortSignal,
+		onUpdate?: (result: unknown) => void,
+	): Promise<{ output: unknown }>;
+}
 
+/**
+ * Spawn interface the engine actually consumes. Implemented by the OMP
+ * adapter ({@link createTaskCaller}) and by test stubs. The shape mirrors the
+ * wire schema `TaskTool` populates: flat single spawn (`{ name?, agent?, task }`)
+ * and batch (`{ context, tasks[] }`) for parallel fan-out.
+ */
 export interface TaskCaller {
-  /**
-   * Spawn a single subagent. Returns when the agent yields.
-   * `task.batch` is also exposed via `batch()`.
-   */
-  call(opts: {
-    agent: string;
-    task: string;
-    effort?: "lo" | "med" | "hi";
-    isolated?: boolean;
-  }): Promise<TaskResult>;
+	/**
+	 * Spawn a single subagent. Wire shape: `{ name?, agent, task, effort? }`.
+	 */
+	call(args: {
+		agent: string;
+		task: string;
+		name?: string;
+		effort?: "lo" | "med" | "hi";
+	}): Promise<TaskResult>;
 
-  /** Spawn N agents in parallel via task.batch. */
-  batch(opts: {
-    context: string;
-    tasks: Array<{
-      name: string;
-      agent: string;
-      task: string;
-      effort?: "lo" | "med" | "hi";
-    }>;
-  }): Promise<TaskResult[]>;
+	/**
+	 * Spawn N subagents in parallel. Wire shape: `{ context, tasks[] }`. Each
+	 * item carries `{ name?, agent, task, effort? }`.
+	 */
+	batch(args: {
+		context: string;
+		tasks: Array<{
+			name?: string;
+			agent: string;
+			task: string;
+			effort?: "lo" | "med" | "hi";
+		}>;
+	}): Promise<TaskResult[]>;
 }
 
 export interface TaskResult {
-  id: string;
-  output: string;
-  artifacts: Record<string, string>;
-  exitCode: number;
-  error?: string;
+	id: string;
+	output: string;
+	artifacts: Record<string, string>;
+	exitCode: number;
+	error?: string;
 }
+
+/**
+ * Validated single-spawn result. We only promise to read five fields;
+ * anything else in the `TaskTool` output is ignored. Batch results arrive
+ * as `{ results: SingleSpawnPayload[] }` at the top level; the caller
+ * unpacks that separately.
+ */
+interface SingleSpawnPayload {
+	id?: string;
+	output?: string;
+	artifacts?: Record<string, string>;
+	exitCode?: number;
+	error?: string;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function readSingleSpawn(raw: unknown): SingleSpawnPayload {
+	if (!isObject(raw)) return {};
+	const id = typeof raw.id === "string" ? raw.id : undefined;
+	const output = typeof raw.output === "string" ? raw.output : undefined;
+	const exitCode = typeof raw.exitCode === "number" ? raw.exitCode : undefined;
+	const error = typeof raw.error === "string" ? raw.error : undefined;
+	let artifacts: Record<string, string> | undefined;
+	if (isObject(raw.artifacts) && Object.values(raw.artifacts).every((v) => typeof v === "string")) {
+		artifacts = Object.fromEntries(Object.entries(raw.artifacts)) as Record<string, string>;
+	}
+	return { id, output, artifacts, exitCode, error };
+}
+
+function extractResult(raw: { output: unknown }, newId: () => string): TaskResult {
+	if (isObject(raw.output)) {
+		const r = readSingleSpawn(raw.output);
+		return {
+			id: r.id ?? newId(),
+			output: r.output ?? JSON.stringify(raw.output),
+			artifacts: r.artifacts ?? {},
+			exitCode: r.exitCode ?? 0,
+			error: r.error,
+		};
+	}
+	return {
+		id: newId(),
+		output: typeof raw.output === "string" ? raw.output : "",
+		artifacts: {},
+		exitCode: 0,
+	};
+}
+
+/**
+ * Build a {@link TaskCaller} that delegates to a real OMP {@link TaskToolLike}.
+ * Kept in `core` so the engine can drive workflows through the native `task`
+ * tool without re-implementing wire framing, output handling, or worktree
+ * isolation. Use from a custom-TS command, an extension, or a test scaffold.
+ */
+export function createTaskCaller(tool: TaskToolLike): TaskCaller {
+	let nextId = 0;
+	const newId = (): string => `task-${Date.now().toString(36)}-${(nextId++).toString(36)}`;
+
+	return {
+		async call(args) {
+			const params: Record<string, unknown> = {
+				agent: args.agent,
+				task: args.task,
+			};
+			if (args.name) params.name = args.name;
+			if (args.effort) params.effort = args.effort;
+			const result = await tool.execute(newId(), params);
+			return extractResult(result, newId);
+		},
+		async batch(args) {
+			const params: Record<string, unknown> = {
+				context: args.context,
+				tasks: args.tasks.map((t) => {
+					const item: Record<string, unknown> = { agent: t.agent, task: t.task };
+					if (t.name) item.name = t.name;
+					if (t.effort) item.effort = t.effort;
+					return item;
+				}),
+			};
+			const result = await tool.execute(newId(), params);
+			const root = isObject(result.output) ? result.output : {};
+			const results = Array.isArray(root.results) ? root.results : [];
+			return results.map((r) => extractResult({ output: r }, newId));
+		},
+	};
+}
+
+/**
+ * Compute a stable wire name for a single subagent (used as default `name:`
+ * when the caller doesn't supply one). Mirrors OMP's `oneLineLabel` rules so
+ * the rendered spawn roster is readable.
+ */
+export function spawnLabel(role: string, stageId: string, cwd: string): string {
+	return `${stageId}-${role}`;
+}
+
 
 export interface StageOutcome {
   stageId: string;
