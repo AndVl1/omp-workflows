@@ -29,6 +29,15 @@ omp plugin install @andvl1/omp-workflows-core
 # Plain npm (works the same — npm respects the registry scoping in ~/.npmrc)
 npm install @andvl1/omp-workflows-fullstack
 
+### Slash command bootstrap — works for both install paths
+
+OMP's `discoverCustomCommands` only scans project-local `.omp/commands/<name>/index.ts`; it does **not** read the installed plugin's `node_modules` directly. The shipped slash commands must land in `<project>/.omp/commands/` for OMP to find them. Two paths cover every install mode:
+
+- **`npm install`** — the package's `postinstall` script runs `scripts/copy-commands.mjs` and force-copies the commands.
+- **`omp plugin install`** — npm's `postinstall` does *not* fire (the package lives in `~/.omp/plugins/`, outside any project's `node_modules`). The `@andvl1/omp-workflows-fullstack` extension listens for `session_start` and calls `ensureCommandsForSession` which copies anything missing — leaving your local edits untouched. The first OMP session in each project materialises the commands automatically; no manual run is needed.
+
+The `session_start` path is conservative (it never overwrites existing files), the `postinstall` path is destructive (it overwrites so reinstalls can repair drift). Both produce the same `<project>/.omp/commands/` layout.
+
 > **Использование одновременно с Claude Code-плагинами.** Этот пакет и слаг `claude-plugin` (legacy Claude Code-плагин) ставят пересекающийся набор агентов и скиллов. Если вы ставили `claude-plugin` через `claude plugin install`, в omp он подгружается через discovery-provider `claude-plugins` (то же, что `ast-index@ast-index-marketplace`, `figma@claude-plugins-official`, и т. д.). Чтобы не дублировать агентов — отключите provider в `~/.omp/agent/config.yml` одним из способов ниже.
 
 ## Отключение дублирующих плагинов
@@ -198,20 +207,16 @@ markdown prose into TypeScript.
 
 ### Bootstrap custom-TS commands into your project
 
+Bootstrapping is automatic for both install paths — see *Slash command bootstrap — works for both install paths* above. The CLI script below remains available for explicit re-sync (for example, after editing a shipped command in the source repo and wanting to refresh a downstream checkout before the next session).
+
 ```bash
-# After `npm install @andvl1/omp-workflows-fullstack`:
-npm run --prefix node_modules/@andvl1/omp-workflows-fullstack copy-commands
-# Or:
+# Force-copy from a local source checkout (e.g. the monorepo):
 npx omp-workflows-copy-commands
+# Or from a project where the package lives in node_modules:
+npm run --prefix node_modules/@andvl1/omp-workflows-fullstack copy-commands
 ```
 
-Either command copies the 7 slash commands into `.omp/commands/` of the
-current directory. OMP will discover them on the next session start.
-
-If you don't run this, the extension still wires gates/roles — only the
-slash commands are missing.
-
-## Release
+OMP discovers them on the next session start.
 
 Releases are driven by pushing a semver tag:
 
