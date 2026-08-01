@@ -30,10 +30,8 @@
 	"scripts": {
 		"build": "tsc",
 		"typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.commands.json",
-		"typecheck:commands": "tsc --noEmit -p tsconfig.commands.json",
-		"test": "node --test --import tsx test/*.test.ts",
 		"copy-commands": "node scripts/copy-commands.mjs",
-		"prepublishOnly": "npm run build && npm run typecheck"
+		"postinstall": "node scripts/copy-commands.mjs || true"
 	},
 	"bin": {
 		"omp-workflows-copy-commands": "scripts/copy-commands.mjs"

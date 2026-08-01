@@ -11,7 +11,7 @@
   "plugins": [
     {
       "name": "omp-workflows",
-      "description": "Profile-driven workflow engine for omp. /team runs a deterministic 7-phase feature pipeline, /pulse is the read-only project steward, /team-yolo is the autonomous night loop. 15 agents, 8 JSON profiles, typed DoD artifact with backstop gate.",
+      "description": "Profile-driven workflow engine for omp. /do-work runs a deterministic 7-phase feature pipeline, /pulse is the read-only project steward, /team-yolo is the autonomous night loop. /team ships as an alias for /do-work. 17 agents, 31 skills, 8 JSON profiles, typed DoD artifact with backstop gate.",
       "source": "./",
       "category": "development",
       "keywords": [

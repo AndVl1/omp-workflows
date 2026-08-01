@@ -117,14 +117,14 @@ omp-workflows-monorepo/
 │   └── fullstack/            # @andvl1/omp-workflows-fullstack
 │       ├── src/
 │       │   └── index.ts      # default export: registerTeamWorkflow(pi, defaultFullstackRoles, ...)
-│       ├── commands/         # 7 OMP custom-TS slash commands (team, pulse, ...)
-│       │   ├── team/         # orchestrates /team: classify → resolve → return prompt
-│       │   ├── pulse/        # read-only project digest
-│       │   ├── team-next/    # pop next queued task
-│       │   ├── team-yolo/    # [AUTONOMOUS] wrapper
-│       │   ├── init-team/    # write .omp/team.config.json
-│       │   ├── interview/    # analyst-driven clarification
-│       │   └── coordinator-stats/  # profile-usage rollup
+       ├── commands/         # 8 OMP custom-TS slash commands (do-work, pulse, team-next, ...)
+       │   ├── do-work/      # orchestrates /do-work: classify → resolve → return prompt
+       │   ├── team/         # thin alias for /do-work (kept for backwards compatibility)
+       │   ├── pulse/        # read-only project digest
+       │   ├── team-next/    # pop next queued task
+       │   ├── team-yolo/    # [AUTONOMOUS] wrapper
+       │   ├── init-team/    # write .omp/team.config.json
+│       └── coordinator-stats/  # profile-usage rollup
 │       ├── scripts/          # copy-commands.mjs — installs commands into .omp/commands/
 │       ├── agents/           # 17 agent markdown files
 │       ├── skills/           # 31 domain skills
@@ -158,16 +158,16 @@ modelRegistry) — they can NOT call `task` directly. They either:
 
 ## Usage
 
-```bash
-/team Add OAuth authentication with Google and GitHub
-/team Fix the 500 error on /api/users endpoint
-/team Review my auth changes
+/do-work Add OAuth authentication with Google and GitHub
+/do-work Fix the 500 error on /api/users endpoint
+/do-work Review my auth changes
+/do-work Add a small CLI flag  (works in non-git directories)
 /pulse
 /init-team
 /team-yolo
+> **Note**: `/team` is shipped as an alias for `/do-work` for muscle-memory compatibility; both commands resolve to the same workflow.
 ## How it works
-
-`/team <task>` walks:
+`/do-work <task>` walks (same as `/team`):
 
 1. **Classify** the request → `Classification = {type, complexity, confidence, workflow}`.
 2. **Resolve** the profile via the `Type × Complexity → Workflow` table.
@@ -184,8 +184,7 @@ modelRegistry) — they can NOT call `task` directly. They either:
 8. **Mirror** progress into `team-state.md`.
 
 Concretely, in v0.4.0+:
-
-- The `/team` custom-TS command parses the envelope and returns a prompt
+- The `/do-work` custom-TS command (or its `/team` alias) parses the envelope and returns a prompt
   to the main agent with the resolved `Workflow:` name and the role
   mapping table.
 - The main agent then runs the `task` tool with the resolved agent for

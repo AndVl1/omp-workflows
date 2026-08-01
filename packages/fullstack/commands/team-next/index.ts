@@ -3,7 +3,8 @@
  *
  * Reads the next entry from `.work-state/queue.json` and yields a prompt
  * that re-enters the `/team` workflow with that task. This is the
- * dispatch-side counterpart of the `coordinator` agent's queue management.
+ * Reads the next entry from `.work-state/queue.json` and yields a prompt
+ * that re-enters the `/do-work` workflow with that task. This is the
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -36,12 +37,12 @@ const factory = (_api: CustomCommandAPI): CustomCommand => ({
 		if (!cwd) return "ERROR: no cwd available.";
 		const queue = readQueue(cwd);
 		if (queue.length === 0) {
-			return "queue: empty. Use /team <description> to start a task or commit something to the queue.";
+			return "queue: empty. Use /do-work <description> to start a task or commit something to the queue.";
 		}
 		const next = queue[0];
 		if (!next) return "queue: empty.";
 		ctx.ui?.notify?.(`team-next: running '${next.title}'`, "info");
-		return `Run /team ${next.body}`;
+		return `Run /do-work ${next.body}`;
 	},
 });
 

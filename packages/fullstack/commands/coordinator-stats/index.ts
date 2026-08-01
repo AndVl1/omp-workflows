@@ -23,7 +23,7 @@ const factory = (_api: CustomCommandAPI): CustomCommand => ({
 		if (!existsSync(statsPath)) {
 			return [
 				"coordinator-stats: no profile-stats.md yet.",
-				"Run several /team invocations so the coordinator agent can record profile usage.",
+				"Run several /do-work invocations so the coordinator agent can record profile usage.",
 				"Then this command will return the rolled-up digest.",
 			].join("\n");
 		}
