@@ -70,4 +70,6 @@ export type {
   Recommendation,
   GenerateReportOptions,
   GenerateReportResult,
-} from './report.js';
+  } from './report.js';
+
+export { deferred, type Deferred } from './util.js';

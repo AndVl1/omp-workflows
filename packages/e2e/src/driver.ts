@@ -28,6 +28,7 @@ import { WebSocket } from 'ws';
 
 import type { TranscriptFrame } from './server.js';
 
+import { deferred } from './util.js';
 /* ------------------------------------------------------------------ */
 /* Small async helpers                                                 */
 /* ------------------------------------------------------------------ */
@@ -55,7 +56,7 @@ export async function waitFor(
         `waitFor timed out after ${timeoutMs}ms${opts.label !== undefined ? ` (${opts.label})` : ''}`,
       );
     }
-    const { promise: ticked, resolve: tick } = Promise.withResolvers<void>();
+    const { promise: ticked, resolve: tick } = deferred<void>();
     setTimeout(tick, intervalMs);
     await ticked;
   }
@@ -113,13 +114,12 @@ export class WsDriver implements TerminalDriver {
   async open(): Promise<void> {
     if (this.#ws !== null) return;
     const ws = new WebSocket(this.#wsUrl);
-
-    const { promise: opened, resolve: openSucceeded, reject: openFailed } = Promise.withResolvers<void>();
+    const { promise: opened, resolve: openSucceeded, reject: openFailed } = deferred<void>();
     ws.once('open', () => openSucceeded());
     ws.once('error', err => openFailed(err));
 
     // Auth ack: the server sends {t:'s', ok:true} right after upgrade.
-    const { promise: acked, resolve: ackReceived, reject: ackFailed } = Promise.withResolvers<void>();
+    const { promise: acked, resolve: ackReceived, reject: ackFailed } = deferred<void>();
     ws.once('message', raw => {
       try {
         const msg = JSON.parse(raw.toString('utf8')) as { t?: string; ok?: boolean };
@@ -132,7 +132,7 @@ export class WsDriver implements TerminalDriver {
 
     try {
       await opened;
-      const { promise: timedOut, reject: timeoutReached } = Promise.withResolvers<never>();
+      const { promise: timedOut, reject: timeoutReached } = deferred<never>();
       const timer = setTimeout(() => timeoutReached(new WaitTimeoutError('ux-e2e: ws auth ack timeout')), 5000);
       try {
         await Promise.race([acked, timedOut]);

@@ -29,6 +29,7 @@ import { AskStateTracker, TranscriptLog, waitFor, WsDriver } from './driver.js';
 import { generateReport, type ReportInput, type Verdict } from './report.js';
 import { loadScenario, type ScenarioDefinition } from './scenario.js';
 
+import { deferred } from './util.js';
 const USAGE = `ux-e2e — interactive UX E2E test framework for omp + omp-workflows
 
 Usage: ux-e2e <subcommand> [options]
@@ -322,8 +323,7 @@ async function driveForeground(session: TestSession, scenario: ScenarioDefinitio
       await session.close();
       process.exit(0);
     }
-    const { promise: ticked, resolve: tick } = Promise.withResolvers<void>();
-    setTimeout(tick, pollMs);
+    const { promise: ticked, resolve: tick } = deferred<void>();
     await ticked;
   }
 }
@@ -411,7 +411,7 @@ async function runStartDetached(args: StartArgs): Promise<number> {
       logStream.end();
       return 1;
     }
-    const { promise: ticked, resolve: tick } = Promise.withResolvers<void>();
+    const { promise: ticked, resolve: tick } = deferred<void>();
     setTimeout(tick, 250);
     await ticked;
   }
@@ -499,7 +499,7 @@ export async function runTranscript(args: TranscriptArgs): Promise<number> {
   if (args.follow) {
     let lastLen = existsSync(transcriptPath) ? readFileSync(transcriptPath, 'utf8').length : 0;
     for (;;) {
-      const { promise: ticked, resolve: tick } = Promise.withResolvers<void>();
+      const { promise: ticked, resolve: tick } = deferred<void>();
       setTimeout(tick, 500);
       await ticked;
       if (!existsSync(transcriptPath)) continue;

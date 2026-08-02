@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import type { IPty } from 'node-pty';
 import { WebSocketServer, type WebSocket as WS } from 'ws';
 
+import { deferred } from './util.js';
 /** Max inbound WS frame size (defense-in-depth; the browser never needs more). */
 export const MAX_INBOUND_WS_BYTES = 64 * 1024;
 /**
@@ -255,7 +256,7 @@ export async function killProcessTree(pid: number, opts: KillProcessTreeOptions 
   const graceMs = opts.graceMs ?? 500;
   if (typeof pid !== 'number' || pid <= 0) return;
 
-  const { promise: slept, resolve: finishSleep } = Promise.withResolvers<void>();
+  const { promise: slept, resolve: finishSleep } = deferred<void>();
   setTimeout(finishSleep, graceMs);
 
   try {
@@ -982,7 +983,7 @@ function deriveSlug(scratchDir: string): string {
 
 async function resolveOmpVersion(binary: string): Promise<string> {
   try {
-    const { promise, resolve: done, reject: fail } = Promise.withResolvers<string>();
+    const { promise, resolve: done, reject: fail } = deferred<string>();
     // stdin ignored: a fake test command must not block on --version.
     const child = spawn(binary, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 });
     let out = '';
@@ -1053,7 +1054,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_INBOUND_WS_BYTES });
   const consumed = new Set<string>();
 
-  const { promise: listening, resolve: bound, reject: bindFailed } = Promise.withResolvers<void>();
+  const { promise: listening, resolve: bound, reject: bindFailed } = deferred<void>();
   httpServer.once('error', bindFailed);
   httpServer.listen(opts.port ?? 0, host, () => bound());
   await listening;
@@ -1186,7 +1187,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     if (ptyProc !== null) {
       await killProcessTree(ptyProc.pid);
     }
-    const { promise: closed, resolve: done } = Promise.withResolvers<void>();
+    const { promise: closed, resolve: done } = deferred<void>();
     httpServer.close(() => done());
     await closed;
   };

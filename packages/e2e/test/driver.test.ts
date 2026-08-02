@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { WebSocket } from 'ws';
 
+import { deferred } from '../src/util.js';
 import { AskStateTracker, TranscriptLog, waitFor, WaitTimeoutError, WsDriver } from '../src/driver.js';
 import { startTestSession } from '../src/server.js';
 
@@ -196,9 +197,9 @@ test('WsDriver: open() closes the failed socket on auth failure', async t => {
 
   // First consume the token via a raw WS so the next WsDriver.open() is rejected.
   const first = new WebSocket(`ws://127.0.0.1:${session.port}/ws?token=sekret`);
-  const { promise: ackReceived, resolve: ackSeen } = Promise.withResolvers<void>();
+  const { promise: ackReceived, resolve: ackSeen } = deferred<void>();
   first.on('message', () => ackSeen());
-  const { promise: opened, resolve: openDone, reject: openFailed } = Promise.withResolvers<void>();
+  const { promise: opened, resolve: openDone, reject: openFailed } = deferred<void>();
   first.once('open', () => openDone());
   first.once('error', err => openFailed(err));
   await opened;

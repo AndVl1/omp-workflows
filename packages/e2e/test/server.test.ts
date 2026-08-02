@@ -13,6 +13,8 @@ import { test } from 'node:test';
 
 import { WebSocket } from 'ws';
 
+import { deferred } from '../src/util.js';
+
 import { waitFor, WaitTimeoutError } from '../src/driver.js';
 import {
   assertNoLiveSession,
@@ -37,7 +39,7 @@ function openWs(
   opts: { origin?: string } = {},
   onMessage?: (msg: ServerMsg) => void,
 ): Promise<WebSocket> {
-  const { promise, resolve, reject } = Promise.withResolvers<WebSocket>();
+  const { promise, resolve, reject } = deferred<WebSocket>();
   const ws = new WebSocket(
     `ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`,
     opts.origin !== undefined ? { origin: opts.origin } : undefined,
@@ -59,7 +61,7 @@ function openWs(
 }
 
 function wsFails(port: number, token: string, opts: { origin?: string } = {}): Promise<Error> {
-  const { promise, resolve, reject } = Promise.withResolvers<Error>();
+  const { promise, resolve, reject } = deferred<Error>();
   const ws = new WebSocket(
     `ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`,
     opts.origin !== undefined ? { origin: opts.origin } : undefined,
