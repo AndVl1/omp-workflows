@@ -44,7 +44,7 @@ Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
 | Command | Purpose |
 |---|---|
 | `bootstrap <slug> <branch>` | Create `<workdir>/omp-ux-e2e-<slug>` (default `/tmp`), `git init`, wire the plugin via `npm link` (NOT `file:` — the unpublished peer would fail with ETARGET), write `.omp/ux-e2e-overlay.json`, copy `.omp/team.config.json`, materialize custom-TS commands. `--force` re-creates. |
-| `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a **detached child that survives the parent** — the child writes its stdout/stderr directly into `<scratch>/.work-state/ux-e2e/detach.log` via an inherited file descriptor (no pipe between parent and child, so the child cannot crash with EPIPE when the parent exits). The parent tails the last 8 KiB on the 15 s startup timeout so failures are not swallowed. `--scenario`, `--task`, `--surface web\|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. |
+| `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a **detached child that survives the parent** — the child writes its stdout/stderr directly into `<scratch>/.work-state/ux-e2e/detach.log` via an inherited file descriptor (no pipe between parent and child, so the child cannot crash with EPIPE when the parent exits). The parent tails the last 8 KiB on the 15 s startup timeout so failures are not swallowed. `--scenario`, `--task`, `--surface web\|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. Honours the optional user-supplied overlay at `<scratch>/.omp/ux-e2e-overlay.user.json` (see [User-supplied overlay](#user-supplied-overlay)). |
 | `stop <scratch-dir>` | SIGTERM → SIGKILL the recorded process tree (see session.json `pid`). |
 | `transcript <scratch-dir>` | Render transcript.jsonl as text; `--tail N`, `--follow`. |
 | `ask <scratch-dir> [<answer>]` | `--list` shows the pending `[ask_user]` block; with `<answer>` it sends `<answer>\n` in ONE `{t:'i'}` frame and appends `{ts, answer}` to ask-state.jsonl. Double-answer guard refuses stale/already-answered prompts. |
@@ -78,13 +78,18 @@ and leaves the rest of the host untouched.
   alive for reconnect until `session.close()`, idle timeout, or PTY exit. Vendored static routes
   (`terminal.html`, `page.js`, `xterm.js`, `xterm.css`, `addon-fit.js`; query
   strings are stripped by `pathnameOf`, so cache-busters like `?cb=1` resolve
-  to the same file). Spawns omp with the host's `~/.omp/agent/config.yml`
-  prepended as the FIRST `--config` overlay and the ux-e2e overlay emitted
-  second (omp merges overlays in argv order, later wins — the host's
-  `modelRoles` survive so omp boots with a real model, while the overlay's
-  overrides for `terminal` / `startup` / `autolearn` / `ask` win). Every PTY
-  output frame is appended to `transcript.jsonl` — the server-side evidence
-  backbone.
+  to the same file). Spawns omp with up to three `--config` overlays in
+  argv order (omp merges them with later wins on conflict):
+  1. host `~/.omp/agent/config.yml` (auto-inherited — operator's modelRoles,
+     creds, models.db survive so omp boots with a real model);
+  2. `<scratch>/.omp/ux-e2e-overlay.json` (regenerated every start — session
+     bookkeeping wins over host defaults for keys it explicitly sets);
+  3. `<scratch>/.omp/ux-e2e-overlay.user.json` (operator-supplied, **opt-in** —
+     emitted only when the file exists; wins on conflict so a test run can
+     pin e.g. `modelRoles.default` without touching the host config or the
+     regenerated standard overlay; see [User-supplied overlay](#user-supplied-overlay)).
+  Every PTY output frame is appended to `transcript.jsonl` — the
+  server-side evidence backbone.
 - **`src/driver.ts`** — `TerminalDriver` seam: `WsDriver` (text mode, reads the
   transcript) and `createPlaywrightDriver` (lazy optional `playwright`
   dependency). `TranscriptLog` (append-only scan, O(delta) cursor) +
@@ -104,6 +109,48 @@ and leaves the rest of the host untouched.
   for stdout/stderr pointing at `detach.log` (no parent-side pipe — the
   child outlives the parent without an EPIPE crash) and tails the log on
   the 15 s startup timeout.
+
+## User-supplied overlay
+
+The harness auto-emits two `--config` overlays for every session: the host
+config (so `modelRoles` survive) and the regenerated ux-e2e overlay. Drop a
+third file at `<scratch>/.omp/ux-e2e-overlay.user.json` (any valid
+omp config.yml subset) and the harness will pass it as the **third**
+`--config` — its keys win on conflict over both the host config and the
+standard overlay, without touching either.
+
+Use it to pin the active session model without modifying the operator's
+host config or the regenerated standard overlay:
+
+```yaml
+# <scratch>/.omp/ux-e2e-overlay.user.json
+modelRoles:
+  default: minimax/MiniMax-M2.7
+  ask: minimax/MiniMax-M2.7
+  plan: minimax/MiniMax-M2.7
+```
+
+Presence is the opt-in signal: the file is never auto-created, and the
+third `--config` is omitted entirely when the file is absent. The resolved
+path (or `null`) is recorded in `session.json` under `user_config` for
+diagnostics:
+
+```jsonc
+{
+  "user_config": {
+    "path": "/tmp/omp-ux-e2e-my-feature/.omp/ux-e2e-overlay.user.json",
+    "default_path": "/tmp/omp-ux-e2e-my-feature/.omp/ux-e2e-overlay.user.json"
+  }
+}
+```
+
+Argv order (omp merges with later wins on duplicate keys):
+
+```
+--config <~/.omp/agent/config.yml>             # host   — modelRoles survive
+--config <scratch>/.omp/ux-e2e-overlay.json    # ux-e2e  — session bookkeeping
+--config <scratch>/.omp/ux-e2e-overlay.user.json   # user — highest priority (opt-in)
+```
 
 ## WS protocol
 
@@ -167,6 +214,13 @@ reconnects while the session is alive and becomes unusable after shutdown.
   `--config` overlay so omp boots with a model. If the host config is missing
   or has no `modelRoles`, a WARNING is written to stderr and the resolved
   path + warning are recorded in `session.json` under `host_config`.
+- A user-supplied overlay at `<scratch>/.omp/ux-e2e-overlay.user.json` is
+  emitted as the **third** `--config` (highest priority) so a test run can
+  pin `modelRoles` (or any other key) without touching the host config or
+  the regenerated standard overlay. Presence is the opt-in signal: the file
+  is never auto-created, and the path (or `null`) is recorded in
+  `session.json` under `user_config`. See
+  [User-supplied overlay](#user-supplied-overlay).
 - Screenshots require the web surface (`playwright` installed); text mode
   `screenshot()` throws by design.
 - **Single-PTY lifecycle** — the session holds ONE PTY for the whole run. A WS

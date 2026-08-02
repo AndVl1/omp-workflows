@@ -310,6 +310,27 @@ export interface OmpLaunchConfig {
    *     scratch bits) win over the host's defaults.
    */
   readonly hostConfigPath?: string;
+  /**
+   * Optional path to a *user-supplied* omp config overlay emitted AFTER
+   * `configPath` (the standard ux-e2e overlay). This is the third and
+   * last `--config` in argv order, so its keys win over both the host
+   * config and the standard overlay on conflict — letting a test run
+   * pin a specific active model (`modelRoles`) without touching the
+   * operator's host config or the regenerated standard overlay.
+   *
+   * The harness only resolves this path when the file actually exists
+   * (presence is the opt-in signal); an unset/falsy value is the normal
+   * case and is recorded as `null` in `session.json` for diagnostics.
+   */
+  readonly userConfigPath?: string;
+  /**
+   * Convenience: absolute path to the canonical user-overlay file
+   * (`<scratchDir>/.omp/ux-e2e-overlay.user.json`). Exposed so the
+   * caller can decide whether to pass `userConfigPath`. Always set —
+   * its existence at runtime is what determines whether the third
+   * `--config` is emitted.
+   */
+  readonly userConfigDefaultPath: string;
 }
 
 /**
@@ -321,6 +342,12 @@ export interface OmpLaunchConfig {
  * (`~/.omp/agent/`) — including `modelRoles`, `models.db`, and
  * credentials — so the run is model-capable out of the box. An
  * explicit `ompProfile` keeps ux-e2e data isolated; the caller picks.
+ *
+ * `--config` overlay order (argv order, later wins on conflict):
+ *   1. `hostConfigPath` (operator's `~/.omp/agent/config.yml` when present)
+ *   2. `configPath` (the regenerated ux-e2e overlay)
+ *   3. `userConfigPath` (operator-supplied `<scratchDir>/.omp/ux-e2e-overlay.user.json`
+ *      when present — third overlay so it overrides everything)
  */
 export function buildOmpArgs(cfg: OmpLaunchConfig): string[] {
   const maxMinutes = Math.max(1, Math.round(cfg.maxTimeSec / 60));
@@ -331,8 +358,11 @@ export function buildOmpArgs(cfg: OmpLaunchConfig): string[] {
   if (cfg.hostConfigPath !== undefined && cfg.hostConfigPath.length > 0) {
     args.push('--config', cfg.hostConfigPath);
   }
+  args.push('--config', cfg.configPath);
+  if (cfg.userConfigPath !== undefined && cfg.userConfigPath.length > 0) {
+    args.push('--config', cfg.userConfigPath);
+  }
   args.push(
-    '--config', cfg.configPath,
     '--session-dir', cfg.sessionDir,
     '--hide-thinking',
     '--max-time', `${maxMinutes}m`,
@@ -1062,14 +1092,24 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   if (hostConfig.warning !== null) {
     process.stderr.write(`ux-e2e: WARNING: ${hostConfig.warning}\n`);
   }
+  // Operator-supplied overlay (opt-in): present-when-exists at
+  // `<scratch>/.omp/ux-e2e-overlay.user.json`. When found, it is emitted
+  // as the THIRD `--config` (after host config and the regenerated
+  // ux-e2e overlay) so its keys win on conflict — letting a test run
+  // pin `modelRoles` (or anything else) without touching the host
+  // config or the regenerated standard overlay. Absence is the normal
+  // case: the file is never auto-created, only consulted. Resolved early
+  // so its presence is recorded in `session.json` regardless of noPty.
+  const userConfigDefaultPath = join(scratchDir, '.omp', 'ux-e2e-overlay.user.json');
+  const userConfigPath = existsSync(userConfigDefaultPath) ? userConfigDefaultPath : null;
 
   let ptyProc: IPty | null = null;
   let spawnError: string | null = null;
   if (opts.noPty !== true) {
     // node-pty is imported lazily: it is a native module whose prebuilt
-  // binary may be missing on some platforms — noPty test sessions must
-  // still work when the native module cannot load.
-  const ptyMod = await import('node-pty');
+    // binary may be missing on some platforms — noPty test sessions must
+    // still work when the native module cannot load.
+    const ptyMod = await import('node-pty');
     const env = buildPtyEnv(process.env, opts.env, { keepProxyEnv: opts.keepProxyEnv });
     const args = buildOmpArgs({
       ompProfile,
@@ -1077,7 +1117,9 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
       approvalMode,
       configPath: join(scratchDir, '.omp', 'ux-e2e-overlay.json'),
       sessionDir: join(scratchDir, '.omp', 'agent'),
+      userConfigDefaultPath,
       ...(hostConfig.path !== null ? { hostConfigPath: hostConfig.path } : {}),
+      ...(userConfigPath !== null ? { userConfigPath } : {}),
     });
     try {
       // omp is spawned directly (never wrapped in a shell), which is
@@ -1105,6 +1147,10 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     host_config: {
       path: hostConfig.path,
       warning: hostConfig.warning,
+    },
+    user_config: {
+      path: userConfigPath,
+      default_path: userConfigDefaultPath,
     },
   };
   writeSessionFile(sessionJsonPath, JSON.stringify(sessionJson, null, 2) + '\n');

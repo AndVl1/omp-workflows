@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Added
+
+- **User-supplied omp config overlay (`ux-e2e-overlay.user.json`)** —
+  a new opt-in third `--config` overlay at `<scratch>/.omp/ux-e2e-overlay.user.json`,
+  emitted by `buildOmpArgs` AFTER the host config and the regenerated ux-e2e
+  overlay (so its keys win on conflict). Lets a test run pin `modelRoles`
+  (e.g. the active session model) without touching the operator's host
+  config or the regenerated standard overlay. Presence is the opt-in
+  signal — the file is never auto-created, and the third `--config` is
+  omitted entirely when the file is absent. Resolved at `startTestSession`
+  time and recorded in `session.json` under `user_config` (path + canonical
+  default_path) for diagnostics. `OmpLaunchConfig` gains two fields:
+  `userConfigDefaultPath` (always required) and `userConfigPath?`
+  (third-overlay path, omitted when the file is absent or empty).
+  Three new unit tests in `test/server.test.ts`:
+  1. `buildOmpArgs appends user config as the THIRD --config overlay (after ux-e2e overlay)`
+  2. `buildOmpArgs omits the THIRD --config when userConfigPath is unset (no file present)`
+  3. `buildOmpArgs treats empty-string userConfigPath as unset`
+  plus one session-assertion test (`session.json records user_config.path
+  when the user overlay file is present`) that creates a temp file, runs
+  `startTestSession` in `noPty` mode, and verifies the resolved path is
+  persisted. README gains a dedicated **User-supplied overlay** section
+  (with a minimal `modelRoles` example) and the `start` subcommand row,
+  Architecture bullet, and Known limitations are updated to mention the
+  third overlay.
+
 ### Fixed
 
 - WebSocket tokens are now scoped to the live session, so clients can reconnect
