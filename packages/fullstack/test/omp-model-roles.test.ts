@@ -286,19 +286,21 @@ test("execute validate reads settings and registry without mutation", async () =
 	assert.deepEqual(notifications.at(-1), ["omp-model-roles: validation complete", "warning"]);
 });
 
-test("execute recommendations returns a closed strict validation contract", async () => {
+test("execute recommendations returns an imperative delegated research contract", async () => {
 	const { api } = createApi();
 	const { ctx } = createContext();
 	const target = modelRolesFactory(api as never);
 	const result = await target.execute(["recommendations"], ctx as never);
-	assert.match(result, /schemaMode:'strict'/);
-	assert.match(result, /outputSchema:/);
-	assert.match(result, /validateResearchResponse\(candidate, immutableInventorySnapshot\)/);
-	assert.match(result, /Reject the ENTIRE response/);
-	assert.match(result, /DEGRADED OUTPUT/);
-	assert.match(result, /malformed\/multiple JSON objects/);
-	assert.match(result, /web_search failure/);
-	assert.match(result, /cancellation/);
+	assert.match(result, /You MUST execute the steps below EXACTLY and in order/);
+	assert.match(result, /Do NOT inspect local files/);
+	assert.match(result, /agent="tech-researcher"/);
+	assert.match(result, /schemaMode="strict"/);
+	assert.match(result, /use web_search for fresh benchmarks/);
+	assert.match(result, /final message MUST be exactly one JSON object/);
+	assert.match(result, /kind must be omp-model-role-recommendations/);
+	assert.match(result, /modelSelector must be present in the availableModels inventory/);
+	assert.match(result, /DO NOT fabricate recommendations/);
+	assert.match(result, /Your final message is the rendered table \(or the degraded notice\)/);
 });
 
 test("execute recommendations deduplicates and bounds a huge registry prompt", async () => {

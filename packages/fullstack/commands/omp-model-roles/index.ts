@@ -343,16 +343,15 @@ export function buildResearchPrompt(data: ValidationData): string {
 		? `WARN: inventory snapshot truncated from ${bounded.total} to ${bounded.models.length} unique normalized models by the ${MAX_RESEARCH_INVENTORY_BYTES}-byte/${MAX_INVENTORY_MODELS}-model budget; recommendations cover only the included snapshot.`
 		: "Inventory snapshot is complete.";
 	const prompt = [
-		"ORCHESTRATION CONTRACT — complete every step; never present unvalidated researcher output as recommendations:",
-		`1. Save this exact immutable inventory snapshot before dispatch: ${immutableInventoryJson}`,
-		`2. Call task({agent:'tech-researcher', task:<researchPrompt>, outputSchema:${JSON.stringify(outputSchema)}, schemaMode:'strict'}).`,
-		"3. Require fresh web_search benchmarks and selectors exclusively from the saved snapshot. The researcher must return exactly one JSON object, without markdown.",
-		"4. After task returns, extract exactly one JSON object from its structured result. Import and apply validateResearchResponse(candidate, immutableInventorySnapshot) from commands/omp-model-roles/_roles.js. Also re-check role and selector membership against that snapshot. Reject the ENTIRE response if parsing, schema validation, uniqueness, membership, or source validation fails.",
-		"5. Only after validation succeeds, render the validated recommendations and unavailable roles. Never render entries from a rejected response.",
-		"6. DEGRADED OUTPUT: on malformed/multiple JSON objects, strict-schema failure, invented selector/role, empty required data, web_search failure, task error, or cancellation, render only: 'WARN: model-role recommendations unavailable: <reason>; no recommendations were accepted.' Do not render a recommendations table. For web failure, the researcher may instead return affected roles in unavailableRoles with evidence warnings, but those must still pass validation.",
+		"You MUST execute the steps below EXACTLY and in order. Do NOT inspect local files, do NOT run bash/grep/python, do NOT read transcripts, reports or session state. Your ONLY job is the research task below.",
+		`Step 1: Call the task tool with agent="tech-researcher" and the task payload below (verbatim JSON research request). Use outputSchema=${JSON.stringify(outputSchema)} and schemaMode="strict". Instruct the subagent to use web_search for fresh benchmarks and to provide URL, title, retrievedAt, and caveat for every benchmark source. It MUST recommend only modelSelector values present in the availableModels inventory.`,
+		"Step 2: Wait for the subagent to finish. Its final message MUST be exactly one JSON object (no markdown wrapper).",
+		`Step 3: Validate the JSON against this exact immutable inventory snapshot: ${immutableInventoryJson}. kind must be omp-model-role-recommendations, schemaVersion 1, generatedAt/retrievedAt/publishedAt must be ISO-8601, every recommendation must have a role from the roles list, modelSelector must be present in the availableModels inventory, and at least one benchmarkSource with url (http/https), title, retrievedAt, and caveat. Duplicate roles and empty strings are invalid. Reject the entire response if any check fails.`,
+		"Step 4: Render a markdown table: role | recommended model | fit | rationale | benchmark sources (with links). For unavailableRoles print a note. Print warnings as-is. If validation fails or the subagent errors, print a degraded notice and DO NOT fabricate recommendations.",
 		truncationWarning,
-		"RESEARCH_REQUEST_JSON:",
+		"RESEARCH_TASK_PAYLOAD_JSON:",
 		JSON.stringify(request),
+		"Your final message is the rendered table (or the degraded notice). Do not append anything else.",
 	].join("\n");
 	if (Buffer.byteLength(prompt) > MAX_RESEARCH_PROMPT_BYTES) throw new Error("bounded recommendations prompt exceeded its hard size limit");
 	return prompt;

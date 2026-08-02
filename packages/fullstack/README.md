@@ -107,6 +107,8 @@ Role values are matched against the authenticated model inventory. If a role is 
 
 `/omp-model-roles recommendations` returns a closed orchestration contract for the main agent: save the bounded immutable inventory, call `task({agent: 'tech-researcher', outputSchema: ..., schemaMode: 'strict', task: ...})`, extract exactly one JSON object, and apply `validateResearchResponse` against the saved inventory before rendering anything. Invalid/malformed responses, web failures, task errors, and cancellation produce a warning with no recommendation table.
 
+После `/omp-model-roles recommendations` агент выполнит research автоматически. Если он начал делать что-то постороннее — попросите его строго следовать инструкции команды.
+
 Example:
 
 ```text
