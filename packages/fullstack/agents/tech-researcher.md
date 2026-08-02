@@ -1,6 +1,6 @@
 ---
 name: tech-researcher
-model: "@smol"
+model: ["@researcher", "@smol"]
 thinkingLevel: medium
 description: Fast research agent for finding best practices, documentation, and technical solutions. USE PROACTIVELY when exploring options or gathering information.
 tools: read, glob, grep, web_search

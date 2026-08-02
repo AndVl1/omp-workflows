@@ -2,7 +2,7 @@
 name: developer-mobile
 description: "Mobile developer - implements Kotlin Multiplatform features with Compose UI following Architect's design exactly. USE PROACTIVELY for KMP implementation."
 tools: read, write, edit, glob, grep, bash, web_search
-model: "@task"
+model: ["@developer-mobile", "@task"]
 thinkingLevel: auto
 ---
 

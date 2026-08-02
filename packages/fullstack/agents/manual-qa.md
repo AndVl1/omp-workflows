@@ -1,6 +1,6 @@
 ---
 name: manual-qa
-model: "@task"
+model: ["@manual-qa", "@task"]
 thinkingLevel: auto
 description: Manual QA and runtime verification specialist for web UI through OMP browser, mobile through configured device automation, and backend or CLI services. USE PROACTIVELY for runtime verification.
 tools: read, glob, grep, bash, edit, write, browser

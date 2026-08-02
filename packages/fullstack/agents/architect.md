@@ -1,6 +1,6 @@
 ---
 name: architect
-model: "@slow"
+model: ["@architect", "@slow"]
 thinkingLevel: high
 description: Technical architect - designs APIs, data models, frontend components, and creates implementation plan. USE PROACTIVELY for complex design decisions requiring deep analysis.
 tools: read, glob, grep, bash, web_search

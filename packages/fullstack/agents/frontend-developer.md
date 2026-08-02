@@ -1,6 +1,6 @@
 ---
 name: frontend-developer
-model: "@task"
+model: ["@frontend-developer", "@task"]
 thinkingLevel: auto
 description: Frontend developer - implements DOM-based web UIs across stacks (React/TS, Telegram Mini App, Kotlin/JS + React/Vue) following Architect's design exactly. USE PROACTIVELY for frontend implementation. (Compose WASM is the Mobile Developer's zone.)
 tools: read, write, edit, glob, grep, bash, web_search

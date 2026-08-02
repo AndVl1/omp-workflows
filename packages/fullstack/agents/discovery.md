@@ -1,6 +1,6 @@
 ---
 name: discovery
-model: "@task"
+model: ["@researcher", "@smol"]
 thinkingLevel: auto
 description: Repository discovery agent - analyzes codebases for team workflows and inventories stacks plus registered OMP agents for /init-team.
 tools: read, glob, grep, bash

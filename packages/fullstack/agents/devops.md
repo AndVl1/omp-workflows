@@ -1,6 +1,6 @@
 ---
 name: devops
-model: "@task"
+model: ["@devops", "@task"]
 thinkingLevel: auto
 description: DevOps engineer - handles Docker, Kubernetes, Helm, CI/CD, and deployments. USE PROACTIVELY when infrastructure changes needed.
 tools: read, write, edit, glob, grep, bash

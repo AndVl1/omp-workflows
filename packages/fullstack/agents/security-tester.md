@@ -1,6 +1,6 @@
 ---
 name: security-tester
-model: "@slow"
+model: ["@security", "@slow"]
 thinkingLevel: high
 description: Security specialist for vulnerability assessment. USE PROACTIVELY for security audits, penetration testing guidance, and security reviews.
 tools: read, glob, grep, bash, web_search

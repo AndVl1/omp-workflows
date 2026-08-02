@@ -1,7 +1,7 @@
 ---
 name: diagnostics
 description: Diagnostics specialist - autonomous bug investigation across full stack (Kotlin/Spring, React, KMP Mobile, Telegram Bot). USE for error investigation and debugging.
-model: "@task"
+model: ["@diagnostics", "@task"]
 thinkingLevel: auto
 tools: read, glob, grep, bash, web_search
 ---

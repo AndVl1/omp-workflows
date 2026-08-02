@@ -1,7 +1,7 @@
 ---
 name: coordinator-yolo
 description: Autonomous night mode of the coordinator - when the user is away and can't answer questions, it moves the project forward ONE task per tick, running the regular /team pipeline for each task, entirely inside an isolated yolo branch. Never touches main, never pushes. USE only via /team-yolo. High autonomy, sandboxed blast radius.
-model: "@slow"
+model: ["@coordinator", "@slow"]
 thinkingLevel: high
 spawns: "*"
 ---

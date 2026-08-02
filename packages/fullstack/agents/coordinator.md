@@ -1,7 +1,7 @@
 ---
 name: coordinator
 description: Read-only project steward that sits ABOVE the /team orchestrator. Holds the vision, takes a pulse of project state, catches drift, and proposes a next-action menu the USER chooses from. It directs — it never executes: it proposes what /team to run, it does not run it. Writes only to its own memory. USE for /pulse, "project pulse", "what's unfinished", "where are we drifting".
-model: "@slow"
+model: ["@coordinator", "@slow"]
 thinkingLevel: high
 tools: read, write, edit, glob, grep, bash, ask, task
 spawns: scout

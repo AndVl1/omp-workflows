@@ -1,6 +1,6 @@
 ---
 name: developer-go
-model: "@task"
+model: ["@developer-go", "@task"]
 thinkingLevel: auto
 description: Go developer - implements CLI tools, system programming, microservices, WebSocket agents, high-performance concurrent systems. USE PROACTIVELY for Go implementation.
 tools: read, write, edit, glob, grep, bash, web_search
