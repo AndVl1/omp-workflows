@@ -19,7 +19,8 @@
 		"test:all": "npm run test --workspaces",
 		"e2e": "npm run build -w @andvl1/omp-workflows-e2e && node packages/e2e/dist/cli.js",
 		"clean": "rm -rf packages/*/dist"
-	},	"engines": {
+	},
+	"engines": {
 		"node": ">=20"
 	}
 }
