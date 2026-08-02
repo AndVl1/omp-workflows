@@ -11,12 +11,45 @@
       body { display: flex; flex-direction: column; }
       #terminal { flex: 1; min-height: 0; padding: 4px; }
       .xterm { height: 100%; }
-      #status { padding: 4px 10px; font: 11px ui-monospace, monospace; color: #9ca3af; background: #0f1115; border-top: 1px solid #1f2937; }
+      #toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 4px 10px;
+        font: 11px ui-monospace, monospace;
+        color: #9ca3af;
+        background: #0f1115;
+        border-top: 1px solid #1f2937;
+      }
+      #toolbar .left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+      #toolbar .right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+      #status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #enter-btn {
+        font: 11px ui-monospace, monospace;
+        color: #e5e7eb;
+        background: #1f2937;
+        border: 1px solid #374151;
+        border-radius: 3px;
+        padding: 3px 10px;
+        cursor: pointer;
+        user-select: none;
+        line-height: 1;
+      }
+      #enter-btn:hover { background: #2b3645; border-color: #4b5563; }
+      #enter-btn:active { background: #111827; }
+      #enter-btn:focus { outline: 1px solid #60a5fa; outline-offset: 1px; }
+      #enter-btn[disabled] { opacity: 0.45; cursor: not-allowed; }
     </style>
   </head>
   <body>
     <div id="terminal"></div>
-    <div id="status">connecting…</div>
+    <div id="toolbar">
+      <div class="left"><span id="status">connecting…</span></div>
+      <div class="right">
+        <button id="enter-btn" type="button" title="Send Enter to the PTY (0x0D)">⏎ Enter</button>
+      </div>
+    </div>
     <script src="/xterm.js"></script>
     <script src="/addon-fit.js"></script>
     <script src="/page.js"></script>

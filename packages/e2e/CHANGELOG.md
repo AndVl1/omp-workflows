@@ -27,11 +27,39 @@
   (with a minimal `modelRoles` example) and the `start` subcommand row,
   Architecture bullet, and Known limitations are updated to mention the
   third overlay.
+- **Enter button + `pressEnter` driver method (web surface)** — the
+  terminal page (`assets/terminal.html`) now has a **⏎ Enter** button
+  (`#enter-btn`) in a dark-themed toolbar next to the status bar.
+  Clicking it calls `window.__pressEnter()` (in `assets/page.js`), which
+  dispatches a synthetic `KeyboardEvent` (`key:'Enter'`, `code:'Enter'`,
+  `keyCode:13`, `which:13`, `bubbles:true`, `cancelable:true`) on
+  `term.textarea` so xterm forwards `'\r'` through `onData` exactly as a
+  real keyboard would. A one-shot `onData` listener guards a ~100 ms
+  fallback that sends `{t:'i', d:'\r'}` directly when the primary path
+  fails (focus lost, textarea disabled) — the listener flips a flag the
+  instant xterm sees `'\r'`, so the fallback never duplicates `'\r'`.
+  Also exposed `window.__typeText(text)` for programmatic input. The
+  button is `disabled` until the WebSocket auth-acks and re-disabled on
+  process exit / disconnect.
+- **`TerminalDriver.pressEnter()` (new interface method)** —
+  `WsDriver.pressEnter()` sends `{t:'i', d:'\r'}`; `PlaywrightDriver.pressEnter()`
+  calls `page.keyboard.press('Enter')` so xterm forwards `'\r'` through
+  CDP. The new `pressEnter()` is the correct API for real PTY submit;
+  `WsDriver.submit()` (legacy) is retained for backward compat and
+  still appends `'\n'`; the comment is corrected to point at the new
+  `pressEnter()` for real PTY submit.
 
 ### Fixed
 
+- **Enter semantics corrected in the README**
+  claimed `'\n'` is Enter and `'\r'` is literal input. A real Enter
+  keypress in a PTY produces CR (0x0D, `'\r'`); `'\n'` is just a line
+  break in the editor buffer. The new **Enter semantics** subsection
+  documents `'\r'` for submit, `'\n'` for line break, and points at
+  `pressEnter()` (driver) and the **⏎ Enter** button (web surface).
+  `WsDriver.submit()` still appends `'\n'` for backward compatibility
+  but is explicitly marked legacy.
 - WebSocket tokens are now scoped to the live session, so clients can reconnect
-  with the same 256-bit localhost URL token until the session shuts down.
 - Closing or losing a WebSocket now detaches only that client instead of killing
   the PTY. `session.close()`, idle timeout, and PTY exit retain their lifecycle
   behavior, including process-tree cleanup and exit notification.

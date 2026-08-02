@@ -28,7 +28,7 @@ node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-my-feature \
 #    Ask-state helpers:
 node packages/e2e/dist/cli.js ask /tmp/omp-ux-e2e-my-feature --list
 node packages/e2e/dist/cli.js ask /tmp/omp-ux-e2e-my-feature "1"
-#    Arbitrary command input (Enter is appended as `\n`):
+#    Arbitrary command input (uses `\n`; for real PTY submit prefer `pressEnter()` / `\r` — see [Enter semantics](#enter-semantics-r-vs-n)):
 node packages/e2e/dist/cli.js input /tmp/omp-ux-e2e-my-feature "/do-work implement it"
 
 # 5. Inspect the session, then emit the report
@@ -47,8 +47,7 @@ Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
 | `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a **detached child that survives the parent** — the child writes its stdout/stderr directly into `<scratch>/.work-state/ux-e2e/detach.log` via an inherited file descriptor (no pipe between parent and child, so the child cannot crash with EPIPE when the parent exits). The parent tails the last 8 KiB on the 15 s startup timeout so failures are not swallowed. `--scenario`, `--task`, `--surface web\|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. Honours the optional user-supplied overlay at `<scratch>/.omp/ux-e2e-overlay.user.json` (see [User-supplied overlay](#user-supplied-overlay)). |
 | `stop <scratch-dir>` | SIGTERM → SIGKILL the recorded process tree (see session.json `pid`). |
 | `transcript <scratch-dir>` | Render transcript.jsonl as text; `--tail N`, `--follow`. |
-| `ask <scratch-dir> [<answer>]` | `--list` shows the pending `[ask_user]` block; with `<answer>` it sends `<answer>\n` in ONE `{t:'i'}` frame and appends `{ts, answer}` to ask-state.jsonl. Double-answer guard refuses stale/already-answered prompts. |
-| `input <scratch-dir> <text>` | Unconditionally sends `<text>\n` in ONE `{t:'i'}` frame, without requiring a pending `[ask_user]` prompt. In the omp TUI, Enter is `\n`; do not use `\r`, which is inserted literally. |
+| `input <scratch-dir> <text>` | Unconditionally sends `<text>\n` in ONE `{t:'i'}` frame, without requiring a pending `[ask_user]` prompt. **Prefer `pressEnter()` (`\r`) for real omp submit** — `submit()` (`\n`) is a legacy text-mode helper; see [Enter semantics](#enter-semantics-r-vs-n). |
 | `report <scratch-dir>` | `generateReport()` → `<scratch>/.work-state/ux-e2e/report.json` + `<mdDir>/<slug>-ux-e2e-<date>.md` (default `./vibe-report`). `--steps` supplies structured ratings; `--copy-evidence` mirrors evidence files. |
 
 ## Session hygiene & safe stopping
@@ -155,13 +154,33 @@ Argv order (omp merges with later wins on duplicate keys):
 ## WS protocol
 
 Inbound (`browser → server`): `{t:'i', d}` input, `{t:'r', cols, rows}` resize.
-For omp TUI submission, append `\n` for Enter; `\r` is literal input.
+See [Enter semantics](#enter-semantics-r-vs-n) below — Enter in a PTY is
+`\r`, not `\n`.
 Outbound: `{t:'s', ok:true}` auth ack · `{t:'o', d}` PTY output ·
 `{t:'exit', code, signal?}` process exit · `{t:'err', code, message}` where
 `code ∈ {rate-limited, idle-timeout, spawn-failed, no-pty}`.
 
+### Enter semantics (`\r` vs `\n`)
+
+A real Enter keypress in a PTY produces **CR (0x0D, `'\r'`)**, not LF
+(0x0A, `'\n'`). In the omp TUI the editor maps `\r` to "submit current
+line"; `\n` is just a line break and does **not** submit.
+
+- `WsDriver.pressEnter()` — sends `{t:'i', d:'\r'}` (real Enter over WS).
+- `PlaywrightDriver.pressEnter()` — calls `page.keyboard.press('Enter')`
+  (real Enter via CDP; xterm forwards `'\r'` through `onData`).
+- Web toolbar **⏎ Enter** button — `window.__pressEnter()` in
+  `assets/page.js`: primary path dispatches a synthetic `KeyboardEvent`
+  (`key:'Enter'`, `keyCode:13`) on `term.textarea`; if xterm does not
+  forward `'\r'` within ~100 ms (focus lost, textarea disabled) the
+  handler falls back to `{t:'i', d:'\r'}` directly. A one-shot `onData`
+  listener guards the fallback so it never duplicates `'\r'` when the
+  primary path succeeds.
+- `WsDriver.submit(text)` (legacy) — appends `'\n'`. Retained for
+  backward compatibility with surfaces that normalised LF → CR; prefer
+  `pressEnter()` for real PTY sessions.
+
 Upgrade path: `/ws?token=<session-scoped-token>`. The token remains valid for
-reconnects while the session is alive and becomes unusable after shutdown.
 
 ## Report schema
 
@@ -188,7 +207,10 @@ reconnects while the session is alive and becomes unusable after shutdown.
 
 1. `ux-e2e start <scratch> --detach` → prints the URL (session survives).
 2. Open the URL in a browser (the token is in the URL; never share it).
-3. Drive the terminal as a human: type `/do-work <task>`.
+3. Drive the terminal as a human: type `/do-work <task>`. The toolbar at
+   the bottom of the page has an **⏎ Enter** button (`window.__pressEnter()`)
+   that emits a real Enter keypress — use it whenever the TUI is waiting
+   for input and you would press Enter at a real keyboard.
 4. On every `[ask_user]` block, either type the answer in the terminal or run
    `ux-e2e ask <scratch> --list` / `ux-e2e ask <scratch> "<answer>"`.
 5. At each stage: screenshot, rate the 6 UX dimensions, log defects to a
@@ -221,8 +243,10 @@ reconnects while the session is alive and becomes unusable after shutdown.
   is never auto-created, and the path (or `null`) is recorded in
   `session.json` under `user_config`. See
   [User-supplied overlay](#user-supplied-overlay).
-- Screenshots require the web surface (`playwright` installed); text mode
-  `screenshot()` throws by design.
+    - **Batch via `ux-e2e input <scratch> "<command>"`** for arbitrary commands
+      — sends the command plus a trailing LF (`\n`). For real PTY submit
+      (omp editor maps `\r` → submit) use `pressEnter()` instead; see
+      [Enter semantics](#enter-semantics-r-vs-n).
 - **Single-PTY lifecycle** — the session holds ONE PTY for the whole run. A WS
   disconnect (browser reload, sleep/resume, network blip, or a rate-limit
   close) only detaches that client; reconnect with the session-scoped token
@@ -239,7 +263,7 @@ reconnects while the session is alive and becomes unusable after shutdown.
     - **Batch via `ux-e2e ask <scratch> "<answer>"`** for pending asks — sends
       the answer in a single `{t:'i'}` frame and writes to `ask-state.jsonl`.
     - **Batch via `ux-e2e input <scratch> "<command>"`** for arbitrary commands
-      — sends the command plus Enter (`\n`, never `\r`) in one frame.
+      — sends the command plus a trailing LF (`\n`). For real PTY submit use `pressEnter()` (`\r`); see [Enter semantics](#enter-semantics-r-vs-n).
     - **Throttle typing** — use `delay ≥ 150 ms` per character on
       `page.keyboard.type(...)` (200 ms was observed safe in a live run).
     - **Send whole prompts in one frame** rather than per-char keystrokes.

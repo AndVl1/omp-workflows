@@ -16,6 +16,7 @@
 
   var termEl = document.getElementById('terminal');
   var statusEl = document.getElementById('status');
+  var enterBtn = document.getElementById('enter-btn');
 
   function setStatus(text) {
     if (statusEl) statusEl.textContent = text;
@@ -55,8 +56,13 @@
     proto + '//' + window.location.host + '/ws?token=' + encodeURIComponent(token)
   );
 
+  // Gate the Enter button until the WS is open so a click before auth-ack
+  // never produces a half-press that the PTY rejects.
+  if (enterBtn) enterBtn.disabled = true;
+
   ws.addEventListener('open', function () {
     setStatus('connected');
+    if (enterBtn) enterBtn.disabled = false;
     term.focus();
   });
 
@@ -72,6 +78,7 @@
     } else if (msg.t === 'exit') {
       term.write('\r\n\x1b[33m[process exited code=' + msg.code + ']\x1b[0m\r\n');
       setStatus('process exited code=' + msg.code);
+      if (enterBtn) enterBtn.disabled = true;
       ws.close();
     } else if (msg.t === 'err') {
       term.write('\r\n\x1b[31m[error ' + msg.code + (msg.message ? ': ' + msg.message : '') + ']\x1b[0m\r\n');
@@ -84,6 +91,7 @@
   ws.addEventListener('close', function () {
     term.write('\r\n\x1b[90m[connection closed]\x1b[0m\r\n');
     setStatus('disconnected');
+    if (enterBtn) enterBtn.disabled = true;
   });
 
   ws.addEventListener('error', function () {
@@ -113,4 +121,112 @@
     new ResizeObserver(sendResize).observe(termEl);
   }
   sendResize();
+
+  // ----------------------------------------------------------------
+  // Press Enter — emulate a REAL keyboard key (Enter) on the xterm
+  // textarea. A real Enter in a PTY sends CR (0x0D, '\r'); '\n'
+  // (LF) is just a line break in the editor and does NOT submit.
+  //
+  // Primary path: dispatch a synthetic KeyboardEvent on
+  // `term.textarea`. xterm's key handler intercepts the keydown
+  // and forwards '\r' via onData → ws.send({t:'i', d:'\r'}).
+  //
+  // Fallback (≈100 ms): if xterm did NOT emit '\r' (e.g. focus is
+  // lost, the textarea is disabled, or a future xterm version
+  // strips synthetic events), send '\r' directly over WS — the
+  // exact same bytes a real Enter would produce. The fallback is
+  // guarded by a one-shot onData listener that flips a flag the
+  // instant xterm sees '\r', so the fallback never duplicates the
+  // '\r' when the primary path succeeded.
+  // ----------------------------------------------------------------
+
+  function pressEnter() {
+    if (ws.readyState !== WebSocket.OPEN) return Promise.resolve(false);
+
+    // Primary: dispatch a real-looking Enter on the xterm textarea.
+    // xterm's CoreBrowserTerminal listens on its own textarea, which
+    // is at `term.textarea` (HTMLTextAreaElement).
+    var textarea = term.textarea;
+    var sawCarriageReturn = false;
+    var stopFlag = false;
+
+    if (textarea) {
+      var disposable = term.onData(function (data) {
+        if (stopFlag) return;
+        if (typeof data === 'string' && data.indexOf('\r') !== -1) {
+          sawCarriageReturn = true;
+        }
+      });
+
+      try {
+        var evt = new KeyboardEvent('keydown', {
+          key: 'Enter',
+          code: 'Enter',
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true,
+        });
+        textarea.dispatchEvent(evt);
+      } catch (e) {
+        // dispatchEvent can throw on a detached element; fall through
+        // to the timeout-based fallback below.
+        sawCarriageReturn = true; // skip the fallback so we don't double-send
+      }
+
+      // Wait briefly for xterm to forward the keypress through onData.
+      // If '\r' has arrived, the primary path succeeded — resolve true.
+      return new Promise(function (resolve) {
+        setTimeout(function () {
+          stopFlag = true;
+          try { disposable.dispose(); } catch (e) { /* ignore */ }
+          if (sawCarriageReturn) {
+            resolve(true);
+            return;
+          }
+          // Fallback: send '\r' directly — exactly what a real Enter
+          // would have produced downstream. xterm's primary path
+          // failed (focus lost, textarea disabled, etc.) so it
+          // never emitted '\r' through onData, hence no duplication.
+          try {
+            ws.send(JSON.stringify({ t: 'i', d: '\r' }));
+            resolve(false);
+          } catch (e) {
+            resolve(false);
+          }
+        }, 100);
+      });
+    }
+
+    // No textarea at all (xterm not initialised) — straight fallback.
+    try {
+      ws.send(JSON.stringify({ t: 'i', d: '\r' }));
+    } catch (e) { /* ignore */ }
+    return Promise.resolve(false);
+  }
+
+  /**
+   * Programmatic text input for tests. Bypasses the xterm textarea
+   * entirely and sends {t:'i', d:<text>} straight to the server. Does
+   * NOT append Enter; use `__pressEnter()` for that.
+   */
+  function typeText(text) {
+    if (ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      ws.send(JSON.stringify({ t: 'i', d: text }));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  window.__pressEnter = pressEnter;
+  window.__typeText = typeText;
+
+  // Wire the toolbar button to the same handler.
+  if (enterBtn) {
+    enterBtn.addEventListener('click', function () {
+      pressEnter();
+    });
+  }
 })();

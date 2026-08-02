@@ -81,6 +81,14 @@ export interface TerminalDriver {
   screenshot(path: string): Promise<string>;
   /** Send raw text to the terminal (no trailing newline added). */
   type(text: string): Promise<void>;
+  /**
+   * Send a real Enter (CR, 0x0D) to the PTY. Text-mode drivers send
+   * '\r' directly; web drivers dispatch a real Enter key via the
+   * browser so xterm forwards '\r' exactly as a human keyboard
+   * would. '\n' is NOT a substitute — it inserts a line break into
+   * the editor and does not submit.
+   */
+  pressEnter(): Promise<void>;
   /** Close the connection / browser. */
   close(): Promise<void>;
 }
@@ -180,7 +188,18 @@ export class WsDriver implements TerminalDriver {
     this.#ws.send(JSON.stringify({ t: 'i', d: text }));
   }
 
-  /** Submit text to omp. Enter in the omp TUI is `\n`; `\r` is literal input. */
+  /**
+   * Send Enter to the PTY as a real Enter keypress would: '\r' (CR,
+   * 0x0D). '\n' is NOT equivalent — it inserts a line break into the
+   * editor buffer and does not submit. (The legacy `submit()` helper
+   * uses '\n' for backward compatibility with old text surfaces that
+   * normalised LF → CR; prefer `pressEnter()` on modern PTYs.)
+   */
+  async pressEnter(): Promise<void> {
+    await this.type('\r');
+  }
+
+  /** Submit text to omp as a single frame. Uses LF for backward compat. */
   async submit(text: string): Promise<void> {
     await this.type(text + '\n');
   }
@@ -300,6 +319,21 @@ class PlaywrightDriver implements TerminalDriver {
       (globalThis as unknown as PageGlobal).__uxTerm?.focus();
     });
     await this.#page.keyboard.insertText(text);
+  }
+
+  /**
+   * Send a real Enter keypress through the browser. Routes through
+   * the OS-level keyboard path (CDP `Input.dispatchKeyEvent`) so
+   * xterm forwards '\r' to the PTY exactly as a human keyboard
+   * would. '\n' is NOT a substitute — see `pressEnter()` on
+   * `WsDriver` for the full Enter-semantics rationale.
+   */
+  async pressEnter(): Promise<void> {
+    if (this.#page === null) throw new Error('ux-e2e: playwright page not open — call open() first');
+    await this.#page.evaluate(() => {
+      (globalThis as unknown as PageGlobal).__uxTerm?.focus();
+    });
+    await this.#page.keyboard.press('Enter');
   }
 
   async close(): Promise<void> {
