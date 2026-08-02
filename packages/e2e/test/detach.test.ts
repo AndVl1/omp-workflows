@@ -30,6 +30,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 
+import { deferred } from '../src/util.js';
+
 // node-pty is a native module; skip the test when its binding cannot
 // load (matches the server.test.ts guard for the noPty fallback). This
 // is the platform-specific-exception case from the ts-no-dynamic-import
@@ -52,7 +54,7 @@ interface CliResult {
 
 /** Spawn `node dist/cli.js <args>` and wait for it to exit. */
 function runCli(args: string[], timeoutMs = 30_000): Promise<CliResult> {
-  const { promise, resolve: done, reject: fail } = Promise.withResolvers<CliResult>();
+  const { promise, resolve: done, reject: fail } = deferred<CliResult>();
   const startedAt = Date.now();
   const chunks: Buffer[] = [];
   const errChunks: Buffer[] = [];
@@ -85,7 +87,7 @@ interface SessionJsonShape {
 
 /** HEAD-style probe: returns true if the URL responds at all (any status). */
 function httpReachable(url: string, timeoutMs = 1500): Promise<boolean> {
-  const { promise, resolve: done } = Promise.withResolvers<boolean>();
+  const { promise, resolve: done } = deferred<boolean>();
   const req = http.get(url, { timeout: timeoutMs }, res => {
     res.resume();
     // Any HTTP response — even 401 / 403 — proves the listener is up.
