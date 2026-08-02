@@ -4,9 +4,12 @@
  */
 
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { main, parseBootstrapArgs, parseMaxTime, parseStartArgs } from '../src/cli.js';
+import { detachLogPath, main, parseBootstrapArgs, parseMaxTime, parseStartArgs, tailLogFile } from '../src/cli.js';
 
 /** Run main() with console/stdout captured; returns { code, out, err }. */
 async function runMain(argv: string[]): Promise<{ code: number; out: string; err: string }> {
@@ -112,3 +115,30 @@ test('cli: parseMaxTime units', () => {
   assert.equal(parseMaxTime('60'), 60);
   assert.throws(() => parseMaxTime('0m'), /positive/u);
 });
+
+test('cli: detachLogPath + tailLogFile surface child output (D2)', () => {
+  // The contract: on `--detach` timeout the parent reads the tail of
+  // `<scratch>/.work-state/ux-e2e/detach.log` and prints it to stderr.
+  // We exercise the pure helpers — the live spawn path is covered by
+  // manual QA (an actual failed detach run).
+  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-detach-'));
+  mkdirSync(join(dir, '.work-state', 'ux-e2e'), { recursive: true });
+  const logPath = detachLogPath(dir);
+  // Helper places the log under .work-state/ux-e2e/, NOT the scratch root.
+  assert.ok(logPath.endsWith('.work-state/ux-e2e/detach.log'), `log path: ${logPath}`);
+  // tailLogFile on a missing path returns '' (so the parent prints the
+  // 'no output captured' message instead of a stack trace).
+  assert.equal(tailLogFile(logPath, 1024), '');
+  // tailLogFile on a small file returns the whole file.
+  const smallBody = 'a\nb\nc\n';
+  writeFileSync(logPath, smallBody);
+  assert.equal(tailLogFile(logPath, 1024), smallBody);
+  // tailLogFile on a file larger than maxBytes returns the LAST maxBytes.
+  const bigBody = 'x'.repeat(100) + 'TAIL_MARKER\n';
+  writeFileSync(logPath, bigBody);
+  const tail = tailLogFile(logPath, 16);
+  assert.ok(tail.endsWith('TAIL_MARKER\n'), 'tail contains the most recent bytes');
+  assert.ok(tail.length < bigBody.length, 'tail is truncated to maxBytes');
+  rmSync(dir, { recursive: true });
+});
+

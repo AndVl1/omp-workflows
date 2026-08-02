@@ -42,7 +42,7 @@ Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
 | Command | Purpose |
 |---|---|
 | `bootstrap <slug> <branch>` | Create `<workdir>/omp-ux-e2e-<slug>` (default `/tmp`), `git init`, wire the plugin via `npm link` (NOT `file:` — the unpublished peer would fail with ETARGET), write `.omp/ux-e2e-overlay.json`, copy `.omp/team.config.json`, materialize custom-TS commands. `--force` re-creates. |
-| `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a detached child. `--scenario`, `--task`, `--surface web|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. |
+| `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a detached child whose stdout/stderr are appended to `<scratch>/.work-state/ux-e2e/detach.log` (the parent tails the last 8 KiB on the 15 s startup timeout so failures are not swallowed). `--scenario`, `--task`, `--surface web|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. |
 | `stop <scratch-dir>` | SIGTERM → SIGKILL the recorded process tree (see session.json `pid`). |
 | `transcript <scratch-dir>` | Render transcript.jsonl as text; `--tail N`, `--follow`. |
 | `ask <scratch-dir> [<answer>]` | `--list` shows the pending `[ask_user]` block; with `<answer>` it sends `<answer>\n` in ONE `{t:'i'}` frame and appends `{ts, answer}` to ask-state.jsonl. Double-answer guard refuses stale/already-answered prompts. |
@@ -54,23 +54,33 @@ Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
   single-use 256-bit token (constant-time compare + replay protection), Origin
   (if present) / Host checks, `X-Frame-Options: DENY`, `Referrer-Policy:
   no-referrer`, strict CSP, per-connection rate limit, idle timer, SIGTERM →
-  SIGKILL process-tree kill, 64 KiB max frame. Spawns omp with
-  `--profile ux-e2e-test --config …/.omp/ux-e2e-overlay.json --session-dir …/.omp/agent
-  --hide-thinking --max-time <m>m --approval-mode yolo` (never `-p/--print`,
-  never `--no-pty`). Every PTY output frame is appended to
-  `transcript.jsonl` — the server-side evidence backbone.
+  SIGKILL process-tree kill, 64 KiB max frame. Vendored static routes
+  (`terminal.html`, `page.js`, `xterm.js`, `xterm.css`, `addon-fit.js`; query
+  strings are stripped by `pathnameOf`, so cache-busters like `?cb=1` resolve
+  to the same file). Spawns omp with the host's `~/.omp/agent/config.yml`
+  prepended as the FIRST `--config` overlay and the ux-e2e overlay emitted
+  second (omp merges overlays in argv order, later wins — the host's
+  `modelRoles` survive so omp boots with a real model, while the overlay's
+  overrides for `terminal` / `startup` / `autolearn` / `ask` win). Every PTY
+  output frame is appended to `transcript.jsonl` — the server-side evidence
+  backbone.
 - **`src/driver.ts`** — `TerminalDriver` seam: `WsDriver` (text mode, reads the
   transcript) and `createPlaywrightDriver` (lazy optional `playwright`
   dependency). `TranscriptLog` (append-only scan, O(delta) cursor) +
   `AskStateTracker` ([ask_user] detection, double-answer guard).
 - **`src/scenario.ts`** — `loadScenario()`: JSON scenario = data; validates with
   field names in errors, resolves `task: {file}`, expands `{{slug}} {{branch}}
-  {{task}} {{cols}} {{rows}} {{max_time}}` plus scenario params.
+  {{task}} {{cols}} {{rows}} {{max_time}} {{feature_description}}
+  {{project_name}} {{platform_scope}}` plus scenario params. Built-in defaults
+  cover every `{{key}}` in the reference `full-feature-task.md` so the rendered
+  prompt never contains a literal `{{...}}`. Merge precedence: caller
+  `params` > `def.params` > `BUILTIN_DEFAULTS`.
 - **`src/report.ts`** — `generateReport()`: ux-e2e JSON + manual_qa-compatible
   markdown. Defect floors: CRITICAL→1, HIGH→2, MEDIUM→3, LOW→4; ratings are
   clamped and warnings are emitted.
 - **`src/cli.ts`** — thin `node:util parseArgs` dispatch over the six
-  subcommands.
+  subcommands. `--detach` pipes child stdout/stderr to
+  `detach.log` and tails it on timeout.
 
 ## WS protocol
 
@@ -120,10 +130,16 @@ Upgrade path: `/ws?token=<single-use-token>`.
   first real run. Answers typed *inside* the terminal (not via `ask`) are not
   recorded in ask-state.jsonl and are treated as "the transcript moved on".
 - Single session at a time per scratch dir (session.json live-pid guard).
-- `--detach` runs the session in a detached child; stop it with
+- `--detach` runs the session in a detached child; its stdout/stderr are
+  captured to `<scratch>/.work-state/ux-e2e/detach.log` and the parent
+  surfaces the tail on the 15 s startup timeout. Stop the run with
   `ux-e2e stop <scratch>` (or let `--max-time` expire).
 - The xterm stylesheet is served from `@xterm/xterm/css/xterm.css` (the package
   does not ship `lib/xterm.css`).
+- The host `~/.omp/agent/config.yml` is auto-inherited as the first
+  `--config` overlay so omp boots with a model. If the host config is missing
+  or has no `modelRoles`, a WARNING is written to stderr and the resolved
+  path + warning are recorded in `session.json` under `host_config`.
 - Screenshots require the web surface (`playwright` installed); text mode
   `screenshot()` throws by design.
 - **Single-PTY lifecycle** — the session holds ONE PTY for the whole

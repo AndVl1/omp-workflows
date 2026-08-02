@@ -230,6 +230,13 @@ const BUILTIN_DEFAULTS: Readonly<Record<string, string>> = {
   cols: '100',
   rows: '30',
   max_time: '30m',
+  // Built-in defaults for the `full-feature` reference task template. These
+  // let `loadScenario` produce a usable prompt out of the box (no literal
+  // `{{...}}` left in the rendered text) and document the contract for
+  // downstream scenarios that want to reuse the same template.
+  feature_description: 'the feature described in the task prompt',
+  project_name: 'ux-e2e-scratch',
+  platform_scope: 'the requested surface (web / cli / mobile) as clarified by the user',
 };
 
 /** Replace `{{key}}` occurrences from `ctx`; unknown keys stay literal. */

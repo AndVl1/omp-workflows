@@ -21,6 +21,7 @@
 import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { basename, join, resolve } from 'node:path';
@@ -282,6 +283,20 @@ export interface OmpLaunchConfig {
   readonly approvalMode: string;
   readonly configPath: string;
   readonly sessionDir: string;
+  /**
+   * Optional path to the *host* `~/.omp/agent/config.yml` to load as the
+   * FIRST `--config` overlay. omp merges overlays in argv order, with
+   * later overlays overriding earlier ones for duplicate keys (verified
+   * against `omp v17.2.3 --help`: `--config=<value>  Load an extra
+   * config.yml-style overlay for this run (repeatable)`). Putting the
+   * host config FIRST and the ux-e2e overlay SECOND means:
+   *   - keys NOT touched by the overlay (most importantly `modelRoles`)
+   *     come from the host, so omp boots with a real model instead of
+   *     "No model selected";
+   *   - keys the overlay explicitly sets (e.g. session-dir-relative
+   *     scratch bits) win over the host's defaults.
+   */
+  readonly hostConfigPath?: string;
 }
 
 /**
@@ -290,15 +305,103 @@ export interface OmpLaunchConfig {
  */
 export function buildOmpArgs(cfg: OmpLaunchConfig): string[] {
   const maxMinutes = Math.max(1, Math.round(cfg.maxTimeSec / 60));
-  return [
-    '--profile', cfg.ompProfile,
+  const args: string[] = ['--profile', cfg.ompProfile];
+  if (cfg.hostConfigPath !== undefined && cfg.hostConfigPath.length > 0) {
+    args.push('--config', cfg.hostConfigPath);
+  }
+  args.push(
     '--config', cfg.configPath,
     '--session-dir', cfg.sessionDir,
     '--hide-thinking',
     '--max-time', `${maxMinutes}m`,
     '--approval-mode', cfg.approvalMode,
-  ];
+  );
+  return args;
 }
+
+/**
+ * Default location of the user's host omp config (the "real" ~/.omp
+ * that ships API keys + modelRoles). Inherited by every ux-e2e session
+ * via `--config` so omp boots with a model; without this, the
+ * ux-e2e-overlay alone (which only sets session bookkeeping) has no
+ * `modelRoles` and omp prints "No model selected".
+ */
+export function defaultHostOmpConfigPath(): string {
+  return join(homedir(), '.omp', 'agent', 'config.yml');
+}
+
+export interface HostConfigCheck {
+  /** The host config path, when it exists AND is readable. */
+  readonly path: string | null;
+  /** Human-readable warning, or null when the config is healthy. */
+  readonly warning: string | null;
+}
+
+/**
+ * Resolve the host omp config and return a warning if it is missing,
+ * unreadable, or has no `modelRoles`. omp config.yml uses a small
+ * subset of YAML — keys are top-level strings, values can be mappings.
+ * We do a defensive key scan: any non-empty `modelRoles` value
+ * (mapping, list, or string) is treated as configured; a missing or
+ * empty value is the failure mode the warning calls out.
+ */
+export function checkHostOmpConfig(path: string = defaultHostOmpConfigPath()): HostConfigCheck {
+  if (!existsSync(path)) {
+    return {
+      path: null,
+      warning: `host omp config not found at ${path}; omp will boot without a model. Set OMP_BIN's profile or provide ~/.omp/agent/config.yml with a 'modelRoles' block.`,
+    };
+  }
+  let body: string;
+  try {
+    body = readFileSync(path, 'utf8');
+  } catch (err) {
+    return {
+      path: null,
+      warning: `host omp config at ${path} is unreadable: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  // Cheap YAML key check — we look for a top-level `modelRoles:` line
+  // (possibly with leading whitespace) followed by a non-empty value on
+  // the next non-empty line. This is good enough for the
+  // "operator forgot to set a model" smoke check; omp itself will
+  // emit the authoritative error if the YAML is malformed.
+  const lines = body.split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] ?? '';
+    if (!/^\s*modelRoles\s*:/u.test(line)) continue;
+    // Look at the RAW next lines for an indented continuation: a sibling
+    // top-level key is NOT a value, so we require the next non-empty,
+    // non-comment line to start with whitespace (or be a YAML block
+    // scalar marker like `|` / `>`).
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const raw = lines[j] ?? '';
+      const trimmed = raw.trim();
+      if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
+      if (trimmed === '|' || trimmed === '>' || trimmed.startsWith('|') || trimmed.startsWith('>')) {
+        return { path, warning: null };
+      }
+      // Indented lines are the value (mapping entries, list items,
+      // or scalar strings).
+      if (/^\s+/u.test(raw)) return { path, warning: null };
+      // Unindented line = a different top-level key, modelRoles is empty.
+      return {
+        path,
+        warning: `host omp config at ${path} has 'modelRoles:' but no value follows; omp will boot without a model.`,
+      };
+    }
+    // modelRoles was the last key in the file and had no value.
+    return {
+      path,
+      warning: `host omp config at ${path} has 'modelRoles:' but no value follows; omp will boot without a model.`,
+    };
+  }
+  return {
+    path,
+    warning: `host omp config at ${path} has no 'modelRoles' key; omp will boot without a model.`,
+  };
+}
+
 
 /* ------------------------------------------------------------------ */
 /* Session types                                                       */
@@ -487,6 +590,7 @@ export function cspHeader(selfOrigin: string): string {
 
 interface VendorAssets {
   readonly terminalHtml: string;
+  readonly pageJs: string;
   readonly xtermJs: string;
   readonly xtermCss: string;
   readonly addonFitJs: string;
@@ -501,6 +605,7 @@ function resolveVendorAssets(): VendorAssets {
   // `lib/xterm.css` (verified against 5.5.0). The JS bundles live in `lib/`.
   return {
     terminalHtml: fileURLToPath(new URL('../assets/terminal.html', import.meta.url)),
+    pageJs: fileURLToPath(new URL('../assets/page.js', import.meta.url)),
     xtermJs: require.resolve('@xterm/xterm/lib/xterm.js'),
     xtermCss: require.resolve('@xterm/xterm/css/xterm.css'),
     addonFitJs: require.resolve('@xterm/addon-fit/lib/addon-fit.js'),
@@ -930,8 +1035,17 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   const origin = `http://${publicHost}:${boundPort}`;
   const wsPath = '/ws';
   const url = `http://${publicHost}:${boundPort}/?token=${encodeURIComponent(token)}`;
+  // Resolve the host omp config FIRST so the warning is in session.json
+  // (and stderr) regardless of noPty mode. omp merges `--config` overlays
+  // in argv order — putting the host config before the ux-e2e overlay
+  // means the overlay (later) wins for keys it explicitly sets, and the
+  // host's `modelRoles` (and any other untouched keys) survive. Without
+  // the host config, omp boots with "No model selected".
+  const hostConfig = checkHostOmpConfig();
+  if (hostConfig.warning !== null) {
+    process.stderr.write(`ux-e2e: WARNING: ${hostConfig.warning}\n`);
+  }
 
-  // ---- PTY: spawn omp (or a fake command in unit tests) -------------
   let ptyProc: IPty | null = null;
   let spawnError: string | null = null;
   if (opts.noPty !== true) {
@@ -946,6 +1060,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
       approvalMode,
       configPath: join(scratchDir, '.omp', 'ux-e2e-overlay.json'),
       sessionDir: join(scratchDir, '.omp', 'agent'),
+      ...(hostConfig.path !== null ? { hostConfigPath: hostConfig.path } : {}),
     });
     try {
       // omp is spawned directly (never wrapped in a shell), which is
@@ -970,9 +1085,12 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     task_prompt: opts.taskPrompt !== null && opts.taskPrompt !== undefined ? sanitizeForJson(opts.taskPrompt) : null,
     scenario: opts.scenario ?? null,
     surface,
+    host_config: {
+      path: hostConfig.path,
+      warning: hostConfig.warning,
+    },
   };
   writeSessionFile(sessionJsonPath, JSON.stringify(sessionJson, null, 2) + '\n');
-
   // ---- HTTP: security headers + static page -------------------------
   const assets = resolveVendorAssets();
   httpServer.on('request', (req, res) => {
@@ -981,6 +1099,10 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     const path = pathnameOf(req);
     if (path === '/') {
       serveFile(res, assets.terminalHtml, 'text/html; charset=utf-8');
+      return;
+    }
+    if (path === '/page.js') {
+      serveFile(res, assets.pageJs, 'application/javascript; charset=utf-8');
       return;
     }
     if (path === '/xterm.js') {

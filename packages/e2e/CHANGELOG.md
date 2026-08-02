@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.1.2 — 2026-08-02
+
+### QA-blocking defect fixes (manual-QA verdict FAIL)
+
+- **CRITICAL (D1)** — `/page.js` is now served as a static route by
+  the loopback HTTP server. The browser-side terminal page boots
+  end-to-end (terminal.html + page.js + xterm.js + xterm.css +
+  addon-fit.js). `pathnameOf(req)` already stripped query strings so
+  cache-busters like `?cb=1` do not break the route. Verified via
+  `curl /page.js?cb=1` → 200 with the real page.js bytes (3474 B).
+- **HIGH (D2)** — `ux-e2e start --detach` now pipes the child process
+  stdout/stderr to `<scratch>/.work-state/ux-e2e/detach.log`. On the
+  15 s startup timeout the parent reads the last 8 KiB of that log
+  and prints it to stderr so the real failure mode is visible
+  instead of being swallowed by `stdio: 'ignore'`.
+- **HIGH (D3)** — `BUILTIN_DEFAULTS` now includes `feature_description`,
+  `project_name`, and `platform_scope` so the `full-feature` reference
+  task template expands without any literal `{{...}}` left in the
+  rendered prompt. Merge precedence (`params` > `def.params` >
+  `BUILTIN_DEFAULTS`) was already correct; a regression test pins both
+  the expansion and the precedence.
+- **HIGH (D4)** — `buildOmpArgs` now accepts `hostConfigPath`. The
+  host's `~/.omp/agent/config.yml` is prepended to the argv as the
+  FIRST `--config` overlay (verified against `omp v17.2.3 --help`:
+  overlays merge in argv order, later wins). The ux-e2e overlay is
+  emitted second so its overrides win for keys it explicitly sets,
+  while the host's `modelRoles` (untouched by the overlay) survives —
+  preventing the "No model selected" boot state documented in the
+  manual-QA evidence. The host config path and a `WARNING` (when
+  the file is missing or has no `modelRoles`) are recorded in
+  `session.json` under `host_config` and emitted to stderr.
+
+### Tests
+
+- 5 new tests (D1 HTTP route, D2 detach-log helpers, D3 zero-literal
+  expansion, D4 args-builder order, D4 host-config check). Total:
+  46 (was 41).
+
 ## 0.1.1 — 2026-08-02
 
 ### Review fixes (code-reviewer + security-tester, 10 findings)

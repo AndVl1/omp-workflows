@@ -12,7 +12,7 @@
  */
 
 import { execSync, spawn } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createWriteStream, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { parseArgs, type ParseArgsConfig } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -323,9 +323,36 @@ async function driveForeground(session: TestSession, scenario: ScenarioDefinitio
   }
 }
 
+/** How many bytes of the detached child's log to dump on a startup timeout. */
+export const DETACH_LOG_TAIL_BYTES = 8 * 1024;
+
+/** Path of the per-scratch detach log file. */
+export function detachLogPath(scratchDir: string): string {
+  return join(stateDirOf(scratchDir), 'detach.log');
+}
+
+/**
+ * Read the last `maxBytes` of a file. Used to surface the real failure
+ * mode of a detached child whose startup never produced a live session.
+ */
+export function tailLogFile(path: string, maxBytes: number): string {
+  if (!existsSync(path)) return '';
+  const body = readFileSync(path, 'utf8');
+  if (Buffer.byteLength(body, 'utf8') <= maxBytes) return body;
+  return body.slice(-maxBytes);
+}
+
 /** --detach: run the session in a detached child, exit with the URL. */
 async function runStartDetached(args: StartArgs): Promise<number> {
   assertNoLiveSession(args.scratchDir, args.force);
+
+  const stateDir = stateDirOf(args.scratchDir);
+  mkdirSync(stateDir, { recursive: true });
+  const logPath = detachLogPath(args.scratchDir);
+  // Append so a subsequent --detach run after a crash keeps the prior
+  // log entries (operators triage by timeline).
+  const logStream = createWriteStream(logPath, { flags: 'a' });
+  logStream.write(`\n--- ux-e2e detached start @ ${new Date().toISOString()} ---\n`);
 
   const cliPath = fileURLToPath(import.meta.url);
   const childArgs = [
@@ -341,8 +368,19 @@ async function runStartDetached(args: StartArgs): Promise<number> {
   if (args.task !== undefined) childArgs.push('--task', args.task);
   childArgs.push('--max-time', `${Math.round(args.maxTimeSec / 60)}m`, '--idle-ms', String(args.idleMs));
 
-  const child = spawn(process.execPath, childArgs, { detached: true, stdio: 'ignore', cwd: args.scratchDir });
+  const child = spawn(process.execPath, childArgs, {
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: args.scratchDir,
+  });
   child.unref();
+  if (child.stdout !== null) child.stdout.pipe(logStream, { end: false });
+  if (child.stderr !== null) child.stderr.pipe(logStream, { end: false });
+  // child exit: close the log so the tail is flushable on a subsequent
+  // --detach call from this scratch.
+  child.once('exit', () => {
+    logStream.end();
+  });
 
   // Wait for the child's session.json to appear with a live pid.
   const deadline = Date.now() + 15_000;
@@ -356,6 +394,16 @@ async function runStartDetached(args: StartArgs): Promise<number> {
     }
     if (Date.now() >= deadline) {
       console.error('ux-e2e start: timed out waiting for the detached session to start');
+      const tail = tailLogFile(logPath, DETACH_LOG_TAIL_BYTES);
+      if (tail.length > 0) {
+        console.error(`ux-e2e start: last ${DETACH_LOG_TAIL_BYTES} bytes of ${logPath}:`);
+        for (const line of tail.split('\n')) {
+          console.error(`  ${line}`);
+        }
+      } else {
+        console.error(`ux-e2e start: no output captured in ${logPath}; child may have failed before writing.`);
+      }
+      logStream.end();
       return 1;
     }
     const { promise: ticked, resolve: tick } = Promise.withResolvers<void>();

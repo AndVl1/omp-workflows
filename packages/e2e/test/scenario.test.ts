@@ -130,3 +130,29 @@ test('scenario: expandTemplate replaces known keys only', () => {
   assert.equal(expandTemplate('{{nope}}', {}), '{{nope}}');
   assert.equal(expandTemplate('{{ slug }}', { slug: 'y' }), 'y');
 });
+
+test('scenario: full-feature task expands with zero literal {{ (D3)', () => {
+  // The full-feature reference scenario is the acceptance test for the
+  // template expansion. Every {{key}} in the task template MUST resolve
+  // — either from BUILTIN_DEFAULTS (feature_description, project_name,
+  // platform_scope, max_time) or from the scenario's own params
+  // (slug, branch, task). If any key is missing, the agent receives a
+  // literal '{{...}}' string and silently ignores it.
+  const scenario = loadScenario(FULL_FEATURE, { slug: 'my-feature', branch: 'feat/my-feature' });
+  const literal = scenario.task.match(/\{\{[a-zA-Z0-9_]+\}\}/gu) ?? [];
+  assert.deepEqual(literal, [], `full-feature task should not contain literal placeholders, found: ${literal.join(', ')}`);
+  // And the same goes for the rendered title (uses {{slug}}).
+  assert.ok(!scenario.title.includes('{{'), 'rendered title has no literal placeholders');
+  // Every stage name must also expand cleanly.
+  for (const stage of scenario.stages) {
+    assert.ok(!stage.name.includes('{{'), `stage ${stage.id} name still has literal {{`);
+  }
+  // Smoke-check the actually-substituted values: feature_description /
+  // project_name / platform_scope came from BUILTIN_DEFAULTS so they
+  // are present in the rendered task text.
+  assert.match(scenario.task, /my-feature/, '{{slug}} expanded');
+  assert.match(scenario.task, /feat\/my-feature/, '{{branch}} expanded');
+  assert.match(scenario.task, /30m/, '{{max_time}} expanded (BUILTIN_DEFAULTS)');
+  assert.match(scenario.task, /the feature described in the task prompt/u, '{{feature_description}} from BUILTIN_DEFAULTS');
+  assert.match(scenario.task, /ux-e2e-scratch/u, '{{project_name}} from BUILTIN_DEFAULTS');
+});

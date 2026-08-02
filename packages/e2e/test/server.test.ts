@@ -5,7 +5,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import * as http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -16,6 +17,7 @@ import { waitFor, WaitTimeoutError } from '../src/driver.js';
 import {
   assertNoLiveSession,
   buildOmpArgs,
+  checkHostOmpConfig,
   mintToken,
   pidIsLive,
   safeEqual,
@@ -95,6 +97,110 @@ test('server: buildOmpArgs matches the launch contract', () => {
   ]);
   assert.ok(!args.includes('-p') && !args.includes('--print'), 'never passes -p/--print');
   assert.ok(!args.includes('--no-pty'), 'never passes --no-pty');
+});
+
+test('server: buildOmpArgs prepends host config (D4 — model inheritance)', () => {
+  // omp merges `--config` overlays in argv order with later overlays
+  // overriding earlier ones for duplicate keys (verified against
+  // `omp v17.2.3 --help`). The ux-e2e overlay must come AFTER the
+  // host config so its overrides win, but the host's `modelRoles` (not
+  // touched by the overlay) survives — preventing the "No model
+  // selected" boot state.
+  const args = buildOmpArgs({
+    ompProfile: 'ux-e2e-test',
+    maxTimeSec: 1800,
+    approvalMode: 'yolo',
+    configPath: '/scratch/.omp/ux-e2e-overlay.json',
+    sessionDir: '/scratch/.omp/agent',
+    hostConfigPath: '/Users/test/.omp/agent/config.yml',
+  });
+  // Two `--config` flags in the right order: host first, overlay second.
+  const configIdx = args.reduce<number[]>((acc, v, i) => (v === '--config' ? [...acc, i] : acc), []);
+  assert.equal(configIdx.length, 2, 'emits two --config flags');
+  assert.equal(args[configIdx[0] + 1], '/Users/test/.omp/agent/config.yml', 'host config is first');
+  assert.equal(args[configIdx[1] + 1], '/scratch/.omp/ux-e2e-overlay.json', 'overlay is second (wins on conflict)');
+  // Sanity: still never passes -p/--print/--no-pty.
+  assert.ok(!args.includes('-p') && !args.includes('--print'));
+  assert.ok(!args.includes('--no-pty'));
+});
+
+test('server: checkHostOmpConfig warns on missing or empty modelRoles', () => {
+  // Missing file → path:null + warning.
+  const missing = checkHostOmpConfig('/nonexistent/omp/config.yml');
+  assert.equal(missing.path, null);
+  assert.match(missing.warning ?? '', /not found/u);
+  // File with a populated modelRoles → path + no warning.
+  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-hostcfg-'));
+  const goodPath = join(dir, 'good.yml');
+  writeFileSync(goodPath, 'modelRoles:\n  default: anthropic/claude-sonnet-4.5\n');
+  const good = checkHostOmpConfig(goodPath);
+  assert.equal(good.path, goodPath);
+  assert.equal(good.warning, null);
+  // File with `modelRoles:` but no value → warning.
+  const emptyPath = join(dir, 'empty.yml');
+  writeFileSync(emptyPath, 'modelRoles:\ntheme: dark\n');
+  const empty = checkHostOmpConfig(emptyPath);
+  assert.equal(empty.path, emptyPath);
+  assert.match(empty.warning ?? '', /modelRoles/u);
+  // File with no modelRoles key at all → warning.
+  const noKeyPath = join(dir, 'nokey.yml');
+  writeFileSync(noKeyPath, 'theme: dark\n');
+  const noKey = checkHostOmpConfig(noKeyPath);
+  assert.equal(noKey.path, noKeyPath);
+  assert.match(noKey.warning ?? '', /no 'modelRoles' key/u);
+  rmSync(dir, { recursive: true });
+
+});
+
+test('server: HTTP serves /page.js with cache-buster query (D1)', async t => {
+  const scratch = makeScratch();
+  const session = await startTestSession({ cwd: scratch, noPty: true, token: 'sekret' });
+  t.after(() => session.close());
+
+  // `/page.js?cb=1` must return 200 + the actual page.js bytes.
+  // The query string stripping happens in `pathnameOf(req)`, so a
+  // cache-buster like `?cb=...` does not change the route.
+  const ok = await new Promise<{ status: number; body: string; ctype: string }>((resolve, reject) => {
+    const req = http.get(`http://127.0.0.1:${String(session.port)}/page.js?cb=1`, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        resolve({
+          status: res.statusCode ?? 0,
+          ctype: String(res.headers['content-type'] ?? ''),
+          body: Buffer.concat(chunks).toString('utf8'),
+        });
+      });
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+  });
+  assert.equal(ok.status, 200, '/page.js?cb=1 returns 200');
+  assert.match(ok.ctype, /javascript/u, 'content-type is JS');
+  assert.match(ok.body, /window\.__uxTerm/u, 'served body is the actual page.js (not 404 fallback)');
+
+  // Also exercise the static /xterm.js, /xterm.css, /addon-fit.js routes
+  // for symmetry (these were already present; just keep them covered).
+  for (const p of ['/xterm.js', '/xterm.css', '/addon-fit.js']) {
+    const got = await new Promise<number>((res, rej) => {
+      const r = http.get(`http://127.0.0.1:${String(session.port)}${p}`, (r2) => {
+        r2.resume();
+        res(r2.statusCode ?? 0);
+      });
+      r.on('error', rej);
+    });
+    assert.equal(got, 200, `${p} returns 200`);
+  }
+
+  // And an unknown path stays 404.
+  const missing = await new Promise<number>((res, rej) => {
+    const r = http.get(`http://127.0.0.1:${String(session.port)}/no-such-asset.js`, (r2) => {
+      r2.resume();
+      res(r2.statusCode ?? 0);
+    });
+    r.on('error', rej);
+  });
+  assert.equal(missing, 404);
 });
 
 test('server: ws rejects a missing token', async t => {
