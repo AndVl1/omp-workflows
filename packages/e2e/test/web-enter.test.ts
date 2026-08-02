@@ -61,9 +61,11 @@ exec od -An -c
  */
 const FAKE_IDLE_SCRIPT = '#!/bin/sh\nexec cat\n';
 
+import { deferred } from '../src/util.js';
+
 /** Replace `new Promise((r) => setTimeout(r, ms))` with withResolvers. */
 function sleep(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
+  const { promise, resolve } = deferred<void>();
   setTimeout(resolve, ms);
   return promise;
 }
