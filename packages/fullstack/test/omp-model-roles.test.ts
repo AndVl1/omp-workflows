@@ -1,6 +1,5 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +12,6 @@ import {
 	isResearchResponse,
 	resolveRoleChain,
 } from "../commands/omp-model-roles/_roles.js";
-const bunAvailable = spawnSync("bun", ["--version"], { stdio: "ignore" }).status === 0;
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const now = "2026-08-02T12:00:00.000Z";
@@ -170,22 +168,41 @@ test("every bundled agent frontmatter contains class role followed by standard f
 	}
 });
 
-test("native resolveAgentModelPatterns enforces request, settings override, then frontmatter precedence", { skip: !bunAvailable && "Bun is not installed; OMP native TypeScript modules require its runtime" }, () => {
-	const script = `
-		import { resolveAgentModelPatterns } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
-		const settings = { getModelRole: role => ({ architect: "test/class-model", slow: "test/fallback-model" })[role] };
-		const frontmatter = ["@architect", "@slow"];
-		const request = resolveAgentModelPatterns({ settingsOverride: "test/request-model", agentModel: frontmatter, settings });
-		const settingsOverride = resolveAgentModelPatterns({ settingsOverride: "test/settings-override", agentModel: frontmatter, settings });
-		const frontmatterOnly = resolveAgentModelPatterns({ agentModel: frontmatter, settings });
-		console.log(JSON.stringify({ request, settingsOverride, frontmatterOnly }));
-	`;
-	const output = execFileSync("bun", ["--eval", script], { cwd: packageRoot, encoding: "utf8" });
-	assert.deepEqual(JSON.parse(output), {
-		request: ["test/request-model"],
-		settingsOverride: ["test/settings-override"],
-		frontmatterOnly: ["test/class-model", "test/fallback-model"],
-	});
+test("inventory chain resolveEntry returns class selector when configured model matches inventory", async () => {
+	const { api } = createApi();
+	const { ctx } = createContext();
+	const target = modelRolesFactory(api as never);
+	const result = await target.execute(["validate"], ctx as never);
+	// architect is configured to test/class-model and that selector exists in inventory → class.
+	assert.match(result, /\barchitect \| [^|]*\| class \(test\/class-model\)/);
+	// developer-go is NOT configured; its standardFallback @task resolves to test/fallback-model → fallback.
+	assert.match(result, /\bdeveloper-go \| [^|]*\| fallback \(test\/fallback-model\)/);
+});
+
+test("inventory chain resolveEntry falls back to standardFallback when the class role is not configured", async () => {
+	const { api } = createApi();
+	const { ctx } = createContext();
+	const target = modelRolesFactory(api as never);
+	const result = await target.execute(["validate"], ctx as never);
+	// Every developer/qa/researcher agent whose class role is not configured must use @task/@smol/@slow fallback.
+	assert.match(result, /\bdeveloper-go \| [^|]*\| [^|]*\| fallback \(test\/fallback-model\)/);
+	assert.match(result, /\bdeveloper-kotlin \| [^|]*\| [^|]*\| fallback \(test\/fallback-model\)/);
+	assert.match(result, /\bfrontend-developer \| [^|]*\| [^|]*\| fallback \(test\/fallback-model\)/);
+	assert.match(result, /\bqa \| [^|]*\| [^|]*\| fallback \(test\/fallback-model\)/);
+	assert.match(result, /\bresearcher \| [^|]*\| [^|]*\| fallback \(test\/fallback-model\)/);
+});
+
+test("inventory chain resolveEntry returns none when neither class nor fallback is in inventory", async () => {
+	const restrictedInventory: InventoryModel[] = [
+		{ selector: "test/other-model", provider: "test", id: "other-model", name: "Other", contextWindow: 8_000, maxTokens: 1_000, reasoning: false },
+	];
+	const { api } = createApi();
+	const { ctx } = createContext({ models: restrictedInventory });
+	const target = modelRolesFactory(api as never);
+	const result = await target.execute(["validate"], ctx as never);
+	// Class selector test/class-model and fallback test/fallback-model are both absent → none.
+	assert.match(result, /\barchitect \| [^|]*\| none\b/);
+	assert.match(result, /\bdeveloper-go \| [^|]*\| none\b/);
 });
 
 test("research request schema accepts a complete request and rejects a non-ISO timestamp", () => {

@@ -27,18 +27,9 @@ interface SettingsLike {
 	get?: (path: string) => unknown;
 }
 
-interface ModelResolverModule {
-	resolveModelRoleValue?: (
-		roleValue: string | undefined,
-		availableModels: readonly unknown[],
-		options?: { settings?: unknown; roleLookup?: unknown },
-	) => { model?: { provider?: string; id?: string }; warning?: string };
-}
-
 interface ValidationData {
 	settings: SettingsLike | undefined;
 	inventory: InventoryModel[];
-	resolver: ModelResolverModule | undefined;
 	warnings: string[];
 	frontmatterWarning?: string;
 }
@@ -94,35 +85,8 @@ function uniqueInventory(models: readonly unknown[]): InventoryModel[] {
 	return inventory;
 }
 
-function settingsRoleLookup(settings: SettingsLike | undefined): { getModelRole(role: string): string | undefined } {
-	return { getModelRole: role => settings?.getModelRole?.(role) };
-}
-
-function selectorFromNative(value: string | undefined, data: ValidationData): string | undefined {
-	if (!value?.trim() || !data.resolver?.resolveModelRoleValue) return undefined;
-	try {
-		const result = data.resolver.resolveModelRoleValue(value, data.inventory as unknown[], {
-			settings: data.settings,
-			roleLookup: settingsRoleLookup(data.settings),
-		});
-		if (!result.model?.provider || !result.model.id) return undefined;
-		return `${result.model.provider}/${result.model.id}`;
-	} catch (error) {
-		data.warnings.push(`native resolver failed for ${value}: ${error instanceof Error ? error.message : String(error)}`);
-		return undefined;
-	}
-}
-
 function resolveEntry(entry: ModelRoleEntry, data: ValidationData): { status: "class" | "fallback" | "none"; selector?: string } {
-	const roleLookup = settingsRoleLookup(data.settings);
-	if (data.resolver?.resolveModelRoleValue) {
-		const classSelector = selectorFromNative(data.settings?.getModelRole?.(entry.role), data);
-		if (classSelector) return { status: "class", selector: classSelector };
-		const fallbackSelector = selectorFromNative(entry.standardFallback, data);
-		if (fallbackSelector) return { status: "fallback", selector: fallbackSelector };
-		return { status: "none" };
-	}
-	return resolveRoleChain(entry, roleLookup, data.inventory);
+	return resolveRoleChain(entry, { getModelRole: role => data.settings?.getModelRole?.(role) }, data.inventory);
 }
 
 function findAgentsDirectory(cwd: string): string | undefined {
@@ -168,15 +132,6 @@ async function loadSettings(api: CustomCommandAPI, cwd: string): Promise<Setting
 	return settings.loadReadOnly({ cwd });
 }
 
-async function loadResolver(data: ValidationData): Promise<void> {
-	try {
-		// Optional deep import keeps the command usable with older OMP installations.
-		data.resolver = (await import("@oh-my-pi/pi-coding-agent/config/model-resolver") as unknown) as ModelResolverModule;
-	} catch (error) {
-		data.warnings.push(`native model resolver unavailable; using inventory matching (${error instanceof Error ? error.message : String(error)})`);
-	}
-}
-
 function modelRoleSource(settings: SettingsLike | undefined, role: string): string {
 	try {
 		return settings?.getModelRoleSource?.(role) ?? "effective";
@@ -215,7 +170,7 @@ function degradedReport(warnings: string[]): string {
 
 async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext, cwd: string): Promise<{ report: string; data: ValidationData }> {
 	const warnings: string[] = [];
-	const data: ValidationData = { settings: undefined, inventory: [], resolver: undefined, warnings };
+	const data: ValidationData = { settings: undefined, inventory: [], warnings };
 	try {
 		data.settings = await loadSettings(api, cwd);
 	} catch (error) {
@@ -232,7 +187,7 @@ async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext,
 		notify(ctx, "omp-model-roles: validation degraded", "warning");
 		return { report: degradedReport(warnings), data };
 	}
-	await loadResolver(data);
+	warnings.push("INFO: resolving roles against available models inventory (provider/id matcher; no native module import)");
 	data.frontmatterWarning = validateFrontmatter(cwd);
 	if (data.frontmatterWarning) warnings.push(data.frontmatterWarning);
 	const conflicts = MODEL_ROLES.map(entry => entry.role).filter(role => BUILTIN_ROLES.includes(role));
