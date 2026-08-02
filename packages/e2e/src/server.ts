@@ -278,7 +278,19 @@ export async function killProcessTree(pid: number, opts: KillProcessTreeOptions 
 /* ------------------------------------------------------------------ */
 
 export interface OmpLaunchConfig {
-  readonly ompProfile: string;
+  /**
+   * Optional omp profile name. When set, omp is launched with
+   * `--profile <name>`, which keeps auth, sessions, caches and
+   * `models.db` inside that profile's isolated directory.
+   *
+   * When unset, NO `--profile` flag is passed and omp inherits the
+   * default profile (`~/.omp/agent/`) — including the host's
+   * `modelRoles`, `models.db`, and credentials. This is the right
+   * default for UX testing: an explicit `ompProfile` isolates the
+   * ux-e2e run from the host's data; inheriting lets the run use the
+   * same models the operator uses day-to-day.
+   */
+  readonly ompProfile?: string;
   readonly maxTimeSec: number;
   readonly approvalMode: string;
   readonly configPath: string;
@@ -302,10 +314,19 @@ export interface OmpLaunchConfig {
 /**
  * Build the omp argument vector. NEVER passes `-p`/`--print` and NEVER
  * `--no-pty` — the session must be a real interactive PTY.
+ *
+ * `--profile` is emitted only when `cfg.ompProfile` is a non-empty
+ * string. With NO profile, omp inherits the host default profile
+ * (`~/.omp/agent/`) — including `modelRoles`, `models.db`, and
+ * credentials — so the run is model-capable out of the box. An
+ * explicit `ompProfile` keeps ux-e2e data isolated; the caller picks.
  */
 export function buildOmpArgs(cfg: OmpLaunchConfig): string[] {
   const maxMinutes = Math.max(1, Math.round(cfg.maxTimeSec / 60));
-  const args: string[] = ['--profile', cfg.ompProfile];
+  const args: string[] = [];
+  if (typeof cfg.ompProfile === 'string' && cfg.ompProfile.length > 0) {
+    args.push('--profile', cfg.ompProfile);
+  }
   if (cfg.hostConfigPath !== undefined && cfg.hostConfigPath.length > 0) {
     args.push('--config', cfg.hostConfigPath);
   }
@@ -431,7 +452,12 @@ export interface TestSessionOptions {
   readonly rateLimit?: RateLimitOptions;
   /** omp binary. Default `$OMP_BIN` else `omp`. */
   readonly ompBinary?: string;
-  /** omp profile name. Default 'ux-e2e-test'. */
+  /**
+   * omp profile name. Default: unset — omp inherits the host default
+   * profile (`~/.omp/agent/`), so `modelRoles` + credentials come from
+   * the host's real config. Pass a name to isolate the run into its
+   * own profile directory (caller-managed).
+   */
   readonly ompProfile?: string;
   /** Session time budget in seconds. Default 1800 (30 min). */
   readonly maxTimeSec?: number;
@@ -1005,7 +1031,11 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     windowMs: opts.rateLimit?.windowMs ?? 1000,
   };
   const ompBinary = opts.ompBinary ?? process.env['OMP_BIN'] ?? 'omp';
-  const ompProfile = opts.ompProfile ?? 'ux-e2e-test';
+  // Default: NO --profile flag. omp inherits the host default profile
+  // (`~/.omp/agent/`) — `modelRoles`, `models.db`, credentials all
+  // resolve there. Explicit `ompProfile` keeps the run isolated; the
+  // caller opts in.
+  const ompProfile = opts.ompProfile;
   const maxTimeSec = opts.maxTimeSec ?? 1800;
   const approvalMode = opts.approvalMode ?? 'yolo';
   const token = opts.token ?? mintToken();

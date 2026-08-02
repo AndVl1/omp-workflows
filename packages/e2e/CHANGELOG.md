@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.1.3 — 2026-08-02
+
+### QA fixes round 2 (manual-QA verdict CONDITIONAL → PASS)
+
+- **LOW (FD-R1)** — `parseStartArgs` normalizes `--scenario` to an
+  absolute path against `process.cwd()` BEFORE the detached spawn.
+  Previously the detached child re-ran `parseStartArgs` with
+  `cwd = scratchDir`, so a relative `--scenario` resolved against the
+  scratch dir and failed. Absolute paths pass through unchanged.
+  Verified live: `start --detach --surface text --scenario
+  packages/e2e/scenarios/full-feature.json` produces a session whose
+  `session.json.scenario = { id: 'full-feature', title: 'Full workflow:
+  discovery -> exploration -> clarify -> architecture -> implementation ->
+  review -> manual QA' }`.
+- **HIGH (model blocker)** — `buildOmpArgs` no longer emits `--profile`
+  by default. `ompProfile` on `OmpLaunchConfig` is optional; when set,
+  `--profile <name>` is still passed (callers opt in to a dedicated
+  profile); when unset, NO profile flag is passed and omp inherits
+  the host default profile (`~/.omp/agent/`) — `modelRoles`,
+  `models.db`, and credentials all resolve there. The ux-e2e overlay
+  still runs SECOND as a `--config` overlay so its overrides win; the
+  host's `modelRoles` survive untouched. `startTestSession` records
+  the resolved profile name in `session.json.profile` (null when no
+  profile is set; `report.ts` falls back to `default`). Verified live:
+  spawning `omp --config ~/.omp/agent/config.yml
+  --config <scratch>/.omp/ux-e2e-overlay.json --session-dir
+  <scratch>/.omp/agent --hide-thinking --max-time 30m --approval-mode
+  yolo` (exactly the args the new builder emits) boots omp
+  model-capable — the welcome screen shows `DeepSeek V4 Flash (New) ·
+  opencode-go` (the host default from `~/.omp/agent/config.yml`).
+  No `No model selected` / `No models available` errors.
+
+### Tests
+
+- 2 new tests: FD-R1 scenario-path normalization in `cli.test.ts`,
+  default-args contract in `server.test.ts` (omits `--profile`, still
+  emits both `--config` overlays in host-first / overlay-second order).
+  Total: 48 (was 46).
+
+# Changelog
+
 ## 0.1.2 — 2026-08-02
 
 ### QA-blocking defect fixes (manual-QA verdict FAIL)

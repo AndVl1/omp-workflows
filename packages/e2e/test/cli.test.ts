@@ -108,6 +108,32 @@ test('cli: start missing scratch-dir exits 1 via main', async () => {
   assert.ok(err.includes('missing <scratch-dir>'));
 });
 
+test('cli: start --scenario normalizes to absolute path against process.cwd() (FD-R1)', () => {
+  // Fix A: a relative --scenario must be resolved against the PARENT
+  // process cwd at parse time, not against the scratch dir. The
+  // detached child re-runs parseStartArgs with cwd = scratchDir, so
+  // without normalization the relative path resolves to the wrong
+  // root and loadScenario() fails. Absolute paths must pass through
+  // unchanged.
+  const relArgs = parseStartArgs(['/tmp/scratch', '--scenario', 'packages/e2e/scenarios/full-feature.json']);
+  assert.ok(
+    relArgs.scenario !== undefined && relArgs.scenario.endsWith('packages/e2e/scenarios/full-feature.json'),
+    `relative --scenario must be absolute; got ${String(relArgs.scenario)}`,
+  );
+  assert.ok(
+    relArgs.scenario === `${process.cwd()}/packages/e2e/scenarios/full-feature.json` ||
+      relArgs.scenario === `${process.cwd()}/packages/e2e/scenarios/full-feature.json`.replace(/\/+/gu, '/'),
+    'relative --scenario resolves against process.cwd()',
+  );
+  // Absolute pass-through: the input is already absolute, no change.
+  const absPath = '/tmp/abs/full-feature.json';
+  const absArgs = parseStartArgs(['/tmp/scratch', '--scenario', absPath]);
+  assert.equal(absArgs.scenario, absPath);
+  // No --scenario → undefined.
+  const noArgs = parseStartArgs(['/tmp/scratch']);
+  assert.equal(noArgs.scenario, undefined);
+});
+
 test('cli: parseMaxTime units', () => {
   assert.equal(parseMaxTime('30m'), 1800);
   assert.equal(parseMaxTime('1h'), 3600);

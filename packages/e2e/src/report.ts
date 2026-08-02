@@ -506,7 +506,7 @@ export function generateReport(
       slug,
       scratch_dir: scratchDir,
       omp_version: typeof rawSession.omp_version === 'string' ? rawSession.omp_version : 'unknown',
-      profile: typeof rawSession.profile === 'string' ? rawSession.profile : 'ux-e2e-test',
+      profile: typeof rawSession.profile === 'string' && rawSession.profile.length > 0 ? rawSession.profile : 'default',
       tty: readTty(rawSession.tty),
       started_at: typeof rawSession.started_at === 'string' ? rawSession.started_at : null,
       finished_at: null,

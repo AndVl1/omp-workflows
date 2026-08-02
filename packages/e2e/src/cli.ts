@@ -239,7 +239,12 @@ export function parseStartArgs(argv: string[]): StartArgs {
     rows: typeof values.rows === 'string' ? parsePositiveInt(values.rows, '--rows') : 30,
     detach: values.detach === true,
     force: values.force === true,
-    scenario: typeof values.scenario === 'string' ? values.scenario : undefined,
+    // Normalize --scenario against the *parent* cwd at parse time so
+    // --detach works (the detached child runs with cwd = scratchDir and
+    // would otherwise resolve a relative --scenario against the wrong
+    // root). Already-absolute paths pass through unchanged.
+    scenario:
+      typeof values.scenario === 'string' ? resolve(values.scenario) : undefined,
     task: typeof values.task === 'string' ? values.task : undefined,
     maxTimeSec: typeof values['max-time'] === 'string' ? parseMaxTime(values['max-time']) : 1800,
     idleMs: typeof values['idle-ms'] === 'string' ? parsePositiveInt(values['idle-ms'], '--idle-ms') : 1_200_000,

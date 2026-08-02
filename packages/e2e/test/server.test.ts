@@ -99,6 +99,32 @@ test('server: buildOmpArgs matches the launch contract', () => {
   assert.ok(!args.includes('--no-pty'), 'never passes --no-pty');
 });
 
+test('server: buildOmpArgs omits --profile when ompProfile is unset (default = inherit host profile)', () => {
+  // The default ux-e2e launch has NO `--profile` flag — omp inherits
+  // the host's default profile (`~/.omp/agent/`) so `modelRoles`,
+  // `models.db`, and credentials all resolve there. An explicit
+  // `ompProfile` is opt-in only (the next test).
+  const args = buildOmpArgs({
+    maxTimeSec: 1800,
+    approvalMode: 'yolo',
+    configPath: '/tmp/scratch/.omp/ux-e2e-overlay.json',
+    sessionDir: '/tmp/scratch/.omp/agent',
+    hostConfigPath: '/Users/test/.omp/agent/config.yml',
+  });
+  assert.ok(!args.includes('--profile'), 'no --profile flag when ompProfile is unset');
+  assert.deepEqual(args, [
+    '--config', '/Users/test/.omp/agent/config.yml',
+    '--config', '/tmp/scratch/.omp/ux-e2e-overlay.json',
+    '--session-dir', '/tmp/scratch/.omp/agent',
+    '--hide-thinking',
+    '--max-time', '30m',
+    '--approval-mode', 'yolo',
+  ]);
+  assert.ok(!args.includes('-p') && !args.includes('--print'));
+  assert.ok(!args.includes('--no-pty'));
+});
+
+
 test('server: buildOmpArgs prepends host config (D4 — model inheritance)', () => {
   // omp merges `--config` overlays in argv order with later overlays
   // overriding earlier ones for duplicate keys (verified against
