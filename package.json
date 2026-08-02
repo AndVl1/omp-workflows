@@ -17,6 +17,7 @@
 		"test:core": "npm run test -w @andvl1/omp-workflows-core",
 		"test:fullstack": "npm run test -w @andvl1/omp-workflows-fullstack",
 		"test:all": "npm run test --workspaces",
+		"e2e": "npm run build -w @andvl1/omp-workflows-e2e && node packages/e2e/dist/cli.js",
 		"clean": "rm -rf packages/*/dist"
 	},
 	"engines": {

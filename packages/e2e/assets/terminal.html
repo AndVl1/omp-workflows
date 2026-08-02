@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>ux-e2e terminal</title>
+    <link rel="stylesheet" href="/xterm.css" />
+    <style>
+      html, body { height: 100%; margin: 0; background: #0b0b0b; }
+      body { display: flex; flex-direction: column; }
+      #terminal { flex: 1; min-height: 0; padding: 4px; }
+      .xterm { height: 100%; }
+      #status { padding: 4px 10px; font: 11px ui-monospace, monospace; color: #9ca3af; background: #0f1115; border-top: 1px solid #1f2937; }
+    </style>
+  </head>
+  <body>
+    <div id="terminal"></div>
+    <div id="status">connecting…</div>
+    <script src="/xterm.js"></script>
+    <script src="/addon-fit.js"></script>
+    <script src="/page.js"></script>
+  </body>
+</html>

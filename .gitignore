@@ -13,3 +13,6 @@ coverage
 # Local runtime / workflow state — per-machine, never committed
 .omp/
 .work-state/
+
+# UX E2E run evidence (heavy: transcripts, screenshots) — keep local, reports go to git
+vibe-report/evidence/
