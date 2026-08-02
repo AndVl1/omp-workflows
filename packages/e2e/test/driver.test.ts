@@ -4,12 +4,14 @@
  */
 
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { WebSocket } from 'ws';
 
-import { AskStateTracker, TranscriptLog, waitFor, WaitTimeoutError } from '../src/driver.js';
+import { AskStateTracker, TranscriptLog, waitFor, WaitTimeoutError, WsDriver } from '../src/driver.js';
+import { startTestSession } from '../src/server.js';
 
 function makeDir(): string {
   return mkdtempSync(join(tmpdir(), 'ux-e2e-driver-'));
@@ -160,4 +162,55 @@ test('waitFor: resolves immediately and times out with a clear error', async () 
     waitFor(() => false, { timeoutMs: 60, intervalMs: 10, label: 'never-happens' }),
     (err: unknown) => err instanceof WaitTimeoutError && /never-happens/u.test(err.message),
   );
+});
+
+test('TranscriptLog: refresh reads only the delta on subsequent calls', () => {
+  const dir = makeDir();
+  const path = join(dir, 'transcript.jsonl');
+  const lines: string[] = [];
+  for (let i = 0; i < 200; i += 1) {
+    lines.push(oFrame(`pre-existing line ${i}\r\n`));
+  }
+  writeFileSync(path, lines.join(''));
+  assert.equal(statSync(path).size, lines.join('').length, 'pre-existing file is non-empty');
+  const log = new TranscriptLog(path);
+  const first = log.refresh();
+  assert.equal(first.length, 200, 'initial refresh ingests every pre-existing frame');
+  assert.equal(log.frames.length, 200);
+
+  const appended = oFrame('appended line\r\n');
+  appendFileSync(path, appended);
+  const second = log.refresh();
+  assert.equal(second.length, 1, 'second refresh ingests only the appended frame');
+  assert.equal(log.frames.length, 201);
+  const last = log.frames[log.frames.length - 1];
+  assert.ok(last !== undefined && last.t === 'o');
+  assert.ok(last !== undefined && (last as { d: string }).d.includes('appended line'));
+});
+
+test('WsDriver: open() closes the failed socket on auth failure', async t => {
+  const dir = makeDir();
+  mkdirSync(join(dir, '.work-state', 'ux-e2e'), { recursive: true });
+  const session = await startTestSession({ cwd: dir, noPty: true, token: 'sekret' });
+  t.after(() => session.close());
+
+  // First consume the token via a raw WS so the next WsDriver.open() is rejected.
+  const first = new WebSocket(`ws://127.0.0.1:${session.port}/ws?token=sekret`);
+  const { promise: ackReceived, resolve: ackSeen } = Promise.withResolvers<void>();
+  first.on('message', () => ackSeen());
+  const { promise: opened, resolve: openDone, reject: openFailed } = Promise.withResolvers<void>();
+  first.once('open', () => openDone());
+  first.once('error', err => openFailed(err));
+  await opened;
+  // Wait for the server's auth ack ({t:'s', ok:true}) — once received the
+  // server has consumed the token and the next WsDriver.open() will be
+  // rejected with a 401.
+  await ackReceived;
+  first.close();
+
+  const transcriptPath = join(dir, 'transcript-fail.jsonl');
+  const driver = new WsDriver({ url: session.url, transcriptPath });
+  await assert.rejects(driver.open(), /401|unexpected server response/iu);
+  // Even after a failed open, close() must be a no-op (no throw).
+  await driver.close();
 });

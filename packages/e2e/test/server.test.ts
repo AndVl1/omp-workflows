@@ -250,3 +250,23 @@ test('driver: waitFor timeout semantics', async () => {
     WaitTimeoutError,
   );
 });
+
+test('server: ws accepts a localhost client (loopback alias)', async t => {
+  const scratch = makeScratch();
+  const session = await startTestSession({ cwd: scratch, noPty: true, token: 'sekret' });
+  t.after(() => session.close());
+
+  const msgs: ServerMsg[] = [];
+  const ws = await openWs(session.port, 'sekret', { origin: `http://localhost:${session.port}` }, m => msgs.push(m));
+  await waitFor(() => msgs.some(m => m.t === 's'), { timeoutMs: 2000 });
+  await ws.close();
+});
+
+test('server: ws rejects a mismatched port on the loopback alias', async t => {
+  const scratch = makeScratch();
+  const session = await startTestSession({ cwd: scratch, noPty: true, token: 'sekret' });
+  t.after(() => session.close());
+  // origin is on the wrong port — must NOT be aliased through.
+  const err = await wsFails(session.port, 'sekret', { origin: `http://localhost:${session.port + 1}` });
+  assert.match(err.message, /403|unexpected server response/iu);
+});

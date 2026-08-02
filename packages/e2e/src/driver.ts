@@ -130,15 +130,27 @@ export class WsDriver implements TerminalDriver {
       }
     });
 
-    await opened;
-    const { promise: timedOut, reject: timeoutReached } = Promise.withResolvers<never>();
-    const timer = setTimeout(() => timeoutReached(new WaitTimeoutError('ux-e2e: ws auth ack timeout')), 5000);
     try {
-      await Promise.race([acked, timedOut]);
-    } finally {
-      clearTimeout(timer);
+      await opened;
+      const { promise: timedOut, reject: timeoutReached } = Promise.withResolvers<never>();
+      const timer = setTimeout(() => timeoutReached(new WaitTimeoutError('ux-e2e: ws auth ack timeout')), 5000);
+      try {
+        await Promise.race([acked, timedOut]);
+      } finally {
+        clearTimeout(timer);
+      }
+      this.#ws = ws;
+    } catch (err) {
+      // Close the failed socket so we don't leak the underlying fd + listeners.
+      // `terminate()` is fire-and-forget — it doesn't throw if the socket is
+      // already torn down — and removes the need for a follow-up close().
+      try {
+        ws.terminate();
+      } catch {
+        /* ignore. */
+      }
+      throw err;
     }
-    this.#ws = ws;
   }
 
   async readScreen(): Promise<string> {
@@ -326,7 +338,18 @@ const OPTION_LINE_RE = /^\s*(?:\d+[.)\]]\s*|\*\s*|-\s*|\[[ xX]\]\s*)/u;
 export class TranscriptLog {
   readonly #path: string;
   readonly #frames: TranscriptFrame[] = [];
-  #cursorLines = 0;
+  /**
+   * Byte offset of the next read. Tracked via fstatSync so refresh()
+   * only reads the delta, not the whole file (matches the docstring and
+   * the prior-art port payload contract).
+   */
+  #offset = 0;
+  /**
+   * Whether the trailing partial line (after the last newline) has been
+   * ingested. We never split a frame across reads; a partial line is
+   * rolled back to the next newline boundary on the next refresh.
+   */
+  #partialTail = '';
 
   constructor(transcriptPath: string) {
     this.#path = resolve(transcriptPath);
@@ -338,28 +361,44 @@ export class TranscriptLog {
     const fd = openSync(this.#path, 'r');
     try {
       const { size } = fstatSync(fd);
-      const buf = Buffer.alloc(size);
-      let offset = 0;
-      while (offset < buf.length) {
-        const n = readSync(fd, buf, offset, buf.length - offset, offset);
-        if (n <= 0) break;
-        offset += n;
+      if (size < this.#offset) {
+        // File was truncated/replaced under us — reset to the start.
+        this.#offset = 0;
+        this.#partialTail = '';
+        this.#frames.length = 0;
       }
-      const text = buf.toString('utf8');
-      const lines = text.split('\n');
+      if (size === this.#offset) return [];
+      const buf = Buffer.alloc(size - this.#offset);
+      let read = 0;
+      while (read < buf.length) {
+        const n = readSync(fd, buf, read, buf.length - read, this.#offset + read);
+        if (n <= 0) break;
+        read += n;
+      }
+      const text = this.#partialTail + buf.toString('utf8');
+      // Drop the trailing partial line so we never split a frame.
+      const lastNewline = text.lastIndexOf('\n');
+      let toIngest: string;
+      if (lastNewline === -1) {
+        // No complete lines yet — keep accumulating.
+        this.#partialTail = text;
+        return [];
+      }
+      toIngest = text.slice(0, lastNewline);
+      this.#partialTail = text.slice(lastNewline + 1);
+      this.#offset = size - Buffer.byteLength(this.#partialTail, 'utf8');
       const added: TranscriptFrame[] = [];
-      for (let i = this.#cursorLines; i < lines.length; i += 1) {
-        const line = lines[i]?.trim();
-        if (line === undefined || line.length === 0) continue;
+      for (const line of toIngest.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.length === 0) continue;
         try {
-          const frame = JSON.parse(line) as TranscriptFrame;
+          const frame = JSON.parse(trimmed) as TranscriptFrame;
           this.#frames.push(frame);
           added.push(frame);
         } catch {
           /* skip partial line */
         }
       }
-      this.#cursorLines = lines.length;
       return added;
     } finally {
       try {
@@ -540,13 +579,12 @@ export class AskStateTracker {
       // Nothing captured yet — refresh and decide from the live state.
       const fresh = this.pendingBlock();
       if (fresh !== null) return this.#recordAnswer(fresh, text);
+      // No pending block. If the transcript has any blocks at all, the
+      // last one was already answered (pendingBlock would have returned
+      // it otherwise). Otherwise there are no asks — 'no-pending'.
       const all = this.#log.askBlocks();
       if (all.length > 0) {
-        const last = all[all.length - 1];
-        if (last !== undefined && this.#answered.has(AskStateTracker.#key(last))) {
-          return { ok: false, reason: 'already-answered' };
-        }
-        return { ok: false, reason: 'transcript-advanced' };
+        return { ok: false, reason: 'already-answered' };
       }
       return { ok: false, reason: 'no-pending' };
     }

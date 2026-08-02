@@ -10,6 +10,20 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSyn
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 
+
+/**
+ * Strip ANSI escapes and lone C0 control chars from a value destined for
+ * the report. Keeps \t \n \r at the byte level (they're harmless in JSON)
+ * but drops the ESC (0x1b) sequence and embedded BEL/BS/VT/FF that
+ * downstream renderers can mishandle. Mirrors `sanitizeForJson` in
+ * server.ts — duplicated here so report.ts remains import-free.
+ */
+function sanitizeForJson(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  return value
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/gu, '')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/gu, '');
+}
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
 /* ------------------------------------------------------------------ */
@@ -482,7 +496,6 @@ export function generateReport(
     const mdRoot = resolve(opts.mdDir ?? join(process.cwd(), 'vibe-report'));
     evidence = copyEvidence(evidence, join(mdRoot, 'evidence', slug));
   }
-
   const report: UxE2eReport = {
     type: 'ux-e2e',
     schema_version: 1,
@@ -497,7 +510,7 @@ export function generateReport(
       tty: readTty(rawSession.tty),
       started_at: typeof rawSession.started_at === 'string' ? rawSession.started_at : null,
       finished_at: null,
-      task_prompt: typeof rawSession.task_prompt === 'string' ? rawSession.task_prompt : null,
+      task_prompt: typeof rawSession.task_prompt === 'string' ? sanitizeForJson(rawSession.task_prompt) : null,
       scenario: readScenarioRef(rawSession.scenario),
       transcript,
       session_jsonl: sessionJsonl,

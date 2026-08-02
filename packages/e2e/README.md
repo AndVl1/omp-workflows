@@ -126,6 +126,13 @@ Upgrade path: `/ws?token=<single-use-token>`.
   does not ship `lib/xterm.css`).
 - Screenshots require the web surface (`playwright` installed); text mode
   `screenshot()` throws by design.
+- **Single-PTY lifecycle** — the session holds ONE PTY for the whole
+  run; any WS disconnect (browser reload, sleep/resume, network blip)
+  kills the omp process and the session ends. The token is single-use
+  so there is no reconnect. This is an explicit design decision, not a
+  bug — restructuring to per-connection PTY would change the contract.
+  Plan transient resilience with `--max-time` and a fresh
+  `ux-e2e start <scratch>` if the run needs to span browser reloads.
 
 ## License
 

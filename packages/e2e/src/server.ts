@@ -20,7 +20,7 @@
 
 import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { basename, join, resolve } from 'node:path';
@@ -32,7 +32,87 @@ import { WebSocketServer, type WebSocket as WS } from 'ws';
 
 /** Max inbound WS frame size (defense-in-depth; the browser never needs more). */
 export const MAX_INBOUND_WS_BYTES = 64 * 1024;
+/**
+ * Proxy env vars to strip when `keepProxyEnv` is false. Both upper and
+ * lower variants are listed because POSIX permits mixed-case names and
+ * tools like curl/Python honour the lowercase form. Ported from
+ * @pi-harness/web-terminal buildPtyEnv.
+ */
+export const PROXY_ENV_KEYS = [
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+  'no_proxy',
+] as const;
 
+/**
+ * Build the env passed to `pty.spawn`. Merges `process.env` with caller
+ * overrides, pins TERM, and (by default) deletes the proxy env vars so a
+ * hostile or corporate proxy cannot MITM LLM/API calls. Pass
+ * `keepProxyEnv: true` to opt out.
+ */
+export function buildPtyEnv(
+  baseEnv: Readonly<Record<string, string | undefined>>,
+  overrides: Readonly<Record<string, string>> | undefined,
+  opts: { readonly keepProxyEnv?: boolean } = {},
+): Record<string, string> {
+  const env: Record<string, string> = {
+    ...(baseEnv as Record<string, string>),
+    ...(overrides ?? {}),
+    TERM: 'xterm-256color',
+  };
+  if (opts.keepProxyEnv !== true) {
+    // Remove proxy vars after the spread so no source can sneak them in.
+    for (const key of PROXY_ENV_KEYS) delete env[key];
+  }
+  return env;
+}
+
+/**
+ * Perm tightening for the session evidence files. The default umask is
+ * 0o022, which leaves session.json + transcript.jsonl world-readable on
+ * multi-user hosts — exposing the bearer token and the full PTY I/O.
+ * writeFileSync({mode:0o600}) pins the mode at create time; chmodSync
+ * is the belt-and-braces second pass because umask can still narrow
+ * the effective bits on some platforms.
+ */
+export const SESSION_FILE_MODE = 0o600;
+export const SESSION_DIR_MODE = 0o700;
+
+function writeSessionFile(path: string, body: string): void {
+  writeFileSync(path, body, { mode: SESSION_FILE_MODE });
+  try {
+    chmodSync(path, SESSION_FILE_MODE);
+  } catch {
+    /* filesystem may not support chmod (e.g. some Windows volumes) — best-effort. */
+  }
+}
+
+function appendSessionFile(path: string, body: string): void {
+  appendFileSync(path, body, { mode: SESSION_FILE_MODE });
+  try {
+    chmodSync(path, SESSION_FILE_MODE);
+  } catch {
+    /* best-effort. */
+  }
+}
+
+/**
+ * Strip ANSI escapes and lone C0 control chars from a value destined for
+ * a JSON file (session.json / report). Keeps \t \n \r at the byte level
+ * (they're harmless in JSON) but drops the ESC (0x1b) sequence and
+ * embedded BEL/BS/VT/FF that downstream renderers can mishandle.
+ */
+export function sanitizeForJson(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  return value
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/gu, '')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/gu, '');
+}
 /* ------------------------------------------------------------------ */
 /* Token primitives                                                    */
 /* ------------------------------------------------------------------ */
@@ -266,6 +346,12 @@ export interface TestSessionOptions {
    * never for real e2e runs.
    */
   readonly noPty?: boolean;
+  /**
+   * Keep proxy env vars (HTTP_PROXY etc.) when spawning the PTY. Default
+   * false — they are stripped to prevent a hostile or corporate proxy
+   * from MITMing LLM/API calls. Pass true to opt out.
+   */
+  readonly keepProxyEnv?: boolean;
 }
 
 /** Handle to a running test session. */
@@ -348,29 +434,53 @@ export function assertNoLiveSession(scratchDir: string, force: boolean): void {
 /* HTTP security headers + CSP                                         */
 /* ------------------------------------------------------------------ */
 
-/** Hardening headers applied to every HTTP response. */
+/**
+ * Hardening headers applied to every HTTP response. Frame deny + referrer
+ * policy are first-class defenses; CSP is layered on top in `cspHeader`.
+ */
 export function securityHeaders(host: string, port: number): Readonly<Record<string, string>> {
   return {
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
     'X-Content-Type-Options': 'nosniff',
     'Cache-Control': 'no-store',
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cross-Origin-Embedder-Policy': 'require-corp',
+    'Cross-Origin-Resource-Policy': 'same-origin',
     'Content-Security-Policy': cspHeader(`http://${host}:${port}`),
   };
 }
 
-/** Strict CSP: no remote scripts, no frames, only self + the local WS. */
+/**
+ * Strict CSP — full set, ported from @pi-harness/web-terminal origin.ts.
+ * The page only loads its own bundle (`'self'`); inline `style` attributes
+ * are required by xterm.js so `'unsafe-inline'` is allowed in `style-src`
+ * but never in `script-src` or `connect-src`. `connect-src` includes the
+ * same-origin WS so a malicious page cannot convince the browser to open
+ * an arbitrary WS upgrade using a stolen token.
+ */
 export function cspHeader(selfOrigin: string): string {
-  let wsAllow = '';
+  let wsSelf = '';
   try {
     const u = new URL(selfOrigin);
-    wsAllow = ` ws://${u.host}`;
+    wsSelf = u.protocol === 'https:' ? `wss://${u.host}` : `ws://${u.host}`;
   } catch {
     /* keep connect-src minimal on parse failure */
   }
-  return `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'${wsAllow}`;
+  return [
+    "default-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+    "img-src 'self' data:",
+    "font-src 'self' data:",
+    "style-src 'self' 'unsafe-inline'",
+    "script-src 'self'",
+    "connect-src 'self' " + wsSelf,
+    "object-src 'none'",
+    "manifest-src 'self'",
+  ].join('; ');
 }
-
 /* ------------------------------------------------------------------ */
 /* Static assets (terminal page + vendored xterm)                      */
 /* ------------------------------------------------------------------ */
@@ -396,6 +506,7 @@ function resolveVendorAssets(): VendorAssets {
     addonFitJs: require.resolve('@xterm/addon-fit/lib/addon-fit.js'),
   };
 }
+
 
 function serveFile(res: ServerResponse, path: string, contentType: string): void {
   let body = assetCache.get(path);
@@ -458,26 +569,86 @@ function readToken(req: IncomingMessage): string | null {
 }
 
 /**
- * Origin/Host verification. The Host header must match `<host>:<port>`
- * exactly (loopback-only server). The Origin header — sent by browsers —
- * is checked ONLY when present (curl / ws clients omit it and have no
- * ambient authority to abuse).
+ * Origin / Host verification — ported from @pi-harness/web-terminal
+ * `isLocalhostOrigin`. The server is bound to 127.0.0.1; the browser may
+ * connect via `localhost` (or `[::1]`) instead — both refer to the same
+ * loopback interface, so we accept them as long as the port matches.
+ * Non-loopback hosts are NEVER aliased. The Origin header (when sent by
+ * a browser) is checked in full; the Host header is the fallback for
+ * curl / ws clients that omit Origin.
  */
-function originAllowed(req: IncomingMessage, expectedOrigin: string): boolean {
+const LOOPBACK_ALIASES = new Set(['127.0.0.1', 'localhost', '::1']);
+const ALIAS_PROTOCOLS = new Set(['http:', 'https:', 'ws:', 'wss:']);
+const BRACKETED_V6 = /^\[([0-9a-fA-F:]+)\](?::(\d+))?$/u;
+const HOST_PORT = /^([^:\[]+)(?::(\d+))?$/u;
+
+/** Parse `host[:port]` where host may be IPv4, IPv6, or a DNS name. */
+export function parseHostPort(value: string): { hostname: string; port: string } | null {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  const v6 = BRACKETED_V6.exec(trimmed);
+  if (v6 !== null) {
+    const host = v6[1] ?? '';
+    const port = v6[2] ?? '';
+    return { hostname: host, port };
+  }
+  const m = HOST_PORT.exec(trimmed);
+  if (m === null) return null;
+  return { hostname: m[1] ?? '', port: m[2] ?? '' };
+}
+
+export function originAllowed(req: IncomingMessage, expectedOrigin: string): boolean {
   let expectedHost = '';
+  let expectedHostname = '';
+  let expectedPort = '';
+  let expectedProtocol = '';
   try {
-    expectedHost = new URL(expectedOrigin).host;
+    const u = new URL(expectedOrigin);
+    expectedHost = u.host;
+    expectedHostname = u.hostname;
+    expectedProtocol = u.protocol;
+    expectedPort = u.port;
   } catch {
     return false;
   }
-  const hostHeader = req.headers.host;
-  if (typeof hostHeader !== 'string' || hostHeader.length === 0) return false;
-  if (hostHeader !== expectedHost) return false;
   const origin = req.headers.origin;
+  let candidateHost = '';
+  let candidateHostname = '';
+  let candidatePort = '';
+  let candidateProto = '';
   if (typeof origin === 'string' && origin.length > 0) {
-    return origin === expectedOrigin;
+    try {
+      const ou = new URL(origin);
+      candidateHost = ou.host;
+      candidateHostname = ou.hostname;
+      candidateProto = ou.protocol;
+      candidatePort = ou.port;
+    } catch {
+      return false;
+    }
+  } else {
+    const hostHeader = req.headers.host;
+    if (typeof hostHeader !== 'string' || hostHeader.length === 0) return false;
+    const parsed = parseHostPort(hostHeader);
+    if (parsed === null) return false;
+    candidateHost = hostHeader;
+    candidateHostname = parsed.hostname;
+    candidatePort = parsed.port;
   }
-  return true;
+  if (candidateHost.length === 0) return false;
+  // 1) Exact match (existing behaviour).
+  if (candidateHost === expectedHost) return true;
+  // 2) Loopback alias — localhost <-> 127.0.0.1 <-> ::1 — ports must match.
+  if (
+    LOOPBACK_ALIASES.has(candidateHostname) &&
+    LOOPBACK_ALIASES.has(expectedHostname) &&
+    candidatePort === expectedPort &&
+    ALIAS_PROTOCOLS.has(candidateProto || expectedProtocol) &&
+    ALIAS_PROTOCOLS.has(expectedProtocol)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 export type AttachResult =
@@ -521,7 +692,7 @@ export function attachSession(
 
   const appendTranscript = (frame: TranscriptFrame): void => {
     try {
-      appendFileSync(opts.transcriptPath, JSON.stringify(frame) + '\n');
+      appendSessionFile(opts.transcriptPath, JSON.stringify(frame) + '\n');
     } catch {
       /* transcript is best-effort evidence — never fatal. */
     }
@@ -567,19 +738,25 @@ export function attachSession(
     // Authenticated — ack first.
     send(ws, { t: 's', ok: true });
 
-    if (opts.pty === null) {
-      if (opts.spawnError !== null) {
-        send(ws, { t: 'err', code: 'spawn-failed', message: opts.spawnError });
-        appendTranscript({ ts: new Date().toISOString(), t: 'err', code: 'spawn-failed', message: opts.spawnError });
-        try {
-          ws.close(1000, 'spawn failed');
-        } catch {
-          /* ignore. */
-        }
-        return;
+    if (opts.pty === null && opts.spawnError !== null) {
+      // Spawn failed — fatal: report it and close the socket so the
+      // client does not keep banging on a dead session.
+      send(ws, { t: 'err', code: 'spawn-failed', message: opts.spawnError });
+      appendTranscript({ ts: new Date().toISOString(), t: 'err', code: 'spawn-failed', message: opts.spawnError });
+      try {
+        ws.close(1000, 'spawn failed');
+      } catch {
+        /* ignore. */
       }
-      // noPty test mode — keep the socket open; input is rejected below.
-    } else {
+      return;
+    }
+    if (opts.pty === null) {
+      // noPty test mode — keep the socket open so the client can drive
+      // protocol-level exercises (rate-limit, idle-timeout, sanitize).
+      // Port matches @pi-harness/web-terminal: silently drop input when
+      // ptyProc===null. Resize is also a no-op (no terminal to resize).
+    }
+    if (opts.pty !== null) {
       const ptyProc = opts.pty;
       ptyProc.onData(data => {
         if (closed) return;
@@ -626,18 +803,14 @@ export function attachSession(
       } catch {
         return;
       }
+      if (opts.pty === null) {
+        // noPty sessions: silently drop input/resize — the contract
+        // matches @pi-harness/web-terminal (see CHANGELOG "no-pty
+        // behavior" decision). The socket stays open so unit tests can
+        // exercise rate-limit and idle-timeout over the same WS.
+        return;
+      }
       if (msg.t === 'i') {
-        if (opts.pty === null) {
-          const m = 'this session has no PTY (noPty mode)';
-          send(ws, { t: 'err', code: 'no-pty', message: m });
-          appendTranscript({ ts: new Date().toISOString(), t: 'err', code: 'no-pty', message: m });
-          try {
-            ws.close(1000, 'no pty');
-          } catch {
-            /* ignore. */
-          }
-          return;
-        }
         appendTranscript({ ts: new Date().toISOString(), t: 'i', d: msg.d });
         try {
           opts.pty.write(msg.d);
@@ -645,7 +818,6 @@ export function attachSession(
           /* PTY may be dying — best-effort. */
         }
       } else if (msg.t === 'r') {
-        if (opts.pty === null) return;
         if (msg.cols > 0 && msg.rows > 0) {
           try {
             opts.pty.resize(Math.min(msg.cols, 1000), Math.min(msg.rows, 1000));
@@ -734,11 +906,11 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   const token = opts.token ?? mintToken();
 
   const stateDir = stateDirOf(scratchDir);
-  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(stateDir, { recursive: true, mode: SESSION_DIR_MODE });
   const transcriptPath = join(stateDir, 'transcript.jsonl');
   const sessionJsonPath = join(stateDir, 'session.json');
   // Truncate the transcript — a fresh session starts with a clean evidence file.
-  writeFileSync(transcriptPath, '');
+  writeSessionFile(transcriptPath, '');
 
   const ompVersion = await resolveOmpVersion(ompBinary);
 
@@ -767,11 +939,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   // binary may be missing on some platforms — noPty test sessions must
   // still work when the native module cannot load.
   const ptyMod = await import('node-pty');
-    const env: Record<string, string> = {
-      ...(process.env as Record<string, string>),
-      TERM: 'xterm-256color',
-      ...opts.env,
-    };
+    const env = buildPtyEnv(process.env, opts.env, { keepProxyEnv: opts.keepProxyEnv });
     const args = buildOmpArgs({
       ompProfile,
       maxTimeSec,
@@ -789,7 +957,6 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     }
   }
 
-  // ---- session.json (evidence pointer for report/stop/transcript) ----
   const sessionJson = {
     slug: deriveSlug(scratchDir),
     url,
@@ -800,11 +967,11 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     omp_version: ompVersion,
     profile: ompProfile,
     tty: { cols, rows, term: 'xterm-256color' },
-    task_prompt: opts.taskPrompt ?? null,
+    task_prompt: opts.taskPrompt !== null && opts.taskPrompt !== undefined ? sanitizeForJson(opts.taskPrompt) : null,
     scenario: opts.scenario ?? null,
     surface,
   };
-  writeFileSync(sessionJsonPath, JSON.stringify(sessionJson, null, 2) + '\n');
+  writeSessionFile(sessionJsonPath, JSON.stringify(sessionJson, null, 2) + '\n');
 
   // ---- HTTP: security headers + static page -------------------------
   const assets = resolveVendorAssets();
