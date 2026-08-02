@@ -1,0 +1,96 @@
+{
+  "id": "full-feature",
+  "title": "Full workflow: discovery -> exploration -> clarify -> architecture -> implementation -> review -> manual QA",
+  "description": "Runs the complete omp-workflows pipeline end-to-end in a fresh scratch project: the tester types /do-work, answers the [ask_user] clarify prompts, watches each stage, and rates the UX. Expects 6 clarify questions plus 1 architecture choice.",
+  "task": { "file": "full-feature-task.md" },
+  "params": {
+    "slug": "my-feature",
+    "branch": "feat/my-feature",
+    "task": "implement the feature described in the task prompt"
+  },
+  "stages": [
+    {
+      "id": "discovery",
+      "name": "Discovery",
+      "expect": ["Discovery", "stage: discovery", "discovery"]
+    },
+    {
+      "id": "exploration",
+      "name": "Exploration",
+      "expect": ["Exploration", "stage: exploration", "exploration"]
+    },
+    {
+      "id": "clarify",
+      "name": "Clarification",
+      "expect": ["Clarif", "stage: clarify", "ask_user"],
+      "ask_user": [
+        {
+          "answer": "scoped to the requested surface; keep it minimal",
+          "count": 6
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "name": "Architecture",
+      "expect": ["Architect", "stage: architecture"],
+      "ask_user": [
+        {
+          "titlePattern": "architecture",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "implementation",
+      "name": "Implementation",
+      "expect": ["Implementation", "stage: implementation", "implement"]
+    },
+    {
+      "id": "code_review",
+      "name": "Code review",
+      "expect": ["Code review", "stage: code_review", "review"]
+    },
+    {
+      "id": "review_fixes",
+      "name": "Review fixes",
+      "expect": ["fix", "stage: review_fixes", "rework"]
+    },
+    {
+      "id": "manual_qa",
+      "name": "Manual QA",
+      "expect": ["Manual QA", "stage: manual_qa", "qa"]
+    },
+    {
+      "id": "qa_tests",
+      "name": "QA tests",
+      "expect": ["test", "stage: qa_tests", "verification"]
+    },
+    {
+      "id": "summary",
+      "name": "Summary",
+      "expect": ["Summary", "stage: summary", "report"]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 600000,
+    "checkpointPollMs": 2000
+  },
+  "screenshots": {
+    "on": ["stage_start", "ask_user", "error"]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}
