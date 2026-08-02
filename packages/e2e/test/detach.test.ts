@@ -53,7 +53,7 @@ interface CliResult {
 }
 
 /** Spawn `node dist/cli.js <args>` and wait for it to exit. */
-function runCli(args: string[], timeoutMs = 30_000): Promise<CliResult> {
+function runCli(args: string[], timeoutMs = 90_000): Promise<CliResult> {
   const { promise, resolve: done, reject: fail } = deferred<CliResult>();
   const startedAt = Date.now();
   const chunks: Buffer[] = [];

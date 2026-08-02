@@ -414,7 +414,9 @@ async function runStartDetached(args: StartArgs): Promise<number> {
   child.unref();
 
   // Wait for the child's session.json to appear with a live pid.
-  const deadline = Date.now() + 15_000;
+  // Cold starts (CI runners, slow disks) can exceed 15 s; keep a generous
+  // deadline so the detached child has time to boot omp and write session.json.
+  const deadline = Date.now() + 60_000;
   for (;;) {
     const info = readSessionInfo(args.scratchDir);
     if (info !== null && pidIsLive(info.pid)) {
