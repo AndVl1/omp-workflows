@@ -44,12 +44,29 @@ Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
 | Command | Purpose |
 |---|---|
 | `bootstrap <slug> <branch>` | Create `<workdir>/omp-ux-e2e-<slug>` (default `/tmp`), `git init`, wire the plugin via `npm link` (NOT `file:` — the unpublished peer would fail with ETARGET), write `.omp/ux-e2e-overlay.json`, copy `.omp/team.config.json`, materialize custom-TS commands. `--force` re-creates. |
-| `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a detached child whose stdout/stderr are appended to `<scratch>/.work-state/ux-e2e/detach.log` (the parent tails the last 8 KiB on the 15 s startup timeout so failures are not swallowed). `--scenario`, `--task`, `--surface web|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. |
+| `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a **detached child that survives the parent** — the child writes its stdout/stderr directly into `<scratch>/.work-state/ux-e2e/detach.log` via an inherited file descriptor (no pipe between parent and child, so the child cannot crash with EPIPE when the parent exits). The parent tails the last 8 KiB on the 15 s startup timeout so failures are not swallowed. `--scenario`, `--task`, `--surface web\|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. |
 | `stop <scratch-dir>` | SIGTERM → SIGKILL the recorded process tree (see session.json `pid`). |
 | `transcript <scratch-dir>` | Render transcript.jsonl as text; `--tail N`, `--follow`. |
 | `ask <scratch-dir> [<answer>]` | `--list` shows the pending `[ask_user]` block; with `<answer>` it sends `<answer>\n` in ONE `{t:'i'}` frame and appends `{ts, answer}` to ask-state.jsonl. Double-answer guard refuses stale/already-answered prompts. |
 | `input <scratch-dir> <text>` | Unconditionally sends `<text>\n` in ONE `{t:'i'}` frame, without requiring a pending `[ask_user]` prompt. In the omp TUI, Enter is `\n`; do not use `\r`, which is inserted literally. |
 | `report <scratch-dir>` | `generateReport()` → `<scratch>/.work-state/ux-e2e/report.json` + `<mdDir>/<slug>-ux-e2e-<date>.md` (default `./vibe-report`). `--steps` supplies structured ratings; `--copy-evidence` mirrors evidence files. |
+
+## Session hygiene & safe stopping
+
+Stop sessions **only** through `ux-e2e stop <scratch>` (or the equivalent
+`npm run e2e -- stop <scratch>`). The command reads the session PID from
+`<scratch>/.work-state/ux-e2e/session.json`, verifies that the live process
+belongs to that scratch session, then sends SIGTERM and (after the grace
+period) SIGKILL to its process tree. If the PID is stale or belongs to another
+process, stopping is refused rather than risking an unrelated session.
+
+**Never** use `pkill`, `killall`, or `kill` by a process name or pattern (for
+example `omp` or `bun`). Those commands can terminate omp sessions belonging
+to other terminals or users. `start --force` already resolves a live session
+for the requested scratch directory; manual process cleanup is not needed.
+
+When the recorded PID is no longer running, `ux-e2e stop` reports that state
+and leaves the rest of the host untouched.
 
 ## Architecture
 
@@ -83,8 +100,10 @@ Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
   markdown. Defect floors: CRITICAL→1, HIGH→2, MEDIUM→3, LOW→4; ratings are
   clamped and warnings are emitted.
 - **`src/cli.ts`** — thin `node:util parseArgs` dispatch over the seven
-  subcommands. `--detach` pipes child stdout/stderr to `detach.log` and tails
-  it on timeout.
+  subcommands. `--detach` spawns the child with an inherited file descriptor
+  for stdout/stderr pointing at `detach.log` (no parent-side pipe — the
+  child outlives the parent without an EPIPE crash) and tails the log on
+  the 15 s startup timeout.
 
 ## WS protocol
 
@@ -136,10 +155,12 @@ reconnects while the session is alive and becomes unusable after shutdown.
   first real run. Answers typed *inside* the terminal (not via `ask`) are not
   recorded in ask-state.jsonl and are treated as "the transcript moved on".
 - Single session at a time per scratch dir (session.json live-pid guard).
-- `--detach` runs the session in a detached child; its stdout/stderr are
-  captured to `<scratch>/.work-state/ux-e2e/detach.log` and the parent
-  surfaces the tail on the 15 s startup timeout. Stop the run with
-  `ux-e2e stop <scratch>` (or let `--max-time` expire).
+- `--detach` runs the session in a detached child whose stdout/stderr are
+  captured to `<scratch>/.work-state/ux-e2e/detach.log` via an inherited
+  file descriptor (no pipe between parent and child — the child
+  **outlives the parent** and is only stopped via `ux-e2e stop <scratch>` or
+  `--max-time` expiry). The parent surfaces the log tail on the 15 s
+  startup timeout.
 - The xterm stylesheet is served from `@xterm/xterm/css/xterm.css` (the package
   does not ship `lib/xterm.css`).
 - The host `~/.omp/agent/config.yml` is auto-inherited as the first

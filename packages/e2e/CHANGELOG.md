@@ -12,6 +12,28 @@
 - Added `ux-e2e input <scratch-dir> <text>` for arbitrary terminal commands. It
   sends `<text>\n` as one input frame without waiting for `[ask_user]`; `\n` is
   Enter in the omp TUI, while `\r` is literal input.
+- Hardened `ux-e2e stop` against stale or foreign `session.json` PIDs: a live
+  process must have a command line containing the requested scratch path before
+  its process tree is terminated; mismatches are refused with an error.
+- Added README guidance in **Session hygiene & safe stopping**: use only
+  `ux-e2e stop <scratch>`, never broad `pkill`/`killall`/name-pattern kills,
+  and rely on `start --force` for live-session replacement.
+- `ux-e2e start --detach` now spawns the detached child with stdout/stderr
+  redirected to `<scratch>/.work-state/ux-e2e/detach.log` via an inherited
+  file descriptor — **no pipe between parent and child** — so the detached
+  session survives the parent exiting. Previously the parent held a
+  `pipe → logStream` open (event loop never drained; parent hung for >60 s
+  after printing the URL) AND, more fatally, the parent's stdio teardown
+  closed the pipe ends the child was writing to, so the next `console.log()`
+  in the child triggered an unhandled EPIPE on its stdout and the process
+  died ~3-4 s after the parent's exit (ECONNREFUSED on the session URL).
+  Regression pinned by `test/detach.test.ts`: bootstrap → `start --detach`
+  → assert parent exits in < 10 s → assert pid alive + port listening
+  after 5.5 s → assert `ux-e2e input` round-trip — all green; the same
+  flow previously hung the parent and crashed the child.
+- README updates describing the fd-based detach mechanism in the `start`
+  row, the `src/cli.ts` architecture bullet, and the `--detach`
+  Known-limitation bullet.
 
 ## 0.1.4 — 2026-08-02
 

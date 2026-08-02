@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { detachLogPath, main, parseBootstrapArgs, parseInputArgs, parseMaxTime, parseStartArgs, runInput, tailLogFile } from '../src/cli.js';
+import { detachLogPath, main, parseBootstrapArgs, parseInputArgs, parseMaxTime, parseStartArgs, runInput, runStop, tailLogFile } from '../src/cli.js';
 
 /** Run main() with console/stdout captured; returns { code, out, err }. */
 async function runMain(argv: string[]): Promise<{ code: number; out: string; err: string }> {
@@ -138,6 +138,26 @@ test('cli: input sends text plus newline in one frame without ask state', async 
   assert.equal(code, 0);
   assert.deepEqual(frames, ['/do-work implement it\n']);
   rmSync(scratchDir, { recursive: true });
+});
+
+test('cli: stop refuses a live PID whose command line is not the scratch session', async () => {
+  const scratchDir = mkdtempSync(join(tmpdir(), 'ux-e2e-stop-stale-'));
+  const stateDir = join(scratchDir, '.work-state', 'ux-e2e');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(stateDir, 'session.json'), JSON.stringify({ pid: process.pid }));
+
+  const originalError = console.error;
+  const errors: string[] = [];
+  console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+  try {
+    const code = await runStop({ scratchDir });
+    assert.equal(code, 1);
+    assert.match(errors.join('\n'), /does not match scratch session/u);
+    assert.equal(process.kill(process.pid, 0), true, 'the test process remains alive');
+  } finally {
+    console.error = originalError;
+    rmSync(scratchDir, { recursive: true });
+  }
 });
 
 test('cli: start --scenario normalizes to absolute path against process.cwd() (FD-R1)', () => {
