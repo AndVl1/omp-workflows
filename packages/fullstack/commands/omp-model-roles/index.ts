@@ -19,11 +19,7 @@ const MAX_PROVIDER_LENGTH = 96;
 const MAX_MODEL_ID_LENGTH = 192;
 const MAX_MODEL_NAME_LENGTH = 128;
 const FRONTMATTER_ROLE_PATTERN = /^model:\s*\[\s*"(@[^\"]+)"\s*,\s*"(@[^\"]+)"\s*\]\s*$/m;
-const USAGE = [
-	"Usage: /omp-model-roles [validate|recommendations]",
-	"  validate          inspect role settings, model inventory, and agent frontmatter (default)",
-	"  recommendations   return a prompt for task(agent: 'tech-researcher') with the validated inventory",
-].join("\n");
+const USAGE = 'Usage: /omp-model-roles [validate|recommendations] — type "recommendations" to get model suggestions for your available models, or "validate" to check current role config';
 
 interface SettingsLike {
 	getModelRole?: (role: string) => string | undefined;
@@ -366,25 +362,27 @@ const factory = (api: CustomCommandAPI): CustomCommand => ({
 	name: "omp-model-roles",
 	description: "Validate per-agent model roles or delegate fresh model recommendations.",
 	async execute(args: string[], ctx: HookCommandContext): Promise<string> {
-		const action = args.length === 0 ? "validate" : args.length === 1 ? args[0] : undefined;
+		const isDefault = args.length === 0;
+		const action = isDefault ? "validate" : args.length === 1 ? args[0] : undefined;
 		if (action !== "validate" && action !== "recommendations") return USAGE;
+		const wrap = (report: string): string => (isDefault ? `${USAGE}\n${report}` : report);
 		const cwd = ctx.cwd ?? api.cwd;
 		if (!cwd) {
 			const report = degradedReport(["no cwd available"]);
 			notify(ctx, "omp-model-roles: no cwd available", "warning");
-			return report;
+			return wrap(report);
 		}
 		try {
 			const validation = await collectValidation(api, ctx, cwd);
-			if (action === "validate") return validation.report;
+			if (action === "validate") return wrap(validation.report);
 			if (validation.data.inventory.length === 0) {
-				return `${validation.report}\nWARN: model-role recommendations unavailable: no validated models in the inventory; research was not dispatched.`;
+				return wrap(`${validation.report}\nWARN: model-role recommendations unavailable: no validated models in the inventory; research was not dispatched.`);
 			}
-			return `${validation.report}\n\n${buildResearchPrompt(validation.data)}`;
+			return wrap(`${validation.report}\n\n${buildResearchPrompt(validation.data)}`);
 		} catch (error) {
 			const report = degradedReport([`unexpected validation failure: ${error instanceof Error ? error.message : String(error)}`]);
 			notify(ctx, "omp-model-roles: unexpected validation failure", "warning");
-			return report;
+			return wrap(report);
 		}
 	},
 });
