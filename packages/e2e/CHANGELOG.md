@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.1.4 — 2026-08-02
+
+### qa_tests regression coverage (manual-QA verdict PASS, encoded as durable tests)
+
+- **Report contract test** — `test/qa-regression.test.ts`: feeds
+  `generateReport()` the realistic 11-step + 3-defect
+  (FD-DETACH-LIFECYCLE / FD-RL / FD-REVIEW-REPORT-LOSS) input mirroring the
+  live ux-e2e-reference3 run, asserts the JSON carries every
+  manual_qa-required field (verdict / evidence / mode / regressions) AND
+  the full ux-e2e shape (session / steps / defects / agent_quality /
+  overall). Verdict PASS stays PASS; the CONDITIONAL → FAIL projection
+  rule used by the downstream CI gate is documented as a single source of
+  truth. MEDIUM defect floor clamps `overall.score` to 3 (matches the
+  observed score of 3 in the live run).
+- **Scenario shape test** — asserts `scenarios/full-feature.json` loads,
+  expands with zero literal `{{...}}` left in the rendered task, and that
+  its 10 stage ids (`discovery, exploration, clarify, architecture,
+  implementation, code_review, review_fixes, manual_qa, qa_tests, summary`)
+  match `packages/core/workflows/full-feature.json` IN ORDER.
+- **Model-config inheritance test** — asserts `buildOmpArgs` emits
+  `--config <host>` BEFORE `--config <overlay>` (overlay wins on conflict
+  per omp's argv-order merge), NO `--profile` flag by default (host
+  profile inherited so `modelRoles` survive), and `--profile <name>`
+  emitted only when `opts.ompProfile` is set. Asserts `--profile` is
+  positioned BEFORE the first `--config` so profile selection is resolved
+  before overlay lookup.
+- **Session artifact test** — fixture-driven assertion that session.json
+  carries every field the report reads (slug, url, token, pid,
+  started_at, omp_version, profile, tty, task_prompt) and that
+  `task_prompt` contains no literal `{{...}}`. Also runs end-to-end
+  through `generateReport()` to confirm the values flow from the fixture
+  into the report's `report.session.*` fields.
+
+### Documentation
+
+- **FD-RL rate-limit typing threshold (doc-only, no code change)** —
+  documented the observed typing-speed threshold in `README.md`
+  "Known limitations" and `CHANGELOG.md` (this entry). The per-connection
+  rate limit is **200 messages / 1 s window** (see `RateLimiter` in
+  `src/server.ts`); puppeteer's default ~30 ms / char keyboard.type can
+  cross the rolling window on a long prompt burst and emit
+  `{t:'err',code:'rate-limited'}`. With single-PTY lifecycle, a
+  rate-limit close kills the omp session. Recommended workarounds for
+  driver code: batch via `ux-e2e ask <scratch> "<answer>"` (one frame),
+  throttle to `delay ≥ 150 ms` per character (200 ms observed safe), or
+  send the whole prompt in one WS frame instead of per-char keystrokes.
+  **Do NOT raise the limit code without first reviewing
+  single-PTY-lifecycle implications** — the limit exists to keep a
+  runaway client from drowning the PTY. Recorded as known framework
+  defect FD-RL (MEDIUM) per manual QA — observation only, no fix.
+
+### Tests
+
+- 8 new tests in `test/qa-regression.test.ts` (3 report, 1 scenario,
+  2 buildOmpArgs, 2 session artifact). Total: 56 (was 48).
+
+# Changelog
+
 ## 0.1.3 — 2026-08-02
 
 ### QA fixes round 2 (manual-QA verdict CONDITIONAL → PASS)

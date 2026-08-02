@@ -149,6 +149,26 @@ Upgrade path: `/ws?token=<single-use-token>`.
   bug — restructuring to per-connection PTY would change the contract.
   Plan transient resilience with `--max-time` and a fresh
   `ux-e2e start <scratch>` if the run needs to span browser reloads.
+- **Rate-limit typing threshold (FD-RL, observed live)** — the per-connection
+  inbound rate limit is **200 messages / 1 s window** (see `RateLimiter` in
+  `src/server.ts`). puppeteer's default `page.keyboard.type` runs at
+  ~30 ms / char (~33 chars/s) which is comfortably under the limit for
+  short bursts, but long prompt bursts (e.g. a 200-char task prompt typed
+  back-to-back) can cross the rolling window and emit
+  `{t:'err',code:'rate-limited'}`. With the single-PTY lifecycle, a
+  rate-limit close kills the omp session. Recommended workarounds for
+  driver code:
+    - **Batch via `ux-e2e ask <scratch> "<answer>"`** — sends the answer in
+      a single `{t:'i'}` frame and writes to `ask-state.jsonl`, bypassing
+      the character-by-character path.
+    - **Throttle typing** — use `delay ≥ 150 ms` per character on
+      `page.keyboard.type(...)` (200 ms is the safe value observed live
+      against the real run).
+    - **Send whole prompts in one frame** — concatenate and submit the
+      prompt via a single WS frame rather than per-char keystrokes.
+  Do NOT raise the limit code without first reviewing single-PTY-lifecycle
+  implications — the limit exists to keep a runaway client from drowning
+  the PTY.
 
 ## License
 
