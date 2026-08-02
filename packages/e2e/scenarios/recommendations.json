@@ -1,0 +1,50 @@
+{
+  "id": "recommendations",
+  "title": "/omp-model-roles recommendations — verify delegation to tech-researcher",
+  "description": "Run /omp-model-roles recommendations and verify the main agent delegates to a tech-researcher sub-agent and renders the recommendation table.",
+  "task": { "file": "recommendations-task.md" },
+  "params": {
+    "slug": "model-roles",
+    "branch": "feat/agent-model-roles"
+  },
+  "stages": [
+    {
+      "id": "submit",
+      "name": "Submit /omp-model-roles recommendations",
+      "expect": ["/omp-model-roles", "recommendations"]
+    },
+    {
+      "id": "delegate",
+      "name": "Delegate to tech-researcher sub-agent",
+      "expect": ["tech-researcher", "task("]
+    },
+    {
+      "id": "research",
+      "name": "Sub-agent runs web_search and gathers sources",
+      "expect": ["web_search"]
+    },
+    {
+      "id": "table",
+      "name": "Render recommendations table",
+      "expect": ["role", "model", "source"]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 900000,
+    "checkpointPollMs": 2000
+  },
+  "screenshots": { "on": ["stage_start", "ask_user", "error"] },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

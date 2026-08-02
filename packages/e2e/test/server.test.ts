@@ -247,18 +247,23 @@ test('server: ws rejects a wrong token', async t => {
   assert.match(err.message, /401|unexpected server response/iu);
 });
 
-test('server: single-use token — replay is rejected', async t => {
+test('server: session-scoped token — reconnect is accepted until the session closes', async () => {
   const scratch = makeScratch();
   const session = await startTestSession({ cwd: scratch, noPty: true, token: 'sekret' });
-  t.after(() => session.close());
 
-  const msgs: ServerMsg[] = [];
-  const ws = await openWs(session.port, 'sekret', {}, m => msgs.push(m));
-  await waitFor(() => msgs.some(m => m.t === 's'), { timeoutMs: 2000 });
-  await ws.close();
+  const firstMessages: ServerMsg[] = [];
+  const first = await openWs(session.port, 'sekret', {}, message => firstMessages.push(message));
+  await waitFor(() => firstMessages.some(message => message.t === 's'), { timeoutMs: 2000 });
+  await first.close();
 
-  const err = await wsFails(session.port, 'sekret');
-  assert.match(err.message, /401|unexpected server response/iu);
+  const reconnectMessages: ServerMsg[] = [];
+  const reconnect = await openWs(session.port, 'sekret', {}, message => reconnectMessages.push(message));
+  await waitFor(() => reconnectMessages.some(message => message.t === 's'), { timeoutMs: 2000 });
+  await reconnect.close();
+
+  await session.close();
+  const error = await wsFails(session.port, 'sekret');
+  assert.match(error.message, /401|ECONNREFUSED|connect/iu);
 });
 
 test('server: ws rejects a mismatched Origin', async t => {
@@ -335,12 +340,21 @@ test('server: ws echo roundtrip through a fake PTY command', async t => {
     { timeoutMs: 5000, label: 'pty echo' },
   );
 
-  // Server-side transcript got the frames — the evidence backbone.
-  const transcript = readFileSync(session.transcriptPath, 'utf8');
-  assert.ok(transcript.includes('echo:hello'), 'transcript.jsonl contains the pty output');
-  assert.ok(transcript.includes('"t":"i"'), 'transcript.jsonl records the input frame');
-
   await ws.close();
+
+  const reconnectMessages: ServerMsg[] = [];
+  const reconnect = await openWs(session.port, 'sekret', {}, message => reconnectMessages.push(message));
+  await waitFor(() => reconnectMessages.some(message => message.t === 's'), { timeoutMs: 2000 });
+  reconnect.send(JSON.stringify({ t: 'i', d: 'again\n' }));
+  await waitFor(
+    () => reconnectMessages.some(message => message.t === 'o' && message.d.includes('echo:again')),
+    { timeoutMs: 5000, label: 'pty echo after reconnect' },
+  );
+  await reconnect.close();
+  const transcript = readFileSync(session.transcriptPath, 'utf8');
+  assert.ok(transcript.includes('echo:hello'), 'transcript.jsonl contains output before disconnect');
+  assert.ok(transcript.includes('echo:again'), 'same PTY accepts input after reconnect');
+  assert.ok(transcript.includes('"t":"i"'), 'transcript.jsonl records input frames');
 });
 
 test('server: session.json + pty metadata written', async t => {

@@ -180,6 +180,11 @@ export class WsDriver implements TerminalDriver {
     this.#ws.send(JSON.stringify({ t: 'i', d: text }));
   }
 
+  /** Submit text to omp. Enter in the omp TUI is `\n`; `\r` is literal input. */
+  async submit(text: string): Promise<void> {
+    await this.type(text + '\n');
+  }
+
   async close(): Promise<void> {
     const ws = this.#ws;
     this.#ws = null;

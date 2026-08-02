@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- WebSocket tokens are now scoped to the live session, so clients can reconnect
+  with the same 256-bit localhost URL token until the session shuts down.
+- Closing or losing a WebSocket now detaches only that client instead of killing
+  the PTY. `session.close()`, idle timeout, and PTY exit retain their lifecycle
+  behavior, including process-tree cleanup and exit notification.
+- Added `ux-e2e input <scratch-dir> <text>` for arbitrary terminal commands. It
+  sends `<text>\n` as one input frame without waiting for `[ask_user]`; `\n` is
+  Enter in the omp TUI, while `\r` is literal input.
+
 ## 0.1.4 — 2026-08-02
 
 ### qa_tests regression coverage (manual-QA verdict PASS, encoded as durable tests)
@@ -41,15 +54,12 @@
   rate limit is **200 messages / 1 s window** (see `RateLimiter` in
   `src/server.ts`); puppeteer's default ~30 ms / char keyboard.type can
   cross the rolling window on a long prompt burst and emit
-  `{t:'err',code:'rate-limited'}`. With single-PTY lifecycle, a
-  rate-limit close kills the omp session. Recommended workarounds for
-  driver code: batch via `ux-e2e ask <scratch> "<answer>"` (one frame),
-  throttle to `delay ≥ 150 ms` per character (200 ms observed safe), or
-  send the whole prompt in one WS frame instead of per-char keystrokes.
-  **Do NOT raise the limit code without first reviewing
-  single-PTY-lifecycle implications** — the limit exists to keep a
-  runaway client from drowning the PTY. Recorded as known framework
-  defect FD-RL (MEDIUM) per manual QA — observation only, no fix.
+  `{t:'err',code:'rate-limited'}`. At the time this release shipped, a
+  rate-limit close also killed the omp session; this lifecycle defect is fixed
+  in Unreleased. Recommended workarounds were batching via `ux-e2e ask`,
+  throttling to `delay ≥ 150 ms` per character, or sending a whole prompt in
+  one WS frame. The limit remains to prevent a runaway client from drowning
+  the PTY.
 
 ### Tests
 
@@ -176,20 +186,18 @@
 
 ### Documented design decisions
 
-- **Single-PTY lifecycle** — the session holds ONE PTY for the whole
-  run; any WS disconnect kills it (single-use token, no reconnect).
-  Documented as an explicit design decision in README
-  "Known limitations" — restructuring to per-connection PTY would
-  change the contract. Any transient WS failure (browser reload,
-  sleep/resume) terminates the omp run; use `--max-time` and re-run.
+- **Single-PTY lifecycle (superseded)** — this release ended the session on
+  any WS disconnect and used a single-use token. Unreleased replaces that
+  behavior with client detachment plus session-scoped reconnects.
 
 ## 0.1.0 — 2026-08-02
 
 Initial release of the UX E2E test framework (pragmatic architecture).
 
-- `startTestSession()`: loopback-only HTTP+WS server with single-use token
-  auth, Origin/Host checks, strict CSP/frame/referrer headers, per-connection
-  rate limit, idle timer, SIGTERM→SIGKILL process-tree kill, and a real omp
+- `startTestSession()`: loopback-only HTTP+WS server with the original
+  single-use-token auth (superseded by the session-scoped token in Unreleased),
+  Origin/Host checks, strict CSP/frame/referrer headers, per-connection rate
+  limit, idle timer, SIGTERM→SIGKILL process-tree kill, and a real omp
   PTY (TERM=xterm-256color, rc-suppressed by direct spawn).
 - Server-side `transcript.jsonl` append — the evidence backbone for reports.
 - TerminalDriver seam: `WsDriver` (text mode over the transcript) and lazy

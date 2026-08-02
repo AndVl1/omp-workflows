@@ -8,6 +8,7 @@
  *   stop <scratch-dir>           stop a running session (SIGTERM -> SIGKILL its tree)
  *   transcript <scratch-dir>     render the session transcript
  *   ask <scratch-dir> [<answer>] list or answer a pending [ask_user] prompt
+ *   input <scratch-dir> <text>   send arbitrary input followed by Enter
  *   report <scratch-dir>         generate the ux-e2e report (JSON + markdown)
  */
 
@@ -40,6 +41,7 @@ Subcommands:
   stop <scratch-dir>            stop a running session (SIGTERM -> SIGKILL its tree)
   transcript <scratch-dir>      render the session transcript
   ask <scratch-dir> [<answer>]  list or answer a pending [ask_user] prompt
+  input <scratch-dir> <text>    send arbitrary input followed by Enter
   report <scratch-dir>          generate the ux-e2e report (JSON + markdown)
 
 Run 'ux-e2e <subcommand> --help' for subcommand options.`;
@@ -584,9 +586,50 @@ export async function runAsk(args: AskArgs): Promise<number> {
   }
   const driver = new WsDriver({ url, transcriptPath });
   await driver.open();
-  await driver.type(args.answer + '\n');
+  await driver.submit(args.answer);
   await driver.close();
   console.log(`ux-e2e ask: answered [ask_user #${result.block.index}] with ${JSON.stringify(args.answer)}`);
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* input                                                               */
+/* ------------------------------------------------------------------ */
+
+export interface InputArgs {
+  readonly scratchDir: string;
+  readonly text: string;
+}
+
+export function parseInputArgs(argv: string[]): InputArgs {
+  const { positionals } = parseArgsOrThrow(argv, {});
+  const scratchDir = positionals[0];
+  const text = positionals[1];
+  if (scratchDir === undefined) throw new Error('ux-e2e input: missing <scratch-dir> argument');
+  if (text === undefined) throw new Error('ux-e2e input: missing <text> argument');
+  return { scratchDir: resolve(scratchDir), text };
+}
+
+export async function runInput(
+  args: InputArgs,
+  createDriver: (url: string, transcriptPath: string) => Pick<WsDriver, 'open' | 'submit' | 'close'> =
+    (url, transcriptPath) => new WsDriver({ url, transcriptPath }),
+): Promise<number> {
+  const sessionJson = readSessionJson(args.scratchDir);
+  const url = typeof sessionJson.url === 'string' ? sessionJson.url : null;
+  if (url === null) {
+    console.error('ux-e2e input: no session.json url — is a session running?');
+    return 1;
+  }
+  const transcriptPath = join(stateDirOf(args.scratchDir), 'transcript.jsonl');
+  const driver = createDriver(url, transcriptPath);
+  await driver.open();
+  try {
+    await driver.submit(args.text);
+  } finally {
+    await driver.close();
+  }
+  console.log(`ux-e2e input: sent ${JSON.stringify(args.text)} followed by Enter`);
   return 0;
 }
 
@@ -688,6 +731,10 @@ export async function main(argv: string[]): Promise<number> {
       case 'ask': {
         const args = parseAskArgs(rest);
         return runAsk(args);
+      }
+      case 'input': {
+        const args = parseInputArgs(rest);
+        return runInput(args);
       }
       case 'report': {
         const args = parseReportArgs(rest);
