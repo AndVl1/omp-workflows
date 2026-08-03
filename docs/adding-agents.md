@@ -4,6 +4,12 @@
 например, для Rust-, Go- или mobile-проекта. Механика проверена на
 `@andvl1/omp-workflows-fullstack` (17 агентов, 8 команд) и omp 17.2.x.
 
+> **Агенту потребителя**: если плагин установлен через `omp plugin install`,
+> эта инструкция попадает к нему как skill `custom-agent-bundle`
+> (`<pkg>/skills/custom-agent-bundle/SKILL.md` — omp дискаверит skills из
+> плагинов). `docs/` сам по себе omp не дискаверит и агент его не увидит.
+> Включай `docs` в `package.json#files` только если файл нужен человеку.
+
 ---
 
 ## 1. Как omp находит агентов
