@@ -41,7 +41,7 @@ function roleLookup(values: Record<string, string | undefined>) {
 	return { getModelRole: (role: string) => values[role] };
 }
 
-function createSettings(options: { fail?: boolean; overrides?: Record<string, string> } = {}) {
+function createSettings(options: { fail?: boolean; overrides?: Record<string, string>; webSearchEnabled?: boolean } = {}) {
 	if (options.fail) throw new Error("settings failed");
 	const roles: Record<string, string> = {
 		architect: "test/class-model",
@@ -49,14 +49,18 @@ function createSettings(options: { fail?: boolean; overrides?: Record<string, st
 		task: "test/fallback-model",
 		smol: "test/fallback-model",
 	};
+	const extras: Record<string, unknown> = {};
+	if (options.webSearchEnabled !== undefined) extras["web_search.enabled"] = options.webSearchEnabled;
 	return {
 		getModelRole: (role: string) => roles[role],
 		getModelRoleSource: () => "project",
-		get: (path: string) => path === "task.agentModelOverrides" ? options.overrides ?? {} : undefined,
+		get: (path: string) => {
+			if (path === "task.agentModelOverrides") return options.overrides ?? {};
+			return extras[path];
+		},
 	};
 }
-
-function createApi(options: { cwd?: string; settingsFailure?: boolean; overrides?: Record<string, string> } = {}) {
+function createApi(options: { cwd?: string; settingsFailure?: boolean; overrides?: Record<string, string>; webSearchEnabled?: boolean } = {}) {
 	let execCalls = 0;
 	const api = {
 		cwd: options.cwd ?? packageRoot,
@@ -69,7 +73,7 @@ function createApi(options: { cwd?: string; settingsFailure?: boolean; overrides
 		zod: {},
 		pi: {
 			Settings: {
-				loadReadOnly: async () => createSettings({ fail: options.settingsFailure, overrides: options.overrides }),
+				loadReadOnly: async () => createSettings({ fail: options.settingsFailure, overrides: options.overrides, webSearchEnabled: options.webSearchEnabled }),
 			},
 		},
 	};
@@ -296,7 +300,7 @@ test("execute validate reads settings and registry without mutation", async () =
 	const { ctx, notifications } = createContext();
 	const target = modelRolesFactory(api as never);
 	const result = await target.execute(["validate"], ctx as never);
-	assert.match(result, /\/omp-model-roles validate \(2 available models\)/);
+	assert.match(result, /\/omp-model-roles validate \(2 available models, web_search=unknown\)/);
 	assert.match(result, /use \/model without arguments/);
 	assert.match(result, /use \/switch \(Alt\+P\)/);
 	assert.equal(getExecCalls(), 0);
@@ -390,4 +394,44 @@ test("execute remains exit-safe when UI notify throws", async () => {
 test("command source contains no mutation APIs", () => {
 	const source = readFileSync(join(packageRoot, "commands", "omp-model-roles", "index.ts"), "utf8");
 	assert.doesNotMatch(source, /setModelRole|setProjectModelRole|writeFile|appendFile|mkdir|rmSync|api\.exec/);
+});
+
+test("execute validate reports web_search=enabled header and INFO when toggle is on", async () => {
+	const { api } = createApi({ webSearchEnabled: true });
+	const { ctx } = createContext();
+	const target = modelRolesFactory(api as never);
+	const result = await target.execute(["validate"], ctx as never);
+	assert.match(result, /web_search=enabled/);
+	assert.match(result, /WARN: INFO: web_search\.enabled=true/);
+	assert.match(result, /HookCommandContext lacks authStorage\/ToolSession/);
+});
+
+test("execute validate reports web_search=disabled header and WARN when toggle is off", async () => {
+	const { api } = createApi({ webSearchEnabled: false });
+	const { ctx } = createContext();
+	const target = modelRolesFactory(api as never);
+	const result = await target.execute(["validate"], ctx as never);
+	assert.match(result, /web_search=disabled/);
+	assert.match(result, /WARN: web_search disabled in settings/);
+});
+
+test("execute recommendations wraps the research contract in a marker envelope", async () => {
+	const { api } = createApi();
+	const { ctx } = createContext();
+	const target = modelRolesFactory(api as never);
+	const result = await target.execute(["recommendations"], ctx as never);
+	assert.match(result, /^<<<omp-model-roles-research-request>>>\n/);
+	assert.match(result, /\n<<<omp-model-roles-research-request-end>>>$/);
+	// The inner payload must still contain the original research contract.
+	const inner = result.replace(/^<<<omp-model-roles-research-request>>>\n/, "").replace(/\n<<<omp-model-roles-research-request-end>>>$/, "");
+	assert.match(inner, /agent="tech-researcher"/);
+	assert.match(inner, /RESEARCH_TASK_PAYLOAD_JSON:/);
+});
+
+test("execute validate is NOT wrapped in the research marker", async () => {
+	const { api } = createApi();
+	const { ctx } = createContext();
+	const target = modelRolesFactory(api as never);
+	const result = await target.execute(["validate"], ctx as never);
+	assert.doesNotMatch(result, /<<<omp-model-roles-research-request/);
 });

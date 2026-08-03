@@ -168,13 +168,32 @@ function degradedReport(warnings: string[]): string {
 	return lines.join("\n");
 }
 
-async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext, cwd: string): Promise<{ report: string; data: ValidationData }> {
+async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext, cwd: string): Promise<{ report: string; data: ValidationData; webSearchEnabled: boolean | null }> {
 	const warnings: string[] = [];
 	const data: ValidationData = { settings: undefined, inventory: [], warnings };
 	try {
 		data.settings = await loadSettings(api, cwd);
 	} catch (error) {
 		warnings.push(`settings unavailable: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	// web_search.enabled diagnostic: read toggle via the same SettingsLike proxy.
+	// HookCommandContext (hooks/types.ts:178-191) does NOT expose authStorage/ToolSession,
+	// so we cannot call resolveProviderChain/discoverAuthStorage here; the toggle is the
+	// only signal observable from a custom command. We surface the result as a header
+	// suffix and (when meaningfully different from the default) as a warning.
+	let webSearchEnabled: boolean | null = null;
+	try {
+		const raw = data.settings?.get?.("web_search.enabled");
+		webSearchEnabled = typeof raw === "boolean" ? raw : null;
+		if (webSearchEnabled === false) {
+			warnings.push("WARN: web_search disabled in settings (subagents see no web_search tool)");
+		} else if (webSearchEnabled === true) {
+			warnings.push(
+				"INFO: web_search.enabled=true; provider availability is NOT observable from /omp-model-roles (HookCommandContext lacks authStorage/ToolSession). Run `omp /login google-gemini-cli` or set GEMINI_API_KEY for reliable quality; free providers (duckduckgo/ecosia) may be bot-challenged.",
+			);
+		}
+	} catch {
+		// settings.get may throw on missing key — leave webSearchEnabled null, omit warning.
 	}
 	try {
 		const models = ctx.modelRegistry?.getAvailable?.() ?? [];
@@ -185,7 +204,7 @@ async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext,
 	}
 	if (!data.settings || data.inventory.length === 0) {
 		notify(ctx, "omp-model-roles: validation degraded", "warning");
-		return { report: degradedReport(warnings), data };
+		return { report: degradedReport(warnings), data, webSearchEnabled };
 	}
 	warnings.push("INFO: resolving roles against available models inventory (provider/id matcher; no native module import)");
 	data.frontmatterWarning = validateFrontmatter(cwd);
@@ -196,8 +215,9 @@ async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext,
 	if (overriddenAgents.length > 0) {
 		warnings.push(`INFO: task.agentModelOverrides takes priority for: ${overriddenAgents.join(", ")}`);
 	}
+	const webSearchSuffix = webSearchEnabled === true ? "enabled" : webSearchEnabled === false ? "disabled" : "unknown";
 	const lines = [
-		`/omp-model-roles validate (${data.inventory.length} available models)`,
+		`/omp-model-roles validate (${data.inventory.length} available models, web_search=${webSearchSuffix})`,
 		"role | agents | fallback | status | config-value | source",
 	];
 	for (const entry of MODEL_ROLES) {
@@ -211,7 +231,7 @@ async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext,
 	if (warnings.length > 0) lines.push(...warnings.map(warning => `WARN: ${truncate(warning, 180)}`));
 	lines.push(nativeModelHelp());
 	notify(ctx, "omp-model-roles: validation complete", warnings.length > 0 ? "warning" : "info");
-	return { report: lines.join("\n"), data };
+	return { report: lines.join("\n"), data, webSearchEnabled };
 }
 interface BoundedInventory {
 	models: InventoryModel[];
@@ -312,6 +332,15 @@ export function buildResearchPrompt(data: ValidationData): string {
 	return prompt;
 }
 
+const RESEARCH_REQUEST_START = "<<<omp-model-roles-research-request>>>";
+const RESEARCH_REQUEST_END = "<<<omp-model-roles-research-request-end>>>";
+function wrapResearchRequest(payload: string): string {
+	// The marker envelope is detected by an extension hook on `before_agent_start`
+	// (see packages/fullstack/src/index.ts). The hook is opaque to OMP itself —
+	// the literal lines are still part of the user-visible transcript — so the
+	// enclosed payload is identical to the pre-marker return value.
+	return `${RESEARCH_REQUEST_START}\n${payload}\n${RESEARCH_REQUEST_END}`;
+}
 const factory = (api: CustomCommandAPI): CustomCommand => ({
 	name: "omp-model-roles",
 	description: "Validate per-agent model roles or delegate fresh model recommendations.",
@@ -332,7 +361,12 @@ const factory = (api: CustomCommandAPI): CustomCommand => ({
 			if (validation.data.inventory.length === 0) {
 				return wrap(`${validation.report}\nWARN: model-role recommendations unavailable: no validated models in the inventory; research was not dispatched.`);
 			}
-			return wrap(`${validation.report}\n\n${buildResearchPrompt(validation.data)}`);
+			const recommendations = `${validation.report}\n\n${buildResearchPrompt(validation.data)}`;
+			// Marker envelope: detected by the extension's `before_agent_start` hook,
+			// which injects an agent-attributed developer instruction above the user
+			// prompt. The hook only fires for this action; `validate` is left bare
+			// (no hook contract — a pure read of role/registry state).
+			return wrapResearchRequest(wrap(recommendations));
 		} catch (error) {
 			const report = degradedReport([`unexpected validation failure: ${error instanceof Error ? error.message : String(error)}`]);
 			notify(ctx, "omp-model-roles: unexpected validation failure", "warning");

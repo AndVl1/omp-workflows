@@ -227,7 +227,126 @@ git push origin v0.2.0
 
 `.github/workflows/release.yml` then runs `npm ci`, full monorepo build, typecheck, tests, stamps `packages/{core,fullstack}/package.json#version` from the tag, and publishes `@andvl1/omp-workflows-core` then `@andvl1/omp-workflows-fullstack` to `npm.pkg.github.com` as `--access public`. `GITHUB_TOKEN` is sufficient; the `AndVl1/omp-workflows` repo is public so its tokens carry `packages: write` for the org.
 
-## Custom bundles
+## Strict recommendations command (vp9)
+
+`/omp-model-roles recommendations` is a **strict** command: it must
+delegate the actual research to the `tech-researcher` subagent
+deterministically. The contract relies on a marker envelope plus a
+`before_agent_start` extension hook:
+
+1. **Marker contract.** The custom command returns its validate-report
+   plus the research prompt wrapped in
+   ```text
+   <<<omp-model-roles-research-request>>>
+   <payload>
+   <<<omp-model-roles-research-request-end>>>
+   ```
+   The literal lines survive `input-controller.ts:665` (`text.trim()`)
+   and stay in the user-visible transcript. The marker is opaque to
+   OMP — it is detected by our hook, not by the engine.
+
+2. **`before_agent_start` hook.** The default bundle registers a
+   handler on `pi.on("before_agent_start", ...)` in
+   `packages/fullstack/src/index.ts`. When the marker is present in
+   `event.prompt`, the handler returns
+   `{ message: { customType, content, display, details, attribution: "agent" } }`
+   where `content` is the 4-step developer instruction
+   (`Step 1: task(tech-researcher, payload=ResearchRequest)`,
+   `Step 2: wait`, `Step 3: strict validation against the immutable
+   inventory snapshot`, `Step 4: render a markdown table or a
+   degraded-notice`). See
+   `packages/fullstack/src/before-agent-start-marker.ts` for the pure
+   helpers (`extractPayloadBetweenMarkers`,
+   `buildResearchRequestDeveloperInstruction`).
+
+3. **`attribution: "agent"` = developer priority.** OMP's
+   `normalizeCustomMessageAttribution` (`session/messages.ts:578-579`)
+   treats everything except an explicit `user` as `agent`. The LLM
+   processes agent-attributed messages as developer-priority — strictly
+   above user-text. This is the key fix for the
+   `recommendations_live_5/6/7` regression where the main agent
+   ignored the user-prompt delegation request.
+
+4. **Why this is NOT a `/do-work` stage.** The user explicitly chose a
+   `before_agent_start` hook over a workflow stage. A new
+   `/do-work` stage would couple delegation to the team workflow
+   (`team-state.json`, gates, role mapping) and force the user to
+   commit to a profile. The hook is **session-scoped**, fires once per
+   agent loop, and does not require any `work-state` artifact.
+   `team-state.json` remains untouched.
+
+5. **Fallback for sessions without the extension.** If the
+   `@andvl1/omp-workflows-fullstack` extension is not installed (e.g.
+   a slim bundle or a custom build), the custom command still emits
+   the validate-report + research prompt as plain text. The LLM
+   receives the same instruction but without the developer-attributed
+   message — i.e. it may ignore the delegation (the original
+   failure mode). The hook is a strict upgrade: it never makes
+   delegation worse, only better.
+
+## Web search provider configuration
+
+The `tech-researcher` agent calls `web_search` as **Step 1** of
+`## External Research (MUST)`. The runtime depends on OMP's
+`web_search` tool resolving to a working provider.
+
+### Free providers (no signup, may be bot-challenged)
+
+| Provider | Notes |
+|----------|-------|
+| `duckduckgo` | Default. May rate-limit or CAPTCHA in CI or shared IPs. |
+| `ecosia` | Fallback. Same bot-challenge risk as DuckDuckGo. |
+| `google-scrape` | Read-only scrape. Bot-challenged aggressively. |
+
+Free providers are good for ad-hoc lookups, but for production
+research the agent may degrade to MCP fallback (Context7, DeepWiki)
+when the search returns `Error: No web search provider configured.`
+or empty sources. See `## External Research (MUST) → Step 2:
+Degraded-notice` in `packages/fullstack/agents/tech-researcher.md`.
+
+### Paid providers (reliable quality, requires auth)
+
+| Provider | Login command | Environment variable |
+|----------|---------------|----------------------|
+| `google-gemini-cli` | `omp /login google-gemini-cli` | `GEMINI_API_KEY` |
+| `exa` | `omp /login exa` | `EXA_API_KEY` |
+| `brave` | `omp /login brave` | `BRAVE_API_KEY` |
+| `perplexity` | `omp /login perplexity` | `PERPLEXITY_API_KEY` |
+| `tavily` | `omp /login tavily` | `TAVILY_API_KEY` |
+
+Pick **Gemini** (`google-gemini-cli`) for the best
+price/performance — it returns structured snippets suitable for
+benchmark extraction. **Exa** is a strong alternative with native
+neural search.
+
+Set the env var in `.env` or your shell; OMP picks it up on the next
+session start. Login commands persist credentials in the OMP auth
+storage and survive session restarts.
+
+### Diagnose via `/omp-model-roles validate`
+
+The custom command's `validate` action reports
+`web_search=enabled|disabled|unknown` in the report header and adds
+an `INFO:` / `WARN:` line that explains what is and is not
+observable from a custom-command context:
+
+```text
+/omp-model-roles validate (14 available models, web_search=enabled)
+role | agents | fallback | status | config-value | source
+...
+WARN: INFO: web_search.enabled=true; provider availability is NOT observable
+      from /omp-model-roles (HookCommandContext lacks authStorage/ToolSession).
+      Run `omp /login google-gemini-cli` or set GEMINI_API_KEY for reliable
+      quality; free providers (duckduckgo/ecosia) may be bot-challenged.
+```
+
+The header suffix is the source of truth for the toggle. The body
+warning tells you that **runtime provider availability** (e.g. is
+the Gemini key valid right now?) cannot be probed from
+`HookCommandContext` — `authStorage` and `ToolSession` are not part
+of that surface (see `hooks/types.ts:178-191`). For a real
+provider probe, run the agent and read its `Degraded Notices` block.
+
 
 ```typescript
 // your-package/src/index.ts
