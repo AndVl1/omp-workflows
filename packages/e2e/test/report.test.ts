@@ -46,7 +46,12 @@ test('report: manual_qa-compatible JSON + markdown written', () => {
 
   assert.ok(existsSync(result.jsonPath), 'report.json written');
   assert.ok(existsSync(result.mdPath), 'markdown written');
-  assert.ok(result.mdPath.endsWith('my-feature-ux-e2e-2026-08-02.md'), 'md filename <slug>-ux-e2e-<date>.md');
+  // Filename carries today's UTC date: <slug>-ux-e2e-<YYYY-MM-DD>.md.
+  const expectedDate = new Date().toISOString().slice(0, 10);
+  assert.ok(
+    result.mdPath.endsWith(`my-feature-ux-e2e-${expectedDate}.md`),
+    `md filename <slug>-ux-e2e-<date>.md (got ${result.mdPath})`,
+  );
 
   const report = JSON.parse(readFileSync(result.jsonPath, 'utf8')) as UxE2eReport;
   assert.equal(report.type, 'ux-e2e');
