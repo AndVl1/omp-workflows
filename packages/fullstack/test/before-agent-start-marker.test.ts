@@ -129,3 +129,32 @@ test("buildResearchRequestDeveloperInstruction carries a concrete degraded-notic
 	const instruction = buildResearchRequestDeveloperInstruction(14, null);
 	assert.match(instruction, /> DEGRADED:/);
 });
+
+
+test("buildResearchRequestDeveloperInstruction parameterization is text-invariant for the 4-step contract", () => {
+	// Architecture (api_contract.before_agent_start_marker_parameterization): the
+	// body of the developer instruction is invariant — all 4 steps are identical for
+	// any (roleCount, availableModelCount) — so the function only uses the
+	// parameters as future hooks. Today: two different parameter combinations must
+	// produce the same text. This guards against a regression that starts
+	// interpolating the numbers into the body, which would re-introduce a hard-coded
+	// `14` and break second-bundle parity.
+	const baseline = buildResearchRequestDeveloperInstruction(14, null);
+	const smallBundle = buildResearchRequestDeveloperInstruction(3, 0);
+	const largeBundle = buildResearchRequestDeveloperInstruction(42, 123);
+	const defaultParam = buildResearchRequestDeveloperInstruction(14);
+	assert.equal(smallBundle, baseline, "roleCount=3, modelCount=0 must match roleCount=14, modelCount=null");
+	assert.equal(largeBundle, baseline, "roleCount=42, modelCount=123 must match roleCount=14, modelCount=null");
+	assert.equal(defaultParam, baseline, "omitting availableModelCount must match the explicit null");
+	// And all four must still reference every Step + the marker contract.
+	for (const [label, text] of [
+		["baseline", baseline],
+		["smallBundle", smallBundle],
+		["largeBundle", largeBundle],
+		["defaultParam", defaultParam],
+	] as const) {
+		assert.match(text, /Step 1/, `${label} missing Step 1`);
+		assert.match(text, /Step 4/, `${label} missing Step 4`);
+		assert.match(text, /tech-researcher/, `${label} missing tech-researcher`);
+	}
+});
