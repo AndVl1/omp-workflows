@@ -33,6 +33,7 @@ import type { CustomCommand, CustomCommandAPI } from "@oh-my-pi/pi-coding-agent/
 import type { HookCommandContext } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/types";
 import { classifyTask, resolveWorkflowName } from "./_lib/classify.js";
 import { loadTeamConfig } from "./_lib/config.js";
+import { loadWorkflowProfile, renderStagesSkeleton, resolveWorkflowProfilePath } from "./_lib/profile.js";
 
 const AUTONOMOUS_PREFIX = "[AUTONOMOUS";
 
@@ -91,6 +92,19 @@ export function buildPrompt(envelope: ParsedEnvelope, cwd: string): string {
 		.map(([role, agent]) => `| \`${role}\` | \`${agent}\` |`)
 		.join("\n");
 
+	const profilePath = resolveWorkflowProfilePath(workflow, cwd);
+	const profile = profilePath ? loadWorkflowProfile(workflow, cwd) : null;
+	const profileSection = profile && profilePath
+		? [
+				`### Workflow profile: \`${profile.name}\` — ${profile.title}`,
+				...(profile.description ? [`> ${profile.description}`] : []),
+				`Profile file (absolute, existence-checked — read exactly this one file):`,
+				`  \`${profilePath}\``,
+				"Stages (skeleton — order, types, gates, checkpoints; produces/consumes are in the file above):",
+				renderStagesSkeleton(profile),
+			].join("\n")
+		: `- Workflow profile: \`packages/core/workflows/${workflow}.json\` (not found from this cwd — locate it, e.g. \`find .. -name "${workflow}.json" -path "*workflows*" -not -path "*/node_modules/*"\`; only as a last resort)`;
+
 	const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
 	const branchMeta = envelope.branch ? `Branch: \`${envelope.branch}\`\n` : "Branch: (no git work tree)\n";
 	const autonomousMeta = envelope.autonomous
@@ -110,7 +124,8 @@ export function buildPrompt(envelope: ParsedEnvelope, cwd: string): string {
 		`- Complexity: ${classification.complexity}`,
 		`- Confidence: ${classification.confidence}`,
 		`- Workflow: \`${workflow}\``,
-		`- Workflow profile: \`packages/core/workflows/${workflow}.json\` (read this file for the stage list, gates, checkpoints, produces/consumes)`,
+		"",
+		profileSection,
 		"",
 		"### Role mapping (from .omp/team.config.json)",
 		"| Role | Agent |",
@@ -131,6 +146,15 @@ export function buildPrompt(envelope: ParsedEnvelope, cwd: string): string {
 			"- Do NOT re-delegate from a subagent (rogue router).",
 			"- Do NOT skip the `before_agent_start` classification gate.",
 			"- Do NOT mark a stage done when its `artifacts` are empty.",
+			"",
+			"### File access rule (hard)",
+			"- The workflow profile path in Classification is ABSOLUTE and verified to exist. Read exactly that one file for the stage list, gates, checkpoints, produces/consumes.",
+			"- Do NOT glob `**/workflows/**` or `**/profiles/**`.",
+			"- Do NOT run `find` over the filesystem (`find / …`) to locate workflow definitions.",
+			"- Do NOT read the command's own sources (`.omp/commands/do-work/**`, `_lib/**`, `classify.ts`).",
+			"- Do NOT scan `~/.omp/plugins/**`, `node_modules/**`, or `~/.omp/agent/**` looking for configs or workflow copies.",
+			"- Do NOT re-read `.omp/team.config.json` — the resolved role table is above. The only legitimate file reads are the project's own source files needed to implement the task.",
+			"- If the profile path is missing, only then locate it (e.g. `find .. -name \"<name>.json\" -path \"*workflows*\"`) and start there.",
 		].join("\n"),
 		"",
 		"### Subagent validation contract (machine-checked, v0.7.0+)",
