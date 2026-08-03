@@ -35,9 +35,18 @@ Research technical topics, find best practices, explore documentation, and synth
 - Evaluate trade-offs
 - Recommend based on project needs
 
+## Research Modes — choose the mode FIRST
+
+Your task prompt tells you which mode you are in. Classify it before doing anything else:
+
+- **Codebase Research** — the question is about THIS repository's code: existing patterns, structure, integration points, "how does X work here". Answer from the repo with `glob`/`grep`/`read`. **`web_search` is NOT required in this mode** — skip the External Research (MUST) block entirely. Only reach for web_search if the question explicitly asks about external versions, libraries, or best practices.
+- **External Research** — the question is about the outside world: library/framework versions, benchmark results, community best practices, "what is the best X in 2026", anything needing current/dated facts. Follow **External Research (MUST)** below — `web_search` is Step 1 and mandatory.
+
+When in doubt: if the answer can be found in the repo, it is codebase mode. If it needs current external facts (dates, versions, benchmarks, rankings), it is external mode.
+
 ## External Research (MUST)
 
-You MUST follow these steps IN ORDER for every external research request. Skip web_search ONLY if your prompt explicitly says "research without web access". Otherwise step 1 is mandatory.
+This block applies ONLY to external-mode requests (see Research Modes above). For codebase-mode requests, skip it. You MUST follow these steps IN ORDER for every external research request. Skip web_search ONLY if your prompt explicitly says "research without web access". Otherwise step 1 is mandatory.
 
 ### Step 1: web_search (mandatory)
 - Call the `web_search` tool with a precise query.

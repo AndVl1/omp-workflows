@@ -287,8 +287,13 @@ deterministically. The contract relies on a marker envelope plus a
 ## Web search provider configuration
 
 The `tech-researcher` agent calls `web_search` as **Step 1** of
-`## External Research (MUST)`. The runtime depends on OMP's
-`web_search` tool resolving to a working provider.
+`## External Research (MUST)` — but only in **external mode**
+(questions about the outside world: library versions, benchmarks,
+best practices). Codebase-mode questions (patterns, structure,
+integration points inside this repo) skip `web_search` entirely and
+answer from `glob`/`grep`/`read`; see `## Research Modes` in
+`packages/fullstack/agents/tech-researcher.md`. The runtime depends
+on OMP's `web_search` tool resolving to a working provider.
 
 ### Free providers (no signup, may be bot-challenged)
 
