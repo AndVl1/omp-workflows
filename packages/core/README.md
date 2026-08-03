@@ -27,6 +27,10 @@ export default function (pi: ExtensionAPI) {
 
 ## Custom bundle — with your own model-role taxonomy
 
+> Полный гайд по созданию своего набора агентов (frontmatter, model-роли,
+> registerTeamWorkflow, slash-команды, минимальный скелет бандла):
+> **[`docs/adding-agents.md`](../docs/adding-agents.md)**.
+
 `defaultFullstackModelRoles` ships as the default 14-entry taxonomy, but any bundle
 can override it with its own `ModelRoleEntry[]` while reusing the helpers
 (`resolveRoleChain`, `isResearchRequest`, `isResearchResponse`):
