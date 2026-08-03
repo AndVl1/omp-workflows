@@ -287,11 +287,14 @@ deterministically. The contract relies on a marker envelope plus a
 ## Web search provider configuration
 
 The `tech-researcher` agent calls `web_search` as **Step 1** of
-`## External Research (MUST)` — but only in **external mode**
-(questions about the outside world: library versions, benchmarks,
-best practices). Codebase-mode questions (patterns, structure,
-integration points inside this repo) skip `web_search` entirely and
-answer from `glob`/`grep`/`read`; see `## Research Modes` in
+`## External Research — Fresh-Facts (MUST)` — but only in
+**Fresh-Facts mode** (benchmarks, model/library versions, release
+dates, comparisons — anything needing current dated facts).
+Codebase-mode questions (patterns, structure, integration points
+inside this repo) skip `web_search` entirely and answer from
+`glob`/`grep`/`read`; Documentation-mode questions (how a stable API
+or library feature works) use Context7/DeepWiki/official docs first
+with `web_search` optional. See `## Research Modes` in
 `packages/fullstack/agents/tech-researcher.md`. The runtime depends
 on OMP's `web_search` tool resolving to a working provider.
 
@@ -306,7 +309,7 @@ on OMP's `web_search` tool resolving to a working provider.
 Free providers are good for ad-hoc lookups, but for production
 research the agent may degrade to MCP fallback (Context7, DeepWiki)
 when the search returns `Error: No web search provider configured.`
-or empty sources. See `## External Research (MUST) → Step 2:
+or empty sources. See `## External Research — Fresh-Facts (MUST) → Step 2:
 Degraded-notice` in `packages/fullstack/agents/tech-researcher.md`.
 
 ### Paid providers (reliable quality, requires auth)

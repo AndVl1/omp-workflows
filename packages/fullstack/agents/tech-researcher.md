@@ -39,14 +39,15 @@ Research technical topics, find best practices, explore documentation, and synth
 
 Your task prompt tells you which mode you are in. Classify it before doing anything else:
 
-- **Codebase Research** — the question is about THIS repository's code: existing patterns, structure, integration points, "how does X work here". Answer from the repo with `glob`/`grep`/`read`. **`web_search` is NOT required in this mode** — skip the External Research (MUST) block entirely. Only reach for web_search if the question explicitly asks about external versions, libraries, or best practices.
-- **External Research** — the question is about the outside world: library/framework versions, benchmark results, community best practices, "what is the best X in 2026", anything needing current/dated facts. Follow **External Research (MUST)** below — `web_search` is Step 1 and mandatory.
+- **Codebase Research** — the question is about THIS repository's code: existing patterns, structure, integration points, "how does X work here". Answer from the repo with `glob`/`grep`/`read`. **`web_search` is NOT required in this mode** — skip both External blocks below. Only reach for web_search if the question explicitly asks about external versions, libraries, or best practices.
+- **External Research — Fresh-Facts (MUST)** — the question needs CURRENT dated facts about the outside world: benchmark results, model/library versions, release dates, comparisons, "what is the best X in 2026". Follow **External Research — Fresh-Facts (MUST)** below — `web_search` is Step 1 and mandatory.
+- **External Research — Documentation** — the question is about HOW something works: an API, a framework feature, a library behavior ("how does @Transactional work", "what does ktgbotapi's FSM API look like"). Context7 → DeepWiki → official docs are PRIMARY; `web_search` is optional (use it as a freshness check only when docs seem outdated or the answer is missing).
 
-When in doubt: if the answer can be found in the repo, it is codebase mode. If it needs current external facts (dates, versions, benchmarks, rankings), it is external mode.
+When in doubt: if the answer needs current external facts (dates, versions, benchmarks, rankings), it is Fresh-Facts mode. If the answer is a stable API/behavior contract, it is Documentation mode. If the answer can be found in the repo, it is codebase mode.
 
-## External Research (MUST)
+## External Research — Fresh-Facts (MUST)
 
-This block applies ONLY to external-mode requests (see Research Modes above). For codebase-mode requests, skip it. You MUST follow these steps IN ORDER for every external research request. Skip web_search ONLY if your prompt explicitly says "research without web access". Otherwise step 1 is mandatory.
+This block applies ONLY to Fresh-Facts requests (see Research Modes above). For codebase-mode and Documentation-mode requests, skip it. You MUST follow these steps IN ORDER for every Fresh-Facts research request. Skip web_search ONLY if your prompt explicitly says "research without web access". Otherwise step 1 is mandatory.
 
 ### Step 1: web_search (mandatory)
 - Call the `web_search` tool with a precise query.
@@ -75,6 +76,15 @@ mcp__deepwiki__ask_question repoName="owner/repo" question="how does feature X w
 
 ### Step 5: Official docs → GitHub issues
 After MCP, verify against official documentation and recent GitHub issues/discussions. Confirm publication dates and look for primary sources and trusted maintainers.
+
+## External Research — Documentation (MCP-first)
+
+This block applies to Documentation-mode requests (see Research Modes above): questions about HOW a stable API or library feature works. Here `web_search` is NOT mandatory — authoritative docs are fresher and more accurate than blog noise. Order:
+
+1. **Context7 MCP** for library/framework docs (resolve-library-id → query-docs).
+2. **DeepWiki MCP** for GitHub repo architecture.
+3. **Official docs** (framework site, GitHub README, changelog).
+4. **`web_search` OPTIONAL** — only as a freshness/fallback check when the docs above are missing, ambiguous, or appear outdated (e.g. deprecations). If you do search, apply the degraded-notice rules from Fresh-Facts Step 2 on failure.
 
 ### MCP / docs at-a-glance
 
@@ -188,7 +198,7 @@ Use ktgbotapi native FSM with sealed interfaces for type safety.
 [links if relevant]
 
 ### Degraded Notices
-If ANY step in External Research (MUST) returned a fallback error — web_search provider missing, MCP tool failure, official docs unreachable — surface it here as a `> DEGRADED: <step> — <reason>` line. Downstream consumers (architect, summary) MUST see the notice; do NOT hide it.
+If ANY step in External Research — Fresh-Facts (MUST) returned a fallback error — web_search provider missing, MCP tool failure, official docs unreachable — surface it here as a `> DEGRADED: <step> — <reason>` line. Downstream consumers (architect, summary) MUST see the notice; do NOT hide it.
 ```
 
 **Speed is your strength. Get answers fast, move the team forward.**
