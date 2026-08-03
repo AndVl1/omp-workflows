@@ -6,7 +6,8 @@
   },
   "metadata": {
     "description": "Declarative multi-stage workflow engine for omp — 15 specialized agents, 8 declarative JSON profiles, role-driven DoD gate, profile-driven workflow engine. Native omp plugin (no Claude Code hooks).",
-    "version": "0.1.0"
+    "version": "0.10.1",
+    "pluginRoot": "packages/fullstack"
   },
   "plugins": [
     {
