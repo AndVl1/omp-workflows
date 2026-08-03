@@ -52,6 +52,50 @@ test("extractPayloadBetweenMarkers returns null for empty input", () => {
 	assert.equal(extractPayloadBetweenMarkers(""), null);
 });
 
+test("extractPayloadBetweenMarkers returns null for non-string input", () => {
+	// The detector guards against malformed events; non-string prompts must
+	// not crash the hook and must not yield a payload.
+	assert.equal(extractPayloadBetweenMarkers(undefined as unknown as string), null);
+	assert.equal(extractPayloadBetweenMarkers(null as unknown as string), null);
+	assert.equal(extractPayloadBetweenMarkers(42 as unknown as string), null);
+});
+
+test("extractPayloadBetweenMarkers does not strip a missing leading newline", () => {
+	// Envelope without a newline immediately after START or before END —
+	// the strip-once rule must leave the payload untouched.
+	const text = `<<<omp-model-roles-research-request>>>body<<<omp-model-roles-research-request-end>>>`;
+	assert.equal(extractPayloadBetweenMarkers(text), "body");
+});
+
+test("extractPayloadBetweenMarkers strips exactly one leading newline (not more)", () => {
+	// `\\n\\nbody\\n\\n` → strip one from each side → `\\nbody\\n`.
+	// The function only ever removes one newline per side; double-stripping
+	// would re-introduce silent whitespace handling drift.
+	const text = [
+		"<<<omp-model-roles-research-request>>>",
+		"",
+		"body",
+		"",
+		"<<<omp-model-roles-research-request-end>>>",
+	].join("\n");
+	assert.equal(extractPayloadBetweenMarkers(text), "\nbody\n");
+});
+
+test("extractPayloadBetweenMarkers returns the first envelope when multiple appear in text", () => {
+	// The detector takes the first START then the first END after it; any
+	// trailing envelopes are opaque and outside the contract.
+	const text = [
+		"<<<omp-model-roles-research-request>>>",
+		"first",
+		"<<<omp-model-roles-research-request-end>>>",
+		"noise",
+		"<<<omp-model-roles-research-request>>>",
+		"second",
+		"<<<omp-model-roles-research-request-end>>>",
+	].join("\n");
+	assert.equal(extractPayloadBetweenMarkers(text), "first");
+});
+
 test("buildResearchRequestDeveloperInstruction references the 4 hard steps and the marker contract", () => {
 	const instruction = buildResearchRequestDeveloperInstruction();
 	assert.match(instruction, /Step 1/);
@@ -63,4 +107,25 @@ test("buildResearchRequestDeveloperInstruction references the 4 hard steps and t
 	assert.match(instruction, /immutable inventory/);
 	assert.match(instruction, /DEGRADED|degraded/i);
 	assert.match(instruction, /attribution: ?"agent"/);
+});
+
+test("buildResearchRequestDeveloperInstruction forbids local analysis by the main agent", () => {
+	// The contract (architecture.json prompt_delta_tech_researcher + full_hook_flow step 11)
+	// requires the main LLM to delegate research to the tech-researcher subagent
+	// instead of inspecting files, transcripts, or session state. Drift here would
+	// silently re-introduce recommendations_live_5/6/7 failures (LLM ignores the
+	// delegation when the text permits local fallback).
+	const instruction = buildResearchRequestDeveloperInstruction();
+	assert.match(instruction, /Do NOT inspect local files/i);
+	assert.match(instruction, /do NOT run bash\/grep\/python/i);
+	assert.match(instruction, /do NOT read transcripts/i);
+	assert.match(instruction, /Your ONLY job is the research task/i);
+});
+
+test("buildResearchRequestDeveloperInstruction carries a concrete degraded-notice format", () => {
+	// vp9-r7 — the assertion against /DEGRADED|degraded/i passes either case.
+	// The contract specifies `> DEGRADED: <step> — <reason>`, so the instruction
+	// must contain that literal marker.
+	const instruction = buildResearchRequestDeveloperInstruction();
+	assert.match(instruction, /> DEGRADED:/);
 });

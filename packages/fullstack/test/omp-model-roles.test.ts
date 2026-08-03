@@ -444,3 +444,60 @@ test("ROLE_COUNT constant in the before_agent_start handler matches MODEL_ROLES.
 	// is the bridge: bump `ROLE_COUNT` and `MODEL_ROLES` together.
 	assert.equal(MODEL_ROLES.length, 14, "MODEL_ROLES length drifted from the handler's hard-coded ROLE_COUNT");
 });
+
+test("execute validate reports web_search=unknown header when toggle is unset", async () => {
+	// When settings.get('web_search.enabled') returns a non-boolean (the toggle
+	// is missing or wrong type), the diagnostic header must show
+	// `web_search=unknown` and stay neutral (no INFO/WARN line is appended).
+	const { api } = createApi();
+	const { ctx } = createContext();
+	const target = modelRolesFactory(api as never);
+	const result = await target.execute(["validate"], ctx as never);
+	assert.match(result, /web_search=unknown/);
+	assert.doesNotMatch(result, /web_search=(enabled|disabled)/);
+	assert.doesNotMatch(result, /INFO: web_search\.enabled=true/);
+	assert.doesNotMatch(result, /WARN: web_search disabled in settings/);
+});
+
+test("execute validate does not double-prefix warnings that already carry WARN/INFO/ERROR", async () => {
+	// vp9-r5 — the legacy `WARN: ` prefix used to wrap every line, so
+	// INFO/ERROR entries read as `WARN: INFO: …`. The fix detects an existing
+	// prefix and only truncates; this test guards against a regression that
+	// re-introduces the double prefix.
+	const { api } = createApi({ webSearchEnabled: true });
+	const { ctx } = createContext();
+	const target = modelRolesFactory(api as never);
+	const result = await target.execute(["validate"], ctx as never);
+	assert.doesNotMatch(result, /WARN: INFO: /);
+	assert.doesNotMatch(result, /WARN: ERROR: /);
+	assert.match(result, /INFO: web_search\.enabled=true/);
+	assert.match(result, /INFO: resolving roles against available models inventory/);
+});
+
+test("execute validate does not double-prefix warnings that already carry WARN", async () => {
+	// With web_search disabled the warning starts with `WARN:`. The line must
+	// not become `WARN: WARN: …`. (Plain warnings still receive `WARN: `; this
+	// test scopes the check to already-prefixed ones.)
+	const { api } = createApi({ webSearchEnabled: false });
+	const { ctx } = createContext();
+	const target = modelRolesFactory(api as never);
+	const result = await target.execute(["validate"], ctx as never);
+	assert.doesNotMatch(result, /WARN: WARN: /);
+	assert.match(result, /WARN: web_search disabled in settings/);
+});
+
+test("execute validate prefixes plain warnings with WARN:", async () => {
+	// `createSettings` only configures 4 of MODEL_ROLES; every other role is
+	// unconfigured and produces a plain `role X is not configured; …` line.
+	// Such plain warnings must receive the legacy `WARN: ` prefix so the
+	// transcript classifies them as warnings (the WARN/INFO/ERROR detector
+	// only short-circuits when the prefix is already present).
+	const { api } = createApi();
+	const { ctx } = createContext();
+	const target = modelRolesFactory(api as never);
+	const result = await target.execute(["validate"], ctx as never);
+	// Positive: at least one plain-warning line is prefixed.
+	assert.match(result, /^WARN: role \S+ is not configured; using \S+ fallback/m);
+	// Negative: the prefix must not be doubled.
+	assert.doesNotMatch(result, /^WARN: WARN: role \S+ is not configured;/m);
+});
