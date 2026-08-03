@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.10.1] — 2026-08-03
+### Fixed
+- **`/do-work` now resolves and names the workflow profile's absolute path** (`packages/fullstack/commands/do-work/index.ts`, `buildPrompt`, new `_lib/profile.ts`). The prompt previously told the main agent to read `packages/core/workflows/<name>.json` — a relative path that only resolves from the monorepo root. From a git worktree, a subdirectory, or a consumer project the file was missing, so the agent compensated with filesystem-wide exploration on every dispatch: globbing `**/workflows/**` (200+ files), reading the command's own sources, `find /` across the whole disk (~145 s), scanning `~/.omp/plugins` and `node_modules` caches. `buildPrompt` now resolves the profile at prompt-build time (cwd → walk-up to 4 levels → `node_modules/@andvl1/omp-workflows-core` → `~/.omp/plugins` install), hands the agent the **absolute, existence-checked** path, and inlines a stage skeleton carrying the behavioural stop-signs (gate, checkpoint + auto-decision, skip_if; ~300 tokens for full-feature) so the orchestrator cannot fly past a checkpoint or gate without opening the profile. A hard file-access rule bans globs/`find`/command-source reads/cache scanning unless the named path is genuinely missing. Artifact wiring (produces/consumes) is read from the one named file.
+
 ## [0.10.0] — 2026-08-03
 ### Added
 - **Per-agent-class OMP model roles with standard-role fallback**. 17 agents in `packages/fullstack/agents/*.md` now declare `model: ["@<class-role>", "@<standard-role>"]` across 14 custom class roles (architect, reviewer, security, coordinator, researcher, analyst, developer-go, developer-kotlin, frontend-developer, developer-mobile, devops, diagnostics, qa, manual-qa). First resolvable pattern wins (`resolveConfiguredRolePattern` / `resolveModelRoleValue`); an unknown `@role` falls back to the next pattern, so standard OMP roles (`@task`, `@slow`, `@smol`) keep working when a class role is not configured. Configure via `modelRoles` in project `.omp/config.yml` or global `~/.omp/agent/config.yml`.
