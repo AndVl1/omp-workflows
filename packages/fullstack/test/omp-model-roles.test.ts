@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import modelRolesFactory, { MAX_RESEARCH_PROMPT_BYTES } from "../commands/omp-model-roles/index.js";
+import modelRolesFactory, {
+	BUILTIN_ROLES,
+	MAX_RESEARCH_PROMPT_BYTES,
+} from "../commands/omp-model-roles/index.js";
 import {
 	defaultFullstackModelRoles as MODEL_ROLES,
 	type InventoryModel,
@@ -11,7 +14,6 @@ import {
 	isResearchResponse,
 	resolveRoleChain,
 } from "@andvl1/omp-workflows-core";
-import { BUILTIN_ROLES } from "../commands/omp-model-roles/index.js";
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const now = "2026-08-02T12:00:00.000Z";

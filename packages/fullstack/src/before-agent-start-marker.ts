@@ -50,6 +50,10 @@ export function extractPayloadBetweenMarkers(text: string): string | null {
  * the main LLM sees as a developer-priority message above the user
  * prompt. It MUST contain every step; the test in
  * `test/before-agent-start-marker.test.ts` enforces this.
+ *
+ * `roleCount` и `availableModelCount` зарезервированы для будущих
+ * вариаций текста инструкции (architecture: 'parameterization is for
+ * future use'). В текущей версии тело инвариантно — параметры no-op.
  */
 export function buildResearchRequestDeveloperInstruction(roleCount: number, availableModelCount: number | null = null): string {
 	return [

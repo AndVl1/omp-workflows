@@ -29,6 +29,7 @@ import {
 	RESEARCH_REQUEST_MARKER_START,
 	buildResearchRequestDeveloperInstruction,
 } from "./before-agent-start-marker.js";
+// Auto-derived from core taxonomy; test-invariант в test/omp-model-roles.test.ts:439-446 ловит drift.
 const ROLE_COUNT = defaultFullstackModelRoles.length;
 
 /**
@@ -70,9 +71,10 @@ function beforeAgentStartMarkerHandler(
 			// `details` carries the marker contract advertised to recipients
 			// (custom UI, downstream tooling). It mirrors the top-level
 			// fields of the in-payload `ResearchRequest` (see
-			// `_roles.ts` and `buildResearchPrompt`) without re-parsing
-			// the prompt: the full inventory lives inside the marker
-			// payload and is duplicated here only as a count.
+			// `@andvl1/omp-workflows-core` model-roles module and
+			// `buildResearchPrompt`) without re-parsing the prompt: the
+			// full inventory lives inside the marker payload and is
+			// duplicated here only as a count.
 			details: {
 				kind: "omp-model-role-research-request",
 				schemaVersion: 1,
