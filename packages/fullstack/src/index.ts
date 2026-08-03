@@ -25,9 +25,17 @@ import {
 import { ensureCommandsForSession } from "./copy-commands.js";
 import {
 	RESEARCH_REQUEST_MARKER_START,
-	extractPayloadBetweenMarkers,
+	RESEARCH_REQUEST_MARKER_END,
 	buildResearchRequestDeveloperInstruction,
 } from "./before-agent-start-marker.js";
+// `roleCount` MUST match `MODEL_ROLES.length` in
+// `../commands/omp-model-roles/_roles.ts`. We intentionally do NOT
+// import `MODEL_ROLES` from here: that file lives under the
+// `commands/` directory and `tsconfig.json` (rootDir=src) refuses
+// cross-directory imports (TS6059). Instead the invariant is
+// enforced by a test in `omp-model-roles.test.ts` (see
+// `marker handler details.roleCount matches MODEL_ROLES.length`).
+const ROLE_COUNT = 14;
 
 /**
  * Narrow the `session_start` context to a usable cwd string. The OMP
@@ -52,18 +60,38 @@ function beforeAgentStartMarkerHandler(
 	event: BeforeAgentStartEvent,
 ): BeforeAgentStartEventResult | undefined {
 	if (typeof event?.prompt !== "string") return undefined;
+	// Marker envelope guard: both start and end markers must be present.
+	// A truncated envelope (START without END) would still inject the
+	// developer instruction and promise the LLM a payload it can never
+	// extract, so we bail with `undefined` and let the regular prompt
+	// path handle it. The end marker is exported from the marker module
+	// next to the start marker.
 	if (!event.prompt.includes(RESEARCH_REQUEST_MARKER_START)) return undefined;
-	// Best-effort: the payload may be malformed; we still emit the
-	// instruction so the LLM knows the marker fired. The extraction is
-	// only a sanity check — the actual payload is already in
-	// `event.prompt` and the LLM sees it.
-	extractPayloadBetweenMarkers(event.prompt);
+	if (!event.prompt.includes(RESEARCH_REQUEST_MARKER_END)) return undefined;
 	return {
 		message: {
 			customType: "omp-model-roles-research-instructions",
 			content: buildResearchRequestDeveloperInstruction(),
 			display: true,
-			details: { kind: "omp-model-role-research-request", schemaVersion: 1 },
+			// `details` carries the marker contract advertised to recipients
+			// (custom UI, downstream tooling). It mirrors the top-level
+			// fields of the in-payload `ResearchRequest` (see
+			// `_roles.ts` and `buildResearchPrompt`) without re-parsing
+			// the prompt: the full inventory lives inside the marker
+			// payload and is duplicated here only as a count.
+			details: {
+				kind: "omp-model-role-research-request",
+				schemaVersion: 1,
+				requestedAt: new Date().toISOString(),
+				roleCount: ROLE_COUNT,
+				// `modelCount` is intentionally `null`: counting requires
+				// parsing the embedded JSON payload, which we deliberately
+				// avoid in the hook (re-parse + re-validate of a payload
+				// the LLM already sees). Receivers that need the actual
+				// list must read it from the payload, keeping the two
+				// in sync.
+				modelCount: null,
+			},
 			attribution: "agent",
 		},
 	};

@@ -334,7 +334,7 @@ observable from a custom-command context:
 /omp-model-roles validate (14 available models, web_search=enabled)
 role | agents | fallback | status | config-value | source
 ...
-WARN: INFO: web_search.enabled=true; provider availability is NOT observable
+INFO: web_search.enabled=true; provider availability is NOT observable
       from /omp-model-roles (HookCommandContext lacks authStorage/ToolSession).
       Run `omp /login google-gemini-cli` or set GEMINI_API_KEY for reliable
       quality; free providers (duckduckgo/ecosia) may be bot-challenged.

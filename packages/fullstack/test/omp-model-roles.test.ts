@@ -402,7 +402,7 @@ test("execute validate reports web_search=enabled header and INFO when toggle is
 	const target = modelRolesFactory(api as never);
 	const result = await target.execute(["validate"], ctx as never);
 	assert.match(result, /web_search=enabled/);
-	assert.match(result, /WARN: INFO: web_search\.enabled=true/);
+	assert.match(result, /INFO: web_search\.enabled=true/);
 	assert.match(result, /HookCommandContext lacks authStorage\/ToolSession/);
 });
 
@@ -434,4 +434,13 @@ test("execute validate is NOT wrapped in the research marker", async () => {
 	const target = modelRolesFactory(api as never);
 	const result = await target.execute(["validate"], ctx as never);
 	assert.doesNotMatch(result, /<<<omp-model-roles-research-request/);
+});
+
+test("ROLE_COUNT constant in the before_agent_start handler matches MODEL_ROLES.length", () => {
+	// The marker handler in `packages/fullstack/src/index.ts` exposes
+	// `details.roleCount` as a literal `ROLE_COUNT = 14` because the
+	// handler's `tsconfig.json` has `rootDir=src` and cannot import
+	// from `../commands/omp-model-roles/_roles.js` (TS6059). This test
+	// is the bridge: bump `ROLE_COUNT` and `MODEL_ROLES` together.
+	assert.equal(MODEL_ROLES.length, 14, "MODEL_ROLES length drifted from the handler's hard-coded ROLE_COUNT");
 });

@@ -228,7 +228,21 @@ async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext,
 			`${entry.role} | ${entry.agents.join(",")} | ${entry.standardFallback} | ${resolution.status}${resolution.selector ? ` (${truncate(resolution.selector)})` : ""} | ${truncate(configValue)} | ${modelRoleSource(data.settings, entry.role)}`,
 		);
 	}
-	if (warnings.length > 0) lines.push(...warnings.map(warning => `WARN: ${truncate(warning, 180)}`));
+	if (warnings.length > 0) {
+		lines.push(
+			...warnings.map(warning => {
+				// Avoid doubling the level prefix: warnings pushed earlier in
+				// `collectValidation` already start with `WARN:`, `INFO:` or
+				// `ERROR:` (case-insensitive, first token before `:`). For
+				// these we only truncate. Plain warnings keep the legacy
+				// `WARN: ` prefix so the report still classifies them.
+				const trimmed = warning.trim();
+				return /^(WARN|INFO|ERROR):/i.test(trimmed)
+					? truncate(trimmed, 180)
+					: `WARN: ${truncate(trimmed, 180)}`;
+			}),
+		);
+	}
 	lines.push(nativeModelHelp());
 	notify(ctx, "omp-model-roles: validation complete", warnings.length > 0 ? "warning" : "info");
 	return { report: lines.join("\n"), data, webSearchEnabled };
