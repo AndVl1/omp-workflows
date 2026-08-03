@@ -25,10 +25,11 @@ OMP discovers the commands from `.omp/commands/<name>/index.ts` on the next sess
 ```typescript
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
-  registerTeamWorkflow,
+  defaultFullstackFlags,
+  defaultFullstackModelRoles,
   defaultFullstackRoles,
   defaultFullstackScopeMap,
-  defaultFullstackFlags,
+  registerTeamWorkflow,
 } from "@andvl1/omp-workflows-core";
 
 export default function (pi: ExtensionAPI) {
@@ -39,7 +40,10 @@ export default function (pi: ExtensionAPI) {
     flags: defaultFullstackFlags,
   });
 }
-```
+
+The taxonomy that backs the bundled `/omp-model-roles validate` command (`defaultFullstackModelRoles`,
+14 entries) is imported from `@andvl1/omp-workflows-core` so any other bundle can compose the same
+helpers (`resolveRoleChain`, `isResearchRequest`, `isResearchResponse`) against its own `ModelRoleEntry[]`.
 
 The extension registers gates (`before_agent_start`, `session_stop`, `tool_call`) and writes `.omp/team.config.json`. **It does NOT register slash commands** — those ship as OMP custom-TS commands in `commands/` (see below).
 

@@ -51,7 +51,7 @@ export function extractPayloadBetweenMarkers(text: string): string | null {
  * prompt. It MUST contain every step; the test in
  * `test/before-agent-start-marker.test.ts` enforces this.
  */
-export function buildResearchRequestDeveloperInstruction(): string {
+export function buildResearchRequestDeveloperInstruction(roleCount: number, availableModelCount: number | null = null): string {
 	return [
 		"You received a `<<<omp-model-roles-research-request>>>` marker in the user prompt. The marker wraps a validate-report plus a research contract that delegates model recommendations to the `tech-researcher` subagent. Follow the 4 hard steps below EXACTLY and in order. Do NOT inspect local files, do NOT run bash/grep/python, do NOT read transcripts, reports or session state. Your ONLY job is the research task below.",
 		"Step 1: Call the `task` tool with `agent=\"tech-researcher\"` and the payload below. The payload is the inner content of the marker envelope (everything between the two `<<<omp-model-roles-research-request>>>` lines). Pass it verbatim as the `ResearchRequest`.",

@@ -97,7 +97,7 @@ test("extractPayloadBetweenMarkers returns the first envelope when multiple appe
 });
 
 test("buildResearchRequestDeveloperInstruction references the 4 hard steps and the marker contract", () => {
-	const instruction = buildResearchRequestDeveloperInstruction();
+	const instruction = buildResearchRequestDeveloperInstruction(14, null);
 	assert.match(instruction, /Step 1/);
 	assert.match(instruction, /Step 2/);
 	assert.match(instruction, /Step 3/);
@@ -115,7 +115,7 @@ test("buildResearchRequestDeveloperInstruction forbids local analysis by the mai
 	// instead of inspecting files, transcripts, or session state. Drift here would
 	// silently re-introduce recommendations_live_5/6/7 failures (LLM ignores the
 	// delegation when the text permits local fallback).
-	const instruction = buildResearchRequestDeveloperInstruction();
+	const instruction = buildResearchRequestDeveloperInstruction(14, null);
 	assert.match(instruction, /Do NOT inspect local files/i);
 	assert.match(instruction, /do NOT run bash\/grep\/python/i);
 	assert.match(instruction, /do NOT read transcripts/i);
@@ -126,6 +126,6 @@ test("buildResearchRequestDeveloperInstruction carries a concrete degraded-notic
 	// vp9-r7 — the assertion against /DEGRADED|degraded/i passes either case.
 	// The contract specifies `> DEGRADED: <step> — <reason>`, so the instruction
 	// must contain that literal marker.
-	const instruction = buildResearchRequestDeveloperInstruction();
+	const instruction = buildResearchRequestDeveloperInstruction(14, null);
 	assert.match(instruction, /> DEGRADED:/);
 });

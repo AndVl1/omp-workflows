@@ -4,14 +4,19 @@ import { fileURLToPath } from "node:url";
 import type { CustomCommand, CustomCommandAPI } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/types";
 import type { HookCommandContext } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/types";
 import {
-	BUILTIN_ROLES,
-	MODEL_ROLES,
+	defaultFullstackModelRoles,
 	type InventoryModel,
 	type ModelRoleEntry,
 	resolveRoleChain,
-} from "./_roles.js";
+} from "@andvl1/omp-workflows-core";
 
 const AGENT_FILE_COUNT = 17;
+/** OMP harness reserved model-class names. Stays local to fullstack: core
+ * is OMP-agnostic; future bundles that need the same collision check
+ * declare their own copy. */
+export const BUILTIN_ROLES = ["default", "smol", "slow", "vision", "plan", "designer", "commit", "tiny", "task", "advisor"];
+
+
 const MAX_INVENTORY_MODELS = 128;
 const MAX_RESEARCH_INVENTORY_BYTES = 48_000;
 export const MAX_RESEARCH_PROMPT_BYTES = 96_000;
@@ -112,7 +117,7 @@ function findAgentsDirectory(cwd: string): string | undefined {
 function validateFrontmatter(cwd: string): string | undefined {
 	const agentsDirectory = findAgentsDirectory(cwd);
 	if (!agentsDirectory) return "map-only validation: bundled agents directory is unavailable";
-	for (const entry of MODEL_ROLES) {
+	for (const entry of defaultFullstackModelRoles) {
 		for (const agent of entry.agents) {
 			const path = join(agentsDirectory, `${agent}.md`);
 			if (!existsSync(path)) return `frontmatter warning: missing ${path}`;
@@ -122,7 +127,7 @@ function validateFrontmatter(cwd: string): string | undefined {
 			}
 		}
 	}
-	const count = MODEL_ROLES.reduce((total, entry) => total + entry.agents.length, 0);
+	const count = defaultFullstackModelRoles.reduce((total, entry) => total + entry.agents.length, 0);
 	return count === AGENT_FILE_COUNT ? undefined : `frontmatter warning: expected ${AGENT_FILE_COUNT} agents, found ${count}`;
 }
 
@@ -143,7 +148,7 @@ function overridesForAgents(settings: SettingsLike | undefined): string[] {
 	try {
 		const overrides = settings?.get?.("task.agentModelOverrides");
 		if (!overrides || typeof overrides !== "object") return [];
-		const names = new Set(MODEL_ROLES.flatMap(entry => entry.agents));
+		const names = new Set(defaultFullstackModelRoles.flatMap(entry => entry.agents));
 		return Object.keys(overrides as Record<string, unknown>).filter(agent => names.has(agent));
 	} catch {
 		return [];
@@ -160,7 +165,7 @@ function nativeModelHelp(): string {
 
 function degradedReport(warnings: string[]): string {
 	const lines = ["/omp-model-roles validate (degraded)", "role | agents | fallback | status | config-value | source"];
-	for (const entry of MODEL_ROLES) {
+	for (const entry of defaultFullstackModelRoles) {
 		lines.push(`${entry.role} | ${entry.agents.join(",")} | ${entry.standardFallback} | none | — | unavailable`);
 	}
 	lines.push(`WARN: ${warnings.join("; ") || "validation unavailable"}`);
@@ -209,7 +214,7 @@ async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext,
 	warnings.push("INFO: resolving roles against available models inventory (provider/id matcher; no native module import)");
 	data.frontmatterWarning = validateFrontmatter(cwd);
 	if (data.frontmatterWarning) warnings.push(data.frontmatterWarning);
-	const conflicts = MODEL_ROLES.map(entry => entry.role).filter(role => BUILTIN_ROLES.includes(role));
+	const conflicts = defaultFullstackModelRoles.map(entry => entry.role).filter(role => BUILTIN_ROLES.includes(role));
 	if (conflicts.length > 0) warnings.push(`ERROR: custom roles overlap built-ins: ${conflicts.join(", ")}`);
 	const overriddenAgents = overridesForAgents(data.settings);
 	if (overriddenAgents.length > 0) {
@@ -220,7 +225,7 @@ async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext,
 		`/omp-model-roles validate (${data.inventory.length} available models, web_search=${webSearchSuffix})`,
 		"role | agents | fallback | status | config-value | source",
 	];
-	for (const entry of MODEL_ROLES) {
+	for (const entry of defaultFullstackModelRoles) {
 		const configValue = data.settings.getModelRole?.(entry.role) ?? "—";
 		if (configValue === "—") warnings.push(`role ${entry.role} is not configured; using ${entry.standardFallback} fallback when available`);
 		const resolution = resolveEntry(entry, data);
@@ -266,7 +271,7 @@ function boundedResearchInventory(inventory: readonly InventoryModel[]): Bounded
 }
 
 function researchOutputSchema(selectors: readonly string[]): Record<string, unknown> {
-	const roleEnum = MODEL_ROLES.map(entry => entry.role);
+	const roleEnum = defaultFullstackModelRoles.map(entry => entry.role);
 	const source = {
 		type: "object",
 		additionalProperties: false,
@@ -324,7 +329,7 @@ export function buildResearchPrompt(data: ValidationData): string {
 		kind: "omp-model-role-research-request",
 		schemaVersion: 1,
 		requestedAt: new Date().toISOString(),
-		roles: MODEL_ROLES,
+		roles: defaultFullstackModelRoles,
 		availableModels: bounded.models,
 	};
 	const outputSchema = researchOutputSchema(bounded.models.map(model => model.selector));

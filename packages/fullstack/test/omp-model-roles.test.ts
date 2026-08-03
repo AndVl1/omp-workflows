@@ -5,13 +5,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import modelRolesFactory, { MAX_RESEARCH_PROMPT_BYTES } from "../commands/omp-model-roles/index.js";
 import {
-	MODEL_ROLES,
-	BUILTIN_ROLES,
+	defaultFullstackModelRoles as MODEL_ROLES,
 	type InventoryModel,
 	isResearchRequest,
 	isResearchResponse,
 	resolveRoleChain,
-} from "../commands/omp-model-roles/_roles.js";
+} from "@andvl1/omp-workflows-core";
+import { BUILTIN_ROLES } from "../commands/omp-model-roles/index.js";
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const now = "2026-08-02T12:00:00.000Z";

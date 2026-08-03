@@ -17,25 +17,19 @@ import type {
 	SessionStartEvent,
 } from "@oh-my-pi/pi-coding-agent";
 import {
-	registerTeamWorkflow,
+	defaultFullstackFlags,
+	defaultFullstackModelRoles,
 	defaultFullstackRoles,
 	defaultFullstackScopeMap,
-	defaultFullstackFlags,
+	registerTeamWorkflow,
 } from "@andvl1/omp-workflows-core";
 import { ensureCommandsForSession } from "./copy-commands.js";
 import {
-	RESEARCH_REQUEST_MARKER_START,
 	RESEARCH_REQUEST_MARKER_END,
+	RESEARCH_REQUEST_MARKER_START,
 	buildResearchRequestDeveloperInstruction,
 } from "./before-agent-start-marker.js";
-// `roleCount` MUST match `MODEL_ROLES.length` in
-// `../commands/omp-model-roles/_roles.ts`. We intentionally do NOT
-// import `MODEL_ROLES` from here: that file lives under the
-// `commands/` directory and `tsconfig.json` (rootDir=src) refuses
-// cross-directory imports (TS6059). Instead the invariant is
-// enforced by a test in `omp-model-roles.test.ts` (see
-// `marker handler details.roleCount matches MODEL_ROLES.length`).
-const ROLE_COUNT = 14;
+const ROLE_COUNT = defaultFullstackModelRoles.length;
 
 /**
  * Narrow the `session_start` context to a usable cwd string. The OMP
@@ -71,7 +65,7 @@ function beforeAgentStartMarkerHandler(
 	return {
 		message: {
 			customType: "omp-model-roles-research-instructions",
-			content: buildResearchRequestDeveloperInstruction(),
+			content: buildResearchRequestDeveloperInstruction(ROLE_COUNT),
 			display: true,
 			// `details` carries the marker contract advertised to recipients
 			// (custom UI, downstream tooling). It mirrors the top-level
