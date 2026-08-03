@@ -632,7 +632,8 @@ export async function runAsk(args: AskArgs): Promise<number> {
   }
   const driver = new WsDriver({ url, transcriptPath });
   await driver.open();
-  await driver.submit(args.answer);
+  await driver.type(args.answer);
+  await driver.pressEnter();
   await driver.close();
   console.log(`ux-e2e ask: answered [ask_user #${result.block.index}] with ${JSON.stringify(args.answer)}`);
   return 0;
@@ -658,7 +659,7 @@ export function parseInputArgs(argv: string[]): InputArgs {
 
 export async function runInput(
   args: InputArgs,
-  createDriver: (url: string, transcriptPath: string) => Pick<WsDriver, 'open' | 'submit' | 'close'> =
+  createDriver: (url: string, transcriptPath: string) => Pick<WsDriver, 'open' | 'type' | 'pressEnter' | 'close'> =
     (url, transcriptPath) => new WsDriver({ url, transcriptPath }),
 ): Promise<number> {
   const sessionJson = readSessionJson(args.scratchDir);
@@ -671,7 +672,11 @@ export async function runInput(
   const driver = createDriver(url, transcriptPath);
   await driver.open();
   try {
-    await driver.submit(args.text);
+    // LF ('\n') only inserts a line break in the editor buffer and does NOT
+    // submit on modern PTYs (see WsDriver.pressEnter docs). Send the text and
+    // a real Enter ('\r') so the prompt actually reaches the agent loop.
+    await driver.type(args.text);
+    await driver.pressEnter();
   } finally {
     await driver.close();
   }
