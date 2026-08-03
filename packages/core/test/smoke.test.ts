@@ -134,26 +134,26 @@ test("core: workflow dispatch leaves model selection to OMP", async () => {
   assert.equal(calls[0]?.agent, "developer-kotlin");
 });
 
-test("fullstack: agent frontmatter uses OMP capability roles", () => {
+test("fullstack: agent frontmatter uses OMP class role with standard fallback", () => {
   const agentsDir = join(dirname(fileURLToPath(import.meta.url)), "../../fullstack/agents");
-  const expected: Record<string, { model: string; thinkingLevel: string }> = {
-    analyst: { model: "@task", thinkingLevel: "auto" },
-    architect: { model: "@slow", thinkingLevel: "high" },
-    "code-reviewer": { model: "@slow", thinkingLevel: "high" },
-    "coordinator-yolo": { model: "@slow", thinkingLevel: "high" },
-    coordinator: { model: "@slow", thinkingLevel: "high" },
-    "developer-go": { model: "@task", thinkingLevel: "auto" },
-    "developer-kotlin": { model: "@task", thinkingLevel: "auto" },
-    "developer-mobile": { model: "@task", thinkingLevel: "auto" },
-    devops: { model: "@task", thinkingLevel: "auto" },
-    diagnostics: { model: "@task", thinkingLevel: "auto" },
-    discovery: { model: "@task", thinkingLevel: "auto" },
-    "frontend-developer": { model: "@task", thinkingLevel: "auto" },
-    "init-mobile": { model: "@task", thinkingLevel: "auto" },
-    "manual-qa": { model: "@task", thinkingLevel: "auto" },
-    qa: { model: "@task", thinkingLevel: "auto" },
-    "security-tester": { model: "@slow", thinkingLevel: "high" },
-    "tech-researcher": { model: "@smol", thinkingLevel: "medium" },
+  const expected: Record<string, { classRole: string; fallbackRole: string; thinkingLevel: string }> = {
+    analyst: { classRole: "@analyst", fallbackRole: "@task", thinkingLevel: "auto" },
+    architect: { classRole: "@architect", fallbackRole: "@slow", thinkingLevel: "high" },
+    "code-reviewer": { classRole: "@reviewer", fallbackRole: "@slow", thinkingLevel: "high" },
+    "coordinator-yolo": { classRole: "@coordinator", fallbackRole: "@slow", thinkingLevel: "high" },
+    coordinator: { classRole: "@coordinator", fallbackRole: "@slow", thinkingLevel: "high" },
+    "developer-go": { classRole: "@developer-go", fallbackRole: "@task", thinkingLevel: "auto" },
+    "developer-kotlin": { classRole: "@developer-kotlin", fallbackRole: "@task", thinkingLevel: "auto" },
+    "developer-mobile": { classRole: "@developer-mobile", fallbackRole: "@task", thinkingLevel: "auto" },
+    devops: { classRole: "@devops", fallbackRole: "@task", thinkingLevel: "auto" },
+    diagnostics: { classRole: "@diagnostics", fallbackRole: "@task", thinkingLevel: "auto" },
+    discovery: { classRole: "@researcher", fallbackRole: "@smol", thinkingLevel: "auto" },
+    "frontend-developer": { classRole: "@frontend-developer", fallbackRole: "@task", thinkingLevel: "auto" },
+    "init-mobile": { classRole: "@developer-mobile", fallbackRole: "@task", thinkingLevel: "auto" },
+    "manual-qa": { classRole: "@manual-qa", fallbackRole: "@task", thinkingLevel: "auto" },
+    qa: { classRole: "@qa", fallbackRole: "@task", thinkingLevel: "auto" },
+    "security-tester": { classRole: "@security", fallbackRole: "@slow", thinkingLevel: "high" },
+    "tech-researcher": { classRole: "@researcher", fallbackRole: "@smol", thinkingLevel: "medium" },
   };
   const supportedFields: Record<string, true> = {
     name: true,
@@ -183,7 +183,10 @@ test("fullstack: agent frontmatter uses OMP capability roles", () => {
     for (const field of Object.keys(fields)) assert.ok(supportedFields[field], `${file}: unsupported ${field}`);
     const name = fields.name;
     assert.ok(name && expected[name], `${file}: unexpected agent name ${name}`);
-    assert.equal(fields.model?.replaceAll('"', ""), expected[name].model, `${name}: model role`);
+    const modelMatch = fields.model?.match(/^\[\s*"(@[^"]+)"\s*,\s*"(@[^"]+)"\s*\]\s*$/);
+    assert.ok(modelMatch, `${name}: model must be ["@class-role", "@fallback-role"]`);
+    assert.equal(modelMatch?.[1], expected[name].classRole, `${name}: class role`);
+    assert.equal(modelMatch?.[2], expected[name].fallbackRole, `${name}: standard fallback`);
     assert.equal(fields.thinkingLevel, expected[name].thinkingLevel, `${name}: reasoning level`);
     const tools = (fields.tools ?? "").split(",").map((tool) => tool.trim()).filter(Boolean);
     assert.ok(tools.every((tool) => tool === tool.toLowerCase()), `${name}: tool ids must be lowercase`);

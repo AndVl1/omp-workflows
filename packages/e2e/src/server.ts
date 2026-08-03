@@ -7,8 +7,8 @@
  * server-side `transcript.jsonl` — the evidence backbone for the report.
  *
  * Security posture (ported from @pi-harness/web-terminal, MIT):
- *   - binds to 127.0.0.1 — unreachable from other hosts;
- *   - one-shot single-use token in `?token=` (256-bit, URL-safe base64);
+ *   - session-scoped 256-bit token in `?token=` (URL-safe base64), valid only
+ *     while the localhost-only session is alive;
  *   - Origin header (when present) must match the server's own origin,
  *     Host header must match exactly;
  *   - X-Frame-Options: DENY, Referrer-Policy: no-referrer, strict CSP;
@@ -310,6 +310,27 @@ export interface OmpLaunchConfig {
    *     scratch bits) win over the host's defaults.
    */
   readonly hostConfigPath?: string;
+  /**
+   * Optional path to a *user-supplied* omp config overlay emitted AFTER
+   * `configPath` (the standard ux-e2e overlay). This is the third and
+   * last `--config` in argv order, so its keys win over both the host
+   * config and the standard overlay on conflict — letting a test run
+   * pin a specific active model (`modelRoles`) without touching the
+   * operator's host config or the regenerated standard overlay.
+   *
+   * The harness only resolves this path when the file actually exists
+   * (presence is the opt-in signal); an unset/falsy value is the normal
+   * case and is recorded as `null` in `session.json` for diagnostics.
+   */
+  readonly userConfigPath?: string;
+  /**
+   * Convenience: absolute path to the canonical user-overlay file
+   * (`<scratchDir>/.omp/ux-e2e-overlay.user.json`). Exposed so the
+   * caller can decide whether to pass `userConfigPath`. Always set —
+   * its existence at runtime is what determines whether the third
+   * `--config` is emitted.
+   */
+  readonly userConfigDefaultPath: string;
 }
 
 /**
@@ -321,6 +342,12 @@ export interface OmpLaunchConfig {
  * (`~/.omp/agent/`) — including `modelRoles`, `models.db`, and
  * credentials — so the run is model-capable out of the box. An
  * explicit `ompProfile` keeps ux-e2e data isolated; the caller picks.
+ *
+ * `--config` overlay order (argv order, later wins on conflict):
+ *   1. `hostConfigPath` (operator's `~/.omp/agent/config.yml` when present)
+ *   2. `configPath` (the regenerated ux-e2e overlay)
+ *   3. `userConfigPath` (operator-supplied `<scratchDir>/.omp/ux-e2e-overlay.user.json`
+ *      when present — third overlay so it overrides everything)
  */
 export function buildOmpArgs(cfg: OmpLaunchConfig): string[] {
   const maxMinutes = Math.max(1, Math.round(cfg.maxTimeSec / 60));
@@ -331,8 +358,11 @@ export function buildOmpArgs(cfg: OmpLaunchConfig): string[] {
   if (cfg.hostConfigPath !== undefined && cfg.hostConfigPath.length > 0) {
     args.push('--config', cfg.hostConfigPath);
   }
+  args.push('--config', cfg.configPath);
+  if (cfg.userConfigPath !== undefined && cfg.userConfigPath.length > 0) {
+    args.push('--config', cfg.userConfigPath);
+  }
   args.push(
-    '--config', cfg.configPath,
     '--session-dir', cfg.sessionDir,
     '--hide-thinking',
     '--max-time', `${maxMinutes}m`,
@@ -785,190 +815,175 @@ export function originAllowed(req: IncomingMessage, expectedOrigin: string): boo
 
 export type AttachResult =
   | { readonly ok: true }
-  | { readonly ok: false; readonly reason: 'no-token' | 'bad-token' | 'bad-origin' };
+  | { readonly ok: false; readonly reason: 'no-token' | 'bad-token' | 'bad-origin' | 'closed' };
 
-interface AttachOptions {
-  readonly origin: string;
+interface SessionControllerOptions {
   readonly pty: IPty | null;
   readonly spawnError: string | null;
-  readonly cols: number;
-  readonly rows: number;
   readonly idleMs: number;
-  readonly rateLimit: Required<RateLimitOptions>;
   readonly transcriptPath: string;
 }
 
-/**
- * Wire one WS upgrade to the session's PTY. Authentication is
- * token + replay + origin checked BEFORE `handleUpgrade`, so a rejected
- * request never becomes a WebSocket.
- */
+class SessionController {
+  readonly #opts: SessionControllerOptions;
+  readonly #idler: IdleTimer;
+  #attachedWs: WS | null = null;
+  #closed = false;
+
+  constructor(opts: SessionControllerOptions) {
+    this.#opts = opts;
+    this.#idler = new IdleTimer({
+      idleMs: opts.idleMs,
+      onIdle: () => {
+        if (this.#closed) return;
+        const message = `no inbound traffic for ${opts.idleMs}ms`;
+        if (this.#attachedWs !== null) {
+          send(this.#attachedWs, { t: 'err', code: 'idle-timeout', message });
+        }
+        this.#append({ ts: new Date().toISOString(), t: 'err', code: 'idle-timeout', message });
+        void this.close();
+      },
+    });
+    opts.pty?.onData(data => this.#handlePtyData(data));
+    opts.pty?.onExit(({ exitCode, signal }) => this.#handlePtyExit(exitCode, signal));
+  }
+
+  get closed(): boolean {
+    return this.#closed;
+  }
+
+  attach(ws: WS): void {
+    if (this.#closed) {
+      ws.close(1001, 'session closed');
+      return;
+    }
+    this.#attachedWs = ws;
+    this.#idler.bump();
+    send(ws, { t: 's', ok: true });
+    if (this.#opts.pty === null && this.#opts.spawnError !== null) {
+      send(ws, { t: 'err', code: 'spawn-failed', message: this.#opts.spawnError });
+      this.#append({ ts: new Date().toISOString(), t: 'err', code: 'spawn-failed', message: this.#opts.spawnError });
+      ws.close(1000, 'spawn failed');
+      void this.close();
+    }
+  }
+
+  detach(ws: WS): void {
+    if (this.#attachedWs === ws) this.#attachedWs = null;
+  }
+
+  handleMessage(ws: WS, raw: unknown, limiter: RateLimiter): void {
+    if (this.#closed || this.#attachedWs !== ws) return;
+    this.#idler.bump();
+    if (!limiter.record()) {
+      send(ws, { t: 'err', code: 'rate-limited', message: 'too many messages' });
+      this.#append({ ts: new Date().toISOString(), t: 'err', code: 'rate-limited' });
+      ws.close(1008, 'rate limited');
+      return;
+    }
+    let msg: ClientMsg;
+    try {
+      const text = typeof raw === 'string' ? raw : String(raw);
+      if (text.length > MAX_INBOUND_WS_BYTES) return;
+      msg = JSON.parse(text) as ClientMsg;
+    } catch {
+      return;
+    }
+    if (this.#opts.pty === null) return;
+    if (msg.t === 'i') {
+      this.#append({ ts: new Date().toISOString(), t: 'i', d: msg.d });
+      try {
+        this.#opts.pty.write(msg.d);
+      } catch {
+        /* PTY may be dying — best-effort. */
+      }
+    } else if (msg.t === 'r' && msg.cols > 0 && msg.rows > 0) {
+      try {
+        this.#opts.pty.resize(Math.min(msg.cols, 1000), Math.min(msg.rows, 1000));
+      } catch {
+        /* resize can fail if the PTY is closing. */
+      }
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#idler.fireNow();
+    const ws = this.#attachedWs;
+    this.#attachedWs = null;
+    if (ws !== null) {
+      try {
+        ws.close(1001, 'session closed');
+      } catch {
+        /* ignore. */
+      }
+    }
+    if (this.#opts.pty !== null) await killProcessTree(this.#opts.pty.pid);
+  }
+
+  #handlePtyData(data: string): void {
+    if (this.#closed) return;
+    this.#append({ ts: new Date().toISOString(), t: 'o', d: data });
+    if (this.#attachedWs !== null) send(this.#attachedWs, { t: 'o', d: data });
+  }
+
+  #handlePtyExit(exitCode: number, signal: number | undefined): void {
+    if (this.#closed) return;
+    const frame = {
+      ts: new Date().toISOString(),
+      t: 'exit',
+      code: exitCode,
+      ...(signal !== undefined ? { signal } : {}),
+    } as const;
+    this.#append(frame);
+    if (this.#attachedWs !== null) {
+      send(this.#attachedWs, { t: 'exit', code: exitCode, ...(signal !== undefined ? { signal } : {}) });
+      this.#attachedWs.close(1000, 'pty exited');
+    }
+    this.#closed = true;
+    this.#attachedWs = null;
+    this.#idler.fireNow();
+  }
+
+  #append(frame: TranscriptFrame): void {
+    try {
+      appendSessionFile(this.#opts.transcriptPath, JSON.stringify(frame) + '\n');
+    } catch {
+      /* transcript is best-effort evidence — never fatal. */
+    }
+  }
+}
+
+interface AttachOptions {
+  readonly origin: string;
+  readonly rateLimit: Required<RateLimitOptions>;
+  readonly controller: SessionController;
+}
+
+/** Authenticate a WS upgrade and attach it to the live PTY session. */
 export function attachSession(
   req: IncomingMessage,
   socket: Duplex,
   head: Buffer,
   wss: WebSocketServer,
   expectedToken: string,
-  consumed: Set<string>,
   opts: AttachOptions,
 ): AttachResult {
   const token = readToken(req);
   if (token === null) return { ok: false, reason: 'no-token' };
   if (!safeEqual(token, expectedToken)) return { ok: false, reason: 'bad-token' };
-  if (consumed.has(token)) return { ok: false, reason: 'bad-token' };
   if (!originAllowed(req, opts.origin)) return { ok: false, reason: 'bad-origin' };
-
-  // Mark consumed BEFORE handleUpgrade: this token is single-use per
-  // process and we cannot roll back a synchronous upgrade failure.
-  consumed.add(token);
-
-  const appendTranscript = (frame: TranscriptFrame): void => {
-    try {
-      appendSessionFile(opts.transcriptPath, JSON.stringify(frame) + '\n');
-    } catch {
-      /* transcript is best-effort evidence — never fatal. */
-    }
-  };
-
-  let closed = false;
-  let attachedWs: WS | null = null;
-
-  const limiter = new RateLimiter(opts.rateLimit);
-  const idler = new IdleTimer({
-    idleMs: opts.idleMs,
-    onIdle: () => {
-      if (closed) return;
-      const msg = `no inbound traffic for ${opts.idleMs}ms`;
-      if (attachedWs !== null) {
-        send(attachedWs, { t: 'err', code: 'idle-timeout', message: msg });
-      }
-      appendTranscript({ ts: new Date().toISOString(), t: 'err', code: 'idle-timeout', message: msg });
-      void detach();
-    },
-  });
-
-  const detach = async (): Promise<void> => {
-    if (closed) return;
-    closed = true;
-    idler.fireNow();
-    if (attachedWs !== null) {
-      try {
-        attachedWs.close(1001, 'session closed');
-      } catch {
-        /* ignore. */
-      }
-    }
-    if (opts.pty !== null) {
-      await killProcessTree(opts.pty.pid);
-    }
-  };
+  if (opts.controller.closed) return { ok: false, reason: 'closed' };
 
   wss.handleUpgrade(req, socket, head, ws => {
-    attachedWs = ws;
-    idler.bump();
-
-    // Authenticated — ack first.
-    send(ws, { t: 's', ok: true });
-
-    if (opts.pty === null && opts.spawnError !== null) {
-      // Spawn failed — fatal: report it and close the socket so the
-      // client does not keep banging on a dead session.
-      send(ws, { t: 'err', code: 'spawn-failed', message: opts.spawnError });
-      appendTranscript({ ts: new Date().toISOString(), t: 'err', code: 'spawn-failed', message: opts.spawnError });
-      try {
-        ws.close(1000, 'spawn failed');
-      } catch {
-        /* ignore. */
-      }
-      return;
-    }
-    if (opts.pty === null) {
-      // noPty test mode — keep the socket open so the client can drive
-      // protocol-level exercises (rate-limit, idle-timeout, sanitize).
-      // Port matches @pi-harness/web-terminal: silently drop input when
-      // ptyProc===null. Resize is also a no-op (no terminal to resize).
-    }
-    if (opts.pty !== null) {
-      const ptyProc = opts.pty;
-      ptyProc.onData(data => {
-        if (closed) return;
-        const frame = { ts: new Date().toISOString(), t: 'o', d: data } as const;
-        appendTranscript(frame);
-        send(ws, { t: 'o', d: data });
-      });
-      ptyProc.onExit(({ exitCode, signal }) => {
-        if (closed) return;
-        const msg: ServerMsg = {
-          t: 'exit',
-          code: exitCode,
-          ...(signal !== undefined ? { signal } : {}),
-        };
-        appendTranscript({ ts: new Date().toISOString(), t: 'exit', code: exitCode, ...(signal !== undefined ? { signal } : {}) });
-        send(ws, msg);
-        try {
-          ws.close(1000, 'pty exited');
-        } catch {
-          /* ignore. */
-        }
-        void detach();
-      });
-    }
-
-    ws.on('message', raw => {
-      idler.bump();
-      if (!limiter.record()) {
-        // Hard cap reached — kick the client so the PTY stays responsive.
-        send(ws, { t: 'err', code: 'rate-limited', message: 'too many messages' });
-        appendTranscript({ ts: new Date().toISOString(), t: 'err', code: 'rate-limited' });
-        try {
-          ws.close(1008, 'rate limited');
-        } catch {
-          /* ignore. */
-        }
-        return;
-      }
-      let msg: ClientMsg;
-      try {
-        const text = typeof raw === 'string' ? raw : raw.toString('utf8');
-        if (text.length > MAX_INBOUND_WS_BYTES) return;
-        msg = JSON.parse(text) as ClientMsg;
-      } catch {
-        return;
-      }
-      if (opts.pty === null) {
-        // noPty sessions: silently drop input/resize — the contract
-        // matches @pi-harness/web-terminal (see CHANGELOG "no-pty
-        // behavior" decision). The socket stays open so unit tests can
-        // exercise rate-limit and idle-timeout over the same WS.
-        return;
-      }
-      if (msg.t === 'i') {
-        appendTranscript({ ts: new Date().toISOString(), t: 'i', d: msg.d });
-        try {
-          opts.pty.write(msg.d);
-        } catch {
-          /* PTY may be dying — best-effort. */
-        }
-      } else if (msg.t === 'r') {
-        if (msg.cols > 0 && msg.rows > 0) {
-          try {
-            opts.pty.resize(Math.min(msg.cols, 1000), Math.min(msg.rows, 1000));
-          } catch {
-            /* resize can fail if the PTY is closing. */
-          }
-        }
-      }
-    });
-
-    ws.on('close', () => {
-      void detach();
-    });
-    ws.on('error', () => {
-      void detach();
-    });
+    const limiter = new RateLimiter(opts.rateLimit);
+    opts.controller.attach(ws);
+    ws.on('message', raw => opts.controller.handleMessage(ws, raw, limiter));
+    ws.on('close', () => opts.controller.detach(ws));
+    ws.on('error', () => opts.controller.detach(ws));
   });
-
-  return { ok: true as const };
+  return { ok: true };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1014,7 +1029,7 @@ function stateDirOf(scratchDir: string): string {
  *
  * The caller is responsible for calling `close()` on shutdown — typically
  * from a SIGINT/SIGTERM handler or a `finally` block. The returned `url`
- * embeds the single-use token; it is the only thing an operator needs.
+ * embeds a 256-bit session-scoped token valid only while the session lives.
  */
 export async function startTestSession(opts: TestSessionOptions): Promise<TestSession> {
   if (typeof opts.cwd !== 'string' || opts.cwd.length === 0) {
@@ -1052,7 +1067,8 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
 
   const httpServer: Server = createServer();
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_INBOUND_WS_BYTES });
-  const consumed = new Set<string>();
+  // The 256-bit bearer token is session-scoped: localhost and origin checks
+  // constrain its use, and reconnects remain possible until shutdown.
 
   const { promise: listening, resolve: bound, reject: bindFailed } = deferred<void>();
   httpServer.once('error', bindFailed);
@@ -1076,14 +1092,24 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   if (hostConfig.warning !== null) {
     process.stderr.write(`ux-e2e: WARNING: ${hostConfig.warning}\n`);
   }
+  // Operator-supplied overlay (opt-in): present-when-exists at
+  // `<scratch>/.omp/ux-e2e-overlay.user.json`. When found, it is emitted
+  // as the THIRD `--config` (after host config and the regenerated
+  // ux-e2e overlay) so its keys win on conflict — letting a test run
+  // pin `modelRoles` (or anything else) without touching the host
+  // config or the regenerated standard overlay. Absence is the normal
+  // case: the file is never auto-created, only consulted. Resolved early
+  // so its presence is recorded in `session.json` regardless of noPty.
+  const userConfigDefaultPath = join(scratchDir, '.omp', 'ux-e2e-overlay.user.json');
+  const userConfigPath = existsSync(userConfigDefaultPath) ? userConfigDefaultPath : null;
 
   let ptyProc: IPty | null = null;
   let spawnError: string | null = null;
   if (opts.noPty !== true) {
     // node-pty is imported lazily: it is a native module whose prebuilt
-  // binary may be missing on some platforms — noPty test sessions must
-  // still work when the native module cannot load.
-  const ptyMod = await import('node-pty');
+    // binary may be missing on some platforms — noPty test sessions must
+    // still work when the native module cannot load.
+    const ptyMod = await import('node-pty');
     const env = buildPtyEnv(process.env, opts.env, { keepProxyEnv: opts.keepProxyEnv });
     const args = buildOmpArgs({
       ompProfile,
@@ -1091,7 +1117,9 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
       approvalMode,
       configPath: join(scratchDir, '.omp', 'ux-e2e-overlay.json'),
       sessionDir: join(scratchDir, '.omp', 'agent'),
+      userConfigDefaultPath,
       ...(hostConfig.path !== null ? { hostConfigPath: hostConfig.path } : {}),
+      ...(userConfigPath !== null ? { userConfigPath } : {}),
     });
     try {
       // omp is spawned directly (never wrapped in a shell), which is
@@ -1119,6 +1147,10 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     host_config: {
       path: hostConfig.path,
       warning: hostConfig.warning,
+    },
+    user_config: {
+      path: userConfigPath,
+      default_path: userConfigDefaultPath,
     },
   };
   writeSessionFile(sessionJsonPath, JSON.stringify(sessionJson, null, 2) + '\n');
@@ -1153,17 +1185,14 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     res.end('not found');
   });
 
+  const controller = new SessionController({ pty: ptyProc, spawnError, idleMs, transcriptPath });
+
   // ---- WS: authenticated upgrade -------------------------------------
   httpServer.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-    const result = attachSession(req, socket, head, wss, token, consumed, {
+    const result = attachSession(req, socket, head, wss, token, {
       origin,
-      pty: ptyProc,
-      spawnError,
-      cols,
-      rows,
-      idleMs,
       rateLimit,
-      transcriptPath,
+      controller,
     });
     if (!result.ok) {
       const reason = result.reason;
@@ -1183,10 +1212,8 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
         /* ignore. */
       }
     });
+    await controller.close();
     wss.close();
-    if (ptyProc !== null) {
-      await killProcessTree(ptyProc.pid);
-    }
     const { promise: closed, resolve: done } = deferred<void>();
     httpServer.close(() => done());
     await closed;

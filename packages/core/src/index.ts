@@ -75,6 +75,26 @@ export const defaultFullstackFlags: RoleConfig["flags"] = {
   has_security: ["**/auth/**", "**/security/**", "**/*crypto*", "**/*Secret*", "**/*Token*"],
   has_infra: ["**/Dockerfile", "**/helm/**", "**/k8s/**", "**/.github/workflows/**"],
 };
+// ── Model-role taxonomy ─────────────────────────────────────────────────────
+export { defaultFullstackModelRoles } from "./model-roles.js";
+export {
+	resolveRoleChain,
+	isResearchRequest,
+	isResearchResponse,
+	validateResearchRequest,
+	validateResearchResponse,
+} from "./model-roles.js";
+export type {
+	ModelRoleEntry,
+	InventoryModel,
+	RoleLookup,
+	RoleResolution,
+	RoleResolutionStatus,
+	ResearchRequest,
+	ResearchResponse,
+	BenchmarkSource,
+	ResearchRecommendation,
+} from "./model-roles.js";
 
 /**
  * Wire the engine into omp's ExtensionAPI. Bundles call this from their

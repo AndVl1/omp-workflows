@@ -8,11 +8,12 @@
  *   stop <scratch-dir>           stop a running session (SIGTERM -> SIGKILL its tree)
  *   transcript <scratch-dir>     render the session transcript
  *   ask <scratch-dir> [<answer>] list or answer a pending [ask_user] prompt
+ *   input <scratch-dir> <text>   send arbitrary input followed by Enter
  *   report <scratch-dir>         generate the ux-e2e report (JSON + markdown)
  */
 
-import { execSync, spawn } from 'node:child_process';
-import { createWriteStream, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execSync, spawn, spawnSync } from 'node:child_process';
+import { closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { parseArgs, type ParseArgsConfig } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -40,6 +41,7 @@ Subcommands:
   stop <scratch-dir>            stop a running session (SIGTERM -> SIGKILL its tree)
   transcript <scratch-dir>      render the session transcript
   ask <scratch-dir> [<answer>]  list or answer a pending [ask_user] prompt
+  input <scratch-dir> <text>    send arbitrary input followed by Enter
   report <scratch-dir>          generate the ux-e2e report (JSON + markdown)
 
 Run 'ux-e2e <subcommand> --help' for subcommand options.`;
@@ -347,7 +349,25 @@ export function tailLogFile(path: string, maxBytes: number): string {
   return body.slice(-maxBytes);
 }
 
-/** --detach: run the session in a detached child, exit with the URL. */
+/** --detach: run the session in a detached child, exit with the URL.
+ *
+ * The detached child writes its stdout/stderr DIRECTLY into `logPath` via
+ * an inherited file descriptor. There is NO pipe between parent and child,
+ * so when the parent (this command) exits, the child cannot crash with
+ * EPIPE — the kernel-level file write path is independent of any process
+ * lifetime. Previous versions used `stdio: ['ignore','pipe','pipe']` plus
+ * `child.stdout.pipe(logStream)`, which left the parent holding the
+ * pipe/logStream open (event loop) AND, more fatally, killed the child
+ * ~3-4s after the parent's exit: the parent's stdio teardown closed the
+ * pipe ends the child was still writing to, so the next `console.log()`
+ * in the child triggered an unhandled 'error' on its stdout stream and
+ * the process exited without a frame.
+ *
+ * The fd is opened in append mode so a `--detach` rerun keeps prior log
+ * history. We write a header line via `writeSync` BEFORE spawning, then
+ * close the parent's fd copy after spawn — the child inherited its own
+ * fd during exec and continues to write into the same file.
+ */
 async function runStartDetached(args: StartArgs): Promise<number> {
   assertNoLiveSession(args.scratchDir, args.force);
 
@@ -356,8 +376,17 @@ async function runStartDetached(args: StartArgs): Promise<number> {
   const logPath = detachLogPath(args.scratchDir);
   // Append so a subsequent --detach run after a crash keeps the prior
   // log entries (operators triage by timeline).
-  const logStream = createWriteStream(logPath, { flags: 'a' });
-  logStream.write(`\n--- ux-e2e detached start @ ${new Date().toISOString()} ---\n`);
+  const fd = openSync(logPath, 'a');
+  try {
+    writeSync(fd, `\n--- ux-e2e detached start @ ${new Date().toISOString()} ---\n`);
+  } finally {
+    // The header line is the only thing the parent itself writes; the
+    // child writes everything else via its inherited fd copy. Closing
+    // the parent's fd here means the parent holds no FDs into the log
+    // file, so its event loop drains and `main()` returns as soon as
+    // the session URL is known.
+    closeSync(fd);
+  }
 
   const cliPath = fileURLToPath(import.meta.url);
   const childArgs = [
@@ -375,20 +404,19 @@ async function runStartDetached(args: StartArgs): Promise<number> {
 
   const child = spawn(process.execPath, childArgs, {
     detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    // fd is closed; re-open for the child so it can write straight to
+    // the file. Both stdout and stderr share the same fd (the OS
+    // atomically interleaves writes — fine for a log file; stdout/stderr
+    // distinction is not preserved, but that's irrelevant for triage).
+    stdio: ['ignore', openSync(logPath, 'a'), openSync(logPath, 'a')],
     cwd: args.scratchDir,
   });
   child.unref();
-  if (child.stdout !== null) child.stdout.pipe(logStream, { end: false });
-  if (child.stderr !== null) child.stderr.pipe(logStream, { end: false });
-  // child exit: close the log so the tail is flushable on a subsequent
-  // --detach call from this scratch.
-  child.once('exit', () => {
-    logStream.end();
-  });
 
   // Wait for the child's session.json to appear with a live pid.
-  const deadline = Date.now() + 15_000;
+  // Cold starts (CI runners, slow disks) can exceed 15 s; keep a generous
+  // deadline so the detached child has time to boot omp and write session.json.
+  const deadline = Date.now() + 60_000;
   for (;;) {
     const info = readSessionInfo(args.scratchDir);
     if (info !== null && pidIsLive(info.pid)) {
@@ -408,7 +436,6 @@ async function runStartDetached(args: StartArgs): Promise<number> {
       } else {
         console.error(`ux-e2e start: no output captured in ${logPath}; child may have failed before writing.`);
       }
-      logStream.end();
       return 1;
     }
     const { promise: ticked, resolve: tick } = deferred<void>();
@@ -432,6 +459,18 @@ export function parseStopArgs(argv: string[]): StopArgs {
   return { scratchDir: resolve(scratchDir) };
 }
 
+/**
+ * Return the command line for a live process. `ps` is the process inspection
+ * primitive available on supported POSIX hosts (including macOS, where
+ * `/proc` is not present).
+ */
+function processCommandLine(pid: number): string | null {
+  const result = spawnSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' });
+  if (result.error !== undefined || result.status !== 0) return null;
+  const command = result.stdout.trim();
+  return command.length > 0 ? command : null;
+}
+
 export async function runStop(args: StopArgs): Promise<number> {
   const info = readSessionInfo(args.scratchDir);
   if (info === null) {
@@ -442,6 +481,15 @@ export async function runStop(args: StopArgs): Promise<number> {
     console.log(`ux-e2e stop: session pid ${String(info.pid)} is not running`);
     return 0;
   }
+
+  const commandLine = processCommandLine(info.pid as number);
+  if (commandLine === null || !commandLine.includes(args.scratchDir)) {
+    console.error(
+      `ux-e2e stop: pid ${String(info.pid)} does not match scratch session — refusing (stale session.json?)`,
+    );
+    return 1;
+  }
+
   await killProcessTree(info.pid as number);
   console.log(`ux-e2e stop: sent SIGTERM->SIGKILL to pid ${String(info.pid)}`);
   return 0;
@@ -584,9 +632,50 @@ export async function runAsk(args: AskArgs): Promise<number> {
   }
   const driver = new WsDriver({ url, transcriptPath });
   await driver.open();
-  await driver.type(args.answer + '\n');
+  await driver.submit(args.answer);
   await driver.close();
   console.log(`ux-e2e ask: answered [ask_user #${result.block.index}] with ${JSON.stringify(args.answer)}`);
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* input                                                               */
+/* ------------------------------------------------------------------ */
+
+export interface InputArgs {
+  readonly scratchDir: string;
+  readonly text: string;
+}
+
+export function parseInputArgs(argv: string[]): InputArgs {
+  const { positionals } = parseArgsOrThrow(argv, {});
+  const scratchDir = positionals[0];
+  const text = positionals[1];
+  if (scratchDir === undefined) throw new Error('ux-e2e input: missing <scratch-dir> argument');
+  if (text === undefined) throw new Error('ux-e2e input: missing <text> argument');
+  return { scratchDir: resolve(scratchDir), text };
+}
+
+export async function runInput(
+  args: InputArgs,
+  createDriver: (url: string, transcriptPath: string) => Pick<WsDriver, 'open' | 'submit' | 'close'> =
+    (url, transcriptPath) => new WsDriver({ url, transcriptPath }),
+): Promise<number> {
+  const sessionJson = readSessionJson(args.scratchDir);
+  const url = typeof sessionJson.url === 'string' ? sessionJson.url : null;
+  if (url === null) {
+    console.error('ux-e2e input: no session.json url — is a session running?');
+    return 1;
+  }
+  const transcriptPath = join(stateDirOf(args.scratchDir), 'transcript.jsonl');
+  const driver = createDriver(url, transcriptPath);
+  await driver.open();
+  try {
+    await driver.submit(args.text);
+  } finally {
+    await driver.close();
+  }
+  console.log(`ux-e2e input: sent ${JSON.stringify(args.text)} followed by Enter`);
   return 0;
 }
 
@@ -688,6 +777,10 @@ export async function main(argv: string[]): Promise<number> {
       case 'ask': {
         const args = parseAskArgs(rest);
         return runAsk(args);
+      }
+      case 'input': {
+        const args = parseInputArgs(rest);
+        return runInput(args);
       }
       case 'report': {
         const args = parseReportArgs(rest);

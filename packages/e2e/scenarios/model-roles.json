@@ -1,0 +1,53 @@
+{
+  "id": "model-roles",
+  "title": "Model roles: /omp-model-roles validate + /do-work agent spawn on role models",
+  "description": "Verifies the per-agent-class OMP model roles feature: the tester configures modelRoles in the project .omp/config.yml, runs /omp-model-roles validate (expects class-role resolution + fallback), then runs a small /do-work task and checks that subagents spawn. Expects a resolve table and one small workflow run.",
+  "task": { "file": "model-roles-task.md" },
+  "params": {
+    "slug": "model-roles",
+    "branch": "feat/agent-model-roles",
+    "task": "implement a tiny documented feature in the scratch project (add a README section) via the /do-work workflow"
+  },
+  "stages": [
+    {
+      "id": "configure",
+      "name": "Configure modelRoles",
+      "expect": ["omp-model-roles", "validate", "Model roles"]
+    },
+    {
+      "id": "validate",
+      "name": "Role resolution table",
+      "expect": ["architect", "developer-go", "fallback", "resolved", "class"]
+    },
+    {
+      "id": "do_work",
+      "name": "Small workflow run",
+      "expect": ["do-work", "stage:", "implement"]
+    },
+    {
+      "id": "verify",
+      "name": "Spawn verification",
+      "expect": ["model", "spawn", "subagent"]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 900000,
+    "checkpointPollMs": 2000
+  },
+  "screenshots": {
+    "on": ["stage_start", "ask_user", "error"]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

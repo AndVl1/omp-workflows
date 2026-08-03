@@ -1,6 +1,6 @@
 ---
 name: qa
-model: "@task"
+model: ["@qa", "@task"]
 thinkingLevel: auto
 description: QA engineer - writes tests, reviews code, checks security, ensures quality before deployment. USE PROACTIVELY after implementation.
 tools: read, write, edit, glob, grep, bash

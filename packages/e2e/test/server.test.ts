@@ -88,6 +88,7 @@ test('server: buildOmpArgs matches the launch contract', () => {
     approvalMode: 'yolo',
     configPath: '/tmp/scratch/.omp/ux-e2e-overlay.json',
     sessionDir: '/tmp/scratch/.omp/agent',
+    userConfigDefaultPath: '/tmp/scratch/.omp/ux-e2e-overlay.user.json',
   });
   assert.deepEqual(args, [
     '--profile', 'ux-e2e-test',
@@ -112,6 +113,7 @@ test('server: buildOmpArgs omits --profile when ompProfile is unset (default = i
     configPath: '/tmp/scratch/.omp/ux-e2e-overlay.json',
     sessionDir: '/tmp/scratch/.omp/agent',
     hostConfigPath: '/Users/test/.omp/agent/config.yml',
+    userConfigDefaultPath: '/tmp/scratch/.omp/ux-e2e-overlay.user.json',
   });
   assert.ok(!args.includes('--profile'), 'no --profile flag when ompProfile is unset');
   assert.deepEqual(args, [
@@ -141,15 +143,87 @@ test('server: buildOmpArgs prepends host config (D4 — model inheritance)', () 
     configPath: '/scratch/.omp/ux-e2e-overlay.json',
     sessionDir: '/scratch/.omp/agent',
     hostConfigPath: '/Users/test/.omp/agent/config.yml',
+    userConfigDefaultPath: '/scratch/.omp/ux-e2e-overlay.user.json',
   });
   // Two `--config` flags in the right order: host first, overlay second.
+  // (`userConfigPath` is unset here, so the third `--config` is NOT emitted.)
   const configIdx = args.reduce<number[]>((acc, v, i) => (v === '--config' ? [...acc, i] : acc), []);
-  assert.equal(configIdx.length, 2, 'emits two --config flags');
+  assert.equal(configIdx.length, 2, 'emits exactly two --config flags when userConfigPath is unset');
   assert.equal(args[configIdx[0] + 1], '/Users/test/.omp/agent/config.yml', 'host config is first');
   assert.equal(args[configIdx[1] + 1], '/scratch/.omp/ux-e2e-overlay.json', 'overlay is second (wins on conflict)');
   // Sanity: still never passes -p/--print/--no-pty.
   assert.ok(!args.includes('-p') && !args.includes('--print'));
   assert.ok(!args.includes('--no-pty'));
+});
+
+test('server: buildOmpArgs appends user config as the THIRD --config overlay (after ux-e2e overlay)', () => {
+  // When the operator has dropped `<scratch>/.omp/ux-e2e-overlay.user.json`
+  // into the scratch dir, the harness emits a third `--config` AFTER the
+  // standard ux-e2e overlay so the user's keys win on conflict — letting
+  // a test run pin, e.g., `modelRoles.default` (active session model)
+  // without touching the host config or the regenerated standard overlay.
+  // omp merges `--config` overlays in argv order and later overrides
+  // earlier on duplicate keys (verified against `omp v17.2.3 --help`).
+  const args = buildOmpArgs({
+    ompProfile: 'ux-e2e-test',
+    maxTimeSec: 1800,
+    approvalMode: 'yolo',
+    configPath: '/scratch/.omp/ux-e2e-overlay.json',
+    sessionDir: '/scratch/.omp/agent',
+    hostConfigPath: '/Users/test/.omp/agent/config.yml',
+    userConfigDefaultPath: '/scratch/.omp/ux-e2e-overlay.user.json',
+    userConfigPath: '/scratch/.omp/ux-e2e-overlay.user.json',
+  });
+  // Three `--config` flags in the right order:
+  //   1. host config (modelRoles survives)
+  //   2. ux-e2e overlay (regenerated every start)
+  //   3. user overlay (highest priority — wins on conflict)
+  const configIdx = args.reduce<number[]>((acc, v, i) => (v === '--config' ? [...acc, i] : acc), []);
+  assert.equal(configIdx.length, 3, 'emits three --config flags when userConfigPath is set');
+  assert.equal(args[configIdx[0] + 1], '/Users/test/.omp/agent/config.yml', 'host config is first');
+  assert.equal(args[configIdx[1] + 1], '/scratch/.omp/ux-e2e-overlay.json', 'ux-e2e overlay is second');
+  assert.equal(args[configIdx[2] + 1], '/scratch/.omp/ux-e2e-overlay.user.json', 'user overlay is third (highest priority)');
+  // Sanity: still never passes -p/--print/--no-pty.
+  assert.ok(!args.includes('-p') && !args.includes('--print'));
+  assert.ok(!args.includes('--no-pty'));
+});
+
+test('server: buildOmpArgs omits the THIRD --config when userConfigPath is unset (no file present)', () => {
+  // Absence of the user file is the normal case — the harness must NOT
+  // emit a dangling `--config` with `undefined` or an empty path. The
+  // default path is still recorded in the contract for diagnostics but
+  // never emitted as `--config <default-path>` unless the file exists.
+  const args = buildOmpArgs({
+    maxTimeSec: 1800,
+    approvalMode: 'yolo',
+    configPath: '/scratch/.omp/ux-e2e-overlay.json',
+    sessionDir: '/scratch/.omp/agent',
+    hostConfigPath: '/Users/test/.omp/agent/config.yml',
+    userConfigDefaultPath: '/scratch/.omp/ux-e2e-overlay.user.json',
+  });
+  const configIdx = args.reduce<number[]>((acc, v, i) => (v === '--config' ? [...acc, i] : acc), []);
+  assert.equal(configIdx.length, 2, 'emits exactly two --config flags when userConfigPath is unset');
+  assert.equal(args[configIdx[0] + 1], '/Users/test/.omp/agent/config.yml');
+  assert.equal(args[configIdx[1] + 1], '/scratch/.omp/ux-e2e-overlay.json');
+  // Default path is referenced via the contract but never emitted as `--config`.
+  assert.ok(!args.includes('/scratch/.omp/ux-e2e-overlay.user.json'),
+    'user default path is not emitted when userConfigPath is unset');
+});
+
+test('server: buildOmpArgs treats empty-string userConfigPath as unset', () => {
+  // Defensive: a caller (e.g. a CLI flag) might pass an empty string
+  // instead of `undefined`; the contract must treat that the same way.
+  const args = buildOmpArgs({
+    maxTimeSec: 1800,
+    approvalMode: 'yolo',
+    configPath: '/scratch/.omp/ux-e2e-overlay.json',
+    sessionDir: '/scratch/.omp/agent',
+    userConfigDefaultPath: '/scratch/.omp/ux-e2e-overlay.user.json',
+    userConfigPath: '',
+  });
+  const configIdx = args.reduce<number[]>((acc, v, i) => (v === '--config' ? [...acc, i] : acc), []);
+  assert.equal(configIdx.length, 1, 'empty userConfigPath is treated as unset');
+  assert.equal(args[configIdx[0] + 1], '/scratch/.omp/ux-e2e-overlay.json');
 });
 
 test('server: checkHostOmpConfig warns on missing or empty modelRoles', () => {
@@ -247,18 +321,23 @@ test('server: ws rejects a wrong token', async t => {
   assert.match(err.message, /401|unexpected server response/iu);
 });
 
-test('server: single-use token — replay is rejected', async t => {
+test('server: session-scoped token — reconnect is accepted until the session closes', async () => {
   const scratch = makeScratch();
   const session = await startTestSession({ cwd: scratch, noPty: true, token: 'sekret' });
-  t.after(() => session.close());
 
-  const msgs: ServerMsg[] = [];
-  const ws = await openWs(session.port, 'sekret', {}, m => msgs.push(m));
-  await waitFor(() => msgs.some(m => m.t === 's'), { timeoutMs: 2000 });
-  await ws.close();
+  const firstMessages: ServerMsg[] = [];
+  const first = await openWs(session.port, 'sekret', {}, message => firstMessages.push(message));
+  await waitFor(() => firstMessages.some(message => message.t === 's'), { timeoutMs: 2000 });
+  await first.close();
 
-  const err = await wsFails(session.port, 'sekret');
-  assert.match(err.message, /401|unexpected server response/iu);
+  const reconnectMessages: ServerMsg[] = [];
+  const reconnect = await openWs(session.port, 'sekret', {}, message => reconnectMessages.push(message));
+  await waitFor(() => reconnectMessages.some(message => message.t === 's'), { timeoutMs: 2000 });
+  await reconnect.close();
+
+  await session.close();
+  const error = await wsFails(session.port, 'sekret');
+  assert.match(error.message, /401|ECONNREFUSED|connect/iu);
 });
 
 test('server: ws rejects a mismatched Origin', async t => {
@@ -335,12 +414,21 @@ test('server: ws echo roundtrip through a fake PTY command', async t => {
     { timeoutMs: 5000, label: 'pty echo' },
   );
 
-  // Server-side transcript got the frames — the evidence backbone.
-  const transcript = readFileSync(session.transcriptPath, 'utf8');
-  assert.ok(transcript.includes('echo:hello'), 'transcript.jsonl contains the pty output');
-  assert.ok(transcript.includes('"t":"i"'), 'transcript.jsonl records the input frame');
-
   await ws.close();
+
+  const reconnectMessages: ServerMsg[] = [];
+  const reconnect = await openWs(session.port, 'sekret', {}, message => reconnectMessages.push(message));
+  await waitFor(() => reconnectMessages.some(message => message.t === 's'), { timeoutMs: 2000 });
+  reconnect.send(JSON.stringify({ t: 'i', d: 'again\n' }));
+  await waitFor(
+    () => reconnectMessages.some(message => message.t === 'o' && message.d.includes('echo:again')),
+    { timeoutMs: 5000, label: 'pty echo after reconnect' },
+  );
+  await reconnect.close();
+  const transcript = readFileSync(session.transcriptPath, 'utf8');
+  assert.ok(transcript.includes('echo:hello'), 'transcript.jsonl contains output before disconnect');
+  assert.ok(transcript.includes('echo:again'), 'same PTY accepts input after reconnect');
+  assert.ok(transcript.includes('"t":"i"'), 'transcript.jsonl records input frames');
 });
 
 test('server: session.json + pty metadata written', async t => {
@@ -361,6 +449,44 @@ test('server: session.json + pty metadata written', async t => {
   assert.deepEqual(sessionJson.scenario, { id: 'full-feature', title: 'Full feature' });
   assert.equal(session.pty.mode, 'noPty');
   assert.ok(session.url.includes(`token=sekret`), 'url embeds the token');
+  // user_config block is always present — `path` is null when the file
+  // is absent (the normal case), `default_path` always points at the
+  // canonical <scratch>/.omp/ux-e2e-overlay.user.json location.
+  const userConfig = sessionJson.user_config as { path: string | null; default_path: string };
+  assert.equal(userConfig.path, null, 'user_config.path is null when file is absent');
+  assert.equal(
+    userConfig.default_path,
+    join(scratch, '.omp', 'ux-e2e-overlay.user.json'),
+    'user_config.default_path always points at the canonical location',
+  );
+});
+
+test('server: session.json records user_config.path when the user overlay file is present', async t => {
+  // When the operator drops `<scratch>/.omp/ux-e2e-overlay.user.json`
+  // into the scratch dir, the harness must record the resolved path in
+  // session.json under `user_config.path` for diagnostics — even when
+  // running in `noPty` mode (where no PTY is spawned but the file's
+  // presence is still observable).
+  const scratch = makeScratch();
+  mkdirSync(join(scratch, '.omp'), { recursive: true });
+  const userOverlayPath = join(scratch, '.omp', 'ux-e2e-overlay.user.json');
+  writeFileSync(
+    userOverlayPath,
+    'modelRoles:\n  default: anthropic/claude-sonnet-4.5\n',
+  );
+  const session = await startTestSession({
+    cwd: scratch,
+    noPty: true,
+    token: 'sekret',
+    taskPrompt: 'pin the model',
+  });
+  t.after(() => session.close());
+
+  const sessionJson = JSON.parse(readFileSync(session.sessionJsonPath, 'utf8')) as Record<string, unknown>;
+  const userConfig = sessionJson.user_config as { path: string | null; default_path: string };
+  assert.equal(userConfig.path, userOverlayPath, 'user_config.path is the resolved user overlay');
+  assert.equal(userConfig.default_path, userOverlayPath);
+  rmSync(userOverlayPath);
 });
 
 test('server: concurrency guard refuses a live session without --force', () => {

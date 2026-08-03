@@ -1,12 +1,23 @@
 # @andvl1/omp-workflows-core
 
-Profile-driven multi-stage workflow engine for omp. No agents, no skills — pure runtime.
+Profile-driven multi-stage workflow engine for omp. No agents — bundles ship those.
+Ships the `custom-agent-bundle` skill (how to add your own agents).
 
 ## Install
 
 ```bash
 npm install @andvl1/omp-workflows-core
 ```
+
+To expose the bundled skill to the agent (so it can help build a custom
+bundle), install core as an omp plugin too:
+
+```bash
+omp plugin install @andvl1/omp-workflows-core
+```
+
+(The package carries an `omp: {}` manifest — skills are discovered without
+an extension entry; see [`docs/adding-agents.md`](../docs/adding-agents.md).)
 
 ## Public API
 
@@ -25,7 +36,40 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
-Or use the built-in defaults for fullstack projects:
+## Custom bundle — with your own model-role taxonomy
+
+> Полный гайд по созданию своего набора агентов (frontmatter, model-роли,
+> registerTeamWorkflow, slash-команды, минимальный скелет бандла):
+> **[`docs/adding-agents.md`](../docs/adding-agents.md)**.
+
+`defaultFullstackModelRoles` ships as the default 14-entry taxonomy, but any bundle
+can override it with its own `ModelRoleEntry[]` while reusing the helpers
+(`resolveRoleChain`, `isResearchRequest`, `isResearchResponse`):
+
+```typescript
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import {
+  registerTeamWorkflow,
+  defaultFullstackRoles,
+  type ModelRoleEntry,
+} from "@andvl1/omp-workflows-core";
+
+
+const MY_MODEL_ROLES: ModelRoleEntry[] = [
+  { role: "rust-architect", agents: ["architect"], standardFallback: "@slow" },
+  { role: "rust-developer", agents: ["developer-rust"], standardFallback: "@task" },
+];
+
+export default function (pi: ExtensionAPI) {
+  registerTeamWorkflow(pi, {
+    label: "omp-workflows-rust",
+    roles: defaultFullstackRoles, // engine-level role mapping (unchanged)
+  });
+  // ...use MY_MODEL_ROLES + resolveRoleChain in your `/rust-model-roles validate` command.
+}
+```
+
+Or use the built-in fullstack defaults (matches the shipped `/omp-model-roles` command):
 
 ```typescript
 import {
@@ -51,6 +95,8 @@ The engine surface is also available directly:
 - `writeState(cwd, state)`, `readState(cwd)`, `setStageStatus(...)`, `setPause(...)`, `checkMonotonic(...)`, `resolveState(cwd)`
 - `writeArtifact(dir, id, data)`, `readArtifact(dir, id)`
 - `appendDoDItem(dir, ...)`, `closeDoDItem(dir, ...)`, `readDoD(dir)`, `isDoDComplete(dod)`, `isRootCauseDocumented(dir)`
+- `defaultFullstackModelRoles`, `resolveRoleChain`, `isResearchRequest`, `isResearchResponse`, `validateResearchRequest`, `validateResearchResponse` (model-role taxonomy + research request/response validators, types `ModelRoleEntry`, `InventoryModel`, `RoleLookup`, `RoleResolution`, `ResearchRequest`, `Response`, `BenchmarkSource`, `ResearchRecommendation`)
+
 
 ## Workflows
 

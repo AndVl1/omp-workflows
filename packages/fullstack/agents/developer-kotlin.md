@@ -1,6 +1,6 @@
 ---
 name: developer-kotlin
-model: "@task"
+model: ["@developer-kotlin", "@task"]
 thinkingLevel: auto
 description: Backend developer - implements Kotlin/Spring services and Telegram bots following Architect's design exactly. USE PROACTIVELY for implementation.
 tools: read, write, edit, glob, grep, bash, web_search

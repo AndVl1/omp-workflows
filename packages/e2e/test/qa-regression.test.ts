@@ -305,6 +305,7 @@ test('qa-regression: buildOmpArgs emits --config host BEFORE --config overlay an
     configPath: '/scratch/.omp/ux-e2e-overlay.json',
     sessionDir: '/scratch/.omp/agent',
     hostConfigPath: '/Users/test/.omp/agent/config.yml',
+    userConfigDefaultPath: '/scratch/.omp/ux-e2e-overlay.user.json',
   });
 
   // No --profile by default.
@@ -332,6 +333,9 @@ test('qa-regression: buildOmpArgs emits --config host BEFORE --config overlay an
     'overlay config is SECOND --config (later wins on conflict)',
   );
   assert.ok(configPositions[0]! < configPositions[1]!, 'host --config strictly before overlay --config');
+  // Third --config (user overlay) is NOT emitted when userConfigPath is unset.
+  assert.ok(!args.includes('/scratch/.omp/ux-e2e-overlay.user.json'),
+    'user default path is not emitted when userConfigPath is unset');
 });
 
 test('qa-regression: buildOmpArgs emits --profile when opts.ompProfile is set', () => {
@@ -342,6 +346,7 @@ test('qa-regression: buildOmpArgs emits --profile when opts.ompProfile is set', 
     configPath: '/scratch/.omp/ux-e2e-overlay.json',
     sessionDir: '/scratch/.omp/agent',
     hostConfigPath: '/Users/test/.omp/agent/config.yml',
+    userConfigDefaultPath: '/scratch/.omp/ux-e2e-overlay.user.json',
   });
 
   // --profile emitted.

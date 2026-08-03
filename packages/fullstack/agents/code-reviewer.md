@@ -1,6 +1,6 @@
 ---
 name: code-reviewer
-model: "@slow"
+model: ["@reviewer", "@slow"]
 thinkingLevel: high
 description: Expert code reviewer. USE PROACTIVELY after any code changes to ensure quality, security, and maintainability.
 tools: read, glob, grep, bash

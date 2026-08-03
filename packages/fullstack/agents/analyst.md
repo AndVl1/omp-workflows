@@ -1,7 +1,7 @@
 ---
 name: analyst
 description: Requirements analyst - clarifies requirements, researches patterns, identifies edge cases before design. USE PROACTIVELY for requirement gathering.
-model: "@task"
+model: ["@analyst", "@task"]
 thinkingLevel: auto
 tools: read, glob, grep, bash, web_search
 ---

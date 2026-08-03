@@ -1,6 +1,6 @@
 {
   "name": "@andvl1/omp-workflows-e2e",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Interactive UX E2E test framework for omp + omp-workflows: spawns a real omp PTY session in a scratch project, drives a workflow like a human UX tester, and emits a manual_qa-compatible report.",
   "type": "module",
   "license": "MIT",

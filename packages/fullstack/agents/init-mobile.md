@@ -1,6 +1,6 @@
 ---
 name: init-mobile
-model: "@task"
+model: ["@developer-mobile", "@task"]
 thinkingLevel: auto
 description: Mobile project initializer - creates new KMP Compose Multiplatform project with full structure, builds, and runs on all targets.
 tools: read, write, edit, glob, grep, bash, web_search

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { detachLogPath, main, parseBootstrapArgs, parseMaxTime, parseStartArgs, tailLogFile } from '../src/cli.js';
+import { detachLogPath, main, parseBootstrapArgs, parseInputArgs, parseMaxTime, parseStartArgs, runInput, runStop, tailLogFile } from '../src/cli.js';
 
 /** Run main() with console/stdout captured; returns { code, out, err }. */
 async function runMain(argv: string[]): Promise<{ code: number; out: string; err: string }> {
@@ -42,10 +42,10 @@ async function runMain(argv: string[]): Promise<{ code: number; out: string; err
   }
 }
 
-test('cli: --help prints the 6 subcommands and exits 0', async () => {
+test('cli: --help prints the 7 subcommands and exits 0', async () => {
   const { code, out } = await runMain(['--help']);
   assert.equal(code, 0);
-  for (const sub of ['bootstrap', 'start', 'stop', 'transcript', 'ask', 'report']) {
+  for (const sub of ['bootstrap', 'start', 'stop', 'transcript', 'ask', 'input', 'report']) {
     assert.ok(out.includes(sub), `usage mentions ${sub}`);
   }
 });
@@ -106,6 +106,58 @@ test('cli: start missing scratch-dir exits 1 via main', async () => {
   const { code, err } = await runMain(['start']);
   assert.equal(code, 1);
   assert.ok(err.includes('missing <scratch-dir>'));
+});
+
+test('cli: input parses arbitrary text and validates required positionals', () => {
+  assert.throws(() => parseInputArgs([]), /missing <scratch-dir>/u);
+  assert.throws(() => parseInputArgs(['/tmp/scratch']), /missing <text>/u);
+  assert.deepEqual(parseInputArgs(['/tmp/scratch', '/do-work implement it']), {
+    scratchDir: '/tmp/scratch',
+    text: '/do-work implement it',
+  });
+});
+
+test('cli: input sends text plus newline in one frame without ask state', async () => {
+  const scratchDir = mkdtempSync(join(tmpdir(), 'ux-e2e-input-'));
+  const stateDir = join(scratchDir, '.work-state', 'ux-e2e');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(stateDir, 'session.json'), JSON.stringify({ url: 'http://127.0.0.1:1234/?token=sekret' }));
+  const frames: string[] = [];
+  const driver = {
+    open: async () => undefined,
+    type: async (text: string) => frames.push(text),
+    submit: async (text: string) => frames.push(text + '\n'),
+    close: async () => undefined,
+  };
+
+  const code = await runInput(
+    { scratchDir, text: '/do-work implement it' },
+    () => driver,
+  );
+
+  assert.equal(code, 0);
+  assert.deepEqual(frames, ['/do-work implement it\n']);
+  rmSync(scratchDir, { recursive: true });
+});
+
+test('cli: stop refuses a live PID whose command line is not the scratch session', async () => {
+  const scratchDir = mkdtempSync(join(tmpdir(), 'ux-e2e-stop-stale-'));
+  const stateDir = join(scratchDir, '.work-state', 'ux-e2e');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(stateDir, 'session.json'), JSON.stringify({ pid: process.pid }));
+
+  const originalError = console.error;
+  const errors: string[] = [];
+  console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+  try {
+    const code = await runStop({ scratchDir });
+    assert.equal(code, 1);
+    assert.match(errors.join('\n'), /does not match scratch session/u);
+    assert.equal(process.kill(process.pid, 0), true, 'the test process remains alive');
+  } finally {
+    console.error = originalError;
+    rmSync(scratchDir, { recursive: true });
+  }
 });
 
 test('cli: start --scenario normalizes to absolute path against process.cwd() (FD-R1)', () => {
