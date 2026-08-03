@@ -2,6 +2,23 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.10.0] — 2026-08-03
+### Added
+- **Per-agent-class OMP model roles with standard-role fallback**. 17 agents in `packages/fullstack/agents/*.md` now declare `model: ["@<class-role>", "@<standard-role>"]` across 14 custom class roles (architect, reviewer, security, coordinator, researcher, analyst, developer-go, developer-kotlin, frontend-developer, developer-mobile, devops, diagnostics, qa, manual-qa). First resolvable pattern wins (`resolveConfiguredRolePattern` / `resolveModelRoleValue`); an unknown `@role` falls back to the next pattern, so standard OMP roles (`@task`, `@slow`, `@smol`) keep working when a class role is not configured. Configure via `modelRoles` in project `.omp/config.yml` or global `~/.omp/agent/config.yml`.
+- **`/omp-model-roles` command** (custom-TS): `validate` renders the class-role/frontmatter table against the live model inventory, flags built-in collisions and frontmatter drift; `recommendations` returns a strict research contract (ResearchRequest JSON, immutable inventory snapshot, `outputSchema` with schemaMode=strict) that delegates fresh benchmark research to the `tech-researcher` subagent. The return value is wrapped in a marker envelope; an extension `before_agent_start` hook injects an agent-attributed developer instruction so the main LLM treats the four hard steps as developer-priority (fixes the live-runs where the main agent ignored the user-attributed prompt).
+- **`web_search` MUST for fresh-facts research in `tech-researcher`**. The agent prompt now classifies requests into three modes: codebase (no web), fresh-facts (benchmarks/versions/dates — `web_search` mandatory with degraded-notice fallback to Context7/DeepWiki/official docs), and documentation (MCP-first, web optional). `web_search` works out of the box via free providers (duckduckgo, ecosia, google-scrape) and gains reliable quality with a paid provider (`omp /login google-gemini-cli` or `GEMINI_API_KEY`, Exa, Brave, Tavily, Perplexity).
+- **`/omp-model-roles validate` diagnostics**: header reports `web_search=enabled|disabled|unknown`; WARN/INFO lines explain what a custom-command context can observe.
+- **Model-role taxonomy moved into `@andvl1/omp-workflows-core`** as a build-time export: `defaultFullstackModelRoles` (the 14 class roles), types (`ModelRoleEntry`, `InventoryModel`, `ResearchRequest`, `ResearchResponse`, …) and pure helpers (`resolveRoleChain`, `isResearchRequest`, `isResearchResponse`). Custom bundles (Rust/Go/mobile) can now ship their own `ModelRoleEntry[]` taxonomy on top of core and reuse the same helpers — see `docs/adding-agents.md` and the `custom-agent-bundle` skill.
+- **`custom-agent-bundle` skill** shipped in both `@andvl1/omp-workflows-core` (installable via `omp plugin install @andvl1/omp-workflows-core`, carries an `omp: {}` manifest) and `@andvl1/omp-workflows-fullstack` — the agent-side guide for building a custom dev bundle.
+- **`docs/adding-agents.md`**: complete how-to for adding your own agents on top of core (agent discovery precedence, frontmatter reference, model-role taxonomy, `registerTeamWorkflow` roles/scopeMap/flags, custom slash commands vs extension hooks, minimal bundle skeleton).
+### Changed
+- `@andvl1/omp-workflows-core`: `defaultFullstackModelRoles` exported; `ROLE_COUNT` in fullstack's `before_agent_start` handler now derives from the core taxonomy instead of a hardcoded 14 (resolves the TS6059 cross-directory import).
+- `@andvl1/omp-workflows-fullstack`: `buildResearchRequestDeveloperInstruction(roleCount, availableModelCount)` parameterized for bundle reuse.
+### Fixed
+- e2e report test filename assertion made date-agnostic (pre-existing flake that failed when the UTC date rolled over).
+### Notes
+- Versions: core 0.8.1 → 0.10.0, fullstack 0.9.0 → 0.10.0 (both minor bumps for the new public API surface). Test suite: 202/202 (core 61, fullstack 69, e2e 72).
+
 ## [0.8.1] — 2026-08-01
 ### Fixed
 - **`/do-work` prompt now points at the workflow profile JSON** (`packages/fullstack/commands/do-work/index.ts`, `buildPrompt`). The Classification block previously named the resolved workflow (e.g. `lightweight`, `full-feature`) but not where its profile lived, so the main agent spent a search pass on every dispatch to locate the stage list, gates, checkpoints, and produces/consumes. Added a single line: `Workflow profile: packages/core/workflows/<workflow>.json` with a hint to read it for the stage list. No behaviour change for `/do-work` consumers other than removing the search round-trip. Test count unchanged: 49 in core, 11 in fullstack. All pass with `npm test`.
