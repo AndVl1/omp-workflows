@@ -54,6 +54,18 @@ test("fullstack: /do-work command loads and parses an envelope", async () => {
 	assert.ok(result.includes("OAuth with Google"), "result echoes the task");
 	assert.ok(result.includes("Workflow: `lightweight`"), "FEATURE/QUICK classifies as lightweight");
 	assert.ok(result.includes("Role mapping"), "result includes the role mapping table");
+	assert.ok(
+		result.includes("Profile file (absolute, existence-checked"),
+		"prompt names an absolute profile path instead of telling the agent to search",
+	);
+	assert.ok(
+		result.includes("Quick Discovery") && result.includes("Stages (skeleton"),
+		"stage skeleton is inlined for orientation",
+	);
+	assert.ok(
+		!result.includes("(read this file for the stage list"),
+		"prompt no longer references the old relative-path instruction",
+	);
 });
 
 test("fullstack: /team alias delegates to /do-work", async () => {
