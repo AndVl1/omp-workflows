@@ -1,12 +1,23 @@
 # @andvl1/omp-workflows-core
 
-Profile-driven multi-stage workflow engine for omp. No agents, no skills — pure runtime.
+Profile-driven multi-stage workflow engine for omp. No agents — bundles ship those.
+Ships the `custom-agent-bundle` skill (how to add your own agents).
 
 ## Install
 
 ```bash
 npm install @andvl1/omp-workflows-core
 ```
+
+To expose the bundled skill to the agent (so it can help build a custom
+bundle), install core as an omp plugin too:
+
+```bash
+omp plugin install @andvl1/omp-workflows-core
+```
+
+(The package carries an `omp: {}` manifest — skills are discovered without
+an extension entry; see [`docs/adding-agents.md`](../docs/adding-agents.md).)
 
 ## Public API
 
