@@ -245,3 +245,11 @@ omp-workflows-rust/
 
 Типы и хелперы (`ModelRoleEntry`, `resolveRoleChain`, валидаторы
 ResearchRequest/Response) — из `@andvl1/omp-workflows-core`, не дублируй.
+
+---
+
+## 8. См. также
+
+- **Собственный канал связи (эскалации CTO)** — `docs/adding-escalation-adapter.md`:
+  интерфейс `EscalationAdapter` в core, жизненный цикл outbox → send → answers,
+  референсы HTTP/Telegram в fullstack.
