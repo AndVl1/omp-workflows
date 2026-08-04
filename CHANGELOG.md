@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.11.1] — 2026-08-04
+### Fixed
+- **Lead discipline (live E2E finding)**: `team-lead` agents could write source code — in the 2026-08-04 multi-feature run one of three leads (CliLead) implemented its slice itself (10 `write` calls, zero worker spawns) because the prompt only banned `edit` while `write` was in the toolset. Now: zero-tolerance rule — leads never `write`/`edit` outside `.work-state/` (only state: `decisions.md`, `dod.json`), delegation is mandatory for ALL slices (no trivial-slice exception), a zero-worker lead is a failed lead. The `/cto` prompt contract and the `cto` agent verify each lead's transcript after it returns (any `write`/`edit` on a non-`.work-state/` path = delegation violation, logged in `decisions.md`). Evidence: `vibe-report/cto-suborchestration-e2e-2026-08-04.md`.
+
 ## [0.11.0] — 2026-08-04
 ### Added
 - **CTO sub-orchestration (CTO/Head mode)** — 3-level orchestration (CTO → team leads → workers): the CTO agent decomposes a task into a `TeamPlan` (up to 8 teams, decomposition depth 2), spawns one lead per team, coordinates teams over `hub`, and integrates results. Design + interview decisions: `vibe-report/sub-orchestration-2026-08-04.md`.
