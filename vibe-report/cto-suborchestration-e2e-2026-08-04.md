@@ -285,3 +285,15 @@ Total run budget (от `/cto` Enter до summary завершения): **~38 м
 ```
 
 Плагин `@andvl1/omp-workflows-fullstack@0.11.0` соответствует release tag `v0.11.0` в `omp-workflows-monorepo/packages/fullstack/package.json`. Версия omp `17.2.6` подтверждена `~/.bun/bin/omp --version`.
+
+## Скриншоты (live re-verification после прогона)
+
+Дашборд пере-поднят из scratch (`./gradlew run` + `python3 -m http.server 8088`), скрин снят headless-браузером:
+
+![Status Dashboard — Backend: Hello from backend](https://gist.githubusercontent.com/AndVl1/56c9dee5ea86e118a9cbce237ab39690/raw/dashboard.png)
+
+Состояние на скрине: `status ok`, текст «Backend: Hello from backend» — реальный cross-origin fetch с `:8090/api/hello` (контракт `{"message":"Hello from backend"}`).
+
+## Gist
+
+- Отчёт: https://gist.github.com/AndVl1/9d6724539e27d6b692f310cee6d863c1
