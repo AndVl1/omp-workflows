@@ -1,6 +1,6 @@
 {
   "name": "@andvl1/omp-workflows-core",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "description": "Workflow engine + gates + custom-TS command helpers + runtime observability for omp. No agents — bundles ship those. Ships the custom-agent-bundle skill (installable via `omp plugin install @andvl1/omp-workflows-core`).",
   "type": "module",
   "license": "MIT",
