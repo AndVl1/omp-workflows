@@ -45,6 +45,11 @@ lead ── task ──► workers (existing single-purpose agents)
    you or the lead. Decide the git strategy per team — coupled tasks share
    one branch with parallel teams, independent tasks get separate worktrees.
    Persist the plan via the engine (`runCto`): state at `.work-state/cto/<id>/`.
+   **Multi-team runs: architecture first** — after the plan, spawn the
+   `architect` (single `task`) to produce the cross-team contract BEFORE
+   spawning leads: api_contract (endpoints/DTOs), file ownership per team,
+   shared interfaces, ports/CORS. Leads consume the contract in their
+   slices. Single-team runs: skip the stage, the contract lives in the plan.
 3. **Spawn leads, not workers.** One lead per team via `task`. Leads own
    their team's execution; you own the plan, the integration, and the
    escalations. **Verify delegation after every lead returns**: scan its

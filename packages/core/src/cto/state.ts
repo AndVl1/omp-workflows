@@ -119,6 +119,13 @@ export function setCtoPause(
   return state;
 }
 
+/** Stamp a mid-run amendment (br-k19); persists when a root is given. */
+export function markAmended(state: CtoState, root: string | null = null): CtoState {
+  state.amended_at = new Date().toISOString();
+  if (root) writeCtoState(state, root);
+  return state;
+}
+
 /**
  * Expire pending escalations whose timeout elapsed. `timeout_ms: 0`/absent
  * (blocker default) never expires — the team stays parked and the rest of

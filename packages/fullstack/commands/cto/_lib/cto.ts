@@ -12,7 +12,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { resolveWorkflowProfilePath } from "../../do-work/_lib/profile.js";
 
@@ -128,21 +128,25 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string): string
     "   code). Decide the git strategy per team:",
     "   coupled tasks -> one branch with parallel teams; independent tasks -> separate worktrees.",
     "   Persist the plan through the engine (`runCto`): state lives in `.work-state/cto/<id>/`.",
-    "2. **Spawn leads** via `task` — one lead per team. Leads own their team: they decompose the slice into",
+    "2. **Architecture first (multi-team runs)**: after the plan, run the architecture stage — spawn the",
+    "   `architect` (single `task`) to produce the cross-team contract BEFORE spawning leads: api_contract",
+    "   (endpoints/DTOs), file ownership per team, shared interfaces, ports/CORS. Leads consume the contract",
+    "   in their slices. Single-team runs: skip the stage, the contract lives in the plan.",
+    "3. **Spawn leads** via `task` — one lead per team. Leads own their team: they decompose the slice into",
     "   worker tasks and spawn workers. Only you and the leads have `task`+`hub`; workers never re-delegate.",
     "   **Leads never write source** — after each lead returns, verify its transcript: any `write`/`edit` on a",
     "   path outside `.work-state/` is a delegation violation; log it in `decisions.md` and re-state the rule on",
     "   the next spawn. A zero-worker lead is a failed lead.",
-    "3. **Escalation ladder**: worker -> lead -> you (CTO) -> user. Decide what you can with a documented",
+    "4. **Escalation ladder**: worker -> lead -> you (CTO) -> user. Decide what you can with a documented",
     "   `why` (decisions.md); escalate only what you cannot. `blocker` waits without timeout — the team parks",
     "   (`background_wait`), all other work continues; `question`/`decision` get `timeoutMs` + `default`.",
-    "4. **Answers** arrive as files `.work-state/cto/<id>/answers/<esc-id>.json` (shape { id, answer, at, by })",
+    "5. **Answers** arrive as files `.work-state/cto/<id>/answers/<esc-id>.json` (shape { id, answer, at, by })",
     "   — pick them up at the next team checkpoint. Apply only if the team is still waiting; late answers are",
     "   advisory.",
-    "5. **Summaries, not artifacts**: feed leads' compact summaries up, never raw artifacts.",
-    "6. **Integration**: merge worktree branches, run the integration review stage, aggregate per-team DoDs.",
+    "6. **Summaries, not artifacts**: feed leads' compact summaries up, never raw artifacts.",
+    "7. **Integration**: merge worktree branches, run the integration review stage, aggregate per-team DoDs.",
     "   A failed team is isolated: re-spawn with the gate's reason, drop its scope, or escalate.",
-    "7. **Never code yourself.** Never patch a team's artifact by hand — re-spawn with a sharper task.",
+    "8. **Never code yourself.** Never patch a team's artifact by hand — re-spawn with a sharper task.",
     "",
     "### Failure modes to avoid",
     "- Do NOT let a worker re-delegate (rogue router) — only CTO/lead spawn.",
@@ -153,5 +157,90 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string): string
     "- Do NOT scan the filesystem for profiles/teams — read exactly `cto.json`, `.omp/teams.json`, `.omp/team.config.json`.",
     "",
     "Begin: decompose the task into a TeamPlan, persist it, and spawn the first leads.",
+  ].join("\n");
+}
+
+export interface ActiveCtoRun {
+  runId: string;
+  state: {
+    plan: { created_at: string };
+    teams: Array<{ id: string; status: string }>;
+    pause: { kind: string; reason?: string };
+    updated_at: string;
+  };
+}
+
+/**
+ * Find the single active CTO run — any state.json under
+ * `.work-state/cto/<runId>/` whose pause.kind is not done/failed; latest by
+ * updated_at, else null. Self-contained copy of the core contract (br-k19
+ * amend protocol).
+ */
+export function findActiveCtoRun(cwd: string): ActiveCtoRun | null {
+  const runsDir = join(cwd, ".work-state", "cto");
+  if (!existsSync(runsDir)) return null;
+  let best: ActiveCtoRun | null = null;
+  let bestAt = "";
+  for (const runId of readdirSync(runsDir)) {
+    const statePath = join(runsDir, runId, "state.json");
+    if (!existsSync(statePath)) continue;
+    try {
+      const state = JSON.parse(readFileSync(statePath, "utf8")) as ActiveCtoRun["state"];
+      if (state?.pause?.kind === "done" || state?.pause?.kind === "failed") continue;
+      if (!best || state.updated_at > bestAt) {
+        best = { runId, state };
+        bestAt = state.updated_at;
+      }
+    } catch {
+      // corrupt state — skip
+    }
+  }
+  return best;
+}
+
+/** Amend contract: second /cto while a run is active folds the task into it. */
+export function buildAmendPrompt(
+  envelope: ParsedCtoEnvelope,
+  active: ActiveCtoRun,
+): string {
+  const teamsLine = active.state.teams.map((t) => `${t.id}:${t.status}`).join(", ");
+  const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
+  const autonomousMeta = envelope.autonomous
+    ? "Autonomous mode: ON — apply documented defaults at every checkpoint."
+    : "Autonomous mode: OFF — pause at checkpoints for user review.";
+
+  return [
+    "/cto AMEND — a new task arrived while a CTO run is ACTIVE.",
+    "",
+    "### Active run",
+    `Run: \`${active.runId}\` (started ${active.state.plan.created_at})`,
+    `Teams: ${teamsLine}`,
+    `Pause: ${active.state.pause.kind} — ${active.state.pause.reason || "no reason"}`,
+    `State: \`.work-state/cto/${active.runId}/state.json\` — read it BEFORE touching anything.`,
+    "",
+    "### New task (fold into the SAME run)",
+    issueMeta + autonomousMeta,
+    envelope.task,
+    "",
+    "### You are still the CTO (single orchestrator, this session)",
+    "Do NOT start a second run or orchestrator. Do NOT spawn a sub-CTO.",
+    "",
+    "### Amend rules",
+    "1. **Re-plan**: add teams from the registry (`.omp/teams.json`) for the new task — total teams across the",
+    "   run <= 8, depth <= 2. New leads spawn in PARALLEL with active teams; existing teams keep working.",
+    "   Choose sub-profiles with the SAME resolution as /do-work (resolveWorkflow).",
+    "2. **Architecture**: if the new task adds cross-team surface, run the architect for the ADDITIONAL",
+    "   contract (or extend the existing architecture artifact); new leads consume it.",
+    "3. **Persist**: append the new teams to `state.json` and stamp `amended_at`; document the amend in",
+    "   `decisions.md` (why).",
+    "4. **Integration covers ALL teams** (original + added): integration review verifies the merged result",
+    "   against the (extended) contract; DoD aggregation across every team.",
+    "5. **Edge cases**: run at max teams -> write the task to `.work-state/queue.json` for the next run;",
+    "   run already in the integration phase -> same (queue it); scope overlap with an active team -> extend",
+    "   that team's slice (re-spawn its lead with an additional worker task) instead of adding a team.",
+    "6. **Escalations** of the new teams use the same ladder (worker -> lead -> you -> user); you never spawn",
+    "   a second orchestrator.",
+    "",
+    "Begin: read the active state, amend the plan, spawn the new leads.",
   ].join("\n");
 }

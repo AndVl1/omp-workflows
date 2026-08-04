@@ -158,6 +158,8 @@ export interface CtoState {
     status: "pending" | "in_progress" | "done" | "failed";
     note?: string;
   };
+  /** Set when a mid-run task was folded into this run (br-k19 amend protocol). */
+  amended_at?: string;
   pause: {
     /**
      * Reuses the existing PauseKind vocabulary: `background_wait` for a

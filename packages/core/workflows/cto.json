@@ -24,10 +24,21 @@
       "produces": "team_plan"
     },
     {
+      "id": "architecture",
+      "title": "Cross-Team Architecture",
+      "type": "single",
+      "role": "architect",
+      "consumes": ["team_plan"],
+      "gate": "contract_complete",
+      "checkpoint": "confirm_contract",
+      "autonomous": "proceed with the architect's contract (documented defaults)",
+      "produces": "architecture"
+    },
+    {
       "id": "teams",
       "title": "Parallel Teams",
       "type": "team",
-      "consumes": ["team_plan"],
+      "consumes": ["architecture"],
       "produces": "team_artifacts",
       "integration": {
         "stage": "integration_review",

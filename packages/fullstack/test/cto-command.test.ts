@@ -6,11 +6,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import ctoFactory from "../commands/cto/index.js";
-import { buildCtoPrompt, parseEnvelope } from "../commands/cto/_lib/cto.js";
+import { buildCtoPrompt, buildAmendPrompt, findActiveCtoRun, parseEnvelope } from "../commands/cto/_lib/cto.js";
 
 const projectRoot = process.cwd();
 
@@ -80,6 +80,7 @@ test("fullstack: /cto command loads and parses an envelope", async () => {
 		assert.ok(result.includes("Leads never write source"), "lead self-coding forbidden in the contract");
 		assert.ok(result.includes("You ARE the orchestrator"), "single-CTO rule in the contract");
 		assert.ok(result.includes("debug-cycle"), "bug-fix slices run debug-cycle through the team");
+		assert.ok(result.includes("Architecture first"), "architecture stage in the contract");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -122,6 +123,75 @@ test("fullstack: parseEnvelope falls back to branch=null outside a git work tree
 		assert.equal(envelope.branch, null);
 		assert.equal(envelope.task, "Add OAuth");
 		assert.equal(envelope.autonomous, false);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("fullstack: /cto routes to AMEND when an active run exists", async () => {
+	const root = mkdtempSync(join(tmpdir(), "cto-cmd-amend-"));
+	try {
+		mkdirSync(join(root, ".omp"), { recursive: true });
+		writeFileSync(join(root, ".omp", "teams.json"), JSON.stringify(TEAMS_JSON));
+		// Simulate an active CTO run.
+		const runId = "feature-a-2026-08-04";
+		mkdirSync(join(root, ".work-state", "cto", runId), { recursive: true });
+		writeFileSync(
+			join(root, ".work-state", "cto", runId, "state.json"),
+			JSON.stringify({
+				schema: 1,
+				id: runId,
+				task: "Feature A",
+				branch: "main",
+				autonomous: false,
+				plan: { id: runId, task: "Feature A", teams: [], created_at: "2026-08-04T10:00:00.000Z" },
+				teams: [
+					{ id: "kotlin-backend", status: "in_progress", escalations: {} },
+					{ id: "frontend", status: "parked", escalations: {} },
+				],
+				integration: { status: "pending" },
+				pause: { kind: "none", reason: "" },
+				updated_at: "2026-08-04T10:05:00.000Z",
+			}),
+		);
+
+		const active = findActiveCtoRun(root);
+		assert.equal(active?.runId, runId);
+		assert.ok(!active?.state.pause.kind.includes("done"));
+
+		const cmd = ctoFactory(fakeApi as never);
+		const result = await cmd.execute(["Add feature B"], { ...fakeCtx, cwd: root } as never);
+		assert.ok(result.includes("/cto AMEND"), "second /cto returns the amend contract");
+		assert.ok(result.includes("Add feature B"), "new task folded in");
+		assert.ok(result.includes("Do NOT start a second run"), "single orchestrator rule");
+
+		// A finished run no longer amends.
+		const doneRun = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+			pause: { kind: string };
+		};
+		doneRun.pause.kind = "done";
+		writeFileSync(join(root, ".work-state", "cto", runId, "state.json"), JSON.stringify(doneRun));
+		assert.equal(findActiveCtoRun(root), null);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("fullstack: buildAmendPrompt renders the amend contract", () => {
+	const root = mkdtempSync(join(tmpdir(), "cto-cmd-amendp-"));
+	try {
+		const prompt = buildAmendPrompt(parseEnvelope("Task B", root), {
+			runId: "run-1",
+			state: {
+				plan: { created_at: "2026-08-04T10:00:00.000Z" },
+				teams: [{ id: "backend", status: "in_progress" }],
+				pause: { kind: "none", reason: "" },
+				updated_at: "2026-08-04T10:05:00.000Z",
+			},
+		});
+		assert.ok(prompt.includes("/cto AMEND"));
+		assert.ok(prompt.includes("Run: `run-1`"));
+		assert.ok(prompt.includes("Integration covers ALL teams"));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

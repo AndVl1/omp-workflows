@@ -61,6 +61,8 @@ test("cto-cmd: buildCtoPrompt renders teams from .omp/teams.json", () => {
     assert.ok(prompt.includes("never spawn a CTO"), "no sub-CTO delegation allowed");
     assert.ok(prompt.includes("full-feature"), "full-feature available as team sub-profile");
     assert.ok(prompt.includes("debug-cycle"), "bug-fix slices run debug-cycle through the team");
+    assert.ok(prompt.includes("Architecture first"), "architecture stage in the contract");
+    assert.ok(prompt.includes("api_contract"), "architect produces the cross-team contract");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

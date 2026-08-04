@@ -9,7 +9,7 @@
 
 import type { CustomCommand, CustomCommandAPI } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/types";
 import type { HookCommandContext } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/types";
-import { buildCtoPrompt, parseEnvelope } from "./_lib/cto.js";
+import { buildAmendPrompt, buildCtoPrompt, findActiveCtoRun, parseEnvelope } from "./_lib/cto.js";
 
 const factory = (api: CustomCommandAPI): CustomCommand => ({
   name: "cto",
@@ -20,7 +20,8 @@ const factory = (api: CustomCommandAPI): CustomCommand => ({
       return [
         "Usage: /cto <task description> [issue=#N] [AUTONOMOUS]",
         "",
-        "CTO sub-orchestration: decompose -> teams -> integration.",
+        "CTO sub-orchestration: decompose -> architecture -> teams -> integration.",
+        "A second /cto while a run is active folds the new task into that run (amend).",
         "Example: /cto Add OAuth with Google and GitHub",
       ].join("\n");
     }
@@ -28,6 +29,11 @@ const factory = (api: CustomCommandAPI): CustomCommand => ({
     if (!cwd) return "ERROR: no cwd available.";
     const envelope = parseEnvelope(raw, cwd);
     if (!envelope.task) return "ERROR: empty task after stripping prefix.";
+    const active = findActiveCtoRun(cwd);
+    if (active) {
+      ctx.ui?.notify?.(`cto: amending run ${active.runId} with: ${envelope.task.slice(0, 50)}`, "info");
+      return buildAmendPrompt(envelope, active);
+    }
     ctx.ui?.notify?.(`cto: ${envelope.task.slice(0, 60)} (decomposition pending)`, "info");
     return buildCtoPrompt(envelope, cwd);
   },

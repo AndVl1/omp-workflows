@@ -275,7 +275,15 @@ export {
 } from "./cto/state.js";
 export { teamDoDComplete, integrationDoD, ctoBackstop } from "./cto/gates.js";
 export { runCto, ctoRunId, type RunCtoOptions, type RunCtoResult } from "./cto/run.js";
-export { ctoCommand, parseEnvelope as parseCtoEnvelope, buildCtoPrompt, type ParsedCtoEnvelope } from "./commands/cto.js";
+export {
+  ctoCommand,
+  parseEnvelope as parseCtoEnvelope,
+  buildCtoPrompt,
+  buildAmendPrompt,
+  findActiveCtoRun,
+  type ParsedCtoEnvelope,
+} from "./commands/cto.js";
+export { markAmended } from "./cto/state.js";
 export {
 	EventRecorder,
 	rollupFromEvents,
