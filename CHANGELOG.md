@@ -2,6 +2,17 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.12.0] — 2026-08-04
+### Added
+- **Amend protocol (mid-run task injection, br-k19)** — `/cto` is now context-aware: when a CTO run is active (pause not done/failed), a second `/cto <task>` returns the **AMEND contract** — the new task is folded into the SAME run by the SAME orchestrator (single CTO, no sub-CTO, no second orchestrator), new leads spawn in parallel with active teams, integration and DoD aggregation cover ALL teams (original + added). Edge cases: run at max teams → queue (`.work-state/queue.json`), run in the integration phase → queue, scope overlap → extend the existing team's slice (re-spawn its lead) instead of adding a team. `CtoState` gains `amended_at` (`markAmended`); `findActiveCtoRun` + `buildAmendPrompt` exported from core.
+- **Cross-team architecture stage (br-vk8)** — `cto.json` gains an `architecture` stage (single, `architect` role) between decomposition and teams: for multi-team runs the architect produces the cross-team contract (api_contract, file ownership, shared interfaces, ports/CORS) BEFORE leads spawn; teams consume it. Single-team runs skip the stage (contract lives in the plan). The `/cto` prompt contract and `cto` agent state the rule.
+- **Full sub-profile resolution for teams** — team sub-profiles use the same resolution as `/do-work` (`resolveWorkflow`): FEATURE/REFACTOR QUICK → lightweight, MEDIUM → standard, COMPLEX/CRITICAL → **full-feature**; BUG_FIX → **debug-cycle** (bug-fix only for interactive QUICK); OPS/INVESTIGATION mapped. Bug-fix slices run through the team: the lead walks debug-cycle (diagnose → root cause → fix → verify; root_cause gate before code).
+### Fixed
+- **Amend detection for agent-written runs (br-5ql)** — `findActiveCtoRun` only scanned `state.json`, but the CTO agent writes markdown state (team-plan.md, decisions.md, cto_discovery.md) and never calls the TS engine. Added a markdown fallback: a run is active when it has any of those state files and no finish marker (summary.md/json, integration_review.md/json); broadened to `cto_discovery.md` so the amend window opens at the first checkpoint. `state.json` (schema:1) still wins when present. Live-verified: a second `/cto` while a run was parked at `confirm_understanding` returned `cto: amending run` + `/cto AMEND`.
+- **`cto/*/state.json` in a doc comment closed the block comment early** (premature `*/`), breaking parsing of `commands/cto.ts` — reworded.
+### Verified
+- 253 unit tests green (core 95 incl. amend markdown-fallback + routing, fullstack 72, e2e 86), typecheck + build clean. Live e2e (0.11.x code + repo profiles): architecture stage ran before leads (ArchitectPing → contract), leads delegated to workers, single-team skip of architecture respected, agent improvised amendment (Plan B parallel). Evidence: `vibe-report/` + `/tmp/cto-live`.
+
 ## [0.11.2] — 2026-08-04
 ### Fixed
 - **Single orchestrator rule (from mid-run live test)**: the `/cto` prompt contract and the `cto` agent now state explicitly that the recipient IS the CTO and must execute the contract in-session; delegating the orchestrator role to a sub-agent (sub-CTO) is forbidden. Rationale (live evidence, br-k19): a delegated CTO eats a nesting level and the lead at depth 3 loses `task`/`hub` (mid-run run: lead was bash-only, could not delegate, D9 collapse). Depth contract fixed: main(CTO) → lead → worker, max 3 levels.
