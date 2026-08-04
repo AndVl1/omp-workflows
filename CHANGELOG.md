@@ -2,6 +2,13 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.11.2] — 2026-08-04
+### Fixed
+- **Single orchestrator rule (from mid-run live test)**: the `/cto` prompt contract and the `cto` agent now state explicitly that the recipient IS the CTO and must execute the contract in-session; delegating the orchestrator role to a sub-agent (sub-CTO) is forbidden. Rationale (live evidence, br-k19): a delegated CTO eats a nesting level and the lead at depth 3 loses `task`/`hub` (mid-run run: lead was bash-only, could not delegate, D9 collapse). Depth contract fixed: main(CTO) → lead → worker, max 3 levels.
+### Added
+- **`custom-escalation-adapter` skill** (shipped in both `@andvl1/omp-workflows-core` and `@andvl1/omp-workflows-fullstack`): per-project guide for implementing your own CTO escalation channel — `EscalationAdapter` interface (core), outbox → send → answers lifecycle, `.omp/escalation.json` registration, references (HTTP/Telegram), tests.
+- **`docs/adding-escalation-adapter.md`**: full consumer guide for custom escalation channels (interface contract, lifecycle, per-project wiring, rules: R4 sanitization, file-only answers, blocker → park). Cross-linked from `docs/adding-agents.md`.
+
 ## [0.11.1] — 2026-08-04
 ### Fixed
 - **Lead discipline (live E2E finding)**: `team-lead` agents could write source code — in the 2026-08-04 multi-feature run one of three leads (CliLead) implemented its slice itself (10 `write` calls, zero worker spawns) because the prompt only banned `edit` while `write` was in the toolset. Now: zero-tolerance rule — leads never `write`/`edit` outside `.work-state/` (only state: `decisions.md`, `dod.json`), delegation is mandatory for ALL slices (no trivial-slice exception), a zero-worker lead is a failed lead. The `/cto` prompt contract and the `cto` agent verify each lead's transcript after it returns (any `write`/`edit` on a non-`.work-state/` path = delegation violation, logged in `decisions.md`). Evidence: `vibe-report/cto-suborchestration-e2e-2026-08-04.md`.
