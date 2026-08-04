@@ -297,3 +297,13 @@ Total run budget (от `/cto` Enter до summary завершения): **~38 м
 ## Gist
 
 - Отчёт: https://gist.github.com/AndVl1/9d6724539e27d6b692f310cee6d863c1
+
+## Follow-up: делегирование лидов (проверено по транскриптам sub-сессий)
+
+| Лид | Спавн воркера | Инструменты лида | Воркер (sub-сессия) |
+|---|---|---|---|
+| BackendLead | ✅ 1×task → `BackendLead.KtorBackendImpl` | 20 bash, 4 hub — 0 write/edit | KtorBackendImpl: 13 write, 4 edit, 82 bash, 5 web_search |
+| FrontendLead | ✅ 1×task → `FrontendLead.FrontendDashboard` | 14 bash, 12 read, 1 hub — 0 write/edit | FrontendDashboard: 5 write, 9 bash |
+| CliLead | ❌ 0 task | 34 bash, 10 write — писал код сам | — (sub-сессии нет) |
+
+Finding: 2 из 3 лидов корректно делегировали воркерам (лид = диспетчер: task + hub-мониторинг + проверка/DoD, без write/edit). **CliLead нарушил дисциплину** — написал код сам (10 write), воркера не спавнил. Причина: `team-lead` промпт допускает «лид может выполнить тривиальный слайс сам» при малом объёме; для честной 3-уровневой модели нужно ужесточить (лид обязан делегировать, исключений нет) или engine-гейт (лид с write/edit на src = violation). Задача на фикс: br-f7b-followup (лид-дисциплина).
