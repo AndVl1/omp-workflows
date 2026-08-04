@@ -45,8 +45,8 @@
         "id": { "type": "string", "pattern": "^[a-z0-9_]+$", "description": "Unique stage id within the profile. Used as stage_cursor in team-state.json." },
         "title": { "type": "string" },
         "type": {
-          "enum": ["orchestrator", "single", "consilium", "bash", "none"],
-          "description": "orchestrator = main context performs it (no subagent). single = exactly one subagent (role resolved via team.config or scope). consilium = N subagents in parallel (see `roles`). bash = deterministic shell step, no model. none = placeholder/skip."
+          "enum": ["orchestrator", "single", "consilium", "bash", "none", "team"],
+          "description": "orchestrator = main context performs it (no subagent). single = exactly one subagent (role resolved via team.config or scope). consilium = N subagents in parallel (see `roles`). bash = deterministic shell step, no model. none = placeholder/skip. team = each listed team runs its own sub-workflow profile in parallel (CTO sub-orchestration; see `teams`/`profile`/`integration`)."
         },
         "roles": {
           "type": "array",
@@ -57,7 +57,26 @@
           "type": "string",
           "description": "For single: the role to launch. May be a template like \"${scope.dev_agent}\" resolved from the scope of touched files."
         },
-        "parallel": { "type": "boolean", "default": false, "description": "For consilium: launch all roles in one message (true) or sequentially (false)." },
+        "parallel": { "type": "boolean", "default": false, "description": "For consilium: launch all roles in one message (true) or sequentially (false). For team: launch all teams in parallel (true) or sequentially (false)." },
+        "teams": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "For team stages: team ids (from the consumer's teams.json / TeamDef list) to run as sub-workflows. Each team gets its own lead + roster and executes its own profile."
+        },
+        "profile": {
+          "type": "string",
+          "description": "For team stages: sub-workflow profile name (lightweight | standard | ...) each team executes. CTO may override per-team at plan time."
+        },
+        "integration": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "For team stages: integration contract after the teams return.",
+          "properties": {
+            "stage": { "type": "string", "description": "Stage id that reviews the merged team output (e.g. code_review)." },
+            "on_failure": { "type": "string", "description": "Action when a team failed: re-spawn | drop scope | escalate_user." }
+          },
+          "required": ["stage", "on_failure"]
+        },
         "consumes": {
           "type": "array",
           "items": { "type": "string" },

@@ -1,0 +1,34 @@
+[
+  {
+    "id": "kotlin-backend",
+    "name": "Kotlin Backend",
+    "scope": ["backend-kotlin"],
+    "profile": "lightweight",
+    "lead": "team-lead",
+    "roster": ["backend-kotlin"]
+  },
+  {
+    "id": "frontend",
+    "name": "Frontend",
+    "scope": ["frontend"],
+    "profile": "lightweight",
+    "lead": "team-lead",
+    "roster": ["frontend"]
+  },
+  {
+    "id": "mobile",
+    "name": "Mobile",
+    "scope": ["mobile"],
+    "profile": "standard",
+    "lead": "team-lead",
+    "roster": ["mobile"]
+  },
+  {
+    "id": "devops",
+    "name": "DevOps / Infra",
+    "scope": ["devops"],
+    "profile": "lightweight",
+    "lead": "team-lead",
+    "roster": ["devops"]
+  }
+]

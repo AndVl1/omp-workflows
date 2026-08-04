@@ -24,6 +24,7 @@ import {
 	registerTeamWorkflow,
 } from "@andvl1/omp-workflows-core";
 import { ensureCommandsForSession } from "./copy-commands.js";
+import { createEscalationAdapter, loadEscalationConfig, startDispatcher } from "./adapters/registry.js";
 import {
 	RESEARCH_REQUEST_MARKER_END,
 	RESEARCH_REQUEST_MARKER_START,
@@ -121,5 +122,13 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     const cwd = extractCwdFromContext(ctx);
     if (!cwd) return;
     ensureCommandsForSession(cwd);
+    // CTO escalation dispatcher: when the project configures an escalation
+    // channel (.omp/escalation.json), drain the outbox on every session
+    // start (pending escalations survive restarts — R7) and keep polling.
+    const config = loadEscalationConfig(cwd);
+    if (config) {
+      const adapter = createEscalationAdapter(config, cwd);
+      if (adapter) startDispatcher(cwd, adapter, 10_000);
+    }
   });
 }

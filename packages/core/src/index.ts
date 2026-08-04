@@ -232,6 +232,50 @@ export type {
 	DoD,
 	DoDItem,
 } from "./engine/types.js";
+// ── CTO sub-orchestration (pure engine) ────────────────────────────────────
+export { MAX_TEAMS, MAX_DECOMPOSITION_DEPTH } from "./cto/types.js";
+export type {
+	TeamDef,
+	TeamPlan,
+	TeamPlanEntry,
+	WorktreeStrategy,
+	Escalation,
+	EscalationOption,
+	EscalationLevel,
+	EscalationAdapter,
+	EscalationReceipt,
+	EscalationStatus,
+	EscalationRecord,
+	EscalationAnswer,
+	TeamRunStatus,
+	CtoState,
+} from "./cto/types.js";
+export {
+	validateEscalation,
+	sanitizeEscalation,
+	answersDir,
+	readAnswers,
+	ensureAnswersDir,
+} from "./cto/escalation.js";
+export { buildTeamPlan, validateDecompositionDepth, loadTeamDefs, type PlanTeamInput, type BuildResult } from "./cto/plan.js";
+export {
+	ctoStateDir,
+	ctoStatePath,
+	newCtoState,
+	readCtoState,
+	writeCtoState,
+	setTeamStatus,
+	setEscalation,
+	setEscalationStatus,
+	setIntegration,
+	setCtoPause,
+	expireEscalations,
+	pendingEscalations,
+	activeTeams,
+} from "./cto/state.js";
+export { teamDoDComplete, integrationDoD, ctoBackstop } from "./cto/gates.js";
+export { runCto, ctoRunId, type RunCtoOptions, type RunCtoResult } from "./cto/run.js";
+export { ctoCommand, parseEnvelope as parseCtoEnvelope, buildCtoPrompt, type ParsedCtoEnvelope } from "./commands/cto.js";
 export {
 	EventRecorder,
 	rollupFromEvents,

@@ -16,9 +16,10 @@ export type WorkflowName =
   | "bug-fix"
   | "emergency"
   | "research"
-  | "review";
+  | "review"
+  | "cto";
 
-export type StageType = "orchestrator" | "single" | "consilium" | "bash" | "none";
+export type StageType = "orchestrator" | "single" | "consilium" | "bash" | "none" | "team";
 
 export type StageStatus = "pending" | "in_progress" | "done" | "skipped";
 
@@ -51,6 +52,17 @@ export interface StageDef {
   roles?: string[];
   /** For single: the role. */
   role?: string;
+  /** For team: teams to run as sub-workflows (ids from teams.json). */
+  teams?: string[];
+  /** For team: sub-workflow profile name each team executes. */
+  profile?: string;
+  /** For team: integration contract after teams return. */
+  integration?: {
+    /** Stage id that reviews the merged team output. */
+    stage: string;
+    /** Action when a team failed: re-spawn | drop scope | escalate_user. */
+    on_failure: string;
+  };
   /** Consilium parallel flag (always true for consilium in practice). */
   parallel?: boolean;
   /** Artifact ids this stage reads from `.work-state/artifacts/<id>.json`. */

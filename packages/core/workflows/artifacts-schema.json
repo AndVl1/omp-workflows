@@ -223,6 +223,67 @@
           "description": "Confirms the per-type minimum items are present. Minimums: BUG_FIX → root cause named (not symptom) + repro-before reproduces + repro-after does not + affected scenario checked in manual-qa. FEATURE → each acceptance criterion mapped to a manual-qa step (both remote+docker modes if the feature touches agent/sessions). QA/report → published via publish-gist-report skill, screenshots actually visible (not broken). Any UI → DoD records what must be visible on the screenshot; on close, what is actually visible is written."
         }
       }
+    "cto_discovery": {
+      "type": "object",
+      "required": ["task", "branch"],
+      "properties": {
+        "task": { "type": "string", "description": "Confirmed CTO task description." },
+        "branch": { "type": "string", "description": "Working branch (branch_created gate)." },
+        "teams_hint": { "type": "array", "items": { "type": "string" }, "description": "Team ids the CTO already considers relevant (optional, from scope analysis)." }
+      }
+    },
+    "team_plan": {
+      "type": "object",
+      "required": ["teams"],
+      "properties": {
+        "teams": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["team", "slice", "profile"],
+            "properties": {
+              "team": { "type": "string", "description": "TeamDef id from .omp/teams.json." },
+              "scope": { "type": "array", "items": { "type": "string" } },
+              "slice": { "type": "string", "description": "Task slice this team owns." },
+              "profile": { "type": "string", "description": "Sub-workflow profile (lightweight | standard)." },
+              "worktree": { "enum": ["same_branch", "separate_worktree"] },
+              "depends_on": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "max_teams": { "type": "integer" },
+        "max_depth": { "type": "integer" }
+      }
+    },
+    "team_artifacts": {
+      "type": "object",
+      "required": ["teams"],
+      "properties": {
+        "teams": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["team", "status"],
+            "properties": {
+              "team": { "type": "string" },
+              "status": { "enum": ["done", "failed", "parked"] },
+              "summary": { "type": "string", "description": "Compact lead summary — raw artifacts stay in .work-state/artifacts/<team>/." },
+              "dod_path": { "type": "string" },
+              "escalations": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    "integration_review": {
+      "type": "object",
+      "required": ["verdict"],
+      "properties": {
+        "verdict": { "enum": ["approve", "reject"] },
+        "findings": { "type": "array", "items": { "type": "string" } },
+        "merged_branches": { "type": "array", "items": { "type": "string" } },
+        "note": { "type": "string" }
+      }
     }
   }
 }

@@ -22,13 +22,22 @@ import {
 } from "@andvl1/omp-workflows-core";
 import { runStage } from "../src/engine/stage.js";
 
-test("core: loadAllProfiles returns 8 profiles", async () => {
+test("core: loadAllProfiles returns 9 profiles", async () => {
   const profiles = await loadAllProfiles();
-  assert.equal(profiles.length, 8);
+  assert.equal(profiles.length, 9);
   const names = profiles.map((p) => p.name);
   assert.ok(names.includes("lightweight"));
   assert.ok(names.includes("full-feature"));
   assert.ok(names.includes("debug-cycle"));
+  assert.ok(names.includes("cto"), "cto profile ships but is never auto-selected");
+
+  // The CTO profile is explicit-only: no classification may select it.
+  for (const type of ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "INVESTIGATION", "REVIEW", "HOTFIX"] as const) {
+    for (const complexity of ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] as const) {
+      const selected = selectProfile(profiles, { type, complexity, confidence: "HIGH", workflow: "standard" });
+      assert.notEqual(selected?.name, "cto", `${type}/${complexity} must not select cto`);
+    }
+  }
 });
 
 test("core: resolveWorkflow matrix", () => {
@@ -142,6 +151,8 @@ test("fullstack: agent frontmatter uses OMP class role with standard fallback", 
     "code-reviewer": { classRole: "@reviewer", fallbackRole: "@slow", thinkingLevel: "high" },
     "coordinator-yolo": { classRole: "@coordinator", fallbackRole: "@slow", thinkingLevel: "high" },
     coordinator: { classRole: "@coordinator", fallbackRole: "@slow", thinkingLevel: "high" },
+    cto: { classRole: "@cto", fallbackRole: "@slow", thinkingLevel: "high" },
+    "team-lead": { classRole: "@team-lead", fallbackRole: "@task", thinkingLevel: "auto" },
     "developer-go": { classRole: "@developer-go", fallbackRole: "@task", thinkingLevel: "auto" },
     "developer-kotlin": { classRole: "@developer-kotlin", fallbackRole: "@task", thinkingLevel: "auto" },
     "developer-mobile": { classRole: "@developer-mobile", fallbackRole: "@task", thinkingLevel: "auto" },

@@ -14,7 +14,9 @@ returning user gets progress, not a broken repo.
 
 You are a **dispatcher, not the doer, and not a whole-feature swallower.** Per tick you take
 **exactly one task** and run it through the **regular `/team` pipeline** (autonomous mode) — the
-same deterministic classification → stages → DoD flow a human would trigger. You do NOT reimplement
+same deterministic classification → stages → DoD flow a human would trigger. For **large,
+multi-scope items** (several stacks/teams), run **`/cto`** instead: the CTO decomposes into
+parallel teams, each with its own sub-workflow, and integrates. You do NOT reimplement
 orchestration, and you do NOT drain the whole backlog in a single invocation. Cadence is external:
 `/team-yolo` wraps you in `/loop <interval>`, and **each tick is one invocation = one task**.
 
@@ -25,9 +27,12 @@ orchestration, and you do NOT drain the whole backlog in a single invocation. Ca
    force, never deploy, never destructive git.
 2. **One task per tick.** Load memory, pick the single highest-leverage task, run it, return.
    The next task is the next `/loop` tick — never loop over the whole backlog inside one tick.
-3. **Regular /team per task.** Execute the chosen task by running the normal `/team` workflow in
-   autonomous mode (resolve checkpoints with each stage's `autonomous` decision). Do not hand the
-   whole feature to yourself; `/team` decomposes it and delegates to the worker agents as usual.
+3. **Regular /team (or /cto) per task.** Execute the chosen task by running the normal `/team`
+   workflow in autonomous mode (resolve checkpoints with each stage's `autonomous` decision).
+   Large multi-scope tasks: run `/cto` and let the CTO decompose into teams. Do not hand the
+   whole feature to yourself; `/team`/`/cto` decomposes it and delegates to the worker agents
+   as usual. In autonomous mode escalations to the user are forbidden — the CTO resolves with
+   documented defaults.
 4. **Validate before commit.** A task is done only if the project builds and tests are green.
    Broke it → roll that task back to the last green (`git restore` / `git checkout -- .`), log the
    failure, move on. Never leave a red tree.

@@ -24,6 +24,8 @@ mechanically. Same classification → same stage sequence.
 | `artifacts-schema.json` | Typed handoff contracts written to `.work-state/artifacts/<id>.json` (P2). |
 | `<name>.json` | One profile per workflow. |
 | `stages/<id>.md` | Per-stage prompt templates / criteria, **loaded on demand** by the interpreter (P9). The file name equals the stage `id`. Keeps `commands/team.md` lean — it holds only governance; the "how" of each stage is read only when that stage runs. |
+| `cto.json` | CTO sub-orchestration profile (explicit `/cto` only — `match.type` is `[]`, never auto-selected). Stages: discovery → decomposition → teams (`type: team`, filled from `.omp/teams.json`) → integration review → summary. |
+| `teams.example.json` | Example TeamDef registry (`id, name, scope, profile, lead, roster`). Consumers copy it to `<project>/.omp/teams.json` to register their development teams for `/cto`. |
 
 > **Work-state paths.** The hooks read state from per-feature subdirs
 > (`.work-state/features/<slug>/state.json` — see `commands/team.md` § Work-state directory

@@ -117,7 +117,7 @@ test('cli: input parses arbitrary text and validates required positionals', () =
   });
 });
 
-test('cli: input sends text plus newline in one frame without ask state', async () => {
+test('cli: input sends text plus Enter keypress without ask state', async () => {
   const scratchDir = mkdtempSync(join(tmpdir(), 'ux-e2e-input-'));
   const stateDir = join(scratchDir, '.work-state', 'ux-e2e');
   mkdirSync(stateDir, { recursive: true });
@@ -126,7 +126,7 @@ test('cli: input sends text plus newline in one frame without ask state', async 
   const driver = {
     open: async () => undefined,
     type: async (text: string) => frames.push(text),
-    submit: async (text: string) => frames.push(text + '\n'),
+    pressEnter: async () => frames.push('\r'),
     close: async () => undefined,
   };
 
@@ -136,7 +136,7 @@ test('cli: input sends text plus newline in one frame without ask state', async 
   );
 
   assert.equal(code, 0);
-  assert.deepEqual(frames, ['/do-work implement it\n']);
+  assert.deepEqual(frames, ['/do-work implement it', '\r']);
   rmSync(scratchDir, { recursive: true });
 });
 

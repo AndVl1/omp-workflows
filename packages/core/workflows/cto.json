@@ -1,0 +1,56 @@
+{
+  "name": "cto",
+  "title": "CTO Sub-Orchestration",
+  "description": "Top-level CTO run: discovery -> decomposition -> parallel teams -> integration review -> summary. Never auto-selected by classification (match.type = [] — the CTO profile is invoked explicitly via /cto). The 'teams' stage is filled at runtime from .omp/teams.json by the CTO agent.",
+  "match": { "type": [] },
+  "stages": [
+    {
+      "id": "cto_discovery",
+      "title": "CTO Discovery",
+      "type": "orchestrator",
+      "gate": "branch_created",
+      "checkpoint": "confirm_understanding",
+      "autonomous": "log confirmed understanding, continue",
+      "produces": "cto_discovery"
+    },
+    {
+      "id": "decomposition",
+      "title": "Decomposition",
+      "type": "orchestrator",
+      "consumes": ["cto_discovery"],
+      "checkpoint": "confirm_plan",
+      "autonomous": "proceed with the proposed TeamPlan (documented defaults)",
+      "gate": "plan_valid",
+      "produces": "team_plan"
+    },
+    {
+      "id": "teams",
+      "title": "Parallel Teams",
+      "type": "team",
+      "consumes": ["team_plan"],
+      "produces": "team_artifacts",
+      "integration": {
+        "stage": "integration_review",
+        "on_failure": "escalate_user"
+      }
+    },
+    {
+      "id": "integration_review",
+      "title": "Integration Review",
+      "type": "single",
+      "role": "code-reviewer",
+      "consumes": ["team_artifacts"],
+      "gate": "verdict != reject",
+      "checkpoint": "user_accepts",
+      "autonomous": "proceed with review verdict",
+      "produces": "integration_review"
+    },
+    {
+      "id": "cto_summary",
+      "title": "CTO Summary",
+      "type": "orchestrator",
+      "consumes": ["integration_review"],
+      "produces": "summary"
+    }
+  ]
+}
