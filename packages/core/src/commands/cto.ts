@@ -18,8 +18,8 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { basename, join } from "node:path";
 import { findProfileDir } from "../engine/profile.js";
 import { loadTeamDefs } from "../cto/plan.js";
 import { readCtoState, ctoStateDir } from "../cto/state.js";
@@ -152,9 +152,96 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string): string
 }
 
 /**
- * Find the single active CTO run — any state.json under
- * `.work-state/cto/<runId>/` whose pause.kind is not done/failed.
- * Returns the latest by updated_at, or null.
+ * Files that mark a markdown-state run as FINISHED (agent-written).
+ * Two-layer reality: the CTO agent writes state as markdown (team-plan.md,
+ * decisions.md, cto_discovery.md) and never calls the TS engine — so a run
+ * without state.json is active until one of these markers appears.
+ */
+const FINISH_MARKERS = ["summary.md", "summary.json", "integration_review.md", "integration_review.json"];
+
+/** Team ids referenced in a markdown team-plan (best-effort extraction). */
+const TEAM_LINE = /(?:^\s*[-*]\s*(?:team\s*)?[:\-]?\s*|^\s*\|\s*)`?([a-z0-9][a-z0-9-_]*)`?/i;
+
+function markdownFiles(runDir: string): string[] {
+  try {
+    return readdirSync(runDir).filter((name) => name.endsWith(".md") || name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+}
+
+function newestMtime(runDir: string, files: string[]): string {
+  let newest = 0;
+  for (const name of files) {
+    try {
+      newest = Math.max(newest, statSync(join(runDir, name)).mtimeMs);
+    } catch {
+      // missing/racy — skip
+    }
+  }
+  return newest > 0 ? new Date(newest).toISOString() : new Date(0).toISOString();
+}
+
+/**
+ * Build a minimal CtoState from the agent-written markdown files, so the
+ * amend prompt can render run context without a state.json (br-5ql).
+ */
+function markdownCtoState(runId: string, runDir: string): CtoState | null {
+  const files = markdownFiles(runDir);
+  // Active evidence: any CTO state file. cto_discovery.md alone means the run
+  // started (often parked at a confirm_understanding checkpoint) — still active.
+  if (!files.some((name) => ["team-plan.md", "decisions.md", "cto_discovery.md"].includes(name))) return null;
+  if (files.some((name) => FINISH_MARKERS.includes(name))) return null;
+
+  let task = runId;
+  for (const name of ["cto_discovery.md", "team-plan.md"]) {
+    if (!files.includes(name)) continue;
+    try {
+      const first = readFileSync(join(runDir, name), "utf8").split("\n").find((l) => l.startsWith("# "));
+      if (first) {
+        task = first.replace(/^#\s+/, "").trim();
+        break;
+      }
+    } catch {
+      // unreadable — keep runId
+    }
+  }
+
+  const teams: CtoState["teams"] = [];
+  try {
+    const planPath = join(runDir, "team-plan.md");
+    if (existsSync(planPath)) {
+      for (const line of readFileSync(planPath, "utf8").split("\n")) {
+        const match = line.match(TEAM_LINE);
+        if (match?.[1] && !teams.some((t) => t.id === match[1])) {
+          teams.push({ id: match[1], status: "in_progress", escalations: {} });
+        }
+      }
+    }
+  } catch {
+    // best-effort
+  }
+
+  const updatedAt = newestMtime(runDir, files);
+  return {
+    schema: 1,
+    id: runId,
+    task,
+    branch: "",
+    autonomous: false,
+    plan: { id: runId, task, teams: [], created_at: updatedAt },
+    teams,
+    integration: { status: "pending" },
+    pause: { kind: "none", reason: "markdown state (agent-written, no state.json)" },
+    updated_at: updatedAt,
+  };
+}
+
+/**
+ * Find the single active CTO run — state.json first (engine-written), then
+ * a markdown fallback for agent-written runs (br-5ql). A run is finished
+ * when its pause is done/failed, or (markdown) when a summary or
+ * integration-review marker exists. Returns the latest by updated_at.
  * The amend protocol (br-k19): a second `/cto` while a run is active folds
  * the new task into THAT run instead of starting a fresh orchestrator.
  */
@@ -164,13 +251,23 @@ export function findActiveCtoRun(cwd: string): { runId: string; state: CtoState 
   let best: { runId: string; state: CtoState } | null = null;
   let bestAt = "";
   for (const runId of readdirSync(runsDir)) {
-    if (!existsSync(ctoStateDir(runId, cwd))) continue;
+    const runDir = ctoStateDir(runId, cwd);
+    if (!existsSync(runDir)) continue;
+
     const state = readCtoState(runId, cwd);
-    if (!state) continue;
-    if (state.pause.kind === "done" || state.pause.kind === "failed") continue;
-    if (!best || state.updated_at > bestAt) {
-      best = { runId, state };
-      bestAt = state.updated_at;
+    if (state) {
+      if (state.pause.kind === "done" || state.pause.kind === "failed") continue;
+      if (!best || state.updated_at > bestAt) {
+        best = { runId, state };
+        bestAt = state.updated_at;
+      }
+      continue;
+    }
+
+    const mdState = markdownCtoState(runId, runDir);
+    if (mdState && (!best || mdState.updated_at > bestAt)) {
+      best = { runId, state: mdState };
+      bestAt = mdState.updated_at;
     }
   }
   return best;
@@ -194,7 +291,7 @@ export function buildAmendPrompt(envelope: ParsedCtoEnvelope, cwd: string, activ
     `Run: \`${active.runId}\` (started ${active.state.plan.created_at})`,
     `Teams: ${teamsLine}`,
     `Pause: ${active.state.pause.kind} — ${active.state.pause.reason || "no reason"}`,
-    `State: \`.work-state/cto/${active.runId}/state.json\` — read it BEFORE touching anything.`,
+    `State: \`.work-state/cto/${active.runId}/\` (state.json when engine-written, markdown otherwise) — read it BEFORE touching anything.`,
     "",
     "### New task (fold into the SAME run)",
     issueMeta + autonomousMeta,

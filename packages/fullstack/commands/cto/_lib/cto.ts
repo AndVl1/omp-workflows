@@ -12,7 +12,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { resolveWorkflowProfilePath } from "../../do-work/_lib/profile.js";
 
@@ -170,29 +170,73 @@ export interface ActiveCtoRun {
   };
 }
 
+const FINISH_MARKERS = ["summary.md", "summary.json", "integration_review.md", "integration_review.json"];
+const TEAM_LINE = /(?:^\s*[-*]\s*(?:team\s*)?[:\-]?\s*|^\s*\|\s*)`?([a-z0-9][a-z0-9-_]*)`?/i;
+
+function markdownCtoState(runId: string, runDir: string): ActiveCtoRun["state"] | null {
+  let files: string[];
+  try {
+    files = readdirSync(runDir).filter((name) => name.endsWith(".md") || name.endsWith(".json"));
+  } catch {
+    return null;
+  }
+  if (!files.some((name) => ["team-plan.md", "decisions.md", "cto_discovery.md"].includes(name))) return null;
+  if (files.some((name) => FINISH_MARKERS.includes(name))) return null;
+
+  const teams: Array<{ id: string; status: string }> = [];
+  try {
+    const planPath = join(runDir, "team-plan.md");
+    if (existsSync(planPath)) {
+      for (const line of readFileSync(planPath, "utf8").split("\n")) {
+        const match = line.match(TEAM_LINE);
+        if (match?.[1] && !teams.some((t) => t.id === match[1])) teams.push({ id: match[1], status: "in_progress" });
+      }
+    }
+  } catch { /* best-effort */ }
+
+  let newest = 0;
+  for (const name of files) {
+    try { newest = Math.max(newest, statSync(join(runDir, name)).mtimeMs); } catch { /* skip */ }
+  }
+  const updatedAt = newest > 0 ? new Date(newest).toISOString() : new Date(0).toISOString();
+  return {
+    plan: { created_at: updatedAt },
+    teams,
+    pause: { kind: "none", reason: "markdown state (agent-written, no state.json)" },
+    updated_at: updatedAt,
+  };
+}
+
+type ActiveRunBest = { runId: string; state: ActiveCtoRun["state"] };
+
 /**
- * Find the single active CTO run — any state.json under
- * `.work-state/cto/<runId>/` whose pause.kind is not done/failed; latest by
- * updated_at, else null. Self-contained copy of the core contract (br-k19
- * amend protocol).
+ * Find the single active CTO run — state.json first (engine-written), then a
+ * markdown fallback for agent-written runs (br-5ql). A run is finished when
+ * its pause is done/failed, or (markdown) when a summary/integration-review
+ * marker exists; latest by updated_at, else null. Self-contained copy of the
+ * core contract (br-k19 amend protocol).
  */
-export function findActiveCtoRun(cwd: string): ActiveCtoRun | null {
+export function findActiveCtoRun(cwd: string): ActiveRunBest | null {
   const runsDir = join(cwd, ".work-state", "cto");
   if (!existsSync(runsDir)) return null;
-  let best: ActiveCtoRun | null = null;
+  let best: ActiveRunBest | null = null;
   let bestAt = "";
   for (const runId of readdirSync(runsDir)) {
-    const statePath = join(runsDir, runId, "state.json");
-    if (!existsSync(statePath)) continue;
-    try {
-      const state = JSON.parse(readFileSync(statePath, "utf8")) as ActiveCtoRun["state"];
-      if (state?.pause?.kind === "done" || state?.pause?.kind === "failed") continue;
-      if (!best || state.updated_at > bestAt) {
-        best = { runId, state };
-        bestAt = state.updated_at;
-      }
-    } catch {
-      // corrupt state — skip
+    const runDir = join(runsDir, runId);
+    if (!existsSync(runDir)) continue;
+    const statePath = join(runDir, "state.json");
+    let state: ActiveCtoRun["state"] | null = null;
+    if (existsSync(statePath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(statePath, "utf8")) as ActiveCtoRun["state"];
+        if (parsed?.pause?.kind !== "done" && parsed?.pause?.kind !== "failed") state = parsed;
+      } catch { /* corrupt — fall through to markdown */ }
+    }
+    if (!state) state = markdownCtoState(runId, runDir);
+    if (!state) continue;
+    if (!best || state.updated_at > bestAt) {
+      best = { runId, state };
+      bestAt = state.updated_at;
     }
   }
   return best;

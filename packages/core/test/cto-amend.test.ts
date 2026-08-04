@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -110,6 +110,80 @@ test("cto-amend: ctoCommand routes to AMEND while a run is active, fresh otherwi
     const freshAgain = ctoCommand(ctx("Add feature C"));
     assert.ok(freshAgain.includes("/cto workflow"));
     assert.ok(!freshAgain.includes("AMEND"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-amend: findActiveCtoRun falls back to markdown state (br-5ql)", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-amend-md-"));
+  try {
+    // Agent-written run: NO state.json — only markdown files.
+    const runId = "feat-ping-2026-08-04";
+    const runDir = join(root, ".work-state", "cto", runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, "cto_discovery.md"), "# Implement Feature A\n\nDiscovered scope.\n");
+    writeFileSync(
+      join(runDir, "team-plan.md"),
+      [
+        "# Team Plan — feat-ping",
+        "",
+        "- team: backend — server slice",
+        "- team: frontend — status page",
+        "",
+        "Shared contract defined in architecture.md.",
+      ].join("\n"),
+    );
+    writeFileSync(join(runDir, "decisions.md"), "| # | When | Decision | Why |\n");
+
+    const active = findActiveCtoRun(root);
+    assert.ok(active, "markdown-only run detected as active");
+    assert.equal(active?.runId, runId);
+    assert.deepEqual(
+      active?.state.teams.map((t) => t.id).sort(),
+      ["backend", "frontend"],
+      "team ids extracted from team-plan.md",
+    );
+    assert.equal(active?.state.pause.kind, "none");
+    assert.ok(active?.state.pause.reason?.includes("markdown"), "markdown fallback flagged");
+
+    // Adding a summary marker finishes the run.
+    writeFileSync(join(runDir, "summary.md"), "# Summary\nAll done.\n");
+    assert.equal(findActiveCtoRun(root), null, "summary.md marks the run finished");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-amend: ctoCommand routes to AMEND for markdown-only runs", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-amend-mdcmd-"));
+  try {
+    const runId = "md-run-1";
+    const runDir = join(root, ".work-state", "cto", runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, "team-plan.md"), "# Team Plan\n- team: backend\n");
+    writeFileSync(join(runDir, "decisions.md"), "table\n");
+
+    const notifyCalls: string[] = [];
+    const prompt = ctoCommand({ args: "Add feature B", cwd: root, ui: { notify: (m) => notifyCalls.push(m) } });
+    assert.ok(prompt.includes("/cto AMEND"), "markdown-only run amends");
+    assert.ok(prompt.includes(runId), "run id in the amend prompt");
+    assert.ok(notifyCalls.some((m) => m.includes("amending run")), "notify announces the amend");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-amend: cto_discovery.md alone marks the run active (early amend window)", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-amend-early-"));
+  try {
+    const runId = "early-run";
+    const runDir = join(root, ".work-state", "cto", runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, "cto_discovery.md"), "# Implement Feature A\n");
+    const active = findActiveCtoRun(root);
+    assert.ok(active, "run detected while parked at the first checkpoint");
+    assert.equal(active?.runId, runId);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

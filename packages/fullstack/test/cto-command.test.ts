@@ -177,6 +177,30 @@ test("fullstack: /cto routes to AMEND when an active run exists", async () => {
 	}
 });
 
+test("fullstack: findActiveCtoRun falls back to markdown state (br-5ql)", () => {
+	const root = mkdtempSync(join(tmpdir(), "cto-cmd-md-"));
+	try {
+		const runId = "md-run-2";
+		const runDir = join(root, ".work-state", "cto", runId);
+		mkdirSync(runDir, { recursive: true });
+		writeFileSync(join(runDir, "team-plan.md"), "# Team Plan\n- team: kotlin-backend\n- team: frontend\n");
+		writeFileSync(join(runDir, "decisions.md"), "table\n");
+
+		const active = findActiveCtoRun(root);
+		assert.ok(active, "markdown-only run detected");
+		assert.equal(active?.runId, runId);
+		assert.deepEqual(
+			active?.state.teams.map((t) => t.id).sort(),
+			["frontend", "kotlin-backend"],
+		);
+
+		writeFileSync(join(runDir, "summary.md"), "# Summary\n");
+		assert.equal(findActiveCtoRun(root), null, "summary finishes the run");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("fullstack: buildAmendPrompt renders the amend contract", () => {
 	const root = mkdtempSync(join(tmpdir(), "cto-cmd-amendp-"));
 	try {
