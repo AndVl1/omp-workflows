@@ -68,7 +68,7 @@ test("fullstack: /cto command loads and parses an envelope", async () => {
 	assert.ok(result.includes("max 8"), "prompt states the team cap");
 });
 
-test("fullstack: /cto renders teams from .omp/teams.json", () => {
+	test("fullstack: /cto renders teams from .omp/teams.json", () => {
 	const root = mkdtempSync(join(tmpdir(), "cto-cmd-"));
 	try {
 		mkdirSync(join(root, ".omp"), { recursive: true });
@@ -77,6 +77,7 @@ test("fullstack: /cto renders teams from .omp/teams.json", () => {
 		assert.ok(result.includes("| `kotlin-backend` | Kotlin Backend |"), "backend team row rendered");
 		assert.ok(result.includes("| `frontend` | Frontend |"), "frontend team row rendered");
 		assert.ok(!result.includes("(no teams configured)"), "no fallback hint when teams exist");
+		assert.ok(result.includes("Leads never write source"), "lead self-coding forbidden in the contract");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

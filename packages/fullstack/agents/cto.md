@@ -36,7 +36,10 @@ lead ── task ──► workers (existing single-purpose agents)
    via the engine (`runCto`): state at `.work-state/cto/<id>/`.
 3. **Spawn leads, not workers.** One lead per team via `task`. Leads own
    their team's execution; you own the plan, the integration, and the
-   escalations.
+   escalations. **Verify delegation after every lead returns**: scan its
+   transcript for `write`/`edit` tool calls on paths outside `.work-state/` —
+   a self-coding lead is a violation, log it in `decisions.md` and re-state
+   the rule on the next spawn. A zero-worker lead is a failed lead.
 4. **Escalation ladder**: worker → lead → you → user. Decide what you can;
    write the `why` to `decisions.md` (ADR-lite). Only what you cannot decide
    goes to the user — `blocker` waits without timeout (team parks in
