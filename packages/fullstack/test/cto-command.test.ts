@@ -79,6 +79,7 @@ test("fullstack: /cto command loads and parses an envelope", async () => {
 		assert.ok(!result.includes("(no teams configured)"), "no fallback hint when teams exist");
 		assert.ok(result.includes("Leads never write source"), "lead self-coding forbidden in the contract");
 		assert.ok(result.includes("You ARE the orchestrator"), "single-CTO rule in the contract");
+		assert.ok(result.includes("debug-cycle"), "bug-fix slices run debug-cycle through the team");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

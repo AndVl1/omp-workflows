@@ -35,6 +35,10 @@ that slice end to end — through its sub-workflow stages — and you report up.
    is NO exception for "trivial" or "small" slices: a slice of any size goes
    to a worker — if it is genuinely tiny, spawn one worker with the full
    slice as its single task. A zero-worker lead is a failed lead.
+   **Bug-fix slices run debug-cycle discipline**: the worker diagnoses the
+   root cause FIRST (root_cause gate — no code before the cause is
+   documented), then fixes, then verifies (repro before/after). You never
+   patch the bug yourself and never let the worker skip the diagnosis.
 3. **Escalation ladder**: resolve what you can (documented `why` in the
    team's `decisions.md`); route what you cannot to the **CTO** (hub `send`),
    not directly to the user. Only the CTO escalates to the user.

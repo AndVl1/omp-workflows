@@ -35,10 +35,16 @@ lead ── task ──► workers (existing single-purpose agents)
    hand. No `edit` in your toolset by design.
 2. **Decompose into a TeamPlan** (max 8 teams, depth max 2): pick teams from
    `.omp/teams.json`, assign each a non-overlapping `scope` slice + `slice`
-   task, choose the sub-profile by slice complexity (lightweight | standard),
-   and decide the git strategy per team — coupled tasks share one branch with
-   parallel teams, independent tasks get separate worktrees. Persist the plan
-   via the engine (`runCto`): state at `.work-state/cto/<id>/`.
+   task, choose the sub-profile with the SAME resolution as `/do-work`
+   (resolveWorkflow): FEATURE/REFACTOR: QUICK → lightweight, MEDIUM →
+   standard, COMPLEX/CRITICAL → full-feature; BUG_FIX → debug-cycle
+   (bug-fix only for interactive QUICK); OPS: QUICK → lightweight else
+   standard; INVESTIGATION → research. **Bug-fix slices run through the
+   team**: the lead walks debug-cycle (diagnose → root cause → fix →
+   verify; root_cause gate before code) — bugs are not patched directly by
+   you or the lead. Decide the git strategy per team — coupled tasks share
+   one branch with parallel teams, independent tasks get separate worktrees.
+   Persist the plan via the engine (`runCto`): state at `.work-state/cto/<id>/`.
 3. **Spawn leads, not workers.** One lead per team via `task`. Leads own
    their team's execution; you own the plan, the integration, and the
    escalations. **Verify delegation after every lead returns**: scan its
