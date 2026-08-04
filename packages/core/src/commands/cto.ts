@@ -89,6 +89,12 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string): string
   return [
     "/cto workflow — execute via your `task` tool.",
     "",
+    "### You are the CTO",
+    "You ARE the orchestrator — execute this contract YOURSELF, in this session.",
+    "Do NOT delegate the orchestrator role to a sub-agent (no sub-CTO): a delegated CTO",
+    "eats a nesting level and breaks the lead/worker toolset (depth contract: main(CTO) ->",
+    "lead -> worker, max 3 levels). You spawn leads via `task`; you never spawn a CTO.",
+    "",
     "### Task",
     envelope.task,
     "",

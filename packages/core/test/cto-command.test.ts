@@ -57,6 +57,8 @@ test("cto-cmd: buildCtoPrompt renders teams from .omp/teams.json", () => {
     assert.ok(prompt.includes("max 8, decomposition depth max 2"));
     assert.ok(prompt.includes("Leads never write source"), "lead self-coding forbidden in the contract");
     assert.ok(prompt.includes("self-coding lead"), "CTO must reject self-coding leads");
+    assert.ok(prompt.includes("You ARE the orchestrator"), "single-CTO rule in the contract");
+    assert.ok(prompt.includes("never spawn a CTO"), "no sub-CTO delegation allowed");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
