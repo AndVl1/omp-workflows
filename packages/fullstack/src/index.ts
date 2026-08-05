@@ -25,6 +25,7 @@ import {
 } from "@andvl1/omp-workflows-core";
 import { ensureCommandsForSession } from "./copy-commands.js";
 import { createEscalationAdapter, loadEscalationConfig, startDispatcher } from "./adapters/registry.js";
+import { createCtoModeReminderHandler } from "./cto-mode-reminder.js";
 import {
 	RESEARCH_REQUEST_MARKER_END,
 	RESEARCH_REQUEST_MARKER_START,
@@ -106,6 +107,14 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   // each agent loop and injects a developer-attributed instruction when
   // the custom command's return value carries the marker envelope.
   pi.on("before_agent_start", beforeAgentStartMarkerHandler);
+
+  // CTO-mode reminder — fires before EVERY LLM call. While a CTO run is
+  // active (.work-state/cto/), prepend a short steering message restating
+  // the delegation contract (orchestrator -> teams, lead -> workers,
+  // worker -> escalate up). Keeps the discipline in front of the model on
+  // every turn of long autonomous runs (and after compaction), for the
+  // main session and subagents. See cto-mode-reminder.ts.
+  pi.on("context", createCtoModeReminderHandler());
 
   // Auto-bootstrap OMP custom-TS slash commands into the active project's
   // `.omp/commands/` directory on every session start. OMP's discovery

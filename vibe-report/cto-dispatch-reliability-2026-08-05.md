@@ -113,3 +113,54 @@ reminder 3 of 3 → assistant: (пусто) → session_exit
   (CiLead.jsonl, CiLead2.jsonl, WatchLead.jsonl, AiLead.jsonl, CiFix355.jsonl, CiFix355b.jsonl).
 - Решение CTO: `.work-state/cto/pr-watch/decisions.md` (запись 2026-08-05).
 - Бэкап конфига: `~/.omp/agent/config.yml.bak-cto-dispatch-20260805`.
+
+---
+
+# Дополнение: CTO-mode напоминалка (per-turn delegation reminder)
+
+## Запрос
+
+«Можно ли в CTO mode на каждое сообщение оставлять напоминалку, что мы в CTO
+и проблемы надо делегировать в команды?»
+
+## Да — реализовано через `context`-хук
+
+Механизм (проверен live, omp 17.2.8, `/tmp/hook-probe/`):
+- **`context`-событие стреляет перед КАЖДЫМ LLM-вызовом** — каждый ход главной
+  сессии и сабагентов (probe 1: события на ходах 0,1,2 + в сессии воркера).
+- Контракт результата: `{ messages: [...] }` (голый массив харнесс отбрасывает —
+  probe 5, «SAW=yes» только после фикса контракта).
+- Steering-сообщение (`role:"user", steering:true`) харнесс оборачивает в
+  `<system-notice>` с приоритетом и потребляет per-turn (эфемерно — каждый ход
+  инжектится заново; probe 6/7: INJECT на обоих ходах, доставка подтверждена).
+- Детерминированная проверка доставки (probe 12, префикс-требование): W1 (полная
+  factory плагина) / W2 / W3 — доставлено во всех конфигурациях. Ранние «SAW=no»
+  были артефактами пробы: модель педантично искала «CTO MODE ACTIVE» с пробелами,
+  а токен `[CTO-MODE-ACTIVE]` содержит дефисы (W3-run3 модель сама объяснила это).
+
+Реализация:
+- `packages/fullstack/src/cto-mode-reminder.ts` — детекция активного рана
+  (core `findActiveCtoRun`, кэш 10с), текст напоминалки (~70 токенов), инжект с
+  dedupe, никогда не бросает.
+- `packages/fullstack/src/index.ts` — `pi.on("context", createCtoModeReminderHandler())`.
+- 7 юнит-тестов; суммарно 262/262 зелёные (было 255).
+
+Текст напоминалки (роль-агностичен — безопасен для CTO, лидов и воркеров):
+```
+[CTO-MODE-ACTIVE] A CTO sub-orchestration run is ACTIVE in this workspace (run `<id>`: <task>).
+You are part of that run. DELEGATE, do not absorb:
+- Orchestrator (the CTO): decompose and delegate problems to teams via `task`; never code or patch yourself.
+- Team lead: every slice goes to a worker via `task`; escalate what you cannot decide to the CTO.
+- Worker: complete your single task; escalate blockers to your lead; never re-delegate or expand scope.
+```
+
+Стоимость: ~70 токенов на LLM-вызов пока раунд активен; ноль накладных без
+активного рана. Покрывает и ходы после компактификации (напоминалка впрыскивается
+заново на первом же вызове после compaction).
+
+## Активация
+
+Фича входит в `@andvl1/omp-workflows-fullstack` (src + dist) — вступит в силу
+после пересборки/переустановки плагина (репозиторий уже содержит код; установленный
+в `~/.omp/plugins` 0.12.0 пока без неё). Локально проверялось через
+`omp -e <repo>/packages/fullstack/dist/index.js`.

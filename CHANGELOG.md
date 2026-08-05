@@ -3,10 +3,12 @@
 All notable changes to `omp-workflows` are documented here.
 
 ## [0.12.1] — 2026-08-05
+### Added
+- **CTO-mode delegation reminder (per-turn)** — a `context` hook (fires before EVERY LLM call in the session and in subagents) injects a short steering message restating the delegation contract while a CTO run is active (`.work-state/cto/`, detected via core `findActiveCtoRun`): orchestrator delegates to teams, leads spawn workers, workers escalate up. Keeps the discipline in front of the model on every turn of long autonomous runs — including turns after compaction — instead of relying on the /cto prompt drifting in context. Zero overhead when no run is active (cached 10s detection). Mechanism verified live on omp 17.2.8 (context-hook contract is `{ messages }`; steering user messages are wrapped per turn by the harness and are ephemeral, so each turn re-injects). Activation: ships in the fullstack bundle — takes effect after plugin republish/install.
 ### Fixed
 - **Subagent dispatch reliability protocol (lead exit-1 failover)** — live evidence (pr-watch CTO run + /tmp/cto-dispatch-exp probe matrix, omp 17.2.8): subagents below the main agent resolve to `modelRoles.task`; when that role is `minimax-code/MiniMax-M3`, they intermittently die with exit 1 — stalling at a nested `task` call (empty turns → killed after 3 idle reminders), yielding null/empty data, or hallucinating garbage tool calls mid-work. Nested dispatch is NOT the defect: a directly-dispatched worker failed identically on the same model; `opencode-go/deepseek-v4-flash` as task role showed 0 failures across 17+ live probe runs. The `/cto` prompt contract (core + fullstack copies), `cto` agent, and `team-lead` agent now carry: verify-disk-first + re-spawn-with-same-spec failover for exit-1 leads, degrade-to-direct-dispatch on a second failure, single-worker slices skip the lead hop, and dispatch hygiene (spawn early before context grows, lean specs with findings on disk, one worker per `task` call). Host-level fix applied separately: `modelRoles.task` → deepseek-v4-flash (see vibe-report).
 ### Verified
-- 255 unit tests green (core 96, fullstack 72, e2e 87 — was 253), typecheck + build clean. Live probe matrix in `/tmp/cto-dispatch-exp` (simple + heavy nested chains, MiniMax vs deepseek task role, direct vs nested dispatch).
+- 262 unit tests green (core 96, fullstack 79, e2e 87 — was 253), typecheck + build clean. Live probe matrix in `/tmp/cto-dispatch-exp` (simple + heavy nested chains, MiniMax vs deepseek task role, direct vs nested dispatch); context-hook delivery probes in `/tmp/hook-probe`.
 
 ## [0.12.0] — 2026-08-04
 ### Added
