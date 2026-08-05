@@ -162,3 +162,25 @@ export async function sendTelegramText(
     return false;
   }
 }
+
+/**
+ * File an answer marker in the local drop ({ kind: "answer" }) so a live
+ * session wakes [CTO-ANSWER] even though it does not poll telegram while the
+ * bridge owns the bot. Deterministic name by esc id (wx) — no duplicates.
+ */
+export function writeAnswerMarker(cwd: string, answer: { id: string; answer: string }): string | null {
+  const file = `${answer.id.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`;
+  try {
+    const dir = localInboxDrop(cwd);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, file);
+    writeFileSync(
+      path,
+      JSON.stringify({ kind: "answer", id: answer.id, text: answer.answer, at: new Date().toISOString(), by: "telegram-bridge" }, null, 2),
+      { flag: "wx" },
+    );
+    return path;
+  } catch {
+    return null; // already filed (duplicate) or IO error
+  }
+}

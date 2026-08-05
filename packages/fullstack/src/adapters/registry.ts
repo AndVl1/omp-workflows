@@ -198,6 +198,51 @@ export function localInboxDrop(root: string): string {
   return join(root, ".omp", "inbox");
 }
 
+// ── Bridge ownership (one getUpdates consumer per bot token) ───────────────
+
+/**
+ * Lock file the tg-bridge daemon writes on start and removes on exit.
+ * The in-session dispatcher checks it: while the bridge is alive it owns the
+ * bot's getUpdates, so the session must NOT long-poll telegram itself — it
+ * only picks up the bridge's files from the drop. Without the bridge the
+ * session polls telegram directly. Stale lock (dead pid) is ignored.
+ */
+export function bridgeLockPath(root: string): string {
+  return join(root, ".omp", "tg-bridge.lock");
+}
+
+/** True when a live tg-bridge owns the bot for this project. */
+export function isBridgeAlive(root: string): boolean {
+  try {
+    const raw = JSON.parse(readFileSync(bridgeLockPath(root), "utf8")) as { pid?: number };
+    if (typeof raw?.pid !== "number") return false;
+    process.kill(raw.pid, 0); // throws ESRCH when the process is gone
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Write the bridge lock (called by the tg-bridge daemon on start). */
+export function writeBridgeLock(root: string): void {
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(bridgeLockPath(root), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2));
+  } catch {
+    // best-effort
+  }
+}
+
+/** Remove the bridge lock (called by the daemon on shutdown). */
+export function clearBridgeLock(root: string): void {
+  try {
+    const path = bridgeLockPath(root);
+    if (existsSync(path)) renameSync(path, `${path}.stopped`);
+  } catch {
+    // best-effort
+  }
+}
+
 /**
  * Resolve the run an inbox task belongs to: the active CTO run when there is
  * one, otherwise create a standby run (id `standby-<ts>`) so the task has a
@@ -263,7 +308,9 @@ export async function pollInbox(
   onTask?: (t: InboxTask) => void,
   onAnswer?: (a: { id: string; answer: string }) => void,
 ): Promise<void> {
-  // 1. Local drop (manual / test injection).
+  // 1. Local drop (bridge-written tasks + answer markers, or manual/test
+  //    injection). The bridge files answers as { kind: "answer" } markers so
+  //    the session wakes [CTO-ANSWER] even though it does not poll telegram.
   try {
     const drop = localInboxDrop(root);
     if (existsSync(drop)) {
@@ -271,8 +318,13 @@ export async function pollInbox(
         if (!name.endsWith(".json")) continue;
         const path = join(drop, name);
         try {
-          const raw = JSON.parse(readFileSync(path, "utf8")) as InboxTask;
+          const raw = JSON.parse(readFileSync(path, "utf8")) as InboxTask & { kind?: string };
           if (typeof raw?.text !== "string" || raw.text.trim().length === 0) continue;
+          if (raw.kind === "answer") {
+            onAnswer?.({ id: raw.id, answer: raw.text });
+            moveToProcessed(drop, path, name);
+            continue;
+          }
           const task: InboxTask = {
             id: raw.id ?? `local:${name}`,
             text: raw.text,
@@ -280,11 +332,7 @@ export async function pollInbox(
             by: raw.by ?? "local-drop",
           };
           const moved = handleInboxTask(root, task, onTask);
-          if (moved) {
-            const processedDir = join(drop, "processed");
-            mkdirSync(processedDir, { recursive: true });
-            renameSync(path, join(processedDir, name));
-          }
+          if (moved) moveToProcessed(drop, path, name);
         } catch {
           // unreadable / malformed — leave in place
         }
@@ -293,20 +341,39 @@ export async function pollInbox(
   } catch {
     // drop missing — nothing to do
   }
-  // 2. Telegram long-poll (answers + plain-message inbox). Only the Telegram
-  // adapter exposes pollOnce; http is send-only. Cast at the boundary once.
-  const telegramLike = adapter as { pollOnce: () => Promise<Array<{ id: string; answer: string }>> } | null;
-  if (telegramLike && typeof telegramLike.pollOnce === "function") {
+  // 2. Telegram long-poll (answers + plain-message inbox) — ONLY when no
+  //    tg-bridge owns the bot. While the bridge is alive it is the sole
+  //    getUpdates consumer (409 otherwise); the session just reads its files.
+  if (adapter && !isBridgeAlive(root) && isTelegramPollable(adapter)) {
     try {
-      const answers = (await telegramLike.pollOnce()) ?? [];
+      const answers = (await adapter.pollOnce()) ?? [];
       for (const answer of answers) {
         if (!answer?.id || seenAnswers.has(answer.id)) continue;
         seenAnswers.add(answer.id);
         onAnswer?.(answer);
       }
     } catch {
-      // network hiccup — next tick retries
+      // network hiccup / 409 with a bridge — next tick retries
     }
+  }
+}
+
+/** Narrow the Telegram-specific pollOnce surface (http is send-only). */
+function isTelegramPollable(
+  adapter: unknown,
+): adapter is { pollOnce: () => Promise<Array<{ id: string; answer: string }>> } {
+  if (typeof adapter !== "object" || adapter === null) return false;
+  if (!("pollOnce" in adapter)) return false;
+  return typeof adapter.pollOnce === "function";
+}
+
+function moveToProcessed(drop: string, path: string, name: string): void {
+  try {
+    const processedDir = join(drop, "processed");
+    mkdirSync(processedDir, { recursive: true });
+    renameSync(path, join(processedDir, name));
+  } catch {
+    // processed move is best-effort; the file stays and will be re-seen
   }
 }
 

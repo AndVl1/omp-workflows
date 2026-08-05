@@ -30,10 +30,13 @@ import { join } from "node:path";
 import {
   loadEscalationConfig,
   createEscalationAdapter,
+  writeBridgeLock,
+  clearBridgeLock,
 } from "../dist/adapters/registry.js";
 import {
   classifyIncoming,
   sendTelegramText,
+  writeAnswerMarker,
 } from "../dist/telegram-bridge.js";
 
 function arg(name) {
@@ -47,6 +50,10 @@ if (!config || config.adapter !== "telegram" || !config.telegram?.token || !conf
   console.error(`tg-bridge: no telegram escalation config at ${join(cwd, ".omp", "escalation.json")}`);
   process.exit(1);
 }
+
+// Claim the bot: the in-session dispatcher sees the lock and stops polling
+// telegram itself (one getUpdates consumer per token).
+writeBridgeLock(cwd);
 
 const { token, chatId } = config.telegram;
 const adapter = createEscalationAdapter(config, cwd);
@@ -70,11 +77,30 @@ adapter.setPlainMessageHandler((msg) => {
 });
 
 const intervalMs = config.telegram.pollIntervalMs ?? 5_000;
-const timer = setInterval(() => {
-  adapter.pollOnce().catch(() => undefined);
+const timer = setInterval(async () => {
+  try {
+    // Answers are written to answers/ by the adapter; forward each as a
+    // marker so a live session wakes [CTO-ANSWER] without polling telegram.
+    const answers = await adapter.pollOnce();
+    for (const answer of answers) {
+      if (!answer?.id) continue;
+      const marker = writeAnswerMarker(cwd, answer);
+      console.log(`tg-bridge: answer ${answer.id} -> answers/ + marker ${marker ?? "(dup)"}`);
+    }
+  } catch (error) {
+    console.error("tg-bridge: poll error", error instanceof Error ? error.message : error);
+  }
 }, intervalMs);
 void adapter.pollOnce().catch(() => undefined);
 console.log(`tg-bridge: polling telegram every ${intervalMs}ms (cwd=${cwd}) — one consumer per token.`);
 
-process.on("SIGINT", () => clearInterval(timer));
-process.on("SIGTERM", () => clearInterval(timer));
+process.on("SIGINT", () => {
+  clearInterval(timer);
+  clearBridgeLock(cwd);
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  clearInterval(timer);
+  clearBridgeLock(cwd);
+  process.exit(0);
+});

@@ -25,6 +25,9 @@ import {
   pollInbox,
   resolveInboxRunId,
   inboxDir,
+  isBridgeAlive,
+  writeBridgeLock,
+  clearBridgeLock,
 } from "../src/adapters/registry.js";
 import {
   loadEscalationConfig,
@@ -351,6 +354,68 @@ test("adapters: pollInbox wakes on a new escalation answer (user-initiated)", as
     // Same answer again -> deduped (no re-wake).
     await pollInbox(root, stub, undefined, (a) => answers.push(a));
     assert.equal(answers.length, 1, "duplicate answer not re-woken");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("adapters: bridge lock — alive while pid lives, stale after exit", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-lock-"));
+  try {
+    assert.equal(isBridgeAlive(root), false, "no lock -> not alive");
+    // lock with a dead pid -> stale, treated as not alive
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "tg-bridge.lock"), JSON.stringify({ pid: 99999999 }));
+    assert.equal(isBridgeAlive(root), false, "stale lock (dead pid) ignored");
+    // lock with OUR live pid -> alive
+    writeBridgeLock(root);
+    assert.equal(isBridgeAlive(root), true, "live lock -> bridge owns the bot");
+    clearBridgeLock(root);
+    assert.equal(isBridgeAlive(root), false, "cleared on shutdown");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: pollInbox skips telegram polling while the bridge is alive", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-bridge-"));
+  try {
+    let polls = 0;
+    const stub = {
+      kind: "telegram",
+      pollOnce: async () => {
+        polls += 1;
+        return [];
+      },
+    } as unknown as import("../src/adapters/telegram.js").TelegramEscalationAdapter;
+
+    await pollInbox(root, stub, undefined, undefined);
+    assert.equal(polls, 1, "no bridge -> session polls telegram");
+
+    writeBridgeLock(root);
+    await pollInbox(root, stub, undefined, undefined);
+    assert.equal(polls, 1, "bridge alive -> session must NOT poll telegram");
+    clearBridgeLock(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: pollInbox wakes [CTO-ANSWER] from a bridge answer marker", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-ansmark-"));
+  try {
+    const drop = join(root, ".omp", "inbox");
+    mkdirSync(drop, { recursive: true });
+    writeFileSync(
+      join(drop, "esc-1.json"),
+      JSON.stringify({ kind: "answer", id: "run-1/team-a/q1", text: "use grpc", by: "telegram-bridge" }),
+    );
+    const answers: Array<{ id: string; answer: string }> = [];
+    await pollInbox(root, null, undefined, (a) => answers.push(a));
+    assert.equal(answers.length, 1, "answer marker woke the session");
+    assert.equal(answers[0]?.answer, "use grpc");
+    assert.ok(existsSync(join(drop, "processed", "esc-1.json")), "marker moved to processed");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
