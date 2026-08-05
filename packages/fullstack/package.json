@@ -24,6 +24,7 @@
     "agents",
     "skills",
     "commands",
+    "bin",
     "scripts",
     "tsconfig.commands.json",
     "README.md",
