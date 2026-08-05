@@ -12,7 +12,9 @@ import { join } from "node:path";
 
 import {
   buildCtoPrompt,
+  buildStandbyCtoPrompt,
   parseCtoEnvelope,
+  renderChannelSection,
   ctoCommand,
 } from "@andvl1/omp-workflows-core";
 
@@ -68,6 +70,19 @@ test("cto-cmd: buildCtoPrompt renders teams from .omp/teams.json", () => {
   }
 });
 
+test("cto-cmd: buildCtoPrompt carries the lead exit-1 failover protocol", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-core-failover-"));
+  try {
+    const prompt = buildCtoPrompt(parseCtoEnvelope("Add OAuth", root), root);
+    assert.ok(prompt.includes("Subagent dispatch reliability"), "reliability section present");
+    assert.ok(prompt.includes("SAME slice spec"), "re-spawn with the same spec");
+    assert.ok(prompt.includes("Second failure -> degrade"), "degradation path documented");
+    assert.ok(prompt.includes("skip the lead hop"), "single-worker slices dispatch directly");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("cto-cmd: buildCtoPrompt degrades without teams.json", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-core-"));
   try {
@@ -79,17 +94,63 @@ test("cto-cmd: buildCtoPrompt degrades without teams.json", () => {
   }
 });
 
-test("cto-cmd: ctoCommand returns usage on empty args and notifies on task", () => {
+test("cto-cmd: ctoCommand with empty args starts STANDBY and notifies on task", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-core-"));
   try {
     const notifyCalls: string[] = [];
-    const usage = ctoCommand({ args: "", cwd: root, ui: { notify: (m) => notifyCalls.push(m) } });
-    assert.ok(usage.includes("Usage: /cto"));
+    const standby = ctoCommand({ args: "", cwd: root, ui: { notify: (m) => notifyCalls.push(m) } });
+    assert.ok(standby.includes("/cto STANDBY"), "empty args start standby mode");
+    assert.ok(standby.includes("awaiting inbox tasks"), "standby names the inbox contract");
+    assert.ok(standby.includes("[CTO-INBOX]"), "standby documents the wake envelope");
+    assert.ok(notifyCalls.some((m) => m.includes("standby")), "notify announces standby");
 
     const prompt = ctoCommand({ args: "Add OAuth", cwd: root, ui: { notify: (m) => notifyCalls.push(m) } });
     assert.ok(prompt.includes("Add OAuth"));
-    assert.equal(notifyCalls.length, 1);
-    assert.ok(notifyCalls[0]?.includes("cto: Add OAuth"));
+    assert.ok(notifyCalls.some((m) => m.includes("cto: Add OAuth")));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-cmd: renderChannelSection reflects .omp/escalation.json", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-core-chan-"));
+  try {
+    // no channel
+    assert.ok(renderChannelSection(root).includes("No escalation channel"));
+    assert.ok(renderChannelSection(root).includes("Use the `ask` tool"));
+
+    // telegram -> bidirectional, ask banned
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "t", chatId: "c" } }));
+    const tg = renderChannelSection(root);
+    assert.ok(tg.includes("BIDIRECTIONAL"), "telegram is bidirectional");
+    assert.ok(tg.includes("NEVER use the `ask` tool"), "ask banned in messenger mode");
+    assert.ok(tg.includes("outbox"), "questions route via the outbox");
+
+    // http -> push-only, ask allowed
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "http", http: { url: "https://x" } }));
+    const http = renderChannelSection(root);
+    assert.ok(http.includes("push-only"), "http is push-only");
+    assert.ok(http.includes("Use `ask`"), "http keeps ask");
+
+    // consumer bidirectional transport (flag) -> messenger mode like telegram
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "slack", bidirectional: true }));
+    const slack = renderChannelSection(root);
+    assert.ok(slack.includes("BIDIRECTIONAL"), "bidirectional flag enables messenger mode");
+    assert.ok(slack.includes("NEVER use the `ask` tool"), "ask banned for any bidirectional transport");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-cmd: buildCtoPrompt embeds the channel section", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-core-chan2-"));
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "t", chatId: "c" } }));
+    const prompt = buildCtoPrompt(parseCtoEnvelope("Add OAuth", root), root);
+    assert.ok(prompt.includes("### User channel (messenger, BIDIRECTIONAL)"), "prompt carries the channel section");
+    assert.ok(prompt.includes("NEVER use the `ask` tool"), "prompt bans ask in messenger mode");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

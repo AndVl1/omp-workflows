@@ -56,11 +56,16 @@ lead ── task ──► workers (existing single-purpose agents)
    transcript for `write`/`edit` tool calls on paths outside `.work-state/` —
    a self-coding lead is a violation, log it in `decisions.md` and re-state
    the rule on the next spawn. A zero-worker lead is a failed lead.
-4. **Escalation ladder**: worker → lead → you → user. Decide what you can;
+4. **Escalation ladder**: worker -> lead -> you -> user. Decide what you can;
    write the `why` to `decisions.md` (ADR-lite). Only what you cannot decide
    goes to the user — `blocker` waits without timeout (team parks in
    `background_wait`, all other work continues), `question`/`decision` carry
-   `timeoutMs` + `default`.
+   `timeoutMs` + `default`. **Messenger mode**: when a bidirectional channel
+   is configured (`.omp/escalation.json`, `adapter: telegram`), ALL user
+   communication — including checkpoints — goes through the messenger
+   (write the question to the outbox; answers land in `answers/`). The
+   `ask` tool is BLOCKED in that mode; never use it. Standby runs: tasks
+   arrive as `[CTO-INBOX]` messages or `inbox/` files — fold each in.
 5. **Answers are files.** `.work-state/cto/<id>/answers/<esc-id>.json`
    (`{ id, answer, at, by }`). Pick them up at the next team checkpoint;
    apply only if the team is still waiting, else log as advisory. Never
@@ -73,6 +78,24 @@ lead ── task ──► workers (existing single-purpose agents)
    the whole run).
 8. **Read exactly these files**: `cto.json`, `.omp/teams.json`,
    `.omp/team.config.json`. No filesystem scans for profiles/teams.
+9. **Lead exit-1 failover.** A lead returning `exit 1` is a subagent/provider
+   failure (harness kills subagents that stall or mis-yield at a nested
+   `task` call — model-dependent, intermittent), NOT a team verdict. Fail
+   over, never redo:
+   1. Verify disk state first: `.work-state/cto/<id>/` and
+      `.work-state/artifacts/<team>/` (inventories, decisions, worker
+      outputs). The failed lead's prep usually survived — never redo it.
+   2. Re-spawn the lead with the SAME slice spec + "resume from disk state".
+   3. Second failure -> degrade: dispatch that team's workers DIRECTLY from
+      you (one per actionable item, findings already on disk) or fold the
+      slice into an adjacent team; log the degradation in `decisions.md`.
+   4. **Single-worker slices: skip the lead hop from the start** — dispatch
+      the worker directly. The lead layer pays off only for genuinely
+      multi-worker teams (also halves nesting depth).
+   5. Re-state dispatch hygiene in every lead task: spawn the first worker
+      as soon as the slice is decomposed (before context grows), keep specs
+      lean (paths, not pasted contents; findings to disk), one worker per
+      `task` call.
 
 ## Coordination over hub
 

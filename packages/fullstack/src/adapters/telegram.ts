@@ -33,6 +33,12 @@ export interface TelegramAdapterOptions {
   cwd: string;
   pollIntervalMs?: number;
   fetchImpl?: typeof fetch;
+  /**
+   * Called for plain messages (not replies to a sent escalation, not
+   * callback queries). Used by the CTO inbox: a plain message to the bot is
+   * a NEW TASK for the standby CTO, routed to `.work-state/cto/<id>/inbox/`.
+   */
+  onPlainMessage?: (msg: { id: string; text: string; at: string }) => void;
 }
 
 interface TgUpdate {
@@ -48,6 +54,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   private readonly cwd: string;
   private readonly pollIntervalMs: number;
   private readonly fetchImpl: typeof fetch;
+  private onPlainMessage: TelegramAdapterOptions["onPlainMessage"];
   private offset = 0;
   private polling = false;
 
@@ -57,6 +64,12 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     this.cwd = options.cwd;
     this.pollIntervalMs = options.pollIntervalMs ?? 5_000;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.onPlainMessage = options.onPlainMessage;
+  }
+
+  /** Set/replace the plain-message (inbox task) handler. */
+  setPlainMessageHandler(handler: NonNullable<TelegramAdapterOptions["onPlainMessage"]>): void {
+    this.onPlainMessage = handler;
   }
 
   private async api(method: string, payload: Record<string, unknown>): Promise<unknown> {
@@ -105,6 +118,16 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     }
   }
 
+  /** Plain text reply (no reply markup) — used by the standalone bridge. */
+  async sendPlainText(target: string, text: string): Promise<{ sent: boolean; channelRef?: string }> {
+    try {
+      await this.api("sendMessage", { chat_id: target, text });
+      return { sent: true };
+    } catch (error) {
+      return { sent: false, channelRef: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   /** Start the long-polling loop (non-blocking); returns a stop function. */
   start(): () => void {
     if (this.polling) return () => undefined;
@@ -144,6 +167,10 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     if (message?.reply_to_message && typeof message.text === "string") {
       const escId = this.escIdOfMessage(message.reply_to_message.message_id);
       if (escId) return { id: escId, answer: message.text, at, by: "telegram:reply" };
+    }
+    // Plain message (no reply target, not a callback) -> CTO inbox task.
+    if (message && typeof message.text === "string" && message.text.trim().length > 0) {
+      this.onPlainMessage?.({ id: `tg:${message.message_id}`, text: message.text, at });
     }
     return null;
   }

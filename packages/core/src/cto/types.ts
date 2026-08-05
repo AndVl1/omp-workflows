@@ -106,11 +106,30 @@ export interface EscalationReceipt {
  * them to `.work-state/cto/<runId>/answers/<esc-id>.json` and the engine /
  * parked agent picks them up at the next checkpoint (durable across
  * restarts and compaction). See `escalation.ts` for the file helpers.
+ *
+ * The inbound surface (`pollOnce` / `setPlainMessageHandler` /
+ * `sendPlainText`) is OPTIONAL — bidirectional channels (telegram today,
+ * any consumer transport) implement it; push-only channels (http) skip it.
+ * The in-session dispatcher and the standalone bridge duck-type on these
+ * methods, so a new transport works the same the moment its adapter
+ * implements them (register it via `registerEscalationAdapter`).
  */
+export interface EscalationInboundMessage {
+  id: string;
+  text: string;
+  at: string;
+}
+
 export interface EscalationAdapter {
   readonly kind: string;
   send(esc: Escalation): Promise<EscalationReceipt>;
   cancel(id: string): Promise<void>;
+  /** One inbound poll round: writes answer files, returns the new answers. */
+  pollOnce?(): Promise<EscalationAnswer[]>;
+  /** Route plain (non-answer) inbound messages — new tasks for the CTO. */
+  setPlainMessageHandler?(handler: (msg: EscalationInboundMessage) => void): void;
+  /** Send a plain text (not an escalation) back to a user target. */
+  sendPlainText?(target: string, text: string): Promise<{ sent: boolean; channelRef?: string }>;
 }
 
 export type EscalationStatus = "pending" | "answered" | "expired" | "cancelled" | "undelivered";

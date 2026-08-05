@@ -24,7 +24,9 @@ import {
 	registerTeamWorkflow,
 } from "@andvl1/omp-workflows-core";
 import { ensureCommandsForSession } from "./copy-commands.js";
-import { createEscalationAdapter, loadEscalationConfig, startDispatcher } from "./adapters/registry.js";
+import { createEscalationAdapter, loadEscalationConfig, startDispatcher, type InboxTask } from "./adapters/registry.js";
+import { createAskRedirectGate } from "./messenger-channel.js";
+import { createCtoModeReminderHandler } from "./cto-mode-reminder.js";
 import {
 	RESEARCH_REQUEST_MARKER_END,
 	RESEARCH_REQUEST_MARKER_START,
@@ -107,6 +109,19 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   // the custom command's return value carries the marker envelope.
   pi.on("before_agent_start", beforeAgentStartMarkerHandler);
 
+  // CTO-mode reminder — fires before EVERY LLM call. While a CTO run is
+  // active (.work-state/cto/), prepend a short steering message restating
+  // the delegation contract (orchestrator -> teams, lead -> workers,
+  // worker -> escalate up). Keeps the discipline in front of the model on
+  // every turn of long autonomous runs (and after compaction), for the
+  // main session and subagents. See cto-mode-reminder.ts.
+  pi.on("context", createCtoModeReminderHandler());
+
+  // Messenger-mode `ask` redirect: while a bidirectional channel (telegram)
+  // AND an active CTO run exist, block the interactive `ask` tool so ALL
+  // user communication goes through the messenger (outbox -> answers/).
+  pi.on("tool_call", createAskRedirectGate());
+
   // Auto-bootstrap OMP custom-TS slash commands into the active project's
   // `.omp/commands/` directory on every session start. OMP's discovery
   // (see `discoverCustomCommands` in @oh-my-pi/pi-coding-agent) only
@@ -128,7 +143,29 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     const config = loadEscalationConfig(cwd);
     if (config) {
       const adapter = createEscalationAdapter(config, cwd);
-      if (adapter) startDispatcher(cwd, adapter, 10_000);
+      if (adapter) {
+        startDispatcher(cwd, adapter, 10_000, {
+          // Wake the CTO session on an inbound task: idle starts a turn,
+          // streaming queues as steer. The [CTO-INBOX] envelope is the
+          // contract the standby/CTO prompt tells the agent to fold in.
+          onTask: (task: InboxTask) => {
+            pi.sendUserMessage(
+              `[CTO-INBOX] New task via messenger (run \`${task.runId ?? "?"}\`):\n${task.text}\n\n` +
+                "Treat this as a /cto task — fold it into the active run (amend discipline: re-plan, " +
+                "spawn leads in parallel, integration covers ALL teams).",
+            );
+          },
+          // Wake on a user-initiated answer (reply / button) so the agent
+          // reacts without waiting for the next checkpoint poll.
+          onAnswer: (answer) => {
+            pi.sendUserMessage(
+              `[CTO-ANSWER] User answered escalation \`${answer.id}\` with: ${answer.answer}\n\n` +
+                `Read \`.work-state/cto/${answer.id.split("/")[0] ?? "?"}/answers/${answer.id.replace(/[^a-zA-Z0-9-_]/g, "-")}.json\` ` +
+                "and apply it now if the waiting team is still parked; otherwise treat it as advisory.",
+            );
+          },
+        });
+      }
     }
   });
 }

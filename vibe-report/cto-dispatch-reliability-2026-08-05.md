@@ -1,0 +1,247 @@
+# CTO-mode subagent dispatch reliability — root cause + fix
+
+Дата: 2026-08-05 · Статус: FIXED (root cause найден, фикс применён, воспроизведение live)
+Автор: main agent (автономно, пользователь спит) · omp: 17.2.8 · Плагин: @andvl1/omp-workflows-fullstack 0.12.0
+
+## TL;DR
+
+«Лиды умирают с exit 1 на вложенном `task`» — это НЕ дефект вложенного диспатча и НЕ
+дефект харнесса. Корень: **роль `modelRoles.task` была закреплена за
+`minimax-code/MiniMax-M3`**, а MiniMax-M3 под тяжёлым контекстом/большой спекой
+интермиттентно ломается в роли сабагента: (1) сталл на nested-`task` — пустые ходы,
+харнесс убивает после 3 idle-reminders; (2) yield с null/пустыми данными; (3) галлюцинация
+мусорных tool-call'ов / утечка `<mm:think>` середи работы. Прямой диспатч из главного
+агента на той же модели падает ТАК ЖЕ (CiFix355) — «lead-layer vs direct» не имеет
+значения, имеет значение модель.
+
+**Фикс: `modelRoles.task` → `opencode-go/deepseek-v4-flash:high`** (host config, бэкап
+`~/.omp/agent/config.yml.bak-cto-dispatch-20260805`) + контракт-хардненинг в репо
+(failover-протокол, dispatch-гигиена). Live-пробы: тяжёлые nested — MiniMax 3/4 ранов
+с отказом сабагента, deepseek 9/9 чистых; суммарно deepseek 0/20 прогонов.
+
+## Evidence из продакшена (pr-watch run, crads-platform, 2026-08-05)
+
+| Агент | Роль | Модель | Исход |
+|---|---|---|---|
+| WatchLead | team-lead | MiniMax-M3 | OK — спавнил воркера (spec 7.8KB) |
+| AiLead | team-lead | MiniMax-M3 | OK — спавнил 3 воркеров (3–5KB) |
+| CiLead | team-lead | MiniMax-M3 | **exit 1** на 10m08s — сталл при 2-м диспатче (текст без tool-call, idle-reminders) |
+| CiLead2 | team-lead | MiniMax-M3 | **exit 1** на 2m09s — сталл при 1-м диспатче (7 мин тишины → dispose) |
+| CiFix355 | devops (прямой диспатч CTO) | MiniMax-M3 | **exit 1** середи работы — галлюцинация: `<mm:think>` + мусорный `curl https://ima.qq.com/...` вместо правки |
+| CiFix355b | devops (прямой диспатч) | MiniMax-M3 | OK (после респавна) |
+
+Все 4 лида — на одном провайдере (MiniMax-M3), успешные и упавшие. Решение CTO по ходу
+рана зафиксировано в `.work-state/cto/pr-watch/decisions.md` (2026-08-05 запись):
+«do NOT re-spawn leads for single-worker slices; CTO dispatches fix workers directly».
+Этот вывод частично верен (гигиена), но root cause не в слое лида — прямой воркер
+CiFix355 упал так же.
+
+## Live-эксперименты (omp 17.2.8, /tmp/cto-dispatch-exp)
+
+Пробник: main → task(lead) → task(worker). Воркер пишет маркер-файл + yield.
+- **Простой пробник** (маленькая спека, лёгкий контекст): MiniMax-лиды 1/9 отказов
+  (lead «yield with null data»), deepseek 0/7. Маленькая нагрузка — слабый сигнал.
+- **Тяжёлый пробник** (лид читает 2×94KB файлов, затем спавнит воркера со спекой 5KB —
+  зеркалит реальный CiLead-сценарий):
+  - **MiniMax (HA)**: 3/4 ранов с отказом сабагента.
+    - h1: `Subagent exited without calling yield tool after 3 reminders` — сталл, маркер НЕ создан (точное воспроизведение CiLead).
+    - h2: лид failed (вывод «{»), воркер успел (маркер есть).
+    - h3: лид completed, но воркер — `yield result stayed empty after 4 consecutive attempts`.
+    - h4: чистый прогон.
+  - **deepseek (HB+HC+HD)**: 9/9 чистых (лид completed, воркер completed, маркер есть).
+  - **direct** (HE MiniMax / HF deepseek, воркер с лёгким контекстом): 4/4 чистых —
+    сталл-риск концентрируется на лиде (тяжёлый контекст + большая спека), прямой воркер
+    с лёгким контекстом выживает даже на MiniMax.
+
+Транскрипт сталла (h1-HA1 LeadProbe.jsonl, хвост):
+```
+reminder 1 of 3 → assistant: (пусто) → assistant: (пусто)
+reminder 2 of 3 → assistant: (пусто)
+reminder 3 of 3 → assistant: (пусто) → session_exit
+```
+Точь-в-точь паттерн CiLead2 (текст-без-tool-call → idle-reminders → kill).
+
+## Механика (harness source, bundled omp 17.2.8)
+
+- Сабагенты — in-process сессии (`sN`/`Sl`); nested `task` вызывает ту же функцию рекурсивно.
+- Глубина: main=0, lead=1, worker=2; `task.maxRecursionDepth` по умолчанию 2 — лид имеет
+  `task`, воркер нет. Механика диспатча не ломается.
+- Модель сабагента: `modelRoles.task` (lead: `@team-lead` → `@task` → `task` role; worker:
+  `@task` → `task` role). `task.agentModelOverrides` в overlay-конфиге на 17.2.8 НЕ
+  применился (проверено эмпирически: лид остался MiniMax) — полагаться на него нельзя.
+- Точки отказа — на стороне модели: пустой/текстовый ход без tool-call (сталл → kill),
+  yield c null/empty (ретраи → abort), мусорный `<tool_call>` в тексте (не исполняется,
+  агент сходит с рельс).
+
+## Решение (применено)
+
+1. **Host config (root cause)**: `~/.omp/agent/config.yml` `modelRoles.task`:
+   `minimax-code/MiniMax-M3:high` → `opencode-go/deepseek-v4-flash:high`.
+   Бэкап: `config.yml.bak-cto-dispatch-20260805`. Влияет на ВСЕ сабагенты всех проектов
+   пользователя (лиды, воркеры, task-роль). `plan/smol/slow` остались на MiniMax.
+   Откат: восстановить бэкап.
+2. **Контракт `/cto`** (core `packages/core/src/commands/cto.ts` + fullstack-копия
+   `packages/fullstack/commands/cto/_lib/cto.ts` + `.omp/commands/cto/_lib/cto.ts`):
+   новый блок «Subagent dispatch reliability (lead exit-1 protocol)»:
+   1) verify disk state first (никогда не редоить инвентаризацию); 2) респавн лида с ТОЙ ЖЕ
+   спекой («resume from disk»); 3) второй отказ → degrade: воркеры напрямую из CTO или
+   слияние слайса; 4) single-worker слайсы — без лида сразу; 5) dispatch-гигиена лидов.
+3. **Агенты**: `packages/fullstack/agents/cto.md` (rule 9 — failover + degrade + direct
+   для single-worker) и `packages/fullstack/agents/team-lead.md` (rule 2 — dispatch-гигиена:
+   спавнить рано, спеки по путям, findings на диск, один воркер на вызов; recovery воркера:
+   проверка артефактов на диске → респавн с той же спекой).
+4. **Тесты**: +1 в core (`cto-command.test.ts`) и +1 в fullstack — assert нового блока
+   контракта. 255/255 зелёные (было 253).
+5. **CHANGELOG**: запись 0.12.1.
+
+## Выводы / рекомендации
+
+- **Главный фикс — конфиг, не код.** Пин `task`-роли на надёжного провайдера (deepseek).
+  MiniMax-M3 можно оставить для plan/slow (оркестрация поверх, не сабагенты).
+- «Прямой диспатч вместо лида» — полезная гигиена (меньше хопов, меньше шансов на сталл),
+  но НЕ фикс: CiFix355 (direct, MiniMax) упал так же. Не переоценивать (старая lesson
+  запись в памяти частично неверна — обновлена).
+- Следить: если deepseek-v4-flash в task-роли начнёт сталлить на очень больших спеку/
+  контексте — вернуться к измерению. Спеки >10KB + контекст >200KB — зона риска для любой
+  модели: контракт уже требует findings на диск, не в спек.
+
+## Артефакты
+
+- Эксперименты: `/tmp/cto-dispatch-exp/` (runs/, matrix-results.tsv, heavy-results.tsv,
+  конфиги-оверлеи, run-probe.sh / run-heavy.sh).
+- Продакшен-транскрипты: `~/.omp/agent/sessions/home-crads-platform-…/2026-08-04T22-37-27-820Z…/`
+  (CiLead.jsonl, CiLead2.jsonl, WatchLead.jsonl, AiLead.jsonl, CiFix355.jsonl, CiFix355b.jsonl).
+- Решение CTO: `.work-state/cto/pr-watch/decisions.md` (запись 2026-08-05).
+- Бэкап конфига: `~/.omp/agent/config.yml.bak-cto-dispatch-20260805`.
+
+---
+
+# Дополнение: CTO-mode напоминалка (per-turn delegation reminder)
+
+## Запрос
+
+«Можно ли в CTO mode на каждое сообщение оставлять напоминалку, что мы в CTO
+и проблемы надо делегировать в команды?»
+
+## Да — реализовано через `context`-хук
+
+Механизм (проверен live, omp 17.2.8, `/tmp/hook-probe/`):
+- **`context`-событие стреляет перед КАЖДЫМ LLM-вызовом** — каждый ход главной
+  сессии и сабагентов (probe 1: события на ходах 0,1,2 + в сессии воркера).
+- Контракт результата: `{ messages: [...] }` (голый массив харнесс отбрасывает —
+  probe 5, «SAW=yes» только после фикса контракта).
+- Steering-сообщение (`role:"user", steering:true`) харнесс оборачивает в
+  `<system-notice>` с приоритетом и потребляет per-turn (эфемерно — каждый ход
+  инжектится заново; probe 6/7: INJECT на обоих ходах, доставка подтверждена).
+- Детерминированная проверка доставки (probe 12, префикс-требование): W1 (полная
+  factory плагина) / W2 / W3 — доставлено во всех конфигурациях. Ранние «SAW=no»
+  были артефактами пробы: модель педантично искала «CTO MODE ACTIVE» с пробелами,
+  а токен `[CTO-MODE-ACTIVE]` содержит дефисы (W3-run3 модель сама объяснила это).
+
+Реализация:
+- `packages/fullstack/src/cto-mode-reminder.ts` — детекция активного рана
+  (core `findActiveCtoRun`, кэш 10с), текст напоминалки (~70 токенов), инжект с
+  dedupe, никогда не бросает.
+- `packages/fullstack/src/index.ts` — `pi.on("context", createCtoModeReminderHandler())`.
+- 7 юнит-тестов; суммарно 262/262 зелёные (было 255).
+
+Текст напоминалки (роль-агностичен — безопасен для CTO, лидов и воркеров):
+```
+[CTO-MODE-ACTIVE] A CTO sub-orchestration run is ACTIVE in this workspace (run `<id>`: <task>).
+You are part of that run. DELEGATE, do not absorb:
+- Orchestrator (the CTO): decompose and delegate problems to teams via `task`; never code or patch yourself.
+- Team lead: every slice goes to a worker via `task`; escalate what you cannot decide to the CTO.
+- Worker: complete your single task; escalate blockers to your lead; never re-delegate or expand scope.
+```
+
+Стоимость: ~70 токенов на LLM-вызов пока раунд активен; ноль накладных без
+активного рана. Покрывает и ходы после компактификации (напоминалка впрыскивается
+заново на первом же вызове после compaction).
+
+## Активация
+
+Фича входит в `@andvl1/omp-workflows-fullstack` (src + dist) — вступит в силу
+после пересборки/переустановки плагина (репозиторий уже содержит код; установленный
+в `~/.omp/plugins` 0.12.0 пока без неё). Локально проверялось через
+`omp -e <repo>/packages/fullstack/dist/index.js`.
+
+---
+
+# Дополнение 2: CTO STANDBY (задачи через Telegram) + весь диалог через мессенджер
+
+## Запросы
+1. «Включаю cto mode без явной задачи и потом накидываю через телегу, чтобы он запускал команды разработки»
+2. «Если настроен мессенджер с обратной связью (не чисто пуши) — всё общение с пользователем уносить туда, даже вместо ask tool»
+
+## Ответ: да, работает — реализовано и проверено live
+
+### 1. CTO STANDBY + задачи через мессенджер
+
+Флоу (live-проверен на omp 17.2.8, интерактивная PTY-сессия, `/tmp/cto-standby-live`):
+```
+/cto (без задачи) → standby-промпт (buildStandbyCtoPrompt)
+  → агент пишет .work-state/cto/standby-<id>/state.json (run активен)
+  → yield и ждёт (сессия idle)
+сообщение в Telegram (plain, не reply) / файл в .omp/inbox/
+  → диспетчер (session_start, 10с поллинг) → run-инбокс + sendUserMessage("[CTO-INBOX] ...")
+  → idle-сессия просыпается («idle starts a turn») → агент сворачивает задачу (amend-дисциплина)
+```
+
+Live-транскрипт подтверждает каждый шаг:
+- `Standby run persisted... then yielding.` → state.json на диске
+- `[CTO-INBOX] New task via messenger (run standby-20260805-085938): Add a hello endpoint to the backend (Kotlin)`
+- `Task received. Folding into run ... First, reading the amend contract text...` → декомпозиция пошла
+
+Механика:
+- `TelegramEscalationAdapter`: plain-сообщения (не reply/не callback) → `onPlainMessage` (было: игнорировались). Заодно починен латентный баг: `pollOnce()` (long-poll ответов) никогда не вызывался из диспетчера — ответы в проде не приходили.
+- `startDispatcher(root, adapter, intervalMs, { onTask })`: поллит локальный дроп `.omp/inbox/*.json` + telegram (ответы + задачи); новые задачи → `handleInboxTask` (идемпотентно, `wx`) → wake через `pi.sendUserMessage`.
+- Нет активного рана → `ensureStandbyRun` создаёт standby-ран (state.json), задача кладётся туда.
+- `sendUserMessage` без deliverAs: idle → стартует ход (доказано live).
+
+### 2. Весь диалог через мессенджер вместо ask
+
+- `/cto`-промпт (core + fullstack копии) рендерит `renderChannelSection(cwd)` из `.omp/escalation.json`:
+  - `telegram` (двусторонний): ВСЕ вопросы пользователю — через outbox → answers/; `ask` ЗАБЛОКИРОВАН.
+  - `http` (push-only): ask остаётся для интерактивных чекпоинтов.
+  - нет канала: ask.
+- `createAskRedirectGate()` — `tool_call`-хук: блокирует `ask`, когда telegram-канал И активный CTO-ран (вне рана ask работает — обычная интерактивная работа не страдает). Причина блокировки возвращается LLM (outbox-контракт).
+- cto.md (rule 4) и team-lead.md (rule 3) обновлены.
+
+## Активация
+Код в репозитории (ветка fix/cto-dispatch-reliability, запушено). Для прода: пересборка/переустановка `@andvl1/omp-workflows-fullstack` (установленный 0.12.0 пока старый) + `.omp/escalation.json` с `adapter: telegram` (token/chatId) + запуск `/cto` без задачи в интерактивной сессии, которую оставляем открытой. Telegram-бот должен иметь доступ к чату; ответы на эскалации — reply'ем или кнопкой; новые задачи — обычным сообщением.
+
+## Ограничения
+- Wake работает только пока сессия CTO жива (интерактивная, idle). Закрытая сессия не получит wake — задача ждёт в инбоксе и подхватится при следующем старте (промпт standby велит проверить inbox/).
+- Несколько сессий в одном проекте → несколько диспетчеров; дубликаты задач отсекаются `wx`-идемпотентностью (первый победитель).
+- `ask`-гейт срабатывает только при активном CTO-ране (по замыслу).
+
+---
+
+# Дополнение 3: реакция агента на инициативу ЮЗЕРА в канале
+
+## Ответ на вопрос
+
+Да — агент реагирует на все три формы инициативы юзера в канале связи. До этого
+витка был пробел: ответы юзера на эскалации (reply/кнопка) только писались в
+`answers/`, но НЕ будили агента — реакция происходила лишь на следующем чекпоинте
+(в idle/standby-сессии — вообще никак). Закрыто.
+
+| Инициатива юзера | Механизм | Реакция агента |
+|---|---|---|
+| Reply на эскалацию / кнопка | answer-файл + **`[CTO-ANSWER]` wake** (новое) | применяет ответ сразу (или advisory, если поздно) |
+| Plain-сообщение (новая задача) | inbox-файл + `[CTO-INBOX]` wake | сворачивает задачу (amend-дисциплина) |
+| Файл в `.omp/inbox/` | то же | то же |
+| Задача пришла, пока сессии не было | ждёт в `inbox/` | подхват при следующем `/cto` (промпты new+amend велят проверить inbox/) |
+
+Live-проверено ранее: `[CTO-INBOX]` wake будит idle-сессию (sendUserMessage,
+«idle starts a turn»). `[CTO-ANSWER]` использует тот же механизм.
+
+Ограничения (честно):
+- Wake требует ЖИВОЙ сессии. Мёртвая сессия не проснётся; ответ/задача ждут на
+  диске и применяются при следующем старте CTO-сессии.
+- Несколько живых сессий в одном проекте → несколько диспетчеров могут
+  продублировать wake (для задач wx-идемпотентность исключает двойную запись;
+  для ответов — per-dispatcher dedupe; кросс-сессионный дубль приемлем: вторая
+  сессия трактует ответ как advisory).
+- Plain-сообщение трактуется как задача (даже «привет» или комментарий) — CTO
+  разберётся по контексту; это by design.
