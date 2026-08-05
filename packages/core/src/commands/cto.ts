@@ -81,13 +81,15 @@ function renderTeamsTable(cwd: string): string {
  */
 export function renderChannelSection(cwd: string): string {
   let adapter: string | null = null;
+  let bidirectional = false;
   try {
-    const raw = JSON.parse(readFileSync(join(cwd, ".omp", "escalation.json"), "utf8")) as { adapter?: string };
+    const raw = JSON.parse(readFileSync(join(cwd, ".omp", "escalation.json"), "utf8")) as { adapter?: string; bidirectional?: boolean };
     if (typeof raw?.adapter === "string") adapter = raw.adapter;
+    if (raw?.bidirectional === true) bidirectional = true;
   } catch {
     // missing/malformed — no channel
   }
-  if (adapter === "telegram") {
+  if (adapter === "telegram" || bidirectional) {
     return [
       "### User channel (messenger, BIDIRECTIONAL)",
       "A messenger channel with feedback is configured. ALL user communication goes through it:",

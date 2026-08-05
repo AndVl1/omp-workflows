@@ -34,9 +34,13 @@ import { HttpEscalationAdapter } from "./http.js";
 import { TelegramEscalationAdapter } from "./telegram.js";
 
 export interface EscalationConfig {
-  adapter: "http" | "telegram";
+  adapter: string;
+  /** True when the channel can receive user replies (bidirectional). */
+  bidirectional?: boolean;
   http?: { url: string; headers?: Record<string, string> };
   telegram?: { token: string; chatId: string; pollIntervalMs?: number };
+  /** Transport-specific config for consumer-registered adapters. */
+  [transport: string]: unknown;
 }
 
 /** Run id is the first segment of the escalation correlation id. */
@@ -48,11 +52,41 @@ export function outboxDir(runId: string, root: string): string {
   return join(ctoStateDir(runId, root), "outbox");
 }
 
+/** Adapter factory for a transport kind (built-in or consumer-registered). */
+export type EscalationAdapterFactory = (config: EscalationConfig, cwd: string) => EscalationAdapter | null;
+
+const adapterFactories = new Map<string, EscalationAdapterFactory>([
+  ["http", (config) => (config.http?.url ? new HttpEscalationAdapter({ url: config.http.url, headers: config.http.headers }) : null)],
+  [
+    "telegram",
+    (config, cwd) =>
+      config.telegram?.token && config.telegram.chatId
+        ? new TelegramEscalationAdapter({
+            token: config.telegram.token,
+            chatId: config.telegram.chatId,
+            cwd,
+            pollIntervalMs: config.telegram.pollIntervalMs ?? 5_000,
+          })
+        : null,
+  ],
+]);
+
+/**
+ * Register a consumer transport adapter (e.g. slack, whatsapp, signal) so the
+ * in-session dispatcher and the standalone bridge can create it from
+ * `.omp/escalation.json` like any built-in. Implement the optional inbound
+ * surface (pollOnce / setPlainMessageHandler / sendPlainText) for the same
+ * bidirectional behavior as telegram.
+ */
+export function registerEscalationAdapter(kind: string, factory: EscalationAdapterFactory): void {
+  adapterFactories.set(kind, factory);
+}
+
 /** Read `.omp/escalation.json`; missing/malformed -> null. */
 export function loadEscalationConfig(cwd: string): EscalationConfig | null {
   try {
     const raw = JSON.parse(readFileSync(join(cwd, ".omp", "escalation.json"), "utf8")) as EscalationConfig;
-    if (raw.adapter !== "http" && raw.adapter !== "telegram") return null;
+    if (typeof raw.adapter !== "string" || raw.adapter.length === 0) return null;
     return raw;
   } catch {
     return null;
@@ -61,20 +95,23 @@ export function loadEscalationConfig(cwd: string): EscalationConfig | null {
 
 /** Build the configured adapter; null when the config is unusable. */
 export function createEscalationAdapter(config: EscalationConfig, cwd: string): EscalationAdapter | null {
-  if (config.adapter === "http") {
-    if (!config.http?.url) return null;
-    return new HttpEscalationAdapter({ url: config.http.url, headers: config.http.headers });
+  const factory = adapterFactories.get(config.adapter);
+  if (!factory) return null;
+  try {
+    return factory(config, cwd);
+  } catch {
+    return null;
   }
-  if (config.adapter === "telegram") {
-    if (!config.telegram?.token || !config.telegram.chatId) return null;
-    return new TelegramEscalationAdapter({
-      token: config.telegram.token,
-      chatId: config.telegram.chatId,
-      cwd,
-      pollIntervalMs: config.telegram.pollIntervalMs ?? 5_000,
-    });
-  }
-  return null;
+}
+
+/**
+ * True when the configured channel can receive user-initiated replies
+ * (telegram today, or any transport explicitly marked bidirectional).
+ */
+export function isBidirectionalChannel(cwd: string): boolean {
+  const config = loadEscalationConfig(cwd);
+  if (!config) return false;
+  return config.adapter === "telegram" || config.bidirectional === true;
 }
 
 /**
@@ -201,14 +238,14 @@ export function localInboxDrop(root: string): string {
 // ── Bridge ownership (one getUpdates consumer per bot token) ───────────────
 
 /**
- * Lock file the tg-bridge daemon writes on start and removes on exit.
+ * Lock file the standalone bridge daemon writes on start and removes on exit.
  * The in-session dispatcher checks it: while the bridge is alive it owns the
  * bot's getUpdates, so the session must NOT long-poll telegram itself — it
  * only picks up the bridge's files from the drop. Without the bridge the
  * session polls telegram directly. Stale lock (dead pid) is ignored.
  */
 export function bridgeLockPath(root: string): string {
-  return join(root, ".omp", "tg-bridge.lock");
+  return join(root, ".omp", "bridge.lock");
 }
 
 /** True when a live tg-bridge owns the bot for this project. */

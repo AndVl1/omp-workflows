@@ -118,6 +118,16 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     }
   }
 
+  /** Plain text reply (no reply markup) — used by the standalone bridge. */
+  async sendPlainText(target: string, text: string): Promise<{ sent: boolean; channelRef?: string }> {
+    try {
+      await this.api("sendMessage", { chat_id: target, text });
+      return { sent: true };
+    } catch (error) {
+      return { sent: false, channelRef: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   /** Start the long-polling loop (non-blocking); returns a stop function. */
   start(): () => void {
     if (this.polling) return () => undefined;

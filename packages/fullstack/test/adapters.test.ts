@@ -28,6 +28,8 @@ import {
   isBridgeAlive,
   writeBridgeLock,
   clearBridgeLock,
+  registerEscalationAdapter,
+  isBidirectionalChannel,
 } from "../src/adapters/registry.js";
 import {
   loadEscalationConfig,
@@ -416,6 +418,71 @@ test("adapters: pollInbox wakes [CTO-ANSWER] from a bridge answer marker", async
     assert.equal(answers.length, 1, "answer marker woke the session");
     assert.equal(answers[0]?.answer, "use grpc");
     assert.ok(existsSync(join(drop, "processed", "esc-1.json")), "marker moved to processed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("adapters: consumer transport registers and builds like a built-in", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-reg-"));
+  try {
+    registerEscalationAdapter("slack", (config) => {
+      if (!config.slack?.token) return null;
+      return {
+        kind: "slack",
+        send: async () => ({ sent: true }),
+        cancel: async () => undefined,
+        pollOnce: async () => [],
+      };
+    });
+    // built via the same factory path as http/telegram
+    const config = loadEscalationConfig(root);
+    assert.equal(config, null);
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(
+      join(root, ".omp", "escalation.json"),
+      JSON.stringify({ adapter: "slack", bidirectional: true, slack: { token: "x" } }),
+    );
+    const adapter = createEscalationAdapter(loadEscalationConfig(root)!, root);
+    assert.equal(adapter?.kind, "slack", "consumer adapter created from config");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: bidirectional detected by flag for non-telegram transports", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-bi-"));
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "slack", bidirectional: true }));
+    assert.equal(isBidirectionalChannel(root), true, "bidirectional flag -> bidirectional");
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "http", bidirectional: false }));
+    assert.equal(isBidirectionalChannel(root), false, "http without flag -> push-only");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: telegram sendPlainText posts plain text without markup", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-plain-"));
+  try {
+    let payload: Record<string, unknown> | null = null;
+    const fetchImpl = (async (url: unknown, init: unknown) => {
+      const method = String(url).split("/").pop();
+      if (method === "sendMessage") {
+        payload = JSON.parse((init as { body: string }).body) as Record<string, unknown>;
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), { status: 200 });
+      }
+      throw new Error(`unexpected method: ${method}`);
+    }) as typeof fetch;
+
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "c", cwd: root, fetchImpl });
+    const result = await adapter.sendPlainText("c", "status reply");
+    assert.equal(result.sent, true);
+    assert.equal(payload?.chat_id, "c");
+    assert.equal(payload?.text, "status reply");
+    assert.equal("reply_markup" in (payload ?? {}), false, "plain text, no reply markup");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

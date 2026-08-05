@@ -132,6 +132,12 @@ test("cto-cmd: renderChannelSection reflects .omp/escalation.json", () => {
     const http = renderChannelSection(root);
     assert.ok(http.includes("push-only"), "http is push-only");
     assert.ok(http.includes("Use `ask`"), "http keeps ask");
+
+    // consumer bidirectional transport (flag) -> messenger mode like telegram
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "slack", bidirectional: true }));
+    const slack = renderChannelSection(root);
+    assert.ok(slack.includes("BIDIRECTIONAL"), "bidirectional flag enables messenger mode");
+    assert.ok(slack.includes("NEVER use the `ask` tool"), "ask banned for any bidirectional transport");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

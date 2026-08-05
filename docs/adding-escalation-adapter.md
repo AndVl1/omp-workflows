@@ -115,3 +115,36 @@ writeFileSync(join(dir, `${escId.replace(/[^\w-]/g, "-")}.json`),
   (`background_wait`), остальные работают. Канал — fire-and-forget + файлы.
 - Контракт глубины: эскалацию инициирует главный агент (CTO) или лид —
   воркеры эскалаций не шлют.
+
+## 6. Двусторонний канал: входящий контракт (работает как telegram)
+
+Чтобы кастомный мессенджер вёл себя **так же** (мост/диспетчер слушают,
+задачи/ответы будят CTO), адаптер должен реализовать опциональный входящий
+контракт (`EscalationAdapter` в `@andvl1/omp-workflows-core`):
+
+```ts
+pollOnce?(): Promise<EscalationAnswer[]>;                     // 1 раунд приёма: пишет answers/, возвращает новые
+setPlainMessageHandler?(h: (m: { id; text; at }) => void): void;  // обычные сообщения -> задачи CTO
+sendPlainText?(target: string, text: string): Promise<{ sent: boolean }>;  // ответ юзеру без reply-разметки
+```
+
+Встроенные `startDispatcher`/`pollInbox` и standalone-мост duck-type'ят эти
+методы — новый транспорт подхватывается автоматически. Конфиг:
+
+```json
+{ "adapter": "slack", "bidirectional": true, "slack": { "token": "…" } }
+```
+
+- `bidirectional: true` (или `adapter: "telegram"`) включает messenger-режим:
+  `/cto`-промпт рендерит «BIDIRECTIONAL», `ask`-гейт блокирует `ask` при
+  активном ране, все вопросы идут через outbox → answers.
+- Реестр: `registerEscalationAdapter("slack", (config, cwd) => adapter)` —
+  фабрика, как у встроенных http/telegram; `createEscalationAdapter` и мост
+  используют её.
+- Мост (standalone, вне omp-сессии): `bin/tg-bridge.mjs` работает с любым
+  зарегистрированным транспортом (отправка через `adapter.sendPlainText`;
+  без него мост логирует «transport has no sendPlainText»). Lock-файл
+  `.omp/bridge.lock` — один потребитель канала: пока мост жив, сессия не
+  поллит сама, только читает его файлы из `.omp/inbox/`.
+- Полный двусторонний референс — `telegram.ts` (send + getUpdates + mapping +
+  plain → inbox); push-only референс — `http.ts`.

@@ -35,7 +35,6 @@ import {
 } from "../dist/adapters/registry.js";
 import {
   classifyIncoming,
-  sendTelegramText,
   writeAnswerMarker,
 } from "../dist/telegram-bridge.js";
 
@@ -64,10 +63,12 @@ adapter.setPlainMessageHandler((msg) => {
     if (replied.has(msg.id)) return;
     replied.add(msg.id);
     const result = classifyIncoming(cwd, msg);
-    if (result.reply) {
-      sendTelegramText(token, chatId, result.reply).then((ok) => {
-        console.log(`tg-bridge: replied to ${msg.id} (${result.action}) ok=${ok}`);
+    if (result.reply && typeof adapter.sendPlainText === "function") {
+      adapter.sendPlainText(chatId, result.reply).then((ok) => {
+        console.log(`tg-bridge: replied to ${msg.id} (${result.action}) ok=${ok.sent}`);
       });
+    } else if (result.reply) {
+      console.error(`tg-bridge: transport '${adapter.kind}' has no sendPlainText — cannot reply to ${msg.id}`);
     } else {
       console.log(`tg-bridge: filed ${msg.id} as ${result.action} -> ${result.filedPath ?? "?"}`);
     }

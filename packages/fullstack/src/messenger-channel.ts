@@ -17,6 +17,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { findActiveCtoRun } from "@andvl1/omp-workflows-core";
+import { isBidirectionalChannel } from "./adapters/registry.js";
 
 export type ChannelMode = "telegram" | "http" | null;
 
@@ -44,6 +45,8 @@ export function clearChannelCache(): void {
   cache.clear();
 }
 
+export { isBidirectionalChannel } from "./adapters/registry.js";
+
 /**
  * `tool_call` hook: block the `ask` tool when a bidirectional channel is
  * configured AND a CTO run is active. The `reason` is returned to the LLM,
@@ -56,7 +59,7 @@ export function createAskRedirectGate(): (
   return (event, ctx) => {
     try {
       if (event?.toolName !== "ask") return undefined;
-      if (channelMode(ctx.cwd) !== "telegram") return undefined;
+      if (!isBidirectionalChannel(ctx.cwd)) return undefined;
       if (!findActiveCtoRun(ctx.cwd)) return undefined;
       return {
         block: true,
