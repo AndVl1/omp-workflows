@@ -124,10 +124,12 @@ test("fullstack: issue=#N is stripped into the prompt metadata", async () => {
 	assert.ok(!result.includes("issue=#7"), "raw issue token stripped from the task");
 });
 
-test("fullstack: usage hint on empty args", async () => {
+test("fullstack: empty args start CTO STANDBY", async () => {
 	const cmd = ctoFactory(fakeApi as never);
 	const result = await cmd.execute([], fakeCtx as never);
-	assert.ok(result.includes("Usage: /cto"), "usage hint on empty args");
+	assert.ok(result.includes("/cto STANDBY"), "empty args start standby mode");
+	assert.ok(result.includes("[CTO-INBOX]"), "standby documents the wake envelope");
+	assert.ok(result.includes("awaiting inbox tasks"), "standby names the inbox contract");
 });
 
 test("fullstack: parseEnvelope falls back to branch=null outside a git work tree", () => {
@@ -218,7 +220,7 @@ test("fullstack: findActiveCtoRun falls back to markdown state (br-5ql)", () => 
 test("fullstack: buildAmendPrompt renders the amend contract", () => {
 	const root = mkdtempSync(join(tmpdir(), "cto-cmd-amendp-"));
 	try {
-		const prompt = buildAmendPrompt(parseEnvelope("Task B", root), {
+		const prompt = buildAmendPrompt(parseEnvelope("Task B", root), root, {
 			runId: "run-1",
 			state: {
 				plan: { created_at: "2026-08-04T10:00:00.000Z" },
@@ -230,6 +232,25 @@ test("fullstack: buildAmendPrompt renders the amend contract", () => {
 		assert.ok(prompt.includes("/cto AMEND"));
 		assert.ok(prompt.includes("Run: `run-1`"));
 		assert.ok(prompt.includes("Integration covers ALL teams"));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+
+test("fullstack: /cto prompt embeds the channel section from .omp/escalation.json", () => {
+	const root = mkdtempSync(join(tmpdir(), "cto-cmd-chan-"));
+	try {
+		const noChannel = buildCtoPrompt(parseEnvelope("Add OAuth", root), root);
+		assert.ok(noChannel.includes("User channel (none)"), "no-channel hint rendered");
+		mkdirSync(join(root, ".omp"), { recursive: true });
+		writeFileSync(
+			join(root, ".omp", "escalation.json"),
+			JSON.stringify({ adapter: "telegram", telegram: { token: "t", chatId: "c" } }),
+		);
+		const withChannel = buildCtoPrompt(parseEnvelope("Add OAuth", root), root);
+		assert.ok(withChannel.includes("BIDIRECTIONAL"), "telegram rendered as bidirectional");
+		assert.ok(withChannel.includes("NEVER use the `ask` tool"), "ask banned in messenger mode");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

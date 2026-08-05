@@ -19,7 +19,7 @@
  *   }
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   ctoStateDir,
@@ -29,6 +29,7 @@ import {
   type EscalationAdapter,
   type EscalationReceipt,
 } from "@andvl1/omp-workflows-core";
+import { findActiveCtoRun } from "@andvl1/omp-workflows-core";
 import { HttpEscalationAdapter } from "./http.js";
 import { TelegramEscalationAdapter } from "./telegram.js";
 
@@ -83,9 +84,10 @@ export function createEscalationAdapter(config: EscalationConfig, cwd: string): 
  */
 export async function drainOutbox(
   root: string,
-  adapter: EscalationAdapter,
+  adapter: EscalationAdapter | null,
   maxRetries = 3,
 ): Promise<Array<{ escId: string; sent: boolean; error?: string }>> {
+  if (!adapter) return [];
   const results: Array<{ escId: string; sent: boolean; error?: string }> = [];
   const runsDir = join(root, ".work-state", "cto");
   if (!existsSync(runsDir)) return results;
@@ -138,11 +140,150 @@ async function sendWithRetry(adapter: EscalationAdapter, esc: Escalation, maxRet
 }
 
 /** Start the dispatcher loop; returns a stop function. */
-export function startDispatcher(root: string, adapter: EscalationAdapter, intervalMs = 10_000): () => void {
-  const timer = setInterval(() => {
+export function startDispatcher(
+  root: string,
+  adapter: EscalationAdapter | null,
+  intervalMs = 10_000,
+  opts: DispatcherOptions = {},
+): () => void {
+  const { onTask } = opts;
+  const inboxHandler = (task: InboxTask) => handleInboxTask(root, task, onTask);
+  if (adapter && typeof (adapter as unknown as { setPlainMessageHandler?: unknown }).setPlainMessageHandler === "function") {
+    (adapter as unknown as { setPlainMessageHandler: (h: (t: InboxTask) => void) => void }).setPlainMessageHandler(inboxHandler);
+  }
+  const tick = (): void => {
     void drainOutbox(root, adapter).catch(() => undefined);
-  }, intervalMs);
+    void pollInbox(root, adapter, onTask).catch(() => undefined);
+  };
+  const timer = setInterval(tick, intervalMs);
   // Drain once immediately on start (survives restarts — R7).
-  void drainOutbox(root, adapter).catch(() => undefined);
+  tick();
   return () => clearInterval(timer);
+}
+
+// ── CTO task inbox ─────────────────────────────────────────────────────────
+
+/** A task arriving from the messenger or the local drop. */
+export interface InboxTask {
+  id: string;
+  text: string;
+  at: string;
+  by?: string;
+  /** Resolved run id the task was filed under. */
+  runId?: string;
+}
+
+export interface DispatcherOptions {
+  /** Called once per new inbox task (after the inbox file is written). */
+  onTask?: (task: InboxTask) => void;
+}
+
+/** `.work-state/cto/<runId>/inbox/` — tasks the CTO reads at checkpoints. */
+export function inboxDir(runId: string, root: string): string {
+  return join(ctoStateDir(runId, root), "inbox");
+}
+
+/** Local task drop: `<root>/.omp/inbox/*.json` ({ id, text, by? }). */
+export function localInboxDrop(root: string): string {
+  return join(root, ".omp", "inbox");
+}
+
+/**
+ * Resolve the run an inbox task belongs to: the active CTO run when there is
+ * one, otherwise create a standby run (id `standby-<ts>`) so the task has a
+ * home and the run becomes active.
+ */
+export function resolveInboxRunId(root: string): string {
+  const active = findActiveCtoRun(root);
+  if (active) return active.runId;
+  return ensureStandbyRun(root);
+}
+
+/** Create a minimal standby run state.json; returns its run id. */
+export function ensureStandbyRun(root: string): string {
+  const runId = `standby-${Date.now()}`;
+  const runDir = ctoStateDir(runId, root);
+  mkdirSync(runDir, { recursive: true });
+  const now = new Date().toISOString();
+  const state = {
+    schema: 1,
+    id: runId,
+    task: "standby — awaiting inbox tasks",
+    branch: "",
+    autonomous: true,
+    plan: { id: runId, task: "standby — awaiting inbox tasks", teams: [], created_at: now },
+    teams: [],
+    integration: { status: "pending" },
+    pause: { kind: "none", reason: "standby" },
+    updated_at: now,
+  };
+  writeFileSync(join(runDir, "state.json"), JSON.stringify(state, null, 2));
+  return runId;
+}
+
+/**
+ * Write an inbox task file (idempotent — `wx`: the first dispatcher wins,
+ * duplicates across sessions are dropped) and wake the CTO session.
+ */
+export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: InboxTask) => void): string | null {
+  try {
+    const runId = task.runId ?? resolveInboxRunId(root);
+    const dir = inboxDir(runId, root);
+    mkdirSync(dir, { recursive: true });
+    const fileName = `${task.id.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`;
+    const path = join(dir, fileName);
+    writeFileSync(path, JSON.stringify({ ...task, runId }, null, 2), { flag: "wx" });
+    onTask?.({ ...task, runId });
+    return path;
+  } catch {
+    return null; // already exists (another dispatcher won) or IO error — skip
+  }
+}
+
+/**
+ * Poll all inbox sources:
+ *  1. local drop `<root>/.omp/inbox/*.json` (moved into the run inbox),
+ *  2. telegram `pollOnce()` — answer files are written by the adapter; plain
+ *     messages are routed to the inbox handler via `setPlainMessageHandler`.
+ * Never throws.
+ */
+export async function pollInbox(root: string, adapter: EscalationAdapter | null, onTask?: (t: InboxTask) => void): Promise<void> {
+  // 1. Local drop (manual / test injection).
+  try {
+    const drop = localInboxDrop(root);
+    if (existsSync(drop)) {
+      for (const name of readdirSync(drop)) {
+        if (!name.endsWith(".json")) continue;
+        const path = join(drop, name);
+        try {
+          const raw = JSON.parse(readFileSync(path, "utf8")) as InboxTask;
+          if (typeof raw?.text !== "string" || raw.text.trim().length === 0) continue;
+          const task: InboxTask = {
+            id: raw.id ?? `local:${name}`,
+            text: raw.text,
+            at: raw.at ?? new Date().toISOString(),
+            by: raw.by ?? "local-drop",
+          };
+          const moved = handleInboxTask(root, task, onTask);
+          if (moved) {
+            const processedDir = join(drop, "processed");
+            mkdirSync(processedDir, { recursive: true });
+            renameSync(path, join(processedDir, name));
+          }
+        } catch {
+          // unreadable / malformed — leave in place
+        }
+      }
+    }
+  } catch {
+    // drop missing — nothing to do
+  }
+  // 2. Telegram long-poll (answers + plain-message inbox).
+  if (adapter && typeof (adapter as unknown as { pollOnce?: unknown }).pollOnce === "function") {
+    try {
+      await (adapter as unknown as { pollOnce: () => Promise<unknown> }).pollOnce();
+    } catch {
+      // network hiccup — next tick retries
+    }
+  }
 }

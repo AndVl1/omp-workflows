@@ -17,7 +17,15 @@ import {
   readAnswers,
 } from "@andvl1/omp-workflows-core";
 import { HttpEscalationAdapter } from "../src/adapters/http.js";
-import { TelegramEscalationAdapter } from "../src/adapters/telegram.js";
+import {
+  TelegramEscalationAdapter,
+} from "../src/adapters/telegram.js";
+import {
+  handleInboxTask,
+  pollInbox,
+  resolveInboxRunId,
+  inboxDir,
+} from "../src/adapters/registry.js";
 import {
   loadEscalationConfig,
   createEscalationAdapter,
@@ -238,6 +246,87 @@ test("adapters: telegram callback_query maps to an option answer", async () => {
     assert.equal(answers[0]?.answer, "grpc");
     assert.equal(answers[0]?.by, "telegram:callback");
     assert.equal(answers[0]?.id, "run-1/team-a/clarify/1");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("adapters: telegram plain message routes to the inbox handler (not an answer)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-tg-inbox-"));
+  try {
+    const inboxMessages: Array<{ id: string; text: string; at: string }> = [];
+    const fetchImpl = (async (url: unknown) => {
+      const method = String(url).split("/").pop();
+      if (method === "getUpdates") {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            result: [{ update_id: 3, message: { message_id: 200, text: "Fix the login bug" } }],
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`unexpected method: ${method}`);
+    }) as typeof fetch;
+
+    const adapter = new TelegramEscalationAdapter({
+      token: "t",
+      chatId: "c",
+      cwd: root,
+      fetchImpl,
+      onPlainMessage: (msg) => inboxMessages.push(msg),
+    });
+    const answers = await adapter.pollOnce();
+    assert.equal(answers.length, 0, "plain message is not an answer");
+    assert.equal(inboxMessages.length, 1, "plain message routed to inbox handler");
+    assert.equal(inboxMessages[0]?.text, "Fix the login bug");
+    assert.ok(inboxMessages[0]?.id.includes("200"), "message id becomes the task id");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: handleInboxTask files a task under the active run and is idempotent", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-inbox-"));
+  try {
+    // No active run -> a standby run is created.
+    const runId = resolveInboxRunId(root);
+    assert.ok(runId.startsWith("standby-"), "standby run created when none active");
+    assert.ok(existsSync(join(root, ".work-state", "cto", runId, "state.json")), "standby state persisted");
+
+    const tasks: Array<{ id: string; text: string; at: string; runId?: string }> = [];
+    const path = handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, (t) => tasks.push(t));
+    assert.ok(path, "task filed");
+    assert.equal(tasks.length, 1, "onTask called once");
+    assert.equal(tasks[0]?.runId, runId);
+
+    // Same task id again -> dropped (wx), onTask not re-invoked.
+    const again = handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, (t) => tasks.push(t));
+    assert.equal(again, null, "duplicate task id dropped");
+    assert.equal(tasks.length, 1, "onTask not re-invoked for duplicates");
+
+    const filed = readdirSync(inboxDir(runId, root)).filter((n) => n.endsWith(".json"));
+    assert.equal(filed.length, 1, "one inbox file on disk");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: pollInbox ingests local .omp/inbox drop files", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-drop-"));
+  try {
+    const drop = join(root, ".omp", "inbox");
+    mkdirSync(drop, { recursive: true });
+    writeFileSync(join(drop, "task-a.json"), JSON.stringify({ id: "local-a", text: "Task from local drop" }));
+
+    const tasks: Array<{ id: string; text: string; at: string; runId?: string }> = [];
+    await pollInbox(root, null, (t) => tasks.push(t));
+
+    assert.equal(tasks.length, 1, "drop task ingested");
+    assert.equal(tasks[0]?.text, "Task from local drop");
+    assert.ok(tasks[0]?.runId?.startsWith("standby-"), "filed under a standby run");
+    assert.ok(existsSync(join(drop, "processed", "task-a.json")), "drop file moved to processed");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

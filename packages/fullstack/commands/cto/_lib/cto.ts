@@ -84,6 +84,86 @@ function renderTeamsTable(cwd: string): string {
     .join("\n");
 }
 
+/**
+ * Render the user-communication channel section from `.omp/escalation.json`.
+ * - `telegram`: bidirectional — ALL user questions go through the messenger
+ *   (outbox -> answers/), the `ask` tool is blocked.
+ * - `http`: push-only — use `ask` for interactive checkpoints.
+ * - none: use `ask`.
+ */
+export function renderChannelSection(cwd: string): string {
+  let adapter: string | null = null;
+  try {
+    const raw = JSON.parse(readFileSync(join(cwd, ".omp", "escalation.json"), "utf8")) as { adapter?: string };
+    if (typeof raw?.adapter === "string") adapter = raw.adapter;
+  } catch {
+    // missing/malformed — no channel
+  }
+  if (adapter === "telegram") {
+    return [
+      "### User channel (messenger, BIDIRECTIONAL)",
+      "A messenger channel with feedback is configured. ALL user communication goes through it:",
+      "- Checkpoints and any question: write the escalation to `.work-state/cto/<id>/outbox/<escId>.json`",
+      "  (level `question`/`decision`, `timeoutMs` + `default`); answers arrive in `answers/<escId>.json`.",
+      "- NEVER use the `ask` tool — it is blocked while this channel is active.",
+      "- Blocking waits park the team (`background_wait`); everything else continues.",
+      "- In standby: tasks arrive as `[CTO-INBOX]` messages — fold each into the run (amend discipline).",
+    ].join("\n");
+  }
+  if (adapter === "http") {
+    return [
+      "### User channel (push-only)",
+      "An HTTP channel is configured but it is PUSH-ONLY (no feedback path).",
+      "Use `ask` for interactive checkpoints; escalations sent over the channel are advisory.",
+    ].join("\n");
+  }
+  return [
+    "### User channel (none)",
+    "No escalation channel configured. Use the `ask` tool for checkpoints.",
+  ].join("\n");
+}
+
+/**
+ * Build the CTO STANDBY prompt: CTO mode with no task yet. The agent persists
+ * a standby run (so the run is active: amend detection, inbox routing and the
+ * per-turn reminder all key off it), yields, and waits for `[CTO-INBOX]`
+ * tasks (injected by the messenger dispatcher or dropped in
+ * `.work-state/cto/<id>/inbox/`).
+ */
+export function buildStandbyCtoPrompt(cwd: string): string {
+  return [
+    "/cto STANDBY — CTO sub-orchestration is ON with NO task yet. Execute this contract YOURSELF, in this session.",
+    "",
+    "### You are the CTO (standby)",
+    "You ARE the orchestrator. Do NOT invent work while waiting. Do NOT delegate the orchestrator role.",
+    "",
+    "### Standby steps",
+    "1. **Persist the standby run NOW**: write `.work-state/cto/standby-<id>/state.json`",
+    "   (schema 1, `pause.kind: \"none\"`, `plan.task: \"standby — awaiting inbox tasks\"`, `teams: []`,",
+    "   `autonomous: true`). Until this file exists the run is NOT active: inbox routing,",
+    "   amend detection and the per-turn reminder will not engage.",
+    "2. Read `.omp/teams.json` + `cto.json` profile now (not later) so the wake turn is cheap.",
+    "3. Yield and WAIT. You will be woken with a task.",
+    "",
+    "### Tasks arrive two ways",
+    "- A `[CTO-INBOX]` user message (injected by the messenger dispatcher), or",
+    "- files in `.work-state/cto/<id>/inbox/*.json` ({ id, text, at, by }).",
+    "On EACH wake: treat the payload as a `/cto <task>` command — fold it into THIS run",
+    "(amend discipline: re-plan, spawn leads in parallel, integration covers ALL teams).",
+    "Multiple tasks = multiple sequential waves; do not merge them into one team.",
+    "",
+    "### Your rules (abridged)",
+    "- Delegate, never code. Teams: pick from the registry, one lead per team, leads spawn workers.",
+    "- Escalation ladder: worker -> lead -> you -> user.",
+    "- Failed subagents (exit 1) are resource failures: verify disk artifacts, re-spawn the SAME spec,",
+    "  on second failure dispatch the workers directly (single-worker slices skip the lead from the start).",
+    "",
+    renderChannelSection(cwd),
+    "",
+    "Begin: persist the standby run, read the registry, yield.",
+  ].join("\n");
+}
+
 export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string): string {
   const profilePath = resolveWorkflowProfilePath("cto", cwd);
   const profileSection = profilePath
@@ -117,6 +197,8 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string): string
     renderTeamsTable(cwd),
     "",
     profileSection,
+    "",
+    renderChannelSection(cwd),
     "",
     "### CTO discipline (you are the orchestrator, not a coder)",
     "1. **Decompose** the task into a TeamPlan: pick teams from the registry (max 8, decomposition depth max 2),",
@@ -266,6 +348,7 @@ export function findActiveCtoRun(cwd: string): ActiveRunBest | null {
 /** Amend contract: second /cto while a run is active folds the task into it. */
 export function buildAmendPrompt(
   envelope: ParsedCtoEnvelope,
+  cwd: string,
   active: ActiveCtoRun,
 ): string {
   const teamsLine = active.state.teams.map((t) => `${t.id}:${t.status}`).join(", ");
@@ -305,6 +388,8 @@ export function buildAmendPrompt(
     "   that team's slice (re-spawn its lead with an additional worker task) instead of adding a team.",
     "6. **Escalations** of the new teams use the same ladder (worker -> lead -> you -> user); you never spawn",
     "   a second orchestrator.",
+    "",
+    renderChannelSection(cwd),
     "",
     "Begin: read the active state, amend the plan, spawn the new leads.",
   ].join("\n");

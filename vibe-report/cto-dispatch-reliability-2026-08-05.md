@@ -164,3 +164,53 @@ You are part of that run. DELEGATE, do not absorb:
 после пересборки/переустановки плагина (репозиторий уже содержит код; установленный
 в `~/.omp/plugins` 0.12.0 пока без неё). Локально проверялось через
 `omp -e <repo>/packages/fullstack/dist/index.js`.
+
+---
+
+# Дополнение 2: CTO STANDBY (задачи через Telegram) + весь диалог через мессенджер
+
+## Запросы
+1. «Включаю cto mode без явной задачи и потом накидываю через телегу, чтобы он запускал команды разработки»
+2. «Если настроен мессенджер с обратной связью (не чисто пуши) — всё общение с пользователем уносить туда, даже вместо ask tool»
+
+## Ответ: да, работает — реализовано и проверено live
+
+### 1. CTO STANDBY + задачи через мессенджер
+
+Флоу (live-проверен на omp 17.2.8, интерактивная PTY-сессия, `/tmp/cto-standby-live`):
+```
+/cto (без задачи) → standby-промпт (buildStandbyCtoPrompt)
+  → агент пишет .work-state/cto/standby-<id>/state.json (run активен)
+  → yield и ждёт (сессия idle)
+сообщение в Telegram (plain, не reply) / файл в .omp/inbox/
+  → диспетчер (session_start, 10с поллинг) → run-инбокс + sendUserMessage("[CTO-INBOX] ...")
+  → idle-сессия просыпается («idle starts a turn») → агент сворачивает задачу (amend-дисциплина)
+```
+
+Live-транскрипт подтверждает каждый шаг:
+- `Standby run persisted... then yielding.` → state.json на диске
+- `[CTO-INBOX] New task via messenger (run standby-20260805-085938): Add a hello endpoint to the backend (Kotlin)`
+- `Task received. Folding into run ... First, reading the amend contract text...` → декомпозиция пошла
+
+Механика:
+- `TelegramEscalationAdapter`: plain-сообщения (не reply/не callback) → `onPlainMessage` (было: игнорировались). Заодно починен латентный баг: `pollOnce()` (long-poll ответов) никогда не вызывался из диспетчера — ответы в проде не приходили.
+- `startDispatcher(root, adapter, intervalMs, { onTask })`: поллит локальный дроп `.omp/inbox/*.json` + telegram (ответы + задачи); новые задачи → `handleInboxTask` (идемпотентно, `wx`) → wake через `pi.sendUserMessage`.
+- Нет активного рана → `ensureStandbyRun` создаёт standby-ран (state.json), задача кладётся туда.
+- `sendUserMessage` без deliverAs: idle → стартует ход (доказано live).
+
+### 2. Весь диалог через мессенджер вместо ask
+
+- `/cto`-промпт (core + fullstack копии) рендерит `renderChannelSection(cwd)` из `.omp/escalation.json`:
+  - `telegram` (двусторонний): ВСЕ вопросы пользователю — через outbox → answers/; `ask` ЗАБЛОКИРОВАН.
+  - `http` (push-only): ask остаётся для интерактивных чекпоинтов.
+  - нет канала: ask.
+- `createAskRedirectGate()` — `tool_call`-хук: блокирует `ask`, когда telegram-канал И активный CTO-ран (вне рана ask работает — обычная интерактивная работа не страдает). Причина блокировки возвращается LLM (outbox-контракт).
+- cto.md (rule 4) и team-lead.md (rule 3) обновлены.
+
+## Активация
+Код в репозитории (ветка fix/cto-dispatch-reliability, запушено). Для прода: пересборка/переустановка `@andvl1/omp-workflows-fullstack` (установленный 0.12.0 пока старый) + `.omp/escalation.json` с `adapter: telegram` (token/chatId) + запуск `/cto` без задачи в интерактивной сессии, которую оставляем открытой. Telegram-бот должен иметь доступ к чату; ответы на эскалации — reply'ем или кнопкой; новые задачи — обычным сообщением.
+
+## Ограничения
+- Wake работает только пока сессия CTO жива (интерактивная, idle). Закрытая сессия не получит wake — задача ждёт в инбоксе и подхватится при следующем старте (промпт standby велит проверить inbox/).
+- Несколько сессий в одном проекте → несколько диспетчеров; дубликаты задач отсекаются `wx`-идемпотентностью (первый победитель).
+- `ask`-гейт срабатывает только при активном CTO-ране (по замыслу).

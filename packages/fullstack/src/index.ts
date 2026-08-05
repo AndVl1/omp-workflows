@@ -24,7 +24,8 @@ import {
 	registerTeamWorkflow,
 } from "@andvl1/omp-workflows-core";
 import { ensureCommandsForSession } from "./copy-commands.js";
-import { createEscalationAdapter, loadEscalationConfig, startDispatcher } from "./adapters/registry.js";
+import { createEscalationAdapter, loadEscalationConfig, startDispatcher, type InboxTask } from "./adapters/registry.js";
+import { createAskRedirectGate } from "./messenger-channel.js";
 import { createCtoModeReminderHandler } from "./cto-mode-reminder.js";
 import {
 	RESEARCH_REQUEST_MARKER_END,
@@ -116,6 +117,11 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   // main session and subagents. See cto-mode-reminder.ts.
   pi.on("context", createCtoModeReminderHandler());
 
+  // Messenger-mode `ask` redirect: while a bidirectional channel (telegram)
+  // AND an active CTO run exist, block the interactive `ask` tool so ALL
+  // user communication goes through the messenger (outbox -> answers/).
+  pi.on("tool_call", createAskRedirectGate());
+
   // Auto-bootstrap OMP custom-TS slash commands into the active project's
   // `.omp/commands/` directory on every session start. OMP's discovery
   // (see `discoverCustomCommands` in @oh-my-pi/pi-coding-agent) only
@@ -137,7 +143,20 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     const config = loadEscalationConfig(cwd);
     if (config) {
       const adapter = createEscalationAdapter(config, cwd);
-      if (adapter) startDispatcher(cwd, adapter, 10_000);
+      if (adapter) {
+        startDispatcher(cwd, adapter, 10_000, {
+          // Wake the CTO session on an inbound task: idle starts a turn,
+          // streaming queues as steer. The [CTO-INBOX] envelope is the
+          // contract the standby/CTO prompt tells the agent to fold in.
+          onTask: (task: InboxTask) => {
+            pi.sendUserMessage(
+              `[CTO-INBOX] New task via messenger (run \`${task.runId ?? "?"}\`):\n${task.text}\n\n` +
+                "Treat this as a /cto task — fold it into the active run (amend discipline: re-plan, " +
+                "spawn leads in parallel, integration covers ALL teams).",
+            );
+          },
+        });
+      }
     }
   });
 }

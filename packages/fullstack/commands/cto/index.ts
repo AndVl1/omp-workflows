@@ -9,30 +9,25 @@
 
 import type { CustomCommand, CustomCommandAPI } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/types";
 import type { HookCommandContext } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/types";
-import { buildAmendPrompt, buildCtoPrompt, findActiveCtoRun, parseEnvelope } from "./_lib/cto.js";
+import { buildAmendPrompt, buildCtoPrompt, buildStandbyCtoPrompt, findActiveCtoRun, parseEnvelope } from "./_lib/cto.js";
 
 const factory = (api: CustomCommandAPI): CustomCommand => ({
   name: "cto",
-  description: "CTO sub-orchestration: decompose a task into parallel development teams. /cto <task>",
+  description: "CTO sub-orchestration: decompose a task into parallel development teams. /cto <task>; /cto alone starts STANDBY (tasks arrive via messenger inbox)",
   async execute(args: string[], ctx: HookCommandContext): Promise<string> {
-    const raw = args.join(" ").trim();
-    if (!raw) {
-      return [
-        "Usage: /cto <task description> [issue=#N] [AUTONOMOUS]",
-        "",
-        "CTO sub-orchestration: decompose -> architecture -> teams -> integration.",
-        "A second /cto while a run is active folds the new task into that run (amend).",
-        "Example: /cto Add OAuth with Google and GitHub",
-      ].join("\n");
-    }
     const cwd = ctx.cwd ?? api.cwd;
     if (!cwd) return "ERROR: no cwd available.";
+    const raw = args.join(" ").trim();
+    if (!raw) {
+      ctx.ui?.notify?.("cto: standby mode — awaiting tasks via messenger inbox", "info");
+      return buildStandbyCtoPrompt(cwd);
+    }
     const envelope = parseEnvelope(raw, cwd);
     if (!envelope.task) return "ERROR: empty task after stripping prefix.";
     const active = findActiveCtoRun(cwd);
     if (active) {
       ctx.ui?.notify?.(`cto: amending run ${active.runId} with: ${envelope.task.slice(0, 50)}`, "info");
-      return buildAmendPrompt(envelope, active);
+      return buildAmendPrompt(envelope, cwd, active);
     }
     ctx.ui?.notify?.(`cto: ${envelope.task.slice(0, 60)} (decomposition pending)`, "info");
     return buildCtoPrompt(envelope, cwd);

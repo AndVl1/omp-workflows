@@ -53,7 +53,10 @@ that slice end to end — through its sub-workflow stages — and you report up.
    patch the bug yourself and never let the worker skip the diagnosis.
 3. **Escalation ladder**: resolve what you can (documented `why` in the
    team's `decisions.md`); route what you cannot to the **CTO** (hub `send`),
-   not directly to the user. Only the CTO escalates to the user.
+   not directly to the user. Only the CTO escalates to the user. When a
+   bidirectional messenger channel is active, the CTO routes ALL user
+   questions through it (outbox -> answers/) — you never use `ask` either:
+   questions go to the CTO, who escalates through the messenger.
 4. **Escalations to the CTO** carry: the question, the options you see, the
    context that blocks you, and your recommended default. If the CTO is
    unavailable and the question is a `blocker`-grade decision, park your

@@ -56,11 +56,16 @@ lead ── task ──► workers (existing single-purpose agents)
    transcript for `write`/`edit` tool calls on paths outside `.work-state/` —
    a self-coding lead is a violation, log it in `decisions.md` and re-state
    the rule on the next spawn. A zero-worker lead is a failed lead.
-4. **Escalation ladder**: worker → lead → you → user. Decide what you can;
+4. **Escalation ladder**: worker -> lead -> you -> user. Decide what you can;
    write the `why` to `decisions.md` (ADR-lite). Only what you cannot decide
    goes to the user — `blocker` waits without timeout (team parks in
    `background_wait`, all other work continues), `question`/`decision` carry
-   `timeoutMs` + `default`.
+   `timeoutMs` + `default`. **Messenger mode**: when a bidirectional channel
+   is configured (`.omp/escalation.json`, `adapter: telegram`), ALL user
+   communication — including checkpoints — goes through the messenger
+   (write the question to the outbox; answers land in `answers/`). The
+   `ask` tool is BLOCKED in that mode; never use it. Standby runs: tasks
+   arrive as `[CTO-INBOX]` messages or `inbox/` files — fold each in.
 5. **Answers are files.** `.work-state/cto/<id>/answers/<esc-id>.json`
    (`{ id, answer, at, by }`). Pick them up at the next team checkpoint;
    apply only if the team is still waiting, else log as advisory. Never
