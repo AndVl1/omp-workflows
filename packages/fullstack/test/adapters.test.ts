@@ -331,3 +331,27 @@ test("adapters: pollInbox ingests local .omp/inbox drop files", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+
+test("adapters: pollInbox wakes on a new escalation answer (user-initiated)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-answer-wake-"));
+  try {
+    const answers: Array<{ id: string; answer: string }> = [];
+    // Stub adapter exposing only pollOnce (telegram-like).
+    const stub = {
+      kind: "telegram",
+      pollOnce: async () => [{ id: "run-1/team-a/q1", answer: "use grpc" }],
+    } as unknown as import("../src/adapters/telegram.js").TelegramEscalationAdapter;
+
+    await pollInbox(root, stub, undefined, (a) => answers.push(a));
+    assert.equal(answers.length, 1, "answer wake fired");
+    assert.equal(answers[0]?.id, "run-1/team-a/q1");
+    assert.equal(answers[0]?.answer, "use grpc");
+
+    // Same answer again -> deduped (no re-wake).
+    await pollInbox(root, stub, undefined, (a) => answers.push(a));
+    assert.equal(answers.length, 1, "duplicate answer not re-woken");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

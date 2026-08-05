@@ -155,6 +155,15 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
                 "spawn leads in parallel, integration covers ALL teams).",
             );
           },
+          // Wake on a user-initiated answer (reply / button) so the agent
+          // reacts without waiting for the next checkpoint poll.
+          onAnswer: (answer) => {
+            pi.sendUserMessage(
+              `[CTO-ANSWER] User answered escalation \`${answer.id}\` with: ${answer.answer}\n\n` +
+                `Read \`.work-state/cto/${answer.id.split("/")[0] ?? "?"}/answers/${answer.id.replace(/[^a-zA-Z0-9-_]/g, "-")}.json\` ` +
+                "and apply it now if the waiting team is still parked; otherwise treat it as advisory.",
+            );
+          },
         });
       }
     }

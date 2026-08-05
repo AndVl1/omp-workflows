@@ -146,14 +146,17 @@ export function startDispatcher(
   intervalMs = 10_000,
   opts: DispatcherOptions = {},
 ): () => void {
-  const { onTask } = opts;
+  const { onTask, onAnswer } = opts;
   const inboxHandler = (task: InboxTask) => handleInboxTask(root, task, onTask);
-  if (adapter && typeof (adapter as unknown as { setPlainMessageHandler?: unknown }).setPlainMessageHandler === "function") {
-    (adapter as unknown as { setPlainMessageHandler: (h: (t: InboxTask) => void) => void }).setPlainMessageHandler(inboxHandler);
+  // Only the Telegram adapter exposes setPlainMessageHandler; http is
+  // send-only. Cast at the boundary once, guarded at runtime.
+  const telegramLike = adapter as { setPlainMessageHandler: (h: (t: InboxTask) => void) => void } | null;
+  if (telegramLike && typeof telegramLike.setPlainMessageHandler === "function") {
+    telegramLike.setPlainMessageHandler(inboxHandler);
   }
   const tick = (): void => {
     void drainOutbox(root, adapter).catch(() => undefined);
-    void pollInbox(root, adapter, onTask).catch(() => undefined);
+    void pollInbox(root, adapter, onTask, onAnswer).catch(() => undefined);
   };
   const timer = setInterval(tick, intervalMs);
   // Drain once immediately on start (survives restarts — R7).
@@ -176,6 +179,13 @@ export interface InboxTask {
 export interface DispatcherOptions {
   /** Called once per new inbox task (after the inbox file is written). */
   onTask?: (task: InboxTask) => void;
+  /**
+   * Called once per newly received escalation answer (user-initiated reply
+   * or button in the messenger channel). The answer file is already written
+   * by the adapter; the wake tells the agent to apply it at the next
+   * checkpoint (or immediately if it is waiting).
+   */
+  onAnswer?: (answer: { id: string; answer: string }) => void;
 }
 
 /** `.work-state/cto/<runId>/inbox/` — tasks the CTO reads at checkpoints. */
@@ -247,7 +257,12 @@ export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: Inbo
  *     messages are routed to the inbox handler via `setPlainMessageHandler`.
  * Never throws.
  */
-export async function pollInbox(root: string, adapter: EscalationAdapter | null, onTask?: (t: InboxTask) => void): Promise<void> {
+export async function pollInbox(
+  root: string,
+  adapter: EscalationAdapter | null,
+  onTask?: (t: InboxTask) => void,
+  onAnswer?: (a: { id: string; answer: string }) => void,
+): Promise<void> {
   // 1. Local drop (manual / test injection).
   try {
     const drop = localInboxDrop(root);
@@ -278,12 +293,29 @@ export async function pollInbox(root: string, adapter: EscalationAdapter | null,
   } catch {
     // drop missing — nothing to do
   }
-  // 2. Telegram long-poll (answers + plain-message inbox).
-  if (adapter && typeof (adapter as unknown as { pollOnce?: unknown }).pollOnce === "function") {
+  // 2. Telegram long-poll (answers + plain-message inbox). Only the Telegram
+  // adapter exposes pollOnce; http is send-only. Cast at the boundary once.
+  const telegramLike = adapter as { pollOnce: () => Promise<Array<{ id: string; answer: string }>> } | null;
+  if (telegramLike && typeof telegramLike.pollOnce === "function") {
     try {
-      await (adapter as unknown as { pollOnce: () => Promise<unknown> }).pollOnce();
+      const answers = (await telegramLike.pollOnce()) ?? [];
+      for (const answer of answers) {
+        if (!answer?.id || seenAnswers.has(answer.id)) continue;
+        seenAnswers.add(answer.id);
+        onAnswer?.(answer);
+      }
     } catch {
       // network hiccup — next tick retries
     }
   }
 }
+
+/**
+ * Esc-ids already woken for (per dispatcher). pollOnce advances the TG offset
+ * so a single dispatcher never sees the same update twice; this set guards
+ * against double-wake if a dispatcher's tick overlaps itself. Multiple
+ * dispatchers in multiple live sessions may both wake on the same answer —
+ * acceptable: the session that owns the waiting team applies it, others treat
+ * it as advisory (the CTO contract says late answers are advisory).
+ */
+const seenAnswers = new Set<string>();
