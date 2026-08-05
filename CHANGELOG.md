@@ -2,6 +2,12 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.12.1] — 2026-08-05
+### Fixed
+- **Subagent dispatch reliability protocol (lead exit-1 failover)** — live evidence (pr-watch CTO run + /tmp/cto-dispatch-exp probe matrix, omp 17.2.8): subagents below the main agent resolve to `modelRoles.task`; when that role is `minimax-code/MiniMax-M3`, they intermittently die with exit 1 — stalling at a nested `task` call (empty turns → killed after 3 idle reminders), yielding null/empty data, or hallucinating garbage tool calls mid-work. Nested dispatch is NOT the defect: a directly-dispatched worker failed identically on the same model; `opencode-go/deepseek-v4-flash` as task role showed 0 failures across 17+ live probe runs. The `/cto` prompt contract (core + fullstack copies), `cto` agent, and `team-lead` agent now carry: verify-disk-first + re-spawn-with-same-spec failover for exit-1 leads, degrade-to-direct-dispatch on a second failure, single-worker slices skip the lead hop, and dispatch hygiene (spawn early before context grows, lean specs with findings on disk, one worker per `task` call). Host-level fix applied separately: `modelRoles.task` → deepseek-v4-flash (see vibe-report).
+### Verified
+- 255 unit tests green (core 96, fullstack 72, e2e 87 — was 253), typecheck + build clean. Live probe matrix in `/tmp/cto-dispatch-exp` (simple + heavy nested chains, MiniMax vs deepseek task role, direct vs nested dispatch).
+
 ## [0.12.0] — 2026-08-04
 ### Added
 - **Amend protocol (mid-run task injection, br-k19)** — `/cto` is now context-aware: when a CTO run is active (pause not done/failed), a second `/cto <task>` returns the **AMEND contract** — the new task is folded into the SAME run by the SAME orchestrator (single CTO, no sub-CTO, no second orchestrator), new leads spawn in parallel with active teams, integration and DoD aggregation cover ALL teams (original + added). Edge cases: run at max teams → queue (`.work-state/queue.json`), run in the integration phase → queue, scope overlap → extend the existing team's slice (re-spawn its lead) instead of adding a team. `CtoState` gains `amended_at` (`markAmended`); `findActiveCtoRun` + `buildAmendPrompt` exported from core.

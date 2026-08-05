@@ -68,6 +68,19 @@ test("cto-cmd: buildCtoPrompt renders teams from .omp/teams.json", () => {
   }
 });
 
+test("cto-cmd: buildCtoPrompt carries the lead exit-1 failover protocol", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-core-failover-"));
+  try {
+    const prompt = buildCtoPrompt(parseCtoEnvelope("Add OAuth", root), root);
+    assert.ok(prompt.includes("Subagent dispatch reliability"), "reliability section present");
+    assert.ok(prompt.includes("SAME slice spec"), "re-spawn with the same spec");
+    assert.ok(prompt.includes("Second failure -> degrade"), "degradation path documented");
+    assert.ok(prompt.includes("skip the lead hop"), "single-worker slices dispatch directly");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("cto-cmd: buildCtoPrompt degrades without teams.json", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-core-"));
   try {

@@ -73,6 +73,24 @@ lead ── task ──► workers (existing single-purpose agents)
    the whole run).
 8. **Read exactly these files**: `cto.json`, `.omp/teams.json`,
    `.omp/team.config.json`. No filesystem scans for profiles/teams.
+9. **Lead exit-1 failover.** A lead returning `exit 1` is a subagent/provider
+   failure (harness kills subagents that stall or mis-yield at a nested
+   `task` call — model-dependent, intermittent), NOT a team verdict. Fail
+   over, never redo:
+   1. Verify disk state first: `.work-state/cto/<id>/` and
+      `.work-state/artifacts/<team>/` (inventories, decisions, worker
+      outputs). The failed lead's prep usually survived — never redo it.
+   2. Re-spawn the lead with the SAME slice spec + "resume from disk state".
+   3. Second failure -> degrade: dispatch that team's workers DIRECTLY from
+      you (one per actionable item, findings already on disk) or fold the
+      slice into an adjacent team; log the degradation in `decisions.md`.
+   4. **Single-worker slices: skip the lead hop from the start** — dispatch
+      the worker directly. The lead layer pays off only for genuinely
+      multi-worker teams (also halves nesting depth).
+   5. Re-state dispatch hygiene in every lead task: spawn the first worker
+      as soon as the slice is decomposed (before context grows), keep specs
+      lean (paths, not pasted contents; findings to disk), one worker per
+      `task` call.
 
 ## Coordination over hub
 

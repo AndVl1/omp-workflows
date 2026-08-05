@@ -97,6 +97,20 @@ test("fullstack: /cto degrades gracefully without teams.json", () => {
 	}
 });
 
+test("fullstack: /cto contract carries the lead exit-1 failover protocol", () => {
+	const root = mkdtempSync(join(tmpdir(), "cto-cmd-failover-"));
+	try {
+		const result = buildCtoPrompt(parseEnvelope("Add OAuth", root), root);
+		assert.ok(result.includes("Subagent dispatch reliability"), "reliability section present");
+		assert.ok(result.includes("lead exit-1 protocol"), "failover protocol named");
+		assert.ok(result.includes("SAME slice spec"), "re-spawn with the same spec");
+		assert.ok(result.includes("Second failure -> degrade"), "degradation path documented");
+		assert.ok(result.includes("skip the lead hop"), "single-worker slices dispatch directly");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("fullstack: [AUTONOMOUS] prefix toggles autonomous mode", async () => {
 	const cmd = ctoFactory(fakeApi as never);
 	const result = await cmd.execute(["[AUTONOMOUS] Fix bug #42"], fakeCtx as never);
