@@ -31,6 +31,27 @@ interface AgentStartContext {
   cwd: string;
 }
 
+interface ToolCallEvent {
+  toolName: string;
+}
+
+/**
+ * Enforce the zero-step contract at the task boundary. A workflow run that
+ * has initialized `.work-state/` must persist classification before spawning
+ * any subagent. Projects without workflow state retain legacy behavior.
+ */
+export function classificationToolGate(event: ToolCallEvent, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
+  if (event.toolName !== "task") return;
+  const wsDir = resolve(ctx.cwd, WORK_STATE_DIR);
+  if (!existsSync(wsDir)) return;
+  if (!resolveStatePath(ctx.cwd)) {
+    return {
+      block: true,
+      reason: "BLOCK (P5): classification state is missing. Complete PHASE 0, write .work-state/team-state.json, then launch agents.",
+    };
+  }
+}
+
 export function classificationGate(event: AgentStartEvent, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
   const statePath = resolveStatePath(ctx.cwd);
   if (!statePath) return;

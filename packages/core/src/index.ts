@@ -18,13 +18,12 @@
  */
 
 import type { ExtensionAPI, BeforeAgentStartEvent, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
-import { classificationGate } from "./gates/classification.js";
+import { classificationGate, classificationToolGate } from "./gates/classification.js";
 import { monotonicGate } from "./gates/monotonic.js";
 import { dodBackstop } from "./gates/dod-backstop.js";
 import { safetyGuard } from "./gates/safety.js";
 import { registerObservabilityHooks } from "./observability/index.js";
 import type { RoleConfig } from "./engine/types.js";
-
 export interface RegisterOptions {
   label?: string;
   roles?: RoleConfig["roles"];
@@ -133,11 +132,12 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 		const c = ctx as { cwd: string };
 		return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], c);
 	});
-
-	pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
-		const c = ctx as { cwd: string };
-		return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
-	});
+  pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
+    const c = ctx as { cwd: string };
+    const r0 = classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c);
+    if (r0?.block) return r0;
+    return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
+  });
 
 	// ── Observability ────────────────────────────────────────────────────────
 	// Wire telemetry hooks AFTER gates so a blocked agent_start still emits

@@ -1,16 +1,6 @@
 /**
- * Smoke test: the `/do-work` custom-TS command (and its `/team` alias)
- * must boot, parse the envelope, classify the task, and emit a fully-formed
- * prompt — without importing OMP at all. We feed the factory a fake
- * `CustomCommandAPI` and a fake `HookCommandContext`, then assert on the
- * returned string.
- *
- * This catches:
- *  - syntax errors in the TS source,
- *  - missing imports / bad paths,
- *  - envelope parsing regressions,
- *  - classification table regressions,
- *  - the "no git work tree" fallback path.
+ * Smoke tests for the `/do-work` custom-TS command. The command must hand
+ * semantic classification to the main LLM before any workflow is selected.
  */
 
 import { test } from "node:test";
@@ -48,34 +38,28 @@ test("fullstack: /do-work command loads and parses an envelope", async () => {
 	const cmd = doWorkFactory(fakeApi as never);
 	assert.equal(cmd.name, "do-work");
 	assert.ok(cmd.description.length > 0);
-
-	const result = await cmd.execute(["Add OAuth with Google"], fakeCtx as never);
+});
+test("fullstack: /do-work defers workflow selection to semantic classification", async () => {
+	const cmd = doWorkFactory(fakeApi as never);
+	const result = await cmd.execute(["Research how LLM agents are configured for app testing"], fakeCtx as never);
 	assert.equal(typeof result, "string");
-	assert.ok(result.includes("OAuth with Google"), "result echoes the task");
-	assert.ok(result.includes("Workflow: `lightweight`"), "FEATURE/QUICK classifies as lightweight");
-	assert.ok(result.includes("Role mapping"), "result includes the role mapping table");
-	assert.ok(
-		result.includes("Profile file (absolute, existence-checked"),
-		"prompt names an absolute profile path instead of telling the agent to search",
-	);
-	assert.ok(
-		result.includes("Quick Discovery") && result.includes("Stages (skeleton"),
-		"stage skeleton is inlined for orientation",
-	);
-	assert.ok(
-		!result.includes("(read this file for the stage list"),
-		"prompt no longer references the old relative-path instruction",
-	);
+	assert.ok(result.includes("Research how LLM agents are configured for app testing"));
+	assert.ok(result.includes("classification pass"));
+	assert.ok(result.includes("Do NOT use keyword counts"));
+	assert.ok(result.includes("INVESTIGATION"));
+	assert.ok(result.includes("Do NOT call `task` during classification"));
+	assert.ok(!result.includes("Workflow: `full-feature`"), "no eager heuristic workflow is emitted");
+	assert.ok(!result.includes("Stages (skeleton"), "profile stages are not exposed before classification");
 });
 
-test("fullstack: /team alias delegates to /do-work", async () => {
+test("fullstack: /team alias delegates to deferred /do-work prompt", async () => {
 	const cmd = teamAliasFactory(fakeApi as never);
-	assert.equal(cmd.name, "team");
 	const result = await cmd.execute(["Refactor auth middleware"], fakeCtx as never);
 	assert.equal(typeof result, "string");
 	assert.ok(result.includes("Refactor auth middleware"));
-	assert.ok(result.includes("Workflow:"), "alias command produces the same workflow prompt");
+	assert.ok(result.includes("classification pass"));
 });
+
 
 test("fullstack: [AUTONOMOUS] prefix toggles autonomous mode", async () => {
 	const cmd = doWorkFactory(fakeApi as never);
