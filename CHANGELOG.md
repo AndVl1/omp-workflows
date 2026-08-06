@@ -8,7 +8,7 @@ All notable changes to `omp-workflows` are documented here.
 - **Reliable Telegram/inbox dispatch** — Telegram polling is serialized, update offsets remain retryable after persistence failures, only the interactive main session owns the dispatcher, and inbound tasks wake standby or active CTO runs.
 - **Explicit CTO nesting guard** — core blocks direct and batched `task` calls targeting `cto`/`@cto`.
 ### Verified
-- Core: 101/101 tests passed. Fullstack: 143/143 tests passed. Build, typecheck, whitespace check, and `node --check packages/fullstack/bin/tg-bridge.mjs` passed.
+- Core: 102/102 tests passed. E2E: 73/73 tests passed. Fullstack: 146/146 tests passed. Build and typecheck passed.
 
 ## [0.14.0] — 2026-08-06
 ### Added
