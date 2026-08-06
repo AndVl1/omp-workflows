@@ -60,13 +60,14 @@ export function writeStandbyTask(cwd: string, msg: BridgeIncoming, runId?: strin
 }
 
 function writeInboxTaskFile(dir: string, fileName: string, cwd: string, msg: BridgeIncoming, runId?: string): string | null {
+  const path = join(dir, fileName);
   try {
     mkdirSync(dir, { recursive: true });
-    const path = join(dir, fileName);
     writeFileSync(path, JSON.stringify({ id: msg.id, text: msg.text, at: msg.at, by: msg.by ?? "telegram-bridge", runId }, null, 2), { flag: "wx" });
     return path;
-  } catch {
-    return null; // already filed (duplicate delivery) or IO error
+  } catch (error) {
+    if (existsSync(path) && statSync(path).isFile()) return null; // duplicate delivery — already durable
+    throw error; // persistence failure must keep the Telegram update unconfirmed
   }
 }
 

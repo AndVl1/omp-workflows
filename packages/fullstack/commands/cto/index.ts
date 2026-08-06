@@ -2,9 +2,10 @@
  * /cto — CTO sub-orchestration custom-TS command.
  *
  * Same pattern as `/do-work`: parses the envelope, returns a fully-formed
- * prompt that the main agent executes through its own `task` tool. The logic
- * lives in `./_lib/cto.ts` (self-contained copy of the core contract —
- * `packages/core/src/commands/cto.ts`); canonical source is core.
+ * prompt that the MAIN AGENT of the session (the resident CTO) executes
+ * in-session. The logic lives in `./_lib/cto.ts` (self-contained copy of the
+ * core contract — `packages/core/src/commands/cto.ts`); canonical source is core.
+ * The CTO role is main-session only: never dispatched via `task(agent=cto)`.
  */
 
 import type { CustomCommand, CustomCommandAPI } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/types";
@@ -13,7 +14,7 @@ import { buildAmendPrompt, buildCtoPrompt, buildStandbyCtoPrompt, findActiveCtoR
 
 const factory = (api: CustomCommandAPI): CustomCommand => ({
   name: "cto",
-  description: "CTO sub-orchestration: decompose a task into parallel development teams. /cto <task>; /cto alone starts STANDBY (tasks arrive via messenger inbox)",
+  description: "CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /cto <task>; /cto alone starts STANDBY (tasks arrive via messenger inbox). Runs in-session — never task(agent=cto)",
   async execute(args: string[], ctx: HookCommandContext): Promise<string> {
     const cwd = ctx.cwd ?? api.cwd;
     if (!cwd) return "ERROR: no cwd available.";

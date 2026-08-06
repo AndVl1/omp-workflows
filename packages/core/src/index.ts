@@ -22,6 +22,7 @@ import { classificationGate, classificationToolGate } from "./gates/classificati
 import { monotonicGate } from "./gates/monotonic.js";
 import { dodBackstop } from "./gates/dod-backstop.js";
 import { safetyGuard } from "./gates/safety.js";
+import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { registerObservabilityHooks } from "./observability/index.js";
 import type { RoleConfig } from "./engine/types.js";
 export interface RegisterOptions {
@@ -132,12 +133,14 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 		const c = ctx as { cwd: string };
 		return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], c);
 	});
-  pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string };
-    const r0 = classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c);
-    if (r0?.block) return r0;
-    return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
-  });
+	pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
+		const c = ctx as { cwd: string };
+		const nestedCto = ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]);
+		if (nestedCto?.block) return nestedCto;
+		const r0 = classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c);
+		if (r0?.block) return r0;
+		return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
+	});
 
 	// ── Observability ────────────────────────────────────────────────────────
 	// Wire telemetry hooks AFTER gates so a blocked agent_start still emits
