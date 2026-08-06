@@ -22,6 +22,12 @@ test("cto-reminder: buildCtoModeReminder renders the delegation contract with ru
 	assert.ok(text.includes("never code or patch yourself"), "orchestrator rule");
 	assert.ok(text.includes("escalate what you cannot decide to the CTO"), "lead rule");
 	assert.ok(text.includes("never re-delegate"), "worker rule");
+	assert.ok(
+		text.includes("task(agent=cto)") && text.includes("task(agent=@cto)"),
+		"nested CTO dispatch forbidden in the reminder",
+	);
+	assert.ok(text.includes("MAIN AGENT"), "reminder names the main-session CTO");
+	assert.ok(text.includes("returns to standby"), "reminder returns the CTO to standby");
 });
 
 test("cto-reminder: injectCtoModeReminder prepends a steering user message", () => {

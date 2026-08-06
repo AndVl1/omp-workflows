@@ -19,7 +19,7 @@
  *   }
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   ctoStateDir,
@@ -176,7 +176,12 @@ async function sendWithRetry(adapter: EscalationAdapter, esc: Escalation, maxRet
   return { sent: false };
 }
 
-/** Start the dispatcher loop; returns a stop function. */
+/**
+ * Start the dispatcher loop; returns a stop function. Each tick drains the
+ * outbox and polls the inbox exactly once; ticks never overlap — a tick that
+ * outlives the interval is skipped until the previous one completes (no
+ * double-drain, no double-poll of the same updates).
+ */
 export function startDispatcher(
   root: string,
   adapter: EscalationAdapter | null,
@@ -191,13 +196,22 @@ export function startDispatcher(
   if (telegramLike && typeof telegramLike.setPlainMessageHandler === "function") {
     telegramLike.setPlainMessageHandler(inboxHandler);
   }
-  const tick = (): void => {
-    void drainOutbox(root, adapter).catch(() => undefined);
-    void pollInbox(root, adapter, onTask, onAnswer).catch(() => undefined);
+  let ticking = false;
+  const tick = async (): Promise<void> => {
+    if (ticking) return;
+    ticking = true;
+    try {
+      await drainOutbox(root, adapter);
+      await pollInbox(root, adapter, onTask, onAnswer);
+    } catch {
+      // drain/poll never throw in practice; keep the loop alive regardless.
+    } finally {
+      ticking = false;
+    }
   };
-  const timer = setInterval(tick, intervalMs);
+  const timer = setInterval(() => void tick(), intervalMs);
   // Drain once immediately on start (survives restarts — R7).
-  tick();
+  void tick();
   return () => clearInterval(timer);
 }
 
@@ -291,11 +305,20 @@ export function resolveInboxRunId(root: string): string {
   return ensureStandbyRun(root);
 }
 
-/** Create a minimal standby run state.json; returns its run id. */
+/**
+ * Create a minimal standby run state.json; returns its run id. Reuses an
+ * existing active run (e.g. a standby created by an earlier telegram task)
+ * instead of always minting a new `standby-<ts>` — otherwise /cto could
+ * start a second run with a fresh inbox and miss the tasks already filed
+ * (findActiveCtoRun treats the standby state — pause: none — as active).
+ */
 export function ensureStandbyRun(root: string): string {
+  const active = findActiveCtoRun(root);
+  if (active) return active.runId;
   const runId = `standby-${Date.now()}`;
   const runDir = ctoStateDir(runId, root);
   mkdirSync(runDir, { recursive: true });
+  mkdirSync(join(runDir, "inbox"), { recursive: true });
   const now = new Date().toISOString();
   const state = {
     schema: 1,
@@ -314,22 +337,54 @@ export function ensureStandbyRun(root: string): string {
 }
 
 /**
- * Write an inbox task file (idempotent — `wx`: the first dispatcher wins,
- * duplicates across sessions are dropped) and wake the CTO session.
+ * Write an inbox task file and wake the CTO session.
+ *
+ * The file write is idempotent (`wx`: the first write wins; duplicates are
+ * at-most-once — the winner wakes, later calls return null without waking)
+ * and is separated from the wake callback. The callback runs only after the
+ * file is durable, and its exceptions are NOT hidden: the just-created file
+ * is removed and the error propagates to the transport, which keeps the
+ * update (the local drop file stays in place) and retries on the next tick —
+ * the retry writes the file fresh, so no wx collision blocks the re-wake.
+ *
+ * Returns the path when this call wrote the file and woke; null when another
+ * call already filed the task (duplicate — no re-wake); throws when the task
+ * could not be filed (IO error) or when the wake callback threw (the file is
+ * removed so the transport can retry the update).
  */
 export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: InboxTask) => void): string | null {
+  const runId = task.runId ?? resolveInboxRunId(root);
+  const dir = inboxDir(runId, root);
+  const fileName = `${task.id.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`;
+  const path = join(dir, fileName);
   try {
-    const runId = task.runId ?? resolveInboxRunId(root);
-    const dir = inboxDir(runId, root);
     mkdirSync(dir, { recursive: true });
-    const fileName = `${task.id.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`;
-    const path = join(dir, fileName);
     writeFileSync(path, JSON.stringify({ ...task, runId }, null, 2), { flag: "wx" });
-    onTask?.({ ...task, runId });
-    return path;
-  } catch {
-    return null; // already exists (another dispatcher won) or IO error — skip
+  } catch (error) {
+    // wx collision (another dispatcher already filed this task — at-most-once:
+    // the winner woke, we must NOT re-wake) or IO error (nothing durable).
+    if (!existsSync(path)) {
+      throw new Error(`inbox task ${task.id} not filed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return null; // duplicate — first write wins, no re-wake
   }
+  try {
+    // Wake AFTER the file is durable and OUTSIDE the write guard: a throwing
+    // callback must reach the transport so it can retry the update instead of
+    // being hidden as a null result.
+    onTask?.({ ...task, runId });
+  } catch (error) {
+    // Roll back the just-created file so the retry is a fresh write (no wx
+    // collision) — otherwise the transport's retry would see a duplicate and
+    // skip the wake, losing the update.
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      // best-effort removal; worst case the next poll collides and skips
+    }
+    throw error;
+  }
+  return path;
 }
 
 /**
@@ -368,10 +423,16 @@ export async function pollInbox(
             at: raw.at ?? new Date().toISOString(),
             by: raw.by ?? "local-drop",
           };
-          const moved = handleInboxTask(root, task, onTask);
-          if (moved) moveToProcessed(drop, path, name);
+          // File the task (wx idempotent) and wake. A throwing wake (or an
+          // IO failure to file) propagates to the catch below, keeping the
+          // drop file in place so the next tick retries the wake. Any
+          // non-throwing return means the task is durable AND woken →
+          // move to processed.
+          handleInboxTask(root, task, onTask);
+          moveToProcessed(drop, path, name);
         } catch {
-          // unreadable / malformed — leave in place
+          // unreadable / malformed / wake failed — leave in place for the
+          // next tick (nothing is lost)
         }
       }
     }
@@ -384,9 +445,10 @@ export async function pollInbox(
   if (adapter && !isBridgeAlive(root) && isTelegramPollable(adapter)) {
     try {
       const answers = (await adapter.pollOnce()) ?? [];
+      const seen = seenAnswersFor(root);
       for (const answer of answers) {
-        if (!answer?.id || seenAnswers.has(answer.id)) continue;
-        seenAnswers.add(answer.id);
+        if (!answer?.id || seen.has(answer.id)) continue;
+        seen.add(answer.id);
         onAnswer?.(answer);
       }
     } catch {
@@ -415,11 +477,22 @@ function moveToProcessed(drop: string, path: string, name: string): void {
 }
 
 /**
- * Esc-ids already woken for (per dispatcher). pollOnce advances the TG offset
- * so a single dispatcher never sees the same update twice; this set guards
- * against double-wake if a dispatcher's tick overlaps itself. Multiple
- * dispatchers in multiple live sessions may both wake on the same answer —
- * acceptable: the session that owns the waiting team applies it, others treat
- * it as advisory (the CTO contract says late answers are advisory).
+ * Esc-ids already woken for, scoped per root/cwd. pollOnce advances the TG
+ * offset so a single dispatcher never sees the same update twice; this set
+ * guards against double-wake if a dispatcher's tick overlaps itself.
+ * Multiple dispatchers in multiple live sessions (same or different roots)
+ * may both wake on the same answer — acceptable: the session that owns the
+ * waiting team applies it, others treat it as advisory (the CTO contract
+ * says late answers are advisory). Keyed by root so one project's wakes
+ * never suppress another project's wakes for the same esc id.
  */
-const seenAnswers = new Set<string>();
+const seenAnswersByRoot = new Map<string, Set<string>>();
+
+function seenAnswersFor(root: string): Set<string> {
+  let seen = seenAnswersByRoot.get(root);
+  if (!seen) {
+    seen = new Set<string>();
+    seenAnswersByRoot.set(root, seen);
+  }
+  return seen;
+}

@@ -61,8 +61,11 @@ const replied = new Set(); // message ids we already answered (dedupe)
 adapter.setPlainMessageHandler((msg) => {
   try {
     if (replied.has(msg.id)) return;
-    replied.add(msg.id);
     const result = classifyIncoming(cwd, msg);
+    // Mark only after classification/file persistence succeeds. A thrown
+    // persistence error must reach pollOnce so Telegram keeps the update at
+    // the current offset and retries it on the next round.
+    replied.add(msg.id);
     if (result.reply && typeof adapter.sendPlainText === "function") {
       adapter.sendPlainText(chatId, result.reply).then((ok) => {
         console.log(`tg-bridge: replied to ${msg.id} (${result.action}) ok=${ok.sent}`);
@@ -74,34 +77,44 @@ adapter.setPlainMessageHandler((msg) => {
     }
   } catch (error) {
     console.error("tg-bridge: handler error", error instanceof Error ? error.message : error);
+    throw error;
   }
 });
 
 const intervalMs = config.telegram.pollIntervalMs ?? 5_000;
-const timer = setInterval(async () => {
-  try {
-    // Answers are written to answers/ by the adapter; forward each as a
-    // marker so a live session wakes [CTO-ANSWER] without polling telegram.
-    const answers = await adapter.pollOnce();
-    for (const answer of answers) {
-      if (!answer?.id) continue;
-      const marker = writeAnswerMarker(cwd, answer);
-      console.log(`tg-bridge: answer ${answer.id} -> answers/ + marker ${marker ?? "(dup)"}`);
+let stopped = false;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Self-scheduling loop: a new poll starts only after the previous round
+// finished (a long-poll round can block up to `timeout: 30` seconds), so
+// there is never more than one in-flight getUpdates per token.
+async function pollLoop() {
+  while (!stopped) {
+    try {
+      // Answers are written to answers/ by the adapter; forward each as a
+      // marker so a live session wakes [CTO-ANSWER] without polling telegram.
+      const answers = await adapter.pollOnce();
+      for (const answer of answers) {
+        if (!answer?.id) continue;
+        const marker = writeAnswerMarker(cwd, answer);
+        console.log(`tg-bridge: answer ${answer.id} -> answers/ + marker ${marker ?? "(dup)"}`);
+      }
+    } catch (error) {
+      console.error("tg-bridge: poll error", error instanceof Error ? error.message : error);
     }
-  } catch (error) {
-    console.error("tg-bridge: poll error", error instanceof Error ? error.message : error);
+    if (stopped) break;
+    await sleep(intervalMs);
   }
-}, intervalMs);
-void adapter.pollOnce().catch(() => undefined);
+}
+
+void pollLoop();
 console.log(`tg-bridge: polling telegram every ${intervalMs}ms (cwd=${cwd}) — one consumer per token.`);
 
-process.on("SIGINT", () => {
-  clearInterval(timer);
+const shutdown = () => {
+  if (stopped) return;
+  stopped = true;
   clearBridgeLock(cwd);
   process.exit(0);
-});
-process.on("SIGTERM", () => {
-  clearInterval(timer);
-  clearBridgeLock(cwd);
-  process.exit(0);
-});
+};
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
