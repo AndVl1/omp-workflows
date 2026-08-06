@@ -5,6 +5,9 @@
  * auto-bootstraps the shipped custom-TS slash commands into the active
  * project's `.omp/commands/` directory on every session start.
  *
+ * Also wires the live subagent-tree widget (see `subagent-tree.ts`) and
+ * exposes a `/subagents` toggle command.
+ *
  * For a custom bundle (e.g. Rust, Go-only, or any non-fullstack stack),
  * write your own package that calls `registerTeamWorkflow(pi, { roles: ..., ... })`
  * with your own role mapping. Do not depend on this package.
@@ -12,6 +15,7 @@
 
 import type {
 	ExtensionAPI,
+	ExtensionUIContext,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	SessionStartEvent,
@@ -32,6 +36,11 @@ import {
 	RESEARCH_REQUEST_MARKER_START,
 	buildResearchRequestDeveloperInstruction,
 } from "./before-agent-start-marker.js";
+import {
+	handleSubagentsCommand,
+	registerSubagentTree,
+	type SubagentTreeController,
+} from "./subagent-tree.js";
 // Auto-derived from core taxonomy; test-invariант в test/omp-model-roles.test.ts:439-446 ловит drift.
 const ROLE_COUNT = defaultFullstackModelRoles.length;
 
@@ -45,6 +54,19 @@ function extractCwdFromContext(ctx: unknown): string | undefined {
 	if (!ctx || typeof ctx !== "object") return undefined;
 	const candidate = "cwd" in ctx ? ctx.cwd : undefined;
 	return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+}
+
+/**
+ * Extract the ExtensionUIContext from a session_start ctx. The OMP
+ * extension API exposes `ui` on context objects at runtime but the bundled
+ * `.d.ts` narrows session_start ctx to a subset; hand-narrow at the
+ * boundary instead of an unchecked cast.
+ */
+function extractUiFromContext(ctx: unknown): ExtensionUIContext | undefined {
+	if (!ctx || typeof ctx !== "object") return undefined;
+	if (!("ui" in ctx)) return undefined;
+	const candidate = (ctx as { ui: unknown }).ui;
+	return candidate && typeof candidate === "object" ? (candidate as ExtensionUIContext) : undefined;
 }
 
 /**
@@ -96,6 +118,13 @@ function beforeAgentStartMarkerHandler(
 	};
 }
 
+/**
+ * Per-session subagent-tree controller. Filled by session_start; consumed by
+ * the `/subagents` command handler. Ref pattern keeps the handler registered
+ * once at extension load while the controller is bound at session start.
+ */
+const subagentTreeRef: { current: SubagentTreeController | null } = { current: null };
+
 export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   registerTeamWorkflow(pi, {
     label: "omp-workflows-fullstack",
@@ -122,7 +151,22 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   // user communication goes through the messenger (outbox -> answers/).
   pi.on("tool_call", createAskRedirectGate());
 
-  // Auto-bootstrap OMP custom-TS slash commands into the active project's
+  // `/subagents` — toggle / mode / clear for the live subagent-tree widget.
+  // The controller is created lazily; if no session_start has run yet
+  // the command reports a friendly "no active session" message.
+  pi.registerCommand("subagents", {
+    description: "Toggle the live subagent-tree widget (on/off/toggle/verbose/compact/clear/status)",
+    handler: (args, ctx): Promise<void> => {
+      const controller = subagentTreeRef.current;
+      if (!controller) {
+        ctx.ui.notify("subagent-tree: no active session yet", "info");
+        return Promise.resolve();
+      }
+      const message = handleSubagentsCommand(controller, controller.cwd, ctx.ui, args);
+      ctx.ui.notify(message, "info");
+      return Promise.resolve();
+    },
+  });
   // `.omp/commands/` directory on every session start. OMP's discovery
   // (see `discoverCustomCommands` in @oh-my-pi/pi-coding-agent) only
   // reads from project-local `.omp/commands/<name>/index.ts` — it does
@@ -137,6 +181,11 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     const cwd = extractCwdFromContext(ctx);
     if (!cwd) return;
     ensureCommandsForSession(cwd);
+    // Subagent-tree live widget — bound to the cwd of the active session.
+    // The controller replays from <cwd>/.omp/subagent-tree.json so the
+    // previous view state (on/off + verbose/compact) survives restarts.
+    const ui = extractUiFromContext(ctx);
+    if (ui) subagentTreeRef.current = registerSubagentTree(pi, ui, cwd);
     // CTO escalation dispatcher: when the project configures an escalation
     // channel (.omp/escalation.json), drain the outbox on every session
     // start (pending escalations survive restarts — R7) and keep polling.
