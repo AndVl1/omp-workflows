@@ -61,6 +61,12 @@ test("cto-cmd: buildCtoPrompt renders teams from .omp/teams.json", () => {
     assert.ok(prompt.includes("self-coding lead"), "CTO must reject self-coding leads");
     assert.ok(prompt.includes("You ARE the orchestrator"), "single-CTO rule in the contract");
     assert.ok(prompt.includes("never spawn a CTO"), "no sub-CTO delegation allowed");
+    assert.ok(prompt.includes("resident CTO"), "main-session CTO role in the contract");
+    assert.ok(
+      prompt.includes("task(agent=cto)") && prompt.includes("task(agent=@cto)"),
+      "nested CTO dispatch forbidden in the contract",
+    );
+    assert.ok(prompt.includes("return to standby"), "CTO returns to standby after the wave");
     assert.ok(prompt.includes("full-feature"), "full-feature available as team sub-profile");
     assert.ok(prompt.includes("debug-cycle"), "bug-fix slices run debug-cycle through the team");
     assert.ok(prompt.includes("Architecture first"), "architecture stage in the contract");
@@ -102,6 +108,10 @@ test("cto-cmd: ctoCommand with empty args starts STANDBY and notifies on task", 
     assert.ok(standby.includes("/cto STANDBY"), "empty args start standby mode");
     assert.ok(standby.includes("awaiting inbox tasks"), "standby names the inbox contract");
     assert.ok(standby.includes("[CTO-INBOX]"), "standby documents the wake envelope");
+    assert.ok(standby.includes("Adopt or persist the standby run"), "standby reuses queued tasks instead of creating a second run");
+    assert.ok(standby.includes("ARE USER COMMANDS"), "inbox messages are user commands to the main-session CTO");
+    assert.ok(standby.includes("return to standby"), "standby returns to standby after each wave");
+    assert.ok(standby.includes("task(agent=@cto)"), "nested CTO dispatch forbidden in standby");
     assert.ok(notifyCalls.some((m) => m.includes("standby")), "notify announces standby");
 
     const prompt = ctoCommand({ args: "Add OAuth", cwd: root, ui: { notify: (m) => notifyCalls.push(m) } });
@@ -126,6 +136,7 @@ test("cto-cmd: renderChannelSection reflects .omp/escalation.json", () => {
     assert.ok(tg.includes("BIDIRECTIONAL"), "telegram is bidirectional");
     assert.ok(tg.includes("NEVER use the `ask` tool"), "ask banned in messenger mode");
     assert.ok(tg.includes("outbox"), "questions route via the outbox");
+    assert.ok(tg.includes("USER COMMAND"), "inbox tasks are user commands in messenger mode");
 
     // http -> push-only, ask allowed
     writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "http", http: { url: "https://x" } }));

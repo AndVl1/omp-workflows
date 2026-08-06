@@ -24,12 +24,15 @@ import {
   handleInboxTask,
   pollInbox,
   resolveInboxRunId,
+  ensureStandbyRun,
   inboxDir,
   isBridgeAlive,
   writeBridgeLock,
   clearBridgeLock,
   registerEscalationAdapter,
   isBidirectionalChannel,
+  startDispatcher,
+  dispatcherLockPath,
 } from "../src/adapters/registry.js";
 import {
   loadEscalationConfig,
@@ -292,6 +295,101 @@ test("adapters: telegram plain message routes to the inbox handler (not an answe
   }
 });
 
+test("adapters: telegram concurrent pollOnce calls share one getUpdates round", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-tg-cc-"));
+  try {
+    let updatesCalled = 0;
+    const fetchImpl = (async (url: unknown) => {
+      const method = String(url).split("/").pop();
+      if (method === "sendMessage") {
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), { status: 200 });
+      }
+      if (method === "getUpdates") {
+        updatesCalled += 1;
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            result: [
+              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 7 } } },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`unexpected method: ${method}`);
+    }) as typeof fetch;
+
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "c", cwd: root, fetchImpl });
+    await adapter.send(sampleEscalation());
+
+    // Both calls are in flight together; the second must reuse the first's
+    // round instead of issuing a second getUpdates.
+    const first = adapter.pollOnce();
+    const second = adapter.pollOnce();
+    assert.equal(updatesCalled, 1, "concurrent pollOnce calls issue exactly one getUpdates");
+
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(a.length, 1);
+    assert.equal(a[0]?.answer, "rest");
+    assert.equal(b.length, 1);
+    assert.equal(b[0]?.answer, "rest");
+    assert.equal(updatesCalled, 1, "still exactly one getUpdates after both settle");
+    assert.equal(readAnswers("run-1", root).length, 1, "answer persisted once");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: telegram pollOnce keeps the offset on answer persistence failure (retry)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-tg-retry-"));
+  try {
+    let getUpdatesCalls = 0;
+    const fetchImpl = (async (url: unknown) => {
+      const method = String(url).split("/").pop();
+      if (method === "sendMessage") {
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), { status: 200 });
+      }
+      if (method === "getUpdates") {
+        getUpdatesCalls += 1;
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            result: [
+              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 7 } } },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`unexpected method: ${method}`);
+    }) as typeof fetch;
+
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "c", cwd: root, fetchImpl });
+    await adapter.send(sampleEscalation());
+
+    // Sabotage answer persistence: the answers dir path is occupied by a
+    // regular file, so ensureAnswersDir's recursive mkdirSync throws EEXIST.
+    writeFileSync(join(root, ".work-state", "cto", "run-1", "answers"), "blocker");
+
+    await assert.rejects(() => adapter.pollOnce(), /EEXIST/);
+    assert.equal(getUpdatesCalls, 1);
+    assert.deepEqual(readAnswers("run-1", root), [], "failed persistence wrote no answer");
+
+    // Unblock and poll again: the same update is re-delivered (the offset did
+    // not advance past the failed update) and processed to completion.
+    rmSync(join(root, ".work-state", "cto", "run-1", "answers"));
+    const answers = await adapter.pollOnce();
+    assert.equal(getUpdatesCalls, 2);
+    assert.equal(answers.length, 1);
+    assert.equal(answers[0]?.answer, "rest");
+    const persisted = readAnswers("run-1", root);
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0]?.answer, "rest");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("adapters: handleInboxTask files a task under the active run and is idempotent", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-inbox-"));
   try {
@@ -306,7 +404,8 @@ test("adapters: handleInboxTask files a task under the active run and is idempot
     assert.equal(tasks.length, 1, "onTask called once");
     assert.equal(tasks[0]?.runId, runId);
 
-    // Same task id again -> dropped (wx), onTask not re-invoked.
+    // Same task id again -> dropped (wx), onTask NOT re-invoked: the first
+    // write wins and wakes; duplicates are at-most-once.
     const again = handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, (t) => tasks.push(t));
     assert.equal(again, null, "duplicate task id dropped");
     assert.equal(tasks.length, 1, "onTask not re-invoked for duplicates");
@@ -484,6 +583,246 @@ test("adapters: telegram sendPlainText posts plain text without markup", async (
     assert.equal(payload?.text, "status reply");
     assert.equal("reply_markup" in (payload ?? {}), false, "plain text, no reply markup");
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: handleInboxTask propagates a failing wake and retries it", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-inbox-wake-"));
+  try {
+    const runId = resolveInboxRunId(root);
+    let calls = 0;
+    const onTask = () => {
+      calls += 1;
+      if (calls === 1) throw new Error("wake failed (transport down)");
+    };
+    // First attempt: the file is written, then the wake throws — the
+    // exception must reach the transport (not be hidden as a null result)
+    // and the just-created file is removed so the next poll retries with a
+    // fresh write instead of hitting a wx collision (which would skip the
+    // wake and lose the update).
+    assert.throws(
+      () => handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, onTask),
+      /wake failed/,
+    );
+    assert.equal(
+      readdirSync(inboxDir(runId, root)).filter((n) => n.endsWith(".json")).length,
+      0,
+      "failed-wake file removed for a clean retry",
+    );
+    // Retry: no wx collision — the file is written fresh and the wake fires
+    // again until it succeeds.
+    const path = handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, onTask);
+    assert.ok(path, "retry writes the file");
+    assert.equal(calls, 2, "wake retried until it succeeds");
+    assert.equal(
+      readdirSync(inboxDir(runId, root)).filter((n) => n.endsWith(".json")).length,
+      1,
+      "exactly one inbox file after the successful retry",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: pollInbox keeps the drop file and retries the wake on callback failure", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-drop-retry-"));
+  try {
+    const drop = join(root, ".omp", "inbox");
+    mkdirSync(drop, { recursive: true });
+    writeFileSync(join(drop, "task-a.json"), JSON.stringify({ id: "local-a", text: "Task from local drop" }));
+
+    let calls = 0;
+    const onTask = () => {
+      calls += 1;
+      if (calls === 1) throw new Error("wake failed");
+    };
+
+    await pollInbox(root, null, onTask);
+    assert.equal(calls, 1, "first wake attempt fails");
+    assert.equal(existsSync(join(drop, "processed", "task-a.json")), false, "drop file kept in place for retry");
+
+    // Next tick: the wake succeeds and the drop file is finally processed.
+    await pollInbox(root, null, onTask);
+    assert.equal(calls, 2, "wake retried on the next tick");
+    assert.ok(existsSync(join(drop, "processed", "task-a.json")), "drop file moved to processed after a successful wake");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: dispatcher tick never overlaps (one drain+poll pass at a time)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-tick-"));
+  try {
+    let active = 0;
+    let maxActive = 0;
+    let polls = 0;
+    const stub = {
+      kind: "telegram",
+      send: async () => ({ sent: false }),
+      cancel: async () => undefined,
+      pollOnce: async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        active -= 1;
+        polls += 1;
+        return [];
+      },
+    } as unknown as import("../src/adapters/telegram.js").TelegramEscalationAdapter;
+
+    // Interval (40ms) is much shorter than a poll pass (120ms): without the
+    // no-overlap guard ticks would pile up and poll concurrently.
+    const stop = startDispatcher(root, stub, 40);
+    await new Promise((resolve) => setTimeout(resolve, 550));
+    stop();
+
+    assert.equal(maxActive, 1, "poll passes never overlap");
+    assert.ok(polls >= 2, `dispatcher kept ticking after the first pass (${polls} passes)`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: answer dedupe is scoped per root, not global", async () => {
+  const rootA = mkdtempSync(join(tmpdir(), "cto-dedupe-a-"));
+  const rootB = mkdtempSync(join(tmpdir(), "cto-dedupe-b-"));
+  try {
+    const answersA: Array<{ id: string; answer: string }> = [];
+    const answersB: Array<{ id: string; answer: string }> = [];
+    const stub = {
+      kind: "telegram",
+      pollOnce: async () => [{ id: "run-1/team-a/q1", answer: "use grpc" }],
+    } as unknown as import("../src/adapters/telegram.js").TelegramEscalationAdapter;
+
+    await pollInbox(rootA, stub, undefined, (a) => answersA.push(a));
+    // The same esc id in a DIFFERENT cwd must still wake (no global dedupe).
+    await pollInbox(rootB, stub, undefined, (a) => answersB.push(a));
+    assert.equal(answersA.length, 1);
+    assert.equal(answersB.length, 1, "different cwd wakes independently");
+    // The same root still dedupes (contract preserved).
+    await pollInbox(rootA, stub, undefined, (a) => answersA.push(a));
+    assert.equal(answersA.length, 1, "same root still dedupes");
+  } finally {
+    rmSync(rootA, { recursive: true, force: true });
+    rmSync(rootB, { recursive: true, force: true });
+  }
+});
+
+test("adapters: ensureStandbyRun reuses an existing active standby run", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-standby-reuse-"));
+  try {
+    const first = resolveInboxRunId(root);
+    assert.ok(first.startsWith("standby-"), "standby run created when none active");
+    // A direct call must not mint a second run with a fresh inbox: tasks
+    // filed by the bridge before /cto starts must land in the SAME standby
+    // inbox, otherwise the command would start a second run and miss them.
+    const again = ensureStandbyRun(root);
+    assert.equal(again, first, "existing active standby run reused");
+    assert.equal(
+      readdirSync(inboxDir(first, root)).filter((n) => n.endsWith(".json")).length,
+      0,
+      "no second run dir with an empty inbox",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("adapters: only one dispatcher owns a cwd across live sessions", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-dispatch-owner-"));
+  let firstStop: (() => void) | undefined;
+  let secondStop: (() => void) | undefined;
+  let thirdStop: (() => void) | undefined;
+  try {
+    let firstPolls = 0;
+    let secondPolls = 0;
+    const tasks = [
+      { id: "tg:1", text: "first message", at: new Date().toISOString() },
+      { id: "tg:2", text: "second message", at: new Date().toISOString() },
+    ];
+    const firstReceived: string[] = [];
+    const secondReceived: string[] = [];
+    const makeAdapter = (onPoll: () => void) => {
+      let handler: ((task: { id: string; text: string; at: string }) => void) | undefined;
+      let delivered = false;
+      return {
+        kind: "telegram",
+        send: async () => ({ sent: false }),
+        cancel: async () => undefined,
+        setPlainMessageHandler: (nextHandler: typeof handler) => {
+          handler = nextHandler;
+        },
+        pollOnce: async () => {
+          onPoll();
+          if (!delivered) {
+            delivered = true;
+            for (const task of tasks) handler?.(task);
+          }
+          return [];
+        },
+      } as unknown as TelegramEscalationAdapter;
+    };
+
+    firstStop = startDispatcher(root, makeAdapter(() => (firstPolls += 1)), 5, {
+      onTask: (task) => firstReceived.push(task.text),
+    });
+    secondStop = startDispatcher(root, makeAdapter(() => (secondPolls += 1)), 5, {
+      onTask: (task) => secondReceived.push(task.text),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    secondStop?.();
+    firstStop?.();
+
+    let thirdPolls = 0;
+    thirdStop = startDispatcher(root, makeAdapter(() => (thirdPolls += 1)), 5);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.ok(firstPolls >= 1, "the first dispatcher owns and polls the cwd");
+    assert.equal(secondPolls, 0, "a second live session must not create another poller");
+    assert.ok(thirdPolls >= 1, "a stopped owner releases the cwd for the next session");
+    assert.deepEqual(firstReceived, ["first message", "second message"], "the owner wakes for every inbound task");
+    assert.deepEqual(secondReceived, [], "the non-owner never receives a split wake");
+  } finally {
+    thirdStop?.();
+    secondStop?.();
+    firstStop?.();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("adapters: stale dispatcher lease is reclaimed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-dispatch-stale-"));
+  let stop: (() => void) | undefined;
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    const staleAt = new Date(Date.now() - 60_000).toISOString();
+    writeFileSync(
+      dispatcherLockPath(root),
+      JSON.stringify({ pid: process.pid, token: "stale", startedAt: staleAt, heartbeatAt: staleAt }),
+    );
+
+    let polls = 0;
+    stop = startDispatcher(
+      root,
+      {
+        kind: "telegram",
+        send: async () => ({ sent: false }),
+        cancel: async () => undefined,
+        pollOnce: async () => {
+          polls += 1;
+          return [];
+        },
+      } as unknown as TelegramEscalationAdapter,
+      5,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    stop?.();
+
+    assert.ok(polls >= 1, "a stale owner must not block the next dispatcher");
+  } finally {
+    stop?.();
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -1,6 +1,11 @@
 /**
  * CTO-mode reminder — per-turn delegation reminder while a CTO run is active.
  *
+ * The CTO is the MAIN AGENT of the session (the resident product assistant):
+ * `/cto` runs in-session and is never dispatched via `task(agent=cto)` —
+ * the reminder states that so neither the main agent nor a subagent spawns
+ * a nested CTO.
+ *
  * Wired as a `context` hook: that event fires before EVERY LLM call (main
  * session and subagents alike). When an active CTO run exists under
  * `.work-state/cto/` (detected via core `findActiveCtoRun`), the handler
@@ -38,7 +43,7 @@ interface CachedRef {
 const cache = new Map<string, CachedRef>();
 
 /**
- * Build the reminder text. Kept short (~70 tokens) because it is paid on
+ * Build the reminder text. Kept short (~90 tokens) because it is paid on
  * every LLM call while a run is active.
  */
 export function buildCtoModeReminder(run: CtoRunRef): string {
@@ -49,6 +54,9 @@ export function buildCtoModeReminder(run: CtoRunRef): string {
     "- Orchestrator (the CTO): decompose and delegate problems to teams via `task`; never code or patch yourself.",
     "- Team lead: every slice goes to a worker via `task`; escalate what you cannot decide to the CTO.",
     "- Worker: complete your single task; escalate blockers to your lead; never re-delegate or expand scope.",
+    "The CTO is THE MAIN AGENT of this session (the resident CTO) — never spawned: do not run",
+    "`task(agent=cto)` / `task(agent=@cto)`; the role has no nested form. The CTO stays on-line",
+    "after each wave and returns to standby (await the next `[CTO-INBOX]` task).",
   ].join("\n");
 }
 

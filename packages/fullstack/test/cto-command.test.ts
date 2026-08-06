@@ -79,6 +79,12 @@ test("fullstack: /cto command loads and parses an envelope", async () => {
 		assert.ok(!result.includes("(no teams configured)"), "no fallback hint when teams exist");
 		assert.ok(result.includes("Leads never write source"), "lead self-coding forbidden in the contract");
 		assert.ok(result.includes("You ARE the orchestrator"), "single-CTO rule in the contract");
+		assert.ok(result.includes("resident CTO"), "main-session CTO role in the contract");
+		assert.ok(
+			result.includes("task(agent=cto)") && result.includes("task(agent=@cto)"),
+			"nested CTO dispatch forbidden in the contract",
+		);
+		assert.ok(result.includes("return to standby"), "CTO returns to standby after the wave");
 		assert.ok(result.includes("debug-cycle"), "bug-fix slices run debug-cycle through the team");
 		assert.ok(result.includes("Architecture first"), "architecture stage in the contract");
 	} finally {
@@ -129,7 +135,11 @@ test("fullstack: empty args start CTO STANDBY", async () => {
 	const result = await cmd.execute([], fakeCtx as never);
 	assert.ok(result.includes("/cto STANDBY"), "empty args start standby mode");
 	assert.ok(result.includes("[CTO-INBOX]"), "standby documents the wake envelope");
+	assert.ok(result.includes("Adopt or persist the standby run"), "standby reuses queued tasks instead of creating a second run");
 	assert.ok(result.includes("awaiting inbox tasks"), "standby names the inbox contract");
+	assert.ok(result.includes("ARE USER COMMANDS"), "inbox messages are user commands to the main-session CTO");
+	assert.ok(result.includes("return to standby"), "standby returns to standby after each wave");
+	assert.ok(result.includes("task(agent=@cto)"), "nested CTO dispatch forbidden in standby");
 });
 
 test("fullstack: parseEnvelope falls back to branch=null outside a git work tree", () => {
@@ -180,6 +190,7 @@ test("fullstack: /cto routes to AMEND when an active run exists", async () => {
 		assert.ok(result.includes("/cto AMEND"), "second /cto returns the amend contract");
 		assert.ok(result.includes("Add feature B"), "new task folded in");
 		assert.ok(result.includes("Do NOT start a second run"), "single orchestrator rule");
+		assert.ok(result.includes("resident CTO"), "amend keeps the main-session CTO role");
 
 		// A finished run no longer amends.
 		const doneRun = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
@@ -251,6 +262,7 @@ test("fullstack: /cto prompt embeds the channel section from .omp/escalation.jso
 		const withChannel = buildCtoPrompt(parseEnvelope("Add OAuth", root), root);
 		assert.ok(withChannel.includes("BIDIRECTIONAL"), "telegram rendered as bidirectional");
 		assert.ok(withChannel.includes("NEVER use the `ask` tool"), "ask banned in messenger mode");
+		assert.ok(withChannel.includes("USER COMMAND"), "inbox tasks are user commands in messenger mode");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

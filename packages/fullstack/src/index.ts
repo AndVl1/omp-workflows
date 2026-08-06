@@ -124,6 +124,22 @@ function beforeAgentStartMarkerHandler(
  * once at extension load while the controller is bound at session start.
  */
 const subagentTreeRef: { current: SubagentTreeController | null } = { current: null };
+/** One dispatcher per interactive main session/cwd; subagents must not poll Telegram. */
+const dispatcherStopsByCwd = new Map<string, () => void>();
+
+/**
+ * Task subagents run with `hasUI: false` and load the same extension. Only the
+ * interactive main session may own the product messenger dispatcher; otherwise
+ * every lead/worker creates another getUpdates consumer with its own offset.
+ * Unknown contexts are treated as main for compatibility with older OMP/test
+ * runtimes that did not expose `hasUI` on session_start.
+ */
+export function isMainSessionContext(ctx: unknown): boolean {
+	if (!ctx || typeof ctx !== "object") return true;
+	if (!("hasUI" in ctx)) return true;
+	return ctx.hasUI !== false;
+}
+
 
 export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   registerTeamWorkflow(pi, {
@@ -186,35 +202,44 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     // previous view state (on/off + verbose/compact) survives restarts.
     const ui = extractUiFromContext(ctx);
     if (ui) subagentTreeRef.current = registerSubagentTree(pi, ui, cwd);
-    // CTO escalation dispatcher: when the project configures an escalation
-    // channel (.omp/escalation.json), drain the outbox on every session
-    // start (pending escalations survive restarts — R7) and keep polling.
+    // CTO escalation dispatcher: only the interactive main session may own
+    // Telegram polling. Task subagents also emit session_start, but starting a
+    // dispatcher there creates another getUpdates consumer with offset=0.
+    if (!isMainSessionContext(ctx)) return;
+    dispatcherStopsByCwd.get(cwd)?.();
+    dispatcherStopsByCwd.delete(cwd);
     const config = loadEscalationConfig(cwd);
-    if (config) {
-      const adapter = createEscalationAdapter(config, cwd);
-      if (adapter) {
-        startDispatcher(cwd, adapter, 10_000, {
-          // Wake the CTO session on an inbound task: idle starts a turn,
-          // streaming queues as steer. The [CTO-INBOX] envelope is the
-          // contract the standby/CTO prompt tells the agent to fold in.
-          onTask: (task: InboxTask) => {
-            pi.sendUserMessage(
-              `[CTO-INBOX] New task via messenger (run \`${task.runId ?? "?"}\`):\n${task.text}\n\n` +
-                "Treat this as a /cto task — fold it into the active run (amend discipline: re-plan, " +
-                "spawn leads in parallel, integration covers ALL teams).",
-            );
-          },
-          // Wake on a user-initiated answer (reply / button) so the agent
-          // reacts without waiting for the next checkpoint poll.
-          onAnswer: (answer) => {
-            pi.sendUserMessage(
-              `[CTO-ANSWER] User answered escalation \`${answer.id}\` with: ${answer.answer}\n\n` +
-                `Read \`.work-state/cto/${answer.id.split("/")[0] ?? "?"}/answers/${answer.id.replace(/[^a-zA-Z0-9-_]/g, "-")}.json\` ` +
-                "and apply it now if the waiting team is still parked; otherwise treat it as advisory.",
-            );
-          },
-        });
-      }
-    }
+    if (!config) return;
+    const adapter = createEscalationAdapter(config, cwd);
+    if (!adapter) return;
+    const stopDispatcher = startDispatcher(cwd, adapter, 10_000, {
+      // Wake the CTO session on an inbound task: idle starts a turn,
+      // streaming queues as steer. The [CTO-INBOX] envelope is the
+      // contract the standby/CTO prompt tells the agent to fold in.
+      onTask: (task: InboxTask) => {
+        pi.sendUserMessage(
+          `[CTO-INBOX] New task via messenger (run \`${task.runId ?? "?"}\`):\n${task.text}\n\n` +
+            "Treat this as a /cto task — fold it into the active run (amend discipline: re-plan, " +
+            "spawn leads in parallel, integration covers ALL teams).",
+        );
+      },
+      // Wake on a user-initiated answer (reply / button) so the agent
+      // reacts without waiting for the next checkpoint poll.
+      onAnswer: (answer) => {
+        pi.sendUserMessage(
+          `[CTO-ANSWER] User answered escalation \`${answer.id}\` with: ${answer.answer}\n\n` +
+            `Read \`.work-state/cto/${answer.id.split("/")[0] ?? "?"}/answers/${answer.id.replace(/[^a-zA-Z0-9-_]/g, "-")}.json\` ` +
+            "and apply it now if the waiting team is still parked; otherwise treat it as advisory.",
+        );
+      },
+    });
+    dispatcherStopsByCwd.set(cwd, stopDispatcher);
+  });
+  pi.on("session_shutdown", (_event: unknown, ctx: unknown) => {
+    if (!isMainSessionContext(ctx)) return;
+    const cwd = extractCwdFromContext(ctx);
+    if (!cwd) return;
+    dispatcherStopsByCwd.get(cwd)?.();
+    dispatcherStopsByCwd.delete(cwd);
   });
 }

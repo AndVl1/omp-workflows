@@ -140,6 +140,20 @@ test("bridge: task writes are wx-idempotent (duplicate delivery skipped)", () =>
   }
 });
 
+test("bridge: persistence failures propagate instead of looking like duplicate delivery", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-write-error-"));
+  try {
+    const drop = join(root, ".omp", "inbox");
+    mkdirSync(drop, { recursive: true });
+    // A directory at the deterministic task path proves the write was not
+    // durable; treating any existing path as a duplicate would lose the update.
+    mkdirSync(join(drop, "tg-11.json"));
+    assert.throws(() => writeTaskDrop(root, MSG), /EEXIST|EISDIR|directory|is a directory/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("bridge: sendTelegramText posts to the bot API and reports ok", async () => {
   let payload: Record<string, unknown> | null = null;
   const fetchImpl = (async (url: unknown, init: unknown) => {

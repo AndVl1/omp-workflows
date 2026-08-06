@@ -2,6 +2,14 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.15.0] — 2026-08-06
+### Added
+- **Resident CTO mode** — `/cto` now runs as the main-session assistant, stays active after each wave, and folds subsequent messenger/inbox tasks into the same run without nested CTO dispatch.
+- **Reliable Telegram/inbox dispatch** — Telegram polling is serialized, update offsets remain retryable after persistence failures, only the interactive main session owns the dispatcher, and inbound tasks wake standby or active CTO runs.
+- **Explicit CTO nesting guard** — core blocks direct and batched `task` calls targeting `cto`/`@cto`.
+### Verified
+- Core: 101/101 tests passed. Fullstack: 143/143 tests passed. Build, typecheck, whitespace check, and `node --check packages/fullstack/bin/tg-bridge.mjs` passed.
+
 ## [0.14.0] — 2026-08-06
 ### Added
 - **LLM-driven zero-step classification** — `/do-work` now requires a semantic Phase 0 classification before profile selection, workflow reads, or agent delegation. Keyword and task-length heuristics are no longer used by the custom command.

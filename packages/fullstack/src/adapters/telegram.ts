@@ -57,6 +57,10 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   private onPlainMessage: TelegramAdapterOptions["onPlainMessage"];
   private offset = 0;
   private polling = false;
+  /** In-flight getUpdates round — concurrent pollOnce calls share it (one getUpdates per adapter). */
+  private pollInFlight: Promise<EscalationAnswer[]> | null = null;
+  /** Bumped on every start(); lets a stale loop notice a stop+restart. */
+  private loopGeneration = 0;
 
   constructor(options: TelegramAdapterOptions) {
     this.token = options.token;
@@ -132,16 +136,52 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   start(): () => void {
     if (this.polling) return () => undefined;
     this.polling = true;
-    const timer = setInterval(() => void this.pollOnce(), this.pollIntervalMs);
-    void this.pollOnce();
+    const generation = ++this.loopGeneration;
+    void this.pollLoop(generation);
     return () => {
       this.polling = false;
-      clearInterval(timer);
     };
   }
 
-  /** One getUpdates round: writes any answer files, advances the offset. */
+  /**
+   * Self-scheduling poll loop: the next round starts only after the previous
+   * one completed (a long-poll round can block up to `timeout: 30`), so there
+   * is never more than one in-flight getUpdates per adapter.
+   */
+  private async pollLoop(generation: number): Promise<void> {
+    while (this.polling && generation === this.loopGeneration) {
+      try {
+        await this.pollOnce();
+      } catch {
+        // One bad round must not kill the loop; the next iteration retries
+        // from the unconfirmed offset (updates are not lost).
+      }
+      if (!this.polling || generation !== this.loopGeneration) break;
+      const { promise, resolve } = deferred<void>();
+      setTimeout(resolve, this.pollIntervalMs);
+      await promise;
+    }
+  }
+
+  /**
+   * One getUpdates round. Concurrent callers share the same in-flight round,
+   * so at most one getUpdates request is issued per adapter at any time. The
+   * offset is advanced only after an update was processed successfully: a
+   * callback/answer persistence failure keeps the update unconfirmed so
+   * Telegram re-delivers it on the next poll (no lost messages).
+   */
   async pollOnce(): Promise<EscalationAnswer[]> {
+    if (this.pollInFlight) return this.pollInFlight;
+    const round = this.runPollOnce();
+    this.pollInFlight = round;
+    try {
+      return await round;
+    } finally {
+      if (this.pollInFlight === round) this.pollInFlight = null;
+    }
+  }
+
+  private async runPollOnce(): Promise<EscalationAnswer[]> {
     if (!this.polling && this.offset === 0) this.polling = true;
     const updates = (await this.api("getUpdates", {
       offset: this.offset,
@@ -150,9 +190,11 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     })) as TgUpdate[];
     const answers: EscalationAnswer[] = [];
     for (const update of updates) {
-      this.offset = Math.max(this.offset, update.update_id + 1);
+      // Process first, confirm after: a persistence failure throws before the
+      // offset moves, leaving this update (and everything after it) queued.
       const answer = this.answerFromUpdate(update);
       if (answer) answers.push(this.writeAnswer(answer));
+      this.offset = Math.max(this.offset, update.update_id + 1);
     }
     return answers;
   }
@@ -233,4 +275,22 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
 
 function runIdOf(esc: Escalation): string {
   return esc.id.split("/")[0] ?? esc.id;
+}
+
+/**
+ * Node 20-compatible `Promise.withResolvers` (which is Node 22+ / ES2024);
+ * mirrors the repo convention in packages/e2e/src/util.ts.
+ */
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
