@@ -32,6 +32,7 @@ import {
   registerEscalationAdapter,
   isBidirectionalChannel,
   startDispatcher,
+  dispatcherLockPath,
 } from "../src/adapters/registry.js";
 import {
   loadEscalationConfig,
@@ -724,6 +725,104 @@ test("adapters: ensureStandbyRun reuses an existing active standby run", () => {
       "no second run dir with an empty inbox",
     );
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("adapters: only one dispatcher owns a cwd across live sessions", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-dispatch-owner-"));
+  let firstStop: (() => void) | undefined;
+  let secondStop: (() => void) | undefined;
+  let thirdStop: (() => void) | undefined;
+  try {
+    let firstPolls = 0;
+    let secondPolls = 0;
+    const tasks = [
+      { id: "tg:1", text: "first message", at: new Date().toISOString() },
+      { id: "tg:2", text: "second message", at: new Date().toISOString() },
+    ];
+    const firstReceived: string[] = [];
+    const secondReceived: string[] = [];
+    const makeAdapter = (onPoll: () => void) => {
+      let handler: ((task: { id: string; text: string; at: string }) => void) | undefined;
+      let delivered = false;
+      return {
+        kind: "telegram",
+        send: async () => ({ sent: false }),
+        cancel: async () => undefined,
+        setPlainMessageHandler: (nextHandler: typeof handler) => {
+          handler = nextHandler;
+        },
+        pollOnce: async () => {
+          onPoll();
+          if (!delivered) {
+            delivered = true;
+            for (const task of tasks) handler?.(task);
+          }
+          return [];
+        },
+      } as unknown as TelegramEscalationAdapter;
+    };
+
+    firstStop = startDispatcher(root, makeAdapter(() => (firstPolls += 1)), 5, {
+      onTask: (task) => firstReceived.push(task.text),
+    });
+    secondStop = startDispatcher(root, makeAdapter(() => (secondPolls += 1)), 5, {
+      onTask: (task) => secondReceived.push(task.text),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    secondStop?.();
+    firstStop?.();
+
+    let thirdPolls = 0;
+    thirdStop = startDispatcher(root, makeAdapter(() => (thirdPolls += 1)), 5);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.ok(firstPolls >= 1, "the first dispatcher owns and polls the cwd");
+    assert.equal(secondPolls, 0, "a second live session must not create another poller");
+    assert.ok(thirdPolls >= 1, "a stopped owner releases the cwd for the next session");
+    assert.deepEqual(firstReceived, ["first message", "second message"], "the owner wakes for every inbound task");
+    assert.deepEqual(secondReceived, [], "the non-owner never receives a split wake");
+  } finally {
+    thirdStop?.();
+    secondStop?.();
+    firstStop?.();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("adapters: stale dispatcher lease is reclaimed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-dispatch-stale-"));
+  let stop: (() => void) | undefined;
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    const staleAt = new Date(Date.now() - 60_000).toISOString();
+    writeFileSync(
+      dispatcherLockPath(root),
+      JSON.stringify({ pid: process.pid, token: "stale", startedAt: staleAt, heartbeatAt: staleAt }),
+    );
+
+    let polls = 0;
+    stop = startDispatcher(
+      root,
+      {
+        kind: "telegram",
+        send: async () => ({ sent: false }),
+        cancel: async () => undefined,
+        pollOnce: async () => {
+          polls += 1;
+          return [];
+        },
+      } as unknown as TelegramEscalationAdapter,
+      5,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    stop?.();
+
+    assert.ok(polls >= 1, "a stale owner must not block the next dispatcher");
+  } finally {
+    stop?.();
     rmSync(root, { recursive: true, force: true });
   }
 });
