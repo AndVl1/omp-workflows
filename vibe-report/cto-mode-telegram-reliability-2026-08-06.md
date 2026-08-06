@@ -53,6 +53,7 @@ Telegram delivery защищён от конкурирующих pollers и пе
 - `packages/fullstack/test/adapters.test.ts` — concurrent poll sharing, offset retry, failed wake retry, serialized dispatcher ticks, per-root answer dedupe и standby reuse.
 - `packages/fullstack/test/dispatcher-lifecycle.test.ts` — main-only dispatcher boundary.
 - `packages/fullstack/test/telegram-bridge.test.ts` — persistence error не считается duplicate delivery.
+- `packages/e2e/test/cto-inbox-mock.test.ts` — реальный node-pty + WS text surface, fake `omp`, mock Telegram adapter: две inbox-задачи приходят во время wave 1 и обе входят в wave 2.
 - Обновлены CTO prompt/reminder assertions.
 
 ## Проверка
@@ -63,7 +64,12 @@ Telegram delivery защищён от конкурирующих pollers и пе
 - `npm run typecheck` — core, e2e и fullstack, включая command TS config.
 - `npm run test -w @andvl1/omp-workflows-core` — **101/101**.
 - `npm run test -w @andvl1/omp-workflows-fullstack` — **143/143**.
+- `npm run test -w @andvl1/omp-workflows-e2e` — **73/73**.
+- `node --test --import tsx test/cto-inbox-mock.test.ts` — **4 последовательных запуска, 4/4 PASS**.
+- `npx tsc --noEmit ... test/cto-inbox-mock.test.ts` — OK.
 - `node --check packages/fullstack/bin/tg-bridge.mjs` — OK.
+
+Mock E2E подтверждает полный сценарий без LLM и Telegram network: active resident wave 1 → два inbound task → durable files в том же `run-active/inbox` → оба `[CTO-INBOX]` wake на PTY/WS → wave 2 с обоими task IDs. Максимум concurrent mock polls: 1.
 
 Тесты печатают ожидаемые `fatal: not a git repository` строки из `parseEnvelope` при намеренной проверке временных каталогов вне git worktree; assertions проходят.
 
