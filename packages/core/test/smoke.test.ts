@@ -9,10 +9,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-
+import { tmpdir } from "node:os";
 import {
   registerTeamWorkflow,
   defaultFullstackRoles,
@@ -20,6 +20,7 @@ import {
   resolveWorkflow,
   selectProfile,
 } from "@andvl1/omp-workflows-core";
+import { classificationToolGate } from "../src/gates/classification.js";
 import { runStage } from "../src/engine/stage.js";
 
 test("core: loadAllProfiles returns 9 profiles", async () => {
@@ -99,6 +100,18 @@ test("core: registerTeamWorkflow registers gates but NOT commands", () => {
 		0,
 		"extension must not register slash commands",
 	);
+});
+test("core: task gate blocks launches without zero-step state", () => {
+  const root = join(tmpdir(), `omp-gate-${Date.now()}`);
+  mkdirSync(join(root, ".work-state"), { recursive: true });
+  writeFileSync(join(root, ".work-state", ".active-feature"), "pending\n");
+  try {
+    const result = classificationToolGate({ toolName: "task" }, { cwd: root });
+    assert.equal(result?.block, true);
+    assert.match(result?.reason ?? "", /PHASE 0/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 test("core: workflow dispatch leaves model selection to OMP", async () => {
   const calls: Array<{ agent: string; task: string }> = [];

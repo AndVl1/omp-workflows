@@ -15,12 +15,11 @@
  * - `[AUTONOMOUS] <task> [issue=#N]` — autonomous mode.
  * - `<task> [issue=#N]`              — interactive mode.
  *
- * Returns a fully-formed prompt that:
- *  1. Sets the workflow discipline (discovery → architecture → implementation
- *     → review → manual-qa → qa-tests for full-feature).
- *  2. Resolves the role mapping from `.omp/team.config.json`.
- *  3. Names the next classified profile so the main agent picks the right
- *     workflow.
+ * Returns a classification-first prompt that:
+ *  1. Makes the main LLM semantically understand the task before routing.
+ *  2. Resolves the profile only after the classification gate.
+ *  3. Walks the selected profile through the main agent's `task` tool.
+ *  4. Resolves role mapping from `.omp/team.config.json`.
  *
  * Backwards compatibility: a sibling command `/team` (`commands/team/index.ts`)
  * is shipped as a thin alias that delegates to the same `parseEnvelope` /
@@ -31,9 +30,7 @@
 import { execSync } from "node:child_process";
 import type { CustomCommand, CustomCommandAPI } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/types";
 import type { HookCommandContext } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/types";
-import { classifyTask, resolveWorkflowName } from "./_lib/classify.js";
 import { loadTeamConfig } from "./_lib/config.js";
-import { loadWorkflowProfile, renderStagesSkeleton, resolveWorkflowProfilePath } from "./_lib/profile.js";
 
 const AUTONOMOUS_PREFIX = "[AUTONOMOUS";
 
@@ -74,102 +71,78 @@ export function parseEnvelope(args: string, cwd: string): ParsedEnvelope {
 }
 
 /**
- * Build the workflow prompt the main agent will execute.
- *
- * Same output regardless of whether the user invoked `/do-work` or `/team` —
- * the alias command delegates here.
+ * Build the first-pass prompt. Profile resolution is intentionally deferred:
+ * custom-TS commands cannot call the model directly, so this prompt is the
+ * handoff to the main LLM's semantic classification turn. It must not contain
+ * a resolved profile or stage skeleton; otherwise the model starts executing
+ * an heuristic route before understanding the task.
  */
 export function buildPrompt(envelope: ParsedEnvelope, cwd: string): string {
 	const config = loadTeamConfig(cwd);
-	const classification = classifyTask(envelope.task, { autonomous: envelope.autonomous });
-	const workflow = resolveWorkflowName(
-		classification.type,
-		classification.complexity,
-		envelope.autonomous,
-	);
 	const roles = Object.entries(config.roles ?? {});
 	const roleTable = roles
 		.map(([role, agent]) => `| \`${role}\` | \`${agent}\` |`)
 		.join("\n");
 
-	const profilePath = resolveWorkflowProfilePath(workflow, cwd);
-	const profile = profilePath ? loadWorkflowProfile(workflow, cwd) : null;
-	const profileSection = profile && profilePath
-		? [
-				`### Workflow profile: \`${profile.name}\` — ${profile.title}`,
-				...(profile.description ? [`> ${profile.description}`] : []),
-				`Profile file (absolute, existence-checked — read exactly this one file):`,
-				`  \`${profilePath}\``,
-				"Stages (skeleton — order, types, gates, checkpoints; produces/consumes are in the file above):",
-				renderStagesSkeleton(profile),
-			].join("\n")
-		: `- Workflow profile: \`packages/core/workflows/${workflow}.json\` (not found from this cwd — locate it, e.g. \`find .. -name "${workflow}.json" -path "*workflows*" -not -path "*/node_modules/*"\`; only as a last resort)`;
-
 	const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
 	const branchMeta = envelope.branch ? `Branch: \`${envelope.branch}\`\n` : "Branch: (no git work tree)\n";
 	const autonomousMeta = envelope.autonomous
-		? "Autonomous mode: ON. Skip user checkpoints; apply `autonomous` decision for every `checkpoint` stage.\n"
-		: "Autonomous mode: OFF. Pause at each `checkpoint` stage for user review.\n";
+		? "Autonomous mode: ON. After classification, apply the profile's autonomous decisions.\n"
+		: "Autonomous mode: OFF. After classification, pause at profile checkpoints for user review.\n";
 
 	return [
-		"/do-work workflow — execute via your `task` tool.",
+		"/do-work classification pass — understand the task before selecting a workflow.",
 		"",
 		"### Task",
 		envelope.task,
 		"",
 		"### Metadata",
 		issueMeta + branchMeta + autonomousMeta,
-		"### Classification",
-		`- Type: ${classification.type}`,
-		`- Complexity: ${classification.complexity}`,
-		`- Confidence: ${classification.confidence}`,
-		`- Workflow: \`${workflow}\``,
+		"### PHASE 0: INTELLIGENT CLASSIFICATION (zero step)",
+		"Before any other tool call — no `read`, `glob`, `grep`, `bash`, `edit`, `write`, or `task` — understand the task semantically.",
+		"Do NOT use keyword counts, task length, or language-specific keyword lists. Infer the requested outcome, primary intent, scope, constraints, risk, and whether code changes are actually requested.",
 		"",
-		profileSection,
+		"Return this visible block before continuing:",
+		"CLASSIFICATION:",
+		"- Type: FEATURE | REFACTOR | OPS | BUG_FIX | INVESTIGATION | REVIEW | HOTFIX",
+		"- Complexity: QUICK | MEDIUM | COMPLEX | CRITICAL",
+		"- Workflow: resolved from the matrix below",
+		"- Confidence: HIGH | MEDIUM | LOW",
+		"- Reason: concise evidence-based explanation",
 		"",
+		"Then write `.work-state/team-state.json` (or the active feature state) with the classification, resolved workflow, task, autonomous flag, and initial pending stages. This state write is the gate before any investigation or delegation.",
+		"If confidence is LOW, ask a focused clarification question before writing an expansive workflow (unless autonomous mode is ON; then document a conservative default).",
+		"",
+		"### Workflow resolution (only after PHASE 0)",
+		"Resolve the profile from the semantic classification, not from heuristics:",
+		"| Type | QUICK | MEDIUM | COMPLEX | CRITICAL |",
+		"| --- | --- | --- | --- | --- |",
+		"| FEATURE | lightweight | standard | full-feature | full-feature |",
+		"| REFACTOR | lightweight | standard | full-feature | full-feature |",
+		"| OPS | lightweight | standard | standard | standard |",
+		"| BUG_FIX | bug-fix | debug-cycle | debug-cycle | debug-cycle |",
+		"| INVESTIGATION | research | research | research | research |",
+		"| REVIEW | review | review | review | review |",
+		"| HOTFIX | emergency | emergency | emergency | emergency |",
+		"",
+		"### Only after state is written",
+		"1. Read exactly the resolved workflow profile file and then its stages.",
+		"2. Walk the selected profile in order; do not execute any stage before classification and state persistence.",
+		"3. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch.",
+		"4. Honour gates, checkpoints, loops, typed artifacts, and the validation contract.",
 		"### Role mapping (from .omp/team.config.json)",
 		"| Role | Agent |",
 		"| --- | --- |",
 		roleTable || "| (no roles configured) | |",
 		"",
-		"### Required workflow",
-		[
-			"1. Walk the stages declared in the matched profile in order.",
-			"2. For each `single` stage, call `task` once with the resolved agent.",
-			"3. For each `consilium` stage, call `task` with `{ context, tasks: [...] }` for parallel fan-out.",
-			"4. Honour `gate` blocks — stop until DoD holds.",
-			"5. Honour `checkpoint` stages — pause unless autonomous.",
-			"6. Honour `loop` — re-run `back_to` until `until` is satisfied or `max_iterations` is reached.",
-			"7. Write each stage's typed artifact to `.work-state/artifacts/<id>.json`.",
-			"",
-			"### Failure modes to avoid",
-			"- Do NOT re-delegate from a subagent (rogue router).",
-			"- Do NOT skip the `before_agent_start` classification gate.",
-			"- Do NOT mark a stage done when its `artifacts` are empty.",
-			"",
-			"### File access rule (hard)",
-			"- The workflow profile path in Classification is ABSOLUTE and verified to exist. Read exactly that one file for the stage list, gates, checkpoints, produces/consumes.",
-			"- Do NOT glob `**/workflows/**` or `**/profiles/**`.",
-			"- Do NOT run `find` over the filesystem (`find / …`) to locate workflow definitions.",
-			"- Do NOT read the command's own sources (`.omp/commands/do-work/**`, `_lib/**`, `classify.ts`).",
-			"- Do NOT scan `~/.omp/plugins/**`, `node_modules/**`, or `~/.omp/agent/**` looking for configs or workflow copies.",
-			"- Do NOT re-read `.omp/team.config.json` — the resolved role table is above. The only legitimate file reads are the project's own source files needed to implement the task.",
-			"- If the profile path is missing, only then locate it (e.g. `find .. -name \"<name>.json\" -path \"*workflows*\"`) and start there.",
-		].join("\n"),
-		"",
-		"### Subagent validation contract (machine-checked, v0.7.0+)",
-		"For any stage that produces a code-bearing artifact (`implementation`, `review_fixes`), the engine inspects the produced JSON before handing it to the next stage. Required: `ready: true`, `validation_run: \"true\"` (string), and non-empty `validation_evidence` containing verbatim build/test output. A subagent that returns `ready: true` without these is rejected — the stage is marked `failed` and you re-spawn the developer. There is NO escape hatch: phrases like \"orchestrator owns validation\", \"subagent skips tests\", `validation_run: \"false\"` do not exist in the engine. If a subagent's task is genuinely unvalidatable, mark the stage `failed` and have the developer fix it.",
-		"",
-		"### Orchestrator discipline (you are the dispatcher, not the coder)",
-		"- You do NOT edit source code. If a subagent's output is wrong, re-spawn with a sharper task. Do not patch their artifact by hand.",
-		"- You do NOT second-guess build/test output by re-running it. The subagent owns the validation evidence; you trust it or re-spawn.",
-		"- You do NOT skip stages to \"save time\". The profile order is the contract.",
-		"- You do NOT mark a stage done to unblock downstream work. If the gate rejected, surface the rejection and re-spawn.",
-		"- When a stage fails validation, your only job is to call the same agent again with the gate's reason as the new task. The reason is in the stage outcome's `note` field — copy it verbatim into the re-spawn prompt so the subagent can fix the gap.",
-		"",
-		"Begin with the first stage of the resolved workflow now.",
+		"### Hard constraints",
+		"- Do NOT call `task` during classification.",
+		"- Do NOT glob for workflow files or scan installed plugins.",
+		"- Do NOT read command sources or reconstruct classification from keywords.",
+		"- Do NOT mark a stage done without its required artifact and gate evidence.",
 	].join("\n");
 }
+
 
 const factory = (api: CustomCommandAPI): CustomCommand => ({
 	name: "do-work",

@@ -2,6 +2,13 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.14.0] — 2026-08-06
+### Added
+- **LLM-driven zero-step classification** — `/do-work` now requires a semantic Phase 0 classification before profile selection, workflow reads, or agent delegation. Keyword and task-length heuristics are no longer used by the custom command.
+- **Bundle-independent classification gate** — core blocks `task` launches when workflow state exists without persisted classification; fullstack and VK Android adapters share the same contract while retaining their own agent roles and domain policies.
+### Verified
+- VK Android bundle targeted tests: 9 passed, 0 failed.
+
 ## [0.13.0] — 2026-08-06
 ### Added
 - **Live subagent-tree widget** (`packages/fullstack/src/subagent-tree.ts`, 560 lines) — per-session `SubagentTreeController` subscribes to OMP's `task:subagent:lifecycle` EventBus channel and renders a compact / expandable HUD above the editor plus inline task cards in the transcript (start/finish/progress). Persistent state under `.work-state/subagent-tree/<cwd>.json`. Commands: `on` / `off` / `toggle` / `verbose` / `compact` / `clear` / `status`.
