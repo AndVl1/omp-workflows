@@ -20,9 +20,9 @@ import { resolve, join } from "node:path";
 import { resolveWorkflow } from "../engine/profile.js";
 import type { Classification, Complexity, TaskType } from "../engine/types.js";
 
+const WORK_STATE_DIR = ".work-state";
 const ACTIVE_FEATURE = ".active-feature";
 const LEGACY_STATE = "team-state.json";
-
 interface AgentStartEvent {
   /** Optional agent type/name. */
   agent?: string;

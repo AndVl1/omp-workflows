@@ -9,8 +9,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
   registerTeamWorkflow,
@@ -103,6 +104,7 @@ test("core: registerTeamWorkflow registers gates but NOT commands", () => {
 test("core: task gate blocks launches without zero-step state", () => {
   const root = join(tmpdir(), `omp-gate-${Date.now()}`);
   mkdirSync(join(root, ".work-state"), { recursive: true });
+  writeFileSync(join(root, ".work-state", ".active-feature"), "pending\n");
   try {
     const result = classificationToolGate({ toolName: "task" }, { cwd: root });
     assert.equal(result?.block, true);
