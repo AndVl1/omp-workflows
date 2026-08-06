@@ -20,7 +20,8 @@ import { resolve, join } from "node:path";
 import { resolveWorkflow } from "../engine/profile.js";
 import type { Classification, Complexity, TaskType } from "../engine/types.js";
 
-const WORK_STATE_DIR = ".work-state";
+const ACTIVE_FEATURE = ".active-feature";
+const LEGACY_STATE = "team-state.json";
 
 interface AgentStartEvent {
   /** Optional agent type/name. */
@@ -44,6 +45,11 @@ export function classificationToolGate(event: ToolCallEvent, ctx: AgentStartCont
   if (event.toolName !== "task") return;
   const wsDir = resolve(ctx.cwd, WORK_STATE_DIR);
   if (!existsSync(wsDir)) return;
+  // Other tools (e2e, observability, CTO) may use `.work-state/` without
+  // running the team workflow. Only a workflow pointer arms this gate.
+  const active = join(wsDir, ACTIVE_FEATURE);
+  const legacy = join(wsDir, LEGACY_STATE);
+  if (!existsSync(active) && !existsSync(legacy)) return;
   if (!resolveStatePath(ctx.cwd)) {
     return {
       block: true,
@@ -51,7 +57,6 @@ export function classificationToolGate(event: ToolCallEvent, ctx: AgentStartCont
     };
   }
 }
-
 export function classificationGate(event: AgentStartEvent, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
   const statePath = resolveStatePath(ctx.cwd);
   if (!statePath) return;
