@@ -19,7 +19,7 @@
  *   }
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   ctoStateDir,
@@ -176,11 +176,117 @@ async function sendWithRetry(adapter: EscalationAdapter, esc: Escalation, maxRet
   return { sent: false };
 }
 
+const DISPATCHER_LEASE_TTL_MS = 30_000;
+const DISPATCHER_HEARTBEAT_MS = 5_000;
+
+interface DispatcherLeaseRecord {
+  pid: number;
+  token: string;
+  startedAt: string;
+  heartbeatAt: string;
+}
+
+interface DispatcherLease {
+  path: string;
+  token: string;
+}
+
+/** Cross-process ownership file: one messenger dispatcher per project cwd. */
+export function dispatcherLockPath(root: string): string {
+  return join(root, ".omp", "cto-dispatcher.lock");
+}
+
+function readDispatcherLease(path: string): DispatcherLeaseRecord | null {
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<DispatcherLeaseRecord>;
+    if (
+      typeof raw.pid === "number" &&
+      typeof raw.token === "string" &&
+      typeof raw.startedAt === "string" &&
+      typeof raw.heartbeatAt === "string"
+    ) {
+      return raw as DispatcherLeaseRecord;
+    }
+  } catch {
+    // A partially written or missing lease is handled by the claimant.
+  }
+  return null;
+}
+
+function isDispatcherLeaseAlive(lease: DispatcherLeaseRecord): boolean {
+  const heartbeatAt = Date.parse(lease.heartbeatAt);
+  if (!Number.isFinite(heartbeatAt) || Date.now() - heartbeatAt > DISPATCHER_LEASE_TTL_MS) return false;
+  try {
+    process.kill(lease.pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "EEXIST");
+}
+
+function claimDispatcher(root: string): DispatcherLease | null {
+  const path = dispatcherLockPath(root);
+  const token = `${process.pid}:${Date.now()}:${Math.random()}`;
+  const now = new Date().toISOString();
+  const record = JSON.stringify({ pid: process.pid, token, startedAt: now, heartbeatAt: now }, null, 2);
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(path, record, { flag: "wx" });
+    return { path, token };
+  } catch (error) {
+    if (!isAlreadyExists(error)) return null;
+    const existing = readDispatcherLease(path);
+    if (existing && isDispatcherLeaseAlive(existing)) return null;
+    try {
+      if (!existing) {
+        const mtimeMs = statSync(path).mtimeMs;
+        if (Date.now() - mtimeMs <= DISPATCHER_LEASE_TTL_MS) return null;
+      }
+      rmSync(path, { force: true });
+      writeFileSync(path, record, { flag: "wx" });
+      return { path, token };
+    } catch {
+      return null;
+    }
+  }
+}
+
+function ownsDispatcherLease(lease: DispatcherLease): boolean {
+  return readDispatcherLease(lease.path)?.token === lease.token;
+}
+
+function refreshDispatcherLease(lease: DispatcherLease): void {
+  const current = readDispatcherLease(lease.path);
+  if (!current || current.token !== lease.token) return;
+  try {
+    writeFileSync(lease.path, JSON.stringify({ ...current, heartbeatAt: new Date().toISOString() }, null, 2));
+  } catch {
+    // The next tick will stop when ownership can no longer be confirmed.
+  }
+}
+
+function releaseDispatcherLease(lease: DispatcherLease): void {
+  if (!ownsDispatcherLease(lease)) return;
+  try {
+    rmSync(lease.path, { force: true });
+  } catch {
+    // Best-effort release; the heartbeat TTL handles crashed owners.
+  }
+}
+
 /**
  * Start the dispatcher loop; returns a stop function. Each tick drains the
  * outbox and polls the inbox exactly once; ticks never overlap — a tick that
  * outlives the interval is skipped until the previous one completes (no
  * double-drain, no double-poll of the same updates).
+ *
+ * A project may have more than one interactive omp session. Only the process
+ * holding the lease polls and wakes that project's CTO; this keeps Telegram
+ * updates and local-drop wakes on one deterministic session.
  */
 export function startDispatcher(
   root: string,
@@ -188,8 +294,18 @@ export function startDispatcher(
   intervalMs = 10_000,
   opts: DispatcherOptions = {},
 ): () => void {
+  const lease = claimDispatcher(root);
+  if (!lease) return () => undefined;
+  const heartbeat = setInterval(() => refreshDispatcherLease(lease), DISPATCHER_HEARTBEAT_MS);
   const { onTask, onAnswer } = opts;
-  const inboxHandler = (task: InboxTask) => handleInboxTask(root, task, onTask);
+  const wakeTask = (task: InboxTask): void => {
+    if (!ownsDispatcherLease(lease)) throw new Error("messenger dispatcher lease lost before task wake");
+    onTask?.(task);
+  };
+  const wakeAnswer = (answer: { id: string; answer: string }): void => {
+    if (ownsDispatcherLease(lease)) onAnswer?.(answer);
+  };
+  const inboxHandler = (task: InboxTask) => handleInboxTask(root, task, wakeTask);
   // Only the Telegram adapter exposes setPlainMessageHandler; http is
   // send-only. Cast at the boundary once, guarded at runtime.
   const telegramLike = adapter as { setPlainMessageHandler: (h: (t: InboxTask) => void) => void } | null;
@@ -198,11 +314,11 @@ export function startDispatcher(
   }
   let ticking = false;
   const tick = async (): Promise<void> => {
-    if (ticking) return;
+    if (ticking || !ownsDispatcherLease(lease)) return;
     ticking = true;
     try {
       await drainOutbox(root, adapter);
-      await pollInbox(root, adapter, onTask, onAnswer);
+      await pollInbox(root, adapter, wakeTask, wakeAnswer);
     } catch {
       // drain/poll never throw in practice; keep the loop alive regardless.
     } finally {
@@ -212,7 +328,11 @@ export function startDispatcher(
   const timer = setInterval(() => void tick(), intervalMs);
   // Drain once immediately on start (survives restarts — R7).
   void tick();
-  return () => clearInterval(timer);
+  return () => {
+    clearInterval(timer);
+    clearInterval(heartbeat);
+    releaseDispatcherLease(lease);
+  };
 }
 
 // ── CTO task inbox ─────────────────────────────────────────────────────────
