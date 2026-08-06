@@ -2,6 +2,14 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.13.0] — 2026-08-06
+### Added
+- **Live subagent-tree widget** (`packages/fullstack/src/subagent-tree.ts`, 560 lines) — per-session `SubagentTreeController` subscribes to OMP's `task:subagent:lifecycle` EventBus channel and renders a compact / expandable HUD above the editor plus inline task cards in the transcript (start/finish/progress). Persistent state under `.work-state/subagent-tree/<cwd>.json`. Commands: `on` / `off` / `toggle` / `verbose` / `compact` / `clear` / `status`.
+- **`/subagents` slash command** — registered via `pi.registerCommand` from `packages/fullstack/src/index.ts`. Known OMP 17.2.x limitation documented in `vibe-report/subagent-tree-manual-qa-2026-08-06.md`: `pi.registerCommand` is silently ignored in 17.2.x — slash dispatches only from `.omp/commands/` files; widget layer still works.
+- **21 unit tests** (`packages/fullstack/test/subagent-tree.test.ts`): controller state, lifecycle/progress payloads, command toggles, compact/expanded rendering, persistent state, inline-card renderer.
+### Verified
+- 134/134 fullstack unit tests green (was 113); typecheck + build clean. Manual-qa via `playwright-cli` + e2e web surface (`packages/e2e`): TUI renders, `/task` spawns subagents, built-in OMP HUD + LLM summary flow end-to-end on omp 17.2.9. Screenshots + repro script in `vibe-report/subagent-tree-manual-qa-2026-08-06.md`.
+
 ## [0.12.2] — 2026-08-05
 ### Fixed
 - **`bin/tg-bridge.mjs` missing from the published package** — `files` did not include `bin`, so the standalone bridge was absent from the installed tarball. Added `bin` to `files` (0.12.1 shipped without it; 0.12.2 is the publishable release).
