@@ -45,15 +45,22 @@ import {
 const ROLE_COUNT = defaultFullstackModelRoles.length;
 
 /**
- * Narrow the `session_start` context to a usable cwd string. The OMP
- * extension API exposes ExtensionContext.cwd at runtime but the bundled
- * .d.ts lacks a typed overload for this hook, so we hand-narrow at the
- * boundary instead of an unchecked cast.
+ * Resolve the `session_start` context to a usable cwd string. An explicit
+ * non-empty `ctx.cwd` always wins. OMP 17.2.10 emits `session_start` without
+ * a `cwd` field on the context object, so we fall back to `process.cwd()` —
+ * the directory the OMP session was launched from — instead of silently
+ * skipping dispatcher/command-copy startup (no `.omp/cto-dispatcher.lock`
+ * appeared until a probe used `process.cwd()`). The extension API exposes
+ * ExtensionContext.cwd at runtime but the bundled .d.ts lacks a typed
+ * overload for this hook, so we hand-narrow at the boundary instead of an
+ * unchecked cast. Non-object contexts (unknown/legacy hook invocations)
+ * still resolve to undefined.
  */
-function extractCwdFromContext(ctx: unknown): string | undefined {
+export function resolveSessionCwd(ctx: unknown): string | undefined {
 	if (!ctx || typeof ctx !== "object") return undefined;
 	const candidate = "cwd" in ctx ? ctx.cwd : undefined;
-	return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+	if (typeof candidate === "string" && candidate.length > 0) return candidate;
+	return process.cwd();
 }
 
 /**
@@ -194,7 +201,7 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   // Best-effort, never throws: any IO error is captured by
   // `ensureCommandsForSession` and dropped.
   pi.on("session_start", (_event: SessionStartEvent, ctx: unknown) => {
-    const cwd = extractCwdFromContext(ctx);
+    const cwd = resolveSessionCwd(ctx);
     if (!cwd) return;
     ensureCommandsForSession(cwd);
     // Subagent-tree live widget — bound to the cwd of the active session.
@@ -237,9 +244,12 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   });
   pi.on("session_shutdown", (_event: unknown, ctx: unknown) => {
     if (!isMainSessionContext(ctx)) return;
-    const cwd = extractCwdFromContext(ctx);
+    const cwd = resolveSessionCwd(ctx);
     if (!cwd) return;
     dispatcherStopsByCwd.get(cwd)?.();
     dispatcherStopsByCwd.delete(cwd);
   });
 }
+
+// ── cto-safety (br-zps.4, br-zps.5, br-zps.6) ──
+export { MockEscalationAdapter, registerMockAdapter } from "./adapters/mock.js";

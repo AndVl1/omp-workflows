@@ -23,6 +23,7 @@ import { monotonicGate } from "./gates/monotonic.js";
 import { dodBackstop } from "./gates/dod-backstop.js";
 import { safetyGuard } from "./gates/safety.js";
 import { ctoNestingGuard } from "./gates/cto-nesting.js";
+import { outboxEnforcementGate } from "./gates/outbox.js";
 import { registerObservabilityHooks } from "./observability/index.js";
 import { registerWorkflowProfiles } from "./engine/profile.js";
 import type { RoleConfig } from "./engine/types.js";
@@ -134,6 +135,8 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 		const c = ctx as { cwd: string };
 		const nestedCto = ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]);
 		if (nestedCto?.block) return nestedCto;
+		const outboxGate = outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], c);
+		if (outboxGate?.block) return outboxGate;
 		const r0 = classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c);
 		if (r0?.block) return r0;
 		return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
@@ -306,3 +309,49 @@ export {
  * commands to short-circuit when no engine is present.
  */
 export const CORE_ENGINE_MARKER = "omp-workflows-core/0.8.0";
+
+// ── cto-core (br-zps.1, br-zps.3, br-zps.11) ────────────────────────────────
+export {
+	migrateCtoState,
+	canonicalizeState,
+} from "./cto/state.js";
+export {
+	acquireLease,
+	heartbeatLease,
+	releaseLease,
+	isLeaseAlive,
+	reclaimDeadLeases,
+} from "./cto/leases.js";
+export { recordDecision, recallDecisions, decisionsToMarkdown } from "./cto/decisions.js";
+export type {
+	BudgetPolicy,
+	BudgetAccounting,
+	BudgetState,
+	BudgetStatus,
+	TeamLease,
+	DecisionMemoryEntry,
+	QuarantineRecord,
+	RunHealth,
+	SchedulerState,
+	ScheduledDigest,
+	RedactionConfig,
+	RefinementResult,
+	DissentTrigger,
+	DissentEvaluation,
+} from "./cto/types.js";
+
+// ── cto-safety (br-zps.4, br-zps.5, br-zps.6) ───────────────────────────────
+export { redactEscalation, DEFAULT_REDACTION_CONFIG } from "./cto/redaction.js";
+export { outboxEnforcementGate } from "./gates/outbox.js";
+export type { EscalationInboundMessage } from "./cto/types.js";
+
+// ── cto-operations (br-zps.2, br-zps.7, br-zps.8) ───────────────────────────
+export { defaultBudgetState, checkBudget, recordSpend, setBudgetPolicy, CHAR_HEURISTIC_RECORDER } from "./cto/budget.js";
+export type { BudgetRecorder } from "./cto/budget.js";
+export { assessRunHealth, healthToMarkdown } from "./cto/health.js";
+export { shouldRunWave, buildDigest, startWaveScheduler } from "./cto/scheduler.js";
+
+// ── cto-quality (br-zps.9, br-zps.10) ───────────────────────────────────────
+export { refineTask, validateRefinement } from "./cto/refinement.js";
+export { evaluateDissent } from "./cto/dissent.js";
+export { dissentGate } from "./cto/gates.js";

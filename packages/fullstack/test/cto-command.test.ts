@@ -140,6 +140,8 @@ test("fullstack: empty args start CTO STANDBY", async () => {
 	assert.ok(result.includes("ARE USER COMMANDS"), "inbox messages are user commands to the main-session CTO");
 	assert.ok(result.includes("return to standby"), "standby returns to standby after each wave");
 	assert.ok(result.includes("task(agent=@cto)"), "nested CTO dispatch forbidden in standby");
+	assert.ok(result.includes("(schema 2,"), "standby writer instructed to emit schema-2 state (core parity)");
+	assert.ok(!result.includes("schema 1"), "no schema-1 drift in the shipped standby prompt");
 });
 
 test("fullstack: parseEnvelope falls back to branch=null outside a git work tree", () => {

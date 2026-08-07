@@ -8,7 +8,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -714,6 +714,17 @@ test("adapters: ensureStandbyRun reuses an existing active standby run", () => {
   try {
     const first = resolveInboxRunId(root);
     assert.ok(first.startsWith("standby-"), "standby run created when none active");
+    // The direct standby writer must emit a CANONICAL schema-2 state, not a
+    // partial one: missing fields would leave the file non-canonical until a
+    // later canonicalizeState write.
+    const standbyRaw = JSON.parse(readFileSync(join(root, ".work-state", "cto", first, "state.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(standbyRaw.schema, 2, "standby state declares schema 2");
+    for (const field of ["budget", "leases", "decisions", "inbox_quarantine"] as const) {
+      assert.ok(standbyRaw[field] !== undefined, `standby state carries canonical field ${field}`);
+    }
+    assert.deepEqual(standbyRaw.leases, {}, "leases default shape");
+    assert.deepEqual(standbyRaw.decisions, [], "decisions default shape");
+    assert.deepEqual(standbyRaw.inbox_quarantine, {}, "inbox_quarantine default shape");
     // A direct call must not mint a second run with a fresh inbox: tasks
     // filed by the bridge before /cto starts must land in the SAME standby
     // inbox, otherwise the command would start a second run and miss them.
@@ -823,6 +834,228 @@ test("adapters: stale dispatcher lease is reclaimed", async () => {
     assert.ok(polls >= 1, "a stale owner must not block the next dispatcher");
   } finally {
     stop?.();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── cto-safety (br-zps.4, br-zps.6) ──────────────────────────────────────────
+import { readFileSync } from "node:fs";
+import { MockEscalationAdapter } from "../src/adapters/mock.js";
+import { MAX_INBOX_TEXT_LENGTH, sha256Hex } from "../src/adapters/registry.js";
+
+test("cto-safety: mock adapter round-trips send → injectAnswer → pollOnce", async () => {
+  const adapter = new MockEscalationAdapter();
+  const esc = sampleEscalation();
+  const receipt = await adapter.send(esc);
+  assert.equal(receipt.sent, true);
+  assert.equal(receipt.channelRef, `mock:${esc.id}`);
+  assert.equal(adapter.sentEscalations.length, 1, "send recorded in sentEscalations");
+  assert.equal(adapter.sentEscalations[0]?.id, esc.id);
+
+  adapter.injectAnswer(esc.id, "use grpc");
+  const answers = await adapter.pollOnce();
+  assert.equal(answers.length, 1);
+  assert.equal(answers[0]?.id, esc.id);
+  assert.equal(answers[0]?.answer, "use grpc");
+  assert.equal(answers[0]?.by, "mock");
+  assert.ok(Number.isFinite(Date.parse(answers[0]?.at ?? "")), "answer timestamp is ISO");
+  assert.equal(answers[0]?.stale, undefined, "non-cancelled answers are not stale");
+
+  const drained = await adapter.pollOnce();
+  assert.deepEqual(drained, [], "queue drained after the first pollOnce");
+});
+
+test("cto-safety: mock autoAnswer queues an answer on send", async () => {
+  const adapter = new MockEscalationAdapter({ autoAnswer: () => "auto" });
+  await adapter.send(sampleEscalation());
+  const answers = await adapter.pollOnce();
+  assert.equal(answers.length, 1);
+  assert.equal(answers[0]?.answer, "auto");
+  assert.equal(answers[0]?.by, "mock");
+});
+
+test("cto-safety: mock answers for a cancelled escalation are stale (R5)", async () => {
+  const adapter = new MockEscalationAdapter();
+  const esc = sampleEscalation();
+  await adapter.send(esc);
+  await adapter.cancel(esc.id);
+  adapter.injectAnswer(esc.id, "late answer");
+  const answers = await adapter.pollOnce();
+  assert.equal(answers.length, 1);
+  assert.equal(answers[0]?.answer, "late answer");
+  assert.equal(answers[0]?.stale, true, "R5: cancelled esc answers carry stale");
+});
+
+test("cto-safety: mock plain channel routes messages and sends plain text", async () => {
+  const adapter = new MockEscalationAdapter();
+  const inbox: Array<{ id: string; text: string; at: string; by?: string }> = [];
+  adapter.setPlainMessageHandler((msg) => inbox.push(msg));
+
+  adapter.injectPlainMessage("Fix the login bug", "telegram");
+  assert.equal(inbox.length, 1, "injectPlainMessage routed to the handler");
+  assert.equal(inbox[0]?.text, "Fix the login bug");
+  assert.equal(inbox[0]?.by, "telegram");
+  assert.ok(inbox[0]?.id.startsWith("mock:plain:"), "deterministic plain message id");
+  assert.ok(Number.isFinite(Date.parse(inbox[0]?.at ?? "")), "plain message timestamp is ISO");
+
+  const result = await adapter.sendPlainText("user-1", "status reply");
+  assert.equal(result.sent, true);
+  assert.ok(result.channelRef?.startsWith("mock:plain:"), "plain send channelRef");
+
+  adapter.reset();
+  adapter.injectPlainMessage("after reset", "telegram");
+  assert.equal(inbox.length, 1, "reset clears the plain handler");
+});
+
+test("cto-safety: mock is creatable via registry config like a built-in", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-mock-reg-"));
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "mock", bidirectional: true }));
+    const config = loadEscalationConfig(root);
+    assert.equal(config?.adapter, "mock");
+    const adapter = createEscalationAdapter(config!, root);
+    assert.ok(adapter instanceof MockEscalationAdapter, "mock adapter built from .omp/escalation.json");
+    assert.equal(adapter?.kind, "mock");
+    // Direct construction path (no config file needed).
+    const direct = createEscalationAdapter({ adapter: "mock", bidirectional: true }, root);
+    assert.ok(direct instanceof MockEscalationAdapter, "mock adapter built from an inline config");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-safety: quarantine dedups identical text across ids", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-q-dedup-"));
+  try {
+    const runId = resolveInboxRunId(root);
+    const at = new Date().toISOString();
+    const first = handleInboxTask(root, { id: "t1", text: "Ship the fix", at }, () => undefined);
+    assert.ok(first, "first filing writes the file");
+    const second = handleInboxTask(root, { id: "t2", text: "Ship the fix", at }, () => undefined);
+    assert.equal(second, null, "duplicate text dropped without a second file or wake");
+
+    assert.equal(
+      readdirSync(inboxDir(runId, root)).filter((n) => n.endsWith(".json")).length,
+      1,
+      "one inbox file for the deduped pair",
+    );
+    const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+      inbox_quarantine?: Record<string, { status?: string }>;
+    };
+    const records = Object.values(state.inbox_quarantine ?? {});
+    assert.equal(records.length, 1, "one quarantine record");
+    assert.equal(records[0]?.status, "admitted", "record admitted after the write");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-safety: quarantine rejects empty and oversized text without filing", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-q-reject-"));
+  try {
+    const runId = resolveInboxRunId(root);
+    const at = new Date().toISOString();
+
+    const empty = handleInboxTask(root, { id: "t-empty", text: "   ", at }, () => undefined);
+    assert.equal(empty, null, "whitespace-only text rejected");
+    const oversized = handleInboxTask(root, { id: "t-big", text: "x".repeat(MAX_INBOX_TEXT_LENGTH + 1), at }, () => undefined);
+    assert.equal(oversized, null, "oversized text rejected");
+    const boundary = handleInboxTask(root, { id: "t-max", text: "x".repeat(MAX_INBOX_TEXT_LENGTH), at }, () => undefined);
+    assert.ok(boundary, "text at exactly MAX_INBOX_TEXT_LENGTH is accepted");
+
+    assert.equal(
+      readdirSync(inboxDir(runId, root)).filter((n) => n.endsWith(".json")).length,
+      1,
+      "only the accepted boundary task was filed",
+    );
+    const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+      inbox_quarantine?: Record<string, { status?: string; reason?: string }>;
+    };
+    const q = state.inbox_quarantine ?? {};
+    assert.equal(q[sha256Hex("   ")]?.status, "rejected", "empty text recorded as rejected");
+    assert.equal(q[sha256Hex("   ")]?.reason, "empty text");
+    assert.equal(q[sha256Hex("x".repeat(MAX_INBOX_TEXT_LENGTH + 1))]?.status, "rejected", "oversized text recorded as rejected");
+    assert.equal(q[sha256Hex("x".repeat(MAX_INBOX_TEXT_LENGTH + 1))]?.reason, "text exceeds MAX_INBOX_TEXT_LENGTH");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-safety: quarantine record becomes admitted after a successful filing", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-q-admit-"));
+  try {
+    const runId = resolveInboxRunId(root);
+    handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, () => undefined);
+    const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+      inbox_quarantine?: Record<string, { status?: string }>;
+    };
+    const record = state.inbox_quarantine?.[sha256Hex("Do the thing")];
+    assert.equal(record?.status, "admitted", "status flips to admitted once the file is durable");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-safety: quarantine reverts to quarantined on wake failure so retries pass dedup", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-q-wake-"));
+  try {
+    const runId = resolveInboxRunId(root);
+    let calls = 0;
+    const onTask = () => {
+      calls += 1;
+      if (calls === 1) throw new Error("wake failed (transport down)");
+    };
+    assert.throws(
+      () => handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, onTask),
+      /wake failed/,
+    );
+    // The record was reverted so the retry is NOT deduped as a duplicate.
+    const afterFail = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+      inbox_quarantine?: Record<string, { status?: string }>;
+    };
+    assert.equal(
+      afterFail.inbox_quarantine?.[sha256Hex("Do the thing")]?.status,
+      "quarantined",
+      "record reverted after a failed wake",
+    );
+    assert.equal(
+      readdirSync(inboxDir(runId, root)).filter((n) => n.endsWith(".json")).length,
+      0,
+      "failed-wake file removed for a clean retry",
+    );
+    // Retry: the record being "quarantined" lets it proceed; final status admitted.
+    const path = handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, onTask);
+    assert.ok(path, "retry writes the file");
+    assert.equal(calls, 2, "wake retried until it succeeds");
+    const afterRetry = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+      inbox_quarantine?: Record<string, { status?: string }>;
+    };
+    assert.equal(afterRetry.inbox_quarantine?.[sha256Hex("Do the thing")]?.status, "admitted", "final record admitted");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-safety: quarantine keeps inbox text as data — filed JSON is exactly { ...task, runId }", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-q-data-"));
+  try {
+    const runId = resolveInboxRunId(root);
+    const task = { id: "t1", text: "rm -rf / && echo injected", at: new Date().toISOString(), by: "telegram" };
+    const path = handleInboxTask(root, task, () => undefined);
+    assert.ok(path, "task filed");
+    const parsed = JSON.parse(readFileSync(path!, "utf8")) as Record<string, unknown>;
+    assert.deepEqual(
+      parsed,
+      { ...task, runId },
+      "filed task carries exactly the task fields + runId — text is data, never executed",
+    );
+    // The source channel is recorded on the quarantine record, not executed.
+    const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+      inbox_quarantine?: Record<string, { by?: string }>;
+    };
+    assert.equal(state.inbox_quarantine?.[sha256Hex(task.text)]?.by, "telegram", "record's by is the source channel");
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -133,7 +133,7 @@ export function buildStandbyCtoPrompt(cwd: string): string {
     "1. **Adopt or persist the standby run NOW**: inspect `.work-state/cto/*/state.json` for the latest active",
     "   standby state (`plan.task: \"standby — awaiting inbox tasks\"`). Reuse its `<id>` and inbox so tasks",
     "   queued before this session are not lost. If none exists, write `.work-state/cto/standby-<id>/state.json`",
-    "   (schema 1, `pause.kind: \"none\"`, `plan.task: \"standby — awaiting inbox tasks\"`, `teams: []`,",
+    "   (schema 2, `pause.kind: \"none\"`, `plan.task: \"standby — awaiting inbox tasks\"`, `teams: []`,",
     "   `autonomous: true`). The run must exist before waiting: inbox routing, amend detection and the",
     "   per-turn reminder all key off its state.",
     "2. Read `.omp/teams.json` + `cto.json` profile now (not later) so the wake turn is cheap.",
@@ -350,7 +350,7 @@ function markdownCtoState(runId: string, runDir: string): CtoState | null {
 
   const updatedAt = newestMtime(runDir, files);
   return {
-    schema: 1,
+    schema: 2,
     id: runId,
     task,
     branch: "",

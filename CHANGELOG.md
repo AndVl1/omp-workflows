@@ -2,6 +2,16 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.17.0] — 2026-08-07
+### Added
+- **Durable CTO control plane** — `packages/core/src/cto/{budget,leases,health,scheduler,refinement,dissent,decisions,redaction}.ts` + `packages/fullstack/src/cto-scheduler-daemon.ts`: budget caps (`checkBudget`/`recordSpend`/`setBudgetPolicy`, all limits default to unlimited) with a char-heuristic spend recorder, team leases with fencing tokens and restart-safe TTL + PID liveness (`acquireLease`/`heartbeatLease`/`releaseLease`/`isLeaseAlive`/`reclaimDeadLeases`), run health assessment (`assessRunHealth`/`healthToMarkdown`) with additive `estimatedTokens`/`estimatedDollars`/`ctoRunHealth` on the observability rollup, wave scheduling (`shouldRunWave`/`buildDigest`/`startWaveScheduler`), five-whys task refinement (`refineTask`/`validateRefinement`), a conditional dissent gate (fires only on high-stakes/irreversible/contradicts-decision/budget-exceeded), and project decision memory (`recordDecision`/`recallDecisions`/`decisionsToMarkdown`).
+- **Canonical schema-2 CTO state** — `state.json` is now canonical: `migrateCtoState`/`canonicalizeState` migrate schema 1→2 additively and idempotently, with 14 shared schema-2 interfaces; standby runs persist complete schema-2 state and the shipped standby prompts align with the schema.
+- **Standby/inbox quarantine and dedup** — `handleInboxTask` quarantines inbound tasks: SHA-256 dedup against admitted hashes, rejection of empty/oversized payloads (>4000 chars), a `quarantined` → `admitted` lifecycle with rollback on wake failure, and inbox text treated strictly as data (never evaluated).
+- **Sanitized escalation outbox/answers** — `outboxEnforcementGate` blocks the interactive `ask` tool while a bidirectional channel is configured; deterministic `redactEscalation` (line-drop → inline-replace → truncate → marker; no LLM or randomness) backs `sanitizeEscalation`; `MockEscalationAdapter` (`kind: mock`, network-free) for offline testing.
+### Fixed
+- **Dispatcher session cwd fallback** — the fullstack `session_start`/`session_shutdown` handlers resolve the session cwd with extension-context precedence (OMP 17.2.10 emits `session_start` without a `cwd` field), falling back to `process.cwd()` instead of silently skipping dispatcher/command-copy startup.
+- **Node 20 test compatibility** — scheduler tests use `deferred()` instead of `Promise.withResolvers` (unavailable on Node 20).
+
 ## [0.16.0] — 2026-08-07
 ### Added
 - **Bundle-owned workflow profile registry** — `registerTeamWorkflow` now accepts `workflowProfiles`, making custom domain workflows available to core's profile loader and interpreter.
