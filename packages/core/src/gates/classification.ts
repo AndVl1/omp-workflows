@@ -17,7 +17,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
-import { resolveWorkflow } from "../engine/profile.js";
+import { isRegisteredWorkflow, matchesProfile, resolveWorkflow } from "../engine/profile.js";
 import type { Classification, Complexity, TaskType } from "../engine/types.js";
 
 const WORK_STATE_DIR = ".work-state";
@@ -87,6 +87,7 @@ export function classificationGate(event: AgentStartEvent, ctx: AgentStartContex
   const expected = resolveWorkflow(type, complexity, autonomous);
   const actual = c.workflow;
   if (actual && actual !== expected) {
+    if (isRegisteredWorkflow(actual) && matchesProfile(actual, { type, complexity })) return;
     return {
       block: true,
       reason: `BLOCK (P5): workflow '${actual}' does not match classification (type=${type} complexity=${complexity} autonomous=${autonomous} -> expected '${expected}'). Fix the workflow in team-state.json, or set workflow_override: true.`,

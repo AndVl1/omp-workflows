@@ -21,6 +21,26 @@ const SELECTION_ORDER: WorkflowName[] = [
   "review",
   "emergency",
 ];
+const registeredProfiles = new Map<string, Profile>();
+
+/** Register bundle-owned profiles for the core interpreter. */
+export function registerWorkflowProfiles(profiles: Profile[]): void {
+  for (const profile of profiles) {
+    if (!profile.name || !profile.stages?.length || !profile.match?.type) {
+      throw new Error(`invalid workflow profile registration: ${JSON.stringify(profile)}`);
+    }
+    registeredProfiles.set(profile.name, profile);
+  }
+}
+export function isRegisteredWorkflow(name: string): boolean {
+  return registeredProfiles.has(name) || loadAllProfiles().some((profile) => profile.name === name);
+}
+
+export function matchesProfile(name: string, c: Pick<Classification, "type" | "complexity">): boolean {
+  const profile = loadAllProfiles().find((candidate) => candidate.name === name);
+  if (!profile) return false;
+  return profile.match.type.includes(c.type) && (!profile.match.complexity || profile.match.complexity.includes(c.complexity));
+}
 
 export function findProfileDir(): string {
   // Distribution layout: <pkg>/dist/engine/profile.js -> <pkg>/workflows/
@@ -31,22 +51,26 @@ export function findProfileDir(): string {
 
 export function loadAllProfiles(): Profile[] {
   const dir = findProfileDir();
-  if (!existsSync(dir)) return [];
-  const result: Profile[] = [];
-  for (const name of readdirSync(dir)) {
-    if (!name.endsWith(".json")) continue;
-    if (name.startsWith("_") || name === "artifacts-schema.json" || name === "team.config.example.json" || name === "team.config.schema.json") continue;
-    const path = join(dir, name);
-    try {
-      const raw = JSON.parse(readFileSync(path, "utf8")) as Profile;
-      if (raw?.name && raw?.stages && raw?.match) result.push(raw);
-    } catch {
-      // skip malformed profile
+  const result = [...registeredProfiles.values()];
+  if (existsSync(dir)) {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".json")) continue;
+      if (name.startsWith("_") || name === "artifacts-schema.json" || name === "team.config.example.json" || name === "team.config.schema.json") continue;
+      const path = join(dir, name);
+      try {
+        const raw = JSON.parse(readFileSync(path, "utf8")) as Profile;
+        if (raw?.name && raw?.stages && raw?.match) result.push(raw);
+      } catch {
+        // skip malformed profile
+      }
     }
   }
-  // Keep selection order stable.
-  result.sort((a, b) => SELECTION_ORDER.indexOf(a.name) - SELECTION_ORDER.indexOf(b.name));
-  return result;
+  const unique = new Map(result.map((profile) => [profile.name, profile]));
+  return [...unique.values()].sort((a, b) => {
+    const ai = SELECTION_ORDER.indexOf(a.name);
+    const bi = SELECTION_ORDER.indexOf(b.name);
+    return (ai < 0 ? Number.MAX_SAFE_INTEGER : ai) - (bi < 0 ? Number.MAX_SAFE_INTEGER : bi);
+  });
 }
 
 export function loadProfile(name: WorkflowName): Profile | null {
@@ -94,6 +118,8 @@ export function resolveWorkflow(
  * classification. Returns null if no profile matches.
  */
 export function selectProfile(profiles: Profile[], c: Classification): Profile | null {
+  const explicit = profiles.find((p) => p.name === c.workflow);
+  if (explicit) return explicit;
   for (const name of SELECTION_ORDER) {
     const p = profiles.find((x) => x.name === name);
     if (!p) continue;

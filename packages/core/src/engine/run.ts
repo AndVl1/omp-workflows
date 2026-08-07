@@ -51,15 +51,14 @@ export async function run(opts: RunOptions): Promise<RunResult> {
 
   // 1. classify.
   const base = classify(opts.task, { autonomous: opts.autonomous });
+  const classifiedType = opts.classification?.type ?? base.type;
+  const classifiedComplexity = opts.classification?.complexity ?? base.complexity;
+  const explicitWorkflow = opts.classification?.workflow;
   const classification: Classification = {
-    type: opts.classification?.type ?? base.type,
-    complexity: opts.classification?.complexity ?? base.complexity,
+    type: classifiedType,
+    complexity: classifiedComplexity,
     confidence: opts.classification?.confidence ?? base.confidence,
-    workflow: resolveWorkflow(
-      opts.classification?.type ?? base.type,
-      opts.classification?.complexity ?? base.complexity,
-      opts.autonomous,
-    ),
+    workflow: explicitWorkflow ?? resolveWorkflow(classifiedType, classifiedComplexity, opts.autonomous),
   };
 
   // 2. select profile.

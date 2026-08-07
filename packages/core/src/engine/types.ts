@@ -17,7 +17,8 @@ export type WorkflowName =
   | "emergency"
   | "research"
   | "review"
-  | "cto";
+  | "cto"
+  | (string & {});
 
 export type StageType = "orchestrator" | "single" | "consilium" | "bash" | "none" | "team";
 
@@ -94,6 +95,8 @@ export interface Profile {
   description: string;
   match: ProfileMatch;
   stages: StageDef[];
+  /** Custom profiles are explicit-only unless registered as auto-selectable. */
+  autoSelect?: boolean;
 }
 
 export interface TeamState {
