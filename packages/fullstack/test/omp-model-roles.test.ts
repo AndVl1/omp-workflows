@@ -161,18 +161,6 @@ test("custom role names do not overlap built-in roles", () => {
 	assert.deepEqual(overlap, []);
 });
 
-test("every bundled agent frontmatter contains class role followed by standard fallback", () => {
-	const agentsDirectory = join(packageRoot, "agents");
-	for (const entry of MODEL_ROLES) {
-		for (const agent of entry.agents) {
-			const frontmatter = readFileSync(join(agentsDirectory, `${agent}.md`), "utf8");
-			const match = frontmatter.match(/^model:\s*\[\s*"(@[^\"]+)"\s*,\s*"(@[^\"]+)"\s*\]/m);
-			assert.ok(match, `${agent} must define a two-pattern model array`);
-			assert.equal(match?.[1], `@${entry.role}`, `${agent} class role`);
-			assert.equal(match?.[2], entry.standardFallback, `${agent} fallback role`);
-		}
-	}
-});
 
 test("inventory chain resolveEntry returns class selector when configured model matches inventory", async () => {
 	const { api } = createApi();
@@ -439,12 +427,7 @@ test("execute validate is NOT wrapped in the research marker", async () => {
 });
 
 test("ROLE_COUNT constant in the before_agent_start handler matches MODEL_ROLES.length", () => {
-	// The marker handler in `packages/fullstack/src/index.ts` exposes
-	// `details.roleCount` as a literal `ROLE_COUNT = 14` because the
-	// handler's `tsconfig.json` has `rootDir=src` and cannot import
-	// from `../commands/omp-model-roles/_roles.js` (TS6059). This test
-	// is the bridge: bump `ROLE_COUNT` and `MODEL_ROLES` together.
-	assert.equal(MODEL_ROLES.length, 14, "MODEL_ROLES length drifted from the handler's hard-coded ROLE_COUNT");
+	assert.equal(MODEL_ROLES.length, 13, "MODEL_ROLES length drifted from the handler's hard-coded ROLE_COUNT");
 });
 
 test("execute validate reports web_search=unknown header when toggle is unset", async () => {

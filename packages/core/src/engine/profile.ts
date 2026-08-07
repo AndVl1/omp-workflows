@@ -72,6 +72,10 @@ export function loadAllProfiles(): Profile[] {
     return (ai < 0 ? Number.MAX_SAFE_INTEGER : ai) - (bi < 0 ? Number.MAX_SAFE_INTEGER : bi);
   });
 }
+export function resolveWorkflowProfilePath(name: string, _cwd?: string): string | null {
+  const path = join(findProfileDir(), `${name}.json`);
+  return existsSync(path) ? path : null;
+}
 
 export function loadProfile(name: WorkflowName): Profile | null {
   return loadAllProfiles().find((p) => p.name === name) ?? null;

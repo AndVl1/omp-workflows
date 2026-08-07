@@ -121,13 +121,6 @@ lead ── task ──► workers (existing single-purpose agents)
 `decisions.md`. Read `state.json` before every step — it is the source of
 truth and survives compaction.
 
-## Relationship to the read-only coordinator
-
-The read-only `coordinator` (via /pulse) proposes next steps to the user —
-including "run `/cto <task>`". You are its executor brother: it directs, you
-decompose and drive. `coordinator-yolo` may invoke `/cto` for large backlog
-items in its night loop (one task per tick).
-
 ## When you start
 
 1. Read the task + team registry + `cto.json` profile.

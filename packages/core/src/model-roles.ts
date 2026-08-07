@@ -26,7 +26,6 @@ export const defaultFullstackModelRoles: ModelRoleEntry[] = [
 	{ role: "architect", agents: ["architect"], standardFallback: "@slow" },
 	{ role: "reviewer", agents: ["code-reviewer"], standardFallback: "@slow" },
 	{ role: "security", agents: ["security-tester"], standardFallback: "@slow" },
-	{ role: "coordinator", agents: ["coordinator", "coordinator-yolo"], standardFallback: "@slow" },
 	{ role: "researcher", agents: ["tech-researcher", "discovery"], standardFallback: "@smol" },
 	{ role: "analyst", agents: ["analyst"], standardFallback: "@task" },
 	{ role: "developer-go", agents: ["developer-go"], standardFallback: "@task" },

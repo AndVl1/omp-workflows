@@ -56,8 +56,8 @@ function roleLookup(values: Record<string, string | undefined>) {
 
 const fixedTimestamp = "2026-08-03T12:00:00.000Z";
 
-test("core model-roles: defaultFullstackModelRoles exposes 14 entries", () => {
-	assert.equal(defaultFullstackModelRoles.length, 14);
+test("core model-roles: defaultFullstackModelRoles exposes 13 entries", () => {
+	assert.equal(defaultFullstackModelRoles.length, 13);
 });
 
 test("core model-roles: every entry has role/agents/standardFallback", () => {

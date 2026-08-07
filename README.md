@@ -85,7 +85,6 @@ task:
     - analyst
     - architect
     - code-reviewer
-    - coordinator
     - developer-kotlin
     # ... полный список агентов из claude-plugin
 ```
@@ -115,28 +114,23 @@ omp-workflows-monorepo/
 ├── packages/
 │   ├── core/                 # @andvl1/omp-workflows-core
 │   │   ├── src/
-│   │   │   ├── engine/       # state, profile, stage, classify, scope, config, dod
-│   │   │   ├── gates/        # classification, monotonic, dod-backstop, safety
-│   │   │   ├── commands/     # team.ts (legacy envelope), shortcuts.ts
+│   │   │   ├── commands/     # do-work, CTO, shared command contracts
 │   │   │   ├── runtime-config.ts
 │   │   │   └── index.ts      # public API: registerTeamWorkflow(pi, opts)
-│   │   ├── workflows/        # 8 declarative JSON profiles + schemas
+│   │   ├── workflows/        # generic declarative profiles + schemas
 │   │   ├── test/             # smoke + integration tests
 │   │   └── package.json
 │   └── fullstack/            # @andvl1/omp-workflows-fullstack
-│       ├── src/
-│       │   └── index.ts      # default export: registerTeamWorkflow(pi, defaultFullstackRoles, ...)
-       ├── commands/         # 8 OMP custom-TS slash commands (do-work, pulse, team-next, ...)
-       │   ├── do-work/      # orchestrates /do-work: classify → resolve → return prompt
-       │   ├── team/         # thin alias for /do-work (kept for backwards compatibility)
-       │   ├── pulse/        # read-only project digest
-       │   ├── team-next/    # pop next queued task
-       │   ├── team-yolo/    # [AUTONOMOUS] wrapper
-       │   ├── init-team/    # write .omp/team.config.json
-│       └── coordinator-stats/  # profile-usage rollup
-│       ├── scripts/          # copy-commands.mjs — installs commands into .omp/commands/
-│       ├── agents/           # 17 agent markdown files
-│       ├── skills/           # 31 domain skills
+│       ├── src/index.ts      # bundle registration and discovery bootstrap
+│       ├── commands/         # 6 OMP custom-TS slash command adapters
+│       │   ├── cto/          # main-session CTO orchestration
+│       │   ├── do-work/      # core-backed classification workflow
+│       │   ├── team/         # compatibility alias for /do-work
+│       │   ├── init-team/
+│       │   ├── interview/
+│       │   └── omp-model-roles/
+│       ├── agents/            # 16 domain/team agents
+│       ├── skills/            # 27 domain skills
 │       └── package.json
 ├── .github/workflows/
 │   └── release.yml           # tag-driven publish to GitHub Packages
@@ -151,37 +145,19 @@ directly. So as of v0.4.0, the workflow engine splits cleanly:
 
 - **Extension** (`packages/fullstack/src/index.ts`) registers gates and
   writes the runtime config. It does **not** register slash commands.
-- **Custom-TS commands** (`packages/fullstack/commands/<name>/index.ts`)
-  ship as OMP custom-TS commands. Each parses the envelope, reads
-  `.omp/team.config.json`, and returns a prompt the main agent runs
-  through its own `task` tool.
-- **`copy-commands.mjs`** (run after install) copies the bundled commands
-  into `<project>/.omp/commands/` so OMP can discover them.
-
-Custom-TS commands receive `HookCommandContext` (ui, cwd, sessionManager,
-modelRegistry) — they can NOT call `task` directly. They either:
-
-1. Return a string prompt (the main agent runs the workflow through its own `task` tool), or
-2. Inspect filesystem state and return a digest (the LLM or user acts on it).
+- **Custom-TS commands** (`packages/fullstack/commands/<name>/index.ts`) are thin OMP discovery adapters. Generic envelope/prompt contracts live in core; adapters return the prompt the main agent runs through its own `task` tool.
+- **`copy-commands.mjs`** copies the retained commands into `<project>/.omp/commands/` for OMP discovery.
 
 
 ## Usage
 
+/cto Implement a cross-team feature
 /do-work Add OAuth authentication with Google and GitHub
 /do-work Fix the 500 error on /api/users endpoint
 /do-work Review my auth changes
-/do-work Add a small CLI flag  (works in non-git directories)
-/pulse
 /init-team
-/team-yolo
-> **Note**: `/team` is shipped as an alias for `/do-work` for muscle-memory compatibility; both commands resolve to the same workflow.
-## How it works
-`/do-work <task>` walks (same as `/team`):
-
-1. **Classify** the request → `Classification = {type, complexity, confidence, workflow}`.
-2. **Resolve** the profile via the `Type × Complexity → Workflow` table.
-3. **Write** `.work-state/team-state.json` BEFORE any subagent launch (the gate blocks otherwise).
-4. **Walk** stages in profile order. Each by `type`:
+> **Note**: `/team` remains a compatibility alias for `/do-work`; `/cto` is the sole orchestration entrypoint.
+1. **Walk** stages in profile order. Each by `type`:
    - `orchestrator` → inline orientation
    - `single` → one `task` call
    - `consilium` → parallel `task` calls in one batch

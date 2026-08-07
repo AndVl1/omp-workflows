@@ -179,8 +179,6 @@ test("fullstack: agent frontmatter uses OMP class role with standard fallback", 
     analyst: { classRole: "@analyst", fallbackRole: "@task", thinkingLevel: "auto" },
     architect: { classRole: "@architect", fallbackRole: "@slow", thinkingLevel: "high" },
     "code-reviewer": { classRole: "@reviewer", fallbackRole: "@slow", thinkingLevel: "high" },
-    "coordinator-yolo": { classRole: "@coordinator", fallbackRole: "@slow", thinkingLevel: "high" },
-    coordinator: { classRole: "@coordinator", fallbackRole: "@slow", thinkingLevel: "high" },
     cto: { classRole: "@cto", fallbackRole: "@slow", thinkingLevel: "high" },
     "team-lead": { classRole: "@team-lead", fallbackRole: "@task", thinkingLevel: "auto" },
     "developer-go": { classRole: "@developer-go", fallbackRole: "@task", thinkingLevel: "auto" },
@@ -280,26 +278,6 @@ test("core: consilium preserves role variants without pinning models", async () 
 });
 
 
-test("core: registerTeamWorkflow accepts commands subset (legacy option, no-op)", () => {
-	const calls: string[] = [];
-	const fakePi = {
-		setLabel: () => undefined,
-		on: () => undefined,
-		registerCommand: (name: string) => {
-			calls.push(name);
-		},
-	};
-	// The `commands:` option is preserved for backward compatibility with
-	// bundles that pre-date v0.4.0. It no longer drives registration because
-	// slash commands ship as OMP custom-TS commands in the bundle; the
-	// extension only registers gates.
-	assert.doesNotThrow(() =>
-		registerTeamWorkflow(fakePi as unknown as Parameters<typeof registerTeamWorkflow>[0], {
-			commands: ["team", "pulse"],
-		}),
-	);
-	assert.equal(calls.length, 0, "extension must not register slash commands");
-});
 
 test("fullstack: bundle imports core and registers engine", async () => {
   const core = await import("@andvl1/omp-workflows-core");
