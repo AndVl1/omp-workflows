@@ -2,6 +2,14 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.17.1] — 2026-08-07
+### Fixed
+- **Peer compatibility for fullstack ↔ core** — `@andvl1/omp-workflows-fullstack` now declares `@andvl1/omp-workflows-core` as `^0.17.0` instead of `*`. A stale core 0.12 installed alongside fullstack 0.17 broke the plugin at load time with a missing/mismatched ESM export; the range now forces a compatible core on the same 0.17.x line.
+- **Core-first install requirement** — README now states that fullstack does not upgrade core automatically and instructs users to install `@andvl1/omp-workflows-core` first so the peer requirement resolves against a matching core (both `omp plugin install` and plain `npm install` paths).
+- **Regression test** — `packages/fullstack/test/package-contract.test.ts` pins the core peer range contract so a future relaxation back to `*` fails CI.
+### Verified
+- Build and typecheck passed. Core: 194/194 tests, E2E: 73/73 tests, Fullstack: 161/161 tests.
+
 ## [0.17.0] — 2026-08-07
 ### Added
 - **Durable CTO control plane** — `packages/core/src/cto/{budget,leases,health,scheduler,refinement,dissent,decisions,redaction}.ts` + `packages/fullstack/src/cto-scheduler-daemon.ts`: budget caps (`checkBudget`/`recordSpend`/`setBudgetPolicy`, all limits default to unlimited) with a char-heuristic spend recorder, team leases with fencing tokens and restart-safe TTL + PID liveness (`acquireLease`/`heartbeatLease`/`releaseLease`/`isLeaseAlive`/`reclaimDeadLeases`), run health assessment (`assessRunHealth`/`healthToMarkdown`) with additive `estimatedTokens`/`estimatedDollars`/`ctoRunHealth` on the observability rollup, wave scheduling (`shouldRunWave`/`buildDigest`/`startWaveScheduler`), five-whys task refinement (`refineTask`/`validateRefinement`), a conditional dissent gate (fires only on high-stakes/irreversible/contradicts-decision/budget-exceeded), and project decision memory (`recordDecision`/`recallDecisions`/`decisionsToMarkdown`).
