@@ -33,18 +33,11 @@ export interface RegisterOptions {
   scopeMap?: RoleConfig["scope_map"];
   flags?: RoleConfig["flags"];
   designSystem?: string | null;
-  commands?: Array<CommandId>;
-  /** Bundle-owned profiles made available to the core interpreter. */
   workflowProfiles?: import("./engine/types.js").Profile[];
-  /**
-   * Telemetry opt-in. Default: true (always on). Set to `false` to disable
-   * the recorder for bundles that don't want per-session event logs.
-   */
   observability?: boolean;
 }
 
-export type CommandId =
-  | "team" | "team-next" | "team-yolo" | "pulse" | "init-team" | "interview" | "coordinator-stats";
+export type CommandId = "do-work" | "team" | "cto" | "init-team" | "interview" | "omp-model-roles";
 
 export const defaultFullstackRoles: RoleConfig["roles"] = {
   analyst: "analyst",
@@ -173,14 +166,8 @@ function writeRuntimeConfig(opts: RegisterOptions): void {
 }
 export { teamCommand } from "./commands/team.js";
 export {
-	teamNextCommand,
-	teamYoloCommand,
-	pulseCommand,
-	initTeamCommand,
-	interviewCommand,
-	coordinatorStatsCommand,
-} from "./commands/shortcuts.js";
-export {
+  findProfileDir,
+  resolveWorkflowProfilePath,
   loadAllProfiles,
   loadProfile,
   isRegisteredWorkflow,
@@ -294,6 +281,12 @@ export {
   findActiveCtoRun,
   type ParsedCtoEnvelope,
 } from "./commands/cto.js";
+export {
+  parseWorkEnvelope,
+  buildDoWorkPrompt,
+  type ParsedWorkEnvelope,
+  type WorkTeamConfig,
+} from "./commands/do-work.js";
 export { markAmended } from "./cto/state.js";
 export {
 	EventRecorder,

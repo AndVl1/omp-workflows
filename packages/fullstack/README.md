@@ -1,6 +1,6 @@
 # @andvl1/omp-workflows-fullstack
 
-Default fullstack bundle for `@andvl1/omp-workflows-core`. Ships 17 specialized agents, 31 domain skills, and 8 OMP custom-TS slash commands for Spring/Kotlin/React/KMP/Telegram-bot projects.
+Default fullstack bundle for `@andvl1/omp-workflows-core`. Ships 16 specialized agents, 27 domain skills, and 6 OMP custom-TS slash command adapters for Spring/Kotlin/React/KMP/Telegram-bot projects.
 
 ## Install
 
@@ -49,20 +49,18 @@ The extension registers gates (`before_agent_start`, `session_stop`, `tool_call`
 
 The `agents/` and `skills/` directories are picked up by OMP's discovery automatically.
 
-## Slash commands (v0.4.0+)
+## Slash commands
 
 | Command | Purpose |
 | --- | --- |
-| `/team <task>` | Classify and resolve the workflow; return a prompt the main agent runs through its `task` tool. |
-| `/pulse` | Read-only project digest: workflow state, git status, last commits, beads ready. |
-| `/team-next` | Pop the next entry from `.work-state/queue.json` and route to `/team`. |
-| `/team-yolo` | Same as `/team-next` but wrapped in `[AUTONOMOUS]`. |
-| `/init-team` | Write `.omp/team.config.json` with the fullstack defaults (idempotent). |
-| `/interview <topic>` | Delegate to the `analyst` agent for structured clarifying questions. |
-| `/coordinator-stats` | Return `.work-state/coordinator/profile-stats.md` if it exists. |
-| `/omp-model-roles` | Validate per-agent model-role configuration or return a delegated research prompt. |
+| `/cto <task>` | Main-session CTO orchestration into parallel teams. |
+| `/do-work <task>` | Classification-first profile-driven workflow. |
+| `/team <task>` | Compatibility alias for `/do-work`. |
+| `/init-team` | Write `.omp/team.config.json` with detected/default stack mappings. |
+| `/interview <topic>` | Delegate structured clarification to the analyst. |
+| `/omp-model-roles` | Validate model-role configuration or delegate recommendations. |
 
-Each command is a TypeScript module at `commands/<name>/index.ts`. They receive a `HookCommandContext` (ui, cwd, sessionManager, modelRegistry) and return a string prompt or void — they do **not** drive subagent dispatch themselves (the `task` tool is owned by the main agent in OMP 17.x).
+Commands are OMP custom-TS modules copied into project-local `.omp/commands/`; they return prompts and do not dispatch subagents directly.
 
 ## Model roles
 
@@ -73,7 +71,6 @@ Each agent class has a first-choice role followed by a standard fallback in fron
 | `architect` | `architect` | `@slow` | `architect: anthropic/claude-opus-4-6` |
 | `reviewer` | `code-reviewer` | `@slow` | `reviewer: openai/gpt-5.4` |
 | `security` | `security-tester` | `@slow` | `security: anthropic/claude-sonnet-4-6` |
-| `coordinator` | `coordinator`, `coordinator-yolo` | `@slow` | `coordinator: anthropic/claude-opus-4-6` |
 | `researcher` | `tech-researcher`, `discovery` | `@smol` | `researcher: google/gemini-2.5-flash` |
 | `analyst` | `analyst` | `@task` | `analyst: openai/gpt-5-mini` |
 | `developer-go` | `developer-go` | `@task` | `developer-go: openai/gpt-5.3-codex` |
@@ -126,9 +123,9 @@ In the interactive TUI, use /model without arguments to assign project/global ro
 
 ## What's inside
 
-- 17 agents (`analyst`, `architect`, `code-reviewer`, `developer-{kotlin,go,mobile}`, `devops`, `diagnostics`, `discovery`, `frontend-developer`, `init-mobile`, `manual-qa`, `qa`, `security-tester`, `tech-researcher`, `coordinator`, `coordinator-yolo`)
-- 31 skills (`kotlin-spring-boot`, `kmp`, `react-vite`, `telegram-mini-apps`, …)
-- 8 custom-TS slash commands (see above)
+- 15 agents (`analyst`, `architect`, `code-reviewer`, `cto`, `developer-{kotlin,go,mobile}`, `devops`, `diagnostics`, `discovery`, `frontend-developer`, `init-mobile`, `manual-qa`, `qa`, `security-tester`, `team-lead`, `tech-researcher`)
+- 27 domain skills
+- 6 custom-TS slash commands (see above)
 
 ## FAQ
 

@@ -43,11 +43,9 @@ test("fullstack: ensureCommandsForSession populates a fresh project", () => {
 		assert.ok(result.copied.includes("do-work"), "do-work should be copied on a fresh project");
 
 		// Spot-check the copied tree: <dir>/.omp/commands/do-work/index.ts exists
-		// and is non-empty, and its sibling `_lib/` is present too.
-		const doWorkIndex = join(dir, ".omp", "commands", "do-work", "index.ts");
-		const lib = join(dir, ".omp", "commands", "do-work", "_lib", "classify.ts");
-		assert.ok(readFileSync(doWorkIndex, "utf8").includes("/do-work"), "do-work/index.ts is a do-work command file");
-		assert.ok(readFileSync(lib, "utf8").length > 0, "do-work/_lib/classify.ts is non-empty");
+    // The copied entrypoint is a thin adapter over the core command contract.
+    const doWorkIndex = join(dir, ".omp", "commands", "do-work", "index.ts");
+    assert.ok(readFileSync(doWorkIndex, "utf8").includes("@andvl1/omp-workflows-core"), "do-work adapter consumes core contract");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

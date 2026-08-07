@@ -147,10 +147,7 @@ export class EventRecorder {
   }
 }
 
-/**
- * Pure rollup computation. Exported for callers (e.g. /pulse) that want to
- * re-aggregate without going through the recorder. Idempotent.
- */
+/** Pure rollup computation. Exported for callers that need re-aggregation. */
 export function rollupFromEvents(events: ReadonlyArray<ObservabilityEvent>): ObservabilityRollup {
   if (events.length === 0) {
     return emptyRollup(new Date(0).toISOString());

@@ -31,7 +31,6 @@ export default function (pi: ExtensionAPI) {
     roles: { /* role -> agent name */ },
     scopeMap: [/* glob -> scope rules */],
     flags: { /* glob -> flag */ },
-    commands: ["team", "pulse", "init-team"], // subset
   });
 }
 ```

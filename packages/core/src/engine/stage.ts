@@ -409,11 +409,8 @@ ${roleHint}
 
 function isOrchestratorRole(role: string): boolean {
   // Orchestrator roles are the ones the engine marks as "inline" — they
-  // are read-only dispatchers. The agent frontmatter for these roles
-  // (`coordinator`, `coordinator-yolo`, `discovery`) already frames them
-  // this way, but we duplicate the hint at the prompt level so a
-  // sub-spawned agent cannot drift into code edits.
-  return role === "coordinator" || role === "coordinator-yolo" || role === "discovery";
+  // Discovery is a read-only dispatcher; all other orchestration belongs to CTO.
+  return role === "discovery";
 }
 
 function expandRole(role: string, ctx: StageContext): string {
@@ -470,5 +467,5 @@ async function runLoop(stage: StageDef, ctx: StageContext): Promise<StageOutcome
   return outcomes;
 }
 
-// Re-export so callers (tests, /pulse) can read the gate cheaply.
+// Re-export so consumers can read the validation gate cheaply.
 export { validationGate };

@@ -1,10 +1,9 @@
 /**
  * /cto — CTO sub-orchestration custom-TS command.
  *
- * Same pattern as `/do-work`: parses the envelope, returns a fully-formed
  * prompt that the MAIN AGENT of the session (the resident CTO) executes
- * in-session. The logic lives in `./_lib/cto.ts` (self-contained copy of the
- * core contract — `packages/core/src/commands/cto.ts`); canonical source is core.
+ * in-session. The implementation is re-exported from core through the
+ * self-contained discovery adapter in `./_lib/cto.ts`.
  * The CTO role is main-session only: never dispatched via `task(agent=cto)`.
  */
 
