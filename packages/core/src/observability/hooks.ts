@@ -219,6 +219,5 @@ export const observabilityHooks: HookHandlers = {
     });
   },
 };
-
-/** Re-export so consumers (tests, /pulse) can read the pointer cheaply. */
+/** Re-export so consumers can read the pointer cheaply. */
 export { readObservabilityPointer } from "./recorder.js";

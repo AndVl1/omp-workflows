@@ -9,10 +9,8 @@
  *
  * Same two-layer contract as `/do-work`: custom-TS commands have no `task`
  * surface, so this command returns a fully-formed prompt that the main agent
- * executes mechanically through its own `task`/`hub`. Consumers wire this
- * module into their own commands/hooks; the fullstack bundle ships a
- * self-contained copy (`packages/fullstack/commands/cto/`) — keep them in
- * sync (canonical source is here).
+ * executes mechanically through its own `task`/`hub`. Consumers re-export the
+ * contract through thin project-local discovery adapters.
  *
  * Design: vibe-report/sub-orchestration-2026-08-04.md
  */

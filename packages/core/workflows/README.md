@@ -194,8 +194,7 @@ model per-session from `modelRoles` / `task.agentModelOverrides`; the workflow c
 set models — it only names agents.
 
 | tier | model role | thinkingLevel | examples |
-|------|-----------|---------------|---------|
-| high | `@slow` | `high` | architect, code-reviewer, security-tester, coordinator, coordinator-yolo |
+| high | `@slow` | `high` | architect, code-reviewer, security-tester, cto, team-lead |
 | middle | `@task` | `auto` | developer-kotlin, developer-go, frontend-developer, qa, … |
 | low | `@smol` | `medium` | tech-researcher |
 

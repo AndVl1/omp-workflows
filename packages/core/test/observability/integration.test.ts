@@ -7,8 +7,7 @@
  *   2. The rollup reflects subagent spawns (toolName="task" → subagent).
  *   3. Skills are extracted from before_agent_start systemPrompt.
  *   4. The `writeState` engine call picks up the pointer and embeds it in
- *      TeamState.observability (so /pulse can read it without touching
- *      the jsonl directly).
+ *      `TeamState.observability` for lightweight status consumers.
  *
  * Tests use `flushRecorder(cwd)` to drain the in-memory write queue
  * instead of real timers — the latter would race on loaded machines and
