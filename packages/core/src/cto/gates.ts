@@ -9,6 +9,7 @@
 
 import { join } from "node:path";
 import { isDoDComplete, readDoD } from "../engine/dod.js";
+import { checkBudget } from "./budget.js";
 import type { CtoState } from "./types.js";
 
 export type GateResult = { ok: true } | { ok: false; reason: string };
@@ -59,4 +60,46 @@ export function ctoBackstop(state: CtoState, root: string): { continue: true } |
     };
   }
   return { continue: true };
+}
+
+/**
+ * Conditional dissent gate (architecture §4.11 — br-zps.10, cto-quality).
+ * Dissent triggers ONLY on high-stakes, irreversible, or budget-exceeding
+ * actions — low-stakes reversible work passes with NO dissent check (no gate
+ * tax). Semantics, highest precedence first:
+ *
+ *   1. budget status "exceeded" → block; <teamId> must escalate to cto.
+ *   2. stakes === "high" or reversible === false → block; <teamId> must
+ *      escalate to cto (trigger names included in the reason).
+ *   3. else → { ok: true }.
+ *
+ * Contradiction checks are NOT performed here: this gate has no
+ * contradicts_decision_tag in its signature, so it does not read decision
+ * memory. Tag-aware contradiction dissent happens via evaluateDissent()
+ * (dissent.ts) where the calling layer can supply a tag.
+ *
+ * `checkBudget` tolerates a state without the optional schema-2 `budget`
+ * field (D3: all limits null → "unlimited"), so no guard is needed here.
+ */
+export function dissentGate(
+  state: CtoState,
+  teamId: string,
+  action: { stakes: "low" | "medium" | "high"; reversible: boolean },
+): GateResult {
+  if (checkBudget(state).status === "exceeded") {
+    return {
+      ok: false,
+      reason: `dissent: budget exceeded — ${teamId} must escalate to cto (stakes: ${action.stakes}, reversible: ${action.reversible})`,
+    };
+  }
+  const triggers: string[] = [];
+  if (action.stakes === "high") triggers.push("high_stakes");
+  if (action.reversible === false) triggers.push("irreversible");
+  if (triggers.length > 0) {
+    return {
+      ok: false,
+      reason: `dissent: ${triggers.join(", ")} — ${teamId} must escalate to cto (stakes: ${action.stakes}, reversible: ${action.reversible})`,
+    };
+  }
+  return { ok: true };
 }

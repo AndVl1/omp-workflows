@@ -13,6 +13,7 @@
 import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Escalation, EscalationAnswer } from "./types.js";
+import { DEFAULT_REDACTION_CONFIG, redactEscalation } from "./redaction.js";
 
 const REQUIRED: Array<keyof Escalation> = ["id", "level", "title", "body"];
 const LEVELS: Record<string, true> = {
@@ -22,22 +23,17 @@ const LEVELS: Record<string, true> = {
   blocker: true,
 };
 
-/** Lines that look like secrets — dropped whole by sanitizeEscalation (R4). */
-const SECRET_LINE = /(token|password|passwd|secret|api[_-]?key|authorization|bearer|private[_-]?key)\s*[:=]/i;
-const TITLE_MAX = 120;
-const BODY_MAX = 2000;
-
 /**
  * R4 filter applied by the engine before any adapter send: no secrets, no
  * unbounded content. Title truncated to 120 chars, body truncated to 2000
  * chars with secret-bearing lines dropped (a fully-redacted body becomes
  * "[redacted]"). Never throws.
+ *
+ * Delegates to {@link redactEscalation} with {@link DEFAULT_REDACTION_CONFIG}
+ * (br-zps.6) — the config-driven pipeline replaces the former inline logic.
  */
 export function sanitizeEscalation(esc: Escalation): Escalation {
-  const title = esc.title.slice(0, TITLE_MAX);
-  const bodyLines = esc.body.split("\n").filter((line) => !SECRET_LINE.test(line));
-  const body = bodyLines.join("\n").slice(0, BODY_MAX) || "[redacted]";
-  return { ...esc, title, body };
+  return redactEscalation(esc, DEFAULT_REDACTION_CONFIG);
 }
 
 /**

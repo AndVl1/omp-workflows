@@ -243,3 +243,6 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     dispatcherStopsByCwd.delete(cwd);
   });
 }
+
+// ── cto-safety (br-zps.4, br-zps.5, br-zps.6) ──
+export { MockEscalationAdapter, registerMockAdapter } from "./adapters/mock.js";

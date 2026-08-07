@@ -19,19 +19,24 @@
  *   }
  */
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   ctoStateDir,
+  readCtoState,
   sanitizeEscalation,
   validateEscalation,
+  writeCtoState,
   type Escalation,
   type EscalationAdapter,
   type EscalationReceipt,
+  type QuarantineRecord,
 } from "@andvl1/omp-workflows-core";
 import { findActiveCtoRun } from "@andvl1/omp-workflows-core";
 import { HttpEscalationAdapter } from "./http.js";
 import { TelegramEscalationAdapter } from "./telegram.js";
+import { MockEscalationAdapter, registerMockAdapter } from "./mock.js";
 
 export interface EscalationConfig {
   adapter: string;
@@ -70,6 +75,17 @@ const adapterFactories = new Map<string, EscalationAdapterFactory>([
         : null,
   ],
 ]);
+
+// Register the in-process mock transport (br-zps.6 / D4): no config, no
+// network — `.omp/escalation.json` `{"adapter":"mock"}` selects it for tests
+// and the epic's E2E. registerMockAdapter lives in mock.ts and calls back
+// into registerEscalationAdapter — the registry→mock→registry import cycle is
+// safe because both sides only invoke each other's functions after module
+// evaluation completes (function declarations are hoisted). MockEscalationAdapter
+// is imported alongside so the fallback — registering
+// `["mock", () => new MockEscalationAdapter()]` inline in the map above — is
+// one edit away if the cycle ever misbehaves.
+registerMockAdapter();
 
 /**
  * Register a consumer transport adapter (e.g. slack, whatsapp, signal) so the
@@ -441,7 +457,7 @@ export function ensureStandbyRun(root: string): string {
   mkdirSync(join(runDir, "inbox"), { recursive: true });
   const now = new Date().toISOString();
   const state = {
-    schema: 1,
+    schema: 2,
     id: runId,
     task: "standby — awaiting inbox tasks",
     branch: "",
@@ -457,7 +473,70 @@ export function ensureStandbyRun(root: string): string {
 }
 
 /**
+ * Maximum accepted inbox task body length (br-zps.4). Oversized bodies are
+ * REJECTED, never truncated — the messenger must shorten the text before
+ * filing, otherwise the quarantine record carries
+ * `reason: "text exceeds MAX_INBOX_TEXT_LENGTH"` and the task is dropped.
+ */
+export const MAX_INBOX_TEXT_LENGTH = 4000;
+
+/**
+ * SHA-256 hex digest of `text.trim()` — normalization is a trim, so callers
+ * comparing hashes must normalize the same way (trailing/leading whitespace
+ * is ignored).
+ */
+export function sha256Hex(text: string): string {
+  return createHash("sha256").update(text.trim(), "utf8").digest("hex");
+}
+
+/**
+ * Persist a quarantine record for a task (br-zps.4). Best-effort, NEVER
+ * throws: a rejection (or an unreadable run state) must not take down the
+ * messenger path. `state.inbox_quarantine` is default-filled when absent
+ * (schema-1 standby states migrate to schema 2 on read).
+ */
+function recordQuarantine(
+  root: string,
+  runId: string,
+  task: InboxTask,
+  hash: string,
+  status: QuarantineRecord["status"],
+  reason?: string,
+): void {
+  try {
+    const state = readCtoState(runId, root);
+    if (!state) return;
+    state.inbox_quarantine = state.inbox_quarantine ?? {};
+    state.inbox_quarantine[hash] = {
+      id: task.id,
+      hash,
+      received_at: task.at ?? new Date().toISOString(),
+      by: task.by ?? "inbox",
+      status,
+      ...(reason ? { reason } : {}),
+    };
+    writeCtoState(state, root);
+  } catch {
+    // best-effort — the rejection itself must never throw
+  }
+}
+
+/**
  * Write an inbox task file and wake the CTO session.
+ *
+ * Quarantine (br-zps.4): external inbox text is untrusted DATA, not a
+ * policy override. Before the file write the task is shape-validated and
+ * SHA-256 hashed (normalized by trim):
+ *   - empty/oversized bodies are REJECTED — recorded in the run's
+ *     `state.inbox_quarantine` and dropped (nothing filed, no wake);
+ *   - an already-ADMITTED hash is a duplicate — dropped (no file, no wake);
+ *   - otherwise the record is persisted as `quarantined` BEFORE the write
+ *     and flipped to `admitted` AFTER it. A wake failure reverts the record
+ *     to `quarantined` (before removing the file) so the transport's retry
+ *     passes the admitted-dedup and re-wakes.
+ * When the run state is unreadable the task is filed WITHOUT quarantine
+ * bookkeeping — availability over strictness; corrupt state is a separate
+ * incident.
  *
  * The file write is idempotent (`wx`: the first write wins; duplicates are
  * at-most-once — the winner wakes, later calls return null without waking)
@@ -467,13 +546,51 @@ export function ensureStandbyRun(root: string): string {
  * update (the local drop file stays in place) and retries on the next tick —
  * the retry writes the file fresh, so no wx collision blocks the re-wake.
  *
- * Returns the path when this call wrote the file and woke; null when another
- * call already filed the task (duplicate — no re-wake); throws when the task
- * could not be filed (IO error) or when the wake callback threw (the file is
- * removed so the transport can retry the update).
+ * Returns the path when this call wrote the file and woke; null when the
+ * task was rejected, deduped, or already filed (duplicate — no re-wake);
+ * throws when the task could not be filed (IO error) or when the wake
+ * callback threw (the file is removed so the transport can retry the update).
  */
 export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: InboxTask) => void): string | null {
   const runId = task.runId ?? resolveInboxRunId(root);
+
+  // ── Quarantine pass (br-zps.4) ───────────────────────────────────────────
+  const rawText = typeof task.text === "string" ? task.text : "";
+  const normalized = rawText.trim();
+  const hash = sha256Hex(rawText);
+  if (normalized.length === 0 || normalized.length > MAX_INBOX_TEXT_LENGTH) {
+    const reason = normalized.length === 0 ? "empty text" : "text exceeds MAX_INBOX_TEXT_LENGTH";
+    recordQuarantine(root, runId, task, hash, "rejected", reason);
+    return null; // nothing filed, no wake — validation failures never throw
+  }
+  // Dedup: an already-admitted hash is a duplicate task (same normalized
+  // text) — no file, no wake. A "quarantined" record means a previous
+  // attempt died mid-flight (wake failed, write rolled back) → proceed.
+  const state = readCtoState(runId, root);
+  if (state && state.inbox_quarantine?.[hash]?.status === "admitted") {
+    return null;
+  }
+  // Track the in-flight task BEFORE the write; flipped to "admitted" after
+  // the file write succeeds. State unreadable → file as today, no tracking.
+  let quarantineTracked = false;
+  if (state) {
+    try {
+      state.inbox_quarantine = state.inbox_quarantine ?? {};
+      state.inbox_quarantine[hash] = {
+        id: task.id,
+        hash,
+        received_at: task.at ?? new Date().toISOString(),
+        by: task.by ?? "inbox",
+        status: "quarantined",
+      };
+      writeCtoState(state, root);
+      quarantineTracked = true;
+    } catch {
+      // Persisting the record failed — file the task anyway (availability).
+      quarantineTracked = false;
+    }
+  }
+
   const dir = inboxDir(runId, root);
   const fileName = `${task.id.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`;
   const path = join(dir, fileName);
@@ -488,6 +605,19 @@ export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: Inbo
     }
     return null; // duplicate — first write wins, no re-wake
   }
+  if (quarantineTracked && state) {
+    try {
+      const record = state.inbox_quarantine?.[hash];
+      if (record) {
+        record.status = "admitted";
+        writeCtoState(state, root);
+      }
+    } catch {
+      // Best-effort: the task file is already durable; a record stuck on
+      // "quarantined" just means a retry re-files instead of deduping —
+      // safe either way.
+    }
+  }
   try {
     // Wake AFTER the file is durable and OUTSIDE the write guard: a throwing
     // callback must reach the transport so it can retry the update instead of
@@ -496,7 +626,21 @@ export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: Inbo
   } catch (error) {
     // Roll back the just-created file so the retry is a fresh write (no wx
     // collision) — otherwise the transport's retry would see a duplicate and
-    // skip the wake, losing the update.
+    // skip the wake, losing the update. ALSO revert the quarantine record to
+    // "quarantined" (best-effort) so the retry is not swallowed by the
+    // admitted-dedup. Order: revert record → rm file → rethrow.
+    if (quarantineTracked) {
+      try {
+        const current = readCtoState(runId, root) ?? state;
+        const record = current?.inbox_quarantine?.[hash];
+        if (current && record) {
+          record.status = "quarantined";
+          writeCtoState(current, root);
+        }
+      } catch {
+        // best-effort — the wake failure is the primary error to propagate
+      }
+    }
     try {
       rmSync(path, { force: true });
     } catch {

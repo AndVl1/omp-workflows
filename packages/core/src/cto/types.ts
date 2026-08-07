@@ -161,7 +161,7 @@ export type TeamRunStatus = "pending" | "in_progress" | "parked" | "done" | "fai
 
 /** Per-CTO-run persistent state under `.work-state/cto/<id>/state.json`. */
 export interface CtoState {
-  schema: 1;
+  schema: 2;
   id: string;
   task: string;
   branch: string;
@@ -190,4 +190,167 @@ export interface CtoState {
     reason: string;
   };
   updated_at: string;
+  // ── schema-2 additions (all optional, default-filled by migrateCtoState) ──
+  budget?: BudgetState;                                    // br-zps.2 (cto-operations)
+  leases?: Record<string, TeamLease>;                      // br-zps.3 (cto-core)
+  decisions?: DecisionMemoryEntry[];                       // br-zps.11 (cto-core)
+  inbox_quarantine?: Record<string, QuarantineRecord>;     // br-zps.4 (cto-safety)
+  health?: RunHealth;                                      // br-zps.7 (cto-operations)
+  scheduler?: SchedulerState;                              // br-zps.8 (cto-operations)
+}
+
+// ── Schema-2 shared typed interfaces (cto-core defines; all teams consume) ──
+
+/** Budget limits — declared policy, not enforcement (D3). br-zps.2. */
+export interface BudgetPolicy {
+  /** null = unlimited (DEFAULT, D3). */
+  token_limit: number | null;
+  /** null = unlimited (DEFAULT, D3). */
+  dollar_limit: number | null;
+  /** null = unlimited (DEFAULT, D3). */
+  time_limit_ms: number | null;
+}
+
+/** Accumulated spend — chars/4 heuristic until a BudgetRecorder is wired (C1). br-zps.2. */
+export interface BudgetAccounting {
+  /** chars/4 heuristic (C1) — 0 until a recorder is wired. */
+  tokens_estimated: number;
+  /** 0 until a recorder is wired. */
+  dollars_estimated: number;
+  elapsed_ms: number;
+  per_team: Record<string, { tokens: number; dollars: number; ms: number }>;
+}
+
+export interface BudgetState {
+  policy: BudgetPolicy;
+  accounting: BudgetAccounting;
+}
+
+export type BudgetStatus = "unlimited" | "ok" | "approaching" | "exceeded";
+
+/**
+ * Team lease — fencing token guarding one team against duplicate spawns.
+ * Restarts-safe: a lease with `heartbeat_at` older than `ttl_ms` OR a dead
+ * `pid` is reclaimable. Mirrors the dispatcher's DispatcherLeaseRecord.
+ * br-zps.3.
+ */
+export interface TeamLease {
+  /** Opaque fence token (crypto.randomUUID). */
+  token: string;
+  /** ISO. */
+  acquired_at: string;
+  /** ISO — refreshed by the holding process. */
+  heartbeat_at: string;
+  /** 0 = until released (no expiry); else heartbeat age > ttl → reclaimable. */
+  ttl_ms: number;
+  /** Holder PID for liveness (process.kill(pid, 0)). */
+  pid: number;
+  /** Which team this lease guards. */
+  team_id: string;
+}
+
+/** Project decision memory entry — tag-based recall only (D6). br-zps.11. */
+export interface DecisionMemoryEntry {
+  /** ULID-ish or crypto.randomUUID. */
+  id: string;
+  /** ISO. */
+  at: string;
+  /** What was decided. */
+  decision: string;
+  /** Rationale (mandatory, non-empty). */
+  why: string;
+  /** Exact-match recall keys (project-scoped, D6). */
+  tags: string[];
+  /** Team id or "cto". */
+  by: string;
+  /** Escalation ids, issue numbers. */
+  refs?: string[];
+}
+
+/** Inbox quarantine record — untrusted inbox text is data, never a policy override. br-zps.4. */
+export interface QuarantineRecord {
+  id: string;
+  /** SHA-256 of normalized text. */
+  hash: string;
+  /** ISO. */
+  received_at: string;
+  /** Source channel. */
+  by: string;
+  status: "quarantined" | "admitted" | "rejected";
+  /** Rejection reason. */
+  reason?: string;
+}
+
+/** Deterministic redaction config — replaces the internals of sanitizeEscalation. br-zps.6. */
+export interface RedactionConfig {
+  /** Regex source strings; default: existing SECRET_LINE. */
+  secret_line_patterns: string[];
+  /** Regex for inline values (e.g. Bearer tokens in non-key lines). */
+  inline_value_patterns: string[];
+  /** Default: "[redacted]". */
+  replacement: string;
+  /** Default: 120. */
+  max_title: number;
+  /** Default: 2000. */
+  max_body: number;
+}
+
+/** Run health snapshot derived from CtoState (not events). br-zps.7. */
+export interface RunHealth {
+  run_id: string;
+  healthy: boolean;
+  active_teams: number;
+  parked_teams: number;
+  failed_teams: number;
+  pending_escalations: number;
+  budget_status: BudgetStatus;
+  last_heartbeat_at: string;
+  /** Human-readable health issues. */
+  issues: string[];
+}
+
+/** Wave/digest scheduling state — setInterval while a session is alive (C2). br-zps.8. */
+export interface SchedulerState {
+  /** Default: 0 (disabled). */
+  wave_interval_ms: number;
+  /** ISO. */
+  last_wave_at?: string;
+  /** ISO. */
+  next_wave_at?: string;
+  /** Mock target (D4: no real channel). */
+  digest_recipient?: string;
+  last_digest_at?: string;
+}
+
+export interface ScheduledDigest {
+  run_id: string;
+  at: string;
+  health: RunHealth;
+  recent_decisions: DecisionMemoryEntry[];
+  open_escalations: number;
+  budget_status: BudgetStatus;
+}
+
+/** Task refinement — five-whys output, validated/structured by the engine. br-zps.9. */
+export interface RefinementResult {
+  original_task: string;
+  /** The 5th "why" or convergence point. */
+  root_cause: string;
+  /** The actionable restatement. */
+  refined_task: string;
+  /** The chain (1-5, may converge early). */
+  whys: string[];
+  /** True if root cause reached before 5. */
+  converged: boolean;
+}
+
+export type DissentTrigger = "high_stakes" | "irreversible" | "contradicts_decision" | "budget_exceeded";
+
+/** Conditional dissent gate evaluation. br-zps.10. */
+export interface DissentEvaluation {
+  /** null = no dissent needed. */
+  trigger: DissentTrigger | null;
+  severity: "none" | "advisory" | "blocking";
+  reason: string;
+  escalate_to: "lead" | "cto" | "user" | null;
 }

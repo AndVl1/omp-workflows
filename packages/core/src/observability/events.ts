@@ -12,6 +12,9 @@
  * remains the source of truth. Observability is for *who* ran, *how long*,
  * and *what skills were active*; not for the content of the work.
  */
+
+import type { RunHealth } from "../cto/types.js";
+
 export type EventKind =
   | "session_start"
   | "session_stop"
@@ -82,6 +85,13 @@ export interface ObservabilityRollup {
   firstEventAt: string;
   /** ISO timestamp of the last event in the current rollup. */
   lastEventAt: string;
+  // ── cto-operations (br-zps.7) additive fields ──
+  /** chars/4 heuristic sum (C1) — 0 until a real BudgetRecorder is wired. br-zps.2. */
+  estimatedTokens?: number;
+  /** 0 until a real BudgetRecorder is wired (C1). br-zps.2. */
+  estimatedDollars?: number;
+  /** Run health snapshot derived from CtoState (not events). br-zps.7. */
+  ctoRunHealth?: RunHealth;
 }
 
 /**
