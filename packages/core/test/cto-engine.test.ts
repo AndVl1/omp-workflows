@@ -1234,9 +1234,28 @@ describe("cto-operations health+scheduler", () => {
 
   /** Wall-clock delay; see the real-timer exception note below. */
   function delay(ms: number): Promise<void> {
-    const { promise, resolve } = Promise.withResolvers<void>();
+    const { promise, resolve } = deferred<void>();
     setTimeout(resolve, ms);
     return promise;
+  }
+
+  /**
+   * Node 20-compatible `Promise.withResolvers` (Node 22+ / ES2024);
+   * mirrors the repo convention in packages/e2e/src/util.ts and
+   * src/adapters/telegram.ts.
+   */
+  function deferred<T>(): {
+    promise: Promise<T>;
+    resolve: (value: T | PromiseLike<T>) => void;
+    reject: (reason?: unknown) => void;
+  } {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
   }
 
   // EXCEPTION to the fake-timer rule (ts-no-test-timers): this test deliberately
