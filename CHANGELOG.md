@@ -2,6 +2,15 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.16.0] — 2026-08-07
+### Added
+- **Bundle-owned workflow profile registry** — `registerTeamWorkflow` now accepts `workflowProfiles`, making custom domain workflows available to core's profile loader and interpreter.
+- **Explicit custom workflow selection** — registered profiles can be selected after semantic classification without changing the standard Type × Complexity matrix.
+
+### Verified
+- Core: typecheck, build, and 103 tests passed.
+- VK Android bundle: 9 tests passed.
+
 ## [0.15.0] — 2026-08-06
 ### Added
 - **Resident CTO mode** — `/cto` now runs as the main-session assistant, stays active after each wave, and folds subsequent messenger/inbox tasks into the same run without nested CTO dispatch.
