@@ -20,13 +20,19 @@ echo "//npm.pkg.github.com/:_authToken=ghp_xxx" >> ~/.npmrc
 Then install with your usual tooling:
 
 ```bash
-# Most projects: fullstack (engine + agents + skills)
+# Both packages must be on the same compatible minor line (e.g. 0.17.x):
+# fullstack does not upgrade core automatically, so install core first and
+# let the peer requirement resolve against a matching core.
+
+# Most projects: core first, then fullstack (engine + agents + skills)
+omp plugin install @andvl1/omp-workflows-core
 omp plugin install @andvl1/omp-workflows-fullstack
 
 # Engine-only (no agents / skills, build your own)
 omp plugin install @andvl1/omp-workflows-core
 
 # Plain npm (works the same — npm respects the registry scoping in ~/.npmrc)
+npm install @andvl1/omp-workflows-core
 npm install @andvl1/omp-workflows-fullstack
 
 ### Slash command bootstrap — works for both install paths
