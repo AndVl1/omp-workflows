@@ -17,6 +17,7 @@ import {
   registerTeamWorkflow,
   defaultFullstackRoles,
   loadAllProfiles,
+  registerWorkflowProfiles,
   resolveWorkflow,
   selectProfile,
 } from "@andvl1/omp-workflows-core";
@@ -62,6 +63,22 @@ test("core: selectProfile resolves to the right profile", async () => {
   assert.deepEqual(p.stages.map((s) => s.id), [
     "discovery", "implementation", "code_review", "review_fixes", "qa_tests", "summary",
   ]);
+});
+test("core: registered profiles are available and explicit workflow selects them", () => {
+  const custom = {
+    name: "android-feature-regression",
+    title: "Android feature regression",
+    description: "Bundle-owned regression profile",
+    match: { type: ["INVESTIGATION"] as const },
+    stages: [{ id: "intake", title: "Intake", type: "orchestrator" as const }],
+  };
+  registerWorkflowProfiles([custom]);
+  const profiles = loadAllProfiles();
+  assert.equal(profiles.find((p) => p.name === custom.name)?.title, custom.title);
+  const selected = selectProfile(profiles, {
+    type: "INVESTIGATION", complexity: "MEDIUM", confidence: "HIGH", workflow: custom.name,
+  });
+  assert.equal(selected?.name, custom.name);
 });
 test("core: defaultFullstackRoles has 16 slots (15 dev + 3 architect variants)", () => {
   const keys = Object.keys(defaultFullstackRoles);

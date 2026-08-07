@@ -24,6 +24,7 @@ import { dodBackstop } from "./gates/dod-backstop.js";
 import { safetyGuard } from "./gates/safety.js";
 import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { registerObservabilityHooks } from "./observability/index.js";
+import { registerWorkflowProfiles } from "./engine/profile.js";
 import type { RoleConfig } from "./engine/types.js";
 export interface RegisterOptions {
   label?: string;
@@ -33,6 +34,8 @@ export interface RegisterOptions {
   flags?: RoleConfig["flags"];
   designSystem?: string | null;
   commands?: Array<CommandId>;
+  /** Bundle-owned profiles made available to the core interpreter. */
+  workflowProfiles?: import("./engine/types.js").Profile[];
   /**
    * Telemetry opt-in. Default: true (always on). Set to `false` to disable
    * the recorder for bundles that don't want per-session event logs.
@@ -117,6 +120,7 @@ export type {
 export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {}): void {
 	const label = opts.label ?? "omp-workflows";
 	pi.setLabel(label);
+  if (opts.workflowProfiles?.length) registerWorkflowProfiles(opts.workflowProfiles);
 
 	writeRuntimeConfig(opts);
 
@@ -176,12 +180,14 @@ export {
 	interviewCommand,
 	coordinatorStatsCommand,
 } from "./commands/shortcuts.js";
-export type { CommandContext } from "./commands/types.js";
 export {
-	loadAllProfiles,
-	loadProfile,
-	resolveWorkflow,
-	selectProfile,
+  loadAllProfiles,
+  loadProfile,
+  isRegisteredWorkflow,
+  matchesProfile,
+  registerWorkflowProfiles,
+  resolveWorkflow,
+  selectProfile,
 } from "./engine/profile.js";
 export { resolveConfig } from "./engine/config.js";
 export { resolveScope, applyConditional, shouldSkip } from "./engine/scope.js";

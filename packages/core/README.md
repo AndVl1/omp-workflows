@@ -37,6 +37,21 @@ export default function (pi: ExtensionAPI) {
 ```
 
 ## Custom bundle — with your own model-role taxonomy
+## Bundle-owned workflow profiles
+
+A bundle can register additional profiles with the core interpreter:
+
+```typescript
+import profile from "./workflows/android-feature-regression.json" with { type: "json" };
+import { registerTeamWorkflow } from "@andvl1/omp-workflows-core";
+
+registerTeamWorkflow(pi, {
+  workflowProfiles: [profile],
+  roles: { "feature-regression": "manual-qa" },
+});
+```
+
+Registered profiles are included in `loadAllProfiles()` and can be selected explicitly by setting `classification.workflow` to the registered profile name. They do not override the standard Type × Complexity matrix implicitly; this keeps domain-specific profiles from hijacking unrelated feature or bug-fix requests. Bundles should perform semantic intent classification before setting the explicit workflow.
 
 > Полный гайд по созданию своего набора агентов (frontmatter, model-роли,
 > registerTeamWorkflow, slash-команды, минимальный скелет бандла):
