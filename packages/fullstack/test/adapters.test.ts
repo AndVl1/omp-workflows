@@ -8,7 +8,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -714,6 +714,17 @@ test("adapters: ensureStandbyRun reuses an existing active standby run", () => {
   try {
     const first = resolveInboxRunId(root);
     assert.ok(first.startsWith("standby-"), "standby run created when none active");
+    // The direct standby writer must emit a CANONICAL schema-2 state, not a
+    // partial one: missing fields would leave the file non-canonical until a
+    // later canonicalizeState write.
+    const standbyRaw = JSON.parse(readFileSync(join(root, ".work-state", "cto", first, "state.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(standbyRaw.schema, 2, "standby state declares schema 2");
+    for (const field of ["budget", "leases", "decisions", "inbox_quarantine"] as const) {
+      assert.ok(standbyRaw[field] !== undefined, `standby state carries canonical field ${field}`);
+    }
+    assert.deepEqual(standbyRaw.leases, {}, "leases default shape");
+    assert.deepEqual(standbyRaw.decisions, [], "decisions default shape");
+    assert.deepEqual(standbyRaw.inbox_quarantine, {}, "inbox_quarantine default shape");
     // A direct call must not mint a second run with a fresh inbox: tasks
     // filed by the bridge before /cto starts must land in the SAME standby
     // inbox, otherwise the command would start a second run and miss them.

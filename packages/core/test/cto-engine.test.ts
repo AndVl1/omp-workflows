@@ -6,7 +6,7 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -394,7 +394,7 @@ test("cto-core: migrateCtoState upgrades schema-1 state with defaults and preser
   assert.equal(migrated.scheduler, undefined);
 });
 
-test("cto-core: migrateCtoState treats missing schema as v1 and passes through schema >= 2", () => {
+test("cto-core: migrateCtoState treats missing schema as v1 and default-fills partial schema-2 state", () => {
   // Missing schema -> treated as v1 and migrated.
   const noSchema = schema1Fixture();
   delete noSchema.schema;
@@ -402,7 +402,9 @@ test("cto-core: migrateCtoState treats missing schema as v1 and passes through s
   assert.equal(migrated.schema, 2);
   assert.deepEqual(migrated.leases, {});
 
-  // Pass-through: schema-2 input keeps its own shape; nothing is default-filled.
+  // Partial schema-2 input (e.g. a direct standby writer that emitted only
+  // the base fields): present values preserved, missing schema-2 fields
+  // default-filled — no pass-through of an incomplete canonical state.
   const s2 = {
     ...schema1Fixture(),
     schema: 2,
@@ -411,10 +413,12 @@ test("cto-core: migrateCtoState treats missing schema as v1 and passes through s
       accounting: { tokens_estimated: 10, dollars_estimated: 0, elapsed_ms: 5, per_team: {} },
     },
   };
-  const passthrough = migrateCtoState(s2);
-  assert.equal(passthrough.schema, 2);
-  assert.deepEqual(passthrough.budget, s2.budget);
-  assert.equal(passthrough.leases, undefined);
+  const completed = migrateCtoState(s2);
+  assert.equal(completed.schema, 2);
+  assert.deepEqual(completed.budget, s2.budget, "present budget preserved untouched");
+  assert.deepEqual(completed.leases, {}, "missing leases default-filled");
+  assert.deepEqual(completed.decisions, [], "missing decisions default-filled");
+  assert.deepEqual(completed.inbox_quarantine, {}, "missing inbox_quarantine default-filled");
 });
 
 test("cto-core: readCtoState applies migration to legacy state files", () => {
@@ -448,6 +452,70 @@ test("cto-core: canonicalizeState migrates a legacy file once and is idempotent"
     assert.equal(second.schema, 2);
     const afterSecond = readFileSync(path, "utf8");
     assert.equal(afterSecond, afterFirst);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-core: canonicalizeState rewrites a partial schema-2 file once and is idempotent", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-canon-s2-"));
+  try {
+    const runId = "standby-1234";
+    // Direct standby-writer shape (registry.ensureStandbyRun): schema 2 but
+    // no canonical schema-2 fields — a partial canonical state.
+    const partial = {
+      schema: 2,
+      id: runId,
+      task: "standby — awaiting inbox tasks",
+      branch: "",
+      autonomous: true,
+      plan: { id: runId, task: "standby — awaiting inbox tasks", teams: [], created_at: "2026-08-07T00:00:00.000Z" },
+      teams: [],
+      integration: { status: "pending" },
+      pause: { kind: "none", reason: "standby" },
+      updated_at: "2026-08-07T00:00:00.000Z",
+    };
+    const dir = join(root, ".work-state", "cto", runId);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "state.json");
+    writeFileSync(path, JSON.stringify(partial, null, 2));
+
+    const first = canonicalizeState(runId, root);
+    assert.equal(first.schema, 2);
+    assert.deepEqual(first.budget?.policy, { token_limit: null, dollar_limit: null, time_limit_ms: null });
+    assert.deepEqual(first.leases, {});
+    assert.deepEqual(first.decisions, []);
+    assert.deepEqual(first.inbox_quarantine, {});
+    const afterFirst = readFileSync(path, "utf8");
+    assert.ok(afterFirst.includes('"leases": {}'), "canonical fields persisted to disk");
+
+    const second = canonicalizeState(runId, root);
+    assert.equal(second.schema, 2);
+    const afterSecond = readFileSync(path, "utf8");
+    assert.equal(afterSecond, afterFirst, "no rewrite once the state is canonical");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-core: canonicalizeState leaves a complete schema-2 state untouched", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-canon-complete-"));
+  try {
+    const state = newCtoState({
+      id: "complete-run",
+      task: "t",
+      branch: "b",
+      autonomous: false,
+      plan: { id: "complete-run", task: "t", teams: [], created_at: "2026-08-07T00:00:00.000Z" },
+    });
+    writeCtoState(state, root);
+    const path = join(root, ".work-state", "cto", "complete-run", "state.json");
+    const before = readFileSync(path, "utf8");
+
+    const canonical = canonicalizeState("complete-run", root);
+    assert.equal(canonical.schema, 2);
+    const after = readFileSync(path, "utf8");
+    assert.equal(after, before, "complete canonical state is not rewritten (updated_at not re-stamped)");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

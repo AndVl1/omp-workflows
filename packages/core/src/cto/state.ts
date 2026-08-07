@@ -53,17 +53,22 @@ function defaultBudgetShape(): BudgetState {
   };
 }
 
+/** Schema-2 fields a canonical state must carry (default-filled by migrateCtoState). */
+const SCHEMA2_CANONICAL_FIELDS = ["budget", "leases", "decisions", "inbox_quarantine"] as const;
+
 /**
  * Additive, backward-compatible schema migration (br-zps.1, architecture 3.3):
- * schema 1 (or missing schema) input → schema 2 with the schema-2 fields
- * default-filled; schema ≥ 2 passes through untouched. All existing fields
- * are preserved.
+ * ANY input — schema 1, missing schema, or a partial schema-2 state written
+ * directly by a standby/legacy writer — becomes schema 2 with the schema-2
+ * fields (`budget`, `leases`, `decisions`, `inbox_quarantine`) default-filled
+ * when absent. Present values are preserved untouched, so a complete
+ * canonical state passes through unchanged. `health`/`scheduler` stay
+ * undefined until their owning teams write them.
  */
 export function migrateCtoState(raw: Record<string, unknown>): CtoState {
   const schema = typeof raw.schema === "number" ? raw.schema : 1;
-  if (schema >= 2) return raw as unknown as CtoState;
   const state: Record<string, unknown> = { ...raw };
-  state.schema = 2;
+  if (schema < 2) state.schema = 2;
   if (state.budget === undefined) state.budget = defaultBudgetShape();
   if (state.leases === undefined) state.leases = {};
   if (state.decisions === undefined) state.decisions = [];
@@ -73,23 +78,25 @@ export function migrateCtoState(raw: Record<string, unknown>): CtoState {
 
 /**
  * Canonicalize a run's state on disk (architecture 3.1/3.3): read →
- * migrate → re-write via writeCtoState ONLY when the stored schema was
- * below 2. Idempotent — a second call on an already-canonical state
- * performs no write.
+ * migrate → re-write via writeCtoState ONLY when the stored state is not
+ * yet canonical — schema below 2, or any schema-2 field missing (a partial
+ * schema-2 state written directly by a standby writer). Idempotent: a
+ * second call on an already-canonical state performs no write.
  */
 export function canonicalizeState(runId: string, root: string): CtoState {
   const state = readCtoState(runId, root);
   if (!state) {
     throw new Error(`canonicalizeState: no readable CtoState at ${ctoStatePath(runId, root)}`);
   }
-  let schemaChanged = true;
+  let needsWrite = true;
   try {
     const raw = JSON.parse(readFileSync(ctoStatePath(runId, root), "utf8")) as Record<string, unknown>;
-    schemaChanged = typeof raw.schema !== "number" || raw.schema < 2;
+    const schema = typeof raw.schema === "number" ? raw.schema : 1;
+    needsWrite = schema < 2 || SCHEMA2_CANONICAL_FIELDS.some((field) => raw[field] === undefined);
   } catch {
     // unreadable file — persist the migrated in-memory state
   }
-  if (schemaChanged) writeCtoState(state, root);
+  if (needsWrite) writeCtoState(state, root);
   return state;
 }
 

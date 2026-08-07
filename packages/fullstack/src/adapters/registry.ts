@@ -24,6 +24,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, s
 import { join } from "node:path";
 import {
   ctoStateDir,
+  defaultBudgetState,
   readCtoState,
   sanitizeEscalation,
   validateEscalation,
@@ -467,6 +468,14 @@ export function ensureStandbyRun(root: string): string {
     integration: { status: "pending" },
     pause: { kind: "none", reason: "standby" },
     updated_at: now,
+    // Canonical schema-2 fields (br-zps.1): this writer emits state.json
+    // directly, so it must not create a partial canonical state — missing
+    // fields would be default-filled only on read, leaving the file itself
+    // non-canonical until a later canonicalizeState write.
+    budget: defaultBudgetState(),
+    leases: {},
+    decisions: [],
+    inbox_quarantine: {},
   };
   writeFileSync(join(runDir, "state.json"), JSON.stringify(state, null, 2));
   return runId;
@@ -493,7 +502,8 @@ export function sha256Hex(text: string): string {
  * Persist a quarantine record for a task (br-zps.4). Best-effort, NEVER
  * throws: a rejection (or an unreadable run state) must not take down the
  * messenger path. `state.inbox_quarantine` is default-filled when absent
- * (schema-1 standby states migrate to schema 2 on read).
+ * (standby states written without the canonical schema-2 fields migrate to
+ * schema 2 on read).
  */
 function recordQuarantine(
   root: string,
