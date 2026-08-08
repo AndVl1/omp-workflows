@@ -6,6 +6,23 @@
 - **Slug**: cto-autonomy-stale-commands
 - **Verdict**: **PASS**
 
+## Superseded scenarios (read first)
+
+Scenarios 1-4 below were recorded against the **pre-model-first**
+implementation (a shared deterministic parser where `[AUTONOMOUS]` /
+approved natural-language directives made autonomy authoritative). They are
+**superseded** by the current model-first implementation — where the model's
+structured `classification: { ... autonomous ... }` is the sole autonomy
+authority and parser keywords are non-authoritative mechanical hints — as
+recorded in:
+
+- `vibe-report/llm-autonomy-classification-e2e-2026-08-08.md`
+- `vibe-report/llm-autonomy-live-e2e-2026-08-08.md`
+- `vibe-report/russian-autonomy-live-e2e-2026-08-08.md`
+
+Scenarios 5-10 (ownership, standby adoptability, terminality, copy-commands
+seed/prune/discovery, script path, repeat/leakage) remain current.
+
 ## Контекст
 
 `.work-state/diagnosis.json` фиксирует 6 root causes (RC1..RC6) и перечисляет

@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,7 +18,9 @@ import {
   setTeamStatus,
   newCtoState,
   writeCtoState,
+  readCtoState,
   isCtoRunTerminal,
+  ctoBackstop,
   type TeamDef,
 } from "@andvl1/omp-workflows-core";
 
@@ -104,6 +106,56 @@ test("cto-owner: all teams done plus integration done is terminal without pause 
     setTeamStatus(res.state, "frontend", "done", root);
     assert.equal(isCtoRunTerminal(res.state), true, "all teams done + integration done is terminal");
     assert.equal(findActiveCtoRun(root), null, "terminal run is not selectable as active");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-owner: state without pause is non-terminal and never crashes detection (legacy state)", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-owner-nopause-"));
+  try {
+    const res = runCto({
+      task: "Legacy run",
+      cwd: root,
+      branch: "main",
+      autonomous: false,
+      teams: [{ team: "backend", slice: "s1" }],
+      defs: sampleDefs(),
+    });
+    assert.ok(res);
+
+    // Simulate a legacy state.json written before the pause field existed.
+    const statePath = join(root, ".work-state", "cto", res.plan.id, "state.json");
+    const raw = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+    delete raw.pause;
+    writeFileSync(statePath, JSON.stringify(raw, null, 2));
+
+    const state = readCtoState(res.plan.id, root);
+    assert.ok(state);
+    assert.equal(state?.pause, undefined, "legacy state genuinely lacks pause");
+
+    assert.equal(isCtoRunTerminal(state!), false, "missing pause alone is NOT terminal");
+    assert.equal(findActiveCtoRun(root)?.runId, res.plan.id, "legacy state is still detected as active without crashing");
+
+    // Missing pause must not crash ctoBackstop either: not a done claim ->
+    // continue; background-worthy pauses keep going; no DoD gate invoked.
+    assert.deepEqual(ctoBackstop(state!, root), { continue: true }, "missing pause is not a done claim — backstop continues");
+    assert.deepEqual(ctoBackstop({ ...state!, pause: { kind: "background_wait", reason: "parked" } }, root), { continue: true });
+    assert.deepEqual(ctoBackstop({ ...state!, pause: { kind: "needs_human", reason: "blocker" } }, root), { continue: true });
+    assert.deepEqual(ctoBackstop({ ...state!, pause: { kind: "failed", reason: "boom" } }, root), { continue: true });
+
+    // Missing pause + all teams done + integration done -> still terminal.
+    setTeamStatus(state!, "backend", "done", root);
+    setIntegration(state!, "done", "wave 1", root);
+    assert.equal(isCtoRunTerminal(state!), true, "integration/team conditions prove terminality even without pause");
+    assert.equal(findActiveCtoRun(root), null, "completed legacy run is not selectable");
+
+    // Integration done without a pause still invokes the DoD gate: the run
+    // has no dod.json, so the backstop blocks on the missing DoD claim.
+    const gate = ctoBackstop(state!, root);
+    if (!("decision" in gate)) assert.fail(`expected a block on the incomplete DoD, got ${JSON.stringify(gate)}`);
+    assert.equal(gate.decision, "block", "integration done invokes the DoD gate even with missing pause");
+    assert.match(gate.reason, /DoD/, "block reason names the DoD gate");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

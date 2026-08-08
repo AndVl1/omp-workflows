@@ -102,6 +102,43 @@ test("cto-class: newCtoState mirrors classification into the top-level field —
   assert.equal(resolveCtoAutonomous(state), false);
 });
 
+test("cto-class: newCtoState with a malformed runtime classification keeps the explicit caller flag (never a half-stored classification)", () => {
+  const now = new Date().toISOString();
+  const state = newCtoState({
+    id: "r2",
+    task: "t",
+    branch: "b",
+    autonomous: false, // explicit caller flag must survive the malformed classification
+    classification: {
+      type: "BUG_FIX",
+      complexity: "QUICK",
+      confidence: "HIGH",
+      autonomous: "true", // non-boolean runtime value from a loosely typed parse
+    } as unknown as Parameters<typeof newCtoState>[0]["classification"],
+    plan: { id: "r2", task: "t", teams: [], created_at: now },
+  });
+  assert.equal(state.classification, undefined, "malformed classification is not persisted");
+  assert.equal(state.autonomous, false, "explicit caller flag is the fallback — never silently discarded");
+  assert.equal(resolveCtoAutonomous(state), false);
+});
+
+test("cto-class: newCtoState with a partial runtime classification (boolean autonomous only) is not authoritative — caller flag wins, nothing persists", () => {
+  const now = new Date().toISOString();
+  const state = newCtoState({
+    id: "r3",
+    task: "t",
+    branch: "b",
+    autonomous: false,
+    classification: {
+      autonomous: true, // partial: type/complexity/confidence missing — not a valid PHASE-0 classification
+    } as unknown as Parameters<typeof newCtoState>[0]["classification"],
+    plan: { id: "r3", task: "t", teams: [], created_at: now },
+  });
+  assert.equal(state.classification, undefined, "partial classification is not persisted");
+  assert.equal(state.autonomous, false, "explicit caller flag is the fallback for partial runtime values — boolean autonomous alone is not authority");
+  assert.equal(resolveCtoAutonomous(state), false);
+});
+
 test("cto-class: markdown state restores the structured classification; classification.autonomous wins over the legacy line", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-class-md-"));
   try {

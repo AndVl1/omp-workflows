@@ -45,13 +45,29 @@ export function newCtoState(opts: {
   /** Session that owns this interactive task run (foreign sessions do not amend it). */
   owner_session?: string;
 }): CtoState {
+  // Model-first: a well-formed classification carries ALL four PHASE-0
+  // fields — string `type`/`complexity`/`confidence` and boolean
+  // `autonomous` — and is the AUTHORITY, mirrored into the top-level field.
+  // A malformed/partial runtime classification object — e.g. loosely typed
+  // JSON parse missing any of the four or with a non-boolean `autonomous` —
+  // must NOT hijack the flag: the explicit caller fallback (opts.autonomous)
+  // applies and the malformed classification is not persisted (mirrors
+  // isStructuredClassification on the markdown path).
+  const classification =
+    opts.classification &&
+    typeof opts.classification.type === "string" &&
+    typeof opts.classification.complexity === "string" &&
+    typeof opts.classification.confidence === "string" &&
+    typeof opts.classification.autonomous === "boolean"
+      ? opts.classification
+      : undefined;
   return {
     schema: 2,
     id: opts.id,
     task: opts.task,
     branch: opts.branch,
-    autonomous: opts.classification ? opts.classification.autonomous : opts.autonomous,
-    ...(opts.classification ? { classification: opts.classification } : {}),
+    autonomous: classification ? classification.autonomous : opts.autonomous,
+    ...(classification ? { classification } : {}),
     plan: opts.plan,
     teams: opts.plan.teams.map((t) => ({ id: t.team, status: "pending", escalations: {} })),
     integration: { status: "pending" },
@@ -268,9 +284,14 @@ export function activeTeams(state: CtoState): string[] {
  * done/failed AND integration is done — even when the pause was never
  * stamped done/failed (e.g. runs whose wave completed through the engine
  * without a pause transition).
+ *
+ * Legacy/non-canonical state may lack `pause` entirely (pre-pause writers;
+ * migrateCtoState does not default it). Missing pause is NOT terminal by
+ * itself — only the integration/team conditions below can prove terminality.
  */
 export function isCtoRunTerminal(state: CtoState): boolean {
-  if (state.pause.kind === "done" || state.pause.kind === "failed") return true;
+  const pauseKind = state.pause?.kind;
+  if (pauseKind === "done" || pauseKind === "failed") return true;
   if (state.integration?.status === "done") {
     return state.teams.every((t) => t.status === "done" || t.status === "failed");
   }
