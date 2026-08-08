@@ -18,10 +18,9 @@
  */
 
 import { execSync } from "node:child_process";
+import { parseAutonomousDirective } from "./envelope.js";
 import type { CommandContext } from "./types.js";
 export type { CommandContext } from "./types.js";
-
-const AUTONOMOUS_PREFIX = "[AUTONOMOUS";
 
 export async function teamCommand(ctx: CommandContext): Promise<string> {
   const args = ctx.args.trim();
@@ -36,9 +35,9 @@ export async function teamCommand(ctx: CommandContext): Promise<string> {
     ].join("\n");
   }
 
-  const autonomous = args.startsWith(AUTONOMOUS_PREFIX);
-  const withoutPrefix = autonomous ? args.slice(AUTONOMOUS_PREFIX.length).trimStart() : args;
-  const cleanedTask = withoutPrefix.startsWith("]") ? withoutPrefix.slice(1).trimStart() : withoutPrefix;
+  const directive = parseAutonomousDirective(ctx.args);
+  const autonomyHint = directive.autonomyHint;
+  const cleanedTask = directive.task;
   const issueMatch = cleanedTask.match(/issue=#(\d+)/);
   const issue = issueMatch ? Number(issueMatch[1]) : null;
   const finalTask = issueMatch ? cleanedTask.replace(issueMatch[0], "").trim() : cleanedTask;
@@ -57,7 +56,7 @@ export async function teamCommand(ctx: CommandContext): Promise<string> {
     "## /team envelope (v0.3 stub)",
     "",
     `- task: ${finalTask}`,
-    `- autonomous: ${autonomous}`,
+    `- autonomyHint: ${autonomyHint} (mechanical leading-directive marker, NOT authoritative)`,
     `- issue: ${issue ?? "(none)"}`,
     `- branch: ${branch}`,
     `- cwd: ${ctx.cwd}`,

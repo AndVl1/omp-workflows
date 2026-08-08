@@ -34,9 +34,8 @@ function makeState(): TeamState {
   return {
     schema: 1,
     branch: "main",
-    classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", workflow: "lightweight" },
+    classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", workflow: "lightweight", autonomous: false },
     task: "synthetic",
-    autonomous: true,
     workflow_override: false,
     issue: null,
     stage_cursor: "implementation",

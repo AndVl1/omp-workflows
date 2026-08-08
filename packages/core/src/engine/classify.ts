@@ -1,13 +1,27 @@
 /**
- * Task type classifier. Lightweight keyword-based heuristic — the original
- * claude-plugin's `/team` command does the same in prose. Returns a
- * `Classification` for `resolveWorkflow()` to map to a profile.
+ * DEMOTED keyword classifier — no longer an authority.
  *
- * This is the FIRST STEP the engine runs, before any state is written, so
- * the model should classify via this helper for consistency.
+ * The model-first contract (RC2+): the main LLM classifies
+ * `type`/`complexity`/`confidence`/`autonomous` together at PHASE-0 from the
+ * COMPLETE task semantics in any language. `keywordClassify` is a bounded
+ * keyword heuristic kept ONLY for legacy engine callers that run `run()`
+ * without a model classification; it cannot decide autonomy (the return
+ * type has no `autonomous` field) and it is never consulted on the
+ * model-first command path (`run()` refuses to fill a partial model
+ * classification from keywords).
  */
 
-import type { Classification, Complexity, Confidence, TaskType } from "./types.js";
+import type { Complexity, Confidence, TaskType } from "./types.js";
+
+/**
+ * Keyword-only guess: type/complexity/confidence. Deliberately carries NO
+ * `autonomous` — a keyword scanner must never decide the autonomy flag.
+ */
+export interface KeywordGuess {
+  type: TaskType;
+  complexity: Complexity;
+  confidence: Confidence;
+}
 
 const TYPE_KEYWORDS: Record<TaskType, string[]> = {
   FEATURE: ["add", "implement", "create", "build", "new", "introduce", "feature"],
@@ -26,15 +40,12 @@ const COMPLEXITY_HINTS: Record<Complexity, string[]> = {
   CRITICAL: ["prod", "production", "outage", "incident", "critical"],
 };
 
-export function classify(
-  task: string,
-  opts: { autonomous?: boolean } = {},
-): Classification {
+export function keywordClassify(task: string): KeywordGuess {
   const lower = task.toLowerCase();
   const type = pickType(lower);
   const complexity = pickComplexity(lower, type);
   const confidence = pickConfidence(lower, type);
-  return { type, complexity, confidence, workflow: "standard" }; // workflow resolved by classifier driver
+  return { type, complexity, confidence };
 }
 
 function pickType(lower: string): TaskType {

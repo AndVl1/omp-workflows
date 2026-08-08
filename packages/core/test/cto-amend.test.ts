@@ -18,6 +18,10 @@ import {
   setCtoPause,
   markAmended,
   readCtoState,
+  setIntegration,
+  setTeamStatus,
+  newCtoState,
+  isCtoRunTerminal,
   type TeamDef,
 } from "@andvl1/omp-workflows-core";
 
@@ -208,12 +212,15 @@ test("cto-amend: buildAmendPrompt includes active run metadata", () => {
     const res = startRun(root);
     assert.ok(res);
     const prompt = buildAmendPrompt(
-      { task: "Task B", autonomous: true, issue: null, branch: "main" },
+      { task: "Task B", autonomyHint: true, issue: null, branch: "main" },
       root,
       { runId: res.plan.id, state: res.state },
     );
     assert.ok(prompt.includes(`Run: \`${res.plan.id}\``));
-    assert.ok(prompt.includes("Autonomous mode: ON"));
+    assert.ok(prompt.includes(`.work-state/cto/${res.plan.id}/inbox/*.json`), "amend inbox check points at the ACTUAL run inbox");
+    assert.ok(!prompt.includes("+runId+"), "no literal template placeholder leaks into the rendered prompt");
+    assert.ok(prompt.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): ON"), "amend renders the mechanical hint, not a decision");
+    assert.ok(prompt.includes("- Autonomous: true | false"), "amend requests the model autonomy decision");
     assert.ok(prompt.includes("Integration covers ALL teams"));
   } finally {
     rmSync(root, { recursive: true, force: true });

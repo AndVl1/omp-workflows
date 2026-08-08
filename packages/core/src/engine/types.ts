@@ -37,6 +37,15 @@ export interface Classification {
   complexity: Complexity;
   confidence: Confidence;
   workflow: WorkflowName;
+  /**
+   * Model-decided autonomy (PHASE-0). The ONLY authority for the autonomous
+   * flag: `resolveWorkflow` and the P5 gate read this field, never the
+   * mechanical parser hint (`autonomyHint`) and never the legacy top-level
+   * `TeamState.autonomous` (read-compat only).
+   */
+  autonomous: boolean;
+  /** Model's one-sentence justification for the autonomy decision. */
+  autonomous_reason?: string;
 }
 
 export interface ProfileMatch {
@@ -104,7 +113,14 @@ export interface TeamState {
   branch: string;
   classification: Classification;
   task: string;
-  autonomous: boolean;
+  /**
+   * LEGACY read-compat only. New writes persist the decision inside
+   * `classification.autonomous`; this top-level field is read by the P5 gate
+   * solely for old state files that predate the model-first contract. It is
+   * NEVER written by new state and never overrides a present
+   * `classification.autonomous`.
+   */
+  autonomous?: boolean;
   workflow_override: boolean;
   issue: { number: number; url?: string } | null;
   stage_cursor: string;

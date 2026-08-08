@@ -8,6 +8,7 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ModelClassification } from "../engine/run.js";
 import {
   type CtoState,
   type BudgetState,
@@ -25,18 +26,55 @@ export function ctoStatePath(runId: string, root: string): string {
   return join(ctoStateDir(runId, root), "state.json");
 }
 
-export function newCtoState(opts: { id: string; task: string; branch: string; autonomous: boolean; plan: TeamPlan }): CtoState {
+export function newCtoState(opts: {
+  id: string;
+  task: string;
+  branch: string;
+  autonomous: boolean;
+  /**
+   * Model-first PHASE-0 classification (authority for `autonomous`). When
+   * present, `classification.autonomous` is the decision and the top-level
+   * `autonomous` field is mirrored from it for legacy readers — the two can
+   * never disagree by construction. Legacy callers and engine-created
+   * standby runs omit it and keep the explicit top-level flag verbatim.
+   */
+  classification?: ModelClassification;
+  plan: TeamPlan;
+  /** Standby runs are adoptable cross-session (inbox continuity). */
+  standby?: boolean;
+  /** Session that owns this interactive task run (foreign sessions do not amend it). */
+  owner_session?: string;
+}): CtoState {
+  // Model-first: a well-formed classification carries ALL four PHASE-0
+  // fields — string `type`/`complexity`/`confidence` and boolean
+  // `autonomous` — and is the AUTHORITY, mirrored into the top-level field.
+  // A malformed/partial runtime classification object — e.g. loosely typed
+  // JSON parse missing any of the four or with a non-boolean `autonomous` —
+  // must NOT hijack the flag: the explicit caller fallback (opts.autonomous)
+  // applies and the malformed classification is not persisted (mirrors
+  // isStructuredClassification on the markdown path).
+  const classification =
+    opts.classification &&
+    typeof opts.classification.type === "string" &&
+    typeof opts.classification.complexity === "string" &&
+    typeof opts.classification.confidence === "string" &&
+    typeof opts.classification.autonomous === "boolean"
+      ? opts.classification
+      : undefined;
   return {
     schema: 2,
     id: opts.id,
     task: opts.task,
     branch: opts.branch,
-    autonomous: opts.autonomous,
+    autonomous: classification ? classification.autonomous : opts.autonomous,
+    ...(classification ? { classification } : {}),
     plan: opts.plan,
     teams: opts.plan.teams.map((t) => ({ id: t.team, status: "pending", escalations: {} })),
     integration: { status: "pending" },
     pause: { kind: "none", reason: "" },
     updated_at: new Date().toISOString(),
+    ...(opts.standby === true ? { standby: true } : {}),
+    ...(opts.owner_session ? { owner_session: opts.owner_session } : {}),
     // ── schema-2 defaults (br-zps.1): health/scheduler stay undefined until their owning teams write them ──
     budget: defaultBudgetShape(),
     leases: {},
@@ -115,6 +153,22 @@ export function writeCtoState(state: CtoState, root: string): string {
   state.updated_at = new Date().toISOString();
   writeFileSync(path, JSON.stringify(state, null, 2));
   return path;
+}
+
+/**
+ * Resolve the authoritative autonomous flag for a CTO run, model-first:
+ * - `classification.autonomous` (the model's PHASE-0 decision) is the
+ *   AUTHORITY whenever a classification is present — the top-level field
+ *   can never override it (new state mirrors the classification, so the two
+ *   agree by construction; a legacy file with both must honor the model).
+ * - The top-level `autonomous` field is the fallback ONLY when the
+ *   classification is absent: legacy runs and the engine-created standby
+ *   exception (no user task, nothing to classify).
+ */
+export function resolveCtoAutonomous(state: Pick<CtoState, "classification" | "autonomous">): boolean {
+  const model = state.classification?.autonomous;
+  if (model !== undefined) return model;
+  return state.autonomous;
 }
 
 function teamOf(state: CtoState, teamId: string): CtoState["teams"][number] | undefined {
@@ -222,4 +276,24 @@ export function pendingEscalations(state: CtoState): Array<{ teamId: string; esc
 /** Teams not yet finished (pending | in_progress | parked). */
 export function activeTeams(state: CtoState): string[] {
   return state.teams.filter((t) => t.status === "pending" || t.status === "in_progress" || t.status === "parked").map((t) => t.id);
+}
+
+/**
+ * True when the run is finished and must not be selected as active (RC5).
+ * A run is terminal when its pause is done/failed, or when ALL teams are
+ * done/failed AND integration is done — even when the pause was never
+ * stamped done/failed (e.g. runs whose wave completed through the engine
+ * without a pause transition).
+ *
+ * Legacy/non-canonical state may lack `pause` entirely (pre-pause writers;
+ * migrateCtoState does not default it). Missing pause is NOT terminal by
+ * itself — only the integration/team conditions below can prove terminality.
+ */
+export function isCtoRunTerminal(state: CtoState): boolean {
+  const pauseKind = state.pause?.kind;
+  if (pauseKind === "done" || pauseKind === "failed") return true;
+  if (state.integration?.status === "done") {
+    return state.teams.every((t) => t.status === "done" || t.status === "failed");
+  }
+  return false;
 }

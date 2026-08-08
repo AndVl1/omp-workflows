@@ -201,8 +201,10 @@ export {
 } from "./engine/dod.js";
 export {
 	run,
+	resolveClassification,
 	type RunOptions,
 	type RunResult,
+	type ModelClassification,
 } from "./engine/run.js";
 export {
 	walkProfile,
@@ -271,6 +273,8 @@ export {
 	expireEscalations,
 	pendingEscalations,
 	activeTeams,
+	isCtoRunTerminal,
+	resolveCtoAutonomous,
 } from "./cto/state.js";
 export { teamDoDComplete, integrationDoD, ctoBackstop } from "./cto/gates.js";
 export { runCto, ctoRunId, type RunCtoOptions, type RunCtoResult } from "./cto/run.js";
@@ -283,6 +287,7 @@ export {
   renderChannelSection,
   findActiveCtoRun,
   type ParsedCtoEnvelope,
+  type CtoPromptOptions,
 } from "./commands/cto.js";
 export {
   parseWorkEnvelope,
@@ -290,6 +295,12 @@ export {
   type ParsedWorkEnvelope,
   type WorkTeamConfig,
 } from "./commands/do-work.js";
+export {
+  parseAutonomousDirective,
+  AUTONOMOUS_TOKEN,
+  AUTONOMOUS_DIRECTIVES,
+  type AutonomousDirective,
+} from "./commands/envelope.js";
 export { markAmended } from "./cto/state.js";
 export {
 	EventRecorder,
@@ -343,6 +354,9 @@ export type {
 // ── cto-safety (br-zps.4, br-zps.5, br-zps.6) ───────────────────────────────
 export { redactEscalation, DEFAULT_REDACTION_CONFIG } from "./cto/redaction.js";
 export { outboxEnforcementGate } from "./gates/outbox.js";
+export { classificationGate, classificationToolGate } from "./gates/classification.js";
+export { keywordClassify, type KeywordGuess } from "./engine/classify.js";
+export { buildClassificationPhaseZero, buildWorkflowMatrix, CLASSIFICATION_FIELDS, type ClassificationHint } from "./commands/classification-contract.js";
 export type { EscalationInboundMessage } from "./cto/types.js";
 
 // ── cto-operations (br-zps.2, br-zps.7, br-zps.8) ───────────────────────────

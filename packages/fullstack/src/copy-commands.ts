@@ -23,11 +23,28 @@
  * the missing commands land in `.omp/commands/` automatically.
  */
 
-import { copyFileSync, Dirent, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { copyFileSync, Dirent, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SHIPPED_COMMANDS_DIR = "commands";
+
+/**
+ * Manifest file written into `.omp/commands/` recording the command names
+ * the plugin materialized. Pruning removes a tracked directory once it
+ * drops out of the shipped set, converging the target to the shipped set.
+ * The manifest is a plain JSON file (not a directory), so OMP's
+ * `.omp/commands/<name>/index.ts` discovery never treats it as a command.
+ */
+export const SHIPPED_MANIFEST_FILE = ".omp-shipped.json";
+
+/**
+ * Narrowly scoped migration list: command directories shipped by older
+ * plugin versions BEFORE the manifest existed (copied without tracking).
+ * They are plugin-owned artifacts, removed on sync, while user-created
+ * command directories (never shipped, never in this list) are preserved.
+ */
+export const LEGACY_REMOVED_COMMANDS = ["team-next", "team-yolo", "pulse", "coordinator-stats"] as const;
 
 export interface CopyCommandsOptions {
 	/** Override the target directory; defaults to `<cwd>/.omp/commands`. */
@@ -38,6 +55,64 @@ export interface CopyCommandsResult {
 	copied: string[];
 	skipped: string[];
 	errors: string[];
+}
+
+interface ShippedManifest {
+	schema: 1;
+	shipped: string[];
+}
+
+function readShippedManifest(targetRoot: string): string[] {
+	try {
+		const raw = JSON.parse(readFileSync(join(targetRoot, SHIPPED_MANIFEST_FILE), "utf8")) as { shipped?: unknown };
+		if (Array.isArray(raw.shipped)) {
+			return raw.shipped.filter((name): name is string => typeof name === "string");
+		}
+	} catch {
+		// missing/malformed manifest — nothing tracked yet
+	}
+	return [];
+}
+
+function writeShippedManifest(targetRoot: string, shipped: string[]): void {
+	try {
+		const manifest: ShippedManifest = { schema: 1, shipped };
+		writeFileSync(join(targetRoot, SHIPPED_MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`);
+	} catch {
+		// best-effort — a missing manifest only delays pruning of future removals
+	}
+}
+
+/**
+ * Converge `.omp/commands/` to the shipped set: remove plugin-owned command
+ * directories that no longer ship (tracked by the manifest, or from the
+ * known legacy shipped set), while preserving explicitly user-owned
+ * commands (never tracked, not in the legacy list). Rewrites the manifest
+ * with the current shipped set. Returns the removed command names.
+ */
+export function pruneStaleCommands(targetRoot: string, shippedNames: string[]): string[] {
+	const tracked = readShippedManifest(targetRoot);
+	const legacy = LEGACY_REMOVED_COMMANDS as readonly string[];
+	const removed: string[] = [];
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(targetRoot, { withFileTypes: true });
+	} catch {
+		return removed;
+	}
+	for (const entry of entries) {
+		if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+		if (shippedNames.includes(entry.name)) continue;
+		if (!tracked.includes(entry.name) && !legacy.includes(entry.name)) continue;
+		try {
+			rmSync(join(targetRoot, entry.name), { recursive: true, force: true });
+			removed.push(entry.name);
+		} catch {
+			// best-effort — a locked directory is retried next session
+		}
+	}
+	writeShippedManifest(targetRoot, shippedNames);
+	return removed;
 }
 
 /**
@@ -167,9 +242,11 @@ export function copyCommandsForInstall(
 	const entries: Dirent[] = readdirSync(shippedRoot, { withFileTypes: true });
 	if (!existsSync(targetRoot)) mkdirSync(targetRoot, { recursive: true });
 
+	const shippedNames: string[] = [];
 	for (const entry of entries) {
 		if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
 		try {
+			shippedNames.push(entry.name);
 			const outcome = copyCommandDir(shippedRoot, entry.name, targetRoot, "overwrite");
 			if (outcome === "copied") result.copied.push(entry.name);
 			else result.skipped.push(entry.name);
@@ -177,6 +254,9 @@ export function copyCommandsForInstall(
 			result.errors.push(`${entry.name}: ${String(err)}`);
 		}
 	}
+	// Converge to the shipped set: drop plugin-owned stale command dirs
+	// (manifest-tracked or legacy shipped names), keep user-owned ones.
+	pruneStaleCommands(targetRoot, shippedNames);
 	return result;
 }
 
@@ -212,9 +292,11 @@ export function ensureCommandsForSession(
 	}
 
 	const entries: Dirent[] = readdirSync(shippedRoot, { withFileTypes: true });
+	const shippedNames: string[] = [];
 	for (const entry of entries) {
 		if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
 		try {
+			shippedNames.push(entry.name);
 			if (isAlreadyUpToDate(shippedRoot, entry.name, targetRoot)) {
 				result.skipped.push(entry.name);
 				continue;
@@ -226,5 +308,9 @@ export function ensureCommandsForSession(
 			result.errors.push(`${entry.name}: ${String(err)}`);
 		}
 	}
+	// Every session start converges the target to the shipped set: stale
+	// plugin-owned command dirs (team-next/team-yolo and other removed
+	// shipped entries) stop being selectable once a fresh session starts.
+	pruneStaleCommands(targetRoot, shippedNames);
 	return result;
 }

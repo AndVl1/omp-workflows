@@ -3,8 +3,12 @@
  * PreToolUse(Task) hook.
  *
  * Blocks subagent launches when `.work-state/team-state.json` lacks a
- * classification, or when the resolved `workflow` does not match the
- * Type x Complexity -> Workflow table.
+ * classification, when `classification.autonomous` is missing or non-boolean
+ * (fail closed — no silent default), or when the resolved `workflow` does
+ * not match the Type x Complexity -> Workflow table. The autonomous flag
+ * comes from `classification.autonomous` (the model decision); the legacy
+ * top-level `autonomous` field is read only as read-compatibility for old
+ * state files and can never override a present model field.
  *
  * Wired to `before_agent_start` so the engine catches it before the agent
  * executes.
@@ -12,7 +16,10 @@
  * Gracefully degrades:
  *   - no JSON state    -> allow (legacy flow)
  *   - parse error      -> allow (transient write)
- *   - intentional override (`workflow_override: true`) -> allow
+ *   - intentional override (`workflow_override: true`) -> allow, but ONLY
+ *     after the model autonomy field validates: missing or non-boolean
+ *     `classification.autonomous` still blocks — an explicit override can
+ *     skip the workflow-mismatch check, never the fail-closed autonomy gate.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -79,15 +86,26 @@ export function classificationGate(event: AgentStartEvent, ctx: AgentStartContex
     return { block: true, reason: "BLOCK (P5): missing classification. Run /team so a CLASSIFICATION block is written to .work-state/team-state.json before launching agents." };
   }
 
+  // Fail-closed autonomy validation runs BEFORE the override escape hatch:
+  // `workflow_override: true` may skip the workflow-mismatch check below, but
+  // it must NEVER bypass a missing or non-boolean model autonomy field. The
+  // model decision is the only authority and no silent default applies.
+  const autonomous = resolveAutonomous(state);
+  if (autonomous === undefined) return { block: true, reason: autonomousBlockReason(state) };
+
   if (state.workflow_override === true) return;
 
   const type = c.type as TaskType;
   const complexity = c.complexity as Complexity;
-  const autonomous = state.autonomous === true;
   const expected = resolveWorkflow(type, complexity, autonomous);
   const actual = c.workflow;
   if (actual && actual !== expected) {
-    if (isRegisteredWorkflow(actual) && matchesProfile(actual, { type, complexity })) return;
+    // Non-autonomous runs may pick a different registered profile whose match
+    // table accepts this classification (intentional override). Autonomous
+    // runs resolve through the MODEL classification field (e.g. BUG_FIX ->
+    // debug-cycle) and may NOT be silently downgraded to the interactive
+    // counterpart via the profile-match escape hatch.
+    if (!autonomous && isRegisteredWorkflow(actual) && matchesProfile(actual, { type, complexity })) return;
     return {
       block: true,
       reason: `BLOCK (P5): workflow '${actual}' does not match classification (type=${type} complexity=${complexity} autonomous=${autonomous} -> expected '${expected}'). Fix the workflow in team-state.json, or set workflow_override: true.`,
@@ -109,4 +127,35 @@ function resolveStatePath(cwd: string): string | null {
   const legacy = join(wsDir, "team-state.json");
   if (existsSync(legacy)) return legacy;
   return null;
+}
+
+/**
+ * Resolve the autonomous flag for the P5 gate, fail-closed:
+ * - `classification.autonomous` is the MODEL decision — the only authority.
+ *   A present non-boolean value BLOCKS (never silently replaced).
+ * - Absent classification field falls back to the legacy top-level
+ *   `TeamState.autonomous` ONLY for old state files (read compatibility).
+ * - Neither present -> BLOCK: no silent true/false default for a task.
+ */
+function resolveAutonomous(state: {
+  classification?: Partial<Classification>;
+  autonomous?: boolean;
+}): boolean | undefined {
+  const modelAutonomous = state.classification?.autonomous;
+  if (modelAutonomous !== undefined) {
+    return typeof modelAutonomous === "boolean" ? modelAutonomous : undefined;
+  }
+  if (typeof state.autonomous === "boolean") return state.autonomous;
+  return undefined;
+}
+
+function autonomousBlockReason(state: {
+  classification?: Partial<Classification>;
+  autonomous?: boolean;
+}): string {
+  const modelAutonomous = state.classification?.autonomous;
+  if (modelAutonomous !== undefined) {
+    return `BLOCK (P5): classification.autonomous must be a boolean, got ${JSON.stringify(modelAutonomous)}. Fail closed — the model decision is invalid and no silent default applies.`;
+  }
+  return "BLOCK (P5): classification.autonomous is missing. PHASE-0 must decide `autonomous: true | false`; no silent default and no workflow can be resolved without it.";
 }

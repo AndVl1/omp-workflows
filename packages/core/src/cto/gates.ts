@@ -46,7 +46,10 @@ export function integrationDoD(state: CtoState, root: string): GateResult {
  * gates/dod-backstop.ts.
  */
 export function ctoBackstop(state: CtoState, root: string): { continue: true } | { decision: "block"; reason: string } {
-  const kind = state.pause.kind;
+  // Missing pause (legacy pre-pause writers) is NOT a done claim — same
+  // semantics as isCtoRunTerminal: only integration/team conditions can
+  // prove a done-claim, and background_wait/needs_human/failed keep going.
+  const kind = state.pause?.kind;
   if (kind === "background_wait" || kind === "needs_human" || kind === "failed") return { continue: true };
 
   const claimingDone = kind === "done" || state.integration.status === "done";

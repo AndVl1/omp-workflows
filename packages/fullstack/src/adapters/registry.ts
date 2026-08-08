@@ -463,6 +463,10 @@ export function ensureStandbyRun(root: string): string {
     task: "standby — awaiting inbox tasks",
     branch: "",
     autonomous: true,
+    // Explicit standby marker (RC4): adoptable cross-session so queued
+    // inbox tasks are never lost when a new session starts. Ownership is
+    // enforced only for interactive task runs, never for standby runs.
+    standby: true,
     plan: { id: runId, task: "standby — awaiting inbox tasks", teams: [], created_at: now },
     teams: [],
     integration: { status: "pending" },

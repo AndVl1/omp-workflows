@@ -36,7 +36,7 @@ test("core: loadAllProfiles returns 9 profiles", async () => {
   // The CTO profile is explicit-only: no classification may select it.
   for (const type of ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "INVESTIGATION", "REVIEW", "HOTFIX"] as const) {
     for (const complexity of ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] as const) {
-      const selected = selectProfile(profiles, { type, complexity, confidence: "HIGH", workflow: "standard" });
+      const selected = selectProfile(profiles, { type, complexity, confidence: "HIGH", workflow: "standard", autonomous: false });
       assert.notEqual(selected?.name, "cto", `${type}/${complexity} must not select cto`);
     }
   }
@@ -56,7 +56,7 @@ test("core: resolveWorkflow matrix", () => {
 test("core: selectProfile resolves to the right profile", async () => {
   const profiles = await loadAllProfiles();
   const p = selectProfile(profiles, {
-    type: "FEATURE", complexity: "QUICK", confidence: "HIGH", workflow: "lightweight",
+    type: "FEATURE", complexity: "QUICK", confidence: "HIGH", workflow: "lightweight", autonomous: false,
   });
   assert.ok(p);
   assert.equal(p.name, "lightweight");
@@ -76,7 +76,7 @@ test("core: registered profiles are available and explicit workflow selects them
   const profiles = loadAllProfiles();
   assert.equal(profiles.find((p) => p.name === custom.name)?.title, custom.title);
   const selected = selectProfile(profiles, {
-    type: "INVESTIGATION", complexity: "MEDIUM", confidence: "HIGH", workflow: custom.name,
+    type: "INVESTIGATION", complexity: "MEDIUM", confidence: "HIGH", workflow: custom.name, autonomous: false,
   });
   assert.equal(selected?.name, custom.name);
 });
@@ -135,9 +135,8 @@ test("core: workflow dispatch leaves model selection to OMP", async () => {
   const state = {
     schema: 1 as const,
     branch: "feat/role-routing",
-    classification: { type: "FEATURE" as const, complexity: "QUICK" as const, confidence: "HIGH" as const, workflow: "lightweight" as const },
+    classification: { type: "FEATURE" as const, complexity: "QUICK" as const, confidence: "HIGH" as const, workflow: "lightweight" as const, autonomous: false },
     task: "exercise role routing",
-    autonomous: false,
     workflow_override: false,
     issue: null,
     stage_cursor: "implementation",
@@ -237,9 +236,8 @@ test("core: consilium preserves role variants without pinning models", async () 
   const state = {
     schema: 1 as const,
     branch: "feat/role-routing",
-    classification: { type: "FEATURE" as const, complexity: "COMPLEX" as const, confidence: "HIGH" as const, workflow: "full-feature" as const },
+    classification: { type: "FEATURE" as const, complexity: "COMPLEX" as const, confidence: "HIGH" as const, workflow: "full-feature" as const, autonomous: false },
     task: "compare architecture variants",
-    autonomous: false,
     workflow_override: false,
     issue: null,
     stage_cursor: "architecture",
