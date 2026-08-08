@@ -10,6 +10,7 @@
 
 import { buildTeamPlan, validateDecompositionDepth, type PlanTeamInput } from "./plan.js";
 import { newCtoState, writeCtoState } from "./state.js";
+import type { ModelClassification } from "../engine/run.js";
 import type { CtoState, TeamDef, TeamPlan } from "./types.js";
 
 export interface RunCtoOptions {
@@ -17,6 +18,13 @@ export interface RunCtoOptions {
   cwd: string;
   branch: string;
   autonomous: boolean;
+  /**
+   * Model-first PHASE-0 classification (authority for `autonomous`). When
+   * present it is persisted as `state.classification` and its `autonomous`
+   * wins over the top-level flag; legacy callers / engine-created standby
+   * omit it and keep the explicit top-level flag.
+   */
+  classification?: ModelClassification;
   /** Proposed decomposition (from the CTO agent / consumer orchestrator). */
   teams: PlanTeamInput[];
   /** TeamDef registry (consumer-owned). */
@@ -60,6 +68,7 @@ export function runCto(opts: RunCtoOptions): RunCtoResult {
     task: opts.task,
     branch: opts.branch,
     autonomous: opts.autonomous,
+    classification: opts.classification,
     plan: built.plan,
     ...(opts.standby === true ? { standby: true } : {}),
     ...(opts.owner_session ? { owner_session: opts.owner_session } : {}),

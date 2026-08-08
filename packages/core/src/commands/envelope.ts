@@ -2,22 +2,26 @@
  * Shared deterministic autonomy-directive parser for /cto, /do-work and
  * /team.
  *
- * One parser feeds every command surface so the resolved `autonomous` flag
- * and the stripped task text never diverge between commands. It is a
+ * One parser feeds every command surface so the resolved `autonomyHint` and
+ * the stripped task text never diverge between commands. It is a
  * leading-directive parser by contract:
  *
- *  - The exact bracket token `[AUTONOMOUS]` enables autonomy. It must be
+ *  - The exact bracket token `[AUTONOMOUS]` enables the hint. It must be
  *    followed by whitespace or the end of the input; a lookalike such as
  *    `[AUTONOMOUSLY]` (the closing bracket never lands) or `[AUTONOMOUS]`
  *    glued to the task (`[AUTONOMOUS]task`) is NOT a directive — it stays
  *    verbatim in the task text so input is never corrupted.
  *  - A bounded, explicit list of natural-language leading directives
  *    (`действуй автономно`, normalized: case-insensitive, whitespace
- *    collapsed) enables autonomy and is stripped together with an optional
+ *    collapsed) enables the hint and is stripped together with an optional
  *    `:`, `,` or `;` separator. No fuzzy keyword matching, no
  *    LLM-dependent mode detection.
  *
- * Anything else is task text, returned verbatim with `autonomous: false`.
+ * Authority contract (RC2+): the result is a MECHANICAL HINT, never the
+ * autonomy decision. PHASE-0 instructs the main LLM to classify
+ * `autonomous` from the complete task semantics in any language; this hint
+ * is rendered as non-authoritative metadata and must never be copied into
+ * persisted state as the decision.
  */
 
 /** Exact bracket token that enables autonomous mode. */
@@ -34,8 +38,14 @@ export const AUTONOMOUS_DIRECTIVES = ["действуй автономно"] as 
 const DIRECTIVE_SEPARATOR = "[\\s:,;]+";
 
 export interface AutonomousDirective {
-  /** True when a recognized directive was present and stripped. */
-  autonomous: boolean;
+  /**
+   * MECHANICAL autonomy hint: true when a recognized leading directive was
+   * present and stripped. NON-AUTHORITATIVE by contract — the main LLM
+   * decides `autonomous` in PHASE-0 from the complete task semantics; this
+   * hint is rendered for mechanical envelope hygiene only and is never
+   * copied into persisted state as the decision.
+   */
+  autonomyHint: boolean;
   /**
    * Task text after stripping a recognized leading directive (leading
    * whitespace removed); the verbatim trimmed input when none matched.
@@ -59,11 +69,15 @@ const DIRECTIVE_PATTERNS = AUTONOMOUS_DIRECTIVES.map(directivePattern);
 /**
  * Parse a raw `<args>` string for the leading autonomy directive.
  *
- * Returns `{ autonomous: true, task }` when an exact `[AUTONOMOUS]` token
+ * Returns `{ autonomyHint: true, task }` when an exact `[AUTONOMOUS]` token
  * or an approved natural directive opens the input (token followed by
  * whitespace/EOS; natural directive followed by whitespace/EOS or a
- * `: , ;` separator). Otherwise `{ autonomous: false, task }` with the
+ * `: , ;` separator). Otherwise `{ autonomyHint: false, task }` with the
  * trimmed input preserved verbatim.
+ *
+ * The result is a MECHANICAL HINT (never authoritative): PHASE-0 has the
+ * main LLM decide `autonomous` from the full task semantics, and this value
+ * is only rendered as non-authoritative metadata.
  */
 export function parseAutonomousDirective(args: string): AutonomousDirective {
   const trimmed = args.trimStart();
@@ -73,17 +87,17 @@ export function parseAutonomousDirective(args: string): AutonomousDirective {
     // Token must stand alone: whitespace or end of input. `[AUTONOMOUS]task`
     // is ambiguous — keep it literal rather than corrupting the task.
     if (rest === "" || /^\s/.test(rest)) {
-      return { autonomous: true, task: rest.trimStart() };
+      return { autonomyHint: true, task: rest.trimStart() };
     }
-    return { autonomous: false, task: trimmed };
+    return { autonomyHint: false, task: trimmed };
   }
 
   for (const pattern of DIRECTIVE_PATTERNS) {
     const match = trimmed.match(pattern);
     if (match) {
-      return { autonomous: true, task: trimmed.slice(match[0].length).trimStart() };
+      return { autonomyHint: true, task: trimmed.slice(match[0].length).trimStart() };
     }
   }
 
-  return { autonomous: false, task: trimmed };
+  return { autonomyHint: false, task: trimmed };
 }

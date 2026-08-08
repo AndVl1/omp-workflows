@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   buildCtoPrompt,
   buildStandbyCtoPrompt,
+  buildAmendPrompt,
   parseCtoEnvelope,
   renderChannelSection,
   ctoCommand,
@@ -29,21 +30,22 @@ const TEAMS_JSON = [
   },
 ];
 
-test("cto-cmd: natural-language directive enables autonomy and stays out of the task", () => {
+test("cto-cmd: natural-language directive sets the hint and stays out of the task", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-core-ru-"));
   try {
     const envelope = parseCtoEnvelope("действуй автономно: Add OAuth", root);
-    assert.equal(envelope.autonomous, true);
+    assert.equal(envelope.autonomyHint, true);
     assert.equal(envelope.task, "Add OAuth");
 
     const prompt = buildCtoPrompt(envelope, root);
-    assert.ok(prompt.includes("Autonomous mode: ON"), "natural directive renders ON");
-    assert.ok(prompt.includes("autonomous: true"), "persistence contract carries the literal flag");
+    assert.ok(prompt.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): ON"), "natural directive renders hint ON");
+    assert.ok(prompt.includes("autonomous: <true|false>"), "persistence contract carries the MODEL decision, not the parser flag");
+    assert.ok(!prompt.includes("`autonomous: true`"), "parser boolean is NOT copied into the persistence contract");
 
     const lookalike = parseCtoEnvelope("[AUTONOMOUSLY] Add OAuth", root);
-    assert.equal(lookalike.autonomous, false, "lookalike does not enable autonomy");
+    assert.equal(lookalike.autonomyHint, false, "lookalike does not set the hint");
     assert.equal(lookalike.task, "[AUTONOMOUSLY] Add OAuth", "lookalike stays literal");
-    assert.ok(buildCtoPrompt(lookalike, root).includes("Autonomous mode: OFF"), "lookalike renders OFF");
+    assert.ok(buildCtoPrompt(lookalike, root).includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): OFF"), "lookalike renders hint OFF");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -55,10 +57,10 @@ test("cto-cmd: parseCtoEnvelope handles prefixes and issue", () => {
     const plain = parseCtoEnvelope("Add OAuth issue=#3", root);
     assert.equal(plain.task, "Add OAuth");
     assert.equal(plain.issue, 3);
-    assert.equal(plain.autonomous, false);
+    assert.equal(plain.autonomyHint, false);
 
     const auto = parseCtoEnvelope("[AUTONOMOUS] Fix bug issue=#9", root);
-    assert.equal(auto.autonomous, true);
+    assert.equal(auto.autonomyHint, true);
     assert.equal(auto.task, "Fix bug");
     assert.equal(auto.issue, 9);
     assert.equal(auto.branch, null); // tmpdir is not a git work tree
@@ -91,6 +93,48 @@ test("cto-cmd: buildCtoPrompt renders teams from .omp/teams.json", () => {
     assert.ok(prompt.includes("debug-cycle"), "bug-fix slices run debug-cycle through the team");
     assert.ok(prompt.includes("Architecture first"), "architecture stage in the contract");
     assert.ok(prompt.includes("api_contract"), "architect produces the cross-team contract");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-cmd: buildCtoPrompt includes the COMPLETE workflow matrix (REVIEW/HOTFIX + P5 rule)", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-core-matrix-"));
+  try {
+    const prompt = buildCtoPrompt(parseCtoEnvelope("Add OAuth", root), root);
+    assert.ok(prompt.includes("### Workflow resolution"), "workflow matrix section present");
+    assert.ok(prompt.includes("| REVIEW | review | review | review | review |"), "REVIEW row rendered");
+    assert.ok(prompt.includes("| HOTFIX | emergency | emergency | emergency | emergency |"), "HOTFIX row rendered");
+    assert.ok(prompt.includes("(`classification.autonomous`)"), "P5 re-derives from classification.autonomous");
+    assert.ok(prompt.includes("Never re-derive"), "autonomy is never re-derived from task text or markers");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-cmd: buildAmendPrompt includes the complete workflow matrix too", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-core-matrix-amend-"));
+  try {
+    const prompt = buildAmendPrompt(
+      parseCtoEnvelope("Task B", root),
+      root,
+      { runId: "run-1", state: { plan: { created_at: "2026-08-04T10:00:00.000Z" }, teams: [{ id: "backend", status: "in_progress" }], pause: { kind: "none", reason: "" }, updated_at: "2026-08-04T10:05:00.000Z" } },
+    );
+    assert.ok(prompt.includes("| REVIEW | review | review | review | review |"), "REVIEW row in amend");
+    assert.ok(prompt.includes("| HOTFIX | emergency | emergency | emergency | emergency |"), "HOTFIX row in amend");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-cmd: persistence contract instructs the STRUCTURED classification; classification.autonomous is the authority", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-core-persist-"));
+  try {
+    const prompt = buildCtoPrompt(parseCtoEnvelope("Add OAuth", root), root);
+    assert.ok(prompt.includes('classification: { "type":'), "prompt instructs the structured classification line");
+    assert.ok(prompt.includes("classification.autonomous"), "classification.autonomous named as the authority");
+    assert.ok(prompt.includes("read-compat only"), "top-level line documented as legacy read-compat");
+    assert.ok(!prompt.includes("`autonomous: true`"), "parser boolean is never copied as the decision");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -146,6 +146,10 @@ export function writeStateMd(stateDir: string, state: TeamState): void {
   lines.push(`- Complexity: ${state.classification.complexity}`);
   lines.push(`- Workflow: ${state.classification.workflow}`);
   lines.push(`- Confidence: ${state.classification.confidence}`);
+  lines.push(`- Autonomous: ${state.classification.autonomous}`);
+  if (state.classification.autonomous_reason) {
+    lines.push(`- Autonomous reason: ${state.classification.autonomous_reason}`);
+  }
   lines.push("");
   lines.push("## Task");
   lines.push(state.task);

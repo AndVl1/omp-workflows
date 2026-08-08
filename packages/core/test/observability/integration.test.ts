@@ -55,9 +55,8 @@ function makeInitialState(branch: string): TeamState {
   return {
     schema: 1,
     branch,
-    classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", workflow: "lightweight" },
+    classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", workflow: "lightweight", autonomous: false },
     task: "synthetic workflow",
-    autonomous: true,
     workflow_override: false,
     issue: null,
     stage_cursor: "discovery",

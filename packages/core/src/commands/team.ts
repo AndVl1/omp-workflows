@@ -36,7 +36,7 @@ export async function teamCommand(ctx: CommandContext): Promise<string> {
   }
 
   const directive = parseAutonomousDirective(ctx.args);
-  const autonomous = directive.autonomous;
+  const autonomyHint = directive.autonomyHint;
   const cleanedTask = directive.task;
   const issueMatch = cleanedTask.match(/issue=#(\d+)/);
   const issue = issueMatch ? Number(issueMatch[1]) : null;
@@ -56,7 +56,7 @@ export async function teamCommand(ctx: CommandContext): Promise<string> {
     "## /team envelope (v0.3 stub)",
     "",
     `- task: ${finalTask}`,
-    `- autonomous: ${autonomous}`,
+    `- autonomyHint: ${autonomyHint} (mechanical leading-directive marker, NOT authoritative)`,
     `- issue: ${issue ?? "(none)"}`,
     `- branch: ${branch}`,
     `- cwd: ${ctx.cwd}`,

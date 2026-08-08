@@ -20,14 +20,22 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { findProfileDir } from "../engine/profile.js";
 import { loadTeamDefs } from "../cto/plan.js";
-import { isCtoRunTerminal, readCtoState, ctoStateDir } from "../cto/state.js";
+import { isCtoRunTerminal, readCtoState, resolveCtoAutonomous, ctoStateDir } from "../cto/state.js";
 import { MAX_DECOMPOSITION_DEPTH, MAX_TEAMS, type CtoState } from "../cto/types.js";
+import type { ModelClassification } from "../engine/run.js";
 import { parseAutonomousDirective } from "./envelope.js";
+import { buildClassificationPhaseZero, buildWorkflowMatrix } from "./classification-contract.js";
 import type { CommandContext } from "./types.js";
 
 export interface ParsedCtoEnvelope {
   task: string;
-  autonomous: boolean;
+  /**
+   * MECHANICAL hint from the leading-directive parser. NON-AUTHORITATIVE:
+   * PHASE-0 has the main LLM decide `autonomous` from the full task
+   * semantics; this value is rendered as a hint and never persisted as the
+   * decision.
+   */
+  autonomyHint: boolean;
   issue: number | null;
   branch: string | null;
 }
@@ -41,7 +49,7 @@ export interface ParsedCtoEnvelope {
  */
 export function parseEnvelope(args: string, cwd: string): ParsedCtoEnvelope {
   const directive = parseAutonomousDirective(args);
-  const autonomous = directive.autonomous;
+  const autonomyHint = directive.autonomyHint;
   const cleaned = directive.task;
   const issueMatch = cleaned.match(/issue=#(\d+)/);
   const issue = issueMatch ? Number(issueMatch[1]) : null;
@@ -53,7 +61,7 @@ export function parseEnvelope(args: string, cwd: string): ParsedCtoEnvelope {
   } catch {
     branch = null;
   }
-  return { task, autonomous, issue, branch };
+  return { task, autonomyHint, issue, branch };
 }
 
 function renderTeamsTable(cwd: string): string {
@@ -138,6 +146,11 @@ export function buildStandbyCtoPrompt(cwd: string): string {
     "   `plan.task: \"standby — awaiting inbox tasks\"`, `teams: []`, `autonomous: true`, `standby: true` — the",
     "   standby marker keeps the run adoptable across sessions). The run must exist before waiting: inbox",
     "   routing, amend detection and the per-turn reminder all key off its state.",
+    "   **This `autonomous: true` is ENGINE-CREATED — standby has NO user task, so there is nothing to",
+    "   classify.** The standby state therefore carries NO `classification` field (model-first: a",
+    "   classification exists only when a task was classified). It is not a PHASE-0 decision; each",
+    "   inbox task that arrives is classified by YOU (type, complexity, confidence, autonomous) on",
+    "   wake, exactly like a `/cto <task>` invocation.",
     "2. Read `.omp/teams.json` + `cto.json` profile now (not later) so the wake turn is cheap.",
     "3. Drain the adopted run's pending inbox before yielding, then yield and WAIT.",
     "",
@@ -179,14 +192,17 @@ export interface CtoPromptOptions {
 }
 
 /** Persistence contract lines shared by the CTO task/amend prompts. */
-function persistenceContract(envelope: ParsedCtoEnvelope, opts: CtoPromptOptions): string {
+function persistenceContract(opts: CtoPromptOptions): string {
   const sessionLine = opts.sessionId ? `\`session: ${opts.sessionId}\`` : "`session: <your current omp session id>`";
   return [
     "### State persistence (mandatory)",
-    "When you persist the run state (cto_discovery.md / team-plan.md / state.json), include these metadata",
-    "lines VERBATIM so autonomy and session ownership survive across sessions and are never re-derived",
-    "from task text:",
-    `\`autonomous: ${envelope.autonomous}\``,
+    "When you persist the run state (cto_discovery.md / team-plan.md / state.json), include the",
+    "classification you decided in PHASE-0 as the STRUCTURED model decision — one",
+    "`classification: { \"type\": ..., \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>,",
+    "\"autonomous_reason\": ... }` line. `classification.autonomous` is the AUTHORITY; the legacy",
+    "top-level `autonomous` line is read-compat only. The `autonomous` value is YOUR model decision,",
+    "never the mechanical hint. Also keep the metadata line below VERBATIM so session ownership",
+    "survives across sessions and is never re-derived from task text:",
     sessionLine,
     "",
   ].join("\n");
@@ -203,9 +219,6 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
 
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
   const branchMeta = envelope.branch ? `Branch: \`${envelope.branch}\`\n` : "Branch: (no git work tree)\n";
-  const autonomousMeta = envelope.autonomous
-    ? "Autonomous mode: ON. Skip user checkpoints; apply `autonomous` decision for every `checkpoint` stage."
-    : "Autonomous mode: OFF. Pause at each `checkpoint` stage for user review.";
   const sessionMeta = opts.sessionId ? `Session: \`${opts.sessionId}\`\n` : "";
 
   return [
@@ -224,9 +237,21 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     envelope.task,
     "",
     "### Metadata",
-    issueMeta + branchMeta + autonomousMeta + sessionMeta,
+    issueMeta + branchMeta + sessionMeta,
     "",
-    persistenceContract(envelope, opts),
+    buildClassificationPhaseZero({ label: "leading directive", value: envelope.autonomyHint }),
+    "",
+    buildWorkflowMatrix(),
+    "",
+    "### Persist the classification",
+    "Record your PHASE-0 classification in the run state as the STRUCTURED model decision, on ONE",
+    "line in cto_discovery.md / team-plan.md / state.json:",
+    "`classification: { \"type\": ..., \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>,",
+    "\"autonomous_reason\": ... }`. `classification.autonomous` is the AUTHORITY — the legacy",
+    "top-level `autonomous: <true|false>` line is read-compat only and never overrides a present",
+    "classification. The persisted `autonomous` value is YOUR model decision — never the mechanical hint.",
+    "",
+    persistenceContract(opts),
     "### Team registry (.omp/teams.json)",
     "| Team | Name | Scope | Profile | Lead | Roster |",
     "| --- | --- | --- | --- | --- | --- |",
@@ -238,10 +263,9 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "",
     "### CTO discipline (you are the orchestrator, not a coder)",
     "1. **Decompose** the task into a TeamPlan: pick teams from the registry (max 8, decomposition depth max 2),",
-    "   assign each a non-overlapping `scope` slice + task `slice`, choose the sub-profile with the SAME",
-    "   resolution as /do-work (resolveWorkflow): FEATURE/REFACTOR: QUICK -> lightweight, MEDIUM -> standard,",
-    "   COMPLEX/CRITICAL -> full-feature; BUG_FIX -> debug-cycle (bug-fix only for interactive QUICK);",
-    "   OPS: QUICK -> lightweight else standard; INVESTIGATION -> research. Bug-fix slices run through the",
+    "   assign each a non-overlapping `scope` slice + task `slice`, and choose the sub-profile from the",
+    "   Workflow resolution matrix above — the SAME table as /do-work (resolveWorkflow), including REVIEW ->",
+    "   review and HOTFIX -> emergency. Bug-fix slices run through the",
     "   team: the lead walks debug-cycle (diagnose -> root cause -> fix -> verify; root_cause gate before",
     "   code). Decide the git strategy per team (Q3):",
     "   coupled tasks -> one branch with parallel teams; independent tasks -> separate worktrees.",
@@ -340,24 +364,47 @@ function newestMtime(runDir: string, files: string[]): string {
 
 /**
  * Deterministic metadata line inside agent-written state files. The CTO
- * prompts instruct persisting `autonomous: <bool>` and `session: <id>` on
- * their own lines so markdown-state runs keep the parsed flag and their
- * session owner instead of erasing them (RC3/RC4).
+ * prompts instruct persisting the model classification as ONE
+ * `classification: { ... }` line plus `session: <id>` on their own lines, so
+ * markdown-state runs keep the parsed classification and their session owner
+ * instead of erasing them (RC3/RC4). The top-level `autonomous: <bool>` and
+ * `standby: <bool>` lines remain LEGACY read-compat only: `autonomous` is
+ * consulted solely when no classification line is present, and standby stays
+ * the engine-created marker.
  */
 const STATE_META_LINE = /^\s*(autonomous|session|standby)\s*:\s*(.+?)\s*$/i;
 
+/** One-line structured model classification: `classification: { "type": ..., ... }`. */
+const CLASSIFICATION_LINE = /^\s*classification\s*:\s*(\{.*\})\s*$/i;
+
 /**
  * Files that may carry the persisted state-metadata lines per the CTO
- * prompt contract (`autonomous:` / `session:` / `standby:`). Only these are
- * scanned so unrelated markdown prose (e.g. a decisions.md line starting
- * with "session: ...") can never be misread as run metadata.
+ * prompt contract (`classification:` / `autonomous:` / `session:` /
+ * `standby:`). Only these are scanned so unrelated markdown prose (e.g. a
+ * decisions.md line starting with "session: ...") can never be misread as
+ * run metadata.
  */
 const STATE_META_FILES = ["state.json", "cto_discovery.md", "team-plan.md"];
 
 interface MarkdownStateMeta {
+  /** Model-first structured classification (the authority when present). */
+  classification?: ModelClassification;
+  /** LEGACY top-level autonomy line — read-compat only. */
   autonomous?: boolean;
   session?: string;
   standby?: boolean;
+}
+
+/** A classification line counts only when it carries the required fields. */
+function isStructuredClassification(value: unknown): value is ModelClassification {
+  if (!value || typeof value !== "object") return false;
+  const c = value as Record<string, unknown>;
+  return (
+    typeof c.type === "string" &&
+    typeof c.complexity === "string" &&
+    typeof c.confidence === "string" &&
+    typeof c.autonomous === "boolean"
+  );
 }
 
 function readStateMeta(runDir: string, files: string[]): MarkdownStateMeta {
@@ -371,6 +418,18 @@ function readStateMeta(runDir: string, files: string[]): MarkdownStateMeta {
       continue; // unreadable — try the next state file
     }
     for (const line of body.split("\n")) {
+      const classMatch = line.match(CLASSIFICATION_LINE);
+      if (classMatch?.[1] && meta.classification === undefined) {
+        try {
+          const parsed = JSON.parse(classMatch[1]) as unknown;
+          if (isStructuredClassification(parsed)) meta.classification = parsed;
+          // A malformed classification line is NOT stored — the run falls
+          // back to the legacy top-level autonomous line (see markdownCtoState).
+        } catch {
+          // unparseable JSON — same legacy fallback
+        }
+        continue;
+      }
       const match = line.match(STATE_META_LINE);
       if (!match) continue;
       const key = match[1]?.toLowerCase();
@@ -392,9 +451,12 @@ function readStateMeta(runDir: string, files: string[]): MarkdownStateMeta {
 /**
  * Build a minimal CtoState from the agent-written markdown files, so the
  * amend prompt can render run context without a state.json (br-5ql).
- * Autonomy and session ownership are read from the persisted metadata
- * lines (see readStateMeta); absent metadata defaults to non-autonomous,
- * unowned — matching legacy agent-written runs.
+ * The model-first classification is read from the persisted
+ * `classification: { ... }` line (authority for autonomy); the top-level
+ * `autonomous:` line is legacy read-compat used only when no classification
+ * is present. Session ownership is restored from the `session:` line;
+ * absent metadata defaults to non-autonomous, unowned — matching legacy
+ * agent-written runs.
  */
 function markdownCtoState(runId: string, runDir: string): CtoState | null {
   const files = markdownFiles(runDir);
@@ -440,7 +502,12 @@ function markdownCtoState(runId: string, runDir: string): CtoState | null {
     id: runId,
     task,
     branch: "",
-    autonomous: meta.autonomous ?? false,
+    // Model-first: a present classification is the authority; the top-level
+    // field mirrors it for legacy readers. Without a classification the
+    // legacy `autonomous:` line applies; absent both -> non-autonomous
+    // (legacy agent-written runs, status quo).
+    ...(meta.classification ? { classification: meta.classification } : {}),
+    autonomous: resolveCtoAutonomous({ classification: meta.classification, autonomous: meta.autonomous ?? false }),
     ...(meta.session ? { owner_session: meta.session } : {}),
     ...(meta.standby === true ? { standby: true } : {}),
     plan: { id: runId, task, teams: [], created_at: updatedAt },
@@ -525,9 +592,6 @@ export function buildAmendPrompt(
 ): string {
   const teamsLine = active.state.teams.map((t) => `${t.id}:${t.status}`).join(", ");
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
-  const autonomousMeta = envelope.autonomous
-    ? "Autonomous mode: ON — apply documented defaults at every checkpoint."
-    : "Autonomous mode: OFF — pause at checkpoints for user review.";
   const sessionMeta = opts.sessionId ? `Session: \`${opts.sessionId}\` (state field: \`owner_session\`)\n` : "";
 
   return [
@@ -540,10 +604,22 @@ export function buildAmendPrompt(
     `State: \`.work-state/cto/${active.runId}/\` (state.json when engine-written, markdown otherwise) — read it BEFORE touching anything.`,
     "",
     "### New task (fold into the SAME run)",
-    issueMeta + autonomousMeta + sessionMeta,
+    issueMeta + sessionMeta,
     envelope.task,
     "",
-    persistenceContract(envelope, opts),
+    buildClassificationPhaseZero({ label: "leading directive", value: envelope.autonomyHint }),
+    "",
+    buildWorkflowMatrix(),
+    "",
+    "### Persist the classification",
+    "Record your PHASE-0 classification for the new task in the run state as the STRUCTURED model",
+    "decision: `classification: { \"type\": ..., \"complexity\": ..., \"confidence\": ...,",
+    "\"autonomous\": <true|false>, \"autonomous_reason\": ... }` on ONE line in the run state files.",
+    "`classification.autonomous` is the AUTHORITY — the legacy top-level `autonomous: <true|false>`",
+    "line is read-compat only and never overrides a present classification. The persisted `autonomous`",
+    "value is YOUR model decision — never the mechanical hint.",
+    "",
+    persistenceContract(opts),
     "### You are still the CTO (single orchestrator, this session)",
     "You are the MAIN AGENT — the resident CTO. Do NOT start a second run or orchestrator.",
     "Do NOT spawn a sub-CTO: NEVER `task(agent=cto)` / `task(agent=@cto)` (main-session only, no",
@@ -552,7 +628,7 @@ export function buildAmendPrompt(
     "### Amend rules",
     "1. **Re-plan**: add teams from the registry (`.omp/teams.json`) for the new task — total teams across the",
     "   run <= 8, depth <= 2. New leads spawn in PARALLEL with active teams; existing teams keep working.",
-    "   Choose sub-profiles with the SAME resolution as /do-work (resolveWorkflow).",
+    "   Choose sub-profiles from the Workflow resolution matrix above — the SAME table as /do-work (resolveWorkflow).",
     "2. **Architecture**: if the new task adds cross-team surface, run the architect for the ADDITIONAL",
     "   contract (or extend the existing architecture artifact); new leads consume it.",
     "3. **Persist**: append the new teams to \`state.json\` and stamp \`amended_at\`; document the amend in",

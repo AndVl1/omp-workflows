@@ -11,12 +11,14 @@
  *   The main agent owns the `task` tool and runs the workflow through it.
  * - Does NOT call `task` directly (custom-TS commands lack that surface).
  *
- * Supported prefixes:
- * - `[AUTONOMOUS] <task> [issue=#N]` — autonomous mode.
- * - `<task> [issue=#N]`              — interactive mode.
+ * Supported prefixes (mechanical HINTS only — the model decides autonomy):
+ * - `[AUTONOMOUS] <task> [issue=#N]` — sets the autonomy hint ON.
+ * - `<task> [issue=#N]`              — hint OFF.
  *
  * Returns a classification-first prompt that:
  *  1. Makes the main LLM semantically understand the task before routing.
+ *     PHASE-0 classifies type/complexity/confidence/autonomous together; the
+ *     parser hint is non-authoritative and never drives state.
  *  2. Resolves the profile only after the classification gate.
  *  3. Walks the selected profile through the main agent's `task` tool.
  *  4. Resolves role mapping from `.omp/team.config.json`.

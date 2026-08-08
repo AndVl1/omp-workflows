@@ -8,6 +8,7 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ModelClassification } from "../engine/run.js";
 import {
   type CtoState,
   type BudgetState,
@@ -30,6 +31,14 @@ export function newCtoState(opts: {
   task: string;
   branch: string;
   autonomous: boolean;
+  /**
+   * Model-first PHASE-0 classification (authority for `autonomous`). When
+   * present, `classification.autonomous` is the decision and the top-level
+   * `autonomous` field is mirrored from it for legacy readers — the two can
+   * never disagree by construction. Legacy callers and engine-created
+   * standby runs omit it and keep the explicit top-level flag verbatim.
+   */
+  classification?: ModelClassification;
   plan: TeamPlan;
   /** Standby runs are adoptable cross-session (inbox continuity). */
   standby?: boolean;
@@ -41,7 +50,8 @@ export function newCtoState(opts: {
     id: opts.id,
     task: opts.task,
     branch: opts.branch,
-    autonomous: opts.autonomous,
+    autonomous: opts.classification ? opts.classification.autonomous : opts.autonomous,
+    ...(opts.classification ? { classification: opts.classification } : {}),
     plan: opts.plan,
     teams: opts.plan.teams.map((t) => ({ id: t.team, status: "pending", escalations: {} })),
     integration: { status: "pending" },
@@ -127,6 +137,22 @@ export function writeCtoState(state: CtoState, root: string): string {
   state.updated_at = new Date().toISOString();
   writeFileSync(path, JSON.stringify(state, null, 2));
   return path;
+}
+
+/**
+ * Resolve the authoritative autonomous flag for a CTO run, model-first:
+ * - `classification.autonomous` (the model's PHASE-0 decision) is the
+ *   AUTHORITY whenever a classification is present — the top-level field
+ *   can never override it (new state mirrors the classification, so the two
+ *   agree by construction; a legacy file with both must honor the model).
+ * - The top-level `autonomous` field is the fallback ONLY when the
+ *   classification is absent: legacy runs and the engine-created standby
+ *   exception (no user task, nothing to classify).
+ */
+export function resolveCtoAutonomous(state: Pick<CtoState, "classification" | "autonomous">): boolean {
+  const model = state.classification?.autonomous;
+  if (model !== undefined) return model;
+  return state.autonomous;
 }
 
 function teamOf(state: CtoState, teamId: string): CtoState["teams"][number] | undefined {

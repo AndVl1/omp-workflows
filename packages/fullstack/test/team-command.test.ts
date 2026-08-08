@@ -61,11 +61,11 @@ test("fullstack: /team alias delegates to deferred /do-work prompt", async () =>
 });
 
 
-test("fullstack: [AUTONOMOUS] prefix toggles autonomous mode", async () => {
+test("fullstack: [AUTONOMOUS] prefix sets the mechanical hint", async () => {
 	const cmd = doWorkFactory(fakeApi as never);
 	const result = await cmd.execute(["[AUTONOMOUS] Fix bug #42"], fakeCtx as never);
 	assert.equal(typeof result, "string");
-	assert.ok(result.includes("Autonomous mode: ON"), "AUTONOMOUS prefix flips mode on");
+	assert.ok(result.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): ON"), "AUTONOMOUS prefix renders the hint ON");
 	assert.ok(result.includes("Fix bug #42"));
 });
 

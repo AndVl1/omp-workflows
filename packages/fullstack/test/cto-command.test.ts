@@ -4,7 +4,7 @@
  * importing OMP at all (fake CustomCommandAPI + HookCommandContext).
  */
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,7 +12,13 @@ import { join } from "node:path";
 import ctoFactory from "../commands/cto/index.js";
 import { buildCtoPrompt, buildAmendPrompt, findActiveCtoRun, parseEnvelope } from "../commands/cto/_lib/cto.js";
 
-const projectRoot = process.cwd();
+// Deterministic isolated project root for the fresh `/cto` cases: the fake
+// api/ctx below must never resolve the caller's real `.work-state/cto` —
+// an active CTO run in the workspace would route a fresh /cto to AMEND and
+// flip the fresh-prompt assertions. Amend/foreign/standby tests create their
+// own explicit fixtures and override `cwd` per test.
+const projectRoot = mkdtempSync(join(tmpdir(), "cto-cmd-fresh-"));
+after(() => rmSync(projectRoot, { recursive: true, force: true }));
 
 const fakeApi = {
 	cwd: projectRoot,
@@ -117,17 +123,18 @@ test("fullstack: /cto contract carries the lead exit-1 failover protocol", () =>
 	}
 });
 
-test("fullstack: [AUTONOMOUS] prefix toggles autonomous mode", async () => {
+test("fullstack: [AUTONOMOUS] prefix sets the mechanical hint", async () => {
 	const cmd = ctoFactory(fakeApi as never);
 	const result = await cmd.execute(["[AUTONOMOUS] Fix bug #42"], fakeCtx as never);
-	assert.ok(result.includes("Autonomous mode: ON"), "autonomous flag lands in metadata");
+	assert.ok(result.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): ON"), "autonomous marker renders the hint ON");
 });
 
-test("fullstack: natural-language directive toggles autonomous mode ON and persists the flag", async () => {
+test("fullstack: natural-language directive sets the hint and the persistence contract carries the MODEL decision", async () => {
 	const cmd = ctoFactory(fakeApi as never);
 	const result = await cmd.execute(["действуй автономно: Fix bug #42"], fakeCtx as never);
-	assert.ok(result.includes("Autonomous mode: ON"), "natural directive flips mode on");
-	assert.ok(result.includes("autonomous: true"), "persistence contract carries the literal parsed flag");
+	assert.ok(result.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): ON"), "natural directive renders the hint ON");
+	assert.ok(result.includes("autonomous: <true|false>"), "persistence contract carries the model decision, not the parsed flag");
+	assert.ok(!result.includes("`autonomous: true`"), "parser boolean is never copied into the persistence contract");
 	assert.ok(result.includes("Fix bug #42"), "task text preserved after stripping the directive");
 });
 
@@ -196,7 +203,7 @@ test("fullstack: parseEnvelope falls back to branch=null outside a git work tree
 		const envelope = parseEnvelope("Add OAuth", root);
 		assert.equal(envelope.branch, null);
 		assert.equal(envelope.task, "Add OAuth");
-		assert.equal(envelope.autonomous, false);
+		assert.equal(envelope.autonomyHint, false);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

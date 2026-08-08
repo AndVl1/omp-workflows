@@ -13,6 +13,7 @@
  */
 
 import type { PauseKind } from "../engine/types.js";
+import type { ModelClassification } from "../engine/run.js";
 
 /** Git strategy for a team — decided by the CTO at plan time (interview Q3). */
 export type WorktreeStrategy = "same_branch" | "separate_worktree";
@@ -165,7 +166,23 @@ export interface CtoState {
   id: string;
   task: string;
   branch: string;
+  /**
+   * LEGACY / engine-created autonomy flag. For task runs this is read-compat
+   * only: new state mirrors `classification.autonomous` here so old readers
+   * keep working, and the top-level flag NEVER overrides a present
+   * classification. Standby runs are the documented engine-created exception
+   * (no user task to classify): they carry `autonomous: true` and NO
+   * `classification` field.
+   */
   autonomous: boolean;
+  /**
+   * Model-first PHASE-0 classification (schema-2 optional). Persisted for NEW
+   * task runs: `classification.autonomous` is the AUTHORITY for the run's
+   * autonomy; the top-level `autonomous` field is mirrored (never
+   * independent) when a classification is present. Absent on legacy runs and
+   * on engine-created standby runs (nothing to classify).
+   */
+  classification?: ModelClassification;
   plan: TeamPlan;
   teams: Array<{
     id: string;
