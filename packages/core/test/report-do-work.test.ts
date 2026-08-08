@@ -11,10 +11,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { buildSessionReport } from "../src/report/assemble.js";
+import { registerWorkflowProfiles } from "../src/engine/profile.js";
 import { rollupFromEvents, EventRecorder } from "../src/observability/recorder.js";
 import type { ObservabilityEvent } from "../src/observability/events.js";
 import type { SessionReport, StageInfo } from "../src/report/types.js";
-import type { TeamState } from "../src/engine/types.js";
+import type { Profile, TeamState } from "../src/engine/types.js";
 
 function makeTeamState(overrides: Partial<TeamState> = {}): TeamState {
   return {
@@ -514,6 +515,93 @@ test("do-work: full-feature stages carry resolved agents, original roles, and de
     // never written, yet the stage still lists it as an output.
     assert.equal(report.artifacts.find((a) => a.id === "architecture")?.status, "missing");
     assert.deepEqual(arch?.outputs, ["architecture"]);
+
+    // Profile metadata (checkpoint / gate / autonomous) copied from StageDef.
+    const discovery = report.stages.find((s) => s.id === "discovery");
+    assert.equal(discovery?.gate, "branch_created");
+    assert.equal(discovery?.checkpoint, "confirm_understanding");
+    assert.equal(discovery?.autonomous, "log confirmed understanding, continue");
+
+    const codeReview = report.stages.find((s) => s.id === "code_review");
+    assert.equal(codeReview?.gate, "verdict != reject");
+    assert.equal(codeReview?.checkpoint, "fix_decision");
+    assert.equal(codeReview?.autonomous, "fix CRITICAL+HIGH, then continue");
+
+    const manualQa = report.stages.find((s) => s.id === "manual_qa");
+    assert.equal(manualQa?.gate, "manual_qa.verdict != FAIL");
+
+    // Stages that declare none of the metadata keep every field absent.
+    assert.equal(exploration?.description, undefined);
+    assert.equal(exploration?.checkpoint, undefined);
+    assert.equal(exploration?.gate, undefined);
+    assert.equal(exploration?.autonomous, undefined);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("do-work: declared stage description/checkpoint/gate/autonomous flow into profile-backed stages", () => {
+  // No shipped profile declares stage-level `description` (schema keeps it
+  // optional), so the copy path is proven with a registered fixture profile.
+  registerWorkflowProfiles([
+    {
+      name: "stage-detail",
+      title: "Stage Detail Fixture",
+      description: "Fixture profile for stage metadata copying.",
+      match: { type: ["FEATURE"] },
+      stages: [
+        {
+          id: "design",
+          title: "Design",
+          type: "single",
+          role: "architect",
+          description: "Pick the architecture approach.",
+          checkpoint: "user_choice",
+          gate: "option_chosen",
+          autonomous: "pick option #1, record rationale",
+          produces: "design",
+        },
+        {
+          id: "tidy",
+          title: "Tidy",
+          type: "single",
+          role: "qa",
+          produces: "tidy",
+        },
+      ],
+    },
+  ]);
+
+  const cwd = tmpWorkspace();
+  try {
+    const state = makeTeamState({
+      classification: { ...makeTeamState().classification, workflow: "stage-detail" },
+      stages: [
+        { id: "design", status: "done" },
+        { id: "tidy", status: "pending" },
+      ],
+    });
+    writeFeature(cwd, "session-report", state);
+
+    const report = buildSessionReport(cwd, { kind: "do-work" });
+
+    // All four profile metadata fields are copied verbatim.
+    const design = report.stages.find((s) => s.id === "design");
+    assert.equal(design?.description, "Pick the architecture approach.");
+    assert.equal(design?.checkpoint, "user_choice");
+    assert.equal(design?.gate, "option_chosen");
+    assert.equal(design?.autonomous, "pick option #1, record rationale");
+    // Existing provenance behavior untouched.
+    assert.deepEqual(design?.agents, [{ name: "architect", role: "architect", source: "workflow" }]);
+    assert.deepEqual(design?.outputs, ["design"]);
+
+    // Undeclared fields stay absent — even on a profile-backed stage.
+    const tidy = report.stages.find((s) => s.id === "tidy");
+    assert.equal(tidy?.description, undefined);
+    assert.equal(tidy?.checkpoint, undefined);
+    assert.equal(tidy?.gate, undefined);
+    assert.equal(tidy?.autonomous, undefined);
+    assert.deepEqual(tidy?.outputs, ["tidy"]);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -602,6 +690,10 @@ test("do-work: custom/unknown workflow falls back safely — provenance fields a
     assert.equal(impl?.inputs, undefined, "no profile def → inputs absent");
     assert.equal(impl?.outputs, undefined, "no profile def → outputs absent");
     assert.equal(impl?.type, undefined);
+    assert.equal(impl?.description, undefined, "no profile def → description absent");
+    assert.equal(impl?.checkpoint, undefined, "no profile def → checkpoint absent");
+    assert.equal(impl?.gate, undefined, "no profile def → gate absent");
+    assert.equal(impl?.autonomous, undefined, "no profile def → autonomous absent");
     // No profile → ordinal transition spine, still a valid report.
     assert.ok(report.edges.some((e) => e.kind === "transition"));
   } finally {

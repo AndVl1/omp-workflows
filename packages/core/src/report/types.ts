@@ -101,6 +101,14 @@ export interface StageInfo {
   inputs?: string[];
   /** Artifact ids this stage produces (`StageDef.produces`); absent without a def. */
   outputs?: string[];
+  /** Stage description from the workflow profile; absent without a def. */
+  description?: string;
+  /** Human checkpoint label from the workflow profile (e.g. "confirm_understanding"). */
+  checkpoint?: string;
+  /** Gate condition from the workflow profile; must hold for the stage to be `done`. */
+  gate?: string;
+  /** Autonomous branch decision text from the workflow profile (checkpoint auto-decision). */
+  autonomous?: string;
 }
 
 export type EdgeKind = "produces" | "consumes" | "depends_on" | "integration" | "transition";

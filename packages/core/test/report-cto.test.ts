@@ -283,6 +283,33 @@ test("cto: workflow stages carry profile agents/inputs/outputs; team stages carr
     assert.deepEqual(report.stages.find((s) => s.id === "team:beta")?.agents, [
       { name: "team-lead-beta", role: "team-lead", source: "workflow" },
     ]);
+
+    // Profile metadata (description / checkpoint / gate / autonomous) copied
+    // from the CTO workflow's StageDefs.
+    assert.equal(discovery?.gate, "branch_created");
+    assert.equal(discovery?.checkpoint, "confirm_understanding");
+    assert.equal(discovery?.autonomous, "log confirmed understanding, continue");
+
+    assert.equal(decomposition?.checkpoint, "confirm_plan");
+    assert.equal(decomposition?.gate, "plan_valid");
+    assert.equal(decomposition?.autonomous, "proceed with the proposed TeamPlan (documented defaults)");
+
+    assert.equal(integrationReview?.gate, "verdict != reject");
+    assert.equal(integrationReview?.checkpoint, "user_accepts");
+    assert.equal(integrationReview?.autonomous, "proceed with review verdict");
+
+    // The `teams` stage declares no metadata in the CTO profile — absent.
+    assert.equal(teams?.description, undefined);
+    assert.equal(teams?.checkpoint, undefined);
+    assert.equal(teams?.gate, undefined);
+    assert.equal(teams?.autonomous, undefined);
+
+    // Derived team stages (no StageDef) never carry profile metadata.
+    const alpha = report.stages.find((s) => s.id === "team:alpha");
+    assert.equal(alpha?.description, undefined);
+    assert.equal(alpha?.checkpoint, undefined);
+    assert.equal(alpha?.gate, undefined);
+    assert.equal(alpha?.autonomous, undefined);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

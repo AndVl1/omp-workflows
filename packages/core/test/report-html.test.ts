@@ -678,6 +678,184 @@ test("renderer: derived team: stage and bare report.teams entry emit one diagram
   assert.ok(html.includes("slice: API"), "backend team detail preserved");
 });
 
+/**
+ * Focused fixture: stage profile metadata (description/checkpoint/gate/
+ * autonomous), declared input/output ids resolving to produced and missing
+ * artifact records, and an undeclared input id with no artifact record.
+ */
+function stageDetailsReport(): SessionReport {
+  return {
+    schema: 1,
+    kind: "do-work",
+    meta: {
+      title: "Stage details fixture",
+      task: "Global task for stage details",
+      branch: "feat/stage-details",
+      workflow: "standard",
+      pause: { kind: "none", reason: "" },
+      updated_at: "2026-08-08T10:00:00.000Z",
+      generated_at: "2026-08-08T12:00:00.000Z",
+      autonomous: true,
+    },
+    source: {
+      kind: "do-work",
+      id: "stage-details",
+      statePath: ".work-state/features/stage-details/state.json",
+      format: "json",
+      isLegacy: false,
+    },
+    stages: [
+      {
+        id: "planning",
+        title: "Planning",
+        status: "done",
+        phase: "standard",
+        type: "orchestrator",
+        at: "2026-08-08T09:00:00.000Z",
+        description: "Plan the <b>work</b> with </details><script>alert(1)</script>",
+        checkpoint: "checkpoint-a",
+        gate: "gate-a",
+        autonomous: "autonomous run",
+        agents: [{ name: "main session", role: "orchestrator", source: "workflow" }],
+        inputs: ["oauth-plan", "ghost-input"],
+        outputs: ["oauth-plan", "missing-artifact"],
+      },
+      { id: "implementation", title: "Implementation", status: "in_progress", phase: "standard", type: "single" },
+    ],
+    edges: [],
+    artifacts: [
+      {
+        id: "oauth-plan",
+        path: ".work-state/features/stage-details/artifacts/oauth-plan.json",
+        owner: "planning",
+        status: "produced",
+        bytes: 42,
+        type: "implementation plan",
+        keys: ["title", "steps"],
+        summary: "Plan summary text",
+      },
+      {
+        id: "missing-artifact",
+        path: ".work-state/features/stage-details/artifacts/missing-artifact.json",
+        owner: "planning",
+        status: "missing",
+        summary: "(missing)",
+      },
+    ],
+    telemetry: { eventsPath: ".work-state/features/stage-details/observability/events.jsonl", rollup: null },
+    chronology: [],
+    warnings: [],
+  };
+}
+
+test("renderer: stage cards keep the compact default with a collapsed details disclosure", () => {
+  const html = renderReportHtml(doWorkReport());
+  const details = html.match(/<details class="stage-details">/g) ?? [];
+  assert.equal(details.length, doWorkReport().stages.length, "one disclosure per stage card");
+  assert.ok(!/<details class="stage-details"[^>]*open/.test(html), "disclosures start collapsed (no open attribute)");
+  assert.ok(html.includes("<summary>Show stage details</summary>"), "clear summary label rendered");
+
+  // The disclosure lives inside the stage list cards, never inside the SVG diagram.
+  const svg = /<svg id="omp-diagram-svg"[\s\S]*?<\/svg>/.exec(html)?.[0] ?? "";
+  assert.ok(!svg.includes("stage-details"), "no disclosure inside the svg diagram");
+
+  // Compact card lines are preserved and precede the disclosure inside the article.
+  const card = /<article class="node[^>]*data-node-id="planning"[\s\S]*?<\/article>/.exec(html)?.[0] ?? "";
+  assert.ok(card.includes('class="node-agents"'), "compact agents line kept");
+  assert.ok(card.includes("at: "), "compact timestamp line kept");
+  assert.ok(card.indexOf("node-agents") < card.indexOf("stage-details"), "disclosure appends after the compact lines");
+});
+
+test("renderer: expanded stage details show session task, profile metadata, agents and artifact summaries", () => {
+  const html = renderReportHtml(stageDetailsReport());
+  const planning = /<article class="node[^>]*data-node-id="planning"[\s\S]*?<\/article>/.exec(html)?.[0] ?? "";
+  assert.ok(planning.includes("<summary>Show stage details</summary>"), "disclosure present in the stage card");
+  assert.ok(planning.includes("Global task for stage details"), "global session task rendered");
+  assert.ok(
+    planning.includes("Plan the &lt;b&gt;work&lt;/b&gt; with &lt;/details&gt;&lt;script&gt;alert(1)&lt;/script&gt;"),
+    "description rendered escaped",
+  );
+  assert.ok(/<dt>Checkpoint<\/dt><dd>checkpoint-a<\/dd>/.test(planning), "checkpoint row rendered");
+  assert.ok(/<dt>Gate<\/dt><dd>gate-a<\/dd>/.test(planning), "gate row rendered");
+  assert.ok(/<dt>Autonomous<\/dt><dd>autonomous run<\/dd>/.test(planning), "autonomous row rendered");
+  assert.ok(planning.includes("agents: main session (orchestrator, workflow)"), "agents/source rendered");
+  assert.ok(planning.includes("Plan summary text"), "bounded artifact summary rendered");
+  assert.ok(planning.includes("type: implementation plan"), "artifact type rendered");
+  assert.ok(planning.includes("keys: title, steps"), "artifact keys rendered");
+  assert.ok(
+    planning.includes('<a class="artifact-link" href="#omp-artifact-0">card</a>'),
+    "in-page anchor to the produced artifact card",
+  );
+  assert.ok(html.includes('id="omp-artifact-0"'), "artifact card carries the anchor target id");
+
+  // A stage without profile metadata renders no empty rows (task + agents only).
+  const impl = /<article class="node[^>]*data-node-id="implementation"[\s\S]*?<\/article>/.exec(html)?.[0] ?? "";
+  assert.ok(impl.includes("<summary>Show stage details</summary>"), "profile-less stage still discloses the session task");
+  assert.ok(!impl.includes("<dt>Description</dt>"), "no empty description row");
+  assert.ok(!impl.includes("<dt>Inputs</dt>"), "no empty inputs row");
+  assert.ok(!impl.includes("<dt>Outputs</dt>"), "no empty outputs row");
+});
+
+test("renderer: stage details report declared-missing and undeclared artifacts honestly", () => {
+  const html = renderReportHtml(stageDetailsReport());
+  const planning = /<article class="node[^>]*data-node-id="planning"[\s\S]*?<\/article>/.exec(html)?.[0] ?? "";
+  // Declared-but-missing artifact: missing badge + bounded summary + anchor.
+  assert.ok(
+    /<span class="badge b-status st-missing">missing<\/span><span class="sd-artifact-id">missing-artifact<\/span>/.test(planning),
+    "declared-missing artifact shows the missing badge",
+  );
+  assert.ok(planning.includes('href="#omp-artifact-1"'), "declared artifact links to its card even when missing");
+  assert.ok(planning.includes("(missing)"), "missing artifact bounded summary rendered");
+  // Undeclared input id: explicit no-record state, no card to anchor to.
+  assert.ok(planning.includes("ghost-input"), "undeclared input id named");
+  assert.ok(planning.includes("no artifact record"), "undeclared id flagged as having no record");
+  assert.ok(!/<a class="artifact-link"[^>]*ghost/.test(planning), "no anchor for an undeclared artifact");
+});
+
+test("renderer: CTO team stage details show the linked team record without duplicating the teams section", () => {
+  const report = ctoReport();
+  const backend = report.teams!.find((t) => t.id === "backend")!;
+  backend.scope = ["API", "payments"];
+  backend.depends_on = ["auth"];
+  const html = renderReportHtml(report);
+  const teamStage = /<article class="node[^>]*data-node-id="team-backend"[\s\S]*?<\/article>/.exec(html)?.[0] ?? "";
+  assert.ok(teamStage.includes("<summary>Show stage details</summary>"), "CTO team stage carries a disclosure");
+  assert.ok(/<dt>Team scope<\/dt><dd>API, payments<\/dd>/.test(teamStage), "team scope rendered");
+  assert.ok(/<dt>Team slice<\/dt><dd>API<\/dd>/.test(teamStage), "team slice rendered");
+  assert.ok(/<dt>Team profile<\/dt><dd>full-feature<\/dd>/.test(teamStage), "team profile rendered");
+  assert.ok(/<dt>Worktree<\/dt><dd>separate_worktree<\/dd>/.test(teamStage), "team worktree rendered");
+  assert.ok(/<dt>Team depends on<\/dt><dd>auth<\/dd>/.test(teamStage), "team dependencies rendered");
+  assert.ok(/<dt>Escalations<\/dt><dd>1<\/dd>/.test(teamStage), "team escalations rendered");
+  assert.equal((html.match(/<div class="node-list team-list">/g) ?? []).length, 1, "full teams section not duplicated");
+  assert.ok(teamStage.indexOf("Session task") < teamStage.indexOf("Team scope"), "task precedes team fields");
+});
+
+test("renderer: stage details stay escaped, offline, and do not disturb graph interactions", () => {
+  const html = renderReportHtml(stageDetailsReport());
+  assert.ok(!html.includes("<script>alert"), "no unescaped script payload anywhere");
+  assert.ok(
+    html.includes("&lt;/details&gt;&lt;script&gt;alert(1)&lt;/script&gt;"),
+    "details/script payload escaped in the disclosure",
+  );
+  assert.ok(!html.includes("http://"), "no plain-http references");
+  assert.ok(!html.includes('src="'), "no src attributes anywhere");
+  assert.ok(!html.includes("fetch("), "no fetch calls");
+  assert.ok(!html.includes("<link"), "no <link> elements");
+  assert.ok(/href="#omp-artifact-\d+"/.test(html), "artifact anchors are in-page fragments only");
+  assert.ok(!/href="https?:/.test(html), "no external hrefs");
+
+  // Graph interaction wiring is untouched.
+  assert.ok(html.includes('ev.key === "Enter" || ev.key === " "'), "keyboard activation preserved");
+  assert.ok(html.includes("function sameNodeId(a, b)"), "highlight alias preserved");
+  assert.ok(html.includes('id="omp-zoom-in"'), "zoom controls preserved");
+  assert.ok(html.includes('id="omp-graph-filter"'), "status filter preserved");
+
+  // Disclosure toggles never reach the card's selection handler.
+  const script = /<script>\n\(function \(\) \{[\s\S]*?\n\}\)\(\);\n<\/script>/.exec(html)?.[0] ?? "";
+  assert.ok(script.includes('querySelectorAll(".stage-details")'), "script wires stage-details elements");
+  assert.ok(script.includes("ev.stopPropagation()"), "disclosure clicks/keydown stop before the card toggle");
+});
+
 test("renderer: report without a derived team: stage still emits the standalone team node", () => {
   const html = renderReportHtml(ctoReport());
 

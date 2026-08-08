@@ -240,6 +240,25 @@ function isUnresolvedTemplateRole(role: string): boolean {
 }
 
 /**
+ * Optional profile metadata copied verbatim from `StageDef` — the stage
+ * detail the renderer shows under a disclosure. Only declared fields with
+ * non-empty values are emitted; custom/legacy stages (no def) keep all four
+ * fields absent. Profile/config metadata only — never raw prompts, event
+ * data, or unbounded artifact content.
+ */
+function stageProfileMeta(
+  def: StageDef | undefined,
+): Partial<Pick<StageInfo, "description" | "checkpoint" | "gate" | "autonomous">> {
+  if (!def) return {};
+  return {
+    ...(def.description ? { description: def.description } : {}),
+    ...(def.checkpoint ? { checkpoint: def.checkpoint } : {}),
+    ...(def.gate ? { gate: def.gate } : {}),
+    ...(def.autonomous ? { autonomous: def.autonomous } : {}),
+  };
+}
+
+/**
  * Provenance for a profile stage. `source` is always "workflow": the entry
  * is derived from the loaded profile + resolved role config. Runtime
  * observations (global agent/tool counts) are never stage-correlated here
@@ -369,6 +388,7 @@ function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionRep
       at: stageEventTimes.get(s.id) ?? artifactTime ?? state.updated_at,
       // Declared artifact ids are preserved even when files are missing;
       // custom/legacy stages (no def) keep the fields absent.
+      ...stageProfileMeta(def),
       ...(def ? { inputs: [...(def.consumes ?? [])] } : {}),
       ...(def ? { outputs: asList(def.produces) } : {}),
       ...(agents ? { agents } : {}),
@@ -510,6 +530,7 @@ function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOpt
       phase: "cto",
       type: def.type,
       at: teamEventTimes.get(def.id) ?? state.updated_at,
+      ...stageProfileMeta(def),
       inputs: [...(def.consumes ?? [])],
       outputs: asList(def.produces),
       ...(agents ? { agents } : {}),

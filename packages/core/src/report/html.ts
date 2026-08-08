@@ -17,6 +17,14 @@
  *     edge + card highlighting, status filter synchronized with the diagram,
  *     zoom +/-/reset, keyboard activation). No external link, script src,
  *     fetch, or runtime/browser dependency is emitted.
+ *   - Every stage card carries a collapsed native <details> disclosure
+ *     ("Show stage details"): expanded in place it shows the global session
+ *     task, the stage's optional profile metadata (description/checkpoint/
+ *     gate/autonomous), agents/source, inputs/outputs with compact artifact
+ *     summaries (status, type/keys, bounded summary, in-page anchor to the
+ *     artifact card), and — for CTO team stages — the linked team record
+ *     (scope/slice/profile/worktree/dependencies/escalations). Full artifact
+ *     bodies stay opt-in behind `--full`; nothing is embedded here.
  *
  * Safety:
  *   - Static text is HTML-escaped (esc).
@@ -241,7 +249,7 @@ function renderGraphSection(report: SessionReport): string {
 
   const diagram = renderDiagram(report);
   const nodes = report.stages
-    .map((s) => renderStageNode(s, isCto))
+    .map((s) => renderStageNode(s, isCto, report))
     .join("");
   const teams = report.teams ? `<h3>Teams</h3><div class="node-list team-list">${report.teams.map(renderTeamNode).join("")}</div>` : "";
   const edges = renderEdges(report.edges);
@@ -250,7 +258,7 @@ function renderGraphSection(report: SessionReport): string {
   return `<section class="section" id="omp-graph"><h2>${header}</h2>${note}<div class="graph-filter" id="omp-graph-filter">${chips}</div>${diagram}<div class="node-list stage-list">${nodes}</div>${teams}${edges}${integration}</section>`;
 }
 
-function renderStageNode(s: SessionReport["stages"][number], derived: boolean): string {
+function renderStageNode(s: SessionReport["stages"][number], derived: boolean, report: SessionReport): string {
   const meta: string[] = [];
   if (s.phase) meta.push(`phase: ${esc(s.phase)}`);
   if (s.type) meta.push(`type: ${esc(s.type)}`);
@@ -261,7 +269,93 @@ function renderStageNode(s: SessionReport["stages"][number], derived: boolean): 
   const io: string[] = [];
   if (s.inputs?.length) io.push(`<div class="node-io">in: ${esc(s.inputs.join(", "))}</div>`);
   if (s.outputs?.length) io.push(`<div class="node-io">out: ${esc(s.outputs.join(", "))}</div>`);
-  return `<article class="node ${statusClass(s.status)}" data-node-id="${esc(s.id)}" data-status="${esc(s.status)}" tabindex="0"><header class="node-head"><span class="node-dot"></span><h3 class="node-title">${esc(s.title ?? s.id)}</h3><span class="badge b-status ${statusClass(s.status)}">${esc(statusLabel(s.status))}</span>${derivedChip}</header><div class="node-meta">${meta.join(" · ")}</div>${agents}${io.join("")}<div class="node-time">at: ${renderTime(s.at, "(no timestamp)")}</div>${detail}</article>`;
+  return `<article class="node ${statusClass(s.status)}" data-node-id="${esc(s.id)}" data-status="${esc(s.status)}" tabindex="0"><header class="node-head"><span class="node-dot"></span><h3 class="node-title">${esc(s.title ?? s.id)}</h3><span class="badge b-status ${statusClass(s.status)}">${esc(statusLabel(s.status))}</span>${derivedChip}</header><div class="node-meta">${meta.join(" · ")}</div>${agents}${io.join("")}<div class="node-time">at: ${renderTime(s.at, "(no timestamp)")}</div>${detail}${renderStageDetails(s, report)}</article>`;
+}
+
+// ── Stage details disclosure (collapsed by default) ─────────────────────────
+//
+// Every stage card carries a native <details class="stage-details"> disclosure.
+// Collapsed (no `open` attribute) it contributes only the summary line to the
+// main screen; expanded it reveals, in place:
+//   - the global session task (report.meta.task — never a stage-specific task),
+//   - the stage's optional profile metadata (description/checkpoint/gate/
+//     autonomous — consumed from the shared optional StageInfo contract),
+//   - agents/source, declared inputs and outputs,
+//   - compact artifact summaries for input/output ids (status, type/keys,
+//     bounded summary, and an in-page anchor to the matching artifact card
+//     when the id resolves to a recorded artifact),
+//   - for CTO team stages, the linked report.teams record (scope, slice,
+//     profile, worktree, dependencies, escalations) without duplicating the
+//     full teams section.
+// All values are HTML-escaped; full artifact bodies stay behind `--full`
+// (artifact-body disclosure) and are never embedded here.
+
+function renderStageDetails(s: SessionReport["stages"][number], report: SessionReport): string {
+  const rows: string[] = [];
+  const pushRow = (label: string, valueHtml: string): void => {
+    rows.push(`<div class="sd-row"><dt>${esc(label)}</dt><dd>${valueHtml}</dd></div>`);
+  };
+
+  pushRow(
+    "Session task",
+    report.meta.task ? esc(report.meta.task) : '<span class="unknown">(no task)</span>',
+  );
+  if (s.description) pushRow("Description", esc(s.description));
+  if (s.checkpoint) pushRow("Checkpoint", esc(s.checkpoint));
+  if (s.gate) pushRow("Gate", esc(s.gate));
+  if (s.autonomous !== undefined && s.autonomous !== "") pushRow("Autonomous", esc(s.autonomous));
+  pushRow("Agents", esc(agentSummary(s.agents)));
+
+  // CTO team stages: pull the linked report.teams record (bare id) so the
+  // team's scope/slice/profile/worktree/dependencies/escalations are
+  // actionable here without duplicating the full teams section below.
+  if (s.team) {
+    const team = report.teams?.find((t) => t.id === s.team);
+    if (team) {
+      if (team.scope?.length) pushRow("Team scope", team.scope.map((v) => esc(v)).join(", "));
+      if (team.slice) pushRow("Team slice", esc(team.slice));
+      if (team.profile) pushRow("Team profile", esc(team.profile));
+      if (team.worktree) pushRow("Worktree", esc(team.worktree));
+      if (team.depends_on?.length) pushRow("Team depends on", esc(team.depends_on.join(", ")));
+      if (team.escalations !== undefined) pushRow("Escalations", esc(String(team.escalations)));
+    } else {
+      pushRow("Team", esc(s.team));
+    }
+  }
+
+  if (s.inputs?.length) pushRow("Inputs", s.inputs.map((id) => artifactSummaryHtml(id, report)).join(" "));
+  if (s.outputs?.length) pushRow("Outputs", s.outputs.map((id) => artifactSummaryHtml(id, report)).join(" "));
+
+  return `<details class="stage-details"><summary>Show stage details</summary><dl>${rows.join("")}</dl></details>`;
+}
+
+/**
+ * Compact, bounded artifact summary for one declared input/output id.
+ *
+ * Every value is escaped; the summary comes from the assembler-bounded
+ * `ReportArtifact.summary` field (never a full body). An id with no artifact
+ * record renders an explicit "no artifact record" state. When the id resolves
+ * to exactly one recorded artifact, the row carries an in-page anchor
+ * (`#omp-artifact-<index>`) to its existing card — index-based because
+ * artifact ids may contain characters that are unsafe in HTML ids and may be
+ * duplicated across owners.
+ */
+function artifactSummaryHtml(id: string, report: SessionReport): string {
+  const entries = report.artifacts.filter((a) => a.id === id);
+  if (entries.length === 0) {
+    return `<span class="sd-artifact"><span class="badge b-status st-missing">missing</span><span class="sd-artifact-id">${esc(id)}</span><span class="muted">no artifact record</span></span>`;
+  }
+  return entries
+    .map((a) => {
+      const idx = report.artifacts.indexOf(a);
+      const typeBits: string[] = [];
+      if (a.type) typeBits.push(`type: ${esc(a.type)}`);
+      if (a.keys?.length) typeBits.push(`keys: ${a.keys.map((k) => esc(k)).join(", ")}`);
+      const summary = a.summary ? esc(a.summary) : '<span class="muted">(no summary)</span>';
+      const anchor = idx >= 0 ? ` <a class="artifact-link" href="#omp-artifact-${idx}">card</a>` : "";
+      return `<span class="sd-artifact"><span class="badge b-status ${statusClass(a.status)}">${esc(statusLabel(a.status))}</span><span class="sd-artifact-id">${esc(a.id)}</span>${typeBits.length ? `<span class="sd-artifact-type">${typeBits.join(" · ")}</span>` : ""}<span class="sd-artifact-summary">${summary}</span>${anchor}</span>`;
+    })
+    .join(" ");
 }
 
 function renderTeamNode(t: NonNullable<SessionReport["teams"]>[number]): string {
@@ -602,11 +696,11 @@ function renderArtifacts(report: SessionReport): string {
   if (report.artifacts.length === 0) {
     return `<section class="section"><h2>Artifacts</h2><p class="empty">No artifacts declared for this session.</p></section>`;
   }
-  const cards = report.artifacts.map(renderArtifactCard).join("");
+  const cards = report.artifacts.map((a, i) => renderArtifactCard(a, i)).join("");
   return `<section class="section" id="omp-artifacts"><h2>Artifacts <span class="count">${report.artifacts.length}</span></h2>${cards}</section>`;
 }
 
-function renderArtifactCard(a: SessionReport["artifacts"][number]): string {
+function renderArtifactCard(a: SessionReport["artifacts"][number], index: number): string {
   const meta: string[] = [`owner: ${esc(a.owner)}`, `path: ${esc(a.path)}`];
   if (a.bytes !== undefined) meta.push(`${esc(String(a.bytes))} B`);
   if (a.mtime) meta.push(`mtime: ${renderTime(a.mtime)}`);
@@ -626,7 +720,7 @@ function renderArtifactCard(a: SessionReport["artifacts"][number]): string {
     a.body !== undefined
       ? `<details class="artifact-body"><summary>Show full content (${esc(String(a.bytes ?? a.body.length))} B)</summary><pre>${esc(a.body)}</pre></details>`
       : "";
-  return `<article class="artifact" data-owner="${esc(a.owner)}" tabindex="0"><header class="artifact-head"><h3 class="artifact-id">${esc(a.id)}</h3><span class="badge b-status ${statusClass(a.status)}">${esc(statusLabel(a.status))}</span></header><div class="artifact-meta">${meta.join(" · ")}</div>${typeLine}${statusNote}${summary}${body}</article>`;
+  return `<article class="artifact" id="omp-artifact-${index}" data-owner="${esc(a.owner)}" tabindex="0"><header class="artifact-head"><h3 class="artifact-id">${esc(a.id)}</h3><span class="badge b-status ${statusClass(a.status)}">${esc(statusLabel(a.status))}</span></header><div class="artifact-meta">${meta.join(" · ")}</div>${typeLine}${statusNote}${summary}${body}</article>`;
 }
 
 function renderChronology(report: SessionReport): string {
@@ -787,6 +881,16 @@ const APP_SCRIPT = `<script>
   }
   nodes.forEach(bindNode);
 
+  // Stage-detail disclosures live INSIDE the clickable stage cards. Toggling
+  // a <details> (click, or Enter/Space on its summary) must never also toggle
+  // the card's selection highlight — stop propagation at the disclosure so
+  // the native summary toggle still runs but the card handlers never see it.
+  var stageDetails = document.querySelectorAll(".stage-details");
+  stageDetails.forEach(function (d) {
+    d.addEventListener("click", function (ev) { ev.stopPropagation(); });
+    d.addEventListener("keydown", function (ev) { ev.stopPropagation(); });
+  });
+
   artifacts.forEach(function (a) {
     a.addEventListener("click", function () { activateArtifact(a); });
     a.addEventListener("keydown", function (ev) {
@@ -933,6 +1037,25 @@ section.section { background: var(--card); border: 1px solid var(--line); border
 .node-meta, .node-time, .node-scope, .node-agents, .node-io { color: var(--muted); font-size: 12px; margin-top: 4px; word-break: break-word; }
 .node-detail { margin-top: 6px; font-size: 13px; }
 .team-list { margin-top: 12px; }
+
+/* stage details disclosure (collapsed by default: only the summary line) */
+.stage-details { margin-top: 6px; }
+.stage-details > summary { cursor: pointer; color: var(--accent); font-size: 12px; font-weight: 600; }
+.stage-details > summary::marker { color: var(--muted); }
+.stage-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.stage-details dl {
+  margin: 8px 0 0; padding: 8px 0 0; border-top: 1px solid var(--line);
+  display: grid; grid-template-columns: 1fr; gap: 2px;
+}
+.stage-details .sd-row { display: flex; gap: 8px; padding: 3px 0; border-top: 1px solid var(--line); font-size: 12px; }
+.stage-details .sd-row dt { flex: 0 0 110px; color: var(--muted); font-weight: 600; }
+.stage-details .sd-row dd { margin: 0; word-break: break-word; min-width: 0; }
+.sd-artifact { display: inline-flex; flex-wrap: wrap; gap: 2px 6px; align-items: baseline; margin-right: 8px; }
+.sd-artifact-id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+.sd-artifact-type { color: var(--muted); font-size: 11px; }
+.sd-artifact-summary { font-size: 12px; }
+.artifact-link { color: var(--accent); font-size: 11px; text-decoration: none; }
+.artifact-link:hover { text-decoration: underline; }
 
 /* edges */
 .edge-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
