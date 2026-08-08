@@ -2,6 +2,15 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.19.0] — 2026-08-08
+### Added
+- **`/session-report` slash command + shared session-state report API** (`packages/core/src/report/{assemble,html,redact,types}.ts`, `packages/fullstack/commands/session-report/`) — renders ONE selected or latest do-work/CTO session as a self-contained offline HTML report (single file, inline CSS/JS/data, no network): `/session-report [do-work|cto] [id=<slug|runId>] [--full]`. The command is a thin orchestration shell over the core report API — `buildSessionReport` (normalization/redaction) → `renderReportHtml` (pure renderer) → `writeReport` (enforces the `.work-state` boundary and restrictive permissions); it never dispatches agents and never embeds raw events/transcripts.
+- **Interactive stage/artifact graph with provenance** — the report renders a readable workflow graph of stages and artifacts, with per-stage provenance (definition, state, agents) and expandable stage details.
+- **Sanitized, bounded telemetry/artifacts** — state/artifacts are authoritative; telemetry is an optional bounded rollup (per-kind counts, no raw events/transcripts). Artifact bodies are redacted and byte-capped; `--full` embeds sanitized full content.
+- **Reconstructed prompt previews** — bounded, deterministic reconstruction of the shape of each stage prompt (explicitly NOT the literal runtime prompt), derived from profile/config metadata and per-stage task text.
+### Verified
+- Build and typecheck passed. Report rendering covered by `packages/core/test/report-{cto,do-work,html}.test.ts`; provider-backed evidence in `vibe-report/session-prompt-preview-2026-08-08.md` and `vibe-report/session-stage-details-2026-08-08.md`.
+
 ## [0.18.0] — 2026-08-08
 ### Added
 - **Model-first PHASE-0 classification** (`packages/core/src/commands/classification-contract.ts`) — `/do-work` and `/cto` (shipped in both `@andvl1/omp-workflows-core` and `@andvl1/omp-workflows-fullstack`) now request the same four-field model classification (`Type`, `Complexity`, `Confidence`, `Autonomous` + reason + resolved `Workflow`) before any tool call. The keyword classifier is demoted to a bounded, autonomy-less `keywordClassify` kept only for legacy engine callers; the engine fails closed rather than filling a partial model classification from keywords.
