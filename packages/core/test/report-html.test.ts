@@ -180,6 +180,72 @@ function extractIsland(html: string): unknown {
   return JSON.parse(m[1]!);
 }
 
+/**
+ * Focused diagram fixture: exercises the typed endpoint rules —
+ * a same-ID stage/artifact pair ("implementation"), a consumes edge whose
+ * source is a declared-but-missing artifact ("oauth-plan"), and endpoints
+ * that exist nowhere (ghost nodes keep the diagram connected).
+ */
+function diagramReport(): SessionReport {
+  return {
+    schema: 1,
+    kind: "do-work",
+    meta: {
+      title: "Diagram fixture",
+      task: "Diagram fixture task",
+      branch: "feat/diagram",
+      workflow: "standard",
+      pause: { kind: "none", reason: "" },
+      updated_at: "2026-08-08T10:00:00.000Z",
+      generated_at: "2026-08-08T12:00:00.000Z",
+      autonomous: true,
+    },
+    source: {
+      kind: "do-work",
+      id: "diagram",
+      statePath: ".work-state/features/diagram/state.json",
+      format: "json",
+      isLegacy: false,
+    },
+    stages: [
+      { id: "planning", title: "Planning", status: "done", phase: "standard", type: "orchestrator", at: "2026-08-08T09:00:00.000Z" },
+      { id: "implementation", title: "Implementation", status: "in_progress", phase: "standard", type: "single", at: "2026-08-08T09:30:00.000Z" },
+    ],
+    edges: [
+      { from: "planning", to: "implementation", kind: "transition" },
+      // Same-ID pair: stage "implementation" AND artifact "implementation".
+      { from: "implementation", to: "implementation", kind: "produces", label: "plan" },
+      // Consumes source is an artifact id (declared, but missing).
+      { from: "oauth-plan", to: "implementation", kind: "consumes", label: "uses" },
+      // Endpoint that exists nowhere → phantom artifact node keeps the diagram connected.
+      { from: "planning", to: "ghost-artifact", kind: "produces" },
+      // Endpoint that exists nowhere → phantom stage node.
+      { from: "ghost-stage", to: "planning", kind: "transition" },
+    ],
+    artifacts: [
+      {
+        id: "implementation",
+        path: ".work-state/features/diagram/artifacts/implementation.json",
+        owner: "implementation",
+        status: "produced",
+        bytes: 12,
+        mtime: "2026-08-08T09:31:00.000Z",
+        summary: "plan",
+      },
+      {
+        id: "oauth-plan",
+        path: ".work-state/features/diagram/artifacts/oauth-plan.json",
+        owner: "implementation",
+        status: "missing",
+        summary: "(missing)",
+      },
+    ],
+    telemetry: { eventsPath: ".work-state/features/diagram/observability/events.jsonl", rollup: null },
+    chronology: [],
+    warnings: [],
+  };
+}
+
 test("renderer: output is a single self-contained file with zero external references", () => {
   const html = renderReportHtml(doWorkReport());
   assert.ok(html.startsWith("<!doctype html>"));
@@ -348,4 +414,84 @@ test("renderer: empty sections degrade gracefully (no artifacts, no chronology)"
   const html = renderReportHtml(report);
   assert.ok(html.includes("No artifacts declared for this session."));
   assert.ok(html.includes("No chronology recorded for this session."));
+});
+
+test("renderer: diagram renders typed stage and artifact SVG nodes in separate lanes before the detail lists", () => {
+  const html = renderReportHtml(diagramReport());
+  assert.ok(html.includes('<svg id="omp-diagram-svg"'), "SVG diagram present");
+  const diagramPos = html.indexOf('data-node-key="stage:planning"');
+  const listsPos = html.indexOf('<div class="node-list stage-list">');
+  assert.ok(diagramPos >= 0 && listsPos >= 0 && diagramPos < listsPos, "diagram precedes the detail lists");
+
+  assert.ok(
+    html.includes('data-node-key="stage:planning" data-node-id="planning" data-status="done" data-diagram-type="stage"'),
+    "stage node typed and statused",
+  );
+  const ctoHtml = renderReportHtml(ctoReport());
+  assert.ok(ctoHtml.includes('data-diagram-type="team"'), "CTO team nodes typed as teams");
+  assert.ok(ctoHtml.includes('data-node-key="team:backend"'), "CTO team node keyed from report.teams");
+  assert.ok(html.includes('data-node-key="artifact:oauth-plan"'), "artifact node typed");
+  assert.ok(html.includes('data-diagram-type="artifact"'), "artifact diagram type marker");
+
+  // Same-ID stage/artifact pair stays distinct: two nodes, one per lane.
+  assert.ok(html.includes('data-node-key="stage:implementation"'), "stage node for the same-ID pair");
+  assert.ok(html.includes('data-node-key="artifact:implementation"'), "artifact node for the same-ID pair");
+  assert.ok(html.indexOf('data-node-key="stage:implementation"') !== html.indexOf('data-node-key="artifact:implementation"'), "same-ID nodes are distinct elements");
+
+  // Missing artifacts stay visible in red; produced artifacts in green.
+  assert.ok(html.includes('class="dg-node st-missing"'), "missing artifact node carries st-missing");
+  assert.ok(html.includes('class="dg-node st-done"'), "produced artifact node carries st-done");
+
+  // Accessible, keyboard-activatable nodes with visible focus ring wiring.
+  assert.ok(html.includes('role="button" tabindex="0" aria-label="stage implementation, in progress"'), "stage node accessible label");
+  assert.ok(html.includes('class="dg-node-focus"'), "focus ring element present");
+});
+
+test("renderer: diagram edges are directed curved paths with arrow markers, typed endpoints and kind labels", () => {
+  const html = renderReportHtml(diagramReport());
+  assert.ok(html.includes('<marker id="arr-ok"'), "green arrow marker for produces");
+  assert.ok(html.includes('<marker id="arr-accent"'), "accent arrow marker for consumes");
+  assert.ok(html.includes('<marker id="arr-gray"'), "gray arrow marker for transitions");
+  assert.ok(html.includes('class="dg-edge kind-produces"'), "produces edge kind class");
+  assert.ok(
+    html.includes('data-from-key="stage:implementation" data-to-key="artifact:implementation"'),
+    "same-ID produces edge typed: stage source, artifact target",
+  );
+  assert.ok(
+    html.includes('data-from-key="artifact:oauth-plan" data-to-key="stage:implementation"'),
+    "consumes source typed as artifact node",
+  );
+  assert.ok(html.includes('marker-end="url(#arr-ok)"'), "arrowhead marker applied");
+  assert.ok(html.includes('<path class="dg-edge-path" d="M '), "curved path emitted");
+  assert.ok(html.includes('class="dg-edge-label" x="305"'), "cross-lane edge kind label centered in the gap");
+  assert.ok(html.includes(">produces</text>"), "kind label text rendered");
+  assert.ok(html.includes(">consumes</text>"), "consumes kind label rendered");
+
+  // Endpoints that exist nowhere become dashed phantom nodes — diagram stays connected.
+  assert.ok(html.includes('data-node-key="artifact:ghost-artifact"'), "undeclared produces target becomes a phantom artifact node");
+  assert.ok(html.includes('data-node-key="stage:ghost-stage"'), "unknown transition endpoint becomes a phantom stage node");
+  assert.ok(html.includes("dg-phantom"), "phantom nodes are visually distinct");
+});
+
+test("renderer: diagram interaction controls are inline, keyboard-friendly and offline", () => {
+  const html = renderReportHtml(diagramReport());
+  assert.ok(html.includes('id="omp-zoom-in"'), "zoom in control");
+  assert.ok(html.includes('id="omp-zoom-out"'), "zoom out control");
+  assert.ok(html.includes('id="omp-zoom-reset"'), "zoom reset control");
+  assert.ok(html.includes('id="omp-zoom-label"'), "zoom percentage readout");
+  assert.ok(html.includes('aria-live="polite"'), "zoom readout announced");
+  assert.ok(html.includes('class="diagram-scroll" id="omp-diagram-scroll"'), "scrollable diagram viewport");
+  assert.ok(html.includes("prefers-reduced-motion"), "reduced motion respected");
+  assert.ok(html.includes('ev.key === "Enter" || ev.key === " "'), "keyboard activation wired");
+  assert.ok(html.includes("applyZoom"), "zoom logic wired");
+  assert.ok(html.includes("data-from-key"), "typed endpoint matching wired into the script data model");
+  assert.ok(html.includes("data-edge-key"), "script targets diagram edges");
+
+  // Offline contract holds for the diagram output too.
+  assert.ok(!html.includes("http://"), "no plain-http references");
+  assert.ok(!html.includes("https://"), "no https references");
+  assert.ok(!html.includes('src="'), "no src attributes anywhere");
+  assert.ok(!html.includes("fetch("), "no fetch calls");
+  assert.ok(!html.includes("<link"), "no <link> elements");
+  assert.ok(!html.includes("<script src"), "no external scripts");
 });

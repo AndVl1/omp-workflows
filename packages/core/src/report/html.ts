@@ -5,9 +5,15 @@
  *   - ALL CSS is inline in a <style> block.
  *   - ALL report data is embedded in an escaped JSON data island
  *     (<script id="omp-report-data" type="application/json">).
- *   - A small amount of vanilla JS enhances navigation (stage/team selection,
- *     edge + artifact highlighting, status filter). No external link, script
- *     src, fetch, or runtime/browser dependency is emitted.
+ *   - A deterministic interactive SVG diagram renders the workflow before the
+ *     detail lists: stage/team nodes in a left lane, artifact nodes in a right
+ *     lane, curved directed edges with arrowheads and kind labels. `produces`
+ *     targets and `consumes` sources resolve to artifact nodes whenever the
+ *     artifact id exists (same-ID stage/artifact pairs stay distinct).
+ *   - A small amount of vanilla JS enhances navigation (node selection with
+ *     edge + card highlighting, status filter synchronized with the diagram,
+ *     zoom +/-/reset, keyboard activation). No external link, script src,
+ *     fetch, or runtime/browser dependency is emitted.
  *
  * Safety:
  *   - Static text is HTML-escaped (esc).
@@ -22,7 +28,7 @@
  * timeline (statuses are derived from team/integration state).
  */
 
-import type { SessionReport } from "./types.js";
+import type { EdgeKind, SessionReport } from "./types.js";
 
 // ── Escaping ────────────────────────────────────────────────────────────────
 
@@ -175,8 +181,8 @@ function renderGraphSection(report: SessionReport): string {
     ? "CTO team &amp; dependency graph"
     : "Workflow stage graph";
   const note = isCto
-    ? '<p class="graph-note">Stage statuses below are <strong>derived</strong> from team/integration state — CtoState has no explicit stage timeline. Click a node to highlight its edges and artifacts.</p>'
-    : '<p class="graph-note">Click a stage to highlight its edges and produced artifacts.</p>';
+    ? '<p class="graph-note">Stage statuses below are <strong>derived</strong> from team/integration state — CtoState has no explicit stage timeline. Use the interactive diagram or the lists: click a node (or press Enter/Space when focused) to highlight its edges and cards.</p>'
+    : '<p class="graph-note">Use the interactive diagram or the lists: click a node (or press Enter/Space when focused) to highlight its edges and cards.</p>';
 
   const filterGroups = new Set<string>(["all"]);
   for (const s of report.stages) filterGroups.add(s.status);
@@ -188,6 +194,7 @@ function renderGraphSection(report: SessionReport): string {
     )
     .join("");
 
+  const diagram = renderDiagram(report);
   const nodes = report.stages
     .map((s) => renderStageNode(s, isCto))
     .join("");
@@ -195,7 +202,7 @@ function renderGraphSection(report: SessionReport): string {
   const edges = renderEdges(report.edges);
   const integration = report.integration ? renderIntegration(report.integration) : "";
 
-  return `<section class="section" id="omp-graph"><h2>${header}</h2>${note}<div class="graph-filter" id="omp-graph-filter">${chips}</div><div class="node-list stage-list">${nodes}</div>${teams}${edges}${integration}</section>`;
+  return `<section class="section" id="omp-graph"><h2>${header}</h2>${note}<div class="graph-filter" id="omp-graph-filter">${chips}</div>${diagram}<div class="node-list stage-list">${nodes}</div>${teams}${edges}${integration}</section>`;
 }
 
 function renderStageNode(s: SessionReport["stages"][number], derived: boolean): string {
@@ -233,6 +240,225 @@ function renderEdges(edges: SessionReport["edges"]): string {
   return `<h3>Dependencies &amp; transitions</h3><ul class="edge-list">${rows}</ul>`;
 }
 
+// ── Interactive SVG diagram (deterministic typed layout) ────────────────────
+//
+// Two-lane layout rendered server-side (no client-side graph layout):
+//   - left lane: stage/team nodes (all `report.stages`, plus `report.teams`
+//     whose id is not already a stage id);
+//   - right lane: artifact nodes (every `report.artifacts` entry, including
+//     missing ones, which stay visible in red).
+// Edge endpoint typing: `produces` targets and `consumes` sources resolve to
+// artifact nodes whenever the artifact id exists in `report.artifacts`; every
+// other endpoint resolves to a stage/team node. Endpoints that exist nowhere
+// become dashed "phantom" nodes so the diagram always stays connected.
+// Same-ID stage/artifact pairs (e.g. stage "implementation" producing artifact
+// "implementation") are distinct nodes distinguished by their typed key.
+
+interface DiagramNode {
+  /** Typed key: `stage:<id>` | `team:<id>` | `artifact:<id>` — unique per lane. */
+  key: string;
+  /** Raw id (stage/team/artifact id). */
+  id: string;
+  kind: "stage" | "team" | "artifact";
+  status: string;
+  /** Display label (stage title when present, else id). */
+  label: string;
+  /** True when the node exists only to anchor an edge endpoint. */
+  phantom: boolean;
+}
+
+interface DiagramEdge {
+  fromKey: string;
+  toKey: string;
+  fromId: string;
+  toId: string;
+  kind: EdgeKind;
+}
+
+const DG_LAYOUT = {
+  padX: 70, // left lane x
+  artX: 370, // right lane x
+  nodeW: 170,
+  nodeH: 52,
+  rowH: 64,
+  top: 12,
+  bottom: 20,
+  gapMid: 305, // midpoint between the lanes (edge label anchor)
+  width: 600,
+} as const;
+
+/** Arrow marker suffix per edge kind (marker fills match the stroke colors). */
+const DG_EDGE_COLOR: Record<string, string> = {
+  produces: "ok",
+  consumes: "accent",
+  depends_on: "amber",
+  integration: "purple",
+  transition: "gray",
+};
+
+const DG_MARKERS = [
+  "<defs>",
+  '<marker id="arr-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#12b76a"/></marker>',
+  '<marker id="arr-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2f6fed"/></marker>',
+  '<marker id="arr-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#b54708"/></marker>',
+  '<marker id="arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#7a5af8"/></marker>',
+  '<marker id="arr-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker>',
+  "</defs>",
+].join("");
+
+function buildDiagramModel(report: SessionReport): {
+  processNodes: DiagramNode[];
+  artifactNodes: DiagramNode[];
+  edges: DiagramEdge[];
+} {
+  const processNodes: DiagramNode[] = [];
+  const processById = new Map<string, DiagramNode>();
+  const artifactNodes: DiagramNode[] = [];
+  const artifactById = new Map<string, DiagramNode>();
+
+  for (const s of report.stages) {
+    if (processById.has(s.id)) continue;
+    const n: DiagramNode = { key: `stage:${s.id}`, id: s.id, kind: "stage", status: s.status, label: s.title ?? s.id, phantom: false };
+    processNodes.push(n);
+    processById.set(s.id, n);
+  }
+  if (report.teams) {
+    for (const t of report.teams) {
+      if (processById.has(t.id)) continue;
+      const n: DiagramNode = { key: `team:${t.id}`, id: t.id, kind: "team", status: t.status, label: t.id, phantom: false };
+      processNodes.push(n);
+      processById.set(t.id, n);
+    }
+  }
+  for (const a of report.artifacts) {
+    const n: DiagramNode = { key: `artifact:${a.id}`, id: a.id, kind: "artifact", status: a.status, label: a.id, phantom: false };
+    artifactNodes.push(n);
+    artifactById.set(a.id, n);
+  }
+
+  const resolveProcess = (id: string): DiagramNode => {
+    const hit = processById.get(id);
+    if (hit) return hit;
+    const n: DiagramNode = { key: `stage:${id}`, id, kind: "stage", status: "unknown", label: id, phantom: true };
+    processNodes.push(n);
+    processById.set(id, n);
+    return n;
+  };
+  const resolveArtifact = (id: string): DiagramNode => {
+    const hit = artifactById.get(id);
+    if (hit) return hit;
+    const n: DiagramNode = { key: `artifact:${id}`, id, kind: "artifact", status: "missing", label: id, phantom: true };
+    artifactNodes.push(n);
+    artifactById.set(id, n);
+    return n;
+  };
+
+  const edges: DiagramEdge[] = [];
+  for (const e of report.edges) {
+    let from: DiagramNode;
+    let to: DiagramNode;
+    if (e.kind === "produces") {
+      from = resolveProcess(e.from);
+      to = resolveArtifact(e.to);
+    } else if (e.kind === "consumes") {
+      from = resolveArtifact(e.from);
+      to = resolveProcess(e.to);
+    } else {
+      from = resolveProcess(e.from);
+      to = resolveProcess(e.to);
+    }
+    if (from.key === to.key) continue; // degenerate self-loop on one diagram node
+    edges.push({ fromKey: from.key, toKey: to.key, fromId: e.from, toId: e.to, kind: e.kind });
+  }
+
+  return { processNodes, artifactNodes, edges };
+}
+
+function renderDiagram(report: SessionReport): string {
+  const model = buildDiagramModel(report);
+  if (model.processNodes.length === 0 && model.artifactNodes.length === 0) return "";
+
+  const rows = Math.max(model.processNodes.length, model.artifactNodes.length, 1);
+  const height = DG_LAYOUT.top + (rows - 1) * DG_LAYOUT.rowH + DG_LAYOUT.nodeH + DG_LAYOUT.bottom;
+
+  const pos = new Map<string, { x: number; y: number; cy: number }>();
+  model.processNodes.forEach((n, i) => {
+    const y = DG_LAYOUT.top + i * DG_LAYOUT.rowH;
+    pos.set(n.key, { x: DG_LAYOUT.padX, y, cy: y + DG_LAYOUT.nodeH / 2 });
+  });
+  model.artifactNodes.forEach((n, i) => {
+    const y = DG_LAYOUT.top + i * DG_LAYOUT.rowH;
+    pos.set(n.key, { x: DG_LAYOUT.artX, y, cy: y + DG_LAYOUT.nodeH / 2 });
+  });
+
+  const edgeHtml = model.edges
+    .map((e, i) => {
+      const p1 = pos.get(e.fromKey);
+      const p2 = pos.get(e.toKey);
+      if (!p1 || !p2) return "";
+      const fromArtifact = e.fromKey.startsWith("artifact:");
+      const toArtifact = e.toKey.startsWith("artifact:");
+      let d: string;
+      let labelX: number;
+      if (fromArtifact && !toArtifact) {
+        // consumes: artifact (right lane) → process (left lane), bows through the gap
+        d = `M ${p1.x} ${p1.cy} C ${p1.x - 30} ${p1.cy} ${p2.x + DG_LAYOUT.nodeW + 30} ${p2.cy} ${p2.x + DG_LAYOUT.nodeW} ${p2.cy}`;
+        labelX = DG_LAYOUT.gapMid;
+      } else if (!fromArtifact && toArtifact) {
+        // produces: process (left lane) → artifact (right lane), bows through the gap
+        d = `M ${p1.x + DG_LAYOUT.nodeW} ${p1.cy} C ${p1.x + DG_LAYOUT.nodeW + 50} ${p1.cy} ${p2.x - 50} ${p2.cy} ${p2.x} ${p2.cy}`;
+        labelX = DG_LAYOUT.gapMid;
+      } else {
+        // process → process: bow left of the lane so transition flows never cross artifact edges
+        d = `M ${p1.x} ${p1.cy} C ${p1.x - 46} ${p1.cy} ${p2.x - 46} ${p2.cy} ${p2.x} ${p2.cy}`;
+        labelX = DG_LAYOUT.padX - 34;
+      }
+      const labelY = (p1.cy + p2.cy) / 2 - 3;
+      const color = DG_EDGE_COLOR[e.kind] ?? "gray";
+      const kindLabel = EDGE_LABELS[e.kind] ?? e.kind;
+      return `<g class="dg-edge kind-${esc(e.kind)}" data-edge data-edge-key="e${i}" data-from="${esc(e.fromId)}" data-to="${esc(e.toId)}" data-from-key="${esc(e.fromKey)}" data-to-key="${esc(e.toKey)}"><path class="dg-edge-path" d="${esc(d)}" marker-end="url(#arr-${color})"/><text class="dg-edge-label" x="${labelX}" y="${labelY}">${esc(kindLabel)}</text></g>`;
+    })
+    .join("");
+
+  const nodeHtml = model.processNodes
+    .concat(model.artifactNodes)
+    .map((n) => {
+      const p = pos.get(n.key);
+      if (!p) return "";
+      const x = n.kind === "artifact" ? DG_LAYOUT.artX : DG_LAYOUT.padX;
+      const phantom = n.phantom ? " dg-phantom" : "";
+      return `<g class="dg-node ${statusClass(n.status)}${phantom}" data-node-key="${esc(n.key)}" data-node-id="${esc(n.id)}" data-status="${esc(n.status)}" data-diagram-type="${esc(n.kind)}" role="button" tabindex="0" aria-label="${esc(`${n.kind} ${n.id}, ${statusLabel(n.status)}`)}"><title>${esc(n.label)}</title><rect class="dg-node-box" x="${x}" y="${p.y}" width="${DG_LAYOUT.nodeW}" height="${DG_LAYOUT.nodeH}" rx="8"/><text class="dg-node-title" x="${x + 12}" y="${p.y + 22}">${esc(n.label)}</text><text class="dg-node-status" x="${x + 12}" y="${p.y + 40}">${esc(statusLabel(n.status))}</text><rect class="dg-node-focus" x="${x}" y="${p.y}" width="${DG_LAYOUT.nodeW}" height="${DG_LAYOUT.nodeH}" rx="8" fill="none"/></g>`;
+    })
+    .join("");
+
+  const processCount = model.processNodes.length;
+  const artifactCount = model.artifactNodes.length;
+  const edgeCount = model.edges.length;
+  const ariaLabel = `Workflow diagram: ${processCount} stage or team node${processCount === 1 ? "" : "s"}, ${artifactCount} artifact node${artifactCount === 1 ? "" : "s"}, ${edgeCount} connection${edgeCount === 1 ? "" : "s"}`;
+
+  return (
+    `<div class="diagram-wrap" id="omp-diagram">` +
+    `<div class="diagram-toolbar">` +
+    `<strong class="diagram-title">Interactive diagram</strong>` +
+    `<span class="diagram-hint">Click a node, or press Enter/Space when focused, to highlight its edges and cards.</span>` +
+    `<span class="diagram-zoom">` +
+    `<button type="button" id="omp-zoom-out" aria-label="Zoom out">-</button>` +
+    `<span id="omp-zoom-label" class="diagram-zoom-label" aria-live="polite">100%</span>` +
+    `<button type="button" id="omp-zoom-in" aria-label="Zoom in">+</button>` +
+    `<button type="button" id="omp-zoom-reset" aria-label="Reset zoom">Reset</button>` +
+    `</span>` +
+    `</div>` +
+    `<div class="diagram-scroll" id="omp-diagram-scroll">` +
+    `<svg id="omp-diagram-svg" viewBox="0 0 ${DG_LAYOUT.width} ${height}" role="img" aria-label="${esc(ariaLabel)}">` +
+    DG_MARKERS +
+    (edgeHtml ? `<g class="dg-edges">${edgeHtml}</g>` : "") +
+    `<g class="dg-nodes">${nodeHtml}</g>` +
+    `</svg>` +
+    `</div>` +
+    `</div>`
+  );
+}
+
 function renderIntegration(i: NonNullable<SessionReport["integration"]>): string {
   return `<div class="integration"><span class="badge b-status ${statusClass(i.status)}">integration: ${esc(statusLabel(i.status))}</span>${i.note ? `<span class="integration-note">${esc(i.note)}</span>` : ""}</div>`;
 }
@@ -265,7 +491,7 @@ function renderArtifactCard(a: SessionReport["artifacts"][number]): string {
     a.body !== undefined
       ? `<details class="artifact-body"><summary>Show full content (${esc(String(a.bytes ?? a.body.length))} B)</summary><pre>${esc(a.body)}</pre></details>`
       : "";
-  return `<article class="artifact" data-owner="${esc(a.owner)}"><header class="artifact-head"><h3 class="artifact-id">${esc(a.id)}</h3><span class="badge b-status ${statusClass(a.status)}">${esc(statusLabel(a.status))}</span></header><div class="artifact-meta">${meta.join(" · ")}</div>${typeLine}${statusNote}${summary}${body}</article>`;
+  return `<article class="artifact" data-owner="${esc(a.owner)}" tabindex="0"><header class="artifact-head"><h3 class="artifact-id">${esc(a.id)}</h3><span class="badge b-status ${statusClass(a.status)}">${esc(statusLabel(a.status))}</span></header><div class="artifact-meta">${meta.join(" · ")}</div>${typeLine}${statusNote}${summary}${body}</article>`;
 }
 
 function renderChronology(report: SessionReport): string {
@@ -356,22 +582,69 @@ const APP_SCRIPT = `<script>
   var report = null;
   try { report = JSON.parse(island.textContent || "null"); } catch (e) { report = null; }
 
+  // [data-node-id] covers node cards (stage/team) AND svg diagram nodes.
   var nodes = document.querySelectorAll("[data-node-id]");
-  var edges = document.querySelectorAll("[data-edge]");
+  var svgNodes = document.querySelectorAll("[data-node-key]");
+  // [data-edge][data-from] covers detail-list edges AND svg diagram edges.
+  var edges = document.querySelectorAll("[data-edge][data-from]");
+  var svgEdges = document.querySelectorAll("[data-edge-key]");
   var artifacts = document.querySelectorAll("[data-owner]");
 
-  nodes.forEach(function (node) {
-    node.addEventListener("click", function () {
-      var id = node.getAttribute("data-node-id");
-      var active = node.classList.toggle("sel");
-      edges.forEach(function (e) {
-        var f = e.getAttribute("data-from");
-        var t = e.getAttribute("data-to");
-        if (f === id || t === id) e.classList.toggle("hl", active);
+  function applyActive(id, keys, active) {
+    nodes.forEach(function (n) {
+      if (n.getAttribute("data-node-id") === id) n.classList.toggle("sel", active);
+    });
+    artifacts.forEach(function (a) {
+      if (a.getAttribute("data-owner") === id) a.classList.toggle("hl", active);
+    });
+    edges.forEach(function (e) {
+      var f = e.getAttribute("data-from");
+      var t = e.getAttribute("data-to");
+      if (f === id || t === id) e.classList.toggle("hl", active);
+    });
+    if (keys && keys.length) {
+      svgEdges.forEach(function (e) {
+        var fk = e.getAttribute("data-from-key");
+        var tk = e.getAttribute("data-to-key");
+        for (var i = 0; i < keys.length; i++) {
+          if (fk === keys[i] || tk === keys[i]) { e.classList.toggle("hl", active); break; }
+        }
       });
-      artifacts.forEach(function (a) {
-        if (a.getAttribute("data-owner") === id) a.classList.toggle("hl", active);
-      });
+    }
+  }
+
+  function keysForId(id) {
+    var keys = [];
+    svgNodes.forEach(function (n) {
+      if (n.getAttribute("data-node-id") === id) keys.push(n.getAttribute("data-node-key"));
+    });
+    return keys;
+  }
+
+  function activateNode(el) {
+    var id = el.getAttribute("data-node-id");
+    if (!id) return;
+    applyActive(id, keysForId(id), !el.classList.contains("sel"));
+  }
+
+  function activateArtifact(el) {
+    var id = el.getAttribute("data-owner");
+    if (!id) return;
+    applyActive(id, keysForId(id), !el.classList.contains("hl"));
+  }
+
+  function bindNode(el) {
+    el.addEventListener("click", function () { activateNode(el); });
+    el.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); activateNode(el); }
+    });
+  }
+  nodes.forEach(bindNode);
+
+  artifacts.forEach(function (a) {
+    a.addEventListener("click", function () { activateArtifact(a); });
+    a.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); activateArtifact(a); }
     });
   });
 
@@ -382,12 +655,41 @@ const APP_SCRIPT = `<script>
       chip.addEventListener("click", function () {
         var wanted = chip.getAttribute("data-filter");
         chips.forEach(function (c) { c.classList.toggle("on", c === chip); });
+        // Node cards AND svg diagram nodes share [data-node-id]/[data-status].
         nodes.forEach(function (n) {
           var st = n.getAttribute("data-status") || "";
           n.style.display = (wanted === "all" || st === wanted) ? "" : "none";
         });
+        // Diagram edges hide when either typed endpoint node is hidden.
+        svgEdges.forEach(function (e) {
+          var fk = e.getAttribute("data-from-key");
+          var tk = e.getAttribute("data-to-key");
+          var hidden = false;
+          svgNodes.forEach(function (n) {
+            if (hidden) return;
+            var k = n.getAttribute("data-node-key");
+            if (k === fk || k === tk) hidden = n.style.display === "none";
+          });
+          e.style.display = hidden ? "none" : "";
+        });
       });
     });
+  }
+
+  var dgSvg = document.getElementById("omp-diagram-svg");
+  if (dgSvg) {
+    var zoomLabel = document.getElementById("omp-zoom-label");
+    var zoomScale = 1;
+    function applyZoom() {
+      dgSvg.style.transform = "scale(" + zoomScale + ")";
+      if (zoomLabel) zoomLabel.textContent = Math.round(zoomScale * 100) + "%";
+    }
+    var zoomIn = document.getElementById("omp-zoom-in");
+    var zoomOut = document.getElementById("omp-zoom-out");
+    var zoomReset = document.getElementById("omp-zoom-reset");
+    if (zoomIn) zoomIn.addEventListener("click", function () { zoomScale = Math.min(3, zoomScale * 1.25); applyZoom(); });
+    if (zoomOut) zoomOut.addEventListener("click", function () { zoomScale = Math.max(0.5, zoomScale / 1.25); applyZoom(); });
+    if (zoomReset) zoomReset.addEventListener("click", function () { zoomScale = 1; applyZoom(); });
   }
 })();
 </script>`;
@@ -499,6 +801,48 @@ section.section { background: var(--card); border: 1px solid var(--line); border
 .edge-label { color: var(--muted); font-size: 12px; margin-left: auto; }
 .integration { margin-top: 12px; display: flex; align-items: center; gap: 10px; }
 
+/* interactive diagram */
+.diagram-wrap { margin-top: 6px; }
+.diagram-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.diagram-title { font-size: 13px; }
+.diagram-hint { color: var(--muted); font-size: 12px; flex: 1; min-width: 200px; }
+.diagram-zoom { display: inline-flex; align-items: center; gap: 4px; }
+.diagram-zoom button {
+  border: 1px solid var(--line); background: var(--card); color: var(--ink);
+  border-radius: 6px; min-width: 28px; height: 26px; padding: 0 8px; font-size: 13px;
+  cursor: pointer; line-height: 1;
+}
+.diagram-zoom button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.diagram-zoom-label { min-width: 46px; text-align: center; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.diagram-scroll { overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: #fbfcfe; }
+#omp-diagram-svg { display: block; width: 100%; min-width: 580px; height: auto; transform-origin: 0 0; transition: transform .18s ease; }
+
+.dg-node { cursor: pointer; }
+.dg-node-box { fill: var(--card); stroke: var(--line); stroke-width: 1.5; }
+.dg-node.st-done .dg-node-box { stroke: var(--ok); }
+.dg-node.st-active .dg-node-box { stroke: var(--accent); }
+.dg-node.st-pending .dg-node-box { stroke: #98a2b3; }
+.dg-node.st-skipped .dg-node-box { stroke: #d0d5dd; }
+.dg-node.st-parked .dg-node-box { stroke: var(--amber); }
+.dg-node.st-missing .dg-node-box { stroke: var(--err); }
+.dg-node.st-failed .dg-node-box { stroke: var(--err); }
+.dg-node.st-unknown .dg-node-box { stroke: #98a2b3; }
+.dg-node.dg-phantom .dg-node-box { stroke-dasharray: 6 4; }
+.dg-node.sel .dg-node-box { stroke: var(--accent); stroke-width: 2.5; fill: #f4f7ff; }
+.dg-node:focus-visible { outline: none; }
+.dg-node:focus-visible .dg-node-focus { stroke: var(--accent); }
+.dg-node-title { fill: var(--ink); font-size: 13px; font-weight: 600; }
+.dg-node-status { fill: var(--muted); font-size: 11px; }
+
+.dg-edge-path { fill: none; stroke-width: 1.6; opacity: .95; }
+.dg-edge.kind-produces .dg-edge-path { stroke: var(--ok); }
+.dg-edge.kind-consumes .dg-edge-path { stroke: var(--accent); }
+.dg-edge.kind-depends_on .dg-edge-path { stroke: var(--amber); }
+.dg-edge.kind-integration .dg-edge-path { stroke: #7a5af8; }
+.dg-edge.kind-transition .dg-edge-path { stroke: #98a2b3; }
+.dg-edge.hl .dg-edge-path { stroke-width: 2.6; opacity: 1; }
+.dg-edge-label { fill: var(--muted); font-size: 10px; paint-order: stroke; stroke: #ffffff; stroke-width: 3px; stroke-linejoin: round; }
+
 /* artifacts */
 .artifact { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-top: 8px; transition: border-color .12s ease, background .12s ease; }
 .artifact.hl { border-color: var(--accent); background: #f4f7ff; }
@@ -546,6 +890,11 @@ section.section { background: var(--card); border: 1px solid var(--line); border
 @media (max-width: 640px) {
   .meta-row { flex-direction: column; gap: 2px; }
   .meta-row dt { flex-basis: auto; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #omp-diagram-svg { transition: none; }
+  .node, .edge, .artifact { transition: none !important; }
 }
 `;
 
