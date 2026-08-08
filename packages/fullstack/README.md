@@ -1,6 +1,6 @@
 # @andvl1/omp-workflows-fullstack
 
-Default fullstack bundle for `@andvl1/omp-workflows-core`. Ships 16 specialized agents, 27 domain skills, and 6 OMP custom-TS slash command adapters for Spring/Kotlin/React/KMP/Telegram-bot projects.
+Default fullstack bundle for `@andvl1/omp-workflows-core`. Ships 16 specialized agents, 27 domain skills, and 7 OMP custom-TS slash command adapters for Spring/Kotlin/React/KMP/Telegram-bot projects.
 
 ## Install
 
@@ -59,8 +59,9 @@ The `agents/` and `skills/` directories are picked up by OMP's discovery automat
 | `/init-team` | Write `.omp/team.config.json` with detected/default stack mappings. |
 | `/interview <topic>` | Delegate structured clarification to the analyst. |
 | `/omp-model-roles` | Validate model-role configuration or delegate recommendations. |
+| `/session-report [do-work|cto] [id=<id>] [--full]` | Generate a self-contained offline HTML snapshot of one workflow session. |
 
-Commands are OMP custom-TS modules copied into project-local `.omp/commands/`; they return prompts and do not dispatch subagents directly.
+Commands are OMP custom-TS modules copied into project-local `.omp/commands/`; most return prompts and do not dispatch subagents directly. `/session-report` is deterministic: it reads persisted state/artifacts, renders HTML, and writes only under `.work-state`.
 
 ## Model roles
 
@@ -125,7 +126,7 @@ In the interactive TUI, use /model without arguments to assign project/global ro
 
 - 15 agents (`analyst`, `architect`, `code-reviewer`, `cto`, `developer-{kotlin,go,mobile}`, `devops`, `diagnostics`, `discovery`, `frontend-developer`, `init-mobile`, `manual-qa`, `qa`, `security-tester`, `team-lead`, `tech-researcher`)
 - 27 domain skills
-- 6 custom-TS slash commands (see above)
+- 7 custom-TS slash commands (see above)
 
 ## FAQ
 
