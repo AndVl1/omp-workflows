@@ -25,7 +25,17 @@ export function ctoStatePath(runId: string, root: string): string {
   return join(ctoStateDir(runId, root), "state.json");
 }
 
-export function newCtoState(opts: { id: string; task: string; branch: string; autonomous: boolean; plan: TeamPlan }): CtoState {
+export function newCtoState(opts: {
+  id: string;
+  task: string;
+  branch: string;
+  autonomous: boolean;
+  plan: TeamPlan;
+  /** Standby runs are adoptable cross-session (inbox continuity). */
+  standby?: boolean;
+  /** Session that owns this interactive task run (foreign sessions do not amend it). */
+  owner_session?: string;
+}): CtoState {
   return {
     schema: 2,
     id: opts.id,
@@ -37,6 +47,8 @@ export function newCtoState(opts: { id: string; task: string; branch: string; au
     integration: { status: "pending" },
     pause: { kind: "none", reason: "" },
     updated_at: new Date().toISOString(),
+    ...(opts.standby === true ? { standby: true } : {}),
+    ...(opts.owner_session ? { owner_session: opts.owner_session } : {}),
     // ── schema-2 defaults (br-zps.1): health/scheduler stay undefined until their owning teams write them ──
     budget: defaultBudgetShape(),
     leases: {},
@@ -222,4 +234,19 @@ export function pendingEscalations(state: CtoState): Array<{ teamId: string; esc
 /** Teams not yet finished (pending | in_progress | parked). */
 export function activeTeams(state: CtoState): string[] {
   return state.teams.filter((t) => t.status === "pending" || t.status === "in_progress" || t.status === "parked").map((t) => t.id);
+}
+
+/**
+ * True when the run is finished and must not be selected as active (RC5).
+ * A run is terminal when its pause is done/failed, or when ALL teams are
+ * done/failed AND integration is done — even when the pause was never
+ * stamped done/failed (e.g. runs whose wave completed through the engine
+ * without a pause transition).
+ */
+export function isCtoRunTerminal(state: CtoState): boolean {
+  if (state.pause.kind === "done" || state.pause.kind === "failed") return true;
+  if (state.integration?.status === "done") {
+    return state.teams.every((t) => t.status === "done" || t.status === "failed");
+  }
+  return false;
 }

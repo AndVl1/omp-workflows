@@ -179,6 +179,19 @@ export interface CtoState {
   };
   /** Set when a mid-run task was folded into this run (br-k19 amend protocol). */
   amended_at?: string;
+  /**
+   * Standby run marker (schema-2 optional). Set by the inbox bootstrap and
+   * the standby prompt; standby runs are adoptable cross-session so queued
+   * inbox tasks are never lost when a new session starts.
+   */
+  standby?: boolean;
+  /**
+   * OMP session id that owns an interactive task run (schema-2 optional).
+   * Foreign sessions must not amend an owned run (fresh contract instead);
+   * standby runs have no owner. Absent on legacy runs — they remain
+   * amendable (status quo).
+   */
+  owner_session?: string;
   pause: {
     /**
      * Reuses the existing PauseKind vocabulary: `background_wait` for a

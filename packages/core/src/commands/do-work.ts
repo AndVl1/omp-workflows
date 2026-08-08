@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { parseAutonomousDirective } from "./envelope.js";
 import type { Complexity, TaskType, WorkflowName } from "../engine/types.js";
 
 export interface ParsedWorkEnvelope {
@@ -14,12 +15,10 @@ export interface WorkTeamConfig {
   roles?: Record<string, string>;
 }
 
-const AUTONOMOUS_PREFIX = "[AUTONOMOUS";
-
 export function parseWorkEnvelope(args: string, cwd: string): ParsedWorkEnvelope {
-  const autonomous = args.trimStart().startsWith(AUTONOMOUS_PREFIX);
-  const stripped = autonomous ? args.trimStart().slice(AUTONOMOUS_PREFIX.length).trimStart() : args;
-  const cleaned = stripped.startsWith("]") ? stripped.slice(1).trimStart() : stripped;
+  const directive = parseAutonomousDirective(args);
+  const autonomous = directive.autonomous;
+  const cleaned = directive.task;
   const issueMatch = cleaned.match(/issue=#(\d+)/);
   const issue = issueMatch ? Number(issueMatch[1]) : null;
   const task = (issueMatch ? cleaned.replace(issueMatch[0], "") : cleaned).trim();
@@ -49,8 +48,8 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
   const branchMeta = envelope.branch ? `Branch: \`${envelope.branch}\`\n` : "Branch: (no git work tree)\n";
   const autonomousMeta = envelope.autonomous
-    ? "Autonomous mode: ON. After classification, apply the profile's autonomous decisions.\n"
-    : "Autonomous mode: OFF. After classification, pause at profile checkpoints for user review.\n";
+    ? "Autonomous mode: ON. After classification, apply the profile's autonomous decisions.\nstate.autonomous: true (persist this literal value in team-state.json)\n"
+    : "Autonomous mode: OFF. After classification, pause at profile checkpoints for user review.\nstate.autonomous: false (persist this literal value in team-state.json)\n";
   return [
     "/do-work classification pass — understand the task before selecting a workflow.", "", "### Task", envelope.task, "",
     "### Metadata", issueMeta + branchMeta + autonomousMeta,
@@ -68,6 +67,10 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "| FEATURE | lightweight | standard | full-feature | full-feature |", "| REFACTOR | lightweight | standard | full-feature | full-feature |",
     "| OPS | lightweight | standard | standard | standard |", "| BUG_FIX | bug-fix | debug-cycle | debug-cycle | debug-cycle |",
     "| INVESTIGATION | research | research | research | research |", "| REVIEW | review | review | review | review |", "| HOTFIX | emergency | emergency | emergency | emergency |", "",
+    "> Autonomous mode (from Metadata above) forces BUG_FIX -> debug-cycle even for QUICK — the engine and the",
+    "> P5 gate resolve the workflow with the SAME parsed flag, so write the workflow row using the",
+    "> `state.autonomous` value rendered in Metadata. Do not re-derive autonomy from task text.",
+    "",
     "### Only after state is written", "1. Read exactly the resolved workflow profile file and then its stages.",
     "2. Walk the selected profile in order; do not execute any stage before classification and state persistence.",
     "3. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch.",

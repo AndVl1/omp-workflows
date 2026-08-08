@@ -18,6 +18,10 @@ import {
   setCtoPause,
   markAmended,
   readCtoState,
+  setIntegration,
+  setTeamStatus,
+  newCtoState,
+  isCtoRunTerminal,
   type TeamDef,
 } from "@andvl1/omp-workflows-core";
 

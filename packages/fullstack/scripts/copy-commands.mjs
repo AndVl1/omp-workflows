@@ -18,12 +18,20 @@
  * Idempotent: existing files are overwritten with the shipped versions.
  */
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const shippedDir = resolve(__dirname, "..", "commands");
+
+/**
+ * Command directories shipped by OLDER plugin versions before the manifest
+ * existed. They are plugin-owned artifacts and are pruned on sync; user-owned
+ * command directories (never shipped, never in this list) are preserved.
+ */
+const LEGACY_REMOVED_COMMANDS = ["team-next", "team-yolo", "pulse", "coordinator-stats"];
+const SHIPPED_MANIFEST_FILE = ".omp-shipped.json";
 
 const targetArg = process.argv[2];
 const projectRoot = process.env.OMP_PROJECT_DIR || process.env.INIT_CWD || targetArg || process.cwd();
@@ -35,6 +43,54 @@ function isDirectory(path) {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * Converge `.omp/commands/` to the shipped set: remove plugin-owned command
+ * directories that no longer ship (manifest-tracked or legacy shipped
+ * names), preserve explicitly user-owned commands, and rewrite the manifest
+ * with the current shipped set. Mirrors pruneStaleCommands in
+ * src/copy-commands.ts (this script is standalone so it cannot import the
+ * TS module).
+ */
+function pruneStaleCommands(targetRoot, shippedNames) {
+	let tracked = [];
+	try {
+		const raw = JSON.parse(readFileSync(join(targetRoot, SHIPPED_MANIFEST_FILE), "utf8"));
+		if (Array.isArray(raw?.shipped)) tracked = raw.shipped.filter((name) => typeof name === "string");
+	} catch {
+		// missing/malformed manifest — nothing tracked yet
+	}
+	const removed = [];
+	let entries;
+	try {
+		entries = readdirSync(targetRoot, { withFileTypes: true });
+	} catch {
+		return removed;
+	}
+	for (const entry of entries) {
+		if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+		if (shippedNames.includes(entry.name)) continue;
+		if (!tracked.includes(entry.name) && !LEGACY_REMOVED_COMMANDS.includes(entry.name)) continue;
+		try {
+			rmSync(join(targetRoot, entry.name), { recursive: true, force: true });
+			removed.push(entry.name);
+		} catch {
+			// best-effort — retried on the next sync
+		}
+	}
+	try {
+		writeFileSync(
+			join(targetRoot, SHIPPED_MANIFEST_FILE),
+			`${JSON.stringify({ schema: 1, shipped: shippedNames }, null, 2)}\n`,
+		);
+	} catch {
+		// best-effort
+	}
+	if (removed.length > 0) {
+		console.log(`copy-commands: pruned stale plugin-owned commands: ${removed.join(", ")}`);
+	}
+	return removed;
 }
 
 function copyTree(src, dst) {
@@ -71,5 +127,10 @@ if (!isDirectory(shippedDir)) {
 }
 
 console.log(`copy-commands: ${shippedDir} -> ${targetDir}`);
+const shippedNames = [];
+for (const entry of readdirSync(shippedDir, { withFileTypes: true })) {
+	if (entry.isDirectory() && !entry.name.startsWith(".")) shippedNames.push(entry.name);
+}
 copyTree(shippedDir, targetDir);
+pruneStaleCommands(targetDir, shippedNames);
 console.log("copy-commands: done");

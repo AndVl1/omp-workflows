@@ -123,6 +123,52 @@ test("fullstack: [AUTONOMOUS] prefix toggles autonomous mode", async () => {
 	assert.ok(result.includes("Autonomous mode: ON"), "autonomous flag lands in metadata");
 });
 
+test("fullstack: natural-language directive toggles autonomous mode ON and persists the flag", async () => {
+	const cmd = ctoFactory(fakeApi as never);
+	const result = await cmd.execute(["действуй автономно: Fix bug #42"], fakeCtx as never);
+	assert.ok(result.includes("Autonomous mode: ON"), "natural directive flips mode on");
+	assert.ok(result.includes("autonomous: true"), "persistence contract carries the literal parsed flag");
+	assert.ok(result.includes("Fix bug #42"), "task text preserved after stripping the directive");
+});
+
+test("fullstack: /cto amends only same-session runs (foreign session gets a fresh contract)", async () => {
+	const root = mkdtempSync(join(tmpdir(), "cto-cmd-owner-"));
+	try {
+		mkdirSync(join(root, ".omp"), { recursive: true });
+		writeFileSync(join(root, ".omp", "teams.json"), JSON.stringify(TEAMS_JSON));
+		const runId = "owned-run";
+		mkdirSync(join(root, ".work-state", "cto", runId), { recursive: true });
+		writeFileSync(
+			join(root, ".work-state", "cto", runId, "state.json"),
+			JSON.stringify({
+				schema: 2,
+				id: runId,
+				task: "Owned task",
+				branch: "main",
+				autonomous: true,
+				standby: false,
+				owner_session: "sess-A",
+				plan: { id: runId, task: "Owned task", teams: [], created_at: "2026-08-04T10:00:00.000Z" },
+				teams: [{ id: "kotlin-backend", status: "in_progress", escalations: {} }],
+				integration: { status: "pending" },
+				pause: { kind: "none", reason: "" },
+				updated_at: "2026-08-04T10:05:00.000Z",
+			}),
+		);
+
+		const ownerCtx = { ...fakeCtx, cwd: root, sessionManager: { getSessionId: () => "sess-A" } };
+		const ownerResult = await ctoFactory(fakeApi as never).execute(["Add feature B"], ownerCtx as never);
+		assert.ok(ownerResult.includes("/cto AMEND"), "same session folds into its own run");
+
+		const foreignCtx = { ...fakeCtx, cwd: root, sessionManager: { getSessionId: () => "sess-B" } };
+		const foreignResult = await ctoFactory(fakeApi as never).execute(["Add feature C"], foreignCtx as never);
+		assert.ok(foreignResult.includes("/cto workflow"), "foreign session gets the fresh contract");
+		assert.ok(!foreignResult.includes("/cto AMEND"), "foreign session must not amend an owned run");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("fullstack: issue=#N is stripped into the prompt metadata", async () => {
 	const cmd = ctoFactory(fakeApi as never);
 	const result = await cmd.execute(["Add OAuth issue=#7"], fakeCtx as never);

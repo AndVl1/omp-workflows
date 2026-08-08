@@ -22,15 +22,19 @@ const factory = (api: CustomCommandAPI): CustomCommand => ({
       ctx.ui?.notify?.("cto: standby mode — awaiting tasks via messenger inbox", "info");
       return buildStandbyCtoPrompt(cwd);
     }
+    // Session identity for run ownership: interactive task runs are amended
+    // only by the session that owns them; foreign sessions get a fresh
+    // contract. Standby runs stay adoptable cross-session.
+    const sessionId = ctx.sessionManager?.getSessionId?.() ?? undefined;
     const envelope = parseEnvelope(raw, cwd);
     if (!envelope.task) return "ERROR: empty task after stripping prefix.";
-    const active = findActiveCtoRun(cwd);
+    const active = findActiveCtoRun(cwd, { sessionId });
     if (active) {
       ctx.ui?.notify?.(`cto: amending run ${active.runId} with: ${envelope.task.slice(0, 50)}`, "info");
-      return buildAmendPrompt(envelope, cwd, active);
+      return buildAmendPrompt(envelope, cwd, active, { sessionId });
     }
     ctx.ui?.notify?.(`cto: ${envelope.task.slice(0, 60)} (decomposition pending)`, "info");
-    return buildCtoPrompt(envelope, cwd);
+    return buildCtoPrompt(envelope, cwd, { sessionId });
   },
 });
 

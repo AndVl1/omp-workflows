@@ -87,7 +87,12 @@ export function classificationGate(event: AgentStartEvent, ctx: AgentStartContex
   const expected = resolveWorkflow(type, complexity, autonomous);
   const actual = c.workflow;
   if (actual && actual !== expected) {
-    if (isRegisteredWorkflow(actual) && matchesProfile(actual, { type, complexity })) return;
+    // Non-autonomous runs may pick a different registered profile whose match
+    // table accepts this classification (intentional override). Autonomous
+    // runs resolve through the parsed explicit flag (e.g. BUG_FIX ->
+    // debug-cycle) and may NOT be silently downgraded to the interactive
+    // counterpart via the profile-match escape hatch.
+    if (!autonomous && isRegisteredWorkflow(actual) && matchesProfile(actual, { type, complexity })) return;
     return {
       block: true,
       reason: `BLOCK (P5): workflow '${actual}' does not match classification (type=${type} complexity=${complexity} autonomous=${autonomous} -> expected '${expected}'). Fix the workflow in team-state.json, or set workflow_override: true.`,

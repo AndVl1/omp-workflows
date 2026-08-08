@@ -5,6 +5,13 @@
  *
  * This is the FIRST STEP the engine runs, before any state is written, so
  * the model should classify via this helper for consistency.
+ *
+ * Autonomy contract (RC2): `classify` never derives the autonomous flag
+ * from task text — the flag comes exclusively from the shared envelope
+ * parser (`parseAutonomousDirective`) and is consumed by the workflow
+ * driver (`resolveWorkflow(type, complexity, autonomous)`), which is what
+ * the P5 gate recomputes from the persisted state. The `workflow` field
+ * returned here is a placeholder resolved by the driver with that flag.
  */
 
 import type { Classification, Complexity, Confidence, TaskType } from "./types.js";

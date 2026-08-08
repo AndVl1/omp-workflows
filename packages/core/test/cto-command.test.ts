@@ -29,6 +29,26 @@ const TEAMS_JSON = [
   },
 ];
 
+test("cto-cmd: natural-language directive enables autonomy and stays out of the task", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-core-ru-"));
+  try {
+    const envelope = parseCtoEnvelope("действуй автономно: Add OAuth", root);
+    assert.equal(envelope.autonomous, true);
+    assert.equal(envelope.task, "Add OAuth");
+
+    const prompt = buildCtoPrompt(envelope, root);
+    assert.ok(prompt.includes("Autonomous mode: ON"), "natural directive renders ON");
+    assert.ok(prompt.includes("autonomous: true"), "persistence contract carries the literal flag");
+
+    const lookalike = parseCtoEnvelope("[AUTONOMOUSLY] Add OAuth", root);
+    assert.equal(lookalike.autonomous, false, "lookalike does not enable autonomy");
+    assert.equal(lookalike.task, "[AUTONOMOUSLY] Add OAuth", "lookalike stays literal");
+    assert.ok(buildCtoPrompt(lookalike, root).includes("Autonomous mode: OFF"), "lookalike renders OFF");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("cto-cmd: parseCtoEnvelope handles prefixes and issue", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-core-"));
   try {

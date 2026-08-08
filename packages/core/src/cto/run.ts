@@ -23,6 +23,10 @@ export interface RunCtoOptions {
   defs: Record<string, TeamDef> | Map<string, TeamDef>;
   /** Optional: sub-profile depth (team stages inside each profile), for the depth cap. */
   profileDepth?: (profile: string) => number;
+  /** Standby runs are adoptable cross-session (inbox continuity). */
+  standby?: boolean;
+  /** Session owning this interactive task run (foreign sessions do not amend it). */
+  owner_session?: string;
   log?: (line: string) => void;
 }
 
@@ -57,6 +61,8 @@ export function runCto(opts: RunCtoOptions): RunCtoResult {
     branch: opts.branch,
     autonomous: opts.autonomous,
     plan: built.plan,
+    ...(opts.standby === true ? { standby: true } : {}),
+    ...(opts.owner_session ? { owner_session: opts.owner_session } : {}),
   });
   const statePath = writeCtoState(state, opts.cwd);
   opts.log?.(`cto: plan ${built.plan.id} — ${built.plan.teams.length} teams, depth ${depth.depth}, state ${statePath}`);
