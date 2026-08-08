@@ -1,0 +1,93 @@
+{
+  "skill_name": "release-process",
+  "scope": "repo-local release skills for the omp-workflows monorepo (.omp/skills): release-process, release-preflight, release-verify",
+  "note": "Prompts designed but NOT executed. Each entry: realistic user prompt, expected skill behavior, and assertions for evaluation.",
+  "evals": [
+    {
+      "id": 1,
+      "skill": "release-process",
+      "name": "full-minor-release",
+      "prompt": "Подготовь и выпусти релиз v0.19.0: забампай версии core и fullstack, обнови peer-диапазон и changelog, синхронизируй marketplace.json, закоммить и запушь тег v0.19.0.",
+      "expected_output": "Сначала вызывается release-preflight; при PASS — bump обоих package.json до 0.19.0, peer @andvl1/omp-workflows-core = ^0.19.0, секция ## [0.19.0] в корневом CHANGELOG.md, metadata.version marketplace = 0.19.0 со свежими счётчиками без удалённых команд; целевой коммит chore(release): v0.19.0 (только перечисленные файлы); тег v0.19.0 + push; hand off на release-verify. Отчёт: версия, файлы, hash, тег.",
+      "assertions": [
+        "release-preflight прочитан и выполнен до любых мутаций без будущей версии; вердикт PASS",
+        "Версии packages/core и packages/fullstack равны 0.19.0",
+        "peerDependencies['@andvl1/omp-workflows-core'] == ^0.19.0",
+        "В CHANGELOG.md первая секция ## [0.19.0]",
+        "marketplace.json: metadata.version == 0.19.0, нет team-next/team-yolo/pulse/coordinator-stats",
+        "Нет git add . / git add -A; только целевые файлы",
+        "Коммит chore(release): v0.19.0 и тег v0.19.0 запушены",
+        "CI/скрипты не менялись"
+      ]
+    },
+    {
+      "id": 2,
+      "skill": "release-process",
+      "name": "patch-hotfix",
+      "prompt": "Выпусти hotfix: бампни patch до 0.18.1 и запушь релизный тег.",
+      "expected_output": "Тот же flow для 0.18.1: версии обоих пакетов = 0.18.1, peer-диапазон ОСТАЁТСЯ ^0.18.0 (major.minor не изменился), секция ## [0.18.1] с ### Fixed в CHANGELOG.md, marketplace metadata.version = 0.18.1, тег v0.18.1, hand off на release-verify.",
+      "assertions": [
+        "Версии обоих пакетов = 0.18.1",
+        "peer-диапазон не тронут для patch-bump: остаётся ^0.18.0",
+        "Секция ## [0.18.1] добавлена до следующего ## ",
+        "Тег v0.18.1 создан и запушен",
+        "Release-verify получил hand off"
+      ]
+    },
+    {
+      "id": 3,
+      "skill": "release-preflight",
+      "name": "readiness-audit-019",
+      "prompt": "Проверь готовность к релизу 0.19.0 — только аудит, ничего не меняй.",
+      "expected_output": "Таблица из 7 проверок (дерево, версии пакетов, peer-диапазон, changelog, marketplace, тег, e2e) каждая с PASS/FAIL/BLOCKED и evidence путь:значение; итоговый вердикт; при PASS — указание запускать release-process. Никаких изменений файлов, тегов или push'ей.",
+      "assertions": [
+        "Не выполняется ни одна мутация (нет npm version, git tag, git commit, git push)",
+        "Проверены версии core == fullstack == 0.19.0",
+        "Проверен peer-диапазон ^0.19.0",
+        "Проверены секция ## [0.19.0] в CHANGELOG.md и metadata.version marketplace",
+        "Проверено отсутствие тега v0.19.0 локально и на remote",
+        "Вывод содержит evidence в формате путь:значение и итоговый вердикт"
+      ]
+    },
+    {
+      "id": 4,
+      "skill": "release-preflight",
+      "name": "ambiguous-readiness",
+      "prompt": "Мы готовы к релизу? Посмотри статус репозитория и скажи, можно ли публиковать.",
+      "expected_output": "Целевая версия берётся из package.json (без угадывания); если версии пакетов расходятся или тег уже существует — FAIL с evidence; если версия не определяема — BLOCKED с указанием причины. Read-only, вердикт детерминирован.",
+      "assertions": [
+        "Версия не выдумана — взята из файлов или запрошена",
+        "Расхождение версий пакетов даёт FAIL, а не молчаливый выбор",
+        "Никаких мутаций",
+        "Вердикт PASS/FAIL/BLOCKED с evidence"
+      ]
+    },
+    {
+      "id": 5,
+      "skill": "release-verify",
+      "name": "verify-pushed-release",
+      "prompt": "Релиз v0.18.0 запушен, проверь что всё опубликовалось.",
+      "expected_output": "Найден run release.yml на refs/tags/v0.18.0 с conclusion success; npm view @andvl1/omp-workflows-core@0.18.0 и @andvl1/omp-workflows-fullstack@0.18.0 на registry npm.pkg.github.com оба возвращают версию; gh release view v0.18.0 — не draft, тело непустое; вердикт VERIFIED с URL run'а и релиза. Никаких действий по перезапуску.",
+      "assertions": [
+        "Проверены ОБА пакета (core и fullstack) — не только один",
+        "packages/e2e не проверяется и не упоминается как публикуемый",
+        "GitHub Release проверен: существует, не draft, body непустое",
+        "Нет перезапусков CI, нет push'ей, нет retry",
+        "Вердикт VERIFIED/FAILED с evidence (URL run, версии пакетов)"
+      ]
+    },
+    {
+      "id": 6,
+      "skill": "release-verify",
+      "name": "diagnose-guard-failure",
+      "prompt": "CI по тегу v0.19.0 упал на шаге Verify version matches tag — что делать?",
+      "expected_output": "Read-only диагностика: причина — версии package.json ≠ тегу v0.19.0; рекомендация (текстом, не действием) — выровнять ОБА package.json до 0.19.0, коммит, push, затем повторить релиз через release-process; запрет на force-push тега и ручной retry.",
+      "assertions": [
+        "Причина сопоставлена с конкретным шагом CI (Verify version matches tag)",
+        "Рекомендация — текст для release-process, а не выполнение здесь",
+        "Никаких мутаций: нет bump'а, нет перезаписи тега, нет retry",
+        "Указано: тег не перезаписывать"
+      ]
+    }
+  ]
+}

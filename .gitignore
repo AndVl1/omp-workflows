@@ -10,8 +10,13 @@ coverage
 .vscode
 .idea
 
-# Local runtime / workflow state — per-machine, never committed
+# Local runtime / workflow state — per-machine, never committed.
 .omp/
+!/.omp/
+.omp/*
+!/.omp/skills/
+!/.omp/skills/**
+
 .work-state/
 
 # UX E2E run evidence (heavy: transcripts, screenshots) — keep local, reports go to git
