@@ -208,8 +208,8 @@ function diagramReport(): SessionReport {
       isLegacy: false,
     },
     stages: [
-      { id: "planning", title: "Planning", status: "done", phase: "standard", type: "orchestrator", at: "2026-08-08T09:00:00.000Z" },
-      { id: "implementation", title: "Implementation", status: "in_progress", phase: "standard", type: "single", at: "2026-08-08T09:30:00.000Z" },
+      { id: "planning", title: "Planning", status: "done", phase: "standard", type: "orchestrator", at: "2026-08-08T09:00:00.000Z", agents: [{ name: "main session", role: "orchestrator", source: "workflow" }], inputs: [], outputs: [] },
+      { id: "implementation", title: "Implementation", status: "in_progress", phase: "standard", type: "single", at: "2026-08-08T09:30:00.000Z", agents: [{ name: "dev", role: "single", source: "workflow" }, { name: "reviewer", role: "consilium", source: "observed" }], inputs: ["oauth-plan"], outputs: ["implementation"] },
     ],
     edges: [
       { from: "planning", to: "implementation", kind: "transition" },
@@ -241,6 +241,102 @@ function diagramReport(): SessionReport {
       },
     ],
     telemetry: { eventsPath: ".work-state/features/diagram/observability/events.jsonl", rollup: null },
+    chronology: [],
+    warnings: [],
+  };
+}
+
+/**
+ * Focused CTO fixture: two teams declare the same artifact id "dod" —
+ * the diagram must collapse both into one deterministic node.
+ */
+function ctoDuplicateArtifactReport(): SessionReport {
+  return {
+    schema: 1,
+    kind: "cto",
+    meta: {
+      title: "CTO duplicate dod",
+      task: "Two teams, one dod",
+      branch: "feat/cto-dup-dod",
+      workflow: "cto",
+      pause: { kind: "none", reason: "" },
+      updated_at: "2026-08-08T11:00:00.000Z",
+      generated_at: "2026-08-08T12:00:00.000Z",
+      autonomous: false,
+    },
+    source: {
+      kind: "cto",
+      id: "cto-dup-dod",
+      statePath: ".work-state/cto/cto-dup-dod/state.json",
+      format: "json",
+      isLegacy: false,
+    },
+    stages: [
+      { id: "team-backend", title: "Backend team", status: "done", phase: "cto", type: "team", team: "backend", at: "2026-08-08T10:00:00.000Z" },
+      { id: "team-web", title: "Web team", status: "in_progress", phase: "cto", type: "team", team: "web", at: "2026-08-08T10:30:00.000Z" },
+    ],
+    edges: [
+      { from: "backend", to: "dod", kind: "produces" },
+      { from: "web", to: "dod", kind: "produces" },
+      { from: "dod", to: "team-web", kind: "consumes" },
+    ],
+    artifacts: [
+      { id: "dod", path: ".work-state/cto/cto-dup-dod/teams/backend/dod.json", owner: "backend", status: "produced", bytes: 8, summary: "backend dod" },
+      { id: "dod", path: ".work-state/cto/cto-dup-dod/teams/web/dod.json", owner: "web", status: "missing", summary: "(missing)" },
+    ],
+    teams: [
+      { id: "backend", status: "done", slice: "API", profile: "full-feature", worktree: "separate_worktree", dod_path: ".work-state/cto/cto-dup-dod/teams/backend/dod.json", depends_on: [] },
+      { id: "web", status: "in_progress", slice: "Frontend", profile: "standard", depends_on: ["backend"] },
+    ],
+    telemetry: { eventsPath: ".work-state/cto/cto-dup-dod/observability/events.jsonl", rollup: null },
+    chronology: [],
+    warnings: [],
+  };
+}
+
+/**
+ * Focused CTO fixture: the normalized report carries BOTH a derived stage
+ * entry with id `team:<id>` AND a `report.teams` entry with the bare id —
+ * the diagram must emit exactly one visual node per team (the derived stage
+ * wins) while the dependency edges (which use `team:<id>` endpoints) stay
+ * connected to that single node.
+ */
+function ctoDerivedTeamStageReport(): SessionReport {
+  return {
+    schema: 1,
+    kind: "cto",
+    meta: {
+      title: "CTO derived team stages",
+      task: "One diagram node per team",
+      branch: "feat/cto-derived-teams",
+      workflow: "cto",
+      pause: { kind: "none", reason: "" },
+      updated_at: "2026-08-08T11:00:00.000Z",
+      generated_at: "2026-08-08T12:00:00.000Z",
+      autonomous: false,
+    },
+    source: {
+      kind: "cto",
+      id: "cto-derived-teams",
+      statePath: ".work-state/cto/cto-derived-teams/state.json",
+      format: "json",
+      isLegacy: false,
+    },
+    stages: [
+      { id: "team:backend", title: "Backend team", status: "done", phase: "cto", type: "team", team: "backend", at: "2026-08-08T10:00:00.000Z" },
+      { id: "team:web", title: "Web team", status: "in_progress", phase: "cto", type: "team", team: "web", at: "2026-08-08T10:30:00.000Z" },
+    ],
+    edges: [
+      // CTO dependency edges use `team:<id>` endpoints — they must resolve to
+      // the derived team stage node (never to a second, phantom team node).
+      { from: "team:backend", to: "team:web", kind: "depends_on" },
+    ],
+    artifacts: [],
+    teams: [
+      { id: "backend", status: "done", slice: "API", profile: "full-feature", worktree: "separate_worktree", depends_on: [] },
+      { id: "web", status: "in_progress", slice: "Frontend", profile: "standard", depends_on: ["backend"] },
+    ],
+    telemetry: { eventsPath: ".work-state/cto/cto-derived-teams/observability/events.jsonl", rollup: null },
     chronology: [],
     warnings: [],
   };
@@ -416,7 +512,7 @@ test("renderer: empty sections degrade gracefully (no artifacts, no chronology)"
   assert.ok(html.includes("No chronology recorded for this session."));
 });
 
-test("renderer: diagram renders typed stage and artifact SVG nodes in separate lanes before the detail lists", () => {
+test("renderer: diagram renders typed stage and artifact SVG nodes in columns before the detail lists", () => {
   const html = renderReportHtml(diagramReport());
   assert.ok(html.includes('<svg id="omp-diagram-svg"'), "SVG diagram present");
   const diagramPos = html.indexOf('data-node-key="stage:planning"');
@@ -463,14 +559,189 @@ test("renderer: diagram edges are directed curved paths with arrow markers, type
   );
   assert.ok(html.includes('marker-end="url(#arr-ok)"'), "arrowhead marker applied");
   assert.ok(html.includes('<path class="dg-edge-path" d="M '), "curved path emitted");
-  assert.ok(html.includes('class="dg-edge-label" x="305"'), "cross-lane edge kind label centered in the gap");
-  assert.ok(html.includes(">produces</text>"), "kind label text rendered");
-  assert.ok(html.includes(">consumes</text>"), "consumes kind label rendered");
+  assert.ok(html.includes('class="dg-edge-label"'), "edge labels rendered in the diagram");
+  assert.ok(html.includes(">produces: implementation</text>"), "produces edge labeled with the artifact it carries");
+  assert.ok(html.includes(">consumes: oauth-plan</text>"), "consumes edge labeled with the artifact it carries");
 
   // Endpoints that exist nowhere become dashed phantom nodes — diagram stays connected.
   assert.ok(html.includes('data-node-key="artifact:ghost-artifact"'), "undeclared produces target becomes a phantom artifact node");
   assert.ok(html.includes('data-node-key="stage:ghost-stage"'), "unknown transition endpoint becomes a phantom stage node");
   assert.ok(html.includes("dg-phantom"), "phantom nodes are visually distinct");
+});
+
+/** Extract the SVG node box x coordinate for a typed node key. */
+function nodeRectX(html: string, nodeKey: string): number {
+  const re = new RegExp(`data-node-key="${nodeKey}"[^>]*><title>[^<]*</title><rect class="dg-node-box" x="(\\d+)"`);
+  const m = re.exec(html);
+  assert.ok(m, `diagram node ${nodeKey} rect present`);
+  return Number(m![1]!);
+}
+
+test("renderer: diagram lays stages left-to-right with agent details, artifact edge labels and missing/produced colors", () => {
+  const html = renderReportHtml(diagramReport());
+
+  // Left-to-right columns ordered by report.stages; phantom endpoints append after.
+  const planningX = nodeRectX(html, "stage:planning");
+  const implementationX = nodeRectX(html, "stage:implementation");
+  const ghostStageX = nodeRectX(html, "stage:ghost-stage");
+  assert.ok(planningX < implementationX, "stage columns advance left to right in report order");
+  assert.ok(implementationX < ghostStageX, "phantom stage column appends after real stages");
+  // Artifact nodes stay attached to their producing/consuming stage edges: the
+  // phantom artifact produced by planning sits between planning and the next column.
+  const ghostArtifactX = nodeRectX(html, "artifact:ghost-artifact");
+  assert.ok(planningX < ghostArtifactX && ghostArtifactX < implementationX, "artifact node sits in the gap between producing and next column");
+
+  // Stage agent details render with role/source indication.
+  assert.ok(html.includes("agents: main session (orchestrator, workflow)"), "orchestrator stage renders the main session agent");
+  assert.ok(html.includes("agents: dev (single, workflow), reviewer (consilium, observed)"), "multiple agents render name, role and source");
+  assert.ok(html.includes("in: oauth-plan"), "stage inputs rendered");
+  assert.ok(html.includes("out: implementation"), "stage outputs rendered");
+  const plain = renderReportHtml(doWorkReport());
+  assert.ok(plain.includes("agents: no agent recorded"), "stage without recorded agents renders honestly");
+
+  // Edges carry the artifact they move on produces/consumes labels.
+  assert.ok(html.includes(">produces: implementation</text>"), "produces edge labeled with the artifact id");
+  assert.ok(html.includes(">consumes: oauth-plan</text>"), "consumes edge labeled with the artifact id");
+  assert.ok(html.includes(">produces: ghost-artifact</text>"), "phantom artifact id on produces label");
+  assert.ok(html.includes(">transition</text>"), "non-artifact edge keeps its kind label");
+
+  // Missing/produced artifact typing and colors preserved.
+  assert.ok(/data-node-key="artifact:oauth-plan"[^>]*data-status="missing"/.test(html), "missing artifact typed and statused");
+  assert.ok(/data-node-key="artifact:implementation"[^>]*data-status="produced"/.test(html), "produced artifact typed and statused");
+  assert.ok(html.includes('class="dg-node st-missing"'), "missing artifact node carries the missing (red) style");
+  assert.ok(html.includes('class="dg-node st-done"'), "produced artifact node carries the produced (green) style");
+});
+
+test("renderer: duplicate artifact ids collapse into one deterministic SVG node with an honest label", () => {
+  const html = renderReportHtml(ctoDuplicateArtifactReport());
+
+  // Exactly one diagram node is emitted for the shared artifact id.
+  const dodNodes = html.match(/data-node-key="artifact:dod"/g) ?? [];
+  assert.equal(dodNodes.length, 1, "duplicate artifact ids emit a single diagram node, no duplicate keys");
+
+  // The collapsed node keeps the raw id, honors severity (missing wins over
+  // produced), and stays the single click/filter/highlight target.
+  assert.ok(
+    /data-node-key="artifact:dod" data-node-id="dod" data-status="missing" data-diagram-type="artifact"/.test(html),
+    "collapsed node keeps the raw id and the worst (missing) status",
+  );
+  const dodIds = html.match(/data-node-id="dod"/g) ?? [];
+  assert.equal(dodIds.length, 1, "exactly one interactive node for id dod");
+  assert.ok(html.includes('class="dg-node st-missing"'), "collapsed node stays visibly missing");
+
+  // Honest duplicate label in the tooltip and on the node title text.
+  assert.ok(html.includes("<title>dod (2 owners)</title>"), "tooltip names the duplicate owner count");
+  assert.ok(html.includes(">dod (2 owners)</text>"), "node title text names the duplicate owner count");
+
+  // Both producing teams' edges resolve to the single collapsed node; the
+  // consumes edge leaves from it.
+  const toDod = html.match(/data-to-key="artifact:dod"/g) ?? [];
+  assert.equal(toDod.length, 2, "both teams' produces edges target the collapsed node");
+  assert.ok(html.includes('data-from-key="artifact:dod" data-to-key="stage:team-web"'), "consumes edge leaves the collapsed node");
+
+  // The data island and the artifact cards are untouched: two raw entries.
+  const parsed = extractIsland(html) as SessionReport;
+  assert.equal(parsed.artifacts.length, 2, "data island keeps both artifact entries");
+  assert.equal(parsed.artifacts.filter((a) => a.id === "dod").length, 2, "raw artifact ids preserved in the island");
+  const cards = html.match(/<article class="artifact"/g) ?? [];
+  assert.equal(cards.length, 2, "artifact cards unchanged for duplicate ids");
+  assert.ok(html.includes('class="artifact-id">dod</h3>'), "artifact cards render the raw id");
+});
+
+test("renderer: derived team: stage and bare report.teams entry emit one diagram node with edges connected", () => {
+  const html = renderReportHtml(ctoDerivedTeamStageReport());
+
+  // Exactly one process node per team: the derived `team:<id>` stage wins,
+  // the bare team node is skipped — no visual duplication.
+  assert.equal((html.match(/data-node-key="stage:team:backend"/g) ?? []).length, 1, "derived backend stage node emitted once");
+  assert.equal((html.match(/data-node-key="stage:team:web"/g) ?? []).length, 1, "derived web stage node emitted once");
+  assert.equal((html.match(/data-node-key="team:backend"/g) ?? []).length, 0, "bare team node skipped when the derived team: stage exists");
+  assert.equal((html.match(/data-node-key="team:web"/g) ?? []).length, 0, "bare web team node skipped when the derived team: stage exists");
+
+  // The surviving node is the derived stage, carrying the team's status.
+  assert.ok(
+    /data-node-key="stage:team:backend" data-node-id="team:backend" data-status="done" data-diagram-type="stage"/.test(html),
+    "derived stage node typed and statused",
+  );
+
+  // CTO dependency edges use `team:<id>` endpoints and resolve to the single
+  // derived node — never to a duplicate or phantom team target.
+  assert.ok(
+    html.includes('data-from-key="stage:team:backend" data-to-key="stage:team:web"'),
+    "depends_on edge connects the two derived team nodes",
+  );
+  assert.ok(html.includes('data-from="team:backend" data-to="team:web"'), "edge keeps the raw team:<id> endpoints");
+
+  // The detail team list stays unchanged: both bare team cards still render.
+  assert.ok(html.includes('<div class="node-list team-list">'), "team detail list present");
+  assert.ok((html.match(/data-node-id="backend"/g) ?? []).length >= 1, "team detail list still renders the bare team id");
+  assert.ok(html.includes("slice: API"), "backend team detail preserved");
+});
+
+test("renderer: report without a derived team: stage still emits the standalone team node", () => {
+  const html = renderReportHtml(ctoReport());
+
+  // ctoReport uses `team-backend`-style stage ids, so no derived `team:<id>`
+  // stage exists — the bare team node must still render (exactly once).
+  assert.equal((html.match(/data-node-key="stage:team:backend"/g) ?? []).length, 0, "no derived team: stage in this fixture");
+  assert.equal((html.match(/data-node-key="team:backend"/g) ?? []).length, 1, "standalone team node emitted when no derived stage exists");
+  assert.ok(
+    /data-node-key="team:backend" data-node-id="backend" data-status="done" data-diagram-type="team"/.test(html),
+    "standalone team node typed as team",
+  );
+});
+
+test("renderer: derived team: stage and bare team card share selection/highlight via the team: alias, report unchanged", () => {
+  const report = ctoDerivedTeamStageReport();
+  const html = renderReportHtml(report);
+
+  // The alias is client-side selection/highlight only — the serialized
+  // report (and the server-rendered structure) is byte-for-byte unchanged.
+  assert.deepEqual(extractIsland(html), report, "report serialization unchanged");
+
+  // Typed keys stay exact: the derived stage keeps its stage:team:backend key
+  // and raw team:<id> id, while the bare team detail card keeps the bare id.
+  assert.ok(
+    /data-node-key="stage:team:backend" data-node-id="team:backend" data-status="done" data-diagram-type="stage"/.test(html),
+    "derived stage node keeps its typed key and raw team:<id> id",
+  );
+  assert.ok((html.match(/data-node-id="backend"/g) ?? []).length >= 1, "bare team detail card keeps the bare id");
+
+  // The inline script defines sameNodeId and compares every raw id through it.
+  const script = /<script>\n\(function \(\) \{[\s\S]*?\n\}\)\(\);\n<\/script>/.exec(html)?.[0] ?? "";
+  assert.ok(script.includes("function sameNodeId(a, b)"), "inline script defines the sameNodeId helper");
+  assert.ok(
+    script.includes('sameNodeId(n.getAttribute("data-node-id"), id)'),
+    "applyActive compares node ids through sameNodeId",
+  );
+  assert.ok(
+    script.includes('sameNodeId(a.getAttribute("data-owner"), id)'),
+    "applyActive compares artifact owners through sameNodeId",
+  );
+  assert.ok(
+    script.includes("sameNodeId(f, id) || sameNodeId(t, id)"),
+    "applyActive compares detail edge endpoints through sameNodeId",
+  );
+  assert.ok(
+    script.includes('sameNodeId(n.getAttribute("data-node-id"), id)) keys.push'),
+    "keysForId maps ids to svg keys through sameNodeId",
+  );
+  assert.ok(!script.includes("sameNodeId(fk"), "typed svg edge keys are never matched through the alias");
+
+  // Evaluate the shipped helper (pure, no DOM) and prove the cross-highlight
+  // semantics: clicking the bare team card or the derived team: stage selects
+  // the other; unrelated ids never match.
+  const fnMatch = /function sameNodeId\(a, b\) \{[\s\S]*?\n  \}/.exec(script);
+  assert.ok(fnMatch, "sameNodeId source is extractable from the inline script");
+  const sameNodeId = new Function(`${fnMatch[0]}\n  return sameNodeId;`)() as (a: string, b: string) => boolean;
+
+  assert.equal(sameNodeId("backend", "backend"), true, "exact bare ids match");
+  assert.equal(sameNodeId("team:backend", "team:backend"), true, "exact team: ids match");
+  assert.equal(sameNodeId("team:backend", "backend"), true, "derived stage id selects the bare team card");
+  assert.equal(sameNodeId("backend", "team:backend"), true, "bare team card selects the derived stage id");
+  assert.equal(sameNodeId("backend", "web"), false, "unrelated bare ids never match");
+  assert.equal(sameNodeId("team:backend", "team:web"), false, "unrelated team: ids never match");
+  assert.equal(sameNodeId("team:backend", "web"), false, "team: prefix does not alias an unrelated bare id");
 });
 
 test("renderer: diagram interaction controls are inline, keyboard-friendly and offline", () => {

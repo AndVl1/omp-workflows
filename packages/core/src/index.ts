@@ -383,6 +383,7 @@ export type {
 	SessionSelector,
 	BuildSessionReportOptions,
 	StageInfo,
+	StageAgentInfo,
 	EdgeKind,
 	SessionEdge,
 	ArtifactStatus,

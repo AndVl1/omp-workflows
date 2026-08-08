@@ -53,6 +53,25 @@ export interface BuildSessionReportOptions {
 
 // ── Normalized model ────────────────────────────────────────────────────────
 
+/**
+ * Agent/role provenance attached to a stage.
+ *
+ * `source: "workflow"` means the entry was derived from the loaded workflow
+ * profile / resolved role config — never a runtime observation. `observed`
+ * is reserved for deterministic stage-correlated runtime evidence; global
+ * agent/tool counts are NOT stage evidence and must never be claimed as
+ * such. Missing artifacts/rosters stay missing — entries are never
+ * synthesized.
+ */
+export interface StageAgentInfo {
+  /** Resolved agent name (role→agent mapping, or the truthful descriptor). */
+  name: string;
+  /** Original role from the workflow profile (e.g. "architect_minimal"). */
+  role?: string;
+  /** "workflow" = profile/config-derived; "observed" = runtime-correlated. */
+  source: "workflow" | "observed";
+}
+
 /** One stage of the session (do-work profile stage or derived CTO stage). */
 export interface StageInfo {
   id: string;
@@ -72,6 +91,16 @@ export interface StageInfo {
   at?: string;
   /** Raw/unmapped status text when it did not fit the known vocabulary. */
   detail?: string;
+  /**
+   * Agents/roles that run this stage — profile/config-derived provenance.
+   * Absent when the stage has no profile definition (custom/legacy) or no
+   * truthful roster is available.
+   */
+  agents?: StageAgentInfo[];
+  /** Artifact ids this stage consumes (`StageDef.consumes`); absent without a def. */
+  inputs?: string[];
+  /** Artifact ids this stage produces (`StageDef.produces`); absent without a def. */
+  outputs?: string[];
 }
 
 export type EdgeKind = "produces" | "consumes" | "depends_on" | "integration" | "transition";

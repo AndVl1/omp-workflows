@@ -466,6 +466,149 @@ test("rollups: new event kinds count additively; old kinds and old rollups are u
   }
 });
 
+// ── Stage provenance (agents / inputs / outputs) ────────────────────────────
+
+test("do-work: full-feature stages carry resolved agents, original roles, and declared inputs/outputs", () => {
+  const cwd = tmpWorkspace();
+  try {
+    writeFeature(cwd, "session-report", makeTeamState());
+    // No artifacts written on disk: declared outputs must survive as declared
+    // artifact ids even when the files are missing (missing ≠ undeclared).
+    const report = buildSessionReport(cwd, { kind: "do-work" });
+
+    // Single stage: resolved agent + original role.
+    const qa = report.stages.find((s) => s.id === "qa_tests");
+    assert.deepEqual(qa?.agents, [{ name: "qa", role: "qa", source: "workflow" }]);
+    assert.deepEqual(qa?.inputs, ["manual_qa", "implementation", "architecture"]);
+    assert.deepEqual(qa?.outputs, ["qa_tests"]);
+
+    // Consilium: role roster maps every declared role to its resolved agent.
+    const arch = report.stages.find((s) => s.id === "architecture");
+    assert.deepEqual(arch?.agents, [
+      { name: "architect", role: "architect_minimal", source: "workflow" },
+      { name: "architect", role: "architect_clean", source: "workflow" },
+      { name: "architect", role: "architect_pragmatic", source: "workflow" },
+    ]);
+    assert.deepEqual(arch?.inputs, ["exploration", "clarifications"]);
+    assert.deepEqual(arch?.outputs, ["architecture"]);
+
+    // Orchestrator: truthful main-session entry — never an invented agent.
+    const summary = report.stages.find((s) => s.id === "summary");
+    assert.deepEqual(summary?.agents, [{ name: "main session", role: "orchestrator", source: "workflow" }]);
+    assert.deepEqual(summary?.outputs, ["summary"]);
+
+    // Consilium roles with duplicates stay as declared by the profile.
+    const exploration = report.stages.find((s) => s.id === "exploration");
+    assert.deepEqual(exploration?.agents, [
+      { name: "analyst", role: "analyst", source: "workflow" },
+      { name: "tech-researcher", role: "tech-researcher", source: "workflow" },
+      { name: "analyst", role: "analyst", source: "workflow" },
+    ]);
+    assert.deepEqual(exploration?.outputs, ["exploration", "dod"]);
+
+    // Stage with no `produces` declares an empty (not absent) output list.
+    const reviewFixes = report.stages.find((s) => s.id === "review_fixes");
+    assert.deepEqual(reviewFixes?.outputs, []);
+
+    // Missing artifacts stay declared on the stage: architecture.json was
+    // never written, yet the stage still lists it as an output.
+    assert.equal(report.artifacts.find((a) => a.id === "architecture")?.status, "missing");
+    assert.deepEqual(arch?.outputs, ["architecture"]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("do-work: consilium roster honors configured roster_overrides (add/replace)", () => {
+  const cwd = tmpWorkspace();
+  try {
+    writeFeature(cwd, "session-report", makeTeamState());
+    const ompDir = join(cwd, ".omp");
+    mkdirSync(ompDir, { recursive: true });
+    writeFileSync(
+      join(ompDir, "team.config.json"),
+      JSON.stringify({
+        roster_overrides: {
+          code_review: { add: ["security-tester"] },
+          architecture: { replace: ["architect_clean"] },
+        },
+      }),
+    );
+
+    const report = buildSessionReport(cwd, { kind: "do-work" });
+
+    const codeReview = report.stages.find((s) => s.id === "code_review");
+    assert.deepEqual(codeReview?.agents, [
+      { name: "code-reviewer", role: "code-reviewer", source: "workflow" },
+      { name: "security-tester", role: "security-tester", source: "workflow" },
+    ]);
+
+    const arch = report.stages.find((s) => s.id === "architecture");
+    assert.deepEqual(arch?.agents, [{ name: "architect", role: "architect_clean", source: "workflow" }]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("do-work: unresolved ${scope.dev_agent} template roles are omitted, inputs/outputs kept", () => {
+  const cwd = tmpWorkspace();
+  try {
+    writeFeature(cwd, "session-report", makeTeamState());
+    const report = buildSessionReport(cwd, { kind: "do-work" });
+
+    // implementation + review_fixes declare role "${scope.dev_agent}" in the
+    // full-feature profile. The report has no touched-file scope scan, so it
+    // cannot resolve the template: the agent entry must stay absent (the
+    // renderer shows "no agent recorded") — never the literal placeholder,
+    // never a guessed role.
+    for (const stageId of ["implementation", "review_fixes"]) {
+      const stage = report.stages.find((s) => s.id === stageId);
+      assert.ok(stage, `${stageId} stage present`);
+      assert.equal(stage.agents, undefined, `${stageId} claims no agent without scope evidence`);
+    }
+
+    // Declared inputs/outputs survive without the roster.
+    const impl = report.stages.find((s) => s.id === "implementation");
+    assert.deepEqual(impl?.inputs, ["architecture", "exploration"]);
+    assert.deepEqual(impl?.outputs, ["implementation"]);
+    const reviewFixes = report.stages.find((s) => s.id === "review_fixes");
+    assert.deepEqual(reviewFixes?.inputs, ["review"]);
+    assert.deepEqual(reviewFixes?.outputs, []);
+
+    // No literal template placeholder can leak into any stage's agent names.
+    for (const s of report.stages) {
+      for (const a of s.agents ?? []) {
+        assert.ok(!a.name.includes("${"), `no template placeholder in agent names (${a.name})`);
+      }
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("do-work: custom/unknown workflow falls back safely — provenance fields absent, no throw", () => {
+  const cwd = tmpWorkspace();
+  try {
+    const state = makeTeamState({
+      classification: { ...makeTeamState().classification, workflow: "custom-flow" },
+    });
+    writeFeature(cwd, "session-report", state);
+
+    const report = buildSessionReport(cwd, { kind: "do-work" });
+
+    const impl = report.stages.find((s) => s.id === "implementation");
+    assert.ok(impl, "custom stages still normalize");
+    assert.equal(impl?.agents, undefined, "no profile def → no agent claim");
+    assert.equal(impl?.inputs, undefined, "no profile def → inputs absent");
+    assert.equal(impl?.outputs, undefined, "no profile def → outputs absent");
+    assert.equal(impl?.type, undefined);
+    // No profile → ordinal transition spine, still a valid report.
+    assert.ok(report.edges.some((e) => e.kind === "transition"));
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("recorder: recordStageTransition/recordArtifactWritten persist additive events", async () => {
   const cwd = tmpWorkspace();
   try {

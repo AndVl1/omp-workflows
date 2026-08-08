@@ -30,11 +30,13 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 
 import { resolveState } from "../engine/state.js";
 import { loadProfile } from "../engine/profile.js";
-import type { Profile, StageDef, StageStatus, TeamState } from "../engine/types.js";
+import { resolveConfig, resolveAgentForRole } from "../engine/config.js";
+import type { Profile, RoleConfig, StageDef, StageStatus, TeamState } from "../engine/types.js";
 import { readCtoState } from "../cto/state.js";
 import { assessRunHealth } from "../cto/health.js";
+import { loadTeamDefs } from "../cto/plan.js";
 import { markdownCtoState } from "../commands/cto.js";
-import type { CtoState, RunHealth, TeamRunStatus } from "../cto/types.js";
+import type { CtoState, RunHealth, TeamDef, TeamRunStatus } from "../cto/types.js";
 import { readObservabilityPointer } from "../observability/recorder.js";
 import type { ObservabilityEvent, ObservabilityPointer } from "../observability/events.js";
 import { redactReportBody } from "./redact.js";
@@ -52,6 +54,7 @@ import type {
   SessionKind,
   SessionReport,
   SessionSelector,
+  StageAgentInfo,
   StageInfo,
 } from "./types.js";
 
@@ -217,6 +220,79 @@ export function buildSessionReport(
   return assembleDoWork(cwd, dw, options);
 }
 
+// ── Stage provenance (agents / inputs / outputs) ────────────────────────────
+
+/**
+ * Truthful entry for orchestrator stages: they run in the main session, not
+ * via a spawned role. The literal descriptor avoids inventing an agent/model.
+ */
+const ORCHESTRATOR_AGENT: StageAgentInfo = { name: "main session", role: "orchestrator", source: "workflow" };
+
+/**
+ * True when a role is still an unresolved `${scope.*}` template. The stage
+ * runner resolves these from a touched-file scope scan at execution time;
+ * the report deliberately performs no such scan, so a template role cannot
+ * be resolved to a truthful agent here. Such roles are unavailable — never
+ * guessed, and the literal placeholder is never emitted.
+ */
+function isUnresolvedTemplateRole(role: string): boolean {
+  return role.includes("${");
+}
+
+/**
+ * Provenance for a profile stage. `source` is always "workflow": the entry
+ * is derived from the loaded profile + resolved role config. Runtime
+ * observations (global agent/tool counts) are never stage-correlated here
+ * and are therefore never claimed. Returns undefined when no truthful roster
+ * exists (custom/legacy stages, def without roles, or a roster of only
+ * unresolved template roles).
+ */
+function stageAgents(def: StageDef, config: RoleConfig): StageAgentInfo[] | undefined {
+  if (def.type === "orchestrator") return [ORCHESTRATOR_AGENT];
+  const roster = effectiveRoster(def, config);
+  if (roster.length === 0) return undefined;
+  return roster.map((role) => ({
+    name: resolveAgentForRole(role, config),
+    role,
+    source: "workflow" as const,
+  }));
+}
+
+/**
+ * Effective role roster for a stage: profile roles (consilium `roles` /
+ * single `role`) + configured `roster_overrides` (replace/add/remove) from
+ * team.config.json. Profile `conditional` additions (`if: scope.has_…`) are
+ * NOT evaluated — scope needs a file scan the report does not have, so they
+ * are only applied when the project config declares them statically. Roles
+ * that remain unresolved `${scope.*}` templates are dropped for the same
+ * reason: the report cannot claim an agent it has no scope evidence for.
+ */
+function effectiveRoster(def: StageDef, config: RoleConfig): string[] {
+  let roster: string[];
+  if (def.roles && def.roles.length > 0) roster = [...def.roles];
+  else if (def.role) roster = [def.role];
+  else return [];
+  const override = config.roster_overrides?.[def.id];
+  if (override) {
+    if (Array.isArray(override.replace)) roster = [...override.replace];
+    if (Array.isArray(override.add)) roster.push(...override.add);
+    if (Array.isArray(override.remove)) roster = roster.filter((r) => !override.remove!.includes(r));
+  }
+  return roster.filter((r) => !isUnresolvedTemplateRole(r));
+}
+
+/**
+ * Lead provenance for a CTO team stage, from the consumer-owned
+ * `.omp/teams.json` registry (`loadTeamDefs` — missing/malformed → no
+ * entries, never throws). No registry entry → undefined: the lead agent is
+ * not invented. The `lead` is a configured agent name, never a model claim.
+ */
+function teamLeadAgents(teamId: string, teamDefs: Map<string, TeamDef>): StageAgentInfo[] | undefined {
+  const def = teamDefs.get(teamId);
+  if (!def) return undefined;
+  return [{ name: def.lead, role: "team-lead", source: "workflow" as const }];
+}
+
 // ── do-work assembly ────────────────────────────────────────────────────────
 
 function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionReportOptions): SessionReport {
@@ -225,6 +301,7 @@ function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionRep
   const profile = loadProfile(state.classification.workflow);
   const stageDefs = new Map<string, StageDef>();
   if (profile) for (const s of profile.stages) stageDefs.set(s.id, s);
+  const config = resolveConfig(cwd);
 
   const { telemetry, events } = doWorkTelemetry(cwd, r, warnings);
   const stageEventTimes = latestTransitionTimes(events, (e) => e.stageId);
@@ -282,6 +359,7 @@ function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionRep
       ? [...declaredProduces.entries()].filter(([, owner]) => owner === s.id).map(([id]) => id)
       : [];
     const artifactTime = produced.map((id) => artifactEventTimes.get(id) ?? artifactMtimes.get(id)).find(Boolean);
+    const agents = def ? stageAgents(def, config) : undefined;
     return {
       id: s.id,
       title: def?.title,
@@ -289,6 +367,11 @@ function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionRep
       phase: state.classification.workflow,
       type: def?.type,
       at: stageEventTimes.get(s.id) ?? artifactTime ?? state.updated_at,
+      // Declared artifact ids are preserved even when files are missing;
+      // custom/legacy stages (no def) keep the fields absent.
+      ...(def ? { inputs: [...(def.consumes ?? [])] } : {}),
+      ...(def ? { outputs: asList(def.produces) } : {}),
+      ...(agents ? { agents } : {}),
     };
   });
 
@@ -387,6 +470,8 @@ function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOpt
   const profile = loadProfile("cto");
   const stageDefs = new Map<string, StageDef>();
   if (profile) for (const s of profile.stages) stageDefs.set(s.id, s);
+  const config = resolveConfig(cwd);
+  const teamDefs = new Map(loadTeamDefs(cwd).map((d) => [d.id, d]));
 
   const { telemetry, events } = ctoTelemetry(cwd, r, warnings);
   const teamIds = new Set(state.teams.map((t) => t.id));
@@ -417,6 +502,7 @@ function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOpt
 
   const stages: StageInfo[] = [];
   for (const def of profile?.stages ?? []) {
+    const agents = stageAgents(def, config);
     stages.push({
       id: def.id,
       title: def.title,
@@ -424,9 +510,13 @@ function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOpt
       phase: "cto",
       type: def.type,
       at: teamEventTimes.get(def.id) ?? state.updated_at,
+      inputs: [...(def.consumes ?? [])],
+      outputs: asList(def.produces),
+      ...(agents ? { agents } : {}),
     });
   }
   for (const t of state.teams) {
+    const agents = teamLeadAgents(t.id, teamDefs);
     stages.push({
       id: `team:${t.id}`,
       title: `Team ${t.id}`,
@@ -435,6 +525,7 @@ function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOpt
       type: "team",
       team: t.id,
       at: teamEventTimes.get(t.id) ?? state.updated_at,
+      ...(agents ? { agents } : {}),
     });
   }
 

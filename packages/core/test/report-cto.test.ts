@@ -231,6 +231,82 @@ test("cto: absent observability → null rollup, CTO-specific warning, chronolog
 
 // ── Standby stage derivation ────────────────────────────────────────────────
 
+// ── Stage provenance (agents / inputs / outputs) ────────────────────────────
+
+test("cto: workflow stages carry profile agents/inputs/outputs; team stages carry lead provenance", () => {
+  const cwd = tmpWorkspace();
+  try {
+    writeRun(cwd, makeCtoState());
+    const ompDir = join(cwd, ".omp");
+    mkdirSync(ompDir, { recursive: true });
+    writeFileSync(
+      join(ompDir, "teams.json"),
+      JSON.stringify([
+        { id: "alpha", name: "Alpha", scope: ["backend"], profile: "standard", lead: "team-lead-alpha", roster: ["developer-kotlin"] },
+        { id: "beta", name: "Beta", scope: ["frontend"], profile: "standard", lead: "team-lead-beta", roster: ["frontend"] },
+      ]),
+    );
+
+    const report = buildSessionReport(cwd, { kind: "cto" });
+
+    // Single stage: resolved agent + original role.
+    const arch = report.stages.find((s) => s.id === "architecture");
+    assert.deepEqual(arch?.agents, [{ name: "architect", role: "architect", source: "workflow" }]);
+    assert.deepEqual(arch?.inputs, ["team_plan"]);
+    assert.deepEqual(arch?.outputs, ["architecture"]);
+
+    const integrationReview = report.stages.find((s) => s.id === "integration_review");
+    assert.deepEqual(integrationReview?.agents, [{ name: "code-reviewer", role: "code-reviewer", source: "workflow" }]);
+    assert.deepEqual(integrationReview?.inputs, ["team_artifacts"]);
+    assert.deepEqual(integrationReview?.outputs, ["integration_review"]);
+
+    // Orchestrator stages: truthful main-session entry.
+    const discovery = report.stages.find((s) => s.id === "cto_discovery");
+    assert.deepEqual(discovery?.agents, [{ name: "main session", role: "orchestrator", source: "workflow" }]);
+    assert.deepEqual(discovery?.outputs, ["cto_discovery"]);
+    const decomposition = report.stages.find((s) => s.id === "decomposition");
+    assert.deepEqual(decomposition?.agents, [{ name: "main session", role: "orchestrator", source: "workflow" }]);
+    assert.deepEqual(decomposition?.inputs, ["cto_discovery"]);
+    assert.deepEqual(decomposition?.outputs, ["team_plan"]);
+
+    // The `teams` stage declares inputs/outputs but has no role roster →
+    // agents stay absent (no truthful single-agent claim for the phase).
+    const teams = report.stages.find((s) => s.id === "teams");
+    assert.equal(teams?.agents, undefined);
+    assert.deepEqual(teams?.inputs, ["architecture"]);
+    assert.deepEqual(teams?.outputs, ["team_artifacts"]);
+
+    // CTO team stages: lead provenance from the teams.json registry.
+    assert.deepEqual(report.stages.find((s) => s.id === "team:alpha")?.agents, [
+      { name: "team-lead-alpha", role: "team-lead", source: "workflow" },
+    ]);
+    assert.deepEqual(report.stages.find((s) => s.id === "team:beta")?.agents, [
+      { name: "team-lead-beta", role: "team-lead", source: "workflow" },
+    ]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("cto: without a teams.json registry, team stages claim no lead (never invented)", () => {
+  const cwd = tmpWorkspace();
+  try {
+    writeRun(cwd, makeCtoState());
+
+    const report = buildSessionReport(cwd, { kind: "cto" });
+
+    const alpha = report.stages.find((s) => s.id === "team:alpha");
+    assert.equal(alpha?.agents, undefined, "no registry entry → no invented lead/model");
+    assert.equal(alpha?.inputs, undefined, "team stages are derived, not def-backed → no input claim");
+    assert.equal(alpha?.outputs, undefined);
+    // Existing fields still intact.
+    assert.equal(alpha?.status, "done");
+    assert.equal(alpha?.team, "alpha");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("cto: standby run derives pending cto_discovery and decomposition stages", () => {
   const cwd = tmpWorkspace();
   try {

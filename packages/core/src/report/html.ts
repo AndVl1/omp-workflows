@@ -6,10 +6,13 @@
  *   - ALL report data is embedded in an escaped JSON data island
  *     (<script id="omp-report-data" type="application/json">).
  *   - A deterministic interactive SVG diagram renders the workflow before the
- *     detail lists: stage/team nodes in a left lane, artifact nodes in a right
- *     lane, curved directed edges with arrowheads and kind labels. `produces`
- *     targets and `consumes` sources resolve to artifact nodes whenever the
- *     artifact id exists (same-ID stage/artifact pairs stay distinct).
+ *     detail lists: stage/team nodes are columns ordered by `report.stages`
+ *     (extra teams and unknown endpoints append deterministically), artifact
+ *     nodes sit in the gaps around their producing/consuming stage columns,
+ *     and directed edges carry `produces:`/`consumes:` artifact labels with
+ *     arrowheads and kind colors. `produces` targets and `consumes` sources
+ *     resolve to artifact nodes whenever the artifact id exists (same-ID
+ *     stage/artifact pairs stay distinct).
  *   - A small amount of vanilla JS enhances navigation (node selection with
  *     edge + card highlighting, status filter synchronized with the diagram,
  *     zoom +/-/reset, keyboard activation). No external link, script src,
@@ -28,7 +31,7 @@
  * timeline (statuses are derived from team/integration state).
  */
 
-import type { EdgeKind, SessionReport } from "./types.js";
+import type { ArtifactStatus, EdgeKind, ReportArtifact, SessionReport, StageAgentInfo } from "./types.js";
 
 // ── Escaping ────────────────────────────────────────────────────────────────
 
@@ -93,6 +96,33 @@ function statusLabel(status: string): string {
   return status.replace(/_/g, " ");
 }
 
+/**
+ * Worst-first rank for collapsing duplicate artifact ids into one diagram
+ * node: `missing` outranks `skipped` outranks `produced` (unknown stays 0).
+ */
+const ARTIFACT_STATUS_RANK: Record<string, number> = {
+  missing: 3,
+  skipped: 2,
+  produced: 1,
+};
+
+/** Return the more severe of two artifact statuses (first wins ties). */
+function worseArtifactStatus(a: ArtifactStatus, b: ArtifactStatus): ArtifactStatus {
+  return (ARTIFACT_STATUS_RANK[a] ?? 0) >= (ARTIFACT_STATUS_RANK[b] ?? 0) ? a : b;
+}
+
+/**
+ * Display label for an artifact diagram node. When several report entries
+ * share one artifact id, the label states how many owners declared it —
+ * e.g. `dod (2 owners)` — instead of silently picking one entry.
+ */
+function artifactLabel(id: string, entries: ReportArtifact[]): string {
+  if (entries.length <= 1) return id;
+  const owners = new Set(entries.map((e) => e.owner).filter((o) => o.length > 0));
+  const count = owners.size > 0 ? owners.size : entries.length;
+  return `${id} (${count} ${count === 1 ? "owner" : "owners"})`;
+}
+
 const EDGE_LABELS: Record<string, string> = {
   produces: "produces",
   consumes: "consumes",
@@ -100,6 +130,21 @@ const EDGE_LABELS: Record<string, string> = {
   integration: "integration",
   transition: "transition",
 };
+
+/**
+ * Compact one-line stage agent summary, e.g. `planner (orchestrator, workflow)`.
+ * The main/standby session is rendered honestly as "main session"; a stage
+ * with no recorded agents renders "no agent recorded" — never synthesized.
+ */
+function agentSummary(agents: StageAgentInfo[] | undefined): string {
+  if (!agents || agents.length === 0) return "no agent recorded";
+  return agents
+    .map((a) => {
+      const name = a.name === "__main__" ? "main session" : a.name;
+      return `${name}${a.role ? ` (${a.role}, ${a.source})` : ` (${a.source})`}`;
+    })
+    .join(", ");
+}
 
 /** Render an ISO timestamp or a visible "(unknown)" marker. */
 function renderTime(iso: string | undefined, fallback = "(unknown)"): string {
@@ -212,7 +257,11 @@ function renderStageNode(s: SessionReport["stages"][number], derived: boolean): 
   if (s.team) meta.push(`team: ${esc(s.team)}`);
   const derivedChip = derived ? '<span class="derived-chip" title="derived from team/integration state">derived</span>' : "";
   const detail = s.detail ? `<div class="node-detail">${esc(s.detail)}</div>` : "";
-  return `<article class="node ${statusClass(s.status)}" data-node-id="${esc(s.id)}" data-status="${esc(s.status)}" tabindex="0"><header class="node-head"><span class="node-dot"></span><h3 class="node-title">${esc(s.title ?? s.id)}</h3><span class="badge b-status ${statusClass(s.status)}">${esc(statusLabel(s.status))}</span>${derivedChip}</header><div class="node-meta">${meta.join(" · ")}</div><div class="node-time">at: ${renderTime(s.at, "(no timestamp)")}</div>${detail}</article>`;
+  const agents = `<div class="node-agents">agents: ${esc(agentSummary(s.agents))}</div>`;
+  const io: string[] = [];
+  if (s.inputs?.length) io.push(`<div class="node-io">in: ${esc(s.inputs.join(", "))}</div>`);
+  if (s.outputs?.length) io.push(`<div class="node-io">out: ${esc(s.outputs.join(", "))}</div>`);
+  return `<article class="node ${statusClass(s.status)}" data-node-id="${esc(s.id)}" data-status="${esc(s.status)}" tabindex="0"><header class="node-head"><span class="node-dot"></span><h3 class="node-title">${esc(s.title ?? s.id)}</h3><span class="badge b-status ${statusClass(s.status)}">${esc(statusLabel(s.status))}</span>${derivedChip}</header><div class="node-meta">${meta.join(" · ")}</div>${agents}${io.join("")}<div class="node-time">at: ${renderTime(s.at, "(no timestamp)")}</div>${detail}</article>`;
 }
 
 function renderTeamNode(t: NonNullable<SessionReport["teams"]>[number]): string {
@@ -240,22 +289,30 @@ function renderEdges(edges: SessionReport["edges"]): string {
   return `<h3>Dependencies &amp; transitions</h3><ul class="edge-list">${rows}</ul>`;
 }
 
-// ── Interactive SVG diagram (deterministic typed layout) ────────────────────
+// ── Interactive SVG diagram (deterministic left-to-right layout) ─────────────
 //
-// Two-lane layout rendered server-side (no client-side graph layout):
-//   - left lane: stage/team nodes (all `report.stages`, plus `report.teams`
-//     whose id is not already a stage id);
-//   - right lane: artifact nodes (every `report.artifacts` entry, including
-//     missing ones, which stay visible in red).
+// Deterministic left-to-right stage graph rendered server-side (no client-side
+// graph layout):
+//   - columns: all `report.stages` in `report.stages` order, then `report.teams`
+//     whose id is not already a stage id and that has no derived `team:<id>`
+//     stage (CTO reports emit both — one visual node per team), then any
+//     phantom stage endpoints (appended, so the diagram always stays connected);
+//   - artifact nodes live in the horizontal gap right of the column that
+//     produces them (falling back to the column that consumes them, then the
+//     last column), so every artifact stays attached to its stage edges;
+//   - every stage column renders compact details: status, agent names with
+//     role/source, and the stage's declared inputs/outputs.
 // Edge endpoint typing: `produces` targets and `consumes` sources resolve to
 // artifact nodes whenever the artifact id exists in `report.artifacts`; every
 // other endpoint resolves to a stage/team node. Endpoints that exist nowhere
-// become dashed "phantom" nodes so the diagram always stays connected.
-// Same-ID stage/artifact pairs (e.g. stage "implementation" producing artifact
-// "implementation") are distinct nodes distinguished by their typed key.
+// become dashed "phantom" nodes. Same-ID stage/artifact pairs (e.g. stage
+// "implementation" producing artifact "implementation") are distinct nodes
+// distinguished by their typed key. Duplicate artifact ids (several teams
+// declaring the same artifact, e.g. "dod") collapse into one node: raw id
+// kept, worst status wins, label states the owner count.
 
 interface DiagramNode {
-  /** Typed key: `stage:<id>` | `team:<id>` | `artifact:<id>` — unique per lane. */
+  /** Typed key: `stage:<id>` | `team:<id>` | `artifact:<id>` — unique per node. */
   key: string;
   /** Raw id (stage/team/artifact id). */
   id: string;
@@ -265,6 +322,10 @@ interface DiagramNode {
   label: string;
   /** True when the node exists only to anchor an edge endpoint. */
   phantom: boolean;
+  /** Compact stage provenance (stages only; teams/artifacts have none). */
+  agents?: StageAgentInfo[];
+  inputs?: string[];
+  outputs?: string[];
 }
 
 interface DiagramEdge {
@@ -273,18 +334,20 @@ interface DiagramEdge {
   fromId: string;
   toId: string;
   kind: EdgeKind;
+  /** Source edge label (shown alongside the kind on non-artifact edges). */
+  label?: string;
 }
 
 const DG_LAYOUT = {
-  padX: 70, // left lane x
-  artX: 370, // right lane x
-  nodeW: 170,
-  nodeH: 52,
-  rowH: 64,
-  top: 12,
-  bottom: 20,
-  gapMid: 305, // midpoint between the lanes (edge label anchor)
-  width: 600,
+  padX: 56, // left padding
+  colW: 236, // stage/team column width
+  colH: 128, // stage/team node height (status + agents + io lines)
+  gapW: 240, // inter-column gap (holds artifact nodes + edge labels)
+  artW: 140, // artifact node width
+  artH: 40, // artifact node height
+  artStep: 58, // vertical step between artifact nodes in one gap
+  top: 24,
+  bottom: 32,
 } as const;
 
 /** Arrow marker suffix per edge kind (marker fills match the stroke colors). */
@@ -318,22 +381,50 @@ function buildDiagramModel(report: SessionReport): {
 
   for (const s of report.stages) {
     if (processById.has(s.id)) continue;
-    const n: DiagramNode = { key: `stage:${s.id}`, id: s.id, kind: "stage", status: s.status, label: s.title ?? s.id, phantom: false };
+    const n: DiagramNode = { key: `stage:${s.id}`, id: s.id, kind: "stage", status: s.status, label: s.title ?? s.id, phantom: false, agents: s.agents, inputs: s.inputs, outputs: s.outputs };
     processNodes.push(n);
     processById.set(s.id, n);
   }
   if (report.teams) {
     for (const t of report.teams) {
-      if (processById.has(t.id)) continue;
+      // CTO reports carry BOTH a derived stage entry with id `team:<id>` and
+      // a `report.teams` entry with the bare id — emitting the bare team node
+      // too would draw every team twice. The exact-id guard stays (a team
+      // whose id collides with a plain stage id must not add a node either);
+      // the derived-key guard skips the bare node when the `team:<id>` stage
+      // already represents it. Reports without the derived stage (stage ids
+      // like `team-backend`) still emit the standalone team node.
+      if (processById.has(t.id) || processById.has(`team:${t.id}`)) continue;
       const n: DiagramNode = { key: `team:${t.id}`, id: t.id, kind: "team", status: t.status, label: t.id, phantom: false };
       processNodes.push(n);
       processById.set(t.id, n);
     }
   }
+  // Collapse duplicate artifact ids into ONE deterministic node per id:
+  // several teams can declare the same artifact (commonly "dod"), and one
+  // node per entry produced stacked SVG nodes with identical typed keys.
+  // The collapsed node keeps the raw id, the worst status wins (missing
+  // stays visibly missing), and the label names the owner count.
+  const entriesById = new Map<string, ReportArtifact[]>();
   for (const a of report.artifacts) {
-    const n: DiagramNode = { key: `artifact:${a.id}`, id: a.id, kind: "artifact", status: a.status, label: a.id, phantom: false };
+    const list = entriesById.get(a.id);
+    if (list) list.push(a);
+    else entriesById.set(a.id, [a]);
+  }
+  for (const [id, entries] of entriesById) {
+    // entriesById values always hold at least the entry that created the id.
+    let status: ArtifactStatus = entries[0]!.status;
+    for (const e of entries) status = worseArtifactStatus(status, e.status);
+    const n: DiagramNode = {
+      key: `artifact:${id}`,
+      id,
+      kind: "artifact",
+      status,
+      label: artifactLabel(id, entries),
+      phantom: false,
+    };
     artifactNodes.push(n);
-    artifactById.set(a.id, n);
+    artifactById.set(id, n);
   }
 
   const resolveProcess = (id: string): DiagramNode => {
@@ -368,7 +459,7 @@ function buildDiagramModel(report: SessionReport): {
       to = resolveProcess(e.to);
     }
     if (from.key === to.key) continue; // degenerate self-loop on one diagram node
-    edges.push({ fromKey: from.key, toKey: to.key, fromId: e.from, toId: e.to, kind: e.kind });
+    edges.push({ fromKey: from.key, toKey: to.key, fromId: e.from, toId: e.to, kind: e.kind, label: e.label });
   }
 
   return { processNodes, artifactNodes, edges };
@@ -378,18 +469,55 @@ function renderDiagram(report: SessionReport): string {
   const model = buildDiagramModel(report);
   if (model.processNodes.length === 0 && model.artifactNodes.length === 0) return "";
 
-  const rows = Math.max(model.processNodes.length, model.artifactNodes.length, 1);
-  const height = DG_LAYOUT.top + (rows - 1) * DG_LAYOUT.rowH + DG_LAYOUT.nodeH + DG_LAYOUT.bottom;
+  const colCount = model.processNodes.length;
+  const colX = (i: number): number => DG_LAYOUT.padX + i * (DG_LAYOUT.colW + DG_LAYOUT.gapW);
+  const gapCenterX = (i: number): number =>
+    colCount === 0
+      ? DG_LAYOUT.padX
+      : colX(Math.min(Math.max(i, 0), colCount - 1)) + DG_LAYOUT.colW + DG_LAYOUT.gapW / 2;
 
   const pos = new Map<string, { x: number; y: number; cy: number }>();
+  const stageCy = DG_LAYOUT.top + DG_LAYOUT.colH / 2;
   model.processNodes.forEach((n, i) => {
-    const y = DG_LAYOUT.top + i * DG_LAYOUT.rowH;
-    pos.set(n.key, { x: DG_LAYOUT.padX, y, cy: y + DG_LAYOUT.nodeH / 2 });
+    pos.set(n.key, { x: colX(i), y: DG_LAYOUT.top, cy: stageCy });
   });
-  model.artifactNodes.forEach((n, i) => {
-    const y = DG_LAYOUT.top + i * DG_LAYOUT.rowH;
-    pos.set(n.key, { x: DG_LAYOUT.artX, y, cy: y + DG_LAYOUT.nodeH / 2 });
+
+  // Artifact gap = the column that produces the artifact (first produces edge),
+  // falling back to the column that consumes it, then the last column.
+  const colIndex = new Map(model.processNodes.map((n, i) => [n.key, i] as const));
+  const gapByArtifact = new Map<string, number>();
+  for (const e of model.edges) {
+    if (e.kind === "produces") {
+      const fromCol = colIndex.get(e.fromKey);
+      if (fromCol !== undefined && !gapByArtifact.has(e.toKey)) gapByArtifact.set(e.toKey, fromCol);
+    }
+  }
+  for (const e of model.edges) {
+    if (e.kind === "consumes") {
+      const toCol = colIndex.get(e.toKey);
+      if (toCol !== undefined && !gapByArtifact.has(e.fromKey)) gapByArtifact.set(e.fromKey, toCol);
+    }
+  }
+  const slotByGap = new Map<number, number>();
+  let maxSlots = 1;
+  model.artifactNodes.forEach((n) => {
+    const gap = gapByArtifact.get(n.key) ?? Math.max(colCount - 1, 0);
+    const slot = slotByGap.get(gap) ?? 0;
+    slotByGap.set(gap, slot + 1);
+    maxSlots = Math.max(maxSlots, slot + 1);
+    const x = colCount === 0 ? DG_LAYOUT.padX : gapCenterX(gap) - DG_LAYOUT.artW / 2;
+    const y = DG_LAYOUT.top + 4 + slot * DG_LAYOUT.artStep;
+    pos.set(n.key, { x, y, cy: y + DG_LAYOUT.artH / 2 });
   });
+
+  const width =
+    colCount === 0
+      ? DG_LAYOUT.padX + DG_LAYOUT.artW + DG_LAYOUT.padX
+      : DG_LAYOUT.padX + colCount * (DG_LAYOUT.colW + DG_LAYOUT.gapW) + DG_LAYOUT.padX;
+  const height = Math.max(
+    DG_LAYOUT.top + DG_LAYOUT.colH + DG_LAYOUT.bottom,
+    DG_LAYOUT.top + 4 + (maxSlots - 1) * DG_LAYOUT.artStep + DG_LAYOUT.artH + DG_LAYOUT.bottom,
+  );
 
   const edgeHtml = model.edges
     .map((e, i) => {
@@ -398,25 +526,23 @@ function renderDiagram(report: SessionReport): string {
       if (!p1 || !p2) return "";
       const fromArtifact = e.fromKey.startsWith("artifact:");
       const toArtifact = e.toKey.startsWith("artifact:");
-      let d: string;
-      let labelX: number;
-      if (fromArtifact && !toArtifact) {
-        // consumes: artifact (right lane) → process (left lane), bows through the gap
-        d = `M ${p1.x} ${p1.cy} C ${p1.x - 30} ${p1.cy} ${p2.x + DG_LAYOUT.nodeW + 30} ${p2.cy} ${p2.x + DG_LAYOUT.nodeW} ${p2.cy}`;
-        labelX = DG_LAYOUT.gapMid;
-      } else if (!fromArtifact && toArtifact) {
-        // produces: process (left lane) → artifact (right lane), bows through the gap
-        d = `M ${p1.x + DG_LAYOUT.nodeW} ${p1.cy} C ${p1.x + DG_LAYOUT.nodeW + 50} ${p1.cy} ${p2.x - 50} ${p2.cy} ${p2.x} ${p2.cy}`;
-        labelX = DG_LAYOUT.gapMid;
-      } else {
-        // process → process: bow left of the lane so transition flows never cross artifact edges
-        d = `M ${p1.x} ${p1.cy} C ${p1.x - 46} ${p1.cy} ${p2.x - 46} ${p2.cy} ${p2.x} ${p2.cy}`;
-        labelX = DG_LAYOUT.padX - 34;
-      }
-      const labelY = (p1.cy + p2.cy) / 2 - 3;
+      const x1 = p1.x + (fromArtifact ? DG_LAYOUT.artW : DG_LAYOUT.colW);
+      const y1 = p1.cy;
+      const x2 = p2.x;
+      const y2 = p2.cy;
+      const backward = x2 <= x1 + 2;
+      const d = backward
+        ? `M ${x1} ${y1} C ${x1 + 64} ${y1 + 90} ${x2 - 64} ${y2 + 90} ${x2} ${y2}`
+        : `M ${x1} ${y1} C ${x1 + 48} ${y1} ${x2 - 48} ${y2} ${x2} ${y2}`;
+      const labelX = Math.round((x1 + x2) / 2);
+      const labelY = backward ? Math.max(y1, y2) + 48 : Math.round((y1 + y2) / 2) - 4;
       const color = DG_EDGE_COLOR[e.kind] ?? "gray";
       const kindLabel = EDGE_LABELS[e.kind] ?? e.kind;
-      return `<g class="dg-edge kind-${esc(e.kind)}" data-edge data-edge-key="e${i}" data-from="${esc(e.fromId)}" data-to="${esc(e.toId)}" data-from-key="${esc(e.fromKey)}" data-to-key="${esc(e.toKey)}"><path class="dg-edge-path" d="${esc(d)}" marker-end="url(#arr-${color})"/><text class="dg-edge-label" x="${labelX}" y="${labelY}">${esc(kindLabel)}</text></g>`;
+      // Artifact-carrying edges label the artifact id ("produces: plan",
+      // "consumes: team_plan"); other edges keep the kind (and any label).
+      const carried = e.kind === "produces" ? e.toId : e.kind === "consumes" ? e.fromId : undefined;
+      const labelText = carried !== undefined ? `${kindLabel}: ${carried}` : e.label ? `${kindLabel}: ${e.label}` : kindLabel;
+      return `<g class="dg-edge kind-${esc(e.kind)}" data-edge data-edge-key="e${i}" data-from="${esc(e.fromId)}" data-to="${esc(e.toId)}" data-from-key="${esc(e.fromKey)}" data-to-key="${esc(e.toKey)}"><path class="dg-edge-path" d="${esc(d)}" marker-end="url(#arr-${color})"/><text class="dg-edge-label" x="${labelX}" y="${labelY}">${esc(labelText)}</text></g>`;
     })
     .join("");
 
@@ -425,9 +551,18 @@ function renderDiagram(report: SessionReport): string {
     .map((n) => {
       const p = pos.get(n.key);
       if (!p) return "";
-      const x = n.kind === "artifact" ? DG_LAYOUT.artX : DG_LAYOUT.padX;
+      const isArtifact = n.kind === "artifact";
+      const w = isArtifact ? DG_LAYOUT.artW : DG_LAYOUT.colW;
+      const h = isArtifact ? DG_LAYOUT.artH : DG_LAYOUT.colH;
+      const rx = isArtifact ? 6 : 8;
       const phantom = n.phantom ? " dg-phantom" : "";
-      return `<g class="dg-node ${statusClass(n.status)}${phantom}" data-node-key="${esc(n.key)}" data-node-id="${esc(n.id)}" data-status="${esc(n.status)}" data-diagram-type="${esc(n.kind)}" role="button" tabindex="0" aria-label="${esc(`${n.kind} ${n.id}, ${statusLabel(n.status)}`)}"><title>${esc(n.label)}</title><rect class="dg-node-box" x="${x}" y="${p.y}" width="${DG_LAYOUT.nodeW}" height="${DG_LAYOUT.nodeH}" rx="8"/><text class="dg-node-title" x="${x + 12}" y="${p.y + 22}">${esc(n.label)}</text><text class="dg-node-status" x="${x + 12}" y="${p.y + 40}">${esc(statusLabel(n.status))}</text><rect class="dg-node-focus" x="${x}" y="${p.y}" width="${DG_LAYOUT.nodeW}" height="${DG_LAYOUT.nodeH}" rx="8" fill="none"/></g>`;
+      const lines: string[] = [];
+      if (n.kind === "stage") {
+        lines.push(`<text class="dg-node-line" x="${p.x + 12}" y="${p.y + 52}">${esc(`agents: ${agentSummary(n.agents)}`)}</text>`);
+        if (n.inputs && n.inputs.length) lines.push(`<text class="dg-node-line" x="${p.x + 12}" y="${p.y + 68}">${esc(`in: ${n.inputs.join(", ")}`)}</text>`);
+        if (n.outputs && n.outputs.length) lines.push(`<text class="dg-node-line" x="${p.x + 12}" y="${p.y + 84}">${esc(`out: ${n.outputs.join(", ")}`)}</text>`);
+      }
+      return `<g class="dg-node ${statusClass(n.status)}${phantom}" data-node-key="${esc(n.key)}" data-node-id="${esc(n.id)}" data-status="${esc(n.status)}" data-diagram-type="${esc(n.kind)}" role="button" tabindex="0" aria-label="${esc(`${n.kind} ${n.id}, ${statusLabel(n.status)}`)}"><title>${esc(n.label)}</title><rect class="dg-node-box" x="${p.x}" y="${p.y}" width="${w}" height="${h}" rx="${rx}"/><text class="dg-node-title" x="${p.x + 12}" y="${p.y + (isArtifact ? 17 : 18)}">${esc(n.label)}</text><text class="dg-node-status" x="${p.x + 12}" y="${p.y + (isArtifact ? 32 : 34)}">${esc(statusLabel(n.status))}</text>${lines.join("")}<rect class="dg-node-focus" x="${p.x}" y="${p.y}" width="${w}" height="${h}" rx="${rx}" fill="none"/></g>`;
     })
     .join("");
 
@@ -449,7 +584,7 @@ function renderDiagram(report: SessionReport): string {
     `</span>` +
     `</div>` +
     `<div class="diagram-scroll" id="omp-diagram-scroll">` +
-    `<svg id="omp-diagram-svg" viewBox="0 0 ${DG_LAYOUT.width} ${height}" role="img" aria-label="${esc(ariaLabel)}">` +
+    `<svg id="omp-diagram-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(ariaLabel)}">` +
     DG_MARKERS +
     (edgeHtml ? `<g class="dg-edges">${edgeHtml}</g>` : "") +
     `<g class="dg-nodes">${nodeHtml}</g>` +
@@ -590,17 +725,28 @@ const APP_SCRIPT = `<script>
   var svgEdges = document.querySelectorAll("[data-edge-key]");
   var artifacts = document.querySelectorAll("[data-owner]");
 
+  // Cross-highlight alias: a CTO derived team stage carries the raw id
+  // "team:<id>" while its report.teams detail card (and any bare "<id>"
+  // diagram node) uses the bare id — clicking either must select/highlight
+  // both. Exact ids always match; "team:<id>" and "<id>" match each other
+  // for selection/highlight only. Typed data-node-key values are never
+  // compared through this helper, so same-id stage/artifact nodes stay
+  // distinct.
+  function sameNodeId(a, b) {
+    return a === b || a === "team:" + b || b === "team:" + a;
+  }
+
   function applyActive(id, keys, active) {
     nodes.forEach(function (n) {
-      if (n.getAttribute("data-node-id") === id) n.classList.toggle("sel", active);
+      if (sameNodeId(n.getAttribute("data-node-id"), id)) n.classList.toggle("sel", active);
     });
     artifacts.forEach(function (a) {
-      if (a.getAttribute("data-owner") === id) a.classList.toggle("hl", active);
+      if (sameNodeId(a.getAttribute("data-owner"), id)) a.classList.toggle("hl", active);
     });
     edges.forEach(function (e) {
       var f = e.getAttribute("data-from");
       var t = e.getAttribute("data-to");
-      if (f === id || t === id) e.classList.toggle("hl", active);
+      if (sameNodeId(f, id) || sameNodeId(t, id)) e.classList.toggle("hl", active);
     });
     if (keys && keys.length) {
       svgEdges.forEach(function (e) {
@@ -616,7 +762,7 @@ const APP_SCRIPT = `<script>
   function keysForId(id) {
     var keys = [];
     svgNodes.forEach(function (n) {
-      if (n.getAttribute("data-node-id") === id) keys.push(n.getAttribute("data-node-key"));
+      if (sameNodeId(n.getAttribute("data-node-id"), id)) keys.push(n.getAttribute("data-node-key"));
     });
     return keys;
   }
@@ -784,7 +930,7 @@ section.section { background: var(--card); border: 1px solid var(--line); border
 .st-active .node-dot { background: var(--accent); }
 .st-parked .node-dot { background: var(--amber); }
 .st-failed .node-dot { background: var(--err); }
-.node-meta, .node-time, .node-scope { color: var(--muted); font-size: 12px; margin-top: 4px; word-break: break-word; }
+.node-meta, .node-time, .node-scope, .node-agents, .node-io { color: var(--muted); font-size: 12px; margin-top: 4px; word-break: break-word; }
 .node-detail { margin-top: 6px; font-size: 13px; }
 .team-list { margin-top: 12px; }
 
@@ -833,6 +979,7 @@ section.section { background: var(--card); border: 1px solid var(--line); border
 .dg-node:focus-visible .dg-node-focus { stroke: var(--accent); }
 .dg-node-title { fill: var(--ink); font-size: 13px; font-weight: 600; }
 .dg-node-status { fill: var(--muted); font-size: 11px; }
+.dg-node-line { fill: #475467; font-size: 10px; }
 
 .dg-edge-path { fill: none; stroke-width: 1.6; opacity: .95; }
 .dg-edge.kind-produces .dg-edge-path { stroke: var(--ok); }
