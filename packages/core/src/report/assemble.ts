@@ -258,6 +258,52 @@ function stageProfileMeta(
   };
 }
 
+const STAGE_PROMPT_PREVIEW_MAX_CHARS = 4096;
+// Task text is the largest variable in a preview: clip it before the
+// stage-specific lines are appended so a multi-KB task cannot crowd the
+// agents/inputs/outputs/checkpoint/gate/autonomous metadata past the cap.
+const STAGE_PROMPT_TASK_MAX_CHARS = 1024;
+
+/** Clip `text` to at most `max` chars; the `…` marker counts toward `max`. */
+function clipTo(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/**
+ * Bounded, deterministic reconstruction of the shape of a stage prompt.
+ * This is explicitly NOT the literal runtime prompt — per-stage task text is
+ * generated dynamically by the agent run and is never persisted, so the
+ * preview is assembled only from persisted metadata: the stage definition
+ * (title/id/type, declared input/output ids, checkpoint/gate/autonomous),
+ * the session task, and truthful resolved agent/role provenance. Raw
+ * artifact JSON, event/transcript data, tool arguments, and secrets are
+ * never interpolated. Roles that remain unresolved `${scope.*}` templates
+ * are omitted (the caller passes the same roster `stageAgents` resolved, so
+ * no resolved agent is ever claimed where no scope evidence exists).
+ */
+function stagePromptPreview(def: StageDef, task: string, agents: StageAgentInfo[] | undefined): string {
+  const lines = [`${def.title} [${def.id}] type: ${def.type}`];
+  if (task) lines.push(`task: ${clipTo(task, STAGE_PROMPT_TASK_MAX_CHARS)}`);
+  if (agents && agents.length > 0) {
+    lines.push(
+      `agents: ${agents
+        .map((a) => (a.role && a.role !== a.name ? `${a.role} -> ${a.name}` : a.name))
+        .join(", ")}`,
+    );
+  }
+  const consumes = asList(def.consumes);
+  if (consumes.length > 0) lines.push(`inputs: ${consumes.join(", ")}`);
+  const produces = asList(def.produces);
+  if (produces.length > 0) lines.push(`outputs: ${produces.join(", ")}`);
+  if (def.checkpoint) lines.push(`checkpoint: ${def.checkpoint}`);
+  if (def.gate) lines.push(`gate: ${def.gate}`);
+  if (def.autonomous) lines.push(`autonomous: ${def.autonomous}`);
+  const text = lines.join("\n");
+  // Strict final cap: the `…` marker is counted inside the budget, so the
+  // preview never exceeds STAGE_PROMPT_PREVIEW_MAX_CHARS characters.
+  return clipTo(text, STAGE_PROMPT_PREVIEW_MAX_CHARS);
+}
+
 /**
  * Provenance for a profile stage. `source` is always "workflow": the entry
  * is derived from the loaded profile + resolved role config. Runtime
@@ -389,6 +435,7 @@ function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionRep
       // Declared artifact ids are preserved even when files are missing;
       // custom/legacy stages (no def) keep the fields absent.
       ...stageProfileMeta(def),
+      ...(def ? { promptPreview: stagePromptPreview(def, state.task, agents) } : {}),
       ...(def ? { inputs: [...(def.consumes ?? [])] } : {}),
       ...(def ? { outputs: asList(def.produces) } : {}),
       ...(agents ? { agents } : {}),
@@ -531,6 +578,7 @@ function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOpt
       type: def.type,
       at: teamEventTimes.get(def.id) ?? state.updated_at,
       ...stageProfileMeta(def),
+      promptPreview: stagePromptPreview(def, state.task, agents),
       inputs: [...(def.consumes ?? [])],
       outputs: asList(def.produces),
       ...(agents ? { agents } : {}),

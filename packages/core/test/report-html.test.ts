@@ -716,6 +716,8 @@ function stageDetailsReport(): SessionReport {
         checkpoint: "checkpoint-a",
         gate: "gate-a",
         autonomous: "autonomous run",
+        promptPreview:
+          'Plan the <b>work</b> with a <script>alert("xss")</script> marker\nline two: & < > " \'</details>',
         agents: [{ name: "main session", role: "orchestrator", source: "workflow" }],
         inputs: ["oauth-plan", "ghost-input"],
         outputs: ["oauth-plan", "missing-artifact"],
@@ -854,6 +856,74 @@ test("renderer: stage details stay escaped, offline, and do not disturb graph in
   const script = /<script>\n\(function \(\) \{[\s\S]*?\n\}\)\(\);\n<\/script>/.exec(html)?.[0] ?? "";
   assert.ok(script.includes('querySelectorAll(".stage-details")'), "script wires stage-details elements");
   assert.ok(script.includes("ev.stopPropagation()"), "disclosure clicks/keydown stop before the card toggle");
+});
+
+test("renderer: prompt preview renders as a collapsed nested disclosure inside stage details", () => {
+  const html = renderReportHtml(stageDetailsReport());
+  const planning = /<article class="node[^>]*data-node-id="planning"[\s\S]*?<\/article>/.exec(html)?.[0] ?? "";
+
+  // Nested details, collapsed by default, labeled as reconstructed — never the runtime prompt.
+  assert.ok(planning.includes('<details class="prompt-preview">'), "nested preview disclosure present for stages with the field");
+  assert.ok(!/<details class="prompt-preview"[^>]*open/.test(planning), "nested preview starts collapsed (no open attribute)");
+  assert.ok(
+    planning.includes("<summary>Show reconstructed prompt preview (not the original runtime prompt)</summary>"),
+    "summary names the reconstructed preview and flags it is not the original runtime prompt",
+  );
+
+  // Lives inside the outer stage-details disclosure, after the rows, before the article ends.
+  assert.ok(
+    planning.indexOf('<details class="prompt-preview">') > planning.indexOf('<details class="stage-details">'),
+    "nested preview sits inside the outer stage-details disclosure",
+  );
+  assert.ok(
+    planning.indexOf("</details>") > planning.indexOf("<pre>"),
+    "nested preview opens before the outer disclosure closes",
+  );
+  assert.ok(planning.endsWith("</details></article>"), "nested preview closes before the outer disclosure/article");
+
+  // Never inside the SVG diagram.
+  const svg = /<svg id="omp-diagram-svg"[\s\S]*?<\/svg>/.exec(html)?.[0] ?? "";
+  assert.ok(!svg.includes("prompt-preview"), "no prompt preview inside the svg diagram");
+
+  // Compact CSS for the nested preview ships in the inline stylesheet.
+  assert.ok(html.includes(".prompt-preview { margin-top: 6px; }"), "compact preview CSS emitted without changing card density");
+  assert.ok(html.includes(".prompt-preview pre {"), "preview pre styling emitted");
+  assert.ok(html.includes("max-height: 320px"), "bounded preview scroll height");
+  assert.ok(html.includes("white-space: pre-wrap; word-break: break-word;"), "preview text wraps instead of overflowing");
+});
+
+test("renderer: prompt preview content is escaped and preserves line breaks in a pre", () => {
+  const html = renderReportHtml(stageDetailsReport());
+  const planning = /<article class="node[^>]*data-node-id="planning"[\s\S]*?<\/article>/.exec(html)?.[0] ?? "";
+  const pre = /<pre>([\s\S]*?)<\/pre>/.exec(planning)?.[1] ?? "";
+  assert.ok(pre.length > 0, "preview body is a pre element");
+  assert.ok(pre.includes("&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;"), "script payload escaped");
+  assert.ok(pre.includes("line two: &amp; &lt; &gt; &quot; &#39;"), "entities escaped");
+  assert.ok(pre.includes("&lt;/details&gt;"), "closing-details payload escaped");
+  assert.ok(!pre.includes("<script>"), "no raw script tag inside the preview");
+  assert.ok(!pre.includes("</details>"), "escaped preview text cannot forge a closing details tag");
+  assert.ok(pre.includes("marker\nline two"), "line breaks preserved verbatim in the pre");
+});
+
+test("renderer: stages without promptPreview emit no nested preview", () => {
+  const html = renderReportHtml(stageDetailsReport());
+  const impl = /<article class="node[^>]*data-node-id="implementation"[\s\S]*?<\/article>/.exec(html)?.[0] ?? "";
+  assert.ok(!impl.includes("prompt-preview"), "profile-less/custom stage without the field has no preview disclosure");
+  assert.ok(!impl.includes("reconstructed prompt preview"), "no reconstructed label for stages without the field");
+  assert.equal(
+    (html.match(/<details class="prompt-preview">/g) ?? []).length,
+    1,
+    "only the stage carrying promptPreview renders a nested preview",
+  );
+});
+
+test("renderer: prompt preview adds no raw script payload or external references", () => {
+  const html = renderReportHtml(stageDetailsReport());
+  assert.ok(!html.includes("<script>alert"), "preview script payload stays escaped");
+  assert.ok(!html.includes('src="'), "no src attributes anywhere");
+  assert.ok(!html.includes("fetch("), "no fetch calls");
+  assert.ok(!html.includes("<link"), "no <link> elements");
+  assert.ok(!/href="https?:/.test(html), "no external hrefs");
 });
 
 test("renderer: report without a derived team: stage still emits the standalone team node", () => {

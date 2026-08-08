@@ -109,6 +109,17 @@ export interface StageInfo {
   gate?: string;
   /** Autonomous branch decision text from the workflow profile (checkpoint auto-decision). */
   autonomous?: string;
+  /**
+   * Bounded, RECONSTRUCTED preview of the stage prompt — NEVER the literal
+   * runtime prompt (per-stage task text is generated dynamically by the
+   * agent run and is not persisted). Assembled deterministically from the
+   * persisted stage definition (title/id/type, declared inputs/outputs,
+   * checkpoint/gate/autonomous), the session task, and truthful resolved
+   * agent/role provenance only. Never contains raw artifact JSON, event or
+   * transcript data, tool arguments, or secrets. Absent for custom/legacy
+   * stages and derived stages without a StageDef.
+   */
+  promptPreview?: string;
 }
 
 export type EdgeKind = "produces" | "consumes" | "depends_on" | "integration" | "transition";

@@ -674,6 +674,98 @@ test("do-work: unresolved ${scope.dev_agent} template roles are omitted, inputs/
   }
 });
 
+test("do-work: profile-backed stages carry a bounded reconstructed promptPreview; custom stages omit it", () => {
+  const cwd = tmpWorkspace();
+  try {
+    const state = makeTeamState();
+    writeFeature(cwd, "session-report", state);
+    const artifactsDir = join(cwd, ".work-state", "features", "session-report", "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    writeFileSync(
+      join(artifactsDir, "implementation.json"),
+      JSON.stringify({ type: "implementation", title: "Impl plan", notes: "x" }, null, 2),
+    );
+
+    const report = buildSessionReport(cwd, { kind: "do-work" });
+
+    // Representative preview: title/id/type, session task, resolved
+    // agent/role, declared inputs/outputs, and profile metadata.
+    const qa = report.stages.find((s) => s.id === "qa_tests");
+    assert.ok(qa?.promptPreview, "profile-backed stage carries a preview");
+    assert.ok(qa.promptPreview!.includes("Automated Tests [qa_tests] type: single"), "title/id/type head line");
+    assert.ok(qa.promptPreview!.includes("task: Build the session report"), "session task present");
+    assert.ok(qa.promptPreview!.includes("agents: qa"), "resolved agent/role present");
+    assert.ok(qa.promptPreview!.includes("inputs: manual_qa, implementation, architecture"), "declared inputs");
+    assert.ok(qa.promptPreview!.includes("outputs: qa_tests"), "declared outputs");
+    assert.ok(qa.promptPreview!.includes("gate: manual_qa.verdict == PASS"), "profile gate metadata");
+    assert.ok(qa.promptPreview!.length <= 4096, "normal-size preview stays within the strict cap");
+
+    // Consilium: every resolved roster role is listed with its original role.
+    const arch = report.stages.find((s) => s.id === "architecture");
+    assert.ok(
+      arch?.promptPreview?.includes("agents: architect_minimal -> architect, architect_clean -> architect, architect_pragmatic -> architect"),
+      "consilium roster shown role -> agent",
+    );
+    assert.ok(arch.promptPreview!.includes("checkpoint: user_choice"), "checkpoint metadata");
+
+    // Orchestrator stages report the truthful main-session descriptor.
+    const summary = report.stages.find((s) => s.id === "summary");
+    assert.ok(summary?.promptPreview?.includes("orchestrator -> main session"), "truthful orchestrator descriptor");
+
+    // Unresolved ${scope.dev_agent} template: no agent claim in the preview,
+    // but declared inputs/outputs and metadata stay.
+    const impl = report.stages.find((s) => s.id === "implementation");
+    assert.ok(impl?.promptPreview, "def-backed stage still gets a preview");
+    assert.ok(!impl.promptPreview!.includes("agents:"), "no agent claim without scope evidence");
+    assert.ok(!impl.promptPreview!.includes("${"), "no template placeholder leaks into the preview");
+    assert.ok(impl.promptPreview!.includes("inputs: architecture, exploration"), "inputs survive without roster");
+    assert.ok(impl.promptPreview!.includes("outputs: implementation"), "outputs survive without roster");
+
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("do-work: promptPreview never contains raw artifact JSON/body markers, and stays bounded", () => {
+  const cwd = tmpWorkspace();
+  try {
+    const tailMarker = "UNIQUE-TRUNCATION-TAIL-MARKER";
+    const state = makeTeamState({ task: `prefix ${"x".repeat(12000)} ${tailMarker}` });
+    writeFeature(cwd, "session-report", state);
+    const artifactsDir = join(cwd, ".work-state", "features", "session-report", "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    writeFileSync(
+      join(artifactsDir, "implementation.json"),
+      JSON.stringify({ type: "implementation", title: "Impl plan", notes: "x" }, null, 2),
+    );
+
+    const report = buildSessionReport(cwd, { kind: "do-work" });
+
+    for (const s of report.stages) {
+      const p = s.promptPreview;
+      if (!p) continue;
+      // Bounded: an oversized session task is truncated, never embedded whole.
+      assert.ok(!p.includes(tailMarker), `${s.id}: oversized task text is truncated`);
+      // Strict cap: the preview including its `…` marker never exceeds 4096.
+      assert.ok(p.length <= 4096, `${s.id}: preview length ${p.length} <= 4096`);
+      // Stage metadata survives: the task line is clipped first, so at least
+      // one stage-specific line stays present behind a 12k task string.
+      assert.ok(
+        /(outputs:|gate:|checkpoint:|autonomous:|inputs:|agents:)/.test(p),
+        `${s.id}: stage-specific metadata survives an oversized task`,
+      );
+      // No raw artifact JSON / body markers — artifact ids are fine, content is not.
+      assert.ok(!p.includes('"title":'), `${s.id}: no artifact JSON key markers`);
+      assert.ok(!p.includes("Impl plan"), `${s.id}: no artifact body content`);
+      assert.ok(!p.includes("notes:"), `${s.id}: no artifact body field`);
+      // No transcript/event data markers.
+      assert.ok(!p.includes("stage_transition") && !p.includes("artifact_written"), `${s.id}: no event kinds`);
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("do-work: custom/unknown workflow falls back safely — provenance fields absent, no throw", () => {
   const cwd = tmpWorkspace();
   try {
@@ -694,6 +786,7 @@ test("do-work: custom/unknown workflow falls back safely — provenance fields a
     assert.equal(impl?.checkpoint, undefined, "no profile def → checkpoint absent");
     assert.equal(impl?.gate, undefined, "no profile def → gate absent");
     assert.equal(impl?.autonomous, undefined, "no profile def → autonomous absent");
+    assert.equal(impl?.promptPreview, undefined, "no profile def → reconstructed prompt preview absent");
     // No profile → ordinal transition spine, still a valid report.
     assert.ok(report.edges.some((e) => e.kind === "transition"));
   } finally {

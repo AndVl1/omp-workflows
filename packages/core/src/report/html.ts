@@ -25,6 +25,10 @@
  *     artifact card), and — for CTO team stages — the linked team record
  *     (scope/slice/profile/worktree/dependencies/escalations). Full artifact
  *     bodies stay opt-in behind `--full`; nothing is embedded here.
+ *   - Stage cards may additionally carry a nested collapsed disclosure with
+ *     the stage's reconstructed prompt preview (StageInfo.promptPreview): an
+ *     explicitly labeled, bounded approximation — never the literal runtime
+ *     prompt — rendered escaped in a line-preserving <pre>.
  *
  * Safety:
  *   - Static text is HTML-escaped (esc).
@@ -286,7 +290,14 @@ function renderStageNode(s: SessionReport["stages"][number], derived: boolean, r
 //     when the id resolves to a recorded artifact),
 //   - for CTO team stages, the linked report.teams record (scope, slice,
 //     profile, worktree, dependencies, escalations) without duplicating the
-//     full teams section.
+//     full teams section,
+//   - when the assembler attached one (StageInfo.promptPreview): a nested
+//     collapsed disclosure labeled "Show reconstructed prompt preview (not
+//     the original runtime prompt)" holding the escaped, line-preserving
+//     preview in a <pre>. It is an explicitly labeled approximation built
+//     only from persisted task/profile metadata and artifact ids — never the
+//     literal runtime prompt — and is absent for custom/legacy stages and
+//     derived CTO stages without a StageDef.
 // All values are HTML-escaped; full artifact bodies stay behind `--full`
 // (artifact-body disclosure) and are never embedded here.
 
@@ -326,7 +337,17 @@ function renderStageDetails(s: SessionReport["stages"][number], report: SessionR
   if (s.inputs?.length) pushRow("Inputs", s.inputs.map((id) => artifactSummaryHtml(id, report)).join(" "));
   if (s.outputs?.length) pushRow("Outputs", s.outputs.map((id) => artifactSummaryHtml(id, report)).join(" "));
 
-  return `<details class="stage-details"><summary>Show stage details</summary><dl>${rows.join("")}</dl></details>`;
+  // Optional reconstructed prompt preview (shared StageInfo contract): a
+  // bounded approximation built from persisted task/profile metadata and
+  // artifact ids — never the literal runtime prompt (that text is generated
+  // per-turn and not persisted). Rendered only when the assembler attached
+  // one; starts collapsed so it adds no height to the compact card, and the
+  // escaped <pre> preserves the preview's line breaks.
+  const preview = s.promptPreview
+    ? `<details class="prompt-preview"><summary>Show reconstructed prompt preview (not the original runtime prompt)</summary><pre>${esc(s.promptPreview)}</pre></details>`
+    : "";
+
+  return `<details class="stage-details"><summary>Show stage details</summary><dl>${rows.join("")}</dl>${preview}</details>`;
 }
 
 /**
@@ -1056,6 +1077,19 @@ section.section { background: var(--card); border: 1px solid var(--line); border
 .sd-artifact-summary { font-size: 12px; }
 .artifact-link { color: var(--accent); font-size: 11px; text-decoration: none; }
 .artifact-link:hover { text-decoration: underline; }
+
+/* nested reconstructed prompt preview (collapsed by default: summary line only) */
+.prompt-preview { margin-top: 6px; }
+.prompt-preview > summary { cursor: pointer; color: var(--accent); font-size: 12px; font-weight: 600; }
+.prompt-preview > summary::marker { color: var(--muted); }
+.prompt-preview > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.prompt-preview pre {
+  margin: 8px 0 0; padding: 10px; background: #fafbfc; color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+  max-height: 320px; overflow-y: auto;
+}
 
 /* edges */
 .edge-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }

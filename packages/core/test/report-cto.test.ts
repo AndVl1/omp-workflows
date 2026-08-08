@@ -315,6 +315,55 @@ test("cto: workflow stages carry profile agents/inputs/outputs; team stages carr
   }
 });
 
+test("cto: profile-backed workflow stages carry a reconstructed promptPreview; derived team stages omit it", () => {
+  const cwd = tmpWorkspace();
+  try {
+    writeRun(cwd, makeCtoState());
+
+    const report = buildSessionReport(cwd, { kind: "cto" });
+
+    // Representative orchestrator stage: title/id/type, session task,
+    // truthful main-session descriptor, declared outputs + profile metadata.
+    const discovery = report.stages.find((s) => s.id === "cto_discovery");
+    assert.ok(discovery?.promptPreview, "profile-backed CTO stage carries a preview");
+    assert.ok(discovery.promptPreview!.includes("CTO Discovery [cto_discovery] type: orchestrator"), "title/id/type head line");
+    assert.ok(discovery.promptPreview!.includes("task: Build the report feature"), "session task present");
+    assert.ok(discovery.promptPreview!.includes("agents: orchestrator -> main session"), "truthful orchestrator descriptor");
+    assert.ok(discovery.promptPreview!.includes("outputs: cto_discovery"), "declared outputs");
+    assert.ok(discovery.promptPreview!.includes("checkpoint: confirm_understanding"), "checkpoint metadata");
+    assert.ok(discovery.promptPreview!.includes("gate: branch_created"), "gate metadata");
+    assert.ok(discovery.promptPreview!.includes("autonomous: log confirmed understanding, continue"), "autonomous metadata");
+
+    // Single role stage: resolved agent + declared inputs/outputs.
+    const arch = report.stages.find((s) => s.id === "architecture");
+    assert.ok(arch?.promptPreview?.includes("agents: architect"), "resolved agent present");
+    assert.ok(arch.promptPreview!.includes("inputs: team_plan"), "declared inputs");
+    assert.ok(arch.promptPreview!.includes("outputs: architecture"), "declared outputs");
+
+    // The `teams` stage declares inputs/outputs but has no role roster —
+    // the preview carries no agent claim for the phase.
+    const teams = report.stages.find((s) => s.id === "teams");
+    assert.ok(teams?.promptPreview, "def-backed teams stage still gets a preview");
+    assert.ok(!teams.promptPreview!.includes("agents:"), "no invented agent for the team phase");
+
+    // Derived team stages have no StageDef → no preview.
+    for (const teamId of ["alpha", "beta"]) {
+      const team = report.stages.find((s) => s.id === `team:${teamId}`);
+      assert.equal(team?.promptPreview, undefined, `derived team:${teamId} stage omits the preview`);
+    }
+
+    // No raw artifact JSON / transcript / event markers anywhere.
+    for (const s of report.stages) {
+      const p = s.promptPreview;
+      if (!p) continue;
+      assert.ok(!p.includes('"title":'), `${s.id}: no artifact JSON key markers`);
+      assert.ok(!p.includes("stage_transition") && !p.includes("artifact_written"), `${s.id}: no event kinds`);
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("cto: without a teams.json registry, team stages claim no lead (never invented)", () => {
   const cwd = tmpWorkspace();
   try {
@@ -326,6 +375,7 @@ test("cto: without a teams.json registry, team stages claim no lead (never inven
     assert.equal(alpha?.agents, undefined, "no registry entry → no invented lead/model");
     assert.equal(alpha?.inputs, undefined, "team stages are derived, not def-backed → no input claim");
     assert.equal(alpha?.outputs, undefined);
+    assert.equal(alpha?.promptPreview, undefined, "derived team stages have no StageDef → no preview");
     // Existing fields still intact.
     assert.equal(alpha?.status, "done");
     assert.equal(alpha?.team, "alpha");
