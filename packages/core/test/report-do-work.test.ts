@@ -138,6 +138,54 @@ test("do-work: produced / missing / skipped artifacts are distinct, extras scann
   }
 });
 
+test("do-work: state.artifacts refs resolve against .work-state; absolute and explicit forms preserved, escapes rejected", () => {
+  const cwd = tmpWorkspace();
+  try {
+    const slug = "session-report";
+    const artifactsDir = join(cwd, ".work-state", "features", slug, "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    // Real persisted layout: files under .work-state/features/<slug>/artifacts/,
+    // state.json stamps them as state-relative refs (no .work-state/ prefix).
+    writeFileSync(
+      join(artifactsDir, "implementation.json"),
+      JSON.stringify({ type: "implementation", title: "Impl plan" }, null, 2),
+    );
+    writeFileSync(
+      join(artifactsDir, "exploration.json"),
+      JSON.stringify({ type: "exploration", title: "Explore" }, null, 2),
+    );
+    writeFileSync(join(artifactsDir, "dod.json"), JSON.stringify({ type: "dod", items: [] }, null, 2));
+
+    const state = makeTeamState({
+      artifacts: {
+        implementation: `features/${slug}/artifacts/implementation.json`, // state-relative (per-feature layout)
+        exploration: `.work-state/features/${slug}/artifacts/exploration.json`, // explicit .work-state path
+        dod: join(artifactsDir, "dod.json"), // absolute path preserved
+        architecture: "../escaped.json", // escapes .work-state → rejected, never read
+      },
+    });
+    writeFeature(cwd, slug, state);
+
+    const report = buildSessionReport(cwd, { kind: "do-work", id: slug });
+
+    const impl = report.artifacts.find((a) => a.id === "implementation");
+    assert.equal(impl?.status, "produced");
+    assert.equal(impl?.path, join(artifactsDir, "implementation.json"));
+
+    const exploration = report.artifacts.find((a) => a.id === "exploration");
+    assert.equal(exploration?.status, "produced");
+
+    const dod = report.artifacts.find((a) => a.id === "dod");
+    assert.equal(dod?.status, "produced");
+
+    const escaped = report.artifacts.find((a) => a.id === "architecture");
+    assert.equal(escaped?.status, "missing");
+    assert.equal(escaped?.summary, "not produced");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("do-work: includeFullArtifacts embeds redacted, byte-capped bodies; default omits them", () => {
   const cwd = tmpWorkspace();
   try {

@@ -687,8 +687,31 @@ function buildArtifact(
 
 function artifactFilePath(cwd: string, r: DoWorkResolved, artifactId: string): string | null {
   const mapped = r.state.artifacts?.[artifactId];
-  if (mapped) return resolve(cwd, mapped);
+  if (mapped) return resolveArtifactPath(cwd, mapped);
   return join(r.artifactsDir, `${artifactId}.json`);
+}
+
+/**
+ * Resolve a persisted artifact reference from `TeamState.artifacts`.
+ *
+ * The do-work orchestration stamps state-relative refs
+ * (`features/<slug>/artifacts/<id>.json`, `artifacts/<id>.json`) rooted at
+ * `.work-state` — the engine's per-feature layout (`writeState`). Accepted:
+ * - absolute paths — kept as-is;
+ * - `.work-state/…` — cwd-relative (CTO `dod_path` / legacy-root style);
+ * - any other relative form — resolved against `.work-state`.
+ * References escaping `.work-state` (e.g. `../../…`) are rejected (null).
+ */
+function resolveArtifactPath(cwd: string, ref: string): string | null {
+  if (isAbsolute(ref)) return ref;
+  if (ref === WORK_STATE_DIR || ref.startsWith(`${WORK_STATE_DIR}/`) || ref.startsWith(`${WORK_STATE_DIR}${sep}`)) {
+    return resolve(cwd, ref);
+  }
+  const wsRoot = resolve(cwd, WORK_STATE_DIR);
+  const candidate = resolve(wsRoot, ref);
+  const rel = relative(wsRoot, candidate);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+  return candidate;
 }
 
 function summarizeArtifact(data: unknown): { summary: string; type?: string; keys?: string[] } {
