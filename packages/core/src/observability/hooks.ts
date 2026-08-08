@@ -91,6 +91,43 @@ function safeAppend(
   }
 }
 
+/**
+ * Best-effort stage transition event (additive, session-state-visualization).
+ * Called by the engine's state/team writers; NEVER throws and never blocks
+ * the underlying write. Agent-driven writes bypass these hooks entirely —
+ * report assembly falls back to artifact mtime / state.updated_at.
+ */
+export function recordStageTransition(
+  cwd: string,
+  opts: { stageId: string; stageStatus?: string; runId?: string; ts?: string },
+): void {
+  safeAppend(cwd, {
+    kind: "stage_transition",
+    ts: opts.ts ?? new Date().toISOString(),
+    stageId: opts.stageId,
+    stageStatus: opts.stageStatus,
+    runId: opts.runId,
+  });
+}
+
+/**
+ * Best-effort artifact write event (additive, session-state-visualization).
+ * Same guarantees as {@link recordStageTransition}.
+ */
+export function recordArtifactWritten(
+  cwd: string,
+  opts: { artifactId: string; artifactPath?: string; artifactBytes?: number; runId?: string; ts?: string },
+): void {
+  safeAppend(cwd, {
+    kind: "artifact_written",
+    ts: opts.ts ?? new Date().toISOString(),
+    artifactId: opts.artifactId,
+    artifactPath: opts.artifactPath,
+    artifactBytes: opts.artifactBytes,
+    runId: opts.runId,
+  });
+}
+
 /** Approximate char count of a value (matches what OMP's task tool sends). */
 function approxChars(value: unknown): number {
   if (value == null) return 0;

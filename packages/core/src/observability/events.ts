@@ -22,7 +22,9 @@ export type EventKind =
   | "agent_start"
   | "agent_end"
   | "tool_call"
-  | "tool_result";
+  | "tool_result"
+  | "stage_transition"
+  | "artifact_written";
 
 /**
  * A single recorded event. `id` is a ULID-ish monotonic counter scoped to the
@@ -56,6 +58,23 @@ export interface ObservabilityEvent {
   messageCount?: number;
   /** Skills detected from the system prompt during this turn. */
   skills?: string[];
+  // ── Additive stage/artifact chronology (session-state-visualization) ──────
+  // All fields below are OPTIONAL and backward-compatible: old event readers
+  // ignore them, and absence never blocks state/artifact writes. Emission is
+  // best-effort — agent-driven writes bypass the engine hooks entirely, so
+  // reports fall back to artifact mtime / state.updated_at.
+  /** For stage_transition: workflow stage id (do-work) or team id (cto). */
+  stageId?: string;
+  /** For stage_transition: the new stage/team status. */
+  stageStatus?: string;
+  /** For artifact_written: artifact id (workflow produces id or file stem). */
+  artifactId?: string;
+  /** For artifact_written: artifact file path (relative to the project root). */
+  artifactPath?: string;
+  /** For artifact_written: artifact size in bytes. */
+  artifactBytes?: number;
+  /** Run scope: cto run id or feature slug, to disambiguate concurrent runs. */
+  runId?: string;
 }
 
 /**
@@ -92,6 +111,13 @@ export interface ObservabilityRollup {
   estimatedDollars?: number;
   /** Run health snapshot derived from CtoState (not events). br-zps.7. */
   ctoRunHealth?: RunHealth;
+  // ── Additive stage/artifact counters (session-state-visualization) ────────
+  // Optional + backward-compatible: old rollups lack these fields and readers
+  // must treat absence as 0 (`?? 0`). Only populated by new recorders.
+  /** Count of stage_transition events in the window. */
+  stageTransitions?: number;
+  /** Count of artifact_written events in the window. */
+  artifactWrites?: number;
 }
 
 /**

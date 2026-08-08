@@ -458,7 +458,7 @@ function readStateMeta(runDir: string, files: string[]): MarkdownStateMeta {
  * absent metadata defaults to non-autonomous, unowned — matching legacy
  * agent-written runs.
  */
-function markdownCtoState(runId: string, runDir: string): CtoState | null {
+export function markdownCtoState(runId: string, runDir: string): CtoState | null {
   const files = markdownFiles(runDir);
   // Active evidence: any CTO state file. cto_discovery.md alone means the run
   // started (often parked at a confirm_understanding checkpoint) — still active.

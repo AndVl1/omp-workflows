@@ -24,6 +24,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { readObservabilityPointer } from "../observability/recorder.js";
+import { recordStageTransition } from "../observability/hooks.js";
 import type { PauseKind, StageStatus, TeamState } from "./types.js";
 
 const WORK_STATE_DIR = ".work-state";
@@ -205,9 +206,22 @@ export function setPause(state: TeamState, kind: PauseKind, reason = ""): TeamSt
   return { ...state, pause: { kind, reason }, updated_at: new Date().toISOString() };
 }
 
-export function setStageStatus(state: TeamState, stageId: string, status: StageStatus): TeamState {
+export function setStageStatus(
+  state: TeamState,
+  stageId: string,
+  status: StageStatus,
+  /** Project root — enables best-effort stage_transition telemetry (optional). */
+  cwd?: string,
+): TeamState {
   const stages = state.stages.map((s) => (s.id === stageId ? { ...s, status } : s));
   const cursor = status === "in_progress" ? stageId : state.stage_cursor;
+  if (cwd) {
+    try {
+      recordStageTransition(cwd, { stageId, stageStatus: status });
+    } catch {
+      // best-effort telemetry — never blocks the state transition
+    }
+  }
   return { ...state, stages, stage_cursor: cursor, updated_at: new Date().toISOString() };
 }
 

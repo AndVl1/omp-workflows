@@ -168,7 +168,7 @@ export async function run(opts: RunOptions): Promise<RunResult> {
   for (const o of outcomes) {
     if (o.status === "done" || o.status === "skipped") {
       const updated = readState(statePath);
-      const next = setStageStatus(updated, o.stageId, o.status);
+      const next = setStageStatus(updated, o.stageId, o.status, opts.cwd);
       writeState(opts.cwd, next);
     }
   }

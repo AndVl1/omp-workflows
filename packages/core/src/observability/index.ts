@@ -48,6 +48,7 @@ export function registerObservabilityHooks(
 
 export { EventRecorder, rollupFromEvents, readObservabilityPointer } from "./recorder.js";
 export { extractSkills } from "./skills.js";
+export { recordStageTransition, recordArtifactWritten } from "./hooks.js";
 export type {
   ObservabilityEvent,
   ObservabilityPointer,

@@ -9,7 +9,8 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
+import { recordArtifactWritten } from "../observability/hooks.js";
 
 export type ArtifactId =
   | "discovery"
@@ -45,8 +46,32 @@ export function readArtifact<T = unknown>(artifactsDir: string, id: string): T |
 export function writeArtifact<T = unknown>(artifactsDir: string, id: string, data: T): string {
   mkdirSync(artifactsDir, { recursive: true });
   const path = join(artifactsDir, `${id}.json`);
-  writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf8");
+  const body = JSON.stringify(data, null, 2) + "\n";
+  writeFileSync(path, body, "utf8");
+  // Best-effort artifact_written telemetry (additive; never blocks the write).
+  // The project root is derived from the `.work-state` segment of the
+  // artifacts dir; dirs outside `.work-state` (e.g. scratch tests) skip it.
+  const root = projectRootFromWorkStatePath(artifactsDir);
+  if (root) {
+    try {
+      recordArtifactWritten(root, {
+        artifactId: id,
+        artifactPath: relative(root, path),
+        artifactBytes: Buffer.byteLength(body, "utf8"),
+      });
+    } catch {
+      // best-effort telemetry
+    }
+  }
   return path;
+}
+
+/** Project root = path prefix ending at the `.work-state` segment, if any. */
+function projectRootFromWorkStatePath(dir: string): string | null {
+  const parts = dir.split(sep);
+  const idx = parts.indexOf(".work-state");
+  if (idx <= 0) return null;
+  return parts.slice(0, idx).join(sep) || sep;
 }
 
 export function readAllArtifacts(artifactsDir: string): Record<string, unknown> {
