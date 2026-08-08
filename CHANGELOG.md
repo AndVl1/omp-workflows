@@ -2,6 +2,18 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.18.0] — 2026-08-08
+### Added
+- **Model-first PHASE-0 classification** (`packages/core/src/commands/classification-contract.ts`) — `/do-work` and `/cto` (shipped in both `@andvl1/omp-workflows-core` and `@andvl1/omp-workflows-fullstack`) now request the same four-field model classification (`Type`, `Complexity`, `Confidence`, `Autonomous` + reason + resolved `Workflow`) before any tool call. The keyword classifier is demoted to a bounded, autonomy-less `keywordClassify` kept only for legacy engine callers; the engine fails closed rather than filling a partial model classification from keywords.
+- **Shared deterministic autonomy-directive parser** (`packages/core/src/commands/envelope.ts`) — one leading-directive parser feeds `/cto`, `/do-work`, and `/team`: the exact `[AUTONOMOUS]` token and the bounded natural directive `действуй автономно` are stripped and surfaced as a mechanical hint. The hint is never the decision: the model's `autonomous` field is the only authority, and the P5 gate fails closed on a missing/non-boolean value (`workflow_override` cannot bypass it).
+- **Audit backlog** — `.beads/issues.jsonl` gains epic `br-5o0` "Make CTO workflow artifacts audit-ready" (machine-auditable run-scoped artifacts with provenance, schema-validated produces/consumes, enforced stage order).
+### Changed
+- **CTO ownership / standby / AMEND state semantics** (`packages/core/src/cto/{state,types,run}.ts`) — `CtoState` gains `classification` (model-first authority for `autonomous`), `standby`, and `owner_session`; `resolveAutonomous`/`resolveCtoAutonomous` honor the model classification over the legacy top-level flag, which new state mirrors for read-compat only. Standby runs are marked explicitly (`standby: true`) so they are adoptable cross-session and queued inbox tasks are never lost when a new session starts; ownership enforcement applies only to interactive task runs, and `isCtoRunTerminal` keeps finished runs out of the active set.
+### Fixed
+- **Stale command pruning** (`packages/fullstack/src/copy-commands.ts` + `scripts/copy-commands.mjs`) — `.omp/commands/` now converges to the shipped set on every sync (install, CLI, and `session_start`): a shipped manifest plus a legacy shipped-name list lets `pruneStaleCommands` remove plugin-owned command directories that no longer ship (e.g. `team-next`/`team-yolo`) while preserving user-owned commands.
+### Verified
+- Build and typecheck passed for core, fullstack, and e2e. Core: 248/248 tests, Fullstack: 168/168 tests, E2E: 73/73 tests. Provider-backed live E2E evidence in `vibe-report/cto-autonomy-stale-commands-e2e-2026-08-08.md` and `vibe-report/llm-autonomy-classification-e2e-2026-08-08.md`.
+
 ## [0.17.1] — 2026-08-07
 ### Fixed
 - **Peer compatibility for fullstack ↔ core** — `@andvl1/omp-workflows-fullstack` now declares `@andvl1/omp-workflows-core` as `^0.17.0` instead of `*`. A stale core 0.12 installed alongside fullstack 0.17 broke the plugin at load time with a missing/mismatched ESM export; the range now forces a compatible core on the same 0.17.x line.
