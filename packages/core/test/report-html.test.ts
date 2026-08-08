@@ -18,7 +18,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { renderReportHtml } from "../src/report/html.js";
-import type { SessionReport } from "../src/report/types.js";
+import type { SessionReport, StageInfo } from "../src/report/types.js";
 
 function doWorkReport(): SessionReport {
   return {
@@ -765,4 +765,61 @@ test("renderer: diagram interaction controls are inline, keyboard-friendly and o
   assert.ok(!html.includes("fetch("), "no fetch calls");
   assert.ok(!html.includes("<link"), "no <link> elements");
   assert.ok(!html.includes("<script src"), "no external scripts");
+});
+
+test("renderer: diagram svg renders intrinsic dimensions matching the viewBox, wider than the report column", () => {
+  const html = renderReportHtml(diagramReport());
+  const m = /<svg id="omp-diagram-svg" width="(\d+)" height="(\d+)" viewBox="0 0 (\d+) (\d+)"/.exec(html);
+  assert.ok(m, "svg emits explicit intrinsic width and height attributes alongside the viewBox");
+  assert.equal(m[1], m[3], "intrinsic width equals the viewBox width");
+  assert.equal(m[2], m[4], "intrinsic height equals the viewBox height");
+  assert.ok(Number(m[1]) > 980, "canvas is wider than the 980px report column");
+
+  // A 10-stage workflow (the compressed-report case) must keep a multi-thousand
+  // pixel intrinsic width — the workflow canvas, not the report column, defines it.
+  const wide = doWorkReport();
+  wide.stages = Array.from({ length: 10 }, (_, i) => ({
+    id: `stage-${i}`,
+    title: `Stage ${i}`,
+    status: (i % 2 === 0 ? "done" : "pending") as StageInfo["status"],
+    phase: "standard",
+    type: "single",
+    at: "2026-08-08T09:00:00.000Z",
+  }));
+  wide.edges = wide.stages.slice(1).map((s, i) => ({ from: wide.stages[i]!.id, to: s.id, kind: "transition" }));
+  wide.artifacts = [];
+  const wideHtml = renderReportHtml(wide);
+  const wm = /<svg id="omp-diagram-svg" width="(\d+)" height="(\d+)" viewBox="0 0 (\d+) (\d+)"/.exec(wideHtml);
+  assert.ok(wm, "wide report svg carries intrinsic dimensions");
+  assert.equal(wm[1], wm[3], "wide svg width equals its viewBox width");
+  assert.equal(wm[2], wm[4], "wide svg height equals its viewBox height");
+  assert.ok(Number(wm[1]) > 4000, "10-stage canvas stays multi-thousand-pixel wide");
+
+  // Preservation: intrinsic sizing must not disturb graph/interaction markup.
+  assert.ok(html.includes('role="img" aria-label='), "svg keeps its accessible role and label");
+  assert.ok(html.includes('data-node-key="stage:planning"'), "typed nodes still render");
+  assert.ok(html.includes('class="dg-edge kind-produces"'), "typed edges still render");
+  assert.ok(html.includes('id="omp-zoom-in"'), "zoom controls still render");
+  assert.ok(html.includes('class="diagram-scroll" id="omp-diagram-scroll"'), "scroll viewport still present");
+});
+
+test("renderer: diagram svg is intrinsically sized so the scroll viewport exposes horizontal overflow", () => {
+  const html = renderReportHtml(diagramReport());
+  assert.ok(html.includes(".diagram-scroll { overflow: auto;"), "scroll viewport keeps overflow: auto");
+  assert.ok(
+    /#omp-diagram-svg \{ display: block; width: auto; min-width: 0; height: auto; transform-origin: 0 0;/.test(html),
+    "svg is sized intrinsically (width auto, min-width 0, height auto), never scaled to the report column",
+  );
+  assert.ok(!/#omp-diagram-svg[^}]*width: 100%/.test(html), "no width:100% scaling rule remains for the svg");
+  assert.ok(html.includes("transition: transform .18s ease"), "zoom transition preserved");
+  assert.ok(html.includes("prefers-reduced-motion"), "reduced-motion handling preserved");
+});
+
+test("renderer: diagram hint explains horizontal scrolling and the click/Enter/Space highlight interaction", () => {
+  const html = renderReportHtml(diagramReport());
+  const hint = /<span class="diagram-hint">([\s\S]*?)<\/span>/.exec(html)?.[1] ?? "";
+  assert.ok(/scroll horizontally/i.test(hint), "hint tells the reader to scroll horizontally to follow the workflow");
+  assert.ok(/Enter\/Space/i.test(hint), "hint keeps the Enter/Space keyboard activation");
+  assert.ok(/highlight/i.test(hint), "hint keeps the click-to-highlight guidance");
+  assert.ok(/edges and cards/i.test(hint), "hint names what gets highlighted: edges and cards");
 });

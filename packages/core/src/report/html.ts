@@ -575,7 +575,7 @@ function renderDiagram(report: SessionReport): string {
     `<div class="diagram-wrap" id="omp-diagram">` +
     `<div class="diagram-toolbar">` +
     `<strong class="diagram-title">Interactive diagram</strong>` +
-    `<span class="diagram-hint">Click a node, or press Enter/Space when focused, to highlight its edges and cards.</span>` +
+    `<span class="diagram-hint">Scroll horizontally to follow the full workflow. Click a node, or press Enter/Space when focused, to highlight its edges and cards.</span>` +
     `<span class="diagram-zoom">` +
     `<button type="button" id="omp-zoom-out" aria-label="Zoom out">-</button>` +
     `<span id="omp-zoom-label" class="diagram-zoom-label" aria-live="polite">100%</span>` +
@@ -584,7 +584,7 @@ function renderDiagram(report: SessionReport): string {
     `</span>` +
     `</div>` +
     `<div class="diagram-scroll" id="omp-diagram-scroll">` +
-    `<svg id="omp-diagram-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(ariaLabel)}">` +
+    `<svg id="omp-diagram-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(ariaLabel)}">` +
     DG_MARKERS +
     (edgeHtml ? `<g class="dg-edges">${edgeHtml}</g>` : "") +
     `<g class="dg-nodes">${nodeHtml}</g>` +
@@ -961,7 +961,7 @@ section.section { background: var(--card); border: 1px solid var(--line); border
 .diagram-zoom button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .diagram-zoom-label { min-width: 46px; text-align: center; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .diagram-scroll { overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: #fbfcfe; }
-#omp-diagram-svg { display: block; width: 100%; min-width: 580px; height: auto; transform-origin: 0 0; transition: transform .18s ease; }
+#omp-diagram-svg { display: block; width: auto; min-width: 0; height: auto; transform-origin: 0 0; transition: transform .18s ease; }
 
 .dg-node { cursor: pointer; }
 .dg-node-box { fill: var(--card); stroke: var(--line); stroke-width: 1.5; }
