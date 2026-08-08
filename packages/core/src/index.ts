@@ -369,3 +369,31 @@ export { shouldRunWave, buildDigest, startWaveScheduler } from "./cto/scheduler.
 export { refineTask, validateRefinement } from "./cto/refinement.js";
 export { evaluateDissent } from "./cto/dissent.js";
 export { dissentGate } from "./cto/gates.js";
+
+// ── Session-state visualization (pragmatic architecture) ───────────────────
+export {
+	buildSessionReport,
+	writeReport,
+} from "./report/assemble.js";
+export { renderReportHtml } from "./report/html.js";
+export { redactReportBody } from "./report/redact.js";
+export { recordStageTransition, recordArtifactWritten } from "./observability/index.js";
+export type {
+	SessionKind,
+	SessionSelector,
+	BuildSessionReportOptions,
+	StageInfo,
+	StageAgentInfo,
+	EdgeKind,
+	SessionEdge,
+	ArtifactStatus,
+	ReportArtifact,
+	ReportTeam,
+	ReportIntegration,
+	ReportHealth,
+	ReportMeta,
+	ReportSource,
+	ReportTelemetry,
+	ChronologyEvent,
+	SessionReport,
+} from "./report/types.js";

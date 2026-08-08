@@ -8,6 +8,7 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { recordStageTransition } from "../observability/hooks.js";
 import type { ModelClassification } from "../engine/run.js";
 import {
   type CtoState,
@@ -179,7 +180,14 @@ function teamOf(state: CtoState, teamId: string): CtoState["teams"][number] | un
 export function setTeamStatus(state: CtoState, teamId: string, status: TeamRunStatus, root: string | null = null): CtoState {
   const team = teamOf(state, teamId);
   if (team) team.status = status;
-  if (root) writeCtoState(state, root);
+  if (root) {
+    writeCtoState(state, root);
+    try {
+      recordStageTransition(root, { stageId: teamId, stageStatus: status, runId: state.id });
+    } catch {
+      // best-effort telemetry — never blocks the state write
+    }
+  }
   return state;
 }
 

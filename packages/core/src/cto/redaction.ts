@@ -57,6 +57,50 @@ function applyInline(value: string, patterns: RegExp[], replacement: string): st
   return out;
 }
 
+/** Compile all configured patterns; invalid patterns are skipped (never throw). */
+function compileAll(config: RedactionConfig): { secretRes: RegExp[]; inlineRes: RegExp[] } {
+  const secretRes: RegExp[] = [];
+  for (const pattern of config.secret_line_patterns) {
+    const re = compile(pattern);
+    if (re) secretRes.push(re);
+  }
+  const inlineRes: RegExp[] = [];
+  for (const pattern of config.inline_value_patterns) {
+    const re = compile(pattern);
+    if (re) inlineRes.push(re);
+  }
+  return { secretRes, inlineRes };
+}
+
+/**
+ * Generalized deterministic redaction pipeline over an arbitrary text body:
+ * 1. Drop whole lines matching any `secret_line_patterns`.
+ * 2. Replace inline values per `inline_value_patterns`.
+ * 3. Truncate to `max_body` chars.
+ * 4. Empty/whitespace result becomes the replacement marker.
+ *
+ * Never throws; identical semantics to the historical `sanitizeEscalation`
+ * body path, reusable for report artifact content. A bad pattern degrades to
+ * a no-op rather than an exception.
+ */
+export function redactText(text: string, config: RedactionConfig = DEFAULT_REDACTION_CONFIG): string {
+  const { secretRes, inlineRes } = compileAll(config);
+  const keptLines = String(text)
+    .split("\n")
+    .filter(
+      (line) =>
+        !secretRes.some((re) => {
+          re.lastIndex = 0; // `.test()` with g/y flags is stateful — reset for determinism
+          return re.test(line);
+        }),
+    );
+  const bodyText = keptLines
+    .map((line) => applyInline(line, inlineRes, config.replacement))
+    .join("\n")
+    .slice(0, config.max_body);
+  return bodyText.trim() === "" ? config.replacement : bodyText;
+}
+
 /**
  * Deterministic redaction pipeline:
  * 1. Drop whole body lines matching any `secret_line_patterns`.
@@ -71,34 +115,8 @@ export function redactEscalation(
   esc: Escalation,
   config: RedactionConfig = DEFAULT_REDACTION_CONFIG,
 ): Escalation {
-  const replacement = config.replacement;
-  const secretRes: RegExp[] = [];
-  for (const pattern of config.secret_line_patterns) {
-    const re = compile(pattern);
-    if (re) secretRes.push(re);
-  }
-  const inlineRes: RegExp[] = [];
-  for (const pattern of config.inline_value_patterns) {
-    const re = compile(pattern);
-    if (re) inlineRes.push(re);
-  }
-
-  const title = applyInline(String(esc.title), inlineRes, replacement).slice(0, config.max_title);
-
-  const keptLines = String(esc.body)
-    .split("\n")
-    .filter(
-      (line) =>
-        !secretRes.some((re) => {
-          re.lastIndex = 0; // `.test()` with g/y flags is stateful — reset for determinism
-          return re.test(line);
-        }),
-    );
-  const bodyText = keptLines
-    .map((line) => applyInline(line, inlineRes, replacement))
-    .join("\n")
-    .slice(0, config.max_body);
-  const body = bodyText.trim() === "" ? replacement : bodyText;
-
+  const { inlineRes } = compileAll(config);
+  const title = applyInline(String(esc.title), inlineRes, config.replacement).slice(0, config.max_title);
+  const body = redactText(esc.body, config);
   return { ...esc, title, body };
 }

@@ -188,6 +188,13 @@ export function rollupFromEvents(events: ReadonlyArray<ObservabilityEvent>): Obs
         rollup.skills[s] = (rollup.skills[s] ?? 0) + 1;
       }
     }
+    // Additive stage/artifact counters — old rollups simply lack these fields.
+    if (e.kind === "stage_transition") {
+      rollup.stageTransitions = (rollup.stageTransitions ?? 0) + 1;
+    }
+    if (e.kind === "artifact_written") {
+      rollup.artifactWrites = (rollup.artifactWrites ?? 0) + 1;
+    }
   }
   const start = Date.parse(first.ts);
   const end = Date.parse(last.ts);
