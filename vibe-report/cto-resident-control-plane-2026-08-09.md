@@ -3,7 +3,7 @@
 Slug: `cto-resident-control-plane`
 Дата: 2026-08-09
 Run: `cto-full-scenarios-2026-08-07`
-Branch: `feat/cto-resident-control-plane` (HEAD = `7567e00 chore(release): v0.19.0`)
+Branch: `feat/cto-resident-control-plane` (HEAD = `f0bbc68 feat(cto): add resident control plane lifecycle`)
 Статус: **COMPLETED / PASS**
 
 ---
