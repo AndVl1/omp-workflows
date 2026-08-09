@@ -11,14 +11,14 @@
  * `createAskRedirectGate` (packages/fullstack/src/messenger-channel.ts) and
  * `isBidirectionalChannel` (packages/fullstack/src/adapters/registry.ts).
  * Core cannot import fullstack (package direction), so the channel
- * configuration is read directly here. Both gates may coexist; double-blocking
- * is harmless. Unlike the fullstack gate, this one is NOT scoped to an active
- * CTO run: a bidirectional channel is by construction a detached run setup,
- * so `ask` must be routed to the outbox whenever the channel is configured.
+ * configuration is read through the shared pure normalizer (cto/channels.ts).
+ * Both gates may coexist; double-blocking is harmless. Unlike the fullstack
+ * gate, this one is NOT scoped to an active CTO run: a bidirectional channel
+ * is by construction a detached run setup, so `ask` must be routed to the
+ * outbox whenever the channel is configured.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { resolveChannelProfile } from "../cto/channels.js";
 
 interface ToolCallEvent {
   toolName?: string;
@@ -36,23 +36,17 @@ export const OUTBOX_GATE_BLOCK_REASON =
   "CTO picks it up at the next checkpoint.";
 
 /**
- * True when `.omp/escalation.json` declares a bidirectional channel:
- * `adapter === "telegram"` (bidirectional by definition) or
- * `bidirectional === true`. Never throws — a missing or malformed config is
- * treated as no channel. Mirrors fullstack's `isBidirectionalChannel` for the
- * core-side gate (core cannot import fullstack).
+ * True when `.omp/escalation.json` resolves to a validated RW primary
+ * channel (cto/channels.js normalizer). Legacy `adapter === "telegram"` and
+ * `bidirectional === true` configs normalize to rw, so they still block ask;
+ * explicit `channels[]` with a capability-validated "read-write" entry
+ * behave identically. Never throws — a missing or malformed config resolves
+ * to {direction:"none"} and returns false. Mirrors fullstack's
+ * `isBidirectionalChannel` for the core-side gate (core cannot import
+ * fullstack).
  */
 export function hasBidirectionalChannel(cwd: string): boolean {
-  try {
-    if (!existsSync(join(cwd, ".omp", "escalation.json"))) return false;
-    const raw = JSON.parse(readFileSync(join(cwd, ".omp", "escalation.json"), "utf8")) as {
-      adapter?: string;
-      bidirectional?: boolean;
-    };
-    return raw?.adapter === "telegram" || raw?.bidirectional === true;
-  } catch {
-    return false;
-  }
+  return resolveChannelProfile(cwd).direction === "rw";
 }
 
 /**

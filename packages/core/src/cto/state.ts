@@ -17,6 +17,7 @@ import {
   type EscalationStatus,
   type TeamRunStatus,
   type TeamPlan,
+  type WaveRecord,
 } from "./types.js";
 
 export function ctoStateDir(runId: string, root: string): string {
@@ -81,6 +82,10 @@ export function newCtoState(opts: {
     leases: {},
     decisions: [],
     inbox_quarantine: {},
+    // ── resident control-plane (cto-core): waves accumulate from wave 0; the
+    // dispatcher/resolver owners set active_wave_id/channel_profile, never the
+    // constructor (a fresh run has no wave and no resolved channel yet) ──
+    wave_history: [],
   };
 }
 
@@ -93,16 +98,18 @@ function defaultBudgetShape(): BudgetState {
 }
 
 /** Schema-2 fields a canonical state must carry (default-filled by migrateCtoState). */
-const SCHEMA2_CANONICAL_FIELDS = ["budget", "leases", "decisions", "inbox_quarantine"] as const;
+const SCHEMA2_CANONICAL_FIELDS = ["budget", "leases", "decisions", "inbox_quarantine", "wave_history"] as const;
 
 /**
  * Additive, backward-compatible schema migration (br-zps.1, architecture 3.3):
  * ANY input — schema 1, missing schema, or a partial schema-2 state written
  * directly by a standby/legacy writer — becomes schema 2 with the schema-2
- * fields (`budget`, `leases`, `decisions`, `inbox_quarantine`) default-filled
- * when absent. Present values are preserved untouched, so a complete
- * canonical state passes through unchanged. `health`/`scheduler` stay
- * undefined until their owning teams write them.
+ * fields (`budget`, `leases`, `decisions`, `inbox_quarantine`, `wave_history`)
+ * default-filled when absent. Present values are preserved untouched, so a
+ * complete canonical state passes through unchanged. `health`/`scheduler`
+ * stay undefined until their owning teams write them. `active_wave_id` and
+ * `channel_profile` are deliberately NOT default-filled: they are set only by
+ * their owners (wave lifecycle / channel resolver).
  */
 export function migrateCtoState(raw: Record<string, unknown>): CtoState {
   const schema = typeof raw.schema === "number" ? raw.schema : 1;
@@ -112,6 +119,7 @@ export function migrateCtoState(raw: Record<string, unknown>): CtoState {
   if (state.leases === undefined) state.leases = {};
   if (state.decisions === undefined) state.decisions = [];
   if (state.inbox_quarantine === undefined) state.inbox_quarantine = {};
+  if (state.wave_history === undefined) state.wave_history = [];
   return state as unknown as CtoState;
 }
 
@@ -249,6 +257,83 @@ export function markAmended(state: CtoState, root: string | null = null): CtoSta
   return state;
 }
 
+// ── Resident control-plane: wave lifecycle (schema-2 additive) ─────────────
+
+/**
+ * True when the run is a CTO resident: the standby marker makes a run
+ * adoptable cross-session and keeps it ACTIVE after wave completion.
+ * Pure check — `state.standby === true` (contract: resident marker).
+ */
+export function isCtoResident(state: Pick<CtoState, "standby">): boolean {
+  return state.standby === true;
+}
+
+/**
+ * Admit a work wave (state_contract.wave_history). IDEMPOTENT on transport
+ * `source_id`: when a record with the same `source_id` already exists the
+ * state is returned UNCHANGED (no second record, `active_wave_id` untouched)
+ * — a duplicate inbound message must never start a second wave. Otherwise the
+ * record is appended with status "active" and `active_wave_id` is set.
+ * Persists when a root is given (same pattern as setTeamStatus).
+ */
+export function appendWave(
+  state: CtoState,
+  opts: { id: string; source: string; source_id: string; task: string; slice_ids?: string[]; now?: string },
+  root: string | null = null,
+): CtoState {
+  const history = state.wave_history ?? [];
+  if (history.some((w) => w.source_id === opts.source_id)) return state;
+  const record: WaveRecord = {
+    id: opts.id,
+    source: opts.source,
+    source_id: opts.source_id,
+    task: opts.task,
+    slice_ids: opts.slice_ids ?? [],
+    status: "active",
+    started_at: opts.now ?? new Date().toISOString(),
+  };
+  history.push(record);
+  state.wave_history = history;
+  state.active_wave_id = opts.id;
+  if (root) writeCtoState(state, root);
+  return state;
+}
+
+/**
+ * Close a wave: stamp `finished_at` + status ("done" | "failed") and clear
+ * `active_wave_id` when it points at this wave. Unknown id → return unchanged
+ * (never throws). The run itself stays active when resident — the resident
+ * carve-out lives in isCtoRunTerminal. Persists when a root is given.
+ */
+export function finishWave(
+  state: CtoState,
+  opts: { id: string; status: "done" | "failed"; now?: string },
+  root: string | null = null,
+): CtoState {
+  const record = (state.wave_history ?? []).find((w) => w.id === opts.id);
+  if (!record) return state;
+  record.status = opts.status;
+  record.finished_at = opts.now ?? new Date().toISOString();
+  if (state.active_wave_id === opts.id) delete state.active_wave_id;
+  if (root) writeCtoState(state, root);
+  return state;
+}
+
+/**
+ * The currently running wave: the wave_history record with status "active"
+ * whose id matches `active_wave_id`. No active_wave_id → null.
+ */
+export function activeWave(state: CtoState): WaveRecord | null {
+  if (!state.active_wave_id) return null;
+  const record = (state.wave_history ?? []).find((w) => w.id === state.active_wave_id);
+  return record && record.status === "active" ? record : null;
+}
+
+/** Find a wave record by its transport source_id (dedup / admission lookup). */
+export function findWaveBySourceId(state: CtoState, sourceId: string): WaveRecord | null {
+  return (state.wave_history ?? []).find((w) => w.source_id === sourceId) ?? null;
+}
+
 /**
  * Expire pending escalations whose timeout elapsed. `timeout_ms: 0`/absent
  * (blocker default) never expires — the team stays parked and the rest of
@@ -293,6 +378,13 @@ export function activeTeams(state: CtoState): string[] {
  * stamped done/failed (e.g. runs whose wave completed through the engine
  * without a pause transition).
  *
+ * Resident carve-out (state_contract.resident): an explicit stop/failure
+ * (pause done/failed) is ALWAYS terminal — the first check — but a run with
+ * `standby: true` (the CTO resident marker) stays ACTIVE after wave
+ * completion: teams done + integration done only closes the wave, the
+ * resident run returns to standby and awaits the next inbox task. Non-resident
+ * runs keep the legacy terminality verbatim.
+ *
  * Legacy/non-canonical state may lack `pause` entirely (pre-pause writers;
  * migrateCtoState does not default it). Missing pause is NOT terminal by
  * itself — only the integration/team conditions below can prove terminality.
@@ -300,6 +392,7 @@ export function activeTeams(state: CtoState): string[] {
 export function isCtoRunTerminal(state: CtoState): boolean {
   const pauseKind = state.pause?.kind;
   if (pauseKind === "done" || pauseKind === "failed") return true;
+  if (state.standby === true) return false; // resident run stays active after wave completion
   if (state.integration?.status === "done") {
     return state.teams.every((t) => t.status === "done" || t.status === "failed");
   }

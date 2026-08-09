@@ -17,7 +17,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import {
   ctoStateDir,
   ensureAnswersDir,
@@ -34,6 +34,19 @@ export interface TelegramAdapterOptions {
   pollIntervalMs?: number;
   fetchImpl?: typeof fetch;
   /**
+   * Additional chats allowed for inbound beyond the configured chatId
+   * (conservative allowlist). The configured chatId is ALWAYS allowed; this
+   * list only extends it. Applies to callback answers, reply answers, and
+   * plain CTO task messages.
+   */
+  allowedChatIds?: string[];
+  /**
+   * When non-empty, inbound senders must be in this list (conservative
+   * allowlist). When absent/empty, no sender restriction — the chat-level
+   * rule still applies.
+   */
+  allowedSenderIds?: string[];
+  /**
    * Called for plain messages (not replies to a sent escalation, not
    * callback queries). Used by the CTO inbox: a plain message to the bot is
    * a NEW TASK for the standby CTO, routed to `.work-state/cto/<id>/inbox/`.
@@ -43,8 +56,19 @@ export interface TelegramAdapterOptions {
 
 interface TgUpdate {
   update_id: number;
-  message?: { message_id: number; text?: string; reply_to_message?: { message_id: number } };
-  callback_query?: { id: string; message?: { message_id: number }; data?: string };
+  message?: {
+    message_id: number;
+    text?: string;
+    chat?: { id: number };
+    from?: { id: number };
+    reply_to_message?: { message_id: number };
+  };
+  callback_query?: {
+    id: string;
+    message?: { message_id: number; chat?: { id: number } };
+    from?: { id: number };
+    data?: string;
+  };
 }
 
 export class TelegramEscalationAdapter implements EscalationAdapter {
@@ -54,6 +78,8 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   private readonly cwd: string;
   private readonly pollIntervalMs: number;
   private readonly fetchImpl: typeof fetch;
+  private readonly allowedChatIds: string[];
+  private readonly allowedSenderIds: string[];
   private onPlainMessage: TelegramAdapterOptions["onPlainMessage"];
   private offset = 0;
   private polling = false;
@@ -68,6 +94,8 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     this.cwd = options.cwd;
     this.pollIntervalMs = options.pollIntervalMs ?? 5_000;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.allowedChatIds = options.allowedChatIds ?? [];
+    this.allowedSenderIds = options.allowedSenderIds ?? [];
     this.onPlainMessage = options.onPlainMessage;
   }
 
@@ -108,7 +136,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       this.recordMapping(esc.id, result.message_id, esc);
       return { sent: true, channelRef: `tg:${result.message_id}` };
     } catch (error) {
-      return { sent: false, channelRef: error instanceof Error ? error.message : String(error) };
+      return { sent: false, channelRef: this.failedChannelRef("sendMessage", error) };
     }
   }
 
@@ -128,8 +156,25 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       await this.api("sendMessage", { chat_id: target, text });
       return { sent: true };
     } catch (error) {
-      return { sent: false, channelRef: error instanceof Error ? error.message : String(error) };
+      return { sent: false, channelRef: this.failedChannelRef("sendMessage", error) };
     }
+  }
+
+  /**
+   * SEC-002: map a failed call to a token-free channelRef. The receipt
+   * channelRef is logged by dispatchers/operators, and some fetch
+   * implementations (node-fetch v2 style) embed the full request URL —
+   * including `bot<TOKEN>` — in error.message, so raw error text must never
+   * land there. The adapter builds the marker itself:
+   * `tg:<method>:failed`, or `tg:<method>:http-<status>` when the failure is
+   * the adapter's own HTTP-status error from `api()` (status digits only,
+   * token-free by construction).
+   */
+  private failedChannelRef(method: string, error: unknown): string {
+    const message = error instanceof Error ? error.message : "";
+    const match = /^telegram \S+ -> (\d+)$/.exec(message);
+    if (match) return `tg:${method}:http-${match[1]}`;
+    return `tg:${method}:failed`;
   }
 
   /** Start the long-polling loop (non-blocking); returns a stop function. */
@@ -190,8 +235,16 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     })) as TgUpdate[];
     const answers: EscalationAnswer[] = [];
     for (const update of updates) {
-      // Process first, confirm after: a persistence failure throws before the
-      // offset moves, leaving this update (and everything after it) queued.
+      // Authorization gate runs BEFORE any side effect: unauthorized updates
+      // are dropped at the boundary — no answer file, no onPlainMessage wake —
+      // but the offset still advances (max(update_id+1)) so Telegram does not
+      // redeliver them forever. Authorized updates keep the "process first,
+      // confirm after" semantics below (a persistence failure throws before
+      // the offset moves, leaving the update queued).
+      if (!this.isAuthorizedUpdate(update)) {
+        this.offset = Math.max(this.offset, update.update_id + 1);
+        continue;
+      }
       const answer = this.answerFromUpdate(update);
       if (answer) answers.push(this.writeAnswer(answer));
       this.offset = Math.max(this.offset, update.update_id + 1);
@@ -199,11 +252,35 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     return answers;
   }
 
+  /**
+   * Inbound provenance gate (SEC-1). Fail closed:
+   * - the update must carry a chat id (message.chat.id or
+   *   callback_query.message.chat.id) that equals the configured chatId or is
+   *   listed in allowedChatIds (the configured chatId is ALWAYS allowed;
+   *   allowedChatIds only extends it);
+   * - when allowedSenderIds is set (non-empty), the update must carry a
+   *   sender id (message.from.id or callback_query.from.id) listed in it.
+   * A missing chat id, or a missing sender id under a sender allowlist,
+   * rejects the update.
+   */
+  private isAuthorizedUpdate(update: TgUpdate): boolean {
+    const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
+    if (chatId === undefined) return false;
+    const allowedChats = new Set([this.chatId, ...this.allowedChatIds]);
+    if (!allowedChats.has(String(chatId))) return false;
+    if (this.allowedSenderIds.length > 0) {
+      const senderId = update.message?.from?.id ?? update.callback_query?.from?.id;
+      if (senderId === undefined) return false;
+      if (!this.allowedSenderIds.includes(String(senderId))) return false;
+    }
+    return true;
+  }
+
   private answerFromUpdate(update: TgUpdate): EscalationAnswer | null {
     const at = new Date().toISOString();
     if (update.callback_query?.data && update.callback_query.message) {
       const [escId, optionId] = update.callback_query.data.split("::");
-      if (escId && optionId) return { id: escId, answer: optionId, at, by: "telegram:callback" };
+      if (escId && optionId && isSafeEscId(escId)) return { id: escId, answer: optionId, at, by: "telegram:callback" };
     }
     const message = update.message;
     if (message?.reply_to_message && typeof message.text === "string") {
@@ -219,9 +296,18 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
 
   private writeAnswer(answer: EscalationAnswer): EscalationAnswer {
     const runId = answer.id.split("/")[0] ?? answer.id;
-    const dir = ensureAnswersDir(runId, this.cwd);
+    if (!isSafeRunId(runId)) {
+      throw new Error(`telegram: writeAnswer rejected unsafe runId "${runId}" (answer id "${answer.id}")`);
+    }
+    const dir = join(this.cwd, ".work-state", "cto", runId, "answers");
+    const expected = resolve(join(this.cwd, ".work-state", "cto", runId, "answers"));
+    const resolvedDir = resolve(dir);
+    if (resolvedDir !== expected && !resolvedDir.startsWith(expected + sep)) {
+      throw new Error(`telegram: writeAnswer containment violation for answer "${answer.id}"`);
+    }
+    const ensuredDir = ensureAnswersDir(runId, this.cwd);
     const fileName = answer.id.replace(/[^a-zA-Z0-9-_]/g, "-");
-    writeFileSync(join(dir, `${fileName}.json`), JSON.stringify(answer, null, 2));
+    writeFileSync(join(ensuredDir, `${fileName}.json`), JSON.stringify(answer, null, 2));
     return answer;
   }
 
@@ -275,6 +361,24 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
 
 function runIdOf(esc: Escalation): string {
   return esc.id.split("/")[0] ?? esc.id;
+}
+
+/**
+ * SEC-001: safe slug-path shape for callback escIds (non-empty slug segments;
+ * rejects dots, backslashes, empty segments, absolute paths, whitespace,
+ * colons). Valid engine ids (`<runId>/<team>/<checkpoint>/<attempt>`, all slug
+ * segments) and test ids like `run-sec1/esc-1` satisfy it.
+ */
+const SAFE_ESC_ID = /^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/;
+/** SEC-001: a single safe runId segment (no separators, dots, or traversal). */
+const SAFE_RUN_ID = /^[A-Za-z0-9_-]+$/;
+
+function isSafeEscId(escId: string): boolean {
+  return SAFE_ESC_ID.test(escId);
+}
+
+function isSafeRunId(runId: string): boolean {
+  return SAFE_RUN_ID.test(runId);
 }
 
 /**

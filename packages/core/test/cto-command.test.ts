@@ -77,7 +77,18 @@ test("cto-cmd: buildCtoPrompt renders teams from .omp/teams.json", () => {
     const prompt = buildCtoPrompt(parseCtoEnvelope("Add OAuth", root), root);
     assert.ok(prompt.includes("| `kotlin-backend` | Kotlin Backend |"));
     assert.ok(prompt.includes("Escalation ladder"));
-    assert.ok(prompt.includes("runCto"));
+    assert.ok(prompt.includes("Wave / slice gate contract"), "wave/slice gate contract section present");
+    assert.ok(
+      prompt.includes("<!-- omp-cto-slice run=<runId> slice=<sliceId> -->"),
+      "exact slice marker literal in the fresh prompt",
+    );
+    assert.ok(prompt.includes('wave_history` record `{ id, source, source_id, task, slice_ids'), "wave creation wording");
+    assert.ok(prompt.includes("active_wave_id"), "active_wave_id required before lead spawn");
+    assert.ok(prompt.includes("teams[].classification"), "per-slice classification required");
+    assert.ok(prompt.includes("resolveWorkflow(type,"), "matrix-resolved workflow required");
+    assert.ok(prompt.includes("dod.json"), "per-slice DoD artifact required");
+    assert.ok(prompt.includes("Leads propagate"), "leads must propagate the marker to workers");
+    assert.ok(!prompt.includes("runCto"), "no TS engine call remains in the prompt");
     assert.ok(prompt.includes("max 8, decomposition depth max 2"));
     assert.ok(prompt.includes("Leads never write source"), "lead self-coding forbidden in the contract");
     assert.ok(prompt.includes("self-coding lead"), "CTO must reject self-coding leads");
@@ -176,6 +187,9 @@ test("cto-cmd: ctoCommand with empty args starts STANDBY and notifies on task", 
     assert.ok(standby.includes("ARE USER COMMANDS"), "inbox messages are user commands to the main-session CTO");
     assert.ok(standby.includes("return to standby"), "standby returns to standby after each wave");
     assert.ok(standby.includes("task(agent=@cto)"), "nested CTO dispatch forbidden in standby");
+    assert.ok(standby.includes("run id NEVER changes"), "standby keeps the SAME run id across follow-up waves");
+    assert.ok(standby.includes("wave_history"), "each inbox task appends a NEW wave record to the same state.json");
+    assert.ok(standby.includes("PER-SLICE"), "each inbox task is classified per-slice before dispatch");
     assert.ok(notifyCalls.some((m) => m.includes("standby")), "notify announces standby");
 
     const prompt = ctoCommand({ args: "Add OAuth", cwd: root, ui: { notify: (m) => notifyCalls.push(m) } });
@@ -192,12 +206,14 @@ test("cto-cmd: renderChannelSection reflects .omp/escalation.json", () => {
     // no channel
     assert.ok(renderChannelSection(root).includes("No escalation channel"));
     assert.ok(renderChannelSection(root).includes("Use the `ask` tool"));
+    assert.ok(renderChannelSection(root).includes("TERMINAL-ONLY"), "none mode named TERMINAL-ONLY");
 
     // telegram -> bidirectional, ask banned
     mkdirSync(join(root, ".omp"), { recursive: true });
     writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "t", chatId: "c" } }));
     const tg = renderChannelSection(root);
     assert.ok(tg.includes("BIDIRECTIONAL"), "telegram is bidirectional");
+    assert.ok(tg.includes("VALIDATED RW-PRIMARY"), "rw mode named VALIDATED RW-PRIMARY");
     assert.ok(tg.includes("NEVER use the `ask` tool"), "ask banned in messenger mode");
     assert.ok(tg.includes("outbox"), "questions route via the outbox");
     assert.ok(tg.includes("USER COMMAND"), "inbox tasks are user commands in messenger mode");
@@ -206,6 +222,7 @@ test("cto-cmd: renderChannelSection reflects .omp/escalation.json", () => {
     writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "http", http: { url: "https://x" } }));
     const http = renderChannelSection(root);
     assert.ok(http.includes("push-only"), "http is push-only");
+    assert.ok(http.includes("RO-REPORT"), "ro mode named RO-REPORT");
     assert.ok(http.includes("Use `ask`"), "http keeps ask");
 
     // consumer bidirectional transport (flag) -> messenger mode like telegram

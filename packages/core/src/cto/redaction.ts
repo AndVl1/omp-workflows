@@ -3,8 +3,9 @@
  *
  * Config-driven replacement for the inline sanitize logic that used to live
  * in `escalation.ts`: whole secret-bearing lines are dropped, inline values
- * can be replaced, title/body are truncated, and an empty body falls back to
- * the replacement marker. Pure and deterministic — no randomness, no I/O,
+ * can be replaced, title/body are truncated, option labels / default /
+ * replyTo are redacted (SEC-3), and an empty body falls back to the
+ * replacement marker. Pure and deterministic — no randomness, no I/O,
  * never throws.
  *
  * Patterns are regex-literal source strings (e.g. `/Bearer\s+\S+/g`, with
@@ -16,16 +17,28 @@
 import type { Escalation, RedactionConfig } from "./types.js";
 
 /**
- * Default redaction policy — reproduces the historical `sanitizeEscalation`
- * behavior exactly: drop whole lines matching the SECRET_LINE pattern, no
- * inline replacement, title ≤ 120 chars, body ≤ 2000 chars, "[redacted]"
- * for an empty/whitespace body.
+ * Default redaction policy — the historical `sanitizeEscalation` line-dropping
+ * plus default inline replacement for common prose secrets (SEC-3):
+ * - whole lines matching the SECRET_LINE pattern are dropped (unchanged);
+ * - prose JWTs (`eyJ…` — three dot-separated url-safe base64url segments, the
+ *   header always starts `eyJ`) are replaced inline wherever they appear;
+ * - prose `Bearer <token>` values are replaced inline when the token contains
+ *   at least one digit or url-safe punctuation char, so plain-English prose
+ *   like "the bearer of the news" / "bearer bonds" is NOT redacted;
+ * - title ≤ 120 chars, body ≤ 2000 chars, "[redacted]" for an empty/
+ *   whitespace body.
  */
 export const DEFAULT_REDACTION_CONFIG: RedactionConfig = {
   secret_line_patterns: [
     "/(token|password|passwd|secret|api[_-]?key|authorization|bearer|private[_-]?key)\\s*[:=]/i",
   ],
-  inline_value_patterns: [],
+  inline_value_patterns: [
+    // prose JWT: header segment always starts `eyJ`; three dot-separated url-safe base64url segments
+    "/\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\b/g",
+    // prose Bearer value: the token must contain ≥1 digit or url-safe punctuation,
+    // so "bearer of" / "bearer bonds" (no such char) never false-positive
+    "/\\bBearer\\s+[A-Za-z0-9._~+/=-]*[0-9._~+/=-][A-Za-z0-9._~+/=-]*\\b/gi",
+  ],
   replacement: "[redacted]",
   max_title: 120,
   max_body: 2000,
@@ -55,6 +68,20 @@ function applyInline(value: string, patterns: RegExp[], replacement: string): st
     out = out.replace(re, replacement);
   }
   return out;
+}
+
+/**
+ * Redact a short field value (option label, default, replyTo): a value that
+ * is itself a secret line (any secret_line_pattern matches it) becomes the
+ * replacement marker, otherwise inline values are replaced. No truncation —
+ * SEC-3 is about secret coverage, not size.
+ */
+function redactFieldValue(value: string, secretRes: RegExp[], inlineRes: RegExp[], replacement: string): string {
+  const isSecret = secretRes.some((re) => {
+    re.lastIndex = 0; // `.test()` with g/y flags is stateful — reset for determinism
+    return re.test(value);
+  });
+  return isSecret ? replacement : applyInline(value, inlineRes, replacement);
 }
 
 /** Compile all configured patterns; invalid patterns are skipped (never throw). */
@@ -107,16 +134,31 @@ export function redactText(text: string, config: RedactionConfig = DEFAULT_REDAC
  * 2. Replace inline values (title + remaining body lines) per `inline_value_patterns`.
  * 3. Truncate title to `max_title` chars, body to `max_body` chars.
  * 4. Empty/whitespace body becomes the replacement marker.
+ * 5. option labels, `default` and `replyTo` (when strings) get the same
+ *    secret-line + inline treatment — a label that is itself a secret line
+ *    becomes the replacement marker; option `id`/`apply` are preserved
+ *    EXACTLY (id is the answer-correlation key and is never redacted).
  *
- * Never throws; returns a NEW object `{ ...esc, title, body }` — all other
- * {@link Escalation} fields pass through untouched.
+ * Never throws; returns a NEW object — the input escalation, its options
+ * array and option objects are never mutated, and absent/undefined
+ * `options`/`default`/`replyTo` stay absent.
  */
 export function redactEscalation(
   esc: Escalation,
   config: RedactionConfig = DEFAULT_REDACTION_CONFIG,
 ): Escalation {
-  const { inlineRes } = compileAll(config);
+  const { secretRes, inlineRes } = compileAll(config);
   const title = applyInline(String(esc.title), inlineRes, config.replacement).slice(0, config.max_title);
   const body = redactText(esc.body, config);
-  return { ...esc, title, body };
+  const out: Escalation = { ...esc, title, body };
+  if (Array.isArray(esc.options)) {
+    out.options = esc.options.map((opt) => ({ ...opt, label: redactFieldValue(opt.label, secretRes, inlineRes, config.replacement) }));
+  }
+  if (typeof esc.default === "string") {
+    out.default = redactFieldValue(esc.default, secretRes, inlineRes, config.replacement);
+  }
+  if (typeof esc.replyTo === "string") {
+    out.replyTo = redactFieldValue(esc.replyTo, secretRes, inlineRes, config.replacement);
+  }
+  return out;
 }

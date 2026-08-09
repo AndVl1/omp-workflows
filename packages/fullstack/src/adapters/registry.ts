@@ -17,18 +17,53 @@
  *     "http":     { "url": "https://ntfy.sh/my-topic", "headers": {} },
  *     "telegram": { "token": "...", "chatId": "...", "pollIntervalMs": 5000 }
  *   }
+ *
+ * ── Resident control-plane: profile-aware channel sets (schema-2 additive) ──
+ *
+ * `createChannelSet(cwd)` resolves the config through the core channel
+ * normalizer (capability-validated directions) and builds one adapter per
+ * profile: the first RW profile becomes the PRIMARY (inbound + outbound),
+ * every RO profile becomes an outbound REPORT SINK. The primary is the only
+ * adapter that may be wired for inbound (`setPlainMessageHandler`) or polled
+ * (`pollOnce`); RO sinks are never touched for inbound (architecture
+ * invariant: RO adapters are never polled or wired for inbound handlers).
+ *
+ * Outbox delivery is envelope-aware: entries may carry additive
+ * `intent` (`ack` | `question` | `progress` | `summary`), `target`
+ * (ackTarget override) and `topic` (report topic). After the primary send,
+ * successfully-sent `summary` entries are best-effort fanned out to each RO
+ * sink: a sink with `subscriptions[]` receives only matching `topic`s, a
+ * sink without subscriptions receives all reports. Sink failures never fail
+ * the primary result.
+ *
+ * `isBidirectionalChannel(cwd)` is now capability-validated via core
+ * `hasRwPrimary`: a legacy `{adapter:"http", bidirectional:true}` flag alone
+ * does NOT make http bidirectional — http has no inbound capability
+ * (core's built-in capability table: http = push-only). NOTE: core's legacy
+ * normalization branch honors the `bidirectional` flag for any adapter kind
+ * (compatibility wrapper), so legacy `http + bidirectional:true` still
+ * normalizes to rw; the capability rule (declared rw on an incapable kind
+ * downgrades to ro) is enforced for explicit `channels[]` entries.
  */
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  appendWave,
   ctoStateDir,
   defaultBudgetState,
+  findWaveBySourceId,
+  hasRwPrimary,
+  loadEscalationConfigRaw,
+  normalizeChannelConfig,
   readCtoState,
+  resolveChannelProfile,
   sanitizeEscalation,
   validateEscalation,
   writeCtoState,
+  type ChannelCapabilities,
+  type ChannelProfile,
   type Escalation,
   type EscalationAdapter,
   type EscalationReceipt,
@@ -44,7 +79,15 @@ export interface EscalationConfig {
   /** True when the channel can receive user replies (bidirectional). */
   bidirectional?: boolean;
   http?: { url: string; headers?: Record<string, string> };
-  telegram?: { token: string; chatId: string; pollIntervalMs?: number };
+  telegram?: {
+    token: string;
+    chatId: string;
+    pollIntervalMs?: number;
+    /** Additional chats allowed for inbound beyond chatId (chatId always allowed). */
+    allowedChatIds?: string[];
+    /** When non-empty, inbound senders must be in this list. */
+    allowedSenderIds?: string[];
+  };
   /** Transport-specific config for consumer-registered adapters. */
   [transport: string]: unknown;
 }
@@ -56,6 +99,46 @@ export function runIdOf(esc: Escalation): string {
 
 export function outboxDir(runId: string, root: string): string {
   return join(ctoStateDir(runId, root), "outbox");
+}
+
+// ── Delivery envelope (schema-2 additive) ──────────────────────────────────
+
+/**
+ * Delivery intent stamped on durable outbox entries. Additive fields on the
+ * Escalation shape — core validateEscalation tolerates extras, and
+ * sanitizeEscalation/redactEscalation preserve them, so the whole
+ * retry/redaction/sent-file path passes them through untouched.
+ */
+export type DeliveryIntent = "ack" | "question" | "progress" | "summary";
+
+/** A durable outbox delivery: escalation-shaped + additive envelope fields. */
+export type CtoDelivery = Escalation & {
+  intent: DeliveryIntent;
+  /** ackTarget override — the channel/user the message is addressed to. */
+  target?: string;
+  /** Report topic — RO sink subscription routing (`summary` intents). */
+  topic?: string;
+};
+
+/**
+ * Queue a CTO delivery durably: writes `<outboxDir(runId, root)>/<id>.json`
+ * (mkdir -p, `wx` — first write wins). Idempotent on the delivery id: a
+ * duplicate returns null without overwriting. Returns the file path or null
+ * on duplicate / write failure (best-effort — the caller must never treat
+ * this as a blocking path). The regular `drainOutbox` tick picks the entry
+ * up with the existing retry/redaction/sent-file semantics.
+ */
+export function queueCtoDelivery(root: string, runId: string, delivery: CtoDelivery): string | null {
+  const dir = outboxDir(runId, root);
+  const fileName = `${delivery.id.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`;
+  const path = join(dir, fileName);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path, JSON.stringify(delivery, null, 2), { flag: "wx" });
+    return path;
+  } catch {
+    return null;
+  }
 }
 
 /** Adapter factory for a transport kind (built-in or consumer-registered). */
@@ -72,6 +155,8 @@ const adapterFactories = new Map<string, EscalationAdapterFactory>([
             chatId: config.telegram.chatId,
             cwd,
             pollIntervalMs: config.telegram.pollIntervalMs ?? 5_000,
+            allowedChatIds: config.telegram.allowedChatIds,
+            allowedSenderIds: config.telegram.allowedSenderIds,
           })
         : null,
   ],
@@ -121,28 +206,168 @@ export function createEscalationAdapter(config: EscalationConfig, cwd: string): 
   }
 }
 
+// ── Profile-aware channel sets (resident control-plane) ────────────────────
+
 /**
- * True when the configured channel can receive user-initiated replies
- * (telegram today, or any transport explicitly marked bidirectional).
+ * A resolved channel set for one cwd: the normalized profiles, THE resolved
+ * profile (first RW preferred, else first RO, else {direction:"none"}),
+ * the primary adapter (first RW profile — core guarantees direction "rw"
+ * only when the adapter kind has inbound AND outbound capabilities), and
+ * one adapter per RO profile as an outbound report sink. RO sinks are
+ * NEVER wired or polled for inbound (architecture invariant).
+ *
+ * `legacySingleAdapter` is true when the raw config had NO `channels[]`
+ * array (a legacy single-adapter config). The dispatcher loop treats that
+ * single RO adapter as the outbound drain target — legacy configs (e.g.
+ * `{adapter:"http", http:{url}}`) must keep delivering ALL outbox entries
+ * exactly as the pre-channel-set dispatcher did; the capability model only
+ * changes WHICH adapter drains, not whether legacy delivery happens.
  */
-export function isBidirectionalChannel(cwd: string): boolean {
-  const config = loadEscalationConfig(cwd);
-  if (!config) return false;
-  return config.adapter === "telegram" || config.bidirectional === true;
+export interface ChannelSet {
+  profiles: ChannelProfile[];
+  profile: ChannelProfile;
+  primary: EscalationAdapter | null;
+  roSinks: EscalationAdapter[];
+  legacySingleAdapter: boolean;
+}
+
+/**
+ * Sink subscriptions attached to RO sink adapters by `createChannelSet`.
+ * `drainOutbox` reads them for report routing; adapters not produced here
+ * (legacy callers, tests) have no subscriptions -> receive all reports.
+ */
+const RO_SINK_SUBSCRIPTIONS = Symbol("omp-cto-ro-sink-subscriptions");
+
+/** Adapter side of the subscription marker (set by createChannelSet only). */
+interface RoSinkMarker {
+  [RO_SINK_SUBSCRIPTIONS]?: string[];
+}
+
+function sinkSubscriptionsOf(sink: EscalationAdapter): string[] | undefined {
+  // Trusted marker: attached by createChannelSet; absent on foreign adapters.
+  const marked = sink as RoSinkMarker;
+  return marked[RO_SINK_SUBSCRIPTIONS];
+}
+
+/**
+ * Resolve `.omp/escalation.json` into a channel set (see {@link ChannelSet}).
+ * Factory routing: for explicit `channels[]` configs each profile's adapter
+ * is built from the per-entry config object; for legacy single-adapter
+ * configs the whole config is passed (EscalationConfig has an index
+ * signature, so per-transport sub-objects ride along). Adapter construction
+ * failures degrade to null (never throw). No profiles ->
+ * `{ profiles: [], profile: {direction:"none"}, primary: null, roSinks: [] }`.
+ */
+export function createChannelSet(cwd: string, capabilities?: Record<string, ChannelCapabilities>): ChannelSet {
+  const raw = loadEscalationConfigRaw(cwd);
+  const profiles = normalizeChannelConfig(raw, capabilities);
+  if (profiles.length === 0) {
+    return { profiles: [], profile: { direction: "none" }, primary: null, roSinks: [], legacySingleAdapter: false };
+  }
+  // Explicit channels[] entries (validated as an array by Array.isArray);
+  // absent -> a legacy single-adapter config (adapter profile guaranteed by
+  // profiles.length > 0).
+  const channels = Array.isArray(raw?.channels) ? (raw?.channels as Array<Record<string, unknown>>) : null;
+  const legacySingleAdapter = channels === null;
+  const entryFor = (profile: ChannelProfile): Record<string, unknown> | null => {
+    const kind = profile.adapter ?? profile.transport;
+    if (!channels || !kind) return raw;
+    // Profile-aware binding (static-2): an explicit entry with an id binds
+    // by THAT id — two same-kind channels with distinct ids get distinct
+    // per-entry configs. An id-less profile (a single id-less entry per
+    // kind survives the normalizer's ambiguity rejection) binds to the
+    // id-less entry of its kind, never to a same-kind id-ful entry.
+    if (typeof profile.id === "string" && profile.id.length > 0) {
+      return channels.find((c) => c.id === profile.id) ?? null;
+    }
+    return channels.find((c) => c.adapter === kind && !(typeof c.id === "string" && c.id.trim().length > 0)) ?? null;
+  };
+  const build = (profile: ChannelProfile): EscalationAdapter | null => {
+    const kind = profile.adapter ?? profile.transport;
+    if (!kind) return null;
+    const factory = adapterFactories.get(kind);
+    if (!factory) return null;
+    const entry = entryFor(profile);
+    if (!entry) return null;
+    try {
+      return factory(entry as EscalationConfig, cwd);
+    } catch {
+      return null;
+    }
+  };
+  const primaryProfile = profiles.find((p) => p.direction === "rw");
+  const primary = primaryProfile ? build(primaryProfile) : null;
+  const roSinks = profiles
+    .filter((p) => p.direction === "ro")
+    .map((p) => {
+      const sink = build(p);
+      if (sink) Object.defineProperty(sink, RO_SINK_SUBSCRIPTIONS, { value: p.subscriptions, enumerable: false, configurable: true });
+      return sink;
+    })
+    .filter((a): a is EscalationAdapter => a !== null);
+  return { profiles, profile: resolveChannelProfile(cwd, capabilities), primary, roSinks, legacySingleAdapter };
+}
+
+/**
+ * True when the resolved channel is a validated RW primary. Reimplemented as
+ * core `hasRwPrimary` (capability-validated): legacy telegram and any legacy
+ * `bidirectional: true` flag normalize to rw through core's compatibility
+ * branch; legacy http WITHOUT the flag is push-only (ro -> false); explicit
+ * `channels[]` entries are capability-checked (declared rw on an incapable
+ * kind like http downgrades to ro -> false). See the module docblock.
+ */
+export function isBidirectionalChannel(cwd: string, capabilities?: Record<string, ChannelCapabilities>): boolean {
+  return hasRwPrimary(cwd, capabilities);
 }
 
 /**
  * Drain the outbox: for every `.work-state/cto/<runId>/outbox/*.json` that
  * is a valid escalation, sanitize (R4), send via the adapter, and move the
  * file to `sent/` on success. Returns the send results. Never throws.
+ *
+ * The additive 4th param enables RO report routing: after the primary send
+ * path, each SUCCESSFULLY-sent entry with `intent === "summary"` is
+ * best-effort fanned out to every RO sink — a sink with `subscriptions[]`
+ * receives the entry only when its `topic` is subscribed, a sink without
+ * subscriptions receives all reports. Sink sends use `adapter.send(esc)`
+ * (http has no sendPlainText); sink failures never fail the primary result
+ * and are recorded on the result entry as `sinkErrors`. Existing callers
+ * pass no opts -> no routing, behavior unchanged.
+ *
+ * RO-only delivery (no primary): when `adapter` is null but RO sinks are
+ * given, `summary` entries are delivered directly to the sinks. Delivery is
+ * HONEST about what actually happened:
+ *   - every attempted sink failed (`failed === attempted > 0`) → reported
+ *     `sent:false` with `error: "all ro sinks failed"` + `sinkErrors` and
+ *     LEFT in the outbox (pending/retryable — the next drain retries it);
+ *   - at least one attempted sink succeeded → archived to `sent/` as
+ *     `sent:true`, partial sink failures recorded as `sinkErrors`;
+ *   - every sink subscription-skipped the topic (`attempted === 0`) →
+ *     honest no-op: archived as `sent:true` with NO `sinkErrors`.
+ * Non-report entries cannot be delivered without a validated RW primary —
+ * they are reported `sent:false` with
+ * `"no rw primary to deliver non-report entry"` and LEFT in place so a
+ * later drain with a primary (restart/recovery) still delivers them.
+ * When both adapter and sinks are absent the outbox is untouched (the
+ * historical null-adapter early return).
  */
+export interface DrainOutboxResult {
+  escId: string;
+  sent: boolean;
+  error?: string;
+  /** Best-effort RO sink send failures (summary routing); primary still sent. */
+  sinkErrors?: string[];
+}
+
 export async function drainOutbox(
   root: string,
   adapter: EscalationAdapter | null,
   maxRetries = 3,
-): Promise<Array<{ escId: string; sent: boolean; error?: string }>> {
-  if (!adapter) return [];
-  const results: Array<{ escId: string; sent: boolean; error?: string }> = [];
+  opts: { roSinks?: EscalationAdapter[] } = {},
+): Promise<DrainOutboxResult[]> {
+  const roSinks = opts.roSinks ?? [];
+  if (!adapter && roSinks.length === 0) return [];
+  const results: DrainOutboxResult[] = [];
   const runsDir = join(root, ".work-state", "cto");
   if (!existsSync(runsDir)) return results;
   const runs = readdirSync(runsDir);
@@ -154,19 +379,69 @@ export async function drainOutbox(
       const escId = name.slice(0, -".json".length);
       const path = join(outbox, name);
       try {
-        const raw = JSON.parse(readFileSync(path, "utf8")) as Escalation;
+        const raw = JSON.parse(readFileSync(path, "utf8")) as Escalation & { intent?: DeliveryIntent; topic?: string };
         const validation = validateEscalation(raw);
         if (validation) {
           results.push({ escId, sent: false, error: validation });
           continue;
         }
+        // sanitizeEscalation preserves additive fields (intent/target/topic).
         const clean = sanitizeEscalation(raw);
+        if (!adapter) {
+          // RO-only set: only subscribed report entries are deliverable.
+          if (raw.intent === "summary") {
+            const sinkErrors: string[] = [];
+            const outcome = await routeReportsToSinks({ ...clean, intent: "summary", topic: raw.topic }, roSinks, sinkErrors);
+            if (outcome.attempted === 0) {
+              // Every sink subscription-skipped this topic — honest no-op:
+              // nothing was attempted, archive as sent with no sinkErrors.
+              const sentDir = join(outbox, "sent");
+              mkdirSync(sentDir, { recursive: true });
+              renameSync(path, join(sentDir, name));
+              results.push({ escId, sent: true });
+            } else if (outcome.failed > 0 && outcome.failed === outcome.attempted) {
+              // Every sink that was ACTUALLY attempted failed — the summary
+              // was not delivered anywhere. Leave the file in outbox/ (NOT
+              // archived) so the next drain retries it — pending/retryable.
+              const result: DrainOutboxResult = { escId, sent: false, error: "all ro sinks failed", sinkErrors };
+              results.push(result);
+            } else {
+              // At least one sink succeeded — archive the summary; partial
+              // sink failures are recorded (today's behavior).
+              const sentDir = join(outbox, "sent");
+              mkdirSync(sentDir, { recursive: true });
+              renameSync(path, join(sentDir, name));
+              const result: DrainOutboxResult = { escId, sent: true };
+              if (sinkErrors.length > 0) result.sinkErrors = sinkErrors;
+              results.push(result);
+            }
+          } else {
+            // No validated RW primary -> questions/progress/legacy entries
+            // stay durable for a later primary (restart-safe).
+            results.push({ escId, sent: false, error: "no rw primary to deliver non-report entry" });
+          }
+          continue;
+        }
         const receipt = await sendWithRetry(adapter, clean, maxRetries);
         if (receipt.sent) {
+          const sinkErrors: string[] = [];
+          if (raw.intent === "summary" && roSinks.length > 0) {
+            // Rebuild the envelope on the sanitized entry (sinks receive the
+            // same redacted content as the primary); topic stays optional.
+            // The drain adapter itself is skipped as a routing target — a
+            // legacy single-RO-adapter config drains via its only sink and
+            // must not double-send its own summaries.
+            const routingSinks = roSinks.filter((s) => s !== adapter);
+            if (routingSinks.length > 0) {
+              await routeReportsToSinks({ ...clean, intent: "summary", topic: raw.topic }, routingSinks, sinkErrors);
+            }
+          }
           const sentDir = join(outbox, "sent");
           mkdirSync(sentDir, { recursive: true });
           renameSync(path, join(sentDir, name));
-          results.push({ escId, sent: true });
+          const result: DrainOutboxResult = { escId, sent: true };
+          if (sinkErrors.length > 0) result.sinkErrors = sinkErrors;
+          results.push(result);
         } else {
           results.push({ escId, sent: false, error: `send failed after ${maxRetries} attempts` });
         }
@@ -176,6 +451,44 @@ export async function drainOutbox(
     }
   }
   return results;
+}
+
+/**
+ * Fan a successfully-sent summary report out to the RO sinks. Per-sink
+ * subscription filter: subscriptions present -> send only when the entry
+ * `topic` is subscribed; no subscriptions -> send all reports. Best-effort:
+ * a throwing/failing sink never propagates — its error is recorded in
+ * `sinkErrors` and the remaining sinks are still tried.
+ *
+ * Returns the delivery outcome: `attempted` = sinks ACTUALLY sent to
+ * (subscription-skipped sinks do not count), `failed` = sinks that threw
+ * OR returned a receipt with `sent !== true`. The RO-only drain branch uses
+ * the outcome to decide whether a summary is deliverable at all (all sinks
+ * failed -> leave the entry for the next drain).
+ */
+async function routeReportsToSinks(
+  esc: Escalation & { intent: DeliveryIntent; topic?: string },
+  roSinks: EscalationAdapter[],
+  sinkErrors: string[],
+): Promise<{ attempted: number; failed: number }> {
+  let attempted = 0;
+  let failed = 0;
+  for (const sink of roSinks) {
+    const subscriptions = sinkSubscriptionsOf(sink);
+    if (subscriptions && (!esc.topic || !subscriptions.includes(esc.topic))) continue;
+    attempted += 1;
+    try {
+      const receipt = await sink.send(esc);
+      if (receipt.sent !== true) {
+        failed += 1;
+        sinkErrors.push(`sink ${sink.kind} reported unsent`);
+      }
+    } catch (error) {
+      failed += 1;
+      sinkErrors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  return { attempted, failed };
 }
 
 async function sendWithRetry(adapter: EscalationAdapter, esc: Escalation, maxRetries: number): Promise<EscalationReceipt> {
@@ -296,21 +609,41 @@ function releaseDispatcherLease(lease: DispatcherLease): void {
 }
 
 /**
- * Start the dispatcher loop; returns a stop function. Each tick drains the
- * outbox and polls the inbox exactly once; ticks never overlap — a tick that
- * outlives the interval is skipped until the previous one completes (no
- * double-drain, no double-poll of the same updates).
+ * Shared dispatcher loop behind `startDispatcher` (legacy single-adapter)
+ * and `startChannelDispatcher` (profile-aware channel set). Inbound wiring
+ * (`setPlainMessageHandler`) and polling (`pollOnce`) happen ONLY on the
+ * primary adapter — RO sinks are never wired or polled (architecture
+ * invariant: RO adapters are never polled or wired for inbound handlers).
+ * The legacy wrapper's primary IS its single adapter, so its duck-typed
+ * behavior is unchanged (telegram/mock are rw by builtin capabilities).
+ *
+ * Outbox draining uses the primary when one exists; for a legacy
+ * single-adapter config the single RO adapter becomes the drain target so
+ * legacy outbound delivery keeps working (the capability model changes
+ * WHICH adapter drains, never whether legacy delivery happens). Report
+ * routing to RO sinks still applies on top (the drain adapter is skipped
+ * as a routing target — no double send).
+ *
+ * Each tick drains the outbox and polls the inbox exactly once; ticks never
+ * overlap — a tick that outlives the interval is skipped until the previous
+ * one completes (no double-drain, no double-poll of the same updates).
  *
  * A project may have more than one interactive omp session. Only the process
  * holding the lease polls and wakes that project's CTO; this keeps Telegram
  * updates and local-drop wakes on one deterministic session.
  */
-export function startDispatcher(
-  root: string,
-  adapter: EscalationAdapter | null,
-  intervalMs = 10_000,
-  opts: DispatcherOptions = {},
-): () => void {
+interface DispatcherTarget {
+  primary: EscalationAdapter | null;
+  roSinks: EscalationAdapter[];
+  /** Legacy single-adapter configs drain via their single RO adapter. */
+  legacySingleAdapter?: boolean;
+  intervalMs: number;
+  opts: DispatcherOptions;
+}
+
+function startDispatcherLoop(root: string, target: DispatcherTarget): () => void {
+  const { primary, roSinks, intervalMs, opts } = target;
+  const drainAdapter = primary ?? (target.legacySingleAdapter ? (roSinks[0] ?? null) : null);
   const lease = claimDispatcher(root);
   if (!lease) return () => undefined;
   const heartbeat = setInterval(() => refreshDispatcherLease(lease), DISPATCHER_HEARTBEAT_MS);
@@ -323,19 +656,19 @@ export function startDispatcher(
     if (ownsDispatcherLease(lease)) onAnswer?.(answer);
   };
   const inboxHandler = (task: InboxTask) => handleInboxTask(root, task, wakeTask);
-  // Only the Telegram adapter exposes setPlainMessageHandler; http is
-  // send-only. Cast at the boundary once, guarded at runtime.
-  const telegramLike = adapter as { setPlainMessageHandler: (h: (t: InboxTask) => void) => void } | null;
-  if (telegramLike && typeof telegramLike.setPlainMessageHandler === "function") {
-    telegramLike.setPlainMessageHandler(inboxHandler);
+  // Inbound surface lives on the primary ONLY (telegram/mock implement it;
+  // http is send-only). Cast at the boundary once, guarded at runtime.
+  const inboundCapable = primary as { setPlainMessageHandler: (h: (t: InboxTask) => void) => void } | null;
+  if (inboundCapable && typeof inboundCapable.setPlainMessageHandler === "function") {
+    inboundCapable.setPlainMessageHandler(inboxHandler);
   }
   let ticking = false;
   const tick = async (): Promise<void> => {
     if (ticking || !ownsDispatcherLease(lease)) return;
     ticking = true;
     try {
-      await drainOutbox(root, adapter);
-      await pollInbox(root, adapter, wakeTask, wakeAnswer);
+      await drainOutbox(root, drainAdapter, 3, { roSinks });
+      await pollInbox(root, primary, wakeTask, wakeAnswer);
     } catch {
       // drain/poll never throw in practice; keep the loop alive regardless.
     } finally {
@@ -352,6 +685,43 @@ export function startDispatcher(
   };
 }
 
+/**
+ * Start the dispatcher loop (legacy single-adapter mode); returns a stop
+ * function. Duck-typed like the pre-channel-set dispatcher: the adapter is
+ * wired/polled when it exposes the optional inbound surface — legacy
+ * telegram/mock are rw by builtin capabilities, http stays push-only.
+ */
+export function startDispatcher(
+  root: string,
+  adapter: EscalationAdapter | null,
+  intervalMs = 10_000,
+  opts: DispatcherOptions = {},
+): () => void {
+  return startDispatcherLoop(root, { primary: adapter, roSinks: [], intervalMs, opts });
+}
+
+/**
+ * Start the dispatcher loop for a profile-aware {@link ChannelSet}; returns
+ * a stop function. The set's primary is the only adapter wired/polled for
+ * inbound; outbox delivery goes through the primary and `summary` intents
+ * fan out to the set's RO sinks (see {@link drainOutbox}). `opts.roSinks`
+ * overrides the set's sinks when provided.
+ */
+export function startChannelDispatcher(
+  root: string,
+  channelSet: ChannelSet,
+  intervalMs = 10_000,
+  opts: DispatcherOptions & { roSinks?: EscalationAdapter[] } = {},
+): () => void {
+  return startDispatcherLoop(root, {
+    primary: channelSet.primary,
+    roSinks: opts.roSinks ?? channelSet.roSinks,
+    legacySingleAdapter: channelSet.legacySingleAdapter,
+    intervalMs,
+    opts,
+  });
+}
+
 // ── CTO task inbox ─────────────────────────────────────────────────────────
 
 /** A task arriving from the messenger or the local drop. */
@@ -362,6 +732,8 @@ export interface InboxTask {
   by?: string;
   /** Resolved run id the task was filed under. */
   runId?: string;
+  /** Resident wave id admitted for this task (set when run state is readable). */
+  waveId?: string;
 }
 
 export interface DispatcherOptions {
@@ -632,11 +1004,39 @@ export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: Inbo
       // safe either way.
     }
   }
+  // ── Wave admission (resident control-plane) ─────────────────────────────
+  // After the file is durable and the quarantine record is admitted, admit
+  // the transport task as a wave in the run's canonical state. Best-effort,
+  // NEVER throws: an unreadable run state (or a state write failure) must
+  // not block the wake. appendWave is idempotent on source_id, so a wake
+  // rollback + transport retry re-admits the SAME wave (findWaveBySourceId
+  // returns the existing record) — a duplicate inbound message id never
+  // starts a second wave.
+  let waveId: string | undefined;
+  try {
+    const waveState = readCtoState(runId, root);
+    if (waveState) {
+      appendWave(
+        waveState,
+        {
+          id: `wave-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          source: task.by ?? "inbox",
+          source_id: task.id,
+          task: task.text,
+          slice_ids: [],
+        },
+        root,
+      );
+      waveId = findWaveBySourceId(waveState, task.id)?.id;
+    }
+  } catch {
+    // best-effort — the wake below is the primary path
+  }
   try {
     // Wake AFTER the file is durable and OUTSIDE the write guard: a throwing
     // callback must reach the transport so it can retry the update instead of
     // being hidden as a null result.
-    onTask?.({ ...task, runId });
+    onTask?.({ ...task, runId, waveId });
   } catch (error) {
     // Roll back the just-created file so the retry is a fresh write (no wx
     // collision) — otherwise the transport's retry would see a duplicate and
@@ -689,18 +1089,37 @@ export async function pollInbox(
         const path = join(drop, name);
         try {
           const raw = JSON.parse(readFileSync(path, "utf8")) as InboxTask & { kind?: string };
-          if (typeof raw?.text !== "string" || raw.text.trim().length === 0) continue;
+          const text = typeof raw?.text === "string" ? raw.text : "";
           if (raw.kind === "answer") {
+            // Answer markers must carry non-empty text (an empty answer is
+            // meaningless); a malformed marker stays in the drop for
+            // operator visibility (today's behavior).
+            if (text.trim().length === 0) continue;
             onAnswer?.({ id: raw.id, answer: raw.text });
             moveToProcessed(drop, path, name);
             continue;
           }
           const task: InboxTask = {
             id: raw.id ?? `local:${name}`,
-            text: raw.text,
+            text,
             at: raw.at ?? new Date().toISOString(),
             by: raw.by ?? "local-drop",
           };
+          if (text.trim().length === 0 || text.trim().length > MAX_INBOX_TEXT_LENGTH) {
+            // Rejected (SEC-2): empty or oversized bodies are never
+            // deliverable. Record a durable `inbox_quarantine` rejection
+            // (best-effort — handleInboxTask validates and returns null,
+            // never throws for validation failures) and MOVE the drop file
+            // to rejected/ instead of leaving it in drop/ forever.
+            try {
+              handleInboxTask(root, task, onTask);
+            } catch {
+              // quarantine bookkeeping is best-effort; the move below is
+              // the durable part
+            }
+            moveToRejected(drop, path, name);
+            continue;
+          }
           // File the task (wx idempotent) and wake. A throwing wake (or an
           // IO failure to file) propagates to the catch below, keeping the
           // drop file in place so the next tick retries the wake. Any
@@ -751,6 +1170,17 @@ function moveToProcessed(drop: string, path: string, name: string): void {
     renameSync(path, join(processedDir, name));
   } catch {
     // processed move is best-effort; the file stays and will be re-seen
+  }
+}
+
+function moveToRejected(drop: string, path: string, name: string): void {
+  try {
+    const rejectedDir = join(drop, "rejected");
+    mkdirSync(rejectedDir, { recursive: true });
+    renameSync(path, join(rejectedDir, name));
+  } catch {
+    // rejected move is best-effort; the file stays and will be re-seen
+    // (and re-rejected) on the next tick
   }
 }
 
