@@ -60,6 +60,25 @@ function withActiveRun(root: string): void {
   );
 }
 
+/**
+ * Node 20-compatible `Promise.withResolvers` (Node 22+ / ES2024);
+ * mirrors the repo convention in packages/e2e/src/util.ts and
+ * src/adapters/telegram.ts.
+ */
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 // ── Policy / capabilities ──────────────────────────────────────────────────
 
 test("policy: legacy telegram config -> RW primary via createChannelSet", () => {
@@ -281,7 +300,7 @@ test("RO inbound prohibition: only the primary is wired; the RO sink is not", as
     // PRIMARY — resolve the gate when that poll actually runs, so the
     // assertions below observe a tick that has already been executed
     // (no wall-clock wait).
-    const pollGate = Promise.withResolvers<void>();
+    const pollGate = deferred<void>();
     const origPrimaryPoll = primary.pollOnce.bind(primary);
     primary.pollOnce = (async () => {
       const result = await origPrimaryPoll();
@@ -423,7 +442,7 @@ test("legacy RO adapter still receives outbox entries via startChannelDispatcher
   try {
     // Deterministic completion: the immediate first tick drains the outbox
     // through the legacy drain target — resolve when its send actually runs.
-    const sendGate = Promise.withResolvers<void>();
+    const sendGate = deferred<void>();
     const delivered: Escalation[] = [];
     let wireCalls = 0;
     registerEscalationAdapter("spy-legacy", () => ({
