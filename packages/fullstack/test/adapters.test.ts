@@ -28,6 +28,7 @@ import {
   ensureStandbyRun,
   inboxDir,
   isBridgeAlive,
+  bridgeLockPath,
   writeBridgeLock,
   clearBridgeLock,
   registerEscalationAdapter,
@@ -621,7 +622,7 @@ test("adapters: bridge lock — alive while pid lives, stale after exit", () => 
     assert.equal(isBridgeAlive(root), false, "no lock -> not alive");
     // lock with a dead pid -> stale, treated as not alive
     mkdirSync(join(root, ".omp"), { recursive: true });
-    writeFileSync(join(root, ".omp", "tg-bridge.lock"), JSON.stringify({ pid: 99999999 }));
+    writeFileSync(bridgeLockPath(root), JSON.stringify({ pid: 99999999 }));
     assert.equal(isBridgeAlive(root), false, "stale lock (dead pid) ignored");
     // lock with OUR live pid -> alive
     writeBridgeLock(root);
@@ -652,6 +653,62 @@ test("adapters: pollInbox skips telegram polling while the bridge is alive", asy
     await pollInbox(root, stub, undefined, undefined);
     assert.equal(polls, 1, "bridge alive -> session must NOT poll telegram");
     clearBridgeLock(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: pollInbox — persisted mock RW adapter polls through a live tg-bridge lock and delivers the inbound task exactly once", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-mock-lock-"));
+  const dir = join(root, "rw");
+  const tasks: Array<{ id: string; text: string }> = [];
+  try {
+    const adapter = new MockEscalationAdapter({ persisted: { dir } });
+    adapter.setPlainMessageHandler((m) => tasks.push({ id: m.id, text: m.text }));
+
+    // Live-lock resident repro: the tg-bridge lock is up BEFORE the first poll.
+    writeBridgeLock(root);
+
+    // Second-process path: a SEPARATE writer drops the inbound file; this
+    // adapter instance only ever sees it via pollOnce() (no injection-time
+    // in-memory fire), so delivery is observable through the handler alone.
+    const inbound = join(dir, "inbound");
+    mkdirSync(inbound, { recursive: true });
+    writeFileSync(
+      join(inbound, "task-1.json"),
+      JSON.stringify({ id: "task-1", text: "bridge-lock mock task", at: new Date().toISOString(), by: "second-process" }),
+    );
+
+    await pollInbox(root, adapter, undefined, undefined);
+
+    assert.equal(tasks.length, 1, "live tg-bridge lock must not suppress a non-telegram RW adapter");
+    assert.equal(tasks[0]?.text, "bridge-lock mock task");
+    assert.ok(existsSync(join(inbound, "processed", "task-1.json")), "inbound task consumed (moved to processed)");
+
+    // Next tick: nothing new to drain — delivered exactly once.
+    await pollInbox(root, adapter, undefined, undefined);
+    assert.equal(tasks.length, 1, "inbound task delivered exactly once");
+  } finally {
+    clearBridgeLock(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: pollInbox — send-only adapter (no pollOnce) is never polled", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-sendonly-"));
+  try {
+    const stub = {
+      kind: "http",
+      send: async () => ({ sent: true }),
+    } as unknown as EscalationAdapter;
+    const tasks: Array<{ id: string; text: string }> = [];
+    const answers: Array<{ id: string; answer: string }> = [];
+    // Two ticks: resolves without throwing, and delivers nothing (RO/send-only
+    // adapters remain non-pollable — legacy behavior unchanged).
+    await pollInbox(root, stub, (t) => tasks.push(t), (a) => answers.push(a));
+    await pollInbox(root, stub, (t) => tasks.push(t), (a) => answers.push(a));
+    assert.equal(tasks.length, 0, "send-only adapter delivers no inbound tasks");
+    assert.equal(answers.length, 0, "send-only adapter delivers no answers");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

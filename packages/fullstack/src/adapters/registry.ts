@@ -64,10 +64,12 @@ import {
   writeCtoState,
   type ChannelCapabilities,
   type ChannelProfile,
+  type CtoState,
   type Escalation,
   type EscalationAdapter,
   type EscalationReceipt,
   type QuarantineRecord,
+  type WaveRecord,
 } from "@andvl1/omp-workflows-core";
 import { findActiveCtoRun } from "@andvl1/omp-workflows-core";
 import { HttpEscalationAdapter } from "./http.js";
@@ -127,6 +129,12 @@ export type CtoDelivery = Escalation & {
  * on duplicate / write failure (best-effort — the caller must never treat
  * this as a blocking path). The regular `drainOutbox` tick picks the entry
  * up with the existing retry/redaction/sent-file semantics.
+ *
+ * At-most-once across restart: the drain moves delivered files to
+ * `sent/`, so a later identical queue (e.g. a producer re-run after a
+ * dispatcher restart) must NOT re-queue an id that was already delivered.
+ * The `outbox/` `wx` guard alone only dedupes the not-yet-drained window;
+ * the `sent/` existence check below closes the drained window too.
  */
 export function queueCtoDelivery(root: string, runId: string, delivery: CtoDelivery): string | null {
   const dir = outboxDir(runId, root);
@@ -134,6 +142,7 @@ export function queueCtoDelivery(root: string, runId: string, delivery: CtoDeliv
   const path = join(dir, fileName);
   try {
     mkdirSync(dir, { recursive: true });
+    if (existsSync(join(dir, "sent", fileName))) return null;
     writeFileSync(path, JSON.stringify(delivery, null, 2), { flag: "wx" });
     return path;
   } catch {
@@ -318,6 +327,107 @@ export function createChannelSet(cwd: string, capabilities?: Record<string, Chan
  */
 export function isBidirectionalChannel(cwd: string, capabilities?: Record<string, ChannelCapabilities>): boolean {
   return hasRwPrimary(cwd, capabilities);
+}
+
+/**
+ * Synthesize a wave-completion summary body ONLY from authoritative run
+ * state (the `readCtoState` document): wave status/started_at/finished_at,
+ * run id, trimmed task excerpt, team status counts, and integration status
+ * when present. Dispatcher-side — no prompt/agent content is ever consulted.
+ */
+function waveSummaryBody(state: CtoState, wave: WaveRecord): string {
+  const excerpt = wave.task.trim().slice(0, 200);
+  const counts: Record<string, number> = {};
+  for (const team of state.teams ?? []) {
+    counts[team.status] = (counts[team.status] ?? 0) + 1;
+  }
+  const teamSummary =
+    Object.entries(counts)
+      .map(([status, n]) => `${n} ${status}`)
+      .sort()
+      .join(", ") || "0 teams";
+  const lines = [
+    `Run ${state.id}: wave ${wave.id} ${wave.status}.`,
+    `Started: ${wave.started_at}; finished: ${wave.finished_at}.`,
+    `Task: "${excerpt}"`,
+    `Teams: ${teamSummary}.`,
+  ];
+  if (state.integration?.status) lines.push(`Integration: ${state.integration.status}.`);
+  return lines.join("\n");
+}
+
+/**
+ * True when a persisted wave record has every field waveSummaryBody reads
+ * (malformed records are skipped, never summarized). Persisted state is
+ * UNTRUSTED at this boundary (agent-written/corrupt): a missing field must
+ * never abort the scan of other valid records. Active waves have no
+ * `finished_at` -> fail the guard -> skipped, same as today.
+ */
+function isSummarizableWave(wave: unknown): boolean {
+  if (typeof wave !== "object" || wave === null) return false;
+  const w = wave as Record<string, unknown>;
+  return (
+    typeof w.id === "string" && w.id.length > 0 &&
+    typeof w.task === "string" &&
+    typeof w.status === "string" &&
+    typeof w.started_at === "string" &&
+    typeof w.finished_at === "string" && w.finished_at.length > 0
+  );
+}
+
+/**
+ * Produce wave-completion summary deliveries (RW outbound producer).
+ *
+ * Scans every run's authoritative `.work-state/cto/<runId>/state.json` via
+ * `readCtoState` and, for each wave record with a set `finished_at` (a wave
+ * the engine closed — status "done" or "failed"), durably queues one
+ * deterministic `<runId>/wave/<waveId>/summary` entry (intent "summary",
+ * level "question" — the only non-blocking core level; "info" is not part
+ * of the core `EscalationLevel` union, topic "summary"). Waves without
+ * `finished_at` (still active) are NEVER summarized.
+ *
+ * Guarded: a config with NO profiles at all (no `.omp/escalation.json`, or
+ * one that resolves to zero channels) queues nothing. RO-only configs DO
+ * queue summaries — `drainOutbox` delivers them to the RO sinks (the
+ * permitted report fan-out; RO never becomes an inbound/answer source).
+ *
+ * At-most-once per (runId, waveId): the outbox/ `wx` guard dedupes within
+ * the not-yet-drained window, the `sent/` dedupe (queueCtoDelivery) closes
+ * the drained window across ticks and dispatcher restarts. Called from the
+ * dispatcher tick BEFORE `drainOutbox` so the first tick after a wave
+ * finishes both queues AND drains it.
+ *
+ * Returns the number of NEW deliveries queued (0 on re-runs). Never throws.
+ */
+export function produceWaveDeliveries(root: string): number {
+  try {
+    const channelSet = createChannelSet(root);
+    if (channelSet.profiles.length === 0) return 0;
+    const runsDir = join(root, ".work-state", "cto");
+    if (!existsSync(runsDir)) return 0;
+    let queued = 0;
+    for (const runId of readdirSync(runsDir)) {
+      const state = readCtoState(runId, root);
+      if (!state) continue;
+      const history = state.wave_history;
+      if (!Array.isArray(history)) continue; // corrupt non-array container: treat as empty, never abort the scan
+      for (const wave of history) {
+        if (!isSummarizableWave(wave)) continue; // active waves and malformed records are never summarized
+        const delivery = queueCtoDelivery(root, runId, {
+          id: `${runId}/wave/${wave.id}/summary`,
+          level: "question",
+          title: "CTO wave complete",
+          body: waveSummaryBody(state, wave),
+          intent: "summary",
+          topic: "summary",
+        });
+        if (delivery) queued += 1;
+      }
+    }
+    return queued;
+  } catch {
+    return 0; // never throws — the dispatcher tick must stay alive
+  }
 }
 
 /**
@@ -667,6 +777,9 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): () => void
     if (ticking || !ownsDispatcherLease(lease)) return;
     ticking = true;
     try {
+      // Wave-completion summaries first: a wave that finished since the
+      // last tick is queued AND drained in this same tick.
+      produceWaveDeliveries(root);
       await drainOutbox(root, drainAdapter, 3, { roSinks });
       await pollInbox(root, primary, wakeTask, wakeAnswer);
     } catch {
@@ -1062,6 +1175,33 @@ export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: Inbo
     }
     throw error;
   }
+  // ── Admission ACK (RW outbound producer) ────────────────────────────────
+  // A SUCCESSFUL wake is what makes the task admitted, so the deterministic
+  // `<runId>/wave/<task.id>/ack` entry is queued only AFTER the wake callback
+  // completed: a throwing wake rolls back the file and rethrows, never
+  // reaching this block — no false "task admitted" ACK can outlive a failed
+  // admission. At-most-once via the outbox/ wx guard + the sent/ dedupe in
+  // queueCtoDelivery (transport retries and dispatcher restarts never
+  // produce a second ACK). The body is short authoritative text — run id,
+  // wave id, trimmed task excerpt — and the entry is addressed to the
+  // profile's ackTarget when one is set. Best-effort, NEVER throws: a
+  // missing/malformed config (or any IO failure) must not break the return.
+  try {
+    const channelSet = createChannelSet(root);
+    if (channelSet.profile.direction === "rw" && channelSet.primary !== null) {
+      const excerpt = task.text.trim().slice(0, 200);
+      queueCtoDelivery(root, runId, {
+        id: `${runId}/wave/${task.id}/ack`,
+        level: "question",
+        title: "CTO task admitted",
+        body: `Run ${runId} admitted task "${excerpt}"${waveId ? ` as wave ${waveId}` : ""}.`,
+        intent: "ack",
+        ...(channelSet.profile.ackTarget ? { target: channelSet.profile.ackTarget } : {}),
+      });
+    }
+  } catch {
+    // best-effort — a failed ACK must never break the return path
+  }
   return path;
 }
 
@@ -1136,10 +1276,16 @@ export async function pollInbox(
   } catch {
     // drop missing — nothing to do
   }
-  // 2. Telegram long-poll (answers + plain-message inbox) — ONLY when no
-  //    tg-bridge owns the bot. While the bridge is alive it is the sole
-  //    getUpdates consumer (409 otherwise); the session just reads its files.
-  if (adapter && !isBridgeAlive(root) && isTelegramPollable(adapter)) {
+  // 2. Adapter long-poll (answers + plain-message inbox) — Telegram is
+  //    polled ONLY when no tg-bridge owns the bot: while the bridge is alive
+  //    it is the sole getUpdates consumer (409 otherwise); the session just
+  //    reads its files. The bridge lock is TELEGRAM-specific (one getUpdates
+  //    consumer per bot token) — a non-telegram adapter (the persisted
+  //    fake-RW mock, consumer transports) has no getUpdates consumer and is
+  //    polled REGARDLESS of the lock, so a live tg bridge never suppresses a
+  //    configured RW channel's inbound delivery.
+  const bridgeOwnsPoll = adapter !== null && adapter.kind === "telegram" && isBridgeAlive(root);
+  if (adapter && !bridgeOwnsPoll && isPollOnceCapable(adapter)) {
     try {
       const answers = (await adapter.pollOnce()) ?? [];
       const seen = seenAnswersFor(root);
@@ -1154,8 +1300,13 @@ export async function pollInbox(
   }
 }
 
-/** Narrow the Telegram-specific pollOnce surface (http is send-only). */
-function isTelegramPollable(
+/**
+ * Narrow the OPTIONAL pollOnce surface (http is send-only). Shared by the
+ * telegram adapter AND RW/consumer adapters (the persisted fake-RW mock,
+ * consumer transports) — NOT telegram-specific: any adapter exposing
+ * pollOnce() can deliver inbound while the session itself stays passive.
+ */
+function isPollOnceCapable(
   adapter: unknown,
 ): adapter is { pollOnce: () => Promise<Array<{ id: string; answer: string }>> } {
   if (typeof adapter !== "object" || adapter === null) return false;
