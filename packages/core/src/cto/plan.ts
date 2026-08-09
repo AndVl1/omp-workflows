@@ -32,23 +32,32 @@ export type BuildResult = { ok: true; plan: TeamPlan } | { ok: false; reason: st
 /**
  * TeamDef registry loader: reads the consumer-owned `.omp/teams.json`
  * (array of {@link TeamDef}). Missing/malformed file -> empty array (never
- * throws). Consumers may also pass TeamDef[] directly to the engine.
+ * throws). Entries that do not match the complete TeamDef shape are ignored.
+ * Consumers may also pass TeamDef[] directly to the engine.
  */
 export function loadTeamDefs(cwd: string): TeamDef[] {
   try {
     const raw = JSON.parse(readFileSync(join(cwd, ".omp", "teams.json"), "utf8")) as unknown;
     if (!Array.isArray(raw)) return [];
     return raw.filter((entry): entry is TeamDef => {
+      if (typeof entry !== "object" || entry === null) return false;
+      const candidate = entry as Partial<TeamDef>;
       return (
-        typeof entry === "object" &&
-        entry !== null &&
-        typeof (entry as TeamDef).id === "string" &&
-        typeof (entry as TeamDef).name === "string"
+        typeof candidate.id === "string" &&
+        typeof candidate.name === "string" &&
+        isStringArray(candidate.scope) &&
+        typeof candidate.profile === "string" &&
+        typeof candidate.lead === "string" &&
+        isStringArray(candidate.roster)
       );
     });
   } catch {
     return [];
   }
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
 /**
