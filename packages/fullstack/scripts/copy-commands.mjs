@@ -18,8 +18,9 @@
  * Idempotent: existing files are overwritten with the shipped versions.
  */
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -45,15 +46,37 @@ function isDirectory(path) {
 	}
 }
 
+function sha256File(filePath) {
+	return createHash("sha256").update(readFileSync(filePath)).digest("hex");
+}
+
+function collectShippedHashes(root, names) {
+	const files = {};
+	const visit = (sourceDir, name, relativeDir = "") => {
+		for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
+			if (entry.name === "node_modules") continue;
+			const relativePath = join(relativeDir, entry.name);
+			const sourcePath = join(sourceDir, entry.name);
+			if (entry.isDirectory()) {
+				visit(sourcePath, name, relativePath);
+			} else if (entry.isFile()) {
+				files[join(name, relativePath).split(sep).join("/")] = sha256File(sourcePath);
+			}
+		}
+	};
+	for (const name of names) visit(join(root, name), name);
+	return files;
+}
+
 /**
  * Converge `.omp/commands/` to the shipped set: remove plugin-owned command
  * directories that no longer ship (manifest-tracked or legacy shipped
  * names), preserve explicitly user-owned commands, and rewrite the manifest
- * with the current shipped set. Mirrors pruneStaleCommands in
+ * with the current shipped set and file hashes. Mirrors pruneStaleCommands in
  * src/copy-commands.ts (this script is standalone so it cannot import the
  * TS module).
  */
-function pruneStaleCommands(targetRoot, shippedNames) {
+function pruneStaleCommands(targetRoot, shippedNames, files = {}) {
 	let tracked = [];
 	try {
 		const raw = JSON.parse(readFileSync(join(targetRoot, SHIPPED_MANIFEST_FILE), "utf8"));
@@ -82,7 +105,7 @@ function pruneStaleCommands(targetRoot, shippedNames) {
 	try {
 		writeFileSync(
 			join(targetRoot, SHIPPED_MANIFEST_FILE),
-			`${JSON.stringify({ schema: 1, shipped: shippedNames }, null, 2)}\n`,
+			`${JSON.stringify({ schema: 2, shipped: shippedNames, files }, null, 2)}\n`,
 		);
 	} catch {
 		// best-effort
@@ -132,5 +155,5 @@ for (const entry of readdirSync(shippedDir, { withFileTypes: true })) {
 	if (entry.isDirectory() && !entry.name.startsWith(".")) shippedNames.push(entry.name);
 }
 copyTree(shippedDir, targetDir);
-pruneStaleCommands(targetDir, shippedNames);
+pruneStaleCommands(targetDir, shippedNames, collectShippedHashes(shippedDir, shippedNames));
 console.log("copy-commands: done");
