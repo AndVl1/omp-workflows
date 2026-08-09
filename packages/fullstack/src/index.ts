@@ -25,10 +25,11 @@ import {
 	defaultFullstackModelRoles,
 	defaultFullstackRoles,
 	defaultFullstackScopeMap,
+	findActiveCtoRun,
 	registerTeamWorkflow,
 } from "@andvl1/omp-workflows-core";
 import { ensureCommandsForSession } from "./copy-commands.js";
-import { createEscalationAdapter, loadEscalationConfig, startDispatcher, type InboxTask } from "./adapters/registry.js";
+import { createChannelSet, queueCtoDelivery, startChannelDispatcher, type InboxTask } from "./adapters/registry.js";
 import { createAskRedirectGate } from "./messenger-channel.js";
 import { createCtoModeReminderHandler } from "./cto-mode-reminder.js";
 import {
@@ -210,22 +211,42 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     const ui = extractUiFromContext(ctx);
     if (ui) subagentTreeRef.current = registerSubagentTree(pi, ui, cwd);
     // CTO escalation dispatcher: only the interactive main session may own
-    // Telegram polling. Task subagents also emit session_start, but starting a
+    // inbound polling. Task subagents also emit session_start, but starting a
     // dispatcher there creates another getUpdates consumer with offset=0.
     if (!isMainSessionContext(ctx)) return;
     dispatcherStopsByCwd.get(cwd)?.();
     dispatcherStopsByCwd.delete(cwd);
-    const config = loadEscalationConfig(cwd);
-    if (!config) return;
-    const adapter = createEscalationAdapter(config, cwd);
-    if (!adapter) return;
-    const stopDispatcher = startDispatcher(cwd, adapter, 10_000, {
+    // Profile-aware channel set (core capability-validated normalization):
+    // the RW primary is the only adapter wired/polled for inbound; RO sinks
+    // are outbound report sinks only.
+    const channelSet = createChannelSet(cwd);
+    if (channelSet.profiles.length === 0) return;
+    // Online ACK: with a validated RW primary AND an active resident run,
+    // queue a durable online-ack delivery BEFORE the dispatcher starts —
+    // its immediate first tick drains it. No active run -> no ACK (standby
+    // creation belongs to /cto, not the dispatcher).
+    if (channelSet.profile.direction === "rw") {
+      const active = findActiveCtoRun(cwd);
+      if (active) {
+        queueCtoDelivery(cwd, active.runId, {
+          id: `${active.runId}/system/ack/${Date.now()}`,
+          level: "question",
+          title: "CTO online",
+          body: `resident run ${active.runId} standby — awaiting tasks (wave admission + outbox delivery active)`,
+          intent: "ack",
+          target: channelSet.profile.ackTarget,
+        });
+      }
+    }
+    const stopDispatcher = startChannelDispatcher(cwd, channelSet, 10_000, {
       // Wake the CTO session on an inbound task: idle starts a turn,
       // streaming queues as steer. The [CTO-INBOX] envelope is the
-      // contract the standby/CTO prompt tells the agent to fold in.
+      // contract the standby/CTO prompt tells the agent to fold in; the
+      // wave id is included when wave admission succeeded.
       onTask: (task: InboxTask) => {
+        const wave = task.waveId ? ` (wave ${task.waveId})` : "";
         pi.sendUserMessage(
-          `[CTO-INBOX] New task via messenger (run \`${task.runId ?? "?"}\`):\n${task.text}\n\n` +
+          `[CTO-INBOX] New task via messenger (run \`${task.runId ?? "?"}\`)${wave}:\n${task.text}\n\n` +
             "Treat this as a /cto task — fold it into the active run (amend discipline: re-plan, " +
             "spawn leads in parallel, integration covers ALL teams).",
         );

@@ -24,6 +24,7 @@ import { dodBackstop } from "./gates/dod-backstop.js";
 import { safetyGuard } from "./gates/safety.js";
 import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { outboxEnforcementGate } from "./gates/outbox.js";
+import { ctoSliceTaskGate } from "./cto/slice-gate.js";
 import { registerObservabilityHooks } from "./observability/index.js";
 import { registerWorkflowProfiles } from "./engine/profile.js";
 import type { RoleConfig } from "./engine/types.js";
@@ -139,6 +140,12 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 		if (outboxGate?.block) return outboxGate;
 		const r0 = classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c);
 		if (r0?.block) return r0;
+		// CTO slice dispatch gate: after classification, before safety. No
+		// marker → block when an active CTO wave exists (fail-closed), else
+		// allow; marker + invalid canonical state → block. ctoNestingGuard
+		// above stays first and untouched.
+		const rSlice = ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c);
+		if (rSlice?.block) return rSlice;
 		return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
 	});
 
@@ -275,6 +282,12 @@ export {
 	activeTeams,
 	isCtoRunTerminal,
 	resolveCtoAutonomous,
+	// ── resident control-plane (wave lifecycle) ──
+	isCtoResident,
+	appendWave,
+	finishWave,
+	activeWave,
+	findWaveBySourceId,
 } from "./cto/state.js";
 export { teamDoDComplete, integrationDoD, ctoBackstop } from "./cto/gates.js";
 export { runCto, ctoRunId, type RunCtoOptions, type RunCtoResult } from "./cto/run.js";
@@ -350,6 +363,26 @@ export type {
 	DissentTrigger,
 	DissentEvaluation,
 } from "./cto/types.js";
+
+// ── cto resident control-plane (channel policy, slice gate) ────────────────
+export {
+	resolveChannelProfile,
+	normalizeChannelConfig,
+	hasRwPrimary,
+	loadEscalationConfigRaw,
+} from "./cto/channels.js";
+export type { ExplicitChannelConfig, ChannelCapabilities } from "./cto/channels.js";
+export {
+	buildCtoSliceMarker,
+	parseCtoSliceMarker,
+	assertCtoSliceDispatchable,
+	ctoSliceTaskGate,
+	validateSliceClassification,
+	validateSliceWorkflow,
+	validateSliceDoD,
+	CTO_SLICE_MARKER_PREFIX,
+} from "./cto/slice-gate.js";
+export type { WaveRecord, ChannelProfile, ChannelDirection } from "./cto/types.js";
 
 // ── cto-safety (br-zps.4, br-zps.5, br-zps.6) ───────────────────────────────
 export { redactEscalation, DEFAULT_REDACTION_CONFIG } from "./cto/redaction.js";

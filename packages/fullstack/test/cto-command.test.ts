@@ -93,6 +93,14 @@ test("fullstack: /cto command loads and parses an envelope", async () => {
 		assert.ok(result.includes("return to standby"), "CTO returns to standby after the wave");
 		assert.ok(result.includes("debug-cycle"), "bug-fix slices run debug-cycle through the team");
 		assert.ok(result.includes("Architecture first"), "architecture stage in the contract");
+		assert.ok(result.includes("Wave / slice gate contract"), "wave/slice gate contract section present");
+		assert.ok(
+			result.includes("<!-- omp-cto-slice run=<runId> slice=<sliceId> -->"),
+			"exact slice marker literal in the fresh prompt",
+		);
+		assert.ok(result.includes("active_wave_id"), "wave creation required before lead spawn");
+		assert.ok(result.includes("dod.json"), "per-slice DoD required before lead spawn");
+		assert.ok(!result.includes("runCto"), "no TS engine call remains in the prompt");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -193,6 +201,7 @@ test("fullstack: empty args start CTO STANDBY", async () => {
 	assert.ok(result.includes("ARE USER COMMANDS"), "inbox messages are user commands to the main-session CTO");
 	assert.ok(result.includes("return to standby"), "standby returns to standby after each wave");
 	assert.ok(result.includes("task(agent=@cto)"), "nested CTO dispatch forbidden in standby");
+	assert.ok(result.includes("run id NEVER changes"), "standby keeps the SAME run id across follow-up waves");
 	assert.ok(result.includes("(schema 2,"), "standby writer instructed to emit schema-2 state (core parity)");
 	assert.ok(!result.includes("schema 1"), "no schema-1 drift in the shipped standby prompt");
 });
@@ -298,6 +307,11 @@ test("fullstack: buildAmendPrompt renders the amend contract", () => {
 		assert.ok(prompt.includes("/cto AMEND"));
 		assert.ok(prompt.includes("Run: `run-1`"));
 		assert.ok(prompt.includes("Integration covers ALL teams"));
+		assert.ok(
+			prompt.includes("<!-- omp-cto-slice run=<runId> slice=<sliceId> -->"),
+			"exact marker literal in the amend prompt",
+		);
+		assert.ok(prompt.includes("Wave / slice gate contract"), "amend carries the wave/slice gate contract");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

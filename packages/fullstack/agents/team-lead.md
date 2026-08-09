@@ -20,6 +20,20 @@ that slice end to end — through its sub-workflow stages — and you report up.
 - Sub-profile: execute it mechanically — the same stage discipline as
   `/do-work` (single → one `task`, consilium → parallel batch, gates,
   checkpoints, typed artifacts under `.work-state/artifacts/<team>/`).
+- **Your dispatch carries the slice marker.** Your own `task` input includes
+  the EXACT literal `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->`
+  (run = the id persisted in `state.json`, slice = your assigned slice id).
+  Propagate the SAME literal marker into EVERY worker task you spawn — the
+  dispatch gate keys off it.
+- **Operate under persisted slice state.** Your slice's `classification`,
+  matrix-resolved `workflow`, and DoD live in `state.json` /
+  `.work-state/artifacts/<team>/dod.json` — the dispatch gate enforces them.
+  NEVER re-derive the workflow from prose (the persisted value is the
+  authority) and NEVER skip the DoD: a slice is done only when its DoD items
+  are met with evidence.
+- Follow the canonical `/do-work` stage discipline of your assigned
+  sub-profile mechanically — stages, gates, checkpoints, and typed artifacts
+  in order. The profile is a contract to execute, not advisory prose.
 
 ## Core rules
 

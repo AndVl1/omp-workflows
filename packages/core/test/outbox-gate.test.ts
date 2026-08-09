@@ -95,3 +95,30 @@ test("missing cwd path passes, never throws", () => {
   const cwd = join(tmpdir(), "outbox-gate-does-not-exist-" + Date.now());
   assert.equal(outboxEnforcementGate(ask, { cwd }), undefined);
 });
+
+// ── Explicit channels[] (architecture-4): hasBidirectionalChannel now
+// resolves through the shared normalizer (cto/channels.ts), so a
+// capability-validated RW primary blocks ask and a declared-rw incapable
+// kind (http, no inbound) downgrades to ro and passes. Guards against
+// reverting hasBidirectionalChannel to the legacy direct-read, which would
+// silently drop explicit-channels support at this boundary while leaving
+// every other test green.
+test("ask is blocked for an explicit validated RW primary channel (explicit channels[])", () => {
+  const cwd = makeCwd({ channels: [{ id: "control", adapter: "mock", direction: "read-write", primary: true }] });
+  try {
+    const result = outboxEnforcementGate(ask, { cwd });
+    assert.ok(result, "expected a block for a validated RW primary");
+    assert.equal(result.block, true);
+  } finally {
+    cleanup(cwd);
+  }
+});
+
+test("ask passes for an explicit declared-rw incapable kind (http downgrades to ro)", () => {
+  const cwd = makeCwd({ channels: [{ id: "sink", adapter: "http", direction: "read-write" }] });
+  try {
+    assert.equal(outboxEnforcementGate(ask, { cwd }), undefined, "http has no inbound -> ro -> ask passes");
+  } finally {
+    cleanup(cwd);
+  }
+});

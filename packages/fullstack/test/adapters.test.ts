@@ -14,6 +14,7 @@ import { join } from "node:path";
 
 import {
   type Escalation,
+  type EscalationAdapter,
   readAnswers,
 } from "@andvl1/omp-workflows-core";
 import { HttpEscalationAdapter } from "../src/adapters/http.js";
@@ -27,12 +28,16 @@ import {
   ensureStandbyRun,
   inboxDir,
   isBridgeAlive,
+  bridgeLockPath,
   writeBridgeLock,
   clearBridgeLock,
   registerEscalationAdapter,
   isBidirectionalChannel,
   startDispatcher,
   dispatcherLockPath,
+  MAX_INBOX_TEXT_LENGTH,
+  sha256Hex,
+  createChannelSet,
 } from "../src/adapters/registry.js";
 import {
   loadEscalationConfig,
@@ -190,7 +195,7 @@ test("adapters: telegram sendMessage + pollOnce writes answer files", async () =
           JSON.stringify({
             ok: true,
             result: [
-              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 42 } } },
+              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 42 }, chat: { id: 100 }, from: { id: 100 } } },
             ],
           }),
           { status: 200 },
@@ -199,10 +204,10 @@ test("adapters: telegram sendMessage + pollOnce writes answer files", async () =
       throw new Error(`unexpected method: ${method}`);
     }) as typeof fetch;
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "c", cwd: root, fetchImpl });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl });
     const receipt = await adapter.send(sampleEscalation());
     assert.equal(receipt.sent, true);
-    assert.equal((sentPayload as { chat_id?: string })?.chat_id, "c");
+    assert.equal((sentPayload as { chat_id?: string })?.chat_id, "100");
     const keyboard = (sentPayload as { reply_markup?: { inline_keyboard?: unknown[][] } })?.reply_markup as {
       inline_keyboard?: unknown[][];
     };
@@ -237,7 +242,12 @@ test("adapters: telegram callback_query maps to an option answer", async () => {
             result: [
               {
                 update_id: 2,
-                callback_query: { id: "q1", message: { message_id: 7 }, data: "run-1/team-a/clarify/1::grpc" },
+                callback_query: {
+                  id: "q1",
+                  from: { id: 100 },
+                  message: { message_id: 7, chat: { id: 100 } },
+                  data: "run-1/team-a/clarify/1::grpc",
+                },
               },
             ],
           }),
@@ -247,7 +257,7 @@ test("adapters: telegram callback_query maps to an option answer", async () => {
       throw new Error(`unexpected method: ${method}`);
     }) as typeof fetch;
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "c", cwd: root, fetchImpl });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl });
     await adapter.send(sampleEscalation());
     const answers = await adapter.pollOnce();
     assert.equal(answers.length, 1);
@@ -270,7 +280,7 @@ test("adapters: telegram plain message routes to the inbox handler (not an answe
         return new Response(
           JSON.stringify({
             ok: true,
-            result: [{ update_id: 3, message: { message_id: 200, text: "Fix the login bug" } }],
+            result: [{ update_id: 3, message: { message_id: 200, text: "Fix the login bug", chat: { id: 100 }, from: { id: 100 } } }],
           }),
           { status: 200 },
         );
@@ -280,7 +290,7 @@ test("adapters: telegram plain message routes to the inbox handler (not an answe
 
     const adapter = new TelegramEscalationAdapter({
       token: "t",
-      chatId: "c",
+      chatId: "100",
       cwd: root,
       fetchImpl,
       onPlainMessage: (msg) => inboxMessages.push(msg),
@@ -310,7 +320,7 @@ test("adapters: telegram concurrent pollOnce calls share one getUpdates round", 
           JSON.stringify({
             ok: true,
             result: [
-              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 7 } } },
+              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 7 }, chat: { id: 100 }, from: { id: 100 } } },
             ],
           }),
           { status: 200 },
@@ -319,7 +329,7 @@ test("adapters: telegram concurrent pollOnce calls share one getUpdates round", 
       throw new Error(`unexpected method: ${method}`);
     }) as typeof fetch;
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "c", cwd: root, fetchImpl });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl });
     await adapter.send(sampleEscalation());
 
     // Both calls are in flight together; the second must reuse the first's
@@ -355,7 +365,7 @@ test("adapters: telegram pollOnce keeps the offset on answer persistence failure
           JSON.stringify({
             ok: true,
             result: [
-              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 7 } } },
+              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 7 }, chat: { id: 100 }, from: { id: 100 } } },
             ],
           }),
           { status: 200 },
@@ -364,7 +374,7 @@ test("adapters: telegram pollOnce keeps the offset on answer persistence failure
       throw new Error(`unexpected method: ${method}`);
     }) as typeof fetch;
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "c", cwd: root, fetchImpl });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl });
     await adapter.send(sampleEscalation());
 
     // Sabotage answer persistence: the answers dir path is occupied by a
@@ -436,6 +446,151 @@ test("adapters: pollInbox ingests local .omp/inbox drop files", async () => {
   }
 });
 
+test("adapters: pollInbox rejects empty and oversized drop files to drop/rejected/ with quarantine records", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-drop-reject-"));
+  try {
+    const runId = resolveInboxRunId(root); // standby run first so state is readable
+    const drop = join(root, ".omp", "inbox");
+    mkdirSync(drop, { recursive: true });
+    writeFileSync(join(drop, "empty.json"), JSON.stringify({ id: "e1", text: "   " }));
+    writeFileSync(join(drop, "big.json"), JSON.stringify({ id: "b1", text: "x".repeat(MAX_INBOX_TEXT_LENGTH + 1) }));
+    writeFileSync(join(drop, "valid.json"), JSON.stringify({ id: "v1", text: "Do the thing" }));
+
+    const tasks: Array<{ id: string; text: string }> = [];
+    await pollInbox(root, null, (t) => tasks.push(t));
+
+    // The valid file still processes as today:
+    assert.equal(tasks.length, 1, "only the valid task woke");
+    assert.equal(tasks[0]?.text, "Do the thing");
+    assert.ok(existsSync(join(drop, "processed", "valid.json")), "valid drop file moved to processed");
+    // Rejected files are moved OUT of drop/ (never skipped forever):
+    assert.ok(existsSync(join(drop, "rejected", "empty.json")), "empty drop file moved to rejected/");
+    assert.ok(existsSync(join(drop, "rejected", "big.json")), "oversized drop file moved to rejected/");
+    // Durable quarantine records in the run state:
+    const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+      inbox_quarantine?: Record<string, { status?: string; reason?: string }>;
+    };
+    const q = state.inbox_quarantine ?? {};
+    assert.equal(q[sha256Hex("   ")]?.status, "rejected", "empty text recorded as rejected");
+    assert.equal(q[sha256Hex("   ")]?.reason, "empty text");
+    assert.equal(q[sha256Hex("x".repeat(MAX_INBOX_TEXT_LENGTH + 1))]?.status, "rejected", "oversized text recorded as rejected");
+    assert.equal(q[sha256Hex("x".repeat(MAX_INBOX_TEXT_LENGTH + 1))]?.reason, "text exceeds MAX_INBOX_TEXT_LENGTH");
+    assert.equal(q[sha256Hex("Do the thing")]?.status, "admitted", "valid task admitted");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: drainOutbox RO-only — every sink fails → file stays in outbox, sent:false with sinkErrors", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-ro-fail-"));
+  try {
+    const runId = "run-ro-fail";
+    mkdirSync(outboxDir(runId, root), { recursive: true });
+    writeFileSync(
+      join(outboxDir(runId, root), "s1.json"),
+      JSON.stringify({ id: "run-ro-fail/sum/1", level: "question", title: "T", body: "b", intent: "summary" }),
+    );
+    const failing = (label: string): EscalationAdapter => ({
+      kind: "mock",
+      send: async () => {
+        throw new Error(`sink ${label} down`);
+      },
+      cancel: async () => undefined,
+    });
+    const results = await drainOutbox(root, null, 3, { roSinks: [failing("a"), failing("b")] });
+    assert.equal(results.length, 1);
+    assert.equal(results[0]?.sent, false, "not archived when every attempted sink failed");
+    assert.equal(results[0]?.error, "all ro sinks failed");
+    assert.equal(results[0]?.sinkErrors?.length, 2, "both sink failures recorded");
+    assert.ok(existsSync(join(outboxDir(runId, root), "s1.json")), "file LEFT in outbox/ for the next drain");
+    assert.equal(existsSync(join(outboxDir(runId, root), "sent")), false, "nothing archived");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: drainOutbox RO-only — partial sink failure → archived sent:true with sinkErrors", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-ro-partial-"));
+  try {
+    const runId = "run-ro-partial";
+    mkdirSync(outboxDir(runId, root), { recursive: true });
+    writeFileSync(
+      join(outboxDir(runId, root), "s1.json"),
+      JSON.stringify({ id: "run-ro-partial/sum/1", level: "question", title: "T", body: "b", intent: "summary" }),
+    );
+    const failing: EscalationAdapter = {
+      kind: "mock",
+      send: async () => {
+        throw new Error("sink down");
+      },
+      cancel: async () => undefined,
+    };
+    const ok: EscalationAdapter = {
+      kind: "mock",
+      send: async () => ({ sent: true }),
+      cancel: async () => undefined,
+    };
+    const results = await drainOutbox(root, null, 3, { roSinks: [failing, ok] });
+    assert.equal(results.length, 1);
+    assert.equal(results[0]?.sent, true, "archived when at least one sink succeeded");
+    assert.equal(results[0]?.sinkErrors?.length, 1, "partial sink failure recorded");
+    assert.ok(existsSync(join(outboxDir(runId, root), "sent", "s1.json")), "archived to sent/");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: drainOutbox RO-only — all sinks subscription-skipped → archived sent:true, no sinkErrors", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-ro-skip-"));
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(
+      join(root, ".omp", "escalation.json"),
+      JSON.stringify({ channels: [{ id: "audit", adapter: "mock", direction: "read-only", subscriptions: ["billing"] }] }),
+    );
+    const set = createChannelSet(root);
+    assert.equal(set.primary, null, "RO-only set");
+    assert.equal(set.roSinks.length, 1);
+    const runId = "run-ro-skip";
+    mkdirSync(outboxDir(runId, root), { recursive: true });
+    writeFileSync(
+      join(outboxDir(runId, root), "s1.json"),
+      JSON.stringify({ id: "run-ro-skip/sum/1", level: "question", title: "T", body: "b", intent: "summary", topic: "progress" }),
+    );
+    const results = await drainOutbox(root, null, 3, { roSinks: set.roSinks });
+    assert.equal(results.length, 1);
+    assert.equal(results[0]?.sent, true, "subscription-skipped summary archived as an honest no-op");
+    assert.equal(results[0]?.sinkErrors, undefined, "no sinkErrors when nothing was attempted");
+    assert.ok(existsSync(join(outboxDir(runId, root), "sent", "s1.json")), "archived to sent/");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: drainOutbox RO-only — succeeding sink → archived sent:true (today's behavior)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-ro-ok-"));
+  try {
+    const runId = "run-ro-ok";
+    mkdirSync(outboxDir(runId, root), { recursive: true });
+    writeFileSync(
+      join(outboxDir(runId, root), "s1.json"),
+      JSON.stringify({ id: "run-ro-ok/sum/1", level: "question", title: "T", body: "b", intent: "summary" }),
+    );
+    const ok: EscalationAdapter = {
+      kind: "mock",
+      send: async () => ({ sent: true }),
+      cancel: async () => undefined,
+    };
+    const results = await drainOutbox(root, null, 3, { roSinks: [ok] });
+    assert.equal(results.length, 1);
+    assert.equal(results[0]?.sent, true);
+    assert.equal(results[0]?.sinkErrors, undefined, "no sinkErrors on full success");
+    assert.ok(existsSync(join(outboxDir(runId, root), "sent", "s1.json")), "archived to sent/");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 
 test("adapters: pollInbox wakes on a new escalation answer (user-initiated)", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-answer-wake-"));
@@ -467,7 +622,7 @@ test("adapters: bridge lock — alive while pid lives, stale after exit", () => 
     assert.equal(isBridgeAlive(root), false, "no lock -> not alive");
     // lock with a dead pid -> stale, treated as not alive
     mkdirSync(join(root, ".omp"), { recursive: true });
-    writeFileSync(join(root, ".omp", "tg-bridge.lock"), JSON.stringify({ pid: 99999999 }));
+    writeFileSync(bridgeLockPath(root), JSON.stringify({ pid: 99999999 }));
     assert.equal(isBridgeAlive(root), false, "stale lock (dead pid) ignored");
     // lock with OUR live pid -> alive
     writeBridgeLock(root);
@@ -498,6 +653,62 @@ test("adapters: pollInbox skips telegram polling while the bridge is alive", asy
     await pollInbox(root, stub, undefined, undefined);
     assert.equal(polls, 1, "bridge alive -> session must NOT poll telegram");
     clearBridgeLock(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: pollInbox — persisted mock RW adapter polls through a live tg-bridge lock and delivers the inbound task exactly once", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-mock-lock-"));
+  const dir = join(root, "rw");
+  const tasks: Array<{ id: string; text: string }> = [];
+  try {
+    const adapter = new MockEscalationAdapter({ persisted: { dir } });
+    adapter.setPlainMessageHandler((m) => tasks.push({ id: m.id, text: m.text }));
+
+    // Live-lock resident repro: the tg-bridge lock is up BEFORE the first poll.
+    writeBridgeLock(root);
+
+    // Second-process path: a SEPARATE writer drops the inbound file; this
+    // adapter instance only ever sees it via pollOnce() (no injection-time
+    // in-memory fire), so delivery is observable through the handler alone.
+    const inbound = join(dir, "inbound");
+    mkdirSync(inbound, { recursive: true });
+    writeFileSync(
+      join(inbound, "task-1.json"),
+      JSON.stringify({ id: "task-1", text: "bridge-lock mock task", at: new Date().toISOString(), by: "second-process" }),
+    );
+
+    await pollInbox(root, adapter, undefined, undefined);
+
+    assert.equal(tasks.length, 1, "live tg-bridge lock must not suppress a non-telegram RW adapter");
+    assert.equal(tasks[0]?.text, "bridge-lock mock task");
+    assert.ok(existsSync(join(inbound, "processed", "task-1.json")), "inbound task consumed (moved to processed)");
+
+    // Next tick: nothing new to drain — delivered exactly once.
+    await pollInbox(root, adapter, undefined, undefined);
+    assert.equal(tasks.length, 1, "inbound task delivered exactly once");
+  } finally {
+    clearBridgeLock(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: pollInbox — send-only adapter (no pollOnce) is never polled", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-sendonly-"));
+  try {
+    const stub = {
+      kind: "http",
+      send: async () => ({ sent: true }),
+    } as unknown as EscalationAdapter;
+    const tasks: Array<{ id: string; text: string }> = [];
+    const answers: Array<{ id: string; answer: string }> = [];
+    // Two ticks: resolves without throwing, and delivers nothing (RO/send-only
+    // adapters remain non-pollable — legacy behavior unchanged).
+    await pollInbox(root, stub, (t) => tasks.push(t), (a) => answers.push(a));
+    await pollInbox(root, stub, (t) => tasks.push(t), (a) => answers.push(a));
+    assert.equal(tasks.length, 0, "send-only adapter delivers no inbound tasks");
+    assert.equal(answers.length, 0, "send-only adapter delivers no answers");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

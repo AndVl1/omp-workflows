@@ -12,7 +12,7 @@
  * `vibe-report/sub-orchestration-2026-08-04.md`.
  */
 
-import type { PauseKind } from "../engine/types.js";
+import type { PauseKind, WorkflowName } from "../engine/types.js";
 import type { ModelClassification } from "../engine/run.js";
 
 /** Git strategy for a team — decided by the CTO at plan time (interview Q3). */
@@ -160,6 +160,59 @@ export interface EscalationAnswer {
 
 export type TeamRunStatus = "pending" | "in_progress" | "parked" | "done" | "failed";
 
+// ── Resident control-plane (schema-2 additive; cto-core defines, dispatcher/resolver owners write) ──
+
+/** Declared channel direction in `.omp/escalation.json` (explicit channels[]). */
+export type ChannelDirection = "read-write" | "read-only";
+
+/**
+ * One admitted work wave (schema-2 additive). Transport source_id admission
+ * idempotency: `appendWave` dedupes on `source_id`, so a duplicate inbound
+ * task (same transport message id) never starts a second wave.
+ */
+export interface WaveRecord {
+  /** Local wave id (ULID-ish / run-scoped). */
+  id: string;
+  /** Transport source kind (telegram|http|mock|inbox|cli|...). */
+  source: string;
+  /** Transport message id — the dedup key (idempotent admission). */
+  source_id: string;
+  /** The task text that started the wave. */
+  task: string;
+  /** Slice ids this wave dispatches (leads/workers per slice). */
+  slice_ids: string[];
+  status: "active" | "done" | "failed";
+  /** ISO. */
+  started_at: string;
+  /** ISO — set by finishWave. */
+  finished_at?: string;
+}
+
+/**
+ * Resolved channel profile (one and only one — architecture-4). `direction`
+ * "none" means no channel at all (terminal ask fallback stays available).
+ */
+export interface ChannelProfile {
+  direction: "rw" | "ro" | "none";
+  /** Transport kind (telegram|http|mock|...). */
+  transport?: string;
+  /**
+   * Explicit channels[] entry id — present for explicit entries that carry
+   * one (the unique per-entry handle createChannelSet binds an adapter to
+   * its own entry config); ABSENT for legacy single-adapter profiles and
+   * for id-less explicit entries.
+   */
+  id?: string;
+  /** Adapter kind (telegram|http|mock|...). */
+  adapter?: string;
+  /** Where to route answers / commands (e.g. telegram chatId). */
+  ackTarget?: string;
+  /** True for the preferred primary channel. */
+  primary?: boolean;
+  /** Topics this channel is subscribed to (explicit channels[] only). */
+  subscriptions?: string[];
+}
+
 /** Per-CTO-run persistent state under `.work-state/cto/<id>/state.json`. */
 export interface CtoState {
   schema: 2;
@@ -189,6 +242,21 @@ export interface CtoState {
     status: TeamRunStatus;
     escalations: Record<string, EscalationRecord>;
     dod_path?: string;
+    /**
+     * Slice this team owns in a resident wave (schema-2 additive; set by the
+     * CTO at plan time). The slice gate keys off it (see cto/slice-gate.ts).
+     */
+    slice_id?: string;
+    /**
+     * Per-slice model classification (schema-2 additive; PHASE-0 contract).
+     * Required before lead/worker dispatch (architecture-3).
+     */
+    classification?: ModelClassification;
+    /**
+     * Matrix-resolved workflow for this slice (schema-2 additive). Must equal
+     * resolveWorkflow(type, complexity, autonomous) — validated by the gate.
+     */
+    workflow?: WorkflowName;
   }>;
   integration: {
     status: "pending" | "in_progress" | "done" | "failed";
@@ -227,6 +295,20 @@ export interface CtoState {
   inbox_quarantine?: Record<string, QuarantineRecord>;     // br-zps.4 (cto-safety)
   health?: RunHealth;                                      // br-zps.7 (cto-operations)
   scheduler?: SchedulerState;                              // br-zps.8 (cto-operations)
+  // ── resident control-plane (schema-2 additive; default-filled by migrateCtoState, written by cto-core) ──
+  /**
+   * Append-only wave records (state_contract.wave_history). Idempotent on
+   * transport `source_id`; a standby/resident run accumulates waves across
+   * sessions and stays active (isCtoRunTerminal honors the standby carve-out).
+   */
+  wave_history?: WaveRecord[];
+  /** Set only while a wave is running; cleared by finishWave (state_contract.resident). */
+  active_wave_id?: string;
+  /**
+   * Resolved channel profile (state_contract.channel). Written by the
+   * dispatcher/resolver owners; prompt rendering derives from it.
+   */
+  channel_profile?: ChannelProfile;
 }
 
 // ── Schema-2 shared typed interfaces (cto-core defines; all teams consume) ──

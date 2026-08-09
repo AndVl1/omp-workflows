@@ -20,6 +20,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { findProfileDir } from "../engine/profile.js";
 import { loadTeamDefs } from "../cto/plan.js";
+import { resolveChannelProfile } from "../cto/channels.js";
 import { isCtoRunTerminal, readCtoState, resolveCtoAutonomous, ctoStateDir } from "../cto/state.js";
 import { MAX_DECOMPOSITION_DEPTH, MAX_TEAMS, type CtoState } from "../cto/types.js";
 import type { ModelClassification } from "../engine/run.js";
@@ -80,44 +81,53 @@ function renderTeamsTable(cwd: string): string {
 }
 
 /**
- * Render the user-communication channel section from `.omp/escalation.json`.
- * - `telegram`: bidirectional — ALL user questions go through the messenger
- *   (outbox -> answers/), the `ask` tool is blocked.
- * - `http`: push-only — use `ask` for interactive checkpoints.
- * - none: use `ask`.
+ * Render the user-communication channel section. Drives off the single
+ * resolved channel profile (cto/channels.ts — architecture-4), which
+ * normalizes both legacy {adapter,bidirectional,http,telegram} and explicit
+ * `channels[]` configs:
+ * - direction "rw" (validated inbound + outbound): messenger mode — ALL user
+ *   questions go through the outbox (outbox -> answers/), the `ask` tool is
+ *   blocked.
+ * - direction "ro" (push-only sink): report-only — `ask` stays available for
+ *   interactive checkpoints.
+ * - direction "none": use `ask`.
  */
 export function renderChannelSection(cwd: string): string {
-  let adapter: string | null = null;
-  let bidirectional = false;
-  try {
-    const raw = JSON.parse(readFileSync(join(cwd, ".omp", "escalation.json"), "utf8")) as { adapter?: string; bidirectional?: boolean };
-    if (typeof raw?.adapter === "string") adapter = raw.adapter;
-    if (raw?.bidirectional === true) bidirectional = true;
-  } catch {
-    // missing/malformed — no channel
-  }
-  if (adapter === "telegram" || bidirectional) {
+  const profile = resolveChannelProfile(cwd);
+  if (profile.direction === "rw") {
+    const ack = profile.ackTarget ? `, ack target \`${profile.ackTarget}\`` : "";
+    const primary = profile.primary ? ", primary" : "";
     return [
-      "### User channel (messenger, BIDIRECTIONAL)",
-      "A messenger channel with feedback is configured. ALL user communication goes through it:",
+      "### User channel (messenger, BIDIRECTIONAL) — VALIDATED RW-PRIMARY",
+      `Resolved channel profile: direction \`rw\` (transport ${profile.transport ?? "unknown"}, adapter ${profile.adapter ?? "unknown"}${ack}${primary}) —`,
+      "validated inbound + outbound. Messenger mode: ALL user communication goes through it:",
       "- Checkpoints and any question: write the escalation to `.work-state/cto/<id>/outbox/<escId>.json`",
       "  (level `question`/`decision`, `timeoutMs` + `default`); answers arrive in `answers/<escId>.json`.",
+      "- Inbound tasks/answers arrive via this channel — `[CTO-INBOX]` messages are USER COMMANDS.",
       "- NEVER use the `ask` tool — it is blocked while this channel is active.",
       "- Blocking waits park the team (`background_wait`); everything else continues.",
       "- In standby: tasks arrive as `[CTO-INBOX]` messages — treat each as a USER COMMAND to the",
       "  main-session CTO: fold it into the run (amend discipline) and return to standby after the wave.",
     ].join("\n");
   }
-  if (adapter === "http") {
+  if (profile.direction === "ro") {
+    const adapter = profile.adapter ?? "unknown";
+    const firstLine =
+      adapter === "http"
+        ? "An HTTP channel is configured but it is PUSH-ONLY (no feedback path)."
+        : `A report-only channel is configured (adapter ${adapter}) — PUSH-ONLY (no feedback path).`;
     return [
-      "### User channel (push-only)",
-      "An HTTP channel is configured but it is PUSH-ONLY (no feedback path).",
+      "### User channel (push-only) — RO-REPORT",
+      firstLine,
+      "Capability mode RO-REPORT: the channel is a push-only report sink — escalations are advisory and",
+      "NEVER inbound; `ask` stays available for interactive checkpoints.",
       "Use `ask` for interactive checkpoints; escalations sent over the channel are advisory.",
     ].join("\n");
   }
   return [
-    "### User channel (none)",
-    "No escalation channel configured. Use the `ask` tool for checkpoints.",
+    "### User channel (none) — TERMINAL-ONLY",
+    "No escalation channel configured (capability mode TERMINAL-ONLY, direction `none`): no channel exists.",
+    "Use the `ask` tool for checkpoints (local ask fallback).",
   ].join("\n");
 }
 
@@ -166,6 +176,12 @@ export function buildStandbyCtoPrompt(cwd: string): string {
     "Stay on-line when a wave completes — you remain the CTO of this session. Close the wave",
     "(integration + summary), keep the run active, and return to standby: yield and wait for the",
     "next `[CTO-INBOX]` task (or `inbox/` file) to fold in.",
+    "**The run id NEVER changes across follow-up waves.** Every inbox task is a NEW wave in the SAME",
+    "state.json: append a `wave_history` record `{ id, source, source_id, task, slice_ids,",
+    "status: \"active\" }` and set `active_wave_id`; classify each incoming task PER-SLICE before any",
+    "dispatch (PHASE-0 type/complexity/confidence/autonomous + the matrix-resolved workflow + a",
+    "readable non-empty DoD — the dispatch gate enforces all of them); close the wave (status",
+    "`done`|`failed` + `finished_at`, clear `active_wave_id`) BEFORE this standby resumes.",
     "",
     "### Your rules (abridged)",
     "- Delegate, never code. Teams: pick from the registry, one lead per team, leads spawn workers.",
@@ -269,7 +285,10 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "   team: the lead walks debug-cycle (diagnose -> root cause -> fix -> verify; root_cause gate before",
     "   code). Decide the git strategy per team (Q3):",
     "   coupled tasks -> one branch with parallel teams; independent tasks -> separate worktrees.",
-    "   Persist the plan through the engine (`runCto`): state lives in `.work-state/cto/<id>/`.",
+    "   Persist the plan as FILES — state lives in `.work-state/cto/<id>/state.json` (schema 2) and is",
+    "   written directly by you: schema-2 additive fields (wave_history, active_wave_id, teams[].slice_id,",
+    "   teams[].classification, teams[].workflow, teams[].dod_path). There is NO TS engine call from",
+    "   this side — engine state APIs are consumer-side validation only, never tools you invoke.",
     "2. **Architecture first (multi-team runs)**: after the plan, run the architecture stage — spawn the",
     "   `architect` (single `task`) to produce the cross-team contract BEFORE spawning leads: api_contract",
     "   (endpoints/DTOs), file ownership per team, shared interfaces, ports/CORS. Leads consume the contract",
@@ -292,6 +311,30 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "9. **Inbox check**: read `.work-state/cto/*/inbox/*.json` BEFORE decomposing — tasks may have",
     "   arrived via the messenger while no session was listening; fold them into this run too",
     "   (each as its own wave, amend discipline).",
+    "",
+    "### Wave / slice gate contract (BEFORE any lead is spawned)",
+    "A lead/worker `task` call is MECHANICALLY BLOCKED unless the canonical state in",
+    "`.work-state/cto/<id>/state.json` proves, for this run and slice: an active wave, a team mapped to",
+    "the slice, a full per-slice classification, the matrix-resolved workflow, and a readable non-empty",
+    "DoD. Build exactly that state before the first lead spawn — in this order:",
+    "1. **Create the wave**: append a `wave_history` record `{ id, source, source_id, task, slice_ids,",
+    "   status: \"active\" }` to `state.json` and set `active_wave_id` to its `id`.",
+    "2. **Classify every slice (PHASE-0, per team)**: for EACH team/slice write the structured",
+    "   classification line into `state.json` `teams[].classification`: `{ \"type\": ...,",
+    "   \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>, \"autonomous_reason\": ... }`.",
+    "3. **Resolve the workflow per slice**: `teams[].workflow` MUST equal `resolveWorkflow(type,",
+    "   complexity, autonomous)` from the matrix above — never re-derive it from prose; the gate",
+    "   validates it exactly.",
+    "4. **Write the DoD**: a readable non-empty per-slice DoD artifact at",
+    "   `.work-state/artifacts/<team>/dod.json` (or set `teams[].dod_path` to a readable non-empty",
+    "   equivalent).",
+    "5. **Stamp the marker on EVERY lead task**: each lead `task` input MUST carry the EXACT literal",
+    "   `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` where `<runId>` = the id persisted in",
+    "   `state.json` (the SAME id for the whole run) and `<sliceId>` = the slice id you assigned that",
+    "   team. State is written as files (schema-2 additive fields) — never via a TS engine call.",
+    "6. **Leads propagate**: leads MUST propagate the marker into every worker task they spawn and",
+    "   follow the canonical /do-work stage discipline of the resolved workflow (stages, gates,",
+    "   checkpoints, typed artifacts) mechanically.",
     "",
     "### Failure modes to avoid",
     "- Do NOT let a worker re-delegate (rogue router) — only CTO/lead spawn.",
@@ -323,9 +366,11 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "   stall.",
     "",
     "### After the wave",
-    "When integration completes and the summary is written, close ONLY the current wave.",
-    "Keep the resident CTO run active; return to standby — stay on-line, yield, and await the next task",
-    "(`[CTO-INBOX]` message or `inbox/` file), folding it in as an amend.",
+    "When integration completes and the summary is written, close ONLY the current wave: set its",
+    "`wave_history` record status to `done`|`failed` with `finished_at`, and clear `active_wave_id`.",
+    "Keep the resident CTO run active with the SAME run id; return to standby — stay on-line, yield,",
+    "and await the next task (`[CTO-INBOX]` message or `inbox/` file), folding it in as an amend that",
+    "appends a NEW wave record to the same `state.json`.",
     "",
     "Begin: decompose the task into a TeamPlan, persist it, and spawn the first leads.",
   ].join("\n");
@@ -643,11 +688,36 @@ export function buildAmendPrompt(
     `7. **Inbox check**: read \`.work-state/cto/${active.runId}/inbox/*.json\` for tasks that arrived while`,
     "   no session was listening; fold each in as its own wave.",
     "",
+    "### Wave / slice gate contract (BEFORE any new lead is spawned)",
+    "The dispatch gate MECHANICALLY BLOCKS a lead/worker `task` call unless the canonical state in",
+    "`.work-state/cto/<id>/state.json` proves, for this run and slice: an active wave, a team mapped to",
+    "the slice, a full per-slice classification, the matrix-resolved workflow, and a readable non-empty",
+    "DoD. For the new task, before spawning any new lead:",
+    "1. **Create the wave**: append a `wave_history` record `{ id, source, source_id, task, slice_ids,",
+    "   status: \"active\" }` to the SAME `state.json` and set `active_wave_id` to its `id` (the run id",
+    "   `<runId>` NEVER changes across amend waves).",
+    "2. **Classify every new slice (PHASE-0, per team)**: write the structured classification into",
+    "   `state.json` `teams[].classification` for each team in this wave: `{ \"type\": ...,",
+    "   \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>, \"autonomous_reason\": ... }`.",
+    "3. **Resolve the workflow per slice**: `teams[].workflow` MUST equal `resolveWorkflow(type,",
+    "   complexity, autonomous)` from the matrix above — never re-derive it; the gate validates it.",
+    "4. **Write the DoD**: a readable non-empty per-slice DoD artifact at",
+    "   `.work-state/artifacts/<team>/dod.json` (or `teams[].dod_path` to a readable non-empty equivalent).",
+    "5. **Stamp the marker on EVERY lead task**: each lead `task` input MUST carry the EXACT literal",
+    "   `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` where `<runId>` = this run's persisted",
+    "   `state.json` id and `<sliceId>` = the slice id you assigned that team. State is written as files",
+    "   (schema-2 additive fields) — never via a TS engine call.",
+    "6. **Leads propagate**: leads MUST propagate the marker into every worker task and follow the",
+    "   canonical /do-work stage discipline of the resolved workflow (stages, gates, checkpoints,",
+    "   typed artifacts) mechanically.",
+    "",
     renderChannelSection(cwd),
     "",
     "### After the wave",
-    "When the amended wave integrates, close ONLY that wave and keep the resident CTO run active.",
-    "Return to standby — stay on-line, yield, and await the next `[CTO-INBOX]` task to fold in.",
+    "When the amended wave integrates, close ONLY that wave: set its `wave_history` record status to",
+    "`done`|`failed` with `finished_at`, and clear `active_wave_id`. Keep the resident CTO run active",
+    "with the SAME run id. Return to standby — stay on-line, yield, and await the next `[CTO-INBOX]`",
+    "task to fold in as a NEW wave record on the same `state.json`.",
     "",
     "Begin: read the active state, amend the plan, spawn the new leads.",
   ].join("\n");

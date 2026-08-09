@@ -1,23 +1,29 @@
 /**
  * Messenger-channel mode detection + `ask` redirect gate.
  *
- * When a BIDIRECTIONAL escalation channel (telegram) is configured
+ * When a validated RW escalation channel (telegram, or a channel whose
+ * adapter kind has inbound+outbound capabilities) is configured
  * (`.omp/escalation.json`), ALL user communication in a CTO run must go
  * through the messenger (outbox -> answers/), never through the interactive
  * `ask` tool. This module:
  *   - `channelMode(cwd)` — "telegram" | "http" | null (cached).
  *   - `createAskRedirectGate()` — a `tool_call` hook that BLOCKS `ask` while
- *     a bidirectional channel AND an active CTO run exist, returning the
- *     outbox contract as the reason (the LLM sees it and routes the question).
+ *     a capability-validated RW primary AND an active CTO run exist,
+ *     returning the outbox contract as the reason (the LLM sees it and
+ *     routes the question).
  *
  * The gate is deliberately scoped to active CTO runs: outside a run, normal
  * interactive work keeps `ask` working even in projects with a channel.
+ * Terminal/RO-only modes keep `ask` as the fallback (no validated RW
+ * primary -> no redirect). The gate is CAPABILITY-validated (core
+ * `hasRwPrimary`): a declared `bidirectional` flag is no longer sufficient
+ * on its own for explicit `channels[]` entries — http has no inbound path,
+ * so a declared-rw http entry downgrades to ro and never blocks ask.
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { findActiveCtoRun } from "@andvl1/omp-workflows-core";
-import { isBidirectionalChannel } from "./adapters/registry.js";
+import { findActiveCtoRun, hasRwPrimary } from "@andvl1/omp-workflows-core";
 
 export type ChannelMode = "telegram" | "http" | null;
 
@@ -48,9 +54,9 @@ export function clearChannelCache(): void {
 export { isBidirectionalChannel } from "./adapters/registry.js";
 
 /**
- * `tool_call` hook: block the `ask` tool when a bidirectional channel is
- * configured AND a CTO run is active. The `reason` is returned to the LLM,
- * which then writes the question to the outbox instead.
+ * `tool_call` hook: block the `ask` tool when a capability-validated RW
+ * primary is configured AND a CTO run is active. The `reason` is returned
+ * to the LLM, which then writes the question to the outbox instead.
  */
 export function createAskRedirectGate(): (
   event: { toolName?: string },
@@ -59,7 +65,7 @@ export function createAskRedirectGate(): (
   return (event, ctx) => {
     try {
       if (event?.toolName !== "ask") return undefined;
-      if (!isBidirectionalChannel(ctx.cwd)) return undefined;
+      if (!hasRwPrimary(ctx.cwd)) return undefined;
       if (!findActiveCtoRun(ctx.cwd)) return undefined;
       return {
         block: true,

@@ -222,6 +222,13 @@ test("cto-amend: buildAmendPrompt includes active run metadata", () => {
     assert.ok(prompt.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): ON"), "amend renders the mechanical hint, not a decision");
     assert.ok(prompt.includes("- Autonomous: true | false"), "amend requests the model autonomy decision");
     assert.ok(prompt.includes("Integration covers ALL teams"));
+    assert.ok(
+      prompt.includes("<!-- omp-cto-slice run=<runId> slice=<sliceId> -->"),
+      "exact marker literal in the amend prompt",
+    );
+    assert.ok(prompt.includes("Wave / slice gate contract"), "amend carries the wave/slice gate contract");
+    assert.ok(prompt.includes("active_wave_id"), "amend requires wave creation before lead spawn");
+    assert.ok(prompt.includes("NEVER changes across amend waves"), "amend keeps the SAME run id across waves");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
