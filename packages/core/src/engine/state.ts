@@ -224,6 +224,33 @@ export function setStageStatus(
   }
   return { ...state, stages, stage_cursor: cursor, updated_at: new Date().toISOString() };
 }
+/**
+ * Reopen a completed workflow after user feedback without losing prior state.
+ * The affected stage and all downstream stages become pending; upstream
+ * artifacts and stage history remain intact.
+ */
+export function reopenFromFeedback(
+  state: TeamState,
+  feedback: string,
+  stageId?: string,
+): TeamState {
+  const target = stageId ?? state.stage_cursor;
+  const index = state.stages.findIndex((stage) => stage.id === target);
+  if (index < 0) throw new Error(`cannot reopen unknown stage: ${target}`);
+  const history = [...(state.history ?? []), { task: state.task, feedback, at: new Date().toISOString() }];
+  const stages = state.stages.map((stage, i) =>
+    i >= index ? { ...stage, status: "pending" as const } : stage,
+  );
+  return {
+    ...state,
+    task: `${state.task}\n\nUser feedback: ${feedback}`,
+    history,
+    stages,
+    stage_cursor: target,
+    pause: { kind: "none", reason: "" },
+    updated_at: new Date().toISOString(),
+  };
+}
 
 /**
  * Monotonic check: a stage with `pending` must not precede a stage that is

@@ -20,6 +20,7 @@ import {
   registerWorkflowProfiles,
   resolveWorkflow,
   selectProfile,
+  reopenFromFeedback,
 } from "@andvl1/omp-workflows-core";
 import { classificationToolGate } from "../src/gates/classification.js";
 import { runStage } from "../src/engine/stage.js";
@@ -170,6 +171,31 @@ test("core: workflow dispatch leaves model selection to OMP", async () => {
   assert.equal(calls.length, 1);
   assert.deepEqual(Object.keys(calls[0] ?? {}).sort(), ["agent", "task"]);
   assert.equal(calls[0]?.agent, "developer-kotlin");
+});
+test("core: feedback reopens affected stage and preserves history", () => {
+  const state = {
+    schema: 1 as const,
+    branch: "feat/resume",
+    classification: { type: "BUG_FIX" as const, complexity: "MEDIUM" as const, confidence: "HIGH" as const, workflow: "debug-cycle" as const, autonomous: false },
+    task: "fix empty input",
+    workflow_override: false,
+    issue: null,
+    stage_cursor: "verification",
+    stages: [
+      { id: "diagnosis", status: "done" as const },
+      { id: "implementation", status: "done" as const },
+      { id: "verification", status: "done" as const },
+    ],
+    artifacts: { diagnosis: "diagnosis.json", implementation: "implementation.json" },
+    pause: { kind: "done" as const, reason: "" },
+    updated_at: new Date(0).toISOString(),
+  };
+  const reopened = reopenFromFeedback(state, "empty input still crashes", "implementation");
+  assert.equal(reopened.stages[0]?.status, "done");
+  assert.equal(reopened.stages[1]?.status, "pending");
+  assert.equal(reopened.stages[2]?.status, "pending");
+  assert.match(reopened.task, /empty input still crashes/);
+  assert.equal(reopened.history?.length, 1);
 });
 
 test("fullstack: agent frontmatter uses OMP class role with standard fallback", () => {

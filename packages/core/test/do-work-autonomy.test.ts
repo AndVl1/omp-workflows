@@ -27,6 +27,18 @@ function writeWorkflowState(root: string, state: Record<string, unknown>): void 
   mkdirSync(join(root, ".work-state"), { recursive: true });
   writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(state));
 }
+test("do-work: existing state prompt requires same-turn continuation", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-resume-"));
+  try {
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ task: "previous fix" }));
+    const prompt = buildDoWorkPrompt(parseWorkEnvelope("feedback", root), root);
+    assert.match(prompt, /resumable continuation/);
+    assert.match(prompt, /Continue executing in THIS TURN/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("do-work: natural-language directive sets the hint and strips from task", () => {
   const root = mkdtempSync(join(tmpdir(), "do-work-ru-"));

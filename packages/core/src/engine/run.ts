@@ -25,7 +25,7 @@ import { readFileSync } from "node:fs";
 import { loadAllProfiles, resolveWorkflow, selectProfile } from "./profile.js";
 import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope } from "./scope.js";
-import { writeState, setStageStatus, setPause, resolveState } from "./state.js";
+import { writeState, setStageStatus, setPause, resolveState, reopenFromFeedback } from "./state.js";
 import { keywordClassify } from "./classify.js";
 import { walkProfile, type StageContext, type TaskCaller } from "./stage.js";
 import type { Classification, Complexity, Confidence, Profile, TaskType, TeamState, WorkflowName } from "./types.js";
@@ -50,22 +50,17 @@ export interface RunOptions {
   task: string;
   cwd: string;
   branch: string;
-  /**
-   * LEGACY autonomy flag for callers that do not supply a model
-   * `classification`. Used verbatim (never defaulted) on the legacy path
-   * only; the model path reads `classification.autonomous`.
-   */
+  /** Legacy autonomy flag for callers without model classification. */
   autonomous: boolean;
   /** Authoritative model classification (PHASE-0). */
   classification?: ModelClassification;
   /** Caller-issued task tool reference. */
   taskTool: TaskCaller;
-  /** Optional issue metadata (number + url) for PR/decision wiring. */
   issue?: { number: number; url?: string } | null;
-  /** Pause for a user checkpoint. */
   pause?: (reason: string) => Promise<void>;
-  /** Logger for engine progress. */
   log?: (line: string) => void;
+  /** Resume prior state after user feedback, preserving artifacts/history. */
+  continuation?: { feedback: string; stageId?: string };
 }
 
 export interface RunResult {
@@ -111,44 +106,31 @@ export function resolveClassification(opts: Pick<RunOptions, "task" | "autonomou
 export async function run(opts: RunOptions): Promise<RunResult> {
   const config = resolveConfig(opts.cwd);
   const profiles = loadAllProfiles();
-
-  // 1. classify — the model classification is authoritative.
   const classification = resolveClassification(opts);
-
-  // 2. select profile.
   const profile = selectProfile(profiles, classification);
-  if (!profile) {
-    throw new Error(`no profile matches classification ${JSON.stringify(classification)}`);
-  }
-
-  // 3. write state BEFORE any subagent launch — the gate requires this.
-  const flags = resolveScope([], config); // resolved later when files surface
+  if (!profile) throw new Error(`no profile matches classification ${JSON.stringify(classification)}`);
+  const flags = resolveScope([], config);
   const existing = resolveState(opts.cwd, opts.branch);
-
-  const stages = profile.stages.map((s) => ({
-    id: s.id,
-    status: "pending" as const,
-  }));
-
-  const initialState: TeamState = {
+  const continuation = opts.continuation && existing.state
+    ? reopenFromFeedback(existing.state, opts.continuation.feedback, opts.continuation.stageId)
+    : null;
+  const initialState: TeamState = continuation ?? {
     schema: 1,
     branch: opts.branch,
     classification,
     task: opts.task,
-    // New writes carry the decision in classification.autonomous; the legacy
-    // top-level field is intentionally NOT written.
     workflow_override: opts.classification?.workflow !== undefined,
     issue: opts.issue ?? null,
     stage_cursor: profile.stages[0]?.id ?? "",
-    stages,
+    stages: profile.stages.map((s) => ({ id: s.id, status: "pending" as const })),
     artifacts: {},
     pause: { kind: "none", reason: "" },
     updated_at: new Date().toISOString(),
   };
-
+  if (continuation) initialState.classification = classification;
   const { statePath, artifactsDir } = writeState(opts.cwd, initialState);
-
-  // 4. walk stages.
+  const completed = new Set(initialState.stages.filter((s) => s.status === "done" || s.status === "skipped").map((s) => s.id));
+  const runnableProfile = completed.size === 0 ? profile : { ...profile, stages: profile.stages.filter((s) => !completed.has(s.id)) };
   const ctx: StageContext = {
     cwd: opts.cwd,
     state: initialState,
@@ -157,35 +139,21 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     agent: (role) => resolveAgentForRole(role, config),
     task: opts.taskTool,
     pause: opts.pause ?? (async () => undefined),
-    log: opts.log ?? ((line) => undefined),
+    log: opts.log ?? (() => undefined),
     resolveDevAgent: () => flags.dev_agent,
   };
-
-  opts.log?.(`walking profile: ${profile.name} (${profile.stages.length} stages)`);
-  const outcomes = await walkProfile(profile, ctx);
-
-  // 5. update state stages[].
-  for (const o of outcomes) {
-    if (o.status === "done" || o.status === "skipped") {
+  opts.log?.(`walking profile: ${profile.name} (${runnableProfile.stages.length} stages)`);
+  const outcomes = await walkProfile(runnableProfile, ctx);
+  for (const outcome of outcomes) {
+    if (outcome.status === "done" || outcome.status === "skipped") {
       const updated = readState(statePath);
-      const next = setStageStatus(updated, o.stageId, o.status, opts.cwd);
-      writeState(opts.cwd, next);
+      writeState(opts.cwd, setStageStatus(updated, outcome.stageId, outcome.status, opts.cwd));
     }
   }
-
   const final = readState(statePath);
-  const done = outcomes.every((o) => o.status === "done" || o.status === "skipped");
-  writeState(
-    opts.cwd,
-    setPause(final, done ? "done" : "failed", done ? "" : "one or more stages failed"),
-  );
-
-  return {
-    classification,
-    profile,
-    outcomes: outcomes.map((o) => ({ stageId: o.stageId, status: o.status, note: o.note })),
-    statePath,
-  };
+  const done = final.stages.every((s) => s.status === "done" || s.status === "skipped");
+  writeState(opts.cwd, setPause(final, done ? "done" : "failed", done ? "" : "one or more stages failed"));
+  return { classification, profile, outcomes: outcomes.map((o) => ({ stageId: o.stageId, status: o.status, note: o.note })), statePath };
 }
 
 function readState(path: string): TeamState {

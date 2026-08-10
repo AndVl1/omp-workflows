@@ -189,11 +189,12 @@ export {
 export { resolveConfig } from "./engine/config.js";
 export { resolveScope, applyConditional, shouldSkip } from "./engine/scope.js";
 export {
-	writeState,
-	setStageStatus,
-	setPause,
-	checkMonotonic,
-	resolveState,
+  writeState,
+  setStageStatus,
+  setPause,
+  checkMonotonic,
+  resolveState,
+  reopenFromFeedback,
 } from "./engine/state.js";
 export {
 	writeArtifact,
