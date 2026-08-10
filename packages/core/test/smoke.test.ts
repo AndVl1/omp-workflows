@@ -312,7 +312,7 @@ test("fullstack: bundle imports core and registers engine", async () => {
   const core = await import("@andvl1/omp-workflows-core");
   assert.equal(typeof core.registerTeamWorkflow, "function");
   assert.equal(typeof core.defaultFullstackRoles, "object");
-  assert.equal(Object.keys(core.defaultFullstackRoles).length, 16);
+  assert.equal(Object.keys(core.defaultFullstackRoles).length, 20);
 });
 
 test("fullstack: default empty registerTeamWorkflow does not crash", () => {
