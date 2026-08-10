@@ -2,6 +2,11 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.20.2] — 2026-08-10
+### Fixed
+- **Resumable `/do-work` sessions** — workflow execution now continues in the same turn after classification and state persistence; later user feedback is retained in session history and reopens only the affected stage plus downstream stages without discarding upstream artifacts.
+- **Workflow continuation prompts** — existing state is detected for follow-up work, completed stages are skipped, and the agent is explicitly instructed to continue instead of stopping after the classification output.
+
 ## [0.20.0] — 2026-08-10
 ### Added
 - **Resident / control-plane CTO lifecycle** (`packages/core/src/cto/{state,types,channels,slice-gate}.ts`, `packages/fullstack/src/adapters/registry.ts`) — `/cto` with no task starts a standby run that stays resident between waves and accepts follow-up tasks via durable inbox (terminal and RW channels); `/cto <task>` starts a task run, and an active standby run folds follow-ups into a new wave. Common PHASE-0 classification, the `/do-work` workflow matrix, marker-gated lead dispatch, and the nested-CTO ban are preserved. Wave/task state stays file-backed and survives restarts; slices run in separate git worktrees; wave completion builds an authoritative summary.
