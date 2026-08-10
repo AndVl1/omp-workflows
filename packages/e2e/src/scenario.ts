@@ -9,7 +9,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve, sep } from 'node:path';
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -291,7 +291,12 @@ export function loadScenario(path: string, params: Record<string, string> = {}):
   if (typeof def.task === 'string') {
     taskText = def.task;
   } else {
-    const taskPath = resolve(dirname(path), def.task.file);
+    const scenarioRoot = resolve(dirname(path));
+    const taskPath = resolve(scenarioRoot, def.task.file);
+    const taskRelative = relative(scenarioRoot, taskPath);
+    if (taskRelative === '..' || taskRelative.startsWith(`..${sep}`) || taskRelative.length === 0) {
+      throw new ScenarioValidationError('task.file', 'referenced task file must stay inside the scenario directory');
+    }
     if (!existsSync(taskPath)) {
       throw new ScenarioValidationError('task.file', `referenced task file does not exist: ${taskPath}`);
     }

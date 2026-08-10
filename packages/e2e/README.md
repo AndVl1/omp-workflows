@@ -180,7 +180,7 @@ line"; `\n` is just a line break and does **not** submit.
   backward compatibility with surfaces that normalised LF → CR; prefer
   `pressEnter()` for real PTY sessions.
 
-Upgrade path: `/ws?token=<session-scoped-token>`. The token remains valid for
+Upgrade path: `/ws?token=<session-scoped-token>` remains for trusted programmatic/text clients. The CLI never prints the bearer; visual browser clients use the bearer-free origin plus the `ux-e2e-token` HttpOnly cookie.
 
 ## Report schema
 

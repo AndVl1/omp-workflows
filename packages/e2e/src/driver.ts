@@ -217,12 +217,37 @@ export class WsDriver implements TerminalDriver {
   }
 }
 
-/** Build the `ws://host:port/ws?token=...` URL from the page URL. */
+/** Reject session URLs that could forward a bearer token to a remote host. */
+export function assertLoopbackPageUrl(pageUrl: string): URL {
+  let url: URL;
+  try {
+    url = new URL(pageUrl);
+  } catch {
+    throw new Error('ux-e2e: session URL must be an absolute HTTP(S) URL');
+  }
+  const hostname = url.hostname.replace(/^\[|\]$/gu, '').toLowerCase();
+  if (!['127.0.0.1', 'localhost', '::1'].includes(hostname)) {
+    throw new Error(`ux-e2e: refusing non-loopback session host "${url.hostname}"`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`ux-e2e: refusing non-HTTP session protocol "${url.protocol}"`);
+  }
+  if (url.port.length === 0 || Number(url.port) < 1 || Number(url.port) > 65_535) {
+    throw new Error('ux-e2e: session URL must include a valid port');
+  }
+  if (url.username.length > 0 || url.password.length > 0) {
+    throw new Error('ux-e2e: session URL must not include userinfo');
+  }
+  return url;
+}
+
+/** Build the `ws://host:port/ws?token=...` URL from a loopback page URL. */
 export function wsUrlFromPageUrl(pageUrl: string): string {
-  const u = new URL(pageUrl);
+  const u = assertLoopbackPageUrl(pageUrl);
   const proto = u.protocol === 'https:' ? 'wss:' : 'ws:';
-  const token = u.searchParams.get('token') ?? '';
-  return `${proto}//${u.host}/ws?token=${encodeURIComponent(token)}`;
+  const base = `${proto}//${u.host}/ws`;
+  const token = u.searchParams.get('token');
+  return token === null || token.length === 0 ? base : `${base}?token=${encodeURIComponent(token)}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -280,6 +305,7 @@ class PlaywrightDriver implements TerminalDriver {
   }
 
   async open(url: string): Promise<void> {
+    assertLoopbackPageUrl(url);
     const browser = await this.#pw.chromium.launch({ headless: this.#headless });
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: 'load' });

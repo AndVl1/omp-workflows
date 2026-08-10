@@ -21,13 +21,17 @@ function makeSessionDir(): string {
       slug: 'my-feature',
       omp_version: 'omp 17.2.3',
       profile: 'ux-e2e-test',
+      url: 'http://127.0.0.1:1234/?token=super-secret-token',
+      token: 'super-secret-token',
+      wsPath: '/ws',
+      user_config: { path: '/tmp/private/config.json', default_path: '/tmp/private/default.json' },
       tty: { cols: 100, rows: 30, term: 'xterm-256color' },
       started_at: '2026-08-02T10:00:00.000Z',
       task_prompt: 'implement the feature',
       scenario: { id: 'full-feature', title: 'Full feature' },
     }) + '\n',
   );
-  writeFileSync(join(stateDir, 'transcript.jsonl'), '{"ts":"2026-08-02T10:00:00.000Z","t":"o","d":"stage: discovery\\n"}\n');
+  writeFileSync(join(stateDir, 'transcript.jsonl'), '{"ts":"2026-08-02T10:00:00.000Z","t":"o","d":"Authorization: Bearer long-lived-secret-value token=super-secret-token \\"token\\":\\"quoted-secret\\"\\n"}\n');
   return dir;
 }
 
@@ -136,8 +140,15 @@ test('report: copyEvidence mirrors evidence files under <mdDir>/evidence/<slug>/
   const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-'));
   const result = generateReport(dir, BASE_INPUT, { mdDir, copyEvidence: true });
 
+  const mirroredSession = readFileSync(join(mdDir, 'evidence', 'my-feature', 'session.json'), 'utf8');
+  assert.equal(mirroredSession.includes('super-secret-token'), false, 'mirrored session does not contain the bearer');
+  assert.equal(mirroredSession.includes('/tmp/private'), false, 'mirrored session does not contain private paths');
   const report = JSON.parse(readFileSync(result.jsonPath, 'utf8')) as UxE2eReport;
   assert.ok(report.evidence.some(e => e.includes(join('evidence', 'my-feature'))), 'evidence points at mirrored copies');
   assert.ok(existsSync(join(mdDir, 'evidence', 'my-feature', 'transcript.jsonl')), 'transcript mirrored');
   assert.ok(existsSync(join(mdDir, 'evidence', 'my-feature', 'session.json')), 'session.json mirrored');
+  const mirroredTranscript = readFileSync(join(mdDir, 'evidence', 'my-feature', 'transcript.jsonl'), 'utf8');
+  assert.equal(mirroredTranscript.includes('long-lived-secret-value'), false, 'mirrored transcript does not contain a bearer');
+  assert.equal(mirroredTranscript.includes('super-secret-token'), false, 'mirrored transcript does not contain the session token');
+  assert.equal(mirroredTranscript.includes('quoted-secret'), false, 'mirrored transcript redacts quoted JSON credentials');
 });

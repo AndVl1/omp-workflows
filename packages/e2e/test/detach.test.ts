@@ -177,7 +177,8 @@ test('detach: parent exits fast and detached child survives past the EPIPE windo
     `parent returned within the startup deadline; actual ${String(result.durationMs)}ms`,
   );
   assert.match(result.stdout, /ux-e2e: detached session started/u, 'parent prints the started line');
-  assert.match(result.stdout, /ux-e2e: url: http/u, 'parent prints the URL line');
+  assert.match(result.stdout, /ux-e2e: url \(redacted\): http/u, 'parent prints a redacted URL line');
+  assert.doesNotMatch(result.stdout, /[?&]token=[^<\s]+/u, 'parent does not print the bearer');
 
   // 3. session.json is populated with a live pid.
   const sessionPath = join(realScratch, '.work-state', 'ux-e2e', 'session.json');

@@ -7,6 +7,8 @@ export {
   startTestSession,
   mintToken,
   safeEqual,
+  safePtyEnv,
+  SAFE_PTY_ENV_KEYS,
   buildOmpArgs,
   killProcessTree,
   pidIsLive,
@@ -53,6 +55,31 @@ export type {
   AskExpectation,
   ScreenshotTrigger,
 } from './scenario.js';
+
+export {
+  AI_PUBLIC_DEFAULTS,
+  discoverCommandIds,
+  loadAiCommandManifest,
+  validateAiCommandManifest,
+  resolveAiModelConfig,
+  writeModelOverlay,
+  renderCommandPrompt,
+  redactSensitive,
+  containsSensitive,
+  runAiCommandMatrix,
+  main as aiCommandRunnerMain,
+} from './ai-command-runner.js';
+export type {
+  AiPhase,
+  CommandScenario,
+  AiCommandManifest,
+  AiModelConfig,
+  BrowserClient,
+  AiRunnerDependencies,
+  AiCommandRunnerOptions,
+  AiCommandCaseResult,
+  AiCommandRunReport,
+} from './ai-command-runner.js';
 
 export { generateReport, DEFECT_FLOORS, UX_DIMENSIONS, AGENT_DIMENSIONS, DEFECT_SEVERITIES } from './report.js';
 export type {

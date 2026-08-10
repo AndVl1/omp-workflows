@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "guide": "ai-command-e2e-guide.md",
+  "registry_root": "../../fullstack/commands",
+  "prompt_template": "AI-E2E smoke check for /{command}: {instruction} Do not edit files, delegate work, access production, or wait for the full workflow. Report STARTED and stop.",
+  "commands": [
+    {
+      "id": "cto",
+      "picker_prefix": "cto",
+      "command_args": "AI-E2E smoke check: acknowledge that the CTO command started, then stop without delegating or editing.",
+      "instruction": "Start the CTO command in its main-session role and acknowledge startup only.",
+      "start_patterns": ["cto:", "Working", "Thinking"],
+      "error_patterns": ["ERROR:", "No model selected", "API key", "401", "403", "429", "rate limit"]
+    },
+    {
+      "id": "do-work",
+      "picker_prefix": "do-wo",
+      "command_args": "AI-E2E smoke check: classify this request, report STARTED, and stop without tools or edits.",
+      "instruction": "Start one classification-first workflow request without changing files.",
+      "start_patterns": ["do-work:", "Working", "Thinking", "workflow pending"],
+      "error_patterns": ["ERROR:", "No model selected", "API key", "401", "403", "429", "rate limit"]
+    },
+    {
+      "id": "init-team",
+      "picker_prefix": "init-te",
+      "command_args": "AI-E2E smoke check",
+      "instruction": "Run the idempotent team configuration bootstrap and report its result.",
+      "start_patterns": ["init-team:", "wrote", "Skipping"],
+      "error_patterns": ["ERROR:", "EACCES", "permission denied", "No model selected"]
+    },
+    {
+      "id": "interview",
+      "picker_prefix": "interv",
+      "command_args": "AI-E2E smoke check: ask one clarification question, report STARTED, and stop.",
+      "instruction": "Start an interview with one small clarification topic and do not continue beyond startup.",
+      "start_patterns": ["interview:", "Working", "Thinking"],
+      "error_patterns": ["ERROR:", "No model selected", "API key", "401", "403", "429", "rate limit"]
+    },
+    {
+      "id": "omp-model-roles",
+      "picker_prefix": "omp-model-rol",
+      "command_args": "validate",
+      "instruction": "Run the deterministic validate action and report its first status line.",
+      "start_patterns": ["omp-model-roles validate", "omp-model-roles:", "role |", "Working", "Thinking"],
+      "error_patterns": ["ERROR:", "No model selected", "API key", "401", "403", "429", "rate limit"]
+    },
+    {
+      "id": "session-report",
+      "picker_prefix": "session-rep",
+      "command_args": "do-work id=ai-command-e2e",
+      "instruction": "Render the prepared local smoke-test session report and report its output path.",
+      "start_patterns": ["Session report written", "session-report:", "offline report"],
+      "error_patterns": ["ERROR:", "could not build report", "No model selected"]
+    },
+    {
+      "id": "team",
+      "picker_prefix": "tea",
+      "command_args": "AI-E2E smoke check: classify this alias request, report STARTED, and stop without tools or edits.",
+      "instruction": "Start the legacy team alias and verify it reaches the same workflow path.",
+      "start_patterns": ["team:", "Working", "Thinking", "workflow pending"],
+      "error_patterns": ["ERROR:", "No model selected", "API key", "401", "403", "429", "rate limit"]
+    }
+  ]
+}
