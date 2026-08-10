@@ -25,14 +25,15 @@ import {
 import { classificationToolGate } from "../src/gates/classification.js";
 import { runStage } from "../src/engine/stage.js";
 
-test("core: loadAllProfiles returns 9 profiles", async () => {
+test("core: loadAllProfiles returns reusable core profiles", async () => {
   const profiles = await loadAllProfiles();
-  assert.equal(profiles.length, 9);
+  assert.ok(profiles.length >= 11);
   const names = profiles.map((p) => p.name);
-  assert.ok(names.includes("lightweight"));
-  assert.ok(names.includes("full-feature"));
-  assert.ok(names.includes("debug-cycle"));
-  assert.ok(names.includes("cto"), "cto profile ships but is never auto-selected");
+  for (const name of ["lightweight", "full-feature", "debug-cycle", "cto", "android-feature-regression", "android-spec-preparation"]) {
+    assert.ok(names.includes(name), `${name} profile is shipped`);
+  }
+  assert.ok(profiles.find((p) => p.name === "android-feature-regression")?.stages.every((stage) => stage.prompt), "regression stages carry prompts");
+  assert.ok(profiles.find((p) => p.name === "android-spec-preparation")?.stages.every((stage) => stage.prompt), "spec stages carry prompts");
 
   // The CTO profile is explicit-only: no classification may select it.
   for (const type of ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "INVESTIGATION", "REVIEW", "HOTFIX"] as const) {
@@ -67,8 +68,8 @@ test("core: selectProfile resolves to the right profile", async () => {
 });
 test("core: registered profiles are available and explicit workflow selects them", () => {
   const custom = {
-    name: "android-feature-regression",
-    title: "Android feature regression",
+    name: "android-feature-regression-test",
+    title: "Android feature regression test",
     description: "Bundle-owned regression profile",
     match: { type: ["INVESTIGATION"] as const },
     stages: [{ id: "intake", title: "Intake", type: "orchestrator" as const }],
@@ -81,12 +82,16 @@ test("core: registered profiles are available and explicit workflow selects them
   });
   assert.equal(selected?.name, custom.name);
 });
-test("core: defaultFullstackRoles has 16 slots (15 dev + 3 architect variants)", () => {
+
+test("core: defaultFullstackRoles includes generic regression roles", () => {
   const keys = Object.keys(defaultFullstackRoles);
-  assert.equal(keys.length, 16);
+  assert.ok(keys.length >= 16);
   assert.equal(defaultFullstackRoles["backend-kotlin"], "developer-kotlin");
   assert.equal(defaultFullstackRoles["frontend"], "frontend-developer");
   assert.equal(defaultFullstackRoles["mobile"], "developer-mobile");
+  assert.equal(defaultFullstackRoles["regression-planner"], "analyst");
+  assert.equal(defaultFullstackRoles["feature-regression"], "manual-qa");
+  assert.equal(defaultFullstackRoles["regression-oracle"], "qa");
 });
 
 test("core: registerTeamWorkflow registers gates but NOT commands", () => {

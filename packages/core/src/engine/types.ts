@@ -57,6 +57,8 @@ export interface StageDef {
   id: string;
   title: string;
   type: StageType;
+  /** Role-specific instructions supplied to the executor. */
+  prompt?: string;
   description?: string;
   /** For consilium: parallel roles. */
   roles?: string[];

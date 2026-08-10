@@ -397,6 +397,9 @@ ${roleHint}
 ### Task
 ${ctx.state.task}
 
+### Stage instructions
+${stage.prompt ?? "Follow the stage title and produce the declared artifact from the task and prior artifacts."}
+
 ### Your job
 Execute this stage. Write your typed artifact to .work-state/artifacts/<id>.json matching the engine's schema (the engine reads only JSON, not prose).
 
