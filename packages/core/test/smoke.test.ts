@@ -29,11 +29,11 @@ test("core: loadAllProfiles returns reusable core profiles", async () => {
   const profiles = await loadAllProfiles();
   assert.ok(profiles.length >= 11);
   const names = profiles.map((p) => p.name);
-  for (const name of ["lightweight", "full-feature", "debug-cycle", "cto", "android-feature-regression", "android-spec-preparation"]) {
+  for (const name of ["lightweight", "full-feature", "debug-cycle", "cto", "feature-regression", "spec-preparation"]) {
     assert.ok(names.includes(name), `${name} profile is shipped`);
   }
-  assert.ok(profiles.find((p) => p.name === "android-feature-regression")?.stages.every((stage) => stage.prompt), "regression stages carry prompts");
-  assert.ok(profiles.find((p) => p.name === "android-spec-preparation")?.stages.every((stage) => stage.prompt), "spec stages carry prompts");
+  assert.ok(profiles.find((p) => p.name === "feature-regression")?.stages.every((stage) => stage.prompt), "regression stages carry prompts");
+  assert.ok(profiles.find((p) => p.name === "spec-preparation")?.stages.every((stage) => stage.prompt), "spec stages carry prompts");
 
   // The CTO profile is explicit-only: no classification may select it.
   for (const type of ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "INVESTIGATION", "REVIEW", "HOTFIX"] as const) {
@@ -90,7 +90,7 @@ test("core: defaultFullstackRoles includes generic regression roles", () => {
   assert.equal(defaultFullstackRoles["frontend"], "frontend-developer");
   assert.equal(defaultFullstackRoles["mobile"], "developer-mobile");
   assert.equal(defaultFullstackRoles["regression-planner"], "analyst");
-  assert.equal(defaultFullstackRoles["feature-regression"], "manual-qa");
+  assert.equal(defaultFullstackRoles["regression-executor"], "manual-qa");
   assert.equal(defaultFullstackRoles["regression-oracle"], "qa");
 });
 

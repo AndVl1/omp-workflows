@@ -60,7 +60,7 @@ export const defaultFullstackRoles: RoleConfig["roles"] = {
   "security-tester": "security-tester",
   devops: "devops",
   "regression-planner": "analyst",
-  "feature-regression": "manual-qa",
+  "regression-executor": "manual-qa",
   "regression-oracle": "qa",
 };
 

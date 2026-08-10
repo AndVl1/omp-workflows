@@ -41,14 +41,16 @@ export default function (pi: ExtensionAPI) {
 A bundle can register additional profiles with the core interpreter:
 
 ```typescript
-import profile from "./workflows/android-feature-regression.json" with { type: "json" };
+import profile from "./workflows/feature-regression.json" with { type: "json" };
 import { registerTeamWorkflow } from "@andvl1/omp-workflows-core";
 
 registerTeamWorkflow(pi, {
   workflowProfiles: [profile],
-  roles: { "feature-regression": "manual-qa" },
+  roles: { "regression-executor": "manual-qa" },
 });
 ```
+
+The shipped `feature-regression` and `spec-preparation` profiles are platform-neutral. A bundle supplies the platform-specific executor, observer, adapter, and oracle roles; the workflow contracts remain reusable across mobile, web, desktop, and service environments.
 
 Registered profiles are included in `loadAllProfiles()` and can be selected explicitly by setting `classification.workflow` to the registered profile name. They do not override the standard Type × Complexity matrix implicitly; this keeps domain-specific profiles from hijacking unrelated feature or bug-fix requests. Bundles should perform semantic intent classification before setting the explicit workflow.
 
