@@ -84,7 +84,6 @@ jobs:
       OMP_VISUAL_MODEL: minimax-m3
       OMP_BIN: ${{ github.workspace }}/node_modules/.bin/omp
       AGENT_BROWSER_BIN: agent-browser
-      AI_E2E_ARTIFACT_DIR: ${{ runner.temp }}/omp-ai-command-e2e
     steps:
       - name: Checkout PR head (pull_request_target)
         if: github.event_name == 'pull_request_target'
@@ -161,6 +160,7 @@ jobs:
         continue-on-error: true
         env:
           OPENCODE_API_KEY: ${{ secrets.opencode_api_key }}
+          AI_E2E_ARTIFACT_DIR: ${{ runner.temp }}/omp-ai-command-e2e
         run: npm run test:ai-commands -w @andvl1/omp-workflows-e2e
 
       - name: Scan redacted AI artifacts
@@ -168,6 +168,7 @@ jobs:
         if: always()
         env:
           OPENCODE_API_KEY: ${{ secrets.opencode_api_key }}
+          AI_E2E_ARTIFACT_DIR: ${{ runner.temp }}/omp-ai-command-e2e
         run: |
           set -euo pipefail
           artifact_dir="$AI_E2E_ARTIFACT_DIR"
