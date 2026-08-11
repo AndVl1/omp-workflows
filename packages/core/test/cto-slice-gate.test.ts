@@ -210,6 +210,22 @@ test("cto-slice-gate: workflow mismatch vs matrix blocks with expected name (BUG
     cleanup(f);
   }
 });
+test("cto-slice-gate: SPEC and REGRESS reject any workflow that disagrees with the classification matrix", () => {
+  for (const type of ["SPEC", "REGRESS"] as const) {
+    const f = validRun();
+    try {
+      const team = f.state.teams[0]!;
+      team.classification = { type, complexity: "CRITICAL", confidence: "HIGH", autonomous: true };
+      team.workflow = type === "SPEC" ? "feature-regression" : "spec-preparation";
+      const expected = resolveWorkflow(type, "CRITICAL", true);
+      const r = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+      assert.equal(expected, type === "SPEC" ? "spec-preparation" : "feature-regression");
+      assert.match(blockReason(r), new RegExp(`workflow mismatch: expected ${expected}`));
+    } finally {
+      cleanup(f);
+    }
+  }
+});
 
 test("cto-slice-gate: missing/unreadable/empty per-slice DoD blocks", () => {
   // missing

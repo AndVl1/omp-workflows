@@ -54,11 +54,20 @@ test("core: resolveWorkflow matrix", () => {
   assert.equal(resolveWorkflow("INVESTIGATION", "QUICK", false), "research");
   assert.equal(resolveWorkflow("REVIEW", "QUICK", false), "review");
 });
-test("core: SPEC and REGRESS resolve to dedicated workflows", () => {
-  assert.equal(resolveWorkflow("SPEC", "QUICK", false), "spec-preparation");
-  assert.equal(resolveWorkflow("SPEC", "CRITICAL", true), "spec-preparation");
-  assert.equal(resolveWorkflow("REGRESS", "MEDIUM", false), "feature-regression");
-  assert.equal(resolveWorkflow("REGRESS", "CRITICAL", true), "feature-regression");
+test("core: SPEC and REGRESS resolve to dedicated workflows for every complexity/autonomy combination", () => {
+  const complexities = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] as const;
+  for (const type of ["SPEC", "REGRESS"] as const) {
+    const expected = type === "SPEC" ? "spec-preparation" : "feature-regression";
+    for (const complexity of complexities) {
+      for (const autonomous of [false, true]) {
+        assert.equal(
+          resolveWorkflow(type, complexity, autonomous),
+          expected,
+          `${type}/${complexity}/autonomous=${autonomous} must keep its dedicated workflow`,
+        );
+      }
+    }
+  }
 });
 
 test("core: selectProfile resolves to the right profile", async () => {

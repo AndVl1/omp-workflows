@@ -37,6 +37,8 @@ export interface ParsedCtoEnvelope {
    * decision.
    */
   autonomyHint: boolean;
+  /** @deprecated Use autonomyHint; retained for parsed-envelope consumers. */
+  autonomous: boolean;
   issue: number | null;
   branch: string | null;
 }
@@ -62,7 +64,7 @@ export function parseEnvelope(args: string, cwd: string): ParsedCtoEnvelope {
   } catch {
     branch = null;
   }
-  return { task, autonomyHint, issue, branch };
+  return { task, autonomyHint, autonomous: autonomyHint, issue, branch };
 }
 
 function renderTeamsTable(cwd: string): string {
