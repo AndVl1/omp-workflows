@@ -124,10 +124,26 @@ host config or the regenerated standard overlay:
 ```yaml
 # <scratch>/.omp/ux-e2e-overlay.user.json
 modelRoles:
-  default: minimax/MiniMax-M2.7
-  ask: minimax/MiniMax-M2.7
-  plan: minimax/MiniMax-M2.7
+  default: opencode-go/deepseek-v4-flash:high
+  task: opencode-go/deepseek-v4-flash:high
+  vision: opencode-go/minimax-m3
 ```
+
+The AI command matrix's resolved contract (see
+`scenarios/ai-command-e2e-guide.md`): provider `opencode-go` (env var
+`OPENCODE_API_KEY` — `node_modules/@oh-my-pi/pi-catalog/src/provider-models/descriptors.ts:329-332`),
+base model `deepseek-v4-flash` (openai-completions, input `["text"]` —
+`src/models.json:66502-66511`), vision model `minimax-m3` (input
+`["text","image"]` — `src/models.json:67021-67031`).
+`opencode-go/minimax-m2.5` **exists but is text-only** (input `["text"]` —
+`src/models.json:66960-66969`) and can never serve `modelRoles.vision`;
+the runner rejects it with that evidence. The `OMP_API_PROVIDER` /
+`OMP_BASE_MODEL` / `OMP_VISUAL_MODEL` names are runner-internal overrides
+only — OMP itself does not read them; the modelRoles overlay is loaded by
+omp via the `--config` flag
+(`node_modules/@oh-my-pi/pi-coding-agent/src/commands/launch.ts:82-85`,
+`src/config/settings.ts:381-383,1254-1286`; there is no `.user.json`
+auto-discovery).
 
 Presence is the opt-in signal: the file is never auto-created, and the
 third `--config` is omitted entirely when the file is absent. The resolved
@@ -180,7 +196,7 @@ line"; `\n` is just a line break and does **not** submit.
   backward compatibility with surfaces that normalised LF → CR; prefer
   `pressEnter()` for real PTY sessions.
 
-Upgrade path: `/ws?token=<session-scoped-token>`. The token remains valid for
+Upgrade path: `/ws?token=<session-scoped-token>` remains for trusted programmatic/text clients. The CLI never prints the bearer; visual browser clients use the bearer-free origin plus the `ux-e2e-token` HttpOnly cookie.
 
 ## Report schema
 

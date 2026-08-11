@@ -2,7 +2,8 @@
  * ux-e2e terminal page — plain script (no build step).
  *
  * Wire a local xterm instance to the session WebSocket:
- *   - token comes from ?token= (single-use, minted by the server);
+ *   - token comes from an HttpOnly cookie for the visual browser path;
+ *     the legacy text path may still use ?token=;
  *   - outbound: {t:'i',d} keystrokes, {t:'r',cols,rows} resizes;
  *   - inbound:  {t:'o',d} output, {t:'exit',code} process exit,
  *               {t:'err',code,message} session errors, {t:'s',ok} ack.
@@ -32,11 +33,10 @@
   }
 
   var params = new URLSearchParams(window.location.search);
-  var token = params.get('token');
-  if (!token) {
-    fatal('missing ?token= — open the URL printed by `ux-e2e start`');
-    return;
-  }
+  // Browser sessions authenticate with the HttpOnly ux-e2e-token cookie.
+  // Keep the query-token fallback for the text/legacy driver only; the
+  // visual AI runner never puts a bearer in the browser URL or argv.
+  var token = window.__uxE2eToken || params.get('token');
 
   var term = new Terminal({
     cursorBlink: true,
@@ -52,9 +52,9 @@
   window.__uxTerm = term;
 
   var proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  var ws = new WebSocket(
-    proto + '//' + window.location.host + '/ws?token=' + encodeURIComponent(token)
-  );
+  var wsUrl = proto + '//' + window.location.host + '/ws';
+  if (token) wsUrl += '?token=' + encodeURIComponent(token);
+  var ws = new WebSocket(wsUrl);
 
   // Gate the Enter button until the WS is open so a click before auth-ack
   // never produces a half-press that the PTY rejects.

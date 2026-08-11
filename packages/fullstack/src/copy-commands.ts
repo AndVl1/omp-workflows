@@ -11,30 +11,31 @@
  *    `copy-commands.mjs` CLI script and by the `postinstall` hook.
  *    Overwrites existing files so a fresh install can repair drift.
  *
- *  - {@link ensureCommandsForSession}: conservative copy, used by the
- *    `session_start` extension hook. Skips files that already exist in
- *    the target, so user customizations are preserved. Best-effort:
- *    errors are captured in the result but never thrown.
+ *  - {@link ensureCommandsForSession}: hash-aware conservative sync, used by
+ *    the `session_start` extension hook. It updates files whose contents still
+ *    match the previous shipped hash and preserves user customizations.
+ *    Best-effort: errors are captured in the result but never thrown.
  *
  * OMP installs plugins into `~/.omp/plugins/`, which is OUTSIDE any
  * project's `node_modules`. As a result, the standard npm `postinstall`
  * hook never fires for `omp plugin install`. The `session_start` hook
  * covers that case: every time the user starts a session in a project,
- * the missing commands land in `.omp/commands/` automatically.
+ * missing commands and safe plugin updates land in `.omp/commands/`.
  */
 
+import { createHash } from "node:crypto";
 import { copyFileSync, Dirent, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SHIPPED_COMMANDS_DIR = "commands";
 
 /**
  * Manifest file written into `.omp/commands/` recording the command names
- * the plugin materialized. Pruning removes a tracked directory once it
- * drops out of the shipped set, converging the target to the shipped set.
- * The manifest is a plain JSON file (not a directory), so OMP's
- * `.omp/commands/<name>/index.ts` discovery never treats it as a command.
+ * and hashes of the plugin materialized. A hash records the last shipped
+ * content, allowing session sync to distinguish plugin updates from user
+ * edits. The manifest is a plain JSON file, so OMP does not discover it as a
+ * command.
  */
 export const SHIPPED_MANIFEST_FILE = ".omp-shipped.json";
 
@@ -58,25 +59,48 @@ export interface CopyCommandsResult {
 }
 
 interface ShippedManifest {
-	schema: 1;
+	schema: 2;
 	shipped: string[];
+	files: Record<string, string>;
 }
 
-function readShippedManifest(targetRoot: string): string[] {
+interface ManifestSnapshot {
+	shipped: string[];
+	files: Record<string, string>;
+}
+
+function readHashMap(value: unknown): Record<string, string> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const hashes: Record<string, string> = {};
+	for (const [path, hash] of Object.entries(value)) {
+		if (typeof hash === "string") hashes[path] = hash;
+	}
+	return hashes;
+}
+
+function readShippedManifest(targetRoot: string): ManifestSnapshot {
 	try {
-		const raw = JSON.parse(readFileSync(join(targetRoot, SHIPPED_MANIFEST_FILE), "utf8")) as { shipped?: unknown };
-		if (Array.isArray(raw.shipped)) {
-			return raw.shipped.filter((name): name is string => typeof name === "string");
-		}
+		const raw = JSON.parse(readFileSync(join(targetRoot, SHIPPED_MANIFEST_FILE), "utf8")) as {
+			schema?: unknown;
+			shipped?: unknown;
+			files?: unknown;
+		};
+		const shipped = Array.isArray(raw.shipped)
+			? raw.shipped.filter((name): name is string => typeof name === "string")
+			: [];
+		// Schema 1 tracked only directory names. Existing files are treated as
+		// unknown and stay untouched until a force-copy establishes hashes.
+		const files = raw.schema === 2 ? readHashMap(raw.files) : {};
+		return { shipped, files };
 	} catch {
 		// missing/malformed manifest — nothing tracked yet
+		return { shipped: [], files: {} };
 	}
-	return [];
 }
 
-function writeShippedManifest(targetRoot: string, shipped: string[]): void {
+function writeShippedManifest(targetRoot: string, shipped: string[], files: Record<string, string> = {}): void {
 	try {
-		const manifest: ShippedManifest = { schema: 1, shipped };
+		const manifest: ShippedManifest = { schema: 2, shipped, files };
 		writeFileSync(join(targetRoot, SHIPPED_MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`);
 	} catch {
 		// best-effort — a missing manifest only delays pruning of future removals
@@ -88,10 +112,16 @@ function writeShippedManifest(targetRoot: string, shipped: string[]): void {
  * directories that no longer ship (tracked by the manifest, or from the
  * known legacy shipped set), while preserving explicitly user-owned
  * commands (never tracked, not in the legacy list). Rewrites the manifest
- * with the current shipped set. Returns the removed command names.
+ * with the current shipped set and file hashes. Returns the removed command
+ * names.
  */
-export function pruneStaleCommands(targetRoot: string, shippedNames: string[]): string[] {
-	const tracked = readShippedManifest(targetRoot);
+export function pruneStaleCommands(
+	targetRoot: string,
+	shippedNames: string[],
+	fileHashes?: Record<string, string>,
+): string[] {
+	const manifest = readShippedManifest(targetRoot);
+	const tracked = manifest.shipped;
 	const legacy = LEGACY_REMOVED_COMMANDS as readonly string[];
 	const removed: string[] = [];
 	let entries: Dirent[];
@@ -111,7 +141,12 @@ export function pruneStaleCommands(targetRoot: string, shippedNames: string[]): 
 			// best-effort — a locked directory is retried next session
 		}
 	}
-	writeShippedManifest(targetRoot, shippedNames);
+	const hashes =
+		fileHashes ??
+		Object.fromEntries(
+			Object.entries(manifest.files).filter(([path]) => shippedNames.includes(path.split("/")[0] ?? "")),
+		);
+	writeShippedManifest(targetRoot, shippedNames, hashes);
 	return removed;
 }
 
@@ -143,86 +178,106 @@ export function resolveShippedCommandsDir(): string {
 	}
 	return resolve(process.cwd(), "packages", "fullstack", SHIPPED_COMMANDS_DIR);
 }
+interface ShippedFile {
+	sourcePath: string;
+	targetPath: string;
+	manifestPath: string;
+}
+
+function listShippedFiles(shippedRoot: string, name: string, targetRoot: string): ShippedFile[] {
+	const sourceRoot = join(shippedRoot, name);
+	if (!existsSync(sourceRoot) || !statSync(sourceRoot).isDirectory()) return [];
+	const files: ShippedFile[] = [];
+	const visit = (sourceDir: string, relativeDir: string): void => {
+		for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
+			if (entry.name === "node_modules") continue;
+			const relativePath = join(relativeDir, entry.name);
+			const sourcePath = join(sourceDir, entry.name);
+			if (entry.isDirectory()) {
+				visit(sourcePath, relativePath);
+			} else if (entry.isFile()) {
+				files.push({
+					sourcePath,
+					targetPath: join(targetRoot, name, relativePath),
+					manifestPath: join(name, relativePath).split(sep).join("/"),
+				});
+			}
+		}
+	};
+	visit(sourceRoot, "");
+	return files;
+}
+
+function sha256File(filePath: string): string {
+	return createHash("sha256").update(readFileSync(filePath)).digest("hex");
+}
 
 /**
- * Copy a single shipped command directory into `targetRoot` (which is the
- * target `.omp/commands/` directory — NOT the project root).
- *
- * @param shippedRoot Absolute path to `packages/fullstack/commands/`.
- * @param name         The command name (subdirectory under `shippedRoot`).
- * @param targetRoot   Absolute path to the destination `.omp/commands/`.
- * @param mode         "overwrite" for install-time force-copy;
- *                     "skip-existing" for runtime auto-bootstrap.
+ * Copy a shipped command directory into `targetRoot`, overwriting every
+ * shipped file. Used by the install-time force-copy path.
  */
-function copyCommandDir(
+function copyCommandDir(shippedRoot: string, name: string, targetRoot: string): "copied" | "skipped" {
+	let copied = 0;
+	for (const file of listShippedFiles(shippedRoot, name, targetRoot)) {
+		try {
+			mkdirSync(dirname(file.targetPath), { recursive: true });
+			copyFileSync(file.sourcePath, file.targetPath);
+			copied++;
+		} catch {
+			/* unreadable file — leave it for the next sync */
+		}
+	}
+	return copied > 0 ? "copied" : "skipped";
+}
+
+interface SessionSyncResult {
+	copied: boolean;
+	hashes: Record<string, string>;
+	errors: string[];
+}
+
+function syncCommandDirForSession(
 	shippedRoot: string,
 	name: string,
 	targetRoot: string,
-	mode: "overwrite" | "skip-existing",
-): "copied" | "skipped" {
-	const src = join(shippedRoot, name);
-	const dst = join(targetRoot, name);
-	if (!existsSync(src) || !statSync(src).isDirectory()) return "skipped";
-
-	if (!existsSync(dst)) mkdirSync(dst, { recursive: true });
-
-	let copied = 0;
-	const entries: Dirent[] = readdirSync(src, { withFileTypes: true });
-	for (const entry of entries) {
-		if (entry.name === "node_modules") continue;
-		const s = join(src, entry.name);
-		const d = join(dst, entry.name);
-		if (entry.isDirectory()) {
-			if (!existsSync(d)) mkdirSync(d, { recursive: true });
-			// Recurse one level — enough for `<command>/_lib/*.ts`.
-			const sub: Dirent[] = readdirSync(s, { withFileTypes: true });
-			for (const subEntry of sub) {
-				if (!subEntry.isFile()) continue;
-				const ss = join(s, subEntry.name);
-				const dd = join(d, subEntry.name);
-				if (mode === "skip-existing" && existsSync(dd)) continue;
-				try {
-					copyFileSync(ss, dd);
-					copied++;
-				} catch {
-					/* unreadable file — leave it for next session */
-				}
-			}
-		} else if (entry.isFile()) {
-			// `d` here targets the destination FILE, not a directory.
-			if (mode === "skip-existing" && existsSync(d)) continue;
-			try {
-				copyFileSync(s, d);
-				copied++;
-			} catch {
-				/* unreadable file */
-			}
-		}
-	}
-
-	return copied > 0 || mode === "overwrite" ? "copied" : "skipped";
-}
-
-function isAlreadyUpToDate(shippedRoot: string, name: string, targetRoot: string): boolean {
-	const markers = ["index.ts", "index.js", "index.mjs", "index.cjs"];
-	for (const marker of markers) {
-		const shipped = join(shippedRoot, name, marker);
-		const target = join(targetRoot, name, marker);
-		if (!existsSync(shipped) || !existsSync(target)) continue;
+	previousHashes: Record<string, string>,
+): SessionSyncResult {
+	const result: SessionSyncResult = { copied: false, hashes: {}, errors: [] };
+	for (const file of listShippedFiles(shippedRoot, name, targetRoot)) {
 		try {
-			if (readFileSync(shipped, "utf8") === readFileSync(target, "utf8")) return true;
-		} catch {
-			/* unreadable — treat as out-of-date */
-			return false;
+			const sourceHash = sha256File(file.sourcePath);
+			if (!existsSync(file.targetPath)) {
+				mkdirSync(dirname(file.targetPath), { recursive: true });
+				copyFileSync(file.sourcePath, file.targetPath);
+				result.copied = true;
+				result.hashes[file.manifestPath] = sourceHash;
+				continue;
+			}
+
+			const targetHash = sha256File(file.targetPath);
+			const previousHash = previousHashes[file.manifestPath];
+			if (targetHash === sourceHash) {
+				result.hashes[file.manifestPath] = sourceHash;
+			} else if (previousHash && targetHash === previousHash) {
+				copyFileSync(file.sourcePath, file.targetPath);
+				result.copied = true;
+				result.hashes[file.manifestPath] = sourceHash;
+			} else if (previousHash) {
+				// The target diverged from both shipped versions: preserve the
+				// user edit and retain the last known shipped baseline.
+				result.hashes[file.manifestPath] = previousHash;
+			}
+		} catch (error) {
+			result.errors.push(`${file.manifestPath}: ${String(error)}`);
 		}
 	}
-	return false;
+	return result;
 }
 
 /**
  * Hard-copy shipped commands into the target. Used by `postinstall` and
  * the manual CLI script — overwrites existing files so reinstalls can
- * repair drift.
+ * repair drift and records the resulting shipped hashes.
  */
 export function copyCommandsForInstall(
 	projectRoot: string,
@@ -247,26 +302,35 @@ export function copyCommandsForInstall(
 		if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
 		try {
 			shippedNames.push(entry.name);
-			const outcome = copyCommandDir(shippedRoot, entry.name, targetRoot, "overwrite");
+			const outcome = copyCommandDir(shippedRoot, entry.name, targetRoot);
 			if (outcome === "copied") result.copied.push(entry.name);
 			else result.skipped.push(entry.name);
 		} catch (err) {
 			result.errors.push(`${entry.name}: ${String(err)}`);
 		}
 	}
+
+	const fileHashes: Record<string, string> = {};
+	for (const name of shippedNames) {
+		for (const file of listShippedFiles(shippedRoot, name, targetRoot)) {
+			try {
+				fileHashes[file.manifestPath] = sha256File(file.sourcePath);
+			} catch (error) {
+				result.errors.push(`${file.manifestPath}: ${String(error)}`);
+			}
+		}
+	}
 	// Converge to the shipped set: drop plugin-owned stale command dirs
 	// (manifest-tracked or legacy shipped names), keep user-owned ones.
-	pruneStaleCommands(targetRoot, shippedNames);
+	pruneStaleCommands(targetRoot, shippedNames, fileHashes);
 	return result;
 }
 
 /**
- * Best-effort auto-bootstrap: ensures a target project's `.omp/commands/`
- * has the shipped commands present, WITHOUT overwriting any user-modified
- * files. Designed to be invoked from the `session_start` extension hook
- * so the commands are present regardless of whether the user installed
- * via `npm install` (postinstall path) or `omp plugin install`
- * (extension-hook path).
+ * Best-effort session sync. Each existing target file is overwritten only
+ * when its hash matches the previous shipped hash; unknown or user-modified
+ * files are preserved. Legacy schema-1 manifests have no hashes, so existing
+ * files remain untouched until a force-copy establishes the baseline.
  */
 export function ensureCommandsForSession(
 	projectRoot: string,
@@ -291,19 +355,19 @@ export function ensureCommandsForSession(
 		}
 	}
 
+	const previousHashes = readShippedManifest(targetRoot).files;
+	const fileHashes: Record<string, string> = {};
 	const entries: Dirent[] = readdirSync(shippedRoot, { withFileTypes: true });
 	const shippedNames: string[] = [];
 	for (const entry of entries) {
 		if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
 		try {
 			shippedNames.push(entry.name);
-			if (isAlreadyUpToDate(shippedRoot, entry.name, targetRoot)) {
-				result.skipped.push(entry.name);
-				continue;
-			}
-			const outcome = copyCommandDir(shippedRoot, entry.name, targetRoot, "skip-existing");
-			if (outcome === "copied") result.copied.push(entry.name);
+			const sync = syncCommandDirForSession(shippedRoot, entry.name, targetRoot, previousHashes);
+			if (sync.copied) result.copied.push(entry.name);
 			else result.skipped.push(entry.name);
+			Object.assign(fileHashes, sync.hashes);
+			result.errors.push(...sync.errors);
 		} catch (err) {
 			result.errors.push(`${entry.name}: ${String(err)}`);
 		}
@@ -311,6 +375,6 @@ export function ensureCommandsForSession(
 	// Every session start converges the target to the shipped set: stale
 	// plugin-owned command dirs (team-next/team-yolo and other removed
 	// shipped entries) stop being selectable once a fresh session starts.
-	pruneStaleCommands(targetRoot, shippedNames);
+	pruneStaleCommands(targetRoot, shippedNames, fileHashes);
 	return result;
 }

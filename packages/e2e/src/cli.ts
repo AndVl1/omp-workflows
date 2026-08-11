@@ -75,6 +75,11 @@ function readSessionJson(scratchDir: string): SessionJson {
     return {};
   }
 }
+function redactSessionUrl(value: unknown): string {
+  return typeof value === 'string'
+    ? value.replace(/([?&](?:token|key)=)[^&]+/giu, '$1<redacted>')
+    : 'unknown';
+}
 
 /** Monorepo root: default = the repo that ships this package. */
 function defaultMonorepoRoot(): string {
@@ -286,7 +291,8 @@ async function runStartForeground(args: StartArgs): Promise<number> {
     taskPrompt,
     scenario: scenario !== null ? { id: scenario.id, title: scenario.title } : null,
   });
-  console.log(`ux-e2e: session started — url: ${session.url}`);
+  console.log(`ux-e2e: browser URL: ${session.browserUrl}`);
+  console.log(`ux-e2e: session URL (redacted): ${redactSessionUrl(session.url)}`);
   console.log(`ux-e2e: transcript: ${session.transcriptPath}`);
   return await driveForeground(session, scenario);
 }
@@ -422,7 +428,7 @@ async function runStartDetached(args: StartArgs): Promise<number> {
     if (info !== null && pidIsLive(info.pid)) {
       const sessionJson = readSessionJson(args.scratchDir);
       console.log(`ux-e2e: detached session started (pid ${String(info.pid)})`);
-      console.log(`ux-e2e: url: ${typeof sessionJson.url === 'string' ? sessionJson.url : 'unknown'}`);
+      console.log(`ux-e2e: url (redacted): ${redactSessionUrl(sessionJson.url)}`);
       return 0;
     }
     if (Date.now() >= deadline) {

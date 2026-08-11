@@ -2,6 +2,13 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.20.1] — 2026-08-10
+### Fixed
+- **CTO team registry validation** (`packages/core/src/cto/plan.ts`, `packages/core/src/commands/cto.ts`) — validate each `.omp/teams.json` entry's `id`, `name`, `scope`, `profile`, `lead`, and `roster` shape before prompt rendering; malformed/non-array roster entries are ignored instead of causing `t.roster.map` crashes.
+- **Hash-aware shipped-command synchronization** (`packages/fullstack/src/copy-commands.ts`, `packages/fullstack/scripts/copy-commands.mjs`) — session-start sync updates stale plugin-owned files by shipped hash while preserving user edits and prunes removed plugin-owned commands.
+### Verified
+- Full workspace build, typecheck, and tests passed: core 373/373, e2e 74/74, fullstack 255/255.
+
 ## [0.20.0] — 2026-08-10
 ### Added
 - **Resident / control-plane CTO lifecycle** (`packages/core/src/cto/{state,types,channels,slice-gate}.ts`, `packages/fullstack/src/adapters/registry.ts`) — `/cto` with no task starts a standby run that stays resident between waves and accepts follow-up tasks via durable inbox (terminal and RW channels); `/cto <task>` starts a task run, and an active standby run folds follow-ups into a new wave. Common PHASE-0 classification, the `/do-work` workflow matrix, marker-gated lead dispatch, and the nested-CTO ban are preserved. Wave/task state stays file-backed and survives restarts; slices run in separate git worktrees; wave completion builds an authoritative summary.

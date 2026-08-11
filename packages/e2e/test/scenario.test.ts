@@ -88,6 +88,10 @@ test('scenario: missing/invalid fields throw with field names', () => {
     /task\.file/u,
   );
   assert.throws(
+    () => loadScenario(write('outside-task.json', { ...valid, task: { file: '../secret.md' } })),
+    /must stay inside/iu,
+  );
+  assert.throws(
     () => loadScenario(join(dir, 'does-not-exist.json')),
     /cannot read\/parse/u,
   );

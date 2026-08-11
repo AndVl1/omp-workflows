@@ -8,11 +8,13 @@
  */
 
 import { test } from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+	SHIPPED_MANIFEST_FILE,
 	copyCommandsForInstall,
 	ensureCommandsForSession,
 	resolveShippedCommandsDir,
@@ -23,6 +25,9 @@ const projectRoot = resolve(fileURLToPath(import.meta.url), "..", "..", "..");
 
 function freshProjectDir(): string {
 	return mkdtempSync(join(tmpdir(), "omp-copy-test-"));
+}
+function sha256(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
 }
 
 test("fullstack: resolveShippedCommandsDir returns a real directory in this checkout", () => {
@@ -41,6 +46,12 @@ test("fullstack: ensureCommandsForSession populates a fresh project", () => {
 		assert.ok(result.errors.length === 0, `errors: ${result.errors.join(" | ")}`);
 		assert.ok(result.copied.length > 0, "should copy at least one command on a fresh project");
 		assert.ok(result.copied.includes("do-work"), "do-work should be copied on a fresh project");
+		const manifest = JSON.parse(readFileSync(join(dir, ".omp", "commands", SHIPPED_MANIFEST_FILE), "utf8")) as {
+			schema: number;
+			files: Record<string, string>;
+		};
+		assert.equal(manifest.schema, 2, "fresh sync writes the hash manifest");
+		assert.ok(manifest.files["do-work/index.ts"], "fresh sync records shipped file hashes");
 
 		// Spot-check the copied tree: <dir>/.omp/commands/do-work/index.ts exists
     // The copied entrypoint is a thin adapter over the core command contract.
@@ -99,6 +110,59 @@ test("fullstack: copyCommandsForInstall overwrites existing files (force-copy)",
 		);
 		const after = readFileSync(victim, "utf8");
 		assert.ok(!after.startsWith("// should be replaced"), "the user's edit must be replaced");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("fullstack: ensureCommandsForSession updates stale shipped helpers by manifest hash", () => {
+	const dir = freshProjectDir();
+	try {
+		const target = join(dir, ".omp", "commands");
+		ensureCommandsForSession(dir);
+		const helper = join(target, "cto", "_lib", "cto.ts");
+		const manifestPath = join(target, SHIPPED_MANIFEST_FILE);
+		const previous = "// previous shipped helper\n";
+		writeFileSync(helper, previous, "utf8");
+		writeFileSync(
+			manifestPath,
+			JSON.stringify({
+				schema: 2,
+				shipped: ["cto"],
+				files: { "cto/_lib/cto.ts": sha256(previous) },
+			}),
+		);
+
+		const result = ensureCommandsForSession(dir);
+		const shipped = readFileSync(join(resolveShippedCommandsDir(), "cto", "_lib", "cto.ts"), "utf8");
+		assert.ok(result.copied.includes("cto"), "stale shipped helper should be replaced");
+		assert.equal(readFileSync(helper, "utf8"), shipped, "target receives the current shipped helper");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("fullstack: ensureCommandsForSession preserves user edits that differ from shipped hash", () => {
+	const dir = freshProjectDir();
+	try {
+		const target = join(dir, ".omp", "commands");
+		ensureCommandsForSession(dir);
+		const helper = join(target, "cto", "_lib", "cto.ts");
+		const manifestPath = join(target, SHIPPED_MANIFEST_FILE);
+		const previous = "// previous shipped helper\n";
+		const userEdit = "// user customization\n";
+		writeFileSync(helper, userEdit, "utf8");
+		writeFileSync(
+			manifestPath,
+			JSON.stringify({
+				schema: 2,
+				shipped: ["cto"],
+				files: { "cto/_lib/cto.ts": sha256(previous) },
+			}),
+		);
+
+		ensureCommandsForSession(dir);
+		assert.equal(readFileSync(helper, "utf8"), userEdit, "user customization must not be overwritten");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

@@ -50,6 +50,35 @@ export const PROXY_ENV_KEYS = [
   'all_proxy',
   'no_proxy',
 ] as const;
+/**
+ * Environment values safe to carry into an OMP test PTY by default.
+ *
+ * OPENCODE_API_KEY and OMP_API_PROVIDER / OMP_BASE_MODEL / OMP_VISUAL_MODEL
+ * are intentionally NOT listed: the AI command runner injects the API key
+ * explicitly into its own session env (ai-command-runner.ts spawn site), so
+ * generic e2e sessions must never inherit it (or the runner-internal override
+ * names) from the parent env.
+ */
+export const SAFE_PTY_ENV_KEYS = [
+  'PATH',
+  'HOME',
+  'LANG',
+  'LC_ALL',
+  'TERM',
+  'COLORTERM',
+  'NO_COLOR',
+  'FORCE_COLOR',
+  'CI',
+] as const;
+
+export function safePtyEnv(source: Readonly<Record<string, string | undefined>> = process.env): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of SAFE_PTY_ENV_KEYS) {
+    const value = source[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
 
 /**
  * Build the env passed to `pty.spawn`. Merges `process.env` with caller
@@ -104,7 +133,6 @@ function appendSessionFile(path: string, body: string): void {
 }
 
 /**
- * Strip ANSI escapes and lone C0 control chars from a value destined for
  * a JSON file (session.json / report). Keeps \t \n \r at the byte level
  * (they're harmless in JSON) but drops the ESC (0x1b) sequence and
  * embedded BEL/BS/VT/FF that downstream renderers can mishandle.
@@ -496,8 +524,12 @@ export interface TestSessionOptions {
   readonly approvalMode?: string;
   /** Task prompt recorded in session.json. */
   readonly taskPrompt?: string | null;
-  /** Extra env vars merged on top of `process.env` (TERM is forced). */
+  /** Extra env vars merged on top of the selected base environment (TERM is forced). */
   readonly env?: Readonly<Record<string, string>>;
+  /** When false or unset, use the safe PTY environment allowlist; true opts into full inheritance. */
+  readonly inheritEnv?: boolean;
+  /** Host config path override; null disables host config discovery for this session. */
+  readonly hostConfigPath?: string | null;
   /** Pre-minted token override (tests). Default: freshly minted. */
   readonly token?: string;
   /**
@@ -521,6 +553,8 @@ export interface TestSession {
   readonly port: number;
   readonly token: string;
   readonly url: string;
+  /** Origin URL for visual browser clients; authentication is via an HttpOnly cookie. */
+  readonly browserUrl: string;
   /** WebSocket path, e.g. `/ws`. The token goes in `?token=` (see `url`). */
   readonly wsPath: string;
   readonly scratchDir: string;
@@ -719,15 +753,32 @@ function send(ws: WS, msg: ServerMsg): boolean {
   }
 }
 
+const SESSION_COOKIE = 'ux-e2e-token';
+
 function readToken(req: IncomingMessage): string | null {
-  if (req.url === undefined) return null;
   try {
-    const u = new URL(req.url, 'http://placeholder.invalid/');
-    const t = u.searchParams.get('token');
-    return t !== null && t.length > 0 ? t : null;
+    const u = new URL(req.url ?? '/', 'http://placeholder.invalid/');
+    const queryToken = u.searchParams.get('token');
+    if (queryToken !== null && queryToken.length > 0) return queryToken;
   } catch {
-    return null;
+    // Fall through to the cookie path.
   }
+  const cookieHeader = req.headers.cookie;
+  if (typeof cookieHeader !== 'string') return null;
+  for (const part of cookieHeader.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator < 0) continue;
+    const name = part.slice(0, separator).trim();
+    if (name !== SESSION_COOKIE) continue;
+    const value = part.slice(separator + 1).trim();
+    if (value.length === 0) return null;
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 /**
@@ -798,15 +849,13 @@ export function originAllowed(req: IncomingMessage, expectedOrigin: string): boo
     candidatePort = parsed.port;
   }
   if (candidateHost.length === 0) return false;
-  // 1) Exact match (existing behaviour).
-  if (candidateHost === expectedHost) return true;
+  if (candidateHost === expectedHost && (candidateProto.length === 0 || candidateProto === expectedProtocol)) return true;
   // 2) Loopback alias — localhost <-> 127.0.0.1 <-> ::1 — ports must match.
   if (
     LOOPBACK_ALIASES.has(candidateHostname) &&
     LOOPBACK_ALIASES.has(expectedHostname) &&
     candidatePort === expectedPort &&
-    ALIAS_PROTOCOLS.has(candidateProto || expectedProtocol) &&
-    ALIAS_PROTOCOLS.has(expectedProtocol)
+    (candidateProto.length === 0 || candidateProto === expectedProtocol)
   ) {
     return true;
   }
@@ -996,11 +1045,11 @@ function deriveSlug(scratchDir: string): string {
   return base.startsWith(PREFIX) ? base.slice(PREFIX.length) : base;
 }
 
-async function resolveOmpVersion(binary: string): Promise<string> {
+async function resolveOmpVersion(binary: string, env?: NodeJS.ProcessEnv): Promise<string> {
   try {
     const { promise, resolve: done, reject: fail } = deferred<string>();
     // stdin ignored: a fake test command must not block on --version.
-    const child = spawn(binary, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 });
+    const child = spawn(binary, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, ...(env !== undefined ? { env } : {}) });
     let out = '';
     if (child.stdout !== null) {
       child.stdout.on('data', (chunk: Buffer) => {
@@ -1055,6 +1104,8 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   const maxTimeSec = opts.maxTimeSec ?? 1800;
   const approvalMode = opts.approvalMode ?? 'yolo';
   const token = opts.token ?? mintToken();
+  const launchBaseEnv = opts.inheritEnv === true ? process.env : safePtyEnv();
+  const launchEnv = buildPtyEnv(launchBaseEnv, opts.env, { keepProxyEnv: opts.keepProxyEnv });
 
   const stateDir = stateDirOf(scratchDir);
   mkdirSync(stateDir, { recursive: true, mode: SESSION_DIR_MODE });
@@ -1063,7 +1114,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   // Truncate the transcript — a fresh session starts with a clean evidence file.
   writeSessionFile(transcriptPath, '');
 
-  const ompVersion = await resolveOmpVersion(ompBinary);
+  const ompVersion = await resolveOmpVersion(ompBinary, launchEnv);
 
   const httpServer: Server = createServer();
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_INBOUND_WS_BYTES });
@@ -1081,14 +1132,18 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   const boundPort = addr.port;
   const origin = `http://${publicHost}:${boundPort}`;
   const wsPath = '/ws';
-  const url = `http://${publicHost}:${boundPort}/?token=${encodeURIComponent(token)}`;
+  const url = `${origin}/?token=${encodeURIComponent(token)}`;
+  /** Browser URL is intentionally bearer-free; the runner installs a cookie from a mode-600 file. */
+  const browserUrl = `${origin}/`;
   // Resolve the host omp config FIRST so the warning is in session.json
   // (and stderr) regardless of noPty mode. omp merges `--config` overlays
   // in argv order — putting the host config before the ux-e2e overlay
   // means the overlay (later) wins for keys it explicitly sets, and the
   // host's `modelRoles` (and any other untouched keys) survive. Without
   // the host config, omp boots with "No model selected".
-  const hostConfig = checkHostOmpConfig();
+  const hostConfig = opts.hostConfigPath === null
+    ? { path: null, warning: null }
+    : checkHostOmpConfig(opts.hostConfigPath ?? undefined);
   if (hostConfig.warning !== null) {
     process.stderr.write(`ux-e2e: WARNING: ${hostConfig.warning}\n`);
   }
@@ -1110,7 +1165,6 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     // binary may be missing on some platforms — noPty test sessions must
     // still work when the native module cannot load.
     const ptyMod = await import('node-pty');
-    const env = buildPtyEnv(process.env, opts.env, { keepProxyEnv: opts.keepProxyEnv });
     const args = buildOmpArgs({
       ompProfile,
       maxTimeSec,
@@ -1125,7 +1179,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
       // omp is spawned directly (never wrapped in a shell), which is
       // inherently rc/profile-suppressed: no shell rc files can reorder
       // PATH or print noise into the terminal.
-      ptyProc = ptyMod.spawn(ompBinary, args, { name: 'xterm-256color', cols, rows, cwd: scratchDir, env });
+      ptyProc = ptyMod.spawn(ompBinary, args, { name: 'xterm-256color', cols, rows, cwd: scratchDir, env: launchEnv });
     } catch (err) {
       spawnError = err instanceof Error ? err.message : String(err);
     }
@@ -1162,6 +1216,12 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     const path = pathnameOf(req);
     if (path === '/') {
       serveFile(res, assets.terminalHtml, 'text/html; charset=utf-8');
+      return;
+    }
+    if (path === '/session-token.js') {
+      res.statusCode = 404;
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.end('not found');
       return;
     }
     if (path === '/page.js') {
@@ -1225,6 +1285,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     port: boundPort,
     token,
     url,
+    browserUrl,
     wsPath,
     scratchDir,
     transcriptPath,

@@ -105,6 +105,21 @@ test("fullstack: /cto command loads and parses an envelope", async () => {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+test("fullstack: /cto ignores malformed roster entries instead of throwing", async () => {
+	const root = mkdtempSync(join(tmpdir(), "cto-cmd-malformed-team-"));
+	try {
+		mkdirSync(join(root, ".omp"), { recursive: true });
+		writeFileSync(
+			join(root, ".omp", "teams.json"),
+			JSON.stringify([{ ...TEAMS_JSON[0], roster: "backend-kotlin" }]),
+		);
+		const cmd = ctoFactory({ ...fakeApi, cwd: root } as never);
+		const result = await cmd.execute(["Add OAuth"], { ...fakeCtx, cwd: root } as never);
+		assert.ok(result.includes("(no teams configured)"), "invalid team entries are excluded from the rendered registry");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 
 test("fullstack: /cto degrades gracefully without teams.json", () => {
 	const root = mkdtempSync(join(tmpdir(), "cto-cmd-empty-"));

@@ -11,7 +11,7 @@ import { test } from 'node:test';
 import { WebSocket } from 'ws';
 
 import { deferred } from '../src/util.js';
-import { AskStateTracker, TranscriptLog, waitFor, WaitTimeoutError, WsDriver } from '../src/driver.js';
+import { AskStateTracker, assertLoopbackPageUrl, TranscriptLog, waitFor, WaitTimeoutError, WsDriver, wsUrlFromPageUrl } from '../src/driver.js';
 import { startTestSession } from '../src/server.js';
 
 function makeDir(): string {
@@ -163,6 +163,12 @@ test('waitFor: resolves immediately and times out with a clear error', async () 
     waitFor(() => false, { timeoutMs: 60, intervalMs: 10, label: 'never-happens' }),
     (err: unknown) => err instanceof WaitTimeoutError && /never-happens/u.test(err.message),
   );
+});
+test('driver: session URL guard only permits loopback HTTP(S) origins', () => {
+  assert.equal(assertLoopbackPageUrl('http://127.0.0.1:1234/?token=sekret').hostname, '127.0.0.1');
+  assert.equal(wsUrlFromPageUrl('http://localhost:4321/?token=sekret'), 'ws://localhost:4321/ws?token=sekret');
+  assert.throws(() => assertLoopbackPageUrl('https://evil.example:443/?token=sekret'), /non-loopback/iu);
+  assert.throws(() => wsUrlFromPageUrl('file:///tmp/session?token=sekret'), /non-loopback|protocol/iu);
 });
 
 test('TranscriptLog: refresh reads only the delta on subsequent calls', () => {

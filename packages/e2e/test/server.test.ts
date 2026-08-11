@@ -23,6 +23,7 @@ import {
   mintToken,
   pidIsLive,
   safeEqual,
+  safePtyEnv,
   startTestSession,
   type ServerMsg,
 } from '../src/server.js';
@@ -36,13 +37,17 @@ function makeScratch(): string {
 function openWs(
   port: number,
   token: string,
-  opts: { origin?: string } = {},
+  opts: { origin?: string; cookie?: string } = {},
   onMessage?: (msg: ServerMsg) => void,
 ): Promise<WebSocket> {
   const { promise, resolve, reject } = deferred<WebSocket>();
+  const headers = opts.cookie === undefined ? undefined : { Cookie: opts.cookie };
   const ws = new WebSocket(
-    `ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`,
-    opts.origin !== undefined ? { origin: opts.origin } : undefined,
+    `ws://127.0.0.1:${port}/ws${opts.cookie === undefined ? `?token=${encodeURIComponent(token)}` : ''}`,
+    {
+      ...(opts.origin !== undefined ? { origin: opts.origin } : {}),
+      ...(headers === undefined ? {} : { headers }),
+    },
   );
   if (onMessage !== undefined) {
     // Attach BEFORE open resolves — the server's {t:'s'} ack can arrive
@@ -253,6 +258,19 @@ test('server: checkHostOmpConfig warns on missing or empty modelRoles', () => {
   rmSync(dir, { recursive: true });
 
 });
+test('server: safe PTY env excludes unrelated host credentials and secrets', () => {
+  const env = safePtyEnv({
+    PATH: '/bin',
+    HOME: '/home/test',
+    OPENCODE_API_KEY: 'opencode-secret',
+    AWS_SECRET_ACCESS_KEY: 'aws-secret',
+    NODE_OPTIONS: '--require=evil',
+  });
+  assert.deepEqual(env, {
+    PATH: '/bin',
+    HOME: '/home/test',
+  });
+});
 
 test('server: HTTP serves /page.js with cache-buster query (D1)', async t => {
   const scratch = makeScratch();
@@ -280,6 +298,17 @@ test('server: HTTP serves /page.js with cache-buster query (D1)', async t => {
   assert.equal(ok.status, 200, '/page.js?cb=1 returns 200');
   assert.match(ok.ctype, /javascript/u, 'content-type is JS');
   assert.match(ok.body, /window\.__uxTerm/u, 'served body is the actual page.js (not 404 fallback)');
+  assert.equal(new URL(session.browserUrl).search, '', 'browserUrl carries no bearer query');
+  const tokenScript = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const req = http.get(`http://127.0.0.1:${String(session.port)}/session-token.js`, res => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+  });
+  assert.equal(tokenScript.status, 404, '/session-token.js is not a bearer-token endpoint');
 
   // Also exercise the static /xterm.js, /xterm.css, /addon-fit.js routes
   // for symmetry (these were already present; just keep them covered).
@@ -340,12 +369,24 @@ test('server: session-scoped token — reconnect is accepted until the session c
   assert.match(error.message, /401|ECONNREFUSED|connect/iu);
 });
 
+test('server: ws accepts the browser HttpOnly session cookie without a URL token', async t => {
+  const scratch = makeScratch();
+  const session = await startTestSession({ cwd: scratch, noPty: true, token: 'sekret' });
+  t.after(() => session.close());
+  const messages: ServerMsg[] = [];
+  const ws = await openWs(session.port, 'ignored', { cookie: 'ux-e2e-token=sekret' }, message => messages.push(message));
+  await waitFor(() => messages.some(message => message.t === 's'), { timeoutMs: 2000 });
+  await ws.close();
+});
+
 test('server: ws rejects a mismatched Origin', async t => {
   const scratch = makeScratch();
   const session = await startTestSession({ cwd: scratch, noPty: true, token: 'sekret' });
   t.after(() => session.close());
   const err = await wsFails(session.port, 'sekret', { origin: 'http://evil.example' });
   assert.match(err.message, /403|unexpected server response/iu);
+  const exactHostWrongScheme = await wsFails(session.port, 'sekret', { origin: `https://127.0.0.1:${String(session.port)}` });
+  assert.match(exactHostWrongScheme.message, /403|unexpected server response/iu);
 });
 
 test('server: rate limit kicks the client', async t => {

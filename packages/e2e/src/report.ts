@@ -269,21 +269,99 @@ function collectEvidence(
   }
   return [...new Set(evidence)];
 }
+function redactSessionEvidence(content: string): string {
+  try {
+    const value: unknown = JSON.parse(content);
+    const redact = (entry: unknown, key?: string): unknown => {
+      if (key !== undefined && /(?:^|_)(?:token|key)$/iu.test(key)) return '<redacted>';
+      if (key !== undefined && /(?:^|_)(?:url)$/iu.test(key) && typeof entry === 'string') {
+        return entry.replace(/([?&](?:token|key|api[_-]?key)=)[^&\s]+/giu, '$1<redacted>');
+      }
+      if (key !== undefined && /(?:^|_)(?:path|dir)$/iu.test(key)) return '<path>';
+      if (Array.isArray(entry)) return entry.map(item => redact(item));
+      if (typeof entry === 'object' && entry !== null) {
+        return Object.fromEntries(Object.entries(entry).map(([childKey, childValue]) => [childKey, redact(childValue, childKey)]));
+      }
+      return typeof entry === 'string' ? sanitizeForJson(entry) : entry;
+    };
+    return `${JSON.stringify(redact(value), null, 2)}\n`;
+  } catch {
+    // Never copy an unparseable session file: it may contain a raw bearer.
+    return '{"redacted":true,"reason":"unparseable session evidence"}\n';
+  }
+}
+const TEXT_EVIDENCE_EXTENSIONS = new Set(['.json', '.jsonl', '.log', '.md', '.txt']);
 
+function evidenceSecrets(evidence: readonly string[]): string[] {
+  const secrets = new Set<string>();
+  const sessionPath = evidence.find(path => basename(path) === 'session.json');
+  if (sessionPath !== undefined) {
+    try {
+      const raw = JSON.parse(readFileSync(sessionPath, 'utf8')) as RawSessionJson;
+      if (typeof raw.token === 'string' && raw.token.length >= 8) secrets.add(raw.token);
+    } catch {
+      // The session file is redacted fail-closed below if it cannot be parsed.
+    }
+  }
+  for (const key of [
+    'OPENCODE_API_KEY',
+    'OPENAI_API_KEY',
+    'ANTHROPIC_API_KEY',
+    'GEMINI_API_KEY',
+    'GOOGLE_API_KEY',
+    'OPENROUTER_API_KEY',
+    'XAI_API_KEY',
+  ]) {
+    const value = process.env[key];
+    if (value !== undefined && value.length >= 8) secrets.add(value);
+  }
+  return [...secrets];
+}
+
+function redactTextEvidence(content: string, secrets: readonly string[]): string {
+  let result = sanitizeForJson(content);
+  for (const secret of secrets) result = result.split(secret).join('<redacted>');
+  return result
+    .replace(/((?:\\?["']?(?:api[_-]?key|authorization|bearer|access[_-]?token|session[_-]?token|token)\\?["']?)\s*[:=]\s*\\?["']?(?:bearer\s+)?)(?!<redacted>)[^<\s\\'",;]{8,}/giu, '$1<redacted>')
+    .replace(/([?&](?:token|key|api[_-]?key)=)[^&\s]+/giu, '$1<redacted>');
+}
+
+function isTextEvidence(path: string): boolean {
+  const dot = path.lastIndexOf('.');
+  return dot >= 0 && TEXT_EVIDENCE_EXTENSIONS.has(path.slice(dot).toLowerCase());
+}
+
+/** Copy evidence through a text redactor; binary screenshots are copied as-is. */
 function copyEvidence(evidence: readonly string[], targetDir: string): string[] {
   mkdirSync(targetDir, { recursive: true });
   const copied: string[] = [];
+  const secrets = evidenceSecrets(evidence);
   for (const src of evidence) {
+    const dst = join(targetDir, basename(src));
     try {
-      const dst = join(targetDir, basename(src));
-      copyFileSync(src, dst);
+      if (basename(src) === 'session.json') {
+        const redacted = redactTextEvidence(redactSessionEvidence(readFileSync(src, 'utf8')), secrets);
+        writeFileSync(dst, redacted, { mode: 0o600 });
+      } else if (isTextEvidence(src)) {
+        writeFileSync(dst, redactTextEvidence(readFileSync(src, 'utf8'), secrets), { mode: 0o600 });
+      } else {
+        copyFileSync(src, dst);
+      }
       copied.push(dst);
     } catch {
-      copied.push(src); // keep the original reference when copy fails
+      // Fail closed: never point the report back at an unredacted source.
+      if (basename(src) === 'session.json') {
+        try {
+          writeFileSync(join(targetDir, 'session.json.redaction-failed'), '{"redacted":true,"reason":"copy failed"}\n', { mode: 0o600 });
+        } catch {
+          // No safe evidence path is available.
+        }
+      }
     }
   }
   return copied;
 }
+
 
 /** Runtime-narrowed tty metadata from session.json (defaults when absent). */
 function readTty(raw: unknown): { cols: number; rows: number; term: string } {
@@ -491,7 +569,9 @@ export function generateReport(
   const sessionJsonl = join(stateDir, 'session.jsonl');
 
   const screenshots = clampedSteps.flatMap(s => s.screenshots);
-  let evidence = collectEvidence(scratchDir, screenshots);
+  const rawEvidence = collectEvidence(scratchDir, screenshots);
+  const sessionSecrets = evidenceSecrets(rawEvidence);
+  let evidence = rawEvidence;
   if (opts.copyEvidence === true) {
     const mdRoot = resolve(opts.mdDir ?? join(process.cwd(), 'vibe-report'));
     evidence = copyEvidence(evidence, join(mdRoot, 'evidence', slug));
@@ -510,7 +590,7 @@ export function generateReport(
       tty: readTty(rawSession.tty),
       started_at: typeof rawSession.started_at === 'string' ? rawSession.started_at : null,
       finished_at: null,
-      task_prompt: typeof rawSession.task_prompt === 'string' ? sanitizeForJson(rawSession.task_prompt) : null,
+      task_prompt: typeof rawSession.task_prompt === 'string' ? redactTextEvidence(rawSession.task_prompt, sessionSecrets) : null,
       scenario: readScenarioRef(rawSession.scenario),
       transcript,
       session_jsonl: sessionJsonl,
@@ -526,13 +606,11 @@ export function generateReport(
   };
 
   const jsonPath = join(stateDir, 'report.json');
-  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const mdDir = resolve(opts.mdDir ?? join(process.cwd(), 'vibe-report'));
-  mkdirSync(mdDir, { recursive: true });
+  mkdirSync(mdDir, { recursive: true, mode: 0o700 });
   const mdPath = join(mdDir, `${slug}-ux-e2e-${todayStamp()}.md`);
-
-  writeFileSync(jsonPath, JSON.stringify(report, null, 2) + '\n');
-  writeFileSync(mdPath, renderMarkdown(report));
-
+  writeFileSync(jsonPath, JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });
+  writeFileSync(mdPath, renderMarkdown(report), { mode: 0o600 });
   return { jsonPath, mdPath, warnings };
 }
