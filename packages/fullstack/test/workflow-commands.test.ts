@@ -42,7 +42,7 @@ test("fullstack: workflow commands register as authoritative extension commands"
 	assert.ok(commands.get("cto")?.description?.includes("resident CTO"));
 });
 
-test("fullstack: direct /do-work and /team handlers emit current prompts", async () => {
+test("fullstack: direct /do-work and /team send prompts through OMP", async () => {
 	const { commands, prompts, notifications } = commandHarness();
 	const ctx = context(process.cwd(), notifications);
 

@@ -149,8 +149,8 @@ omp-workflows-monorepo/
 
 OMP 17.x exposes the `task` tool only to the main agent. Workflow commands therefore return prompts; the main agent executes the workflow through its own `task` tool.
 
-- **Authoritative runtime path:** `packages/fullstack/src/workflow-commands.ts` registers `/do-work`, `/team`, and `/cto` through `ExtensionAPI.registerCommand` during extension loading. OMP gives registered extension commands precedence over project-local custom-TS commands for both autocomplete and execution.
-- **Compatibility path:** `packages/fullstack/commands/<name>/index.ts` contains the thin custom-TS adapters. `copy-commands.mjs` and the `session_start` SHA-256 sync materialize them under `<project>/.omp/commands/` for runtimes that still rely on disk discovery.
+- **Authoritative runtime path:** `packages/fullstack/src/workflow-commands.ts` registers `/do-work`, `/team`, and `/cto` through `ExtensionAPI.registerCommand` during extension loading. OMP gives registered extension commands precedence over project-local custom-TS commands for both autocomplete and execution. The handlers still send the generated prompt through OMP's normal user-message lifecycle, so external `before_agent_start`/`context` hooks continue to run.
+- **Compatibility path:** `packages/fullstack/commands/<name>/index.ts` contains the thin custom-TS adapters. `copy-commands.mjs` and the `session_start` SHA-256 sync materialize them under `<project>/.omp/commands/` for runtimes that still rely on disk discovery. These copies are not an override API; same-name external extension commands use OMP's normal load-order rule, and Claude marketplace commands stay namespaced.
 
 
 ## Usage

@@ -45,8 +45,7 @@ export default function (pi: ExtensionAPI) {
 The taxonomy that backs the bundled `/omp-model-roles validate` command (`defaultFullstackModelRoles`,
 14 entries) is imported from `@andvl1/omp-workflows-core` so any other bundle can compose the same
 helpers (`resolveRoleChain`, `isResearchRequest`, `isResearchResponse`) against its own `ModelRoleEntry[]`.
-
-The extension registers the workflow gates, writes `.omp/team.config.json`, and registers `/do-work`, `/team`, and `/cto` as authoritative extension commands. The `commands/` adapters remain the compatibility path for runtimes that only discover custom-TS files from disk.
+The extension registers the workflow gates, writes `.omp/team.config.json`, and registers `/do-work`, `/team`, and `/cto` as authoritative extension commands. Their prompts still pass through OMP's normal user-message lifecycle, so external `before_agent_start`/`context` hooks continue to run. The `commands/` adapters remain the compatibility path for runtimes that only discover custom-TS files from disk; same-name project files are not an override API.
 
 The `agents/` and `skills/` directories are picked up by OMP's discovery automatically.
 
