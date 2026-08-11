@@ -7,7 +7,9 @@ type Registered = {
 	handler: (args: string, ctx: unknown) => Promise<void>;
 };
 
-function commandHarness(): { commands: Map<string, Registered>; prompts: string[]; notifications: string[] } {
+function commandHarness(
+	transformPrompt: (prompt: string) => string = prompt => prompt,
+): { commands: Map<string, Registered>; prompts: string[]; notifications: string[] } {
 	const commands = new Map<string, Registered>();
 	const prompts: string[] = [];
 	const notifications: string[] = [];
@@ -16,7 +18,9 @@ function commandHarness(): { commands: Map<string, Registered>; prompts: string[
 			commands.set(name, options);
 		},
 		sendUserMessage(prompt: string) {
-			prompts.push(prompt);
+			// This is the handoff into AgentSession.prompt, where external
+			// before_agent_start/context hooks observe and augment the prompt.
+			prompts.push(transformPrompt(prompt));
 		},
 	} as never);
 	return { commands, prompts, notifications };
@@ -55,6 +59,19 @@ test("fullstack: direct /do-work and /team send prompts through OMP", async () =
 	assert.ok(prompts[1]?.includes("Fresh team task"));
 	assert.ok(prompts[1]?.includes("classification pass"));
 	assert.deepEqual(notifications.map(message => message.split(":")[0]), ["do-work", "team"]);
+});
+
+test("fullstack: external hook boundary can augment /do-work prompt", async () => {
+	let observed = "";
+	const { commands, prompts } = commandHarness(prompt => {
+		observed = prompt;
+		return `${prompt}\n[external-hook-marker]`;
+	});
+
+	await commands.get("do-work")?.handler("Hooked workflow task", context(process.cwd(), []));
+
+	assert.ok(observed.includes("Hooked workflow task"));
+	assert.ok(prompts[0]?.endsWith("[external-hook-marker]"));
 });
 
 test("fullstack: direct /cto handler emits fresh and standby prompts", async () => {
