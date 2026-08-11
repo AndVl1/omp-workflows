@@ -3,12 +3,17 @@ name: ci
 on:
   workflow_dispatch:
   pull_request:
+    branches:
+      - main
+  pull_request_target:
+    branches:
+      - main
   push:
     branches:
       - main
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -20,7 +25,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Checkout PR head (pull_request_target)
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+
       - name: Checkout
+        if: github.event_name != 'pull_request_target'
         uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -43,26 +57,63 @@ jobs:
         run: npm test
 
 
+  # Security: this job consumes OPENCODE_API_KEY and therefore must never run
+  # on ordinary pull_request events — on those, the workflow definition and
+  # scripts themselves are PR-controlled (same-repo PRs included), so the
+  # secret would be injected into attacker-controlled code. It runs only on
+  # pull_request_target (workflow from the trusted base branch, code checked
+  # out from the PR head) for same-repository PRs, gated by the `ai-e2e`
+  # environment (required reviewers = explicit approval), and on trusted
+  # push/workflow_dispatch to main. Fork PRs never run it (same-repo guard).
+  # The 'ai-e2e' environment must exist in repository settings with required reviewers configured (auto-created environments have no protection rules); the 'Verify ai-e2e environment protection' step enforces this at runtime.
+  # The preflight calls the environments API, so the job token needs 'actions: read' permission (see the job's permissions block).
+  # Protected reviewers must inspect PR package/build/runtime changes because the matrix executes PR-head code with OPENCODE_API_KEY after approval.
   ai-e2e:
     name: visual AI command E2E
     needs: verify
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name != 'pull_request' && (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment: ai-e2e
     permissions:
       contents: read
+      actions: read
     env:
-      OMP_API_PROVIDER: opencode
+      OMP_API_PROVIDER: opencode-go
       OMP_BASE_MODEL: deepseek-v4-flash
-      OMP_VISUAL_MODEL: minimax-m2.5
+      OMP_VISUAL_MODEL: minimax-m3
       OMP_BIN: ${{ github.workspace }}/node_modules/.bin/omp
       AGENT_BROWSER_BIN: agent-browser
       AI_E2E_ARTIFACT_DIR: ${{ runner.temp }}/omp-ai-command-e2e
     steps:
-      - name: Checkout
+      - name: Checkout PR head (pull_request_target)
+        if: github.event_name == 'pull_request_target'
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Checkout
+        if: github.event_name != 'pull_request_target'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify ai-e2e environment protection
+        if: github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          env_name="ai-e2e"
+          protection="$(gh api "repos/$GITHUB_REPOSITORY/environments/$env_name" --jq '.protection_rules // []')"
+          reviewer_count="$(printf '%s' "$protection" | jq '[.[] | select(.type == "required_reviewers") | .reviewers[]?] | length')"
+          if [ "$reviewer_count" -lt 1 ]; then
+            echo "::error::The '$env_name' environment must have a 'required_reviewers' protection rule with at least one reviewer configured (repository Settings -> Environments -> $env_name)."
+            exit 1
+          fi
+          echo "ai-e2e environment protection OK ($reviewer_count reviewer(s) configured)"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -131,7 +182,7 @@ jobs:
             '["]?(api[_-]?key|authorization|bearer|access[_-]?token|session[_-]?token|token)["]?[[:space:]]*[:=][[:space:]]*["]?(bearer[[:space:]]+)?[^<[:space:]",]{8,}' \
             '[?&](token|key|api[_-]?key)=[^<[:space:]]{8,}' \
             '/home/runner/work/|/Users/'; do
-            if find "$artifact_dir" -type f -print0 | xargs -0 -r grep -aFlEi -- "$pattern" | grep -q .; then
+            if find "$artifact_dir" -type f -print0 | xargs -0 -r grep -aEli -- "$pattern" | grep -q .; then
               echo "sensitive value pattern detected in AI E2E artifacts"
               exit 1
             fi

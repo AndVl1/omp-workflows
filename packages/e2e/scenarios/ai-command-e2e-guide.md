@@ -7,15 +7,28 @@ This guide is the execution contract for the CI AI command matrix. It is intenti
 1. Build the workspace with Node.js 24, Bun 1.3.14+, and the pinned OMP package.
 2. Install the pinned `agent-browser` CLI and its Chromium runtime; CI verifies both the npm tarball integrity and the Ubuntu native binary SHA-256 before use. Never resolve `latest` in CI.
 3. Start each command in a fresh scratch project through `packages/e2e` (`bootstrap` then `start --surface web`). Keep the session foreground-owned by the runner; do not use `pkill`, `killall`, or an unvalidated PID.
-4. The CI job exposes these public values:
+4. The CI job exposes these public values (resolved contract):
 
    ```text
-   OMP_API_PROVIDER=opencode
+   OMP_API_PROVIDER=opencode-go
    OMP_BASE_MODEL=deepseek-v4-flash
-   OMP_VISUAL_MODEL=minimax-m2.5
+   OMP_VISUAL_MODEL=minimax-m3
    ```
 
-   The current OMP catalog names the authenticated provider `opencode-go`. The runner maps the public values to a secret-free project overlay:
+   `OMP_API_PROVIDER` / `OMP_BASE_MODEL` / `OMP_VISUAL_MODEL` are
+   **runner-internal overrides** — the runner reads them from its own
+   environment and rejects values outside the verified contract. OMP itself
+   does not read these names; the model contract reaches the spawned omp
+   exclusively through the `--config` modelRoles overlay
+   (`node_modules/@oh-my-pi/pi-coding-agent/src/commands/launch.ts:82-85`,
+   `src/config/settings.ts:381-383,1254-1286`), which the e2e server emits
+   for `<scratch>/.omp/ux-e2e-overlay.user.json`
+   (`packages/e2e/src/server.ts:1147-1172`).
+
+   The provider id is `opencode-go` (not `opencode`), whose catalog descriptor
+   declares the `OPENCODE_API_KEY` env var
+   (`node_modules/@oh-my-pi/pi-catalog/src/provider-models/descriptors.ts:329-332`).
+   The runner maps the public values to a secret-free project overlay:
 
    ```json
    {
@@ -29,10 +42,24 @@ This guide is the execution contract for the CI AI command matrix. It is intenti
        "tiny": "opencode-go/deepseek-v4-flash:high",
        "task": "opencode-go/deepseek-v4-flash:high",
        "advisor": "opencode-go/deepseek-v4-flash:high",
-       "vision": "opencode-go/minimax-m2.5"
+       "vision": "opencode-go/minimax-m3"
      }
    }
    ```
+
+   Evidence notes (pi-catalog is the source of truth):
+   - `opencode-go/deepseek-v4-flash` is a valid openai-completions model,
+     input `["text"]`
+     (`node_modules/@oh-my-pi/pi-catalog/src/models.json:66502-66511`).
+   - `opencode-go/minimax-m2.5` **exists but is TEXT ONLY** (input
+     `["text"]`, anthropic-messages — `models.json:66960-66969`), so it
+     can never serve `modelRoles.vision`; the runner rejects it with this
+     evidence in the error. It is not silently accepted or substituted.
+   - `opencode-go/minimax-m3` is the vision-capable MiniMax model on
+     opencode-go (input `["text","image"]` —
+     `models.json:67021-67031`); other vision-capable ids: `kimi-k2.5`
+     (`models.json:66712-66722`), `mimo-v2.5`
+     (`models.json:66899-66909`).
 
    `OPENCODE_API_KEY` is inherited by the PTY only from the trusted CI secret. It must never be written into the overlay, prompt, report, screenshot metadata, or command line.
 
@@ -71,4 +98,6 @@ Always close the agent-browser session first, then close the bounded `TestSessio
 
 ## Evidence and security
 
-Keep only bounded, redacted screen snapshots, phase results, command ids, and sanitized diagnostics. Replace the API key, bearer/token values, session URL query, scratch paths, and repository absolute paths before staging. Scan every staged byte for the exact secret and key-shaped values; if the scan fails, do not upload artifacts. Fork pull requests do not receive this secret-bearing job. Never use `pull_request_target` for this test because it would execute untrusted code with credentials.
+Keep only bounded, redacted screen snapshots, phase results, command ids, and sanitized diagnostics. Replace the API key, bearer/token values, session URL query, scratch paths, and repository absolute paths before staging. Scan every staged byte for the exact secret and key-shaped values; if the scan fails, do not upload artifacts.
+
+The secret-bearing ai-e2e job intentionally runs on `pull_request_target`, but only under a guarded contract: same-repository PRs targeting `main`, a same-repo-only guard, the protected `ai-e2e` environment, and the trusted-base workflow — the job definition and env wiring come from the base branch's `ci.yml`, and the PR head is checked out only for the runner code. Ordinary `pull_request` events and fork PRs never receive the key: fork PRs skip the secret-bearing job entirely.

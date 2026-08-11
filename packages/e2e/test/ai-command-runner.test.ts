@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 
 import {
+  AI_PUBLIC_DEFAULTS,
   discoverCommandIds,
   defaultMonorepoRoot,
   defaultManifestPath,
@@ -15,6 +16,7 @@ import {
   runAiCommandMatrix,
   validateAiCommandManifest,
   containsSensitive,
+  writeModelOverlay,
   type BrowserClient,
 } from '../src/ai-command-runner.js';
 import type { TestSession, TestSessionOptions } from '../src/server.js';
@@ -57,18 +59,76 @@ test('AI registry completeness rejects a missing or extra command', () => {
   );
 });
 
-test('AI model mapping is qualified and never serializes the API key', () => {
+test('AI model defaults match the resolved pi-catalog contract', () => {
+  assert.deepEqual(AI_PUBLIC_DEFAULTS, {
+    provider: 'opencode-go',
+    baseModel: 'deepseek-v4-flash',
+    visualModel: 'minimax-m3',
+  });
+  const config = resolveAiModelConfig({});
+  assert.equal(config.publicProvider, 'opencode-go');
+  assert.equal(config.baseModel, 'deepseek-v4-flash');
+  assert.equal(config.visualModel, 'minimax-m3');
+});
+
+test('AI model mapping is qualified, renders selectors, and never serializes the API key', () => {
   const config = resolveAiModelConfig({
-    OMP_API_PROVIDER: 'opencode',
+    OMP_API_PROVIDER: 'opencode-go',
     OMP_BASE_MODEL: 'deepseek-v4-flash',
-    OMP_VISUAL_MODEL: 'minimax-m2.5',
+    OMP_VISUAL_MODEL: 'minimax-m3',
     OPENCODE_API_KEY: 'test-secret-key',
   });
+  // Base roles resolve to the `:high` selector; vision resolves to the
+  // bare vision-capable id (modelRoles selectors are provider/id[:thinking]).
   assert.equal(config.modelRoles.default, 'opencode-go/deepseek-v4-flash:high');
   assert.equal(config.modelRoles.task, 'opencode-go/deepseek-v4-flash:high');
-  assert.equal(config.modelRoles.vision, 'opencode-go/minimax-m2.5');
+  assert.equal(config.modelRoles.advisor, 'opencode-go/deepseek-v4-flash:high');
+  assert.equal(config.modelRoles.vision, 'opencode-go/minimax-m3');
+  assert.equal(Object.values(config.modelRoles).filter(role => role === 'opencode-go/deepseek-v4-flash:high').length, 9);
   assert.equal(JSON.stringify(config.modelRoles).includes('test-secret-key'), false);
   assert.match(renderCommandPrompt('Run /{command}: {instruction}', { ...config, id: 'demo', pickerPrefix: 'demo', commandArgs: 'x', instruction: 'check', startPatterns: ['start'], errorPatterns: ['error'] }), /Run \/demo: check/);
+});
+
+test('AI model mapping rejects provider "opencode" and names "opencode-go"', () => {
+  assert.throws(
+    () => resolveAiModelConfig({ OMP_API_PROVIDER: 'opencode' }),
+    /unsupported OMP_API_PROVIDER "opencode".*expected provider id is "opencode-go"/u,
+  );
+});
+
+test('AI model mapping rejects text-only minimax-m2.5 for vision with the catalog evidence', () => {
+  assert.throws(
+    () => resolveAiModelConfig({ OMP_VISUAL_MODEL: 'minimax-m2.5' }),
+    /minimax-m2\.5.*cannot serve modelRoles\.vision.*\["text"\] only.*models\.json:66960-66969/u,
+  );
+});
+
+test('AI model mapping rejects an unknown visual model (never silently substitutes)', () => {
+  assert.throws(
+    () => resolveAiModelConfig({ OMP_VISUAL_MODEL: 'some-unknown-vision-model' }),
+    /unsupported OMP_VISUAL_MODEL "some-unknown-vision-model".*vision-capable opencode-go model/u,
+  );
+});
+
+test('AI model mapping accepts every catalog vision-capable opencode-go id', () => {
+  for (const visualModel of ['minimax-m3', 'kimi-k2.5', 'mimo-v2.5']) {
+    const config = resolveAiModelConfig({ OMP_VISUAL_MODEL: visualModel });
+    assert.equal(config.modelRoles.vision, `opencode-go/${visualModel}`);
+  }
+});
+
+test('AI model overlay is secret-free modelRoles JSON with mode 0600', () => {
+  const dir = temporaryDirectory('ai-overlay-');
+  const config = resolveAiModelConfig({ OPENCODE_API_KEY: 'test-secret-key' });
+  const overlayPath = join(dir, 'ux-e2e-overlay.user.json');
+  writeModelOverlay(overlayPath, config);
+  const raw = readFileSync(overlayPath, 'utf8');
+  const overlay = JSON.parse(raw) as { modelRoles?: Record<string, string> };
+  assert.equal(overlay.modelRoles?.default, 'opencode-go/deepseek-v4-flash:high');
+  assert.equal(overlay.modelRoles?.vision, 'opencode-go/minimax-m3');
+  assert.equal(raw.includes('test-secret-key'), false);
+  assert.equal(raw.includes('apiKey'), false);
+  assert.equal((0o600 & (0o777 & statSync(overlayPath).mode)), 0o600);
 });
 
 test('AI evidence redaction removes secrets, tokens, and absolute paths', () => {
@@ -170,9 +230,9 @@ test('AI runner drives picker, Tab, CR/Enter, and cleanup for every command with
     outputDir,
     runId: 'test-run',
     env: {
-      OMP_API_PROVIDER: 'opencode',
+      OMP_API_PROVIDER: 'opencode-go',
       OMP_BASE_MODEL: 'deepseek-v4-flash',
-      OMP_VISUAL_MODEL: 'minimax-m2.5',
+      OMP_VISUAL_MODEL: 'minimax-m3',
       OPENCODE_API_KEY: 'test-secret-key',
     },
     typingDelayMs: 0,

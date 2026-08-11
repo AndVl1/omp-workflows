@@ -258,7 +258,7 @@ test('server: checkHostOmpConfig warns on missing or empty modelRoles', () => {
   rmSync(dir, { recursive: true });
 
 });
-test('server: safe PTY env excludes unrelated host credentials', () => {
+test('server: safe PTY env excludes unrelated host credentials and secrets', () => {
   const env = safePtyEnv({
     PATH: '/bin',
     HOME: '/home/test',
@@ -269,7 +269,6 @@ test('server: safe PTY env excludes unrelated host credentials', () => {
   assert.deepEqual(env, {
     PATH: '/bin',
     HOME: '/home/test',
-    OPENCODE_API_KEY: 'opencode-secret',
   });
 });
 

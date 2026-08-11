@@ -27,10 +27,22 @@ import { deferred } from './util.js';
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Resolved model contract for the AI E2E matrix (verified against the bundled
+ * pi-catalog, node_modules/@oh-my-pi/pi-catalog):
+ * - Provider id is `opencode-go`, whose descriptor declares the env var
+ *   `OPENCODE_API_KEY` (src/provider-models/descriptors.ts:329-332).
+ * - `opencode-go/deepseek-v4-flash` is a valid openai-completions model
+ *   (src/models.json:66502-66511) and serves every non-vision role.
+ * - `opencode-go/minimax-m3` is the vision-capable MiniMax model
+ *   (input ["text","image"], src/models.json:67021-67031).
+ * NOTE: `opencode-go/minimax-m2.5` EXISTS but its catalog input is ["text"]
+ * only (src/models.json:66960-66969) — it can never serve modelRoles.vision.
+ */
 export const AI_PUBLIC_DEFAULTS = {
-  provider: 'opencode',
+  provider: 'opencode-go',
   baseModel: 'deepseek-v4-flash',
-  visualModel: 'minimax-m2.5',
+  visualModel: 'minimax-m3',
 } as const;
 
 const BASE_ROLES = ['default', 'smol', 'slow', 'plan', 'designer', 'commit', 'tiny', 'task', 'advisor'] as const;
@@ -269,15 +281,50 @@ export function validateAiCommandManifest(manifest: AiCommandManifest, discovere
   }
 }
 
+/**
+ * VERIFIED FAIL-CLOSED ALLOWLIST of vision-capable opencode-go models,
+ * derived from the bundled pi-catalog (entries whose `input` advertises
+ * `["text","image"]`):
+ *   minimax-m3  src/models.json:67021-67031
+ *   kimi-k2.5   src/models.json:66712-66722
+ *   mimo-v2.5   src/models.json:66899-66909
+ * This table is a deliberate freeze of the ids verified at the pinned
+ * catalog version, not a live mirror of it — the catalog may grow. A
+ * configured visual model MUST be in this table: anything else (including
+ * text-only ids such as minimax-m2.5) is rejected, never silently accepted
+ * or substituted.
+ */
+const VISION_CAPABLE_MODELS: Record<string, true> = {
+  'minimax-m3': true,
+  'kimi-k2.5': true,
+  'mimo-v2.5': true,
+};
+
 export function resolveAiModelConfig(env: Readonly<Record<string, string | undefined>> = process.env): AiModelConfig {
+  // OMP_API_PROVIDER / OMP_BASE_MODEL / OMP_VISUAL_MODEL are RUNNER-INTERNAL
+  // overrides read from the runner's own environment (CI sets them). OMP
+  // itself does not read these names — the spawned omp process is configured
+  // exclusively through the `--config` modelRoles overlay (see the spawn site
+  // and server.ts); these env names are never forwarded to the PTY.
   const publicProvider = env.OMP_API_PROVIDER?.trim() || AI_PUBLIC_DEFAULTS.provider;
   const baseModel = env.OMP_BASE_MODEL?.trim() || AI_PUBLIC_DEFAULTS.baseModel;
   const visualModel = env.OMP_VISUAL_MODEL?.trim() || AI_PUBLIC_DEFAULTS.visualModel;
   if (publicProvider !== AI_PUBLIC_DEFAULTS.provider) {
-    throw new Error(`AI E2E: unsupported OMP_API_PROVIDER "${publicProvider}"; expected "${AI_PUBLIC_DEFAULTS.provider}"`);
+    throw new Error(
+      `AI E2E: unsupported OMP_API_PROVIDER "${publicProvider}"; the expected provider id is "${AI_PUBLIC_DEFAULTS.provider}" (bare "opencode" is not a valid OMP_API_PROVIDER value)`,
+    );
   }
   if (baseModel !== AI_PUBLIC_DEFAULTS.baseModel) throw new Error(`AI E2E: unsupported OMP_BASE_MODEL "${baseModel}"`);
-  if (visualModel !== AI_PUBLIC_DEFAULTS.visualModel) throw new Error(`AI E2E: unsupported OMP_VISUAL_MODEL "${visualModel}"`);
+  if (VISION_CAPABLE_MODELS[visualModel] !== true) {
+    if (visualModel === 'minimax-m2.5') {
+      throw new Error(
+        'AI E2E: OMP_VISUAL_MODEL "minimax-m2.5" cannot serve modelRoles.vision: pi-catalog marks opencode-go/minimax-m2.5 input as ["text"] only (node_modules/@oh-my-pi/pi-catalog/src/models.json:66960-66969). Pick a vision-capable opencode-go model: minimax-m3, kimi-k2.5, mimo-v2.5.',
+      );
+    }
+    throw new Error(
+      `AI E2E: unsupported OMP_VISUAL_MODEL "${visualModel}"; expected a vision-capable opencode-go model (minimax-m3, kimi-k2.5, mimo-v2.5 per pi-catalog models.json)`,
+    );
+  }
   const baseSelector = `opencode-go/${baseModel}:high`;
   const visualSelector = `opencode-go/${visualModel}`;
   const modelRoles: Record<string, string> = {};
@@ -612,20 +659,35 @@ async function runCase(
       join(runtimeRoot, 'run'),
     ];
     for (const directory of isolatedDirs) mkdirSync(directory, { recursive: true, mode: 0o700 });
+    // The spawned omp receives ONLY real environment (HOME/TMPDIR/XDG_*, PATH,
+    // CI) plus the provider API key. OMP_API_PROVIDER / OMP_BASE_MODEL /
+    // OMP_VISUAL_MODEL are runner-internal overrides read by
+    // resolveAiModelConfig from the RUNNER's env (CI sets them); OMP does not
+    // read those names (pi-coding-agent reads settings from config.yml +
+    // `--config` overlays, src/config/settings.ts:1244-1262), so they must
+    // never be passed to the PTY. The model contract reaches omp exclusively
+    // through the modelRoles overlay written below.
     const sessionEnv: Record<string, string> = {
       HOME: join(scratchDir, '.home'),
       TMPDIR: join(runtimeRoot, 'tmp'),
       XDG_CONFIG_HOME: join(runtimeRoot, 'config'),
       XDG_CACHE_HOME: join(runtimeRoot, 'cache'),
       XDG_RUNTIME_DIR: join(runtimeRoot, 'run'),
-      OMP_API_PROVIDER: options.model.publicProvider,
-      OMP_BASE_MODEL: options.model.baseModel,
-      OMP_VISUAL_MODEL: options.model.visualModel,
       CI: 'true',
     };
     const pathValue = options.env.PATH ?? process.env.PATH;
     if (pathValue !== undefined) sessionEnv.PATH = pathValue;
     if (options.model.apiKey) sessionEnv.OPENCODE_API_KEY = options.model.apiKey;
+    // Overlay wiring (real OMP contract): pi-coding-agent has NO `.user.json`
+    // auto-discovery — overlays load only via the repeatable `--config` flag
+    // (src/commands/launch.ts:82-85) or the PI_CONFIG_FILES env var
+    // (src/config/settings.ts:381-383), merged by #loadConfigOverlays /
+    // #loadOverlayYaml (src/config/settings.ts:1254-1286; YAML.parse at
+    // settings.ts:1283 also accepts JSON). startTestSession emits the
+    // overlayPath written above as the LAST `--config` in argv when the
+    // file exists (packages/e2e/src/server.ts:1147-1172) — hostConfigPath
+    // is null for this session, so the overlay is the final one and wins
+    // on conflict — so omp boots with our modelRoles.
     session = await deps.start({
       cwd: scratchDir,
       surface: 'web',
@@ -780,7 +842,10 @@ function requiredOptions(options: AiCommandRunnerOptions, model: AiModelConfig, 
     typingDelayMs: options.typingDelayMs ?? 80,
     startGraceMs: options.startGraceMs ?? 1_000,
     runId: options.runId ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-    outputDir: options.outputDir ?? env.AI_E2E_ARTIFACT_DIR ?? join(options.monorepoRoot ?? defaultMonorepoRoot(), 'vibe-report', 'evidence', 'ai-command-e2e'),
+    // Local runs without an explicit artifact dir or CI's AI_E2E_ARTIFACT_DIR
+    // write evidence to an OS temp dir (never the checkout), so secret-bearing
+    // report artifacts cannot be staged accidentally.
+    outputDir: options.outputDir ?? env.AI_E2E_ARTIFACT_DIR ?? join(tmpdir(), 'omp-ai-command-e2e'),
     model,
     guidePath,
     env,

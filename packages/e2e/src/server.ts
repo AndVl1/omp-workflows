@@ -50,7 +50,15 @@ export const PROXY_ENV_KEYS = [
   'all_proxy',
   'no_proxy',
 ] as const;
-/** Environment values safe to carry into an OMP test PTY by default. */
+/**
+ * Environment values safe to carry into an OMP test PTY by default.
+ *
+ * OPENCODE_API_KEY and OMP_API_PROVIDER / OMP_BASE_MODEL / OMP_VISUAL_MODEL
+ * are intentionally NOT listed: the AI command runner injects the API key
+ * explicitly into its own session env (ai-command-runner.ts spawn site), so
+ * generic e2e sessions must never inherit it (or the runner-internal override
+ * names) from the parent env.
+ */
 export const SAFE_PTY_ENV_KEYS = [
   'PATH',
   'HOME',
@@ -61,10 +69,6 @@ export const SAFE_PTY_ENV_KEYS = [
   'NO_COLOR',
   'FORCE_COLOR',
   'CI',
-  'OMP_API_PROVIDER',
-  'OMP_BASE_MODEL',
-  'OMP_VISUAL_MODEL',
-  'OPENCODE_API_KEY',
 ] as const;
 
 export function safePtyEnv(source: Readonly<Record<string, string | undefined>> = process.env): Record<string, string> {
