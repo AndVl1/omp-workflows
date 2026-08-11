@@ -36,7 +36,7 @@ test("core: loadAllProfiles returns reusable core profiles", async () => {
   assert.ok(profiles.find((p) => p.name === "spec-preparation")?.stages.every((stage) => stage.prompt), "spec stages carry prompts");
 
   // The CTO profile is explicit-only: no classification may select it.
-  for (const type of ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "INVESTIGATION", "REVIEW", "HOTFIX"] as const) {
+  for (const type of ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX"] as const) {
     for (const complexity of ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] as const) {
       const selected = selectProfile(profiles, { type, complexity, confidence: "HIGH", workflow: "standard", autonomous: false });
       assert.notEqual(selected?.name, "cto", `${type}/${complexity} must not select cto`);
@@ -53,6 +53,12 @@ test("core: resolveWorkflow matrix", () => {
   assert.equal(resolveWorkflow("HOTFIX", "QUICK", false), "emergency");
   assert.equal(resolveWorkflow("INVESTIGATION", "QUICK", false), "research");
   assert.equal(resolveWorkflow("REVIEW", "QUICK", false), "review");
+});
+test("core: SPEC and REGRESS resolve to dedicated workflows", () => {
+  assert.equal(resolveWorkflow("SPEC", "QUICK", false), "spec-preparation");
+  assert.equal(resolveWorkflow("SPEC", "CRITICAL", true), "spec-preparation");
+  assert.equal(resolveWorkflow("REGRESS", "MEDIUM", false), "feature-regression");
+  assert.equal(resolveWorkflow("REGRESS", "CRITICAL", true), "feature-regression");
 });
 
 test("core: selectProfile resolves to the right profile", async () => {

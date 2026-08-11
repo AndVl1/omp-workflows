@@ -5,7 +5,7 @@
  * guarantees; the JSON files on disk are loaded and validated against these shapes.
  */
 
-export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "INVESTIGATION" | "REVIEW" | "HOTFIX";
+export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "SPEC" | "REGRESS" | "INVESTIGATION" | "REVIEW" | "HOTFIX";
 export type Complexity = "QUICK" | "MEDIUM" | "COMPLEX" | "CRITICAL";
 export type Confidence = "HIGH" | "MEDIUM" | "LOW";
 export type WorkflowName =
@@ -17,6 +17,8 @@ export type WorkflowName =
   | "emergency"
   | "research"
   | "review"
+  | "spec-preparation"
+  | "feature-regression"
   | "cto"
   | (string & {});
 

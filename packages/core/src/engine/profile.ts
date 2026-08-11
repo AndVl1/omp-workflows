@@ -18,6 +18,8 @@ const SELECTION_ORDER: WorkflowName[] = [
   "standard",
   "lightweight",
   "research",
+  "spec-preparation",
+  "feature-regression",
   "review",
   "emergency",
 ];
@@ -106,6 +108,10 @@ export function resolveWorkflow(
       if (autonomous) return "debug-cycle";
       if (complexity === "QUICK") return "bug-fix";
       return "debug-cycle"; // MEDIUM | COMPLEX | CRITICAL
+    case "SPEC":
+      return "spec-preparation";
+    case "REGRESS":
+      return "feature-regression";
     case "INVESTIGATION":
       return "research";
     case "REVIEW":

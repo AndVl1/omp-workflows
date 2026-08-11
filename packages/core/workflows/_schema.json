@@ -21,7 +21,7 @@
       "properties": {
         "type": {
           "type": "array",
-          "items": { "enum": ["FEATURE", "BUG_FIX", "INVESTIGATION", "REVIEW", "HOTFIX", "REFACTOR", "OPS"] }
+          "items": { "enum": ["FEATURE", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "REFACTOR", "OPS"] }
         },
         "complexity": {
           "type": "array",

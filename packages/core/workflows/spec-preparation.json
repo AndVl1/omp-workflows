@@ -2,8 +2,8 @@
   "$schema": "./_schema.json",
   "name": "spec-preparation",
   "title": "Implementation-ready specification preparation",
-  "description": "Reusable profile for turning an underspecified feature, refactor, investigation, or bug-fix request into a traceable implementation-ready specification. It produces specification artifacts only and does not modify application code.",
-  "match": { "type": ["FEATURE", "REFACTOR", "INVESTIGATION", "BUG_FIX"], "complexity": ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] },
+  "description": "Platform-neutral workflow for SPEC requests. Produces a traceable implementation-ready specification and does not modify application code.",
+  "match": { "type": ["SPEC"], "complexity": ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] },
   "stages": [
     { "id": "intake_repo_map", "title": "Intake and repository map", "type": "consilium", "roles": ["analyst", "tech-researcher"], "parallel": true, "prompt": "Normalize the request, inspect repository structure and conventions, identify affected modules/symbols/configuration, and gather authoritative local or external evidence. Separate verified facts, assumptions, and open questions; do not edit code or specification files.", "produces": "spec_intake_repo_map" },
     { "id": "requirements_edge_cases", "title": "Requirements and edge cases", "type": "single", "role": "analyst", "prompt": "Convert the intake into testable functional requirements, non-goals, acceptance criteria, invariants, error behavior, lifecycle/state transitions, security/privacy constraints, compatibility constraints, and edge cases. Trace every requirement to evidence or mark it as a decision needed.", "consumes": ["spec_intake_repo_map"], "produces": "spec_requirements_edge_cases" },

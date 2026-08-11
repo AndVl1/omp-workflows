@@ -2,8 +2,8 @@
   "$schema": "./_schema.json",
   "name": "feature-regression",
   "title": "Feature regression and evidence handoff",
-  "description": "Reusable regression workflow for feature, bug-fix, and investigation requests. Produces bounded scenarios, raw evidence, deterministic oracle verdicts, replay data, and a triage report; it never treats missing capability as PASS.",
-  "match": { "type": ["FEATURE", "BUG_FIX", "INVESTIGATION"], "complexity": ["MEDIUM", "COMPLEX", "CRITICAL"] },
+  "description": "Platform-neutral regression workflow for REGRESS requests. Produces bounded scenarios, raw evidence, deterministic oracle verdicts, replay data, and a triage report; it never treats missing capability as PASS.",
+  "match": { "type": ["REGRESS"], "complexity": ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] },
   "stages": [
     { "id": "discovery_intake", "title": "Discovery and intake", "type": "orchestrator", "prompt": "Normalize the request into changed surfaces, expected behavior, non-goals, available test capabilities, evidence policy, and acceptance criteria. Do not invent repository facts; mark assumptions and capability gaps.", "produces": "regression_intake" },
     { "id": "surface_mapping", "title": "Map affected surfaces", "type": "single", "role": "regression-planner", "prompt": "Inspect the repository and relevant runtime/test adapters. Map changed files, symbols, routes, resources, permissions, shared components, and entry points to stable surface references. Include source evidence, confidence, and inferred mappings.", "consumes": ["regression_intake"], "produces": "regression_surface_map" },
