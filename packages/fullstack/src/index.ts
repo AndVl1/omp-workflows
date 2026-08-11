@@ -28,6 +28,7 @@ import {
 	findActiveCtoRun,
 	registerTeamWorkflow,
 } from "@andvl1/omp-workflows-core";
+import { registerWorkflowCommands } from "./workflow-commands.js";
 import { ensureCommandsForSession } from "./copy-commands.js";
 import { createChannelSet, queueCtoDelivery, startChannelDispatcher, type InboxTask } from "./adapters/registry.js";
 import { createAskRedirectGate } from "./messenger-channel.js";
@@ -156,6 +157,12 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     scopeMap: defaultFullstackScopeMap,
     flags: defaultFullstackFlags,
   });
+  // Register the three workflow entry points while the extension is loaded.
+  // OMP snapshots registered commands before it discovers project-local
+  // `.omp/commands` files, so this keeps slash suggestions and execution
+  // authoritative even when a copied file is stale or cannot resolve the
+  // plugin's peer dependency from the consumer cwd.
+  registerWorkflowCommands(pi);
 
   // Marker detector for `/omp-model-roles recommendations` — fires before
   // each agent loop and injects a developer-attributed instruction when
@@ -191,13 +198,10 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
       return Promise.resolve();
     },
   });
-  // `.omp/commands/` directory on every session start. OMP's discovery
-  // (see `discoverCustomCommands` in @oh-my-pi/pi-coding-agent) only
-  // reads from project-local `.omp/commands/<name>/index.ts` — it does
-  // NOT scan `node_modules` of omp-managed plugins. `omp plugin install`
-  // puts the package in `~/.omp/plugins/`, which never triggers npm's
-  // `postinstall` hook, so without this listener the user would have to
-  // run `npx omp-workflows-copy-commands` manually.
+  // Keep the project-local command tree synchronized for runtimes that still
+  // discover custom-TS commands from disk. The authoritative commands were
+  // registered above, before OMP snapshots slash suggestions; this copy is a
+  // compatibility fallback and a cache for older runtimes.
   //
   // Best-effort, never throws: any IO error is captured by
   // `ensureCommandsForSession` and dropped.
