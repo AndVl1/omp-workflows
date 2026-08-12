@@ -52,12 +52,12 @@ test("fullstack: stale plugin-owned commands are pruned, user-owned preserved", 
 		}
 		assert.equal(existsSync(join(target, "my-custom-helper")), true, "user-owned command must survive");
 		assert.equal(existsSync(join(target, "_lib")), true, "shared _lib helper must survive");
-		assert.equal(existsSync(join(target, "do-work")), true, "current shipped command must be present");
+		assert.equal(existsSync(join(target, "init-team")), true, "current copied custom command must be present");
 
-		// The manifest records the current shipped set for future pruning.
+		// The manifest records only project-local compatibility commands.
 		const manifest = JSON.parse(readFileSync(join(target, SHIPPED_MANIFEST_FILE), "utf8")) as { shipped: string[] };
-		assert.ok(manifest.shipped.includes("do-work"), "manifest tracks shipped commands");
-		assert.ok(!manifest.shipped.includes("team-next"), "manifest never tracks pruned commands");
+		assert.ok(manifest.shipped.includes("init-team"), "manifest tracks copied compatibility commands");
+		assert.ok(!manifest.shipped.includes("do-work"), "extension-owned commands are never manifest-tracked");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -71,7 +71,7 @@ test("fullstack: manifest-tracked removed commands are pruned on upgrade", () =>
 		ensureCommandsForSession(dir);
 		const manifestPath = join(target, SHIPPED_MANIFEST_FILE);
 		const before = JSON.parse(readFileSync(manifestPath, "utf8")) as { shipped: string[] };
-		assert.ok(before.shipped.includes("cto"));
+		assert.ok(before.shipped.includes("init-team"));
 
 		// Simulate an upgrade: "ghost" was shipped by the previous version
 		// (so it is manifest-tracked) but is gone from the shipped set now.
@@ -81,7 +81,7 @@ test("fullstack: manifest-tracked removed commands are pruned on upgrade", () =>
 
 		ensureCommandsForSession(dir);
 		assert.equal(existsSync(join(target, "ghost")), false, "manifest-tracked removed command must be pruned");
-		assert.equal(existsSync(join(target, "cto")), true, "current shipped command untouched");
+		assert.equal(existsSync(join(target, "init-team")), true, "current copied command untouched");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -95,7 +95,7 @@ test("fullstack: copyCommandsForInstall also prunes stale dirs", () => {
 		writeCommand(target, "user-keep", "// mine\n" + COMMAND_BODY);
 
 		const result = copyCommandsForInstall(dir);
-		assert.ok(result.copied.includes("do-work"), "install copies the shipped set");
+		assert.ok(result.copied.includes("init-team"), "install copies the compatibility command set");
 		assert.equal(existsSync(join(target, "team-yolo")), false, "install prunes legacy stale dirs");
 		assert.equal(existsSync(join(target, "user-keep")), true, "install preserves user-owned dirs");
 	} finally {
@@ -123,9 +123,10 @@ test("fullstack: pruneStaleCommands is a pure converge helper", () => {
 	}
 });
 
-test("fullstack: resolveShippedCommandsDir ships no stale command dirs", () => {
+test("fullstack: obsolete workflow adapters are absent from the package tree", () => {
 	const shipped = resolveShippedCommandsDir();
-	for (const name of LEGACY_REMOVED_COMMANDS) {
-		assert.equal(existsSync(join(shipped, name)), false, `${name} must not be part of the shipped set`);
+	for (const name of ["do-work", "team", "cto"]) {
+		assert.equal(existsSync(join(shipped, name)), false, `${name} must not ship as a project-local adapter`);
+		assert.ok(LEGACY_REMOVED_COMMANDS.includes(name as never), `${name} must remain in upgrade cleanup`);
 	}
 });

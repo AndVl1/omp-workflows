@@ -26,12 +26,9 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const shippedDir = resolve(__dirname, "..", "commands");
 
-/**
- * Command directories shipped by OLDER plugin versions before the manifest
- * existed. They are plugin-owned artifacts and are pruned on sync; user-owned
- * command directories (never shipped, never in this list) are preserved.
- */
-const LEGACY_REMOVED_COMMANDS = ["team-next", "team-yolo", "pulse", "coordinator-stats"];
+/** Plugin-owned commands removed from the project-local discovery path. */
+const LEGACY_REMOVED_COMMANDS = ["do-work", "team", "cto", "team-next", "team-yolo", "pulse", "coordinator-stats"];
+const REMOVED_COMMAND_NAMES = Object.fromEntries(LEGACY_REMOVED_COMMANDS.map(name => [name, true]));
 const SHIPPED_MANIFEST_FILE = ".omp-shipped.json";
 
 const targetArg = process.argv[2];
@@ -152,8 +149,8 @@ if (!isDirectory(shippedDir)) {
 console.log(`copy-commands: ${shippedDir} -> ${targetDir}`);
 const shippedNames = [];
 for (const entry of readdirSync(shippedDir, { withFileTypes: true })) {
-	if (entry.isDirectory() && !entry.name.startsWith(".")) shippedNames.push(entry.name);
+	if (entry.isDirectory() && !entry.name.startsWith(".") && !REMOVED_COMMAND_NAMES[entry.name]) shippedNames.push(entry.name);
 }
-copyTree(shippedDir, targetDir);
+for (const name of shippedNames) copyTree(resolve(shippedDir, name), resolve(targetDir, name));
 pruneStaleCommands(targetDir, shippedNames, collectShippedHashes(shippedDir, shippedNames));
 console.log("copy-commands: done");

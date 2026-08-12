@@ -40,12 +40,23 @@ const SHIPPED_COMMANDS_DIR = "commands";
 export const SHIPPED_MANIFEST_FILE = ".omp-shipped.json";
 
 /**
- * Narrowly scoped migration list: command directories shipped by older
- * plugin versions BEFORE the manifest existed (copied without tracking).
- * They are plugin-owned artifacts, removed on sync, while user-created
- * command directories (never shipped, never in this list) are preserved.
+ * Plugin-owned command directories that must not survive current-version sync.
+ * Workflow entry points are registered synchronously by the extension; keeping
+ * disk adapters makes OMP load duplicate commands and resolve package imports
+ * relative to arbitrary consumer worktrees.
  */
-export const LEGACY_REMOVED_COMMANDS = ["team-next", "team-yolo", "pulse", "coordinator-stats"] as const;
+export const LEGACY_REMOVED_COMMANDS = [
+	"do-work",
+	"team",
+	"cto",
+	"team-next",
+	"team-yolo",
+	"pulse",
+	"coordinator-stats",
+] as const;
+const REMOVED_COMMAND_NAMES: Record<string, true> = Object.fromEntries(
+	LEGACY_REMOVED_COMMANDS.map(name => [name, true] as const),
+);
 
 export interface CopyCommandsOptions {
 	/** Override the target directory; defaults to `<cwd>/.omp/commands`. */
@@ -296,10 +307,10 @@ export function copyCommandsForInstall(
 
 	const entries: Dirent[] = readdirSync(shippedRoot, { withFileTypes: true });
 	if (!existsSync(targetRoot)) mkdirSync(targetRoot, { recursive: true });
-
 	const shippedNames: string[] = [];
+
 	for (const entry of entries) {
-		if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+		if (!entry.isDirectory() || entry.name.startsWith(".") || REMOVED_COMMAND_NAMES[entry.name]) continue;
 		try {
 			shippedNames.push(entry.name);
 			const outcome = copyCommandDir(shippedRoot, entry.name, targetRoot);
@@ -360,7 +371,7 @@ export function ensureCommandsForSession(
 	const entries: Dirent[] = readdirSync(shippedRoot, { withFileTypes: true });
 	const shippedNames: string[] = [];
 	for (const entry of entries) {
-		if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+		if (!entry.isDirectory() || entry.name.startsWith(".") || REMOVED_COMMAND_NAMES[entry.name]) continue;
 		try {
 			shippedNames.push(entry.name);
 			const sync = syncCommandDirForSession(shippedRoot, entry.name, targetRoot, previousHashes);

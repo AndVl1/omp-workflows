@@ -308,6 +308,10 @@ export {
   type CtoPromptOptions,
 } from "./commands/cto.js";
 export {
+	registerWorkflowCommands,
+	type WorkflowCommandOptions,
+} from "./commands/register.js";
+export {
   parseWorkEnvelope,
   buildDoWorkPrompt,
   type ParsedWorkEnvelope,

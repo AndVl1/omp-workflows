@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [Unreleased]
+### Fixed
+- **Extension-owned workflow command discovery** — core now exposes a synchronous `/do-work`, `/team`, and `/cto` registrar for consumer bundles. Commands register during extension load, before OMP snapshots slash suggestions, so fresh sessions no longer depend on project-local `.omp/commands` imports or consumer `node_modules` resolution.
+
 ## [0.20.4] — 2026-08-11
 ### Added
 - **Reusable platform-neutral SPEC and REGRESS workflows** — adds implementation-ready specification preparation and evidence-driven feature regression profiles with typed classification routing, role-based stages, deterministic gates, and artifact validation.

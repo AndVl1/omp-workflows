@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
   registerTeamWorkflow,
+  registerWorkflowCommands,
   defaultFullstackRoles,
   loadAllProfiles,
   registerWorkflowProfiles,
@@ -24,6 +25,51 @@ import {
 } from "@andvl1/omp-workflows-core";
 import { classificationToolGate } from "../src/gates/classification.js";
 import { runStage } from "../src/engine/stage.js";
+
+test("core: workflow commands register before project command discovery", async () => {
+  const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+  const prompts: string[] = [];
+  registerWorkflowCommands({
+    registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+      commands.set(name, command);
+    },
+    sendUserMessage(prompt: string) {
+      prompts.push(prompt);
+    },
+  } as never);
+
+  assert.deepEqual([...commands.keys()], ["do-work", "team", "cto"]);
+  await commands.get("do-work")?.handler("Core-owned task", {
+    cwd: process.cwd(),
+    ui: { notify() {} },
+    sessionManager: { getSessionId: () => "core-command-test" },
+  });
+  assert.match(prompts[0] ?? "", /Core-owned task/);
+});
+
+test("core: workflow registration accepts a bundle prompt decorator", async () => {
+  const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+  const prompts: string[] = [];
+  registerWorkflowCommands({
+    registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+      commands.set(name, command);
+    },
+    sendUserMessage(prompt: string) {
+      prompts.push(prompt);
+    },
+  } as never, {
+    buildDoWorkPrompt(envelope, cwd) {
+      return `${envelope.task}\n${cwd}\n[bundle-profile]`;
+    },
+  });
+
+  await commands.get("team")?.handler("Decorated task", {
+    cwd: process.cwd(),
+    ui: { notify() {} },
+    sessionManager: { getSessionId: () => "core-command-decorator-test" },
+  });
+  assert.match(prompts[0] ?? "", /Decorated task.*\[bundle-profile\]/s);
+});
 
 test("core: loadAllProfiles returns reusable core profiles", async () => {
   const profiles = await loadAllProfiles();
