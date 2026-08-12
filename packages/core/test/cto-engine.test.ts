@@ -7,6 +7,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -558,8 +559,38 @@ test("cto-core: writeCtoState round-trips schema 2 with stable defaults", () => 
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("cto-core: readCtoState never observes partial state during concurrent writes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-atomic-"));
+  const initial = newCtoState({ id: "atomic-run", task: "t", branch: "b", autonomous: false,
+    plan: { id: "atomic-run", task: "t", teams: [], created_at: "" } });
+  initial.plan.task = "x".repeat(256 * 1024);
+  writeCtoState(initial, root);
+  const writer = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+    import { writeCtoState, newCtoState } from './src/cto/state.ts';
+    const root = process.env.CTO_ROOT;
+    if (!root) throw new Error('missing CTO_ROOT');
+    const state = newCtoState({ id: 'atomic-run', task: 't', branch: 'b', autonomous: false,
+      plan: { id: 'atomic-run', task: 't', teams: [], created_at: '' } });
+    state.plan.task = 'x'.repeat(256 * 1024);
+    for (let i = 0; i < 200; i++) writeCtoState(state, root);
+  `], { cwd: process.cwd(), env: { ...process.env, CTO_ROOT: root }, stdio: ["ignore", "ignore", "pipe"] });
+  let writerError = "";
+  writer.stderr?.on("data", (chunk: Buffer) => { writerError += String(chunk); });
+  try {
+    for (let i = 0; i < 20_000; i++) {
+      const observed = readCtoState("atomic-run", root);
+      assert.ok(observed, `readCtoState returned null at iteration ${i}`);
+      assert.equal(observed?.plan.task.length, 256 * 1024);
+      if (writer.exitCode !== null) break;
+    }
+    const status = await new Promise<number>((resolve) => writer.once("exit", (code) => resolve(code ?? 1)));
+    assert.equal(status, 0, writerError);
+  } finally {
+    writer.kill();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
-// ── cto-core team leases (br-zps.3) ─────────────────────────────────────────
 
 function leaseFixture(id = "lease-run"): CtoState {
   return newCtoState({ id, task: "t", branch: "b", autonomous: false, plan: { id, task: "t", teams: [], created_at: "" } });

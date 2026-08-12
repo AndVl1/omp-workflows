@@ -6,7 +6,8 @@
  * (R7). The engine is the only writer; agents read through it.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { recordStageTransition } from "../observability/hooks.js";
 import type { ModelClassification } from "../engine/run.js";
@@ -158,9 +159,22 @@ export function readCtoState(runId: string, root: string): CtoState | null {
 
 export function writeCtoState(state: CtoState, root: string): string {
   const path = ctoStatePath(state.id, root);
-  mkdirSync(ctoStateDir(state.id, root), { recursive: true });
+  const dir = ctoStateDir(state.id, root);
+  mkdirSync(dir, { recursive: true });
   state.updated_at = new Date().toISOString();
-  writeFileSync(path, JSON.stringify(state, null, 2));
+  const serialized = JSON.stringify(state, null, 2);
+  const tempPath = join(dir, `.state.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(tempPath, serialized);
+    renameSync(tempPath, path);
+  } catch (error) {
+    try {
+      unlinkSync(tempPath);
+    } catch {
+      // Best-effort cleanup must not hide the original I/O error.
+    }
+    throw error;
+  }
   return path;
 }
 
