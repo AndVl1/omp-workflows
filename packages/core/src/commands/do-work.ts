@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseAutonomousDirective } from "./envelope.js";
 import { buildClassificationPhaseZero, buildWorkflowMatrix } from "./classification-contract.js";
+import { resolveState } from "../engine/state.js";
 import type { Complexity, TaskType, WorkflowName } from "../engine/types.js";
 
 export interface ParsedWorkEnvelope {
@@ -53,15 +54,11 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
   const roleTable = roles.map(([role, agent]) => `| \`${role}\` | \`${agent}\` |`).join("\n");
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
   const branchMeta = envelope.branch ? `Branch: \`${envelope.branch}\`\n` : "Branch: (no git work tree)\n";
-  const activeFeaturePath = resolve(cwd, ".work-state", ".active-feature");
-  const activeFeature = existsSync(activeFeaturePath) ? readFileSync(activeFeaturePath, "utf8").trim() : "";
-  const statePath = activeFeature
-    ? resolve(cwd, ".work-state", "features", activeFeature, "state.json")
-    : resolve(cwd, ".work-state", "team-state.json");
+  const resolvedState = resolveState(cwd, envelope.branch ?? undefined);
   let continuation = "No existing do-work state was found. Start a new workflow.";
-  if (existsSync(statePath)) {
+  if (resolvedState.state && !resolvedState.isStale && resolvedState.statePath) {
     continuation = [
-      `Existing workflow state found at \`${statePath}\`. This is a resumable continuation, not a new task.`,
+      `Existing workflow state found at \`${resolvedState.statePath}\`. This is a resumable continuation, not a new task.`,
       "Read it before choosing stages; preserve its classification, artifacts, stage history, and prior task text.",
       "If the user reports a defect in the previous result, append the feedback to the task/history, reopen the smallest affected stage, reset only that stage and its downstream stages to pending, and continue from there.",
       "Do not discard or overwrite completed artifacts unless the reopened stage produces a replacement artifact.",

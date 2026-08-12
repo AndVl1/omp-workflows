@@ -27,14 +27,26 @@ function writeWorkflowState(root: string, state: Record<string, unknown>): void 
   mkdirSync(join(root, ".work-state"), { recursive: true });
   writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(state));
 }
-test("do-work: existing state prompt requires same-turn continuation", () => {
-  const root = mkdtempSync(join(tmpdir(), "do-work-resume-"));
+test("do-work: matching-branch state prompt is resumable", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-resume-match-"));
   try {
-    mkdirSync(join(root, ".work-state"), { recursive: true });
-    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ task: "previous fix" }));
-    const prompt = buildDoWorkPrompt(parseWorkEnvelope("feedback", root), root);
+    writeWorkflowState(root, { branch: "feat/current", task: "previous fix" });
+    const prompt = buildDoWorkPrompt({ task: "feedback", autonomyHint: false, issue: null, branch: "feat/current" }, root);
     assert.match(prompt, /resumable continuation/);
-    assert.match(prompt, /Continue executing in THIS TURN/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("do-work: stale active-feature state starts a new workflow", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-resume-stale-"));
+  try {
+    mkdirSync(join(root, ".work-state", "features", "old"), { recursive: true });
+    writeFileSync(join(root, ".work-state", ".active-feature"), "old\n");
+    writeFileSync(join(root, ".work-state", "features", "old", "state.json"), JSON.stringify({ branch: "feat/old", task: "previous fix" }));
+    const prompt = buildDoWorkPrompt({ task: "feedback", autonomyHint: false, issue: null, branch: "feat/current" }, root);
+    assert.match(prompt, /No existing do-work state was found/);
+    assert.doesNotMatch(prompt, /resumable continuation/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

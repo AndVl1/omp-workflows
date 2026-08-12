@@ -60,7 +60,7 @@ export interface RunOptions {
   pause?: (reason: string) => Promise<void>;
   log?: (line: string) => void;
   /** Resume prior state after user feedback, preserving artifacts/history. */
-  continuation?: { feedback: string; stageId?: string };
+  continuation?: { feedback: string; stageId: string };
 }
 
 export interface RunResult {
@@ -106,13 +106,19 @@ export function resolveClassification(opts: Pick<RunOptions, "task" | "autonomou
 export async function run(opts: RunOptions): Promise<RunResult> {
   const config = resolveConfig(opts.cwd);
   const profiles = loadAllProfiles();
-  const classification = resolveClassification(opts);
-  const profile = selectProfile(profiles, classification);
+  const existing = resolveState(opts.cwd, opts.branch);
+  if (opts.continuation && (!existing.state || existing.isStale)) {
+    throw new Error(`cannot continue workflow: no non-stale state for branch ${opts.branch}`);
+  }
+  const persistedClassification = opts.continuation ? existing.state?.classification : undefined;
+  const classification = persistedClassification ?? resolveClassification(opts);
+  const profile = persistedClassification
+    ? profiles.find((candidate) => candidate.name === persistedClassification.workflow)
+    : selectProfile(profiles, classification);
   if (!profile) throw new Error(`no profile matches classification ${JSON.stringify(classification)}`);
   const flags = resolveScope([], config);
-  const existing = resolveState(opts.cwd, opts.branch);
-  const continuation = opts.continuation && existing.state
-    ? reopenFromFeedback(existing.state, opts.continuation.feedback, opts.continuation.stageId)
+  const continuation = opts.continuation
+    ? reopenFromFeedback(existing.state!, opts.continuation.feedback, opts.continuation.stageId)
     : null;
   const initialState: TeamState = continuation ?? {
     schema: 1,
@@ -127,14 +133,13 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     pause: { kind: "none", reason: "" },
     updated_at: new Date().toISOString(),
   };
-  if (continuation) initialState.classification = classification;
-  const { statePath, artifactsDir } = writeState(opts.cwd, initialState);
+  const { statePath, artifactsDir } = writeState(opts.cwd, initialState, opts.continuation ? { target: existing } : {});
   const completed = new Set(initialState.stages.filter((s) => s.status === "done" || s.status === "skipped").map((s) => s.id));
   const runnableProfile = completed.size === 0 ? profile : { ...profile, stages: profile.stages.filter((s) => !completed.has(s.id)) };
   const ctx: StageContext = {
     cwd: opts.cwd,
     state: initialState,
-    artifactsDir: artifactsDir ?? `${opts.cwd}/.work-state/artifacts`,
+    artifactsDir,
     flags,
     agent: (role) => resolveAgentForRole(role, config),
     task: opts.taskTool,
@@ -147,12 +152,12 @@ export async function run(opts: RunOptions): Promise<RunResult> {
   for (const outcome of outcomes) {
     if (outcome.status === "done" || outcome.status === "skipped") {
       const updated = readState(statePath);
-      writeState(opts.cwd, setStageStatus(updated, outcome.stageId, outcome.status, opts.cwd));
+      writeState(opts.cwd, setStageStatus(updated, outcome.stageId, outcome.status, opts.cwd), opts.continuation ? { target: existing } : {});
     }
   }
   const final = readState(statePath);
   const done = final.stages.every((s) => s.status === "done" || s.status === "skipped");
-  writeState(opts.cwd, setPause(final, done ? "done" : "failed", done ? "" : "one or more stages failed"));
+  writeState(opts.cwd, setPause(final, done ? "done" : "failed", done ? "" : "one or more stages failed"), opts.continuation ? { target: existing } : {});
   return { classification, profile, outcomes: outcomes.map((o) => ({ stageId: o.stageId, status: o.status, note: o.note })), statePath };
 }
 
