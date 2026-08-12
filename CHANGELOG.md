@@ -2,6 +2,12 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.20.3] — 2026-08-12
+### Fixed
+- **Reliable `/do-work` continuation** — continuation is now branch-safe, requires an explicit reopen stage, preserves the persisted workflow classification, history, upstream progress, and artifacts, and writes back to the exact custom-feature or legacy state layout.
+- **Workflow command handoff** — fullstack command installation and prompt-hook injection now preserve authoritative `/do-work`, `/team`, and `/cto` dispatch after copied-command setup.
+- **Atomic CTO state persistence** — CTO state updates use same-directory atomic replacement so concurrent readers never observe truncated JSON during resident control-plane activity.
+
 ## [0.20.2] — 2026-08-10
 ### Fixed
 - **Resumable `/do-work` sessions** — workflow execution now continues in the same turn after classification and state persistence; later user feedback is retained in session history and reopens only the affected stage plus downstream stages without discarding upstream artifacts.
