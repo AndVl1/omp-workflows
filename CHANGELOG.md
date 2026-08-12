@@ -2,9 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
-## [Unreleased]
+## [0.20.5] — 2026-08-12
 ### Fixed
 - **Extension-owned workflow command discovery** — core now exposes a synchronous `/do-work`, `/team`, and `/cto` registrar for consumer bundles. Commands register during extension load, before OMP snapshots slash suggestions, so fresh sessions no longer depend on project-local `.omp/commands` imports or consumer `node_modules` resolution.
+- **Clean command migration** — current installs and session bootstrap remove the obsolete project-local workflow adapters while preserving unrelated user commands; published packages no longer contain duplicate `/do-work`, `/team`, or `/cto` adapters.
 
 ## [0.20.4] — 2026-08-11
 ### Added
