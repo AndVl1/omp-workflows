@@ -101,7 +101,7 @@ test("classification contract: /do-work and /cto request the SAME four model fie
     const cto = buildCtoPrompt(parseWorkEnvelope("Fix login bug", root), root);
     for (const prompt of [work, cto]) {
       assert.ok(prompt.includes("CLASSIFICATION:"), "visible classification block");
-      assert.ok(prompt.includes("- Type: FEATURE | REFACTOR | OPS | BUG_FIX | INVESTIGATION | REVIEW | HOTFIX"), "Type field");
+      assert.ok(prompt.includes("- Type: FEATURE | REFACTOR | OPS | BUG_FIX | SPEC | REGRESS | INVESTIGATION | REVIEW | HOTFIX"), "Type field");
       assert.ok(prompt.includes("- Complexity: QUICK | MEDIUM | COMPLEX | CRITICAL"), "Complexity field");
       assert.ok(prompt.includes("- Confidence: HIGH | MEDIUM | LOW"), "Confidence field");
       assert.ok(prompt.includes("- Autonomous: true | false"), "Autonomous field");

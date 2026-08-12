@@ -42,7 +42,7 @@ export function buildClassificationPhaseZero(hint?: ClassificationHint): string 
     "",
     "Return this visible block before continuing:",
     "CLASSIFICATION:",
-    "- Type: FEATURE | REFACTOR | OPS | BUG_FIX | INVESTIGATION | REVIEW | HOTFIX",
+    "- Type: FEATURE | REFACTOR | OPS | BUG_FIX | SPEC | REGRESS | INVESTIGATION | REVIEW | HOTFIX",
     "- Complexity: QUICK | MEDIUM | COMPLEX | CRITICAL",
     "- Confidence: HIGH | MEDIUM | LOW",
     "- Autonomous: true | false",
@@ -70,13 +70,16 @@ export function buildWorkflowMatrix(): string {
     "| REFACTOR | lightweight | standard | full-feature | full-feature |",
     "| OPS | lightweight | standard | standard | standard |",
     "| BUG_FIX | bug-fix | debug-cycle | debug-cycle | debug-cycle |",
+    "| SPEC | spec-preparation | spec-preparation | spec-preparation | spec-preparation |",
+    "| REGRESS | feature-regression | feature-regression | feature-regression | feature-regression |",
     "| INVESTIGATION | research | research | research | research |",
     "| REVIEW | review | review | review | review |",
     "| HOTFIX | emergency | emergency | emergency | emergency |",
     "",
     "> Autonomous BUG_FIX resolves to debug-cycle even at QUICK complexity (autonomous=true).",
+    "> SPEC and REGRESS are first-class task intents and do not modify the standard FEATURE/BUG_FIX routing.",
     "> The P5 gate re-derives the expected workflow from the persisted classification",
-    "> (`classification.autonomous`), so the workflow row must match this matrix. Never re-derive",
-    "> autonomy from task text or markers — the model `autonomous` field is the only authority.",
+    "(`classification.autonomous`), so the workflow row must match this matrix. Never re-derive",
+    "autonomy from task text or markers — the model `autonomous` field is the only authority."
   ].join("\n");
 }

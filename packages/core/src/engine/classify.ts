@@ -25,7 +25,9 @@ export interface KeywordGuess {
 
 const TYPE_KEYWORDS: Record<TaskType, string[]> = {
   FEATURE: ["add", "implement", "create", "build", "new", "introduce", "feature"],
-  BUG_FIX: ["fix", "broken", "error", "doesn't work", "bug", "failing", "regression"],
+  BUG_FIX: ["fix", "broken", "error", "doesn't work", "bug", "failing"],
+  SPEC: ["spec", "specification", "requirements", "implementation-ready", "implementation ready"],
+  REGRESS: ["regression", "regress", "replay", "test matrix"],
   INVESTIGATION: ["why", "investigate", "understand", "find out", "research", "explore"],
   REVIEW: ["review", "check", "audit", "feedback", "audit"],
   HOTFIX: ["urgent", "production", "critical", "asap", "hotfix", "incident"],
@@ -51,9 +53,13 @@ export function keywordClassify(task: string): KeywordGuess {
 function pickType(lower: string): TaskType {
   // HOTFIX wins first; urgency beats everything else.
   if (TYPE_KEYWORDS.HOTFIX.some((k) => lower.includes(k))) return "HOTFIX";
+  if (TYPE_KEYWORDS.SPEC.some((k) => lower.includes(k))) return "SPEC";
+  if (TYPE_KEYWORDS.REGRESS.some((k) => lower.includes(k))) return "REGRESS";
   const scored: Record<TaskType, number> = {
     FEATURE: 0,
     BUG_FIX: 0,
+    SPEC: 0,
+    REGRESS: 0,
     INVESTIGATION: 0,
     REVIEW: 0,
     HOTFIX: 0,

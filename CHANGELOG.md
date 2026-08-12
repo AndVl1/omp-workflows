@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.20.4] — 2026-08-11
+### Added
+- **Reusable platform-neutral SPEC and REGRESS workflows** — adds implementation-ready specification preparation and evidence-driven feature regression profiles with typed classification routing, role-based stages, deterministic gates, and artifact validation.
+
 ## [0.20.3] — 2026-08-12
 ### Fixed
 - **Reliable `/do-work` continuation** — continuation is now branch-safe, requires an explicit reopen stage, preserves the persisted workflow classification, history, upstream progress, and artifacts, and writes back to the exact custom-feature or legacy state layout.

@@ -53,11 +53,15 @@ export const defaultFullstackRoles: RoleConfig["roles"] = {
   go: "developer-go",
   frontend: "frontend-developer",
   mobile: "developer-mobile",
+  android: "developer-mobile",
   qa: "qa",
   "manual-qa": "manual-qa",
   "code-reviewer": "code-reviewer",
   "security-tester": "security-tester",
   devops: "devops",
+  "regression-planner": "analyst",
+  "regression-executor": "manual-qa",
+  "regression-oracle": "qa",
 };
 
 

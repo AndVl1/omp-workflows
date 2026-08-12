@@ -21,7 +21,7 @@
       "properties": {
         "type": {
           "type": "array",
-          "items": { "enum": ["FEATURE", "BUG_FIX", "INVESTIGATION", "REVIEW", "HOTFIX", "REFACTOR", "OPS"] }
+          "items": { "enum": ["FEATURE", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "REFACTOR", "OPS"] }
         },
         "complexity": {
           "type": "array",
@@ -53,10 +53,8 @@
           "items": { "type": "string" },
           "description": "For consilium: list of roles to launch in parallel. Role names resolve to agents via .omp/team.config.json `roles` (falling back to built-in defaults, then the legacy .claude config). A role may repeat (e.g. architect x3 for design options)."
         },
-        "role": {
-          "type": "string",
-          "description": "For single: the role to launch. May be a template like \"${scope.dev_agent}\" resolved from the scope of touched files."
-        },
+        "role": { "type": "string", "description": "For single: the role to resolve and launch for this stage." },
+        "prompt": { "type": "string", "description": "Stage-specific executor instructions rendered into the task prompt." },
         "parallel": { "type": "boolean", "default": false, "description": "For consilium: launch all roles in one message (true) or sequentially (false). For team: launch all teams in parallel (true) or sequentially (false)." },
         "teams": {
           "type": "array",

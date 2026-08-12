@@ -14,6 +14,8 @@ export interface ParsedWorkEnvelope {
    * semantics; this value is rendered as a hint and never persisted.
    */
   autonomyHint: boolean;
+  /** @deprecated Use autonomyHint; retained for parsed-envelope consumers. */
+  autonomous: boolean;
   issue: number | null;
   branch: string | null;
 }
@@ -35,7 +37,7 @@ export function parseWorkEnvelope(args: string, cwd: string): ParsedWorkEnvelope
   } catch {
     branch = null;
   }
-  return { task, autonomyHint, issue, branch };
+  return { task, autonomyHint, autonomous: autonomyHint, issue, branch };
 }
 
 function loadTeamConfig(cwd: string): WorkTeamConfig {

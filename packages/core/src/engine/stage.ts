@@ -234,15 +234,11 @@ export async function runStage(
 }
 
 async function runOrchestrator(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
-  // The orchestrator stage is INLINE — orientation only. The model itself reads
-  // consumes / writes produces (or returns guidance to the parent).
+  // Inline orchestration is intentionally valid when it emits no artifacts. When
+  // a profile declares outputs, however, the stage must leave every artifact on
+  // disk before it can be reported as done, just like subagent stages.
   ctx.log(`  orchestrator: ${stage.produces?.toString() ?? "none"}`);
-  return {
-    stageId: stage.id,
-    status: "done",
-    note: "orchestrator stage (inline)",
-    artifacts: produces,
-  };
+  return validateProduced(stage, ctx, produces, "orchestrator stage (inline)");
 }
 
 async function runSingle(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
@@ -335,12 +331,19 @@ function validateProduced(
   produces: string[],
   successNote: string,
 ): StageOutcome {
-  // The gate is keyed on the *produces* list, not the stage id, so a
-  // test or a custom profile that reuses the "implementation" id for a
-  // non-code stage (no produces) is not penalised. The semantic
-  // invariant is: a stage that produces a code-bearing artifact
-  // (`implementation` or `review_fixes`) MUST include validation
-  // evidence; everything else is unconstrained.
+  // Every declared output is required. Validation-specific checks below add
+  // stronger semantic requirements for code-bearing artifacts.
+  for (const id of produces) {
+    if (!readArtifact(ctx.artifactsDir, id)) {
+      return {
+        stageId: stage.id,
+        status: "failed",
+        note: `produced artifact "${id}.json" not found at ${ctx.artifactsDir}/${id}.json — stage claimed done without writing its artifact.`,
+        artifacts: produces,
+      };
+    }
+  }
+
   const validatedIds = new Set(["implementation", "review_fixes"]);
   const gated = produces.filter((p) => validatedIds.has(p));
   if (gated.length === 0) {
@@ -348,23 +351,10 @@ function validateProduced(
   }
   for (const id of gated) {
     const data = readArtifact(ctx.artifactsDir, id);
-    if (!data) {
-      return {
-        stageId: stage.id,
-        status: "failed",
-        note: `produced artifact "${id}.json" not found at ${ctx.artifactsDir}/${id}.json — subagent claimed done without writing its artifact. Re-spawn.`,
-        artifacts: produces,
-      };
-    }
     const result = validationCheckArtifact(id, data as Record<string, unknown>);
     if (!result.ok) {
       ctx.log(`  validation: REJECTED for ${id} — ${result.reason}`);
-      return {
-        stageId: stage.id,
-        status: "failed",
-        note: result.reason,
-        artifacts: produces,
-      };
+      return { stageId: stage.id, status: "failed", note: result.reason, artifacts: produces };
     }
   }
   ctx.log(`  validation: PASSED for ${stage.id}`);
@@ -396,6 +386,9 @@ ${roleHint}
 
 ### Task
 ${ctx.state.task}
+
+### Stage instructions
+${stage.prompt ?? "Follow the stage title and produce the declared artifact from the task and prior artifacts."}
 
 ### Your job
 Execute this stage. Write your typed artifact to .work-state/artifacts/<id>.json matching the engine's schema (the engine reads only JSON, not prose).

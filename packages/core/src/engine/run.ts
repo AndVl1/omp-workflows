@@ -82,13 +82,17 @@ export function resolveClassification(opts: Pick<RunOptions, "task" | "autonomou
         `classification gate: model classification incomplete (type=${model.type}, complexity=${model.complexity}, confidence=${model.confidence}, autonomous=${model.autonomous}). PHASE-0 must classify type, complexity, confidence and autonomous together; refusing to fall back to keyword guesses.`,
       );
     }
+    const expected = resolveWorkflow(model.type, model.complexity, model.autonomous);
+    if (model.workflow !== undefined && model.workflow !== expected && (model.type === "SPEC" || model.type === "REGRESS")) {
+      throw new Error(`classification gate: ${model.type} must resolve to '${expected}', got '${model.workflow}'`);
+    }
     return {
       type: model.type,
       complexity: model.complexity,
       confidence: model.confidence,
       autonomous: model.autonomous,
       autonomous_reason: model.autonomous_reason,
-      workflow: model.workflow ?? resolveWorkflow(model.type, model.complexity, model.autonomous),
+      workflow: model.workflow ?? expected,
     };
   }
   // Legacy path: keyword guess for type/complexity/confidence only; the

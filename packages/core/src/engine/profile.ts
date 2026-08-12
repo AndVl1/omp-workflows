@@ -18,6 +18,8 @@ const SELECTION_ORDER: WorkflowName[] = [
   "standard",
   "lightweight",
   "research",
+  "spec-preparation",
+  "feature-regression",
   "review",
   "emergency",
 ];
@@ -106,6 +108,10 @@ export function resolveWorkflow(
       if (autonomous) return "debug-cycle";
       if (complexity === "QUICK") return "bug-fix";
       return "debug-cycle"; // MEDIUM | COMPLEX | CRITICAL
+    case "SPEC":
+      return "spec-preparation";
+    case "REGRESS":
+      return "feature-regression";
     case "INVESTIGATION":
       return "research";
     case "REVIEW":
@@ -120,10 +126,17 @@ export function resolveWorkflow(
 /**
  * Pick the first profile (in selection order) whose match passes for the
  * classification. Returns null if no profile matches.
+ *
+ * SPEC and REGRESS are dedicated intents: a model-provided workflow such as
+ * `standard` must not silently hijack either intent. The explicit
+ * `workflow_override: true` state marker is the intentional escape hatch
+ * enforced by the P5 gate; profile selection itself remains safe by falling
+ * back to the dedicated profile.
  */
 export function selectProfile(profiles: Profile[], c: Classification): Profile | null {
+  const dedicated = c.type === "SPEC" ? "spec-preparation" : c.type === "REGRESS" ? "feature-regression" : null;
   const explicit = profiles.find((p) => p.name === c.workflow);
-  if (explicit) return explicit;
+  if (explicit && (!dedicated || explicit.name === dedicated)) return explicit;
   for (const name of SELECTION_ORDER) {
     const p = profiles.find((x) => x.name === name);
     if (!p) continue;

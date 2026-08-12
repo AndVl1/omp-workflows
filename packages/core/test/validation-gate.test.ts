@@ -325,3 +325,34 @@ test("runStage: implementation stage where the subagent never wrote the artifact
     cleanup();
   }
 });
+
+test("runStage: orchestrator with declared artifact fails when output is missing", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    const artifactsDir = join(cwd, "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    const ctx = makeStageCtx(artifactsDir, {
+      async call() { return { id: "unused", output: "", artifacts: {}, exitCode: 0 }; },
+      async batch() { return []; },
+    });
+    const outcome = await runStage({ id: "planning", title: "Planning", type: "orchestrator", produces: "team_plan" }, ctx);
+    assert.equal(outcome.status, "failed");
+    assert.match(outcome.note, /team_plan\.json.*not found/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("runStage: inline orchestrator with no outputs remains done", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    const ctx = makeStageCtx(join(cwd, "artifacts"), {
+      async call() { return { id: "unused", output: "", artifacts: {}, exitCode: 0 }; },
+      async batch() { return []; },
+    });
+    const outcome = await runStage({ id: "summary", title: "Summary", type: "orchestrator" }, ctx);
+    assert.equal(outcome.status, "done");
+  } finally {
+    cleanup();
+  }
+});
