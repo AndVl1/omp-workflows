@@ -22,7 +22,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { readObservabilityPointer } from "../observability/recorder.js";
 import { recordStageTransition } from "../observability/hooks.js";
 import type { PauseKind, StageStatus, TeamState } from "./types.js";
@@ -86,16 +86,23 @@ export function resolveState(cwd: string, currentBranch?: string): ResolvedState
 export function writeState(
   cwd: string,
   state: TeamState,
-  opts: { featureSlug?: string } = {},
+  opts: { featureSlug?: string; target?: ResolvedState } = {},
 ): { statePath: string; artifactsDir: string } {
   const wsDir = resolve(cwd, WORK_STATE_DIR);
-  const featureSlug = opts.featureSlug ?? deriveFeatureSlugFromBranch(state.branch) ?? "default";
+  const target = opts.target;
+  const featureSlug = target
+    ? target.isLegacy ? null : basename(target.stateDir!)
+    : opts.featureSlug ?? deriveFeatureSlugFromBranch(state.branch) ?? "default";
 
   let stateDir: string;
   let statePath: string;
   let artifactsDir: string;
 
-  if (featureSlug) {
+  if (target) {
+    stateDir = target.stateDir!;
+    statePath = target.statePath!;
+    artifactsDir = target.artifactsDir!;
+  } else if (featureSlug) {
     stateDir = join(wsDir, "features", featureSlug);
     statePath = join(stateDir, "state.json");
     artifactsDir = join(stateDir, "artifacts");
@@ -114,7 +121,7 @@ export function writeState(
   // `<featureDir>/observability/events.jsonl`; we read it synchronously
   // here because `writeState` is itself sync and the file is bounded by
   // session length.
-  const obsPointer = readObservabilityPointerSafe(cwd, featureSlug);
+  const obsPointer = featureSlug ? readObservabilityPointerSafe(cwd, featureSlug) : null;
   if (obsPointer) {
     stamped.observability = obsPointer;
   } else {
@@ -223,6 +230,33 @@ export function setStageStatus(
     }
   }
   return { ...state, stages, stage_cursor: cursor, updated_at: new Date().toISOString() };
+}
+/**
+ * Reopen a completed workflow after user feedback without losing prior state.
+ * The affected stage and all downstream stages become pending; upstream
+ * artifacts and stage history remain intact.
+ */
+export function reopenFromFeedback(
+  state: TeamState,
+  feedback: string,
+  stageId: string,
+): TeamState {
+  const target = stageId;
+  const index = state.stages.findIndex((stage) => stage.id === target);
+  if (index < 0) throw new Error(`cannot reopen unknown stage: ${target}`);
+  const history = [...(state.history ?? []), { task: state.task, feedback, at: new Date().toISOString() }];
+  const stages = state.stages.map((stage, i) =>
+    i >= index ? { ...stage, status: "pending" as const } : stage,
+  );
+  return {
+    ...state,
+    task: `${state.task}\n\nUser feedback: ${feedback}`,
+    history,
+    stages,
+    stage_cursor: target,
+    pause: { kind: "none", reason: "" },
+    updated_at: new Date().toISOString(),
+  };
 }
 
 /**

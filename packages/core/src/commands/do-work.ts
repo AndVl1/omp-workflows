@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseAutonomousDirective } from "./envelope.js";
 import { buildClassificationPhaseZero, buildWorkflowMatrix } from "./classification-contract.js";
+import { resolveState } from "../engine/state.js";
 import type { Complexity, TaskType, WorkflowName } from "../engine/types.js";
 
 export interface ParsedWorkEnvelope {
@@ -53,6 +54,16 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
   const roleTable = roles.map(([role, agent]) => `| \`${role}\` | \`${agent}\` |`).join("\n");
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
   const branchMeta = envelope.branch ? `Branch: \`${envelope.branch}\`\n` : "Branch: (no git work tree)\n";
+  const resolvedState = resolveState(cwd, envelope.branch ?? undefined);
+  let continuation = "No existing do-work state was found. Start a new workflow.";
+  if (resolvedState.state && !resolvedState.isStale && resolvedState.statePath) {
+    continuation = [
+      `Existing workflow state found at \`${resolvedState.statePath}\`. This is a resumable continuation, not a new task.`,
+      "Read it before choosing stages; preserve its classification, artifacts, stage history, and prior task text.",
+      "If the user reports a defect in the previous result, append the feedback to the task/history, reopen the smallest affected stage, reset only that stage and its downstream stages to pending, and continue from there.",
+      "Do not discard or overwrite completed artifacts unless the reopened stage produces a replacement artifact.",
+    ].join("\n");
+  }
   return [
     "/do-work classification pass — understand the task before selecting a workflow.",
     "",
@@ -62,22 +73,27 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "### Metadata",
     issueMeta + branchMeta,
     "",
+    continuation,
+    "",
     buildClassificationPhaseZero({ label: "leading directive", value: envelope.autonomyHint }),
     "",
     buildWorkflowMatrix(),
     "",
     "Then write `.work-state/team-state.json` (or the active feature state) with the classification",
     "(type, complexity, confidence, autonomous, autonomous_reason), the resolved workflow, the task,",
-    "and the initial pending stages. This state write is the gate before any investigation or",
-    "delegation — the P5 gate reads `classification.autonomous` as the authority.",
+    "and the initial pending stages only when starting a new workflow. For a continuation, update the",
+    "existing state in place and preserve its history. This state write is the gate before any",
+    "investigation or delegation — the P5 gate reads `classification.autonomous` as the authority.",
     "If confidence is LOW, ask a focused clarification question before writing an expansive workflow",
     "(unless `autonomous` is true; then document a conservative default).",
     "",
     "### Only after state is written",
-    "1. Read exactly the resolved workflow profile file and then its stages.",
-    "2. Walk the selected profile in order; do not execute any stage before classification and state persistence.",
-    "3. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch.",
-    "4. Honour gates, checkpoints, loops, typed artifacts, and the validation contract.",
+    "1. Read exactly the resolved workflow profile JSON and then its stages. Use `packages/core/workflows/<workflow>.json` in this repository, or the installed package's `workflows/<workflow>.json`; never invent a `.md` profile path.",
+    "2. Continue executing in THIS TURN. Do not stop after printing CLASSIFICATION or writing state; immediately read the profile and walk its stages.",
+    "3. On continuation, skip stages already done/skipped and start at the first reopened or pending stage.",
+    "4. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch.",
+    "5. Honour gates, checkpoints, loops, typed artifacts, and the validation contract.",
+    "6. When a stage or the whole workflow finishes, remain available in this same session: later user feedback reopens the affected state instead of starting a fresh workflow.",
     "",
     "### Role mapping (from .omp/team.config.json)",
     "| Role | Agent |",

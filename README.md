@@ -35,14 +35,16 @@ omp plugin install @andvl1/omp-workflows-core
 npm install @andvl1/omp-workflows-core
 npm install @andvl1/omp-workflows-fullstack
 
-### Slash command bootstrap — works for both install paths
+### Slash command bootstrap — deterministic for both install paths
 
-OMP's `discoverCustomCommands` only scans project-local `.omp/commands/<name>/index.ts`; it does **not** read the installed plugin's `node_modules` directly. The shipped slash commands must land in `<project>/.omp/commands/` for OMP to find them. Two paths cover every install mode:
+The fullstack extension registers `/do-work`, `/team`, and `/cto` directly while OMP loads the plugin. Registered extension commands are available to slash autocomplete and execute before project-local custom-TS files, so a stale `.omp/commands/` copy or an unresolved peer dependency cannot hide or replace the current plugin implementation.
 
-- **`npm install`** — the package's `postinstall` script runs `scripts/copy-commands.mjs` and force-copies the commands.
-- **`omp plugin install`** — npm's `postinstall` does *not* fire (the package lives in `~/.omp/plugins/`, outside any project's `node_modules`). The `@andvl1/omp-workflows-fullstack` extension listens for `session_start` and calls `ensureCommandsForSession` which copies anything missing — leaving your local edits untouched. The first OMP session in each project materialises the commands automatically; no manual run is needed.
+Project-local `.omp/commands/` copies remain a compatibility path for runtimes that only discover custom-TS commands from disk:
 
-The `session_start` path is conservative (it never overwrites existing files), the `postinstall` path is destructive (it overwrites so reinstalls can repair drift). Both produce the same `<project>/.omp/commands/` layout.
+- **`npm install`** — `postinstall` runs `scripts/copy-commands.mjs` and force-copies the shipped files.
+- **`omp plugin install`** — npm's `postinstall` does not fire because the package lives in `~/.omp/plugins/`. The extension's `session_start` hook runs a SHA-256-aware sync into `<project>/.omp/commands/`; files unchanged since the previous shipped hash are updated, while user-edited files are preserved.
+
+The sync writes `.omp/commands/.omp-shipped.json` (schema 2) with per-file hashes. The authoritative registered commands are loaded on the next OMP session after a plugin update; the compatibility copies are refreshed at session start.
 
 > **Использование одновременно с Claude Code-плагинами.** Этот пакет и слаг `claude-plugin` (legacy Claude Code-плагин) ставят пересекающийся набор агентов и скиллов. Если вы ставили `claude-plugin` через `claude plugin install`, в omp он подгружается через discovery-provider `claude-plugins` (то же, что `ast-index@ast-index-marketplace`, `figma@claude-plugins-official`, и т. д.). Чтобы не дублировать агентов — отключите provider в `~/.omp/agent/config.yml` одним из способов ниже.
 
@@ -143,16 +145,12 @@ omp-workflows-monorepo/
 └── vibe-report/              # migration notes, walk reports
 ```
 
-### How slash commands ship (v0.4.0+)
+### How slash commands ship (v0.20.2+)
 
-OMP 17.x exposes the `task` tool only to the main agent — neither
-extension commands nor custom-TS commands can drive subagent dispatch
-directly. So as of v0.4.0, the workflow engine splits cleanly:
+OMP 17.x exposes the `task` tool only to the main agent. Workflow commands therefore return prompts; the main agent executes the workflow through its own `task` tool.
 
-- **Extension** (`packages/fullstack/src/index.ts`) registers gates and
-  writes the runtime config. It does **not** register slash commands.
-- **Custom-TS commands** (`packages/fullstack/commands/<name>/index.ts`) are thin OMP discovery adapters. Generic envelope/prompt contracts live in core; adapters return the prompt the main agent runs through its own `task` tool.
-- **`copy-commands.mjs`** copies the retained commands into `<project>/.omp/commands/` for OMP discovery.
+- **Authoritative runtime path:** `packages/fullstack/src/workflow-commands.ts` registers `/do-work`, `/team`, and `/cto` through `ExtensionAPI.registerCommand` during extension loading. OMP gives registered extension commands precedence over project-local custom-TS commands for both autocomplete and execution. The handlers still send the generated prompt through OMP's normal user-message lifecycle, so external `before_agent_start`/`context` hooks continue to run.
+- **Compatibility path:** `packages/fullstack/commands/<name>/index.ts` contains the thin custom-TS adapters. `copy-commands.mjs` and the `session_start` SHA-256 sync materialize them under `<project>/.omp/commands/` for runtimes that still rely on disk discovery. These copies are not an override API; same-name external extension commands use OMP's normal load-order rule, and Claude marketplace commands stay namespaced.
 
 
 ## Usage

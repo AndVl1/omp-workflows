@@ -8,7 +8,7 @@ Default fullstack bundle for `@andvl1/omp-workflows-core`. Ships 16 specialized 
 npm install @andvl1/omp-workflows-fullstack @andvl1/omp-workflows-core
 ```
 
-Then bootstrap the slash commands into your project:
+The extension registers `/do-work`, `/team`, and `/cto` directly during plugin loading, so they appear in slash autocomplete and execute from the installed package without a project-local copy. The copy command remains available for disk-discovery runtimes and explicit bootstrap:
 
 ```bash
 npm run --prefix node_modules/@andvl1/omp-workflows-fullstack copy-commands
@@ -16,7 +16,7 @@ npm run --prefix node_modules/@andvl1/omp-workflows-fullstack copy-commands
 npx omp-workflows-copy-commands
 ```
 
-OMP discovers the commands from `.omp/commands/<name>/index.ts` on the next session start.
+On `omp plugin install`, `session_start` performs a SHA-256-aware compatibility sync into `.omp/commands/`. It updates files that still match the previous shipped hash and preserves user edits. The manifest is `.omp/commands/.omp-shipped.json` (schema 2).
 
 ## What it does
 
@@ -40,12 +40,12 @@ export default function (pi: ExtensionAPI) {
     flags: defaultFullstackFlags,
   });
 }
+```
 
 The taxonomy that backs the bundled `/omp-model-roles validate` command (`defaultFullstackModelRoles`,
 14 entries) is imported from `@andvl1/omp-workflows-core` so any other bundle can compose the same
 helpers (`resolveRoleChain`, `isResearchRequest`, `isResearchResponse`) against its own `ModelRoleEntry[]`.
-
-The extension registers gates (`before_agent_start`, `session_stop`, `tool_call`) and writes `.omp/team.config.json`. **It does NOT register slash commands** — those ship as OMP custom-TS commands in `commands/` (see below).
+The extension registers the workflow gates, writes `.omp/team.config.json`, and registers `/do-work`, `/team`, and `/cto` as authoritative extension commands. Their prompts still pass through OMP's normal user-message lifecycle, so external `before_agent_start`/`context` hooks continue to run. The `commands/` adapters remain the compatibility path for runtimes that only discover custom-TS files from disk; same-name project files are not an override API.
 
 The `agents/` and `skills/` directories are picked up by OMP's discovery automatically.
 
@@ -61,7 +61,7 @@ The `agents/` and `skills/` directories are picked up by OMP's discovery automat
 | `/omp-model-roles` | Validate model-role configuration or delegate recommendations. |
 | `/session-report [do-work|cto] [id=<id>] [--full]` | Generate a self-contained offline HTML snapshot of one workflow session. |
 
-Commands are OMP custom-TS modules copied into project-local `.omp/commands/`; most return prompts and do not dispatch subagents directly. `/session-report` is deterministic: it reads persisted state/artifacts, renders HTML, and writes only under `.work-state`.
+The three workflow entry points are registered directly; `/init-team`, `/interview`, `/omp-model-roles`, and `/session-report` remain custom-TS modules copied into project-local `.omp/commands/`. Most commands return prompts and do not dispatch subagents directly. `/session-report` is deterministic: it reads persisted state/artifacts, renders HTML, and writes only under `.work-state`.
 
 ## Model roles
 

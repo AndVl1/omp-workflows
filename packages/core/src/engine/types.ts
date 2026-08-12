@@ -113,6 +113,8 @@ export interface TeamState {
   branch: string;
   classification: Classification;
   task: string;
+  /** User feedback and prior task text retained across continuations. */
+  history?: Array<{ task: string; feedback?: string; at: string }>;
   /**
    * LEGACY read-compat only. New writes persist the decision inside
    * `classification.autonomous`; this top-level field is read by the P5 gate
@@ -128,12 +130,6 @@ export interface TeamState {
   artifacts: Record<string, string>;
   pause: { kind: PauseKind; reason: string };
   updated_at: string;
-  /**
-   * Observability pointer. Absent on features created before telemetry
-   * landed; readers should treat absence as "no telemetry available"
-   * rather than an error. The engine writes this on every `writeState`
-   * by re-reading the jsonl event log.
-   */
   observability?: import("../observability/events.js").ObservabilityPointer;
 }
 
