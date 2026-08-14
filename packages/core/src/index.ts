@@ -27,7 +27,9 @@ import { safetyGuard } from "./gates/safety.js";
 import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { outboxEnforcementGate } from "./gates/outbox.js";
 import { ctoSliceTaskGate } from "./cto/slice-gate.js";
-import { registerObservabilityHooks } from "./observability/index.js";
+import { registerObservabilityHooks, recordToolCallAttempt } from "./observability/index.js";
+import { reconcileTaskResult } from "./engine/durable.js";
+import { resolveState } from "./engine/state.js";
 import { registerWorkflowProfiles } from "./engine/profile.js";
 import type { RoleConfig } from "./engine/types.js";
 export interface RegisterOptions {
@@ -138,25 +140,32 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 		const c = ctx as { cwd: string };
 		return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], c);
 	});
-	pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
-		const c = ctx as { cwd: string };
-		const nestedCto = ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]);
-		if (nestedCto?.block) return nestedCto;
-		const outboxGate = outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], c);
-		if (outboxGate?.block) return outboxGate;
-    const r0 = classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c);
-    if (r0?.block) return r0;
-    const rWrite = orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], c);
-    if (rWrite?.block) return rWrite;
-    // CTO slice validation precedes shared dispatch authorization. This keeps
-    // the canonical target and its slice membership authoritative before a
-    // dispatch record can be created.
-    const rSlice = ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c);
-    if (rSlice?.block) return rSlice;
-    const rDispatch = dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], c);
-    if (rDispatch?.block) return rDispatch;
-    return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
-	});
+  pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
+    const c = ctx as { cwd: string };
+    let result: { block?: boolean; reason?: string } | undefined;
+    const run = (candidate: { block?: boolean; reason?: string } | void) => { if (!result && candidate?.block) result = candidate; };
+    run(ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]));
+    run(outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], c));
+    run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c));
+    run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], c));
+    run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c));
+    run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], c));
+    run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c));
+    if (opts.observability !== false) recordToolCallAttempt(c.cwd, event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }, result ? "blocked" : "allowed", result?.reason);
+    return result;
+  });
+  pi.on("tool_result", (event: unknown, ctx: unknown) => {
+    const e = event as { toolName?: string; toolCallId?: string; output?: unknown; content?: unknown; isError?: boolean; details?: { async?: { state?: string } } };
+    const c = ctx as { cwd: string };
+    if (e.toolName !== "task" || !e.toolCallId) return;
+    const state = resolveState(c.cwd).state;
+    const record = state?.dispatch_capability?.dispatches?.find((d) => d.tool_call_id === e.toolCallId);
+    if (!record || !state?.dispatch_capability?.issued_for || !state.dispatch_capability.dispatch_token_hash) return;
+    // Secrets are never reconstructed from tool results; this hook only
+    // reconciles records authorized by the engine's task caller.
+    const output = typeof e.output === "string" ? e.output : typeof e.content === "string" ? e.content : undefined;
+    reconcileTaskResult(c.cwd, { dispatch_id: record.id, token: "", capability_id: state.dispatch_capability.capability_id ?? "", cursor_epoch: state.dispatch_capability.issued_for.cursor_epoch, output, isError: e.isError, details: e.details });
+  });
 
 	// ── Observability ────────────────────────────────────────────────────────
 	// Wire telemetry hooks AFTER gates so a blocked agent_start still emits

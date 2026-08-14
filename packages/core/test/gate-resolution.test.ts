@@ -60,3 +60,23 @@ test("armed malformed state is rejected before dispatch can be authorized", () =
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("malformed classification task is fail-closed through the actual gate chain", () => {
+  const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
+  const pi = { setLabel() {}, on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { if (name === "tool_call") handlers.push(handler); } };
+  registerTeamWorkflow(pi as never);
+  const root = mkdtempSync(join(tmpdir(), "omp-gate-malformed-classification-"));
+  try {
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    const armed = {
+      ...minimalState(),
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false },
+      policy: { strict_orchestrator: true },
+    };
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(armed));
+    const result = handlers[0]!({ toolName: "task", input: { task: "prompt-only" } }, { cwd: root }) as { block?: boolean; reason?: string } | undefined;
+    assert.equal(result?.block, true);
+    assert.match(result?.reason ?? "", /malformed classification|workflow/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

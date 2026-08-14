@@ -82,13 +82,19 @@ function safeAppend(
   cwd: string,
   ev: Omit<ObservabilityEvent, "id" | "branch"> & { kind: EventKind },
 ): void {
-  try {
-    void getRecorder(cwd).append(ev);
-  } catch (e) {
-    // never let observability break a tool call
-    // eslint-disable-next-line no-console
-    console.warn("[omp-workflows] observability append failed:", e);
-  }
+  try { getRecorder(cwd).append(ev); } catch { /* telemetry is best effort */ }
+}
+
+export function recordToolCallAttempt(
+  cwd: string,
+  event: { toolName?: string; toolCallId?: string; input?: unknown },
+  decision: "allowed" | "blocked",
+  reason?: string,
+): void {
+  const toolName = typeof event.toolName === "string" ? event.toolName : undefined;
+  if (!toolName) return;
+  const { subagent, taskChars } = toolName === "task" ? subagentFromTaskInput(event.input) : {};
+  safeAppend(cwd, { kind: "tool_call", ts: new Date().toISOString(), toolName, toolCallId: event.toolCallId, subagent, subagentTaskChars: taskChars, gateDecision: decision, gateReason: reason });
 }
 
 /**

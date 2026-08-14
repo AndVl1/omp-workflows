@@ -25,6 +25,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { isRegisteredWorkflow, matchesProfile, resolveWorkflow } from "../engine/profile.js";
+import { monotonicGate } from "./monotonic.js";
 import type { Classification, Complexity, TaskType } from "../engine/types.js";
 
 const WORK_STATE_DIR = ".work-state";
@@ -52,17 +53,18 @@ export function classificationToolGate(event: ToolCallEvent, ctx: AgentStartCont
   if (event.toolName !== "task") return;
   const wsDir = resolve(ctx.cwd, WORK_STATE_DIR);
   if (!existsSync(wsDir)) return;
-  // Other tools (e2e, observability, CTO) may use `.work-state/` without
-  // running the team workflow. Only a workflow pointer arms this gate.
+  // Other tools may use `.work-state/` without running the team workflow.
   const active = join(wsDir, ACTIVE_FEATURE);
   const legacy = join(wsDir, LEGACY_STATE);
   if (!existsSync(active) && !existsSync(legacy)) return;
   if (!resolveStatePath(ctx.cwd)) {
-    return {
-      block: true,
-      reason: "BLOCK (P5): classification state is missing. Complete PHASE 0, write .work-state/team-state.json, then launch agents.",
-    };
+    return { block: true, reason: "BLOCK (P5): classification state is missing. Complete PHASE 0, write .work-state/team-state.json, then launch agents." };
   }
+  // The complete classification contract is enforced pre-execution. The
+  // before_agent_start hook remains a reminder only (OMP cannot block there).
+  const classification = classificationGate(event as unknown as AgentStartEvent, ctx);
+  if (classification?.block) return classification;
+  return monotonicGate(event, ctx);
 }
 export function classificationGate(event: AgentStartEvent, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
   const statePath = resolveStatePath(ctx.cwd);

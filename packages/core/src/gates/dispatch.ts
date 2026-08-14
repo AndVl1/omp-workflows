@@ -29,8 +29,12 @@ export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx:
   const state = resolved.state;
   if (resolved.isStale) return { block: true, reason: "dispatch gate: workflow state is stale for the active branch" };
   if (state.policy?.strict_orchestrator !== true) return;
-  const profile = loadProfile(state.classification.workflow);
-  if (!profile) return { block: true, reason: `dispatch gate: workflow '${state.classification.workflow}' is unavailable` };
+  const classification = state.classification;
+  if (!classification || typeof classification !== "object" || typeof classification.workflow !== "string" || !classification.workflow) {
+    return { block: true, reason: "dispatch gate: malformed classification state; refusing task launch" };
+  }
+  const profile = loadProfile(classification.workflow);
+  if (!profile) return { block: true, reason: `dispatch gate: workflow '${classification.workflow}' is unavailable` };
   const hash = profileHash(profile);
   if (!state.profile_hash || state.profile_hash !== hash) return { block: true, reason: "dispatch gate: persisted profile is missing or stale" };
   const stage = profile.stages.find((candidate) => candidate.id === state.stage_cursor);

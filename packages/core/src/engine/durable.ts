@@ -125,8 +125,22 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
   persist(cwd, next, target); return { ok: true, state: next, handoff };
 }
 
-export function reconcileTaskResult(cwd: string, input: { dispatch_id: string; token: string; capability_id: string; cursor_epoch?: string; output?: string; isError?: boolean; details?: { async?: { state?: string } } }): TransitionResult {
+export function reconcileTaskResult(cwd: string, input: { dispatch_id?: string; tool_call_id?: string; token?: string; capability_id: string; cursor_epoch?: string; output?: string; isError?: boolean; details?: { async?: { state?: string } } }): TransitionResult {
   const asyncState = input.details?.async?.state;
   if (asyncState === "running" || asyncState === "spawned" || asyncState === "scheduled" || (!input.output && !input.isError)) return { ok: false, error: "asynchronous task remains pending" };
-  return completeDispatch(cwd, { ...input, outcome: input.isError ? "failed" : "succeeded", evidence: input.output?.trim() || (input.isError ? "task failed" : ""), completed_by: "synchronous_tool_result" });
+  const found = current(cwd);
+  if (!found) return { ok: false, error: "state not found" };
+  const cap = activeCapability(found.state.dispatch_capability);
+  if (!cap || cap.capability_id !== input.capability_id || (input.cursor_epoch && cap.issued_for.cursor_epoch !== input.cursor_epoch)) return { ok: false, error: "capability binding mismatch", state: found.state };
+  const record = cap.dispatches.find((d) => (input.dispatch_id && d.id === input.dispatch_id) || (input.tool_call_id && d.tool_call_id === input.tool_call_id));
+  if (!record) return { ok: false, error: "unknown dispatch", state: found.state };
+  const token = input.token;
+  if (token) return completeDispatch(cwd, { dispatch_id: record.id, token, capability_id: input.capability_id, cursor_epoch: cap.issued_for.cursor_epoch, outcome: input.isError ? "failed" : "succeeded", evidence: input.output?.trim() || (input.isError ? "task failed" : ""), completed_by: "synchronous_tool_result" });
+  if (record.completion) return { ok: true, state: found.state, record };
+  const evidence = input.output?.trim() || (input.isError ? "task failed" : "task completed");
+  const completion: DispatchCompletion = { dispatch_id: record.id, cursor_epoch: cap.issued_for.cursor_epoch, outcome: input.isError ? "failed" : "succeeded", artifact_ids: [], evidence, completed_by: "synchronous_tool_result", completed_at: now() };
+  const updated = { ...record, status: completion.outcome, completed_at: completion.completed_at, completion } as DispatchRecord;
+  const next: TeamState = { ...found.state, dispatch_capability: { ...cap, dispatches: cap.dispatches.map((d) => d.id === record.id ? updated : d) } };
+  persist(cwd, next, found.target);
+  return { ok: true, state: next, record: updated };
 }
