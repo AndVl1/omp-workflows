@@ -6,11 +6,11 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-
+import { join, dirname, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   MAX_TEAMS,
   buildTeamPlan,
@@ -573,7 +573,7 @@ test("cto-core: readCtoState never observes partial state during concurrent writ
       plan: { id: 'atomic-run', task: 't', teams: [], created_at: '' } });
     state.plan.task = 'x'.repeat(256 * 1024);
     for (let i = 0; i < 200; i++) writeCtoState(state, root);
-  `], { cwd: process.cwd(), env: { ...process.env, CTO_ROOT: root }, stdio: ["ignore", "ignore", "pipe"] });
+  `], { cwd: resolve(dirname(fileURLToPath(import.meta.url)), ".."), env: { ...process.env, CTO_ROOT: root }, stdio: ["ignore", "ignore", "pipe"] });
   let writerError = "";
   writer.stderr?.on("data", (chunk: Buffer) => { writerError += String(chunk); });
   try {

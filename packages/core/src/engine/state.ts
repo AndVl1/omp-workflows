@@ -20,11 +20,11 @@
  *   2. .work-state/team-state.json (legacy)
  *   3. undefined (no state yet)
  */
-
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { readObservabilityPointer } from "../observability/recorder.js";
 import { recordStageTransition } from "../observability/hooks.js";
+import { activeWave, readCtoState } from "../cto/state.js";
 import type { PauseKind, StageStatus, TeamState } from "./types.js";
 
 const WORK_STATE_DIR = ".work-state";
@@ -41,6 +41,46 @@ export interface ResolvedState {
   isStale: boolean;
 }
 
+export type StateSelector = { kind?: "auto" | "team" | "cto-slice"; runId?: string; sliceId?: string; capabilityId?: string };
+export interface ResolvedActiveRun extends ResolvedState {
+  kind: "legacy-root" | "feature" | "cto-slice";
+  runKey: string;
+  branch: string;
+  workflow: string;
+  profileHash: string;
+  stageCursor: string;
+  cursorEpoch: string;
+  dispatch: unknown;
+  staleReason: string | null;
+  selectedTeam?: unknown;
+}
+
+/** Resolve the one authoritative persisted run. Armed pointers and explicit CTO
+ * selectors fail closed; they never silently fall back to another state. */
+export function resolveCanonicalRun(cwd: string, selector: StateSelector = {}, currentBranch?: string): ResolvedActiveRun | null {
+  const branch = currentBranch;
+  if (selector.kind === "cto-slice" || selector.runId || selector.sliceId) {
+    if (!selector.runId || !selector.sliceId) throw new Error("cto-slice selector requires runId and sliceId");
+    const runId = selector.runId, sliceId = selector.sliceId;
+    const cto = readCtoState(runId, cwd);
+    if (!cto) throw new Error(`CTO run '${runId}' is missing or unreadable`);
+    const wave = activeWave(cto);
+    if (!wave) throw new Error(`CTO run '${runId}' has no active wave`);
+    const matches = cto.teams.filter((team) => team.slice_id === sliceId);
+    if (matches.length !== 1) throw new Error(`CTO slice '${sliceId}' must map to exactly one active team`);
+    const team = matches[0]!;
+    const execution = (team as unknown as { execution?: unknown }).execution;
+    if (!execution) throw new Error(`CTO slice '${sliceId}' has no shared execution capability`);
+    const staleReason = branch && cto.branch !== branch ? `branch mismatch: persisted '${cto.branch}', current '${branch}'` : null;
+    return { state: cto as any, statePath: join(cwd, WORK_STATE_DIR, "cto", cto.id, "state.json"), stateDir: join(cwd, WORK_STATE_DIR, "cto", cto.id), artifactsDir: join(cwd, WORK_STATE_DIR, "cto", cto.id, "artifacts"), isLegacy: false, isStale: Boolean(staleReason), kind: "cto-slice", runKey: `cto:${cto.id}:${sliceId}`, branch: cto.branch, workflow: team.workflow ?? "cto", profileHash: String((execution as any).profile_hash ?? ""), stageCursor: String((execution as any).stage_cursor ?? ""), cursorEpoch: String((execution as any).cursor_epoch ?? ""), dispatch: execution, staleReason, selectedTeam: team };
+  }
+  const resolved = resolveState(cwd, branch);
+  if (!resolved.state || !resolved.statePath) return null;
+  const state = resolved.state;
+  const kind = resolved.isLegacy ? "legacy-root" : "feature";
+  const staleReason = resolved.isStale ? `branch mismatch: persisted '${state.branch}', current '${branch ?? "unknown"}'` : null;
+  return { ...resolved, kind, runKey: resolved.isLegacy ? `team:${state.branch}:root` : `team:${state.branch}:${basename(resolved.stateDir ?? "")}`, branch: state.branch, workflow: state.classification.workflow, profileHash: state.profile_hash ?? "", stageCursor: state.stage_cursor, cursorEpoch: (state as any).cursor_epoch ?? "", dispatch: state.dispatch_capability ?? null, staleReason };
+}
 export function resolveState(cwd: string, currentBranch?: string): ResolvedState {
   const wsDir = resolve(cwd, WORK_STATE_DIR);
   if (!existsSync(wsDir)) {
@@ -50,34 +90,22 @@ export function resolveState(cwd: string, currentBranch?: string): ResolvedState
   const activeFile = join(wsDir, ACTIVE_FEATURE);
   if (existsSync(activeFile)) {
     const slug = readFileSync(activeFile, "utf8").trim();
-    if (slug) {
-      const featureDir = join(wsDir, "features", slug);
-      const statePath = join(featureDir, "state.json");
-      if (existsSync(statePath)) {
-        const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-        return {
-          state,
-          statePath,
-          stateDir: featureDir,
-          artifactsDir: join(featureDir, "artifacts"),
-          isLegacy: false,
-          isStale: currentBranch ? state.branch !== currentBranch : false,
-        };
-      }
+    if (!slug) return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false };
+    const featureDir = join(wsDir, "features", slug);
+    const statePath = join(featureDir, "state.json");
+    if (!existsSync(statePath)) return { state: null, statePath: null, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false };
+    try {
+      const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+      return { state, statePath, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: currentBranch ? state.branch !== currentBranch : false };
+    } catch {
+      return { state: null, statePath: statePath, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false };
     }
   }
 
   const legacyPath = join(wsDir, LEGACY_STATE);
   if (existsSync(legacyPath)) {
     const state = JSON.parse(readFileSync(legacyPath, "utf8")) as TeamState;
-    return {
-      state,
-      statePath: legacyPath,
-      stateDir: wsDir,
-      artifactsDir: join(wsDir, "artifacts"),
-      isLegacy: true,
-      isStale: currentBranch ? state.branch !== currentBranch : false,
-    };
+    return { state, statePath: legacyPath, stateDir: wsDir, artifactsDir: join(wsDir, "artifacts"), isLegacy: true, isStale: currentBranch ? state.branch !== currentBranch : false };
   }
 
   return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false };
@@ -127,16 +155,19 @@ export function writeState(
   } else {
     delete stamped.observability;
   }
-  writeFileSync(statePath, JSON.stringify(stamped, null, 2) + "\n", "utf8");
+  atomicWrite(statePath, JSON.stringify(stamped, null, 2) + "\n");
   writeStateMd(stateDir, stamped);
-
-  if (featureSlug) {
-    writeFileSync(join(wsDir, ACTIVE_FEATURE), featureSlug + "\n", "utf8");
-  }
+  if (featureSlug) atomicWrite(join(wsDir, ACTIVE_FEATURE), featureSlug + "\n");
 
   return { statePath, artifactsDir };
 }
 
+function atomicWrite(path: string, content: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, content, "utf8");
+  renameSync(tmp, path);
+}
 function readObservabilityPointerSafe(cwd: string, featureSlug: string) {
   try {
     return readObservabilityPointer(cwd, featureSlug);

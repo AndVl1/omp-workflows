@@ -112,6 +112,60 @@ export interface Profile {
   autoSelect?: boolean;
 }
 
+export interface DispatchCompletion {
+  dispatch_id: string;
+  cursor_epoch: string;
+  outcome: "succeeded" | "failed" | "cancelled";
+  artifact_ids: string[];
+  evidence: string;
+  completed_by: "workflow_complete" | "synchronous_tool_result" | "engine_task_caller";
+  completed_at: string;
+}
+
+export interface DispatchRecord {
+  id: string;
+  role: string;
+  agent: string;
+  tool_call_id?: string;
+  status: "authorized" | "running" | "succeeded" | "failed" | "cancelled";
+  attempt: number;
+  created_at: string;
+  completed_at?: string;
+  completion?: DispatchCompletion;
+}
+
+export interface CapabilityRosterEntry {
+  role: string;
+  agent: string;
+}
+
+export interface DispatchCapabilityState {
+  /** Legacy aliases retained for schema-1 readers; strict armed dispatch ignores them. */
+  run?: string;
+  workflow?: WorkflowName;
+  profile_hash?: string;
+  stage?: string;
+  roles?: string[];
+  capability_id?: string;
+  dispatch_token_hash?: string;
+  advance_token_hash?: string;
+  issued_for?: { run_key: string; branch: string; workflow: WorkflowName; profile_hash: string; stage_cursor: string; cursor_epoch: string };
+  kind: "none" | "single" | "consilium";
+  expected_roles?: string[];
+  expected_count?: number;
+  expected_roster?: CapabilityRosterEntry[];
+  status?: "ready" | "dispatched" | "joining" | "complete" | "invalidated";
+  dispatches?: DispatchRecord[];
+}
+
+export interface JoinSummary {
+  stage_id: string;
+  cursor_epoch: string;
+  dispatch_ids: string[];
+  roles: string[];
+  joined_at: string;
+}
+
 export interface TeamState {
   schema: 1;
   branch: string;
@@ -119,13 +173,6 @@ export interface TeamState {
   task: string;
   /** User feedback and prior task text retained across continuations. */
   history?: Array<{ task: string; feedback?: string; at: string }>;
-  /**
-   * LEGACY read-compat only. New writes persist the decision inside
-   * `classification.autonomous`; this top-level field is read by the P5 gate
-   * solely for old state files that predate the model-first contract. It is
-   * NEVER written by new state and never overrides a present
-   * `classification.autonomous`.
-   */
   autonomous?: boolean;
   workflow_override: boolean;
   issue: { number: number; url?: string } | null;
@@ -134,6 +181,12 @@ export interface TeamState {
   artifacts: Record<string, string>;
   pause: { kind: PauseKind; reason: string };
   updated_at: string;
+  policy?: { strict_orchestrator?: boolean };
+  profile_hash?: string;
+  cursor_epoch?: string;
+  run_key?: string;
+  dispatch_capability?: DispatchCapabilityState;
+  join_summary?: JoinSummary;
   observability?: import("../observability/events.js").ObservabilityPointer;
 }
 

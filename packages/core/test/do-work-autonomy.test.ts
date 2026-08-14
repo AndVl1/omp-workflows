@@ -12,6 +12,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadProfile, profileHash } from "../src/engine/profile.js";
+import { createCapability } from "../src/engine/durable.js";
 
 import {
   parseWorkEnvelope,
@@ -365,6 +367,75 @@ test("P5 gate: missing classification blocks; absent state allows (legacy flow)"
 
     rmSync(join(root, ".work-state"), { recursive: true, force: true });
     assert.equal(classificationGate({ agent: "developer" }, { cwd: root }), undefined, "no state -> legacy allow");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("strict orchestrator policy blocks source writes and allows workflow state writes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-write-policy-"));
+  try {
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
+    const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
+    const source = orchestratorWriteGate({ toolName: "write", input: { actor: "orchestrator", path: "src/app.ts" } }, { cwd: root });
+    assert.equal(source?.block, true);
+    assert.match(source?.reason ?? "", /may write only under \.work-state/);
+    const state = orchestratorWriteGate({ toolName: "edit", input: { actor: "orchestrator", path: ".work-state/team-state.json" } }, { cwd: root });
+    assert.equal(state, undefined);
+    const worker = orchestratorWriteGate({ toolName: "write", input: { actor: "worker", path: "src/app.ts" } }, { cwd: root });
+    assert.equal(worker, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("do-work prompt makes orchestrator non-coding policy explicit", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-policy-prompt-"));
+  try {
+    const prompt = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
+    assert.match(prompt, /STRICT ORCHESTRATOR POLICY/);
+    assert.match(prompt, /write\/edit application source or project files \| DENY/);
+    assert.match(prompt, /After every delegated call or parallel batch/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("team and do-work use the same strict orchestration contract", () => {
+  const root = mkdtempSync(join(tmpdir(), "team-alias-policy-"));
+  try {
+    const work = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
+    const team = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
+    assert.equal(team, work, "/team alias must resolve to the identical canonical prompt");
+    assert.match(team, /STRICT ORCHESTRATOR POLICY/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dispatch gate requires the exact active cursor stage and roster", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-cursor-"));
+  try {
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    const profile = loadProfile("lightweight");
+    assert.ok(profile, "lightweight profile must be available for strict dispatch fixture");
+    const persistedProfileHash = profileHash(profile);
+    const capability = createCapability({
+      run_key: "feat/test", branch: "feat/test", workflow: "lightweight", profile_hash: persistedProfileHash,
+      stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "${scope.dev_agent}" }],
+    });
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
+      branch: "feat/test", run_key: "feat/test", policy: { strict_orchestrator: true }, stage_cursor: "implementation",
+      cursor_epoch: capability.state.issued_for?.cursor_epoch, profile_hash: persistedProfileHash,
+      dispatch_capability: capability.state,
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+    }));
+    const { dispatchGate } = await import("../src/gates/dispatch.ts");
+    const wrong = dispatchGate({ toolName: "task", input: { agent: "backend-kotlin", task: "<!-- omp-dispatch run=feat/test stage=discovery kind=single cursor=discovery roles=analyst -->" } }, { cwd: root });
+    assert.equal(wrong?.block, true);
+    const right = dispatchGate({ toolName: "task", input: { agent: "${scope.dev_agent}", role: "${scope.dev_agent}", task: `<!-- omp-dispatch run=feat/test stage=implementation kind=single cursor=${capability.state.issued_for?.cursor_epoch} roles=\${scope.dev_agent} -->` } }, { cwd: root });
+    assert.equal(right, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

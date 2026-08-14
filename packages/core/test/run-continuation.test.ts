@@ -133,6 +133,8 @@ test("run continuation preserves persisted classification, upstream state, artif
     assert.equal(state.history?.length, 2);
     assert.equal(state.history?.[1]?.feedback, "Rework the reopened stage");
     assert.match(state.task, /User feedback: Rework the reopened stage/);
+    assert.equal(state.dispatch_capability?.status, "complete", "successful continuation must durably join and advance every stage");
+    assert.doesNotMatch(readFileSync(statePath, "utf8"), /"(?:dispatch_token|advance_token)"\s*:/, "plaintext handoff secrets must never be persisted");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

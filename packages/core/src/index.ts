@@ -17,6 +17,8 @@
  *   }
  */
 
+import { orchestratorWriteGate } from "./gates/orchestrator-write.js";
+import { dispatchGate } from "./gates/dispatch.js";
 import type { ExtensionAPI, BeforeAgentStartEvent, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import { classificationGate, classificationToolGate } from "./gates/classification.js";
 import { monotonicGate } from "./gates/monotonic.js";
@@ -142,15 +144,18 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 		if (nestedCto?.block) return nestedCto;
 		const outboxGate = outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], c);
 		if (outboxGate?.block) return outboxGate;
-		const r0 = classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c);
-		if (r0?.block) return r0;
-		// CTO slice dispatch gate: after classification, before safety. No
-		// marker → block when an active CTO wave exists (fail-closed), else
-		// allow; marker + invalid canonical state → block. ctoNestingGuard
-		// above stays first and untouched.
-		const rSlice = ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c);
-		if (rSlice?.block) return rSlice;
-		return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
+    const r0 = classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c);
+    if (r0?.block) return r0;
+    const rWrite = orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], c);
+    if (rWrite?.block) return rWrite;
+    // CTO slice validation precedes shared dispatch authorization. This keeps
+    // the canonical target and its slice membership authoritative before a
+    // dispatch record can be created.
+    const rSlice = ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c);
+    if (rSlice?.block) return rSlice;
+    const rDispatch = dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], c);
+    if (rDispatch?.block) return rDispatch;
+    return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
 	});
 
 	// ── Observability ────────────────────────────────────────────────────────
@@ -190,6 +195,14 @@ export {
   resolveWorkflow,
   selectProfile,
 } from "./engine/profile.js";
+export {
+  resolveWorkflowContract,
+  resolveStageInstructions,
+  WorkflowContractError,
+  type WorkflowContract,
+  type WorkflowContractOptions,
+  type WorkflowStageContract,
+} from "./engine/workflow-contract.js";
 export { resolveConfig } from "./engine/config.js";
 export { resolveScope, applyConditional, shouldSkip } from "./engine/scope.js";
 export {
@@ -198,6 +211,9 @@ export {
   setPause,
   checkMonotonic,
   resolveState,
+  resolveCanonicalRun,
+  type ResolvedActiveRun,
+  type StateSelector,
   reopenFromFeedback,
 } from "./engine/state.js";
 export {
@@ -211,6 +227,18 @@ export {
 	isDoDComplete,
 	isRootCauseDocumented,
 } from "./engine/dod.js";
+export { dispatchGate, buildDispatchMarker, parseDispatchMarker } from "./gates/dispatch.js";
+export {
+  hashDispatchSecret,
+  createCapability,
+  authorizeDispatch,
+  completeDispatch,
+  advanceCursor,
+  reconcileTaskResult,
+  type DispatchAuth,
+  type TransitionResult,
+} from "./engine/durable.js";
+export { orchestratorWriteGate, actorOf, hasStrictOrchestratorState } from "./gates/orchestrator-write.js";
 export {
 	run,
 	resolveClassification,
@@ -230,20 +258,24 @@ export {
 	type StageOutcome,
 } from "./engine/stage.js";
 export type {
-	Profile,
-	StageDef,
-	StageType,
-	StageStatus,
-	PauseKind,
-	TaskType,
-	Complexity,
-	Confidence,
-	WorkflowName,
-	Classification,
-	TeamState,
-	RoleConfig,
-	DoD,
-	DoDItem,
+  Profile,
+  StageDef,
+  StageType,
+  StageStatus,
+  PauseKind,
+  TaskType,
+  Complexity,
+  Confidence,
+  WorkflowName,
+  Classification,
+  TeamState,
+  RoleConfig,
+  DoD,
+  DoDItem,
+  DispatchCompletion,
+  DispatchRecord,
+  DispatchCapabilityState,
+  JoinSummary,
 } from "./engine/types.js";
 // ── CTO sub-orchestration (pure engine) ────────────────────────────────────
 export { MAX_TEAMS, MAX_DECOMPOSITION_DEPTH } from "./cto/types.js";

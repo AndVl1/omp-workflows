@@ -19,6 +19,7 @@
  * the artifact. See `gates/validation.ts` for the full contract.
  */
 
+import { buildDispatchMarker } from "../gates/dispatch.js";
 import { execSync } from "node:child_process";
 import { readArtifact } from "./artifacts.js";
 import { resolveConfig } from "./config.js";
@@ -34,12 +35,16 @@ export interface StageContext {
   agent: (role: string) => string;
   /** Run a single task subagent. The engine owns the `task` tool reference. */
   task: TaskCaller;
-  /** Pause for /user input. Used by `checkpoint` stages. */
   pause: (reason: string) => Promise<void>;
-  /** Append a log line to the human mirror. */
   log: (line: string) => void;
-  /** Resolve ${scope.dev_agent} -> string. */
   resolveDevAgent: () => string | null;
+  onStageStart?: (stageId: string) => void;
+  /** Present when strict durable execution is armed. */
+  durable?: {
+    authorize: (role: string, agent: string) => { ok: true; dispatchId: string } | { ok: false; error: string };
+    complete: (dispatchId: string, output: string, outcome: "succeeded" | "failed", artifactIds?: string[]) => { ok: true } | { ok: false; error: string };
+    advance: (evidence: string) => { ok: true; handoff?: { capability_id: string; dispatch_token: string; advance_token: string; cursor_epoch: string } } | { ok: false; error: string };
+  };
 }
 /**
  * Minimum shape we depend on from the real OMP `TaskTool`. `TaskTool` is
@@ -214,6 +219,7 @@ export async function runStage(
   }
 
   ctx.log(`stage ${stage.id}: ${stage.title}`);
+  ctx.onStageStart?.(stage.id);
 
   const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
 
@@ -243,23 +249,19 @@ async function runOrchestrator(stage: StageDef, ctx: StageContext, produces: str
 
 async function runSingle(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
   const role = stage.role ? expandRole(stage.role, ctx) : "";
-  if (!role) {
-    return { stageId: stage.id, status: "failed", note: "single stage missing role", artifacts: [] };
-  }
+  if (!role) return { stageId: stage.id, status: "failed", note: "single stage missing role", artifacts: [] };
   const agent = ctx.agent(role);
   const task = buildStagePrompt(stage, ctx, role);
-
   ctx.log(`  single: ${agent} (role=${role})`);
+  const authorized = ctx.durable?.authorize(role, agent);
+  if (authorized && !authorized.ok) return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${authorized.error}`, artifacts: produces };
   const result = await ctx.task.call({ agent, task });
-
-  if (result.exitCode !== 0) {
-    return {
-      stageId: stage.id,
-      status: "failed",
-      note: result.error ?? `${agent} returned exit ${result.exitCode}`,
-      artifacts: produces,
-    };
+  const outcome = result.exitCode === 0 ? "succeeded" : "failed";
+  if (authorized) {
+    const completed = ctx.durable!.complete(authorized.dispatchId, result.output, outcome, Object.keys(result.artifacts));
+    if (!completed.ok) return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
   }
+  if (result.exitCode !== 0) return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} returned exit ${result.exitCode}`, artifacts: produces };
   return validateProduced(stage, ctx, produces, `${agent} returned exit 0`);
 }
 
@@ -267,35 +269,23 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
   const baseRoles = stage.roles ?? [];
   const roster = applyConditional(baseRoles, stage.conditional, ctx.flags);
   const overridden = applyRosterOverrides(roster, ctx.cwd, stage.id);
-
   ctx.log(`  consilium: ${overridden.join(", ")}`);
-
-  const tasks = overridden.map((role) => ({
-    name: `${stage.id}-${role}`,
-    agent: ctx.agent(role),
-    task: buildStagePrompt(stage, ctx, role),
-  }));
-
-  const results = await ctx.task.batch({
-    context: `Parallel agents for stage "${stage.id}" (${stage.title}). Each of you gathers its own context.`,
-    tasks,
-  });
-
-  const failed = results.filter((r) => r.exitCode !== 0);
-  if (failed.length > 0) {
-    return {
-      stageId: stage.id,
-      status: "failed",
-      note: `${failed.length}/${tasks.length} failed`,
-      artifacts: produces,
-    };
+  const tasks = overridden.map((role) => ({ name: `${stage.id}-${role}`, agent: ctx.agent(role), task: buildStagePrompt(stage, ctx, role) }));
+  const authorized = ctx.durable ? overridden.map((role, i) => ctx.durable!.authorize(role, tasks[i]!.agent)) : [];
+  const denied = authorized.find((a) => !a.ok);
+  if (denied && !denied.ok) return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${denied.error}`, artifacts: produces };
+  const results = await ctx.task.batch({ context: `Parallel agents for stage "${stage.id}" (${stage.title}). Each of you gathers its own context.`, tasks });
+  for (let i = 0; i < results.length; i++) {
+    const auth = authorized[i];
+    if (auth?.ok) {
+      const result = results[i]!;
+      const completed = ctx.durable!.complete(auth.dispatchId, result.output, result.exitCode === 0 ? "succeeded" : "failed", Object.keys(result.artifacts));
+      if (!completed.ok) return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
+    }
   }
-  return validateProduced(
-    stage,
-    ctx,
-    produces,
-    `${tasks.length} agents in parallel`,
-  );
+  const failed = results.filter((r) => r.exitCode !== 0);
+  if (failed.length > 0) return { stageId: stage.id, status: "failed", note: `${failed.length}/${tasks.length} failed`, artifacts: produces };
+  return validateProduced(stage, ctx, produces, `${tasks.length} agents in parallel`);
 }
 
 async function runBash(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
@@ -375,6 +365,9 @@ function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string): str
   const roleHint = isOrchestratorRole(role)
     ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
     : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
+  const dispatchMarker = stage.type === "single" || stage.type === "consilium"
+    ? buildDispatchMarker(ctx.state.branch, stage)
+    : "";
   return `## Stage: ${stage.id} — ${stage.title}
 ${stage.description ?? ""}
 
@@ -383,6 +376,9 @@ Classification: ${ctx.state.classification.type}/${ctx.state.classification.comp
 Workflow role: ${role}
 
 ${roleHint}
+
+### Dispatch contract
+${dispatchMarker || "No task dispatch is permitted for this stage."}
 
 ### Task
 ${ctx.state.task}
@@ -431,7 +427,14 @@ export async function walkProfile(
 ): Promise<StageOutcome[]> {
   const outcomes: StageOutcome[] = [];
   for (const stage of profile.stages) {
-    const outcome = await runStage(stage, ctx);
+    let outcome = await runStage(stage, ctx);
+    // Strict durable stages advance only after all dispatches have joined.
+    if (outcome.status === "done" && ctx.durable && (stage.type === "single" || stage.type === "consilium")) {
+      const advanced = ctx.durable.advance(outcome.note);
+      if (!advanced.ok) {
+        outcome = { ...outcome, status: "failed", note: `durable cursor advance failed: ${advanced.error}` };
+      }
+    }
     outcomes.push(outcome);
     if (outcome.status === "failed") {
       ctx.log(`halting at stage ${stage.id}`);

@@ -253,7 +253,7 @@ function noMarkerBlockReason(active: { runId: string; waveId: string }, attempte
  *   the fail-closed path (blocked when an active wave exists, item named); a
  *   batch is allowed only when every item's marker passes canonical
  *   validation (first failing item blocks with its run/slice named).
- * - Never throws: odd input falls back to the fail-safe allow in the catch.
+ * - Malformed input or state errors fail closed and block the task launch.
  */
 export function ctoSliceTaskGate(
   event: { toolName?: string; input?: unknown },
@@ -306,8 +306,7 @@ export function ctoSliceTaskGate(
     // No task payload at all — fail closed while a wave is active.
     const active = findActiveWave(ctx.cwd);
     return active ? { block: true, reason: noMarkerBlockReason(active, false, undefined) } : undefined;
-  } catch {
-    // fail-safe allow — the gate must never throw.
-    return undefined;
+  } catch (error) {
+    return { block: true, reason: `cto slice gate: malformed dispatch input or unreadable state — refusing task launch (${String(error)})` };
   }
 }

@@ -109,6 +109,23 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "- Do NOT copy the autonomy hint ([AUTONOMOUS]/natural directive) into state as the decision —",
     "  persist your own `autonomous` classification from PHASE-0.",
     "- Do NOT mark a stage done without its required artifact and gate evidence.",
+    "",
+    "### STRICT ORCHESTRATOR POLICY (non-negotiable)",
+    "You are the workflow orchestrator, not an implementation agent. Your allowed work is limited to reading application code, writing workflow state and typed artifacts under `.work-state/`, and deterministic auxiliary operations required to inspect or coordinate the run.",
+    "NEVER use `write` or `edit` on application source, tests, configuration, lockfiles, documentation, or any path outside `.work-state/`. NEVER patch a subagent's code, validation, or artifact to make a stage pass.",
+    "Every implementation, review-fix, or source-changing operation MUST be delegated through the profile's `single`/`consilium` stage. If a subagent fails, returns incomplete evidence, or produces incorrect work, re-spawn the same role with a corrected task; do not fix it yourself.",
+    "After every delegated call or parallel batch: stop and reconcile the result with persisted state. Write the stage outcome, require every declared artifact and gate/validation evidence, then dispatch the next stage only if the state transition is valid. A subagent return is not permission to improvise, skip stages, or self-complete.",
+    "If state, delegation evidence, artifact evidence, or gate evidence is missing/corrupt, fail closed: record the failure in `.work-state/` and re-delegate or pause for the user. Do not continue by judgment alone.",
+    "",
+    "### Tool permission summary",
+    "| Operation | Orchestrator |",
+    "| --- | --- |",
+    "| read/glob/grep | ALLOW |",
+    "| write/edit `.work-state/**` | ALLOW |",
+    "| write/edit application source or project files | DENY |",
+    "| task for a declared stage | ALLOW |",
+    "| task outside the active profile/state contract | DENY |",
+    "| direct implementation or review-fix | DENY |",
   ].join("\n");
 }
 

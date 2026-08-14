@@ -14,19 +14,22 @@
  */
 
 import type {
-	ExtensionAPI,
-	ExtensionUIContext,
-	BeforeAgentStartEvent,
-	BeforeAgentStartEventResult,
-	SessionStartEvent,
+  ExtensionAPI,
+  ExtensionUIContext,
+  BeforeAgentStartEvent,
+  BeforeAgentStartEventResult,
+  SessionStartEvent,
 } from "@oh-my-pi/pi-coding-agent";
 import {
-	defaultFullstackFlags,
-	defaultFullstackModelRoles,
-	defaultFullstackRoles,
-	defaultFullstackScopeMap,
-	findActiveCtoRun,
-	registerTeamWorkflow,
+  defaultFullstackFlags,
+  defaultFullstackModelRoles,
+  defaultFullstackRoles,
+  defaultFullstackScopeMap,
+  findActiveCtoRun,
+  registerTeamWorkflow,
+  completeDispatch,
+  advanceCursor,
+  type DispatchAuth,
 } from "@andvl1/omp-workflows-core";
 import { registerWorkflowCommands } from "./workflow-commands.js";
 import { ensureCommandsForSession } from "./copy-commands.js";
@@ -38,6 +41,7 @@ import {
 	RESEARCH_REQUEST_MARKER_START,
 	buildResearchRequestDeveloperInstruction,
 } from "./before-agent-start-marker.js";
+import { resolveWorkflowContract } from "@andvl1/omp-workflows-core";
 import {
 	handleSubagentsCommand,
 	registerSubagentTree,
@@ -150,6 +154,65 @@ export function isMainSessionContext(ctx: unknown): boolean {
 }
 
 
+export function registerWorkflowTools(pi: ExtensionAPI): void {
+  const { z } = pi.zod;
+  type ToolResult = { content: [{ type: "text"; text: string }]; details: unknown };
+  const result = (value: unknown): ToolResult => ({
+    content: [{ type: "text", text: JSON.stringify(value) }],
+    details: value,
+  });
+  const emptyParameters = z.object({}) as never;
+  pi.registerTool({
+    name: "workflow_instructions",
+    label: "Workflow instructions",
+    description: "Read the current structured workflow stage contract.",
+    parameters: emptyParameters,
+    async execute(_id, _params, _signal, _update, ctx) {
+      try {
+        const contract = resolveWorkflowContract(resolveSessionCwd(ctx) ?? process.cwd());
+        return result(contract);
+      } catch (error) {
+        return result({ ok: false, code: "WORKFLOW_RESOLUTION_FAILED", error: String(error) });
+      }
+    },
+  });
+  pi.registerTool({
+    name: "workflow_complete",
+    label: "Complete workflow dispatch",
+    description: "Record durable completion for an authorized workflow dispatch.",
+    parameters: z.object({
+      dispatch_id: z.string().min(1), token: z.string().min(1), capability_id: z.string().min(1),
+      run_key: z.string().min(1), cursor_epoch: z.string().min(1), evidence: z.string().min(1),
+      artifact_ids: z.array(z.string().min(1)).default([]),
+      outcome: z.enum(["succeeded", "failed", "cancelled"]).default("succeeded"),
+    }) as never,
+    async execute(_id, params, _signal, _update, ctx) {
+      const cwd = resolveSessionCwd(ctx);
+      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      const input = params as DispatchAuth & { dispatch_id: string; evidence: string; artifact_ids?: string[]; outcome: "succeeded" | "failed" | "cancelled" };
+      try {
+        const transition = completeDispatch(cwd, { ...input, completed_by: "workflow_complete" });
+        return transition.ok ? result({ ok: true, transition: "complete", dispatch_id: input.dispatch_id, state: transition.state, record: transition.record }) : result({ ok: false, code: "WORKFLOW_COMPLETE_REJECTED", error: transition.error, dispatch_id: input.dispatch_id });
+      } catch (error) { return result({ ok: false, code: "WORKFLOW_COMPLETE_FAILED", error: String(error), dispatch_id: input.dispatch_id }); }
+    },
+  });
+  pi.registerTool({
+    name: "workflow_advance",
+    label: "Advance workflow",
+    description: "Join the current stage and advance its durable cursor after all dispatches complete.",
+    parameters: z.object({ token: z.string().min(1), capability_id: z.string().min(1), run_key: z.string().min(1), cursor_epoch: z.string().min(1), evidence: z.string().min(1) }) as never,
+    async execute(_id, params, _signal, _update, ctx) {
+      const cwd = resolveSessionCwd(ctx);
+      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      const input = params as { token: string; capability_id: string; run_key: string; cursor_epoch: string; evidence: string };
+      try {
+        const transition = advanceCursor(cwd, input);
+        return transition.ok ? result({ ok: true, transition: "advance", stage_cursor: transition.state.stage_cursor, cursor_epoch: transition.state.cursor_epoch, state: transition.state }) : result({ ok: false, code: "WORKFLOW_ADVANCE_REJECTED", error: transition.error });
+      } catch (error) { return result({ ok: false, code: "WORKFLOW_ADVANCE_FAILED", error: String(error) }); }
+    },
+  });
+}
+
 export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   registerTeamWorkflow(pi, {
     label: "omp-workflows-fullstack",
@@ -157,6 +220,7 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     scopeMap: defaultFullstackScopeMap,
     flags: defaultFullstackFlags,
   });
+  registerWorkflowTools(pi);
   // Register the three workflow entry points while the extension is loaded.
   // OMP snapshots registered commands before it discovers project-local
   // `.omp/commands` files, so this keeps slash suggestions and execution

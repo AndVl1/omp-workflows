@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 /**
  * Profile loader and classification resolver.
  *
@@ -81,6 +82,16 @@ export function resolveWorkflowProfilePath(name: string, _cwd?: string): string 
 
 export function loadProfile(name: WorkflowName): Profile | null {
   return loadAllProfiles().find((p) => p.name === name) ?? null;
+}
+
+/** Stable canonical SHA-256 fingerprint used to reject profile drift. */
+export function profileHash(profile: Profile): string {
+  const canonicalize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonicalize(v)]));
+    return value;
+  };
+  return createHash("sha256").update(JSON.stringify(canonicalize(profile))).digest("hex");
 }
 
 /**
