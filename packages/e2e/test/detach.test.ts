@@ -34,12 +34,23 @@ import { test } from 'node:test';
 import { deferred } from '../src/util.js';
 
 // node-pty is a native module; skip the test when its binding cannot
-// load (matches the server.test.ts guard for the noPty fallback). This
-// is the platform-specific-exception case from the ts-no-dynamic-import
-// rule: the module name is fixed but its existence is platform-conditional.
+// create a PTY (an installed but unusable native binding otherwise
+// downgrades startTestSession to its noPty fallback). This is the
+// platform-specific-exception case from the ts-no-dynamic-import rule:
+// the module name is fixed but its native executable is platform-conditional.
 async function nodePtyAvailable(): Promise<boolean> {
   try {
-    await import('node-pty');
+    const pty = await import('node-pty');
+    const shell = process.platform === 'win32' ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh';
+    const args = process.platform === 'win32' ? ['/c', 'exit 0'] : ['-c', 'exit 0'];
+    const probe = pty.spawn(shell, args, {
+      name: 'xterm-256color',
+      cols: 80,
+      rows: 24,
+      env: process.env,
+    });
+    probe.onData(() => {});
+    probe.onExit(() => {});
     return true;
   } catch {
     return false;

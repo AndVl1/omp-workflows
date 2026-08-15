@@ -20,8 +20,8 @@
  * drain the queue without real timers.
  */
 
-import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   emptyRollup,
   type ObservabilityEvent,
@@ -32,6 +32,14 @@ import {
 const OBSERVABILITY_DIR = "observability";
 const EVENTS_FILENAME = "events.jsonl";
 
+function isWithinTree(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
+function isSafeFeatureSlug(value: string): boolean {
+  return value.length > 0 && /^[A-Za-z0-9._-]+$/.test(value);
+}
 export interface RecorderOptions {
   /** Cwd of the project. */
   cwd: string;
@@ -131,10 +139,49 @@ export class EventRecorder {
   }
 
   private resolveEventsPath(): string {
-    const wsDir = resolve(this.cwd, ".work-state", "features", this.featureSlug);
-    const obsDir = join(wsDir, OBSERVABILITY_DIR);
+    if (!isSafeFeatureSlug(this.featureSlug)) throw new Error("unsafe observability feature slug");
+    const projectRoot = realpathSync(resolve(this.cwd));
+    const wsDir = resolve(this.cwd, ".work-state");
+    mkdirSync(wsDir, { recursive: true });
+    const realWorkState = realpathSync(wsDir);
+    if (!isWithinTree(projectRoot, realWorkState)) throw new Error("observability path escapes project root");
+    const featuresDir = join(wsDir, "features");
+    mkdirSync(featuresDir, { recursive: true });
+    const realFeatures = realpathSync(featuresDir);
+    if (!isWithinTree(realWorkState, realFeatures)) throw new Error("observability features path escapes .work-state");
+    const featureDir = join(featuresDir, this.featureSlug);
+    if (existsSync(featureDir) && !isWithinTree(realFeatures, realpathSync(featureDir))) {
+      throw new Error("observability feature path escapes .work-state/features");
+    }
+    mkdirSync(featureDir, { recursive: true });
+    const realFeature = realpathSync(featureDir);
+    if (!isWithinTree(realFeatures, realFeature)) throw new Error("observability feature path escapes .work-state/features");
+    const obsDir = join(featureDir, OBSERVABILITY_DIR);
+    if (existsSync(obsDir) && !isWithinTree(realFeature, realpathSync(obsDir))) {
+      throw new Error("observability directory escapes feature path");
+    }
     mkdirSync(obsDir, { recursive: true });
-    return join(obsDir, EVENTS_FILENAME);
+    const realObs = realpathSync(obsDir);
+    if (!isWithinTree(realFeature, realObs)) throw new Error("observability directory escapes feature path");
+    const eventsPath = join(realObs, EVENTS_FILENAME);
+    if (existsSync(eventsPath) && !isWithinTree(realObs, realpathSync(eventsPath))) {
+      throw new Error("observability event log escapes feature path");
+    }
+    return eventsPath;
+  }
+
+  private assertEventsPathSafe(): void {
+    const projectRoot = realpathSync(resolve(this.cwd));
+    const realWorkState = realpathSync(resolve(this.cwd, ".work-state"));
+    const realFeatures = realpathSync(join(realWorkState, "features"));
+    const realFeature = realpathSync(join(realFeatures, this.featureSlug));
+    const realObs = realpathSync(dirname(this.eventsPath));
+    if (!isWithinTree(projectRoot, realWorkState) || !isWithinTree(realWorkState, realFeatures) || !isWithinTree(realFeatures, realFeature) || !isWithinTree(realFeature, realObs)) {
+      throw new Error("observability event path escapes project state");
+    }
+    if (existsSync(this.eventsPath) && !isWithinTree(realObs, realpathSync(this.eventsPath))) {
+      throw new Error("observability event log escapes feature path");
+    }
   }
 
   private relativePath(): string {
@@ -142,6 +189,7 @@ export class EventRecorder {
   }
 
   private async writeOne(event: ObservabilityEvent): Promise<void> {
+    this.assertEventsPathSafe();
     mkdirSync(dirname(this.eventsPath), { recursive: true });
     appendFileSync(this.eventsPath, JSON.stringify(event) + "\n", "utf8");
   }

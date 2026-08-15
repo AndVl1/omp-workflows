@@ -13,9 +13,9 @@
  * the engine's notion of the "active feature".
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { execSync } from "node:child_process";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { EventRecorder } from "./recorder.js";
 import { extractSkills } from "./skills.js";
 import type { ObservabilityEvent, EventKind } from "./events.js";
@@ -48,12 +48,19 @@ function currentBranch(cwd: string): string {
  * always has a place to write.
  */
 function activeFeatureSlug(cwd: string): string {
-  const active = resolve(cwd, WORK_STATE_DIR, ACTIVE_FEATURE);
-  if (existsSync(active)) {
+  const workState = resolve(cwd, WORK_STATE_DIR);
+  const active = resolve(workState, ACTIVE_FEATURE);
+  if (!existsSync(active)) return "default";
+  try {
+    const realRoot = realpathSync(workState);
+    const realPointer = realpathSync(active);
+    const rel = relative(realRoot, realPointer);
+    if (rel !== ACTIVE_FEATURE && (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel))) return "default";
     const slug = readFileSync(active, "utf8").trim();
-    if (slug) return slug;
+    return /^[A-Za-z0-9._-]+$/.test(slug) ? slug : "default";
+  } catch {
+    return "default";
   }
-  return "default";
 }
 
 const recorderCache = new Map<string, EventRecorder>();
@@ -82,7 +89,9 @@ function safeAppend(
   cwd: string,
   ev: Omit<ObservabilityEvent, "id" | "branch"> & { kind: EventKind },
 ): void {
-  try { getRecorder(cwd).append(ev); } catch { /* telemetry is best effort */ }
+  try {
+    void getRecorder(cwd).append(ev).catch(() => { /* telemetry is best effort */ });
+  } catch { /* telemetry is best effort */ }
 }
 
 export function recordToolCallAttempt(

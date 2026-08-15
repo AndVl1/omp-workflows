@@ -21,7 +21,7 @@
 
 import { buildDispatchMarker } from "../gates/dispatch.js";
 import { execSync } from "node:child_process";
-import { readArtifact } from "./artifacts.js";
+import { persistReturnedArtifacts, readArtifact } from "./artifacts.js";
 import { resolveConfig } from "./config.js";
 import { resolveScope, applyConditional, shouldSkip, type ScopeFlags } from "./scope.js";
 import { checkArtifact as validationCheckArtifact, validationGate } from "../gates/validation.js";
@@ -38,7 +38,16 @@ export interface StageContext {
   pause: (reason: string) => Promise<void>;
   log: (line: string) => void;
   resolveDevAgent: () => string | null;
+  /** Let the owning main session execute an inline orchestrator stage. */
+  orchestrate?: (args: {
+    stage: StageDef;
+    prompt: string;
+    cwd: string;
+    artifactsDir: string;
+    state: TeamState;
+  }) => Promise<OrchestratorResult | void> | OrchestratorResult | void;
   onStageStart?: (stageId: string) => void;
+  onStageComplete?: (stageId: string, status: StageOutcome["status"]) => void;
   /** Present when strict durable execution is armed. */
   durable?: {
     authorize: (role: string, agent: string) => { ok: true; dispatchId: string } | { ok: false; error: string };
@@ -53,13 +62,22 @@ export interface StageContext {
  * the call site (see `packages/fullstack/commands/team/index.ts`). The
  * structural shape below is the only contract the engine depends on.
  */
+export interface OrchestratorResult {
+  output?: string;
+  artifacts?: Record<string, unknown>;
+}
+
 export interface TaskToolLike {
-	execute(
-		toolCallId: string,
-		params: Record<string, unknown>,
-		signal?: AbortSignal,
-		onUpdate?: (result: unknown) => void,
-	): Promise<{ output: unknown }>;
+  execute(
+    toolCallId: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+    onUpdate?: (result: unknown) => void,
+  ): Promise<{
+    output?: unknown;
+    content?: Array<{ type?: string; text?: string }>;
+    details?: unknown;
+  }>;
 }
 
 /**
@@ -79,77 +97,119 @@ export interface TaskCaller {
 		effort?: "lo" | "med" | "hi";
 	}): Promise<TaskResult>;
 
-	/**
-	 * Spawn N subagents in parallel. Wire shape: `{ context, tasks[] }`. Each
-	 * item carries `{ name?, agent, task, effort? }`.
-	 */
-	batch(args: {
-		context: string;
-		tasks: Array<{
-			name?: string;
-			agent: string;
-			task: string;
-			effort?: "lo" | "med" | "hi";
-		}>;
-	}): Promise<TaskResult[]>;
+  /**
+   * Spawn N subagents in parallel. Wire shape: `{ context, tasks[] }`. Each
+   * item carries `{ name?, agent, task, effort? }`.
+   */
+  batch(args: {
+    context: string;
+    tasks: Array<{
+      name?: string;
+      agent: string;
+      task: string;
+      effort?: "lo" | "med" | "hi";
+    }>;
+  }): Promise<TaskResult[]>;
 }
 
 export interface TaskResult {
-	id: string;
-	output: string;
-	artifacts: Record<string, string>;
-	exitCode: number;
-	error?: string;
+  id: string;
+  output: string;
+  artifacts: Record<string, string>;
+  exitCode: number;
+  error?: string;
+  pending?: boolean;
 }
 
 /**
- * Validated single-spawn result. We only promise to read five fields;
- * anything else in the `TaskTool` output is ignored. Batch results arrive
- * as `{ results: SingleSpawnPayload[] }` at the top level; the caller
- * unpacks that separately.
+ * Normalized task-tool payload. Native OMP results expose these fields under
+ * `details.results`; the legacy adapter shape puts one payload under `output`.
  */
 interface SingleSpawnPayload {
-	id?: string;
-	output?: string;
-	artifacts?: Record<string, string>;
-	exitCode?: number;
-	error?: string;
+  id?: string;
+  output?: string;
+  artifacts?: Record<string, string>;
+  exitCode?: number;
+  error?: string;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
+  return typeof value === "object" && value !== null;
+}
+
+function contentText(value: unknown): string {
+  if (!isObject(value) || !Array.isArray(value.content)) return "";
+  return value.content
+    .map((part) => isObject(part) && typeof part.text === "string" ? part.text : "")
+    .filter(Boolean)
+    .join("\n");
+}
+
+function taskDetails(value: unknown): Record<string, unknown> | null {
+  if (!isObject(value) || !isObject(value.details)) return null;
+  return value.details;
+}
+
+function taskResultRows(value: unknown): unknown[] {
+  const details = taskDetails(value);
+  if (details && Array.isArray(details.results)) return details.results;
+  if (isObject(value) && isObject(value.output) && Array.isArray(value.output.results)) {
+    return value.output.results;
+  }
+  return [];
+}
+
+function taskIsPending(value: unknown): boolean {
+  const asyncState = taskDetails(value)?.async;
+  return isObject(asyncState) && asyncState.state === "running";
 }
 
 function readSingleSpawn(raw: unknown): SingleSpawnPayload {
-	if (!isObject(raw)) return {};
-	const id = typeof raw.id === "string" ? raw.id : undefined;
-	const output = typeof raw.output === "string" ? raw.output : undefined;
-	const exitCode = typeof raw.exitCode === "number" ? raw.exitCode : undefined;
-	const error = typeof raw.error === "string" ? raw.error : undefined;
-	let artifacts: Record<string, string> | undefined;
-	if (isObject(raw.artifacts) && Object.values(raw.artifacts).every((v) => typeof v === "string")) {
-		artifacts = Object.fromEntries(Object.entries(raw.artifacts)) as Record<string, string>;
-	}
-	return { id, output, artifacts, exitCode, error };
+  if (!isObject(raw)) return {};
+  const id = typeof raw.id === "string" ? raw.id : undefined;
+  const output = typeof raw.output === "string" ? raw.output : undefined;
+  const exitCode = typeof raw.exitCode === "number" ? raw.exitCode : undefined;
+  const error = typeof raw.error === "string" ? raw.error : undefined;
+  let artifacts: Record<string, string> | undefined;
+  if (isObject(raw.artifacts) && Object.values(raw.artifacts).every((v) => typeof v === "string")) {
+    artifacts = Object.fromEntries(Object.entries(raw.artifacts)) as Record<string, string>;
+  }
+  return { id, output, artifacts, exitCode, error };
 }
 
-function extractResult(raw: { output: unknown }, newId: () => string): TaskResult {
-	if (isObject(raw.output)) {
-		const r = readSingleSpawn(raw.output);
-		return {
-			id: r.id ?? newId(),
-			output: r.output ?? JSON.stringify(raw.output),
-			artifacts: r.artifacts ?? {},
-			exitCode: r.exitCode ?? 0,
-			error: r.error,
-		};
-	}
-	return {
-		id: newId(),
-		output: typeof raw.output === "string" ? raw.output : "",
-		artifacts: {},
-		exitCode: 0,
-	};
+function extractPayload(raw: unknown, newId: () => string): TaskResult {
+  const value = isObject(raw) && "output" in raw && !("id" in raw || "exitCode" in raw || "artifacts" in raw || "error" in raw)
+    ? raw.output
+    : raw;
+  if (isObject(value)) {
+    const r = readSingleSpawn(value);
+    return {
+      id: r.id ?? newId(),
+      output: r.output ?? JSON.stringify(value),
+      artifacts: r.artifacts ?? {},
+      exitCode: r.exitCode ?? 0,
+      error: r.error,
+    };
+  }
+  return {
+    id: newId(),
+    output: typeof value === "string" ? value : "",
+    artifacts: {},
+    exitCode: 0,
+  };
+}
+
+function extractResult(raw: unknown, newId: () => string): TaskResult {
+  const rows = taskResultRows(raw);
+  const result = extractPayload(rows[0] ?? raw, newId);
+  if (taskIsPending(raw)) {
+    return { ...result, pending: true, exitCode: 1, error: "task remains asynchronous" };
+  }
+  if (rows.length === 0 && result.output === "") {
+    const text = contentText(raw);
+    if (text) return { ...result, output: text };
+  }
+  return result;
 }
 
 /**
@@ -184,9 +244,10 @@ export function createTaskCaller(tool: TaskToolLike): TaskCaller {
 				}),
 			};
 			const result = await tool.execute(newId(), params);
-			const root = isObject(result.output) ? result.output : {};
-			const results = Array.isArray(root.results) ? root.results : [];
-			return results.map((r) => extractResult({ output: r }, newId));
+			const results = taskResultRows(result);
+			if (results.length > 0) return results.map((r) => extractPayload(r, newId));
+			if (taskIsPending(result)) return [];
+			return [];
 		},
 	};
 }
@@ -240,50 +301,123 @@ export async function runStage(
 }
 
 async function runOrchestrator(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
-  // Inline orchestration is intentionally valid when it emits no artifacts. When
-  // a profile declares outputs, however, the stage must leave every artifact on
-  // disk before it can be reported as done, just like subagent stages.
   ctx.log(`  orchestrator: ${stage.produces?.toString() ?? "none"}`);
-  return validateProduced(stage, ctx, produces, "orchestrator stage (inline)");
+  if (ctx.orchestrate) {
+    try {
+      const result = await ctx.orchestrate({
+        stage,
+        prompt: buildStagePrompt(stage, ctx, "orchestrator"),
+        cwd: ctx.cwd,
+        artifactsDir: ctx.artifactsDir,
+        state: ctx.state,
+      });
+      if (result?.artifacts) persistReturnedArtifacts(ctx.artifactsDir, result.artifacts);
+      return validateProduced(stage, ctx, produces, result?.output?.trim() || "orchestrator stage completed");
+    } catch (error) {
+      return { stageId: stage.id, status: "failed", note: `orchestrator stage failed: ${String(error)}`, artifacts: produces };
+    }
+  }
+  if (produces.length > 0) {
+    return {
+      stageId: stage.id,
+      status: "failed",
+      note: "orchestrator stage declares artifacts but no orchestrate callback is configured",
+      artifacts: produces,
+    };
+  }
+  return validateProduced(stage, ctx, [], "orchestrator stage (inline)");
+}
+
+function persistTaskArtifacts(ctx: StageContext, result: TaskResult): { ids: string[]; error?: string } {
+  try {
+    return { ids: persistReturnedArtifacts(ctx.artifactsDir, result.artifacts ?? {}) };
+  } catch (error) {
+    return { ids: [], error: String(error) };
+  }
+}
+function failAuthorizedDispatches(
+  ctx: StageContext,
+  authorized: Array<{ ok: true; dispatchId: string } | { ok: false; error: string }>,
+  evidence: string,
+): void {
+  if (!ctx.durable) return;
+  for (const entry of authorized) {
+    if (!entry.ok) continue;
+    const completed = ctx.durable.complete(entry.dispatchId, evidence, "failed");
+    if (!completed.ok) ctx.log(`  durable cleanup failed for ${entry.dispatchId}: ${completed.error}`);
+  }
+}
+
+function taskEvidence(result: TaskResult, outcome: "succeeded" | "failed"): string {
+  return result.output.trim() || result.error?.trim() || (outcome === "failed" ? "task failed" : "task completed");
 }
 
 async function runSingle(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
-  const role = stage.role ? expandRole(stage.role, ctx) : "";
+  const role = resolveStageDispatchRoles(stage, ctx)[0] ?? "";
   if (!role) return { stageId: stage.id, status: "failed", note: "single stage missing role", artifacts: [] };
   const agent = ctx.agent(role);
   const task = buildStagePrompt(stage, ctx, role);
   ctx.log(`  single: ${agent} (role=${role})`);
   const authorized = ctx.durable?.authorize(role, agent);
   if (authorized && !authorized.ok) return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${authorized.error}`, artifacts: produces };
-  const result = await ctx.task.call({ agent, task });
-  const outcome = result.exitCode === 0 ? "succeeded" : "failed";
+  let result: TaskResult;
+  try {
+    result = await ctx.task.call({ agent, task });
+  } catch (error) {
+    if (authorized?.ok) failAuthorizedDispatches(ctx, [authorized], `task call failed: ${String(error)}`);
+    return { stageId: stage.id, status: "failed", note: `${agent} task call failed: ${String(error)}`, artifacts: produces };
+  }
+  const persisted = persistTaskArtifacts(ctx, result);
+  const outcome = result.exitCode === 0 && !result.pending && !persisted.error ? "succeeded" : "failed";
   if (authorized) {
-    const completed = ctx.durable!.complete(authorized.dispatchId, result.output, outcome, Object.keys(result.artifacts));
+    const completed = ctx.durable!.complete(authorized.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids);
     if (!completed.ok) return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
   }
-  if (result.exitCode !== 0) return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} returned exit ${result.exitCode}`, artifacts: produces };
+  if (persisted.error) return { stageId: stage.id, status: "failed", note: persisted.error, artifacts: produces };
+  if (result.exitCode !== 0 || result.pending) return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} returned exit ${result.exitCode}`, artifacts: produces };
   return validateProduced(stage, ctx, produces, `${agent} returned exit 0`);
 }
 
 async function runConsilium(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
-  const baseRoles = stage.roles ?? [];
-  const roster = applyConditional(baseRoles, stage.conditional, ctx.flags);
-  const overridden = applyRosterOverrides(roster, ctx.cwd, stage.id);
-  ctx.log(`  consilium: ${overridden.join(", ")}`);
-  const tasks = overridden.map((role) => ({ name: `${stage.id}-${role}`, agent: ctx.agent(role), task: buildStagePrompt(stage, ctx, role) }));
-  const authorized = ctx.durable ? overridden.map((role, i) => ctx.durable!.authorize(role, tasks[i]!.agent)) : [];
+  const roster = resolveStageDispatchRoles(stage, ctx);
+  if (roster.length === 0) return { stageId: stage.id, status: "failed", note: "consilium stage resolved to an empty roster", artifacts: produces };
+  ctx.log(`  consilium: ${roster.join(", ")}`);
+  const tasks = roster.map((role) => ({ name: `${stage.id}-${role}`, agent: ctx.agent(role), task: buildStagePrompt(stage, ctx, role) }));
+  const authorized = ctx.durable ? roster.map((role, i) => ctx.durable!.authorize(role, tasks[i]!.agent)) : [];
   const denied = authorized.find((a) => !a.ok);
-  if (denied && !denied.ok) return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${denied.error}`, artifacts: produces };
-  const results = await ctx.task.batch({ context: `Parallel agents for stage "${stage.id}" (${stage.title}). Each of you gathers its own context.`, tasks });
+  if (denied && !denied.ok) {
+    failAuthorizedDispatches(ctx, authorized, `dispatch authorization failed: ${denied.error}`);
+    return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${denied.error}`, artifacts: produces };
+  }
+  let results: TaskResult[];
+  try {
+    results = await ctx.task.batch({ context: `Parallel agents for stage "${stage.id}" (${stage.title}). Each of you gathers its own context.`, tasks });
+  } catch (error) {
+    failAuthorizedDispatches(ctx, authorized, `task batch failed: ${String(error)}`);
+    return { stageId: stage.id, status: "failed", note: `task batch failed: ${String(error)}`, artifacts: produces };
+  }
+  if (results.length !== tasks.length) {
+    failAuthorizedDispatches(ctx, authorized, `task batch returned ${results.length}/${tasks.length} results`);
+    return { stageId: stage.id, status: "failed", note: `task batch returned ${results.length}/${tasks.length} results`, artifacts: produces };
+  }
   for (let i = 0; i < results.length; i++) {
     const auth = authorized[i];
     if (auth?.ok) {
       const result = results[i]!;
-      const completed = ctx.durable!.complete(auth.dispatchId, result.output, result.exitCode === 0 ? "succeeded" : "failed", Object.keys(result.artifacts));
-      if (!completed.ok) return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
+      const persisted = persistTaskArtifacts(ctx, result);
+      const outcome = result.exitCode === 0 && !result.pending && !persisted.error ? "succeeded" : "failed";
+      const completed = ctx.durable!.complete(auth.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids);
+      if (!completed.ok) {
+        failAuthorizedDispatches(ctx, authorized.slice(i), `dispatch completion failed: ${completed.error}`);
+        return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
+      }
+      if (persisted.error) {
+        failAuthorizedDispatches(ctx, authorized.slice(i + 1), persisted.error);
+        return { stageId: stage.id, status: "failed", note: persisted.error, artifacts: produces };
+      }
     }
   }
-  const failed = results.filter((r) => r.exitCode !== 0);
+  const failed = results.filter((r) => r.exitCode !== 0 || r.pending);
   if (failed.length > 0) return { stageId: stage.id, status: "failed", note: `${failed.length}/${tasks.length} failed`, artifacts: produces };
   return validateProduced(stage, ctx, produces, `${tasks.length} agents in parallel`);
 }
@@ -298,7 +432,7 @@ async function runBash(stage: StageDef, ctx: StageContext, produces: string[]): 
   }
   try {
     execSync(cmd, { cwd: ctx.cwd, stdio: "inherit" });
-    return { stageId: stage.id, status: "done", note: cmd, artifacts: produces };
+    return validateProduced(stage, ctx, produces, cmd);
   } catch (e) {
     return { stageId: stage.id, status: "failed", note: String(e), artifacts: produces };
   }
@@ -366,7 +500,10 @@ function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string): str
     ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
     : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
   const dispatchMarker = stage.type === "single" || stage.type === "consilium"
-    ? buildDispatchMarker(ctx.state.branch, stage)
+    ? buildDispatchMarker(ctx.state.run_key ?? ctx.state.branch, stage, resolveStageDispatchRoles(stage, ctx), role, ctx.state.cursor_epoch ?? stage.id)
+    : "";
+  const durableBinding = dispatchMarker
+    ? `run_key=${ctx.state.run_key ?? ctx.state.branch} branch=${ctx.state.branch} workflow=${ctx.state.classification.workflow} profile_hash=${ctx.state.profile_hash ?? ""} stage_cursor=${stage.id} cursor_epoch=${ctx.state.cursor_epoch ?? ""}`
     : "";
   return `## Stage: ${stage.id} — ${stage.title}
 ${stage.description ?? ""}
@@ -374,11 +511,13 @@ ${stage.description ?? ""}
 Branch: ${ctx.state.branch}
 Classification: ${ctx.state.classification.type}/${ctx.state.classification.complexity} (workflow=${ctx.state.classification.workflow})
 Workflow role: ${role}
-
 ${roleHint}
 
 ### Dispatch contract
 ${dispatchMarker || "No task dispatch is permitted for this stage."}
+
+### Durable binding
+${durableBinding || "No durable dispatch binding is active."}
 
 ### Task
 ${ctx.state.task}
@@ -387,7 +526,7 @@ ${ctx.state.task}
 ${stage.prompt ?? "Follow the stage title and produce the declared artifact from the task and prior artifacts."}
 
 ### Your job
-Execute this stage. Write your typed artifact to .work-state/artifacts/<id>.json matching the engine's schema (the engine reads only JSON, not prose).
+Execute this stage. Write your typed artifact to ${ctx.artifactsDir}/<id>.json matching the engine's schema (the engine reads only JSON, not prose).
 
 Produces: ${produces}${readsBlock}
 
@@ -397,12 +536,24 @@ ${roleHint}
 }
 
 function isOrchestratorRole(role: string): boolean {
-  // Orchestrator roles are the ones the engine marks as "inline" — they
-  // Discovery is a read-only dispatcher; all other orchestration belongs to CTO.
-  return role === "discovery";
+  // Orchestrator roles are the ones the engine marks as inline; all other
+  // roles are executors.
+  return role === "discovery" || role === "orchestrator";
 }
 
-function expandRole(role: string, ctx: StageContext): string {
+export function resolveStageDispatchRoles(
+  stage: StageDef,
+  ctx: Pick<StageContext, "flags" | "cwd" | "resolveDevAgent">,
+): string[] {
+  const base = stage.type === "single" ? [stage.role ?? ""] : stage.roles ?? [];
+  const expanded = base.map((role) => expandRole(role, ctx));
+  const conditioned = stage.type === "consilium"
+    ? applyConditional(expanded, stage.conditional, ctx.flags)
+    : expanded;
+  return applyRosterOverrides(conditioned, ctx.cwd, stage.id).map((role) => expandRole(role, ctx));
+}
+
+function expandRole(role: string, ctx: Pick<StageContext, "resolveDevAgent">): string {
   if (role === "${scope.dev_agent}") return ctx.resolveDevAgent() ?? "developer-kotlin";
   return role;
 }
@@ -435,6 +586,7 @@ export async function walkProfile(
         outcome = { ...outcome, status: "failed", note: `durable cursor advance failed: ${advanced.error}` };
       }
     }
+    ctx.onStageComplete?.(stage.id, outcome.status);
     outcomes.push(outcome);
     if (outcome.status === "failed") {
       ctx.log(`halting at stage ${stage.id}`);

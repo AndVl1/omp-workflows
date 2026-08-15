@@ -12,9 +12,9 @@
 
 import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import type { Escalation, EscalationAnswer } from "./types.js";
+import { ctoStateDir } from "./state.js";
 import { DEFAULT_REDACTION_CONFIG, redactEscalation } from "./redaction.js";
-
+import type { Escalation, EscalationAnswer } from "./types.js";
 const REQUIRED: Array<keyof Escalation> = ["id", "level", "title", "body"];
 const LEVELS: Record<string, true> = {
   question: true,
@@ -68,7 +68,7 @@ export function validateEscalation(esc: Escalation): string | null {
 
 /** Directory holding answer files for a CTO run. */
 export function answersDir(runId: string, root: string): string {
-  return join(root, ".work-state", "cto", runId, "answers");
+  return join(ctoStateDir(runId, root), "answers");
 }
 
 /** Read all answer files for a run (invalid JSON is skipped, never throws). */

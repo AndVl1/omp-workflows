@@ -24,7 +24,7 @@ export type WorkflowName =
 
 export type StageType = "orchestrator" | "single" | "consilium" | "bash" | "none" | "team";
 
-export type StageStatus = "pending" | "in_progress" | "done" | "skipped";
+export type StageStatus = "pending" | "in_progress" | "done" | "skipped" | "failed";
 
 export type PauseKind =
   | "none"
@@ -163,6 +163,7 @@ export interface JoinSummary {
   cursor_epoch: string;
   dispatch_ids: string[];
   roles: string[];
+  evidence?: string;
   joined_at: string;
 }
 
@@ -182,6 +183,15 @@ export interface TeamState {
   pause: { kind: PauseKind; reason: string };
   updated_at: string;
   policy?: { strict_orchestrator?: boolean };
+  /** Scope snapshot used to resolve conditional rosters across durable handoffs. */
+  scope?: {
+    scope: string[];
+    has_security: boolean;
+    has_infra: boolean;
+    has_ui: boolean;
+    has_runtime: boolean;
+    dev_agent: string | null;
+  };
   profile_hash?: string;
   cursor_epoch?: string;
   run_key?: string;

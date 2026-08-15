@@ -8,10 +8,40 @@
  * parses and matches the type name — but the schema is preserved for ref.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
+import { randomUUID } from "node:crypto";
 import { recordArtifactWritten } from "../observability/hooks.js";
 
+const ARTIFACT_ID_RE = /^[A-Za-z0-9._-]+$/;
+
+function assertArtifactId(id: string): void {
+  if (!ARTIFACT_ID_RE.test(id) || id === "." || id === "..") {
+    throw new Error(`unsafe artifact id: ${id}`);
+  }
+}
+
+function parseReturnedArtifact(id: string, value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    throw new Error(`artifact "${id}" is not valid JSON`);
+  }
+}
+
+export function persistReturnedArtifacts(
+  artifactsDir: string,
+  artifacts: Record<string, unknown>,
+): string[] {
+  const ids: string[] = [];
+  for (const [id, value] of Object.entries(artifacts)) {
+    assertArtifactId(id);
+    writeArtifact(artifactsDir, id, parseReturnedArtifact(id, value));
+    ids.push(id);
+  }
+  return ids;
+}
 export type ArtifactId =
   | "discovery"
   | "feature_spec"
@@ -26,16 +56,10 @@ export type ArtifactId =
   | "qa_tests"
   | "manual_qa"
   | "summary";
-
-export interface ArtifactResult<T> {
-  id: string;
-  path: string;
-  data: T;
-}
-
 export function readArtifact<T = unknown>(artifactsDir: string, id: string): T | null {
-  const path = join(artifactsDir, `${id}.json`);
-  if (!existsSync(path)) return null;
+  if (!ARTIFACT_ID_RE.test(id) || id === "." || id === "..") return null;
+  const path = safeArtifactPath(artifactsDir, id, false);
+  if (!path || !existsSync(path)) return null;
   try {
     return JSON.parse(readFileSync(path, "utf8")) as T;
   } catch {
@@ -44,10 +68,23 @@ export function readArtifact<T = unknown>(artifactsDir: string, id: string): T |
 }
 
 export function writeArtifact<T = unknown>(artifactsDir: string, id: string, data: T): string {
+  assertArtifactId(id);
   mkdirSync(artifactsDir, { recursive: true });
-  const path = join(artifactsDir, `${id}.json`);
+  const path = safeArtifactPath(artifactsDir, id, true);
+  if (!path) throw new Error(`unsafe artifact path: ${id}`);
   const body = JSON.stringify(data, null, 2) + "\n";
-  writeFileSync(path, body, "utf8");
+  const tempPath = join(artifactsDir, `.artifact.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(tempPath, body, "utf8");
+    renameSync(tempPath, path);
+  } catch (error) {
+    try {
+      if (existsSync(tempPath)) unlinkSync(tempPath);
+    } catch {
+      // Best-effort cleanup must not hide the original write error.
+    }
+    throw error;
+  }
   // Best-effort artifact_written telemetry (additive; never blocks the write).
   // The project root is derived from the `.work-state` segment of the
   // artifacts dir; dirs outside `.work-state` (e.g. scratch tests) skip it.
@@ -64,6 +101,28 @@ export function writeArtifact<T = unknown>(artifactsDir: string, id: string, dat
     }
   }
   return path;
+}
+
+function safeArtifactPath(artifactsDir: string, id: string, forWrite: boolean): string | null {
+  try {
+    if (!existsSync(artifactsDir)) return null;
+    const realRoot = realpathSync(artifactsDir);
+    const path = join(artifactsDir, `${id}.json`);
+    if (!existsSync(path)) {
+      if (!forWrite || !isWithinTree(realRoot, realpathSync(artifactsDir))) return null;
+      return path;
+    }
+    if (lstatSync(path).isSymbolicLink()) return null;
+    const realPath = realpathSync(path);
+    return isWithinTree(realRoot, realPath) ? path : null;
+  } catch {
+    return null;
+  }
+}
+
+function isWithinTree(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !rel.startsWith(sep));
 }
 
 /** Project root = path prefix ending at the `.work-state` segment, if any. */

@@ -18,11 +18,17 @@ test("fullstack: workflow tools register and fail closed with structured respons
     },
   } as never);
 
-  assert.deepEqual([...tools.keys()], ["workflow_instructions", "workflow_complete", "workflow_advance"]);
+  assert.deepEqual([...tools.keys()], ["workflow_begin", "workflow_status", "workflow_instructions", "workflow_complete", "workflow_advance"]);
   for (const name of tools.keys()) {
     assert.ok(tools.get(name)?.parameters, `${name} exposes a parameter schema`);
   }
 
+  const begin = tools.get("workflow_begin")!;
+  const workerBeginResult = await begin.execute("worker", {}, undefined, undefined, { cwd: process.cwd(), hasUI: false } as never);
+  assert.equal((workerBeginResult.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
+  const status = tools.get("workflow_status")!;
+  const beginResult = await begin.execute("test", {}, undefined, undefined, null);
+  const statusResult = await status.execute("test", {}, undefined, undefined, null);
   const complete = tools.get("workflow_complete")!;
   const advance = tools.get("workflow_advance")!;
   const completeResult = await complete.execute("test", {
@@ -41,11 +47,13 @@ test("fullstack: workflow tools register and fail closed with structured respons
     evidence: "evidence",
   }, undefined, undefined, null);
 
-  for (const response of [completeResult, advanceResult]) {
+  for (const response of [beginResult, statusResult, completeResult, advanceResult]) {
     assert.equal(response.details && typeof response.details, "object");
     assert.equal((response.details as { ok?: boolean }).ok, false);
     assert.match(response.content[0].text, /\"ok\":false/);
   }
+  assert.equal((beginResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
+  assert.equal((statusResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
   assert.equal((completeResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
   assert.equal((advanceResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
 });

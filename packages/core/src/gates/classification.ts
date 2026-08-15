@@ -26,6 +26,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { isRegisteredWorkflow, matchesProfile, resolveWorkflow } from "../engine/profile.js";
 import { monotonicGate } from "./monotonic.js";
+import { isSafeStateSegment, resolveState } from "../engine/state.js";
 import type { Classification, Complexity, TaskType } from "../engine/types.js";
 
 const WORK_STATE_DIR = ".work-state";
@@ -53,10 +54,12 @@ export function classificationToolGate(event: ToolCallEvent, ctx: AgentStartCont
   if (event.toolName !== "task") return;
   const wsDir = resolve(ctx.cwd, WORK_STATE_DIR);
   if (!existsSync(wsDir)) return;
-  // Other tools may use `.work-state/` without running the team workflow.
   const active = join(wsDir, ACTIVE_FEATURE);
   const legacy = join(wsDir, LEGACY_STATE);
   if (!existsSync(active) && !existsSync(legacy)) return;
+  if (resolveState(ctx.cwd).invalid) {
+    return { block: true, reason: "BLOCK (P5): workflow state is malformed or unsafe; refusing task launch." };
+  }
   if (!resolveStatePath(ctx.cwd)) {
     return { block: true, reason: "BLOCK (P5): classification state is missing. Complete PHASE 0, write .work-state/team-state.json, then launch agents." };
   }
@@ -121,7 +124,7 @@ function resolveStatePath(cwd: string): string | null {
   const active = join(wsDir, ".active-feature");
   if (existsSync(active)) {
     const slug = readFileSync(active, "utf8").trim();
-    if (slug) {
+    if (isSafeStateSegment(slug)) {
       const path = join(wsDir, "features", slug, "state.json");
       if (existsSync(path)) return path;
     }

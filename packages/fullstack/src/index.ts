@@ -27,8 +27,10 @@ import {
   defaultFullstackScopeMap,
   findActiveCtoRun,
   registerTeamWorkflow,
+  beginCapability,
   completeDispatch,
   advanceCursor,
+  resolveState,
   type DispatchAuth,
 } from "@andvl1/omp-workflows-core";
 import { registerWorkflowCommands } from "./workflow-commands.js";
@@ -155,19 +157,91 @@ export function isMainSessionContext(ctx: unknown): boolean {
 
 
 export function registerWorkflowTools(pi: ExtensionAPI): void {
+  // Older OMP/test runtimes may not expose the schema helper. Keep the
+  // extension loadable there; tool registration is available when zod exists.
+  if (!pi.zod) return;
   const { z } = pi.zod;
+  const emptyParameters = z.object({}) as never;
   type ToolResult = { content: [{ type: "text"; text: string }]; details: unknown };
   const result = (value: unknown): ToolResult => ({
     content: [{ type: "text", text: JSON.stringify(value) }],
     details: value,
   });
-  const emptyParameters = z.object({}) as never;
+  const contextError = (ctx: unknown): ToolResult | null =>
+    isMainSessionContext(ctx)
+      ? null
+      : result({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "workflow control tools are available only in the main session" });
+  const stateSummary = (cwd: string): unknown => {
+    const resolved = resolveState(cwd);
+    if (resolved.invalid) return { ok: false, code: "WORKFLOW_STATE_INVALID", error: "workflow state path is invalid or unsafe" };
+    if (!resolved.state) return { ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow state not found" };
+    const state = resolved.state;
+    const capability = state.dispatch_capability;
+    return {
+      ok: true,
+      branch: state.branch,
+      workflow: state.classification?.workflow,
+      stage_cursor: state.stage_cursor,
+      cursor_epoch: state.cursor_epoch,
+      stages: state.stages,
+      pause: state.pause,
+      join_summary: state.join_summary,
+      capability: capability ? {
+        capability_id: capability.capability_id,
+        kind: capability.kind,
+        status: capability.status,
+        expected_roles: capability.expected_roles,
+        dispatches: (capability.dispatches ?? []).map((dispatch) => ({
+          id: dispatch.id,
+          role: dispatch.role,
+          agent: dispatch.agent,
+          tool_call_id: dispatch.tool_call_id,
+          status: dispatch.status,
+          completed: Boolean(dispatch.completion),
+          outcome: dispatch.completion?.outcome,
+        })),
+      } : null,
+    };
+  };
+  pi.registerTool({
+    name: "workflow_begin",
+    label: "Begin workflow stage",
+    description: "Issue a durable opaque capability for the current workflow stage.",
+    parameters: emptyParameters,
+    async execute(_id, _params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      const cwd = resolveSessionCwd(ctx);
+      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      try {
+        const transition = beginCapability(cwd);
+        if (!transition.ok) return result({ ok: false, code: "WORKFLOW_BEGIN_REJECTED", error: transition.error, state: transition.state ? stateSummary(cwd) : undefined });
+        return result({ ok: true, transition: "begin", handoff: transition.handoff, state: stateSummary(cwd) });
+      } catch (error) {
+        return result({ ok: false, code: "WORKFLOW_BEGIN_FAILED", error: String(error) });
+      }
+    },
+  });
+  pi.registerTool({
+    name: "workflow_status",
+    label: "Workflow status",
+    description: "Read the current durable workflow stage and dispatch status.",
+    parameters: emptyParameters,
+    async execute(_id, _params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      const cwd = resolveSessionCwd(ctx);
+      return result(cwd ? stateSummary(cwd) : { ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+    },
+  });
   pi.registerTool({
     name: "workflow_instructions",
     label: "Workflow instructions",
     description: "Read the current structured workflow stage contract.",
     parameters: emptyParameters,
     async execute(_id, _params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
       try {
         const contract = resolveWorkflowContract(resolveSessionCwd(ctx) ?? process.cwd());
         return result(contract);
@@ -182,11 +256,13 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
     description: "Record durable completion for an authorized workflow dispatch.",
     parameters: z.object({
       dispatch_id: z.string().min(1), token: z.string().min(1), capability_id: z.string().min(1),
-      run_key: z.string().min(1), cursor_epoch: z.string().min(1), evidence: z.string().min(1),
+      run_key: z.string().min(1), branch: z.string().min(1), workflow: z.string().min(1), profile_hash: z.string().min(1), stage_cursor: z.string().min(1), cursor_epoch: z.string().min(1), evidence: z.string().min(1),
       artifact_ids: z.array(z.string().min(1)).default([]),
       outcome: z.enum(["succeeded", "failed", "cancelled"]).default("succeeded"),
     }) as never,
     async execute(_id, params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
       const cwd = resolveSessionCwd(ctx);
       if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
       const input = params as DispatchAuth & { dispatch_id: string; evidence: string; artifact_ids?: string[]; outcome: "succeeded" | "failed" | "cancelled" };
@@ -200,14 +276,16 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
     name: "workflow_advance",
     label: "Advance workflow",
     description: "Join the current stage and advance its durable cursor after all dispatches complete.",
-    parameters: z.object({ token: z.string().min(1), capability_id: z.string().min(1), run_key: z.string().min(1), cursor_epoch: z.string().min(1), evidence: z.string().min(1) }) as never,
+    parameters: z.object({ token: z.string().min(1), capability_id: z.string().min(1), run_key: z.string().min(1), branch: z.string().min(1), workflow: z.string().min(1), profile_hash: z.string().min(1), stage_cursor: z.string().min(1), cursor_epoch: z.string().min(1), evidence: z.string().min(1) }) as never,
     async execute(_id, params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
       const cwd = resolveSessionCwd(ctx);
       if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      const input = params as { token: string; capability_id: string; run_key: string; cursor_epoch: string; evidence: string };
+      const input = params as DispatchAuth & { evidence: string };
       try {
         const transition = advanceCursor(cwd, input);
-        return transition.ok ? result({ ok: true, transition: "advance", stage_cursor: transition.state.stage_cursor, cursor_epoch: transition.state.cursor_epoch, state: transition.state }) : result({ ok: false, code: "WORKFLOW_ADVANCE_REJECTED", error: transition.error });
+        return transition.ok ? result({ ok: true, transition: "advance", stage_cursor: transition.state.stage_cursor, cursor_epoch: transition.state.cursor_epoch, handoff: transition.handoff, state: stateSummary(cwd) }) : result({ ok: false, code: "WORKFLOW_ADVANCE_REJECTED", error: transition.error });
       } catch (error) { return result({ ok: false, code: "WORKFLOW_ADVANCE_FAILED", error: String(error) }); }
     },
   });

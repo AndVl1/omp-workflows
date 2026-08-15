@@ -122,3 +122,69 @@ test("core: createTaskCaller normalises non-object output to a string", async ()
 	assert.equal(result.output, "raw text response");
 	assert.equal(result.exitCode, 0);
 });
+
+test("core: createTaskCaller reads native TaskTool details results", async () => {
+  const fakeTool: TaskToolLike = {
+    async execute() {
+      return {
+        content: [{ type: "text", text: "tool summary" }],
+        details: {
+          async: { state: "completed" },
+          results: [{
+            id: "native-1",
+            output: "native output",
+            artifacts: { report: "{\"ok\":true}" },
+            exitCode: 0,
+          }],
+        },
+      };
+    },
+  };
+
+  const result = await createTaskCaller(fakeTool).call({ agent: "qa", task: "inspect" });
+  assert.equal(result.id, "native-1");
+  assert.equal(result.output, "native output");
+  assert.deepEqual(result.artifacts, { report: "{\"ok\":true}" });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.error, undefined);
+});
+
+test("core: createTaskCaller rejects an asynchronous TaskTool result as pending", async () => {
+  const fakeTool: TaskToolLike = {
+    async execute() {
+      return { details: { async: { state: "running" } } };
+    },
+  };
+
+  const result = await createTaskCaller(fakeTool).call({ agent: "qa", task: "inspect" });
+  assert.equal(result.pending, true);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.error ?? "", /asynchronous/);
+});
+
+test("core: createTaskCaller maps native batch details", async () => {
+  const fakeTool: TaskToolLike = {
+    async execute() {
+      return {
+        details: {
+          results: [
+            { id: "native-a", output: "a", artifacts: {}, exitCode: 0 },
+            { id: "native-b", output: "b", artifacts: {}, exitCode: 2, error: "failed" },
+          ],
+        },
+      };
+    },
+  };
+
+  const results = await createTaskCaller(fakeTool).batch({
+    context: "review",
+    tasks: [
+      { agent: "qa", task: "check a" },
+      { agent: "security-tester", task: "check b" },
+    ],
+  });
+  assert.deepEqual(results.map((result) => [result.id, result.output, result.exitCode, result.error]), [
+    ["native-a", "a", 0, undefined],
+    ["native-b", "b", 2, "failed"],
+  ]);
+});
