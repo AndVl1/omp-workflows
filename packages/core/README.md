@@ -116,7 +116,7 @@ The engine surface is also available directly:
 
 ## Workflows
 
-`workflows/*.json` ships with the package: 8 profiles (`full-feature`, `standard`, `lightweight`, `debug-cycle`, `bug-fix`, `emergency`, `research`, `review`) plus the typed artifact schema. Bundles can ship their own profiles by replacing or extending; the engine reads them from the package's `workflows/` directory.
+`workflows/*.json` ships with the package: 11 profiles (`full-feature`, `standard`, `lightweight`, `debug-cycle`, `bug-fix`, `emergency`, `research`, `review`, `spec-preparation`, `feature-regression`, `cto`) plus the typed artifact schema. Bundles can ship their own profiles by replacing or extending; the engine reads them from the package's `workflows/` directory.
 
 ## Build
 
