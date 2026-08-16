@@ -2,6 +2,13 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.21.0] — 2026-08-15
+### Added
+- **Strict workflow control plane** — durable dispatch capabilities, typed workflow contracts, runtime boundary gates, and artifact-backed stage validation now enforce the persisted workflow cursor and resolved agent roster.
+- **Branch-safe continuation and observability** — workflow state transitions, handoffs, and append-only session telemetry preserve authoritative progress across resumptions and control-plane turns.
+### Fixed
+- **Control-plane authorization and state safety** — malformed state, stale branches, unsafe feature paths, tokenless completion replay, worker writes to canonical state, and completed-capability reuse now fail closed.
+
 ## [0.20.5] — 2026-08-12
 ### Fixed
 - **Extension-owned workflow command discovery** — core now exposes a synchronous `/do-work`, `/team`, and `/cto` registrar for consumer bundles. Commands register during extension load, before OMP snapshots slash suggestions, so fresh sessions no longer depend on project-local `.omp/commands` imports or consumer `node_modules` resolution.
