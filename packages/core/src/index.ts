@@ -17,7 +17,9 @@
  *   }
  */
 
-import type { ExtensionAPI, BeforeAgentStartEvent, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
+import { orchestratorWriteGate } from "./gates/orchestrator-write.js";
+import { dispatchGate, trustedDispatchRequests } from "./gates/dispatch.js";
+import type { ExtensionAPI, BeforeAgentStartEvent, SessionStopEvent, ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
 import { classificationGate, classificationToolGate } from "./gates/classification.js";
 import { monotonicGate } from "./gates/monotonic.js";
 import { dodBackstop } from "./gates/dod-backstop.js";
@@ -25,7 +27,8 @@ import { safetyGuard } from "./gates/safety.js";
 import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { outboxEnforcementGate } from "./gates/outbox.js";
 import { ctoSliceTaskGate } from "./cto/slice-gate.js";
-import { registerObservabilityHooks } from "./observability/index.js";
+import { registerObservabilityHooks, recordToolCallAttempt } from "./observability/index.js";
+import { authorizeDispatchTrusted, reconcileTrustedTaskResult } from "./engine/durable.js";
 import { registerWorkflowProfiles } from "./engine/profile.js";
 import type { RoleConfig } from "./engine/types.js";
 export interface RegisterOptions {
@@ -123,7 +126,6 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 
 	writeRuntimeConfig(opts);
 
-	// ── Gates ────────────────────────────────────────────────────────────────
 	// @ts-expect-error -- ExtensionAPI.on(string, handler) overload is enough at runtime; we type the handler explicitly.
 	pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx: unknown) => {
 		const c = ctx as { cwd: string };
@@ -136,28 +138,69 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 		const c = ctx as { cwd: string };
 		return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], c);
 	});
-	pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
-		const c = ctx as { cwd: string };
-		const nestedCto = ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]);
-		if (nestedCto?.block) return nestedCto;
-		const outboxGate = outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], c);
-		if (outboxGate?.block) return outboxGate;
-		const r0 = classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c);
-		if (r0?.block) return r0;
-		// CTO slice dispatch gate: after classification, before safety. No
-		// marker → block when an active CTO wave exists (fail-closed), else
-		// allow; marker + invalid canonical state → block. ctoNestingGuard
-		// above stays first and untouched.
-		const rSlice = ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c);
-		if (rSlice?.block) return rSlice;
-		return safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c);
-	});
+  pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
+    const c = ctx as { cwd: string; hasUI?: boolean; actor?: "orchestrator" | "worker" | "lead" };
+    let result: { block?: boolean; reason?: string } | undefined;
+    const run = (candidate: { block?: boolean; reason?: string } | void) => { if (!result && candidate?.block) result = candidate; };
+    run(ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]));
+    run(outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], c));
+    run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c));
+    run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], c));
+    run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c));
+    run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c));
+    run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], c));
+    if (!result && event.toolName === "task") {
+      const authorization = trustedDispatchRequests(
+        event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
+        c,
+      );
+      if (!authorization.ok) {
+        run({ block: true, reason: authorization.reason });
+      } else {
+        for (const request of authorization.requests) {
+          const authorized = authorizeDispatchTrusted(c.cwd, request);
+          if (!authorized.ok) {
+            run({ block: true, reason: `dispatch authorization failed: ${authorized.error}` });
+            break;
+          }
+        }
+      }
+    }
+    if (opts.observability !== false) recordToolCallAttempt(c.cwd, event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }, result ? "blocked" : "allowed", result?.reason);
+
+    return result;
+  });
+  // Native task results are the trusted completion signal for synchronous
+  // calls. Async task jobs remain pending until the workflow_complete tool
+  // receives their explicit result/evidence binding.
+  pi.on("tool_result", (event: ToolResultEvent, ctx: unknown) => {
+    if (event.toolName !== "task") return;
+    const c = ctx as { cwd?: string };
+    if (!c.cwd) return;
+    const details = (event as unknown as { details?: { async?: { state?: string } } }).details;
+    const asyncState = details?.async?.state;
+    if (asyncState === "running" || asyncState === "spawned" || asyncState === "scheduled") return;
+    const content = event.content
+      .filter((part): part is { type: "text"; text: string } => part.type === "text")
+      .map((part) => part.text)
+      .join("\n")
+      .trim();
+    const evidence = content || (event.isError ? "native task failed" : "native task completed");
+    const reconciled = reconcileTrustedTaskResult(c.cwd, {
+      tool_call_id: event.toolCallId,
+      outcome: event.isError ? "failed" : "succeeded",
+      evidence,
+    });
+    if (!reconciled.ok && !reconciled.error.includes("unknown or already reconciled")) {
+      console.warn(`omp workflow task reconciliation failed: ${reconciled.error}`);
+    }
+  });
 
 	// ── Observability ────────────────────────────────────────────────────────
 	// Wire telemetry hooks AFTER gates so a blocked agent_start still emits
 	// the event (operators want to see *why* the gate fired). The recorder
 	// is best-effort; never throws.
-	registerObservabilityHooks(pi, { enabled: opts.observability });
+	registerObservabilityHooks(pi, { enabled: opts.observability, toolCall: false });
 }
 
 function writeRuntimeConfig(opts: RegisterOptions): void {
@@ -179,6 +222,7 @@ function writeRuntimeConfig(opts: RegisterOptions): void {
   }
 }
 export { teamCommand } from "./commands/team.js";
+export { dispatchGate, buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests, type DispatchAuthorizationRequest } from "./gates/dispatch.js";
 export {
   findProfileDir,
   resolveWorkflowProfilePath,
@@ -190,6 +234,29 @@ export {
   resolveWorkflow,
   selectProfile,
 } from "./engine/profile.js";
+export {
+  hashDispatchSecret,
+  createCapability,
+  beginCapability,
+  authorizeDispatch,
+  authorizeDispatchTrusted,
+  completeDispatch,
+  reconcileTrustedTaskResult,
+  advanceCursor,
+  reconcileTaskResult,
+  type DispatchAuth,
+  type TrustedDispatchInput,
+  type CapabilityHandoff,
+  type TransitionResult,
+} from "./engine/durable.js";
+export {
+  resolveWorkflowContract,
+  resolveStageInstructions,
+  WorkflowContractError,
+  type WorkflowContract,
+  type WorkflowContractOptions,
+  type WorkflowStageContract,
+} from "./engine/workflow-contract.js";
 export { resolveConfig } from "./engine/config.js";
 export { resolveScope, applyConditional, shouldSkip } from "./engine/scope.js";
 export {
@@ -198,11 +265,15 @@ export {
   setPause,
   checkMonotonic,
   resolveState,
+  resolveCanonicalRun,
+  type ResolvedActiveRun,
+  type StateSelector,
   reopenFromFeedback,
 } from "./engine/state.js";
 export {
-	writeArtifact,
-	readArtifact,
+  writeArtifact,
+  readArtifact,
+  persistReturnedArtifacts,
 } from "./engine/artifacts.js";
 export {
 	appendDoDItem,
@@ -211,6 +282,7 @@ export {
 	isDoDComplete,
 	isRootCauseDocumented,
 } from "./engine/dod.js";
+export { orchestratorWriteGate, actorOf, hasStrictOrchestratorState } from "./gates/orchestrator-write.js";
 export {
 	run,
 	resolveClassification,
@@ -230,20 +302,24 @@ export {
 	type StageOutcome,
 } from "./engine/stage.js";
 export type {
-	Profile,
-	StageDef,
-	StageType,
-	StageStatus,
-	PauseKind,
-	TaskType,
-	Complexity,
-	Confidence,
-	WorkflowName,
-	Classification,
-	TeamState,
-	RoleConfig,
-	DoD,
-	DoDItem,
+  Profile,
+  StageDef,
+  StageType,
+  StageStatus,
+  PauseKind,
+  TaskType,
+  Complexity,
+  Confidence,
+  WorkflowName,
+  Classification,
+  TeamState,
+  RoleConfig,
+  DoD,
+  DoDItem,
+  DispatchCompletion,
+  DispatchRecord,
+  DispatchCapabilityState,
+  JoinSummary,
 } from "./engine/types.js";
 // ── CTO sub-orchestration (pure engine) ────────────────────────────────────
 export { MAX_TEAMS, MAX_DECOMPOSITION_DEPTH } from "./cto/types.js";

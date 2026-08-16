@@ -11,7 +11,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
-
+import { isSafeStateSegment } from "../engine/state.js";
 const WORK_STATE_DIR = ".work-state";
 
 interface AgentStartContext {
@@ -20,7 +20,7 @@ interface AgentStartContext {
 
 interface StageEntry {
   id: string;
-  status?: "pending" | "in_progress" | "done" | "skipped";
+  status?: "pending" | "in_progress" | "done" | "skipped" | "failed";
 }
 
 export function monotonicGate(_event: unknown, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
@@ -52,7 +52,7 @@ function resolveStatePath(cwd: string): string | null {
   const active = join(wsDir, ".active-feature");
   if (existsSync(active)) {
     const slug = readFileSync(active, "utf8").trim();
-    if (slug) {
+    if (isSafeStateSegment(slug)) {
       const path = join(wsDir, "features", slug, "state.json");
       if (existsSync(path)) return path;
     }

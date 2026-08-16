@@ -61,7 +61,13 @@ export function dodBackstop(event: SessionStopEvent, ctx: SessionStopContext): {
   const cursor = state.stage_cursor;
   const claimingDone = pause === "done" || cursor === "summary";
   if (!claimingDone) return;
-
+  const pendingDispatches = (state as TeamState & { dispatch_capability?: { dispatches?: Array<{ id: string; status?: string }> } }).dispatch_capability?.dispatches?.filter((d) => d.status === "authorized" || d.status === "running") ?? [];
+  if (pendingDispatches.length > 0) {
+    return {
+      decision: "block",
+      reason: `Durable join incomplete: ${pendingDispatches.length} dispatch(es) still authorized/running (${pendingDispatches.map((d) => d.id).join(", ")}). Reconcile terminal tool_result outcomes before stopping.`,
+    };
+  }
   const dodPath = resolveDoDPath(statePath);
   const dod = readDoD(dodPath);
   if (!dod) {

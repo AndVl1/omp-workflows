@@ -160,7 +160,7 @@ function writeActiveRun(root: string): void {
   );
 }
 
-test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2', async () => {
+test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2', async t => {
   // GIVEN: a real E2E PTY/WS session, an active CTO run with several teams,
   // and a deterministic Telegram-shaped inbound transport.
   const scratch = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-cto-inbox-'));
@@ -179,6 +179,10 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
       maxTimeSec: 30,
       idleMs: 30_000,
     });
+    if (session.pty.mode !== 'pty') {
+      t.skip('node-pty PTY is unavailable; startTestSession used its noPty fallback');
+      return;
+    }
     driver = new WsDriver({ url: session.url, transcriptPath: session.transcriptPath });
     await driver.open();
     await waitFor(async () => (await driver!.readScreen()).includes('MOCK_READY'), { label: 'mock omp ready' });

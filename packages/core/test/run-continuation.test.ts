@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -52,6 +53,10 @@ function fixtureState(branch: string, statuses: TeamState["stages"][number]["sta
   };
 }
 
+function initGit(root: string, branch: string): void {
+  execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
+}
+
 function options(root: string, branch: string, taskTool: TaskCaller, continuation?: { feedback: string; stageId: string }) {
   return {
     task: "New conflicting task classification",
@@ -94,6 +99,7 @@ test("run continuation preserves persisted classification, upstream state, artif
   const root = mkdtempSync(join(tmpdir(), "omp-run-valid-"));
   const branch = "feature/continuation";
   try {
+    initGit(root, branch);
     writeState(root, fixtureState(branch, ["done", "done", "done"]));
     const calls: string[] = [];
     const taskTool: TaskCaller = {
@@ -133,6 +139,8 @@ test("run continuation preserves persisted classification, upstream state, artif
     assert.equal(state.history?.length, 2);
     assert.equal(state.history?.[1]?.feedback, "Rework the reopened stage");
     assert.match(state.task, /User feedback: Rework the reopened stage/);
+    assert.equal(state.dispatch_capability?.status, "complete", "successful continuation must durably join and advance every stage");
+    assert.doesNotMatch(readFileSync(statePath, "utf8"), /"(?:dispatch_token|advance_token)"\s*:/, "plaintext handoff secrets must never be persisted");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -142,6 +150,7 @@ test("run continuation keeps explicit custom feature state and artifacts layout"
   const root = mkdtempSync(join(tmpdir(), "omp-run-custom-"));
   const branch = "feature/x";
   try {
+    initGit(root, branch);
     const customDir = join(root, ".work-state", "features", "custom");
     mkdirSync(join(customDir, "artifacts"), { recursive: true });
     writeFileSync(join(root, ".work-state", ".active-feature"), "custom\n");
@@ -168,6 +177,7 @@ test("run continuation keeps legacy state and artifacts layout", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-run-legacy-"));
   const branch = "feature/x";
   try {
+    initGit(root, branch);
     const state = fixtureState(branch, ["done", "done", "done"]);
     const legacyDir = join(root, ".work-state");
     mkdirSync(join(legacyDir, "artifacts"), { recursive: true });

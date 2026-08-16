@@ -48,6 +48,10 @@ export interface ObservabilityEvent {
   toolName?: string;
   /** True when the tool result reported an error. */
   isError?: boolean;
+  /** Pre-execution gate outcome, when the canonical gate wrapper observed it. */
+  gateDecision?: "allowed" | "blocked";
+  /** Stable category/reason for a blocked or exceptional attempt. */
+  gateReason?: string;
   /** For tool_call: the subagent agent name when the tool was `task`. */
   subagent?: string;
   /** For tool_call on `task`: the prompt size (chars) of the subagent's task body. */

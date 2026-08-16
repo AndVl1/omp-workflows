@@ -6,9 +6,9 @@
  * (R7). The engine is the only writer; agents read through it.
  */
 
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { recordStageTransition } from "../observability/hooks.js";
 import type { ModelClassification } from "../engine/run.js";
 import {
@@ -22,7 +22,24 @@ import {
 } from "./types.js";
 
 export function ctoStateDir(runId: string, root: string): string {
-  return join(root, ".work-state", "cto", runId);
+  if (!runId || runId === "." || runId === ".." || !/^[A-Za-z0-9._-]+$/.test(runId)) throw new Error("unsafe CTO run id");
+  const workState = resolve(root, ".work-state");
+  const ctoRoot = join(workState, "cto");
+  const runDir = join(ctoRoot, runId);
+  try {
+    const realWorkState = existsSync(workState) ? realpathSync(workState) : workState;
+    const realCtoRoot = existsSync(ctoRoot) ? realpathSync(ctoRoot) : join(realWorkState, "cto");
+    const rootRel = relative(realWorkState, realCtoRoot);
+    if (rootRel.startsWith("..") || isAbsolute(rootRel)) throw new Error("CTO path escapes .work-state");
+    if (existsSync(runDir)) {
+      const runRel = relative(realCtoRoot, realpathSync(runDir));
+      if (runRel.startsWith("..") || isAbsolute(runRel)) throw new Error("CTO run path escapes .work-state/cto");
+    }
+  } catch (error) {
+    if (error instanceof Error && /escapes/.test(error.message)) throw error;
+    throw new Error("unsafe CTO state path");
+  }
+  return runDir;
 }
 
 export function ctoStatePath(runId: string, root: string): string {

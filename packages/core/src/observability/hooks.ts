@@ -13,9 +13,9 @@
  * the engine's notion of the "active feature".
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { execSync } from "node:child_process";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { EventRecorder } from "./recorder.js";
 import { extractSkills } from "./skills.js";
 import type { ObservabilityEvent, EventKind } from "./events.js";
@@ -48,12 +48,19 @@ function currentBranch(cwd: string): string {
  * always has a place to write.
  */
 function activeFeatureSlug(cwd: string): string {
-  const active = resolve(cwd, WORK_STATE_DIR, ACTIVE_FEATURE);
-  if (existsSync(active)) {
+  const workState = resolve(cwd, WORK_STATE_DIR);
+  const active = resolve(workState, ACTIVE_FEATURE);
+  if (!existsSync(active)) return "default";
+  try {
+    const realRoot = realpathSync(workState);
+    const realPointer = realpathSync(active);
+    const rel = relative(realRoot, realPointer);
+    if (rel !== ACTIVE_FEATURE && (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel))) return "default";
     const slug = readFileSync(active, "utf8").trim();
-    if (slug) return slug;
+    return /^[A-Za-z0-9._-]+$/.test(slug) ? slug : "default";
+  } catch {
+    return "default";
   }
-  return "default";
 }
 
 const recorderCache = new Map<string, EventRecorder>();
@@ -83,12 +90,20 @@ function safeAppend(
   ev: Omit<ObservabilityEvent, "id" | "branch"> & { kind: EventKind },
 ): void {
   try {
-    void getRecorder(cwd).append(ev);
-  } catch (e) {
-    // never let observability break a tool call
-    // eslint-disable-next-line no-console
-    console.warn("[omp-workflows] observability append failed:", e);
-  }
+    void getRecorder(cwd).append(ev).catch(() => { /* telemetry is best effort */ });
+  } catch { /* telemetry is best effort */ }
+}
+
+export function recordToolCallAttempt(
+  cwd: string,
+  event: { toolName?: string; toolCallId?: string; input?: unknown },
+  decision: "allowed" | "blocked",
+  reason?: string,
+): void {
+  const toolName = typeof event.toolName === "string" ? event.toolName : undefined;
+  if (!toolName) return;
+  const { subagent, taskChars } = toolName === "task" ? subagentFromTaskInput(event.input) : {};
+  safeAppend(cwd, { kind: "tool_call", ts: new Date().toISOString(), toolName, toolCallId: event.toolCallId, subagent, subagentTaskChars: taskChars, gateDecision: decision, gateReason: reason });
 }
 
 /**

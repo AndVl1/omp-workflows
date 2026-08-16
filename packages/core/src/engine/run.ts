@@ -22,13 +22,14 @@
  */
 
 import { readFileSync } from "node:fs";
-import { loadAllProfiles, resolveWorkflow, selectProfile } from "./profile.js";
+import { loadAllProfiles, profileHash, resolveWorkflow, selectProfile } from "./profile.js";
 import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope } from "./scope.js";
 import { writeState, setStageStatus, setPause, resolveState, reopenFromFeedback } from "./state.js";
+import { authorizeDispatch, completeDispatch, advanceCursor, createCapability } from "./durable.js";
 import { keywordClassify } from "./classify.js";
-import { walkProfile, type StageContext, type TaskCaller } from "./stage.js";
 import type { Classification, Complexity, Confidence, Profile, TaskType, TeamState, WorkflowName } from "./types.js";
+import { walkProfile, resolveStageDispatchRoles, type StageContext, type TaskCaller } from "./stage.js";
 
 /**
  * The model's PHASE-0 classification. `type`, `complexity`, `confidence` and
@@ -56,6 +57,10 @@ export interface RunOptions {
   classification?: ModelClassification;
   /** Caller-issued task tool reference. */
   taskTool: TaskCaller;
+  /** Repository paths used for conditional scope and roster resolution. */
+  files?: string[];
+  /** Execute an inline orchestrator stage in the owning main session. */
+  orchestrate?: NonNullable<StageContext["orchestrate"]>;
   issue?: { number: number; url?: string } | null;
   pause?: (reason: string) => Promise<void>;
   log?: (line: string) => void;
@@ -120,26 +125,33 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     ? profiles.find((candidate) => candidate.name === persistedClassification.workflow)
     : selectProfile(profiles, classification);
   if (!profile) throw new Error(`no profile matches classification ${JSON.stringify(classification)}`);
-  const flags = resolveScope([], config);
+  const flags = opts.files
+    ? resolveScope(opts.files, config)
+    : opts.continuation && existing.state?.scope
+      ? existing.state.scope
+      : resolveScope([], config);
+  const resolveRoles = (stage: NonNullable<Profile["stages"][number]>): string[] =>
+    resolveStageDispatchRoles(stage, { cwd: opts.cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  const expectedRoster = (stage: Profile["stages"][number]): Array<{ role: string; agent: string }> =>
+    resolveRoles(stage).map((role) => ({ role, agent: resolveAgentForRole(role, config) }));
   const continuation = opts.continuation
     ? reopenFromFeedback(existing.state!, opts.continuation.feedback, opts.continuation.stageId)
     : null;
-  const initialState: TeamState = continuation ?? {
-    schema: 1,
-    branch: opts.branch,
-    classification,
-    task: opts.task,
-    workflow_override: opts.classification?.workflow !== undefined,
-    issue: opts.issue ?? null,
-    stage_cursor: profile.stages[0]?.id ?? "",
-    stages: profile.stages.map((s) => ({ id: s.id, status: "pending" as const })),
-    artifacts: {},
-    pause: { kind: "none", reason: "" },
-    updated_at: new Date().toISOString(),
-  };
-  const { statePath, artifactsDir } = writeState(opts.cwd, initialState, opts.continuation ? { target: existing } : {});
+  const initialState: TeamState = continuation
+    ? { ...continuation, scope: flags, policy: { ...(continuation.policy ?? {}), strict_orchestrator: true } }
+    : (() => {
+        const stage = profile.stages[0];
+        const kind: "single" | "consilium" | null = stage?.type === "single" ? "single" : stage?.type === "consilium" ? "consilium" : null;
+        const issued = stage && kind
+          ? createCapability({ run_key: opts.branch, branch: opts.branch, workflow: profile.name, profile_hash: profileHash(profile), stage_cursor: stage.id, kind, expected_roster: expectedRoster(stage) })
+          : null;
+        return { schema: 1, branch: opts.branch, classification, task: opts.task, workflow_override: opts.classification?.workflow !== undefined, issue: opts.issue ?? null, stage_cursor: stage?.id ?? "", stages: profile.stages.map((s) => ({ id: s.id, status: "pending" as const })), pause: { kind: "none" as const, reason: "" }, artifacts: {}, scope: flags, policy: { strict_orchestrator: true }, profile_hash: profileHash(profile), run_key: opts.branch, cursor_epoch: issued?.state.issued_for?.cursor_epoch, dispatch_capability: issued?.state, updated_at: new Date().toISOString() } satisfies TeamState;
+      })();
+  const stateTarget = opts.continuation ? { target: existing } : {};
+  const { statePath, artifactsDir } = writeState(opts.cwd, initialState, stateTarget);
   const completed = new Set(initialState.stages.filter((s) => s.status === "done" || s.status === "skipped").map((s) => s.id));
   const runnableProfile = completed.size === 0 ? profile : { ...profile, stages: profile.stages.filter((s) => !completed.has(s.id)) };
+  let durableStage: { stageId: string; dispatchToken: string; advanceToken: string; epoch: string } | null = null;
   const ctx: StageContext = {
     cwd: opts.cwd,
     state: initialState,
@@ -147,18 +159,62 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     flags,
     agent: (role) => resolveAgentForRole(role, config),
     task: opts.taskTool,
+    orchestrate: opts.orchestrate
+      ? (args) => opts.orchestrate!({ ...args, state: ctx.state })
+      : undefined,
     pause: opts.pause ?? (async () => undefined),
+    onStageStart: (stageId) => {
+      const current = readState(statePath);
+      const stage = profile.stages.find((candidate) => candidate.id === stageId);
+      const kind: "single" | "consilium" | null = stage?.type === "single" ? "single" : stage?.type === "consilium" ? "consilium" : null;
+      const next = setStageStatus(current, stageId, "in_progress", opts.cwd);
+      const issued = stage && kind
+        ? createCapability({ run_key: next.run_key ?? next.branch, branch: next.branch, workflow: profile.name, profile_hash: profileHash(profile), stage_cursor: stage.id, kind, expected_roster: expectedRoster(stage) })
+        : null;
+      const nextState: TeamState = issued
+        ? { ...next, run_key: next.run_key ?? next.branch, cursor_epoch: issued.state.issued_for!.cursor_epoch, profile_hash: profileHash(profile), dispatch_capability: issued.state }
+        : { ...next, cursor_epoch: undefined, dispatch_capability: undefined };
+      ctx.state = nextState;
+      if (issued) durableStage = { stageId, dispatchToken: issued.dispatch_token, advanceToken: issued.advance_token, epoch: issued.state.issued_for!.cursor_epoch };
+      else durableStage = null;
+      writeState(opts.cwd, nextState, stateTarget);
+    },
+    onStageComplete: (stageId, status) => {
+      const current = readState(statePath);
+      const next = setStageStatus(current, stageId, status, opts.cwd);
+      ctx.state = next;
+      writeState(opts.cwd, next, stateTarget);
+    },
     log: opts.log ?? (() => undefined),
     resolveDevAgent: () => flags.dev_agent,
+    durable: {
+      authorize: (role, agent) => {
+        if (!durableStage) return { ok: false, error: "durable stage unavailable" };
+        const current = readState(statePath);
+        const r = authorizeDispatch(opts.cwd, { token: durableStage.dispatchToken, capability_id: current.dispatch_capability?.capability_id ?? "", run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, role, agent });
+        if (r.ok) ctx.state = r.state;
+        return r.ok && r.record ? { ok: true, dispatchId: r.record.id } : { ok: false, error: r.ok ? "missing dispatch record" : r.error };
+      },
+      complete: (dispatchId, output, outcome, artifactIds) => {
+        if (!durableStage) return { ok: false, error: "durable stage unavailable" };
+        const current = readState(statePath);
+        const r = completeDispatch(opts.cwd, { token: durableStage.dispatchToken, capability_id: current.dispatch_capability?.capability_id ?? "", dispatch_id: dispatchId, run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, outcome, evidence: output || (outcome === "failed" ? "task failed" : "task completed"), artifact_ids: artifactIds });
+        if (r.ok) ctx.state = r.state;
+        return r.ok ? { ok: true } : { ok: false, error: r.error };
+      },
+      advance: (evidence) => {
+        if (!durableStage) return { ok: false, error: "durable stage unavailable" };
+        const current = readState(statePath);
+        const r = advanceCursor(opts.cwd, { token: durableStage.advanceToken, capability_id: current.dispatch_capability?.capability_id ?? "", run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, evidence });
+        if (!r.ok) return { ok: false, error: `${r.error}: ${evidence}` };
+        ctx.state = r.state;
+        if (r.handoff) durableStage = { stageId: r.state.stage_cursor, dispatchToken: r.handoff.dispatch_token, advanceToken: r.handoff.advance_token, epoch: r.handoff.cursor_epoch };
+        return { ok: true, handoff: r.handoff };
+      },
+    },
   };
   opts.log?.(`walking profile: ${profile.name} (${runnableProfile.stages.length} stages)`);
   const outcomes = await walkProfile(runnableProfile, ctx);
-  for (const outcome of outcomes) {
-    if (outcome.status === "done" || outcome.status === "skipped") {
-      const updated = readState(statePath);
-      writeState(opts.cwd, setStageStatus(updated, outcome.stageId, outcome.status, opts.cwd), opts.continuation ? { target: existing } : {});
-    }
-  }
   const final = readState(statePath);
   const done = final.stages.every((s) => s.status === "done" || s.status === "skipped");
   writeState(opts.cwd, setPause(final, done ? "done" : "failed", done ? "" : "one or more stages failed"), opts.continuation ? { target: existing } : {});

@@ -13,7 +13,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -337,7 +337,7 @@ test("runStage: orchestrator with declared artifact fails when output is missing
     });
     const outcome = await runStage({ id: "planning", title: "Planning", type: "orchestrator", produces: "team_plan" }, ctx);
     assert.equal(outcome.status, "failed");
-    assert.match(outcome.note, /team_plan\.json.*not found/);
+    assert.match(outcome.note, /orchestrate callback is configured/);
   } finally {
     cleanup();
   }
@@ -352,6 +352,36 @@ test("runStage: inline orchestrator with no outputs remains done", async () => {
     });
     const outcome = await runStage({ id: "summary", title: "Summary", type: "orchestrator" }, ctx);
     assert.equal(outcome.status, "done");
+  } finally {
+    cleanup();
+  }
+});
+
+test("runStage: orchestrator persists callback artifacts before validating outputs", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    const artifactsDir = join(cwd, "artifacts");
+    const ctx = makeStageCtx(artifactsDir, {
+      async call() { return { id: "unused", output: "", artifacts: {}, exitCode: 0 }; },
+      async batch() { return []; },
+    });
+    ctx.orchestrate = async () => ({
+      output: "plan ready",
+      artifacts: { team_plan: { decision: "parallel", contributors: 2 } },
+    });
+
+    const outcome = await runStage({
+      id: "planning",
+      title: "Planning",
+      type: "orchestrator",
+      produces: "team_plan",
+    }, ctx);
+
+    assert.equal(outcome.status, "done");
+    assert.deepEqual(JSON.parse(readFileSync(join(artifactsDir, "team_plan.json"), "utf8")), {
+      decision: "parallel",
+      contributors: 2,
+    });
   } finally {
     cleanup();
   }

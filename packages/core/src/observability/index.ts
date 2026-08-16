@@ -16,6 +16,11 @@ export interface ObservabilityRegisterOptions {
    * that opt out of telemetry. Default: true.
    */
   enabled?: boolean;
+  /**
+   * Set false when the caller owns the `tool_call` hook and needs to attach
+   * gate decisions to the single recorded event.
+   */
+  toolCall?: boolean;
 }
 
 export function registerObservabilityHooks(
@@ -32,9 +37,11 @@ export function registerObservabilityHooks(
   pi.on("agent_end", (event: unknown, ctx: unknown) => {
     observabilityHooks.onAgentEnd(event, ctx);
   });
-  pi.on("tool_call", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onToolCall(event, ctx);
-  });
+  if (opts.toolCall !== false) {
+    pi.on("tool_call", (event: unknown, ctx: unknown) => {
+      observabilityHooks.onToolCall(event, ctx);
+    });
+  }
   pi.on("tool_result", (event: unknown, ctx: unknown) => {
     observabilityHooks.onToolResult(event, ctx);
   });
@@ -49,6 +56,7 @@ export function registerObservabilityHooks(
 export { EventRecorder, rollupFromEvents, readObservabilityPointer } from "./recorder.js";
 export { extractSkills } from "./skills.js";
 export { recordStageTransition, recordArtifactWritten } from "./hooks.js";
+export { recordToolCallAttempt } from "./hooks.js";
 export type {
   ObservabilityEvent,
   ObservabilityPointer,

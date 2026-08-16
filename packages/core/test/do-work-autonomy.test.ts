@@ -9,9 +9,16 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadProfile, profileHash } from "../src/engine/profile.js";
+import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
+import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
+import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
+import { registerTeamWorkflow } from "../src/index.js";
+import { resolveState, writeState } from "../src/engine/state.js";
 
 import {
   parseWorkEnvelope,
@@ -26,6 +33,10 @@ import {
 function writeWorkflowState(root: string, state: Record<string, unknown>): void {
   mkdirSync(join(root, ".work-state"), { recursive: true });
   writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(state));
+}
+
+function initGit(root: string, branch: string): void {
+  execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
 }
 test("do-work: matching-branch state prompt is resumable", () => {
   const root = mkdtempSync(join(tmpdir(), "do-work-resume-match-"));
@@ -47,6 +58,22 @@ test("do-work: stale active-feature state starts a new workflow", () => {
     const prompt = buildDoWorkPrompt({ task: "feedback", autonomyHint: false, issue: null, branch: "feat/current" }, root);
     assert.match(prompt, /No existing do-work state was found/);
     assert.doesNotMatch(prompt, /resumable continuation/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("resolveState: rejects feature artifacts that escape through a symlink", () => {
+  const root = mkdtempSync(join(tmpdir(), "state-artifact-symlink-"));
+  try {
+    const featureDir = join(root, ".work-state", "features", "current");
+    const outside = join(root, "outside-artifacts");
+    mkdirSync(featureDir, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(root, ".work-state", ".active-feature"), "current\n");
+    writeFileSync(join(featureDir, "state.json"), JSON.stringify({ branch: "feat/current" }));
+    symlinkSync(outside, join(featureDir, "artifacts"), "dir");
+    const resolved = resolveState(root, "feat/current");
+    assert.equal(resolved.invalid, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -365,6 +392,439 @@ test("P5 gate: missing classification blocks; absent state allows (legacy flow)"
 
     rmSync(join(root, ".work-state"), { recursive: true, force: true });
     assert.equal(classificationGate({ agent: "developer" }, { cwd: root }), undefined, "no state -> legacy allow");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("strict orchestrator policy blocks source and canonical-state writes, allows artifacts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-write-policy-"));
+  try {
+    mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
+    const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
+    const source = orchestratorWriteGate({ toolName: "write", input: { actor: "worker", path: "src/app.ts" } }, { cwd: root, hasUI: true });
+    assert.equal(source?.block, true);
+    assert.match(source?.reason ?? "", /may write only under \.work-state/);
+    const state = orchestratorWriteGate({ toolName: "edit", input: { actor: "worker", path: ".work-state/team-state.json" } }, { cwd: root, hasUI: true });
+    assert.equal(state?.block, true);
+    assert.match(state?.reason ?? "", /canonical workflow state/);
+    const artifact = orchestratorWriteGate({ toolName: "write", input: { actor: "worker", path: ".work-state/artifacts/report.json" } }, { cwd: root, hasUI: true });
+    assert.equal(artifact, undefined);
+    const worker = orchestratorWriteGate({ toolName: "write", input: { actor: "orchestrator", path: "src/app.ts" } }, { cwd: root, hasUI: false });
+    assert.equal(worker, undefined);
+    const bashEcho = orchestratorWriteGate({ toolName: "bash", input: { command: "echo hacked > src/app.ts" } }, { cwd: root, hasUI: true });
+    assert.equal(bashEcho?.block, true);
+    const bashRemove = orchestratorWriteGate({ toolName: "bash", input: { command: "rm src/app.ts" } }, { cwd: root, hasUI: true });
+    assert.equal(bashRemove?.block, true);
+    const bashRead = orchestratorWriteGate({ toolName: "bash", input: { command: "git diff -- src/app.ts" } }, { cwd: root, hasUI: true });
+    assert.equal(bashRead, undefined);
+    const workerCanonicalBash = orchestratorWriteGate({ toolName: "bash", input: { command: "cat > .work-state/team-state.json" } }, { cwd: root, hasUI: false });
+    assert.equal(workerCanonicalBash?.block, true);
+    const ctoCanonicalBash = orchestratorWriteGate({ toolName: "bash", input: { command: "awk '{print}' > .work-state/cto/run-1/state.json" } }, { cwd: root, hasUI: true });
+    assert.equal(ctoCanonicalBash?.block, true);
+    const redirectedSource = orchestratorWriteGate({ toolName: "bash", input: { command: "git show HEAD:src/app.ts > \"$(pwd)/src/app.ts\"" } }, { cwd: root, hasUI: true });
+    assert.equal(redirectedSource?.block, true);
+    const workerCanonicalInPlace = orchestratorWriteGate({ toolName: "bash", input: { command: "awk -i inplace '{print}' .work-state/team-state.json" } }, { cwd: root, hasUI: false });
+    assert.equal(workerCanonicalInPlace?.block, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("strict durable transitions fail closed when no active git branch exists", () => {
+  const root = mkdtempSync(join(tmpdir(), "durable-no-git-"));
+  try {
+    writeWorkflowState(root, {
+      branch: "feature/no-git",
+      classification: { workflow: "lightweight" },
+      stage_cursor: "implementation",
+      stages: [{ id: "implementation", status: "in_progress" }],
+    });
+    const begun = beginCapability(root);
+    assert.equal(begun.ok, false);
+    assert.match(begun.error, /stale for the active branch/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("do-work prompt makes orchestrator non-coding policy explicit", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-policy-prompt-"));
+  try {
+    const prompt = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
+    assert.match(prompt, /STRICT ORCHESTRATOR POLICY/);
+    assert.match(prompt, /write\/edit application source or project files \| DENY/);
+    assert.match(prompt, /After every delegated call or parallel batch/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("team and do-work use the same strict orchestration contract", () => {
+  const root = mkdtempSync(join(tmpdir(), "team-alias-policy-"));
+  try {
+    const work = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
+    const team = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
+    assert.equal(team, work, "/team alias must resolve to the identical canonical prompt");
+    assert.match(team, /STRICT ORCHESTRATOR POLICY/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dispatch gate requires the exact active cursor stage and roster", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-cursor-"));
+  try {
+    initGit(root, "feat/test");
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    const profile = loadProfile("lightweight");
+    assert.ok(profile, "lightweight profile must be available for strict dispatch fixture");
+    const persistedProfileHash = profileHash(profile);
+    const capability = createCapability({
+      run_key: "feat/test", branch: "feat/test", workflow: "lightweight", profile_hash: persistedProfileHash,
+      stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "${scope.dev_agent}" }],
+    });
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
+      branch: "feat/test", run_key: "feat/test", policy: { strict_orchestrator: true }, stage_cursor: "implementation",
+      stages: [{ id: "implementation", status: "in_progress" }],
+      cursor_epoch: capability.state.issued_for?.cursor_epoch, profile_hash: persistedProfileHash,
+      dispatch_capability: capability.state,
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+    }));
+    const { dispatchGate } = await import("../src/gates/dispatch.ts");
+    const wrong = dispatchGate({ toolName: "task", input: { agent: "backend-kotlin", task: "<!-- omp-dispatch run=feat/test stage=discovery kind=single cursor=discovery roles=analyst -->" } }, { cwd: root });
+    assert.equal(wrong?.block, true);
+    const right = dispatchGate({ toolName: "task", input: { agent: "${scope.dev_agent}", role: "${scope.dev_agent}", task: `<!-- omp-dispatch run=feat/test stage=implementation kind=single cursor=${capability.state.issued_for?.cursor_epoch} roles=\${scope.dev_agent} -->` } }, { cwd: root });
+    assert.equal(right, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("dispatch markers bind to the persisted cursor epoch", () => {
+  const stage = { id: "implementation", title: "Implementation", type: "single" as const, role: "go" };
+  const marker = buildDispatchMarker("run-1", stage, ["go"], "go", "epoch-1");
+  assert.equal(parseDispatchMarker(marker)?.cursor, "epoch-1");
+});
+test("strict runtime issues opaque capabilities and reconciles native task results", () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-capability-runtime-"));
+  try {
+    initGit(root, "feature/capability");
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    writeWorkflowState(root, {
+      schema: 1,
+      branch: "feature/capability",
+      task: "capability test",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      stage_cursor: "implementation",
+      stages: profile.stages.map((stage) => ({
+        id: stage.id,
+        status: stage.id === "implementation" ? "in_progress" : stage.id === "discovery" ? "done" : "pending",
+      })),
+      artifacts: {},
+      scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
+      policy: { strict_orchestrator: true },
+      pause: { kind: "none", reason: "" },
+    });
+
+    const begun = beginCapability(root);
+    assert.equal(begun.ok, true);
+    if (!begun.ok || !begun.handoff) return;
+    const handoff = begun.handoff;
+    const persisted = readFileSync(join(root, ".work-state", "team-state.json"), "utf8");
+    assert.doesNotMatch(persisted, new RegExp(handoff.dispatch_token));
+    assert.doesNotMatch(persisted, new RegExp(handoff.advance_token));
+
+    const stage = profile.stages.find((candidate) => candidate.id === "implementation");
+    assert.ok(stage);
+    const marker = buildDispatchMarker(handoff.run_key, stage, ["developer-kotlin"], "developer-kotlin", handoff.cursor_epoch);
+    const request = trustedDispatchRequests({
+      toolName: "task",
+      toolCallId: "tool-1",
+      input: { agent: "developer-kotlin", role: "developer-kotlin", task: marker },
+    }, { cwd: root });
+    assert.equal(request.ok, true);
+    if (!request.ok) return;
+    assert.equal(request.requests.length, 1);
+    const preauthorized = authorizeDispatch(root, {
+      token: handoff.dispatch_token,
+      capability_id: handoff.capability_id,
+      run_key: handoff.run_key,
+      branch: handoff.branch,
+      workflow: handoff.workflow,
+      profile_hash: handoff.profile_hash,
+      stage_cursor: handoff.stage_cursor,
+      cursor_epoch: handoff.cursor_epoch,
+      role: "developer-kotlin",
+      agent: "developer-kotlin",
+    });
+    assert.equal(preauthorized.ok, true);
+    const authorized = authorizeDispatchTrusted(root, request.requests[0]!);
+    assert.equal(authorized.ok, true);
+    if (!authorized.ok || !authorized.record) return;
+    const duplicateAuthorization = authorizeDispatchTrusted(root, request.requests[0]!);
+    assert.equal(duplicateAuthorization.ok, true);
+    if (!duplicateAuthorization.ok || !duplicateAuthorization.record) return;
+    assert.equal(duplicateAuthorization.record.id, authorized.record.id);
+
+    const reconciled = reconcileTrustedTaskResult(root, {
+      tool_call_id: "tool-1",
+      outcome: "succeeded",
+      evidence: "native task result",
+    });
+    assert.equal(reconciled.ok, true);
+    mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "artifacts", "result.json"), "{}");
+    writeFileSync(join(root, ".work-state", "artifacts", "implementation.json"), JSON.stringify({
+      ready: true,
+      validation_run: true,
+      validation_evidence: "focused durable capability test",
+    }));
+    const replay = completeDispatch(root, {
+      token: handoff.dispatch_token,
+      capability_id: handoff.capability_id,
+      run_key: handoff.run_key,
+      branch: handoff.branch,
+      workflow: handoff.workflow,
+      profile_hash: handoff.profile_hash,
+      stage_cursor: handoff.stage_cursor,
+      cursor_epoch: handoff.cursor_epoch,
+      role: "developer-kotlin",
+      agent: "developer-kotlin",
+      tool_call_id: "tool-1",
+      dispatch_id: authorized.record.id,
+      outcome: "succeeded",
+      evidence: "explicit workflow evidence",
+      artifact_ids: ["result"],
+    });
+    assert.equal(replay.ok, true);
+
+    const advanced = advanceCursor(root, {
+      token: handoff.advance_token,
+      capability_id: handoff.capability_id,
+      run_key: handoff.run_key,
+      branch: handoff.branch,
+      workflow: handoff.workflow,
+      profile_hash: handoff.profile_hash,
+      stage_cursor: handoff.stage_cursor,
+      cursor_epoch: handoff.cursor_epoch,
+      evidence: "implementation completed",
+    });
+    assert.equal(advanced.ok, true);
+    if (!advanced.ok) return;
+    assert.equal(advanced.state.stage_cursor, "code_review");
+    assert.equal(advanced.handoff?.expected_roster[0]?.role, "code-reviewer");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("native task hook leaves spawned and scheduled results pending", () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-capability-async-"));
+  try {
+    initGit(root, "feature/async-capability");
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    writeWorkflowState(root, {
+      schema: 1,
+      branch: "feature/async-capability",
+      task: "async capability test",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      stage_cursor: "implementation",
+      stages: profile.stages.map((stage) => ({
+        id: stage.id,
+        status: stage.id === "implementation" ? "in_progress" : stage.id === "discovery" ? "done" : "pending",
+      })),
+      artifacts: {},
+      scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
+      policy: { strict_orchestrator: true },
+      pause: { kind: "none", reason: "" },
+    });
+    const begun = beginCapability(root);
+    assert.equal(begun.ok, true);
+    if (!begun.ok || !begun.handoff) return;
+    const stage = profile.stages.find((candidate) => candidate.id === "implementation");
+    assert.ok(stage);
+    const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["developer-kotlin"], "developer-kotlin", begun.handoff.cursor_epoch);
+    const request = trustedDispatchRequests({
+      toolName: "task",
+      toolCallId: "tool-async",
+      input: { agent: "developer-kotlin", role: "developer-kotlin", task: marker },
+    }, { cwd: root });
+    assert.equal(request.ok, true);
+    if (!request.ok) return;
+    assert.equal(authorizeDispatchTrusted(root, request.requests[0]!).ok, true);
+
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    registerTeamWorkflow({
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        handlers.set(name, handler);
+      },
+    } as never, { observability: false });
+    const onToolResult = handlers.get("tool_result");
+    assert.ok(onToolResult);
+    for (const state of ["spawned", "scheduled"]) {
+      onToolResult!({
+        toolName: "task",
+        toolCallId: "tool-async",
+        content: [],
+        isError: false,
+        details: { async: { state } },
+      }, { cwd: root });
+    }
+    const persisted = resolveState(root, "feature/async-capability").state;
+    assert.equal(persisted?.dispatch_capability?.dispatches[0]?.status, "authorized");
+    assert.equal(persisted?.dispatch_capability?.dispatches[0]?.completion, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("trusted reconciliation preserves every dispatch in a consilium batch", () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-capability-batch-"));
+  try {
+    initGit(root, "feature/batch-capability");
+    const profile = loadProfile("review");
+    assert.ok(profile);
+    writeWorkflowState(root, {
+      schema: 1,
+      branch: "feature/batch-capability",
+      task: "batch capability test",
+      classification: { type: "REVIEW", complexity: "COMPLEX", confidence: "HIGH", autonomous: true, workflow: "review" },
+      stage_cursor: "review",
+      stages: profile.stages.map((stage) => ({
+        id: stage.id,
+        status: stage.id === "review" ? "in_progress" : stage.id === "discovery" ? "done" : "pending",
+      })),
+      artifacts: {},
+      scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
+      policy: { strict_orchestrator: true },
+      pause: { kind: "none", reason: "" },
+    });
+
+    const begun = beginCapability(root);
+    assert.equal(begun.ok, true);
+    if (!begun.ok || !begun.handoff) return;
+    const request = trustedDispatchRequests({
+      toolName: "task",
+      toolCallId: "tool-batch",
+      input: {
+        tasks: [
+          { role: "code-reviewer", agent: "code-reviewer", task: "review the branch" },
+          { role: "qa", agent: "qa", task: "check the branch" },
+        ],
+      },
+    }, { cwd: root });
+    assert.equal(request.ok, true);
+    if (!request.ok) return;
+    assert.equal(request.requests.length, 2);
+    for (const authorization of request.requests) {
+      assert.equal(authorizeDispatchTrusted(root, authorization).ok, true);
+    }
+
+    const reconciled = reconcileTrustedTaskResult(root, {
+      tool_call_id: "tool-batch",
+      outcome: "succeeded",
+      evidence: "batch completed",
+    });
+    assert.equal(reconciled.ok, true);
+    if (!reconciled.ok) return;
+    assert.deepEqual(
+      reconciled.state.dispatch_capability?.dispatches.map((dispatch) => dispatch.status),
+      ["succeeded", "succeeded"],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+
+test("advance handoff resolves the next stage roster", () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-handoff-"));
+  try {
+    initGit(root, "feat/handoff");
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    const persistedProfileHash = profileHash(profile);
+    const issued = createCapability({
+      run_key: "feat/handoff",
+      branch: "feat/handoff",
+      workflow: "lightweight",
+      profile_hash: persistedProfileHash,
+      stage_cursor: "implementation",
+      kind: "single",
+      expected_roster: [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }],
+    });
+    const state = {
+      schema: 1,
+      branch: "feat/handoff",
+      run_key: "feat/handoff",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      task: "handoff",
+      workflow_override: false,
+      issue: null,
+      stage_cursor: "implementation",
+      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "implementation" ? "in_progress" as const : "pending" as const })),
+      artifacts: {},
+      pause: { kind: "none" as const, reason: "" },
+      policy: { strict_orchestrator: true },
+      profile_hash: persistedProfileHash,
+      cursor_epoch: issued.state.issued_for?.cursor_epoch,
+      dispatch_capability: issued.state,
+      updated_at: new Date().toISOString(),
+    };
+    writeState(root, state, { featureSlug: "handoff" });
+    mkdirSync(join(root, ".work-state", "features", "handoff", "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "features", "handoff", "artifacts", "implementation.json"), JSON.stringify({
+      ready: true,
+      validation_run: true,
+      validation_evidence: "focused handoff test",
+    }));
+    const authInput = {
+      token: issued.dispatch_token,
+      capability_id: issued.capability_id,
+      run_key: "feat/handoff",
+      branch: "feat/handoff",
+      workflow: "lightweight",
+      profile_hash: persistedProfileHash,
+      stage_cursor: "implementation",
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      role: "${scope.dev_agent}",
+      agent: "developer-kotlin",
+    };
+    const authorized = authorizeDispatch(root, authInput);
+    assert.equal(authorized.ok, true);
+    if (!authorized.ok || !authorized.record) return;
+    const completed = completeDispatch(root, {
+      ...authInput,
+      dispatch_id: authorized.record.id,
+      outcome: "succeeded",
+      evidence: "task completed",
+    });
+    assert.equal(completed.ok, true);
+    const advanced = advanceCursor(root, {
+      ...authInput,
+      token: issued.advance_token,
+      evidence: "stage completed",
+    });
+    assert.equal(advanced.ok, true);
+    if (!advanced.ok) return;
+    assert.equal(advanced.state.stage_cursor, "code_review");
+    assert.deepEqual(advanced.state.dispatch_capability?.expected_roster, [{ role: "code-reviewer", agent: "code-reviewer" }]);
+    assert.equal(advanced.state.dispatch_capability?.kind, "single");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow contract supports an explicit stateless profile lookup", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-contract-stateless-"));
+  try {
+    const contract = resolveWorkflowContract(root, { requireState: false, workflow: "lightweight", branch: "main" });
+    assert.equal(contract.state.path, null);
+    assert.equal(contract.provenance.statePath, null);
+    assert.equal(contract.stage.id, "discovery");
+    assert.equal(contract.state.dispatch.allowed, false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
