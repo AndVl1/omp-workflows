@@ -57,3 +57,30 @@ test("fullstack: workflow tools register and fail closed with structured respons
   assert.equal((completeResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
   assert.equal((advanceResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
 });
+test("fullstack: mutable schema defaults are factories", () => {
+  const strictZ = {
+    ...z,
+    array: (element: Parameters<typeof z.array>[0]) => {
+      const schema = z.array(element);
+      return new Proxy(schema, {
+        get(target, property, receiver) {
+          if (property !== "default") return Reflect.get(target, property, receiver);
+          const defaultMethod = Reflect.get(target, property, receiver) as (value: unknown) => unknown;
+          return (value: unknown) => {
+            if (value !== null && typeof value === "object") {
+              throw new Error("mutable default must be a factory");
+            }
+            return Reflect.apply(defaultMethod, target, [value]);
+          };
+        },
+      });
+    },
+  } as typeof z;
+
+  assert.doesNotThrow(() => {
+    registerWorkflowTools({
+      zod: { z: strictZ },
+      registerTool() {},
+    } as never);
+  });
+});

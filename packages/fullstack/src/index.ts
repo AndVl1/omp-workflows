@@ -257,7 +257,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
     parameters: z.object({
       dispatch_id: z.string().min(1), token: z.string().min(1), capability_id: z.string().min(1),
       run_key: z.string().min(1), branch: z.string().min(1), workflow: z.string().min(1), profile_hash: z.string().min(1), stage_cursor: z.string().min(1), cursor_epoch: z.string().min(1), evidence: z.string().min(1),
-      artifact_ids: z.array(z.string().min(1)).default([]),
+      artifact_ids: z.array(z.string().min(1)).default(() => []),
       outcome: z.enum(["succeeded", "failed", "cancelled"]).default("succeeded"),
     }) as never,
     async execute(_id, params, _signal, _update, ctx) {
