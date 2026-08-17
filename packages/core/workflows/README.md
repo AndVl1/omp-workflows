@@ -60,8 +60,9 @@ OR `match.complexity` is absent).
 4. `standard`
 5. `lightweight`
 6. `research`
-7. `review`
-8. `emergency`
+7. `lecture-research`
+8. `review`
+9. `emergency`
 
 Resulting table (every Type × Complexity resolves):
 
@@ -72,6 +73,7 @@ Resulting table (every Type × Complexity resolves):
 | OPS | lightweight | standard | standard | standard |
 | BUG_FIX | bug-fix | debug-cycle | debug-cycle | debug-cycle |
 | INVESTIGATION | research | research | research | research |
+| LECTURE_RESEARCH | lecture-research | lecture-research | lecture-research | lecture-research |
 | REVIEW | review | review | review | review |
 | HOTFIX | emergency | emergency | emergency | emergency |
 
@@ -80,8 +82,74 @@ Resulting table (every Type × Complexity resolves):
 **Autonomous override**: in autonomous mode, every `BUG_FIX` uses `debug-cycle` regardless
 of complexity (the diagnostics ↔ manual-qa loop is how a hypothesis is formed without a human).
 
+**Dedicated research intent**: `LECTURE_RESEARCH` (transcript/playlist research) is a
+first-class type DISTINCT from generic `INVESTIGATION` → `research`. It resolves to
+`lecture-research` at EVERY complexity and autonomy and is never routed to an implementation
+profile (research-only, human approval gate — see below).
+
 This table is mirrored in `hooks/validate-state.sh` (P5) — the classification gate blocks
 launching agents if `team-state.json`'s `workflow` does not match its `classification`.
+
+## Lecture research workflow (`lecture-research`)
+
+Dedicated research-only profile for transcript/playlist research (semantic type
+`LECTURE_RESEARCH`). It turns lectures/playlists into verifiable, actionable findings —
+**never into code**.
+
+**Deterministic resolution.** `resolveWorkflow("LECTURE_RESEARCH", <any complexity>, <any
+autonomous>) === "lecture-research"` — one profile for the whole type, regardless of complexity
+or autonomy. It is a first-class intent DISTINCT from generic `INVESTIGATION` → `research`:
+generic investigation explores a codebase/problem, `LECTURE_RESEARCH` grounds every finding in
+source transcripts/playlists and ends at an explicit human approval gate.
+
+**Stages** (the exact stage list, gates and checkpoint definitions live in
+`lecture-research.json`; each stage embeds its prompt in the profile — there are no per-stage
+template files for this profile):
+
+1. **Intake** (orchestrator) — transcript-first source intake: collect the source
+   transcripts/playlists, confirm the bounded lecture set, and record observable provenance
+   for every source (file path/URL/playlist id, how obtained, available timecodes). No
+   summarization or judgement yet, so later stages can quote evidence precisely. Produces
+   `lecture_intake`.
+2. **Lecture mapping** (consilium, bounded parallel roster) — `analyst`, `tech-researcher`
+   and `diagnostics` map the intake sources in parallel slices; every mapped unit carries
+   quoted source evidence (source id, timecode where available) and the stage records what was
+   mapped vs. what remains unknown. Produces `lecture_mapping`.
+3. **Synthesis & dedupe** (single `analyst`) — merge overlapping claims across sources, record
+   conflicts explicitly with the winning source and the losing sources/claims, and produce the
+   deduplicated candidate findings set. Produces `lecture_candidates`.
+4. **Repo fit & security review** (consilium, parallel, read-only) — `architect` checks
+   whether each candidate matches the actual codebase, citing concrete repo evidence (commit
+   hash, file path, symbol); `security-tester` reviews candidates for security and IP/licensing
+   risks. No fixes, no edits — findings only. Produces `lecture_repo_fit`.
+5. **Approval** (orchestrator, explicit human checkpoint) — the run pauses (`ask` or a
+   `decision` escalation with `timeoutMs` + `default`), records the verdict, and completes the
+   terminal stage on EITHER an explicit `approved` or `rejected` decision
+   (`gate: lecture_decision.verdict == approved || lecture_decision.verdict == rejected`).
+   No implementation task or code work may begin before approval; on rejection the run stops
+   with the findings as the deliverable. Produces `lecture_decision`.
+
+**Artifacts.** Every stage writes typed artifacts to `.work-state/artifacts/<id>.json`
+per `artifacts-schema.json`: the intake with provenance, evidence-grounded lecture maps, the
+synthesis with conflicts, the combined repo-fit + security findings, and the explicit human
+decision. The profile never produces source code.
+
+**Human gate.** The approval checkpoint is the profile's terminal decision point: the run waits
+for an explicit human decision before anything beyond findings is allowed, and the stage
+completes only once that decision is recorded (`approved` or `rejected`). Neither decision path
+starts implementation — implementing an approved finding is a NEW task with its own
+classification, workflow and DoD, never a stage of this profile.
+
+**Entry points.** Both `/do-work` and `/cto` route through the same classification contract and
+matrix — there is no new slash command. `/do-work` classifies the task (PHASE-0 type
+`LECTURE_RESEARCH`), resolves the profile deterministically and walks it stage by stage. `/cto`
+resolves per-slice workflows from the same matrix: a `LECTURE_RESEARCH` slice is staffed with
+the profile's research-only roster — `analyst`, `tech-researcher`, `diagnostics` for the
+parallel lecture mapping, then `architect` + `security-tester` for the read-only repo-fit and
+security review — keeps provenance/timecoded evidence, and ends at the human approval gate — no
+implementation before approval. Both surfaces resolve the current stage through the opaque
+workflow-tools contract (`resolveWorkflowContract` / `resolveStageInstructions`), which
+validates persisted state, profile hash and dispatch capability before any stage runs.
 
 ## Interpreter contract (how `/team` walks a profile)
 

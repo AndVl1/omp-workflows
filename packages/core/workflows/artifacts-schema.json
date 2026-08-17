@@ -285,6 +285,142 @@
         "merged_branches": { "type": "array", "items": { "type": "string" } },
         "note": { "type": "string" }
       }
+    },
+    "lecture_intake": {
+      "type": "object",
+      "description": "Transcript-first intake for the lecture-research workflow: the research question plus the source material every later claim must be grounded in. Produced by the intake (orchestrator) stage.",
+      "required": ["task", "sources"],
+      "properties": {
+        "task": { "type": "string", "description": "The research question/goal the user asked about the lectures/playlist." },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Every lecture/playlist source the research may use. Each entry requires observable provenance so downstream evidence can be traced.",
+          "items": {
+            "type": "object",
+            "required": ["id", "kind", "location", "provenance"],
+            "properties": {
+              "id": { "type": "string", "description": "Stable source id (e.g. lecture-01) referenced by every downstream evidence field." },
+              "kind": { "enum": ["transcript", "playlist", "audio", "video", "notes", "document", "url", "other"], "description": "What the source material is." },
+              "location": { "type": "string", "description": "Where the source lives: file path, URL, or playlist id." },
+              "provenance": { "type": "string", "description": "How/where the source was obtained (downloaded, provided file, linked in task) and any timecode/indexing available." },
+              "constraints": { "type": "array", "items": { "type": "string" }, "description": "Per-source boundaries (language, allowed segments, redactions)." }
+            }
+          }
+        },
+        "constraints": { "type": "array", "items": { "type": "string" }, "description": "Boundaries from the request (language, scope, which lectures matter)." }
+      }
+    },
+    "lecture_mapping": {
+      "type": "object",
+      "description": "Bounded parallel mapping of the intake sources into evidence-grounded lecture units. Produced by the lecture_mapping (consilium) stage; the required 'lectures' array merges deterministically across slots (concat + JSON-identity dedupe), the required 'coverage' scalar resolves via the declared fan_in resolution.",
+      "required": ["lectures", "coverage"],
+      "properties": {
+        "coverage": { "type": "string", "description": "What was mapped vs. what remains unknown across the assigned source slice (deterministic first-slot synthesis of the parallel contributions)." },
+        "lectures": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "title", "source_id", "evidence"],
+            "properties": {
+              "id": { "type": "string", "description": "Stable unit id (e.g. lecture-01-unit-3)." },
+              "title": { "type": "string", "description": "Short title of the mapped unit." },
+              "source_id": { "type": "string", "description": "Intake source id this unit was mapped from." },
+              "evidence": { "type": "string", "description": "Quoted transcript/source evidence with timecode where available — required, entries without evidence are rejected." },
+              "claims": { "type": "array", "items": { "type": "string" }, "description": "Claims made in this unit." },
+              "concepts": { "type": "array", "items": { "type": "string" }, "description": "Key concepts covered." },
+              "uncertainty": { "type": "string", "description": "What is unknown/ambiguous in this unit." }
+            }
+          }
+        },
+        "gaps": { "type": "array", "items": { "type": "string" }, "description": "Sources or segments that could not be mapped, and why." },
+        "sources_consulted": { "type": "array", "items": { "type": "string" }, "description": "Intake source ids actually mapped (mergeable by fan-in)." }
+      }
+    },
+    "lecture_candidates": {
+      "type": "object",
+      "description": "Synthesized, deduplicated candidate findings produced by the synthesis (single analyst) stage. Each candidate is grounded in quoted evidence sources and records its dedupe/conflict history.",
+      "required": ["candidates"],
+      "properties": {
+        "candidates": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "topic", "evidence_sources", "conflicts"],
+            "properties": {
+              "id": { "type": "string", "description": "Stable candidate id (e.g. candidate-1)." },
+              "topic": { "type": "string", "description": "One synthesized finding: a deduped claim/insight grounded in the mapped lectures." },
+              "evidence_sources": {
+                "type": "array",
+                "minItems": 1,
+                "description": "Provenance: every claim is backed by these intake sources.",
+                "items": {
+                  "type": "object",
+                  "required": ["source_id", "evidence"],
+                  "properties": {
+                    "source_id": { "type": "string", "description": "Intake source id providing this evidence." },
+                    "evidence": { "type": "string", "description": "Quoted evidence / timecode backing this candidate." }
+                  }
+                }
+              },
+              "conflicts": {
+                "type": "array",
+                "description": "Dedupe/conflict record: overlapping claims merged here, disagreements listed with the winning source and the losing sources — never discarded silently. Empty array when no conflicts arose.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "claim": { "type": "string", "description": "The disputed claim." },
+                    "winner": { "type": "string", "description": "source_id that won the disagreement." },
+                    "losers": { "type": "array", "items": { "type": "string" }, "description": "source_ids whose versions lost." }
+                  }
+                }
+              },
+              "relevance": { "type": "string", "description": "Why this candidate matters for the intake task question." }
+            }
+          }
+        },
+        "deduped_count": { "type": "integer", "description": "Number of mapping units merged away during synthesis." }
+      }
+    },
+    "lecture_repo_fit": {
+      "type": "object",
+      "description": "Read-only repo-fit plus security/IP review of the candidates. Produced by the repo_fit (consilium) stage; the required 'findings' array merges deterministically across slots. Verdict is an optional per-slot summary — the approval stage is the authoritative decision point.",
+      "required": ["findings"],
+      "properties": {
+        "findings": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Repo-fit/security/IP findings, each grounded in observable evidence.",
+          "items": {
+            "type": "object",
+            "required": ["title", "category", "evidence"],
+            "properties": {
+              "title": { "type": "string", "description": "Short finding title." },
+              "category": { "enum": ["repo_fit", "mismatch", "security", "ip", "gap"], "description": "repo_fit = claim matches the codebase; mismatch = claim contradicts it; security/ip = review findings; gap = claim with no repo anchor." },
+              "evidence": { "type": "string", "description": "Concrete observable evidence: quoted source evidence, commit hash, file path, symbol." },
+              "files": { "type": "array", "items": { "type": "string" }, "description": "Repo file paths the finding cites." },
+              "symbols": { "type": "array", "items": { "type": "string" }, "description": "Repo symbols/APIs the finding cites." },
+              "commits": { "type": "array", "items": { "type": "string" }, "description": "Commit hashes the finding cites." },
+              "severity": { "enum": ["info", "warning", "critical"] }
+            }
+          }
+        },
+        "verdict": { "enum": ["fit", "needs_rework", "rejected"], "description": "Optional per-slot summary verdict; not a gate input." },
+        "unverified_claims": { "type": "array", "items": { "type": "string" }, "description": "Candidate claims the repository neither supports nor refutes." }
+      }
+    },
+    "lecture_decision": {
+      "type": "object",
+      "description": "Explicit human decision on the research findings, produced by the approval (orchestrator) stage. The approval gate completes for either an explicit 'approved' or 'rejected' verdict — both are terminal research outcomes and neither launches implementation. This workflow is research-only and never implements.",
+      "required": ["verdict"],
+      "properties": {
+        "verdict": { "enum": ["approved", "rejected"], "description": "Explicit decision. Gate: approval stage completes on 'approved' or 'rejected' — both terminal, neither starts implementation." },
+        "rationale": { "type": "string", "description": "Why approved/rejected (user words, or the documented autonomous decision)." },
+        "approved_candidates": { "type": "array", "items": { "type": "string" }, "description": "Candidate ids accepted for any follow-up." },
+        "next_steps": { "type": "array", "items": { "type": "string" }, "description": "Notes for a future, separately-classified slice — never started by this workflow." }
+      }
     }
   }
 }

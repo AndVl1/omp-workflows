@@ -7,7 +7,7 @@
 
 import type { ObservabilityPointer } from "../observability/events.js";
 
-export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "SPEC" | "REGRESS" | "INVESTIGATION" | "REVIEW" | "HOTFIX";
+export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "SPEC" | "REGRESS" | "INVESTIGATION" | "LECTURE_RESEARCH" | "REVIEW" | "HOTFIX";
 export type Complexity = "QUICK" | "MEDIUM" | "COMPLEX" | "CRITICAL";
 export type Confidence = "HIGH" | "MEDIUM" | "LOW";
 export type WorkflowName =
@@ -18,6 +18,7 @@ export type WorkflowName =
   | "bug-fix"
   | "emergency"
   | "research"
+  | "lecture-research"
   | "review"
   | "spec-preparation"
   | "feature-regression"
