@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.7] — 2026-08-18
+### Fixed
+- **Engine-owned workflow preparation** — `/do-work` now persists PHASE-0 classification through `workflow_prepare`, binds state to the canonical session cwd, and invalidates stale capabilities when continuing a run.
+
 ## [0.22.2] — 2026-08-17
 ### Fixed
 - **Tool-only stage instructions in `/do-work`** — the `/do-work` prompt no longer instructs reading workflow profile JSON from the filesystem or package paths. The orchestrator obtains the current stage contract exclusively through the OMP workflow tools: `workflow_begin` to arm the durable capability, `workflow_instructions` for the capability-aware stage contract (`stage.instructions`, roles, consumes, produces, checkpoint/gate, provenance), and a fresh `workflow_instructions` fetch after every `workflow_advance`; tool errors fail closed instead of guessing stage content.
