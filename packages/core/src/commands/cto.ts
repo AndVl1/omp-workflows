@@ -15,7 +15,6 @@
  * Design: vibe-report/sub-orchestration-2026-08-04.md
  */
 
-import { execSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { findProfileDir } from "../engine/profile.js";
@@ -27,6 +26,7 @@ import type { ModelClassification } from "../engine/run.js";
 import { parseAutonomousDirective } from "./envelope.js";
 import { buildClassificationPhaseZero, buildWorkflowMatrix } from "./classification-contract.js";
 import type { CommandContext } from "./types.js";
+import { DETACHED_BRANCH, NO_GIT_BRANCH, resolveActiveBranch } from "../engine/state.js";
 
 export interface ParsedCtoEnvelope {
   task: string;
@@ -58,12 +58,8 @@ export function parseEnvelope(args: string, cwd: string): ParsedCtoEnvelope {
   const issue = issueMatch ? Number(issueMatch[1]) : null;
   const task = (issueMatch ? cleaned.replace(issueMatch[0], "") : cleaned).trim();
 
-  let branch: string | null = null;
-  try {
-    branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd, encoding: "utf8" }).trim() || null;
-  } catch {
-    branch = null;
-  }
+  const activeBranch = resolveActiveBranch(cwd);
+  const branch = activeBranch === NO_GIT_BRANCH || activeBranch === DETACHED_BRANCH ? null : activeBranch;
   return { task, autonomyHint, autonomous: autonomyHint, issue, branch };
 }
 
@@ -236,7 +232,9 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     : "Workflow profile: `cto.json` not shipped yet — use the stage skeleton below and write the typed artifacts per stage.";
 
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
-  const branchMeta = envelope.branch ? `Branch: \`${envelope.branch}\`\n` : "Branch: (no git work tree)\n";
+  const branchMeta = envelope.branch
+    ? `Branch: \`${envelope.branch}\` (canonical session branch; persist this exact value)\n`
+    : "Branch: (no git work tree; strict workflow transitions cannot start)\n";
   const sessionMeta = opts.sessionId ? `Session: \`${opts.sessionId}\`\n` : "";
 
   return [
@@ -268,7 +266,7 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "\"autonomous_reason\": ... }`. `classification.autonomous` is the AUTHORITY — the legacy",
     "top-level `autonomous: <true|false>` line is read-compat only and never overrides a present",
     "classification. The persisted `autonomous` value is YOUR model decision — never the mechanical hint.",
-    "",
+    "Persist the exact canonical `branch` value from Metadata; do not infer or replace it.",
     persistenceContract(opts),
     "### Team registry (.omp/teams.json)",
     "| Team | Name | Scope | Profile | Lead | Roster |",
