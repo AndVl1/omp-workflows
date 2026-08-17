@@ -33,6 +33,7 @@ const TYPE_KEYWORDS: Record<TaskType, string[]> = {
   HOTFIX: ["urgent", "production", "critical", "asap", "hotfix", "incident"],
   REFACTOR: ["refactor", "clean up", "improve", "optimize", "rewrite"],
   OPS: ["build", "deploy", "test", "docker", "k8s", "ci", "pipeline", "infra"],
+  PRODUCT_DISCOVERY: ["product discovery", "product opportunity", "product direction", "product strategy", "market opportunity", "product-market fit", "product brief", "product requirements", "prd", "jtbd", "user problem", "validate idea", "product spec"],
 };
 
 const COMPLEXITY_HINTS: Record<Complexity, string[]> = {
@@ -53,8 +54,15 @@ export function keywordClassify(task: string): KeywordGuess {
 function pickType(lower: string): TaskType {
   // HOTFIX wins first; urgency beats everything else.
   if (TYPE_KEYWORDS.HOTFIX.some((k) => lower.includes(k))) return "HOTFIX";
-  if (TYPE_KEYWORDS.SPEC.some((k) => lower.includes(k))) return "SPEC";
+  // Explicit product phrases (product discovery, product brief/PRD, JTBD,
+  // user problem, validate idea, product spec) are product discovery, not
+  // implementation work — they must beat the generic SPEC match ("product
+  // spec" contains "spec"). Ordinary specifications without product framing
+  // still resolve to SPEC below; the scoring fallback never makes a bare
+  // "implement the spec" request product discovery.
+  if (TYPE_KEYWORDS.PRODUCT_DISCOVERY.some((k) => lower.includes(k))) return "PRODUCT_DISCOVERY";
   if (TYPE_KEYWORDS.REGRESS.some((k) => lower.includes(k))) return "REGRESS";
+  if (TYPE_KEYWORDS.SPEC.some((k) => lower.includes(k))) return "SPEC";
   const scored: Record<TaskType, number> = {
     FEATURE: 0,
     BUG_FIX: 0,
@@ -65,6 +73,7 @@ function pickType(lower: string): TaskType {
     HOTFIX: 0,
     REFACTOR: 0,
     OPS: 0,
+    PRODUCT_DISCOVERY: 0,
   };
   for (const t of Object.keys(TYPE_KEYWORDS) as TaskType[]) {
     for (const k of TYPE_KEYWORDS[t]) {

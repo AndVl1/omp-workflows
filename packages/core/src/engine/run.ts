@@ -89,8 +89,13 @@ export function resolveClassification(opts: Pick<RunOptions, "task" | "autonomou
         `classification gate: model classification incomplete (type=${model.type}, complexity=${model.complexity}, confidence=${model.confidence}, autonomous=${model.autonomous}). PHASE-0 must classify type, complexity, confidence and autonomous together; refusing to fall back to keyword guesses.`,
       );
     }
+    if (model.type === "PRODUCT_DISCOVERY" && model.autonomous) {
+      throw new Error(
+        "classification gate: PRODUCT_DISCOVERY is always human-approved; autonomous product discovery fails closed (reclassify with autonomous=false, the product_approval checkpoint is interactive-only)",
+      );
+    }
     const expected = resolveWorkflow(model.type, model.complexity, model.autonomous);
-    if (model.workflow !== undefined && model.workflow !== expected && (model.type === "SPEC" || model.type === "REGRESS")) {
+    if (model.workflow !== undefined && model.workflow !== expected && (model.type === "SPEC" || model.type === "REGRESS" || model.type === "PRODUCT_DISCOVERY")) {
       throw new Error(`classification gate: ${model.type} must resolve to '${expected}', got '${model.workflow}'`);
     }
     return {
@@ -105,6 +110,11 @@ export function resolveClassification(opts: Pick<RunOptions, "task" | "autonomou
   // Legacy path: keyword guess for type/complexity/confidence only; the
   // caller's explicit autonomous flag is used verbatim — never defaulted.
   const base = keywordClassify(opts.task);
+  if (base.type === "PRODUCT_DISCOVERY" && opts.autonomous) {
+    throw new Error(
+      "classification gate: PRODUCT_DISCOVERY is always human-approved; autonomous product discovery fails closed (reclassify with autonomous=false, the product_approval checkpoint is interactive-only)",
+    );
+  }
   return {
     type: base.type,
     complexity: base.complexity,

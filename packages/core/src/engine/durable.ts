@@ -12,7 +12,7 @@ import { isDoDComplete, isRootCauseDocumented, readDoD } from "./dod.js";
 import { validationGate } from "../gates/validation.js";
 import { buildDispatchMarker } from "../gates/dispatch.js";
 import { evaluatePredicate } from "./predicate.js";
-import { appendCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
+import { appendCheckpointDecision, findCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
 import { loopExhaustionKind, loopIterationRecord, loopReentryDecision, loopStateFor, resolveBackToStage } from "./loops.js";
 import {
   DEFAULT_FAN_IN_POLICY,
@@ -812,6 +812,32 @@ const NAMED_GATES: Record<string, (state: TeamState, artifactsDir: string) => st
   tests_passed: (_state, artifactsDir) => {
     const tests = objectArtifact(artifactsDir, "qa_tests");
     return tests?.build_status === "pass" ? null : "tests_passed gate requires qa_tests.build_status=pass";
+  },
+  /**
+   * Product approval gate. Requires a durable decision for the
+   * (stage, checkpoint) pair ('product_approval', 'product_approval'):
+   * recorded interactively, never autonomous, normalized to exactly one of
+   * the four allowed product decisions. Attached to both the
+   * `product_approval` stage (which records the decision) and the
+   * `product_handoff` stage (which consumes the approval record), so the
+   * decision lookup is keyed by the declaring stage id, not the gate host.
+   */
+  product_approval_recorded: (state) => {
+    const PRODUCT_APPROVAL_STAGE = "product_approval";
+    const PRODUCT_APPROVAL_CHECKPOINT = "product_approval";
+    const PRODUCT_DECISIONS = ["proceed", "needs_more_validation", "defer", "reject"];
+    const decision = findCheckpointDecision(state, PRODUCT_APPROVAL_STAGE, PRODUCT_APPROVAL_CHECKPOINT);
+    if (!decision) {
+      return "product_approval_recorded gate: no durable decision recorded for checkpoint 'product_approval' (stage 'product_approval'); the product owner must answer via workflow_checkpoint with mode=interactive and decision exactly one of proceed | needs_more_validation | defer | reject — no inferred consent";
+    }
+    if (decision.mode !== "interactive") {
+      return `product_approval_recorded gate: checkpoint 'product_approval' was recorded in mode '${decision.mode}', but product approval requires an interactive human decision — autonomous decisions are rejected`;
+    }
+    const normalized = decision.decision.trim().toLowerCase();
+    if (!PRODUCT_DECISIONS.includes(normalized)) {
+      return `product_approval_recorded gate: decision '${decision.decision}' is not one of the four allowed product approval decisions (proceed | needs_more_validation | defer | reject)`;
+    }
+    return null;
   },
 };
 

@@ -75,14 +75,15 @@ test("core: loadAllProfiles returns reusable core profiles", async () => {
   const profiles = await loadAllProfiles();
   assert.ok(profiles.length >= 11);
   const names = profiles.map((p) => p.name);
-  for (const name of ["lightweight", "full-feature", "debug-cycle", "cto", "feature-regression", "spec-preparation"]) {
+  for (const name of ["lightweight", "full-feature", "debug-cycle", "cto", "feature-regression", "spec-preparation", "product-discovery"]) {
     assert.ok(names.includes(name), `${name} profile is shipped`);
   }
   assert.ok(profiles.find((p) => p.name === "feature-regression")?.stages.every((stage) => stage.prompt), "regression stages carry prompts");
   assert.ok(profiles.find((p) => p.name === "spec-preparation")?.stages.every((stage) => stage.prompt), "spec stages carry prompts");
+  assert.ok(profiles.find((p) => p.name === "product-discovery")?.stages.every((stage) => stage.prompt), "product-discovery stages carry prompts");
 
   // The CTO profile is explicit-only: no classification may select it.
-  for (const type of ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX"] as const) {
+  for (const type of ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"] as const) {
     for (const complexity of ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] as const) {
       const selected = selectProfile(profiles, { type, complexity, confidence: "HIGH", workflow: "standard", autonomous: false });
       assert.notEqual(selected?.name, "cto", `${type}/${complexity} must not select cto`);
@@ -99,11 +100,12 @@ test("core: resolveWorkflow matrix", () => {
   assert.equal(resolveWorkflow("HOTFIX", "QUICK", false), "emergency");
   assert.equal(resolveWorkflow("INVESTIGATION", "QUICK", false), "research");
   assert.equal(resolveWorkflow("REVIEW", "QUICK", false), "review");
+  assert.equal(resolveWorkflow("PRODUCT_DISCOVERY", "QUICK", false), "product-discovery");
 });
-test("core: SPEC and REGRESS resolve to dedicated workflows for every complexity/autonomy combination", () => {
+test("core: SPEC, REGRESS and PRODUCT_DISCOVERY resolve to dedicated workflows for every complexity/autonomy combination", () => {
   const complexities = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] as const;
-  for (const type of ["SPEC", "REGRESS"] as const) {
-    const expected = type === "SPEC" ? "spec-preparation" : "feature-regression";
+  for (const type of ["SPEC", "REGRESS", "PRODUCT_DISCOVERY"] as const) {
+    const expected = type === "SPEC" ? "spec-preparation" : type === "PRODUCT_DISCOVERY" ? "product-discovery" : "feature-regression";
     for (const complexity of complexities) {
       for (const autonomous of [false, true]) {
         assert.equal(
@@ -153,6 +155,10 @@ test("core: defaultFullstackRoles includes generic regression roles", () => {
   assert.equal(defaultFullstackRoles["regression-planner"], "analyst");
   assert.equal(defaultFullstackRoles["regression-executor"], "manual-qa");
   assert.equal(defaultFullstackRoles["regression-oracle"], "qa");
+  assert.equal(defaultFullstackRoles["product-analyst"], "product-analyst");
+  assert.equal(defaultFullstackRoles["product-researcher"], "product-researcher");
+  assert.equal(defaultFullstackRoles["product-critic"], "product-critic");
+  assert.equal(defaultFullstackRoles["product-strategist"], "product-strategist");
 });
 
 test("core: registerTeamWorkflow registers gates but NOT commands", () => {
@@ -284,6 +290,10 @@ test("fullstack: agent frontmatter uses OMP class role with standard fallback", 
     qa: { classRole: "@qa", fallbackRole: "@task", thinkingLevel: "auto" },
     "security-tester": { classRole: "@security", fallbackRole: "@slow", thinkingLevel: "high" },
     "tech-researcher": { classRole: "@researcher", fallbackRole: "@smol", thinkingLevel: "medium" },
+    "product-analyst": { classRole: "@analyst", fallbackRole: "@task", thinkingLevel: "auto" },
+    "product-researcher": { classRole: "@researcher", fallbackRole: "@smol", thinkingLevel: "medium" },
+    "product-critic": { classRole: "@reviewer", fallbackRole: "@slow", thinkingLevel: "high" },
+    "product-strategist": { classRole: "@architect", fallbackRole: "@slow", thinkingLevel: "high" },
   };
   const supportedFields: Record<string, true> = {
     name: true,
@@ -384,7 +394,7 @@ test("fullstack: bundle imports core and registers engine", async () => {
   const core = await import("@andvl1/omp-workflows-core");
   assert.equal(typeof core.registerTeamWorkflow, "function");
   assert.equal(typeof core.defaultFullstackRoles, "object");
-  assert.equal(Object.keys(core.defaultFullstackRoles).length, 20);
+  assert.equal(Object.keys(core.defaultFullstackRoles).length, 24);
 });
 
 test("fullstack: default empty registerTeamWorkflow does not crash", () => {
