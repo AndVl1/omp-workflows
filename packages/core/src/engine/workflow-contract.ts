@@ -5,6 +5,7 @@ import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope } from "./scope.js";
 import { resolveActiveBranch, resolveState } from "./state.js";
 import { resolveStageDispatchSlots } from "./stage.js";
+import { artifactSchemaFor, type JsonSchemaDef } from "./artifact-contract.js";
 import type { StageDef, TeamState, WorkflowName } from "./types.js";
 
 export interface WorkflowContractOptions {
@@ -19,10 +20,17 @@ export interface WorkflowContractOptions {
 export interface WorkflowStageContract {
   id: string; title: string; type: StageDef["type"]; description: string; prompt: string;
   roles: Array<{ role: string; agent: string }>; parallel: boolean; consumes: string[]; produces: string[];
+  /** Exact JSON schemas for every declared output; null means the id is intentionally unconstrained. */
+  artifact_schemas: Record<string, JsonSchemaDef | null>;
   checkpoint: string | null; autonomous: string | null; gate: string | null; skip_if: string | null; loop: StageDef["loop"] | null;
   dispatch: { permitted: boolean; kind: "single" | "consilium" | null; expected_count: number; capability_id: string | null; cursor_epoch: string | null };
   instructions: string;
   provenance: { source: "workflow"; profilePath: string | null; profileHash: string; stageHash: string };
+}
+
+function artifactSchemasFor(stage: StageDef): Record<string, JsonSchemaDef | null> {
+  const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
+  return Object.fromEntries(produces.map((id) => [id, artifactSchemaFor(id)]));
 }
 
 export interface WorkflowContract {
@@ -99,6 +107,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     description: stage.description ?? "", prompt: stage.prompt ?? "",
     roles: slots.map(slot => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) })), parallel: stage.parallel ?? stage.type === "consilium",
     consumes: stage.consumes ?? [], produces: typeof stage.produces === "string" ? [stage.produces] : stage.produces ?? [],
+    artifact_schemas: artifactSchemasFor(stage),
     checkpoint: stage.checkpoint ?? null, autonomous: stage.autonomous ?? null, gate: stage.gate ?? null, skip_if: stage.skip_if ?? null, loop: stage.loop ?? null,
     dispatch: { permitted: dispatchAllowed, kind, expected_count: capability?.expected_count ?? slots.length, capability_id: capability?.capability_id ?? null, cursor_epoch: state?.cursor_epoch ?? null },
     instructions: instructions(stage, options.maxInstructions ?? 4000),

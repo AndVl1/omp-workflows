@@ -635,6 +635,8 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     assert.match(prompt, /workflow_advance`, call `workflow_instructions`/);
     assert.match(prompt, /handoff\.dispatch_markers/);
     assert.match(prompt, /tasks\[\]\.task/);
+    assert.match(prompt, /artifact_schemas/);
+    assert.match(prompt, /dod.*items.*MUST be objects/i);
 
     // No filesystem/package-path/plugin-root workflow content sourcing.
     assert.ok(!prompt.includes("findProfileDir"), "prompt must not reference the profile directory helper");
@@ -1035,6 +1037,10 @@ test("workflow contract supports an explicit stateless profile lookup", () => {
     assert.equal(contract.state.path, null);
     assert.equal(contract.provenance.statePath, null);
     assert.equal(contract.stage.id, "discovery");
+    assert.equal(contract.stage.artifact_schemas.discovery?.type, "object");
+    assert.deepEqual(contract.stage.artifact_schemas.discovery?.required, ["task", "branch"]);
+    assert.equal(contract.stage.artifact_schemas.dod?.properties?.items?.items?.type, "object");
+    assert.deepEqual(contract.stage.artifact_schemas.dod?.properties?.items?.items?.required, ["criterion", "verify_method", "status"]);
     assert.equal(contract.state.dispatch.allowed, false);
   } finally {
     rmSync(root, { recursive: true, force: true });

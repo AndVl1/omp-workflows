@@ -133,6 +133,41 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
   }
 });
 
+test("fullstack: workflow_instructions exposes declared artifact schemas", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-workflow-artifact-schemas-"));
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    writeBeginFixture(root, "main");
+    const tools = new Map<string, RegisteredTool>();
+    registerWorkflowTools({
+      zod: { z },
+      registerTool(tool: RegisteredTool) {
+        tools.set(tool.name, tool);
+      },
+    } as never);
+    const instructions = tools.get("workflow_instructions")!;
+    const response = await instructions.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
+    const details = response.details as {
+      stage?: {
+        artifact_schemas?: Record<string, {
+          type?: string;
+          required?: string[];
+          properties?: {
+            items?: { type?: string; items?: { type?: string; required?: string[] } };
+          };
+        } | null>;
+      };
+    };
+    const schemas = details.stage?.artifact_schemas ?? {};
+    assert.equal(schemas.discovery?.type, "object");
+    assert.deepEqual(schemas.discovery?.required, ["task", "branch"]);
+    assert.equal(schemas.dod?.properties?.items?.items?.type, "object");
+    assert.deepEqual(schemas.dod?.properties?.items?.items?.required, ["criterion", "verify_method", "status"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("fullstack: workflow tools register and fail closed with structured responses", async () => {
   const tools = new Map<string, RegisteredTool>();
   registerWorkflowTools({
