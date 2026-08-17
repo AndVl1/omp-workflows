@@ -509,6 +509,17 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
     assert.match(state?.reason ?? "", /canonical workflow state/);
     const artifact = orchestratorWriteGate({ toolName: "write", input: { actor: "worker", path: ".work-state/artifacts/report.json" } }, { cwd: root, hasUI: true });
     assert.equal(artifact, undefined);
+
+    const mountedWorkflowTool = orchestratorWriteGate(
+      { toolName: "write", input: { path: "xd://workflow_instructions", content: "{}" } },
+      { cwd: root, hasUI: true },
+    );
+    assert.equal(mountedWorkflowTool, undefined, "mounted xd tools are not project writes");
+    const mountedDiagnosticTool = orchestratorWriteGate(
+      { toolName: "write", input: { path: "xd://report_issue", content: "tool routing failed" } },
+      { cwd: root, hasUI: true },
+    );
+    assert.equal(mountedDiagnosticTool, undefined, "mounted diagnostics are not project writes");
     const worker = orchestratorWriteGate({ toolName: "write", input: { actor: "orchestrator", path: "src/app.ts" } }, { cwd: root, hasUI: false });
     assert.equal(worker, undefined);
     const bashEcho = orchestratorWriteGate({ toolName: "bash", input: { command: "echo hacked > src/app.ts" } }, { cwd: root, hasUI: true });

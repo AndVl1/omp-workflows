@@ -25,6 +25,9 @@ export function orchestratorWriteGate(
 ): { block?: boolean; reason?: string } | void {
   if (!hasStrictOrchestratorState(ctx.cwd)) return;
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
+  // The host invokes mounted `xd://` devices through the generic write
+  // transport. That transport is not a project filesystem mutation.
+  if (event.toolName !== "bash" && isMountedToolRouteInput(event.input)) return;
   const actor = trustedActorOf(ctx);
 
   if (event.toolName === "bash") {
@@ -80,6 +83,11 @@ function pathsFromInput(input: Record<string, unknown> | undefined): string[] {
   if (typeof raw === "string") return [raw];
   if (Array.isArray(raw)) return raw.filter((p): p is string => typeof p === "string");
   return [];
+}
+
+function isMountedToolRouteInput(input: Record<string, unknown> | undefined): boolean {
+  const paths = pathsFromInput(input);
+  return paths.length > 0 && paths.every((path) => path.trim().toLowerCase().startsWith("xd://"));
 }
 
 function isWorkStatePath(path: string, cwd: string): boolean {
@@ -200,6 +208,7 @@ export function workerWriteScopeGate(
   const scope = ctx.writeScope;
   if (!scope?.enabled) return;
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
+  if (event.toolName !== "bash" && isMountedToolRouteInput(event.input)) return;
   if (trustedActorOf(ctx) !== "worker") return;
   const paths = event.toolName === "bash" ? bashMutationTargets(String(event.input?.command ?? "")) : pathsFromInput(event.input);
   if (paths.length === 0) return;
