@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.9] — 2026-08-18
+### Fixed
+- **Typed artifact guidance** — `workflow_instructions` now returns the exact JSON schemas for declared artifacts, and `/do-work` explicitly requires schema-conformant output such as object-shaped DoD items.
+
 ## [0.22.8] — 2026-08-18
 ### Fixed
 - **Dispatch marker handoff** — `workflow_begin` now returns role-specific opaque dispatch markers and `/do-work` places them in each `task` payload, allowing strict consilium and single-stage dispatches to start.
