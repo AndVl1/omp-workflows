@@ -105,6 +105,61 @@ test("resolveState: complete legacy classification wins over an incomplete activ
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("beginCapability: migrates pre-durable top-level workflow state", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-legacy-state-migration-"));
+  try {
+    initGit(root, "main");
+    writeWorkflowState(root, {
+      task: "legacy spec task",
+      branch: "main",
+      classification: {
+        type: "SPEC",
+        complexity: "COMPLEX",
+        confidence: "HIGH",
+        autonomous: true,
+      },
+      workflow: "spec-preparation",
+      status: "in_progress",
+      pending_stages: ["research", "architecture", "specification", "review"],
+      history: [],
+    });
+
+    const resolved = resolveState(root, "main");
+    assert.equal(resolved.state?.classification.workflow, "spec-preparation");
+    assert.deepEqual(resolved.state?.stages, []);
+
+    const begun = beginCapability(root);
+    assert.equal(begun.ok, true);
+    assert.equal(begun.state?.stage_cursor, "intake_repo_map");
+    assert.ok(begun.state?.stages.some((stage) => stage.id === "intake_repo_map"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("beginCapability: remains fail-closed for incomplete state shapes", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-incomplete-state-shape-"));
+  try {
+    initGit(root, "main");
+    writeWorkflowState(root, {
+      task: "incomplete state",
+      branch: "main",
+      classification: {
+        type: "SPEC",
+        complexity: "COMPLEX",
+        confidence: "HIGH",
+        autonomous: true,
+        workflow: "spec-preparation",
+      },
+    });
+
+    const begun = beginCapability(root);
+    assert.equal(begun.ok, false);
+    assert.equal(begun.error, "workflow stages are missing");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 test("resolveState: rejects feature artifacts that escape through a symlink", () => {
   const root = mkdtempSync(join(tmpdir(), "state-artifact-symlink-"));
   try {
