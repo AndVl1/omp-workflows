@@ -5,6 +5,8 @@
  * guarantees; the JSON files on disk are loaded and validated against these shapes.
  */
 
+import type { ObservabilityPointer } from "../observability/events.js";
+
 export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "SPEC" | "REGRESS" | "INVESTIGATION" | "REVIEW" | "HOTFIX";
 export type Complexity = "QUICK" | "MEDIUM" | "COMPLEX" | "CRITICAL";
 export type Confidence = "HIGH" | "MEDIUM" | "LOW";
@@ -87,6 +89,16 @@ export interface StageDef {
   checkpoint?: string;
   /** Autonomous branch decision text. */
   autonomous?: string;
+  /** Bash stages: the deterministic shell command to execute. */
+  command?: string;
+  /**
+   * Explicit consilium fan-in resolutions: documented, deliberate handling
+   * of schema-required scalar disagreements for this stage's produces. A
+   * resolution applies only to exactly `(artifact, field)` and every applied
+   * resolution is recorded in the synthesis provenance (`conflicts`) with
+   * the winning slot and losing values — never a silent choice.
+   */
+  fan_in?: { resolutions?: StageFanInResolution[] };
   /** Gate condition; gate must hold for stage to be marked `done`. */
   gate?: string;
   /** Conditional roster adjustments. */
@@ -134,7 +146,26 @@ export interface DispatchRecord {
   completion?: DispatchCompletion;
 }
 
+/**
+ * A resolved dispatch occurrence for a stage. `slot` is the stable unique
+ * identity used by capability rosters, dispatch markers, authorization and
+ * join/reconciliation; `role` is the semantic profile role it derives from.
+ * Repeated semantic roles normalize to distinct deterministic slots (e.g.
+ * `analyst#1`, `analyst#2`) that all resolve to the same concrete agent, so
+ * multiplicity is never collapsed by Set/object-key deduplication.
+ */
+export interface DispatchSlot {
+  slot: string;
+  role: string;
+}
+
 export interface CapabilityRosterEntry {
+  /**
+   * Dispatch slot identity. For unique semantic roles this equals the role
+   * name; repeated roles normalize to stable numbered slots (`analyst#1`,
+   * `analyst#2`) so every occurrence is independently dispatchable while
+   * `agent` stays the configured concrete agent for the semantic role.
+   */
   role: string;
   agent: string;
 }
@@ -167,6 +198,111 @@ export interface JoinSummary {
   joined_at: string;
 }
 
+/**
+ * Durable checkpoint decision. Declared checkpoints (`stage.checkpoint`) are
+ * prompt/display metadata only until a decision is recorded here; advance
+ * refuses to leave a stage whose checkpoint is unresolved. `mode` records
+ * whether the decision came from an interactive user or the autonomous path,
+ * and `actor`/`rationale` preserve who decided and why.
+ */
+export interface CheckpointDecision {
+  stage_id: string;
+  checkpoint: string;
+  mode: "interactive" | "autonomous";
+  decision: string;
+  actor: string;
+  rationale: string;
+  decided_at: string;
+}
+
+/** Durable provenance of one slot's artifact contribution to a consilium stage. */
+export interface SlotArtifactRecord {
+  /** Absolute path of the namespaced per-slot snapshot (`<id>-<slot>.json`). */
+  path: string;
+  /** SHA-256 of the normalized artifact JSON captured at completion. */
+  hash: string;
+}
+
+/**
+ * Explicit fan-in resolution declared on a consilium stage. Declaring a
+ * resolution is the ONLY way a schema-required scalar disagreement may be
+ * resolved without blocking handoff; every applied resolution is recorded
+ * durably in the synthesis provenance (see {@link FanInConflictRecord}) so
+ * no disagreement is ever discarded silently.
+ */
+export interface StageFanInResolution {
+  /** Artifact id the resolution applies to (exact match). */
+  artifact: string;
+  /** Top-level field path within the artifact (e.g. `chosen`, `summary`). */
+  field: string;
+  /** Deterministic resolution strategy. */
+  strategy: "first_slot";
+  /** Why this disagreement is deliberately resolved (persisted verbatim). */
+  rationale: string;
+}
+
+/** Durable provenance of a resolved required-scalar disagreement. */
+export interface FanInConflictRecord {
+  artifact: string;
+  /** Field path the disagreement occurred at (e.g. `summary`). */
+  field: string;
+  /** How the disagreement was resolved: declared resolution or lenient policy. */
+  strategy: "first_slot" | "lenient";
+  /** The winning scalar value (deterministic first-slot-wins). */
+  resolved_value: unknown;
+  /** Slot whose value won (first roster-order contributor of the field). */
+  winner_slot: string;
+  /** Every slot that disagreed and the value it offered. */
+  losing_values: Array<{ slot: string; value: unknown }>;
+  /** Rationale of the declared resolution (or the lenient-policy explanation). */
+  rationale: string;
+  resolved_at: string;
+}
+
+/** Per-stage slot artifact provenance plus deterministic synthesis evidence. */
+export interface StageSlotRecords {
+  /** slot -> artifactId -> record */
+  slots: Record<string, Record<string, SlotArtifactRecord>>;
+  /**
+   * Deterministic synthesis provenance: artifactId -> contributing slots
+   * plus any resolved required-scalar disagreements (never silent).
+   */
+  shared?: Record<string, { slots: string[]; synthesized_at: string; conflicts?: FanInConflictRecord[] }>;
+}
+
+export interface LoopIterationRecord {
+  /** 1-based re-entry number (1 = first loop-back). */
+  iteration: number;
+  /** Cursor epoch that authorized the loop stage completion. */
+  from_epoch: string;
+  /** Fresh cursor epoch issued for the re-entered stage. */
+  to_epoch: string;
+  until_satisfied: boolean;
+  at: string;
+}
+
+/**
+ * Durable bounded-loop state. `reentries` counts the loop-backs actually
+ * performed; when the `until` expression still fails and `reentries` has
+ * reached `max_iterations`, the loop is exhausted and maps to
+ * `needs_human` or `failed` via `on_exhausted`.
+ */
+export interface LoopState {
+  /** Stage id that owns the loop. */
+  stage_id: string;
+  back_to: string;
+  until: string;
+  max_iterations: number;
+  on_exhausted: string;
+  reentries: number;
+  /** Cursor epoch of the most recent re-entry capability. */
+  epoch: string;
+  status: "running" | "complete" | "exhausted";
+  outcome?: "needs_human" | "failed";
+  history: LoopIterationRecord[];
+  ended_at?: string;
+}
+
 export interface TeamState {
   schema: 1;
   branch: string;
@@ -197,7 +333,13 @@ export interface TeamState {
   run_key?: string;
   dispatch_capability?: DispatchCapabilityState;
   join_summary?: JoinSummary;
-  observability?: import("../observability/events.js").ObservabilityPointer;
+  /** Durable checkpoint decisions (additive, schema:1 compatible). */
+  checkpoint_decisions?: CheckpointDecision[];
+  /** Durable bounded-loop state (additive). */
+  loop_state?: LoopState;
+  /** Per-slot consilium artifact provenance + synthesis evidence (additive). */
+  slot_artifacts?: Record<string, StageSlotRecords>;
+  observability?: ObservabilityPointer;
 }
 
 export interface RoleConfig {

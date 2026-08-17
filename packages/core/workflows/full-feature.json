@@ -20,7 +20,17 @@
       "roles": ["analyst", "tech-researcher", "analyst"],
       "parallel": true,
       "consumes": ["discovery"],
-      "produces": ["exploration", "dod"]
+      "produces": ["exploration", "dod"],
+      "fan_in": {
+        "resolutions": [
+          {
+            "artifact": "exploration",
+            "field": "summary",
+            "strategy": "first_slot",
+            "rationale": "Parallel exploration slots each summarize the codebase from their own angle; every slot's full summary stays available in its slot-scoped artifact (<id>-<slot>.json). The shared artifact deterministically resolves the required 'summary' scalar to the first roster slot's contribution so downstream stages receive a stable synthesis. Every applied disagreement is recorded in the synthesis provenance (conflicts) with the winning slot and losing values — never discarded silently."
+          }
+        ]
+      }
     },
     {
       "id": "clarify",
@@ -40,7 +50,17 @@
       "consumes": ["exploration", "clarifications"],
       "checkpoint": "user_choice",
       "autonomous": "pick option #1, record rationale",
-      "produces": "architecture"
+      "produces": "architecture",
+      "fan_in": {
+        "resolutions": [
+          {
+            "artifact": "architecture",
+            "field": "chosen",
+            "strategy": "first_slot",
+            "rationale": "Deliberate multi-option architecture consilium: each slot presents an option and the required 'chosen' scalar is resolved deterministically to the first roster slot's choice so the shared artifact can hand off. The immediately following 'user_choice' checkpoint is the authoritative decision point — interactive runs confirm or override it, autonomous runs record the documented default (option #1). Every disagreement is recorded in the synthesis provenance (conflicts) with the winning slot and losing values; no option is discarded silently."
+          }
+        ]
+      }
     },
     {
       "id": "implementation",

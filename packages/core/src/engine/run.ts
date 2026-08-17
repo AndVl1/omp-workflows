@@ -26,10 +26,12 @@ import { loadAllProfiles, profileHash, resolveWorkflow, selectProfile } from "./
 import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope } from "./scope.js";
 import { writeState, setStageStatus, setPause, resolveState, reopenFromFeedback } from "./state.js";
-import { authorizeDispatch, completeDispatch, advanceCursor, createCapability } from "./durable.js";
+import { authorizeDispatch, completeDispatch, advanceCursor, createCapability, recordCheckpointDecision } from "./durable.js";
+import { hasCheckpointDecision } from "./checkpoints.js";
 import { keywordClassify } from "./classify.js";
 import type { Classification, Complexity, Confidence, Profile, TaskType, TeamState, WorkflowName } from "./types.js";
-import { walkProfile, resolveStageDispatchRoles, type StageContext, type TaskCaller } from "./stage.js";
+import { walkProfile, resolveStageDispatchSlots, type StageContext, type TaskCaller } from "./stage.js";
+import type { DispatchSlot } from "./types.js";
 
 /**
  * The model's PHASE-0 classification. `type`, `complexity`, `confidence` and
@@ -130,10 +132,10 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     : opts.continuation && existing.state?.scope
       ? existing.state.scope
       : resolveScope([], config);
-  const resolveRoles = (stage: NonNullable<Profile["stages"][number]>): string[] =>
-    resolveStageDispatchRoles(stage, { cwd: opts.cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  const resolveSlots = (stage: NonNullable<Profile["stages"][number]>): DispatchSlot[] =>
+    resolveStageDispatchSlots(stage, { cwd: opts.cwd, flags, resolveDevAgent: () => flags.dev_agent });
   const expectedRoster = (stage: Profile["stages"][number]): Array<{ role: string; agent: string }> =>
-    resolveRoles(stage).map((role) => ({ role, agent: resolveAgentForRole(role, config) }));
+    resolveSlots(stage).map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
   const continuation = opts.continuation
     ? reopenFromFeedback(existing.state!, opts.continuation.feedback, opts.continuation.stageId)
     : null;
@@ -141,11 +143,16 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     ? { ...continuation, scope: flags, policy: { ...(continuation.policy ?? {}), strict_orchestrator: true } }
     : (() => {
         const stage = profile.stages[0];
-        const kind: "single" | "consilium" | null = stage?.type === "single" ? "single" : stage?.type === "consilium" ? "consilium" : null;
-        const issued = stage && kind
-          ? createCapability({ run_key: opts.branch, branch: opts.branch, workflow: profile.name, profile_hash: profileHash(profile), stage_cursor: stage.id, kind, expected_roster: expectedRoster(stage) })
+        // Mirror beginCapability: a capability is issued for the first stage
+        // regardless of type — non-dispatch stages (orchestrator/bash/none)
+        // get kind "none" with an empty roster, so the persisted state is
+        // self-consistent before the walk starts and checkpoint enforcement
+        // applies uniformly to every stage type.
+        const kind: "single" | "consilium" | "none" = stage?.type === "single" ? "single" : stage?.type === "consilium" ? "consilium" : "none";
+        const issued = stage
+          ? createCapability({ run_key: opts.branch, branch: opts.branch, workflow: profile.name, profile_hash: profileHash(profile), stage_cursor: stage.id, kind, expected_roster: kind === "none" ? [] : expectedRoster(stage) })
           : null;
-        return { schema: 1, branch: opts.branch, classification, task: opts.task, workflow_override: opts.classification?.workflow !== undefined, issue: opts.issue ?? null, stage_cursor: stage?.id ?? "", stages: profile.stages.map((s) => ({ id: s.id, status: "pending" as const })), pause: { kind: "none" as const, reason: "" }, artifacts: {}, scope: flags, policy: { strict_orchestrator: true }, profile_hash: profileHash(profile), run_key: opts.branch, cursor_epoch: issued?.state.issued_for?.cursor_epoch, dispatch_capability: issued?.state, updated_at: new Date().toISOString() } satisfies TeamState;
+        return { schema: 1, branch: opts.branch, classification, task: opts.task, workflow_override: opts.classification?.workflow !== undefined, issue: opts.issue ?? null, stage_cursor: stage?.id ?? "", stages: profile.stages.map((s) => ({ id: s.id, status: issued && s.id === stage?.id ? "in_progress" as const : "pending" as const })), pause: { kind: "none" as const, reason: "" }, artifacts: {}, scope: flags, policy: { strict_orchestrator: true }, profile_hash: profileHash(profile), run_key: opts.branch, cursor_epoch: issued?.state.issued_for?.cursor_epoch, dispatch_capability: issued?.state, updated_at: new Date().toISOString() } satisfies TeamState;
       })();
   const stateTarget = opts.continuation ? { target: existing } : {};
   const { statePath, artifactsDir } = writeState(opts.cwd, initialState, stateTarget);
@@ -165,11 +172,32 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     pause: opts.pause ?? (async () => undefined),
     onStageStart: (stageId) => {
       const current = readState(statePath);
+      // A durable advance (normal or loop re-entry) already armed this stage
+      // with a ready capability and the handoff secrets live in durableStage.
+      // Reuse it so loop re-entry keeps the fresh epoch issued by
+      // advanceCursor; do not re-mint a second capability for the same stage.
+      const armed = current.dispatch_capability;
+      if (
+        durableStage &&
+        durableStage.stageId === stageId &&
+        armed?.issued_for?.stage_cursor === stageId &&
+        (armed.status === "ready" || armed.status === "dispatched")
+      ) {
+        const next = setStageStatus(current, stageId, "in_progress", opts.cwd);
+        ctx.state = next;
+        writeState(opts.cwd, next, stateTarget);
+        return;
+      }
       const stage = profile.stages.find((candidate) => candidate.id === stageId);
-      const kind: "single" | "consilium" | null = stage?.type === "single" ? "single" : stage?.type === "consilium" ? "consilium" : null;
+      // A capability is bound for EVERY stage type so the durable advance
+      // (checkpoint enforcement, autonomous decision recording, atomic
+      // arming of the next stage) is available for orchestrator/bash/none
+      // stages exactly as it is for single/consilium. Non-dispatch stages
+      // get kind "none" with an empty roster, mirroring beginCapability.
+      const kind: "single" | "consilium" | "none" = stage?.type === "single" ? "single" : stage?.type === "consilium" ? "consilium" : "none";
       const next = setStageStatus(current, stageId, "in_progress", opts.cwd);
-      const issued = stage && kind
-        ? createCapability({ run_key: next.run_key ?? next.branch, branch: next.branch, workflow: profile.name, profile_hash: profileHash(profile), stage_cursor: stage.id, kind, expected_roster: expectedRoster(stage) })
+      const issued = stage
+        ? createCapability({ run_key: next.run_key ?? next.branch, branch: next.branch, workflow: profile.name, profile_hash: profileHash(profile), stage_cursor: stage.id, kind, expected_roster: kind === "none" ? [] : expectedRoster(stage) })
         : null;
       const nextState: TeamState = issued
         ? { ...next, run_key: next.run_key ?? next.branch, cursor_epoch: issued.state.issued_for!.cursor_epoch, profile_hash: profileHash(profile), dispatch_capability: issued.state }
@@ -205,6 +233,30 @@ export async function run(opts: RunOptions): Promise<RunResult> {
       advance: (evidence) => {
         if (!durableStage) return { ok: false, error: "durable stage unavailable" };
         const current = readState(statePath);
+        // Autonomous runs record the declared auto-decision for unresolved
+        // checkpoints before advance; interactive runs leave them unresolved
+        // so advance fails closed and the owning session records the user's
+        // decision via workflow_checkpoint.
+        const stageDef = profile.stages.find((candidate) => candidate.id === durableStage!.stageId);
+        if (stageDef?.checkpoint && current.classification.autonomous && !hasCheckpointDecision(current, stageDef.id, stageDef.checkpoint)) {
+          const recorded = recordCheckpointDecision(opts.cwd, {
+            token: durableStage.advanceToken,
+            capability_id: current.dispatch_capability?.capability_id ?? "",
+            run_key: current.run_key ?? current.branch,
+            branch: current.branch,
+            workflow: profile.name,
+            profile_hash: current.profile_hash ?? profileHash(profile),
+            stage_cursor: durableStage.stageId,
+            cursor_epoch: durableStage.epoch,
+            checkpoint: stageDef.checkpoint,
+            mode: "autonomous",
+            decision: "proceed",
+            actor: "orchestrator",
+            rationale: stageDef.autonomous ?? "autonomous mode",
+          });
+          if (!recorded.ok) return { ok: false, error: `checkpoint record failed: ${recorded.error}` };
+          ctx.state = recorded.state;
+        }
         const r = advanceCursor(opts.cwd, { token: durableStage.advanceToken, capability_id: current.dispatch_capability?.capability_id ?? "", run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, evidence });
         if (!r.ok) return { ok: false, error: `${r.error}: ${evidence}` };
         ctx.state = r.state;
@@ -214,10 +266,15 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     },
   };
   opts.log?.(`walking profile: ${profile.name} (${runnableProfile.stages.length} stages)`);
-  const outcomes = await walkProfile(runnableProfile, ctx);
+  const outcomes = await walkProfile(profile, ctx);
   const final = readState(statePath);
   const done = final.stages.every((s) => s.status === "done" || s.status === "skipped");
-  writeState(opts.cwd, setPause(final, done ? "done" : "failed", done ? "" : "one or more stages failed"), opts.continuation ? { target: existing } : {});
+  // A loop-exhaustion pause (needs_human/failed) is the durable outcome of
+  // the run; do not overwrite it with a generic status.
+  const terminal = final.pause.kind === "needs_human" || final.pause.kind === "failed"
+    ? final
+    : setPause(final, done ? "done" : "failed", done ? "" : "one or more stages failed");
+  writeState(opts.cwd, terminal, opts.continuation ? { target: existing } : {});
   return { classification, profile, outcomes: outcomes.map((o) => ({ stageId: o.stageId, status: o.status, note: o.note })), statePath };
 }
 

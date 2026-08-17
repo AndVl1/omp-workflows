@@ -17,7 +17,7 @@
  *   }
  */
 
-import { orchestratorWriteGate } from "./gates/orchestrator-write.js";
+import { orchestratorWriteGate, workerWriteScopeGate } from "./gates/orchestrator-write.js";
 import { dispatchGate, trustedDispatchRequests } from "./gates/dispatch.js";
 import type { ExtensionAPI, BeforeAgentStartEvent, SessionStopEvent, ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
 import { classificationGate, classificationToolGate } from "./gates/classification.js";
@@ -30,7 +30,8 @@ import { ctoSliceTaskGate } from "./cto/slice-gate.js";
 import { registerObservabilityHooks, recordToolCallAttempt } from "./observability/index.js";
 import { authorizeDispatchTrusted, reconcileTrustedTaskResult } from "./engine/durable.js";
 import { registerWorkflowProfiles } from "./engine/profile.js";
-import type { RoleConfig } from "./engine/types.js";
+import type { Profile, RoleConfig } from "./engine/types.js";
+import type { WorkerWriteScope } from "./gates/orchestrator-write.js";
 export interface RegisterOptions {
   label?: string;
   roles?: RoleConfig["roles"];
@@ -38,8 +39,14 @@ export interface RegisterOptions {
   scopeMap?: RoleConfig["scope_map"];
   flags?: RoleConfig["flags"];
   designSystem?: string | null;
-  workflowProfiles?: import("./engine/types.js").Profile[];
+  workflowProfiles?: Profile[];
   observability?: boolean;
+  /**
+   * Bounded write_scope experiment: when enabled, worker source writes are
+   * narrowed to the declared scope after the orchestrator gate. Off by
+   * default — shipped workflows keep the single-writer model.
+   */
+  writeScope?: WorkerWriteScope;
 }
 
 export type CommandId = "do-work" | "team" | "cto" | "init-team" | "interview" | "omp-model-roles";
@@ -146,6 +153,9 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     run(outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], c));
     run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c));
     run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], c));
+    // Bounded write_scope experiment: composed AFTER the orchestrator gate,
+    // so it can only narrow worker writes, never weaken the boundary.
+    run(workerWriteScopeGate(event as unknown as Parameters<typeof workerWriteScopeGate>[0], { ...c, writeScope: opts.writeScope }));
     run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c));
     run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c));
     run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], c));
@@ -244,11 +254,68 @@ export {
   reconcileTrustedTaskResult,
   advanceCursor,
   reconcileTaskResult,
+  recordCheckpointDecision,
+  setArtifactContractPolicy,
+  setFanInPolicy,
+  type CheckpointDecisionInput,
   type DispatchAuth,
   type TrustedDispatchInput,
   type CapabilityHandoff,
   type TransitionResult,
 } from "./engine/durable.js";
+export {
+  parseExpression,
+  evaluatePredicate,
+  evaluateExpression,
+  validateProfileExpressions,
+  deepEqual,
+  type PredicateAst,
+  type PredicateContext,
+  type PredicateResult,
+  type PredicateParseResult,
+  type PredicateTerm,
+} from "./engine/predicate.js";
+export {
+  loadArtifactSchemas,
+  artifactSchemaFor,
+  requiredFieldsOf,
+  validateProducedArtifact,
+  validateConsumedArtifacts,
+  DEFAULT_ARTIFACT_CONTRACT_POLICY,
+  type ArtifactContractPolicy,
+  type ArtifactIssue,
+  type ArtifactValidationResult,
+  type ConsumeDiagnostic,
+  type ConsumeValidationResult,
+  type JsonSchemaDef,
+} from "./engine/artifact-contract.js";
+export {
+  findCheckpointDecision,
+  hasCheckpointDecision,
+  appendCheckpointDecision,
+  unresolvedCheckpointError,
+} from "./engine/checkpoints.js";
+export {
+  loopExhaustionKind,
+  loopStateFor,
+  loopReentryDecision,
+  resolveBackToStage,
+  loopIterationRecord,
+} from "./engine/loops.js";
+export {
+  sanitizeSlot,
+  namespacedArtifactId,
+  isNamespacedArtifactId,
+  slotRecordsFor,
+  missingSlotResults,
+  mergeSlotValues,
+  synthesizeArtifacts,
+  validateStageFanInResolutions,
+  DEFAULT_FAN_IN_POLICY,
+  type FanInPolicy,
+  type MergeResult,
+  type SynthesisResult,
+} from "./engine/fan-in.js";
 export {
   resolveWorkflowContract,
   resolveStageInstructions,
@@ -282,7 +349,7 @@ export {
 	isDoDComplete,
 	isRootCauseDocumented,
 } from "./engine/dod.js";
-export { orchestratorWriteGate, actorOf, hasStrictOrchestratorState } from "./gates/orchestrator-write.js";
+export { orchestratorWriteGate, workerWriteScopeGate, actorOf, hasStrictOrchestratorState, type WorkerWriteScope } from "./gates/orchestrator-write.js";
 export {
 	run,
 	resolveClassification,
@@ -320,6 +387,13 @@ export type {
   DispatchRecord,
   DispatchCapabilityState,
   JoinSummary,
+  CheckpointDecision,
+  SlotArtifactRecord,
+  StageSlotRecords,
+  StageFanInResolution,
+  FanInConflictRecord,
+  LoopIterationRecord,
+  LoopState,
 } from "./engine/types.js";
 // ── CTO sub-orchestration (pure engine) ────────────────────────────────────
 export { MAX_TEAMS, MAX_DECOMPOSITION_DEPTH } from "./cto/types.js";

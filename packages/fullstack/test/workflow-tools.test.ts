@@ -18,7 +18,7 @@ test("fullstack: workflow tools register and fail closed with structured respons
     },
   } as never);
 
-  assert.deepEqual([...tools.keys()], ["workflow_begin", "workflow_status", "workflow_instructions", "workflow_complete", "workflow_advance"]);
+  assert.deepEqual([...tools.keys()], ["workflow_begin", "workflow_status", "workflow_instructions", "workflow_complete", "workflow_checkpoint", "workflow_advance"]);
   for (const name of tools.keys()) {
     assert.ok(tools.get(name)?.parameters, `${name} exposes a parameter schema`);
   }

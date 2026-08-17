@@ -30,6 +30,7 @@ import {
   beginCapability,
   completeDispatch,
   advanceCursor,
+  recordCheckpointDecision,
   resolveState,
   type DispatchAuth,
 } from "@andvl1/omp-workflows-core";
@@ -270,6 +271,28 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
         const transition = completeDispatch(cwd, { ...input, completed_by: "workflow_complete" });
         return transition.ok ? result({ ok: true, transition: "complete", dispatch_id: input.dispatch_id, state: transition.state, record: transition.record }) : result({ ok: false, code: "WORKFLOW_COMPLETE_REJECTED", error: transition.error, dispatch_id: input.dispatch_id });
       } catch (error) { return result({ ok: false, code: "WORKFLOW_COMPLETE_FAILED", error: String(error), dispatch_id: input.dispatch_id }); }
+    },
+  });
+  pi.registerTool({
+    name: "workflow_checkpoint",
+    label: "Record checkpoint decision",
+    description: "Persist a durable decision for a declared stage checkpoint (interactive user answer or autonomous rationale). Unresolved checkpoints block workflow_advance.",
+    parameters: z.object({
+      token: z.string().min(1), capability_id: z.string().min(1),
+      run_key: z.string().min(1), branch: z.string().min(1), workflow: z.string().min(1), profile_hash: z.string().min(1), stage_cursor: z.string().min(1), cursor_epoch: z.string().min(1),
+      checkpoint: z.string().min(1), mode: z.enum(["interactive", "autonomous"]), decision: z.string().min(1),
+      actor: z.string().default("orchestrator"), rationale: z.string().default(""),
+    }) as never,
+    async execute(_id, params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      const cwd = resolveSessionCwd(ctx);
+      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      const input = params as DispatchAuth & { checkpoint: string; mode: "interactive" | "autonomous"; decision: string; actor: string; rationale: string };
+      try {
+        const transition = recordCheckpointDecision(cwd, input);
+        return transition.ok ? result({ ok: true, transition: "checkpoint", checkpoint: input.checkpoint, state: stateSummary(cwd) }) : result({ ok: false, code: "WORKFLOW_CHECKPOINT_REJECTED", error: transition.error });
+      } catch (error) { return result({ ok: false, code: "WORKFLOW_CHECKPOINT_FAILED", error: String(error) }); }
     },
   });
   pi.registerTool({

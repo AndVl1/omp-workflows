@@ -14,7 +14,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
-import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
+import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { registerTeamWorkflow } from "../src/index.js";
@@ -575,10 +575,12 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
     assert.equal(reconciled.ok, true);
     mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
     writeFileSync(join(root, ".work-state", "artifacts", "result.json"), "{}");
+    writeFileSync(join(root, ".work-state", "artifacts", "discovery.json"), JSON.stringify({ task: "capability test", branch: "feature/capability" }));
     writeFileSync(join(root, ".work-state", "artifacts", "implementation.json"), JSON.stringify({
       ready: true,
       validation_run: true,
       validation_evidence: "focused durable capability test",
+      files_touched: ["src/main.ts"],
     }));
     const replay = completeDispatch(root, {
       token: handoff.dispatch_token,
@@ -598,6 +600,21 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
       artifact_ids: ["result"],
     });
     assert.equal(replay.ok, true);
+
+    // lightweight implementation declares a checkpoint; record the durable
+    // decision before advance is allowed.
+    const checkpoint = recordCheckpointDecision(root, {
+      token: handoff.advance_token,
+      capability_id: handoff.capability_id,
+      run_key: handoff.run_key,
+      branch: handoff.branch,
+      workflow: handoff.workflow,
+      profile_hash: handoff.profile_hash,
+      stage_cursor: handoff.stage_cursor,
+      cursor_epoch: handoff.cursor_epoch,
+      checkpoint: "approve_implementation", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "fixture",
+    });
+    assert.equal(checkpoint.ok, true);
 
     const advanced = advanceCursor(root, {
       token: handoff.advance_token,
@@ -779,6 +796,7 @@ test("advance handoff resolves the next stage roster", () => {
       ready: true,
       validation_run: true,
       validation_evidence: "focused handoff test",
+      files_touched: ["src/main.ts"],
     }));
     const authInput = {
       token: issued.dispatch_token,
@@ -802,6 +820,12 @@ test("advance handoff resolves the next stage roster", () => {
       evidence: "task completed",
     });
     assert.equal(completed.ok, true);
+    const checkpoint = recordCheckpointDecision(root, {
+      ...authInput,
+      token: issued.advance_token,
+      checkpoint: "approve_implementation", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "fixture",
+    });
+    assert.equal(checkpoint.ok, true);
     const advanced = advanceCursor(root, {
       ...authInput,
       token: issued.advance_token,

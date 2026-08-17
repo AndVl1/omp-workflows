@@ -17,7 +17,17 @@
       "roles": ["analyst", "tech-researcher", "diagnostics"],
       "parallel": true,
       "consumes": ["discovery"],
-      "produces": "exploration"
+      "produces": "exploration",
+      "fan_in": {
+        "resolutions": [
+          {
+            "artifact": "exploration",
+            "field": "summary",
+            "strategy": "first_slot",
+            "rationale": "Parallel exploration slots each summarize the codebase from their own angle; every slot's full summary stays available in its slot-scoped artifact (<id>-<slot>.json). The shared artifact deterministically resolves the required 'summary' scalar to the first roster slot's contribution so downstream stages receive a stable synthesis. Every applied disagreement is recorded in the synthesis provenance (conflicts) with the winning slot and losing values — never discarded silently."
+          }
+        ]
+      }
     },
     {
       "id": "summary",

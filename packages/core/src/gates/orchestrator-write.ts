@@ -157,3 +157,63 @@ export function hasStrictOrchestratorState(cwd: string): boolean {
   if (resolved.invalid) return true;
   return resolved.state?.policy?.strict_orchestrator === true;
 }
+
+// ── Bounded write_scope experiment (scope 7) ───────────────────────────────
+//
+// Advisory-only worker path matcher, OFF by default. When enabled it is
+// composed AFTER orchestratorWriteGate and can only ADD blocks (narrow the
+// paths a worker may write); it can never weaken the orchestrator boundary
+// or the canonical-state protection. Shipped defaults keep the single-writer
+// model: no write_scope is configured unless a bundle opts in explicitly.
+
+export interface WorkerWriteScope {
+  enabled: boolean;
+  /** Glob patterns a worker may write (relative to the project root). */
+  allow: string[];
+  /** Glob patterns a worker may never write (deny wins over allow). */
+  deny?: string[];
+}
+
+function matchesAnyGlob(path: string, patterns: string[]): boolean {
+  const normalized = path.replace(/\\/g, "/");
+  for (const pattern of patterns) {
+    const candidate = pattern.replace(/\\/g, "/");
+    if (candidate === normalized) return true;
+    if (candidate.endsWith("/**") && normalized.startsWith(candidate.slice(0, -3))) return true;
+    if (candidate.endsWith("/") && normalized.startsWith(candidate)) return true;
+    const base = candidate.replace(/\/\*$/u, "");
+    if (base !== candidate && (normalized === base || normalized.startsWith(`${base}/`))) return true;
+  }
+  return false;
+}
+
+/**
+ * Narrowing gate for worker source writes. Composed after
+ * orchestratorWriteGate in `registerTeamWorkflow`; it only ever blocks
+ * worker writes outside the declared scope. Non-worker actors and disabled
+ * scopes are unaffected.
+ */
+export function workerWriteScopeGate(
+  event: ToolCallEvent,
+  ctx: ToolCallContext & { writeScope?: WorkerWriteScope },
+): { block?: boolean; reason?: string } | void {
+  const scope = ctx.writeScope;
+  if (!scope?.enabled) return;
+  if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
+  if (trustedActorOf(ctx) !== "worker") return;
+  const paths = event.toolName === "bash" ? bashMutationTargets(String(event.input?.command ?? "")) : pathsFromInput(event.input);
+  if (paths.length === 0) return;
+  for (const path of paths) {
+    const absolute = isAbsolute(path) ? resolve(path) : resolve(ctx.cwd, path);
+    const rel = relative(resolve(ctx.cwd), absolute);
+    if (rel.startsWith("..") || isAbsolute(rel)) {
+      return { block: true, reason: `write_scope: worker target '${path}' escapes the project root` };
+    }
+    if (matchesAnyGlob(rel, scope.deny ?? [])) {
+      return { block: true, reason: `write_scope: worker write to '${rel}' is denied by write_scope` };
+    }
+    if (!matchesAnyGlob(rel, scope.allow)) {
+      return { block: true, reason: `write_scope: worker write to '${rel}' is outside the declared write scope` };
+    }
+  }
+}
