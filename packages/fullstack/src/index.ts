@@ -31,8 +31,11 @@ import {
   completeDispatch,
   advanceCursor,
   recordCheckpointDecision,
+  prepareWorkflowState,
   resolveState,
   type DispatchAuth,
+  type ModelClassification,
+  type WorkflowPrepareOptions,
 } from "@andvl1/omp-workflows-core";
 import { registerWorkflowCommands } from "./workflow-commands.js";
 import { ensureCommandsForSession } from "./copy-commands.js";
@@ -210,6 +213,71 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
       } : null,
     };
   };
+  const classificationParameters = z.object({
+    type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX"]),
+    complexity: z.enum(["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"]),
+    confidence: z.enum(["HIGH", "MEDIUM", "LOW"]),
+    autonomous: z.boolean(),
+    autonomous_reason: z.string().optional(),
+    workflow: z.string().optional(),
+  });
+  pi.registerTool({
+    name: "workflow_prepare",
+    label: "Prepare workflow state",
+    description: "Persist PHASE-0 classification and initialize or reopen engine-owned workflow state.",
+    parameters: z.object({
+      task: z.string().min(1),
+      branch: z.string().min(1),
+      classification: classificationParameters.optional(),
+      files: z.array(z.string().min(1)).default(() => []),
+      issue: z.union([z.number().int(), z.object({ number: z.number().int(), url: z.string().optional() })]).nullable().default(null),
+      continuation: z.object({
+        feedback: z.string().min(1),
+        stageId: z.string().min(1),
+      }).optional(),
+    }) as never,
+    async execute(_id, params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      const cwd = resolveSessionCwd(ctx);
+      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      const input = params as {
+        task: string;
+        branch: string;
+        classification?: ModelClassification;
+        files?: string[];
+        issue?: number | { number: number; url?: string } | null;
+        continuation?: { feedback: string; stageId: string };
+      };
+      if (!input.continuation && !input.classification) {
+        return result({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: "new workflow preparation requires a complete classification" });
+      }
+      try {
+        const options: WorkflowPrepareOptions = {
+          task: input.task,
+          cwd,
+          branch: input.branch,
+          autonomous: input.classification?.autonomous ?? false,
+          classification: input.classification,
+          files: input.files,
+          issue: typeof input.issue === "number" ? { number: input.issue } : input.issue ?? null,
+          continuation: input.continuation,
+        };
+        const prepared = prepareWorkflowState(options);
+        return result({
+          ok: true,
+          transition: "prepare",
+          state_path: prepared.statePath,
+          artifacts_dir: prepared.artifactsDir,
+          workflow: prepared.profile.name,
+          classification: prepared.classification,
+          state: stateSummary(cwd),
+        });
+      } catch (error) {
+        return result({ ok: false, code: "WORKFLOW_PREPARE_FAILED", error: String(error) });
+      }
+    },
+  });
   pi.registerTool({
     name: "workflow_begin",
     label: "Begin workflow stage",

@@ -26,6 +26,7 @@ import {
   keywordClassify,
   resolveWorkflow,
   resolveClassification,
+  prepareWorkflowState,
   classificationGate,
   buildCtoPrompt,
 } from "@andvl1/omp-workflows-core";
@@ -58,6 +59,39 @@ test("do-work: stale active-feature state starts a new workflow", () => {
     const prompt = buildDoWorkPrompt({ task: "feedback", autonomyHint: false, issue: null, branch: "feat/current" }, root);
     assert.match(prompt, /No existing do-work state was found/);
     assert.doesNotMatch(prompt, /resumable continuation/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare: stale active-feature state is replaced for the current branch", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-stale-feature-"));
+  try {
+    initGit(root, "main");
+    mkdirSync(join(root, ".work-state", "features", "old"), { recursive: true });
+    writeFileSync(join(root, ".work-state", ".active-feature"), "old\n");
+    writeFileSync(join(root, ".work-state", "features", "old", "state.json"), JSON.stringify({
+      schema: 1,
+      branch: "feat/old",
+      task: "previous fix",
+      classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "bug-fix" },
+      stage_cursor: "discovery",
+      stages: [{ id: "discovery", status: "pending" }],
+      artifacts: {},
+      pause: { kind: "none", reason: "" },
+    }));
+    const prepared = prepareWorkflowState({
+      task: "current branch fix",
+      cwd: root,
+      branch: "main",
+      autonomous: false,
+      classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false },
+      files: [],
+      issue: null,
+    });
+    assert.equal(prepared.statePath, join(root, ".work-state", "features", "main", "state.json"));
+    assert.equal(resolveState(root, "main").state?.branch, "main");
+    assert.equal(readFileSync(join(root, ".work-state", ".active-feature"), "utf8"), "main\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -576,16 +610,22 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     assert.ok(!existsSync(join(root, "packages", "core")), "temp consumer cwd has no packages/core");
     const prompt = buildDoWorkPrompt(parseWorkEnvelope("Fix login bug", root), root);
 
-    // Step 1 must be an explicit tool-only sequence: workflow_begin first,
-    // then workflow_instructions as the ONLY workflow instruction source.
+    // Step 1 must be an explicit tool-only sequence: workflow_prepare first,
+    // then workflow_begin and workflow_instructions as the ONLY workflow instruction source.
     assert.ok(
-      prompt.includes("workflow_begin"),
-      "prompt must require workflow_begin after state is persisted",
+      prompt.includes("workflow_prepare"),
+      "prompt must require workflow_prepare before state transitions",
+    );
+    assert.ok(
+      prompt.indexOf("workflow_prepare") < prompt.indexOf("workflow_begin"),
+      "workflow_prepare must precede workflow_begin in the tool sequence",
     );
     assert.ok(
       prompt.indexOf("workflow_begin") < prompt.indexOf("workflow_instructions"),
       "workflow_begin must precede workflow_instructions in the tool sequence",
     );
+    assert.match(prompt, /ONLY supported state initialization\/update path/);
+    assert.doesNotMatch(prompt, /Then write `.work-state\/team-state\.json`/);
     assert.ok(
       prompt.includes("stage.instructions"),
       "prompt must name the returned stage contract field stage.instructions",

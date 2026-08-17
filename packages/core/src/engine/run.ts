@@ -24,12 +24,12 @@
 import { readFileSync } from "node:fs";
 import { loadAllProfiles, profileHash, resolveWorkflow, selectProfile } from "./profile.js";
 import { resolveConfig, resolveAgentForRole } from "./config.js";
-import { resolveScope } from "./scope.js";
-import { writeState, setStageStatus, setPause, resolveState, reopenFromFeedback } from "./state.js";
+import { resolveScope, type ScopeFlags } from "./scope.js";
+import { writeState, setStageStatus, setPause, resolveState, reopenFromFeedback, type ResolvedState } from "./state.js";
 import { authorizeDispatch, completeDispatch, advanceCursor, createCapability, recordCheckpointDecision } from "./durable.js";
 import { hasCheckpointDecision } from "./checkpoints.js";
 import { keywordClassify } from "./classify.js";
-import type { Classification, Complexity, Confidence, Profile, TaskType, TeamState, WorkflowName } from "./types.js";
+import type { Classification, Complexity, Confidence, Profile, RoleConfig, TaskType, TeamState, WorkflowName } from "./types.js";
 import { walkProfile, resolveStageDispatchSlots, type StageContext, type TaskCaller } from "./stage.js";
 import type { DispatchSlot } from "./types.js";
 
@@ -114,48 +114,85 @@ export function resolveClassification(opts: Pick<RunOptions, "task" | "autonomou
   };
 }
 
-export async function run(opts: RunOptions): Promise<RunResult> {
+export type WorkflowPrepareOptions = Pick<RunOptions, "task" | "cwd" | "branch" | "autonomous" | "classification" | "files" | "issue" | "continuation">;
+
+export interface PreparedWorkflowState {
+  config: RoleConfig;
+  profile: Profile;
+  flags: ScopeFlags;
+  classification: Classification;
+  state: TeamState;
+  statePath: string;
+  artifactsDir: string;
+  stateTarget: { target?: ResolvedState };
+  expectedRoster: (stage: NonNullable<Profile["stages"][number]>) => Array<{ role: string; agent: string }>;
+}
+
+/**
+ * Persist a new PHASE-0 classification through the engine-owned state writer.
+ * The interactive orchestrator must call this helper through `workflow_prepare`
+ * instead of editing canonical `.work-state` files directly.
+ */
+export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWorkflowState {
   const config = resolveConfig(opts.cwd);
   const profiles = loadAllProfiles();
   const existing = resolveState(opts.cwd, opts.branch);
-  if (opts.continuation && (!existing.state || existing.isStale)) {
+  const isContinuation = Boolean(opts.continuation);
+  if (existing.invalid) throw new Error("workflow state is invalid or unsafe");
+  if (isContinuation && (!existing.state || existing.isStale)) {
     throw new Error(`cannot continue workflow: no non-stale state for branch ${opts.branch}`);
   }
-  const persistedClassification = opts.continuation ? existing.state?.classification : undefined;
+  if (!isContinuation && existing.state && !existing.isStale) {
+    throw new Error("workflow state already exists for this branch; use continuation mode");
+  }
+
+  const persistedClassification = isContinuation ? existing.state?.classification : undefined;
   const classification = persistedClassification ?? resolveClassification(opts);
   const profile = persistedClassification
     ? profiles.find((candidate) => candidate.name === persistedClassification.workflow)
     : selectProfile(profiles, classification);
   if (!profile) throw new Error(`no profile matches classification ${JSON.stringify(classification)}`);
-  const flags = opts.files
+
+  const flags = opts.files !== undefined
     ? resolveScope(opts.files, config)
-    : opts.continuation && existing.state?.scope
+    : isContinuation && existing.state?.scope
       ? existing.state.scope
       : resolveScope([], config);
   const resolveSlots = (stage: NonNullable<Profile["stages"][number]>): DispatchSlot[] =>
     resolveStageDispatchSlots(stage, { cwd: opts.cwd, flags, resolveDevAgent: () => flags.dev_agent });
-  const expectedRoster = (stage: Profile["stages"][number]): Array<{ role: string; agent: string }> =>
+  const expectedRoster = (stage: NonNullable<Profile["stages"][number]>): Array<{ role: string; agent: string }> =>
     resolveSlots(stage).map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
-  const continuation = opts.continuation
+
+  const reopened = opts.continuation
     ? reopenFromFeedback(existing.state!, opts.continuation.feedback, opts.continuation.stageId)
     : null;
-  const initialState: TeamState = continuation
-    ? { ...continuation, scope: flags, policy: { ...(continuation.policy ?? {}), strict_orchestrator: true } }
-    : (() => {
-        const stage = profile.stages[0];
-        // Mirror beginCapability: a capability is issued for the first stage
-        // regardless of type — non-dispatch stages (orchestrator/bash/none)
-        // get kind "none" with an empty roster, so the persisted state is
-        // self-consistent before the walk starts and checkpoint enforcement
-        // applies uniformly to every stage type.
-        const kind: "single" | "consilium" | "none" = stage?.type === "single" ? "single" : stage?.type === "consilium" ? "consilium" : "none";
-        const issued = stage
-          ? createCapability({ run_key: opts.branch, branch: opts.branch, workflow: profile.name, profile_hash: profileHash(profile), stage_cursor: stage.id, kind, expected_roster: kind === "none" ? [] : expectedRoster(stage) })
-          : null;
-        return { schema: 1, branch: opts.branch, classification, task: opts.task, workflow_override: opts.classification?.workflow !== undefined, issue: opts.issue ?? null, stage_cursor: stage?.id ?? "", stages: profile.stages.map((s) => ({ id: s.id, status: issued && s.id === stage?.id ? "in_progress" as const : "pending" as const })), pause: { kind: "none" as const, reason: "" }, artifacts: {}, scope: flags, policy: { strict_orchestrator: true }, profile_hash: profileHash(profile), run_key: opts.branch, cursor_epoch: issued?.state.issued_for?.cursor_epoch, dispatch_capability: issued?.state, updated_at: new Date().toISOString() } satisfies TeamState;
-      })();
-  const stateTarget = opts.continuation ? { target: existing } : {};
-  const { statePath, artifactsDir } = writeState(opts.cwd, initialState, stateTarget);
+  const state: TeamState = reopened
+    ? { ...reopened, dispatch_capability: undefined, cursor_epoch: undefined, scope: flags, policy: { ...(reopened.policy ?? {}), strict_orchestrator: true } }
+    : {
+        schema: 1,
+        branch: opts.branch,
+        classification,
+        task: opts.task,
+        workflow_override: opts.classification?.workflow !== undefined,
+        issue: opts.issue ?? null,
+        stage_cursor: profile.stages[0]?.id ?? "",
+        stages: profile.stages.map((s) => ({ id: s.id, status: "pending" as const })),
+        pause: { kind: "none" as const, reason: "" },
+        artifacts: {},
+        scope: flags,
+        policy: { strict_orchestrator: true },
+        profile_hash: profileHash(profile),
+        run_key: opts.branch,
+        updated_at: new Date().toISOString(),
+      } satisfies TeamState;
+  const stateTarget = isContinuation ? { target: existing } : {};
+  const { statePath, artifactsDir } = writeState(opts.cwd, state, stateTarget);
+  return { config, profile, flags, classification, state, statePath, artifactsDir, stateTarget, expectedRoster };
+}
+
+export async function run(opts: RunOptions): Promise<RunResult> {
+  const prepared = prepareWorkflowState(opts);
+  const { config, profile, flags, classification, state: initialState, statePath, artifactsDir, stateTarget, expectedRoster } = prepared;
   const completed = new Set(initialState.stages.filter((s) => s.status === "done" || s.status === "skipped").map((s) => s.id));
   const runnableProfile = completed.size === 0 ? profile : { ...profile, stages: profile.stages.filter((s) => !completed.has(s.id)) };
   let durableStage: { stageId: string; dispatchToken: string; advanceToken: string; epoch: string } | null = null;
@@ -274,7 +311,7 @@ export async function run(opts: RunOptions): Promise<RunResult> {
   const terminal = final.pause.kind === "needs_human" || final.pause.kind === "failed"
     ? final
     : setPause(final, done ? "done" : "failed", done ? "" : "one or more stages failed");
-  writeState(opts.cwd, terminal, opts.continuation ? { target: existing } : {});
+  writeState(opts.cwd, terminal, stateTarget);
   return { classification, profile, outcomes: outcomes.map((o) => ({ stageId: o.stageId, status: o.status, note: o.note })), statePath };
 }
 
