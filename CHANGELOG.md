@@ -2,6 +2,16 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.0] — 2026-08-17
+### Added
+- **Durable workflow engine** — workflows now run against a durable execution cursor with typed workflow contracts, capability-scoped dispatch, and stage-level enforcement, so resumed runs replay authoritative state instead of re-deriving it from stale in-memory data.
+- **Artifact contracts** — stage inputs and outputs are validated against declarative artifact schemas at runtime boundaries; malformed or missing artifacts fail closed instead of propagating downstream.
+- **Strict fan-in** — parallel stage completion is gated by deterministic fan-in that waits for all required upstream outputs and rejects unknown or duplicate contributors.
+- **Checkpoints** — durable stage checkpoints persist progress between turns, enabling safe resumption after interruption or role handoff without re-running completed stages.
+- **Bounded loops** — iterative workflow stages are bounded with explicit iteration caps and loop guards, preventing runaway re-processing.
+- **Skip-aware transitions** — stage transitions are predicate-driven and skip-aware: explicitly skipped stages are recorded in the cursor and never silently re-run or re-validated as completed.
+- **`write_scope` experiment** — experimental gate restricting worker writes to declared scopes, enforcing read-only/append-only boundaries for orchestrator and worker phases.
+
 ## [0.21.1] — 2026-08-16
 ### Fixed
 - **OMP extension schema compatibility** — mutable `artifact_ids` defaults now use a factory, allowing validation on OMP 17.3+.
