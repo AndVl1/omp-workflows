@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { dispatchGate } from "@andvl1/omp-workflows-core";
 import { registerWorkflowTools } from "../src/index.js";
 
 type RegisteredTool = {
@@ -41,6 +42,96 @@ function writeBeginFixture(root: string, branch: string): void {
     pause: { kind: "none", reason: "" },
   }) + "\n");
 }
+
+function writeConsiliumBeginFixture(root: string): void {
+  mkdirSync(join(root, ".work-state"), { recursive: true });
+  writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
+    schema: 1,
+    branch: "main",
+    run_key: "main",
+    classification: {
+      type: "SPEC",
+      complexity: "COMPLEX",
+      confidence: "HIGH",
+      autonomous: true,
+      workflow: "spec-preparation",
+    },
+    task: "consilium marker regression",
+    stage_cursor: "intake_repo_map",
+    stages: [{ id: "intake_repo_map", status: "in_progress" }],
+    artifacts: {},
+    scope: {
+      scope: [],
+      has_security: false,
+      has_infra: false,
+      has_ui: false,
+      has_runtime: false,
+      dev_agent: null,
+    },
+    policy: { strict_orchestrator: true },
+    pause: { kind: "none", reason: "" },
+  }) + "\n");
+}
+
+test("fullstack: workflow_begin exposes role-bound dispatch markers", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-workflow-marker-handoff-"));
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    writeConsiliumBeginFixture(root);
+    const tools = new Map<string, RegisteredTool>();
+    registerWorkflowTools({
+      zod: { z },
+      registerTool(tool: RegisteredTool) {
+        tools.set(tool.name, tool);
+      },
+    } as never);
+
+    const begin = tools.get("workflow_begin")!;
+    const response = await begin.execute(
+      "test",
+      {},
+      undefined,
+      undefined,
+      { cwd: root, hasUI: true } as never,
+    );
+    const details = response.details as {
+      ok?: boolean;
+      handoff?: {
+        run_key: string;
+        stage_cursor: string;
+        cursor_epoch: string;
+        dispatch_markers?: Array<{ role: string; agent: string; marker: string }>;
+      };
+    };
+    assert.equal(details.ok, true);
+    const markers = details.handoff?.dispatch_markers ?? [];
+    assert.deepEqual(
+      markers.map(({ role, agent }) => ({ role, agent })),
+      [
+        { role: "analyst", agent: "analyst" },
+        { role: "tech-researcher", agent: "tech-researcher" },
+      ],
+    );
+    for (const marker of markers) {
+      assert.match(marker.marker, /<!-- omp-dispatch run=main stage=intake_repo_map kind=consilium/);
+      assert.match(marker.marker, new RegExp(`cursor=${details.handoff?.cursor_epoch}`));
+      assert.match(marker.marker, new RegExp(`role=${marker.role}`));
+    }
+    const gate = dispatchGate({
+      toolName: "task",
+      input: {
+        tasks: markers.map(({ role, agent, marker }) => ({
+          role,
+          agent,
+          task: `${marker}\nComplete the declared intake work.`,
+        })),
+      },
+    }, { cwd: root });
+    assert.equal(gate, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("fullstack: workflow tools register and fail closed with structured responses", async () => {
   const tools = new Map<string, RegisteredTool>();

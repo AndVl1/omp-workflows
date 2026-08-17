@@ -633,6 +633,8 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     assert.match(prompt, /only workflow instruction source/i);
     // After every workflow_advance the model must re-fetch workflow_instructions.
     assert.match(prompt, /workflow_advance`, call `workflow_instructions`/);
+    assert.match(prompt, /handoff\.dispatch_markers/);
+    assert.match(prompt, /tasks\[\]\.task/);
 
     // No filesystem/package-path/plugin-root workflow content sourcing.
     assert.ok(!prompt.includes("findProfileDir"), "prompt must not reference the profile directory helper");

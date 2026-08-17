@@ -9,6 +9,7 @@ import { resolveStageDispatchSlots } from "./stage.js";
 import { readArtifact, writeArtifact } from "./artifacts.js";
 import { isDoDComplete, isRootCauseDocumented, readDoD } from "./dod.js";
 import { validationGate } from "../gates/validation.js";
+import { buildDispatchMarker } from "../gates/dispatch.js";
 import { evaluatePredicate } from "./predicate.js";
 import { appendCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
 import { loopExhaustionKind, loopIterationRecord, loopReentryDecision, loopStateFor, resolveBackToStage } from "./loops.js";
@@ -123,14 +124,24 @@ export interface CapabilityHandoff {
   cursor_epoch: string;
   kind: "none" | "single" | "consilium";
   expected_roster: Array<{ role: string; agent: string }>;
+  dispatch_markers: Array<{ role: string; agent: string; marker: string }>;
 }
 
 function handoffFromState(
   state: TeamState,
   secrets: { capability_id: string; dispatch_token: string; advance_token: string },
+  stage: StageDef,
 ): CapabilityHandoff | undefined {
   const cap = activeCapability(state.dispatch_capability);
   if (!cap) return undefined;
+  const roles = cap.expected_roster.map(({ role }) => role);
+  const dispatch_markers = cap.kind === "none"
+    ? []
+    : cap.expected_roster.map(({ role, agent }) => ({
+      role,
+      agent,
+      marker: buildDispatchMarker(cap.issued_for.run_key, stage, roles, role, cap.issued_for.cursor_epoch),
+    }));
   return {
     capability_id: secrets.capability_id,
     dispatch_token: secrets.dispatch_token,
@@ -143,8 +154,10 @@ function handoffFromState(
     cursor_epoch: cap.issued_for.cursor_epoch,
     kind: cap.kind,
     expected_roster: cap.expected_roster,
+    dispatch_markers,
   };
 }
+
 
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
 const now = (): string => new Date().toISOString();
@@ -264,7 +277,7 @@ export function beginCapability(cwd: string): TransitionResult {
       capability_id: issued.capability_id,
       dispatch_token: issued.dispatch_token,
       advance_token: issued.advance_token,
-    }),
+    }, stage),
   };
 }
 function auth(cap: ActiveCapability, a: DispatchAuth, secretHash: string): string | null {
@@ -815,7 +828,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
     pause: nextStage ? state.pause : { kind: "done", reason: "" },
   };
   persist(cwd, next, target);
-  return { ok: true, state: next, handoff: handoffSecrets ? handoffFromState(next, handoffSecrets) : undefined };
+  return { ok: true, state: next, handoff: nextStage && handoffSecrets ? handoffFromState(next, handoffSecrets, nextStage) : undefined };
 }
 
 /**
@@ -898,7 +911,7 @@ function reenterLoop(
       capability_id: issued.capability_id,
       dispatch_token: issued.dispatch_token,
       advance_token: issued.advance_token,
-    }),
+    }, backToStage),
   };
 }
 
