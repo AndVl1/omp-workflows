@@ -4,7 +4,6 @@ import { resolve } from "node:path";
 import { parseAutonomousDirective } from "./envelope.js";
 import { buildClassificationPhaseZero, buildWorkflowMatrix } from "./classification-contract.js";
 import { resolveState } from "../engine/state.js";
-import { findProfileDir } from "../engine/profile.js";
 import type { Complexity, TaskType, WorkflowName } from "../engine/types.js";
 
 export interface ParsedWorkEnvelope {
@@ -55,7 +54,6 @@ function loadTeamConfig(cwd: string): WorkTeamConfig {
 export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): string {
   const roles = Object.entries(loadTeamConfig(cwd).roles ?? {});
   const roleTable = roles.map(([role, agent]) => `| \`${role}\` | \`${agent}\` |`).join("\n");
-  const profileDir = findProfileDir();
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
   const branchMeta = envelope.branch ? `Branch: \`${envelope.branch}\`\n` : "Branch: (no git work tree)\n";
   const resolvedState = resolveState(cwd, envelope.branch ?? undefined);
@@ -92,12 +90,14 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "(unless `autonomous` is true; then document a conservative default).",
     "",
     "### Only after state is written",
-    `1. Read exactly the resolved workflow profile JSON and then its stages: \`${profileDir}/<workflow>.json\`. The absolute profile directory \`${profileDir}\` ships with this installed package and is the only valid source for its workflow profiles — must not use Claude Code-only CLAUDE_PLUGIN_ROOT paths or \`omp://\` guesses for them, and never invent a \`.md\` profile path.`,
-    "2. Continue executing in THIS TURN. Do not stop after printing CLASSIFICATION or writing state; immediately read the profile and walk its stages.",
-    "3. On continuation, skip stages already done/skipped and start at the first reopened or pending stage.",
-    "4. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch.",
-    "5. Honour gates, checkpoints, loops, typed artifacts, and the validation contract.",
-    "6. When a stage or the whole workflow finishes, remain available in this same session: later user feedback reopens the affected state instead of starting a fresh workflow.",
+    "1. Call `workflow_begin` to issue the durable opaque capability for the current stage. If it fails, stop and record the error — never guess stage content.",
+    "2. Call `workflow_instructions` and treat its returned current stage contract (`stage.instructions`, `roles`, `consumes`, `produces`, `checkpoint`/`gate`, `provenance`) as the ONLY workflow instruction source. Do not read, glob, or infer workflow profile JSON from the filesystem, package paths, or plugin directories.",
+    "3. Continue executing in THIS TURN. Do not stop after printing CLASSIFICATION or writing state; immediately call `workflow_begin` and `workflow_instructions` and walk the returned stage contract.",
+    "4. On continuation, skip stages already done/skipped and start at the first reopened or pending stage.",
+    "5. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch.",
+    "6. Honour gates, checkpoints, loops, typed artifacts, and the validation contract.",
+    "7. After every `workflow_advance`, call `workflow_instructions` again and use the returned next-stage contract. If any workflow tool errors, fail closed: stop and record the failure rather than guessing the stage.",
+    "8. When a stage or the whole workflow finishes, remain available in this same session: later user feedback reopens the affected state instead of starting a fresh workflow.",
     "",
     "### Role mapping (from .omp/team.config.json)",
     "| Role | Agent |",

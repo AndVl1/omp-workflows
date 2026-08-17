@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, profileHash, findProfileDir } from "../src/engine/profile.js";
+import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
@@ -460,23 +460,37 @@ test("do-work prompt makes orchestrator non-coding policy explicit", () => {
   }
 });
 
-test("do-work: prompt exposes the absolute installed profile dir for an arbitrary consumer cwd", () => {
+test("do-work: prompt is tool-only for workflow content and never instructs filesystem profile reads", () => {
   // Arbitrary consumer project: a fresh temp dir, no packages/core anywhere.
   const root = mkdtempSync(join(tmpdir(), "do-work-consumer-"));
   try {
     assert.ok(!existsSync(join(root, "packages", "core")), "temp consumer cwd has no packages/core");
     const prompt = buildDoWorkPrompt(parseWorkEnvelope("Fix login bug", root), root);
+
+    // Step 1 must be an explicit tool-only sequence: workflow_begin first,
+    // then workflow_instructions as the ONLY workflow instruction source.
     assert.ok(
-      prompt.includes(findProfileDir()),
-      "prompt must expose the absolute installed workflow profile directory (findProfileDir)",
+      prompt.includes("workflow_begin"),
+      "prompt must require workflow_begin after state is persisted",
     );
     assert.ok(
-      prompt.includes(`${findProfileDir()}/<workflow>.json`),
-      "prompt must instruct reading <absolute-profile-dir>/<workflow>.json",
+      prompt.indexOf("workflow_begin") < prompt.indexOf("workflow_instructions"),
+      "workflow_begin must precede workflow_instructions in the tool sequence",
     );
-    assert.match(prompt, /must not use/);
-    assert.match(prompt, /CLAUDE_PLUGIN_ROOT/);
-    assert.match(prompt, /omp:\/\//);
+    assert.ok(
+      prompt.includes("stage.instructions"),
+      "prompt must name the returned stage contract field stage.instructions",
+    );
+    assert.match(prompt, /only workflow instruction source/i);
+    // After every workflow_advance the model must re-fetch workflow_instructions.
+    assert.match(prompt, /workflow_advance`, call `workflow_instructions`/);
+
+    // No filesystem/package-path/plugin-root workflow content sourcing.
+    assert.ok(!prompt.includes("findProfileDir"), "prompt must not reference the profile directory helper");
+    assert.ok(!prompt.includes("<workflow>.json"), "prompt must not instruct reading workflow JSON from disk");
+    assert.ok(!prompt.includes("CLAUDE_PLUGIN_ROOT"), "prompt must not mention CLAUDE_PLUGIN_ROOT");
+    assert.ok(!prompt.includes("omp://"), "prompt must not mention omp:// for workflow content");
+    assert.match(prompt, /Do NOT glob for workflow files/, "prompt must forbid globbing workflow files");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
