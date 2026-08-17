@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.6] — 2026-08-17
+### Fixed
+- **Mounted workflow-tool routing** — strict orchestrator write policy no longer misclassifies the host's generic `write` transport for `xd://workflow_instructions` and `xd://report_issue` as project filesystem writes. Source and canonical `.work-state` write protections remain enforced.
+
 ## [0.22.2] — 2026-08-17
 ### Fixed
 - **Tool-only stage instructions in `/do-work`** — the `/do-work` prompt no longer instructs reading workflow profile JSON from the filesystem or package paths. The orchestrator obtains the current stage contract exclusively through the OMP workflow tools: `workflow_begin` to arm the durable capability, `workflow_instructions` for the capability-aware stage contract (`stage.instructions`, roles, consumes, produces, checkpoint/gate, provenance), and a fresh `workflow_instructions` fetch after every `workflow_advance`; tool errors fail closed instead of guessing stage content.
