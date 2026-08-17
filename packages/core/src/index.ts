@@ -72,6 +72,10 @@ export const defaultFullstackRoles: RoleConfig["roles"] = {
   "regression-planner": "analyst",
   "regression-executor": "manual-qa",
   "regression-oracle": "qa",
+  "product-analyst": "product-analyst",
+  "product-researcher": "product-researcher",
+  "product-critic": "product-critic",
+  "product-strategist": "product-strategist",
 };
 
 

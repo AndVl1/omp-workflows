@@ -481,6 +481,8 @@ test("cto-slice-gate: timing sanity — small valid state completes < 50ms (arch
 
 test("cto-slice-gate: validateSliceClassification / validateSliceWorkflow units", () => {
   assert.equal(validateSliceClassification({ type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: true }), null);
+  // Every TaskType must be accepted, including the product-discovery intent.
+  assert.equal(validateSliceClassification({ type: "PRODUCT_DISCOVERY", complexity: "COMPLEX", confidence: "HIGH", autonomous: false }), null);
   assert.match(validateSliceClassification({ type: "NOPE", complexity: "MEDIUM", confidence: "HIGH", autonomous: true }) ?? "", /type/);
   assert.match(validateSliceClassification({ type: "FEATURE", complexity: "BIG", confidence: "HIGH", autonomous: true }) ?? "", /complexity/);
   assert.match(validateSliceClassification({ type: "FEATURE", complexity: "MEDIUM", confidence: "SURE", autonomous: true }) ?? "", /confidence/);

@@ -35,7 +35,7 @@ import type { CtoState } from "./types.js";
 /** Routing-marker prefix — a CTO slice task call carries `<!-- omp-cto-slice ... -->`. */
 export const CTO_SLICE_MARKER_PREFIX = "<!-- omp-cto-slice";
 
-const TASK_TYPES: readonly TaskType[] = ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX"];
+const TASK_TYPES: readonly TaskType[] = ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"];
 const COMPLEXITIES: readonly Complexity[] = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"];
 const CONFIDENCES: readonly Confidence[] = ["HIGH", "MEDIUM", "LOW"];
 

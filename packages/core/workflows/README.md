@@ -60,8 +60,11 @@ OR `match.complexity` is absent).
 4. `standard`
 5. `lightweight`
 6. `research`
-7. `review`
-8. `emergency`
+7. `product-discovery`
+8. `spec-preparation`
+9. `feature-regression`
+10. `review`
+11. `emergency`
 
 Resulting table (every Type × Complexity resolves):
 
@@ -74,11 +77,32 @@ Resulting table (every Type × Complexity resolves):
 | INVESTIGATION | research | research | research | research |
 | REVIEW | review | review | review | review |
 | HOTFIX | emergency | emergency | emergency | emergency |
+| SPEC | spec-preparation | spec-preparation | spec-preparation | spec-preparation |
+| REGRESS | feature-regression | feature-regression | feature-regression | feature-regression |
+| PRODUCT_DISCOVERY | product-discovery | product-discovery | product-discovery | product-discovery |
 
 **Fallback**: if no profile matches (e.g. a custom type), the interpreter uses `standard`.
 
 **Autonomous override**: in autonomous mode, every `BUG_FIX` uses `debug-cycle` regardless
 of complexity (the diagnostics ↔ manual-qa loop is how a hypothesis is formed without a human).
+
+### Product discovery vs specification
+
+`PRODUCT_DISCOVERY` and `SPEC` are deliberately distinct first-class intents:
+
+- **`product-discovery`** answers **what to build and why** — product-level only. It is
+  evidence-first (every claim is `verified | assumption | unknown` with a source), never
+  touches application code, and always ends in an **interactive product-owner approval**
+  (`product_approval` checkpoint, decision exactly one of
+  `proceed | needs_more_validation | defer | reject`, recorded via `workflow_checkpoint`
+  with `mode=interactive` — no inferred consent, no auto-approval). Because the decision is
+  always human-made, **autonomous product discovery fails closed**: a `PRODUCT_DISCOVERY`
+  classification with `autonomous=true` is rejected at the classification gate.
+- **`spec-preparation`** answers **how to build it** — it turns a confirmed direction (a
+  `product_spec` handoff from an approved discovery, or a standalone SPEC request) into an
+  implementation-ready specification with requirements, options, architecture slices, and a
+  completeness gate. Its intake stage optionally consumes `product_spec` as approved product
+  context; the absence of that artifact never blocks a standalone SPEC.
 
 This table is mirrored in `hooks/validate-state.sh` (P5) — the classification gate blocks
 launching agents if `team-state.json`'s `workflow` does not match its `classification`.

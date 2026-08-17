@@ -8,7 +8,7 @@
 import type { AgentMappingState } from "./agent-mapping.js";
 import type { ObservabilityPointer } from "../observability/events.js";
 
-export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "SPEC" | "REGRESS" | "INVESTIGATION" | "REVIEW" | "HOTFIX";
+export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "SPEC" | "REGRESS" | "INVESTIGATION" | "REVIEW" | "HOTFIX" | "PRODUCT_DISCOVERY";
 export type Complexity = "QUICK" | "MEDIUM" | "COMPLEX" | "CRITICAL";
 export type Confidence = "HIGH" | "MEDIUM" | "LOW";
 export type WorkflowName =
@@ -22,6 +22,7 @@ export type WorkflowName =
   | "review"
   | "spec-preparation"
   | "feature-regression"
+  | "product-discovery"
   | "cto"
   | (string & {});
 
@@ -375,6 +376,10 @@ export const DEFAULT_ROLES: RoleConfig["roles"] = {
   "code-reviewer": "code-reviewer",
   "security-tester": "security-tester",
   devops: "devops",
+  "product-analyst": "product-analyst",
+  "product-researcher": "product-researcher",
+  "product-critic": "product-critic",
+  "product-strategist": "product-strategist",
 };
 
 export const DEFAULT_SCOPE_MAP: RoleConfig["scope_map"] = [
