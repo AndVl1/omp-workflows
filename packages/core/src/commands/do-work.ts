@@ -1,9 +1,8 @@
-import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseAutonomousDirective } from "./envelope.js";
 import { buildClassificationPhaseZero, buildWorkflowMatrix } from "./classification-contract.js";
-import { resolveState } from "../engine/state.js";
+import { DETACHED_BRANCH, NO_GIT_BRANCH, resolveActiveBranch, resolveState } from "../engine/state.js";
 import type { Complexity, TaskType, WorkflowName } from "../engine/types.js";
 
 export interface ParsedWorkEnvelope {
@@ -31,12 +30,8 @@ export function parseWorkEnvelope(args: string, cwd: string): ParsedWorkEnvelope
   const issueMatch = cleaned.match(/issue=#(\d+)/);
   const issue = issueMatch ? Number(issueMatch[1]) : null;
   const task = (issueMatch ? cleaned.replace(issueMatch[0], "") : cleaned).trim();
-  let branch: string | null = null;
-  try {
-    branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd, encoding: "utf8" }).trim() || null;
-  } catch {
-    branch = null;
-  }
+  const activeBranch = resolveActiveBranch(cwd);
+  const branch = activeBranch === NO_GIT_BRANCH || activeBranch === DETACHED_BRANCH ? null : activeBranch;
   return { task, autonomyHint, autonomous: autonomyHint, issue, branch };
 }
 
@@ -55,7 +50,9 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
   const roles = Object.entries(loadTeamConfig(cwd).roles ?? {});
   const roleTable = roles.map(([role, agent]) => `| \`${role}\` | \`${agent}\` |`).join("\n");
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
-  const branchMeta = envelope.branch ? `Branch: \`${envelope.branch}\`\n` : "Branch: (no git work tree)\n";
+  const branchMeta = envelope.branch
+    ? `Branch: \`${envelope.branch}\` (canonical session branch; persist this exact value)\n`
+    : "Branch: (no git work tree; strict workflow transitions cannot start)\n";
   const resolvedState = resolveState(cwd, envelope.branch ?? undefined);
   let continuation = "No existing do-work state was found. Start a new workflow.";
   if (resolvedState.state && !resolvedState.isStale && resolvedState.statePath) {
@@ -83,9 +80,10 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "",
     "Then write `.work-state/team-state.json` (or the active feature state) with the classification",
     "(type, complexity, confidence, autonomous, autonomous_reason), the resolved workflow, the task,",
-    "and the initial pending stages only when starting a new workflow. For a continuation, update the",
-    "existing state in place and preserve its history. This state write is the gate before any",
-    "investigation or delegation — the P5 gate reads `classification.autonomous` as the authority.",
+    "the exact canonical `branch` value from Metadata, and the initial pending stages only when",
+    "starting a new workflow. For a continuation, update the existing state in place and preserve",
+    "its history. This state write is the gate before any investigation or delegation — the P5 gate",
+    "reads `classification.autonomous` as the authority.",
     "If confidence is LOW, ask a focused clarification question before writing an expansive workflow",
     "(unless `autonomous` is true; then document a conservative default).",
     "",

@@ -27,6 +27,10 @@ test("dispatcher lifecycle: session cwd resolves from context with a process.cwd
   assert.equal(resolveSessionCwd(undefined), undefined);
   assert.equal(resolveSessionCwd(null), undefined);
 });
+test("dispatcher lifecycle: canonical session manager cwd wins over a stale context cwd", () => {
+  const sessionManager = { getCwd: () => "/canonical/project" };
+  assert.equal(resolveSessionCwd({ cwd: "/stale/project", sessionManager }), "/canonical/project");
+});
 
 test("dispatcher lifecycle: session_start without context cwd still starts the dispatcher", () => {
   const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
