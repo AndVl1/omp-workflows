@@ -10,7 +10,7 @@
  *   - stale state (branch != current)
  *   - pause.kind in background_wait | user_checkpoint | needs_human | failed
  *   - override marker .work-state/.dod-override present
- *   - workflow in research | review | emergency (no implementation phase)
+ *   - workflow in research | review | emergency | lecture-research (no implementation phase)
  *   - not claiming done yet (cursor not at summary AND pause.kind != done)
  */
 
@@ -53,7 +53,7 @@ export function dodBackstop(event: SessionStopEvent, ctx: SessionStopContext): {
   if (existsSync(join(ctx.cwd, WORK_STATE_DIR, ".dod-override"))) return;
 
   const workflow = state.classification?.workflow;
-  if (workflow === "research" || workflow === "review" || workflow === "emergency") return;
+  if (workflow === "research" || workflow === "review" || workflow === "emergency" || workflow === "lecture-research") return;
 
   const pause = state.pause?.kind ?? "none";
   if (pause === "background_wait" || pause === "user_checkpoint" || pause === "needs_human" || pause === "failed") return;
