@@ -637,6 +637,8 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     assert.match(prompt, /tasks\[\]\.task/);
     assert.match(prompt, /artifact_schemas/);
     assert.match(prompt, /dod.*items.*MUST be objects/i);
+    assert.match(prompt, /Before `workflow_advance`.*workflow_checkpoint/);
+    assert.match(prompt, /workflow_\*.*main-session-only.*canonical `\.work-state`.*bash.*write/i);
 
     // No filesystem/package-path/plugin-root workflow content sourcing.
     assert.ok(!prompt.includes("findProfileDir"), "prompt must not reference the profile directory helper");
