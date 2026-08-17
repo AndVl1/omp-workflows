@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.21.1] — 2026-08-16
+### Fixed
+- **OMP extension schema compatibility** — mutable `artifact_ids` defaults now use a factory, allowing validation on OMP 17.3+.
+
 ## [0.21.0] — 2026-08-15
 ### Added
 - **Strict workflow control plane** — durable dispatch capabilities, typed workflow contracts, runtime boundary gates, and artifact-backed stage validation now enforce the persisted workflow cursor and resolved agent roster.

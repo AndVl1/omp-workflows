@@ -4,7 +4,7 @@ import { loadProfile, profileHash as sharedProfileHash, resolveWorkflowProfilePa
 import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope } from "./scope.js";
 import { resolveActiveBranch, resolveState } from "./state.js";
-import { resolveStageDispatchRoles } from "./stage.js";
+import { resolveStageDispatchSlots } from "./stage.js";
 import type { StageDef, TeamState, WorkflowName } from "./types.js";
 
 export interface WorkflowContractOptions {
@@ -87,7 +87,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   if (!stage) throw new WorkflowContractError("STAGE_MISSING", `stage cursor '${stageId ?? ""}' is not present in '${workflow}'`);
   const config = resolveConfig(cwd);
   const flags = state?.scope ?? resolveScope([], config);
-  const roles = resolveStageDispatchRoles(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  const slots = resolveStageDispatchSlots(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
   const kind = stage.type === "single" || stage.type === "consilium" ? stage.type : null;
   const statuses = state?.stages.map(item => ({ id: item.id, status: item.status }))
     ?? profile.stages.map(item => ({ id: item.id, status: "pending" }));
@@ -97,10 +97,10 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   const stageContract: WorkflowStageContract = {
     id: stage.id, title: stage.title, type: stage.type,
     description: stage.description ?? "", prompt: stage.prompt ?? "",
-    roles: roles.map(role => ({ role, agent: resolveAgentForRole(role, config) })), parallel: stage.parallel ?? stage.type === "consilium",
+    roles: slots.map(slot => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) })), parallel: stage.parallel ?? stage.type === "consilium",
     consumes: stage.consumes ?? [], produces: typeof stage.produces === "string" ? [stage.produces] : stage.produces ?? [],
     checkpoint: stage.checkpoint ?? null, autonomous: stage.autonomous ?? null, gate: stage.gate ?? null, skip_if: stage.skip_if ?? null, loop: stage.loop ?? null,
-    dispatch: { permitted: dispatchAllowed, kind, expected_count: capability?.expected_count ?? roles.length, capability_id: capability?.capability_id ?? null, cursor_epoch: state?.cursor_epoch ?? null },
+    dispatch: { permitted: dispatchAllowed, kind, expected_count: capability?.expected_count ?? slots.length, capability_id: capability?.capability_id ?? null, cursor_epoch: state?.cursor_epoch ?? null },
     instructions: instructions(stage, options.maxInstructions ?? 4000),
     provenance: { source: "workflow", profilePath: path, profileHash: pHash, stageHash: hash(stage) },
   };

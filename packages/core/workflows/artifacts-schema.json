@@ -223,6 +223,7 @@
           "description": "Confirms the per-type minimum items are present. Minimums: BUG_FIX → root cause named (not symptom) + repro-before reproduces + repro-after does not + affected scenario checked in manual-qa. FEATURE → each acceptance criterion mapped to a manual-qa step (both remote+docker modes if the feature touches agent/sessions). QA/report → published via publish-gist-report skill, screenshots actually visible (not broken). Any UI → DoD records what must be visible on the screenshot; on close, what is actually visible is written."
         }
       }
+    },
     "cto_discovery": {
       "type": "object",
       "required": ["task", "branch"],

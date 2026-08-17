@@ -9,6 +9,8 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { validateProfileExpressions } from "./predicate.js";
+import { validateStageFanInResolutions } from "./fan-in.js";
 import type { Classification, Complexity, Profile, TaskType, WorkflowName } from "./types.js";
 
 /** Selection order — first match wins. */
@@ -31,6 +33,19 @@ export function registerWorkflowProfiles(profiles: Profile[]): void {
   for (const profile of profiles) {
     if (!profile.name || !profile.stages?.length || !profile.match?.type) {
       throw new Error(`invalid workflow profile registration: ${JSON.stringify(profile)}`);
+    }
+    // Reject unsupported DSL at load: an expression that cannot parse must
+    // never silently evaluate to false during a run.
+    const diagnostics = validateProfileExpressions(profile);
+    if (diagnostics.length > 0) {
+      throw new Error(`invalid workflow profile '${profile.name}' expressions: ${diagnostics.join("; ")}`);
+    }
+    // Reject malformed fan-in resolutions at load: a resolution must
+    // deliberately document exactly how a required-scalar disagreement is
+    // resolved, so it can never resolve a disagreement silently.
+    const fanInDiagnostics = profile.stages.flatMap((stage) => validateStageFanInResolutions(stage));
+    if (fanInDiagnostics.length > 0) {
+      throw new Error(`invalid workflow profile '${profile.name}' fan-in resolutions: ${fanInDiagnostics.join("; ")}`);
     }
     registeredProfiles.set(profile.name, profile);
   }

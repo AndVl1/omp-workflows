@@ -21,11 +21,13 @@
 
 import { buildDispatchMarker } from "../gates/dispatch.js";
 import { execSync } from "node:child_process";
-import { persistReturnedArtifacts, readArtifact } from "./artifacts.js";
+import { persistReturnedArtifacts, readArtifact, writeArtifact } from "./artifacts.js";
 import { resolveConfig } from "./config.js";
-import { resolveScope, applyConditional, shouldSkip, type ScopeFlags } from "./scope.js";
+import { resolveScope, applyConditional, type ScopeFlags } from "./scope.js";
+import { evaluatePredicate } from "./predicate.js";
+import { namespacedArtifactId, sanitizeSlot } from "./fan-in.js";
 import { checkArtifact as validationCheckArtifact, validationGate } from "../gates/validation.js";
-import type { Profile, StageDef, TeamState } from "./types.js";
+import type { DispatchSlot, Profile, StageDef, TeamState } from "./types.js";
 
 export interface StageContext {
   cwd: string;
@@ -274,9 +276,23 @@ export async function runStage(
   stage: StageDef,
   ctx: StageContext,
 ): Promise<StageOutcome> {
-  if (shouldSkip(stage, ctx.flags)) {
-    ctx.log(`stage ${stage.id}: skipped by skip_if`);
-    return { stageId: stage.id, status: "skipped", note: "skipped by skip_if", artifacts: [] };
+  if (stage.skip_if) {
+    // Fail closed: an expression we cannot evaluate (unsupported syntax or a
+    // missing referenced artifact) blocks the stage instead of silently
+    // skipping or silently running.
+    const skip = evaluatePredicate(stage.skip_if, {
+      flags: ctx.flags,
+      artifactsDir: ctx.artifactsDir,
+      state: ctx.state,
+      stage,
+    });
+    if (!skip.ok) {
+      return { stageId: stage.id, status: "failed", note: `skip_if evaluation failed: ${skip.error}`, artifacts: [] };
+    }
+    if (skip.value) {
+      ctx.log(`stage ${stage.id}: skipped by skip_if`);
+      return { stageId: stage.id, status: "skipped", note: "skipped by skip_if", artifacts: [] };
+    }
   }
 
   ctx.log(`stage ${stage.id}: ${stage.title}`);
@@ -353,12 +369,12 @@ function taskEvidence(result: TaskResult, outcome: "succeeded" | "failed"): stri
 }
 
 async function runSingle(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
-  const role = resolveStageDispatchRoles(stage, ctx)[0] ?? "";
-  if (!role) return { stageId: stage.id, status: "failed", note: "single stage missing role", artifacts: [] };
-  const agent = ctx.agent(role);
-  const task = buildStagePrompt(stage, ctx, role);
-  ctx.log(`  single: ${agent} (role=${role})`);
-  const authorized = ctx.durable?.authorize(role, agent);
+  const slot = resolveStageDispatchSlots(stage, ctx)[0];
+  if (!slot) return { stageId: stage.id, status: "failed", note: "single stage missing role", artifacts: [] };
+  const agent = ctx.agent(slot.role);
+  const task = buildStagePrompt(stage, ctx, slot.slot);
+  ctx.log(`  single: ${agent} (slot=${slot.slot}, role=${slot.role})`);
+  const authorized = ctx.durable?.authorize(slot.slot, agent);
   if (authorized && !authorized.ok) return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${authorized.error}`, artifacts: produces };
   let result: TaskResult;
   try {
@@ -379,11 +395,12 @@ async function runSingle(stage: StageDef, ctx: StageContext, produces: string[])
 }
 
 async function runConsilium(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
-  const roster = resolveStageDispatchRoles(stage, ctx);
+  const roster = resolveStageDispatchSlots(stage, ctx);
   if (roster.length === 0) return { stageId: stage.id, status: "failed", note: "consilium stage resolved to an empty roster", artifacts: produces };
-  ctx.log(`  consilium: ${roster.join(", ")}`);
-  const tasks = roster.map((role) => ({ name: `${stage.id}-${role}`, agent: ctx.agent(role), task: buildStagePrompt(stage, ctx, role) }));
-  const authorized = ctx.durable ? roster.map((role, i) => ctx.durable!.authorize(role, tasks[i]!.agent)) : [];
+  const multiSlot = roster.length > 1;
+  ctx.log(`  consilium: ${roster.map((slot) => slot.slot).join(", ")}${multiSlot ? " (slot-scoped artifacts)" : ""}`);
+  const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: ctx.agent(slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot) }));
+  const authorized = ctx.durable ? roster.map((slot, i) => ctx.durable!.authorize(slot.slot, tasks[i]!.agent)) : [];
   const denied = authorized.find((a) => !a.ok);
   if (denied && !denied.ok) {
     failAuthorizedDispatches(ctx, authorized, `dispatch authorization failed: ${denied.error}`);
@@ -404,7 +421,10 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
     const auth = authorized[i];
     if (auth?.ok) {
       const result = results[i]!;
-      const persisted = persistTaskArtifacts(ctx, result);
+      const slot = roster[i]!.slot;
+      const persisted = multiSlot
+        ? persistConsiliumSlotArtifacts(ctx, slot, result, produces)
+        : persistTaskArtifacts(ctx, result);
       const outcome = result.exitCode === 0 && !result.pending && !persisted.error ? "succeeded" : "failed";
       const completed = ctx.durable!.complete(auth.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids);
       if (!completed.ok) {
@@ -419,14 +439,53 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
   }
   const failed = results.filter((r) => r.exitCode !== 0 || r.pending);
   if (failed.length > 0) return { stageId: stage.id, status: "failed", note: `${failed.length}/${tasks.length} failed`, artifacts: produces };
-  return validateProduced(stage, ctx, produces, `${tasks.length} agents in parallel`);
+  return validateProduced(stage, ctx, produces, `${tasks.length} agents in parallel`, multiSlot ? roster : undefined);
+}
+
+/**
+ * Persist a consilium slot's returned artifacts and guarantee the
+ * slot-scoped namespaced files (`<id>-<slot>.json`) exist for every declared
+ * produce. When the slot returned the shared id, a namespaced copy is made
+ * from its own just-written content, so later slots can never clobber this
+ * slot's provenance. The namespaced ids are declared on the durable
+ * completion so advance-time synthesis can read them deterministically.
+ */
+function persistConsiliumSlotArtifacts(
+  ctx: StageContext,
+  slot: string,
+  result: TaskResult,
+  produces: string[],
+): { ids: string[]; error?: string } {
+  const persisted = persistTaskArtifacts(ctx, result);
+  if (persisted.error) return persisted;
+  const ids = [...persisted.ids];
+  for (const produce of produces) {
+    const namespaced = namespacedArtifactId(produce, slot);
+    if (ids.includes(namespaced)) continue;
+    // Only snapshot a produce this slot EXPLICITLY returned under the shared
+    // id: at this moment the shared file is the slot's own just-written
+    // content. A slot that returned no artifact for a produce must never
+    // inherit another slot's (or a prior iteration's) shared file as its
+    // namespaced provenance — that would count a free-rider slot as a
+    // contributor and record incorrect fan-in provenance.
+    if (!ids.includes(produce)) continue;
+    const shared = readArtifact(ctx.artifactsDir, produce);
+    if (shared !== null) {
+      try {
+        writeArtifact(ctx.artifactsDir, namespaced, shared);
+      } catch (error) {
+        return { ids, error: String(error) };
+      }
+      ids.push(namespaced);
+    }
+  }
+  return { ids };
 }
 
 async function runBash(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
-  // The stage's task field may describe a command; for now we infer a single
-  // command from the task id (e.g. "install_hooks"). User-driven stages use
-  // a custom `command:` field embedded in the stage.
-  const cmd = (stage as unknown as { command?: string }).command;
+  // The stage's task field may describe a command; user-driven stages use
+  // the typed `command:` field on the stage definition.
+  const cmd = stage.command;
   if (!cmd) {
     return { stageId: stage.id, status: "failed", note: "bash stage missing command", artifacts: [] };
   }
@@ -454,7 +513,11 @@ function validateProduced(
   ctx: StageContext,
   produces: string[],
   successNote: string,
+  slots?: DispatchSlot[],
 ): StageOutcome {
+  if (slots && slots.length > 1) {
+    return validateProducedMultiSlot(stage, ctx, produces, successNote, slots);
+  }
   // Every declared output is required. Validation-specific checks below add
   // stronger semantic requirements for code-bearing artifacts.
   for (const id of produces) {
@@ -485,7 +548,51 @@ function validateProduced(
   return { stageId: stage.id, status: "done", note: successNote, artifacts: produces };
 }
 
-function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string): string {
+/**
+ * Multi-slot consilium produced validation: every declared produce must have
+ * at least one slot-scoped result and every slot must have contributed at
+ * least one artifact. The shared artifacts are synthesized deterministically
+ * by advance-time fan-in, so this stage-level check verifies the per-slot
+ * provenance files exist.
+ */
+function validateProducedMultiSlot(
+  stage: StageDef,
+  ctx: StageContext,
+  produces: string[],
+  successNote: string,
+  slots: DispatchSlot[],
+): StageOutcome {
+  // No declared produces => nothing to fan in; the shared-id check does not
+  // apply (there are no shared artifacts for this stage).
+  if (produces.length === 0) {
+    return { stageId: stage.id, status: "done", note: successNote, artifacts: produces };
+  }
+  const contributing = new Set<string>();
+  for (const id of produces) {
+    const contributors = slots.filter((slot) => readArtifact(ctx.artifactsDir, namespacedArtifactId(id, slot.slot)) !== null);
+    if (contributors.length === 0) {
+      return {
+        stageId: stage.id,
+        status: "failed",
+        note: `produced artifact "${id}" has no per-slot results (<id>-<slot>.json) at ${ctx.artifactsDir} — every consilium slot must write its slot-scoped artifact for each declared produce.`,
+        artifacts: produces,
+      };
+    }
+    for (const contributor of contributors) contributing.add(contributor.slot);
+  }
+  const emptySlots = slots.filter((slot) => !contributing.has(slot.slot));
+  if (emptySlots.length > 0) {
+    return {
+      stageId: stage.id,
+      status: "failed",
+      note: `consilium slots produced no artifacts: ${emptySlots.map((slot) => slot.slot).join(", ")}`,
+      artifacts: produces,
+    };
+  }
+  return { stageId: stage.id, status: "done", note: successNote, artifacts: produces };
+}
+
+function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string, slotScoped = false): string {
   const consumes = stage.consumes ?? [];
   const reads = consumes
     .map((id) => {
@@ -495,12 +602,15 @@ function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string): str
     .filter((x): x is string => x !== null);
 
   const readsBlock = reads.length > 0 ? `\n\n## Reads from prior stages\n${reads.join("\n\n")}` : "";
-  const produces = Array.isArray(stage.produces) ? stage.produces.join(", ") : stage.produces ?? "(none)";
+  const rawProduces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
+  const produces = slotScoped
+    ? rawProduces.map((id) => `${id}-${sanitizeSlot(role)}.json`).join(", ")
+    : rawProduces.join(", ") || "(none)";
   const roleHint = isOrchestratorRole(role)
     ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
     : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
   const dispatchMarker = stage.type === "single" || stage.type === "consilium"
-    ? buildDispatchMarker(ctx.state.run_key ?? ctx.state.branch, stage, resolveStageDispatchRoles(stage, ctx), role, ctx.state.cursor_epoch ?? stage.id)
+    ? buildDispatchMarker(ctx.state.run_key ?? ctx.state.branch, stage, resolveStageDispatchSlots(stage, ctx).map((slot) => slot.slot), role, ctx.state.cursor_epoch ?? stage.id)
     : "";
   const durableBinding = dispatchMarker
     ? `run_key=${ctx.state.run_key ?? ctx.state.branch} branch=${ctx.state.branch} workflow=${ctx.state.classification.workflow} profile_hash=${ctx.state.profile_hash ?? ""} stage_cursor=${stage.id} cursor_epoch=${ctx.state.cursor_epoch ?? ""}`
@@ -526,7 +636,7 @@ ${ctx.state.task}
 ${stage.prompt ?? "Follow the stage title and produce the declared artifact from the task and prior artifacts."}
 
 ### Your job
-Execute this stage. Write your typed artifact to ${ctx.artifactsDir}/<id>.json matching the engine's schema (the engine reads only JSON, not prose).
+Execute this stage. Write your typed artifact to ${ctx.artifactsDir}/${slotScoped ? "<id>-<slot>.json" : "<id>.json"} matching the engine's schema (the engine reads only JSON, not prose).${slotScoped ? " This is a parallel consilium slot: write ONLY your own slot-scoped files (other slots write theirs). The engine deterministically synthesizes the shared artifacts at advance." : ""}
 
 Produces: ${produces}${readsBlock}
 
@@ -541,16 +651,57 @@ function isOrchestratorRole(role: string): boolean {
   return role === "discovery" || role === "orchestrator";
 }
 
-export function resolveStageDispatchRoles(
+/**
+ * Resolve the stage's dispatch roster as stable occurrence slots. Semantic
+ * profile roles are preserved on `slot.role`; repeated roles normalize to
+ * unique deterministic slot identities (`analyst#1`, `analyst#2`) so
+ * capability rosters, markers, authorization and joins can distinguish
+ * occurrences while the concrete agent mapping stays per semantic role.
+ */
+export function resolveStageDispatchSlots(
   stage: StageDef,
   ctx: Pick<StageContext, "flags" | "cwd" | "resolveDevAgent">,
-): string[] {
+): DispatchSlot[] {
   const base = stage.type === "single" ? [stage.role ?? ""] : stage.roles ?? [];
   const expanded = base.map((role) => expandRole(role, ctx));
   const conditioned = stage.type === "consilium"
     ? applyConditional(expanded, stage.conditional, ctx.flags)
     : expanded;
-  return applyRosterOverrides(conditioned, ctx.cwd, stage.id).map((role) => expandRole(role, ctx));
+  const roster = applyRosterOverrides(conditioned, ctx.cwd, stage.id).map((role) => expandRole(role, ctx));
+  return normalizeDispatchSlots(roster);
+}
+
+/**
+ * Map a resolved semantic roster to stable unique slot identities. A role
+ * that occurs exactly once keeps its bare name (unique-role profiles are
+ * byte-identical to the pre-slot era); a role that occurs more than once
+ * gets every occurrence numbered deterministically by position
+ * (`analyst#1`, `analyst#2`). Order is preserved, so the mapping is stable
+ * across capability creation, handoff, markers and joins.
+ */
+function normalizeDispatchSlots(roles: string[]): DispatchSlot[] {
+  const totals = new Map<string, number>();
+  for (const role of roles) totals.set(role, (totals.get(role) ?? 0) + 1);
+  const seen = new Map<string, number>();
+  return roles.map((role) => {
+    const occurrence = (seen.get(role) ?? 0) + 1;
+    seen.set(role, occurrence);
+    const repeated = (totals.get(role) ?? 0) > 1;
+    return { slot: repeated ? `${role}#${occurrence}` : role, role };
+  });
+}
+
+/**
+ * Semantic dispatch roster (profile roles after expansion, conditionals and
+ * overrides). Dispatch identity lives in {@link resolveStageDispatchSlots};
+ * this view keeps the profile's declared roles verbatim (duplicates
+ * included) for display and reporting.
+ */
+export function resolveStageDispatchRoles(
+  stage: StageDef,
+  ctx: Pick<StageContext, "flags" | "cwd" | "resolveDevAgent">,
+): string[] {
+  return resolveStageDispatchSlots(stage, ctx).map((slot) => slot.role);
 }
 
 function expandRole(role: string, ctx: Pick<StageContext, "resolveDevAgent">): string {
@@ -571,19 +722,56 @@ function applyRosterOverrides(roster: string[], cwd: string, stageId: string): s
 
 /**
  * Walk the profile to completion. The principal output of running a `/team`.
+ *
+ * Cursor-driven: after a durable advance, the cursor repositions to the
+ * armed stage. A normal advance moves it forward; a bounded-loop re-entry
+ * (handled inside `advanceCursor`) points it back at the loop's `back_to`
+ * stage, which is re-run with a fresh capability and epoch. Loop exhaustion
+ * leaves the durable pause in `needs_human`/`failed`, which halts the walk.
+ * Stages already completed in a prior session are skipped without re-running.
  */
 export async function walkProfile(
   profile: Profile,
   ctx: StageContext,
 ): Promise<StageOutcome[]> {
   const outcomes: StageOutcome[] = [];
-  for (const stage of profile.stages) {
+  let cursor = 0;
+  while (cursor < profile.stages.length) {
+    const stage = profile.stages[cursor]!;
+    const persisted = ctx.state.stages.find((entry) => entry.id === stage.id);
+    if (persisted && (persisted.status === "done" || persisted.status === "skipped")) {
+      ctx.log(`stage ${stage.id}: already ${persisted.status}; skipping`);
+      cursor += 1;
+      continue;
+    }
     let outcome = await runStage(stage, ctx);
     // Strict durable stages advance only after all dispatches have joined.
-    if (outcome.status === "done" && ctx.durable && (stage.type === "single" || stage.type === "consilium")) {
+    // EVERY stage type (orchestrator/single/consilium/bash/none) routes its
+    // completion through the same durable transition: declared checkpoints
+    // are enforced (interactive runs fail closed on unresolved decisions) or
+    // auto-recorded (autonomous runs), and no stage reaches done while its
+    // checkpoint is unresolved. The interpreter binds a capability for every
+    // stage type (kind "none" for non-dispatch stages) so advance is always
+    // available under strict durable execution.
+    if (outcome.status === "done" && ctx.durable) {
       const advanced = ctx.durable.advance(outcome.note);
       if (!advanced.ok) {
         outcome = { ...outcome, status: "failed", note: `durable cursor advance failed: ${advanced.error}` };
+      } else {
+        ctx.onStageComplete?.(stage.id, outcome.status);
+        outcomes.push(outcome);
+        // Loop exhaustion / needs-human halt: no further stage may run.
+        if (ctx.state.pause?.kind === "needs_human" || ctx.state.pause?.kind === "failed") {
+          ctx.log(`halting at stage ${stage.id}: ${ctx.state.pause.reason}`);
+          return outcomes;
+        }
+        // Reposition to the armed stage: forward on normal advance, backward
+        // on bounded-loop re-entry.
+        const armedIndex = ctx.state.stage_cursor
+          ? profile.stages.findIndex((candidate) => candidate.id === ctx.state.stage_cursor)
+          : -1;
+        cursor = armedIndex >= 0 ? armedIndex : cursor + 1;
+        continue;
       }
     }
     ctx.onStageComplete?.(stage.id, outcome.status);
@@ -592,25 +780,7 @@ export async function walkProfile(
       ctx.log(`halting at stage ${stage.id}`);
       break;
     }
-    if (stage.loop) {
-      const iterations = await runLoop(stage, ctx);
-      outcomes.push(...iterations);
-    }
-  }
-  return outcomes;
-}
-
-async function runLoop(stage: StageDef, ctx: StageContext): Promise<StageOutcome[]> {
-  const outcomes: StageOutcome[] = [];
-  for (let i = 0; i < stage.loop!.max_iterations; i++) {
-    const verdict = readArtifact(ctx.artifactsDir, "debug");
-    if (verdict && typeof verdict === "object" && "verdict" in verdict && (verdict as { verdict?: unknown }).verdict === "PASS") {
-      ctx.log(`loop done at iteration ${i + 1}`);
-      break;
-    }
-    ctx.log(`loop iteration ${i + 1} -> ${stage.loop!.back_to}`);
-    // Caller re-runs the back_to stage itself; this just records the loop.
-    outcomes.push({ stageId: stage.id, status: "done", note: `loop iteration ${i + 1}`, artifacts: [], loopIteration: i + 1 });
+    cursor += 1;
   }
   return outcomes;
 }

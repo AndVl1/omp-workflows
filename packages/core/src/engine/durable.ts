@@ -4,12 +4,29 @@ import { join } from "node:path";
 import { loadProfile, profileHash } from "./profile.js";
 import { resolveState, writeState, isSafeStateSegment, resolveActiveBranch, type ResolvedState } from "./state.js";
 import { resolveConfig, resolveAgentForRole } from "./config.js";
-import { resolveScope } from "./scope.js";
-import { resolveStageDispatchRoles } from "./stage.js";
-import { readArtifact } from "./artifacts.js";
+import { resolveScope, type ScopeFlags } from "./scope.js";
+import { resolveStageDispatchSlots } from "./stage.js";
+import { readArtifact, writeArtifact } from "./artifacts.js";
 import { isDoDComplete, isRootCauseDocumented, readDoD } from "./dod.js";
 import { validationGate } from "../gates/validation.js";
-import type { DispatchCompletion, DispatchRecord, TeamState, StageDef } from "./types.js";
+import { evaluatePredicate } from "./predicate.js";
+import { appendCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
+import { loopExhaustionKind, loopIterationRecord, loopReentryDecision, loopStateFor, resolveBackToStage } from "./loops.js";
+import {
+  DEFAULT_FAN_IN_POLICY,
+  isNamespacedArtifactId,
+  namespacedArtifactId,
+  synthesizeArtifacts,
+  type FanInPolicy,
+} from "./fan-in.js";
+import {
+  artifactSchemaFor,
+  validateConsumedArtifacts,
+  validateProducedArtifact,
+  DEFAULT_ARTIFACT_CONTRACT_POLICY,
+  type ArtifactContractPolicy,
+} from "./artifact-contract.js";
+import type { CheckpointDecision, DispatchCompletion, DispatchRecord, LoopState, TeamState, StageDef } from "./types.js";
 
 export type DispatchAuth = {
   token: string;
@@ -199,13 +216,13 @@ export function beginCapability(cwd: string): TransitionResult {
   const flags = state.scope ?? resolveScope([], config);
   const kind: "none" | "single" | "consilium" =
     stage.type === "single" || stage.type === "consilium" ? stage.type : "none";
-  const roles = kind === "none"
+  const slots = kind === "none"
     ? []
-    : resolveStageDispatchRoles(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
-  if ((kind === "single" && roles.length !== 1) || (kind === "consilium" && roles.length === 0)) {
+    : resolveStageDispatchSlots(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) {
     return { ok: false, error: `workflow stage '${stage.id}' has an invalid dispatch roster`, state };
   }
-  const expectedRoster = roles.map((role) => ({ role, agent: resolveAgentForRole(role, config) }));
+  const expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
   if (existing && existingDispatches.length > 0 && JSON.stringify(existing.expected_roster) !== JSON.stringify(expectedRoster)) {
     return { ok: false, error: "active dispatch capability roster is inconsistent", state };
   }
@@ -361,7 +378,12 @@ function completeRecord(
     if (sameOutcome && record.completion.completed_by === "synchronous_tool_result" && record.completion.artifact_ids.length === 0 && artifact_ids.length > 0) {
       const completion = { ...record.completion, artifact_ids, evidence: input.evidence, completed_by: input.completed_by ?? "workflow_complete" };
       const updated: DispatchRecord = { ...record, completed_at: completion.completed_at, completion };
-      const next: TeamState = { ...state, dispatch_capability: { ...cap, dispatches: cap.dispatches.map((d) => d.id === record.id ? updated : d) } };
+      const snapshotted = snapshotSlotArtifacts(state, cap, record, artifact_ids, artifactDir);
+      if (!snapshotted.ok) return { ok: false, error: snapshotted.error, state };
+      const next: TeamState = {
+        ...snapshotted.state,
+        dispatch_capability: { ...cap, dispatches: cap.dispatches.map((d) => d.id === record.id ? updated : d) },
+      };
       persist(cwd, next, target);
       return { ok: true, state: next, record: updated };
     }
@@ -377,9 +399,62 @@ function completeRecord(
     completed_at: now(),
   };
   const updated: DispatchRecord = { ...record, status: input.outcome, completed_at: completion.completed_at, completion };
-  const next: TeamState = { ...state, dispatch_capability: { ...cap, dispatches: cap.dispatches.map((d) => d.id === record.id ? updated : d) } };
+  const snapshotted = snapshotSlotArtifacts(state, cap, record, artifact_ids, artifactDir);
+  if (!snapshotted.ok) return { ok: false, error: snapshotted.error, state };
+  const next: TeamState = {
+    ...snapshotted.state,
+    dispatch_capability: { ...cap, dispatches: cap.dispatches.map((d) => d.id === record.id ? updated : d) },
+  };
   persist(cwd, next, target);
   return { ok: true, state: next, record: updated };
+}
+
+/**
+ * For multi-slot consilium stages, capture each slot's artifact content into
+ * a namespaced snapshot (`<id>-<slot>.json`) at completion time, before a
+ * later slot can overwrite the shared file. Recording the same artifact for
+ * the same slot twice with different content is a collision and fails
+ * closed. The namespaced snapshots are the provenance source for the
+ * deterministic synthesis performed at advance.
+ */
+function snapshotSlotArtifacts(
+  state: TeamState,
+  cap: ActiveCapability,
+  record: DispatchRecord,
+  artifactIds: string[],
+  artifactsDir: string,
+): { ok: true; state: TeamState } | { ok: false; error: string } {
+  if (cap.kind !== "consilium" || cap.expected_count <= 1 || artifactIds.length === 0) {
+    return { ok: true, state };
+  }
+  const stageId = cap.issued_for.stage_cursor;
+  const existing = state.slot_artifacts?.[stageId] ?? { slots: {} };
+  const slots = { ...existing.slots };
+  const slotMap = { ...(slots[record.role] ?? {}) };
+  for (const id of artifactIds) {
+    const value = readArtifact(artifactsDir, id);
+    if (value === null) {
+      return { ok: false, error: `slot '${record.role}' artifact '${id}' disappeared before completion` };
+    }
+    // Already slot-scoped ids are the slot's own provenance; only copy the
+    // shared-id writes into the namespace before a later slot can clobber.
+    const namespaced = isNamespacedArtifactId(id, record.role) ? id : namespacedArtifactId(id, record.role);
+    if (namespaced !== id) {
+      writeArtifact(artifactsDir, namespaced, value);
+    }
+    const hash = hashValue(value);
+    const previous = slotMap[id];
+    if (previous && previous.hash !== hash) {
+      return { ok: false, error: `slot artifact conflict: slot '${record.role}' wrote '${id}' with different content` };
+    }
+    slotMap[id] = { path: join(artifactsDir, `${namespaced}.json`), hash };
+  }
+  slots[record.role] = slotMap;
+  return { ok: true, state: { ...state, slot_artifacts: { ...(state.slot_artifacts ?? {}), [stageId]: { ...existing, slots } } } };
+}
+
+function hashValue(value: unknown): string {
+  return hash(JSON.stringify(value));
 }
 export function completeDispatch(cwd: string, input: DispatchAuth & { dispatch_id: string } & CompletionInput): TransitionResult {
   const found = current(cwd); if (!found) return { ok: false, error: "state not found" };
@@ -434,101 +509,271 @@ function objectArtifact(artifactsDir: string, id: string): Record<string, unknow
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function evaluateStageGate(stage: StageDef, state: TeamState, artifactsDir: string): string | null {
+function evaluateStageGate(stage: StageDef, state: TeamState, artifactsDir: string, flags: ScopeFlags): string | null {
   const gate = stage.gate?.trim();
   if (!gate) return null;
-  if (gate === "branch_created") return state.branch.trim() ? null : "branch_created gate requires a persisted branch";
-  if (gate === "root_cause_documented") {
-    const result = isRootCauseDocumented(artifactsDir);
-    return result.ok ? null : result.reason;
-  }
-  if (gate === "dod_complete") {
-    const result = isDoDComplete(readDoD(artifactsDir));
-    return result.ok ? null : `dod_complete gate is not satisfied (${result.pending.length} pending items)`;
-  }
-  if (gate === "plan_valid") {
-    const plan = objectArtifact(artifactsDir, "team_plan");
-    return plan && Array.isArray(plan.teams) && plan.teams.length > 0 ? null : "plan_valid gate requires a non-empty team_plan.teams array";
-  }
-  if (gate === "contract_complete") {
-    const architecture = objectArtifact(artifactsDir, "architecture");
-    return architecture && Array.isArray(architecture.options) && architecture.options.length > 0 && typeof architecture.chosen === "string" && architecture.chosen.trim() ? null : "contract_complete gate requires architecture options and a chosen option";
-  }
-  if (gate === "feature_spec_present") {
-    const spec = objectArtifact(artifactsDir, "feature_spec");
-    return spec && typeof spec.goal === "string" && spec.goal.trim() && Array.isArray(spec.acceptance_criteria) && spec.acceptance_criteria.length > 0 ? null : "feature_spec_present gate requires a goal and acceptance criteria";
-  }
-  if (gate === "tests_passed") {
-    const tests = objectArtifact(artifactsDir, "qa_tests");
-    return tests?.build_status === "pass" ? null : "tests_passed gate requires qa_tests.build_status=pass";
-  }
-  const verdictGate = /^(?:(?<artifact>[A-Za-z0-9._-]+)\.)?verdict\s*(?<operator>==|!=)\s*(?<expected>[A-Za-z0-9_-]+)$/.exec(gate);
-  if (verdictGate?.groups) {
-    const artifactId = verdictGate.groups.artifact ?? stageProduces(stage).find((id) => objectArtifact(artifactsDir, id)?.verdict !== undefined);
-    const artifact = artifactId ? objectArtifact(artifactsDir, artifactId) : null;
-    const actual = typeof artifact?.verdict === "string" ? artifact.verdict : null;
-    if (!actual) return `verdict gate '${gate}' requires a normalized verdict artifact`;
-    const matches = actual === verdictGate.groups.expected;
-    return (verdictGate.groups.operator === "==" ? matches : !matches) ? null : `verdict gate '${gate}' rejected verdict '${actual}'`;
-  }
-  return `unsupported workflow gate '${gate}'`;
+  const result = evaluatePredicate(gate, {
+    flags,
+    artifactsDir,
+    state,
+    stage,
+    namedGate: (name) => {
+      const named = NAMED_GATES[name];
+      return named ? named(state, artifactsDir) : undefined;
+    },
+  });
+  if (!result.ok) return result.error;
+  return result.value ? null : `gate '${gate}' is not satisfied`;
 }
 
-function validateStageCompletion(stage: StageDef, state: TeamState, target: ResolvedState, evidence: string): string | null {
-  if (!evidence.trim()) return "stage completion evidence required";
+/** Named gates are plain identifiers resolved by the predicate evaluator. */
+const NAMED_GATES: Record<string, (state: TeamState, artifactsDir: string) => string | null> = {
+  branch_created: (state) => (state.branch.trim() ? null : "branch_created gate requires a persisted branch"),
+  root_cause_documented: (_state, artifactsDir) => {
+    const result = isRootCauseDocumented(artifactsDir);
+    return result.ok ? null : result.reason;
+  },
+  dod_complete: (_state, artifactsDir) => {
+    const result = isDoDComplete(readDoD(artifactsDir));
+    return result.ok ? null : `dod_complete gate is not satisfied (${result.pending.length} pending items)`;
+  },
+  plan_valid: (_state, artifactsDir) => {
+    const plan = objectArtifact(artifactsDir, "team_plan");
+    return plan && Array.isArray(plan.teams) && plan.teams.length > 0 ? null : "plan_valid gate requires a non-empty team_plan.teams array";
+  },
+  contract_complete: (_state, artifactsDir) => {
+    const architecture = objectArtifact(artifactsDir, "architecture");
+    return architecture && Array.isArray(architecture.options) && architecture.options.length > 0 && typeof architecture.chosen === "string" && architecture.chosen.trim() ? null : "contract_complete gate requires architecture options and a chosen option";
+  },
+  feature_spec_present: (_state, artifactsDir) => {
+    const spec = objectArtifact(artifactsDir, "feature_spec");
+    return spec && typeof spec.goal === "string" && spec.goal.trim() && Array.isArray(spec.acceptance_criteria) && spec.acceptance_criteria.length > 0 ? null : "feature_spec_present gate requires a goal and acceptance criteria";
+  },
+  tests_passed: (_state, artifactsDir) => {
+    const tests = objectArtifact(artifactsDir, "qa_tests");
+    return tests?.build_status === "pass" ? null : "tests_passed gate requires qa_tests.build_status=pass";
+  },
+};
+
+type StageCompletionResult = { ok: true; notes: string[] } | { ok: false; error: string };
+
+/**
+ * Executable artifact contract policy for durable advance. Additive and
+ * compatibility-first: the shipped default validates every schema-defined
+ * artifact with no grandfathering; legacy artifacts can be grandfathered
+ * explicitly via {@link setArtifactContractPolicy}.
+ */
+let artifactContractPolicy: ArtifactContractPolicy = DEFAULT_ARTIFACT_CONTRACT_POLICY;
+
+/** Override the artifact contract policy (e.g. explicit legacy grandfathering). */
+export function setArtifactContractPolicy(policy: ArtifactContractPolicy): void {
+  artifactContractPolicy = policy;
+}
+
+/** Fan-in policy for multi-slot consilium synthesis. */
+let fanInPolicy: FanInPolicy = DEFAULT_FAN_IN_POLICY;
+
+/** Override the consilium fan-in policy. */
+export function setFanInPolicy(policy: FanInPolicy): void {
+  fanInPolicy = policy;
+}
+
+function validateStageCompletion(
+  stage: StageDef,
+  state: TeamState,
+  target: ResolvedState,
+  evidence: string,
+  flags: ScopeFlags,
+  profile: NonNullable<ReturnType<typeof loadProfile>>,
+): StageCompletionResult {
+  if (!evidence.trim()) return { ok: false, error: "stage completion evidence required" };
   const artifactsDir = target.artifactsDir ?? "";
   for (const id of stageProduces(stage)) {
-    if (!isSafeStateSegment(id) || !readArtifact(artifactsDir, id)) return `required stage artifact '${id}.json' is missing or invalid`;
+    if (!isSafeStateSegment(id)) return { ok: false, error: `unsafe stage artifact id '${id}'` };
+    const value = readArtifact(artifactsDir, id);
+    if (value === null) return { ok: false, error: `required stage artifact '${id}.json' is missing or invalid` };
+    const validated = validateProducedArtifact(id, value, artifactContractPolicy);
+    if (!validated.ok) {
+      return {
+        ok: false,
+        error: `produced artifact '${id}' violates its contract: ${validated.issues.map((issue) => `${issue.field}: ${issue.message}`).join("; ")}`,
+      };
+    }
   }
+  const consumed = validateConsumedArtifacts(stage, artifactsDir, state, profile, artifactContractPolicy);
+  if (!consumed.ok) return { ok: false, error: consumed.error };
   const validation = validationGate({ cwd: target.stateDir ?? "", stageId: stage.id, artifactsDir, produces: stage.produces });
-  if (!validation.ok) return validation.reason;
-  return evaluateStageGate(stage, state, artifactsDir);
+  if (!validation.ok) return { ok: false, error: validation.reason };
+  const gateError = evaluateStageGate(stage, state, artifactsDir, flags);
+  if (gateError) return { ok: false, error: gateError };
+  const notes = consumed.diagnostics
+    .filter((diagnostic) => diagnostic.missing && diagnostic.issues.length === 0)
+    .map((diagnostic) => `consumed artifact '${diagnostic.id}' is absent (producer ${diagnostic.producer_status ?? "unknown"})`);
+  return { ok: true, notes };
 }
 
 export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResult {
   const found = current(cwd);
   if (!found) return { ok: false, error: "state not found" };
-  const { state, target } = found;
-  if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state };
-  const cap = activeCapability(state.dispatch_capability);
-  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  const { state: rawState, target } = found;
+  if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state: rawState };
+  const cap = activeCapability(rawState.dispatch_capability);
+  if (!cap) return { ok: false, error: "dispatch capability unavailable", state: rawState };
   const error = auth(cap, input, cap.advance_token_hash);
-  if (error) return { ok: false, error, state };
-  if (cap.status === "invalidated" || cap.status === "complete") return { ok: false, error: "capability invalidated", state };
-  if (input.cursor_epoch !== cap.issued_for.cursor_epoch || state.stage_cursor !== cap.issued_for.stage_cursor || state.cursor_epoch !== cap.issued_for.cursor_epoch) return { ok: false, error: "stale cursor binding", state };
-  if (typeof input.evidence !== "string" || !input.evidence.trim()) return { ok: false, error: "stage advancement evidence required", state };
+  if (error) return { ok: false, error, state: rawState };
+  if (cap.status === "invalidated" || cap.status === "complete") return { ok: false, error: "capability invalidated", state: rawState };
+  if (input.cursor_epoch !== cap.issued_for.cursor_epoch || rawState.stage_cursor !== cap.issued_for.stage_cursor || rawState.cursor_epoch !== cap.issued_for.cursor_epoch) return { ok: false, error: "stale cursor binding", state: rawState };
+  if (typeof input.evidence !== "string" || !input.evidence.trim()) return { ok: false, error: "stage advancement evidence required", state: rawState };
   const profile = loadProfile(cap.issued_for.workflow);
-  if (!profile || profileHash(profile) !== cap.issued_for.profile_hash) return { ok: false, error: "workflow profile is missing or stale", state };
-  const currentStage = profile.stages.find((candidate) => candidate.id === state.stage_cursor);
-  if (!currentStage) return { ok: false, error: "current workflow stage unavailable", state };
-  const completionError = validateStageCompletion(currentStage, state, target, input.evidence);
-  if (completionError) return { ok: false, error: completionError, state };
+  if (!profile || profileHash(profile) !== cap.issued_for.profile_hash) return { ok: false, error: "workflow profile is missing or stale", state: rawState };
+  const currentStage = profile.stages.find((candidate) => candidate.id === rawState.stage_cursor);
+  if (!currentStage) return { ok: false, error: "current workflow stage unavailable", state: rawState };
 
+  const config = resolveConfig(cwd);
+  const flags = rawState.scope ?? resolveScope([], config);
+
+  // Join completeness — every dispatched role must have succeeded.
   const expected = new Set(cap.expected_roles);
   const latest = new Map<string, DispatchRecord>();
   for (const record of cap.dispatches) latest.set(record.role, record);
   const records = Array.from(latest.values());
   if (records.length !== cap.expected_count || records.some((record) => !expected.has(record.role) || record.status !== "succeeded")) {
-    return { ok: false, error: "dispatch join incomplete", state };
+    return { ok: false, error: "dispatch join incomplete", state: rawState };
+  }
+  const joinSummary = {
+    stage_id: rawState.stage_cursor,
+    cursor_epoch: cap.issued_for.cursor_epoch,
+    dispatch_ids: records.map((r) => r.id),
+    roles: records.map((r) => r.role),
+    evidence: input.evidence.trim(),
+    joined_at: now(),
+  };
+
+  // Fan-in: deterministically synthesize multi-slot consilium results into
+  // the stable shared artifact ids before any validation or handoff. Missing
+  // slot results and collisions fail closed; schema-required scalar
+  // disagreements block by default (strict) unless the stage declares an
+  // explicit, documented resolution — every applied resolution is recorded
+  // in the synthesis provenance (`conflicts`).
+  let state = rawState;
+  const isMultiSlotConsilium = cap.kind === "consilium" && cap.expected_count > 1;
+  if (isMultiSlotConsilium) {
+    const policy: FanInPolicy = {
+      ...fanInPolicy,
+      resolutions: [...(fanInPolicy.resolutions ?? []), ...(currentStage.fan_in?.resolutions ?? [])],
+    };
+    const synthesized = synthesizeArtifacts(
+      state,
+      currentStage.id,
+      target.artifactsDir ?? "",
+      stageProduces(currentStage),
+      cap.expected_roster.map((entry) => entry.role),
+      policy,
+    );
+    if (!synthesized.ok) return { ok: false, error: synthesized.error, state };
+    state = synthesized.state;
+  }
+
+  // Stage completion validation: consumes, produces, schema contracts, the
+  // validation gate and the gate expression all fail closed.
+  const completion = validateStageCompletion(currentStage, state, target, input.evidence, flags, profile);
+  if (!completion.ok) return { ok: false, error: completion.error, state };
+
+  // Unresolved declared checkpoints block advance.
+  const checkpointError = unresolvedCheckpointError(currentStage, state);
+  if (checkpointError) return { ok: false, error: checkpointError, state };
+
+  // Bounded loop: evaluate `until`; re-enter `back_to` with a fresh
+  // epoch/capability or map exhaustion to needs_human/failed.
+  if (currentStage.loop) {
+    const until = evaluatePredicate(currentStage.loop.until, {
+      flags,
+      artifactsDir: target.artifactsDir ?? "",
+      state,
+      stage: currentStage,
+    });
+    if (!until.ok) return { ok: false, error: `loop until evaluation failed: ${until.error}`, state };
+    if (!until.value) {
+      const loop = loopStateFor(state, currentStage.id);
+      const decision = loopReentryDecision(loop, currentStage.loop.max_iterations);
+      if (decision.exhausted) {
+        const kind = loopExhaustionKind(currentStage.loop.on_exhausted);
+        const exhausted: LoopState = {
+          ...(loop ?? { reentries: 0, history: [], epoch: cap.issued_for.cursor_epoch }),
+          stage_id: currentStage.id,
+          back_to: currentStage.loop.back_to,
+          until: currentStage.loop.until,
+          max_iterations: currentStage.loop.max_iterations,
+          on_exhausted: currentStage.loop.on_exhausted,
+          status: "exhausted",
+          outcome: kind,
+          ended_at: now(),
+        };
+        const next: TeamState = {
+          ...state,
+          loop_state: exhausted,
+          pause: { kind, reason: `loop '${currentStage.id}' exhausted after ${currentStage.loop.max_iterations} iteration(s)` },
+          stages: state.stages.map((s) => (s.id === currentStage.id ? { ...s, status: "done" as const } : s)),
+          join_summary: joinSummary,
+          dispatch_capability: { ...cap, status: "complete" as const, dispatches: [] },
+          updated_at: now(),
+        };
+        persist(cwd, next, target);
+        return { ok: true, state: next };
+      }
+      return reenterLoop(cwd, state, target, profile, cap, currentStage, records, joinSummary, decision.reentries, flags, config);
+    }
+    const existingLoop = loopStateFor(state, currentStage.id);
+    if (existingLoop) {
+      state = { ...state, loop_state: { ...existingLoop, status: "complete" as const, ended_at: now() } };
+    }
   }
 
   const index = state.stages.findIndex((s) => s.id === state.stage_cursor);
   if (index < 0) return { ok: false, error: "current workflow stage unavailable", state };
-  const nextStageEntry = state.stages[index + 1];
-  const nextStage = nextStageEntry && profile.stages.find((candidate) => candidate.id === nextStageEntry.id);
-  if (nextStageEntry && !nextStage) return { ok: false, error: "next workflow stage unavailable", state };
+
+  // Skip-aware advance (WF-3): evaluate every consecutive next stage's
+  // `skip_if` with the same fail-closed predicate evaluator the interpreter
+  // uses before arming a capability. A stage whose skip_if holds is marked
+  // terminal `skipped` and is never armed or counted as an expected
+  // dispatch; the first runnable stage is armed atomically under this
+  // advance token. Malformed or unsupported skip expressions fail closed —
+  // they block advance instead of silently skipping or silently running.
+  const skippedStageIds: string[] = [];
+  let nextStage: StageDef | undefined;
+  for (let i = index + 1; i < state.stages.length; i += 1) {
+    const entry = state.stages[i];
+    const candidate = entry ? profile.stages.find((s) => s.id === entry.id) : undefined;
+    if (entry && !candidate) return { ok: false, error: "next workflow stage unavailable", state };
+    if (!entry || !candidate) break;
+    if (candidate.skip_if) {
+      const skip = evaluatePredicate(candidate.skip_if, {
+        flags,
+        artifactsDir: target.artifactsDir ?? "",
+        state,
+        stage: candidate,
+      });
+      if (!skip.ok) {
+        return { ok: false, error: `next stage '${candidate.id}' skip_if evaluation failed: ${skip.error}`, state };
+      }
+      if (skip.value) {
+        skippedStageIds.push(candidate.id);
+        continue;
+      }
+    }
+    nextStage = candidate;
+    break;
+  }
   const epoch = randomUUID();
   let handoffSecrets: { capability_id: string; dispatch_token: string; advance_token: string } | undefined;
   let nextCap: NonNullable<TeamState["dispatch_capability"]>;
   if (nextStage) {
     const nextKind: "none" | "single" | "consilium" =
       nextStage.type === "single" || nextStage.type === "consilium" ? nextStage.type : "none";
-    const config = resolveConfig(cwd);
-    const flags = state.scope ?? resolveScope([], config);
-    const roles = nextKind === "none"
+    const slots = nextKind === "none"
       ? []
-      : resolveStageDispatchRoles(nextStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
-    if ((nextKind === "single" && roles.length !== 1) || (nextKind === "consilium" && roles.length === 0)) {
+      : resolveStageDispatchSlots(nextStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+    if ((nextKind === "single" && slots.length !== 1) || (nextKind === "consilium" && slots.length === 0)) {
       return { ok: false, error: `next stage '${nextStage.id}' has an invalid dispatch roster`, state };
     }
     const issued = createCapability({
@@ -539,7 +784,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
       stage_cursor: nextStage.id,
       cursor_epoch: epoch,
       kind: nextKind,
-      expected_roster: roles.map((role) => ({ role, agent: resolveAgentForRole(role, config) })),
+      expected_roster: slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) })),
     });
     nextCap = issued.state;
     handoffSecrets = { capability_id: issued.capability_id, dispatch_token: issued.dispatch_token, advance_token: issued.advance_token };
@@ -550,13 +795,158 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
     ...state,
     stage_cursor: nextStage?.id ?? state.stage_cursor,
     cursor_epoch: epoch,
-    stages: state.stages.map((s) => s.id === state.stage_cursor ? { ...s, status: "done" as const } : s),
-    join_summary: { stage_id: state.stage_cursor, cursor_epoch: cap.issued_for.cursor_epoch, dispatch_ids: records.map((r) => r.id), roles: records.map((r) => r.role), evidence: input.evidence.trim(), joined_at: now() },
+    // The newly armed ready capability must never be persisted while its
+    // stage cursor is still pending: mark the next stage in_progress in the
+    // same atomic state update that arms the capability, so a resumed run
+    // can dispatch against it immediately. Consecutive skip_if stages are
+    // marked terminal `skipped` in the same update; they are never armed.
+    stages: state.stages.map((s) => {
+      if (s.id === state.stage_cursor) return { ...s, status: "done" as const };
+      if (skippedStageIds.includes(s.id)) return { ...s, status: "skipped" as const };
+      if (nextStage && s.id === nextStage.id) return { ...s, status: "in_progress" as const };
+      return s;
+    }),
+    join_summary: joinSummary,
     dispatch_capability: nextCap,
     pause: nextStage ? state.pause : { kind: "done", reason: "" },
   };
   persist(cwd, next, target);
   return { ok: true, state: next, handoff: handoffSecrets ? handoffFromState(next, handoffSecrets) : undefined };
+}
+
+/**
+ * Loop re-entry: point the cursor back at the loop's `back_to` stage and
+ * issue a fresh capability with a fresh cursor epoch. Old epochs can never
+ * authorize a re-entered iteration — the durable binding rotates with every
+ * loop-back. Iteration history is appended durably.
+ */
+function reenterLoop(
+  cwd: string,
+  state: TeamState,
+  target: ResolvedState,
+  profile: NonNullable<ReturnType<typeof loadProfile>>,
+  cap: ActiveCapability,
+  currentStage: StageDef,
+  records: DispatchRecord[],
+  joinSummary: TeamState["join_summary"],
+  reentries: number,
+  flags: ScopeFlags,
+  config: ReturnType<typeof resolveConfig>,
+): TransitionResult {
+  const loop = currentStage.loop!;
+  const backToStage = resolveBackToStage(profile, loop.back_to);
+  if (!backToStage) return { ok: false, error: `loop back_to '${loop.back_to}' is not a stage in the profile`, state };
+  const kind: "none" | "single" | "consilium" =
+    backToStage.type === "single" || backToStage.type === "consilium" ? backToStage.type : "none";
+  const slots = kind === "none"
+    ? []
+    : resolveStageDispatchSlots(backToStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) {
+    return { ok: false, error: `loop target stage '${backToStage.id}' has an invalid dispatch roster`, state };
+  }
+  const epoch = randomUUID();
+  const issued = createCapability({
+    run_key: cap.issued_for.run_key,
+    branch: cap.issued_for.branch,
+    workflow: cap.issued_for.workflow,
+    profile_hash: cap.issued_for.profile_hash,
+    stage_cursor: backToStage.id,
+    cursor_epoch: epoch,
+    kind,
+    expected_roster: slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) })),
+  });
+  const iteration = reentries + 1;
+  const loopState: LoopState = {
+    stage_id: currentStage.id,
+    back_to: loop.back_to,
+    until: loop.until,
+    max_iterations: loop.max_iterations,
+    on_exhausted: loop.on_exhausted,
+    reentries: iteration,
+    epoch,
+    status: "running",
+    history: [
+      ...(loopStateFor(state, currentStage.id)?.history ?? []),
+      loopIterationRecord(iteration, cap.issued_for.cursor_epoch, epoch, false),
+    ],
+  };
+  const next: TeamState = {
+    ...state,
+    stage_cursor: backToStage.id,
+    cursor_epoch: epoch,
+    loop_state: loopState,
+    stages: state.stages.map((s) =>
+      s.id === currentStage.id
+        ? { ...s, status: "done" as const }
+        : s.id === backToStage.id
+          ? { ...s, status: "in_progress" as const }
+          : s,
+    ),
+    join_summary: joinSummary,
+    dispatch_capability: { ...issued.state, status: "ready" as const, dispatches: [] },
+    updated_at: now(),
+  };
+  persist(cwd, next, target);
+  return {
+    ok: true,
+    state: next,
+    handoff: handoffFromState(next, {
+      capability_id: issued.capability_id,
+      dispatch_token: issued.dispatch_token,
+      advance_token: issued.advance_token,
+    }),
+  };
+}
+
+export interface CheckpointDecisionInput extends DispatchAuth {
+  checkpoint: string;
+  mode: "interactive" | "autonomous";
+  decision: string;
+  actor: string;
+  rationale: string;
+}
+
+/**
+ * Persist a durable checkpoint decision (interactive user answer or the
+ * autonomous path's recorded rationale). Bound to the active capability via
+ * the orchestrator's advance token; the checkpoint name must match the
+ * current stage's declared checkpoint. Recording is idempotent per
+ * (stage, checkpoint): the latest decision wins.
+ */
+export function recordCheckpointDecision(cwd: string, input: CheckpointDecisionInput): TransitionResult {
+  const found = current(cwd);
+  if (!found) return { ok: false, error: "state not found" };
+  const { state, target } = found;
+  if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state };
+  const cap = activeCapability(state.dispatch_capability);
+  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  const error = auth(cap, input, cap.advance_token_hash);
+  if (error) return { ok: false, error, state };
+  if (cap.status === "invalidated" || cap.status === "complete") return { ok: false, error: "capability invalidated", state };
+  if (input.stage_cursor !== cap.issued_for.stage_cursor) {
+    return { ok: false, error: "checkpoint stage does not match the active capability", state };
+  }
+  if (!input.checkpoint.trim() || !input.decision.trim()) {
+    return { ok: false, error: "checkpoint name and decision are required", state };
+  }
+  const profile = loadProfile(cap.issued_for.workflow);
+  const stage = profile?.stages.find((candidate) => candidate.id === cap.issued_for.stage_cursor);
+  if (!stage?.checkpoint) return { ok: false, error: `stage '${cap.issued_for.stage_cursor}' declares no checkpoint`, state };
+  if (input.checkpoint !== stage.checkpoint) {
+    return { ok: false, error: `checkpoint '${input.checkpoint}' does not match declared checkpoint '${stage.checkpoint}'`, state };
+  }
+  const decision: CheckpointDecision = {
+    stage_id: cap.issued_for.stage_cursor,
+    checkpoint: input.checkpoint,
+    mode: input.mode,
+    decision: input.decision.trim(),
+    actor: input.actor.trim() || "orchestrator",
+    rationale: input.rationale.trim(),
+    decided_at: now(),
+  };
+  const next = appendCheckpointDecision(state, decision);
+  persist(cwd, next, target);
+  return { ok: true, state: next };
 }
 
 export function reconcileTaskResult(cwd: string, input: { dispatch_id?: string; tool_call_id?: string; token?: string; capability_id: string; cursor_epoch?: string; output?: string; isError?: boolean; details?: { async?: { state?: string } } }): TransitionResult {

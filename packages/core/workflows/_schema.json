@@ -92,6 +92,31 @@
           "type": "string",
           "description": "Auto-decision applied at this stage's checkpoint when running in autonomous mode (e.g. 'pick option #1', 'abort needs-human if confidence LOW')."
         },
+        "command": {
+          "type": "string",
+          "description": "For bash stages: the deterministic shell command executed by the engine (e.g. 'npm install'). Required for type=bash."
+        },
+        "fan_in": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Explicit consilium fan-in resolutions. Schema-required scalar disagreements block handoff by default (strict); a resolution is the ONLY way a specific (artifact, field) disagreement may be resolved without blocking, and every applied resolution is recorded in the synthesis provenance with the winning slot and losing values — never a silent choice.",
+          "properties": {
+            "resolutions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["artifact", "field", "strategy", "rationale"],
+                "properties": {
+                  "artifact": { "type": "string", "description": "Artifact id this resolution applies to (exact match)." },
+                  "field": { "type": "string", "description": "Top-level field path within the artifact (e.g. 'chosen', 'summary')." },
+                  "strategy": { "enum": ["first_slot"], "description": "Deterministic resolution strategy: first roster-order slot's value wins." },
+                  "rationale": { "type": "string", "description": "Why this disagreement is deliberately resolved (persisted verbatim in the conflict provenance)." }
+                }
+              }
+            }
+          }
+        },
         "gate": {
           "type": "string",
           "description": "Precondition that must hold before the interpreter may mark this stage done (e.g. 'branch_created', 'verdict != reject', 'root_cause_documented', 'dod_complete', 'tests_passed'). Review stages use 'verdict != reject' — keyed on the review artifact's normalized verdict (see artifacts-schema review.verdict), not a subjective confidence number."
