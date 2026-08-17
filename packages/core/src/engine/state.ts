@@ -82,6 +82,31 @@ export interface ResolvedState {
   invalid?: boolean;
 }
 
+/**
+ * A stale `.active-feature` pointer can survive an upgrade while the
+ * orchestrator writes the current classification to the legacy root state.
+ * Use that root only when the pointed feature state is incomplete and the
+ * root state is a complete, branch-compatible workflow state. A complete
+ * feature state remains authoritative; malformed or foreign root state never
+ * becomes a fallback.
+ */
+function resolveLegacyWorkflowFallback(cwd: string, wsDir: string, currentBranch?: string): ResolvedState | null {
+  const legacyPath = join(wsDir, LEGACY_STATE);
+  if (!existsSync(legacyPath)) return null;
+  try {
+    const realWorkState = realpathSync(wsDir);
+    if (!isWithin(realpathSync(cwd), realWorkState) || !isWithin(realWorkState, realpathSync(legacyPath))) return null;
+    const artifactsPath = join(wsDir, "artifacts");
+    if (existsSync(artifactsPath) && !isWithin(realWorkState, realpathSync(artifactsPath))) return null;
+    const state = JSON.parse(readFileSync(legacyPath, "utf8")) as TeamState | null;
+    if (!state || !state.classification || typeof state.classification.workflow !== "string" || !state.classification.workflow || typeof state.branch !== "string" || !state.branch) return null;
+    if (currentBranch && state.branch !== currentBranch) return null;
+    return { state, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: false };
+  } catch {
+    return null;
+  }
+}
+
 export type StateSelector = { kind?: "auto" | "team" | "cto-slice"; runId?: string; sliceId?: string; capabilityId?: string };
 export interface ResolvedActiveRun extends ResolvedState {
   kind: "legacy-root" | "feature" | "cto-slice";
@@ -96,8 +121,9 @@ export interface ResolvedActiveRun extends ResolvedState {
   selectedTeam?: unknown;
 }
 
-/** Resolve the one authoritative persisted run. Armed pointers and explicit CTO
- * selectors fail closed; they never silently fall back to another state. */
+/** Resolve the one authoritative persisted run. Explicit CTO selectors fail closed.
+ * A stale active-feature pointer may use a complete, branch-compatible legacy
+ * root only when the pointed feature state is incomplete. */
 export function resolveCanonicalRun(cwd: string, selector: StateSelector = {}, currentBranch?: string): ResolvedActiveRun | null {
   const branch = currentBranch;
   if (selector.kind === "cto-slice" || selector.runId || selector.sliceId) {
@@ -167,6 +193,10 @@ export function resolveState(cwd: string, currentBranch?: string): ResolvedState
         return { state: null, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: false, invalid: true };
       }
       const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+      if (!state?.classification || typeof state.classification.workflow !== "string" || !state.classification.workflow) {
+        const legacyFallback = resolveLegacyWorkflowFallback(cwd, wsDir, currentBranch);
+        if (legacyFallback) return legacyFallback;
+      }
       return { state, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: currentBranch ? state.branch !== currentBranch : false };
     } catch {
       return { state: null, statePath, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false, invalid: true };

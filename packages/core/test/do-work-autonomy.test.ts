@@ -62,6 +62,49 @@ test("do-work: stale active-feature state starts a new workflow", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("resolveState: complete legacy classification wins over an incomplete active feature", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-active-feature-legacy-fallback-"));
+  try {
+    initGit(root, "main");
+    mkdirSync(join(root, ".work-state", "features", "stale"), { recursive: true });
+    writeFileSync(join(root, ".work-state", ".active-feature"), "stale\n");
+    writeFileSync(join(root, ".work-state", "features", "stale", "state.json"), JSON.stringify({
+      schema: 1,
+      branch: "main",
+      task: "incomplete feature state",
+    }));
+    writeWorkflowState(root, {
+      schema: 1,
+      branch: "main",
+      classification: {
+        type: "SPEC",
+        complexity: "COMPLEX",
+        confidence: "HIGH",
+        autonomous: true,
+        workflow: "spec-preparation",
+      },
+      task: "current task",
+      stage_cursor: "intake_repo_map",
+      stages: [{ id: "intake_repo_map", status: "in_progress" }],
+      artifacts: {},
+      workflow_override: false,
+      issue: null,
+      pause: { kind: "none", reason: "" },
+      updated_at: new Date().toISOString(),
+      policy: { strict_orchestrator: true },
+    });
+
+    const resolved = resolveState(root, "main");
+    assert.equal(resolved.isLegacy, true);
+    assert.equal(resolved.statePath, join(root, ".work-state", "team-state.json"));
+    assert.equal(resolved.state?.classification.workflow, "spec-preparation");
+
+    const begun = beginCapability(root);
+    assert.equal(begun.ok, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 test("resolveState: rejects feature artifacts that escape through a symlink", () => {
   const root = mkdtempSync(join(tmpdir(), "state-artifact-symlink-"));
   try {
