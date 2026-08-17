@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.8] — 2026-08-18
+### Fixed
+- **Dispatch marker handoff** — `workflow_begin` now returns role-specific opaque dispatch markers and `/do-work` places them in each `task` payload, allowing strict consilium and single-stage dispatches to start.
+
 ## [0.22.7] — 2026-08-18
 ### Fixed
 - **Engine-owned workflow preparation** — `/do-work` now persists PHASE-0 classification through `workflow_prepare`, binds state to the canonical session cwd, and invalidates stale capabilities when continuing a run.
