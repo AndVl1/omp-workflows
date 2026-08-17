@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.2] — 2026-08-17
+### Fixed
+- **Tool-only stage instructions in `/do-work`** — the `/do-work` prompt no longer instructs reading workflow profile JSON from the filesystem or package paths. The orchestrator obtains the current stage contract exclusively through the OMP workflow tools: `workflow_begin` to arm the durable capability, `workflow_instructions` for the capability-aware stage contract (`stage.instructions`, roles, consumes, produces, checkpoint/gate, provenance), and a fresh `workflow_instructions` fetch after every `workflow_advance`; tool errors fail closed instead of guessing stage content.
+
 ## [0.22.1] — 2026-08-17
 ### Fixed
 - **Installed workflow profile path in `/do-work`** — the `/do-work` prompt now exposes the absolute installed workflow profile directory (resolved from the shipped package) and directs the orchestrator to read the resolved profile JSON from there, instead of guessing `CLAUDE_PLUGIN_ROOT`/`omp://` paths or inventing `.md` profile paths.
