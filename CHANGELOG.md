@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.1] — 2026-08-17
+### Fixed
+- **Installed workflow profile path in `/do-work`** — the `/do-work` prompt now exposes the absolute installed workflow profile directory (resolved from the shipped package) and directs the orchestrator to read the resolved profile JSON from there, instead of guessing `CLAUDE_PLUGIN_ROOT`/`omp://` paths or inventing `.md` profile paths.
+
 ## [0.22.0] — 2026-08-17
 ### Added
 - **Durable workflow engine** — workflows now run against a durable execution cursor with typed workflow contracts, capability-scoped dispatch, and stage-level enforcement, so resumed runs replay authoritative state instead of re-deriving it from stale in-memory data.
