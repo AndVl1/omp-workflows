@@ -351,11 +351,14 @@ export {
 } from "./engine/dod.js";
 export { orchestratorWriteGate, workerWriteScopeGate, actorOf, hasStrictOrchestratorState, type WorkerWriteScope } from "./gates/orchestrator-write.js";
 export {
-	run,
-	resolveClassification,
-	type RunOptions,
-	type RunResult,
-	type ModelClassification,
+  run,
+  prepareWorkflowState,
+  resolveClassification,
+  type RunOptions,
+  type WorkflowPrepareOptions,
+  type PreparedWorkflowState,
+  type RunResult,
+  type ModelClassification,
 } from "./engine/run.js";
 export {
 	walkProfile,

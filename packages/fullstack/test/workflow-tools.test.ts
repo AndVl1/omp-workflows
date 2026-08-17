@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -51,7 +51,7 @@ test("fullstack: workflow tools register and fail closed with structured respons
     },
   } as never);
 
-  assert.deepEqual([...tools.keys()], ["workflow_begin", "workflow_status", "workflow_instructions", "workflow_complete", "workflow_checkpoint", "workflow_advance"]);
+  assert.deepEqual([...tools.keys()], ["workflow_prepare", "workflow_begin", "workflow_status", "workflow_instructions", "workflow_complete", "workflow_checkpoint", "workflow_advance"]);
   for (const name of tools.keys()) {
     assert.ok(tools.get(name)?.parameters, `${name} exposes a parameter schema`);
   }
@@ -89,6 +89,99 @@ test("fullstack: workflow tools register and fail closed with structured respons
   assert.equal((statusResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
   assert.equal((completeResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
   assert.equal((advanceResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
+});
+
+test("fullstack: workflow_prepare persists PHASE-0 state in the canonical session cwd", async () => {
+  const canonical = mkdtempSync(join(tmpdir(), "omp-workflow-prepare-canonical-"));
+  const stale = mkdtempSync(join(tmpdir(), "omp-workflow-prepare-stale-"));
+  try {
+    execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    const tools = new Map<string, RegisteredTool>();
+    registerWorkflowTools({
+      zod: { z },
+      registerTool(tool: RegisteredTool) {
+        tools.set(tool.name, tool);
+      },
+    } as never);
+
+    const prepare = tools.get("workflow_prepare")!;
+    const response = await prepare.execute(
+      "test",
+      {
+        task: "prepare state binding regression",
+        branch: "main",
+        classification: {
+          type: "BUG_FIX",
+          complexity: "QUICK",
+          confidence: "HIGH",
+          autonomous: false,
+          autonomous_reason: "interactive regression fix",
+        },
+        files: ["src/main/App.kt"],
+        issue: 42,
+      },
+      undefined,
+      undefined,
+      { cwd: stale, sessionManager: { getCwd: () => canonical }, hasUI: true } as never,
+    );
+
+    const details = response.details as { ok?: boolean; state_path?: string; state?: { branch?: string } };
+    assert.equal(details.ok, true);
+    assert.equal(details.state?.branch, "main");
+    assert.equal(details.state_path, join(canonical, ".work-state", "features", "main", "state.json"));
+    const state = JSON.parse(readFileSync(details.state_path!, "utf8")) as {
+      branch: string;
+      task: string;
+
+      classification?: { type: string; autonomous: boolean; workflow?: string };
+      scope?: { scope: string[] };
+    };
+
+    const begin = tools.get("workflow_begin")!;
+    const beginResponse = await begin.execute(
+      "test",
+      {},
+      undefined,
+      undefined,
+      { cwd: canonical, hasUI: true } as never,
+    );
+    assert.equal((beginResponse.details as { ok?: boolean }).ok, true);
+    assert.equal(state.branch, "main");
+    assert.equal(state.task, "prepare state binding regression");
+    assert.deepEqual(state.classification, {
+      type: "BUG_FIX",
+      complexity: "QUICK",
+      confidence: "HIGH",
+      autonomous: false,
+      autonomous_reason: "interactive regression fix",
+      workflow: "bug-fix",
+    });
+    assert.deepEqual(state.scope?.scope, ["backend-kotlin"]);
+
+    const reopenResponse = await tools.get("workflow_prepare")!.execute(
+      "test",
+      {
+        task: "continue current workflow",
+        branch: "main",
+        continuation: { feedback: "recheck the fix", stageId: "discovery" },
+      },
+      undefined,
+      undefined,
+      { cwd: canonical, hasUI: true } as never,
+    );
+    assert.equal((reopenResponse.details as { ok?: boolean }).ok, true);
+    const resumedBegin = await begin.execute(
+      "test",
+      {},
+      undefined,
+      undefined,
+      { cwd: canonical, hasUI: true } as never,
+    );
+    assert.equal((resumedBegin.details as { ok?: boolean }).ok, true);
+  } finally {
+    rmSync(canonical, { recursive: true, force: true });
+    rmSync(stale, { recursive: true, force: true });
+  }
 });
 test("fullstack: workflow_begin follows the canonical session cwd, not a stale context cwd", async () => {
   const canonical = mkdtempSync(join(tmpdir(), "omp-workflow-canonical-"));
