@@ -71,6 +71,43 @@ function isWithinTree(root: string, candidate: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+/**
+ * Normalize state written by pre-durable workflow commands. Those states keep
+ * `workflow` at the root and track progress as `pending_stages`; the durable
+ * engine needs the classification nested and a cursor-shaped state.
+ */
+function normalizePersistedState(raw: unknown): TeamState | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const state: Record<string, unknown> = { ...(raw as Record<string, unknown>) };
+  const rawClassification = state.classification;
+  const classification = rawClassification && typeof rawClassification === "object" && !Array.isArray(rawClassification)
+    ? { ...(rawClassification as Record<string, unknown>) }
+    : null;
+  const legacyWorkflow = typeof state.workflow === "string" && state.workflow.length > 0 ? state.workflow : null;
+  if (classification && typeof classification.workflow !== "string" && legacyWorkflow) {
+    classification.workflow = legacyWorkflow;
+    state.classification = classification;
+  }
+
+  const hasLegacyCursor = Array.isArray(state.pending_stages) || typeof state.status === "string";
+  const hasDurableCursor = Array.isArray(state.stages) && typeof state.stage_cursor === "string";
+  if (classification && legacyWorkflow && hasLegacyCursor && !hasDurableCursor) {
+    state.schema = 1;
+    state.run_key = typeof state.run_key === "string" ? state.run_key : typeof state.branch === "string" ? state.branch : undefined;
+    state.stage_cursor = "";
+    state.stages = [];
+    const rawArtifacts = state.artifacts;
+    state.artifacts = rawArtifacts && typeof rawArtifacts === "object" && !Array.isArray(rawArtifacts) ? rawArtifacts : {};
+    state.workflow_override = typeof state.workflow_override === "boolean" ? state.workflow_override : false;
+    state.issue = "issue" in state ? state.issue : null;
+    const rawPause = state.pause;
+    state.pause = rawPause && typeof rawPause === "object" && !Array.isArray(rawPause) ? rawPause : { kind: "none", reason: "" };
+    state.updated_at = typeof state.updated_at === "string" ? state.updated_at : new Date().toISOString();
+  }
+  return state as unknown as TeamState;
+}
+
+
 
 export interface ResolvedState {
   state: TeamState | null;
@@ -98,7 +135,7 @@ function resolveLegacyWorkflowFallback(cwd: string, wsDir: string, currentBranch
     if (!isWithin(realpathSync(cwd), realWorkState) || !isWithin(realWorkState, realpathSync(legacyPath))) return null;
     const artifactsPath = join(wsDir, "artifacts");
     if (existsSync(artifactsPath) && !isWithin(realWorkState, realpathSync(artifactsPath))) return null;
-    const state = JSON.parse(readFileSync(legacyPath, "utf8")) as TeamState | null;
+    const state = normalizePersistedState(JSON.parse(readFileSync(legacyPath, "utf8")));
     if (!state || !state.classification || typeof state.classification.workflow !== "string" || !state.classification.workflow || typeof state.branch !== "string" || !state.branch) return null;
     if (currentBranch && state.branch !== currentBranch) return null;
     return { state, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: false };
@@ -192,8 +229,13 @@ export function resolveState(cwd: string, currentBranch?: string): ResolvedState
       if (existsSync(artifactsPath) && !isWithin(realFeature, realpathSync(artifactsPath))) {
         return { state: null, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: false, invalid: true };
       }
-      const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-      if (!state?.classification || typeof state.classification.workflow !== "string" || !state.classification.workflow) {
+      const state = normalizePersistedState(JSON.parse(readFileSync(statePath, "utf8")));
+      if (!state) {
+        const legacyFallback = resolveLegacyWorkflowFallback(cwd, wsDir, currentBranch);
+        if (legacyFallback) return legacyFallback;
+        return { state: null, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: false, invalid: true };
+      }
+      if (!state.classification || typeof state.classification.workflow !== "string" || !state.classification.workflow) {
         const legacyFallback = resolveLegacyWorkflowFallback(cwd, wsDir, currentBranch);
         if (legacyFallback) return legacyFallback;
       }
@@ -214,7 +256,8 @@ export function resolveState(cwd: string, currentBranch?: string): ResolvedState
       if (existsSync(artifactsPath) && !isWithin(realWorkState, realpathSync(artifactsPath))) {
         return { state: null, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: false, invalid: true };
       }
-      const state = JSON.parse(readFileSync(legacyPath, "utf8")) as TeamState;
+      const state = normalizePersistedState(JSON.parse(readFileSync(legacyPath, "utf8")));
+      if (!state) return { state: null, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: false, invalid: true };
       return { state, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: currentBranch ? state.branch !== currentBranch : false };
     } catch {
       return { state: null, statePath: legacyPath, stateDir: wsDir, artifactsDir: join(wsDir, "artifacts"), isLegacy: true, isStale: false, invalid: true };

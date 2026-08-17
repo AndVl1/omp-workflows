@@ -196,10 +196,14 @@ export function beginCapability(cwd: string): TransitionResult {
   if (state.profile_hash && state.profile_hash !== persistedHash) {
     return { ok: false, error: "workflow profile hash is stale", state };
   }
+  if (!Array.isArray(state.stages)) return { ok: false, error: "workflow stages are missing", state };
+  const stages = state.stages.length > 0
+    ? state.stages
+    : profile.stages.map((candidate) => ({ id: candidate.id, status: "pending" as const }));
   const stageId = state.stage_cursor || profile.stages[0]?.id;
   const stage = profile.stages.find((candidate) => candidate.id === stageId);
   if (!stage) return { ok: false, error: `workflow stage '${stageId ?? ""}' is unavailable`, state };
-  const stageEntry = state.stages.find((candidate) => candidate.id === stage.id);
+  const stageEntry = stages.find((candidate) => candidate.id === stage.id);
   if (!stageEntry) return { ok: false, error: `workflow stage '${stage.id}' is not persisted`, state };
   if (stageEntry.status === "done" || stageEntry.status === "skipped") {
     return { ok: false, error: `workflow stage '${stage.id}' is already ${stageEntry.status}`, state };
@@ -243,7 +247,7 @@ export function beginCapability(cwd: string): TransitionResult {
     stage_cursor: stage.id,
     scope: flags,
     policy: { ...(state.policy ?? {}), strict_orchestrator: true },
-    stages: state.stages.map((entry) => entry.id === stage.id ? { ...entry, status: "in_progress" as const } : entry),
+    stages: stages.map((entry) => entry.id === stage.id ? { ...entry, status: "in_progress" as const } : entry),
     dispatch_capability: {
       ...issued.state,
       status: existingDispatches.length > 0 ? "dispatched" as const : "ready" as const,
