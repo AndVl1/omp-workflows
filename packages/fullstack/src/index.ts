@@ -54,21 +54,27 @@ import {
 const ROLE_COUNT = defaultFullstackModelRoles.length;
 
 /**
- * Resolve the `session_start` context to a usable cwd string. An explicit
- * non-empty `ctx.cwd` always wins. OMP 17.2.10 emits `session_start` without
- * a `cwd` field on the context object, so we fall back to `process.cwd()` —
- * the directory the OMP session was launched from — instead of silently
- * skipping dispatcher/command-copy startup (no `.omp/cto-dispatcher.lock`
- * appeared until a probe used `process.cwd()`). The extension API exposes
- * ExtensionContext.cwd at runtime but the bundled .d.ts lacks a typed
- * overload for this hook, so we hand-narrow at the boundary instead of an
- * unchecked cast. Non-object contexts (unknown/legacy hook invocations)
- * still resolve to undefined.
+ * Resolve the session project root for hooks and workflow tools.
+ *
+ * The session manager is authoritative across resume/switch operations. Some
+ * OMP runtimes omit `cwd` from lifecycle/tool contexts, while other versions
+ * can leave the copied context value stale after a session move; using the
+ * manager first keeps commands and durable transitions on the same worktree.
+ * The context and process cwd remain compatibility fallbacks.
  */
 export function resolveSessionCwd(ctx: unknown): string | undefined {
 	if (!ctx || typeof ctx !== "object") return undefined;
-	const candidate = "cwd" in ctx ? ctx.cwd : undefined;
-	if (typeof candidate === "string" && candidate.length > 0) return candidate;
+	const objectContext = ctx as { cwd?: unknown; sessionManager?: unknown };
+	const manager = objectContext.sessionManager;
+	if (manager && typeof manager === "object" && "getCwd" in manager && typeof manager.getCwd === "function") {
+		try {
+			const sessionCwd = manager.getCwd();
+			if (typeof sessionCwd === "string" && sessionCwd.length > 0) return sessionCwd;
+		} catch {
+			// Fall through to the context/process fallback.
+		}
+	}
+	if (typeof objectContext.cwd === "string" && objectContext.cwd.length > 0) return objectContext.cwd;
 	return process.cwd();
 }
 

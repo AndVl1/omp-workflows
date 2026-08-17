@@ -19,6 +19,25 @@ export interface WorkflowCommandOptions {
 	teamDescription?: string;
 	ctoDescription?: string;
 }
+/**
+ * Resolve the project root from the session manager first.
+ *
+ * OMP has shipped runtimes where the command context's `cwd` is absent or
+ * lags the session after a resume/switch. The session manager owns the
+ * session's canonical project root; the context and process cwd are
+ * compatibility fallbacks for older test/runtime hosts.
+ */
+function resolveCommandCwd(ctx: ExtensionCommandContext): string {
+	const sessionManager = ctx.sessionManager as unknown as { getCwd?: () => unknown } | undefined;
+	try {
+		const sessionCwd = sessionManager?.getCwd?.();
+		if (typeof sessionCwd === "string" && sessionCwd.length > 0) return sessionCwd;
+	} catch {
+		// Fall through to the context/process fallback.
+	}
+	if (typeof ctx.cwd === "string" && ctx.cwd.length > 0) return ctx.cwd;
+	return process.cwd();
+}
 
 function registerPromptCommand(
 	pi: ExtensionAPI,
@@ -60,28 +79,30 @@ function buildDoWorkCommandPrompt(
 				].join("\n");
 	}
 
-	const envelope = parseWorkEnvelope(args, ctx.cwd);
+	const cwd = resolveCommandCwd(ctx);
+	const envelope = parseWorkEnvelope(args, cwd);
 	if (!envelope.task) return "ERROR: empty task after stripping prefix.";
 	ctx.ui.notify(`${commandName}: ${envelope.task.slice(0, 60)} (workflow pending)`, "info");
-	return promptBuilder(envelope, ctx.cwd);
+	return promptBuilder(envelope, cwd);
 }
 
 function buildCtoCommandPrompt(args: string, ctx: ExtensionCommandContext): string {
+	const cwd = resolveCommandCwd(ctx);
 	if (!args) {
 		ctx.ui.notify("cto: standby mode — awaiting tasks via messenger inbox", "info");
-		return buildStandbyCtoPrompt(ctx.cwd);
+		return buildStandbyCtoPrompt(cwd);
 	}
 
 	const sessionId = ctx.sessionManager.getSessionId();
-	const envelope = parseCtoEnvelope(args, ctx.cwd);
+	const envelope = parseCtoEnvelope(args, cwd);
 	if (!envelope.task) return "ERROR: empty task after stripping prefix.";
-	const active = findActiveCtoRun(ctx.cwd, { sessionId });
+	const active = findActiveCtoRun(cwd, { sessionId });
 	if (active) {
 		ctx.ui.notify(`cto: amending run ${active.runId} with: ${envelope.task.slice(0, 50)}`, "info");
-		return buildAmendPrompt(envelope, ctx.cwd, active, { sessionId });
+		return buildAmendPrompt(envelope, cwd, active, { sessionId });
 	}
 	ctx.ui.notify(`cto: ${envelope.task.slice(0, 60)} (decomposition pending)`, "info");
-	return buildCtoPrompt(envelope, ctx.cwd, { sessionId });
+	return buildCtoPrompt(envelope, cwd, { sessionId });
 }
 
 /** Register workflow entry points during extension load, before OMP snapshots slash suggestions. */

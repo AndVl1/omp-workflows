@@ -1,5 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { registerWorkflowCommands } from "../src/workflow-commands.js";
 
 type Registered = {
@@ -26,7 +30,7 @@ function commandHarness(
 	return { commands, prompts, notifications };
 }
 
-function context(cwd: string, notifications: string[], sessionId = "session-direct"): unknown {
+function context(cwd: string, notifications: string[], sessionId = "session-direct", sessionCwd?: string): unknown {
 	return {
 		cwd,
 		ui: {
@@ -34,7 +38,10 @@ function context(cwd: string, notifications: string[], sessionId = "session-dire
 				notifications.push(message);
 			},
 		},
-		sessionManager: { getSessionId: () => sessionId },
+		sessionManager: {
+			getSessionId: () => sessionId,
+			...(sessionCwd ? { getCwd: () => sessionCwd } : {}),
+		},
 	};
 }
 
@@ -59,6 +66,22 @@ test("fullstack: direct /do-work and /team send prompts through OMP", async () =
 	assert.ok(prompts[1]?.includes("Fresh team task"));
 	assert.ok(prompts[1]?.includes("classification pass"));
 	assert.deepEqual(notifications.map(message => message.split(":")[0]), ["do-work", "team"]);
+});
+test("fullstack: workflow commands use the session manager cwd after a context cwd drift", async () => {
+	const canonical = mkdtempSync(join(tmpdir(), "omp-command-canonical-"));
+	const stale = mkdtempSync(join(tmpdir(), "omp-command-stale-"));
+	try {
+		execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+		const { commands, prompts } = commandHarness();
+		await commands.get("do-work")?.handler("Canonical branch task", context(stale, [], "session-drift", canonical));
+
+		assert.equal(prompts.length, 1);
+		assert.match(prompts[0] ?? "", /Branch: `main`/);
+		assert.doesNotMatch(prompts[0] ?? "", /no git work tree/);
+	} finally {
+		rmSync(canonical, { recursive: true, force: true });
+		rmSync(stale, { recursive: true, force: true });
+	}
 });
 
 test("fullstack: external hook boundary can augment /do-work prompt", async () => {
