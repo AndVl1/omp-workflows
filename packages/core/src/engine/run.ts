@@ -97,7 +97,7 @@ export function resolveClassification(opts: Pick<RunOptions, "task" | "autonomou
       );
     }
     const expected = resolveWorkflow(model.type, model.complexity, model.autonomous);
-    if (model.workflow !== undefined && model.workflow !== expected && (model.type === "SPEC" || model.type === "REGRESS" || model.type === "PRODUCT_DISCOVERY")) {
+    if (model.workflow !== undefined && model.workflow !== expected && (model.type === "SPEC" || model.type === "REGRESS" || model.type === "LECTURE_RESEARCH" || model.type === "PRODUCT_DISCOVERY")) {
       throw new Error(`classification gate: ${model.type} must resolve to '${expected}', got '${model.workflow}'`);
     }
     return {
