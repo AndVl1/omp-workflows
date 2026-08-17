@@ -10,10 +10,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, profileHash } from "../src/engine/profile.js";
+import { loadProfile, profileHash, findProfileDir } from "../src/engine/profile.js";
 import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
@@ -455,6 +455,28 @@ test("do-work prompt makes orchestrator non-coding policy explicit", () => {
     assert.match(prompt, /STRICT ORCHESTRATOR POLICY/);
     assert.match(prompt, /write\/edit application source or project files \| DENY/);
     assert.match(prompt, /After every delegated call or parallel batch/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("do-work: prompt exposes the absolute installed profile dir for an arbitrary consumer cwd", () => {
+  // Arbitrary consumer project: a fresh temp dir, no packages/core anywhere.
+  const root = mkdtempSync(join(tmpdir(), "do-work-consumer-"));
+  try {
+    assert.ok(!existsSync(join(root, "packages", "core")), "temp consumer cwd has no packages/core");
+    const prompt = buildDoWorkPrompt(parseWorkEnvelope("Fix login bug", root), root);
+    assert.ok(
+      prompt.includes(findProfileDir()),
+      "prompt must expose the absolute installed workflow profile directory (findProfileDir)",
+    );
+    assert.ok(
+      prompt.includes(`${findProfileDir()}/<workflow>.json`),
+      "prompt must instruct reading <absolute-profile-dir>/<workflow>.json",
+    );
+    assert.match(prompt, /must not use/);
+    assert.match(prompt, /CLAUDE_PLUGIN_ROOT/);
+    assert.match(prompt, /omp:\/\//);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

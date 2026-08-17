@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { parseAutonomousDirective } from "./envelope.js";
 import { buildClassificationPhaseZero, buildWorkflowMatrix } from "./classification-contract.js";
 import { resolveState } from "../engine/state.js";
+import { findProfileDir } from "../engine/profile.js";
 import type { Complexity, TaskType, WorkflowName } from "../engine/types.js";
 
 export interface ParsedWorkEnvelope {
@@ -54,6 +55,7 @@ function loadTeamConfig(cwd: string): WorkTeamConfig {
 export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): string {
   const roles = Object.entries(loadTeamConfig(cwd).roles ?? {});
   const roleTable = roles.map(([role, agent]) => `| \`${role}\` | \`${agent}\` |`).join("\n");
+  const profileDir = findProfileDir();
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
   const branchMeta = envelope.branch ? `Branch: \`${envelope.branch}\`\n` : "Branch: (no git work tree)\n";
   const resolvedState = resolveState(cwd, envelope.branch ?? undefined);
@@ -90,7 +92,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "(unless `autonomous` is true; then document a conservative default).",
     "",
     "### Only after state is written",
-    "1. Read exactly the resolved workflow profile JSON and then its stages. Use `packages/core/workflows/<workflow>.json` in this repository, or the installed package's `workflows/<workflow>.json`; never invent a `.md` profile path.",
+    `1. Read exactly the resolved workflow profile JSON and then its stages: \`${profileDir}/<workflow>.json\`. The absolute profile directory \`${profileDir}\` ships with this installed package and is the only valid source for its workflow profiles — must not use Claude Code-only CLAUDE_PLUGIN_ROOT paths or \`omp://\` guesses for them, and never invent a \`.md\` profile path.`,
     "2. Continue executing in THIS TURN. Do not stop after printing CLASSIFICATION or writing state; immediately read the profile and walk its stages.",
     "3. On continuation, skip stages already done/skipped and start at the first reopened or pending stage.",
     "4. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch.",
