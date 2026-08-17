@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.10] — 2026-08-18
+### Fixed
+- **Checkpoint-aware orchestration** — `/do-work` now requires an explicit `workflow_checkpoint` decision before `workflow_advance` and tells dispatched workers to leave workflow control and canonical-state writes to the main session.
+
 ## [0.22.9] — 2026-08-18
 ### Fixed
 - **Typed artifact guidance** — `workflow_instructions` now returns the exact JSON schemas for declared artifacts, and `/do-work` explicitly requires schema-conformant output such as object-shaped DoD items.
