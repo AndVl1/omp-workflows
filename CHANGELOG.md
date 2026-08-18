@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.16] — 2026-08-18
+### Fixed
+- **Security mapping fallback** — security review roles remain explicitly unavailable when their specialist agent is missing instead of silently degrading to the generic `task` worker.
+
 ## [0.22.15] — 2026-08-18
 ### Fixed
 - **Compact capability bindings** — workflow control calls now use a bounded profile-hash fingerprint while durable state retains the full hash, preventing long-session handoff truncation from rejecting valid completions without weakening binding checks.
