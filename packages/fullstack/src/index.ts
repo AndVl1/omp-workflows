@@ -351,7 +351,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "workflow_complete",
     label: "Complete workflow dispatch",
-    description: "Record durable completion for an authorized workflow dispatch.",
+    description: "Record durable completion for an authorized workflow dispatch. Copy the compact profile_hash fingerprint exactly from the current workflow handoff; do not abbreviate or reconstruct it.",
     parameters: z.object({
       dispatch_id: z.string().min(1), token: z.string().min(1), capability_id: z.string().min(1),
       run_key: z.string().min(1), branch: z.string().min(1), workflow: z.string().min(1), profile_hash: z.string().min(1), stage_cursor: z.string().min(1), cursor_epoch: z.string().min(1), evidence: z.string().min(1),

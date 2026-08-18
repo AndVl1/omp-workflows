@@ -53,6 +53,19 @@ type ActiveCapability = {
   expected_roster: Array<{ role: string; agent: string }>;
   status: "ready" | "dispatched" | "joining" | "complete" | "invalidated"; dispatches: DispatchRecord[];
 };
+/**
+ * Keep the profile binding model-safe without weakening its identity.
+ *
+ * The full SHA-256 remains persisted in state. Workflow control calls carry a
+ * compact first-30/last-2 fingerprint because long hashes are routinely
+ * abbreviated by an LLM when copied through a long-running session.
+ */
+const profileHashFingerprint = (value: string): string =>
+  value.length > 32 ? `${value.slice(0, 30)}${value.slice(-2)}` : value;
+
+const profileHashMatches = (expected: string, provided: string): boolean =>
+  provided === expected || provided === profileHashFingerprint(expected);
+
 const activeCapability = (value: TeamState["dispatch_capability"]): ActiveCapability | null => {
   if (
     !value?.issued_for ||
@@ -120,6 +133,7 @@ export interface CapabilityHandoff {
   run_key: string;
   branch: string;
   workflow: TeamState["classification"]["workflow"];
+  /** Compact first-30/last-2 binding fingerprint; the full hash stays state-only. */
   profile_hash: string;
   stage_cursor: string;
   cursor_epoch: string;
@@ -150,7 +164,7 @@ function handoffFromState(
     run_key: cap.issued_for.run_key,
     branch: cap.issued_for.branch,
     workflow: cap.issued_for.workflow,
-    profile_hash: cap.issued_for.profile_hash,
+    profile_hash: profileHashFingerprint(cap.issued_for.profile_hash),
     stage_cursor: cap.issued_for.stage_cursor,
     cursor_epoch: cap.issued_for.cursor_epoch,
     kind: cap.kind,
@@ -347,7 +361,7 @@ function auth(cap: ActiveCapability, a: DispatchAuth, secretHash: string): strin
   if (!a.capability_id || a.capability_id !== cap.capability_id) return "capability identity mismatch";
   if (!a.token || hash(a.token) !== secretHash) return "invalid secret";
   const b = cap.issued_for;
-  if (a.run_key !== b.run_key || a.branch !== b.branch || a.workflow !== b.workflow || a.profile_hash !== b.profile_hash || a.stage_cursor !== b.stage_cursor || a.cursor_epoch !== b.cursor_epoch) return "capability binding mismatch";
+  if (a.run_key !== b.run_key || a.branch !== b.branch || a.workflow !== b.workflow || !profileHashMatches(b.profile_hash, a.profile_hash) || a.stage_cursor !== b.stage_cursor || a.cursor_epoch !== b.cursor_epoch) return "capability binding mismatch";
   return null;
 }
 

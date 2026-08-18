@@ -641,6 +641,7 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     assert.match(prompt, /native task result.*artifact completion/i);
     assert.match(prompt, /dod.*items.*MUST be objects/i);
     assert.match(prompt, /Before `workflow_advance`.*workflow_checkpoint/);
+    assert.match(prompt, /compact first-30\/last-2 binding fingerprint/);
     assert.match(prompt, /workflow_\*.*main-session-only.*canonical `\.work-state`.*bash.*write/i);
 
     // No filesystem/package-path/plugin-root workflow content sourcing.
@@ -725,6 +726,26 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
     assert.equal(begun.ok, true);
     if (!begun.ok || !begun.handoff) return;
     const handoff = begun.handoff;
+    const fullProfileHash = profileHash(profile);
+    const expectedFingerprint = `${fullProfileHash.slice(0, 30)}${fullProfileHash.slice(-2)}`;
+    assert.notEqual(expectedFingerprint, fullProfileHash);
+    assert.equal(handoff.profile_hash, expectedFingerprint);
+    const wrongProfileHash = `${handoff.profile_hash.slice(0, -1)}${handoff.profile_hash.endsWith("0") ? "1" : "0"}`;
+    const wrongBinding = authorizeDispatch(root, {
+      token: handoff.dispatch_token,
+      capability_id: handoff.capability_id,
+      run_key: handoff.run_key,
+      branch: handoff.branch,
+      workflow: handoff.workflow,
+      profile_hash: wrongProfileHash,
+      stage_cursor: handoff.stage_cursor,
+      cursor_epoch: handoff.cursor_epoch,
+      role: "developer-kotlin",
+      agent: "developer-kotlin",
+    });
+    assert.equal(wrongBinding.ok, false);
+    if (wrongBinding.ok) return;
+    assert.equal(wrongBinding.error, "capability binding mismatch");
     const persisted = readFileSync(join(root, ".work-state", "team-state.json"), "utf8");
     assert.doesNotMatch(persisted, new RegExp(handoff.dispatch_token));
     assert.doesNotMatch(persisted, new RegExp(handoff.advance_token));
