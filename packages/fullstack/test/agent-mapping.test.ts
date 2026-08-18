@@ -40,3 +40,18 @@ test("fullstack refresh uses generic task when a specialized planner is absent",
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("fullstack refresh keeps security review unavailable without its specialist", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-fullstack-mapping-security-"));
+  try {
+    const result = await refreshFullstackAgentMappings(root, async () => ({
+      agents: [{ name: "task" }],
+    }));
+
+    assert.equal(result.resolved_roles["security-tester"], undefined);
+    assert.equal(result.diagnostics["security-tester"]?.status, "unavailable");
+    assert.ok(result.unresolved_roles.includes("security-tester"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

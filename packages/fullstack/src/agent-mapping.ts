@@ -36,7 +36,7 @@ export const defaultFullstackAgentFallbacks: Record<string, readonly string[]> =
 
 /** Security review must not silently degrade to a generic worker. */
 const genericFallbackRoles = Array.from(new Set([
-  ...Object.keys(defaultFullstackAgentFallbacks),
+  ...Object.keys(defaultFullstackAgentFallbacks).filter(role => role !== "security-tester"),
   ...Object.entries(defaultFullstackRoles)
     .filter(([role]) => role !== "security-tester")
     .map(([, agent]) => agent),
