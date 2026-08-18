@@ -324,7 +324,24 @@ export {
   type WorkflowContractOptions,
   type WorkflowStageContract,
 } from "./engine/workflow-contract.js";
-export { resolveConfig } from "./engine/config.js";
+export {
+  resolveConfig,
+  resolveAgentForRole,
+  agentMappingIssueForRole,
+} from "./engine/config.js";
+export {
+  AGENT_MAPPING_SCHEMA,
+  DEFAULT_GENERIC_AGENT,
+  agentMappingPath,
+  buildAgentMapping,
+  mappingPreferencesHash,
+  readAgentMapping,
+  writeAgentMapping,
+  type AgentMappingDiagnostic,
+  type AgentMappingOptions,
+  type AgentMappingState,
+  type AgentMappingStatus,
+} from "./engine/agent-mapping.js";
 export { resolveScope, applyConditional, shouldSkip } from "./engine/scope.js";
 export {
   writeState,

@@ -5,6 +5,7 @@
  * guarantees; the JSON files on disk are loaded and validated against these shapes.
  */
 
+import type { AgentMappingState } from "./agent-mapping.js";
 import type { ObservabilityPointer } from "../observability/events.js";
 
 export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "SPEC" | "REGRESS" | "INVESTIGATION" | "REVIEW" | "HOTFIX";
@@ -353,6 +354,8 @@ export interface RoleConfig {
   flags: Record<string, string[]>;
   /** design system hint (UI work) */
   design_system: string | null;
+  /** Live role -> agent resolution generated from OMP discovery. */
+  agent_mapping?: AgentMappingState;
 }
 
 export const DEFAULT_ROLES: RoleConfig["roles"] = {

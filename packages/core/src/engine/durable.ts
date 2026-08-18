@@ -3,7 +3,8 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "./profile.js";
 import { resolveState, writeState, isSafeStateSegment, resolveActiveBranch, type ResolvedState } from "./state.js";
-import { resolveConfig, resolveAgentForRole } from "./config.js";
+import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole } from "./config.js";
+import type { AgentMappingDiagnostic } from "./agent-mapping.js";
 import { resolveScope, type ScopeFlags } from "./scope.js";
 import { resolveStageDispatchSlots } from "./stage.js";
 import { readArtifact, writeArtifact } from "./artifacts.js";
@@ -225,9 +226,6 @@ export function beginCapability(cwd: string): TransitionResult {
   if (state.policy?.strict_orchestrator === true && state.dispatch_capability && !existing) {
     return { ok: false, error: "workflow dispatch capability is malformed", state };
   }
-  if (existing && existing.issued_for.stage_cursor === stage.id && existing.status !== "complete" && existing.status !== "invalidated") {
-    return { ok: false, error: "workflow stage already has an active capability; use the existing handoff", state };
-  }
   const existingDispatches = existing?.issued_for.stage_cursor === stage.id ? existing.dispatches : [];
   const config = resolveConfig(cwd);
   const flags = state.scope ?? resolveScope([], config);
@@ -239,9 +237,28 @@ export function beginCapability(cwd: string): TransitionResult {
   if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) {
     return { ok: false, error: `workflow stage '${stage.id}' has an invalid dispatch roster`, state };
   }
+  const mappingIssues: Array<{ role: string; diagnostic: AgentMappingDiagnostic }> = [];
+  for (const slot of slots) {
+    const diagnostic = agentMappingIssueForRole(slot.role, config);
+    if (diagnostic) mappingIssues.push({ role: slot.role, diagnostic });
+  }
+  if (mappingIssues.length > 0) {
+    const details = mappingIssues
+      .map(({ role, diagnostic }) => `role '${role}' requested '${diagnostic.requested}' (candidates: ${diagnostic.candidates.join(", ")})`)
+      .join("; ");
+    return { ok: false, error: `workflow stage '${stage.id}' has no available agent mapping: ${details}`, state };
+  }
   const expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
-  if (existing && existingDispatches.length > 0 && JSON.stringify(existing.expected_roster) !== JSON.stringify(expectedRoster)) {
-    return { ok: false, error: "active dispatch capability roster is inconsistent", state };
+  if (existing && existing.issued_for.stage_cursor === stage.id && existing.status !== "complete" && existing.status !== "invalidated") {
+    const rosterChanged = JSON.stringify(existing.expected_roster) !== JSON.stringify(expectedRoster);
+    if (existingDispatches.length > 0 && rosterChanged) {
+      return { ok: false, error: "active dispatch capability roster is inconsistent", state };
+    }
+    if (!rosterChanged) {
+      return { ok: false, error: "workflow stage already has an active capability; use the existing handoff", state };
+    }
+    // No dispatch was authorized under the stale roster. Reissue the capability
+    // with the current mapping so a resumed workflow does not need manual repair.
   }
   const issued = createCapability({
     run_key: state.run_key ?? state.branch,

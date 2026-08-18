@@ -144,6 +144,44 @@ roles: {
 }
 ```
 
+### Runtime actualization and fallback
+
+`roles` остаётся декларативным **желаемым** mapping, а не гарантией того, что
+агент реально загружен. Fullstack на `session_start` вызывает OMP
+`discoverAgents(cwd)` и публикует эффективный mapping в
+`.work-state/runtime/agent-mapping.json` (файл локальный и не меняет
+`.omp/team.config.json`):
+
+1. выбранный в `roles` агент используется, если он есть в live inventory;
+2. затем проверяется ordered `fallbackChains` бандла;
+3. для разрешённых ролей последним fallback является встроенный OMP `task`;
+4. если кандидатов нет, роль помечается `unavailable`, а `workflow_begin`
+   блокируется с перечислением кандидатов — неизвестное имя не уходит в
+   `task` и не маскируется под успешный dispatch.
+
+Для fullstack `security-tester` намеренно не деградирует до generic worker:
+отсутствие security-агента требует его добавить/включить или явно изменить
+mapping. Если capability уже создана, но ни один dispatch ещё не
+авторизован, resume автоматически перевыпускает её с актуальным roster.
+Capability с уже начатым dispatch не переписывается.
+
+Свой bundle может использовать те же pure helpers:
+
+```typescript
+const mapping = buildAgentMapping({
+  roles,
+  availableAgents: discovered.agents.map(agent => agent.name),
+  fallbackChains,
+  genericFallbackRoles: ["analyst", "qa"],
+});
+writeAgentMapping(cwd, mapping);
+```
+
+Если подходящего агента нет, корректные варианты — ordered semantic fallback,
+`task` с явной degraded-диагностикой или fail-closed блокировка для критичной
+роли. Подставлять имя отсутствующего агента нельзя: это приводит к
+`role-agent roster mismatch` уже после выдачи capability.
+
 ### scopeMap — какой агент пишет код под какие файлы
 
 ```typescript

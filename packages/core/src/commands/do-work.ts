@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { parseAutonomousDirective } from "./envelope.js";
 import { buildClassificationPhaseZero, buildWorkflowMatrix } from "./classification-contract.js";
 import { DETACHED_BRANCH, NO_GIT_BRANCH, resolveActiveBranch, resolveState } from "../engine/state.js";
+import { readAgentMapping } from "../engine/agent-mapping.js";
 import type { Complexity, TaskType, WorkflowName } from "../engine/types.js";
 
 export interface ParsedWorkEnvelope {
@@ -40,7 +41,15 @@ function loadTeamConfig(cwd: string): WorkTeamConfig {
   if (!existsSync(path)) return {};
   try {
     const raw = JSON.parse(readFileSync(path, "utf8")) as WorkTeamConfig;
-    return raw;
+    const mapping = readAgentMapping(cwd);
+    if (!mapping) return raw;
+    const configuredRoles = raw.roles ?? {};
+    return {
+      ...raw,
+      roles: Object.fromEntries(
+        Object.entries(configuredRoles).map(([role, agent]) => [role, mapping.resolved_roles[role] ?? agent]),
+      ),
+    };
   } catch {
     return {};
   }
@@ -95,7 +104,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "9. After every `workflow_advance`, call `workflow_instructions` again and use the returned next-stage contract. If any workflow tool errors, fail closed: stop and record the failure rather than guessing the stage.",
     "10. When a stage or the whole workflow finishes, remain available in this same session: later user feedback reopens the affected state instead of starting a fresh workflow.",
     "",
-    "### Role mapping (from .omp/team.config.json)",
+    "### Role mapping (effective runtime resolution)",
     "| Role | Agent |",
     "| --- | --- |",
     roleTable || "| (no roles configured) | |",

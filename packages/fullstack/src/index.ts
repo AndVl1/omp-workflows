@@ -32,6 +32,7 @@ import {
   advanceCursor,
   recordCheckpointDecision,
   prepareWorkflowState,
+  readAgentMapping,
   resolveState,
   type DispatchAuth,
   type ModelClassification,
@@ -39,6 +40,7 @@ import {
 } from "@andvl1/omp-workflows-core";
 import { registerWorkflowCommands } from "./workflow-commands.js";
 import { ensureCommandsForSession } from "./copy-commands.js";
+import { refreshFullstackAgentMappings, waitForFullstackAgentMappings } from "./agent-mapping.js";
 import { createChannelSet, queueCtoDelivery, startChannelDispatcher, type InboxTask } from "./adapters/registry.js";
 import { createAskRedirectGate } from "./messenger-channel.js";
 import { createCtoModeReminderHandler } from "./cto-mode-reminder.js";
@@ -79,6 +81,23 @@ export function resolveSessionCwd(ctx: unknown): string | undefined {
 	}
 	if (typeof objectContext.cwd === "string" && objectContext.cwd.length > 0) return objectContext.cwd;
 	return process.cwd();
+}
+function summarizeAgentMapping(cwd: string): {
+  generated_at: string;
+  available_agents: string[];
+  fallback_roles: string[];
+  unresolved_roles: string[];
+} | null {
+  const mapping = readAgentMapping(cwd);
+  if (!mapping) return null;
+  return {
+    generated_at: mapping.generated_at,
+    available_agents: mapping.available_agents,
+    fallback_roles: Object.entries(mapping.diagnostics)
+      .filter(([, diagnostic]) => diagnostic.status === "fallback")
+      .map(([role]) => role),
+    unresolved_roles: mapping.unresolved_roles,
+  };
 }
 
 /**
@@ -195,6 +214,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
       cursor_epoch: state.cursor_epoch,
       stages: state.stages,
       pause: state.pause,
+      agent_mapping: summarizeAgentMapping(cwd),
       join_summary: state.join_summary,
       capability: capability ? {
         capability_id: capability.capability_id,
@@ -291,6 +311,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
       const cwd = resolveSessionCwd(ctx);
       if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
       try {
+        await waitForFullstackAgentMappings(cwd);
         const transition = beginCapability(cwd);
         if (!transition.ok) return result({ ok: false, code: "WORKFLOW_BEGIN_REJECTED", error: transition.error, state: transition.state ? stateSummary(cwd) : undefined });
         return result({ ok: true, transition: "begin", handoff: transition.handoff, state: stateSummary(cwd) });
@@ -450,6 +471,9 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     const cwd = resolveSessionCwd(ctx);
     if (!cwd) return;
     ensureCommandsForSession(cwd);
+    if (isMainSessionContext(ctx)) {
+      void refreshFullstackAgentMappings(cwd).catch(() => undefined);
+    }
     // Subagent-tree live widget — bound to the cwd of the active session.
     // The controller replays from <cwd>/.omp/subagent-tree.json so the
     // previous view state (on/off + verbose/compact) survives restarts.
