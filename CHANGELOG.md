@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.13] — 2026-08-18
+### Fixed
+- **Native artifact completion recovery** — workflow dispatches now defer slot snapshotting when a native task result races a partial or unreadable artifact write, then recover the binding at `workflow_advance` without restarting the workflow.
+
 ## [0.22.12] — 2026-08-18
 ### Fixed
 - **Runtime agent mapping actualization** — fullstack refreshes workflow-role mappings from OMP's live agent inventory at session start, uses ordered semantic fallbacks or the generic `task` agent, persists diagnostics outside project config, and fails closed when no valid candidate exists; undispatched stale capabilities are reissued on resume.
