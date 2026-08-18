@@ -298,6 +298,14 @@ test("fullstack: agent frontmatter uses OMP class role with standard fallback", 
     blocking: true,
     prewalk: true,
   };
+  const artifactWriterAgents = new Set([
+    "analyst",
+    "architect",
+    "code-reviewer",
+    "diagnostics",
+    "security-tester",
+    "tech-researcher",
+  ]);
   const files = readdirSync(agentsDir).filter((name) => name.endsWith(".md"));
   assert.equal(files.length, Object.keys(expected).length);
   for (const file of files) {
@@ -320,6 +328,9 @@ test("fullstack: agent frontmatter uses OMP class role with standard fallback", 
     assert.equal(fields.thinkingLevel, expected[name].thinkingLevel, `${name}: reasoning level`);
     const tools = (fields.tools ?? "").split(",").map((tool) => tool.trim()).filter(Boolean);
     assert.ok(tools.every((tool) => tool === tool.toLowerCase()), `${name}: tool ids must be lowercase`);
+    if (artifactWriterAgents.has(name)) {
+      assert.ok(tools.includes("write"), `${name}: artifact-producing workflow roles must be able to write typed artifacts`);
+    }
   }
 });
 
