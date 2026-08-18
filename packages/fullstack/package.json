@@ -1,6 +1,6 @@
 {
   "name": "@andvl1/omp-workflows-fullstack",
-  "version": "0.22.11",
+  "version": "0.22.12",
   "description": "Default team agents and skills for omp-workflows with extension-owned workflow commands and project-local compatibility commands. Pulls @andvl1/omp-workflows-core as peer.",
   "type": "module",
   "license": "MIT",

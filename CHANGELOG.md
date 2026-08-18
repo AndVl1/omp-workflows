@@ -2,10 +2,13 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.12] — 2026-08-18
+### Fixed
+- **Runtime agent mapping actualization** — fullstack refreshes workflow-role mappings from OMP's live agent inventory at session start, uses ordered semantic fallbacks or the generic `task` agent, persists diagnostics outside project config, and fails closed when no valid candidate exists; undispatched stale capabilities are reissued on resume.
+
 ## [0.22.11] — 2026-08-18
 ### Fixed
 - **Artifact-producing roles** — workflow roles that create typed stage artifacts now have the `write` tool required by the strict artifact contract; added a regression assertion for these permissions.
-- **Runtime agent mapping actualization** — fullstack refreshes workflow-role mappings from OMP's live agent inventory at session start, uses ordered semantic fallbacks or the generic `task` agent, persists diagnostics outside project config, and fails closed when no valid candidate exists; undispatched stale capabilities are reissued on resume.
 
 
 ## [0.22.10] — 2026-08-18
