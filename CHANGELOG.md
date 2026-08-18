@@ -2,6 +2,11 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.14] — 2026-08-18
+### Fixed
+- **Resumable capability handoff** — `workflow_begin` now rotates plaintext dispatch and advance secrets while preserving an active capability and its authorized dispatch records, so resumed sessions can continue without manual state repair.
+
+
 ## [0.22.13] — 2026-08-18
 ### Fixed
 - **Native artifact completion recovery** — workflow dispatches now defer slot snapshotting when a native task result races a partial or unreadable artifact write, then recover the binding at `workflow_advance` without restarting the workflow.
