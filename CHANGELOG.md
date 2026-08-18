@@ -2,6 +2,11 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.11] — 2026-08-18
+### Fixed
+- **Artifact-producing roles** — workflow roles that create typed stage artifacts now have the `write` tool required by the strict artifact contract; added a regression assertion for these permissions.
+
+
 ## [0.22.10] — 2026-08-18
 ### Fixed
 - **Checkpoint-aware orchestration** — `/do-work` now requires an explicit `workflow_checkpoint` decision before `workflow_advance` and tells dispatched workers to leave workflow control and canonical-state writes to the main session.
