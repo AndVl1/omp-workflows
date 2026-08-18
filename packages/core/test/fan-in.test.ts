@@ -20,7 +20,7 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { createCapability, authorizeDispatch, completeDispatch, advanceCursor } from "../src/engine/durable.js";
+import { createCapability, authorizeDispatch, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
 import {
   namespacedArtifactId,
   sanitizeSlot,
@@ -78,6 +78,44 @@ function writeFixtureState(root: string, profileName: string, stageId: string): 
   return issued;
 }
 
+function writeSpecFixtureState(root: string): ReturnType<typeof createCapability> {
+  const profile = loadProfile("spec-preparation");
+  assert.ok(profile);
+  const persistedHash = profileHash(profile);
+  const issued = createCapability({
+    run_key: "main",
+    branch: "main",
+    workflow: "spec-preparation",
+    profile_hash: persistedHash,
+    stage_cursor: "intake_repo_map",
+    kind: "consilium",
+    expected_roster: [
+      { role: "analyst", agent: "analyst" },
+      { role: "tech-researcher", agent: "tech-researcher" },
+    ],
+  });
+  writeState(root, {
+    schema: 1,
+    branch: "main",
+    run_key: "main",
+    classification: { type: "SPEC", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "spec-preparation" },
+    task: "spec intake",
+    workflow_override: false,
+    issue: null,
+    stage_cursor: "intake_repo_map",
+    stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "intake_repo_map" ? "in_progress" as const : "pending" as const })),
+    artifacts: {},
+    pause: { kind: "none", reason: "" },
+    policy: { strict_orchestrator: true },
+    profile_hash: persistedHash,
+    scope: NO_SCOPE,
+    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    dispatch_capability: issued.state,
+    updated_at: new Date().toISOString(),
+  }, { featureSlug: "spec" });
+  return issued;
+}
+
 function artifactsDir(root: string): string {
   const dir = join(root, ".work-state", "features", "fan", "artifacts");
   mkdirSync(dir, { recursive: true });
@@ -86,6 +124,11 @@ function artifactsDir(root: string): string {
 
 function stateOf(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "features", "fan", "state.json"), "utf8")) as TeamState;
+}
+function specArtifactsDir(root: string): string {
+  const dir = join(root, ".work-state", "features", "spec", "artifacts");
+  mkdirSync(dir, { recursive: true });
+  return dir;
 }
 
 function completeSlot(root: string, issued: ReturnType<typeof createCapability>, role: string, agent: string, artifactIds: string[]): void {
@@ -107,6 +150,24 @@ function completeSlot(root: string, issued: ReturnType<typeof createCapability>,
   const completed = completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: `${role} done`, artifact_ids: artifactIds });
   assert.equal(completed.ok, true, `complete ${role}`);
   if (!completed.ok) throw new Error(`complete failed: ${completed.error}`);
+}
+
+function authorizeSlot(root: string, issued: ReturnType<typeof createCapability>, role: string, agent: string, toolCallId: string): void {
+  const auth = {
+    token: issued.dispatch_token,
+    capability_id: issued.capability_id,
+    run_key: issued.state.issued_for!.run_key,
+    branch: issued.state.issued_for!.branch,
+    workflow: issued.state.issued_for!.workflow,
+    profile_hash: issued.state.issued_for!.profile_hash,
+    stage_cursor: issued.state.issued_for!.stage_cursor,
+    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    role,
+    agent,
+    tool_call_id: toolCallId,
+  };
+  const authorized = authorizeDispatch(root, auth);
+  assert.equal(authorized.ok, true, `authorize ${role}`);
 }
 
 const EXPLORATION = (summary: string, files: string[]) => ({ files_to_read: files.map((path) => ({ path, why: "x" })), summary });
@@ -184,6 +245,7 @@ test("fan-in: deterministic synthesis merges slots in roster order, records prov
     if (!synthesized.ok) return;
     const shared = JSON.parse(readFileSync(join(dir, "exploration.json"), "utf8")) as { files_to_read: unknown[]; summary: string };
     assert.equal(shared.files_to_read.length, 3, "arrays concatenate in roster order without dedupe loss");
+
     assert.deepEqual(shared.files_to_read.map((f) => (f as { path: string }).path), ["a.ts", "c.ts", "b.ts"], "deterministic roster order");
     assert.equal(shared.summary, "analyst one", "declared resolution resolves the required scalar first-slot-wins");
     const provenance = synthesized.state.slot_artifacts!["exploration"]!.shared!;
@@ -198,6 +260,99 @@ test("fan-in: deterministic synthesis merges slots in roster order, records prov
     assert.deepEqual(conflicts!.map((c) => c.losing_values.map((l) => l.slot)), [["tech-researcher"], ["analyst#2"]]);
     assert.equal(conflicts![0]!.resolved_value, "analyst one");
     assert.match(conflicts![0]!.rationale, /preserved per slot/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("fan-in: advance recovers native completions after slots wrote declared files", () => {
+  const root = mkdtempSync(join(tmpdir(), "fan-native-recovery-"));
+  try {
+    initGit(root, "feat/fan");
+    const issued = writeFixtureState(root, "full-feature", "exploration");
+    const dir = artifactsDir(root);
+    writeFileSync(join(dir, "discovery.json"), JSON.stringify({ task: "t", branch: "feat/fan" }));
+
+    for (const [role, agent, toolCallId] of [
+      ["analyst#1", "analyst", "tool-analyst-1"],
+      ["tech-researcher", "tech-researcher", "tool-researcher"],
+      ["analyst#2", "analyst", "tool-analyst-2"],
+    ] as const) {
+      authorizeSlot(root, issued, role, agent, toolCallId);
+      const reconciled = reconcileTrustedTaskResult(root, {
+        tool_call_id: toolCallId,
+        outcome: "succeeded",
+        evidence: `${role} native result`,
+      });
+      assert.equal(reconciled.ok, true, `native reconciliation for ${role}`);
+    }
+
+    writeFileSync(join(dir, "exploration-analyst-1.json"), JSON.stringify(EXPLORATION("one", ["a.ts"])));
+    writeFileSync(join(dir, "exploration-tech-researcher.json"), JSON.stringify(EXPLORATION("two", ["b.ts"])));
+    writeFileSync(join(dir, "exploration-analyst-2.json"), JSON.stringify(EXPLORATION("three", ["c.ts"])));
+    writeFileSync(join(dir, "dod-analyst-1.json"), JSON.stringify({ items: [{ criterion: "c", verify_method: "v", status: "pending" }] }));
+
+    const advanced = advanceCursor(root, {
+      token: issued.advance_token,
+      capability_id: issued.capability_id,
+      run_key: issued.state.issued_for!.run_key,
+      branch: issued.state.issued_for!.branch,
+      workflow: issued.state.issued_for!.workflow,
+      profile_hash: issued.state.issued_for!.profile_hash,
+      stage_cursor: issued.state.issued_for!.stage_cursor,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      evidence: "native consilium outputs reconciled",
+    });
+    assert.equal(advanced.ok, true, "native completion without ids is repaired from slot-scoped files");
+    assert.equal(existsSync(join(dir, "exploration.json")), true, "fan-in writes the shared produce after recovery");
+    const recovered = stateOf(root);
+    const slots = recovered.slot_artifacts!.exploration!.slots;
+    assert.deepEqual(Object.keys(slots["analyst#1"] ?? {}).sort(), ["dod-analyst-1", "exploration-analyst-1"]);
+    assert.deepEqual(Object.keys(slots["tech-researcher"] ?? {}), ["exploration-tech-researcher"]);
+    assert.deepEqual(Object.keys(slots["analyst#2"] ?? {}), ["exploration-analyst-2"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("spec-preparation: native consilium completion advances from slot-scoped outputs", () => {
+  const root = mkdtempSync(join(tmpdir(), "fan-spec-native-"));
+  try {
+    initGit(root, "main");
+    const issued = writeSpecFixtureState(root);
+    const dir = specArtifactsDir(root);
+    for (const [role, agent, toolCallId] of [
+      ["analyst", "analyst", "tool-spec-analyst"],
+      ["tech-researcher", "tech-researcher", "tool-spec-researcher"],
+    ] as const) {
+      authorizeSlot(root, issued, role, agent, toolCallId);
+      const reconciled = reconcileTrustedTaskResult(root, {
+        tool_call_id: toolCallId,
+        outcome: "succeeded",
+        evidence: `${role} native result`,
+      });
+      assert.equal(reconciled.ok, true, `native reconciliation for ${role}`);
+    }
+    writeFileSync(join(dir, "spec_intake_repo_map-analyst.json"), JSON.stringify({ facts: [{ source: "analyst" }] }));
+    writeFileSync(join(dir, "spec_intake_repo_map-tech-researcher.json"), JSON.stringify({ facts: [{ source: "research" }] }));
+
+    const advanced = advanceCursor(root, {
+      token: issued.advance_token,
+      capability_id: issued.capability_id,
+      run_key: issued.state.issued_for!.run_key,
+      branch: issued.state.issued_for!.branch,
+      workflow: issued.state.issued_for!.workflow,
+      profile_hash: issued.state.issued_for!.profile_hash,
+      stage_cursor: issued.state.issued_for!.stage_cursor,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      evidence: "spec intake complete",
+    });
+    assert.equal(advanced.ok, true, "spec-preparation intake transition succeeds");
+    assert.equal(advanced.ok && advanced.state.stage_cursor, "requirements_edge_cases");
+    assert.equal(existsSync(join(dir, "spec_intake_repo_map.json")), true, "shared spec intake artifact is synthesized");
+    assert.deepEqual(
+      Object.keys(advanced.ok ? advanced.state.slot_artifacts!.intake_repo_map!.slots : {}).sort(),
+      ["analyst", "tech-researcher"],
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

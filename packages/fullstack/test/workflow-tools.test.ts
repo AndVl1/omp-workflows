@@ -1,12 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { dispatchGate } from "@andvl1/omp-workflows-core";
+import { dispatchGate, createCapability, authorizeDispatch, completeDispatch, loadProfile } from "@andvl1/omp-workflows-core";
 import { registerWorkflowTools } from "../src/index.js";
+function profileHash(profile: unknown): string {
+  const canonicalize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, entry]) => [key, canonicalize(entry)]));
+    }
+    return value;
+  };
+  return createHash("sha256").update(JSON.stringify(canonicalize(profile))).digest("hex");
+}
 
 type RegisteredTool = {
   name: string;
@@ -117,6 +128,13 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
       assert.match(marker.marker, new RegExp(`cursor=${details.handoff?.cursor_epoch}`));
       assert.match(marker.marker, new RegExp(`role=${marker.role}`));
     }
+    const instructions = tools.get("workflow_instructions")!;
+    const instructionResponse = await instructions.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
+    const instructionDetails = instructionResponse.details as { stage?: { slot_artifacts?: Record<string, string[]> } };
+    assert.deepEqual(instructionDetails.stage?.slot_artifacts, {
+      analyst: ["spec_intake_repo_map-analyst"],
+      "tech-researcher": ["spec_intake_repo_map-tech-researcher"],
+    });
     const gate = dispatchGate({
       toolName: "task",
       input: {
@@ -160,9 +178,99 @@ test("fullstack: workflow_instructions exposes declared artifact schemas", async
     };
     const schemas = details.stage?.artifact_schemas ?? {};
     assert.equal(schemas.discovery?.type, "object");
+
     assert.deepEqual(schemas.discovery?.required, ["task", "branch"]);
     assert.equal(schemas.dod?.properties?.items?.items?.type, "object");
     assert.deepEqual(schemas.dod?.properties?.items?.items?.required, ["criterion", "verify_method", "status"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("fullstack: workflow_status exposes completion artifact bindings", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-workflow-status-artifacts-"));
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    const persistedProfileHash = profileHash(profile);
+    const issued = createCapability({
+      run_key: "main",
+      branch: "main",
+      workflow: "lightweight",
+      profile_hash: persistedProfileHash,
+      stage_cursor: "implementation",
+      kind: "single",
+      expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
+    });
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
+      schema: 1,
+      branch: "main",
+      run_key: "main",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      task: "status artifact binding",
+      stage_cursor: "implementation",
+      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "implementation" ? "in_progress" : stage.id === "discovery" ? "done" : "pending" })),
+      artifacts: {},
+      scope: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: "developer-kotlin" },
+      policy: { strict_orchestrator: true },
+      pause: { kind: "none", reason: "" },
+      profile_hash: persistedProfileHash,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      dispatch_capability: issued.state,
+    }) + "\n");
+    const tools = new Map<string, RegisteredTool>();
+    registerWorkflowTools({
+      zod: { z },
+      registerTool(tool: RegisteredTool) {
+        tools.set(tool.name, tool);
+      },
+    } as never);
+    const auth = {
+      token: issued.dispatch_token,
+      capability_id: issued.capability_id,
+      run_key: "main",
+      branch: "main",
+      workflow: "lightweight",
+      profile_hash: persistedProfileHash,
+      stage_cursor: "implementation",
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      role: "developer-kotlin",
+      agent: "developer-kotlin",
+      tool_call_id: "tool-status-artifact",
+    };
+    const authorized = authorizeDispatch(root, auth);
+    assert.equal(authorized.ok, true);
+    assert.ok(authorized.ok && authorized.record);
+    mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "artifacts", "implementation.json"), JSON.stringify({
+      ready: true,
+      validation_run: true,
+      validation_evidence: "status binding fixture",
+      files_touched: ["src/main.ts"],
+    }));
+    const completed = completeDispatch(root, {
+      ...auth,
+      dispatch_id: authorized.record.id,
+      outcome: "succeeded",
+      evidence: "implementation completed",
+      artifact_ids: ["implementation"],
+    });
+    assert.equal(completed.ok, true);
+    const status = tools.get("workflow_status")!;
+    const response = await status.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
+    const details = response.details as { capability?: { dispatches?: Array<Record<string, unknown>> } };
+    assert.deepEqual(details.capability?.dispatches?.[0], {
+      id: authorized.record.id,
+      role: "developer-kotlin",
+      agent: "developer-kotlin",
+      tool_call_id: "tool-status-artifact",
+      status: "succeeded",
+      completed: true,
+      completed_by: "workflow_complete",
+      artifact_ids: ["implementation"],
+      outcome: "succeeded",
+    });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

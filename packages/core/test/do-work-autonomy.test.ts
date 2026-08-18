@@ -636,6 +636,9 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     assert.match(prompt, /handoff\.dispatch_markers/);
     assert.match(prompt, /tasks\[\]\.task/);
     assert.match(prompt, /artifact_schemas/);
+    assert.match(prompt, /slot_artifacts/);
+    assert.match(prompt, /artifact_ids/);
+    assert.match(prompt, /native task result.*artifact completion/i);
     assert.match(prompt, /dod.*items.*MUST be objects/i);
     assert.match(prompt, /Before `workflow_advance`.*workflow_checkpoint/);
     assert.match(prompt, /workflow_\*.*main-session-only.*canonical `\.work-state`.*bash.*write/i);
@@ -1022,7 +1025,7 @@ test("advance handoff resolves the next stage roster", () => {
       token: issued.advance_token,
       evidence: "stage completed",
     });
-    assert.equal(advanced.ok, true);
+    assert.equal(advanced.ok, true, advanced.ok ? undefined : advanced.error);
     if (!advanced.ok) return;
     assert.equal(advanced.state.stage_cursor, "code_review");
     assert.deepEqual(advanced.state.dispatch_capability?.expected_roster, [{ role: "code-reviewer", agent: "code-reviewer" }]);

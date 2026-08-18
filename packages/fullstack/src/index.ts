@@ -208,6 +208,8 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
           tool_call_id: dispatch.tool_call_id,
           status: dispatch.status,
           completed: Boolean(dispatch.completion),
+          completed_by: dispatch.completion?.completed_by,
+          artifact_ids: dispatch.completion?.artifact_ids ?? [],
           outcome: dispatch.completion?.outcome,
         })),
       } : null,

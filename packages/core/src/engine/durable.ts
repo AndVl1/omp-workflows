@@ -521,6 +521,47 @@ function stageProduces(stage: StageDef): string[] {
   return stage.produces ? [stage.produces] : [];
 }
 
+/**
+ * Native task results are reconciled before the orchestrator can inspect the
+ * executor's output, so they intentionally carry no artifact ids. When the
+ * executor already wrote the declared slot-scoped files, recover that missing
+ * binding deterministically at the advance boundary. Shared ids are never
+ * inferred for a multi-slot consilium: a clobbered shared file cannot prove
+ * which slot produced it.
+ */
+function recoverSynchronousArtifactIds(
+  cwd: string,
+  state: TeamState,
+  target: ResolvedState,
+  cap: ActiveCapability,
+  stage: StageDef,
+): { ok: true; state: TeamState } | { ok: false; error: string } {
+  const artifactsDir = target.artifactsDir ?? "";
+  let recovered = state;
+  for (const candidate of cap.dispatches) {
+    const completion = candidate.completion;
+    if (!completion || completion.completed_by !== "synchronous_tool_result" || completion.outcome !== "succeeded" || completion.artifact_ids.length > 0) continue;
+    const produces = stageProduces(stage);
+    const artifactIds = cap.kind === "consilium" && cap.expected_count > 1
+      ? produces.map((id) => namespacedArtifactId(id, candidate.role)).filter((id) => readArtifact(artifactsDir, id) !== null)
+      : produces.every((id) => readArtifact(artifactsDir, id) !== null) ? produces : [];
+    if (artifactIds.length === 0) continue;
+    const currentCap = activeCapability(recovered.dispatch_capability);
+    if (!currentCap) return { ok: false, error: "dispatch capability disappeared during artifact recovery" };
+    const record = currentCap.dispatches.find((entry) => entry.id === candidate.id);
+    if (!record) return { ok: false, error: "dispatch disappeared during artifact recovery" };
+    const result = completeRecord(cwd, recovered, target, currentCap, record, {
+      outcome: completion.outcome,
+      evidence: `${completion.evidence}\nRecovered declared artifact ids at workflow advance.`,
+      artifact_ids: artifactIds,
+      completed_by: "synchronous_tool_result",
+    });
+    if (!result.ok) return { ok: false, error: result.error };
+    recovered = result.state;
+  }
+  return { ok: true, state: recovered };
+}
+
 function objectArtifact(artifactsDir: string, id: string): Record<string, unknown> | null {
   const value = readArtifact(artifactsDir, id);
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -648,6 +689,9 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
 
   const config = resolveConfig(cwd);
   const flags = rawState.scope ?? resolveScope([], config);
+  const recovered = recoverSynchronousArtifactIds(cwd, rawState, target, cap, currentStage);
+  if (!recovered.ok) return { ok: false, error: recovered.error, state: rawState };
+  let state = recovered.state;
 
   // Join completeness — every dispatched role must have succeeded.
   const expected = new Set(cap.expected_roles);
@@ -655,7 +699,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
   for (const record of cap.dispatches) latest.set(record.role, record);
   const records = Array.from(latest.values());
   if (records.length !== cap.expected_count || records.some((record) => !expected.has(record.role) || record.status !== "succeeded")) {
-    return { ok: false, error: "dispatch join incomplete", state: rawState };
+    return { ok: false, error: "dispatch join incomplete", state };
   }
   const joinSummary = {
     stage_id: rawState.stage_cursor,
@@ -672,8 +716,20 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
   // disagreements block by default (strict) unless the stage declares an
   // explicit, documented resolution — every applied resolution is recorded
   // in the synthesis provenance (`conflicts`).
-  let state = rawState;
   const isMultiSlotConsilium = cap.kind === "consilium" && cap.expected_count > 1;
+  if (isMultiSlotConsilium) {
+    const currentRecords = activeCapability(state.dispatch_capability)?.dispatches ?? records;
+    const withoutArtifacts = currentRecords
+      .filter((record) => record.status === "succeeded" && (record.completion?.artifact_ids.length ?? 0) === 0)
+      .map((record) => `${record.role} (${namespacedArtifactId(stageProduces(currentStage)[0] ?? "artifact", record.role)})`);
+    if (withoutArtifacts.length > 0) {
+      return {
+        ok: false,
+        error: `consilium fan-in incomplete: dispatches without recorded artifact_ids: ${withoutArtifacts.join(", ")}; call workflow_complete with each slot's artifact ids before workflow_advance`,
+        state,
+      };
+    }
+  }
   if (isMultiSlotConsilium) {
     const policy: FanInPolicy = {
       ...fanInPolicy,
