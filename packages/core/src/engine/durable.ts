@@ -399,23 +399,54 @@ function completeRecord(
   const artifact_ids = input.artifact_ids ?? [];
   const artifactDir = target.artifactsDir ?? "";
   const declaredArtifacts = state.artifacts ?? {};
-  if (
-    new Set(artifact_ids).size !== artifact_ids.length ||
-    artifact_ids.some((id) => !isSafeStateSegment(id) || (!existsSync(join(artifactDir, `${id}.json`)) && !Object.prototype.hasOwnProperty.call(declaredArtifacts, id)))
-  ) {
+  const previousCompletion = record.completion;
+  const sameOutcome = previousCompletion?.outcome === input.outcome;
+  const sameArtifacts = previousCompletion !== undefined && JSON.stringify(previousCompletion.artifact_ids) === JSON.stringify(artifact_ids);
+  // Native task results may be persisted before the executor's artifact write
+  // becomes visible to the orchestrator. Preserve the binding and let the
+  // advance-boundary recovery snapshot it once the file is readable.
+  const canDeferNativeArtifacts = previousCompletion?.completed_by === "synchronous_tool_result" &&
+    sameOutcome &&
+    (sameArtifacts || (previousCompletion.artifact_ids.length === 0 && artifact_ids.length > 0));
+  const unsafeArtifacts = new Set(artifact_ids).size !== artifact_ids.length ||
+    artifact_ids.some((id) => !isSafeStateSegment(id));
+  const missingArtifacts = artifact_ids.some((id) =>
+    !existsSync(join(artifactDir, `${id}.json`)) && !Object.prototype.hasOwnProperty.call(declaredArtifacts, id),
+  );
+  if (unsafeArtifacts || (missingArtifacts && !canDeferNativeArtifacts)) {
     return { ok: false, error: "declared artifact missing or unsafe", state };
   }
-  if (record.completion) {
-    const sameOutcome = record.completion.outcome === input.outcome;
-    const sameArtifacts = JSON.stringify(record.completion.artifact_ids) === JSON.stringify(artifact_ids);
-    if (sameOutcome && sameArtifacts) return { ok: true, state, record };
-    if (sameOutcome && record.completion.completed_by === "synchronous_tool_result" && record.completion.artifact_ids.length === 0 && artifact_ids.length > 0) {
-      const completion = { ...record.completion, artifact_ids, evidence: input.evidence, completed_by: input.completed_by ?? "workflow_complete" };
-      const updated: DispatchRecord = { ...record, completed_at: completion.completed_at, completion };
+  if (previousCompletion) {
+    if (sameOutcome && sameArtifacts) {
+      if (previousCompletion.completed_by === "synchronous_tool_result" && artifact_ids.length > 0) {
+        const snapshotted = snapshotSlotArtifacts(state, cap, record, artifact_ids, artifactDir);
+        if (!snapshotted.ok) {
+          if (snapshotted.retryable) return { ok: true, state, record };
+          return { ok: false, error: snapshotted.error, state };
+        }
+        const completion = {
+          ...previousCompletion,
+          evidence: input.evidence,
+          completed_by: input.completed_by ?? previousCompletion.completed_by,
+        };
+        const updated: DispatchRecord = { ...record, completed_at: completion.completed_at, completion };
+        const next: TeamState = {
+          ...snapshotted.state,
+          dispatch_capability: { ...cap, dispatches: cap.dispatches.map((d) => d.id === record.id ? updated : d) },
+        };
+        persist(cwd, next, target);
+        return { ok: true, state: next, record: updated };
+      }
+      return { ok: true, state, record };
+    }
+    if (sameOutcome && previousCompletion.completed_by === "synchronous_tool_result" && previousCompletion.artifact_ids.length === 0 && artifact_ids.length > 0) {
       const snapshotted = snapshotSlotArtifacts(state, cap, record, artifact_ids, artifactDir);
-      if (!snapshotted.ok) return { ok: false, error: snapshotted.error, state };
+      if (!snapshotted.ok && !snapshotted.retryable) return { ok: false, error: snapshotted.error, state };
+      const completedBy = snapshotted.ok ? input.completed_by ?? "workflow_complete" : "synchronous_tool_result";
+      const completion = { ...previousCompletion, artifact_ids, evidence: input.evidence, completed_by: completedBy };
+      const updated: DispatchRecord = { ...record, completed_at: completion.completed_at, completion };
       const next: TeamState = {
-        ...snapshotted.state,
+        ...(snapshotted.ok ? snapshotted.state : state),
         dispatch_capability: { ...cap, dispatches: cap.dispatches.map((d) => d.id === record.id ? updated : d) },
       };
       persist(cwd, next, target);
@@ -457,7 +488,7 @@ function snapshotSlotArtifacts(
   record: DispatchRecord,
   artifactIds: string[],
   artifactsDir: string,
-): { ok: true; state: TeamState } | { ok: false; error: string } {
+): { ok: true; state: TeamState } | { ok: false; error: string; retryable?: boolean } {
   if (cap.kind !== "consilium" || cap.expected_count <= 1 || artifactIds.length === 0) {
     return { ok: true, state };
   }
@@ -465,21 +496,29 @@ function snapshotSlotArtifacts(
   const existing = state.slot_artifacts?.[stageId] ?? { slots: {} };
   const slots = { ...existing.slots };
   const slotMap = { ...(slots[record.role] ?? {}) };
+  const values: Array<{ id: string; value: unknown }> = [];
   for (const id of artifactIds) {
     const value = readArtifact(artifactsDir, id);
     if (value === null) {
-      return { ok: false, error: `slot '${record.role}' artifact '${id}' disappeared before completion` };
+      return {
+        ok: false,
+        retryable: true,
+        error: `slot '${record.role}' artifact '${id}' is not readable yet; retry completion or workflow_advance`,
+      };
+    }
+    values.push({ id, value });
+  }
+  for (const { id, value } of values) {
+    const hash = hashValue(value);
+    const previous = slotMap[id];
+    if (previous && previous.hash !== hash) {
+      return { ok: false, error: `slot artifact conflict: slot '${record.role}' wrote '${id}' with different content` };
     }
     // Already slot-scoped ids are the slot's own provenance; only copy the
     // shared-id writes into the namespace before a later slot can clobber.
     const namespaced = isNamespacedArtifactId(id, record.role) ? id : namespacedArtifactId(id, record.role);
     if (namespaced !== id) {
       writeArtifact(artifactsDir, namespaced, value);
-    }
-    const hash = hashValue(value);
-    const previous = slotMap[id];
-    if (previous && previous.hash !== hash) {
-      return { ok: false, error: `slot artifact conflict: slot '${record.role}' wrote '${id}' with different content` };
     }
     slotMap[id] = { path: join(artifactsDir, `${namespaced}.json`), hash };
   }
@@ -540,11 +579,11 @@ function stageProduces(stage: StageDef): string[] {
 
 /**
  * Native task results are reconciled before the orchestrator can inspect the
- * executor's output, so they intentionally carry no artifact ids. When the
- * executor already wrote the declared slot-scoped files, recover that missing
- * binding deterministically at the advance boundary. Shared ids are never
- * inferred for a multi-slot consilium: a clobbered shared file cannot prove
- * which slot produced it.
+ * executor's output, so they intentionally carry no artifact ids. The
+ * orchestrator may also bind those ids before a concurrent artifact write is
+ * readable. Recover both forms deterministically at the advance boundary.
+ * Shared ids are never inferred for a multi-slot consilium: a clobbered shared
+ * file cannot prove which slot produced it.
  */
 function recoverSynchronousArtifactIds(
   cwd: string,
@@ -554,15 +593,29 @@ function recoverSynchronousArtifactIds(
   stage: StageDef,
 ): { ok: true; state: TeamState } | { ok: false; error: string } {
   const artifactsDir = target.artifactsDir ?? "";
+  const produces = stageProduces(stage);
+  const multiSlot = cap.kind === "consilium" && cap.expected_count > 1;
   let recovered = state;
   for (const candidate of cap.dispatches) {
     const completion = candidate.completion;
-    if (!completion || completion.completed_by !== "synchronous_tool_result" || completion.outcome !== "succeeded" || completion.artifact_ids.length > 0) continue;
-    const produces = stageProduces(stage);
-    const artifactIds = cap.kind === "consilium" && cap.expected_count > 1
-      ? produces.map((id) => namespacedArtifactId(id, candidate.role)).filter((id) => readArtifact(artifactsDir, id) !== null)
-      : produces.every((id) => readArtifact(artifactsDir, id) !== null) ? produces : [];
-    if (artifactIds.length === 0) continue;
+    if (!completion || completion.completed_by !== "synchronous_tool_result" || completion.outcome !== "succeeded") continue;
+
+    let artifactIds = completion.artifact_ids;
+    if (artifactIds.length > 0) {
+      // Explicit ids are already bound. Only re-enter completion to create
+      // missing consilium snapshots; single-stage artifacts are validated
+      // directly by the stage contract below.
+      if (!multiSlot) continue;
+      const slotMap = recovered.slot_artifacts?.[stage.id]?.slots?.[candidate.role] ?? {};
+      const needsSnapshot = artifactIds.some((id) => !slotMap[id]);
+      if (!needsSnapshot || !artifactIds.every((id) => readArtifact(artifactsDir, id) !== null)) continue;
+    } else {
+      artifactIds = multiSlot
+        ? produces.map((id) => namespacedArtifactId(id, candidate.role)).filter((id) => readArtifact(artifactsDir, id) !== null)
+        : produces.every((id) => readArtifact(artifactsDir, id) !== null) ? produces : [];
+      if (artifactIds.length === 0) continue;
+    }
+
     const currentCap = activeCapability(recovered.dispatch_capability);
     if (!currentCap) return { ok: false, error: "dispatch capability disappeared during artifact recovery" };
     const record = currentCap.dispatches.find((entry) => entry.id === candidate.id);

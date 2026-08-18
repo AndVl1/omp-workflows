@@ -357,6 +357,90 @@ test("spec-preparation: native consilium completion advances from slot-scoped ou
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("fan-in: native artifact ids can bind before a slot file becomes readable", () => {
+  const root = mkdtempSync(join(tmpdir(), "fan-native-delayed-"));
+  try {
+    initGit(root, "main");
+    const issued = writeSpecFixtureState(root);
+    const dir = specArtifactsDir(root);
+    const sharedId = "spec_intake_repo_map";
+    const analystAuth = {
+      token: issued.dispatch_token,
+      capability_id: issued.capability_id,
+      run_key: issued.state.issued_for!.run_key,
+      branch: issued.state.issued_for!.branch,
+      workflow: issued.state.issued_for!.workflow,
+      profile_hash: issued.state.issued_for!.profile_hash,
+      stage_cursor: issued.state.issued_for!.stage_cursor,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      role: "analyst",
+      agent: "analyst",
+      tool_call_id: "tool-spec-delayed-analyst",
+    };
+    const analystDispatch = authorizeDispatch(root, analystAuth);
+    assert.equal(analystDispatch.ok, true);
+    assert.ok(analystDispatch.ok && analystDispatch.record);
+    const analystNative = reconcileTrustedTaskResult(root, {
+      tool_call_id: analystAuth.tool_call_id,
+      outcome: "succeeded",
+      evidence: "analyst native result",
+    });
+    assert.equal(analystNative.ok, true);
+
+    // The native completion is already durable, but the executor's artifact
+    // path currently contains a partial write and is not readable yet.
+    writeFileSync(join(dir, `${sharedId}.json`), "{");
+    const early = completeDispatch(root, {
+      ...analystAuth,
+      dispatch_id: analystDispatch.ok ? analystDispatch.record!.id : "",
+      outcome: "succeeded",
+      evidence: "analyst declared intake artifact",
+      artifact_ids: [sharedId],
+    });
+    assert.equal(early.ok, true, early.ok ? "" : early.error);
+    assert.equal(
+      early.ok ? early.record?.completion?.completed_by : undefined,
+      "synchronous_tool_result",
+      "a deferred binding remains marked as native until its snapshot exists",
+    );
+
+    const researcherAuth = {
+      ...analystAuth,
+      role: "tech-researcher",
+      agent: "tech-researcher",
+      tool_call_id: "tool-spec-delayed-researcher",
+    };
+    const researcherDispatch = authorizeDispatch(root, researcherAuth);
+    assert.equal(researcherDispatch.ok, true);
+    const researcherNative = reconcileTrustedTaskResult(root, {
+      tool_call_id: researcherAuth.tool_call_id,
+      outcome: "succeeded",
+      evidence: "researcher native result",
+    });
+    assert.equal(researcherNative.ok, true);
+
+    // Both files become readable before the advance boundary. Recovery must
+    // snapshot the already-bound analyst id and infer the still-empty slot.
+    writeFileSync(join(dir, `${sharedId}.json`), JSON.stringify({ facts: [{ source: "analyst" }] }));
+    writeFileSync(join(dir, `${sharedId}-tech-researcher.json`), JSON.stringify({ facts: [{ source: "research" }] }));
+    const advanced = advanceCursor(root, {
+      token: issued.advance_token,
+      capability_id: issued.capability_id,
+      run_key: issued.state.issued_for!.run_key,
+      branch: issued.state.issued_for!.branch,
+      workflow: issued.state.issued_for!.workflow,
+      profile_hash: issued.state.issued_for!.profile_hash,
+      stage_cursor: issued.state.issued_for!.stage_cursor,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      evidence: "delayed native artifacts recovered",
+    });
+    assert.equal(advanced.ok, true, advanced.ok ? "" : advanced.error);
+    assert.equal(advanced.ok && advanced.state.stage_cursor, "requirements_edge_cases");
+    assert.equal(existsSync(join(dir, `${sharedId}-analyst.json`)), true, "the late analyst file is snapshotted by recovery");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("fan-in: merge dedupes identical array items and deep-merges objects", () => {
   const merged = mergeSlotValues(
