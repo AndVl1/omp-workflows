@@ -93,7 +93,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "If confidence is LOW, ask a focused clarification question before preparing an expansive workflow (unless `autonomous` is true; then document a conservative default).",
     "",
     "### Only after workflow_prepare succeeds",
-    "1. Call `workflow_begin` to issue the durable opaque capability for the current stage. If it fails, stop and record the error — never guess stage content.",
+    "1. Call `workflow_begin` to issue the durable opaque capability for the current stage. On a resumed active stage, it may reissue fresh plaintext secrets while preserving the capability identity and authorized dispatch records; always use the newly returned handoff and never retry a stale token. If it fails, stop and record the error — never guess stage content.",
     "2. Call `workflow_instructions` and treat its returned current stage contract (`stage.instructions`, `roles`, `consumes`, `produces`, `artifact_schemas`, `slot_artifacts`, `checkpoint`/`gate`, `provenance`) as the ONLY workflow instruction source. Do not read, glob, or infer workflow profile JSON or artifact schemas from the filesystem, package paths, or plugin directories.",
     "3. Continue executing in THIS TURN. Do not stop after printing CLASSIFICATION or preparing state; immediately call `workflow_begin` and `workflow_instructions` and walk the returned stage contract.",
     "4. On continuation, skip stages already done/skipped and start at the first reopened or pending stage.",

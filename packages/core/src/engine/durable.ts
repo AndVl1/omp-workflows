@@ -189,6 +189,26 @@ export function createCapability(input: {
   const state = { capability_id: randomUUID(), dispatch_token_hash: hash(dispatch_token), advance_token_hash: hash(advance_token), issued_for: { run_key: input.run_key, branch: input.branch, workflow: input.workflow, profile_hash: input.profile_hash, stage_cursor: input.stage_cursor, cursor_epoch }, kind: input.kind, expected_roles, expected_count: roster.length, expected_roster: roster, status: "ready" as const, dispatches: [] };
   return { capability_id: state.capability_id, dispatch_token, advance_token, state };
 }
+function reissueActiveCapability(cap: ActiveCapability): {
+  capability_id: string;
+  dispatch_token: string;
+  advance_token: string;
+  state: NonNullable<TeamState["dispatch_capability"]>;
+} {
+  const dispatch_token = randomUUID();
+  const advance_token = randomUUID();
+  return {
+    capability_id: cap.capability_id,
+    dispatch_token,
+    advance_token,
+    state: {
+      ...cap,
+      dispatch_token_hash: hash(dispatch_token),
+      advance_token_hash: hash(advance_token),
+    },
+  };
+}
+
 /**
  * Create the opaque dispatch capability after the model has persisted the
  * classification and stage list. This is the entry point for the native
@@ -255,7 +275,33 @@ export function beginCapability(cwd: string): TransitionResult {
       return { ok: false, error: "active dispatch capability roster is inconsistent", state };
     }
     if (!rosterChanged) {
-      return { ok: false, error: "workflow stage already has an active capability; use the existing handoff", state };
+      // Plaintext secrets are intentionally not persisted. Reissue them when
+      // a resumed main session needs to recover an active handoff, preserving
+      // the capability identity and already-authorized dispatch records.
+      const reissued = reissueActiveCapability(existing);
+      const next: TeamState = {
+        ...state,
+        run_key: state.run_key ?? state.branch,
+        profile_hash: persistedHash,
+        cursor_epoch: reissued.state.issued_for!.cursor_epoch,
+        stage_cursor: stage.id,
+        scope: flags,
+        policy: { ...(state.policy ?? {}), strict_orchestrator: true },
+        stages: stages.map((entry) => entry.id === stage.id ? { ...entry, status: "in_progress" as const } : entry),
+        dispatch_capability: reissued.state,
+        pause: { kind: "none", reason: "" },
+        updated_at: now(),
+      };
+      persist(cwd, next, target);
+      return {
+        ok: true,
+        state: next,
+        handoff: handoffFromState(next, {
+          capability_id: reissued.capability_id,
+          dispatch_token: reissued.dispatch_token,
+          advance_token: reissued.advance_token,
+        }, stage),
+      };
     }
     // No dispatch was authorized under the stale roster. Reissue the capability
     // with the current mapping so a resumed workflow does not need manual repair.

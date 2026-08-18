@@ -829,6 +829,75 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("beginCapability reissues secrets for an active dispatch without losing its record", () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-capability-resume-"));
+  try {
+    initGit(root, "feature/resume-capability");
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    writeWorkflowState(root, {
+      schema: 1,
+      branch: "feature/resume-capability",
+      task: "resume capability test",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      stage_cursor: "implementation",
+      stages: profile.stages.map((stage) => ({
+        id: stage.id,
+        status: stage.id === "implementation" ? "in_progress" : stage.id === "discovery" ? "done" : "pending",
+      })),
+      artifacts: {},
+      scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
+      policy: { strict_orchestrator: true },
+      pause: { kind: "none", reason: "" },
+    });
+
+    const first = beginCapability(root);
+    assert.equal(first.ok, true);
+    if (!first.ok || !first.handoff) return;
+    const auth = {
+      token: first.handoff.dispatch_token,
+      capability_id: first.handoff.capability_id,
+      run_key: first.handoff.run_key,
+      branch: first.handoff.branch,
+      workflow: first.handoff.workflow,
+      profile_hash: first.handoff.profile_hash,
+      stage_cursor: first.handoff.stage_cursor,
+      cursor_epoch: first.handoff.cursor_epoch,
+      role: "developer-kotlin",
+      agent: "developer-kotlin",
+    };
+    const authorized = authorizeDispatch(root, auth);
+    assert.equal(authorized.ok, true);
+    if (!authorized.ok || !authorized.record) return;
+
+    const resumed = beginCapability(root);
+    assert.equal(resumed.ok, true);
+    if (!resumed.ok || !resumed.handoff) return;
+    assert.equal(resumed.handoff.capability_id, first.handoff.capability_id);
+    assert.notEqual(resumed.handoff.dispatch_token, first.handoff.dispatch_token);
+    assert.equal(resumed.state.dispatch_capability?.dispatches[0]?.id, authorized.record.id);
+
+    const stale = completeDispatch(root, {
+      ...auth,
+      dispatch_id: authorized.record.id,
+      outcome: "succeeded",
+      evidence: "stale handoff must be rejected",
+    });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.error, "invalid secret");
+
+    const recovered = completeDispatch(root, {
+      ...auth,
+      token: resumed.handoff.dispatch_token,
+      dispatch_id: authorized.record.id,
+      outcome: "succeeded",
+      evidence: "resumed handoff completed the dispatch",
+    });
+    assert.equal(recovered.ok, true, recovered.ok ? undefined : recovered.error);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 test("native task hook leaves spawned and scheduled results pending", () => {
   const root = mkdtempSync(join(tmpdir(), "dispatch-capability-async-"));
   try {
