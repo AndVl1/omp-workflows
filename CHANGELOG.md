@@ -2,10 +2,14 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.15] — 2026-08-18
+### Fixed
+- **Compact capability bindings** — workflow control calls now use a bounded profile-hash fingerprint while durable state retains the full hash, preventing long-session handoff truncation from rejecting valid completions without weakening binding checks.
+
+
 ## [0.22.14] — 2026-08-18
 ### Fixed
 - **Resumable capability handoff** — `workflow_begin` now rotates plaintext dispatch and advance secrets while preserving an active capability and its authorized dispatch records, so resumed sessions can continue without manual state repair.
-
 
 ## [0.22.13] — 2026-08-18
 ### Fixed
