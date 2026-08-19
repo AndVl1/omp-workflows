@@ -609,3 +609,13 @@ export type {
 	ChronologyEvent,
 	SessionReport,
 } from "./report/types.js";
+
+// ── Workflow visualization (visualize OPT-A, on-demand projection) ──────────
+// Additive seam: the fullstack `/workflow-view` command consumes this surface.
+// `export *` deliberately leaves three name clashes to the pre-existing
+// explicit exports (ES semantics: explicit exports win over star re-exports),
+// so `SessionKind` / `ArtifactStatus` / `WorkflowName` keep their report/
+// engine meanings — no breaking export change. The visualize barrel's own
+// definitions of those three names (different unions) remain reachable via
+// the additive `@andvl1/omp-workflows-core/visualize` subpath export.
+export * from "./visualize/index.js";
