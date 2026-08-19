@@ -783,6 +783,45 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
   }
 });
 
+test("do-work: handoff requires explicit typed approval before workflow_handoff and continues only with the returned target envelope", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-handoff-prompt-"));
+  try {
+    const prompt = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
+    assert.ok(prompt.includes("workflow_handoff"), "prompt teaches the handoff control tool");
+    assert.ok(prompt.includes("workflow_approval"), "prompt names the typed approval artifact");
+
+    // Approval precondition is stated BEFORE the handoff tool call; the
+    // prompt must never suggest calling the tool without approval evidence.
+    const approvalIndex = prompt.indexOf("explicitly approves");
+    const handoffCallIndex = prompt.indexOf("call `workflow_handoff`");
+    assert.ok(approvalIndex >= 0, "prompt states the explicit approval precondition");
+    assert.ok(handoffCallIndex > approvalIndex, "approval precondition precedes the handoff call instruction");
+    assert.match(prompt, /NEVER infer approval from natural-language output/);
+    assert.match(prompt, /call `workflow_handoff` without typed approval evidence/);
+
+    // Continuation uses ONLY the returned target envelope, then re-fetches
+    // instructions; fail-closed on any handoff tool error.
+    assert.match(prompt, /use ONLY the returned target handoff/i);
+    assert.match(prompt, /call `workflow_instructions` again/);
+    assert.match(prompt, /do not edit state\.json or profile JSON/);
+    assert.match(prompt, /do not guess credentials/);
+
+    // Permission summary gains explicit handoff rows.
+    assert.match(prompt, /workflow_handoff after explicit typed user approval \| ALLOW/);
+    assert.match(prompt, /workflow_handoff without approval evidence or mid-workflow \| DENY/);
+
+    // Pinned invariants survive the handoff text unchanged.
+    assert.ok(prompt.indexOf("workflow_begin") < prompt.indexOf("workflow_instructions"));
+    assert.match(prompt, /only workflow instruction source/i);
+    assert.match(prompt, /workflow_advance`, call `workflow_instructions`/);
+    assert.ok(!prompt.includes("findProfileDir"), "no profile-directory helper in the prompt");
+    assert.ok(!prompt.includes("<workflow>.json"), "no workflow JSON read instruction");
+    assert.match(prompt, /Do NOT glob for workflow files/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("team and do-work use the same strict orchestration contract", () => {
   const root = mkdtempSync(join(tmpdir(), "team-alias-policy-"));
   try {
