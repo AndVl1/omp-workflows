@@ -10,7 +10,7 @@ import { readArtifact, writeArtifact } from "./artifacts.js";
 import { isDoDComplete, isRootCauseDocumented, readDoD } from "./dod.js";
 import { validationGate } from "../gates/validation.js";
 import { evaluatePredicate } from "./predicate.js";
-import { appendCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
+import { appendCheckpointDecision, findCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
 import { loopExhaustionKind, loopIterationRecord, loopReentryDecision, loopStateFor, resolveBackToStage } from "./loops.js";
 import {
   DEFAULT_FAN_IN_POLICY,
@@ -26,7 +26,7 @@ import {
   DEFAULT_ARTIFACT_CONTRACT_POLICY,
   type ArtifactContractPolicy,
 } from "./artifact-contract.js";
-import type { CheckpointDecision, DispatchCompletion, DispatchRecord, LoopState, TeamState, StageDef } from "./types.js";
+import type { CheckpointDecision, DispatchCompletion, DispatchRecord, HandoffContext, HandoffRecord, HandoffRoute, LoopState, TeamState, StageDef } from "./types.js";
 
 export type DispatchAuth = {
   token: string;
@@ -981,4 +981,311 @@ export function reconcileTaskResult(cwd: string, input: { dispatch_id?: string; 
     if (!last.ok) return last;
   }
   return last;
+}
+
+// ── Handoff: cross-profile transfer of an approved completed run ──────────
+//
+// A handoff moves an explicitly approved, completed source run into a
+// registered target workflow without editing shipped profile JSON or copying
+// artifacts: the feature directory is already shared, so artifacts/decisions/
+// history/scope survive by construction and the transition only rewrites the
+// engine-owned state bindings. Every validation failure returns before the
+// single `persist` call, so rejected handoffs leave canonical state and
+// artifacts byte-identical (fail closed). Plaintext capability secrets are
+// returned only in the one-time result envelope; state.json persists hashes
+// only.
+
+export interface HandoffApproval {
+  kind: "checkpoint" | "artifact";
+  /** Checkpoint name (checkpoint kind) or safe artifact id (artifact kind). */
+  ref: string;
+  /** Must equal the authenticated source stage and the registered route source stage. */
+  source_stage: string;
+  /** Must be the literal `approved`; free text is never an approval. */
+  decision: string;
+}
+
+export interface HandoffWorkflowInput extends DispatchAuth {
+  target_workflow: string;
+  /** Optional caller precondition; the engine always persists the current target hash. */
+  target_profile_hash?: string;
+  approval: HandoffApproval;
+  /** Non-empty bounded audit actor; the control tool defaults this to "orchestrator". */
+  actor: string;
+  handoff_context?: HandoffContext;
+}
+
+export type HandoffTransitionResult =
+  | { ok: true; state: TeamState; route: HandoffRoute; handoff: CapabilityHandoff; audit: HandoffRecord }
+  | { ok: false; error: string; state?: TeamState };
+
+const MAX_HANDOFF_CONTEXT_ARTIFACTS = 32;
+const MAX_HANDOFF_CONTEXT_DECISION_REFS = 32;
+const MAX_HANDOFF_CONTEXT_SUMMARY_CHARS = 2000;
+const MAX_HANDOFF_CONTEXT_SERIALIZED_BYTES = 8192;
+const MAX_HANDOFF_DECISION_REF_CHARS = 200;
+
+/** Registered source-workflow/source-stage/target-workflow -> route. */
+const handoffRoutes = new Map<string, HandoffRoute>();
+const handoffRouteKey = (sourceWorkflow: string, sourceStage: string, targetWorkflow: string): string =>
+  `${sourceWorkflow}\u0000${sourceStage}\u0000${targetWorkflow}`;
+
+/**
+ * Register a generic handoff route. Duplicate keys (same source workflow +
+ * source stage + target workflow) are rejected deterministically so route
+ * metadata can never drift silently.
+ */
+export function registerWorkflowHandoffRoute(route: HandoffRoute): void {
+  if (
+    !route ||
+    typeof route.source_workflow !== "string" || !route.source_workflow.trim() ||
+    typeof route.source_stage !== "string" || !route.source_stage.trim() ||
+    typeof route.target_workflow !== "string" || !route.target_workflow.trim() ||
+    typeof route.target_stage !== "string" || !route.target_stage.trim()
+  ) {
+    throw new Error("invalid handoff route registration");
+  }
+  const key = handoffRouteKey(route.source_workflow, route.source_stage, route.target_workflow);
+  if (handoffRoutes.has(key)) {
+    throw new Error(`handoff route already registered: ${route.source_workflow}:${route.source_stage} -> ${route.target_workflow}`);
+  }
+  handoffRoutes.set(key, route);
+}
+
+// First supported route: spec-preparation's literal final stage `handoff`
+// transfers into full-feature's canonical entry stage `discovery`. Route
+// metadata is engine-owned; the shipped profiles and their hashes are not
+// touched.
+registerWorkflowHandoffRoute({
+  source_workflow: "spec-preparation",
+  source_stage: "handoff",
+  target_workflow: "full-feature",
+  target_stage: "discovery",
+});
+
+/**
+ * Validate typed approval evidence. Checkpoint kind requires an existing
+ * durable checkpoint decision for the authenticated source stage whose
+ * decision is the literal `approved`; artifact kind reads a typed
+ * `workflow_approval` artifact bound to the source run/workflow/stage.
+ * Free text or a natural-language request never authorizes a handoff.
+ */
+function validateHandoffApproval(
+  input: HandoffWorkflowInput,
+  state: TeamState,
+  artifactsDir: string,
+  route: HandoffRoute,
+): string | null {
+  const approval = input.approval;
+  if (!approval || typeof approval !== "object") return "handoff approval evidence is missing";
+  if (approval.decision !== "approved") return "handoff approval evidence is invalid";
+  if (approval.source_stage !== input.stage_cursor || approval.source_stage !== route.source_stage) {
+    return "handoff approval evidence is invalid";
+  }
+  const actor = typeof input.actor === "string" ? input.actor.trim() : "";
+  if (!actor) return "handoff approval evidence is invalid";
+  if (approval.kind === "checkpoint") {
+    const ref = approval.ref;
+    if (typeof ref !== "string" || !ref.trim()) return "handoff approval evidence is invalid";
+    const decision = findCheckpointDecision(state, input.stage_cursor, ref);
+    if (!decision) return "handoff approval evidence is missing";
+    if (decision.decision !== "approved") return "handoff approval evidence is invalid";
+    return null;
+  }
+  if (approval.kind === "artifact") {
+    const ref = approval.ref;
+    if (typeof ref !== "string" || !isSafeStateSegment(ref)) return "handoff approval evidence is invalid";
+    const value = readArtifact(artifactsDir, ref);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return "handoff approval evidence is missing";
+    const record = value as Record<string, unknown>;
+    if (record.type !== "workflow_approval" || record.version !== 1 || record.decision !== "approved") {
+      return "handoff approval evidence is invalid";
+    }
+    if (record.run_key !== (state.run_key ?? state.branch) || record.workflow !== state.classification?.workflow || record.stage !== route.source_stage) {
+      return "handoff approval evidence is invalid";
+    }
+    if (typeof record.actor !== "string" || !record.actor.trim()) return "handoff approval evidence is invalid";
+    if (typeof record.decided_at !== "string" || !record.decided_at.trim() || Number.isNaN(Date.parse(record.decided_at))) {
+      return "handoff approval evidence is invalid";
+    }
+    return null;
+  }
+  return "handoff approval evidence is invalid";
+}
+
+/** Validate bounded handoff context: safe, resolvable, size-capped references. */
+function validateHandoffContext(input: HandoffWorkflowInput, artifactsDir: string): string | null {
+  const context = input.handoff_context ?? {};
+  const artifactIds = Array.isArray(context.artifact_ids) ? context.artifact_ids : [];
+  const decisionRefs = Array.isArray(context.decision_refs) ? context.decision_refs : [];
+  const summary = typeof context.summary === "string" ? context.summary : "";
+  if (artifactIds.length > MAX_HANDOFF_CONTEXT_ARTIFACTS) return "handoff context is invalid or exceeds limits";
+  if (decisionRefs.length > MAX_HANDOFF_CONTEXT_DECISION_REFS) return "handoff context is invalid or exceeds limits";
+  if (summary.length > MAX_HANDOFF_CONTEXT_SUMMARY_CHARS) return "handoff context is invalid or exceeds limits";
+  if (
+    new Set(artifactIds).size !== artifactIds.length ||
+    artifactIds.some((id) => typeof id !== "string" || !isSafeStateSegment(id) || readArtifact(artifactsDir, id) === null)
+  ) {
+    return "handoff context is invalid or exceeds limits";
+  }
+  if (
+    decisionRefs.some((ref) => typeof ref !== "string" || !ref.trim() || ref.length > MAX_HANDOFF_DECISION_REF_CHARS) ||
+    decisionRefs.some((ref, index) => decisionRefs.indexOf(ref) !== index)
+  ) {
+    return "handoff context is invalid or exceeds limits";
+  }
+  const serialized = JSON.stringify({ artifact_ids: artifactIds, decision_refs: decisionRefs, summary });
+  if (Buffer.byteLength(serialized, "utf8") > MAX_HANDOFF_CONTEXT_SERIALIZED_BYTES) {
+    return "handoff context is invalid or exceeds limits";
+  }
+  return null;
+}
+
+/**
+ * Cross-profile handoff transition. Validates source capability/binding,
+ * source profile hash, terminal source shape (all stages done/skipped,
+ * pause done, capability complete), source produced artifacts, registered
+ * route, target profile/hash/stage, typed approval evidence, and bounded
+ * context entirely in memory; then performs exactly one atomic `writeState`
+ * to the same feature directory and returns a fresh one-time target
+ * capability. Rejections never mutate state.
+ */
+export function handoffWorkflow(cwd: string, input: HandoffWorkflowInput): HandoffTransitionResult {
+  const branch = resolveActiveBranch(cwd);
+  const target = resolveState(cwd, branch);
+  if (target.invalid) return { ok: false, error: "workflow state is invalid or unsafe" };
+  if (!target.state || !target.statePath) return { ok: false, error: "workflow state not found" };
+  if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state: target.state };
+  const state = target.state;
+  const cap = activeCapability(state.dispatch_capability);
+  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  const error = auth(cap, input, cap.advance_token_hash);
+  if (error) return { ok: false, error, state };
+  if (cap.status !== "complete") return { ok: false, error: "source workflow is not a completed handoff source", state };
+
+  const sourceWorkflow = cap.issued_for.workflow;
+  const sourceProfile = loadProfile(sourceWorkflow);
+  if (!sourceProfile || profileHash(sourceProfile) !== cap.issued_for.profile_hash) {
+    return { ok: false, error: "source workflow profile is missing or stale", state };
+  }
+  const sourceStage = sourceProfile.stages.find((candidate) => candidate.id === input.stage_cursor);
+  if (!sourceStage) return { ok: false, error: "source workflow is not a completed handoff source", state };
+  if (state.pause?.kind !== "done" || !Array.isArray(state.stages) || state.stages.length === 0 || state.stages.some((s) => s.status !== "done" && s.status !== "skipped")) {
+    return { ok: false, error: "source workflow is not a completed handoff source", state };
+  }
+  const artifactsDir = target.artifactsDir ?? "";
+  for (const id of stageProduces(sourceStage)) {
+    if (!isSafeStateSegment(id) || readArtifact(artifactsDir, id) === null) {
+      return { ok: false, error: `source produced artifact '${id}' is missing or invalid`, state };
+    }
+  }
+
+  const targetWorkflow = input.target_workflow;
+  const targetProfile = loadProfile(targetWorkflow);
+  if (!targetProfile) return { ok: false, error: "target workflow is unavailable", state };
+  const targetHash = profileHash(targetProfile);
+  if (input.target_profile_hash && input.target_profile_hash !== targetHash) {
+    return { ok: false, error: "target profile hash mismatch", state };
+  }
+  const route = handoffRoutes.get(handoffRouteKey(sourceWorkflow, input.stage_cursor, targetWorkflow));
+  if (!route) return { ok: false, error: "workflow transition is not registered", state };
+  const targetStage = targetProfile.stages.find((candidate) => candidate.id === route.target_stage);
+  if (!targetStage) return { ok: false, error: "target stage is unavailable", state };
+
+  const approvalError = validateHandoffApproval(input, state, artifactsDir, route);
+  if (approvalError) return { ok: false, error: approvalError, state };
+  const contextError = validateHandoffContext(input, artifactsDir);
+  if (contextError) return { ok: false, error: contextError, state };
+
+  const config = resolveConfig(cwd);
+  const flags = state.scope ?? resolveScope([], config);
+  const kind: "none" | "single" | "consilium" =
+    targetStage.type === "single" || targetStage.type === "consilium" ? targetStage.type : "none";
+  const slots = kind === "none"
+    ? []
+    : resolveStageDispatchSlots(targetStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) {
+    return { ok: false, error: `target stage '${targetStage.id}' has an invalid dispatch roster`, state };
+  }
+  const expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+  const epoch = randomUUID();
+  const issued = createCapability({
+    run_key: cap.issued_for.run_key,
+    branch: cap.issued_for.branch,
+    workflow: targetWorkflow,
+    profile_hash: targetHash,
+    stage_cursor: targetStage.id,
+    cursor_epoch: epoch,
+    kind,
+    expected_roster: expectedRoster,
+  });
+
+  const audit: HandoffRecord = {
+    id: randomUUID(),
+    route: {
+      source_workflow: sourceWorkflow,
+      source_stage: route.source_stage,
+      target_workflow: targetWorkflow,
+      target_stage: route.target_stage,
+    },
+    source: {
+      workflow: sourceWorkflow,
+      profile_hash: cap.issued_for.profile_hash,
+      stage: cap.issued_for.stage_cursor,
+      cursor_epoch: cap.issued_for.cursor_epoch,
+      run_key: cap.issued_for.run_key,
+      branch: cap.issued_for.branch,
+    },
+    target: {
+      workflow: targetWorkflow,
+      profile_hash: targetHash,
+      stage: targetStage.id,
+      cursor_epoch: epoch,
+      capability_id: issued.capability_id,
+    },
+    approval: {
+      kind: input.approval.kind,
+      ref: input.approval.ref,
+      decision: "approved",
+      actor: input.actor.trim(),
+      decided_at: now(),
+    },
+    context: {
+      artifact_ids: [...(input.handoff_context?.artifact_ids ?? [])],
+      decision_refs: [...(input.handoff_context?.decision_refs ?? [])],
+      summary: input.handoff_context?.summary ?? "",
+    },
+    at: now(),
+  };
+
+  // Build the complete target TeamState in memory, then persist exactly once.
+  // Source provenance (workflow/hash/stage/epoch) lives in the audit record;
+  // the active stage list must contain target stages only so workflow
+  // contract, monotonic checks and dispatch gates resolve the target profile.
+  // Source join/loop/slot metadata names source stage ids and epochs, so it
+  // is dropped outright (never carried as undefined-valued keys).
+  const { join_summary: _joinSummary, loop_state: _loopState, slot_artifacts: _slotArtifacts, ...sourceRest } = state;
+  const next: TeamState = {
+    ...sourceRest,
+    run_key: state.run_key ?? state.branch,
+    classification: { ...state.classification, workflow: targetWorkflow },
+    workflow_override: true,
+    profile_hash: targetHash,
+    stage_cursor: targetStage.id,
+    cursor_epoch: epoch,
+    stages: targetProfile.stages.map((s) => ({ id: s.id, status: s.id === targetStage.id ? "in_progress" as const : "pending" as const })),
+    dispatch_capability: issued.state,
+    pause: { kind: "none", reason: "" },
+    policy: { ...(state.policy ?? {}), strict_orchestrator: true },
+    handoffs: [...(state.handoffs ?? []), audit],
+    updated_at: now(),
+  };
+  persist(cwd, next, target);
+  const handoff = handoffFromState(next, {
+    capability_id: issued.capability_id,
+    dispatch_token: issued.dispatch_token,
+    advance_token: issued.advance_token,
+  });
+  if (!handoff) return { ok: false, error: "handoff capability construction failed" };
+  return { ok: true, state: next, route: audit.route, handoff, audit };
 }

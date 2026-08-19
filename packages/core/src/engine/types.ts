@@ -304,6 +304,57 @@ export interface LoopState {
   ended_at?: string;
 }
 
+/**
+ * Engine-owned handoff route: a registered source workflow stage that may
+ * transfer an approved completed run into a target workflow's entry stage.
+ * Route metadata lives in the engine (never in shipped profile JSON) so
+ * `profileHash` stays stable for in-flight runs and no profile edit can
+ * invalidate active states.
+ */
+export interface HandoffRoute {
+  source_workflow: string;
+  source_stage: string;
+  target_workflow: string;
+  target_stage: string;
+}
+
+/** Bounded references carried across a handoff; never a state clone. */
+export interface HandoffContext {
+  artifact_ids?: string[];
+  decision_refs?: string[];
+  summary?: string;
+}
+
+/** Durable audit record appended once per successful handoff. */
+export interface HandoffRecord {
+  id: string;
+  route: HandoffRoute;
+  source: {
+    workflow: string;
+    profile_hash: string;
+    stage: string;
+    cursor_epoch: string;
+    run_key: string;
+    branch: string;
+  };
+  target: {
+    workflow: string;
+    profile_hash: string;
+    stage: string;
+    cursor_epoch: string;
+    capability_id: string;
+  };
+  approval: {
+    kind: "checkpoint" | "artifact";
+    ref: string;
+    decision: string;
+    actor: string;
+    decided_at: string;
+  };
+  context: { artifact_ids: string[]; decision_refs: string[]; summary: string };
+  at: string;
+}
+
 export interface TeamState {
   schema: 1;
   branch: string;
@@ -340,6 +391,8 @@ export interface TeamState {
   loop_state?: LoopState;
   /** Per-slot consilium artifact provenance + synthesis evidence (additive). */
   slot_artifacts?: Record<string, StageSlotRecords>;
+  /** Durable cross-profile handoff audit trail (additive, append-only). */
+  handoffs?: HandoffRecord[];
   observability?: ObservabilityPointer;
 }
 
