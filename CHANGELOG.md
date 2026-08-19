@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.22.17] — 2026-08-19
+### Fixed
+- **Git lifecycle in strict orchestration** — `/team` and `/do-work` can create or select working branches, synchronize and integrate delegated commits, then commit, push, and open PRs; direct path restore/discard operations remain blocked.
+
 ## [0.22.16] — 2026-08-18
 ### Fixed
 - **Security mapping fallback** — security review roles remain explicitly unavailable when their specialist agent is missing instead of silently degrading to the generic `task` worker.
