@@ -156,8 +156,28 @@ function isProjectPath(path: string, cwd: string): boolean {
 }
 
 
+const CHECKOUT_PATH_MUTATION = /\bgit\s+checkout\b[^;&|]*(?:--(?:\s|$)|(?:^|\s)(?:\.{1,2}|\/)(?:[\/\s"'`]|$)|(?:^|\s)(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$))/i;
+const CHECKOUT_FORCE_MUTATION = /(?:^|[;&|]\s*)git\s+checkout\b[^;&|]*(?:--force\b|(?:^|\s)-f(?:\s|$|[;&|]))/;
+const CHECKOUT_FORCE_BRANCH_MUTATION = /(?:^|[;&|]\s*)git\s+checkout\b[^;&|]*(?:^|\s)-B(?:\s|$|[;&|])/;
+const SWITCH_DISCARD_MUTATION = /(?:^|[;&|]\s*)git\s+switch\b[^;&|]*--discard-changes\b/i;
+const SWITCH_FORCE_BRANCH_MUTATION = /(?:^|[;&|]\s*)git\s+switch\b[^;&|]*(?:^|\s)-C(?:\s|$|[;&|])/;
+
+/**
+ * Detect direct source/worktree mutations that the orchestrator must not perform.
+ *
+ * Commit/publication and history-integration commands (`git commit`, `git push`,
+ * `git fetch`, `git merge`, `git rebase`, `git cherry-pick`, `gh pr create`)
+ * reconcile or publish delegated work and are intentionally not matched here.
+ * Branch setup is also allowed; only checkout/switch forms that restore or
+ * discard worktree contents remain blocked.
+ */
 function looksLikeSourceMutation(command: string): boolean {
-  return /(?:\b(?:tee)\b|\b(?:cat|printf|echo)\b[^\n]*(?:>|>>|<<)|(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|rsync|patch|ed|sponge)\b|\b(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\b(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\bgit\s+(?:apply|checkout|restore|reset|clean|mv|rm|commit|merge|rebase|cherry-pick|stash)\b|\bgit\s+show\b[^\n]*(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:python|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile|write_text|open\(|unlink|rename|mkdir)\b)/i.test(command);
+  return /(?:\b(?:tee)\b|\b(?:cat|printf|echo)\b[^\n]*(?:>|>>|<<)|(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|rsync|patch|ed|sponge)\b|\b(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\b(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\bgit\s+(?:apply|restore|reset|clean|mv|rm|stash)\b|\bgit\s+show\b[^\n]*(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:python|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile|write_text|open\(|unlink|rename|mkdir)\b)/i.test(command)
+    || CHECKOUT_PATH_MUTATION.test(command)
+    || CHECKOUT_FORCE_MUTATION.test(command)
+    || CHECKOUT_FORCE_BRANCH_MUTATION.test(command)
+    || SWITCH_DISCARD_MUTATION.test(command)
+    || SWITCH_FORCE_BRANCH_MUTATION.test(command);
 }
 
 export function hasStrictOrchestratorState(cwd: string): boolean {

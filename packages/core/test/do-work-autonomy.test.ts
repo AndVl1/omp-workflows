@@ -574,6 +574,62 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("strict orchestrator policy permits git publication and PR control-plane commands", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-git-policy-"));
+  try {
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
+    const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
+    const allowed = [
+      'git status --short && git add src/app.ts && git commit -m "fix: publish worker changes" && git fetch origin main && git rebase origin/main && git push origin HEAD && gh pr create --fill',
+      "git checkout main && git pull origin main && git checkout -b feat/example",
+      "git checkout main",
+      "git checkout -b feat/example",
+      "git switch main",
+      "git switch -c feat/example",
+      "git fetch origin main",
+      "git pull --rebase origin main",
+      "git rebase origin/main",
+      "git rebase --continue",
+      "git merge --no-edit feature/worker",
+      "git merge --abort",
+      "git cherry-pick abc123",
+      "git cherry-pick --abort",
+      "git push origin HEAD",
+      "gh pr create --fill",
+    ];
+    for (const command of allowed) {
+      assert.equal(
+        orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true }),
+        undefined,
+        `control-plane command should be allowed: ${command}`,
+      );
+    }
+    const blocked = [
+      "git checkout -- src/app.ts",
+      "git checkout HEAD -- src/app.ts",
+      "git checkout src/app.ts",
+      "git checkout -f main",
+      "git checkout .",
+      "git switch --discard-changes main",
+      "git restore src/app.ts",
+      "git reset --hard HEAD",
+      "git clean -fd",
+      "git stash push -m temp",
+    ];
+    for (const command of blocked) {
+      assert.equal(
+        orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true })?.block,
+        true,
+        `direct worktree mutation should remain blocked: ${command}`,
+      );
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("strict durable transitions fail closed when no active git branch exists", () => {
   const root = mkdtempSync(join(tmpdir(), "durable-no-git-"));
   try {
@@ -597,6 +653,8 @@ test("do-work prompt makes orchestrator non-coding policy explicit", () => {
     const prompt = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
     assert.match(prompt, /STRICT ORCHESTRATOR POLICY/);
     assert.match(prompt, /write\/edit application source or project files \| DENY/);
+    assert.match(prompt, /git status.*git fetch.*git merge.*git rebase.*git cherry-pick.*git add.*git commit.*git push.*gh pr create/);
+    assert.match(prompt, /git checkout <branch>.*git checkout -b <branch>.*git switch <branch>.*git switch -c <branch>/);
     assert.match(prompt, /After every delegated call or parallel batch/);
   } finally {
     rmSync(root, { recursive: true, force: true });
