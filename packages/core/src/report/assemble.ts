@@ -28,18 +28,21 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { resolveState } from "../engine/state.js";
 import { loadProfile } from "../engine/profile.js";
 import { resolveConfig, resolveAgentForRole } from "../engine/config.js";
 import type { Profile, RoleConfig, StageDef, StageStatus, TeamState } from "../engine/types.js";
-import { readCtoState } from "../cto/state.js";
 import { assessRunHealth } from "../cto/health.js";
 import { loadTeamDefs } from "../cto/plan.js";
-import { markdownCtoState } from "../commands/cto.js";
 import type { CtoState, RunHealth, TeamDef, TeamRunStatus } from "../cto/types.js";
 import { readObservabilityPointer } from "../observability/recorder.js";
 import type { ObservabilityEvent, ObservabilityPointer } from "../observability/events.js";
 import { redactReportBody } from "./redact.js";
+import {
+  resolveCtoSource,
+  resolveDoWorkSource,
+  TEAM_ARTIFACTS_DIR,
+  WORK_STATE_DIR,
+} from "./session-source.js";
 import type {
   BuildSessionReportOptions,
   ChronologyEvent,
@@ -58,10 +61,8 @@ import type {
   StageInfo,
 } from "./types.js";
 
-const WORK_STATE_DIR = ".work-state";
-const LEGACY_STATE = "team-state.json";
-const CTO_DIR = "cto";
-const TEAM_ARTIFACTS_DIR = "artifacts"; // .work-state/artifacts/<teamId>/ per the CTO prompt contract
+// Session-source layout constants and resolution live in session-source.ts
+// (single source of truth for feature/legacy/CTO discovery — architecture-2).
 const DEFAULT_MAX_ARTIFACT_BYTES = 16 * 1024;
 const MAX_EVENT_BYTES = 2 * 1024 * 1024;
 const MAX_EVENT_LINES = 5000;
@@ -89,96 +90,16 @@ interface CtoResolved {
 
 /** Resolve a do-work TeamState; null when not found (id probe or empty work-state). */
 function resolveDoWork(cwd: string, id?: string): DoWorkResolved | null {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  if (id && id !== "legacy") {
-    const featureDir = join(wsDir, "features", id);
-    const statePath = join(featureDir, "state.json");
-    if (!existsSync(statePath)) return null;
-    const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-    return { id, state, statePath, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false };
-  }
-  if (id === "legacy") {
-    const statePath = join(wsDir, LEGACY_STATE);
-    if (!existsSync(statePath)) return null;
-    const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-    return { id: "legacy", state, statePath, stateDir: wsDir, artifactsDir: join(wsDir, "artifacts"), isLegacy: true };
-  }
-  const resolved = resolveState(cwd);
-  if (resolved.state && resolved.statePath) {
-    const slug = resolved.isLegacy ? "legacy" : basename(resolved.stateDir ?? "");
-    return {
-      id: slug,
-      state: resolved.state,
-      statePath: resolved.statePath,
-      stateDir: resolved.stateDir ?? wsDir,
-      artifactsDir: resolved.artifactsDir ?? join(wsDir, "artifacts"),
-      isLegacy: resolved.isLegacy,
-      isStale: resolved.isStale,
-    };
-  }
-  // "Latest" fallback: the active-feature pointer may be absent or pointing
-  // elsewhere — scan per-feature states and pick the newest by updated_at.
-  const featuresDir = join(wsDir, "features");
-  if (existsSync(featuresDir)) {
-    let best: DoWorkResolved | null = null;
-    try {
-      for (const slug of readdirSync(featuresDir)) {
-        const featureDir = join(featuresDir, slug);
-        const statePath = join(featureDir, "state.json");
-        if (!existsSync(statePath)) continue;
-        try {
-          const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-          if (!best || state.updated_at > best.state.updated_at) {
-            best = {
-              id: slug,
-              state,
-              statePath,
-              stateDir: featureDir,
-              artifactsDir: join(featureDir, "artifacts"),
-              isLegacy: false,
-            };
-          }
-        } catch {
-          // corrupt state file — skip in the latest scan
-        }
-      }
-    } catch {
-      // unreadable features dir
-    }
-    if (best) return best;
-  }
-  return null;
+  // Delegated: deterministic feature/legacy/latest discovery with the exact
+  // report selectors lives in session-source.ts (architecture-2).
+  return resolveDoWorkSource(cwd, id);
 }
 
 /** Resolve a CTO run; null when not found (id probe or no runs). */
 function resolveCto(cwd: string, id?: string): CtoResolved | null {
-  const runsDir = join(cwd, WORK_STATE_DIR, CTO_DIR);
-  if (!existsSync(runsDir)) return null;
-  const readRun = (runId: string): CtoResolved | null => {
-    const runDir = join(runsDir, runId);
-    if (!existsSync(runDir)) return null;
-    const statePath = join(runDir, "state.json");
-    if (existsSync(statePath)) {
-      const state = readCtoState(runId, cwd);
-      if (!state) return null;
-      return { id: runId, state, statePath, runDir, format: "json" };
-    }
-    const mdState = markdownCtoState(runId, runDir);
-    if (!mdState) return null;
-    return { id: runId, state: mdState, statePath: null, runDir, format: "markdown" };
-  };
-  if (id) return readRun(id);
-  let best: CtoResolved | null = null;
-  try {
-    for (const runId of readdirSync(runsDir)) {
-      const run = readRun(runId);
-      if (!run) continue;
-      if (!best || run.state.updated_at > best.state.updated_at) best = run;
-    }
-  } catch {
-    // unreadable runs dir — no CTO session available
-  }
-  return best;
+  // Delegated: deterministic JSON-first/markdown-fallback discovery with the
+  // exact report selectors lives in session-source.ts (architecture-2).
+  return resolveCtoSource(cwd, id);
 }
 
 /** Auto-detect: the newest of the best do-work state and best CTO run. */
