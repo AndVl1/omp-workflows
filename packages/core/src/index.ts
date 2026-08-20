@@ -258,6 +258,7 @@ export {
   recordCheckpointDecision,
   handoffWorkflow,
   registerWorkflowHandoffRoute,
+  handoffRouteCatalogue,
   setArtifactContractPolicy,
   setFanInPolicy,
   type CheckpointDecisionInput,
@@ -421,6 +422,8 @@ export type {
   LoopIterationRecord,
   LoopState,
   HandoffRoute,
+  HandoffRouteKind,
+  HandoffRouteDisposition,
   HandoffContext,
   HandoffRecord,
 } from "./engine/types.js";

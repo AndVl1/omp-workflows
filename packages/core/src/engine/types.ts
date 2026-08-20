@@ -306,17 +306,61 @@ export interface LoopState {
 }
 
 /**
+ * Route semantics: what kind of transfer this is. Stable, engine-owned
+ * labels surfaced in the safe tool result and the audit trail.
+ */
+export type HandoffRouteKind =
+  /** Approved implementation-ready spec -> feature discovery. */
+  | "feature-intake"
+  /** Post-feature regression intake (full-feature|standard|lightweight summary). */
+  | "regression"
+  /** Regression report -> confirmed actionable/obvious bug fix. */
+  | "bug-fix-diagnostic"
+  /** Regression report -> uncertain/iterative debug cycle. */
+  | "debug-diagnostic"
+  /** Post-fix feedback/reopen regression (bug-fix|debug-cycle|emergency summary). */
+  | "feedback-regression"
+  /** Explicitly documented direct pair that must never complete. */
+  | "unsupported";
+
+/**
+ * Route lifecycle state. `enabled` routes may complete; `conditional`
+ * routes are catalogue-only until their required evidence/materialization
+ * adapter exists and reject deterministically; `unsupported` pairs are
+ * documented default-deny entries with a human-readable reason.
+ */
+export type HandoffRouteDisposition = "enabled" | "conditional" | "unsupported";
+
+/**
  * Engine-owned handoff route: a registered source workflow stage that may
  * transfer an approved completed run into a target workflow's entry stage.
  * Route metadata lives in the engine (never in shipped profile JSON) so
  * `profileHash` stays stable for in-flight runs and no profile edit can
- * invalidate active states.
+ * invalidate active states. Entries are catalogue-typed: stable ids, an
+ * explicit disposition/semantics, source/target stages, prerequisites, and
+ * UX metadata. Unknown and unsupported routes fail closed.
  */
 export interface HandoffRoute {
+  /** Stable, unique catalogue id (e.g. `spec-handoff->full-feature`). */
+  id: string;
   source_workflow: string;
   source_stage: string;
   target_workflow: string;
   target_stage: string;
+  /** Route semantics: what kind of transfer this is. */
+  kind: HandoffRouteKind;
+  /** `enabled` | `conditional` | `unsupported`. */
+  disposition: HandoffRouteDisposition;
+  /** Human-readable meaning shown in the safe tool result. */
+  description: string;
+  /** What the target stage materializes from the carried context. */
+  preparation?: string;
+  /** Prerequisites that must hold before the route may be used. */
+  prerequisites?: string[];
+  /** Why a conditional route cannot complete yet (adapter/evidence gaps). */
+  blocked_by?: string[];
+  /** UX hint: when the orchestrator may select this route. */
+  when?: string;
 }
 
 /** Bounded references carried across a handoff; never a state clone. */

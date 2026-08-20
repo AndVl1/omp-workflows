@@ -418,6 +418,16 @@ test("fullstack: workflow_handoff delegates to the engine and returns the one-ti
     assert.equal(details.state?.workflow, "full-feature");
     assert.equal(details.state?.stage_cursor, "discovery");
 
+    // The safe result exposes the typed catalogue route metadata.
+    const route = details.route as { id?: string; kind?: string; disposition?: string; source_workflow?: string; target_stage?: string; description?: string } | undefined;
+    assert.equal(route?.id, "spec-handoff->full-feature");
+    assert.equal(route?.kind, "feature-intake");
+    assert.equal(route?.disposition, "enabled");
+    assert.equal(route?.source_workflow, "spec-preparation");
+    assert.equal(route?.target_stage, "discovery");
+    assert.ok(route?.description, "human-readable route meaning is exposed");
+    assert.equal((details.audit as { route?: { id?: string } }).route?.id, "spec-handoff->full-feature");
+
     // Plaintext secrets live only in the one-time envelope; state persists hashes.
     const persisted = JSON.parse(readFileSync(join(root, ".work-state", "features", "handoff-tool", "state.json"), "utf8")) as {
       dispatch_capability: { dispatch_token_hash: string; advance_token_hash: string };
