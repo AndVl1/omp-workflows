@@ -126,7 +126,8 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "After every task result, call `workflow_status`. Synchronous task results are reconciled by the runtime; if a dispatch remains `authorized` or an async job has settled outside the hook, call `workflow_complete` with its dispatch token, identity binding, outcome, evidence, and artifact IDs.",
     "Advance only through `workflow_advance` after all current-stage dispatches are complete and required artifacts/gates exist. Use the returned next-stage handoff for the next stage; never call `task` from a stale cursor.",
     "### Cross-profile handoff (workflow_handoff)",
-    "When the current profile completes at a `handoff` source stage and the user explicitly approves the result, persist a typed `workflow_approval` artifact in the existing feature artifacts directory (`type: workflow_approval`, `version: 1`, `decision: approved`, the run_key, source workflow, source stage, actor, and decided_at), then call `workflow_handoff` with the completed run's advance-token handoff, the target workflow, the approval reference, and only bounded artifact/decision references.",
+    "When the current profile completes at a `handoff` source stage and the user explicitly approves the result, choose the target workflow from the engine's typed route catalogue. The safe result of `workflow_handoff` exposes route id/kind/status, source and target workflow/stage, prerequisites, and the target preparation/materialization description. Only `enabled` catalogue routes complete; `conditional` routes are rejected deterministically until their declared evidence/materialization adapter exists, and `unsupported` or arbitrary target strings are denied — never pick a target outside the catalogue.",
+    "Persist a typed `workflow_approval` artifact in the existing feature artifacts directory (`type: workflow_approval`, `version: 1`, `decision: approved`, the run_key, source workflow, source stage, actor, and decided_at), then call `workflow_handoff` with the completed run's advance-token handoff, the target workflow, the approval reference, and only bounded artifact/decision references.",
     "NEVER infer approval from natural-language output or call `workflow_handoff` without typed approval evidence. If `workflow_handoff` rejects or fails, stop and preserve state: do not edit state.json or profile JSON, do not guess credentials, and do not retry with free text.",
     "On success, discard the source envelope, use ONLY the returned target handoff, call `workflow_instructions` again, and continue with the returned target stage contract; record the target stage's own checkpoints under the fresh capability.",
     "",
@@ -140,6 +141,8 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "| task outside the active profile/state contract | DENY |",
     "| direct implementation or review-fix | DENY |",
     "| workflow_handoff after explicit typed user approval | ALLOW |",
+    "| workflow_handoff to a catalogue `enabled` route with typed approval evidence | ALLOW |",
+    "| workflow_handoff to conditional/unsupported routes or arbitrary targets | DENY |",
     "| workflow_handoff without approval evidence or mid-workflow | DENY |",
   ].join("\n");
 }

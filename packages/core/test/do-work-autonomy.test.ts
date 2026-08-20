@@ -519,9 +519,19 @@ test("do-work: handoff requires explicit typed approval before workflow_handoff 
     assert.match(prompt, /do not edit state\.json or profile JSON/);
     assert.match(prompt, /do not guess credentials/);
 
+    // The prompt teaches catalogue-based route selection: the orchestrator
+    // picks an `enabled` route, never a conditional/unsupported/arbitrary
+    // target (default-deny is engine-enforced).
+    assert.match(prompt, /route catalogue/);
+    assert.match(prompt, /route id\/kind\/status/);
+    assert.match(prompt, /conditional/);
+    assert.match(prompt, /unsupported/);
+    assert.match(prompt, /never pick a target outside the catalogue/);
+
     // Permission summary gains explicit handoff rows.
     assert.match(prompt, /workflow_handoff after explicit typed user approval \| ALLOW/);
     assert.match(prompt, /workflow_handoff without approval evidence or mid-workflow \| DENY/);
+    assert.match(prompt, /workflow_handoff to conditional\/unsupported routes or arbitrary targets \| DENY/);
 
     // Pinned invariants survive the handoff text unchanged.
     assert.ok(prompt.indexOf("workflow_begin") < prompt.indexOf("workflow_instructions"));

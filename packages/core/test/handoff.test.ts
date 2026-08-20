@@ -40,6 +40,7 @@ import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engin
 import {
   handoffWorkflow,
   registerWorkflowHandoffRoute,
+  handoffRouteCatalogue,
   createCapability,
   beginCapability,
   type HandoffWorkflowInput,
@@ -50,7 +51,7 @@ import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { classificationToolGate } from "../src/gates/classification.js";
 import { dispatchGate, buildDispatchMarker } from "../src/gates/dispatch.js";
 import { artifactSchemaFor, validateProducedArtifact } from "../src/engine/artifact-contract.js";
-import type { Profile, TeamState } from "../src/engine/types.js";
+import type { HandoffRecord, HandoffRoute, Profile, TaskType, TeamState } from "../src/engine/types.js";
 
 let fixtureCounter = 0;
 
@@ -118,45 +119,101 @@ function setupCompletedSpecPreparation(options: {
   capabilityNotComplete?: boolean;
   missingProducedArtifact?: boolean;
   missingApprovalArtifact?: boolean;
-} = {}): { root: string; input: HandoffWorkflowInput; issued: ReturnType<typeof createCapability> } {
+} = {}): { root: string; input: HandoffWorkflowInput; issued: IssuedCapability } {
+  const { root, issued, branch, persistedHash } = setupCompletedSource({
+    workflow: "spec-preparation",
+    branch: options.branch,
+    task: "spec handoff fixture",
+    autonomousReason: "approved spec",
+    wrongSourceProfileHash: options.wrongSourceProfileHash,
+    incompleteStages: options.incompleteStages,
+    pauseNotDone: options.pauseNotDone,
+    capabilityNotComplete: options.capabilityNotComplete,
+    missingProducedArtifact: options.missingProducedArtifact,
+    missingApprovalArtifact: options.missingApprovalArtifact,
+    stateArtifacts: { spec_handoff: "spec_handoff.json" },
+  });
+  // spec_handoff carries the approved specification (feature_spec contract).
+  writeFileSync(join(artifactsDirOf(root), "spec_handoff.json"), JSON.stringify({ goal: "implement handoff", scope: ["core"], acceptance_criteria: ["handoff works"] }));
+  const input = handoffInputFor(issued, branch, persistedHash, {
+    target_workflow: "full-feature",
+    handoff_context: { artifact_ids: ["spec_handoff"], decision_refs: [], summary: "spec approved for implementation" },
+  });
+  return { root, input, issued };
+}
+
+function readState(root: string): TeamState {
+  return JSON.parse(readFileSync(statePathOf(root), "utf8")) as TeamState;
+}
+
+/** Named capability shape returned by createCapability (test contract). */
+type IssuedCapability = { capability_id: string; dispatch_token: string; advance_token: string; state: NonNullable<TeamState["dispatch_capability"]> };
+
+/** Artifact ids a stage produces (single string or array). */
+function producedIds(stage: { produces?: string | string[] }): string[] {
+  return Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
+}
+
+/**
+ * Build a completed source run for any shipped profile: terminal stage done,
+ * every stage terminal, capability complete, pause done, produced artifacts
+ * + approval artifact present. Reuses the same fail-closed options as the
+ * spec-shaped wrapper below.
+ */
+function setupCompletedSource(options: {
+  workflow: string;
+  branch?: string;
+  classificationType?: TaskType;
+  task?: string;
+  autonomousReason?: string;
+  wrongSourceProfileHash?: boolean;
+  incompleteStages?: boolean;
+  pauseNotDone?: boolean;
+  capabilityNotComplete?: boolean;
+  missingProducedArtifact?: boolean;
+  missingApprovalArtifact?: boolean;
+  stateArtifacts?: Record<string, string>;
+  artifactContents?: Record<string, unknown>;
+} = {}): { root: string; issued: IssuedCapability; profile: Profile; branch: string; persistedHash: string } {
   const branch = options.branch ?? `feat/handoff-${fixtureCounter++}`;
   const root = mkdtempSync(join(tmpdir(), `handoff-${branch.replace(/\//g, "-")}-`));
   initGit(root, branch);
-  const sourceProfile = loadProfile("spec-preparation");
-  assert.ok(sourceProfile, "shipped spec-preparation profile must load");
-  const persistedHash = options.wrongSourceProfileHash ? "deadbeef".repeat(8) : profileHash(sourceProfile);
+  const profile = loadProfile(options.workflow as never);
+  assert.ok(profile, `profile ${options.workflow} must load`);
+  const terminal = profile.stages[profile.stages.length - 1]!;
+  const persistedHash = options.wrongSourceProfileHash ? "deadbeef".repeat(8) : profileHash(profile);
   const issued = createCapability({
     run_key: branch,
     branch,
-    workflow: "spec-preparation",
+    workflow: profile.name,
     profile_hash: persistedHash,
-    stage_cursor: "handoff",
+    stage_cursor: terminal.id,
     kind: "none",
     expected_roster: [],
   });
   const stageStatuses = options.incompleteStages
-    ? sourceProfile.stages.map((s, index) => ({ id: s.id, status: (index === 0 ? "in_progress" : "pending") as const }))
-    : sourceProfile.stages.map((s) => ({ id: s.id, status: "done" as const }));
+    ? profile.stages.map((s, index) => ({ id: s.id, status: (index === 0 ? "in_progress" : "pending") as const }))
+    : profile.stages.map((s) => ({ id: s.id, status: "done" as const }));
   writeState(root, {
     schema: 1,
     branch,
     run_key: branch,
     classification: {
-      type: "SPEC",
+      type: options.classificationType ?? "SPEC",
       complexity: "MEDIUM",
       confidence: "HIGH",
       autonomous: false,
-      workflow: "spec-preparation",
-      autonomous_reason: "approved spec",
+      workflow: profile.name,
+      autonomous_reason: options.autonomousReason ?? "approved source run",
     },
-    task: "spec handoff fixture",
+    task: options.task ?? `${profile.name} handoff fixture`,
     history: [{ task: "original request", at: "2026-08-01T00:00:00.000Z" }],
     autonomous: false,
     workflow_override: false,
     issue: { number: 42, url: "https://example.test/42" },
-    stage_cursor: "handoff",
+    stage_cursor: terminal.id,
     stages: stageStatuses,
-    artifacts: { spec_handoff: "spec_handoff.json" },
+    artifacts: options.stateArtifacts ?? {},
     pause: { kind: options.pauseNotDone ? ("none" as const) : ("done" as const), reason: "" },
     policy: { strict_orchestrator: true },
     profile_hash: persistedHash,
@@ -166,41 +223,55 @@ function setupCompletedSpecPreparation(options: {
       ? issued.state
       : { ...issued.state, status: "complete" as const, dispatches: [] },
     checkpoint_decisions: [
-      { stage_id: "intake_repo_map", checkpoint: "orientation", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "fixture", decided_at: "2026-08-01T00:00:00.000Z" },
+      { stage_id: profile.stages[0]!.id, checkpoint: "orientation", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "fixture", decided_at: "2026-08-01T00:00:00.000Z" },
     ],
     updated_at: new Date().toISOString(),
   }, { featureSlug: "handoff-test" });
   const dir = artifactsDirOf(root);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "spec_handoff.json"), JSON.stringify({ goal: "implement handoff", scope: ["core"], acceptance_criteria: ["handoff works"] }));
-  if (!options.missingProducedArtifact) {
-    writeFileSync(join(dir, "spec-preparation.json"), JSON.stringify({ ready: true }));
+  for (const id of producedIds(terminal)) {
+    if (options.missingProducedArtifact) break;
+    writeFileSync(join(dir, `${id}.json`), JSON.stringify(options.artifactContents?.[id] ?? { ready: true }));
   }
   if (!options.missingApprovalArtifact) {
-    writeApprovalArtifact(root, "workflow_approval", {}, branch);
+    writeApprovalArtifact(root, "workflow_approval", {}, branch, profile.name, terminal.id);
   }
-  const input: HandoffWorkflowInput = {
+  return { root, issued, profile, branch, persistedHash };
+}
+
+/** Build a handoff input for an issued completed-source capability. */
+function handoffInputFor(
+  issued: IssuedCapability,
+  branch: string,
+  persistedHash: string,
+  overrides: Partial<HandoffWorkflowInput> = {},
+): HandoffWorkflowInput {
+  const binding = issued.state.issued_for!;
+  return {
     token: issued.advance_token,
     capability_id: issued.capability_id,
     run_key: branch,
     branch,
-    workflow: "spec-preparation",
+    workflow: binding.workflow,
     profile_hash: persistedHash,
-    stage_cursor: "handoff",
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    stage_cursor: binding.stage_cursor,
+    cursor_epoch: binding.cursor_epoch,
     target_workflow: "full-feature",
-    approval: { kind: "artifact", ref: "workflow_approval", source_stage: "handoff", decision: "approved" },
+    approval: { kind: "artifact", ref: "workflow_approval", source_stage: binding.stage_cursor, decision: "approved" },
     actor: "orchestrator",
-    handoff_context: { artifact_ids: ["spec_handoff"], decision_refs: [], summary: "spec approved for implementation" },
+    handoff_context: { artifact_ids: [], decision_refs: [], summary: "" },
+    ...overrides,
   };
-  return { root, input, issued };
-}
-
-function readState(root: string): TeamState {
-  return JSON.parse(readFileSync(statePathOf(root), "utf8")) as TeamState;
 }
 
 const TARGET_HASH = profileHash(loadProfile("full-feature")!);
+
+/**
+ * Snapshot of the catalogue at import time (shipped entries only) so the
+ * integrity test is order-independent: tests may register synthetic routes
+ * into the live map, but the shipped catalogue contract stays pinned.
+ */
+const SHIPPED_CATALOGUE = handoffRouteCatalogue();
 
 test("handoff: success preserves source state and arms the target discovery stage with a fresh capability", () => {
   const { root, input } = setupCompletedSpecPreparation();
@@ -282,6 +353,17 @@ test("handoff: success preserves source state and arms the target discovery stag
     assert.equal(result.handoff.kind, "none");
     assert.deepEqual(result.handoff.expected_roster, []);
     assert.deepEqual(result.route, audit.route);
+
+    // The safe result exposes the typed catalogue route: id/kind/status,
+    // source and target workflow/stage, prerequisites and description.
+    assert.equal(result.route.id, "spec-handoff->full-feature");
+    assert.equal(result.route.kind, "feature-intake");
+    assert.equal(result.route.disposition, "enabled");
+    assert.ok(result.route.description.length > 0, "route carries a human-readable meaning");
+    assert.ok(Array.isArray(result.route.prerequisites) && result.route.prerequisites.length > 0, "route declares prerequisites");
+    assert.ok(result.route.preparation?.length, "route declares target preparation/materialization");
+    assert.equal(audit.route.id, "spec-handoff->full-feature");
+    assert.equal(audit.route.disposition, "enabled");
 
     // Hash-only secret persistence: no plaintext tokens in state.json.
     const persisted = readFileSync(statePathOf(root), "utf8");
@@ -596,6 +678,60 @@ test("handoff: unsafe or oversized context is rejected", () => {
   }
 });
 
+test("handoff: a full audit trail rejects overflow instead of appending past the cap", () => {
+  /** Minimal well-formed record; only the record count is under test here. */
+  const record = (index: number): HandoffRecord => ({
+    id: `prior-handoff-${index}`,
+    route: SHIPPED_CATALOGUE[0]!,
+    source: {
+      workflow: "spec-preparation",
+      profile_hash: "0".repeat(64),
+      stage: "handoff",
+      cursor_epoch: `source-epoch-${index}`,
+      run_key: "prior-run",
+      branch: "prior-branch",
+    },
+    target: {
+      workflow: "full-feature",
+      profile_hash: "0".repeat(64),
+      stage: "discovery",
+      cursor_epoch: `target-epoch-${index}`,
+      capability_id: `prior-capability-${index}`,
+    },
+    approval: { kind: "artifact", ref: "workflow_approval", decision: "approved", actor: "orchestrator", decided_at: "2026-08-01T00:00:00.000Z" },
+    context: { artifact_ids: [], decision_refs: [], summary: "" },
+    at: "2026-08-01T00:00:00.000Z",
+  });
+
+  // Exactly at the cap (32): reject rather than truncate or overflow; state byte-identical.
+  {
+    const { root, input } = setupCompletedSpecPreparation();
+    try {
+      writeState(root, { ...readState(root), handoffs: Array.from({ length: 32 }, (_, index) => record(index)) }, { featureSlug: "handoff-test" });
+      const before = snapshot(root);
+      const result = handoffWorkflow(root, input);
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.error, "handoff audit trail is full");
+      assertUnchanged(root, before);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // One below the cap (31): the handoff succeeds and persists exactly 32 records.
+  {
+    const { root, input } = setupCompletedSpecPreparation();
+    try {
+      writeState(root, { ...readState(root), handoffs: Array.from({ length: 31 }, (_, index) => record(index)) }, { featureSlug: "handoff-test" });
+      const result = handoffWorkflow(root, input);
+      assert.equal(result.ok, true);
+      assert.equal(readState(root).handoffs?.length, 32);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("handoff: duplicate and replayed handoffs are deterministic rejections without state mutation", () => {
   const { root, input, issued } = setupCompletedSpecPreparation();
   try {
@@ -665,7 +801,16 @@ test("handoff: synthetic route transfers into a dispatchable single target stage
     ],
   };
   registerWorkflowProfiles([sourceProfile, targetProfile]);
-  registerWorkflowHandoffRoute({ source_workflow: sourceName, source_stage: "handoff", target_workflow: targetName, target_stage: "implementation" });
+  registerWorkflowHandoffRoute({
+    id: `synthetic-${targetName}`,
+    source_workflow: sourceName,
+    source_stage: "handoff",
+    target_workflow: targetName,
+    target_stage: "implementation",
+    kind: "feature-intake",
+    disposition: "enabled",
+    description: "Synthetic dispatchable target used by handoff gate tests.",
+  });
 
   const branch = `feat/synthetic-${fixtureCounter++}`;
   const root = mkdtempSync(join(tmpdir(), `handoff-synthetic-${branch.replace(/\//g, "-")}-`));
@@ -763,7 +908,16 @@ test("handoff: checkpoint-kind approval uses a durable approved decision on the 
     stages: [{ id: "discovery", title: "Discovery", type: "orchestrator" }],
   };
   registerWorkflowProfiles([sourceProfile, targetProfile]);
-  registerWorkflowHandoffRoute({ source_workflow: sourceName, source_stage: "handoff", target_workflow: targetName, target_stage: "discovery" });
+  registerWorkflowHandoffRoute({
+    id: `ckpt-${targetName}`,
+    source_workflow: sourceName,
+    source_stage: "handoff",
+    target_workflow: targetName,
+    target_stage: "discovery",
+    kind: "feature-intake",
+    disposition: "enabled",
+    description: "Synthetic checkpoint-approval handoff route used by tests.",
+  });
 
   const branch = `feat/ckpt-${fixtureCounter++}`;
   const root = mkdtempSync(join(tmpdir(), `handoff-ckpt-${branch.replace(/\//g, "-")}-`));
@@ -847,6 +1001,217 @@ test("handoff: a persist failure fails closed — old state intact, no tmp debri
     const debris = readdirSync(dir).filter((name) => name.includes(".tmp"));
     assert.deepEqual(debris, [], "atomicWrite leaves no tmp residue");
     assert.equal(resolveState(root).state?.classification?.workflow, "spec-preparation", "no partial switch");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("handoff: the shipped route catalogue is typed, complete, and references real profiles/stages", () => {
+  const catalogue = SHIPPED_CATALOGUE;
+  assert.ok(catalogue.length > 0, "the shipped catalogue is not empty");
+  const ids = catalogue.map((route) => route.id);
+  assert.equal(new Set(ids).size, ids.length, "route ids are unique");
+  const keys = catalogue.map((route) => `${route.source_workflow}:${route.source_stage}->${route.target_workflow}`);
+  assert.equal(new Set(keys).size, keys.length, "route keys (source workflow/stage -> target workflow) are unique");
+
+  // Every entry is typed, documented, and points at real shipped stages.
+  for (const route of catalogue) {
+    assert.ok(["enabled", "conditional", "unsupported"].includes(route.disposition), `${route.id} has a valid disposition`);
+    assert.ok(route.description.trim(), `${route.id} carries a human-readable description`);
+    const source = loadProfile(route.source_workflow as never);
+    assert.ok(source, `source profile ${route.source_workflow} exists`);
+    assert.ok(source.stages.some((stage) => stage.id === route.source_stage), `source stage ${route.source_workflow}:${route.source_stage} exists`);
+    const target = loadProfile(route.target_workflow as never);
+    assert.ok(target, `target profile ${route.target_workflow} exists`);
+    assert.ok(target.stages.some((stage) => stage.id === route.target_stage), `target stage ${route.target_workflow}:${route.target_stage} exists`);
+    if (route.disposition !== "enabled") {
+      assert.ok(route.when?.trim(), `${route.id} documents when it may be selected`);
+    }
+  }
+
+  // Policy shape: exactly one enabled route today; the conditional families
+  // and the documented unsupported pairs are all present.
+  const enabled = catalogue.filter((route) => route.disposition === "enabled").map((route) => route.id);
+  assert.deepEqual(enabled, ["spec-handoff->full-feature"], "exactly one enabled route: spec -> full-feature");
+  const conditional = catalogue.filter((route) => route.disposition === "conditional").map((route) => route.id).sort();
+  assert.deepEqual(conditional, [
+    "bug-fix-summary->regression",
+    "debug-cycle-summary->regression",
+    "emergency-summary->regression",
+    "full-feature-summary->regression",
+    "lightweight-summary->regression",
+    "regression-summary->bug-fix",
+    "regression-summary->debug-cycle",
+    "standard-summary->regression",
+  ], "conditional routes match the declared policy families");
+  for (const route of catalogue.filter((entry) => entry.disposition === "conditional")) {
+    assert.ok(Array.isArray(route.blocked_by) && route.blocked_by.length > 0, `${route.id} declares its missing adapter/evidence gaps`);
+    assert.ok(Array.isArray(route.prerequisites) && route.prerequisites.length > 0, `${route.id} declares prerequisites`);
+  }
+  const unsupported = catalogue.filter((route) => route.disposition === "unsupported");
+  const unsupportedPairs = new Set(unsupported.map((route) => `${route.source_workflow}->${route.target_workflow}`));
+  assert.ok(unsupportedPairs.has("spec-preparation->bug-fix"), "spec -> bug-fix is documented unsupported");
+  assert.ok(unsupportedPairs.has("full-feature->debug-cycle"), "feature -> debug-cycle is documented unsupported");
+  assert.ok(unsupportedPairs.has("feature-regression->full-feature"), "regression -> feature is documented unsupported");
+  assert.ok(unsupportedPairs.has("review->full-feature"), "review -> implementation is documented unsupported");
+  assert.ok(unsupportedPairs.has("research->full-feature"), "analysis -> implementation is documented unsupported");
+  assert.ok(unsupported.some((route) => route.source_workflow === route.target_workflow), "same-profile transitions are documented unsupported");
+});
+
+test("handoff: conditional catalogue routes reject deterministically with visible route metadata and unchanged state", () => {
+  const { root, issued, branch, persistedHash } = setupCompletedSource({ workflow: "full-feature", classificationType: "FEATURE" });
+  try {
+    const before = snapshot(root);
+    const result = handoffWorkflow(root, handoffInputFor(issued, branch, persistedHash, { target_workflow: "feature-regression" }));
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.error, /conditional and not enabled/);
+      assert.match(result.error, /full-feature-summary->regression/);
+      assert.match(result.error, /blocking:/);
+      assert.equal(result.route?.id, "full-feature-summary->regression");
+      assert.equal(result.route?.kind, "regression");
+      assert.equal(result.route?.disposition, "conditional");
+      assert.equal(result.route?.source_workflow, "full-feature");
+      assert.equal(result.route?.source_stage, "summary");
+      assert.equal(result.route?.target_workflow, "feature-regression");
+      assert.equal(result.route?.target_stage, "discovery_intake");
+      assert.ok((result.route?.blocked_by ?? []).length > 0, "conditional rejection exposes the missing adapters");
+    }
+    assertUnchanged(root, before);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("handoff: explicitly unsupported catalogue pairs are denied with a human-readable reason", () => {
+  const { root, input } = setupCompletedSpecPreparation();
+  try {
+    const before = snapshot(root);
+    const result = handoffWorkflow(root, { ...input, target_workflow: "bug-fix" });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.error, /unsupported/);
+      assert.match(result.error, /spec-handoff->bug-fix/);
+      assert.equal(result.route?.id, "spec-handoff->bug-fix");
+      assert.equal(result.route?.kind, "unsupported");
+      assert.equal(result.route?.disposition, "unsupported");
+      assert.equal(result.route?.source_workflow, "spec-preparation");
+      assert.equal(result.route?.target_workflow, "bug-fix");
+    }
+    assertUnchanged(root, before);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("handoff: duplicate route ids and duplicate route keys are rejected deterministically at registration", () => {
+  // Id collision with the shipped catalogue (different key) is rejected.
+  assert.throws(
+    () => registerWorkflowHandoffRoute({
+      id: "spec-handoff->full-feature",
+      source_workflow: "spec-preparation",
+      source_stage: "handoff",
+      target_workflow: "research",
+      target_stage: "summary",
+      kind: "unsupported",
+      disposition: "unsupported",
+      description: "duplicate id",
+    }),
+    /handoff route id already registered/,
+  );
+  // Key collision (same source workflow/stage -> target workflow) is rejected.
+  const fresh: HandoffRoute = {
+    id: "dup-key-1",
+    source_workflow: "research",
+    source_stage: "summary",
+    target_workflow: "bug-fix",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "duplicate key fixture",
+  };
+  registerWorkflowHandoffRoute(fresh);
+  assert.throws(
+    () => registerWorkflowHandoffRoute({ ...fresh, id: "dup-key-2" }),
+    /handoff route already registered/,
+  );
+  // Malformed entries (unknown disposition, missing description) are rejected.
+  assert.throws(
+    () => registerWorkflowHandoffRoute({ ...fresh, id: "dup-key-3", disposition: "bogus" as never }),
+    /invalid handoff route registration/,
+  );
+  assert.throws(
+    () => registerWorkflowHandoffRoute({ ...fresh, id: "dup-key-4", description: "" }),
+    /invalid handoff route registration/,
+  );
+});
+
+test("handoff: a registered route whose target stage does not exist in the target profile is rejected", () => {
+  const sourceName = `handoff-stage-src-${fixtureCounter++}`;
+  const targetName = `handoff-stage-tgt-${fixtureCounter++}`;
+  const sourceProfile: Profile = {
+    name: sourceName,
+    title: "Stage-validation source",
+    description: "source with a handoff terminal stage",
+    match: { type: ["SPEC"] },
+    stages: [
+      { id: "spec", title: "Spec", type: "orchestrator" },
+      { id: "handoff", title: "Handoff", type: "orchestrator" },
+    ],
+  };
+  const targetProfile: Profile = {
+    name: targetName,
+    title: "Stage-validation target",
+    description: "target missing the routed entry stage",
+    match: { type: ["FEATURE"] },
+    stages: [{ id: "discovery", title: "Discovery", type: "orchestrator" }],
+  };
+  registerWorkflowProfiles([sourceProfile, targetProfile]);
+  registerWorkflowHandoffRoute({
+    id: `stage-route-${fixtureCounter}`,
+    source_workflow: sourceName,
+    source_stage: "handoff",
+    target_workflow: targetName,
+    target_stage: "does-not-exist",
+    kind: "feature-intake",
+    disposition: "enabled",
+    description: "synthetic route with a missing target stage",
+  });
+
+  const branch = `feat/stage-${fixtureCounter++}`;
+  const root = mkdtempSync(join(tmpdir(), `handoff-stage-${branch.replace(/\//g, "-")}-`));
+  try {
+    initGit(root, branch);
+    const sourceHash = profileHash(sourceProfile);
+    const issued = createCapability({
+      run_key: branch, branch, workflow: sourceName, profile_hash: sourceHash,
+      stage_cursor: "handoff", kind: "none", expected_roster: [],
+    });
+    writeState(root, {
+      schema: 1,
+      branch,
+      run_key: branch,
+      classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: sourceName },
+      task: "stage validation",
+      workflow_override: false,
+      issue: null,
+      stage_cursor: "handoff",
+      stages: sourceProfile.stages.map((s) => ({ id: s.id, status: "done" as const })),
+      artifacts: {},
+      pause: { kind: "done" as const, reason: "" },
+      policy: { strict_orchestrator: true },
+      profile_hash: sourceHash,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      dispatch_capability: { ...issued.state, status: "complete" as const, dispatches: [] },
+      updated_at: new Date().toISOString(),
+    }, { featureSlug: "handoff-test" });
+    mkdirSync(artifactsDirOf(root), { recursive: true });
+    writeApprovalArtifact(root, "workflow_approval", {}, branch, sourceName, "handoff");
+    const before = snapshot(root);
+    const result = handoffWorkflow(root, handoffInputFor(issued, branch, sourceHash, { target_workflow: targetName }));
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error, "target stage is unavailable");
+    assertUnchanged(root, before);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
