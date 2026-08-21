@@ -24,6 +24,24 @@ test("do-work prompt makes workflow tool envelopes and marker source explicit", 
   }
 });
 
+test("do-work prompt specifies the exact flat workflow approval artifact shape", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-approval-shape-prompt-"));
+  try {
+    const prompt = buildDoWorkPrompt(
+      { task: "Prepare a specification", autonomyHint: false, autonomous: false, issue: null, branch: null },
+      root,
+    );
+    assert.match(prompt, /Persist exactly this flat typed `workflow_approval` artifact/);
+    for (const field of ["type", "version", "decision", "run_key", "source_workflow", "source_stage", "actor", "decided_at"]) {
+      assert.match(prompt, new RegExp(`\\b${field}\\b`), `prompt names ${field}`);
+    }
+    assert.match(prompt, /exact `source_workflow` and `source_stage` field names/);
+    assert.match(prompt, /never invented `workflow`\/`stage` aliases/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("do-work prompt binds workflow_complete to the persisted dispatch record id", () => {
   const root = mkdtempSync(join(tmpdir(), "do-work-dispatch-id-prompt-"));
   try {
@@ -54,6 +72,34 @@ test("do-work prompt binds workflow_complete to the persisted dispatch record id
     ]) {
       assert.match(prompt, forbidden);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("do-work prompt requires target capability marker rollover after workflow_handoff", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-target-rollover-prompt-"));
+  try {
+    const prompt = buildDoWorkPrompt(
+      { task: "Continue after an approved handoff", autonomyHint: false, autonomous: false, issue: null, branch: null },
+      root,
+    );
+    const handoffIndex = prompt.indexOf("On success, discard the source envelope");
+    const instructionsIndex = prompt.indexOf("On the target, call `workflow_instructions`");
+    const targetTaskIndex = prompt.indexOf("For every target");
+    const advanceIndex = prompt.indexOf("After every target `workflow_advance`");
+
+    assert.ok(handoffIndex >= 0, "handoff success must enter target continuation");
+    assert.ok(instructionsIndex > handoffIndex, "target instructions follow handoff");
+    assert.ok(targetTaskIndex > instructionsIndex, "target dispatch rules follow target instructions");
+    assert.ok(advanceIndex > targetTaskIndex, "target rollover follows target dispatch rules");
+    assert.match(prompt, /`workflow_handoff` returns a fresh target capability/i);
+    assert.match(prompt, /source credentials(?:,| and) dispatch markers.*invalid immediately/i);
+    assert.match(prompt, /call `workflow_instructions`.*fresh target handoff/i);
+    assert.match(prompt, /For every target .*copy the latest target `handoff\.dispatch_markers\[\]\.marker`.*verbatim.*each role/i);
+    assert.match(prompt, /After every target `workflow_advance`, call `workflow_status`.*`workflow_instructions`/i);
+    assert.match(prompt, /replace the marker.*epoch.*roster.*newly returned values/i);
+    assert.match(prompt, /never retry.*stale source.*previous-stage marker/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
