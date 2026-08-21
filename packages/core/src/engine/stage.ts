@@ -5,6 +5,7 @@
  *   - `orchestrator` -> inline prompt (orientation only, not investigation)
  *   - `single`       -> one `task` call with the resolved agent
  *   - `consilium`    -> parallel `task` calls in one batch (one per role)
+ *   - `document`     -> deterministic engine-rendered document (no agent)
  *   - `bash`         -> deterministic shell step
  *   - `none`         -> skip
  *
@@ -21,11 +22,13 @@
 
 import { buildDispatchMarker } from "../gates/dispatch.js";
 import { execSync } from "node:child_process";
+import { dirname } from "node:path";
 import { persistReturnedArtifacts, readArtifact, writeArtifact } from "./artifacts.js";
 import { resolveConfig } from "./config.js";
 import { resolveScope, applyConditional, type ScopeFlags } from "./scope.js";
 import { evaluatePredicate } from "./predicate.js";
 import { namespacedArtifactId, sanitizeSlot } from "./fan-in.js";
+import { PRD_SOURCE_ARTIFACT_IDS, validateProductPrdDocument, writeProductPrdDocument } from "./product-prd.js";
 import { checkArtifact as validationCheckArtifact, validationGate } from "../gates/validation.js";
 import type { DispatchSlot, Profile, StageDef, TeamState } from "./types.js";
 
@@ -300,6 +303,7 @@ export async function runStage(
 
   const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
 
+
   switch (stage.type) {
     case "orchestrator":
       return runOrchestrator(stage, ctx, produces);
@@ -307,6 +311,8 @@ export async function runStage(
       return runSingle(stage, ctx, produces);
     case "consilium":
       return runConsilium(stage, ctx, produces);
+    case "document":
+      return runProductPrdRender(stage, ctx, produces);
     case "bash":
       return runBash(stage, ctx, produces);
     case "none":
@@ -392,6 +398,53 @@ async function runSingle(stage: StageDef, ctx: StageContext, produces: string[])
   if (persisted.error) return { stageId: stage.id, status: "failed", note: persisted.error, artifacts: produces };
   if (result.exitCode !== 0 || result.pending) return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} returned exit ${result.exitCode}`, artifacts: produces };
   return validateProduced(stage, ctx, produces, `${agent} returned exit 0`);
+}
+
+/**
+ * Executable `document` stage (shipped renderer: product-prd): the engine
+ * itself — not an agent — renders the declared document from the stage's
+ * declared sources and persists both the markdown document and the typed
+ * artifact. Like bash stages this is deterministic engine work: no agent
+ * dispatch and no durable dispatch records — the stage completes through
+ * the normal produced-artifact validation and advance flow.
+ */
+async function runProductPrdRender(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
+  const contract = stage.document;
+  if (!contract) {
+    return { stageId: stage.id, status: "failed", note: "document stage is missing its document declaration", artifacts: produces };
+  }
+  if (contract.format !== "markdown") {
+    return { stageId: stage.id, status: "failed", note: `unsupported document format: ${String(contract.format)}`, artifacts: produces };
+  }
+  if (contract.renderer !== "product-prd") {
+    return { stageId: stage.id, status: "failed", note: `unsupported document renderer: ${String(contract.renderer)}`, artifacts: produces };
+  }
+  const sourceArtifacts: Record<string, unknown> = {};
+  for (const id of PRD_SOURCE_ARTIFACT_IDS) {
+    const artifact = readArtifact(ctx.artifactsDir, id);
+    if (artifact === null) {
+      return { stageId: stage.id, status: "failed", note: `product_prd render: source artifact '${id}.json' not found`, artifacts: produces };
+    }
+    sourceArtifacts[id] = artifact;
+  }
+  const written = writeProductPrdDocument({
+    stateDir: dirname(ctx.artifactsDir),
+    artifactsDir: ctx.artifactsDir,
+    path: contract.path,
+    sourceArtifacts,
+  });
+  if (!written.ok) {
+    return { stageId: stage.id, status: "failed", note: `product_prd render failed: ${written.error}`, artifacts: produces };
+  }
+  // Fail closed on the freshly persisted pair: re-verify the exact manifest
+  // shape, hash agreement, on-disk document bytes and source staleness
+  // BEFORE the produced-artifact validation can mark the stage done.
+  const pair = validateProductPrdDocument({ stateDir: dirname(ctx.artifactsDir), artifactsDir: ctx.artifactsDir });
+  if (!pair.ok) {
+    return { stageId: stage.id, status: "failed", note: `product_prd pair validation failed: ${pair.issues.join("; ")}`, artifacts: produces };
+  }
+  ctx.log(`  product_prd: deterministic render -> ${written.documentPath}`);
+  return validateProduced(stage, ctx, produces, `deterministic product PRD rendered to ${written.documentPath}`);
 }
 
 async function runConsilium(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {

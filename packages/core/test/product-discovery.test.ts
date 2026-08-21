@@ -128,12 +128,13 @@ test("product-discovery: profile ships with the exact stage order and role wirin
       "evidence_and_alternatives",
       "product_critique",
       "product_synthesis",
+      "product_prd_document",
       "product_approval",
       "product_handoff",
     ],
   );
 
-  const [intake, framing, evidence, critique, synthesis, approval, handoff] = profile.stages;
+  const [intake, framing, evidence, critique, synthesis, prdDocument, approval, handoff] = profile.stages;
 
   // product_intake: parallel consilium of the two evidence-gathering roles.
   assert.equal(intake?.type, "consilium");
@@ -165,9 +166,19 @@ test("product-discovery: profile ships with the exact stage order and role wirin
   assert.deepEqual(synthesis?.consumes, ["product_framing", "product_evidence", "product_critique"]);
   assert.equal(synthesis?.produces, "product_spec");
 
+  // product_prd_document: executable document stage — deterministic engine render BEFORE the owner approves.
+  assert.equal(prdDocument?.type, "document");
+  assert.deepEqual(
+    prdDocument?.document,
+    { format: "markdown", renderer: "product-prd", path: "documents/product-prd.md" },
+    "the stage declares the exact shipped document contract",
+  );
+  assert.deepEqual(prdDocument?.consumes, ["product_intake", "product_framing", "product_evidence", "product_critique", "product_spec"]);
+  assert.equal(prdDocument?.produces, "product_prd");
+
   // product_approval: interactive human gate.
   assert.equal(approval?.type, "orchestrator");
-  assert.deepEqual(approval?.consumes, ["product_spec"]);
+  assert.deepEqual(approval?.consumes, ["product_prd", "product_spec"]);
   assert.equal(approval?.checkpoint, "product_approval");
   assert.equal(approval?.gate, "product_approval_recorded");
   assert.equal(approval?.produces, "product_approval_record");
@@ -176,9 +187,9 @@ test("product-discovery: profile ships with the exact stage order and role wirin
   assert.match(approval?.prompt ?? "", /proceed \| needs_more_validation \| defer \| reject/);
   assert.match(approval?.prompt ?? "", /no inferred consent|never self-approve/i);
 
-  // product_handoff: same approval gate, consumes spec + approval record.
+  // product_handoff: same approval gate, consumes the PRD, spec + approval record.
   assert.equal(handoff?.type, "orchestrator");
-  assert.deepEqual(handoff?.consumes, ["product_spec", "product_approval_record"]);
+  assert.deepEqual(handoff?.consumes, ["product_prd", "product_spec", "product_approval_record"]);
   assert.equal(handoff?.gate, "product_approval_recorded");
   assert.equal(handoff?.produces, "product_handoff");
   assert.match(handoff?.prompt ?? "", /spec-preparation.*proceed/i);

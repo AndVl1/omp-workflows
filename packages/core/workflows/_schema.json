@@ -45,8 +45,8 @@
         "id": { "type": "string", "pattern": "^[a-z0-9_]+$", "description": "Unique stage id within the profile. Used as stage_cursor in team-state.json." },
         "title": { "type": "string" },
         "type": {
-          "enum": ["orchestrator", "single", "consilium", "bash", "none", "team"],
-          "description": "orchestrator = main context performs it (no subagent). single = exactly one subagent (role resolved via team.config or scope). consilium = N subagents in parallel (see `roles`). bash = deterministic shell step, no model. none = placeholder/skip. team = each listed team runs its own sub-workflow profile in parallel (CTO sub-orchestration; see `teams`/`profile`/`integration`)."
+          "enum": ["orchestrator", "single", "consilium", "document", "bash", "none", "team"],
+          "description": "orchestrator = main context performs it (no subagent). single = exactly one subagent (role resolved via team.config or scope). consilium = N subagents in parallel (see `roles`). document = deterministic engine-rendered document (see `document`; no model, no dispatch). bash = deterministic shell step, no model. none = placeholder/skip. team = each listed team runs its own sub-workflow profile in parallel (CTO sub-orchestration; see `teams`/`profile`/`integration`)."
         },
         "roles": {
           "type": "array",
@@ -95,6 +95,17 @@
         "command": {
           "type": "string",
           "description": "For bash stages: the deterministic shell command executed by the engine (e.g. 'npm install'). Required for type=bash."
+        },
+        "document": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["format", "renderer", "path"],
+          "description": "For document stages: the executable document contract. The engine itself renders the document — no agent dispatch, no model.",
+          "properties": {
+            "format": { "enum": ["markdown"], "description": "Output format (only markdown is shipped)." },
+            "renderer": { "enum": ["product-prd"], "description": "Renderer selector resolved by the engine to the shipped product-prd renderer; the manifest records the exact renderer id+version." },
+            "path": { "type": "string", "description": "Safe relative path of the rendered document inside the state dir (e.g. 'documents/product-prd.md')." }
+          }
         },
         "fan_in": {
           "type": "object",
