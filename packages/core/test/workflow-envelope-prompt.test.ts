@@ -104,3 +104,22 @@ test("do-work prompt requires target capability marker rollover after workflow_h
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("do-work prompt requires declared artifacts under the returned feature directory", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-artifact-path-prompt-"));
+  const artifactRoot = [".", "work-state"].join("") + "/artifacts";
+  try {
+    const prompt = buildDoWorkPrompt(
+      { task: "Produce a typed implementation artifact", autonomyHint: false, autonomous: false, issue: null, branch: null },
+      root,
+    );
+    assert.match(prompt, /authenticated feature-scoped `state\.artifactsDir`/i);
+    assert.match(prompt, /every producer MUST write each declared artifact under that returned directory/i);
+    assert.match(prompt, /`<artifact_id>\.json`/);
+    assert.match(prompt, /`<artifact_id>-<slot>\.json`/);
+    assert.ok(prompt.includes(`root ${artifactRoot}`), "prompt forbids the root artifact directory");
+    assert.match(prompt, /guess an artifact path/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

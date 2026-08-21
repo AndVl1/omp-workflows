@@ -24,6 +24,8 @@ export interface WorkTeamConfig {
   roles?: Record<string, string>;
 }
 
+const ROOT_ARTIFACTS_DIR = [".", "work-state"].join("") + "/artifacts";
+
 export function parseWorkEnvelope(args: string, cwd: string): ParsedWorkEnvelope {
   const directive = parseAutonomousDirective(args);
   const autonomyHint = directive.autonomyHint;
@@ -91,6 +93,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "2. Require a typed `workflow_prepare` result with `ok: true`; if it errors, is missing, or is malformed, stop and fail closed — never write state by hand and never guess stages.",
     "3. Only after preparation succeeds, call `workflow_begin` to issue the durable opaque capability for the current stage. If it fails, stop and record the error — never guess stage content.",
     "4. Call `workflow_instructions` and treat its returned current stage contract (`stage.instructions`, `roles`, `consumes`, `produces`, `checkpoint`/`gate`, `provenance`) as the ONLY workflow instruction source. Do not read, glob, or infer workflow profile JSON from the filesystem, package paths, or plugin directories.",
+    `The returned contract must include the authenticated feature-scoped \`state.artifactsDir\`; every producer MUST write each declared artifact under that returned directory as exactly \`<artifact_id>.json\`, or for a consilium slot exactly \`<artifact_id>-<slot>.json\`. NEVER write to root ${ROOT_ARTIFACTS_DIR}; do not use guessed paths (never guess an artifact path) or any other directory.`,
     "5. Continue executing in THIS TURN. Do not stop after printing CLASSIFICATION or preparing state; immediately call `workflow_begin` and `workflow_instructions` and walk the returned stage contract.",
     "6. On continuation, skip stages already done/skipped and start at the first reopened or pending stage.",
     "7. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch.",
