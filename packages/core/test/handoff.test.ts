@@ -38,6 +38,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
 import {
+  advanceCursor,
   handoffWorkflow,
   registerWorkflowHandoffRoute,
   handoffRouteCatalogue,
@@ -102,6 +103,28 @@ function writeApprovalArtifact(
     stage,
     actor: "user",
     decided_at: "2026-08-02T00:00:00.000Z",
+    ...overrides,
+  }));
+}
+
+function writeObservedApprovalArtifact(
+  root: string,
+  runKey: string,
+  overrides: Record<string, unknown> = {},
+  sourceWorkflow = "spec-preparation",
+  sourceStage = "handoff",
+): void {
+  const dir = artifactsDirOf(root);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "workflow_approval.json"), JSON.stringify({
+    type: "workflow_approval",
+    version: 1,
+    decision: "approved",
+    run_key: runKey,
+    source_workflow: sourceWorkflow,
+    source_stage: sourceStage,
+    actor: "user",
+    decided_at: "2026-08-21T10:56:09Z",
     ...overrides,
   }));
 }
@@ -400,6 +423,187 @@ test("handoff: success preserves source state and arms the target discovery stag
     assert.equal(classificationToolGate({ toolName: "task" }, { cwd: root }), undefined, "workflow_override + valid autonomy passes the P5 gate");
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("handoff accepts the observed flat source_workflow/source_stage approval shape", () => {
+  const fixture = setupCompletedSpecPreparation();
+  try {
+    const binding = fixture.issued.state.issued_for!;
+    writeObservedApprovalArtifact(fixture.root, binding.run_key, {}, binding.workflow, binding.stage_cursor);
+    const result = handoffWorkflow(fixture.root, fixture.input);
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.audit.route.source_workflow, binding.workflow);
+    assert.equal(result.audit.route.source_stage, binding.stage_cursor);
+    assert.equal(result.audit.target.workflow, fixture.input.target_workflow);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("handoff accepts flat approval after a normal terminal advance without rotating the completed source epoch", () => {
+  const sourceName = `handoff-terminal-src-${fixtureCounter++}`;
+  const sourceProfile: Profile = {
+    name: sourceName,
+    title: "Terminal advance handoff source",
+    description: "normal next-stage and terminal advances before handoff",
+    match: { type: ["SPEC"] },
+    stages: [
+      { id: "prepare", title: "Prepare", type: "orchestrator" },
+      { id: "handoff", title: "Handoff", type: "orchestrator", produces: "spec_handoff" },
+    ],
+  };
+  registerWorkflowProfiles([sourceProfile]);
+  registerWorkflowHandoffRoute({
+    id: `terminal-${sourceName}`,
+    source_workflow: sourceName,
+    source_stage: "handoff",
+    target_workflow: "full-feature",
+    target_stage: "discovery",
+    kind: "feature-intake",
+    disposition: "enabled",
+    description: "Normal terminal advance regression route.",
+  });
+
+  const branch = `feat/terminal-${fixtureCounter++}`;
+  const root = mkdtempSync(join(tmpdir(), `handoff-terminal-${branch.replace(/\//g, "-")}-`));
+  try {
+    initGit(root, branch);
+    const sourceHash = profileHash(sourceProfile);
+    const issued = createCapability({
+      run_key: branch,
+      branch,
+      workflow: sourceName,
+      profile_hash: sourceHash,
+      stage_cursor: "prepare",
+      kind: "none",
+      expected_roster: [],
+    });
+    const sourceEpoch = issued.state.issued_for!.cursor_epoch;
+    writeState(root, {
+      schema: 1,
+      branch,
+      run_key: branch,
+      classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: sourceName },
+      task: "terminal advance handoff regression",
+      history: [{ task: "fixture", at: "2026-08-01T00:00:00.000Z" }],
+      autonomous: false,
+      workflow_override: false,
+      issue: null,
+      stage_cursor: "prepare",
+      stages: sourceProfile.stages.map((stage, index) => ({ id: stage.id, status: index === 0 ? "in_progress" as const : "pending" as const })),
+      artifacts: {},
+      pause: { kind: "none", reason: "" },
+      policy: { strict_orchestrator: true },
+      profile_hash: sourceHash,
+      scope: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null },
+      cursor_epoch: sourceEpoch,
+      dispatch_capability: issued.state,
+      updated_at: new Date().toISOString(),
+    }, { featureSlug: "handoff-test" });
+
+    const nextStage = advanceCursor(root, {
+      token: issued.advance_token,
+      capability_id: issued.capability_id,
+      run_key: branch,
+      branch,
+      workflow: sourceName,
+      profile_hash: sourceHash,
+      stage_cursor: "prepare",
+      cursor_epoch: sourceEpoch,
+      evidence: "prepare completed",
+    });
+    assert.equal(nextStage.ok, true);
+    if (!nextStage.ok || !nextStage.handoff) return;
+    assert.notEqual(nextStage.state.cursor_epoch, sourceEpoch, "a normal next-stage advance rotates the cursor epoch");
+    assert.equal(nextStage.handoff.stage_cursor, "handoff");
+
+    writeFileSync(join(artifactsDirOf(root), "spec_handoff.json"), JSON.stringify({ goal: "terminal advance handoff" }));
+    const terminal = advanceCursor(root, {
+      token: nextStage.handoff.advance_token,
+      capability_id: nextStage.handoff.capability_id,
+      run_key: nextStage.handoff.run_key,
+      branch: nextStage.handoff.branch,
+      workflow: nextStage.handoff.workflow,
+      profile_hash: nextStage.handoff.profile_hash,
+      stage_cursor: nextStage.handoff.stage_cursor,
+      cursor_epoch: nextStage.handoff.cursor_epoch,
+      evidence: "handoff completed",
+    });
+    assert.equal(terminal.ok, true);
+    if (!terminal.ok) return;
+    assert.equal(terminal.handoff, undefined);
+    assert.equal(terminal.state.dispatch_capability?.status, "complete");
+    assert.equal(terminal.state.cursor_epoch, nextStage.handoff.cursor_epoch, "terminal completion preserves the source epoch");
+    assert.equal(terminal.state.dispatch_capability?.issued_for?.cursor_epoch, nextStage.handoff.cursor_epoch);
+
+    writeObservedApprovalArtifact(root, branch, {}, sourceName, "handoff");
+    const handoff = handoffWorkflow(root, {
+      token: nextStage.handoff.advance_token,
+      capability_id: nextStage.handoff.capability_id,
+      run_key: branch,
+      branch,
+      workflow: sourceName,
+      profile_hash: sourceHash,
+      stage_cursor: "handoff",
+      cursor_epoch: nextStage.handoff.cursor_epoch,
+      target_workflow: "full-feature",
+      approval: { kind: "artifact", ref: "workflow_approval", source_stage: "handoff", decision: "approved" },
+      actor: "orchestrator",
+      handoff_context: { artifact_ids: ["spec_handoff"], decision_refs: [], summary: "terminal approval" },
+    });
+    assert.equal(handoff.ok, true, "valid flat workflow approval is accepted after normal terminal advance");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("handoff preserves legacy flat approval compatibility", () => {
+  const fixture = setupCompletedSpecPreparation();
+  try {
+    const result = handoffWorkflow(fixture.root, fixture.input);
+    assert.equal(result.ok, true);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("handoff rejects observed flat approval mismatches without mutation", () => {
+  const mismatches: Array<{ label: string; overrides: Record<string, unknown> }> = [
+    { label: "run_key", overrides: { run_key: "feat/other-run" } },
+    { label: "source_workflow", overrides: { source_workflow: "lightweight" } },
+    { label: "source_stage", overrides: { source_stage: "intake_repo_map" } },
+    { label: "decision", overrides: { decision: "pending" } },
+    { label: "actor", overrides: { actor: "" } },
+    { label: "decided_at", overrides: { decided_at: "not-a-date" } },
+  ];
+  for (const { label, overrides } of mismatches) {
+    const fixture = setupCompletedSpecPreparation();
+    try {
+      const binding = fixture.issued.state.issued_for!;
+      writeObservedApprovalArtifact(fixture.root, binding.run_key, overrides, binding.workflow, binding.stage_cursor);
+      const before = snapshot(fixture.root);
+      const result = handoffWorkflow(fixture.root, fixture.input);
+      assert.equal(result.ok, false, label);
+      if (!result.ok) assert.equal(result.error, "handoff approval evidence is invalid", label);
+      assertUnchanged(fixture.root, before);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
+
+  const targetMismatch = setupCompletedSpecPreparation();
+  try {
+    const binding = targetMismatch.issued.state.issued_for!;
+    writeObservedApprovalArtifact(targetMismatch.root, binding.run_key, {}, binding.workflow, binding.stage_cursor);
+    const before = snapshot(targetMismatch.root);
+    const result = handoffWorkflow(targetMismatch.root, { ...targetMismatch.input, target_workflow: "lightweight" });
+    assert.equal(result.ok, false, "requested target");
+    if (!result.ok) assert.equal(result.error, "workflow transition is not registered");
+    assertUnchanged(targetMismatch.root, before);
+  } finally {
+    rmSync(targetMismatch.root, { recursive: true, force: true });
   }
 });
 

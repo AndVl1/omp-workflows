@@ -792,7 +792,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
     nextStage = candidate;
     break;
   }
-  const epoch = randomUUID();
+  const epoch = nextStage ? randomUUID() : cap.issued_for.cursor_epoch;
   let handoffSecrets: { capability_id: string; dispatch_token: string; advance_token: string } | undefined;
   let nextCap: NonNullable<TeamState["dispatch_capability"]>;
   if (nextStage) {
@@ -1589,10 +1589,62 @@ function isApprovalStringArray(value: unknown): value is string[] {
 }
 
 /**
+ * Normalize the flat approval shapes accepted by the handoff contract. New
+ * artifacts use `source_workflow`/`source_stage`; `workflow`/`stage` remains
+ * accepted only for legacy artifacts. Every source field is compared with the
+ * authenticated capability, canonical state and registered route, while the
+ * requested target is bound to that route.
+ */
+function normalizeFlatWorkflowApproval(
+  value: unknown,
+  input: HandoffWorkflowInput,
+  state: TeamState,
+  cap: ActiveCapability,
+  route: HandoffRoute,
+): NormalizedNestedApproval | null {
+  const record = asApprovalRecord(value);
+  if (
+    !record ||
+    record.type !== "workflow_approval" ||
+    record.version !== 1 ||
+    record.decision !== "approved" ||
+    record.run_key !== cap.issued_for.run_key ||
+    route.source_workflow !== cap.issued_for.workflow ||
+    route.source_stage !== cap.issued_for.stage_cursor ||
+    route.target_workflow !== input.target_workflow ||
+    (state.run_key ?? state.branch) !== cap.issued_for.run_key ||
+    state.branch !== cap.issued_for.branch ||
+    state.classification?.workflow !== cap.issued_for.workflow ||
+    state.stage_cursor !== cap.issued_for.stage_cursor ||
+    state.cursor_epoch !== cap.issued_for.cursor_epoch ||
+    state.profile_hash !== cap.issued_for.profile_hash
+  ) return null;
+
+  const hasObservedSource = "source_workflow" in record || "source_stage" in record;
+  const hasLegacySource = "workflow" in record || "stage" in record;
+  if (hasObservedSource && hasLegacySource) return null;
+  const sourceWorkflow = hasObservedSource ? record.source_workflow : record.workflow;
+  const sourceStage = hasObservedSource ? record.source_stage : record.stage;
+  if (
+    typeof sourceWorkflow !== "string" ||
+    typeof sourceStage !== "string" ||
+    sourceWorkflow !== cap.issued_for.workflow ||
+    sourceWorkflow !== route.source_workflow ||
+    sourceStage !== cap.issued_for.stage_cursor ||
+    sourceStage !== input.stage_cursor ||
+    sourceStage !== route.source_stage ||
+    !isNonEmptyApprovalString(record.actor) ||
+    typeof record.decided_at !== "string" ||
+    !record.decided_at.trim() ||
+    Number.isNaN(Date.parse(record.decided_at))
+  ) return null;
+  return { actor: record.actor.trim() };
+}
+
+/**
  * Normalize the observed nested approval shape only after binding every
  * security-relevant field to the authenticated source capability, state,
- * route and caller input. The flat artifact shape is intentionally handled
- * by the legacy branch in validateHandoffApproval and remains unchanged.
+ * route and caller input.
  */
 function normalizeNestedWorkflowApproval(
   value: unknown,
@@ -1692,17 +1744,7 @@ function validateHandoffApproval(
     if (typeof ref !== "string" || !isSafeStateSegment(ref)) return "handoff approval evidence is invalid";
     const value = readArtifact(artifactsDir, ref);
     if (!value || typeof value !== "object" || Array.isArray(value)) return "handoff approval evidence is missing";
-    const record = value as Record<string, unknown>;
-    if (record.type === "workflow_approval" && record.version === 1 && record.decision === "approved") {
-      if (record.run_key !== (state.run_key ?? state.branch) || record.workflow !== state.classification?.workflow || record.stage !== route.source_stage) {
-        return "handoff approval evidence is invalid";
-      }
-      if (typeof record.actor !== "string" || !record.actor.trim()) return "handoff approval evidence is invalid";
-      if (typeof record.decided_at !== "string" || !record.decided_at.trim() || Number.isNaN(Date.parse(record.decided_at))) {
-        return "handoff approval evidence is invalid";
-      }
-      return null;
-    }
+    if (normalizeFlatWorkflowApproval(value, input, state, cap, route)) return null;
     return normalizeNestedWorkflowApproval(value, ref, input, state, cap, route)
       ? null
       : "handoff approval evidence is invalid";
