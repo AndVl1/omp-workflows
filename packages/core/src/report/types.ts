@@ -110,6 +110,11 @@ export interface StageInfo {
   /** Autonomous branch decision text from the workflow profile (checkpoint auto-decision). */
   autonomous?: string;
   /**
+   * Executable document contract for `document` stages — typed metadata
+   * only (format/renderer/path). Never the rendered document content.
+   */
+  document?: { format: string; renderer: string; path: string };
+  /**
    * Bounded, RECONSTRUCTED preview of the stage prompt — NEVER the literal
    * runtime prompt (per-stage task text is generated dynamically by the
    * agent run and is not persisted). Assembled deterministically from the

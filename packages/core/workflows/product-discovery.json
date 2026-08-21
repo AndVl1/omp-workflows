@@ -1,0 +1,87 @@
+{
+  "$schema": "./_schema.json",
+  "name": "product-discovery",
+  "title": "Product discovery",
+  "description": "Evidence-first product discovery for PRODUCT_DISCOVERY requests. Produces a human-approved product direction and never modifies application code. Always ends in an interactive product-owner approval; autonomous product discovery fails closed at classification.",
+  "match": { "type": ["PRODUCT_DISCOVERY"] },
+  "stages": [
+    {
+      "id": "product_intake",
+      "title": "Product intake",
+      "type": "consilium",
+      "roles": ["product-analyst", "product-researcher"],
+      "parallel": true,
+      "prompt": "Normalize the product request into a product_intake artifact: problem statements, context, stakeholders, constraints, open questions, and an evidence list. This is a parallel consilium slot: write your OWN slot-scoped product_intake artifact and the engine deterministically merges both roles' contributions — every content field is an ARRAY because strict fan-in concatenates arrays and blocks divergent scalars. Never write a single scalar problem_statement/context. DO NOT edit, create, or modify any application code or repository files. DO NOT fabricate data or invent sources: every evidence item carries status verified|assumption|unknown with its source, and 'unknown'/'TBD' is an allowed explicit array entry — never guess. Output the EXACT product_intake schema: problem_statements (array of strings), contexts (array of strings), stakeholders (array of strings), constraints (array of strings), open_questions (array of strings), evidence (array of { claim: string, status: verified|assumption|unknown, source: string }).",
+      "produces": "product_intake"
+    },
+    {
+      "id": "problem_framing",
+      "title": "Problem framing",
+      "type": "single",
+      "role": "product-analyst",
+      "prompt": "Frame the problem from the merged product_intake: derive the problem_restatement from the problem_statements array, draw business context from the contexts array, name target users, define success criteria and non-goals, and list framing assumptions. Keep verified facts distinct from assumptions — trace every assumption to intake evidence or mark it explicitly as an assumption. DO NOT fabricate data, sources, or requirements: 'unknown' is an allowed explicit entry — never guess. DO NOT propose implementation solutions, APIs, or architecture, and DO NOT edit any files. Output the EXACT product_framing schema: problem_restatement (string), target_users (array of strings; 'unknown' allowed), success_criteria (array of strings), non_goals (array of strings), assumptions (array of strings).",
+      "consumes": ["product_intake"],
+      "produces": "product_framing"
+    },
+    {
+      "id": "evidence_and_alternatives",
+      "title": "Evidence and alternatives",
+      "type": "single",
+      "role": "product-researcher",
+      "prompt": "Research the product domain with read-only tools (read, glob, grep, bash, web_search): gather evidence supporting or refuting the framing, identify evidence gaps, and enumerate product alternatives with pros/cons. Preserve the verified|assumption|unknown status of every claim with its source; never fabricate data or sources. DO NOT implement anything and DO NOT touch application code. Output the EXACT product_evidence schema: evidence (array of { claim: string, status: verified|assumption|unknown, source: string }), alternatives (array of { id: string, summary: string, pros: array of strings, cons: array of strings }), gaps (array of strings).",
+      "consumes": ["product_framing"],
+      "produces": "product_evidence"
+    },
+    {
+      "id": "product_critique",
+      "title": "Product critique",
+      "type": "single",
+      "role": "product-critic",
+      "prompt": "Critically review the framing and evidence as a product skeptic: challenge assumptions, test evidence strength, surface missing alternatives and framing errors. The verdict is exactly one of proceed|needs_more_validation|defer|reject — never soften critique to be agreeable and never fabricate findings. DO NOT edit files and DO NOT propose implementation. Output the EXACT product_critique schema: verdict (enum proceed|needs_more_validation|defer|reject), findings (array of strings), blocking_gaps (array of strings).",
+      "consumes": ["product_framing", "product_evidence"],
+      "produces": "product_critique"
+    },
+    {
+      "id": "product_synthesis",
+      "title": "Product synthesis",
+      "type": "single",
+      "role": "product-strategist",
+      "prompt": "Synthesize framing, evidence and critique into a product recommendation: value proposition, opportunity, target users, solution direction (product-level, NOT implementation), success metrics, guardrail metrics, scope, anti-scope, risks, validation plan, an evidence trace mapping every claim to verified|assumption|unknown evidence, and open product decisions. Every product-level concept is REQUIRED — represent unknown/TBD concepts with explicit 'unknown'/'TBD' entries or the string 'unknown', never by omitting the field. The recommendation is exactly one of proceed|needs_more_validation|defer|reject. This stage is READ-ONLY: it must not edit, create, or modify any application or repository files. DO NOT produce APIs, architecture, code, or file changes. DO NOT fabricate data, sources, or requirements: preserve the verified|assumption|unknown status of every claim. Output the EXACT product_spec schema: recommendation (enum proceed|needs_more_validation|defer|reject), value_proposition (string), opportunity (string), target_users (array of strings), solution_direction (string), success_metrics (array of strings), guardrail_metrics (array of strings), scope (array of strings), anti_scope (array of strings), risks (array of strings), validation_plan (array of strings), evidence_trace (array of strings), open_decisions (array of strings).",
+      "consumes": ["product_framing", "product_evidence", "product_critique"],
+      "produces": "product_spec"
+    },
+    {
+      "id": "product_prd_document",
+      "title": "Product PRD document",
+      "type": "document",
+      "document": {
+        "format": "markdown",
+        "renderer": "product-prd",
+        "path": "documents/product-prd.md"
+      },
+      "prompt": "Render the deterministic Markdown product PRD from the five source artifacts (product_intake, product_framing, product_evidence, product_critique, product_spec) via the engine renderer: identical sources always render byte-identical Markdown, and the sha256 source/content hashes plus the safe relative document path are recorded in the typed product_prd artifact. The renderer emits the human-first order: executive summary, then product direction, then critique, evidence, problem framing and intake, then document metadata. Explicit unknowns stay visible — 'unknown'/'TBD' values are rendered verbatim, never silently omitted. DO NOT edit, create, or modify any application or repository files. DO NOT fabricate data or sources: preserve the verified|assumption|unknown status of every claim. This stage is deterministic engine work, not judgment work — never hand-write the document. Output the EXACT product_prd schema: { type, format, renderer, path, source_artifacts, source_hash, content_hash, content }.",
+      "consumes": ["product_intake", "product_framing", "product_evidence", "product_critique", "product_spec"],
+      "produces": "product_prd"
+    },
+    {
+      "id": "product_approval",
+      "title": "Product approval",
+      "type": "orchestrator",
+      "checkpoint": "product_approval",
+      "autonomous": "never auto-approve: product approval requires an interactive human decision; autonomous product discovery is rejected before this workflow starts (fail closed).",
+      "prompt": "Present the product_spec to the product owner and record their decision via workflow_checkpoint with mode=interactive. The decision MUST be exactly one of: proceed | needs_more_validation | defer | reject. No inferred consent: if the owner has not explicitly chosen, record nothing. DO NOT fabricate the owner decision or evidence: preserve the verified|assumption|unknown status of every claim. This stage is READ-ONLY: do not edit, create, or modify any application or repository files. Then write the EXACT product_approval_record artifact: decision (enum proceed|needs_more_validation|defer|reject), approved_by (the human product owner), rationale (string), decided_at (ISO-8601). This approval is interactive-only — never self-approve.",
+      "consumes": ["product_prd", "product_spec"],
+      "gate": "product_approval_recorded",
+      "produces": "product_approval_record"
+    },
+    {
+      "id": "product_handoff",
+      "title": "Product handoff",
+      "type": "orchestrator",
+      "prompt": "Assemble the product_handoff artifact from product_spec and product_approval_record. next_workflow is 'spec-preparation' ONLY when decision == 'proceed'; for needs_more_validation | defer | reject it MUST be 'none' with a blocked_reason. product_spec_artifact names the approved spec artifact ('product_spec'); instructions tell the next workflow what to spec and what evidence to preserve. DO NOT fabricate the decision or evidence: preserve the verified|assumption|unknown status of every claim. DO NOT edit, create, or modify any application or repository files. State explicitly that no application or repository files were changed by this workflow. Output the EXACT product_handoff schema: decision (enum proceed|needs_more_validation|defer|reject), next_workflow (enum spec-preparation|none), product_spec_artifact (string), instructions (string), blocked_reason (string; required when decision != proceed).",
+      "consumes": ["product_prd", "product_spec", "product_approval_record"],
+      "gate": "product_approval_recorded",
+      "produces": "product_handoff"
+    }
+  ]
+}

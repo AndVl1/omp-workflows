@@ -568,6 +568,14 @@ test("do-work: declared stage description/checkpoint/gate/autonomous flow into p
           role: "qa",
           produces: "tidy",
         },
+        {
+          id: "render_prd",
+          title: "Render PRD",
+          type: "document",
+          document: { format: "markdown", renderer: "product-prd", path: "documents/product-prd.md" },
+          consumes: ["design"],
+          produces: "product_prd",
+        },
       ],
     },
   ]);
@@ -579,6 +587,7 @@ test("do-work: declared stage description/checkpoint/gate/autonomous flow into p
       stages: [
         { id: "design", status: "done" },
         { id: "tidy", status: "pending" },
+        { id: "render_prd", status: "in_progress" },
       ],
     });
     writeFeature(cwd, "session-report", state);
@@ -595,12 +604,19 @@ test("do-work: declared stage description/checkpoint/gate/autonomous flow into p
     assert.deepEqual(design?.agents, [{ name: "architect", role: "architect", source: "workflow" }]);
     assert.deepEqual(design?.outputs, ["design"]);
 
+    // Document stages carry their typed document contract verbatim —
+    // metadata only, never rendered content.
+    const renderPrd = report.stages.find((s) => s.id === "render_prd");
+    assert.deepEqual(renderPrd?.document, { format: "markdown", renderer: "product-prd", path: "documents/product-prd.md" });
+    assert.deepEqual(renderPrd?.outputs, ["product_prd"]);
+
     // Undeclared fields stay absent — even on a profile-backed stage.
     const tidy = report.stages.find((s) => s.id === "tidy");
     assert.equal(tidy?.description, undefined);
     assert.equal(tidy?.checkpoint, undefined);
     assert.equal(tidy?.gate, undefined);
     assert.equal(tidy?.autonomous, undefined);
+    assert.equal(tidy?.document, undefined);
     assert.deepEqual(tidy?.outputs, ["tidy"]);
   } finally {
     rmSync(cwd, { recursive: true, force: true });

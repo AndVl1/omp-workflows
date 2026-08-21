@@ -8,7 +8,7 @@
 import type { AgentMappingState } from "./agent-mapping.js";
 import type { ObservabilityPointer } from "../observability/events.js";
 
-export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "SPEC" | "REGRESS" | "INVESTIGATION" | "REVIEW" | "HOTFIX";
+export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "SPEC" | "REGRESS" | "INVESTIGATION" | "REVIEW" | "HOTFIX" | "PRODUCT_DISCOVERY";
 export type Complexity = "QUICK" | "MEDIUM" | "COMPLEX" | "CRITICAL";
 export type Confidence = "HIGH" | "MEDIUM" | "LOW";
 export type WorkflowName =
@@ -22,10 +22,11 @@ export type WorkflowName =
   | "review"
   | "spec-preparation"
   | "feature-regression"
+  | "product-discovery"
   | "cto"
   | (string & {});
 
-export type StageType = "orchestrator" | "single" | "consilium" | "bash" | "none" | "team";
+export type StageType = "orchestrator" | "single" | "consilium" | "document" | "bash" | "none" | "team";
 
 export type StageStatus = "pending" | "in_progress" | "done" | "skipped" | "failed";
 
@@ -92,6 +93,19 @@ export interface StageDef {
   autonomous?: string;
   /** Bash stages: the deterministic shell command to execute. */
   command?: string;
+  /**
+   * For document stages: the executable document contract. The engine —
+   * not an agent — renders the declared document (see engine/product-prd.ts
+   * for the shipped product-prd renderer).
+   */
+  document?: {
+    /** Output format; only "markdown" is shipped. */
+    format: string;
+    /** Renderer selector; only "product-prd" is shipped. */
+    renderer: string;
+    /** Safe relative path of the document inside the state dir. */
+    path: string;
+  };
   /**
    * Explicit consilium fan-in resolutions: documented, deliberate handling
    * of schema-required scalar disagreements for this stage's produces. A
@@ -375,6 +389,10 @@ export const DEFAULT_ROLES: RoleConfig["roles"] = {
   "code-reviewer": "code-reviewer",
   "security-tester": "security-tester",
   devops: "devops",
+  "product-analyst": "product-analyst",
+  "product-researcher": "product-researcher",
+  "product-critic": "product-critic",
+  "product-strategist": "product-strategist",
 };
 
 export const DEFAULT_SCOPE_MAP: RoleConfig["scope_map"] = [

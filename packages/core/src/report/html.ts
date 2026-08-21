@@ -283,7 +283,9 @@ function renderStageNode(s: SessionReport["stages"][number], derived: boolean, r
 // main screen; expanded it reveals, in place:
 //   - the global session task (report.meta.task — never a stage-specific task),
 //   - the stage's optional profile metadata (description/checkpoint/gate/
-//     autonomous — consumed from the shared optional StageInfo contract),
+//     autonomous/document — consumed from the shared optional StageInfo
+//     contract; `document` renders its typed format/renderer/path contract
+//     only, never the rendered document content),
 //   - agents/source, declared inputs and outputs,
 //   - compact artifact summaries for input/output ids (status, type/keys,
 //     bounded summary, and an in-page anchor to the matching artifact card
@@ -315,6 +317,9 @@ function renderStageDetails(s: SessionReport["stages"][number], report: SessionR
   if (s.checkpoint) pushRow("Checkpoint", esc(s.checkpoint));
   if (s.gate) pushRow("Gate", esc(s.gate));
   if (s.autonomous !== undefined && s.autonomous !== "") pushRow("Autonomous", esc(s.autonomous));
+  if (s.document) {
+    pushRow("Document", `${esc(s.document.format)} · ${esc(s.document.renderer)} · <code>${esc(s.document.path)}</code>`);
+  }
   pushRow("Agents", esc(agentSummary(s.agents)));
 
   // CTO team stages: pull the linked report.teams record (bare id) so the
