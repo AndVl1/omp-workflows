@@ -26,6 +26,8 @@ export interface WorkflowStageContract {
   /** Artifact ids each dispatch slot must write before completion. */
   slot_artifacts: Record<string, string[]>;
   checkpoint: string | null; autonomous: string | null; gate: string | null; skip_if: string | null; loop: StageDef["loop"] | null;
+  /** Executable document contract for `document` stages; null otherwise. */
+  document: StageDef["document"] | null;
   dispatch: { permitted: boolean; kind: "single" | "consilium" | null; expected_count: number; capability_id: string | null; cursor_epoch: string | null };
   instructions: string;
   provenance: { source: "workflow"; profilePath: string | null; profileHash: string; stageHash: string };
@@ -124,6 +126,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     artifact_schemas: artifactSchemasFor(stage),
     slot_artifacts: slotArtifactsFor(stage, roleAgents),
     checkpoint: stage.checkpoint ?? null, autonomous: stage.autonomous ?? null, gate: stage.gate ?? null, skip_if: stage.skip_if ?? null, loop: stage.loop ?? null,
+    document: stage.document ?? null,
     dispatch: { permitted: dispatchAllowed, kind, expected_count: capability?.expected_count ?? slots.length, capability_id: capability?.capability_id ?? null, cursor_epoch: state?.cursor_epoch ?? null },
     instructions: instructions(stage, options.maxInstructions ?? 4000),
     provenance: { source: "workflow", profilePath: path, profileHash: pHash, stageHash: hash(stage) },

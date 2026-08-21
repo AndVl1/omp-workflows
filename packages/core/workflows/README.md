@@ -42,6 +42,7 @@ Borrowed from harnest. Every stage is exactly one of:
 | `orchestrator` | Main context performs it directly (no subagent). E.g. discovery, summary, clarifying questions. |
 | `single` | Exactly one subagent. Role resolved via `.omp/team.config.json` (fallback: legacy `.claude/team.config.json`) or file scope. |
 | `consilium` | N subagents in parallel (`roles[]`). E.g. exploration, architecture options, review. |
+| `document` | Deterministic engine-rendered document (see the `document` field: format/renderer/path). No model, no dispatch — the engine renders at the advance boundary. |
 | `bash` | Deterministic shell step, no model. |
 | `none` | Placeholder / skip. |
 
@@ -117,7 +118,7 @@ launching agents if `team-state.json`'s `workflow` does not match its `classific
    - **read** every artifact id in `consumes` from `.work-state/artifacts/<id>.json` and
      thread relevant content into subagent prompts (no pasted prose — P2).
    - **run** per `type`: orchestrator (inline), single (one Task), consilium (parallel Tasks),
-     bash (shell), none (skip). For `consilium`, apply `conditional[]` against scope flags to
+     document (engine render at advance), bash (shell), none (skip). For `consilium`, apply `conditional[]` against scope flags to
      adjust the roster.
    - **resolve roles → agents**: agent name from `.omp/team.config.json` `roles` (P6), falling back to built-in defaults and legacy `.claude/team.config.json`. Model capability is set by agent frontmatter and OMP policy — low-tier agents use `@smol` + `thinkingLevel: medium`, middle-tier use `@task` + `thinkingLevel: auto`, high-tier use `@slow` + `thinkingLevel: high`. Concrete models are configured via OMP `modelRoles` or `task.agentModelOverrides`, not in workflow config.
    - **checkpoint**: interactive → stop and wait; autonomous → apply `autonomous` decision + log.

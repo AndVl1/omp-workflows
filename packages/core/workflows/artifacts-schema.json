@@ -289,6 +289,22 @@
         "open_decisions": { "type": "array", "items": { "type": "string" }, "description": "Product decisions still open for the owner; empty when none." }
       }
     },
+    "product_prd": {
+      "type": "object",
+      "description": "Deterministic Markdown product PRD rendered by the engine from the five product-discovery source artifacts. Exact manifest fields — no extras, none missing. content is the rendered markdown; content_hash is sha256 of it and of the document file bytes; source_hash is the deterministic key-order-independent hash of the five source artifacts at render time (stale sources are detected by re-hashing).",
+      "additionalProperties": false,
+      "required": ["type", "format", "renderer", "path", "source_artifacts", "source_hash", "content_hash", "content"],
+      "properties": {
+        "type": { "enum": ["product_prd"] },
+        "format": { "enum": ["markdown"] },
+        "renderer": { "type": "string", "description": "Renderer identity/version, e.g. 'product-prd-renderer@1'." },
+        "path": { "type": "string", "description": "Safe relative path of the markdown document inside the state dir." },
+        "source_artifacts": { "type": "array", "items": { "type": "string" }, "description": "The five source artifact ids in fixed order." },
+        "source_hash": { "type": "string", "description": "sha256 of the canonical serialization of the five source artifacts at render time." },
+        "content_hash": { "type": "string", "description": "sha256 of the rendered markdown (hex)." },
+        "content": { "type": "string", "description": "The full rendered markdown; must equal the document file bytes." }
+      }
+    },
     "product_approval_record": {
       "type": "object",
       "description": "Durable record of the human product-owner approval. Interactive only — product approval is never auto-approved or inferred; the decision must be exactly one of proceed|needs_more_validation|defer|reject, recorded via workflow_checkpoint with mode=interactive.",

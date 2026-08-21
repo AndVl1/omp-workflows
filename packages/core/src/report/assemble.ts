@@ -163,19 +163,21 @@ function isUnresolvedTemplateRole(role: string): boolean {
 /**
  * Optional profile metadata copied verbatim from `StageDef` — the stage
  * detail the renderer shows under a disclosure. Only declared fields with
- * non-empty values are emitted; custom/legacy stages (no def) keep all four
- * fields absent. Profile/config metadata only — never raw prompts, event
- * data, or unbounded artifact content.
+ * non-empty values are emitted; custom/legacy stages (no def) keep every
+ * field absent. Profile/config metadata only — never raw prompts, event
+ * data, unbounded artifact content, or rendered document bodies (the
+ * `document` entry carries the typed format/renderer/path contract only).
  */
 function stageProfileMeta(
   def: StageDef | undefined,
-): Partial<Pick<StageInfo, "description" | "checkpoint" | "gate" | "autonomous">> {
+): Partial<Pick<StageInfo, "description" | "checkpoint" | "gate" | "autonomous" | "document">> {
   if (!def) return {};
   return {
     ...(def.description ? { description: def.description } : {}),
     ...(def.checkpoint ? { checkpoint: def.checkpoint } : {}),
     ...(def.gate ? { gate: def.gate } : {}),
     ...(def.autonomous ? { autonomous: def.autonomous } : {}),
+    ...(def.document ? { document: def.document } : {}),
   };
 }
 

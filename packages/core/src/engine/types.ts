@@ -26,7 +26,7 @@ export type WorkflowName =
   | "cto"
   | (string & {});
 
-export type StageType = "orchestrator" | "single" | "consilium" | "bash" | "none" | "team";
+export type StageType = "orchestrator" | "single" | "consilium" | "document" | "bash" | "none" | "team";
 
 export type StageStatus = "pending" | "in_progress" | "done" | "skipped" | "failed";
 
@@ -93,6 +93,19 @@ export interface StageDef {
   autonomous?: string;
   /** Bash stages: the deterministic shell command to execute. */
   command?: string;
+  /**
+   * For document stages: the executable document contract. The engine —
+   * not an agent — renders the declared document (see engine/product-prd.ts
+   * for the shipped product-prd renderer).
+   */
+  document?: {
+    /** Output format; only "markdown" is shipped. */
+    format: string;
+    /** Renderer selector; only "product-prd" is shipped. */
+    renderer: string;
+    /** Safe relative path of the document inside the state dir. */
+    path: string;
+  };
   /**
    * Explicit consilium fan-in resolutions: documented, deliberate handling
    * of schema-required scalar disagreements for this stage's produces. A

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { loadProfile, profileHash } from "./profile.js";
 import { resolveState, writeState, isSafeStateSegment, resolveActiveBranch, type ResolvedState } from "./state.js";
 import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole } from "./config.js";
@@ -29,6 +29,7 @@ import {
   type ArtifactContractPolicy,
 } from "./artifact-contract.js";
 import type { CheckpointDecision, DispatchCompletion, DispatchRecord, LoopState, TeamState, StageDef } from "./types.js";
+import { PRD_SOURCE_ARTIFACT_IDS, writeProductPrdDocument } from "./product-prd.js";
 
 export type DispatchAuth = {
   token: string;
@@ -124,6 +125,14 @@ const activeCapability = (value: TeamState["dispatch_capability"]): ActiveCapabi
   return value as ActiveCapability;
 };
 
+/** Issued capability secrets plus the persisted capability state (see createCapability). */
+export type IssuedCapability = {
+  capability_id: string;
+  dispatch_token: string;
+  advance_token: string;
+  state: NonNullable<TeamState["dispatch_capability"]>;
+};
+
 export type TransitionResult = { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff } | { ok: false; error: string; state?: TeamState };
 
 export interface CapabilityHandoff {
@@ -191,7 +200,7 @@ export function createCapability(input: {
   run_key: string; branch: string; workflow: TeamState["classification"]["workflow"]; profile_hash: string;
   stage_cursor: string; cursor_epoch?: string; kind: "none" | "single" | "consilium"; expected_roles?: string[];
   dispatch_secret?: string; advance_secret?: string; expected_roster?: Array<{ role: string; agent: string }>;
-}): { capability_id: string; dispatch_token: string; advance_token: string; state: NonNullable<TeamState["dispatch_capability"]> } {
+}): IssuedCapability {
   if (!input.run_key || !input.branch || !input.workflow || !input.profile_hash || !input.stage_cursor) throw new Error("invalid capability binding");
   const cursor_epoch = input.cursor_epoch ?? randomUUID();
   const dispatch_token = input.dispatch_secret ?? randomUUID();
@@ -203,12 +212,7 @@ export function createCapability(input: {
   const state = { capability_id: randomUUID(), dispatch_token_hash: hash(dispatch_token), advance_token_hash: hash(advance_token), issued_for: { run_key: input.run_key, branch: input.branch, workflow: input.workflow, profile_hash: input.profile_hash, stage_cursor: input.stage_cursor, cursor_epoch }, kind: input.kind, expected_roles, expected_count: roster.length, expected_roster: roster, status: "ready" as const, dispatches: [] };
   return { capability_id: state.capability_id, dispatch_token, advance_token, state };
 }
-function reissueActiveCapability(cap: ActiveCapability): {
-  capability_id: string;
-  dispatch_token: string;
-  advance_token: string;
-  state: NonNullable<TeamState["dispatch_capability"]>;
-} {
+function reissueActiveCapability(cap: ActiveCapability): IssuedCapability {
   const dispatch_token = randomUUID();
   const advance_token = randomUUID();
   return {
@@ -898,6 +902,37 @@ function validateStageCompletion(
   return { ok: true, notes };
 }
 
+/**
+ * Executable `document` stage render at the durable advance boundary: the
+ * engine — not an agent — renders the declared document from the stage's
+ * declared sources and persists the document plus the typed artifact.
+ * Fail-closed: a missing source, an unsupported contract or an unsafe
+ * path blocks the transition before anything is marked done.
+ */
+function renderStageDocument(stage: StageDef, target: ResolvedState): { ok: true } | { ok: false; error: string } {
+  const contract = stage.document;
+  if (!contract) return { ok: false, error: `document stage '${stage.id}' is missing its document declaration` };
+  if (contract.format !== "markdown" || contract.renderer !== "product-prd") {
+    return { ok: false, error: `document stage '${stage.id}' declares an unsupported document contract (format '${contract.format}', renderer '${contract.renderer}')` };
+  }
+  const artifactsDir = target.artifactsDir;
+  if (!artifactsDir) return { ok: false, error: `document stage '${stage.id}': artifacts dir unavailable` };
+  const sourceArtifacts: Record<string, unknown> = {};
+  for (const id of PRD_SOURCE_ARTIFACT_IDS) {
+    const artifact = readArtifact(artifactsDir, id);
+    if (artifact === null) return { ok: false, error: `document stage '${stage.id}': source artifact '${id}.json' not found` };
+    sourceArtifacts[id] = artifact;
+  }
+  const written = writeProductPrdDocument({
+    stateDir: dirname(artifactsDir),
+    artifactsDir,
+    path: contract.path,
+    sourceArtifacts,
+  });
+  if (!written.ok) return { ok: false, error: `document stage '${stage.id}' render failed: ${written.error}` };
+  return { ok: true };
+}
+
 export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResult {
   const found = current(cwd);
   if (!found) return { ok: false, error: "state not found" };
@@ -973,6 +1008,15 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
     );
     if (!synthesized.ok) return { ok: false, error: synthesized.error, state };
     state = synthesized.state;
+  }
+
+  // Executable document stage: the engine renders the declared document
+  // from the stage's declared sources BEFORE the completion validation
+  // commits the transition — the native /do-work path never depends on an
+  // agent having rendered it, and a failed render fails the advance closed.
+  if (currentStage.type === "document") {
+    const rendered = renderStageDocument(currentStage, target);
+    if (!rendered.ok) return { ok: false, error: rendered.error, state };
   }
 
   // Stage completion validation: consumes, produces, schema contracts, the
