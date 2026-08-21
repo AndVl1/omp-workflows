@@ -297,7 +297,7 @@
       "properties": {
         "type": { "enum": ["product_prd"] },
         "format": { "enum": ["markdown"] },
-        "renderer": { "type": "string", "description": "Renderer identity/version, e.g. 'product-prd-renderer@1'." },
+        "renderer": { "type": "string", "description": "Renderer identity/version, e.g. 'product-prd-renderer@2'." },
         "path": { "type": "string", "description": "Safe relative path of the markdown document inside the state dir." },
         "source_artifacts": { "type": "array", "items": { "type": "string" }, "description": "The five source artifact ids in fixed order." },
         "source_hash": { "type": "string", "description": "sha256 of the canonical serialization of the five source artifacts at render time." },
