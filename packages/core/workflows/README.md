@@ -42,7 +42,7 @@ Borrowed from harnest. Every stage is exactly one of:
 | `orchestrator` | Main context performs it directly (no subagent). E.g. discovery, summary, clarifying questions. |
 | `single` | Exactly one subagent. Role resolved via `.omp/team.config.json` (fallback: legacy `.claude/team.config.json`) or file scope. |
 | `consilium` | N subagents in parallel (`roles[]`). E.g. exploration, architecture options, review. |
-| `document` | Deterministic engine-rendered document (see the `document` field: format/renderer/path). No model, no dispatch — the engine renders at the advance boundary. |
+| `document` | Deterministic engine-rendered document (see the `document` field: format/renderer/path). No model, no dispatch — the engine renders at the advance boundary. The shipped product PRD is human-first: executive summary, detailed product direction, then critique/evidence/problem framing/intake and metadata; rendering stays deterministic and engine-owned. |
 | `bash` | Deterministic shell step, no model. |
 | `none` | Placeholder / skip. |
 

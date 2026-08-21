@@ -57,7 +57,7 @@ export const PRD_SOURCE_ARTIFACT_IDS = [
 ] as const;
 
 /** Renderer identity recorded in the manifest; bump on any template change. */
-export const PRODUCT_PRD_RENDERER = "product-prd-renderer@1";
+export const PRODUCT_PRD_RENDERER = "product-prd-renderer@2";
 
 /** Default document location inside the state dir. */
 const DEFAULT_DOCUMENT_PATH = "documents/product-prd.md";
@@ -155,7 +155,11 @@ function claimLines(evidence: unknown): string[] {
   return evidence.map((entry) => {
     if (entry === null || typeof entry !== "object") return `- ${scalar(entry)}`;
     const record = entry as Record<string, unknown>;
-    return `- ${scalar(record.claim)} — status: ${scalar(record.status)} — source: ${scalar(record.source)}`;
+    return [
+      `- **Claim:** ${scalar(record.claim)}`,
+      `  - **Status:** ${scalar(record.status)}`,
+      `  - **Source:** ${scalar(record.source)}`,
+    ].join("\n");
   });
 }
 
@@ -168,93 +172,52 @@ function alternativeLines(alternatives: unknown): string[] {
       continue;
     }
     const record = entry as Record<string, unknown>;
-    lines.push(`- **${scalar(record.id)}**: ${scalar(record.summary)}`);
+    lines.push(`- **${scalar(record.id)}:** ${scalar(record.summary)}`);
     const pros = Array.isArray(record.pros) ? record.pros : [];
     const cons = Array.isArray(record.cons) ? record.cons : [];
-    lines.push(`  - pros: ${pros.length > 0 ? pros.map((pro) => scalar(pro)).join("; ") : "_None._"}`);
-    lines.push(`  - cons: ${cons.length > 0 ? cons.map((con) => scalar(con)).join("; ") : "_None._"}`);
+    lines.push(`  - **Pros:** ${pros.length > 0 ? pros.map((pro) => scalar(pro)).join("; ") : "_None._"}`);
+    lines.push(`  - **Cons:** ${cons.length > 0 ? cons.map((con) => scalar(con)).join("; ") : "_None._"}`);
   }
   return lines;
 }
 
-/**
- * Deterministic Markdown product PRD from the five source artifacts.
- * Template-driven in a fixed section order — never key-iteration-driven,
- * never clock-driven. Throws when one of the five sources is missing.
- */
-export function renderProductPrdDocument(sourceArtifacts: Record<string, unknown>): string {
-  const intake = requireSource(sourceArtifacts, "product_intake");
-  const framing = requireSource(sourceArtifacts, "product_framing");
-  const evidence = requireSource(sourceArtifacts, "product_evidence");
-  const critique = requireSource(sourceArtifacts, "product_critique");
-  const spec = requireSource(sourceArtifacts, "product_spec");
+/** One labeled scalar line plus a trailing blank separator. */
+function labeledValue(label: string, value: unknown): string[] {
+  return [`**${label}.** ${scalar(value)}`, ""];
+}
 
-  const lines: string[] = [
-    "# Product PRD",
+/** One label line, its bullet list and a trailing blank separator. */
+function labeledList(label: string, value: unknown): string[] {
+  return [`**${label}.**`, ...bulletList(value), ""];
+}
+
+/** Human-first opening summary: the decision-relevant fields without subheadings. */
+function executiveSummaryLines(
+  framing: Record<string, unknown>,
+  critique: Record<string, unknown>,
+  spec: Record<string, unknown>,
+): string[] {
+  return [
+    "## Executive summary",
     "",
-    `_Rendered deterministically by \`${PRODUCT_PRD_RENDERER}\` from product_intake, product_framing, product_evidence, product_critique and product_spec. Explicit unknowns stay visible — never silently omitted._`,
+    ...labeledValue("Recommendation", spec.recommendation),
+    ...labeledValue("Critique verdict", critique.verdict),
+    ...labeledValue("Problem", framing.problem_restatement),
+    ...labeledValue("Value proposition", spec.value_proposition),
+    ...labeledList("Target users", spec.target_users),
+    ...labeledValue("Solution direction", spec.solution_direction),
+    ...labeledList("Success metrics", spec.success_metrics),
+    ...labeledList("Scope", spec.scope),
+    ...labeledList("Open product decisions", spec.open_decisions),
+  ];
+}
+
+/** Every product_spec concept as its own section (Recommendation stays a label). */
+function productDirectionLines(spec: Record<string, unknown>): string[] {
+  return [
+    "## Product direction",
     "",
-    "## Product intake",
-    "",
-    "### Problem statements",
-    ...bulletList(intake.problem_statements),
-    "",
-    "### Context",
-    ...bulletList(intake.contexts),
-    "",
-    "### Stakeholders",
-    ...bulletList(intake.stakeholders),
-    "",
-    "### Constraints",
-    ...bulletList(intake.constraints),
-    "",
-    "### Open questions",
-    ...bulletList(intake.open_questions),
-    "",
-    "### Intake evidence",
-    ...claimLines(intake.evidence),
-    "",
-    "## Problem framing",
-    "",
-    `**Problem restatement.** ${scalar(framing.problem_restatement)}`,
-    "",
-    "### Target users",
-    ...bulletList(framing.target_users),
-    "",
-    "### Success criteria",
-    ...bulletList(framing.success_criteria),
-    "",
-    "### Non-goals",
-    ...bulletList(framing.non_goals),
-    "",
-    "### Framing assumptions",
-    ...bulletList(framing.assumptions),
-    "",
-    "## Evidence",
-    "",
-    "### Claims",
-    ...claimLines(evidence.evidence),
-    "",
-    "### Evidence gaps",
-    ...bulletList(evidence.gaps),
-    "",
-    "### Alternatives considered",
-    ...alternativeLines(evidence.alternatives),
-    "",
-    "## Product critique",
-    "",
-    `**Verdict.** ${scalar(critique.verdict)}`,
-    "",
-    "### Findings",
-    ...bulletList(critique.findings),
-    "",
-    "### Blocking gaps",
-    ...bulletList(critique.blocking_gaps),
-    "",
-    "## Product spec",
-    "",
-    `**Recommendation.** ${scalar(spec.recommendation)}`,
-    "",
+    ...labeledValue("Recommendation", spec.recommendation),
     "### Value proposition",
     "",
     scalar(spec.value_proposition),
@@ -294,6 +257,120 @@ export function renderProductPrdDocument(sourceArtifacts: Record<string, unknown
     "### Open product decisions",
     ...bulletList(spec.open_decisions),
     "",
+  ];
+}
+
+function productCritiqueLines(critique: Record<string, unknown>): string[] {
+  return [
+    "## Product critique",
+    "",
+    "### Verdict",
+    "",
+    scalar(critique.verdict),
+    "",
+    "### Findings",
+    ...bulletList(critique.findings),
+    "",
+    "### Blocking gaps",
+    ...bulletList(critique.blocking_gaps),
+    "",
+  ];
+}
+
+function evidenceLines(evidence: Record<string, unknown>): string[] {
+  return [
+    "## Evidence",
+    "",
+    "### Claims",
+    ...claimLines(evidence.evidence),
+    "",
+    "### Evidence gaps",
+    ...bulletList(evidence.gaps),
+    "",
+    "### Alternatives considered",
+    ...alternativeLines(evidence.alternatives),
+    "",
+  ];
+}
+
+function problemFramingLines(framing: Record<string, unknown>): string[] {
+  return [
+    "## Problem framing",
+    "",
+    ...labeledValue("Problem restatement", framing.problem_restatement),
+    "### Target users",
+    ...bulletList(framing.target_users),
+    "",
+    "### Success criteria",
+    ...bulletList(framing.success_criteria),
+    "",
+    "### Non-goals",
+    ...bulletList(framing.non_goals),
+    "",
+    "### Framing assumptions",
+    ...bulletList(framing.assumptions),
+    "",
+  ];
+}
+
+function productIntakeLines(intake: Record<string, unknown>): string[] {
+  return [
+    "## Product intake",
+    "",
+    "### Problem statements",
+    ...bulletList(intake.problem_statements),
+    "",
+    "### Context",
+    ...bulletList(intake.contexts),
+    "",
+    "### Stakeholders",
+    ...bulletList(intake.stakeholders),
+    "",
+    "### Constraints",
+    ...bulletList(intake.constraints),
+    "",
+    "### Open questions",
+    ...bulletList(intake.open_questions),
+    "",
+    "### Intake evidence",
+    ...claimLines(intake.evidence),
+    "",
+  ];
+}
+
+function documentMetadataLines(): string[] {
+  return [
+    "## Document metadata",
+    "",
+    ...labeledValue("Renderer", PRODUCT_PRD_RENDERER),
+    ...labeledValue("Source artifacts", PRD_SOURCE_ARTIFACT_IDS.join(", ")),
+    "Rendering is deterministic: identical source artifacts render byte-identical Markdown with no embedded timestamps.",
+    "Explicit unknowns stay visible: absent concepts render the '_Unknown — not provided by the source artifacts_' marker; 'unknown'/'TBD' values render verbatim.",
+    "",
+  ];
+}
+
+/**
+ * Deterministic Markdown product PRD from the five source artifacts.
+ * Human-first layout in a fixed section order — never key-iteration-driven,
+ * never clock-driven. Throws when one of the five sources is missing.
+ */
+export function renderProductPrdDocument(sourceArtifacts: Record<string, unknown>): string {
+  const intake = requireSource(sourceArtifacts, "product_intake");
+  const framing = requireSource(sourceArtifacts, "product_framing");
+  const evidence = requireSource(sourceArtifacts, "product_evidence");
+  const critique = requireSource(sourceArtifacts, "product_critique");
+  const spec = requireSource(sourceArtifacts, "product_spec");
+  const lines: string[] = [
+    "# Product PRD",
+    "",
+    ...executiveSummaryLines(framing, critique, spec),
+    ...productDirectionLines(spec),
+    ...productCritiqueLines(critique),
+    ...evidenceLines(evidence),
+    ...problemFramingLines(framing),
+    ...productIntakeLines(intake),
+    ...documentMetadataLines(),
   ];
   return `${lines.join("\n")}\n`;
 }

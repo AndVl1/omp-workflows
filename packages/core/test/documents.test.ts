@@ -7,6 +7,8 @@
  *
  *   renderProductPrdDocument(sourceArtifacts) -> string
  *     Deterministic (template-driven, never key-order/clock driven) Markdown
+ *     in a human-first layout: executive summary first, then product
+ *     direction, critique, evidence, problem framing, intake, metadata.
  *     rendering of the FIVE source artifacts (product_intake,
  *     product_framing, product_evidence, product_critique, product_spec).
  *     Throws (fail closed) when one of the five sources is missing. The
@@ -64,6 +66,7 @@ import { join, relative } from "node:path";
 import { loadAllProfiles } from "../src/engine/profile.js";
 import { artifactSchemaFor, requiredFieldsOf, validateProducedArtifact } from "../src/engine/artifact-contract.js";
 import {
+  PRODUCT_PRD_RENDERER,
   renderProductPrdDocument,
   validateProductPrdDocument,
   writeProductPrdDocument,
@@ -179,6 +182,45 @@ function section(markdown: string, include: RegExp, exclude: RegExp[] = []): str
   return lines.slice(start, end).join("\n");
 }
 
+/** Heading level of a line (0 when the line is not a heading). */
+function headingLevel(line: string): number {
+  const match = /^#{1,6}\s/.exec(line);
+  return match ? match[0].trim().length : 0;
+}
+
+/**
+ * Body of a child section: locate the parent heading, scan to the next
+ * heading of the parent level (or shallower), find the child heading inside
+ * that span, and return the child body up to the next heading of the child
+ * level (or shallower). Asserts when either heading is missing.
+ */
+function subsection(markdown: string, parentInclude: RegExp, childInclude: RegExp, childExclude: RegExp[] = []): string {
+  const lines = markdown.split("\n");
+  const parentIndex = lines.findIndex((line) => findHeading(line, parentInclude) !== null);
+  assert.ok(parentIndex >= 0, `heading matching ${parentInclude} must exist`);
+  const parentLevel = headingLevel(lines[parentIndex]!);
+  let parentEnd = lines.length;
+  for (let i = parentIndex + 1; i < lines.length; i += 1) {
+    const level = headingLevel(lines[i]!);
+    if (level > 0 && level <= parentLevel) {
+      parentEnd = i;
+      break;
+    }
+  }
+  const childIndex = lines.findIndex((line, i) => i > parentIndex && i < parentEnd && findHeading(line, childInclude, childExclude) !== null);
+  assert.ok(childIndex >= 0, `heading matching ${childInclude} must exist inside ${parentInclude}`);
+  const childLevel = headingLevel(lines[childIndex]!);
+  let childEnd = lines.length;
+  for (let i = childIndex + 1; i < lines.length; i += 1) {
+    const level = headingLevel(lines[i]!);
+    if (level > 0 && level <= childLevel) {
+      childEnd = i;
+      break;
+    }
+  }
+  return lines.slice(childIndex, childEnd).join("\n");
+}
+
 /** Every product_spec concept keeps its own PRD section. */
 const CONCEPT_HEADINGS: Array<[string, RegExp, RegExp?]> = [
   ["value_proposition", /value proposition/i],
@@ -225,6 +267,49 @@ test("product-prd: rendering is deterministic across key order and repeated invo
 
   assert.doesNotMatch(first, /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/, "no ISO-8601 timestamp in the markdown");
   assert.doesNotMatch(first, /\b\d{2}:\d{2}:\d{2}\b/, "no clock time in the markdown");
+});
+
+test("product-prd: human-first layout puts decision context before supporting detail", () => {
+  const markdown = renderProductPrdDocument(validSources());
+
+  // Decision context first, supporting detail after, metadata last. Exact
+  // heading-LINE match: a substring match would hit "### Evidence trace"
+  // before the real "## Evidence" section.
+  const order = [
+    "## Executive summary",
+    "## Product direction",
+    "## Product critique",
+    "## Evidence",
+    "## Problem framing",
+    "## Product intake",
+    "## Document metadata",
+  ];
+  const lines = markdown.split("\n");
+  let previous = -1;
+  for (const heading of order) {
+    const index = lines.findIndex((line) => line === heading);
+    assert.ok(index >= 0, `heading line "${heading}" exists`);
+    assert.ok(index > previous, `"${heading}" comes after the previous section`);
+    previous = index;
+  }
+
+  // The summary leads with the decision-relevant labeled fields.
+  const summary = section(markdown, /executive summary/i);
+  assert.match(summary, /\*\*Recommendation\.\*\*/);
+  assert.match(summary, /\*\*Value proposition\.\*\*/);
+
+  // Nested readable claim and alternative blocks.
+  assert.ok(markdown.includes("- **Claim:** "), "claim lines are nested readable blocks");
+  assert.ok(markdown.includes("  - **Status:** verified"));
+  assert.ok(markdown.includes("  - **Source:** documents.test.ts"));
+  const alternatives = section(markdown, /alternatives considered/i);
+  assert.match(alternatives, /- \*\*handwritten-prd:\*\* hand-written PRDs/);
+  assert.match(alternatives, /  - \*\*Pros:\*\* _None\._/);
+  assert.match(alternatives, /  - \*\*Cons:\*\* not reproducible/);
+
+  // Metadata records the shipped renderer version.
+  const metadata = section(markdown, /document metadata/i);
+  assert.ok(metadata.includes(PRODUCT_PRD_RENDERER), "metadata records the renderer version");
 });
 
 test("product-prd: rendering fails closed when one of the five source artifacts is missing", () => {
@@ -279,8 +364,12 @@ test("product-prd: explicit unknowns stay visible and every product_spec concept
   }
   assert.match(section(markdown, /value proposition/i), /unknown/i, "unknown value stays visible");
   assert.match(section(markdown, /success metrics/i), /TBD/);
-  assert.match(section(markdown, /target users/i), /unknown/i);
-  assert.match(section(markdown, /\bgaps?\b/i), /TBD/);
+  // The summary and product direction carry their own Target users; the
+  // framing section is scoped explicitly.
+  assert.match(subsection(markdown, /problem framing/i, /target users/i), /unknown/i);
+  // Product critique's "### Blocking gaps" precedes Evidence in the
+  // human-first layout — scope the gaps check to the Evidence section.
+  assert.match(subsection(markdown, /^## Evidence$/, /evidence gaps/i), /TBD/, "evidence gaps stay visible");
 
   // the framing restatement and critique verdict are rendered, not dropped
   assert.match(markdown, /deterministic, tamper-evident/);
@@ -898,7 +987,7 @@ test("product-prd: product_prd is a schema-registered artifact contract", () => 
   const valid = validateProducedArtifact("product_prd", {
     type: "product_prd",
     format: "markdown",
-    renderer: "product-prd-renderer@1",
+    renderer: PRODUCT_PRD_RENDERER,
     path: "docs/product-prd.md",
     source_artifacts: [...SOURCE_ARTIFACT_IDS],
     source_hash: "a".repeat(64),
@@ -913,7 +1002,7 @@ test("product-prd: product_prd is a schema-registered artifact contract", () => 
   const extra = validateProducedArtifact("product_prd", {
     type: "product_prd",
     format: "markdown",
-    renderer: "product-prd-renderer@1",
+    renderer: PRODUCT_PRD_RENDERER,
     path: "docs/product-prd.md",
     source_artifacts: [...SOURCE_ARTIFACT_IDS],
     source_hash: "a".repeat(64),
