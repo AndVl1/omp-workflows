@@ -738,6 +738,7 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
 
     // Step 1 must be an explicit tool-only sequence: workflow_prepare first,
     // then workflow_begin and workflow_instructions as the ONLY workflow instruction source.
+    assert.match(prompt, /typed `workflow_prepare` result with `ok: true`/);
     assert.ok(
       prompt.includes("workflow_prepare"),
       "prompt must require workflow_prepare before state transitions",

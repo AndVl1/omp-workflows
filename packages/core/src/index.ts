@@ -385,6 +385,13 @@ export {
   type ModelClassification,
 } from "./engine/run.js";
 export {
+  prepareWorkflow,
+  type WorkflowPreparationInput,
+  type WorkflowPreparationContinuation,
+  type WorkflowPreparationResult,
+  type PreparedWorkflow,
+} from "./engine/prepare.js";
+export {
 	walkProfile,
 	runStage,
 	createTaskCaller,

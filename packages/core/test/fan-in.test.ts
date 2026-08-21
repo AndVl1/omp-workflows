@@ -575,6 +575,9 @@ test("fan-in: missing slot results block advance end to end", () => {
     completeSlot(root, issued, "tech-researcher", "tech-researcher", ["exploration-tech-researcher"]);
     // analyst#2 completed with NO artifacts -> empty slot -> advance blocked.
     completeSlot(root, issued, "analyst#2", "analyst", []);
+    const emptySlot = stateOf(root).dispatch_capability?.dispatches.find((record) => record.role === "analyst#2");
+    assert.equal(emptySlot?.status, "succeeded", "zero-artifact slot completion is recorded before the fan-in join");
+    assert.deepEqual(emptySlot?.completion?.artifact_ids, [], "zero-artifact completion remains empty until fan-in validation");
     const advanced = advanceCursor(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,

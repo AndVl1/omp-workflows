@@ -290,6 +290,9 @@ test("fullstack: workflow tools register and fail closed with structured respons
     assert.ok(tools.get(name)?.parameters, `${name} exposes a parameter schema`);
   }
 
+  const prepare = tools.get("workflow_prepare")!;
+  const workerPrepareResult = await prepare.execute("worker", {}, undefined, undefined, { cwd: process.cwd(), hasUI: false } as never);
+  assert.equal((workerPrepareResult.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
   const begin = tools.get("workflow_begin")!;
   const workerBeginResult = await begin.execute("worker", {}, undefined, undefined, { cwd: process.cwd(), hasUI: false } as never);
   assert.equal((workerBeginResult.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
