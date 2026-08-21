@@ -381,6 +381,57 @@ export function setStageStatus(
   }
   return { ...state, stages, stage_cursor: cursor, updated_at: new Date().toISOString() };
 }
+const CAPABILITY_STATUSES = ["ready", "dispatched", "joining", "complete", "invalidated"] as const;
+const DISPATCH_STATUSES = ["authorized", "running", "succeeded", "failed", "cancelled"] as const;
+const TERMINAL_CAPABILITY_STATUSES: Record<string, true> = { complete: true, invalidated: true };
+const LIVE_DISPATCH_STATUSES: Record<string, true> = { authorized: true, running: true };
+
+function capabilityAfterReopen(
+  state: TeamState,
+  targetIndex: number,
+): TeamState["dispatch_capability"] {
+  const capability = state.dispatch_capability;
+  if (!capability) return undefined;
+  const issuedFor = capability.issued_for;
+  if (!issuedFor || typeof issuedFor.stage_cursor !== "string" || !issuedFor.stage_cursor.trim()) {
+    throw new Error("cannot reopen workflow with an invalid dispatch capability binding");
+  }
+  if (typeof capability.status !== "string" || !CAPABILITY_STATUSES.includes(capability.status as typeof CAPABILITY_STATUSES[number])) {
+    throw new Error("cannot reopen workflow with an invalid dispatch capability status");
+  }
+  const expectedRunKey = state.run_key ?? state.branch;
+  if (
+    issuedFor.branch !== state.branch ||
+    issuedFor.run_key !== expectedRunKey ||
+    issuedFor.workflow !== state.classification?.workflow ||
+    (state.profile_hash !== undefined && issuedFor.profile_hash !== state.profile_hash) ||
+    state.stage_cursor !== issuedFor.stage_cursor ||
+    (!TERMINAL_CAPABILITY_STATUSES[capability.status] && state.cursor_epoch !== undefined && state.cursor_epoch !== issuedFor.cursor_epoch)
+  ) {
+    throw new Error("cannot reopen workflow with a mismatched dispatch capability binding");
+  }
+  if (typeof capability.capability_id !== "string" || !capability.capability_id.trim() || typeof capability.dispatch_token_hash !== "string" || !/^[0-9a-f]{64}$/.test(capability.dispatch_token_hash) || typeof capability.advance_token_hash !== "string" || !/^[0-9a-f]{64}$/.test(capability.advance_token_hash)) {
+    throw new Error("cannot reopen workflow with an invalid dispatch capability");
+  }
+  const capabilityIndex = state.stages.findIndex((stage) => stage.id === issuedFor.stage_cursor);
+  if (capabilityIndex < 0) {
+    throw new Error(`cannot reopen workflow with an unknown capability stage: ${issuedFor.stage_cursor}`);
+  }
+  if (!Array.isArray(capability.dispatches) || capability.dispatches.some((record) => !record || !DISPATCH_STATUSES.includes(record.status as typeof DISPATCH_STATUSES[number]))) {
+    throw new Error("cannot reopen workflow with invalid dispatch records");
+  }
+  if (capabilityIndex < targetIndex) {
+    if (!TERMINAL_CAPABILITY_STATUSES[capability.status]) {
+      throw new Error("cannot reopen workflow while an upstream dispatch capability is active");
+    }
+    return capability;
+  }
+  if (capability.dispatches.some((record) => LIVE_DISPATCH_STATUSES[record.status])) {
+    throw new Error("cannot reopen workflow while a dispatch is still resumable");
+  }
+  return { ...capability, status: "invalidated", dispatches: [] };
+}
+
 /**
  * Reopen a completed workflow after user feedback without losing prior state.
  * The affected stage and all downstream stages become pending; upstream
@@ -404,6 +455,7 @@ export function reopenFromFeedback(
     history,
     stages,
     stage_cursor: target,
+    dispatch_capability: capabilityAfterReopen(state, index),
     pause: { kind: "none", reason: "" },
     updated_at: new Date().toISOString(),
   };

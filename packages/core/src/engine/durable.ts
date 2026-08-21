@@ -9,6 +9,7 @@ import { resolveStageDispatchSlots } from "./stage.js";
 import { readArtifact, writeArtifact } from "./artifacts.js";
 import { isDoDComplete, isRootCauseDocumented, readDoD } from "./dod.js";
 import { validationGate } from "../gates/validation.js";
+import { buildDispatchMarker } from "../gates/dispatch.js";
 import { evaluatePredicate } from "./predicate.js";
 import { appendCheckpointDecision, findCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
 import { loopExhaustionKind, loopIterationRecord, loopReentryDecision, loopStateFor, resolveBackToStage } from "./loops.js";
@@ -111,6 +112,11 @@ const activeCapability = (value: TeamState["dispatch_capability"]): ActiveCapabi
 
 export type TransitionResult = { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff } | { ok: false; error: string; state?: TeamState };
 
+export interface CapabilityDispatchMarker {
+  role: string;
+  marker: string;
+}
+
 export interface CapabilityHandoff {
   capability_id: string;
   dispatch_token: string;
@@ -123,14 +129,35 @@ export interface CapabilityHandoff {
   cursor_epoch: string;
   kind: "none" | "single" | "consilium";
   expected_roster: Array<{ role: string; agent: string }>;
+  dispatch_markers: CapabilityDispatchMarker[];
 }
 
 function handoffFromState(
+  cwd: string,
   state: TeamState,
   secrets: { capability_id: string; dispatch_token: string; advance_token: string },
 ): CapabilityHandoff | undefined {
   const cap = activeCapability(state.dispatch_capability);
   if (!cap) return undefined;
+  const profile = loadProfile(cap.issued_for.workflow);
+  const stage = profile?.stages.find((candidate) => candidate.id === cap.issued_for.stage_cursor);
+  if (!stage) return undefined;
+  const stageKind = stage.type === "single" || stage.type === "consilium" ? stage.type : "none";
+  if (stageKind !== cap.kind) return undefined;
+
+  const config = resolveConfig(cwd);
+  const flags = state.scope ?? resolveScope([], config);
+  const slots = stageKind === "none"
+    ? []
+    : resolveStageDispatchSlots(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  const resolvedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+  if (JSON.stringify(resolvedRoster) !== JSON.stringify(cap.expected_roster)) return undefined;
+
+  const roles = cap.expected_roster.map((entry) => entry.role);
+  const dispatch_markers = cap.expected_roster.map(({ role }) => ({
+    role,
+    marker: buildDispatchMarker(cap.issued_for.run_key, stage, roles, role, cap.issued_for.cursor_epoch),
+  }));
   return {
     capability_id: secrets.capability_id,
     dispatch_token: secrets.dispatch_token,
@@ -143,6 +170,7 @@ function handoffFromState(
     cursor_epoch: cap.issued_for.cursor_epoch,
     kind: cap.kind,
     expected_roster: cap.expected_roster,
+    dispatch_markers,
   };
 }
 
@@ -256,7 +284,7 @@ export function beginCapability(cwd: string): TransitionResult {
   return {
     ok: true,
     state: next,
-    handoff: handoffFromState(next, {
+    handoff: handoffFromState(cwd, next, {
       capability_id: issued.capability_id,
       dispatch_token: issued.dispatch_token,
       advance_token: issued.advance_token,
@@ -811,7 +839,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
     pause: nextStage ? state.pause : { kind: "done", reason: "" },
   };
   persist(cwd, next, target);
-  return { ok: true, state: next, handoff: handoffSecrets ? handoffFromState(next, handoffSecrets) : undefined };
+  return { ok: true, state: next, handoff: handoffSecrets ? handoffFromState(cwd, next, handoffSecrets) : undefined };
 }
 
 /**
@@ -890,7 +918,7 @@ function reenterLoop(
   return {
     ok: true,
     state: next,
-    handoff: handoffFromState(next, {
+    handoff: handoffFromState(cwd, next, {
       capability_id: issued.capability_id,
       dispatch_token: issued.dispatch_token,
       advance_token: issued.advance_token,
@@ -1542,18 +1570,106 @@ function handoffRouteError(route: HandoffRoute): string | null {
   return `workflow transition is conditional and not enabled: route '${route.id}' (${where}): ${route.description}${prerequisites}${blockedBy}`;
 }
 
+type ApprovalRecord = Record<string, unknown>;
+
+type NormalizedNestedApproval = {
+  actor: string;
+};
+
+function asApprovalRecord(value: unknown): ApprovalRecord | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as ApprovalRecord : null;
+}
+
+function isNonEmptyApprovalString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isApprovalStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
 /**
- * Validate typed approval evidence. Checkpoint kind requires an existing
- * durable checkpoint decision for the authenticated source stage whose
- * decision is the literal `approved`; artifact kind reads a typed
- * `workflow_approval` artifact bound to the source run/workflow/stage.
- * Free text or a natural-language request never authorizes a handoff.
+ * Normalize the observed nested approval shape only after binding every
+ * security-relevant field to the authenticated source capability, state,
+ * route and caller input. The flat artifact shape is intentionally handled
+ * by the legacy branch in validateHandoffApproval and remains unchanged.
  */
+function normalizeNestedWorkflowApproval(
+  value: unknown,
+  ref: string,
+  input: HandoffWorkflowInput,
+  state: TeamState,
+  cap: ActiveCapability,
+  route: HandoffRoute,
+): NormalizedNestedApproval | null {
+  const record = asApprovalRecord(value);
+  const approval = asApprovalRecord(record?.approval);
+  const source = asApprovalRecord(record?.source);
+  const completedHandoff = asApprovalRecord(source?.completed_handoff);
+  const target = asApprovalRecord(record?.target);
+  const classification = asApprovalRecord(target?.classification);
+  const boundedSpecHandoff = asApprovalRecord(record?.bounded_spec_handoff);
+  const transferConstraints = asApprovalRecord(record?.transfer_constraints);
+  if (
+    !record ||
+    record.artifact_id !== ref ||
+    record.schema_version !== 1 ||
+    record.kind !== "workflow_approval" ||
+    record.status !== "approved" ||
+    !approval ||
+    approval.decision !== "approve" ||
+    approval.mode !== "interactive" ||
+    !isNonEmptyApprovalString(approval.actor) ||
+    !isNonEmptyApprovalString(approval.rationale) ||
+    !source ||
+    source.workflow !== cap.issued_for.workflow ||
+    source.stage !== route.source_stage ||
+    source.stage !== input.stage_cursor ||
+    source.status !== "completed" ||
+    source.branch !== cap.issued_for.branch ||
+    source.run_key !== cap.issued_for.run_key ||
+    !completedHandoff ||
+    completedHandoff.capability_id !== cap.capability_id ||
+    completedHandoff.stage_cursor !== cap.issued_for.stage_cursor ||
+    completedHandoff.cursor_epoch !== cap.issued_for.cursor_epoch ||
+    completedHandoff.profile_hash !== cap.issued_for.profile_hash ||
+    !target ||
+    target.workflow !== input.target_workflow ||
+    target.workflow !== route.target_workflow ||
+    target.branch !== cap.issued_for.branch ||
+    target.run_key !== cap.issued_for.run_key ||
+    !classification ||
+    !isNonEmptyApprovalString(classification.type) ||
+    !isNonEmptyApprovalString(classification.complexity) ||
+    !isNonEmptyApprovalString(classification.confidence) ||
+    typeof classification.autonomous !== "boolean" ||
+    !boundedSpecHandoff ||
+    !isNonEmptyApprovalString(boundedSpecHandoff.artifact) ||
+    !isApprovalStringArray(boundedSpecHandoff.scope) ||
+    !isApprovalStringArray(boundedSpecHandoff.contract) ||
+    !isNonEmptyApprovalString(boundedSpecHandoff.acceptance_artifact) ||
+    !isApprovalStringArray(boundedSpecHandoff.blocking_gaps) ||
+    !isApprovalStringArray(boundedSpecHandoff.implementation_sequence) ||
+    !transferConstraints ||
+    transferConstraints.do_not_restart_specification !== true ||
+    transferConstraints.do_not_modify_spec_handoff !== true ||
+    transferConstraints.do_not_expand_scope_beyond_bounded_handoff !== true ||
+    (state.run_key ?? state.branch) !== cap.issued_for.run_key ||
+    state.branch !== cap.issued_for.branch ||
+    state.classification?.workflow !== cap.issued_for.workflow ||
+    state.stage_cursor !== cap.issued_for.stage_cursor ||
+    state.cursor_epoch !== cap.issued_for.cursor_epoch ||
+    state.profile_hash !== cap.issued_for.profile_hash
+  ) return null;
+  return { actor: approval.actor.trim() };
+}
+
 function validateHandoffApproval(
   input: HandoffWorkflowInput,
   state: TeamState,
   artifactsDir: string,
   route: HandoffRoute,
+  cap: ActiveCapability,
 ): string | null {
   const approval = input.approval;
   if (!approval || typeof approval !== "object") return "handoff approval evidence is missing";
@@ -1577,17 +1693,19 @@ function validateHandoffApproval(
     const value = readArtifact(artifactsDir, ref);
     if (!value || typeof value !== "object" || Array.isArray(value)) return "handoff approval evidence is missing";
     const record = value as Record<string, unknown>;
-    if (record.type !== "workflow_approval" || record.version !== 1 || record.decision !== "approved") {
-      return "handoff approval evidence is invalid";
+    if (record.type === "workflow_approval" && record.version === 1 && record.decision === "approved") {
+      if (record.run_key !== (state.run_key ?? state.branch) || record.workflow !== state.classification?.workflow || record.stage !== route.source_stage) {
+        return "handoff approval evidence is invalid";
+      }
+      if (typeof record.actor !== "string" || !record.actor.trim()) return "handoff approval evidence is invalid";
+      if (typeof record.decided_at !== "string" || !record.decided_at.trim() || Number.isNaN(Date.parse(record.decided_at))) {
+        return "handoff approval evidence is invalid";
+      }
+      return null;
     }
-    if (record.run_key !== (state.run_key ?? state.branch) || record.workflow !== state.classification?.workflow || record.stage !== route.source_stage) {
-      return "handoff approval evidence is invalid";
-    }
-    if (typeof record.actor !== "string" || !record.actor.trim()) return "handoff approval evidence is invalid";
-    if (typeof record.decided_at !== "string" || !record.decided_at.trim() || Number.isNaN(Date.parse(record.decided_at))) {
-      return "handoff approval evidence is invalid";
-    }
-    return null;
+    return normalizeNestedWorkflowApproval(value, ref, input, state, cap, route)
+      ? null
+      : "handoff approval evidence is invalid";
   }
   return "handoff approval evidence is invalid";
 }
@@ -1673,7 +1791,7 @@ export function handoffWorkflow(cwd: string, input: HandoffWorkflowInput): Hando
   const targetStage = targetProfile.stages.find((candidate) => candidate.id === route.target_stage);
   if (!targetStage) return { ok: false, error: "target stage is unavailable", state };
 
-  const approvalError = validateHandoffApproval(input, state, artifactsDir, route);
+  const approvalError = validateHandoffApproval(input, state, artifactsDir, route, cap);
   if (approvalError) return { ok: false, error: approvalError, state };
   const contextError = validateHandoffContext(input, artifactsDir);
   if (contextError) return { ok: false, error: contextError, state };
@@ -1760,7 +1878,7 @@ export function handoffWorkflow(cwd: string, input: HandoffWorkflowInput): Hando
     updated_at: now(),
   };
   persist(cwd, next, target);
-  const handoff = handoffFromState(next, {
+  const handoff = handoffFromState(cwd, next, {
     capability_id: issued.capability_id,
     dispatch_token: issued.dispatch_token,
     advance_token: issued.advance_token,

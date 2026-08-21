@@ -285,6 +285,14 @@ test("fullstack: agent frontmatter uses OMP class role with standard fallback", 
     "security-tester": { classRole: "@security", fallbackRole: "@slow", thinkingLevel: "high" },
     "tech-researcher": { classRole: "@researcher", fallbackRole: "@smol", thinkingLevel: "medium" },
   };
+  const artifactWriterAgents: Record<string, true> = {
+    analyst: true,
+    "tech-researcher": true,
+    architect: true,
+    "code-reviewer": true,
+    "security-tester": true,
+    diagnostics: true,
+  };
   const supportedFields: Record<string, true> = {
     name: true,
     description: true,
@@ -320,6 +328,9 @@ test("fullstack: agent frontmatter uses OMP class role with standard fallback", 
     assert.equal(fields.thinkingLevel, expected[name].thinkingLevel, `${name}: reasoning level`);
     const tools = (fields.tools ?? "").split(",").map((tool) => tool.trim()).filter(Boolean);
     assert.ok(tools.every((tool) => tool === tool.toLowerCase()), `${name}: tool ids must be lowercase`);
+    if (artifactWriterAgents[name] === true) {
+      assert.ok(tools.includes("write"), `${name}: intake artifact roles must be able to write typed artifacts`);
+    }
   }
 });
 

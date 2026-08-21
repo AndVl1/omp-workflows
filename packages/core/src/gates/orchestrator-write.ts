@@ -13,7 +13,7 @@ import { resolveState } from "../engine/state.js";
 
 interface ToolCallEvent {
   toolName: string;
-  input?: Record<string, unknown>;
+  input?: unknown;
 }
 interface ToolCallContext { cwd: string; hasUI?: boolean; actor?: Actor }
 
@@ -28,7 +28,7 @@ export function orchestratorWriteGate(
   const actor = trustedActorOf(ctx);
 
   if (event.toolName === "bash") {
-    const command = String(event.input?.command ?? "");
+    const command = stringField(event.input, "command");
     const targets = bashMutationTargets(command);
     const canonical = targets.find((path) => isCanonicalStatePath(path, ctx.cwd));
     if (canonical || looksLikeWorkflowStateMutation(command)) {
@@ -44,7 +44,7 @@ export function orchestratorWriteGate(
     return;
   }
 
-  const paths = pathsFromInput(event.input);
+  const paths = pathsFromInput(event.input, event.toolName);
   if (paths.length === 0) {
     return { block: true, reason: `orchestrator policy: ${actor ?? "unknown"} write/edit has no verifiable path` };
   }
@@ -75,11 +75,59 @@ export function actorOf(input: Record<string, unknown> | undefined): Actor | und
   return raw === "orchestrator" || raw === "worker" || raw === "lead" ? raw : undefined;
 }
 
-function pathsFromInput(input: Record<string, unknown> | undefined): string[] {
-  const raw = input?.path ?? input?.file_path ?? input?.paths;
-  if (typeof raw === "string") return [raw];
-  if (Array.isArray(raw)) return raw.filter((p): p is string => typeof p === "string");
-  return [];
+function pathsFromInput(input: unknown, toolName: string): string[] {
+  const paths: string[] = [];
+  collectInputPaths(input, toolName === "edit", paths, new Set<object>());
+  return paths;
+}
+
+function collectInputPaths(
+  input: unknown,
+  parseEditHeaders: boolean,
+  paths: string[],
+  visited: Set<object>,
+): void {
+  if (typeof input === "string") {
+    if (parseEditHeaders) paths.push(...editHeaderPaths(input));
+    return;
+  }
+  if (!isRecord(input) || visited.has(input)) return;
+  visited.add(input);
+  appendPathValue(input.path, paths);
+  appendPathValue(input.file_path, paths);
+  appendPathValue(input.paths, paths);
+  collectInputPaths(input.input, parseEditHeaders, paths, visited);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function appendPathValue(value: unknown, paths: string[]): void {
+  if (typeof value === "string") {
+    paths.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    paths.push(...value.filter((candidate): candidate is string => typeof candidate === "string"));
+  }
+}
+
+/** Parse only line-anchored OMP edit headers; arbitrary patch prose is not a path. */
+function editHeaderPaths(patch: string): string[] {
+  const paths: string[] = [];
+  const header = /^\[([^\]\r\n]+)#([0-9a-fA-F]{4})\](?=\r?$|\r?\n)/gm;
+  for (const match of patch.matchAll(header)) {
+    const path = match[1];
+    if (path) paths.push(path);
+  }
+  return paths;
+}
+
+function stringField(input: unknown, field: string): string {
+  if (!isRecord(input)) return "";
+  const value = input[field];
+  return typeof value === "string" ? value : "";
 }
 
 function isWorkStatePath(path: string, cwd: string): boolean {
@@ -201,7 +249,7 @@ export function workerWriteScopeGate(
   if (!scope?.enabled) return;
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
   if (trustedActorOf(ctx) !== "worker") return;
-  const paths = event.toolName === "bash" ? bashMutationTargets(String(event.input?.command ?? "")) : pathsFromInput(event.input);
+  const paths = event.toolName === "bash" ? bashMutationTargets(stringField(event.input, "command")) : pathsFromInput(event.input, event.toolName);
   if (paths.length === 0) return;
   for (const path of paths) {
     const absolute = isAbsolute(path) ? resolve(path) : resolve(ctx.cwd, path);

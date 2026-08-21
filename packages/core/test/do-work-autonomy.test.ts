@@ -467,8 +467,11 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     assert.ok(!existsSync(join(root, "packages", "core")), "temp consumer cwd has no packages/core");
     const prompt = buildDoWorkPrompt(parseWorkEnvelope("Fix login bug", root), root);
 
-    // Step 1 must be an explicit tool-only sequence: workflow_begin first,
-    // then workflow_instructions as the ONLY workflow instruction source.
+    // Step 1 must prepare typed state before issuing a capability, then
+    // fetch workflow instructions as the ONLY workflow instruction source.
+    assert.ok(prompt.includes("workflow_prepare"), "prompt must require workflow_prepare after PHASE-0");
+    assert.ok(prompt.indexOf("workflow_prepare") < prompt.indexOf("workflow_begin"), "workflow_prepare must precede workflow_begin");
+    assert.match(prompt, /typed `workflow_prepare` result with `ok: true`/);
     assert.ok(
       prompt.includes("workflow_begin"),
       "prompt must require workflow_begin after state is persisted",
