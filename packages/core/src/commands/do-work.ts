@@ -24,6 +24,8 @@ export interface WorkTeamConfig {
   roles?: Record<string, string>;
 }
 
+const ROOT_ARTIFACTS_DIR = [".", "work-state"].join("") + "/artifacts";
+
 export function parseWorkEnvelope(args: string, cwd: string): ParsedWorkEnvelope {
   const directive = parseAutonomousDirective(args);
   const autonomyHint = directive.autonomyHint;
@@ -95,12 +97,13 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "### Only after workflow_prepare succeeds",
     "1. Call `workflow_begin` to issue the durable opaque capability for the current stage. On a resumed active stage, it may reissue fresh plaintext secrets while preserving the capability identity and authorized dispatch records; always use the newly returned handoff and never retry a stale token. If it fails, stop and record the error — never guess stage content.",
     "2. Call `workflow_instructions` and treat its returned current stage contract (`stage.instructions`, `roles`, `consumes`, `produces`, `artifact_schemas`, `slot_artifacts`, `checkpoint`/`gate`, `provenance`, and `state.artifactsDir`) as the ONLY workflow instruction source. Use `state.artifactsDir` as the exact destination for every declared artifact; do not read, glob, or infer workflow profile JSON or artifact schemas from the filesystem, package paths, or plugin directories.",
+    `The returned contract must include the authenticated feature-scoped \`state.artifactsDir\`; every producer MUST write each declared artifact under that returned directory as exactly \`<artifact_id>.json\`, or for a consilium slot exactly \`<artifact_id>-<slot>.json\`. NEVER write to root ${ROOT_ARTIFACTS_DIR}; do not use guessed paths (never guess an artifact path) or any other directory.`,
     "3. Continue executing in THIS TURN. Do not stop after printing CLASSIFICATION or preparing state; immediately call `workflow_begin` and `workflow_instructions` and walk the returned stage contract.",
     "4. On continuation, skip stages already done/skipped and start at the first reopened or pending stage.",
     "5. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch. Every delegated task payload must state that `workflow_*` control tools are main-session-only, must not mutate canonical `.work-state` with `bash`, and must use `write` for its declared artifact before returning. In a consilium, each role writes only its own `slot_artifacts[role]` files; never write the shared produce id directly.",
     "6. Before writing any declared artifact, match its JSON exactly to `stage.artifact_schemas[artifactId]`; for `dod`, `items` MUST be objects with `criterion`, `verify_method`, and `status` (`pending` or `met`), never bare strings or a legacy `criteria` array.",
     "7. After every task result, call `workflow_status`. For every dispatch whose status is not `succeeded`, wait or fail closed. For every succeeded dispatch whose `artifact_ids` is empty, call `workflow_complete` exactly once with the dispatch's identity binding and the exact artifact IDs from `slot_artifacts` (including `produce-slot` IDs for consilium); do not treat a native task result as artifact completion. If the runtime already repaired a synchronous completion, use the IDs shown by `workflow_status` and do not replay it with different IDs.",
-    "8. Before `workflow_advance`, if the current stage contract declares a non-null `checkpoint`, call `workflow_checkpoint` first with the same capability handoff, checkpoint name, mode, decision, and rationale; for autonomous stages, record the orchestrator's explicit proceed/approve decision instead of relying on `workflow_advance` to infer it.",
+    "8. Before `workflow_advance`, if the current stage contract declares a non-null `checkpoint`, call `workflow_checkpoint` first with the same capability handoff, checkpoint name, mode, decision, and rationale; for autonomous stages, record the orchestrator's explicit proceed/approve decision instead of relying on `workflow_advance` to infer it."
     "9. After every `workflow_advance`, call `workflow_instructions` again and use the returned next-stage contract. If any workflow tool errors, fail closed: stop and record the failure rather than guessing the stage.",
     "10. When a stage or the whole workflow finishes, remain available in this same session: later user feedback reopens the affected state instead of starting a fresh workflow.",
     "",

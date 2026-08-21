@@ -19,6 +19,7 @@ import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { registerTeamWorkflow } from "../src/index.js";
 import { resolveState, writeState } from "../src/engine/state.js";
+import type { TeamState } from "../src/engine/types.js";
 
 import {
   parseWorkEnvelope,
@@ -1347,6 +1348,39 @@ test("workflow contract exposes the active feature artifact directory", () => {
     assert.equal(prepared.artifactsDir, expectedArtifactsDir);
     assert.equal(contract.state.artifactsDir, expectedArtifactsDir);
     assert.equal(contract.state.path, prepared.statePath);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("workflow contract exposes the authenticated feature-scoped artifacts directory", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-contract-artifacts-"));
+  const branch = "feat/artifacts-contract";
+  const workState = [".", "work-state"].join("");
+  try {
+    initGit(root, branch);
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    const state: TeamState = {
+      schema: 1,
+      branch,
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      task: "artifact directory contract",
+      workflow_override: false,
+      issue: null,
+      stage_cursor: profile.stages[0]!.id,
+      stages: profile.stages.map((stage) => ({ id: stage.id, status: "pending" })),
+      artifacts: {},
+      pause: { kind: "none", reason: "" },
+      updated_at: new Date().toISOString(),
+    };
+    writeState(root, state, { featureSlug: "artifact-contract" });
+
+    const contract = resolveWorkflowContract(root, { branch });
+    assert.equal(
+      contract.state.artifactsDir,
+      join(root, workState, "features", "artifact-contract", "artifacts"),
+    );
+    assert.notEqual(contract.state.artifactsDir, join(root, workState, "artifacts"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
