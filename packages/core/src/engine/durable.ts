@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { loadProfile, profileHash } from "./profile.js";
 import { resolveState, writeState, isSafeStateSegment, resolveActiveBranch, type ResolvedState } from "./state.js";
 import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole } from "./config.js";
@@ -223,6 +223,74 @@ function reissueActiveCapability(cap: ActiveCapability): {
   };
 }
 
+/** Remove one stale slot snapshot only after validating it stays in the target artifact tree. */
+function removeClearedArtifactFile(target: ResolvedState, candidate: string): void {
+  const artifactsDir = target.artifactsDir;
+  if (!artifactsDir || !isAbsolute(candidate)) return;
+  try {
+    const realRoot = realpathSync(artifactsDir);
+    if (!existsSync(candidate) || !lstatSync(candidate).isFile()) return;
+    const realCandidate = realpathSync(candidate);
+    const rel = relative(realRoot, realCandidate);
+    if (rel === "" || rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) return;
+    unlinkSync(candidate);
+  } catch {
+    // Stale cleanup is intentionally best-effort; capability reset remains authoritative.
+  }
+}
+
+function resetReopenedStageState(
+  state: TeamState,
+  target: ResolvedState,
+  profile: NonNullable<ReturnType<typeof loadProfile>>,
+  stageId: string,
+  existing: ActiveCapability | null,
+): TeamState {
+  const index = state.stages.findIndex((entry) => entry.id === stageId);
+  if (index < 0) return state;
+  const clearedStageIds = new Set(state.stages.slice(index).map((entry) => entry.id));
+  const profileIndex = profile.stages.findIndex((entry) => entry.id === stageId);
+  if (profileIndex >= 0) {
+    for (const stage of profile.stages.slice(profileIndex)) clearedStageIds.add(stage.id);
+  }
+  const clearedProduced = new Set(
+    profileIndex < 0 ? [] : profile.stages.slice(profileIndex).flatMap((stage) => stageProduces(stage)),
+  );
+  const staleFiles = new Set<string>();
+  const clearedArtifactIds = new Set<string>();
+  for (const clearedStageId of clearedStageIds) {
+    const records = state.slot_artifacts?.[clearedStageId];
+    for (const slotRecords of Object.values(records?.slots ?? {})) {
+      for (const [artifactId, record] of Object.entries(slotRecords ?? {})) {
+        clearedArtifactIds.add(artifactId);
+        if (record && typeof record.path === "string") staleFiles.add(record.path);
+      }
+    }
+  }
+  if (existing && clearedStageIds.has(existing.issued_for.stage_cursor)) {
+    for (const record of existing.dispatches) {
+      for (const id of record.completion?.artifact_ids ?? []) {
+        clearedArtifactIds.add(id);
+        if (clearedProduced.has(id) && target.artifactsDir) staleFiles.add(join(target.artifactsDir, id + ".json"));
+      }
+    }
+  }
+  for (const path of staleFiles) removeClearedArtifactFile(target, path);
+
+  const retainedSlotArtifacts = Object.fromEntries(
+    Object.entries(state.slot_artifacts ?? {}).filter(([id]) => !clearedStageIds.has(id)),
+  );
+  // Upstream mappings are intentionally retained; only artifacts named by cleared records are stale.
+  const retainedArtifacts = Object.fromEntries(
+    Object.entries(state.artifacts ?? {}).filter(([id]) => !clearedArtifactIds.has(id)),
+  );
+  return {
+    ...state,
+    artifacts: retainedArtifacts,
+    slot_artifacts: Object.keys(retainedSlotArtifacts).length > 0 ? retainedSlotArtifacts : undefined,
+  };
+}
+
 /**
  * Create the opaque dispatch capability after the model has persisted the
  * classification and stage list. This is the entry point for the native
@@ -283,7 +351,7 @@ export function beginCapability(cwd: string): TransitionResult {
     return { ok: false, error: `workflow stage '${stage.id}' has no available agent mapping: ${details}`, state };
   }
   const expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
-  if (existing && existing.issued_for.stage_cursor === stage.id && existing.status !== "complete" && existing.status !== "invalidated") {
+  if (existing && existing.issued_for.stage_cursor === stage.id && stageEntry.status === "in_progress" && existing.status !== "complete" && existing.status !== "invalidated") {
     const rosterChanged = JSON.stringify(existing.expected_roster) !== JSON.stringify(expectedRoster);
     if (existingDispatches.length > 0 && rosterChanged) {
       return { ok: false, error: "active dispatch capability roster is inconsistent", state };
@@ -320,8 +388,12 @@ export function beginCapability(cwd: string): TransitionResult {
     // No dispatch was authorized under the stale roster. Reissue the capability
     // with the current mapping so a resumed workflow does not need manual repair.
   }
+  const resetState = stageEntry.status === "in_progress"
+    ? state
+    : resetReopenedStageState(state, target, profile, stage.id, existing);
+  const retainedDispatches = stageEntry.status === "in_progress" ? existingDispatches : [];
   const issued = createCapability({
-    run_key: state.run_key ?? state.branch,
+    run_key: resetState.run_key ?? resetState.branch,
     branch: state.branch,
     workflow,
     profile_hash: persistedHash,
@@ -330,8 +402,8 @@ export function beginCapability(cwd: string): TransitionResult {
     expected_roster: expectedRoster,
   });
   const next: TeamState = {
-    ...state,
-    run_key: state.run_key ?? state.branch,
+    ...resetState,
+    run_key: resetState.run_key ?? resetState.branch,
     profile_hash: persistedHash,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     stage_cursor: stage.id,
@@ -340,8 +412,8 @@ export function beginCapability(cwd: string): TransitionResult {
     stages: stages.map((entry) => entry.id === stage.id ? { ...entry, status: "in_progress" as const } : entry),
     dispatch_capability: {
       ...issued.state,
-      status: existingDispatches.length > 0 ? "dispatched" as const : "ready" as const,
-      dispatches: existingDispatches,
+      status: retainedDispatches.length > 0 ? "dispatched" as const : "ready" as const,
+      dispatches: retainedDispatches,
     },
     pause: { kind: "none", reason: "" },
     updated_at: now(),

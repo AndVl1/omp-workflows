@@ -630,6 +630,74 @@ test("strict orchestrator policy permits git publication and PR control-plane co
   }
 });
 
+test("strict orchestrator policy parses edit patches and allows read-only artifact validation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-write-patch-policy-"));
+  try {
+    mkdirSync(join(root, ".work-state", "features", "visualize", "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
+    const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
+    const sourcePatch = [
+      "[packages/e2e/src/server.ts#064B]",
+      "PUT 1.=1:",
+      "+export const server = true;",
+    ].join("\n");
+    assert.equal(
+      orchestratorWriteGate({ toolName: "edit", input: { input: sourcePatch } }, { cwd: root, hasUI: false }),
+      undefined,
+      "a worker edit patch with a file header is a verifiable source path",
+    );
+    assert.equal(
+      orchestratorWriteGate({ toolName: "edit", input: sourcePatch }, { cwd: root, hasUI: false }),
+      undefined,
+      "a worker edit patch passed as the raw tool input is a verifiable source path",
+    );
+    const canonicalPatch = [
+      "[.work-state/features/visualize/state.json#064B]",
+      "PUT 1.=1:",
+      "+{}",
+    ].join("\n");
+    const blockedCanonicalPatch = orchestratorWriteGate(
+      { toolName: "edit", input: { input: canonicalPatch } },
+      { cwd: root, hasUI: false },
+    );
+    assert.equal(blockedCanonicalPatch?.block, true);
+    assert.match(blockedCanonicalPatch?.reason ?? "", /canonical workflow state/);
+    const blockedHeaderlessPatch = orchestratorWriteGate(
+      { toolName: "edit", input: { input: "PUT 1.=1:\n+not a file patch" } },
+      { cwd: root, hasUI: false },
+    );
+    assert.equal(blockedHeaderlessPatch?.block, true);
+    assert.match(blockedHeaderlessPatch?.reason ?? "", /no verifiable path/);
+
+    const pythonReadOnlyValidation =
+      "/usr/bin/python3 -m json.tool .work-state/features/visualize/artifacts/spec_intake_repo_map-analyst.json > /dev/null";
+    const pythonJsonReadOnlyValidation =
+      "python3 -c 'import glob,json; [json.load(open(path)) for path in glob.glob(\".work-state/features/visualize/artifacts/*.json\")]'";
+    const nodeReadOnlyValidation =
+      "node -e 'const fs=require(\"node:fs\"); const value=JSON.parse(fs.readFileSync(\".work-state/features/visualize/artifacts/spec_requirements_edge_cases.json\", \"utf8\")); const valid=[value].every((item) => item !== null);'";
+    const nodeGlobReadOnlyValidation =
+      "node -e 'const fs=require(\"node:fs\"); const values=fs.globSync(\".work-state/features/visualize/artifacts/*.json\").map((path) => JSON.parse(fs.readFileSync(path, \"utf8\")));'";
+    for (const command of [pythonReadOnlyValidation, pythonJsonReadOnlyValidation, nodeReadOnlyValidation, nodeGlobReadOnlyValidation]) {
+      assert.equal(
+        orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true }),
+        undefined,
+        "read-only artifact validation must remain allowed: " + command,
+      );
+    }
+
+    for (const command of [
+      "printf '{}' > .work-state/team-state.json",
+      "printf '{}' | tee .work-state/features/visualize/state.json",
+      "cd .work-state/features/visualize && printf '{}' > state.json",
+    ]) {
+      const blocked = orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true });
+      assert.equal(blocked?.block, true, "canonical workflow write must remain blocked: " + command);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("strict durable transitions fail closed when no active git branch exists", () => {
   const root = mkdtempSync(join(tmpdir(), "durable-no-git-"));
   try {
