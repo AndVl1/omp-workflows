@@ -379,6 +379,15 @@ test('server: idle timer closes the session', async t => {
   await waitFor(() => msgs.some(m => m.t === 'err' && m.code === 'idle-timeout'), { timeoutMs: 3000 });
   const idleErr = msgs.find(m => m.t === 'err' && m.code === 'idle-timeout');
   assert.ok(idleErr !== undefined && idleErr.t === 'err');
+  await waitFor(() => session.isClosed(), { timeoutMs: 3000, label: 'idle session close' });
+});
+
+test('server: max session time closes the full bridge', async t => {
+  const scratch = makeScratch();
+  const session = await startTestSession({ cwd: scratch, noPty: true, token: 'sekret', idleMs: 60_000, maxTimeSec: 0.05 });
+  t.after(() => session.close());
+
+  await waitFor(() => session.isClosed(), { timeoutMs: 2000, label: 'max-time session close' });
 });
 
 test('server: ws echo roundtrip through a fake PTY command', async t => {
@@ -439,6 +448,7 @@ test('server: session.json + pty metadata written', async t => {
     token: 'sekret',
     taskPrompt: 'do the thing',
     scenario: { id: 'full-feature', title: 'Full feature' },
+    serverPid: process.pid,
   });
   t.after(() => session.close());
 
@@ -447,6 +457,7 @@ test('server: session.json + pty metadata written', async t => {
   assert.equal(sessionJson.wsPath, '/ws');
   assert.equal(sessionJson.task_prompt, 'do the thing');
   assert.deepEqual(sessionJson.scenario, { id: 'full-feature', title: 'Full feature' });
+  assert.equal(sessionJson.server_pid, process.pid);
   assert.equal(session.pty.mode, 'noPty');
   assert.ok(session.url.includes(`token=sekret`), 'url embeds the token');
   // user_config block is always present — `path` is null when the file

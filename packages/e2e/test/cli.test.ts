@@ -4,6 +4,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -156,6 +157,40 @@ test('cli: stop refuses a live PID whose command line is not the scratch session
     assert.equal(process.kill(process.pid, 0), true, 'the test process remains alive');
   } finally {
     console.error = originalError;
+    rmSync(scratchDir, { recursive: true });
+  }
+});
+
+test('cli: stop targets the bridge PID instead of only the PTY', async () => {
+  const scratchDir = mkdtempSync(join(tmpdir(), 'ux-e2e-stop-bridge-'));
+  const stateDir = join(scratchDir, '.work-state', 'ux-e2e');
+  mkdirSync(stateDir, { recursive: true });
+  const holdScript = join(scratchDir, 'hold.mjs');
+  writeFileSync(holdScript, 'setInterval(() => {}, 1000);\n');
+  const child = spawn(process.execPath, [holdScript], {
+    cwd: scratchDir,
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  assert.ok(child.pid !== undefined, 'bridge fixture has a PID');
+  writeFileSync(
+    join(stateDir, 'session.json'),
+    JSON.stringify({ server_pid: child.pid, pid: null }),
+  );
+
+  try {
+    const code = await runStop({ scratchDir });
+    assert.equal(code, 0);
+    assert.throws(() => process.kill(child.pid as number, 0), /ESRCH/u);
+  } finally {
+    if (child.pid !== undefined) {
+      try {
+        process.kill(child.pid, 'SIGKILL');
+      } catch {
+        /* fixture already stopped */
+      }
+    }
     rmSync(scratchDir, { recursive: true });
   }
 });

@@ -283,12 +283,17 @@ async function runStartForeground(args: StartArgs): Promise<number> {
     rows: args.rows,
     idleMs: args.idleMs,
     maxTimeSec: args.maxTimeSec,
+    serverPid: process.pid,
     taskPrompt,
     scenario: scenario !== null ? { id: scenario.id, title: scenario.title } : null,
   });
   console.log(`ux-e2e: session started — url: ${session.url}`);
   console.log(`ux-e2e: transcript: ${session.transcriptPath}`);
-  return await driveForeground(session, scenario);
+  try {
+    return await driveForeground(session, scenario);
+  } finally {
+    await session.close();
+  }
 }
 
 /** Foreground loop: print [ask_user] hints, exit when the PTY exits. */
@@ -299,34 +304,37 @@ async function driveForeground(session: TestSession, scenario: ScenarioDefinitio
   let stopped = false;
 
   const stop = (): void => {
-    if (stopped) return;
     stopped = true;
-    void session.close().then(() => {
-      console.log('ux-e2e: session stopped');
-      process.exit(0);
-    });
   };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
+  process.once('SIGHUP', stop);
 
-  for (;;) {
-    log.refresh();
-    for (const block of log.askBlocks()) {
-      if (seenTitles.has(`${block.index}:${block.title}`)) continue;
-      seenTitles.add(`${block.index}:${block.title}`);
-      console.log(`ux-e2e [ask_user #${block.index}]: ${block.title}`);
-      for (const opt of block.options) console.log(`  ${opt}`);
-      console.log(`ux-e2e: answer with: ux-e2e ask ${shellQuote(process.cwd())} <answer>`);
+  try {
+    for (;;) {
+      log.refresh();
+      const frames = log.frames;
+      const last = frames[frames.length - 1];
+      if (last !== undefined && last.t === 'exit') {
+        console.log(`ux-e2e: omp exited (code ${String(last.code)}); closing session`);
+        return 0;
+      }
+      if (stopped || session.isClosed()) return 0;
+      for (const block of log.askBlocks()) {
+        if (seenTitles.has(`${block.index}:${block.title}`)) continue;
+        seenTitles.add(`${block.index}:${block.title}`);
+        console.log(`ux-e2e [ask_user #${block.index}]: ${block.title}`);
+        for (const opt of block.options) console.log(`  ${opt}`);
+        console.log(`ux-e2e: answer with: ux-e2e ask ${shellQuote(process.cwd())} <answer>`);
+      }
+      const { promise: ticked, resolve: tick } = deferred<void>();
+      setTimeout(tick, pollMs);
+      await ticked;
     }
-    const frames = log.frames;
-    const last = frames[frames.length - 1];
-    if (last !== undefined && last.t === 'exit') {
-      console.log(`ux-e2e: omp exited (code ${String(last.code)}); closing session`);
-      await session.close();
-      process.exit(0);
-    }
-    const { promise: ticked, resolve: tick } = deferred<void>();
-    await ticked;
+  } finally {
+    process.removeListener('SIGINT', stop);
+    process.removeListener('SIGTERM', stop);
+    process.removeListener('SIGHUP', stop);
   }
 }
 
@@ -413,15 +421,16 @@ async function runStartDetached(args: StartArgs): Promise<number> {
   });
   child.unref();
 
-  // Wait for the child's session.json to appear with a live pid.
+  // Wait for the child's session.json to appear with a live server pid.
   // Cold starts (CI runners, slow disks) can exceed 15 s; keep a generous
   // deadline so the detached child has time to boot omp and write session.json.
   const deadline = Date.now() + 60_000;
   for (;;) {
     const info = readSessionInfo(args.scratchDir);
-    if (info !== null && pidIsLive(info.pid)) {
+    const serverPid = info?.serverPid ?? null;
+    if (info !== null && serverPid !== null && pidIsLive(serverPid)) {
       const sessionJson = readSessionJson(args.scratchDir);
-      console.log(`ux-e2e: detached session started (pid ${String(info.pid)})`);
+      console.log(`ux-e2e: detached session started (pid ${String(serverPid)})`);
       console.log(`ux-e2e: url: ${typeof sessionJson.url === 'string' ? sessionJson.url : 'unknown'}`);
       return 0;
     }
@@ -436,6 +445,7 @@ async function runStartDetached(args: StartArgs): Promise<number> {
       } else {
         console.error(`ux-e2e start: no output captured in ${logPath}; child may have failed before writing.`);
       }
+      await stopDetachedChild(child.pid, args.scratchDir);
       return 1;
     }
     const { promise: ticked, resolve: tick } = deferred<void>();
@@ -471,27 +481,63 @@ function processCommandLine(pid: number): string | null {
   return command.length > 0 ? command : null;
 }
 
+async function terminateProcess(pid: number): Promise<void> {
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {
+    return;
+  }
+  const deadline = Date.now() + 1_000;
+  while (pidIsLive(pid) && Date.now() < deadline) {
+    await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 50));
+  }
+  if (pidIsLive(pid)) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* process exited during the race */
+    }
+  }
+}
+
+async function stopDetachedChild(pid: number | undefined, scratchDir: string): Promise<void> {
+  if (pid === undefined) return;
+  const commandLine = processCommandLine(pid);
+  if (commandLine === null || !commandLine.includes(scratchDir)) return;
+  await killProcessTree(pid);
+}
+
 export async function runStop(args: StopArgs): Promise<number> {
   const info = readSessionInfo(args.scratchDir);
   if (info === null) {
     console.log('ux-e2e stop: no session.json found — nothing to stop');
     return 0;
   }
-  if (!pidIsLive(info.pid)) {
-    console.log(`ux-e2e stop: session pid ${String(info.pid)} is not running`);
+
+  const serverPid = info.serverPid;
+  const targetPid = serverPid !== null && pidIsLive(serverPid) ? serverPid : info.pid;
+  if (targetPid === null || !pidIsLive(targetPid)) {
+    console.log(`ux-e2e stop: session pid ${String(targetPid)} is not running`);
     return 0;
   }
 
-  const commandLine = processCommandLine(info.pid as number);
+  const commandLine = processCommandLine(targetPid);
   if (commandLine === null || !commandLine.includes(args.scratchDir)) {
     console.error(
-      `ux-e2e stop: pid ${String(info.pid)} does not match scratch session — refusing (stale session.json?)`,
+      `ux-e2e stop: pid ${String(targetPid)} does not match scratch session — refusing (stale session.json?)`,
     );
     return 1;
   }
 
-  await killProcessTree(info.pid as number);
-  console.log(`ux-e2e stop: sent SIGTERM->SIGKILL to pid ${String(info.pid)}`);
+  if (targetPid === serverPid) {
+    await terminateProcess(targetPid);
+    if (info.pid !== null && info.pid !== targetPid && pidIsLive(info.pid)) {
+      await killProcessTree(info.pid);
+    }
+  } else {
+    await killProcessTree(targetPid);
+  }
+  console.log(`ux-e2e stop: sent SIGTERM->SIGKILL to pid ${String(targetPid)}`);
   return 0;
 }
 

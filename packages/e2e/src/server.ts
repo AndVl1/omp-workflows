@@ -492,6 +492,8 @@ export interface TestSessionOptions {
   readonly ompProfile?: string;
   /** Session time budget in seconds. Default 1800 (30 min). */
   readonly maxTimeSec?: number;
+  /** PID of the process hosting the HTTP/WS bridge, recorded for safe stop. */
+  readonly serverPid?: number;
   /** omp approval mode. Default 'yolo'. */
   readonly approvalMode?: string;
   /** Task prompt recorded in session.json. */
@@ -527,6 +529,7 @@ export interface TestSession {
   readonly transcriptPath: string;
   readonly sessionJsonPath: string;
   readonly pty: { readonly pid: number | null; readonly cols: number; readonly rows: number; readonly mode: 'pty' | 'noPty' };
+  readonly isClosed: () => boolean;
   /** Stop accepting connections, kill the PTY group, close everything. */
   readonly close: () => Promise<void>;
 }
@@ -544,6 +547,7 @@ export type TranscriptFrame =
 
 export interface SessionInfo {
   readonly pid: number | null;
+  readonly serverPid: number | null;
   readonly startedAt: string | null;
   readonly path: string;
 }
@@ -553,9 +557,14 @@ export function readSessionInfo(scratchDir: string): SessionInfo | null {
   const p = join(scratchDir, '.work-state', 'ux-e2e', 'session.json');
   if (!existsSync(p)) return null;
   try {
-    const j = JSON.parse(readFileSync(p, 'utf8')) as { pid?: unknown; started_at?: unknown };
+    const j = JSON.parse(readFileSync(p, 'utf8')) as {
+      pid?: unknown;
+      server_pid?: unknown;
+      started_at?: unknown;
+    };
     return {
       pid: typeof j.pid === 'number' ? j.pid : null,
+      serverPid: typeof j.server_pid === 'number' ? j.server_pid : null,
       startedAt: typeof j.started_at === 'string' ? j.started_at : null,
       path: p,
     };
@@ -582,12 +591,12 @@ export function pidIsLive(pid: number | null | undefined): boolean {
 export function assertNoLiveSession(scratchDir: string, force: boolean): void {
   const info = readSessionInfo(scratchDir);
   if (info === null) return;
-  if (pidIsLive(info.pid)) {
-    if (force) return;
-    throw new Error(
-      `ux-e2e: live session found (pid ${info.pid}) at ${info.path}; stop it or pass --force to override`,
-    );
-  }
+  const livePid = [info.serverPid, info.pid].find(pid => pidIsLive(pid));
+  if (livePid === undefined) return;
+  if (force) return;
+  throw new Error(
+    `ux-e2e: live session found (pid ${String(livePid)}) at ${info.path}; stop it or pass --force to override`,
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -822,6 +831,7 @@ interface SessionControllerOptions {
   readonly spawnError: string | null;
   readonly idleMs: number;
   readonly transcriptPath: string;
+  readonly onClosed?: () => void;
 }
 
 class SessionController {
@@ -841,11 +851,16 @@ class SessionController {
           send(this.#attachedWs, { t: 'err', code: 'idle-timeout', message });
         }
         this.#append({ ts: new Date().toISOString(), t: 'err', code: 'idle-timeout', message });
-        void this.close();
+        if (opts.onClosed !== undefined) {
+          queueMicrotask(opts.onClosed);
+        } else {
+          void this.close();
+        }
       },
     });
     opts.pty?.onData(data => this.#handlePtyData(data));
     opts.pty?.onExit(({ exitCode, signal }) => this.#handlePtyExit(exitCode, signal));
+    this.#idler.bump();
   }
 
   get closed(): boolean {
@@ -944,6 +959,7 @@ class SessionController {
     this.#closed = true;
     this.#attachedWs = null;
     this.#idler.fireNow();
+    if (this.#opts.onClosed !== undefined) queueMicrotask(this.#opts.onClosed);
   }
 
   #append(frame: TranscriptFrame): void {
@@ -1137,6 +1153,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     token,
     wsPath,
     pid: ptyProc?.pid ?? null,
+    server_pid: opts.serverPid ?? null,
     started_at: new Date().toISOString(),
     omp_version: ompVersion,
     profile: ompProfile,
@@ -1185,7 +1202,19 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     res.end('not found');
   });
 
-  const controller = new SessionController({ pty: ptyProc, spawnError, idleMs, transcriptPath });
+  let closeSession: () => Promise<void> = async () => undefined;
+  let closePromise: Promise<void> | null = null;
+  let maxTimeHandle: NodeJS.Timeout | null = null;
+  const requestClose = (): void => {
+    void closeSession();
+  };
+  const controller = new SessionController({
+    pty: ptyProc,
+    spawnError,
+    idleMs,
+    transcriptPath,
+    onClosed: requestClose,
+  });
 
   // ---- WS: authenticated upgrade -------------------------------------
   httpServer.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
@@ -1204,20 +1233,37 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     }
   });
 
-  const close = async (): Promise<void> => {
-    wss.clients.forEach(c => {
-      try {
-        c.close(1001, 'server shutting down');
-      } catch {
-        /* ignore. */
+  const close = (): Promise<void> => {
+    if (closePromise !== null) return closePromise;
+    closePromise = (async () => {
+      if (maxTimeHandle !== null) {
+        clearTimeout(maxTimeHandle);
+        maxTimeHandle = null;
       }
-    });
-    await controller.close();
-    wss.close();
-    const { promise: closed, resolve: done } = deferred<void>();
-    httpServer.close(() => done());
-    await closed;
+      wss.clients.forEach(c => {
+        try {
+          c.close(1001, 'server shutting down');
+        } catch {
+          /* ignore. */
+        }
+      });
+      await controller.close();
+      wss.close();
+      if (!httpServer.listening) return;
+      await new Promise<void>(done => {
+        httpServer.close(() => done());
+      });
+    })();
+    return closePromise;
   };
+  closeSession = close;
+  if (maxTimeSec > 0) {
+    const timer = setTimeout(() => {
+      void close();
+    }, maxTimeSec * 1000);
+    maxTimeHandle = timer;
+    timer.unref();
+  }
 
   return {
     host,
@@ -1235,6 +1281,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
       rows,
       mode: ptyProc !== null ? 'pty' : 'noPty',
     },
+    isClosed: () => controller.closed,
     close,
   };
 }

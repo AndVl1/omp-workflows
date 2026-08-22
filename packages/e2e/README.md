@@ -45,7 +45,7 @@ Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
 |---|---|
 | `bootstrap <slug> <branch>` | Create `<workdir>/omp-ux-e2e-<slug>` (default `/tmp`), `git init`, wire the plugin via `npm link` (NOT `file:` — the unpublished peer would fail with ETARGET), write `.omp/ux-e2e-overlay.json`, copy `.omp/team.config.json`, materialize custom-TS commands. `--force` re-creates. |
 | `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a **detached child that survives the parent** — the child writes its stdout/stderr directly into `<scratch>/.work-state/ux-e2e/detach.log` via an inherited file descriptor (no pipe between parent and child, so the child cannot crash with EPIPE when the parent exits). The parent tails the last 8 KiB on the 15 s startup timeout so failures are not swallowed. `--scenario`, `--task`, `--surface web\|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. Honours the optional user-supplied overlay at `<scratch>/.omp/ux-e2e-overlay.user.json` (see [User-supplied overlay](#user-supplied-overlay)). |
-| `stop <scratch-dir>` | SIGTERM → SIGKILL the recorded process tree (see session.json `pid`). |
+| `stop <scratch-dir>` | Stop the recorded E2E bridge (`session.json.server_pid`) and its PTY; legacy sessions fall back to `pid`. |
 | `transcript <scratch-dir>` | Render transcript.jsonl as text; `--tail N`, `--follow`. |
 | `input <scratch-dir> <text>` | Unconditionally sends `<text>\n` in ONE `{t:'i'}` frame, without requiring a pending `[ask_user]` prompt. **Prefer `pressEnter()` (`\r`) for real omp submit** — `submit()` (`\n`) is a legacy text-mode helper; see [Enter semantics](#enter-semantics-r-vs-n). |
 | `report <scratch-dir>` | `generateReport()` → `<scratch>/.work-state/ux-e2e/report.json` + `<mdDir>/<slug>-ux-e2e-<date>.md` (default `./vibe-report`). `--steps` supplies structured ratings; `--copy-evidence` mirrors evidence files. |
@@ -53,11 +53,14 @@ Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
 ## Session hygiene & safe stopping
 
 Stop sessions **only** through `ux-e2e stop <scratch>` (or the equivalent
-`npm run e2e -- stop <scratch>`). The command reads the session PID from
-`<scratch>/.work-state/ux-e2e/session.json`, verifies that the live process
-belongs to that scratch session, then sends SIGTERM and (after the grace
-period) SIGKILL to its process tree. If the PID is stale or belongs to another
-process, stopping is refused rather than risking an unrelated session.
+`npm run e2e -- stop <scratch>`). The command reads `server_pid` (the HTTP/WS
+bridge) and `pid` (the OMP PTY) from
+`<scratch>/.work-state/ux-e2e/session.json`, verifies that the selected live
+process belongs to that scratch session, then sends SIGTERM and (after the
+grace period) SIGKILL to the bridge and any remaining PTY. Legacy metadata
+without `server_pid` falls back to the PTY PID. If the PID is stale or belongs
+to another process, stopping is refused rather than risking an unrelated
+session.
 
 **Never** use `pkill`, `killall`, or `kill` by a process name or pattern (for
 example `omp` or `bun`). Those commands can terminate omp sessions belonging
@@ -72,9 +75,11 @@ and leaves the rest of the host untouched.
 - **`src/server.ts`** — `startTestSession()`: loopback-only HTTP+WS server,
   session-scoped 256-bit token (constant-time compare), Origin (if present) /
   Host checks, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, strict
-  CSP, per-connection rate limit, idle timer, SIGTERM → SIGKILL process-tree
-  kill, 64 KiB max frame. Closing a WS only detaches that client; the PTY stays
-  alive for reconnect until `session.close()`, idle timeout, or PTY exit. Vendored static routes
+  CSP, per-connection rate limit, idle timer, hard max-time cleanup,
+  SIGTERM → SIGKILL process-tree kill, 64 KiB max frame. Closing a WS only
+  detaches that client; the PTY stays alive for reconnect until `session.close()`,
+  idle timeout, max-time expiry, or PTY exit. The foreground CLI polls the
+  transcript and always closes the bridge in a `finally` block. Vendored static routes
   (`terminal.html`, `page.js`, `xterm.js`, `xterm.css`, `addon-fit.js`; query
   strings are stripped by `pathnameOf`, so cache-busters like `?cb=1` resolve
   to the same file). Spawns omp with up to three `--config` overlays in
@@ -227,9 +232,9 @@ Upgrade path: `/ws?token=<session-scoped-token>`. The token remains valid for
 - `--detach` runs the session in a detached child whose stdout/stderr are
   captured to `<scratch>/.work-state/ux-e2e/detach.log` via an inherited
   file descriptor (no pipe between parent and child — the child
-  **outlives the parent** and is only stopped via `ux-e2e stop <scratch>` or
-  `--max-time` expiry). The parent surfaces the log tail on the 15 s
-  startup timeout.
+  **outlives the parent** and is stopped via `ux-e2e stop <scratch>`,
+  idle timeout, PTY exit, or `--max-time` expiry). Startup timeouts terminate
+  the detached child after surfacing the log tail.
 - The xterm stylesheet is served from `@xterm/xterm/css/xterm.css` (the package
   does not ship `lib/xterm.css`).
 - The host `~/.omp/agent/config.yml` is auto-inherited as the first

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Detached E2E lifecycle cleanup** — the foreground driver now polls instead
+  of waiting on an unresolved promise, session metadata records the bridge PID
+  separately from the OMP PTY PID, and `ux-e2e stop` terminates the bridge plus
+  any remaining PTY. Idle and max-time expiry close the full HTTP/WS server,
+  while detached startup timeouts clean up their child process.
+
 ### Added
 
 - **User-supplied omp config overlay (`ux-e2e-overlay.user.json`)** —

@@ -25,7 +25,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import * as http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -75,13 +75,14 @@ interface CliResult {
 }
 
 /** Spawn `node dist/cli.js <args>` and wait for it to exit. */
-function runCli(args: string[], timeoutMs = 90_000): Promise<CliResult> {
+function runCli(args: string[], timeoutMs = 90_000, env?: NodeJS.ProcessEnv): Promise<CliResult> {
   const { promise, resolve: done, reject: fail } = deferred<CliResult>();
   const startedAt = Date.now();
   const chunks: Buffer[] = [];
   const errChunks: Buffer[] = [];
   const child: ChildProcess = spawn(process.execPath, [DIST_CLI, ...args], {
     stdio: ['ignore', 'pipe', 'pipe'],
+    env,
   });
   child.stdout?.on('data', (c: Buffer) => chunks.push(c));
   child.stderr?.on('data', (c: Buffer) => errChunks.push(c));
@@ -104,6 +105,7 @@ function runCli(args: string[], timeoutMs = 90_000): Promise<CliResult> {
 
 interface SessionJsonShape {
   pid?: unknown;
+  server_pid?: unknown;
   url?: unknown;
 }
 
@@ -197,6 +199,10 @@ test('detach: parent exits fast and detached child survives past the EPIPE windo
   assert.equal(typeof session.pid, 'number', 'session.json.pid is a number');
   const pid = session.pid as number;
   assert.ok(pid > 0 && pidIsAlive(pid), `pid ${String(pid)} is alive right after parent exits`);
+  assert.equal(typeof session.server_pid, 'number', 'session.json.server_pid is a number');
+  const serverPid = session.server_pid as number;
+  assert.ok(serverPid > 0 && pidIsAlive(serverPid), `server pid ${String(serverPid)} is alive right after parent exits`);
+  assert.notEqual(serverPid, pid, 'bridge PID and PTY PID are distinct');
   assert.equal(typeof session.url, 'string', 'session.json.url is a string');
   const url = session.url as string;
 
@@ -223,10 +229,35 @@ test('detach: parent exits fast and detached child survives past the EPIPE windo
   assert.equal(inputRes.code, 0, `input accepts frames (stderr: ${inputRes.stderr})`);
   assert.match(inputRes.stdout, /sent .* followed by Enter/u);
 
+  const stopRes = await runCli(['stop', realScratch], 10_000);
+  assert.equal(stopRes.code, 0, `stop terminates the bridge (stderr: ${stopRes.stderr})`);
+  assert.throws(() => process.kill(serverPid, 0), /ESRCH/u, 'bridge process is gone after stop');
+
   // eslint-disable-next-line no-console
   console.log(
     `[detach-it] parent exited in ${String(result.durationMs)}ms; pid ${String(pid)} survived ${String(waitMs)}ms; input round-trip ok`,
   );
+});
+
+test('foreground: exits after the PTY process exits', async t => {
+  if (!(await nodePtyAvailable())) {
+    t.skip('node-pty native binding is not loadable in this environment');
+    return;
+  }
+
+  const scratch = mkdtempSync(join(tmpdir(), 'ux-e2e-foreground-'));
+  const fakeOmp = join(scratch, 'fake-omp.sh');
+  writeFileSync(fakeOmp, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo fake-omp; fi\nexit 0\n');
+  chmodSync(fakeOmp, 0o755);
+  t.after(() => rmSync(scratch, { recursive: true, force: true }));
+
+  const result = await runCli(
+    ['start', scratch, '--surface', 'text', '--idle-ms', '5000', '--max-time', '30s'],
+    10_000,
+    { ...process.env, OMP_BIN: fakeOmp },
+  );
+  assert.equal(result.code, 0, `foreground start exits cleanly (stderr: ${result.stderr})`);
+  assert.match(result.stdout, /omp exited/u, 'foreground loop observes the PTY exit');
 });
 
 /** Test seam: pidIsAlive is called from two distinct wait points; both
