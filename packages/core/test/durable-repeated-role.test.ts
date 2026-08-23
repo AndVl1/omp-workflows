@@ -17,7 +17,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
@@ -26,6 +26,7 @@ import { createCapability, beginCapability, authorizeDispatch, completeDispatch,
 import { buildDispatchMarker, parseDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
 import { writeState } from "../src/engine/state.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
+import type { TeamState } from "../src/engine/types.js";
 
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
 
@@ -304,6 +305,194 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
     const marker = buildDispatchMarker("feat/single", codeReview, ["code-reviewer"], "code-reviewer", advanced.state.cursor_epoch);
     const gate = dispatchGate({ toolName: "task", input: { agent: "code-reviewer", role: "code-reviewer", task: marker } }, { cwd: root });
     assert.equal(gate, undefined, "armed next stage is immediately executable");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("br-eu6: reopening a stage clears stale downstream slot bindings and starts with a fresh empty capability", () => {
+  const root = mkdtempSync(join(tmpdir(), "br-eu6-reopen-"));
+  const branch = "feat/reopen";
+  try {
+    initGit(root, branch);
+    const profile = loadProfile("full-feature");
+    assert.ok(profile);
+    const persistedProfileHash = profileHash(profile);
+    const issued = createCapability({
+      run_key: branch,
+      branch,
+      workflow: "full-feature",
+      profile_hash: persistedProfileHash,
+      stage_cursor: "exploration",
+      kind: "consilium",
+      expected_roster: [
+        { role: "analyst#1", agent: "analyst" },
+        { role: "tech-researcher", agent: "tech-researcher" },
+        { role: "analyst#2", agent: "analyst" },
+      ],
+    });
+    const initialState: TeamState = {
+      schema: 1,
+      branch,
+      run_key: branch,
+      classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "full-feature" },
+      task: "reopen stale bindings",
+      workflow_override: false,
+      issue: null,
+      stage_cursor: "exploration",
+      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "discovery" ? "done" as const : stage.id === "exploration" ? "in_progress" as const : "pending" as const })),
+      artifacts: { discovery: "artifacts/discovery.json", feature_spec: "artifacts/feature_spec.json" },
+      pause: { kind: "none", reason: "" },
+      policy: { strict_orchestrator: true },
+      profile_hash: persistedProfileHash,
+      scope: NO_SCOPE,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      dispatch_capability: issued.state,
+      updated_at: new Date().toISOString(),
+    };
+    writeState(root, initialState, { featureSlug: "reopen" });
+    const artifactsDir = join(root, ".work-state", "features", "reopen", "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "reopen stale bindings", branch }));
+    const upstreamPath = join(artifactsDir, "discovery-upstream.json");
+    writeFileSync(upstreamPath, "upstream");
+    const outsideDir = join(root, "outside");
+    mkdirSync(outsideDir, { recursive: true });
+    const outsidePath = join(outsideDir, "must-survive.json");
+    writeFileSync(outsidePath, "outside");
+
+    const oldArtifacts = [
+      { role: "analyst#1", agent: "analyst", id: "exploration-analyst-1" },
+      { role: "tech-researcher", agent: "tech-researcher", id: "exploration-tech-researcher" },
+      { role: "analyst#2", agent: "analyst", id: "exploration-analyst-2" },
+    ];
+    for (const item of oldArtifacts) {
+      writeFileSync(join(artifactsDir, item.id + ".json"), JSON.stringify({ files_to_read: [{ path: "old.ts" }], summary: "old" }));
+    }
+    const oldAuth = {
+      token: issued.dispatch_token,
+      capability_id: issued.capability_id,
+      run_key: branch,
+      branch,
+      workflow: "full-feature",
+      profile_hash: persistedProfileHash,
+      stage_cursor: "exploration",
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    };
+    const oldRecords: Array<{ role: string; agent: string; id: string }> = [];
+    for (const item of oldArtifacts) {
+      const authorized = authorizeDispatch(root, { ...oldAuth, role: item.role, agent: item.agent });
+      assert.equal(authorized.ok, true);
+      if (!authorized.ok || !authorized.record) return;
+      const completed = completeDispatch(root, {
+        ...oldAuth,
+        role: item.role,
+        agent: item.agent,
+        dispatch_id: authorized.record.id,
+        outcome: "succeeded",
+        evidence: "old completion",
+        artifact_ids: [item.id],
+      });
+      assert.equal(completed.ok, true);
+      oldRecords.push({ role: item.role, agent: item.agent, id: authorized.record.id });
+    }
+
+    const staleState = JSON.parse(readFileSync(join(root, ".work-state", "features", "reopen", "state.json"), "utf8")) as TeamState;
+    staleState.stages = profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "discovery" ? "done" as const : "pending" as const }));
+    staleState.dispatch_capability = { ...staleState.dispatch_capability!, status: "complete" };
+    staleState.slot_artifacts = {
+      ...staleState.slot_artifacts,
+      discovery: { slots: { prior: { discovery: { path: upstreamPath, hash: "upstream" } } } },
+      architecture: { slots: { architect_clean: { architecture: { path: join(artifactsDir, "architecture-architect-clean.json"), hash: "downstream" } } } },
+    };
+    const oldExplorationSlots = staleState.slot_artifacts.exploration?.slots["analyst#1"];
+    if (!oldExplorationSlots) return;
+    oldExplorationSlots.outside = { path: outsidePath, hash: "outside" };
+    const downstreamPath = join(artifactsDir, "architecture-architect-clean.json");
+    writeFileSync(downstreamPath, "downstream");
+    writeState(root, staleState, { featureSlug: "reopen" });
+
+    const begun = beginCapability(root);
+    assert.equal(begun.ok, true);
+    if (!begun.ok || !begun.handoff) return;
+    assert.deepEqual(begun.state.artifacts, initialState.artifacts, "upstream state.artifacts survives the reopen");
+    assert.deepEqual(begun.state.dispatch_capability?.dispatches, [], "reopened capability never reuses old dispatch records");
+    assert.equal(begun.state.slot_artifacts?.exploration, undefined, "reopened slot bindings are cleared");
+    assert.equal(begun.state.slot_artifacts?.architecture, undefined, "downstream slot bindings are cleared");
+    assert.ok(begun.state.slot_artifacts?.discovery, "upstream slot bindings remain available");
+    assert.equal(existsSync(upstreamPath), true, "upstream slot artifact file remains");
+    assert.equal(existsSync(outsidePath), true, "out-of-tree stale path is never removed");
+    for (const item of oldArtifacts) assert.equal(existsSync(join(artifactsDir, item.id + ".json")), false, "stale slot file is removed: " + item.id);
+    assert.equal(existsSync(downstreamPath), false, "downstream stale slot file is removed");
+
+    const replay = completeDispatch(root, {
+      ...oldAuth,
+      dispatch_id: oldRecords[0]!.id,
+      role: oldRecords[0]!.role,
+      agent: oldRecords[0]!.agent,
+      outcome: "succeeded",
+      evidence: "stale replay",
+      artifact_ids: [],
+    });
+    assert.equal(replay.ok, false, "the old capability cannot authorize a fresh completion");
+
+    const fresh = begun.handoff;
+    const freshAuth = {
+      token: fresh.dispatch_token,
+      capability_id: fresh.capability_id,
+      run_key: fresh.run_key,
+      branch: fresh.branch,
+      workflow: fresh.workflow,
+      profile_hash: fresh.profile_hash,
+      stage_cursor: fresh.stage_cursor,
+      cursor_epoch: fresh.cursor_epoch,
+    };
+    writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "reopen stale bindings", branch }));
+    const first = oldArtifacts[0]!;
+    const firstAuth = authorizeDispatch(root, { ...freshAuth, role: first.role, agent: first.agent });
+    assert.equal(firstAuth.ok, true);
+    if (!firstAuth.ok || !firstAuth.record) return;
+    const missingOldFile = completeDispatch(root, {
+      ...freshAuth,
+      role: first.role,
+      agent: first.agent,
+      dispatch_id: firstAuth.record.id,
+      outcome: "succeeded",
+      evidence: "stale file replay",
+      artifact_ids: [first.id],
+    });
+    assert.equal(missingOldFile.ok, false, "a removed old file cannot authorize fresh completion");
+    if (missingOldFile.ok) return;
+    assert.match(missingOldFile.error, /declared artifact missing/);
+
+    for (const item of oldArtifacts) {
+      writeFileSync(join(artifactsDir, item.id + ".json"), JSON.stringify({ files_to_read: [{ path: "fresh.ts" }], summary: "fresh " + item.role }));
+      const dodId = item.id.replace("exploration-", "dod-");
+      writeFileSync(join(artifactsDir, dodId + ".json"), JSON.stringify({ items: [{ criterion: "fresh", verify_method: "focused regression", status: "pending" }] }));
+    }
+    const freshRecords = [{ role: first.role, agent: first.agent, id: firstAuth.record.id }, ...oldArtifacts.slice(1).map((item) => {
+      const authorized = authorizeDispatch(root, { ...freshAuth, role: item.role, agent: item.agent });
+      assert.equal(authorized.ok, true);
+      if (!authorized.ok || !authorized.record) throw new Error("fresh dispatch authorization failed");
+      return { role: item.role, agent: item.agent, id: authorized.record.id };
+    })];
+    for (const item of freshRecords) {
+      const explorationId = "exploration-" + item.role.replace(/[^A-Za-z0-9._-]/g, "-");
+      const dodId = "dod-" + item.role.replace(/[^A-Za-z0-9._-]/g, "-");
+      const completed = completeDispatch(root, {
+        ...freshAuth,
+        role: item.role,
+        agent: item.agent,
+        dispatch_id: item.id,
+        outcome: "succeeded",
+        evidence: "fresh completion",
+        artifact_ids: [explorationId, dodId],
+      });
+      assert.equal(completed.ok, true);
+    }
+    const advanced = advanceCursor(root, { ...freshAuth, token: fresh.advance_token, evidence: "fresh exploration completed" });
+    assert.equal(advanced.ok, true, "fresh downstream artifacts complete after stale bindings are cleared");
+    if (advanced.ok) assert.equal(advanced.state.stage_cursor, "clarify");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

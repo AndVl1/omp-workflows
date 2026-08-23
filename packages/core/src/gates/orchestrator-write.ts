@@ -13,7 +13,7 @@ import { resolveState } from "../engine/state.js";
 
 interface ToolCallEvent {
   toolName: string;
-  input?: Record<string, unknown>;
+  input?: Record<string, unknown> | string;
 }
 interface ToolCallContext { cwd: string; hasUI?: boolean; actor?: Actor }
 
@@ -31,7 +31,7 @@ export function orchestratorWriteGate(
   const actor = trustedActorOf(ctx);
 
   if (event.toolName === "bash") {
-    const command = String(event.input?.command ?? "");
+    const command = commandFromInput(event.input);
     const targets = bashMutationTargets(command);
     const canonical = targets.find((path) => isCanonicalStatePath(path, ctx.cwd));
     if (canonical || looksLikeWorkflowStateMutation(command)) {
@@ -78,14 +78,34 @@ export function actorOf(input: Record<string, unknown> | undefined): Actor | und
   return raw === "orchestrator" || raw === "worker" || raw === "lead" ? raw : undefined;
 }
 
-function pathsFromInput(input: Record<string, unknown> | undefined): string[] {
-  const raw = input?.path ?? input?.file_path ?? input?.paths;
-  if (typeof raw === "string") return [raw];
-  if (Array.isArray(raw)) return raw.filter((p): p is string => typeof p === "string");
-  return [];
+function commandFromInput(input: ToolCallEvent["input"]): string {
+  if (typeof input === "string") return input;
+  if (!input) return "";
+  return String(input.command ?? "");
 }
 
-function isMountedToolRouteInput(input: Record<string, unknown> | undefined): boolean {
+function pathsFromInput(input: ToolCallEvent["input"]): string[] {
+  if (typeof input === "string") return pathsFromPatch(input);
+
+  const paths: string[] = [];
+  const raw = input?.path ?? input?.file_path ?? input?.paths;
+  if (typeof raw === "string") paths.push(raw);
+  if (Array.isArray(raw)) paths.push(...raw.filter((p): p is string => typeof p === "string"));
+  if (typeof input?.input === "string") paths.push(...pathsFromPatch(input.input));
+  return paths;
+}
+
+function pathsFromPatch(patch: string): string[] {
+  const paths: string[] = [];
+  const header = /^\[([^#\]\r\n]+)#[0-9A-Fa-f]{4}\]\s*$/gm;
+  for (const match of patch.matchAll(header)) {
+    const path = match[1];
+    if (path) paths.push(path);
+  }
+  return paths;
+}
+
+function isMountedToolRouteInput(input: ToolCallEvent["input"]): boolean {
   const paths = pathsFromInput(input);
   return paths.length > 0 && paths.every((path) => path.trim().toLowerCase().startsWith("xd://"));
 }
@@ -124,9 +144,25 @@ function isCanonicalStatePath(path: string, cwd: string): boolean {
 }
 
 function looksLikeWorkflowStateMutation(command: string): boolean {
-  const workflowPath = /(?:^|[\s"'`])(?:\.\/)?\.work-state(?:[\/\s"'`]|$)|(?:^|[\s"'`])(?:\.\/)?(?:team-state\.json|\.active-feature)(?:[\s"'`]|$)/i;
-  if (!workflowPath.test(command)) return false;
-  return /(?:>|>>|tee\b|(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|chmod|rsync|patch|ed|sponge)\b|(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|(?:python|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile|write_text|open\(|unlink|rename|mkdir)\b|git\s+(?:apply|checkout|restore|reset|clean|mv|rm|show|stash)\b)/i.test(command);
+  const workflowPath =
+    /(?:^|[\s"'`/])(?:\.\/)?\.work-state\/(?:team-state\.json|\.active-feature|features\/[A-Za-z0-9._-]+\/state\.json|cto\/[A-Za-z0-9._-]+\/state\.json)(?=$|[\s"'`;&|),])|(?:^|[\s"'`])(?:\.\/)?(?:team-state\.json|\.active-feature)(?=$|[\s"'`;&|),])/i;
+  if (!workflowPath.test(command) && !hasRelativeWorkflowStateContext(command)) return false;
+  return /(?:>|>>|tee\b|(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|chmod|rsync|patch|ed|sponge)\b|(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|(?:python(?:3)?|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile(?:Sync)?|appendFile(?:Sync)?|write_text|write_bytes|unlink|rename|mkdir|rmdir|remove|replace)\b|(?:python(?:3)?|ruby)\b[^\n]*(?:-c|--eval)[^\n]*open\([^\n)]*,\s*["\'][^"\']*[wax+][^"\']*["\']|git\s+(?:apply|checkout|restore|reset|clean|mv|rm|show|stash)\b)/i.test(command);
+}
+
+function hasRelativeWorkflowStateContext(command: string): boolean {
+  const cd = /(?:^|[;&|]\s*)cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi;
+  const rootRelative = /(?:^|[\s"'`])(?:\.\/)?(?:team-state\.json|\.active-feature|(?:features|cto)\/[A-Za-z0-9._-]+\/state\.json)(?=$|[\s"'`;&|),])/i;
+  const nestedRelative = /(?:^|[\s"'`])(?:\.\/)?state\.json(?=$|[\s"'`;&|),])/i;
+
+  for (const match of command.matchAll(cd)) {
+    const directory = (match[1] ?? match[2] ?? match[3] ?? "").replace(/\/+$/, "");
+    const afterCd = command.slice((match.index ?? 0) + match[0].length);
+    if (/(?:^|\/)\.work-state$/.test(directory) && rootRelative.test(afterCd)) return true;
+    if (/(?:^|\/)\.work-state\/features\/[A-Za-z0-9._-]+$/.test(directory) && nestedRelative.test(afterCd)) return true;
+    if (/(?:^|\/)\.work-state\/cto\/[A-Za-z0-9._-]+$/.test(directory) && nestedRelative.test(afterCd)) return true;
+  }
+  return false;
 }
 function bashMutationTargets(command: string): string[] {
   const targets: string[] = [];
@@ -172,7 +208,7 @@ const SWITCH_FORCE_BRANCH_MUTATION = /(?:^|[;&|]\s*)git\s+switch\b[^;&|]*(?:^|\s
  * discard worktree contents remain blocked.
  */
 function looksLikeSourceMutation(command: string): boolean {
-  return /(?:\b(?:tee)\b|\b(?:cat|printf|echo)\b[^\n]*(?:>|>>|<<)|(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|rsync|patch|ed|sponge)\b|\b(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\b(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\bgit\s+(?:apply|restore|reset|clean|mv|rm|stash)\b|\bgit\s+show\b[^\n]*(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:python|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile|write_text|open\(|unlink|rename|mkdir)\b)/i.test(command)
+  return /(?:\b(?:tee)\b|\b(?:cat|printf|echo)\b[^\n]*(?:>|>>|<<)|(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|rsync|patch|ed|sponge)\b|\b(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\b(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\bgit\s+(?:apply|restore|reset|clean|mv|rm|stash)\b|\bgit\s+show\b[^\n]*(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:python(?:3)?|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile(?:Sync)?|appendFile(?:Sync)?|write_text|write_bytes|unlink|rename|mkdir|rmdir|remove|replace)\b|(?:python(?:3)?|ruby)\b[^\n]*(?:-c|--eval)[^\n]*open\([^\n)]*,\s*["'][^"']*[wax+][^"']*["'])/i.test(command)
     || CHECKOUT_PATH_MUTATION.test(command)
     || CHECKOUT_FORCE_MUTATION.test(command)
     || CHECKOUT_FORCE_BRANCH_MUTATION.test(command)
@@ -230,7 +266,7 @@ export function workerWriteScopeGate(
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
   if (event.toolName !== "bash" && isMountedToolRouteInput(event.input)) return;
   if (trustedActorOf(ctx) !== "worker") return;
-  const paths = event.toolName === "bash" ? bashMutationTargets(String(event.input?.command ?? "")) : pathsFromInput(event.input);
+  const paths = event.toolName === "bash" ? bashMutationTargets(commandFromInput(event.input)) : pathsFromInput(event.input);
   if (paths.length === 0) return;
   for (const path of paths) {
     const absolute = isAbsolute(path) ? resolve(path) : resolve(ctx.cwd, path);
