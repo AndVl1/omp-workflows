@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.23.1] — 2026-08-23
+### Fixed
+- **Stale reopened-stage slot-artifact cleanup** — PR #44 (commit `897e031`) now removes stale slot artifacts when a workflow stage is reopened, preventing outdated artifacts from surviving a reopen.
+
 ## [0.23.0] — 2026-08-20
 ### Added
 - **On-demand workflow visualization (`/workflow-view`, visualize OPT-A)** — `packages/core/src/visualize/{types,snapshot,render-config,renderer-registry,render-json,render-spec,markdown,html,manifest,writer}.ts` + `packages/fullstack/commands/workflow-view/` — renders the selected/latest do-work or CTO workflow specification as a local, self-contained Markdown/HTML bundle under `.work-state/visualize/` (`index.md`, `index.html`, `manifest.json`, per-session pages). The bundle is a deterministic, read-only projection of canonical state and artifacts: statuses for produced/missing/pending/skipped/unreadable/degraded content, redacted and byte-bounded bodies, provenance (source digest, freshness, renderer identity), and a zero-dead-link internal link graph. **Local-only and on-demand**: generation runs only when the command is invoked — no engine hook, no automatic trigger, no implicit export or hosting; canonical state stays the source of truth and the bundle is always regenerable. **Deferred gates**: automated regeneration, explicit export, historical snapshots/URLs, and runtime search remain out of scope for OPT-A (the static bundle uses browser-native find). Compatibility boundary: `/session-report`, `buildSessionReport`/`renderReportHtml`/`writeReport`, `report.html` and every existing public contract are unchanged.
