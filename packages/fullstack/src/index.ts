@@ -50,6 +50,7 @@ import {
 	registerSubagentTree,
 	type SubagentTreeController,
 } from "./subagent-tree.js";
+import { registerLectureAcquireTool } from "./tools/lecture-acquire.js";
 // Auto-derived from core taxonomy; test-invariант в test/omp-model-roles.test.ts:439-446 ловит drift.
 const ROLE_COUNT = defaultFullstackModelRoles.length;
 
@@ -312,6 +313,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
       } catch (error) { return result({ ok: false, code: "WORKFLOW_ADVANCE_FAILED", error: String(error) }); }
     },
   });
+  registerLectureAcquireTool(pi, z, { resolveSessionCwd, isMainSessionContext });
 }
 
 export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {

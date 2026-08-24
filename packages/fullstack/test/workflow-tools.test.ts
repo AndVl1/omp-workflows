@@ -18,10 +18,15 @@ test("fullstack: workflow tools register and fail closed with structured respons
     },
   } as never);
 
-  assert.deepEqual([...tools.keys()], ["workflow_begin", "workflow_status", "workflow_instructions", "workflow_complete", "workflow_checkpoint", "workflow_advance"]);
+  assert.deepEqual([...tools.keys()], ["workflow_begin", "workflow_status", "workflow_instructions", "workflow_complete", "workflow_checkpoint", "workflow_advance", "lecture_acquire"]);
   for (const name of tools.keys()) {
     assert.ok(tools.get(name)?.parameters, `${name} exposes a parameter schema`);
   }
+  const lectureAcquire = tools.get("lecture_acquire")!;
+  const workerLectureResult = await lectureAcquire.execute("worker", {}, undefined, undefined, { cwd: process.cwd(), hasUI: false } as never);
+  assert.equal((workerLectureResult.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
+  const lectureUnavailableResult = await lectureAcquire.execute("test", {}, undefined, undefined, null);
+  assert.equal((lectureUnavailableResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
 
   const begin = tools.get("workflow_begin")!;
   const workerBeginResult = await begin.execute("worker", {}, undefined, undefined, { cwd: process.cwd(), hasUI: false } as never);

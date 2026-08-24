@@ -5,16 +5,20 @@
  *   - resolveWorkflow: LECTURE_RESEARCH -> "lecture-research" at EVERY
  *     complexity x autonomy; generic INVESTIGATION -> "research" unchanged.
  *   - selectProfile over the shipped profiles: the dedicated LECTURE_RESEARCH
- *     intent selects lecture-research with the exact five-stage sequence
- *     intake -> lecture_mapping -> synthesis -> repo_fit -> approval, and a
- *     model-provided workflow cannot hijack the dedicated intent.
+ *     intent selects lecture-research with the exact six-stage sequence
+ *     intake -> acquisition -> lecture_mapping -> synthesis -> repo_fit -> approval,
+ *     and a model-provided workflow cannot hijack the dedicated intent.
  *   - The profile's artifacts are covered by the shipped schema registry:
- *     grounded intake/mapping/candidate/repo-fit/decision shapes pass;
- *     missing provenance/evidence and invalid verdicts block.
+ *     URL-first intake/acquisition/mapping/candidate/repo-fit/decision shapes pass;
+ *     missing provenance/evidence, invalid acquisition timestamps, and invalid
+ *     verdicts block.
+ *   - Acquisition gate: only succeeded or evidence-bearing partial acquisition
+ *     advances; failed and empty/invalid partial results fail closed.
  *   - Approval gate: the profile's gate expression completes ONLY on an
  *     approved or rejected decision; anything else fails closed.
  *   - Prompts: /do-work (classification contract) and the fresh + amend /cto
- *     prompts expose LECTURE_RESEARCH, lecture-research and the
+ *     prompts expose URL + prompt as the only prerequisite, mandatory
+ *     lecture_acquire, no transcript request, no network mapping, and
  *     no-implementation-before-approval policy.
  *   - Keyword fallback stays conservative: lecture/playlist wording maps to
  *     LECTURE_RESEARCH, generic investigate/research wording stays
@@ -91,6 +95,52 @@ function lectureProfile() {
   assert.ok(profile, "the lecture-research profile must ship with the package");
   return profile;
 }
+function acquisitionArtifact(
+  status: "succeeded" | "partial" | "failed",
+  evidence: unknown[] = status === "failed"
+    ? []
+    : [{
+        evidenceId: "ev-1",
+        sourceId: "yt-video-abc",
+        location: "https://www.youtube.com/watch?v=abc",
+        provider: "test-provider",
+        kind: "transcript_excerpt",
+        quote: "events are the source of truth",
+        startSeconds: 4,
+        endSeconds: 18,
+      }],
+  failures: unknown[] = [],
+): Record<string, unknown> {
+  return {
+    schemaVersion: 1,
+    status,
+    request: {
+      sourceUrl: "https://www.youtube.com/watch?v=abc",
+      canonicalUrl: "https://www.youtube.com/watch?v=abc",
+      sourceKind: "video",
+      prompt: "What architecture does the lecture teach?",
+      limits: {
+        maxItems: 8,
+        maxPages: 4,
+        deadlineMs: 300000,
+        maxAttempts: 2,
+        maxResponseBytes: 1048576,
+        maxEvidenceSegmentsPerSource: 64,
+      },
+    },
+    sourceSet: {
+      requested: { kind: "video", videoId: "abc", canonicalUrl: "https://www.youtube.com/watch?v=abc" },
+      items: [{ sourceId: "yt-video-abc", videoId: "abc", canonicalUrl: "https://www.youtube.com/watch?v=abc" }],
+      truncated: false,
+      failures,
+    },
+    evidence,
+    failures,
+    provider: { id: "test-provider", model: "offline" },
+    startedAt: "2026-08-24T10:00:00.000Z",
+    completedAt: "2026-08-24T10:00:01.000Z",
+  };
+}
 
 test("lecture-research: resolveWorkflow maps LECTURE_RESEARCH at every complexity and autonomy", () => {
   for (const complexity of COMPLEXITIES) {
@@ -118,13 +168,23 @@ test("lecture-research: selectProfile returns the shipped profile with the exact
   assert.equal(profile.name, "lecture-research");
   assert.deepEqual(
     profile.stages.map((stage) => stage.id),
-    ["intake", "lecture_mapping", "synthesis", "repo_fit", "approval"],
+    ["intake", "acquisition", "lecture_mapping", "synthesis", "repo_fit", "approval"],
     "exact lecture-research stage sequence",
   );
   const approval = profile.stages.find((stage) => stage.id === "approval");
   assert.ok(approval, "approval stage exists");
   assert.ok(approval.gate, "approval stage declares a gate");
   assert.equal(approval.produces, "lecture_decision");
+  const acquisition = profile.stages.find((stage) => stage.id === "acquisition");
+  assert.ok(acquisition, "automatic acquisition stage exists");
+  const acquisitionPrompt = acquisition?.prompt ?? "";
+  assert.ok(
+    acquisitionPrompt.includes("Do not ask the user for a transcript"),
+    "automatic acquisition must not request a manual transcript",
+  );
+  for (const manualSource of ["captions", "recording", "notes", "media file"]) {
+    assert.ok(acquisitionPrompt.includes(manualSource), `automatic acquisition must not request ${manualSource}`);
+  }
 });
 
 test("lecture-research: dedicated intent cannot be hijacked by a model-provided workflow", () => {
@@ -204,6 +264,7 @@ test("lecture-research: every artifact the profile produces or consumes has a sh
     for (const id of stage.consumes ?? []) ids.add(id);
   }
   assert.deepEqual([...ids].sort(), [
+    "lecture_acquisition",
     "lecture_candidates",
     "lecture_decision",
     "lecture_intake",
@@ -213,24 +274,36 @@ test("lecture-research: every artifact the profile produces or consumes has a sh
   const schemas = loadArtifactSchemas();
   for (const id of ids) assert.ok(schemas[id], `schema for '${id}' must exist`);
   assert.deepEqual(requiredFieldsOf("lecture_intake"), ["task", "sources"]);
+  assert.deepEqual(requiredFieldsOf("lecture_acquisition"), [
+    "schemaVersion",
+    "status",
+    "request",
+    "sourceSet",
+    "evidence",
+    "failures",
+    "provider",
+    "startedAt",
+    "completedAt",
+  ]);
   assert.deepEqual(requiredFieldsOf("lecture_mapping"), ["lectures", "coverage"]);
   assert.deepEqual(requiredFieldsOf("lecture_decision"), ["verdict"]);
 });
 
 test("lecture-research: artifact contract accepts grounded artifacts, rejects missing provenance/evidence", () => {
-  // intake: grounded provenance passes; missing provenance and empty sources block.
+  // intake: one URL plus prompt and acquisition-pending provenance pass; missing
+  // provenance and empty sources block.
   assert.deepEqual(
     validateProducedArtifact("lecture_intake", {
       task: "What architecture does the course teach?",
       sources: [
-        { id: "lecture-01", kind: "transcript", location: "sources/lecture-01.vtt", provenance: "provided file; timecodes embedded" },
+        { id: "lecture-url", kind: "url", location: "https://www.youtube.com/watch?v=abc", provenance: "user-provided URL; acquisition pending" },
       ],
     }),
     { ok: true },
   );
   const noProvenance = validateProducedArtifact("lecture_intake", {
     task: "t",
-    sources: [{ id: "lecture-01", kind: "transcript", location: "sources/lecture-01.vtt" }],
+    sources: [{ id: "lecture-url", kind: "url", location: "https://www.youtube.com/watch?v=abc" }],
   });
   assert.equal(noProvenance.ok, false, "intake source without provenance blocks");
   if (!noProvenance.ok) {
@@ -241,12 +314,49 @@ test("lecture-research: artifact contract accepts grounded artifacts, rejects mi
   }
   assert.equal(validateProducedArtifact("lecture_intake", { task: "t", sources: [] }).ok, false, "empty intake sources block");
 
+  // acquisition: normalized timestamped evidence is required for success and
+  // partial; failed may preserve a provider failure with no evidence.
+  const failure = { code: "NETWORK_ERROR", message: "provider timeout", retryable: true, attempts: 2, severity: "warning" };
+  assert.deepEqual(validateProducedArtifact("lecture_acquisition", acquisitionArtifact("succeeded")), { ok: true });
+  assert.deepEqual(
+    validateProducedArtifact("lecture_acquisition", acquisitionArtifact("partial", undefined, [failure])),
+    { ok: true },
+    "partial acquisition preserves failures while carrying valid evidence",
+  );
+  assert.deepEqual(validateProducedArtifact("lecture_acquisition", acquisitionArtifact("failed", [], [failure])), { ok: true });
+  const emptyPartial = validateProducedArtifact("lecture_acquisition", acquisitionArtifact("partial", [], [failure]));
+  assert.equal(emptyPartial.ok, false, "partial acquisition without evidence cannot advance");
+  const invalidTimestamp = validateProducedArtifact(
+    "lecture_acquisition",
+    acquisitionArtifact("succeeded", [{ ...((acquisitionArtifact("succeeded").evidence as unknown[])[0] as Record<string, unknown>), endSeconds: 4 }]),
+  );
+  assert.equal(invalidTimestamp.ok, false, "evidence end timestamp must be strictly greater than start");
+  const backwardsClock = validateProducedArtifact("lecture_acquisition", {
+    ...acquisitionArtifact("failed"),
+    startedAt: "2026-08-24T10:00:02.000Z",
+    completedAt: "2026-08-24T10:00:01.000Z",
+  });
+  assert.equal(backwardsClock.ok, false, "acquisition completion timestamp cannot precede start");
+
   // mapping: every lecture entry must carry quoted evidence.
   assert.deepEqual(
     validateProducedArtifact("lecture_mapping", {
       coverage: "lecture-01 mapped; lecture-02 unmapped (no transcript)",
       lectures: [
-        { id: "lecture-01-unit-1", title: "Event sourcing intro", source_id: "lecture-01", evidence: '[04:12] "events are the source of truth"' },
+        {
+          id: "lecture-01-unit-1",
+          title: "Event sourcing intro",
+          source_id: "lecture-01",
+          evidence: '[00:04-00:18] "events are the source of truth"',
+          evidence_refs: [{
+            evidence_id: "ev-1",
+            source_id: "yt-video-abc",
+            location: "https://www.youtube.com/watch?v=abc",
+            quote: "events are the source of truth",
+            start_seconds: 4,
+            end_seconds: 18,
+          }],
+        },
       ],
     }),
     { ok: true },
@@ -321,6 +431,42 @@ test("lecture-research: decision artifact accepts approved and rejected verdicts
   );
 });
 
+test("lecture-research: acquisition gate accepts succeeded/partial and rejects failed", () => {
+  const acquisition = lectureProfile().stages.find((stage) => stage.id === "acquisition");
+  assert.ok(acquisition, "acquisition stage exists");
+  assert.equal(acquisition.type, "orchestrator");
+  assert.deepEqual(acquisition.consumes, ["lecture_intake"]);
+  assert.equal(acquisition.produces, "lecture_acquisition");
+  assert.match(acquisition.prompt ?? "", /lecture_acquire/);
+  assert.match(acquisition.prompt ?? "", /provider.*setup|installation/i);
+  assert.match(acquisition.prompt ?? "", /do not ask the user for a transcript/i);
+  const root = mkdtempSync(join(tmpdir(), "lecture-acquisition-gate-"));
+  try {
+    const artifactsDir = join(root, "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    const stageState = { ...minimalState(), stage_cursor: "acquisition", stages: [{ id: "acquisition", status: "in_progress" }] };
+    const gate = acquisition.gate ?? "";
+    assert.match(gate, /lecture_acquisition\.status == succeeded/);
+    assert.match(gate, /lecture_acquisition\.status == partial/);
+    for (const status of ["succeeded", "partial"] as const) {
+      writeFileSync(join(artifactsDir, "lecture_acquisition.json"), JSON.stringify(acquisitionArtifact(status)));
+      assert.deepEqual(
+        evaluatePredicate(gate, { flags: FLAGS, artifactsDir, state: stageState, stage: acquisition }),
+        { ok: true, value: true },
+        `acquisition gate must accept '${status}'`,
+      );
+    }
+    writeFileSync(join(artifactsDir, "lecture_acquisition.json"), JSON.stringify(acquisitionArtifact("failed")));
+    assert.deepEqual(
+      evaluatePredicate(gate, { flags: FLAGS, artifactsDir, state: stageState, stage: acquisition }),
+      { ok: true, value: false },
+      "acquisition gate must reject failed status",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("lecture-research: approval gate completes only on approved or rejected decisions", () => {
   const approval = lectureProfile().stages.find((stage) => stage.id === "approval");
   assert.ok(approval, "approval stage exists");
@@ -391,6 +537,13 @@ test("lecture-research: do-work prompt and classification contract expose the de
     );
     assert.ok(prompt.includes("LECTURE_RESEARCH"), "do-work prompt exposes the LECTURE_RESEARCH type");
     assert.ok(prompt.includes("lecture-research"), "do-work prompt exposes the lecture-research profile");
+    assert.ok(prompt.includes("lecture_acquire"), "do-work prompt mandates automatic acquisition through lecture_acquire");
+    assert.match(prompt, /only user content prerequisite is exactly one public YouTube video\/playlist URL/i);
+    assert.match(prompt, /do not ask for or require a transcript/i);
+    assert.ok(
+      prompt.includes("Mapping consumes normalized acquisition evidence and performs no network access."),
+      "do-work mapping contract is offline and consumes normalized acquisition evidence",
+    );
     assert.ok(prompt.includes("never routed to an implementation workflow"), "do-work prompt carries the research-only policy");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -406,7 +559,11 @@ test("lecture-research: fresh and amend CTO prompts keep the research-only human
     );
     assert.ok(fresh.includes("LECTURE_RESEARCH"), "fresh CTO prompt exposes the LECTURE_RESEARCH type");
     assert.ok(fresh.includes("lecture-research"), "fresh CTO prompt exposes the lecture-research profile");
-    assert.match(fresh, /no implementation (?:starts )?before approval/i, "fresh CTO prompt carries the no-implementation-before-approval policy");
+    assert.ok(fresh.includes("No implementation starts before approval."), "fresh CTO prompt carries the no-implementation-before-approval policy");
+    assert.ok(fresh.includes("lecture_acquire"), "fresh CTO prompt mandates automatic acquisition");
+    assert.match(fresh, /URL is the only user content prerequisite/i);
+    assert.match(fresh, /no transcript is requested/i);
+    assert.match(fresh, /core does not fetch URLs/i);
 
     const res = runCto({
       task: "Feature A",
@@ -427,7 +584,11 @@ test("lecture-research: fresh and amend CTO prompts keep the research-only human
     );
     assert.ok(amend.includes("LECTURE_RESEARCH"), "amend CTO prompt exposes the LECTURE_RESEARCH type");
     assert.ok(amend.includes("lecture-research"), "amend CTO prompt exposes the lecture-research profile");
-    assert.match(amend, /no implementation (?:starts )?before approval/i, "amend CTO prompt carries the no-implementation-before-approval policy");
+    assert.ok(amend.includes("No implementation starts before approval."), "amend CTO prompt carries the no-implementation-before-approval policy");
+    assert.ok(amend.includes("lecture_acquire"), "amend CTO prompt mandates automatic acquisition");
+    assert.match(amend, /URL is the only user content prerequisite/i);
+    assert.match(amend, /no transcript is requested/i);
+    assert.match(amend, /core does not fetch URLs/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

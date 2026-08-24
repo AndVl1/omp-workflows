@@ -79,9 +79,9 @@ export function buildWorkflowMatrix(): string {
     "",
     "> Autonomous BUG_FIX resolves to debug-cycle even at QUICK complexity (autonomous=true).",
     "> SPEC and REGRESS are first-class task intents and do not modify the standard FEATURE/BUG_FIX routing.",
-    "> LECTURE_RESEARCH (transcript/playlist research) is a DEDICATED research intent, distinct from generic",
+    "> LECTURE_RESEARCH (one public video/playlist URL + natural-language prompt) is a DEDICATED research intent, distinct from generic",
     "> INVESTIGATION -> research: it resolves to the lecture-research profile at EVERY complexity and",
-    "> autonomy, and is never routed to an implementation workflow (research-only, human approval gate).",
+    "> autonomy, and is never routed to an implementation workflow (research-only, human approval gate). The URL is the only user content prerequisite; do not request a transcript. Acquisition is automatic through the consumer-provided `lecture_acquire` tool; provider setup is an installation concern and core does not fetch URLs.",
     "> The P5 gate re-derives the expected workflow from the persisted classification",
     "(`classification.autonomous`), so the workflow row must match this matrix. Never re-derive",
     "autonomy from task text or markers — the model `autonomous` field is the only authority."

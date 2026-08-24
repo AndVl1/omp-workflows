@@ -26,6 +26,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 import { readArtifact } from "./artifacts.js";
+import { validateLectureAcquisitionArtifact } from "../lecture/acquisition.js";
 import type { Profile, StageDef, TeamState } from "./types.js";
 
 export interface JsonSchemaDef {
@@ -116,6 +117,9 @@ export function validateProducedArtifact(
   if (!schema) return { ok: true };
   const issues: ArtifactIssue[] = [];
   validateValue(schema, value, "$", issues, `artifact '${id}'`);
+  if (id === "lecture_acquisition") {
+    issues.push(...validateLectureAcquisitionArtifact(value));
+  }
   return issues.length > 0 ? { ok: false, issues } : { ok: true };
 }
 
@@ -178,6 +182,9 @@ export function validateConsumedArtifacts(
     }
     const issues: ArtifactIssue[] = [];
     validateValue(schema, value, "$", issues, `artifact '${id}'`);
+    if (id === "lecture_acquisition") {
+      issues.push(...validateLectureAcquisitionArtifact(value));
+    }
     diagnostics.push({ id, missing: false, producer_status: producerStatus.get(id) ?? null, issues });
   }
   const blocking = diagnostics.filter((diagnostic) => diagnostic.issues.length > 0);

@@ -44,7 +44,7 @@ function state(overrides: Partial<TeamState> = {}): TeamState {
 
 test("artifact contract: shipped schema registry covers every workflow artifact id", () => {
   const schemas = loadArtifactSchemas();
-  for (const id of ["discovery", "exploration", "clarifications", "architecture", "diagnosis", "implementation", "debug", "review", "summary", "manual_qa", "qa_tests", "feature_spec", "dod", "cto_discovery", "team_plan", "team_artifacts", "integration_review"]) {
+  for (const id of ["discovery", "exploration", "clarifications", "architecture", "diagnosis", "implementation", "debug", "review", "summary", "manual_qa", "qa_tests", "feature_spec", "dod", "cto_discovery", "team_plan", "team_artifacts", "integration_review", "lecture_acquisition"]) {
     assert.ok(schemas[id], `schema for '${id}' must exist`);
   }
   assert.deepEqual(requiredFieldsOf("implementation"), ["files_touched"]);
