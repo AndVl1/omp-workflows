@@ -42,6 +42,7 @@ Borrowed from harnest. Every stage is exactly one of:
 | `orchestrator` | Main context performs it directly (no subagent). E.g. discovery, summary, clarifying questions. |
 | `single` | Exactly one subagent. Role resolved via `.omp/team.config.json` (fallback: legacy `.claude/team.config.json`) or file scope. |
 | `consilium` | N subagents in parallel (`roles[]`). E.g. exploration, architecture options, review. |
+| `document` | Deterministic engine-rendered document (see the `document` field: format/renderer/path). No model, no dispatch — the engine renders at the advance boundary. The shipped product PRD is human-first: executive summary, detailed product direction, then critique/evidence/problem framing/intake and metadata; rendering stays deterministic and engine-owned. |
 | `bash` | Deterministic shell step, no model. |
 | `none` | Placeholder / skip. |
 
@@ -60,8 +61,11 @@ OR `match.complexity` is absent).
 4. `standard`
 5. `lightweight`
 6. `research`
-7. `review`
-8. `emergency`
+7. `product-discovery`
+8. `spec-preparation`
+9. `feature-regression`
+10. `review`
+11. `emergency`
 
 Resulting table (every Type × Complexity resolves):
 
@@ -74,11 +78,32 @@ Resulting table (every Type × Complexity resolves):
 | INVESTIGATION | research | research | research | research |
 | REVIEW | review | review | review | review |
 | HOTFIX | emergency | emergency | emergency | emergency |
+| SPEC | spec-preparation | spec-preparation | spec-preparation | spec-preparation |
+| REGRESS | feature-regression | feature-regression | feature-regression | feature-regression |
+| PRODUCT_DISCOVERY | product-discovery | product-discovery | product-discovery | product-discovery |
 
 **Fallback**: if no profile matches (e.g. a custom type), the interpreter uses `standard`.
 
 **Autonomous override**: in autonomous mode, every `BUG_FIX` uses `debug-cycle` regardless
 of complexity (the diagnostics ↔ manual-qa loop is how a hypothesis is formed without a human).
+
+### Product discovery vs specification
+
+`PRODUCT_DISCOVERY` and `SPEC` are deliberately distinct first-class intents:
+
+- **`product-discovery`** answers **what to build and why** — product-level only. It is
+  evidence-first (every claim is `verified | assumption | unknown` with a source), never
+  touches application code, and always ends in an **interactive product-owner approval**
+  (`product_approval` checkpoint, decision exactly one of
+  `proceed | needs_more_validation | defer | reject`, recorded via `workflow_checkpoint`
+  with `mode=interactive` — no inferred consent, no auto-approval). Because the decision is
+  always human-made, **autonomous product discovery fails closed**: a `PRODUCT_DISCOVERY`
+  classification with `autonomous=true` is rejected at the classification gate.
+- **`spec-preparation`** answers **how to build it** — it turns a confirmed direction (a
+  `product_spec` handoff from an approved discovery, or a standalone SPEC request) into an
+  implementation-ready specification with requirements, options, architecture slices, and a
+  completeness gate. Its intake stage optionally consumes `product_spec` as approved product
+  context; the absence of that artifact never blocks a standalone SPEC.
 
 This table is mirrored in `hooks/validate-state.sh` (P5) — the classification gate blocks
 launching agents if `team-state.json`'s `workflow` does not match its `classification`.
@@ -93,7 +118,7 @@ launching agents if `team-state.json`'s `workflow` does not match its `classific
    - **read** every artifact id in `consumes` from `.work-state/artifacts/<id>.json` and
      thread relevant content into subagent prompts (no pasted prose — P2).
    - **run** per `type`: orchestrator (inline), single (one Task), consilium (parallel Tasks),
-     bash (shell), none (skip). For `consilium`, apply `conditional[]` against scope flags to
+     document (engine render at advance), bash (shell), none (skip). For `consilium`, apply `conditional[]` against scope flags to
      adjust the roster.
    - **resolve roles → agents**: agent name from `.omp/team.config.json` `roles` (P6), falling back to built-in defaults and legacy `.claude/team.config.json`. Model capability is set by agent frontmatter and OMP policy — low-tier agents use `@smol` + `thinkingLevel: medium`, middle-tier use `@task` + `thinkingLevel: auto`, high-tier use `@slow` + `thinkingLevel: high`. Concrete models are configured via OMP `modelRoles` or `task.agentModelOverrides`, not in workflow config.
    - **checkpoint**: interactive → stop and wait; autonomous → apply `autonomous` decision + log.

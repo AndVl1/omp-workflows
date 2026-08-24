@@ -43,26 +43,11 @@
  * timeline (statuses are derived from team/integration state).
  */
 
+import { escapeHtml, OFFLINE_BASE_CSS, renderOfflineHtml } from "./html-shell.js";
 import type { ArtifactStatus, EdgeKind, ReportArtifact, SessionReport, StageAgentInfo } from "./types.js";
 
-// ── Escaping ────────────────────────────────────────────────────────────────
+const esc = escapeHtml;
 
-/** HTML-escape a value for a text node or double-quoted attribute. */
-function esc(value: unknown): string {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-/**
- * True when a value is a usable http(s) link target: a non-empty string whose
- * scheme is exactly http:// or https:// (case-insensitive). Empty, malformed,
- * and non-http(s) schemes (javascript:, data:, file:, …) are rejected so
- * agent-written state can never produce a script-capable href.
- */
 function isHttpUrl(value: unknown): value is string {
   if (typeof value !== "string" || value.trim().length === 0) return false;
   try {
@@ -71,21 +56,8 @@ function isHttpUrl(value: unknown): value is string {
   } catch {
     return false;
   }
-}
 
-/**
- * Serialize the report into a JSON string that is safe to embed between
- * <script>…</script> delimiters. `<` can only appear inside JSON string
- * literals, so replacing it with the (string-valid) \u003c escape can never
- * change the document structure and JSON.parse round-trips the payload.
- */
-function jsonIsland(report: SessionReport): string {
-  return JSON.stringify(report)
-    .replace(/</g, "\\u003c")
-    .replace(/\u2028/g, "\\u2028")
-    .replace(/\u2029/g, "\\u2029");
 }
-
 // ── Status / label helpers ──────────────────────────────────────────────────
 
 const STATUS_CLASS: Record<string, string> = {
@@ -283,7 +255,9 @@ function renderStageNode(s: SessionReport["stages"][number], derived: boolean, r
 // main screen; expanded it reveals, in place:
 //   - the global session task (report.meta.task — never a stage-specific task),
 //   - the stage's optional profile metadata (description/checkpoint/gate/
-//     autonomous — consumed from the shared optional StageInfo contract),
+//     autonomous/document — consumed from the shared optional StageInfo
+//     contract; `document` renders its typed format/renderer/path contract
+//     only, never the rendered document content),
 //   - agents/source, declared inputs and outputs,
 //   - compact artifact summaries for input/output ids (status, type/keys,
 //     bounded summary, and an in-page anchor to the matching artifact card
@@ -315,6 +289,9 @@ function renderStageDetails(s: SessionReport["stages"][number], report: SessionR
   if (s.checkpoint) pushRow("Checkpoint", esc(s.checkpoint));
   if (s.gate) pushRow("Gate", esc(s.gate));
   if (s.autonomous !== undefined && s.autonomous !== "") pushRow("Autonomous", esc(s.autonomous));
+  if (s.document) {
+    pushRow("Document", `${esc(s.document.format)} · ${esc(s.document.renderer)} · <code>${esc(s.document.path)}</code>`);
+  }
   pushRow("Agents", esc(agentSummary(s.agents)));
 
   // CTO team stages: pull the linked report.teams record (bare id) so the
@@ -968,26 +945,7 @@ const APP_SCRIPT = `<script>
 // ── Stylesheet (inline, no external assets) ─────────────────────────────────
 
 const CSS = `
-:root {
-  --bg: #f5f6f8;
-  --card: #ffffff;
-  --ink: #1c2330;
-  --muted: #667085;
-  --line: #e4e7ec;
-  --accent: #2f6fed;
-  --ok: #12b76a;
-  --warn: #b54708;
-  --err: #d92d20;
-  --amber: #b54708;
-}
-* { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; }
-body {
-  margin: 0;
-  font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  background: var(--bg);
-  color: var(--ink);
-}
+${OFFLINE_BASE_CSS}
 .container { max-width: 980px; margin: 0 auto; padding: 28px 18px 72px; }
 h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
 h2 { font-size: 16px; margin: 0 0 12px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
@@ -1222,20 +1180,12 @@ export function renderReportHtml(report: SessionReport): string {
     `<footer class="report-footer">${REDACTION_NOTICE}</footer>`,
   ].join("\n");
 
-  return [
-    "<!doctype html>",
-    '<html lang="en">',
-    "<head>",
-    '  <meta charset="utf-8">',
-    '  <meta name="viewport" content="width=device-width, initial-scale=1">',
-    `  <title>${esc(report.meta.title)} — Session Report</title>`,
-    `  <style>${CSS}</style>`,
-    "</head>",
-    "<body>",
+  return renderOfflineHtml({
+    title: `${report.meta.title} — Session Report`,
+    lang: "en",
+    css: CSS,
     body,
-    `<script id="omp-report-data" type="application/json">${jsonIsland(report)}</script>`,
-    APP_SCRIPT,
-    "</body>",
-    "</html>",
-  ].join("\n");
+    dataIsland: { id: "omp-report-data", value: report },
+    script: APP_SCRIPT,
+  });
 }

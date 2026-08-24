@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { loadProfile, profileHash } from "./profile.js";
 import { resolveState, writeState, isSafeStateSegment, resolveActiveBranch, type ResolvedState } from "./state.js";
 import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole } from "./config.js";
@@ -12,7 +12,7 @@ import { isDoDComplete, isRootCauseDocumented, readDoD } from "./dod.js";
 import { validationGate } from "../gates/validation.js";
 import { buildDispatchMarker } from "../gates/dispatch.js";
 import { evaluatePredicate } from "./predicate.js";
-import { appendCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
+import { appendCheckpointDecision, findCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
 import { loopExhaustionKind, loopIterationRecord, loopReentryDecision, loopStateFor, resolveBackToStage } from "./loops.js";
 import {
   DEFAULT_FAN_IN_POLICY,
@@ -29,6 +29,7 @@ import {
   type ArtifactContractPolicy,
 } from "./artifact-contract.js";
 import type { CheckpointDecision, DispatchCompletion, DispatchRecord, LoopState, TeamState, StageDef } from "./types.js";
+import { PRD_SOURCE_ARTIFACT_IDS, writeProductPrdDocument } from "./product-prd.js";
 
 export type DispatchAuth = {
   token: string;
@@ -124,6 +125,14 @@ const activeCapability = (value: TeamState["dispatch_capability"]): ActiveCapabi
   return value as ActiveCapability;
 };
 
+/** Issued capability secrets plus the persisted capability state (see createCapability). */
+export type IssuedCapability = {
+  capability_id: string;
+  dispatch_token: string;
+  advance_token: string;
+  state: NonNullable<TeamState["dispatch_capability"]>;
+};
+
 export type TransitionResult = { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff } | { ok: false; error: string; state?: TeamState };
 
 export interface CapabilityHandoff {
@@ -191,7 +200,7 @@ export function createCapability(input: {
   run_key: string; branch: string; workflow: TeamState["classification"]["workflow"]; profile_hash: string;
   stage_cursor: string; cursor_epoch?: string; kind: "none" | "single" | "consilium"; expected_roles?: string[];
   dispatch_secret?: string; advance_secret?: string; expected_roster?: Array<{ role: string; agent: string }>;
-}): { capability_id: string; dispatch_token: string; advance_token: string; state: NonNullable<TeamState["dispatch_capability"]> } {
+}): IssuedCapability {
   if (!input.run_key || !input.branch || !input.workflow || !input.profile_hash || !input.stage_cursor) throw new Error("invalid capability binding");
   const cursor_epoch = input.cursor_epoch ?? randomUUID();
   const dispatch_token = input.dispatch_secret ?? randomUUID();
@@ -203,12 +212,7 @@ export function createCapability(input: {
   const state = { capability_id: randomUUID(), dispatch_token_hash: hash(dispatch_token), advance_token_hash: hash(advance_token), issued_for: { run_key: input.run_key, branch: input.branch, workflow: input.workflow, profile_hash: input.profile_hash, stage_cursor: input.stage_cursor, cursor_epoch }, kind: input.kind, expected_roles, expected_count: roster.length, expected_roster: roster, status: "ready" as const, dispatches: [] };
   return { capability_id: state.capability_id, dispatch_token, advance_token, state };
 }
-function reissueActiveCapability(cap: ActiveCapability): {
-  capability_id: string;
-  dispatch_token: string;
-  advance_token: string;
-  state: NonNullable<TeamState["dispatch_capability"]>;
-} {
+function reissueActiveCapability(cap: ActiveCapability): IssuedCapability {
   const dispatch_token = randomUUID();
   const advance_token = randomUUID();
   return {
@@ -813,6 +817,32 @@ const NAMED_GATES: Record<string, (state: TeamState, artifactsDir: string) => st
     const tests = objectArtifact(artifactsDir, "qa_tests");
     return tests?.build_status === "pass" ? null : "tests_passed gate requires qa_tests.build_status=pass";
   },
+  /**
+   * Product approval gate. Requires a durable decision for the
+   * (stage, checkpoint) pair ('product_approval', 'product_approval'):
+   * recorded interactively, never autonomous, normalized to exactly one of
+   * the four allowed product decisions. Attached to both the
+   * `product_approval` stage (which records the decision) and the
+   * `product_handoff` stage (which consumes the approval record), so the
+   * decision lookup is keyed by the declaring stage id, not the gate host.
+   */
+  product_approval_recorded: (state) => {
+    const PRODUCT_APPROVAL_STAGE = "product_approval";
+    const PRODUCT_APPROVAL_CHECKPOINT = "product_approval";
+    const PRODUCT_DECISIONS = ["proceed", "needs_more_validation", "defer", "reject"];
+    const decision = findCheckpointDecision(state, PRODUCT_APPROVAL_STAGE, PRODUCT_APPROVAL_CHECKPOINT);
+    if (!decision) {
+      return "product_approval_recorded gate: no durable decision recorded for checkpoint 'product_approval' (stage 'product_approval'); the product owner must answer via workflow_checkpoint with mode=interactive and decision exactly one of proceed | needs_more_validation | defer | reject — no inferred consent";
+    }
+    if (decision.mode !== "interactive") {
+      return `product_approval_recorded gate: checkpoint 'product_approval' was recorded in mode '${decision.mode}', but product approval requires an interactive human decision — autonomous decisions are rejected`;
+    }
+    const normalized = decision.decision.trim().toLowerCase();
+    if (!PRODUCT_DECISIONS.includes(normalized)) {
+      return `product_approval_recorded gate: decision '${decision.decision}' is not one of the four allowed product approval decisions (proceed | needs_more_validation | defer | reject)`;
+    }
+    return null;
+  },
 };
 
 type StageCompletionResult = { ok: true; notes: string[] } | { ok: false; error: string };
@@ -870,6 +900,37 @@ function validateStageCompletion(
     .filter((diagnostic) => diagnostic.missing && diagnostic.issues.length === 0)
     .map((diagnostic) => `consumed artifact '${diagnostic.id}' is absent (producer ${diagnostic.producer_status ?? "unknown"})`);
   return { ok: true, notes };
+}
+
+/**
+ * Executable `document` stage render at the durable advance boundary: the
+ * engine — not an agent — renders the declared document from the stage's
+ * declared sources and persists the document plus the typed artifact.
+ * Fail-closed: a missing source, an unsupported contract or an unsafe
+ * path blocks the transition before anything is marked done.
+ */
+function renderStageDocument(stage: StageDef, target: ResolvedState): { ok: true } | { ok: false; error: string } {
+  const contract = stage.document;
+  if (!contract) return { ok: false, error: `document stage '${stage.id}' is missing its document declaration` };
+  if (contract.format !== "markdown" || contract.renderer !== "product-prd") {
+    return { ok: false, error: `document stage '${stage.id}' declares an unsupported document contract (format '${contract.format}', renderer '${contract.renderer}')` };
+  }
+  const artifactsDir = target.artifactsDir;
+  if (!artifactsDir) return { ok: false, error: `document stage '${stage.id}': artifacts dir unavailable` };
+  const sourceArtifacts: Record<string, unknown> = {};
+  for (const id of PRD_SOURCE_ARTIFACT_IDS) {
+    const artifact = readArtifact(artifactsDir, id);
+    if (artifact === null) return { ok: false, error: `document stage '${stage.id}': source artifact '${id}.json' not found` };
+    sourceArtifacts[id] = artifact;
+  }
+  const written = writeProductPrdDocument({
+    stateDir: dirname(artifactsDir),
+    artifactsDir,
+    path: contract.path,
+    sourceArtifacts,
+  });
+  if (!written.ok) return { ok: false, error: `document stage '${stage.id}' render failed: ${written.error}` };
+  return { ok: true };
 }
 
 export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResult {
@@ -947,6 +1008,15 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
     );
     if (!synthesized.ok) return { ok: false, error: synthesized.error, state };
     state = synthesized.state;
+  }
+
+  // Executable document stage: the engine renders the declared document
+  // from the stage's declared sources BEFORE the completion validation
+  // commits the transition — the native /do-work path never depends on an
+  // agent having rendered it, and a failed render fails the advance closed.
+  if (currentStage.type === "document") {
+    const rendered = renderStageDocument(currentStage, target);
+    if (!rendered.ok) return { ok: false, error: rendered.error, state };
   }
 
   // Stage completion validation: consumes, produces, schema contracts, the

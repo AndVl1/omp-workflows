@@ -345,7 +345,8 @@ function ctoDerivedTeamStageReport(): SessionReport {
 test("renderer: output is a single self-contained file with zero external references", () => {
   const html = renderReportHtml(doWorkReport());
   assert.ok(html.startsWith("<!doctype html>"));
-  assert.ok(html.includes('<style>'), "inline CSS block present");
+  assert.ok(html.includes("<style>"), "inline CSS block present");
+  assert.equal((html.match(/<style>/g) ?? []).length, 1, "shared shell emits one style block");
   assert.ok(html.includes('<script id="omp-report-data" type="application/json">'), "data island present");
   assert.ok(html.includes("</html>"), "document closed");
   assert.ok(!html.includes("<link"), "no <link> elements");
@@ -716,6 +717,7 @@ function stageDetailsReport(): SessionReport {
         checkpoint: "checkpoint-a",
         gate: "gate-a",
         autonomous: "autonomous run",
+        document: { format: "markdown", renderer: "product-prd", path: "documents/product-prd.md" },
         promptPreview:
           'Plan the <b>work</b> with a <script>alert("xss")</script> marker\nline two: & < > " \'</details>',
         agents: [{ name: "main session", role: "orchestrator", source: "workflow" }],
@@ -780,6 +782,7 @@ test("renderer: expanded stage details show session task, profile metadata, agen
   assert.ok(/<dt>Checkpoint<\/dt><dd>checkpoint-a<\/dd>/.test(planning), "checkpoint row rendered");
   assert.ok(/<dt>Gate<\/dt><dd>gate-a<\/dd>/.test(planning), "gate row rendered");
   assert.ok(/<dt>Autonomous<\/dt><dd>autonomous run<\/dd>/.test(planning), "autonomous row rendered");
+  assert.ok(/<dt>Document<\/dt><dd>markdown · product-prd · <code>documents\/product-prd\.md<\/code><\/dd>/.test(planning), "document contract row rendered");
   assert.ok(planning.includes("agents: main session (orchestrator, workflow)"), "agents/source rendered");
   assert.ok(planning.includes("Plan summary text"), "bounded artifact summary rendered");
   assert.ok(planning.includes("type: implementation plan"), "artifact type rendered");

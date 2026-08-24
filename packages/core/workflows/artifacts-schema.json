@@ -184,6 +184,156 @@
         "decisions": { "type": "array", "items": { "type": "string" }, "description": "ADR-lite: decision + rationale pairs." }
       }
     },
+    "product_intake": {
+      "type": "object",
+      "description": "Normalized product discovery intake: what the request is, what is known, and what is not. Evidence-first — every claim carries a verified|assumption|unknown status with its source, and explicit 'unknown'/'TBD' is an allowed answer but must never be guessed. The intake is produced by a parallel consilium (product-analyst + product-researcher), so every content field is a MERGEABLE ARRAY: strict fan-in concatenates the slots' arrays deterministically, and a single scalar (problem_statement/context) would block on the first divergent phrasing between the two roles. Empty arrays are valid; 'unknown'/'TBD' string entries are the explicit way to represent missing knowledge.",
+      "required": ["problem_statements", "contexts", "stakeholders", "constraints", "open_questions", "evidence"],
+      "properties": {
+        "problem_statements": { "type": "array", "items": { "type": "string" }, "description": "The product problem or opportunity, one or two sentences per entry, from each intake role; 'TBD' allowed only when genuinely unknown and marked as such." },
+        "contexts": { "type": "array", "items": { "type": "string" }, "description": "Business/product context per intake role; explicit 'unknown' entries allowed." },
+        "stakeholders": { "type": "array", "items": { "type": "string" }, "description": "Stakeholders affected by or interested in the problem; 'unknown' allowed explicitly." },
+        "constraints": { "type": "array", "items": { "type": "string" }, "description": "Constraints that bound any solution; 'unknown' allowed explicitly." },
+        "open_questions": { "type": "array", "items": { "type": "string" }, "description": "Open questions that must be answered before the direction is decided; 'unknown' allowed explicitly." },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["claim", "status", "source"],
+            "properties": {
+              "claim": { "type": "string" },
+              "status": { "enum": ["verified", "assumption", "unknown"], "description": "verified = observed/confirmed from a source; assumption = unverified but stated as such; unknown = not known yet." },
+              "source": { "type": "string", "description": "Where the claim came from (file:line, interview, doc, web source); 'n/a' for explicit assumptions/unknowns." }
+            }
+          }
+        }
+      }
+    },
+    "product_framing": {
+      "type": "object",
+      "description": "Problem framing produced by the product analyst from the intake: restated problem, target users, success criteria and non-goals. Verified facts and assumptions stay distinct.",
+      "required": ["problem_restatement", "target_users", "success_criteria", "non_goals", "assumptions"],
+      "properties": {
+        "problem_restatement": { "type": "string" },
+        "target_users": { "type": "array", "items": { "type": "string" }, "description": "Who experiences the problem; 'unknown'/'TBD' allowed explicitly." },
+        "success_criteria": { "type": "array", "items": { "type": "string" }, "description": "Observable product outcomes that would show the problem is solved." },
+        "non_goals": { "type": "array", "items": { "type": "string" }, "description": "Explicitly out of scope for this discovery." },
+        "assumptions": { "type": "array", "items": { "type": "string" }, "description": "Assumptions shaping the framing, each marked as an assumption (never dressed as a verified fact)." }
+      }
+    },
+    "product_evidence": {
+      "type": "object",
+      "description": "Evidence and alternatives gathered by the product researcher: verified facts, assumptions, unknowns, evidence gaps, and product alternatives considered. No fabricated data or invented sources.",
+      "required": ["evidence", "alternatives", "gaps"],
+      "properties": {
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["claim", "status", "source"],
+            "properties": {
+              "claim": { "type": "string" },
+              "status": { "enum": ["verified", "assumption", "unknown"], "description": "verified = observed/confirmed; assumption = unverified but stated; unknown = not known yet." },
+              "source": { "type": "string", "description": "Where the claim came from (file:line, doc, web source, interview); 'n/a' for explicit assumptions/unknowns." }
+            }
+          }
+        },
+        "alternatives": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "summary"],
+            "properties": {
+              "id": { "type": "string" },
+              "summary": { "type": "string" },
+              "pros": { "type": "array", "items": { "type": "string" } },
+              "cons": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "gaps": { "type": "array", "items": { "type": "string" }, "description": "Evidence gaps that must be validated before the direction can be considered solid." }
+      }
+    },
+    "product_critique": {
+      "type": "object",
+      "description": "Adversarial review of the framing and evidence. The verdict is one of proceed|needs_more_validation|defer|reject and is never softened to be agreeable.",
+      "required": ["verdict", "findings", "blocking_gaps"],
+      "properties": {
+        "verdict": {
+          "enum": ["proceed", "needs_more_validation", "defer", "reject"],
+          "description": "proceed = evidence supports moving to approval; needs_more_validation = direction plausible but evidence insufficient; defer = right area, not now; reject = the framing/direction itself is wrong or unsafe."
+        },
+        "findings": { "type": "array", "items": { "type": "string" }, "description": "Concrete critique points: unsupported claims, weak evidence, missing alternatives, framing errors." },
+        "blocking_gaps": { "type": "array", "items": { "type": "string" }, "description": "Evidence or analysis gaps that must close before proceed." }
+      }
+    },
+    "product_spec": {
+      "type": "object",
+      "description": "Synthesized product direction prepared by the product strategist from framing, evidence and critique. Product-level only — no APIs, no architecture, no implementation details. Every product-level concept is REQUIRED as its own field: an unknown/TBD concept is represented by an explicit array entry (e.g. 'unknown'/'TBD') or the string 'unknown', never by silently omitting the field — a spec that only carries recommendation/value/risk is not a decision.",
+      "required": ["recommendation", "value_proposition", "opportunity", "target_users", "solution_direction", "success_metrics", "guardrail_metrics", "scope", "anti_scope", "risks", "validation_plan", "evidence_trace", "open_decisions"],
+      "properties": {
+        "recommendation": {
+          "enum": ["proceed", "needs_more_validation", "defer", "reject"],
+          "description": "The strategist's recommendation to the product owner."
+        },
+        "value_proposition": { "type": "string", "description": "What is delivered, to whom, and why it matters; 'unknown' allowed explicitly." },
+        "opportunity": { "type": "string", "description": "Size/attractiveness of the opportunity; 'unknown' allowed explicitly." },
+        "target_users": { "type": "array", "items": { "type": "string" }, "description": "Who the direction is for; explicit 'unknown'/'TBD' entries allowed." },
+        "solution_direction": { "type": "string", "description": "Product-level direction (what and why) — deliberately NOT an implementation plan; 'TBD' allowed explicitly." },
+        "success_metrics": { "type": "array", "items": { "type": "string" }, "description": "Observable product outcomes that would show the direction works; explicit 'unknown'/'TBD' entries allowed." },
+        "guardrail_metrics": { "type": "array", "items": { "type": "string" }, "description": "Metrics that must NOT regress (safety/constraints the direction may not trade away); explicit 'unknown'/'TBD' entries allowed." },
+        "scope": { "type": "array", "items": { "type": "string" }, "description": "What the direction covers; explicit 'TBD' entries allowed." },
+        "anti_scope": { "type": "array", "items": { "type": "string" }, "description": "Explicitly out of scope — the boundary that stops creep; explicit 'TBD' entries allowed." },
+        "risks": { "type": "array", "items": { "type": "string" }, "description": "Risks that remain even after critique; explicit 'unknown' entries allowed." },
+        "validation_plan": { "type": "array", "items": { "type": "string" }, "description": "What must be validated before/after implementation; empty when recommendation is proceed." },
+        "evidence_trace": { "type": "array", "items": { "type": "string" }, "description": "Maps each recommendation claim to product_evidence items by verified|assumption|unknown status." },
+        "open_decisions": { "type": "array", "items": { "type": "string" }, "description": "Product decisions still open for the owner; empty when none." }
+      }
+    },
+    "product_prd": {
+      "type": "object",
+      "description": "Deterministic Markdown product PRD rendered by the engine from the five product-discovery source artifacts. Exact manifest fields — no extras, none missing. content is the rendered markdown; content_hash is sha256 of it and of the document file bytes; source_hash is the deterministic key-order-independent hash of the five source artifacts at render time (stale sources are detected by re-hashing).",
+      "additionalProperties": false,
+      "required": ["type", "format", "renderer", "path", "source_artifacts", "source_hash", "content_hash", "content"],
+      "properties": {
+        "type": { "enum": ["product_prd"] },
+        "format": { "enum": ["markdown"] },
+        "renderer": { "type": "string", "description": "Renderer identity/version, e.g. 'product-prd-renderer@2'." },
+        "path": { "type": "string", "description": "Safe relative path of the markdown document inside the state dir." },
+        "source_artifacts": { "type": "array", "items": { "type": "string" }, "description": "The five source artifact ids in fixed order." },
+        "source_hash": { "type": "string", "description": "sha256 of the canonical serialization of the five source artifacts at render time." },
+        "content_hash": { "type": "string", "description": "sha256 of the rendered markdown (hex)." },
+        "content": { "type": "string", "description": "The full rendered markdown; must equal the document file bytes." }
+      }
+    },
+    "product_approval_record": {
+      "type": "object",
+      "description": "Durable record of the human product-owner approval. Interactive only — product approval is never auto-approved or inferred; the decision must be exactly one of proceed|needs_more_validation|defer|reject, recorded via workflow_checkpoint with mode=interactive.",
+      "required": ["decision", "approved_by", "rationale", "decided_at"],
+      "properties": {
+        "decision": {
+          "enum": ["proceed", "needs_more_validation", "defer", "reject"],
+          "description": "The product owner's explicit decision."
+        },
+        "approved_by": { "type": "string", "description": "Who approved — always a human product owner, never an autonomous agent." },
+        "rationale": { "type": "string", "description": "The owner's stated rationale." },
+        "decided_at": { "type": "string", "description": "ISO-8601 timestamp of the decision." }
+      }
+    },
+    "product_handoff": {
+      "type": "object",
+      "description": "Handoff of an approved product direction to the next workflow. next_workflow is 'spec-preparation' ONLY when decision == 'proceed'; for needs_more_validation | defer | reject it MUST be 'none' with a blocked_reason.",
+      "required": ["decision", "next_workflow", "product_spec_artifact", "instructions"],
+      "properties": {
+        "decision": { "enum": ["proceed", "needs_more_validation", "defer", "reject"] },
+        "next_workflow": {
+          "enum": ["spec-preparation", "none"],
+          "description": "spec-preparation ONLY when decision == 'proceed'; 'none' otherwise."
+        },
+        "product_spec_artifact": { "type": "string", "description": "Artifact id of the approved product spec (e.g. 'product_spec')." },
+        "instructions": { "type": "string", "description": "What the next workflow must spec and what evidence it must preserve." },
+        "blocked_reason": { "type": "string", "description": "Why the direction was NOT handed off; required when decision != proceed." }
+      }
+    },
     "dod": {
       "type": "object",
       "description": "Definition of Done — acceptance criteria fixed BEFORE code, each with how it is verified and (when closed) the proof. Produced early (clarify/discovery/diagnose), then FANNED IN by later stages: every role with relevant context may APPEND items (with source + unique id) or CLOSE an existing item (pending→met with evidence). The dod_complete gate and the Stop backstop (hooks/dod-gate.sh) require every item met WITH evidence before a task may claim done.",

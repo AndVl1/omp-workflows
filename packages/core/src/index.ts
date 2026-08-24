@@ -72,6 +72,10 @@ export const defaultFullstackRoles: RoleConfig["roles"] = {
   "regression-planner": "analyst",
   "regression-executor": "manual-qa",
   "regression-oracle": "qa",
+  "product-analyst": "product-analyst",
+  "product-researcher": "product-researcher",
+  "product-critic": "product-critic",
+  "product-strategist": "product-strategist",
 };
 
 
@@ -316,6 +320,18 @@ export {
   type MergeResult,
   type SynthesisResult,
 } from "./engine/fan-in.js";
+export {
+  renderProductPrdDocument,
+  writeProductPrdDocument,
+  validateProductPrdDocument,
+  PRODUCT_PRD_ARTIFACT_ID,
+  PRODUCT_PRD_RENDERER,
+  PRD_SOURCE_ARTIFACT_IDS,
+  type ProductPrdManifest,
+  type ProductPrdWriteOptions,
+  type ProductPrdWriteResult,
+  type ProductPrdValidation,
+} from "./engine/product-prd.js";
 export {
   resolveWorkflowContract,
   resolveStageInstructions,
@@ -588,6 +604,8 @@ export {
 	writeReport,
 } from "./report/assemble.js";
 export { renderReportHtml } from "./report/html.js";
+export { renderMarkdownDocumentHtml } from "./report/markdown.js";
+export type { MarkdownDocumentOptions } from "./report/markdown.js";
 export { redactReportBody } from "./report/redact.js";
 export { recordStageTransition, recordArtifactWritten } from "./observability/index.js";
 export type {
