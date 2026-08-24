@@ -31,16 +31,14 @@ import {
   completeDispatch,
   advanceCursor,
   recordCheckpointDecision,
-  prepareWorkflowState,
   readAgentMapping,
+  resolveClassification,
   handoffWorkflow,
   prepareWorkflow,
   resolveState,
   type DispatchAuth,
   type ModelClassification,
-  type WorkflowPrepareOptions,
   type HandoffWorkflowInput,
-  type WorkflowPreparationInput,
 } from "@andvl1/omp-workflows-core";
 import { registerWorkflowCommands } from "./workflow-commands.js";
 import { ensureCommandsForSession } from "./copy-commands.js";
@@ -240,7 +238,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
     };
   };
   const classificationParameters = z.object({
-    type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX"]),
+    type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "LECTURE_RESEARCH", "REVIEW", "HOTFIX"]),
     complexity: z.enum(["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"]),
     confidence: z.enum(["HIGH", "MEDIUM", "LOW"]),
     autonomous: z.boolean(),
@@ -250,7 +248,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "workflow_prepare",
     label: "Prepare workflow state",
-    description: "Persist PHASE-0 classification and initialize or reopen engine-owned workflow state.",
+    description: "Validate PHASE-0 classification and the active branch, then atomically initialize or reopen feature-scoped workflow state. Main-session only; capability secrets are issued only by workflow_begin.",
     parameters: z.object({
       task: z.string().min(1),
       branch: z.string().min(1),
@@ -279,57 +277,24 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
         return result({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: "new workflow preparation requires a complete classification" });
       }
       try {
-        const options: WorkflowPrepareOptions = {
+        const classification = input.classification && input.classification.workflow === undefined
+          ? {
+            ...input.classification,
+            workflow: resolveClassification({
+              task: input.task,
+              autonomous: input.classification.autonomous,
+              classification: input.classification,
+            }).workflow,
+          }
+          : input.classification;
+        const prepared = prepareWorkflow(cwd, {
           task: input.task,
-          cwd,
           branch: input.branch,
-          autonomous: input.classification?.autonomous ?? false,
-          classification: input.classification,
+          classification: classification as ModelClassification,
           files: input.files,
           issue: typeof input.issue === "number" ? { number: input.issue } : input.issue ?? null,
           continuation: input.continuation,
-        };
-        const prepared = prepareWorkflowState(options);
-        return result({
-          ok: true,
-          transition: "prepare",
-          state_path: prepared.statePath,
-          artifacts_dir: prepared.artifactsDir,
-          workflow: prepared.profile.name,
-          classification: prepared.classification,
-          state: stateSummary(cwd),
         });
-      } catch (error) {
-        return result({ ok: false, code: "WORKFLOW_PREPARE_FAILED", error: String(error) });
-      }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_prepare",
-    label: "Prepare workflow state",
-    description: "Validate PHASE-0 classification and the active branch, then atomically initialize or reopen feature-scoped workflow state. Main-session only; capability secrets are issued only by workflow_begin.",
-    parameters: z.object({
-      task: z.string().min(1),
-      branch: z.string().min(1),
-      classification: z.object({
-        type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "LECTURE_RESEARCH", "REVIEW", "HOTFIX"]),
-        complexity: z.enum(["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"]),
-        confidence: z.enum(["HIGH", "MEDIUM", "LOW"]),
-        autonomous: z.boolean(),
-        autonomous_reason: z.string().optional(),
-        workflow: z.string().min(1).optional(),
-      }),
-      issue: z.object({ number: z.number().int().positive(), url: z.string().optional() }).nullable().optional(),
-      files: z.array(z.string()).default(() => []),
-      continuation: z.object({ feedback: z.string().min(1), stageId: z.string().min(1) }).optional(),
-    }) as never,
-    async execute(_id, params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = resolveSessionCwd(ctx);
-      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      try {
-        const prepared = prepareWorkflow(cwd, params as WorkflowPreparationInput);
         if (!prepared.ok) {
           return result({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: prepared.error, state: prepared.state ? stateSummary(cwd) : undefined });
         }

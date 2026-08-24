@@ -90,6 +90,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     buildWorkflowMatrix(),
     "",
     "After PHASE-0 classification, call `workflow_prepare` with the task, the exact canonical branch, the classification object, changed file paths, and issue metadata. For a continuation, pass the existing feedback and affected stage instead of creating a new state.",
+    "Require a typed `workflow_prepare` result with `ok: true`; if it errors, is missing, or is malformed, stop and fail closed — never write state by hand and never guess stages.",
     "`workflow_prepare` is the ONLY supported state initialization/update path: do not call `write`, `edit`, `bash`, or any filesystem API to create or modify `.work-state` files. It persists the classification, resolved workflow, task, branch, stages, scope, and durable capability atomically.",
     "If `workflow_prepare` fails, stop and record the structured error — never guess a state path or repair canonical state by hand. The P5 gate reads `classification.autonomous` as the authority.",
     "If confidence is LOW, ask a focused clarification question before preparing an expansive workflow (unless `autonomous` is true; then document a conservative default).",
@@ -103,7 +104,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "5. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch. Every delegated task payload must state that `workflow_*` control tools are main-session-only, must not mutate canonical `.work-state` with `bash`, and must use `write` for its declared artifact before returning. In a consilium, each role writes only its own `slot_artifacts[role]` files; never write the shared produce id directly.",
     "6. Before writing any declared artifact, match its JSON exactly to `stage.artifact_schemas[artifactId]`; for `dod`, `items` MUST be objects with `criterion`, `verify_method`, and `status` (`pending` or `met`), never bare strings or a legacy `criteria` array.",
     "7. After every task result, call `workflow_status`. For every dispatch whose status is not `succeeded`, wait or fail closed. For every succeeded dispatch whose `artifact_ids` is empty, call `workflow_complete` exactly once with the dispatch's identity binding and the exact artifact IDs from `slot_artifacts` (including `produce-slot` IDs for consilium); do not treat a native task result as artifact completion. If the runtime already repaired a synchronous completion, use the IDs shown by `workflow_status` and do not replay it with different IDs.",
-    "8. Before `workflow_advance`, if the current stage contract declares a non-null `checkpoint`, call `workflow_checkpoint` first with the same capability handoff, checkpoint name, mode, decision, and rationale; for autonomous stages, record the orchestrator's explicit proceed/approve decision instead of relying on `workflow_advance` to infer it."
+    "8. Before `workflow_advance`, if the current stage contract declares a non-null `checkpoint`, call `workflow_checkpoint` first with the same capability handoff, checkpoint name, mode, decision, and rationale; for autonomous stages, record the orchestrator's explicit proceed/approve decision instead of relying on `workflow_advance` to infer it.",
     "9. After every `workflow_advance`, call `workflow_instructions` again and use the returned next-stage contract. If any workflow tool errors, fail closed: stop and record the failure rather than guessing the stage.",
     "10. When a stage or the whole workflow finishes, remain available in this same session: later user feedback reopens the affected state instead of starting a fresh workflow.",
     "",
@@ -112,7 +113,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "When invoking them through Python `eval`, `tool.workflow_*` returns `{ \"text\": \"<JSON>\" }`; parse `json.loads(r[\"text\"])`, never `json.loads(r)`.",
     "Require `ok: true` on operation envelopes such as `workflow_prepare` and `workflow_begin`; require `workflow_instructions` to contain the expected `stage` and `provenance` objects before reading it.",
     "Keep the parsed `workflow_begin` payload: only its `handoff.dispatch_markers` contains dispatch markers; `workflow_instructions` returns the stage contract and does not contain `dispatch_markers`.",
-    "For each declared role, select the marker by exact role from that begin handoff and preserve it verbatim; missing, empty, duplicate, or mismatched markers are a fail-closed condition."
+    "For each declared role, select the marker by exact role from that begin handoff and preserve it verbatim; missing, empty, duplicate, or mismatched markers are a fail-closed condition.",
     "",
     "### Role mapping (effective runtime resolution)",
     "| Role | Agent |",
@@ -144,7 +145,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "After every task result, immediately call `workflow_status` before interpreting completion. In its `capability.dispatches[]`, select the single persisted dispatch record matching the completed task by exact `role`, `agent`, and `tool_call_id` binding; pass exactly that record's `id` verbatim as `workflow_complete.dispatch_id`.",
     "NEVER pass job IDs, task call IDs (including task-call IDs), capability IDs, role names, or synthesized IDs (including synthesized/derived IDs) as `workflow_complete.dispatch_id`; only the matching persisted dispatch record's `id` is valid. If no unique matching persisted record exists, fail closed and do not call `workflow_complete`.",
     "When calling `workflow_complete`, preserve the exact current dispatch token, capability identity (`capability_id`), run/branch/workflow/stage binding, `stage_cursor`/`cursor_epoch`, and `profile_hash`, and include the actual outcome, evidence, and artifact IDs. Preserve the one-batch/declared-roster, actor/path, and stale-branch rules; any missing or mismatched binding fails closed.",
-    "For every succeeded dispatch whose `artifact_ids` is empty, call `workflow_complete` exactly once with its identity binding and the exact artifact IDs from `slot_artifacts` (including `produce-slot` IDs for consilium); do not treat a native task result as artifact completion. If the runtime already repaired a synchronous completion, use the IDs shown by `workflow_status` and do not replay it with different IDs."
+    "For every succeeded dispatch whose `artifact_ids` is empty, call `workflow_complete` exactly once with its identity binding and the exact artifact IDs from `slot_artifacts` (including `produce-slot` IDs for consilium); do not treat a native task result as artifact completion. If the runtime already repaired a synchronous completion, use the IDs shown by `workflow_status` and do not replay it with different IDs.",
     "Advance only through `workflow_advance` after all current-stage dispatches are complete and required artifacts/gates exist. Use the returned next-stage handoff for the next stage; never call `task` from a stale cursor.",
     "### Cross-profile handoff (workflow_handoff)",
     "When the current profile completes at a `handoff` source stage and the user explicitly approves the result, choose the target workflow from the engine's typed route catalogue. The safe result of `workflow_handoff` exposes route id/kind/status, source and target workflow/stage, prerequisites, and the target preparation/materialization description. Only `enabled` catalogue routes complete; `conditional` routes are rejected deterministically until their declared evidence/materialization adapter exists, and `unsupported` or arbitrary target strings are denied — never pick a target outside the catalogue.",
@@ -163,7 +164,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "| read/glob/grep | ALLOW |",
     "| workflow_prepare after PHASE-0 with typed input | ALLOW |",
     "| workflow_prepare with malformed classification/branch or without ok:true | DENY |",
-    "| write/edit declared artifacts under `state.artifactsDir` returned by `workflow_instructions` | ALLOW |"
+    "| write/edit declared artifacts under `state.artifactsDir` returned by `workflow_instructions` | ALLOW |",
     "| write/edit application source or project files | DENY |",
     "| direct write/edit canonical workflow state | DENY |",
     "| git status, git diff, git log, git show, git fetch, git pull, git pull --rebase | ALLOW |",

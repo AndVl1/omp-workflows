@@ -370,7 +370,8 @@ test("handoff: success preserves source state and arms the target discovery stag
     // Returned one-time envelope matches the fresh target capability.
     assert.equal(result.handoff.capability_id, state.dispatch_capability?.capability_id);
     assert.equal(result.handoff.workflow, "full-feature");
-    assert.equal(result.handoff.profile_hash, TARGET_HASH);
+    // Control envelopes use the compact binding fingerprint; canonical state retains the full target hash.
+    assert.equal(result.handoff.profile_hash, `${TARGET_HASH.slice(0, 30)}${TARGET_HASH.slice(-2)}`);
     assert.equal(result.handoff.stage_cursor, "discovery");
     assert.equal(result.handoff.cursor_epoch, state.cursor_epoch);
     assert.equal(result.handoff.kind, "none");
@@ -414,10 +415,10 @@ test("handoff: success preserves source state and arms the target discovery stag
     assert.equal(contract.profile.hash, TARGET_HASH);
     assert.equal(contract.state.dispatch.allowed, false, "orchestrator discovery is not a dispatch stage");
 
-    // beginCapability must not mint a second capability for the armed stage.
+    // beginCapability reissues the active handoff without minting a new identity.
     const begun = beginCapability(root);
-    assert.equal(begun.ok, false);
-    if (!begun.ok) assert.match(begun.error, /already has an active capability/);
+    assert.equal(begun.ok, true);
+    if (begun.ok) assert.equal(begun.state.dispatch_capability?.capability_id, state.dispatch_capability?.capability_id);
 
     // Task-boundary gates accept the target state (P5 + dispatch shape).
     assert.equal(classificationToolGate({ toolName: "task" }, { cwd: root }), undefined, "workflow_override + valid autonomy passes the P5 gate");
