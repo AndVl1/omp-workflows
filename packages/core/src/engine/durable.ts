@@ -1328,6 +1328,7 @@ const handoffRouteKey = (sourceWorkflow: string, sourceStage: string, targetWork
   `${sourceWorkflow}\u0000${sourceStage}\u0000${targetWorkflow}`;
 
 const HANDOFF_ROUTE_DISPOSITIONS = ["enabled", "conditional", "unsupported"] as const;
+const HANDOFF_ROUTE_KINDS = ["feature-intake", "regression", "bug-fix-diagnostic", "debug-diagnostic", "feedback-regression", "unsupported"] as const;
 
 /**
  * Register a generic handoff route. Duplicate keys (same source workflow +
@@ -1346,7 +1347,7 @@ export function registerWorkflowHandoffRoute(route: HandoffRoute): void {
     typeof route.source_stage !== "string" || !route.source_stage.trim() ||
     typeof route.target_workflow !== "string" || !route.target_workflow.trim() ||
     typeof route.target_stage !== "string" || !route.target_stage.trim() ||
-    typeof route.kind !== "string" || !route.kind.trim() ||
+    !HANDOFF_ROUTE_KINDS.includes(route.kind) ||
     !HANDOFF_ROUTE_DISPOSITIONS.includes(route.disposition) ||
     typeof route.description !== "string" || !route.description.trim()
   ) {

@@ -1357,6 +1357,10 @@ test("handoff: duplicate route ids and duplicate route keys are rejected determi
     /invalid handoff route registration/,
   );
   assert.throws(
+    () => registerWorkflowHandoffRoute({ ...fresh, id: "dup-key-5", kind: "bogus" as never }),
+    /invalid handoff route registration/,
+  );
+  assert.throws(
     () => registerWorkflowHandoffRoute({ ...fresh, id: "dup-key-4", description: "" }),
     /invalid handoff route registration/,
   );
