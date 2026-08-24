@@ -208,6 +208,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
     const capability = state.dispatch_capability;
     return {
       ok: true,
+      run_key: state.run_key,
       branch: state.branch,
       workflow: state.classification?.workflow,
       stage_cursor: state.stage_cursor,

@@ -770,6 +770,35 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     assert.match(prompt, /dod.*items.*MUST be objects/i);
     assert.match(prompt, /Before `workflow_advance`.*workflow_checkpoint/);
     assert.match(prompt, /compact first-30\/last-2 binding fingerprint/);
+    assert.ok(
+      prompt.includes("copy `run_key`, `branch`, `workflow`, `profile_hash`, `stage_cursor`, `cursor_epoch`, and `capability_id` byte-for-byte"),
+      "prompt must copy every non-secret handoff binding byte-for-byte",
+    );
+    assert.ok(
+      prompt.includes("`run_key` is opaque, may contain `/`"),
+      "prompt must preserve slash-containing opaque run keys",
+    );
+    assert.ok(
+      prompt.includes("must never be derived, slugified, normalized"),
+      "prompt must prohibit run-key normalization",
+    );
+    assert.ok(
+      prompt.includes("complete marker string returned by `handoff.dispatch_markers` verbatim inside every role-specific `tasks[].task` string"),
+      "prompt must place the complete marker in every role task",
+    );
+    assert.ok(
+      prompt.includes("shared context is insufficient and does not satisfy the dispatch gate"),
+      "prompt must reject shared-context-only markers",
+    );
+    assert.ok(
+      prompt.includes("at most one fresh handoff with `workflow_begin`") &&
+        prompt.includes("retry only the failed request once"),
+      "prompt must bound fresh-handoff recovery to one retry",
+    );
+    assert.ok(
+      prompt.includes("If the fresh handoff or retry fails") && prompt.includes("fail closed and stop"),
+      "prompt must fail closed after a failed recovery",
+    );
     assert.match(prompt, /workflow_\*.*main-session-only.*canonical `\.work-state`.*bash.*write/i);
 
     // No filesystem/package-path/plugin-root workflow content sourcing.

@@ -194,8 +194,9 @@ test("fullstack: workflow_status exposes completion artifact bindings", async ()
     const profile = loadProfile("lightweight");
     assert.ok(profile);
     const persistedProfileHash = profileHash(profile);
+    const runKey = "fix/sync-secrets-before-restart";
     const issued = createCapability({
-      run_key: "main",
+      run_key: runKey,
       branch: "main",
       workflow: "lightweight",
       profile_hash: persistedProfileHash,
@@ -206,7 +207,7 @@ test("fullstack: workflow_status exposes completion artifact bindings", async ()
     writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
       schema: 1,
       branch: "main",
-      run_key: "main",
+      run_key: runKey,
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
       task: "status artifact binding",
       stage_cursor: "implementation",
@@ -229,7 +230,7 @@ test("fullstack: workflow_status exposes completion artifact bindings", async ()
     const auth = {
       token: issued.dispatch_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: runKey,
       branch: "main",
       workflow: "lightweight",
       profile_hash: persistedProfileHash,
@@ -249,6 +250,17 @@ test("fullstack: workflow_status exposes completion artifact bindings", async ()
       validation_evidence: "status binding fixture",
       files_touched: ["src/main.ts"],
     }));
+    const wrongRunKey = completeDispatch(root, {
+      ...auth,
+      run_key: "fix-sync-secrets-before-restart",
+      dispatch_id: authorized.record.id,
+      outcome: "succeeded",
+      evidence: "normalized run key must be rejected",
+      artifact_ids: ["implementation"],
+    });
+    assert.equal(wrongRunKey.ok, false);
+    if (wrongRunKey.ok) throw new Error("wrong run key was accepted");
+    assert.equal(wrongRunKey.error, "capability binding mismatch");
     const completed = completeDispatch(root, {
       ...auth,
       dispatch_id: authorized.record.id,
@@ -259,7 +271,16 @@ test("fullstack: workflow_status exposes completion artifact bindings", async ()
     assert.equal(completed.ok, true);
     const status = tools.get("workflow_status")!;
     const response = await status.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
-    const details = response.details as { capability?: { dispatches?: Array<Record<string, unknown>> } };
+    const details = response.details as {
+      run_key?: string;
+      token?: unknown;
+      profile_hash?: unknown;
+      capability?: { dispatches?: Array<Record<string, unknown>> };
+    };
+    assert.equal(details.run_key, runKey);
+    assert.equal(details.token, undefined);
+    assert.equal(details.profile_hash, undefined);
+    assert.doesNotMatch(response.content[0].text, /dispatch_token|advance_token|profile_hash/);
     assert.deepEqual(details.capability?.dispatches?.[0], {
       id: authorized.record.id,
       role: "developer-kotlin",
