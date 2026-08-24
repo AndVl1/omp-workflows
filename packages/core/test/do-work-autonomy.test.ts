@@ -757,6 +757,8 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
       "prompt must name the returned stage contract field stage.instructions",
     );
     assert.match(prompt, /only workflow instruction source/i);
+    assert.match(prompt, /state\.artifactsDir/);
+    assert.doesNotMatch(prompt, /writing declared typed artifacts under `\.work-state\/artifacts\/`/);
     // After every workflow_advance the model must re-fetch workflow_instructions.
     assert.match(prompt, /workflow_advance`, call `workflow_instructions`/);
     assert.match(prompt, /handoff\.dispatch_markers/);
@@ -1256,6 +1258,7 @@ test("workflow contract supports an explicit stateless profile lookup", () => {
   try {
     const contract = resolveWorkflowContract(root, { requireState: false, workflow: "lightweight", branch: "main" });
     assert.equal(contract.state.path, null);
+    assert.equal(contract.state.artifactsDir, null);
     assert.equal(contract.provenance.statePath, null);
     assert.equal(contract.stage.id, "discovery");
     assert.equal(contract.stage.artifact_schemas.discovery?.type, "object");
@@ -1263,6 +1266,37 @@ test("workflow contract supports an explicit stateless profile lookup", () => {
     assert.equal(contract.stage.artifact_schemas.dod?.properties?.items?.items?.type, "object");
     assert.deepEqual(contract.stage.artifact_schemas.dod?.properties?.items?.items?.required, ["criterion", "verify_method", "status"]);
     assert.equal(contract.state.dispatch.allowed, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow contract exposes the active feature artifact directory", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-contract-feature-artifacts-"));
+  try {
+    const branch = "fix/artifact-path";
+    initGit(root, branch);
+    const prepared = prepareWorkflowState({
+      task: "fix artifact path",
+      cwd: root,
+      branch,
+      autonomous: true,
+      classification: {
+        type: "BUG_FIX",
+        complexity: "COMPLEX",
+        confidence: "HIGH",
+        autonomous: true,
+        workflow: "debug-cycle",
+      },
+      files: [],
+      issue: null,
+    });
+    const contract = resolveWorkflowContract(root, { branch });
+    const expectedArtifactsDir = join(root, ".work-state", "features", "fix-artifact-path", "artifacts");
+
+    assert.equal(prepared.artifactsDir, expectedArtifactsDir);
+    assert.equal(contract.state.artifactsDir, expectedArtifactsDir);
+    assert.equal(contract.state.path, prepared.statePath);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

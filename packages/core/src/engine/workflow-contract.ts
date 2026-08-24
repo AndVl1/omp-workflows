@@ -49,6 +49,8 @@ export interface WorkflowContract {
   profile: { title: string; description: string; path: string | null; hash: string; source: "workflow" };
   state: {
     path: string | null;
+    /** Exact directory where the current run's declared artifacts must be written. */
+    artifactsDir: string | null;
     branch: string;
     workflow: WorkflowName;
     profileHash: string;
@@ -132,7 +134,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     : hash({ source: "stateless", workflow, stage: stage.id, profileHash: pHash });
   return {
     workflow, profile: { title: profile.title, description: profile.description, path, hash: pHash, source: "workflow" },
-    state: { path: resolved.statePath, branch: state?.branch ?? expectedBranch ?? "", workflow, profileHash: pHash, stageCursor: state?.stage_cursor ?? stage.id, stageStatuses: statuses, dispatch: { allowed: dispatchAllowed, stageId: stage.id, kind, capability: kind ? `task:${kind}` : "none", cursorEpoch: state?.cursor_epoch ?? null } },
+    state: { path: resolved.statePath, artifactsDir: resolved.artifactsDir, branch: state?.branch ?? expectedBranch ?? "", workflow, profileHash: pHash, stageCursor: state?.stage_cursor ?? stage.id, stageStatuses: statuses, dispatch: { allowed: dispatchAllowed, stageId: stage.id, kind, capability: kind ? `task:${kind}` : "none", cursorEpoch: state?.cursor_epoch ?? null } },
     stage: stageContract,
     provenance: { statePath: resolved.statePath, profilePath: path, profileHash: pHash, stateHash },
   };
