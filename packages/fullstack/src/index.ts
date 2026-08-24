@@ -31,12 +31,14 @@ import {
   completeDispatch,
   advanceCursor,
   recordCheckpointDecision,
-  prepareWorkflowState,
   readAgentMapping,
+  resolveClassification,
+  handoffWorkflow,
+  prepareWorkflow,
   resolveState,
   type DispatchAuth,
   type ModelClassification,
-  type WorkflowPrepareOptions,
+  type HandoffWorkflowInput,
 } from "@andvl1/omp-workflows-core";
 import { registerWorkflowCommands } from "./workflow-commands.js";
 import { ensureCommandsForSession } from "./copy-commands.js";
@@ -236,7 +238,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
     };
   };
   const classificationParameters = z.object({
-    type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX"]),
+    type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "LECTURE_RESEARCH", "REVIEW", "HOTFIX"]),
     complexity: z.enum(["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"]),
     confidence: z.enum(["HIGH", "MEDIUM", "LOW"]),
     autonomous: z.boolean(),
@@ -246,7 +248,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "workflow_prepare",
     label: "Prepare workflow state",
-    description: "Persist PHASE-0 classification and initialize or reopen engine-owned workflow state.",
+    description: "Validate PHASE-0 classification and the active branch, then atomically initialize or reopen feature-scoped workflow state. Main-session only; capability secrets are issued only by workflow_begin.",
     parameters: z.object({
       task: z.string().min(1),
       branch: z.string().min(1),
@@ -275,24 +277,40 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
         return result({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: "new workflow preparation requires a complete classification" });
       }
       try {
-        const options: WorkflowPrepareOptions = {
+        const classification = input.classification && input.classification.workflow === undefined
+          ? {
+            ...input.classification,
+            workflow: resolveClassification({
+              task: input.task,
+              autonomous: input.classification.autonomous,
+              classification: input.classification,
+            }).workflow,
+          }
+          : input.classification;
+        const prepared = prepareWorkflow(cwd, {
           task: input.task,
-          cwd,
           branch: input.branch,
-          autonomous: input.classification?.autonomous ?? false,
-          classification: input.classification,
+          classification: classification as ModelClassification,
           files: input.files,
           issue: typeof input.issue === "number" ? { number: input.issue } : input.issue ?? null,
           continuation: input.continuation,
-        };
-        const prepared = prepareWorkflowState(options);
+        });
+        if (!prepared.ok) {
+          return result({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: prepared.error, state: prepared.state ? stateSummary(cwd) : undefined });
+        }
         return result({
           ok: true,
           transition: "prepare",
+          branch: prepared.state.branch,
+          classification: prepared.state.classification,
+          workflow: prepared.profile.name,
+          profile_hash: prepared.state.profile_hash,
+          stage_cursor: prepared.state.stage_cursor,
+          stages: prepared.state.stages,
           state_path: prepared.statePath,
           artifacts_dir: prepared.artifactsDir,
-          workflow: prepared.profile.name,
-          classification: prepared.classification,
+          feature_slug: prepared.featureSlug,
+          continuation: prepared.continuation,
           state: stateSummary(cwd),
         });
       } catch (error) {
@@ -407,6 +425,41 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
         const transition = advanceCursor(cwd, input);
         return transition.ok ? result({ ok: true, transition: "advance", stage_cursor: transition.state.stage_cursor, cursor_epoch: transition.state.cursor_epoch, handoff: transition.handoff, state: stateSummary(cwd) }) : result({ ok: false, code: "WORKFLOW_ADVANCE_REJECTED", error: transition.error });
       } catch (error) { return result({ ok: false, code: "WORKFLOW_ADVANCE_FAILED", error: String(error) }); }
+    },
+  });
+  pi.registerTool({
+    name: "workflow_handoff",
+    label: "Handoff workflow",
+    description: "Transfer an approved completed workflow stage to another registered workflow profile through the engine's typed route catalogue. Main-session only; requires explicit typed approval evidence and returns a fresh one-time target capability. Only `enabled` catalogue routes complete; `conditional` routes are rejected deterministically (route metadata and missing evidence/materialization adapters are returned) until their adapter exists; `unsupported` and unknown targets are denied.",
+    parameters: z.object({
+      token: z.string().min(1), capability_id: z.string().min(1),
+      run_key: z.string().min(1), branch: z.string().min(1), workflow: z.string().min(1), profile_hash: z.string().min(1), stage_cursor: z.string().min(1), cursor_epoch: z.string().min(1),
+      target_workflow: z.string().min(1),
+      target_profile_hash: z.string().min(1).optional(),
+      approval: z.object({
+        kind: z.enum(["checkpoint", "artifact"]),
+        ref: z.string().min(1),
+        source_stage: z.string().min(1),
+        decision: z.literal("approved"),
+      }),
+      actor: z.string().default("orchestrator"),
+      handoff_context: z.object({
+        artifact_ids: z.array(z.string().min(1)).default(() => []),
+        decision_refs: z.array(z.string().min(1)).default(() => []),
+        summary: z.string().default(""),
+      }).default(() => ({ artifact_ids: [], decision_refs: [], summary: "" })),
+    }) as never,
+    async execute(_id, params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      const cwd = resolveSessionCwd(ctx);
+      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      const input = params as HandoffWorkflowInput;
+      try {
+        const transition = handoffWorkflow(cwd, input);
+        if (!transition.ok) return result({ ok: false, code: "WORKFLOW_HANDOFF_REJECTED", error: transition.error, route: transition.route, state: transition.state ? stateSummary(cwd) : undefined });
+        return result({ ok: true, transition: "handoff", route: transition.route, handoff: transition.handoff, audit: transition.audit, state: stateSummary(cwd) });
+      } catch (error) { return result({ ok: false, code: "WORKFLOW_HANDOFF_FAILED", error: String(error) }); }
     },
   });
 }

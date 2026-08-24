@@ -19,6 +19,7 @@ import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { registerTeamWorkflow } from "../src/index.js";
 import { resolveState, writeState } from "../src/engine/state.js";
+import type { TeamState } from "../src/engine/types.js";
 
 import {
   parseWorkEnvelope,
@@ -738,6 +739,7 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
 
     // Step 1 must be an explicit tool-only sequence: workflow_prepare first,
     // then workflow_begin and workflow_instructions as the ONLY workflow instruction source.
+    assert.match(prompt, /typed `workflow_prepare` result with `ok: true`/);
     assert.ok(
       prompt.includes("workflow_prepare"),
       "prompt must require workflow_prepare before state transitions",
@@ -778,6 +780,55 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     assert.ok(!prompt.includes("CLAUDE_PLUGIN_ROOT"), "prompt must not mention CLAUDE_PLUGIN_ROOT");
     assert.ok(!prompt.includes("omp://"), "prompt must not mention omp:// for workflow content");
     assert.match(prompt, /Do NOT glob for workflow files/, "prompt must forbid globbing workflow files");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("do-work: handoff requires explicit typed approval before workflow_handoff and continues only with the returned target envelope", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-handoff-prompt-"));
+  try {
+    const prompt = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
+    assert.ok(prompt.includes("workflow_handoff"), "prompt teaches the handoff control tool");
+    assert.ok(prompt.includes("workflow_approval"), "prompt names the typed approval artifact");
+
+    // Approval precondition is stated BEFORE the handoff tool call; the
+    // prompt must never suggest calling the tool without approval evidence.
+    const approvalIndex = prompt.indexOf("explicitly approves");
+    const handoffCallIndex = prompt.indexOf("call `workflow_handoff`");
+    assert.ok(approvalIndex >= 0, "prompt states the explicit approval precondition");
+    assert.ok(handoffCallIndex > approvalIndex, "approval precondition precedes the handoff call instruction");
+    assert.match(prompt, /NEVER infer approval from natural-language output/);
+    assert.match(prompt, /call `workflow_handoff` without typed approval evidence/);
+
+    // Continuation uses ONLY the returned target envelope, then re-fetches
+    // instructions; fail-closed on any handoff tool error.
+    assert.match(prompt, /use ONLY the returned target handoff/i);
+    assert.match(prompt, /call `workflow_instructions` again/);
+    assert.match(prompt, /do not edit state\.json or profile JSON/);
+    assert.match(prompt, /do not guess credentials/);
+
+    // The prompt teaches catalogue-based route selection: the orchestrator
+    // picks an `enabled` route, never a conditional/unsupported/arbitrary
+    // target (default-deny is engine-enforced).
+    assert.match(prompt, /route catalogue/);
+    assert.match(prompt, /route id\/kind\/status/);
+    assert.match(prompt, /conditional/);
+    assert.match(prompt, /unsupported/);
+    assert.match(prompt, /never pick a target outside the catalogue/);
+
+    // Permission summary gains explicit handoff rows.
+    assert.match(prompt, /workflow_handoff after explicit typed user approval \| ALLOW/);
+    assert.match(prompt, /workflow_handoff without approval evidence or mid-workflow \| DENY/);
+    assert.match(prompt, /workflow_handoff to conditional\/unsupported routes or arbitrary targets \| DENY/);
+
+    // Pinned invariants survive the handoff text unchanged.
+    assert.ok(prompt.indexOf("workflow_begin") < prompt.indexOf("workflow_instructions"));
+    assert.match(prompt, /only workflow instruction source/i);
+    assert.match(prompt, /workflow_advance`, call `workflow_instructions`/);
+    assert.ok(!prompt.includes("findProfileDir"), "no profile-directory helper in the prompt");
+    assert.ok(!prompt.includes("<workflow>.json"), "no workflow JSON read instruction");
+    assert.match(prompt, /Do NOT glob for workflow files/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1297,6 +1348,39 @@ test("workflow contract exposes the active feature artifact directory", () => {
     assert.equal(prepared.artifactsDir, expectedArtifactsDir);
     assert.equal(contract.state.artifactsDir, expectedArtifactsDir);
     assert.equal(contract.state.path, prepared.statePath);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("workflow contract exposes the authenticated feature-scoped artifacts directory", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-contract-artifacts-"));
+  const branch = "feat/artifacts-contract";
+  const workState = [".", "work-state"].join("");
+  try {
+    initGit(root, branch);
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    const state: TeamState = {
+      schema: 1,
+      branch,
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      task: "artifact directory contract",
+      workflow_override: false,
+      issue: null,
+      stage_cursor: profile.stages[0]!.id,
+      stages: profile.stages.map((stage) => ({ id: stage.id, status: "pending" })),
+      artifacts: {},
+      pause: { kind: "none", reason: "" },
+      updated_at: new Date().toISOString(),
+    };
+    writeState(root, state, { featureSlug: "artifact-contract" });
+
+    const contract = resolveWorkflowContract(root, { branch });
+    assert.equal(
+      contract.state.artifactsDir,
+      join(root, workState, "features", "artifact-contract", "artifacts"),
+    );
+    assert.notEqual(contract.state.artifactsDir, join(root, workState, "artifacts"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

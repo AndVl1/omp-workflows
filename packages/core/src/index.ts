@@ -238,6 +238,7 @@ export {
   resolveWorkflowProfilePath,
   loadAllProfiles,
   loadProfile,
+  profileHash,
   isRegisteredWorkflow,
   matchesProfile,
   registerWorkflowProfiles,
@@ -255,6 +256,9 @@ export {
   advanceCursor,
   reconcileTaskResult,
   recordCheckpointDecision,
+  handoffWorkflow,
+  registerWorkflowHandoffRoute,
+  handoffRouteCatalogue,
   setArtifactContractPolicy,
   setFanInPolicy,
   type CheckpointDecisionInput,
@@ -262,6 +266,9 @@ export {
   type TrustedDispatchInput,
   type CapabilityHandoff,
   type TransitionResult,
+  type HandoffWorkflowInput,
+  type HandoffApproval,
+  type HandoffTransitionResult,
 } from "./engine/durable.js";
 export {
   parseExpression,
@@ -378,6 +385,13 @@ export {
   type ModelClassification,
 } from "./engine/run.js";
 export {
+  prepareWorkflow,
+  type WorkflowPreparationInput,
+  type WorkflowPreparationContinuation,
+  type WorkflowPreparationResult,
+  type PreparedWorkflow,
+} from "./engine/prepare.js";
+export {
 	walkProfile,
 	runStage,
 	createTaskCaller,
@@ -414,6 +428,11 @@ export type {
   FanInConflictRecord,
   LoopIterationRecord,
   LoopState,
+  HandoffRoute,
+  HandoffRouteKind,
+  HandoffRouteDisposition,
+  HandoffContext,
+  HandoffRecord,
 } from "./engine/types.js";
 // ── CTO sub-orchestration (pure engine) ────────────────────────────────────
 export { MAX_TEAMS, MAX_DECOMPOSITION_DEPTH } from "./cto/types.js";

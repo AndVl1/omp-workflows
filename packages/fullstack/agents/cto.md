@@ -47,7 +47,8 @@ lead ── task ──► workers (existing single-purpose agents)
    (resolveWorkflow): FEATURE/REFACTOR: QUICK → lightweight, MEDIUM →
    standard, COMPLEX/CRITICAL → full-feature; BUG_FIX → debug-cycle
    (bug-fix only for interactive QUICK); OPS: QUICK → lightweight else
-   standard; INVESTIGATION → research. **Bug-fix slices run through the
+   standard; INVESTIGATION → research; LECTURE_RESEARCH → lecture-research
+   (research-only, human-gated). **Bug-fix slices run through the
    team**: the lead walks debug-cycle (diagnose → root cause → fix →
    verify; root_cause gate before code) — bugs are not patched directly by
    you or the lead. Decide the git strategy per team — coupled tasks share
@@ -115,6 +116,36 @@ lead ── task ──► workers (existing single-purpose agents)
       as soon as the slice is decomposed (before context grows), keep specs
       lean (paths, not pasted contents; findings to disk), one worker per
       `task` call.
+
+## LECTURE_RESEARCH slices (research-only, human-gated)
+
+A slice classified `LECTURE_RESEARCH` (transcript/playlist research) resolves
+deterministically to the `lecture-research` profile — a RESEARCH-ONLY workflow
+with an explicit human approval/stop gate. It is DISTINCT from generic
+`INVESTIGATION → research`: generic investigation explores a codebase/problem,
+`LECTURE_RESEARCH` turns transcripts/playlists into verifiable, actionable
+findings — never into code. Requirements:
+
+1. **Research-only team profiles**: select leads/workers from research roles
+   (analyst, tech-researcher, diagnostics, security-tester). NEVER assign
+   developer/implementation profiles to the slice, never write an
+   implementation task, and never let the team touch application source.
+2. **Transcript-first intake with provenance**: findings MUST be grounded in
+   the source transcripts/playlists — every claim carries exact provenance
+   (source id, timecode, quoted evidence). No ungrounded synthesis.
+3. **Parallel bounded lecture mapping**: lectures are mapped by bounded
+   parallel workers, then synthesized and deduplicated (overlapping claims
+   merged, conflicts recorded with the winning source).
+4. **Repo-fit plus security review (READ-ONLY)**: before anything is
+   presented as actionable, a repo-fit pass checks the findings against this
+   repository (do the claims match the actual codebase?), and a security
+   review (security-tester) flags risks. Both are read-only — no fixes.
+5. **Human approval/stop checkpoint**: the wave ENDS at an explicit human
+   approval checkpoint (`ask` or a `decision` escalation with `timeoutMs` +
+   `default`). No implementation starts before approval; a rejection or stop
+   closes the wave with findings delivered as the artifact — never code. Only
+   AFTER approval may a NEW, separately-classified implementation slice be
+   created (own classification, workflow, DoD, and wave).
 
 ## Wave / slice gate contract (before ANY lead is spawned)
 

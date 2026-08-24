@@ -24,6 +24,8 @@ export interface WorkTeamConfig {
   roles?: Record<string, string>;
 }
 
+const ROOT_ARTIFACTS_DIR = [".", "work-state"].join("") + "/artifacts";
+
 export function parseWorkEnvelope(args: string, cwd: string): ParsedWorkEnvelope {
   const directive = parseAutonomousDirective(args);
   const autonomyHint = directive.autonomyHint;
@@ -88,6 +90,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     buildWorkflowMatrix(),
     "",
     "After PHASE-0 classification, call `workflow_prepare` with the task, the exact canonical branch, the classification object, changed file paths, and issue metadata. For a continuation, pass the existing feedback and affected stage instead of creating a new state.",
+    "Require a typed `workflow_prepare` result with `ok: true`; if it errors, is missing, or is malformed, stop and fail closed — never write state by hand and never guess stages.",
     "`workflow_prepare` is the ONLY supported state initialization/update path: do not call `write`, `edit`, `bash`, or any filesystem API to create or modify `.work-state` files. It persists the classification, resolved workflow, task, branch, stages, scope, and durable capability atomically.",
     "If `workflow_prepare` fails, stop and record the structured error — never guess a state path or repair canonical state by hand. The P5 gate reads `classification.autonomous` as the authority.",
     "If confidence is LOW, ask a focused clarification question before preparing an expansive workflow (unless `autonomous` is true; then document a conservative default).",
@@ -95,6 +98,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "### Only after workflow_prepare succeeds",
     "1. Call `workflow_begin` to issue the durable opaque capability for the current stage. On a resumed active stage, it may reissue fresh plaintext secrets while preserving the capability identity and authorized dispatch records; always use the newly returned handoff and never retry a stale token. If it fails, stop and record the error — never guess stage content.",
     "2. Call `workflow_instructions` and treat its returned current stage contract (`stage.instructions`, `roles`, `consumes`, `produces`, `artifact_schemas`, `slot_artifacts`, `checkpoint`/`gate`, `provenance`, and `state.artifactsDir`) as the ONLY workflow instruction source. Use `state.artifactsDir` as the exact destination for every declared artifact; do not read, glob, or infer workflow profile JSON or artifact schemas from the filesystem, package paths, or plugin directories.",
+    `The returned contract must include the authenticated feature-scoped \`state.artifactsDir\`; every producer MUST write each declared artifact under that returned directory as exactly \`<artifact_id>.json\`, or for a consilium slot exactly \`<artifact_id>-<slot>.json\`. NEVER write to root ${ROOT_ARTIFACTS_DIR}; do not use guessed paths (never guess an artifact path) or any other directory.`,
     "3. Continue executing in THIS TURN. Do not stop after printing CLASSIFICATION or preparing state; immediately call `workflow_begin` and `workflow_instructions` and walk the returned stage contract.",
     "4. On continuation, skip stages already done/skipped and start at the first reopened or pending stage.",
     "5. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch. Every delegated task payload must state that `workflow_*` control tools are main-session-only, must not mutate canonical `.work-state` with `bash`, and must use `write` for its declared artifact before returning. In a consilium, each role writes only its own `slot_artifacts[role]` files; never write the shared produce id directly.",
@@ -103,6 +107,13 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "8. Before `workflow_advance`, if the current stage contract declares a non-null `checkpoint`, call `workflow_checkpoint` first with the same capability handoff, checkpoint name, mode, decision, and rationale; for autonomous stages, record the orchestrator's explicit proceed/approve decision instead of relying on `workflow_advance` to infer it.",
     "9. After every `workflow_advance`, call `workflow_instructions` again and use the returned next-stage contract. If any workflow tool errors, fail closed: stop and record the failure rather than guessing the stage.",
     "10. When a stage or the whole workflow finishes, remain available in this same session: later user feedback reopens the affected state instead of starting a fresh workflow.",
+    "",
+    "### Workflow tool-result envelope (mandatory)",
+    "Native workflow control tools return an OMP result envelope `{ content: [{ type: \"text\", text: \"<JSON>\" }], details: <object> }`.",
+    "When invoking them through Python `eval`, `tool.workflow_*` returns `{ \"text\": \"<JSON>\" }`; parse `json.loads(r[\"text\"])`, never `json.loads(r)`.",
+    "Require `ok: true` on operation envelopes such as `workflow_prepare` and `workflow_begin`; require `workflow_instructions` to contain the expected `stage` and `provenance` objects before reading it.",
+    "Keep the parsed `workflow_begin` payload: only its `handoff.dispatch_markers` contains dispatch markers; `workflow_instructions` returns the stage contract and does not contain `dispatch_markers`.",
+    "For each declared role, select the marker by exact role from that begin handoff and preserve it verbatim; missing, empty, duplicate, or mismatched markers are a fail-closed condition.",
     "",
     "### Role mapping (effective runtime resolution)",
     "| Role | Agent |",
@@ -128,15 +139,31 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "### OPAQUE CAPABILITY EXECUTION PROTOCOL",
     "After `workflow_prepare` succeeds, call `workflow_begin` before any stage action. Treat its returned handoff as the only valid capability credentials; never invent, reuse, or write tokens to `.work-state/`.",
     "The handoff's `profile_hash` is a compact first-30/last-2 binding fingerprint; copy it verbatim in every `workflow_complete`, `workflow_checkpoint`, and `workflow_advance` request. Never abbreviate or reconstruct it.",
-    "For `single` and `consilium` stages, call `task` only with the exact returned stage cursor, epoch, expected role/agent roster, and the role-specific marker from `handoff.dispatch_markers`. Put that marker verbatim inside each `tasks[].task` string (not only in the surrounding context); keep the declared `role` and `agent` beside it. Use one task call for `single` and one parallel batch for `consilium`; do not dispatch an undeclared role.",
+    "For every declared role, copy the exact `handoff.dispatch_markers[].marker` string returned by `workflow_begin` verbatim into that role's `tasks[].task` payload, including the full `<!-- omp-dispatch ... -->` syntax. Put that exact marker inside every role-specific `tasks[].task` payload, not only in shared context. Do not synthesize, transform, normalize, truncate, or otherwise alter it; if the required marker is unavailable, stop and fail closed without calling `task`.",
+    "For `single` and `consilium` stages, call `task` only with the exact returned stage cursor, epoch, expected role/agent roster, dispatch marker, and count. Use exactly one task call for each `single` stage and one parallel task batch for each `consilium` stage; include exactly the returned roster/count and do not dispatch an undeclared role.",
     "For `orchestrator`, `bash`, or `none` stages, perform only the declared contract action, persist required typed artifacts, then call `workflow_advance` with the current handoff's advance token and evidence.",
-    "After every task result, call `workflow_status`. For every succeeded dispatch whose `artifact_ids` is empty, call `workflow_complete` exactly once with its identity binding and the exact artifact IDs from `slot_artifacts` (including `produce-slot` ids for consilium); do not treat a native task result as artifact completion. If the runtime already repaired a synchronous completion, use the IDs shown by `workflow_status` and do not replay it with different IDs.",
+    "After every task result, immediately call `workflow_status` before interpreting completion. In its `capability.dispatches[]`, select the single persisted dispatch record matching the completed task by exact `role`, `agent`, and `tool_call_id` binding; pass exactly that record's `id` verbatim as `workflow_complete.dispatch_id`.",
+    "NEVER pass job IDs, task call IDs (including task-call IDs), capability IDs, role names, or synthesized IDs (including synthesized/derived IDs) as `workflow_complete.dispatch_id`; only the matching persisted dispatch record's `id` is valid. If no unique matching persisted record exists, fail closed and do not call `workflow_complete`.",
+    "When calling `workflow_complete`, preserve the exact current dispatch token, capability identity (`capability_id`), run/branch/workflow/stage binding, `stage_cursor`/`cursor_epoch`, and `profile_hash`, and include the actual outcome, evidence, and artifact IDs. Preserve the one-batch/declared-roster, actor/path, and stale-branch rules; any missing or mismatched binding fails closed.",
+    "For every succeeded dispatch whose `artifact_ids` is empty, call `workflow_complete` exactly once with its identity binding and the exact artifact IDs from `slot_artifacts` (including `produce-slot` IDs for consilium); do not treat a native task result as artifact completion. If the runtime already repaired a synchronous completion, use the IDs shown by `workflow_status` and do not replay it with different IDs.",
     "Advance only through `workflow_advance` after all current-stage dispatches are complete and required artifacts/gates exist. Use the returned next-stage handoff for the next stage; never call `task` from a stale cursor.",
+    "### Cross-profile handoff (workflow_handoff)",
+    "When the current profile completes at a `handoff` source stage and the user explicitly approves the result, choose the target workflow from the engine's typed route catalogue. The safe result of `workflow_handoff` exposes route id/kind/status, source and target workflow/stage, prerequisites, and the target preparation/materialization description. Only `enabled` catalogue routes complete; `conditional` routes are rejected deterministically until their declared evidence/materialization adapter exists, and `unsupported` or arbitrary target strings are denied — never pick a target outside the catalogue.",
+    "Persist exactly this flat typed `workflow_approval` artifact in the existing feature artifacts directory: `{ \"type\": \"workflow_approval\", \"version\": 1, \"decision\": \"approved\", \"run_key\": \"<authenticated source run_key>\", \"source_workflow\": \"<authenticated source workflow>\", \"source_stage\": \"<authenticated source stage>\", \"actor\": \"<approving actor>\", \"decided_at\": \"<ISO-8601 timestamp>\" }`. New artifacts MUST use the exact `source_workflow` and `source_stage` field names, never invented `workflow`/`stage` aliases; legacy flat aliases remain engine-compatible only for existing artifacts. Then call `workflow_handoff` with the completed run's advance-token handoff, the requested target workflow, the approval reference, and only bounded artifact/decision references.",
+    "NEVER infer approval from natural-language output or call `workflow_handoff` without typed approval evidence. If `workflow_handoff` rejects or fails, stop and preserve state: do not edit state.json or profile JSON, do not guess credentials, and do not retry with free text.",
+    "On success, discard the source envelope, use ONLY the returned target handoff, call `workflow_instructions` again, and continue with the returned target stage contract; record the target stage's own checkpoints under the fresh capability.",
+    "`workflow_handoff` returns a fresh target capability on success. Source credentials and dispatch markers are invalid immediately; discard them and never use the source capability, advance token, cursor epoch, roster, or marker for target work.",
+    "On the target, call `workflow_instructions` using only the fresh target handoff before selecting the target stage contract.",
+    "For every target task, copy the latest target `handoff.dispatch_markers[].marker` verbatim into each role-specific `tasks[].task`; use only the latest target handoff's exact cursor/epoch, expected role/agent roster, and count.",
+    "After every target `workflow_advance`, call `workflow_status` and `workflow_instructions` to refresh the target handoff; replace the marker, cursor/epoch, advance token, and expected role/agent roster with the newly returned values before any next target task or advance.",
+    "Never retry target work with a stale source or previous-stage marker (or any stale source/previous-stage capability, cursor/epoch, roster, or advance token); missing or mismatched fresh values fail closed.",
     "",
     "### Tool permission summary",
     "| Operation | Orchestrator |",
     "| --- | --- |",
     "| read/glob/grep | ALLOW |",
+    "| workflow_prepare after PHASE-0 with typed input | ALLOW |",
+    "| workflow_prepare with malformed classification/branch or without ok:true | DENY |",
     "| write/edit declared artifacts under `state.artifactsDir` returned by `workflow_instructions` | ALLOW |",
     "| write/edit application source or project files | DENY |",
     "| direct write/edit canonical workflow state | DENY |",
@@ -148,6 +175,10 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "| task for a declared stage | ALLOW |",
     "| task outside the active profile/state contract | DENY |",
     "| direct implementation or review-fix | DENY |",
+    "| workflow_handoff after explicit typed user approval | ALLOW |",
+    "| workflow_handoff to a catalogue `enabled` route with typed approval evidence | ALLOW |",
+    "| workflow_handoff to conditional/unsupported routes or arbitrary targets | DENY |",
+    "| workflow_handoff without approval evidence or mid-workflow | DENY |",
   ].join("\n");
 }
 

@@ -1,0 +1,65 @@
+{
+  "name": "lecture-research",
+  "title": "Lecture / Playlist Research",
+  "description": "LECTURE_RESEARCH. Transcript-first research over lecture/playlist source material: source intake with provenance, bounded parallel lecture mapping, synthesis with dedupe/conflict recording, read-only repo-fit plus security/IP review, then an explicit human approval/stop gate. Research-only — never implements.",
+  "match": { "type": ["LECTURE_RESEARCH"] },
+  "stages": [
+    {
+      "id": "intake",
+      "title": "Source Intake",
+      "type": "orchestrator",
+      "prompt": "Transcript-first intake: collect the lecture/playlist source material the research must be grounded in. For EVERY source record exact observable provenance — where the transcript/recording/notes live (file path, URL, playlist id), how it was obtained, and any timecode/indexing available. Preserve raw source identity; do not summarize, filter or judge yet, so later stages can quote evidence precisely. Do NOT start any implementation, repo edit or task creation — intake is research-only.",
+      "produces": "lecture_intake"
+    },
+    {
+      "id": "lecture_mapping",
+      "title": "Bounded Lecture Mapping",
+      "type": "consilium",
+      "roles": ["analyst", "tech-researcher", "diagnostics"],
+      "parallel": true,
+      "prompt": "Bounded parallel lecture mapping over the intake sources. Map the lectures/playlist segments in your assigned slice of the sources: for each mapped unit record the source id, quoted transcript/source evidence (with timecode where available), key claims and concepts. Stay strictly within the intake artifact's sources — do not fetch or invent material outside it. Every entry MUST carry observable evidence quoted from a source; entries without evidence are rejected. Record what was mapped vs. what remains unknown. Read-only research — no code, no repo edits, no task creation.",
+      "consumes": ["lecture_intake"],
+      "produces": "lecture_mapping",
+      "fan_in": {
+        "resolutions": [
+          {
+            "artifact": "lecture_mapping",
+            "field": "coverage",
+            "strategy": "first_slot",
+            "rationale": "Parallel mapping slots each describe coverage from their own slice of the intake sources; every slot's full coverage stays available in its slot-scoped artifact (<id>-<slot>.json). The shared artifact deterministically resolves the required 'coverage' scalar to the first roster slot's contribution so the synthesis stage receives a stable summary. Every applied disagreement is recorded in the synthesis provenance (conflicts) with the winning slot and losing values — never discarded silently."
+          }
+        ]
+      }
+    },
+    {
+      "id": "synthesis",
+      "title": "Synthesis & Dedupe",
+      "type": "single",
+      "role": "analyst",
+      "prompt": "Synthesize and dedupe the mapped lectures into candidate findings. Merge overlapping claims across sources; record conflicts EXPLICITLY with the winning source and the losing sources/claims — never discard a disagreement silently. Every candidate MUST list its evidence sources (intake source id + quoted evidence/timecode) and any dedupe/conflict history. Do not create tasks or code from the findings: candidates are research output only.",
+      "consumes": ["lecture_mapping", "lecture_intake"],
+      "produces": "lecture_candidates"
+    },
+    {
+      "id": "repo_fit",
+      "title": "Repo Fit & Security Review",
+      "type": "consilium",
+      "roles": ["architect", "security-tester"],
+      "parallel": true,
+      "prompt": "READ-ONLY repo-fit plus security/IP review of the candidates against this repository. Architect: check whether each candidate claim matches the actual codebase — cite concrete repo evidence (commit hash, file path, symbol) for matches and mismatches; flag claims the repo does not support. Security-tester: review candidates for security and IP/licensing risks (proprietary content, leaked secrets, license incompatibility) with evidence. NO fixes, NO edits, NO implementation — findings only, each grounded in observable repo or source evidence.",
+      "consumes": ["lecture_candidates", "lecture_intake"],
+      "produces": "lecture_repo_fit"
+    },
+    {
+      "id": "approval",
+      "title": "Approval",
+      "type": "orchestrator",
+      "prompt": "Present the synthesized, repo-fitted research findings and STOP at the explicit human approval checkpoint. Record the verdict and rationale in the decision artifact. NO implementation, task creation or code work may begin before approval; on rejection the run stops with the findings as the deliverable.",
+      "consumes": ["lecture_repo_fit", "lecture_candidates"],
+      "checkpoint": "approve_research",
+      "autonomous": "record the synthesized research decision as final; never start implementation — a follow-up implementation slice requires its own classification, workflow, DoD and wave",
+      "gate": "lecture_decision.verdict == approved || lecture_decision.verdict == rejected",
+      "produces": "lecture_decision"
+    }
+  ]
+}

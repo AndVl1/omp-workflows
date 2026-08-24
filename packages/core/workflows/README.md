@@ -60,8 +60,9 @@ OR `match.complexity` is absent).
 4. `standard`
 5. `lightweight`
 6. `research`
-7. `review`
-8. `emergency`
+7. `lecture-research`
+8. `review`
+9. `emergency`
 
 Resulting table (every Type × Complexity resolves):
 
@@ -72,6 +73,7 @@ Resulting table (every Type × Complexity resolves):
 | OPS | lightweight | standard | standard | standard |
 | BUG_FIX | bug-fix | debug-cycle | debug-cycle | debug-cycle |
 | INVESTIGATION | research | research | research | research |
+| LECTURE_RESEARCH | lecture-research | lecture-research | lecture-research | lecture-research |
 | REVIEW | review | review | review | review |
 | HOTFIX | emergency | emergency | emergency | emergency |
 
@@ -80,8 +82,74 @@ Resulting table (every Type × Complexity resolves):
 **Autonomous override**: in autonomous mode, every `BUG_FIX` uses `debug-cycle` regardless
 of complexity (the diagnostics ↔ manual-qa loop is how a hypothesis is formed without a human).
 
+**Dedicated research intent**: `LECTURE_RESEARCH` (transcript/playlist research) is a
+first-class type DISTINCT from generic `INVESTIGATION` → `research`. It resolves to
+`lecture-research` at EVERY complexity and autonomy and is never routed to an implementation
+profile (research-only, human approval gate — see below).
+
 This table is mirrored in `hooks/validate-state.sh` (P5) — the classification gate blocks
 launching agents if `team-state.json`'s `workflow` does not match its `classification`.
+
+## Lecture research workflow (`lecture-research`)
+
+Dedicated research-only profile for transcript/playlist research (semantic type
+`LECTURE_RESEARCH`). It turns lectures/playlists into verifiable, actionable findings —
+**never into code**.
+
+**Deterministic resolution.** `resolveWorkflow("LECTURE_RESEARCH", <any complexity>, <any
+autonomous>) === "lecture-research"` — one profile for the whole type, regardless of complexity
+or autonomy. It is a first-class intent DISTINCT from generic `INVESTIGATION` → `research`:
+generic investigation explores a codebase/problem, `LECTURE_RESEARCH` grounds every finding in
+source transcripts/playlists and ends at an explicit human approval gate.
+
+**Stages** (the exact stage list, gates and checkpoint definitions live in
+`lecture-research.json`; each stage embeds its prompt in the profile — there are no per-stage
+template files for this profile):
+
+1. **Intake** (orchestrator) — transcript-first source intake: collect the source
+   transcripts/playlists, confirm the bounded lecture set, and record observable provenance
+   for every source (file path/URL/playlist id, how obtained, available timecodes). No
+   summarization or judgement yet, so later stages can quote evidence precisely. Produces
+   `lecture_intake`.
+2. **Lecture mapping** (consilium, bounded parallel roster) — `analyst`, `tech-researcher`
+   and `diagnostics` map the intake sources in parallel slices; every mapped unit carries
+   quoted source evidence (source id, timecode where available) and the stage records what was
+   mapped vs. what remains unknown. Produces `lecture_mapping`.
+3. **Synthesis & dedupe** (single `analyst`) — merge overlapping claims across sources, record
+   conflicts explicitly with the winning source and the losing sources/claims, and produce the
+   deduplicated candidate findings set. Produces `lecture_candidates`.
+4. **Repo fit & security review** (consilium, parallel, read-only) — `architect` checks
+   whether each candidate matches the actual codebase, citing concrete repo evidence (commit
+   hash, file path, symbol); `security-tester` reviews candidates for security and IP/licensing
+   risks. No fixes, no edits — findings only. Produces `lecture_repo_fit`.
+5. **Approval** (orchestrator, explicit human checkpoint) — the run pauses (`ask` or a
+   `decision` escalation with `timeoutMs` + `default`), records the verdict, and completes the
+   terminal stage on EITHER an explicit `approved` or `rejected` decision
+   (`gate: lecture_decision.verdict == approved || lecture_decision.verdict == rejected`).
+   No implementation task or code work may begin before approval; on rejection the run stops
+   with the findings as the deliverable. Produces `lecture_decision`.
+
+**Artifacts.** Every stage writes typed artifacts to `.work-state/artifacts/<id>.json`
+per `artifacts-schema.json`: the intake with provenance, evidence-grounded lecture maps, the
+synthesis with conflicts, the combined repo-fit + security findings, and the explicit human
+decision. The profile never produces source code.
+
+**Human gate.** The approval checkpoint is the profile's terminal decision point: the run waits
+for an explicit human decision before anything beyond findings is allowed, and the stage
+completes only once that decision is recorded (`approved` or `rejected`). Neither decision path
+starts implementation — implementing an approved finding is a NEW task with its own
+classification, workflow and DoD, never a stage of this profile.
+
+**Entry points.** Both `/do-work` and `/cto` route through the same classification contract and
+matrix — there is no new slash command. `/do-work` classifies the task (PHASE-0 type
+`LECTURE_RESEARCH`), resolves the profile deterministically and walks it stage by stage. `/cto`
+resolves per-slice workflows from the same matrix: a `LECTURE_RESEARCH` slice is staffed with
+the profile's research-only roster — `analyst`, `tech-researcher`, `diagnostics` for the
+parallel lecture mapping, then `architect` + `security-tester` for the read-only repo-fit and
+security review — keeps provenance/timecoded evidence, and ends at the human approval gate — no
+implementation before approval. Both surfaces resolve the current stage through the opaque
+workflow-tools contract (`resolveWorkflowContract` / `resolveStageInstructions`), which
+validates persisted state, profile hash and dispatch capability before any stage runs.
 
 ## Interpreter contract (how `/team` walks a profile)
 
@@ -198,6 +266,52 @@ set models — it only names agents.
 | middle | `@task` | `auto` | developer-kotlin, developer-go, frontend-developer, qa, … |
 | low | `@smol` | `medium` | tech-researcher |
 
+
+## Cross-profile handoff route catalogue
+
+`workflow_handoff` transfers an explicitly approved, completed run from a `handoff`-capable source stage into a **registered target workflow** through an engine-owned typed catalogue (`packages/core/src/engine/durable.ts` → `HANDOFF_ROUTE_CATALOGUE`; live snapshot via `handoffRouteCatalogue()`). Route metadata lives in the engine, never in shipped profile JSON, so `profileHash` stays stable for in-flight runs and no profile edit can invalidate active states. The tool call itself remains the user-visible handoff event — it is a separate main-session control tool beside `workflow_advance`, never a slash command or hidden state mutation.
+
+**Default-deny.** Only `enabled` routes complete. `conditional` routes are catalogue-only: `handoffWorkflow` rejects them deterministically (error names the route id, required prerequisites, and the missing `blocked_by` evidence/materialization adapters; the rejection carries the full route metadata) until their adapter exists. `unsupported` pairs and any unregistered target string fail closed with a human-readable reason. Rejections never mutate canonical state or artifacts (single atomic `writeState` only on success).
+
+### Route matrix
+
+| Route id | Kind | Disposition | Source → Target | Prerequisites | Status |
+|---|---|---|---|---|---|
+| `spec-handoff->full-feature` | feature-intake | **enabled** | `spec-preparation:handoff` → `full-feature:discovery` | `spec_handoff` artifact; typed approval (artifact or approved checkpoint); source terminal | **usable today** — target discovery owns feature-spec normalization/preparation |
+| `full-feature-summary->regression` | regression | conditional | `full-feature:summary` → `feature-regression:discovery_intake` | `summary` artifact; bounded implementation/review/QA context; explicit regression intent/approval | blocked: regression intent/approval + context materialization adapters |
+| `standard-summary->regression` | regression | conditional | `standard:summary` → `feature-regression:discovery_intake` | same as above | blocked: same adapters |
+| `lightweight-summary->regression` | regression | conditional | `lightweight:summary` → `feature-regression:discovery_intake` | same as above | blocked: same adapters |
+| `regression-summary->bug-fix` | bug-fix-diagnostic | conditional | `feature-regression:summary_handoff` → `bug-fix:discovery` | `regression_report` artifact; confirmed actionable/obvious finding with triage evidence | blocked: regression report/triage materialization adapter |
+| `regression-summary->debug-cycle` | debug-diagnostic | conditional | `feature-regression:summary_handoff` → `debug-cycle:discovery` | `regression_report` artifact; uncertain/iterative/replay-required finding | blocked: regression report/triage materialization adapter |
+| `bug-fix-summary->regression` | feedback-regression | conditional | `bug-fix:summary` → `feature-regression:discovery_intake` | `summary` artifact; fix/verification evidence; explicit regression intent/approval | blocked: post-fix intent/approval + evidence materialization adapters |
+| `debug-cycle-summary->regression` | feedback-regression | conditional | `debug-cycle:summary` → `feature-regression:discovery_intake` | same as above | blocked: same adapters |
+| `emergency-summary->regression` | feedback-regression | conditional | `emergency:summary` → `feature-regression:discovery_intake` | same as above | blocked: same adapters |
+
+### Explicitly unsupported pairs (documented default-deny)
+
+These direct pairs are catalogue entries with `disposition: "unsupported"` — they never complete, and `handoffWorkflow` rejects them with the route id and a reason instead of pretending arbitrary target strings are safe:
+
+- **spec → bug-fix / debug-cycle** (`spec-handoff->bug-fix`, `spec-handoff->debug-cycle`) — a confirmed fix or uncertain finding must first be evidenced by a regression run.
+- **feature → bug-fix / debug-cycle** (`full-feature|standard|lightweight-summary->bug-fix|debug-cycle`) — suspected defects must be evidenced by post-feature regression first.
+- **regression → feature** (`regression-summary->full-feature|standard|lightweight`) — regression findings never reopen feature implementation; reopen the affected stage or start a new feature task.
+- **review/analysis → implementation** (`review-summary->full-feature`, `research-summary->full-feature`) — review/research deliverables never start feature implementation; classify a new task.
+- **same-profile transitions** (`full-feature->full-feature`, `standard->standard`, `lightweight->lightweight`, `bug-fix->bug-fix`, `debug-cycle->debug-cycle`, `feature-regression->feature-regression`, `emergency->emergency`, `spec-preparation->spec-preparation`) — a completed run never restarts its own profile; reopen the affected stage instead.
+
+Any other source/stage/target triple is **not registered** and is rejected with `workflow transition is not registered` (fail closed).
+
+### Target stages (each retains its profile's own gates/checkpoints)
+
+| Target stage | Profile | Contract |
+|---|---|---|
+| `discovery` | `full-feature`, `standard`, `lightweight`, `bug-fix`, `debug-cycle` | entry stage; orchestrator; the source context is materialized by this stage's own preparation (feature_spec normalization / fix confirmation / debug intake) |
+| `discovery_intake` | `feature-regression` | entry stage; orchestrator; materializes a regression intake from the carried context |
+
+### Adding a future route
+
+1. Add the entry to `HANDOFF_ROUTE_CATALOGUE` in `packages/core/src/engine/durable.ts` with a stable unique `id`, real source/target workflow + stage names (stages must exist in the shipped profiles — the catalogue integrity test enforces this), `kind`, `disposition`, `description`, and, for conditional routes, `prerequisites` + `blocked_by`.
+2. Keep the route `conditional` until its required evidence/materialization adapter is implemented — never flip it to `enabled` "so it exists". While conditional, `handoffWorkflow` rejects it deterministically with the declared gaps; enabling is the adapter's completion, not a catalogue edit.
+3. Update the route matrix above and `CHANGELOG.md`.
+4. Duplicate ids/keys throw at registration; the regression tests (`packages/core/test/handoff.test.ts`) defend catalogue integrity, enabled success, conditional/unsupported rejection with unchanged state, and unknown-target default-deny.
 
 ## Adding a custom profile
 

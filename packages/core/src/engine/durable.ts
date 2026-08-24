@@ -12,7 +12,7 @@ import { isDoDComplete, isRootCauseDocumented, readDoD } from "./dod.js";
 import { validationGate } from "../gates/validation.js";
 import { buildDispatchMarker } from "../gates/dispatch.js";
 import { evaluatePredicate } from "./predicate.js";
-import { appendCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
+import { appendCheckpointDecision, findCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
 import { loopExhaustionKind, loopIterationRecord, loopReentryDecision, loopStateFor, resolveBackToStage } from "./loops.js";
 import {
   DEFAULT_FAN_IN_POLICY,
@@ -28,7 +28,7 @@ import {
   DEFAULT_ARTIFACT_CONTRACT_POLICY,
   type ArtifactContractPolicy,
 } from "./artifact-contract.js";
-import type { CheckpointDecision, DispatchCompletion, DispatchRecord, LoopState, TeamState, StageDef } from "./types.js";
+import type { CheckpointDecision, DispatchCompletion, DispatchRecord, HandoffContext, HandoffRecord, HandoffRoute, LoopState, TeamState, StageDef } from "./types.js";
 
 export type DispatchAuth = {
   token: string;
@@ -126,6 +126,12 @@ const activeCapability = (value: TeamState["dispatch_capability"]): ActiveCapabi
 
 export type TransitionResult = { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff } | { ok: false; error: string; state?: TeamState };
 
+export interface CapabilityDispatchMarker {
+  role: string;
+  agent: string;
+  marker: string;
+}
+
 export interface CapabilityHandoff {
   capability_id: string;
   dispatch_token: string;
@@ -143,19 +149,34 @@ export interface CapabilityHandoff {
 }
 
 function handoffFromState(
+  cwd: string,
   state: TeamState,
   secrets: { capability_id: string; dispatch_token: string; advance_token: string },
   stage: StageDef,
 ): CapabilityHandoff | undefined {
   const cap = activeCapability(state.dispatch_capability);
   if (!cap) return undefined;
-  const roles = cap.expected_roster.map(({ role }) => role);
+  const profile = loadProfile(cap.issued_for.workflow);
+  const profileStage = profile?.stages.find((candidate) => candidate.id === cap.issued_for.stage_cursor);
+  if (!profileStage || profileStage.id !== stage.id) return undefined;
+  const stageKind = profileStage.type === "single" || profileStage.type === "consilium" ? profileStage.type : "none";
+  if (stageKind !== cap.kind) return undefined;
+
+  const config = resolveConfig(cwd);
+  const flags = state.scope ?? resolveScope([], config);
+  const slots = stageKind === "none"
+    ? []
+    : resolveStageDispatchSlots(profileStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  const resolvedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+  if (JSON.stringify(resolvedRoster) !== JSON.stringify(cap.expected_roster)) return undefined;
+
+  const roles = cap.expected_roster.map((entry) => entry.role);
   const dispatch_markers = cap.kind === "none"
     ? []
     : cap.expected_roster.map(({ role, agent }) => ({
       role,
       agent,
-      marker: buildDispatchMarker(cap.issued_for.run_key, stage, roles, role, cap.issued_for.cursor_epoch),
+      marker: buildDispatchMarker(cap.issued_for.run_key, profileStage, roles, role, cap.issued_for.cursor_epoch),
     }));
   return {
     capability_id: secrets.capability_id,
@@ -378,7 +399,7 @@ export function beginCapability(cwd: string): TransitionResult {
       return {
         ok: true,
         state: next,
-        handoff: handoffFromState(next, {
+        handoff: handoffFromState(cwd, next, {
           capability_id: reissued.capability_id,
           dispatch_token: reissued.dispatch_token,
           advance_token: reissued.advance_token,
@@ -422,7 +443,7 @@ export function beginCapability(cwd: string): TransitionResult {
   return {
     ok: true,
     state: next,
-    handoff: handoffFromState(next, {
+    handoff: handoffFromState(cwd, next, {
       capability_id: issued.capability_id,
       dispatch_token: issued.dispatch_token,
       advance_token: issued.advance_token,
@@ -1039,7 +1060,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
     nextStage = candidate;
     break;
   }
-  const epoch = randomUUID();
+  const epoch = nextStage ? randomUUID() : cap.issued_for.cursor_epoch;
   let handoffSecrets: { capability_id: string; dispatch_token: string; advance_token: string } | undefined;
   let nextCap: NonNullable<TeamState["dispatch_capability"]>;
   if (nextStage) {
@@ -1086,7 +1107,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
     pause: nextStage ? state.pause : { kind: "done", reason: "" },
   };
   persist(cwd, next, target);
-  return { ok: true, state: next, handoff: nextStage && handoffSecrets ? handoffFromState(next, handoffSecrets, nextStage) : undefined };
+  return { ok: true, state: next, handoff: nextStage && handoffSecrets ? handoffFromState(cwd, next, handoffSecrets, nextStage) : undefined };
 }
 
 /**
@@ -1165,7 +1186,7 @@ function reenterLoop(
   return {
     ok: true,
     state: next,
-    handoff: handoffFromState(next, {
+    handoff: handoffFromState(cwd, next, {
       capability_id: issued.capability_id,
       dispatch_token: issued.dispatch_token,
       advance_token: issued.advance_token,
@@ -1256,4 +1277,922 @@ export function reconcileTaskResult(cwd: string, input: { dispatch_id?: string; 
     if (!last.ok) return last;
   }
   return last;
+}
+
+// ── Handoff: cross-profile transfer of an approved completed run ──────────
+//
+// A handoff moves an explicitly approved, completed source run into a
+// registered target workflow without editing shipped profile JSON or copying
+// artifacts: the feature directory is already shared, so artifacts/decisions/
+// history/scope survive by construction and the transition only rewrites the
+// engine-owned state bindings. Every validation failure returns before the
+// single `persist` call, so rejected handoffs leave canonical state and
+// artifacts byte-identical (fail closed). Plaintext capability secrets are
+// returned only in the one-time result envelope; state.json persists hashes
+// only.
+
+export interface HandoffApproval {
+  kind: "checkpoint" | "artifact";
+  /** Checkpoint name (checkpoint kind) or safe artifact id (artifact kind). */
+  ref: string;
+  /** Must equal the authenticated source stage and the registered route source stage. */
+  source_stage: string;
+  /** Must be the literal `approved`; free text is never an approval. */
+  decision: string;
+}
+
+export interface HandoffWorkflowInput extends DispatchAuth {
+  target_workflow: string;
+  /** Optional caller precondition; the engine always persists the current target hash. */
+  target_profile_hash?: string;
+  approval: HandoffApproval;
+  /** Non-empty bounded audit actor; the control tool defaults this to "orchestrator". */
+  actor: string;
+  handoff_context?: HandoffContext;
+}
+
+export type HandoffTransitionResult =
+  | { ok: true; state: TeamState; route: HandoffRoute; handoff: CapabilityHandoff; audit: HandoffRecord }
+  | { ok: false; error: string; state?: TeamState; route?: HandoffRoute };
+
+const MAX_HANDOFF_CONTEXT_ARTIFACTS = 32;
+const MAX_HANDOFF_CONTEXT_DECISION_REFS = 32;
+const MAX_HANDOFF_CONTEXT_SUMMARY_CHARS = 2000;
+const MAX_HANDOFF_CONTEXT_SERIALIZED_BYTES = 8192;
+const MAX_HANDOFF_DECISION_REF_CHARS = 200;
+const MAX_HANDOFF_RECORDS = 32;
+
+/** Registered source-workflow/source-stage/target-workflow -> route. */
+const handoffRoutes = new Map<string, HandoffRoute>();
+const handoffRouteKey = (sourceWorkflow: string, sourceStage: string, targetWorkflow: string): string =>
+  `${sourceWorkflow}\u0000${sourceStage}\u0000${targetWorkflow}`;
+
+const HANDOFF_ROUTE_DISPOSITIONS = ["enabled", "conditional", "unsupported"] as const;
+
+/**
+ * Register a generic handoff route. Duplicate keys (same source workflow +
+ * source stage + target workflow) and duplicate route ids are rejected
+ * deterministically so route metadata can never drift silently. Route
+ * entries must carry a stable id, an explicit disposition (`enabled` |
+ * `conditional` | `unsupported`), a semantics kind, and human-readable
+ * description; `conditional` entries declare prerequisites and the
+ * `blocked_by` adapter/evidence gaps that keep them from completing.
+ */
+export function registerWorkflowHandoffRoute(route: HandoffRoute): void {
+  if (
+    !route ||
+    typeof route.id !== "string" || !route.id.trim() ||
+    typeof route.source_workflow !== "string" || !route.source_workflow.trim() ||
+    typeof route.source_stage !== "string" || !route.source_stage.trim() ||
+    typeof route.target_workflow !== "string" || !route.target_workflow.trim() ||
+    typeof route.target_stage !== "string" || !route.target_stage.trim() ||
+    typeof route.kind !== "string" || !route.kind.trim() ||
+    !HANDOFF_ROUTE_DISPOSITIONS.includes(route.disposition) ||
+    typeof route.description !== "string" || !route.description.trim()
+  ) {
+    throw new Error("invalid handoff route registration");
+  }
+  for (const field of ["preparation", "when"] as const) {
+    const value = route[field];
+    if (value !== undefined && (typeof value !== "string" || !value.trim())) {
+      throw new Error("invalid handoff route registration");
+    }
+  }
+  for (const field of ["prerequisites", "blocked_by"] as const) {
+    const values = route[field];
+    if (values !== undefined && (!Array.isArray(values) || values.some((entry) => typeof entry !== "string" || !entry.trim()))) {
+      throw new Error("invalid handoff route registration");
+    }
+  }
+  const key = handoffRouteKey(route.source_workflow, route.source_stage, route.target_workflow);
+  if (handoffRoutes.has(key)) {
+    throw new Error(`handoff route already registered: ${route.source_workflow}:${route.source_stage} -> ${route.target_workflow}`);
+  }
+  for (const existing of handoffRoutes.values()) {
+    if (existing.id === route.id) {
+      throw new Error(`handoff route id already registered: ${route.id}`);
+    }
+  }
+  handoffRoutes.set(key, route);
+}
+
+/**
+ * Engine-owned typed transition catalogue (see `workflows/README.md` for the
+ * maintainers' matrix). Default-deny: only `enabled` routes may complete;
+ * `conditional` routes are catalogue-only until their required
+ * evidence/materialization adapter exists (`handoffWorkflow` rejects them
+ * deterministically with the route metadata and the missing gaps); and
+ * explicitly documented `unsupported` pairs — plus any unregistered target
+ * string — fail closed. Route metadata lives here, never in shipped profile
+ * JSON, so `profileHash` stays stable for in-flight runs.
+ */
+const HANDOFF_ROUTE_CATALOGUE: readonly HandoffRoute[] = [
+  // ── Enabled: approved implementation-ready spec -> feature discovery ────
+  {
+    id: "spec-handoff->full-feature",
+    source_workflow: "spec-preparation",
+    source_stage: "handoff",
+    target_workflow: "full-feature",
+    target_stage: "discovery",
+    kind: "feature-intake",
+    disposition: "enabled",
+    description: "Transfer an approved implementation-ready specification into full-feature discovery.",
+    preparation: "Target discovery normalizes the carried spec_handoff context into the feature profile's own feature_spec contract and runs the feature profile's discovery/preparation gates.",
+    prerequisites: [
+      "source stage `handoff` is complete and every source stage is done/skipped",
+      "typed `workflow_approval` artifact (or an approved checkpoint) bound to the source run/workflow/stage",
+      "`spec_handoff` produced artifact is present and addressable",
+    ],
+    when: "the user explicitly approves the specification for implementation",
+  },
+
+  // ── Conditional: post-feature regression intake ─────────────────────────
+  {
+    id: "full-feature-summary->regression",
+    source_workflow: "full-feature",
+    source_stage: "summary",
+    target_workflow: "feature-regression",
+    target_stage: "discovery_intake",
+    kind: "regression",
+    disposition: "conditional",
+    description: "Conditional post-feature regression after an approved full-feature summary.",
+    preparation: "Target discovery_intake materializes a regression intake from the carried implementation/review/QA context.",
+    prerequisites: [
+      "`summary` produced artifact is present",
+      "bounded implementation/review/QA context carried",
+      "explicit regression intent/approval",
+    ],
+    blocked_by: [
+      "regression intent/approval evidence adapter not implemented",
+      "implementation/review/QA context materialization adapter not implemented",
+    ],
+    when: "the user explicitly requests a regression pass over the completed feature",
+  },
+  {
+    id: "standard-summary->regression",
+    source_workflow: "standard",
+    source_stage: "summary",
+    target_workflow: "feature-regression",
+    target_stage: "discovery_intake",
+    kind: "regression",
+    disposition: "conditional",
+    description: "Conditional post-feature regression after an approved standard summary.",
+    preparation: "Target discovery_intake materializes a regression intake from the carried implementation/review/QA context.",
+    prerequisites: [
+      "`summary` produced artifact is present",
+      "bounded implementation/review/QA context carried",
+      "explicit regression intent/approval",
+    ],
+    blocked_by: [
+      "regression intent/approval evidence adapter not implemented",
+      "implementation/review/QA context materialization adapter not implemented",
+    ],
+    when: "the user explicitly requests a regression pass over the completed feature",
+  },
+  {
+    id: "lightweight-summary->regression",
+    source_workflow: "lightweight",
+    source_stage: "summary",
+    target_workflow: "feature-regression",
+    target_stage: "discovery_intake",
+    kind: "regression",
+    disposition: "conditional",
+    description: "Conditional post-feature regression after an approved lightweight summary.",
+    preparation: "Target discovery_intake materializes a regression intake from the carried implementation/review/QA context.",
+    prerequisites: [
+      "`summary` produced artifact is present",
+      "bounded implementation/review/QA context carried",
+      "explicit regression intent/approval",
+    ],
+    blocked_by: [
+      "regression intent/approval evidence adapter not implemented",
+      "implementation/review/QA context materialization adapter not implemented",
+    ],
+    when: "the user explicitly requests a regression pass over the completed feature",
+  },
+
+  // ── Conditional: regression -> confirmed obvious bug fix ────────────────
+  {
+    id: "regression-summary->bug-fix",
+    source_workflow: "feature-regression",
+    source_stage: "summary_handoff",
+    target_workflow: "bug-fix",
+    target_stage: "discovery",
+    kind: "bug-fix-diagnostic",
+    disposition: "conditional",
+    description: "Conditional diagnostic handoff into a confirmed, actionable bug fix from a regression report.",
+    preparation: "Target discovery confirms the obvious fix from the carried regression report/triage evidence.",
+    prerequisites: [
+      "`regression_report` produced artifact is present",
+      "confirmed actionable/obvious finding with regression triage evidence",
+    ],
+    blocked_by: ["regression report/triage materialization adapter not implemented"],
+    when: "the regression run confirms an actionable, obvious fix",
+  },
+
+  // ── Conditional: regression -> uncertain/iterative debug cycle ──────────
+  {
+    id: "regression-summary->debug-cycle",
+    source_workflow: "feature-regression",
+    source_stage: "summary_handoff",
+    target_workflow: "debug-cycle",
+    target_stage: "discovery",
+    kind: "debug-diagnostic",
+    disposition: "conditional",
+    description: "Conditional diagnostic handoff into iterative verification for uncertain, replay-required regression findings.",
+    preparation: "Target discovery starts an iterative debug cycle from the carried regression evidence.",
+    prerequisites: [
+      "`regression_report` produced artifact is present",
+      "uncertain/iterative finding requiring replay verification",
+    ],
+    blocked_by: ["regression report/triage materialization adapter not implemented"],
+    when: "the finding is uncertain or requires iterative verification",
+  },
+
+  // ── Conditional: post-fix feedback/reopen regression ────────────────────
+  {
+    id: "bug-fix-summary->regression",
+    source_workflow: "bug-fix",
+    source_stage: "summary",
+    target_workflow: "feature-regression",
+    target_stage: "discovery_intake",
+    kind: "feedback-regression",
+    disposition: "conditional",
+    description: "Conditional post-fix regression/feedback after an approved bug-fix summary.",
+    preparation: "Target discovery_intake materializes a regression intake from the carried fix/verification evidence.",
+    prerequisites: [
+      "`summary` produced artifact is present",
+      "fix/verification evidence is available",
+      "explicit regression intent/approval",
+    ],
+    blocked_by: [
+      "post-fix regression intent/approval evidence adapter not implemented",
+      "fix/verification evidence materialization adapter not implemented",
+    ],
+    when: "the user requests post-fix regression or feedback verification",
+  },
+  {
+    id: "debug-cycle-summary->regression",
+    source_workflow: "debug-cycle",
+    source_stage: "summary",
+    target_workflow: "feature-regression",
+    target_stage: "discovery_intake",
+    kind: "feedback-regression",
+    disposition: "conditional",
+    description: "Conditional post-fix regression/feedback after an approved debug-cycle summary.",
+    preparation: "Target discovery_intake materializes a regression intake from the carried fix/verification evidence.",
+    prerequisites: [
+      "`summary` produced artifact is present",
+      "fix/verification evidence is available",
+      "explicit regression intent/approval",
+    ],
+    blocked_by: [
+      "post-fix regression intent/approval evidence adapter not implemented",
+      "fix/verification evidence materialization adapter not implemented",
+    ],
+    when: "the user requests post-fix regression or feedback verification",
+  },
+  {
+    id: "emergency-summary->regression",
+    source_workflow: "emergency",
+    source_stage: "summary",
+    target_workflow: "feature-regression",
+    target_stage: "discovery_intake",
+    kind: "feedback-regression",
+    disposition: "conditional",
+    description: "Conditional post-fix regression/feedback after an approved emergency summary.",
+    preparation: "Target discovery_intake materializes a regression intake from the carried fix/verification evidence.",
+    prerequisites: [
+      "`summary` produced artifact is present",
+      "fix/verification evidence is available",
+      "explicit regression intent/approval",
+    ],
+    blocked_by: [
+      "post-fix regression intent/approval evidence adapter not implemented",
+      "fix/verification evidence materialization adapter not implemented",
+    ],
+    when: "the user requests post-fix regression or feedback verification",
+  },
+
+  // ── Explicitly unsupported direct pairs (documented default-deny) ───────
+  // These complete nothing today and reject deterministically with a
+  // human-readable reason; they exist so the catalogue documents the policy
+  // instead of pretending arbitrary target strings are safe.
+  {
+    id: "spec-handoff->bug-fix",
+    source_workflow: "spec-preparation",
+    source_stage: "handoff",
+    target_workflow: "bug-fix",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct spec -> bug-fix transfer is unsupported: a confirmed fix must first be validated by a regression run that produces triage evidence.",
+    when: "never — start a new classification instead",
+  },
+  {
+    id: "spec-handoff->debug-cycle",
+    source_workflow: "spec-preparation",
+    source_stage: "handoff",
+    target_workflow: "debug-cycle",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct spec -> debug-cycle transfer is unsupported: uncertain findings must come from a regression run, not from a specification.",
+    when: "never — start a new classification instead",
+  },
+  {
+    id: "full-feature-summary->bug-fix",
+    source_workflow: "full-feature",
+    source_stage: "summary",
+    target_workflow: "bug-fix",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct feature -> bug-fix transfer is unsupported: a suspected defect must first be evidenced by a regression run.",
+    when: "never — request post-feature regression instead",
+  },
+  {
+    id: "full-feature-summary->debug-cycle",
+    source_workflow: "full-feature",
+    source_stage: "summary",
+    target_workflow: "debug-cycle",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct feature -> debug-cycle transfer is unsupported: uncertain defects must first be evidenced by a regression run.",
+    when: "never — request post-feature regression instead",
+  },
+  {
+    id: "standard-summary->bug-fix",
+    source_workflow: "standard",
+    source_stage: "summary",
+    target_workflow: "bug-fix",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct feature -> bug-fix transfer is unsupported: a suspected defect must first be evidenced by a regression run.",
+    when: "never — request post-feature regression instead",
+  },
+  {
+    id: "standard-summary->debug-cycle",
+    source_workflow: "standard",
+    source_stage: "summary",
+    target_workflow: "debug-cycle",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct feature -> debug-cycle transfer is unsupported: uncertain defects must first be evidenced by a regression run.",
+    when: "never — request post-feature regression instead",
+  },
+  {
+    id: "lightweight-summary->bug-fix",
+    source_workflow: "lightweight",
+    source_stage: "summary",
+    target_workflow: "bug-fix",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct feature -> bug-fix transfer is unsupported: a suspected defect must first be evidenced by a regression run.",
+    when: "never — request post-feature regression instead",
+  },
+  {
+    id: "lightweight-summary->debug-cycle",
+    source_workflow: "lightweight",
+    source_stage: "summary",
+    target_workflow: "debug-cycle",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct feature -> debug-cycle transfer is unsupported: uncertain defects must first be evidenced by a regression run.",
+    when: "never — request post-feature regression instead",
+  },
+  {
+    id: "regression-summary->full-feature",
+    source_workflow: "feature-regression",
+    source_stage: "summary_handoff",
+    target_workflow: "full-feature",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct regression -> feature transfer is unsupported: regression findings never reopen feature implementation; reopen the affected stage or start a new feature task.",
+    when: "never — reopen the affected stage instead",
+  },
+  {
+    id: "regression-summary->standard",
+    source_workflow: "feature-regression",
+    source_stage: "summary_handoff",
+    target_workflow: "standard",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct regression -> feature transfer is unsupported: regression findings never reopen feature implementation.",
+    when: "never — reopen the affected stage instead",
+  },
+  {
+    id: "regression-summary->lightweight",
+    source_workflow: "feature-regression",
+    source_stage: "summary_handoff",
+    target_workflow: "lightweight",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct regression -> feature transfer is unsupported: regression findings never reopen feature implementation.",
+    when: "never — reopen the affected stage instead",
+  },
+  {
+    id: "review-summary->full-feature",
+    source_workflow: "review",
+    source_stage: "summary",
+    target_workflow: "full-feature",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct review -> implementation transfer is unsupported: a review deliverable never starts feature implementation; classify a new implementation task.",
+    when: "never — start a new classification instead",
+  },
+  {
+    id: "research-summary->full-feature",
+    source_workflow: "research",
+    source_stage: "summary",
+    target_workflow: "full-feature",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Direct analysis -> implementation transfer is unsupported: research findings never start feature implementation; classify a new implementation task.",
+    when: "never — start a new classification instead",
+  },
+  {
+    id: "full-feature->full-feature",
+    source_workflow: "full-feature",
+    source_stage: "summary",
+    target_workflow: "full-feature",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Same-profile transitions are unsupported: a completed run never restarts its own profile; reopen the affected stage instead.",
+    when: "never — reopen the affected stage instead",
+  },
+  {
+    id: "standard->standard",
+    source_workflow: "standard",
+    source_stage: "summary",
+    target_workflow: "standard",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Same-profile transitions are unsupported: a completed run never restarts its own profile; reopen the affected stage instead.",
+    when: "never — reopen the affected stage instead",
+  },
+  {
+    id: "lightweight->lightweight",
+    source_workflow: "lightweight",
+    source_stage: "summary",
+    target_workflow: "lightweight",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Same-profile transitions are unsupported: a completed run never restarts its own profile; reopen the affected stage instead.",
+    when: "never — reopen the affected stage instead",
+  },
+  {
+    id: "bug-fix->bug-fix",
+    source_workflow: "bug-fix",
+    source_stage: "summary",
+    target_workflow: "bug-fix",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Same-profile transitions are unsupported: a completed run never restarts its own profile; reopen the affected stage instead.",
+    when: "never — reopen the affected stage instead",
+  },
+  {
+    id: "debug-cycle->debug-cycle",
+    source_workflow: "debug-cycle",
+    source_stage: "summary",
+    target_workflow: "debug-cycle",
+    target_stage: "discovery",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Same-profile transitions are unsupported: a completed run never restarts its own profile; reopen the affected stage instead.",
+    when: "never — reopen the affected stage instead",
+  },
+  {
+    id: "feature-regression->feature-regression",
+    source_workflow: "feature-regression",
+    source_stage: "summary_handoff",
+    target_workflow: "feature-regression",
+    target_stage: "discovery_intake",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Same-profile transitions are unsupported: a completed run never restarts its own profile; reopen the affected stage instead.",
+    when: "never — reopen the affected stage instead",
+  },
+  {
+    id: "emergency->emergency",
+    source_workflow: "emergency",
+    source_stage: "summary",
+    target_workflow: "emergency",
+    target_stage: "implementation",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Same-profile transitions are unsupported: a completed run never restarts its own profile; reopen the affected stage instead.",
+    when: "never — reopen the affected stage instead",
+  },
+  {
+    id: "spec-preparation->spec-preparation",
+    source_workflow: "spec-preparation",
+    source_stage: "handoff",
+    target_workflow: "spec-preparation",
+    target_stage: "intake_repo_map",
+    kind: "unsupported",
+    disposition: "unsupported",
+    description: "Same-profile transitions are unsupported: a completed run never restarts its own profile; reopen the affected stage instead.",
+    when: "never — reopen the affected stage instead",
+  },
+];
+
+for (const route of HANDOFF_ROUTE_CATALOGUE) {
+  registerWorkflowHandoffRoute(route);
+}
+
+/** Live snapshot of the registered handoff route catalogue (insertion order). */
+export function handoffRouteCatalogue(): readonly HandoffRoute[] {
+  return [...handoffRoutes.values()];
+}
+
+/**
+ * Deterministic default-deny gate over the route catalogue. `enabled`
+ * routes pass; `conditional` routes fail closed with the route id, required
+ * prerequisites and the missing evidence/materialization adapters; and
+ * `unsupported` pairs fail with a human-readable reason. The full route
+ * metadata rides along in the rejection so callers can render the state.
+ */
+function handoffRouteError(route: HandoffRoute): string | null {
+  if (route.disposition === "enabled") return null;
+  const where = `${route.source_workflow}:${route.source_stage} -> ${route.target_workflow}:${route.target_stage}`;
+  if (route.disposition === "unsupported") {
+    return `workflow transition is unsupported: route '${route.id}' (${where}): ${route.description}`;
+  }
+  const prerequisites = route.prerequisites?.length ? ` prerequisites: ${route.prerequisites.join("; ")}.` : "";
+  const blockedBy = route.blocked_by?.length ? ` blocking: ${route.blocked_by.join("; ")}.` : "";
+  return `workflow transition is conditional and not enabled: route '${route.id}' (${where}): ${route.description}${prerequisites}${blockedBy}`;
+}
+
+type ApprovalRecord = Record<string, unknown>;
+
+type NormalizedNestedApproval = {
+  actor: string;
+};
+
+function asApprovalRecord(value: unknown): ApprovalRecord | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as ApprovalRecord : null;
+}
+
+function isNonEmptyApprovalString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isApprovalStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+/**
+ * Normalize the flat approval shapes accepted by the handoff contract. New
+ * artifacts use `source_workflow`/`source_stage`; `workflow`/`stage` remains
+ * accepted only for legacy artifacts. Every source field is compared with the
+ * authenticated capability, canonical state and registered route, while the
+ * requested target is bound to that route.
+ */
+function normalizeFlatWorkflowApproval(
+  value: unknown,
+  input: HandoffWorkflowInput,
+  state: TeamState,
+  cap: ActiveCapability,
+  route: HandoffRoute,
+): NormalizedNestedApproval | null {
+  const record = asApprovalRecord(value);
+  if (
+    !record ||
+    record.type !== "workflow_approval" ||
+    record.version !== 1 ||
+    record.decision !== "approved" ||
+    record.run_key !== cap.issued_for.run_key ||
+    route.source_workflow !== cap.issued_for.workflow ||
+    route.source_stage !== cap.issued_for.stage_cursor ||
+    route.target_workflow !== input.target_workflow ||
+    (state.run_key ?? state.branch) !== cap.issued_for.run_key ||
+    state.branch !== cap.issued_for.branch ||
+    state.classification?.workflow !== cap.issued_for.workflow ||
+    state.stage_cursor !== cap.issued_for.stage_cursor ||
+    state.cursor_epoch !== cap.issued_for.cursor_epoch ||
+    state.profile_hash !== cap.issued_for.profile_hash
+  ) return null;
+
+  const hasObservedSource = "source_workflow" in record || "source_stage" in record;
+  const hasLegacySource = "workflow" in record || "stage" in record;
+  if (hasObservedSource && hasLegacySource) return null;
+  const sourceWorkflow = hasObservedSource ? record.source_workflow : record.workflow;
+  const sourceStage = hasObservedSource ? record.source_stage : record.stage;
+  if (
+    typeof sourceWorkflow !== "string" ||
+    typeof sourceStage !== "string" ||
+    sourceWorkflow !== cap.issued_for.workflow ||
+    sourceWorkflow !== route.source_workflow ||
+    sourceStage !== cap.issued_for.stage_cursor ||
+    sourceStage !== input.stage_cursor ||
+    sourceStage !== route.source_stage ||
+    !isNonEmptyApprovalString(record.actor) ||
+    typeof record.decided_at !== "string" ||
+    !record.decided_at.trim() ||
+    Number.isNaN(Date.parse(record.decided_at))
+  ) return null;
+  return { actor: record.actor.trim() };
+}
+
+/**
+ * Normalize the observed nested approval shape only after binding every
+ * security-relevant field to the authenticated source capability, state,
+ * route and caller input.
+ */
+function normalizeNestedWorkflowApproval(
+  value: unknown,
+  ref: string,
+  input: HandoffWorkflowInput,
+  state: TeamState,
+  cap: ActiveCapability,
+  route: HandoffRoute,
+): NormalizedNestedApproval | null {
+  const record = asApprovalRecord(value);
+  const approval = asApprovalRecord(record?.approval);
+  const source = asApprovalRecord(record?.source);
+  const completedHandoff = asApprovalRecord(source?.completed_handoff);
+  const target = asApprovalRecord(record?.target);
+  const classification = asApprovalRecord(target?.classification);
+  const boundedSpecHandoff = asApprovalRecord(record?.bounded_spec_handoff);
+  const transferConstraints = asApprovalRecord(record?.transfer_constraints);
+  if (
+    !record ||
+    record.artifact_id !== ref ||
+    record.schema_version !== 1 ||
+    record.kind !== "workflow_approval" ||
+    record.status !== "approved" ||
+    !approval ||
+    approval.decision !== "approve" ||
+    approval.mode !== "interactive" ||
+    !isNonEmptyApprovalString(approval.actor) ||
+    !isNonEmptyApprovalString(approval.rationale) ||
+    !source ||
+    source.workflow !== cap.issued_for.workflow ||
+    source.stage !== route.source_stage ||
+    source.stage !== input.stage_cursor ||
+    source.status !== "completed" ||
+    source.branch !== cap.issued_for.branch ||
+    source.run_key !== cap.issued_for.run_key ||
+    !completedHandoff ||
+    completedHandoff.capability_id !== cap.capability_id ||
+    completedHandoff.stage_cursor !== cap.issued_for.stage_cursor ||
+    completedHandoff.cursor_epoch !== cap.issued_for.cursor_epoch ||
+    completedHandoff.profile_hash !== cap.issued_for.profile_hash ||
+    !target ||
+    target.workflow !== input.target_workflow ||
+    target.workflow !== route.target_workflow ||
+    target.branch !== cap.issued_for.branch ||
+    target.run_key !== cap.issued_for.run_key ||
+    !classification ||
+    !isNonEmptyApprovalString(classification.type) ||
+    !isNonEmptyApprovalString(classification.complexity) ||
+    !isNonEmptyApprovalString(classification.confidence) ||
+    typeof classification.autonomous !== "boolean" ||
+    !boundedSpecHandoff ||
+    !isNonEmptyApprovalString(boundedSpecHandoff.artifact) ||
+    !isApprovalStringArray(boundedSpecHandoff.scope) ||
+    !isApprovalStringArray(boundedSpecHandoff.contract) ||
+    !isNonEmptyApprovalString(boundedSpecHandoff.acceptance_artifact) ||
+    !isApprovalStringArray(boundedSpecHandoff.blocking_gaps) ||
+    !isApprovalStringArray(boundedSpecHandoff.implementation_sequence) ||
+    !transferConstraints ||
+    transferConstraints.do_not_restart_specification !== true ||
+    transferConstraints.do_not_modify_spec_handoff !== true ||
+    transferConstraints.do_not_expand_scope_beyond_bounded_handoff !== true ||
+    (state.run_key ?? state.branch) !== cap.issued_for.run_key ||
+    state.branch !== cap.issued_for.branch ||
+    state.classification?.workflow !== cap.issued_for.workflow ||
+    state.stage_cursor !== cap.issued_for.stage_cursor ||
+    state.cursor_epoch !== cap.issued_for.cursor_epoch ||
+    state.profile_hash !== cap.issued_for.profile_hash
+  ) return null;
+  return { actor: approval.actor.trim() };
+}
+
+function validateHandoffApproval(
+  input: HandoffWorkflowInput,
+  state: TeamState,
+  artifactsDir: string,
+  route: HandoffRoute,
+  cap: ActiveCapability,
+): string | null {
+  const approval = input.approval;
+  if (!approval || typeof approval !== "object") return "handoff approval evidence is missing";
+  if (approval.decision !== "approved") return "handoff approval evidence is invalid";
+  if (approval.source_stage !== input.stage_cursor || approval.source_stage !== route.source_stage) {
+    return "handoff approval evidence is invalid";
+  }
+  const actor = typeof input.actor === "string" ? input.actor.trim() : "";
+  if (!actor) return "handoff approval evidence is invalid";
+  if (approval.kind === "checkpoint") {
+    const ref = approval.ref;
+    if (typeof ref !== "string" || !ref.trim()) return "handoff approval evidence is invalid";
+    const decision = findCheckpointDecision(state, input.stage_cursor, ref);
+    if (!decision) return "handoff approval evidence is missing";
+    if (decision.decision !== "approved") return "handoff approval evidence is invalid";
+    return null;
+  }
+  if (approval.kind === "artifact") {
+    const ref = approval.ref;
+    if (typeof ref !== "string" || !isSafeStateSegment(ref)) return "handoff approval evidence is invalid";
+    const value = readArtifact(artifactsDir, ref);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return "handoff approval evidence is missing";
+    if (normalizeFlatWorkflowApproval(value, input, state, cap, route)) return null;
+    return normalizeNestedWorkflowApproval(value, ref, input, state, cap, route)
+      ? null
+      : "handoff approval evidence is invalid";
+  }
+  return "handoff approval evidence is invalid";
+}
+
+/** Validate bounded handoff context: safe, resolvable, size-capped references. */
+function validateHandoffContext(input: HandoffWorkflowInput, artifactsDir: string): string | null {
+  const context = input.handoff_context ?? {};
+  const artifactIds = Array.isArray(context.artifact_ids) ? context.artifact_ids : [];
+  const decisionRefs = Array.isArray(context.decision_refs) ? context.decision_refs : [];
+  const summary = typeof context.summary === "string" ? context.summary : "";
+  if (artifactIds.length > MAX_HANDOFF_CONTEXT_ARTIFACTS) return "handoff context is invalid or exceeds limits";
+  if (decisionRefs.length > MAX_HANDOFF_CONTEXT_DECISION_REFS) return "handoff context is invalid or exceeds limits";
+  if (summary.length > MAX_HANDOFF_CONTEXT_SUMMARY_CHARS) return "handoff context is invalid or exceeds limits";
+  if (
+    new Set(artifactIds).size !== artifactIds.length ||
+    artifactIds.some((id) => typeof id !== "string" || !isSafeStateSegment(id) || readArtifact(artifactsDir, id) === null)
+  ) {
+    return "handoff context is invalid or exceeds limits";
+  }
+  if (
+    decisionRefs.some((ref) => typeof ref !== "string" || !ref.trim() || ref.length > MAX_HANDOFF_DECISION_REF_CHARS) ||
+    decisionRefs.some((ref, index) => decisionRefs.indexOf(ref) !== index)
+  ) {
+    return "handoff context is invalid or exceeds limits";
+  }
+  const serialized = JSON.stringify({ artifact_ids: artifactIds, decision_refs: decisionRefs, summary });
+  if (Buffer.byteLength(serialized, "utf8") > MAX_HANDOFF_CONTEXT_SERIALIZED_BYTES) {
+    return "handoff context is invalid or exceeds limits";
+  }
+  return null;
+}
+
+/**
+ * Cross-profile handoff transition. Validates source capability/binding,
+ * source profile hash, terminal source shape (all stages done/skipped,
+ * pause done, capability complete), source produced artifacts, registered
+ * route, target profile/hash/stage, typed approval evidence, and bounded
+ * context entirely in memory; then performs exactly one atomic `writeState`
+ * to the same feature directory and returns a fresh one-time target
+ * capability. Rejections never mutate state.
+ */
+export function handoffWorkflow(cwd: string, input: HandoffWorkflowInput): HandoffTransitionResult {
+  const branch = resolveActiveBranch(cwd);
+  const target = resolveState(cwd, branch);
+  if (target.invalid) return { ok: false, error: "workflow state is invalid or unsafe" };
+  if (!target.state || !target.statePath) return { ok: false, error: "workflow state not found" };
+  if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state: target.state };
+  const state = target.state;
+  const cap = activeCapability(state.dispatch_capability);
+  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  const error = auth(cap, input, cap.advance_token_hash);
+  if (error) return { ok: false, error, state };
+  if (cap.status !== "complete") return { ok: false, error: "source workflow is not a completed handoff source", state };
+
+  const sourceWorkflow = cap.issued_for.workflow;
+  const sourceProfile = loadProfile(sourceWorkflow);
+  if (!sourceProfile || profileHash(sourceProfile) !== cap.issued_for.profile_hash) {
+    return { ok: false, error: "source workflow profile is missing or stale", state };
+  }
+  const sourceStage = sourceProfile.stages.find((candidate) => candidate.id === input.stage_cursor);
+  if (!sourceStage) return { ok: false, error: "source workflow is not a completed handoff source", state };
+  if (state.pause?.kind !== "done" || !Array.isArray(state.stages) || state.stages.length === 0 || state.stages.some((s) => s.status !== "done" && s.status !== "skipped")) {
+    return { ok: false, error: "source workflow is not a completed handoff source", state };
+  }
+  const artifactsDir = target.artifactsDir ?? "";
+  for (const id of stageProduces(sourceStage)) {
+    if (!isSafeStateSegment(id) || readArtifact(artifactsDir, id) === null) {
+      return { ok: false, error: `source produced artifact '${id}' is missing or invalid`, state };
+    }
+  }
+
+  const targetWorkflow = input.target_workflow;
+  const targetProfile = loadProfile(targetWorkflow);
+  if (!targetProfile) return { ok: false, error: "target workflow is unavailable", state };
+  const targetHash = profileHash(targetProfile);
+  if (input.target_profile_hash && input.target_profile_hash !== targetHash) {
+    return { ok: false, error: "target profile hash mismatch", state };
+  }
+  const route = handoffRoutes.get(handoffRouteKey(sourceWorkflow, input.stage_cursor, targetWorkflow));
+  if (!route) return { ok: false, error: "workflow transition is not registered", state };
+  const routeError = handoffRouteError(route);
+  if (routeError) return { ok: false, error: routeError, state, route };
+  const targetStage = targetProfile.stages.find((candidate) => candidate.id === route.target_stage);
+  if (!targetStage) return { ok: false, error: "target stage is unavailable", state };
+
+  const approvalError = validateHandoffApproval(input, state, artifactsDir, route, cap);
+  if (approvalError) return { ok: false, error: approvalError, state };
+  const contextError = validateHandoffContext(input, artifactsDir);
+  if (contextError) return { ok: false, error: contextError, state };
+  if ((state.handoffs?.length ?? 0) >= MAX_HANDOFF_RECORDS) {
+    return { ok: false, error: "handoff audit trail is full", state };
+  }
+
+  const config = resolveConfig(cwd);
+  const flags = state.scope ?? resolveScope([], config);
+  const kind: "none" | "single" | "consilium" =
+    targetStage.type === "single" || targetStage.type === "consilium" ? targetStage.type : "none";
+  const slots = kind === "none"
+    ? []
+    : resolveStageDispatchSlots(targetStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) {
+    return { ok: false, error: `target stage '${targetStage.id}' has an invalid dispatch roster`, state };
+  }
+  const expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+  const epoch = randomUUID();
+  const issued = createCapability({
+    run_key: cap.issued_for.run_key,
+    branch: cap.issued_for.branch,
+    workflow: targetWorkflow,
+    profile_hash: targetHash,
+    stage_cursor: targetStage.id,
+    cursor_epoch: epoch,
+    kind,
+    expected_roster: expectedRoster,
+  });
+
+  const audit: HandoffRecord = {
+    id: randomUUID(),
+    route: { ...route },
+    source: {
+      workflow: sourceWorkflow,
+      profile_hash: cap.issued_for.profile_hash,
+      stage: cap.issued_for.stage_cursor,
+      cursor_epoch: cap.issued_for.cursor_epoch,
+      run_key: cap.issued_for.run_key,
+      branch: cap.issued_for.branch,
+    },
+    target: {
+      workflow: targetWorkflow,
+      profile_hash: targetHash,
+      stage: targetStage.id,
+      cursor_epoch: epoch,
+      capability_id: issued.capability_id,
+    },
+    approval: {
+      kind: input.approval.kind,
+      ref: input.approval.ref,
+      decision: "approved",
+      actor: input.actor.trim(),
+      decided_at: now(),
+    },
+    context: {
+      artifact_ids: [...(input.handoff_context?.artifact_ids ?? [])],
+      decision_refs: [...(input.handoff_context?.decision_refs ?? [])],
+      summary: input.handoff_context?.summary ?? "",
+    },
+    at: now(),
+  };
+
+  // Build the complete target TeamState in memory, then persist exactly once.
+  // Source provenance (workflow/hash/stage/epoch) lives in the audit record;
+  // the active stage list must contain target stages only so workflow
+  // contract, monotonic checks and dispatch gates resolve the target profile.
+  // Source join/loop/slot metadata names source stage ids and epochs, so it
+  // is dropped outright (never carried as undefined-valued keys).
+  const { join_summary: _joinSummary, loop_state: _loopState, slot_artifacts: _slotArtifacts, ...sourceRest } = state;
+  const next: TeamState = {
+    ...sourceRest,
+    run_key: state.run_key ?? state.branch,
+    classification: { ...state.classification, workflow: targetWorkflow },
+    workflow_override: true,
+    profile_hash: targetHash,
+    stage_cursor: targetStage.id,
+    cursor_epoch: epoch,
+    stages: targetProfile.stages.map((s) => ({ id: s.id, status: s.id === targetStage.id ? "in_progress" as const : "pending" as const })),
+    dispatch_capability: issued.state,
+    pause: { kind: "none", reason: "" },
+    policy: { ...(state.policy ?? {}), strict_orchestrator: true },
+    handoffs: [...(state.handoffs ?? []), audit],
+    updated_at: now(),
+  };
+  persist(cwd, next, target);
+  const handoff = handoffFromState(cwd, next, {
+    capability_id: issued.capability_id,
+    dispatch_token: issued.dispatch_token,
+    advance_token: issued.advance_token,
+  }, targetStage);
+  if (!handoff) return { ok: false, error: "handoff capability construction failed" };
+  return { ok: true, state: next, route: audit.route, handoff, audit };
 }
