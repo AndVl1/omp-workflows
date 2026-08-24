@@ -324,6 +324,34 @@ test("fullstack: workflow tools register and fail closed with structured respons
   assert.equal((completeResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
   assert.equal((advanceResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
 });
+test("fullstack: workflow_prepare schema accepts PRODUCT_DISCOVERY classifications", () => {
+  const tools = new Map<string, RegisteredTool>();
+  registerWorkflowTools({
+    zod: { z },
+    registerTool(tool: RegisteredTool) {
+      tools.set(tool.name, tool);
+    },
+  } as never);
+
+  const prepare = tools.get("workflow_prepare")!;
+  const parameters = prepare.parameters as {
+    safeParse(input: unknown): { success: boolean };
+  };
+  const parsed = parameters.safeParse({
+    task: "prepare product discovery workflow",
+    branch: "main",
+    classification: {
+      type: "PRODUCT_DISCOVERY",
+      complexity: "COMPLEX",
+      confidence: "HIGH",
+      autonomous: false,
+      autonomous_reason: "product discovery requires interactive review",
+    },
+    files: [],
+    issue: null,
+  });
+  assert.equal(parsed.success, true);
+});
 
 test("fullstack: workflow_prepare persists PHASE-0 state in the canonical session cwd", async () => {
   const canonical = mkdtempSync(join(tmpdir(), "omp-workflow-prepare-canonical-"));
