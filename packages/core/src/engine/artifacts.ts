@@ -55,7 +55,13 @@ export type ArtifactId =
   | "review"
   | "qa_tests"
   | "manual_qa"
-  | "summary";
+  | "summary"
+  | "lecture_intake"
+  | "lecture_acquisition"
+  | "lecture_mapping"
+  | "lecture_candidates"
+  | "lecture_repo_fit"
+  | "lecture_decision";
 export function readArtifact<T = unknown>(artifactsDir: string, id: string): T | null {
   if (!ARTIFACT_ID_RE.test(id) || id === "." || id === "..") return null;
   const path = safeArtifactPath(artifactsDir, id, false);

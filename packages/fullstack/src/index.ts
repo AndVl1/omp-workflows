@@ -48,6 +48,7 @@ import {
   registerSubagentTree,
   type SubagentTreeController,
 } from "./subagent-tree.js";
+import { registerLectureAcquireTool } from "./tools/lecture-acquire.js";
 // Auto-derived from core taxonomy; test-invariант в test/omp-model-roles.test.ts:439-446 ловит drift.
 
 export const defaultFullstackRoles: RoleConfig["roles"] = {
@@ -281,6 +282,7 @@ export function fullstackOwnerForCwd(cwd: string): WorkflowOwnerIdentity {
       config_path: join(root, ".omp", "team.config.json"),
     },
   };
+
 }
 
 const fullstackWorkflowToolAdapter: WorkflowToolAdapter = createWorkflowToolAdapter({
@@ -309,6 +311,12 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     owner: fullstackOwnerForCwd,
   });
   registerWorkflowTools(pi);
+  // URL-first lecture research acquisition — main-session only; core owns the
+  // workflow state boundary, this bundle owns the provider-specific acquire tool.
+  if (pi.zod) {
+    const { z } = pi.zod;
+    registerLectureAcquireTool(pi, z, { resolveSessionCwd, isMainSessionContext });
+  }
   // Register the three workflow entry points while the extension is loaded.
   // OMP snapshots registered commands before it discovers project-local
   // `.omp/commands` files, so this keeps slash suggestions and execution

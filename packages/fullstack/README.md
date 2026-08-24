@@ -60,6 +60,38 @@ API.
 
 The `agents/` and `skills/` directories are picked up by OMP's discovery automatically.
 
+## URL-first lecture research
+
+Submit exactly one public HTTPS YouTube video or playlist URL together with a natural-language prompt to `/do-work`. The URL is the user's explicit approval for automated analysis of that public video; the user remains responsible for having the rights to submit it. Its intake invokes the main-session `lecture_acquire` tool: for playlists it automatically expands bounded public playlist metadata, then analyzes each video. Mapping, synthesis, repository-fit, security, and approval remain research-only stages. No manual transcript, captions, recording, media, or notes are requested.
+
+Set `GEMINI_API_KEY` for video analysis. Set `YOUTUBE_DATA_API_KEY` for playlist expansion; a public video URL needs only Gemini. An optional project `.omp/lecture-research.json` can tighten bounded limits or set provider model/environment names, but optional provider endpoints are constrained to the official Google YouTube/Gemini hosts; project config must not point API keys at arbitrary hosts, and must never store secrets:
+The adapter sends the restricted YouTube API key via the `x-goog-api-key` request header (Gemini uses the same header); the key must be restricted, and secrets must never be stored in `.omp/lecture-research.json`.
+
+```json
+{
+  "limits": {
+    "maxItems": 4,
+    "maxPages": 2,
+    "deadlineMs": 120000,
+    "maxAttempts": 1,
+    "maxResponseBytes": 1048576,
+    "maxEvidenceSegmentsPerSource": 20
+  },
+  "gemini": {
+    "model": "gemini-2.5-flash",
+    "endpoint": "https://generativelanguage.googleapis.com",
+    "apiKeyEnv": "GEMINI_API_KEY"
+  },
+  "youtube": {
+    "endpoint": "https://www.googleapis.com/youtube/v3",
+    "apiKeyEnv": "YOUTUBE_DATA_API_KEY"
+  }
+}
+```
+
+Limitations are explicit: only public videos are supported. Private or unlisted videos, rights restrictions, quota/network failures, and provider failures are preserved as failed or partial evidence. The core does not fetch URLs; adapters use official APIs and provider URL analysis. Approval does not start implementation.
+
+
 ## Slash commands
 
 | Command | Purpose |
