@@ -20,7 +20,35 @@ import type {
   BeforeAgentStartEventResult,
   SessionStartEvent,
 } from "@oh-my-pi/pi-coding-agent";
+import * as core from "@andvl1/omp-workflows-core";
+import type {
+  DispatchAuth,
+  ModelClassification,
+  WorkflowPrepareOptions,
+  HandoffWorkflowInput,
+} from "@andvl1/omp-workflows-core";
+import { registerWorkflowCommands } from "./workflow-commands.js";
+import { ensureCommandsForSession } from "./copy-commands.js";
+import { refreshFullstackAgentMappings, waitForFullstackAgentMappings } from "./agent-mapping.js";
+import { createChannelSet, queueCtoDelivery, startChannelDispatcher, type InboxTask } from "./adapters/registry.js";
+import { createAskRedirectGate } from "./messenger-channel.js";
+import { createCtoModeReminderHandler } from "./cto-mode-reminder.js";
 import {
+	RESEARCH_REQUEST_MARKER_END,
+	RESEARCH_REQUEST_MARKER_START,
+	buildResearchRequestDeveloperInstruction,
+} from "./before-agent-start-marker.js";
+import {
+  FULLSTACK_RUNTIME_CONTRACT,
+  assertWorkflowRuntimeCompatibility,
+} from "./runtime-compatibility.js";
+import {
+	handleSubagentsCommand,
+	registerSubagentTree,
+	type SubagentTreeController,
+} from "./subagent-tree.js";
+// Auto-derived from core taxonomy; test-invariант в test/omp-model-roles.test.ts:439-446 ловит drift.
+const {
   defaultFullstackFlags,
   defaultFullstackModelRoles,
   defaultFullstackRoles,
@@ -35,30 +63,10 @@ import {
   readAgentMapping,
   handoffWorkflow,
   resolveState,
-  type DispatchAuth,
-  type ModelClassification,
-  type WorkflowPrepareOptions,
-  type HandoffWorkflowInput,
-} from "@andvl1/omp-workflows-core";
-import { registerWorkflowCommands } from "./workflow-commands.js";
-import { ensureCommandsForSession } from "./copy-commands.js";
-import { refreshFullstackAgentMappings, waitForFullstackAgentMappings } from "./agent-mapping.js";
-import { createChannelSet, queueCtoDelivery, startChannelDispatcher, type InboxTask } from "./adapters/registry.js";
-import { createAskRedirectGate } from "./messenger-channel.js";
-import { createCtoModeReminderHandler } from "./cto-mode-reminder.js";
-import {
-	RESEARCH_REQUEST_MARKER_END,
-	RESEARCH_REQUEST_MARKER_START,
-	buildResearchRequestDeveloperInstruction,
-} from "./before-agent-start-marker.js";
-import { resolveWorkflowContract } from "@andvl1/omp-workflows-core";
-import {
-	handleSubagentsCommand,
-	registerSubagentTree,
-	type SubagentTreeController,
-} from "./subagent-tree.js";
-// Auto-derived from core taxonomy; test-invariант в test/omp-model-roles.test.ts:439-446 ловит drift.
-const ROLE_COUNT = defaultFullstackModelRoles.length;
+  resolveWorkflowContract,
+} = core;
+
+const ROLE_COUNT = core.defaultFullstackModelRoles?.length ?? 0;
 
 /**
  * Resolve the session project root for hooks and workflow tools.
@@ -188,6 +196,7 @@ export function isMainSessionContext(ctx: unknown): boolean {
 
 
 export function registerWorkflowTools(pi: ExtensionAPI): void {
+  assertWorkflowRuntimeCompatibility();
   // Older OMP/test runtimes may not expose the schema helper. Keep the
   // extension loadable there; tool registration is available when zod exists.
   if (!pi.zod) return;
@@ -449,11 +458,13 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
 }
 
 export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
+  assertWorkflowRuntimeCompatibility();
   registerTeamWorkflow(pi, {
     label: "omp-workflows-fullstack",
     roles: defaultFullstackRoles,
     scopeMap: defaultFullstackScopeMap,
     flags: defaultFullstackFlags,
+    runtimeContract: FULLSTACK_RUNTIME_CONTRACT,
   });
   registerWorkflowTools(pi);
   // Register the three workflow entry points while the extension is loaded.
@@ -580,3 +591,8 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
 
 // ── cto-safety (br-zps.4, br-zps.5, br-zps.6) ──
 export { MockEscalationAdapter, registerMockAdapter } from "./adapters/mock.js";
+export {
+  FULLSTACK_RUNTIME_CONTRACT,
+  WorkflowRuntimeCompatibilityError,
+  assertWorkflowRuntimeCompatibility,
+} from "./runtime-compatibility.js";

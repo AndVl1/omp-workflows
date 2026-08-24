@@ -32,6 +32,11 @@ import { authorizeDispatchTrusted, reconcileTrustedTaskResult } from "./engine/d
 import { registerWorkflowProfiles } from "./engine/profile.js";
 import type { Profile, RoleConfig } from "./engine/types.js";
 import type { WorkerWriteScope } from "./gates/orchestrator-write.js";
+import {
+  assertWorkflowBundleCompatibility,
+  type WorkflowRuntimeContract,
+} from "./runtime-compatibility.js";
+
 export interface RegisterOptions {
   label?: string;
   roles?: RoleConfig["roles"];
@@ -47,6 +52,13 @@ export interface RegisterOptions {
    * default — shipped workflows keep the single-writer model.
    */
   writeScope?: WorkerWriteScope;
+  /**
+   * Runtime compatibility declaration supplied by the default fullstack
+   * bundle. The well-known fullstack label is rejected without it so an old
+   * extension cannot silently run against a newer core.
+   */
+  runtimeContract?: WorkflowRuntimeContract;
+
 }
 
 export type CommandId = "do-work" | "team" | "cto" | "init-team" | "interview" | "omp-model-roles";
@@ -128,6 +140,7 @@ export type {
  */
 export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {}): void {
 	const label = opts.label ?? "omp-workflows";
+  if (label === "omp-workflows-fullstack") assertWorkflowBundleCompatibility(opts.runtimeContract);
 	pi.setLabel(label);
   if (opts.workflowProfiles?.length) registerWorkflowProfiles(opts.workflowProfiles);
 
@@ -231,6 +244,19 @@ function writeRuntimeConfig(opts: RegisterOptions): void {
     // best-effort
   }
 }
+export {
+  CORE_RUNTIME_CONTRACT,
+  FULLSTACK_RUNTIME_LABEL,
+  WORKFLOW_HANDOFF_CAPABILITY,
+  WORKFLOW_RUNTIME_PROTOCOL,
+  assertWorkflowBundleCompatibility,
+  getCoreRuntimeContract,
+  WorkflowRuntimeCompatibilityError,
+} from "./runtime-compatibility.js";
+export type {
+  WorkflowRuntimeContract,
+  WorkflowRuntimePackage,
+} from "./runtime-compatibility.js";
 export { teamCommand } from "./commands/team.js";
 export { dispatchGate, buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests, type DispatchAuthorizationRequest } from "./gates/dispatch.js";
 export {

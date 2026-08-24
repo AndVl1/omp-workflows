@@ -41,6 +41,10 @@ export default function (pi: ExtensionAPI) {
   });
 }
 ```
+The wrapper also declares the runtime compatibility contract for the loaded
+core peer. If the pair is stale or mixed, extension loading fails with both
+package versions and module paths plus instructions to rebuild/install the
+matched pair; workflow tools are not registered against an incomplete core.
 
 The taxonomy that backs the bundled `/omp-model-roles validate` command (`defaultFullstackModelRoles`,
 14 entries) is imported from `@andvl1/omp-workflows-core` so any other bundle can compose the same
