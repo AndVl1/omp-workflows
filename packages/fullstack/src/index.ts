@@ -414,7 +414,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "workflow_handoff",
     label: "Handoff workflow",
-    description: "Transfer an approved completed workflow stage to another registered workflow profile. Main-session only; requires explicit typed approval evidence and returns a fresh one-time target capability.",
+    description: "Transfer an approved completed workflow stage to another registered workflow profile through the engine's typed route catalogue. Main-session only; requires explicit typed approval evidence and returns a fresh one-time target capability. Only `enabled` catalogue routes complete; `conditional` routes are rejected deterministically (route metadata and missing evidence/materialization adapters are returned) until their adapter exists; `unsupported` and unknown targets are denied.",
     parameters: z.object({
       token: z.string().min(1), capability_id: z.string().min(1),
       run_key: z.string().min(1), branch: z.string().min(1), workflow: z.string().min(1), profile_hash: z.string().min(1), stage_cursor: z.string().min(1), cursor_epoch: z.string().min(1),
@@ -441,7 +441,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
       const input = params as HandoffWorkflowInput;
       try {
         const transition = handoffWorkflow(cwd, input);
-        if (!transition.ok) return result({ ok: false, code: "WORKFLOW_HANDOFF_REJECTED", error: transition.error, state: transition.state ? stateSummary(cwd) : undefined });
+        if (!transition.ok) return result({ ok: false, code: "WORKFLOW_HANDOFF_REJECTED", error: transition.error, route: transition.route, state: transition.state ? stateSummary(cwd) : undefined });
         return result({ ok: true, transition: "handoff", route: transition.route, handoff: transition.handoff, audit: transition.audit, state: stateSummary(cwd) });
       } catch (error) { return result({ ok: false, code: "WORKFLOW_HANDOFF_FAILED", error: String(error) }); }
     },
