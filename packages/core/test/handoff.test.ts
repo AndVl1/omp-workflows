@@ -370,7 +370,7 @@ test("handoff: success preserves source state and arms the target discovery stag
     // Returned one-time envelope matches the fresh target capability.
     assert.equal(result.handoff.capability_id, state.dispatch_capability?.capability_id);
     assert.equal(result.handoff.workflow, "full-feature");
-    assert.equal(result.handoff.profile_hash, TARGET_HASH);
+    assert.equal(result.handoff.profile_hash, `${TARGET_HASH.slice(0, 30)}${TARGET_HASH.slice(-2)}`);
     assert.equal(result.handoff.stage_cursor, "discovery");
     assert.equal(result.handoff.cursor_epoch, state.cursor_epoch);
     assert.equal(result.handoff.kind, "none");
@@ -414,10 +414,21 @@ test("handoff: success preserves source state and arms the target discovery stag
     assert.equal(contract.profile.hash, TARGET_HASH);
     assert.equal(contract.state.dispatch.allowed, false, "orchestrator discovery is not a dispatch stage");
 
-    // beginCapability must not mint a second capability for the armed stage.
+    // beginCapability reissues plaintext secrets for the active target
+    // capability without changing its identity or cursor position.
     const begun = beginCapability(root);
-    assert.equal(begun.ok, false);
-    if (!begun.ok) assert.match(begun.error, /already has an active capability/);
+    assert.equal(begun.ok, true);
+    if (!begun.ok || !begun.handoff) return;
+    assert.equal(begun.handoff.capability_id, result.handoff.capability_id);
+    assert.equal(begun.handoff.stage_cursor, result.handoff.stage_cursor);
+    assert.equal(begun.handoff.cursor_epoch, result.handoff.cursor_epoch);
+    assert.notEqual(begun.handoff.dispatch_token, result.handoff.dispatch_token);
+    assert.notEqual(begun.handoff.advance_token, result.handoff.advance_token);
+    const reissuedPersisted = readFileSync(statePathOf(root), "utf8");
+    assert.doesNotMatch(reissuedPersisted, new RegExp(begun.handoff.dispatch_token));
+    assert.doesNotMatch(reissuedPersisted, new RegExp(begun.handoff.advance_token));
+    assert.match(String(begun.state.dispatch_capability?.dispatch_token_hash), /^[0-9a-f]{64}$/);
+    assert.match(String(begun.state.dispatch_capability?.advance_token_hash), /^[0-9a-f]{64}$/);
 
     // Task-boundary gates accept the target state (P5 + dispatch shape).
     assert.equal(classificationToolGate({ toolName: "task" }, { cwd: root }), undefined, "workflow_override + valid autonomy passes the P5 gate");
