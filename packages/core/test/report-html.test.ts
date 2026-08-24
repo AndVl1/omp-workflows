@@ -345,7 +345,8 @@ function ctoDerivedTeamStageReport(): SessionReport {
 test("renderer: output is a single self-contained file with zero external references", () => {
   const html = renderReportHtml(doWorkReport());
   assert.ok(html.startsWith("<!doctype html>"));
-  assert.ok(html.includes('<style>'), "inline CSS block present");
+  assert.ok(html.includes("<style>"), "inline CSS block present");
+  assert.equal((html.match(/<style>/g) ?? []).length, 1, "shared shell emits one style block");
   assert.ok(html.includes('<script id="omp-report-data" type="application/json">'), "data island present");
   assert.ok(html.includes("</html>"), "document closed");
   assert.ok(!html.includes("<link"), "no <link> elements");

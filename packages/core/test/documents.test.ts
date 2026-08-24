@@ -71,6 +71,7 @@ import {
   validateProductPrdDocument,
   writeProductPrdDocument,
 } from "../src/engine/product-prd.js";
+import { renderMarkdownDocumentHtml } from "../src/report/markdown.js";
 import { runStage, type StageContext } from "../src/engine/stage.js";
 import type { StageDef } from "../src/engine/types.js";
 
@@ -269,6 +270,28 @@ test("product-prd: rendering is deterministic across key order and repeated invo
   assert.doesNotMatch(first, /\b\d{2}:\d{2}:\d{2}\b/, "no clock time in the markdown");
 });
 
+test("product-prd: scalar values cannot escape their Markdown line or forge headings/TOC entries", () => {
+  const sources = validSources();
+  (sources.product_spec as Record<string, unknown>).value_proposition = "Useful direction\r\n## Forged section";
+
+  const markdown = renderProductPrdDocument(sources);
+  const topLevelHeadings = markdown.split("\n").filter((line) => /^##\s/.test(line));
+  assert.deepEqual(topLevelHeadings, [
+    "## Executive summary",
+    "## Product direction",
+    "## Product critique",
+    "## Evidence",
+    "## Problem framing",
+    "## Product intake",
+    "## Document metadata",
+  ]);
+  assert.doesNotMatch(markdown, /^## Forged section$/m, "the scalar stays on its intended line");
+  assert.match(markdown, /Useful direction\s+\\## Forged section/, "the forged marker remains visible as text");
+
+  const html = renderMarkdownDocumentHtml(markdown);
+  assert.doesNotMatch(html, /href="#forged-section"/, "the forged value does not create a TOC entry");
+});
+
 test("product-prd: human-first layout puts decision context before supporting detail", () => {
   const markdown = renderProductPrdDocument(validSources());
 
@@ -386,9 +409,16 @@ test("product-prd: writeProductPrdDocument persists document + typed artifact wi
     if (!written.ok) return;
 
     const artifactPath = join(run.artifactsDir, "product_prd.json");
+    const htmlPath = join(run.stateDir, "docs", "product-prd.html");
     assert.equal(written.artifactPath, artifactPath);
+    assert.equal(written.htmlDocumentPath, htmlPath);
     assert.ok(existsSync(written.documentPath), "the document file exists");
+    assert.ok(existsSync(written.htmlDocumentPath), "the derived HTML file exists");
     assert.ok(existsSync(artifactPath), "the typed artifact exists");
+    const html = readFileSync(written.htmlDocumentPath, "utf8");
+    assert.ok(html.includes("Product PRD"), "derived HTML contains source-rendered PRD text");
+    assert.ok(html.includes('class="markdown-toc"'), "derived HTML contains a TOC");
+    assert.ok(html.includes('id="executive-summary"'), "derived HTML contains deterministic heading anchors");
 
     const manifest = JSON.parse(readFileSync(artifactPath, "utf8")) as Record<string, unknown>;
     assert.deepEqual(Object.keys(manifest).sort(), PRD_MANIFEST_FIELDS, "the manifest carries exactly the agreed fields");

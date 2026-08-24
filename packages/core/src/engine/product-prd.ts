@@ -14,10 +14,11 @@
  *     artifact renders an explicit unknown marker — never a silent
  *     omission.
  *   - `writeProductPrdDocument` persists the markdown document at a SAFE
- *     RELATIVE path inside the state dir plus the typed `product_prd`
- *     artifact carrying EXACTLY { type, format, renderer, path,
- *     source_artifacts, source_hash, content_hash, content }. Writes are
- *     atomic (temp file + rename) and a rejected write mutates nothing.
+ *     RELATIVE path inside the state dir, a derived sibling HTML viewer, and
+ *     the typed `product_prd` artifact carrying EXACTLY { type, format,
+ *     renderer, path, source_artifacts, source_hash, content_hash, content }.
+ *     All three outputs are staged and committed atomically (temp file +
+ *     rename) with complete rollback; a rejected write mutates nothing.
  *     `source_hash` is a key-order-independent hash of the five sources;
  *     `content_hash` is sha256 of the markdown bytes.
  *   - `validateProductPrdDocument` re-verifies the whole shape: exact
@@ -43,6 +44,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { renderMarkdownDocumentHtml } from "../report/markdown.js";
 
 /** Typed artifact id produced by the PRD document stage. */
 export const PRODUCT_PRD_ARTIFACT_ID = "product_prd";
@@ -97,9 +99,8 @@ export interface ProductPrdWriteOptions {
   /** The five source artifacts keyed by artifact id. */
   sourceArtifacts: Record<string, unknown>;
 }
-
 export type ProductPrdWriteResult =
-  | { ok: true; documentPath: string; artifactPath: string; source_hash: string; content_hash: string }
+  | { ok: true; documentPath: string; htmlDocumentPath: string; artifactPath: string; source_hash: string; content_hash: string }
   | { ok: false; error: string };
 
 export interface ProductPrdValidation {
@@ -134,13 +135,31 @@ function requireSource(sourceArtifacts: Record<string, unknown>, id: string): Re
 
 // ── deterministic rendering ────────────────────────────────────────────────
 
+const SCALAR_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g;
+const SCALAR_STRUCTURAL_MARKERS =
+  /(^|\s)((?:#{1,}(?=\s|$)|[-+*>](?=\s|$)|\d{1,9}[.)](?=\s)|[`~]{3,}|(?:[-*_]\s*){3,}))/g;
+
+function sanitizeScalar(text: string): string {
+  // Scalar values are rendered as text on an existing Markdown line. Replace
+  // every line/control separator with a space so a value cannot create a new
+  // block, then escape block markers that could still be interpreted after
+  // whitespace normalization. The rendered text remains visible verbatim.
+  const normalized = text.replace(SCALAR_CONTROL_CHARACTERS, " ").replace(/^ {4,}/, " ");
+  return normalized.replace(SCALAR_STRUCTURAL_MARKERS, (_match, boundary: string, marker: string) => {
+    // Escape the punctuation in ordered-list markers, rather than the
+    // leading number, so the visible scalar text stays unchanged.
+    const escaped = /^\d/.test(marker) ? marker.replace(/[.)]/, "\\$&") : `\\${marker}`;
+    return `${boundary}${escaped}`;
+  });
+}
+
 function scalar(value: unknown): string {
   if (value === undefined || value === null) return UNKNOWN_MARKER;
-  if (typeof value === "string") return value;
+  if (typeof value === "string") return sanitizeScalar(value);
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   // Nested objects/arrays render through the canonical (key-sorted)
   // serialization so a reordered source object can never change the bytes.
-  return canonicalJson(value);
+  return sanitizeScalar(canonicalJson(value));
 }
 
 function bulletList(value: unknown): string[] {
@@ -437,6 +456,10 @@ function safeDocumentPath(stateDir: string, documentPath: string): { ok: true; a
   return { ok: true, absolute };
 }
 
+function derivedHtmlPath(documentPath: string): string {
+  return documentPath.endsWith(".md") ? `${documentPath.slice(0, -3)}.html` : `${documentPath}.html`;
+}
+
 // ── atomic persistence ─────────────────────────────────────────────────────
 
 let tempCounter = 0;
@@ -479,14 +502,47 @@ function safeArtifactsDir(stateDir: string, artifactsDir: string): { ok: true } 
       return { ok: false, error: `unsafe artifacts dir: '${segment}' on the path to '${artifactsDir}' is a symlink` };
     }
   }
+
   return { ok: true };
+}
+
+interface FileSnapshot {
+  exists: boolean;
+  bytes: Buffer | null;
+}
+
+function validateArtifactTarget(path: string): { ok: true } | { ok: false; error: string } {
+  if (!existsSync(path)) return { ok: true };
+  const info = lstatSync(path);
+  if (info.isSymbolicLink()) return { ok: false, error: `product PRD persistence failed: unsafe artifact target: '${path}' is a symlink` };
+  if (!info.isFile()) return { ok: false, error: `product PRD persistence failed: unsafe artifact target: '${path}' is not a regular file` };
+  return { ok: true };
+}
+
+function captureSnapshot(path: string): FileSnapshot {
+  return existsSync(path) ? { exists: true, bytes: readFileSync(path) } : { exists: false, bytes: null };
+}
+
+function restoreSnapshot(path: string, snapshot: FileSnapshot): void {
+  if (!snapshot.exists || snapshot.bytes === null) {
+    rmSync(path, { force: true });
+    return;
+  }
+  const restoreTemp = tempPathFor(path);
+  try {
+    writeFileSync(restoreTemp, snapshot.bytes);
+    renameSync(restoreTemp, path);
+  } finally {
+    rmSync(restoreTemp, { force: true });
+  }
 }
 
 /**
  * Render and atomically persist the product PRD: the markdown document at
- * `join(stateDir, path)` and the typed `product_prd` artifact with the exact
- * manifest fields. All validation happens before the first byte is written —
- * a rejected write mutates nothing.
+ * `join(stateDir, path)`, its derived sibling HTML viewer, and the typed
+ * `product_prd` artifact with the exact manifest fields. All validation and
+ * rendering happens before the first commit rename; failures restore every
+ * previous target and clean temporary files.
  */
 export function writeProductPrdDocument(options: ProductPrdWriteOptions): ProductPrdWriteResult {
   const sourceArtifacts: Record<string, unknown> = {};
@@ -502,69 +558,92 @@ export function writeProductPrdDocument(options: ProductPrdWriteOptions): Produc
   const relativePath = options.path ?? DEFAULT_DOCUMENT_PATH;
   const safe = safeDocumentPath(options.stateDir, relativePath);
   if (!safe.ok) return { ok: false, error: safe.error };
+  const htmlRelativePath = derivedHtmlPath(relativePath);
+  const safeHtml = safeDocumentPath(options.stateDir, htmlRelativePath);
+  if (!safeHtml.ok) return { ok: false, error: safeHtml.error };
+  if (safe.absolute === safeHtml.absolute) {
+    return { ok: false, error: `unsafe document path: Markdown and HTML targets collide at '${safe.absolute}'` };
+  }
   const artifactsDirSafe = safeArtifactsDir(options.stateDir, options.artifactsDir);
   if (!artifactsDirSafe.ok) return { ok: false, error: artifactsDirSafe.error };
-
-  const markdown = renderProductPrdDocument(sourceArtifacts);
-  const source_hash = sourceHash(sourceArtifacts);
-  const content_hash = sha256(markdown);
-  const manifest: ProductPrdManifest = {
-    type: PRODUCT_PRD_ARTIFACT_ID,
-    format: "markdown",
-    renderer: PRODUCT_PRD_RENDERER,
-    path: relativePath,
-    source_artifacts: [...PRD_SOURCE_ARTIFACT_IDS],
-    source_hash,
-    content_hash,
-    content: markdown,
-  };
+  const artifactPath = join(options.artifactsDir, `${PRODUCT_PRD_ARTIFACT_ID}.json`);
+  const artifactTargetSafe = validateArtifactTarget(artifactPath);
+  if (!artifactTargetSafe.ok) return { ok: false, error: artifactTargetSafe.error };
 
   let documentTemp: string | null = null;
+  let htmlTemp: string | null = null;
   let artifactTemp: string | null = null;
+  let snapshots: Array<[string, FileSnapshot]> | null = null;
   try {
+    const markdown = renderProductPrdDocument(sourceArtifacts);
+    const html = renderMarkdownDocumentHtml(markdown, {
+      title: "Product PRD",
+      lang: "en",
+      toc: true,
+      navigation: true,
+    });
+    const source_hash = sourceHash(sourceArtifacts);
+    const content_hash = sha256(markdown);
+    const manifest: ProductPrdManifest = {
+      type: PRODUCT_PRD_ARTIFACT_ID,
+      format: "markdown",
+      renderer: PRODUCT_PRD_RENDERER,
+      path: relativePath,
+      source_artifacts: [...PRD_SOURCE_ARTIFACT_IDS],
+      source_hash,
+      content_hash,
+      content: markdown,
+    };
+    snapshots = [
+      [safe.absolute, captureSnapshot(safe.absolute)],
+      [safeHtml.absolute, captureSnapshot(safeHtml.absolute)],
+      [artifactPath, captureSnapshot(artifactPath)],
+    ];
+
     mkdirSync(dirname(safe.absolute), { recursive: true });
+    mkdirSync(dirname(safeHtml.absolute), { recursive: true });
     mkdirSync(options.artifactsDir, { recursive: true });
-    const artifactPath = join(options.artifactsDir, `${PRODUCT_PRD_ARTIFACT_ID}.json`);
-    // Stage BOTH temp files before committing either rename: a failure
-    // while staging (or an unsafe artifacts dir) leaves a previously
-    // written document+manifest pair completely untouched.
+
+    // Stage all three outputs before committing any rename.
     documentTemp = tempPathFor(safe.absolute);
     writeFileSync(documentTemp, markdown, "utf8");
+    htmlTemp = tempPathFor(safeHtml.absolute);
+    writeFileSync(htmlTemp, html, "utf8");
     artifactTemp = tempPathFor(artifactPath);
     writeFileSync(artifactTemp, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-    // Capture the previous document BEFORE the first rename so a manifest
-    // commit failure can roll the document back atomically — the store never
-    // keeps a new document paired with a stale manifest.
-    const previousDocument = existsSync(safe.absolute) ? readFileSync(safe.absolute, "utf8") : null;
+
     renameSync(documentTemp, safe.absolute);
     documentTemp = null;
-    try {
-      renameSync(artifactTemp, artifactPath);
-      artifactTemp = null;
-    } catch (manifestError) {
-      // Roll back the just-committed document: restore the previous content
-      // (atomic temp+rename) or remove the document when there was none.
-      try {
-        if (previousDocument !== null) {
-          const restoreTemp = tempPathFor(safe.absolute);
-          writeFileSync(restoreTemp, previousDocument, "utf8");
-          renameSync(restoreTemp, safe.absolute);
-        } else {
-          rmSync(safe.absolute, { force: true });
-        }
-      } catch (restoreError) {
-        return {
-          ok: false,
-          error: `product PRD persistence failed: ${String(manifestError)}; document rollback also failed: ${String(restoreError)}`,
-        };
-      }
-      throw manifestError;
-    }
-    return { ok: true, documentPath: safe.absolute, artifactPath, source_hash, content_hash };
+    renameSync(htmlTemp, safeHtml.absolute);
+    htmlTemp = null;
+    renameSync(artifactTemp, artifactPath);
+    artifactTemp = null;
+    return {
+      ok: true,
+      documentPath: safe.absolute,
+      htmlDocumentPath: safeHtml.absolute,
+      artifactPath,
+      source_hash,
+      content_hash,
+    };
   } catch (error) {
     if (documentTemp !== null) rmSync(documentTemp, { force: true });
+    if (htmlTemp !== null) rmSync(htmlTemp, { force: true });
     if (artifactTemp !== null) rmSync(artifactTemp, { force: true });
-    return { ok: false, error: `product PRD persistence failed: ${String(error)}` };
+    const rollbackErrors: string[] = [];
+    if (snapshots !== null) {
+      for (const [target, snapshot] of snapshots) {
+        try {
+          restoreSnapshot(target, snapshot);
+        } catch (rollbackError) {
+          rollbackErrors.push(`${target}: ${String(rollbackError)}`);
+        }
+      }
+    }
+    return {
+      ok: false,
+      error: `product PRD persistence failed: ${String(error)}${rollbackErrors.length ? `; rollback: ${rollbackErrors.join("; ")}` : ""}`,
+    };
   }
 }
 

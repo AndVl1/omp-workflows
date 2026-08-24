@@ -15,6 +15,8 @@ export {
   writeReport,
 } from "./assemble.js";
 export { renderReportHtml } from "./html.js";
+export { renderMarkdownDocumentHtml } from "./markdown.js";
+export type { MarkdownDocumentOptions } from "./markdown.js";
 export { redactReportBody, redactText, DEFAULT_REDACTION_CONFIG } from "./redact.js";
 export type { RedactionConfig } from "./redact.js";
 export type {

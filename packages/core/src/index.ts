@@ -604,6 +604,8 @@ export {
 	writeReport,
 } from "./report/assemble.js";
 export { renderReportHtml } from "./report/html.js";
+export { renderMarkdownDocumentHtml } from "./report/markdown.js";
+export type { MarkdownDocumentOptions } from "./report/markdown.js";
 export { redactReportBody } from "./report/redact.js";
 export { recordStageTransition, recordArtifactWritten } from "./observability/index.js";
 export type {

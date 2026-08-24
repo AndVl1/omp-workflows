@@ -151,8 +151,10 @@ test("durable document advance: the engine renders doc + product_prd before the 
     assert.equal(advanced.ok, true, "advance succeeds for a fully-sourced document stage");
     if (!advanced.ok) return;
 
-    // The engine created the document and the typed artifact at the advance boundary.
+    // The engine created the document, its derived offline viewer and the
+    // typed artifact at the advance boundary.
     assert.ok(existsSync(join(featureDir, "documents", "product-prd.md")), "the PRD document is rendered");
+    assert.ok(existsSync(join(featureDir, "documents", "product-prd.html")), "the derived PRD HTML viewer is rendered");
     assert.ok(existsSync(join(artifactsDir, "product_prd.json")), "the typed product_prd artifact is written");
     assert.deepEqual(validateProductPrdDocument({ stateDir: featureDir, artifactsDir }), { ok: true, issues: [] });
 
