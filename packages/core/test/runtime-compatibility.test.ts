@@ -52,12 +52,15 @@ test("core: stale fullstack registration fails with loaded package versions and 
 });
 
 test("core: a skewed fullstack version is rejected before hook registration", () => {
+  const coreVersion = CORE_RUNTIME_CONTRACT.package.version;
+  const skewedVersion = `${coreVersion}-skew`;
+  const skewedPath = "/Users/operator/.omp/plugins/node_modules/@andvl1/omp-workflows-fullstack/dist/index.js";
   const skewed = {
     ...matchedFullstackContract,
     package: {
       ...matchedFullstackContract.package,
-      version: "0.23.2",
-      path: "/Users/operator/.omp/plugins/node_modules/@andvl1/omp-workflows-fullstack/dist/index.js",
+      version: skewedVersion,
+      path: skewedPath,
     },
   };
   assert.throws(
@@ -65,8 +68,8 @@ test("core: a skewed fullstack version is rejected before hook registration", ()
     (error: unknown) => {
       assert.ok(error instanceof Error);
       assert.match(error.message, /package versions differ/);
-      assert.match(error.message, /core=0\.23\.0, fullstack=0\.23\.2/);
-      assert.match(error.message, /path=\/Users\/operator\/\.omp\/plugins/);
+      assert.ok(error.message.includes(`core=${coreVersion}, fullstack=${skewedVersion}`));
+      assert.ok(error.message.includes(`path=${skewedPath}`));
       return true;
     },
   );

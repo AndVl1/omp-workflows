@@ -45,12 +45,15 @@ test("fullstack: missing core handoff export fails with an actionable loaded-run
 });
 
 test("fullstack: a mismatched core contract is rejected before tool registration", () => {
+  const coreVersion = core.CORE_RUNTIME_CONTRACT.package.version;
+  const skewedVersion = `${coreVersion}-skew`;
+  const skewedPath = "/Users/operator/.omp/plugins/node_modules/@andvl1/omp-workflows-core/dist/index.js";
   const skewedContract = {
     ...core.CORE_RUNTIME_CONTRACT,
     package: {
       ...core.CORE_RUNTIME_CONTRACT.package,
-      version: "0.23.2",
-      path: "/Users/operator/.omp/plugins/node_modules/@andvl1/omp-workflows-core/dist/index.js",
+      version: skewedVersion,
+      path: skewedPath,
     },
   };
   const skewedCore = {
@@ -64,8 +67,8 @@ test("fullstack: a mismatched core contract is rejected before tool registration
     (error: unknown) => {
       assert.ok(error instanceof Error);
       assert.match(error.message, /package versions differ/);
-      assert.match(error.message, /core=0\.23\.2/);
-      assert.match(error.message, /path=\/Users\/operator\/\.omp\/plugins/);
+      assert.ok(error.message.includes(`core=${skewedVersion}, fullstack=${FULLSTACK_RUNTIME_CONTRACT.package.version}`));
+      assert.ok(error.message.includes(`path=${skewedPath}`));
       assert.match(error.message, /matched pair/);
       return true;
     },
