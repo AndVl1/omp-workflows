@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.24.1] — 2026-08-24
+### Fixed
+- **`PRODUCT_DISCOVERY` workflow preparation schema** — the runtime `workflow_prepare` schema now accepts `PRODUCT_DISCOVERY` classifications while preserving the core approval gate.
+
 ## [0.24.0] — 2026-08-24
 ### Added
 - **Product discovery workflow** — a deterministic, evidence-first workflow that produces a typed product specification and requires explicit product-owner approval before handoff.
