@@ -2,6 +2,11 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.24.0] — 2026-08-24
+### Added
+- **Product discovery workflow** — a deterministic, evidence-first workflow that produces a typed product specification and requires explicit product-owner approval before handoff.
+- **Reusable offline PRD viewer** — Product PRD documents now ship as self-contained HTML with a table of contents, deterministic section anchors, and previous/next navigation.
+
 ## [0.23.2] — 2026-08-24
 ### Fixed
 - **Feature-scoped workflow artifacts** — PR #45 (`4ca2d44`) now exposes the active run's exact artifact directory to `/do-work`, preventing discovery artifacts from being written to the legacy root and blocking stage advancement.
