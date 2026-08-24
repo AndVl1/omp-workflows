@@ -132,6 +132,10 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "For `orchestrator`, `bash`, or `none` stages, perform only the declared contract action, persist required typed artifacts, then call `workflow_advance` with the current handoff's advance token and evidence.",
     "After every task result, call `workflow_status`. For every succeeded dispatch whose `artifact_ids` is empty, call `workflow_complete` exactly once with its identity binding and the exact artifact IDs from `slot_artifacts` (including `produce-slot` ids for consilium); do not treat a native task result as artifact completion. If the runtime already repaired a synchronous completion, use the IDs shown by `workflow_status` and do not replay it with different IDs.",
     "Advance only through `workflow_advance` after all current-stage dispatches are complete and required artifacts/gates exist. Use the returned next-stage handoff for the next stage; never call `task` from a stale cursor.",
+    "### Cross-profile handoff (workflow_handoff)",
+    "When the current profile completes at a `handoff` source stage and the user explicitly approves the result, persist a typed `workflow_approval` artifact in the existing feature artifacts directory (`type: workflow_approval`, `version: 1`, `decision: approved`, the run_key, source workflow, source stage, actor, and decided_at), then call `workflow_handoff` with the completed run's advance-token handoff, the target workflow, the approval reference, and only bounded artifact/decision references.",
+    "NEVER infer approval from natural-language output or call `workflow_handoff` without typed approval evidence. If `workflow_handoff` rejects or fails, stop and preserve state: do not edit state.json or profile JSON, do not guess credentials, and do not retry with free text.",
+    "On success, discard the source envelope, use ONLY the returned target handoff, call `workflow_instructions` again, and continue with the returned target stage contract; record the target stage's own checkpoints under the fresh capability.",
     "",
     "### Tool permission summary",
     "| Operation | Orchestrator |",
@@ -148,6 +152,8 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "| task for a declared stage | ALLOW |",
     "| task outside the active profile/state contract | DENY |",
     "| direct implementation or review-fix | DENY |",
+    "| workflow_handoff after explicit typed user approval | ALLOW |",
+    "| workflow_handoff without approval evidence or mid-workflow | DENY |",
   ].join("\n");
 }
 

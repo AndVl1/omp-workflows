@@ -33,10 +33,12 @@ import {
   recordCheckpointDecision,
   prepareWorkflowState,
   readAgentMapping,
+  handoffWorkflow,
   resolveState,
   type DispatchAuth,
   type ModelClassification,
   type WorkflowPrepareOptions,
+  type HandoffWorkflowInput,
 } from "@andvl1/omp-workflows-core";
 import { registerWorkflowCommands } from "./workflow-commands.js";
 import { ensureCommandsForSession } from "./copy-commands.js";
@@ -407,6 +409,41 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
         const transition = advanceCursor(cwd, input);
         return transition.ok ? result({ ok: true, transition: "advance", stage_cursor: transition.state.stage_cursor, cursor_epoch: transition.state.cursor_epoch, handoff: transition.handoff, state: stateSummary(cwd) }) : result({ ok: false, code: "WORKFLOW_ADVANCE_REJECTED", error: transition.error });
       } catch (error) { return result({ ok: false, code: "WORKFLOW_ADVANCE_FAILED", error: String(error) }); }
+    },
+  });
+  pi.registerTool({
+    name: "workflow_handoff",
+    label: "Handoff workflow",
+    description: "Transfer an approved completed workflow stage to another registered workflow profile. Main-session only; requires explicit typed approval evidence and returns a fresh one-time target capability.",
+    parameters: z.object({
+      token: z.string().min(1), capability_id: z.string().min(1),
+      run_key: z.string().min(1), branch: z.string().min(1), workflow: z.string().min(1), profile_hash: z.string().min(1), stage_cursor: z.string().min(1), cursor_epoch: z.string().min(1),
+      target_workflow: z.string().min(1),
+      target_profile_hash: z.string().min(1).optional(),
+      approval: z.object({
+        kind: z.enum(["checkpoint", "artifact"]),
+        ref: z.string().min(1),
+        source_stage: z.string().min(1),
+        decision: z.literal("approved"),
+      }),
+      actor: z.string().default("orchestrator"),
+      handoff_context: z.object({
+        artifact_ids: z.array(z.string().min(1)).default(() => []),
+        decision_refs: z.array(z.string().min(1)).default(() => []),
+        summary: z.string().default(""),
+      }).default(() => ({ artifact_ids: [], decision_refs: [], summary: "" })),
+    }) as never,
+    async execute(_id, params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      const cwd = resolveSessionCwd(ctx);
+      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      const input = params as HandoffWorkflowInput;
+      try {
+        const transition = handoffWorkflow(cwd, input);
+        if (!transition.ok) return result({ ok: false, code: "WORKFLOW_HANDOFF_REJECTED", error: transition.error, state: transition.state ? stateSummary(cwd) : undefined });
+        return result({ ok: true, transition: "handoff", route: transition.route, handoff: transition.handoff, audit: transition.audit, state: stateSummary(cwd) });
+      } catch (error) { return result({ ok: false, code: "WORKFLOW_HANDOFF_FAILED", error: String(error) }); }
     },
   });
 }
