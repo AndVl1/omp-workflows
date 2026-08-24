@@ -288,6 +288,7 @@ function handoffInputFor(
 }
 
 const TARGET_HASH = profileHash(loadProfile("full-feature")!);
+const TARGET_HASH_FINGERPRINT = TARGET_HASH.length > 32 ? `${TARGET_HASH.slice(0, 30)}${TARGET_HASH.slice(-2)}` : TARGET_HASH;
 
 /**
  * Snapshot of the catalogue at import time (shipped entries only) so the

@@ -23,6 +23,7 @@ import {
   loadArtifactSchemas,
   type ArtifactContractPolicy,
 } from "../src/engine/artifact-contract.js";
+import { isRootCauseDocumented } from "../src/engine/dod.js";
 import type { StageDef, TeamState } from "../src/engine/types.js";
 
 function state(overrides: Partial<TeamState> = {}): TeamState {
@@ -51,6 +52,31 @@ test("artifact contract: shipped schema registry covers every workflow artifact 
   assert.deepEqual(requiredFieldsOf("debug"), ["verdict", "iterations"]);
   assert.equal(requiredFieldsOf("regression_intake"), null, "ids without a schema definition are unconstrained");
 });
+test("artifact contract: diagnosis schema matches root-cause gate explanation requirement", () => {
+  assert.deepEqual(requiredFieldsOf("diagnosis"), ["root_cause", "explanation"]);
+  const missingExplanation = validateProducedArtifact("diagnosis", { root_cause: "cause" });
+  assert.equal(missingExplanation.ok, false, "schema rejects diagnosis without the gate-required explanation");
+  if (!missingExplanation.ok) assert.match(missingExplanation.issues[0]!.message, /required field 'explanation' is missing/);
+
+  const root = mkdtempSync(join(tmpdir(), "ac-diagnosis-"));
+  try {
+    const artifactsDir = join(root, "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    writeFileSync(join(artifactsDir, "diagnosis.json"), JSON.stringify({ root_cause: "cause" }));
+    const missingGateEvidence = isRootCauseDocumented(artifactsDir);
+    assert.equal(missingGateEvidence.ok, false);
+    if (!missingGateEvidence.ok) assert.match(missingGateEvidence.reason, /diagnosis\.explanation is empty/);
+
+    writeFileSync(join(artifactsDir, "diagnosis.json"), JSON.stringify({ root_cause: "cause", explanation: "why the fix closes it" }));
+    assert.deepEqual(isRootCauseDocumented(artifactsDir), {
+      ok: true,
+      diagnosis: { root_cause: "cause", explanation: "why the fix closes it" },
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 
 test("artifact contract: valid produced artifacts pass; invalid block with field diagnostics", () => {
   const ok = validateProducedArtifact("review", {

@@ -2021,17 +2021,39 @@ function validateHandoffApproval(
 }
 
 /** Validate bounded handoff context: safe, resolvable, size-capped references. */
-function validateHandoffContext(input: HandoffWorkflowInput, artifactsDir: string): string | null {
-  const context = input.handoff_context ?? {};
-  const artifactIds = Array.isArray(context.artifact_ids) ? context.artifact_ids : [];
-  const decisionRefs = Array.isArray(context.decision_refs) ? context.decision_refs : [];
-  const summary = typeof context.summary === "string" ? context.summary : "";
+function validateHandoffContext(
+  input: HandoffWorkflowInput,
+  artifactsDir: string,
+  state: TeamState,
+  sourceProducedIds: string[],
+): string | null {
+  const context = input.handoff_context;
+  if (context !== undefined && (!context || typeof context !== "object" || Array.isArray(context))) {
+    return "handoff context is invalid or exceeds limits";
+  }
+  if (context?.artifact_ids !== undefined && !Array.isArray(context.artifact_ids)) {
+    return "handoff context is invalid or exceeds limits";
+  }
+  if (context?.decision_refs !== undefined && !Array.isArray(context.decision_refs)) {
+    return "handoff context is invalid or exceeds limits";
+  }
+  if (context?.summary !== undefined && typeof context.summary !== "string") {
+    return "handoff context is invalid or exceeds limits";
+  }
+  const artifactIds = context?.artifact_ids ?? [];
+  const decisionRefs = context?.decision_refs ?? [];
+  const summary = context?.summary ?? "";
   if (artifactIds.length > MAX_HANDOFF_CONTEXT_ARTIFACTS) return "handoff context is invalid or exceeds limits";
   if (decisionRefs.length > MAX_HANDOFF_CONTEXT_DECISION_REFS) return "handoff context is invalid or exceeds limits";
   if (summary.length > MAX_HANDOFF_CONTEXT_SUMMARY_CHARS) return "handoff context is invalid or exceeds limits";
+  const allowedArtifactIds = new Set([
+    ...Object.keys(state.artifacts ?? {}),
+    ...sourceProducedIds,
+    ...(input.approval.kind === "artifact" && typeof input.approval.ref === "string" ? [input.approval.ref] : []),
+  ]);
   if (
     new Set(artifactIds).size !== artifactIds.length ||
-    artifactIds.some((id) => typeof id !== "string" || !isSafeStateSegment(id) || readArtifact(artifactsDir, id) === null)
+    artifactIds.some((id) => typeof id !== "string" || !isSafeStateSegment(id) || !allowedArtifactIds.has(id) || readArtifact(artifactsDir, id) === null)
   ) {
     return "handoff context is invalid or exceeds limits";
   }
@@ -2068,6 +2090,17 @@ export function handoffWorkflow(cwd: string, input: HandoffWorkflowInput): Hando
   if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
   const error = auth(cap, input, cap.advance_token_hash);
   if (error) return { ok: false, error, state };
+  const binding = cap.issued_for;
+  if (
+    state.branch !== binding.branch ||
+    (state.run_key ?? state.branch) !== binding.run_key ||
+    state.classification?.workflow !== binding.workflow ||
+    state.profile_hash !== binding.profile_hash ||
+    state.stage_cursor !== binding.stage_cursor ||
+    state.cursor_epoch !== binding.cursor_epoch
+  ) {
+    return { ok: false, error: "source capability binding mismatch", state };
+  }
   if (cap.status !== "complete") return { ok: false, error: "source workflow is not a completed handoff source", state };
 
   const sourceWorkflow = cap.issued_for.workflow;
@@ -2081,7 +2114,8 @@ export function handoffWorkflow(cwd: string, input: HandoffWorkflowInput): Hando
     return { ok: false, error: "source workflow is not a completed handoff source", state };
   }
   const artifactsDir = target.artifactsDir ?? "";
-  for (const id of stageProduces(sourceStage)) {
+  const sourceProducedIds = stageProduces(sourceStage);
+  for (const id of sourceProducedIds) {
     if (!isSafeStateSegment(id) || readArtifact(artifactsDir, id) === null) {
       return { ok: false, error: `source produced artifact '${id}' is missing or invalid`, state };
     }
@@ -2091,7 +2125,7 @@ export function handoffWorkflow(cwd: string, input: HandoffWorkflowInput): Hando
   const targetProfile = loadProfile(targetWorkflow);
   if (!targetProfile) return { ok: false, error: "target workflow is unavailable", state };
   const targetHash = profileHash(targetProfile);
-  if (input.target_profile_hash && input.target_profile_hash !== targetHash) {
+  if (input.target_profile_hash && !profileHashMatches(targetHash, input.target_profile_hash)) {
     return { ok: false, error: "target profile hash mismatch", state };
   }
   const route = handoffRoutes.get(handoffRouteKey(sourceWorkflow, input.stage_cursor, targetWorkflow));
@@ -2103,7 +2137,7 @@ export function handoffWorkflow(cwd: string, input: HandoffWorkflowInput): Hando
 
   const approvalError = validateHandoffApproval(input, state, artifactsDir, route, cap);
   if (approvalError) return { ok: false, error: approvalError, state };
-  const contextError = validateHandoffContext(input, artifactsDir);
+  const contextError = validateHandoffContext(input, artifactsDir, state, sourceProducedIds);
   if (contextError) return { ok: false, error: contextError, state };
   if ((state.handoffs?.length ?? 0) >= MAX_HANDOFF_RECORDS) {
     return { ok: false, error: "handoff audit trail is full", state };
@@ -2187,12 +2221,12 @@ export function handoffWorkflow(cwd: string, input: HandoffWorkflowInput): Hando
     handoffs: [...(state.handoffs ?? []), audit],
     updated_at: now(),
   };
-  persist(cwd, next, target);
   const handoff = handoffFromState(cwd, next, {
     capability_id: issued.capability_id,
     dispatch_token: issued.dispatch_token,
     advance_token: issued.advance_token,
   }, targetStage);
-  if (!handoff) return { ok: false, error: "handoff capability construction failed" };
+  if (!handoff) return { ok: false, error: "handoff capability construction failed", state };
+  persist(cwd, next, target);
   return { ok: true, state: next, route: audit.route, handoff, audit };
 }

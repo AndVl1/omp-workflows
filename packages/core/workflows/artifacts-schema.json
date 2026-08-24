@@ -64,9 +64,10 @@
     },
     "diagnosis": {
       "type": "object",
-      "required": ["root_cause"],
+      "required": ["root_cause", "explanation"],
       "properties": {
         "root_cause": { "type": "string" },
+        "explanation": { "type": "string", "description": "Why the proposed fix closes the documented root cause." },
         "evidence": { "type": "array", "items": { "type": "string" }, "description": "Stacktraces, logs, repro steps." },
         "proposed_fix": { "type": "string", "description": "Diff or description." },
         "verification_checklist": { "type": "array", "items": { "type": "string" } }
