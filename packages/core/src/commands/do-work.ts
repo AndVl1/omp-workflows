@@ -109,7 +109,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "When invoking them through Python `eval`, `tool.workflow_*` returns `{ \"text\": \"<JSON>\" }`; parse `json.loads(r[\"text\"])`, never `json.loads(r)`.",
     "Require `ok: true` on operation envelopes such as `workflow_prepare` and `workflow_begin`; require `workflow_instructions` to contain the expected `stage` and `provenance` objects before reading it.",
     "Keep the parsed `workflow_begin` payload: only its `handoff.dispatch_markers` contains dispatch markers; `workflow_instructions` returns the stage contract and does not contain `dispatch_markers`.",
-    "For each declared role, select the marker by exact role from that begin handoff and preserve it verbatim; missing, empty, duplicate, or mismatched markers are a fail-closed condition."
+    "For each declared role, select the marker by exact role from that begin handoff and preserve it verbatim; missing, empty, duplicate, or mismatched markers are a fail-closed condition.",
     "",
     "### Role mapping (effective runtime resolution)",
     "| Role | Agent |",
