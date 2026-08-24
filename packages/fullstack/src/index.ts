@@ -236,7 +236,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
     };
   };
   const classificationParameters = z.object({
-    type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX"]),
+    type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"]),
     complexity: z.enum(["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"]),
     confidence: z.enum(["HIGH", "MEDIUM", "LOW"]),
     autonomous: z.boolean(),
