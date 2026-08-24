@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.23.2] — 2026-08-24
+### Fixed
+- **Feature-scoped workflow artifacts** — PR #45 (`4ca2d44`) now exposes the active run's exact artifact directory to `/do-work`, preventing discovery artifacts from being written to the legacy root and blocking stage advancement.
+
 ## [0.23.1] — 2026-08-23
 ### Fixed
 - **Stale reopened-stage slot-artifact cleanup** — PR #44 (commit `897e031`) now removes stale slot artifacts when a workflow stage is reopened, preventing outdated artifacts from surviving a reopen.
