@@ -24,6 +24,7 @@ import {
   type ArtifactContractPolicy,
 } from "../src/engine/artifact-contract.js";
 import { isRootCauseDocumented } from "../src/engine/dod.js";
+import { checkArtifact } from "../src/gates/validation.js";
 import type { StageDef, TeamState } from "../src/engine/types.js";
 
 function state(overrides: Partial<TeamState> = {}): TeamState {
@@ -48,9 +49,41 @@ test("artifact contract: shipped schema registry covers every workflow artifact 
   for (const id of ["discovery", "exploration", "clarifications", "architecture", "diagnosis", "implementation", "debug", "review", "summary", "manual_qa", "qa_tests", "feature_spec", "dod", "cto_discovery", "team_plan", "team_artifacts", "integration_review"]) {
     assert.ok(schemas[id], `schema for '${id}' must exist`);
   }
-  assert.deepEqual(requiredFieldsOf("implementation"), ["files_touched"]);
+  assert.deepEqual(requiredFieldsOf("implementation"), ["files_touched", "ready", "validation_run", "validation_evidence"]);
   assert.deepEqual(requiredFieldsOf("debug"), ["verdict", "iterations"]);
   assert.equal(requiredFieldsOf("regression_intake"), null, "ids without a schema definition are unconstrained");
+});
+
+test("artifact contract: implementation schema exposes validation gate requirements", () => {
+  const required = requiredFieldsOf("implementation");
+  assert.deepEqual(required, ["files_touched", "ready", "validation_run", "validation_evidence"]);
+
+  const complete = {
+    files_touched: ["src/index.ts"],
+    ready: true,
+    validation_run: true,
+    validation_evidence: "npm test: PASS",
+  };
+  assert.deepEqual(validateProducedArtifact("implementation", complete), { ok: true });
+  assert.deepEqual(checkArtifact("implementation", complete), { ok: true });
+
+  for (const field of ["ready", "validation_run", "validation_evidence"]) {
+    const missing = { ...complete } as Record<string, unknown>;
+    delete missing[field];
+    const schemaResult = validateProducedArtifact("implementation", missing);
+    assert.equal(schemaResult.ok, false, `schema must require ${field}`);
+    const gateResult = checkArtifact("implementation", missing);
+    assert.equal(gateResult.ok, false, `validationGate must require ${field}`);
+  }
+
+  const missingFiles = { ...complete } as Record<string, unknown>;
+  delete missingFiles.files_touched;
+  const missingFilesResult = validateProducedArtifact("implementation", missingFiles);
+  assert.equal(missingFilesResult.ok, false, "schema must continue requiring files_touched");
+
+  const invalidReady = { ...complete, ready: false };
+  assert.equal(validateProducedArtifact("implementation", invalidReady).ok, false, "schema must reject ready=false");
+  assert.equal(checkArtifact("implementation", invalidReady).ok, false, "validationGate must reject ready=false");
 });
 test("artifact contract: diagnosis schema matches root-cause gate explanation requirement", () => {
   assert.deepEqual(requiredFieldsOf("diagnosis"), ["root_cause", "explanation"]);

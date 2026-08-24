@@ -75,12 +75,15 @@
     },
     "implementation": {
       "type": "object",
-      "required": ["files_touched"],
+      "required": ["files_touched", "ready", "validation_run", "validation_evidence"],
       "properties": {
         "files_touched": { "type": "array", "items": { "type": "string" } },
         "commits": { "type": "array", "items": { "type": "string" } },
         "build_status": { "enum": ["pass", "fail", "n/a"] },
-        "scope": { "type": "array", "items": { "type": "string" }, "description": "Project-defined scope names touched (e.g. backend-kotlin, go, frontend, mobile, devops, rust). Matches scope_map in team.config." }
+        "scope": { "type": "array", "items": { "type": "string" }, "description": "Project-defined scope names touched (e.g. backend-kotlin, go, frontend, mobile, devops, rust). Matches scope_map in team.config." },
+        "ready": { "enum": [true, "true"], "description": "The implementation is complete and ready for the next stage. Matches validationGate's accepted ready=true values." },
+        "validation_run": { "enum": [true, "true"], "description": "Focused validation was run by the implementation agent. Matches validationGate's accepted validation_run=true values." },
+        "validation_evidence": { "type": "string", "description": "Non-empty, verbatim build/test output captured by the implementation agent; validationGate rejects missing or blank evidence." }
       }
     },
     "debug": {

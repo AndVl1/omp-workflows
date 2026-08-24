@@ -1314,6 +1314,20 @@ test("workflow contract supports an explicit stateless profile lookup", () => {
     assert.deepEqual(contract.stage.artifact_schemas.discovery?.required, ["task", "branch"]);
     assert.equal(contract.stage.artifact_schemas.dod?.properties?.items?.items?.type, "object");
     assert.deepEqual(contract.stage.artifact_schemas.dod?.properties?.items?.items?.required, ["criterion", "verify_method", "status"]);
+    const implementation = resolveWorkflowContract(root, {
+      requireState: false,
+      workflow: "lightweight",
+      branch: "main",
+      stageId: "implementation",
+    });
+    assert.equal(implementation.stage.id, "implementation");
+    assert.deepEqual(
+      implementation.stage.artifact_schemas.implementation?.required,
+      ["files_touched", "ready", "validation_run", "validation_evidence"],
+    );
+    assert.deepEqual(implementation.stage.artifact_schemas.implementation?.properties?.ready?.enum, [true, "true"]);
+    assert.deepEqual(implementation.stage.artifact_schemas.implementation?.properties?.validation_run?.enum, [true, "true"]);
+    assert.equal(implementation.stage.artifact_schemas.implementation?.properties?.validation_evidence?.type, "string");
     assert.equal(contract.state.dispatch.allowed, false);
   } finally {
     rmSync(root, { recursive: true, force: true });
