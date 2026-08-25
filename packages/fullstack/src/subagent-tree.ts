@@ -70,6 +70,40 @@ interface SubagentProgressPayload {
 	progress: SubagentProgress;
 }
 
+/** Minimal public AgentRegistry projection used to mirror nested agents. */
+interface AgentRegistryRefLike {
+	id: string;
+	displayName: string;
+	kind: "main" | "sub" | "advisor";
+	parentId?: string;
+	status: "running" | "idle" | "parked" | "aborted";
+	createdAt: number;
+	lastActivity: number;
+	activity?: string;
+	history?: {
+		metrics?: {
+			tokens?: number;
+		};
+	};
+}
+
+interface AgentRegistryLike {
+	list(): AgentRegistryRefLike[];
+	onChange(listener: () => void): () => void;
+}
+
+/** Resolve OMP's process-global registry without a Bun-only runtime import. */
+function resolveAgentRegistry(pi: ExtensionAPI): AgentRegistryLike | undefined {
+	const exports = pi.pi as
+		| {
+				AgentRegistry?: {
+					global(): AgentRegistryLike;
+				};
+		  }
+		| undefined;
+	return exports?.AgentRegistry?.global();
+}
+
 /** Inline card data — what we append to the transcript. */
 export interface SubagentCardData {
 	id: string;
@@ -105,6 +139,9 @@ export interface SubagentTreePersistedState {
 /** Per-node state kept in memory. */
 interface SubagentNode {
 	id: string;
+	/** Authoritative agent lineage from AgentRegistry.parentId. */
+	parentId?: string;
+	/** Spawning tool-call metadata retained for inline transcript cards. */
 	parentToolCallId?: string;
 	agent: string;
 	description?: string;
@@ -194,7 +231,7 @@ export function renderSubagentTree(nodes: SubagentNode[]): string[] {
 
 	const byParent = new Map<string | undefined, SubagentNode[]>();
 	for (const node of nodes) {
-		const key = node.parentToolCallId;
+		const key = node.parentId;
 		const list = byParent.get(key);
 		if (list) list.push(node);
 		else byParent.set(key, [node]);
@@ -288,6 +325,7 @@ export class SubagentTreeController {
 	/** cwd of the session this controller is bound to. */
 	readonly cwd: string;
 	private evictTimer: NodeJS.Timeout | null = null;
+	private cleanups: Array<() => void> = [];
 
 	constructor(initial: SubagentTreePersistedState, cwd: string) {
 		this.enabled = initial.enabled;
@@ -303,13 +341,18 @@ export class SubagentTreeController {
 		if (!isLifecyclePayload(raw)) return null;
 		const payload = raw;
 		if (payload.status === "running") {
+			const existing = this.nodes.get(payload.id);
 			const node: SubagentNode = {
 				id: payload.id,
-				parentToolCallId: payload.parentToolCallId,
+				// Lifecycle events carry a tool-call id, not an agent parent.
+				// Only AgentRegistry reconciliation may establish lineage.
+				parentId: existing?.parentId,
+				parentToolCallId: payload.parentToolCallId ?? existing?.parentToolCallId,
 				agent: payload.agent,
-				description: payload.description,
+				description: payload.description ?? existing?.description,
 				status: "running",
-				startedAtMs: Date.now(),
+				progress: existing?.progress,
+				startedAtMs: existing?.startedAtMs ?? Date.now(),
 			};
 			this.nodes.set(payload.id, node);
 			this.scheduleEvict();
@@ -319,7 +362,7 @@ export class SubagentTreeController {
 					id: payload.id,
 					agent: payload.agent,
 					parentToolCallId: payload.parentToolCallId,
-					description: payload.description,
+					description: node.description,
 					startedAtMs: node.startedAtMs,
 					status: "running",
 				},
@@ -346,6 +389,80 @@ export class SubagentTreeController {
 			};
 		}
 		return null;
+	}
+
+	/**
+	 * Reconcile against OMP's process-global AgentRegistry. Task lifecycle
+	 * channels are session-local, so a main-session extension cannot observe
+	 * workers spawned by a lead's child session through its own EventBus.
+	 * AgentRegistry is the authoritative process-wide source for membership and
+	 * parent/child lineage.
+	 */
+	reconcileRegistry(refs: readonly AgentRegistryRefLike[]): boolean {
+		const now = Date.now();
+		const visible = refs.filter(
+			(ref) => ref.kind === "sub" && (ref.status === "running" || now - ref.lastActivity < FINISHED_HOLD_MS),
+		);
+		const visibleIds = new Set(visible.map((ref) => ref.id));
+		let changed = false;
+
+		for (const ref of visible) {
+			const existing = this.nodes.get(ref.id);
+			const registryStatus: SubagentStatus =
+				ref.status === "running" ? "running" : ref.status === "aborted" ? "aborted" : "completed";
+			const status =
+				existing && existing.status !== "running" && registryStatus === "completed"
+					? existing.status
+					: registryStatus;
+			const tokens = ref.history?.metrics?.tokens;
+			const progress =
+				existing?.progress || ref.activity || tokens
+					? {
+							...existing?.progress,
+							currentTool: existing?.progress?.currentTool ?? ref.activity,
+							tokens: existing?.progress?.tokens ?? tokens,
+						}
+					: undefined;
+			const finishedAtMs = status === "running" ? undefined : (existing?.finishedAtMs ?? ref.lastActivity);
+			const next: SubagentNode = {
+				id: ref.id,
+				parentId: ref.parentId === "Main" ? undefined : ref.parentId,
+				parentToolCallId: existing?.parentToolCallId,
+				agent: ref.displayName,
+				description: existing?.description,
+				status,
+				progress,
+				startedAtMs: existing?.startedAtMs ?? ref.createdAt,
+				finishedAtMs,
+			};
+
+			if (
+				!existing ||
+				existing.parentId !== next.parentId ||
+				existing.parentToolCallId !== next.parentToolCallId ||
+				existing.agent !== next.agent ||
+				existing.status !== next.status ||
+				existing.progress?.currentTool !== next.progress?.currentTool ||
+				existing.progress?.tokens !== next.progress?.tokens ||
+				existing.startedAtMs !== next.startedAtMs ||
+				existing.finishedAtMs !== next.finishedAtMs
+			) {
+				this.nodes.set(ref.id, next);
+				changed = true;
+			}
+		}
+
+		// A running event-only node that disappeared from the registry has
+		// settled. Keep it briefly for expanded mode, but never count it as live.
+		for (const node of this.nodes.values()) {
+			if (node.status !== "running" || visibleIds.has(node.id)) continue;
+			node.status = "completed";
+			node.finishedAtMs = Date.now();
+			changed = true;
+		}
+
+		if (changed) this.scheduleEvict();
+		return changed;
 	}
 
 	/** Apply a raw progress payload. Returns true if the visible tree changed. */
@@ -414,6 +531,18 @@ export class SubagentTreeController {
 		return this.nodes.size;
 	}
 
+	addCleanup(cleanup: () => void): void {
+		this.cleanups.push(cleanup);
+	}
+
+	dispose(): void {
+		for (const cleanup of this.cleanups.splice(0)) cleanup();
+		if (this.evictTimer) {
+			clearInterval(this.evictTimer);
+			this.evictTimer = null;
+		}
+	}
+
 	private scheduleEvict(): void {
 		if (this.evictTimer) return;
 		this.evictTimer = setInterval(() => {
@@ -470,7 +599,12 @@ export function buildCardRenderer(): (message: unknown) => ComponentLike {
 	};
 }
 
-/** Wire EventBus + custom-message-renderer subscriptions to the extension. */
+/**
+ * Wire the main session's EventBus and OMP's process-global AgentRegistry.
+ * The EventBus supplies rich progress for direct children; AgentRegistry
+ * supplies complete membership and authoritative lineage across nested child
+ * sessions, whose lifecycle events stay on their own session-local buses.
+ */
 export function registerSubagentTree(
 	pi: ExtensionAPI,
 	ui: ExtensionUIContext,
@@ -479,23 +613,35 @@ export function registerSubagentTree(
 	const persisted = readPersistedState(cwd);
 	const controller = new SubagentTreeController(persisted, cwd);
 
-	pi.events.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, (raw) => {
-		const result = controller.applyLifecycle(raw);
-		if (!result) return;
-		// Push an inline card into the transcript so it scrolls with the chat.
-		try {
-			pi.appendEntry(SUBAGENT_CARD_TYPE, result.data);
-		} catch {
-			// entry is best-effort: a failed append must not break the HUD.
-		}
-		if (ui) renderWidget(ui, controller);
-	});
+	controller.addCleanup(
+		pi.events.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, (raw) => {
+			const result = controller.applyLifecycle(raw);
+			if (!result) return;
+			// Push an inline card into the transcript so it scrolls with the chat.
+			try {
+				pi.appendEntry(SUBAGENT_CARD_TYPE, result.data);
+			} catch {
+				// entry is best-effort: a failed append must not break the HUD.
+			}
+			renderWidget(ui, controller);
+		}),
+	);
 
-	pi.events.on(TASK_SUBAGENT_PROGRESS_CHANNEL, (raw) => {
-		if (controller.applyProgress(raw)) {
-			if (ui) renderWidget(ui, controller);
-		}
-	});
+	controller.addCleanup(
+		pi.events.on(TASK_SUBAGENT_PROGRESS_CHANNEL, (raw) => {
+			if (controller.applyProgress(raw)) renderWidget(ui, controller);
+		}),
+	);
+
+	const registry = resolveAgentRegistry(pi);
+	if (registry) {
+		const reconcile = (): void => {
+			if (controller.reconcileRegistry(registry.list())) renderWidget(ui, controller);
+		};
+		controller.addCleanup(registry.onChange(reconcile));
+		reconcile();
+	}
+	renderWidget(ui, controller);
 
 	// Register the inline-card renderer once. It returns a lightweight
 	// `Component`-like object; no pi-tui runtime import required.

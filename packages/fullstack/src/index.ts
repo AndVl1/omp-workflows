@@ -375,16 +375,20 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   pi.on("session_start", (_event: SessionStartEvent, ctx: unknown) => {
     const cwd = resolveSessionCwd(ctx);
     if (!cwd) return;
+    const isMainSession = isMainSessionContext(ctx);
     ensureCommandsForSession(cwd);
-    // Subagent-tree live widget — bound to the cwd of the active session.
-    // The controller replays from <cwd>/.omp/subagent-tree.json so the
-    // previous view state (on/off + verbose/compact) survives restarts.
+    // The interactive main session owns the live widget. Its controller also
+    // reconciles OMP's process-global AgentRegistry, so nested workers remain
+    // visible without loading a second UI controller in headless children.
     const ui = extractUiFromContext(ctx);
-    if (ui) subagentTreeRef.current = registerSubagentTree(pi, ui, cwd);
+    if (ui && isMainSession) {
+      subagentTreeRef.current?.dispose();
+      subagentTreeRef.current = registerSubagentTree(pi, ui, cwd);
+    }
     // CTO escalation dispatcher: only the interactive main session may own
     // inbound polling. Task subagents also emit session_start, but starting a
     // dispatcher there creates another getUpdates consumer with offset=0.
-    if (!isMainSessionContext(ctx)) return;
+    if (!isMainSession) return;
     dispatcherStopsByCwd.get(cwd)?.();
     dispatcherStopsByCwd.delete(cwd);
     // Profile-aware channel set (core capability-validated normalization):
@@ -436,6 +440,8 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   });
   pi.on("session_shutdown", (_event: unknown, ctx: unknown) => {
     if (!isMainSessionContext(ctx)) return;
+    subagentTreeRef.current?.dispose();
+    subagentTreeRef.current = null;
     const cwd = resolveSessionCwd(ctx);
     if (!cwd) return;
     dispatcherStopsByCwd.get(cwd)?.();

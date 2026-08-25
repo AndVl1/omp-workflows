@@ -13,9 +13,10 @@ import {
 	readPersistedState,
 	renderSubagentCompactLine,
 	renderSubagentTree,
+	registerSubagentTree,
 	writePersistedState,
 } from "../src/subagent-tree.js";
-import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 
 /** Create a fresh cwd for filesystem-isolated tests. */
 function tmpCwd(prefix: string): string {
@@ -93,10 +94,10 @@ test("subagent-tree: renderSubagentCompactLine returns empty for empty input", (
 
 test("subagent-tree: renderSubagentCompactLine produces a single line for running agents", () => {
 	const nodes = [
-		{ id: "a", parentToolCallId: undefined, agent: "developer-kotlin", status: "running" as const, startedAtMs: 0 },
-		{ id: "b", parentToolCallId: undefined, agent: "developer-kotlin", status: "running" as const, startedAtMs: 1 },
-		{ id: "c", parentToolCallId: undefined, agent: "team-lead", status: "running" as const, startedAtMs: 2 },
-		{ id: "d", parentToolCallId: undefined, agent: "qa", status: "completed" as const, startedAtMs: 3, finishedAtMs: 100 },
+		{ id: "a", parentId: undefined, agent: "developer-kotlin", status: "running" as const, startedAtMs: 0 },
+		{ id: "b", parentId: undefined, agent: "developer-kotlin", status: "running" as const, startedAtMs: 1 },
+		{ id: "c", parentId: undefined, agent: "team-lead", status: "running" as const, startedAtMs: 2 },
+		{ id: "d", parentId: undefined, agent: "qa", status: "completed" as const, startedAtMs: 3, finishedAtMs: 100 },
 	];
 	const lines = renderSubagentCompactLine(nodes);
 	assert.equal(lines.length, 1, "exactly one line");
@@ -112,9 +113,9 @@ test("subagent-tree: renderSubagentTree returns empty list for empty input", () 
 
 test("subagent-tree: renderSubagentTree renders header + root + nested children", () => {
 	const nodes = [
-		{ id: "lead-1", parentToolCallId: undefined, agent: "team-lead", status: "running" as const, startedAtMs: 0 },
-		{ id: "w-1", parentToolCallId: "lead-1", agent: "developer", status: "running" as const, startedAtMs: 1 },
-		{ id: "w-2", parentToolCallId: "lead-1", agent: "qa", status: "completed" as const, startedAtMs: 2, finishedAtMs: 5_000 },
+		{ id: "lead-1", parentId: undefined, agent: "team-lead", status: "running" as const, startedAtMs: 0 },
+		{ id: "w-1", parentId: "lead-1", agent: "developer", status: "running" as const, startedAtMs: 1 },
+		{ id: "w-2", parentId: "lead-1", agent: "qa", status: "completed" as const, startedAtMs: 2, finishedAtMs: 5_000 },
 	];
 	const lines = renderSubagentTree(nodes);
 	assert.ok(lines.length >= 4, "header + root + 2 children");
@@ -124,10 +125,113 @@ test("subagent-tree: renderSubagentTree renders header + root + nested children"
 	assert.ok(lines.some((l) => l.includes("qa")), "qa rendered");
 });
 
+test("subagent-tree: registry reconciliation adds nested workers missed by the parent EventBus", () => {
+	const controller = new SubagentTreeController({ enabled: true, mode: "expanded" }, "/tmp");
+	controller.applyLifecycle(started("lead-1", undefined, "team-lead"));
+
+	const changed = controller.reconcileRegistry([
+		{
+			id: "lead-1",
+			displayName: "team-lead",
+			kind: "sub",
+			parentId: "Main",
+			status: "running",
+			createdAt: 1,
+			lastActivity: 10,
+		},
+		{
+			id: "worker-1",
+			displayName: "developer",
+			kind: "sub",
+			parentId: "lead-1",
+			status: "running",
+			createdAt: 2,
+			lastActivity: 11,
+		},
+	]);
+
+	assert.equal(changed, true);
+	assert.equal(controller.runningCount, 2, "registry supplies the nested worker missing from the main EventBus");
+	const lines = renderSubagentTree(controller.snapshot());
+	const worker = lines.find((line) => line.includes("developer"));
+	assert.ok(worker?.startsWith("   \u2514\u2500"), "worker renders beneath its AgentRegistry parent");
+	controller.dispose();
+});
+
+test("subagent-tree: registerSubagentTree subscribes to the process-global registry", () => {
+	const cwd = tmpCwd("subagent-tree-registry-");
+	try {
+		writePersistedState(cwd, { enabled: true, mode: "expanded" });
+		const ui = fakeUi();
+		const registryListeners = new Set<() => void>();
+		const refs = [
+			{
+				id: "lead-1",
+				displayName: "team-lead",
+				kind: "sub" as const,
+				parentId: "Main",
+				status: "running" as const,
+				createdAt: 1,
+				lastActivity: 10,
+			},
+			{
+				id: "worker-1",
+				displayName: "developer",
+				kind: "sub" as const,
+				parentId: "lead-1",
+				status: "running" as const,
+				createdAt: 2,
+				lastActivity: 11,
+			},
+			{
+				id: "old-worker",
+				displayName: "qa",
+				kind: "sub" as const,
+				parentId: "lead-1",
+				status: "parked" as const,
+				createdAt: 1,
+				lastActivity: 1,
+			},
+		];
+		const registry = {
+			list: () => refs,
+			onChange: (listener: () => void) => {
+				registryListeners.add(listener);
+				return () => registryListeners.delete(listener);
+			},
+		};
+		const eventListeners = new Map<string, (payload: unknown) => void>();
+		const pi = {
+			pi: { AgentRegistry: { global: () => registry } },
+			events: {
+				on: (channel: string, listener: (payload: unknown) => void) => {
+					eventListeners.set(channel, listener);
+					return () => eventListeners.delete(channel);
+				},
+			},
+			appendEntry: () => {},
+			registerMessageRenderer: () => {},
+		} as unknown as ExtensionAPI;
+
+		const controller = registerSubagentTree(pi, ui, cwd);
+		assert.equal(controller.runningCount, 2);
+		assert.equal(controller.count, 2, "stale parked history is not imported into the live HUD");
+		const visible = ui.calls.at(-1)?.content ?? [];
+		assert.ok(visible.some((line) => line.includes("team-lead")));
+		assert.ok(visible.some((line) => line.includes("developer")));
+
+		controller.dispose();
+		assert.equal(registryListeners.size, 0, "registry listener released with the controller");
+		assert.equal(eventListeners.size, 0, "session-local EventBus listeners released with the controller");
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
 test("subagent-tree: renderSubagentTree caps output at MAX_RENDER_LINES", () => {
 	const nodes = Array.from({ length: 30 }, (_, i) => ({
 		id: `w-${i}`,
-		parentToolCallId: undefined,
+		parentId: undefined,
 		agent: "developer",
 		status: "running" as const,
 		startedAtMs: i,
@@ -183,14 +287,14 @@ test("subagent-tree: applyProgress is a no-op for unknown id", () => {
 	assert.equal(changed, false);
 });
 
-test("subagent-tree: tree topology follows parentToolCallId", () => {
-	const controller = new SubagentTreeController({ enabled: true, mode: "expanded" }, "/tmp");
-	controller.applyLifecycle(started("lead", undefined, "team-lead"));
-	controller.applyLifecycle(started("w-1", "lead", "developer-go"));
-	controller.applyLifecycle(started("w-2", "lead", "developer-kotlin"));
-	controller.applyLifecycle(started("g-1", "w-1", "developer-mobile"));
-	const lines = renderSubagentTree(controller.snapshot());
-	const joined = lines.join("\n");
+test("subagent-tree: tree topology follows authoritative agent parent ids", () => {
+	const nodes = [
+		{ id: "lead", parentId: undefined, agent: "team-lead", status: "running" as const, startedAtMs: 0 },
+		{ id: "w-1", parentId: "lead", agent: "developer-go", status: "running" as const, startedAtMs: 1 },
+		{ id: "w-2", parentId: "lead", agent: "developer-kotlin", status: "running" as const, startedAtMs: 2 },
+		{ id: "g-1", parentId: "w-1", agent: "developer-mobile", status: "running" as const, startedAtMs: 3 },
+	];
+	const joined = renderSubagentTree(nodes).join("\n");
 	assert.ok(joined.includes("team-lead"));
 	assert.ok(joined.includes("developer-go"));
 	assert.ok(joined.includes("developer-kotlin"));
