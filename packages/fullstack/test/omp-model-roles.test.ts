@@ -7,13 +7,15 @@ import modelRolesFactory, {
 	BUILTIN_ROLES,
 	MAX_RESEARCH_PROMPT_BYTES,
 } from "../commands/omp-model-roles/index.js";
+import { fullstackPreset } from "../src/index.js";
 import {
-	defaultFullstackModelRoles as MODEL_ROLES,
 	type InventoryModel,
 	isResearchRequest,
 	isResearchResponse,
 	resolveRoleChain,
 } from "@andvl1/omp-workflows-core";
+
+const MODEL_ROLES = fullstackPreset.modelRoles;
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const now = "2026-08-02T12:00:00.000Z";
@@ -212,77 +214,77 @@ test("research request schema accepts a complete request and rejects a non-ISO t
 });
 
 test("research response schema accepts a fully valid response", () => {
-	assert.equal(isResearchResponse(validResearchResponse(), inventory), true);
+	assert.equal(isResearchResponse(validResearchResponse(), inventory, MODEL_ROLES), true);
 });
 
 test("research response rejects a non-ISO generatedAt timestamp", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.generatedAt = "yesterday"; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.generatedAt = "yesterday"; }), inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects empty fit", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.fit = "  "; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.fit = "  "; }), inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects empty rationale", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.rationale = ""; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.rationale = ""; }), inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects recommendations without benchmark sources", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.benchmarkSources = []; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.benchmarkSources = []; }), inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects a missing source caveat", () => {
 	const response = validResearchResponse() as unknown as { recommendations: Array<{ benchmarkSources: Array<Record<string, unknown>> }> };
 	delete response.recommendations[0]!.benchmarkSources[0]!.caveat;
-	assert.equal(isResearchResponse(response, inventory), false);
+	assert.equal(isResearchResponse(response, inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects a non-http source URL", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.benchmarkSources[0]!.url = "ftp://example.com"; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.benchmarkSources[0]!.url = "ftp://example.com"; }), inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects an empty source title", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.benchmarkSources[0]!.title = ""; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.benchmarkSources[0]!.title = ""; }), inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects a non-ISO source retrievedAt", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.benchmarkSources[0]!.retrievedAt = "2026-08-02"; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.benchmarkSources[0]!.retrievedAt = "2026-08-02"; }), inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects a non-ISO optional publishedAt", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.benchmarkSources[0]!.publishedAt = "last week"; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.benchmarkSources[0]!.publishedAt = "last week"; }), inventory, MODEL_ROLES), false);
 });
 
 
 test("research response rejects an unknown unavailable role", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.unavailableRoles[0]!.role = "invented"; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.unavailableRoles[0]!.role = "invented"; }), inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects an unknown recommendation role", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.role = "invented"; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.role = "invented"; }), inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects an empty unavailable reason", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.unavailableRoles[0]!.reason = ""; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.unavailableRoles[0]!.reason = ""; }), inventory, MODEL_ROLES), false);
 });
 
 
 test("research response rejects duplicate roles across result sections", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.unavailableRoles[0]!.role = "architect"; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.unavailableRoles[0]!.role = "architect"; }), inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects duplicate recommendation roles", () => {
 	const response = validResearchResponse();
 	response.recommendations.push(structuredClone(response.recommendations[0]!));
-	assert.equal(isResearchResponse(response, inventory), false);
+	assert.equal(isResearchResponse(response, inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects a selector outside the immutable inventory", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.modelSelector = "test/invented"; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.recommendations[0]!.modelSelector = "test/invented"; }), inventory, MODEL_ROLES), false);
 });
 
 test("research response rejects empty warnings", () => {
-	assert.equal(isResearchResponse(responseWith(response => { response.warnings[0] = " "; }), inventory), false);
+	assert.equal(isResearchResponse(responseWith(response => { response.warnings[0] = " "; }), inventory, MODEL_ROLES), false);
 });
 
 test("execute validate reads settings and registry without mutation", async () => {

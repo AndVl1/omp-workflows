@@ -4,11 +4,27 @@ import { fileURLToPath } from "node:url";
 import type { CustomCommand, CustomCommandAPI } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/types";
 import type { HookCommandContext } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/types";
 import {
-	defaultFullstackModelRoles,
 	type InventoryModel,
 	type ModelRoleEntry,
 	resolveRoleChain,
 } from "@andvl1/omp-workflows-core";
+
+/** Fullstack-owned model taxonomy; core intentionally provides no default. */
+const defaultFullstackModelRoles: ModelRoleEntry[] = [
+	{ role: "architect", agents: ["architect"], standardFallback: "@slow" },
+	{ role: "reviewer", agents: ["code-reviewer"], standardFallback: "@slow" },
+	{ role: "security", agents: ["security-tester"], standardFallback: "@slow" },
+	{ role: "researcher", agents: ["tech-researcher", "discovery"], standardFallback: "@smol" },
+	{ role: "analyst", agents: ["analyst"], standardFallback: "@task" },
+	{ role: "developer-go", agents: ["developer-go"], standardFallback: "@task" },
+	{ role: "developer-kotlin", agents: ["developer-kotlin"], standardFallback: "@task" },
+	{ role: "frontend-developer", agents: ["frontend-developer"], standardFallback: "@task" },
+	{ role: "developer-mobile", agents: ["developer-mobile", "init-mobile"], standardFallback: "@task" },
+	{ role: "devops", agents: ["devops"], standardFallback: "@task" },
+	{ role: "diagnostics", agents: ["diagnostics"], standardFallback: "@task" },
+	{ role: "qa", agents: ["qa"], standardFallback: "@task" },
+	{ role: "manual-qa", agents: ["manual-qa"], standardFallback: "@task" },
+];
 
 const AGENT_FILE_COUNT = 17;
 /** OMP harness reserved model-class names. Stays local to fullstack: core

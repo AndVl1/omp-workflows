@@ -1,18 +1,9 @@
 /**
- * Pure model-role taxonomy shared across bundles.
+ * Generic model-role contracts shared across bundles.
  *
- * This module is the build-time source of truth for the default
- * fullstack class-role/frontmatter mapping plus the stateless helpers
- * (`resolveRoleChain`, `isResearchRequest`, `isResearchResponse`) that
- * any bundle can compose against its own inventory.
- *
- * Intentionally bundle-agnostic: the OMP harness knowledge
- * (`BUILTIN_ROLES`) lives next to consumers that need it (e.g.
- * `packages/fullstack/commands/omp-model-roles/index.ts`), not here.
- *
- * Bundles that ship their own taxonomy (Rust, Go-only, etc.) import the
- * types below and define their own `const MY_MODEL_ROLES: ModelRoleEntry[] = [...]`.
- * They get `resolveRoleChain` + the request/response validators for free.
+ * Core deliberately does not ship a default taxonomy. A bundle supplies its
+ * own role entries when it resolves model classes or validates research
+ * recommendations.
  */
 
 export interface ModelRoleEntry {
@@ -21,22 +12,13 @@ export interface ModelRoleEntry {
 	standardFallback: string;
 }
 
-/** Single source of truth for the model-class role/frontmatter mapping. */
-export const defaultFullstackModelRoles: ModelRoleEntry[] = [
-	{ role: "architect", agents: ["architect"], standardFallback: "@slow" },
-	{ role: "reviewer", agents: ["code-reviewer"], standardFallback: "@slow" },
-	{ role: "security", agents: ["security-tester"], standardFallback: "@slow" },
-	{ role: "researcher", agents: ["tech-researcher", "discovery"], standardFallback: "@smol" },
-	{ role: "analyst", agents: ["analyst"], standardFallback: "@task" },
-	{ role: "developer-go", agents: ["developer-go"], standardFallback: "@task" },
-	{ role: "developer-kotlin", agents: ["developer-kotlin"], standardFallback: "@task" },
-	{ role: "frontend-developer", agents: ["frontend-developer"], standardFallback: "@task" },
-	{ role: "developer-mobile", agents: ["developer-mobile", "init-mobile"], standardFallback: "@task" },
-	{ role: "devops", agents: ["devops"], standardFallback: "@task" },
-	{ role: "diagnostics", agents: ["diagnostics"], standardFallback: "@task" },
-	{ role: "qa", agents: ["qa"], standardFallback: "@task" },
-	{ role: "manual-qa", agents: ["manual-qa"], standardFallback: "@task" },
-];
+/** A caller-supplied taxonomy; core never selects a product-specific default. */
+export type ModelRoleTaxonomy = readonly ModelRoleEntry[];
+export interface ModelRolePreset {
+	name: string;
+	roles: ModelRoleTaxonomy;
+}
+
 
 export interface InventoryModel {
 	selector: string;
@@ -202,9 +184,12 @@ function isBenchmarkSource(value: unknown): value is BenchmarkSource {
 		isNonEmptyString(value.caveat)
 	);
 }
-
-/** Validate recommendations and reject selectors absent from the live inventory. */
-export function isResearchResponse(value: unknown, inventory: readonly InventoryModel[]): value is ResearchResponse {
+/** Validate recommendations against a caller-supplied taxonomy and inventory. */
+export function isResearchResponse(
+	value: unknown,
+	inventory: readonly InventoryModel[],
+	taxonomy: ModelRoleTaxonomy = [],
+): value is ResearchResponse {
 	if (!isRecord(value) || value.kind !== "omp-model-role-recommendations" || value.schemaVersion !== 1) return false;
 	if (
 		!isIsoTimestamp(value.generatedAt) ||
@@ -213,10 +198,11 @@ export function isResearchResponse(value: unknown, inventory: readonly Inventory
 		!Array.isArray(value.warnings)
 	) return false;
 	const selectors = new Set(inventory.map(model => model.selector));
-	const knownRoles = new Set(defaultFullstackModelRoles.map(entry => entry.role));
+	const knownRoles = taxonomy.length > 0 ? new Set(taxonomy.map(entry => entry.role)) : undefined;
 	const responseRoles = new Set<string>();
 	for (const recommendation of value.recommendations) {
-		if (!isRecord(recommendation) || !isNonEmptyString(recommendation.role) || !knownRoles.has(recommendation.role)) return false;
+		if (!isRecord(recommendation) || !isNonEmptyString(recommendation.role)) return false;
+		if (knownRoles && !knownRoles.has(recommendation.role)) return false;
 		if (responseRoles.has(recommendation.role)) return false;
 		responseRoles.add(recommendation.role);
 		if (
@@ -231,12 +217,12 @@ export function isResearchResponse(value: unknown, inventory: readonly Inventory
 		) return false;
 	}
 	for (const unavailableRole of value.unavailableRoles) {
-		if (!isRecord(unavailableRole) || !isNonEmptyString(unavailableRole.role) || !knownRoles.has(unavailableRole.role)) return false;
+		if (!isRecord(unavailableRole) || !isNonEmptyString(unavailableRole.role)) return false;
+		if (knownRoles && !knownRoles.has(unavailableRole.role)) return false;
 		if (responseRoles.has(unavailableRole.role) || !isNonEmptyString(unavailableRole.reason)) return false;
 		responseRoles.add(unavailableRole.role);
 	}
 	return value.warnings.every(isNonEmptyString);
 }
-
 export const validateResearchRequest = isResearchRequest;
 export const validateResearchResponse = isResearchResponse;

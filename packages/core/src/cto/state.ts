@@ -14,12 +14,15 @@ import type { ModelClassification } from "../engine/run.js";
 import {
   type CtoState,
   type BudgetState,
+  type CtoControlPlaneFields,
   type EscalationRecord,
   type EscalationStatus,
   type TeamRunStatus,
   type TeamPlan,
   type WaveRecord,
 } from "./types.js";
+import { validateTypedControlPlane } from "../engine/workflow-contract.js";
+import type { ControlPlaneProvenance, WorkIdentity } from "../engine/types.js";
 
 export function ctoStateDir(runId: string, root: string): string {
   if (!runId || runId === "." || runId === ".." || !/^[A-Za-z0-9._-]+$/.test(runId)) throw new Error("unsafe CTO run id");
@@ -119,6 +122,30 @@ function defaultBudgetShape(): BudgetState {
 const SCHEMA2_CANONICAL_FIELDS = ["budget", "leases", "decisions", "inbox_quarantine", "wave_history"] as const;
 
 /**
+ * Typed control-plane fields are validated (never trusted) on every
+ * migration: values present on disk must parse against the shared contract,
+ * otherwise they are quarantined behind an `invalid` provenance record.
+ * Legacy autonomy/roles/checkpoints stay display/migration inputs — they
+ * never become permission here.
+ */
+function normalizeControlPlaneFields(state: Record<string, unknown>): void {
+  state.control_plane_provenance ??= {
+    completion_intent: "none", checkpoint_policy: "none", roster_policy: "legacy",
+    roster_selection: "none", work_identity: "none", pending: "none",
+    child_join: "none", completion_envelope: "none", legacy_inputs: [],
+    warnings: [], status: "migrated",
+  };
+  const validation = validateTypedControlPlane(state);
+  if (!validation.ok) {
+    state.control_plane_provenance = {
+      ...(state.control_plane_provenance as ControlPlaneProvenance),
+      warnings: validation.issues.map((issue) => `${issue.path} ${issue.message}`),
+      status: "invalid",
+    };
+  }
+}
+
+/**
  * Additive, backward-compatible schema migration (br-zps.1, architecture 3.3):
  * ANY input — schema 1, missing schema, or a partial schema-2 state written
  * directly by a standby/legacy writer — becomes schema 2 with the schema-2
@@ -138,6 +165,8 @@ export function migrateCtoState(raw: Record<string, unknown>): CtoState {
   if (state.decisions === undefined) state.decisions = [];
   if (state.inbox_quarantine === undefined) state.inbox_quarantine = {};
   if (state.wave_history === undefined) state.wave_history = [];
+
+  normalizeControlPlaneFields(state);
   return state as unknown as CtoState;
 }
 
@@ -288,6 +317,58 @@ export function markAmended(state: CtoState, root: string | null = null): CtoSta
   return state;
 }
 
+// ── Typed control-plane projection (schema-2 additive; cto-core owns writes) ──
+
+function assertTypedControlPlane(value: unknown): void {
+  const validation = validateTypedControlPlane(value);
+  if (!validation.ok) {
+    throw new Error(`invalid typed control-plane update: ${validation.issues.map((issue) => `${issue.path} ${issue.message}`).join("; ")}`);
+  }
+}
+
+function assignDefined(target: Record<string, unknown>, patch: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) target[key] = value;
+  }
+}
+
+/**
+ * Merge a contract-valid typed control-plane projection into run state;
+ * persists when a root is given. Undefined patch entries never erase an
+ * existing field. Validation runs BEFORE the merge so an invalid update
+ * cannot poison persisted state — legacy autonomy/prose stays display input
+ * and never becomes permission here.
+ */
+export function setCtoControlPlane(
+  state: CtoState,
+  fields: Partial<CtoControlPlaneFields>,
+  root: string | null = null,
+): CtoState {
+  assertTypedControlPlane({ ...state, ...fields });
+  assignDefined(state as unknown as Record<string, unknown>, fields as Record<string, unknown>);
+  if (root) writeCtoState(state, root);
+  return state;
+}
+
+/**
+ * Merge a contract-valid typed control-plane projection into ONE team slice
+ * entry; persists when a root is given. Same validation contract as
+ * setCtoControlPlane.
+ */
+export function setTeamControlPlane(
+  state: CtoState,
+  teamId: string,
+  fields: Partial<Omit<CtoControlPlaneFields, "child_joins" | "migration" | "control_plane_provenance" | "control_plane_status">>,
+  root: string | null = null,
+): CtoState {
+  const team = teamOf(state, teamId);
+  if (!team) return state;
+  assertTypedControlPlane({ ...team, ...fields });
+  assignDefined(team as unknown as Record<string, unknown>, fields as Record<string, unknown>);
+  if (root) writeCtoState(state, root);
+  return state;
+}
+
 // ── Resident control-plane: wave lifecycle (schema-2 additive) ─────────────
 
 /**
@@ -309,11 +390,12 @@ export function isCtoResident(state: Pick<CtoState, "standby">): boolean {
  */
 export function appendWave(
   state: CtoState,
-  opts: { id: string; source: string; source_id: string; task: string; slice_ids?: string[]; now?: string },
+  opts: { id: string; source: string; source_id: string; task: string; slice_ids?: string[]; work_identity?: WorkIdentity; now?: string },
   root: string | null = null,
 ): CtoState {
   const history = state.wave_history ?? [];
   if (history.some((w) => w.source_id === opts.source_id)) return state;
+  if (opts.work_identity) assertTypedControlPlane({ work_identity: opts.work_identity });
   const record: WaveRecord = {
     id: opts.id,
     source: opts.source,
@@ -322,6 +404,7 @@ export function appendWave(
     slice_ids: opts.slice_ids ?? [],
     status: "active",
     started_at: opts.now ?? new Date().toISOString(),
+    ...(opts.work_identity ? { work_identity: opts.work_identity } : {}),
   };
   history.push(record);
   state.wave_history = history;

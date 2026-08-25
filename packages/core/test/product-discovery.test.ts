@@ -29,6 +29,7 @@ import {
 } from "@andvl1/omp-workflows-core";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
 import { createCapability, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
+import { checkpointPolicyHash, recordTrustedCheckpointAnswer, unresolvedCheckpointError } from "../src/engine/checkpoints.js";
 import { writeState } from "../src/engine/state.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
@@ -183,7 +184,8 @@ test("product-discovery: profile ships with the exact stage order and role wirin
   assert.equal(approval?.gate, "product_approval_recorded");
   assert.equal(approval?.produces, "product_approval_record");
   assert.match(approval?.autonomous ?? "", /never auto-approve/i);
-  assert.match(approval?.prompt ?? "", /mode=interactive/i);
+  assert.match(approval?.prompt ?? "", /authorization=human/i);
+  assert.match(approval?.prompt ?? "", /actor_provenance/i);
   assert.match(approval?.prompt ?? "", /proceed \| needs_more_validation \| defer \| reject/);
   assert.match(approval?.prompt ?? "", /no inferred consent|never self-approve/i);
 
@@ -422,34 +424,59 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
     );
 
     // 1. Advance with no durable decision fails closed: the gate fires its
-    //    no-decision diagnostic (gate 'product_approval_recorded' is not
-    //    satisfied) before the unresolved-checkpoint check, so no later
-    //    stage can run while the product owner has not answered.
+    //    no-decision diagnostic before the unresolved-checkpoint check.
     assert.equal((readState(root).checkpoint_decisions ?? []).length, 0, "no decision recorded yet");
     const noDecision = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" });
     assert.equal(noDecision.ok, false, "advance without a product decision must block");
     if (!noDecision.ok) assert.match(noDecision.error, /gate 'product_approval_recorded' is not satisfied/);
 
-    // 2. An autonomous decision is recorded durably but the gate still
-    //    rejects it: product approval requires an interactive human decision.
-    const autonomous = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "product_approval", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "auto-approve" });
-    assert.equal(autonomous.ok, true);
-    if (!autonomous.ok) return;
-    const autonomousRecord = readState(root).checkpoint_decisions?.[0];
-    assert.equal(autonomousRecord?.mode, "autonomous", "autonomous decision is persisted durably");
-    assert.equal(autonomousRecord?.decision, "proceed");
-    const rejected = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" });
-    assert.equal(rejected.ok, false, "an autonomous product approval decision must still block advance");
-    if (!rejected.ok) assert.match(rejected.error, /gate 'product_approval_recorded' is not satisfied/);
+    // 2. Legacy mode/actor input is rejected before it can authorize. The
+    //    checkpoint remains resumable and floor consent is needs_human.
+    const legacy = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "product_approval", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "auto-approve" });
+    assert.equal(legacy.ok, false, "legacy checkpoint input must fail closed");
+    if (!legacy.ok) assert.match(legacy.error, /typed checkpoint authorization and actor provenance/);
+    assert.equal((readState(root).typed_checkpoint_decisions ?? []).length, 0);
+    const unresolvedState = readState(root);
+    const unresolved = unresolvedCheckpointError(profile.stages.find((stage) => stage.id === "product_approval")!, unresolvedState);
+    assert.match(unresolved ?? "", /checkpoint_unresolved/);
+    assert.equal(unresolvedState.pause.kind, "needs_human");
+    writeState(root, unresolvedState, { featureSlug: "product-approval" });
+    assert.equal(readState(root).pause.kind, "needs_human");
 
-    // 3. An interactive allowed decision (proceed) replaces the record and
-    //    satisfies the gate, unblocking advance; with no next stage the
-    //    single-stage run completes.
-    const interactive = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "product_approval", mode: "interactive", decision: "proceed", actor: "Product Owner", rationale: "evidence supports it" });
+    // 3. An interactive answer must carry typed human provenance. The
+    //    adapter binds policy hash and capability epoch from the active state.
+    const beforeInteractive = readState(root);
+    const expectedPolicyHash = checkpointPolicyHash(beforeInteractive.checkpoint_policy!);
+    const trusted = recordTrustedCheckpointAnswer(beforeInteractive, {
+      answer_id: "product-owner/product_approval/1",
+      channel: "escalation",
+      reference: "escalation-answer/product-owner/product_approval/1",
+      stage_id: "product_approval",
+      checkpoint_id: "product_approval",
+      decision: "proceed",
+    });
+    writeState(root, trusted.state, { featureSlug: "product-approval" });
+    const expectedEpoch = beforeInteractive.dispatch_capability!.issued_for!.cursor_epoch;
+    const interactive = recordCheckpointDecision(root, {
+      ...advanceAuth(issued),
+      checkpoint: "product_approval",
+      checkpoint_kind: "product_approval",
+      decision: "proceed",
+      authorization: "human",
+      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
+      rationale: "evidence supports it",
+    });
     assert.equal(interactive.ok, true);
     if (!interactive.ok) return;
+    const typedRecord = readState(root).typed_checkpoint_decisions?.[0];
+    assert.equal(typedRecord?.authorization, "human");
+    assert.equal(typedRecord?.actor.kind, "user");
+    assert.equal(typedRecord?.actor.ref, trusted.answer.reference);
+    assert.deepEqual(typedRecord?.actor.proof, trusted.proof);
+    assert.equal(typedRecord?.capability_epoch, expectedEpoch);
+    assert.equal(typedRecord?.decision, "proceed");
     const interactiveRecord = readState(root).checkpoint_decisions?.[0];
-    assert.equal(interactiveRecord?.mode, "interactive", "interactive decision replaces the autonomous record");
+    assert.equal(interactiveRecord?.mode, "interactive");
     assert.equal(interactiveRecord?.decision, "proceed");
     const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" });
     assert.equal(advanced.ok, true, "an interactive proceed decision allows advance");

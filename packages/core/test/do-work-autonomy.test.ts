@@ -14,9 +14,11 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
-import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
+import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
+import { appendCheckpointDecision, checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
+import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
 import { registerTeamWorkflow } from "../src/index.js";
 import { resolveState, writeState } from "../src/engine/state.js";
 
@@ -38,6 +40,41 @@ function writeWorkflowState(root: string, state: Record<string, unknown>): void 
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
+}
+function recordTypedCheckpoint(root: string, stageId: string, checkpointId: string): void {
+  const resolved = resolveState(root);
+  assert.ok(resolved.state, "checkpoint fixture state must resolve");
+  const state = resolved.state!;
+  const policy = state.checkpoint_policy;
+  const capability = state.dispatch_capability;
+  assert.ok(policy, "checkpoint fixture must have a typed policy");
+  assert.ok(capability?.capability_id && capability.issued_for?.cursor_epoch, "checkpoint fixture must have a capability binding");
+  const rule = policy.rules[checkpointId];
+  assert.ok(rule, `checkpoint fixture must define ${checkpointId}`);
+  const runId = state.work_identity?.run_id ?? state.run_key ?? state.branch;
+  const trusted = recordTrustedCheckpointAnswer(state, {
+    answer_id: `do-work/${stageId}/${checkpointId}`,
+    channel: "terminal",
+    reference: `terminal-answer/do-work/${stageId}/${checkpointId}`,
+    stage_id: stageId,
+    checkpoint_id: checkpointId,
+    decision: "proceed",
+  });
+  const typed = {
+    run_id: runId,
+    stage_id: stageId,
+    checkpoint_id: checkpointId,
+    checkpoint_kind: rule.kind,
+    decision: "proceed",
+    authorization: "human" as const,
+    actor: { kind: "user" as const, ref: trusted.answer.reference, proof: trusted.proof },
+    capability_id: capability.capability_id,
+    capability_epoch: capability.issued_for!.cursor_epoch,
+    policy_hash: checkpointPolicyHash(policy),
+    rationale: "explicit typed fixture answer",
+    decided_at: new Date().toISOString(),
+  };
+  writeState(root, appendCheckpointDecision(trusted.state, typed), { target: resolved });
 }
 test("do-work: matching-branch state prompt is resumable", () => {
   const root = mkdtempSync(join(tmpdir(), "do-work-resume-match-"));
@@ -240,13 +277,13 @@ test("do-work: prompt renders the hint as NON-authoritative metadata", () => {
   const root = mkdtempSync(join(tmpdir(), "do-work-prompt-"));
   try {
     const on = buildDoWorkPrompt(parseWorkEnvelope("действуй автономно: Fix bug", root), root);
-    assert.ok(on.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): ON"), "hint ON rendered");
+    assert.ok(on.includes("Autonomy is YOUR decision for routing only"), "routing autonomy wording rendered");
     assert.ok(on.includes("Never copy the hint into persisted"), "hint must not be copied as the decision");
     assert.ok(!on.includes("state.autonomous: true"), "prompt must NOT instruct persisting the parsed flag");
     assert.ok(!on.includes("state.autonomous: false"), "prompt must NOT instruct persisting the parsed flag");
 
     const off = buildDoWorkPrompt(parseWorkEnvelope("[AUTONOMOUSLY] Fix bug", root), root);
-    assert.ok(off.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): OFF"), "hint OFF rendered");
+    assert.ok(off.includes("Autonomy is YOUR decision for routing only"), "routing autonomy wording rendered");
     assert.ok(off.includes("[AUTONOMOUSLY] Fix bug"), "task text carries the lookalike verbatim");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -282,7 +319,7 @@ test("P5 gate: natural-language autonomous task (hint false) is accepted as debu
     // The prompt hands the FULL task to the model and lets it decide true.
     const prompt = buildDoWorkPrompt(envelope, root);
     assert.ok(prompt.includes("Do this without waiting for approval"), "full task visible to PHASE-0");
-    assert.ok(prompt.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): OFF"), "hint OFF, not truth");
+    assert.ok(prompt.includes("Autonomy is YOUR decision for routing only"), "routing autonomy wording is explicit");
 
     // Model output: autonomous=true -> debug-cycle passes the gate.
     writeWorkflowState(root, {
@@ -303,8 +340,8 @@ test("P5 gate: [AUTONOMOUS] marker can be OVERRIDDEN by the model to interactive
     assert.equal(envelope.autonomyHint, true, "static hint is ON");
 
     const prompt = buildDoWorkPrompt(envelope, root);
-    assert.ok(prompt.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): ON"), "hint ON rendered");
-    assert.ok(prompt.includes("a marked task can still be interactive"), "prompt documents that the model may override");
+    assert.ok(prompt.includes("Autonomy is YOUR decision for routing only"), "routing autonomy wording rendered");
+    assert.ok(prompt.includes("does not authorize a checkpoint"), "prompt separates routing from checkpoint permission");
 
     // Model decides autonomous=false -> interactive bug-fix passes; debug-cycle blocks.
     writeWorkflowState(root, {
@@ -769,6 +806,8 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     assert.match(prompt, /native task result.*artifact completion/i);
     assert.match(prompt, /dod.*items.*MUST be objects/i);
     assert.match(prompt, /Before `workflow_advance`.*workflow_checkpoint/);
+    assert.match(prompt, /typed `workflow_checkpoint` envelope/);
+    assert.match(prompt, /actor_provenance/);
     assert.match(prompt, /compact first-30\/last-2 binding fingerprint/);
     assert.match(prompt, /workflow_\*.*main-session-only.*canonical `\.work-state`.*bash.*write/i);
 
@@ -782,6 +821,110 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("do-work: resume guidance is exactly seven ordered steps with no-micromanagement and typed marker discipline", () => {
+  const root = mkdtempSync(join(tmpdir(), "do-work-resume-contract-"));
+  try {
+    const prompt = buildDoWorkPrompt(parseWorkEnvelope("Continue the previous fix", root), root);
+    const resumeStart = prompt.indexOf("### Seven-step resume-from-disk contract");
+    const workerPolicyStart = prompt.indexOf("### NO-MICROMANAGEMENT WORKER POLICY");
+    assert.ok(resumeStart >= 0);
+    assert.ok(workerPolicyStart > resumeStart);
+    const resumeSection = prompt.slice(resumeStart, workerPolicyStart);
+    assert.deepEqual(resumeSection.match(/^\d+\. /gm), ["1. ", "2. ", "3. ", "4. ", "5. ", "6. ", "7. "]);
+    for (const label of [
+      "**Prepare**",
+      "**Resolve and validate selection**",
+      "**Freeze snapshot/capability**",
+      "**Authorize identity**",
+      "**Reconcile pending/terminal**",
+      "**Join/fan-in**",
+      "**Checkpoint/gate/advance**",
+    ]) {
+      assert.match(resumeSection, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    }
+    assert.match(prompt, /NO-MICROMANAGEMENT WORKER POLICY/);
+    assert.match(prompt, /Do not prescribe code shape, file edits, command sequences/);
+    assert.match(prompt, /Pending\/active workers.*Still Running.*neutral/);
+    assert.match(prompt, /typed marker.*missing or malformed/);
+    assert.match(prompt, /legacy alias.*autonomous\/completion claim/);
+    assert.match(prompt, /completion intent, free text, prompt wording/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("DoD gate: malformed and legacy artifacts fail closed while typed evidence passes", () => {
+  const valid = validateTypedDoD({
+    items: [{ criterion: "criterion", verify_method: "run the focused check", status: "met", evidence: "observed pass" }],
+  });
+  assert.equal(valid.ok, true);
+  assert.equal(validateTypedDoD({ items: ["criterion"] }).ok, false);
+  assert.equal(validateTypedDoD({ criteria: ["legacy"] }).ok, false);
+  assert.equal(validateTypedDoD({ items: [{ criterion: "criterion", status: "met" }] }).ok, false);
+
+  const root = mkdtempSync(join(tmpdir(), "dod-typed-backstop-"));
+  try {
+    const workState = join(root, ".work-state");
+    const artifacts = join(workState, "artifacts");
+    mkdirSync(artifacts, { recursive: true });
+    writeFileSync(join(workState, "team-state.json"), JSON.stringify({
+      stage_cursor: "summary",
+      pause: { kind: "done" },
+      classification: { workflow: "lightweight" },
+    }));
+    const dodPath = join(artifacts, "dod.json");
+    writeFileSync(join(workState, ".active-feature"), "../escape");
+    assert.equal(dodBackstop({}, { cwd: root }), undefined, "unsafe active-feature slug must fail closed before reading state");
+    rmSync(join(workState, ".active-feature"));
+
+    writeFileSync(dodPath, JSON.stringify({ items: [{ criterion: "criterion", status: "met", evidence: "observed pass" }] }));
+    const malformed = dodBackstop({}, { cwd: root });
+    assert.equal(malformed?.decision, "block");
+    assert.match(malformed?.reason ?? "", /malformed typed artifact/);
+
+    writeFileSync(dodPath, JSON.stringify({
+      items: [{ criterion: "criterion", verify_method: "run the focused check", status: "pending" }],
+    }));
+    const pending = dodBackstop({}, { cwd: root });
+    assert.equal(pending?.decision, "block");
+    assert.match(pending?.reason ?? "", /unmet or evidence-less/);
+
+    writeFileSync(dodPath, JSON.stringify({
+      items: [{ criterion: "criterion", verify_method: "run the focused check", status: "met", evidence: "observed pass" }],
+    }));
+    assert.deepEqual(dodBackstop({}, { cwd: root }), { continue: true });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("DoD gate: active, pending, waiting, polling, and temporary artifact states are neutral", () => {
+  const root = mkdtempSync(join(tmpdir(), "dod-neutral-runtime-"));
+  try {
+    const statePath = join(root, ".work-state", "team-state.json");
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    const transientStates: Record<string, unknown>[] = [
+      { worker: { status: "active" } },
+      { worker_status: "pending" },
+      { pause: { kind: "Still Running" } },
+      { wait: { kind: "nested wait" } },
+      { polling: { status: "polling" } },
+      { artifact_status: "temporary artifact absence" },
+    ];
+    for (const transient of transientStates) {
+      writeFileSync(statePath, JSON.stringify({
+        stage_cursor: "summary",
+        pause: { kind: "done" },
+        classification: { workflow: "lightweight" },
+        ...transient,
+      }));
+      assert.equal(dodBackstop({}, { cwd: root }), undefined);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 
 test("team and do-work use the same strict orchestration contract", () => {
   const root = mkdtempSync(join(tmpdir(), "team-alias-policy-"));
@@ -815,6 +958,10 @@ test("dispatch gate requires the exact active cursor stage and roster", async ()
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
     }));
     const { dispatchGate } = await import("../src/gates/dispatch.ts");
+    const missing = dispatchGate({ toolName: "task", input: { agent: "backend-kotlin", task: "Implement the stage without a marker" } }, { cwd: root });
+    assert.equal(missing?.block, true, "missing structured marker must fail closed");
+    const malformed = dispatchGate({ toolName: "task", input: { agent: "backend-kotlin", task: "<!-- omp-dispatch run=feat/test stage=implementation -->" } }, { cwd: root });
+    assert.equal(malformed?.block, true, "malformed structured marker must fail closed");
     const wrong = dispatchGate({ toolName: "task", input: { agent: "backend-kotlin", task: "<!-- omp-dispatch run=feat/test stage=discovery kind=single cursor=discovery roles=analyst -->" } }, { cwd: root });
     assert.equal(wrong?.block, true);
     const right = dispatchGate({ toolName: "task", input: { agent: "${scope.dev_agent}", role: "${scope.dev_agent}", task: `<!-- omp-dispatch run=feat/test stage=implementation kind=single cursor=${capability.state.issued_for?.cursor_epoch} roles=\${scope.dev_agent} -->` } }, { cwd: root });
@@ -944,20 +1091,10 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
     });
     assert.equal(replay.ok, true);
 
-    // lightweight implementation declares a checkpoint; record the durable
-    // decision before advance is allowed.
-    const checkpoint = recordCheckpointDecision(root, {
-      token: handoff.advance_token,
-      capability_id: handoff.capability_id,
-      run_key: handoff.run_key,
-      branch: handoff.branch,
-      workflow: handoff.workflow,
-      profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor,
-      cursor_epoch: handoff.cursor_epoch,
-      checkpoint: "approve_implementation", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "fixture",
-    });
-    assert.equal(checkpoint.ok, true);
+    // Checkpoint permission is a separate typed transition. Legacy
+    // mode/autonomous prose is migration input and cannot authorize advance.
+    recordTypedCheckpoint(root, "implementation", "approve_implementation");
+    assert.equal(resolveState(root).state?.typed_checkpoint_decisions?.length, 1);
 
     const advanced = advanceCursor(root, {
       token: handoff.advance_token,
@@ -970,7 +1107,7 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
       cursor_epoch: handoff.cursor_epoch,
       evidence: "implementation completed",
     });
-    assert.equal(advanced.ok, true);
+    assert.equal(advanced.ok, true, advanced.ok ? undefined : advanced.error);
     if (!advanced.ok) return;
     assert.equal(advanced.state.stage_cursor, "code_review");
     assert.equal(advanced.handoff?.expected_roster[0]?.role, "code-reviewer");
@@ -1133,13 +1270,14 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
     const begun = beginCapability(root);
     assert.equal(begun.ok, true);
     if (!begun.ok || !begun.handoff) return;
+    const markerFor = (role: string) => begun.handoff!.dispatch_markers.find((entry) => entry.role === role)?.marker ?? "";
     const request = trustedDispatchRequests({
       toolName: "task",
       toolCallId: "tool-batch",
       input: {
         tasks: [
-          { role: "code-reviewer", agent: "code-reviewer", task: "review the branch" },
-          { role: "qa", agent: "qa", task: "check the branch" },
+          { role: "code-reviewer", agent: "code-reviewer", task: markerFor("code-reviewer") },
+          { role: "qa", agent: "qa", task: markerFor("qa") },
         ],
       },
     }, { cwd: root });
@@ -1150,15 +1288,19 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
       assert.equal(authorizeDispatchTrusted(root, authorization).ok, true);
     }
 
-    const reconciled = reconcileTrustedTaskResult(root, {
-      tool_call_id: "tool-batch",
-      outcome: "succeeded",
-      evidence: "batch completed",
-    });
-    assert.equal(reconciled.ok, true);
-    if (!reconciled.ok) return;
+    for (const authorization of request.requests) {
+      const reconciled = reconcileTrustedTaskResult(root, {
+        tool_call_id: authorization.tool_call_id,
+        slot_id: authorization.slot_id,
+        task_id: authorization.task_id,
+        outcome: "succeeded",
+        evidence: `batch completed for ${authorization.slot_id}`,
+      });
+      assert.equal(reconciled.ok, true);
+    }
+    const reconciledState = resolveState(root).state;
     assert.deepEqual(
-      reconciled.state.dispatch_capability?.dispatches.map((dispatch) => dispatch.status),
+      reconciledState?.dispatch_capability?.dispatches.map((dispatch) => dispatch.status),
       ["succeeded", "succeeded"],
     );
   } finally {
@@ -1232,12 +1374,8 @@ test("advance handoff resolves the next stage roster", () => {
       evidence: "task completed",
     });
     assert.equal(completed.ok, true);
-    const checkpoint = recordCheckpointDecision(root, {
-      ...authInput,
-      token: issued.advance_token,
-      checkpoint: "approve_implementation", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "fixture",
-    });
-    assert.equal(checkpoint.ok, true);
+    recordTypedCheckpoint(root, "implementation", "approve_implementation");
+    assert.equal(resolveState(root).state?.typed_checkpoint_decisions?.length, 1);
     const advanced = advanceCursor(root, {
       ...authInput,
       token: issued.advance_token,

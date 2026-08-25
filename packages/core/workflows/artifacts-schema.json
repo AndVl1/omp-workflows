@@ -307,7 +307,7 @@
     },
     "product_approval_record": {
       "type": "object",
-      "description": "Durable record of the human product-owner approval. Interactive only — product approval is never auto-approved or inferred; the decision must be exactly one of proceed|needs_more_validation|defer|reject, recorded via workflow_checkpoint with mode=interactive.",
+      "description": "Durable record of the human product-owner approval. Interactive only — product approval is never auto-approved or inferred; the decision must be exactly one of proceed|needs_more_validation|defer|reject, recorded via workflow_checkpoint with checkpoint_kind=product_approval, authorization=human, and actor_provenance bound to the product-owner answer.",
       "required": ["decision", "approved_by", "rationale", "decided_at"],
       "properties": {
         "decision": {

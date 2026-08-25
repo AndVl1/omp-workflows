@@ -6,8 +6,27 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { dispatchGate, createCapability, authorizeDispatch, completeDispatch, loadProfile } from "@andvl1/omp-workflows-core";
-import { registerWorkflowTools } from "../src/index.js";
+import {
+  dispatchGate,
+  createCapability,
+  authorizeDispatch,
+  completeDispatch,
+  loadProfile,
+  claimWorkflowOwner,
+  resetWorkflowOwners,
+  workflowOwnerFor,
+  setCtoControlPlane,
+  setTeamControlPlane,
+  recordWorkPending,
+  recordWorkTerminal,
+} from "@andvl1/omp-workflows-core";
+import {
+  FULLSTACK_BUNDLE_ID,
+  fullstackOwnerForCwd,
+  fullstackPreset,
+  registerWorkflowTools,
+} from "../src/index.js";
+
 function profileHash(profile: unknown): string {
   const canonicalize = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(canonicalize);
@@ -119,8 +138,9 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
     assert.deepEqual(
       markers.map(({ role, agent }) => ({ role, agent })),
       [
-        { role: "analyst", agent: "analyst" },
+        { role: "analyst#1", agent: "analyst" },
         { role: "tech-researcher", agent: "tech-researcher" },
+        { role: "analyst#2", agent: "analyst" },
       ],
     );
     for (const marker of markers) {
@@ -506,4 +526,90 @@ test("fullstack: mutable schema defaults are factories", () => {
       registerTool() {},
     } as never);
   });
+});
+test("fullstack: explicit preset feeds the core owner-aware service", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-fullstack-owner-"));
+  try {
+    assert.equal(fullstackPreset.roles["backend-kotlin"], "developer-kotlin");
+    assert.ok(fullstackPreset.scopeMap.some(entry => entry.scope === "frontend"));
+    assert.ok(fullstackPreset.flags.has_security?.includes("**/auth/**"));
+    assert.ok(fullstackPreset.modelRoles.some(entry => entry.role === "architect"));
+
+    const owner = fullstackOwnerForCwd(root);
+    assert.equal(owner.owner_id, FULLSTACK_BUNDLE_ID);
+    assert.equal(owner.bundle_id, FULLSTACK_BUNDLE_ID);
+    assert.equal(owner.provenance.cwd, root);
+
+    const first = claimWorkflowOwner(root, "workflow_registration", owner);
+    assert.equal(first.ok, true);
+    const repeat = claimWorkflowOwner(root, "workflow_registration", owner);
+    assert.equal(repeat.ok, true);
+    assert.equal(repeat.ok && repeat.idempotent, true);
+
+    const conflict = claimWorkflowOwner(root, "workflow_registration", {
+      ...owner,
+      owner_id: "private-omp",
+    });
+    assert.equal(conflict.ok, false);
+    assert.equal(!conflict.ok && conflict.code, "owner_conflict");
+    assert.equal(workflowOwnerFor(root, "workflow_registration")?.owner.owner_id, FULLSTACK_BUNDLE_ID);
+  } finally {
+    resetWorkflowOwners(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fullstack: workflow_checkpoint accepts only the typed decision envelope", () => {
+  const tools = new Map<string, RegisteredTool>();
+  registerWorkflowTools({
+    zod: { z },
+    registerTool(tool: RegisteredTool) {
+      tools.set(tool.name, tool);
+    },
+  } as never);
+  const checkpoint = tools.get("workflow_checkpoint")!;
+  const parameters = checkpoint.parameters as { safeParse(input: unknown): { success: boolean } };
+  const typedEnvelope = {
+    token: "token",
+    capability_id: "capability",
+    run_key: "run",
+    branch: "main",
+    workflow: "product-discovery",
+    profile_hash: "profile-hash",
+    stage_cursor: "product_approval",
+    cursor_epoch: "epoch",
+    checkpoint: "product_approval",
+    checkpoint_id: "product-approval-1",
+    checkpoint_kind: "product_approval",
+    authorization: "human",
+    actor_provenance: {
+      kind: "user",
+      ref: "terminal-answer/product-owner/1",
+      proof: {
+        answer_id: "product-owner/1",
+        nonce: "durable-nonce",
+        channel: "terminal",
+        reference: "terminal-answer/product-owner/1",
+        binding: "durable-binding",
+      },
+    },
+    decision: "proceed",
+    rationale: "evidence supports the decision",
+  };
+  assert.equal(parameters.safeParse(typedEnvelope).success, true);
+  assert.equal(
+    parameters.safeParse({
+      ...typedEnvelope,
+      mode: "interactive",
+      actor: "user",
+    }).success,
+    false,
+  );
+  assert.equal(parameters.safeParse({ ...typedEnvelope, unexpected: true }).success, false);
+});
+
+test("fullstack: F7 core lifecycle exports remain public", () => {
+  for (const hook of [setCtoControlPlane, setTeamControlPlane, recordWorkPending, recordWorkTerminal]) {
+    assert.equal(typeof hook, "function");
+  }
 });

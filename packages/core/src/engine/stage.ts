@@ -20,17 +20,26 @@
  * the artifact. See `gates/validation.ts` for the full contract.
  */
 
-import { buildDispatchMarker } from "../gates/dispatch.js";
+import { buildDispatchMarker, dispatchTaskId } from "../gates/dispatch.js";
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { persistReturnedArtifacts, readArtifact, writeArtifact } from "./artifacts.js";
 import { resolveConfig } from "./config.js";
-import { resolveScope, applyConditional, type ScopeFlags } from "./scope.js";
+import { type ScopeFlags } from "./scope.js";
 import { evaluatePredicate } from "./predicate.js";
 import { namespacedArtifactId, sanitizeSlot } from "./fan-in.js";
 import { PRD_SOURCE_ARTIFACT_IDS, validateProductPrdDocument, writeProductPrdDocument } from "./product-prd.js";
 import { checkArtifact as validationCheckArtifact, validationGate } from "../gates/validation.js";
-import type { DispatchSlot, Profile, StageDef, TeamState } from "./types.js";
+import type {
+  DispatchSlot,
+  Profile,
+  RosterPolicy,
+  RosterSelection,
+  RosterSelectionEntry,
+  StageDef,
+  TeamState,
+} from "./types.js";
 
 export interface StageContext {
   cwd: string;
@@ -57,6 +66,7 @@ export interface StageContext {
   durable?: {
     authorize: (role: string, agent: string) => { ok: true; dispatchId: string } | { ok: false; error: string };
     complete: (dispatchId: string, output: string, outcome: "succeeded" | "failed", artifactIds?: string[]) => { ok: true } | { ok: false; error: string };
+    pending?: (dispatchId: string, reason?: "provider_running" | "awaiting_result" | "transport_reconnect", providerRef?: string) => { ok: true } | { ok: false; error: string };
     advance: (evidence: string) => { ok: true; handoff?: { capability_id: string; dispatch_token: string; advance_token: string; cursor_epoch: string } } | { ok: false; error: string };
   };
 }
@@ -116,9 +126,14 @@ export interface TaskCaller {
     }>;
   }): Promise<TaskResult[]>;
 }
-
 export interface TaskResult {
+  /** Provider result identity. Positional-only batch rows are rejected. */
   id: string;
+  slot_id?: string;
+  task_id?: string;
+  dispatch_id?: string;
+  capability_id?: string;
+  capability_epoch?: string;
   output: string;
   artifacts: Record<string, string>;
   exitCode: number;
@@ -128,10 +143,16 @@ export interface TaskResult {
 
 /**
  * Normalized task-tool payload. Native OMP results expose these fields under
- * `details.results`; the legacy adapter shape puts one payload under `output`.
+ * `details.results`; the legacy adapter shape puts one payload under
+ * `output`.
  */
 interface SingleSpawnPayload {
   id?: string;
+  slot_id?: string;
+  task_id?: string;
+  dispatch_id?: string;
+  capability_id?: string;
+  capability_epoch?: string;
   output?: string;
   artifacts?: Record<string, string>;
   exitCode?: number;
@@ -171,7 +192,23 @@ function taskIsPending(value: unknown): boolean {
 
 function readSingleSpawn(raw: unknown): SingleSpawnPayload {
   if (!isObject(raw)) return {};
+  const identity = isObject(raw.work_identity) ? raw.work_identity : raw;
   const id = typeof raw.id === "string" ? raw.id : undefined;
+  const slot_id = typeof raw.slot_id === "string"
+    ? raw.slot_id
+    : typeof identity.slot_id === "string" ? identity.slot_id : undefined;
+  const task_id = typeof raw.task_id === "string"
+    ? raw.task_id
+    : typeof identity.task_id === "string" ? identity.task_id : undefined;
+  const dispatch_id = typeof raw.dispatch_id === "string"
+    ? raw.dispatch_id
+    : typeof identity.dispatch_id === "string" ? identity.dispatch_id : undefined;
+  const capability_id = typeof raw.capability_id === "string"
+    ? raw.capability_id
+    : typeof identity.capability_id === "string" ? identity.capability_id : undefined;
+  const capability_epoch = typeof raw.capability_epoch === "string"
+    ? raw.capability_epoch
+    : typeof identity.capability_epoch === "string" ? identity.capability_epoch : undefined;
   const output = typeof raw.output === "string" ? raw.output : undefined;
   const exitCode = typeof raw.exitCode === "number" ? raw.exitCode : undefined;
   const error = typeof raw.error === "string" ? raw.error : undefined;
@@ -179,17 +216,22 @@ function readSingleSpawn(raw: unknown): SingleSpawnPayload {
   if (isObject(raw.artifacts) && Object.values(raw.artifacts).every((v) => typeof v === "string")) {
     artifacts = Object.fromEntries(Object.entries(raw.artifacts)) as Record<string, string>;
   }
-  return { id, output, artifacts, exitCode, error };
+  return { id, slot_id, task_id, dispatch_id, capability_id, capability_epoch, output, artifacts, exitCode, error };
 }
 
 function extractPayload(raw: unknown, newId: () => string): TaskResult {
-  const value = isObject(raw) && "output" in raw && !("id" in raw || "exitCode" in raw || "artifacts" in raw || "error" in raw)
+  const value = isObject(raw) && "output" in raw && !("id" in raw || "exitCode" in raw || "artifacts" in raw || "error" in raw || "slot_id" in raw || "task_id" in raw)
     ? raw.output
     : raw;
   if (isObject(value)) {
     const r = readSingleSpawn(value);
     return {
       id: r.id ?? newId(),
+      ...(r.slot_id ? { slot_id: r.slot_id } : {}),
+      ...(r.task_id ? { task_id: r.task_id } : {}),
+      ...(r.dispatch_id ? { dispatch_id: r.dispatch_id } : {}),
+      ...(r.capability_id ? { capability_id: r.capability_id } : {}),
+      ...(r.capability_epoch ? { capability_epoch: r.capability_epoch } : {}),
       output: r.output ?? JSON.stringify(value),
       artifacts: r.artifacts ?? {},
       exitCode: r.exitCode ?? 0,
@@ -215,6 +257,31 @@ function extractResult(raw: unknown, newId: () => string): TaskResult {
     if (text) return { ...result, output: text };
   }
   return result;
+}
+
+/**
+ * Native TaskTool batch results may omit assignment identity. The trusted
+ * adapter can bind a purely positional, exact-count response to the frozen
+ * task names before the engine's strict pairing step. Mixed identity,
+ * duplicate/missing names, and count mismatches remain unbound so pairing
+ * fails closed instead of guessing.
+ */
+function stampPositionalBatchIdentity(
+  tasks: Array<{ name?: string }>,
+  results: TaskResult[],
+): TaskResult[] {
+  if (results.length === 0 || results.length !== tasks.length) return results;
+  const names = tasks.map((task) => task.name);
+  if (names.some((name) => typeof name !== "string" || name.length === 0)) return results;
+  if (new Set(names).size !== names.length) return results;
+  const positionalOnly = results.every((result) =>
+    !result.slot_id && !result.task_id && !result.dispatch_id,
+  );
+  if (!positionalOnly) return results;
+  return results.map((result, index) => ({
+    ...result,
+    task_id: names[index]!,
+  }));
 }
 
 /**
@@ -250,7 +317,10 @@ export function createTaskCaller(tool: TaskToolLike): TaskCaller {
 			};
 			const result = await tool.execute(newId(), params);
 			const results = taskResultRows(result);
-			if (results.length > 0) return results.map((r) => extractPayload(r, newId));
+			if (results.length > 0) {
+				const normalized = results.map((r) => extractPayload(r, newId));
+				return stampPositionalBatchIdentity(args.tasks, normalized);
+			}
 			if (taskIsPending(result)) return [];
 			return [];
 		},
@@ -384,19 +454,26 @@ async function runSingle(stage: StageDef, ctx: StageContext, produces: string[])
   if (authorized && !authorized.ok) return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${authorized.error}`, artifacts: produces };
   let result: TaskResult;
   try {
-    result = await ctx.task.call({ agent, task });
+    result = await ctx.task.call({ agent, task, name: `${stage.id}-${slot.slot}` });
   } catch (error) {
     if (authorized?.ok) failAuthorizedDispatches(ctx, [authorized], `task call failed: ${String(error)}`);
     return { stageId: stage.id, status: "failed", note: `${agent} task call failed: ${String(error)}`, artifacts: produces };
   }
+  if (result.pending) {
+    if (authorized?.ok && ctx.durable?.pending) {
+      const pending = ctx.durable.pending(authorized.dispatchId, "provider_running", result.id);
+      if (!pending.ok) return { stageId: stage.id, status: "failed", note: `dispatch pending transition failed: ${pending.error}`, artifacts: produces };
+    }
+    return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} remains active`, artifacts: produces };
+  }
   const persisted = persistTaskArtifacts(ctx, result);
-  const outcome = result.exitCode === 0 && !result.pending && !persisted.error ? "succeeded" : "failed";
+  const outcome = result.exitCode === 0 && !persisted.error ? "succeeded" : "failed";
   if (authorized) {
     const completed = ctx.durable!.complete(authorized.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids);
     if (!completed.ok) return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
   }
   if (persisted.error) return { stageId: stage.id, status: "failed", note: persisted.error, artifacts: produces };
-  if (result.exitCode !== 0 || result.pending) return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} returned exit ${result.exitCode}`, artifacts: produces };
+  if (result.exitCode !== 0) return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} returned exit ${result.exitCode}`, artifacts: produces };
   return validateProduced(stage, ctx, produces, `${agent} returned exit 0`);
 }
 
@@ -446,6 +523,27 @@ async function runProductPrdRender(stage: StageDef, ctx: StageContext, produces:
   ctx.log(`  product_prd: deterministic render -> ${written.documentPath}`);
   return validateProduced(stage, ctx, produces, `deterministic product PRD rendered to ${written.documentPath}`);
 }
+function pairConsiliumResults(roster: DispatchSlot[], tasks: Array<{ name?: string }>, results: TaskResult[]): { ok: true; paired: Array<{ slot: DispatchSlot; result: TaskResult }> } | { ok: false; error: string } {
+  const bySlot = new Map<string, TaskResult>();
+  for (const result of results) {
+    const explicitTaskIndex = result.id ? tasks.findIndex((task) => task.name === result.id) : -1;
+    const taskIdentityIndex = result.task_id ? tasks.findIndex((task) => task.name === result.task_id) : -1;
+    if (explicitTaskIndex >= 0 && taskIdentityIndex >= 0 && explicitTaskIndex !== taskIdentityIndex) {
+      return { ok: false, error: "task batch result carries conflicting task identity" };
+    }
+    const taskIndex = explicitTaskIndex >= 0 ? explicitTaskIndex : taskIdentityIndex;
+    const slotId = result.slot_id
+      ?? (taskIndex >= 0 ? roster[taskIndex]?.slot : undefined)
+      ?? result.task_id;
+    if (!slotId) return { ok: false, error: "task batch result lacks slot/task identity; positional-only reconciliation is forbidden" };
+    const slot = roster.find((candidate) => candidate.slot === slotId || candidate.slot_id === slotId);
+    if (!slot) return { ok: false, error: `task batch result references unknown slot '${slotId}'` };
+    if (bySlot.has(slot.slot)) return { ok: false, error: `task batch returned duplicate result for slot '${slot.slot}'` };
+    bySlot.set(slot.slot, result);
+  }
+  if (bySlot.size !== roster.length) return { ok: false, error: "task batch result set is incomplete or ambiguous" };
+  return { ok: true, paired: roster.map((slot) => ({ slot, result: bySlot.get(slot.slot)! })) };
+}
 
 async function runConsilium(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
   const roster = resolveStageDispatchSlots(stage, ctx);
@@ -470,28 +568,38 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
     failAuthorizedDispatches(ctx, authorized, `task batch returned ${results.length}/${tasks.length} results`);
     return { stageId: stage.id, status: "failed", note: `task batch returned ${results.length}/${tasks.length} results`, artifacts: produces };
   }
-  for (let i = 0; i < results.length; i++) {
-    const auth = authorized[i];
+  const paired = pairConsiliumResults(roster, tasks, results);
+  if (!paired.ok) {
+    failAuthorizedDispatches(ctx, authorized, paired.error);
+    return { stageId: stage.id, status: "failed", note: paired.error, artifacts: produces };
+  }
+  for (const { slot, result } of paired.paired) {
+    const auth = authorized[roster.findIndex((candidate) => candidate.slot === slot.slot)];
+    if (result.pending) {
+      if (auth?.ok && ctx.durable?.pending) {
+        const pending = ctx.durable.pending(auth.dispatchId, "provider_running", result.id);
+        if (!pending.ok) return { stageId: stage.id, status: "failed", note: `dispatch pending transition failed: ${pending.error}`, artifacts: produces };
+      }
+      continue;
+    }
     if (auth?.ok) {
-      const result = results[i]!;
-      const slot = roster[i]!.slot;
       const persisted = multiSlot
-        ? persistConsiliumSlotArtifacts(ctx, slot, result, produces)
+        ? persistConsiliumSlotArtifacts(ctx, slot.slot, result, produces)
         : persistTaskArtifacts(ctx, result);
-      const outcome = result.exitCode === 0 && !result.pending && !persisted.error ? "succeeded" : "failed";
+      const outcome = result.exitCode === 0 && !persisted.error ? "succeeded" : "failed";
       const completed = ctx.durable!.complete(auth.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids);
       if (!completed.ok) {
-        failAuthorizedDispatches(ctx, authorized.slice(i), `dispatch completion failed: ${completed.error}`);
+        failAuthorizedDispatches(ctx, authorized.slice(roster.findIndex((candidate) => candidate.slot === slot.slot) + 1), `dispatch completion failed: ${completed.error}`);
         return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
       }
       if (persisted.error) {
-        failAuthorizedDispatches(ctx, authorized.slice(i + 1), persisted.error);
+        failAuthorizedDispatches(ctx, authorized.slice(roster.findIndex((candidate) => candidate.slot === slot.slot) + 1), persisted.error);
         return { stageId: stage.id, status: "failed", note: persisted.error, artifacts: produces };
       }
     }
   }
-  const failed = results.filter((r) => r.exitCode !== 0 || r.pending);
-  if (failed.length > 0) return { stageId: stage.id, status: "failed", note: `${failed.length}/${tasks.length} failed`, artifacts: produces };
+  const failed = paired.paired.filter(({ result }) => result.exitCode !== 0 || result.pending);
+  if (failed.length > 0) return { stageId: stage.id, status: "failed", note: `${failed.length}/${tasks.length} failed or pending`, artifacts: produces };
   return validateProduced(stage, ctx, produces, `${tasks.length} agents in parallel`, multiSlot ? roster : undefined);
 }
 
@@ -662,8 +770,13 @@ function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string, slot
   const roleHint = isOrchestratorRole(role)
     ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
     : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
+  const capability = ctx.state.dispatch_capability;
+  const markerCapabilityId = capability?.capability_id;
+  const markerTaskId = markerCapabilityId
+    ? dispatchTaskId(markerCapabilityId, capability.issued_for?.run_key ?? ctx.state.run_key ?? ctx.state.branch, capability.issued_for?.branch ?? ctx.state.branch, capability.issued_for?.workflow ?? ctx.state.classification.workflow, stage.id, role)
+    : undefined;
   const dispatchMarker = stage.type === "single" || stage.type === "consilium"
-    ? buildDispatchMarker(ctx.state.run_key ?? ctx.state.branch, stage, resolveStageDispatchSlots(stage, ctx).map((slot) => slot.slot), role, ctx.state.cursor_epoch ?? stage.id)
+    ? buildDispatchMarker(ctx.state.run_key ?? ctx.state.branch, stage, resolveStageDispatchSlots(stage, ctx).map((slot) => slot.slot), role, ctx.state.cursor_epoch ?? stage.id, markerCapabilityId, role, markerTaskId)
     : "";
   const durableBinding = dispatchMarker
     ? `run_key=${ctx.state.run_key ?? ctx.state.branch} branch=${ctx.state.branch} workflow=${ctx.state.classification.workflow} profile_hash=${ctx.state.profile_hash ?? ""} stage_cursor=${stage.id} cursor_epoch=${ctx.state.cursor_epoch ?? ""}`
@@ -713,12 +826,26 @@ function isOrchestratorRole(role: string): boolean {
  */
 export function resolveStageDispatchSlots(
   stage: StageDef,
-  ctx: Pick<StageContext, "flags" | "cwd" | "resolveDevAgent">,
+  ctx: Pick<StageContext, "flags" | "cwd" | "resolveDevAgent"> & { state?: TeamState },
 ): DispatchSlot[] {
+  if (stage.roster_policy && ctx.state) {
+    const persisted = ctx.state.roster_selection?.stage_id === stage.id
+      ? ctx.state.roster_selection
+      : ctx.state.roster_selections?.[stage.id];
+    if (persisted && persisted.capability_epoch === (ctx.state.cursor_epoch ?? persisted.capability_epoch)) {
+      return persisted.selected.map((entry) => ({
+        slot: entry.slot_id,
+        slot_id: entry.slot_id,
+        role: entry.role,
+        occurrence: entry.occurrence,
+        facet: entry.facet,
+      }));
+    }
+  }
   const base = stage.type === "single" ? [stage.role ?? ""] : stage.roles ?? [];
   const expanded = base.map((role) => expandRole(role, ctx));
   const conditioned = stage.type === "consilium"
-    ? applyConditional(expanded, stage.conditional, ctx.flags)
+    ? applyConditionalOccurrences(expanded, stage.conditional, ctx.flags)
     : expanded;
   const roster = applyRosterOverrides(conditioned, ctx.cwd, stage.id).map((role) => expandRole(role, ctx));
   return normalizeDispatchSlots(roster);
@@ -762,16 +889,339 @@ function expandRole(role: string, ctx: Pick<StageContext, "resolveDevAgent">): s
   return role;
 }
 
+function conditionalFlag(expr: string, flags: ScopeFlags): boolean {
+  const value = expr.trim();
+  const negated = value.startsWith("!");
+  const key = (negated ? value.slice(1) : value).replace(/^scope\./, "");
+  const supported: Record<string, boolean> = {
+    has_security: flags.has_security,
+    has_infra: flags.has_infra,
+    has_ui: flags.has_ui,
+    has_runtime: flags.has_runtime,
+  };
+  if (!(key in supported)) return false;
+  return negated ? !(supported[key] ?? false) : (supported[key] ?? false);
+}
+
+/** Apply conditional changes without collapsing repeated semantic occurrences. */
+function applyConditionalOccurrences(
+  roster: string[],
+  conditional: Array<{ if: string; add?: string; remove?: string }> | undefined,
+  flags: ScopeFlags,
+): string[] {
+  const result = [...roster];
+  for (const rule of conditional ?? []) {
+    if (!conditionalFlag(rule.if, flags)) continue;
+    if (rule.add) result.push(rule.add);
+    if (rule.remove) {
+      for (let index = result.length - 1; index >= 0; index -= 1) {
+        if (result[index] === rule.remove) result.splice(index, 1);
+      }
+    }
+  }
+  return result;
+}
+
 function applyRosterOverrides(roster: string[], cwd: string, stageId: string): string[] {
   const config = resolveConfig(cwd);
   const override = config.roster_overrides[stageId];
-  if (!override) return roster;
-  if (override.replace) return override.replace;
-  const result = new Set(roster);
-  for (const r of override.add ?? []) result.add(r);
-  for (const r of override.remove ?? []) result.delete(r);
-  return Array.from(result);
+  if (!override) return [...roster];
+  if (override.replace) return [...override.replace];
+  const result = [...roster];
+  for (const role of override.add ?? []) result.push(role);
+  for (const role of override.remove ?? []) {
+    for (let index = result.length - 1; index >= 0; index -= 1) {
+      if (result[index] === role) result.splice(index, 1);
+    }
+  }
+  return result;
 }
+export interface RosterSelectionOccurrence {
+  role: string;
+  facet?: string | null;
+  focus?: string;
+  reason?: string;
+  /** Caller-supplied concrete agents are checked, never trusted. */
+  agent?: string;
+}
+
+export interface RosterSelectionContext {
+  cwd: string;
+  flags: ScopeFlags;
+  resolveDevAgent: () => string | null;
+  state?: TeamState;
+  profile_hash?: string;
+  policy_hash?: string;
+  mapping_hash?: string;
+  run_key?: string;
+  wave_id?: string;
+  slice_id?: string;
+  session_id?: string;
+  workflow?: string;
+  capability_epoch?: string;
+  selected_occurrences?: RosterSelectionOccurrence[];
+  rationale?: string;
+  evidence?: string[];
+  /** Reuse is explicit and only valid for the same capability epoch. */
+  existing_selection?: RosterSelection;
+  resolveAgent?: (role: string) => string;
+}
+
+export type RosterSelectionResult =
+  | { ok: true; selection: RosterSelection; slots: DispatchSlot[]; expected_roster: Array<{ role: string; agent: string }> }
+  | { ok: false; error: string; code: "policy_invalid" | "selection_invalid" | "mapping_invalid" | "selection_conflict" };
+
+function canonicalRosterValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalRosterValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, canonicalRosterValue(item)]),
+    );
+  }
+  return value;
+}
+
+function rosterHash(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(canonicalRosterValue(value))).digest("hex");
+}
+
+function rosterPolicyIssues(stage: StageDef, policy: RosterPolicy): string[] {
+  const issues: string[] = [];
+  const dispatchStage = stage.type === "single" || stage.type === "consilium";
+  if (!dispatchStage) {
+    if (policy.allowed_roles.length !== 0 || policy.min_workers !== 0 || policy.max_workers !== 0) issues.push("non-dispatch stage roster must be empty");
+    return issues;
+  }
+  if (policy.allowed_roles.length === 0) issues.push("allowed_roles must not be empty");
+  if (!Number.isInteger(policy.min_workers) || !Number.isInteger(policy.max_workers) || policy.min_workers < 1 || policy.max_workers < policy.min_workers) {
+    issues.push("worker bounds are invalid");
+  }
+  if (stage.type === "single" && (policy.min_workers !== 1 || policy.max_workers !== 1)) issues.push("single stages require exactly one worker");
+  const allowed = new Set(policy.allowed_roles);
+  for (const role of policy.required_roles) if (!allowed.has(role)) issues.push(`required role '${role}' is outside allowed_roles`);
+  let minimum = 0;
+  for (const [role, bound] of Object.entries(policy.multiplicity)) {
+    if (!allowed.has(role)) issues.push(`multiplicity role '${role}' is outside allowed_roles`);
+    if (!Number.isInteger(bound.min) || !Number.isInteger(bound.max) || bound.min < 0 || bound.max < bound.min) issues.push(`multiplicity bounds for '${role}' are invalid`);
+    minimum += Number.isInteger(bound.min) ? bound.min : 0;
+  }
+  if (minimum > policy.max_workers) issues.push("sum of multiplicity minima exceeds max_workers");
+  if (policy.required_roles.some((role) => (policy.multiplicity[role]?.max ?? policy.max_workers) < 1)) issues.push("required role has zero maximum multiplicity");
+  if (typeof policy.prefer_distinct_agents !== "boolean") issues.push("prefer_distinct_agents must be boolean");
+  if (policy.selection_mode !== "pre_dispatch_minimum_valid") issues.push("selection_mode is unsupported");
+  if (!policy.budget || (policy.budget.token_limit !== null && (!Number.isFinite(policy.budget.token_limit) || policy.budget.token_limit < 0)) || (policy.budget.dollar_limit !== null && (!Number.isFinite(policy.budget.dollar_limit) || policy.budget.dollar_limit < 0))) {
+    issues.push("budget is invalid");
+  }
+  return issues;
+}
+
+function triggerFacts(stage: StageDef, ctx: RosterSelectionContext): string[] {
+  const policy = stage.roster_policy!;
+  const classification = ctx.state?.classification;
+  const facts: string[] = [];
+  if (classification && policy.triggers.complexity.includes(classification.complexity)) facts.push(`complexity:${classification.complexity}`);
+  if (classification && policy.triggers.confidence.includes(classification.confidence)) facts.push(`confidence:${classification.confidence}`);
+  for (const flag of policy.triggers.scope_flags) {
+    const enabled = flag === "has_security"
+      ? ctx.flags.has_security
+      : flag === "has_infra"
+        ? ctx.flags.has_infra
+        : flag === "has_ui"
+          ? ctx.flags.has_ui
+          : flag === "has_runtime"
+            ? ctx.flags.has_runtime
+            : ctx.flags.scope.includes(flag);
+    if (enabled) facts.push(`scope:${flag}`);
+  }
+  for (const evidence of ctx.evidence ?? []) {
+    if (policy.triggers.evidence.some((needle) => evidence.includes(needle))) facts.push(`evidence:${evidence}`);
+  }
+  return [...new Set(facts)];
+}
+
+function selectionRoleBound(policy: RosterPolicy, role: string): { min: number; max: number } {
+  return policy.multiplicity[role] ?? { min: policy.required_roles.includes(role) ? 1 : 0, max: policy.max_workers };
+}
+
+function selectionRoleAgent(role: string, ctx: RosterSelectionContext): string | null {
+  const config = resolveConfig(ctx.cwd);
+  const resolved = ctx.resolveAgent?.(role) ?? config.agent_mapping?.resolved_roles[role] ?? config.roles[role] ?? role;
+  return resolved.trim() || null;
+}
+
+function normalizeSelectionEntries(
+  roles: string[],
+  occurrences: RosterSelectionOccurrence[],
+): { entries: RosterSelectionEntry[]; slots: DispatchSlot[] } {
+  const counts = new Map<string, number>();
+  for (const role of roles) counts.set(role, (counts.get(role) ?? 0) + 1);
+  const seen = new Map<string, number>();
+  const slots = roles.map((role) => {
+    const occurrence = (seen.get(role) ?? 0) + 1;
+    seen.set(role, occurrence);
+    const slot = (counts.get(role) ?? 0) > 1 ? `${role}#${occurrence}` : role;
+    return { slot, slot_id: slot, role, occurrence };
+  });
+  const entries = slots.map((slot, index) => {
+    const proposal = occurrences[index];
+    return {
+      slot_id: slot.slot,
+      role: slot.role,
+      occurrence: slot.occurrence ?? 1,
+      facet: proposal?.facet ?? null,
+      agent: proposal?.agent ?? "",
+      reason: proposal?.reason?.trim() || `selected ${slot.role} occurrence ${slot.occurrence ?? 1}`,
+    };
+  });
+  return { entries, slots };
+}
+
+/**
+ * Validate and freeze a bounded adaptive roster before capability issuance.
+ * The selector is deterministic for identical policy/context/proposals and
+ * never accepts a model-supplied concrete agent as authority.
+ */
+export function selectRoster(stage: StageDef, ctx: RosterSelectionContext): RosterSelectionResult {
+  const policy = stage.roster_policy;
+  if (!policy) {
+    const slots = resolveStageDispatchSlots(stage, ctx);
+    return {
+      ok: true,
+      slots,
+      expected_roster: slots.map((slot) => ({ role: slot.slot, agent: selectionRoleAgent(slot.role, ctx) ?? slot.role })),
+      selection: undefined as never,
+    };
+  }
+  const issues = rosterPolicyIssues(stage, policy);
+  if (issues.length > 0) return { ok: false, code: "policy_invalid", error: issues.join("; ") };
+  const profileHash = ctx.profile_hash ?? ctx.state?.profile_hash ?? "unresolved-profile";
+  const runKey = ctx.run_key ?? ctx.state?.run_key ?? ctx.state?.branch ?? "run";
+  const workflow = ctx.workflow ?? ctx.state?.classification.workflow ?? "standard";
+  const capabilityEpoch = ctx.capability_epoch ?? ctx.existing_selection?.capability_epoch ?? `epoch-${rosterHash(`${runKey}|${stage.id}|${profileHash}`)}`;
+  const policyHash = ctx.policy_hash ?? rosterHash(policy);
+  const scopeHash = rosterHash(ctx.flags);
+  const mapping: Record<string, string> = {};
+  const omitted: Array<{ role: string; reason: string }> = [];
+  for (const role of policy.allowed_roles) {
+    const agent = selectionRoleAgent(role, ctx);
+    if (agent) mapping[role] = agent;
+    else omitted.push({ role, reason: "role has no available concrete agent mapping" });
+  }
+  for (const role of policy.required_roles) {
+    if (!mapping[role]) return { ok: false, code: "mapping_invalid", error: `required role '${role}' has no available concrete agent mapping` };
+  }
+  const provided = ctx.selected_occurrences;
+  const roles: string[] = [];
+  const proposals: RosterSelectionOccurrence[] = [];
+  if (provided) {
+    for (const occurrence of provided) {
+      if (!policy.allowed_roles.includes(occurrence.role)) return { ok: false, code: "selection_invalid", error: `selected role '${occurrence.role}' is outside allowed_roles` };
+      const agent = mapping[occurrence.role];
+      if (!agent) {
+        if (policy.required_roles.includes(occurrence.role)) return { ok: false, code: "mapping_invalid", error: `required role '${occurrence.role}' is unavailable` };
+        omitted.push({ role: occurrence.role, reason: "selected role is unavailable in the active agent mapping" });
+        continue;
+      }
+      if (occurrence.agent !== undefined && occurrence.agent !== agent) return { ok: false, code: "selection_invalid", error: `concrete agent override for '${occurrence.role}' is not permitted` };
+      roles.push(occurrence.role);
+      proposals.push({ ...occurrence, agent });
+    }
+  } else {
+    for (const role of policy.required_roles) {
+      if (roles.includes(role)) continue;
+      roles.push(role);
+      proposals.push({ role, agent: mapping[role], reason: "required role coverage" });
+    }
+    for (const facet of policy.required_facets) {
+      if (proposals.some((entry) => entry.facet === facet)) continue;
+      const role = policy.required_roles.find((candidate) => roles.includes(candidate) && (selectionRoleBound(policy, candidate).max > (roles.filter((item) => item === candidate).length))) ?? policy.allowed_roles.find((candidate) => mapping[candidate]);
+      if (!role) return { ok: false, code: "selection_invalid", error: `required facet '${facet}' has no available allowed role` };
+      roles.push(role);
+      proposals.push({ role, facet, agent: mapping[role], reason: "required facet coverage" });
+    }
+  }
+  const triggerList = triggerFacts(stage, ctx);
+  const triggered = triggerList.length > 0;
+  const candidateRoles = policy.allowed_roles.filter((role) => Boolean(mapping[role]));
+  const roleCounts = (role: string): number => roles.filter((candidate) => candidate === role).length;
+  const budget = policy.budget.token_limit ?? policy.budget.dollar_limit;
+  if (budget !== null && roles.length > budget) return { ok: false, code: "selection_invalid", error: "required roster exceeds the configured selection budget" };
+  if (roles.length < policy.min_workers) {
+    for (const role of candidateRoles) {
+      while (roles.length < policy.min_workers && roleCounts(role) < selectionRoleBound(policy, role).max) {
+        roles.push(role);
+        proposals.push({ role, agent: mapping[role], reason: "minimum worker bound" });
+      }
+      if (roles.length >= policy.min_workers) break;
+    }
+  }
+  if (roles.length < policy.min_workers) return { ok: false, code: "selection_invalid", error: "minimum worker bound cannot be satisfied" };
+  if (triggered && !provided) {
+    const existingAgents = new Set(proposals.map((entry) => mapping[entry.role]));
+    const candidate = candidateRoles.find((role) =>
+      roles.length < policy.max_workers
+      && roleCounts(role) < selectionRoleBound(policy, role).max
+      && (budget === null || roles.length < budget)
+      && (!policy.prefer_distinct_agents || !existingAgents.has(mapping[role])),
+    ) ?? candidateRoles.find((role) => roles.length < policy.max_workers && roleCounts(role) < selectionRoleBound(policy, role).max && (budget === null || roles.length < budget));
+    if (candidate) {
+      roles.push(candidate);
+      proposals.push({ role: candidate, agent: mapping[candidate], reason: `risk trigger ${triggerList.join(", ")}` });
+    }
+  }
+  for (const role of policy.allowed_roles) {
+    const bound = selectionRoleBound(policy, role);
+    if (roleCounts(role) < bound.min) return { ok: false, code: "selection_invalid", error: `role '${role}' does not satisfy multiplicity minimum` };
+    if (roleCounts(role) > bound.max) return { ok: false, code: "selection_invalid", error: `role '${role}' exceeds multiplicity maximum` };
+  }
+  if (roles.length < policy.min_workers || roles.length > policy.max_workers) return { ok: false, code: "selection_invalid", error: "selected worker count is outside policy bounds" };
+  for (const role of policy.required_roles) if (roleCounts(role) < 1) return { ok: false, code: "selection_invalid", error: `required role '${role}' is not covered` };
+  for (const facet of policy.required_facets) if (!proposals.some((entry) => entry.facet === facet)) return { ok: false, code: "selection_invalid", error: `required facet '${facet}' is not covered` };
+  const normalized = normalizeSelectionEntries(roles, proposals);
+  const entries = normalized.entries.map((entry) => ({ ...entry, agent: mapping[entry.role]! }));
+  const selectedSet = new Set(entries.map((entry) => entry.role));
+  for (const role of policy.allowed_roles) if (!selectedSet.has(role)) omitted.push({ role, reason: triggered ? "risk threshold satisfied before optional role" : "optional role not required by minimum valid set" });
+  const stop_reason: RosterSelection["stop_reason"] = budget !== null && roles.length >= budget
+    ? "budget_limit"
+    : triggered && roles.length >= policy.max_workers
+      ? "max_workers"
+      : triggered
+        ? "risk_trigger_satisfied"
+        : "minimum_valid_set";
+  const selectedAt = new Date().toISOString();
+  const base = {
+    run_key: runKey,
+    wave_id: ctx.wave_id ?? ctx.state?.work_identity?.wave_id ?? `wave-${runKey}`,
+    slice_id: ctx.slice_id ?? ctx.state?.work_identity?.slice_id ?? stage.id,
+    session_id: ctx.session_id ?? ctx.state?.work_identity?.session_id ?? `session-${runKey}`,
+    workflow: workflow as TeamState["classification"]["workflow"],
+    stage_id: stage.id,
+    profile_hash: profileHash,
+    policy_hash: policyHash,
+    scope_hash: scopeHash,
+    mapping_hash: ctx.mapping_hash ?? rosterHash(mapping),
+    capability_epoch: capabilityEpoch,
+    selected: entries,
+    omitted,
+    triggers: triggerList.length > 0 ? triggerList : ["selection:minimum_valid_set"],
+    stop_reason,
+    selected_at: selectedAt,
+    frozen_at: selectedAt,
+  };
+  const snapshot_id = `selection-${rosterHash(base).slice(0, 32)}`;
+  const selection: RosterSelection = { snapshot_id, ...base };
+  return {
+    ok: true,
+    selection,
+    slots: normalized.slots.map((slot, index) => ({ ...slot, slot_id: entries[index]!.slot_id, facet: entries[index]!.facet })),
+    expected_roster: entries.map((entry) => ({ role: entry.slot_id, agent: entry.agent })),
+  };
+}
+
+/** Explicit alias used by durable callers and external adapters. */
+export const selectStageRoster = selectRoster;
 
 /**
  * Walk the profile to completion. The principal output of running a `/team`.

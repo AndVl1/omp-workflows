@@ -1,10 +1,10 @@
+import { createHash } from "node:crypto";
 import { resolveState, resolveActiveBranch } from "../engine/state.js";
 import { loadProfile, profileHash } from "../engine/profile.js";
 
-
 import type { StageDef } from "../engine/types.js";
 export const DISPATCH_MARKER_PREFIX = "<!-- omp-dispatch";
-const MARKER_RE = /<!--\s*omp-dispatch\s+run=([^\s]+)\s+stage=([^\s]+)\s+kind=(single|consilium)\s+cursor=([^\s]+)\s+roles=([^\s]+)(?:\s+role=([^\s]+))?\s*-->/;
+const MARKER_RE = /<!--\s*omp-dispatch\s+run=([^\s]+)\s+stage=([^\s]+)\s+kind=(single|consilium)\s+cursor=([^\s]+)\s+roles=([^\s]+)(?:\s+role=([^\s]+))?(?:\s+capability=([^\s]+))?(?:\s+slot=([^\s]+))?(?:\s+task=([^\s]+))?\s*-->/;
 
 export type DispatchMarker = {
   run: string;
@@ -13,22 +13,52 @@ export type DispatchMarker = {
   cursor: string;
   roles: string[];
   role?: string;
+  capability_id?: string;
+  slot_id?: string;
+  task_id?: string;
 };
 
-export function buildDispatchMarker(run: string, stage: StageDef, rolesOverride?: string[], role?: string, cursor = stage.id): string {
+/** Stable task identity used by the marker and durable authorization layers. */
+export function dispatchTaskId(capabilityId: string, runKey: string, branch: string, workflow: string, stage: string, role: string): string {
+  return `task-${createHash("sha256").update(`${capabilityId}|${runKey}|${branch}|${workflow}|${stage}|${role}`).digest("hex").slice(0, 32)}`;
+}
+
+export function buildDispatchMarker(
+  run: string,
+  stage: StageDef,
+  rolesOverride?: string[],
+  role?: string,
+  cursor = stage.id,
+  capabilityId?: string,
+  slotId?: string,
+  taskId?: string,
+): string {
   const roles = rolesOverride ?? (stage.type === "single" ? [stage.role ?? ""] : stage.roles ?? []);
   const rolePart = role ? ` role=${role}` : "";
-  return `${DISPATCH_MARKER_PREFIX} run=${run} stage=${stage.id} kind=${stage.type} cursor=${cursor} roles=${roles.length > 0 ? roles.join(",") : "-"}${rolePart} -->`;
+  const capabilityPart = capabilityId ? ` capability=${capabilityId}` : "";
+  const slotPart = slotId ? ` slot=${slotId}` : "";
+  const taskPart = taskId ? ` task=${taskId}` : "";
+  return `${DISPATCH_MARKER_PREFIX} run=${run} stage=${stage.id} kind=${stage.type} cursor=${cursor} roles=${roles.length > 0 ? roles.join(",") : "-"}${rolePart}${capabilityPart}${slotPart}${taskPart} -->`;
 }
 
 export function parseDispatchMarker(text: string): DispatchMarker | null {
   const match = text.match(MARKER_RE);
   if (!match) return null;
-  const [run, stage, kind, cursor, rolesText, role] = match.slice(1);
+  const [run, stage, kind, cursor, rolesText, role, capability_id, slot_id, task_id] = match.slice(1);
   if (!run || !stage || !kind || !cursor || !rolesText) return null;
   const roles = rolesText === "-" ? [] : rolesText.split(",");
   if (roles.some((entry) => !entry)) return null;
-  return { run, stage, kind: kind as DispatchMarker["kind"], cursor, roles, ...(role ? { role } : {}) };
+  return {
+    run,
+    stage,
+    kind: kind as DispatchMarker["kind"],
+    cursor,
+    roles,
+    ...(role ? { role } : {}),
+    ...(capability_id ? { capability_id } : {}),
+    ...(slot_id ? { slot_id } : {}),
+    ...(task_id ? { task_id } : {}),
+  };
 }
 
 export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx: { cwd: string }): { block: true; reason: string } | undefined {
@@ -136,19 +166,27 @@ export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx:
   for (const { item, text } of items) {
     const marker = parseDispatchMarker(text);
     if (
-      !marker ||
-      marker.run !== issued.run_key ||
-      marker.stage !== issued.stage_cursor ||
-      marker.cursor !== issued.cursor_epoch ||
-      marker.kind !== capability.kind ||
-      JSON.stringify([...marker.roles].sort()) !== JSON.stringify(expectedRoster.map((entry) => entry.role).sort())
+      !marker
+      || marker.run !== issued.run_key
+      || marker.stage !== issued.stage_cursor
+      || marker.cursor !== issued.cursor_epoch
+      || marker.kind !== capability.kind
+      || JSON.stringify([...marker.roles].sort()) !== JSON.stringify(expectedRoster.map((entry) => entry.role).sort())
     ) {
       return { block: true, reason: "dispatch gate: task marker does not match persisted opaque capability" };
     }
     const agent = typeof item.agent === "string" ? item.agent : "";
-    const role = marker.role ?? (typeof item.role === "string" ? item.role : "");
+    const role = marker.slot_id ?? marker.role ?? (typeof item.role === "string" ? item.role : "");
     const roster = expectedRoster.find((entry) => entry.role === role);
-    if (!roster || seenRoles.has(role) || agent !== roster.agent) return { block: true, reason: "dispatch gate: role-agent roster mismatch" };
+    const expectedTask = dispatchTaskId(capability.capability_id, issued.run_key, issued.branch, issued.workflow, issued.stage_cursor, role);
+    if (
+      marker.capability_id !== undefined && marker.capability_id !== capability.capability_id
+      || marker.slot_id !== undefined && marker.slot_id !== role
+      || marker.task_id !== undefined && marker.task_id !== expectedTask
+      || !roster
+      || seenRoles.has(role)
+      || agent !== roster.agent
+    ) return { block: true, reason: "dispatch gate: role-agent-identity roster mismatch" };
     seenRoles.add(role);
   }
   if (seenRoles.size !== expectedCount) return { block: true, reason: "dispatch gate: dispatch roster is incomplete" };
@@ -163,9 +201,12 @@ export interface DispatchAuthorizationRequest {
   stage_cursor: string;
   cursor_epoch: string;
   role: string;
+  slot_id: string;
+  task_id: string;
   agent: string;
   tool_call_id: string;
   expected_count: number;
+  retry_of?: string;
 }
 
 /**
@@ -181,6 +222,8 @@ export function trustedDispatchRequests(
   const resolved = resolveState(ctx.cwd, resolveActiveBranch(ctx.cwd));
   const state = resolved.state;
   if (!state || state.policy?.strict_orchestrator !== true) return { ok: true, requests: [] };
+  const blocked = dispatchGate(event, ctx);
+  if (blocked) return { ok: false, reason: blocked.reason };
   const toolCallId = event.toolCallId;
   if (!toolCallId) return { ok: false, reason: "dispatch gate: task call identity is missing" };
   const cap = state.dispatch_capability;
@@ -194,10 +237,13 @@ export function trustedDispatchRequests(
   const items = Array.isArray(input?.tasks)
     ? input.tasks.map((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate) ? candidate as Record<string, unknown> : {})
     : [input ?? {}];
-  const requests = items.map((item) => {
+  const requests: DispatchAuthorizationRequest[] = [];
+  for (const item of items) {
     const marker = parseDispatchMarker(String(item.task ?? ""));
-    const role = marker?.role ?? (typeof item.role === "string" ? item.role : "");
-    return {
+    if (!marker) return { ok: false, reason: "dispatch gate: task marker disappeared during authorization" };
+    const slotId = marker.slot_id ?? marker.role ?? (typeof item.role === "string" ? item.role : "");
+    if (!slotId) return { ok: false, reason: "dispatch gate: task slot identity is missing" };
+    requests.push({
       capability_id: capabilityId,
       run_key: issued.run_key,
       branch: issued.branch,
@@ -205,12 +251,15 @@ export function trustedDispatchRequests(
       profile_hash: issued.profile_hash,
       stage_cursor: issued.stage_cursor,
       cursor_epoch: issued.cursor_epoch,
-      role,
+      role: slotId,
+      slot_id: slotId,
+      task_id: marker.task_id ?? dispatchTaskId(capabilityId, issued.run_key, issued.branch, issued.workflow, issued.stage_cursor, slotId),
       agent: typeof item.agent === "string" ? item.agent : "",
       tool_call_id: toolCallId,
       expected_count: expectedCount,
-    };
-  });
+      ...(typeof item.retry_of === "string" ? { retry_of: item.retry_of } : {}),
+    });
+  }
   return { ok: true, requests };
 }
 

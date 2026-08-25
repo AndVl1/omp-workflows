@@ -3,6 +3,23 @@
   "name": "feature-regression",
   "title": "Feature regression and evidence handoff",
   "description": "Platform-neutral regression workflow for REGRESS requests. Produces bounded scenarios, raw evidence, deterministic oracle verdicts, replay data, and a triage report; it never treats missing capability as PASS.",
+  "completion_intent": {
+    "mode": "complete_outcome",
+    "acceptance": "explicit_human_acceptance",
+    "source": "workflow_policy",
+    "rationale": "Regression workflows produce bounded evidence and require explicit acceptance of the plan before execution."
+  },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": ["product_approval", "security", "destructive_side_effect", "production", "bundle_activation", "migration_cutover"],
+    "rules": {
+      "regression_plan_approval": { "kind": "regression_plan", "default": "required_human", "allowed_decisions": ["proceed", "defer", "reject"], "phase": "before_advance", "rationale": "A bounded regression plan must be explicitly accepted before execution." }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Conservative typed opt-in policy never silently enables destructive actions or external upload."
+  },
   "match": { "type": ["REGRESS"], "complexity": ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] },
   "stages": [
     { "id": "discovery_intake", "title": "Discovery and intake", "type": "orchestrator", "prompt": "Normalize the request into changed surfaces, expected behavior, non-goals, available test capabilities, evidence policy, and acceptance criteria. Do not invent repository facts; mark assumptions and capability gaps.", "produces": "regression_intake" },

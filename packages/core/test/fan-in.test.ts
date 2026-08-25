@@ -661,10 +661,10 @@ test("fan-in: a zero-artifact slot never inherits foreign shared content as its 
       async call() { return { id: "x", output: "ok", artifacts: {}, exitCode: 0 }; },
       async batch() {
         return [
-          { id: "a", output: "ok", artifacts: { exploration: EXPLORATION("analyst view", ["a.ts"]) }, exitCode: 0 },
+          { id: "exploration-analyst", output: "ok", artifacts: { exploration: EXPLORATION("analyst view", ["a.ts"]) }, exitCode: 0 },
           // The second slot returns nothing. It must not inherit the shared
           // exploration.json (written by the first slot) as its provenance.
-          { id: "b", output: "ok", artifacts: {}, exitCode: 0 },
+          { id: "exploration-tech-researcher", output: "ok", artifacts: {}, exitCode: 0 },
         ];
       },
     };

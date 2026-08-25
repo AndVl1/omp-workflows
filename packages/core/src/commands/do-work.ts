@@ -1,9 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { parseAutonomousDirective } from "./envelope.js";
 import { buildClassificationPhaseZero, buildWorkflowMatrix } from "./classification-contract.js";
 import { DETACHED_BRANCH, NO_GIT_BRANCH, resolveActiveBranch, resolveState } from "../engine/state.js";
-import { readAgentMapping } from "../engine/agent-mapping.js";
+import { resolveConfig, type ResolvedConfig } from "../engine/config.js";
 import type { Complexity, TaskType, WorkflowName } from "../engine/types.js";
 
 export interface ParsedWorkEnvelope {
@@ -14,15 +12,12 @@ export interface ParsedWorkEnvelope {
    * semantics; this value is rendered as a hint and never persisted.
    */
   autonomyHint: boolean;
-  /** @deprecated Use autonomyHint; retained for parsed-envelope consumers. */
-  autonomous: boolean;
   issue: number | null;
   branch: string | null;
 }
 
-export interface WorkTeamConfig {
-  roles?: Record<string, string>;
-}
+/** Config shape consumed by the prompt, including resolver provenance/metadata. */
+export type WorkTeamConfig = Partial<ResolvedConfig>;
 
 export function parseWorkEnvelope(args: string, cwd: string): ParsedWorkEnvelope {
   const directive = parseAutonomousDirective(args);
@@ -33,31 +28,41 @@ export function parseWorkEnvelope(args: string, cwd: string): ParsedWorkEnvelope
   const task = (issueMatch ? cleaned.replace(issueMatch[0], "") : cleaned).trim();
   const activeBranch = resolveActiveBranch(cwd);
   const branch = activeBranch === NO_GIT_BRANCH || activeBranch === DETACHED_BRANCH ? null : activeBranch;
-  return { task, autonomyHint, autonomous: autonomyHint, issue, branch };
+  return { task, autonomyHint, issue, branch };
 }
 
 function loadTeamConfig(cwd: string): WorkTeamConfig {
-  const path = resolve(cwd, ".omp", "team.config.json");
-  if (!existsSync(path)) return {};
-  try {
-    const raw = JSON.parse(readFileSync(path, "utf8")) as WorkTeamConfig;
-    const mapping = readAgentMapping(cwd);
-    if (!mapping) return raw;
-    const configuredRoles = raw.roles ?? {};
-    return {
-      ...raw,
-      roles: Object.fromEntries(
-        Object.entries(configuredRoles).map(([role, agent]) => [role, mapping.resolved_roles[role] ?? agent]),
-      ),
-    };
-  } catch {
-    return {};
-  }
+  const config = resolveConfig(cwd);
+  const mapping = config.agent_mapping;
+  if (!mapping) return config;
+  return {
+    ...config,
+    roles: Object.fromEntries(
+      Object.entries(config.roles).map(([role, agent]) => [role, mapping.resolved_roles[role] ?? agent]),
+    ),
+  };
 }
+const RESUME_FROM_DISK_STEPS = [
+  "**Prepare** — call `workflow_prepare` once with the PHASE-0 classification, exact canonical branch, changed files, and issue metadata. On a matching branch, continue the existing run; preserve its task, classification, stage history, artifact IDs, and capability/dispatch identities instead of creating or resetting state.",
+  "**Resolve and validate selection** — after preparation succeeds, call `workflow_begin`, then validate the returned current stage, cursor epoch, role roster, and workflow against the persisted state. Reject stale, missing, or mismatched selection; never guess a stage from prompt text or a filesystem path.",
+  "**Freeze snapshot/capability** — treat the `workflow_begin` handoff as the immutable run snapshot (run key, profile hash, capability identity, cursor, epoch, and dispatch markers), then call `workflow_instructions`. Its returned contract (`stage.instructions`, `roles`, `consumes`, `produces`, `artifact_schemas`, `slot_artifacts`, `checkpoint`/`gate`, `provenance`, and `state.artifactsDir`) is the only workflow instruction source; do not reconstruct schemas or profile data from disk.",
+  "**Authorize identity** — dispatch only the exact declared role/agent with the current cursor, epoch, and role-specific marker. A marker is typed/structured: missing, malformed, stale, or mismatched markers reject the dispatch before worker work; free-text or legacy autonomy wording is never a bypass.",
+  "**Reconcile pending/terminal** — after every task result call `workflow_status`. Pending or active workers, `Still Running`, nested waits, polling, and temporary artifact absence are neutral: wait/reconcile and do not fail, replace, duplicate, or advance the worker. Any non-succeeded terminal result fails closed until the engine reports a valid recovery.",
+  "**Join/fan-in** — for every succeeded dispatch, call `workflow_complete` exactly once with its identity binding and exact `artifact_ids`; in consilium stages use each role's `slot_artifacts` and then the shared fan-in contract. A native task result is never artifact completion, and every typed artifact (for `dod`, `items` MUST be objects with `criterion`, `verify_method`, and `status` `pending` or `met`, never bare strings or a legacy `criteria` array) must validate before joining.",
+  "**Checkpoint/gate/advance** — checkpoint permission exists only when the returned stage contract declares it. Before `workflow_advance`, call `workflow_checkpoint` with the same handoff identity plus `checkpoint_id`, `checkpoint_kind`, `authorization`, `actor_provenance`, `decision`, and `rationale`; legacy `mode`/`actor` fields cannot authorize. Advance only after gates/evidence pass; after `workflow_advance`, call `workflow_instructions` again and remain in this session for later feedback.",
+] as const;
+
 
 export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): string {
-  const roles = Object.entries(loadTeamConfig(cwd).roles ?? {});
+  const config = loadTeamConfig(cwd);
+  const roles = Object.entries(config.roles ?? {});
   const roleTable = roles.map(([role, agent]) => `| \`${role}\` | \`${agent}\` |`).join("\n");
+  const configDiagnostics = config.diagnostics?.length
+    ? [
+      "Diagnostics (configuration is not silently ignored):",
+      ...config.diagnostics.map(diagnostic => `- [${diagnostic.code}] ${diagnostic.path}: ${diagnostic.message}`),
+    ].join("\n")
+    : "Diagnostics: none";
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
   const branchMeta = envelope.branch
     ? `Branch: \`${envelope.branch}\` (canonical session branch; persist this exact value)\n`
@@ -91,23 +96,24 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "`workflow_prepare` is the ONLY supported state initialization/update path: do not call `write`, `edit`, `bash`, or any filesystem API to create or modify `.work-state` files. It persists the classification, resolved workflow, task, branch, stages, scope, and durable capability atomically.",
     "If `workflow_prepare` fails, stop and record the structured error — never guess a state path or repair canonical state by hand. The P5 gate reads `classification.autonomous` as the authority.",
     "If confidence is LOW, ask a focused clarification question before preparing an expansive workflow (unless `autonomous` is true; then document a conservative default).",
+    "Continue executing in THIS TURN: do not stop after printing CLASSIFICATION or preparing state; immediately enter the seven-step contract.",
     "",
-    "### Only after workflow_prepare succeeds",
-    "1. Call `workflow_begin` to issue the durable opaque capability for the current stage. On a resumed active stage, it may reissue fresh plaintext secrets while preserving the capability identity and authorized dispatch records; always use the newly returned handoff and never retry a stale token. If it fails, stop and record the error — never guess stage content.",
-    "2. Call `workflow_instructions` and treat its returned current stage contract (`stage.instructions`, `roles`, `consumes`, `produces`, `artifact_schemas`, `slot_artifacts`, `checkpoint`/`gate`, `provenance`, and `state.artifactsDir`) as the ONLY workflow instruction source. Use `state.artifactsDir` as the exact destination for every declared artifact; do not read, glob, or infer workflow profile JSON or artifact schemas from the filesystem, package paths, or plugin directories.",
-    "3. Continue executing in THIS TURN. Do not stop after printing CLASSIFICATION or preparing state; immediately call `workflow_begin` and `workflow_instructions` and walk the returned stage contract.",
-    "4. On continuation, skip stages already done/skipped and start at the first reopened or pending stage.",
-    "5. For each `single` stage, call `task` once; for each `consilium` stage, use one parallel `task` batch. Every delegated task payload must state that `workflow_*` control tools are main-session-only, must not mutate canonical `.work-state` with `bash`, and must use `write` for its declared artifact before returning. In a consilium, each role writes only its own `slot_artifacts[role]` files; never write the shared produce id directly.",
-    "6. Before writing any declared artifact, match its JSON exactly to `stage.artifact_schemas[artifactId]`; for `dod`, `items` MUST be objects with `criterion`, `verify_method`, and `status` (`pending` or `met`), never bare strings or a legacy `criteria` array.",
-    "7. After every task result, call `workflow_status`. For every dispatch whose status is not `succeeded`, wait or fail closed. For every succeeded dispatch whose `artifact_ids` is empty, call `workflow_complete` exactly once with the dispatch's identity binding and the exact artifact IDs from `slot_artifacts` (including `produce-slot` IDs for consilium); do not treat a native task result as artifact completion. If the runtime already repaired a synchronous completion, use the IDs shown by `workflow_status` and do not replay it with different IDs.",
-    "8. Before `workflow_advance`, if the current stage contract declares a non-null `checkpoint`, call `workflow_checkpoint` first with the same capability handoff, checkpoint name, mode, decision, and rationale; for autonomous stages, record the orchestrator's explicit proceed/approve decision instead of relying on `workflow_advance` to infer it.",
-    "9. After every `workflow_advance`, call `workflow_instructions` again and use the returned next-stage contract. If any workflow tool errors, fail closed: stop and record the failure rather than guessing the stage.",
-    "10. When a stage or the whole workflow finishes, remain available in this same session: later user feedback reopens the affected state instead of starting a fresh workflow.",
+    "### Seven-step resume-from-disk contract (mandatory for every continuation)",
+    ...RESUME_FROM_DISK_STEPS.map((step, index) => `${index + 1}. ${step}`),
+    "",
+    "### NO-MICROMANAGEMENT WORKER POLICY",
+    "Give each worker the outcome, scope, constraints, exact typed artifact schema, and exact dispatch marker — not a scripted implementation. Do not prescribe code shape, file edits, command sequences, validation choreography, or a replacement worker; the delegated role chooses its method and returns evidence.",
+    "Pending/active workers, `Still Running`, nested waits, polling, and temporary artifact absence are neutral runtime states. Do not poll-loop, duplicate, fail, or replace a worker; reconcile through the engine and wait for a terminal result.",
     "",
     "### Role mapping (effective runtime resolution)",
     "| Role | Agent |",
     "| --- | --- |",
     roleTable || "| (no roles configured) | |",
+    "",
+    "### Runtime configuration",
+    `Source: \`${config.config_source ?? "defaults"}\``,
+    `Path: \`${config.config_path ?? "(none)"}\``,
+    configDiagnostics,
     "",
     "### Hard constraints",
     "- Do NOT call `task` during classification.",
@@ -122,17 +128,17 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "NEVER use `write` or `edit` on application source, tests, configuration, lockfiles, documentation, or canonical workflow state. NEVER patch a subagent's code, validation, or artifact to make a stage pass.",
     "Every implementation, review-fix, or source-changing operation MUST be delegated through the profile's `single`/`consilium` stage. If a subagent fails, returns incomplete evidence, or produces incorrect work, re-spawn the same role with a corrected task; do not fix it yourself.",
     "Version-control/review control-plane operations are allowed once delegated work is ready: inspect with `git status`, `git diff`, `git log`, or `git show`; synchronize with `git fetch`, `git pull`, or `git pull --rebase`; integrate delegated commits with `git merge`, `git rebase`, or `git cherry-pick`; then `git add`, `git commit`, non-force `git push`, and `gh pr create`/`gh pr view`. At discovery start, create or select the working branch with `git checkout <branch>`, `git checkout -b <branch>`, `git switch <branch>`, or `git switch -c <branch>`. These operations reconcile or publish worker changes; they do not authorize editing source yourself.",
-    "After every delegated call or parallel batch: stop and reconcile the result through `workflow_status` and the engine-owned completion/advance tools. Require every declared artifact and gate/validation evidence, then dispatch the next stage only if the state transition is valid. A subagent return is not permission to improvise, skip stages, or self-complete.",
-    "If state, delegation evidence, artifact evidence, or gate evidence is missing/corrupt, fail closed: return the structured workflow error and stop or pause through the workflow tools. Do not continue by judgment alone.",
+    "After every delegated call or parallel batch: stop and reconcile the result through `workflow_status` and the engine-owned completion/advance tools. Every delegated task payload must state that `workflow_*` control tools are main-session-only, must not mutate canonical `.work-state` with `bash`, and must use `write` for its declared artifact before returning. Require every declared artifact and gate/validation evidence, then dispatch the next stage only if the state transition is valid. A subagent return is not permission to improvise, skip stages, or self-complete.",
+    "If state, delegation evidence, artifact evidence, or gate evidence is missing/corrupt, or any workflow control tool errors, fail closed: return the structured workflow error and stop or pause through the workflow tools. Do not continue by judgment alone or guess stage content.",
     "",
     "### OPAQUE CAPABILITY EXECUTION PROTOCOL",
-    "After `workflow_prepare` succeeds, call `workflow_begin` before any stage action. Treat its returned handoff as the only valid capability credentials; never invent, reuse, or write tokens to `.work-state/`.",
+    "The `workflow_begin` handoff is the only valid capability credential. Preserve its capability identity and authorized dispatch records on resume; never invent, reuse stale, or write tokens to `.work-state/`.",
     "The handoff's `profile_hash` is a compact first-30/last-2 binding fingerprint; copy it verbatim in every `workflow_complete`, `workflow_checkpoint`, and `workflow_advance` request. Never abbreviate or reconstruct it.",
-    "For `single` and `consilium` stages, call `task` only with the exact returned stage cursor, epoch, expected role/agent roster, and the role-specific marker from `handoff.dispatch_markers`. Put that marker verbatim inside each `tasks[].task` string (not only in the surrounding context); keep the declared `role` and `agent` beside it. Use one task call for `single` and one parallel batch for `consilium`; do not dispatch an undeclared role.",
+    "For `single` and `consilium` stages, call `task` only with the exact returned stage cursor, epoch, expected role/agent roster, and role-specific marker from `handoff.dispatch_markers`. Put that typed marker verbatim inside each `tasks[].task` string (not only in surrounding context), keep the declared `role` and `agent` beside it, and reject missing or malformed markers before work. Never replace a marker with free text, a legacy alias, or an autonomous/completion claim.",
     "For `orchestrator`, `bash`, or `none` stages, perform only the declared contract action, persist required typed artifacts, then call `workflow_advance` with the current handoff's advance token and evidence.",
     "For `document` stages, dispatch nothing and write nothing by hand: the engine renders the declared document deterministically at the `workflow_advance` boundary, exactly per `stage.document` {format, renderer, path}. Call `workflow_advance` directly with evidence that this is a deterministic document render; a render failure returns a structured error — never hand-write the document or its manifest to force the stage through.",
-    "After every task result, call `workflow_status`. For every succeeded dispatch whose `artifact_ids` is empty, call `workflow_complete` exactly once with its identity binding and the exact artifact IDs from `slot_artifacts` (including `produce-slot` ids for consilium); do not treat a native task result as artifact completion. If the runtime already repaired a synchronous completion, use the IDs shown by `workflow_status` and do not replay it with different IDs.",
-    "Advance only through `workflow_advance` after all current-stage dispatches are complete and required artifacts/gates exist. Use the returned next-stage handoff for the next stage; never call `task` from a stale cursor.",
+    "After every delegated call or parallel batch, reconcile through `workflow_status`; a native task result is not artifact completion. Complete only the exact declared artifact IDs, including each consilium `slot_artifacts` ID, and advance only after current-stage dispatches, typed artifacts, and gates are complete. Never call `task` from a stale cursor.",
+    "Checkpoint permission comes only from the current stage contract plus an explicit typed `workflow_checkpoint` envelope (`checkpoint_id`, `checkpoint_kind`, `authorization`, `actor_provenance`, `decision`, and `rationale`); completion intent, free text, prompt wording, worker output, or legacy mode/actor fields cannot infer approval.",
     "",
     "### Tool permission summary",
     "| Operation | Orchestrator |",

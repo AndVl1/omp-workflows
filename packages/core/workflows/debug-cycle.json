@@ -2,6 +2,23 @@
   "name": "debug-cycle",
   "title": "Debug Cycle (diagnostics ↔ manual-qa loop)",
   "description": "BUG_FIX requiring verification, or any BUG_FIX in autonomous mode. Iterative loop: diagnose → fix → manual-qa verify; on FAIL loop back to diagnose with new evidence (max 3).",
+  "completion_intent": {
+    "mode": "complete_outcome",
+    "acceptance": "dod_and_artifacts",
+    "source": "workflow_policy",
+    "rationale": "Debug cycles complete a verified fix with diagnosis, evidence, and DoD artifacts."
+  },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": ["product_approval", "security", "destructive_side_effect", "production", "bundle_activation", "migration_cutover"],
+    "rules": {
+      "approve_fix": { "kind": "implementation_approval", "default": "required_human", "allowed_decisions": ["proceed", "reject"], "phase": "before_advance", "rationale": "Applying a fix requires explicit approval even after diagnostics." }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Conservative typed opt-in policy keeps fix approval human-required."
+  },
   "match": { "type": ["BUG_FIX"], "complexity": ["MEDIUM", "COMPLEX", "CRITICAL"] },
   "stages": [
     {

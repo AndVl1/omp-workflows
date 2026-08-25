@@ -6,13 +6,20 @@ import { resolveState, writeState, isSafeStateSegment, resolveActiveBranch, type
 import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole } from "./config.js";
 import type { AgentMappingDiagnostic } from "./agent-mapping.js";
 import { resolveScope, type ScopeFlags } from "./scope.js";
-import { resolveStageDispatchSlots } from "./stage.js";
+import { resolveStageDispatchSlots, selectRoster, type RosterSelectionContext } from "./stage.js";
 import { readArtifact, writeArtifact } from "./artifacts.js";
 import { isDoDComplete, isRootCauseDocumented, readDoD } from "./dod.js";
 import { validationGate } from "../gates/validation.js";
-import { buildDispatchMarker } from "../gates/dispatch.js";
+import { buildDispatchMarker, dispatchTaskId } from "../gates/dispatch.js";
 import { evaluatePredicate } from "./predicate.js";
-import { appendCheckpointDecision, findCheckpointDecision, unresolvedCheckpointError } from "./checkpoints.js";
+import {
+  appendCheckpointDecision,
+  checkpointPolicyHash,
+  findCheckpointDecision,
+  resolveCheckpointPolicy,
+  validateCheckpointDecision,
+  unresolvedCheckpointError,
+} from "./checkpoints.js";
 import { loopExhaustionKind, loopIterationRecord, loopReentryDecision, loopStateFor, resolveBackToStage } from "./loops.js";
 import {
   DEFAULT_FAN_IN_POLICY,
@@ -28,7 +35,20 @@ import {
   DEFAULT_ARTIFACT_CONTRACT_POLICY,
   type ArtifactContractPolicy,
 } from "./artifact-contract.js";
-import type { CheckpointDecision, DispatchCompletion, DispatchRecord, LoopState, TeamState, StageDef } from "./types.js";
+import type {
+  CheckpointDecision,
+  ChildJoin,
+  CompletionArtifactRef,
+  CompletionEnvelope,
+  DispatchCompletion,
+  DispatchRecord,
+  LoopState,
+  PendingState,
+  StageDef,
+  TeamState,
+  TypedCheckpointDecision,
+  WorkIdentity,
+} from "./types.js";
 import { PRD_SOURCE_ARTIFACT_IDS, writeProductPrdDocument } from "./product-prd.js";
 
 export type DispatchAuth = {
@@ -41,18 +61,23 @@ export type DispatchAuth = {
   stage_cursor: string;
   cursor_epoch: string;
   role?: string;
+  slot_id?: string;
+  task_id?: string;
+  retry_of?: string;
   evidence?: string;
   agent?: string;
   expected_count?: number;
   tool_call_id?: string;
+  pending?: boolean;
+  pending_reason?: PendingState["pending_reason"];
+  provider_ref?: string;
 };
-
 type ActiveCapability = {
   capability_id: string; dispatch_token_hash: string; advance_token_hash: string;
   issued_for: { run_key: string; branch: string; workflow: TeamState["classification"]["workflow"]; profile_hash: string; stage_cursor: string; cursor_epoch: string };
   kind: "none" | "single" | "consilium"; expected_roles: string[]; expected_count: number;
   expected_roster: Array<{ role: string; agent: string }>;
-  status: "ready" | "dispatched" | "joining" | "complete" | "invalidated"; dispatches: DispatchRecord[];
+  status: "ready" | "dispatched" | "joining" | "complete" | "invalidated"; dispatches: DispatchRecord[]; pending?: PendingState[];
 };
 /**
  * Keep the profile binding model-safe without weakening its identity.
@@ -69,51 +94,105 @@ const profileHashMatches = (expected: string, provided: string): boolean =>
 
 const activeCapability = (value: TeamState["dispatch_capability"]): ActiveCapability | null => {
   if (
-    !value?.issued_for ||
-    typeof value.issued_for !== "object" ||
-    typeof value.capability_id !== "string" ||
-    !value.capability_id ||
-    typeof value.dispatch_token_hash !== "string" ||
-    !/^[0-9a-f]{64}$/.test(value.dispatch_token_hash) ||
-    typeof value.advance_token_hash !== "string" ||
-    !/^[0-9a-f]{64}$/.test(value.advance_token_hash) ||
-    !Array.isArray(value.dispatches) ||
-    !Array.isArray(value.expected_roles) ||
-    value.expected_count === undefined ||
-    !Number.isInteger(value.expected_count) ||
-    !Array.isArray(value.expected_roster) ||
-    !value.status
+    !value?.issued_for
+    || typeof value.issued_for !== "object"
+    || typeof value.capability_id !== "string"
+    || !value.capability_id
+    || typeof value.dispatch_token_hash !== "string"
+    || !/^[0-9a-f]{64}$/.test(value.dispatch_token_hash)
+    || typeof value.advance_token_hash !== "string"
+    || !/^[0-9a-f]{64}$/.test(value.advance_token_hash)
+    || !Array.isArray(value.dispatches)
+    || !Array.isArray(value.expected_roles)
+    || value.expected_count === undefined
+    || !Number.isInteger(value.expected_count)
+    || !Array.isArray(value.expected_roster)
+    || !value.status
   ) return null;
   const issued = value.issued_for;
   const expectedRoles = value.expected_roles;
   const expectedRoster = value.expected_roster;
   const expectedCount = value.expected_count;
-  if (!["none", "single", "consilium"].includes(value.kind) || !["ready", "dispatched", "joining", "complete", "invalidated"].includes(value.status)) return null;
-  if ([issued.run_key, issued.branch, issued.workflow, issued.profile_hash, issued.stage_cursor, issued.cursor_epoch].some((field) => typeof field !== "string" || !field)) return null;
-  if ((value.kind === "none" ? expectedCount !== 0 : expectedCount <= 0) || expectedCount !== expectedRoles.length || expectedCount !== expectedRoster.length) return null;
-  if (expectedRoles.some((role) => typeof role !== "string" || !role) || expectedRoster.some((entry) => !entry || typeof entry !== "object" || typeof entry.role !== "string" || !entry.role || typeof entry.agent !== "string" || !entry.agent)) return null;
-  if (new Set(expectedRoles).size !== expectedRoles.length || new Set(expectedRoster.map((r) => r.role)).size !== expectedRoster.length) return null;
-  if (expectedRoles.some((role) => !expectedRoster.some((entry) => entry.role === role))) return null;
-  const terminalStatuses = new Set(["succeeded", "failed", "cancelled"]);
   if (
-    new Set(value.dispatches.map((record) => record?.id)).size !== value.dispatches.length ||
-    value.dispatches.some((record) => {
-      if (!record || typeof record.id !== "string" || !record.id || typeof record.role !== "string" || !record.role || !expectedRoles.includes(record.role) || typeof record.agent !== "string" || !record.agent || !expectedRoster.some((entry) => entry.role === record.role && entry.agent === record.agent) || !["authorized", "running", "succeeded", "failed", "cancelled"].includes(record.status) || !Number.isInteger(record.attempt) || record.attempt < 1 || typeof record.created_at !== "string" || (record.tool_call_id !== undefined && (typeof record.tool_call_id !== "string" || !record.tool_call_id))) return true;
+    !["none", "single", "consilium"].includes(value.kind)
+    || !["ready", "dispatched", "joining", "complete", "invalidated"].includes(value.status)
+    || [issued.run_key, issued.branch, issued.workflow, issued.profile_hash, issued.stage_cursor, issued.cursor_epoch].some((field) => typeof field !== "string" || !field)
+  ) return null;
+  if ((value.kind === "none" ? expectedCount !== 0 : expectedCount <= 0) || expectedCount !== expectedRoles.length || expectedCount !== expectedRoster.length) return null;
+  if (
+    expectedRoles.some((role) => typeof role !== "string" || !role)
+    || expectedRoster.some((entry) => !entry || typeof entry !== "object" || typeof entry.role !== "string" || !entry.role || typeof entry.agent !== "string" || !entry.agent)
+    || new Set(expectedRoles).size !== expectedRoles.length
+    || new Set(expectedRoster.map((entry) => entry.role)).size !== expectedRoster.length
+    || expectedRoles.some((role) => !expectedRoster.some((entry) => entry.role === role))
+  ) return null;
+  const terminalStatuses = new Set(["succeeded", "failed", "cancelled"]);
+  const identityValid = (identity: WorkIdentity, role: string, dispatchId: string, attempt: number): boolean =>
+    Boolean(identity.run_id)
+    && identity.slot_id === role
+    && identity.capability_id === value.capability_id
+    && identity.capability_epoch === issued.cursor_epoch
+    && identity.dispatch_id === dispatchId
+    && identity.attempt === attempt
+    && Boolean(identity.task_id)
+    && Boolean(identity.worker_id);
+  const envelopeValid = (envelope: CompletionEnvelope | undefined, identity: WorkIdentity, outcome: CompletionEnvelope["outcome"]): boolean =>
+    envelope !== undefined
+    && envelope.schema_version === 1
+    && sameIdentity(envelope.identity, identity)
+    && envelope.outcome === outcome
+    && (outcome === "pending" ? envelope.terminal_signal === null : envelope.terminal_signal !== null)
+    && Array.isArray(envelope.artifact_refs)
+    && typeof envelope.emitted_at === "string";
+  if (
+    new Set(value.dispatches.map((record) => record?.id)).size !== value.dispatches.length
+    || value.dispatches.some((record) => {
+      if (
+        !record
+        || typeof record.id !== "string"
+        || !record.id
+        || typeof record.role !== "string"
+        || !record.role
+        || !expectedRoles.includes(record.role)
+        || typeof record.agent !== "string"
+        || !record.agent
+        || !expectedRoster.some((entry) => entry.role === record.role && entry.agent === record.agent)
+        || !["authorized", "running", "pending", "succeeded", "failed", "cancelled"].includes(record.status)
+        || !Number.isInteger(record.attempt)
+        || record.attempt < 1
+        || typeof record.created_at !== "string"
+        || (record.tool_call_id !== undefined && (typeof record.tool_call_id !== "string" || !record.tool_call_id))
+        || !record.work_identity
+        || !identityValid(record.work_identity, record.role, record.id, record.attempt)
+      ) return true;
       const completion = record.completion;
-      if (!terminalStatuses.has(record.status)) return completion !== undefined;
-      return !completion ||
-        typeof completion !== "object" ||
-        completion.dispatch_id !== record.id ||
-        completion.cursor_epoch !== issued.cursor_epoch ||
-        completion.outcome !== record.status ||
-        typeof completion.evidence !== "string" ||
-        !completion.evidence.trim() ||
-        !Array.isArray(completion.artifact_ids) ||
-        new Set(completion.artifact_ids).size !== completion.artifact_ids.length ||
-        completion.artifact_ids.some((id) => typeof id !== "string" || !isSafeStateSegment(id)) ||
-        !["workflow_complete", "synchronous_tool_result", "engine_task_caller"].includes(completion.completed_by) ||
-        typeof completion.completed_at !== "string" ||
-        record.completed_at !== completion.completed_at;
+      if (!terminalStatuses.has(record.status)) {
+        if (completion !== undefined) return true;
+        if (!envelopeValid(record.completion_envelope, record.work_identity, record.status === "pending" ? "pending" : "pending")) return true;
+        if (record.pending !== undefined && (
+          record.pending.identity.dispatch_id !== record.id
+          || record.pending.identity.slot_id !== record.role
+          || record.pending.status !== record.status
+          || (record.status === "pending" && record.pending.terminal_signal !== undefined && record.pending.terminal_signal !== null)
+        )) return true;
+        return false;
+      }
+      return !completion
+        || typeof completion !== "object"
+        || completion.dispatch_id !== record.id
+        || completion.cursor_epoch !== issued.cursor_epoch
+        || completion.outcome !== record.status
+        || typeof completion.evidence !== "string"
+        || !completion.evidence.trim()
+        || !Array.isArray(completion.artifact_ids)
+        || new Set(completion.artifact_ids).size !== completion.artifact_ids.length
+        || completion.artifact_ids.some((id) => typeof id !== "string" || !isSafeStateSegment(id))
+        || !["workflow_complete", "synchronous_tool_result", "engine_task_caller"].includes(completion.completed_by)
+        || typeof completion.completed_at !== "string"
+        || record.completed_at !== completion.completed_at
+        || !completion.work_identity
+        || !sameIdentity(completion.work_identity, record.work_identity)
+        || !envelopeValid(record.completion_envelope, record.work_identity, record.status);
     })
   ) return null;
   const latestByRole = new Map<string, DispatchRecord>();
@@ -133,7 +212,7 @@ export type IssuedCapability = {
   state: NonNullable<TeamState["dispatch_capability"]>;
 };
 
-export type TransitionResult = { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff } | { ok: false; error: string; state?: TeamState };
+export type TransitionResult = { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff; child_join?: ChildJoin } | { ok: false; error: string; state?: TeamState; child_join?: ChildJoin };
 
 export interface CapabilityHandoff {
   capability_id: string;
@@ -164,7 +243,16 @@ function handoffFromState(
     : cap.expected_roster.map(({ role, agent }) => ({
       role,
       agent,
-      marker: buildDispatchMarker(cap.issued_for.run_key, stage, roles, role, cap.issued_for.cursor_epoch),
+      marker: buildDispatchMarker(
+        cap.issued_for.run_key,
+        stage,
+        roles,
+        role,
+        cap.issued_for.cursor_epoch,
+        cap.capability_id,
+        role,
+        expectedTaskId(cap, role),
+      ),
     }));
   return {
     capability_id: secrets.capability_id,
@@ -193,23 +281,127 @@ const persist = (cwd: string, state: TeamState, target: ResolvedState): void => 
   if (!target.statePath || !target.stateDir || !target.artifactsDir) throw new Error("state target missing");
   writeState(cwd, state, { target });
 };
+function stableIdentitySeed(state: TeamState, cap: Pick<ActiveCapability, "issued_for" | "capability_id">): string {
+  return `${cap.capability_id}|${cap.issued_for.run_key}|${cap.issued_for.branch}|${cap.issued_for.workflow}|${cap.issued_for.stage_cursor}`;
+}
+
+function workIdentityFor(
+  state: TeamState,
+  cap: Pick<ActiveCapability, "issued_for" | "capability_id">,
+  role: string,
+  agent: string,
+  dispatchId: string,
+  attempt: number,
+  taskId?: string,
+): WorkIdentity {
+  const base = state.work_identity;
+  const seed = stableIdentitySeed(state, cap);
+  return {
+    run_id: base?.run_id ?? cap.issued_for.run_key,
+    wave_id: base?.wave_id ?? `wave-${hash(seed).slice(0, 20)}`,
+    slice_id: base?.slice_id ?? cap.issued_for.stage_cursor,
+    session_id: base?.session_id ?? `session-${hash(`${seed}|session`).slice(0, 20)}`,
+    workflow: cap.issued_for.workflow,
+    stage_id: cap.issued_for.stage_cursor,
+    stage_cursor: cap.issued_for.stage_cursor,
+    capability_id: cap.capability_id,
+    capability_epoch: cap.issued_for.cursor_epoch,
+    slot_id: role,
+    task_id: taskId ?? dispatchTaskId(cap.capability_id, cap.issued_for.run_key, cap.issued_for.branch, cap.issued_for.workflow, cap.issued_for.stage_cursor, role),
+    dispatch_id: dispatchId,
+    attempt,
+    worker_id: agent,
+  };
+}
+
+function pendingFor(
+  identity: WorkIdentity,
+  status: PendingState["status"],
+  reason?: PendingState["pending_reason"],
+  providerRef?: string,
+  retryOf?: string | null,
+): PendingState {
+  return {
+    identity,
+    status,
+    ...(reason ? { pending_reason: reason } : {}),
+    ...(providerRef ? { provider_ref: providerRef } : {}),
+    ...(status === "pending" ? { lease: { token: randomUUID(), observed_at: now(), revoked_at: null } } : {}),
+    terminal_signal: status === "pending" ? null : undefined,
+    retry_of: retryOf ?? null,
+    updated_at: now(),
+  };
+}
+
+function completionArtifactRefs(
+  artifactsDir: string,
+  artifactIds: string[],
+): CompletionArtifactRef[] {
+  return artifactIds.map((artifactId) => {
+    const value = readArtifact(artifactsDir, artifactId);
+    return {
+      artifact_id: artifactId,
+      path: `${artifactId}.json`,
+      sha256: hash(JSON.stringify(value)),
+      schema_status: value === null ? "failed" : "met",
+      dod_status: value === null ? "failed" : "met",
+    };
+  });
+}
+
+function completionEnvelopeFor(
+  identity: WorkIdentity,
+  outcome: CompletionEnvelope["outcome"],
+  terminalSignal: CompletionEnvelope["terminal_signal"],
+  artifactRefs: CompletionArtifactRef[],
+  evidence: string,
+  completedBy: CompletionEnvelope["completed_by"],
+): CompletionEnvelope {
+  return {
+    schema_version: 1,
+    identity,
+    outcome,
+    terminal_signal: terminalSignal,
+    artifact_refs: artifactRefs,
+    evidence_ref: evidence.trim() ? `evidence/${identity.dispatch_id}` : null,
+    conflict_ref: null,
+    completed_by: completedBy,
+    emitted_at: now(),
+  };
+}
 
 export function hashDispatchSecret(secret: string): string { return hash(secret); }
 
 export function createCapability(input: {
   run_key: string; branch: string; workflow: TeamState["classification"]["workflow"]; profile_hash: string;
   stage_cursor: string; cursor_epoch?: string; kind: "none" | "single" | "consilium"; expected_roles?: string[];
-  dispatch_secret?: string; advance_secret?: string; expected_roster?: Array<{ role: string; agent: string }>;
+  dispatch_secret?: string; advance_secret?: string;
+  expected_roster?: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }>;
+  roster_selection?: TeamState["roster_selection"];
+  work_identity?: WorkIdentity;
 }): IssuedCapability {
   if (!input.run_key || !input.branch || !input.workflow || !input.profile_hash || !input.stage_cursor) throw new Error("invalid capability binding");
   const cursor_epoch = input.cursor_epoch ?? randomUUID();
   const dispatch_token = input.dispatch_secret ?? randomUUID();
   const advance_token = input.advance_secret ?? randomUUID();
-  const roster = (input.expected_roster ?? (input.expected_roles ?? []).map((role) => ({ role, agent: role }))).map((entry) => ({ role: entry.role, agent: entry.agent }));
+  const roster = (input.expected_roster ?? (input.expected_roles ?? []).map((role) => ({ role, agent: role }))).map((entry) => ({ ...entry, role: entry.role, agent: entry.agent }));
   const expected_roles = roster.map((entry) => entry.role);
-  if (input.kind === "none" && roster.length !== 0 || input.kind === "single" && roster.length !== 1 || input.kind === "consilium" && roster.length === 0) throw new Error("capability roster does not match dispatch kind");
+  if ((input.kind === "none" && roster.length !== 0) || (input.kind === "single" && roster.length !== 1) || (input.kind === "consilium" && roster.length === 0)) throw new Error("capability roster does not match dispatch kind");
   if (new Set(expected_roles).size !== expected_roles.length || roster.some((entry) => !entry.role || !entry.agent)) throw new Error("invalid capability roster");
-  const state = { capability_id: randomUUID(), dispatch_token_hash: hash(dispatch_token), advance_token_hash: hash(advance_token), issued_for: { run_key: input.run_key, branch: input.branch, workflow: input.workflow, profile_hash: input.profile_hash, stage_cursor: input.stage_cursor, cursor_epoch }, kind: input.kind, expected_roles, expected_count: roster.length, expected_roster: roster, status: "ready" as const, dispatches: [] };
+  const state = {
+    capability_id: randomUUID(),
+    dispatch_token_hash: hash(dispatch_token),
+    advance_token_hash: hash(advance_token),
+    issued_for: { run_key: input.run_key, branch: input.branch, workflow: input.workflow, profile_hash: input.profile_hash, stage_cursor: input.stage_cursor, cursor_epoch },
+    kind: input.kind,
+    expected_roles,
+    expected_count: roster.length,
+    expected_roster: roster,
+    ...(input.roster_selection ? { roster_selection: input.roster_selection } : {}),
+    ...(input.work_identity ? { work_identity: input.work_identity } : {}),
+    status: "ready" as const,
+    dispatches: [],
+  };
   return { capability_id: state.capability_id, dispatch_token, advance_token, state };
 }
 function reissueActiveCapability(cap: ActiveCapability): IssuedCapability {
@@ -313,9 +505,7 @@ export function beginCapability(cwd: string): TransitionResult {
   const profile = loadProfile(workflow);
   if (!profile) return { ok: false, error: `workflow '${workflow}' is unavailable`, state };
   const persistedHash = profileHash(profile);
-  if (state.profile_hash && state.profile_hash !== persistedHash) {
-    return { ok: false, error: "workflow profile hash is stale", state };
-  }
+  if (state.profile_hash && state.profile_hash !== persistedHash) return { ok: false, error: "workflow profile hash is stale", state };
   if (!Array.isArray(state.stages)) return { ok: false, error: "workflow stages are missing", state };
   const stages = state.stages.length > 0
     ? state.stages
@@ -325,46 +515,72 @@ export function beginCapability(cwd: string): TransitionResult {
   if (!stage) return { ok: false, error: `workflow stage '${stageId ?? ""}' is unavailable`, state };
   const stageEntry = stages.find((candidate) => candidate.id === stage.id);
   if (!stageEntry) return { ok: false, error: `workflow stage '${stage.id}' is not persisted`, state };
-  if (stageEntry.status === "done" || stageEntry.status === "skipped") {
-    return { ok: false, error: `workflow stage '${stage.id}' is already ${stageEntry.status}`, state };
-  }
+  if (stageEntry.status === "done" || stageEntry.status === "skipped") return { ok: false, error: `workflow stage '${stage.id}' is already ${stageEntry.status}`, state };
+
   const existing = activeCapability(state.dispatch_capability);
-  if (state.policy?.strict_orchestrator === true && state.dispatch_capability && !existing) {
-    return { ok: false, error: "workflow dispatch capability is malformed", state };
-  }
+  if (state.policy?.strict_orchestrator === true && state.dispatch_capability && !existing) return { ok: false, error: "workflow dispatch capability is malformed", state };
   const existingDispatches = existing?.issued_for.stage_cursor === stage.id ? existing.dispatches : [];
   const config = resolveConfig(cwd);
   const flags = state.scope ?? resolveScope([], config);
-  const kind: "none" | "single" | "consilium" =
-    stage.type === "single" || stage.type === "consilium" ? stage.type : "none";
-  const slots = kind === "none"
-    ? []
-    : resolveStageDispatchSlots(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
-  if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) {
-    return { ok: false, error: `workflow stage '${stage.id}' has an invalid dispatch roster`, state };
+  const kind: "none" | "single" | "consilium" = stage.type === "single" || stage.type === "consilium" ? stage.type : "none";
+  const reuseSelection = stage.roster_policy
+    ? state.roster_selection?.stage_id === stage.id
+      ? state.roster_selection
+      : state.roster_selections?.[stage.id]
+    : undefined;
+  const capabilityEpoch = existing?.issued_for.stage_cursor === stage.id
+    ? existing.issued_for.cursor_epoch
+    : state.cursor_epoch ?? randomUUID();
+  let rosterSelection = reuseSelection;
+  let slots: ReturnType<typeof resolveStageDispatchSlots> = [];
+  let expectedRoster: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
+  if (kind === "none") {
+    slots = [];
+  } else if (stage.roster_policy) {
+    const selection = reuseSelection && reuseSelection.capability_epoch === capabilityEpoch
+      ? {
+          ok: true as const,
+          selection: reuseSelection,
+          slots: reuseSelection.selected.map((entry) => ({ slot: entry.slot_id, slot_id: entry.slot_id, role: entry.role, occurrence: entry.occurrence, facet: entry.facet })),
+          expected_roster: reuseSelection.selected.map((entry) => ({ role: entry.slot_id, agent: entry.agent })),
+        }
+      : selectRoster(stage, {
+          cwd,
+          flags,
+          resolveDevAgent: () => flags.dev_agent,
+          state,
+          profile_hash: persistedHash,
+          run_key: state.run_key ?? state.branch,
+          workflow,
+          capability_epoch: capabilityEpoch,
+          resolveAgent: (role) => resolveAgentForRole(role, config),
+        } satisfies RosterSelectionContext);
+    if (selection.ok === false) return { ok: false, error: `workflow stage '${stage.id}' roster selection failed: ${selection.error}`, state };
+    rosterSelection = selection.selection;
+    slots = selection.slots;
+    expectedRoster = selection.expected_roster;
+  } else {
+    slots = resolveStageDispatchSlots(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+    expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
   }
+  if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) return { ok: false, error: `workflow stage '${stage.id}' has an invalid dispatch roster`, state };
   const mappingIssues: Array<{ role: string; diagnostic: AgentMappingDiagnostic }> = [];
   for (const slot of slots) {
     const diagnostic = agentMappingIssueForRole(slot.role, config);
     if (diagnostic) mappingIssues.push({ role: slot.role, diagnostic });
   }
   if (mappingIssues.length > 0) {
-    const details = mappingIssues
-      .map(({ role, diagnostic }) => `role '${role}' requested '${diagnostic.requested}' (candidates: ${diagnostic.candidates.join(", ")})`)
-      .join("; ");
+    const details = mappingIssues.map(({ role, diagnostic }) => `role '${role}' requested '${diagnostic.requested}' (candidates: ${diagnostic.candidates.join(", ")})`).join("; ");
     return { ok: false, error: `workflow stage '${stage.id}' has no available agent mapping: ${details}`, state };
   }
-  const expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+  if (expectedRoster.length !== slots.length) expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+
   if (existing && existing.issued_for.stage_cursor === stage.id && stageEntry.status === "in_progress" && existing.status !== "complete" && existing.status !== "invalidated") {
     const rosterChanged = JSON.stringify(existing.expected_roster) !== JSON.stringify(expectedRoster);
-    if (existingDispatches.length > 0 && rosterChanged) {
-      return { ok: false, error: "active dispatch capability roster is inconsistent", state };
-    }
+    if (existingDispatches.length > 0 && rosterChanged) return { ok: false, error: "active dispatch capability roster is inconsistent", state };
     if (!rosterChanged) {
-      // Plaintext secrets are intentionally not persisted. Reissue them when
-      // a resumed main session needs to recover an active handoff, preserving
-      // the capability identity and already-authorized dispatch records.
       const reissued = reissueActiveCapability(existing);
+      const pendingActive = (reissued.state.dispatches ?? []).some((record) => record.status === "pending" || record.status === "running");
       const next: TeamState = {
         ...state,
         run_key: state.run_key ?? state.branch,
@@ -374,36 +590,27 @@ export function beginCapability(cwd: string): TransitionResult {
         scope: flags,
         policy: { ...(state.policy ?? {}), strict_orchestrator: true },
         stages: stages.map((entry) => entry.id === stage.id ? { ...entry, status: "in_progress" as const } : entry),
-        dispatch_capability: reissued.state,
-        pause: { kind: "none", reason: "" },
+        ...(rosterSelection ? { roster_selection: rosterSelection, roster_selections: { ...(state.roster_selections ?? {}), [stage.id]: rosterSelection } } : {}),
+        dispatch_capability: { ...reissued.state, roster_selection: rosterSelection ?? reissued.state.roster_selection },
+        pause: pendingActive ? { kind: "background_wait", reason: "provider work remains pending" } : { kind: "none", reason: "" },
         updated_at: now(),
       };
       persist(cwd, next, target);
-      return {
-        ok: true,
-        state: next,
-        handoff: handoffFromState(next, {
-          capability_id: reissued.capability_id,
-          dispatch_token: reissued.dispatch_token,
-          advance_token: reissued.advance_token,
-        }, stage),
-      };
+      return { ok: true, state: next, handoff: handoffFromState(next, { capability_id: reissued.capability_id, dispatch_token: reissued.dispatch_token, advance_token: reissued.advance_token }, stage) };
     }
-    // No dispatch was authorized under the stale roster. Reissue the capability
-    // with the current mapping so a resumed workflow does not need manual repair.
   }
-  const resetState = stageEntry.status === "in_progress"
-    ? state
-    : resetReopenedStageState(state, target, profile, stage.id, existing);
+  const resetState = stageEntry.status === "in_progress" ? state : resetReopenedStageState(state, target, profile, stage.id, existing);
   const retainedDispatches = stageEntry.status === "in_progress" ? existingDispatches : [];
   const issued = createCapability({
     run_key: resetState.run_key ?? resetState.branch,
-    branch: state.branch,
+    branch: resetState.branch,
     workflow,
     profile_hash: persistedHash,
     stage_cursor: stage.id,
+    cursor_epoch: capabilityEpoch,
     kind,
     expected_roster: expectedRoster,
+    roster_selection: rosterSelection,
   });
   const next: TeamState = {
     ...resetState,
@@ -412,13 +619,10 @@ export function beginCapability(cwd: string): TransitionResult {
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     stage_cursor: stage.id,
     scope: flags,
-    policy: { ...(state.policy ?? {}), strict_orchestrator: true },
+    policy: { ...(resetState.policy ?? {}), strict_orchestrator: true },
     stages: stages.map((entry) => entry.id === stage.id ? { ...entry, status: "in_progress" as const } : entry),
-    dispatch_capability: {
-      ...issued.state,
-      status: retainedDispatches.length > 0 ? "dispatched" as const : "ready" as const,
-      dispatches: retainedDispatches,
-    },
+    ...(rosterSelection ? { roster_selection: rosterSelection, roster_selections: { ...(resetState.roster_selections ?? {}), [stage.id]: rosterSelection } } : {}),
+    dispatch_capability: { ...issued.state, status: retainedDispatches.length > 0 ? "dispatched" as const : "ready" as const, dispatches: retainedDispatches },
     pause: { kind: "none", reason: "" },
     updated_at: now(),
   };
@@ -426,11 +630,7 @@ export function beginCapability(cwd: string): TransitionResult {
   return {
     ok: true,
     state: next,
-    handoff: handoffFromState(next, {
-      capability_id: issued.capability_id,
-      dispatch_token: issued.dispatch_token,
-      advance_token: issued.advance_token,
-    }, stage),
+    handoff: handoffFromState(next, { capability_id: issued.capability_id, dispatch_token: issued.dispatch_token, advance_token: issued.advance_token }, stage),
   };
 }
 function auth(cap: ActiveCapability, a: DispatchAuth, secretHash: string): string | null {
@@ -441,22 +641,87 @@ function auth(cap: ActiveCapability, a: DispatchAuth, secretHash: string): strin
   return null;
 }
 
+function expectedTaskId(cap: ActiveCapability, role: string): string {
+  return dispatchTaskId(cap.capability_id, cap.issued_for.run_key, cap.issued_for.branch, cap.issued_for.workflow, cap.issued_for.stage_cursor, role);
+}
+
+function authorizeBoundRecord(
+  cwd: string,
+  state: TeamState,
+  target: ResolvedState,
+  cap: ActiveCapability,
+  input: DispatchAuth,
+): TransitionResult {
+  if (cap.status === "invalidated" || cap.status === "complete") return { ok: false, error: "capability invalidated", state };
+  const role = input.slot_id ?? input.role ?? "";
+  const rosterEntry = cap.expected_roster.find((entry) => entry.role === role);
+  if (!rosterEntry) return { ok: false, error: "role/slot not expected", state };
+  if (input.role !== undefined && input.role !== role) return { ok: false, error: "slot identity mismatch", state };
+  if (input.expected_count !== undefined && input.expected_count !== cap.expected_count) return { ok: false, error: "cardinality mismatch", state };
+  const taskId = expectedTaskId(cap, role);
+  if (input.task_id !== undefined && input.task_id !== taskId) return { ok: false, error: "task identity mismatch", state };
+  const recordsForRole = cap.dispatches.filter((record) => record.role === role);
+  const latest = recordsForRole[recordsForRole.length - 1];
+  if (latest && latest.status !== "failed" && latest.status !== "cancelled") {
+    const sameTool = Boolean(input.tool_call_id && latest.tool_call_id === input.tool_call_id);
+    const sameTask = Boolean(input.task_id && latest.work_identity?.task_id === input.task_id);
+    if (sameTask && !latest.tool_call_id && input.tool_call_id) {
+      const rebound: DispatchRecord = { ...latest, tool_call_id: input.tool_call_id };
+      const reboundState: TeamState = {
+        ...state,
+        dispatch_capability: { ...cap, dispatches: cap.dispatches.map((candidate) => candidate.id === latest.id ? rebound : candidate) },
+        updated_at: now(),
+      };
+      persist(cwd, reboundState, target);
+      return { ok: true, state: reboundState, record: rebound };
+    }
+    if ((sameTool || sameTask) && (!input.task_id || latest.work_identity?.task_id === input.task_id)) return { ok: true, state, record: latest };
+  }
+  if (latest && (!input.retry_of || input.retry_of !== latest.id || (latest.status !== "failed" && latest.status !== "cancelled"))) {
+    return { ok: false, error: "retry requires an explicit terminal failure linkage", state };
+  }
+  const dispatchId = randomUUID();
+  const attempt = latest ? latest.attempt + 1 : 1;
+  const identity = workIdentityFor(state, cap, role, rosterEntry.agent, dispatchId, attempt, taskId);
+  const pending = pendingFor(identity, "authorized", undefined, undefined, latest?.id ?? null);
+  const record: DispatchRecord = {
+    id: dispatchId,
+    role,
+    agent: rosterEntry.agent,
+    tool_call_id: input.tool_call_id,
+    status: "authorized",
+    attempt,
+    created_at: now(),
+    work_identity: identity,
+    pending,
+    completion_envelope: completionEnvelopeFor(identity, "pending", null, [], "authorized", "engine_task_caller"),
+  };
+  const next: TeamState = {
+    ...state,
+    work_identity: identity,
+    completion_envelope: completionEnvelopeFor(identity, "pending", null, [], "authorized", "engine_task_caller"),
+    dispatch_capability: {
+      ...cap,
+      status: "dispatched",
+      dispatches: [...cap.dispatches, record],
+      pending: [...(cap.pending ?? []), pending],
+    },
+  };
+  persist(cwd, next, target);
+  return { ok: true, state: next, record };
+}
+
 /** Persist authorization before any native task is executed. */
 export function authorizeDispatch(cwd: string, authInput: DispatchAuth): TransitionResult {
-  const found = current(cwd); if (!found) return { ok: false, error: "state not found" };
+  const found = current(cwd);
+  if (!found) return { ok: false, error: "state not found" };
   const { state, target } = found;
   if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state };
-  const cap = activeCapability(state.dispatch_capability); if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
-  const error = auth(cap, authInput, cap.dispatch_token_hash); if (error) return { ok: false, error, state };
-  if (cap.status === "invalidated" || cap.status === "complete") return { ok: false, error: "capability invalidated", state };
-  const role = authInput.role ?? ""; const rosterEntry = cap.expected_roster.find((entry) => entry.role === role);
-  if (!rosterEntry) return { ok: false, error: "role not expected", state };
-  if (authInput.agent !== rosterEntry.agent) return { ok: false, error: "agent does not match role roster", state };
-  if (cap.dispatches.some((d) => d.role === role && d.status !== "failed" && d.status !== "cancelled")) return { ok: false, error: "role already dispatched", state };
-  if (authInput.expected_count !== undefined && authInput.expected_count !== cap.expected_count) return { ok: false, error: "cardinality mismatch", state };
-  const record: DispatchRecord = { id: randomUUID(), role, agent: rosterEntry.agent, tool_call_id: authInput.tool_call_id, status: "authorized", attempt: 1, created_at: now() };
-  const next: TeamState = { ...state, dispatch_capability: { ...cap, status: "dispatched", dispatches: [...cap.dispatches, record] } };
-  persist(cwd, next, target); return { ok: true, state: next, record };
+  const cap = activeCapability(state.dispatch_capability);
+  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  const error = auth(cap, authInput, cap.dispatch_token_hash);
+  if (error) return { ok: false, error, state };
+  return authorizeBoundRecord(cwd, state, target, cap, authInput);
 }
 
 export interface TrustedDispatchInput {
@@ -468,9 +733,12 @@ export interface TrustedDispatchInput {
   stage_cursor: string;
   cursor_epoch: string;
   role: string;
+  slot_id?: string;
+  task_id?: string;
   agent: string;
   tool_call_id: string;
   expected_count?: number;
+  retry_of?: string;
 }
 
 /** Authorize a task after the trusted runtime gate validated its marker. */
@@ -478,41 +746,37 @@ export function authorizeDispatchTrusted(cwd: string, input: TrustedDispatchInpu
   const found = current(cwd);
   if (!found) return { ok: false, error: "state not found" };
   const { state, target } = found;
-  const branch = resolveActiveBranch(cwd);
-  if (branch !== state.branch) return { ok: false, error: "workflow state is stale for the active branch", state };
+  if (resolveActiveBranch(cwd) !== state.branch) return { ok: false, error: "workflow state is stale for the active branch", state };
   const cap = activeCapability(state.dispatch_capability);
   if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
   const binding = cap.issued_for;
   if (
-    input.capability_id !== cap.capability_id ||
-    input.run_key !== binding.run_key ||
-    input.branch !== binding.branch ||
-    input.workflow !== binding.workflow ||
-    input.profile_hash !== binding.profile_hash ||
-    input.stage_cursor !== binding.stage_cursor ||
-    input.cursor_epoch !== binding.cursor_epoch
+    input.capability_id !== cap.capability_id
+    || input.run_key !== binding.run_key
+    || input.branch !== binding.branch
+    || input.workflow !== binding.workflow
+    || input.profile_hash !== binding.profile_hash
+    || input.stage_cursor !== binding.stage_cursor
+    || input.cursor_epoch !== binding.cursor_epoch
   ) return { ok: false, error: "capability binding mismatch", state };
-  if (cap.status === "invalidated" || cap.status === "complete") return { ok: false, error: "capability invalidated", state };
   if (!input.tool_call_id) return { ok: false, error: "tool call identity required", state };
-  const rosterEntry = cap.expected_roster.find((entry) => entry.role === input.role);
-  if (!rosterEntry) return { ok: false, error: "role not expected", state };
-  if (rosterEntry.agent !== input.agent) return { ok: false, error: "agent does not match role roster", state };
-  if (input.expected_count !== undefined && input.expected_count !== cap.expected_count) return { ok: false, error: "cardinality mismatch", state };
-  const existing = cap.dispatches.find((record) => record.role === input.role);
-  if (existing && existing.status !== "failed" && existing.status !== "cancelled") {
-    if (existing.status !== "authorized" || (existing.tool_call_id && existing.tool_call_id !== input.tool_call_id)) {
-      return { ok: false, error: "role already dispatched", state };
-    }
-    if (existing.tool_call_id === input.tool_call_id) return { ok: true, state, record: existing };
-    const bound = { ...existing, tool_call_id: input.tool_call_id };
-    const next: TeamState = { ...state, dispatch_capability: { ...cap, dispatches: cap.dispatches.map((record) => record.id === existing.id ? bound : record) } };
-    persist(cwd, next, target);
-    return { ok: true, state: next, record: bound };
-  }
-  const record: DispatchRecord = { id: randomUUID(), role: input.role, agent: input.agent, tool_call_id: input.tool_call_id, status: "authorized", attempt: 1, created_at: now() };
-  const next: TeamState = { ...state, dispatch_capability: { ...cap, status: "dispatched", dispatches: [...cap.dispatches, record] } };
-  persist(cwd, next, target);
-  return { ok: true, state: next, record };
+  return authorizeBoundRecord(cwd, state, target, cap, {
+    token: "__trusted_gate__",
+    capability_id: input.capability_id,
+    run_key: input.run_key,
+    branch: input.branch,
+    workflow: input.workflow,
+    profile_hash: input.profile_hash,
+    stage_cursor: input.stage_cursor,
+    cursor_epoch: input.cursor_epoch,
+    role: input.role,
+    slot_id: input.slot_id,
+    task_id: input.task_id,
+    agent: input.agent,
+    tool_call_id: input.tool_call_id,
+    expected_count: input.expected_count,
+    retry_of: input.retry_of,
+  });
 }
 
 type CompletionInput = {
@@ -520,7 +784,72 @@ type CompletionInput = {
   evidence: string;
   artifact_ids?: string[];
   completed_by?: DispatchCompletion["completed_by"];
+  terminal_signal?: CompletionEnvelope["terminal_signal"];
 };
+
+function pendingRecord(
+  cwd: string,
+  state: TeamState,
+  target: ResolvedState,
+  cap: ActiveCapability,
+  record: DispatchRecord,
+  reason: PendingState["pending_reason"] = "provider_running",
+  providerRef?: string,
+): TransitionResult {
+  if (record.status === "succeeded" || record.status === "failed" || record.status === "cancelled") return { ok: false, error: "terminal dispatch cannot become pending", state };
+  const identity = record.work_identity ?? workIdentityFor(state, cap, record.role, record.agent, record.id, record.attempt);
+  const previous = record.pending;
+  if (previous?.status === "pending" && previous.provider_ref === providerRef && previous.pending_reason === reason) return { ok: true, state, record };
+  if (previous?.status === "pending" && previous.provider_ref !== providerRef) return { ok: false, error: "conflicting pending replay", state };
+  const pending = pendingFor(identity, "pending", reason, providerRef, previous?.retry_of ?? null);
+  const envelope = completionEnvelopeFor(identity, "pending", null, [], providerRef ?? reason, "engine_task_caller");
+  const updated: DispatchRecord = {
+    ...record,
+    status: "pending",
+    work_identity: identity,
+    pending,
+    completion_envelope: envelope,
+  };
+  const nextCapability = {
+    ...cap,
+    status: "dispatched" as const,
+    dispatches: cap.dispatches.map((candidate) => candidate.id === record.id ? updated : candidate),
+    pending: [...(cap.pending ?? []).filter((candidate) => candidate.identity.dispatch_id !== record.id), pending],
+  };
+  const next: TeamState = {
+    ...state,
+    work_identity: identity,
+    pending,
+    completion_envelope: envelope,
+    dispatch_capability: nextCapability,
+    pause: { kind: "background_wait", reason: providerRef ? `provider work pending (${providerRef})` : "provider work remains pending" },
+    updated_at: now(),
+  };
+  persist(cwd, next, target);
+  return { ok: true, state: next, record: updated };
+}
+
+/** Persist a neutral provider-running state before returning to the caller. */
+export function persistPendingDispatch(
+  cwd: string,
+  input: DispatchAuth & { dispatch_id: string; pending_reason?: PendingState["pending_reason"]; provider_ref?: string },
+): TransitionResult {
+  const found = current(cwd);
+  if (!found) return { ok: false, error: "state not found" };
+  const { state, target } = found;
+  if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state };
+  const cap = activeCapability(state.dispatch_capability);
+  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  const error = auth(cap, input, cap.dispatch_token_hash);
+  if (error) return { ok: false, error, state };
+  const record = cap.dispatches.find((candidate) => candidate.id === input.dispatch_id);
+  if (!record) return { ok: false, error: "unknown dispatch", state };
+  if (input.role !== undefined && input.role !== record.role) return { ok: false, error: "dispatch slot mismatch", state };
+  return pendingRecord(cwd, state, target, cap, record, input.pending_reason, input.provider_ref);
+}
+
+/** Alias retained for adapters that name the transition as a lifecycle update. */
+export const markDispatchPending = persistPendingDispatch;
 
 function completeRecord(
   cwd: string,
@@ -535,76 +864,93 @@ function completeRecord(
   const artifact_ids = input.artifact_ids ?? [];
   const artifactDir = target.artifactsDir ?? "";
   const declaredArtifacts = state.artifacts ?? {};
+  const unsafeArtifacts = new Set(artifact_ids).size !== artifact_ids.length || artifact_ids.some((id) => !isSafeStateSegment(id));
   const previousCompletion = record.completion;
   const sameOutcome = previousCompletion?.outcome === input.outcome;
   const sameArtifacts = previousCompletion !== undefined && JSON.stringify(previousCompletion.artifact_ids) === JSON.stringify(artifact_ids);
-  // Native task results may be persisted before the executor's artifact write
-  // becomes visible to the orchestrator. Preserve the binding and let the
-  // advance-boundary recovery snapshot it once the file is readable.
-  const canDeferNativeArtifacts = previousCompletion?.completed_by === "synchronous_tool_result" &&
-    sameOutcome &&
-    (sameArtifacts || (previousCompletion.artifact_ids.length === 0 && artifact_ids.length > 0));
-  const unsafeArtifacts = new Set(artifact_ids).size !== artifact_ids.length ||
-    artifact_ids.some((id) => !isSafeStateSegment(id));
-  const missingArtifacts = artifact_ids.some((id) =>
-    !existsSync(join(artifactDir, `${id}.json`)) && !Object.prototype.hasOwnProperty.call(declaredArtifacts, id),
-  );
-  if (unsafeArtifacts || (missingArtifacts && !canDeferNativeArtifacts)) {
-    return { ok: false, error: "declared artifact missing or unsafe", state };
-  }
-  if (previousCompletion) {
-    if (sameOutcome && sameArtifacts) {
-      if (previousCompletion.completed_by === "synchronous_tool_result" && artifact_ids.length > 0) {
-        const snapshotted = snapshotSlotArtifacts(state, cap, record, artifact_ids, artifactDir);
-        if (!snapshotted.ok) {
-          if (snapshotted.retryable) return { ok: true, state, record };
-          return { ok: false, error: snapshotted.error, state };
-        }
-        const completion = {
-          ...previousCompletion,
-          evidence: input.evidence,
-          completed_by: input.completed_by ?? previousCompletion.completed_by,
-        };
-        const updated: DispatchRecord = { ...record, completed_at: completion.completed_at, completion };
-        const next: TeamState = {
-          ...snapshotted.state,
-          dispatch_capability: { ...cap, dispatches: cap.dispatches.map((d) => d.id === record.id ? updated : d) },
-        };
-        persist(cwd, next, target);
-        return { ok: true, state: next, record: updated };
-      }
-      return { ok: true, state, record };
-    }
-    if (sameOutcome && previousCompletion.completed_by === "synchronous_tool_result" && previousCompletion.artifact_ids.length === 0 && artifact_ids.length > 0) {
-      const snapshotted = snapshotSlotArtifacts(state, cap, record, artifact_ids, artifactDir);
-      if (!snapshotted.ok && !snapshotted.retryable) return { ok: false, error: snapshotted.error, state };
-      const completedBy = snapshotted.ok ? input.completed_by ?? "workflow_complete" : "synchronous_tool_result";
-      const completion = { ...previousCompletion, artifact_ids, evidence: input.evidence, completed_by: completedBy };
-      const updated: DispatchRecord = { ...record, completed_at: completion.completed_at, completion };
-      const next: TeamState = {
-        ...(snapshotted.ok ? snapshotted.state : state),
-        dispatch_capability: { ...cap, dispatches: cap.dispatches.map((d) => d.id === record.id ? updated : d) },
+  const deferredNativeArtifacts = previousCompletion?.completed_by === "synchronous_tool_result"
+    && sameOutcome
+    && previousCompletion.artifact_ids.length === 0
+    && artifact_ids.length > 0;
+  const missingArtifacts = artifact_ids.some((id) => !existsSync(join(artifactDir, `${id}.json`)) && !Object.prototype.hasOwnProperty.call(declaredArtifacts, id));
+  if (unsafeArtifacts || (missingArtifacts && !deferredNativeArtifacts)) return { ok: false, error: "declared artifact missing or unsafe", state };
+  if (previousCompletion && !(sameOutcome && sameArtifacts) && !deferredNativeArtifacts) return { ok: false, error: "conflicting replay", state };
+  const identity = record.work_identity ?? workIdentityFor(state, cap, record.role, record.agent, record.id, record.attempt);
+  const completedBy = input.completed_by ?? "workflow_complete";
+  const terminalSignal = input.terminal_signal ?? (completedBy === "synchronous_tool_result" ? "native_tool_result" : "workflow_complete");
+  const snapshotted = snapshotSlotArtifacts(state, cap, record, artifact_ids, artifactDir);
+  if (snapshotted.ok === false) {
+    if (snapshotted.retryable && previousCompletion) {
+      const identity = record.work_identity ?? workIdentityFor(state, cap, record.role, record.agent, record.id, record.attempt);
+      const deferredCompletion: DispatchCompletion = {
+        ...previousCompletion,
+        artifact_ids,
+        evidence: input.evidence,
+        work_identity: identity,
       };
-      persist(cwd, next, target);
-      return { ok: true, state: next, record: updated };
+      const deferredEnvelope = completionEnvelopeFor(identity, input.outcome, "native_tool_result", completionArtifactRefs(artifactDir, artifact_ids), input.evidence, "synchronous_tool_result");
+      const deferredRecord: DispatchRecord = { ...record, work_identity: identity, completion: deferredCompletion, completion_envelope: deferredEnvelope };
+      const deferredState: TeamState = {
+        ...state,
+        work_identity: identity,
+        completion_envelope: deferredEnvelope,
+        dispatch_capability: { ...cap, dispatches: cap.dispatches.map((candidate) => candidate.id === record.id ? deferredRecord : candidate) },
+        updated_at: now(),
+      };
+      persist(cwd, deferredState, target);
+      return { ok: true, state: deferredState, record: deferredRecord };
     }
-    return { ok: false, error: "conflicting replay", state };
+    return { ok: false, error: snapshotted.error, state };
   }
+  if (previousCompletion && sameOutcome && sameArtifacts) {
+    const replayedRecord: DispatchRecord = { ...record, work_identity: identity };
+    const replayedState: TeamState = {
+      ...snapshotted.state,
+      work_identity: identity,
+      ...(snapshotted.state.pending ? { pending: snapshotted.state.pending } : {}),
+      ...(record.completion_envelope ? { completion_envelope: record.completion_envelope } : {}),
+      dispatch_capability: { ...cap, dispatches: cap.dispatches.map((candidate) => candidate.id === record.id ? replayedRecord : candidate) },
+      updated_at: now(),
+    };
+    persist(cwd, replayedState, target);
+    return { ok: true, state: replayedState, record: replayedRecord };
+  }
+  const completedAt = now();
   const completion: DispatchCompletion = {
     dispatch_id: record.id,
     cursor_epoch: cap.issued_for.cursor_epoch,
     outcome: input.outcome,
     artifact_ids,
     evidence: input.evidence,
-    completed_by: input.completed_by ?? "workflow_complete",
-    completed_at: now(),
+    completed_by: completedBy,
+    completed_at: completedAt,
+    work_identity: identity,
   };
-  const updated: DispatchRecord = { ...record, status: input.outcome, completed_at: completion.completed_at, completion };
-  const snapshotted = snapshotSlotArtifacts(state, cap, record, artifact_ids, artifactDir);
-  if (!snapshotted.ok) return { ok: false, error: snapshotted.error, state };
+  const envelope = completionEnvelopeFor(identity, input.outcome, terminalSignal, completionArtifactRefs(artifactDir, artifact_ids), input.evidence, completedBy);
+  const terminalPending = pendingFor(identity, input.outcome, undefined, undefined, record.pending?.retry_of ?? null);
+  const updated: DispatchRecord = {
+    ...record,
+    status: input.outcome,
+    completed_at: completedAt,
+    work_identity: identity,
+    pending: terminalPending,
+    completion,
+    completion_envelope: envelope,
+  };
+  const nextCapability = {
+    ...cap,
+    dispatches: cap.dispatches.map((candidate) => candidate.id === record.id ? updated : candidate),
+    pending: [...(cap.pending ?? []).filter((candidate) => candidate.identity.dispatch_id !== record.id), terminalPending],
+  };
+  const activePending = nextCapability.dispatches.some((candidate) => candidate.status === "pending" || candidate.status === "running");
   const next: TeamState = {
     ...snapshotted.state,
-    dispatch_capability: { ...cap, dispatches: cap.dispatches.map((d) => d.id === record.id ? updated : d) },
+    work_identity: identity,
+    ...(activePending ? { pending: nextCapability.dispatches.find((candidate) => candidate.status === "pending")?.pending } : {}),
+    completion_envelope: envelope,
+    dispatch_capability: nextCapability,
+    pause: activePending ? { kind: "background_wait", reason: "provider work remains pending" } : { kind: "none", reason: "" },
+    updated_at: now(),
   };
   persist(cwd, next, target);
   return { ok: true, state: next, record: updated };
@@ -665,48 +1011,70 @@ function snapshotSlotArtifacts(
 function hashValue(value: unknown): string {
   return hash(JSON.stringify(value));
 }
-export function completeDispatch(cwd: string, input: DispatchAuth & { dispatch_id: string } & CompletionInput): TransitionResult {
+export function completeDispatch(cwd: string, input: DispatchAuth & { dispatch_id: string } & Partial<CompletionInput>): TransitionResult {
   const found = current(cwd); if (!found) return { ok: false, error: "state not found" };
   const { state, target } = found;
   if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state };
   const cap = activeCapability(state.dispatch_capability); if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
   const error = auth(cap, input, cap.dispatch_token_hash); if (error) return { ok: false, error, state };
-  if (cap.status === "invalidated" || cap.status === "complete") return { ok: false, error: "capability invalidated", state };
   const record = cap.dispatches.find((d) => d.id === input.dispatch_id);
   if (!record) return { ok: false, error: "unknown dispatch", state };
   if (input.role !== undefined && input.role !== record.role) return { ok: false, error: "dispatch role mismatch", state };
+  if (input.slot_id !== undefined && input.slot_id !== record.work_identity?.slot_id && input.slot_id !== record.role) return { ok: false, error: "dispatch slot mismatch", state };
+  if (input.task_id !== undefined && input.task_id !== record.work_identity?.task_id) return { ok: false, error: "dispatch task mismatch", state };
   if (input.agent !== undefined && input.agent !== record.agent) return { ok: false, error: "dispatch agent mismatch", state };
   if (input.tool_call_id !== undefined && record.tool_call_id !== undefined && input.tool_call_id !== record.tool_call_id) return { ok: false, error: "dispatch tool-call mismatch", state };
-  return completeRecord(cwd, state, target, cap, record, input);
+  if (input.pending === true) return pendingRecord(cwd, state, target, cap, record, input.pending_reason, input.provider_ref);
+  if (!input.outcome || !input.evidence) return { ok: false, error: "terminal completion outcome and evidence are required", state };
+  return completeRecord(cwd, state, target, cap, record, input as CompletionInput);
 }
 
 /** Reconcile a native task result without exposing capability secrets to hooks. */
 export function reconcileTrustedTaskResult(cwd: string, input: {
-  tool_call_id: string;
+  tool_call_id?: string;
+  capability_id?: string;
+  cursor_epoch?: string;
+  dispatch_id?: string;
+  role?: string;
+  slot_id?: string;
+  task_id?: string;
+  work_identity?: WorkIdentity;
   outcome: DispatchCompletion["outcome"];
   evidence: string;
   artifact_ids?: string[];
+  pending?: boolean;
+  pending_reason?: PendingState["pending_reason"];
+  provider_ref?: string;
+  terminal_signal?: CompletionEnvelope["terminal_signal"];
 }): TransitionResult {
-  if (!input.tool_call_id) return { ok: false, error: "tool call identity required" };
-  let found = current(cwd);
+  if (!input.tool_call_id && !input.dispatch_id && !input.work_identity) return { ok: false, error: "dispatch identity required" };
+  const found = current(cwd);
   if (!found) return { ok: false, error: "state not found" };
-  const branch = resolveActiveBranch(cwd);
-  if (branch !== found.state.branch) return { ok: false, error: "workflow state is stale for the active branch", state: found.state };
-  let pending = found.state.dispatch_capability?.dispatches?.filter((record) => record.tool_call_id === input.tool_call_id && !record.completion) ?? [];
-  if (pending.length === 0) return { ok: false, error: "unknown or already reconciled tool call", state: found.state };
-  let last: TransitionResult = { ok: true, state: found.state };
-  for (const expected of pending) {
-    if (!found) return { ok: false, error: "state disappeared during reconciliation" };
-    const cap = activeCapability(found.state.dispatch_capability);
-    if (!cap) return { ok: false, error: "dispatch capability unavailable", state: found.state };
-    const record = cap.dispatches.find((candidate) => candidate.id === expected.id);
-    if (!record) return { ok: false, error: "dispatch disappeared during reconciliation", state: found.state };
-    last = completeRecord(cwd, found.state, found.target, cap, record, { ...input, completed_by: "synchronous_tool_result" });
-    if (!last.ok) return last;
-    found = { state: last.state, target: found.target };
-
-  }
-  return last;
+  if (resolveActiveBranch(cwd) !== found.state.branch) return { ok: false, error: "workflow state is stale for the active branch", state: found.state };
+  const cap = activeCapability(found.state.dispatch_capability);
+  if (!cap) return { ok: false, error: "dispatch capability unavailable", state: found.state };
+  if (input.capability_id && input.capability_id !== cap.capability_id) return { ok: false, error: "capability identity mismatch", state: found.state };
+  if (input.cursor_epoch && input.cursor_epoch !== cap.issued_for.cursor_epoch) return { ok: false, error: "cursor epoch mismatch", state: found.state };
+  let candidates = cap.dispatches.filter((record) => {
+    if (input.dispatch_id && record.id !== input.dispatch_id) return false;
+    if (input.tool_call_id && record.tool_call_id !== input.tool_call_id) return false;
+    if (input.slot_id && input.slot_id !== record.role && input.slot_id !== record.work_identity?.slot_id) return false;
+    if (input.task_id && input.task_id !== record.work_identity?.task_id) return false;
+    if (input.work_identity && JSON.stringify(record.work_identity) !== JSON.stringify(input.work_identity)) return false;
+    return !record.completion;
+  });
+  if (candidates.length !== 1) return { ok: false, error: candidates.length === 0 ? "unknown or already reconciled dispatch" : "ambiguous positional result", state: found.state };
+  const record = candidates[0];
+  if (!record) return { ok: false, error: "dispatch result identity disappeared", state: found.state };
+  if (input.role && input.role !== record.role) return { ok: false, error: "dispatch role mismatch", state: found.state };
+  if (input.pending) return pendingRecord(cwd, found.state, found.target, cap, record, input.pending_reason, input.provider_ref);
+  return completeRecord(cwd, found.state, found.target, cap, record, {
+    outcome: input.outcome,
+    evidence: input.evidence,
+    artifact_ids: input.artifact_ids,
+    completed_by: "synchronous_tool_result",
+    terminal_signal: input.terminal_signal ?? "native_tool_result",
+  });
 }
 function stageProduces(stage: StageDef): string[] {
   if (Array.isArray(stage.produces)) return stage.produces;
@@ -832,10 +1200,10 @@ const NAMED_GATES: Record<string, (state: TeamState, artifactsDir: string) => st
     const PRODUCT_DECISIONS = ["proceed", "needs_more_validation", "defer", "reject"];
     const decision = findCheckpointDecision(state, PRODUCT_APPROVAL_STAGE, PRODUCT_APPROVAL_CHECKPOINT);
     if (!decision) {
-      return "product_approval_recorded gate: no durable decision recorded for checkpoint 'product_approval' (stage 'product_approval'); the product owner must answer via workflow_checkpoint with mode=interactive and decision exactly one of proceed | needs_more_validation | defer | reject — no inferred consent";
+      return "product_approval_recorded gate: no durable decision recorded for checkpoint 'product_approval' (stage 'product_approval'); the product owner must answer via workflow_checkpoint with checkpoint_kind=product_approval, authorization=human, and actor_provenance bound to the product-owner answer; decision exactly one of proceed | needs_more_validation | defer | reject — no inferred consent";
     }
     if (decision.mode !== "interactive") {
-      return `product_approval_recorded gate: checkpoint 'product_approval' was recorded in mode '${decision.mode}', but product approval requires an interactive human decision — autonomous decisions are rejected`;
+      return `product_approval_recorded gate: checkpoint 'product_approval' was not recorded with interactive human authorization (projection mode '${decision.mode}'); product approval requires actor provenance from the product owner — autonomous decisions are rejected`;
     }
     const normalized = decision.decision.trim().toLowerCase();
     if (!PRODUCT_DECISIONS.includes(normalized)) {
@@ -956,12 +1324,31 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
   if (!recovered.ok) return { ok: false, error: recovered.error, state: rawState };
   let state = recovered.state;
 
-  // Join completeness — every dispatched role must have succeeded.
-  const expected = new Set(cap.expected_roles);
+  // Join by the persisted slot identity, never by array position or provider
+  // result order. A retry replaces only the same slot's terminal record.
+  const joinCap = activeCapability(state.dispatch_capability) ?? cap;
+  const expected = new Set(joinCap.expected_roles);
   const latest = new Map<string, DispatchRecord>();
-  for (const record of cap.dispatches) latest.set(record.role, record);
-  const records = Array.from(latest.values());
-  if (records.length !== cap.expected_count || records.some((record) => !expected.has(record.role) || record.status !== "succeeded")) {
+  for (const record of joinCap.dispatches) {
+    const prior = latest.get(record.role);
+    if (!prior || record.attempt > prior.attempt) latest.set(record.role, record);
+  }
+  const records = Array.from(latest.values()).sort((left, right) => left.role.localeCompare(right.role));
+  const incomplete = records.some((record) => !expected.has(record.role) || record.status !== "succeeded")
+    || records.length !== joinCap.expected_count
+    || joinCap.expected_roles.some((role) => !latest.has(role));
+  if (incomplete) {
+    const pending = records.find((record) => record.status === "pending")?.pending ?? state.pending;
+    if (pending) {
+      const pendingState: TeamState = {
+        ...state,
+        pending,
+        pause: { kind: "background_wait", reason: "dispatch join remains pending" },
+        updated_at: now(),
+      };
+      persist(cwd, pendingState, target);
+      return { ok: false, error: "dispatch join pending", state: pendingState };
+    }
     return { ok: false, error: "dispatch join incomplete", state };
   }
   const joinSummary = {
@@ -1026,7 +1413,10 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
 
   // Unresolved declared checkpoints block advance.
   const checkpointError = unresolvedCheckpointError(currentStage, state);
-  if (checkpointError) return { ok: false, error: checkpointError, state };
+  if (checkpointError) {
+    persist(cwd, state, target);
+    return { ok: false, error: checkpointError, state };
+  }
 
   // Bounded loop: evaluate `until`; re-enter `back_to` with a fresh
   // epoch/capability or map exhaustion to needs_human/failed.
@@ -1112,12 +1502,32 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
   const epoch = randomUUID();
   let handoffSecrets: { capability_id: string; dispatch_token: string; advance_token: string } | undefined;
   let nextCap: NonNullable<TeamState["dispatch_capability"]>;
+  let nextSelection: TeamState["roster_selection"];
   if (nextStage) {
     const nextKind: "none" | "single" | "consilium" =
       nextStage.type === "single" || nextStage.type === "consilium" ? nextStage.type : "none";
-    const slots = nextKind === "none"
-      ? []
-      : resolveStageDispatchSlots(nextStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+    let slots: ReturnType<typeof resolveStageDispatchSlots> = [];
+    let expectedRoster: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
+    if (nextKind !== "none" && nextStage.roster_policy) {
+      const selection = selectRoster(nextStage, {
+        cwd,
+        flags,
+        resolveDevAgent: () => flags.dev_agent,
+        state,
+        profile_hash: cap.issued_for.profile_hash,
+        run_key: cap.issued_for.run_key,
+        workflow: cap.issued_for.workflow,
+        capability_epoch: epoch,
+        resolveAgent: (role) => resolveAgentForRole(role, config),
+      } satisfies RosterSelectionContext);
+      if (selection.ok === false) return { ok: false, error: `next stage '${nextStage.id}' roster selection failed: ${selection.error}`, state };
+      nextSelection = selection.selection;
+      slots = selection.slots;
+      expectedRoster = selection.expected_roster;
+    } else if (nextKind !== "none") {
+      slots = resolveStageDispatchSlots(nextStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent, state });
+      expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+    }
     if ((nextKind === "single" && slots.length !== 1) || (nextKind === "consilium" && slots.length === 0)) {
       return { ok: false, error: `next stage '${nextStage.id}' has an invalid dispatch roster`, state };
     }
@@ -1129,7 +1539,8 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
       stage_cursor: nextStage.id,
       cursor_epoch: epoch,
       kind: nextKind,
-      expected_roster: slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) })),
+      expected_roster: expectedRoster,
+      roster_selection: nextSelection,
     });
     nextCap = issued.state;
     handoffSecrets = { capability_id: issued.capability_id, dispatch_token: issued.dispatch_token, advance_token: issued.advance_token };
@@ -1152,6 +1563,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
       return s;
     }),
     join_summary: joinSummary,
+    ...(nextSelection ? { roster_selection: nextSelection, roster_selections: { ...(state.roster_selections ?? {}), [nextStage!.id]: nextSelection } } : {}),
     dispatch_capability: nextCap,
     pause: nextStage ? state.pause : { kind: "done", reason: "" },
   };
@@ -1183,13 +1595,33 @@ function reenterLoop(
   if (!backToStage) return { ok: false, error: `loop back_to '${loop.back_to}' is not a stage in the profile`, state };
   const kind: "none" | "single" | "consilium" =
     backToStage.type === "single" || backToStage.type === "consilium" ? backToStage.type : "none";
-  const slots = kind === "none"
-    ? []
-    : resolveStageDispatchSlots(backToStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  const epoch = randomUUID();
+  let rosterSelection: TeamState["roster_selection"];
+  let slots: ReturnType<typeof resolveStageDispatchSlots> = [];
+  let expectedRoster: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
+  if (kind !== "none" && backToStage.roster_policy) {
+    const selection = selectRoster(backToStage, {
+      cwd,
+      flags,
+      resolveDevAgent: () => flags.dev_agent,
+      state,
+      profile_hash: cap.issued_for.profile_hash,
+      run_key: cap.issued_for.run_key,
+      workflow: cap.issued_for.workflow,
+      capability_epoch: epoch,
+      resolveAgent: (role) => resolveAgentForRole(role, config),
+    } satisfies RosterSelectionContext);
+    if (selection.ok === false) return { ok: false, error: `loop target stage '${backToStage.id}' roster selection failed: ${selection.error}`, state };
+    rosterSelection = selection.selection;
+    slots = selection.slots;
+    expectedRoster = selection.expected_roster;
+  } else if (kind !== "none") {
+    slots = resolveStageDispatchSlots(backToStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent, state });
+    expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+  }
   if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) {
     return { ok: false, error: `loop target stage '${backToStage.id}' has an invalid dispatch roster`, state };
   }
-  const epoch = randomUUID();
   const issued = createCapability({
     run_key: cap.issued_for.run_key,
     branch: cap.issued_for.branch,
@@ -1198,7 +1630,8 @@ function reenterLoop(
     stage_cursor: backToStage.id,
     cursor_epoch: epoch,
     kind,
-    expected_roster: slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) })),
+    expected_roster: expectedRoster,
+    roster_selection: rosterSelection,
   });
   const iteration = reentries + 1;
   const loopState: LoopState = {
@@ -1228,6 +1661,7 @@ function reenterLoop(
           : s,
     ),
     join_summary: joinSummary,
+    ...(rosterSelection ? { roster_selection: rosterSelection, roster_selections: { ...(state.roster_selections ?? {}), [backToStage.id]: rosterSelection } } : {}),
     dispatch_capability: { ...issued.state, status: "ready" as const, dispatches: [] },
     updated_at: now(),
   };
@@ -1243,21 +1677,113 @@ function reenterLoop(
   };
 }
 
-export interface CheckpointDecisionInput extends DispatchAuth {
-  checkpoint: string;
-  mode: "interactive" | "autonomous";
-  decision: string;
-  actor: string;
-  rationale: string;
+export interface ChildJoinInput {
+  parent: WorkIdentity;
+  child: WorkIdentity;
+  state: ChildJoin["state"];
+  expected_artifact_ids: string[];
+  completion_envelope_ref: string | null;
+  attempt: number;
+  completion_envelope?: CompletionEnvelope;
 }
 
-/**
- * Persist a durable checkpoint decision (interactive user answer or the
- * autonomous path's recorded rationale). Bound to the active capability via
- * the orchestrator's advance token; the checkpoint name must match the
- * current stage's declared checkpoint. Recording is idempotent per
- * (stage, checkpoint): the latest decision wins.
- */
+function sameIdentity(left: WorkIdentity | undefined, right: WorkIdentity | undefined): boolean {
+  return left !== undefined && right !== undefined && JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** Append a child result to the durable parent ledger without positional joins. */
+export function appendChildJoin(cwd: string, input: ChildJoinInput): TransitionResult {
+  const found = current(cwd);
+  if (!found) return { ok: false, error: "state not found" };
+  const { state, target } = found;
+  if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state };
+  const cap = activeCapability(state.dispatch_capability);
+  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  if (!sameIdentity(input.parent, state.work_identity) && (
+    input.parent.capability_id !== cap.capability_id
+    || input.parent.capability_epoch !== cap.issued_for.cursor_epoch
+  )) return { ok: false, error: "parent identity is not bound to the active capability", state };
+  if (!input.child.run_id || !input.child.task_id || !input.child.dispatch_id || !input.child.worker_id) return { ok: false, error: "child identity is incomplete", state };
+  if (sameIdentity(input.parent, input.child)) return { ok: false, error: "parent and child identities must differ", state };
+  if (!Number.isInteger(input.attempt) || input.attempt < 1) return { ok: false, error: "child attempt must be a positive integer", state };
+  if (new Set(input.expected_artifact_ids).size !== input.expected_artifact_ids.length || input.expected_artifact_ids.some((id) => !isSafeStateSegment(id))) {
+    return { ok: false, error: "child artifact ids are unsafe or duplicated", state };
+  }
+  if (input.completion_envelope) {
+    const terminal = input.state === "succeeded" || input.state === "failed" || input.state === "cancelled";
+    if (
+      !sameIdentity(input.completion_envelope.identity, input.child)
+      || input.completion_envelope.outcome !== (terminal ? input.state : "pending")
+      || (terminal ? input.completion_envelope.terminal_signal === null : input.completion_envelope.terminal_signal !== null)
+    ) return { ok: false, error: "child completion envelope is not a validated terminal/pending envelope", state };
+  }
+  if ((input.state === "succeeded" || input.state === "failed" || input.state === "cancelled") && !input.completion_envelope) {
+    return { ok: false, error: "terminal child join requires a completion envelope", state };
+  }
+  const existing = (state.child_joins ?? []).find((join) => sameIdentity(join.parent, input.parent) && sameIdentity(join.child, input.child));
+  if (existing) {
+    const exact = existing.state === input.state
+      && existing.attempt === input.attempt
+      && existing.completion_envelope_ref === input.completion_envelope_ref
+      && JSON.stringify(existing.expected_artifact_ids) === JSON.stringify(input.expected_artifact_ids);
+    if (exact) return { ok: true, state, child_join: existing };
+    const conflictRef = `conflict:${hash(JSON.stringify({ existing, input }))}`;
+    const conflict: ChildJoin = {
+      parent: input.parent,
+      child: input.child,
+      state: "conflict",
+      expected_artifact_ids: [...input.expected_artifact_ids],
+      completion_envelope_ref: conflictRef,
+      attempt: Math.max(existing.attempt, input.attempt),
+      created_at: existing.created_at,
+      joined_at: now(),
+    };
+    const next: TeamState = { ...state, child_join: conflict, child_joins: [...(state.child_joins ?? []), conflict], updated_at: now() };
+    persist(cwd, next, target);
+    return { ok: false, error: `child join conflict (${conflictRef})`, state: next, child_join: conflict };
+  }
+  const priorChild = (state.child_joins ?? []).find((join) => sameIdentity(join.parent, input.parent) && join.child.task_id === input.child.task_id);
+  if (priorChild && priorChild.state !== "succeeded" && priorChild.state !== "failed" && priorChild.state !== "cancelled") {
+    return { ok: false, error: "active child join cannot be replaced", state };
+  }
+  if (priorChild && input.attempt <= priorChild.attempt) return { ok: false, error: "child replacement attempt must increase", state };
+  const joined: ChildJoin = {
+    parent: input.parent,
+    child: input.child,
+    state: input.state,
+    expected_artifact_ids: [...input.expected_artifact_ids],
+    completion_envelope_ref: input.completion_envelope_ref,
+    attempt: input.attempt,
+    created_at: now(),
+    joined_at: now(),
+  };
+  const next: TeamState = {
+    ...state,
+    child_join: joined,
+    child_joins: [...(state.child_joins ?? []), joined],
+    updated_at: now(),
+  };
+  persist(cwd, next, target);
+  return { ok: true, state: next, child_join: joined };
+}
+
+export const joinChild = appendChildJoin;
+
+export interface CheckpointDecisionInput extends DispatchAuth {
+  checkpoint: string;
+  decision: string;
+  rationale: string;
+  run_id?: string;
+  checkpoint_id?: string;
+  checkpoint_kind?: TypedCheckpointDecision["checkpoint_kind"];
+  authorization?: TypedCheckpointDecision["authorization"];
+  actor_provenance?: TypedCheckpointDecision["actor"];
+  /** Legacy fields are accepted as display input only and never authorize. */
+  mode?: "interactive" | "autonomous";
+  actor?: string;
+}
+
+/** Persist a policy-bound typed checkpoint decision. */
 export function recordCheckpointDecision(cwd: string, input: CheckpointDecisionInput): TransitionResult {
   const found = current(cwd);
   if (!found) return { ok: false, error: "state not found" };
@@ -1268,35 +1794,57 @@ export function recordCheckpointDecision(cwd: string, input: CheckpointDecisionI
   const error = auth(cap, input, cap.advance_token_hash);
   if (error) return { ok: false, error, state };
   if (cap.status === "invalidated" || cap.status === "complete") return { ok: false, error: "capability invalidated", state };
-  if (input.stage_cursor !== cap.issued_for.stage_cursor) {
-    return { ok: false, error: "checkpoint stage does not match the active capability", state };
-  }
-  if (!input.checkpoint.trim() || !input.decision.trim()) {
-    return { ok: false, error: "checkpoint name and decision are required", state };
+  if (input.stage_cursor !== cap.issued_for.stage_cursor) return { ok: false, error: "checkpoint stage does not match the active capability", state };
+  if (!input.checkpoint.trim() || !input.decision.trim()) return { ok: false, error: "checkpoint name and decision are required", state };
+  if (!input.authorization || !input.actor_provenance) {
+    return { ok: false, error: "typed checkpoint authorization and actor provenance are required; legacy mode/actor fields cannot authorize", state };
   }
   const profile = loadProfile(cap.issued_for.workflow);
   const stage = profile?.stages.find((candidate) => candidate.id === cap.issued_for.stage_cursor);
   if (!stage?.checkpoint) return { ok: false, error: `stage '${cap.issued_for.stage_cursor}' declares no checkpoint`, state };
-  if (input.checkpoint !== stage.checkpoint) {
+  if (input.checkpoint !== stage.checkpoint || (input.checkpoint_id && input.checkpoint_id !== input.checkpoint)) {
     return { ok: false, error: `checkpoint '${input.checkpoint}' does not match declared checkpoint '${stage.checkpoint}'`, state };
   }
-  const decision: CheckpointDecision = {
-    stage_id: cap.issued_for.stage_cursor,
-    checkpoint: input.checkpoint,
-    mode: input.mode,
+  const policy = resolveCheckpointPolicy(stage, state);
+  if (!policy) return { ok: false, error: `checkpoint '${input.checkpoint}' has no policy`, state };
+  const rule = policy.rules[input.checkpoint];
+  if (!rule) return { ok: false, error: `checkpoint policy has no rule for '${input.checkpoint}'`, state };
+  const decision: TypedCheckpointDecision = {
+    run_id: input.run_id ?? state.work_identity?.run_id ?? state.run_key ?? state.branch,
+    stage_id: stage.id,
+    checkpoint_id: input.checkpoint,
+    checkpoint_kind: input.checkpoint_kind ?? rule.kind,
     decision: input.decision.trim(),
-    actor: input.actor.trim() || "orchestrator",
+    authorization: input.authorization,
+    actor: input.actor_provenance,
+    capability_id: cap.capability_id,
+    capability_epoch: cap.issued_for.cursor_epoch,
+    policy_hash: checkpointPolicyHash(policy),
     rationale: input.rationale.trim(),
     decided_at: now(),
   };
-  const next = appendCheckpointDecision(state, decision);
-  persist(cwd, next, target);
-  return { ok: true, state: next };
+  const validated = validateCheckpointDecision(state, decision, { stage, policy });
+  if (!validated.ok) return { ok: false, error: `${validated.code}: ${validated.error}`, state };
+  try {
+    const next = appendCheckpointDecision(state, validated.decision);
+    persist(cwd, next, target);
+    return { ok: true, state: next };
+  } catch (appendError) {
+    return { ok: false, error: appendError instanceof Error ? appendError.message : String(appendError), state };
+  }
 }
-
-export function reconcileTaskResult(cwd: string, input: { dispatch_id?: string; tool_call_id?: string; token?: string; capability_id: string; cursor_epoch?: string; output?: string; isError?: boolean; details?: { async?: { state?: string } } }): TransitionResult {
-  const asyncState = input.details?.async?.state;
-  if (asyncState === "running" || asyncState === "spawned" || asyncState === "scheduled" || (!input.output && !input.isError)) return { ok: false, error: "asynchronous task remains pending" };
+export function reconcileTaskResult(cwd: string, input: {
+  dispatch_id?: string;
+  tool_call_id?: string;
+  slot_id?: string;
+  task_id?: string;
+  token?: string;
+  capability_id: string;
+  cursor_epoch?: string;
+  output?: string;
+  isError?: boolean;
+  details?: { async?: { state?: string; provider_ref?: string } };
+}): TransitionResult {
   if (!input.dispatch_id && !input.tool_call_id) return { ok: false, error: "dispatch identity required" };
   if (!input.token) return { ok: false, error: "dispatch token required" };
   const found = current(cwd);
@@ -1304,12 +1852,19 @@ export function reconcileTaskResult(cwd: string, input: { dispatch_id?: string; 
   if (found.target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state: found.state };
   const cap = activeCapability(found.state.dispatch_capability);
   if (!cap || cap.capability_id !== input.capability_id || (input.cursor_epoch && cap.issued_for.cursor_epoch !== input.cursor_epoch)) return { ok: false, error: "capability binding mismatch", state: found.state };
-  const records = cap.dispatches.filter((record) => !record.completion && (input.dispatch_id ? record.id === input.dispatch_id : record.tool_call_id === input.tool_call_id));
-  if (records.length === 0) return { ok: false, error: "unknown dispatch", state: found.state };
-  const evidence = input.output?.trim() || (input.isError ? "task failed" : "");
-  let last: TransitionResult = { ok: true, state: found.state };
-  for (const record of records) {
-    last = completeDispatch(cwd, {
+  const records = cap.dispatches.filter((record) =>
+    !record.completion
+    && (input.dispatch_id ? record.id === input.dispatch_id : record.tool_call_id === input.tool_call_id)
+    && (!input.slot_id || input.slot_id === record.role || input.slot_id === record.work_identity?.slot_id)
+    && (!input.task_id || input.task_id === record.work_identity?.task_id),
+  );
+  if (records.length !== 1) return { ok: false, error: records.length === 0 ? "unknown dispatch" : "ambiguous positional result", state: found.state };
+  const record = records[0];
+  if (!record) return { ok: false, error: "dispatch result identity disappeared", state: found.state };
+  const asyncState = input.details?.async?.state;
+  const remainsPending = asyncState === "running" || asyncState === "spawned" || asyncState === "scheduled" || (!input.output && !input.isError);
+  if (remainsPending) {
+    return completeDispatch(cwd, {
       dispatch_id: record.id,
       token: input.token,
       capability_id: input.capability_id,
@@ -1319,11 +1874,34 @@ export function reconcileTaskResult(cwd: string, input: { dispatch_id?: string; 
       profile_hash: cap.issued_for.profile_hash,
       stage_cursor: cap.issued_for.stage_cursor,
       cursor_epoch: cap.issued_for.cursor_epoch,
-      outcome: input.isError ? "failed" : "succeeded",
-      evidence,
-      completed_by: "synchronous_tool_result",
+      role: record.role,
+      slot_id: record.work_identity?.slot_id,
+      task_id: record.work_identity?.task_id,
+      agent: record.agent,
+      tool_call_id: record.tool_call_id,
+      pending: true,
+      pending_reason: "provider_running",
+      provider_ref: input.details?.async?.provider_ref ?? asyncState,
     });
-    if (!last.ok) return last;
   }
-  return last;
+  const evidence = input.output?.trim() || (input.isError ? "task failed" : "");
+  return completeDispatch(cwd, {
+    dispatch_id: record.id,
+    token: input.token,
+    capability_id: input.capability_id,
+    run_key: cap.issued_for.run_key,
+    branch: cap.issued_for.branch,
+    workflow: cap.issued_for.workflow,
+    profile_hash: cap.issued_for.profile_hash,
+    stage_cursor: cap.issued_for.stage_cursor,
+    cursor_epoch: cap.issued_for.cursor_epoch,
+    role: record.role,
+    slot_id: record.work_identity?.slot_id,
+    task_id: record.work_identity?.task_id,
+    agent: record.agent,
+    tool_call_id: record.tool_call_id,
+    outcome: input.isError ? "failed" : "succeeded",
+    evidence,
+    completed_by: "synchronous_tool_result",
+  });
 }

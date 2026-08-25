@@ -5,10 +5,11 @@
  * Blocks subagent launches when `.work-state/team-state.json` lacks a
  * classification, when `classification.autonomous` is missing or non-boolean
  * (fail closed — no silent default), or when the resolved `workflow` does
- * not match the Type x Complexity -> Workflow table. The autonomous flag
- * comes from `classification.autonomous` (the model decision); the legacy
- * top-level `autonomous` field is read only as read-compatibility for old
- * state files and can never override a present model field.
+ * not match the Type x Complexity -> Workflow table. The autonomous flag is
+ * routing/migration input only: `classification.autonomous` is preferred for
+ * the legacy matrix and the top-level `autonomous` field is read only for old
+ * state files. Neither field grants checkpoint permission; typed policy-bound
+ * decisions do.
  *
  * Wired to `before_agent_start` so the engine catches it before the agent
  * executes.
@@ -24,10 +25,12 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
-import { isRegisteredWorkflow, matchesProfile, resolveWorkflow } from "../engine/profile.js";
+import { isRegisteredWorkflow, loadProfile, matchesProfile, resolveWorkflow } from "../engine/profile.js";
 import { monotonicGate } from "./monotonic.js";
 import { isSafeStateSegment, resolveState } from "../engine/state.js";
-import type { Classification, Complexity, TaskType } from "../engine/types.js";
+import { checkpointPolicyLegacyConflict } from "../engine/workflow-contract.js";
+import { validateTypedControlPlane } from "../engine/workflow-contract.js";
+import type { Classification, Complexity, TaskType, CheckpointPolicy } from "../engine/types.js";
 
 const WORK_STATE_DIR = ".work-state";
 const ACTIVE_FEATURE = ".active-feature";
@@ -79,11 +82,44 @@ export function classificationGate(event: AgentStartEvent, ctx: AgentStartContex
   } catch {
     return;
   }
-  let state: { classification?: Partial<Classification>; autonomous?: boolean; workflow_override?: boolean };
+  let state: {
+    classification?: Partial<Classification>;
+    autonomous?: boolean;
+    workflow_override?: boolean;
+    stage_cursor?: string;
+    checkpoint_policy?: CheckpointPolicy;
+  };
   try {
     state = JSON.parse(raw) as typeof state;
   } catch {
     return;
+  }
+
+  // Typed control-plane validation is deliberately first.  Legacy autonomy
+  // cannot rescue malformed/unknown typed policy, intent, or decisions.
+  const stateTyped = validateTypedControlPlane(state);
+  const stateIssues = stateTyped.ok
+    ? []
+    : stateTyped.issues.filter((issue) => !(
+      state.checkpoint_policy?.source === "migration"
+      && issue.path.endsWith(".allowed_decisions")
+      && issue.message.includes("must not be empty")
+    ));
+  if (stateIssues.length > 0) {
+    return {
+      block: true,
+      reason: `BLOCK (P5): policy_invalid — typed control-plane fields are malformed: ${stateIssues.map((issue) => `${issue.path} ${issue.message}`).join("; ")}`,
+    };
+  }
+  const classificationValue = state.classification as unknown;
+  if (classificationValue !== undefined) {
+    const classificationTyped = validateTypedControlPlane(classificationValue);
+    if (!classificationTyped.ok) {
+      return {
+        block: true,
+        reason: `BLOCK (P5): policy_invalid — typed classification fields are malformed: ${classificationTyped.issues.map((issue) => `${issue.path} ${issue.message}`).join("; ")}`,
+      };
+    }
   }
 
   const c = state.classification;
@@ -91,12 +127,44 @@ export function classificationGate(event: AgentStartEvent, ctx: AgentStartContex
     return { block: true, reason: "BLOCK (P5): missing classification. Run /team so a CLASSIFICATION block is written to .work-state/team-state.json before launching agents." };
   }
 
-  // Fail-closed autonomy validation runs BEFORE the override escape hatch:
-  // `workflow_override: true` may skip the workflow-mismatch check below, but
-  // it must NEVER bypass a missing or non-boolean model autonomy field. The
-  // model decision is the only authority and no silent default applies.
+  // Resolve policy and floor before the workflow override escape hatch.  An
+  // override may select a registered profile; it cannot invent permission or
+  // downgrade a hard-human rule.
+  const workflow = typeof c.workflow === "string" ? c.workflow : undefined;
+  const profile = workflow ? loadProfile(workflow) : undefined;
+  const stage = profile?.stages.find((candidate) => candidate.id === state.stage_cursor);
+  const policy = state.checkpoint_policy ?? stage?.checkpoint_policy ?? profile?.checkpoint_policy;
+  if (stage?.checkpoint) {
+    if (!policy) {
+      return { block: true, reason: `BLOCK (P5): policy_invalid — declared checkpoint '${stage.checkpoint}' has no typed checkpoint policy.` };
+    }
+    const rule = policy.rules[stage.checkpoint];
+    if (!rule) {
+      return { block: true, reason: `BLOCK (P5): policy_invalid — checkpoint policy has no rule for '${stage.checkpoint}'.` };
+    }
+    const floorKinds: Record<string, true> = {
+      product_approval: true,
+      security: true,
+      destructive_side_effect: true,
+      production: true,
+      bundle_activation: true,
+      migration_cutover: true,
+    };
+    const floor = floorKinds[rule.kind] === true || policy.hard_human.includes(rule.kind);
+    if (floor && (policy.default === "autonomous_allowed" || rule.default === "autonomous_allowed")) {
+      return { block: true, reason: `BLOCK (P5): policy_invalid — hard-human checkpoint '${stage.checkpoint}' cannot permit policy_auto.` };
+    }
+  }
+
+  // Fail-closed autonomy validation remains required during the migration
+  // window because it still routes the legacy profile matrix.  It never grants
+  // checkpoint permission.
   const autonomous = resolveAutonomous(state);
   if (autonomous === undefined) return { block: true, reason: autonomousBlockReason(state) };
+  if (policy) {
+    const conflict = checkpointPolicyLegacyConflict(policy, autonomous);
+    if (conflict) return { block: true, reason: `BLOCK (P5): migration_conflict — ${conflict}` };
+  }
 
   if (state.workflow_override === true) return;
 
@@ -107,9 +175,7 @@ export function classificationGate(event: AgentStartEvent, ctx: AgentStartContex
   if (actual && actual !== expected) {
     // Non-autonomous runs may pick a different registered profile whose match
     // table accepts this classification (intentional override). Autonomous
-    // runs resolve through the MODEL classification field (e.g. BUG_FIX ->
-    // debug-cycle) and may NOT be silently downgraded to the interactive
-    // counterpart via the profile-match escape hatch.
+    // runs resolve through the MODEL routing field and may not be downgraded.
     if (!autonomous && isRegisteredWorkflow(actual) && matchesProfile(actual, { type, complexity })) return;
     return {
       block: true,
@@ -135,12 +201,14 @@ function resolveStatePath(cwd: string): string | null {
 }
 
 /**
- * Resolve the autonomous flag for the P5 gate, fail-closed:
- * - `classification.autonomous` is the MODEL decision — the only authority.
+ * Resolve the routing/migration autonomy input for the P5 gate, fail-closed:
+ * - `classification.autonomous` is preferred for the legacy routing matrix.
  *   A present non-boolean value BLOCKS (never silently replaced).
- * - Absent classification field falls back to the legacy top-level
+ * - An absent classification field falls back to the legacy top-level
  *   `TeamState.autonomous` ONLY for old state files (read compatibility).
  * - Neither present -> BLOCK: no silent true/false default for a task.
+ *
+ * The result never authorizes a checkpoint; typed policy/provenance does.
  */
 function resolveAutonomous(state: {
   classification?: Partial<Classification>;

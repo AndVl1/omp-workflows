@@ -2,6 +2,12 @@
   "name": "review",
   "title": "Parallel Code Review",
   "description": "REVIEW. Parallel review agents, findings only, no implementation.",
+  "completion_intent": {
+    "mode": "handoff_only",
+    "acceptance": "dod_and_artifacts",
+    "source": "workflow_policy",
+    "rationale": "Review workflows hand off findings and evidence; they do not implement changes."
+  },
   "match": { "type": ["REVIEW"] },
   "stages": [
     {

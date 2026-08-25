@@ -105,6 +105,16 @@ test("cto-slice-gate: parse rejects malformed markers", () => {
   assert.equal(parseCtoSliceMarker("<!-- omp-cto-slice run=run-1 slice=s1! -->"), null, "non-slug sliceId");
 });
 
+test("cto-slice-gate: marker parsing is bounded, exact-format, and rejects unsafe or ambiguous ids", () => {
+  const valid = buildCtoSliceMarker("run-1", "slice-1");
+  assert.equal(parseCtoSliceMarker("<!--  omp-cto-slice run=run-1 slice=slice-1 -->"), null, "extra spacing is not the exact marker");
+  assert.equal(parseCtoSliceMarker(buildCtoSliceMarker("..", "slice-1")), null, "dot run id is unsafe");
+  assert.equal(parseCtoSliceMarker(buildCtoSliceMarker("run-1", "..")), null, "dot slice id is unsafe");
+  assert.equal(parseCtoSliceMarker(`${valid} ${valid}`), null, "multiple markers are ambiguous");
+  assert.equal(parseCtoSliceMarker(`${valid} <!--  omp-cto-slice run=run-1 slice=slice-1 -->`), null, "malformed second marker is ambiguous");
+  assert.equal(parseCtoSliceMarker(`${"x".repeat(16_384)}${valid}`), null, "oversized payload is rejected before scanning");
+});
+
 test("cto-slice-gate: fully valid per-slice state dispatches (allow)", () => {
   const f = validRun();
   try {
@@ -151,6 +161,39 @@ test("cto-slice-gate: missing active wave blocks (unset and finished variants)",
   }
 });
 
+
+test("cto-slice-gate: slice must be uniquely mapped and admitted by the active wave", () => {
+  const f = validRun();
+  try {
+    f.state.wave_history![0]!.slice_ids = ["other-slice"];
+    const notAdmitted = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+    assert.match(blockReason(notAdmitted), /not uniquely admitted by active wave/);
+
+    f.state.wave_history![0]!.slice_ids = [f.sliceId];
+    f.state.teams.push({ ...f.state.teams[0]!, id: "lead-b" });
+    const ambiguous = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+    assert.match(blockReason(ambiguous), /ambiguous slice slice-1/);
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("cto-slice-gate: unsafe ids and DoD paths fail closed without echoing untrusted values", () => {
+  const f = validRun();
+  try {
+    const unsafeSlice = assertCtoSliceDispatchable(f.state, { sliceId: "..", root: f.root });
+    assert.match(blockReason(unsafeSlice), /unsafe slice id/);
+    const unsafeRun = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root, markerRunId: "../escape" });
+    assert.match(blockReason(unsafeRun), /unsafe marker run id/);
+    assert.doesNotMatch(blockReason(unsafeRun), /\.\.\/escape/);
+    f.state.teams[0]!.dod_path = "../escape";
+    const unsafeDod = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+    assert.match(blockReason(unsafeDod), /slice DoD path invalid/);
+    assert.doesNotMatch(blockReason(unsafeDod), /\.\.\/escape/);
+  } finally {
+    cleanup(f);
+  }
+});
 test("cto-slice-gate: unknown slice blocks", () => {
   const f = validRun();
   try {
@@ -383,7 +426,16 @@ test("cto-slice-gate: marker outside the task payload does not count during an a
   try {
     const marker = buildCtoSliceMarker(f.runId, f.sliceId);
     const res = ctoSliceTaskGate(
-      { toolName: "task", input: { context: marker, task: "plain task", agent: "team-lead" } },
+      {
+        toolName: "task",
+        input: {
+          context: marker,
+          name: marker,
+          agent: marker,
+          outputSchema: marker,
+          task: "plain task",
+        },
+      },
       { cwd: f.root },
     );
     assert.equal(res?.block, true, "marker in a non-task field is not a valid payload marker");
@@ -431,6 +483,55 @@ test("cto-slice-gate: batch — every item with a valid marker against valid sta
     assert.equal(res, undefined, "batch with all-valid markers allows");
   } finally {
     cleanup(f);
+  }
+});
+
+test("cto-slice-gate: batch items are independently admitted and failing item is isolated", () => {
+  const f = validRun();
+  try {
+    const res = ctoSliceTaskGate(
+      {
+        toolName: "task",
+        input: {
+          tasks: [
+            markerInput(f.runId, f.sliceId),
+            { task: buildCtoSliceMarker(f.runId, "not-in-wave"), agent: "team-lead" },
+          ],
+        },
+      },
+      { cwd: f.root },
+    );
+    assert.equal(res?.block, true);
+    assert.match(res?.reason ?? "", /unknown slice not-in-wave/);
+    assert.match(res?.reason ?? "", /batch task item 1/);
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("cto-slice-gate: ambiguous or empty batch shapes fail closed only during an active wave", () => {
+  const f = validRun();
+  try {
+    const marker = buildCtoSliceMarker(f.runId, f.sliceId);
+    const ambiguous = ctoSliceTaskGate(
+      { toolName: "task", input: { task: marker, tasks: [{ task: marker }] } },
+      { cwd: f.root },
+    );
+    assert.equal(ambiguous?.block, true);
+    assert.match(ambiguous?.reason ?? "", /both task and tasks fields/);
+
+    const empty = ctoSliceTaskGate({ toolName: "task", input: { tasks: [] } }, { cwd: f.root });
+    assert.equal(empty?.block, true);
+    assert.match(empty?.reason ?? "", /without a CTO slice marker/);
+  } finally {
+    cleanup(f);
+  }
+  const waveLess = mkdtempSync(join(tmpdir(), "cto-slice-gate-"));
+  try {
+    assert.equal(ctoSliceTaskGate({ toolName: "task", input: { task: "legacy", tasks: [] } }, { cwd: waveLess }), undefined);
+    assert.equal(ctoSliceTaskGate({ toolName: "task", input: { tasks: [] } }, { cwd: waveLess }), undefined);
+  } finally {
+    rmSync(waveLess, { recursive: true, force: true });
   }
 });
 

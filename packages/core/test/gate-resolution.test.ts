@@ -3,7 +3,12 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
-import { registerTeamWorkflow, defaultFullstackRoles } from "../src/index.js";
+import { registerTeamWorkflow } from "../src/index.js";
+import type { RoleConfig } from "../src/engine/types.js";
+
+const genericRoles: RoleConfig["roles"] = {
+  worker: "worker",
+};
 
 function minimalState(branch = "feature/gates") {
   return {
@@ -31,8 +36,14 @@ test("runtime registers the canonical tool-call gate chain in order", () => {
       if (name === "tool_call") handlers.push(handler);
     },
   };
-  registerTeamWorkflow(pi as never, { roles: defaultFullstackRoles });
-  assert.deepEqual(registrations.slice(0, 3), ["before_agent_start", "session_stop", "tool_call"]);
+  registerTeamWorkflow(pi as never, { roles: genericRoles });
+  const toolCallIndex = registrations.indexOf("tool_call");
+  assert.ok(toolCallIndex >= 2);
+  assert.deepEqual(registrations.slice(toolCallIndex - 2, toolCallIndex + 1), [
+    "before_agent_start",
+    "session_stop",
+    "tool_call",
+  ]);
   assert.ok(handlers.length >= 1);
   // An unarmed workspace must retain normal task compatibility: all gates allow.
   const root = mkdtempSync(join(tmpdir(), "omp-gate-order-"));

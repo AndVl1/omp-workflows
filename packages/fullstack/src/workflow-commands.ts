@@ -14,17 +14,24 @@
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { registerWorkflowCommands as registerCoreWorkflowCommands } from "@andvl1/omp-workflows-core";
-
-// Kept as the fullstack export boundary for existing consumers and tests.
+import {
+	registerWorkflowCommands as registerCoreWorkflowCommands,
+	type WorkflowCommandOptions,
+} from "@andvl1/omp-workflows-core";
+import { fullstackOwnerForCwd, resolveSessionCwd } from "./index.js";
 
 /**
- * Register the authoritative `/do-work`, `/team`, and `/cto` surfaces.
- * Registration happens while the extension is loaded, before OMP snapshots
- * slash suggestions and before project-local custom command files are read.
- * Same-name external extension commands still follow OMP's normal extension
- * load-order rule; Claude marketplace commands remain namespaced.
+ * Fullstack is an adapter over the core command service. It supplies the
+ * explicit session-cwd resolver and owner identity; prompt parsing and CTO
+ * command lifecycle remain core-owned.
  */
-export function registerWorkflowCommands(pi: ExtensionAPI): void {
-	registerCoreWorkflowCommands(pi);
+export function registerWorkflowCommands(
+	pi: ExtensionAPI,
+	options: Omit<WorkflowCommandOptions, "owner" | "resolveCwd"> = {},
+): void {
+	registerCoreWorkflowCommands(pi, {
+		...options,
+		resolveCwd: resolveSessionCwd,
+		owner: fullstackOwnerForCwd,
+	});
 }

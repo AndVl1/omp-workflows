@@ -38,14 +38,14 @@ test("cto-cmd: natural-language directive sets the hint and stays out of the tas
     assert.equal(envelope.task, "Add OAuth");
 
     const prompt = buildCtoPrompt(envelope, root);
-    assert.ok(prompt.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): ON"), "natural directive renders hint ON");
+    assert.ok(prompt.includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative; routing/migration metadata only): ON"), "natural directive renders hint ON");
     assert.ok(prompt.includes("autonomous: <true|false>"), "persistence contract carries the MODEL decision, not the parser flag");
     assert.ok(!prompt.includes("`autonomous: true`"), "parser boolean is NOT copied into the persistence contract");
 
     const lookalike = parseCtoEnvelope("[AUTONOMOUSLY] Add OAuth", root);
     assert.equal(lookalike.autonomyHint, false, "lookalike does not set the hint");
     assert.equal(lookalike.task, "[AUTONOMOUSLY] Add OAuth", "lookalike stays literal");
-    assert.ok(buildCtoPrompt(lookalike, root).includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative): OFF"), "lookalike renders hint OFF");
+    assert.ok(buildCtoPrompt(lookalike, root).includes("Autonomy hint (leading directive — MECHANICAL, NOT authoritative; routing/migration metadata only): OFF"), "lookalike renders hint OFF");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -113,10 +113,10 @@ test("cto-cmd: buildCtoPrompt includes the COMPLETE workflow matrix (REVIEW/HOTF
   const root = mkdtempSync(join(tmpdir(), "cto-core-matrix-"));
   try {
     const prompt = buildCtoPrompt(parseCtoEnvelope("Add OAuth", root), root);
-    assert.ok(prompt.includes("### Workflow resolution"), "workflow matrix section present");
+    assert.ok(prompt.includes("### Workflow routing"), "workflow routing matrix section present");
     assert.ok(prompt.includes("| REVIEW | review | review | review | review |"), "REVIEW row rendered");
     assert.ok(prompt.includes("| HOTFIX | emergency | emergency | emergency | emergency |"), "HOTFIX row rendered");
-    assert.ok(prompt.includes("(`classification.autonomous`)"), "P5 re-derives from classification.autonomous");
+    assert.ok(prompt.includes("classification.autonomous during migration only"), "P5 re-derives routing from classification.autonomous only during migration");
     assert.ok(prompt.includes("Never re-derive"), "autonomy is never re-derived from task text or markers");
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -2,6 +2,24 @@
   "name": "lightweight",
   "title": "Lightweight Quick Task",
   "description": "QUICK features. No parallel exploration or architecture options. Implement + quick review.",
+  "completion_intent": {
+    "mode": "complete_outcome",
+    "acceptance": "dod_and_artifacts",
+    "source": "workflow_policy",
+    "rationale": "Lightweight workflows complete the bounded quick-task outcome with durable artifacts and DoD evidence."
+  },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": ["product_approval", "security", "destructive_side_effect", "production", "bundle_activation", "migration_cutover"],
+    "rules": {
+      "approve_implementation": { "kind": "implementation_approval", "default": "required_human", "allowed_decisions": ["proceed", "reject"], "phase": "before_advance", "rationale": "Even a quick implementation requires explicit approval." },
+      "fix_decision": { "kind": "review_fix", "default": "required_human", "allowed_decisions": ["proceed", "defer", "reject"], "phase": "before_advance", "rationale": "Review-fix disposition must be explicit." }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Conservative typed opt-in policy keeps both quick-task checkpoints human-required."
+  },
   "match": { "type": ["FEATURE", "REFACTOR", "OPS"], "complexity": ["QUICK"] },
   "stages": [
     {

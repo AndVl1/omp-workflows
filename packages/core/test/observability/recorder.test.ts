@@ -14,6 +14,7 @@ import { join } from "node:path";
 
 import { EventRecorder, rollupFromEvents, readObservabilityPointer } from "../../src/observability/recorder.js";
 import type { ObservabilityEvent } from "../../src/observability/events.js";
+import type { CompletionEnvelope, WorkIdentity } from "../../src/engine/types.js";
 
 function withTempDir(): { cwd: string; cleanup: () => void } {
   const cwd = mkdtempSync(join(tmpdir(), "omp-obs-"));
@@ -27,6 +28,48 @@ function ts(offsetMs: number): string {
 function makeIdGen(prefix = "e"): () => string {
   let n = 0;
   return () => `${prefix}-${(++n).toString(36)}`;
+}
+const workIdentity: WorkIdentity = {
+  run_id: "run-1",
+  wave_id: "wave-1",
+  slice_id: "slice-1",
+  session_id: "session-1",
+  workflow: "standard",
+  stage_id: "implementation",
+  stage_cursor: "implementation",
+  capability_id: "cap-1",
+  capability_epoch: "epoch-1",
+  slot_id: "analyst#1",
+  task_id: "task-1",
+  dispatch_id: "dispatch-1",
+  attempt: 1,
+  worker_id: "worker-1",
+};
+
+function completionEnvelope(
+  identity: WorkIdentity,
+  outcome: CompletionEnvelope["outcome"],
+  terminalSignal: CompletionEnvelope["terminal_signal"],
+): CompletionEnvelope {
+  return {
+    schema_version: 1,
+    identity,
+    outcome,
+    terminal_signal: terminalSignal,
+    artifact_refs: outcome === "pending"
+      ? []
+      : [{
+          artifact_id: "result",
+          path: "artifacts/result.json",
+          sha256: "a".repeat(64),
+          schema_status: "met",
+          dod_status: "met",
+        }],
+    evidence_ref: outcome === "pending" ? null : "evidence/dispatch-1",
+    conflict_ref: null,
+    completed_by: "engine_task_caller",
+    emitted_at: ts(100),
+  };
 }
 
 test("recorder: appends one event per call as a single jsonl line", async () => {
@@ -150,4 +193,199 @@ test("recorder: empty event log yields a zeroed rollup with sensible defaults", 
   assert.deepEqual(rollup.agents, {});
   assert.equal(rollup.durationMs, 0);
   assert.equal(rollup.firstEventAt, new Date(0).toISOString());
+});
+
+test("recorder: strips prompts and secrets while retaining bounded relative artifact evidence", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-private", nextId: makeIdGen() });
+    const secretPrompt = "PROMPT transcript secret=top-secret api_key=do-not-persist";
+    await r.append({
+      kind: "artifact_written",
+      ts: ts(0),
+      artifactId: "result",
+      artifactPath: join(cwd, "safe", "result.json"),
+      artifactBytes: 12,
+      artifactSha256: "b".repeat(64),
+      gateReason: secretPrompt,
+      prompt: secretPrompt,
+      transcript: secretPrompt,
+    } as unknown as Omit<ObservabilityEvent, "id" | "branch">);
+    const line = readFileSync(r.path, "utf8");
+    assert.doesNotMatch(line, /top-secret|do-not-persist|transcript/);
+    const event = r.readAll()[0]!;
+    assert.equal(event.artifactPath, "safe/result.json");
+    assert.equal(event.artifact_summaries?.[0]?.path, "safe/result.json");
+    assert.equal(event.artifact_summaries?.[0]?.sha256, "b".repeat(64));
+    assert.match(event.gateReason ?? "", /^redacted:/);
+    assert.equal("prompt" in event, false);
+    assert.equal("transcript" in event, false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("recorder: persists canonical identity tuple and profile/policy bindings", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-identity", nextId: makeIdGen() });
+    const profileHash = "c".repeat(64);
+    const policyHash = "d".repeat(64);
+    const envelope = completionEnvelope(workIdentity, "failed", "provider_terminal");
+    await r.append({
+      kind: "work_terminal",
+      ts: ts(0),
+      work_identity: workIdentity,
+      capability_epoch: workIdentity.capability_epoch,
+      profile_hash: profileHash,
+      policy_hash: policyHash,
+      outcome: "failed",
+      status: "failed",
+      terminal_signal: "provider_terminal",
+      completion_envelope: envelope,
+    });
+    const event = r.readAll()[0]!;
+    assert.deepEqual(event.work_identity, workIdentity);
+    assert.equal(event.capability_epoch, "epoch-1");
+    assert.equal(event.profile_hash, profileHash);
+    assert.equal(event.policy_hash, policyHash);
+    assert.equal(event.completion_envelope?.identity.dispatch_id, "dispatch-1");
+    assert.equal(event.terminal_signal, "provider_terminal");
+  } finally {
+    cleanup();
+  }
+});
+
+test("recorder: exact terminal replay is idempotent and does not repeat the event", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-replay", nextId: makeIdGen() });
+    const event: Omit<ObservabilityEvent, "id" | "branch"> = {
+      kind: "work_terminal",
+      ts: ts(0),
+      work_identity: workIdentity,
+      outcome: "failed",
+      status: "failed",
+      terminal_signal: "contract_failure",
+      completion_envelope: completionEnvelope(workIdentity, "failed", "contract_failure"),
+    };
+    const first = await r.append(event);
+    const replay = await r.append(event);
+    assert.equal(replay.id, first.id);
+    assert.equal(r.readAll().length, 1);
+    assert.equal(r.buildRollup().terminalSignals?.contract_failure, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("recorder: terminal replacement requires identity evidence or explicit retry linkage", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-replacement", nextId: makeIdGen() });
+    await r.append({
+      kind: "work_terminal",
+      ts: ts(0),
+      work_identity: workIdentity,
+      outcome: "failed",
+      status: "failed",
+      terminal_signal: "provider_terminal",
+      completion_envelope: completionEnvelope(workIdentity, "failed", "provider_terminal"),
+    });
+    const retryIdentity = { ...workIdentity, dispatch_id: "dispatch-2", attempt: 2 };
+    await assert.rejects(
+      r.append({
+        kind: "work_terminal",
+        ts: ts(10),
+        work_identity: retryIdentity,
+        outcome: "failed",
+        status: "failed",
+        terminal_signal: "contract_failure",
+      }),
+      /identity-bound completion envelope or retry_of/,
+    );
+    await assert.rejects(
+      r.append({
+        kind: "work_terminal",
+        ts: ts(20),
+        work_identity: retryIdentity,
+        outcome: "failed",
+        status: "failed",
+        terminal_signal: "contract_failure",
+        completion_envelope: completionEnvelope(workIdentity, "failed", "contract_failure"),
+      }),
+      /identity mismatch/,
+    );
+    await r.append({
+      kind: "work_terminal",
+      ts: ts(30),
+      work_identity: retryIdentity,
+      outcome: "failed",
+      status: "failed",
+      terminal_signal: "contract_failure",
+      retry_of: "dispatch-1",
+    });
+    assert.equal(r.readAll().length, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("recorder: neutral pending reasons stay active while provider terminal signals are terminal", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-lifecycle", nextId: makeIdGen() });
+    const pendingReasons = ["provider_running", "awaiting_result", "transport_reconnect"] as const;
+    for (const [index, reason] of pendingReasons.entries()) {
+      const identity = { ...workIdentity, dispatch_id: `pending-${index + 1}` };
+      await r.append({
+        kind: "work_pending",
+        ts: ts(index),
+        work_identity: identity,
+        pending_reason: reason,
+        status: "pending",
+        outcome: "pending",
+        terminal_signal: null,
+        completion_envelope: completionEnvelope(identity, "pending", null),
+      });
+    }
+    for (const [index, signal] of (["provider_terminal", "contract_failure"] as const).entries()) {
+      const identity = { ...workIdentity, dispatch_id: `terminal-${index + 1}` };
+      await r.append({
+        kind: "work_terminal",
+        ts: ts(10 + index),
+        work_identity: identity,
+        outcome: "failed",
+        status: "failed",
+        terminal_signal: signal,
+        completion_envelope: completionEnvelope(identity, "failed", signal),
+      });
+    }
+    const rollup = r.buildRollup();
+    assert.equal(rollup.pendingEvents, 3);
+    assert.deepEqual(rollup.pendingReasons, {
+      provider_running: 1,
+      awaiting_result: 1,
+      transport_reconnect: 1,
+    });
+    assert.deepEqual(rollup.terminalSignals, {
+      provider_terminal: 1,
+      contract_failure: 1,
+    });
+    await assert.rejects(
+      r.append({
+        kind: "work_pending",
+        ts: ts(20),
+        work_identity: { ...workIdentity, dispatch_id: "pending-invalid" },
+        pending_reason: "provider_running",
+        status: "pending",
+        outcome: "pending",
+        terminal_signal: "provider_terminal",
+        completion_envelope: completionEnvelope({ ...workIdentity, dispatch_id: "pending-invalid" }, "pending", null),
+      }),
+      /cannot claim a terminal signal/,
+    );
+  } finally {
+    cleanup();
+  }
 });

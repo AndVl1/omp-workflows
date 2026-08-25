@@ -37,6 +37,311 @@ export type PauseKind =
   | "needs_human"
   | "failed"
   | "done";
+export type CompletionIntentMode = "complete_outcome" | "handoff_only";
+export type CompletionAcceptance = "dod_and_artifacts" | "explicit_human_acceptance";
+export type CompletionIntentSource = "user" | "workflow_policy" | "migration";
+
+/**
+ * Desired terminal product. This is deliberately independent from checkpoint
+ * permission: completing an outcome never grants permission to skip consent.
+ */
+export interface CompletionIntent {
+  mode: CompletionIntentMode;
+  acceptance: CompletionAcceptance;
+  source: CompletionIntentSource;
+  rationale: string;
+}
+
+export type CheckpointPolicyDefault = "required_human" | "autonomous_allowed";
+export type CheckpointPolicyScope = "decision";
+export type CheckpointPolicyPhase = "before_dispatch" | "before_advance";
+export type CheckpointRuleKind =
+  | "product_approval"
+  | "clarification"
+  | "architecture_choice"
+  | "implementation_approval"
+  | "review_fix"
+  | "regression_plan"
+  | "integration_acceptance"
+  | "security"
+  | "destructive_side_effect"
+  | "production"
+  | "bundle_activation"
+  | "migration_cutover"
+  | "custom";
+export type HardHumanCheckpointKind = Exclude<CheckpointRuleKind, "custom"> | "custom";
+
+export interface CheckpointRule {
+  kind: CheckpointRuleKind;
+  default: CheckpointPolicyDefault;
+  /** Empty only for migration-generated rules whose decisions are not known yet. */
+  allowed_decisions: string[];
+  phase: CheckpointPolicyPhase;
+  rationale: string;
+}
+
+export interface CheckpointPolicy {
+  default: CheckpointPolicyDefault;
+  scope: CheckpointPolicyScope;
+  hard_human: HardHumanCheckpointKind[];
+  rules: Record<string, CheckpointRule>;
+  source: "profile" | "user" | "migration";
+  policy_version: number;
+  rationale: string;
+}
+
+export type CheckpointActorKind = "user" | "orchestrator" | "system";
+export type CheckpointAnswerChannel = "terminal" | "escalation";
+
+/**
+ * Proof presented by a checkpoint caller.  The proof is only a reference into
+ * the engine-owned durable answer ledger; none of these values are trusted
+ * until the matching immutable record is found and its binding is recomputed.
+ */
+export interface CheckpointAnswerProof {
+  answer_id: string;
+  nonce: string;
+  channel: CheckpointAnswerChannel;
+  reference: string;
+  binding: string;
+}
+
+/**
+ * Immutable answer identity issued by a trusted terminal/escalation ingest
+ * path.  `consumed_at` is an audit marker: exact idempotent replay remains
+ * valid, while a different decision/context can never reuse the answer.
+ */
+export interface TrustedCheckpointAnswer {
+  answer_id: string;
+  nonce: string;
+  channel: CheckpointAnswerChannel;
+  reference: string;
+  run_id: string;
+  stage_id: string;
+  checkpoint_id: string;
+  work_identity_hash: string;
+  capability_id: string;
+  capability_epoch: string;
+  policy_hash: string;
+  decision: string;
+  binding: string;
+  issued_at: string;
+  consumed_at?: string;
+}
+
+export interface CheckpointActor {
+  kind: CheckpointActorKind;
+  /** Display/reference value; human authorization never trusts this alone. */
+  ref: string;
+  /** Durable terminal/escalation answer proof required for human authorization. */
+  proof?: CheckpointAnswerProof;
+}
+export type CheckpointAuthorization = "human" | "policy_auto";
+
+export interface RosterMultiplicity {
+  min: number;
+  max: number;
+}
+
+export interface RosterTriggers {
+  complexity: Complexity[];
+  confidence: Confidence[];
+  scope_flags: string[];
+  evidence: string[];
+}
+
+export interface RosterBudget {
+  token_limit: number | null;
+  dollar_limit: number | null;
+}
+
+export type RosterSelectionMode = "pre_dispatch_minimum_valid";
+export type RosterSelectionStopReason =
+  | "minimum_valid_set"
+  | "risk_trigger_satisfied"
+  | "max_workers"
+  | "budget_limit";
+
+/**
+ * Allowed semantic worker pool. Concrete agents are resolved by the active
+ * mapping and never become caller-supplied authority.
+ */
+export interface RosterPolicy {
+  allowed_roles: string[];
+  required_roles: string[];
+  required_facets: string[];
+  min_workers: number;
+  max_workers: number;
+  multiplicity: Record<string, RosterMultiplicity>;
+  prefer_distinct_agents: boolean;
+  selection_mode: RosterSelectionMode;
+  triggers: RosterTriggers;
+  /** Null means no bound for that metric; this is not a liveness timeout. */
+  budget: RosterBudget;
+}
+
+export interface RosterSelectionEntry {
+  slot_id: string;
+  role: string;
+  occurrence: number;
+  facet: string | null;
+  agent: string;
+  reason: string;
+}
+
+export interface RosterOmittedEntry {
+  role: string;
+  reason: string;
+}
+
+/**
+ * Atomic, immutable selection snapshot. It is a dispatch input, never a
+ * user-approval record.
+ */
+export interface RosterSelection {
+  snapshot_id: string;
+  run_key: string;
+  wave_id: string;
+  slice_id: string;
+  session_id: string;
+  workflow: WorkflowName;
+  stage_id: string;
+  profile_hash: string;
+  policy_hash: string;
+  scope_hash: string;
+  mapping_hash: string;
+  capability_epoch: string;
+  selected: RosterSelectionEntry[];
+  omitted: RosterOmittedEntry[];
+  triggers: string[];
+  stop_reason: RosterSelectionStopReason;
+  selected_at: string;
+  frozen_at: string;
+}
+
+/**
+ * Stable identity carried by dispatch, native results, child joins,
+ * completion envelopes and observability. `dispatch_id` identifies an
+ * attempt; `task_id` remains stable for the same slot assignment.
+ */
+export interface WorkIdentity {
+  run_id: string;
+  wave_id: string;
+  slice_id: string;
+  session_id: string;
+  workflow: WorkflowName;
+  stage_id: string;
+  stage_cursor: string;
+  capability_id: string;
+  capability_epoch: string;
+  slot_id: string;
+  task_id: string;
+  dispatch_id: string;
+  attempt: number;
+  worker_id: string;
+}
+
+export type PendingReason = "provider_running" | "awaiting_result" | "transport_reconnect";
+export interface PendingLease {
+  token: string;
+  observed_at: string;
+  revoked_at: string | null;
+}
+
+/**
+ * Pending is a durable lifecycle state, not a failure or a replacement
+ * signal. Terminal transitions retain the same work identity.
+ */
+export interface PendingState {
+  identity: WorkIdentity;
+  status: "authorized" | "running" | "pending" | "succeeded" | "failed" | "cancelled";
+  pending_reason?: PendingReason;
+  provider_ref?: string;
+  lease?: PendingLease;
+  terminal_signal?: string | null;
+  retry_of?: string | null;
+  updated_at: string;
+}
+export type PendingDispatchState = PendingState;
+
+export type ChildJoinStatus = "planned" | "authorized" | "pending" | "succeeded" | "failed" | "cancelled" | "conflict";
+export interface ChildJoin {
+  parent: WorkIdentity;
+  child: WorkIdentity;
+  state: ChildJoinStatus;
+  expected_artifact_ids: string[];
+  completion_envelope_ref: string | null;
+  attempt: number;
+  created_at: string;
+  joined_at: string;
+}
+
+export type CompletionOutcome = "pending" | "succeeded" | "failed" | "cancelled";
+export type CompletionTerminalSignal = "workflow_complete" | "native_tool_result" | "provider_terminal" | "contract_failure";
+export type CompletionSchemaStatus = "met" | "failed";
+export type CompletionDodStatus = "met" | "pending" | "failed";
+
+export interface CompletionArtifactRef {
+  artifact_id: string;
+  path: string;
+  sha256: string;
+  schema_status: CompletionSchemaStatus;
+  dod_status: CompletionDodStatus;
+}
+
+/**
+ * Unified terminal/pending result envelope consumed by workflow_complete,
+ * trusted native reconciliation and child joins.
+ */
+export interface CompletionEnvelope {
+  schema_version: 1;
+  identity: WorkIdentity;
+  outcome: CompletionOutcome;
+  terminal_signal: CompletionTerminalSignal | null;
+  artifact_refs: CompletionArtifactRef[];
+  evidence_ref: string | null;
+  conflict_ref: string | null;
+  completed_by: "workflow_complete" | "synchronous_tool_result" | "engine_task_caller";
+  emitted_at: string;
+}
+
+export type WorkflowLifecycleStatus = "ready" | "pending" | "paused" | "complete" | "skipped" | "failed" | "blocked" | "invalid";
+export interface WorkflowContractStatus {
+  stage: StageStatus;
+  lifecycle: WorkflowLifecycleStatus;
+  pause: PauseKind;
+  reason: string;
+}
+
+export type ControlPlaneFieldSource = "typed" | "profile" | "state" | "migration" | "legacy" | "none";
+export type ControlPlaneMigrationStatus = "typed" | "migrated" | "conflict" | "invalid";
+export interface ControlPlaneProvenance {
+  completion_intent: ControlPlaneFieldSource;
+  checkpoint_policy: ControlPlaneFieldSource;
+  roster_policy: ControlPlaneFieldSource;
+  roster_selection: ControlPlaneFieldSource;
+  work_identity: ControlPlaneFieldSource;
+  pending: ControlPlaneFieldSource;
+  child_join: ControlPlaneFieldSource;
+  completion_envelope: ControlPlaneFieldSource;
+  legacy_inputs: string[];
+  warnings: string[];
+  status: ControlPlaneMigrationStatus;
+}
+
+export interface MigrationReceipt {
+  id: string;
+  from_schema: number;
+  to_schema: number;
+  source_profile_hash: string;
+  target_profile_hash: string;
+  source_policy_hash: string | null;
+  target_policy_hash: string;
+  legacy_inputs: string[];
+  warnings: string[];
+  status: "complete" | "blocked";
+  migrated_at: string;
+}
 
 export interface Classification {
   type: TaskType;
@@ -44,12 +349,16 @@ export interface Classification {
   confidence: Confidence;
   workflow: WorkflowName;
   /**
-   * Model-decided autonomy (PHASE-0). The ONLY authority for the autonomous
-   * flag: `resolveWorkflow` and the P5 gate read this field, never the
-   * mechanical parser hint (`autonomyHint`) and never the legacy top-level
-   * `TeamState.autonomous` (read-compat only).
+   * Legacy/model routing autonomy input retained during migration. It may
+   * influence profile routing in legacy callers, but it is never checkpoint
+   * permission and cannot authorize a typed decision.
    */
   autonomous: boolean;
+  /**
+   * Optional orthogonal terminal-outcome intent. This is not checkpoint
+   * permission and is retained separately from the routing autonomy input.
+   */
+  completion_intent?: CompletionIntent;
   /** Model's one-sentence justification for the autonomy decision. */
   autonomous_reason?: string;
 }
@@ -89,7 +398,16 @@ export interface StageDef {
   produces?: string | string[];
   /** Human checkpoint label. */
   checkpoint?: string;
-  /** Autonomous branch decision text. */
+  /**
+   * Typed checkpoint permission. `autonomous` remains a display/migration
+   * input only and never authorizes a decision.
+   */
+  checkpoint_policy?: CheckpointPolicy;
+  /** Optional profile/stage completion target; never permission. */
+  completion_intent?: CompletionIntent;
+  /** Typed allowed semantic-role pool; legacy roles/role stay exact-manifest. */
+  roster_policy?: RosterPolicy;
+  /** Legacy autonomous prose: display/migration input only, never authorization. */
   autonomous?: string;
   /** Bash stages: the deterministic shell command to execute. */
   command?: string;
@@ -135,6 +453,10 @@ export interface Profile {
   description: string;
   match: ProfileMatch;
   stages: StageDef[];
+  /** Optional run default; completion intent is never checkpoint permission. */
+  completion_intent?: CompletionIntent;
+  /** Optional default inherited by stages with declared checkpoints. */
+  checkpoint_policy?: CheckpointPolicy;
   /** Custom profiles are explicit-only unless registered as auto-selectable. */
   autoSelect?: boolean;
 }
@@ -147,6 +469,8 @@ export interface DispatchCompletion {
   evidence: string;
   completed_by: "workflow_complete" | "synchronous_tool_result" | "engine_task_caller";
   completed_at: string;
+  /** Additive identity binding; legacy completion records may omit it. */
+  work_identity?: WorkIdentity;
 }
 
 export interface DispatchRecord {
@@ -154,12 +478,20 @@ export interface DispatchRecord {
   role: string;
   agent: string;
   tool_call_id?: string;
-  status: "authorized" | "running" | "succeeded" | "failed" | "cancelled";
+  /**
+   * `pending` is resumable background work, never an elapsed-time failure.
+   * Legacy records remain readable during migration.
+   */
+  status: "authorized" | "running" | "pending" | "succeeded" | "failed" | "cancelled";
   attempt: number;
   created_at: string;
   completed_at?: string;
   completion?: DispatchCompletion;
+  work_identity?: WorkIdentity;
+  pending?: PendingState;
+  completion_envelope?: CompletionEnvelope;
 }
+
 
 /**
  * A resolved dispatch occurrence for a stage. `slot` is the stable unique
@@ -170,8 +502,14 @@ export interface DispatchRecord {
  * multiplicity is never collapsed by Set/object-key deduplication.
  */
 export interface DispatchSlot {
+  /** Legacy slot spelling retained for existing callers. */
   slot: string;
+  /** Canonical persisted spelling; equivalent to `slot` when present. */
+  slot_id?: string;
+  /** Semantic role from which this occurrence was resolved. */
   role: string;
+  occurrence?: number;
+  facet?: string | null;
 }
 
 export interface CapabilityRosterEntry {
@@ -183,6 +521,10 @@ export interface CapabilityRosterEntry {
    */
   role: string;
   agent: string;
+  slot_id?: string;
+  semantic_role?: string;
+  occurrence?: number;
+  facet?: string | null;
 }
 
 export interface DispatchCapabilityState {
@@ -200,6 +542,10 @@ export interface DispatchCapabilityState {
   expected_roles?: string[];
   expected_count?: number;
   expected_roster?: CapabilityRosterEntry[];
+  /** Frozen adaptive selection bound to this capability epoch. */
+  roster_selection?: RosterSelection;
+  work_identity?: WorkIdentity;
+  pending?: PendingState[];
   status?: "ready" | "dispatched" | "joining" | "complete" | "invalidated";
   dispatches?: DispatchRecord[];
 }
@@ -211,25 +557,52 @@ export interface JoinSummary {
   roles: string[];
   evidence?: string;
   joined_at: string;
+  work_identity?: WorkIdentity;
 }
 
 /**
- * Durable checkpoint decision. Declared checkpoints (`stage.checkpoint`) are
- * prompt/display metadata only until a decision is recorded here; advance
- * refuses to leave a stage whose checkpoint is unresolved. `mode` records
- * whether the decision came from an interactive user or the autonomous path,
- * and `actor`/`rationale` preserve who decided and why.
+ * Durable checkpoint decision. The original fields are migration-compatible
+ * read inputs. Typed authorization requires the additive provenance fields;
+ * callers MUST NOT treat `mode: "autonomous"` or a string actor as proof.
  */
 export interface CheckpointDecision {
   stage_id: string;
   checkpoint: string;
   mode: "interactive" | "autonomous";
   decision: string;
+  /** Legacy actor spelling; typed callers use `actor_provenance`. */
   actor: string;
   rationale: string;
   decided_at: string;
+  run_id?: string;
+  checkpoint_id?: string;
+  checkpoint_kind?: CheckpointRuleKind;
+  authorization?: CheckpointAuthorization;
+  actor_provenance?: CheckpointActor;
+  capability_id?: string;
+  capability_epoch?: string;
+  policy_hash?: string;
+  work_identity?: WorkIdentity;
 }
 
+/**
+ * Canonical decision envelope for new callers. `CheckpointDecision` above is
+ * retained as the schema-1 migration record with string actor/mode fields.
+ */
+export interface TypedCheckpointDecision {
+  run_id: string;
+  stage_id: string;
+  checkpoint_id: string;
+  checkpoint_kind: CheckpointRuleKind;
+  decision: string;
+  authorization: CheckpointAuthorization;
+  actor: CheckpointActor;
+  capability_id: string;
+  capability_epoch: string;
+  policy_hash: string;
+  rationale: string;
+  decided_at: string;
+}
 /** Durable provenance of one slot's artifact contribution to a consilium stage. */
 export interface SlotArtifactRecord {
   /** Absolute path of the namespaced per-slot snapshot (`<id>-<slot>.json`). */
@@ -314,6 +687,7 @@ export interface LoopState {
   epoch: string;
   status: "running" | "complete" | "exhausted";
   outcome?: "needs_human" | "failed";
+  /** Durable history of loop re-entries. */
   history: LoopIterationRecord[];
   ended_at?: string;
 }
@@ -325,8 +699,13 @@ export interface TeamState {
   task: string;
   /** User feedback and prior task text retained across continuations. */
   history?: Array<{ task: string; feedback?: string; at: string }>;
+  /** Legacy read-compat input; never overrides typed completion/checkpoint policy. */
   autonomous?: boolean;
   workflow_override: boolean;
+  /** Persisted terminal-outcome intent; never checkpoint permission. */
+  completion_intent?: CompletionIntent;
+  /** Persisted typed checkpoint policy; malformed values fail closed. */
+  checkpoint_policy?: CheckpointPolicy;
   issue: { number: number; url?: string } | null;
   stage_cursor: string;
   stages: Array<{ id: string; status: StageStatus }>;
@@ -347,9 +726,27 @@ export interface TeamState {
   cursor_epoch?: string;
   run_key?: string;
   dispatch_capability?: DispatchCapabilityState;
-  join_summary?: JoinSummary;
-  /** Durable checkpoint decisions (additive, schema:1 compatible). */
+  /** Stable identity for the current work item, when migrated/issued. */
+  work_identity?: WorkIdentity;
+  /** Legacy schema-1 decisions retained only as migration input. */
   checkpoint_decisions?: CheckpointDecision[];
+  /** Immutable trusted terminal/escalation answers referenced by human decisions. */
+  trusted_checkpoint_answers?: TrustedCheckpointAnswer[];
+  /** Canonical policy-bound decisions with trusted actor provenance. */
+  typed_checkpoint_decisions?: TypedCheckpointDecision[];
+  roster_selection?: RosterSelection;
+  /** Optional per-stage snapshots for callers retaining historical selections. */
+  roster_selections?: Record<string, RosterSelection>;
+  /** Resumable provider/background lifecycle for the current work item. */
+  pending?: PendingState;
+  /** Durable orchestrator child ledger entry for the current parent stage. */
+  child_join?: ChildJoin;
+  child_joins?: ChildJoin[];
+  /** Canonical output/result envelope for the current work item. */
+  completion_envelope?: CompletionEnvelope;
+  /** Explicit receipt for schema/profile legacy migration. */
+  migration?: MigrationReceipt;
+  join_summary?: JoinSummary;
   /** Durable bounded-loop state (additive). */
   loop_state?: LoopState;
   /** Per-slot consilium artifact provenance + synthesis evidence (additive). */
