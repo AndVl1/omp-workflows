@@ -4,12 +4,18 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultFullstackRoles } from "../src/index.js";
 import { beginCapability, createCapability } from "../src/engine/durable.js";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { resolveConfig } from "../src/engine/config.js";
 import type { TeamState } from "../src/engine/types.js";
+
+const genericRoles = {
+  "regression-planner": "analyst",
+  "regression-executor": "manual-qa",
+  "regression-oracle": "qa",
+  "security-tester": "security-tester",
+} as const;
 
 function initGit(root: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
@@ -41,13 +47,13 @@ function writeState(root: string, capability: NonNullable<TeamState["dispatch_ca
 
 function publishMapping(root: string, availableAgents: string[]): void {
   mkdirSync(join(root, ".omp"), { recursive: true });
-  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: defaultFullstackRoles }) + "\n");
+  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: genericRoles }) + "\n");
   const config = resolveConfig(root);
   const mapping = buildAgentMapping({
     roles: config.roles,
     availableAgents,
     extraRoles: config.scope_map.map(entry => entry.dev_agent),
-    genericFallbackRoles: Object.keys(defaultFullstackRoles).filter(role => role !== "security-tester"),
+    genericFallbackRoles: Object.keys(genericRoles).filter(role => role !== "security-tester"),
   });
   writeAgentMapping(root, mapping);
 }

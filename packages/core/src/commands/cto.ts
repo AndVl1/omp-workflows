@@ -37,8 +37,6 @@ export interface ParsedCtoEnvelope {
    * decision.
    */
   autonomyHint: boolean;
-  /** @deprecated Use autonomyHint; retained for parsed-envelope consumers. */
-  autonomous: boolean;
   issue: number | null;
   branch: string | null;
 }
@@ -60,7 +58,7 @@ export function parseEnvelope(args: string, cwd: string): ParsedCtoEnvelope {
 
   const activeBranch = resolveActiveBranch(cwd);
   const branch = activeBranch === NO_GIT_BRANCH || activeBranch === DETACHED_BRANCH ? null : activeBranch;
-  return { task, autonomyHint, autonomous: autonomyHint, issue, branch };
+  return { task, autonomyHint, issue, branch };
 }
 
 function renderTeamsTable(cwd: string): string {

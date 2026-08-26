@@ -12,18 +12,18 @@ test("dispatcher lifecycle: task subagent contexts do not own the messenger", ()
   assert.equal(isMainSessionContext(undefined), true, "unknown hook context stays compatible");
 });
 
-test("dispatcher lifecycle: session cwd resolves from context with a process.cwd fallback", () => {
+test("dispatcher lifecycle: session cwd resolves from context only, never process.cwd", () => {
   // Explicit non-empty context cwd always wins.
   assert.equal(resolveSessionCwd({ cwd: "/tmp/project" }), "/tmp/project");
   assert.equal(resolveSessionCwd({ cwd: "/tmp/project", hasUI: true }), "/tmp/project");
-  // OMP 17.2.10 emits session_start without a cwd field — fall back to the
-  // process cwd so the dispatcher/command-copy paths still start.
-  assert.equal(resolveSessionCwd({}), process.cwd());
-  assert.equal(resolveSessionCwd({ hasUI: true }), process.cwd());
-  // Empty / non-string cwd is unusable — same fallback.
-  assert.equal(resolveSessionCwd({ cwd: "" }), process.cwd());
-  assert.equal(resolveSessionCwd({ cwd: 42 }), process.cwd());
-  // Unknown (non-object) contexts stay unresolved, preserving old behavior.
+  // OMP 17.2.10 emits session_start without a cwd field — no hidden
+  // process.cwd fallback: resolution fails closed instead.
+  assert.equal(resolveSessionCwd({}), undefined);
+  assert.equal(resolveSessionCwd({ hasUI: true }), undefined);
+  // Empty / non-string cwd is unusable — same fail-closed result.
+  assert.equal(resolveSessionCwd({ cwd: "" }), undefined);
+  assert.equal(resolveSessionCwd({ cwd: 42 }), undefined);
+  // Unknown (non-object) contexts stay unresolved.
   assert.equal(resolveSessionCwd(undefined), undefined);
   assert.equal(resolveSessionCwd(null), undefined);
 });
@@ -32,7 +32,7 @@ test("dispatcher lifecycle: canonical session manager cwd wins over a stale cont
   assert.equal(resolveSessionCwd({ cwd: "/stale/project", sessionManager }), "/canonical/project");
 });
 
-test("dispatcher lifecycle: session_start without context cwd still starts the dispatcher", () => {
+test("dispatcher lifecycle: session_start without context cwd starts nothing and leaves no lock", () => {
   const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
   const pi = {
     on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
@@ -58,7 +58,9 @@ test("dispatcher lifecycle: session_start without context cwd still starts the d
     assert.ok(sessionStart, "session_start handler registered");
     // 17.2.10-shaped context: interactive main session, no cwd field.
     sessionStart({ type: "session_start" }, { hasUI: true });
-    assert.ok(existsSync(lock), "dispatcher lock appears despite missing context cwd");
+    // Fail-closed: no context cwd -> no dispatcher, no command copy, no lock.
+    assert.ok(!existsSync(lock), "no dispatcher lock without a resolvable session cwd");
+    assert.ok(!existsSync(join(root, ".omp", "commands")), "no command copy without a resolvable session cwd");
 
     const sessionShutdown = handlers.get("session_shutdown");
     assert.ok(sessionShutdown, "session_shutdown handler registered");

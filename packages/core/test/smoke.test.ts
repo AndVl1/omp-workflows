@@ -16,7 +16,6 @@ import { tmpdir } from "node:os";
 import {
   registerTeamWorkflow,
   registerWorkflowCommands,
-  defaultFullstackRoles,
   loadAllProfiles,
   registerWorkflowProfiles,
   resolveWorkflow,
@@ -24,7 +23,9 @@ import {
   reopenFromFeedback,
 } from "@andvl1/omp-workflows-core";
 import { classificationToolGate } from "../src/gates/classification.js";
-import { runStage } from "../src/engine/stage.js";
+import { createTaskCaller, runStage, type TaskToolLike } from "../src/engine/stage.js";
+
+const genericRoles = { worker: "worker" };
 
 test("core: workflow commands register before project command discovery", async () => {
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
@@ -146,20 +147,6 @@ test("core: registered profiles are available and explicit workflow selects them
   assert.equal(selected?.name, custom.name);
 });
 
-test("core: defaultFullstackRoles includes generic regression roles", () => {
-  const keys = Object.keys(defaultFullstackRoles);
-  assert.ok(keys.length >= 16);
-  assert.equal(defaultFullstackRoles["backend-kotlin"], "developer-kotlin");
-  assert.equal(defaultFullstackRoles["frontend"], "frontend-developer");
-  assert.equal(defaultFullstackRoles["mobile"], "developer-mobile");
-  assert.equal(defaultFullstackRoles["regression-planner"], "analyst");
-  assert.equal(defaultFullstackRoles["regression-executor"], "manual-qa");
-  assert.equal(defaultFullstackRoles["regression-oracle"], "qa");
-  assert.equal(defaultFullstackRoles["product-analyst"], "product-analyst");
-  assert.equal(defaultFullstackRoles["product-researcher"], "product-researcher");
-  assert.equal(defaultFullstackRoles["product-critic"], "product-critic");
-  assert.equal(defaultFullstackRoles["product-strategist"], "product-strategist");
-});
 
 test("core: registerTeamWorkflow registers gates but NOT commands", () => {
 	const calls: Array<{ kind: string; key: string }> = [];
@@ -177,7 +164,7 @@ test("core: registerTeamWorkflow registers gates but NOT commands", () => {
 	};
 	registerTeamWorkflow(fakePi as unknown as Parameters<typeof registerTeamWorkflow>[0], {
 		label: "smoke-test",
-		roles: defaultFullstackRoles,
+    roles: genericRoles,
 	});
 
 	assert.ok(calls.some((c) => c.kind === "on" && c.key === "before_agent_start"));
@@ -204,7 +191,7 @@ test("core: task gate blocks launches without zero-step state", () => {
   }
 });
 test("core: workflow dispatch leaves model selection to OMP", async () => {
-  const calls: Array<{ agent: string; task: string }> = [];
+  const calls: Array<{ agent: string; task: string; name?: string }> = [];
   const state = {
     schema: 1 as const,
     branch: "feat/role-routing",
@@ -241,7 +228,8 @@ test("core: workflow dispatch leaves model selection to OMP", async () => {
   assert.equal(outcome.status, "done");
   assert.match(calls[0]?.task ?? "", /Workflow role: backend-kotlin/);
   assert.equal(calls.length, 1);
-  assert.deepEqual(Object.keys(calls[0] ?? {}).sort(), ["agent", "task"]);
+  assert.deepEqual(Object.keys(calls[0] ?? {}).sort(), ["agent", "name", "task"]);
+  assert.equal(calls[0]?.name, "implementation-backend-kotlin");
   assert.equal(calls[0]?.agent, "developer-kotlin");
 });
 test("core: feedback reopens affected stage and preserves history", () => {
@@ -368,13 +356,17 @@ test("core: consilium preserves role variants without pinning models", async () 
       artifactsDir: `${process.cwd()}/.work-state/artifacts`,
       flags: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null },
       agent: () => "architect",
-      task: {
-        call: async () => ({ id: "unused", output: "", artifacts: {}, exitCode: 0 }),
-        batch: async ({ tasks }) => {
+      task: createTaskCaller({
+        async execute(_toolCallId, params) {
+          const tasks = params.tasks as Array<{ name: string; agent: string; task: string }>;
           dispatched = tasks;
-          return tasks.map((_, index) => ({ id: String(index), output: "ok", artifacts: {}, exitCode: 0 }));
+          return {
+            output: {
+              results: tasks.map(() => ({ output: "ok", artifacts: {}, exitCode: 0 })),
+            },
+          };
         },
-      },
+      } satisfies TaskToolLike),
       pause: async () => undefined,
       log: () => undefined,
       resolveDevAgent: () => null,
@@ -390,14 +382,14 @@ test("core: consilium preserves role variants without pinning models", async () 
 
 
 
-test("fullstack: bundle imports core and registers engine", async () => {
-  const core = await import("@andvl1/omp-workflows-core");
+test("core: bundle boundary does not export fullstack defaults", async () => {
+  const core = await import("../src/index.js");
   assert.equal(typeof core.registerTeamWorkflow, "function");
-  assert.equal(typeof core.defaultFullstackRoles, "object");
-  assert.equal(Object.keys(core.defaultFullstackRoles).length, 24);
+  assert.equal("defaultFullstackRoles" in core, false);
+  assert.equal("defaultFullstackModelRoles" in core, false);
 });
 
-test("fullstack: default empty registerTeamWorkflow does not crash", () => {
+test("core: empty generic registerTeamWorkflow does not crash", () => {
   const fakePi = {
     setLabel: () => undefined,
     on: () => undefined,

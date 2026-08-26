@@ -47,9 +47,10 @@
     "@oh-my-pi/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
     "@types/node": "^22.0.0",
-    "tsx": "^4.19.0"
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "zod": "^3.25.76"
   },
   "engines": {
     "node": ">=20"

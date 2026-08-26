@@ -12,6 +12,19 @@
  * `vibe-report/sub-orchestration-2026-08-04.md`.
  */
 
+import type {
+  ChildJoin,
+  CheckpointPolicy,
+  CompletionEnvelope,
+  CompletionIntent,
+  ControlPlaneProvenance,
+  MigrationReceipt,
+  PendingState,
+  RosterPolicy,
+  RosterSelection,
+  WorkflowContractStatus,
+  WorkIdentity,
+} from "../engine/types.js";
 import type { PauseKind, WorkflowName } from "../engine/types.js";
 import type { ModelClassification } from "../engine/run.js";
 
@@ -186,6 +199,8 @@ export interface WaveRecord {
   started_at: string;
   /** ISO — set by finishWave. */
   finished_at?: string;
+  /** Stable identity of the wave's parent work item when admitted by the engine. */
+  work_identity?: WorkIdentity;
 }
 
 /**
@@ -213,8 +228,27 @@ export interface ChannelProfile {
   subscriptions?: string[];
 }
 
+/** Typed control-plane projection carried alongside legacy CTO fields. */
+export interface CtoControlPlaneFields {
+  completion_intent?: CompletionIntent;
+  checkpoint_policy?: CheckpointPolicy;
+  roster_policy?: RosterPolicy;
+  roster_selection?: RosterSelection;
+  roster_selections?: Record<string, RosterSelection>;
+  work_identity?: WorkIdentity;
+  pending?: PendingState;
+  child_join?: ChildJoin;
+  child_joins?: ChildJoin[];
+  completion_envelope?: CompletionEnvelope;
+  migration?: MigrationReceipt;
+  control_plane_provenance?: ControlPlaneProvenance;
+  control_plane_status?: WorkflowContractStatus;
+}
+
+
+
 /** Per-CTO-run persistent state under `.work-state/cto/<id>/state.json`. */
-export interface CtoState {
+export interface CtoState extends CtoControlPlaneFields {
   schema: 2;
   id: string;
   task: string;
@@ -257,6 +291,16 @@ export interface CtoState {
      * resolveWorkflow(type, complexity, autonomous) — validated by the gate.
      */
     workflow?: WorkflowName;
+    completion_intent?: CompletionIntent;
+    checkpoint_policy?: CheckpointPolicy;
+    roster_policy?: RosterPolicy;
+    roster_selection?: RosterSelection;
+    work_identity?: WorkIdentity;
+    pending?: PendingState;
+    child_join?: ChildJoin;
+    completion_envelope?: CompletionEnvelope;
+    control_plane_provenance?: ControlPlaneProvenance;
+    control_plane_status?: WorkflowContractStatus;
   }>;
   integration: {
     status: "pending" | "in_progress" | "done" | "failed";

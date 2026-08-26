@@ -1,20 +1,13 @@
 /**
- * Smoke tests for `packages/core/src/model-roles.ts` — the bundle-agnostic
- * model-role taxonomy shared with downstream bundles.
+ * Smoke tests for the bundle-agnostic model-role contracts.
  *
- * Verifies:
- *   1. The public exports resolve from the package barrel.
- *   2. `defaultFullstackModelRoles` is the same 14 entries fullstack ships today.
- *   3. `resolveRoleChain` returns class / fallback / none against a fixture inventory.
- *   4. `isResearchRequest` / `isResearchResponse` accept valid fixtures and reject
- *      malformed ones (type guard narrowing is exercised by the assert.equal call site).
+ * Core receives a caller-supplied taxonomy; fullstack owns its own preset.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-	defaultFullstackModelRoles,
 	isResearchRequest,
 	isResearchResponse,
 	resolveRoleChain,
@@ -55,13 +48,17 @@ function roleLookup(values: Record<string, string | undefined>) {
 }
 
 const fixedTimestamp = "2026-08-03T12:00:00.000Z";
+const MODEL_ROLES: ModelRoleEntry[] = [
+	{ role: "architect", agents: ["architect"], standardFallback: "@slow" },
+	{ role: "reviewer", agents: ["code-reviewer"], standardFallback: "@slow" },
+];
 
-test("core model-roles: defaultFullstackModelRoles exposes 13 entries", () => {
-	assert.equal(defaultFullstackModelRoles.length, 13);
+test("core model-roles: accepts a caller-supplied taxonomy", () => {
+	assert.equal(MODEL_ROLES.length, 2);
 });
 
-test("core model-roles: every entry has role/agents/standardFallback", () => {
-	for (const entry of defaultFullstackModelRoles) {
+test("core model-roles: every supplied entry has role/agents/standardFallback", () => {
+	for (const entry of MODEL_ROLES) {
 		assert.equal(typeof entry.role, "string");
 		assert.ok(Array.isArray(entry.agents) && entry.agents.length > 0);
 		for (const agent of entry.agents) assert.equal(typeof agent, "string");
@@ -69,6 +66,7 @@ test("core model-roles: every entry has role/agents/standardFallback", () => {
 		assert.ok(entry.standardFallback.startsWith("@"));
 	}
 });
+
 
 test("core model-roles: resolveRoleChain returns class selector when configured", () => {
 	const entry = { role: "example", agents: ["agent"], standardFallback: "@task" };
@@ -93,7 +91,7 @@ test("core model-roles: isResearchRequest accepts a valid request and rejects ga
 		kind: "omp-model-role-research-request",
 		schemaVersion: 1,
 		requestedAt: fixedTimestamp,
-		roles: defaultFullstackModelRoles,
+		roles: MODEL_ROLES,
 		availableModels: inventory,
 	};
 	assert.equal(isResearchRequest(request), true);
@@ -127,7 +125,7 @@ test("core model-roles: isResearchResponse accepts a valid response and rejects 
 		unavailableRoles: [{ role: "reviewer", reason: "No benchmark." }],
 		warnings: ["Coverage limited."],
 	};
-	assert.equal(isResearchResponse(validResponse, inventory), true);
+	assert.equal(isResearchResponse(validResponse, inventory, MODEL_ROLES), true);
 	assert.equal(
 		isResearchResponse(
 			{
@@ -135,10 +133,11 @@ test("core model-roles: isResearchResponse accepts a valid response and rejects 
 				recommendations: [{ ...validResponse.recommendations[0], benchmarkSources: [] }],
 			},
 			inventory,
+			MODEL_ROLES,
 		),
 		false,
 	);
-	assert.equal(isResearchResponse(null, inventory), false);
+	assert.equal(isResearchResponse(null, inventory, MODEL_ROLES), false);
 });
 
 test("core model-roles: validateResearchRequest / validateResearchResponse are the type guards", () => {
@@ -166,7 +165,7 @@ test("core model-roles: isResearchRequest accepts InventoryModel with null conte
 		kind: "omp-model-role-research-request",
 		schemaVersion: 1,
 		requestedAt: fixedTimestamp,
-		roles: defaultFullstackModelRoles,
+		roles: MODEL_ROLES,
 		availableModels: inventoryWithNulls,
 	};
 	assert.equal(isResearchRequest(request), true);
@@ -258,11 +257,11 @@ test("core model-roles: isResearchResponse accepts low/medium/high confidence an
 		};
 	}
 	for (const confidence of ["low", "medium", "high"] as const) {
-		assert.equal(isResearchResponse(makeResponse(confidence), inventory), true, `confidence=${confidence} should be accepted`);
+		assert.equal(isResearchResponse(makeResponse(confidence), inventory, MODEL_ROLES), true, `confidence=${confidence} should be accepted`);
 	}
 	for (const confidence of ["super-high", "LOW", "", "unknown"]) {
 		assert.equal(
-			isResearchResponse(makeResponse(confidence as ResearchRecommendation["confidence"]), inventory),
+			isResearchResponse(makeResponse(confidence as ResearchRecommendation["confidence"]), inventory, MODEL_ROLES),
 			false,
 			`confidence=${JSON.stringify(confidence)} should be rejected`,
 		);
@@ -275,10 +274,10 @@ test("core model-roles: second-bundle scenario compiles and runs against a ficti
 	// + isResearchRequest + ModelRoleEntry verbatim — the core surface must be
 	// bundle-agnostic. This test simulates a Rust-flavored bundle that ships its
 	// own taxonomy and exercises the part of the contract that is bundle-agnostic.
-	// NOTE: isResearchResponse checks recommendations against the fullstack role
-	// allowlist (defaultFullstackModelRoles), so a Rust bundle cannot reuse it
-	// without supplying its own allowlist — the second-bundle pattern is
-	// documented as "reuses types + resolveRoleChain + isResearchRequest".
+	// The response validator accepts the caller-supplied taxonomy, so a second
+	// bundle can validate recommendations without importing fullstack defaults.
+	// The second-bundle case below intentionally exercises the structural request
+	// contract with a fictional Rust taxonomy.
 	const rustInventory: InventoryModel[] = [
 		{
 			selector: "rust/smol",
@@ -320,8 +319,7 @@ test("core model-roles: second-bundle scenario compiles and runs against a ficti
 	const emptyLookup: RoleLookup = { getModelRole: () => undefined };
 	const noneResolution = resolveRoleChain(RUST_MODEL_ROLES[2]!, emptyLookup, rustInventory);
 	assert.deepEqual(noneResolution, { status: "none" });
-	// The fictional taxonomy flows through isResearchRequest unchanged (the request
-	// validator is purely structural and does not pin to defaultFullstackModelRoles).
+	// The fictional taxonomy flows through isResearchRequest unchanged.
 	const rustRequest: ResearchRequest = {
 		kind: "omp-model-role-research-request",
 		schemaVersion: 1,

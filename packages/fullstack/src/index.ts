@@ -13,6 +13,7 @@
  * with your own role mapping. Do not depend on this package.
  */
 
+import { join, resolve } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionUIContext,
@@ -21,22 +22,15 @@ import type {
   SessionStartEvent,
 } from "@oh-my-pi/pi-coding-agent";
 import {
-  defaultFullstackFlags,
-  defaultFullstackModelRoles,
-  defaultFullstackRoles,
-  defaultFullstackScopeMap,
+  createWorkflowToolAdapter,
   findActiveCtoRun,
   registerTeamWorkflow,
-  beginCapability,
-  completeDispatch,
-  advanceCursor,
-  recordCheckpointDecision,
-  prepareWorkflowState,
   readAgentMapping,
-  resolveState,
-  type DispatchAuth,
-  type ModelClassification,
-  type WorkflowPrepareOptions,
+  type ModelRoleEntry,
+  type RoleConfig,
+  type ScopeRuntimeClassTable,
+  type WorkflowOwnerIdentity,
+  type WorkflowToolAdapter,
 } from "@andvl1/omp-workflows-core";
 import { registerWorkflowCommands } from "./workflow-commands.js";
 import { ensureCommandsForSession } from "./copy-commands.js";
@@ -45,17 +39,106 @@ import { createChannelSet, queueCtoDelivery, startChannelDispatcher, type InboxT
 import { createAskRedirectGate } from "./messenger-channel.js";
 import { createCtoModeReminderHandler } from "./cto-mode-reminder.js";
 import {
-	RESEARCH_REQUEST_MARKER_END,
-	RESEARCH_REQUEST_MARKER_START,
-	buildResearchRequestDeveloperInstruction,
+  RESEARCH_REQUEST_MARKER_END,
+  RESEARCH_REQUEST_MARKER_START,
+  buildResearchRequestDeveloperInstruction,
 } from "./before-agent-start-marker.js";
-import { resolveWorkflowContract } from "@andvl1/omp-workflows-core";
 import {
-	handleSubagentsCommand,
-	registerSubagentTree,
-	type SubagentTreeController,
+  handleSubagentsCommand,
+  registerSubagentTree,
+  type SubagentTreeController,
 } from "./subagent-tree.js";
 // Auto-derived from core taxonomy; test-invariант в test/omp-model-roles.test.ts:439-446 ловит drift.
+
+export const defaultFullstackRoles: RoleConfig["roles"] = {
+  analyst: "analyst",
+  "tech-researcher": "tech-researcher",
+  diagnostics: "diagnostics",
+  architect: "architect",
+  architect_minimal: "architect",
+  architect_clean: "architect",
+  architect_pragmatic: "architect",
+  "backend-kotlin": "developer-kotlin",
+  go: "developer-go",
+  frontend: "frontend-developer",
+  mobile: "developer-mobile",
+  android: "developer-mobile",
+  qa: "qa",
+  "manual-qa": "manual-qa",
+  "code-reviewer": "code-reviewer",
+  "security-tester": "security-tester",
+  devops: "devops",
+  "regression-planner": "analyst",
+  "regression-executor": "manual-qa",
+  "regression-oracle": "qa",
+  "product-analyst": "product-analyst",
+  "product-researcher": "product-researcher",
+  "product-critic": "product-critic",
+  "product-strategist": "product-strategist",
+};
+
+export const defaultFullstackScopeMap: RoleConfig["scope_map"] = [
+  { glob: ["**/iosApp/**", "**/composeApp/**", "**/commonMain/**", "**/androidMain/**"], scope: "mobile", dev_agent: "developer-mobile" },
+  { glob: ["**/*.tsx", "**/*.jsx", "**/*.vue", "**/*.ts", "**/src/jsMain/**", "**/miniapp/**", "**/frontend/**"], scope: "frontend", dev_agent: "frontend-developer" },
+  { glob: ["**/*.go", "**/go.mod", "**/go.sum"], scope: "go", dev_agent: "developer-go" },
+  { glob: ["**/Dockerfile", "**/*.yaml", "**/*.yml", "**/helm/**", "**/.github/**", "**/k8s/**"], scope: "devops", dev_agent: "devops" },
+  { glob: ["**/*.kt", "**/*.java", "**/src/main/**"], scope: "backend-kotlin", dev_agent: "developer-kotlin" },
+];
+
+export const defaultFullstackFlags: RoleConfig["flags"] = {
+  has_security: ["**/auth/**", "**/security/**", "**/*crypto*", "**/*Secret*", "**/*Token*"],
+  has_infra: ["**/Dockerfile", "**/helm/**", "**/k8s/**", "**/.github/workflows/**"],
+};
+
+/** Domain runtime classification moved out of the core default path (INT-001). */
+export const defaultFullstackScopeRuntimeClasses: ScopeRuntimeClassTable = {
+	"backend-kotlin": "runtime",
+	go: "runtime",
+	frontend: "runtime",
+	mobile: "runtime",
+	devops: "runtime",
+};
+
+/** Domain UI scopes moved out of the core default path (INT-001). */
+export const defaultFullstackScopeUiClasses: ScopeRuntimeClassTable = {
+	frontend: true,
+	mobile: true,
+};
+
+export const defaultFullstackModelRoles: ModelRoleEntry[] = [
+  { role: "architect", agents: ["architect"], standardFallback: "@slow" },
+  { role: "reviewer", agents: ["code-reviewer"], standardFallback: "@slow" },
+  { role: "security", agents: ["security-tester"], standardFallback: "@slow" },
+  { role: "researcher", agents: ["tech-researcher", "discovery"], standardFallback: "@smol" },
+  { role: "analyst", agents: ["analyst"], standardFallback: "@task" },
+  { role: "developer-go", agents: ["developer-go"], standardFallback: "@task" },
+  { role: "developer-kotlin", agents: ["developer-kotlin"], standardFallback: "@task" },
+  { role: "frontend-developer", agents: ["frontend-developer"], standardFallback: "@task" },
+  { role: "developer-mobile", agents: ["developer-mobile", "init-mobile"], standardFallback: "@task" },
+  { role: "devops", agents: ["devops"], standardFallback: "@task" },
+  { role: "diagnostics", agents: ["diagnostics"], standardFallback: "@task" },
+  { role: "qa", agents: ["qa"], standardFallback: "@task" },
+  { role: "manual-qa", agents: ["manual-qa"], standardFallback: "@task" },
+];
+
+export interface FullstackPreset {
+  roles: RoleConfig["roles"];
+  scopeMap: RoleConfig["scope_map"];
+  flags: RoleConfig["flags"];
+  scopeRuntimeClasses: ScopeRuntimeClassTable;
+  scopeUiClasses: ScopeRuntimeClassTable;
+  modelRoles: readonly ModelRoleEntry[];
+}
+
+export const fullstackPreset: FullstackPreset = {
+  roles: defaultFullstackRoles,
+  scopeMap: defaultFullstackScopeMap,
+  flags: defaultFullstackFlags,
+  scopeRuntimeClasses: defaultFullstackScopeRuntimeClasses,
+  scopeUiClasses: defaultFullstackScopeUiClasses,
+  modelRoles: defaultFullstackModelRoles,
+};
+// Auto-derived from the explicit fullstack taxonomy; tests guard drift.
 const ROLE_COUNT = defaultFullstackModelRoles.length;
 
 /**
@@ -65,7 +148,7 @@ const ROLE_COUNT = defaultFullstackModelRoles.length;
  * OMP runtimes omit `cwd` from lifecycle/tool contexts, while other versions
  * can leave the copied context value stale after a session move; using the
  * manager first keeps commands and durable transitions on the same worktree.
- * The context and process cwd remain compatibility fallbacks.
+ * A missing cwd remains unavailable; the process cwd is never substituted.
  */
 export function resolveSessionCwd(ctx: unknown): string | undefined {
 	if (!ctx || typeof ctx !== "object") return undefined;
@@ -76,11 +159,11 @@ export function resolveSessionCwd(ctx: unknown): string | undefined {
 			const sessionCwd = manager.getCwd();
 			if (typeof sessionCwd === "string" && sessionCwd.length > 0) return sessionCwd;
 		} catch {
-			// Fall through to the context/process fallback.
+			// Fall through to the context cwd.
 		}
 	}
 	if (typeof objectContext.cwd === "string" && objectContext.cwd.length > 0) return objectContext.cwd;
-	return process.cwd();
+	return undefined;
 }
 function summarizeAgentMapping(cwd: string): {
   generated_at: string;
@@ -183,240 +266,50 @@ export function isMainSessionContext(ctx: unknown): boolean {
 	if (!("hasUI" in ctx)) return true;
 	return ctx.hasUI !== false;
 }
+export const FULLSTACK_BUNDLE_ID = "@andvl1/omp-workflows-fullstack";
+export const FULLSTACK_ACTIVATION_MARKER = "omp-fullstack";
 
-
-export function registerWorkflowTools(pi: ExtensionAPI): void {
-  // Older OMP/test runtimes may not expose the schema helper. Keep the
-  // extension loadable there; tool registration is available when zod exists.
-  if (!pi.zod) return;
-  const { z } = pi.zod;
-  const emptyParameters = z.object({}) as never;
-  type ToolResult = { content: [{ type: "text"; text: string }]; details: unknown };
-  const result = (value: unknown): ToolResult => ({
-    content: [{ type: "text", text: JSON.stringify(value) }],
-    details: value,
-  });
-  const contextError = (ctx: unknown): ToolResult | null =>
-    isMainSessionContext(ctx)
-      ? null
-      : result({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "workflow control tools are available only in the main session" });
-  const stateSummary = (cwd: string): unknown => {
-    const resolved = resolveState(cwd);
-    if (resolved.invalid) return { ok: false, code: "WORKFLOW_STATE_INVALID", error: "workflow state path is invalid or unsafe" };
-    if (!resolved.state) return { ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow state not found" };
-    const state = resolved.state;
-    const capability = state.dispatch_capability;
-    return {
-      ok: true,
-      branch: state.branch,
-      workflow: state.classification?.workflow,
-      stage_cursor: state.stage_cursor,
-      cursor_epoch: state.cursor_epoch,
-      stages: state.stages,
-      pause: state.pause,
-      agent_mapping: summarizeAgentMapping(cwd),
-      join_summary: state.join_summary,
-      capability: capability ? {
-        capability_id: capability.capability_id,
-        kind: capability.kind,
-        status: capability.status,
-        expected_roles: capability.expected_roles,
-        dispatches: (capability.dispatches ?? []).map((dispatch) => ({
-          id: dispatch.id,
-          role: dispatch.role,
-          agent: dispatch.agent,
-          tool_call_id: dispatch.tool_call_id,
-          status: dispatch.status,
-          completed: Boolean(dispatch.completion),
-          completed_by: dispatch.completion?.completed_by,
-          artifact_ids: dispatch.completion?.artifact_ids ?? [],
-          outcome: dispatch.completion?.outcome,
-        })),
-      } : null,
-    };
+export function fullstackOwnerForCwd(cwd: string): WorkflowOwnerIdentity {
+  const root = resolve(cwd);
+  return {
+    owner_id: FULLSTACK_BUNDLE_ID,
+    bundle_id: FULLSTACK_BUNDLE_ID,
+    owner_kind: "fullstack",
+    activation_marker: FULLSTACK_ACTIVATION_MARKER,
+    host_range: ">=17 <19",
+    provenance: {
+      package: FULLSTACK_BUNDLE_ID,
+      entrypoint: "dist/index.js",
+      cwd: root,
+      config_path: join(root, ".omp", "team.config.json"),
+    },
   };
-  const classificationParameters = z.object({
-    type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"]),
-    complexity: z.enum(["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"]),
-    confidence: z.enum(["HIGH", "MEDIUM", "LOW"]),
-    autonomous: z.boolean(),
-    autonomous_reason: z.string().optional(),
-    workflow: z.string().optional(),
-  });
-  pi.registerTool({
-    name: "workflow_prepare",
-    label: "Prepare workflow state",
-    description: "Persist PHASE-0 classification and initialize or reopen engine-owned workflow state.",
-    parameters: z.object({
-      task: z.string().min(1),
-      branch: z.string().min(1),
-      classification: classificationParameters.optional(),
-      files: z.array(z.string().min(1)).default(() => []),
-      issue: z.union([z.number().int(), z.object({ number: z.number().int(), url: z.string().optional() })]).nullable().default(null),
-      continuation: z.object({
-        feedback: z.string().min(1),
-        stageId: z.string().min(1),
-      }).optional(),
-    }) as never,
-    async execute(_id, params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = resolveSessionCwd(ctx);
-      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      const input = params as {
-        task: string;
-        branch: string;
-        classification?: ModelClassification;
-        files?: string[];
-        issue?: number | { number: number; url?: string } | null;
-        continuation?: { feedback: string; stageId: string };
-      };
-      if (!input.continuation && !input.classification) {
-        return result({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: "new workflow preparation requires a complete classification" });
-      }
-      try {
-        const options: WorkflowPrepareOptions = {
-          task: input.task,
-          cwd,
-          branch: input.branch,
-          autonomous: input.classification?.autonomous ?? false,
-          classification: input.classification,
-          files: input.files,
-          issue: typeof input.issue === "number" ? { number: input.issue } : input.issue ?? null,
-          continuation: input.continuation,
-        };
-        const prepared = prepareWorkflowState(options);
-        return result({
-          ok: true,
-          transition: "prepare",
-          state_path: prepared.statePath,
-          artifacts_dir: prepared.artifactsDir,
-          workflow: prepared.profile.name,
-          classification: prepared.classification,
-          state: stateSummary(cwd),
-        });
-      } catch (error) {
-        return result({ ok: false, code: "WORKFLOW_PREPARE_FAILED", error: String(error) });
-      }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_begin",
-    label: "Begin workflow stage",
-    description: "Issue a durable opaque capability for the current workflow stage.",
-    parameters: emptyParameters,
-    async execute(_id, _params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = resolveSessionCwd(ctx);
-      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      try {
-        await waitForFullstackAgentMappings(cwd);
-        const transition = beginCapability(cwd);
-        if (!transition.ok) return result({ ok: false, code: "WORKFLOW_BEGIN_REJECTED", error: transition.error, state: transition.state ? stateSummary(cwd) : undefined });
-        return result({ ok: true, transition: "begin", handoff: transition.handoff, state: stateSummary(cwd) });
-      } catch (error) {
-        return result({ ok: false, code: "WORKFLOW_BEGIN_FAILED", error: String(error) });
-      }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_status",
-    label: "Workflow status",
-    description: "Read the current durable workflow stage and dispatch status.",
-    parameters: emptyParameters,
-    async execute(_id, _params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = resolveSessionCwd(ctx);
-      return result(cwd ? stateSummary(cwd) : { ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-    },
-  });
-  pi.registerTool({
-    name: "workflow_instructions",
-    label: "Workflow instructions",
-    description: "Read the current structured workflow stage contract.",
-    parameters: emptyParameters,
-    async execute(_id, _params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      try {
-        const contract = resolveWorkflowContract(resolveSessionCwd(ctx) ?? process.cwd());
-        return result(contract);
-      } catch (error) {
-        return result({ ok: false, code: "WORKFLOW_RESOLUTION_FAILED", error: String(error) });
-      }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_complete",
-    label: "Complete workflow dispatch",
-    description: "Record durable completion for an authorized workflow dispatch. Copy the compact profile_hash fingerprint exactly from the current workflow handoff; do not abbreviate or reconstruct it.",
-    parameters: z.object({
-      dispatch_id: z.string().min(1), token: z.string().min(1), capability_id: z.string().min(1),
-      run_key: z.string().min(1), branch: z.string().min(1), workflow: z.string().min(1), profile_hash: z.string().min(1), stage_cursor: z.string().min(1), cursor_epoch: z.string().min(1), evidence: z.string().min(1),
-      artifact_ids: z.array(z.string().min(1)).default(() => []),
-      outcome: z.enum(["succeeded", "failed", "cancelled"]).default("succeeded"),
-    }) as never,
-    async execute(_id, params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = resolveSessionCwd(ctx);
-      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      const input = params as DispatchAuth & { dispatch_id: string; evidence: string; artifact_ids?: string[]; outcome: "succeeded" | "failed" | "cancelled" };
-      try {
-        const transition = completeDispatch(cwd, { ...input, completed_by: "workflow_complete" });
-        return transition.ok ? result({ ok: true, transition: "complete", dispatch_id: input.dispatch_id, state: transition.state, record: transition.record }) : result({ ok: false, code: "WORKFLOW_COMPLETE_REJECTED", error: transition.error, dispatch_id: input.dispatch_id });
-      } catch (error) { return result({ ok: false, code: "WORKFLOW_COMPLETE_FAILED", error: String(error), dispatch_id: input.dispatch_id }); }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_checkpoint",
-    label: "Record checkpoint decision",
-    description: "Persist a durable decision for a declared stage checkpoint (interactive user answer or autonomous rationale). Unresolved checkpoints block workflow_advance.",
-    parameters: z.object({
-      token: z.string().min(1), capability_id: z.string().min(1),
-      run_key: z.string().min(1), branch: z.string().min(1), workflow: z.string().min(1), profile_hash: z.string().min(1), stage_cursor: z.string().min(1), cursor_epoch: z.string().min(1),
-      checkpoint: z.string().min(1), mode: z.enum(["interactive", "autonomous"]), decision: z.string().min(1),
-      actor: z.string().default("orchestrator"), rationale: z.string().default(""),
-    }) as never,
-    async execute(_id, params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = resolveSessionCwd(ctx);
-      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      const input = params as DispatchAuth & { checkpoint: string; mode: "interactive" | "autonomous"; decision: string; actor: string; rationale: string };
-      try {
-        const transition = recordCheckpointDecision(cwd, input);
-        return transition.ok ? result({ ok: true, transition: "checkpoint", checkpoint: input.checkpoint, state: stateSummary(cwd) }) : result({ ok: false, code: "WORKFLOW_CHECKPOINT_REJECTED", error: transition.error });
-      } catch (error) { return result({ ok: false, code: "WORKFLOW_CHECKPOINT_FAILED", error: String(error) }); }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_advance",
-    label: "Advance workflow",
-    description: "Join the current stage and advance its durable cursor after all dispatches complete.",
-    parameters: z.object({ token: z.string().min(1), capability_id: z.string().min(1), run_key: z.string().min(1), branch: z.string().min(1), workflow: z.string().min(1), profile_hash: z.string().min(1), stage_cursor: z.string().min(1), cursor_epoch: z.string().min(1), evidence: z.string().min(1) }) as never,
-    async execute(_id, params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = resolveSessionCwd(ctx);
-      if (!cwd) return result({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      const input = params as DispatchAuth & { evidence: string };
-      try {
-        const transition = advanceCursor(cwd, input);
-        return transition.ok ? result({ ok: true, transition: "advance", stage_cursor: transition.state.stage_cursor, cursor_epoch: transition.state.cursor_epoch, handoff: transition.handoff, state: stateSummary(cwd) }) : result({ ok: false, code: "WORKFLOW_ADVANCE_REJECTED", error: transition.error });
-      } catch (error) { return result({ ok: false, code: "WORKFLOW_ADVANCE_FAILED", error: String(error) }); }
-    },
-  });
 }
+
+const fullstackWorkflowToolAdapter: WorkflowToolAdapter = createWorkflowToolAdapter({
+  resolveCwd: resolveSessionCwd,
+  owner: fullstackOwnerForCwd,
+  isMainSession: isMainSessionContext,
+  beforeBegin: async cwd => { await waitForFullstackAgentMappings(cwd); },
+  mappingSummary: summarizeAgentMapping,
+});
+
+/** Fullstack keeps only bundle-specific adaptation; core owns tool behavior. */
+export function registerWorkflowTools(pi: ExtensionAPI): void {
+  fullstackWorkflowToolAdapter.register(pi);
+}
+
 
 export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   registerTeamWorkflow(pi, {
     label: "omp-workflows-fullstack",
-    roles: defaultFullstackRoles,
-    scopeMap: defaultFullstackScopeMap,
-    flags: defaultFullstackFlags,
+    roles: fullstackPreset.roles,
+    scopeMap: fullstackPreset.scopeMap,
+    flags: fullstackPreset.flags,
+    scopeRuntimeClasses: fullstackPreset.scopeRuntimeClasses,
+    scopeUiClasses: fullstackPreset.scopeUiClasses,
+    resolveCwd: resolveSessionCwd,
+    owner: fullstackOwnerForCwd,
   });
   registerWorkflowTools(pi);
   // Register the three workflow entry points while the extension is loaded.

@@ -63,6 +63,27 @@ function writeFeature(cwd: string, slug: string, state: TeamState): void {
   writeFileSync(join(dir, "state.json"), JSON.stringify(state, null, 2));
 }
 
+/**
+ * INT-001: the role→agent mapping is caller-supplied data now — core no
+ * longer substitutes fullstack defaults on the config default path.
+ */
+const REPORT_FIXTURE_ROLES: Record<string, string> = {
+  qa: "qa",
+  analyst: "analyst",
+  "tech-researcher": "tech-researcher",
+  architect_minimal: "architect",
+  architect_clean: "architect",
+  architect_pragmatic: "architect",
+  "code-reviewer": "code-reviewer",
+  "security-tester": "security-tester",
+};
+
+function writeRolesConfig(cwd: string): void {
+  const dir = join(cwd, ".omp");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "team.config.json"), JSON.stringify({ roles: REPORT_FIXTURE_ROLES }, null, 2));
+}
+
 test("do-work: normalizes per-feature TeamState schema 1 into SessionReport", () => {
   const cwd = tmpWorkspace();
   try {
@@ -473,6 +494,7 @@ test("do-work: full-feature stages carry resolved agents, original roles, and de
   const cwd = tmpWorkspace();
   try {
     writeFeature(cwd, "session-report", makeTeamState());
+    writeRolesConfig(cwd);
     // No artifacts written on disk: declared outputs must survive as declared
     // artifact ids even when the files are missing (missing ≠ undeclared).
     const report = buildSessionReport(cwd, { kind: "do-work" });
@@ -632,6 +654,7 @@ test("do-work: consilium roster honors configured roster_overrides (add/replace)
     writeFileSync(
       join(ompDir, "team.config.json"),
       JSON.stringify({
+        roles: REPORT_FIXTURE_ROLES,
         roster_overrides: {
           code_review: { add: ["security-tester"] },
           architecture: { replace: ["architect_clean"] },
@@ -697,10 +720,12 @@ test("do-work: profile-backed stages carry a bounded reconstructed promptPreview
     writeFeature(cwd, "session-report", state);
     const artifactsDir = join(cwd, ".work-state", "features", "session-report", "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
+    const artifactsFile = join(artifactsDir, "implementation.json");
     writeFileSync(
-      join(artifactsDir, "implementation.json"),
+      artifactsFile,
       JSON.stringify({ type: "implementation", title: "Impl plan", notes: "x" }, null, 2),
     );
+    writeRolesConfig(cwd);
 
     const report = buildSessionReport(cwd, { kind: "do-work" });
 

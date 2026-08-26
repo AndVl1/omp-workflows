@@ -13,11 +13,15 @@ type Registered = {
 
 function commandHarness(
 	transformPrompt: (prompt: string) => string = prompt => prompt,
+	sessionCwd = process.cwd(),
 ): { commands: Map<string, Registered>; prompts: string[]; notifications: string[] } {
 	const commands = new Map<string, Registered>();
 	const prompts: string[] = [];
 	const notifications: string[] = [];
 	registerWorkflowCommands({
+		on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+			if (name === "session_start") handler({}, { cwd: sessionCwd });
+		},
 		registerCommand(name: string, options: Registered) {
 			commands.set(name, options);
 		},
@@ -65,6 +69,8 @@ test("fullstack: direct /do-work and /team send prompts through OMP", async () =
 	assert.ok(prompts[0]?.includes("classification pass"));
 	assert.ok(prompts[1]?.includes("Fresh team task"));
 	assert.ok(prompts[1]?.includes("classification pass"));
+	assert.match(prompts[0] ?? "", /typed `workflow_checkpoint` envelope/);
+	assert.match(prompts[0] ?? "", /actor_provenance/);
 	assert.deepEqual(notifications.map(message => message.split(":")[0]), ["do-work", "team"]);
 });
 test("fullstack: workflow commands use the session manager cwd after a context cwd drift", async () => {
@@ -72,7 +78,7 @@ test("fullstack: workflow commands use the session manager cwd after a context c
 	const stale = mkdtempSync(join(tmpdir(), "omp-command-stale-"));
 	try {
 		execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-		const { commands, prompts } = commandHarness();
+		const { commands, prompts } = commandHarness(prompt => prompt, canonical);
 		await commands.get("do-work")?.handler("Canonical branch task", context(stale, [], "session-drift", canonical));
 
 		assert.equal(prompts.length, 1);
@@ -98,15 +104,21 @@ test("fullstack: external hook boundary can augment /do-work prompt", async () =
 });
 
 test("fullstack: direct /cto handler emits fresh and standby prompts", async () => {
-	const { commands, prompts, notifications } = commandHarness();
-	const ctx = context(process.cwd(), notifications);
+	const root = mkdtempSync(join(tmpdir(), "omp-command-cto-"));
+	try {
+		execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+		const { commands, prompts, notifications } = commandHarness(prompt => prompt, root);
+		const ctx = context(root, notifications);
 
-	await commands.get("cto")?.handler("Fresh CTO task", ctx);
-	assert.ok(prompts[0]?.includes("Fresh CTO task"));
-	assert.ok(prompts[0]?.includes("/cto workflow"));
-	assert.ok(notifications.some(message => message.startsWith("cto: Fresh CTO task")));
+		await commands.get("cto")?.handler("Fresh CTO task", ctx);
+		assert.ok(prompts[0]?.includes("Fresh CTO task"));
+		assert.ok(prompts[0]?.includes("/cto workflow"));
+		assert.ok(notifications.some(message => message.startsWith("cto: Fresh CTO task")));
 
-	await commands.get("cto")?.handler("", ctx);
-	assert.ok(prompts[1]?.includes("/cto STANDBY"));
-	assert.ok(notifications.some(message => message.startsWith("cto: standby mode")));
+		await commands.get("cto")?.handler("", ctx);
+		assert.ok(prompts[1]?.includes("/cto STANDBY"));
+		assert.ok(notifications.some(message => message.startsWith("cto: standby mode")));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });

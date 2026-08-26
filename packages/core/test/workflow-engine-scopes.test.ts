@@ -1,9 +1,8 @@
 /**
  * Durable checkpoint decisions and bounded loop re-entry (scopes 4-5):
- *   - interactive and autonomous checkpoint decisions persist and unresolved
- *     checkpoints block advance;
- *   - the interpreter auto-records autonomous checkpoint decisions and fails
- *     closed for interactive ones;
+ *   - interactive and routing-autonomy checkpoint attempts persist no
+ *     authorization while unresolved checkpoints block advance;
+ *   - only explicit typed, policy-bound decisions can unblock a checkpoint;
  *   - loops actually re-enter `back_to` with a fresh epoch/capability,
  *     append durable iteration history, respect `max_iterations`, and map
  *     exhaustion to needs_human/failed;
@@ -18,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
 import { createCapability, authorizeDispatch, completeDispatch, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
+import { appendCheckpointDecision, checkpointAnswerBinding, checkpointPolicyHash, recordTrustedCheckpointAnswer, validateCheckpointDecision } from "../src/engine/checkpoints.js";
 import { writeState } from "../src/engine/state.js";
 import { run } from "../src/engine/run.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
@@ -119,6 +119,44 @@ function readState(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "features", "loop", "state.json"), "utf8")) as TeamState;
 }
 
+function typedCheckpoint(root: string, stageId: string, checkpointId: string, decision = "proceed") {
+  const state = readState(root);
+  const policy = state.checkpoint_policy;
+  const capability = state.dispatch_capability;
+  assert.ok(policy, "checkpoint test state must carry a typed policy");
+  assert.ok(capability?.capability_id && capability.issued_for?.cursor_epoch, "checkpoint test state must carry capability binding");
+  const rule = policy.rules[checkpointId];
+  assert.ok(rule, `checkpoint test policy must define ${checkpointId}`);
+  const trusted = recordTrustedCheckpointAnswer(state, {
+    answer_id: `scope-test/${stageId}/${checkpointId}`,
+    channel: "terminal",
+    reference: `terminal-answer/scope-test/${stageId}/${checkpointId}`,
+    stage_id: stageId,
+    checkpoint_id: checkpointId,
+    decision,
+  });
+  writeState(root, trusted.state, { featureSlug: "loop" });
+  return {
+    run_id: state.work_identity?.run_id ?? state.run_key ?? state.branch,
+    stage_id: stageId,
+    checkpoint_id: checkpointId,
+    checkpoint_kind: rule.kind,
+    decision,
+    authorization: "human" as const,
+    actor: { kind: "user" as const, ref: trusted.answer.reference, proof: trusted.proof },
+    capability_id: capability.capability_id,
+    capability_epoch: capability.issued_for!.cursor_epoch,
+    policy_hash: checkpointPolicyHash(policy),
+    rationale: "explicit typed test answer",
+    decided_at: new Date().toISOString(),
+  };
+}
+
+function persistTypedCheckpoint(root: string, stageId: string, checkpointId: string, decision = "proceed"): void {
+  const typed = typedCheckpoint(root, stageId, checkpointId, decision);
+  writeState(root, appendCheckpointDecision(readState(root), typed), { featureSlug: "loop" });
+}
+
 const LOOP_PROFILE: Profile = {
   name: "loop-regression",
   title: "Loop regression",
@@ -161,7 +199,7 @@ function runSingleStage(
   return issued;
 }
 
-test("checkpoint: unresolved declared checkpoint blocks advance; recorded decision unblocks", () => {
+test("checkpoint: unresolved declared checkpoint blocks advance; an explicit typed decision unblocks", () => {
   const root = mkdtempSync(join(tmpdir(), "ck-block-"));
   try {
     initGit(root, "feat/ck");
@@ -178,29 +216,170 @@ test("checkpoint: unresolved declared checkpoint blocks advance; recorded decisi
 
     const blocked = advanceCursor(root, { ...advanceAuth(issued), evidence: "done" });
     assert.equal(blocked.ok, false, "unresolved checkpoint must block advance");
-    if (!blocked.ok) assert.match(blocked.error, /checkpoint 'approve_implementation' for stage 'implementation' is unresolved/);
+    if (!blocked.ok) {
+      assert.match(blocked.error, /checkpoint 'approve_implementation' for stage 'implementation' is unresolved/);
+      assert.equal(blocked.state.pause.kind, "user_checkpoint", "missing consent is resumable");
+    }
+    assert.equal((readState(root).typed_checkpoint_decisions ?? []).length, 0, "classification never creates consent");
 
-    const recorded = recordCheckpointDecision(root, {
-      ...advanceAuth(issued),
-      checkpoint: "approve_implementation", mode: "interactive", decision: "approved", actor: "user", rationale: "looks good",
-    });
-    assert.equal(recorded.ok, true);
-    if (!recorded.ok) return;
-    const decisions = readState(root).checkpoint_decisions ?? [];
-    assert.equal(decisions.length, 1);
-    assert.equal(decisions[0]!.mode, "interactive");
-    assert.equal(decisions[0]!.actor, "user");
-    assert.equal(decisions[0]!.decision, "approved");
-    assert.ok(decisions[0]!.decided_at);
+    persistTypedCheckpoint(root, "implementation", "approve_implementation");
+    const recorded = readState(root);
+    assert.equal(recorded.typed_checkpoint_decisions?.length, 1);
+    assert.equal(recorded.checkpoint_decisions?.length, 1, "legacy record is only a typed mirror");
+    assert.equal(recorded.checkpoint_decisions?.[0]?.mode, "interactive");
+    assert.equal(recorded.checkpoint_decisions?.[0]?.actor, "user:terminal-answer/scope-test/implementation/approve_implementation");
+    assert.equal(recorded.checkpoint_decisions?.[0]?.decision, "proceed");
+    assert.ok(recorded.checkpoint_decisions?.[0]?.decided_at);
 
     const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "done" });
-    assert.equal(advanced.ok, true, "recorded decision unblocks advance");
+    assert.equal(advanced.ok, true, "typed decision unblocks advance");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("checkpoint: hard-human authorization requires a durable answer proof, not a forgeable prefix", () => {
+  const root = mkdtempSync(join(tmpdir(), "ck-provenance-"));
+  try {
+    initGit(root, "feat/ck-provenance");
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
+    setupStage(root, "feat/ck-provenance", profile, "implementation", "single", roster);
+
+    const valid = typedCheckpoint(root, "implementation", "approve_implementation");
+    const state = readState(root);
+    const stage = { id: "implementation", checkpoint: "approve_implementation" };
+    const accepted = validateCheckpointDecision(state, valid, { stage });
+    assert.equal(accepted.ok, true, "the trusted ingest path creates a valid proof");
+
+    for (const ref of ["user:fabricated", "terminal:also-forgeable", "escalation:also-forgeable"]) {
+      const spoofed = { ...valid, actor: { kind: "user" as const, ref } };
+      const rejected = validateCheckpointDecision(state, spoofed, { stage });
+      assert.equal(rejected.ok, false, `bare ${ref} must not authorize`);
+      if (!rejected.ok) assert.equal(rejected.code, "checkpoint_unverified");
+    }
+    const trustedRecord = state.trusted_checkpoint_answers?.[0];
+    assert.ok(trustedRecord, "trusted ingest must persist an answer record before proof submission");
+    const forgedRecord = {
+      ...trustedRecord,
+      answer_id: "caller-minted-answer",
+      nonce: "caller-chosen-nonce",
+      reference: "terminal-answer/caller-minted-answer",
+      binding: "",
+    };
+    const forgedBinding = checkpointAnswerBinding(forgedRecord);
+    const selfConsistentForgery = {
+      ...valid,
+      actor: {
+        kind: "user" as const,
+        ref: forgedRecord.reference,
+        proof: {
+          answer_id: forgedRecord.answer_id,
+          nonce: forgedRecord.nonce,
+          channel: forgedRecord.channel,
+          reference: forgedRecord.reference,
+          binding: forgedBinding,
+        },
+      },
+    };
+    const forged = validateCheckpointDecision(state, selfConsistentForgery, { stage });
+    assert.equal(forged.ok, false, "a caller-computed binding without a durable answer record must not authorize");
+    if (!forged.ok) assert.equal(forged.code, "checkpoint_unverified");
+
+
+    const proof = valid.actor.proof!;
+    const mismatches = [
+      { ...valid, run_id: "stale-run" },
+      { ...valid, capability_epoch: "stale-epoch" },
+      { ...valid, policy_hash: "stale-policy" },
+      { ...valid, decision: "reject" },
+      { ...valid, actor: { ...valid.actor, proof: { ...proof, nonce: "replayed-nonce" } } },
+      { ...valid, actor: { ...valid.actor, proof: { ...proof, binding: "forged-binding" } } },
+      { ...valid, actor: { ...valid.actor, proof: { ...proof, channel: "escalation" as const } } },
+      { ...valid, actor: { ...valid.actor, proof: { ...proof, reference: "terminal:wrong-reference" } } },
+    ];
+    for (const candidate of mismatches) {
+      const rejected = validateCheckpointDecision(state, candidate, { stage });
+      assert.equal(rejected.ok, false, "mismatched durable answer context must fail closed");
+      if (!rejected.ok) assert.equal(rejected.code, "checkpoint_unverified");
+    }
+
+    const persisted = appendCheckpointDecision(state, valid);
+    assert.equal(persisted.typed_checkpoint_decisions?.length, 1);
+    assert.equal(persisted.trusted_checkpoint_answers?.[0]?.consumed_at !== undefined, true, "answer consumption is durable");
+    assert.deepEqual(persisted.artifacts, state.artifacts, "checkpoint authorization does not overwrite artifacts");
+    assert.equal(validateCheckpointDecision(persisted, valid, { stage }).ok, true, "exact replay is idempotent");
+    assert.throws(
+      () => appendCheckpointDecision(persisted, { ...valid, decision: "reject" }),
+      /checkpoint_unverified|migration_conflict/,
+      "a replayed answer cannot authorize a different decision",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("checkpoint: recording is idempotent and replaces the latest decision; wrong checkpoint name fails", () => {
+
+test("checkpoint: routing autonomy stays orthogonal to profile consent; migration conflicts fail closed", () => {
+  const root = mkdtempSync(join(tmpdir(), "ck-policy-orthogonal-"));
+  try {
+    initGit(root, "feat/ck-policy");
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
+    const { issued, artifactsDir } = setupStage(root, "feat/ck-policy", profile, "implementation", "single", roster);
+    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "evidence", files_touched: ["x"] }));
+    const auth = authOf(issued, "${scope.dev_agent}", "developer-kotlin");
+    const authorized = authorizeDispatch(root, auth);
+    assert.equal(authorized.ok, true);
+    if (!authorized.ok || !authorized.record) return;
+    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "done" }).ok, true);
+
+    const profileState = readState(root);
+    assert.equal(profileState.checkpoint_policy?.source, "profile");
+    writeState(root, { ...profileState, classification: { ...profileState.classification, autonomous: true } }, { featureSlug: "loop" });
+    persistTypedCheckpoint(root, "implementation", "approve_implementation");
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "typed human consent" });
+    assert.equal(advanced.ok, true, "routing autonomous=true must not conflict with a profile-source human policy");
+
+    const migrationRoot = mkdtempSync(join(tmpdir(), "ck-policy-migration-conflict-"));
+    try {
+      initGit(migrationRoot, "feat/ck-policy-migration");
+      const migrationSetup = setupStage(migrationRoot, "feat/ck-policy-migration", profile, "implementation", "single", roster);
+      const migrationState = readState(migrationRoot);
+      const basePolicy = migrationState.checkpoint_policy!;
+      const migrationPolicy = {
+        ...basePolicy,
+        default: "autonomous_allowed" as const,
+        source: "migration" as const,
+        rules: {
+          ...basePolicy.rules,
+          approve_implementation: { ...basePolicy.rules.approve_implementation!, default: "autonomous_allowed" as const },
+        },
+      };
+      const conflictingState = {
+        ...migrationState,
+        classification: { ...migrationState.classification, autonomous: false },
+        checkpoint_policy: migrationPolicy,
+      };
+      writeState(migrationRoot, conflictingState, { featureSlug: "loop" });
+      const typed = typedCheckpoint(migrationRoot, "implementation", "approve_implementation");
+      const conflict = validateCheckpointDecision(readState(migrationRoot), typed, {
+        stage: { id: "implementation", checkpoint: "approve_implementation", checkpoint_policy: migrationPolicy },
+        policy: migrationPolicy,
+      });
+      assert.equal(conflict.ok, false);
+      if (!conflict.ok) assert.equal(conflict.code, "migration_conflict");
+      void migrationSetup;
+    } finally {
+      rmSync(migrationRoot, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint: typed recording is idempotent; conflicting decisions fail and wrong names fail", () => {
   const root = mkdtempSync(join(tmpdir(), "ck-replace-"));
   try {
     initGit(root, "feat/ck");
@@ -208,21 +387,25 @@ test("checkpoint: recording is idempotent and replaces the latest decision; wron
     assert.ok(profile);
     const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
     const { issued } = setupStage(root, "feat/ck", profile, "implementation", "single", roster);
-    const first = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "approve_implementation", mode: "interactive", decision: "approved", actor: "user", rationale: "r1" });
-    assert.equal(first.ok, true);
-    const second = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "approve_implementation", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "r2" });
-    assert.equal(second.ok, true);
-    const decisions = readState(root).checkpoint_decisions ?? [];
-    assert.equal(decisions.length, 1, "latest decision replaces the prior record");
-    assert.equal(decisions[0]!.mode, "autonomous");
-    assert.equal(decisions[0]!.rationale, "r2");
+    const typed = typedCheckpoint(root, "implementation", "approve_implementation");
+    writeState(root, appendCheckpointDecision(readState(root), typed), { featureSlug: "loop" });
+    writeState(root, appendCheckpointDecision(readState(root), typed), { featureSlug: "loop" });
+    const decisions = readState(root);
+    assert.equal(decisions.typed_checkpoint_decisions?.length, 1, "identical typed decision is idempotent");
+    assert.equal(decisions.checkpoint_decisions?.length, 1, "typed mirror remains singular");
+    assert.throws(
+      () => appendCheckpointDecision(readState(root), { ...typed, rationale: "conflicting answer" }),
+      /migration_conflict/,
+      "a second answer cannot replace an existing checkpoint decision",
+    );
     const wrongName = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "bogus", mode: "interactive", decision: "x", actor: "user", rationale: "r" });
     assert.equal(wrongName.ok, false);
-    if (!wrongName.ok) assert.match(wrongName.error, /does not match declared checkpoint/);
+    if (!wrongName.ok) assert.match(wrongName.error, /typed checkpoint authorization and actor provenance/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("loop: FAIL until re-enters back_to with a fresh capability and durable history; stale epoch cannot authorize", () => {
   const root = mkdtempSync(join(tmpdir(), "loop-reenter-"));
@@ -396,7 +579,7 @@ test("loop: until PASS exits the loop and advances normally; on_exhausted failed
   }
 });
 
-test("checkpoint: interpreter auto-records autonomous decisions and blocks interactive ones", async () => {
+test("checkpoint: interpreter never auto-records from routing autonomy; unresolved consent pauses", async () => {
   const root = mkdtempSync(join(tmpdir(), "ck-interp-"));
   const branch = "feat/interp";
   try {
@@ -411,8 +594,6 @@ test("checkpoint: interpreter auto-records autonomous decisions and blocks inter
     };
     registerWorkflowProfiles([checkpointProfile]);
 
-    // Interactive run (autonomous=false): advance must fail closed with the
-    // unresolved checkpoint diagnostic.
     const interactive: TaskCaller = {
       async call(args) {
         const stageId = args.task.match(/## Stage: ([^ ]+)/)?.[1] ?? "?";
@@ -432,9 +613,13 @@ test("checkpoint: interpreter auto-records autonomous decisions and blocks inter
       interactiveResult.outcomes.some((o) => o.status === "failed" && /checkpoint 'approve_diagnosis'/.test(o.note)),
       "interactive unresolved checkpoint blocks advance",
     );
+    const interactiveState = JSON.parse(readFileSync(interactiveResult.statePath!, "utf8")) as TeamState;
+    assert.equal(interactiveState.pause.kind, "user_checkpoint");
+    assert.equal(interactiveState.typed_checkpoint_decisions?.length ?? 0, 0);
+    assert.equal(interactiveState.checkpoint_decisions?.length ?? 0, 0);
 
-    // Autonomous run (autonomous=true): the declared auto-decision is
-    // recorded durably and the loop runs to completion.
+    // Routing autonomy is not authorization: no auto decision is recorded and
+    // no later stage runs until a trusted typed decision is supplied.
     const root2 = mkdtempSync(join(tmpdir(), "ck-interp-auto-"));
     try {
       initGit(root2, branch);
@@ -460,16 +645,13 @@ test("checkpoint: interpreter auto-records autonomous decisions and blocks inter
         classification: { type: "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: true, workflow: "interp-checkpoint" },
         taskTool: autonomous,
       });
-      assert.equal(autoResult.outcomes.some((o) => o.status === "failed"), false, "autonomous run completes");
-      const statePath = autoResult.statePath!;
-      const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-      const decision = state.checkpoint_decisions?.find((d) => d.checkpoint === "approve_diagnosis");
-      assert.ok(decision, "autonomous checkpoint decision is recorded durably");
-      assert.equal(decision!.mode, "autonomous");
-      assert.ok(decision!.rationale.length > 0, "autonomous decision preserves the declared rationale");
-      assert.equal(state.loop_state?.status, "complete");
-      assert.equal(state.loop_state?.reentries, 1);
-      assert.equal(verifyRuns, 2);
+      assert.equal(autoResult.outcomes.some((o) => o.status === "failed"), true, "routing autonomy cannot auto-proceed");
+      const state = JSON.parse(readFileSync(autoResult.statePath!, "utf8")) as TeamState;
+      assert.equal(state.pause.kind, "user_checkpoint");
+      assert.equal(state.typed_checkpoint_decisions?.length ?? 0, 0);
+      assert.equal(state.checkpoint_decisions?.length ?? 0, 0);
+      assert.equal(state.stages.find((s) => s.id === "implementation")?.status, "pending");
+      assert.equal(verifyRuns, 0);
     } finally {
       rmSync(root2, { recursive: true, force: true });
     }
@@ -522,13 +704,13 @@ test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash
       "interactive orchestrator checkpoint blocks advance",
     );
     const interactiveState = JSON.parse(readFileSync(interactiveResult.statePath!, "utf8")) as TeamState;
-    assert.equal(interactiveState.stages.find((s) => s.id === "discovery")?.status, "failed");
+    assert.equal(interactiveState.pause.kind, "user_checkpoint");
+    assert.equal(interactiveState.stages.find((s) => s.id === "discovery")?.status, "in_progress");
     assert.equal(interactiveState.stages.find((s) => s.id === "hooks")?.status, "pending", "later stages never run while the checkpoint is unresolved");
     assert.equal(interactiveState.stages.find((s) => s.id === "noop")?.status, "pending");
 
-    // Autonomous: the declared auto-decision is recorded durably and every
-    // stage type (orchestrator/bash/none) advances through the same durable
-    // transition to completion.
+    // Routing autonomy still cannot authorize the orchestrator checkpoint:
+    // every later stage remains pending until a trusted typed decision arrives.
     const root2 = mkdtempSync(join(tmpdir(), "ck-interp-alltypes-auto-"));
     try {
       initGit(root2, branch);
@@ -540,16 +722,14 @@ test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash
         classification: { ...baseClassification, autonomous: true, workflow: "interp-checkpoint-all-types" },
         taskTool,
       });
-      assert.equal(autoResult.outcomes.some((o) => o.status === "failed"), false, "autonomous run completes");
-      assert.deepEqual(autoResult.outcomes.map((o) => o.status), ["done", "done", "done"], "orchestrator/bash/none all advance");
+      assert.equal(autoResult.outcomes.some((o) => o.status === "failed"), true, "autonomous routing cannot auto-proceed");
       const autoState = JSON.parse(readFileSync(autoResult.statePath!, "utf8")) as TeamState;
-      const decision = autoState.checkpoint_decisions?.find((d) => d.checkpoint === "confirm_understanding");
-      assert.ok(decision, "orchestrator checkpoint decision is recorded durably");
-      assert.equal(decision!.mode, "autonomous");
-      assert.equal(decision!.stage_id, "discovery");
-      assert.ok(decision!.rationale.length > 0, "autonomous decision preserves the declared rationale");
-      assert.ok(autoState.stages.every((s) => s.status === "done" || s.status === "skipped"), "no stage reaches done while its checkpoint is unresolved");
-      assert.equal(autoState.pause.kind, "done");
+      assert.equal(autoState.pause.kind, "user_checkpoint");
+      assert.equal(autoState.typed_checkpoint_decisions?.length ?? 0, 0);
+      assert.equal(autoState.checkpoint_decisions?.length ?? 0, 0);
+      assert.equal(autoState.stages.find((s) => s.id === "discovery")?.status, "in_progress");
+      assert.equal(autoState.stages.find((s) => s.id === "hooks")?.status, "pending");
+      assert.equal(autoState.stages.find((s) => s.id === "noop")?.status, "pending");
     } finally {
       rmSync(root2, { recursive: true, force: true });
     }

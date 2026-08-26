@@ -165,18 +165,19 @@ Resolved from touched/planned files against `.omp/team.config.json` `scope_map` 
 
 | flag | true when |
 |------|-----------|
-| `scope.has_security` | touches `**/auth/**`, `**/security/**`, `**/*crypto*`, or auth/secret logic |
-| `scope.has_ui` | scope includes `frontend` or `mobile` |
-| `scope.has_runtime` | the change produces something runnable (any code scope) — false only for pure docs/config/research |
-| `scope.has_infra` | touches Docker/K8s/CI/CD/Helm |
-| `${scope.dev_agent}` | `developer-kotlin` \| `developer-go` \| `frontend-developer` \| `developer-mobile` per dominant scope |
+| `scope.has_security` | touches `**/auth/**`, `**/security/**`, `**/*crypto*`, or auth/secret logic (config `flags`) |
+| `scope.has_ui` | a matched scope is marked in the config's `scope_ui_classes` (fullstack preset: `frontend`, `mobile`) or its class is `"ui"` |
+| `scope.has_runtime` | a matched scope is classified runnable via entry `runtime_class` or config `scope_runtime_classes` |
+| `scope.has_infra` | touches Docker/K8s/CI/CD/Helm (config `flags`) |
+| `${scope.dev_agent}` | the `dev_agent` of the dominant matched scope; **fails closed** with `DevAgentUnavailableError` when no scope matches — never a hardcoded agent |
 
-> **`has_ui` and `has_runtime` are interpreter built-ins, not config globs.**
-> `scope.has_ui = (scope ∩ {frontend, mobile} ≠ ∅)`. `scope.has_runtime = the task touches any
-> executable/deployable code scope` (true for backend, go, frontend, mobile, devops, …; false only
-> for docs/config-only changes). No `flags.*` entries are needed and the built-in defaults omit
-> them. A project that must override *may* add `flags.has_ui` / `flags.has_runtime` (the schema's
-> free-form `additionalProperties` accepts them), but the derived rules are the default.
+> **Classification tables are caller-supplied data, not core defaults (INT-001).**
+> Core owns only the mechanics: entry `runtime_class` wins, then `scope_runtime_classes` /
+> `scope_ui_classes` on the config, then nothing (`null`). The fullstack bundle writes its
+> tables at registration; standalone projects copy them from `team.config.example.json`.
+> A project that must override *may* still add `flags.has_ui` / `flags.has_runtime`
+> (the schema's free-form `additionalProperties` accepts them), but that creates a second
+> source of truth — prefer the tables.
 >
 > **`has_runtime` gates the `manual_qa` stage** (`skip_if: "!scope.has_runtime"`) — so manual
 > runtime verification runs for backend/CLI work too, not only UI. **`has_ui` selects the *mode***
@@ -185,9 +186,9 @@ Resolved from touched/planned files against `.omp/team.config.json` `scope_map` 
 
 ## Custom agents (project / user / other plugins)
 
-A role resolves to a concrete agent via `.omp/team.config.json` `roles` (then the built-in
-default). The resolved value is passed verbatim as the Task `agent`, so it can be **any
-registered agent**:
+A role resolves to a concrete agent via `.omp/team.config.json` `roles`. There is no
+built-in fallback: an unknown role resolves to itself. The resolved value is passed verbatim
+as the Task `agent`, so it can be **any registered agent**:
 
 - project agent `.omp/agents/<name>` → bare `<name>`
 - user agent `~/.omp/agent/agents/<name>` → bare `<name>`

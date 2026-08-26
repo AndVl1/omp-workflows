@@ -14,6 +14,15 @@
  */
 
 import type { RunHealth } from "../cto/types.js";
+import type {
+  CompletionArtifactRef,
+  CompletionEnvelope,
+  CompletionOutcome,
+  CompletionTerminalSignal,
+  PendingReason,
+  PendingState,
+  WorkIdentity,
+} from "../engine/types.js";
 
 export type EventKind =
   | "session_start"
@@ -24,14 +33,54 @@ export type EventKind =
   | "tool_call"
   | "tool_result"
   | "stage_transition"
-  | "artifact_written";
+  | "artifact_written"
+  | "work_pending"
+  | "work_terminal";
+
+/**
+ * A bounded, report-safe view of an artifact. It deliberately carries only
+ * the relative path and digest references needed to prove which artifact was
+ * observed; artifact bodies never belong in the event stream.
+ */
+export interface ObservabilityArtifactSummary {
+  artifact_id: string;
+  path: string;
+  sha256: string;
+  bytes?: number;
+  schema_status?: CompletionArtifactRef["schema_status"];
+  dod_status?: CompletionArtifactRef["dod_status"];
+}
+
+export type ObservabilityStatus = PendingState["status"] | CompletionOutcome;
+
+/**
+ * Lifecycle metadata shared by hook events and explicit work signals. The
+ * canonical identity is kept in the engine's WorkIdentity shape so recorder
+ * validation cannot silently invent a second identity model.
+ */
+export interface ObservabilitySignalFields {
+  work_identity?: WorkIdentity;
+  capability_epoch?: string;
+  policy_hash?: string;
+  profile_hash?: string;
+  pending_reason?: PendingReason;
+  terminal_signal?: CompletionTerminalSignal | null;
+  outcome?: CompletionOutcome;
+  status?: ObservabilityStatus;
+  provider_ref?: string;
+  retry_of?: string | null;
+  completion_envelope?: CompletionEnvelope;
+  artifact_summaries?: ObservabilityArtifactSummary[];
+  /** Caller-supplied replay key for adapters with at-least-once delivery. */
+  idempotency_key?: string;
+}
 
 /**
  * A single recorded event. `id` is a ULID-ish monotonic counter scoped to the
  * recorder instance (one recorder per `cwd`); we don't use uuid because the
  * call site can give a tight, ordered stream.
  */
-export interface ObservabilityEvent {
+export interface ObservabilityEvent extends ObservabilitySignalFields {
   /** Monotonic id within a recorder instance (string for jsonl readability). */
   id: string;
   /** Event kind. */
@@ -50,7 +99,7 @@ export interface ObservabilityEvent {
   isError?: boolean;
   /** Pre-execution gate outcome, when the canonical gate wrapper observed it. */
   gateDecision?: "allowed" | "blocked";
-  /** Stable category/reason for a blocked or exceptional attempt. */
+  /** Stable, bounded reason category/hash for a blocked or exceptional attempt. */
   gateReason?: string;
   /** For tool_call: the subagent agent name when the tool was `task`. */
   subagent?: string;
@@ -77,6 +126,8 @@ export interface ObservabilityEvent {
   artifactPath?: string;
   /** For artifact_written: artifact size in bytes. */
   artifactBytes?: number;
+  /** For artifact_written: digest reference when the caller has one. */
+  artifactSha256?: string;
   /** Run scope: cto run id or feature slug, to disambiguate concurrent runs. */
   runId?: string;
 }
@@ -108,7 +159,14 @@ export interface ObservabilityRollup {
   firstEventAt: string;
   /** ISO timestamp of the last event in the current rollup. */
   lastEventAt: string;
-  // ── cto-operations (br-zps.7) additive fields ──
+  /** Number of events that declared a neutral, resumable pending reason. */
+  pendingEvents?: number;
+  /** Pending counts keyed by the canonical neutral reason. */
+  pendingReasons?: Record<string, number>;
+  /** Terminal counts keyed by the canonical terminal signal. */
+  terminalSignals?: Record<string, number>;
+  /** Number of bounded artifact summaries observed. */
+  artifactSummaries?: number;
   /** chars/4 heuristic sum (C1) — 0 until a real BudgetRecorder is wired. br-zps.2. */
   estimatedTokens?: number;
   /** 0 until a real BudgetRecorder is wired (C1). br-zps.2. */
@@ -153,5 +211,9 @@ export function emptyRollup(now: string): ObservabilityRollup {
     durationMs: 0,
     firstEventAt: now,
     lastEventAt: now,
+    pendingEvents: 0,
+    pendingReasons: {},
+    terminalSignals: {},
+    artifactSummaries: 0,
   };
 }

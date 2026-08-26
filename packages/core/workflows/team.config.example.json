@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy this to your PROJECT's .omp/team.config.json (fallback: .claude/team.config.json for legacy projects) and adjust. These values ARE the built-in defaults — the interpreter behaves identically when the file is absent. Per-project config exists so role→agent/scope resolution is deterministic and explicit instead of inferred at runtime.",
+  "_comment": "Copy this to your PROJECT's .omp/team.config.json (fallback: .claude/team.config.json for legacy projects) and adjust. Core no longer substitutes these values when the file is absent: the engine degrades to neutral empty roles/scope_map, so an owning bundle (e.g. omp-workflows-fullstack) or this explicit file must supply them. Per-project config keeps role→agent/scope resolution deterministic and explicit instead of inferred at runtime.",
 
   "_custom_agents": "roles values are passed verbatim to Task `agent`. Use the registered bare name of a project (.omp/agents/), user (~/.omp/agent/agents/), or enabled extension-package agent; the OMP agent registry is flat. Examples: 'backend' could map to 'my-go-backend', and 'security-tester' to 'pentester'.",
 
@@ -37,10 +37,21 @@
     { "glob": ["**/*.kt", "**/*.java", "**/src/main/**"], "scope": "backend-kotlin", "dev_agent": "developer-kotlin" }
   ],
 
-  "_has_ui_note": "There is deliberately NO flags.has_ui / flags.has_runtime here. Both are interpreter built-ins: has_ui = (scope ∩ {frontend, mobile} ≠ ∅); has_runtime = the task touches any executable/deployable code scope (false only for docs/config-only). has_runtime GATES the manual_qa stage (so backend/CLI runtime checks run too); has_ui SELECTS the mode within it (ui vs runtime). A project MAY override via flags.has_ui / flags.has_runtime (schema allows it via additionalProperties), but that creates a second source of truth — prefer the built-ins.",
+  "_scope_classes_note": "Classification tables are caller-supplied data (INT-001): scope_runtime_classes marks which scopes produce runnable output; scope_ui_classes marks UI scopes. has_runtime GATES the manual_qa stage (so backend/CLI runtime checks run too); has_ui SELECTS the mode within it (ui vs runtime). A project MAY override via flags.has_ui / flags.has_runtime (schema allows it via additionalProperties), but that creates a second source of truth — prefer these tables.",
   "flags": {
     "has_security": ["**/auth/**", "**/security/**", "**/*crypto*", "**/*Secret*", "**/*Token*"],
     "has_infra": ["**/Dockerfile", "**/helm/**", "**/k8s/**", "**/.github/workflows/**"]
+  },
+  "scope_runtime_classes": {
+    "backend-kotlin": "runtime",
+    "go": "runtime",
+    "frontend": "runtime",
+    "mobile": "runtime",
+    "devops": "runtime"
+  },
+  "scope_ui_classes": {
+    "frontend": true,
+    "mobile": true
   },
 
   "design_system": null

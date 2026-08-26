@@ -14,6 +14,8 @@
     },
     "title": { "type": "string", "description": "Human-readable name." },
     "description": { "type": "string" },
+    "completion_intent": { "$ref": "#/definitions/completionIntent" },
+    "checkpoint_policy": { "$ref": "#/definitions/checkpointPolicy" },
     "match": {
       "type": "object",
       "description": "Classification selector. A profile is chosen when classification.type is in `type` AND (complexity is in `complexity` OR complexity is omitted). The first profile (in selection order) whose match passes wins. See workflows/README.md for the resolution table.",
@@ -48,6 +50,9 @@
           "enum": ["orchestrator", "single", "consilium", "document", "bash", "none", "team"],
           "description": "orchestrator = main context performs it (no subagent). single = exactly one subagent (role resolved via team.config or scope). consilium = N subagents in parallel (see `roles`). document = deterministic engine-rendered document (see `document`; no model, no dispatch). bash = deterministic shell step, no model. none = placeholder/skip. team = each listed team runs its own sub-workflow profile in parallel (CTO sub-orchestration; see `teams`/`profile`/`integration`)."
         },
+        "completion_intent": { "$ref": "#/definitions/completionIntent" },
+        "checkpoint_policy": { "$ref": "#/definitions/checkpointPolicy" },
+        "roster_policy": { "$ref": "#/definitions/rosterPolicy" },
         "roles": {
           "type": "array",
           "items": { "type": "string" },
@@ -86,11 +91,11 @@
         },
         "checkpoint": {
           "type": "string",
-          "description": "Named user checkpoint. Interactive mode: stop and wait. Autonomous mode: skip + log the auto-decision (see `autonomous`)."
+          "description": "Named checkpoint identifier. Typed checkpoint_policy.rules controls permission; this legacy label is not authorization."
         },
         "autonomous": {
           "type": "string",
-          "description": "Auto-decision applied at this stage's checkpoint when running in autonomous mode (e.g. 'pick option #1', 'abort needs-human if confidence LOW')."
+          "description": "Legacy display/migration rationale only. Never authorizes a checkpoint decision; use checkpoint_policy.rules for typed permission."
         },
         "command": {
           "type": "string",
@@ -160,6 +165,348 @@
             "on_exhausted": { "type": "string", "description": "Action when max reached, e.g. 'escalate_user', 'needs-human'." }
           }
         }
+      }
+    },
+    "completionIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "acceptance", "source", "rationale"],
+      "properties": {
+        "mode": { "enum": ["complete_outcome", "handoff_only"] },
+        "acceptance": { "enum": ["dod_and_artifacts", "explicit_human_acceptance"] },
+        "source": { "enum": ["user", "workflow_policy", "migration"] },
+        "rationale": { "type": "string", "minLength": 1 }
+      }
+    },
+    "checkpointRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "default", "allowed_decisions", "phase", "rationale"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "product_approval", "clarification", "architecture_choice", "implementation_approval",
+            "review_fix", "regression_plan", "integration_acceptance", "security",
+            "destructive_side_effect", "production", "bundle_activation", "migration_cutover", "custom"
+          ]
+        },
+        "default": { "enum": ["required_human", "autonomous_allowed"] },
+        "allowed_decisions": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "phase": { "enum": ["before_dispatch", "before_advance"] },
+        "rationale": { "type": "string", "minLength": 1 }
+      }
+    },
+    "checkpointPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default", "scope", "hard_human", "rules", "source", "policy_version", "rationale"],
+      "properties": {
+        "default": { "enum": ["required_human", "autonomous_allowed"] },
+        "scope": { "enum": ["decision"] },
+        "hard_human": {
+          "type": "array",
+          "items": {
+            "enum": ["product_approval", "security", "destructive_side_effect", "production", "bundle_activation", "migration_cutover", "custom"]
+          }
+        },
+        "rules": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/checkpointRule" }
+        },
+        "source": { "enum": ["profile", "user", "migration"] },
+        "policy_version": { "type": "integer", "minimum": 1 },
+        "rationale": { "type": "string", "minLength": 1 }
+      }
+    },
+    "checkpointActor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref"],
+      "properties": {
+        "kind": { "enum": ["user", "orchestrator", "system"] },
+        "ref": { "type": "string", "minLength": 1 },
+        "proof": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["answer_id", "nonce", "channel", "reference", "binding"],
+          "properties": {
+            "answer_id": { "type": "string", "minLength": 1 },
+            "nonce": { "type": "string", "minLength": 1 },
+            "channel": { "enum": ["terminal", "escalation"] },
+            "reference": { "type": "string", "minLength": 1 },
+            "binding": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "checkpointDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage_id", "checkpoint", "mode", "decision", "actor", "rationale", "decided_at"],
+      "properties": {
+        "stage_id": { "type": "string", "minLength": 1 },
+        "checkpoint": { "type": "string", "minLength": 1 },
+        "mode": { "enum": ["interactive", "autonomous"] },
+        "decision": { "type": "string", "minLength": 1 },
+        "actor": { "type": "string", "minLength": 1 },
+        "rationale": { "type": "string", "minLength": 1 },
+        "decided_at": { "type": "string", "minLength": 1 },
+        "run_id": { "type": "string", "minLength": 1 },
+        "checkpoint_id": { "type": "string", "minLength": 1 },
+        "checkpoint_kind": { "$ref": "#/definitions/checkpointRule/properties/kind" },
+        "authorization": { "enum": ["human", "policy_auto"] },
+        "actor_provenance": { "$ref": "#/definitions/checkpointActor" },
+        "capability_id": { "type": "string", "minLength": 1 },
+        "capability_epoch": { "type": "string", "minLength": 1 },
+        "policy_hash": { "type": "string", "minLength": 1 },
+        "work_identity": { "$ref": "#/definitions/workIdentity" }
+      }
+    },
+    "typedCheckpointDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id", "stage_id", "checkpoint_id", "checkpoint_kind", "decision", "authorization",
+        "actor", "capability_id", "capability_epoch", "policy_hash", "rationale", "decided_at"
+      ],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "stage_id": { "type": "string", "minLength": 1 },
+        "checkpoint_id": { "type": "string", "minLength": 1 },
+        "checkpoint_kind": { "$ref": "#/definitions/checkpointRule/properties/kind" },
+        "decision": { "type": "string", "minLength": 1 },
+        "authorization": { "enum": ["human", "policy_auto"] },
+        "actor": { "$ref": "#/definitions/checkpointActor" },
+        "capability_id": { "type": "string", "minLength": 1 },
+        "capability_epoch": { "type": "string", "minLength": 1 },
+        "policy_hash": { "type": "string", "minLength": 1 },
+        "rationale": { "type": "string", "minLength": 1 },
+        "decided_at": { "type": "string", "minLength": 1 }
+      }
+    },
+    "rosterMultiplicity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "type": "integer", "minimum": 0 },
+        "max": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "rosterTriggers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complexity", "confidence", "scope_flags", "evidence"],
+      "properties": {
+        "complexity": {
+          "type": "array",
+          "items": { "enum": ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] }
+        },
+        "confidence": {
+          "type": "array",
+          "items": { "enum": ["HIGH", "MEDIUM", "LOW"] }
+        },
+        "scope_flags": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "evidence": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "rosterBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["token_limit", "dollar_limit"],
+      "properties": {
+        "token_limit": { "oneOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }] },
+        "dollar_limit": { "oneOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }] }
+      }
+    },
+    "rosterPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_roles", "required_roles", "required_facets", "min_workers", "max_workers",
+        "multiplicity", "prefer_distinct_agents", "selection_mode", "triggers", "budget"
+      ],
+      "properties": {
+        "allowed_roles": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "required_roles": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "required_facets": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "min_workers": { "type": "integer", "minimum": 0 },
+        "max_workers": { "type": "integer", "minimum": 0 },
+        "multiplicity": { "type": "object", "additionalProperties": { "$ref": "#/definitions/rosterMultiplicity" } },
+        "prefer_distinct_agents": { "type": "boolean" },
+        "selection_mode": { "enum": ["pre_dispatch_minimum_valid"] },
+        "triggers": { "$ref": "#/definitions/rosterTriggers" },
+        "budget": { "$ref": "#/definitions/rosterBudget" }
+      }
+    },
+    "rosterSelectionEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot_id", "role", "occurrence", "facet", "agent", "reason"],
+      "properties": {
+        "slot_id": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "occurrence": { "type": "integer", "minimum": 1 },
+        "facet": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "agent": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "rosterSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snapshot_id", "run_key", "wave_id", "slice_id", "session_id", "workflow", "stage_id",
+        "profile_hash", "policy_hash", "scope_hash", "mapping_hash", "capability_epoch",
+        "selected", "omitted", "triggers", "stop_reason", "selected_at", "frozen_at"
+      ],
+      "properties": {
+        "snapshot_id": { "type": "string", "minLength": 1 },
+        "run_key": { "type": "string", "minLength": 1 },
+        "wave_id": { "type": "string", "minLength": 1 },
+        "slice_id": { "type": "string", "minLength": 1 },
+        "session_id": { "type": "string", "minLength": 1 },
+        "workflow": { "type": "string", "minLength": 1 },
+        "stage_id": { "type": "string", "minLength": 1 },
+        "profile_hash": { "type": "string", "minLength": 1 },
+        "policy_hash": { "type": "string", "minLength": 1 },
+        "scope_hash": { "type": "string", "minLength": 1 },
+        "mapping_hash": { "type": "string", "minLength": 1 },
+        "capability_epoch": { "type": "string", "minLength": 1 },
+        "selected": { "type": "array", "items": { "$ref": "#/definitions/rosterSelectionEntry" } },
+        "omitted": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role", "reason"],
+            "properties": {
+              "role": { "type": "string", "minLength": 1 },
+              "reason": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "triggers": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "stop_reason": { "enum": ["minimum_valid_set", "risk_trigger_satisfied", "max_workers", "budget_limit"] },
+        "selected_at": { "type": "string", "minLength": 1 },
+        "frozen_at": { "type": "string", "minLength": 1 }
+      }
+    },
+    "workIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id", "wave_id", "slice_id", "session_id", "workflow", "stage_id", "stage_cursor",
+        "capability_id", "capability_epoch", "slot_id", "task_id", "dispatch_id", "attempt", "worker_id"
+      ],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "wave_id": { "type": "string", "minLength": 1 },
+        "slice_id": { "type": "string", "minLength": 1 },
+        "session_id": { "type": "string", "minLength": 1 },
+        "workflow": { "type": "string", "minLength": 1 },
+        "stage_id": { "type": "string", "minLength": 1 },
+        "stage_cursor": { "type": "string", "minLength": 1 },
+        "capability_id": { "type": "string", "minLength": 1 },
+        "capability_epoch": { "type": "string", "minLength": 1 },
+        "slot_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "dispatch_id": { "type": "string", "minLength": 1 },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "worker_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "pendingState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "status", "updated_at"],
+      "properties": {
+        "identity": { "$ref": "#/definitions/workIdentity" },
+        "status": { "enum": ["authorized", "running", "pending", "succeeded", "failed", "cancelled"] },
+        "pending_reason": { "enum": ["provider_running", "awaiting_result", "transport_reconnect"] },
+        "provider_ref": { "type": "string", "minLength": 1 },
+        "lease": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["token", "observed_at", "revoked_at"],
+          "properties": {
+            "token": { "type": "string", "minLength": 1 },
+            "observed_at": { "type": "string", "minLength": 1 },
+            "revoked_at": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] }
+          }
+        },
+        "terminal_signal": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "retry_of": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "updated_at": { "type": "string", "minLength": 1 }
+      }
+    },
+    "childJoin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["parent", "child", "state", "expected_artifact_ids", "completion_envelope_ref", "attempt", "created_at", "joined_at"],
+      "properties": {
+        "parent": { "$ref": "#/definitions/workIdentity" },
+        "child": { "$ref": "#/definitions/workIdentity" },
+        "state": { "enum": ["planned", "authorized", "pending", "succeeded", "failed", "cancelled", "conflict"] },
+        "expected_artifact_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "completion_envelope_ref": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "created_at": { "type": "string", "minLength": 1 },
+        "joined_at": { "type": "string", "minLength": 1 }
+      }
+    },
+    "completionArtifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "path", "sha256", "schema_status", "dod_status"],
+      "properties": {
+        "artifact_id": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "pattern": "^(?![/\\\\])(?!.*\\.\\.)(?!.*\\\\).+" },
+        "sha256": { "type": "string", "minLength": 1 },
+        "schema_status": { "enum": ["met", "failed"] },
+        "dod_status": { "enum": ["met", "pending", "failed"] }
+      }
+    },
+    "completionEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "identity", "outcome", "terminal_signal", "artifact_refs", "evidence_ref", "conflict_ref", "completed_by", "emitted_at"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "identity": { "$ref": "#/definitions/workIdentity" },
+        "outcome": { "enum": ["pending", "succeeded", "failed", "cancelled"] },
+        "terminal_signal": {
+          "oneOf": [
+            { "enum": ["workflow_complete", "native_tool_result", "provider_terminal", "contract_failure"] },
+            { "type": "null" }
+          ]
+        },
+        "artifact_refs": { "type": "array", "items": { "$ref": "#/definitions/completionArtifactRef" } },
+        "evidence_ref": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "conflict_ref": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "completed_by": { "enum": ["workflow_complete", "synchronous_tool_result", "engine_task_caller"] },
+        "emitted_at": { "type": "string", "minLength": 1 }
+      }
+    },
+    "migrationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "from_schema", "to_schema", "source_profile_hash", "target_profile_hash",
+        "source_policy_hash", "target_policy_hash", "legacy_inputs", "warnings", "status", "migrated_at"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "from_schema": { "type": "integer", "minimum": 1 },
+        "to_schema": { "type": "integer", "minimum": 1 },
+        "source_profile_hash": { "type": "string", "minLength": 1 },
+        "target_profile_hash": { "type": "string", "minLength": 1 },
+        "source_policy_hash": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "target_policy_hash": { "type": "string", "minLength": 1 },
+        "legacy_inputs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "warnings": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "status": { "enum": ["complete", "blocked"] },
+        "migrated_at": { "type": "string", "minLength": 1 }
       }
     }
   }

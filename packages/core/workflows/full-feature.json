@@ -2,6 +2,28 @@
   "name": "full-feature",
   "title": "Full 7-Phase Feature Development",
   "description": "COMPLEX features. Parallel exploration, mandatory clarifying questions, parallel architecture options, scoped implementation, parallel review.",
+  "completion_intent": {
+    "mode": "complete_outcome",
+    "acceptance": "dod_and_artifacts",
+    "source": "workflow_policy",
+    "rationale": "Full-feature workflows complete the requested outcome with durable artifacts and DoD evidence."
+  },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": ["product_approval", "security", "destructive_side_effect", "production", "bundle_activation", "migration_cutover"],
+    "rules": {
+      "confirm_understanding": { "kind": "clarification", "default": "required_human", "allowed_decisions": ["proceed", "revise"], "phase": "before_advance", "rationale": "The user confirms the normalized understanding before the workflow advances." },
+      "user_answers": { "kind": "clarification", "default": "required_human", "allowed_decisions": ["proceed", "revise", "reject"], "phase": "before_advance", "rationale": "Clarifying answers are explicit user input, not an autonomous prose interpretation." },
+      "user_choice": { "kind": "architecture_choice", "default": "required_human", "allowed_decisions": ["proceed", "revise", "reject"], "phase": "before_advance", "rationale": "The user owns the architecture choice." },
+      "approve_implementation": { "kind": "implementation_approval", "default": "required_human", "allowed_decisions": ["proceed", "reject"], "phase": "before_advance", "rationale": "Implementation approval remains an explicit checkpoint." },
+      "fix_decision": { "kind": "review_fix", "default": "required_human", "allowed_decisions": ["proceed", "defer", "reject"], "phase": "before_advance", "rationale": "Review-fix disposition must be explicit." },
+      "fix_selection": { "kind": "review_fix", "default": "required_human", "allowed_decisions": ["proceed", "defer", "reject"], "phase": "before_advance", "rationale": "The user selects which review fixes are accepted." }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Conservative typed opt-in policy: every declared checkpoint is human-required until a trusted policy transition explicitly permits automation."
+  },
   "match": { "type": ["FEATURE", "REFACTOR"], "complexity": ["COMPLEX"] },
   "stages": [
     {

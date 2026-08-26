@@ -1,69 +1,74 @@
 /**
  * Shared PHASE-0 classification contract for /do-work and /cto.
  *
- * Both command surfaces MUST request the same four-field model
- * classification (type, complexity, confidence, autonomous) so the main LLM
- * decides autonomy from the COMPLETE task semantics in any language. The
- * mechanical parser hint (`autonomyHint`) is rendered as non-authoritative
- * metadata: it never decides and is never copied into persisted state as
- * the decision. Missing/non-boolean model output fails closed at the P5
- * gate (gates/classification.ts) — no silent true/false default.
+ * Routing classification and checkpoint permission are separate control-plane
+ * concerns. The legacy `autonomous` bit remains a routing/migration input and
+ * its rationale is display-only. Completion intent and checkpoint policy are
+ * typed fields; neither completion intent nor model routing can authorize a
+ * human checkpoint.
  */
 
 export interface ClassificationHint {
   /** Where the hint came from (e.g. "leading directive"). */
   label: string;
-  /** Mechanical parser result — NOT the model decision. */
+  /** Mechanical parser result — NOT a routing or permission decision. */
   value: boolean;
 }
 
-/** The four model-classified fields, requested verbatim by both commands. */
+/** Routing fields plus explicitly separated control-plane projections. */
 export const CLASSIFICATION_FIELDS = [
   "Type",
   "Complexity",
   "Confidence",
-  "Autonomous",
-  "Autonomous reason",
-  "Workflow",
+  "Autonomous (routing/migration input only)",
+  "Autonomous reason (display/migration rationale only)",
+  "Workflow (routing result)",
+  "Completion intent (terminal outcome target)",
+  "Checkpoint policy (typed permission policy)",
+  "Checkpoint decision/provenance (typed authorization only)",
   "Reason",
 ] as const;
 
-/** PHASE-0 block: the model classifies type/complexity/confidence/autonomous together. */
+/** PHASE-0 block: classify routing; do not infer checkpoint consent. */
 export function buildClassificationPhaseZero(hint?: ClassificationHint): string {
   const hintLines = hint
     ? [
-        `- Autonomy hint (${hint.label} — MECHANICAL, NOT authoritative): ${hint.value ? "ON" : "OFF"}`,
+        `- Autonomy hint (${hint.label} — MECHANICAL, NOT authoritative; routing/migration metadata only): ${hint.value ? "ON" : "OFF"}`,
       ]
     : [];
   return [
+    ...hintLines,
     "### PHASE 0: INTELLIGENT CLASSIFICATION (zero step)",
     "Before any other tool call — no `read`, `glob`, `grep`, `bash`, `edit`, `write`, or `task` — understand the task semantically.",
-    "Do NOT use keyword counts, task length, or language-specific keyword lists. Infer the requested outcome, primary intent, scope, constraints, risk, and whether code changes are actually requested.",
+    "Do NOT use keyword counts, task length, or language-specific keyword lists. Infer the requested outcome, primary intent, scope, constraints, risk, and the routing profile.",
     "",
     "Return this visible block before continuing:",
     "CLASSIFICATION:",
     "- Type: FEATURE | REFACTOR | OPS | BUG_FIX | SPEC | REGRESS | INVESTIGATION | REVIEW | HOTFIX | PRODUCT_DISCOVERY",
     "- Complexity: QUICK | MEDIUM | COMPLEX | CRITICAL",
     "- Confidence: HIGH | MEDIUM | LOW",
-    "- Autonomous: true | false",
-    "- Autonomous reason: one sentence — may this task proceed without user checkpoints, and why",
-    "- Workflow: resolved from the matrix below (type + complexity + autonomous)",
-    "- Reason: concise evidence-based explanation",
+    "- Autonomous: true | false (routing/migration input only; NEVER checkpoint permission)",
+    "- Autonomous reason: one sentence — display/migration rationale only; NEVER authorization",
+    "- Workflow: resolved from the routing matrix below (type + complexity + autonomous)",
+    "- Completion intent: complete_outcome | handoff_only",
+    "- Acceptance: dod_and_artifacts | explicit_human_acceptance",
+    "- Checkpoint policy: typed required_human | autonomous_allowed policy, never inferred from this classification",
+    "- Checkpoint decision: leave unresolved until a trusted typed human/policy authorization is validated",
+    "- Reason: concise evidence-based routing explanation",
     "",
-    "Autonomy is YOUR decision, made from the COMPLETE task semantics in ANY language: urgency,",
-    "phrasing, implied permission, risk, and explicit directives together. The autonomy hint below",
-    "is a mechanical leading-directive marker, NOT the decision — a task without any marker can be",
-    "autonomous, and a marked task can still be interactive. Never copy the hint into persisted",
-    "state as the decision; persist your own `autonomous` classification.",
-    ...hintLines,
+    "Autonomy is YOUR decision for routing only. It is a routing/migration input and does not authorize a checkpoint, waive consent,",
+    "or turn completion intent, an artifact, a workflow override, or a roster choice into approval.",
+    "Never copy the hint into persisted state as the decision; persist the typed routing classification separately from checkpoint permission.",
+    "The typed checkpoint policy and decision provenance are authoritative; if no trusted decision",
+    "exists, preserve a resumable user_checkpoint/needs_human pause. Never fabricate a human answer.",
   ].join("\n");
 }
 
-/** Workflow resolution matrix — the pure mapping from the model classification. */
+/** Workflow resolution matrix — pure routing from the model classification. */
 export function buildWorkflowMatrix(): string {
   return [
-    "### Workflow resolution (only after PHASE 0)",
-    "Resolve the profile from your semantic classification (type + complexity + autonomous), not from heuristics:",
+    "### Workflow routing (only after PHASE 0)",
+    "Resolve the profile from the routing classification (type + complexity + autonomous), not from heuristics. This field selects a workflow; it never grants checkpoint permission:",
     "| Type | QUICK | MEDIUM | COMPLEX | CRITICAL |",
     "| --- | --- | --- | --- | --- |",
     "| FEATURE | lightweight | standard | full-feature | full-feature |",
@@ -77,13 +82,11 @@ export function buildWorkflowMatrix(): string {
     "| HOTFIX | emergency | emergency | emergency | emergency |",
     "| PRODUCT_DISCOVERY | product-discovery | product-discovery | product-discovery | product-discovery |",
     "",
-    "> Autonomous BUG_FIX resolves to debug-cycle even at QUICK complexity (autonomous=true).",
-    "> SPEC, PRODUCT_DISCOVERY and REGRESS are first-class task intents and do not modify the standard FEATURE/BUG_FIX routing.",
-    "> PRODUCT_DISCOVERY is ALWAYS human-approved: autonomous=true fails closed at the classification gate. The",
-    "> product_approval checkpoint is interactive-only — the product owner answers via workflow_checkpoint",
-    "> (mode=interactive) with exactly one of proceed | needs_more_validation | defer | reject; no inferred consent.",
-    "> The P5 gate re-derives the expected workflow from the persisted classification",
-    "(`classification.autonomous`), so the workflow row must match this matrix. Never re-derive",
-    "autonomy from task text or markers — the model `autonomous` field is the only authority."
+    "> Autonomous BUG_FIX routes to debug-cycle even at QUICK complexity (autonomous=true).",
+    "> SPEC, PRODUCT_DISCOVERY and REGRESS are first-class task intents and do not modify standard routing.",
+    "> PRODUCT_DISCOVERY is ALWAYS human-approved: autonomous=true fails closed at the classification gate.",
+    "> Its product_approval checkpoint requires one trusted typed human decision: proceed | needs_more_validation | defer | reject.",
+    "> The P5 gate re-derives expected routing from persisted classification.autonomous during migration only.",
+    "> Never re-derive permission from task text, markers, completion intent, or legacy prose.",
   ].join("\n");
 }

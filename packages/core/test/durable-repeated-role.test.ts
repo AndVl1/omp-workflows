@@ -23,8 +23,9 @@ import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { resolveStageDispatchSlots, resolveStageDispatchRoles } from "../src/engine/stage.js";
 import { createCapability, beginCapability, authorizeDispatch, completeDispatch, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
+import { checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
 import { buildDispatchMarker, parseDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
-import { writeState } from "../src/engine/state.js";
+import { writeState, resolveState } from "../src/engine/state.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TeamState } from "../src/engine/types.js";
 
@@ -34,6 +35,20 @@ function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
 }
 
+function trustedCheckpoint(root: string, stageId: string, checkpointId: string, decision: string, channel: "terminal" | "escalation" = "terminal") {
+  const resolved = resolveState(root);
+  assert.ok(resolved.state, "checkpoint fixture state must resolve");
+  const trusted = recordTrustedCheckpointAnswer(resolved.state, {
+    answer_id: `durable/${stageId}/${checkpointId}`,
+    channel,
+    reference: `${channel}-answer/durable/${stageId}/${checkpointId}`,
+    stage_id: stageId,
+    checkpoint_id: checkpointId,
+    decision,
+  });
+  writeState(root, trusted.state, { target: resolved });
+  return trusted;
+}
 test("br-eu6: repeated analyst roles normalize to unique dispatch slots that both map to the analyst agent", () => {
   const profile = loadProfile("full-feature");
   assert.ok(profile, "full-feature profile must be available");
@@ -146,6 +161,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
     }, { featureSlug: "repeat" });
+    const trusted = trustedCheckpoint(root, "discovery", "confirm_understanding", "proceed", "escalation");
     const artifactsDir = join(root, ".work-state", "features", "repeat", "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
     // Schema-valid discovery artifacts (task/branch required; feature_spec
@@ -153,16 +169,27 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
     writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "repeat", branch: "feat/repeat", constraints: [] }));
     writeFileSync(join(artifactsDir, "feature_spec.json"), JSON.stringify({ goal: "goal", scope: [], acceptance_criteria: ["criterion"] }));
 
-    // full-feature discovery declares a checkpoint; the durable advance
-    // refuses to leave an unresolved checkpoint.
+    const discoveryStage = profile.stages.find((stage) => stage.id === "discovery");
+    assert.ok(discoveryStage?.checkpoint === "confirm_understanding");
+    const discoveryPolicy = profile.checkpoint_policy;
+    assert.ok(discoveryPolicy);
+    const discoveryRule = discoveryPolicy.rules.confirm_understanding;
+    assert.ok(discoveryRule);
     const checkpoint = recordCheckpointDecision(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/repeat", branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
       stage_cursor: "discovery", cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      checkpoint: "confirm_understanding", mode: "interactive", decision: "confirmed", actor: "user", rationale: "fixture",
+      checkpoint: "confirm_understanding",
+      checkpoint_id: "confirm_understanding",
+      checkpoint_kind: discoveryRule.kind,
+      authorization: "human",
+      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
+      policy_hash: checkpointPolicyHash(discoveryPolicy),
+      decision: "proceed",
+      rationale: "fixture",
     });
-    assert.equal(checkpoint.ok, true, "checkpoint decision must record before advance");
+    assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
 
     const advanced = advanceCursor(root, {
       token: issued.advance_token,
@@ -282,14 +309,28 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
 
     // lightweight implementation declares a checkpoint; record it durably
     // before the advance is allowed.
+    const implementationStage = profile.stages.find((stage) => stage.id === "implementation");
+    assert.ok(implementationStage?.checkpoint === "approve_implementation");
+    const implementationPolicy = profile.checkpoint_policy;
+    assert.ok(implementationPolicy);
+    const implementationRule = implementationPolicy.rules.approve_implementation;
+    assert.ok(implementationRule);
+    const trusted = trustedCheckpoint(root, "implementation", "approve_implementation", "proceed");
     const checkpoint = recordCheckpointDecision(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/single", branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
       stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      checkpoint: "approve_implementation", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "fixture",
+      checkpoint: "approve_implementation",
+      checkpoint_id: "approve_implementation",
+      checkpoint_kind: implementationRule.kind,
+      authorization: "human",
+      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
+      policy_hash: checkpointPolicyHash(implementationPolicy),
+      decision: "proceed",
+      rationale: "fixture",
     });
-    assert.equal(checkpoint.ok, true, "checkpoint decision must record before advance");
+    assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
 
     const advanced = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "implementation completed" });
     assert.equal(advanced.ok, true);

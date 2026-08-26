@@ -2,6 +2,26 @@
   "name": "cto",
   "title": "CTO Sub-Orchestration",
   "description": "Top-level CTO run: discovery -> decomposition -> parallel teams -> integration review -> summary. Never auto-selected by classification (match.type = [] — the CTO profile is invoked explicitly via /cto). The 'teams' stage is filled at runtime from .omp/teams.json by the CTO agent.",
+  "completion_intent": {
+    "mode": "handoff_only",
+    "acceptance": "explicit_human_acceptance",
+    "source": "workflow_policy",
+    "rationale": "CTO orchestration hands off a bounded TeamPlan and integration result; user-owned wave decisions remain explicit."
+  },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": ["product_approval", "security", "destructive_side_effect", "production", "bundle_activation", "migration_cutover"],
+    "rules": {
+      "confirm_understanding": { "kind": "clarification", "default": "required_human", "allowed_decisions": ["proceed", "revise"], "phase": "before_advance", "rationale": "The CTO confirms task understanding before decomposition." },
+      "confirm_plan": { "kind": "architecture_choice", "default": "required_human", "allowed_decisions": ["proceed", "revise", "reject"], "phase": "before_advance", "rationale": "The TeamPlan is an explicit user-owned orchestration decision." },
+      "confirm_contract": { "kind": "integration_acceptance", "default": "required_human", "allowed_decisions": ["proceed", "revise", "reject"], "phase": "before_advance", "rationale": "The cross-team contract requires explicit acceptance." },
+      "user_accepts": { "kind": "integration_acceptance", "default": "required_human", "allowed_decisions": ["proceed", "reject"], "phase": "before_advance", "rationale": "Integration acceptance cannot be inferred from artifact completion." }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Conservative typed opt-in policy keeps load-bearing CTO wave decisions human-required."
+  },
   "match": { "type": [] },
   "stages": [
     {

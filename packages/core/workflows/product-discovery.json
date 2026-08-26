@@ -3,6 +3,23 @@
   "name": "product-discovery",
   "title": "Product discovery",
   "description": "Evidence-first product discovery for PRODUCT_DISCOVERY requests. Produces a human-approved product direction and never modifies application code. Always ends in an interactive product-owner approval; autonomous product discovery fails closed at classification.",
+  "completion_intent": {
+    "mode": "complete_outcome",
+    "acceptance": "explicit_human_acceptance",
+    "source": "workflow_policy",
+    "rationale": "Product discovery ends only with a product-owner decision and a traceable handoff."
+  },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": ["product_approval", "security", "destructive_side_effect", "production", "bundle_activation", "migration_cutover"],
+    "rules": {
+      "product_approval": { "kind": "product_approval", "default": "required_human", "allowed_decisions": ["proceed", "needs_more_validation", "defer", "reject"], "phase": "before_advance", "rationale": "Product direction is owned by the human product owner; no inferred consent is valid." }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Hard-human product approval floor; completion intent never grants consent."
+  },
   "match": { "type": ["PRODUCT_DISCOVERY"] },
   "stages": [
     {
@@ -69,7 +86,7 @@
       "type": "orchestrator",
       "checkpoint": "product_approval",
       "autonomous": "never auto-approve: product approval requires an interactive human decision; autonomous product discovery is rejected before this workflow starts (fail closed).",
-      "prompt": "Present the product_spec to the product owner and record their decision via workflow_checkpoint with mode=interactive. The decision MUST be exactly one of: proceed | needs_more_validation | defer | reject. No inferred consent: if the owner has not explicitly chosen, record nothing. DO NOT fabricate the owner decision or evidence: preserve the verified|assumption|unknown status of every claim. This stage is READ-ONLY: do not edit, create, or modify any application or repository files. Then write the EXACT product_approval_record artifact: decision (enum proceed|needs_more_validation|defer|reject), approved_by (the human product owner), rationale (string), decided_at (ISO-8601). This approval is interactive-only — never self-approve.",
+      "prompt": "Present the product_spec to the product owner and record their decision through workflow_checkpoint using the current typed handoff fields (token, capability_id, run_key, branch, workflow, profile_hash, stage_cursor, cursor_epoch, checkpoint, checkpoint_id, checkpoint_kind, authorization, actor_provenance, decision, rationale). Use checkpoint_kind=product_approval and authorization=human; bind actor_provenance to the actual product-owner answer. The decision MUST be exactly one of: proceed | needs_more_validation | defer | reject. No inferred consent: if the owner has not explicitly chosen, record nothing. DO NOT fabricate the owner decision or evidence: preserve the verified|assumption|unknown status of every claim. This stage is READ-ONLY: do not edit, create, or modify any application or repository files. Then write the EXACT product_approval_record artifact: decision (enum proceed|needs_more_validation|defer|reject), approved_by (the human product owner), rationale (string), decided_at (ISO-8601). This approval is interactive-only — never self-approve.",
       "consumes": ["product_prd", "product_spec"],
       "gate": "product_approval_recorded",
       "produces": "product_approval_record"

@@ -12,13 +12,15 @@
  * `task` tool / `agent` API. The engine itself does NOT use the model; it
  * orchestrates subagents only.
  *
- * Autonomy contract (RC2+): `classification` carries the MODEL decision
- * (`classification.autonomous`) and is authoritative. When it is supplied,
- * type/complexity/confidence/autonomous must all be present — the engine
- * FAILS CLOSED rather than silently filling the gaps from keyword guesses.
- * `keywordClassify` remains only for legacy callers that run without a
- * model classification; it cannot decide autonomy (the caller's `autonomous`
- * option is used verbatim, never defaulted).
+ * Autonomy contract (RC2+): `classification.autonomous` is a routing/migration
+ * input, authoritative only for the legacy workflow matrix. It NEVER grants
+ * checkpoint permission; a checkpoint requires a policy-bound typed decision.
+ * When the field is supplied, type/complexity/confidence/autonomous must all be
+ * present — the engine FAILS CLOSED rather than silently filling the gaps from
+ * keyword guesses.
+ * `keywordClassify` remains only for legacy callers that run without a model
+ * classification; it cannot decide autonomy (the caller's `autonomous` option
+ * is used verbatim, never defaulted).
  */
 
 import { readFileSync } from "node:fs";
@@ -26,8 +28,8 @@ import { loadAllProfiles, profileHash, resolveWorkflow, selectProfile } from "./
 import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope, type ScopeFlags } from "./scope.js";
 import { writeState, setStageStatus, setPause, resolveState, reopenFromFeedback, type ResolvedState } from "./state.js";
-import { authorizeDispatch, completeDispatch, advanceCursor, createCapability, recordCheckpointDecision } from "./durable.js";
-import { hasCheckpointDecision } from "./checkpoints.js";
+import { authorizeDispatch, completeDispatch, advanceCursor, createCapability } from "./durable.js";
+import { validateCheckpointForAdvance } from "./checkpoints.js";
 import { keywordClassify } from "./classify.js";
 import type { Classification, Complexity, Confidence, Profile, RoleConfig, TaskType, TeamState, WorkflowName } from "./types.js";
 import { walkProfile, resolveStageDispatchSlots, type StageContext, type TaskCaller } from "./stage.js";
@@ -236,11 +238,10 @@ export async function run(opts: RunOptions): Promise<RunResult> {
         return;
       }
       const stage = profile.stages.find((candidate) => candidate.id === stageId);
-      // A capability is bound for EVERY stage type so the durable advance
-      // (checkpoint enforcement, autonomous decision recording, atomic
-      // arming of the next stage) is available for orchestrator/bash/none
-      // stages exactly as it is for single/consilium. Non-dispatch stages
-      // get kind "none" with an empty roster, mirroring beginCapability.
+      // (checkpoint enforcement and atomic arming of the next stage) is
+      // available for orchestrator/bash/none stages exactly as it is for
+      // single/consilium. Non-dispatch stages get kind "none" with an empty
+      // roster, mirroring beginCapability.
       const kind: "single" | "consilium" | "none" = stage?.type === "single" ? "single" : stage?.type === "consilium" ? "consilium" : "none";
       const next = setStageStatus(current, stageId, "in_progress", opts.cwd);
       const issued = stage
@@ -256,6 +257,15 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     },
     onStageComplete: (stageId, status) => {
       const current = readState(statePath);
+      // A missing/invalid checkpoint is a resumable pause, not a failed stage.
+      // Keep the stage pending so continuation can answer the same checkpoint.
+      if (
+        status === "failed"
+        && (current.pause?.kind === "user_checkpoint" || current.pause?.kind === "needs_human" || current.pause?.kind === "background_wait")
+      ) {
+        ctx.state = current;
+        return;
+      }
       const next = setStageStatus(current, stageId, status, opts.cwd);
       ctx.state = next;
       writeState(opts.cwd, next, stateTarget);
@@ -280,29 +290,16 @@ export async function run(opts: RunOptions): Promise<RunResult> {
       advance: (evidence) => {
         if (!durableStage) return { ok: false, error: "durable stage unavailable" };
         const current = readState(statePath);
-        // Autonomous runs record the declared auto-decision for unresolved
-        // checkpoints before advance; interactive runs leave them unresolved
-        // so advance fails closed and the owning session records the user's
-        // decision via workflow_checkpoint.
         const stageDef = profile.stages.find((candidate) => candidate.id === durableStage!.stageId);
-        if (stageDef?.checkpoint && current.classification.autonomous && !hasCheckpointDecision(current, stageDef.id, stageDef.checkpoint)) {
-          const recorded = recordCheckpointDecision(opts.cwd, {
-            token: durableStage.advanceToken,
-            capability_id: current.dispatch_capability?.capability_id ?? "",
-            run_key: current.run_key ?? current.branch,
-            branch: current.branch,
-            workflow: profile.name,
-            profile_hash: current.profile_hash ?? profileHash(profile),
-            stage_cursor: durableStage.stageId,
-            cursor_epoch: durableStage.epoch,
-            checkpoint: stageDef.checkpoint,
-            mode: "autonomous",
-            decision: "proceed",
-            actor: "orchestrator",
-            rationale: stageDef.autonomous ?? "autonomous mode",
-          });
-          if (!recorded.ok) return { ok: false, error: `checkpoint record failed: ${recorded.error}` };
-          ctx.state = recorded.state;
+        if (stageDef?.checkpoint) {
+          const checkpoint = validateCheckpointForAdvance(stageDef, current);
+          if (!checkpoint.ok) {
+            const pauseKind = checkpoint.pauseKind ?? (checkpoint.code === "checkpoint_unresolved" ? "user_checkpoint" : "needs_human");
+            const paused = setPause(current, pauseKind, checkpoint.error);
+            ctx.state = paused;
+            writeState(opts.cwd, paused, stateTarget);
+            return { ok: false, error: `${checkpoint.code}: ${checkpoint.error}` };
+          }
         }
         const r = advanceCursor(opts.cwd, { token: durableStage.advanceToken, capability_id: current.dispatch_capability?.capability_id ?? "", run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, evidence });
         if (!r.ok) return { ok: false, error: `${r.error}: ${evidence}` };
@@ -316,9 +313,13 @@ export async function run(opts: RunOptions): Promise<RunResult> {
   const outcomes = await walkProfile(profile, ctx);
   const final = readState(statePath);
   const done = final.stages.every((s) => s.status === "done" || s.status === "skipped");
-  // A loop-exhaustion pause (needs_human/failed) is the durable outcome of
-  // the run; do not overwrite it with a generic status.
-  const terminal = final.pause.kind === "needs_human" || final.pause.kind === "failed"
+  // A loop-exhaustion or checkpoint pause is the durable outcome of the run;
+  // do not overwrite it with a generic status.
+  const resumablePause = final.pause.kind === "user_checkpoint"
+    || final.pause.kind === "needs_human"
+    || final.pause.kind === "background_wait"
+    || final.pause.kind === "failed";
+  const terminal = resumablePause
     ? final
     : setPause(final, done ? "done" : "failed", done ? "" : "one or more stages failed");
   writeState(opts.cwd, terminal, stateTarget);

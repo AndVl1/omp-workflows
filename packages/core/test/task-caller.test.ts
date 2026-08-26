@@ -89,8 +89,47 @@ test("core: createTaskCaller batch rewrites into OMP {context, tasks} shape", as
 
 	assert.equal(results.length, 2);
 	assert.equal(results[0]?.id, "a");
+	assert.equal(results[0]?.task_id, "min");
 	assert.equal(results[0]?.output, "alpha");
+	assert.equal(results[1]?.task_id, "prag");
 	assert.equal(results[1]?.output, "beta");
+});
+
+test("core: trusted batch stamps task identity only for exact positional rows", async () => {
+  const positionalTool: TaskToolLike = {
+    async execute() {
+      return {
+        details: {
+          results: [
+            { output: "first", artifacts: {}, exitCode: 0 },
+            { output: "second", artifacts: {}, exitCode: 0 },
+          ],
+        },
+      };
+    },
+  };
+  const exact = await createTaskCaller(positionalTool).batch({
+    context: "review",
+    tasks: [
+      { agent: "qa", task: "first", name: "assigned-first" },
+      { agent: "qa", task: "second", name: "assigned-second" },
+    ],
+  });
+  assert.deepEqual(exact.map((result) => result.task_id), ["assigned-first", "assigned-second"]);
+
+  const shortTool: TaskToolLike = {
+    async execute() {
+      return { details: { results: [{ output: "only", artifacts: {}, exitCode: 0 }] } };
+    },
+  };
+  const ambiguous = await createTaskCaller(shortTool).batch({
+    context: "review",
+    tasks: [
+      { agent: "qa", task: "first", name: "assigned-first" },
+      { agent: "qa", task: "second", name: "assigned-second" },
+    ],
+  });
+  assert.equal(ambiguous[0]?.task_id, undefined, "count mismatch remains unbound");
 });
 
 test("core: createTaskCaller omits empty optional fields from wire params", async () => {
