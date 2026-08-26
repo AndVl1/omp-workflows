@@ -43,16 +43,29 @@ export function resolveCommandCwd(ctx: ExtensionCommandContext): string | undefi
 	return typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : undefined;
 }
 
+type CommandPromptBuilder = (
+	args: string,
+	ctx: ExtensionCommandContext,
+	cwd: string | undefined,
+) => string;
+type BeforeCommandExecute = (cwd: string | undefined) => void;
+
 function registerPromptCommand(
 	pi: ExtensionAPI,
 	name: string,
 	description: string,
-	buildPrompt: (args: string, ctx: ExtensionCommandContext) => string,
+	buildPrompt: CommandPromptBuilder,
+	resolveCwd: (ctx: ExtensionCommandContext) => string | undefined,
+	beforeExecute?: BeforeCommandExecute,
 ): void {
 	pi.registerCommand(name, {
 		description,
 		handler: async (args, ctx) => {
-			pi.sendUserMessage(buildPrompt(args.trim(), ctx));
+			// Resolve once and pass this exact value through both authorization and
+			// prompt construction. The context may drift while a session is active.
+			const cwd = resolveCwd(ctx);
+			beforeExecute?.(cwd);
+			pi.sendUserMessage(buildPrompt(args.trim(), ctx, cwd));
 		},
 	});
 }
@@ -62,6 +75,7 @@ function buildDoWorkCommandPrompt(
 	ctx: ExtensionCommandContext,
 	commandName: "do-work" | "team",
 	promptBuilder: (envelope: ParsedWorkEnvelope, cwd: string) => string,
+	cwd: string | undefined,
 ): string {
 	if (!args) {
 		return commandName === "do-work"
@@ -83,7 +97,6 @@ function buildDoWorkCommandPrompt(
 				].join("\n");
 	}
 
-	const cwd = resolveCommandCwd(ctx);
 	if (!cwd) return "ERROR: workflow cwd unavailable.";
 	const envelope = parseWorkEnvelope(args, cwd);
 	if (!envelope.task) return "ERROR: empty task after stripping prefix.";
@@ -91,8 +104,7 @@ function buildDoWorkCommandPrompt(
 	return promptBuilder(envelope, cwd);
 }
 
-function buildCtoCommandPrompt(args: string, ctx: ExtensionCommandContext): string {
-	const cwd = resolveCommandCwd(ctx);
+function buildCtoCommandPrompt(args: string, ctx: ExtensionCommandContext, cwd: string | undefined): string {
 	if (!cwd) return "ERROR: workflow cwd unavailable.";
 	if (!args) {
 		ctx.ui.notify("cto: standby mode — awaiting tasks via messenger inbox", "info");
@@ -132,17 +144,46 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 		cto: commandName(prefix, "cto"),
 	};
 	const promptBuilder = options.buildDoWorkPrompt ?? buildDoWorkPrompt;
+	const resolveEffectiveCwd = (ctx: ExtensionCommandContext): string | undefined => {
+		if (options.cwd !== undefined) return options.cwd;
+		const resolvedCwd = options.resolveCwd?.(ctx);
+		if (resolvedCwd !== undefined) return resolvedCwd;
+		return resolveCommandCwd(ctx);
+	};
+	const claimForCommand = options.owner
+		? (cwd: string | undefined): void => {
+			if (!cwd) throw new Error("workflow cwd unavailable.");
+			claimCommandOwner(options, cwd);
+		}
+		: undefined;
 	let registered = false;
 	const registerCommands = (): void => {
 		if (registered) return;
 		registered = true;
-		registerPromptCommand(pi, names.doWork, options.doWorkDescription ?? DO_WORK_DESCRIPTION, (args, ctx) =>
-			buildDoWorkCommandPrompt(args, ctx, "do-work", promptBuilder),
+		registerPromptCommand(
+			pi,
+			names.doWork,
+			options.doWorkDescription ?? DO_WORK_DESCRIPTION,
+			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "do-work", promptBuilder, cwd),
+			resolveEffectiveCwd,
+			claimForCommand,
 		);
-		registerPromptCommand(pi, names.team, options.teamDescription ?? TEAM_DESCRIPTION, (args, ctx) =>
-			buildDoWorkCommandPrompt(args, ctx, "team", promptBuilder),
+		registerPromptCommand(
+			pi,
+			names.team,
+			options.teamDescription ?? TEAM_DESCRIPTION,
+			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "team", promptBuilder, cwd),
+			resolveEffectiveCwd,
+			claimForCommand,
 		);
-		registerPromptCommand(pi, names.cto, options.ctoDescription ?? CTO_DESCRIPTION, buildCtoCommandPrompt);
+		registerPromptCommand(
+			pi,
+			names.cto,
+			options.ctoDescription ?? CTO_DESCRIPTION,
+			(args, ctx, cwd) => buildCtoCommandPrompt(args, ctx, cwd),
+			resolveEffectiveCwd,
+			claimForCommand,
+		);
 	};
 
 	if (options.cwd) {
@@ -150,19 +191,19 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 		registerCommands();
 		return;
 	}
-	if (!options.owner) {
-		registerCommands();
-		return;
-	}
-	if (typeof pi.on !== "function") return;
 
-	// The session root is unavailable during extension load. Do not expose
-	// bare commands until the session-start claim succeeds.
+	// Publish the complete base inventory during extension load. OMP snapshots
+	// registered commands before session_start, and a later extension can still
+	// replace an entry with the same canonical name in the host's command map.
+	registerCommands();
+	if (!options.owner || typeof pi.on !== "function") return;
+
+	// The session root is unavailable during extension load, so claim the
+	// owner once the session supplies its root. Command handlers repeat this
+	// check to remain fail-closed if a conflicting owner wins the claim.
 	pi.on("session_start", (_event: unknown, ctx: unknown) => {
-		if (registered) return;
-		const cwd = options.resolveCwd?.(ctx) ?? resolveCommandCwd(ctx as ExtensionCommandContext);
+		const cwd = resolveEffectiveCwd(ctx as ExtensionCommandContext);
 		if (!cwd) return;
 		claimCommandOwner(options, cwd);
-		registerCommands();
 	});
 }

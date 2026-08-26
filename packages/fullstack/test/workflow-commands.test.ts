@@ -11,16 +11,27 @@ type Registered = {
 	handler: (args: string, ctx: unknown) => Promise<void>;
 };
 
+type SessionStartHandler = (event: unknown, ctx: unknown) => unknown;
+
 function commandHarness(
 	transformPrompt: (prompt: string) => string = prompt => prompt,
 	sessionCwd = process.cwd(),
-): { commands: Map<string, Registered>; prompts: string[]; notifications: string[] } {
+	startSession = true,
+): {
+	commands: Map<string, Registered>;
+	prompts: string[];
+	notifications: string[];
+	sessionStarts: SessionStartHandler[];
+} {
 	const commands = new Map<string, Registered>();
 	const prompts: string[] = [];
 	const notifications: string[] = [];
+	const sessionStarts: SessionStartHandler[] = [];
 	registerWorkflowCommands({
-		on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
-			if (name === "session_start") handler({}, { cwd: sessionCwd });
+		on(name: string, handler: SessionStartHandler) {
+			if (name !== "session_start") return;
+			sessionStarts.push(handler);
+			if (startSession) handler({}, { cwd: sessionCwd });
 		},
 		registerCommand(name: string, options: Registered) {
 			commands.set(name, options);
@@ -31,7 +42,7 @@ function commandHarness(
 			prompts.push(transformPrompt(prompt));
 		},
 	} as never);
-	return { commands, prompts, notifications };
+	return { commands, prompts, notifications, sessionStarts };
 }
 
 function context(cwd: string, notifications: string[], sessionId = "session-direct", sessionCwd?: string): unknown {
@@ -55,6 +66,22 @@ test("fullstack: workflow commands register as authoritative extension commands"
 	assert.equal(commands.get("do-work")?.description, "Run a profile-driven workflow. /do-work <task>. (Alias: /team.)");
 	assert.equal(commands.get("team")?.description, "Alias for /do-work. Prefer /do-work in new code.");
 	assert.ok(commands.get("cto")?.description?.includes("resident CTO"));
+});
+
+test("fullstack: base inventory is public before session_start and remains overrideable", () => {
+	const { commands, sessionStarts } = commandHarness(prompt => prompt, process.cwd(), false);
+	assert.deepEqual([...commands.keys()], ["do-work", "team", "cto"]);
+	assert.equal(sessionStarts.length, 1);
+
+	const override: Registered = {
+		description: "Project plugin team override",
+		handler: async () => undefined,
+	};
+	commands.set("team", override);
+
+	assert.deepEqual([...commands.keys()], ["do-work", "team", "cto"]);
+	assert.equal(commands.get("team"), override);
+	assert.equal([...commands.keys()].filter(name => name === "team").length, 1);
 });
 
 test("fullstack: direct /do-work and /team send prompts through OMP", async () => {
