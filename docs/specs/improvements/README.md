@@ -51,6 +51,8 @@
 | `spec_architecture_tasks-tech-researcher.json` | Adversarial review: блокеры закрыты, verdict PASS, r7 |
 | `spec_completeness.json` | Финальный аудит: 61/61 трассируемость, r8 |
 | `dod.json` | Definition of Done: 9 критериев приёмки с verify_method |
+| `spec-preparation.json` | Top-level summary: статус, решения, инварианты, фазы, верификация |
+| `spec_handoff.json` | Финальный handoff: готовность, оракулы, последовательность внедрения |
 
 ## Верификация (при реализации)
 

@@ -1,0 +1,84 @@
+{
+  "artifact": "spec_handoff",
+  "run_key": "improvements",
+  "branch": "improvements",
+  "workflow": "spec-preparation",
+  "stage": "handoff",
+  "generated_at": "2026-08-26",
+  "revision": "r7-final-implementation-ready",
+  "status": "implementation_ready",
+  "implementation_status": "unblocked_all_ten_decisions_final",
+  "summary": "UDG-1..6 are resolved and audited. All ten decisions are final with gate=false, including the hard autonomy floor, bounded zero-checkpoint unattended sandbox, one canonical bundle-aware engine, layered recovery, deterministic typed-slice planner with central run-wide 8/3 leases, clean legacy-tier cutover over a core-owned situational rubric, and authoritative compact provenance state plus derived report. Completeness gate r8 verdict: PASS_IMPLEMENTATION_READY.",
+  "change_statement": "No application, source, config, test or specification-document files were changed. This workflow changed only declared .work-state artifacts and engine-owned workflow state; no build or test command was run.",
+  "critical_observations": [
+    {"id": "EO-STEERING", "finding": "Parent status steering interrupted a healthy worker's in-flight write and repeated pings caused starvation.", "policy": "Still Running, missing artifact or missing beacon is not hang proof; recover evidence first and never poll an active tool call."},
+    {"id": "EO-BEACON", "finding": "Prompt-only beacon behavior was nondeterministic across healthy workers.", "policy": "Runtime schedules/validates beacons; missing beacon never directly cancels or replays."},
+    {"id": "EO-ARTIFACT-SIZE", "finding": "Valid 144,926-byte JSON was rejected as unreadable; same-worker compaction to 90,468 bytes succeeded. Oversized final candidates were reliably transferred via artifact spill plus parent-side restore.", "policy": "Declare budget and return typed measured/budget size error; compact with same worker before restart or spill exact candidate for parent restore."}
+  ],
+  "resolved_decisions": [
+    {"id": "DEC-1", "answer": "D1-C core floor + profile gates; bounded zero-checkpoint unattended sandbox", "constraints": ["ordinary full five-class human floor", "explicit durable scoped grant only", "zero prompt path in unattended mode", "approved local/dev/domain/Web/Desktop/Android/iOS/resettable-data work remains available", "floor/prohibited/ambiguous actions defer and independent work continues", "terminal handoff when nothing remains", "positive environment proof and effective-action classification"]},
+    {"id": "DEC-2", "answer": "D2-C deterministic typed-slice planner with central 8-global/3-per-role leases", "constraints": ["one candidate per ready independent slice", "risk/platform/package evidence may justify slices or mandatory roles but never directly multiplies slots", "file count evidence only and tokens/time forbidden", "manual-QA whole owner 1 and fan-in output owner 1", "deterministic no-drop waves", "ordered capability-compatible fallback or typed unavailable", "overrides last only within safety bounds", "plan identity includes formula, override, inventory, config, selection, mapping, slice-graph, rubric and bundle-dimension hashes", "no heartbeat/TTL-only lease reclaim"]},
+    {"id": "DEC-3", "answer": "D3-A clean legacy-tier cutover; core-owned eight-dimension situational rubric", "constraints": ["minimal/pragmatic/clean removed from config/input/output/state/docs/tests in one cutover", "no alias/preset/deprecation window", "nested/persisted legacy tier fails pre-planning as LEGACY_TIER_UNSUPPORTED with migration guidance", "never silently maps or ranks", "core versions scope/risk/reversibility/uncertainty/coupling/blast_radius/cost/evidence_quality plus aggregation and rationale", "bundle dimensions namespaced/versioned/hashed additions only", "collision/version/hash drift fail closed into plan identity"]},
+    {"id": "DEC-4", "answer": "D4-C core precedence plus strict canonical ambiguity"},
+    {"id": "DEC-5", "answer": "D5-A one engine with /do-work-<bundle>, /team-<bundle>, /cto-<bundle> aliases"},
+    {"id": "DEC-6", "answer": "State-aware recovery-first with narrow slices, peer fan-in, whole manual-QA and runtime beacons"},
+    {"id": "DEC-7", "answer": "D7-C structured report retained with run + authoritative compact redacted provenance state", "constraints": ["EffectiveConfigResolver.v1 shared authority", "snapshot + monotonic ring latest 32 invalidation/fallback events with eviction on event 33", "atomic CAS snapshot+event updates", "logs telemetry only", "resume from state without log/report; stale/corrupt authority fails closed", "repo-relative paths/stable IDs/hashes only", "absolute/home paths, tokens, secrets, raw args, personal content forbidden"]},
+    {"id": "DEC-8", "answer": "D8-C explicit > project config > exactly one compatible, else fail closed"},
+    {"id": "DEC-9", "answer": "Layered host+repository, authoritative states and no-proof-no-replay"},
+    {"id": "DEC-10", "answer": "D10-B minimal versioned descriptive-only manifest"}
+  ],
+  "dynamic_roster": {
+    "formula": "wdp-d2c-v1 builds a typed disjoint/closed slice DAG. Simultaneously ready independent slices each create one worker candidate; required capabilities determine role composition and multiplicity.",
+    "priority": ["mandatory risk role", "dependency-unblocking critical path", "phase order", "stable slice_id"],
+    "caps": {"global_across_run_and_nested_teams": 8, "per_role": 3, "manual_qa": 1, "fan_in_owner_per_output": 1},
+    "waves": "Every excess ready slice is retained in a deterministic later wave; no slice is dropped.",
+    "leases": "Atomic central CAS acquire/release; ambiguous liveness is not reclaimed from heartbeat/TTL alone.",
+    "overrides": "Applied last and rejected atomically if they conflict with capability pool, caps, dependencies/disjointness, mandatory specialists, ownership or safety.",
+    "identity": "Formula, override, inventory, config, selection, mapping, slice-graph, rubric and bundle-dimension hashes are immutable after launch and checked before dispatch."
+  },
+  "unattended_mode": {
+    "grant": "SandboxGrant is identity-bound to session/branch/worktree/config/inventory/selection, allowed targets/resources/actions, expiry/revocation and provenance.",
+    "allowed": ["local code/commit", "approved project-script dev deploy + health", "approved dev domain/test account", "Web/Desktop validation", "Android/iOS emulator/simulator", "bounded resettable isolated dev data"],
+    "deferred_without_ask": ["production or ambiguous endpoint", "remote push/publish", "credential/access/security change", "irreversible real/external/data effect", "expired/revoked/context-mismatched grant", "opaque/unclassified nested action"],
+    "continue_rule": "DeferredAction records are durable, redacted, attributed and deduplicated; unrelated work continues, then one UnattendedHandoff terminates instead of polling."
+  },
+  "host_probe": {
+    "classification": "mixed_runtime_dependency",
+    "verified": ["session queues", "tool-call boundary", "abort", "lifecycle events", "hyphen command names"],
+    "unverified": ["parent-specific skip routing", "trustworthy not_started proof", "generic colon grammar"],
+    "rule": "Capability chooses queue/guarded/manual; no proof, no replay."
+  },
+  "decision_agenda": [
+    {"order": 1, "id": "UDG-1", "status": "resolved_final", "decisions": ["DEC-9", "DEC-6"]},
+    {"order": 2, "id": "UDG-2", "status": "resolved_final", "decisions": ["DEC-4", "DEC-5", "DEC-10", "DEC-8"]},
+    {"order": 3, "id": "UDG-3", "status": "resolved_final", "decisions": ["DEC-1"], "answer": "D1-C full ordinary floor plus zero-checkpoint bounded SandboxGrant with dev validation and defer-and-continue."},
+    {"order": 4, "id": "UDG-4", "status": "resolved_final", "decisions": ["DEC-2"], "answer": "D2-C typed slice DAG; 8 run-wide/3 per-role central leases; manual-QA 1; fan-in owner 1; deterministic waves; safety-bounded last overrides."},
+    {"order": 5, "id": "UDG-5", "status": "resolved_final", "decisions": ["DEC-7"], "answer": "D7-C human-readable effective-config/mapping report retained with run plus authoritative compact redacted per-run state (snapshot + ring32), logs non-authoritative."},
+    {"order": 6, "id": "UDG-6", "status": "resolved_final", "decisions": ["DEC-3"], "answer": "D3-A clean legacy-tier cutover with core-owned versioned rubric and constrained namespaced bundle dimensions."}
+  ],
+  "readiness": {
+    "discussion": "pass",
+    "implementation": "ready",
+    "blocking_gap": "none",
+    "requirements_traceability": "61/61",
+    "invariants_traceability": "28/28",
+    "edge_case_traceability": "40/40",
+    "final_completeness_gate": "r8 PASS_IMPLEMENTATION_READY",
+    "open_decisions": 0
+  },
+  "implementation_sequence_after_unblock": ["M0 contracts/ownership/artifact+grant policy/report-only observability", "M1 config/catalog/claim/CAS diagnostics and provenance foundation", "M2 typed slice planner, deterministic wave scheduler and central global leases in shadow mode", "M3 policy/sandbox/legacy-cutover/OMP bundle enablement", "M4 layered steering/beacons/fan-in/recovery", "M5 cross-layer evidence"],
+  "planned_verification": {
+    "commands": ["npm run typecheck", "npm run test:core", "npm run test:fullstack", "npm run build"],
+    "behavioral_oracles": ["ordinary floor asks vs unattended defer-with-zero-ask", "grant forgery/replay/expiry/revoke/context drift", "positive dev target proof and redirect/script/subcommand expansion", "approved dev deploy/domain/device/resettable-data reachability", "deduped deferral/continue/terminal handoff", "identical slice plan yields identical roster/waves", "nested global 8/per-role 3 caps and no TTL false reclaim", "no-drop wave fairness and mandatory-risk priority", "fallback/unavailable and override conflict", "manual-QA/fan-in ownership", "resume from compact state alone; ring32 eviction under CAS/crash windows; report regeneration", "LEGACY_TIER_UNSUPPORTED on any nested/persisted legacy tier field; prose untouched", "core rubric determinism/rationale; namespaced additions never override; collision/drift fail closed", "canonical/alias/config/manifest/selection", "steering/recovery/no-proof replay", "beacons/artifact budget"]
+  },
+  "resolved_editorial_followups": ["X-7", "TI-7", "TI-8", "TI-9", "MF-1", "MF-2", "MF-3"],
+  "non_blocking_followups": [],
+  "exact_next_step": "Specification complete: all ten decisions final and audited implementation-ready. Begin implementation on approval following M0..M5; do not reopen finals without explicit new user direction.",
+  "artifacts": {
+    "requirements": "spec_requirements_edge_cases.json revision 5",
+    "options": "spec_options_decisions.json revision 6",
+    "architecture": ["spec_architecture_tasks-architect.json revision 7", "spec_architecture_tasks-tech-researcher.json reconciled final challenge r7"],
+    "completeness": "spec_completeness.json revision r8 PASS_IMPLEMENTATION_READY"
+  },
+  "no_application_or_specification_files_changed": true
+}

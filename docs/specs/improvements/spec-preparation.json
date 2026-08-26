@@ -1,0 +1,168 @@
+{
+  "artifact": "spec-preparation",
+  "run_key": "improvements",
+  "branch": "improvements",
+  "workflow": "spec-preparation",
+  "stage": "handoff",
+  "generated_at": "2026-08-26",
+  "revision": "r7-final-implementation-ready",
+  "status": "implementation_ready__all_decisions_final",
+  "scope": "Evidence-backed research, requirements, decision log, conditional architecture and discussion handoff for omp-workflows improvements; no implementation.",
+  "change_statement": {
+    "application_files_changed": false,
+    "specification_documents_changed": false,
+    "source_config_or_test_files_changed": false,
+    "tests_or_builds_run": false,
+    "only_declared_workflow_artifacts_and_engine_state_changed": true
+  },
+  "outcome": {
+    "discussion_ready": true,
+    "implementation_ready": true,
+    "resolved_decisions": ["DEC-1", "DEC-2", "DEC-3", "DEC-4", "DEC-5", "DEC-6", "DEC-7", "DEC-8", "DEC-9", "DEC-10"],
+    "open_decisions": [],
+    "remaining_decision_count": 0,
+    "reason": "UDG-1 through UDG-6 are resolved. Every decision is final with gate=false; the completeness gate r8 verdict is PASS_IMPLEMENTATION_READY."
+  },
+  "final_user_decisions": [
+    {
+      "id": "DEC-1",
+      "choice": "D1-C immutable core floor plus profile gates, with bounded zero-checkpoint unattended sandbox",
+      "binding_effect": "Ordinary modes always human-gate production deploy/rollback; destructive or irreversible git/filesystem/database/data/schema; irreversible publish/send/payment/account effects; credential/access/security-policy changes; and cancel/restart of a live worker when computation may be lost. Trustworthy not_started or failed-with-no-loss is outside the cancellation class. An explicitly activated durable SandboxGrant has zero runtime asks but never executes floor/prohibited/ambiguous actions: it defers them and continues approved work."
+    },
+    {
+      "id": "DEC-2",
+      "choice": "D2-C deterministic typed-slice planner with bounded global leases",
+      "binding_effect": "A versioned WorkDecompositionPlan creates one candidate per ready independent narrow slice and derives role multiplicity from required capabilities. Run-wide concurrency is capped at 8 across nested teams and 3 per role; manual-QA and every fan-in output each have one owner. Saturation forms deterministic waves, mandatory risk roles are never silently omitted, and overrides apply last only inside safety bounds."
+    },
+    {
+      "id": "DEC-3",
+      "choice": "D3-A clean legacy-tier cutover with core-owned situational rubric",
+      "binding_effect": "minimal/pragmatic/clean vocabulary is removed from config, input schemas, required outputs, state, docs and tests in one cutover with no alias, preset or deprecation window. Nested or persisted legacy tier values fail before planning as typed LEGACY_TIER_UNSUPPORTED with actionable situational-field migration guidance; never silently mapped or ranked. Core owns and versions the eight mandatory rubric dimensions (scope, risk, reversibility, uncertainty, coupling, blast radius, cost, evidence quality), aggregation semantics and required rationale; bundles may add versioned namespaced dimensions that cannot override, remove or shadow core semantics, with collisions and hash drift failing closed into plan identity."
+    },
+    {
+      "id": "DEC-4",
+      "choice": "D4-C documented precedence plus strict canonical ambiguity",
+      "binding_effect": "Preserve documented native/built-in/core precedence, expose all claims, reject ambiguous canonical ownership, and never treat arbitrary plugin load order as API."
+    },
+    {
+      "id": "DEC-5",
+      "choice": "D5-A one core engine plus bundle catalogs and aliases",
+      "binding_effect": "Plugins supply versioned namespaced catalogs/manifests and verified hyphen aliases /do-work-<bundle>, /team-<bundle>, /cto-<bundle>, including omp, over the same engine/state/checkpoint/recovery/artifact chain."
+    },
+    {
+      "id": "DEC-6",
+      "choice": "State-aware recovery-first",
+      "binding_effect": "Evidence and recovery precede replay, restart or cancellation; use narrow single-owner slices, typed peer fan-in, one whole manual-QA owner and runtime safe-boundary beacons."
+    },
+    {
+      "id": "DEC-7",
+      "choice": "D7-C structured report plus authoritative compact provenance state",
+      "binding_effect": "One shared resolver emits a deterministic human-readable effective-config/mapping report retained with run artifacts and persists authoritative compact redacted per-run resume state: exactly one current effective snapshot plus a monotonic ring of the latest 32 invalidation/fallback events with atomic CAS update and oldest eviction on event 33. Observability logs are non-authoritative telemetry. Diagnostic identifiers are normalized repo-relative paths, stable IDs and hashes; absolute/home paths, plaintext tokens, secrets, credential values, raw arguments and unrelated personal content are forbidden, and out-of-project sources become opaque IDs/hashes."
+    },
+    {
+      "id": "DEC-8",
+      "choice": "D8-C explicit > project config > single compatible",
+      "binding_effect": "Otherwise fail closed with candidates/provenance; no hidden picker; resume pins immutable selection identity."
+    },
+    {
+      "id": "DEC-9",
+      "choice": "Layered host plus repository",
+      "binding_effect": "Host queues regular steering and exposes authoritative dispatch states when capable; repository recovers first and replays once only with trustworthy not_started proof."
+    },
+    {
+      "id": "DEC-10",
+      "choice": "D10-B minimal versioned bundle manifest",
+      "binding_effect": "Manifest metadata describes compatibility/catalog/tools/caps/defaults/aliases/hash but never grants permission or remaps model roles."
+    }
+  ],
+  "dynamic_roster": {
+    "planner": "wdp-d2c-v1: versioned typed slice DAG with dependencies, inputs/outputs, write surfaces, required capabilities, package/platform/risk evidence and one fan-in owner",
+    "staffing_formula": "One candidate per simultaneously ready independent slice; role multiplicity is the count of ready slices requiring that capability. File count is evidence only; token/time estimates are forbidden inputs.",
+    "priority": ["mandatory risk role", "dependency-unblocking critical path", "phase order", "stable slice_id"],
+    "hard_caps": {"global_across_run_and_nested_teams": 8, "per_role": 3, "manual_qa_whole_owner": 1, "fan_in_output_owner": 1},
+    "saturation": "Excess ready slices enter deterministic later waves and are never dropped.",
+    "leases": "Central CAS coordinator acquires and releases lifecycle-bound leases. Heartbeat or TTL ambiguity alone never reclaims a live lease; authoritative terminal/not_started/no-loss proof or manual resolution is required.",
+    "fallback": "Only ordered capability-compatible fallback is allowed; missing mandatory capability becomes typed unavailable/deferred.",
+    "overrides": "Applied last but cannot exceed the capability pool, 8/3 caps, dependency/disjointness, mandatory roles, manual-QA/fan-in ownership or safety boundaries; conflicts fail closed with provenance.",
+    "identity": "formula_version, override, discovered inventory, effective config, bundle selection, mapping, slice-graph, rubric and bundle-dimension hashes bind the plan; pre-launch drift rejects and launched plans are immutable."
+  },
+  "provenance_persistence": {
+    "authority": "EffectiveConfigResolver.v1 owns EffectiveConfigProvenanceState (resume authority) and derives EffectiveConfigReport (retained run artifact); observability logs never arbitrate identity or resume.",
+    "retention": "Exactly one current effective snapshot plus ring buffer of latest 32 invalidation/fallback events by monotonic sequence; atomic snapshot+event updates with generation/CAS guards.",
+    "resume": "Valid state resumes without log or report; missing/stale report regenerates deterministically from authoritative state; corrupt/stale authority fails closed before planning.",
+    "redaction": "Repo-relative paths, stable IDs and content hashes only; outside-project sources opaque; secrets/tokens/credentials/raw args/personal content never persisted, with redaction receipts in the audit trail."
+  },
+  "unattended_sandbox": {
+    "activation": "Explicit durable scoped SandboxGrant bound to activator/provenance, session, branch, worktree, config/inventory/selection fingerprints, target/resource/action identities, expiry/revocation and resume policy.",
+    "zero_checkpoint_semantics": "The unattended dispatcher has no prompt path. Floor, prohibited, unknown or ambiguous actions become one durable redacted DeferredAction; independent allowed work continues. If none remains, an UnattendedHandoff terminates the run without polling.",
+    "allowed_when_declared_and_proven": ["local code changes and commits", "project-script dev/validation deploy and health checks", "approved dev domains and test accounts", "Web/Desktop validation", "Android/iOS emulators and simulators", "bounded resettable isolated dev data"],
+    "always_deferred": ["production deploy/rollback or ambiguous target", "remote push/publish", "credential/access/security-policy change", "irreversible real/external/data effect", "expired/revoked/mismatched grant", "opaque or unclassified child action"],
+    "security": "Environment proof is positive and identity-bound, never inferred from hostnames, script names, manifests or credential presence. Scripts/aliases/hooks/subprocesses/redirects are classified by effective action. Existing dev credentials are use-only and redacted."
+  },
+  "verified_facts": [
+    {"id": "VF-1", "confidence": "high", "fact": "Parent status steering interrupted a healthy analyst's in-flight write, repeated pings caused starvation, and cancellation discarded computed work."},
+    {"id": "VF-2", "confidence": "high", "fact": "Prompt-only beacon compliance is nondeterministic: one healthy long-running worker omitted it while another emitted it at a safe boundary."},
+    {"id": "VF-3", "confidence": "high", "fact": "A valid 144,926-byte artifact was rejected twice as unreadable; same-worker compaction to 90,468 bytes succeeded. Artifact spill plus parent-side restore proved the reliable fallback for oversized writes."},
+    {"id": "VF-4", "confidence": "high", "fact": "OMP exact-name/first-wins mechanics do not constitute intentional plugin ownership; hyphenated extension names are verified and generic colon grammar is not."},
+    {"id": "VF-5", "confidence": "high", "fact": "Existing core workflow-contract/observability/gates/CTO/model-role and fullstack seams support additive extension rather than parallel engines."},
+    {"id": "VF-6", "confidence": "high", "fact": "Session queues, tool boundaries, abort and lifecycle events exist in probed host source; parent-specific skip routing and trustworthy not_started proof remain unverified."}
+  ],
+  "requirements_summary": {
+    "functional_requirements": 61,
+    "invariants": 28,
+    "edge_cases": 40,
+    "lifecycle_transitions": 24,
+    "error_behaviors": 25,
+    "compatibility_constraints": 12,
+    "security_constraints": 12,
+    "non_goals": 8,
+    "traceability_pct": 100
+  },
+  "gap_status": {
+    "BG-1": "closed: every DEC-1..10 final with gate=false",
+    "BG-2": "resolved_in_spec: file plan reconciled to existing EXTEND seams",
+    "BG-3": "runtime_capability_dependency: layered ownership with fail-closed manual resolution absent host proof",
+    "BG-4": "resolved_in_spec: full identity hash set, mapping generation, stale-plan rejection and CAS guards",
+    "D2": "resolved_and_audited: no roster-planner blocker remains"
+  },
+  "architecture_outline": {
+    "core": ["semantic autonomy/checkpoint evaluator", "SandboxGrant + positive EnvironmentProof + effective-action authorization", "DeferredAction ledger and UnattendedHandoff", "one diagnostic config/bundle resolver", "canonical claim/collision diagnostics", "immutable bundle selection and manifest validation", "typed WorkDecompositionPlanner and deterministic wave scheduler", "central run-wide GlobalLeaseCoordinator", "EffectiveConfigProvenanceState + EffectiveConfigReport with ring32 retention", "LegacyTierScanner.v1 clean-cutover rejection", "SituationalRubricRegistry.v1 core dimensions and constrained bundle additions", "stale identity/CAS gates", "peer fan-in/beacons/manual-QA ownership", "layered host replay/recovery", "artifact size policy"],
+    "bundle": ["versioned namespaced role catalog", "verified hyphen aliases routed to one engine", "OMP selectable development capabilities", "namespaced rubric dimension contributions without core override", "no duplicate engines, hidden pickers or manifest permissions"]
+  },
+  "migration_phases": [
+    {"id": "M0", "purpose": "Contracts, ownership, artifact/grant policy and report-only observability", "slices": ["TS-00", "TS-01", "TS-11", "TS-16", "TS-17", "TS-18", "TS-19", "TS-20"]},
+    {"id": "M1", "purpose": "Config/catalog/claims/CAS diagnostics and provenance state/report foundation", "slices": ["TS-02", "TS-03", "TS-04", "TS-05", "TS-06"]},
+    {"id": "M2", "purpose": "Typed slice planning, capability assignment, deterministic waves and global leases in shadow mode", "slices": ["TS-07", "TS-08", "TS-16", "TS-19", "TS-21", "TS-22"]},
+    {"id": "M3", "purpose": "Policy, bounded unattended sandbox, legacy-tier cutover and OMP bundle enablement", "slices": ["TS-09", "TS-10", "TS-14", "TS-20", "TS-23"]},
+    {"id": "M4", "purpose": "Layered steering/beacons/fan-in/recovery", "slices": ["TS-12", "TS-13", "TS-17", "TS-18", "HOST-01"]},
+    {"id": "M5", "purpose": "Cross-layer contract and regression evidence", "slices": ["TS-15", "TS-20", "TS-21", "TS-22"]}
+  ],
+  "planned_verification": {
+    "commands_not_run_in_this_spec_workflow": true,
+    "repository_commands": ["npm run typecheck", "npm run test:core", "npm run test:fullstack", "npm run build"],
+    "behavioral_evidence": [
+      "Ordinary floor actions require human approval; identical unattended actions yield zero asks and durable deferral.",
+      "Valid grants allow proven dev deploy/domain/Web/Desktop/Android/iOS/resettable-data validation without checkpoints.",
+      "Forged/replayed/expired/revoked or context-drifted grants never dispatch actions.",
+      "Spoofed dev endpoints, redirects to prod, hidden prod/push flags, aliases/hooks/subprocesses and opaque child actions fail closed.",
+      "Deferrals dedupe, unrelated work continues, and no-progress terminates with one handoff rather than polling.",
+      "Identical slice DAG and identities produce identical roster and waves; file/token/time variation alone does not.",
+      "Nested teams never exceed 8 global or 3 per role; ambiguous crash/heartbeat state never reclaims a potentially live lease.",
+      "Cap saturation queues every slice without starvation or drop; mandatory risk roles and dependency-unblocking slices are ordered first.",
+      "Fallback, unavailable capability, override conflict, manual-QA and fan-in ownership fail closed with typed provenance.",
+      "Resume works from compact state alone; missing/stale reports regenerate; ring holds at 32 events with deterministic eviction under CAS races and crash windows.",
+      "Legacy tier fields anywhere in typed config/state/output fail before planning as LEGACY_TIER_UNSUPPORTED with migration guidance; prose is untouched.",
+      "Core eight-dimension rubric ranks deterministically with explicit rationale; namespaced bundle dimensions add evidence without changing core semantics; collisions/drift fail closed.",
+      "Canonical/alias collisions, config/manifest/selection identity, recovery/no-proof replay, beacons and artifact-budget oracles remain green."
+    ]
+  },
+  "resolved_editorial_followups": ["X-7 stale colon-form example", "TI-7 AF identifier collision", "TI-8 sandbox aggregate slice list", "TI-9 EC-20 self-citation", "MF-1/MF-2/MF-3 bounded transition wording"],
+  "non_blocking_followups": [],
+  "remaining_discussion_order": [],
+  "exact_next_step": "Specification is complete and implementation-ready. Begin implementation on approval following M0..M5 sequence; reopen of any final decision requires explicit new user direction.",
+  "provenance": {
+    "artifacts": ["spec_intake_repo_map-analyst.json", "spec_intake_repo_map-tech-researcher.json", "spec_requirements_edge_cases.json revision 5", "spec_options_decisions.json revision 6", "spec_architecture_tasks-architect.json revision 7", "spec_architecture_tasks-tech-researcher.json reconciled final challenge r7", "spec_completeness.json revision r8 PASS_IMPLEMENTATION_READY"],
+    "external_sources": ["https://github.com/can1357/oh-my-pi/blob/main/docs/skills/authoring-extensions.md", "https://github.com/can1357/oh-my-pi/blob/main/docs/slash-command-internals.md", "https://github.com/can1357/oh-my-pi/blob/main/docs/task-agent-discovery.md", "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/agent-session.ts"],
+    "confidence": {"repository_and_incident_findings": "high", "all_decision_architecture": "final and audited", "host_queue_abort_lifecycle": "high", "parent_specific_skip_and_not_started_proof": "unverified; fail closed/manual mode"}
+  }
+}
