@@ -335,6 +335,11 @@ export function writeRuntimeConfig(opts: RegisterOptions, cwd = opts.cwd): strin
   assertOwner(cwd, ["config_writer"], opts.owner);
   const path = resolveRuntimeConfigPath(cwd);
   if (!path) return null;
+  // Seed-if-absent only. The session seed must never overwrite an existing
+  // config: users and /init-team own the file content after the first
+  // creation, and a per-session preset merge would silently revert every
+  // customization (roles, scope_map) on each omp restart.
+  if (existsSync(path)) return path;
   writeConfig(path, {
     roles: opts.roles ?? {},
     roster_overrides: opts.rosterOverrides ?? {},

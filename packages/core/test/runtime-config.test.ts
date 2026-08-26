@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { resolveConfig } from "../src/engine/config.js";
 import { RuntimeConfigError, resolveRuntimeConfigPath, writeConfig } from "../src/runtime-config.js";
 import {
+  resetWorkflowOwners,
+  writeRuntimeConfig as writeRuntimeConfigFromBarrel,
   RuntimeConfigError as BarrelRuntimeConfigError,
   buildDoWorkPrompt,
   resolveRuntimeConfigPath as barrelResolveRuntimeConfigPath,
@@ -160,6 +162,39 @@ test("writer surfaces an existing malformed document instead of replacing it", (
     );
     assert.equal(readFileSync(path, "utf8"), "{broken");
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("session seed writes the config once and never clobbers user customization", () => {
+  const root = projectRoot("runtime-config-seed-");
+  try {
+    const owner = {
+      owner_id: "seed-test",
+      bundle_id: "seed-test",
+      owner_kind: "fullstack" as const,
+      activation_marker: "test",
+      host_range: "*",
+      provenance: { package: "seed-test", entrypoint: "dist/index.js", cwd: root, config_path: join(root, ".omp", "team.config.json") },
+    };
+    const opts = {
+      roles: { backend: "preset-dev" },
+      scopeMap: [{ glob: ["**/*.kt"], scope: "jvm", dev_agent: "preset-dev" }],
+      flags: {},
+      owner,
+    };
+    const first = writeRuntimeConfigFromBarrel(opts, root);
+    assert.ok(first?.endsWith(join(".omp", "team.config.json")));
+    assert.match(readFileSync(first!, "utf8"), /preset-dev/);
+
+    writeFileSync(first!, `${JSON.stringify({ roles: { backend: "my-rust-agent" }, scope_map: [{ glob: ["**/*.rs"], scope: "rust", dev_agent: "my-rust-agent" }], design_system: null }, null, 2)}\n`);
+    const second = writeRuntimeConfigFromBarrel(opts, root);
+    assert.equal(second, first);
+    const after = JSON.parse(readFileSync(first!, "utf8"));
+    assert.equal(after.roles.backend, "my-rust-agent", "user roles must survive a session seed");
+    assert.equal(after.scope_map[0].scope, "rust", "user scope_map must survive a session seed");
+  } finally {
+    resetWorkflowOwners(root);
     rmSync(root, { recursive: true, force: true });
   }
 });
