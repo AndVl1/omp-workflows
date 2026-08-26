@@ -2,6 +2,23 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.25.0] — 2026-08-26
+### Added
+- Typed control plane: completion intent, checkpoint policy/decisions, roster policy with multiplicity, stable slot/task/work identity, durable pending lifecycle, child join ledger and unified completion envelope with strict fail-closed validation.
+- Engine-owned trusted-answer ledger for human checkpoints: terminal/escalation proof binding (nonce + digest over run/stage/checkpoint, work identity, capability epoch, policy hash); public `workflow_checkpoint` accepts proof references only and rejects fabricated refs, self-consistent bindings, stale proofs and conflicting replay.
+- Durable `pending` dispatch state with identity-based reconciliation, replay protection and linked retries; bounded adaptive roster selection frozen into capability snapshots.
+- Privacy-safe observability identity and terminal transition events proving resume/replacement decisions.
+- Private bundle package `@andvl1/omp-workflows-internal`: 14 `omp-*` agents, `/omp-workflow-team` (+ read-only validate), marker-gated activation (`workspace:package.json+packages/core+packages/fullstack`), atomic all-or-nothing owner claims, host range `>=17.3 <19`.
+
+### Changed
+- Core is engine-only: Kotlin/Go/frontend/mobile roles, scope entries and model-role defaults removed from the default path; presets are explicit caller inputs (fail-closed `DevAgentUnavailableError` replaces the hardcoded fallback); guard suite `core-default-path.test.ts`.
+- Single active owner per canonical worktree × capability family (`workflow_registration`, `workflow_tools`, `config_writer`) enforced fail-closed before any side effect; symlink aliases canonicalized via realpath.
+- Runtime/config safety: explicit session cwd only (no hidden `process.cwd()` fallback), first-existing `.omp`→`.claude` precedence with malformed-first diagnostics, traversal/symlink/cwd-mismatch rejection, mapping invalidation covering roles/scope/flags/roster/config/provider discovery.
+- Hash-based three-way sync for copied commands: untouched shipped copies auto-upgrade on plugin updates, user edits preserved.
+
+### Fixed
+- SEC-CP-001/002/004, SEC-PP-001/002/003, SEC-BUNDLE-001..004 resolved; no open critical/high/medium findings.
+
 ## [0.24.1] — 2026-08-24
 ### Fixed
 - **`PRODUCT_DISCOVERY` workflow preparation schema** — the runtime `workflow_prepare` schema now accepts `PRODUCT_DISCOVERY` classifications while preserving the core approval gate.
