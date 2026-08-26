@@ -2,6 +2,11 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.25.1] — 2026-08-26
+### Fixed
+- `/init-team`: added `--force` regeneration and an honest skip message — opening omp re-seeds a deleted `.omp/team.config.json` from the bundle preset on session_start, so deleting alone never reached the command.
+- Session config seed is write-if-absent: `writeRuntimeConfig` re-merged the bundle preset into `.omp/team.config.json` on every session_start, silently reverting user customizations (roles, scope_map) on each restart.
+
 ## [0.25.0] — 2026-08-26
 ### Added
 - Typed control plane: completion intent, checkpoint policy/decisions, roster policy with multiplicity, stable slot/task/work identity, durable pending lifecycle, child join ledger and unified completion envelope with strict fail-closed validation.
