@@ -17,12 +17,21 @@ import {
   type AgentMappingDiagnostic,
   type MappingPreferencesProvenance,
 } from "./agent-mapping.js";
-import {
-  DEFAULT_FLAGS,
-  DEFAULT_ROLES,
-  DEFAULT_SCOPE_MAP,
-  type RoleConfig,
-} from "./types.js";
+import type { ScopeRuntimeClassTable } from "./scope.js";
+import type { RoleConfig } from "./types.js";
+
+/**
+ * Caller-supplied fallback preset for config documents that omit
+ * `roles`/`scope_map`/`flags`. Core never ships a domain preset of its own:
+ * when neither the config document nor the caller supplies a key, the
+ * resolution degrades to neutral empty values (and `${scope.dev_agent}`
+ * stages fail closed at dispatch time).
+ */
+export interface ConfigPreset {
+  roles?: RoleConfig["roles"];
+  scope_map?: RoleConfig["scope_map"];
+  flags?: RoleConfig["flags"];
+}
 
 export type ConfigSource = "omp" | "legacy" | "defaults";
 export type ConfigDiagnosticCode = "malformed" | "invalid_shape" | "path_invalid";
@@ -44,6 +53,11 @@ export interface ConfigProvenance {
 }
 
 export type ResolvedConfig = RoleConfig & {
+  scope_runtime_classes?: ScopeRuntimeClassTable;
+  /** Alias retained for configs written before the explicit key. */
+  runtime_classes?: ScopeRuntimeClassTable;
+  /** Caller/bundle-supplied scope → UI marker table. */
+  scope_ui_classes?: ScopeRuntimeClassTable;
   config_path: string | null;
   config_source: ConfigSource;
   config_hash: string;
@@ -70,7 +84,11 @@ const CONFIG_KEYS: Record<string, true> = {
   config_version: true,
   writer: true,
   provenance: true,
+  scope_runtime_classes: true,
+  runtime_classes: true,
+  scope_ui_classes: true,
 };
+
 
 function isObject(value: unknown): value is UnknownObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -143,6 +161,32 @@ function readScopeMap(
     } as RoleConfig["scope_map"][number]);
   }
   return valid.length > 0 ? valid : fallback.map(entry => ({ ...entry, glob: [...entry.glob] }));
+}
+
+/**
+ * Validate a scope classification table (`scope_runtime_classes`,
+ * `runtime_classes`, `scope_ui_classes`). Malformed tables are visible
+ * diagnostics and are dropped rather than partially applied.
+ */
+function readRuntimeClassTable(
+  value: unknown,
+  diagnostics: ConfigDiagnostic[],
+  path: string,
+): ScopeRuntimeClassTable | undefined {
+  if (value === undefined) return undefined;
+  if (!isObject(value)) {
+    addDiagnostic(diagnostics, "invalid_shape", path, "expected an object of string or boolean values");
+    return undefined;
+  }
+  const valid: Record<string, string | boolean> = {};
+  for (const [key, candidate] of Object.entries(value)) {
+    if ((typeof candidate === "string" && candidate.trim()) || typeof candidate === "boolean") {
+      valid[key] = candidate;
+    } else {
+      addDiagnostic(diagnostics, "invalid_shape", `${path}.${key}`, "expected a non-empty string or boolean");
+    }
+  }
+  return valid;
 }
 
 function readFlags(
@@ -226,7 +270,7 @@ function mappingInputs(
   };
 }
 
-export function resolveConfig(cwd: string): ResolvedConfig {
+export function resolveConfig(cwd: string, preset: ConfigPreset = {}): ResolvedConfig {
   const resolvedCwd = resolve(cwd);
   const effectiveCwd = existsSync(resolvedCwd) ? realpathSync(resolvedCwd) : resolvedCwd;
   const candidates: Array<{ source: Exclude<ConfigSource, "defaults">; path: string }> = [
@@ -270,9 +314,14 @@ export function resolveConfig(cwd: string): ResolvedConfig {
   }
 
   const document = selected?.document ?? {};
-  const roles = readStringMap(document.roles, DEFAULT_ROLES, diagnostics, "roles");
-  const scope_map = readScopeMap(document.scope_map, DEFAULT_SCOPE_MAP, diagnostics);
-  const flags = readFlags(document.flags, DEFAULT_FLAGS, diagnostics);
+  const presetRoles = preset.roles ?? {};
+  const presetScopeMap = preset.scope_map ?? [];
+  const presetFlags = preset.flags ?? {};
+  const roles = readStringMap(document.roles, presetRoles, diagnostics, "roles");
+  const scope_map = readScopeMap(document.scope_map, presetScopeMap, diagnostics);
+  const flags = readFlags(document.flags, presetFlags, diagnostics);
+  const scope_runtime_classes = readRuntimeClassTable(document.scope_runtime_classes ?? document.runtime_classes, diagnostics, "scope_runtime_classes");
+  const scope_ui_classes = readRuntimeClassTable(document.scope_ui_classes, diagnostics, "scope_ui_classes");
   const roster_overrides = readRosterOverrides(document.roster_overrides, diagnostics);
   const design_system = document.design_system === undefined || document.design_system === null
     ? null
@@ -333,6 +382,8 @@ export function resolveConfig(cwd: string): ResolvedConfig {
     roster_overrides,
     scope_map,
     flags,
+    ...(scope_runtime_classes ? { scope_runtime_classes } : {}),
+    ...(scope_ui_classes ? { scope_ui_classes } : {}),
     agent_mapping,
     config_path: selectedPath,
     config_source: selectedSource,

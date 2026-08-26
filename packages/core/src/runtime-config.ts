@@ -18,7 +18,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import type { ScopeRuntimeClassTable } from "./engine/scope.js";
 import type { RoleConfig } from "./engine/types.js";
+
+/** Writable config surface: role config plus caller-supplied classification tables. */
+type WritableConfig = Partial<RoleConfig> & {
+  scope_runtime_classes?: ScopeRuntimeClassTable;
+  scope_ui_classes?: ScopeRuntimeClassTable;
+};
 
 const CONFIG_DIRECTORY = ".omp";
 const CONFIG_FILENAME = "team.config.json";
@@ -133,7 +140,7 @@ export function resolveRuntimeConfigPath(cwd: string): string | null {
  */
 export function writeConfig(
   path: string,
-  partial: Partial<RoleConfig>,
+  partial: WritableConfig,
   options: RuntimeConfigWriteOptions = {},
 ): void {
   const { target } = validateConfigTarget(path, options.cwd);
@@ -175,6 +182,18 @@ export function writeConfig(
   const newFlags = partial.flags && typeof partial.flags === "object" && !Array.isArray(partial.flags)
     ? partial.flags as Record<string, unknown>
     : {};
+  const oldRuntimeClasses = existing.scope_runtime_classes && typeof existing.scope_runtime_classes === "object" && !Array.isArray(existing.scope_runtime_classes)
+    ? existing.scope_runtime_classes as Record<string, unknown>
+    : {};
+  const newRuntimeClasses = partial.scope_runtime_classes && typeof partial.scope_runtime_classes === "object"
+    ? partial.scope_runtime_classes as Record<string, unknown>
+    : {};
+  const oldUiClasses = existing.scope_ui_classes && typeof existing.scope_ui_classes === "object" && !Array.isArray(existing.scope_ui_classes)
+    ? existing.scope_ui_classes as Record<string, unknown>
+    : {};
+  const newUiClasses = partial.scope_ui_classes && typeof partial.scope_ui_classes === "object"
+    ? partial.scope_ui_classes as Record<string, unknown>
+    : {};
   const merged: Record<string, unknown> = {
     ...existing,
     roles: { ...oldRoles, ...newRoles },
@@ -183,6 +202,8 @@ export function writeConfig(
       ? partial.scope_map
       : Array.isArray(existing.scope_map) ? existing.scope_map : [],
     flags: { ...oldFlags, ...newFlags },
+    scope_runtime_classes: { ...oldRuntimeClasses, ...newRuntimeClasses },
+    scope_ui_classes: { ...oldUiClasses, ...newUiClasses },
     design_system: partial.design_system !== undefined
       ? partial.design_system
       : existing.design_system ?? null,

@@ -1,0 +1,83 @@
+{
+  "name": "omp-feature",
+  "title": "OMP Internal Feature",
+  "description": "QUICK/MEDIUM features in this TypeScript monorepo. Discovery, scoped implementation by bundle generalists, parallel review with conditional security/QA/infra joiners.",
+  "completion_intent": {
+    "mode": "complete_outcome",
+    "acceptance": "dod_and_artifacts",
+    "source": "workflow_policy",
+    "rationale": "Feature workflows complete the bounded outcome with durable artifacts and DoD evidence."
+  },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": ["product_approval", "security", "destructive_side_effect", "production", "bundle_activation", "migration_cutover"],
+    "rules": {
+      "approve_implementation": { "kind": "implementation_approval", "default": "required_human", "allowed_decisions": ["proceed", "reject"], "phase": "before_advance", "rationale": "Implementation approval remains an explicit human checkpoint." },
+      "fix_decision": { "kind": "review_fix", "default": "required_human", "allowed_decisions": ["proceed", "defer", "reject"], "phase": "before_advance", "rationale": "Review-fix disposition must be explicit." }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Conservative typed opt-in policy keeps declared checkpoints human-required."
+  },
+  "match": { "type": ["FEATURE", "REFACTOR", "OPS"], "complexity": ["QUICK", "MEDIUM"] },
+  "stages": [
+    {
+      "id": "discovery",
+      "title": "Discovery",
+      "type": "orchestrator",
+      "gate": "branch_created",
+      "produces": ["discovery", "dod"]
+    },
+    {
+      "id": "implementation",
+      "title": "Implementation",
+      "type": "single",
+      "role": "developer",
+      "consumes": ["discovery"],
+      "checkpoint": "approve_implementation",
+      "autonomous": "proceed",
+      "produces": "implementation"
+    },
+    {
+      "id": "code_review",
+      "title": "Parallel Code Review",
+      "type": "consilium",
+      "roles": ["code-reviewer", "qa"],
+      "parallel": true,
+      "conditional": [
+        { "if": "scope.has_security", "add": "security-tester" },
+        { "if": "scope.has_infra", "add": "devops" }
+      ],
+      "consumes": ["implementation"],
+      "gate": "verdict != reject",
+      "checkpoint": "fix_decision",
+      "autonomous": "fix CRITICAL+HIGH, then continue",
+      "produces": "review"
+    },
+    {
+      "id": "review_fixes",
+      "title": "Review Fixes",
+      "type": "single",
+      "role": "developer",
+      "consumes": ["review"],
+      "skip_if": "review.findings == []"
+    },
+    {
+      "id": "qa_tests",
+      "title": "Focused Tests",
+      "type": "single",
+      "role": "qa",
+      "consumes": ["implementation", "review"],
+      "produces": "qa_tests"
+    },
+    {
+      "id": "summary",
+      "title": "Summary",
+      "type": "orchestrator",
+      "consumes": ["implementation", "review", "qa_tests", "dod"],
+      "gate": "dod_complete",
+      "produces": "summary"
+    }
+  ]
+}

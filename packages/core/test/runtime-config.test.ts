@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { resolveConfig } from "../src/engine/config.js";
 import { RuntimeConfigError, resolveRuntimeConfigPath, writeConfig } from "../src/runtime-config.js";
 import {
-  DEFAULT_SCOPE_RUNTIME_CLASSES,
   RuntimeConfigError as BarrelRuntimeConfigError,
   buildDoWorkPrompt,
   resolveRuntimeConfigPath as barrelResolveRuntimeConfigPath,
@@ -15,6 +14,7 @@ import {
   writeConfig as barrelWriteConfig,
 } from "../src/index.js";
 
+import * as coreBarrel from "../src/index.js";
 function projectRoot(prefix: string): string {
   const root = mkdtempSync(join(tmpdir(), prefix));
   mkdirSync(join(root, ".omp"), { recursive: true });
@@ -24,8 +24,8 @@ test("core barrel exposes runtime config and scope APIs", () => {
   assert.equal(BarrelRuntimeConfigError, RuntimeConfigError);
   assert.equal(barrelResolveRuntimeConfigPath, resolveRuntimeConfigPath);
   assert.equal(barrelWriteConfig, writeConfig);
-  assert.equal(DEFAULT_SCOPE_RUNTIME_CLASSES["backend-kotlin"], "runtime");
-  assert.equal(runtimeClassForScope("backend-kotlin"), "runtime");
+  assert.equal("DEFAULT_SCOPE_RUNTIME_CLASSES" in coreBarrel, false, "core must not export a domain runtime-class table");
+  assert.equal(runtimeClassForScope("backend-kotlin"), null, "unknown scopes classify to null without a caller table");
   assert.equal(scopeToRuntimeClass("custom", { custom: "runtime" }), "runtime");
 });
 
@@ -77,7 +77,9 @@ test("config precedence is explicit and malformed first config never falls throu
     assert.equal(config.config_source, "omp");
     assert.equal(config.diagnostic?.code, "malformed");
     assert.equal(config.config_path, realpathSync(join(root, ".omp", "team.config.json")));
-    assert.equal(config.roles.analyst, "analyst");
+    // INT-001: a malformed config never silently substitutes domain defaults;
+    // resolution degrades to the caller preset (none here) plus diagnostics.
+    assert.equal(config.roles.analyst, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

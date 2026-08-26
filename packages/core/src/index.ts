@@ -39,6 +39,7 @@ import { resolveWorkflowContract } from "./engine/workflow-contract.js";
 import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
 import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof } from "./engine/types.js";
 import type { WorkerWriteScope } from "./gates/orchestrator-write.js";
+import type { ScopeRuntimeClassTable } from "./engine/scope.js";
 import type { DispatchAuth } from "./engine/durable.js";
 export type WorkflowCapability = "workflow_registration" | "workflow_tools" | "config_writer";
 
@@ -210,6 +211,10 @@ export interface RegisterOptions {
   rosterOverrides?: RoleConfig["roster_overrides"];
   scopeMap?: RoleConfig["scope_map"];
   flags?: RoleConfig["flags"];
+  /** Caller-supplied scope → runtime classification table (no core defaults exist). */
+  scopeRuntimeClasses?: ScopeRuntimeClassTable;
+  /** Caller-supplied scope → UI marker table (no core defaults exist). */
+  scopeUiClasses?: ScopeRuntimeClassTable;
   designSystem?: string | null;
   workflowProfiles?: Profile[];
   observability?: boolean;
@@ -317,7 +322,15 @@ function assertOwner(
  * process cwd when this seam is invoked without a known session root.
  */
 export function writeRuntimeConfig(opts: RegisterOptions, cwd = opts.cwd): string | null {
-  const hasOverride = Boolean(opts.roles || opts.scopeMap || opts.flags || opts.rosterOverrides || opts.designSystem !== undefined);
+  const hasOverride = Boolean(
+    opts.roles
+    || opts.scopeMap
+    || opts.flags
+    || opts.rosterOverrides
+    || opts.scopeRuntimeClasses
+    || opts.scopeUiClasses
+    || opts.designSystem !== undefined,
+  );
   if (!hasOverride || !cwd) return null;
   assertOwner(cwd, ["config_writer"], opts.owner);
   const path = resolveRuntimeConfigPath(cwd);
@@ -327,6 +340,8 @@ export function writeRuntimeConfig(opts: RegisterOptions, cwd = opts.cwd): strin
     roster_overrides: opts.rosterOverrides ?? {},
     scope_map: opts.scopeMap ?? [],
     flags: opts.flags ?? {},
+    scope_runtime_classes: opts.scopeRuntimeClasses ?? {},
+    scope_ui_classes: opts.scopeUiClasses ?? {},
     design_system: opts.designSystem ?? null,
   });
   return path;
@@ -862,6 +877,7 @@ export {
   resolveConfig,
   resolveAgentForRole,
   agentMappingIssueForRole,
+  type ConfigPreset,
   type ConfigSource,
   type ConfigDiagnosticCode,
   type ConfigDiagnostic,
@@ -894,7 +910,6 @@ export {
   resolveScope,
   applyConditional,
   shouldSkip,
-  DEFAULT_SCOPE_RUNTIME_CLASSES,
   runtimeClassForScope,
   scopeToRuntimeClass,
   type RuntimeClass,
@@ -941,6 +956,7 @@ export {
 	runStage,
 	createTaskCaller,
 	spawnLabel,
+	DevAgentUnavailableError,
 	type TaskCaller,
 	type TaskResult,
 	type TaskToolLike,
@@ -1061,6 +1077,7 @@ export {
 	expireEscalations,
 	pendingEscalations,
 	activeTeams,
+	markAmended,
 	isCtoRunTerminal,
 	resolveCtoAutonomous,
 	// ── resident control-plane (wave lifecycle) ──
@@ -1083,6 +1100,13 @@ export {
   type ParsedCtoEnvelope,
   type CtoPromptOptions,
 } from "./commands/cto.js";
+export {
+	buildTeamPlan,
+	validateDecompositionDepth,
+	type PlanTeamInput,
+	type PlanBuildInput,
+	type BuildResult,
+} from "./cto/plan.js";
 export {
 	registerWorkflowCommands,
 	type WorkflowCommandOptions,

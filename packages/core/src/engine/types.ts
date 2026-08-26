@@ -769,61 +769,6 @@ export interface RoleConfig {
   agent_mapping?: AgentMappingState;
 }
 
-export const DEFAULT_ROLES: RoleConfig["roles"] = {
-  analyst: "analyst",
-  "tech-researcher": "tech-researcher",
-  diagnostics: "diagnostics",
-  architect: "architect",
-  architect_minimal: "architect",
-  architect_clean: "architect",
-  architect_pragmatic: "architect",
-  "backend-kotlin": "developer-kotlin",
-  go: "developer-go",
-  frontend: "frontend-developer",
-  mobile: "developer-mobile",
-  qa: "qa",
-  "manual-qa": "manual-qa",
-  "code-reviewer": "code-reviewer",
-  "security-tester": "security-tester",
-  devops: "devops",
-  "product-analyst": "product-analyst",
-  "product-researcher": "product-researcher",
-  "product-critic": "product-critic",
-  "product-strategist": "product-strategist",
-};
-
-export const DEFAULT_SCOPE_MAP: RoleConfig["scope_map"] = [
-  {
-    glob: ["**/iosApp/**", "**/composeApp/**", "**/commonMain/**", "**/androidMain/**"],
-    scope: "mobile",
-    dev_agent: "developer-mobile",
-  },
-  {
-    glob: ["**/*.tsx", "**/*.jsx", "**/*.vue", "**/*.ts", "**/src/jsMain/**", "**/miniapp/**", "**/frontend/**"],
-    scope: "frontend",
-    dev_agent: "frontend-developer",
-  },
-  {
-    glob: ["**/*.go", "**/go.mod", "**/go.sum"],
-    scope: "go",
-    dev_agent: "developer-go",
-  },
-  {
-    glob: ["**/Dockerfile", "**/*.yaml", "**/*.yml", "**/helm/**", "**/.github/**", "**/k8s/**"],
-    scope: "devops",
-    dev_agent: "devops",
-  },
-  {
-    glob: ["**/*.kt", "**/*.java", "**/src/main/**"],
-    scope: "backend-kotlin",
-    dev_agent: "developer-kotlin",
-  },
-];
-
-export const DEFAULT_FLAGS: RoleConfig["flags"] = {
-  has_security: ["**/auth/**", "**/security/**", "**/*crypto*", "**/*Secret*", "**/*Token*"],
-  has_infra: ["**/Dockerfile", "**/helm/**", "**/k8s/**", "**/.github/workflows/**"],
-};
 
 /**
  * Definition-of-Done item. Featured by workflow stage, with non-empty evidence

@@ -19,6 +19,7 @@ import {
   setTeamControlPlane,
   recordWorkPending,
   recordWorkTerminal,
+  writeConfig,
 } from "@andvl1/omp-workflows-core";
 import {
   FULLSTACK_BUNDLE_ID,
@@ -378,6 +379,19 @@ test("fullstack: workflow_prepare persists PHASE-0 state in the canonical sessio
   const stale = mkdtempSync(join(tmpdir(), "omp-workflow-prepare-stale-"));
   try {
     execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    // INT-001: the engine no longer falls back to core domain defaults, so the
+    // fixture writes the fullstack preset config exactly as registration does.
+    writeConfig(
+      join(canonical, ".omp", "team.config.json"),
+      {
+        roles: fullstackPreset.roles,
+        scope_map: fullstackPreset.scopeMap,
+        flags: fullstackPreset.flags,
+        scope_runtime_classes: fullstackPreset.scopeRuntimeClasses,
+        scope_ui_classes: fullstackPreset.scopeUiClasses,
+      },
+      { cwd: canonical },
+    );
     const tools = new Map<string, RegisteredTool>();
     registerWorkflowTools({
       zod: { z },

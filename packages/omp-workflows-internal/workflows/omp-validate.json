@@ -1,0 +1,40 @@
+{
+  "name": "omp-validate",
+  "title": "OMP Internal Validation Review",
+  "description": "REVIEW tasks in this monorepo. Parallel findings-only review; no implementation stage.",
+  "completion_intent": {
+    "mode": "handoff_only",
+    "acceptance": "dod_and_artifacts",
+    "source": "workflow_policy",
+    "rationale": "Validation workflows hand off findings and evidence; they do not implement changes."
+  },
+  "match": { "type": ["REVIEW"] },
+  "stages": [
+    {
+      "id": "discovery",
+      "title": "Scope the Validation",
+      "type": "orchestrator",
+      "produces": "discovery"
+    },
+    {
+      "id": "review",
+      "title": "Parallel Validation",
+      "type": "consilium",
+      "roles": ["code-reviewer", "qa"],
+      "parallel": true,
+      "conditional": [
+        { "if": "scope.has_infra", "add": "devops" }
+      ],
+      "consumes": ["discovery"],
+      "gate": "verdict != reject",
+      "produces": "review"
+    },
+    {
+      "id": "summary",
+      "title": "Findings",
+      "type": "orchestrator",
+      "consumes": ["review"],
+      "produces": "summary"
+    }
+  ]
+}

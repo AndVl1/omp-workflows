@@ -2,9 +2,10 @@
  * Generic scope resolution.
  *
  * A scope entry may opt into a runtime class (`runtime_class`) and a caller
- * may supply a `scope_runtime_classes`/`runtime_classes` table on its config.
- * The built-in table only preserves the historical generic behavior; custom
- * domains do not need to be added to this module.
+ * may supply a `scope_runtime_classes`/`runtime_classes` table plus a
+ * `scope_ui_classes` table on its config. Core owns the generic
+ * classification mechanics only; domain scope/classification tables are
+ * caller-supplied data, never core defaults.
  */
 
 import { minimatch } from "./minimatch.js";
@@ -23,23 +24,12 @@ export interface ScopeFlags {
   [flag: string]: boolean | string[] | string | null;
 }
 
-export const DEFAULT_SCOPE_RUNTIME_CLASSES: ScopeRuntimeClassTable = {
-  "backend-kotlin": "runtime",
-  go: "runtime",
-  frontend: "runtime",
-  mobile: "runtime",
-  devops: "runtime",
-};
-
-const DEFAULT_UI_SCOPES: Record<string, true> = {
-  frontend: true,
-  mobile: true,
-};
 
 type ScopeEntry = RoleConfig["scope_map"][number] & { runtime_class?: RuntimeClass | boolean };
 type ScopeConfig = RoleConfig & {
   scope_runtime_classes?: ScopeRuntimeClassTable;
   runtime_classes?: ScopeRuntimeClassTable;
+  scope_ui_classes?: ScopeRuntimeClassTable;
 };
 
 function runtimeClassIsRuntime(runtimeClass: RuntimeClass | boolean | null | undefined): boolean {
@@ -52,10 +42,10 @@ function runtimeClassIsRuntime(runtimeClass: RuntimeClass | boolean | null | und
 function runtimeClassIsUi(runtimeClass: RuntimeClass | boolean | null | undefined): boolean {
   return typeof runtimeClass === "string" && runtimeClass.trim().toLowerCase() === "ui";
 }
-
 /**
  * Resolve one scope to its runtime class.  Entry metadata wins over the
- * caller's table, then the table wins over the compatibility defaults.
+ * caller's table.  Unknown scopes resolve to `null` — core ships no domain
+ * classification defaults.
  */
 export function runtimeClassForScope(
   scope: string,
@@ -70,7 +60,7 @@ export function runtimeClassForScope(
   } else if (configOrTable && scope in configOrTable) {
     return configOrTable[scope] ?? null;
   }
-  return DEFAULT_SCOPE_RUNTIME_CLASSES[scope] ?? null;
+  return null;
 }
 
 /** Alias with an explicit scope-to-runtime-class name for bundle adapters. */
@@ -99,8 +89,10 @@ export function resolveScope(files: string[], config: RoleConfig, options: Scope
       const runtimeClass = entry.runtime_class
         ?? (options.runtimeClasses && entry.scope in options.runtimeClasses ? options.runtimeClasses[entry.scope] : undefined)
         ?? runtimeClassForScope(entry.scope, config);
+      const uiTable = (config as ScopeConfig).scope_ui_classes;
+      const uiMarked = Boolean(uiTable && entry.scope in uiTable && uiTable[entry.scope]);
       hasRuntimeScope ||= runtimeClassIsRuntime(runtimeClass);
-      hasUiScope ||= runtimeClassIsUi(runtimeClass) || DEFAULT_UI_SCOPES[entry.scope] === true;
+      hasUiScope ||= runtimeClassIsUi(runtimeClass) || uiMarked;
       break;
     }
     for (const [flag, patterns] of Object.entries(config.flags ?? {})) {

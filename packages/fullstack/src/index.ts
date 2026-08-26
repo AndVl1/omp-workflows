@@ -28,6 +28,7 @@ import {
   readAgentMapping,
   type ModelRoleEntry,
   type RoleConfig,
+  type ScopeRuntimeClassTable,
   type WorkflowOwnerIdentity,
   type WorkflowToolAdapter,
 } from "@andvl1/omp-workflows-core";
@@ -89,6 +90,21 @@ export const defaultFullstackFlags: RoleConfig["flags"] = {
   has_infra: ["**/Dockerfile", "**/helm/**", "**/k8s/**", "**/.github/workflows/**"],
 };
 
+/** Domain runtime classification moved out of the core default path (INT-001). */
+export const defaultFullstackScopeRuntimeClasses: ScopeRuntimeClassTable = {
+	"backend-kotlin": "runtime",
+	go: "runtime",
+	frontend: "runtime",
+	mobile: "runtime",
+	devops: "runtime",
+};
+
+/** Domain UI scopes moved out of the core default path (INT-001). */
+export const defaultFullstackScopeUiClasses: ScopeRuntimeClassTable = {
+	frontend: true,
+	mobile: true,
+};
+
 export const defaultFullstackModelRoles: ModelRoleEntry[] = [
   { role: "architect", agents: ["architect"], standardFallback: "@slow" },
   { role: "reviewer", agents: ["code-reviewer"], standardFallback: "@slow" },
@@ -109,6 +125,8 @@ export interface FullstackPreset {
   roles: RoleConfig["roles"];
   scopeMap: RoleConfig["scope_map"];
   flags: RoleConfig["flags"];
+  scopeRuntimeClasses: ScopeRuntimeClassTable;
+  scopeUiClasses: ScopeRuntimeClassTable;
   modelRoles: readonly ModelRoleEntry[];
 }
 
@@ -116,6 +134,8 @@ export const fullstackPreset: FullstackPreset = {
   roles: defaultFullstackRoles,
   scopeMap: defaultFullstackScopeMap,
   flags: defaultFullstackFlags,
+  scopeRuntimeClasses: defaultFullstackScopeRuntimeClasses,
+  scopeUiClasses: defaultFullstackScopeUiClasses,
   modelRoles: defaultFullstackModelRoles,
 };
 // Auto-derived from the explicit fullstack taxonomy; tests guard drift.
@@ -280,13 +300,14 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
 }
 
 
-
 export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   registerTeamWorkflow(pi, {
     label: "omp-workflows-fullstack",
     roles: fullstackPreset.roles,
     scopeMap: fullstackPreset.scopeMap,
     flags: fullstackPreset.flags,
+    scopeRuntimeClasses: fullstackPreset.scopeRuntimeClasses,
+    scopeUiClasses: fullstackPreset.scopeUiClasses,
     resolveCwd: resolveSessionCwd,
     owner: fullstackOwnerForCwd,
   });

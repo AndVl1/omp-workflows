@@ -560,8 +560,12 @@ export function beginCapability(cwd: string): TransitionResult {
     slots = selection.slots;
     expectedRoster = selection.expected_roster;
   } else {
-    slots = resolveStageDispatchSlots(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
-    expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+    try {
+      slots = resolveStageDispatchSlots(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+      expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+    } catch (error) {
+      return { ok: false, error: `workflow stage '${stage.id}' dispatch roster unresolved: ${String(error)}`, state };
+    }
   }
   if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) return { ok: false, error: `workflow stage '${stage.id}' has an invalid dispatch roster`, state };
   const mappingIssues: Array<{ role: string; diagnostic: AgentMappingDiagnostic }> = [];
@@ -1525,8 +1529,12 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
       slots = selection.slots;
       expectedRoster = selection.expected_roster;
     } else if (nextKind !== "none") {
-      slots = resolveStageDispatchSlots(nextStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent, state });
-      expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+      try {
+        slots = resolveStageDispatchSlots(nextStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent, state });
+        expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+      } catch (error) {
+        return { ok: false, error: `next stage '${nextStage.id}' dispatch roster unresolved: ${String(error)}`, state };
+      }
     }
     if ((nextKind === "single" && slots.length !== 1) || (nextKind === "consilium" && slots.length === 0)) {
       return { ok: false, error: `next stage '${nextStage.id}' has an invalid dispatch roster`, state };
@@ -1616,8 +1624,12 @@ function reenterLoop(
     slots = selection.slots;
     expectedRoster = selection.expected_roster;
   } else if (kind !== "none") {
-    slots = resolveStageDispatchSlots(backToStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent, state });
-    expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+    try {
+      slots = resolveStageDispatchSlots(backToStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent, state });
+      expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+    } catch (error) {
+      return { ok: false, error: `loop target stage '${backToStage.id}' dispatch roster unresolved: ${String(error)}`, state };
+    }
   }
   if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) {
     return { ok: false, error: `loop target stage '${backToStage.id}' has an invalid dispatch roster`, state };

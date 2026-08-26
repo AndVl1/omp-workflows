@@ -1,0 +1,43 @@
+{
+  "name": "@andvl1/omp-workflows-internal",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Private OMP bundle: workspace-marker-gated workflow engine activation for this monorepo only. Activates exclusively when the project root contains ALL workspace markers (package.json + packages/core + packages/fullstack); fails closed otherwise.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "omp": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "files": [
+    "dist",
+    "agents",
+    "workflows"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --import tsx test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@andvl1/omp-workflows-core": "^0.24.0",
+    "@oh-my-pi/pi-coding-agent": ">=17.3 <19"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

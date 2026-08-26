@@ -41,6 +41,22 @@ import type {
   TeamState,
 } from "./types.js";
 
+
+/**
+ * Fail-closed signal: a stage references `${scope.dev_agent}` but the
+ * resolved scope carries no `dev_agent`. Core never guesses a domain agent;
+ * the caller must supply a matching scope_map entry or an explicit role.
+ */
+export class DevAgentUnavailableError extends Error {
+  constructor(stageId: string) {
+    super(
+      `stage '${stageId}' references \${scope.dev_agent} but the resolved scope has no dev_agent; `
+      + "supply a matching scope_map entry (config or caller preset) or declare an explicit role",
+    );
+    this.name = "DevAgentUnavailableError";
+  }
+}
+
 export interface StageContext {
   cwd: string;
   state: TeamState;
@@ -368,27 +384,32 @@ export async function runStage(
     }
   }
 
-  ctx.log(`stage ${stage.id}: ${stage.title}`);
-  ctx.onStageStart?.(stage.id);
-
   const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
-
-
-  switch (stage.type) {
-    case "orchestrator":
-      return runOrchestrator(stage, ctx, produces);
-    case "single":
-      return runSingle(stage, ctx, produces);
-    case "consilium":
-      return runConsilium(stage, ctx, produces);
-    case "document":
-      return runProductPrdRender(stage, ctx, produces);
-    case "bash":
-      return runBash(stage, ctx, produces);
-    case "none":
-      return { stageId: stage.id, status: "done", note: "no-op stage", artifacts: [] };
-    default:
-      return { stageId: stage.id, status: "failed", note: `unknown stage type: ${stage.type}`, artifacts: [] };
+  try {
+    ctx.log(`stage ${stage.id}: ${stage.title}`);
+    ctx.onStageStart?.(stage.id);
+    switch (stage.type) {
+      case "orchestrator":
+        return await runOrchestrator(stage, ctx, produces);
+      case "single":
+        return await runSingle(stage, ctx, produces);
+      case "consilium":
+        return await runConsilium(stage, ctx, produces);
+      case "document":
+        return await runProductPrdRender(stage, ctx, produces);
+      case "bash":
+        return await runBash(stage, ctx, produces);
+      case "none":
+        return { stageId: stage.id, status: "done", note: "no-op stage", artifacts: [] };
+      default:
+        return { stageId: stage.id, status: "failed", note: `unknown stage type: ${stage.type}`, artifacts: [] };
+    }
+  } catch (error) {
+    if (error instanceof DevAgentUnavailableError) {
+      ctx.log(`stage ${stage.id}: failed — ${error.message}`);
+      return { stageId: stage.id, status: "failed", note: error.message, artifacts: produces };
+    }
+    throw error;
   }
 }
 
@@ -843,11 +864,11 @@ export function resolveStageDispatchSlots(
     }
   }
   const base = stage.type === "single" ? [stage.role ?? ""] : stage.roles ?? [];
-  const expanded = base.map((role) => expandRole(role, ctx));
+  const expanded = base.map((role) => expandRole(role, stage.id, ctx));
   const conditioned = stage.type === "consilium"
     ? applyConditionalOccurrences(expanded, stage.conditional, ctx.flags)
     : expanded;
-  const roster = applyRosterOverrides(conditioned, ctx.cwd, stage.id).map((role) => expandRole(role, ctx));
+  const roster = applyRosterOverrides(conditioned, ctx.cwd, stage.id).map((role) => expandRole(role, stage.id, ctx));
   return normalizeDispatchSlots(roster);
 }
 
@@ -884,8 +905,12 @@ export function resolveStageDispatchRoles(
   return resolveStageDispatchSlots(stage, ctx).map((slot) => slot.role);
 }
 
-function expandRole(role: string, ctx: Pick<StageContext, "resolveDevAgent">): string {
-  if (role === "${scope.dev_agent}") return ctx.resolveDevAgent() ?? "developer-kotlin";
+function expandRole(role: string, stageId: string, ctx: Pick<StageContext, "resolveDevAgent">): string {
+  if (role === "${scope.dev_agent}") {
+    const agent = ctx.resolveDevAgent();
+    if (!agent || !agent.trim()) throw new DevAgentUnavailableError(stageId);
+    return agent;
+  }
   return role;
 }
 
