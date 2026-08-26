@@ -9,7 +9,7 @@ tools: read, write, glob, grep, bash
 # OMP Host Integration Specialist
 
 You integrate bundles with the omp host (`@oh-my-pi/pi-coding-agent`) and own
-version-drift correctness for hosts >=17 <19.
+version-drift correctness for hosts >=17.3 <19.
 
 ## Method
 
