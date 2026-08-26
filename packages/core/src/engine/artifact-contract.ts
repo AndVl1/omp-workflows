@@ -120,7 +120,29 @@ export function validateProducedArtifact(
   if (id === "lecture_acquisition") {
     issues.push(...validateLectureAcquisitionArtifact(value));
   }
+  if (id === "manual_qa") {
+    issues.push(...validateManualQaArtifact(value));
+  }
   return issues.length > 0 ? { ok: false, issues } : { ok: true };
+}
+
+/**
+ * Cross-field manual_qa invariants that draft-07 cannot express:
+ * CONDITIONAL is terminal only when it names a real blocked prerequisite.
+ */
+export function validateManualQaArtifact(value: unknown): ArtifactIssue[] {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return [];
+  const artifact = value as Record<string, unknown>;
+  if (artifact.verdict !== "CONDITIONAL") return [];
+  const blockers = artifact.blocked_prerequisites;
+  if (!Array.isArray(blockers) || blockers.length === 0) {
+    return [{ field: "$.blocked_prerequisites", message: "manual_qa CONDITIONAL requires at least one blocked prerequisite" }];
+  }
+  const emptyIndex = blockers.findIndex((blocker) => typeof blocker === "string" && blocker.trim() === "");
+  if (emptyIndex >= 0) {
+    return [{ field: `$.blocked_prerequisites[${emptyIndex}]`, message: "manual_qa blocked prerequisites must be non-empty strings" }];
+  }
+  return [];
 }
 
 export interface ConsumeDiagnostic {
@@ -184,6 +206,9 @@ export function validateConsumedArtifacts(
     validateValue(schema, value, "$", issues, `artifact '${id}'`);
     if (id === "lecture_acquisition") {
       issues.push(...validateLectureAcquisitionArtifact(value));
+    }
+    if (id === "manual_qa") {
+      issues.push(...validateManualQaArtifact(value));
     }
     diagnostics.push({ id, missing: false, producer_status: producerStatus.get(id) ?? null, issues });
   }

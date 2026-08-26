@@ -441,3 +441,4 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
 
 // ── cto-safety (br-zps.4, br-zps.5, br-zps.6) ──
 export { MockEscalationAdapter, registerMockAdapter } from "./adapters/mock.js";
+export * from "./lecture-acquisition/eval.js";

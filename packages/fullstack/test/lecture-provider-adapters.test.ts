@@ -8,6 +8,7 @@ import { parseYouTubeUrl } from "../src/lecture-acquisition/youtube-url.js";
 import { YouTubePlaylistExpander } from "../src/lecture-acquisition/youtube-playlist.js";
 import { GeminiYouTubeProvider } from "../src/lecture-acquisition/gemini.js";
 import { LectureResearchConfigError, loadLectureResearchConfig } from "../src/lecture-acquisition/config.js";
+import { createDefaultLectureAcquisitionService } from "../src/lecture-acquisition/service.js";
 const limits: AcquisitionLimits = {
   maxPages: 4,
   maxItems: 8,
@@ -112,6 +113,36 @@ test("loadLectureResearchConfig rejects non-official Gemini endpoints without ne
     }));
     const config = await loadLectureResearchConfig(cwd);
     assert.equal(config.gemini.endpoint, "https://generativelanguage.googleapis.com/v1beta");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("enabled OMP route returns typed unavailable before media acquisition without an injected runtime", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "lecture-omp-config-"));
+  try {
+    await mkdir(join(cwd, ".omp"));
+    await writeFile(join(cwd, ".omp", "lecture-research.json"), JSON.stringify({
+      limits: { maxTranscriptSegments: 256 },
+      pipeline: {
+        mode: "transcribe-analyze",
+        audio: { provider: "existing-input", inputEnv: "LECTURE_AUDIO_INPUT", maxBytes: 1024, timeoutMs: 1_000 },
+        asr: { provider: "whisper-local" },
+        analysis: { provider: "ollama", model: "fixture", endpoint: "http://127.0.0.1:11434/v1", trust: "local-loopback" },
+        omp: { enabled: true, role: "lecture-analysis" },
+      },
+    }));
+    const config = await loadLectureResearchConfig(cwd);
+    const service = await createDefaultLectureAcquisitionService(cwd, {});
+    const artifact = await service.acquire({
+      sourceUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      prompt: "Extract bounded claims",
+      limits: config.limits,
+      mediaMode: "owned-audio",
+      rights: { automatedPublicVideoAnalysisApproved: true, ownedCaptionAccessApproved: false, ownedMediaAudioAccessApproved: true },
+    }, new AbortController().signal);
+    assert.equal(artifact.status, "failed");
+    assert.equal(artifact.failures[0]?.code, "OMP_RUNTIME_UNAVAILABLE");
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

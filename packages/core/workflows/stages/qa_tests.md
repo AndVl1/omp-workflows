@@ -11,14 +11,18 @@
 ### PHASE 6.8: AUTOMATED TESTS — encode observed behavior as regression tests
 
 **Why sequenced (v3.0):** tests are written **after** manual QA so they encode what was actually
-observed working (`manual_qa.evidence`), not a guess made against unverified code. This is the
-last runtime stage before summary.
+observed working (`manual_qa.evidence`), not a guess made against unverified code. A
+`CONDITIONAL` manual-qa verdict allows deterministic regression tests to proceed, but does not
+prove the live acceptance criteria that an explicit capability, credential, or configuration
+blocker made unobservable. This is the last runtime stage before summary.
 
-**Gate** (`manual_qa.verdict == PASS || !scope.has_ui`): only write/accept tests once manual QA
-passed. If the task has no UI, `manual_qa` was skipped and this gate degrades to true — tests are
-written directly against the implementation.
+**Gate** (`manual_qa.verdict != FAIL || !scope.has_runtime`): write/accept tests when manual QA
+passed or is `CONDITIONAL` with runtime evidence. If there is no runtime (`!scope.has_runtime`),
+manual_qa is skipped and the fallback remains valid. A `FAIL` verdict while runtime exists, or a
+missing/unknown manual_qa verdict while runtime exists, never passes this gate.
 
-**Input**: `manual_qa` (evidence + verdict) when present, plus `implementation` / `architecture`.
+**Input**: `manual_qa` (evidence + verdict + any `blocked_prerequisites`) when present, plus
+`implementation` / `architecture`.
 
 **Actions**:
 
@@ -29,11 +33,15 @@ written directly against the implementation.
 
     Inputs:
     - manual_qa.evidence (if present) — each observed behavior becomes a test case
+    - manual_qa.verdict and manual_qa.blocked_prerequisites — distinguish observed behavior
+      from criteria that remain unproven because a capability/credential/config blocker exists
     - implementation.files_touched — the code under test
 
     Requirements:
     - encode the manually-observed behavior as durable tests (unit/integration/e2e as fits)
     - cover the acceptance criteria and any regressions manual-qa flagged
+    - when verdict is CONDITIONAL, deterministic checks may proceed, but do not claim blocked
+      live criteria are proven; retain the blocker context in coverage_note
     - run the test suite; report pass/fail
     - do NOT rewrite production code — if a test reveals a defect, report it as a finding
 
@@ -41,7 +49,7 @@ written directly against the implementation.
     - tests_added: files/cases added or updated
     - build_status: pass | fail | n/a
     - based_on_manual_qa: true on the has_ui path
-    - coverage_note: what is and isn't covered"
+    - coverage_note: what is and isn't covered, including any CONDITIONAL blocker"
    ```
 
 2. Write `.work-state/artifacts/qa_tests.json`.

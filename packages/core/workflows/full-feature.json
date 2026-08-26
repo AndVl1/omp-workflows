@@ -158,7 +158,7 @@
       "type": "single",
       "role": "qa",
       "consumes": ["manual_qa", "implementation", "architecture"],
-      "gate": "manual_qa.verdict == PASS || !scope.has_runtime",
+      "gate": "manual_qa.verdict != FAIL || !scope.has_runtime",
       "produces": "qa_tests"
     },
     {

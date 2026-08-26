@@ -56,6 +56,12 @@ import {
   type Complexity,
   type TeamDef,
   type TeamState,
+  HARD_ACQUISITION_LIMITS,
+  chunkTimestampedTranscript,
+  normalizeAnalysisCandidates,
+  type AnalysisResult,
+  type ResolvedVideoSource,
+  type TimestampedTranscriptSegment,
 } from "@andvl1/omp-workflows-core";
 import { dodBackstop } from "../src/gates/dod-backstop.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
@@ -324,6 +330,10 @@ test("lecture-research: artifact contract accepts grounded artifacts, rejects mi
     "partial acquisition preserves failures while carrying valid evidence",
   );
   assert.deepEqual(validateProducedArtifact("lecture_acquisition", acquisitionArtifact("failed", [], [failure])), { ok: true });
+  const invalidFailures = validateProducedArtifact("lecture_acquisition", { ...acquisitionArtifact("failed"), failures: { code: "NETWORK_ERROR" } });
+  assert.equal(invalidFailures.ok, false, "failure collections must remain arrays");
+  const invalidSourceFailures = validateProducedArtifact("lecture_acquisition", { ...acquisitionArtifact("failed"), sourceSet: { ...acquisitionArtifact("failed").sourceSet as Record<string, unknown>, failures: { code: "NETWORK_ERROR" } } });
+  assert.equal(invalidSourceFailures.ok, false, "source failure collections must remain arrays");
   const emptyPartial = validateProducedArtifact("lecture_acquisition", acquisitionArtifact("partial", [], [failure]));
   assert.equal(emptyPartial.ok, false, "partial acquisition without evidence cannot advance");
   const invalidTimestamp = validateProducedArtifact(
@@ -617,4 +627,51 @@ test("lecture-research: DoD backstop exempts lecture-research done-claims", () =
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+test("lecture pipeline core chunking and grounding keep trusted source metadata", () => {
+  const source: ResolvedVideoSource = { sourceId: "yt-video-corefixture", videoId: "corefixture", canonicalUrl: "https://www.youtube.com/watch?v=corefixture" };
+  const transcript: TimestampedTranscriptSegment[] = [
+    { segmentId: "s0", text: "first bounded claim", startSeconds: 0, endSeconds: 2 },
+    { segmentId: "s1", text: "second bounded claim", startSeconds: 2, endSeconds: 4 },
+  ];
+  const chunks = chunkTimestampedTranscript(source.sourceId, transcript, { maxChunkCharacters: 64, maxChunksPerSource: 4 });
+  assert.equal(chunks.length, 1);
+  const result: AnalysisResult = {
+    provider: "fixture-analysis",
+    candidates: [
+      { quote: "second bounded claim", startSeconds: 2, endSeconds: 4, kind: "transcript_excerpt" },
+      { quote: "not in transcript", startSeconds: 20, endSeconds: 21, kind: "transcript_excerpt" },
+    ],
+  };
+  const evidence = normalizeAnalysisCandidates(source, transcript, result, 4, (input) => `${input.sourceId}:${input.startSeconds}:${input.endSeconds}:${input.quote}`);
+  assert.equal(evidence.length, 1);
+  assert.equal(evidence[0]?.location, source.canonicalUrl);
+  assert.equal(evidence[0]?.quote, "second bounded claim");
+});
+ 
+test("lecture pipeline chunking honors configured transcript cap above legacy default and hard bound", () => {
+  const source: ResolvedVideoSource = { sourceId: "yt-video-limitfixture", videoId: "limitfixture", canonicalUrl: "https://www.youtube.com/watch?v=limitfixture" };
+  const transcript: TimestampedTranscriptSegment[] = Array.from({ length: 32 }, (_, index) => ({
+    segmentId: `s${index}`,
+    text: "x".repeat(8_192),
+    startSeconds: index,
+    endSeconds: index + 1,
+  }));
+  const chunking = { maxChunkCharacters: 12_000, maxChunksPerSource: 64 };
+  const chunks = chunkTimestampedTranscript(source.sourceId, transcript, {
+    ...chunking,
+    maxTranscriptCharacters: 300_000,
+  });
+  assert.equal(chunks.length, transcript.length, "each bounded segment remains an individual chunk");
+  assert.ok(chunks.every((chunk) => chunk.text.length <= chunking.maxChunkCharacters), "chunk size remains bounded");
+  assert.throws(
+    () => chunkTimestampedTranscript(source.sourceId, transcript, { ...chunking, maxTranscriptCharacters: 250_000 }),
+    /configured character bound/,
+    "the effective configured transcript cap still rejects oversize input",
+  );
+  assert.throws(
+    () => chunkTimestampedTranscript(source.sourceId, transcript, { ...chunking, maxTranscriptCharacters: HARD_ACQUISITION_LIMITS.maxTranscriptCharacters + 1 }),
+    /invalid transcript chunk bounds/,
+    "the project hard transcript bound cannot be widened",
+  );
 });

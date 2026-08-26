@@ -21,7 +21,7 @@ const fail = (code: string, error?: string): Result => ({ ok: false, code, ...(e
 const MAX_LECTURE_TASK_LENGTH = 16_384;
 
 export function registerLectureAcquireTool(pi: Pi, z: Z, callbacks: Callbacks): void {
-  pi.registerTool({ name: "lecture_acquire", label: "Acquire lecture evidence", description: "Acquire public YouTube evidence from a URL and natural-language prompt. Uses automatic public video analysis and never asks for transcripts, media, or captions. The empty parameter object is intentional: this tool reads the URL and prompt from lecture_intake.", parameters: z.object({}), async execute(_id: string, _params: unknown, signal?: AbortSignal, _update?: unknown, ctx?: ToolContext) {
+  pi.registerTool({ name: "lecture_acquire", label: "Acquire lecture evidence", description: "Acquire bounded lecture evidence from the single URL and prompt in lecture_intake. Rights and media mode are read explicitly from intake; absent approval is metadata-only/fail-closed.", parameters: z.object({}), async execute(_id: string, _params: unknown, signal?: AbortSignal, _update?: unknown, ctx?: ToolContext) {
     let value: Result;
     try {
       if (!callbacks.isMainSessionContext(ctx)) value = fail("WORKFLOW_CONTEXT_REJECTED");
@@ -49,8 +49,20 @@ export function registerLectureAcquireTool(pi: Pi, z: Z, callbacks: Callbacks): 
               if (!location || typeof kind !== "string" || !["url", "video", "playlist"].includes(kind)) value = fail("LECTURE_SOURCE_UNSUPPORTED");
               else {
                 const config = await loadLectureResearchConfig(cwd);
-                const request = { sourceUrl: location, prompt: task, limits: config.limits, rights: { automatedPublicVideoAnalysisApproved: true, ownedCaptionAccessApproved: false } };
-                const service = await createDefaultLectureAcquisitionService(cwd, process.env);
+                const intakeRights = field(intake, "rights");
+                const sourceRights = field(source, "rights");
+                const rightsValue = intakeRights ?? sourceRights;
+                const rights = {
+                  automatedPublicVideoAnalysisApproved: field(rightsValue, "automatedPublicVideoAnalysisApproved") === true,
+                  ownedCaptionAccessApproved: field(rightsValue, "ownedCaptionAccessApproved") === true,
+                  ownedMediaAudioAccessApproved: field(rightsValue, "ownedMediaAudioAccessApproved") === true,
+                  ownedMediaAccessApproved: field(rightsValue, "ownedMediaAccessApproved") === true,
+                  externalTranscriptAnalysisApproved: field(rightsValue, "externalTranscriptAnalysisApproved") === true,
+                };
+                const modeValue = field(intake, "mediaMode");
+                const mediaMode: "metadata-only" | "owned-audio" = modeValue === "owned-audio" ? "owned-audio" : "metadata-only";
+                const request = { sourceUrl: location, prompt: task, limits: config.limits, mediaMode, rights };
+                const service = await createDefaultLectureAcquisitionService(cwd, process.env, { ompRuntime: field(ctx, "ompRuntime") });
                 const artifact = await service.acquire(request, signal ?? contextSignal(ctx) ?? new AbortController().signal);
                 const artifactPath = writeArtifact(resolved.artifactsDir, "lecture_acquisition", artifact);
                 value = { ok: artifact.status === "succeeded" || artifact.status === "partial", code: artifact.status === "succeeded" ? "ACQUISITION_COMPLETED" : artifact.status === "partial" ? "ACQUISITION_PARTIAL" : "ACQUISITION_FAILED", status: artifact.status, artifact_id: "lecture_acquisition", source_count: artifact.sourceSet.items.length, evidence_count: artifact.evidence.length, failure_count: artifact.failures.length, artifact_path: artifactPath };

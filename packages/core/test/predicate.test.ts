@@ -2,7 +2,7 @@
  * Shared expression semantics (gate / skip_if / until):
  *   - every shipped profile expression parses (load-time coverage),
  *   - the previously-broken shipped expressions now evaluate correctly:
- *     full-feature `qa_tests` OR gate, `review_fixes` artifact skip_if,
+ *     full-feature `qa_tests` PASS/CONDITIONAL gate, `review_fixes` artifact
  *     debug-cycle `until` (verdict == PASS),
  *   - unsupported syntax fails closed with diagnostics (never silent false),
  *   - OR evaluation is three-valued: a satisfied fallback term keeps the
@@ -49,19 +49,39 @@ test("predicate: every shipped gate/skip_if/until/conditional expression parses"
   }
 });
 
-test("predicate: full-feature qa_tests OR gate passes via verdict and via skipped runtime fallback", () => {
+test("predicate: full-feature qa_tests gate accepts PASS/CONDITIONAL, rejects FAIL, and preserves skipped fallback", () => {
   const root = mkdtempSync(join(tmpdir(), "pred-or-"));
   try {
     const artifactsDir = join(root, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
     const stage = { id: "qa_tests", title: "QA", type: "single" as const, role: "qa", produces: "qa_tests", consumes: ["manual_qa"] };
-    const gate = "manual_qa.verdict == PASS || !scope.has_runtime";
+    const gate = "manual_qa.verdict != FAIL || !scope.has_runtime";
+
+    for (const profileName of ["full-feature", "standard"]) {
+      const profile = loadProfile(profileName);
+      assert.ok(profile);
+      const qaTests = profile.stages.find((candidate) => candidate.id === "qa_tests");
+      assert.equal(qaTests?.gate, gate, `${profileName} qa_tests gate must preserve conditional runtime semantics`);
+    }
 
     // Verdict path: manual_qa PASS.
     writeFileSync(join(artifactsDir, "manual_qa.json"), JSON.stringify({ verdict: "PASS", evidence: ["ran"] }));
     assert.deepEqual(
       evaluatePredicate(gate, { flags: RUNTIME_FLAGS, artifactsDir, state: state(), stage }),
       { ok: true, value: true },
+    );
+
+    // Conditional path: deterministic/runtime evidence exists, but a required
+    // live criterion is unavailable behind an explicit blocker.
+    writeFileSync(join(artifactsDir, "manual_qa.json"), JSON.stringify({
+      verdict: "CONDITIONAL",
+      evidence: ["deterministic checks passed"],
+      blocked_prerequisites: ["live provider credential unavailable"],
+    }));
+    assert.deepEqual(
+      evaluatePredicate(gate, { flags: RUNTIME_FLAGS, artifactsDir, state: state(), stage }),
+      { ok: true, value: true },
+      "CONDITIONAL is accepted for runtime-backed deterministic QA",
     );
 
     // Fallback path: manual_qa skipped (artifact absent) and no runtime scope.

@@ -29,6 +29,7 @@ export const ACQUISITION_FAILURE_CODES = [
   "INVALID_PROVIDER_RESPONSE",
   "LIMIT_EXCEEDED",
   "PARTIAL_SOURCE_SET",
+  "OMP_RUNTIME_UNAVAILABLE",
 ] as const;
 export type AcquisitionFailureCode = (typeof ACQUISITION_FAILURE_CODES)[number];
 
@@ -50,6 +51,13 @@ export const DEFAULT_ACQUISITION_LIMITS = Object.freeze({
   maxAttempts: 2,
   maxResponseBytes: 1_048_576,
   maxEvidenceSegmentsPerSource: 64,
+  maxAudioBytes: 64 * 1024 * 1024,
+  maxTranscriptCharacters: 250_000,
+  maxTranscriptSegments: 4_096,
+  maxChunkCharacters: 12_000,
+  maxChunksPerSource: 128,
+  maxAnalysisOutputBytes: 262_144,
+  maxProviderCostCents: 5_000,
 } satisfies Omit<AcquisitionLimits, "maxDurationSeconds">);
 
 /** Hard bounds a consumer must not exceed when accepting tool-supplied limits. */
@@ -61,6 +69,13 @@ export const HARD_ACQUISITION_LIMITS = Object.freeze({
   maxAttempts: 2,
   maxResponseBytes: 10_485_760,
   maxEvidenceSegmentsPerSource: 256,
+  maxAudioBytes: 256 * 1024 * 1024,
+  maxTranscriptCharacters: 1_000_000,
+  maxTranscriptSegments: 16_384,
+  maxChunkCharacters: 32_000,
+  maxChunksPerSource: 512,
+  maxAnalysisOutputBytes: 1_048_576,
+  maxProviderCostCents: 100_000,
 } satisfies Required<AcquisitionLimits>);
 
 export interface AcquisitionLimits {
@@ -78,6 +93,20 @@ export interface AcquisitionLimits {
   maxResponseBytes: number;
   /** Maximum normalized evidence segments retained per source. */
   maxEvidenceSegmentsPerSource: number;
+  /** Maximum bytes held by any ephemeral audio lease. */
+  maxAudioBytes?: number;
+  /** Maximum transcript characters retained in memory per source. */
+  maxTranscriptCharacters?: number;
+  /** Maximum normalized transcript segments accepted from one ASR response. */
+  maxTranscriptSegments?: number;
+  /** Maximum characters sent in one analysis chunk. */
+  maxChunkCharacters?: number;
+  /** Maximum analysis chunks processed per source. */
+  maxChunksPerSource?: number;
+  /** Maximum bytes accepted from one analysis response. */
+  maxAnalysisOutputBytes?: number;
+  /** Optional estimated provider budget in cents. */
+  maxProviderCostCents?: number;
 }
 
 /**
@@ -99,6 +128,27 @@ export function normalizeAcquisitionLimits(
     maxAttempts: requested.maxAttempts ?? configured.maxAttempts,
     maxResponseBytes: requested.maxResponseBytes ?? configured.maxResponseBytes,
     maxEvidenceSegmentsPerSource: requested.maxEvidenceSegmentsPerSource ?? configured.maxEvidenceSegmentsPerSource,
+    ...(requested.maxAudioBytes !== undefined || configured.maxAudioBytes !== undefined
+      ? { maxAudioBytes: requested.maxAudioBytes ?? configured.maxAudioBytes }
+      : {}),
+    ...(requested.maxTranscriptCharacters !== undefined || configured.maxTranscriptCharacters !== undefined
+      ? { maxTranscriptCharacters: requested.maxTranscriptCharacters ?? configured.maxTranscriptCharacters }
+      : {}),
+    ...(requested.maxTranscriptSegments !== undefined || configured.maxTranscriptSegments !== undefined
+      ? { maxTranscriptSegments: requested.maxTranscriptSegments ?? configured.maxTranscriptSegments }
+      : {}),
+    ...(requested.maxChunkCharacters !== undefined || configured.maxChunkCharacters !== undefined
+      ? { maxChunkCharacters: requested.maxChunkCharacters ?? configured.maxChunkCharacters }
+      : {}),
+    ...(requested.maxChunksPerSource !== undefined || configured.maxChunksPerSource !== undefined
+      ? { maxChunksPerSource: requested.maxChunksPerSource ?? configured.maxChunksPerSource }
+      : {}),
+    ...(requested.maxAnalysisOutputBytes !== undefined || configured.maxAnalysisOutputBytes !== undefined
+      ? { maxAnalysisOutputBytes: requested.maxAnalysisOutputBytes ?? configured.maxAnalysisOutputBytes }
+      : {}),
+    ...(requested.maxProviderCostCents !== undefined || configured.maxProviderCostCents !== undefined
+      ? { maxProviderCostCents: requested.maxProviderCostCents ?? configured.maxProviderCostCents }
+      : {}),
   };
   if (value.maxItems < 1 || value.maxItems > configured.maxItems || value.maxItems > HARD_ACQUISITION_LIMITS.maxItems) {
     throw new RangeError("maxItems exceeds acquisition bounds");
@@ -120,6 +170,22 @@ export function normalizeAcquisitionLimits(
   }
   if (value.maxEvidenceSegmentsPerSource < 1 || value.maxEvidenceSegmentsPerSource > configured.maxEvidenceSegmentsPerSource || value.maxEvidenceSegmentsPerSource > HARD_ACQUISITION_LIMITS.maxEvidenceSegmentsPerSource) {
     throw new RangeError("maxEvidenceSegmentsPerSource exceeds acquisition bounds");
+  }
+  const optionalBounds: Array<readonly [keyof AcquisitionLimits, number, number]> = [
+    ["maxAudioBytes", 1, HARD_ACQUISITION_LIMITS.maxAudioBytes],
+    ["maxTranscriptCharacters", 1, HARD_ACQUISITION_LIMITS.maxTranscriptCharacters],
+    ["maxTranscriptSegments", 1, HARD_ACQUISITION_LIMITS.maxTranscriptSegments],
+    ["maxChunkCharacters", 1, HARD_ACQUISITION_LIMITS.maxChunkCharacters],
+    ["maxChunksPerSource", 1, HARD_ACQUISITION_LIMITS.maxChunksPerSource],
+    ["maxAnalysisOutputBytes", 1, HARD_ACQUISITION_LIMITS.maxAnalysisOutputBytes],
+    ["maxProviderCostCents", 0, HARD_ACQUISITION_LIMITS.maxProviderCostCents],
+  ];
+  for (const [key, minimum, hardMaximum] of optionalBounds) {
+    const actual = value[key];
+    const configuredMaximum = configured[key];
+    if (actual !== undefined && (!Number.isInteger(actual) || actual < minimum || actual > hardMaximum || (typeof configuredMaximum === "number" && actual > configuredMaximum))) {
+      throw new RangeError(`${String(key)} exceeds acquisition bounds`);
+    }
   }
   return value;
 }
@@ -179,14 +245,176 @@ export interface EvidenceSegment {
   confidence?: EvidenceConfidence;
 }
 
+/** A timestamped, bounded transcript segment returned by a provider-neutral ASR port. */
+export interface TimestampedTranscriptSegment {
+  segmentId?: string;
+  text: string;
+  startSeconds: number;
+  endSeconds: number;
+  language?: string;
+  confidence?: number;
+  /** Whether the segment boundaries came from the provider or a bounded estimate. */
+  timestampSource?: "provider" | "estimated";
+}
+
+/** Ephemeral process-local audio. Implementations must make dispose idempotent. */
+export interface EphemeralAudio {
+  readonly format: string;
+  readonly sizeBytes: number;
+  readonly durationSeconds?: number;
+  open(signal: AbortSignal): Promise<AsyncIterable<Uint8Array>>;
+  dispose(): Promise<void>;
+}
+
+export type MediaLease = EphemeralAudio;
+export type PreparedAudioLease = EphemeralAudio;
+
+export interface LectureAuthorization {
+  mediaMode: "metadata-only" | "owned-audio";
+  automatedPublicVideoAnalysisApproved: boolean;
+  ownedMediaAudioAccessApproved: boolean;
+  externalTranscriptAnalysisApproved?: boolean;
+}
+
+export interface PipelineLimits {
+  maxAudioBytes: number;
+  maxDurationSeconds?: number;
+  maxTranscriptCharacters: number;
+  maxTranscriptSegments?: number;
+  maxChunkCharacters: number;
+  maxChunksPerSource: number;
+  maxAnalysisOutputBytes: number;
+}
+
+/** Fullstack implementations may obtain only caller-owned/rights-attested media. */
+export interface LectureAudioAcquirer {
+  acquire(source: ResolvedVideoSource, request: LectureAcquisitionRequest, signal: AbortSignal): Promise<EphemeralAudio>;
+}
+
+export interface AuthorizedMediaAcquisitionPort {
+  acquire(
+    source: ResolvedVideoSource,
+    authorization: LectureAuthorization,
+    limits: PipelineLimits,
+    signal: AbortSignal,
+  ): Promise<MediaLease>;
+}
+
+export interface BoundedAudioPreprocessorPort {
+  prepare(media: MediaLease, limits: PipelineLimits, signal: AbortSignal): Promise<PreparedAudioLease>;
+}
+
+export interface TimestampedTranscript {
+  sourceId: string;
+  durationSeconds?: number;
+  language?: string;
+  provider: string;
+  model?: string;
+  timestampMode?: "provider" | "estimated";
+  segments: TimestampedTranscriptSegment[];
+}
+
+export interface TranscriptChunk {
+  chunkId: string;
+  sourceId: string;
+  ordinal: number;
+  startSeconds: number;
+  endSeconds: number;
+  text: string;
+  segmentIds: string[];
+}
+
+export interface AnalysisCandidate {
+  quote: string;
+  startSeconds: number;
+  endSeconds: number;
+  kind: EvidenceKind;
+  language?: string;
+  confidence?: EvidenceConfidence;
+}
+
+export interface EvidenceDraft extends AnalysisCandidate {}
+
+export interface AnalysisResult {
+  provider: string;
+  model?: string;
+  candidates: AnalysisCandidate[];
+}
+
+export interface PipelineProviderMetadata {
+  media?: { id: string; mode: "metadata-only" | "owned-audio" };
+  asr?: { id: string; model?: string; timestampMode?: "provider" | "estimated" };
+  analysis?: { id: string; model?: string; route?: string };
+  fallbackUsed?: boolean;
+}
+
+export interface LectureAsrPort {
+  readonly id: string;
+  readonly model?: string;
+  transcribe(
+    audio: EphemeralAudio,
+    source: ResolvedVideoSource,
+    request: LectureAcquisitionRequest,
+    signal: AbortSignal,
+  ): Promise<{ provider: string; model?: string; segments: TimestampedTranscriptSegment[]; timestampMode?: "provider" | "estimated" }>;
+}
+
+export interface TimestampedAsrPort {
+  readonly id: string;
+  readonly model?: string;
+  transcribe(
+    audio: PreparedAudioLease,
+    options: { language?: string; model?: string },
+    limits: PipelineLimits,
+    signal: AbortSignal,
+  ): Promise<TimestampedTranscript>;
+}
+
+export interface LectureTextAnalysisPort {
+  analyze(
+    input: {
+      source: ResolvedVideoSource;
+      prompt: string;
+      transcript: readonly TimestampedTranscriptSegment[];
+    },
+    request: LectureAcquisitionRequest,
+    signal: AbortSignal,
+  ): Promise<{ provider: string; model?: string; evidence: EvidenceDraft[] }>;
+}
+
+export interface TextAnalysisPort {
+  analyze(input: { prompt: string; source: ResolvedVideoSource; chunk: TranscriptChunk }, signal: AbortSignal): Promise<AnalysisResult>;
+}
+
+export interface OmpTextInvoker {
+  invoke(
+    input: { model?: string; messages: readonly { role: "system" | "user" | "assistant"; content: string }[] },
+    options: { maxResponseBytes: number; signal: AbortSignal },
+  ): Promise<string>;
+}
+
+export interface OmpRuntimeCapabilityProbe {
+  probe(runtime: unknown): Promise<
+    { status: "available"; invoke: OmpTextInvoker }
+    | { status: "unsupported" | "unknown"; reason?: string }
+  >;
+}
+
 export interface LectureAcquisitionRequest {
   sourceUrl: string;
   prompt: string;
   limits: AcquisitionLimits;
+  /** Explicit authorization; absent/false never implies ownership. */
   rights: {
     automatedPublicVideoAnalysisApproved: boolean;
     ownedCaptionAccessApproved: boolean;
+    ownedMediaAudioAccessApproved?: boolean;
+    /** Compatibility spelling used by early v2 intake documents. */
+    ownedMediaAccessApproved?: boolean;
+    externalTranscriptAnalysisApproved?: boolean;
   };
+  /** Omitted means metadata-only and must never trigger media access. */
+  mediaMode?: "metadata-only" | "owned-audio";
 }
 
 export interface LectureAcquisitionArtifact {
@@ -204,9 +432,12 @@ export interface LectureAcquisitionArtifact {
   /** Includes warnings and unresolved sources for partial results. */
   failures: AcquisitionFailure[];
   provider: { id: string; model?: string };
+  /** Optional stage descriptors are metadata-only and remain schema-compatible. */
+  pipeline?: PipelineProviderMetadata;
   startedAt: string;
   completedAt: string;
 }
+
 
 export interface LectureSourceParser {
   parse(sourceUrl: string): ParsedLectureUrl | AcquisitionFailure;
@@ -243,6 +474,145 @@ export interface AcquisitionValidationIssue {
   message: string;
 }
 
+export function validateTimestampedTranscriptSegment(value: unknown, path = "$"): AcquisitionValidationIssue[] {
+  if (!record(value)) return [{ field: path, message: "transcript segment must be an object" }];
+  const issues: AcquisitionValidationIssue[] = [];
+  if (typeof value.text !== "string" || value.text.trim().length === 0) {
+    issues.push({ field: `${path}.text`, message: "transcript text must be non-empty" });
+  } else if (value.text.length > 8_192) {
+    issues.push({ field: `${path}.text`, message: "transcript text exceeds the bounded segment limit" });
+  }
+  if (!isValidEvidenceTimestamp(value.startSeconds, value.endSeconds)) {
+    issues.push({ field: `${path}.startSeconds`, message: "transcript timestamps require finite start >= 0 and end > start" });
+  }
+  if (value.segmentId !== undefined && (typeof value.segmentId !== "string" || value.segmentId.length > 128)) {
+    issues.push({ field: `${path}.segmentId`, message: "transcript segment id is invalid" });
+  }
+  if (value.language !== undefined && (typeof value.language !== "string" || value.language.length > 64)) {
+    issues.push({ field: `${path}.language`, message: "transcript language is invalid" });
+  }
+  if (value.confidence !== undefined && (typeof value.confidence !== "number" || !Number.isFinite(value.confidence) || value.confidence < 0 || value.confidence > 1)) {
+    issues.push({ field: `${path}.confidence`, message: "transcript confidence must be between 0 and 1" });
+  }
+  if (value.timestampSource !== undefined && value.timestampSource !== "provider" && value.timestampSource !== "estimated") {
+    issues.push({ field: `${path}.timestampSource`, message: "transcript timestampSource is invalid" });
+  }
+  return issues;
+}
+
+export function isTimestampedTranscriptSegment(value: unknown): value is TimestampedTranscriptSegment {
+  return validateTimestampedTranscriptSegment(value).length === 0;
+}
+
+/**
+ * Sort and bound ASR output without retaining a provider response. A malformed
+ * segment is rejected instead of being silently turned into a fake transcript.
+ */
+export function normalizeTimestampedTranscriptSegments(
+  segments: readonly TimestampedTranscriptSegment[],
+  maxCharacters = DEFAULT_ACQUISITION_LIMITS.maxTranscriptCharacters,
+): TimestampedTranscriptSegment[] {
+  if (!Number.isInteger(maxCharacters) || maxCharacters < 1 || maxCharacters > HARD_ACQUISITION_LIMITS.maxTranscriptCharacters) throw new RangeError("invalid transcript character bound");
+  const out: TimestampedTranscriptSegment[] = [];
+  let characters = 0;
+  for (const [index, segment] of segments.entries()) {
+    if (!isTimestampedTranscriptSegment(segment)) throw new TypeError(`invalid transcript segment at index ${index}`);
+    characters += segment.text.length;
+    if (characters > maxCharacters) throw new RangeError("transcript exceeds the configured character bound");
+    out.push({ ...segment, segmentId: segment.segmentId ?? `segment-${index}` });
+  }
+  out.sort((left, right) => left.startSeconds - right.startSeconds || left.endSeconds - right.endSeconds);
+  for (let index = 1; index < out.length; index += 1) {
+    if (out[index]!.startSeconds < out[index - 1]!.startSeconds) throw new TypeError("transcript segments are not monotonic");
+  }
+  return out;
+}
+
+export function chunkTimestampedTranscript(
+  sourceId: string,
+  segments: readonly TimestampedTranscriptSegment[],
+  limits: Pick<AcquisitionLimits, "maxTranscriptCharacters" | "maxChunkCharacters" | "maxChunksPerSource">,
+): TranscriptChunk[] {
+  const maxTranscriptCharacters = limits.maxTranscriptCharacters ?? DEFAULT_ACQUISITION_LIMITS.maxTranscriptCharacters;
+  const maxCharacters = limits.maxChunkCharacters ?? DEFAULT_ACQUISITION_LIMITS.maxChunkCharacters;
+  const maxChunks = limits.maxChunksPerSource ?? DEFAULT_ACQUISITION_LIMITS.maxChunksPerSource;
+  if (!Number.isInteger(maxTranscriptCharacters) || maxTranscriptCharacters < 1 || maxTranscriptCharacters > HARD_ACQUISITION_LIMITS.maxTranscriptCharacters || !Number.isInteger(maxCharacters) || maxCharacters < 1 || !Number.isInteger(maxChunks) || maxChunks < 1) throw new RangeError("invalid transcript chunk bounds");
+  const chunks: TranscriptChunk[] = [];
+  let current: TimestampedTranscriptSegment[] = [];
+  let characters = 0;
+  const flush = () => {
+    if (!current.length) return;
+    const chunk = {
+      chunkId: `${sourceId}:chunk-${chunks.length}`,
+      sourceId,
+      ordinal: chunks.length,
+      startSeconds: current[0]!.startSeconds,
+      endSeconds: current[current.length - 1]!.endSeconds,
+      text: current.map((segment) => segment.text).join(" ").trim(),
+      segmentIds: current.map((segment, index) => segment.segmentId ?? `segment-${index}`),
+    };
+    chunks.push(chunk);
+    current = [];
+    characters = 0;
+  };
+  for (const segment of normalizeTimestampedTranscriptSegments(segments, maxTranscriptCharacters)) {
+    if (segment.text.length > maxCharacters) throw new RangeError("transcript segment exceeds chunk bound");
+    if (current.length && characters + segment.text.length + 1 > maxCharacters) flush();
+    current.push(segment);
+    characters += segment.text.length + (current.length > 1 ? 1 : 0);
+  }
+  flush();
+  if (chunks.length > maxChunks) throw new RangeError("transcript exceeds chunk count bound");
+  return chunks;
+}
+
+export type EvidenceIdFactory = (input: Pick<EvidenceSegment, "sourceId" | "kind" | "quote" | "startSeconds" | "endSeconds">) => string;
+
+/**
+ * Ground untrusted candidates against the trusted transcript and source.
+ * Candidate source/location claims are not accepted because they are absent
+ * from the input type; location and source id are injected by this function.
+ */
+export function normalizeAnalysisCandidates(
+  source: ResolvedVideoSource,
+  transcript: readonly TimestampedTranscriptSegment[],
+  result: AnalysisResult,
+  cap: number,
+  ids: EvidenceIdFactory,
+): EvidenceSegment[] {
+  if (!Number.isInteger(cap) || cap < 1) throw new RangeError("invalid evidence cap");
+  const boundedTranscript = normalizeTimestampedTranscriptSegments(transcript);
+  const out: EvidenceSegment[] = [];
+  const seen = new Set<string>();
+  for (const candidate of result.candidates) {
+    if (!candidate || typeof candidate.quote !== "string" || candidate.quote.trim().length === 0 || candidate.quote.length > 4_096) continue;
+    if (!isValidEvidenceTimestamp(candidate.startSeconds, candidate.endSeconds) || !EVIDENCE_KINDS.includes(candidate.kind)) continue;
+    const grounded = boundedTranscript.some((segment) =>
+      segment.startSeconds < candidate.endSeconds
+      && segment.endSeconds > candidate.startSeconds
+      && segment.text.includes(candidate.quote.trim()),
+    );
+    if (!grounded) continue;
+    const evidence: EvidenceSegment = {
+      evidenceId: ids({ sourceId: source.sourceId, kind: candidate.kind, quote: candidate.quote.trim(), startSeconds: candidate.startSeconds, endSeconds: candidate.endSeconds }),
+      sourceId: source.sourceId,
+      location: source.canonicalUrl,
+      provider: result.provider,
+      kind: candidate.kind,
+      quote: candidate.quote.trim(),
+      startSeconds: candidate.startSeconds,
+      endSeconds: candidate.endSeconds,
+      ...(candidate.language ? { language: candidate.language } : {}),
+      ...(candidate.confidence ? { confidence: candidate.confidence } : {}),
+    };
+    if (seen.has(evidence.evidenceId)) continue;
+    seen.add(evidence.evidenceId);
+    out.push(evidence);
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -276,15 +646,20 @@ export function validateEvidenceSegment(value: unknown, path = "$",): Acquisitio
   if (!isValidEvidenceTimestamp(value.startSeconds, value.endSeconds)) {
     issues.push({ field: `${path}.startSeconds`, message: "evidence timestamps require finite start >= 0 and end > start" });
   }
-  if (value.language !== undefined && typeof value.language !== "string") {
-    issues.push({ field: `${path}.language`, message: "evidence language must be a string when present" });
+  if (typeof value.quote === "string" && value.quote.length > 4_096) {
+    issues.push({ field: `${path}.quote`, message: "evidence quote exceeds the bounded limit" });
+  }
+  if (typeof value.provider === "string" && value.provider.length > 128) {
+    issues.push({ field: `${path}.provider`, message: "evidence provider exceeds the bounded limit" });
+  }
+  if (value.language !== undefined && (typeof value.language !== "string" || value.language.length > 64)) {
+    issues.push({ field: `${path}.language`, message: "evidence language must be a bounded string when present" });
   }
   if (value.confidence !== undefined && !EVIDENCE_CONFIDENCES.includes(value.confidence as EvidenceConfidence)) {
     issues.push({ field: `${path}.confidence`, message: `evidence confidence '${String(value.confidence)}' is unsupported` });
   }
   return issues;
 }
-
 /**
  * Cross-field invariants that draft-07 cannot express. The declarative schema
  * still documents and bounds each field; this helper is invoked by core
@@ -299,6 +674,33 @@ export function validateLectureAcquisitionArtifact(value: unknown): AcquisitionV
     const status = value.status;
     if ((status === "partial" || status === "succeeded") && evidence.length === 0) {
       issues.push({ field: "$.evidence", message: `${status} acquisition requires at least one valid evidence segment` });
+    }
+  }
+  if (value.pipeline !== undefined) {
+    if (!record(value.pipeline)) {
+      issues.push({ field: "$.pipeline", message: "pipeline metadata must be an object" });
+    } else {
+      const pipeline = value.pipeline;
+      for (const key of ["media", "asr", "analysis"] as const) {
+        const descriptor = pipeline[key];
+        if (descriptor !== undefined) {
+          if (!record(descriptor) || typeof descriptor.id !== "string" || descriptor.id.trim() === "" || descriptor.id.length > 128) {
+            issues.push({ field: `$.pipeline.${key}`, message: "pipeline provider metadata is invalid" });
+          }
+          if (record(descriptor) && descriptor.model !== undefined && (typeof descriptor.model !== "string" || descriptor.model.length > 256)) {
+            issues.push({ field: `$.pipeline.${key}.model`, message: "pipeline model metadata is invalid" });
+          }
+          if (key === "asr" && record(descriptor) && descriptor.timestampMode !== undefined && descriptor.timestampMode !== "provider" && descriptor.timestampMode !== "estimated") {
+            issues.push({ field: "$.pipeline.asr.timestampMode", message: "pipeline ASR timestamp mode is invalid" });
+          }
+          if (record(descriptor) && descriptor.route !== undefined && (typeof descriptor.route !== "string" || descriptor.route.length > 64)) {
+            issues.push({ field: `$.pipeline.${key}.route`, message: "pipeline route metadata is invalid" });
+          }
+        }
+      }
+      if (pipeline.fallbackUsed !== undefined && typeof pipeline.fallbackUsed !== "boolean") {
+        issues.push({ field: "$.pipeline.fallbackUsed", message: "pipeline fallbackUsed must be boolean" });
+      }
     }
   }
   if (typeof value.startedAt === "string" && !Number.isFinite(Date.parse(value.startedAt))) {

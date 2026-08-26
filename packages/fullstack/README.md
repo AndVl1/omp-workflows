@@ -62,35 +62,74 @@ The `agents/` and `skills/` directories are picked up by OMP's discovery automat
 
 ## URL-first lecture research
 
-Submit exactly one public HTTPS YouTube video or playlist URL together with a natural-language prompt to `/do-work`. The URL is the user's explicit approval for automated analysis of that public video; the user remains responsible for having the rights to submit it. Its intake invokes the main-session `lecture_acquire` tool: for playlists it automatically expands bounded public playlist metadata, then analyzes each video. Mapping, synthesis, repository-fit, security, and approval remain research-only stages. No manual transcript, captions, recording, media, or notes are requested.
+Submit exactly one public HTTPS YouTube video or playlist URL together with a natural-language prompt to `/do-work`. Intake records explicit rights and media mode; absent approval is metadata-only and fail-closed. The main-session `lecture_acquire` tool parses the bounded source set, then either runs the legacy public-URL provider (Gemini) when configured, or the rights-gated `transcribe-analyze` pipeline.
 
-Set `GEMINI_API_KEY` for video analysis. Set `YOUTUBE_DATA_API_KEY` for playlist expansion; a public video URL needs only Gemini. An optional project `.omp/lecture-research.json` can tighten bounded limits or set provider model/environment names, but optional provider endpoints are constrained to the official Google YouTube/Gemini hosts; project config must not point API keys at arbitrary hosts, and must never store secrets:
-The adapter sends the restricted YouTube API key via the `x-goog-api-key` request header (Gemini uses the same header); the key must be restricted, and secrets must never be stored in `.omp/lecture-research.json`.
+### Provider matrix and billing separation
+
+| Stage | Default | Alternatives | Billing |
+| --- | --- | --- | --- |
+| Playlist metadata | YouTube Data API (`YOUTUBE_DATA_API_KEY`) | none | YouTube quota units |
+| Legacy URL analysis (compatibility) | disabled unless `gemini` block + `GEMINI_API_KEY` present | — | Gemini API billing |
+| Audio acquisition | `authorized-command` via `LECTURE_AUDIO_COMMAND` or `existing-input` via `LECTURE_AUDIO_INPUT` | — | local only |
+| ASR | `openrouter-native` (native JSON/base64; exact Nemotron model; `OPENROUTER_API_KEY`) | `whisper-local` (`WHISPER_CPP_BIN`, `WHISPER_CPP_MODEL_PATH`) or `hosted-openai-compatible` | OpenRouter per request / 0 / provider per audio minute |
+| Text analysis | `openai-compatible` remote HTTPS (`OPENROUTER_API_KEY` or project-specific env name) | explicit `ollama`/`vllm` loopback fallback; injected OMP runtime capability | provider token billing / 0 locally |
+
+OMP model roles are not runtime credentials. Set `"omp": { "enabled": true, "role": "lecture-analysis" }` only when the host injects a callable `ompRuntime` capability (`invoke(input, options) -> JSON text`) into the lecture service/tool context. Without that capability, acquisition returns the typed `OMP_RUNTIME_UNAVAILABLE` failure before media or ASR work; it never pretends that role metadata can run a model. When OMP is disabled (the default), the configured `analysis` provider is used and its nested `fallback` is the only fallback route.
+
+### Pipeline configuration (opt-in)
+
+A `.omp/lecture-research.json` with a top-level `"pipeline"` block selects `transcribe-analyze`; without it the legacy Gemini compatibility path applies exactly as before:
 
 ```json
 {
-  "limits": {
-    "maxItems": 4,
-    "maxPages": 2,
-    "deadlineMs": 120000,
-    "maxAttempts": 1,
-    "maxResponseBytes": 1048576,
-    "maxEvidenceSegmentsPerSource": 20
-  },
-  "gemini": {
-    "model": "gemini-2.5-flash",
-    "endpoint": "https://generativelanguage.googleapis.com",
-    "apiKeyEnv": "GEMINI_API_KEY"
-  },
-  "youtube": {
-    "endpoint": "https://www.googleapis.com/youtube/v3",
-    "apiKeyEnv": "YOUTUBE_DATA_API_KEY"
+  "limits": { "maxItems": 4, "deadlineMs": 120000, "maxTranscriptSegments": 4096, "maxAudioBytes": 67108864, "maxChunksPerSource": 128, "maxProviderCostCents": 5000 },
+  "pipeline": {
+    "mode": "transcribe-analyze",
+    "audio": { "provider": "authorized-command", "commandEnv": "LECTURE_AUDIO_COMMAND", "maxBytes": 67108864, "timeoutMs": 60000 },
+    "asr": {
+      "provider": "openrouter-native",
+      "transport": "json-base64",
+      "model": "nvidia/nemotron-3.5-asr-streaming-multilingual-0.6b",
+      "endpoint": "https://openrouter.ai/api/v1",
+      "trust": "trusted-remote",
+      "apiKeyEnv": "OPENROUTER_API_KEY",
+      "timestampMode": "estimated",
+      "maxRequestBytes": 33554432,
+      "chunkDurationSeconds": 45,
+      "chunkTimeoutMs": 60000
+    },
+    "analysis": {
+      "provider": "openai-compatible",
+      "model": "fixture-model",
+      "endpoint": "https://openrouter.ai/api/v1",
+      "trust": "trusted-remote",
+      "apiKeyEnv": "OPENROUTER_API_KEY",
+      "fallback": { "provider": "ollama", "model": "llama3.1", "endpoint": "http://127.0.0.1:11434/v1", "trust": "local-loopback" }
+    }
   }
 }
 ```
+The native ASR branch posts to the model-specific, validated `https://openrouter.ai/api/v1/chat/completions` route with the existing `{ model, messages: [{ role: "user", content: [{ type: "input_audio", input_audio: { data: <raw-base64>, format: "wav" } }] }] }` shape. The model is pinned exactly to `nvidia/nemotron-3.5-asr-streaming-multilingual-0.6b`; the model-specific endpoints API is the source of truth for live QA, and generic catalog omission is not a product error. Keys are resolved from the configured environment-variable name immediately before use and are never written to errors or artifacts.
 
-Limitations are explicit: only public videos are supported. Private or unlisted videos, rights restrictions, quota/network failures, and provider failures are preserved as failed or partial evidence. The core does not fetch URLs; adapters use official APIs and provider URL analysis. Approval does not start implementation.
+Prepared normalized PCM WAV leases that fit the conservative encoded envelope retain the exact one-fetch fast path. Larger leases are read once as RIFF/WAVE PCM s16le mono 16-kHz data and sent as bounded sequential chunks (`concurrency=1`) with zero overlap, no retries, and no temporary chunk files. Every chunk body is checked as UTF-8 JSON against `maxRequestBytes` (default 32 MiB, hard cap 64 MiB); each synthesized WAV has a canonical 44-byte header. A chunk error, cancellation, malformed/truncated input, request/cost/response/transcript bound, or final global validation failure discards the complete single-source transcript and produces no partial evidence. `maxChunksPerSource` remains the independent analysis-chunk limit and also caps ASR requests only when OpenRouter chunk mode is selected; it is not silently conflated with transcript segment counts.
 
+`chunkDurationSeconds` defaults to 45 and accepts integers 1..60. `chunkTimeoutMs` defaults to 60000 and accepts integers 1..120000. The existing `maxAudioBytes` lease cap remains a total-source bound; the default 64 MiB must be raised explicitly (never above the 256 MiB hard cap) for long normalized WAVs. Global estimated timestamps are frame-derived and disclosed as `timestampMode: "estimated"` when the provider returns text-only output; provider timestamps are accepted only when each chunk supplies bounded provider segments. The supplied 1:09:42 target is 4,182 seconds, so `ceil(4182 / 45) = 93` sequential requests, below the default 128-request cap; its normalized mono 16-kHz PCM lease is roughly 134 MiB, so it requires an explicit audio lease cap increase while still holding only one request-safe chunk in memory.
+
+For an owned/licensed smoke, set `LECTURE_AUDIO_COMMAND` to a JSON argv such as `["/path/to/node","/path/to/packages/fullstack/scripts/yt-dlp-owned-audio.mjs"]` and set `YT_DLP_BIN` to the installed yt-dlp executable path (for example, `/opt/homebrew/bin/yt-dlp`). The executable requires a non-empty, newline-free `YT_DLP_BIN` (maximum 2048 characters), accepts exactly `--source-id VIDEO_ID`, validates the 11-character YouTube id, invokes the configured binary with the fixed `--ignore-config --no-playlist -f bestaudio[protocol*=m3u8]/bestaudio/best -o -` argv, and writes media to stdout only. The fixed selector prefers audio-only HLS/m3u8 for robust fragment transfer, then falls back to `bestaudio`, then `best`; multilingual and original-language track preferences remain delegated to yt-dlp rather than hardcoded here. This is a format preference, not a claim of full live-stream success. `--ignore-config` makes this owned authorization boundary hermetic: ambient user/system yt-dlp configuration, especially cookie flags, cannot inject options or credentials; operators select a client only through the validated `YT_DLP_PLAYER_CLIENT` environment variable. If `YT_DLP_BIN` is unset or invalid, it fails closed without starting a process. It never evaluates a shell command or accepts a URL/arbitrary downloader arguments. `YT_DLP_PLAYER_CLIENT` is optional: unset or empty keeps the existing argv unchanged; when set, it must be at most 128 characters and match one or more comma-separated lowercase identifiers (`[a-z0-9_]+`). Whitespace, control characters, unsupported separators, assignments, metacharacters, empty list tokens, uppercase, and any other invalid value fail closed with a sanitized exit-2 line before yt-dlp starts. A valid value adds exactly the separate argv entries `--extractor-args` and `youtube:player_client=<value>`; no general extractor-args or cookie input is accepted. The currently observed operator-selected workaround is `YT_DLP_PLAYER_CLIENT=android_vr`, not a permanent default: client availability is externally volatile and must be preflighted before each live run. Rights approvals and `externalTranscriptAnalysisApproved` remain mandatory; no live provider call or media is implied by this documentation.
+
+`maxTranscriptSegments` bounds normalized ASR output independently from `maxChunksPerSource`. The latter remains the analysis-request count in the existing pipeline and additionally caps OpenRouter ASR requests only when chunk mode is selected; neither limit is silently reused as a transcript-segment count.
+
+Endpoint policy is enforced before any fetch: official Google hosts are allowlisted exactly (`www.googleapis.com`, `generativelanguage.googleapis.com`); trusted remote requires explicit HTTPS with no query/userinfo/fragment; HTTP is accepted only for explicitly configured Ollama/vLLM on loopback hosts. Redirects are never followed. Keys are read from validated environment variable names at call time and sent in headers only.
+
+Rights and retention: `automatedPublicVideoAnalysisApproved` authorizes bounded public-URL analysis only; owned audio additionally requires `ownedMediaAudioAccessApproved` (or `ownedMediaAccessApproved`), and remote text analysis requires `externalTranscriptAnalysisApproved`. Raw media, transcripts, cookies, secrets, and raw provider responses are never persisted in `lecture_acquisition` or logs; ephemeral audio leases are deleted in `finally` blocks. The core lecture contracts stay dependency-free TypeScript for future KMP/Android portability; media acquisition, preprocessing, processes, and HTTP remain fullstack-only.
+
+Limitations are explicit: there is no generic public-video downloader; a public URL without authorized audio input remains metadata-only/fail-closed rather than producing fake output. Approval never starts implementation.
+
+### Deterministic evaluation harness
+
+Provider comparisons use the dependency-light API at `@andvl1/omp-workflows-fullstack/lecture-acquisition/eval` (or `src/lecture-acquisition/eval.ts` before publishing). A corpus must be rights-confirmed: use `rightsStatus: "owned-approved"` only for media/transcripts that the project is authorized to evaluate, and record the approval in `rightsNotes`. The shipped `evals/lecture-eval-fixtures.json` is deliberately `synthetic-fixture` text only; it contains no media, URLs, credentials, or provider responses and must not be presented as an owned corpus.
+
+`scoreLectureEvalCase` compares the same bounded reference case and prompt-independent normalized outputs across providers. WER/CER use normalized Levenshtein distance, timestamp alignment uses deterministic one-to-one overlap/boundary matching, and grounded-claim precision/hallucination is an explicitly lexical-plus-timestamp baseline rather than semantic truth. Proposal relevance reports lexical precision/recall/F1 (`n/a` when no reference terms exist), while latency, caller-reported cost, cost per minute, and cleanup status are pass-through run metadata. The returned report includes finite metrics and a bounded aggregate for side-by-side provider/model/route comparison; it makes no unsupported pricing assumptions.
 
 ## Slash commands
 

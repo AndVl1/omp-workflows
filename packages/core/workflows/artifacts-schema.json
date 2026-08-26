@@ -130,14 +130,15 @@
     },
     "manual_qa": {
       "type": "object",
-      "description": "Manual runtime-verification verdict, produced by the manual-qa agent AFTER review_fixes — it exercises the code that will actually ship, not a pre-fix snapshot. NOT UI-only: on a UI scope it drives the real UI through OMP browser or configured device automation; on a backend/CLI scope it runs the app, hits endpoints, and reads logs/output. Gated on scope.has_runtime (skipped only for pure docs/config work). Consumed by qa_tests (evidence → automated regression tests) and by summary. Replaces the old string field inside `debug`.",
+      "description": "Manual runtime-verification verdict, produced by the manual-qa agent AFTER review_fixes — it exercises the code that will actually ship, not a pre-fix snapshot. NOT UI-only: on a UI scope it drives the real UI through OMP browser or configured device automation; on a backend/CLI scope it runs the app, hits endpoints, and reads logs/output. Gated on scope.has_runtime (skipped only for pure docs/config work). PASS requires every acceptance criterion to be observed at runtime. CONDITIONAL is terminal only when deterministic/runtime checks produced real evidence but one or more required criteria are unavailable because an explicit capability, credential, or configuration blocker is recorded in blocked_prerequisites. FAIL means an observed failure. Missing or unknown verdicts fail closed. Consumed by qa_tests (evidence → automated regression tests) and by summary. Replaces the old string field inside `debug`.",
       "required": ["verdict", "evidence"],
       "properties": {
-        "verdict": { "enum": ["PASS", "FAIL"], "description": "PASS only if every acceptance criterion was observed working at runtime. A missing/unknown verdict is treated as FAIL — it never auto-passes." },
+        "verdict": { "enum": ["PASS", "CONDITIONAL", "FAIL"], "description": "PASS only if every acceptance criterion was observed working at runtime. CONDITIONAL only when deterministic/runtime checks produced real evidence but a required criterion is unobservable because an explicit capability, credential, or configuration blocker is recorded in blocked_prerequisites. FAIL means an observed failure. A missing/unknown verdict is treated as FAIL — it never auto-passes." },
         "evidence": {
           "type": "array",
+          "minItems": 1,
           "items": { "type": "string" },
-          "description": "Concrete observations. UI: screenshot path + WHAT IS VISIBLE on it. Backend/CLI: the command/curl run + the actual response/exit code, and the relevant log lines. A bare 'looks good' is not evidence."
+          "description": "At least one concrete observation is required for every terminal verdict. UI: screenshot path + WHAT IS VISIBLE on it. Backend/CLI: the command/curl run + the actual response/exit code, and the relevant log lines. A bare 'looks good' is not evidence."
         },
         "mode": { "enum": ["ui", "runtime"], "description": "Which verification mode was used: 'ui' (OMP browser for web or configured device automation for the app) when scope.has_ui, else 'runtime' (run/curl/logs)." },
         "dod_additions": {
@@ -155,12 +156,17 @@
             }
           }
         },
-        "regressions": { "type": "array", "items": { "type": "string" }, "description": "Pre-existing behavior that broke during testing — empty array if none." }
+        "regressions": { "type": "array", "items": { "type": "string" }, "description": "Pre-existing behavior that broke during testing — empty array if none." },
+        "blocked_prerequisites": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional explicit capability, credential, or configuration blockers that make required acceptance criteria unobservable. Required evidence for a CONDITIONAL verdict: identify the unavailable criterion and the blocker without including secrets, raw provider/media data, or fabricated positive live evidence."
+        }
       }
     },
     "qa_tests": {
       "type": "object",
-      "description": "Automated tests written by the qa agent AFTER manual_qa, encoding the manually-observed behavior (manual_qa.evidence) as durable regression tests. Only accepted when manual_qa.verdict == PASS, or when the task has no UI (!scope.has_ui) so manual_qa was skipped.",
+      "description": "Automated tests written by the qa agent AFTER manual_qa, encoding the manually-observed behavior (manual_qa.evidence) as durable regression tests. Accepted when manual_qa.verdict is PASS or CONDITIONAL while runtime exists, or when the task has no runtime (!scope.has_runtime) and manual_qa was skipped. CONDITIONAL permits deterministic regression tests to proceed but does not prove blocked live criteria; a FAIL verdict with runtime never passes this gate.",
       "required": ["tests_added", "build_status"],
       "properties": {
         "tests_added": { "type": "array", "items": { "type": "string" }, "description": "Test files/cases added or updated." },
@@ -463,7 +469,14 @@
                 "deadlineMs": { "type": "integer", "minimum": 1, "description": "Overall bounded acquisition deadline in milliseconds." },
                 "maxAttempts": { "type": "integer", "minimum": 1, "description": "Maximum attempts per provider call." },
                 "maxResponseBytes": { "type": "integer", "minimum": 1, "description": "Maximum accepted provider response size." },
-                "maxEvidenceSegmentsPerSource": { "type": "integer", "minimum": 1, "description": "Maximum normalized evidence segments retained for one source." }
+                "maxEvidenceSegmentsPerSource": { "type": "integer", "minimum": 1, "description": "Maximum normalized evidence segments retained for one source." },
+                "maxAudioBytes": { "type": "integer", "minimum": 1, "description": "Maximum ephemeral audio bytes." },
+                "maxTranscriptCharacters": { "type": "integer", "minimum": 1, "description": "Maximum transcript characters held in memory." },
+                "maxTranscriptSegments": { "type": "integer", "minimum": 1, "description": "Maximum normalized transcript segments accepted from one ASR response." },
+                "maxChunkCharacters": { "type": "integer", "minimum": 1, "description": "Maximum transcript characters sent in one analysis chunk." },
+                "maxChunksPerSource": { "type": "integer", "minimum": 1, "description": "Maximum analysis chunks per source." },
+                "maxAnalysisOutputBytes": { "type": "integer", "minimum": 1, "description": "Maximum analysis response bytes." },
+                "maxProviderCostCents": { "type": "integer", "minimum": 0, "description": "Optional estimated provider budget." }
               }
             }
           }
@@ -509,7 +522,7 @@
                 "type": "object",
                 "required": ["code", "message", "retryable", "attempts", "severity"],
                 "properties": {
-                  "code": { "enum": ["INVALID_URL", "UNSUPPORTED_URL", "VIDEO_NOT_FOUND", "PLAYLIST_NOT_FOUND", "PRIVATE_OR_UNLISTED", "PLAYLIST_TOO_LARGE", "CAPTIONS_UNAVAILABLE", "MEDIA_NOT_ACCESSIBLE", "RIGHTS_REQUIRED", "PROVIDER_AUTH_MISSING", "QUOTA_EXCEEDED", "PROVIDER_TIMEOUT", "NETWORK_ERROR", "TRANSCRIPT_FAILED", "ANALYSIS_FAILED", "INVALID_PROVIDER_RESPONSE", "LIMIT_EXCEEDED", "PARTIAL_SOURCE_SET"] },
+                  "code": { "enum": ["INVALID_URL", "UNSUPPORTED_URL", "VIDEO_NOT_FOUND", "PLAYLIST_NOT_FOUND", "PRIVATE_OR_UNLISTED", "PLAYLIST_TOO_LARGE", "CAPTIONS_UNAVAILABLE", "MEDIA_NOT_ACCESSIBLE", "RIGHTS_REQUIRED", "PROVIDER_AUTH_MISSING", "QUOTA_EXCEEDED", "PROVIDER_TIMEOUT", "NETWORK_ERROR", "TRANSCRIPT_FAILED", "ANALYSIS_FAILED", "INVALID_PROVIDER_RESPONSE", "LIMIT_EXCEEDED", "PARTIAL_SOURCE_SET", "OMP_RUNTIME_UNAVAILABLE"] },
                   "sourceId": { "type": "string" },
                   "provider": { "type": "string" },
                   "message": { "type": "string", "description": "Sanitized diagnostic; never include provider payloads, keys, or headers." },
@@ -548,7 +561,7 @@
             "type": "object",
             "required": ["code", "message", "retryable", "attempts", "severity"],
             "properties": {
-              "code": { "enum": ["INVALID_URL", "UNSUPPORTED_URL", "VIDEO_NOT_FOUND", "PLAYLIST_NOT_FOUND", "PRIVATE_OR_UNLISTED", "PLAYLIST_TOO_LARGE", "CAPTIONS_UNAVAILABLE", "MEDIA_NOT_ACCESSIBLE", "RIGHTS_REQUIRED", "PROVIDER_AUTH_MISSING", "QUOTA_EXCEEDED", "PROVIDER_TIMEOUT", "NETWORK_ERROR", "TRANSCRIPT_FAILED", "ANALYSIS_FAILED", "INVALID_PROVIDER_RESPONSE", "LIMIT_EXCEEDED", "PARTIAL_SOURCE_SET"] },
+              "code": { "enum": ["INVALID_URL", "UNSUPPORTED_URL", "VIDEO_NOT_FOUND", "PLAYLIST_NOT_FOUND", "PRIVATE_OR_UNLISTED", "PLAYLIST_TOO_LARGE", "CAPTIONS_UNAVAILABLE", "MEDIA_NOT_ACCESSIBLE", "RIGHTS_REQUIRED", "PROVIDER_AUTH_MISSING", "QUOTA_EXCEEDED", "PROVIDER_TIMEOUT", "NETWORK_ERROR", "TRANSCRIPT_FAILED", "ANALYSIS_FAILED", "INVALID_PROVIDER_RESPONSE", "LIMIT_EXCEEDED", "PARTIAL_SOURCE_SET", "OMP_RUNTIME_UNAVAILABLE"] },
               "sourceId": { "type": "string" },
               "provider": { "type": "string" },
               "message": { "type": "string", "description": "Sanitized diagnostic; never include provider payloads, keys, or headers." },
@@ -565,6 +578,16 @@
           "properties": {
             "id": { "type": "string" },
             "model": { "type": "string" }
+          }
+        },
+        "pipeline": {
+          "type": "object",
+          "description": "Optional stage provider metadata; never contains endpoints, credentials, media, transcripts, or raw provider responses.",
+          "properties": {
+            "media": { "type": "object", "required": ["id", "mode"], "properties": { "id": { "type": "string" }, "mode": { "enum": ["metadata-only", "owned-audio"] } } },
+            "asr": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" }, "model": { "type": "string" }, "timestampMode": { "enum": ["provider", "estimated"], "description": "Timestamp provenance. Estimated intervals are bounded navigation hints, not provider timecodes." } } },
+            "analysis": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" }, "model": { "type": "string" }, "route": { "type": "string" } } },
+            "fallbackUsed": { "type": "boolean" }
           }
         },
         "startedAt": { "type": "string", "description": "ISO-8601 acquisition start timestamp." },
@@ -593,6 +616,18 @@
             }
           }
         },
+        "rights": {
+          "type": "object",
+          "description": "Explicit rights declarations. Absence is fail-closed.",
+          "properties": {
+            "automatedPublicVideoAnalysisApproved": { "type": "boolean" },
+            "ownedCaptionAccessApproved": { "type": "boolean" },
+            "ownedMediaAudioAccessApproved": { "type": "boolean" },
+            "ownedMediaAccessApproved": { "type": "boolean" },
+            "externalTranscriptAnalysisApproved": { "type": "boolean" }
+          }
+        },
+        "mediaMode": { "enum": ["metadata-only", "owned-audio"] },
         "constraints": { "type": "array", "items": { "type": "string" }, "description": "Boundaries from the request (language, scope, which lectures matter)." }
       }
     },
