@@ -4,8 +4,11 @@
  * Detect stacks and emit `.omp/team.config.json`. The shipped config is a
  * fixed fullstack defaults bootstrap; the heavy stack detection happens
  * either at the main agent's request via the `discovery` agent or by the
- * user pasting in their own config. The command is idempotent: if the
- * config already exists, it refuses to overwrite.
+ * user pasting in their own config.
+ *
+ * Idempotent, but deletion alone does not reset state: opening omp re-seeds
+ * a missing config from the bundle preset on session_start. Use `--force`
+ * to regenerate over any existing file.
  */
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -66,13 +69,13 @@ const DEFAULT_CONFIG = {
 const factory = (_api: CustomCommandAPI): CustomCommand => ({
 	name: "init-team",
 	description: "Detect stacks and emit .omp/team.config.json (idempotent).",
-	async execute(_args: string[], ctx: HookCommandContext): Promise<string> {
+	async execute(args: string[], ctx: HookCommandContext): Promise<string> {
 		const cwd = ctx.cwd ?? _api.cwd;
 		if (!cwd) return "ERROR: no cwd available.";
 		const dir = resolve(cwd, ".omp");
 		const path = join(dir, "team.config.json");
-		if (existsSync(path)) {
-			return `init-team: ${path} already exists. Skipping. Edit by hand or delete to regenerate.`;
+		if (existsSync(path) && !args.includes("--force")) {
+			return `init-team: ${path} already exists. Skipping. Edit by hand, or run with --force to regenerate (deleting the file alone is not enough: omp re-seeds it on the next session start).`;
 		}
 		mkdirSync(dir, { recursive: true });
 		writeFileSync(path, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n");
