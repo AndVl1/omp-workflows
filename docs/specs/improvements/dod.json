@@ -1,0 +1,69 @@
+{
+  "artifact": "dod",
+  "run_key": "improvements",
+  "branch": "improvements",
+  "workflow": "spec-preparation",
+  "generated_at": "2026-08-26",
+  "status": "complete",
+  "scope_note": "Task type SPEC: deliverable is an implementation-ready specification, not code. All acceptance criteria below were fixed during exploration/diagnosis stages and verified against on-disk artifacts; no application/source/config/test files changed.",
+  "acceptance_criteria": [
+    {
+      "id": "DOD-1",
+      "criterion": "Every user decision group UDG-1..UDG-6 resolved with explicit final choices DEC-1..DEC-10; zero open decision gates.",
+      "verify_method": "spec_options_decisions.json r6: jq gate assertions run by architect worker (10 decisions final=true/gate=false, user_decisions_needed=[], discussion order empty) plus main-side `jq empty` parse validation; cross-checked against completeness r8 decision map (all_final_with_gate_false=true)."
+    },
+    {
+      "id": "DOD-2",
+      "criterion": "Requirements are testable and continuous: REQ-1..REQ-61 with supporting collections INV-28 / LC-24 / ERR-25 / SEC-12 / COMPAT-12 / EC-40 / NG-8, 100% traceability to evidence or slices.",
+      "verify_method": "Completeness r8 programmatic gate (61 unique REQ ids, range-span arithmetic=61, supporting totals asserted, unmapped=0); main-side sha256 match a8d70e0e…5ee0a between reported spill candidate and on-disk spec_completeness.json."
+    },
+    {
+      "id": "DOD-3",
+      "criterion": "Final DEC-2 D2-C dynamic roster contract fully specified: deterministic typed-slice planner, central run-wide global lease caps (8 total incl. nested teams, 3 per role), manual-QA=1, fan-in owner=1, no-drop waves, safety-bounded overrides, immutable plan identity.",
+      "verify_method": "Adversarial tech-researcher challenge reconciled all nine blockers as closed against architecture identifiers/oracles (artifact r6 reconciliation, 7,132→7,907 B valid JSON); completeness r8 D2 blocker status=none."
+    },
+    {
+      "id": "DOD-4",
+      "criterion": "DEC-7 D7-C provenance persistence specified end-to-end: authoritative compact resume state (snapshot + monotonic ring latest-32 with eviction on event 33), deterministic retained report, telemetry-only logs, strict redaction (repo-relative paths/stable IDs/hashes only).",
+      "verify_method": "Architecture r7 defines EffectiveConfigResolver.v1 / EffectiveConfigProvenanceState / EffectiveConfigReport / GenerationCAS / RedactionReceipt schemas+oracles; final challenge closed all six D7 authority/crash/privacy blockers (verdict PASS_IMPLEMENTATION_READY); completeness r8 d7c_proofs covers 9 axes."
+    },
+    {
+      "id": "DOD-5",
+      "criterion": "DEC-3 D3-A clean cutover specified: legacy minimal/pragmatic/clean removed with typed LEGACY_TIER_UNSUPPORTED pre-planning rejection; core-owned versioned eight-dimension rubric with non-overriding namespaced bundle additions bound into plan identity.",
+      "verify_method": "Architecture r7 LegacyTierScanner.v1 + SituationalRubricRegistry.v1 (core-situational-rubric/1) with collision/version/hash-drift fail-closed oracles; completeness r8 d3a_proofs covers 8 axes including arbitrary-prose-non-match and mixed-version fail-closed."
+    },
+    {
+      "id": "DOD-6",
+      "criterion": "Prior incident findings preserved as binding contracts: steering-starvation (VF-1/EO-STEERING), nondeterministic beacons (VF-2/EO-BEACON), artifact-size budget with spill-recovery path (VF-3/EO-ARTIFACT-SIZE), host capability probe limits (VF-6/host_probe).",
+      "verify_method": "Present verbatim in final spec-preparation.json verified_facts and spec_handoff.json critical_observations; carried through requirements r5 security/lifecycle collections and architecture r7 host/recovery contracts."
+    },
+    {
+      "id": "DOD-7",
+      "criterion": "All declared workflow artifacts exist on disk, are valid JSON within size budget (<110 KiB per artifact contract), and carry current cursor epochs at their write time.",
+      "verify_method": "Main-side `jq empty` + `wc -c` + `sha256sum` after every join: requirements r5 107,588 B (sha 5f582bae…c25c16), decisions r6 107,675 B, architect r7 93,753 B, challenge r7 7,907 B, completeness r8 67,202 B (sha a8d70e0e…5ee0a); intake artifacts re-verified on dispute (analyst slot 33,429 B valid JSON, mtime-consistent with gap-fill rewrite)."
+    },
+    {
+      "id": "DOD-8",
+      "criterion": "Engine-owned state transitions complete and authorized: every stage dispatch recorded via workflow_complete with token+capability binding, every advance via workflow_advance; terminal handoff reached without unauthenticated writes.",
+      "verify_method": "workflow_status after each transition showed status=succeeded with matching dispatch ids/tokens and completion records (dispatches 19fc6289, 5caf0789, aa430cdf, fc456179, 5a04f267 succeeded); final advance returned all six stages done, pause.kind=done, capability status=complete. One schema-validation error on first workflow_complete call was corrected per returned schema before retry."
+    },
+    {
+      "id": "DOD-9",
+      "criterion": "No scope creep: implementation explicitly out of scope; only declared .work-state artifacts and engine state modified; no build/lint/test commands run; no production/destructive actions.",
+      "verify_method": "change_statement.no_application_or_specification_files_changed=true asserted in both final handoff artifacts; observability rollup shows only read/glob/jq/bash-validation/write-to-artifacts tool usage; user confirmed twice that remaining work was implementation, deferred by design."
+    }
+  ],
+  "known_deviations": [
+    {
+      "id": "DEV-1",
+      "item": "Registered slot hash for spec_intake_repo_map-analyst.json in engine state (9be7c30e…) predates the 15:19 gap-fill rewrite (current sha 72387aae…). Cosmetic bookkeeping staleness only; downstream stages consumed the rewritten file via shared synthesis.",
+      "resolution": "Accepted; refresh happens on next natural state write. No reopen warranted."
+    },
+    {
+      "id": "DEV-2",
+      "item": "Two oversized subagent candidates could not write targets directly (EPERM); transferred byte-exactly via REPL artifact spill with parent-side restore and SHA-256 verification instead of recomputation.",
+      "resolution": "Resolved; procedure captured as managed skill artifact-spill-transfer and reflected in EO-ARTIFACT-SIZE policy."
+    }
+  ],
+  "final_verdict": "PASS_IMPLEMENTATION_READY — specification complete, all ten decisions final, M0..M5 implementation sequence defined; reopening any final decision requires explicit new user direction."
+}

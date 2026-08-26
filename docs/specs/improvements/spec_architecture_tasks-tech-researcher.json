@@ -1,0 +1,44 @@
+{
+  "artifact":"spec_architecture_tasks-tech-researcher",
+  "role":"tech-researcher",
+  "run_key":"improvements",
+  "stage":"architecture_task_slices",
+  "cursor_epoch":"ed699840-6e3e-4250-a795-2a73ddf2c489",
+  "generated_at":"2026-08-26",
+  "revision":7,
+  "source_revisions":{"requirements":"r5","decisions":"r6","architecture":"r7"},
+  "status":"final_adversarial_review_complete",
+  "verdict":"PASS_IMPLEMENTATION_READY",
+  "decision_guard":{"all_ten_decisions_final":true,"dec_3":"D3-A","dec_7":"D7-C","reopen_prohibited":true},
+  "review_basis":"Architect r7 is implementation_ready and integrates the requested authority, bounded retention, redaction, typed legacy rejection, core rubric, namespace, version/hash, and plan-identity contracts.",
+  "blocker_dispositions":[
+    {"id":"BLK-01","topic":"D7-C authority split","status":"closed","architecture_identifiers":["C2-shared-resolution-mapping","d7c_effective_config.authority.resolver","d7c_effective_config.authority.state","d7c_effective_config.authority.report","d7c_effective_config.authority.logs","EffectiveConfigResolver.v1","single_result_rule"],"oracle":"Report/log deletion, corruption, reordering, or alteration cannot affect planning, invalidation, state, or resume; state is the sole planning/resume authority."},
+    {"id":"BLK-02","topic":"Crash between state/report","status":"closed","architecture_identifiers":["d7c_effective_config.resolver_contract.ordered_steps[7]","C5-coordination-recovery-host-adapter","state/report atomic CAS","GenerationCAS","state_report_resume_validation"],"oracle":"Crash injection at publication boundaries accepts only CAS-valid authoritative state; report is a deterministic projection and cannot roll state back."},
+    {"id":"BLK-03","topic":"Exact ring32 and atomic eviction","status":"closed","architecture_identifiers":["architecture_status.non_negotiables[3]","latest 32 monotonic invalidation/fallback events","event 33 evicts exactly the oldest entry","C6-progress-observability-artifact-policy","C5-coordination-recovery-host-adapter"],"oracle":"33 concurrent events retain exactly 32 newest monotonic entries, evict one oldest atomically, and preserve snapshot-only recovery; logs remain telemetry."},
+    {"id":"BLK-04","topic":"Path/secret/raw-input leakage","status":"closed","architecture_identifiers":["architecture_status.non_negotiables[5]","C6-progress-observability-artifact-policy","redaction before every durability boundary","EffectiveConfigSource.path_ref","EffectiveConfig value_policy hash_only","only normalized repo-relative paths, stable IDs, and hashes cross durability"],"oracle":"Absolute, traversal, symlink, token, raw argv, prompt, and exception inputs produce no forbidden durable/log values; unsupported references fail closed."},
+    {"id":"BLK-05","topic":"D3-A legacy detection","status":"closed","architecture_identifiers":["C10-d3a-legacy-and-rubric","LegacyTierScanner","d7c_effective_config.resolver_contract.ordered_steps[2]","D3-A typed pre-planning rejection","compatibility.D3-A breaking legacy vocabulary"],"oracle":"Legacy values nested in typed/persisted fields reject before planning; legacy words in aliases, prompts, manifests, discovery, or untyped metadata do not trigger handling."},
+    {"id":"BLK-06","topic":"Core rubric and constrained bundles","status":"closed","architecture_identifiers":["C10-d3a-legacy-and-rubric","SituationalRubricRegistry/v1","eight dimensions","deterministic aggregation and rationale","C3-bundle-catalog-registration","d2 planner rubric/dimension identity","bundle metadata never grants permission or remaps model roles"],"oracle":"Reserved-key/namespace collision, schema/hash drift, permissive override, altered rubric, or plan mismatch fails closed; core rubric, safety, routing, leases, and identity remain authoritative."}
+  ],
+  "reconciliation_hook_dispositions":[
+    {"id":"RC-01","status":"closed","evidence":"D7C authority and resolver schemas define EffectiveConfigResolver.v1, state/report roles, source/identity hashes, atomic publication, CAS, and projection semantics.","oracle":"Missing/stale/altered report is non-authoritative and cannot change resume."},
+    {"id":"RC-02","status":"closed","evidence":"Architecture non-negotiable explicitly requires latest 32 monotonic events and event 33 exact oldest eviction; telemetry-only logs and recovery boundaries are specified.","oracle":"Concurrent 33+ event run is bounded at 32 with monotonic survivors and snapshot-only recovery."},
+    {"id":"RC-03","status":"closed","evidence":"Redaction precedes every durability boundary; only normalized repo-relative paths, stable IDs, and hashes cross it; AF-1 applies before parse/persist.","oracle":"Traversal/symlink/outside paths and secrets/raw inputs never persist or authorize."},
+    {"id":"RC-04","status":"closed","evidence":"C10 defines core SituationalRubricRegistry/v1, eight dimensions, deterministic aggregation/rationale, and namespaced extension validation/hashes.","oracle":"Bundle cannot replace rubric or alter aggregation/rationale; collisions fail closed."},
+    {"id":"RC-05","status":"closed","evidence":"D3-A rejects legacy tiers before planning with typed nested/persisted values; unsupported schemas fail closed and no compatibility alias/deprecation path exists.","oracle":"Mixed-version/legacy ambiguity has typed reject, never heuristic downgrade."},
+    {"id":"RC-06","status":"closed","evidence":"Manifest, catalog, inventory, selection, mapping, fallback, invalidation, rubric/dimension, and plan identities are hash-bound; resolver result is shared by all entrypoints.","oracle":"Bundle swap, rubric downgrade, report replay, or plan substitution cannot resume."}
+  ],
+  "safety_privacy_compatibility_determinism_recovery_matrix":[
+    {"case":"normal/missing/mismatched report","authority":"EffectiveConfigProvenanceState","expected":"deterministic projection or explicit degraded status; report never mutates authority"},
+    {"case":"CAS crash/race","authority":"monotonic state CAS","expected":"single valid winner; no torn rollback or duplicate transition"},
+    {"case":"ring overflow","authority":"compact snapshot","expected":"latest 32 monotonic events; event 33 evicts exactly oldest; recovery independent"},
+    {"case":"malicious path or secret/raw input","authority":"typed redaction and normalized refs","expected":"no forbidden value crosses durability/log boundary; fail closed"},
+    {"case":"legacy text versus typed legacy field","authority":"LegacyTierScanner typed surfaces","expected":"text ignored; typed nested/persisted legacy rejected before planning"},
+    {"case":"bundle namespace/schema/hash/rubric/plan drift","authority":"core registry, resolver, identity hashes","expected":"collision or drift rejected; core safety/rubric/identity wins"},
+    {"case":"mixed versions","authority":"versioned typed schemas","expected":"unsupported state/report/manifest/rubric fails closed; no silent downgrade"}
+  ],
+  "falsification_oracles":["Permute map/key/event arrival order and require byte-identical state/report/rationale/hashes.","Resume with only compact state and no report/ring; require safe deterministic outcome.","Crash every CAS/snapshot/report/eviction boundary; accept only checksum-valid monotonic state.","Inject traversal, symlink, absolute paths, tokens, raw args, prompts, and exception chains; scan all durable/log outputs.","Place legacy terms in every untyped surface and valid/invalid typed fields; only typed persisted values affect D3-A.","Load colliding/spoofed/drifted/permissive bundles and attempt bundle/rubric/plan swaps during resume; require fail-closed rejection."],
+  "implementation_ready_only_if_none_remains":true,
+  "remaining_blockers":[],
+  "remaining_hooks":[],
+  "out_of_scope":["alternate D3/D7 choices","architecture edits","implementation","repository/source/config/tests/docs/workflow changes"]
+}

@@ -1,0 +1,519 @@
+{
+  "artifact": "spec_architecture_tasks-architect",
+  "role": "architect",
+  "run_key": "improvements",
+  "stage": "architecture_task_slices",
+  "cursor_epoch": "ed699840-6e3e-4250-a795-2a73ddf2c489",
+  "generated_at": "2026-08-26",
+  "revision": 7,
+  "revision_label": "r7-final-d3a-d7c-authoritative-provenance-rubric",
+  "source_revisions": {
+    "requirements": "r5",
+    "decisions": "r6",
+    "prior_architecture": "r6",
+    "dispatch": "architecture_task_slices/ed699840-6e3e-4250-a795-2a73ddf2c489",
+    "requirements_cursor": "887cef40-aa1b-474f-b361-a759804669e6",
+    "decision_cursor": "e6213c26-e29f-48bd-8fe1-61b2c0d54dd2"
+  },
+  "status": "implementation_ready",
+  "scope": "Implementation-ready architecture and task slices only. This revision integrates final DEC-7/D7-C and DEC-3/D3-A into the prior one-engine, D1 safety, D2 planner/lease, bundle, host, recovery, sandbox, artifact-size, and beacon contracts. It changes no source, tests, configuration, documentation, canonical state, or workflow control state.",
+  "decision_status": {
+    "DEC-1": {"status": "final_approved_by_user", "option": "D1-C", "gate": false},
+    "DEC-2": {"status": "final_approved_by_user", "option": "D2-C", "gate": false},
+    "DEC-3": {"status": "final_approved_by_user", "option": "D3-A", "gate": false},
+    "DEC-4": {"status": "final_approved_by_user", "option": "D4-C", "gate": false},
+    "DEC-5": {"status": "final_approved_by_user", "option": "D5-A", "gate": false},
+    "DEC-6": {"status": "final_approved_by_user", "option": "D6-C", "gate": false},
+    "DEC-7": {"status": "final_approved_by_user", "option": "D7-C", "gate": false},
+    "DEC-8": {"status": "final_approved_by_user", "option": "D8-C", "gate": false},
+    "DEC-9": {"status": "final_approved_by_user", "option": "layered D9-A+D9-B+D9-C", "gate": false},
+    "DEC-10": {"status": "final_approved_by_user", "option": "D10-B", "gate": false}
+  },
+  "architecture_status": {
+    "status": "implementation_ready",
+    "decision_state": "all ten decisions final; zero open decisions or gates",
+    "final_decisions": ["DEC-1", "DEC-2", "DEC-3", "DEC-4", "DEC-5", "DEC-6", "DEC-7", "DEC-8", "DEC-9", "DEC-10"],
+    "remaining_open_decisions": [],
+    "remaining_decision_gate_count": 0,
+    "integrated_guarantee": "One core engine owns safety, resolution, planning, state, recovery, and checkpoint semantics. EffectiveConfigResolver is the sole provenance authority; its redacted state is resume/planning authority, its retained report is a deterministic projection, and logs are telemetry only. D3-A rejects legacy tiers before planning and binds a core-owned situational rubric plus non-overriding namespaced bundle dimensions into selection, plan, and resume identity.",
+    "non_negotiables": [
+      "PHASE-0 model-first autonomy; keywords, commands, aliases, legacy tiers, manifests, discovery, and credentials never grant autonomy or remove a floor.",
+      "D1-C exact five-class ordinary floor; profile gates are additive; scoped SandboxGrant is never a blanket bypass.",
+      "D2-C typed closed/disjoint plan has one candidate per ready independent slice, central run-wide leases (8 global, 3 per role, one manual-QA owner, one fan-in owner), deterministic non-dropping waves, ordered fallback, and immutable hash-bound launch.",
+      "D3-A has no alias, preset, mapping, ranking, or deprecation path for legacy tiers; typed nested/persisted values fail before planning.",
+      "D7-C has one current snapshot and latest 32 monotonic invalidation/fallback events; snapshot, ring, and report projection publish atomically with CAS; event 33 evicts exactly the oldest entry.",
+      "Only normalized repo-relative paths, stable IDs, and hashes cross a durability boundary; logs cannot repair or authorize state."
+    ]
+  },
+  "preserved_architecture": {
+    "core_boundary": "packages/core remains the single engine, resolver, checkpoint/safety path, planner, lease coordinator, lifecycle/recovery, fan-in, artifact validation, and durable-state authority. No second bundle engine, planner, sandbox policy, or permission system is introduced.",
+    "bundle_boundary": "packages/fullstack contributes descriptive versioned BundleManifestV1, namespaced role/capability/fallback catalogs, OMP capabilities, claims, and host-verified hyphen aliases. Metadata never grants permission or remaps model roles.",
+    "selection_and_ownership": [
+      "Canonical ownership uses documented native > built-in > core precedence; every challenger is diagnosed and ambiguous canonical ownership fails closed.",
+      "Selection precedence is explicit namespace/argument > project .omp config > exactly one enabled compatible bundle; zero, multiple, or incompatible candidates fail closed with provenance.",
+      "Only host-verified /do-work-<bundle>, /team-<bundle>, /cto-<bundle> aliases are claimed, including omp; colon grammar is not an API. Copied project commands remain compatibility artifacts, never an override API."
+    ],
+    "d1_sandbox": "Ordinary modes human-gate exactly production deploy/rollback; destructive or irreversible git/filesystem/database/data/schema effects; irreversible external publish/send/payment/account effects; credential/access/security-policy changes; and cancellation/restart of a live worker whose computation may be lost. A complete scoped SandboxGrant permits zero runtime checkpoints only for proven approved dev/validation actions; forbidden, ambiguous, expired, revoked, or mismatched actions become durable redacted deferrals while reachable work continues.",
+    "d2_planner": "The versioned WorkDecompositionPlan uses typed disjoint/closed graph validation, evidence-only file counts, no token/time/effort multiplier, capability-derived multiplicity, ordered compatible fallback, overrides-last atomic validation, mandatory-risk/critical-path/phase/slice-id waves, and plan identity. D3 rubric hashes are additive identity components; the six D2 identity components remain present.",
+    "d2_leases": "One GlobalLeaseCoordinator is shared by parent and nested teams through an opaque handle. Acquire/release are generation CAS operations; heartbeat, TTL, silence, missing beacon, or temporary artifact absence never reclaim an ambiguous lease. Duplicate or foreign release never decrements counters.",
+    "d6_d9_host_recovery": "Regular steering uses the host safe queue/tool-call boundary; urgent abort is distinct. Accepted|started|not_started|completed is authoritative; one replay is allowed only with trustworthy not_started proof, otherwise manual resolution. Recovery restores same-stage computed work before rerun and never polls or silently drops work.",
+    "af_contracts": "AF-1 measures UTF-8 artifact size before parse/persist, never truncates, and allows one same-worker compaction. AF-2 beacons are self-emitted at safe boundaries; absence is evidence only and never interrupts an active call.",
+    "compatibility": [
+      "Profiles without dynamic-slice declarations retain their prior artifact chains.",
+      "Unsupported plan, grant, state, report, rubric, manifest, or mapping schema fails closed rather than approximating.",
+      "D3-A is intentionally breaking only for the legacy tier vocabulary; no compatibility alias or deprecation window is added. All other prior contracts remain additive and versioned."
+    ]
+  },
+  "components": [
+    {"id": "C1-core-semantic-engine", "owner": "packages/core", "action": "modify", "files": ["src/engine/workflow-contract.ts", "src/gates/safety.ts", "src/gates/dispatch.ts", "src/gates/validation.ts", "src/engine/stage.ts", "src/engine/durable.ts"], "responsibilities": ["PHASE-0 and D1 floor/profile", "pre-planning validation and plan admission", "typed errors and durable transitions", "artifact-size and execution-time authorization"]},
+    {"id": "C2-shared-resolution-mapping", "owner": "packages/core", "action": "modify/create", "files": ["src/engine/config.ts", "src/engine/config-diagnostics.ts", "src/engine/bundle-resolution.ts", "src/engine/agent-mapping.ts", "src/engine/effective-config-provenance.ts", "src/engine/effective-config-report.ts"], "responsibilities": ["one EffectiveConfigResolver", "source/selection/manifest/catalog/inventory/mapping/fallback/invalidation identities", "redaction before every durability boundary", "atomic state/report CAS and recovery"]},
+    {"id": "C3-bundle-catalog-registration", "owner": "packages/fullstack + packages/core claims", "action": "modify", "files": ["src/bundle-manifest.ts", "src/role-catalog.ts", "src/dev-bundle.ts", "src/workflow-commands.ts", "packages/core/src/commands/register.ts"], "responsibilities": ["BundleManifestV1, namespaced role and rubric-dimension declarations, ordered fallback, claims, verified aliases", "collision and compatibility diagnostics"]},
+    {"id": "C4-d2c-planner", "owner": "packages/core", "action": "modify", "files": ["src/engine/shape-signals.ts", "src/engine/roster-planner.ts", "src/engine/work-decomposition.ts", "src/engine/proposed-roster.ts", "src/engine/stage.ts"], "responsibilities": ["typed graph, readiness, risk/surface classification, candidate assignment, waves, safe overrides", "rubric/core/bundle dimension identity in plan and selection"]},
+    {"id": "C5-coordination-recovery-host-adapter", "owner": "packages/core + host adapter", "action": "modify", "files": ["src/engine/coordination.ts", "src/engine/recovery.ts", "src/engine/stage.ts", "src/engine/durable.ts"], "responsibilities": ["safe queue/coalescing, urgent abort, proof-gated replay", "state/report resume validation", "same-stage recovery, no-proof-no-replay, no TTL reclaim"]},
+    {"id": "C6-progress-observability-artifact-policy", "owner": "packages/core", "action": "modify/create", "files": ["src/engine/progress-beacon.ts", "src/engine/redaction.ts", "src/observability/events.ts", "src/observability/hooks.ts", "src/observability/recorder.ts", "src/observability/session-summary.ts"], "responsibilities": ["telemetry-only event stream", "D7 state/report projection diagnostics", "redaction receipts and secret/path audits", "beacons, AF-1, planner/lease/sandbox metrics"]},
+    {"id": "C7-fan-in-manual-qa", "owner": "packages/core", "action": "preserve/modify", "files": ["src/engine/peer-fan-in.ts", "src/engine/work-decomposition.ts", "src/engine/stage.ts"], "responsibilities": ["typed ordered contributions", "one fan-in output owner", "whole sequential manual-QA scenario and evidence"]},
+    {"id": "C8-sandbox-proof-boundary", "owner": "packages/core", "action": "preserve/modify", "files": ["src/engine/environment-proof.ts", "src/engine/workflow-contract.ts", "src/gates/safety.ts", "src/engine/durable.ts"], "responsibilities": ["SandboxGrant, EnvironmentProof, action expansion, deferred action, handoff", "D1 floor and positive target proof; no second policy"]},
+    {"id": "C9-global-run-lease-coordinator", "owner": "packages/core main-session coordinator", "action": "preserve/modify", "files": ["src/engine/global-lease.ts", "src/engine/work-decomposition.ts", "src/engine/stage.ts", "src/engine/durable.ts", "src/observability/events.ts"], "responsibilities": ["one run-wide coordinator", "atomic acquire/release and lifecycle identity", "8/3/1/1 caps and wave cursor across nested teams"]},
+    {"id": "C10-d3a-legacy-and-rubric", "owner": "packages/core", "action": "create", "files": ["src/engine/legacy-tier-scanner.ts", "src/engine/situational-rubric.ts", "src/engine/rubric-diagnostics.ts"], "responsibilities": ["typed pre-planning LegacyTierScanner", "core SituationalRubricRegistry/v1 with eight dimensions, deterministic aggregation, and rationale", "namespaced bundle extension validation and hashes"]}
+  ],
+  "d7c_effective_config": {
+    "decision": "DEC-7/D7-C final",
+    "authority": {
+      "resolver": "EffectiveConfigResolver is the only reader/normalizer/provenance authority used by engine and command entrypoints.",
+      "state": "EffectiveConfigProvenanceState is the only planning and resume authority for the run.",
+      "report": "EffectiveConfigReport is a deterministic human-readable projection of accepted state, retained with run artifacts; finalized projection is immutable.",
+      "logs": "Event/log output is telemetry only. Missing, truncated, reordered, or altered logs never alter planning, invalidation, state, report, or resume."
+    },
+    "resolver_contract": {
+      "name": "EffectiveConfigResolver",
+      "version": "EffectiveConfigResolver.v1",
+      "entrypoints": ["engine", "do-work", "team", "cto", "resume", "recovery"],
+      "ordered_steps": [
+        "Resolve project root and CWD once; construct a typed source chain with precedence and source hashes.",
+        "Parse only versioned typed config/input/state/output schemas; measure raw artifacts before parsing under AF-1.",
+        "Run LegacyTierScanner on typed surfaces before option ranking, rubric evaluation, shape discovery, or planning.",
+        "Resolve explicit namespace/argument > .omp config > exactly one compatible enabled bundle; validate claims and BundleManifestV1.",
+        "Validate core rubric and accepted namespaced bundle dimensions; compute rubric and dimension schema identities.",
+        "Capture effective config, manifest, catalog, discovered inventory, selection, mapping generation/CAS, ordered fallback outcomes, and invalidation identity without values.",
+        "Normalize/redact all references, canonicalize fields, hash the accepted result, and atomically publish state, ring event, and report projection.",
+        "Emit only redacted telemetry after the authoritative publication; return the accepted result or a typed fail-closed error."
+      ],
+      "single_result_rule": "Engine and command entrypoints receive the same accepted ResolverResult object; no caller rereads config, mapping, manifest, rubric, or report independently."
+    },
+    "schemas": {
+      "EffectiveConfigSource": {
+        "schema_version": "EffectiveConfigSource.v1",
+        "fields": ["source_id:opaque stable ID", "source_kind:project_config|legacy_config|bundle_manifest|profile|typed_input|typed_state|typed_output|runtime_override", "precedence_rank:uint", "path_ref:normalized repo-relative path or opaque ID/hash", "schema_version:string", "source_hash:sha256", "parse_status:accepted|missing|malformed|ignored|rejected", "selected:boolean", "reason_code:typed enum or null"],
+        "value_policy": "No source values; source_id/path_ref/source_hash are sufficient for provenance without content."
+      },
+      "EffectiveConfig": {
+        "schema_version": "EffectiveConfig.v1",
+        "fields": ["config_hash:sha256 canonical effective configuration", "value_policy:hash_only", "effective_key_set_hash:sha256", "field_hashes:map<stable_field_name,sha256>", "config_schema_version:string", "precedence_policy_version:string", "selection_policy_version:string", "bundle_ref:stable ID+version", "profile_ref:stable ID+version"],
+        "value_policy_detail": "No effective values, raw arguments, prompts, tokens, credentials, or secret presence beyond boolean/hash markers are persisted."
+      },
+      "IdentitySet": {
+        "manifest_identity": ["manifest_schema_version", "bundle_id", "bundle_version", "manifest_hash", "engine_compatibility_hash", "accepted:boolean"],
+        "catalog_identity": ["catalog_schema_version", "catalog_id", "catalog_version", "catalog_hash", "role_catalog_hash", "accepted_bundle_dimension_schema_hash"],
+        "inventory_identity": ["inventory_schema_version", "inventory_hash", "capability_set_hash", "entry_count", "policy_filter_hash"],
+        "selection_identity": ["selection_schema_version", "selection_hash", "selection_source:explicit|omp_config|single_auto", "candidate_set_hash", "claim_set_hash", "selected_bundle_ref", "mapping_generation"],
+        "mapping_identity": ["mapping_schema_version", "mapping_hash", "mapping_generation:uint64", "mapping_cas_version:uint64", "mapping_writer_id:opaque", "mapping_status:current|stale|regenerated|rejected"],
+        "fallback_identity": ["fallback_schema_version", "fallback_hash", "ordered_chain_hash", "outcomes_hash", "preferred_count", "fallback_count", "unavailable_count"],
+        "invalidation_identity": ["invalidation_schema_version", "invalidation_hash", "reason_code", "changed_identity_names", "from_generation:uint64", "to_generation:uint64"]
+      },
+      "GenerationCAS": {
+        "fields": ["state_generation:uint64", "expected_generation:uint64", "published_generation:uint64", "mapping_generation:uint64", "mapping_cas_version:uint64", "writer_id:opaque stable ID", "cas_result:won|conflict|retry|failed", "attempt:uint", "commit_id:opaque stable ID"],
+        "rule": "All generation values are monotonic per authority; a stale writer cannot overwrite a newer snapshot or ring."
+      },
+      "EffectiveConfigSnapshot": {
+        "schema_version": "EffectiveConfigSnapshot.v1",
+        "fields": ["snapshot_id:opaque stable ID", "run_id:opaque stable ID", "snapshot_generation:uint64", "source_chain:array<EffectiveConfigSource>", "effective_config:EffectiveConfig", "manifest_identity:IdentitySet.manifest_identity", "catalog_identity:IdentitySet.catalog_identity", "inventory_identity:IdentitySet.inventory_identity", "selection_identity:IdentitySet.selection_identity", "mapping_identity:IdentitySet.mapping_identity", "fallback_identity:IdentitySet.fallback_identity", "invalidation_identity:IdentitySet.invalidation_identity", "rubric_identity:RubricIdentity", "generation_cas:GenerationCAS", "redaction_receipt:RedactionReceipt", "snapshot_hash:sha256"],
+        "rule": "Exactly one current snapshot exists per run; snapshot_hash is over canonical redacted fields and excludes timestamps, raw values, and telemetry."
+      },
+      "EffectiveConfigEvent": {
+        "schema_version": "EffectiveConfigEvent.v1",
+        "fields": ["seq:uint64 strictly increasing", "event_id:opaque stable ID", "event_kind:invalidation|fallback", "snapshot_id:opaque", "state_generation:uint64", "identity_name:manifest|catalog|inventory|selection|mapping|fallback|rubric|dimension", "reason_code:typed enum", "before_hash:sha256|null", "after_hash:sha256|null", "changed_names:sorted stable identifiers", "redacted_context:hashes/IDs only", "event_hash:sha256"],
+        "rule": "The durable ring contains only invalidation/fallback events, in seq order, with at most 32 entries; event 33 evicts the minimum seq atomically."
+      },
+      "EffectiveConfigProvenanceState": {
+        "schema_version": "EffectiveConfigProvenanceState.v1",
+        "fields": ["run_id:opaque stable ID", "run_artifact_id:opaque stable ID", "state_generation:uint64", "current_snapshot:EffectiveConfigSnapshot exactly one", "event_ring:array<EffectiveConfigEvent>", "ring_capacity:uint=32", "next_event_seq:uint64", "report_ref:opaque artifact ID", "report_projection_hash:sha256", "state_hash:sha256", "redaction_receipt:RedactionReceipt"],
+        "invariants": ["ring length <=32", "next_event_seq is one greater than the highest committed seq", "snapshot/ring/report reference one state_generation", "state_hash covers only canonical redacted state", "state is valid without log or report"],
+        "retention": "The finalized report artifact is independently retained/addressable by run_artifact_id even if state cleanup or telemetry cleanup occurs."
+      },
+      "EffectiveConfigReport": {
+        "schema_version": "EffectiveConfigReport.v1",
+        "fields": ["report_id:opaque artifact ID", "run_artifact_id:opaque artifact ID", "source_state_schema_version", "source_state_generation:uint64", "source_state_hash:sha256", "snapshot_id:opaque", "source_chain_projection", "effective_config_projection", "identity_projection", "fallback_projection", "invalidation_projection", "rubric_projection", "event_seq_start:uint64|null", "event_seq_end:uint64|null", "event_ring_hash:sha256", "projection_schema_version", "projection_hash:sha256", "rendered_text_hash:sha256", "finalized:boolean", "immutable_when_finalized:boolean", "redaction_receipt:RedactionReceipt"],
+        "projection_rule": "Canonical section order, field order, sorted identifiers, UTF-8, and newline rules make both structured projection and human-readable rendering byte-stable. It contains hashes/IDs, not effective values.",
+        "finalization": "Finalization records projection_hash and retains the report with run artifacts. A later accepted state publishes a new state generation and new report version; it never mutates a finalized report."
+      },
+      "RedactionReceipt": {
+        "schema_version": "RedactionReceipt.v1",
+        "fields": ["policy_version", "accepted_path_count", "opaque_reference_count", "replaced_count", "rejected_count", "forbidden_classes_seen:sorted enum", "audit_hash:sha256", "status:passed|failed"],
+        "rule": "Receipt contains no rejected raw values or reversible material."
+      }
+    },
+    "identity_formula": {
+      "canonical_input": ["source_chain_hash", "config_hash", "manifest_hash", "catalog_hash", "inventory_hash", "selection_hash", "mapping_hash", "fallback_hash", "invalidation_hash", "rubric_hash", "core_dimension_hash", "bundle_dimension_schema_hash", "mapping_generation", "state_schema_version"],
+      "hash": "sha256(canonical_json(canonical_input)); sorted keys/sets, UTF-8, no timestamps, secrets, raw values, or logs",
+      "resume_rule": "Recompute identity from current typed inputs and compare every named component before planning; any drift is stale and requires re-resolution/new plan."
+    },
+    "atomic_publication": {
+      "unit": "one CAS transaction publishes current_snapshot, ring append/oldest eviction, state_generation/state_hash, report projection/reference, and report_projection_hash, or publishes none",
+      "algorithm": ["read expected state_generation", "construct redacted candidate and event seq", "if ring length=32 drop only minimum seq in candidate", "CAS expected generation to expected+1", "write state and report through atomic rename/transaction with commit_id", "publish telemetry after commit"],
+      "conflict": "A loser rereads authoritative state and retries only if the resolver input/identity is still valid; otherwise returns EFFECTIVE_CONFIG_STATE_CAS_CONFLICT or EFFECTIVE_CONFIG_IDENTITY_DRIFT. No partial snapshot, ring, or report is visible.",
+      "overflow_example": "With events 1..32, append seq 33 commits ring 2..33 exactly; snapshot remains current and unchanged except for the new generation/report projection."
+    },
+    "resume_and_recovery": {
+      "valid_state": "Validate state schema, canonical state_hash, single snapshot, ring order/capacity, report reference/hash relation, generations, selection/mapping/rubric identities, and current plan identity. Valid state resumes even when logs and report are absent.",
+      "missing_report": "Valid state regenerates deterministic report, attaches a new report_ref, records recovery provenance, and leaves planning authority unchanged.",
+      "stale_report": "State remains authority; report metadata/projection mismatch emits EFFECTIVE_CONFIG_REPORT_STALE and regenerates from state, or refuses finalization if consistency cannot be proven.",
+      "missing_or_corrupt_state": "Fail closed with typed EFFECTIVE_CONFIG_STATE_MISSING or EFFECTIVE_CONFIG_STATE_CORRUPT; never trust report or logs alone and re-resolve before planning.",
+      "stale_authority": "Stale generation, schema, selection, mapping, rubric, dimension, manifest, inventory, or config identity blocks resume/planning and invokes resolver; old plan/state remains immutable."
+    },
+    "redaction_boundary": {
+      "allowed": ["normalized repo-relative path whose resolved target stays within project root", "opaque stable IDs", "sha256/hash values", "typed enum/status/count metadata"],
+      "normalize": ["resolve separators and dot segments", "reject traversal escaping project root", "store project-relative path with stable forward slashes", "hash/opaque-reference outside-project or unrepresentable source"],
+      "outside_or_escape": "Outside-project, absolute, home-directory, traversal, symlink-escape, or ambiguous path is replaced before persistence with a non-reversible opaque stable ID/hash; raw path is never retained.",
+      "forbidden": ["absolute paths", "home paths", "../ traversal", "secrets and secret values", "credentials", "plaintext capability/dispatch/advance tokens", "raw command arguments", "prompts or task prose unrelated to typed fields", "personal content", "full environment dumps"],
+      "failure": "Secret scanner/path validator runs before state, report, event, telemetry, handoff, and error persistence. A forbidden value is rejected or replaced with opaque ID/hash; no raw value may survive in any serialized output."
+    }
+  },
+  "d3a_situational_cutover": {
+    "decision": "DEC-3/D3-A final",
+    "clean_cutover": {
+      "removed_values": ["minimal", "pragmatic", "clean"],
+      "removed_surfaces": ["typed config", "typed input", "typed state", "typed output", "aliases", "presets", "mappings", "ranking", "deprecation markers"],
+      "no_compatibility_path": true,
+      "failure_phase": "before planning, candidate derivation, rubric ranking, or dispatch"
+    },
+    "legacy_tier_scanner": {
+      "name": "LegacyTierScanner",
+      "version": "LegacyTierScanner.v1",
+      "typed_surfaces_only": ["config schema fields", "input request schema fields", "persisted workflow state schema fields", "output/artifact schema fields"],
+      "recursive_rule": "Walk schema-declared objects, arrays, unions, and scalar fields, including nested persisted state and versioned envelopes; inspect only fields typed as workflow/config/rubric/selection values. Do not scan arbitrary prose, prompts, comments, source text, free-form rationale, personal content, or telemetry text for keywords.",
+      "result_fields": ["scanner_schema_version", "surface:config|input|state|output", "schema_id", "schema_version", "typed_pointer", "source_ref:opaque/path after redaction", "persisted_generation:uint64|null", "legacy_value_code:enum", "replacement_dimensions:[scope,risk,reversibility,uncertainty,coupling,blast_radius,cost,evidence_quality]", "migration_action:rewrite_typed_context_and_replan", "error_code:LEGACY_TIER_UNSUPPORTED"],
+      "ordering": "Run after typed parse and redaction of diagnostic references but before option ranking, rubric aggregation, shape discovery, candidate derivation, or WorkDecompositionPlan creation.",
+      "failure": "Any exact legacy value in a typed surface returns LEGACY_TIER_UNSUPPORTED with surface, schema, pointer, source identity, persisted generation when applicable, and actionable core-rubric migration dimensions. It is never silently mapped, ranked, aliased, preset, or deferred.",
+      "arbitrary_prose_non_match": "The same strings in an untyped prompt, free-form rationale, comment, or unrelated prose do not trigger the scanner; they cannot select a workflow or affect rubric scores."
+    },
+    "core_rubric_registry": {
+      "name": "SituationalRubricRegistry",
+      "schema_version": "SituationalRubricRegistry.v1",
+      "rubric_version": "core-situational-rubric/1",
+      "owner": "core",
+      "mandatory": true,
+      "non_overridable": true,
+      "dimensions_exactly": ["scope", "risk", "reversibility", "uncertainty", "coupling", "blast_radius", "cost", "evidence_quality"],
+      "dimension_schema": {"schema": "ordinal-score-v1", "scale": {"kind": "integer", "min": 0, "max": 4, "step": 1}, "direction": "declared per dimension; normalized to attention-priority before aggregation", "evidence_contract": "each score requires typed evidence refs and a non-empty rationale", "weight": "core-owned fixed weight=1 for each dimension", "safety_effect": "none; D1 checkpoint/safety policy is evaluated independently"},
+      "dimension_directions": {
+        "scope": "higher=broader affected scope",
+        "risk": "higher=greater risk",
+        "reversibility": "higher=less reversible",
+        "uncertainty": "higher=less certain",
+        "coupling": "higher=more coupled",
+        "blast_radius": "higher=larger blast radius",
+        "cost": "higher=greater bounded cost",
+        "evidence_quality": "higher=stronger decision evidence"
+      },
+      "aggregation": {"version": "core-mean-v1", "formula": "aggregate_score=sum(normalized_priority_score_i)/8", "normalization": "apply each declared direction to its 0..4 score, then map to 0..1", "tie_breakers": ["mandatory risk class", "critical-path depth", "phase order", "stable decision/slice ID"], "rationale_required": true, "safety_boundary": "aggregate/ranking can never authorize, bypass, remove, or weaken a checkpoint"},
+      "evaluation_fields": ["rubric_schema_version", "rubric_version", "dimension_scores[exactly 8]", "evidence_refs", "dimension_rationales[non-empty each]", "aggregate_score", "aggregate_rationale", "ranking_key", "ranking_rationale_hash", "rubric_hash"],
+      "validation": ["missing or duplicate core dimension fails", "unknown core version fails", "invalid scale/direction/evidence fails", "missing dimension or aggregate rationale fails", "rationale hash must match canonical scores/evidence/ordering"]
+    },
+    "bundle_dimension_contract": {
+      "allowed": "A bundle may add only a fully-qualified, versioned, declared dimension; the core eight remain present and authoritative.",
+      "required_fields": ["bundle_namespace", "bundle_id", "fully_qualified_name:bundle/<bundle_id>/rubric/<dimension_id>", "dimension_id", "dimension_version", "schema", "scale", "direction", "evidence_contract", "dimension_hash", "manifest_hash", "catalog_version"],
+      "fully_qualified_rule": "A declaration lacking a bundle namespace or using a core dimension name as an override is invalid. FQNs are unique across accepted bundles and are sorted for hashing.",
+      "forbidden_operations": ["remove core dimension", "rename core dimension", "redefine core meaning/schema/scale/direction", "reweight core or another bundle dimension", "shadow a core or accepted FQN", "merge conflicting dimensions", "bypass or weaken safety/checkpoint semantics"],
+      "hashes": {"dimension_hash": "sha256(canonical declaration)", "accepted_bundle_dimension_schema_hash": "sha256(canonical sorted accepted declarations)", "rubric_hash": "sha256(core registry + evaluation aggregation + accepted declarations)"},
+      "fail_closed": ["namespace/FQN collision", "incompatible bundle version or engine range", "missing metadata/evidence contract/hash", "core override/remove/reweight/shadow attempt", "dimension or registry hash drift"],
+      "identity_binding": "rubric_hash, core_dimension_hash, and accepted_bundle_dimension_schema_hash are required in EffectiveConfig selection identity, resume identity, WorkDecompositionPlan identity, launch recomputation, and stale/replan provenance."
+    },
+    "state_transitions": [
+      {"from": "typed_input", "event": "legacy_tier_detected", "to": "legacy_rejected", "error": "LEGACY_TIER_UNSUPPORTED", "guard": "typed surface and pointer recorded before planning"},
+      {"from": "typed_input", "event": "core_rubric_validated", "to": "rubric_validated", "guard": "exact eight dimensions, evidence, scale/direction, aggregation, and rationale"},
+      {"from": "rubric_validated", "event": "bundle_dimension_validated", "to": "rubric_bound", "guard": "FQN, namespace, compatibility, hash and non-override checks pass"},
+      {"from": "rubric_bound", "event": "plan_identity_computed", "to": "plan_ready", "guard": "all D2 plus rubric/dimension hashes canonicalized"},
+      {"from": "plan_ready", "event": "rubric_or_dimension_drift", "to": "stale_rejected", "guard": "old plan immutable; deterministic new plan required"}
+    ]
+  },
+  "interfaces_contracts": [
+    {"id": "IC-1", "name": "AutonomyEvaluation", "fields": ["mode", "source", "hint_non_authoritative", "classification_id", "policy_version", "redacted_provenance"], "guarantee": "PHASE-0 model-first; keywords, commands, aliases, legacy tiers, task prose cannot grant autonomy."},
+    {"id": "IC-2", "name": "CheckpointPolicyEvaluation", "fields": ["decision_class", "profile_id", "stage_id", "mandatory_human", "declared_checkpoint", "decision_status", "autonomy_provenance"], "guarantee": "D1 exact five-class floor plus additive profile gates; unresolved floor never self-approves."},
+    {"id": "IC-3", "name": "BundleManifestV1", "fields": ["manifest_version", "bundle_id", "bundle_version", "engine_compatibility", "namespaced_roles", "ordered_fallbacks", "bounded_capability_metadata", "required_tools_metadata", "min_slots", "max_slots", "scope_defaults", "command_aliases", "manifest_hash"], "guarantee": "Descriptive planning metadata only; no permission or model-role routing."},
+    {"id": "IC-4", "name": "EffectiveConfigResolverResult", "fields": ["source_chain", "effective_config", "manifest_identity", "catalog_identity", "inventory_identity", "selection_identity", "mapping_identity", "fallback_identity", "invalidation_identity", "rubric_identity", "redaction_receipt", "result_hash"], "guarantee": "One accepted result feeds engine, state, report, and telemetry."},
+    {"id": "IC-5", "name": "EffectiveConfigProvenanceState", "fields": ["schema_version", "run_id", "run_artifact_id", "state_generation", "current_snapshot exactly one", "event_ring latest32", "next_event_seq", "report_ref", "report_projection_hash", "state_hash", "redaction_receipt"], "guarantee": "Authoritative resume/planning state; valid without logs/report."},
+    {"id": "IC-6", "name": "EffectiveConfigEvent", "fields": ["schema_version", "seq", "event_id", "event_kind", "snapshot_id", "state_generation", "identity_name", "reason_code", "before_hash", "after_hash", "changed_names", "event_hash"], "guarantee": "Ring event kind is invalidation or fallback; seq is strictly increasing; max 32."},
+    {"id": "IC-7", "name": "EffectiveConfigReport", "fields": ["schema_version", "run_artifact_id", "source_state_generation", "source_state_hash", "snapshot_id", "identity/fallback/invalidation/rubric projections", "event_seq_range", "event_ring_hash", "projection_hash", "rendered_text_hash", "finalized", "redaction_receipt"], "guarantee": "Deterministic human-readable projection, retained and immutable after finalization."},
+    {"id": "IC-8", "name": "RedactionReceipt", "fields": ["policy_version", "accepted_path_count", "opaque_reference_count", "replaced_count", "rejected_count", "forbidden_classes_seen", "audit_hash", "status"], "guarantee": "Redaction happens before every state/report/event/log/error write."},
+    {"id": "IC-9", "name": "MappingRefreshCAS", "fields": ["cwd_key", "observed_generation", "next_generation", "preferences_hash", "config_hash", "inventory_hash", "writer_id", "cas_result", "diagnostic"], "guarantee": "Stale mapping writer cannot overwrite."},
+    {"id": "IC-10", "name": "WorkDecompositionPlan", "fields": ["schema_version", "run/stage/plan_id/version", "formula_version", "six D2 identity hashes", "rubric_hash", "core_dimension_hash", "bundle_dimension_schema_hash", "slice_graph", "capability_pool", "waves", "overrides", "plan_hash", "launched_immutable"], "guarantee": "Typed closed/disjoint graph and all identity dimensions bind immutable launch."},
+    {"id": "IC-11", "name": "DispatchAuthorization", "fields": ["capabilities/hashed tokens", "stage/slice/agent", "artifact contract/size", "plan/selection/config/inventory/mapping/rubric identities"], "guarantee": "Execution-time policy recheck; no secret persistence."},
+    {"id": "IC-12", "name": "SteeringQueueAdapter", "fields": ["message/origin/target", "delivery boundary", "host mode", "dispatch state/proof", "replay count", "side-effect class"], "guarantee": "Parent/peer queue, urgent abort distinct, replay at most once with proof."},
+    {"id": "IC-13", "name": "RecoveryRecord", "fields": ["stage/slot/slice", "cause/evidence", "restored/rederived", "resume/replay id", "artifact path ref", "result"], "guarantee": "Same-stage recovery; no blind restart; evidence loss is explicit."},
+    {"id": "IC-14", "name": "HostDispatchState", "fields": ["dispatch_id", "state=accepted|started|not_started|completed", "original_call_hash", "stage/slice", "authoritative_proof", "ack"], "guarantee": "Accepted is not not_started; missing is not proof; completed wins."},
+    {"id": "IC-15", "name": "CanonicalOwnershipClaim", "fields": ["claim_id/kind/token", "owner/source/precedence", "challengers", "accepted/rejected", "diagnostic", "claim_set_hash"], "guarantee": "Native > built-in > core; ambiguity and alias/id collision fail closed."},
+    {"id": "IC-16", "name": "EffectiveBundleSelection", "fields": ["request_hash", "explicit/config/candidates", "root/cwd refs", "manifest hashes", "selected source", "selection_fingerprint", "mapping generation", "claim hash", "rubric/dimension hashes", "immutable resume identity"], "guarantee": "Explicit > .omp > exactly-one auto; resume cannot reselect."},
+    {"id": "IC-17", "name": "ArtifactSizePolicy", "fields": ["max_bytes", "serialized_utf8", "engine_source", "pre_parse_measurement", "measured/budget/ref"], "guarantee": "Typed pre-parse exceedance; no truncate/split/partial persist; one compaction."},
+    {"id": "IC-18", "name": "SandboxGrant", "fields": ["schema/id/activator provenance", "project/branch/worktree/session", "allowed dev targets/resources/actions", "forbidden actions", "issued/expires/revocation", "config/inventory/selection hashes", "resume policy", "redaction"], "guarantee": "Complete scoped envelope; never widens D1 floor."},
+    {"id": "IC-19", "name": "EnvironmentProof", "fields": ["schema/id", "project/branch/worktree/session", "config/inventory/selection", "target/resource/action", "origin/endpoint/account proof", "effective script target", "status", "redaction"], "guarantee": "Positive identity; hostname/name/credential is not proof."},
+    {"id": "IC-20", "name": "ActionAuthorization", "fields": ["work identity", "mode/grant", "action/target/resource/effect", "expanded digest", "proof status", "scope/floor/profile", "decision", "boundary sequence/reason"], "guarantee": "Recursive expansion and checks at dequeue, pre-effect, commit; unattended deny/defer."},
+    {"id": "IC-21", "name": "DeferredActionAndHandoff", "fields": ["id/work identity", "class/reason", "grant/proof status", "redacted context", "attempt/next condition", "recorded_before_continue", "handoff ref", "terminal reason"], "guarantee": "Durable before next dispatch; deduped; no silent retry."},
+    {"id": "IC-22", "name": "GlobalLeaseCoordinator", "fields": ["coordinator_id", "run_id", "coordinator_generation", "global_active", "per_role_active", "manual_qa_owner", "fan_in_owner_index", "wave_cursor", "CAS version", "event cursor"], "guarantee": "One instance per run; nested teams share counters; caps 8/3/1/1."},
+    {"id": "IC-23", "name": "LeaseRecord", "fields": ["lease_id/generation", "run_id/plan_hash", "slice_id/attempt_id", "owner_dispatch_id", "role/capabilities", "parent_team_id", "state", "acquired/released event ids", "lifecycle identity"], "guarantee": "Exact identity and authoritative terminal/no-loss proof required for release."},
+    {"id": "IC-24", "name": "SliceCandidateAssignment", "fields": ["plan_hash/wave", "slice_id", "candidate agent", "capability coverage", "resolution", "priority_key", "reason/provenance"], "guarantee": "Exactly one candidate per ready independent slice; execution policy remains authority."},
+    {"id": "IC-25", "name": "WorkWave", "fields": ["wave_number", "ready_snapshot_hash", "ordered slice ids", "candidate assignments", "queue cursor", "admitted/queued/unavailable/deferred outcomes"], "guarantee": "Mandatory-risk, critical-path, phase, slice-id ordering; no dropped slice."},
+    {"id": "IC-26", "name": "PlannerError", "fields": ["typed code", "plan/formula/phase/slice/role", "derived/pinned values", "violated rule", "tried fallbacks", "provenance", "retry/manual disposition"], "guarantee": "Fail closed; never clamp, silently substitute, drop, or reinterpret."},
+    {"id": "IC-27", "name": "ProgressBeacon", "fields": ["monotonic id", "dispatch/stage/slice", "role/agent/state", "progress/evidence/next milestone", "blocked reason", "timestamp/safe boundary/cadence"], "guarantee": "Self-emitted safe-boundary evidence only; absence cannot cancel active call."},
+    {"id": "IC-28", "name": "ManualQaScenarioOwnership", "fields": ["scenario/stage", "owner", "ordered steps", "whole_stage=true", "split_policy=reject", "evidence"], "guarantee": "One sequential owner and one manual-QA lease."},
+    {"id": "IC-29", "name": "PeerContribution", "fields": ["id/channel/source slice/agent/target", "kind/payload/evidence", "sequence/delivery", "fan_in attribution", "safe boundary"], "guarantee": "Ordered/idempotent; no sibling write or permission transfer."},
+    {"id": "IC-30", "name": "LegacyTierScanResult", "fields": ["scanner/schema", "typed surface", "schema/pointer", "source ref", "persisted generation", "legacy value code", "replacement dimensions", "error code"], "guarantee": "Typed schema scan only; prose does not match; failure precedes planning."},
+    {"id": "IC-31", "name": "SituationalRubricEvaluation", "fields": ["registry/rubric version", "exact eight dimension scores", "scale/direction", "typed evidence refs", "dimension rationales", "aggregate/ranking key", "aggregate rationale", "rationale hash", "rubric hash"], "guarantee": "Core-owned deterministic aggregation; missing/duplicate/rationale failure; safety independent."},
+    {"id": "IC-32", "name": "BundleRubricDimension", "fields": ["namespace", "fully qualified name", "bundle/dimension/version", "schema", "scale", "direction", "evidence contract", "dimension hash", "manifest/catalog hashes"], "guarantee": "Versioned namespaced additions only; collision, override, incompatibility, or drift fails closed."},
+    {"id": "IC-33", "name": "RubricIdentity", "fields": ["rubric_schema_version", "rubric_version", "rubric_hash", "core_dimension_hash", "accepted_bundle_dimension_schema_hash", "accepted_dimension_hashes"], "guarantee": "Joined to selection, plan, launch, and resume identity."}
+  ],
+  "planner_formula": {
+    "formula_version": "wdp-d2c-v1",
+    "plan_schema_version": "WorkDecompositionPlan.v1",
+    "base_identity_components": ["override_hash", "discovered_inventory_hash", "config_hash", "selection_hash", "mapping_hash", "slice_graph_hash"],
+    "rubric_identity_components": ["rubric_hash", "core_dimension_hash", "bundle_dimension_schema_hash"],
+    "plan_hash": "sha256(canonical_json(formula_version + six base identity components + three rubric identity components + canonical typed graph/capability/fallback/risk serialization))",
+    "inputs": ["typed workflow/profile/task contract", "declared risk/surface/platform/package/API/data/migration/infra/security evidence", "recoverable repo-relative file-count evidence", "live capability inventory", "BundleManifestV1/catalog/fallbacks", "effective config/selection/mapping", "validated SituationalRubricEvaluation", "safe roster overrides"],
+    "forbidden_inputs": ["token estimates", "time budgets/durations", "effort estimates", "heartbeat age", "worker-count guesses", "hidden heuristic multipliers", "credential presence", "hostname/name substring", "keywords or prose autonomy inference"],
+    "graph_rules": ["typed closed DAG", "stable slice_id", "exactly one owner", "typed IO", "declared read/write sets", "pairwise-disjoint writes except one declared fan-in owner", "manual-QA whole_stage=true and one sequential owner", "every dependency declared or completed external gate"],
+    "candidate_rule": "Each simultaneously ready independent slice produces exactly one candidate; role multiplicity comes only from capability labels and central lease caps. Ordered compatible fallback yields preferred, fallback, or typed unavailable/deferred; no generic substitute.",
+    "wave_rule": "Sort by mandatory risk, dependency-unblocking critical path, phase, stable UTF-8 slice_id. Admit while the central coordinator permits; retain every blocked candidate in the next cursor-ordered wave.",
+    "override_rule": "Apply roster_overrides after derivation as one atomic transformation; validate pool, caps, graph safety, mandatory roles, manual-QA, fan-in, D1 execution authorization, and all identity hashes. Any conflict rejects the entire set.",
+    "drift_rule": "Launch recomputes all six D2 plus three D3 identity components. Any mismatch refuses launch/resume, names each differing component, and creates an immutable new plan with old-to-new provenance."
+  },
+  "global_leases": {
+    "name": "GlobalLeaseCoordinator",
+    "scope": "one authoritative run-scoped coordinator shared by parent and nested teams through an opaque handle; no child counters",
+    "caps": {"global_active": 8, "per_role_active": 3, "manual_qa_active": 1, "fan_in_output_owner": 1},
+    "acquire": "One CAS over coordinator_generation validates run/plan/wave/candidate identity, execution policy, readiness, dependency, mandatory role, fan-in/manual-QA ownership and all counters before incrementing and creating LeaseRecord.",
+    "release": "Exact lease_id+generation+owner_dispatch_id and authoritative completed/terminal-failed/not_started-no-loss proof are required. Duplicate release is typed and zero-decrement; foreign/stale identity leaves counters unchanged.",
+    "saturation": "LEASE_CAP_EXCEEDED queues in deterministic wave order; it is not a drop or generic failure.",
+    "no_false_reclaim": "Heartbeat, TTL, silence, missing beacon, process age, or temporary artifact absence never releases an ambiguous lease; manual resolution records evidence before release."
+  },
+  "plan_lifecycle": [
+    {"from": "raw/typed input", "event": "parse and redaction", "to": "typed input", "guard": "versioned schema and AF-1 pre-parse measurement", "failure": "ARTIFACT_SIZE_EXCEEDED|SCHEMA_UNSUPPORTED"},
+    {"from": "typed input", "event": "legacy scan", "to": "legacy_rejected|rubric_pending", "guard": "LegacyTierScanner completes before ranking/planning", "failure": "LEGACY_TIER_UNSUPPORTED"},
+    {"from": "rubric_pending", "event": "validate rubric and bundle dimensions", "to": "rubric_bound", "guard": "exact core eight, evidence/rationale, namespace/version/hash rules", "failure": "RUBRIC_CORE_MISSING|RUBRIC_DIMENSION_INVALID|BUNDLE_DIMENSION_COLLISION"},
+    {"from": "rubric_bound", "event": "resolve and publish", "to": "effective_config_published", "guard": "state/ring/report atomic CAS", "failure": "EFFECTIVE_CONFIG_STATE_CAS_CONFLICT|EFFECTIVE_CONFIG_REDACTION_VIOLATION"},
+    {"from": "effective_config_published", "event": "validate graph/derive", "to": "proposed", "guard": "D2 graph, candidates, waves, nine identity components", "failure": "PLAN_GRAPH_INVALID|CAPABILITY_UNAVAILABLE|OVERRIDE_CONFLICT"},
+    {"from": "proposed", "event": "checkpoint/approve", "to": "checkpointed", "guard": "D1 floor/profile and plan proposal gates", "failure": "CHECKPOINT_UNRESOLVED|PLAN_PROPOSAL_REJECTED"},
+    {"from": "checkpointed", "event": "launch", "to": "launched_immutable", "guard": "recompute all identities and exact plan_hash; coordinator ready", "failure": "PLAN_STALE|RUBRIC_HASH_DRIFT|PLAN_IMMUTABLE|LEASE_COORDINATOR_UNAVAILABLE"},
+    {"from": "launched_immutable", "event": "admit wave", "to": "active|queued", "guard": "central atomic lease acquire", "failure": "LEASE_CAP_EXCEEDED queues; CAS/identity failure recovers"},
+    {"from": "active", "event": "terminal evidence", "to": "completed|deferred|unavailable", "guard": "host lifecycle, artifact, fan-in, manual-QA and lease release", "failure": "LEASE_NOT_TERMINAL|ARTIFACT_MISSING|FANIN_OWNER_INVALID"},
+    {"from": "any pre-resume", "event": "state/report validation", "to": "resumed|report_regenerated|re_resolve_required|manual_failure", "guard": "state authority and schema/generation/identity checks", "failure": "EFFECTIVE_CONFIG_STATE_MISSING|EFFECTIVE_CONFIG_STATE_CORRUPT"}
+  ],
+  "recovery": {
+    "effective_config": "Load only EffectiveConfigProvenanceState; validate schema, hash, one snapshot, ring order/capacity, generation, manifest/catalog/inventory/selection/mapping/fallback/rubric identities and plan identity. Missing/stale/corrupt authority fails closed and re-resolves before planning.",
+    "report": "Missing or stale report is projection work from valid state; regenerate deterministically and reattach. A finalized report is never mutated; a new state generation has a new report version.",
+    "logs": "Log absence, truncation, duplication, or corruption is tolerated and cannot affect resume or planning.",
+    "mapping": "Mapping generation/CAS drift invalidates the mapping, regenerates through the shared resolver, and records an invalidation/fallback event; stale writer cannot overwrite.",
+    "plan": "Old launched plan remains immutable. Any config, selection, mapping, manifest, inventory, rubric, core-dimension, bundle-dimension, graph, formula, or override drift creates a new versioned plan with old-to-new provenance.",
+    "leases_host": "Recover coordinator/lease ledger and host dispatch state. Started/unknown work retains lease until authoritative terminal/no-loss proof or manual resolution; no-proof-no-replay and recovery-first remain binding.",
+    "sandbox": "Revalidate grant schema/id/revocation/expiry, branch/worktree/session, config/inventory/selection identity, and positive target proof before ask-free continuation; mismatch/expiry/revoke defers remaining actions durably."
+  },
+  "events": {
+    "durable_authority": "Only EffectiveConfigEvent records of kind invalidation|fallback live in the per-run ring; they are part of the atomic state transaction and are not a standalone log.",
+    "ring_event_kinds": ["invalidation", "fallback"],
+    "telemetry_event_kinds": ["EFFECTIVE_CONFIG_RESOLVED", "EFFECTIVE_CONFIG_STATE_PUBLISHED", "EFFECTIVE_CONFIG_STATE_CAS_CONFLICT", "EFFECTIVE_CONFIG_RING_EVICTED", "EFFECTIVE_CONFIG_REPORT_REGENERATED", "EFFECTIVE_CONFIG_REPORT_STALE", "EFFECTIVE_CONFIG_RESUME_REJECTED", "EFFECTIVE_CONFIG_REDACTION_REJECTED", "EFFECTIVE_CONFIG_MAPPING_INVALIDATED", "LEGACY_TIER_REJECTED", "RUBRIC_VALIDATED", "RUBRIC_REJECTED", "BUNDLE_DIMENSION_ACCEPTED", "BUNDLE_DIMENSION_REJECTED", "RUBRIC_HASH_DRIFT", "WORKFLOW_PLAN_CREATED", "WORKFLOW_PLAN_STALE_REJECTED", "WORKFLOW_LEASE_ACQUIRED", "WORKFLOW_LEASE_RELEASED", "WORKFLOW_LEASE_QUEUED_CAP", "WORKFLOW_HOST_DISPATCH_STATE", "WORKFLOW_STEERING_QUEUED", "WORKFLOW_STEERING_REPLAY_BLOCKED", "WORKFLOW_RECOVERY_RESTORED", "WORKFLOW_ACTION_DEFERRED", "WORKFLOW_UNATTENDED_HANDOFF", "WORKFLOW_BEACON_EMITTED", "WORKFLOW_FANIN_RECONCILED"],
+    "required_telemetry_fields": ["event_id", "event_kind", "run_id", "state/plan generation", "snapshot/plan/selection/rubric identity refs", "seq when state event", "typed reason/error", "redacted provenance", "recorded_at"],
+    "telemetry_rule": "Telemetry is best-effort and may be absent; it is never read to fill state fields, choose a fallback, invalidate a mapping, repair a report, or authorize resume."
+  },
+  "errors": [
+    {"code": "EFFECTIVE_CONFIG_SCHEMA_UNSUPPORTED", "behavior": "Fail closed and re-resolve; no schema approximation."},
+    {"code": "EFFECTIVE_CONFIG_STATE_MISSING", "behavior": "No speculative resume; re-resolve before planning and require fresh authoritative publication."},
+    {"code": "EFFECTIVE_CONFIG_STATE_CORRUPT", "behavior": "Reject hash/schema/generation/ring inconsistency; report/log alone cannot recover authority."},
+    {"code": "EFFECTIVE_CONFIG_STATE_CAS_CONFLICT", "behavior": "Retry only against current generation with unchanged valid identity or fail closed; no partial publication."},
+    {"code": "EFFECTIVE_CONFIG_NON_ATOMIC_WRITE", "behavior": "Reject commit and expose no snapshot/ring/report mixture."},
+    {"code": "EFFECTIVE_CONFIG_REPORT_MISSING", "behavior": "Regenerate from valid state with recovery provenance."},
+    {"code": "EFFECTIVE_CONFIG_REPORT_STALE", "behavior": "State remains authority; regenerate or refuse finalization if consistency cannot be proven."},
+    {"code": "EFFECTIVE_CONFIG_IDENTITY_DRIFT", "behavior": "Name each changed identity and re-resolve/replan; never mutate old state/plan."},
+    {"code": "EFFECTIVE_CONFIG_REDACTION_VIOLATION", "behavior": "Reject or replace with opaque ID/hash before any durability boundary; raw value is not persisted."},
+    {"code": "EFFECTIVE_CONFIG_PATH_ESCAPE", "behavior": "Reject or opaque-reference absolute/home/traversal/outside/symlink-escaped path; never store raw path."},
+    {"code": "EFFECTIVE_CONFIG_LOG_NON_AUTHORITATIVE", "behavior": "Ignore log as authority and continue from state or fail closed if state is unavailable."},
+    {"code": "LEGACY_TIER_UNSUPPORTED", "behavior": "Stop before planning; return typed surface/schema/pointer/source and migration dimensions; no alias/preset/mapping/ranking/deprecation."},
+    {"code": "RUBRIC_SCHEMA_UNSUPPORTED", "behavior": "Fail closed before planning; no approximation."},
+    {"code": "RUBRIC_CORE_MISSING", "behavior": "Reject registry/evaluation when any of eight core dimensions is absent."},
+    {"code": "RUBRIC_CORE_DUPLICATE", "behavior": "Reject duplicate core dimension or duplicate evaluation entry."},
+    {"code": "RUBRIC_DIMENSION_INVALID", "behavior": "Reject missing/invalid scale, direction, evidence contract, or score."},
+    {"code": "RANKING_RATIONALE_MISSING", "behavior": "Reject evaluation without a non-empty per-dimension and aggregate rationale."},
+    {"code": "RANKING_RATIONALE_INCONSISTENT", "behavior": "Reject rationale hash that does not match scores, evidence, aggregation, and tie-break ordering."},
+    {"code": "BUNDLE_DIMENSION_NAMESPACE_COLLISION", "behavior": "Fail closed before planning with both owners/FQNs; no automatic rename, merge, or shadow."},
+    {"code": "BUNDLE_DIMENSION_CORE_OVERRIDE", "behavior": "Reject remove/rename/redefine/reweight/shadow/safety or checkpoint modification."},
+    {"code": "BUNDLE_DIMENSION_SCHEMA_DRIFT", "behavior": "Reject incompatible version/hash drift; require new selection/resume/plan identity."},
+    {"code": "RUBRIC_HASH_DRIFT", "behavior": "Reject launch/resume and create deterministic immutable replan with old/new hashes."},
+    {"code": "PLAN_SCHEMA_UNSUPPORTED", "behavior": "Fail closed; no approximation."},
+    {"code": "FORMULA_VERSION_UNSUPPORTED", "behavior": "Fail closed; no reinterpretation."},
+    {"code": "PLAN_GRAPH_INVALID", "behavior": "Reject cycle, dangling edge, overlapping write, missing owner/IO, duplicate fan-in owner, or manual-QA split."},
+    {"code": "PLAN_STALE", "behavior": "Reject launch and name changed D2/D3 identity dimensions."},
+    {"code": "PLAN_IMMUTABLE", "behavior": "Reject post-launch mutation; in-flight work remains bound to old plan."},
+    {"code": "OVERRIDE_CONFLICT", "behavior": "Reject entire override set with derived/pinned/provenance values."},
+    {"code": "CAPABILITY_UNAVAILABLE", "behavior": "Typed slice/capability/tried candidates; interactive failure or unattended durable defer; no generic substitution."},
+    {"code": "LEASE_CAP_EXCEEDED", "behavior": "Queue deterministically without oversubscription or drop."},
+    {"code": "LEASE_CAS_CONFLICT", "behavior": "Reread generation; no blind increment or release."},
+    {"code": "LEASE_IDENTITY_MISMATCH", "behavior": "Leave counters unchanged and enter recovery/manual path."},
+    {"code": "LEASE_ALREADY_RELEASED", "behavior": "Idempotent zero-decrement result."},
+    {"code": "LEASE_NOT_TERMINAL", "behavior": "Retain lease until authoritative proof/manual resolution."},
+    {"code": "NO_PROOF_NO_REPLAY", "behavior": "Loud manual resolution; never replay unknown/started/completed dispatch."},
+    {"code": "CHECKPOINT_UNRESOLVED", "behavior": "Ordinary advance blocks; unattended action is durable defer, never runtime ask."},
+    {"code": "ARTIFACT_SIZE_EXCEEDED", "behavior": "Pre-parse typed failure; no truncation/partial persist."},
+    {"code": "ENVIRONMENT_PROOF_FAILED", "behavior": "Unknown/ambiguous target fails closed and affected unattended action defers."},
+    {"code": "HANDOFF_PERSIST_FAILED", "behavior": "Loud terminal/manual error; never claim completion or poll."}
+  ],
+  "data_control_flows": [
+    {"id": "F1-command-autonomy", "steps": ["typed parse", "PHASE-0", "D1 checkpoint evaluation", "durable gate"], "failure": "Hints/aliases/legacy tier/task prose cannot alter autonomy or floor."},
+    {"id": "F2-effective-resolution", "steps": ["root/CWD once", "typed source chain", "LegacyTierScanner", "bundle/manifest/selection", "core rubric + bundle dimensions", "inventory/mapping/fallback", "redact/hash", "atomic state/ring/report", "telemetry"], "failure": "Any typed/schema/legacy/collision/redaction/CAS error fails closed."},
+    {"id": "F3-state-event-publication", "steps": ["read generation", "canonical redacted snapshot", "seq event", "evict min when full", "CAS generation", "atomic state/report commit", "emit telemetry"], "failure": "CAS conflict retries valid current identity or publishes nothing."},
+    {"id": "F4-resume", "steps": ["load state", "validate schema/hash/ring/generation/identities", "validate report if present", "regenerate missing/stale report", "validate D2/D3 plan identity", "resume or re-resolve"], "failure": "Missing/corrupt/stale authority fails closed; report/log alone never resumes."},
+    {"id": "F5-d3-preplanning", "steps": ["parse typed surfaces", "scan nested typed values", "reject legacy or produce migration dimensions", "validate core eight", "validate bundle dimensions", "compute rubric hashes", "bind selection/plan"], "failure": "No option ranking, mapping, alias, preset, or plan before success."},
+    {"id": "F6-d2-plan-lease", "steps": ["validate graph", "derive candidates", "fallback", "apply safe overrides", "form waves", "central lease CAS", "dispatch authorization", "fan-in/release"], "failure": "Saturation queues; no silent drop; host/sandbox policy remains authoritative."},
+    {"id": "F7-host-recovery", "steps": ["safe queue", "authoritative dispatch state", "proof-gated replay", "restore evidence", "same-stage resume", "manual resolution/handoff"], "failure": "No proof means no replay; active call is not interrupted by ordinary steering."},
+    {"id": "F8-sandbox", "steps": ["recursive action expansion", "positive environment proof", "grant/floor/profile evaluation", "pre-effect CAS", "defer before continue", "reachable continuation/handoff"], "failure": "Forbidden/ambiguous/expired/revoked/mismatched action fails closed and defers."
+    }
+  ],
+  "migration_order": [
+    {"phase": "M0-contracts-redaction", "actions": ["Add versioned D7 state/snapshot/event/report/identity and D3 scanner/rubric/dimension types.", "Add canonical serialization, strict redaction/path validation, typed errors/events, and state/report retention interfaces.", "Keep all existing D1/D2/host/sandbox/bundle contracts unchanged."], "rollback": "No behavior change; remove only unused additive consumers.", "decision_gates": []},
+    {"phase": "M1-shared-resolution-authority", "actions": ["Route engine and command entrypoints through one EffectiveConfigResolver.", "Remove duplicate config/mapping readers at the seam; preserve precedence and mapping CAS.", "Publish authoritative state/ring/report atomically; keep telemetry consumer-only."], "rollback": "Disable new consumers while retaining one resolver and diagnostics; never fall back to log authority.", "decision_gates": []},
+    {"phase": "M2-clean-legacy-cutover-rubric", "actions": ["Run LegacyTierScanner on typed config/input/state/output before planning.", "Reject legacy values with LEGACY_TIER_UNSUPPORTED and migration dimensions; do not add aliases, presets, mappings, ranking, or deprecation.", "Validate core eight-dimension registry, deterministic aggregation/rationale, and versioned namespaced bundle extensions."], "rollback": "No legacy compatibility rollback is permitted; correct typed inputs or fail closed. Other workflow behavior remains on prior core path.", "decision_gates": []},
+    {"phase": "M3-identity-bound-planner", "actions": ["Join rubric_hash/core_dimension_hash/bundle_dimension_schema_hash to selection, WorkDecompositionPlan, launch, and resume identity.", "Preserve D2 six hashes, graph, fallback, overrides, waves, central leases, fan-in, and immutable launch.", "Shadow/differential compare only the D2 static roster where already planned; never create a second production planner."], "rollback": "Disable dynamic-slice declarations per profile only; old plans remain immutable and diagnostics persist.", "decision_gates": []},
+    {"phase": "M4-recovery-observability-host-sandbox", "actions": ["Validate state/report on resume, regenerate missing/stale projection, fail closed on authority corruption.", "Wire ring overflow/CAS diagnostics and telemetry-only logs.", "Retain layered host queue/replay, D1 grant/proof/defer/handoff, AF-1, AF-2, and central lease recovery."], "rollback": "Keep recovery-first/no-proof-no-replay and interactive floor; never blind-cancel or trust logs.", "decision_gates": []},
+    {"phase": "M5-compatibility-rollout", "actions": ["Profiles without dynamic slices remain artifact-compatible; unsupported schemas fail closed.", "Verify finalized reports remain readable/retained independent of state/telemetry cleanup.", "Audit no legacy vocabulary on accepted typed surfaces and no duplicate resolver/planner/permission paths."], "rollback": "Create a new versioned plan/state; never mutate launched plan or finalized report and never reintroduce legacy aliases."
+    }
+  ],
+  "conditional_file_plan": {
+    "rule": "Conditions are technical seam availability only; DEC-3 and DEC-7 are final and create no open gate.",
+    "core": [
+      {"action": "modify", "path": "packages/core/src/engine/config.ts", "when": "existing config reader seam", "purpose": "EffectiveConfigResolver entrypoint; one root/CWD and typed source chain"},
+      {"action": "create", "path": "packages/core/src/engine/effective-config-provenance.ts", "when": "durable engine state module", "purpose": "Snapshot/state/event schemas, canonical hash, generation CAS, ring eviction"},
+      {"action": "create", "path": "packages/core/src/engine/effective-config-report.ts", "when": "run artifact/report writer seam", "purpose": "deterministic projection, finalization, retention, regeneration"},
+      {"action": "create", "path": "packages/core/src/engine/redaction.ts", "when": "all persistence/telemetry writers", "purpose": "path boundary, secret scan, opaque IDs, receipt"},
+      {"action": "modify", "path": "packages/core/src/engine/config-diagnostics.ts", "when": "existing diagnostics seam", "purpose": "typed D7/D3 errors and provenance without values"},
+      {"action": "create", "path": "packages/core/src/engine/legacy-tier-scanner.ts", "when": "typed pre-planning validation seam", "purpose": "schema-bounded recursive legacy scan"},
+      {"action": "create", "path": "packages/core/src/engine/situational-rubric.ts", "when": "core planning/ranking seam", "purpose": "core registry, exact eight dimensions, aggregation, rationale, hashes"},
+      {"action": "create", "path": "packages/core/src/engine/rubric-diagnostics.ts", "when": "planner diagnostics seam", "purpose": "collision, missing-core, drift, rationale failures"},
+      {"action": "modify", "path": "packages/core/src/engine/bundle-resolution.ts", "when": "shared selection seam", "purpose": "manifest/catalog/dimension validation and identity joins"},
+      {"action": "modify", "path": "packages/core/src/engine/agent-mapping.ts", "when": "mapping persistence seam", "purpose": "generation/CAS and mapping identity"},
+      {"action": "modify", "path": "packages/core/src/engine/workflow-contract.ts", "when": "shared type export seam", "purpose": "D1/D2/D3/D7 interfaces and versioned state transitions"},
+      {"action": "modify", "path": "packages/core/src/observability/events.ts", "when": "existing recorder", "purpose": "telemetry-only D7/D3 events and redaction"},
+      {"action": "modify", "path": "packages/core/src/engine/work-decomposition.ts", "when": "D2 plan identity seam", "purpose": "three D3 identity components in plan/selection/resume validation"}
+    ],
+    "fullstack": [
+      {"action": "modify", "path": "packages/fullstack/src/bundle-manifest.ts", "purpose": "versioned manifest and namespaced dimension declaration"},
+      {"action": "modify", "path": "packages/fullstack/src/role-catalog.ts", "purpose": "catalog identity and ordered fallback/dimension schema hash"},
+      {"action": "modify", "path": "packages/fullstack/src/bundle-resolution.ts", "purpose": "delegate all selection to core resolver"},
+      {"action": "modify", "path": "packages/fullstack/src/workflow-commands.ts", "purpose": "verified aliases and no copied ownership override"}
+    ],
+    "profiles_and_schemas": [
+      {"action": "modify", "path": "packages/core/workflows/_schema.json", "purpose": "versioned D7/D3 typed fields; remove legacy tier fields"},
+      {"action": "modify", "path": "packages/core/workflows/standard.json", "purpose": "retain prior behavior while using core rubric/resolver"},
+      {"action": "modify", "path": "packages/core/workflows/spec-preparation.json", "purpose": "retain artifact chain; no tier aliases"}
+    ],
+    "validation_files": [
+      {"action": "create/modify", "path": "packages/core/test/engine/effective-config-provenance.contract.test.ts", "purpose": "D7 state/ring/CAS/report/redaction oracles"},
+      {"action": "create/modify", "path": "packages/core/test/engine/legacy-tier-rubric.contract.test.ts", "purpose": "D3 typed scanner/rubric/bundle/hash/rationale oracles"},
+      {"action": "modify", "path": "packages/core/test/engine/plan-replay.contract.test.ts", "purpose": "D2 + D3 identity drift and resume"},
+      {"action": "modify", "path": "packages/core/test/engine/global-lease.contract.test.ts", "purpose": "preserved nested lease/CAS/race contracts"},
+      {"action": "modify", "path": "packages/fullstack/test/*.contract.test.ts", "purpose": "manifest/catalog/selection/claim compatibility"}
+    ]
+  },
+  "task_slices": [
+    {"id": "TS-00", "title": "Freeze shared vocabulary and versioned contracts", "owner": "core lead", "files": ["packages/core/src/engine/workflow-contract.ts", "packages/core/workflows/_schema.json"], "dependencies": [], "decision_prerequisites": [], "acceptance": ["all ten final and no open gate", "IC-1..IC-33 versioned", "D7 values hash-only and D3 no legacy compatibility path", "permission/autonomy never inferred from metadata"], "oracles": ["contract/schema review"]},
+    {"id": "TS-01", "title": "Preserve and extend D1 safety, dispatch, artifact-size, grant contracts", "owner": "core safety developer", "files": ["packages/core/src/gates/safety.ts", "packages/core/src/gates/dispatch.ts", "packages/core/src/gates/validation.ts", "packages/core/src/engine/stage.ts", "packages/core/src/engine/workflow-contract.ts"], "dependencies": ["TS-00"], "decision_prerequisites": [], "acceptance": ["exact five-class floor", "scoped grant never widens floor", "recursive action proof/defer", "AF-1 pre-parse/no partial persist"], "oracles": ["TO-01..TO-25", "TO-55"]},
+    {"id": "TS-02", "title": "Implement one EffectiveConfigResolver and source chain", "owner": "config-resolution developer", "files": ["packages/core/src/engine/config.ts", "packages/core/src/engine/config-diagnostics.ts", "packages/core/src/engine/bundle-resolution.ts", "packages/core/src/commands/do-work.ts", "packages/core/src/engine/effective-config-provenance.ts"], "dependencies": ["TS-00", "TS-01"], "decision_prerequisites": [], "acceptance": ["engine and commands call one resolver", "root/CWD read once", "source/effective config values never persisted", "all parse/missing/selection failures typed"], "oracles": ["TO-26 source-chain identity", "TO-28 log absence"]},
+    {"id": "TS-03", "title": "Implement D7 authoritative state, ring, CAS, report", "owner": "durable-state developer", "files": ["packages/core/src/engine/effective-config-provenance.ts", "packages/core/src/engine/effective-config-report.ts", "packages/core/src/engine/durable.ts", "packages/core/src/observability/events.ts"], "dependencies": ["TS-02"], "decision_prerequisites": [], "acceptance": ["one snapshot + latest32 ring", "atomic snapshot/event/report publication", "generation/CAS conflict handling", "event33 evicts exactly oldest", "finalized report independently retained"], "oracles": ["TO-27 ring overflow", "TO-29 CAS race", "TO-30 report missing/stale", "TO-31 state authority"]},
+    {"id": "TS-04", "title": "Enforce D7 redaction and path boundary", "owner": "security/observability developer", "files": ["packages/core/src/engine/redaction.ts", "packages/core/src/engine/effective-config-provenance.ts", "packages/core/src/engine/effective-config-report.ts", "packages/core/src/observability/recorder.ts", "packages/core/src/engine/durable.ts"], "dependencies": ["TS-02", "TS-03"], "decision_prerequisites": [], "acceptance": ["normalized in-project paths only", "outside/escape opaque", "no secrets/tokens/credentials/raw args/prompts/personal data in any serialized surface", "audit before every boundary"], "oracles": ["TO-32 malicious paths", "TO-33 secret scan"]},
+    {"id": "TS-05", "title": "Implement D3 typed LegacyTierScanner and migration dimensions", "owner": "core schema developer", "files": ["packages/core/src/engine/legacy-tier-scanner.ts", "packages/core/src/engine/config-diagnostics.ts", "packages/core/workflows/_schema.json"], "dependencies": ["TS-00", "TS-02"], "decision_prerequisites": [], "acceptance": ["typed config/input/state/output only", "nested/persisted values fail before planning", "error has typed pointer/schema/source/generation/replacement dimensions", "arbitrary prose does not match", "no alias/preset/mapping/ranking/deprecation"], "oracles": ["TO-34 nested legacy", "TO-35 prose non-match"]},
+    {"id": "TS-06", "title": "Implement core SituationalRubricRegistry and rationale", "owner": "core planning developer", "files": ["packages/core/src/engine/situational-rubric.ts", "packages/core/src/engine/rubric-diagnostics.ts", "packages/core/src/engine/workflow-contract.ts"], "dependencies": ["TS-05"], "decision_prerequisites": [], "acceptance": ["exact eight core dimensions", "versioned scale/direction/evidence", "deterministic fixed aggregation", "per-dimension and aggregate rationale required", "safety/checkpoint independent"], "oracles": ["TO-36 missing/duplicate core", "TO-37 rationale"]},
+    {"id": "TS-07", "title": "Validate namespaced bundle rubric dimensions", "owner": "bundle registration developer", "files": ["packages/fullstack/src/bundle-manifest.ts", "packages/fullstack/src/role-catalog.ts", "packages/core/src/engine/bundle-resolution.ts", "packages/core/src/engine/situational-rubric.ts"], "dependencies": ["TS-03", "TS-06"], "decision_prerequisites": [], "acceptance": ["FQN namespace/version/schema/scale/direction/evidence/hash", "collision/core override/version drift fail closed", "accepted schema hash deterministic", "manifest remains descriptive"], "oracles": ["TO-38 collision", "TO-39 incompatible/drift"]},
+    {"id": "TS-08", "title": "Join D3 identities to selection, WorkDecompositionPlan and resume", "owner": "planner/resolution developer", "files": ["packages/core/src/engine/bundle-resolution.ts", "packages/core/src/engine/work-decomposition.ts", "packages/core/src/engine/durable.ts", "packages/core/src/gates/dispatch.ts"], "dependencies": ["TS-03", "TS-06", "TS-07"], "decision_prerequisites": [], "acceptance": ["rubric_hash/core_dimension_hash/bundle_dimension_schema_hash in selection/plan/resume", "drift names every hash", "new immutable plan with old-to-new provenance"], "oracles": ["TO-40 rubric drift", "TO-41 selection/resume drift"]},
+    {"id": "TS-09", "title": "Implement D2 typed planner and waves", "owner": "planner developer", "files": ["packages/core/src/engine/shape-signals.ts", "packages/core/src/engine/roster-planner.ts", "packages/core/src/engine/work-decomposition.ts", "packages/core/src/engine/proposed-roster.ts", "packages/core/src/engine/stage.ts"], "dependencies": ["TS-02", "TS-08"], "decision_prerequisites": [], "acceptance": ["wdp-d2c-v1", "file counts evidence only", "one ready-slice candidate", "ordered fallback", "closed/disjoint graph", "deterministic non-dropping waves"], "oracles": ["TO-42..TO-47 preserved D2"]},
+    {"id": "TS-10", "title": "Preserve central run-wide leases and fan-in/manual-QA", "owner": "lifecycle/planner developer", "files": ["packages/core/src/engine/global-lease.ts", "packages/core/src/engine/peer-fan-in.ts", "packages/core/src/engine/work-decomposition.ts", "packages/core/src/engine/durable.ts"], "dependencies": ["TS-09"], "decision_prerequisites": [], "acceptance": ["one coordinator across nested teams", "8/3/1/1 caps", "CAS identity and no false reclaim", "single fan-in owner", "whole manual-QA"], "oracles": ["TO-48..TO-52 preserved D2 lease suite"]},
+    {"id": "TS-11", "title": "Wire telemetry-only observability and redacted summaries", "owner": "observability developer", "files": ["packages/core/src/observability/events.ts", "packages/core/src/observability/hooks.ts", "packages/core/src/observability/recorder.ts", "packages/core/src/observability/session-summary.ts"], "dependencies": ["TS-03", "TS-04", "TS-10"], "decision_prerequisites": [], "acceptance": ["logs can be absent without authority loss", "events have identity/seq/error/redacted refs", "metrics expose ring/CAS/report/rubric/lease outcomes"], "oracles": ["TO-28, TO-30, TO-33, TO-53"]},
+    {"id": "TS-12", "title": "Integrate layered host steering and state-aware recovery", "owner": "core lifecycle + host owner", "files": ["packages/core/src/engine/coordination.ts", "packages/core/src/engine/recovery.ts", "packages/core/src/engine/stage.ts"], "dependencies": ["TS-03", "TS-10", "TS-11"], "decision_prerequisites": [], "acceptance": ["safe queue and urgent abort distinct", "at-most-once not_started replay", "no-proof manual", "beacon absence no cancel", "state/report validated on resume"], "oracles": ["TO-01..TO-25", "TO-54"]},
+    {"id": "TS-13", "title": "Preserve SandboxGrant proof/defer/handoff over shared state", "owner": "core safety/lifecycle developer", "files": ["packages/core/src/engine/environment-proof.ts", "packages/core/src/gates/safety.ts", "packages/core/src/engine/durable.ts", "packages/core/src/engine/stage.ts"], "dependencies": ["TS-08", "TS-12"], "decision_prerequisites": [], "acceptance": ["recursive target proof", "floor/out-of-scope/unknown/expiry/revocation mismatch defer before continue", "reachable work/handoff", "no second policy"], "oracles": ["TO-15..TO-25"]},
+    {"id": "TS-14", "title": "Compatibility-first profile rollout and clean cutover", "owner": "workflow profile/release developer", "files": ["packages/core/workflows/_schema.json", "packages/core/workflows/standard.json", "packages/core/workflows/spec-preparation.json", ".omp-plugin/marketplace.json"], "dependencies": ["TS-05", "TS-08", "TS-12", "TS-13"], "decision_prerequisites": [], "acceptance": ["non-dynamic profiles retain artifact chains", "legacy tier surfaces removed rather than aliased", "unsupported schemas fail closed", "report retention independent"], "oracles": ["TO-55 compatibility/rollback"]},
+    {"id": "TS-15", "title": "Cross-layer contract and regression evidence", "owner": "QA/integration developer", "files": ["packages/core/test/engine/*.contract.test.ts", "packages/fullstack/test/*.contract.test.ts", "host-harness test repository"], "dependencies": ["TS-01", "TS-04", "TS-07", "TS-08", "TS-10", "TS-12", "TS-13", "TS-14"], "decision_prerequisites": [], "acceptance": ["REQ-1..REQ-61 and prior contracts covered", "D7/D3 adversarial oracles observable in state/events/typed outcomes", "architecture stage itself runs no tests"], "oracles": ["TO-01..TO-55"]},
+    {"id": "TS-16", "title": "Narrow independent slices and dynamic composition", "owner": "decomposition planner developer", "files": ["packages/core/src/engine/work-decomposition.ts", "packages/core/src/engine/roster-planner.ts", "packages/core/src/engine/proposed-roster.ts"], "dependencies": ["TS-09", "TS-10"], "decision_prerequisites": [], "acceptance": ["risk/surface evidence changes boundaries/capabilities only", "no token/time/file multiplier", "no dropped ready slice"], "oracles": ["TO-43, TO-45, TO-46"]},
+    {"id": "TS-17", "title": "Typed peer contribution and attributed fan-in", "owner": "coordination developer", "files": ["packages/core/src/engine/peer-fan-in.ts", "packages/core/src/engine/coordination.ts"], "dependencies": ["TS-10", "TS-11"], "decision_prerequisites": [], "acceptance": ["ordered/idempotent findings", "one output owner/reconciler", "no sibling write or permission transfer"], "oracles": ["TO-51"]},
+    {"id": "TS-18", "title": "Runtime safe-boundary progress beacons", "owner": "progress/observability developer", "files": ["packages/core/src/engine/progress-beacon.ts", "packages/core/src/engine/coordination.ts", "packages/core/src/observability/events.ts"], "dependencies": ["TS-10", "TS-11"], "decision_prerequisites": [], "acceptance": ["monotonic safe-boundary beacon", "missed evidence diagnostic", "active call untouched", "no polling/cancel/replay"], "oracles": ["TO-18, TO-54"]},
+    {"id": "TS-19", "title": "Whole sequential manual-QA ownership", "owner": "workflow contract/planner developer", "files": ["packages/core/src/engine/workflow-contract.ts", "packages/core/src/engine/work-decomposition.ts", "packages/core/src/engine/stage.ts"], "dependencies": ["TS-09", "TS-10"], "decision_prerequisites": [], "acceptance": ["one owner/checklist/transcript", "split rejected before dispatch", "whole recovery/gate"], "oracles": ["TO-52"]},
+    {"id": "TS-20", "title": "Host capability binding", "owner": "host platform owner + main session", "files": ["host-harness exact queue/state/abort integration", "packages/core/src/engine/coordination.ts"], "dependencies": ["TS-11", "TS-12"], "decision_prerequisites": [], "acceptance": ["runtime evidence selects queue/guarded/manual mode", "no inferred proof", "same parent/peer path", "abort distinct"], "oracles": ["TO-54"]},
+    {"id": "TS-21", "title": "D2 adversarial replay/replan/starvation suite", "owner": "architecture/integration test developer", "files": ["packages/core/test/engine/roster-planner.contract.test.ts", "packages/core/test/engine/global-lease.contract.test.ts", "packages/core/test/engine/plan-replay.contract.test.ts"], "dependencies": ["TS-08", "TS-10", "TS-16", "TS-19"], "decision_prerequisites": [], "acceptance": ["nested oversubscription, CAS/ABA, saturation, fallback, stale hash, override, manual-QA/fan-in, starvation all falsifiable"], "oracles": ["TO-42..TO-52"]},
+    {"id": "TS-22", "title": "D7 adversarial authority/ring/report/redaction suite", "owner": "architecture/integration test developer", "files": ["packages/core/test/engine/effective-config-provenance.contract.test.ts", "packages/core/test/engine/effective-config-report.contract.test.ts", "packages/core/test/engine/config-redaction.contract.test.ts"], "dependencies": ["TS-03", "TS-04", "TS-11", "TS-12"], "decision_prerequisites": [], "acceptance": ["ring overflow, CAS race, report missing/stale, log absence, state corruption, malicious/outside paths, secret scanning"], "oracles": ["TO-27..TO-33"]},
+    {"id": "TS-23", "title": "D3 adversarial cutover/rubric/dimension suite", "owner": "architecture/integration test developer", "files": ["packages/core/test/engine/legacy-tier-rubric.contract.test.ts", "packages/fullstack/test/bundle-dimensions.contract.test.ts", "packages/core/test/engine/plan-replay.contract.test.ts"], "dependencies": ["TS-05", "TS-06", "TS-07", "TS-08"], "decision_prerequisites": [], "acceptance": ["nested/persisted legacy rejection, prose non-match, missing/duplicate core, missing rationale, collision, incompatible/drift hashes, immutable replan"], "oracles": ["TO-34..TO-41"]}
+  ],
+  "test_strategy": {
+    "architecture_stage_validation": "No build, lint, or project test run in architecture stage; implementers/QA own later evidence.",
+    "observable_contract": "Each oracle inspects typed result/error plus durable state/report/event output; it does not inspect source text or incidental timing."
+    ,"oracles": [
+      {"id": "TO-27", "oracle": "After 33 valid invalidation/fallback events, authoritative ring contains exactly seq 2..33 in order, length 32, seq 1 is atomically absent, current snapshot is not mixed, and report/state generation is coherent."},
+      {"id": "TO-28", "oracle": "Delete/truncate/reorder telemetry logs; valid state still resumes/plans identically. Missing log never supplies a field or changes fallback/invalidation."},
+      {"id": "TO-29", "oracle": "Two writers with one expected generation race; exactly one CAS commits, loser sees typed conflict/retries only current valid identity, and no mixed snapshot/ring/report is observable."},
+      {"id": "TO-30", "oracle": "Valid state with missing finalized report regenerates byte-identical report, reattaches it, records recovery, and keeps state authority; stale/mismatched report is diagnosed and regenerated or finalization refuses."},
+      {"id": "TO-31", "oracle": "Missing/corrupt state fails closed; a report or telemetry log alone cannot resume or authorize planning; stale authority causes re-resolution before planning."},
+      {"id": "TO-32", "oracle": "Absolute/home/traversal/symlink-escape/outside path is rejected or replaced by a stable opaque ID/hash; normalized in-project path is deterministic and only repo-relative."},
+      {"id": "TO-33", "oracle": "Serialized state/report/ring/event/telemetry/error fixtures contain no plaintext secret, credential, capability/dispatch/advance token, raw args, unrelated prompt, personal content, or reversible outside source; redaction audit runs before write."},
+      {"id": "TO-34", "oracle": "Top-level, nested, and persisted typed legacy values stop before planning with LEGACY_TIER_UNSUPPORTED, typed surface/schema/pointer/source/generation, and all eight replacement dimensions; no old value is accepted."},
+      {"id": "TO-35", "oracle": "Legacy strings in untyped prompt/rationale/comment/free-form prose do not trigger LegacyTierScanner and cannot alter selection/ranking."},
+      {"id": "TO-36", "oracle": "A rubric missing any core dimension, containing a duplicate, or using unsupported registry/schema fails before planning with typed diagnostics."},
+      {"id": "TO-37", "oracle": "Missing per-dimension evidence/rationale, missing aggregate rationale, or inconsistent rationale hash fails; valid evaluation has exactly eight scores and byte-stable deterministic aggregate/ranking rationale."},
+      {"id": "TO-38", "oracle": "Two bundles with the same FQN or a bundle colliding with a core dimension fail closed with both identities; no rename, merge, shadow, or fallback changes semantics."},
+      {"id": "TO-39", "oracle": "Missing namespace/schema/scale/direction/evidence/hash, incompatible version, or changed dimension hash fails closed before planning; accepted bundle schema hash is sorted/deterministic."},
+      {"id": "TO-40", "oracle": "Changing rubric_hash, core_dimension_hash, or bundle_dimension_schema_hash after planning refuses launch/resume, names every drift, preserves old plan, and creates a new immutable plan with old-to-new provenance."},
+      {"id": "TO-41", "oracle": "Selection identity and resume identity contain all three D3 hashes; changing a dimension cannot silently reselect, mutate, or resume an old plan."},
+      {"id": "TO-42", "oracle": "Identical D2+D3 canonical inputs produce byte-identical graph, candidates, waves, all identity hashes, and plan_hash."},
+      {"id": "TO-43", "oracle": "Token/time/effort/heartbeat/hidden multiplier inputs are rejected; changing permitted file-count evidence without changing typed graph/capabilities leaves slot counts identical."},
+      {"id": "TO-44", "oracle": "Ten ready slices with three leases admit first three by mandatory-risk, critical-path, phase, slice_id and retain seven in exact queue order; release admits next and no slice drops."},
+      {"id": "TO-45", "oracle": "Ordered fallback chooses first compatible available candidate; exhaustion names slice/capability/tried candidates and produces unavailable/deferred, never generic substitution."},
+      {"id": "TO-46", "oracle": "Unsafe override (pool/cap/graph/mandatory/manual-QA/fan-in) rejects atomically with derived/pinned values; safe override applies exactly."},
+      {"id": "TO-47", "oracle": "Plan launch recomputes six D2 plus three D3 identity components; any drift rejects stale launch and post-launch mutation returns immutable-plan error."},
+      {"id": "TO-48", "oracle": "Nested parent/child acquisition never exceeds global 8 or role 3; child cannot create private coordinator or release parent lease."},
+      {"id": "TO-49", "oracle": "Concurrent acquire/release/ABA races yield one active lease, one decrement, typed CAS/identity diagnostics, and duplicate release zero effect."},
+      {"id": "TO-50", "oracle": "Heartbeat, TTL, silence, missing beacon, process age, and temporary artifact absence alone never reclaim ambiguous lease; terminal/not_started-no-loss proof or manual resolution is required."},
+      {"id": "TO-51", "oracle": "Two fan-in owners or unordered/duplicate peer contribution fails; one attributed reconciler owns output, and sibling cannot write or transfer permission."},
+      {"id": "TO-52", "oracle": "Manual-QA split fails before dispatch; one whole sequential owner/checklist/transcript and one lease are retained through recovery."},
+      {"id": "TO-53", "oracle": "Every D7/D3 and prior event/metric is redacted, has stable identity/typed reason, and reports state generation/seq where applicable; telemetry absence does not alter state."},
+      {"id": "TO-54", "oracle": "Host queue delivers regular steering only at safe boundary; urgent abort is distinct; accepted is not not_started; one replay requires trustworthy proof; no-proof path is manual and active calls are untouched."},
+      {"id": "TO-55", "oracle": "Profiles without dynamic slices retain prior artifact chains; unsupported schemas fail closed; finalized report remains readable/addressable after telemetry/state cleanup; D3 legacy alias/preset/deprecation does not exist."}
+    ],
+    "preserved_oracles": "TO-01..TO-25 from the prior architecture remain mandatory for ownership/selection/manifest/PHASE-0, D1 floor, steering/recovery, mapping, AF-1, AF-2, sandbox proof/defer/handoff, and artifact contracts."
+  },
+  "observability": {
+    "authority": "State and finalized report are authoritative/projection surfaces; logs are telemetry-only.",
+    "canonical_surface": "packages/core/src/observability/*",
+    "required_fields": ["run/session/project opaque refs", "state/plan/coordinator generations", "snapshot/report/plan/selection/mapping/rubric identities", "event seq/kind where applicable", "ring length/evicted seq", "fallback/invalidation/rationale/error codes", "lease/wave/dispatch lifecycle", "grant/proof/defer/handoff refs", "redaction receipt/audit hash"],
+    "metrics": ["effective_resolutions", "state_cas_conflicts", "non_atomic_write_failures", "ring_length", "ring_evictions", "report_regenerations/stale/missing", "authority_corruptions", "redaction_rejections/replacements", "legacy_rejections", "rubric_validation_failures", "dimension_collisions/drift", "rationale_failures", "plan_stale/replan", "active_global_leases <=8", "active_by_role <=3", "manual_qa <=1", "fan_in_owner_conflicts", "queue_depth/cursor", "no_proof/manual resolutions", "deferred/unavailable slices", "recovery/evidence-lost counts"],
+    "alerts": ["counter invariant breach", "partial/non-atomic state write", "ring seq/order/capacity violation", "state/report hash mismatch at finalization", "unredacted value or failed audit", "legacy value reaching planner", "core rubric missing/duplicate", "dimension collision or drift accepted", "plan hash drift at launch", "lease release without authoritative identity", "heartbeat/TTL reclaim", "slice absent from admitted+queued+terminal partition", "host replay without not_started proof"],
+    "query_surface": "Read-only run summary joins state/report refs with telemetry and labels missing history as lost; it never reconstructs authority from telemetry."
+  },
+  "traceability": {
+    "requirements_to_slices": {"REQ-1..REQ-6": ["TS-01", "TS-09", "TS-13"], "REQ-7..REQ-11": ["TS-07", "TS-09", "TS-10", "TS-16"], "REQ-12..REQ-18": ["TS-05", "TS-06", "TS-07", "TS-14"], "REQ-19..REQ-23": ["TS-02", "TS-03", "TS-04", "TS-11"], "REQ-24..REQ-32": ["TS-11", "TS-12", "TS-13", "TS-20"], "REQ-33..REQ-36": ["TS-09", "TS-10", "TS-16", "TS-17", "TS-18", "TS-19"], "REQ-37..REQ-44": ["TS-01", "TS-09", "TS-12", "TS-13"], "REQ-45..REQ-51": ["TS-09", "TS-10", "TS-16", "TS-21"], "REQ-52..REQ-57": ["TS-02", "TS-03", "TS-04", "TS-11", "TS-22"], "REQ-58..REQ-61": ["TS-05", "TS-06", "TS-07", "TS-08", "TS-23"]},
+    "decision_to_slices": {"DEC-1": ["TS-01", "TS-09", "TS-12", "TS-13", "TS-14", "TS-15"], "DEC-2": ["TS-09", "TS-10", "TS-16", "TS-21"], "DEC-3": ["TS-05", "TS-06", "TS-07", "TS-08", "TS-14", "TS-23"], "DEC-4": ["TS-02", "TS-07", "TS-14"], "DEC-5": ["TS-02", "TS-07", "TS-14"], "DEC-6": ["TS-11", "TS-12", "TS-13", "TS-18"], "DEC-7": ["TS-02", "TS-03", "TS-04", "TS-08", "TS-11", "TS-22"], "DEC-8": ["TS-02", "TS-07", "TS-08", "TS-14"], "DEC-9": ["TS-10", "TS-12", "TS-13", "TS-20"], "DEC-10": ["TS-07", "TS-08", "TS-09", "TS-14"]},
+    "invariants": {"INV-22": "resolver sole authority; state/report from one result; logs telemetry", "INV-23": "one snapshot + latest32 monotonic ring; atomic CAS/eviction", "INV-24": "report deterministic hash-bound immutable projection", "INV-25": "strict redaction before every durability boundary", "INV-26": "typed legacy values fail before planning and are never mapped/ranked", "INV-27": "core owns eight dimensions; bundle additions are namespaced/non-overriding", "INV-28": "rubric/dimension hashes bind plan and resume; drift fails closed", "INV-1..INV-21": "preserved by the prior D1/D2/bundle/host/sandbox architecture"},
+    "lifecycle": ["LC-20 atomic resolver publication", "LC-21 event33 eviction", "LC-22 finalized report retention", "LC-23 state-first resume", "LC-24 pre-planning legacy rejection/rubric identity", "prior LC-1..LC-19 preserved"],
+    "security": ["SEC-9 strict D7 path/secret boundary", "SEC-10 no cross-project reversible provenance", "SEC-11 D3 metadata never grants permission", "SEC-12 hash drift fails closed", "prior SEC-1..SEC-8 preserved"]
+  },
+  "risks": [
+    {"id": "R-D7-authority", "risk": "A duplicate reader or non-atomic writer could create mixed provenance.", "mitigation": "One resolver/result type, one state CAS unit, state-first resume tests, no log repair, explicit generation/hash invariants."},
+    {"id": "R-D7-redaction", "risk": "Paths/secrets leak through diagnostic or telemetry side channels.", "mitigation": "Central pre-boundary redactor, opaque outside refs, serialized secret/path audit over state/report/event/log/error fixtures."},
+    {"id": "R-D3-cutover", "risk": "A compatibility alias/preset or scanner keyword search silently revives legacy tiers.", "mitigation": "Typed-schema-only scanner, no alias/preset/deprecation code path, prose non-match oracle, accepted-surface vocabulary audit."},
+    {"id": "R-D3-rubric", "risk": "Bundle metadata changes core policy or ranking without rationale.", "mitigation": "Core-owned exact eight registry, fixed aggregation, FQN/version/schema/scale/direction/evidence/hash validation, collision/drift fail closed, rationale hash."},
+    {"id": "R-identity-drift", "risk": "Plan/selection/resume uses stale rubric or mapping.", "mitigation": "Join all D2+D3 identities, recompute at launch/resume, immutable old plan and deterministic old-to-new replan."},
+    {"id": "R-preserved-runtime", "risk": "New provenance work accidentally widens D1 or changes host/lease/sandbox semantics.", "mitigation": "Component boundaries and preserved contracts are explicit; D1/D2/host/sandbox oracles remain mandatory and metadata has no authority."}
+  ],
+  "rollback": {
+    "state": "Never mutate launched plan, accepted immutable snapshot history, or finalized report. A corrected input creates a new state generation/plan with parent provenance.",
+    "d7": "If report projection fails, retain valid state and regenerate; if state publication is non-atomic/corrupt, fail closed and re-resolve. Never fall back to logs.",
+    "d3": "There is no rollback to legacy aliases/presets/mappings/ranking/deprecation. Correct the typed input or stop before planning.",
+    "runtime": "Disable only an additive dynamic-slice/profile consumer where necessary; retain one core resolver, D1 floor, D2 static compatibility path, central lease recovery, host no-proof-no-replay, and sandbox deferral."
+  },
+  "open_decisions": [],
+  "blocking_gaps": [],
+  "missing_contracts": [],
+  "genuine_blocker": false,
+  "verdict": "implementation_ready",
+  "decision_guard": "All ten decisions are final, no open gates remain, and every conditional reference to DEC-3/DEC-7 has been replaced by binding implementation work."
+}
