@@ -160,6 +160,19 @@ function options(fetch: typeof globalThis.fetch, overrides: Record<string, unkno
   };
 }
 
+function directSttRequest(init: RequestInit): { model: string; input_audio: { data: string; format: "wav" } } {
+  const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(body).sort(), ["input_audio", "model"]);
+  assert.equal(typeof body.model, "string");
+  const inputAudio = body.input_audio;
+  assert.ok(inputAudio && typeof inputAudio === "object" && !Array.isArray(inputAudio));
+  const envelope = inputAudio as Record<string, unknown>;
+  assert.deepEqual(Object.keys(envelope).sort(), ["data", "format"]);
+  assert.equal(envelope.format, "wav");
+  assert.equal(typeof envelope.data, "string");
+  return { model: body.model as string, input_audio: { data: envelope.data as string, format: "wav" } };
+}
+
 function asrRequest(overrides: Partial<LectureAcquisitionRequest["limits"]> = {}): LectureAcquisitionRequest {
   return {
     ...request,
@@ -182,13 +195,14 @@ test("WAV chunk walking accepts ffmpeg-pipe sentinel RIFF/data with LIST at offs
 
   const audio = streamedAudio(fixture.bytes, 5);
   const dataBytes: number[] = [];
-  const fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: Array<{ input_audio: { data: string } }> }> };
-    const wav = new Uint8Array(Buffer.from(body.messages[0]!.content[0]!.input_audio.data, "base64"));
+  const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(String(input), "https://openrouter.ai/api/v1/audio/transcriptions");
+    const body = directSttRequest(init!);
+    assert.equal(body.model, "nvidia/nemotron-3.5-asr-streaming-multilingual-0.6b");
+    const wav = new Uint8Array(Buffer.from(body.input_audio.data, "base64"));
     const chunkView = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
     dataBytes.push(chunkView.getUint32(40, true));
-    const duration = chunkView.getUint32(40, true) / 32_000;
-    return new Response(JSON.stringify({ segments: [{ id: "chunk", text: "ok", start_seconds: 0, end_seconds: duration }] }), { status: 200 });
+    return new Response(JSON.stringify({ text: "ok" }), { status: 200 });
   };
   const result = await new OpenRouterNativeAsr(options(fetch)).transcribe(audio, source, asrRequest(), new AbortController().signal);
   assert.equal(audio.openCount, 1);

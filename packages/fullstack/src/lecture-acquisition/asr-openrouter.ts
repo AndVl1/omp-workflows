@@ -3,7 +3,6 @@ import { Readable } from "node:stream";
 import { DEFAULT_ACQUISITION_LIMITS, HARD_ACQUISITION_LIMITS, normalizeTimestampedTranscriptSegments } from "@andvl1/omp-workflows-core";
 import { endpointWithPath, validateEndpoint, type ValidatedEndpoint } from "./endpoint-policy.js";
 import { AcquisitionProviderError, classifyProviderHttpStatus, readBoundedResponseText, safeProviderError } from "./provider-errors.js";
-import { normalizeAsrResponse } from "./asr.js";
 import { parseWavPrelude as parseSharedWavPrelude, readWavMetadata, readWavStructureAt, WavAbortError, WavParseError, type ParsedWavPrelude, type WavPositionalReader } from "./wav.js";
 import { ownReadable } from "./readable-lifecycle.js";
 
@@ -128,6 +127,11 @@ function nonRetryableProviderError(error: unknown): AcquisitionProviderError {
     retryable: false,
     ...(sanitized.status === undefined ? {} : { status: sanitized.status }),
   });
+}
+
+function classifyOpenRouterHttpStatus(status: number): AcquisitionProviderError {
+  if (status === 400) return providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR rejected the request", status);
+  return classifyProviderHttpStatus(OPENROUTER_NATIVE_ASR_PROVIDER, status);
 }
 
 function timeoutError(): AcquisitionProviderError {
@@ -262,20 +266,31 @@ async function readBoundedAudio(audio: EphemeralAudio, maxBytes: number, signal:
   return output;
 }
 
+function preparedDurationForAudio(audio: EphemeralAudio): number | undefined {
+  if (audio.durationSeconds === undefined) return undefined;
+  const duration = positiveFinite(audio.durationSeconds);
+  if (duration === undefined) throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR prepared audio has no usable duration");
+  return duration;
+}
+
 function responseDuration(payload: JsonRecord, audio: EphemeralAudio, maxDurationSeconds: number): number {
-  const preparedDuration = positiveFinite(audio.durationSeconds);
+  const preparedDuration = preparedDurationForAudio(audio);
   const usage = record(payload.usage) ? positiveFinite(payload.usage.seconds) : undefined;
-  const duration = preparedDuration !== undefined && usage !== undefined
-    ? Math.min(preparedDuration, usage)
-    : preparedDuration ?? usage;
+  if (usage !== undefined && usage > maxDurationSeconds) throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR returned an oversized duration");
+  const duration = preparedDuration ?? usage;
   if (duration === undefined || duration > maxDurationSeconds) throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR returned no usable duration");
   return duration;
 }
 
 function parseUsage(payload: JsonRecord): ParsedUsage | undefined {
   if (!record(payload.usage)) return undefined;
-  const seconds = positiveFinite(payload.usage.seconds);
-  const costUsd = nonNegativeFinite(payload.usage.cost);
+  const hasSeconds = Object.prototype.hasOwnProperty.call(payload.usage, "seconds");
+  const hasCost = Object.prototype.hasOwnProperty.call(payload.usage, "cost");
+  const seconds = hasSeconds ? positiveFinite(payload.usage.seconds) : undefined;
+  const costUsd = hasCost ? nonNegativeFinite(payload.usage.cost) : undefined;
+  if ((hasSeconds && seconds === undefined) || (hasCost && costUsd === undefined)) {
+    throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR returned invalid usage");
+  }
   return seconds === undefined && costUsd === undefined ? undefined : {
     ...(seconds === undefined ? {} : { seconds }),
     ...(costUsd === undefined ? {} : { costUsd }),
@@ -297,66 +312,6 @@ function splitBoundedText(text: string, maxCharacters: number): string[] {
     offset = end;
   }
   return chunks;
-}
-
-function splitProviderSegments(payload: JsonRecord, maxChunkCharacters: number): JsonRecord {
-  if (!Array.isArray(payload.segments)) return payload;
-  const output: unknown[] = [];
-  for (const item of payload.segments) {
-    if (!record(item) || typeof item.text !== "string") {
-      output.push(item);
-      continue;
-    }
-    const text = item.text.trim();
-    if (text.length <= maxChunkCharacters) {
-      output.push(item);
-      continue;
-    }
-    const startSeconds = typeof item.start_seconds === "number" ? item.start_seconds : item.start;
-    const endSeconds = typeof item.end_seconds === "number" ? item.end_seconds : item.end;
-    if (
-      typeof startSeconds !== "number" ||
-      typeof endSeconds !== "number" ||
-      !Number.isFinite(startSeconds) ||
-      !Number.isFinite(endSeconds) ||
-      startSeconds < 0 ||
-      endSeconds <= startSeconds
-    ) {
-      // Leave malformed timestamps for normalizeAsrResponse to reject; never
-      // invent boundaries just to fit the core segment limit.
-      output.push(item);
-      continue;
-    }
-    const chunks = splitBoundedText(text, maxChunkCharacters);
-    const splitItems: JsonRecord[] = [];
-    let consumedCharacters = 0;
-    let valid = true;
-    for (const [index, chunk] of chunks.entries()) {
-      const chunkStart = startSeconds + (endSeconds - startSeconds) * consumedCharacters / text.length;
-      consumedCharacters += chunk.length;
-      const chunkEnd = index === chunks.length - 1
-        ? endSeconds
-        : startSeconds + (endSeconds - startSeconds) * consumedCharacters / text.length;
-      if (!Number.isFinite(chunkStart) || !Number.isFinite(chunkEnd) || chunkEnd <= chunkStart) {
-        valid = false;
-        break;
-      }
-      const split: JsonRecord = { ...item, text: chunk };
-      if ("start_seconds" in item) split.start_seconds = chunkStart;
-      if ("end_seconds" in item) split.end_seconds = chunkEnd;
-      if (!("start_seconds" in item) && "start" in item) split.start = chunkStart;
-      if (!("end_seconds" in item) && "end" in item) split.end = chunkEnd;
-      const providerId = typeof item.id === "string" ? item.id : undefined;
-      if (providerId !== undefined && index > 0) {
-        const suffix = `-${index}`;
-        split.id = providerId.length + suffix.length <= 128 ? `${providerId}${suffix}` : `segment-${index}`;
-      }
-      splitItems.push(split);
-    }
-    if (valid && splitItems.length === chunks.length) output.push(...splitItems);
-    else output.push(item);
-  }
-  return { ...payload, segments: output };
 }
 
 /**
@@ -414,38 +369,6 @@ export function estimateOpenRouterTimestampedSegments(
   }
 }
 
-function validateProviderSegments(
-  result: { segments: TimestampedTranscriptSegment[] },
-  durationSeconds: number,
-  maxChunkCharacters: number,
-): void {
-  for (const segment of result.segments) {
-    if (
-      segment.text.length > maxChunkCharacters ||
-      segment.startSeconds < 0 ||
-      segment.endSeconds <= segment.startSeconds ||
-      segment.endSeconds > durationSeconds
-    ) {
-      throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR returned unbounded timestamps");
-    }
-  }
-}
-
-function chatCompletionText(payload: JsonRecord): string {
-  if (!Array.isArray(payload.choices) || payload.choices.length === 0) throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR returned no chat completion choices");
-  const first = payload.choices[0];
-  if (!record(first) || !record(first.message)) throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR returned no chat completion message");
-  const content = first.message.content;
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content) || content.length === 0) throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR returned no chat completion text");
-  let extracted = "";
-  for (const part of content) {
-    if (!record(part) || typeof part.text !== "string" || (part.type !== undefined && part.type !== "text")) throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR returned an invalid chat completion text part");
-    extracted += part.text;
-  }
-  return extracted;
-}
-
 function parseResponse(
   text: string,
   audio: EphemeralAudio,
@@ -454,6 +377,7 @@ function parseResponse(
   durationOverride?: number,
   maxSegmentsOverride?: number,
   maxCharactersOverride?: number,
+  maxDurationOverride?: number,
 ): ParsedResponse {
   let payload: unknown;
   try {
@@ -465,31 +389,13 @@ function parseResponse(
   const maxSegments = maxSegmentsOverride ?? options.maxSegments;
   const maxCharacters = maxCharactersOverride ?? options.maxTranscriptCharacters;
   const parsedUsage = parseUsage(payload);
-  if (Array.isArray(payload.segments) && payload.segments.length > 0) {
-    let normalized;
-    try {
-      normalized = normalizeAsrResponse(splitProviderSegments(payload, effectiveChunkCharacters(options.maxChunkCharacters)), {
-        provider: OPENROUTER_NATIVE_ASR_PROVIDER,
-        model,
-        maxCharacters,
-        maxSegments,
-      });
-    } catch (error) {
-      if (error instanceof AcquisitionProviderError) throw error;
-      throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR returned invalid segments");
-    }
-    const duration = durationOverride ?? responseDuration(payload, audio, options.maxDurationSeconds ?? OPENROUTER_NATIVE_ASR_MAX_DURATION_SECONDS);
-    validateProviderSegments(normalized, duration, effectiveChunkCharacters(options.maxChunkCharacters));
-    const segments = normalized.segments.map((segment) => ({ ...segment, timestampSource: "provider" as const }));
-    return { provider: OPENROUTER_NATIVE_ASR_PROVIDER, model, segments, timestampMode: "provider", ...(parsedUsage === undefined ? {} : { parsedUsage }) };
-  }
-  const transcriptText = "choices" in payload
-    ? chatCompletionText(payload)
-    : typeof payload.text === "string"
-      ? payload.text
-      : undefined;
+  const transcriptText = typeof payload.text === "string" ? payload.text : undefined;
   if (transcriptText === undefined) throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR returned no transcript text");
-  const duration = durationOverride ?? responseDuration(payload, audio, options.maxDurationSeconds ?? OPENROUTER_NATIVE_ASR_MAX_DURATION_SECONDS);
+  const maxDurationSeconds = maxDurationOverride ?? options.maxDurationSeconds ?? OPENROUTER_NATIVE_ASR_MAX_DURATION_SECONDS;
+  if (parsedUsage?.seconds !== undefined && parsedUsage.seconds > maxDurationSeconds) {
+    throw providerError("INVALID_PROVIDER_RESPONSE", "OpenRouter ASR returned an oversized duration");
+  }
+  const duration = durationOverride ?? responseDuration(payload, audio, maxDurationSeconds);
   const segments = estimateOpenRouterTimestampedSegments(transcriptText, duration, {
     maxCharacters,
     maxSegments,
@@ -504,13 +410,7 @@ function requestBody(bytes: Uint8Array, model: string, maxRequestBytes: number):
   const inputAudio = Buffer.from(bytes).toString("base64");
   const body = JSON.stringify({
     model,
-    messages: [{
-      role: "user",
-      content: [{
-        type: "input_audio",
-        input_audio: { data: inputAudio, format: "wav" },
-      }],
-    }],
+    input_audio: { data: inputAudio, format: "wav" },
   });
   if (Buffer.byteLength(body, "utf8") > maxRequestBytes) throw providerError("LIMIT_EXCEEDED", "OpenRouter ASR request exceeds the configured bound");
   return body;
@@ -556,9 +456,13 @@ function maxProviderCostForRequest(request: LectureAcquisitionRequest): number {
 }
 
 function maxDurationForRequest(request: LectureAcquisitionRequest, options: OpenRouterNativeAsrOptions): number {
-  const value = options.maxDurationSeconds ?? request.limits.maxDurationSeconds ?? OPENROUTER_NATIVE_ASR_MAX_DURATION_SECONDS;
-  if (!Number.isFinite(value) || value <= 0 || value > OPENROUTER_NATIVE_ASR_MAX_DURATION_SECONDS) throw providerError("LIMIT_EXCEEDED", "OpenRouter ASR duration exceeds the configured bound");
-  return value;
+  const configured = [options.maxDurationSeconds, request.limits.maxDurationSeconds];
+  for (const value of configured) {
+    if (value !== undefined && (!Number.isFinite(value) || value <= 0 || value > OPENROUTER_NATIVE_ASR_MAX_DURATION_SECONDS)) {
+      throw providerError("LIMIT_EXCEEDED", "OpenRouter ASR duration exceeds the configured bound");
+    }
+  }
+  return Math.min(...configured.filter((value): value is number => value !== undefined), OPENROUTER_NATIVE_ASR_MAX_DURATION_SECONDS);
 }
 
 function maxSegmentsForRequest(request: LectureAcquisitionRequest, options: OpenRouterNativeAsrOptions): number | undefined {
@@ -612,7 +516,7 @@ async function fetchChunk(
     let response: Response;
     try {
       response = await Promise.race([
-        Promise.resolve().then(() => fetchImpl(endpointWithPath(endpoint, "/chat/completions"), {
+        Promise.resolve().then(() => fetchImpl(endpointWithPath(endpoint, "/audio/transcriptions"), {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
           body,
@@ -625,7 +529,7 @@ async function fetchChunk(
       if (signal.aborted || timedOut || controller.signal.aborted) throw timeoutError();
       throw nonRetryableProviderError(error);
     }
-    if (!response.ok) throw nonRetryableProviderError(classifyProviderHttpStatus(OPENROUTER_NATIVE_ASR_PROVIDER, response.status));
+    if (!response.ok) throw nonRetryableProviderError(classifyOpenRouterHttpStatus(response.status));
     try {
       return await Promise.race([
         readBoundedResponseText(response, maxResponseBytes, OPENROUTER_NATIVE_ASR_PROVIDER),
@@ -704,15 +608,24 @@ export class OpenRouterNativeAsr implements LectureAsrPort {
     const totalAudioLimit = maxAudioBytesForRequest(request);
     if (!Number.isInteger(audio.sizeBytes) || audio.sizeBytes < 0 || audio.sizeBytes > totalAudioLimit) throw providerError("LIMIT_EXCEEDED", "OpenRouter ASR audio exceeds the configured lease bound");
     checkAbort(signal);
+    const maxDurationSeconds = maxDurationForRequest(request, this.options);
+    const maxProviderCostCents = maxProviderCostForRequest(request);
+    const preparedDuration = preparedDurationForAudio(audio);
+    if (preparedDuration !== undefined && preparedDuration > maxDurationSeconds) {
+      throw providerError("LIMIT_EXCEEDED", "OpenRouter ASR audio exceeds the configured duration bound");
+    }
+    if (preparedDuration !== undefined && estimatedCostCents(preparedDuration) > maxProviderCostCents) {
+      throw providerError("LIMIT_EXCEEDED", "OpenRouter ASR request plan exceeds the configured provider budget");
+    }
 
-    // Preserve the existing one-shot path exactly for small prepared fixtures and
+    // Use the one-shot path for small prepared fixtures and
     // real short leases. It deliberately does not require a WAV parser.
     if (audio.sizeBytes <= this.maxInputBytes) {
       const bytes = await readBoundedAudio(audio, this.maxInputBytes, signal);
       const body = requestBody(bytes, this.model, this.maxRequestBytes);
       let response: Response;
       try {
-        response = await this.fetchImpl(endpointWithPath(this.endpoint, "/chat/completions"), {
+        response = await this.fetchImpl(endpointWithPath(this.endpoint, "/audio/transcriptions"), {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
           body,
@@ -723,24 +636,28 @@ export class OpenRouterNativeAsr implements LectureAsrPort {
         if (signal.aborted) throw timeoutError();
         throw safeProviderError(this.id, error);
       }
-      if (!response.ok) throw classifyProviderHttpStatus(this.id, response.status);
+      if (!response.ok) throw classifyOpenRouterHttpStatus(response.status);
       const responseText = await readBoundedResponseText(response, this.options.maxResponseBytes, this.id);
-      const parsed = parseResponse(responseText, audio, this.options, this.model);
-      const duration = positiveFinite(audio.durationSeconds) ?? parsed.parsedUsage?.seconds;
+      const parsed = parseResponse(responseText, audio, this.options, this.model, undefined, undefined, undefined, maxDurationSeconds);
+      const duration = preparedDuration ?? parsed.parsedUsage?.seconds;
+      const estimatedSeconds = Math.max(duration ?? 0, parsed.parsedUsage?.seconds ?? 0);
+      const estimatedCost = estimatedCostCents(estimatedSeconds);
+      const providerCost = parsed.parsedUsage?.costUsd === undefined ? undefined : Math.ceil(parsed.parsedUsage.costUsd * 100);
+      if (Math.max(estimatedCost, providerCost ?? 0) > maxProviderCostCents) {
+        throw providerError("LIMIT_EXCEEDED", "OpenRouter ASR provider budget was exceeded");
+      }
       return {
         provider: parsed.provider,
         model: parsed.model,
         segments: parsed.segments,
         timestampMode: parsed.timestampMode,
-        ...(duration === undefined && parsed.parsedUsage === undefined ? {} : {
-          usage: {
-            requests: 1,
-            requestedAudioSeconds: duration ?? 0,
-            estimatedCostCents: estimatedCostCents(Math.max(duration ?? 0, parsed.parsedUsage?.seconds ?? 0)),
-            ...(parsed.parsedUsage?.seconds === undefined ? {} : { reportedAudioSeconds: parsed.parsedUsage.seconds }),
-            ...(parsed.parsedUsage?.costUsd === undefined ? {} : { providerCostCents: Math.ceil(parsed.parsedUsage.costUsd * 100) }),
-          },
-        }),
+        usage: {
+          requests: 1,
+          requestedAudioSeconds: duration ?? 0,
+          estimatedCostCents: estimatedCost,
+          ...(parsed.parsedUsage?.seconds === undefined ? {} : { reportedAudioSeconds: parsed.parsedUsage.seconds }),
+          ...(providerCost === undefined ? {} : { providerCostCents: providerCost }),
+        },
       };
     }
 
@@ -749,8 +666,6 @@ export class OpenRouterNativeAsr implements LectureAsrPort {
     if (maxFramesByRequest < 1) throw providerError("LIMIT_EXCEEDED", "OpenRouter ASR request envelope cannot hold one PCM frame");
     const framesPerChunk = Math.min(this.chunkDurationSeconds * OPENROUTER_NATIVE_ASR_SAMPLE_RATE, maxFramesByRequest);
     const maxChunks = maxChunksForRequest(request);
-    const maxDurationSeconds = maxDurationForRequest(request, this.options);
-    const maxProviderCostCents = maxProviderCostForRequest(request);
     const maxSegments = maxSegmentsForRequest(request, this.options);
     const maxCharacters = maxCharactersForRequest(request, this.options);
     const deadlineAt = requestDeadlineAt(request);
@@ -783,7 +698,6 @@ export class OpenRouterNativeAsr implements LectureAsrPort {
       hasProviderCost: false,
     };
     const segments: TimestampedTranscriptSegment[] = [];
-    let allProviderTimestamps = true;
     let parsedWav: ParsedWavPrelude | undefined;
     let totalCharacters = 0;
 
@@ -807,7 +721,7 @@ export class OpenRouterNativeAsr implements LectureAsrPort {
         const chunkDurationSeconds = chunkFrames / OPENROUTER_NATIVE_ASR_SAMPLE_RATE;
         const remainingCharacters = maxCharacters - totalCharacters;
         if (remainingCharacters < 1) throw providerError("LIMIT_EXCEEDED", "OpenRouter ASR transcript exceeds the configured bound");
-        const parsed = parseResponse(responseText, audio, this.options, this.model, chunkDurationSeconds, maxSegments === undefined ? undefined : maxSegments - segments.length, remainingCharacters);
+        const parsed = parseResponse(responseText, audio, this.options, this.model, chunkDurationSeconds, maxSegments === undefined ? undefined : maxSegments - segments.length, remainingCharacters, maxDurationSeconds);
         if (maxSegments !== undefined && segments.length + parsed.segments.length > maxSegments) throw providerError("LIMIT_EXCEEDED", "OpenRouter ASR transcript exceeds the configured segment bound");
         const chunkStartSeconds = startFrame / OPENROUTER_NATIVE_ASR_SAMPLE_RATE;
         const chunkEndSeconds = (startFrame + chunkFrames) / OPENROUTER_NATIVE_ASR_SAMPLE_RATE;
@@ -823,7 +737,6 @@ export class OpenRouterNativeAsr implements LectureAsrPort {
           });
         }
         totalCharacters += parsed.segments.reduce((sum, segment) => sum + segment.text.length, 0);
-        allProviderTimestamps = allProviderTimestamps && parsed.timestampMode === "provider";
         mergeUsage(aggregate, chunkDurationSeconds, parsed.parsedUsage);
         const observedCost = Math.max(estimatedCostCents(aggregate.estimatedAudioSeconds), aggregate.hasProviderCost ? Math.ceil(aggregate.providerCostUsd * 100) : 0);
         if (observedCost > maxProviderCostCents) throw providerError("LIMIT_EXCEEDED", "OpenRouter ASR provider budget was exceeded");
@@ -849,7 +762,7 @@ export class OpenRouterNativeAsr implements LectureAsrPort {
         provider: OPENROUTER_NATIVE_ASR_PROVIDER,
         model: this.model,
         segments: indexed.map(({ segment }) => segment),
-        timestampMode: allProviderTimestamps ? "provider" : "estimated",
+        timestampMode: "estimated",
         usage: {
           requests: aggregate.requests,
           requestedAudioSeconds: aggregate.requestedAudioSeconds,

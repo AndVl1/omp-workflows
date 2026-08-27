@@ -77,6 +77,19 @@ function options(fetch: typeof globalThis.fetch, env: Record<string, string | un
     fetch,
   };
 }
+
+function directSttRequest(init: RequestInit): { model: string; input_audio: { data: string; format: "wav" } } {
+  const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(body).sort(), ["input_audio", "model"]);
+  assert.equal(typeof body.model, "string");
+  const inputAudio = body.input_audio;
+  assert.ok(inputAudio && typeof inputAudio === "object" && !Array.isArray(inputAudio));
+  const envelope = inputAudio as Record<string, unknown>;
+  assert.deepEqual(Object.keys(envelope).sort(), ["data", "format"]);
+  assert.equal(envelope.format, "wav");
+  assert.equal(typeof envelope.data, "string");
+  return { model: body.model as string, input_audio: { data: envelope.data as string, format: "wav" } };
+}
 function asciiBytes(value: string): Uint8Array {
   return Uint8Array.from(value, (character) => character.charCodeAt(0));
 }
@@ -171,7 +184,7 @@ function chunkRequest(overrides: Partial<LectureAcquisitionRequest["limits"]> = 
   };
 }
 
-test("OpenRouter native ASR sends the bounded chat-completions JSON/base64 request shape", async () => {
+test("OpenRouter native ASR sends the bounded direct STT JSON/base64 request shape", async () => {
   const audioBytes = new Uint8Array([0, 1, 2, 255]);
   const audio = fakeAudio(audioBytes, 2);
   const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -181,32 +194,84 @@ test("OpenRouter native ASR sends the bounded chat-completions JSON/base64 reque
   };
   const result = await new OpenRouterNativeAsr(options(fetch)).transcribe(audio, source, request, new AbortController().signal);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0]!.url, "https://openrouter.ai/api/v1/chat/completions");
+  assert.equal(calls[0]!.url, "https://openrouter.ai/api/v1/audio/transcriptions");
   assert.equal(calls[0]!.init.method, "POST");
   assert.equal(calls[0]!.init.redirect, "error");
   const headers = new Headers(calls[0]!.init.headers);
   assert.equal(headers.get("content-type"), "application/json");
   assert.equal(headers.get("authorization"), "Bearer test-key");
-  const body = JSON.parse(String(calls[0]!.init.body)) as {
-    model: string;
-    messages: Array<{
-      role: string;
-      content: Array<{ type: string; input_audio: { data: string; format: string } }>;
-    }>;
-    input_audio?: unknown;
-  };
+  const body = directSttRequest(calls[0]!.init);
   assert.equal(body.model, OPENROUTER_NATIVE_ASR_MODEL);
-  assert.equal(body.messages.length, 1);
-  assert.equal(body.messages[0]!.role, "user");
-  assert.equal(body.messages[0]!.content.length, 1);
-  const part = body.messages[0]!.content[0]!;
-  assert.equal(part.type, "input_audio");
-  assert.equal(part.input_audio.format, "wav");
-  assert.deepEqual(new Uint8Array(Buffer.from(part.input_audio.data, "base64")), audioBytes);
-  assert.ok(!part.input_audio.data.startsWith("data:"));
-  assert.equal(body.input_audio, undefined);
+  assert.equal(body.input_audio.format, "wav");
+  assert.deepEqual(new Uint8Array(Buffer.from(body.input_audio.data, "base64")), audioBytes);
+  assert.ok(!body.input_audio.data.startsWith("data:"));
+  assert.ok(Buffer.byteLength(String(calls[0]!.init.body), "utf8") <= 4_096);
   assert.equal(result.provider, OPENROUTER_NATIVE_ASR_PROVIDER);
   assert.equal(result.model, OPENROUTER_NATIVE_ASR_MODEL);
+});
+
+test("OpenRouter short ASR rejects known audio cost above a zero budget before fetch", async () => {
+  const audio = fakeAudio(new Uint8Array([1, 2, 3]), 1);
+  let fetchCount = 0;
+  const fetch = async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({ text: "never" }), { status: 200 });
+  };
+  await assert.rejects(
+    new OpenRouterNativeAsr(options(fetch)).transcribe(
+      audio,
+      source,
+      { ...request, limits: { ...request.limits, maxProviderCostCents: 0 } },
+      new AbortController().signal,
+    ),
+    (error: unknown) => error instanceof AcquisitionProviderError && error.code === "LIMIT_EXCEEDED" && !error.retryable,
+  );
+  assert.equal(fetchCount, 0);
+  assert.equal(audio.openCount, 0);
+});
+
+test("OpenRouter short ASR rejects known audio above the tighter request duration before fetch", async () => {
+  const audio = fakeAudio(new Uint8Array([1, 2, 3]), 10);
+  let fetchCount = 0;
+  const fetch = async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({ text: "never" }), { status: 200 });
+  };
+  await assert.rejects(
+    new OpenRouterNativeAsr({ ...options(fetch), maxDurationSeconds: 8 }).transcribe(
+      audio,
+      source,
+      { ...request, limits: { ...request.limits, maxDurationSeconds: 5 } },
+      new AbortController().signal,
+    ),
+    (error: unknown) => error instanceof AcquisitionProviderError && error.code === "LIMIT_EXCEEDED" && !error.retryable,
+  );
+  assert.equal(fetchCount, 0);
+  assert.equal(audio.openCount, 0);
+});
+
+test("OpenRouter short ASR keeps known prepared duration when provider usage underreports it", async () => {
+  const audio = fakeAudio(new Uint8Array([1, 2, 3]), 4_000);
+  const fetch = async () => new Response(JSON.stringify({ text: "known duration", usage: { seconds: 1 } }), { status: 200 });
+  const result = await new OpenRouterNativeAsr(options(fetch)).transcribe(audio, source, request, new AbortController().signal);
+  assert.equal(result.segments.at(-1)?.endSeconds, 4_000);
+  assert.equal(result.usage?.requestedAudioSeconds, 4_000);
+  assert.equal(result.usage?.reportedAudioSeconds, 1);
+  assert.equal(result.usage?.estimatedCostCents, 2);
+});
+
+test("OpenRouter short ASR rejects provider cost overflow after its single response", async () => {
+  const audio = fakeAudio(new Uint8Array([1, 2, 3]), 1);
+  let fetchCount = 0;
+  const fetch = async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify({ text: "provider cost", usage: { seconds: 1, cost: 100 } }), { status: 200 });
+  };
+  await assert.rejects(
+    new OpenRouterNativeAsr(options(fetch)).transcribe(audio, source, request, new AbortController().signal),
+    (error: unknown) => error instanceof AcquisitionProviderError && error.code === "LIMIT_EXCEEDED" && !error.retryable,
+  );
+  assert.equal(fetchCount, 1);
 });
 
 test("missing OpenRouter key fails before opening audio or fetching", async () => {
@@ -259,49 +324,32 @@ test("text-only OpenRouter response maps to bounded estimated monotonic windows"
   assert.equal(result.segments.at(-1)?.endSeconds, 6);
 });
 
-test("chat-completions OpenRouter responses map string and text-part content to bounded estimated windows", async () => {
+test("direct STT text responses map long transcripts to bounded estimated windows", async () => {
   const audioBytes = new Uint8Array([4, 5, 6]);
   const transcript = "x".repeat(OPENROUTER_NATIVE_ASR_MAX_SEGMENT_CHARACTERS + 1);
-  const responses: unknown[] = [
-    { choices: [{ message: { content: transcript } }] },
-    {
-      choices: [{
-        message: {
-          content: [
-            { type: "text", text: transcript.slice(0, 4_096) },
-            { type: "text", text: transcript.slice(4_096) },
-          ],
-        },
-      }],
-    },
-  ];
-  for (const payload of responses) {
-    const fetch = async () => new Response(JSON.stringify(payload), { status: 200 });
-    const result = await new OpenRouterNativeAsr({
-      ...options(fetch),
-      maxResponseBytes: 20_000,
-      maxTranscriptCharacters: transcript.length + 1,
-      maxChunkCharacters: 12_000,
-      maxSegments: 4,
-    }).transcribe(fakeAudio(audioBytes, 8), source, request, new AbortController().signal);
-    assert.equal(result.timestampMode, "estimated");
-    assert.ok(result.segments.length >= 2);
-    assert.ok(result.segments.every((segment) =>
-      segment.text.length <= OPENROUTER_NATIVE_ASR_MAX_SEGMENT_CHARACTERS
-      && segment.timestampSource === "estimated"
-      && segment.confidence === 0
-      && segment.endSeconds <= 8,
-    ));
-    assert.equal(result.segments.at(-1)?.endSeconds, 8);
-  }
+  const fetch = async () => new Response(JSON.stringify({ text: transcript, usage: { seconds: 8 } }), { status: 200 });
+  const result = await new OpenRouterNativeAsr({
+    ...options(fetch),
+    maxResponseBytes: 20_000,
+    maxTranscriptCharacters: transcript.length + 1,
+    maxChunkCharacters: 12_000,
+    maxSegments: 4,
+  }).transcribe(fakeAudio(audioBytes, 8), source, request, new AbortController().signal);
+  assert.equal(result.timestampMode, "estimated");
+  assert.ok(result.segments.length >= 2);
+  assert.ok(result.segments.every((segment) =>
+    segment.text.length <= OPENROUTER_NATIVE_ASR_MAX_SEGMENT_CHARACTERS
+    && segment.timestampSource === "estimated"
+    && segment.confidence === 0
+    && segment.endSeconds <= 8,
+  ));
+  assert.equal(result.segments.at(-1)?.endSeconds, 8);
 });
 
-test("OpenRouter native ASR clamps oversized configured chunks and splits provider text within the core bound", async () => {
+test("OpenRouter native ASR clamps oversized configured chunks and splits direct STT text within the core bound", async () => {
   const audio = fakeAudio(new Uint8Array([7, 8, 9]), 4);
   const text = "x".repeat(OPENROUTER_NATIVE_ASR_MAX_SEGMENT_CHARACTERS + 1);
-  const fetch = async () => new Response(JSON.stringify({
-    segments: [{ id: "provider-segment", text, start_seconds: 0, end_seconds: 4 }],
-  }), { status: 200 });
+  const fetch = async () => new Response(JSON.stringify({ text }), { status: 200 });
   const result = await new OpenRouterNativeAsr({
     ...options(fetch),
     maxChunkCharacters: 12_000,
@@ -309,10 +357,10 @@ test("OpenRouter native ASR clamps oversized configured chunks and splits provid
     maxResponseBytes: 20_000,
     maxSegments: 4,
   }).transcribe(audio, source, request, new AbortController().signal);
-  assert.equal(result.timestampMode, "provider");
+  assert.equal(result.timestampMode, "estimated");
   assert.equal(result.segments.length, 2);
   assert.ok(result.segments.every((segment) => segment.text.length <= OPENROUTER_NATIVE_ASR_MAX_SEGMENT_CHARACTERS));
-  assert.ok(result.segments.every((segment) => segment.timestampSource === "provider"));
+  assert.ok(result.segments.every((segment) => segment.timestampSource === "estimated"));
   assert.equal(result.segments[0]?.startSeconds, 0);
   assert.equal(result.segments.at(-1)?.endSeconds, 4);
   assert.ok(result.segments[0]!.endSeconds <= result.segments[1]!.startSeconds);
@@ -323,23 +371,21 @@ test("OpenRouter native ASR clamps oversized configured chunks and splits provid
   );
 });
 
-test("OpenRouter provider segments honor a configured chunk bound below the hard ceiling", async () => {
+test("OpenRouter direct STT text honors a configured chunk bound below the hard ceiling", async () => {
   const audio = fakeAudio(new Uint8Array([7, 8, 9]), 4);
   const text = "x".repeat(6_000);
-  const fetch = async () => new Response(JSON.stringify({
-    segments: [{ id: "provider-segment", text, start_seconds: 0, end_seconds: 4 }],
-  }), { status: 200 });
+  const fetch = async () => new Response(JSON.stringify({ text }), { status: 200 });
   const result = await new OpenRouterNativeAsr({
     ...options(fetch),
     maxChunkCharacters: 4_000,
     maxTranscriptCharacters: 10_000,
     maxSegments: 2,
   }).transcribe(audio, source, request, new AbortController().signal);
-  assert.equal(result.timestampMode, "provider");
+  assert.equal(result.timestampMode, "estimated");
   assert.equal(result.segments.length, 2);
   assert.equal(result.segments.reduce((total, segment) => total + segment.text.length, 0), text.length);
   assert.ok(result.segments.every((segment) => segment.text.length <= 4_000));
-  assert.ok(result.segments.every((segment) => segment.timestampSource === "provider"));
+  assert.ok(result.segments.every((segment) => segment.timestampSource === "estimated"));
   assert.equal(result.segments[0]?.startSeconds, 0);
   assert.equal(result.segments.at(-1)?.endSeconds, 4);
   for (let index = 1; index < result.segments.length; index += 1) {
@@ -362,13 +408,6 @@ test("missing duration, malformed response, and oversized response are sanitized
   const malformed = async () => new Response("not-json", { status: 200 });
   await assert.rejects(
     new OpenRouterNativeAsr(options(malformed)).transcribe(fakeAudio(new Uint8Array([1]), 1), source, request, new AbortController().signal),
-    (error: unknown) => error instanceof AcquisitionProviderError && error.code === "INVALID_PROVIDER_RESPONSE",
-  );
-  const malformedChat = async () => new Response(JSON.stringify({
-    choices: [{ message: { content: [{ type: "audio", data: "not-text" }] } }],
-  }), { status: 200 });
-  await assert.rejects(
-    new OpenRouterNativeAsr(options(malformedChat)).transcribe(fakeAudio(new Uint8Array([1]), 1), source, request, new AbortController().signal),
     (error: unknown) => error instanceof AcquisitionProviderError && error.code === "INVALID_PROVIDER_RESPONSE",
   );
   const huge = async () => new Response("123456789", { status: 200 });
@@ -543,10 +582,15 @@ test("OpenRouter chunk mode canonicalizes sequential WAV envelopes and preserves
   const fixture = pcmWav(48_000);
   const audio = streamedAudio(fixture.bytes, 11);
   const sent: Uint8Array[] = [];
-  const fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: Array<{ input_audio: { data: string } }> }> };
-    const wav = new Uint8Array(Buffer.from(body.messages[0]!.content[0]!.input_audio.data, "base64"));
+  const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(String(input), "https://openrouter.ai/api/v1/audio/transcriptions");
+    const body = directSttRequest(init!);
+    assert.equal(body.model, OPENROUTER_NATIVE_ASR_MODEL);
+    const encodedAudio = body.input_audio.data;
+    assert.equal(typeof encodedAudio, "string");
+    const wav = new Uint8Array(Buffer.from(encodedAudio!, "base64"));
     sent.push(wav);
+    assert.ok(Buffer.byteLength(String(init?.body), "utf8") <= 100_000);
     const view = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
     assert.equal(String.fromCharCode(...wav.subarray(0, 4)), "RIFF");
     assert.equal(String.fromCharCode(...wav.subarray(8, 12)), "WAVE");
@@ -557,7 +601,7 @@ test("OpenRouter chunk mode canonicalizes sequential WAV envelopes and preserves
     assert.equal(view.getUint32(24, true), 16_000);
     assert.equal(view.getUint16(32, true), 2);
     assert.equal(view.getUint16(34, true), 16);
-    return new Response(JSON.stringify({ segments: [{ id: "repeat", text: "chunk", start_seconds: 0, end_seconds: view.getUint32(40, true) / 32_000 }] }), { status: 200 });
+    return new Response(JSON.stringify({ text: "chunk" }), { status: 200 });
   };
   const result = await new OpenRouterNativeAsr(chunkOptions(fetch)).transcribe(audio, source, chunkRequest(), new AbortController().signal);
   assert.equal(audio.openCount, 1);
@@ -572,7 +616,7 @@ test("OpenRouter chunk mode canonicalizes sequential WAV envelopes and preserves
   }
   assert.deepEqual(recovered, fixture.pcm);
   assert.equal(result.usage?.requests, 3);
-  assert.equal(result.timestampMode, "provider");
+  assert.equal(result.timestampMode, "estimated");
   assert.deepEqual(result.segments.map((segment) => segment.segmentId), ["chunk-0-segment-0", "chunk-1-segment-0", "chunk-2-segment-0"]);
   assert.deepEqual(result.segments.map((segment) => [segment.startSeconds, segment.endSeconds]), [[0, 1], [1, 2], [2, 3]]);
 });
@@ -648,7 +692,7 @@ test("OpenRouter mid-sequence provider usage overrun is atomic and never retried
     fetchCount += 1;
     return fetchCount === 1
       ? new Response(JSON.stringify({ text: "first chunk" }), { status: 200 })
-      : new Response(JSON.stringify({ text: "second chunk", usage: { seconds: 1e9 } }), { status: 200 });
+      : new Response(JSON.stringify({ text: "second chunk", usage: { seconds: 1, cost: 100 } }), { status: 200 });
   };
   let result: unknown;
   await assert.rejects(
@@ -756,6 +800,7 @@ test("OpenRouter aggregate transcript bounds fail closed before a subsequent req
 
 test("OpenRouter native ASR maps provider HTTP statuses onto the sanitized failure taxonomy", async () => {
   const expectations = [
+    { status: 400, code: "INVALID_PROVIDER_RESPONSE", retryable: false },
     { status: 401, code: "PROVIDER_AUTH_MISSING", retryable: false },
     { status: 403, code: "MEDIA_NOT_ACCESSIBLE", retryable: false },
     { status: 404, code: "MEDIA_NOT_ACCESSIBLE", retryable: false },
@@ -830,9 +875,11 @@ test("OpenRouter chunk mode streams consumed PCM without retaining chunk buffers
     async dispose() {},
   };
   const payloads: string[] = [];
-  const fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: Array<{ input_audio: { data: string } }> }> };
-    payloads.push(body.messages[0]!.content[0]!.input_audio.data);
+  const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(String(input), "https://openrouter.ai/api/v1/audio/transcriptions");
+    const body = directSttRequest(init!);
+    assert.equal(body.model, OPENROUTER_NATIVE_ASR_MODEL);
+    payloads.push(body.input_audio.data);
     return new Response(JSON.stringify({ text: "ok" }), { status: 200 });
   };
   const result = await new OpenRouterNativeAsr(chunkOptions(fetch)).transcribe(audio, source, chunkRequest(), new AbortController().signal);
@@ -892,11 +939,13 @@ test("OpenRouter target plan uses 93 bounded requests for 4182 seconds without a
   } satisfies EphemeralAudio & { openCount: number; maxYieldBytes: number };
   let fetchCount = 0;
   const dataBytes: number[] = [];
-  const fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+  const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     fetchCount += 1;
+    assert.equal(String(input), "https://openrouter.ai/api/v1/audio/transcriptions");
     assert.ok(Buffer.byteLength(String(init?.body), "utf8") <= 2_000_000);
-    const envelope = JSON.parse(String(init?.body)) as { messages: Array<{ content: Array<{ input_audio: { data: string } }> }> };
-    const wav = Buffer.from(envelope.messages[0]!.content[0]!.input_audio.data, "base64");
+    const envelope = directSttRequest(init!);
+    assert.equal(envelope.model, OPENROUTER_NATIVE_ASR_MODEL);
+    const wav = Buffer.from(envelope.input_audio.data, "base64");
     dataBytes.push(new DataView(wav.buffer, wav.byteOffset, wav.byteLength).getUint32(40, true));
     return new Response(JSON.stringify({ text: "ok" }), { status: 200 });
   };
