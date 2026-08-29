@@ -5,22 +5,32 @@
  * phase requires every team done AND its DoD complete. The backstop mirrors
  * gates/dod-backstop.ts semantics for CtoState — it only blocks at a
  * done-claim, never during background_wait / needs_human / failed pauses.
+ *
+ * `teams[].dod_path` is resolved through the canonical resolver
+ * (resolveDodPath) — both the directory-containing-dod.json form and the
+ * dod.json-file form work identically in every gate; unsafe paths fail closed.
  */
 
-import { join } from "node:path";
-import { isDoDComplete, readDoD } from "../engine/dod.js";
+import { isDoDComplete, readDoDFile, resolveDodPath } from "../engine/dod.js";
 import { checkBudget } from "./budget.js";
 import type { CtoState } from "./types.js";
 
 export type GateResult = { ok: true } | { ok: false; reason: string };
 
-/** A single team's DoD (its dod.json under the team's artifact dir). */
+/**
+ * A single team's DoD, resolved from `teams[].dod_path` — accepted as either
+ * the directory containing dod.json or the dod.json file itself. Unset
+ * dod_path stays "DoD not claimed" (integration requires an explicit claim).
+ */
 export function teamDoDComplete(state: CtoState, teamId: string, root: string): GateResult {
   const team = state.teams.find((t) => t.id === teamId);
   if (!team) return { ok: false, reason: `unknown team: ${teamId}` };
   if (!team.dod_path) return { ok: false, reason: `team ${teamId} has no dod_path — DoD not claimed` };
-  const dod = readDoD(join(root, team.dod_path));
-  const check = isDoDComplete(dod);
+  const resolved = resolveDodPath(root, team.dod_path, teamId);
+  if (!resolved.ok) return { ok: false, reason: `team ${teamId} DoD path invalid: ${resolved.reason}` };
+  const read = readDoDFile(resolved.file, { root });
+  if (!read.ok) return { ok: false, reason: `team ${teamId} DoD: ${read.reason}` };
+  const check = isDoDComplete(read.dod);
   return check.ok ? { ok: true } : { ok: false, reason: `team ${teamId} DoD: ${check.pending.map((p) => p.id).join(", ")}` };
 }
 

@@ -275,6 +275,13 @@ export interface CtoState extends CtoControlPlaneFields {
     id: string;
     status: TeamRunStatus;
     escalations: Record<string, EscalationRecord>;
+    /**
+     * Where this team's dod.json lives, relative to the run root — accepted
+     * as EITHER the directory containing dod.json OR the dod.json file
+     * itself. Every consumer resolves it through the canonical resolver
+     * (engine/dod.ts resolveDodPath); unsafe paths (traversal, absolute,
+     * symlinks) fail closed.
+     */
     dod_path?: string;
     /**
      * Slice this team owns in a resident wave (schema-2 additive; set by the

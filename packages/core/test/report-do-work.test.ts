@@ -71,9 +71,7 @@ const REPORT_FIXTURE_ROLES: Record<string, string> = {
   qa: "qa",
   analyst: "analyst",
   "tech-researcher": "tech-researcher",
-  architect_minimal: "architect",
-  architect_clean: "architect",
-  architect_pragmatic: "architect",
+  architect: "architect",
   "code-reviewer": "code-reviewer",
   "security-tester": "security-tester",
 };
@@ -505,13 +503,11 @@ test("do-work: full-feature stages carry resolved agents, original roles, and de
     assert.deepEqual(qa?.inputs, ["manual_qa", "implementation", "architecture"]);
     assert.deepEqual(qa?.outputs, ["qa_tests"]);
 
-    // Consilium: role roster maps every declared role to its resolved agent.
+    // Consilium with a roster_policy pool: no exact roster exists, so the
+    // report claims no agents for the stage (adaptive selection is a
+    // runtime decision, never synthesized profile data).
     const arch = report.stages.find((s) => s.id === "architecture");
-    assert.deepEqual(arch?.agents, [
-      { name: "architect", role: "architect_minimal", source: "workflow" },
-      { name: "architect", role: "architect_clean", source: "workflow" },
-      { name: "architect", role: "architect_pragmatic", source: "workflow" },
-    ]);
+    assert.equal(arch?.agents, undefined);
     assert.deepEqual(arch?.inputs, ["exploration", "clarifications"]);
     assert.deepEqual(arch?.outputs, ["architecture"]);
 
@@ -520,13 +516,9 @@ test("do-work: full-feature stages carry resolved agents, original roles, and de
     assert.deepEqual(summary?.agents, [{ name: "main session", role: "orchestrator", source: "workflow" }]);
     assert.deepEqual(summary?.outputs, ["summary"]);
 
-    // Consilium roles with duplicates stay as declared by the profile.
+    // Exploration is a roster_policy pool too: no exact roster claimed.
     const exploration = report.stages.find((s) => s.id === "exploration");
-    assert.deepEqual(exploration?.agents, [
-      { name: "analyst", role: "analyst", source: "workflow" },
-      { name: "tech-researcher", role: "tech-researcher", source: "workflow" },
-      { name: "analyst", role: "analyst", source: "workflow" },
-    ]);
+    assert.equal(exploration?.agents, undefined);
     assert.deepEqual(exploration?.outputs, ["exploration", "dod"]);
 
     // Stage with no `produces` declares an empty (not absent) output list.
@@ -656,8 +648,8 @@ test("do-work: consilium roster honors configured roster_overrides (add/replace)
       JSON.stringify({
         roles: REPORT_FIXTURE_ROLES,
         roster_overrides: {
-          code_review: { add: ["security-tester"] },
-          architecture: { replace: ["architect_clean"] },
+          // code_review keeps an exact roster: add + replace both apply.
+          code_review: { replace: ["security-tester"], add: ["code-reviewer"] },
         },
       }),
     );
@@ -666,12 +658,13 @@ test("do-work: consilium roster honors configured roster_overrides (add/replace)
 
     const codeReview = report.stages.find((s) => s.id === "code_review");
     assert.deepEqual(codeReview?.agents, [
-      { name: "code-reviewer", role: "code-reviewer", source: "workflow" },
       { name: "security-tester", role: "security-tester", source: "workflow" },
+      { name: "code-reviewer", role: "code-reviewer", source: "workflow" },
     ]);
 
+    // Pool stages have no exact roster to override: agents stay absent.
     const arch = report.stages.find((s) => s.id === "architecture");
-    assert.deepEqual(arch?.agents, [{ name: "architect", role: "architect_clean", source: "workflow" }]);
+    assert.equal(arch?.agents, undefined);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -741,12 +734,11 @@ test("do-work: profile-backed stages carry a bounded reconstructed promptPreview
     assert.ok(qa.promptPreview!.includes("gate: manual_qa.verdict == PASS"), "profile gate metadata");
     assert.ok(qa.promptPreview!.length <= 4096, "normal-size preview stays within the strict cap");
 
-    // Consilium: every resolved roster role is listed with its original role.
+    // Pool stage: preview makes no agent claim (roster_policy selection is
+    // runtime data); profile metadata stays.
     const arch = report.stages.find((s) => s.id === "architecture");
-    assert.ok(
-      arch?.promptPreview?.includes("agents: architect_minimal -> architect, architect_clean -> architect, architect_pragmatic -> architect"),
-      "consilium roster shown role -> agent",
-    );
+    assert.ok(arch?.promptPreview, "profile-backed stage carries a preview");
+    assert.ok(!arch.promptPreview!.includes("agents:"), "no exact roster claimed for a pool stage");
     assert.ok(arch.promptPreview!.includes("checkpoint: user_choice"), "checkpoint metadata");
 
     // Orchestrator stages report the truthful main-session descriptor.

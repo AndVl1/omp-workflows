@@ -347,7 +347,7 @@ test("core: consilium preserves role variants without pinning models", async () 
     pause: { kind: "none" as const, reason: "" },
     updated_at: new Date(0).toISOString(),
   };
-  const roles = ["architect_minimal", "architect_clean", "architect_pragmatic"];
+  const roles = ["architect", "architect", "architect"];
   const outcome = await runStage(
     { id: "architecture", title: "Architecture", type: "consilium", roles },
     {
@@ -373,10 +373,10 @@ test("core: consilium preserves role variants without pinning models", async () 
     },
   );
   assert.equal(outcome.status, "done");
-  assert.deepEqual(dispatched.map(({ name, agent }) => ({ name, agent })), roles.map((role) => ({ name: `architecture-${role}`, agent: "architect" })));
-  for (const [index, task] of dispatched.entries()) {
+  assert.deepEqual(dispatched.map(({ name, agent }) => ({ name, agent })), ["architect#1", "architect#2", "architect#3"].map((slot) => ({ name: `architecture-${slot}`, agent: "architect" })));
+  for (const task of dispatched) {
     assert.deepEqual(Object.keys(task).sort(), ["agent", "name", "task"]);
-    assert.match(task.task, new RegExp(`Workflow role: ${roles[index]}`));
+    assert.match(task.task, new RegExp("Workflow role: architect"));
   }
 });
 

@@ -25,11 +25,11 @@
  */
 
 import { existsSync, readdirSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { readDoD } from "../engine/dod.js";
+import { join } from "node:path";
+import { readDoDFile, resolveDodPath } from "../engine/dod.js";
 import { resolveWorkflow } from "../engine/profile.js";
 import type { ModelClassification } from "../engine/run.js";
-import type { Complexity, Confidence, DoD, TaskType } from "../engine/types.js";
+import type { Complexity, Confidence, TaskType } from "../engine/types.js";
 import { activeWave, readCtoState } from "./state.js";
 import type { CtoState } from "./types.js";
 
@@ -39,7 +39,6 @@ export const CTO_SLICE_MARKER_PREFIX = "<!-- omp-cto-slice";
 const MAX_MARKER_TEXT_LENGTH = 16_384;
 const MAX_CTO_ID_LENGTH = 128;
 const MAX_WORKFLOW_LABEL_LENGTH = 64;
-const MAX_DOD_PATH_LENGTH = 512;
 const SAFE_CTO_ID_RE = /^[A-Za-z0-9._-]+$/;
 const SAFE_WORKFLOW_LABEL_RE = /^[A-Za-z0-9_-]+$/;
 
@@ -158,33 +157,13 @@ export function validateSliceWorkflow(classification: ModelClassification, workf
   return `slice workflow mismatch: expected ${expected}, got ${got}`;
 }
 
-function resolveSafeDodDir(root: string, teamId: string, configuredPath: unknown): string | null {
-  const candidate =
-    configuredPath === undefined || configuredPath === ""
-      ? join(".work-state", "artifacts", teamId)
-      : configuredPath;
-  if (
-    typeof candidate !== "string" ||
-    candidate.length > MAX_DOD_PATH_LENGTH ||
-    candidate.includes("\0") ||
-    isAbsolute(candidate) ||
-    candidate.split(/[\\/]/).some((part) => part === "..")
-  ) {
-    return null;
-  }
-  const rootPath = resolve(root);
-  const dodDir = resolve(rootPath, candidate);
-  const outside = relative(rootPath, dodDir);
-  if (outside === ".." || outside.startsWith(`..${sep}`) || isAbsolute(outside)) return null;
-  return dodDir;
-}
-
 /**
- * Validate the per-slice DoD artifact. Resolves the DoD dir from the team's
- * `dod_path` (relative to root) when set, else the default
- * `.work-state/artifacts/<teamId>/`; readDoD must return non-null with
- * items.length > 0. Returns null when valid, else an actionable reason
- * (unknown team / unreadable / empty).
+ * Validate the per-slice DoD artifact. Resolves the DoD FILE from the team's
+ * `dod_path` via the canonical resolver — either a directory containing
+ * dod.json or the dod.json file itself (relative to root; default
+ * `.work-state/artifacts/<teamId>/`) — then it must parse with items.length
+ * > 0. Returns null when valid, else an actionable reason (unknown team /
+ * unsafe path / unreadable with resolved path + cause / empty).
  */
 export function validateSliceDoD(state: CtoState, teamId: string, root: string): string | null {
   if (!isSafeCtoId(teamId)) return "unsafe team id: refusing to resolve a slice DoD path";
@@ -196,20 +175,15 @@ export function validateSliceDoD(state: CtoState, teamId: string, root: string):
   }
   const team = state.teams.find((t) => t && t.id === teamId);
   if (!team) return `unknown team ${teamId}: no team record in run ${displayCtoId(state.id)}`;
-  const dodDir = resolveSafeDodDir(root, teamId, team.dod_path);
-  if (!dodDir) return "slice DoD path invalid: configured dod_path is not a safe relative path";
-  let dod: DoD | null;
-  try {
-    dod = readDoD(dodDir);
-  } catch {
-    dod = null;
+  const resolved = resolveDodPath(root, team.dod_path, teamId);
+  if (!resolved.ok) return `slice DoD path invalid: ${resolved.reason}`;
+  const read = readDoDFile(resolved.file, { root });
+  if (!read.ok) return `slice DoD unreadable: ${read.reason}`;
+  if (!Array.isArray(read.dod.items)) {
+    return `slice DoD unreadable: ${resolved.file} has invalid items`;
   }
-  if (!dod) return `slice DoD unreadable: no dod.json at ${join(dodDir, "dod.json")}`;
-  if (!Array.isArray(dod.items)) {
-    return `slice DoD unreadable: ${join(dodDir, "dod.json")} has invalid items`;
-  }
-  if (dod.items.length === 0) {
-    return `slice DoD empty: ${join(dodDir, "dod.json")} has no items`;
+  if (read.dod.items.length === 0) {
+    return `slice DoD empty: ${resolved.file} has no items`;
   }
   return null;
 }

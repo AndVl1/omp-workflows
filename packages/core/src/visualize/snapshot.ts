@@ -50,6 +50,7 @@ import { createHash } from "node:crypto";
 import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
+import { readDoDFileSafe, type DodSafeFileRead, resolveDodPath } from "../engine/dod.js";
 import { loadProfile } from "../engine/profile.js";
 import type { TeamState } from "../engine/types.js";
 import type { CtoState } from "../cto/types.js";
@@ -350,6 +351,16 @@ interface ArtifactPlan {
   absPath?: string;
   /** Safe relative source label (never absolute, never escaping). */
   label?: string;
+  /** dod_path artifact: single safe fd-bound read captured at plan time; the render pipeline never reopens the pathname when set. */
+  safeRead?: DodSafeFileRead;
+}
+
+/**
+ * Head window of a safe fd-bound read's raw text (mirrors readBoundedHead's
+ * byte cap) so safe-read artifacts keep identical window semantics.
+ */
+function windowOfSafeRead(read: Extract<DodSafeFileRead, { ok: true }>, windowBytes: number): string {
+  return Buffer.from(read.raw, "utf8").subarray(0, Math.min(read.bytes, windowBytes)).toString("utf8");
 }
 
 /** Deterministic top-level scan of a directory for JSON artifact files. */
@@ -402,7 +413,7 @@ function planDoWorkArtifacts(
       plans.set(id, { id, declared: true, owner, invalid: resolved.invalid });
       continue;
     }
-    plans.set(id, { id, declared: true, owner, absPath: resolved.absPath, label: resolved.label });
+    plans.set(id, { id, declared: true, owner, absPath: resolved.absPath, label: resolved.label, ...(id === "dod" ? { safeRead: readDoDFileSafe(cwd, resolved.absPath) } : {}) });
   }
 
   // Discovered extras: slot files attach to their declared base, anything
@@ -411,7 +422,7 @@ function planDoWorkArtifacts(
     if (declared.has(id)) return;
     const base = slotBaseOf(id, declared);
     const owner = base ? (producesByStage.get(base) ?? "") : "";
-    plans.set(id, { id, declared: false, owner, ...(base ? { slotFor: base } : {}), absPath, label: cwdRelativeLabel(cwd, absPath) });
+    plans.set(id, { id, declared: false, owner, ...(base ? { slotFor: base } : {}), absPath, label: cwdRelativeLabel(cwd, absPath), ...(id === "dod" ? { safeRead: readDoDFileSafe(cwd, absPath) } : {}) });
   });
 
   return { plans: [...plans.values()], declaredOrder };
@@ -426,35 +437,66 @@ function planCtoArtifacts(
 ): { plans: ArtifactPlan[]; declaredOrder: string[] } {
   const declaredOrder = declaredOrderOf("cto");
   const plans = new Map<string, ArtifactPlan>();
-  const add = (id: string, owner: string, absPath: string, label: string): void => {
+  const reserved = new Set<string>();
+  const add = (id: string, owner: string, absPath: string, label: string, safeRead?: DodSafeFileRead): void => {
+    if (reserved.has(id)) return; // fail-closed reservation: no generic fallback
     if (plans.has(id)) {
       warnings.push(`artifact ${id} exists in multiple locations: first resolution wins`);
       return;
     }
-    plans.set(id, { id, declared: true, owner, absPath, label });
+    plans.set(id, { id, declared: true, owner, absPath, label, ...(safeRead ? { safeRead } : {}) });
   };
 
-  // 1. Run-local artifacts: .work-state/cto/<runId>/artifacts/*.json.
-  scanJsonArtifacts(cwd, join(entry.runDir, "artifacts"), (id, absPath) => {
-    add(id, "", absPath, cwdRelativeLabel(cwd, absPath));
-  });
-
-  // 2. Team compatibility dirs: .work-state/artifacts/<teamId>/*.json.
+  // 1. Canonical team DoD for EVERY team (explicit dod_path or the unset/
+  //    default team artifacts dir), planned BEFORE all generic scans through
+  //    the fd-bound safe read. Plan ids are globally unique: the first
+  //    canonical claim wins, and an unsafe canonical path RESERVES the dod id
+  //    (fail-closed, excluded from rendering) so scans can never provide a
+  //    fallback.
   for (const team of state.teams ?? []) {
-    scanJsonArtifacts(cwd, ctoTeamArtifactsDir(cwd, team.id), (id, absPath) => {
-      add(id, team.id, absPath, cwdRelativeLabel(cwd, absPath));
-    });
-  }
-
-  // 3. Validated dod_path per team (id "dod"; first resolution wins).
-  for (const team of state.teams ?? []) {
-    if (!team.dod_path) continue;
-    const resolved = resolveDeclaredPath(cwd, team.dod_path);
-    if ("invalid" in resolved) {
+    // Canonical dod_path resolution (directory containing dod.json OR the
+    // dod.json file itself; default team artifacts dir when unset).
+    const resolved = resolveDodPath(cwd, team.dod_path, team.id);
+    if (!resolved.ok) {
+      // Fail closed: warn and RESERVE the dod id so run-local and
+      // compatibility scans can never provide a fallback.
       warnings.push(`declared path for dod is not a safe relative path: excluded from rendering`);
+      reserved.add("dod");
       continue;
     }
-    add("dod", team.id, resolved.absPath, resolved.label);
+    if (isExcludedSourcePath(cwd, resolved.file)) {
+      // Canonical exclusion contract (same predicate as declared paths):
+      // generated visualize output, vibe-report documentation and the
+      // observability event stream are never artifact inputs — warn and
+      // reserve against any generic fallback.
+      warnings.push(`declared path for dod is not a safe relative path: excluded from rendering`);
+      reserved.add("dod");
+      continue;
+    }
+    const safe = readDoDFileSafe(cwd, resolved.file);
+    if (!safe.ok && safe.kind === "missing") {
+      // Absent canonical DoD: reserve against generic fallback but keep the
+      // prior no-artifact behavior — no missing plan is added.
+      reserved.add("dod");
+      continue;
+    }
+    reserved.delete("dod"); // a real canonical file outranks an earlier absence
+    add("dod", team.id, resolved.file, cwdRelativeLabel(cwd, resolved.file), safe);
+  }
+
+  // 2. Run-local artifacts: .work-state/cto/<runId>/artifacts/*.json. A
+  //    discovered dod.json is safe-read, never pathname-read.
+  scanJsonArtifacts(cwd, join(entry.runDir, "artifacts"), (id, absPath) => {
+    add(id, "", absPath, cwdRelativeLabel(cwd, absPath), id === "dod" ? readDoDFileSafe(cwd, absPath) : undefined);
+  });
+
+  // 3. Team compatibility dirs: .work-state/artifacts/<teamId>/*.json (a
+  //    discovered dod.json — e.g. the default-dir DoD of a team without a
+  //    configured dod_path — is safe-read, never pathname-read).
+  for (const team of state.teams ?? []) {
+    scanJsonArtifacts(cwd, ctoTeamArtifactsDir(cwd, team.id), (id, absPath) => {
+      add(id, team.id, absPath, cwdRelativeLabel(cwd, absPath), id === "dod" ? readDoDFileSafe(cwd, absPath) : undefined);
+    });
   }
 
   return { plans: [...plans.values()], declaredOrder };
@@ -632,42 +674,73 @@ function buildArtifactModel(plans: ArtifactPlan[], declaredOrder: readonly strin
       continue;
     }
 
-    const absPath = plan.absPath;
-    if (!absPath) {
-      contributions.set(id, { id, present: false, sizeBytes: 0, readBytes: 0 });
-      artifacts.push({ id, owner: plan.owner, status: "missing", ...slotOf(id) });
-      continue;
-    }
+    const safeRead = plan.safeRead;
+    let size: number | null;
+    let text: string | null;
 
-    const size = statSizeOf(absPath);
-    if (size === null) {
-      // Absent (or unstatable) — declared rules apply; never unreadable.
-      const status = absentStatusOf(plan, slotsOfBase, stageStatuses);
-      contributions.set(id, { id, present: false, sizeBytes: 0, readBytes: 0 });
-      if (status === "pending" && plan.declared && stageStatuses.get(plan.owner) === "in_progress" && slotsOfBase.has(plan.id)) {
-        warnings.push(`shared artifact ${plan.id} is pending: producer in_progress, slots present`);
-      } else if (status === "missing") {
-        warnings.push(`declared artifact ${id} is missing`);
+    if (safeRead) {
+      // dod_path artifact: read ONCE at plan time via the safe fd-bound read
+      // (O_NOFOLLOW, regular-file check, fd/path inode bind, cwd containment).
+      // Rendering consumes that result and NEVER reopens the pathname.
+      if (!safeRead.ok) {
+        if (safeRead.kind === "missing") {
+          // Absent — declared rules apply; never unreadable (no path stats).
+          const status = absentStatusOf(plan, slotsOfBase, stageStatuses);
+          contributions.set(id, { id, present: false, sizeBytes: 0, readBytes: 0 });
+          if (status === "pending" && plan.declared && stageStatuses.get(plan.owner) === "in_progress" && slotsOfBase.has(plan.id)) {
+            warnings.push(`shared artifact ${plan.id} is pending: producer in_progress, slots present`);
+          } else if (status === "missing") {
+            warnings.push(`declared artifact ${id} is missing`);
+          }
+          artifacts.push({ id, owner: plan.owner, status, ...slotOf(id) });
+        } else {
+          // Symlink / non-regular / boundary / changed — refused at read time; never parsed.
+          warnings.push(`artifact ${id} is not a safe regular file inside the workspace: skipped`);
+          contributions.set(id, { id, present: true, sizeBytes: 0, readBytes: 0 });
+          artifacts.push({ id, owner: plan.owner, status: "skipped", ...slotOf(id) });
+        }
+        continue;
       }
-      artifacts.push({ id, owner: plan.owner, status, ...slotOf(id) });
-      continue;
-    }
+      size = safeRead.bytes;
+      text = windowOfSafeRead(safeRead, windowBytes);
+    } else {
+      const absPath = plan.absPath;
+      if (!absPath) {
+        contributions.set(id, { id, present: false, sizeBytes: 0, readBytes: 0 });
+        artifacts.push({ id, owner: plan.owner, status: "missing", ...slotOf(id) });
+        continue;
+      }
 
-    // Symlink/boundary escape on a resolvable file — rejected, never read.
-    if (escapesViaSymlink(cwd, absPath)) {
-      warnings.push(`artifact ${id} escapes the workspace via symlink: skipped`);
-      contributions.set(id, { id, present: true, sizeBytes: size, readBytes: Math.min(size, windowBytes) });
-      artifacts.push({ id, owner: plan.owner, status: "skipped", ...slotOf(id) });
-      continue;
-    }
+      size = statSizeOf(absPath);
+      if (size === null) {
+        // Absent (or unstatable) — declared rules apply; never unreadable.
+        const status = absentStatusOf(plan, slotsOfBase, stageStatuses);
+        contributions.set(id, { id, present: false, sizeBytes: 0, readBytes: 0 });
+        if (status === "pending" && plan.declared && stageStatuses.get(plan.owner) === "in_progress" && slotsOfBase.has(plan.id)) {
+          warnings.push(`shared artifact ${plan.id} is pending: producer in_progress, slots present`);
+        } else if (status === "missing") {
+          warnings.push(`declared artifact ${id} is missing`);
+        }
+        artifacts.push({ id, owner: plan.owner, status, ...slotOf(id) });
+        continue;
+      }
 
-    const text = readBoundedHead(absPath, windowBytes);
-    if (text === null) {
-      // Read failure (IO) — unreadable within the window.
-      warnings.push(`artifact ${id} is unreadable: read error`);
-      contributions.set(id, { id, present: true, sizeBytes: size, readBytes: 0 });
-      artifacts.push({ id, owner: plan.owner, status: "unreadable", errorCategory: "read-error", ...slotOf(id) });
-      continue;
+      // Symlink/boundary escape on a resolvable file — rejected, never read.
+      if (escapesViaSymlink(cwd, absPath)) {
+        warnings.push(`artifact ${id} escapes the workspace via symlink: skipped`);
+        contributions.set(id, { id, present: true, sizeBytes: size, readBytes: Math.min(size, windowBytes) });
+        artifacts.push({ id, owner: plan.owner, status: "skipped", ...slotOf(id) });
+        continue;
+      }
+
+      text = readBoundedHead(absPath, windowBytes);
+      if (text === null) {
+        // Read failure (IO) — unreadable within the window.
+        warnings.push(`artifact ${id} is unreadable: read error`);
+        contributions.set(id, { id, present: true, sizeBytes: size, readBytes: 0 });
+        artifacts.push({ id, owner: plan.owner, status: "unreadable", errorCategory: "read-error", ...slotOf(id) });
+        continue;
+      }
     }
 
     contributions.set(id, { id, present: true, sizeBytes: size, readBytes: Math.min(size, windowBytes) });

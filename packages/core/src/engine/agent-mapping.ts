@@ -282,30 +282,63 @@ function isDiagnostic(value: unknown): value is AgentMappingDiagnostic {
     && (diagnostic.resolved === undefined || Boolean(normalizedName(diagnostic.resolved)));
 }
 
-function isMappingState(value: unknown): value is AgentMappingState {
-  if (!value || typeof value !== "object") return false;
+export type AgentMappingStateValidation =
+  | { ok: true; mapping: AgentMappingState }
+  | { ok: false; error: string };
+
+/**
+ * The one complete runtime validator for an `AgentMappingState`. Beyond the
+ * outer structural shape it enforces the semantic invariants a malicious
+ * caller could otherwise forge: every resolved role names a non-empty agent
+ * that is present in `available_agents`, diagnostics are well-formed with
+ * resolved agents inside the live inventory, and `unresolved_roles` stays
+ * disjoint from `resolved_roles` with matching diagnostic status. Trusted
+ * in-memory handoffs and the persisted mapping boundaries (read and write)
+ * share this single gate, so nothing can look valid from the outside while
+ * resolving roles to agents that were never discovered.
+ */
+export function validateAgentMappingState(value: unknown): AgentMappingStateValidation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, error: "mapping is not an object" };
   const mapping = value as Partial<AgentMappingState>;
-  if (mapping.schema !== AGENT_MAPPING_SCHEMA || typeof mapping.generated_at !== "string" || typeof mapping.preferences_hash !== "string") return false;
-  if (!Array.isArray(mapping.available_agents) || !mapping.available_agents.every(agent => Boolean(normalizedName(agent)))) return false;
+  if (mapping.schema !== AGENT_MAPPING_SCHEMA) return { ok: false, error: `schema must be ${AGENT_MAPPING_SCHEMA}` };
+  if (typeof mapping.generated_at !== "string" || !mapping.generated_at) return { ok: false, error: "generated_at must be a non-empty string" };
+  if (typeof mapping.preferences_hash !== "string" || !mapping.preferences_hash) return { ok: false, error: "preferences_hash must be a non-empty string" };
+  if (!Array.isArray(mapping.available_agents) || !mapping.available_agents.every((agent) => Boolean(normalizedName(agent)))) {
+    return { ok: false, error: "available_agents must be an array of non-empty agent names" };
+  }
   const available = new Set(mapping.available_agents);
+  if (available.size !== mapping.available_agents.length) return { ok: false, error: "available_agents must not contain duplicates" };
   const resolvedRoles = mapping.resolved_roles;
-  if (!resolvedRoles || typeof resolvedRoles !== "object" || Array.isArray(resolvedRoles)) return false;
-  if (!Object.entries(resolvedRoles).every(([role, agent]) => Boolean(normalizedName(role)) && Boolean(normalizedName(agent)) && available.has(agent as string))) return false;
-  if (!mapping.diagnostics || typeof mapping.diagnostics !== "object" || Array.isArray(mapping.diagnostics)) return false;
-  if (!Object.entries(mapping.diagnostics).every(([role, diagnostic]) => {
-    if (!Boolean(normalizedName(role)) || !isDiagnostic(diagnostic)) return false;
-    return diagnostic.resolved === undefined || available.has(diagnostic.resolved);
-  })) return false;
-  if (!Array.isArray(mapping.unresolved_roles) || !mapping.unresolved_roles.every(role => Boolean(normalizedName(role)))) return false;
-  if (mapping.unresolved_roles.some(role => role in resolvedRoles)) return false;
-  if (mapping.source !== undefined && !normalizedName(mapping.source)) return false;
-  if (mapping.config_path !== undefined && mapping.config_path !== null && typeof mapping.config_path !== "string") return false;
-  if (mapping.config_hash !== undefined && typeof mapping.config_hash !== "string") return false;
+  if (!resolvedRoles || typeof resolvedRoles !== "object" || Array.isArray(resolvedRoles)) return { ok: false, error: "resolved_roles must be an object" };
+  for (const [role, agent] of Object.entries(resolvedRoles)) {
+    if (!normalizedName(role)) return { ok: false, error: `resolved_roles.${role} is not a non-empty role name` };
+    if (!normalizedName(agent)) return { ok: false, error: `resolved_roles.${role} is not a non-empty agent name` };
+    if (!available.has(agent)) return { ok: false, error: `resolved_roles.${role} names agent '${agent}' outside available_agents` };
+  }
+  if (!mapping.diagnostics || typeof mapping.diagnostics !== "object" || Array.isArray(mapping.diagnostics)) return { ok: false, error: "diagnostics must be an object" };
+  for (const [role, diagnostic] of Object.entries(mapping.diagnostics)) {
+    if (!normalizedName(role) || !isDiagnostic(diagnostic)) return { ok: false, error: `diagnostics.${role} is not a well-formed diagnostic` };
+    if (diagnostic.resolved !== undefined && !available.has(diagnostic.resolved)) return { ok: false, error: `diagnostics.${role} resolves outside available_agents` };
+  }
+  if (!Array.isArray(mapping.unresolved_roles) || !mapping.unresolved_roles.every((role) => Boolean(normalizedName(role)))) {
+    return { ok: false, error: "unresolved_roles must be an array of non-empty role names" };
+  }
+  for (const role of mapping.unresolved_roles) {
+    if (role in resolvedRoles) return { ok: false, error: `unresolved_roles names '${role}' which resolved_roles also resolves` };
+    const diagnostic: AgentMappingDiagnostic | undefined = mapping.diagnostics[role];
+    if (diagnostic && diagnostic.status !== "unavailable") return { ok: false, error: `unresolved role '${role}' carries a '${diagnostic.status}' diagnostic` };
+  }
+  for (const role of Object.keys(resolvedRoles)) {
+    if (mapping.diagnostics[role]?.status === "unavailable") return { ok: false, error: `resolved role '${role}' carries an 'unavailable' diagnostic` };
+  }
+  if (mapping.source !== undefined && !normalizedName(mapping.source)) return { ok: false, error: "source must be a non-empty name when present" };
+  if (mapping.config_path !== undefined && mapping.config_path !== null && typeof mapping.config_path !== "string") return { ok: false, error: "config_path must be a string or null" };
+  if (mapping.config_hash !== undefined && typeof mapping.config_hash !== "string") return { ok: false, error: "config_hash must be a string when present" };
   if (mapping.config_version !== undefined && mapping.config_version !== null
-    && typeof mapping.config_version !== "string" && typeof mapping.config_version !== "number") return false;
-  if (mapping.provider_discovery_hash !== undefined && typeof mapping.provider_discovery_hash !== "string") return false;
-  if (mapping.provenance !== undefined && (!mapping.provenance || typeof mapping.provenance !== "object" || Array.isArray(mapping.provenance))) return false;
-  return true;
+    && typeof mapping.config_version !== "string" && typeof mapping.config_version !== "number") return { ok: false, error: "config_version must be a string, number or null" };
+  if (mapping.provider_discovery_hash !== undefined && typeof mapping.provider_discovery_hash !== "string") return { ok: false, error: "provider_discovery_hash must be a string when present" };
+  if (mapping.provenance !== undefined && (!mapping.provenance || typeof mapping.provenance !== "object" || Array.isArray(mapping.provenance))) return { ok: false, error: "provenance must be an object when present" };
+  return { ok: true, mapping: mapping as AgentMappingState };
 }
 
 function configFingerprint(cwd: string): { path: string | null; hash: string | null } {
@@ -363,8 +396,10 @@ export function readAgentMapping(cwd: string, expected?: AgentMappingExpectation
   if (!existsSync(path)) return undefined;
   try {
     if (lstatSync(path).isSymbolicLink() || !lstatSync(path).isFile()) return undefined;
-    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-    if (!isMappingState(parsed)) return undefined;
+    const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
+    const validated = validateAgentMappingState(raw);
+    if (!validated.ok) return undefined;
+    const parsed = validated.mapping;
     const fingerprint = configFingerprint(root);
     if (parsed.config_path !== undefined && parsed.config_path !== fingerprint.path) return undefined;
     if (parsed.config_hash && fingerprint.hash && parsed.config_hash !== fingerprint.hash) return undefined;
@@ -393,7 +428,7 @@ export function readAgentMapping(cwd: string, expected?: AgentMappingExpectation
 export function writeAgentMapping(cwd: string, mapping: AgentMappingState): string {
   const root = assertSafeMappingRoot(cwd);
   const path = agentMappingPath(root);
-  if (!isMappingState(mapping)) throw new Error("refusing to persist malformed agent mapping");
+  if (!validateAgentMappingState(mapping).ok) throw new Error("refusing to persist malformed agent mapping");
   const directory = dirname(path);
   mkdirSync(directory, { recursive: true });
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;

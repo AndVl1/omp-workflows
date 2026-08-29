@@ -32,6 +32,8 @@ import {
   type FanInPolicy,
 } from "../src/engine/fan-in.js";
 import { writeState } from "../src/engine/state.js";
+import { resolveConfig } from "../src/engine/config.js";
+import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { run } from "../src/engine/run.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
@@ -116,6 +118,22 @@ function writeSpecFixtureState(root: string): ReturnType<typeof createCapability
   return issued;
 }
 
+const trustedIntakeRoles = { analyst: "analyst", "tech-researcher": "tech-researcher" } as const;
+
+/** Publish a trusted live agent mapping covering the spec-preparation intake pool. */
+function publishMapping(root: string): void {
+  mkdirSync(join(root, ".omp"), { recursive: true });
+  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: trustedIntakeRoles }) + "\n");
+  const config = resolveConfig(root);
+  const mapping = buildAgentMapping({
+    roles: config.roles,
+    availableAgents: Object.values(trustedIntakeRoles),
+    extraRoles: config.scope_map.map((entry) => entry.dev_agent),
+    genericFallbackRoles: Object.keys(trustedIntakeRoles),
+  });
+  writeAgentMapping(root, mapping);
+}
+
 function artifactsDir(root: string): string {
   const dir = join(root, ".work-state", "features", "fan", "artifacts");
   mkdirSync(dir, { recursive: true });
@@ -175,7 +193,7 @@ const EXPLORATION = (summary: string, files: string[]) => ({ files_to_read: file
 test("fan-in: slot namespace is deterministic and collision-free", () => {
   assert.equal(namespacedArtifactId("exploration", "analyst#1"), "exploration-analyst-1");
   assert.equal(namespacedArtifactId("exploration", "tech-researcher"), "exploration-tech-researcher");
-  assert.equal(namespacedArtifactId("architecture", "architect_minimal"), "architecture-architect_minimal");
+  assert.equal(namespacedArtifactId("architecture", "architect#2"), "architecture-architect-2");
   assert.equal(sanitizeSlot("analyst#1"), "analyst-1");
   assert.equal(sanitizeSlot("devops"), "devops");
 });
@@ -319,6 +337,7 @@ test("spec-preparation: native consilium completion advances from slot-scoped ou
   try {
     initGit(root, "main");
     const issued = writeSpecFixtureState(root);
+    publishMapping(root);
     const dir = specArtifactsDir(root);
     for (const [role, agent, toolCallId] of [
       ["analyst", "analyst", "tool-spec-analyst"],
@@ -362,6 +381,7 @@ test("fan-in: native artifact ids can bind before a slot file becomes readable",
   try {
     initGit(root, "main");
     const issued = writeSpecFixtureState(root);
+    publishMapping(root);
     const dir = specArtifactsDir(root);
     const sharedId = "spec_intake_repo_map";
     const analystAuth = {

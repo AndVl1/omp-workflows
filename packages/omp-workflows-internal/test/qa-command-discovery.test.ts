@@ -6,10 +6,11 @@ import { resetWorkflowOwners } from "@andvl1/omp-workflows-core";
 import ompWorkflowsInternal from "../src/index.js";
 
 /**
- * Matrix item: `omp-*` agent/command discovery. The bundle's whole command
- * surface is the single hyphen-prefixed diagnostic command registered from
- * the extension entry; bare core command names and `omp-model-roles` are
- * never shadowed.
+ * Matrix item: `omp-*` agent/command discovery. The bundle's command
+ * surface is the hyphen-prefixed diagnostic command registered from the
+ * extension entry plus the core registration surface namespaced as
+ * `omp-do-work` / `omp-team` / `omp-cto`; bare core command names and
+ * `omp-model-roles` are never shadowed.
  */
 
 interface RecordedCommand {
@@ -34,12 +35,16 @@ function load(): Map<string, RecordedCommand> {
 	return commands;
 }
 
-test("the extension registers exactly one command and it is hyphen-prefixed omp-*", () => {
+test("the extension registers the diagnostic command and the eager omp-* namespace trio", () => {
 	const commands = load();
-	assert.equal(commands.size, 1, `expected exactly one command, got: ${[...commands.keys()].join(", ")}`);
-	const command = commands.get("omp-workflow-team");
-	assert.ok(command, "omp-workflow-team must be registered");
-	assert.match(command!.name, /^omp-[a-z0-9-]+$/, "command name must be hyphen-prefixed omp-*");
+	assert.deepEqual(
+		[...commands.keys()].sort(),
+		["omp-cto", "omp-do-work", "omp-team", "omp-workflow-team"],
+		`unexpected command surface: ${[...commands.keys()].join(", ")}`,
+	);
+	for (const name of commands.keys()) {
+		assert.match(name, /^omp-[a-z0-9-]+$/, "command name must be hyphen-prefixed omp-*");
+	}
 });
 
 test("bare core command names and omp-model-roles are never registered", () => {

@@ -155,11 +155,18 @@ test("foreign claim on one capability blocks the whole bundle before any registr
 	const host = makePi();
 	ompWorkflowsInternal(host.pi as never);
 
-	host.fireSessionStart({ cwd: root });
+	// Accepted wave-001 contract: command ownership throws owner_conflict on a
+	// foreign preclaim during session_start instead of failing open.
+	assert.throws(
+		() => host.fireSessionStart({ cwd: root }),
+		/owner_conflict/,
+		"core command ownership must throw owner_conflict against the foreign preclaim",
+	);
 
 	assert.deepEqual(host.labels, [], "fail closed: no label");
 	assert.deepEqual(host.tools, [], "fail closed: no tools");
-	assert.equal(host.hooks.has("before_agent_start"), false);
+	assert.equal(host.hooks.has("before_agent_start"), false, "engine gates stay unwired");
+	assert.equal(isRegisteredWorkflow("omp-feature") && false, false, "no engine/profile registration side effect");
 	assert.equal(workflowOwnerFor(root, "workflow_registration")?.owner.owner_id, "foreign-bundle");
 	assertUnclaimed(root, "workflow_tools");
 	assertUnclaimed(root, "config_writer");

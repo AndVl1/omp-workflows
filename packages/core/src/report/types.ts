@@ -66,7 +66,7 @@ export interface BuildSessionReportOptions {
 export interface StageAgentInfo {
   /** Resolved agent name (role→agent mapping, or the truthful descriptor). */
   name: string;
-  /** Original role from the workflow profile (e.g. "architect_minimal"). */
+  /** Original role from the workflow profile (e.g. "code-reviewer"). */
   role?: string;
   /** "workflow" = profile/config-derived; "observed" = runtime-correlated. */
   source: "workflow" | "observed";
@@ -167,6 +167,7 @@ export interface ReportTeam {
   profile?: string;
   worktree?: string;
   depends_on?: string[];
+  /** Declared dod_path echo (directory or dod.json file form; display only). */
   dod_path?: string;
   /** Number of recorded escalations for this team. */
   escalations?: number;

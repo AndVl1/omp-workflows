@@ -28,6 +28,7 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
+import { readDoDFileSafe, type DodSafeFileRead, resolveDodPath } from "../engine/dod.js";
 import { loadProfile } from "../engine/profile.js";
 import { resolveConfig, resolveAgentForRole } from "../engine/config.js";
 import type { Profile, RoleConfig, StageDef, StageStatus, TeamState } from "../engine/types.js";
@@ -656,6 +657,28 @@ function ctoArtifacts(
   const seen = new Set<string>();
   for (const team of state.teams) {
     const dir = join(cwd, WORK_STATE_DIR, TEAM_ARTIFACTS_DIR, team.id);
+    // Canonical team DoD FIRST (the configured dod_path, else the default
+    // team artifacts dir): read ONCE through the fd-bound safe read. The
+    // generic scan below never pathname-reads dod.json — the canonical
+    // result replaces it (owner-scoped first-wins via the seen key).
+    const canonical = resolveDodPath(cwd, team.dod_path, team.id);
+    if (!canonical.ok) {
+      warnings.push(`team ${team.id} dod_path unusable: ${canonical.reason}`);
+      seen.add(`${team.id}/dod`); // fail closed: no generic pathname fallback
+    } else {
+      const read = readDoDFileSafe(cwd, canonical.file);
+      if (!read.ok) {
+        if (read.kind !== "missing") {
+          warnings.push(`artifact dod (${team.id}) unreadable: ${read.reason}`);
+          artifacts.push({ id: "dod", path: canonical.file, owner: team.id, status: "produced", summary: "unreadable artifact" });
+        }
+      } else {
+        const art = buildArtifactFromRead({ id: "dod", owner: team.id, filePath: canonical.file, status: "produced" }, read, options, warnings);
+        artifacts.push(art);
+        if (art.mtime) artifactMtimes.set("dod", art.mtime);
+      }
+      seen.add(`${team.id}/dod`);
+    }
     if (existsSync(dir)) {
       try {
         for (const file of readdirSync(dir)) {
@@ -671,17 +694,6 @@ function ctoArtifacts(
         }
       } catch {
         warnings.push(`team artifacts dir unreadable: ${dir}`);
-      }
-    }
-    if (team.dod_path) {
-      const key = `${team.id}/dod`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const filePath = resolve(cwd, team.dod_path);
-      if (existsSync(filePath)) {
-        const art = buildArtifact({ id: "dod", owner: team.id, filePath, status: "produced" }, options, warnings);
-        artifacts.push(art);
-        if (art.mtime) artifactMtimes.set("dod", art.mtime);
       }
     }
   }
@@ -733,13 +745,12 @@ function buildArtifact(
     base.summary = "unreadable artifact";
     return base;
   }
-  base.bytes = size;
+  let mtimeMs: number | null = null;
   try {
-    base.mtime = new Date(statSync(input.filePath).mtimeMs).toISOString();
+    mtimeMs = statSync(input.filePath).mtimeMs;
   } catch {
     // mtime best-effort
   }
-
   const summaryCap = Math.max(maxBytes * SUMMARY_CAP_FACTOR, 64 * 1024);
   const raw = readBounded(input.filePath, summaryCap);
   if (raw === null) {
@@ -747,6 +758,42 @@ function buildArtifact(
     base.summary = "unreadable artifact";
     return base;
   }
+  return finishArtifact(base, input, raw, size, mtimeMs, maxBytes, options, warnings);
+}
+
+/**
+ * Assemble the report artifact from a SAFE fd-bound DoD read result: content,
+ * size and mtime come from the safe read — the resolved pathname is never
+ * reopened. Content beyond the summary cap is truncated exactly like the
+ * path-based reader (readBounded) so capped files keep the same diagnostics.
+ */
+function buildArtifactFromRead(
+  input: ArtifactInput,
+  read: Extract<DodSafeFileRead, { ok: true }>,
+  options: BuildSessionReportOptions,
+  warnings: string[],
+): ReportArtifact {
+  const maxBytes = options.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES;
+  const summaryCap = Math.max(maxBytes * SUMMARY_CAP_FACTOR, 64 * 1024);
+  const base: ReportArtifact = { id: input.id, path: input.filePath ?? input.id, owner: input.owner, status: input.status };
+  const raw =
+    read.raw.length > summaryCap ? Buffer.from(read.raw, "utf8").subarray(0, summaryCap).toString("utf8") : read.raw;
+  return finishArtifact(base, input, raw, read.bytes, read.mtimeMs, maxBytes, options, warnings);
+}
+
+/** Shared tail: bytes/mtime stamping, bounded parse, summary and body. */
+function finishArtifact(
+  base: ReportArtifact,
+  input: ArtifactInput,
+  raw: string,
+  size: number,
+  mtimeMs: number | null,
+  maxBytes: number,
+  options: BuildSessionReportOptions,
+  warnings: string[],
+): ReportArtifact {
+  base.bytes = size;
+  if (mtimeMs !== null) base.mtime = new Date(mtimeMs).toISOString();
   let data: unknown = null;
   try {
     data = JSON.parse(raw);

@@ -941,7 +941,21 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   if (stateSelection && capabilitySelection && hash(stateSelection) !== hash(capabilitySelection)) {
     throw new WorkflowContractError("MIGRATION_CONFLICT", "state roster_selection conflicts with capability roster_selection");
   }
-  const roster_selection = stateSelection ?? capabilitySelection;
+  const rawSelection = stateSelection ?? capabilitySelection;
+  // A selection is exposed only while it names the current stage AND is
+  // bound to the authoritative persisted top-level cursor epoch. Anything
+  // else is stale data from a completed, deferred or rotated capability
+  // and is masked — a prior stage's frozen selection can never dress up as
+  // the live stage's contract, and a stale one can never satisfy
+  // `selectionReady`. Legacy states without a top-level cursor epoch mask
+  // fail-closed: a capability-internal epoch is never accepted as a
+  // substitute for the live cursor binding.
+  const selectionCurrent = rawSelection !== null
+    && state !== null
+    && rawSelection.stage_id === stage.id
+    && rawSelection.capability_epoch === state.cursor_epoch;
+  const roster_selection = selectionCurrent ? rawSelection : null;
+  const staleSelection = rawSelection !== null && roster_selection === null ? rawSelection : null;
   const capabilityIdentity = capability?.work_identity ?? null;
   const stateIdentity = state?.work_identity ?? null;
   if (stateIdentity && capabilityIdentity && hash(stateIdentity) !== hash(capabilityIdentity)) {
@@ -986,6 +1000,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     stage.autonomous ? "stage.autonomous is display/migration input only" : null,
     !roster_policy && (stage.roles || stage.role) ? "legacy roles/role manifest remains exact and is not adaptive selection" : null,
     !roster_selection && roster_policy ? "adaptive stage awaits a frozen roster_selection before dispatch" : null,
+    staleSelection ? `stale roster_selection (stage '${staleSelection.stage_id}', epoch '${staleSelection.capability_epoch}') is masked for the current stage cursor` : null,
   ].filter((warning): warning is string => warning !== null);
   const control_plane = controlPlaneProvenance(
     intentSource,
