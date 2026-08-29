@@ -11,14 +11,15 @@
  * `createAskRedirectGate` (packages/fullstack/src/messenger-channel.ts) and
  * `isBidirectionalChannel` (packages/fullstack/src/adapters/registry.ts).
  * Core cannot import fullstack (package direction), so the channel
- * configuration is read through the shared pure normalizer (cto/channels.ts).
- * Both gates may coexist; double-blocking is harmless. Unlike the fullstack
- * gate, this one is NOT scoped to an active CTO run: a bidirectional channel
- * is by construction a detached run setup, so `ask` must be routed to the
- * outbox whenever the channel is configured.
+ * configuration is resolved through the shared identity-bound resolver
+ * (cto/channels.ts). Both gates may coexist; double-blocking is harmless.
+ * Unlike the fullstack gate, this one is NOT scoped to an active CTO run: a
+ * bidirectional channel is by construction a detached run setup, so `ask`
+ * must be routed to the outbox after host identity validation.
  */
 
-import { resolveChannelProfile } from "../cto/channels.js";
+import { resolveBoundChannelProfile } from "../cto/channels.js";
+import type { WorkflowRunIdentity } from "../workflow-v2/types.js";
 
 interface ToolCallEvent {
   toolName?: string;
@@ -26,7 +27,8 @@ interface ToolCallEvent {
 }
 
 interface ToolCallContext {
-  cwd: string;
+  readonly cwd: string;
+  readonly run_identity?: WorkflowRunIdentity;
 }
 
 export const OUTBOX_GATE_BLOCK_REASON =
@@ -35,24 +37,28 @@ export const OUTBOX_GATE_BLOCK_REASON =
   "(level question/decision, timeoutMs + default); the answer lands in `answers/<escId>.json` and the " +
   "CTO picks it up at the next checkpoint.";
 
+const OUTBOX_GATE_MIGRATION_REASON =
+  "MIGRATION_REQUIRED: cto-safety outbox gate requires the exact persisted WorkflowRunIdentity; " +
+  "re-admit the workflow through the protocol-v2 host before invoking ask.";
+
 /**
  * True when `.omp/escalation.json` resolves to a validated RW primary
- * channel (cto/channels.js normalizer). Legacy `adapter === "telegram"` and
- * `bidirectional === true` configs normalize to rw, so they still block ask;
- * explicit `channels[]` with a capability-validated "read-write" entry
- * behave identically. Never throws — a missing or malformed config resolves
- * to {direction:"none"} and returns false. Mirrors fullstack's
- * `isBidirectionalChannel` for the core-side gate (core cannot import
- * fullstack).
+ * channel for the supplied workflow run identity. Legacy and malformed
+ * configuration never become an authority; an invalid identity resolves to
+ * false for this boolean convenience API.
  */
-export function hasBidirectionalChannel(cwd: string): boolean {
-  return resolveChannelProfile(cwd).direction === "rw";
+export function hasBidirectionalChannel(
+  cwd: string,
+  runIdentity: WorkflowRunIdentity,
+): boolean {
+  const resolved = resolveBoundChannelProfile(cwd, runIdentity);
+  return resolved.ok && resolved.value.direction === "rw";
 }
 
 /**
  * `tool_call` gate: block the `ask` tool when a bidirectional channel is
- * configured. The `reason` is returned to the LLM, which then writes the
- * question to the outbox instead. Never throws.
+ * configured. Missing or invalid run identity fails closed; other tools
+ * remain untouched. Never throws.
  */
 export function outboxEnforcementGate(
   event: ToolCallEvent,
@@ -60,9 +66,15 @@ export function outboxEnforcementGate(
 ): { block: true; reason: string } | undefined {
   try {
     if (event?.toolName !== "ask") return undefined;
-    if (!hasBidirectionalChannel(ctx.cwd)) return undefined;
+    if (!ctx.run_identity) return { block: true, reason: OUTBOX_GATE_MIGRATION_REASON };
+
+    const resolved = resolveBoundChannelProfile(ctx.cwd, ctx.run_identity);
+    if (!resolved.ok) return { block: true, reason: OUTBOX_GATE_MIGRATION_REASON };
+    if (resolved.value.direction !== "rw") return undefined;
     return { block: true, reason: OUTBOX_GATE_BLOCK_REASON };
   } catch {
-    return undefined;
+    // An ask decision cannot proceed without an identity-bound channel
+    // resolution. Fail closed if an unexpected boundary value throws.
+    return { block: true, reason: OUTBOX_GATE_MIGRATION_REASON };
   }
 }

@@ -1,11 +1,14 @@
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core --> */
+import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import test from "node:test";
 import {
   checkpointPolicyLegacyConflict,
   migrationCheckpointPolicy,
   migrationCompletionIntent,
+  resolveWorkflowContract,
   validateTypedControlPlane,
+  WorkflowContractError,
 } from "../src/engine/workflow-contract.js";
 import type { CheckpointPolicy } from "../src/engine/types.js";
 
@@ -24,6 +27,26 @@ const identity = {
   dispatch_id: "dispatch-1",
   attempt: 1,
   worker_id: "worker-1",
+};
+
+const projectIdentity = {
+  root_instance_id: `sha256:${"1".repeat(64)}`,
+  provider_id: "@example/test",
+  descriptor_fingerprint: `sha256:${"2".repeat(64)}`,
+  executable_provenance: {
+    build_fingerprint: `sha256:${"8".repeat(64)}`,
+    runtime_fingerprint: `sha256:${"9".repeat(64)}`,
+  },
+  catalog_content_digest: `sha256:${"3".repeat(64)}`,
+  config_byte_sha256: `sha256:${"4".repeat(64)}`,
+  config_semantic_sha256: `sha256:${"5".repeat(64)}`,
+  session: { session_id: "session-1", lifecycle_id: "lifecycle-1" },
+};
+
+const runIdentity = {
+  ...projectIdentity,
+  run_id: "run-1",
+  profile_identity: { id: "standard", fingerprint: `sha256:${"6".repeat(64)}` },
 };
 
 const typedPolicy: CheckpointPolicy = {
@@ -88,6 +111,8 @@ const selection = {
 
 function validControlPlane() {
   return {
+    project_identity: projectIdentity,
+    run_identity: runIdentity,
     completion_intent: {
       mode: "complete_outcome",
       acceptance: "dod_and_artifacts",
@@ -98,8 +123,9 @@ function validControlPlane() {
     roster_policy: typedRosterPolicy,
     roster_selection: selection,
     work_identity: identity,
-    pending: { identity, status: "pending", pending_reason: "provider_running", updated_at: "2026-08-25T00:00:00Z" },
+    pending: { identity, run_identity: runIdentity, status: "pending", pending_reason: "provider_running", updated_at: "2026-08-25T00:00:00Z" },
     child_join: {
+      run_identity: runIdentity,
       parent: identity,
       child: { ...identity, slot_id: "child#1", task_id: "child-task", dispatch_id: "child-dispatch" },
       state: "pending",
@@ -112,6 +138,7 @@ function validControlPlane() {
     completion_envelope: {
       schema_version: 1,
       identity,
+      run_identity: runIdentity,
       outcome: "pending",
       terminal_signal: null,
       artifact_refs: [],
@@ -190,4 +217,15 @@ test("workflow schema declares the same typed control-plane definitions", () => 
     "completionIntent", "checkpointPolicy", "checkpointRule", "checkpointDecision", "typedCheckpointDecision", "checkpointActor",
     "rosterPolicy", "rosterSelection", "workIdentity", "pendingState", "childJoin", "completionEnvelope", "migrationReceipt",
   ]) assert.ok(schema.definitions[definition], `missing schema definition ${definition}`);
+});
+
+test("workflow contract rejects cwd-only resolution without an admitted v2 context", () => {
+  assert.throws(
+    () => resolveWorkflowContract("/tmp/workflow-contract-test", {
+      requireState: false,
+      workflow: "standard",
+      branch: "main",
+    }),
+    (error: unknown) => error instanceof WorkflowContractError && error.code === "MIGRATION_REQUIRED",
+  );
 });

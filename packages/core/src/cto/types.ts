@@ -27,6 +27,7 @@ import type {
 } from "../engine/types.js";
 import type { PauseKind, WorkflowName } from "../engine/types.js";
 import type { ModelClassification } from "../engine/run.js";
+import type { AgentRef, EffectivePolicy, ProfileIdentity, ProjectIdentity, ProviderCatalog, WorkflowRunIdentity } from "../workflow-v2/types.js";
 
 /** Git strategy for a team — decided by the CTO at plan time (interview Q3). */
 export type WorktreeStrategy = "same_branch" | "separate_worktree";
@@ -45,10 +46,21 @@ export interface TeamDef {
   scope: string[];
   /** Sub-workflow profile this team executes by default. */
   profile: string;
+  /** Exact provider catalog identity for the team's default profile. */
+  profile_identity: ProfileIdentity;
   /** Lead agent name (3-level model: CTO -> lead -> workers). */
   lead: string;
   /** Worker roles (from team.config.json `roles`) the lead may spawn. */
   roster: string[];
+}
+
+/** Immutable provider context required by every CTO lifecycle boundary. */
+export interface CtoExecutionContext {
+  /** Project-level activation identity; run selection happens at prepare. */
+  readonly project_identity: ProjectIdentity;
+  readonly catalog: Readonly<ProviderCatalog>;
+  readonly effective_policy: Readonly<EffectivePolicy>;
+  readonly agent_inventory: readonly AgentRef[];
 }
 
 /** One team in a concrete run plan. */
@@ -65,6 +77,13 @@ export interface TeamPlanEntry {
   worktree: WorktreeStrategy;
   /** Team ids this team must wait for before starting. */
   depends_on: string[];
+  /** Exact catalog identity of the selected sub-workflow profile. */
+  profile_identity: ProfileIdentity;
+  /** Provider-qualified lead/worker identities for this planned slice. */
+  lead_ref: AgentRef;
+  roster_refs: readonly AgentRef[];
+  /** Durable identity of the CTO run owning this slice. */
+  run_identity: WorkflowRunIdentity;
 }
 
 /** Full decomposition plan for one CTO run. */
@@ -74,7 +93,10 @@ export interface TeamPlan {
   task: string;
   teams: TeamPlanEntry[];
   created_at: string;
+  /** Durable identity of the CTO run owning this plan. */
+  run_identity: WorkflowRunIdentity;
 }
+
 
 // ── Escalation ──────────────────────────────────────────────────────────────
 
@@ -106,12 +128,17 @@ export interface Escalation {
   timeoutMs?: number;
   /** Parent escalation id (follow-up chains). */
   replyTo?: string;
+  /** Durable run identity bound to this escalation. */
+  run_identity: WorkflowRunIdentity;
 }
 
 export interface EscalationReceipt {
   sent: boolean;
+  /** Identity echoed by a validated channel adapter. */
+  run_identity: WorkflowRunIdentity;
   channelRef?: string;
 }
+
 
 /**
  * Escalation channel — consumer-implemented interface.
@@ -129,6 +156,8 @@ export interface EscalationReceipt {
  * implements them (register it via `registerEscalationAdapter`).
  */
 export interface EscalationInboundMessage {
+  /** Durable run identity supplied by the channel and checked before admission. */
+  run_identity: WorkflowRunIdentity;
   id: string;
   text: string;
   at: string;
@@ -141,7 +170,7 @@ export interface EscalationAdapter {
   /** One inbound poll round: writes answer files, returns the new answers. */
   pollOnce?(): Promise<EscalationAnswer[]>;
   /** Route plain (non-answer) inbound messages — new tasks for the CTO. */
-  setPlainMessageHandler?(handler: (msg: EscalationInboundMessage) => void): void;
+  setPlainMessageHandler?(handler: (msg: EscalationInboundMessage) => Promise<void>): void;
   /** Send a plain text (not an escalation) back to a user target. */
   sendPlainText?(target: string, text: string): Promise<{ sent: boolean; channelRef?: string }>;
 }
@@ -167,6 +196,8 @@ export interface EscalationAnswer {
   by: string;
   /** Set when the answer arrived after cancel/expiry (R5). */
   stale?: boolean;
+  /** Durable run identity supplied by the channel and checked before admission. */
+  run_identity: WorkflowRunIdentity;
 }
 
 // ── Run state ───────────────────────────────────────────────────────────────
@@ -201,6 +232,8 @@ export interface WaveRecord {
   finished_at?: string;
   /** Stable identity of the wave's parent work item when admitted by the engine. */
   work_identity?: WorkIdentity;
+  /** Durable identity of the parent CTO run at wave admission. */
+  run_identity: WorkflowRunIdentity;
 }
 
 /**
@@ -226,9 +259,11 @@ export interface ChannelProfile {
   primary?: boolean;
   /** Topics this channel is subscribed to (explicit channels[] only). */
   subscriptions?: string[];
+  /** Durable identity of the CTO run selecting this channel. */
+  run_identity: WorkflowRunIdentity;
 }
 
-/** Typed control-plane projection carried alongside legacy CTO fields. */
+/** Typed control-plane projection carried alongside CTO fields. */
 export interface CtoControlPlaneFields {
   completion_intent?: CompletionIntent;
   checkpoint_policy?: CheckpointPolicy;
@@ -241,6 +276,8 @@ export interface CtoControlPlaneFields {
   child_joins?: ChildJoin[];
   completion_envelope?: CompletionEnvelope;
   migration?: MigrationReceipt;
+  /** Run identity patch; CtoState always carries it as required. */
+  run_identity?: WorkflowRunIdentity;
   control_plane_provenance?: ControlPlaneProvenance;
   control_plane_status?: WorkflowContractStatus;
 }
@@ -270,6 +307,8 @@ export interface CtoState extends CtoControlPlaneFields {
    * on engine-created standby runs (nothing to classify).
    */
   classification?: ModelClassification;
+  /** Durable identity of this CTO run; required for all state reads/writes. */
+  run_identity: WorkflowRunIdentity;
   plan: TeamPlan;
   teams: Array<{
     id: string;
@@ -301,6 +340,13 @@ export interface CtoState extends CtoControlPlaneFields {
     completion_envelope?: CompletionEnvelope;
     control_plane_provenance?: ControlPlaneProvenance;
     control_plane_status?: WorkflowContractStatus;
+    /** Durable identity for this team slice. */
+    run_identity: WorkflowRunIdentity;
+    /** Exact selected catalog profile identity for this slice. */
+    profile_identity: ProfileIdentity;
+    /** Qualified lead and worker provenance for this slice. */
+    lead_ref: AgentRef;
+    roster_refs: readonly AgentRef[];
   }>;
   integration: {
     status: "pending" | "in_progress" | "done" | "failed";
@@ -480,6 +526,8 @@ export interface SchedulerState {
 
 export interface ScheduledDigest {
   run_id: string;
+  /** Durable identity of the run summarized by this report. */
+  run_identity: WorkflowRunIdentity;
   at: string;
   health: RunHealth;
   recent_decisions: DecisionMemoryEntry[];

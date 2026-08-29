@@ -9,6 +9,7 @@
  * mid-consilium pending shared artifact, zero-artifact sessions, legacy/CTO
  * layouts, corrupt peers without abort, and strict read-only (no canonical
  * mutation). Fixed generated_at for determinism.
+ * <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core -->
  */
 
 import { test } from "node:test";
@@ -17,7 +18,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, ut
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildSessionSnapshot, buildSessionSnapshots } from "../src/visualize/snapshot.js";
+import { buildSessionSnapshot, buildSessionSnapshots, type BuildSessionSnapshotContext } from "../src/visualize/snapshot.js";
 import { renderHubMarkdown } from "../src/visualize/markdown.js";
 import { renderHubHtml } from "../src/visualize/html.js";
 import { buildManifest } from "../src/visualize/manifest.js";
@@ -30,6 +31,7 @@ import {
   resolveDoWorkSource,
   type SessionSourceEntry,
 } from "../src/report/session-source.js";
+import { reportStorageFor } from "./report-storage-fixtures.js";
 import {
   CORRUPT_JSON_SAMPLE,
   FIXED_GENERATED_AT,
@@ -45,6 +47,7 @@ import {
   LARGE_SCALAR_TEXT,
   type CanonicalSessionInput,
 } from "./fixtures/visualize-fixtures.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
 
 // ── Harness: materialize a canonical input onto a temp workspace ────────────
 
@@ -79,21 +82,49 @@ function materialize(cwd: string, input: CanonicalSessionInput, extraFiles: Reco
   for (const f of input.artifacts) write(join(cwd, f.relPath), f.content);
 }
 
-/** The discovered entry for an input (exact selector; terminal md via list). */
+/** The discovered entry for an input (exact selector; markdown via list). */
 function entryOf(cwd: string, input: CanonicalSessionInput): SessionSourceEntry {
+  const storage = reportStorageFor(cwd);
   if (input.kind === "cto") {
-    if (input.state.format === "markdown" && input.state.content.includes("# Summary")) {
-      const entry = listCtoSources(cwd).find((e) => e.id === input.id);
-      if (!entry) throw new Error(`terminal markdown run not discovered: ${input.id}`);
+    if (input.state.format === "markdown") {
+      const entry = listCtoSources(storage).find((e) => e.id === input.id);
+      if (!entry) throw new Error(`markdown CTO run not discovered: ${input.id}`);
       return entry;
     }
-    const resolved = resolveCtoSource(cwd, input.id);
+    const resolved = resolveCtoSource(storage, input.id);
     if (!resolved) throw new Error(`cto run not resolved: ${input.id}`);
     return resolved;
   }
-  const resolved = resolveDoWorkSource(cwd, input.id);
+  const resolved = resolveDoWorkSource(storage, input.id);
   if (!resolved) throw new Error(`do-work session not resolved: ${input.id}`);
   return resolved;
+}
+
+const snapshotContexts = new Map<string, BuildSessionSnapshotContext>();
+
+function contextForEntry(entry: SessionSourceEntry): BuildSessionSnapshotContext {
+  const workflow = entry.kind === "cto" ? "cto" : (entry.state?.classification?.workflow ?? "standard");
+  const cached = snapshotContexts.get(workflow);
+  if (cached) return cached;
+  const fixture = workflowV2Fixture(readWorkflowProfile(workflow));
+  const context: BuildSessionSnapshotContext = {
+    project_identity: fixture.project_identity,
+    catalog: fixture.catalog,
+    effective_policy: fixture.effective_policy,
+  };
+  snapshotContexts.set(workflow, context);
+  return context;
+}
+
+function snapshotOptions(entry: SessionSourceEntry, full = false) {
+  return full
+    ? { full: true, context: contextForEntry(entry) }
+    : { context: contextForEntry(entry) };
+}
+
+function snapshotOf(cwd: string, entry: SessionSourceEntry, full = false) {
+  const storage = reportStorageFor(cwd);
+  return buildSessionSnapshot(storage, entry, FIXED_GENERATED_AT, snapshotOptions(entry, full));
 }
 
 const specInput = (): CanonicalSessionInput => {
@@ -117,7 +148,7 @@ test("snapshot: spec-preparation session matches the frozen golden model (BG-1 d
   try {
     const input = specInput();
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
 
     assert.equal(session.schema, 1);
     assert.equal(session.status, "complete");
@@ -179,7 +210,7 @@ test("snapshot: spec-preparation session matches the frozen golden model (BG-1 d
     assert.equal(session.provenance.sourceDigest.full, digestFor(input).full);
     assert.equal(session.provenance.sourceDigest.bounded, digestFor(input).bounded);
     assert.equal(session.provenance.sourceUpdatedAt, input.state.updatedAt);
-    assert.equal(session.provenance.profileHash, "p-visualize-1");
+    assert.equal(session.provenance.profileHash, "sha256:5be53f2f680f849b1c0df663809b3538d5c5262fe999de2727f681083bde12ce");
     assert.equal(session.provenance.staleness, "fresh");
     assert.equal(session.provenance.generatedAt, FIXED_GENERATED_AT);
 
@@ -237,7 +268,7 @@ test("snapshot: oversized artifacts stay produced with preview markers; only in-
       expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
     });
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
 
     const big = session.artifacts.find((a) => a.id === "big");
     assert.ok(big);
@@ -267,7 +298,7 @@ test("snapshot: oversized artifacts stay produced with preview markers; only in-
     assert.ok(session.warnings.includes("artifact corrupt_small is unreadable: invalid JSON within the read window"));
 
     // --full raises the window: big parses fully and loses the preview flag.
-    const fullSession = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT, { full: true });
+    const fullSession = snapshotOf(cwd, entryOf(cwd, input), true);
     const bigFull = fullSession.artifacts.find((a) => a.id === "big");
     assert.ok(bigFull);
     assert.equal(bigFull.status, "produced");
@@ -309,7 +340,7 @@ test("snapshot: depth 8, 200 collection items and 8192 scalar chars enforce visi
       expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
     });
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
 
     const deep = session.artifacts.find((a) => a.id === "deep");
     assert.ok(deep?.bounds?.depthTruncated, "depth 12 exceeds MAX_DEPTH 8");
@@ -368,7 +399,7 @@ test("snapshot: bug-fix compact hides bodies by default; --full embeds them with
       expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
     });
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
     const config = resolveRenderConfig("bug-fix", false);
     assert.equal(config.depthPolicy, "compact");
     assert.equal(config.bodiesEnabled, false);
@@ -397,7 +428,7 @@ test("snapshot: bug-fix compact hides bodies by default; --full embeds them with
     assert.equal(session.provenance.sourceDigest.full, digestFor(input).full);
 
     // --full: bodies appear, caps grow, redaction still applies.
-    const fullSession = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT, { full: true });
+    const fullSession = snapshotOf(cwd, entryOf(cwd, input), true);
     const fullConfig = resolveRenderConfig("bug-fix", true);
     assert.equal(fullConfig.bodiesEnabled, true);
     assert.equal(fullConfig.options.readWindowBytes, 256 * 1024);
@@ -431,7 +462,7 @@ test("snapshot: mid-consilium yields produced slots plus pending shared artifact
       expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
     });
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
 
     assert.deepEqual(session.artifacts.map((a) => a.id), [
       "spec_architecture_tasks",
@@ -469,7 +500,7 @@ test("snapshot: zero-artifact session is overview-only with a no-artifacts note"
       expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
     });
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
     assert.equal(session.status, "complete");
     assert.deepEqual(session.artifacts, []);
     assert.deepEqual(session.warnings, ["no artifacts yet"]);
@@ -484,6 +515,7 @@ test("snapshot: zero-artifact session is overview-only with a no-artifacts note"
 test("snapshot: legacy root keeps kind/pathKey, stale provenance, and never discovers excluded inputs", () => {
   const cwd = tmpWorkspace();
   try {
+    const legacyFixture = workflowV2Fixture(readWorkflowProfile("standard"), { runId: LEGACY_SESSION_ID });
     const input: CanonicalSessionInput = {
       kind: "legacy",
       id: LEGACY_SESSION_ID,
@@ -492,12 +524,16 @@ test("snapshot: legacy root keeps kind/pathKey, stale provenance, and never disc
         format: "json",
         content: JSON.stringify({
           schema: 1,
+          project_identity: legacyFixture.project_identity,
+          run_identity: legacyFixture.run_identity,
           branch: "main",
+          workflow: "standard",
           classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", workflow: "standard", autonomous: false },
           task: "Legacy do-work run.",
           workflow_override: false,
           issue: null,
           stage_cursor: "summary",
+          cursor_epoch: "legacy-cursor-epoch",
           stages: [
             { id: "discovery", status: "done" },
             { id: "summary", status: "done" },
@@ -529,7 +565,7 @@ test("snapshot: legacy root keeps kind/pathKey, stale provenance, and never disc
     write(join(cwd, ".work-state", "events.jsonl"), '{"ts":"2026-08-19T13:00:01.000Z"}');
     write(join(cwd, "vibe-report", "legacy.md"), "# Legacy report\n");
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
 
     assert.equal(session.identity.kind, "legacy");
     assert.equal(session.identity.id, LEGACY_SESSION_ID);
@@ -592,7 +628,7 @@ test("snapshot: CTO JSON run resolves run-local, team compatibility and dod_path
       expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
     };
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
 
     assert.equal(session.identity.kind, "cto");
     assert.equal(session.identity.title, "CTO run cto-run-7f3a");
@@ -620,9 +656,9 @@ test("snapshot: CTO JSON run resolves run-local, team compatibility and dod_path
   }
 });
 
-// ── 9. CTO markdown state: active complete / terminal degraded ──────────────
+// ── 9. CTO markdown state: active/terminal degraded projections ──────────────
 
-test("snapshot: active markdown CTO is complete with unknown staleness; terminal is degraded with reason", () => {
+test("snapshot: active and terminal markdown CTO runs are degraded projections with unknown staleness", () => {
   const cwd = tmpWorkspace();
   try {
     const activeFiles = markdownCtoFiles({
@@ -642,13 +678,15 @@ test("snapshot: active markdown CTO is complete with unknown staleness; terminal
       declaredArtifacts: {},
       artifacts: [],
       excludedPaths: [],
-      expected: { status: "complete", staleness: "unknown", artifactStatuses: {} },
+      expected: { status: "degraded", staleness: "unknown", artifactStatuses: {}, degradedReasons: ["unreadable state (JSON or markdown); rendering available content"] },
     };
     materialize(cwd, activeInput, activeFiles);
-    const active = buildSessionSnapshot(cwd, entryOf(cwd, activeInput), FIXED_GENERATED_AT);
-    assert.equal(active.status, "complete");
+    const active = snapshotOf(cwd, entryOf(cwd, activeInput));
+    assert.equal(active.status, "degraded");
+    assert.equal(active.identity.degraded, true);
     assert.equal(active.identity.sourceFormat, "markdown");
-    assert.equal(active.identity.task, "Coordinate a markdown-only CTO run.", "task from the markdown state heading");
+    assert.equal(active.identity.task, "", "active markdown has no durable task identity");
+    assert.deepEqual(active.degradedReasons, ["unreadable state (JSON or markdown); rendering available content"]);
     assert.equal(active.provenance.staleness, "unknown", "markdown state carries no updated_at (mtime excluded)");
     assert.equal(active.provenance.sourceUpdatedAt, undefined);
     assert.deepEqual(active.artifacts, []);
@@ -676,7 +714,7 @@ test("snapshot: active markdown CTO is complete with unknown staleness; terminal
       expected: { status: "degraded", staleness: "unknown", artifactStatuses: {}, degradedReasons: ["terminal markdown CTO state: visualization-only projection"] },
     };
     materialize(cwd, terminalInput, terminalFiles);
-    const terminal = buildSessionSnapshot(cwd, entryOf(cwd, terminalInput), FIXED_GENERATED_AT);
+    const terminal = snapshotOf(cwd, entryOf(cwd, terminalInput));
     assert.equal(terminal.status, "degraded");
     assert.equal(terminal.identity.degraded, true);
     assert.equal(terminal.identity.task, "A finished markdown CTO run.", "task derives from the finish-marker state");
@@ -710,7 +748,7 @@ test("snapshot: unsafe ids are skipped, unsafe declared paths are excluded, safe
       expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
     });
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
 
     const statuses = Object.fromEntries(session.artifacts.map((a) => [a.id, a.status]));
     assert.deepEqual(statuses, {
@@ -762,8 +800,8 @@ test("snapshot: BG-1 — identical content with different mtimes yields identica
     utimesSync(stateB, future, future);
     utimesSync(artB, future, future);
 
-    const a = buildSessionSnapshot(cwdA, entryOf(cwdA, input), FIXED_GENERATED_AT);
-    const b = buildSessionSnapshot(cwdB, entryOf(cwdB, input), FIXED_GENERATED_AT);
+    const a = snapshotOf(cwdA, entryOf(cwdA, input));
+    const b = snapshotOf(cwdB, entryOf(cwdB, input));
 
     assert.equal(a.provenance.sourceDigest.full, b.provenance.sourceDigest.full, "mtime never enters the digest");
     assert.deepEqual(a, b, "identical inputs with different mtimes produce identical models");
@@ -773,11 +811,11 @@ test("snapshot: BG-1 — identical content with different mtimes yields identica
     const artA = join(cwdA, ".work-state", "features", "mtime", "artifacts", "spec_handoff.json");
     utimesSync(stateA, future, future);
     utimesSync(artA, future, future);
-    assert.deepEqual(buildSessionSnapshot(cwdA, entryOf(cwdA, input), FIXED_GENERATED_AT), a);
+    assert.deepEqual(snapshotOf(cwdA, entryOf(cwdA, input)), a);
 
     // A real content change invalidates the digest.
     writeFileSync(artB, "y".repeat(2100));
-    const mutated = buildSessionSnapshot(cwdB, entryOf(cwdB, input), FIXED_GENERATED_AT);
+    const mutated = snapshotOf(cwdB, entryOf(cwdB, input));
     assert.notEqual(mutated.provenance.sourceDigest.full, b.provenance.sourceDigest.full, "content mutation changes the digest");
     assert.notEqual(mutated.provenance.sourceDigest.full, a.provenance.sourceDigest.full);
   } finally {
@@ -802,12 +840,12 @@ test("snapshot: staleness — updated_at later than generated_at is stale, equal
       expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
     });
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
     assert.equal(session.provenance.staleness, "fresh", "equal timestamps are fresh (AC-11)");
 
     // Later updated_at → stale.
     writeFileSync(join(cwd, ".work-state", "features", "fresh", "state.json"), JSON.stringify({ ...JSON.parse(input.state.content), updated_at: "2026-08-19T13:00:00.000Z" }, null, 2));
-    const stale = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const stale = snapshotOf(cwd, entryOf(cwd, input));
     assert.equal(stale.provenance.staleness, "stale");
     assert.equal(stale.provenance.sourceUpdatedAt, "2026-08-19T13:00:00.000Z");
   } finally {
@@ -838,16 +876,17 @@ test("snapshot: corrupt artifact peers and corrupt state degrade without abortin
       expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
     });
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
     assert.equal(session.status, "complete", "one corrupt artifact does not degrade the session");
     assert.equal(session.artifacts.find((a) => a.id === "corrupt")?.status, "unreadable");
     assert.equal(session.artifacts.find((a) => a.id === "fine")?.status, "produced");
 
     // Corrupt STATE → degraded session via safe enumeration (never throws).
     writeFileSync(join(cwd, ".work-state", "features", "broken", "state.json"), '{ "schema": 1, broken');
-    const entry = listDoWorkSources(cwd).find((e) => e.id === "broken");
+    const storage = reportStorageFor(cwd);
+    const entry = listDoWorkSources(storage).find((e) => e.id === "broken");
     assert.ok(entry, "corrupt state is still discoverable as an error entry");
-    const degraded = buildSessionSnapshot(cwd, entry, FIXED_GENERATED_AT);
+    const degraded = snapshotOf(cwd, entry);
     assert.equal(degraded.status, "degraded");
     assert.equal(degraded.identity.degraded, true);
     assert.equal(degraded.identity.task, "");
@@ -870,8 +909,8 @@ test("snapshot: fixed-clock regeneration is byte-identical and never mutates can
     const artifactBefore = readFileSync(artifactPath);
 
     const entry = entryOf(cwd, input);
-    const a = buildSessionSnapshot(cwd, entry, FIXED_GENERATED_AT);
-    const b = buildSessionSnapshot(cwd, entry, FIXED_GENERATED_AT);
+    const a = snapshotOf(cwd, entry);
+    const b = snapshotOf(cwd, entry);
     assert.deepEqual(a, b, "identical inputs + fixed clock → identical model");
 
     assert.deepEqual(readFileSync(statePath), stateBefore, "canonical state bytes unchanged");
@@ -903,7 +942,7 @@ test("snapshot: undeclared extras sort lexicographically; unlisted workflows get
       expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
     });
     materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
+    const session = snapshotOf(cwd, entryOf(cwd, input));
 
     // freeform_note is declared but NOT in the research profile produces, so
     // it joins the extras bucket: all four ids sort lexicographically.
@@ -966,9 +1005,13 @@ test("snapshot: F3 — markdown-CTO run-local mtime never reorders; snapshot, ma
     materialize(cwd, doneA, markdownCtoFiles({ task: "Finished markdown CTO run A.", classificationLine: classification, withFinishMarker: true }).files);
     materialize(cwd, doneB, markdownCtoFiles({ task: "Finished markdown CTO run B.", classificationLine: classification, withFinishMarker: true }).files);
 
-    const entries = [resolveDoWorkSource(cwd, "alpha"), ...listCtoSources(cwd)];
+    const storage = reportStorageFor(cwd);
+    const entries = [resolveDoWorkSource(storage, "alpha"), ...listCtoSources(storage)];
     assert.equal(entries.length, 4, "feature + three markdown CTO runs discovered");
-    const sessions = buildSessionSnapshots(cwd, entries, FIXED_GENERATED_AT);
+    const sessions = buildSessionSnapshots(storage, entries, FIXED_GENERATED_AT, {
+      ...snapshotOptions(entries[0]),
+      contextForEntry,
+    });
     assert.deepEqual(
       sessions.map((s) => `${s.identity.kind}/${s.identity.id}`),
       ["feature/alpha", "cto/cto-a", "cto/cto-b", "cto/cto-live"],
@@ -976,7 +1019,10 @@ test("snapshot: F3 — markdown-CTO run-local mtime never reorders; snapshot, ma
     );
 
     // The total order is stable regardless of caller input order.
-    const scrambled = buildSessionSnapshots(cwd, [...entries].reverse(), FIXED_GENERATED_AT);
+    const scrambled = buildSessionSnapshots(storage, [...entries].reverse(), FIXED_GENERATED_AT, {
+      ...snapshotOptions(entries[0]),
+      contextForEntry,
+    });
     assert.deepEqual(scrambled.map((s) => s.identity.id), sessions.map((s) => s.identity.id));
 
     // All output surfaces agree on the same deterministic order.
@@ -1013,14 +1059,18 @@ test("snapshot: F3 — markdown-CTO run-local mtime never reorders; snapshot, ma
         if (statSync(p).isFile()) utimesSync(p, future, future);
       }
     }
-    const touched = listCtoSources(cwd);
+    const touched = listCtoSources(storage);
     for (const [runId, future] of Object.entries(futureByRun)) {
       const entry = touched.find((e) => e.id === runId);
       assert.ok(entry, `touched run still discovered: ${runId}`);
       assert.equal(entry.updatedAt, future.toISOString(), `discovery observes the new run-local mtime for ${runId}`);
     }
 
-    const sessionsAfter = buildSessionSnapshots(cwd, [resolveDoWorkSource(cwd, "alpha"), ...touched], FIXED_GENERATED_AT);
+    const afterEntries = [resolveDoWorkSource(storage, "alpha"), ...touched];
+    const sessionsAfter = buildSessionSnapshots(storage, afterEntries, FIXED_GENERATED_AT, {
+      ...snapshotOptions(afterEntries[0]),
+      contextForEntry,
+    });
     assert.deepEqual(sessionsAfter, sessions, "mtime-only change reorders nothing and changes no model or digest");
     const manifestAfter = buildManifest(sessionsAfter, "all", { generatedAt: FIXED_GENERATED_AT });
     assert.deepEqual(manifestAfter, manifest, "manifest unchanged by mtime-only change");

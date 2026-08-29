@@ -1,12 +1,22 @@
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core --> */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { loadProfile, profileHash as sharedProfileHash, resolveWorkflowProfilePath } from "./profile.js";
-import { resolveConfig, resolveAgentForRole } from "./config.js";
-import { resolveScope } from "./scope.js";
-import { resolveActiveBranch, resolveState } from "./state.js";
-import { resolveStageDispatchSlots } from "./stage.js";
-import { sanitizeSlot } from "./fan-in.js";
+import { resolveStageDispatchSlots, WorkflowStageIdentityError } from "./stage.js";
+import { resolveState } from "./state.js";
+import { loadProfileByIdentity } from "./profile.js";
 import { artifactSchemaFor, type JsonSchemaDef } from "./artifact-contract.js";
+import { sanitizeSlot } from "./fan-in.js";
+import { createDiagnostic } from "../workflow-v2/diagnostics.js";
+import { isProviderId, isWorkflowV2Digest, validateProjectIdentity, validateWorkflowRunIdentity } from "../workflow-v2/identity.js";
+import type {
+  AgentRef,
+  EffectivePolicy,
+  PolicySnapshot,
+  ProjectIdentity,
+  ProviderCatalog,
+  WorkflowRunIdentity,
+  WorkflowV2Diagnostic,
+} from "../workflow-v2/types.js";
 import type {
   CheckpointPolicy,
   CheckpointRule,
@@ -20,9 +30,11 @@ import type {
   ControlPlaneMigrationStatus,
   ControlPlaneProvenance,
   PendingState,
+  RetiredCapability,
   RosterPolicy,
   RosterSelection,
   StageDef,
+  DispatchSlot,
   StageStatus,
   TeamState,
   WorkIdentity,
@@ -63,29 +75,35 @@ function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function isNonEmptyStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item): item is string => nonEmptyString(item));
+}
+
 function requireString(value: UnknownRecord, key: string, path: string, issues: TypedContractIssue[]): void {
   if (!nonEmptyString(value[key])) addIssue(issues, `${path}.${key}`, "must be a non-empty string");
 }
 
 function requireEnum(value: UnknownRecord, key: string, allowed: readonly string[], path: string, issues: TypedContractIssue[]): void {
-  if (typeof value[key] !== "string" || !allowed.includes(value[key] as string)) {
+  const candidate = value[key];
+  if (typeof candidate !== "string" || !allowed.includes(candidate)) {
     addIssue(issues, `${path}.${key}`, `must be one of ${allowed.join(", ")}`);
   }
 }
 
 function requireInteger(value: UnknownRecord, key: string, path: string, issues: TypedContractIssue[], minimum = 0): void {
-  if (!Number.isInteger(value[key]) || (value[key] as number) < minimum) {
+  const candidate = value[key];
+  if (typeof candidate !== "number" || !Number.isInteger(candidate) || candidate < minimum) {
     addIssue(issues, `${path}.${key}`, `must be an integer >= ${minimum}`);
   }
 }
 
 function stringArray(value: unknown, path: string, issues: TypedContractIssue[], required = true): string[] | null {
   if (value === undefined && !required) return null;
-  if (!Array.isArray(value) || value.some((item) => !nonEmptyString(item))) {
+  if (!isNonEmptyStringArray(value)) {
     addIssue(issues, path, "must be an array of non-empty strings");
     return null;
   }
-  const result = value as string[];
+  const result = value;
   for (let index = 0; index < result.length; index += 1) {
     for (let previous = 0; previous < index; previous += 1) {
       if (result[previous] === result[index]) addIssue(issues, `${path}[${index}]`, "duplicate value");
@@ -250,10 +268,11 @@ function validateRosterPolicy(value: unknown, path: string, issues: TypedContrac
   }
 }
 
-function validateWorkIdentity(value: unknown, path: string, issues: TypedContractIssue[]): void {
+function validateWorkIdentity(value: unknown, path: string, issues: TypedContractIssue[]): value is WorkIdentity {
+  const initialIssueCount = issues.length;
   if (!isRecord(value)) {
     addIssue(issues, path, "must be an object");
-    return;
+    return false;
   }
   unknownKeys(value, [
     "run_id", "wave_id", "slice_id", "session_id", "workflow", "stage_id", "stage_cursor",
@@ -264,6 +283,7 @@ function validateWorkIdentity(value: unknown, path: string, issues: TypedContrac
     "capability_id", "capability_epoch", "slot_id", "task_id", "dispatch_id", "worker_id",
   ]) requireString(value, key, path, issues);
   requireInteger(value, "attempt", path, issues, 1);
+  return issues.length === initialIssueCount;
 }
 
 function validateRosterSelection(value: unknown, path: string, issues: TypedContractIssue[]): void {
@@ -320,14 +340,15 @@ function validateRosterSelection(value: unknown, path: string, issues: TypedCont
     });
   }
 }
-
 function validatePendingState(value: unknown, path: string, issues: TypedContractIssue[]): void {
   if (!isRecord(value)) {
     addIssue(issues, path, "must be an object");
     return;
   }
-  unknownKeys(value, ["identity", "status", "pending_reason", "provider_ref", "lease", "terminal_signal", "retry_of", "updated_at"], path, issues);
+  unknownKeys(value, ["identity", "run_identity", "status", "pending_reason", "provider_ref", "lease", "terminal_signal", "retry_of", "updated_at"], path, issues);
   validateWorkIdentity(value.identity, `${path}.identity`, issues);
+  if (!hasOwn(value, "run_identity")) addIssue(issues, `${path}.run_identity`, "required for an active v2 lifecycle");
+  else validateRunIdentityValue(value.run_identity, `${path}.run_identity`, issues);
   requireEnum(value, "status", ["authorized", "running", "pending", "succeeded", "failed", "cancelled"], path, issues);
   if (value.pending_reason !== undefined && (typeof value.pending_reason !== "string" || !["provider_running", "awaiting_result", "transport_reconnect"].includes(value.pending_reason))) {
     addIssue(issues, `${path}.pending_reason`, "unknown pending reason");
@@ -355,7 +376,9 @@ function validateChildJoin(value: unknown, path: string, issues: TypedContractIs
     addIssue(issues, path, "must be an object");
     return;
   }
-  unknownKeys(value, ["parent", "child", "state", "expected_artifact_ids", "completion_envelope_ref", "attempt", "created_at", "joined_at"], path, issues);
+  unknownKeys(value, ["run_identity", "parent", "child", "state", "expected_artifact_ids", "completion_envelope_ref", "attempt", "created_at", "joined_at"], path, issues);
+  if (!hasOwn(value, "run_identity")) addIssue(issues, `${path}.run_identity`, "required for an active v2 lifecycle");
+  else validateRunIdentityValue(value.run_identity, `${path}.run_identity`, issues);
   validateWorkIdentity(value.parent, `${path}.parent`, issues);
   validateWorkIdentity(value.child, `${path}.child`, issues);
   requireEnum(value, "state", ["planned", "authorized", "pending", "succeeded", "failed", "cancelled", "conflict"], path, issues);
@@ -367,17 +390,252 @@ function validateChildJoin(value: unknown, path: string, issues: TypedContractIs
   requireString(value, "created_at", path, issues);
   requireString(value, "joined_at", path, issues);
 }
+const PROJECT_IDENTITY_KEYS = [
+  "root_instance_id",
+  "provider_id",
+  "descriptor_fingerprint",
+  "executable_provenance",
+  "catalog_content_digest",
+  "config_byte_sha256",
+  "config_semantic_sha256",
+  "session",
+] as const;
+
+const RUN_IDENTITY_KEYS = [...PROJECT_IDENTITY_KEYS, "run_id", "profile_identity"] as const;
+
+function validateProjectIdentityValue(value: unknown, path: string, issues: TypedContractIssue[]): ProjectIdentity | null {
+  if (!isRecord(value)) {
+    addIssue(issues, path, "must be a complete project identity");
+    return null;
+  }
+  unknownKeys(value, PROJECT_IDENTITY_KEYS, path, issues);
+  const checked = validateProjectIdentity(value);
+  if (!checked.ok) {
+    for (const diagnostic of checked.diagnostics) {
+      const field = diagnostic.evidence.changed_field;
+      addIssue(issues, typeof field === "string" && field.length > 0 ? `${path}.${field}` : path, "is not a valid project identity");
+    }
+    return null;
+  }
+  return checked.value;
+}
+
+function validateRunIdentityValue(value: unknown, path: string, issues: TypedContractIssue[]): WorkflowRunIdentity | null {
+  if (!isRecord(value)) {
+    addIssue(issues, path, "must be a complete workflow run identity");
+    return null;
+  }
+  unknownKeys(value, RUN_IDENTITY_KEYS, path, issues);
+  const checked = validateWorkflowRunIdentity(value);
+  if (!checked.ok) {
+    for (const diagnostic of checked.diagnostics) {
+      const field = diagnostic.evidence.changed_field;
+      addIssue(issues, typeof field === "string" && field.length > 0 ? `${path}.${field}` : path, "is not a valid workflow run identity");
+    }
+    return null;
+  }
+  return checked.value;
+}
+
+function validateAgentRef(value: unknown, path: string, issues: TypedContractIssue[]): boolean {
+  if (!isRecord(value)) {
+    addIssue(issues, path, "must be a provider-qualified agent reference");
+    return false;
+  }
+  unknownKeys(value, ["registered_name", "provider_id", "source_fingerprint"], path, issues);
+  requireString(value, "registered_name", path, issues);
+  if (!isProviderId(value.provider_id)) addIssue(issues, `${path}.provider_id`, "must be a lowercase package-qualified provider id");
+  if (!isWorkflowV2Digest(value.source_fingerprint)) {
+    addIssue(issues, `${path}.source_fingerprint`, "must be a sha256:<64 lowercase hex> digest");
+  }
+  return true;
+}
+function validateDispatchCompletion(value: unknown, path: string, issues: TypedContractIssue[]): void {
+  if (!isRecord(value)) {
+    addIssue(issues, path, "must be an object");
+    return;
+  }
+  unknownKeys(value, [
+    "dispatch_id", "cursor_epoch", "outcome", "artifact_ids", "evidence",
+    "completed_by", "completed_at", "run_identity", "work_identity",
+  ], path, issues);
+  for (const key of ["dispatch_id", "cursor_epoch", "evidence", "completed_at"]) requireString(value, key, path, issues);
+  requireEnum(value, "outcome", ["succeeded", "failed", "cancelled"], path, issues);
+  stringArray(value.artifact_ids, `${path}.artifact_ids`, issues);
+  requireEnum(value, "completed_by", ["workflow_complete", "synchronous_tool_result", "engine_task_caller"], path, issues);
+  if (!hasOwn(value, "run_identity")) addIssue(issues, `${path}.run_identity`, "required for an active v2 lifecycle");
+  else validateRunIdentityValue(value.run_identity, `${path}.run_identity`, issues);
+  if (hasOwn(value, "work_identity")) validateWorkIdentity(value.work_identity, `${path}.work_identity`, issues);
+}
+
+function validateDispatchRecord(value: unknown, path: string, issues: TypedContractIssue[]): void {
+  if (!isRecord(value)) {
+    addIssue(issues, path, "must be an object");
+    return;
+  }
+  unknownKeys(value, [
+    "id", "role", "agent", "agent_ref", "tool_call_id", "status", "attempt",
+    "created_at", "completed_at", "completion", "run_identity",
+    "work_identity", "pending", "completion_envelope",
+  ], path, issues);
+  for (const key of ["id", "role", "agent", "created_at"]) requireString(value, key, path, issues);
+  requireEnum(value, "status", ["authorized", "running", "pending", "succeeded", "failed", "cancelled"], path, issues);
+  requireInteger(value, "attempt", path, issues, 1);
+  if (value.tool_call_id !== undefined) requireString(value, "tool_call_id", path, issues);
+  if (value.completed_at !== undefined) requireString(value, "completed_at", path, issues);
+  if (hasOwn(value, "agent_ref")) validateAgentRef(value.agent_ref, `${path}.agent_ref`, issues);
+  if (hasOwn(value, "work_identity")) validateWorkIdentity(value.work_identity, `${path}.work_identity`, issues);
+  if (hasOwn(value, "pending")) validatePendingState(value.pending, `${path}.pending`, issues);
+  if (hasOwn(value, "completion")) validateDispatchCompletion(value.completion, `${path}.completion`, issues);
+  if (hasOwn(value, "completion_envelope")) validateCompletionEnvelope(value.completion_envelope, `${path}.completion_envelope`, issues);
+  if (!hasOwn(value, "run_identity")) addIssue(issues, `${path}.run_identity`, "required for an active v2 lifecycle");
+  else validateRunIdentityValue(value.run_identity, `${path}.run_identity`, issues);
+}
+
+function validateExpectedRosterEntry(value: unknown, path: string, issues: TypedContractIssue[]): void {
+  if (!isRecord(value)) {
+    addIssue(issues, path, "must be an object");
+    return;
+  }
+  unknownKeys(value, ["role", "agent", "agent_ref", "slot_id", "semantic_role", "occurrence", "facet"], path, issues);
+  requireString(value, "role", path, issues);
+  requireString(value, "agent", path, issues);
+  if (!hasOwn(value, "agent_ref")) addIssue(issues, `${path}.agent_ref`, "required for a qualified dispatch roster");
+  else validateAgentRef(value.agent_ref, `${path}.agent_ref`, issues);
+  if (value.slot_id !== undefined) requireString(value, "slot_id", path, issues);
+  if (value.semantic_role !== undefined) requireString(value, "semantic_role", path, issues);
+  if (value.occurrence !== undefined) requireInteger(value, "occurrence", path, issues, 1);
+  if (value.facet !== undefined && value.facet !== null) requireString(value, "facet", path, issues);
+}
+
+function validateDispatchCapability(value: unknown, path: string, issues: TypedContractIssue[]): WorkIdentity | null {
+  if (!isRecord(value)) {
+    addIssue(issues, path, "must be an object");
+    return null;
+  }
+  unknownKeys(value, [
+    "run", "workflow", "profile_hash", "stage", "roles", "capability_id",
+    "dispatch_token_hash", "advance_token_hash", "issued_for", "kind",
+    "project_identity", "run_identity", "expected_roles", "expected_count",
+    "expected_roster", "roster_selection", "work_identity", "pending", "status",
+    "dispatches",
+  ], path, issues);
+  let workIdentity: WorkIdentity | null = null;
+  const topProject = hasOwn(value, "project_identity")
+    ? validateProjectIdentityValue(value.project_identity, `${path}.project_identity`, issues)
+    : (addIssue(issues, `${path}.project_identity`, "required for an active v2 lifecycle"), null);
+  const topRun = hasOwn(value, "run_identity")
+    ? validateRunIdentityValue(value.run_identity, `${path}.run_identity`, issues)
+    : (addIssue(issues, `${path}.run_identity`, "required for an active v2 lifecycle"), null);
+  if (topProject && topRun && !sameProjectIdentity(topProject, topRun)) {
+    addIssue(issues, `${path}.run_identity`, "must inherit project_identity");
+  }
+  if (value.run !== undefined) requireString(value, "run", path, issues);
+  if (value.workflow !== undefined) requireString(value, "workflow", path, issues);
+  if (value.profile_hash !== undefined) requireString(value, "profile_hash", path, issues);
+  if (value.stage !== undefined) requireString(value, "stage", path, issues);
+  if (value.roles !== undefined) stringArray(value.roles, `${path}.roles`, issues);
+  if (value.capability_id !== undefined) requireString(value, "capability_id", path, issues);
+  for (const key of ["dispatch_token_hash", "advance_token_hash"]) {
+    if (value[key] !== undefined) {
+      requireString(value, key, path, issues);
+      if (typeof value[key] === "string" && !/^[0-9a-f]{64}$/.test(value[key])) addIssue(issues, `${path}.${key}`, "must be a lowercase sha256 hash");
+    }
+  }
+  if (!isRecord(value.issued_for)) {
+    addIssue(issues, `${path}.issued_for`, "must include the project and run identity binding");
+  } else {
+    unknownKeys(value.issued_for, [
+      "run_key", "branch", "workflow", "profile_hash", "stage_cursor", "cursor_epoch",
+      "project_identity", "run_identity",
+    ], `${path}.issued_for`, issues);
+    for (const key of ["run_key", "branch", "workflow", "profile_hash", "stage_cursor", "cursor_epoch"]) {
+      requireString(value.issued_for, key, `${path}.issued_for`, issues);
+    }
+    const issuedProject = hasOwn(value.issued_for, "project_identity")
+      ? validateProjectIdentityValue(value.issued_for.project_identity, `${path}.issued_for.project_identity`, issues)
+      : (addIssue(issues, `${path}.issued_for.project_identity`, "required for an active v2 lifecycle"), null);
+    const issuedRun = hasOwn(value.issued_for, "run_identity")
+      ? validateRunIdentityValue(value.issued_for.run_identity, `${path}.issued_for.run_identity`, issues)
+      : (addIssue(issues, `${path}.issued_for.run_identity`, "required for an active v2 lifecycle"), null);
+    if (issuedProject && issuedRun && !sameProjectIdentity(issuedProject, issuedRun)) {
+      addIssue(issues, `${path}.issued_for.run_identity`, "must inherit issued_for.project_identity");
+    }
+    if (topProject && issuedProject && !sameProjectIdentity(topProject, issuedProject)) {
+      addIssue(issues, `${path}.issued_for.project_identity`, "must match dispatch_capability.project_identity");
+    }
+    if (topRun && issuedRun && !sameRunIdentity(topRun, issuedRun)) {
+      addIssue(issues, `${path}.issued_for.run_identity`, "must match dispatch_capability.run_identity");
+    }
+  }
+  requireEnum(value, "kind", ["none", "single", "consilium"], path, issues);
+  if (hasOwn(value, "expected_roles")) stringArray(value.expected_roles, `${path}.expected_roles`, issues);
+  if (hasOwn(value, "expected_count")) requireInteger(value, "expected_count", path, issues);
+  if (hasOwn(value, "expected_roster")) {
+    if (!Array.isArray(value.expected_roster)) addIssue(issues, `${path}.expected_roster`, "must be an array");
+    else value.expected_roster.forEach((entry, index) => {
+      const entryPath = `${path}.expected_roster[${index}]`;
+      validateExpectedRosterEntry(entry, entryPath, issues);
+      if (topProject && isRecord(entry) && isRecord(entry.agent_ref) && entry.agent_ref.provider_id !== topProject.provider_id) {
+        addIssue(issues, `${entryPath}.agent_ref.provider_id`, "must match project_identity.provider_id");
+      }
+    });
+  }
+  if (hasOwn(value, "roster_selection")) validateRosterSelection(value.roster_selection, `${path}.roster_selection`, issues);
+  if (!hasOwn(value, "work_identity")) {
+    addIssue(issues, `${path}.work_identity`, "required for an active v2 lifecycle");
+  } else if (validateWorkIdentity(value.work_identity, `${path}.work_identity`, issues)) {
+    workIdentity = value.work_identity as WorkIdentity;
+  }
+  if (hasOwn(value, "pending")) {
+    if (!Array.isArray(value.pending)) addIssue(issues, `${path}.pending`, "must be an array");
+    else value.pending.forEach((entry, index) => validatePendingState(entry, `${path}.pending[${index}]`, issues));
+  }
+  if (hasOwn(value, "status")) requireEnum(value, "status", ["ready", "dispatched", "joining", "complete", "invalidated"], path, issues);
+  if (hasOwn(value, "dispatches")) {
+    if (!Array.isArray(value.dispatches)) addIssue(issues, `${path}.dispatches`, "must be an array");
+    else value.dispatches.forEach((entry, index) => {
+      validateDispatchRecord(entry, `${path}.dispatches[${index}]`, issues);
+      const entryRun = isRecord(entry) ? validateWorkflowRunIdentity(entry.run_identity) : null;
+      if (topRun && entryRun?.ok && !sameRunIdentity(topRun, entryRun.value)) {
+        addIssue(issues, `${path}.dispatches[${index}].run_identity`, "must match dispatch_capability.run_identity");
+      }
+    });
+  }
+  return workIdentity;
+}
+function validateJoinSummary(value: unknown, path: string, issues: TypedContractIssue[]): void {
+  if (!isRecord(value)) {
+    addIssue(issues, path, "must be an object");
+    return;
+  }
+  unknownKeys(value, ["stage_id", "run_identity", "cursor_epoch", "dispatch_ids", "roles", "evidence", "joined_at", "work_identity"], path, issues);
+  for (const key of ["stage_id", "cursor_epoch", "joined_at"]) requireString(value, key, path, issues);
+  stringArray(value.dispatch_ids, `${path}.dispatch_ids`, issues);
+  stringArray(value.roles, `${path}.roles`, issues);
+  if (value.evidence !== undefined) requireString(value, "evidence", path, issues);
+  if (!hasOwn(value, "run_identity")) addIssue(issues, `${path}.run_identity`, "required for an active v2 lifecycle");
+  else validateRunIdentityValue(value.run_identity, `${path}.run_identity`, issues);
+  if (hasOwn(value, "work_identity")) validateWorkIdentity(value.work_identity, `${path}.work_identity`, issues);
+}
 
 function validateCompletionEnvelope(value: unknown, path: string, issues: TypedContractIssue[]): void {
   if (!isRecord(value)) {
     addIssue(issues, path, "must be an object");
     return;
   }
-  unknownKeys(value, ["schema_version", "identity", "outcome", "terminal_signal", "artifact_refs", "evidence_ref", "conflict_ref", "completed_by", "emitted_at"], path, issues);
+  unknownKeys(value, ["schema_version", "identity", "run_identity", "outcome", "terminal_signal", "artifact_refs", "evidence_ref", "conflict_ref", "completed_by", "emitted_at"], path, issues);
   if (value.schema_version !== 1) addIssue(issues, `${path}.schema_version`, "must be 1");
   validateWorkIdentity(value.identity, `${path}.identity`, issues);
+  if (!hasOwn(value, "run_identity")) addIssue(issues, `${path}.run_identity`, "required for an active v2 lifecycle");
+  else validateRunIdentityValue(value.run_identity, `${path}.run_identity`, issues);
   requireEnum(value, "outcome", ["pending", "succeeded", "failed", "cancelled"], path, issues);
-  if (!hasOwn(value, "terminal_signal") || (value.terminal_signal !== null && value.terminal_signal !== undefined && !["workflow_complete", "native_tool_result", "provider_terminal", "contract_failure"].includes(value.terminal_signal as string))) {
+  const terminalSignal = value.terminal_signal;
+  if (!hasOwn(value, "terminal_signal") || (
+    terminalSignal !== null
+    && terminalSignal !== undefined
+    && (typeof terminalSignal !== "string" || !["workflow_complete", "native_tool_result", "provider_terminal", "contract_failure"].includes(terminalSignal))
+  )) {
     addIssue(issues, `${path}.terminal_signal`, "unknown or missing terminal signal");
   }
   if (!Array.isArray(value.artifact_refs)) {
@@ -408,6 +666,67 @@ function validateCompletionEnvelope(value: unknown, path: string, issues: TypedC
     addIssue(issues, `${path}.terminal_signal`, "terminal envelope requires a terminal signal");
   }
 }
+function validateRetiredCapability(value: unknown, path: string, issues: TypedContractIssue[]): void {
+  if (!isRecord(value)) {
+    addIssue(issues, path, "must be an object");
+    return;
+  }
+  unknownKeys(value, [
+    "capability_id", "capability_epoch", "run_identity", "work_identity",
+    "dispatch_capability", "completion_outcome", "completion_envelope", "reason", "retired_at",
+  ], path, issues);
+  for (const key of ["capability_id", "capability_epoch", "reason", "retired_at"]) requireString(value, key, path, issues);
+  if (!hasOwn(value, "run_identity")) addIssue(issues, `${path}.run_identity`, "required");
+  else validateRunIdentityValue(value.run_identity, `${path}.run_identity`, issues);
+  validateWorkIdentity(value.work_identity, `${path}.work_identity`, issues);
+  if (!hasOwn(value, "dispatch_capability")) {
+    addIssue(issues, `${path}.dispatch_capability`, "required");
+  } else if (!isRecord(value.dispatch_capability)) {
+    addIssue(issues, `${path}.dispatch_capability`, "must be an object");
+  } else {
+    const capability = value.dispatch_capability;
+    for (const legacy of ["run", "workflow", "profile_hash", "stage", "roles"]) {
+      if (hasOwn(capability, legacy)) addIssue(issues, `${path}.dispatch_capability.${legacy}`, "legacy capability field is not allowed in retired history");
+    }
+    const capabilityIdentity = validateDispatchCapability(capability, `${path}.dispatch_capability`, issues);
+    if (capabilityIdentity && isRecord(value.work_identity) && isWorkIdentityComparable(value.work_identity) && !sameWorkIdentity(value.work_identity, capabilityIdentity)) {
+      addIssue(issues, `${path}.dispatch_capability.work_identity`, "must match work_identity");
+    }
+    if (isRecord(value.dispatch_capability) && String(value.dispatch_capability.capability_id) !== String(value.capability_id)) {
+      addIssue(issues, `${path}.capability_id`, "must match dispatch_capability.capability_id");
+    }
+    if (isRecord(value.dispatch_capability) && isRecord(value.dispatch_capability.issued_for) && String(value.dispatch_capability.issued_for.cursor_epoch) !== String(value.capability_epoch)) {
+      addIssue(issues, `${path}.capability_epoch`, "must match dispatch_capability.issued_for.cursor_epoch");
+    }
+    const entryRun = validateWorkflowRunIdentity(value.run_identity);
+    const capabilityRun = validateWorkflowRunIdentity(capability.run_identity);
+    if (entryRun.ok && capabilityRun.ok && !sameRunIdentity(entryRun.value, capabilityRun.value)) {
+      addIssue(issues, `${path}.dispatch_capability.run_identity`, "must match run_identity");
+    }
+  }
+  if (!hasOwn(value, "completion_outcome")) addIssue(issues, `${path}.completion_outcome`, "required");
+  else if (value.completion_outcome !== null) requireEnum(value, "completion_outcome", ["pending", "succeeded", "failed", "cancelled"], path, issues);
+  if (!hasOwn(value, "completion_envelope")) {
+    addIssue(issues, `${path}.completion_envelope`, "required");
+  } else if (value.completion_envelope === undefined) {
+    addIssue(issues, `${path}.completion_envelope`, "must not be undefined");
+  } else if (value.completion_envelope !== null) {
+    validateCompletionEnvelope(value.completion_envelope, `${path}.completion_envelope`, issues);
+    if (isRecord(value.completion_envelope) && value.completion_outcome !== value.completion_envelope.outcome) {
+      addIssue(issues, `${path}.completion_outcome`, "must match completion_envelope.outcome");
+    }
+    if (isRecord(value.work_identity) && isWorkIdentityComparable(value.work_identity) && isRecord(value.completion_envelope) && isRecord(value.completion_envelope.identity) && isWorkIdentityComparable(value.completion_envelope.identity) && !sameWorkIdentity(value.work_identity, value.completion_envelope.identity)) {
+      addIssue(issues, `${path}.completion_envelope.identity`, "must match work_identity");
+    }
+    const entryRun = validateRunIdentityValue(value.run_identity, `${path}.run_identity`, issues);
+    const envelope = value.completion_envelope;
+    const envelopeRun = isRecord(envelope) ? validateWorkflowRunIdentity(envelope.run_identity) : null;
+    if (entryRun && envelopeRun?.ok && !sameRunIdentity(entryRun, envelopeRun.value)) addIssue(issues, `${path}.completion_envelope.run_identity`, "must match run_identity");
+  } else if (value.completion_outcome !== null) {
+    addIssue(issues, `${path}.completion_envelope`, "must be present when completion_outcome is non-null");
+  }
+}
+
 
 function validateCheckpointAnswerProof(value: unknown, path: string, issues: TypedContractIssue[]): void {
   if (!isRecord(value)) {
@@ -493,6 +812,114 @@ function validateTypedCheckpointDecision(value: unknown, path: string, issues: T
 }
 
 
+function validateTypedIdentityCoherence(value: UnknownRecord, stateWorkIdentity: WorkIdentity | null, issues: TypedContractIssue[]): void {
+  const rootRun = hasOwn(value, "run_identity") ? validateWorkflowRunIdentity(value.run_identity) : null;
+  if (!rootRun?.ok) return;
+  const run = rootRun.value;
+  const workflow = typeof value.workflow === "string" ? value.workflow : null;
+  const classification = isRecord(value.classification) ? value.classification : null;
+  const classificationWorkflow = classification && typeof classification.workflow === "string" ? classification.workflow : null;
+  const stageCursor = typeof value.stage_cursor === "string" ? value.stage_cursor : null;
+  const bind = (candidate: unknown, path: string, requireStage = false): void => {
+    if (!isRecord(candidate)) return;
+    if (candidate.run_id !== run.run_id) addIssue(issues, `${path}.run_id`, "must match run_identity.run_id");
+    if (candidate.session_id !== run.session.session_id) addIssue(issues, `${path}.session_id`, "must match run_identity.session.session_id");
+    if (workflow && candidate.workflow !== workflow) addIssue(issues, `${path}.workflow`, "must match workflow");
+    if (classificationWorkflow && candidate.workflow !== classificationWorkflow) addIssue(issues, `${path}.workflow`, "must match classification.workflow");
+    if (requireStage && stageCursor && (candidate.stage_id !== stageCursor || candidate.stage_cursor !== stageCursor)) {
+      addIssue(issues, path, "stage_id/stage_cursor must match stage_cursor");
+    }
+  };
+  if (stateWorkIdentity) bind(stateWorkIdentity, "$.work_identity", true);
+  if (isRecord(value.pending)) {
+    bind(value.pending.identity, "$.pending.identity", true);
+    const pendingRun = validateWorkflowRunIdentity(value.pending.run_identity);
+    if (pendingRun.ok && !sameRunIdentity(run, pendingRun.value)) addIssue(issues, "$.pending.run_identity", "must match run_identity");
+    if (stateWorkIdentity && isRecord(value.pending.identity) && isWorkIdentityComparable(value.pending.identity) && !sameWorkIdentity(stateWorkIdentity, value.pending.identity)) addIssue(issues, "$.pending.identity", "must match work_identity");
+  }
+  if (isRecord(value.completion_envelope)) {
+    bind(value.completion_envelope.identity, "$.completion_envelope.identity", true);
+    const envelopeRun = validateWorkflowRunIdentity(value.completion_envelope.run_identity);
+    if (envelopeRun.ok && !sameRunIdentity(run, envelopeRun.value)) addIssue(issues, "$.completion_envelope.run_identity", "must match run_identity");
+    if (stateWorkIdentity && isRecord(value.completion_envelope.identity) && isWorkIdentityComparable(value.completion_envelope.identity) && !sameWorkIdentity(stateWorkIdentity, value.completion_envelope.identity)) addIssue(issues, "$.completion_envelope.identity", "must match work_identity");
+  }
+  const child = (candidate: unknown, path: string): void => {
+    if (!isRecord(candidate)) return;
+    const childRun = validateWorkflowRunIdentity(candidate.run_identity);
+    if (childRun.ok && !sameRunIdentity(run, childRun.value)) addIssue(issues, `${path}.run_identity`, "must match run_identity");
+    bind(candidate.parent, `${path}.parent`);
+    bind(candidate.child, `${path}.child`);
+  };
+  if (hasOwn(value, "child_join")) child(value.child_join, "$.child_join");
+  if (Array.isArray(value.child_joins)) value.child_joins.forEach((join, index) => child(join, `$.child_joins[${index}]`));
+  if (isRecord(value.join_summary)) {
+    const summaryRun = validateWorkflowRunIdentity(value.join_summary.run_identity);
+    if (summaryRun.ok && !sameRunIdentity(run, summaryRun.value)) addIssue(issues, "$.join_summary.run_identity", "must match run_identity");
+    if (isRecord(value.join_summary.work_identity)) bind(value.join_summary.work_identity, "$.join_summary.work_identity");
+  }
+  if (Array.isArray(value.typed_checkpoint_decisions)) {
+    value.typed_checkpoint_decisions.forEach((decision, index) => {
+      if (!isRecord(decision)) return;
+      if (decision.run_id !== run.run_id) addIssue(issues, `$.typed_checkpoint_decisions[${index}].run_id`, "must match run_identity.run_id");
+      const decisionRun = validateWorkflowRunIdentity(decision.run_identity);
+      if (decisionRun.ok && !sameRunIdentity(run, decisionRun.value)) addIssue(issues, `$.typed_checkpoint_decisions[${index}].run_identity`, "must match run_identity");
+    });
+  }
+  if (Array.isArray(value.checkpoint_decisions)) {
+    value.checkpoint_decisions.forEach((decision, index) => {
+      if (!isRecord(decision)) return;
+      if (decision.run_id !== undefined && decision.run_id !== run.run_id) addIssue(issues, `$.checkpoint_decisions[${index}].run_id`, "must match run_identity.run_id");
+      if (decision.run_identity !== undefined) {
+        const decisionRun = validateWorkflowRunIdentity(decision.run_identity);
+        if (decisionRun.ok && !sameRunIdentity(run, decisionRun.value)) addIssue(issues, `$.checkpoint_decisions[${index}].run_identity`, "must match run_identity");
+      }
+      if (decision.work_identity !== undefined && isRecord(decision.work_identity)) bind(decision.work_identity, `$.checkpoint_decisions[${index}].work_identity`);
+    });
+  }
+  if (Array.isArray(value.trusted_checkpoint_answers)) {
+    value.trusted_checkpoint_answers.forEach((answer, index) => {
+      if (isRecord(answer) && answer.run_id !== run.run_id) addIssue(issues, `$.trusted_checkpoint_answers[${index}].run_id`, "must match run_identity.run_id");
+    });
+  }
+  if (isRecord(value.dispatch_capability)) {
+    const capabilityRun = validateWorkflowRunIdentity(value.dispatch_capability.run_identity);
+    if (capabilityRun.ok && !sameRunIdentity(run, capabilityRun.value)) addIssue(issues, "$.dispatch_capability.run_identity", "must match run_identity");
+    const issued = isRecord(value.dispatch_capability.issued_for) ? validateWorkflowRunIdentity(value.dispatch_capability.issued_for.run_identity) : null;
+    if (issued?.ok && !sameRunIdentity(run, issued.value)) addIssue(issues, "$.dispatch_capability.issued_for.run_identity", "must match run_identity");
+    const capabilityIdentity = isRecord(value.dispatch_capability.work_identity) ? value.dispatch_capability.work_identity : null;
+    if (stateWorkIdentity && capabilityIdentity && isWorkIdentityComparable(capabilityIdentity) && !sameWorkIdentity(stateWorkIdentity, capabilityIdentity)) addIssue(issues, "$.dispatch_capability.work_identity", "must match work_identity");
+    if (capabilityIdentity) bind(capabilityIdentity, "$.dispatch_capability.work_identity", true);
+    if (Array.isArray(value.dispatch_capability.pending)) {
+      value.dispatch_capability.pending.forEach((pending, index) => {
+        if (!isRecord(pending)) return;
+        const pendingRun = validateWorkflowRunIdentity(pending.run_identity);
+        if (pendingRun.ok && !sameRunIdentity(run, pendingRun.value)) addIssue(issues, `$.dispatch_capability.pending[${index}].run_identity`, "must match run_identity");
+        bind(pending.identity, `$.dispatch_capability.pending[${index}].identity`);
+      });
+    }
+    if (Array.isArray(value.dispatch_capability.dispatches)) {
+      value.dispatch_capability.dispatches.forEach((record, index) => {
+        if (!isRecord(record)) return;
+        const recordRun = validateWorkflowRunIdentity(record.run_identity);
+        if (recordRun.ok && !sameRunIdentity(run, recordRun.value)) addIssue(issues, `$.dispatch_capability.dispatches[${index}].run_identity`, "must match run_identity");
+        bind(record.work_identity, `$.dispatch_capability.dispatches[${index}].work_identity`);
+        if (isRecord(record.pending)) {
+          const pendingRun = validateWorkflowRunIdentity(record.pending.run_identity);
+          if (pendingRun.ok && !sameRunIdentity(run, pendingRun.value)) addIssue(issues, `$.dispatch_capability.dispatches[${index}].pending.run_identity`, "must match run_identity");
+        }
+        if (isRecord(record.completion)) {
+          const completionRun = validateWorkflowRunIdentity(record.completion.run_identity);
+          if (completionRun.ok && !sameRunIdentity(run, completionRun.value)) addIssue(issues, `$.dispatch_capability.dispatches[${index}].completion.run_identity`, "must match run_identity");
+        }
+        if (isRecord(record.completion_envelope)) {
+          const envelopeRun = validateWorkflowRunIdentity(record.completion_envelope.run_identity);
+          if (envelopeRun.ok && !sameRunIdentity(run, envelopeRun.value)) addIssue(issues, `$.dispatch_capability.dispatches[${index}].completion_envelope.run_identity`, "must match run_identity");
+        }
+      });
+    }
+  }
+}
+
 function validateMigrationReceipt(value: unknown, path: string, issues: TypedContractIssue[]): void {
   if (!isRecord(value)) {
     addIssue(issues, path, "must be an object");
@@ -517,6 +944,9 @@ function validateMigrationReceipt(value: unknown, path: string, issues: TypedCon
 export function validateTypedControlPlane(value: unknown): TypedContractValidationResult {
   if (!isRecord(value)) return { ok: false, issues: [{ path: "$", message: "typed control-plane input must be an object" }] };
   const issues: TypedContractIssue[] = [];
+  if (hasOwn(value, "workflow_identity")) addIssue(issues, "$.workflow_identity", "retired; persist project_identity and run_identity instead");
+  if (hasOwn(value, "project_identity")) validateProjectIdentityValue(value.project_identity, "$.project_identity", issues);
+  if (hasOwn(value, "run_identity")) validateRunIdentityValue(value.run_identity, "$.run_identity", issues);
   if (hasOwn(value, "completion_intent")) validateCompletionIntent(value.completion_intent, "$.completion_intent", issues);
   if (hasOwn(value, "checkpoint_policy")) validateCheckpointPolicy(value.checkpoint_policy, "$.checkpoint_policy", issues);
   if (hasOwn(value, "roster_policy")) validateRosterPolicy(value.roster_policy, "$.roster_policy", issues);
@@ -525,7 +955,9 @@ export function validateTypedControlPlane(value: unknown): TypedContractValidati
     if (!isRecord(value.roster_selections)) addIssue(issues, "$.roster_selections", "must be an object");
     else for (const [stage, selection] of Object.entries(value.roster_selections)) validateRosterSelection(selection, `$.roster_selections.${stage}`, issues);
   }
-  if (hasOwn(value, "work_identity")) validateWorkIdentity(value.work_identity, "$.work_identity", issues);
+  const stateWorkIdentity = hasOwn(value, "work_identity")
+    ? (validateWorkIdentity(value.work_identity, "$.work_identity", issues) ? value.work_identity as WorkIdentity : null)
+    : null;
   if (hasOwn(value, "pending")) validatePendingState(value.pending, "$.pending", issues);
   if (hasOwn(value, "child_join")) validateChildJoin(value.child_join, "$.child_join", issues);
   if (hasOwn(value, "child_joins")) {
@@ -541,37 +973,35 @@ export function validateTypedControlPlane(value: unknown): TypedContractValidati
     else value.trusted_checkpoint_answers.forEach((answer, index) => validateTrustedCheckpointAnswer(answer, `$.trusted_checkpoint_answers[${index}]`, issues));
   }
   if (hasOwn(value, "completion_envelope")) validateCompletionEnvelope(value.completion_envelope, "$.completion_envelope", issues);
+  if (hasOwn(value, "join_summary")) validateJoinSummary(value.join_summary, "$.join_summary", issues);
   if (hasOwn(value, "migration")) validateMigrationReceipt(value.migration, "$.migration", issues);
   if (hasOwn(value, "checkpoint_decisions")) {
     if (!Array.isArray(value.checkpoint_decisions)) addIssue(issues, "$.checkpoint_decisions", "must be an array");
     else value.checkpoint_decisions.forEach((decision, index) => validateCheckpointDecision(decision, `$.checkpoint_decisions[${index}]`, issues));
   }
   if (hasOwn(value, "dispatch_capability")) {
-    if (!isRecord(value.dispatch_capability)) {
-      addIssue(issues, "$.dispatch_capability", "must be an object");
-    } else {
-      const capability = value.dispatch_capability;
-      if (hasOwn(capability, "roster_selection")) validateRosterSelection(capability.roster_selection, "$.dispatch_capability.roster_selection", issues);
-      if (hasOwn(capability, "work_identity")) validateWorkIdentity(capability.work_identity, "$.dispatch_capability.work_identity", issues);
-      if (hasOwn(capability, "pending")) {
-        if (!Array.isArray(capability.pending)) addIssue(issues, "$.dispatch_capability.pending", "must be an array");
-        else capability.pending.forEach((pending, index) => validatePendingState(pending, `$.dispatch_capability.pending[${index}]`, issues));
-      }
-      if (hasOwn(capability, "dispatches")) {
-        if (!Array.isArray(capability.dispatches)) addIssue(issues, "$.dispatch_capability.dispatches", "must be an array");
-        else capability.dispatches.forEach((record, index) => {
-          const recordPath = `$.dispatch_capability.dispatches[${index}]`;
-          if (!isRecord(record)) {
-            addIssue(issues, recordPath, "must be an object");
-            return;
-          }
-          if (hasOwn(record, "work_identity")) validateWorkIdentity(record.work_identity, `${recordPath}.work_identity`, issues);
-          if (hasOwn(record, "pending")) validatePendingState(record.pending, `${recordPath}.pending`, issues);
-          if (hasOwn(record, "completion_envelope")) validateCompletionEnvelope(record.completion_envelope, `${recordPath}.completion_envelope`, issues);
-        });
-      }
+    const capabilityWorkIdentity = validateDispatchCapability(value.dispatch_capability, "$.dispatch_capability", issues);
+    if (stateWorkIdentity && capabilityWorkIdentity && !sameWorkIdentity(stateWorkIdentity, capabilityWorkIdentity)) {
+      addIssue(issues, "$.dispatch_capability.work_identity", "must match state.work_identity");
     }
   }
+  if (hasOwn(value, "retired_capabilities")) {
+    if (!Array.isArray(value.retired_capabilities)) {
+      addIssue(issues, "$.retired_capabilities", "must be an array");
+    } else {
+      if (value.retired_capabilities.length > 128) addIssue(issues, "$.retired_capabilities", "must contain at most 128 entries per run");
+      const retiredKeys = new Set<string>();
+      value.retired_capabilities.forEach((entry, index) => {
+        validateRetiredCapability(entry, `$.retired_capabilities[${index}]`, issues);
+        if (isRecord(entry)) {
+          const key = `${String(entry.capability_id)}:${String(entry.capability_epoch)}`;
+          if (retiredKeys.has(key)) addIssue(issues, `$.retired_capabilities[${index}]`, "duplicate capability_id+capability_epoch");
+          retiredKeys.add(key);
+        }
+      });
+    }
+  }
+  validateTypedIdentityCoherence(value, stateWorkIdentity, issues);
   return issues.length > 0 ? { ok: false, issues } : { ok: true };
 }
 
@@ -633,9 +1063,20 @@ export interface WorkflowContractOptions {
   /** Require a persisted, branch-current run. Defaults to true. */
   requireState?: boolean;
   workflow?: WorkflowName;
+  /** Manager-supplied canonical branch; never inferred from process cwd. */
   branch?: string;
   stageId?: string;
   maxInstructions?: number;
+  /**
+   * These values are produced by host validation. Contract resolution never
+   * reads runtime config, searches a profile directory, or infers a provider.
+   */
+  policySnapshot?: Readonly<PolicySnapshot>;
+  effectivePolicy?: Readonly<EffectivePolicy>;
+  catalog?: Readonly<ProviderCatalog>;
+  project_identity?: Readonly<ProjectIdentity>;
+  run_identity?: Readonly<WorkflowRunIdentity>;
+  agentInventory?: readonly AgentRef[];
 }
 
 export interface WorkflowStageContract {
@@ -644,7 +1085,7 @@ export interface WorkflowStageContract {
   type: StageDef["type"];
   description: string;
   prompt: string;
-  roles: Array<{ role: string; agent: string }>;
+  roles: Array<{ role: string; agent: string; agent_ref: AgentRef }>;
   parallel: boolean;
   consumes: string[];
   produces: string[];
@@ -704,6 +1145,10 @@ function artifactSchemasFor(stage: StageDef): Record<string, JsonSchemaDef | nul
 }
 
 export interface WorkflowContract {
+  /** The validated profile-free project identity used for this contract. */
+  project_identity: ProjectIdentity;
+  /** The exact prepared run identity bound to durable state and dispatch. */
+  run_identity: WorkflowRunIdentity;
   workflow: WorkflowName;
   profile: { title: string; description: string; path: string | null; hash: string; source: "workflow" };
   completion_intent: CompletionIntent;
@@ -717,6 +1162,8 @@ export interface WorkflowContract {
   completion_envelope: CompletionEnvelope | null;
   status: WorkflowContractStatus;
   state: {
+    project_identity: ProjectIdentity;
+    run_identity: WorkflowRunIdentity;
     path: string | null;
     /** Exact directory where the current run's declared artifacts must be written. */
     artifactsDir: string | null;
@@ -754,6 +1201,20 @@ export interface WorkflowContract {
   };
 }
 
+function errorDiagnostic(code: WorkflowContractError["code"], message: string): WorkflowV2Diagnostic {
+  const diagnosticCode: WorkflowV2Diagnostic["code"] =
+    code === "STATE_STALE" || code === "PROFILE_MISMATCH" ? "IDENTITY_MISMATCH"
+      : code === "PROFILE_MISSING" || code === "STAGE_MISSING" ? "PROFILE_UNAVAILABLE"
+        : code === "POLICY_INVALID" || code === "STATE_INVALID" ? "CONFIG_MALFORMED"
+          : "MIGRATION_REQUIRED";
+  return createDiagnostic({
+    code: diagnosticCode,
+    operation: "profile.resolve",
+    evidence: { field: message.match(/'([^']+)'/)?.[1] ?? null },
+    remediation: "Provide unchanged selected-provider policy, catalog and identity snapshots before resolving workflow state.",
+  });
+}
+
 export class WorkflowContractError extends Error {
   readonly code:
     | "STATE_MISSING"
@@ -763,11 +1224,15 @@ export class WorkflowContractError extends Error {
     | "STAGE_MISSING"
     | "PROFILE_MISMATCH"
     | "POLICY_INVALID"
-    | "MIGRATION_CONFLICT";
-  constructor(code: WorkflowContractError["code"], message: string) {
+    | "MIGRATION_CONFLICT"
+    | "MIGRATION_REQUIRED";
+  readonly diagnostic: WorkflowV2Diagnostic;
+
+  constructor(code: WorkflowContractError["code"], message: string, diagnostic?: WorkflowV2Diagnostic) {
     super(message);
     this.name = "WorkflowContractError";
     this.code = code;
+    this.diagnostic = diagnostic ?? errorDiagnostic(code, message);
   }
 }
 
@@ -840,17 +1305,223 @@ function validationMessage(label: string, result: TypedContractValidationResult)
   return `${label}: ${result.issues.map((issue) => `${issue.path} ${issue.message}`).join("; ")}`;
 }
 
+function sameProjectIdentity(left: ProjectIdentity, right: ProjectIdentity): boolean {
+  return left.root_instance_id === right.root_instance_id
+    && left.provider_id === right.provider_id
+    && left.descriptor_fingerprint === right.descriptor_fingerprint
+    && left.executable_provenance.build_fingerprint === right.executable_provenance.build_fingerprint
+    && left.executable_provenance.runtime_fingerprint === right.executable_provenance.runtime_fingerprint
+    && left.catalog_content_digest === right.catalog_content_digest
+    && left.config_byte_sha256 === right.config_byte_sha256
+    && left.config_semantic_sha256 === right.config_semantic_sha256
+    && left.session.session_id === right.session.session_id
+    && left.session.lifecycle_id === right.session.lifecycle_id;
+}
+
+function sameRunIdentity(left: WorkflowRunIdentity, right: WorkflowRunIdentity): boolean {
+  return sameProjectIdentity(left, right)
+    && left.run_id === right.run_id
+    && left.profile_identity.id === right.profile_identity.id
+    && left.profile_identity.fingerprint === right.profile_identity.fingerprint;
+}
+type WorkIdentityComparable = {
+  run_id: string;
+  wave_id: string;
+  slice_id: string;
+  session_id: string;
+  workflow: string;
+  stage_id: string;
+  stage_cursor: string;
+  capability_id: string;
+  capability_epoch: string;
+  slot_id: string;
+  task_id: string;
+  dispatch_id: string;
+  attempt: number;
+  worker_id: string;
+};
+function isWorkIdentityComparable(value: UnknownRecord): value is WorkIdentityComparable {
+  return hasOwn(value, "run_id") && nonEmptyString(value.run_id)
+    && hasOwn(value, "wave_id") && nonEmptyString(value.wave_id)
+    && hasOwn(value, "slice_id") && nonEmptyString(value.slice_id)
+    && hasOwn(value, "session_id") && nonEmptyString(value.session_id)
+    && hasOwn(value, "workflow") && nonEmptyString(value.workflow)
+    && hasOwn(value, "stage_id") && nonEmptyString(value.stage_id)
+    && hasOwn(value, "stage_cursor") && nonEmptyString(value.stage_cursor)
+    && hasOwn(value, "capability_id") && nonEmptyString(value.capability_id)
+    && hasOwn(value, "capability_epoch") && nonEmptyString(value.capability_epoch)
+    && hasOwn(value, "slot_id") && nonEmptyString(value.slot_id)
+    && hasOwn(value, "task_id") && nonEmptyString(value.task_id)
+    && hasOwn(value, "dispatch_id") && nonEmptyString(value.dispatch_id)
+    && hasOwn(value, "attempt") && typeof value.attempt === "number"
+    && Number.isInteger(value.attempt) && value.attempt > 0
+    && hasOwn(value, "worker_id") && nonEmptyString(value.worker_id);
+}
+function sameWorkIdentity(left: WorkIdentityComparable, right: WorkIdentityComparable): boolean {
+  return left.run_id === right.run_id
+    && left.wave_id === right.wave_id
+    && left.slice_id === right.slice_id
+    && left.session_id === right.session_id
+    && left.workflow === right.workflow
+    && left.stage_id === right.stage_id
+    && left.stage_cursor === right.stage_cursor
+    && left.capability_id === right.capability_id
+    && left.capability_epoch === right.capability_epoch
+    && left.slot_id === right.slot_id
+    && left.task_id === right.task_id
+    && left.dispatch_id === right.dispatch_id
+    && left.attempt === right.attempt
+    && left.worker_id === right.worker_id;
+}
+
+
+function requiredValidatedContext(cwd: string, options: WorkflowContractOptions): {
+  policySnapshot: Readonly<PolicySnapshot>;
+  effectivePolicy: Readonly<EffectivePolicy>;
+  catalog: Readonly<ProviderCatalog>;
+  project_identity: ProjectIdentity;
+  run_identity?: WorkflowRunIdentity;
+  agentInventory: readonly AgentRef[];
+} {
+  const policySnapshot = options.policySnapshot;
+  const effectivePolicy = options.effectivePolicy;
+  const catalog = options.catalog;
+  const project_identity = options.project_identity;
+  const agentInventory = options.agentInventory;
+  if (!policySnapshot || !effectivePolicy || !catalog || !project_identity || !agentInventory) {
+    throw new WorkflowContractError(
+      "MIGRATION_REQUIRED",
+      "workflow contract requires the immutable policy, provider catalog, qualified agent inventory, and project identity from host admission",
+    );
+  }
+  if (!Array.isArray(agentInventory)) {
+    throw new WorkflowContractError("POLICY_INVALID", "qualified provider agent inventory is malformed");
+  }
+  const checkedProject = validateProjectIdentity(project_identity);
+  if (!checkedProject.ok) {
+    throw new WorkflowContractError("POLICY_INVALID", "project identity is malformed", checkedProject.diagnostics[0]);
+  }
+  const checkedRun = options.run_identity === undefined ? null : validateWorkflowRunIdentity(options.run_identity);
+  if (checkedRun && !checkedRun.ok) {
+    throw new WorkflowContractError("POLICY_INVALID", "workflow run identity is malformed", checkedRun.diagnostics[0]);
+  }
+  if (checkedRun && checkedRun.ok && !sameProjectIdentity(checkedProject.value, checkedRun.value)) {
+    throw new WorkflowContractError("PROFILE_MISMATCH", "workflow run identity does not inherit the admitted project identity");
+  }
+  if (typeof policySnapshot.root !== "string" || policySnapshot.root !== cwd) {
+    throw new WorkflowContractError("PROFILE_MISMATCH", "validated policy root does not match the workflow contract root");
+  }
+  const provider = effectivePolicy.provider;
+  const documentProvider = policySnapshot.document?.provider;
+  if (
+    !provider
+    || !documentProvider
+    || provider.id !== documentProvider.id
+    || provider.protocol_version !== documentProvider.protocol_version
+    || provider.descriptor_fingerprint !== documentProvider.descriptor_fingerprint
+    || provider.catalog_content_digest !== documentProvider.catalog_content_digest
+    || provider.id !== checkedProject.value.provider_id
+    || provider.descriptor_fingerprint !== checkedProject.value.descriptor_fingerprint
+    || provider.catalog_content_digest !== checkedProject.value.catalog_content_digest
+    || catalog.content_digest !== checkedProject.value.catalog_content_digest
+  ) {
+    throw new WorkflowContractError("PROFILE_MISMATCH", "policy, provider catalog, and project identity are not the same immutable selection");
+  }
+  if (
+    policySnapshot.byte_sha256 !== checkedProject.value.config_byte_sha256
+    || policySnapshot.semantic_sha256 !== checkedProject.value.config_semantic_sha256
+  ) {
+    throw new WorkflowContractError("PROFILE_MISMATCH", "policy snapshot digest does not match the project identity");
+  }
+  for (const candidate of agentInventory) {
+    if (
+      !candidate
+      || typeof candidate.registered_name !== "string"
+      || candidate.registered_name.trim().length === 0
+      || candidate.provider_id !== provider.id
+      || !isProviderId(candidate.provider_id)
+      || !isWorkflowV2Digest(candidate.source_fingerprint)
+    ) {
+      throw new WorkflowContractError("POLICY_INVALID", "qualified provider agent inventory contains an invalid or unselected-provider identity");
+    }
+  }
+  for (const [role, ref] of Object.entries(effectivePolicy.roles ?? {})) {
+    if (
+      !ref
+      || ref.provider_id !== provider.id
+      || !isProviderId(ref.provider_id)
+      || !isWorkflowV2Digest(ref.source_fingerprint)
+    ) {
+      throw new WorkflowContractError("POLICY_INVALID", `policy role '${role}' is not a qualified agent for the selected provider`);
+    }
+    const observed = agentInventory.find((candidate) =>
+      candidate.registered_name === ref.registered_name
+      && candidate.provider_id === ref.provider_id
+      && candidate.source_fingerprint === ref.source_fingerprint
+    );
+    if (!observed) {
+      throw new WorkflowContractError("POLICY_INVALID", `policy role '${role}' is absent from the selected provider inventory`);
+    }
+  }
+  for (const rule of effectivePolicy.scope_map ?? []) {
+    const ref = rule?.dev_agent;
+    const observed = ref && agentInventory.find((candidate) =>
+      candidate.registered_name === ref.registered_name
+      && candidate.provider_id === ref.provider_id
+      && candidate.source_fingerprint === ref.source_fingerprint
+    );
+    if (!ref || !observed || ref.provider_id !== provider.id) {
+      throw new WorkflowContractError("POLICY_INVALID", `scope rule '${rule?.scope ?? ""}' has no matching qualified provider agent`);
+    }
+  }
+  return {
+    policySnapshot,
+    effectivePolicy,
+    catalog,
+    project_identity: checkedProject.value,
+    run_identity: checkedRun?.ok ? checkedRun.value : undefined,
+    agentInventory,
+  };
+}
+
 /** Resolve the persisted run, profile and current stage into one bounded, typed contract. */
 export function resolveWorkflowContract(cwd: string, options: WorkflowContractOptions = {}): WorkflowContract {
-  const expectedBranch = options.branch ?? resolveActiveBranch(cwd);
-  const resolved = resolveState(cwd, expectedBranch);
-  if (resolved.invalid) throw new WorkflowContractError("STATE_INVALID", "workflow state is malformed or unsafe");
-  const state = resolved.state as TeamState | null;
+  const expectedBranch = options.branch?.trim();
+  if (!expectedBranch) {
+    throw new WorkflowContractError("MIGRATION_REQUIRED", "workflow contract requires the canonical branch from the active session manager");
+  }
+  const context = requiredValidatedContext(cwd, options);
+  const resolved = resolveState(cwd, expectedBranch, context.run_identity);
+  if (resolved.invalid) {
+    const diagnostic = resolved.diagnostics?.[0];
+    const code = diagnostic?.code === "IDENTITY_MISMATCH"
+      ? "STATE_STALE"
+      : diagnostic?.code === "MIGRATION_REQUIRED"
+        ? "MIGRATION_REQUIRED"
+        : "STATE_INVALID";
+    const message = diagnostic
+      ? `${diagnostic.code}: ${diagnostic.remediation}`
+      : "workflow state is malformed or unsafe";
+    throw new WorkflowContractError(code, message, diagnostic);
+  }
+  if (resolved.isLegacy) {
+    throw new WorkflowContractError("MIGRATION_REQUIRED", "legacy workflow state is not an authority for provider-v2 contract resolution");
+  }
+  const state = resolved.state;
   if (options.requireState !== false && (!state || !resolved.statePath)) {
     throw new WorkflowContractError("STATE_MISSING", "workflow contract requires an active persisted state");
   }
+  if (state && (!state.project_identity || !state.run_identity)) {
+    throw new WorkflowContractError("MIGRATION_REQUIRED", "persisted workflow state has no complete project and run identity");
+  }
+  if (state && !sameProjectIdentity(state.project_identity, context.project_identity)) {
+    throw new WorkflowContractError("STATE_STALE", "persisted workflow project identity differs from the admitted project identity");
+  }
+  if (state && context.run_identity && !sameRunIdentity(state.run_identity, context.run_identity)) {
+    throw new WorkflowContractError("STATE_STALE", "persisted workflow run identity differs from the requested run identity");
+  }
   if (state && resolved.isStale) {
-    throw new WorkflowContractError("STATE_STALE", `workflow state branch '${state.branch}' is stale (current '${expectedBranch ?? "unknown"}')`);
+    throw new WorkflowContractError("STATE_STALE", `workflow state branch '${state.branch}' is stale (current '${expectedBranch}')`);
   }
   if (state) {
     const stateValidation = validateTypedControlPlane(state);
@@ -861,7 +1532,11 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
       throw new WorkflowContractError("MIGRATION_CONFLICT", "persisted completion_intent conflicts with classification.completion_intent");
     }
   }
-  const workflow = options.workflow ?? state?.classification?.workflow;
+  const run_identity = state?.run_identity ?? context.run_identity;
+  if (!run_identity) {
+    throw new WorkflowContractError("MIGRATION_REQUIRED", "workflow contract requires the exact prepared run identity");
+  }
+  const workflow = options.workflow ?? state?.classification?.workflow ?? run_identity.profile_identity.id;
   if (!workflow) {
     throw new WorkflowContractError(
       options.requireState === false ? "PROFILE_MISSING" : "STATE_MISSING",
@@ -871,12 +1546,18 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   if (state && options.workflow && options.workflow !== state.classification?.workflow) {
     throw new WorkflowContractError("PROFILE_MISMATCH", "requested workflow does not match persisted classification");
   }
-  const profile = loadProfile(workflow);
-  if (!profile) throw new WorkflowContractError("PROFILE_MISSING", `workflow profile '${workflow}' is unavailable`);
+  if (run_identity.profile_identity.id !== workflow) {
+    throw new WorkflowContractError("PROFILE_MISMATCH", `workflow '${workflow}' does not match the selected catalog profile`);
+  }
+  const loadedProfile = loadProfileByIdentity(context.catalog, run_identity.profile_identity);
+  if (!loadedProfile.ok) {
+    throw new WorkflowContractError("PROFILE_MISSING", `workflow profile '${workflow}' is unavailable`, loadedProfile.diagnostics[0]);
+  }
+  const profile = loadedProfile.value;
   const profileValidation = validateTypedControlPlane(profile);
   if (!profileValidation.ok) throw new WorkflowContractError("POLICY_INVALID", validationMessage(`workflow profile '${workflow}'`, profileValidation));
-  const path = resolveWorkflowProfilePath(workflow, cwd);
-  const pHash = sharedProfileHash(profile);
+  const path = null;
+  const pHash = run_identity.profile_identity.fingerprint;
   const persistedHash = state?.profile_hash;
   if (persistedHash && persistedHash !== pHash) throw new WorkflowContractError("PROFILE_MISMATCH", "persisted profile hash is stale");
   const stageId = options.stageId ?? state?.stage_cursor ?? profile.stages.find((candidate) => candidate.id.length > 0)?.id;
@@ -885,9 +1566,33 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   const stageValidation = validateTypedControlPlane(stage);
   if (!stageValidation.ok) throw new WorkflowContractError("POLICY_INVALID", validationMessage(`workflow stage '${stage.id}'`, stageValidation));
 
-  const config = resolveConfig(cwd);
-  const flags = state?.scope ?? resolveScope([], config);
-  const slots = resolveStageDispatchSlots(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  const flags = state?.scope ?? {
+    scope: [],
+    has_security: Boolean(context.effectivePolicy.flags.has_security),
+    has_infra: Boolean(context.effectivePolicy.flags.has_infra),
+    has_ui: Boolean(context.effectivePolicy.flags.has_ui),
+    has_runtime: Boolean(context.effectivePolicy.flags.has_runtime),
+    dev_agent: null,
+  };
+  let slots: DispatchSlot[];
+  try {
+    slots = resolveStageDispatchSlots(stage, {
+      cwd,
+      flags,
+      state: state ?? undefined,
+      project_identity: context.project_identity,
+      run_identity,
+      catalog: context.catalog,
+      effectivePolicy: context.effectivePolicy,
+      agentInventory: context.agentInventory,
+      resolveDevAgent: () => flags.dev_agent,
+    });
+  } catch (error) {
+    if (error instanceof WorkflowStageIdentityError) {
+      throw new WorkflowContractError("POLICY_INVALID", error.message, error.diagnostic);
+    }
+    throw error;
+  }
   const kind = stage.type === "single" || stage.type === "consilium" ? stage.type : null;
   const statuses = state?.stages.map(item => ({ id: item.id, status: item.status }))
     ?? profile.stages.map(item => ({ id: item.id, status: "pending" }));
@@ -895,6 +1600,14 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   if (capability) {
     const capabilityValidation = validateTypedControlPlane(capability);
     if (!capabilityValidation.ok) throw new WorkflowContractError("POLICY_INVALID", validationMessage("dispatch capability typed contract", capabilityValidation));
+    if (
+      !capability.project_identity
+      || !capability.run_identity
+      || !sameProjectIdentity(capability.project_identity, context.project_identity)
+      || !sameRunIdentity(capability.run_identity, run_identity)
+    ) {
+      throw new WorkflowContractError("STATE_STALE", "dispatch capability identity differs from the admitted project/run identity");
+    }
   }
 
   const intentCandidate = state?.completion_intent ?? stage.completion_intent ?? profile.completion_intent;
@@ -914,10 +1627,6 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
       : stage.checkpoint
         ? "migration"
         : "none";
-  // Classification.autonomous is legacy/model routing input, not a checkpoint
-  // permission field. A typed profile/state policy therefore remains valid
-  // alongside it; provenance records the legacy input without comparing
-  // unrelated semantics or granting autonomous authorization.
   const checkpoint_rule = stage.checkpoint
     ? checkpoint_policy?.rules[stage.checkpoint] ?? null
     : null;
@@ -944,7 +1653,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   const roster_selection = stateSelection ?? capabilitySelection;
   const capabilityIdentity = capability?.work_identity ?? null;
   const stateIdentity = state?.work_identity ?? null;
-  if (stateIdentity && capabilityIdentity && hash(stateIdentity) !== hash(capabilityIdentity)) {
+  if (stateIdentity && capabilityIdentity && !sameWorkIdentity(stateIdentity, capabilityIdentity)) {
     throw new WorkflowContractError("MIGRATION_CONFLICT", "state work_identity conflicts with capability work_identity");
   }
   const work_identity = stateIdentity ?? capabilityIdentity;
@@ -966,13 +1675,26 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   const selectionRequired = roster_policy !== null;
   const selectionReady = !selectionRequired || roster_selection !== null;
   const capabilityStatus = capability?.status;
+  const roleAgents = slots.map((slot) => {
+    const ref = context.effectivePolicy.roles[slot.role];
+    if (!ref) {
+      throw new WorkflowContractError("POLICY_INVALID", `stage role '${slot.role}' has no exact qualified policy mapping`);
+    }
+    const observed = context.agentInventory.find((candidate) =>
+      candidate.registered_name === ref.registered_name
+      && candidate.provider_id === ref.provider_id
+      && candidate.source_fingerprint === ref.source_fingerprint
+    );
+    if (!observed) {
+      throw new WorkflowContractError("POLICY_INVALID", `stage role '${slot.role}' has no matching qualified provider inventory entry`);
+    }
+    return { role: slot.slot, agent: ref.registered_name, agent_ref: ref };
+  });
   const dispatchAllowed = state !== null &&
     kind !== null &&
     selectionReady &&
+    roleAgents.length === slots.length &&
     (capabilityStatus === "ready" || capabilityStatus === "dispatched");
-  const selectedRoleAgents = roster_selection?.selected.map((entry) => ({ role: entry.slot_id, agent: entry.agent })) ?? [];
-  const configuredRoleAgents = slots.map(slot => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
-  const roleAgents = configuredRoleAgents.length > 0 ? configuredRoleAgents : selectedRoleAgents;
   const status = workflowStatus(state, stage.id, pending);
   const legacyInputs = [
     state?.classification?.autonomous !== undefined ? "classification.autonomous" : null,
@@ -980,11 +1702,9 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     stage.autonomous ? "stage.autonomous" : null,
     !intentCandidate ? "completion_intent" : null,
     !policyCandidate && stage.checkpoint ? "checkpoint_policy" : null,
-    !roster_policy && (stage.roles || stage.role) ? "roles/role" : null,
   ].filter((input): input is string => input !== null);
   const warnings = [
     stage.autonomous ? "stage.autonomous is display/migration input only" : null,
-    !roster_policy && (stage.roles || stage.role) ? "legacy roles/role manifest remains exact and is not adaptive selection" : null,
     !roster_selection && roster_policy ? "adaptive stage awaits a frozen roster_selection before dispatch" : null,
   ].filter((warning): warning is string => warning !== null);
   const control_plane = controlPlaneProvenance(
@@ -1045,6 +1765,8 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     : hash({ source: "stateless", workflow, stage: stage.id, profileHash: pHash });
   return {
     workflow,
+    project_identity: context.project_identity,
+    run_identity,
     profile: { title: profile.title, description: profile.description, path, hash: pHash, source: "workflow" },
     completion_intent,
     checkpoint_policy,
@@ -1057,9 +1779,11 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     completion_envelope,
     status,
     state: {
+      project_identity: context.project_identity,
+      run_identity,
       path: resolved.statePath,
       artifactsDir: resolved.artifactsDir,
-      branch: state?.branch ?? expectedBranch ?? "",
+      branch: state?.branch ?? expectedBranch,
       workflow,
       profileHash: pHash,
       stageCursor: state?.stage_cursor ?? stage.id,

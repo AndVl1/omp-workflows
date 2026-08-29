@@ -33,13 +33,17 @@ import {
   renderSessionMarkdown,
   sectionAnchorOf,
 } from "../src/visualize/markdown.js";
-import { buildSessionSnapshot } from "../src/visualize/snapshot.js";
+import {
+  buildSessionSnapshot,
+  type BuildSessionSnapshotContext,
+} from "../src/visualize/snapshot.js";
 import {
   listCtoSources,
   resolveCtoSource,
   resolveDoWorkSource,
   type SessionSourceEntry,
 } from "../src/report/session-source.js";
+import type { ReportStorageAuthority } from "../src/report/storage.js";
 import {
   DEFAULT_RENDERER_IDENTITY,
   REGENERATE_HINT,
@@ -63,6 +67,8 @@ import {
   buildSelectedManifest,
   type CanonicalSessionInput,
 } from "./fixtures/visualize-fixtures.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
+import { reportStorageFor } from "./report-storage-fixtures.js";
 
 // ── Harness: materialize a canonical input onto a temp workspace ─────────────
 
@@ -95,25 +101,50 @@ function materialize(cwd: string, input: CanonicalSessionInput, extraFiles: Reco
   for (const f of input.artifacts) write(join(cwd, f.relPath), f.content);
 }
 
-function entryOf(cwd: string, input: CanonicalSessionInput): SessionSourceEntry {
+function entryOf(storage: ReportStorageAuthority, input: CanonicalSessionInput): SessionSourceEntry {
   if (input.kind === "cto") {
     if (input.state.format === "markdown" && input.state.content.includes("# Summary")) {
-      const entry = listCtoSources(cwd).find((e) => e.id === input.id);
+      const entry = listCtoSources(storage).find((e) => e.id === input.id);
       if (!entry) throw new Error(`terminal markdown run not discovered: ${input.id}`);
       return entry;
     }
-    const resolved = resolveCtoSource(cwd, input.id);
+    const resolved = resolveCtoSource(storage, input.id);
     if (!resolved) throw new Error(`cto run not resolved: ${input.id}`);
     return resolved;
   }
-  const resolved = resolveDoWorkSource(cwd, input.id);
+  const resolved = resolveDoWorkSource(storage, input.id);
   if (!resolved) throw new Error(`do-work session not resolved: ${input.id}`);
   return resolved;
 }
 
-function sessionOf(cwd: string, input: CanonicalSessionInput, full = false): VisualizationSession {
-  return buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT, full ? { full: true } : {});
+const snapshotContexts = new Map<string, BuildSessionSnapshotContext>();
+
+function contextForEntry(entry: SessionSourceEntry): BuildSessionSnapshotContext {
+  const workflow = entry.kind === "cto" ? "cto" : (entry.state?.classification?.workflow ?? "standard");
+  const cached = snapshotContexts.get(workflow);
+  if (cached) return cached;
+  const fixture = workflowV2Fixture(readWorkflowProfile(workflow));
+  const context: BuildSessionSnapshotContext = {
+    project_identity: fixture.project_identity,
+    catalog: fixture.catalog,
+    effective_policy: fixture.effective_policy,
+  };
+  snapshotContexts.set(workflow, context);
+  return context;
 }
+
+function snapshotOptions(entry: SessionSourceEntry, full = false) {
+  return full
+    ? { full: true, context: contextForEntry(entry) }
+    : { context: contextForEntry(entry) };
+}
+
+function sessionOf(cwd: string, input: CanonicalSessionInput, full = false): VisualizationSession {
+  const storage = reportStorageFor(cwd);
+  const entry = entryOf(storage, input);
+  return buildSessionSnapshot(storage, entry, FIXED_GENERATED_AT, snapshotOptions(entry, full));
+}
+
 
 function caseInput(id: string): CanonicalSessionInput {
   const found = buildFixtureInventory().cases.find((c) => c.id === id);

@@ -7,6 +7,8 @@
  *
  * Report parity is asserted against buildSessionReport: the public report
  * behavior must remain unchanged after the assemble.ts delegation.
+ *
+ * <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core -->
  */
 
 import { test } from "node:test";
@@ -24,12 +26,55 @@ import {
   listSessions,
   resolveCtoSource,
   resolveDoWorkSource,
+  markdownCtoState,
 } from "../src/report/session-source.js";
-import { buildSessionReport } from "../src/report/assemble.js";
-import { markdownCtoState } from "../src/commands/cto.js";
+import { buildSessionReport, type ReportAssemblyOptions } from "../src/report/assemble.js";
 import type { TeamState } from "../src/engine/types.js";
 import type { CtoState } from "../src/cto/types.js";
+import { readWorkflowProfile, workflowV2Fixture, type WorkflowV2TestFixture } from "./workflow-v2-fixtures.js";
+import { reportStorageFor } from "./report-storage-fixtures.js";
+import type {
+  CanonicalRoot,
+  PolicyDocument,
+  PolicySnapshot,
+  WorkflowPolicy,
+} from "../src/workflow-v2/types.js";
 
+
+const STANDARD_FIXTURE = workflowV2Fixture(readWorkflowProfile("standard"));
+const CTO_FIXTURE = workflowV2Fixture(readWorkflowProfile("cto"), { runId: "run-1" });
+
+function reportOptions(cwd: string, fixture: WorkflowV2TestFixture): ReportAssemblyOptions {
+  const provider = fixture.effective_policy.provider;
+  const policy: WorkflowPolicy = {
+    roles: fixture.effective_policy.roles,
+    scope_map: [],
+    roster_overrides: [],
+    flags: {},
+    runtime_classes: {},
+    ui_classes: {},
+    design_system: null,
+    commands: fixture.effective_policy.commands,
+    workflow: fixture.effective_policy.workflow,
+    prompt_context: {},
+    required_capabilities: [],
+  };
+  const document: PolicyDocument = { schema_version: 2, provider, policy };
+  const policySnapshot: PolicySnapshot = {
+    root: cwd as CanonicalRoot,
+    document,
+    byte_sha256: fixture.project_identity.config_byte_sha256,
+    semantic_sha256: fixture.project_identity.config_semantic_sha256,
+    byte_length: 0,
+  };
+  return {
+    policySnapshot,
+    effectivePolicy: fixture.effective_policy,
+    catalog: fixture.catalog,
+    project_identity: fixture.project_identity,
+    agentInventory: fixture.agent_inventory,
+  };
+}
 function makeTeamState(overrides: Partial<TeamState> = {}): TeamState {
   return {
     schema: 1,
@@ -41,27 +86,34 @@ function makeTeamState(overrides: Partial<TeamState> = {}): TeamState {
       workflow: "standard",
       autonomous: false,
     },
+    workflow: STANDARD_FIXTURE.profile.name,
     task: "Discovery fixture",
     workflow_override: false,
     issue: null,
     stage_cursor: "implementation",
+    cursor_epoch: "session-source-epoch",
     stages: [{ id: "implementation", status: "in_progress" }],
     artifacts: {},
     pause: { kind: "none", reason: "" },
     updated_at: "2026-08-08T10:00:00.000Z",
+    project_identity: STANDARD_FIXTURE.project_identity,
+    run_identity: STANDARD_FIXTURE.run_identity,
     ...overrides,
   };
 }
 
 function makeCtoState(overrides: Partial<CtoState> = {}): CtoState {
+  const id = overrides.id ?? "run-1";
+  const runIdentity = { ...CTO_FIXTURE.run_identity, run_id: id };
   return {
     schema: 2,
-    id: "run-1",
+    id,
     task: "Decompose the migration",
     branch: "feat/payments",
     autonomous: true,
     classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: true },
-    plan: { id: "run-1", task: "Decompose the migration", teams: [], created_at: "2026-08-08T09:00:00.000Z" },
+    run_identity: runIdentity,
+    plan: { id, task: "Decompose the migration", teams: [], created_at: "2026-08-08T09:00:00.000Z", run_identity: runIdentity },
     teams: [],
     integration: { status: "pending" },
     pause: { kind: "none", reason: "" },
@@ -99,22 +151,22 @@ test("session-source: exact feature id resolves; unknown and unsafe ids are null
   try {
     writeFeature(cwd, "alpha", makeTeamState({ updated_at: "2026-08-08T09:00:00.000Z" }));
 
-    const src = resolveDoWorkSource(cwd, "alpha");
+    const src = resolveDoWorkSource(reportStorageFor(cwd), "alpha");
     assert.ok(src);
     assert.equal(src.kind, "do-work");
     assert.equal(src.id, "alpha");
     assert.equal(src.isLegacy, false);
     assert.equal(src.status, "ok");
     assert.equal(src.state?.updated_at, "2026-08-08T09:00:00.000Z");
-    assert.equal(src.stateDir, join(cwd, ".work-state", "features", "alpha"));
-    assert.equal(src.artifactsDir, join(cwd, ".work-state", "features", "alpha", "artifacts"));
+    assert.equal(src.stateDir, join(".work-state", "features", "alpha"));
+    assert.equal(src.artifactsDir, join(".work-state", "features", "alpha", "artifacts"));
 
-    assert.equal(resolveDoWorkSource(cwd, "ghost"), null, "unknown id → null");
-    assert.equal(resolveDoWorkSource(cwd, "../escape"), null, "traversal id → null");
-    assert.equal(resolveDoWorkSource(cwd, "a/b"), null, "path-like id → null");
-    assert.equal(resolveDoWorkSource(cwd, ".."), null, "parent-segment id → null");
-    assert.equal(resolveDoWorkSource(cwd, "."), null, "self-segment id → null");
-    assert.equal(resolveDoWorkSource(cwd, "a\\b"), null, "backslash-shaped id never resolves (rejected or absent)");
+    assert.equal(resolveDoWorkSource(reportStorageFor(cwd), "ghost"), null, "unknown id → null");
+    assert.equal(resolveDoWorkSource(reportStorageFor(cwd), "../escape"), null, "traversal id → null");
+    assert.equal(resolveDoWorkSource(reportStorageFor(cwd), "a/b"), null, "path-like id → null");
+    assert.equal(resolveDoWorkSource(reportStorageFor(cwd), ".."), null, "parent-segment id → null");
+    assert.equal(resolveDoWorkSource(reportStorageFor(cwd), "."), null, "self-segment id → null");
+    assert.equal(resolveDoWorkSource(reportStorageFor(cwd), "a\\b"), null, "backslash-shaped id never resolves (rejected or absent)");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -126,20 +178,22 @@ test("session-source: legacy id resolves only the legacy root; a feature named l
     writeLegacy(cwd, makeTeamState({ updated_at: "2026-08-08T08:00:00.000Z" }));
     writeFeature(cwd, "legacy", makeTeamState({ updated_at: "2026-08-08T09:00:00.000Z" }));
 
-    const src = resolveDoWorkSource(cwd, "legacy");
+    const src = resolveDoWorkSource(reportStorageFor(cwd), "legacy");
     assert.ok(src);
     assert.equal(src.isLegacy, true, "exact id 'legacy' is the legacy root, never a feature");
     assert.equal(src.id, "legacy");
-    assert.equal(src.stateDir, join(cwd, ".work-state"));
+    assert.equal(src.stateDir, join(".work-state"));
     assert.equal(src.state?.updated_at, "2026-08-08T08:00:00.000Z");
 
-    // Report parity: /session-report id=legacy renders the legacy root.
-    const report = buildSessionReport(cwd, { kind: "do-work", id: "legacy" });
-    assert.equal(report.source.id, "legacy");
-    assert.equal(report.source.isLegacy, true);
+    // Legacy state remains discoverable for visualization, but is not a
+    // report authority after the run-identity cutover.
+    assert.throws(
+      () => buildSessionReport(reportStorageFor(cwd), { kind: "do-work", id: "legacy" }, reportOptions(cwd, STANDARD_FIXTURE)),
+      /MIGRATION_REQUIRED: legacy do-work state is not a report authority/,
+    );
 
     // Enumeration exposes BOTH entries with their exact ids — no aliasing.
-    const listed = listDoWorkSources(cwd);
+    const listed = listDoWorkSources(reportStorageFor(cwd));
     assert.equal(listed.length, 2);
     const root = listed.find((e) => e.isLegacy);
     assert.equal(root?.id, "legacy");
@@ -159,11 +213,11 @@ test("session-source: a lone feature named legacy is still unreachable by exact 
     writeFeature(cwd, "legacy", makeTeamState());
 
     // No team-state.json → the exact id "legacy" resolves to nothing.
-    assert.equal(resolveDoWorkSource(cwd, "legacy"), null);
-    assert.throws(() => buildSessionReport(cwd, { kind: "do-work", id: "legacy" }), /do-work session "legacy" not found/);
+    assert.equal(resolveDoWorkSource(reportStorageFor(cwd), "legacy"), null);
+    assert.throws(() => buildSessionReport(reportStorageFor(cwd), { kind: "do-work", id: "legacy" }, reportOptions(cwd, STANDARD_FIXTURE)), /do-work session "legacy" not found/);
 
     // Enumeration still surfaces the real session as degraded.
-    const listed = listDoWorkSources(cwd);
+    const listed = listDoWorkSources(reportStorageFor(cwd));
     assert.equal(listed.length, 1);
     assert.equal(listed[0]?.id, "legacy");
     assert.equal(listed[0]?.isLegacy, false);
@@ -181,22 +235,27 @@ test("session-source: latest follows report precedence — active-feature pointe
     // 1. .active-feature pointer wins even when another feature is newer.
     mkdirSync(join(cwd, ".work-state"), { recursive: true });
     writeFileSync(join(cwd, ".work-state", ".active-feature"), "beta\n");
-    assert.equal(resolveDoWorkSource(cwd)?.id, "beta", "active-feature pointer wins");
-    assert.equal(buildSessionReport(cwd, { kind: "do-work" }).source.id, "beta", "report parity");
+    assert.equal(resolveDoWorkSource(reportStorageFor(cwd))?.id, "beta", "active-feature pointer wins");
+    assert.equal(buildSessionReport(reportStorageFor(cwd), { kind: "do-work" }, reportOptions(cwd, STANDARD_FIXTURE)).source.id, "beta", "report parity");
 
-    // 2. Without a pointer, the legacy root wins.
+    // 2. Without a pointer, the legacy root still wins discovery, but report
+    // assembly fails closed instead of treating the legacy state as current.
     rmSync(join(cwd, ".work-state", ".active-feature"));
     writeLegacy(cwd, makeTeamState({ updated_at: "2026-08-08T08:00:00.000Z" }));
-    const legacy = resolveDoWorkSource(cwd);
+    const legacy = resolveDoWorkSource(reportStorageFor(cwd));
     assert.equal(legacy?.id, "legacy", "legacy root wins over per-feature states");
     assert.equal(legacy?.isLegacy, true);
-    assert.equal(buildSessionReport(cwd, { kind: "do-work" }).source.isLegacy, true, "report parity");
+    assert.throws(
+      () => buildSessionReport(reportStorageFor(cwd), {}, reportOptions(cwd, STANDARD_FIXTURE)),
+      /MIGRATION_REQUIRED: legacy do-work state is not a report authority/,
+      "legacy discovery remains observational and cannot authorize a report",
+    );
 
     // 3. No pointer, no legacy → newest per-feature state.
     rmSync(join(cwd, ".work-state", "team-state.json"));
-    const newest = resolveDoWorkSource(cwd);
+    const newest = resolveDoWorkSource(reportStorageFor(cwd));
     assert.equal(newest?.id, "alpha", "newest feature by updated_at wins");
-    assert.equal(buildSessionReport(cwd, { kind: "do-work" }).source.id, "alpha", "report parity");
+    assert.equal(buildSessionReport(reportStorageFor(cwd), { kind: "do-work" }, reportOptions(cwd, STANDARD_FIXTURE)).source.id, "alpha", "report parity");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -210,30 +269,30 @@ test("session-source: exotic unicode/space-named features stay discoverable — 
 
     // Exact selectors: previously valid exotic single-segment names resolve
     // verbatim — the safe-segment guard must not silently hide them.
-    const exotic = resolveDoWorkSource(cwd, "моя фича");
+    const exotic = resolveDoWorkSource(reportStorageFor(cwd), "моя фича");
     assert.ok(exotic);
     assert.equal(exotic.id, "моя фича");
     assert.equal(exotic.status, "ok");
     assert.equal(exotic.isLegacy, false);
-    assert.equal(exotic.stateDir, join(cwd, ".work-state", "features", "моя фича"));
-    const spaced = resolveDoWorkSource(cwd, "my feature");
+    assert.equal(exotic.stateDir, join(".work-state", "features", "моя фича"));
+    const spaced = resolveDoWorkSource(reportStorageFor(cwd), "my feature");
     assert.ok(spaced);
     assert.equal(spaced.id, "my feature");
 
     // Report parity: /session-report id=<exotic slug> builds the report.
-    const report = buildSessionReport(cwd, { kind: "do-work", id: "моя фича" });
+    const report = buildSessionReport(reportStorageFor(cwd), { kind: "do-work", id: "моя фича" }, reportOptions(cwd, STANDARD_FIXTURE));
     assert.equal(report.source.id, "моя фича");
 
     // Latest: the newest exotic feature wins the latest scan (report precedence).
-    assert.equal(resolveDoWorkSource(cwd)?.id, "моя фича");
-    assert.equal(buildSessionReport(cwd, { kind: "do-work" }).source.id, "моя фича", "report parity");
+    assert.equal(resolveDoWorkSource(reportStorageFor(cwd))?.id, "моя фича");
+    assert.equal(buildSessionReport(reportStorageFor(cwd), { kind: "do-work" }, reportOptions(cwd, STANDARD_FIXTURE)).source.id, "моя фича", "report parity");
 
     // Enumeration: verbatim ids, deterministic order, no aliasing, no silent drops.
     assert.deepEqual(
-      listDoWorkSources(cwd).map((e) => e.id),
+      listDoWorkSources(reportStorageFor(cwd)).map((e) => e.id),
       ["моя фича", "my feature"],
     );
-    assert.ok(listSessions(cwd).some((s) => s.kind === "do-work" && s.id === "моя фича"));
+    assert.ok(listSessions(reportStorageFor(cwd)).some((s) => s.kind === "do-work" && s.id === "моя фича"));
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -247,30 +306,30 @@ test("session-source: cto JSON resolution; corrupt state.json is an error entry 
     mkdirSync(corruptDir, { recursive: true });
     writeFileSync(join(corruptDir, "state.json"), "{ nope");
 
-    const src = resolveCtoSource(cwd, "run-1");
+    const src = resolveCtoSource(reportStorageFor(cwd), "run-1");
     assert.ok(src);
     assert.equal(src.kind, "cto");
     assert.equal(src.id, "run-1");
     assert.equal(src.format, "json");
     assert.equal(src.status, "ok");
-    assert.equal(src.statePath, join(cwd, ".work-state", "cto", "run-1", "state.json"));
-    assert.equal(src.runDir, join(cwd, ".work-state", "cto", "run-1"));
+    assert.equal(src.statePath, join(".work-state", "cto", "run-1", "state.json"));
+    assert.equal(src.runDir, join(".work-state", "cto", "run-1"));
 
-    assert.equal(resolveCtoSource(cwd, "run-2"), null, "corrupt state.json is invisible to the exact probe");
-    assert.equal(resolveCtoSource(cwd, "../escape"), null, "unsafe run id rejected");
-    assert.equal(resolveCtoSource(cwd)?.id, "run-1", "latest = newest JSON run");
+    assert.equal(resolveCtoSource(reportStorageFor(cwd), "run-2"), null, "corrupt state.json is invisible to the exact probe");
+    assert.equal(resolveCtoSource(reportStorageFor(cwd), "../escape"), null, "unsafe run id rejected");
+    assert.equal(resolveCtoSource(reportStorageFor(cwd))?.id, "run-1", "latest = newest JSON run");
 
     // Report parity: the corrupt run stays a "not found" error, unchanged.
-    assert.throws(() => buildSessionReport(cwd, { kind: "cto", id: "run-2" }), /cto session "run-2" not found/);
+    assert.throws(() => buildSessionReport(reportStorageFor(cwd), { kind: "cto", id: "run-2" }, reportOptions(cwd, CTO_FIXTURE)), /cto session "run-2" not found/);
 
     // Enumeration: the corrupt run is a category-only error entry.
-    const listed = listCtoSources(cwd);
+    const listed = listCtoSources(reportStorageFor(cwd));
     const corrupt = listed.find((e) => e.id === "run-2");
     assert.equal(corrupt?.status, "error");
     assert.equal(corrupt?.state, null);
     assert.equal(corrupt?.format, "json");
     assert.equal(corrupt?.updatedAt, null);
-    assert.equal(corrupt?.statePath, join(cwd, ".work-state", "cto", "run-2", "state.json"));
+    assert.equal(corrupt?.statePath, join(".work-state", "cto", "run-2", "state.json"));
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -278,7 +337,7 @@ test("session-source: cto JSON resolution; corrupt state.json is an error entry 
 
 // ── Markdown-state CTO: active vs terminal ──────────────────────────────────
 
-test("session-source: active markdown run resolves; terminal markdown run is a degraded projection invisible to the report", () => {
+test("session-source: active markdown run is an observational projection; terminal markdown run stays degraded and invisible to the report", () => {
   const cwd = tmpWorkspace();
   try {
     // Active agent-written run: no state.json, no finish marker.
@@ -287,18 +346,21 @@ test("session-source: active markdown run resolves; terminal markdown run is a d
     writeFileSync(join(activeDir, "cto_discovery.md"), "# CTO Discovery\nsummary of scope\n");
     writeFileSync(join(activeDir, "team-plan.md"), "# Team Plan\n- team: alpha — API slice\n");
 
-    const active = resolveCtoSource(cwd, "md-run");
+    const active = listCtoSources(reportStorageFor(cwd)).find((entry) => entry.id === "md-run");
     assert.ok(active);
+    assert.equal(resolveCtoSource(reportStorageFor(cwd), "md-run"), null, "markdown evidence never resolves as report state");
     assert.equal(active.format, "markdown");
-    assert.equal(active.status, "ok");
+    assert.equal(active.status, "degraded");
     assert.equal(active.statePath, null, "markdown runs have no canonical state path");
-    assert.equal(active.state?.id, "md-run");
-    assert.equal(markdownCtoState("md-run", activeDir)?.id, "md-run", "markdownCtoState unchanged");
+    assert.equal(active.state, null, "markdown runs have no durable run identity");
+    assert.equal(markdownCtoState(reportStorageFor(cwd), "md-run", join(".work-state", "cto", "md-run")), null, "markdownCtoState remains observational only");
+    assert.match(active.error ?? "", /no durable run identity/);
 
-    // Report parity: markdown fallback still produces a report.
-    const report = buildSessionReport(cwd, { kind: "cto", id: "md-run" });
-    assert.equal(report.source.format, "markdown");
-    assert.equal(report.source.statePath, null);
+    // Markdown resolution is observational only; it has no v2 authority for report assembly.
+    assert.throws(
+      () => buildSessionReport(reportStorageFor(cwd), { kind: "cto", id: "md-run" }, reportOptions(cwd, CTO_FIXTURE)),
+      /cto session "md-run" not found/,
+    );
 
     // Terminal agent-written run: a summary marker finishes it.
     const termDir = join(cwd, ".work-state", "cto", "term-run");
@@ -306,12 +368,12 @@ test("session-source: active markdown run resolves; terminal markdown run is a d
     writeFileSync(join(termDir, "cto_discovery.md"), "# CTO Discovery\n");
     writeFileSync(join(termDir, "summary.md"), "# Summary\ndone\n");
 
-    assert.equal(markdownCtoState("term-run", termDir), null, "markdownCtoState returns null for terminal runs (unchanged)");
-    assert.equal(resolveCtoSource(cwd, "term-run"), null, "terminal run invisible to report resolution");
-    assert.throws(() => buildSessionReport(cwd, { kind: "cto", id: "term-run" }), /cto session "term-run" not found/);
+    assert.equal(markdownCtoState(reportStorageFor(cwd), "term-run", join(".work-state", "cto", "term-run")), null, "markdownCtoState returns null for terminal runs (unchanged)");
+    assert.equal(resolveCtoSource(reportStorageFor(cwd), "term-run"), null, "terminal run invisible to report resolution");
+    assert.throws(() => buildSessionReport(reportStorageFor(cwd), { kind: "cto", id: "term-run" }, reportOptions(cwd, CTO_FIXTURE)), /cto session "term-run" not found/);
 
     // Visualization-only projection: discoverable as degraded, never remapped.
-    const term = listCtoSources(cwd).find((e) => e.id === "term-run");
+    const term = listCtoSources(reportStorageFor(cwd)).find((e) => e.id === "term-run");
     assert.ok(term, "terminal run is enumerated for the projection");
     assert.equal(term.status, "degraded");
     assert.equal(term.terminalMarkdown, true);
@@ -332,53 +394,63 @@ test("session-source: latest cto ignores terminal markdown runs entirely (report
     writeFileSync(join(termDir, "cto_discovery.md"), "# CTO Discovery\n");
     writeFileSync(join(termDir, "integration_review.md"), "# Review\n");
 
-    assert.equal(resolveCtoSource(cwd), null, "no active run → null latest");
-    assert.throws(() => buildSessionReport(cwd, { kind: "cto" }), /cto session "latest" not found/);
-    assert.equal(listCtoSources(cwd).length, 1, "projection still lists the terminal run");
+    assert.equal(resolveCtoSource(reportStorageFor(cwd)), null, "no active run → null latest");
+    assert.throws(() => buildSessionReport(reportStorageFor(cwd), { kind: "cto" }, reportOptions(cwd, CTO_FIXTURE)), /cto session "latest" not found/);
+    assert.equal(listCtoSources(reportStorageFor(cwd)).length, 1, "projection still lists the terminal run");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
 
-test("session-source: exotic cto run ids — active markdown runs resolve verbatim; traversal-shaped selectors rejected", () => {
+test("session-source: exotic CTO markdown names stay observational; unsafe JSON run IDs are rejected; traversal-shaped selectors rejected", () => {
   const cwd = tmpWorkspace();
   try {
-    // Agent-written markdown run with a space in its name: previously
-    // resolvable via the markdown fallback (markdownCtoState has no slug
-    // contract); the safe-segment guard made it undiscoverable.
+    // Agent-written markdown run with a space in its name remains visible in
+    // the observational listing, while no durable run identity exists.
     const mdRunDir = join(cwd, ".work-state", "cto", "md run with space");
     mkdirSync(mdRunDir, { recursive: true });
     writeFileSync(join(mdRunDir, "cto_discovery.md"), "# CTO Discovery\n");
     writeFileSync(join(mdRunDir, "team-plan.md"), "# Team Plan\n");
 
-    const mdRun = resolveCtoSource(cwd, "md run with space");
+    const mdRun = listCtoSources(reportStorageFor(cwd)).find((entry) => entry.id === "md run with space");
     assert.ok(mdRun);
+    assert.equal(resolveCtoSource(reportStorageFor(cwd), "md run with space"), null, "markdown evidence never resolves as report state");
     assert.equal(mdRun.id, "md run with space");
     assert.equal(mdRun.format, "markdown");
-    assert.equal(mdRun.status, "ok");
+    assert.equal(mdRun.status, "degraded");
+    assert.equal(mdRun.state, null);
+    assert.match(mdRun.error ?? "", /no durable run identity/);
 
-    // Report parity: /session-report cto id=<exotic run id> still builds.
-    const report = buildSessionReport(cwd, { kind: "cto", id: "md run with space" });
-    assert.equal(report.source.id, "md run with space");
-    assert.equal(report.source.format, "markdown");
+    // Markdown projection has no v2 report authority.
+    assert.throws(
+      () => buildSessionReport(reportStorageFor(cwd), { kind: "cto", id: "md run with space" }, reportOptions(cwd, CTO_FIXTURE)),
+      /cto session "md run with space" not found/,
+    );
 
-    assert.equal(resolveCtoSource(cwd)?.id, "md run with space", "exotic markdown run can win latest");
-    assert.ok(listCtoSources(cwd).some((e) => e.id === "md run with space"));
-    assert.ok(listSessions(cwd).some((s) => s.kind === "cto" && s.id === "md run with space"));
+    assert.equal(resolveCtoSource(reportStorageFor(cwd)), null, "markdown evidence cannot win the report latest selector");
+    assert.ok(listCtoSources(reportStorageFor(cwd)).some((e) => e.id === "md run with space"));
+    assert.ok(listSessions(reportStorageFor(cwd)).some((s) => s.kind === "cto" && s.id === "md run with space"));
 
-    // A JSON run with an exotic id stays invisible to the report: the
-    // canonical reader (readCtoState) requires ASCII ids by contract, so
-    // neither the exact probe nor the latest scan surfaces it — matching
-    // the pre-delegation report behavior exactly.
+    // JSON runs with an unsafe token are never authoritative, even when a
+    // hand-written state file otherwise resembles a durable CtoState.
     writeRun(cwd, makeCtoState({ id: "run with space", updated_at: "2026-08-08T11:00:00.000Z" }));
-    assert.equal(resolveCtoSource(cwd, "run with space"), null, "exotic JSON run stays invisible (canonical reader contract)");
-    assert.throws(() => buildSessionReport(cwd, { kind: "cto", id: "run with space" }), /cto session "run with space" not found/);
+    assert.equal(resolveCtoSource(reportStorageFor(cwd), "run with space"), null);
+    const exoticJson = listCtoSources(reportStorageFor(cwd)).find((entry) => entry.id === "run with space");
+    assert.ok(exoticJson);
+    assert.equal(exoticJson?.format, "json");
+    assert.equal(exoticJson?.status, "error");
+    assert.equal(exoticJson?.state, null);
+    assert.match(exoticJson?.error ?? "", /unreadable state\.json/);
+    assert.throws(
+      () => buildSessionReport(reportStorageFor(cwd), { kind: "cto", id: "run with space" }, reportOptions(cwd, CTO_FIXTURE)),
+      /cto session "run with space" not found/,
+    );
 
     // Traversal-shaped selectors are rejected outright — never aliased.
-    assert.equal(resolveCtoSource(cwd, "../escape"), null);
-    assert.equal(resolveCtoSource(cwd, "a/b"), null);
-    assert.equal(resolveCtoSource(cwd, ".."), null);
-    assert.equal(resolveCtoSource(cwd, "."), null);
+    assert.equal(resolveCtoSource(reportStorageFor(cwd), "../escape"), null);
+    assert.equal(resolveCtoSource(reportStorageFor(cwd), "a/b"), null);
+    assert.equal(resolveCtoSource(reportStorageFor(cwd), ".."), null);
+    assert.equal(resolveCtoSource(reportStorageFor(cwd), "."), null);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -394,10 +466,10 @@ test("session-source: corrupt feature state — error entry in enumeration, exac
     writeFileSync(join(brokenDir, "state.json"), "{ nope");
 
     // The report's exact-id probe throws the JSON.parse error unchanged.
-    assert.throws(() => resolveDoWorkSource(cwd, "broken"), /JSON/);
-    assert.throws(() => buildSessionReport(cwd, { kind: "do-work", id: "broken" }), /JSON/, "report parity");
+    assert.throws(() => resolveDoWorkSource(reportStorageFor(cwd), "broken"), /JSON/);
+    assert.throws(() => buildSessionReport(reportStorageFor(cwd), { kind: "do-work", id: "broken" }, reportOptions(cwd, STANDARD_FIXTURE)), /JSON/, "report parity");
 
-    const broken = listDoWorkSources(cwd).find((e) => e.id === "broken");
+    const broken = listDoWorkSources(reportStorageFor(cwd)).find((e) => e.id === "broken");
     assert.equal(broken?.status, "error");
     assert.equal(broken?.state, null);
     assert.equal(broken?.updatedAt, null);
@@ -405,8 +477,8 @@ test("session-source: corrupt feature state — error entry in enumeration, exac
     // Corrupt legacy root: same split — exact id throws, enumeration degrades.
     writeLegacy(cwd, makeTeamState());
     writeFileSync(join(cwd, ".work-state", "team-state.json"), "{ nope");
-    assert.throws(() => resolveDoWorkSource(cwd, "legacy"), /JSON/);
-    const legacyEntry = listDoWorkSources(cwd).find((e) => e.isLegacy);
+    assert.throws(() => resolveDoWorkSource(reportStorageFor(cwd), "legacy"), /JSON/);
+    const legacyEntry = listDoWorkSources(reportStorageFor(cwd)).find((e) => e.isLegacy);
     assert.equal(legacyEntry?.status, "error");
     assert.equal(legacyEntry?.state, null);
   } finally {
@@ -422,8 +494,8 @@ test("session-source: latest scan skips corrupt feature states deterministically
     mkdirSync(badDir, { recursive: true });
     writeFileSync(join(badDir, "state.json"), "{ nope");
 
-    assert.equal(resolveDoWorkSource(cwd)?.id, "good", "corrupt states skipped in the latest scan");
-    assert.equal(buildSessionReport(cwd, { kind: "do-work" }).source.id, "good", "report parity");
+    assert.equal(resolveDoWorkSource(reportStorageFor(cwd))?.id, "good", "corrupt states skipped in the latest scan");
+    assert.equal(buildSessionReport(reportStorageFor(cwd), { kind: "do-work" }, reportOptions(cwd, STANDARD_FIXTURE)).source.id, "good", "report parity");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -443,22 +515,22 @@ test("session-source: listSessions is totally ordered (updated_at desc, kind, id
     mkdirSync(corruptDir, { recursive: true });
     writeFileSync(join(corruptDir, "state.json"), "{ nope");
 
-    const sessions = listSessions(cwd);
+    const sessions = listSessions(reportStorageFor(cwd));
     const ids = sessions.map((s) => `${s.kind}:${s.id}`);
     assert.deepEqual(ids, ["cto:run-1", "cto:run-2", "do-work:b", "do-work:a", "do-work:legacy", "cto:corrupt"]);
 
     // Deterministic: identical result across calls.
     assert.deepEqual(
-      listSessions(cwd).map((s) => `${s.kind}:${s.id}`),
+      listSessions(reportStorageFor(cwd)).map((s) => `${s.kind}:${s.id}`),
       ids,
     );
     // Within-kind order is also deterministic.
     assert.deepEqual(
-      listDoWorkSources(cwd).map((s) => s.id),
+      listDoWorkSources(reportStorageFor(cwd)).map((s) => s.id),
       ["b", "a", "legacy"],
     );
     assert.deepEqual(
-      listCtoSources(cwd).map((s) => s.id),
+      listCtoSources(reportStorageFor(cwd)).map((s) => s.id),
       ["run-1", "run-2", "corrupt"],
     );
   } finally {
@@ -480,16 +552,16 @@ test("session-source: events.jsonl, vibe-report and generated visualize output a
     // A real session named visualize is a real feature — never over-excluded.
     writeFeature(cwd, "visualize", makeTeamState());
 
-    const sessions = listSessions(cwd);
+    const sessions = listSessions(reportStorageFor(cwd));
     assert.ok(sessions.some((s) => s.kind === "do-work" && s.id === "visualize"), "feature 'visualize' is a real session");
     assert.ok(!sessions.some((s) => s.id === "vibe-report"), "vibe-report is never a session");
     assert.ok(!sessions.some((s) => s.id === "events.jsonl"), "events.jsonl is never a session");
 
     // Path-level exclusion for generated output / docs / event stream.
-    assert.equal(isExcludedSourcePath(cwd, join(cwd, ".work-state", "visualize", "index.html")), true);
-    assert.equal(isExcludedSourcePath(cwd, join(cwd, "vibe-report", "visualize-e2e.md")), true);
-    assert.equal(isExcludedSourcePath(cwd, join(cwd, ".work-state", "cto", "run-1", "events.jsonl")), true);
-    assert.equal(isExcludedSourcePath(cwd, join(cwd, ".work-state", "features", "alpha", "state.json")), false);
+    assert.equal(isExcludedSourcePath(join(".work-state", "visualize", "index.html")), true);
+    assert.equal(isExcludedSourcePath(join("vibe-report", "visualize-e2e.md")), true);
+    assert.equal(isExcludedSourcePath(join(".work-state", "cto", "run-1", "events.jsonl")), true);
+    assert.equal(isExcludedSourcePath(join(".work-state", "features", "alpha", "state.json")), false);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -498,18 +570,19 @@ test("session-source: events.jsonl, vibe-report and generated visualize output a
 test("session-source: ctoRunLocalFiles excludes state.json, answers, events.jsonl and non-md/json files", () => {
   const cwd = tmpWorkspace();
   try {
-    const runDir = join(cwd, ".work-state", "cto", "run-1");
-    mkdirSync(join(runDir, "answers"), { recursive: true });
-    mkdirSync(join(runDir, "observability"), { recursive: true });
-    writeFileSync(join(runDir, "team-plan.md"), "# Team Plan\n");
-    writeFileSync(join(runDir, "decisions.md"), "# Decisions\n");
-    writeFileSync(join(runDir, "summary.json"), "{}");
-    writeFileSync(join(runDir, "state.json"), "{}"); // canonical state — never an artifact
-    writeFileSync(join(runDir, "answers", "esc-1.json"), "{}");
-    writeFileSync(join(runDir, "observability", "events.jsonl"), "{}");
-    writeFileSync(join(runDir, "notes.txt"), "not md/json\n");
+    const runDir = join(".work-state", "cto", "run-1");
+    const runFsDir = join(cwd, runDir);
+    mkdirSync(join(runFsDir, "answers"), { recursive: true });
+    mkdirSync(join(runFsDir, "observability"), { recursive: true });
+    writeFileSync(join(runFsDir, "team-plan.md"), "# Team Plan\n");
+    writeFileSync(join(runFsDir, "decisions.md"), "# Decisions\n");
+    writeFileSync(join(runFsDir, "summary.json"), "{}");
+    writeFileSync(join(runFsDir, "state.json"), "{}"); // canonical state — never an artifact
+    writeFileSync(join(runFsDir, "answers", "esc-1.json"), "{}");
+    writeFileSync(join(runFsDir, "observability", "events.jsonl"), "{}");
+    writeFileSync(join(runFsDir, "notes.txt"), "not md/json\n");
 
-    const files = ctoRunLocalFiles(runDir);
+    const files = ctoRunLocalFiles(reportStorageFor(cwd), runDir);
     assert.deepEqual(files, ["decisions.md", "summary.json", "team-plan.md"], "sorted, filtered run-local candidates");
     assert.ok(!files.includes("state.json"), "canonical state excluded");
     assert.ok(!files.includes("answers"), "answers dir excluded");
@@ -529,16 +602,16 @@ test("session-source: exposes run-local and compatibility artifact locations", (
     writeLegacy(cwd, makeTeamState());
     writeRun(cwd, makeCtoState());
 
-    const feature = resolveDoWorkSource(cwd, "alpha");
-    assert.equal(feature?.artifactsDir, join(cwd, ".work-state", "features", "alpha", "artifacts"));
+    const feature = resolveDoWorkSource(reportStorageFor(cwd), "alpha");
+    assert.equal(feature?.artifactsDir, join(".work-state", "features", "alpha", "artifacts"));
 
-    const legacy = resolveDoWorkSource(cwd, "legacy");
-    assert.equal(legacy?.artifactsDir, join(cwd, ".work-state", "artifacts"), "legacy root uses the compatibility artifacts dir");
+    const legacy = resolveDoWorkSource(reportStorageFor(cwd), "legacy");
+    assert.equal(legacy?.artifactsDir, join(".work-state", "artifacts"), "legacy root uses the compatibility artifacts dir");
 
-    assert.equal(ctoTeamArtifactsDir(cwd, "alpha"), join(cwd, ".work-state", "artifacts", "alpha"), "CTO team artifacts location");
+    assert.equal(ctoTeamArtifactsDir("alpha"), join(".work-state", "artifacts", "alpha"), "CTO team artifacts location");
 
-    const run = resolveCtoSource(cwd, "run-1");
-    assert.equal(run?.runDir, join(cwd, ".work-state", "cto", "run-1"));
+    const run = resolveCtoSource(reportStorageFor(cwd), "run-1");
+    assert.equal(run?.runDir, join(".work-state", "cto", "run-1"));
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

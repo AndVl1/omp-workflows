@@ -20,6 +20,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
+
 import {
   BOUNDED_DIGEST_LENGTH,
   COMPACT_WORKFLOWS,
@@ -463,7 +465,10 @@ test("visualize contract: provenance staleness total rule (AC-11)", () => {
   const golden = buildExpectedSpecPreparationSession();
   assert.equal(golden.provenance.staleness, "fresh");
   assert.equal(golden.provenance.sourceUpdatedAt, "2026-08-19T10:00:00.000Z");
-  assert.equal(golden.provenance.profileHash, "p-visualize-1");
+  assert.equal(
+    golden.provenance.profileHash,
+    workflowV2Fixture(readWorkflowProfile("spec-preparation"), { runId: "visualize" }).run_identity.profile_identity.fingerprint,
+  );
   assert.equal(golden.provenance.renderer.name, "omp-workflows-visualize");
   assert.ok(golden.provenance.generatedAt === FIXED_GENERATED_AT);
 
@@ -635,7 +640,9 @@ test("visualize contract: fixtures never import generated output, events or vibe
     const specifier = (match[1] ?? "").replace(/^['"]|['"]$/g, "");
     assert.ok(
       specifier.includes("visualize/types.js") ||
+        specifier.includes("workflow-v2/types.js") ||
         specifier.includes("report/redact.js") ||
+        specifier === "../workflow-v2-fixtures.js" ||
         specifier.startsWith("node:"),
       `fixture has an unexpected import specifier: ${specifier}`,
     );

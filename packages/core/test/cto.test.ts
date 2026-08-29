@@ -21,6 +21,15 @@ import {
   type TeamPlan,
   type TeamPlanEntry,
 } from "@andvl1/omp-workflows-core";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
+
+const fixture = workflowV2Fixture(readWorkflowProfile("lightweight"), {
+  roleAgents: { "team-lead": "team-lead", "backend-kotlin": "backend-kotlin", frontend: "frontend" },
+  agentNames: ["team-lead", "backend-kotlin", "frontend"],
+});
+function runIdentity(id: string) {
+  return { ...fixture.run_identity, run_id: id };
+}
 
 function sampleEscalation(overrides: Partial<Escalation> = {}): Escalation {
   return {
@@ -34,16 +43,22 @@ function sampleEscalation(overrides: Partial<Escalation> = {}): Escalation {
     ],
     default: "rest",
     timeoutMs: 3_600_000,
+    run_identity: runIdentity("run"),
     ...overrides,
   };
 }
 
 function samplePlanEntry(overrides: Partial<TeamPlanEntry> = {}): TeamPlanEntry {
+  const run_identity = runIdentity("auth-2026-08-04");
   return {
     team: "kotlin-backend",
     scope: ["backend-kotlin"],
     slice: "Implement auth service",
     profile: "lightweight",
+    profile_identity: fixture.profile_identity,
+    lead_ref: fixture.effective_policy.roles["team-lead"]!,
+    roster_refs: [fixture.effective_policy.roles["backend-kotlin"]!],
+    run_identity,
     worktree: "separate_worktree",
     depends_on: [],
     ...overrides,
@@ -59,6 +74,7 @@ test("cto: TeamPlan shape holds a decomposition", () => {
   const plan: TeamPlan = {
     id: "auth-2026-08-04",
     task: "Add OAuth to the API",
+    run_identity: runIdentity("auth-2026-08-04"),
     created_at: "2026-08-04T10:00:00.000Z",
     teams: [
       samplePlanEntry({ team: "kotlin-backend", worktree: "same_branch" }),
@@ -97,12 +113,12 @@ test("cto: readAnswers round-trips answer files, skips garbage", () => {
   try {
     const dir = ensureAnswersDir("run-1", root);
     assert.equal(answersDir("run-1", root), dir);
-
     const answer: EscalationAnswer = {
       id: "run/team/checkpoint/1",
       answer: "rest",
       at: "2026-08-04T10:05:00.000Z",
       by: "telegram",
+      run_identity: runIdentity("run-1"),
     };
     writeFileSync(join(dir, "run-team-checkpoint-1.json"), JSON.stringify(answer));
     writeFileSync(join(dir, "garbage.json"), "{not json");

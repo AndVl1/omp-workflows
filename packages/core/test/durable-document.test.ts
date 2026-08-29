@@ -8,9 +8,10 @@
  * Coverage:
  *   - happy path: advance succeeds, the document and the typed artifact
  *     exist and validateProductPrdDocument passes, the stage is marked done
- *     and the next stage (product_approval) is armed;
  *   - fail closed: a missing source artifact blocks the advance with the
- *     source named — nothing is rendered, nothing is marked done.
+ *     source named — nothing is rendered, nothing is marked done;
+ *   - identity binding: a missing, malformed, or mismatched workflow run
+ *     identity blocks the advance before rendering or transition.
  */
 
 import { test } from "node:test";
@@ -19,14 +20,16 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { createCapability, advanceCursor, type IssuedCapability } from "../src/engine/durable.js";
+import { readWorkflowProfile, workIdentityScopeFixture, workflowV2Fixture } from "./workflow-v2-fixtures.js";
+import type { WorkflowV2CapabilityContext } from "./workflow-v2-fixtures.js";
+import { createCapability, advanceCursor, type DispatchAuth, type IssuedCapability } from "../src/engine/durable.js";
 import { writeState } from "../src/engine/state.js";
 import { validateProductPrdDocument } from "../src/engine/product-prd.js";
-import type { Profile, TeamState } from "../src/engine/types.js";
+import type { TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 
 const FLAGS: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
+
 
 /** Schema-valid fixtures for all five product-discovery source artifacts. */
 function fiveSources(): Record<string, unknown> {
@@ -84,26 +87,38 @@ function setupDocumentStage(preArtifacts: Record<string, unknown>): {
   root: string;
   featureDir: string;
   artifactsDir: string;
+  context: WorkflowV2CapabilityContext;
 } {
-  const profile = loadProfile("product-discovery") as Profile;
-  assert.ok(profile, "shipped product-discovery profile is available");
-  registerWorkflowProfiles([profile]);
+  const fixture = workflowV2Fixture(readWorkflowProfile("product-discovery"));
+  const profile = fixture.profile;
+  assert.equal(fixture.profile_identity.id, profile.name);
   const branch = "feat/product-discovery-workflow";
   const root = mkdtempSync(join(tmpdir(), "prd-durable-"));
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
-  const persistedHash = profileHash(profile);
+  const persistedHash = fixture.profile_identity.fingerprint;
   const currentStageId = "product_prd_document";
+  const work_identity_scope = workIdentityScopeFixture(fixture, {
+    workflow: profile.name,
+    stage_id: currentStageId,
+    slot_id: currentStageId,
+  });
   // Non-dispatch stage: kind "none" with an empty roster — mirrors the
   // engine's own arming for `document` stages (and orchestrator/bash/none).
   const issued = createCapability({
     run_key: branch, branch, workflow: profile.name, profile_hash: persistedHash,
     stage_cursor: currentStageId, kind: "none", expected_roster: [],
+    work_identity_scope,
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
   });
   writeState(root, {
     schema: 1,
     branch,
     run_key: branch,
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
     classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: profile.name },
+    workflow: profile.name,
     task: "Render the deterministic product PRD document",
     workflow_override: false,
     issue: null,
@@ -113,6 +128,7 @@ function setupDocumentStage(preArtifacts: Record<string, unknown>): {
     pause: { kind: "none" as const, reason: "" },
     policy: { strict_orchestrator: true },
     profile_hash: persistedHash,
+    work_identity: issued.state.work_identity,
     scope: FLAGS,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
@@ -124,14 +140,26 @@ function setupDocumentStage(preArtifacts: Record<string, unknown>): {
   for (const [id, value] of Object.entries(preArtifacts)) {
     writeFileSync(join(artifactsDir, `${id}.json`), JSON.stringify(value));
   }
-  return { issued, root, featureDir, artifactsDir };
+  return {
+    issued,
+    root,
+    featureDir,
+    artifactsDir,
+    context: {
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
+      catalog: fixture.catalog,
+      effective_policy: fixture.effective_policy,
+      agent_inventory: fixture.agent_inventory,
+    },
+  };
 }
 
 function readState(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "features", "product-prd", "state.json"), "utf8")) as TeamState;
 }
 
-function advanceAuth(issued: IssuedCapability) {
+function advanceAuth(issued: IssuedCapability): DispatchAuth {
   return {
     token: issued.advance_token,
     capability_id: issued.capability_id,
@@ -141,13 +169,23 @@ function advanceAuth(issued: IssuedCapability) {
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    project_identity: issued.state.project_identity,
+    run_identity: issued.state.run_identity,
   };
 }
 
+function assertDocumentAdvanceBlocked(root: string, featureDir: string, artifactsDir: string): void {
+  const state = readState(root);
+  assert.equal(state.stages.find((s) => s.id === "product_prd_document")?.status, "in_progress", "stage is not done");
+  assert.equal(state.stage_cursor, "product_prd_document", "cursor did not move");
+  assert.ok(!existsSync(join(artifactsDir, "product_prd.json")), "no artifact was written");
+  assert.ok(!existsSync(join(featureDir, "documents")), "no document was rendered");
+}
+
 test("durable document advance: the engine renders doc + product_prd before the transition commits", () => {
-  const { issued, root, featureDir, artifactsDir } = setupDocumentStage(fiveSources());
+  const { issued, root, featureDir, artifactsDir, context } = setupDocumentStage(fiveSources());
   try {
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "deterministic document render" });
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "deterministic document render" }, context);
     assert.equal(advanced.ok, true, "advance succeeds for a fully-sourced document stage");
     if (!advanced.ok) return;
 
@@ -170,18 +208,129 @@ test("durable document advance: the engine renders doc + product_prd before the 
 test("durable document advance: a missing source fails closed — nothing rendered, nothing transitioned", () => {
   const sources = fiveSources();
   delete sources.product_evidence;
-  const { issued, root, featureDir, artifactsDir } = setupDocumentStage(sources);
+  const { issued, root, featureDir, artifactsDir, context } = setupDocumentStage(sources);
   try {
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "attempted document render" });
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "attempted document render" }, context);
     assert.equal(advanced.ok, false, "a missing source must block the advance");
     if (!advanced.ok) assert.match(advanced.error, /product_evidence/);
 
-    const state = readState(root);
-    assert.equal(state.stages.find((s) => s.id === "product_prd_document")?.status, "in_progress", "stage is not done");
-    assert.equal(state.stage_cursor, "product_prd_document", "cursor did not move");
-    assert.ok(!existsSync(join(artifactsDir, "product_prd.json")), "no artifact was written");
-    assert.ok(!existsSync(join(featureDir, "documents")), "no document was rendered");
+    assertDocumentAdvanceBlocked(root, featureDir, artifactsDir);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("durable document advance: missing, malformed, or mismatched run identity fails closed", () => {
+  const authCases: ReadonlyArray<{
+    readonly label: string;
+    readonly mutate: (auth: DispatchAuth) => DispatchAuth;
+  }> = [
+    {
+      label: "missing",
+      mutate: (auth) => {
+        const withoutRunIdentity = { ...auth } as Partial<DispatchAuth>;
+        delete withoutRunIdentity.run_identity;
+        return withoutRunIdentity as unknown as DispatchAuth;
+      },
+    },
+    {
+      label: "malformed",
+      mutate: (auth) => ({
+        ...auth,
+        run_identity: {
+          ...auth.run_identity,
+          run_id: "",
+        },
+      } as unknown as DispatchAuth),
+    },
+    {
+      label: "mismatched",
+      mutate: (auth) => ({
+        ...auth,
+        run_identity: {
+          ...auth.run_identity,
+          run_id: `${auth.run_identity.run_id}-other`,
+        },
+      }),
+    },
+  ];
+
+  for (const identityCase of authCases) {
+    const { issued, root, featureDir, artifactsDir, context } = setupDocumentStage(fiveSources());
+    try {
+      const advanced = advanceCursor(
+        root,
+        { ...identityCase.mutate(advanceAuth(issued)), evidence: `${identityCase.label} run identity` },
+        context,
+      );
+      assert.equal(advanced.ok, false, `${identityCase.label} run identity must block the advance`);
+      if (!advanced.ok) assert.equal(advanced.diagnostic?.code, "IDENTITY_MISMATCH");
+      assertDocumentAdvanceBlocked(root, featureDir, artifactsDir);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  const contextCases: ReadonlyArray<{
+    readonly label: string;
+    readonly mutate: (context: WorkflowV2CapabilityContext) => WorkflowV2CapabilityContext;
+    readonly throws: boolean;
+  }> = [
+    {
+      label: "missing",
+      throws: true,
+      mutate: (context) => {
+        const withoutRunIdentity = { ...context } as Partial<WorkflowV2CapabilityContext>;
+        delete withoutRunIdentity.run_identity;
+        return withoutRunIdentity as unknown as WorkflowV2CapabilityContext;
+      },
+    },
+    {
+      label: "malformed",
+      throws: true,
+      mutate: (context) => ({
+        ...context,
+        run_identity: {
+          ...context.run_identity,
+          run_id: "",
+        },
+      } as unknown as WorkflowV2CapabilityContext),
+    },
+    {
+      label: "mismatched",
+      throws: false,
+      mutate: (context) => ({
+        ...context,
+        run_identity: {
+          ...context.run_identity,
+          run_id: `${context.run_identity.run_id}-other`,
+        },
+      }),
+    },
+  ];
+
+  for (const identityCase of contextCases) {
+    const { issued, root, featureDir, artifactsDir, context } = setupDocumentStage(fiveSources());
+    try {
+      const advance = () => advanceCursor(
+        root,
+        { ...advanceAuth(issued), evidence: `${identityCase.label} context run identity` },
+        identityCase.mutate(context),
+      );
+      if (identityCase.throws) {
+        assert.throws(
+          advance,
+          /MIGRATION_REQUIRED: workflow advance requires a complete workflow run identity/,
+          `${identityCase.label} context run identity must fail closed`,
+        );
+      } else {
+        const advanced = advance();
+        assert.equal(advanced.ok, false, "mismatched context run identity must block the advance");
+        if (!advanced.ok) assert.equal(advanced.diagnostic?.code, "IDENTITY_MISMATCH");
+      }
+      assertDocumentAdvanceBlocked(root, featureDir, artifactsDir);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });

@@ -12,17 +12,33 @@
  *   report <scratch-dir>         generate the ux-e2e report (JSON + markdown)
  */
 
-import { execSync, spawn, spawnSync } from 'node:child_process';
-import { closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { execSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import {
+  chmodSync,
+  closeSync,
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { parseArgs, type ParseArgsConfig } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 import {
   assertNoLiveSession,
+  buildDiagnosticEnv,
+  canonicalizeTrustedPair,
   killProcessTree,
+  openEvidenceFd,
   pidIsLive,
   readSessionInfo,
+  resolveTrustedPair,
+  SESSION_DIR_MODE,
   startTestSession,
   type TestSession,
 } from './server.js';
@@ -36,7 +52,7 @@ const USAGE = `ux-e2e — interactive UX E2E test framework for omp + omp-workfl
 Usage: ux-e2e <subcommand> [options]
 
 Subcommands:
-  bootstrap <slug> <branch>     create a scratch omp project wired to this monorepo
+  bootstrap <slug> <branch>     create a scratch omp project (launch omp via start with an explicit diagnostic pair)
   start <scratch-dir>           start an omp PTY test session and print the terminal URL
   stop <scratch-dir>            stop a running session (SIGTERM -> SIGKILL its tree)
   transcript <scratch-dir>      render the session transcript
@@ -185,13 +201,11 @@ export function runBootstrap(args: BootstrapArgs): string {
     cpSync(teamConfig, join(ompDir, 'team.config.json'));
   }
 
-  // Materialize custom-TS commands into <scratch>/.omp/commands/.
-  const copyScript = join(fullstackPkg, 'scripts', 'copy-commands.mjs');
-  if (existsSync(copyScript)) {
-    execSync(`${process.execPath} ${shellQuote(copyScript)} ${shellQuote(scratchDir)}`, { stdio: 'inherit' });
-  }
-
   console.log(`ux-e2e bootstrap: scratch project ready at ${scratchDir}`);
+  console.log('ux-e2e bootstrap: NOTE — bootstrap does NOT wire /do-work or any workflow command surface (npm link adds no commands).');
+  console.log('ux-e2e bootstrap: an OMP launch via `ux-e2e start` requires an explicit COMPLETE diagnostic pair, e.g.:');
+  console.log(`ux-e2e bootstrap:   ux-e2e start ${scratchDir} --core-module /absolute/core.mjs --provider-module /absolute/provider.mjs`);
+  console.log('ux-e2e bootstrap: that pair is operator-trusted diagnostic load-order evidence ONLY — it is NOT host/policy admission and NOT selected-provider activation.');
   return scratchDir;
 }
 
@@ -215,7 +229,18 @@ export interface StartArgs {
   readonly scenario: string | undefined;
   readonly task: string | undefined;
   readonly maxTimeSec: number;
+  /** Idle timeout ms for the WS session — closes the session after no inbound traffic. Default 20 min. */
   readonly idleMs: number;
+  /**
+   * Operator-trusted DIAGNOSTIC ordered pair: core position FIRST,
+   * provider position second (repeated --trusted-extension). Undefined =
+   * generic NON-admission harness launch. Load-order evidence ONLY —
+   * never host/policy admission, never selected-provider activation.
+   */
+  readonly coreModule: string | undefined;
+  readonly providerModule: string | undefined;
+  /** Internal: set by runStartDetached on the child so stdout (the detach log) never carries the bearer token. */
+  readonly detachedChild: boolean;
 }
 
 export function parseStartArgs(argv: string[]): StartArgs {
@@ -230,9 +255,23 @@ export function parseStartArgs(argv: string[]): StartArgs {
     task: { type: 'string' },
     'max-time': { type: 'string' },
     'idle-ms': { type: 'string' },
+    'core-module': { type: 'string' },
+    'provider-module': { type: 'string' },
+    'detached-child': { type: 'boolean', default: false },
   });
   const scratchDir = positionals[0];
   if (scratchDir === undefined) throw new Error('ux-e2e start: missing <scratch-dir> argument');
+  const trustedPairInput = {
+    coreModule: typeof values['core-module'] === 'string' && values['core-module'].length > 0 ? values['core-module'] : undefined,
+    providerModule:
+      typeof values['provider-module'] === 'string' && values['provider-module'].length > 0 ? values['provider-module'] : undefined,
+  };
+  // Diagnostic pair gate: any selection switches diagnostic semantics on
+  // and must form a COMPLETE pair — partial, equal, and relative
+  // selections are rejected HERE, before any argv is built or a session
+  // can fall through to ambient discovery. This pair is operator-trusted
+  // diagnostic load-order evidence, NOT host/policy admission.
+  resolveTrustedPair(trustedPairInput);
   const surface = values.surface === 'text' ? 'text' : 'web';
   return {
     scratchDir: resolve(scratchDir),
@@ -251,6 +290,9 @@ export function parseStartArgs(argv: string[]): StartArgs {
     task: typeof values.task === 'string' ? values.task : undefined,
     maxTimeSec: typeof values['max-time'] === 'string' ? parseMaxTime(values['max-time']) : 1800,
     idleMs: typeof values['idle-ms'] === 'string' ? parsePositiveInt(values['idle-ms'], '--idle-ms') : 1_200_000,
+    coreModule: trustedPairInput.coreModule,
+    providerModule: trustedPairInput.providerModule,
+    detachedChild: values['detached-child'] === true,
   };
 }
 
@@ -270,6 +312,25 @@ function resolveTaskPrompt(taskArg: string | undefined, scenario: ScenarioDefini
   return taskArg;
 }
 
+/**
+ * Redact the bearer token query parameter from a session URL. Detached
+ * children write stdout into the (0600) detach log, so the live token
+ * must NEVER appear there; session.json stays the parent-only bearer
+ * channel.
+ */
+export function redactSessionUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.searchParams.has('token')) {
+      parsed.searchParams.set('token', 'REDACTED');
+      return parsed.toString();
+    }
+    return url;
+  } catch {
+    return url.replace(/([?&])token=[^&]*/u, '$1token=REDACTED');
+  }
+}
+
 async function runStartForeground(args: StartArgs): Promise<number> {
   assertNoLiveSession(args.scratchDir, args.force);
 
@@ -283,10 +344,15 @@ async function runStartForeground(args: StartArgs): Promise<number> {
     rows: args.rows,
     idleMs: args.idleMs,
     maxTimeSec: args.maxTimeSec,
+    coreModule: args.coreModule,
+    providerModule: args.providerModule,
     taskPrompt,
     scenario: scenario !== null ? { id: scenario.id, title: scenario.title } : null,
   });
-  console.log(`ux-e2e: session started — url: ${session.url}`);
+  // A detached child's stdout IS the detach log: print the REDACTED url.
+  // Foreground runs print the live url straight to the operator terminal.
+  const urlLabel = args.detachedChild ? redactSessionUrl(session.url) : session.url;
+  console.log(`ux-e2e: session started — url: ${urlLabel}`);
   console.log(`ux-e2e: transcript: ${session.transcriptPath}`);
   return await driveForeground(session, scenario);
 }
@@ -326,6 +392,7 @@ async function driveForeground(session: TestSession, scenario: ScenarioDefinitio
       process.exit(0);
     }
     const { promise: ticked, resolve: tick } = deferred<void>();
+    setTimeout(tick, pollMs);
     await ticked;
   }
 }
@@ -363,29 +430,54 @@ export function tailLogFile(path: string, maxBytes: number): string {
  * in the child triggered an unhandled 'error' on its stdout stream and
  * the process exited without a frame.
  *
- * The fd is opened in append mode so a `--detach` rerun keeps prior log
- * history. We write a header line via `writeSync` BEFORE spawning, then
- * close the parent's fd copy after spawn — the child inherited its own
- * fd during exec and continues to write into the same file.
+ * Security boundary for this log: the state dir is created/verified 0700
+ * (symlinked leaf rejected), the log is opened 0600 with O_NOFOLLOW
+ * append, BOTH parent copies of the child's stdio fds are closed right
+ * after spawn, and the child runs with the internal --detached-child
+ * flag so it prints the token-REDACTED url — the live bearer token never
+ * reaches the log. session.json (0600, no-follow) stays the parent-only
+ * bearer channel.
+ *
+ * Failure surfacing: the parent pre-validates a requested diagnostic
+ * pair (syntax + canonical kind) BEFORE spawning, and watches the
+ * child's exit/error events — a child that dies before writing a live
+ * session surfaces its exit code and log tail immediately instead of
+ * burning the full startup deadline as a generic timeout.
  */
 async function runStartDetached(args: StartArgs): Promise<number> {
   assertNoLiveSession(args.scratchDir, args.force);
 
+  // Parent-side validation: a syntactically complete but missing,
+  // wrong-kind, aliased, or relative pair fails HERE with the exact
+  // typed error instead of inside the detached child. The child still
+  // re-validates at its own pre-spawn boundary.
+  const requestedPair = resolveTrustedPair(args);
+  if (requestedPair !== null) canonicalizeTrustedPair(requestedPair);
+
   const stateDir = stateDirOf(args.scratchDir);
-  mkdirSync(stateDir, { recursive: true });
-  const logPath = detachLogPath(args.scratchDir);
-  // Append so a subsequent --detach run after a crash keeps the prior
-  // log entries (operators triage by timeline).
-  const fd = openSync(logPath, 'a');
+  // Reject a symlinked state-dir leaf BEFORE any chmod could follow it,
+  // then pin 0700 (mkdir applies the mode at creation; chmod covers
+  // pre-existing dirs).
+  mkdirSync(stateDir, { recursive: true, mode: SESSION_DIR_MODE });
+  if (!lstatSync(stateDir).isDirectory()) {
+    throw new Error(`ux-e2e: state dir must be a real directory, not a symlink: ${stateDir}`);
+  }
   try {
-    writeSync(fd, `\n--- ux-e2e detached start @ ${new Date().toISOString()} ---\n`);
+    chmodSync(stateDir, SESSION_DIR_MODE);
+  } catch {
+    /* best-effort */
+  }
+
+  const logPath = detachLogPath(args.scratchDir);
+  // Append (a --detach rerun after a crash keeps prior log entries for
+  // timeline triage) through the secure no-follow 0600 descriptor.
+  const headerFd = openEvidenceFd(logPath, true);
+  try {
+    writeSync(headerFd, `\n--- ux-e2e detached start @ ${new Date().toISOString()} ---\n`);
   } finally {
     // The header line is the only thing the parent itself writes; the
-    // child writes everything else via its inherited fd copy. Closing
-    // the parent's fd here means the parent holds no FDs into the log
-    // file, so its event loop drains and `main()` returns as soon as
-    // the session URL is known.
-    closeSync(fd);
+    // child writes everything else via its inherited fd copy.
+    closeSync(headerFd);
   }
 
   const cliPath = fileURLToPath(import.meta.url);
@@ -400,33 +492,102 @@ async function runStartDetached(args: StartArgs): Promise<number> {
   ];
   if (args.scenario !== undefined) childArgs.push('--scenario', args.scenario);
   if (args.task !== undefined) childArgs.push('--task', args.task);
+  if (args.coreModule !== undefined) childArgs.push('--core-module', args.coreModule);
+  if (args.providerModule !== undefined) childArgs.push('--provider-module', args.providerModule);
   childArgs.push('--max-time', `${Math.round(args.maxTimeSec / 60)}m`, '--idle-ms', String(args.idleMs));
+  // Internal marker: makes the child redact the bearer token on stdout.
+  childArgs.push('--detached-child');
 
-  const child = spawn(process.execPath, childArgs, {
-    detached: true,
-    // fd is closed; re-open for the child so it can write straight to
-    // the file. Both stdout and stderr share the same fd (the OS
-    // atomically interleaves writes — fine for a log file; stdout/stderr
-    // distinction is not preserved, but that's irrelevant for triage).
-    stdio: ['ignore', openSync(logPath, 'a'), openSync(logPath, 'a')],
-    cwd: args.scratchDir,
-  });
+  // Both stdout and stderr share one 0600 no-follow append fd (the OS
+  // atomically interleaves writes — fine for a log file; stdout/stderr
+  // distinction is not preserved, but that's irrelevant for triage).
+  const outFd = openEvidenceFd(logPath, true);
+  const errFd = openEvidenceFd(logPath, true);
+  let child: ChildProcess;
+  try {
+    child = spawn(process.execPath, childArgs, {
+      detached: true,
+      stdio: ['ignore', outFd, errFd],
+      cwd: args.scratchDir,
+      // A detached PAIR launch must not drag parent loader/preload/search
+      // injection (NODE_OPTIONS/NODE_PATH/BUN_*/DYLD_*/LD_*) into the CLI
+      // child before it reaches its own hardened PTY env; the child node
+      // process itself runs injection-stripped. Generic no-pair launches
+      // keep normal inheritance.
+      ...(requestedPair !== null ? { env: buildDiagnosticEnv(process.env, undefined) } : {}),
+    });
+  } catch (err) {
+    closeSync(outFd);
+    closeSync(errFd);
+    throw err;
+  }
+  // The child inherited dups of these fds during exec; the parent's
+  // copies MUST be closed now or the event loop never drains (and the
+  // parent would hold the log open for its whole lifetime).
+  closeSync(outFd);
+  closeSync(errFd);
   child.unref();
+
+  // Watch the child: an early exit (bad args, failed validation, spawn
+  // error) is surfaced immediately instead of waiting out the deadline.
+  // Mutable HOLDERS (not bare `let`) — the callbacks write through the
+  // holder so the poll loop's reads are never flow-narrowed to `never`.
+  const childExit: { current: { readonly code: number | null; readonly signal: string | null } | null } = {
+    current: null,
+  };
+  const childError: { current: string | null } = { current: null };
+  child.once('exit', (code, signal) => {
+    childExit.current = { code, signal: signal ?? null };
+  });
+  child.once('error', err => {
+    childError.current = err instanceof Error ? err.message : String(err);
+  });
 
   // Wait for the child's session.json to appear with a live pid.
   // Cold starts (CI runners, slow disks) can exceed 15 s; keep a generous
   // deadline so the detached child has time to boot omp and write session.json.
   const deadline = Date.now() + 60_000;
   for (;;) {
+    if (childError.current !== null) {
+      console.error(`ux-e2e start: detached child failed to launch: ${childError.current}`);
+      return 1;
+    }
+    const exitNow = childExit.current;
+    if (exitNow !== null) {
+      console.error(
+        `ux-e2e start: detached child exited before the session started (code ${String(exitNow.code)}, signal ${String(exitNow.signal)})`,
+      );
+      const tail = tailLogFile(logPath, DETACH_LOG_TAIL_BYTES);
+      if (tail.length > 0) {
+        console.error(`ux-e2e start: last ${DETACH_LOG_TAIL_BYTES} bytes of ${logPath}:`);
+        for (const line of tail.split('\n')) {
+          console.error(`  ${line}`);
+        }
+      } else {
+        console.error(`ux-e2e start: no output captured in ${logPath}; child may have failed before writing.`);
+      }
+      return 1;
+    }
     const info = readSessionInfo(args.scratchDir);
     if (info !== null && pidIsLive(info.pid)) {
       const sessionJson = readSessionJson(args.scratchDir);
       console.log(`ux-e2e: detached session started (pid ${String(info.pid)})`);
+      // Parent stdout is the operator terminal — the live url is the
+      // operator's handle on the session. The child's own stdout (the
+      // log) is redacted via --detached-child.
       console.log(`ux-e2e: url: ${typeof sessionJson.url === 'string' ? sessionJson.url : 'unknown'}`);
       return 0;
     }
     if (Date.now() >= deadline) {
       console.error('ux-e2e start: timed out waiting for the detached session to start');
+      // Do not leave a half-started supervisor behind: terminate the
+      // detached child's whole process group (it was spawned detached,
+      // so it is its own group leader). The child holds the PTY, the
+      // HTTP+WS server, and the log fds — kill the tree, not just the pid.
+      if (child.pid !== undefined && pidIsLive(child.pid)) {
+        await killProcessTree(child.pid);
+        console.error(`ux-e2e start: terminated the timed-out detached supervisor (pid ${String(child.pid)})`);
+      }
       const tail = tailLogFile(logPath, DETACH_LOG_TAIL_BYTES);
       if (tail.length > 0) {
         console.error(`ux-e2e start: last ${DETACH_LOG_TAIL_BYTES} bytes of ${logPath}:`);
@@ -477,21 +638,39 @@ export async function runStop(args: StopArgs): Promise<number> {
     console.log('ux-e2e stop: no session.json found — nothing to stop');
     return 0;
   }
-  if (!pidIsLive(info.pid)) {
-    console.log(`ux-e2e stop: session pid ${String(info.pid)} is not running`);
-    return 0;
+  // PTY pid stale/exited: fall through to the supervisor check below —
+  // the HTTP+WS server can outlive the OMP process.
+  if (pidIsLive(info.pid)) {
+    const commandLine = processCommandLine(info.pid as number);
+    if (commandLine === null || !commandLine.includes(args.scratchDir)) {
+      console.error(
+        `ux-e2e stop: pid ${String(info.pid)} does not match scratch session — refusing (stale session.json?)`,
+      );
+      return 1;
+    }
+    await killProcessTree(info.pid as number);
+    console.log(`ux-e2e stop: sent SIGTERM->SIGKILL to the omp PTY pid ${String(info.pid)}`);
+  } else if (info.pid !== null) {
+    console.log(`ux-e2e stop: omp PTY pid ${String(info.pid)} is not running`);
   }
 
-  const commandLine = processCommandLine(info.pid as number);
-  if (commandLine === null || !commandLine.includes(args.scratchDir)) {
-    console.error(
-      `ux-e2e stop: pid ${String(info.pid)} does not match scratch session — refusing (stale session.json?)`,
-    );
-    return 1;
+  // The supervisor (node process hosting the HTTP+WS server) is recorded
+  // SEPARATELY from the PTY pid. Terminate it too when it is distinct,
+  // still alive, and provably belongs to this scratch — this closes the
+  // server even after the PTY exited. Never the caller itself.
+  const supervisorPid = info.supervisorPid;
+  if (
+    typeof supervisorPid === 'number' &&
+    supervisorPid !== info.pid &&
+    supervisorPid !== process.pid &&
+    pidIsLive(supervisorPid)
+  ) {
+    const supervisorCommand = processCommandLine(supervisorPid);
+    if (supervisorCommand !== null && supervisorCommand.includes(args.scratchDir)) {
+      await killProcessTree(supervisorPid);
+      console.log(`ux-e2e stop: sent SIGTERM->SIGKILL to the session supervisor pid ${String(supervisorPid)}`);
+    }
   }
-
-  await killProcessTree(info.pid as number);
-  console.log(`ux-e2e stop: sent SIGTERM->SIGKILL to pid ${String(info.pid)}`);
   return 0;
 }
 

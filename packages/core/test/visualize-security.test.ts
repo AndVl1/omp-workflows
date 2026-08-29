@@ -19,8 +19,13 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildSessionSnapshot } from "../src/visualize/snapshot.js";
-import { resolveDoWorkSource } from "../src/report/session-source.js";
+import {
+  buildSessionSnapshot,
+  VisualizationContextError,
+  type BuildSessionSnapshotContext,
+} from "../src/visualize/snapshot.js";
+import { resolveDoWorkSource, type SessionSourceEntry } from "../src/report/session-source.js";
+import { reportStorageFor } from "./report-storage-fixtures.js";
 import {
   DEFAULT_BODY_CAP_BYTES,
   EMPTY_BODY_MARKER,
@@ -37,6 +42,30 @@ import {
   expectedRedactedBody,
   type CanonicalSessionInput,
 } from "./fixtures/visualize-fixtures.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
+import type { WorkflowV2Digest } from "../src/workflow-v2/types.js";
+
+const snapshotContexts = new Map<string, BuildSessionSnapshotContext>();
+
+function contextForEntry(entry: SessionSourceEntry): BuildSessionSnapshotContext {
+  const workflow = entry.kind === "cto" ? "cto" : (entry.state?.classification?.workflow ?? "standard");
+  const cached = snapshotContexts.get(workflow);
+  if (cached) return cached;
+  const fixture = workflowV2Fixture(readWorkflowProfile(workflow));
+  const context: BuildSessionSnapshotContext = {
+    project_identity: fixture.project_identity,
+    catalog: fixture.catalog,
+    effective_policy: fixture.effective_policy,
+  };
+  snapshotContexts.set(workflow, context);
+  return context;
+}
+
+function snapshotOptions(entry: SessionSourceEntry, full = false) {
+  return full
+    ? { full: true, context: contextForEntry(entry) }
+    : { context: contextForEntry(entry) };
+}
 
 function tmpWorkspace(): string {
   return mkdtempSync(join(tmpdir(), "viz-security-"));
@@ -48,10 +77,57 @@ function write(path: string, content: string): void {
 }
 
 function build(cwd: string, input: CanonicalSessionInput, full = false) {
-  const resolved = resolveDoWorkSource(cwd, input.id);
+  const storage = reportStorageFor(cwd);
+  const resolved = resolveDoWorkSource(storage, input.id);
   if (!resolved) throw new Error(`session not resolved: ${input.id}`);
-  return buildSessionSnapshot(cwd, resolved, FIXED_GENERATED_AT, full ? { full: true } : {});
+  return buildSessionSnapshot(storage, resolved, FIXED_GENERATED_AT, snapshotOptions(resolved, full));
 }
+
+test("security: an effective policy catalog digest mismatch fails closed with IDENTITY_MISMATCH", () => {
+  const cwd = tmpWorkspace();
+  try {
+    const input = featureSession({
+      id: "effective-policy-catalog-mismatch",
+      pathKey: "effective-policy-catalog-mismatch",
+      task: "Effective policy identity mismatch.",
+      workflow: "standard",
+      updatedAt: "2026-08-19T10:00:00.000Z",
+      stages: [{ id: "implementation", status: "done" }],
+      declared: {},
+      expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
+    });
+    materializeAll(cwd, input);
+    const storage = reportStorageFor(cwd);
+    const entry = resolveDoWorkSource(storage, input.id);
+    if (!entry) throw new Error(`session not resolved: ${input.id}`);
+
+    const validContext = contextForEntry(entry);
+    const effectivePolicy = validContext.effective_policy;
+    if (!effectivePolicy) throw new Error("fixture effective policy is missing");
+    const catalogDigest = validContext.project_identity.catalog_content_digest;
+    const mismatchedCatalogDigest = (
+      `${catalogDigest.slice(0, -1)}${catalogDigest.endsWith("0") ? "1" : "0"}`
+    ) as WorkflowV2Digest;
+    const mismatchedContext: BuildSessionSnapshotContext = {
+      ...validContext,
+      effective_policy: {
+        ...effectivePolicy,
+        provider: {
+          ...effectivePolicy.provider,
+          catalog_content_digest: mismatchedCatalogDigest,
+        },
+      },
+    };
+
+    assert.throws(
+      () => buildSessionSnapshot(storage, entry, FIXED_GENERATED_AT, { context: mismatchedContext }),
+      (error: unknown) => error instanceof VisualizationContextError
+        && error.diagnostic.code === "IDENTITY_MISMATCH",
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 // ── 1. Redaction at every verbosity, redaction before caps (AC-3) ───────────
 

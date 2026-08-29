@@ -14,7 +14,7 @@
  */
 
 import type { CtoState, ScheduledDigest } from "./types.js";
-import { readCtoState, writeCtoState } from "./state.js";
+import { readCtoState, validateCtoRunIdentity, writeCtoState } from "./state.js";
 import { recallDecisions } from "./decisions.js";
 import { assessRunHealth } from "./health.js";
 import { checkBudget } from "./budget.js";
@@ -44,24 +44,27 @@ export function shouldRunWave(state: CtoState, now?: number): boolean {
 
 /**
  * Build a scheduled digest. The `root` parameter lets callers prefer the
- * CANONICAL state on disk (`readCtoState(state.id, root)`) — the scheduler
- * runs on a live session whose in-memory snapshot may lag what other
- * writers have persisted — falling back to the passed state when the file
- * is missing/unreadable. `at` is the digest build time; `open_escalations`
- * is the same count health reports, and `budget_status` the same
- * `checkBudget` status, so the digest never disagrees with its own health
- * snapshot.
+ * run-identity-bound canonical state on disk (`readCtoState(state.id, root,
+ * state.run_identity)`) — the scheduler runs on a live session whose
+ * in-memory snapshot may lag what other writers have persisted. A missing,
+ * unreadable, or mismatched file leaves the already validated state as the
+ * observational fallback; it is never treated as an unbound state.
  */
 export function buildDigest(state: CtoState, root: string): ScheduledDigest {
-  const diskState = readCtoState(state.id, root) ?? state;
-  const health = assessRunHealth(diskState);
+  const checkedIdentity = validateCtoRunIdentity(state.run_identity);
+  if (!checkedIdentity.ok) throw new Error(checkedIdentity.diagnostics.map((diagnostic) => diagnostic.code).join(","));
+  const runIdentity = checkedIdentity.value;
+  const diskState = readCtoState(state.id, root, runIdentity);
+  const digestState = diskState ?? state;
+  const health = assessRunHealth(digestState);
   return {
-    run_id: diskState.id,
+    run_id: digestState.id,
+    run_identity: digestState.run_identity,
     at: new Date().toISOString(),
     health,
-    recent_decisions: recallDecisions(diskState, { limit: 10 }),
+    recent_decisions: recallDecisions(digestState, { limit: 10 }),
     open_escalations: health.pending_escalations,
-    budget_status: checkBudget(diskState).status,
+    budget_status: checkBudget(digestState).status,
   };
 }
 
@@ -70,11 +73,13 @@ export function buildDigest(state: CtoState, root: string): ScheduledDigest {
  *
  * - `intervalMs <= 0` (or NaN) → returns a no-op stop; nothing is scheduled
  *   and nothing is persisted.
- * - On start: stamps `scheduler.wave_interval_ms = intervalMs` on the given
- *   state and persists it, so disk truth records the active schedule.
- * - Each tick: re-reads fresh state from disk (falling back to the start
- *   snapshot), and when a wave is due calls `onWave()` and persists
- *   `last_wave_at` / `next_wave_at` (both ISO).
+ * - On start: validates the in-memory identity, then reads the canonical
+ *   identity-bound state from disk before stamping
+ *   `scheduler.wave_interval_ms = intervalMs` and persisting it.
+ * - Each tick: re-reads fresh state from disk under the original identity;
+ *   when a wave is due calls `onWave()` and persists
+ *   `last_wave_at` / `next_wave_at` (both ISO). Missing or mismatched state
+ *   fails that tick closed rather than falling back to a raw legacy state.
  * - The timer is `unref()`'d so a process whose only work is the scheduler
  *   exits cleanly.
  * - A tick NEVER throws: `onWave` errors are logged to `console.error` and
@@ -83,21 +88,31 @@ export function buildDigest(state: CtoState, root: string): ScheduledDigest {
 export function startWaveScheduler(state: CtoState, root: string, intervalMs: number, onWave: () => void): () => void {
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) return () => {};
 
-  state.scheduler = state.scheduler ?? { wave_interval_ms: 0 };
-  state.scheduler.wave_interval_ms = intervalMs;
-  writeCtoState(state, root);
+  const checkedRunIdentity = validateCtoRunIdentity(state.run_identity);
+  if (!checkedRunIdentity.ok) {
+    throw new Error(checkedRunIdentity.diagnostics.map((diagnostic) => diagnostic.code).join(","));
+  }
+  const runIdentity = checkedRunIdentity.value;
+  const initial = readCtoState(state.id, root, runIdentity);
+  if (!initial) throw new Error("MIGRATION_REQUIRED: identity-bound CTO state is unavailable");
+
+  initial.scheduler = initial.scheduler ?? { wave_interval_ms: 0 };
+  initial.scheduler.wave_interval_ms = intervalMs;
+  writeCtoState(initial, root, runIdentity);
 
   const timer = setInterval(() => {
     try {
-      const fresh = readCtoState(state.id, root) ?? state;
+      const fresh = readCtoState(state.id, root, runIdentity);
+      if (!fresh) throw new Error("MIGRATION_REQUIRED: identity-bound CTO state is unavailable");
       if (!shouldRunWave(fresh, Date.now())) return;
       onWave();
-      const updated = readCtoState(state.id, root) ?? fresh;
+      const updated = readCtoState(state.id, root, runIdentity);
+      if (!updated) throw new Error("MIGRATION_REQUIRED: identity-bound CTO state is unavailable");
       updated.scheduler = updated.scheduler ?? { wave_interval_ms: 0 };
       updated.scheduler.wave_interval_ms = intervalMs;
       updated.scheduler.last_wave_at = new Date().toISOString();
       updated.scheduler.next_wave_at = new Date(Date.now() + intervalMs).toISOString();
-      writeCtoState(updated, root);
+      writeCtoState(updated, root, runIdentity);
     } catch (err) {
       console.error("[cto-scheduler] wave tick failed:", err);
     }

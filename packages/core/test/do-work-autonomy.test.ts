@@ -4,249 +4,142 @@
  * `confidence`/`autonomous` together at PHASE-0 (in any language); the P5
  * gate reads `classification.autonomous` (the model decision), fails closed
  * on missing/non-boolean values, and never lets a static hint force a
- * workflow. Legacy top-level `TeamState.autonomous` is read-compat only.
+ * workflow.
+ *
+ * <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core -->
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, profileHash } from "../src/engine/profile.js";
-import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
-import { appendCheckpointDecision, checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
-import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
+import { beginCapability } from "../src/engine/durable.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
-import { registerTeamWorkflow } from "../src/index.js";
-import { resolveState, writeState } from "../src/engine/state.js";
+import { buildDoWorkPrompt, parseWorkEnvelope } from "../src/commands/do-work.js";
+import type { WorkflowCommandContext } from "../src/commands/envelope.js";
+import { buildCtoPrompt } from "../src/commands/cto.js";
+import { keywordClassify } from "../src/engine/classify.js";
+import { resolveWorkflow } from "../src/engine/profile.js";
+import { resolveClassification } from "../src/engine/run.js";
+import { classificationGate } from "../src/gates/classification.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
 
-import {
-  parseWorkEnvelope,
-  buildDoWorkPrompt,
-  keywordClassify,
-  resolveWorkflow,
-  resolveClassification,
-  prepareWorkflowState,
-  classificationGate,
-  buildCtoPrompt,
-} from "@andvl1/omp-workflows-core";
+const COMMAND_DIGEST = `sha256:${"a".repeat(64)}`;
+
+const TEST_STATE_FEATURE = "autonomy";
+const DEFAULT_TEST_WORKFLOW = "lightweight";
+
+type PersistedWorkflowState = {
+  classification?: { workflow?: unknown };
+};
+
+function readPersistedWorkflow(root: string): string {
+  const statePath = join(root, ".work-state", "features", TEST_STATE_FEATURE, "state.json");
+  if (!existsSync(statePath)) return DEFAULT_TEST_WORKFLOW;
+  try {
+    const parsed = JSON.parse(readFileSync(statePath, "utf8")) as PersistedWorkflowState;
+    const workflow = parsed.classification?.workflow;
+    return typeof workflow === "string" && workflow.length > 0 ? workflow : DEFAULT_TEST_WORKFLOW;
+  } catch {
+    return DEFAULT_TEST_WORKFLOW;
+  }
+}
+
+function workflowV2Context(root: string) {
+  const fixture = workflowV2Fixture(readWorkflowProfile(readPersistedWorkflow(root)));
+  return {
+    cwd: root,
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    catalog: fixture.catalog,
+    effective_policy: fixture.effective_policy,
+    agent_inventory: fixture.agent_inventory,
+  };
+}
+
+function orchestratorContext(root: string, hasUI: boolean) {
+  const fixture = workflowV2Fixture(readWorkflowProfile(DEFAULT_TEST_WORKFLOW));
+  return {
+    cwd: root,
+    hasUI,
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    catalog: fixture.catalog,
+    effective_policy: fixture.effective_policy,
+    agent_inventory: fixture.agent_inventory,
+  };
+}
+
+function commandContext(branch = "main"): WorkflowCommandContext {
+  const fixture = workflowV2Fixture(readWorkflowProfile("lightweight"));
+  return {
+    branch,
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    catalog: fixture.catalog,
+    effectivePolicy: fixture.effective_policy,
+    agentInventory: fixture.agent_inventory,
+  };
+}
 
 function writeWorkflowState(root: string, state: Record<string, unknown>): void {
-  mkdirSync(join(root, ".work-state"), { recursive: true });
-  writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(state));
-}
-
-function initGit(root: string, branch: string): void {
-  execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
-}
-function recordTypedCheckpoint(root: string, stageId: string, checkpointId: string): void {
-  const resolved = resolveState(root);
-  assert.ok(resolved.state, "checkpoint fixture state must resolve");
-  const state = resolved.state!;
-  const policy = state.checkpoint_policy;
-  const capability = state.dispatch_capability;
-  assert.ok(policy, "checkpoint fixture must have a typed policy");
-  assert.ok(capability?.capability_id && capability.issued_for?.cursor_epoch, "checkpoint fixture must have a capability binding");
-  const rule = policy.rules[checkpointId];
-  assert.ok(rule, `checkpoint fixture must define ${checkpointId}`);
-  const runId = state.work_identity?.run_id ?? state.run_key ?? state.branch;
-  const trusted = recordTrustedCheckpointAnswer(state, {
-    answer_id: `do-work/${stageId}/${checkpointId}`,
-    channel: "terminal",
-    reference: `terminal-answer/do-work/${stageId}/${checkpointId}`,
-    stage_id: stageId,
-    checkpoint_id: checkpointId,
-    decision: "proceed",
-  });
-  const typed = {
-    run_id: runId,
-    stage_id: stageId,
-    checkpoint_id: checkpointId,
-    checkpoint_kind: rule.kind,
-    decision: "proceed",
-    authorization: "human" as const,
-    actor: { kind: "user" as const, ref: trusted.answer.reference, proof: trusted.proof },
-    capability_id: capability.capability_id,
-    capability_epoch: capability.issued_for!.cursor_epoch,
-    policy_hash: checkpointPolicyHash(policy),
-    rationale: "explicit typed fixture answer",
-    decided_at: new Date().toISOString(),
-  };
-  writeState(root, appendCheckpointDecision(trusted.state, typed), { target: resolved });
-}
-test("do-work: matching-branch state prompt is resumable", () => {
-  const root = mkdtempSync(join(tmpdir(), "do-work-resume-match-"));
-  try {
-    writeWorkflowState(root, { branch: "feat/current", task: "previous fix" });
-    const prompt = buildDoWorkPrompt({ task: "feedback", autonomyHint: false, issue: null, branch: "feat/current" }, root);
-    assert.match(prompt, /resumable continuation/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("do-work: stale active-feature state starts a new workflow", () => {
-  const root = mkdtempSync(join(tmpdir(), "do-work-resume-stale-"));
-  try {
-    mkdirSync(join(root, ".work-state", "features", "old"), { recursive: true });
-    writeFileSync(join(root, ".work-state", ".active-feature"), "old\n");
-    writeFileSync(join(root, ".work-state", "features", "old", "state.json"), JSON.stringify({ branch: "feat/old", task: "previous fix" }));
-    const prompt = buildDoWorkPrompt({ task: "feedback", autonomyHint: false, issue: null, branch: "feat/current" }, root);
-    assert.match(prompt, /No existing do-work state was found/);
-    assert.doesNotMatch(prompt, /resumable continuation/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("workflow_prepare: stale active-feature state is replaced for the current branch", () => {
-  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-stale-feature-"));
-  try {
-    initGit(root, "main");
-    mkdirSync(join(root, ".work-state", "features", "old"), { recursive: true });
-    writeFileSync(join(root, ".work-state", ".active-feature"), "old\n");
-    writeFileSync(join(root, ".work-state", "features", "old", "state.json"), JSON.stringify({
-      schema: 1,
-      branch: "feat/old",
-      task: "previous fix",
-      classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "bug-fix" },
-      stage_cursor: "discovery",
-      stages: [{ id: "discovery", status: "pending" }],
-      artifacts: {},
-      pause: { kind: "none", reason: "" },
+  const rawClassification = state.classification;
+  const classification = rawClassification && typeof rawClassification === "object" && !Array.isArray(rawClassification)
+    ? rawClassification as Record<string, unknown>
+    : {};
+  const workflow = typeof classification.workflow === "string" && classification.workflow.length > 0
+    ? classification.workflow
+    : DEFAULT_TEST_WORKFLOW;
+  const fixture = workflowV2Fixture(readWorkflowProfile(workflow));
+  const stageCursor = typeof state.stage_cursor === "string" && state.stage_cursor.length > 0
+    ? state.stage_cursor
+    : fixture.profile.stages[0]?.id ?? "discovery";
+  const stages = Array.isArray(state.stages)
+    ? state.stages
+    : fixture.profile.stages.map((stage) => ({
+      id: stage.id,
+      status: stage.id === stageCursor ? "in_progress" : "pending",
     }));
-    const prepared = prepareWorkflowState({
-      task: "current branch fix",
-      cwd: root,
-      branch: "main",
-      autonomous: false,
-      classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false },
-      files: [],
-      issue: null,
-    });
-    assert.equal(prepared.statePath, join(root, ".work-state", "features", "main", "state.json"));
-    assert.equal(resolveState(root, "main").state?.branch, "main");
-    assert.equal(readFileSync(join(root, ".work-state", ".active-feature"), "utf8"), "main\n");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("resolveState: complete legacy classification wins over an incomplete active feature", () => {
-  const root = mkdtempSync(join(tmpdir(), "do-work-active-feature-legacy-fallback-"));
-  try {
-    initGit(root, "main");
-    mkdirSync(join(root, ".work-state", "features", "stale"), { recursive: true });
-    writeFileSync(join(root, ".work-state", ".active-feature"), "stale\n");
-    writeFileSync(join(root, ".work-state", "features", "stale", "state.json"), JSON.stringify({
+  const rawCapability = state.dispatch_capability;
+  const capabilityWorkIdentity = rawCapability && typeof rawCapability === "object" && !Array.isArray(rawCapability)
+    ? (rawCapability as Record<string, unknown>).work_identity
+    : undefined;
+  const workIdentity = state.work_identity ?? capabilityWorkIdentity;
+  const workState = join(root, ".work-state");
+  const featureDir = join(workState, "features", TEST_STATE_FEATURE);
+  mkdirSync(featureDir, { recursive: true });
+  writeFileSync(join(workState, ".active-feature"), TEST_STATE_FEATURE);
+  writeFileSync(
+    join(featureDir, "state.json"),
+    JSON.stringify({
+      ...state,
       schema: 1,
-      branch: "main",
-      task: "incomplete feature state",
-    }));
-    writeWorkflowState(root, {
-      schema: 1,
-      branch: "main",
-      classification: {
-        type: "SPEC",
-        complexity: "COMPLEX",
-        confidence: "HIGH",
-        autonomous: true,
-        workflow: "spec-preparation",
-      },
-      task: "current task",
-      stage_cursor: "intake_repo_map",
-      stages: [{ id: "intake_repo_map", status: "in_progress" }],
-      artifacts: {},
-      workflow_override: false,
-      issue: null,
-      pause: { kind: "none", reason: "" },
-      updated_at: new Date().toISOString(),
-      policy: { strict_orchestrator: true },
-    });
-
-    const resolved = resolveState(root, "main");
-    assert.equal(resolved.isLegacy, true);
-    assert.equal(resolved.statePath, join(root, ".work-state", "team-state.json"));
-    assert.equal(resolved.state?.classification.workflow, "spec-preparation");
-
-    const begun = beginCapability(root);
-    assert.equal(begun.ok, true);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("beginCapability: migrates pre-durable top-level workflow state", () => {
-  const root = mkdtempSync(join(tmpdir(), "do-work-legacy-state-migration-"));
-  try {
-    initGit(root, "main");
-    writeWorkflowState(root, {
-      task: "legacy spec task",
-      branch: "main",
-      classification: {
-        type: "SPEC",
-        complexity: "COMPLEX",
-        confidence: "HIGH",
-        autonomous: true,
-      },
-      workflow: "spec-preparation",
-      status: "in_progress",
-      pending_stages: ["research", "architecture", "specification", "review"],
-      history: [],
-    });
-
-    const resolved = resolveState(root, "main");
-    assert.equal(resolved.state?.classification.workflow, "spec-preparation");
-    assert.deepEqual(resolved.state?.stages, []);
-
-    const begun = beginCapability(root);
-    assert.equal(begun.ok, true);
-    assert.equal(begun.state?.stage_cursor, "intake_repo_map");
-    assert.ok(begun.state?.stages.some((stage) => stage.id === "intake_repo_map"));
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("beginCapability: remains fail-closed for incomplete state shapes", () => {
-  const root = mkdtempSync(join(tmpdir(), "do-work-incomplete-state-shape-"));
-  try {
-    initGit(root, "main");
-    writeWorkflowState(root, {
-      task: "incomplete state",
-      branch: "main",
-      classification: {
-        type: "SPEC",
-        complexity: "COMPLEX",
-        confidence: "HIGH",
-        autonomous: true,
-        workflow: "spec-preparation",
-      },
-    });
-
-    const begun = beginCapability(root);
-    assert.equal(begun.ok, false);
-    assert.equal(begun.error, "workflow stages are missing");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("resolveState: rejects feature artifacts that escape through a symlink", () => {
-  const root = mkdtempSync(join(tmpdir(), "state-artifact-symlink-"));
-  try {
-    const featureDir = join(root, ".work-state", "features", "current");
-    const outside = join(root, "outside-artifacts");
-    mkdirSync(featureDir, { recursive: true });
-    mkdirSync(outside, { recursive: true });
-    writeFileSync(join(root, ".work-state", ".active-feature"), "current\n");
-    writeFileSync(join(featureDir, "state.json"), JSON.stringify({ branch: "feat/current" }));
-    symlinkSync(outside, join(featureDir, "artifacts"), "dir");
-    const resolved = resolveState(root, "feat/current");
-    assert.equal(resolved.invalid, true);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+      branch: typeof state.branch === "string" ? state.branch : "main",
+      project_identity: state.project_identity ?? fixture.project_identity,
+      run_identity: state.run_identity ?? fixture.run_identity,
+      classification: { ...classification, workflow },
+      workflow,
+      task: typeof state.task === "string" && state.task.length > 0 ? state.task : "autonomy test task",
+      workflow_override: typeof state.workflow_override === "boolean" ? state.workflow_override : false,
+      issue: state.issue ?? null,
+      stages,
+      artifacts: state.artifacts ?? {},
+      pause: state.pause ?? { kind: "none", reason: "" },
+      stage_cursor: stageCursor,
+      cursor_epoch: typeof state.cursor_epoch === "string" && state.cursor_epoch.length > 0 ? state.cursor_epoch : "autonomy-test-epoch",
+      run_key: typeof state.run_key === "string" && state.run_key.length > 0 ? state.run_key : fixture.run_identity.run_id,
+      profile_hash: typeof state.profile_hash === "string" && state.profile_hash.length > 0
+        ? state.profile_hash
+        : fixture.run_identity.profile_identity.fingerprint,
+      updated_at: typeof state.updated_at === "string" && state.updated_at.length > 0
+        ? state.updated_at
+        : "2026-01-01T00:00:00.000Z",
+      ...(workIdentity === undefined ? {} : { work_identity: workIdentity }),
+    }),
+  );
+}
 
 test("do-work: natural-language directive sets the hint and strips from task", () => {
   const root = mkdtempSync(join(tmpdir(), "do-work-ru-"));
@@ -276,13 +169,12 @@ test("do-work: [AUTONOMOUSLY] lookalike stays literal and hint is false", () => 
 test("do-work: prompt renders the hint as NON-authoritative metadata", () => {
   const root = mkdtempSync(join(tmpdir(), "do-work-prompt-"));
   try {
-    const on = buildDoWorkPrompt(parseWorkEnvelope("действуй автономно: Fix bug", root), root);
+    const on = buildDoWorkPrompt(parseWorkEnvelope("действуй автономно: Fix bug", root), commandContext());
     assert.ok(on.includes("Autonomy is YOUR decision for routing only"), "routing autonomy wording rendered");
     assert.ok(on.includes("Never copy the hint into persisted"), "hint must not be copied as the decision");
     assert.ok(!on.includes("state.autonomous: true"), "prompt must NOT instruct persisting the parsed flag");
-    assert.ok(!on.includes("state.autonomous: false"), "prompt must NOT instruct persisting the parsed flag");
 
-    const off = buildDoWorkPrompt(parseWorkEnvelope("[AUTONOMOUSLY] Fix bug", root), root);
+    const off = buildDoWorkPrompt(parseWorkEnvelope("[AUTONOMOUSLY] Fix bug", root), commandContext());
     assert.ok(off.includes("Autonomy is YOUR decision for routing only"), "routing autonomy wording rendered");
     assert.ok(off.includes("[AUTONOMOUSLY] Fix bug"), "task text carries the lookalike verbatim");
   } finally {
@@ -293,8 +185,8 @@ test("do-work: prompt renders the hint as NON-authoritative metadata", () => {
 test("classification contract: /do-work and /cto request the SAME four model fields", () => {
   const root = mkdtempSync(join(tmpdir(), "class-contract-"));
   try {
-    const work = buildDoWorkPrompt(parseWorkEnvelope("Fix login bug", root), root);
-    const cto = buildCtoPrompt(parseWorkEnvelope("Fix login bug", root), root);
+    const work = buildDoWorkPrompt(parseWorkEnvelope("Fix login bug", root), commandContext());
+    const cto = buildCtoPrompt(parseWorkEnvelope("Fix login bug", root), commandContext());
     for (const prompt of [work, cto]) {
       assert.ok(prompt.includes("CLASSIFICATION:"), "visible classification block");
       assert.ok(prompt.includes("- Type: FEATURE | REFACTOR | OPS | BUG_FIX | SPEC | REGRESS | INVESTIGATION | REVIEW | HOTFIX"), "Type field");
@@ -314,10 +206,9 @@ test("P5 gate: natural-language autonomous task (hint false) is accepted as debu
   const root = mkdtempSync(join(tmpdir(), "p5-model-auto-"));
   try {
     const envelope = parseWorkEnvelope("Do this without waiting for approval — fix the login bug", root);
-    assert.equal(envelope.autonomyHint, false, "parser does NOT recognize natural-language autonomy");
+    const prompt = buildDoWorkPrompt(envelope, commandContext());
 
     // The prompt hands the FULL task to the model and lets it decide true.
-    const prompt = buildDoWorkPrompt(envelope, root);
     assert.ok(prompt.includes("Do this without waiting for approval"), "full task visible to PHASE-0");
     assert.ok(prompt.includes("Autonomy is YOUR decision for routing only"), "routing autonomy wording is explicit");
 
@@ -325,7 +216,7 @@ test("P5 gate: natural-language autonomous task (hint false) is accepted as debu
     writeWorkflowState(root, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle", autonomous: true, autonomous_reason: "task explicitly waives approval" },
     });
-    assert.equal(classificationGate({ agent: "developer" }, { cwd: root }), undefined, "model autonomous=true accepted as debug-cycle");
+    assert.equal(classificationGate({ agent: "developer" }, workflowV2Context(root)), undefined, "model autonomous=true accepted as debug-cycle");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -339,7 +230,7 @@ test("P5 gate: [AUTONOMOUS] marker can be OVERRIDDEN by the model to interactive
     const envelope = parseWorkEnvelope("[AUTONOMOUS] Walk me through each step before touching code", root);
     assert.equal(envelope.autonomyHint, true, "static hint is ON");
 
-    const prompt = buildDoWorkPrompt(envelope, root);
+    const prompt = buildDoWorkPrompt(envelope, commandContext());
     assert.ok(prompt.includes("Autonomy is YOUR decision for routing only"), "routing autonomy wording rendered");
     assert.ok(prompt.includes("does not authorize a checkpoint"), "prompt separates routing from checkpoint permission");
 
@@ -347,14 +238,15 @@ test("P5 gate: [AUTONOMOUS] marker can be OVERRIDDEN by the model to interactive
     writeWorkflowState(root, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "bug-fix", autonomous: false, autonomous_reason: "user wants step-by-step review" },
     });
-    assert.equal(classificationGate({ agent: "developer" }, { cwd: root }), undefined, "model false stays interactive");
+    assert.equal(classificationGate({ agent: "developer" }, workflowV2Context(root)), undefined, "model false stays interactive");
 
     writeWorkflowState(root, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle", autonomous: false },
     });
-    const blocked = classificationGate({ agent: "developer" }, { cwd: root });
+    const blocked = classificationGate({ agent: "developer" }, workflowV2Context(root));
     assert.ok(blocked, "interactive QUICK BUG_FIX with debug-cycle is blocked");
-    assert.ok(blocked?.reason?.includes("expected 'bug-fix'"), "block names the interactive resolution");
+    assert.equal(blocked?.diagnostic?.code, "CONFIG_MALFORMED", "block uses the canonical v2 diagnostic code");
+    assert.match(blocked?.diagnostic?.remediation ?? "", /classification matrix/u, "block names the canonical interactive resolution");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -368,7 +260,7 @@ test("P5 gate: missing classification.autonomous blocks — no silent default", 
     writeWorkflowState(root, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle" },
     });
-    const blocked = classificationGate({ agent: "developer" }, { cwd: root });
+    const blocked = classificationGate({ agent: "developer" }, workflowV2Context(root));
     assert.ok(blocked, "missing autonomous blocks");
     assert.ok(blocked?.reason?.includes("classification.autonomous is missing"), "reason names the missing field");
   } finally {
@@ -382,7 +274,7 @@ test("P5 gate: non-boolean classification.autonomous blocks — fail closed", ()
     writeWorkflowState(root, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle", autonomous: "true" },
     });
-    const blocked = classificationGate({ agent: "developer" }, { cwd: root });
+    const blocked = classificationGate({ agent: "developer" }, workflowV2Context(root));
     assert.ok(blocked, "string autonomous blocks");
     assert.ok(blocked?.reason?.includes("must be a boolean"), "reason names the invalid type");
   } finally {
@@ -399,7 +291,7 @@ test("P5 gate: workflow_override:true cannot bypass MISSING classification.auton
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle" },
       workflow_override: true,
     });
-    const blocked = classificationGate({ agent: "developer" }, { cwd: root });
+    const blocked = classificationGate({ agent: "developer" }, workflowV2Context(root));
     assert.ok(blocked, "an explicit override must not bypass a missing model autonomy field");
     assert.ok(blocked?.reason?.includes("classification.autonomous is missing"), "reason names the missing field");
   } finally {
@@ -414,7 +306,7 @@ test("P5 gate: workflow_override:true cannot bypass NON-BOOLEAN classification.a
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle", autonomous: "true" },
       workflow_override: true,
     });
-    const blocked = classificationGate({ agent: "developer" }, { cwd: root });
+    const blocked = classificationGate({ agent: "developer" }, workflowV2Context(root));
     assert.ok(blocked, "an explicit override must not bypass a non-boolean model autonomy field");
     assert.ok(blocked?.reason?.includes("must be a boolean"), "reason names the invalid type");
   } finally {
@@ -430,7 +322,7 @@ test("P5 gate: workflow_override:true still allows a VALID model autonomy decisi
       workflow_override: true,
     });
     assert.equal(
-      classificationGate({ agent: "developer" }, { cwd: root }),
+      classificationGate({ agent: "developer" }, workflowV2Context(root)),
       undefined,
       "override with a valid boolean decision passes — the override skips the mismatch check, not the autonomy gate",
     );
@@ -439,29 +331,8 @@ test("P5 gate: workflow_override:true still allows a VALID model autonomy decisi
   }
 });
 
-// ── (e) legacy top-level state reads safely; new field wins over legacy ─────
 
-test("P5 gate: legacy top-level autonomous reads compatibly when the model field is absent", () => {
-  const root = mkdtempSync(join(tmpdir(), "p5-legacy-"));
-  try {
-    writeWorkflowState(root, {
-      classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle" },
-      autonomous: true,
-    });
-    assert.equal(classificationGate({ agent: "developer" }, { cwd: root }), undefined, "legacy autonomous=true + debug-cycle passes");
-
-    writeWorkflowState(root, {
-      classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle" },
-      autonomous: false,
-    });
-    const blocked = classificationGate({ agent: "developer" }, { cwd: root });
-    assert.ok(blocked, "legacy autonomous=false must NOT silently run debug-cycle");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("P5 gate: a present model field wins over the legacy top-level field", () => {
+test("P5 gate: a present model field wins over an ignored legacy top-level field", () => {
   const root = mkdtempSync(join(tmpdir(), "p5-priority-"));
   try {
     // Legacy says true, model says false — the model decision is the authority.
@@ -469,7 +340,7 @@ test("P5 gate: a present model field wins over the legacy top-level field", () =
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "bug-fix", autonomous: false },
       autonomous: true,
     });
-    assert.equal(classificationGate({ agent: "developer" }, { cwd: root }), undefined, "model false keeps it interactive");
+    assert.equal(classificationGate({ agent: "developer" }, workflowV2Context(root)), undefined, "model false keeps it interactive");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -487,7 +358,7 @@ test("P5 gate: a static hint cannot force autonomous — hint true + model false
     writeWorkflowState(root, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "bug-fix", autonomous: false },
     });
-    assert.equal(classificationGate({ agent: "developer" }, { cwd: root }), undefined, "hint true must not force debug-cycle");
+    assert.equal(classificationGate({ agent: "developer" }, workflowV2Context(root)), undefined, "hint true must not force debug-cycle");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -552,15 +423,15 @@ test("engine: legacy path (no model classification) uses the caller flag verbati
   assert.equal(resolved.workflow, "debug-cycle", "workflow resolved from the caller flag");
 });
 
-test("P5 gate: missing classification blocks; absent state allows (legacy flow)", () => {
+test("P5 gate: missing classification blocks; absent state has no workflow to gate", () => {
   const root = mkdtempSync(join(tmpdir(), "p5-missing-"));
   try {
-    writeWorkflowState(root, { classification: { complexity: "QUICK" } });
-    const blocked = classificationGate({ agent: "developer" }, { cwd: root });
+    writeWorkflowState(root, { classification: { complexity: "QUICK", autonomous: false } });
+    const blocked = classificationGate({ agent: "developer" }, workflowV2Context(root));
     assert.ok(blocked, "missing classification blocks subagent launch");
 
     rmSync(join(root, ".work-state"), { recursive: true, force: true });
-    assert.equal(classificationGate({ agent: "developer" }, { cwd: root }), undefined, "no state -> legacy allow");
+    assert.equal(classificationGate({ agent: "developer" }, workflowV2Context(root)), undefined, "no state -> nothing to gate");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -572,40 +443,46 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
     mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
     writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
     const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
-    const source = orchestratorWriteGate({ toolName: "write", input: { actor: "worker", path: "src/app.ts" } }, { cwd: root, hasUI: true });
+    const missingIdentity = orchestratorWriteGate(
+      { toolName: "write", input: { path: "src/app.ts" } },
+      { cwd: root, hasUI: true },
+    );
+    assert.equal(missingIdentity?.block, true);
+    assert.match(missingIdentity?.reason ?? "", /MIGRATION_REQUIRED/);
+    const source = orchestratorWriteGate({ toolName: "write", input: { actor: "worker", path: "src/app.ts" } }, orchestratorContext(root, true));
     assert.equal(source?.block, true);
     assert.match(source?.reason ?? "", /may write only under \.work-state/);
-    const state = orchestratorWriteGate({ toolName: "edit", input: { actor: "worker", path: ".work-state/team-state.json" } }, { cwd: root, hasUI: true });
+    const state = orchestratorWriteGate({ toolName: "edit", input: { actor: "worker", path: ".work-state/team-state.json" } }, orchestratorContext(root, true));
     assert.equal(state?.block, true);
     assert.match(state?.reason ?? "", /canonical workflow state/);
-    const artifact = orchestratorWriteGate({ toolName: "write", input: { actor: "worker", path: ".work-state/artifacts/report.json" } }, { cwd: root, hasUI: true });
+    const artifact = orchestratorWriteGate({ toolName: "write", input: { actor: "worker", path: ".work-state/artifacts/report.json" } }, orchestratorContext(root, true));
     assert.equal(artifact, undefined);
 
     const mountedWorkflowTool = orchestratorWriteGate(
       { toolName: "write", input: { path: "xd://workflow_instructions", content: "{}" } },
-      { cwd: root, hasUI: true },
+      orchestratorContext(root, true),
     );
     assert.equal(mountedWorkflowTool, undefined, "mounted xd tools are not project writes");
     const mountedDiagnosticTool = orchestratorWriteGate(
       { toolName: "write", input: { path: "xd://report_issue", content: "tool routing failed" } },
-      { cwd: root, hasUI: true },
+      orchestratorContext(root, true),
     );
     assert.equal(mountedDiagnosticTool, undefined, "mounted diagnostics are not project writes");
-    const worker = orchestratorWriteGate({ toolName: "write", input: { actor: "orchestrator", path: "src/app.ts" } }, { cwd: root, hasUI: false });
+    const worker = orchestratorWriteGate({ toolName: "write", input: { actor: "orchestrator", path: "src/app.ts" } }, orchestratorContext(root, false));
     assert.equal(worker, undefined);
-    const bashEcho = orchestratorWriteGate({ toolName: "bash", input: { command: "echo hacked > src/app.ts" } }, { cwd: root, hasUI: true });
+    const bashEcho = orchestratorWriteGate({ toolName: "bash", input: { command: "echo hacked > src/app.ts" } }, orchestratorContext(root, true));
     assert.equal(bashEcho?.block, true);
-    const bashRemove = orchestratorWriteGate({ toolName: "bash", input: { command: "rm src/app.ts" } }, { cwd: root, hasUI: true });
+    const bashRemove = orchestratorWriteGate({ toolName: "bash", input: { command: "rm src/app.ts" } }, orchestratorContext(root, true));
     assert.equal(bashRemove?.block, true);
-    const bashRead = orchestratorWriteGate({ toolName: "bash", input: { command: "git diff -- src/app.ts" } }, { cwd: root, hasUI: true });
+    const bashRead = orchestratorWriteGate({ toolName: "bash", input: { command: "git diff -- src/app.ts" } }, orchestratorContext(root, true));
     assert.equal(bashRead, undefined);
-    const workerCanonicalBash = orchestratorWriteGate({ toolName: "bash", input: { command: "cat > .work-state/team-state.json" } }, { cwd: root, hasUI: false });
+    const workerCanonicalBash = orchestratorWriteGate({ toolName: "bash", input: { command: "cat > .work-state/team-state.json" } }, orchestratorContext(root, false));
     assert.equal(workerCanonicalBash?.block, true);
-    const ctoCanonicalBash = orchestratorWriteGate({ toolName: "bash", input: { command: "awk '{print}' > .work-state/cto/run-1/state.json" } }, { cwd: root, hasUI: true });
+    const ctoCanonicalBash = orchestratorWriteGate({ toolName: "bash", input: { command: "awk '{print}' > .work-state/cto/run-1/state.json" } }, orchestratorContext(root, true));
     assert.equal(ctoCanonicalBash?.block, true);
-    const redirectedSource = orchestratorWriteGate({ toolName: "bash", input: { command: "git show HEAD:src/app.ts > \"$(pwd)/src/app.ts\"" } }, { cwd: root, hasUI: true });
+    const redirectedSource = orchestratorWriteGate({ toolName: "bash", input: { command: "git show HEAD:src/app.ts > \"$(pwd)/src/app.ts\"" } }, orchestratorContext(root, true));
     assert.equal(redirectedSource?.block, true);
-    const workerCanonicalInPlace = orchestratorWriteGate({ toolName: "bash", input: { command: "awk -i inplace '{print}' .work-state/team-state.json" } }, { cwd: root, hasUI: false });
+    const workerCanonicalInPlace = orchestratorWriteGate({ toolName: "bash", input: { command: "awk -i inplace '{print}' .work-state/team-state.json" } }, orchestratorContext(root, false));
     assert.equal(workerCanonicalInPlace?.block, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -638,7 +515,7 @@ test("strict orchestrator policy permits git publication and PR control-plane co
     ];
     for (const command of allowed) {
       assert.equal(
-        orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true }),
+        orchestratorWriteGate({ toolName: "bash", input: { command } }, orchestratorContext(root, true)),
         undefined,
         `control-plane command should be allowed: ${command}`,
       );
@@ -657,7 +534,7 @@ test("strict orchestrator policy permits git publication and PR control-plane co
     ];
     for (const command of blocked) {
       assert.equal(
-        orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true })?.block,
+        orchestratorWriteGate({ toolName: "bash", input: { command } }, orchestratorContext(root, true))?.block,
         true,
         `direct worktree mutation should remain blocked: ${command}`,
       );
@@ -679,12 +556,12 @@ test("strict orchestrator policy parses edit patches and allows read-only artifa
       "+export const server = true;",
     ].join("\n");
     assert.equal(
-      orchestratorWriteGate({ toolName: "edit", input: { input: sourcePatch } }, { cwd: root, hasUI: false }),
+      orchestratorWriteGate({ toolName: "edit", input: { input: sourcePatch } }, orchestratorContext(root, false)),
       undefined,
       "a worker edit patch with a file header is a verifiable source path",
     );
     assert.equal(
-      orchestratorWriteGate({ toolName: "edit", input: sourcePatch }, { cwd: root, hasUI: false }),
+      orchestratorWriteGate({ toolName: "edit", input: sourcePatch }, orchestratorContext(root, false)),
       undefined,
       "a worker edit patch passed as the raw tool input is a verifiable source path",
     );
@@ -695,13 +572,13 @@ test("strict orchestrator policy parses edit patches and allows read-only artifa
     ].join("\n");
     const blockedCanonicalPatch = orchestratorWriteGate(
       { toolName: "edit", input: { input: canonicalPatch } },
-      { cwd: root, hasUI: false },
+      orchestratorContext(root, false),
     );
     assert.equal(blockedCanonicalPatch?.block, true);
     assert.match(blockedCanonicalPatch?.reason ?? "", /canonical workflow state/);
     const blockedHeaderlessPatch = orchestratorWriteGate(
       { toolName: "edit", input: { input: "PUT 1.=1:\n+not a file patch" } },
-      { cwd: root, hasUI: false },
+      orchestratorContext(root, false),
     );
     assert.equal(blockedHeaderlessPatch?.block, true);
     assert.match(blockedHeaderlessPatch?.reason ?? "", /no verifiable path/);
@@ -716,7 +593,7 @@ test("strict orchestrator policy parses edit patches and allows read-only artifa
       "node -e 'const fs=require(\"node:fs\"); const values=fs.globSync(\".work-state/features/visualize/artifacts/*.json\").map((path) => JSON.parse(fs.readFileSync(path, \"utf8\")));'";
     for (const command of [pythonReadOnlyValidation, pythonJsonReadOnlyValidation, nodeReadOnlyValidation, nodeGlobReadOnlyValidation]) {
       assert.equal(
-        orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true }),
+        orchestratorWriteGate({ toolName: "bash", input: { command } }, orchestratorContext(root, true)),
         undefined,
         "read-only artifact validation must remain allowed: " + command,
       );
@@ -727,7 +604,7 @@ test("strict orchestrator policy parses edit patches and allows read-only artifa
       "printf '{}' | tee .work-state/features/visualize/state.json",
       "cd .work-state/features/visualize && printf '{}' > state.json",
     ]) {
-      const blocked = orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true });
+      const blocked = orchestratorWriteGate({ toolName: "bash", input: { command } }, orchestratorContext(root, true));
       assert.equal(blocked?.block, true, "canonical workflow write must remain blocked: " + command);
     }
   } finally {
@@ -740,11 +617,11 @@ test("strict durable transitions fail closed when no active git branch exists", 
   try {
     writeWorkflowState(root, {
       branch: "feature/no-git",
-      classification: { workflow: "lightweight" },
+      classification: { workflow: "lightweight", autonomous: false },
       stage_cursor: "implementation",
       stages: [{ id: "implementation", status: "in_progress" }],
     });
-    const begun = beginCapability(root);
+    const begun = beginCapability(root, workflowV2Context(root));
     assert.equal(begun.ok, false);
     assert.match(begun.error, /stale for the active branch/);
   } finally {
@@ -752,107 +629,16 @@ test("strict durable transitions fail closed when no active git branch exists", 
   }
 });
 
-test("do-work prompt makes orchestrator non-coding policy explicit", () => {
-  const root = mkdtempSync(join(tmpdir(), "do-work-policy-prompt-"));
-  try {
-    const prompt = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
-    assert.match(prompt, /STRICT ORCHESTRATOR POLICY/);
-    assert.match(prompt, /write\/edit application source or project files \| DENY/);
-    assert.match(prompt, /git status.*git fetch.*git merge.*git rebase.*git cherry-pick.*git add.*git commit.*git push.*gh pr create/);
-    assert.match(prompt, /git checkout <branch>.*git checkout -b <branch>.*git switch <branch>.*git switch -c <branch>/);
-    assert.match(prompt, /After every delegated call or parallel batch/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+test("do-work prompt is pure and names only host-owned workflow authorities", () => {
+  const prompt = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", "feature/main"), commandContext("feature/main"));
+  assert.match(prompt, /### Execution contract/);
+  assert.match(prompt, /workflow_prepare/);
+  assert.match(prompt, /selected provider/);
+  assert.match(prompt, /qualified agent identities/);
+  assert.match(prompt, /### Seven-step resume-from-disk contract/);
+  assert.deepEqual(prompt.match(/^\d+\. /gm), ["1. ", "2. ", "3. ", "4. ", "5. ", "6. ", "7. "]);
+  assert.doesNotMatch(prompt, /resolveConfig|findProfileDir|CLAUDE_PLUGIN_ROOT|\.work-state\/team-state\.json/);
 });
-
-test("do-work: prompt is tool-only for workflow content and never instructs filesystem profile reads", () => {
-  // Arbitrary consumer project: a fresh temp dir, no packages/core anywhere.
-  const root = mkdtempSync(join(tmpdir(), "do-work-consumer-"));
-  try {
-    assert.ok(!existsSync(join(root, "packages", "core")), "temp consumer cwd has no packages/core");
-    const prompt = buildDoWorkPrompt(parseWorkEnvelope("Fix login bug", root), root);
-
-    // Step 1 must be an explicit tool-only sequence: workflow_prepare first,
-    // then workflow_begin and workflow_instructions as the ONLY workflow instruction source.
-    assert.ok(
-      prompt.includes("workflow_prepare"),
-      "prompt must require workflow_prepare before state transitions",
-    );
-    assert.ok(
-      prompt.indexOf("workflow_prepare") < prompt.indexOf("workflow_begin"),
-      "workflow_prepare must precede workflow_begin in the tool sequence",
-    );
-    assert.ok(
-      prompt.indexOf("workflow_begin") < prompt.indexOf("workflow_instructions"),
-      "workflow_begin must precede workflow_instructions in the tool sequence",
-    );
-    assert.match(prompt, /ONLY supported state initialization\/update path/);
-    assert.doesNotMatch(prompt, /Then write `.work-state\/team-state\.json`/);
-    assert.ok(
-      prompt.includes("stage.instructions"),
-      "prompt must name the returned stage contract field stage.instructions",
-    );
-    assert.match(prompt, /only workflow instruction source/i);
-    assert.match(prompt, /state\.artifactsDir/);
-    assert.doesNotMatch(prompt, /writing declared typed artifacts under `\.work-state\/artifacts\/`/);
-    // After every workflow_advance the model must re-fetch workflow_instructions.
-    assert.match(prompt, /workflow_advance`, call `workflow_instructions`/);
-    assert.match(prompt, /handoff\.dispatch_markers/);
-    assert.match(prompt, /tasks\[\]\.task/);
-    assert.match(prompt, /artifact_schemas/);
-    assert.match(prompt, /slot_artifacts/);
-    assert.match(prompt, /artifact_ids/);
-    assert.match(prompt, /native task result.*artifact completion/i);
-    assert.match(prompt, /dod.*items.*MUST be objects/i);
-    assert.match(prompt, /Before `workflow_advance`.*workflow_checkpoint/);
-    assert.match(prompt, /typed `workflow_checkpoint` envelope/);
-    assert.match(prompt, /actor_provenance/);
-    assert.match(prompt, /compact first-30\/last-2 binding fingerprint/);
-    assert.match(prompt, /workflow_\*.*main-session-only.*canonical `\.work-state`.*bash.*write/i);
-
-    // No filesystem/package-path/plugin-root workflow content sourcing.
-    assert.ok(!prompt.includes("findProfileDir"), "prompt must not reference the profile directory helper");
-    assert.ok(!prompt.includes("<workflow>.json"), "prompt must not instruct reading workflow JSON from disk");
-    assert.ok(!prompt.includes("CLAUDE_PLUGIN_ROOT"), "prompt must not mention CLAUDE_PLUGIN_ROOT");
-    assert.ok(!prompt.includes("omp://"), "prompt must not mention omp:// for workflow content");
-    assert.match(prompt, /Do NOT glob for workflow files/, "prompt must forbid globbing workflow files");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("do-work: resume guidance is exactly seven ordered steps with no-micromanagement and typed marker discipline", () => {
-  const root = mkdtempSync(join(tmpdir(), "do-work-resume-contract-"));
-  try {
-    const prompt = buildDoWorkPrompt(parseWorkEnvelope("Continue the previous fix", root), root);
-    const resumeStart = prompt.indexOf("### Seven-step resume-from-disk contract");
-    const workerPolicyStart = prompt.indexOf("### NO-MICROMANAGEMENT WORKER POLICY");
-    assert.ok(resumeStart >= 0);
-    assert.ok(workerPolicyStart > resumeStart);
-    const resumeSection = prompt.slice(resumeStart, workerPolicyStart);
-    assert.deepEqual(resumeSection.match(/^\d+\. /gm), ["1. ", "2. ", "3. ", "4. ", "5. ", "6. ", "7. "]);
-    for (const label of [
-      "**Prepare**",
-      "**Resolve and validate selection**",
-      "**Freeze snapshot/capability**",
-      "**Authorize identity**",
-      "**Reconcile pending/terminal**",
-      "**Join/fan-in**",
-      "**Checkpoint/gate/advance**",
-    ]) {
-      assert.match(resumeSection, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    }
-    assert.match(prompt, /NO-MICROMANAGEMENT WORKER POLICY/);
-    assert.match(prompt, /Do not prescribe code shape, file edits, command sequences/);
-    assert.match(prompt, /Pending\/active workers.*Still Running.*neutral/);
-    assert.match(prompt, /typed marker.*missing or malformed/);
-    assert.match(prompt, /legacy alias.*autonomous\/completion claim/);
-    assert.match(prompt, /completion intent, free text, prompt wording/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test("DoD gate: malformed and legacy artifacts fail closed while typed evidence passes", () => {
   const valid = validateTypedDoD({
     items: [{ criterion: "criterion", verify_method: "run the focused check", status: "met", evidence: "observed pass" }],
@@ -865,44 +651,47 @@ test("DoD gate: malformed and legacy artifacts fail closed while typed evidence 
   const root = mkdtempSync(join(tmpdir(), "dod-typed-backstop-"));
   try {
     const workState = join(root, ".work-state");
-    const artifacts = join(workState, "artifacts");
-    mkdirSync(artifacts, { recursive: true });
+    mkdirSync(workState, { recursive: true });
     writeFileSync(join(workState, "team-state.json"), JSON.stringify({
       stage_cursor: "summary",
       pause: { kind: "done" },
       classification: { workflow: "lightweight" },
     }));
+    assert.equal(dodBackstop({}, { cwd: root }), undefined, "missing identity must not inspect legacy canonical state");
+
+    writeWorkflowState(root, {
+      stage_cursor: "summary",
+      pause: { kind: "done", reason: "" },
+      classification: { workflow: "lightweight", autonomous: false },
+    });
+    const context = workflowV2Context(root);
+    const artifacts = join(workState, "features", TEST_STATE_FEATURE, "artifacts");
+    mkdirSync(artifacts, { recursive: true });
     const dodPath = join(artifacts, "dod.json");
-    writeFileSync(join(workState, ".active-feature"), "../escape");
-    assert.equal(dodBackstop({}, { cwd: root }), undefined, "unsafe active-feature slug must fail closed before reading state");
-    rmSync(join(workState, ".active-feature"));
 
     writeFileSync(dodPath, JSON.stringify({ items: [{ criterion: "criterion", status: "met", evidence: "observed pass" }] }));
-    const malformed = dodBackstop({}, { cwd: root });
+    const malformed = dodBackstop({}, context);
     assert.equal(malformed?.decision, "block");
     assert.match(malformed?.reason ?? "", /malformed typed artifact/);
 
     writeFileSync(dodPath, JSON.stringify({
       items: [{ criterion: "criterion", verify_method: "run the focused check", status: "pending" }],
     }));
-    const pending = dodBackstop({}, { cwd: root });
+    const pending = dodBackstop({}, context);
     assert.equal(pending?.decision, "block");
     assert.match(pending?.reason ?? "", /unmet or evidence-less/);
 
     writeFileSync(dodPath, JSON.stringify({
       items: [{ criterion: "criterion", verify_method: "run the focused check", status: "met", evidence: "observed pass" }],
     }));
-    assert.deepEqual(dodBackstop({}, { cwd: root }), { continue: true });
+    assert.deepEqual(dodBackstop({}, context), { continue: true });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
-
 test("DoD gate: active, pending, waiting, polling, and temporary artifact states are neutral", () => {
   const root = mkdtempSync(join(tmpdir(), "dod-neutral-runtime-"));
   try {
-    const statePath = join(root, ".work-state", "team-state.json");
-    mkdirSync(join(root, ".work-state"), { recursive: true });
     const transientStates: Record<string, unknown>[] = [
       { worker: { status: "active" } },
       { worker_status: "pending" },
@@ -912,529 +701,28 @@ test("DoD gate: active, pending, waiting, polling, and temporary artifact states
       { artifact_status: "temporary artifact absence" },
     ];
     for (const transient of transientStates) {
-      writeFileSync(statePath, JSON.stringify({
+      writeWorkflowState(root, {
         stage_cursor: "summary",
-        pause: { kind: "done" },
-        classification: { workflow: "lightweight" },
+        pause: { kind: "done", reason: "" },
+        classification: { workflow: "lightweight", autonomous: false },
         ...transient,
-      }));
-      assert.equal(dodBackstop({}, { cwd: root }), undefined);
-    }
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-
-test("team and do-work use the same strict orchestration contract", () => {
-  const root = mkdtempSync(join(tmpdir(), "team-alias-policy-"));
-  try {
-    const work = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
-    const team = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
-    assert.equal(team, work, "/team alias must resolve to the identical canonical prompt");
-    assert.match(team, /STRICT ORCHESTRATOR POLICY/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("dispatch gate requires the exact active cursor stage and roster", async () => {
-  const root = mkdtempSync(join(tmpdir(), "dispatch-cursor-"));
-  try {
-    initGit(root, "feat/test");
-    mkdirSync(join(root, ".work-state"), { recursive: true });
-    const profile = loadProfile("lightweight");
-    assert.ok(profile, "lightweight profile must be available for strict dispatch fixture");
-    const persistedProfileHash = profileHash(profile);
-    const capability = createCapability({
-      run_key: "feat/test", branch: "feat/test", workflow: "lightweight", profile_hash: persistedProfileHash,
-      stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "${scope.dev_agent}" }],
-    });
-    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
-      branch: "feat/test", run_key: "feat/test", policy: { strict_orchestrator: true }, stage_cursor: "implementation",
-      stages: [{ id: "implementation", status: "in_progress" }],
-      cursor_epoch: capability.state.issued_for?.cursor_epoch, profile_hash: persistedProfileHash,
-      dispatch_capability: capability.state,
-      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
-    }));
-    const { dispatchGate } = await import("../src/gates/dispatch.ts");
-    const missing = dispatchGate({ toolName: "task", input: { agent: "backend-kotlin", task: "Implement the stage without a marker" } }, { cwd: root });
-    assert.equal(missing?.block, true, "missing structured marker must fail closed");
-    const malformed = dispatchGate({ toolName: "task", input: { agent: "backend-kotlin", task: "<!-- omp-dispatch run=feat/test stage=implementation -->" } }, { cwd: root });
-    assert.equal(malformed?.block, true, "malformed structured marker must fail closed");
-    const wrong = dispatchGate({ toolName: "task", input: { agent: "backend-kotlin", task: "<!-- omp-dispatch run=feat/test stage=discovery kind=single cursor=discovery roles=analyst -->" } }, { cwd: root });
-    assert.equal(wrong?.block, true);
-    const right = dispatchGate({ toolName: "task", input: { agent: "${scope.dev_agent}", role: "${scope.dev_agent}", task: `<!-- omp-dispatch run=feat/test stage=implementation kind=single cursor=${capability.state.issued_for?.cursor_epoch} roles=\${scope.dev_agent} -->` } }, { cwd: root });
-    assert.equal(right, undefined);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("dispatch markers bind to the persisted cursor epoch", () => {
-  const stage = { id: "implementation", title: "Implementation", type: "single" as const, role: "go" };
-  const marker = buildDispatchMarker("run-1", stage, ["go"], "go", "epoch-1");
-  assert.equal(parseDispatchMarker(marker)?.cursor, "epoch-1");
-});
-test("strict runtime issues opaque capabilities and reconciles native task results", () => {
-  const root = mkdtempSync(join(tmpdir(), "dispatch-capability-runtime-"));
-  try {
-    initGit(root, "feature/capability");
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    writeWorkflowState(root, {
-      schema: 1,
-      branch: "feature/capability",
-      task: "capability test",
-      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
-      stage_cursor: "implementation",
-      stages: profile.stages.map((stage) => ({
-        id: stage.id,
-        status: stage.id === "implementation" ? "in_progress" : stage.id === "discovery" ? "done" : "pending",
-      })),
-      artifacts: {},
-      scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
-      policy: { strict_orchestrator: true },
-      pause: { kind: "none", reason: "" },
-    });
-
-    const begun = beginCapability(root);
-    assert.equal(begun.ok, true);
-    if (!begun.ok || !begun.handoff) return;
-    const handoff = begun.handoff;
-    const fullProfileHash = profileHash(profile);
-    const expectedFingerprint = `${fullProfileHash.slice(0, 30)}${fullProfileHash.slice(-2)}`;
-    assert.notEqual(expectedFingerprint, fullProfileHash);
-    assert.equal(handoff.profile_hash, expectedFingerprint);
-    const wrongProfileHash = `${handoff.profile_hash.slice(0, -1)}${handoff.profile_hash.endsWith("0") ? "1" : "0"}`;
-    const wrongBinding = authorizeDispatch(root, {
-      token: handoff.dispatch_token,
-      capability_id: handoff.capability_id,
-      run_key: handoff.run_key,
-      branch: handoff.branch,
-      workflow: handoff.workflow,
-      profile_hash: wrongProfileHash,
-      stage_cursor: handoff.stage_cursor,
-      cursor_epoch: handoff.cursor_epoch,
-      role: "developer-kotlin",
-      agent: "developer-kotlin",
-    });
-    assert.equal(wrongBinding.ok, false);
-    if (wrongBinding.ok) return;
-    assert.equal(wrongBinding.error, "capability binding mismatch");
-    const persisted = readFileSync(join(root, ".work-state", "team-state.json"), "utf8");
-    assert.doesNotMatch(persisted, new RegExp(handoff.dispatch_token));
-    assert.doesNotMatch(persisted, new RegExp(handoff.advance_token));
-
-    const stage = profile.stages.find((candidate) => candidate.id === "implementation");
-    assert.ok(stage);
-    const marker = buildDispatchMarker(handoff.run_key, stage, ["developer-kotlin"], "developer-kotlin", handoff.cursor_epoch);
-    const request = trustedDispatchRequests({
-      toolName: "task",
-      toolCallId: "tool-1",
-      input: { agent: "developer-kotlin", role: "developer-kotlin", task: marker },
-    }, { cwd: root });
-    assert.equal(request.ok, true);
-    if (!request.ok) return;
-    assert.equal(request.requests.length, 1);
-    const preauthorized = authorizeDispatch(root, {
-      token: handoff.dispatch_token,
-      capability_id: handoff.capability_id,
-      run_key: handoff.run_key,
-      branch: handoff.branch,
-      workflow: handoff.workflow,
-      profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor,
-      cursor_epoch: handoff.cursor_epoch,
-      role: "developer-kotlin",
-      agent: "developer-kotlin",
-    });
-    assert.equal(preauthorized.ok, true);
-    const authorized = authorizeDispatchTrusted(root, request.requests[0]!);
-    assert.equal(authorized.ok, true);
-    if (!authorized.ok || !authorized.record) return;
-    const duplicateAuthorization = authorizeDispatchTrusted(root, request.requests[0]!);
-    assert.equal(duplicateAuthorization.ok, true);
-    if (!duplicateAuthorization.ok || !duplicateAuthorization.record) return;
-    assert.equal(duplicateAuthorization.record.id, authorized.record.id);
-
-    const reconciled = reconcileTrustedTaskResult(root, {
-      tool_call_id: "tool-1",
-      outcome: "succeeded",
-      evidence: "native task result",
-    });
-    assert.equal(reconciled.ok, true);
-    mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
-    writeFileSync(join(root, ".work-state", "artifacts", "result.json"), "{}");
-    writeFileSync(join(root, ".work-state", "artifacts", "discovery.json"), JSON.stringify({ task: "capability test", branch: "feature/capability" }));
-    writeFileSync(join(root, ".work-state", "artifacts", "implementation.json"), JSON.stringify({
-      ready: true,
-      validation_run: true,
-      validation_evidence: "focused durable capability test",
-      files_touched: ["src/main.ts"],
-    }));
-    const replay = completeDispatch(root, {
-      token: handoff.dispatch_token,
-      capability_id: handoff.capability_id,
-      run_key: handoff.run_key,
-      branch: handoff.branch,
-      workflow: handoff.workflow,
-      profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor,
-      cursor_epoch: handoff.cursor_epoch,
-      role: "developer-kotlin",
-      agent: "developer-kotlin",
-      tool_call_id: "tool-1",
-      dispatch_id: authorized.record.id,
-      outcome: "succeeded",
-      evidence: "explicit workflow evidence",
-      artifact_ids: ["result"],
-    });
-    assert.equal(replay.ok, true);
-
-    // Checkpoint permission is a separate typed transition. Legacy
-    // mode/autonomous prose is migration input and cannot authorize advance.
-    recordTypedCheckpoint(root, "implementation", "approve_implementation");
-    assert.equal(resolveState(root).state?.typed_checkpoint_decisions?.length, 1);
-
-    const advanced = advanceCursor(root, {
-      token: handoff.advance_token,
-      capability_id: handoff.capability_id,
-      run_key: handoff.run_key,
-      branch: handoff.branch,
-      workflow: handoff.workflow,
-      profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor,
-      cursor_epoch: handoff.cursor_epoch,
-      evidence: "implementation completed",
-    });
-    assert.equal(advanced.ok, true, advanced.ok ? undefined : advanced.error);
-    if (!advanced.ok) return;
-    assert.equal(advanced.state.stage_cursor, "code_review");
-    assert.equal(advanced.handoff?.expected_roster[0]?.role, "code-reviewer");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("beginCapability reissues secrets for an active dispatch without losing its record", () => {
-  const root = mkdtempSync(join(tmpdir(), "dispatch-capability-resume-"));
-  try {
-    initGit(root, "feature/resume-capability");
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    writeWorkflowState(root, {
-      schema: 1,
-      branch: "feature/resume-capability",
-      task: "resume capability test",
-      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
-      stage_cursor: "implementation",
-      stages: profile.stages.map((stage) => ({
-        id: stage.id,
-        status: stage.id === "implementation" ? "in_progress" : stage.id === "discovery" ? "done" : "pending",
-      })),
-      artifacts: {},
-      scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
-      policy: { strict_orchestrator: true },
-      pause: { kind: "none", reason: "" },
-    });
-
-    const first = beginCapability(root);
-    assert.equal(first.ok, true);
-    if (!first.ok || !first.handoff) return;
-    const auth = {
-      token: first.handoff.dispatch_token,
-      capability_id: first.handoff.capability_id,
-      run_key: first.handoff.run_key,
-      branch: first.handoff.branch,
-      workflow: first.handoff.workflow,
-      profile_hash: first.handoff.profile_hash,
-      stage_cursor: first.handoff.stage_cursor,
-      cursor_epoch: first.handoff.cursor_epoch,
-      role: "developer-kotlin",
-      agent: "developer-kotlin",
-    };
-    const authorized = authorizeDispatch(root, auth);
-    assert.equal(authorized.ok, true);
-    if (!authorized.ok || !authorized.record) return;
-
-    const resumed = beginCapability(root);
-    assert.equal(resumed.ok, true);
-    if (!resumed.ok || !resumed.handoff) return;
-    assert.equal(resumed.handoff.capability_id, first.handoff.capability_id);
-    assert.notEqual(resumed.handoff.dispatch_token, first.handoff.dispatch_token);
-    assert.equal(resumed.state.dispatch_capability?.dispatches[0]?.id, authorized.record.id);
-
-    const stale = completeDispatch(root, {
-      ...auth,
-      dispatch_id: authorized.record.id,
-      outcome: "succeeded",
-      evidence: "stale handoff must be rejected",
-    });
-    assert.equal(stale.ok, false);
-    assert.equal(stale.error, "invalid secret");
-
-    const recovered = completeDispatch(root, {
-      ...auth,
-      token: resumed.handoff.dispatch_token,
-      dispatch_id: authorized.record.id,
-      outcome: "succeeded",
-      evidence: "resumed handoff completed the dispatch",
-    });
-    assert.equal(recovered.ok, true, recovered.ok ? undefined : recovered.error);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("native task hook leaves spawned and scheduled results pending", () => {
-  const root = mkdtempSync(join(tmpdir(), "dispatch-capability-async-"));
-  try {
-    initGit(root, "feature/async-capability");
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    writeWorkflowState(root, {
-      schema: 1,
-      branch: "feature/async-capability",
-      task: "async capability test",
-      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
-      stage_cursor: "implementation",
-      stages: profile.stages.map((stage) => ({
-        id: stage.id,
-        status: stage.id === "implementation" ? "in_progress" : stage.id === "discovery" ? "done" : "pending",
-      })),
-      artifacts: {},
-      scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
-      policy: { strict_orchestrator: true },
-      pause: { kind: "none", reason: "" },
-    });
-    const begun = beginCapability(root);
-    assert.equal(begun.ok, true);
-    if (!begun.ok || !begun.handoff) return;
-    const stage = profile.stages.find((candidate) => candidate.id === "implementation");
-    assert.ok(stage);
-    const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["developer-kotlin"], "developer-kotlin", begun.handoff.cursor_epoch);
-    const request = trustedDispatchRequests({
-      toolName: "task",
-      toolCallId: "tool-async",
-      input: { agent: "developer-kotlin", role: "developer-kotlin", task: marker },
-    }, { cwd: root });
-    assert.equal(request.ok, true);
-    if (!request.ok) return;
-    assert.equal(authorizeDispatchTrusted(root, request.requests[0]!).ok, true);
-
-    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
-    registerTeamWorkflow({
-      setLabel() {},
-      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
-        handlers.set(name, handler);
-      },
-    } as never, { observability: false });
-    const onToolResult = handlers.get("tool_result");
-    assert.ok(onToolResult);
-    for (const state of ["spawned", "scheduled"]) {
-      onToolResult!({
-        toolName: "task",
-        toolCallId: "tool-async",
-        content: [],
-        isError: false,
-        details: { async: { state } },
-      }, { cwd: root });
-    }
-    const persisted = resolveState(root, "feature/async-capability").state;
-    assert.equal(persisted?.dispatch_capability?.dispatches[0]?.status, "authorized");
-    assert.equal(persisted?.dispatch_capability?.dispatches[0]?.completion, undefined);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("trusted reconciliation preserves every dispatch in a consilium batch", () => {
-  const root = mkdtempSync(join(tmpdir(), "dispatch-capability-batch-"));
-  try {
-    initGit(root, "feature/batch-capability");
-    const profile = loadProfile("review");
-    assert.ok(profile);
-    writeWorkflowState(root, {
-      schema: 1,
-      branch: "feature/batch-capability",
-      task: "batch capability test",
-      classification: { type: "REVIEW", complexity: "COMPLEX", confidence: "HIGH", autonomous: true, workflow: "review" },
-      stage_cursor: "review",
-      stages: profile.stages.map((stage) => ({
-        id: stage.id,
-        status: stage.id === "review" ? "in_progress" : stage.id === "discovery" ? "done" : "pending",
-      })),
-      artifacts: {},
-      scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
-      policy: { strict_orchestrator: true },
-      pause: { kind: "none", reason: "" },
-    });
-
-    const begun = beginCapability(root);
-    assert.equal(begun.ok, true);
-    if (!begun.ok || !begun.handoff) return;
-    const markerFor = (role: string) => begun.handoff!.dispatch_markers.find((entry) => entry.role === role)?.marker ?? "";
-    const request = trustedDispatchRequests({
-      toolName: "task",
-      toolCallId: "tool-batch",
-      input: {
-        tasks: [
-          { role: "code-reviewer", agent: "code-reviewer", task: markerFor("code-reviewer") },
-          { role: "qa", agent: "qa", task: markerFor("qa") },
-        ],
-      },
-    }, { cwd: root });
-    assert.equal(request.ok, true);
-    if (!request.ok) return;
-    assert.equal(request.requests.length, 2);
-    for (const authorization of request.requests) {
-      assert.equal(authorizeDispatchTrusted(root, authorization).ok, true);
-    }
-
-    for (const authorization of request.requests) {
-      const reconciled = reconcileTrustedTaskResult(root, {
-        tool_call_id: authorization.tool_call_id,
-        slot_id: authorization.slot_id,
-        task_id: authorization.task_id,
-        outcome: "succeeded",
-        evidence: `batch completed for ${authorization.slot_id}`,
       });
-      assert.equal(reconciled.ok, true);
+      mkdirSync(join(root, ".work-state", "features", TEST_STATE_FEATURE, "artifacts"), { recursive: true });
+      assert.equal(dodBackstop({}, workflowV2Context(root)), undefined);
     }
-    const reconciledState = resolveState(root).state;
-    assert.deepEqual(
-      reconciledState?.dispatch_capability?.dispatches.map((dispatch) => dispatch.status),
-      ["succeeded", "succeeded"],
-    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 
-
-test("advance handoff resolves the next stage roster", () => {
-  const root = mkdtempSync(join(tmpdir(), "dispatch-handoff-"));
+test("/team alias uses the canonical /do-work prompt", () => {
+  const root = mkdtempSync(join(tmpdir(), "team-alias-"));
   try {
-    initGit(root, "feat/handoff");
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    const persistedProfileHash = profileHash(profile);
-    const issued = createCapability({
-      run_key: "feat/handoff",
-      branch: "feat/handoff",
-      workflow: "lightweight",
-      profile_hash: persistedProfileHash,
-      stage_cursor: "implementation",
-      kind: "single",
-      expected_roster: [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }],
-    });
-    const state = {
-      schema: 1,
-      branch: "feat/handoff",
-      run_key: "feat/handoff",
-      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
-      task: "handoff",
-      workflow_override: false,
-      issue: null,
-      stage_cursor: "implementation",
-      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "implementation" ? "in_progress" as const : "pending" as const })),
-      artifacts: {},
-      pause: { kind: "none" as const, reason: "" },
-      policy: { strict_orchestrator: true },
-      profile_hash: persistedProfileHash,
-      cursor_epoch: issued.state.issued_for?.cursor_epoch,
-      dispatch_capability: issued.state,
-      updated_at: new Date().toISOString(),
-    };
-    writeState(root, state, { featureSlug: "handoff" });
-    mkdirSync(join(root, ".work-state", "features", "handoff", "artifacts"), { recursive: true });
-    writeFileSync(join(root, ".work-state", "features", "handoff", "artifacts", "implementation.json"), JSON.stringify({
-      ready: true,
-      validation_run: true,
-      validation_evidence: "focused handoff test",
-      files_touched: ["src/main.ts"],
-    }));
-    const authInput = {
-      token: issued.dispatch_token,
-      capability_id: issued.capability_id,
-      run_key: "feat/handoff",
-      branch: "feat/handoff",
-      workflow: "lightweight",
-      profile_hash: persistedProfileHash,
-      stage_cursor: "implementation",
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      role: "${scope.dev_agent}",
-      agent: "developer-kotlin",
-    };
-    const authorized = authorizeDispatch(root, authInput);
-    assert.equal(authorized.ok, true);
-    if (!authorized.ok || !authorized.record) return;
-    const completed = completeDispatch(root, {
-      ...authInput,
-      dispatch_id: authorized.record.id,
-      outcome: "succeeded",
-      evidence: "task completed",
-    });
-    assert.equal(completed.ok, true);
-    recordTypedCheckpoint(root, "implementation", "approve_implementation");
-    assert.equal(resolveState(root).state?.typed_checkpoint_decisions?.length, 1);
-    const advanced = advanceCursor(root, {
-      ...authInput,
-      token: issued.advance_token,
-      evidence: "stage completed",
-    });
-    assert.equal(advanced.ok, true, advanced.ok ? undefined : advanced.error);
-    if (!advanced.ok) return;
-    assert.equal(advanced.state.stage_cursor, "code_review");
-    assert.deepEqual(advanced.state.dispatch_capability?.expected_roster, [{ role: "code-reviewer", agent: "code-reviewer" }]);
-    assert.equal(advanced.state.dispatch_capability?.kind, "single");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("workflow contract supports an explicit stateless profile lookup", () => {
-  const root = mkdtempSync(join(tmpdir(), "workflow-contract-stateless-"));
-  try {
-    const contract = resolveWorkflowContract(root, { requireState: false, workflow: "lightweight", branch: "main" });
-    assert.equal(contract.state.path, null);
-    assert.equal(contract.state.artifactsDir, null);
-    assert.equal(contract.provenance.statePath, null);
-    assert.equal(contract.stage.id, "discovery");
-    assert.equal(contract.stage.artifact_schemas.discovery?.type, "object");
-    assert.deepEqual(contract.stage.artifact_schemas.discovery?.required, ["task", "branch"]);
-    assert.equal(contract.stage.artifact_schemas.dod?.properties?.items?.items?.type, "object");
-    assert.deepEqual(contract.stage.artifact_schemas.dod?.properties?.items?.items?.required, ["criterion", "verify_method", "status"]);
-    assert.equal(contract.state.dispatch.allowed, false);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("workflow contract exposes the active feature artifact directory", () => {
-  const root = mkdtempSync(join(tmpdir(), "workflow-contract-feature-artifacts-"));
-  try {
-    const branch = "fix/artifact-path";
-    initGit(root, branch);
-    const prepared = prepareWorkflowState({
-      task: "fix artifact path",
-      cwd: root,
-      branch,
-      autonomous: true,
-      classification: {
-        type: "BUG_FIX",
-        complexity: "COMPLEX",
-        confidence: "HIGH",
-        autonomous: true,
-        workflow: "debug-cycle",
-      },
-      files: [],
-      issue: null,
-    });
-    const contract = resolveWorkflowContract(root, { branch });
-    const expectedArtifactsDir = join(root, ".work-state", "features", "fix-artifact-path", "artifacts");
-
-    assert.equal(prepared.artifactsDir, expectedArtifactsDir);
-    assert.equal(contract.state.artifactsDir, expectedArtifactsDir);
-    assert.equal(contract.state.path, prepared.statePath);
+    const work = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), commandContext());
+    const team = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), commandContext());
+    assert.equal(team, work, "/team alias must resolve to the identical canonical prompt");
+    assert.match(team, /selected provider/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

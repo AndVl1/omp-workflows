@@ -1,10 +1,10 @@
 /**
- * Smoke test for the package split.
+ * Core engine smoke coverage for the v2 clean cutover.
  *
- * Verifies:
- *   1. @andvl1/omp-workflows-core resolves and exports the public API.
- *   2. @andvl1/omp-workflows-fullstack can import core and call registerTeamWorkflow.
- *   3. The public API surface (8 profiles) is reachable end-to-end.
+ * The eager host and strict policy boundaries are covered by focused v2 tests;
+ * this file keeps profile and engine behavior checks.
+ *
+ * <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core -->
  */
 
 import { test } from "node:test";
@@ -14,82 +14,34 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
-  registerTeamWorkflow,
-  registerWorkflowCommands,
-  loadAllProfiles,
-  registerWorkflowProfiles,
-  resolveWorkflow,
-  selectProfile,
   reopenFromFeedback,
-} from "@andvl1/omp-workflows-core";
+  resolveWorkflow,
+} from "../src/index.js";
+import { createProviderCatalog, loadProfileByIdentity } from "../src/engine/profile.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
 import { classificationToolGate } from "../src/gates/classification.js";
 import { createTaskCaller, runStage, type TaskToolLike } from "../src/engine/stage.js";
 
-const genericRoles = { worker: "worker" };
-
-test("core: workflow commands register before project command discovery", async () => {
-  const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
-  const prompts: string[] = [];
-  registerWorkflowCommands({
-    registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
-      commands.set(name, command);
-    },
-    sendUserMessage(prompt: string) {
-      prompts.push(prompt);
-    },
-  } as never);
-
-  assert.deepEqual([...commands.keys()], ["do-work", "team", "cto"]);
-  await commands.get("do-work")?.handler("Core-owned task", {
-    cwd: process.cwd(),
-    ui: { notify() {} },
-    sessionManager: { getSessionId: () => "core-command-test" },
-  });
-  assert.match(prompts[0] ?? "", /Core-owned task/);
-});
-
-test("core: workflow registration accepts a bundle prompt decorator", async () => {
-  const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
-  const prompts: string[] = [];
-  registerWorkflowCommands({
-    registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
-      commands.set(name, command);
-    },
-    sendUserMessage(prompt: string) {
-      prompts.push(prompt);
-    },
-  } as never, {
-    buildDoWorkPrompt(envelope, cwd) {
-      return `${envelope.task}\n${cwd}\n[bundle-profile]`;
-    },
-  });
-
-  await commands.get("team")?.handler("Decorated task", {
-    cwd: process.cwd(),
-    ui: { notify() {} },
-    sessionManager: { getSessionId: () => "core-command-decorator-test" },
-  });
-  assert.match(prompts[0] ?? "", /Decorated task.*\[bundle-profile\]/s);
-});
-
-test("core: loadAllProfiles returns reusable core profiles", async () => {
-  const profiles = await loadAllProfiles();
-  assert.ok(profiles.length >= 11);
-  const names = profiles.map((p) => p.name);
-  for (const name of ["lightweight", "full-feature", "debug-cycle", "cto", "feature-regression", "spec-preparation", "product-discovery"]) {
-    assert.ok(names.includes(name), `${name} profile is shipped`);
+test("core: selected provider catalog resolves only its digest-pinned profile", () => {
+  const profile = readWorkflowProfile("lightweight");
+  const catalog = createProviderCatalog([profile]);
+  const entry = catalog.profiles.find((candidate) => candidate.identity.id === profile.name);
+  assert.ok(entry, "selected provider catalog publishes lightweight");
+  if (!entry) return;
+  const loaded = loadProfileByIdentity(catalog, entry.identity);
+  assert.equal(loaded.ok, true);
+  if (loaded.ok) {
+    assert.equal(loaded.value.name, profile.name);
+    assert.deepEqual(loaded.value.stages.map((stage) => stage.id), [
+      "discovery", "implementation", "code_review", "review_fixes", "qa_tests", "summary",
+    ]);
   }
-  assert.ok(profiles.find((p) => p.name === "feature-regression")?.stages.every((stage) => stage.prompt), "regression stages carry prompts");
-  assert.ok(profiles.find((p) => p.name === "spec-preparation")?.stages.every((stage) => stage.prompt), "spec stages carry prompts");
-  assert.ok(profiles.find((p) => p.name === "product-discovery")?.stages.every((stage) => stage.prompt), "product-discovery stages carry prompts");
-
-  // The CTO profile is explicit-only: no classification may select it.
-  for (const type of ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"] as const) {
-    for (const complexity of ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] as const) {
-      const selected = selectProfile(profiles, { type, complexity, confidence: "HIGH", workflow: "standard", autonomous: false });
-      assert.notEqual(selected?.name, "cto", `${type}/${complexity} must not select cto`);
-    }
-  }
+  const stale = loadProfileByIdentity(catalog, {
+    id: entry.identity.id,
+    fingerprint: `sha256:${"f".repeat(64)}` as typeof entry.identity.fingerprint,
+  });
+  assert.equal(stale.ok, false);
+  if (!stale.ok) assert.equal(stale.diagnostics[0]?.code, "IDENTITY_MISMATCH");
 });
 
 test("core: resolveWorkflow matrix", () => {
@@ -103,6 +55,7 @@ test("core: resolveWorkflow matrix", () => {
   assert.equal(resolveWorkflow("REVIEW", "QUICK", false), "review");
   assert.equal(resolveWorkflow("PRODUCT_DISCOVERY", "QUICK", false), "product-discovery");
 });
+
 test("core: SPEC, REGRESS and PRODUCT_DISCOVERY resolve to dedicated workflows for every complexity/autonomy combination", () => {
   const complexities = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] as const;
   for (const type of ["SPEC", "REGRESS", "PRODUCT_DISCOVERY"] as const) {
@@ -119,90 +72,43 @@ test("core: SPEC, REGRESS and PRODUCT_DISCOVERY resolve to dedicated workflows f
   }
 });
 
-test("core: selectProfile resolves to the right profile", async () => {
-  const profiles = await loadAllProfiles();
-  const p = selectProfile(profiles, {
-    type: "FEATURE", complexity: "QUICK", confidence: "HIGH", workflow: "lightweight", autonomous: false,
-  });
-  assert.ok(p);
-  assert.equal(p.name, "lightweight");
-  assert.deepEqual(p.stages.map((s) => s.id), [
-    "discovery", "implementation", "code_review", "review_fixes", "qa_tests", "summary",
-  ]);
-});
-test("core: registered profiles are available and explicit workflow selects them", () => {
-  const custom = {
-    name: "android-feature-regression-test",
-    title: "Android feature regression test",
-    description: "Bundle-owned regression profile",
-    match: { type: ["INVESTIGATION"] as const },
-    stages: [{ id: "intake", title: "Intake", type: "orchestrator" as const }],
-  };
-  registerWorkflowProfiles([custom]);
-  const profiles = loadAllProfiles();
-  assert.equal(profiles.find((p) => p.name === custom.name)?.title, custom.title);
-  const selected = selectProfile(profiles, {
-    type: "INVESTIGATION", complexity: "MEDIUM", confidence: "HIGH", workflow: custom.name, autonomous: false,
-  });
-  assert.equal(selected?.name, custom.name);
-});
-
-
-test("core: registerTeamWorkflow registers gates but NOT commands", () => {
-	const calls: Array<{ kind: string; key: string }> = [];
-	const fakePi = {
-		setLabel: (label: string) => {
-			calls.push({ kind: "setLabel", key: label });
-		},
-		on: (event: string) => {
-			calls.push({ kind: "on", key: event });
-			return undefined;
-		},
-		registerCommand: (name: string) => {
-			calls.push({ kind: "registerCommand", key: name });
-		},
-	};
-	registerTeamWorkflow(fakePi as unknown as Parameters<typeof registerTeamWorkflow>[0], {
-		label: "smoke-test",
-    roles: genericRoles,
-	});
-
-	assert.ok(calls.some((c) => c.kind === "on" && c.key === "before_agent_start"));
-	assert.ok(calls.some((c) => c.kind === "on" && c.key === "session_stop"));
-	assert.ok(calls.some((c) => c.kind === "on" && c.key === "tool_call"));
-	// Slash commands now ship as OMP custom-TS commands in the bundle;
-	// the extension must not call registerCommand for any of them.
-	assert.equal(
-		calls.filter((c) => c.kind === "registerCommand").length,
-		0,
-		"extension must not register slash commands",
-	);
-});
-test("core: task gate blocks launches without zero-step state", () => {
+test("core: task gate rejects cwd-only context before reading workflow profiles", () => {
   const root = join(tmpdir(), `omp-gate-${Date.now()}`);
   mkdirSync(join(root, ".work-state"), { recursive: true });
   writeFileSync(join(root, ".work-state", ".active-feature"), "pending\n");
   try {
     const result = classificationToolGate({ toolName: "task" }, { cwd: root });
     assert.equal(result?.block, true);
-    assert.match(result?.reason ?? "", /PHASE 0/);
+    assert.match(result?.reason ?? "", /MIGRATION_REQUIRED/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 test("core: workflow dispatch leaves model selection to OMP", async () => {
   const calls: Array<{ agent: string; task: string; name?: string }> = [];
+  const fixture = workflowV2Fixture(readWorkflowProfile("lightweight"), {
+    runId: "lightweight-role-routing",
+    roleAgents: { "backend-kotlin": "developer-kotlin" },
+    agentNames: ["developer-kotlin", "code-reviewer", "qa"],
+  });
   const state = {
     schema: 1 as const,
     branch: "feat/role-routing",
+    run_key: "feat/role-routing",
     classification: { type: "FEATURE" as const, complexity: "QUICK" as const, confidence: "HIGH" as const, workflow: "lightweight" as const, autonomous: false },
+    workflow: "lightweight" as const,
+    profile_hash: fixture.profile_identity.fingerprint,
     task: "exercise role routing",
     workflow_override: false,
     issue: null,
     stage_cursor: "implementation",
+    cursor_epoch: "test-epoch",
     stages: [{ id: "implementation", status: "in_progress" as const }],
     artifacts: {},
     pause: { kind: "none" as const, reason: "" },
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
     updated_at: new Date(0).toISOString(),
   };
   const outcome = await runStage(
@@ -212,6 +118,11 @@ test("core: workflow dispatch leaves model selection to OMP", async () => {
       state,
       artifactsDir: `${process.cwd()}/.work-state/artifacts`,
       flags: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
+      catalog: fixture.catalog,
+      effectivePolicy: fixture.effective_policy,
+      agentInventory: fixture.agent_inventory,
       agent: (role) => role === "backend-kotlin" ? "developer-kotlin" : role,
       task: {
         call: async (opts) => {
@@ -334,17 +245,32 @@ test("fullstack: agent frontmatter uses OMP class role with standard fallback", 
 
 test("core: consilium preserves role variants without pinning models", async () => {
   let dispatched: Array<{ name: string; agent: string; task: string }> = [];
+  const fixture = workflowV2Fixture(readWorkflowProfile("full-feature"), {
+    runId: "full-feature-role-routing",
+    roleAgents: {
+      architect_minimal: "architect",
+      architect_clean: "architect",
+      architect_pragmatic: "architect",
+    },
+    agentNames: ["analyst", "tech-researcher", "architect", "developer-kotlin", "code-reviewer", "manual-qa", "qa"],
+  });
   const state = {
     schema: 1 as const,
     branch: "feat/role-routing",
+    run_key: "feat/role-routing",
     classification: { type: "FEATURE" as const, complexity: "COMPLEX" as const, confidence: "HIGH" as const, workflow: "full-feature" as const, autonomous: false },
+    workflow: "full-feature" as const,
+    profile_hash: fixture.profile_identity.fingerprint,
     task: "compare architecture variants",
     workflow_override: false,
     issue: null,
     stage_cursor: "architecture",
+    cursor_epoch: "test-epoch",
     stages: [{ id: "architecture", status: "in_progress" as const }],
     artifacts: {},
     pause: { kind: "none" as const, reason: "" },
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
     updated_at: new Date(0).toISOString(),
   };
   const roles = ["architect_minimal", "architect_clean", "architect_pragmatic"];
@@ -355,6 +281,11 @@ test("core: consilium preserves role variants without pinning models", async () 
       state,
       artifactsDir: `${process.cwd()}/.work-state/artifacts`,
       flags: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null },
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
+      catalog: fixture.catalog,
+      effectivePolicy: fixture.effective_policy,
+      agentInventory: fixture.agent_inventory,
       agent: () => "architect",
       task: createTaskCaller({
         async execute(_toolCallId, params) {
@@ -382,18 +313,33 @@ test("core: consilium preserves role variants without pinning models", async () 
 
 
 
-test("core: bundle boundary does not export fullstack defaults", async () => {
+test("core: public surface exposes one eager v2 host and no legacy adapters", async () => {
   const core = await import("../src/index.js");
   assert.equal(typeof core.registerTeamWorkflow, "function");
+  assert.equal(typeof core.registerWorkflowV2Host, "function");
+  assert.equal(typeof core.buildProjectIdentity, "function");
+  assert.equal(typeof core.buildWorkflowRunIdentity, "function");
+  assert.equal(typeof core.projectRuntimeKeyFor, "function");
+  assert.equal("buildIdentityEnvelope" in core, false);
+  assert.equal("validateIdentityEnvelope" in core, false);
+  assert.equal("normalizeChannelConfig" in core, false);
+  assert.equal("writeRuntimeConfig" in core, false);
+  assert.deepEqual([...core.WORKFLOW_V2_CANONICAL_COMMANDS], [
+    "do-work",
+    "team",
+    "cto",
+    "workflow-provider",
+    "init-team",
+  ]);
+  assert.deepEqual([...core.WORKFLOW_V2_WORKFLOW_TOOLS], [
+    "workflow_prepare",
+    "workflow_begin",
+    "workflow_status",
+    "workflow_instructions",
+    "workflow_complete",
+    "workflow_checkpoint",
+    "workflow_advance",
+  ]);
   assert.equal("defaultFullstackRoles" in core, false);
   assert.equal("defaultFullstackModelRoles" in core, false);
-});
-
-test("core: empty generic registerTeamWorkflow does not crash", () => {
-  const fakePi = {
-    setLabel: () => undefined,
-    on: () => undefined,
-    registerCommand: () => undefined,
-  };
-  assert.doesNotThrow(() => registerTeamWorkflow(fakePi as unknown as Parameters<typeof registerTeamWorkflow>[0]));
 });

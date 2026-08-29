@@ -1,116 +1,132 @@
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core --> */
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { beginCapability, createCapability } from "../src/engine/durable.js";
-import { loadProfile, profileHash } from "../src/engine/profile.js";
-import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
-import { resolveConfig } from "../src/engine/config.js";
-import type { TeamState } from "../src/engine/types.js";
+import {
+  buildQualifiedAgentMapping,
+  resolveQualifiedAgentForRole,
+} from "../src/engine/agent-mapping.js";
+import type {
+  AgentRef,
+  AgentSourceFingerprint,
+  ProjectIdentity,
+  ProviderId,
+  WorkflowRunIdentity,
+  WorkflowV2Digest,
+} from "../src/workflow-v2/types.js";
 
-const genericRoles = {
-  "regression-planner": "analyst",
-  "regression-executor": "manual-qa",
-  "regression-oracle": "qa",
-  "security-tester": "security-tester",
-} as const;
+const providerId = "@example/workflow-provider" as ProviderId;
+const sourceFingerprint = `sha256:${"a".repeat(64)}` as WorkflowV2Digest;
+const otherSourceFingerprint = `sha256:${"0".repeat(64)}` as WorkflowV2Digest;
+const projectIdentity = {
+  root_instance_id: `sha256:${"b".repeat(64)}` as WorkflowV2Digest,
+  provider_id: providerId,
+  descriptor_fingerprint: `sha256:${"c".repeat(64)}` as WorkflowV2Digest,
+  executable_provenance: {
+    build_fingerprint: `sha256:${"d".repeat(64)}` as WorkflowV2Digest,
+    runtime_fingerprint: `sha256:${"e".repeat(64)}` as WorkflowV2Digest,
+  },
+  catalog_content_digest: `sha256:${"f".repeat(64)}` as WorkflowV2Digest,
+  config_byte_sha256: `sha256:${"1".repeat(64)}` as WorkflowV2Digest,
+  config_semantic_sha256: `sha256:${"2".repeat(64)}` as WorkflowV2Digest,
+  session: { session_id: "session-1", lifecycle_id: "lifecycle-1" },
+} as const satisfies ProjectIdentity;
+const runIdentity = {
+  ...projectIdentity,
+  run_id: "run-1",
+  profile_identity: {
+    id: "balanced",
+    fingerprint: `sha256:${"3".repeat(64)}` as WorkflowV2Digest,
+  },
+} as const satisfies WorkflowRunIdentity;
+const agentSources = [{
+  provider_id: providerId,
+  source_fingerprint: sourceFingerprint,
+  registered_names: ["analyst", "task"],
+}] as const satisfies readonly AgentSourceFingerprint[];
 
-function initGit(root: string): void {
-  execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+const requested: AgentRef = { registered_name: "analyst", provider_id: providerId, source_fingerprint: sourceFingerprint };
+const sameNameOtherSource: AgentRef = { ...requested, source_fingerprint: otherSourceFingerprint };
+const task: AgentRef = { registered_name: "task", provider_id: providerId, source_fingerprint: sourceFingerprint };
+
+function options(overrides: {
+  agent_sources?: readonly AgentSourceFingerprint[];
+  availableAgents?: readonly AgentRef[];
+  roles?: Readonly<Record<string, AgentRef>>;
+  fallbackChains?: Readonly<Record<string, readonly AgentRef[]>>;
+} = {}) {
+  return {
+    project_identity: projectIdentity,
+    run_identity: runIdentity,
+    agent_sources: overrides.agent_sources ?? agentSources,
+    roles: overrides.roles ?? { planner: requested },
+    fallbackChains: overrides.fallbackChains,
+    availableAgents: overrides.availableAgents ?? [requested],
+  };
 }
 
-function writeState(root: string, capability: NonNullable<TeamState["dispatch_capability"]>, profileHashValue: string): void {
-  const profile = loadProfile("feature-regression");
-  assert.ok(profile);
-  writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
-    schema: 1,
-    branch: "main",
-    run_key: "main",
-    classification: { type: "REGRESS", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "feature-regression" },
-    task: "mapping refresh regression",
-    stage_cursor: "surface_mapping",
-    stages: profile.stages.map(stage => ({
-      id: stage.id,
-      status: stage.id === "surface_mapping" ? "in_progress" : stage.id === "discovery_intake" ? "done" : "pending",
-    })),
-    artifacts: {},
-    scope: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null },
-    policy: { strict_orchestrator: true },
-    pause: { kind: "none", reason: "" },
-    profile_hash: profileHashValue,
-    cursor_epoch: capability.issued_for?.cursor_epoch,
-    dispatch_capability: capability,
-  }) + "\n");
-}
-
-function publishMapping(root: string, availableAgents: string[]): void {
-  mkdirSync(join(root, ".omp"), { recursive: true });
-  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: genericRoles }) + "\n");
-  const config = resolveConfig(root);
-  const mapping = buildAgentMapping({
-    roles: config.roles,
-    availableAgents,
-    extraRoles: config.scope_map.map(entry => entry.dev_agent),
-    genericFallbackRoles: Object.keys(genericRoles).filter(role => role !== "security-tester"),
-  });
-  writeAgentMapping(root, mapping);
-}
-
-test("beginCapability reissues an undispatched capability after mapping refresh", () => {
-  const root = mkdtempSync(join(tmpdir(), "omp-mapping-refresh-"));
-  try {
-    initGit(root);
-    mkdirSync(join(root, ".work-state"), { recursive: true });
-    const profile = loadProfile("feature-regression");
-    assert.ok(profile);
-    const persistedHash = profileHash(profile);
-    const stale = createCapability({
-      run_key: "main",
-      branch: "main",
-      workflow: "feature-regression",
-      profile_hash: persistedHash,
-      stage_cursor: "surface_mapping",
-      kind: "single",
-      expected_roster: [{ role: "regression-planner", agent: "regression-planner" }],
-    });
-    publishMapping(root, ["analyst"]);
-    writeState(root, stale.state, persistedHash);
-
-    const begun = beginCapability(root);
-    assert.equal(begun.ok, true);
-    assert.deepEqual(begun.ok && begun.handoff?.expected_roster, [{ role: "regression-planner", agent: "analyst" }]);
-    assert.notEqual(begun.ok && begun.handoff?.capability_id, stale.capability_id);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+test("qualified mapping rejects an observed agent with stale source identity", () => {
+  const result = buildQualifiedAgentMapping(options({ availableAgents: [sameNameOtherSource] }));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.diagnostics[0]?.code, "IDENTITY_MISMATCH");
 });
 
-test("beginCapability fails closed when no eligible or generic agent exists", () => {
-  const root = mkdtempSync(join(tmpdir(), "omp-mapping-unavailable-"));
-  try {
-    initGit(root);
-    mkdirSync(join(root, ".work-state"), { recursive: true });
-    const profile = loadProfile("feature-regression");
-    assert.ok(profile);
-    const persistedHash = profileHash(profile);
-    publishMapping(root, ["scout"]);
-    writeState(root, createCapability({
-      run_key: "main",
-      branch: "main",
-      workflow: "feature-regression",
-      profile_hash: persistedHash,
-      stage_cursor: "surface_mapping",
-      kind: "single",
-      expected_roster: [{ role: "regression-planner", agent: "regression-planner" }],
-    }).state, persistedHash);
+test("qualified mapping rejects incompatible duplicate agent provenance", () => {
+  const result = buildQualifiedAgentMapping(options({ availableAgents: [requested, sameNameOtherSource] }));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.diagnostics[0]?.code, "AGENT_COLLISION");
+});
 
-    const begun = beginCapability(root);
-    assert.equal(begun.ok, false);
-    assert.match(begun.error, /no available agent mapping/);
-    assert.match(begun.error, /regression-planner/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+test("qualified mapping resolves only an explicit provider-qualified fallback", () => {
+  const result = buildQualifiedAgentMapping(options({
+    roles: { planner: requested },
+    fallbackChains: { planner: [task] },
+    availableAgents: [task],
+  }));
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(resolveQualifiedAgentForRole(result.value, "planner"), task);
+  assert.equal(result.value.diagnostics.planner?.status, "fallback");
+});
+
+test("qualified mapping rejects a selected reference missing from the descriptor source set", () => {
+  const result = buildQualifiedAgentMapping(options({
+    agent_sources: [{
+      provider_id: providerId,
+      source_fingerprint: sourceFingerprint,
+      registered_names: ["task"],
+    }],
+  }));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.diagnostics[0]?.code, "IDENTITY_MISMATCH");
+});
+
+test("qualified mapping rejects ambiguous descriptor source names", () => {
+  const result = buildQualifiedAgentMapping(options({
+    agent_sources: [
+      ...agentSources,
+      { provider_id: providerId, source_fingerprint: otherSourceFingerprint, registered_names: ["analyst"] },
+    ],
+  }));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.diagnostics[0]?.code, "AGENT_COLLISION");
+});
+
+
+test("qualified mapping rejects a run identity from another project authority", () => {
+  const foreignProject = {
+    ...projectIdentity,
+    root_instance_id: `sha256:${"9".repeat(64)}` as WorkflowV2Digest,
+  } as const satisfies ProjectIdentity;
+  const foreignRun = {
+    ...foreignProject,
+    run_id: "run-foreign",
+    profile_identity: runIdentity.profile_identity,
+  } as const satisfies WorkflowRunIdentity;
+  const result = buildQualifiedAgentMapping({
+    ...options(),
+    run_identity: foreignRun,
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.diagnostics[0]?.code, "IDENTITY_MISMATCH");
 });

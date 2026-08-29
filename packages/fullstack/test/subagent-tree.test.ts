@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,11 +15,26 @@ import {
 	renderSubagentTree,
 	writePersistedState,
 } from "../src/subagent-tree.js";
-import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
+import type { SubagentTreePersistedState, SubagentTreePersistence } from "../src/subagent-tree.js";
 
 /** Create a fresh cwd for filesystem-isolated tests. */
 function tmpCwd(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), prefix));
+}
+
+/** Build the host-managed persistence object used by migration tests. */
+function testPersistence(cwd: string): SubagentTreePersistence {
+	const path = join(cwd, ".omp", "subagent-tree.json");
+	return {
+		read: () => {
+			if (!existsSync(path)) return undefined;
+			return JSON.parse(readFileSync(path, "utf8")) as SubagentTreePersistedState;
+		},
+		write: (state) => {
+			mkdirSync(join(cwd, ".omp"), { recursive: true });
+			writeFileSync(path, JSON.stringify(state));
+		},
+	};
 }
 
 /** Build a minimal lifecycle payload. */
@@ -219,11 +234,12 @@ test("subagent-tree: clear() drops all nodes", () => {
 test("subagent-tree: persisted state round-trips", () => {
 	const cwd = tmpCwd("subagent-tree-persist-");
 	try {
-		const initial = readPersistedState(cwd);
+		const persistence = testPersistence(cwd);
+		const initial = readPersistedState(persistence);
 		assert.equal(initial.enabled, true, "default enabled");
 		assert.equal(initial.mode, "compact", "default compact");
-		writePersistedState(cwd, { enabled: false, mode: "expanded" });
-		const after = readPersistedState(cwd);
+		writePersistedState(persistence, { enabled: false, mode: "expanded" });
+		const after = readPersistedState(persistence);
 		assert.equal(after.enabled, false);
 		assert.equal(after.mode, "expanded");
 	} finally {
@@ -239,41 +255,42 @@ test("subagent-tree: writePersistedState swallows FS errors", () => {
 test("subagent-tree: handleSubagentsCommand toggles, persists, and switches mode", () => {
 	const cwd = tmpCwd("subagent-tree-cmd-");
 	try {
-		const controller = new SubagentTreeController({ enabled: true, mode: "compact" }, cwd);
+		const persistence = testPersistence(cwd);
+		const controller = new SubagentTreeController({ enabled: true, mode: "compact" }, "/tmp", undefined, persistence);
 		const ui = fakeUi();
 
 		// off
-		assert.match(handleSubagentsCommand(controller, cwd, ui, "off"), /disabled/);
+		assert.match(handleSubagentsCommand(controller, ui, "off"), /disabled/);
 		assert.equal(controller.enabled, false);
 		assert.equal(ui.calls[ui.calls.length - 1]!.content, undefined, "widget hidden");
 
 		// on
-		assert.match(handleSubagentsCommand(controller, cwd, ui, "on"), /enabled/);
+		assert.match(handleSubagentsCommand(controller, ui, "on"), /enabled/);
 		assert.equal(controller.enabled, true);
 
 		// status
-		assert.match(handleSubagentsCommand(controller, cwd, ui, "status"), /on, mode: compact/);
+		assert.match(handleSubagentsCommand(controller, ui, "status"), /on, mode: compact/);
 
 		// expanded
-		assert.match(handleSubagentsCommand(controller, cwd, ui, "expanded"), /expanded mode/);
+		assert.match(handleSubagentsCommand(controller, ui, "expanded"), /expanded mode/);
 		assert.equal(controller.mode, "expanded");
 
 		// compact
-		assert.match(handleSubagentsCommand(controller, cwd, ui, "compact"), /compact mode/);
+		assert.match(handleSubagentsCommand(controller, ui, "compact"), /compact mode/);
 		assert.equal(controller.mode, "compact");
 
 		// toggle
-		assert.match(handleSubagentsCommand(controller, cwd, ui, "toggle"), /disabled/);
+		assert.match(handleSubagentsCommand(controller, ui, "toggle"), /disabled/);
 		assert.equal(controller.enabled, false);
 
 		// clear
 		controller.applyLifecycle(started("id-1", undefined, "developer-go"));
 		assert.equal(controller.count, 1);
-		assert.match(handleSubagentsCommand(controller, cwd, ui, "clear"), /cleared/);
+		assert.match(handleSubagentsCommand(controller, ui, "clear"), /cleared/);
 		assert.equal(controller.count, 0);
 
 		// unknown sub
-		assert.match(handleSubagentsCommand(controller, cwd, ui, "garbage"), /usage:/);
+		assert.match(handleSubagentsCommand(controller, ui, "garbage"), /usage:/);
 
 		// persistence side-effects
 		assert.ok(existsSync(join(cwd, ".omp", "subagent-tree.json")), "state file written");

@@ -12,18 +12,19 @@ import { join, resolve } from "node:path";
 
 import { writeReport } from "../src/report/assemble.js";
 import { redactText, redactReportBody, DEFAULT_REDACTION_CONFIG } from "../src/report/redact.js";
+import { reportStorageFor } from "./report-storage-fixtures.js";
 
 function tmpWorkspace(): string {
   return mkdtempSync(join(tmpdir(), "report-wr-"));
 }
 
-test("writeReport: creates parents, writes mode 0600, returns absolute path", () => {
+test("writeReport: creates parents, writes mode 0600, returns relative path", () => {
   const cwd = tmpWorkspace();
   try {
     const target = join(".work-state", "features", "x", "report.html");
-    const written = writeReport(cwd, target, "<html>hi</html>");
+    const written = writeReport(reportStorageFor(cwd), target, "<html>hi</html>");
     const abs = resolve(cwd, target);
-    assert.equal(written, abs);
+    assert.equal(written, target);
     assert.ok(existsSync(abs));
     const mode = statSync(abs).mode & 0o777;
     assert.equal(mode, 0o600);
@@ -36,8 +37,8 @@ test("writeReport: rejects targets outside .work-state (relative and absolute)",
   const cwd = tmpWorkspace();
   try {
     mkdirSync(join(cwd, "outside"), { recursive: true });
-    assert.throws(() => writeReport(cwd, "../escape.html", "x"), /must be under/);
-    assert.throws(() => writeReport(cwd, join(cwd, "outside", "report.html"), "x"), /must be under/);
+    assert.throws(() => writeReport(reportStorageFor(cwd), "../escape.html", "x"), /unsafe|relative path/i);
+    assert.throws(() => writeReport(reportStorageFor(cwd), join(cwd, "outside", "report.html"), "x"), /unsafe|relative path/i);
     assert.ok(!existsSync(join(cwd, "..", "escape.html")));
     assert.ok(!existsSync(join(cwd, "outside", "report.html")));
   } finally {
@@ -54,20 +55,19 @@ test("writeReport: rejects a symlinked parent that escapes .work-state", () => {
     mkdirSync(ws, { recursive: true });
     symlinkSync(outside, join(ws, "features"));
 
-    assert.throws(() => writeReport(cwd, join(".work-state", "features", "x", "report.html"), "x"), /must be under/);
+    assert.throws(() => writeReport(reportStorageFor(cwd), join(".work-state", "features", "x", "report.html"), "x"), /UNSAFE_PATH|symlink/i);
     assert.ok(!existsSync(join(outside, "x", "report.html")));
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
 
-test("writeReport: accepts absolute targets inside .work-state", () => {
+test("writeReport: rejects absolute targets even when inside .work-state", () => {
   const cwd = tmpWorkspace();
   try {
     const abs = resolve(cwd, ".work-state", "features", "y", "report.html");
-    const written = writeReport(cwd, abs, "html");
-    assert.equal(written, abs);
-    assert.equal(statSync(abs).mode & 0o777, 0o600);
+    assert.throws(() => writeReport(reportStorageFor(cwd), abs, "html"), /unsafe|relative path/i);
+    assert.ok(!existsSync(abs));
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

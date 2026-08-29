@@ -14,7 +14,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadAllProfiles, loadProfile } from "../src/engine/profile.js";
+import { createTestCatalog, readWorkflowProfile } from "./workflow-v2-fixtures.js";
+import { loadProfileByIdentity } from "../src/engine/profile.js";
 import { parseExpression, evaluatePredicate, validateProfileExpressions, deepEqual } from "../src/engine/predicate.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TeamState } from "../src/engine/types.js";
@@ -22,6 +23,23 @@ import type { TeamState } from "../src/engine/types.js";
 const FLAGS: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
 const RUNTIME_FLAGS: ScopeFlags = { ...FLAGS, has_runtime: true, scope: ["backend-kotlin"] };
 const SECURITY_FLAGS: ScopeFlags = { ...FLAGS, has_security: true };
+
+const SHIPPED_PROFILE_NAMES = [
+  "bug-fix",
+  "cto",
+  "debug-cycle",
+  "emergency",
+  "feature-regression",
+  "full-feature",
+  "lightweight",
+  "product-discovery",
+  "research",
+  "review",
+  "spec-preparation",
+  "standard",
+] as const;
+const SHIPPED_CATALOG = createTestCatalog(SHIPPED_PROFILE_NAMES.map((name) => readWorkflowProfile(name)));
+
 
 function state(overrides: Partial<TeamState> = {}): TeamState {
   return {
@@ -41,11 +59,13 @@ function state(overrides: Partial<TeamState> = {}): TeamState {
 }
 
 test("predicate: every shipped gate/skip_if/until/conditional expression parses", () => {
-  const profiles = loadAllProfiles();
-  assert.ok(profiles.length > 0);
-  for (const profile of profiles) {
-    const diagnostics = validateProfileExpressions(profile);
-    assert.deepEqual(diagnostics, [], `shipped profile '${profile.name}' must have fully supported expressions: ${diagnostics.join("; ")}`);
+  assert.ok(SHIPPED_CATALOG.profiles.length > 0);
+  for (const entry of SHIPPED_CATALOG.profiles) {
+    const loaded = loadProfileByIdentity(SHIPPED_CATALOG, entry.identity);
+    assert.equal(loaded.ok, true, `catalog profile '${entry.identity.id}' must load by its pinned identity`);
+    if (!loaded.ok) continue;
+    const diagnostics = validateProfileExpressions(loaded.value);
+    assert.deepEqual(diagnostics, [], `shipped profile '${loaded.value.name}' must have fully supported expressions: ${diagnostics.join("; ")}`);
   }
 });
 
@@ -117,8 +137,12 @@ test("predicate: debug-cycle loop until (verdict == PASS) resolves the implicit 
   try {
     const artifactsDir = join(root, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
-    const profile = loadProfile("debug-cycle");
-    assert.ok(profile);
+    const debugEntry = SHIPPED_CATALOG.profiles.find((entry) => entry.identity.id === "debug-cycle");
+    assert.ok(debugEntry);
+    const loaded = loadProfileByIdentity(SHIPPED_CATALOG, debugEntry.identity);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const profile = loaded.value;
     const verify = profile.stages.find((stage) => stage.id === "verify");
     assert.ok(verify?.loop);
     writeFileSync(join(artifactsDir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 1 }));
@@ -143,8 +167,12 @@ test("predicate: qa_tests verdict gate falls back to a consumed artifact when th
   try {
     const artifactsDir = join(root, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
-    const profile = loadProfile("debug-cycle");
-    assert.ok(profile);
+    const debugEntry = SHIPPED_CATALOG.profiles.find((entry) => entry.identity.id === "debug-cycle");
+    assert.ok(debugEntry);
+    const loaded = loadProfileByIdentity(SHIPPED_CATALOG, debugEntry.identity);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const profile = loaded.value;
     const qaTests = profile.stages.find((stage) => stage.id === "qa_tests");
     assert.ok(qaTests);
     // qa_tests.json has no verdict field; debug.json (consumed) does.

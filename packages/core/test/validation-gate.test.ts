@@ -10,6 +10,7 @@
  * TaskCaller that writes the artifact under artifactsDir, asserting
  * the gate wires correctly.
  */
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core --> */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -20,38 +21,54 @@ import { join } from "node:path";
 import {
   checkArtifact,
   validationGate,
-  resolveArtifactsDir,
 } from "../src/gates/validation.js";
 import { runStage, type TaskCaller, type StageContext } from "../src/engine/stage.js";
 import type { StageDef, TeamState } from "../src/engine/types.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
+
+const validationFixture = workflowV2Fixture(readWorkflowProfile("lightweight"), {
+  roleAgents: { go: "developer-go", analyst: "developer-go" },
+});
+
 
 function withTempDir(): { cwd: string; cleanup: () => void } {
   const cwd = mkdtempSync(join(tmpdir(), "omp-val-"));
   return { cwd, cleanup: () => rmSync(cwd, { recursive: true, force: true }) };
 }
 
-function makeState(): TeamState {
+function makeState(stageId = "implementation"): TeamState {
   return {
     schema: 1,
     branch: "main",
+    project_identity: validationFixture.project_identity,
+    run_identity: validationFixture.run_identity,
     classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", workflow: "lightweight", autonomous: false },
+    workflow: "lightweight",
     task: "synthetic",
     workflow_override: false,
     issue: null,
-    stage_cursor: "implementation",
-    stages: [{ id: "implementation", status: "pending" }],
+    stage_cursor: stageId,
+    cursor_epoch: "validation-test-epoch",
+    run_key: validationFixture.run_identity.run_id,
+    profile_hash: validationFixture.profile_identity.fingerprint,
+    stages: [{ id: stageId, status: "pending" }],
     artifacts: {},
     pause: { kind: "none", reason: "" },
     updated_at: new Date().toISOString(),
   };
 }
 
-function makeStageCtx(artifactsDir: string, task: TaskCaller): StageContext {
+function makeStageCtx(artifactsDir: string, task: TaskCaller, stageId = "implementation"): StageContext {
   return {
     cwd: "/tmp",
-    state: makeState(),
+    state: makeState(stageId),
     artifactsDir,
     flags: { dev_agent: "developer-go" },
+    project_identity: validationFixture.project_identity,
+    run_identity: validationFixture.run_identity,
+    catalog: validationFixture.catalog,
+    effectivePolicy: validationFixture.effective_policy,
+    agentInventory: validationFixture.agent_inventory,
     agent: () => "developer-go",
     task,
     pause: async () => undefined,
@@ -59,6 +76,7 @@ function makeStageCtx(artifactsDir: string, task: TaskCaller): StageContext {
     resolveDevAgent: () => "developer-go",
   };
 }
+
 
 test("validationGate: PASS when implementation artifact has validation_run=true and non-empty evidence", () => {
   const result = checkArtifact("implementation", {
@@ -177,18 +195,6 @@ test("validationGate: file-based — malformed JSON is reported", () => {
   }
 });
 
-test("resolveArtifactsDir: returns legacy artifacts dir when no .active-feature", () => {
-  const { cwd, cleanup } = withTempDir();
-  try {
-    mkdirSync(join(cwd, ".work-state", "artifacts"), { recursive: true });
-    const result = resolveArtifactsDir(cwd);
-    assert.ok(result, "expected a path");
-    assert.ok(result!.endsWith("artifacts"));
-  } finally {
-    cleanup();
-  }
-});
-
 test("runStage: runSingle with implementation stage and unvalidated artifact returns failed", async () => {
   const { cwd, cleanup } = withTempDir();
   try {
@@ -288,8 +294,11 @@ test("runStage: non-validation-required stage (discovery) passes regardless of a
       role: "analyst",
       produces: "discovery",
     };
-    const ctx = makeStageCtx(artifactsDir, stubTask);
+    const ctx = makeStageCtx(artifactsDir, stubTask, stage.id);
     const outcome = await runStage(stage, ctx);
+    assert.equal(ctx.state.stage_cursor, stage.id);
+    assert.equal(ctx.state.stages[0]?.id, stage.id);
+    assert.equal(outcome.stageId, stage.id);
     assert.equal(outcome.status, "done");
   } finally {
     cleanup();

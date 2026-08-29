@@ -63,7 +63,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { loadAllProfiles } from "../src/engine/profile.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
 import { artifactSchemaFor, requiredFieldsOf, validateProducedArtifact } from "../src/engine/artifact-contract.js";
 import {
   PRODUCT_PRD_RENDERER,
@@ -78,6 +78,9 @@ import type { StageDef } from "../src/engine/types.js";
 // ── fixtures ────────────────────────────────────────────────────────────────
 
 const SOURCE_ARTIFACT_IDS = ["product_intake", "product_framing", "product_evidence", "product_critique", "product_spec"] as const;
+
+const PRODUCT_DISCOVERY_FIXTURE = workflowV2Fixture(readWorkflowProfile("product-discovery"));
+
 
 /** Exact manifest field set of the typed product_prd artifact. */
 const PRD_MANIFEST_FIELDS = [
@@ -669,8 +672,8 @@ test("product-prd: validateProductPrdDocument accepts a fresh write and rejects 
 // ── profile stage order / consumes + artifact contract ─────────────────────
 
 test("product-prd: product-discovery declares product_prd_document before approval, consuming the five sources", () => {
-  const profile = loadAllProfiles().find((p) => p.name === "product-discovery");
-  assert.ok(profile, "product-discovery profile is shipped");
+  const profile = PRODUCT_DISCOVERY_FIXTURE.profile;
+  assert.equal(PRODUCT_DISCOVERY_FIXTURE.profile_identity.id, profile.name);
   assert.deepEqual(
     profile.stages.map((s) => s.id),
     [

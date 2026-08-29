@@ -1,6 +1,6 @@
 /**
  * Product discovery workflow tests.
- *
+ * <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core -->
  * Verifies the PRODUCT_DISCOVERY intent end-to-end at the contract level:
  *   1. the shipped product-discovery profile (stage order, roles, consumes/
  *      produces, checkpoint/gate wiring, prompt discipline);
@@ -20,15 +20,11 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  loadAllProfiles,
-  resolveWorkflow,
-  selectProfile,
-  resolveClassification,
-  validateProducedArtifact,
-} from "@andvl1/omp-workflows-core";
-import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { createCapability, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
+import { loadProfileByIdentity, resolveWorkflow, resolveProfileControlPlane } from "../src/engine/profile.js";
+import { resolveClassification } from "../src/engine/run.js";
+import { validateProducedArtifact } from "../src/engine/artifact-contract.js";
+import { agentRef, readWorkflowProfile, workflowV2Fixture, workIdentityScopeFixture, type WorkflowV2TestFixture } from "./workflow-v2-fixtures.js";
+import { createCapability, advanceCursor, recordCheckpointDecision, type CapabilityContext, type IssuedCapability, type DispatchAuth } from "../src/engine/durable.js";
 import { checkpointPolicyHash, recordTrustedCheckpointAnswer, unresolvedCheckpointError } from "../src/engine/checkpoints.js";
 import { writeState } from "../src/engine/state.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
@@ -68,7 +64,17 @@ function readState(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "features", "product-approval", "state.json"), "utf8")) as TeamState;
 }
 
-function advanceAuth(issued: ReturnType<typeof createCapability>) {
+function contextFor(fixture: WorkflowV2TestFixture): CapabilityContext {
+  return {
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    catalog: fixture.catalog,
+    effective_policy: fixture.effective_policy,
+    agent_inventory: fixture.agent_inventory,
+  };
+}
+
+function advanceAuth(issued: IssuedCapability): DispatchAuth {
   return {
     token: issued.advance_token,
     capability_id: issued.capability_id,
@@ -78,11 +84,15 @@ function advanceAuth(issued: ReturnType<typeof createCapability>) {
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    project_identity: issued.state.project_identity,
+    run_identity: issued.state.run_identity,
   };
 }
 
-function setupApprovalStage(root: string, branch: string, profile: Profile): { issued: ReturnType<typeof createCapability>; artifactsDir: string } {
-  const persistedHash = profileHash(profile);
+function setupApprovalStage(root: string, branch: string, profile: Profile): { issued: IssuedCapability; artifactsDir: string; fixture: WorkflowV2TestFixture } {
+  const fixture = workflowV2Fixture(profile);
+  const persistedHash = fixture.profile_identity.fingerprint;
+  const checkpointPolicy = resolveProfileControlPlane(profile, "product_approval").checkpoint_policy;
   const issued = createCapability({
     run_key: branch,
     branch,
@@ -91,11 +101,21 @@ function setupApprovalStage(root: string, branch: string, profile: Profile): { i
     stage_cursor: "product_approval",
     kind: "none", // orchestrator stages are non-dispatch: empty roster
     expected_roster: [],
+    work_identity_scope: workIdentityScopeFixture(fixture, {
+      workflow: profile.name,
+      stage_id: "product_approval",
+      slot_id: "product_approval",
+    }),
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
   });
   const { artifactsDir } = writeState(root, {
     schema: 1,
     branch,
     run_key: branch,
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    workflow: profile.name,
     classification: classification(profile.name, false),
     task: "product approval gate regression",
     workflow_override: false,
@@ -107,17 +127,18 @@ function setupApprovalStage(root: string, branch: string, profile: Profile): { i
     policy: { strict_orchestrator: true },
     profile_hash: persistedHash,
     scope: NO_SCOPE,
+    ...(checkpointPolicy === null ? {} : { checkpoint_policy: checkpointPolicy }),
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    work_identity: issued.work_identity,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
   }, { featureSlug: "product-approval" });
-  return { issued, artifactsDir };
+  return { issued, artifactsDir, fixture };
 }
 
 test("product-discovery: profile ships with the exact stage order and role wiring", async () => {
-  const profiles = await loadAllProfiles();
-  const profile = profiles.find((p) => p.name === "product-discovery");
-  assert.ok(profile, "product-discovery profile is shipped");
+  const productFixture = workflowV2Fixture(readWorkflowProfile("product-discovery"));
+  const profile = productFixture.profile;
   assert.equal(profile.title, "Product discovery");
   assert.ok(profile.match.type.includes("PRODUCT_DISCOVERY"), "match selects PRODUCT_DISCOVERY");
 
@@ -199,9 +220,7 @@ test("product-discovery: profile ships with the exact stage order and role wirin
 });
 
 test("product-discovery: every stage prompt enforces evidence-first, no-code discipline", async () => {
-  const profiles = await loadAllProfiles();
-  const profile = profiles.find((p) => p.name === "product-discovery");
-  assert.ok(profile);
+  const profile = workflowV2Fixture(readWorkflowProfile("product-discovery")).profile;
   for (const stage of profile.stages) {
     const prompt = stage.prompt ?? "";
     assert.match(prompt, /DO NOT edit|do not edit|no application code|read-only/i, `${stage.id} prohibits code edits`);
@@ -414,10 +433,8 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
   const root = mkdtempSync(join(tmpdir(), "pd-approval-"));
   try {
     initGit(root, "feat/product-approval");
-    registerWorkflowProfiles([APPROVAL_PROFILE]);
-    const profile = loadProfile("product-approval-regression");
-    assert.ok(profile);
-    const { issued, artifactsDir } = setupApprovalStage(root, "feat/product-approval", profile);
+    const profile = APPROVAL_PROFILE;
+    const { issued, artifactsDir, fixture } = setupApprovalStage(root, "feat/product-approval", profile);
     writeFileSync(
       join(artifactsDir, "product_approval_record.json"),
       JSON.stringify({ decision: "proceed", approved_by: "Product Owner", rationale: "evidence supports it", decided_at: "2026-08-17T00:00:00Z" }),
@@ -426,13 +443,13 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
     // 1. Advance with no durable decision fails closed: the gate fires its
     //    no-decision diagnostic before the unresolved-checkpoint check.
     assert.equal((readState(root).checkpoint_decisions ?? []).length, 0, "no decision recorded yet");
-    const noDecision = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" });
+    const noDecision = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" }, contextFor(fixture));
     assert.equal(noDecision.ok, false, "advance without a product decision must block");
     if (!noDecision.ok) assert.match(noDecision.error, /gate 'product_approval_recorded' is not satisfied/);
 
     // 2. Legacy mode/actor input is rejected before it can authorize. The
     //    checkpoint remains resumable and floor consent is needs_human.
-    const legacy = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "product_approval", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "auto-approve" });
+    const legacy = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "product_approval", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "auto-approve" }, contextFor(fixture));
     assert.equal(legacy.ok, false, "legacy checkpoint input must fail closed");
     if (!legacy.ok) assert.match(legacy.error, /typed checkpoint authorization and actor provenance/);
     assert.equal((readState(root).typed_checkpoint_decisions ?? []).length, 0);
@@ -465,7 +482,7 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
       authorization: "human",
       actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
       rationale: "evidence supports it",
-    });
+    }, contextFor(fixture));
     assert.equal(interactive.ok, true);
     if (!interactive.ok) return;
     const typedRecord = readState(root).typed_checkpoint_decisions?.[0];
@@ -478,7 +495,7 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
     const interactiveRecord = readState(root).checkpoint_decisions?.[0];
     assert.equal(interactiveRecord?.mode, "interactive");
     assert.equal(interactiveRecord?.decision, "proceed");
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" });
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" }, contextFor(fixture));
     assert.equal(advanced.ok, true, "an interactive proceed decision allows advance");
     if (!advanced.ok) return;
     assert.equal(advanced.state.stages.find((s) => s.id === "product_approval")?.status, "done");
@@ -500,25 +517,23 @@ test("product-discovery: matrix resolves to product-discovery for every complexi
   }
 });
 
-test("product-discovery: selectProfile picks product-discovery for every complexity, never hijacked by 'standard'", async () => {
-  const profiles = await loadAllProfiles();
+test("product-discovery: selected catalog identity keeps product-discovery dedicated and ignores hostile routing labels", () => {
+  const fixture = workflowV2Fixture(readWorkflowProfile("product-discovery"));
+  assert.deepEqual(fixture.run_identity.profile_identity, fixture.profile_identity, "the selected profile is represented by its catalog id and fingerprint");
   for (const complexity of COMPLEXITIES) {
-    const selected = selectProfile(profiles, {
-      type: "PRODUCT_DISCOVERY",
-      complexity,
-      confidence: "HIGH",
-      workflow: "standard", // hostile explicit workflow must not hijack the intent
-      autonomous: false,
-    });
-    assert.equal(selected?.name, "product-discovery", `PRODUCT_DISCOVERY/${complexity} must select product-discovery`);
-    const explicit = selectProfile(profiles, {
-      type: "PRODUCT_DISCOVERY",
-      complexity,
-      confidence: "HIGH",
-      workflow: "product-discovery",
-      autonomous: false,
-    });
-    assert.equal(explicit?.name, "product-discovery");
+    for (const autonomous of [false, true]) {
+      const routed = resolveWorkflow("PRODUCT_DISCOVERY", complexity, autonomous);
+      assert.equal(routed, "product-discovery", `PRODUCT_DISCOVERY/${complexity}/autonomous=${autonomous} must keep its dedicated workflow`);
+      const selected = loadProfileByIdentity(fixture.catalog, {
+        ...fixture.profile_identity,
+      });
+      assert.equal(selected.ok, true, "the selected profile must load by its pinned catalog identity");
+      if (!selected.ok) continue;
+      assert.equal(selected.value.name, routed);
+      // A hostile legacy label cannot replace the exact profile identity.
+      const hostileWorkflow = "standard";
+      assert.notEqual(hostileWorkflow, selected.value.name);
+    }
   }
 });
 

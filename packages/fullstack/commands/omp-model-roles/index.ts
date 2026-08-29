@@ -110,41 +110,26 @@ function resolveEntry(entry: ModelRoleEntry, data: ValidationData): { status: "c
 	return resolveRoleChain(entry, { getModelRole: role => data.settings?.getModelRole?.(role) }, data.inventory);
 }
 
-function findAgentsDirectory(cwd: string): string | undefined {
-	const sourceDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "agents");
-	const candidates = [
-		sourceDirectory,
-		resolve(cwd, "node_modules", "@andvl1", "omp-workflows-fullstack", "agents"),
-		resolve(cwd, "agents"),
-	];
-	for (const candidate of candidates) {
-		if (existsSync(candidate)) return candidate;
-	}
-	try {
-		return readdirSync(dirname(cwd), { withFileTypes: true })
-			.filter(entry => entry.isDirectory() && entry.name.startsWith("omp-workflows-fullstack"))
-			.map(entry => resolve(dirname(cwd), entry.name, "agents"))
-			.find(candidate => existsSync(candidate));
-	} catch {
-		return undefined;
-	}
+function findAgentsDirectory(): string | undefined {
+  const sourceDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "agents");
+  return existsSync(sourceDirectory) ? sourceDirectory : undefined;
 }
 
-function validateFrontmatter(cwd: string): string | undefined {
-	const agentsDirectory = findAgentsDirectory(cwd);
-	if (!agentsDirectory) return "map-only validation: bundled agents directory is unavailable";
-	for (const entry of defaultFullstackModelRoles) {
-		for (const agent of entry.agents) {
-			const path = join(agentsDirectory, `${agent}.md`);
-			if (!existsSync(path)) return `frontmatter warning: missing ${path}`;
-			const match = FRONTMATTER_ROLE_PATTERN.exec(readFileSync(path, "utf8"));
-			if (!match || match[1] !== `@${entry.role}` || match[2] !== entry.standardFallback) {
-				return `frontmatter warning: ${agent}.md must use model: ["@${entry.role}", "${entry.standardFallback}"]`;
-			}
-		}
-	}
-	const count = defaultFullstackModelRoles.reduce((total, entry) => total + entry.agents.length, 0);
-	return count === AGENT_FILE_COUNT ? undefined : `frontmatter warning: expected ${AGENT_FILE_COUNT} agents, found ${count}`;
+function validateFrontmatter(): string | undefined {
+  const agentsDirectory = findAgentsDirectory();
+  if (!agentsDirectory) return "map-only validation: bundled agents directory is unavailable";
+  for (const entry of defaultFullstackModelRoles) {
+    for (const agent of entry.agents) {
+      const path = join(agentsDirectory, `${agent}.md`);
+      if (!existsSync(path)) return `frontmatter warning: bundled agent source '${agent}' is unavailable`;
+      const match = FRONTMATTER_ROLE_PATTERN.exec(readFileSync(path, "utf8"));
+      if (!match || match[1] !== `@${entry.role}` || match[2] !== entry.standardFallback) {
+        return `frontmatter warning: ${agent}.md has an unexpected model-role declaration`;
+      }
+    }
+  }
+  const count = defaultFullstackModelRoles.reduce((total, entry) => total + entry.agents.length, 0);
+  return count === AGENT_FILE_COUNT ? undefined : `frontmatter warning: expected ${AGENT_FILE_COUNT} agents, found ${count}`;
 }
 
 async function loadSettings(api: CustomCommandAPI, cwd: string): Promise<SettingsLike> {
@@ -228,7 +213,7 @@ async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext,
 		return { report: degradedReport(warnings), data, webSearchEnabled };
 	}
 	warnings.push("INFO: resolving roles against available models inventory (provider/id matcher; no native module import)");
-	data.frontmatterWarning = validateFrontmatter(cwd);
+  data.frontmatterWarning = validateFrontmatter();
 	if (data.frontmatterWarning) warnings.push(data.frontmatterWarning);
 	const conflicts = defaultFullstackModelRoles.map(entry => entry.role).filter(role => BUILTIN_ROLES.includes(role));
 	if (conflicts.length > 0) warnings.push(`ERROR: custom roles overlap built-ins: ${conflicts.join(", ")}`);
@@ -243,7 +228,6 @@ async function collectValidation(api: CustomCommandAPI, ctx: HookCommandContext,
 	];
 	for (const entry of defaultFullstackModelRoles) {
 		const configValue = data.settings.getModelRole?.(entry.role) ?? "—";
-		if (configValue === "—") warnings.push(`role ${entry.role} is not configured; using ${entry.standardFallback} fallback when available`);
 		const resolution = resolveEntry(entry, data);
 		lines.push(
 			`${entry.role} | ${entry.agents.join(",")} | ${entry.standardFallback} | ${resolution.status}${resolution.selector ? ` (${truncate(resolution.selector)})` : ""} | ${truncate(configValue)} | ${modelRoleSource(data.settings, entry.role)}`,
@@ -377,37 +361,33 @@ function wrapResearchRequest(payload: string): string {
 	return `${RESEARCH_REQUEST_START}\n${payload}\n${RESEARCH_REQUEST_END}`;
 }
 const factory = (api: CustomCommandAPI): CustomCommand => ({
-	name: "omp-model-roles",
-	description: "Validate per-agent model roles or delegate fresh model recommendations.",
-	async execute(args: string[], ctx: HookCommandContext): Promise<string> {
-		const isDefault = args.length === 0;
-		const action = isDefault ? "validate" : args.length === 1 ? args[0] : undefined;
-		if (action !== "validate" && action !== "recommendations") return USAGE;
-		const wrap = (report: string): string => (isDefault ? `${USAGE}\n${report}` : report);
-		const cwd = ctx.cwd ?? api.cwd;
-		if (!cwd) {
-			const report = degradedReport(["no cwd available"]);
-			notify(ctx, "omp-model-roles: no cwd available", "warning");
-			return wrap(report);
-		}
-		try {
-			const validation = await collectValidation(api, ctx, cwd);
-			if (action === "validate") return wrap(validation.report);
-			if (validation.data.inventory.length === 0) {
-				return wrap(`${validation.report}\nWARN: model-role recommendations unavailable: no validated models in the inventory; research was not dispatched.`);
-			}
-			const recommendations = `${validation.report}\n\n${buildResearchPrompt(validation.data)}`;
-			// Marker envelope: detected by the extension's `before_agent_start` hook,
-			// which injects an agent-attributed developer instruction above the user
-			// prompt. The hook only fires for this action; `validate` is left bare
-			// (no hook contract — a pure read of role/registry state).
-			return wrapResearchRequest(wrap(recommendations));
-		} catch (error) {
-			const report = degradedReport([`unexpected validation failure: ${error instanceof Error ? error.message : String(error)}`]);
-			notify(ctx, "omp-model-roles: unexpected validation failure", "warning");
-			return wrap(report);
-		}
-	},
+  name: "omp-model-roles",
+  description: "Validate per-agent model roles or delegate fresh model recommendations.",
+  async execute(args: string[], ctx: HookCommandContext): Promise<string> {
+    const isDefault = args.length === 0;
+    const action = isDefault ? "validate" : args.length === 1 ? args[0] : undefined;
+    if (action !== "validate" && action !== "recommendations") return USAGE;
+    const wrap = (report: string): string => (isDefault ? `${USAGE}\n${report}` : report);
+    const cwd = ctx.cwd;
+    if (!cwd) {
+      const report = degradedReport(["no manager-supplied project root"]);
+      notify(ctx, "omp-model-roles: no project root available", "warning");
+      return wrap(report);
+    }
+    try {
+      const validation = await collectValidation(api, ctx, cwd);
+      if (action === "validate") return wrap(validation.report);
+      if (validation.data.inventory.length === 0) {
+        return wrap(`${validation.report}\nWARN: model-role recommendations unavailable: no validated models in the inventory; research was not dispatched.`);
+      }
+      const recommendations = `${validation.report}\n\n${buildResearchPrompt(validation.data)}`;
+      return wrapResearchRequest(wrap(recommendations));
+    } catch (error) {
+      const report = degradedReport([`unexpected validation failure: ${error instanceof Error ? error.message : String(error)}`]);
+      notify(ctx, "omp-model-roles: unexpected validation failure", "warning");
+      return wrap(report);
+    }
+  },
 });
 
 export { factory as default };

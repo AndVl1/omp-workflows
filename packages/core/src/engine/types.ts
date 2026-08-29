@@ -4,9 +4,17 @@
  * Mirrors workflows/_schema.json. Kept in TypeScript so the engine gets static
  * guarantees; the JSON files on disk are loaded and validated against these shapes.
  */
-
-import type { AgentMappingState } from "./agent-mapping.js";
 import type { ObservabilityPointer } from "../observability/events.js";
+import type {
+  AgentRef,
+  EffectivePolicy,
+  ProfileIdentity,
+  ProjectIdentity,
+  ProviderCatalog,
+  WorkflowRunIdentity,
+  WorkflowStateContext,
+  WorkflowV2Diagnostic,
+} from "../workflow-v2/types.js";
 
 export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "SPEC" | "REGRESS" | "INVESTIGATION" | "REVIEW" | "HOTFIX" | "PRODUCT_DISCOVERY";
 export type Complexity = "QUICK" | "MEDIUM" | "COMPLEX" | "CRITICAL";
@@ -220,9 +228,10 @@ export interface RosterSelection {
 }
 
 /**
- * Stable identity carried by dispatch, native results, child joins,
- * completion envelopes and observability. `dispatch_id` identifies an
- * attempt; `task_id` remains stable for the same slot assignment.
+ * Capability-bound stable identity carried by dispatch, native results, child
+ * joins, completion envelopes and observability. `dispatch_id` identifies an
+ * attempt; `task_id` remains stable for the same slot assignment. The
+ * capability fields are required and are issued by capability generation.
  */
 export interface WorkIdentity {
   run_id: string;
@@ -241,6 +250,12 @@ export interface WorkIdentity {
   worker_id: string;
 }
 
+/**
+ * Caller-bound stable run/work scope before a capability is generated.
+ * Capability generation binds this scope to the exact `WorkIdentity`.
+ */
+export type WorkIdentityScope = Omit<WorkIdentity, "capability_id" | "capability_epoch">;
+
 export type PendingReason = "provider_running" | "awaiting_result" | "transport_reconnect";
 export interface PendingLease {
   token: string;
@@ -254,6 +269,8 @@ export interface PendingLease {
  */
 export interface PendingState {
   identity: WorkIdentity;
+  /** Durable work is authorized by the exact prepared run identity. */
+  run_identity: WorkflowRunIdentity;
   status: "authorized" | "running" | "pending" | "succeeded" | "failed" | "cancelled";
   pending_reason?: PendingReason;
   provider_ref?: string;
@@ -266,6 +283,8 @@ export type PendingDispatchState = PendingState;
 
 export type ChildJoinStatus = "planned" | "authorized" | "pending" | "succeeded" | "failed" | "cancelled" | "conflict";
 export interface ChildJoin {
+  /** Parent and child joins are accepted only inside one prepared run. */
+  run_identity: WorkflowRunIdentity;
   parent: WorkIdentity;
   child: WorkIdentity;
   state: ChildJoinStatus;
@@ -296,6 +315,8 @@ export interface CompletionArtifactRef {
 export interface CompletionEnvelope {
   schema_version: 1;
   identity: WorkIdentity;
+  /** Terminal output is bound to the exact prepared run identity. */
+  run_identity: WorkflowRunIdentity;
   outcome: CompletionOutcome;
   terminal_signal: CompletionTerminalSignal | null;
   artifact_refs: CompletionArtifactRef[];
@@ -469,7 +490,9 @@ export interface DispatchCompletion {
   evidence: string;
   completed_by: "workflow_complete" | "synchronous_tool_result" | "engine_task_caller";
   completed_at: string;
-  /** Additive identity binding; legacy completion records may omit it. */
+  /** Completion is accepted only for this exact prepared run. */
+  run_identity: WorkflowRunIdentity;
+  /** Additive identity binding for the stable work item. */
   work_identity?: WorkIdentity;
 }
 
@@ -477,20 +500,37 @@ export interface DispatchRecord {
   id: string;
   role: string;
   agent: string;
+  /** Provider-qualified identity for the concrete agent that owns this record. */
+  agent_ref?: AgentRef;
   tool_call_id?: string;
   /**
    * `pending` is resumable background work, never an elapsed-time failure.
-   * Legacy records remain readable during migration.
    */
   status: "authorized" | "running" | "pending" | "succeeded" | "failed" | "cancelled";
   attempt: number;
   created_at: string;
   completed_at?: string;
   completion?: DispatchCompletion;
+  /** Dispatch is authorized only for this exact prepared run. */
+  run_identity: WorkflowRunIdentity;
   work_identity?: WorkIdentity;
   pending?: PendingState;
   completion_envelope?: CompletionEnvelope;
 }
+
+/**
+ * Explicit provider execution context. Every engine operation which can
+ * dispatch, resume, or advance a workflow receives these bound values rather
+ * than resolving authority from cwd or process-global configuration.
+ */
+export interface WorkflowExecutionContext {
+  readonly project_identity: ProjectIdentity;
+  readonly run_identity: WorkflowRunIdentity;
+  readonly catalog: Readonly<ProviderCatalog>;
+  readonly effective_policy: Readonly<EffectivePolicy>;
+  readonly agent_inventory: readonly AgentRef[];
+}
+
 
 
 /**
@@ -521,6 +561,8 @@ export interface CapabilityRosterEntry {
    */
   role: string;
   agent: string;
+  /** Exact provider/source-qualified identity for the concrete agent. */
+  agent_ref?: AgentRef;
   slot_id?: string;
   semantic_role?: string;
   occurrence?: number;
@@ -528,30 +570,61 @@ export interface CapabilityRosterEntry {
 }
 
 export interface DispatchCapabilityState {
-  /** Legacy aliases retained for schema-1 readers; strict armed dispatch ignores them. */
-  run?: string;
-  workflow?: WorkflowName;
-  profile_hash?: string;
-  stage?: string;
-  roles?: string[];
-  capability_id?: string;
-  dispatch_token_hash?: string;
-  advance_token_hash?: string;
-  issued_for?: { run_key: string; branch: string; workflow: WorkflowName; profile_hash: string; stage_cursor: string; cursor_epoch: string };
+  /** Opaque capability identity and one-way authorization token hashes. */
+  capability_id: string;
+  dispatch_token_hash: string;
+  advance_token_hash: string;
+  /** Exact durable binding issued for this capability epoch. */
+  issued_for: {
+    run_key: string;
+    branch: string;
+    workflow: WorkflowName;
+    profile_hash: string;
+    stage_cursor: string;
+    cursor_epoch: string;
+    project_identity: ProjectIdentity;
+    run_identity: WorkflowRunIdentity;
+  };
   kind: "none" | "single" | "consilium";
-  expected_roles?: string[];
-  expected_count?: number;
-  expected_roster?: CapabilityRosterEntry[];
+  /** Project activation pins inherited by this durable capability. */
+  project_identity: ProjectIdentity;
+  /** The exact profile/run selection authorized by prepare. */
+  run_identity: WorkflowRunIdentity;
+  expected_roles: string[];
+  expected_count: number;
+  expected_roster: CapabilityRosterEntry[];
   /** Frozen adaptive selection bound to this capability epoch. */
   roster_selection?: RosterSelection;
-  work_identity?: WorkIdentity;
+  /**
+   * Exact capability-bound identity persisted at `TeamState.work_identity`.
+   * Every armed capability carries this identity.
+   */
+  work_identity: WorkIdentity;
   pending?: PendingState[];
-  status?: "ready" | "dispatched" | "joining" | "complete" | "invalidated";
-  dispatches?: DispatchRecord[];
+  status: "ready" | "dispatched" | "joining" | "complete" | "invalidated";
+  dispatches: DispatchRecord[];
 }
+/**
+ * Immutable audit snapshot of one capability/work lifecycle after it is no
+ * longer current authority. Retired entries are append-only and are never
+ * consulted for authorization.
+ */
+export interface RetiredCapability {
+  capability_id: string;
+  capability_epoch: string;
+  run_identity: WorkflowRunIdentity;
+  work_identity: WorkIdentity;
+  dispatch_capability: DispatchCapabilityState;
+  completion_outcome: CompletionOutcome | null;
+  completion_envelope: CompletionEnvelope | null;
+  reason: string;
+  retired_at: string;
+}
+
 
 export interface JoinSummary {
   stage_id: string;
+  run_identity: WorkflowRunIdentity;
   cursor_epoch: string;
   dispatch_ids: string[];
   roles: string[];
@@ -570,7 +643,7 @@ export interface CheckpointDecision {
   checkpoint: string;
   mode: "interactive" | "autonomous";
   decision: string;
-  /** Legacy actor spelling; typed callers use `actor_provenance`. */
+  /** Legacy actor spelling retained only as migration/display data. */
   actor: string;
   rationale: string;
   decided_at: string;
@@ -582,6 +655,8 @@ export interface CheckpointDecision {
   capability_id?: string;
   capability_epoch?: string;
   policy_hash?: string;
+  /** Every durable decision is bound to the prepared run. */
+  run_identity: WorkflowRunIdentity;
   work_identity?: WorkIdentity;
 }
 
@@ -602,6 +677,8 @@ export interface TypedCheckpointDecision {
   policy_hash: string;
   rationale: string;
   decided_at: string;
+  /** Typed authorization is bound to the exact prepared run. */
+  run_identity: WorkflowRunIdentity;
 }
 /** Durable provenance of one slot's artifact contribution to a consilium stage. */
 export interface SlotArtifactRecord {
@@ -655,7 +732,11 @@ export interface StageSlotRecords {
    * Deterministic synthesis provenance: artifactId -> contributing slots
    * plus any resolved required-scalar disagreements (never silent).
    */
-  shared?: Record<string, { slots: string[]; synthesized_at: string; conflicts?: FanInConflictRecord[] }>;
+  shared?: Record<string, {
+    slots: string[];
+    synthesized_at: string;
+    conflicts?: FanInConflictRecord[];
+  }>;
 }
 
 export interface LoopIterationRecord {
@@ -672,8 +753,8 @@ export interface LoopIterationRecord {
 /**
  * Durable bounded-loop state. `reentries` counts the loop-backs actually
  * performed; when the `until` expression still fails and `reentries` has
- * reached `max_iterations`, the loop is exhausted and maps to
- * `needs_human` or `failed` via `on_exhausted`.
+ * reached `max_iterations`, the loop is exhausted and maps to `needs_human`
+ * or `failed` via `on_exhausted`.
  */
 export interface LoopState {
   /** Stage id that owns the loop. */
@@ -691,10 +772,11 @@ export interface LoopState {
   history: LoopIterationRecord[];
   ended_at?: string;
 }
-
-export interface TeamState {
+export interface TeamState extends WorkflowStateContext {
   schema: 1;
   branch: string;
+  /** Project-level pins are retained for inherited run checks. */
+  project_identity: ProjectIdentity;
   classification: Classification;
   task: string;
   /** User feedback and prior task text retained across continuations. */
@@ -707,7 +789,6 @@ export interface TeamState {
   /** Persisted typed checkpoint policy; malformed values fail closed. */
   checkpoint_policy?: CheckpointPolicy;
   issue: { number: number; url?: string } | null;
-  stage_cursor: string;
   stages: Array<{ id: string; status: StageStatus }>;
   artifacts: Record<string, string>;
   pause: { kind: PauseKind; reason: string };
@@ -722,10 +803,12 @@ export interface TeamState {
     has_runtime: boolean;
     dev_agent: string | null;
   };
+  /** Profile fingerprint retained as a derived display/index field. */
   profile_hash?: string;
-  cursor_epoch?: string;
   run_key?: string;
   dispatch_capability?: DispatchCapabilityState;
+  /** Immutable bounded history of retired capability/work identities. */
+  retired_capabilities?: RetiredCapability[];
   /** Stable identity for the current work item, when migrated/issued. */
   work_identity?: WorkIdentity;
   /** Legacy schema-1 decisions retained only as migration input. */
@@ -751,7 +834,20 @@ export interface TeamState {
   loop_state?: LoopState;
   /** Per-slot consilium artifact provenance + synthesis evidence (additive). */
   slot_artifacts?: Record<string, StageSlotRecords>;
+  /** Provenance of typed versus migrated lifecycle control-plane fields. */
+  control_plane_provenance?: ControlPlaneProvenance;
   observability?: ObservabilityPointer;
+}
+
+/** Typed lifecycle failures retain the structured v2 diagnostic at boundaries. */
+export class WorkflowLifecycleError extends Error {
+  readonly diagnostic: WorkflowV2Diagnostic;
+
+  constructor(diagnostic: WorkflowV2Diagnostic) {
+    super(`${diagnostic.code}: ${diagnostic.remediation}`);
+    this.name = "WorkflowLifecycleError";
+    this.diagnostic = diagnostic;
+  }
 }
 
 export interface RoleConfig {
@@ -765,8 +861,6 @@ export interface RoleConfig {
   flags: Record<string, string[]>;
   /** design system hint (UI work) */
   design_system: string | null;
-  /** Live role -> agent resolution generated from OMP discovery. */
-  agent_mapping?: AgentMappingState;
 }
 
 

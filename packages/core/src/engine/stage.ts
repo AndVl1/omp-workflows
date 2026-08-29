@@ -19,18 +19,28 @@
  * reason so the orchestrator re-spawns the developer instead of editing
  * the artifact. See `gates/validation.ts` for the full contract.
  */
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core --> */
 
 import { buildDispatchMarker, dispatchTaskId } from "../gates/dispatch.js";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { persistReturnedArtifacts, readArtifact, writeArtifact } from "./artifacts.js";
-import { resolveConfig } from "./config.js";
 import { type ScopeFlags } from "./scope.js";
 import { evaluatePredicate } from "./predicate.js";
 import { namespacedArtifactId, sanitizeSlot } from "./fan-in.js";
 import { PRD_SOURCE_ARTIFACT_IDS, validateProductPrdDocument, writeProductPrdDocument } from "./product-prd.js";
 import { checkArtifact as validationCheckArtifact, validationGate } from "../gates/validation.js";
+import { createDiagnostic } from "../workflow-v2/diagnostics.js";
+import { isWorkflowV2Digest, validateProjectIdentity, validateWorkflowRunIdentity } from "../workflow-v2/identity.js";
+import type {
+  AgentRef,
+  EffectivePolicy,
+  ProjectIdentity,
+  ProviderCatalog,
+  WorkflowRunIdentity,
+  WorkflowV2Diagnostic,
+} from "../workflow-v2/types.js";
 import type {
   DispatchSlot,
   Profile,
@@ -41,17 +51,42 @@ import type {
   TeamState,
 } from "./types.js";
 
+/**
+ * A dispatch cannot be resolved from a bare role or the process cwd.  The
+ * selected provider's effective policy must identify the concrete registered
+ * agent before any task call or durable authorization is attempted.
+ */
+export class WorkflowStageIdentityError extends Error {
+  readonly diagnostic: WorkflowV2Diagnostic;
+
+  constructor(
+    stageId: string,
+    message: string,
+    code: WorkflowV2Diagnostic["code"] = "MIGRATION_REQUIRED",
+    evidence: Record<string, unknown> = {},
+  ) {
+    super(message);
+    this.name = "WorkflowStageIdentityError";
+    this.diagnostic = createDiagnostic({
+      code,
+      operation: "agent.preflight",
+      evidence: { field: stageId, ...evidence },
+      remediation: "Invoke the stage with unchanged selected-provider policy, catalog, project/run identities, and qualified agent inventory.",
+    });
+  }
+}
+
 
 /**
  * Fail-closed signal: a stage references `${scope.dev_agent}` but the
  * resolved scope carries no `dev_agent`. Core never guesses a domain agent;
  * the caller must supply a matching scope_map entry or an explicit role.
  */
-export class DevAgentUnavailableError extends Error {
+export class DevAgentUnavailableError extends WorkflowStageIdentityError {
   constructor(stageId: string) {
     super(
-      `stage '${stageId}' references \${scope.dev_agent} but the resolved scope has no dev_agent; `
-      + "supply a matching scope_map entry (config or caller preset) or declare an explicit role",
+      stageId,
+      `stage '${stageId}' references \${scope.dev_agent} but the selected provider policy has no qualified dev_agent`,
     );
     this.name = "DevAgentUnavailableError";
   }
@@ -62,6 +97,19 @@ export interface StageContext {
   state: TeamState;
   artifactsDir: string;
   flags: ScopeFlags;
+  /**
+   * These values are supplied by host admission/selected runtime.  The
+   * project identity is the canonical activation identity and the run
+   * identity is always pinned by workflow_prepare before a stage executes.
+   * Provider capability snapshots remain optional here so ordinary
+   * document/orchestrator stages can be rendered without dispatch metadata;
+   * every dispatch requires the complete selected-provider context below.
+   */
+  project_identity: Readonly<ProjectIdentity>;
+  run_identity: Readonly<WorkflowRunIdentity>;
+  catalog?: Readonly<ProviderCatalog>;
+  effectivePolicy?: Readonly<EffectivePolicy>;
+  agentInventory?: readonly AgentRef[];
   agent: (role: string) => string;
   /** Run a single task subagent. The engine owns the `task` tool reference. */
   task: TaskCaller;
@@ -229,8 +277,18 @@ function readSingleSpawn(raw: unknown): SingleSpawnPayload {
   const exitCode = typeof raw.exitCode === "number" ? raw.exitCode : undefined;
   const error = typeof raw.error === "string" ? raw.error : undefined;
   let artifacts: Record<string, string> | undefined;
-  if (isObject(raw.artifacts) && Object.values(raw.artifacts).every((v) => typeof v === "string")) {
-    artifacts = Object.fromEntries(Object.entries(raw.artifacts)) as Record<string, string>;
+  const rawArtifacts = raw.artifacts;
+  if (
+    isObject(rawArtifacts)
+    && !Array.isArray(rawArtifacts)
+    && Object.values(rawArtifacts).every((value) => typeof value === "string")
+  ) {
+    const artifactEntries: Array<[string, string]> = [];
+    for (const [key, value] of Object.entries(rawArtifacts)) {
+      if (typeof value !== "string") continue;
+      artifactEntries.push([key, value]);
+    }
+    artifacts = Object.fromEntries(artifactEntries);
   }
   return { id, slot_id, task_id, dispatch_id, capability_id, capability_epoch, output, artifacts, exitCode, error };
 }
@@ -294,10 +352,14 @@ function stampPositionalBatchIdentity(
     !result.slot_id && !result.task_id && !result.dispatch_id,
   );
   if (!positionalOnly) return results;
-  return results.map((result, index) => ({
-    ...result,
-    task_id: names[index]!,
-  }));
+  const stamped: TaskResult[] = [];
+  for (let index = 0; index < results.length; index += 1) {
+    const result = results[index];
+    const name = names[index];
+    if (!result || !name) return results;
+    stamped.push({ ...result, task_id: name });
+  }
+  return stamped;
 }
 
 /**
@@ -359,6 +421,7 @@ export interface StageOutcome {
   note: string;
   artifacts: string[];
   loopIteration?: number;
+  diagnostic?: WorkflowV2Diagnostic;
 }
 
 export async function runStage(
@@ -405,9 +468,9 @@ export async function runStage(
         return { stageId: stage.id, status: "failed", note: `unknown stage type: ${stage.type}`, artifacts: [] };
     }
   } catch (error) {
-    if (error instanceof DevAgentUnavailableError) {
+    if (error instanceof WorkflowStageIdentityError) {
       ctx.log(`stage ${stage.id}: failed — ${error.message}`);
-      return { stageId: stage.id, status: "failed", note: error.message, artifacts: produces };
+      return { stageId: stage.id, status: "failed", note: error.message, artifacts: produces, diagnostic: error.diagnostic };
     }
     throw error;
   }
@@ -433,6 +496,7 @@ async function runOrchestrator(stage: StageDef, ctx: StageContext, produces: str
   if (produces.length > 0) {
     return {
       stageId: stage.id,
+
       status: "failed",
       note: "orchestrator stage declares artifacts but no orchestrate callback is configured",
       artifacts: produces,
@@ -460,6 +524,479 @@ function failAuthorizedDispatches(
     if (!completed.ok) ctx.log(`  durable cleanup failed for ${entry.dispatchId}: ${completed.error}`);
   }
 }
+type QualifiedProviderContext = Pick<
+  StageContext,
+  "project_identity" | "run_identity" | "catalog" | "effectivePolicy" | "agentInventory"
+>;
+interface QualifiedProviderContextSnapshot {
+  project_identity: ProjectIdentity;
+  run_identity: WorkflowRunIdentity;
+  catalog: Readonly<ProviderCatalog>;
+  policy: Readonly<EffectivePolicy>;
+  inventory: readonly AgentRef[];
+}
+
+interface StageBindingSnapshot extends QualifiedProviderContextSnapshot {
+  readonly runKey: string;
+  readonly branch: string;
+  readonly workflow: TeamState["classification"]["workflow"];
+  readonly profileHash: string;
+  readonly stageCursor: string;
+  readonly cursorEpoch: string;
+  readonly capabilityId?: string;
+}
+
+function projectIdentityKey(identity: ProjectIdentity): string {
+  return JSON.stringify([
+    identity.root_instance_id,
+    identity.provider_id,
+    identity.descriptor_fingerprint,
+    identity.executable_provenance.build_fingerprint,
+    identity.executable_provenance.runtime_fingerprint,
+    identity.catalog_content_digest,
+    identity.config_byte_sha256,
+    identity.config_semantic_sha256,
+    identity.session.session_id,
+    identity.session.lifecycle_id,
+  ]);
+}
+
+function sameProjectIdentity(left: ProjectIdentity, right: ProjectIdentity): boolean {
+  return projectIdentityKey(left) === projectIdentityKey(right);
+}
+
+function sameProfileIdentity(left: { id: string; fingerprint: string }, right: { id: string; fingerprint: string }): boolean {
+  return left.id === right.id && left.fingerprint === right.fingerprint;
+}
+
+function sameRunIdentity(left: WorkflowRunIdentity, right: WorkflowRunIdentity): boolean {
+  return sameProjectIdentity(left, right)
+    && left.run_id === right.run_id
+    && sameProfileIdentity(left.profile_identity, right.profile_identity);
+}
+
+function requiredBindingString(value: unknown, stageId: string, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0 || /[\s\u0000-\u001f\u007f]/u.test(value)) {
+    throw new WorkflowStageIdentityError(stageId, `workflow dispatch binding is missing a non-empty ${field}`, "MIGRATION_REQUIRED", { field });
+  }
+  return value;
+}
+
+function isWorkflowName(value: unknown): value is TeamState["classification"]["workflow"] {
+  return typeof value === "string"
+    && value.trim().length > 0
+    && !/[\s\u0000-\u001f\u007f]/u.test(value);
+}
+
+function requiredWorkflowName(value: unknown, stageId: string, field: string): TeamState["classification"]["workflow"] {
+  if (!isWorkflowName(value)) {
+    throw new WorkflowStageIdentityError(stageId, `workflow dispatch binding is missing a non-empty ${field}`, "MIGRATION_REQUIRED", { field });
+  }
+  return value;
+}
+
+function requireStageStateBinding(
+  ctx: QualifiedProviderContext & { readonly state?: TeamState },
+  stageId: string,
+  providerContext: QualifiedProviderContextSnapshot,
+  requireStageCursor: boolean,
+): StageBindingSnapshot {
+  const state = ctx.state;
+  if (!state) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow state is required before a dispatch binding can be constructed",
+      "MIGRATION_REQUIRED",
+      { field: "state" },
+    );
+  }
+  const stateProject = validateProjectIdentity(state.project_identity);
+  if (!stateProject.ok) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow state has no validated project identity",
+      "MIGRATION_REQUIRED",
+      { field: "state.project_identity" },
+    );
+  }
+  const stateRun = validateWorkflowRunIdentity(state.run_identity);
+  if (!stateRun.ok) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow state has no validated run identity",
+      "MIGRATION_REQUIRED",
+      { field: "state.run_identity" },
+    );
+  }
+  if (
+    !sameProjectIdentity(providerContext.project_identity, stateProject.value)
+    || !sameRunIdentity(providerContext.run_identity, stateRun.value)
+  ) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow state project/run identity differs from the selected provider identity",
+      "IDENTITY_MISMATCH",
+      { field: "state.run_identity" },
+    );
+  }
+  const profile = providerContext.run_identity.profile_identity;
+  const runKey = requiredBindingString(state.run_key, stageId, "run_key");
+  const branch = requiredBindingString(state.branch, stageId, "branch");
+  const workflow = requiredWorkflowName(state.classification?.workflow, stageId, "workflow");
+  const profileHash = requiredBindingString(state.profile_hash, stageId, "profile_hash");
+  const stageCursor = requiredBindingString(state.stage_cursor, stageId, "stage_cursor");
+  const cursorEpoch = requiredBindingString(state.cursor_epoch, stageId, "cursor_epoch");
+  if (workflow !== profile.id || profileHash !== profile.fingerprint) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow state profile identity differs from the selected catalog profile",
+      "IDENTITY_MISMATCH",
+      { field: workflow !== profile.id ? "workflow" : "profile_hash", profile_id: profile.id },
+    );
+  }
+  if (requireStageCursor && stageCursor !== stageId) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow state stage cursor differs from the requested dispatch stage",
+      "IDENTITY_MISMATCH",
+      { field: "stage_cursor", candidate_id: stageCursor },
+    );
+  }
+  const rawCapability = state.dispatch_capability;
+  if (rawCapability === undefined) {
+    return { ...providerContext, runKey, branch, workflow, profileHash, stageCursor, cursorEpoch };
+  }
+  if (!isObject(rawCapability) || Array.isArray(rawCapability)) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow dispatch capability is malformed",
+      "MIGRATION_REQUIRED",
+      { field: "dispatch_capability" },
+    );
+  }
+  const capability = rawCapability;
+  const capabilityId = requiredBindingString(capability.capability_id, stageId, "capability_id");
+  const capabilityProject = validateProjectIdentity(capability.project_identity);
+  const capabilityRun = validateWorkflowRunIdentity(capability.run_identity);
+  if (!capabilityProject.ok) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow dispatch capability has no validated project identity",
+      "MIGRATION_REQUIRED",
+      { field: "dispatch_capability.project_identity" },
+    );
+  }
+  if (!capabilityRun.ok) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow dispatch capability has no validated run identity",
+      "MIGRATION_REQUIRED",
+      { field: "dispatch_capability.run_identity" },
+    );
+  }
+  if (
+    !sameProjectIdentity(providerContext.project_identity, capabilityProject.value)
+    || !sameRunIdentity(providerContext.run_identity, capabilityRun.value)
+  ) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow dispatch capability project/run identity differs from the selected provider identity",
+      "IDENTITY_MISMATCH",
+      { field: "dispatch_capability.run_identity" },
+    );
+  }
+  const issued = capability.issued_for;
+  if (!isObject(issued) || Array.isArray(issued)) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow dispatch capability has no strict issued binding",
+      "MIGRATION_REQUIRED",
+      { field: "dispatch_capability.issued_for" },
+    );
+  }
+  const issuedRecord = issued;
+  const issuedProject = validateProjectIdentity(issuedRecord.project_identity);
+  if (!issuedProject.ok) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow capability issued binding has no validated project identity",
+      "MIGRATION_REQUIRED",
+      { field: "dispatch_capability.issued_for.project_identity" },
+    );
+  }
+  const issuedRun = validateWorkflowRunIdentity(issuedRecord.run_identity);
+  if (!issuedRun.ok) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow capability issued binding has no validated run identity",
+      "MIGRATION_REQUIRED",
+      { field: "dispatch_capability.issued_for.run_identity" },
+    );
+  }
+  if (
+    !sameProjectIdentity(providerContext.project_identity, issuedProject.value)
+    || !sameRunIdentity(providerContext.run_identity, issuedRun.value)
+  ) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow capability issued project/run identity differs from the selected provider identity",
+      "IDENTITY_MISMATCH",
+      { field: "dispatch_capability.issued_for.run_identity" },
+    );
+  }
+  const issuedRunKey = requiredBindingString(issuedRecord.run_key, stageId, "issued_for.run_key");
+  const issuedBranch = requiredBindingString(issuedRecord.branch, stageId, "issued_for.branch");
+  const issuedWorkflow = requiredBindingString(issuedRecord.workflow, stageId, "issued_for.workflow");
+  const issuedProfileHash = requiredBindingString(issuedRecord.profile_hash, stageId, "issued_for.profile_hash");
+  const issuedStageCursor = requiredBindingString(issuedRecord.stage_cursor, stageId, "issued_for.stage_cursor");
+  const issuedCursorEpoch = requiredBindingString(issuedRecord.cursor_epoch, stageId, "issued_for.cursor_epoch");
+  if (
+    issuedRunKey !== runKey
+    || issuedBranch !== branch
+    || issuedWorkflow !== workflow
+    || issuedProfileHash !== profileHash
+    || issuedStageCursor !== stageCursor
+    || issuedCursorEpoch !== cursorEpoch
+    || (requireStageCursor && issuedStageCursor !== stageId)
+  ) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow dispatch capability binding differs from workflow state",
+      "IDENTITY_MISMATCH",
+      { field: "dispatch_capability.issued_for" },
+    );
+  }
+  return { ...providerContext, runKey, branch, workflow, profileHash, stageCursor, cursorEpoch, capabilityId };
+}
+
+function requireStageDispatchBinding(ctx: StageContext, stageId: string): StageBindingSnapshot {
+  const providerContext = requireQualifiedProviderContext(ctx, stageId);
+  return requireStageStateBinding(ctx, stageId, providerContext, true);
+}
+
+function requireQualifiedProviderContext(
+  ctx: QualifiedProviderContext,
+  stageId: string,
+): QualifiedProviderContextSnapshot {
+  const projectCandidate = ctx.project_identity;
+  const runCandidate = ctx.run_identity;
+  const catalog = ctx.catalog;
+  const policy = ctx.effectivePolicy;
+  const inventory = ctx.agentInventory;
+  if (!projectCandidate || !runCandidate || !catalog || !policy || !inventory) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "selected-provider project/run identity, catalog, effective policy, and qualified agent inventory are required before dispatch",
+      "MIGRATION_REQUIRED",
+    );
+  }
+  const project = validateProjectIdentity(projectCandidate);
+  if (!project.ok) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "selected-provider project identity is malformed",
+      "IDENTITY_MISMATCH",
+      { field: "project_identity" },
+    );
+  }
+  const run = validateWorkflowRunIdentity(runCandidate);
+  if (!run.ok) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "selected-provider run identity is malformed",
+      "IDENTITY_MISMATCH",
+      { field: "run_identity" },
+    );
+  }
+  if (!sameProjectIdentity(project.value, run.value)) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "selected-provider project and run identities are incoherent",
+      "IDENTITY_MISMATCH",
+      { field: "run_identity" },
+    );
+  }
+  const projectIdentity = project.value;
+  const runIdentity = run.value;
+  const provider = policy.provider;
+  const workflow = policy.workflow;
+  if (workflow.selection === "fixed" && !sameProfileIdentity(workflow.profile_identity, runIdentity.profile_identity)) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "selected provider policy profile differs from the workflow run identity",
+      "IDENTITY_MISMATCH",
+      { profile_id: runIdentity.profile_identity.id },
+    );
+  }
+  if (!catalog.profiles.some((candidate) =>
+    candidate.identity.id === runIdentity.profile_identity.id
+    && candidate.identity.fingerprint === runIdentity.profile_identity.fingerprint
+  )) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "workflow run profile is unavailable in the selected provider catalog",
+      "IDENTITY_MISMATCH",
+      { field: "run_identity.profile_identity", profile_id: runIdentity.profile_identity.id },
+    );
+  }
+  if (
+    provider.id !== projectIdentity.provider_id
+    || provider.descriptor_fingerprint !== projectIdentity.descriptor_fingerprint
+    || provider.catalog_content_digest !== projectIdentity.catalog_content_digest
+    || catalog.content_digest !== projectIdentity.catalog_content_digest
+  ) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "selected-provider policy, catalog, and project identity do not describe one immutable provider",
+      "IDENTITY_MISMATCH",
+      { provider_id: projectIdentity.provider_id, catalog_content_digest: projectIdentity.catalog_content_digest },
+    );
+  }
+  if (inventory.some((candidate) =>
+    !candidate
+    || typeof candidate.registered_name !== "string"
+    || candidate.registered_name.trim().length === 0
+    || candidate.provider_id !== provider.id
+    || !isWorkflowV2Digest(candidate.source_fingerprint)
+  )) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "qualified provider agent inventory contains an invalid or unselected-provider identity",
+      "AGENT_COLLISION",
+      { provider_id: provider.id },
+    );
+  }
+  for (const [role, ref] of Object.entries(policy.roles)) {
+    if (
+      !ref
+      || ref.provider_id !== provider.id
+      || !isWorkflowV2Digest(ref.source_fingerprint)
+      || !inventory.some((candidate) =>
+        candidate.registered_name === ref.registered_name
+        && candidate.provider_id === ref.provider_id
+        && candidate.source_fingerprint === ref.source_fingerprint
+      )
+    ) {
+      throw new WorkflowStageIdentityError(
+        stageId,
+        `policy role '${role}' has no matching qualified identity in the selected provider inventory`,
+        "AGENT_COLLISION",
+        { provider_id: provider.id, candidate_id: ref?.registered_name ?? role },
+      );
+    }
+  }
+  for (const [index, rule] of policy.scope_map.entries()) {
+    const ref = rule?.dev_agent;
+    if (
+      !ref
+      || ref.provider_id !== provider.id
+      || !isWorkflowV2Digest(ref.source_fingerprint)
+      || !inventory.some((candidate) =>
+        candidate.registered_name === ref.registered_name
+        && candidate.provider_id === ref.provider_id
+        && candidate.source_fingerprint === ref.source_fingerprint
+      )
+    ) {
+      throw new WorkflowStageIdentityError(
+        stageId,
+        `scope mapping '${index}' has no matching qualified identity in the selected provider inventory`,
+        "AGENT_COLLISION",
+        { provider_id: provider.id, candidate_id: ref?.registered_name ?? `scope_map:${index}` },
+      );
+    }
+  }
+  return { project_identity: projectIdentity, run_identity: runIdentity, catalog, policy, inventory };
+}
+
+function selectedAgentRef(ctx: StageContext, stageId: string, role: string): AgentRef {
+  const { policy, inventory } = requireQualifiedProviderContext(ctx, stageId);
+  const ref = policy.roles[role];
+  if (!ref || ref.provider_id !== policy.provider.id) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      `role '${role}' has no qualified agent in the selected provider policy`,
+      "AGENT_COLLISION",
+      { provider_id: policy.provider.id, candidate_id: role },
+    );
+  }
+  const inventoryRef = inventory.find((candidate) =>
+    candidate.registered_name === ref.registered_name
+    && candidate.provider_id === ref.provider_id
+    && candidate.source_fingerprint === ref.source_fingerprint
+  );
+  if (!inventoryRef) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      `role '${role}' is absent or stale in the qualified provider inventory`,
+      "AGENT_COLLISION",
+      { provider_id: policy.provider.id, candidate_id: ref.registered_name },
+    );
+  }
+  const selected = ctx.agent(role);
+  if (selected !== ref.registered_name) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      `agent resolver disagrees with qualified policy identity for role '${role}'`,
+      "IDENTITY_MISMATCH",
+      { provider_id: policy.provider.id, candidate_id: ref.registered_name },
+    );
+  }
+  return ref;
+}
+
+function selectedAgent(ctx: StageContext, stageId: string, role: string): string {
+  return selectedAgentRef(ctx, stageId, role).registered_name;
+}
+
+interface StageRosterOverride {
+  readonly replace?: readonly string[];
+  readonly add?: readonly string[];
+  readonly remove?: readonly string[];
+}
+interface MutableStageRosterOverride {
+  replace?: readonly string[];
+  add?: readonly string[];
+  remove?: readonly string[];
+}
+
+function isStringArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function parseStageRosterOverride(value: unknown): StageRosterOverride | undefined {
+  if (!isObject(value) || Array.isArray(value)) return undefined;
+  const override: MutableStageRosterOverride = {};
+  if (value.replace !== undefined) {
+    if (!isStringArray(value.replace)) return undefined;
+    override.replace = value.replace;
+  }
+  if (value.add !== undefined) {
+    if (!isStringArray(value.add)) return undefined;
+    override.add = value.add;
+  }
+  if (value.remove !== undefined) {
+    if (!isStringArray(value.remove)) return undefined;
+    override.remove = value.remove;
+  }
+  return override;
+}
+
+function rosterOverrideFor(
+  policy: Readonly<EffectivePolicy> | undefined,
+  stageId: string,
+): StageRosterOverride | undefined {
+  if (!policy) return undefined;
+  const raw: unknown = policy.roster_overrides;
+  if (!Array.isArray(raw)) return undefined;
+  for (const candidate of raw) {
+    if (!isObject(candidate) || Array.isArray(candidate) || candidate.id !== stageId) continue;
+    if (candidate.op === "remove") return { replace: [] };
+    const value = candidate.value ?? candidate.rule ?? candidate;
+    const override = parseStageRosterOverride(value);
+    if (override) return override;
+  }
+  return undefined;
+}
 
 function taskEvidence(result: TaskResult, outcome: "succeeded" | "failed"): string {
   return result.output.trim() || result.error?.trim() || (outcome === "failed" ? "task failed" : "task completed");
@@ -468,7 +1005,7 @@ function taskEvidence(result: TaskResult, outcome: "succeeded" | "failed"): stri
 async function runSingle(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
   const slot = resolveStageDispatchSlots(stage, ctx)[0];
   if (!slot) return { stageId: stage.id, status: "failed", note: "single stage missing role", artifacts: [] };
-  const agent = ctx.agent(slot.role);
+  const agent = selectedAgent(ctx, stage.id, slot.role);
   const task = buildStagePrompt(stage, ctx, slot.slot);
   ctx.log(`  single: ${agent} (slot=${slot.slot}, role=${slot.role})`);
   const authorized = ctx.durable?.authorize(slot.slot, agent);
@@ -563,7 +1100,13 @@ function pairConsiliumResults(roster: DispatchSlot[], tasks: Array<{ name?: stri
     bySlot.set(slot.slot, result);
   }
   if (bySlot.size !== roster.length) return { ok: false, error: "task batch result set is incomplete or ambiguous" };
-  return { ok: true, paired: roster.map((slot) => ({ slot, result: bySlot.get(slot.slot)! })) };
+  const paired: Array<{ slot: DispatchSlot; result: TaskResult }> = [];
+  for (const slot of roster) {
+    const result = bySlot.get(slot.slot);
+    if (!result) return { ok: false, error: `task batch result for slot '${slot.slot}' is missing` };
+    paired.push({ slot, result });
+  }
+  return { ok: true, paired };
 }
 
 async function runConsilium(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
@@ -571,8 +1114,15 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
   if (roster.length === 0) return { stageId: stage.id, status: "failed", note: "consilium stage resolved to an empty roster", artifacts: produces };
   const multiSlot = roster.length > 1;
   ctx.log(`  consilium: ${roster.map((slot) => slot.slot).join(", ")}${multiSlot ? " (slot-scoped artifacts)" : ""}`);
-  const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: ctx.agent(slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot) }));
-  const authorized = ctx.durable ? roster.map((slot, i) => ctx.durable!.authorize(slot.slot, tasks[i]!.agent)) : [];
+  const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: selectedAgent(ctx, stage.id, slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot) }));
+  const durable = ctx.durable;
+  const authorized = durable
+    ? roster.map((slot, index) => {
+      const task = tasks[index];
+      if (!task) throw new WorkflowStageIdentityError(stage.id, `dispatch task is missing for slot '${slot.slot}'`, "MIGRATION_REQUIRED", { field: "tasks" });
+      return durable.authorize(slot.slot, task.agent);
+    })
+    : [];
   const denied = authorized.find((a) => !a.ok);
   if (denied && !denied.ok) {
     failAuthorizedDispatches(ctx, authorized, `dispatch authorization failed: ${denied.error}`);
@@ -603,12 +1153,12 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
       }
       continue;
     }
-    if (auth?.ok) {
+    if (auth?.ok && durable) {
       const persisted = multiSlot
         ? persistConsiliumSlotArtifacts(ctx, slot.slot, result, produces)
         : persistTaskArtifacts(ctx, result);
       const outcome = result.exitCode === 0 && !persisted.error ? "succeeded" : "failed";
-      const completed = ctx.durable!.complete(auth.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids);
+      const completed = durable.complete(auth.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids);
       if (!completed.ok) {
         failAuthorizedDispatches(ctx, authorized.slice(roster.findIndex((candidate) => candidate.slot === slot.slot) + 1), `dispatch completion failed: ${completed.error}`);
         return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
@@ -720,7 +1270,15 @@ function validateProduced(
   }
   for (const id of gated) {
     const data = readArtifact(ctx.artifactsDir, id);
-    const result = validationCheckArtifact(id, data as Record<string, unknown>);
+    if (!isObject(data) || Array.isArray(data)) {
+      return {
+        stageId: stage.id,
+        status: "failed",
+        note: `produced artifact "${id}.json" is not a JSON object and cannot be validated`,
+        artifacts: produces,
+      };
+    }
+    const result = validationCheckArtifact(id, data);
     if (!result.ok) {
       ctx.log(`  validation: REJECTED for ${id} — ${result.reason}`);
       return { stageId: stage.id, status: "failed", note: result.reason, artifacts: produces };
@@ -791,16 +1349,17 @@ function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string, slot
   const roleHint = isOrchestratorRole(role)
     ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
     : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
-  const capability = ctx.state.dispatch_capability;
-  const markerCapabilityId = capability?.capability_id;
-  const markerTaskId = markerCapabilityId
-    ? dispatchTaskId(markerCapabilityId, capability.issued_for?.run_key ?? ctx.state.run_key ?? ctx.state.branch, capability.issued_for?.branch ?? ctx.state.branch, capability.issued_for?.workflow ?? ctx.state.classification.workflow, stage.id, role)
+  const dispatchStage = stage.type === "single" || stage.type === "consilium";
+  const binding = dispatchStage ? requireStageDispatchBinding(ctx, stage.id) : undefined;
+  const markerCapabilityId = binding?.capabilityId;
+  const markerTaskId = markerCapabilityId && binding
+    ? dispatchTaskId(markerCapabilityId, binding.runKey, binding.branch, binding.workflow, binding.stageCursor, role)
     : undefined;
-  const dispatchMarker = stage.type === "single" || stage.type === "consilium"
-    ? buildDispatchMarker(ctx.state.run_key ?? ctx.state.branch, stage, resolveStageDispatchSlots(stage, ctx).map((slot) => slot.slot), role, ctx.state.cursor_epoch ?? stage.id, markerCapabilityId, role, markerTaskId)
+  const dispatchMarker = binding
+    ? buildDispatchMarker(binding.runKey, stage, resolveStageDispatchSlots(stage, ctx).map((slot) => slot.slot), role, binding.cursorEpoch, markerCapabilityId, role, markerTaskId)
     : "";
-  const durableBinding = dispatchMarker
-    ? `run_key=${ctx.state.run_key ?? ctx.state.branch} branch=${ctx.state.branch} workflow=${ctx.state.classification.workflow} profile_hash=${ctx.state.profile_hash ?? ""} stage_cursor=${stage.id} cursor_epoch=${ctx.state.cursor_epoch ?? ""}`
+  const durableBinding = binding
+    ? `run_key=${binding.runKey} branch=${binding.branch} workflow=${binding.workflow} profile_hash=${binding.profileHash} stage_cursor=${binding.stageCursor} cursor_epoch=${binding.cursorEpoch}`
     : "";
   return `## Stage: ${stage.id} — ${stage.title}
 ${stage.description ?? ""}
@@ -845,15 +1404,35 @@ function isOrchestratorRole(role: string): boolean {
  * capability rosters, markers, authorization and joins can distinguish
  * occurrences while the concrete agent mapping stays per semantic role.
  */
+export type StageResolutionContext = Pick<
+  StageContext,
+  "flags" | "cwd" | "resolveDevAgent" | "effectivePolicy" | "project_identity" | "run_identity" | "catalog" | "agentInventory"
+> & { state?: TeamState };
 export function resolveStageDispatchSlots(
   stage: StageDef,
-  ctx: Pick<StageContext, "flags" | "cwd" | "resolveDevAgent"> & { state?: TeamState },
+  ctx: StageResolutionContext,
 ): DispatchSlot[] {
+  const dispatchStage = stage.type === "single" || stage.type === "consilium";
+  const providerContext = dispatchStage
+    ? requireQualifiedProviderContext(ctx, stage.id)
+    : undefined;
+  let stateBinding: StageBindingSnapshot | undefined;
+  if (dispatchStage && ctx.state) {
+    if (!providerContext) {
+      throw new WorkflowStageIdentityError(
+        stage.id,
+        "dispatch stage has no qualified provider context",
+        "MIGRATION_REQUIRED",
+        { field: "provider_context" },
+      );
+    }
+    stateBinding = requireStageStateBinding(ctx, stage.id, providerContext, false);
+  }
   if (stage.roster_policy && ctx.state) {
     const persisted = ctx.state.roster_selection?.stage_id === stage.id
       ? ctx.state.roster_selection
       : ctx.state.roster_selections?.[stage.id];
-    if (persisted && persisted.capability_epoch === (ctx.state.cursor_epoch ?? persisted.capability_epoch)) {
+    if (persisted && stateBinding && persisted.capability_epoch === stateBinding.cursorEpoch) {
       return persisted.selected.map((entry) => ({
         slot: entry.slot_id,
         slot_id: entry.slot_id,
@@ -868,7 +1447,8 @@ export function resolveStageDispatchSlots(
   const conditioned = stage.type === "consilium"
     ? applyConditionalOccurrences(expanded, stage.conditional, ctx.flags)
     : expanded;
-  const roster = applyRosterOverrides(conditioned, ctx.cwd, stage.id).map((role) => expandRole(role, stage.id, ctx));
+  const roster = applyRosterOverrides(conditioned, ctx.effectivePolicy, stage.id)
+    .map((role) => expandRole(role, stage.id, ctx));
   return normalizeDispatchSlots(roster);
 }
 
@@ -900,16 +1480,25 @@ function normalizeDispatchSlots(roles: string[]): DispatchSlot[] {
  */
 export function resolveStageDispatchRoles(
   stage: StageDef,
-  ctx: Pick<StageContext, "flags" | "cwd" | "resolveDevAgent">,
+  ctx: StageResolutionContext,
 ): string[] {
   return resolveStageDispatchSlots(stage, ctx).map((slot) => slot.role);
 }
 
-function expandRole(role: string, stageId: string, ctx: Pick<StageContext, "resolveDevAgent">): string {
+function expandRole(
+  role: string,
+  stageId: string,
+  ctx: Pick<StageContext, "resolveDevAgent" | "effectivePolicy">,
+): string {
   if (role === "${scope.dev_agent}") {
     const agent = ctx.resolveDevAgent();
-    if (!agent || !agent.trim()) throw new DevAgentUnavailableError(stageId);
-    return agent;
+    const policy = ctx.effectivePolicy;
+    const qualified = policy?.scope_map.find((rule) =>
+      rule.dev_agent.registered_name === agent
+      && rule.dev_agent.provider_id === policy.provider.id
+    )?.dev_agent;
+    if (!agent || !agent.trim() || !qualified) throw new DevAgentUnavailableError(stageId);
+    return qualified.registered_name;
   }
   return role;
 }
@@ -946,10 +1535,12 @@ function applyConditionalOccurrences(
   }
   return result;
 }
-
-function applyRosterOverrides(roster: string[], cwd: string, stageId: string): string[] {
-  const config = resolveConfig(cwd);
-  const override = config.roster_overrides[stageId];
+function applyRosterOverrides(
+  roster: string[],
+  policy: Readonly<EffectivePolicy> | undefined,
+  stageId: string,
+): string[] {
+  const override = rosterOverrideFor(policy, stageId);
   if (!override) return [...roster];
   if (override.replace) return [...override.replace];
   const result = [...roster];
@@ -972,6 +1563,14 @@ export interface RosterSelectionOccurrence {
 
 export interface RosterSelectionContext {
   cwd: string;
+  /** Immutable identity and catalog selected by host admission. */
+  project_identity: Readonly<ProjectIdentity>;
+  run_identity: Readonly<WorkflowRunIdentity>;
+  catalog?: Readonly<ProviderCatalog>;
+  /** Validated effective policy from the selected provider. */
+  effectivePolicy?: Readonly<EffectivePolicy>;
+  /** Agent inventory preflighted against the selected provider descriptor. */
+  agentInventory?: readonly AgentRef[];
   flags: ScopeFlags;
   resolveDevAgent: () => string | null;
   state?: TeamState;
@@ -993,14 +1592,14 @@ export interface RosterSelectionContext {
 }
 
 export type RosterSelectionResult =
-  | { ok: true; selection: RosterSelection; slots: DispatchSlot[]; expected_roster: Array<{ role: string; agent: string }> }
-  | { ok: false; error: string; code: "policy_invalid" | "selection_invalid" | "mapping_invalid" | "selection_conflict" };
+  | { ok: true; selection: RosterSelection | undefined; slots: DispatchSlot[]; expected_roster: Array<{ role: string; agent: string }> }
+  | { ok: false; error: string; code: "policy_invalid" | "selection_invalid" | "mapping_invalid" | "selection_conflict"; diagnostic?: WorkflowV2Diagnostic };
 
 function canonicalRosterValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalRosterValue);
-  if (value && typeof value === "object") {
+  if (isObject(value)) {
     return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
+      Object.entries(value)
         .sort(([left], [right]) => left.localeCompare(right))
         .map(([key, item]) => [key, canonicalRosterValue(item)]),
     );
@@ -1043,7 +1642,8 @@ function rosterPolicyIssues(stage: StageDef, policy: RosterPolicy): string[] {
 }
 
 function triggerFacts(stage: StageDef, ctx: RosterSelectionContext): string[] {
-  const policy = stage.roster_policy!;
+  const policy = stage.roster_policy;
+  if (!policy) return [];
   const classification = ctx.state?.classification;
   const facts: string[] = [];
   if (classification && policy.triggers.complexity.includes(classification.complexity)) facts.push(`complexity:${classification.complexity}`);
@@ -1071,9 +1671,18 @@ function selectionRoleBound(policy: RosterPolicy, role: string): { min: number; 
 }
 
 function selectionRoleAgent(role: string, ctx: RosterSelectionContext): string | null {
-  const config = resolveConfig(ctx.cwd);
-  const resolved = ctx.resolveAgent?.(role) ?? config.agent_mapping?.resolved_roles[role] ?? config.roles[role] ?? role;
-  return resolved.trim() || null;
+  const policy = ctx.effectivePolicy;
+  if (!policy) return null;
+  const ref = policy.roles[role];
+  if (!ref || ref.provider_id !== policy.provider.id) return null;
+  const inventory = ctx.agentInventory;
+  if (!inventory) return null;
+  const inventoryRef = inventory.find((candidate) =>
+    candidate.registered_name === ref.registered_name
+    && candidate.provider_id === ref.provider_id
+    && candidate.source_fingerprint === ref.source_fingerprint,
+  );
+  return inventoryRef?.registered_name ?? null;
 }
 
 function normalizeSelectionEntries(
@@ -1103,6 +1712,88 @@ function normalizeSelectionEntries(
   return { entries, slots };
 }
 
+interface RosterBindingSnapshot {
+  readonly runKey: string;
+  readonly workflow: TeamState["classification"]["workflow"];
+  readonly profileHash: string;
+  readonly capabilityEpoch: string;
+  readonly waveId: string;
+  readonly sliceId: string;
+  readonly sessionId: string;
+}
+
+function requireRosterBinding(
+  stageId: string,
+  ctx: RosterSelectionContext,
+  providerContext: QualifiedProviderContextSnapshot,
+): RosterBindingSnapshot {
+  const profile = providerContext.run_identity.profile_identity;
+  const runKey = requiredBindingString(ctx.run_key, stageId, "run_key");
+  const workflow = requiredWorkflowName(ctx.workflow, stageId, "workflow");
+  const profileHash = requiredBindingString(ctx.profile_hash, stageId, "profile_hash");
+  const capabilityEpoch = requiredBindingString(ctx.capability_epoch, stageId, "capability_epoch");
+  if (workflow !== profile.id || profileHash !== profile.fingerprint) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "roster selection profile binding differs from the selected workflow identity",
+      "IDENTITY_MISMATCH",
+      { field: workflow !== profile.id ? "workflow" : "profile_hash", profile_id: profile.id },
+    );
+  }
+  let stateBinding: StageBindingSnapshot | undefined;
+  if (ctx.state) stateBinding = requireStageStateBinding(ctx, stageId, providerContext, false);
+  if (stateBinding && (
+    stateBinding.runKey !== runKey
+    || stateBinding.workflow !== workflow
+    || stateBinding.profileHash !== profileHash
+  )) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "roster selection binding differs from workflow state",
+      "IDENTITY_MISMATCH",
+      { field: "roster_selection" },
+    );
+  }
+  if (ctx.existing_selection && ctx.existing_selection.capability_epoch !== capabilityEpoch) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "roster selection capability epoch is stale",
+      "IDENTITY_MISMATCH",
+      { field: "capability_epoch" },
+    );
+  }
+  const workIdentity = ctx.state?.work_identity;
+  const waveIdCandidate = ctx.wave_id !== undefined ? ctx.wave_id : workIdentity?.wave_id;
+  const sliceIdCandidate = ctx.slice_id !== undefined ? ctx.slice_id : workIdentity?.slice_id;
+  const sessionIdCandidate = ctx.session_id !== undefined
+    ? ctx.session_id
+    : providerContext.run_identity.session.session_id;
+  const waveId = requiredBindingString(waveIdCandidate, stageId, "wave_id");
+  const sliceId = requiredBindingString(sliceIdCandidate, stageId, "slice_id");
+  const sessionId = requiredBindingString(sessionIdCandidate, stageId, "session_id");
+  if (sessionId !== providerContext.run_identity.session.session_id) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "roster selection session differs from the workflow run identity",
+      "IDENTITY_MISMATCH",
+      { field: "session_id" },
+    );
+  }
+  if (workIdentity && (
+    workIdentity.wave_id !== waveId
+    || workIdentity.slice_id !== sliceId
+    || workIdentity.session_id !== sessionId
+  )) {
+    throw new WorkflowStageIdentityError(
+      stageId,
+      "roster selection work identity differs from the supplied state binding",
+      "IDENTITY_MISMATCH",
+      { field: "work_identity" },
+    );
+  }
+  return { runKey, workflow, profileHash, capabilityEpoch, waveId, sliceId, sessionId };
+}
+
 /**
  * Validate and freeze a bounded adaptive roster before capability issuance.
  * The selector is deterministic for identical policy/context/proposals and
@@ -1110,21 +1801,64 @@ function normalizeSelectionEntries(
  */
 export function selectRoster(stage: StageDef, ctx: RosterSelectionContext): RosterSelectionResult {
   const policy = stage.roster_policy;
+  const dispatchStage = stage.type === "single" || stage.type === "consilium";
+  let providerContext: QualifiedProviderContextSnapshot | undefined;
+  if (policy || dispatchStage) {
+    try {
+      providerContext = requireQualifiedProviderContext(ctx, stage.id);
+    } catch (error) {
+      const detail = error instanceof WorkflowStageIdentityError ? error.message : "selected-provider dispatch context is invalid";
+      const code = error instanceof WorkflowStageIdentityError ? error.diagnostic.code : "MIGRATION_REQUIRED";
+      const diagnostic = error instanceof WorkflowStageIdentityError ? error.diagnostic : undefined;
+      return {
+        ok: false,
+        code: code === "IDENTITY_MISMATCH" ? "selection_conflict" : "mapping_invalid",
+        error: `${code}: ${detail}`,
+        ...(diagnostic ? { diagnostic } : {}),
+      };
+    }
+  }
   if (!policy) {
     const slots = resolveStageDispatchSlots(stage, ctx);
+    const expected_roster: Array<{ role: string; agent: string }> = [];
+    for (const slot of slots) {
+      const agent = selectionRoleAgent(slot.role, ctx);
+      if (!agent) {
+        return { ok: false, code: "mapping_invalid", error: "selected roster contains an unmapped qualified role" };
+      }
+      expected_roster.push({ role: slot.slot, agent });
+    }
     return {
       ok: true,
       slots,
-      expected_roster: slots.map((slot) => ({ role: slot.slot, agent: selectionRoleAgent(slot.role, ctx) ?? slot.role })),
-      selection: undefined as never,
+      expected_roster,
+      selection: undefined,
     };
   }
   const issues = rosterPolicyIssues(stage, policy);
   if (issues.length > 0) return { ok: false, code: "policy_invalid", error: issues.join("; ") };
-  const profileHash = ctx.profile_hash ?? ctx.state?.profile_hash ?? "unresolved-profile";
-  const runKey = ctx.run_key ?? ctx.state?.run_key ?? ctx.state?.branch ?? "run";
-  const workflow = ctx.workflow ?? ctx.state?.classification.workflow ?? "standard";
-  const capabilityEpoch = ctx.capability_epoch ?? ctx.existing_selection?.capability_epoch ?? `epoch-${rosterHash(`${runKey}|${stage.id}|${profileHash}`)}`;
+  if (!providerContext) {
+    return {
+      ok: false,
+      code: "mapping_invalid",
+      error: "selected-provider dispatch context is required for roster selection",
+    };
+  }
+  let rosterBinding: RosterBindingSnapshot;
+  try {
+    rosterBinding = requireRosterBinding(stage.id, ctx, providerContext);
+  } catch (error) {
+    const detail = error instanceof WorkflowStageIdentityError ? error.message : "roster selection identity is invalid";
+    const code = error instanceof WorkflowStageIdentityError ? error.diagnostic.code : "MIGRATION_REQUIRED";
+    const diagnostic = error instanceof WorkflowStageIdentityError ? error.diagnostic : undefined;
+    return {
+      ok: false,
+      code: code === "IDENTITY_MISMATCH" ? "selection_conflict" : "mapping_invalid",
+      error: `${code}: ${detail}`,
+      ...(diagnostic ? { diagnostic } : {}),
+    };
+  }
+  const { runKey, workflow, profileHash, capabilityEpoch, waveId, sliceId, sessionId } = rosterBinding;
   const policyHash = ctx.policy_hash ?? rosterHash(policy);
   const scopeHash = rosterHash(ctx.flags);
   const mapping: Record<string, string> = {};
@@ -1205,7 +1939,14 @@ export function selectRoster(stage: StageDef, ctx: RosterSelectionContext): Rost
   for (const role of policy.required_roles) if (roleCounts(role) < 1) return { ok: false, code: "selection_invalid", error: `required role '${role}' is not covered` };
   for (const facet of policy.required_facets) if (!proposals.some((entry) => entry.facet === facet)) return { ok: false, code: "selection_invalid", error: `required facet '${facet}' is not covered` };
   const normalized = normalizeSelectionEntries(roles, proposals);
-  const entries = normalized.entries.map((entry) => ({ ...entry, agent: mapping[entry.role]! }));
+  const entries: RosterSelectionEntry[] = [];
+  for (const entry of normalized.entries) {
+    const agent = mapping[entry.role];
+    if (!agent) {
+      return { ok: false, code: "mapping_invalid", error: `selected role '${entry.role}' has no available concrete agent mapping` };
+    }
+    entries.push({ ...entry, agent });
+  }
   const selectedSet = new Set(entries.map((entry) => entry.role));
   for (const role of policy.allowed_roles) if (!selectedSet.has(role)) omitted.push({ role, reason: triggered ? "risk threshold satisfied before optional role" : "optional role not required by minimum valid set" });
   const stop_reason: RosterSelection["stop_reason"] = budget !== null && roles.length >= budget
@@ -1218,10 +1959,10 @@ export function selectRoster(stage: StageDef, ctx: RosterSelectionContext): Rost
   const selectedAt = new Date().toISOString();
   const base = {
     run_key: runKey,
-    wave_id: ctx.wave_id ?? ctx.state?.work_identity?.wave_id ?? `wave-${runKey}`,
-    slice_id: ctx.slice_id ?? ctx.state?.work_identity?.slice_id ?? stage.id,
-    session_id: ctx.session_id ?? ctx.state?.work_identity?.session_id ?? `session-${runKey}`,
-    workflow: workflow as TeamState["classification"]["workflow"],
+    wave_id: waveId,
+    slice_id: sliceId,
+    session_id: sessionId,
+    workflow,
     stage_id: stage.id,
     profile_hash: profileHash,
     policy_hash: policyHash,
@@ -1237,10 +1978,19 @@ export function selectRoster(stage: StageDef, ctx: RosterSelectionContext): Rost
   };
   const snapshot_id = `selection-${rosterHash(base).slice(0, 32)}`;
   const selection: RosterSelection = { snapshot_id, ...base };
+  const slots: DispatchSlot[] = [];
+  for (let index = 0; index < normalized.slots.length; index += 1) {
+    const slot = normalized.slots[index];
+    const entry = entries[index];
+    if (!slot || !entry) {
+      return { ok: false, code: "selection_invalid", error: "normalized roster entries and slots are inconsistent" };
+    }
+    slots.push({ ...slot, slot_id: entry.slot_id, facet: entry.facet });
+  }
   return {
     ok: true,
     selection,
-    slots: normalized.slots.map((slot, index) => ({ ...slot, slot_id: entries[index]!.slot_id, facet: entries[index]!.facet })),
+    slots,
     expected_roster: entries.map((entry) => ({ role: entry.slot_id, agent: entry.agent })),
   };
 }

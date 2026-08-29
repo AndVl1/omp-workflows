@@ -1,25 +1,17 @@
 /**
- * Pure channel normalizer for `.omp/escalation.json` (architecture-4).
+ * Provider-neutral channel normalization for `.omp/escalation.json`.
  *
- * One and only one resolved channel profile: legacy single-adapter configs
- * ({adapter,bidirectional,http,telegram}) and explicit multi-channel configs
- * (`channels[]`) both normalize to `ChannelProfile[]`, and
- * `resolveChannelProfile(cwd)` picks THE profile the CTO run uses — RW
- * primary preferred, else first RO, else {direction:"none"}.
+ * Raw config parsing and capability normalization are deliberately unbound:
+ * they are observational helpers and can never authorize a notification.
+ * `resolveBoundChannelProfile` is the only path that creates a ChannelProfile
+ * usable by the run-bound control plane; it requires a complete
+ * WorkflowRunIdentity and stamps that identity onto the profile.
  *
- * Explicit entries carry an optional `id` — the per-entry handle that lets a
- * consumer (createChannelSet) bind each profile to its OWN config entry when
- * several entries share an adapter kind. Ambiguous same-kind groups (>=2
- * entries with no ids or duplicate ids) are excluded fail-closed — never
- * silently colliding; a single id-less entry per kind stays (legacy
- * fallback).
- *
- * Capability rule (config_contract.capability_rule): a declared
- * "read-write" channel is honored only when the adapter kind's capabilities
- * have inbound AND outbound (otherwise it downgrades to "ro"); a declared
- * "read-only" channel NEVER upgrades, even with full capabilities. When no
- * capabilities table is supplied, built-in defaults apply (telegram/mock =
- * rw, http and any other kind = ro).
+ * Legacy single-adapter configs (`{adapter,bidirectional,http,telegram}`) and
+ * explicit multi-channel configs (`channels[]`) normalize to unbound profiles.
+ * Resolution prefers the first RW primary, then the first RW profile, then
+ * the first RO primary, then the first RO profile, and otherwise returns
+ * `{direction:"none"}`.
  *
  * The only I/O is a node:fs read of the config file — everything else is
  * pure. Never throws.
@@ -28,6 +20,9 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ChannelDirection, ChannelProfile } from "./types.js";
+import { createDiagnostic, failureResult, successResult } from "../workflow-v2/diagnostics.js";
+import { validateWorkflowRunIdentity } from "../workflow-v2/identity.js";
+import type { DiagnosticResult, WorkflowRunIdentity } from "../workflow-v2/types.js";
 
 /** Declared explicit channel entry (config_contract.explicit). */
 export interface ExplicitChannelConfig {
@@ -37,7 +32,8 @@ export interface ExplicitChannelConfig {
   primary?: boolean;
   subscriptions?: string[];
 }
-
+/** Internal normalized shape; a run identity is added only after binding. */
+type UnboundChannelProfile = Omit<ChannelProfile, "run_identity">;
 /** Adapter-kind capabilities (architecture-2: direction derives from which optional methods are implemented). */
 export interface ChannelCapabilities {
   /** Implements pollOnce/setPlainMessageHandler (inbound). */
@@ -100,7 +96,7 @@ function entryAckTarget(entry: Record<string, unknown>): string | undefined {
 }
 
 /**
- * Normalize a raw escalation config into channel profiles.
+ * Normalize an unbound raw escalation config for observation only.
  *
  * - `channels[]` present → one profile per entry (direction from the config,
  *   capability rule applied; primary = declared flag; ackTarget passthrough;
@@ -114,11 +110,14 @@ function entryAckTarget(entry: Record<string, unknown>): string | undefined {
  *   telegram or `bidirectional === true` → "rw"; otherwise (http push-only or
  *   unknown adapter) → "ro". primary: true; ackTarget from telegram chatId.
  * - else → [] (no channel).
+ *
+ * The returned profiles intentionally carry no run identity. Callers that
+ * authorize notifications must use `resolveBoundChannelProfile` instead.
  */
 export function normalizeChannelConfig(
   config: Record<string, unknown> | null,
   capabilities?: Record<string, ChannelCapabilities>,
-): ChannelProfile[] {
+): UnboundChannelProfile[] {
   if (!config) return [];
   const channels = config.channels;
   if (Array.isArray(channels)) {
@@ -128,7 +127,7 @@ export function normalizeChannelConfig(
     // its OWN config entry — without it, two same-kind entries collide on
     // `entryFor(kind)` (first match wins) and the second profile silently
     // gets the wrong entry's config.
-    const candidates: Array<{ profile: ChannelProfile; key: string }> = [];
+    const candidates: Array<{ profile: UnboundChannelProfile; key: string }> = [];
     for (const entry of channels) {
       if (!entry || typeof entry !== "object") continue;
       const raw = entry as Record<string, unknown>;
@@ -177,31 +176,102 @@ export function normalizeChannelConfig(
 }
 
 /**
- * Resolve THE channel profile for a cwd: first RW profile (primary preferred)
- * → {direction:"rw", ...}; else first RO profile → {direction:"ro", ...};
- * else {direction:"none"}. Never throws.
+ * Resolve one unbound channel profile for observation only.
+ *
+ * This function deliberately cannot authorize a notification: its return
+ * value has no run identity. Use `resolveBoundChannelProfile` at every
+ * notification/dispatch boundary.
  */
 export function resolveChannelProfile(
   cwd: string,
   capabilities?: Record<string, ChannelCapabilities>,
-): ChannelProfile {
+): UnboundChannelProfile {
   const profiles = normalizeChannelConfig(loadEscalationConfigRaw(cwd), capabilities);
   const rw = profiles.filter((p) => p.direction === "rw");
   const ro = profiles.filter((p) => p.direction === "ro");
-  const primary = (list: ChannelProfile[]) => list.find((p) => p.primary === true) ?? list[0];
+  const primary = (list: UnboundChannelProfile[]) => list.find((p) => p.primary === true) ?? list[0];
   const chosen = primary(rw) ?? primary(ro);
   if (!chosen) return { direction: "none" };
   return {
     direction: chosen.direction,
     transport: chosen.transport,
     adapter: chosen.adapter,
+    ...(chosen.id !== undefined ? { id: chosen.id } : {}),
     ackTarget: chosen.ackTarget,
     primary: chosen.primary,
     subscriptions: chosen.subscriptions,
   };
 }
 
-/** True when the resolved channel is RW (validated inbound + outbound). */
+/** Resolve one channel only after validating the owning workflow run identity. */
+export function resolveBoundChannelProfile(
+  cwd: string,
+  runIdentity: WorkflowRunIdentity,
+  capabilities?: Record<string, ChannelCapabilities>,
+): DiagnosticResult<ChannelProfile> {
+  const validated = validateWorkflowRunIdentity(runIdentity);
+  if (!validated.ok) return validated;
+  const unbound = resolveChannelProfile(cwd, capabilities);
+  return successResult({
+    ...unbound,
+    run_identity: validated.value,
+  });
+}
+
+function sameProjectIdentity(left: WorkflowRunIdentity, right: WorkflowRunIdentity): boolean {
+  return left.root_instance_id === right.root_instance_id
+    && left.provider_id === right.provider_id
+    && left.descriptor_fingerprint === right.descriptor_fingerprint
+    && left.executable_provenance.build_fingerprint === right.executable_provenance.build_fingerprint
+    && left.executable_provenance.runtime_fingerprint === right.executable_provenance.runtime_fingerprint
+    && left.catalog_content_digest === right.catalog_content_digest
+    && left.config_byte_sha256 === right.config_byte_sha256
+    && left.config_semantic_sha256 === right.config_semantic_sha256
+    && left.session.session_id === right.session.session_id
+    && left.session.lifecycle_id === right.session.lifecycle_id;
+}
+
+function sameRunIdentity(left: WorkflowRunIdentity, right: WorkflowRunIdentity): boolean {
+  return sameProjectIdentity(left, right)
+    && left.run_id === right.run_id
+    && left.profile_identity.id === right.profile_identity.id
+    && left.profile_identity.fingerprint === right.profile_identity.fingerprint;
+}
+
+
+/** Check that a persisted channel profile still belongs to the current run. */
+export function validateChannelProfileIdentity(
+  profile: ChannelProfile,
+  runIdentity: WorkflowRunIdentity,
+): DiagnosticResult<ChannelProfile> {
+  const expected = validateWorkflowRunIdentity(runIdentity);
+  if (!expected.ok) return expected;
+
+  const missing = failureResult<ChannelProfile>(createDiagnostic({
+    code: "MIGRATION_REQUIRED",
+    operation: "runtime.activate",
+    evidence: { field: "channel_profile.run_identity" },
+    remediation: "Recreate the channel profile through the selected workflow run.",
+  }));
+  const actualValue = typeof profile === "object" && profile !== null && "run_identity" in profile
+    ? profile.run_identity
+    : undefined;
+  if (actualValue === undefined) return missing;
+  const actual = validateWorkflowRunIdentity(actualValue);
+  if (!actual.ok) return missing;
+
+  if (!sameRunIdentity(actual.value, expected.value)) {
+    return failureResult(createDiagnostic({
+      code: "IDENTITY_MISMATCH",
+      operation: "runtime.activate",
+      evidence: { provider_id: expected.value.provider_id, field: "channel_profile.run_identity" },
+      remediation: "Discard the stale channel profile and resolve a new one for the current workflow run.",
+    }));
+  }
+  return successResult(profile);
+}
+
+/** True when the unbound observation resolves to an RW channel. */
 export function hasRwPrimary(cwd: string, capabilities?: Record<string, ChannelCapabilities>): boolean {
   return resolveChannelProfile(cwd, capabilities).direction === "rw";
 }

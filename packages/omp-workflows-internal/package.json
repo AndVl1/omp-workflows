@@ -2,7 +2,7 @@
   "name": "@andvl1/omp-workflows-internal",
   "version": "0.0.0",
   "private": true,
-  "description": "Private OMP bundle: workspace-marker-gated workflow engine activation for this monorepo only. Activates exclusively when the project root contains ALL workspace markers (package.json + packages/core + packages/fullstack); fails closed otherwise.",
+  "description": "Private protocol-v2 workflow provider with a narrowed omp-* agent catalog. Publication is explicit, workspace-marker-gated admission; the core host owns canonical commands and tools.",
   "type": "module",
   "license": "MIT",
   "main": "./dist/index.js",

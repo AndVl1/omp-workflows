@@ -4,7 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { detectWorkspaceMarkers } from "../src/activation.js";
+import {
+	createDescriptorRelativeFsAuthority,
+} from "@andvl1/omp-workflows-core";
+import { createTestDescriptorRelativeFsAuthority } from "../../core/src/workflow-v2/fs-authority.js";
+import {
+	createTestWorkspaceMarkerCapability,
+	detectWorkspaceMarkers,
+} from "../src/activation.js";
+
+const filesystemAuthority = createDescriptorRelativeFsAuthority({
+	native: createTestDescriptorRelativeFsAuthority(),
+});
 
 function makeRoot({ packageJson = false, core = false, fullstack = false, tsFiles = false } = {}): string {
 	const root = mkdtempSync(join(tmpdir(), "omp-internal-activation-"));
@@ -16,9 +27,13 @@ function makeRoot({ packageJson = false, core = false, fullstack = false, tsFile
 	return root;
 }
 
+function detect(root: string) {
+	return detectWorkspaceMarkers(createTestWorkspaceMarkerCapability(root, filesystemAuthority));
+}
+
 test("all three markers present -> ok with the observed marker set", () => {
 	const root = makeRoot({ packageJson: true, core: true, fullstack: true });
-	const result = detectWorkspaceMarkers(root);
+	const result = detect(root);
 	assert.equal(result.ok, true);
 	if (!result.ok) return;
 	assert.deepEqual(
@@ -35,7 +50,7 @@ test("each missing marker alone fails closed with the typed missing list", () =>
 		[{ packageJson: true, core: true }, ["packages/fullstack"]],
 	];
 	for (const [shape, expectedMissing] of cases) {
-		const result = detectWorkspaceMarkers(makeRoot(shape));
+		const result = detect(makeRoot(shape));
 		assert.equal(result.ok, false);
 		if (result.ok) continue;
 		assert.equal(result.code, "activation_markers_missing");
@@ -47,7 +62,7 @@ test("each missing marker alone fails closed with the typed missing list", () =>
 });
 
 test("detection never keys off .ts source files", () => {
-	const result = detectWorkspaceMarkers(makeRoot({ tsFiles: true }));
+	const result = detect(makeRoot({ tsFiles: true }));
 	assert.equal(result.ok, false);
 	if (!result.ok) assert.equal(result.code, "activation_markers_missing");
 });
@@ -55,19 +70,25 @@ test("detection never keys off .ts source files", () => {
 test("a package.json directory instead of file does not satisfy the marker", () => {
 	const root = makeRoot({ core: true, fullstack: true });
 	mkdirSync(join(root, "package.json"), { recursive: true });
-	const result = detectWorkspaceMarkers(root);
+	const result = detect(root);
 	assert.equal(result.ok, false);
-	if (!result.ok) assert.deepEqual(result.missing.map((m) => m.name), ["package.json"]);
+	if (!result.ok) assert.deepEqual(result.missing.map((marker) => marker.name), ["package.json"]);
 });
 
 test("symlinked markers count as missing (physical layout required)", () => {
 	const realCore = mkdtempSync(join(tmpdir(), "omp-internal-core-real-"));
 	const root = makeRoot({ packageJson: true, fullstack: true });
 	symlinkSync(realCore, join(root, "packages", "core"), "dir");
-	const result = detectWorkspaceMarkers(root);
+	const result = detect(root);
 	assert.equal(result.ok, false);
 	if (!result.ok) {
 		assert.equal(result.code, "activation_markers_missing");
 		assert.deepEqual(result.missing.map((marker) => marker.name), ["packages/core"]);
 	}
+});
+
+test("a forged marker capability cannot trigger descriptor-relative inspection", () => {
+	const result = detectWorkspaceMarkers({} as never);
+	assert.equal(result.ok, false);
+	if (!result.ok) assert.deepEqual(result.missing.map((marker) => marker.name), ["package.json", "packages/core", "packages/fullstack"]);
 });

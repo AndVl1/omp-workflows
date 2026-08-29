@@ -31,6 +31,7 @@ import {
   type ObservabilityPointer,
   type ObservabilityRollup,
 } from "./events.js";
+import { validateWorkflowRunIdentity } from "../workflow-v2/identity.js";
 import type {
   CompletionArtifactRef,
   CompletionEnvelope,
@@ -79,6 +80,20 @@ const TERMINAL_STATUSES: Record<string, true> = {
 };
 const SAFE_TOKEN = /^[A-Za-z0-9._:@/#-]+$/;
 const SENSITIVE_TEXT = /(prompt|transcript|secret|password|passwd|bearer|authorization|api[\s_-]*key|private[\s_-]*key|access[\s_-]*token|system\s+message|user\s+message)/i;
+
+function isCompletionOutcome(value: unknown): value is CompletionOutcome {
+  return value === "pending"
+    || value === "succeeded"
+    || value === "failed"
+    || value === "cancelled";
+}
+
+function isCompletionTerminalSignal(value: unknown): value is CompletionTerminalSignal {
+  return value === "workflow_complete"
+    || value === "native_tool_result"
+    || value === "provider_terminal"
+    || value === "contract_failure";
+}
 
 function hashText(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex").slice(0, 32);
@@ -219,10 +234,19 @@ function sanitizeCompletionEnvelope(root: string, value: unknown): CompletionEnv
   if (!record) return undefined;
   const identity = identityFrom(record.identity);
   if (!identity || record.schema_version !== 1) return undefined;
+  const runIdentityResult = validateWorkflowRunIdentity(record.run_identity);
+  if (
+    !runIdentityResult.ok
+    || runIdentityResult.value.run_id !== identity.run_id
+    || runIdentityResult.value.session.session_id !== identity.session_id
+  ) return undefined;
   const outcome = record.outcome;
-  if (outcome !== "pending" && TERMINAL_OUTCOMES[outcome as string] !== true) return undefined;
-  const terminalSignal = record.terminal_signal;
-  if (terminalSignal !== null && terminalSignal !== undefined && TERMINAL_SIGNALS[terminalSignal as CompletionTerminalSignal] !== true) return undefined;
+  if (!isCompletionOutcome(outcome)) return undefined;
+  let terminalSignal: CompletionEnvelope["terminal_signal"] = null;
+  if (record.terminal_signal !== null && record.terminal_signal !== undefined) {
+    if (!isCompletionTerminalSignal(record.terminal_signal)) return undefined;
+    terminalSignal = record.terminal_signal;
+  }
   const artifactRefs: CompletionArtifactRef[] = [];
   if (!Array.isArray(record.artifact_refs)) return undefined;
   for (const candidate of record.artifact_refs.slice(0, MAX_ARTIFACTS)) {
@@ -249,8 +273,9 @@ function sanitizeCompletionEnvelope(root: string, value: unknown): CompletionEnv
   return {
     schema_version: 1,
     identity,
-    outcome: outcome as CompletionEnvelope["outcome"],
-    terminal_signal: terminalSignal === undefined ? null : terminalSignal as CompletionEnvelope["terminal_signal"],
+    run_identity: runIdentityResult.value,
+    outcome,
+    terminal_signal: terminalSignal,
     artifact_refs: artifactRefs,
     evidence_ref: evidenceRef ?? null,
     conflict_ref: conflictRef ?? null,
@@ -279,8 +304,14 @@ function sanitizeEvent(root: string, event: unknown): Omit<ObservabilityEvent, "
   if (typeof kind !== "string" || !validKinds.includes(kind as EventKind)) throw new Error("observability event kind is invalid");
   const ts = safeTimestamp(source.ts);
   if (!ts) throw new Error("observability event timestamp is invalid");
-  const rawEnvelope = sanitizeCompletionEnvelope(root, source.completion_envelope);
-  const identity = identityFrom(source.work_identity) ?? rawEnvelope?.identity;
+  const sourceIdentity = source.work_identity === undefined ? undefined : identityFrom(source.work_identity);
+  if (source.work_identity !== undefined && !sourceIdentity) throw new Error("observability work identity is invalid");
+  const rawEnvelope = source.completion_envelope === undefined
+    ? undefined
+    : sanitizeCompletionEnvelope(root, source.completion_envelope);
+  if (source.completion_envelope !== undefined && !rawEnvelope) throw new Error("observability completion envelope is invalid");
+  if (sourceIdentity && rawEnvelope && !sameIdentity(sourceIdentity, rawEnvelope.identity)) throw new Error("completion envelope identity mismatch");
+  const identity = sourceIdentity ?? rawEnvelope?.identity;
   const output: Record<string, unknown> = { kind, ts };
   if (identity) {
     output.work_identity = identity;

@@ -1,4 +1,5 @@
 /**
+ * <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core -->
  * Integration test for the OMP hook → recorder → TeamState pipeline.
  *
  * Drives the public `observabilityHooks` with synthetic OMP event payloads
@@ -38,6 +39,8 @@ import { observabilityHooks, flushRecorder } from "../../src/observability/hooks
 import { writeState } from "../../src/engine/state.js";
 import type { TeamState } from "../../src/engine/types.js";
 
+import { readWorkflowProfile, workflowV2Fixture } from "../workflow-v2-fixtures.js";
+
 function withTempDir(): { cwd: string; cleanup: () => void } {
   const cwd = mkdtempSync(join(tmpdir(), "omp-obs-int-"));
   return { cwd, cleanup: () => rmSync(cwd, { recursive: true, force: true }) };
@@ -51,17 +54,28 @@ function pinActiveFeature(cwd: string, slug: string): void {
 
 const ctx = (cwd: string): unknown => ({ cwd });
 
+const observabilityFixture = workflowV2Fixture(readWorkflowProfile("lightweight"));
+
 function makeInitialState(branch: string): TeamState {
+  const workflow = observabilityFixture.profile.name;
   return {
     schema: 1,
     branch,
-    classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", workflow: "lightweight", autonomous: false },
+    project_identity: observabilityFixture.project_identity,
+    run_identity: observabilityFixture.run_identity,
+    classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", workflow, autonomous: false },
+    workflow,
     task: "synthetic workflow",
     workflow_override: false,
     issue: null,
     stage_cursor: "discovery",
+    cursor_epoch: "observability-test-epoch",
     stages: [{ id: "discovery", status: "pending" }],
     artifacts: {},
+    scope: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null },
+    policy: { strict_orchestrator: true },
+    profile_hash: observabilityFixture.profile_identity.fingerprint,
+    run_key: branch,
     pause: { kind: "none", reason: "" },
     updated_at: new Date().toISOString(),
   };

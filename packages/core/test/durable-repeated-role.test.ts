@@ -1,5 +1,6 @@
 /**
  * br-eu6 regression tests: repeated semantic stage roles resolve to stable
+ * <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core -->
  * unique dispatch slot identities, and `advanceCursor` atomically arms the
  * next stage's ready capability together with its `in_progress` cursor.
  *
@@ -20,7 +21,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, profileHash } from "../src/engine/profile.js";
+import { readWorkflowProfile, qualifiedRoster, workIdentityFixture, workIdentityScopeFixture, workflowV2Fixture, type WorkflowV2TestFixture } from "./workflow-v2-fixtures.js";
 import { resolveStageDispatchSlots, resolveStageDispatchRoles } from "../src/engine/stage.js";
 import { createCapability, beginCapability, authorizeDispatch, completeDispatch, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
 import { checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
@@ -30,6 +31,33 @@ import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TeamState } from "../src/engine/types.js";
 
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
+function capabilityContext(fixture: WorkflowV2TestFixture) {
+  return {
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    catalog: fixture.catalog,
+    effective_policy: fixture.effective_policy,
+    agent_inventory: fixture.agent_inventory,
+  };
+}
+
+function stageContext(fixture: WorkflowV2TestFixture) {
+  return {
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    catalog: fixture.catalog,
+    effectivePolicy: fixture.effective_policy,
+    agentInventory: fixture.agent_inventory,
+  };
+}
+
+function identityFields(fixture: WorkflowV2TestFixture) {
+  return {
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    profile_hash: fixture.profile_identity.fingerprint,
+  };
+}
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
@@ -50,11 +78,11 @@ function trustedCheckpoint(root: string, stageId: string, checkpointId: string, 
   return trusted;
 }
 test("br-eu6: repeated analyst roles normalize to unique dispatch slots that both map to the analyst agent", () => {
-  const profile = loadProfile("full-feature");
-  assert.ok(profile, "full-feature profile must be available");
+  const profile = readWorkflowProfile("full-feature");
+  const fixture = workflowV2Fixture(profile);
   const exploration = profile.stages.find((stage) => stage.id === "exploration");
   assert.ok(exploration, "full-feature exploration stage must exist");
-  const ctx = { cwd: process.cwd(), flags: NO_SCOPE, resolveDevAgent: () => null as string | null };
+  const ctx = { cwd: process.cwd(), flags: NO_SCOPE, resolveDevAgent: () => null as string | null, ...stageContext(fixture) };
   const slots = resolveStageDispatchSlots(exploration, ctx);
   assert.deepEqual(slots.map((slot) => slot.slot), ["analyst#1", "tech-researcher", "analyst#2"], "repeated roles get unique numbered slots");
   assert.deepEqual(slots.map((slot) => slot.role), ["analyst", "tech-researcher", "analyst"], "semantic roles are preserved");
@@ -72,15 +100,17 @@ test("br-eu6: full-feature exploration issues a valid consilium capability; mark
   const root = mkdtempSync(join(tmpdir(), "br-eu6-cap-"));
   try {
     initGit(root, "feat/repeat");
-    const profile = loadProfile("full-feature");
-    assert.ok(profile);
-    const persistedProfileHash = profileHash(profile);
+    const profile = readWorkflowProfile("full-feature");
+    const fixture = workflowV2Fixture(profile);
     const exploration = profile.stages.find((stage) => stage.id === "exploration");
     assert.ok(exploration);
     writeState(root, {
       schema: 1,
       branch: "feat/repeat",
       run_key: "feat/repeat",
+      workflow: "full-feature",
+      ...identityFields(fixture),
+      work_identity: workIdentityFixture(fixture, { workflow: "full-feature", stage_id: "exploration", slot_id: "analyst#1" }),
       classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "full-feature" },
       task: "repeated analyst regression",
       workflow_override: false,
@@ -90,12 +120,12 @@ test("br-eu6: full-feature exploration issues a valid consilium capability; mark
       artifacts: {},
       pause: { kind: "none" as const, reason: "" },
       policy: { strict_orchestrator: true },
-      profile_hash: persistedProfileHash,
       scope: NO_SCOPE,
+      cursor_epoch: "exploration-epoch",
       updated_at: new Date().toISOString(),
     }, { featureSlug: "repeat" });
 
-    const begun = beginCapability(root);
+    const begun = beginCapability(root, capabilityContext(fixture));
     assert.equal(begun.ok, true, "consilium capability with repeated roles must not be rejected");
     if (!begun.ok || !begun.handoff) return;
     const handoff = begun.handoff;
@@ -116,7 +146,7 @@ test("br-eu6: full-feature exploration issues a valid consilium capability; mark
       { agent: "analyst", task: markerFor("analyst#1") },
       { agent: "tech-researcher", task: markerFor("tech-researcher") },
       { agent: "analyst", task: markerFor("analyst#2") },
-    ] } }, { cwd: root });
+    ] } }, { cwd: root, ...capabilityContext(fixture) });
     assert.equal(batch, undefined, "gate accepts two distinct analyst slots");
 
     // Collapsing both occurrences onto one slot must be rejected.
@@ -124,7 +154,7 @@ test("br-eu6: full-feature exploration issues a valid consilium capability; mark
       { agent: "analyst", task: markerFor("analyst#1") },
       { agent: "tech-researcher", task: markerFor("tech-researcher") },
       { agent: "analyst", task: markerFor("analyst#1") },
-    ] } }, { cwd: root });
+    ] } }, { cwd: root, ...capabilityContext(fixture) });
     assert.equal(collapsed?.block, true, "marker validation cannot collapse analyst slots");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -135,17 +165,30 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
   const root = mkdtempSync(join(tmpdir(), "br-eu6-advance-"));
   try {
     initGit(root, "feat/repeat");
-    const profile = loadProfile("full-feature");
-    assert.ok(profile);
-    const persistedProfileHash = profileHash(profile);
+    const profile = readWorkflowProfile("full-feature");
+    const fixture = workflowV2Fixture(profile);
+    const persistedProfileHash = fixture.profile_identity.fingerprint;
+    const work_identity_scope = workIdentityScopeFixture(fixture, { workflow: "full-feature", stage_id: "discovery", slot_id: "discovery" });
     const issued = createCapability({
-      run_key: "feat/repeat", branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "discovery", kind: "none", expected_roster: [],
+      run_key: "feat/repeat",
+      branch: "feat/repeat",
+      workflow: "full-feature",
+      profile_hash: persistedProfileHash,
+      stage_cursor: "discovery",
+      kind: "none",
+      expected_roster: [],
+      work_identity_scope,
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
     });
     writeState(root, {
       schema: 1,
       branch: "feat/repeat",
       run_key: "feat/repeat",
+      workflow: "full-feature",
+      ...identityFields(fixture),
+      checkpoint_policy: profile.checkpoint_policy,
+      work_identity: issued.state.work_identity,
       classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "full-feature" },
       task: "orchestrator to consilium",
       workflow_override: false,
@@ -155,7 +198,6 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       artifacts: {},
       pause: { kind: "none" as const, reason: "" },
       policy: { strict_orchestrator: true },
-      profile_hash: persistedProfileHash,
       scope: NO_SCOPE,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
@@ -180,6 +222,8 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       capability_id: issued.capability_id,
       run_key: "feat/repeat", branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
       stage_cursor: "discovery", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
       checkpoint: "confirm_understanding",
       checkpoint_id: "confirm_understanding",
       checkpoint_kind: discoveryRule.kind,
@@ -188,7 +232,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       policy_hash: checkpointPolicyHash(discoveryPolicy),
       decision: "proceed",
       rationale: "fixture",
-    });
+    }, capabilityContext(fixture));
     assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
 
     const advanced = advanceCursor(root, {
@@ -196,8 +240,10 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       capability_id: issued.capability_id,
       run_key: "feat/repeat", branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
       stage_cursor: "discovery", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
       evidence: "discovery completed",
-    });
+    }, capabilityContext(fixture));
     assert.equal(advanced.ok, true);
     if (!advanced.ok || !advanced.handoff) return;
     assert.equal(advanced.state.stage_cursor, "exploration");
@@ -208,7 +254,6 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       { role: "tech-researcher", agent: "tech-researcher" },
       { role: "analyst#2", agent: "analyst" },
     ]);
-
     const auth = {
       token: advanced.handoff.dispatch_token,
       capability_id: advanced.handoff.capability_id,
@@ -218,10 +263,12 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       profile_hash: advanced.handoff.profile_hash,
       stage_cursor: advanced.handoff.stage_cursor,
       cursor_epoch: advanced.handoff.cursor_epoch,
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
     };
-    const a1 = authorizeDispatch(root, { ...auth, role: "analyst#1", agent: "analyst" });
-    const a2 = authorizeDispatch(root, { ...auth, role: "analyst#2", agent: "analyst" });
-    const tr = authorizeDispatch(root, { ...auth, role: "tech-researcher", agent: "tech-researcher" });
+    const a1 = authorizeDispatch(root, { ...auth, role: "analyst#1", agent: "analyst", agent_ref: fixture.effective_policy.roles.analyst });
+    const a2 = authorizeDispatch(root, { ...auth, role: "analyst#2", agent: "analyst", agent_ref: fixture.effective_policy.roles.analyst });
+    const tr = authorizeDispatch(root, { ...auth, role: "tech-researcher", agent: "tech-researcher", agent_ref: fixture.effective_policy.roles["tech-researcher"] });
     assert.equal(a1.ok, true);
     assert.equal(a2.ok, true);
     assert.equal(tr.ok, true);
@@ -244,7 +291,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
     assert.equal(complete(a2.record, "analyst#2", "analyst", ["exploration-analyst-2"]).ok, true);
     assert.equal(complete(tr.record, "tech-researcher", "tech-researcher", ["exploration-tech-researcher"]).ok, true);
 
-    const advanced2 = advanceCursor(root, { ...auth, token: advanced.handoff.advance_token, evidence: "exploration completed" });
+    const advanced2 = advanceCursor(root, { ...auth, token: advanced.handoff.advance_token, evidence: "exploration completed" }, capabilityContext(fixture));
     assert.equal(advanced2.ok, true, "consilium with two analyst slots joins, synthesizes and advances");
     if (!advanced2.ok) return;
     assert.equal(advanced2.state.stage_cursor, "clarify");
@@ -262,17 +309,30 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
   const root = mkdtempSync(join(tmpdir(), "br-eu6-single-"));
   try {
     initGit(root, "feat/single");
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    const persistedProfileHash = profileHash(profile);
+    const profile = readWorkflowProfile("lightweight");
+    const fixture = workflowV2Fixture(profile);
+    const persistedProfileHash = fixture.profile_identity.fingerprint;
+    const work_identity_scope = workIdentityScopeFixture(fixture, { workflow: "lightweight", stage_id: "implementation", slot_id: "${scope.dev_agent}" });
     const issued = createCapability({
-      run_key: "feat/single", branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
-      stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }],
+      run_key: "feat/single",
+      branch: "feat/single",
+      workflow: "lightweight",
+      profile_hash: persistedProfileHash,
+      stage_cursor: "implementation",
+      kind: "single",
+      expected_roster: qualifiedRoster(fixture, [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }]),
+      work_identity_scope,
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
     });
     writeState(root, {
       schema: 1,
       branch: "feat/single",
       run_key: "feat/single",
+      workflow: "lightweight",
+      ...identityFields(fixture),
+      checkpoint_policy: profile.checkpoint_policy,
+      work_identity: issued.state.work_identity,
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
       task: "single to single",
       workflow_override: false,
@@ -282,7 +342,6 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
       artifacts: {},
       pause: { kind: "none" as const, reason: "" },
       policy: { strict_orchestrator: true },
-      profile_hash: persistedProfileHash,
       scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
@@ -301,11 +360,15 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
       run_key: "feat/single", branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
       stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch,
       role: "${scope.dev_agent}", agent: "developer-kotlin",
+      agent_ref: fixture.effective_policy.roles["${scope.dev_agent}"],
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
     };
     const authorized = authorizeDispatch(root, auth);
     assert.equal(authorized.ok, true);
     if (!authorized.ok || !authorized.record) return;
     assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed" }).ok, true);
+    const trusted = trustedCheckpoint(root, "implementation", "approve_implementation", "proceed");
 
     // lightweight implementation declares a checkpoint; record it durably
     // before the advance is allowed.
@@ -314,13 +377,13 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
     const implementationPolicy = profile.checkpoint_policy;
     assert.ok(implementationPolicy);
     const implementationRule = implementationPolicy.rules.approve_implementation;
-    assert.ok(implementationRule);
-    const trusted = trustedCheckpoint(root, "implementation", "approve_implementation", "proceed");
     const checkpoint = recordCheckpointDecision(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/single", branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
       stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
       checkpoint: "approve_implementation",
       checkpoint_id: "approve_implementation",
       checkpoint_kind: implementationRule.kind,
@@ -329,22 +392,21 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
       policy_hash: checkpointPolicyHash(implementationPolicy),
       decision: "proceed",
       rationale: "fixture",
-    });
+    }, capabilityContext(fixture));
     assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
 
-    const advanced = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "implementation completed" });
-    assert.equal(advanced.ok, true);
+    const advanced = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "implementation completed" }, capabilityContext(fixture));
     if (!advanced.ok) return;
     assert.equal(advanced.state.stage_cursor, "code_review");
     assert.equal(advanced.state.dispatch_capability?.status, "ready");
     assert.equal(advanced.state.dispatch_capability?.kind, "single");
-    assert.deepEqual(advanced.state.dispatch_capability?.expected_roster, [{ role: "code-reviewer", agent: "code-reviewer" }]);
+    assert.deepEqual(advanced.state.dispatch_capability?.expected_roster, qualifiedRoster(fixture, [{ role: "code-reviewer", agent: "code-reviewer" }]));
     assert.equal(advanced.state.stages.find((s) => s.id === "code_review")?.status, "in_progress", "single-to-single lands on an executable in_progress stage");
 
     const codeReview = profile.stages.find((stage) => stage.id === "code_review");
     assert.ok(codeReview);
     const marker = buildDispatchMarker("feat/single", codeReview, ["code-reviewer"], "code-reviewer", advanced.state.cursor_epoch);
-    const gate = dispatchGate({ toolName: "task", input: { agent: "code-reviewer", role: "code-reviewer", task: marker } }, { cwd: root });
+    const gate = dispatchGate({ toolName: "task", input: { agent: "code-reviewer", role: "code-reviewer", task: marker } }, { cwd: root, ...capabilityContext(fixture) });
     assert.equal(gate, undefined, "armed next stage is immediately executable");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -356,9 +418,10 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
   const branch = "feat/reopen";
   try {
     initGit(root, branch);
-    const profile = loadProfile("full-feature");
-    assert.ok(profile);
-    const persistedProfileHash = profileHash(profile);
+    const profile = readWorkflowProfile("full-feature");
+    const fixture = workflowV2Fixture(profile);
+    const persistedProfileHash = fixture.profile_identity.fingerprint;
+    const work_identity_scope = workIdentityScopeFixture(fixture, { workflow: "full-feature", stage_id: "exploration", slot_id: "analyst#1" });
     const issued = createCapability({
       run_key: branch,
       branch,
@@ -366,16 +429,22 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       profile_hash: persistedProfileHash,
       stage_cursor: "exploration",
       kind: "consilium",
-      expected_roster: [
+      expected_roster: qualifiedRoster(fixture, [
         { role: "analyst#1", agent: "analyst" },
         { role: "tech-researcher", agent: "tech-researcher" },
         { role: "analyst#2", agent: "analyst" },
-      ],
+      ]),
+      work_identity_scope,
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
     });
     const initialState: TeamState = {
       schema: 1,
       branch,
       run_key: branch,
+      workflow: "full-feature",
+      ...identityFields(fixture),
+      work_identity: issued.state.work_identity,
       classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "full-feature" },
       task: "reopen stale bindings",
       workflow_override: false,
@@ -385,7 +454,6 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       artifacts: { discovery: "artifacts/discovery.json", feature_spec: "artifacts/feature_spec.json" },
       pause: { kind: "none", reason: "" },
       policy: { strict_orchestrator: true },
-      profile_hash: persistedProfileHash,
       scope: NO_SCOPE,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
@@ -419,10 +487,12 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       profile_hash: persistedProfileHash,
       stage_cursor: "exploration",
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
     };
     const oldRecords: Array<{ role: string; agent: string; id: string }> = [];
     for (const item of oldArtifacts) {
-      const authorized = authorizeDispatch(root, { ...oldAuth, role: item.role, agent: item.agent });
+      const authorized = authorizeDispatch(root, { ...oldAuth, role: item.role, agent: item.agent, agent_ref: fixture.effective_policy.roles[item.agent] });
       assert.equal(authorized.ok, true);
       if (!authorized.ok || !authorized.record) return;
       const completed = completeDispatch(root, {
@@ -453,7 +523,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     writeFileSync(downstreamPath, "downstream");
     writeState(root, staleState, { featureSlug: "reopen" });
 
-    const begun = beginCapability(root);
+    const begun = beginCapability(root, capabilityContext(fixture));
     assert.equal(begun.ok, true);
     if (!begun.ok || !begun.handoff) return;
     assert.deepEqual(begun.state.artifacts, initialState.artifacts, "upstream state.artifacts survives the reopen");
@@ -487,10 +557,12 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       profile_hash: fresh.profile_hash,
       stage_cursor: fresh.stage_cursor,
       cursor_epoch: fresh.cursor_epoch,
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
     };
     writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "reopen stale bindings", branch }));
     const first = oldArtifacts[0]!;
-    const firstAuth = authorizeDispatch(root, { ...freshAuth, role: first.role, agent: first.agent });
+    const firstAuth = authorizeDispatch(root, { ...freshAuth, role: first.role, agent: first.agent, agent_ref: fixture.effective_policy.roles[first.agent] });
     assert.equal(firstAuth.ok, true);
     if (!firstAuth.ok || !firstAuth.record) return;
     const missingOldFile = completeDispatch(root, {
@@ -512,7 +584,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       writeFileSync(join(artifactsDir, dodId + ".json"), JSON.stringify({ items: [{ criterion: "fresh", verify_method: "focused regression", status: "pending" }] }));
     }
     const freshRecords = [{ role: first.role, agent: first.agent, id: firstAuth.record.id }, ...oldArtifacts.slice(1).map((item) => {
-      const authorized = authorizeDispatch(root, { ...freshAuth, role: item.role, agent: item.agent });
+      const authorized = authorizeDispatch(root, { ...freshAuth, role: item.role, agent: item.agent, agent_ref: fixture.effective_policy.roles[item.agent] });
       assert.equal(authorized.ok, true);
       if (!authorized.ok || !authorized.record) throw new Error("fresh dispatch authorization failed");
       return { role: item.role, agent: item.agent, id: authorized.record.id };
@@ -531,7 +603,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       });
       assert.equal(completed.ok, true);
     }
-    const advanced = advanceCursor(root, { ...freshAuth, token: fresh.advance_token, evidence: "fresh exploration completed" });
+    const advanced = advanceCursor(root, { ...freshAuth, token: fresh.advance_token, evidence: "fresh exploration completed" }, capabilityContext(fixture));
     assert.equal(advanced.ok, true, "fresh downstream artifacts complete after stale bindings are cleared");
     if (advanced.ok) assert.equal(advanced.state.stage_cursor, "clarify");
   } finally {

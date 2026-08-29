@@ -4,92 +4,69 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { ALLOWED_POOL_AGENTS } from "../src/pool.js";
-import { loadOmpWorkflowProfiles } from "../src/profiles.js";
+import {
+	computeDescriptorFingerprint,
+	isProviderId,
+	isWorkflowV2Digest,
+} from "@andvl1/omp-workflows-core";
+
+import {
+	INTERNAL_PROVIDER_CATALOG,
+	INTERNAL_PROVIDER_DESCRIPTOR,
+	INTERNAL_PROVIDER_DESCRIPTOR_FINGERPRINT,
+} from "../src/provider.js";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-test("agents directory contains exactly the allowed omp-* pool", () => {
+const agentNames = INTERNAL_PROVIDER_DESCRIPTOR.agent_sources.flatMap((source) => [...source.registered_names]);
+
+test("agent assets exactly match the provider-qualified descriptor source set", () => {
 	const files = readdirSync(join(packageRoot, "agents")).filter((name) => name.endsWith(".md"));
-	const expected = [...ALLOWED_POOL_AGENTS].sort();
 	assert.deepEqual(
 		files.map((name) => name.replace(/\.md$/, "")).sort(),
-		expected,
+		[...agentNames].sort(),
 	);
-	for (const file of files) {
-		assert.ok(file.startsWith("omp-"), `agent asset must be hyphen-prefixed: ${file}`);
+	for (const source of INTERNAL_PROVIDER_DESCRIPTOR.agent_sources) {
+		assert.equal(source.provider_id, INTERNAL_PROVIDER_DESCRIPTOR.id);
+		assert.equal(source.registered_names.length, 1);
+		assert.ok(isWorkflowV2Digest(source.source_fingerprint));
 	}
+	assert.equal(new Set(agentNames).size, agentNames.length, "source registered names must be unique");
 });
 
-test("no bare or reserved command/agent names leak into assets", () => {
-	const reserved = ["do-work", "team", "cto", "omp-model-roles"];
-	for (const name of ALLOWED_POOL_AGENTS) {
-		for (const bare of ["do-work", "team", "cto"]) {
-			assert.notEqual(name, bare);
-		}
-		assert.notEqual(name, "omp-model-roles");
-		assert.ok(!reserved.includes(name));
-	}
-});
-
-test("agent files declare the full frontmatter and stay concise", () => {
-	for (const agent of ALLOWED_POOL_AGENTS) {
+test("agent files retain their exact omp-* identity and frontmatter", () => {
+	for (const agent of agentNames) {
+		assert.match(agent, /^omp-[a-z0-9-]+$/);
 		const raw = readFileSync(join(packageRoot, "agents", `${agent}.md`), "utf8");
 		const frontmatter = raw.split("---")[1] ?? "";
 		assert.ok(frontmatter.includes(`name: ${agent}\n`), `${agent}: missing name`);
 		for (const key of ["model:", "thinkingLevel:", "description:", "tools:"]) {
-			assert.ok(frontmatter.includes(key), `${agent}: missing frontmatter key ${key}`);
+			assert.ok(frontmatter.includes(key), `${agent}: missing frontmatter key`);
 		}
-		const lineCount = raw.split("\n").length;
-		assert.ok(lineCount < 60, `${agent}: expected <60 lines, got ${lineCount}`);
+		assert.ok(raw.split("\n").length < 60, `${agent}: expected a concise asset`);
 	}
 });
 
-test("bundle profiles load, validate and use only the allowed pool roles", () => {
-	const profiles = loadOmpWorkflowProfiles();
-	assert.deepEqual(profiles.map((profile) => profile.name), ["omp-feature", "omp-validate"]);
-	const roleKeys = new Set(Object.keys({
-		"team-lead": "",
-		analyst: "",
-		"tech-researcher": "",
-		diagnostics: "",
-		architect: "",
-		architect_minimal: "",
-		architect_clean: "",
-		architect_pragmatic: "",
-		developer: "",
-		qa: "",
-		"manual-qa": "",
-		"code-reviewer": "",
-		"security-tester": "",
-		devops: "",
-		"plugin-developer": "",
-		"host-integration": "",
-		"package-release": "",
-	}));
-	for (const profile of profiles) {
-		for (const stage of profile.stages) {
-			if ("role" in stage && typeof stage.role === "string" && !stage.role.startsWith("${")) {
-				assert.ok(roleKeys.has(stage.role), `${profile.name}/${stage.id}: unknown role '${stage.role}'`);
-			}
-			if ("roles" in stage && Array.isArray(stage.roles)) {
-				for (const role of stage.roles) {
-					assert.ok(roleKeys.has(role), `${profile.name}/${stage.id}: unknown role '${role}'`);
-				}
-			}
-			if ("conditional" in stage && Array.isArray(stage.conditional)) {
-				for (const entry of stage.conditional) {
-					if (entry && typeof entry === "object" && "add" in entry) {
-						assert.ok(roleKeys.has(String(entry.add)), `${profile.name}/${stage.id}: unknown conditional role '${String(entry.add)}'`);
-					}
-				}
-			}
-		}
-	}
-});
-
-test("profiles are named omp-* only", () => {
-	for (const profile of loadOmpWorkflowProfiles()) {
-		assert.match(profile.name, /^omp-[a-z-]+$/);
+test("descriptor and catalog expose exact immutable v2 identities", () => {
+	assert.equal(INTERNAL_PROVIDER_DESCRIPTOR.id, "@andvl1/omp-workflows-internal");
+	assert.equal(INTERNAL_PROVIDER_DESCRIPTOR.protocol_version, 2);
+	assert.ok(isProviderId(INTERNAL_PROVIDER_DESCRIPTOR.id));
+	assert.ok(isWorkflowV2Digest(INTERNAL_PROVIDER_DESCRIPTOR.catalog_content_digest));
+	assert.ok(isWorkflowV2Digest(INTERNAL_PROVIDER_CATALOG.content_digest));
+	assert.equal(
+		INTERNAL_PROVIDER_DESCRIPTOR.catalog_content_digest,
+		INTERNAL_PROVIDER_CATALOG.content_digest,
+	);
+	assert.equal(
+		INTERNAL_PROVIDER_DESCRIPTOR_FINGERPRINT,
+		computeDescriptorFingerprint(INTERNAL_PROVIDER_DESCRIPTOR),
+	);
+	assert.deepEqual(
+		INTERNAL_PROVIDER_CATALOG.profiles.map((entry) => entry.identity.id),
+		["omp-feature", "omp-validate"],
+	);
+	for (const entry of INTERNAL_PROVIDER_CATALOG.profiles) {
+		assert.equal(entry.identity.id, entry.profile.name);
+		assert.ok(isWorkflowV2Digest(entry.identity.fingerprint));
 	}
 });

@@ -5,7 +5,17 @@
  */
 
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  linkSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import * as http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,14 +28,21 @@ import { deferred } from '../src/util.js';
 import { waitFor, WaitTimeoutError } from '../src/driver.js';
 import {
   assertNoLiveSession,
+  buildDiagnosticEnv,
   buildOmpArgs,
+  canonicalizeTrustedPair,
   checkHostOmpConfig,
   mintToken,
   pidIsLive,
+  resolveTrustedPair,
   safeEqual,
   startTestSession,
   type ServerMsg,
 } from '../src/server.js';
+
+// parseStartArgs + trusted-pair CLI coverage is consolidated here because
+// the sibling-owned cli.test.ts is outside this slice's editable files.
+import { parseStartArgs, redactSessionUrl } from '../src/cli.js';
 
 function makeScratch(): string {
   const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-server-'));
@@ -224,6 +241,287 @@ test('server: buildOmpArgs treats empty-string userConfigPath as unset', () => {
   const configIdx = args.reduce<number[]>((acc, v, i) => (v === '--config' ? [...acc, i] : acc), []);
   assert.equal(configIdx.length, 1, 'empty userConfigPath is treated as unset');
   assert.equal(args[configIdx[0] + 1], '/scratch/.omp/ux-e2e-overlay.json');
+});
+
+test('server: buildOmpArgs emits the exact ordered --trusted-extension pair (core position FIRST, provider second)', () => {
+  // Operator-trusted DIAGNOSTIC launch: TWO distinct absolute module
+  // files — core position FIRST, provider position SECOND. Active omp
+  // honors repeated --trusted-extension flags in supplied order;
+  // root-form flags no longer exist at all.
+  const args = buildOmpArgs({
+    maxTimeSec: 1800,
+    approvalMode: 'yolo',
+    configPath: '/scratch/.omp/ux-e2e-overlay.json',
+    sessionDir: '/scratch/.omp/agent',
+    userConfigDefaultPath: '/scratch/.omp/ux-e2e-overlay.user.json',
+    coreModule: '/repo/packages/core/dist/index.js',
+    providerModule: '/repo/packages/fullstack/dist/index.js',
+  });
+  assert.deepEqual(args, [
+    '--config', '/scratch/.omp/ux-e2e-overlay.json',
+    '--session-dir', '/scratch/.omp/agent',
+    '--hide-thinking',
+    '--max-time', '30m',
+    '--approval-mode', 'yolo',
+    '--trusted-extension', '/repo/packages/core/dist/index.js',
+    '--trusted-extension', '/repo/packages/fullstack/dist/index.js',
+  ]);
+  assert.ok(!args.includes('--no-extensions'), 'explicit-root mode was removed — never emits --no-extensions');
+  assert.ok(!args.includes('--extension'), 'explicit-root mode was removed — never emits --extension');
+});
+
+test('server: buildOmpArgs rejects partial, equal, and relative diagnostic pairs before argv exists', () => {
+  const base = {
+    maxTimeSec: 1800,
+    approvalMode: 'yolo',
+    configPath: '/scratch/.omp/ux-e2e-overlay.json',
+    sessionDir: '/scratch/.omp/agent',
+    userConfigDefaultPath: '/scratch/.omp/ux-e2e-overlay.user.json',
+  };
+  // Partial pair — either half alone is a diagnostic invocation and must
+  // fail, never fall through to ambient discovery.
+  assert.throws(() => buildOmpArgs({ ...base, providerModule: '/repo/fullstack/dist/index.js' }), /incomplete diagnostic pair/u);
+  assert.throws(() => buildOmpArgs({ ...base, coreModule: '/repo/core/dist/index.js' }), /incomplete diagnostic pair/u);
+  // Equal requested paths — the two entries must be distinct.
+  assert.throws(() => buildOmpArgs({ ...base, coreModule: '/same/entry.js', providerModule: '/same/entry.js' }), /DISTINCT module paths/u);
+  // Relative paths — no cwd inference, in either role.
+  assert.throws(() => buildOmpArgs({ ...base, coreModule: 'core/dist/index.js', providerModule: '/repo/fullstack/dist/index.js' }), /ABSOLUTE path/u);
+  assert.throws(() => buildOmpArgs({ ...base, coreModule: '/repo/core/dist/index.js', providerModule: 'fullstack/dist/index.js' }), /ABSOLUTE path/u);
+});
+
+test('server: resolveTrustedPair accepts normalized absolute spellings verbatim', () => {
+  // The syntax gate is isAbsolute, NOT resolve(value) !== value: a
+  // trailing slash or dot segments are valid absolute spellings and pass
+  // through unchanged (canonicalization happens later, at the spawn
+  // boundary, on the real filesystem).
+  const core = '/repo/core/dist/index.js/';
+  const provider = '/repo/./fullstack/dist/index.js';
+  const pair = resolveTrustedPair({ coreModule: core, providerModule: provider });
+  assert.ok(pair !== null, 'a complete absolute pair resolves');
+  assert.equal(pair.modules[0].role, 'core');
+  assert.equal(pair.modules[0].path, core);
+  assert.equal(pair.modules[1].role, 'provider');
+  assert.equal(pair.modules[1].path, provider);
+  assert.equal(pair.modules[0].canonical, null, 'syntax resolution never touches the filesystem');
+  // ...and rejects genuinely relative spellings in either role.
+  assert.throws(() => resolveTrustedPair({ coreModule: './core.mjs', providerModule: '/repo/provider.mjs' }), /ABSOLUTE path/u);
+  assert.throws(() => resolveTrustedPair({ coreModule: '/repo/core.mjs', providerModule: 'provider.mjs' }), /ABSOLUTE path/u);
+  // Nothing selected = null (generic NON-admission harness launch).
+  assert.equal(resolveTrustedPair({}), null);
+  assert.throws(() => resolveTrustedPair({ coreModule: '/same/x.mjs', providerModule: '/same/x.mjs' }), /DISTINCT module paths/u);
+});
+
+test('server: buildOmpArgs emits no extension flags without selection (explicitly NON-admission generic harness mode)', () => {
+  // The unselected argv is the generic ux-e2e harness launch. It is
+  // valid ONLY outside the diagnostic pair: any pair invocation passes
+  // at least one module flag, and a partial pair is rejected above —
+  // a diagnostic launch can never fall through to ambient discovery.
+  const args = buildOmpArgs({
+    maxTimeSec: 1800,
+    approvalMode: 'yolo',
+    configPath: '/scratch/.omp/ux-e2e-overlay.json',
+    sessionDir: '/scratch/.omp/agent',
+    userConfigDefaultPath: '/scratch/.omp/ux-e2e-overlay.user.json',
+  });
+  assert.ok(!args.includes('--trusted-extension'));
+  assert.ok(!args.includes('--extension'));
+  assert.ok(!args.includes('--no-extensions'));
+});
+
+test('server: startTestSession records requested AND canonical diagnostic identities in session.json', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-diagnostic-'));
+  const coreModule = join(dir, 'core-host.mjs');
+  const providerModule = join(dir, 'provider.mjs');
+  writeFileSync(coreModule, 'export default () => {};\n');
+  writeFileSync(providerModule, 'export default () => {};\n');
+  const scratch = makeScratch();
+  const session = await startTestSession({ cwd: scratch, noPty: true, token: 'sekret', coreModule, providerModule });
+  t.after(() => session.close());
+  const sessionJson = JSON.parse(readFileSync(session.sessionJsonPath, 'utf8')) as {
+    trusted_pair: {
+      purpose: string;
+      mode: string;
+      extensions: Array<{
+        role: string;
+        requested_path: string;
+        canonical_path: string;
+        canonical_dev: number;
+        canonical_ino: number;
+      }>;
+    } | null;
+  };
+  const pair = sessionJson.trusted_pair;
+  assert.ok(pair !== null, 'a diagnostic launch records the pair evidence');
+  assert.match(pair.purpose, /NOT host\/policy admission/u);
+  assert.match(pair.purpose, /NOT selected-provider activation/u);
+  assert.equal(pair.mode, 'trusted-module');
+  const [core, provider] = pair.extensions;
+  assert.equal(core.role, 'core');
+  assert.equal(provider.role, 'provider');
+  // Requested paths verbatim; canonical paths equal realpathSync.native
+  // of each target; the native stat identity is recorded. (Requested and
+  // canonical may DIFFER on hosts whose temp roots cross symlinks.)
+  assert.equal(core.requested_path, coreModule);
+  assert.equal(provider.requested_path, providerModule);
+  assert.equal(core.canonical_path, realpathSync.native(coreModule));
+  assert.equal(provider.canonical_path, realpathSync.native(providerModule));
+  assert.ok(core.canonical_path !== provider.canonical_path, 'distinct targets stay distinct');
+  assert.equal(typeof core.canonical_ino, 'number');
+  assert.equal(typeof provider.canonical_ino, 'number');
+});
+
+test('server: startTestSession rejects missing and wrong-kind diagnostic module paths before any spawn', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-diagnostic-'));
+  const realFile = join(dir, 'real.mjs');
+  writeFileSync(realFile, 'export default () => {};\n');
+  const realDir = join(dir, 'not-a-module');
+  mkdirSync(realDir);
+  // Missing module file.
+  await assert.rejects(
+    () =>
+      startTestSession({
+        cwd: makeScratch(),
+        noPty: true,
+        token: 'sekret',
+        coreModule: join(dir, 'missing.mjs'),
+        providerModule: realFile,
+      }),
+    /must be an existing module file/u,
+  );
+  // Wrong kind: module path is a directory (native stat kind check).
+  await assert.rejects(
+    () => startTestSession({ cwd: makeScratch(), noPty: true, token: 'sekret', coreModule: realDir, providerModule: realFile }),
+    /must be an existing module file/u,
+  );
+});
+
+test('server: startTestSession rejects symlink aliases that canonicalize to one target', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-diagnostic-'));
+  const realFile = join(dir, 'real.mjs');
+  writeFileSync(realFile, 'export default () => {};\n');
+  const alias = join(dir, 'alias.mjs');
+  symlinkSync(realFile, alias);
+  // Two different absolute spellings, ONE canonical target: a single
+  // module must not occupy both ordered positions.
+  await assert.rejects(
+    () =>
+      startTestSession({
+        cwd: makeScratch(),
+        noPty: true,
+        token: 'sekret',
+        coreModule: realFile,
+        providerModule: alias,
+      }),
+    /DISTINCT targets.*symlink alias/u,
+  );
+  // The same alias rejection fires without a session (pure resolver API).
+  const pair = resolveTrustedPair({ coreModule: realFile, providerModule: alias });
+  assert.ok(pair !== null);
+  assert.throws(() => canonicalizeTrustedPair(pair), /DISTINCT targets.*symlink alias/u);
+});
+
+test('server: startTestSession rejects hard-link aliases that share one filesystem identity', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-diagnostic-'));
+  const realFile = join(dir, 'real.mjs');
+  writeFileSync(realFile, 'export default () => {};\n');
+  // Hard links: different canonical paths, ONE inode (same dev/ino).
+  // Canonical path equality alone would NOT catch this — the native stat
+  // identity comparison must.
+  const hardLink = join(dir, 'hard-link.mjs');
+  linkSync(realFile, hardLink);
+  await assert.rejects(
+    () =>
+      startTestSession({
+        cwd: makeScratch(),
+        noPty: true,
+        token: 'sekret',
+        coreModule: realFile,
+        providerModule: hardLink,
+      }),
+    /DISTINCT filesystem identities.*hard-link alias/u,
+  );
+  // Same rejection via the pure resolver API.
+  const pair = resolveTrustedPair({ coreModule: realFile, providerModule: hardLink });
+  assert.ok(pair !== null);
+  assert.throws(() => canonicalizeTrustedPair(pair), /DISTINCT filesystem identities.*hard-link alias/u);
+  // Two genuinely distinct files keep distinct identities — the canonical
+  // pair still resolves cleanly (negative control for the new check).
+  const otherFile = join(dir, 'other.mjs');
+  writeFileSync(otherFile, 'export default () => {};\n');
+  const distinct = resolveTrustedPair({ coreModule: realFile, providerModule: otherFile });
+  assert.ok(distinct !== null);
+  const canonical = canonicalizeTrustedPair(distinct);
+  assert.notEqual(canonical.modules[0].identity?.ino, canonical.modules[1].identity?.ino);
+});
+
+test('server: buildDiagnosticEnv strips loader/preload injection and preserves explicit overrides', () => {
+  const env = buildDiagnosticEnv(
+    {
+      PATH: '/usr/bin:/bin',
+      HOME: '/home/operator',
+      NODE_OPTIONS: '--require /evil.js',
+      NODE_PATH: '/evil/node_modules',
+      NODE_COMPILE_CACHE: '/evil/cache',
+      BUN_INSTALL: '/evil/bun',
+      LD_PRELOAD: '/evil.so',
+      DYLD_INSERT_LIBRARIES: '/evil.dylib',
+      PYTHONPATH: '/evil/py',
+      RUBYOPT: '-r/evil',
+      PERL5OPT: '-Mevil',
+      SHELL: '/bin/zsh',
+    },
+    { HOME: '/scratch/home', MY_FLAG: '1' },
+  );
+  // Safe PATH survives so the host binary and subprocesses resolve; the
+  // explicit override wins for benign vars; TERM is pinned.
+  assert.equal(env.PATH, '/usr/bin:/bin');
+  assert.equal(env.HOME, '/scratch/home');
+  assert.equal(env.MY_FLAG, '1');
+  assert.equal(env.TERM, 'xterm-256color');
+  // Ambient vars are not forwarded at all; injection keys are stripped
+  // EVEN IF an override tried to reintroduce them.
+  assert.equal(env.SHELL, undefined);
+  for (const key of ['NODE_OPTIONS', 'NODE_PATH', 'NODE_COMPILE_CACHE', 'BUN_INSTALL', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES', 'PYTHONPATH', 'RUBYOPT', 'PERL5OPT']) {
+    assert.equal(env[key], undefined, `${key} must be stripped from diagnostic launches`);
+  }
+  const hostile = buildDiagnosticEnv({ PATH: '/bin' }, { NODE_OPTIONS: '--require /evil.js', LD_PRELOAD: '/evil.so' });
+  assert.equal(hostile.NODE_OPTIONS, undefined);
+  assert.equal(hostile.LD_PRELOAD, undefined);
+  // Generic (non-diagnostic) launches keep buildPtyEnv; the diagnostic
+  // builder never touches that path.
+});
+
+test('cli: parseStartArgs restores --idle-ms and rejects an incomplete diagnostic pair at parse time', () => {
+  // idleMs regression guard: the flag parses into StartArgs again
+  // (sibling-owned cli.test.ts depends on this behavior).
+  assert.equal(parseStartArgs(['/tmp/scratch', '--idle-ms', '5000']).idleMs, 5000);
+  assert.equal(parseStartArgs(['/tmp/scratch']).idleMs, 1_200_000);
+  // Partial pair rejected at parse time.
+  assert.throws(
+    () => parseStartArgs(['/tmp/scratch', '--provider-module', '/repo/fullstack/dist/index.js']),
+    /incomplete diagnostic pair/u,
+  );
+  assert.throws(() => parseStartArgs(['/tmp/scratch', '--core-module', '/repo/core/dist/index.js']), /incomplete diagnostic pair/u);
+  // Root flags no longer exist in the parser (strict parsing rejects unknown options).
+  assert.throws(() => parseStartArgs(['/tmp/scratch', '--core-root', '/repo/core']));
+  assert.throws(() => parseStartArgs(['/tmp/scratch', '--provider-root', '/repo/fullstack']));
+  // Normalized absolute spellings pass the parse-time gate verbatim.
+  const normalized = parseStartArgs([
+    '/tmp/scratch',
+    '--core-module', '/repo/core/dist/index.js/',
+    '--provider-module', '/repo/./fullstack/dist/index.js',
+  ]);
+  assert.equal(normalized.coreModule, '/repo/core/dist/index.js/');
+  assert.equal(normalized.providerModule, '/repo/./fullstack/dist/index.js');
+});
+
+test('cli: redactSessionUrl strips the bearer token for detached logs', () => {
+  const url = 'http://127.0.0.1:4321/?token=supersecret&ws=/ws';
+  const redacted = redactSessionUrl(url);
+  assert.ok(!redacted.includes('supersecret'), 'live token must never reach the detach log');
+  assert.ok(redacted.includes('token=REDACTED'));
+  assert.ok(redacted.includes('4321'), 'non-token parts of the url are preserved');
+  assert.equal(redactSessionUrl('http://127.0.0.1:4321/'), 'http://127.0.0.1:4321/');
 });
 
 test('server: checkHostOmpConfig warns on missing or empty modelRoles', () => {

@@ -9,8 +9,8 @@
  * restarts only exist when the dispatcher runs in its own process. This test
  * drives the ACTUAL exported fullstack dispatcher machinery
  * (createChannelSet / startChannelDispatcher / queueCtoDelivery /
- * handleInboxTask / resolveInboxRunId) plus the core wave/gate APIs against
- * an ISOLATED temporary git repository with real git worktrees. No network,
+ * handleInboxTask) plus the core wave/gate APIs against an
+ * ISOLATED temporary git repository with real git worktrees. No network,
  * no credentials, no LLM, no omp binary.
  *
  * Test code NEVER writes inside the monorepo: every artifact lives in a
@@ -25,18 +25,19 @@
 
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import type { WorkflowRunIdentity } from '@andvl1/omp-workflows-core';
 import {
   dispatcherLockPath,
-  inboxDir,
   queueCtoDelivery,
   sha256Hex,
 } from '../../fullstack/src/adapters/registry.js';
+import { runtimeFixture, type RuntimeFixture } from '../../fullstack/test/runtime-fixtures.js';
 import { appendWave, finishWave, readCtoState, writeCtoState } from '../../core/src/cto/state.js';
 import {
   assertCtoSliceDispatchable,
@@ -57,6 +58,7 @@ const MAIN_TASK_TEXT = 'Implement feature X with slice-a and slice-b';
 const MAIN_TASK_ID = 'msg-main-1';
 const FOLLOW_TASK_ID = 'msg-follow-1';
 const SLICES = ['slice-a', 'slice-b'] as const;
+const PROCESS_RUN_ID = 'process-e2e-run';
 
 type EvidenceLine = Record<string, any>;
 
@@ -82,8 +84,34 @@ function auditLines(scratch: string): Array<Record<string, any>> {
   return jsonlLines(join(scratch, '.omp', 'fake-rw-audit', 'outbound', 'messages.jsonl'));
 }
 
+function storageJsonEntries(context: RuntimeFixture['context'], relativeDirectory: string): readonly { name: string; relative_path: string }[] {
+  if (!context.storage) throw new Error('process E2E requires an explicit FullstackStorageAuthority');
+  const listed = context.storage.listJsonBounded(relativeDirectory, 512);
+  if (!listed.ok) throw new Error(`storage listing failed for ${relativeDirectory}: ${listed.message ?? listed.reason}`);
+  return listed.value;
+}
+
+function storageExists(context: RuntimeFixture['context'], relativePath: string): boolean {
+  if (!context.storage) throw new Error('process E2E requires an explicit FullstackStorageAuthority');
+  const stat = context.storage.statBounded(relativePath);
+  if (!stat.ok) throw new Error(`storage stat failed for ${relativePath}: ${stat.message ?? stat.reason}`);
+  return stat.value.exists;
+}
+
+function ctoInboxRelative(runId: string, processed = false): string {
+  return `.work-state/cto/${runId}/inbox${processed ? '/processed' : ''}`;
+}
+
+function fakeInboundRelative(name: string, processed = false): string {
+  return `.omp/fake-rw-control/inbound${processed ? '/processed' : ''}/${name}`;
+}
+
 /** Write one inbound task file (single-writer: the test is the writer). */
-function writeInbound(scratch: string, name: string, task: { id: string; text: string; at: string; by: string }): void {
+function writeInbound(
+  scratch: string,
+  name: string,
+  task: { id: string; text: string; at: string; by: string; run_identity: WorkflowRunIdentity },
+): void {
   const dir = join(scratch, '.omp', 'fake-rw-control', 'inbound');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, name), `${JSON.stringify(task, null, 2)}\n`);
@@ -123,7 +151,7 @@ interface TrackedChild {
 function spawnFixture(scratch: string, evidencePath: string, intervalMs: number): TrackedChild {
   const proc = spawn(
     process.execPath,
-    ['--import', 'tsx', FIXTURE, '--root', scratch, '--evidence', evidencePath, '--interval-ms', String(intervalMs)],
+    ['--import', 'tsx', FIXTURE, '--root', scratch, '--evidence', evidencePath, '--interval-ms', String(intervalMs), '--run-id', PROCESS_RUN_ID],
     { cwd: E2E_DIR, stdio: ['ignore', 'pipe', 'pipe'] },
   );
   const logs = { out: '', err: '' };
@@ -151,37 +179,6 @@ async function stopChild(tracked: TrackedChild): Promise<number> {
 
 function initScratch(scratch: string): void {
   mkdirSync(join(scratch, '.omp'), { recursive: true });
-  // Two-channel config: RW primary "control" (persisted fake-RW) + RO
-  // audit sink "audit" (persisted, subscribed to progress/summary). The
-  // audit channel uses the "mock-ro" transport kind registered by the
-  // dispatcher fixture — createChannelSet builds each channel from the
-  // entry whose adapter kind matches, so distinct kinds are required for
-  // distinct persisted dirs.
-  writeFileSync(
-    join(scratch, '.omp', 'escalation.json'),
-    `${JSON.stringify(
-      {
-        channels: [
-          {
-            id: 'control',
-            adapter: 'mock',
-            direction: 'read-write',
-            primary: true,
-            mock: { persisted: true, dir: '.omp/fake-rw-control' },
-          },
-          {
-            id: 'audit',
-            adapter: 'mock-ro',
-            direction: 'read-only',
-            subscriptions: ['progress', 'summary'],
-            mock: { persisted: true, dir: '.omp/fake-rw-audit' },
-          },
-        ],
-      },
-      null,
-      2,
-    )}\n`,
-  );
   mkdirSync(join(scratch, 'slices'), { recursive: true });
   writeFileSync(join(scratch, 'README.md'), '# Process E2E scratch\n');
   writeFileSync(join(scratch, 'slices', '.gitkeep'), '');
@@ -191,13 +188,16 @@ function initScratch(scratch: string): void {
 }
 
 test('cto process e2e: resident control plane — waves, worktrees, dedupe, restart recovery, gates', async () => {
-  // GIVEN: an isolated scratch git repository with the two-channel escalation config.
+  // GIVEN: an isolated scratch git repository with an explicit runtime context.
   const scratch = mkdtempSync(join(tmpdir(), 'omp-cto-process-e2e-'));
   const evidencePath = join(scratch, 'evidence.jsonl');
   const children: TrackedChild[] = [];
   const stopped = new Set<TrackedChild>();
   try {
     initScratch(scratch);
+    const runtime = runtimeFixture(scratch, { runId: PROCESS_RUN_ID });
+    const runIdentity = runtime.run_identity;
+    const context = runtime.context;
 
     // ══════════════════════════════════════════════════════════════════════
     // PHASE A — MAIN WAVE + durable admission + online ACK
@@ -210,13 +210,14 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
       () => evidenceLines(evidencePath).some((l) => l.t === 'start'),
       { timeoutMs: 10_000, label: 'dispatcher start evidence' },
     );
+    const mainTaskAt = new Date().toISOString();
     writeInbound(scratch, 'task-1.json', {
       id: MAIN_TASK_ID,
       text: MAIN_TASK_TEXT,
-      at: new Date().toISOString(),
+      at: mainTaskAt,
       by: 'fake-rw',
+      run_identity: runIdentity,
     });
-
     // THEN (all from disk): durable inbox admission + wave + online ack.
     const wakeMain = await waitForEvidence(
       evidencePath,
@@ -224,16 +225,20 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
       'main wake',
       20_000,
     );
-    const runId = wakeMain.task.runId;
+    const runId = runIdentity.run_id;
     const wave1Id = wakeMain.task.waveId;
-    assert.ok(typeof runId === 'string' && runId.length > 0, 'wake carries runId');
+    assert.equal(wakeMain.task.runId, runId, 'wake carries the exact prepared run id');
+    assert.deepEqual(wakeMain.task.run_identity, runIdentity, 'wake carries the exact prepared run identity');
     assert.ok(typeof wave1Id === 'string' && wave1Id.length > 0, 'wake carries waveId');
 
-    assert.ok(
-      existsSync(join(scratch, '.work-state', 'cto', runId, 'inbox', `${MAIN_TASK_ID}.json`)),
-      'inbox task file is durable on disk',
+    const pendingInboxCount = storageJsonEntries(context, ctoInboxRelative(runId)).length;
+    const processedInboxCount = storageJsonEntries(context, ctoInboxRelative(runId, true)).length;
+    assert.equal(
+      pendingInboxCount + processedInboxCount,
+      1,
+      'inbox task file is durable on disk (pending or processed)',
     );
-    const stateA = readCtoState(runId, scratch);
+    const stateA = readCtoState(runId, scratch, runIdentity);
     assert.ok(stateA, 'run state readable');
     assert.equal(stateA!.wave_history!.length, 1, 'exactly one wave admitted');
     assert.equal(stateA!.wave_history![0].source_id, MAIN_TASK_ID);
@@ -279,7 +284,7 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
     }
     // Wave completes; summary delivery lands on the primary.
     await waitFor(
-      () => readCtoState(runId, scratch)!.wave_history![0].status === 'done',
+      () => readCtoState(runId, scratch, runIdentity)!.wave_history![0].status === 'done',
       { timeoutMs: 15_000, label: 'main wave done' },
     );
     await waitFor(
@@ -290,7 +295,6 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
     // ══════════════════════════════════════════════════════════════════════
     // PHASE C — RO-REPORT-ONLY
     // ══════════════════════════════════════════════════════════════════════
-    const auditOut = join(scratch, '.omp', 'fake-rw-audit', 'outbound', 'messages.jsonl');
     await waitFor(() => auditLines(scratch).length >= 1, { timeoutMs: 15_000, label: 'audit fan-out line' });
     const audit = auditLines(scratch);
     assert.ok(audit.length >= 1, 'audit sink received the summary');
@@ -319,36 +323,40 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
     stopped.add(child1);
     assert.equal(code1, 0, 'dispatcher child exits 0 on SIGTERM');
     await waitFor(
-      () => !existsSync(dispatcherLockPath(scratch)),
+      () => !storageExists(context, dispatcherLockPath(context)),
       { timeoutMs: 5_000, label: 'dispatcher lease released' },
     );
     // Queue a delivery from the TEST while no dispatcher runs — it must sit
     // durably in the outbox until the restarted dispatcher drains it.
     const progressId = `${runId}/system/progress/${Date.now()}`;
-    const queued = queueCtoDelivery(scratch, runId, {
+    const queued = queueCtoDelivery(context, {
       id: progressId,
       level: 'question',
       title: 'Progress',
       body: 'pending before restart',
       intent: 'progress',
+      run_identity: runIdentity,
     });
-    assert.ok(queued, 'progress delivery queued');
-    assert.ok(existsSync(queued!), 'delivery file durable in outbox before restart');
+    if (!queued.ok) throw new Error(`progress delivery queue failed: ${queued.diagnostics.map((d) => d.remediation).join('; ')}`);
+    assert.ok(queued.value, 'progress delivery queued');
+    const queuedPath = queued.value;
+    if (!queuedPath) throw new Error('progress delivery queue returned no durable path');
+    assert.ok(storageExists(context, queuedPath), 'delivery file durable in outbox before restart');
 
     const child2 = spawnFixture(scratch, evidencePath, 1000);
     children.push(child2);
 
     // THEN (disk): the pending delivery is recovered across the restart, and
-    // the wave/run state is untouched (exactly-one wave, one inbox file,
+    // the wave/run state is untouched (exactly-one wave, one processed inbox file,
     // admitted quarantine).
     await waitFor(
       () => controlLines(scratch).some((l) => l.escId === progressId && l.receipt?.sent === true),
       { timeoutMs: 15_000, label: 'progress recovered across restart' },
     );
-    const stateD = readCtoState(runId, scratch)!;
+    const stateD = readCtoState(runId, scratch, runIdentity)!;
     assert.equal(stateD.wave_history!.length, 1, 'exactly one wave after restart (no re-admission)');
     assert.equal(stateD.wave_history![0].source_id, MAIN_TASK_ID);
-    assert.equal(readdirSync(inboxDir(runId, scratch)).length, 1, 'inbox dir has exactly one file');
+    assert.equal(storageJsonEntries(context, ctoInboxRelative(runId, true)).length, 1, 'processed inbox has exactly one file');
     assert.equal(
       stateD.inbox_quarantine![sha256Hex(MAIN_TASK_TEXT)]?.status,
       'admitted',
@@ -358,22 +366,34 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
     // ══════════════════════════════════════════════════════════════════════
     // PHASE E — DUPLICATE MESSAGE ID (both layers: quarantine hash + wx)
     // ══════════════════════════════════════════════════════════════════════
-    const now = new Date().toISOString();
-    // (a) same id + same text -> quarantine admitted-dedup
-    writeInbound(scratch, 'task-2.json', { id: MAIN_TASK_ID, text: MAIN_TASK_TEXT, at: now, by: 'fake-rw' });
-    // (b) same id + different text -> wx collision on the inbox file
-    writeInbound(scratch, 'task-3.json', { id: MAIN_TASK_ID, text: 'Different text body for the same id', at: now, by: 'fake-rw' });
+    const now = mainTaskAt;
+    // (a) same id + same text -> admitted dedup and processed transport file
+    writeInbound(scratch, 'task-2.json', {
+      id: MAIN_TASK_ID,
+      text: MAIN_TASK_TEXT,
+      at: now,
+      by: 'fake-rw',
+      run_identity: runIdentity,
+    });
+    // (b) same id + different text -> processed-key conflict remains retryable
+    writeInbound(scratch, 'task-3.json', {
+      id: MAIN_TASK_ID,
+      text: 'Different text body for the same id',
+      at: now,
+      by: 'fake-rw',
+      run_identity: runIdentity,
+    });
     await waitFor(
-      () =>
-        !existsSync(join(scratch, '.omp', 'fake-rw-control', 'inbound', 'task-2.json')) &&
-        !existsSync(join(scratch, '.omp', 'fake-rw-control', 'inbound', 'task-3.json')),
-      { timeoutMs: 10_000, label: 'duplicate tasks consumed by transport' },
+      () => storageExists(context, fakeInboundRelative('task-2.json', true))
+        && !storageExists(context, fakeInboundRelative('task-2.json'))
+        && storageExists(context, fakeInboundRelative('task-3.json')),
+      { timeoutMs: 10_000, label: 'duplicate tasks handled by transport' },
     );
 
     const wakesMain = evidenceLines(evidencePath).filter((l) => l.t === 'wake' && l.task?.id === MAIN_TASK_ID);
     assert.equal(wakesMain.length, 1, 'no new wake for the duplicate message id');
-    const stateE = readCtoState(runId, scratch)!;
-    assert.equal(readdirSync(inboxDir(runId, scratch)).length, 1, 'still exactly one inbox file');
+    const stateE = readCtoState(runId, scratch, runIdentity)!;
+    assert.equal(storageJsonEntries(context, ctoInboxRelative(runId, true)).length, 1, 'still exactly one processed inbox file');
     assert.equal(stateE.wave_history!.length, 1, 'still exactly one wave');
     assert.equal(stateE.wave_history![0].source_id, MAIN_TASK_ID);
     assert.equal(
@@ -395,6 +415,7 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
       text: 'Follow-up: polish slice-a',
       at: new Date().toISOString(),
       by: 'fake-rw',
+      run_identity: runIdentity,
     });
     const wakeFollow = await waitForEvidence(
       evidencePath,
@@ -405,18 +426,21 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
     const followWaveId = wakeFollow.task.waveId;
     assert.ok(typeof followWaveId === 'string' && followWaveId !== wave1Id, 'follow-up gets a NEW waveId');
 
-    const runDirs = readdirSync(join(scratch, '.work-state', 'cto'));
+    if (!context.storage) throw new Error('process E2E requires an explicit FullstackStorageAuthority');
+    const runDirectories = context.storage.listBounded('.work-state/cto', 512);
+    if (!runDirectories.ok) throw new Error(`run directory listing failed: ${runDirectories.message ?? runDirectories.reason}`);
+    const runDirs = runDirectories.value.map((entry) => entry.name);
     assert.equal(runDirs.length, 1, 'exactly one run dir (no new standby run)');
     assert.equal(runDirs[0], runId, 'follow-up landed in the SAME resident run');
 
     await waitFor(
       () => {
-        const st = readCtoState(runId, scratch)!;
+        const st = readCtoState(runId, scratch, runIdentity)!;
         return st.wave_history!.length === 2 && st.wave_history!.every((w) => w.status === 'done');
       },
       { timeoutMs: 30_000, label: 'two waves both done' },
     );
-    const stateF = readCtoState(runId, scratch)!;
+    const stateF = readCtoState(runId, scratch, runIdentity)!;
     assert.equal(stateF.wave_history![1].source_id, FOLLOW_TASK_ID);
     assert.notEqual(stateF.wave_history![1].id, stateF.wave_history![0].id, 'distinct wave ids');
 
@@ -458,27 +482,35 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
 
     // The slice gate requires an ACTIVE wave (contract) — both real waves are
     // done by now, so admit a gate-probe wave to exercise the allow path.
-    const gateState = readCtoState(runId, scratch)!;
+    const gateState = readCtoState(runId, scratch, runIdentity)!;
     const probeWaveId = `wave-gate-probe-${Date.now()}`;
     appendWave(
       gateState,
-      { id: probeWaveId, source: 'gate-probe', source_id: 'gate-probe-1', task: 'gate probe wave', slice_ids: [...SLICES] },
+      {
+        id: probeWaveId,
+        source: 'gate-probe',
+        source_id: 'gate-probe-1',
+        task: 'gate probe wave',
+        slice_ids: [...SLICES],
+        run_identity: runIdentity,
+      },
       scratch,
     );
     const marker = buildCtoSliceMarker(runId, 'slice-a');
     const gateEvent = { toolName: 'task', input: { agent: 'team-lead', task: `work slice-a\n${marker}` } };
+    const gateContext = { cwd: scratch, project_identity: runtime.project_identity, run_identity: runIdentity };
 
     // ALLOWED: full per-slice classification + workflow + DoD are on disk.
     assert.equal(
-      ctoSliceTaskGate(gateEvent, { cwd: scratch }),
+      ctoSliceTaskGate(gateEvent, gateContext),
       undefined,
       'slice gate allows a fully-provisioned dispatchable slice',
     );
 
     // Negative (fail-closed, architecture-3): corrupt the persisted
     // classification and the gate must BLOCK mentioning the field.
-    const pristine = structuredClone(readCtoState(runId, scratch));
-    const corrupted = readCtoState(runId, scratch)!;
+    const pristine = structuredClone(readCtoState(runId, scratch, runIdentity));
+    const corrupted = readCtoState(runId, scratch, runIdentity)!;
     const teamA = corrupted.teams.find((t) => t.id === 'slice-a' || t.slice_id === 'slice-a')!;
     teamA.classification = {
       type: 'FEATURE',
@@ -486,24 +518,24 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
       confidence: 'HIGH',
       autonomous: 'yes',
     } as never;
-    writeCtoState(corrupted, scratch);
+    writeCtoState(corrupted, scratch, runIdentity);
     try {
-      const res = ctoSliceTaskGate(gateEvent, { cwd: scratch });
+      const res = ctoSliceTaskGate(gateEvent, gateContext);
       assert.ok(res, 'gate blocks on corrupt classification');
       assert.match(res!.reason, /autonomous/, 'block reason mentions the field');
     } finally {
-      writeCtoState(pristine!, scratch); // restore the real scratch state
+      writeCtoState(pristine!, scratch, runIdentity); // restore the real scratch state
     }
-    assert.equal(ctoSliceTaskGate(gateEvent, { cwd: scratch }), undefined, 'gate allows again after restore');
+    assert.equal(ctoSliceTaskGate(gateEvent, gateContext), undefined, 'gate allows again after restore');
 
     // Marker run mismatch -> actionable failure.
-    const restored = readCtoState(runId, scratch)!;
-    const mismatch = assertCtoSliceDispatchable(restored, { sliceId: 'slice-a', root: scratch, markerRunId: 'standby-other' });
+    const restored = readCtoState(runId, scratch, runIdentity)!;
+    const mismatch = assertCtoSliceDispatchable(restored, { sliceId: 'slice-a', root: scratch, markerRunId: 'standby-other', runIdentity });
     assert.equal(mismatch.ok, false);
     assert.match((mismatch as { reason: string }).reason, /marker run mismatch/, 'actionable mismatch reason');
 
     // Close the probe wave so no active wave lingers.
-    finishWave(readCtoState(runId, scratch)!, { id: probeWaveId, status: 'done' }, scratch);
+    finishWave(readCtoState(runId, scratch, runIdentity)!, { id: probeWaveId, status: 'done', run_identity: runIdentity }, scratch);
 
     // No executor failure anywhere in the run.
     assert.ok(
@@ -518,7 +550,7 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
     stopped.add(child2);
     assert.equal(code2, 0, 'dispatcher child #2 exits 0 on SIGTERM');
     await waitFor(
-      () => !existsSync(dispatcherLockPath(scratch)),
+      () => !storageExists(context, dispatcherLockPath(context)),
       { timeoutMs: 5_000, label: 'dispatcher #2 lease released' },
     );
   } finally {

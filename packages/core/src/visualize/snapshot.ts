@@ -24,11 +24,10 @@
  *
  * Safety (security contract):
  *   - ids must be safe path keys (SAFE_PATH_KEY_RE); unsafe ids are skipped;
- *   - declared paths must be safe RELATIVE paths inside `.work-state` that
- *     do not escape via `..`/absolute/backslash segments and are not
- *     excluded inputs (events.jsonl, vibe-report, .work-state/visualize);
- *     symlinked files whose realpath leaves the work-state root are
- *     rejected; excluded inputs are never discovered, never read;
+ *   - declared paths are accepted only as authority-relative paths inside
+ *     `.work-state`, excluding events.jsonl, vibe-report and
+ *     `.work-state/visualize`; the storage authority enforces containment,
+ *     traversal and symlink policy;
  *   - the snapshot is strictly read-only: canonical state and artifact
  *     files are never written or mutated.
  *
@@ -45,13 +44,35 @@
  * source of truth for layouts, ids, statuses and ordering; nothing here
  * re-implements or conflicts with them.
  */
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core --> */
 
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { loadProfile } from "../engine/profile.js";
-import type { TeamState } from "../engine/types.js";
+import {
+  decodeStorageText,
+  listStorageEntries,
+  readStorageBytes,
+  requireReportStorage,
+  ReportStorageError,
+  statStorage,
+  storagePath,
+  MAX_STORAGE_ENTRIES,
+  type ReportStorageAuthority,
+  type StorageStat,
+} from "../report/storage.js";
+
+import { loadProfileByIdentity } from "../engine/profile.js";
+import { validateProviderCatalog } from "../workflow-v2/descriptor.js";
+import { isProviderId, isWorkflowV2Digest, validateProjectIdentity, validateWorkflowRunIdentity } from "../workflow-v2/identity.js";
+import { createDiagnostic, isDiagnosticEvidenceRecord } from "../workflow-v2/diagnostics.js";
+import type { Profile, TeamState } from "../engine/types.js";
+import type {
+  EffectivePolicy,
+  ProjectIdentity,
+  ProviderCatalog,
+  WorkflowRunIdentity,
+  WorkflowV2Diagnostic,
+} from "../workflow-v2/types.js";
 import type { CtoState } from "../cto/types.js";
 import {
   CTO_MD_EVIDENCE,
@@ -98,14 +119,216 @@ import { resolveRenderConfig, type RenderConfig } from "./render-config.js";
 
 // ── Options ──────────────────────────────────────────────────────────────────
 
+export interface BuildSessionSnapshotContext {
+  readonly project_identity: ProjectIdentity;
+  readonly catalog: Readonly<ProviderCatalog>;
+  readonly effective_policy?: Readonly<EffectivePolicy>;
+}
+
 export interface BuildSessionSnapshotOptions {
-  /** ISO timestamp — the only volatile model field (fixed clock in tests). */
-  generatedAt: string;
   /** --full: bigger bounded body/read caps; never weakens redaction. */
   full?: boolean;
   /** Pre-resolved render config; default: resolveRenderConfig(workflow, full). */
   renderConfig?: RenderConfig;
+  /** Validated provider identity and immutable catalog supplied by the host. */
+  context: BuildSessionSnapshotContext;
 }
+
+/**
+ * Options shared by a plural snapshot build. A shared context supports
+ * homogeneous batches; contextForEntry is the explicit seam for mixed
+ * workflow batches and takes precedence when both are supplied.
+ */
+export interface BuildSessionSnapshotsOptions extends Omit<BuildSessionSnapshotOptions, "context"> {
+  /** Shared validated context for homogeneous batches. */
+  context?: BuildSessionSnapshotContext;
+  /** Resolve a validated context for each entry; takes precedence over context. */
+  contextForEntry?: (entry: SessionSourceEntry) => BuildSessionSnapshotContext;
+}
+
+export class VisualizationContextError extends Error {
+  readonly diagnostic: WorkflowV2Diagnostic;
+  readonly diagnostics: readonly WorkflowV2Diagnostic[];
+
+  constructor(diagnostics: readonly WorkflowV2Diagnostic[]) {
+    const first = diagnostics[0] ?? createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "profile.resolve",
+      remediation: "Pass the admitted provider identity and immutable profile catalog to visualization.",
+    });
+    super(`${first.code}: ${first.remediation}`);
+    this.name = "VisualizationContextError";
+    this.diagnostic = first;
+    this.diagnostics = Object.freeze(diagnostics.length > 0 ? [...diagnostics] : [first]);
+  }
+}
+
+function contextFailure(
+  code: WorkflowV2Diagnostic["code"],
+  remediation: string,
+  evidence: Record<string, unknown> = {},
+): never {
+  throw new VisualizationContextError([
+    createDiagnostic({ code, operation: "profile.resolve", evidence, remediation }),
+  ]);
+}
+
+function requireSnapshotContext(
+  options: { readonly context?: unknown },
+  workflow: string,
+): BuildSessionSnapshotContext {
+  const candidate = options.context;
+  if (!isDiagnosticEvidenceRecord(candidate)) {
+    return contextFailure("MIGRATION_REQUIRED", "Pass the admitted project identity and immutable profile catalog to visualization.");
+  }
+  const projectResult = validateProjectIdentity(candidate.project_identity);
+  if (!projectResult.ok) {
+    return contextFailure("MIGRATION_REQUIRED", "Pass the complete validated project identity to visualization.", {
+      provider_id: isDiagnosticEvidenceRecord(candidate.project_identity) ? candidate.project_identity.provider_id : undefined,
+    });
+  }
+  const catalogResult = validateProviderCatalog(candidate.catalog);
+  if (!catalogResult.ok) {
+    throw new VisualizationContextError(catalogResult.diagnostics);
+  }
+  const projectIdentity = projectResult.value;
+  const catalog = catalogResult.value;
+  if (projectIdentity.catalog_content_digest !== catalog.content_digest) {
+    return contextFailure("IDENTITY_MISMATCH", "Re-read the immutable profile catalog that matches the admitted project identity.", {
+      provider_id: projectIdentity.provider_id,
+      expected_digest: projectIdentity.catalog_content_digest,
+      actual_digest: catalog.content_digest,
+    });
+  }
+  const effective = candidate.effective_policy;
+  if (effective !== undefined) {
+    const effectiveRecord = isDiagnosticEvidenceRecord(effective) ? effective : undefined;
+    const provider = effectiveRecord && isDiagnosticEvidenceRecord(effectiveRecord.provider)
+      ? effectiveRecord.provider
+      : undefined;
+    const workflowSelection = effectiveRecord && isDiagnosticEvidenceRecord(effectiveRecord.workflow)
+      ? effectiveRecord.workflow
+      : undefined;
+    if (
+      provider === undefined
+      || workflowSelection === undefined
+      || !isProviderId(provider.id)
+      || provider.protocol_version !== 2
+      || !isWorkflowV2Digest(provider.descriptor_fingerprint)
+      || !isWorkflowV2Digest(provider.catalog_content_digest)
+      || (workflowSelection.selection !== "fixed" && workflowSelection.selection !== "matrix")
+    ) {
+      return contextFailure("MIGRATION_REQUIRED", "Pass the validated effective workflow policy selected by the admitted provider runtime.", {
+        provider_id: projectIdentity.provider_id,
+      });
+    }
+    if (
+      provider.id !== projectIdentity.provider_id
+      || provider.descriptor_fingerprint !== projectIdentity.descriptor_fingerprint
+      || provider.catalog_content_digest !== projectIdentity.catalog_content_digest
+    ) {
+      return contextFailure("IDENTITY_MISMATCH", "Pass the effective workflow policy bound to the admitted project identity.", {
+        provider_id: projectIdentity.provider_id,
+      });
+    }
+    if (workflowSelection.selection === "fixed") {
+      const policyProfile = workflowSelection.profile_identity;
+      if (
+        !isDiagnosticEvidenceRecord(policyProfile)
+        || typeof policyProfile.id !== "string"
+        || policyProfile.id.length === 0
+        || !isWorkflowV2Digest(policyProfile.fingerprint)
+        || !catalog.profiles.some((candidateProfile) =>
+          candidateProfile.identity.id === policyProfile.id
+          && candidateProfile.identity.fingerprint === policyProfile.fingerprint
+        )
+      ) {
+        return contextFailure("PROFILE_UNAVAILABLE", "The fixed effective-policy profile is not present in the admitted catalog.", {
+          provider_id: projectIdentity.provider_id,
+        });
+      }
+    } else if (Object.prototype.hasOwnProperty.call(workflowSelection, "profile_identity")) {
+      return contextFailure("CONFIG_MALFORMED", "A matrix effective policy cannot carry a profile identity.", {
+        provider_id: projectIdentity.provider_id,
+      });
+    }
+  }
+  return {
+    project_identity: projectIdentity,
+    catalog,
+    ...(effective === undefined ? {} : { effective_policy: effective as Readonly<EffectivePolicy> }),
+  };
+}
+
+
+function contextForSnapshotEntry(
+  options: BuildSessionSnapshotsOptions,
+  entry: SessionSourceEntry,
+): BuildSessionSnapshotContext {
+  const workflow: WorkflowName =
+    entry.kind === "cto" ? "cto" : (entry.state?.classification?.workflow ?? "standard");
+  const resolver = options.contextForEntry;
+  if (resolver !== undefined) {
+    if (typeof resolver !== "function") {
+      return contextFailure(
+        "MIGRATION_REQUIRED",
+        "Pass a callable contextForEntry resolver that returns a validated context for every visualization entry.",
+        { profile_id: workflow },
+      );
+    }
+    let candidate: unknown;
+    try {
+      candidate = resolver(entry);
+    } catch (error) {
+      if (error instanceof VisualizationContextError) throw error;
+      return contextFailure(
+        "MIGRATION_REQUIRED",
+        "The contextForEntry resolver failed; return a validated context for every visualization entry.",
+        { profile_id: workflow },
+      );
+    }
+    return requireSnapshotContext({ context: candidate }, workflow);
+  }
+  return requireSnapshotContext({ context: options.context }, workflow);
+}
+
+
+function profileForSnapshot(
+  context: BuildSessionSnapshotContext,
+  runIdentity: WorkflowRunIdentity,
+  workflow: string,
+): Profile {
+  const profileIdentity = runIdentity.profile_identity;
+  if (profileIdentity.id !== workflow) {
+    return contextFailure("IDENTITY_MISMATCH", `Profile ${profileIdentity.id} does not define workflow ${workflow}.`, {
+      provider_id: runIdentity.provider_id,
+      profile_id: profileIdentity.id,
+    });
+  }
+  const selection = context.effective_policy?.workflow;
+  if (
+    selection?.selection === "fixed"
+    && (
+      selection.profile_identity.id !== profileIdentity.id
+      || selection.profile_identity.fingerprint !== profileIdentity.fingerprint
+    )
+  ) {
+    return contextFailure("IDENTITY_MISMATCH", "Use the exact fixed profile identity selected by the admitted project policy.", {
+      provider_id: runIdentity.provider_id,
+      profile_id: profileIdentity.id,
+    });
+  }
+  const loaded = loadProfileByIdentity(context.catalog, profileIdentity);
+  if (!loaded.ok) throw new VisualizationContextError(loaded.diagnostics);
+  if (loaded.value.name !== workflow) {
+    return contextFailure("IDENTITY_MISMATCH", "Use the catalog profile whose declared workflow name matches the run identity.", {
+      provider_id: runIdentity.provider_id,
+      profile_id: profileIdentity.id,
+    });
+  }
+  return loaded.value;
+}
+
 
 // ── Deterministic stage titles (architecture-1 golden vocabulary) ───────────
 
@@ -148,124 +371,68 @@ function sessionTitleFor(kind: SessionKind, id: string): string {
   return kind === "cto" ? `CTO run ${id}` : `${id} feature worktree`;
 }
 
-function cwdRelativeLabel(cwd: string, absPath: string): string {
-  const rel = relative(cwd, absPath);
-  return rel === "" ? "." : rel;
-}
+// ── Safe storage access ──────────────────────────────────────────────────────
 
-/** Declared id → producing stage id per the workflow profile (produces order). */
-function producesByStageOf(workflow: WorkflowName): Map<string, string> {
-  const out = new Map<string, string>();
-  let profile;
-  try {
-    profile = loadProfile(workflow);
-  } catch {
-    profile = null;
-  }
-  for (const stage of profile?.stages ?? []) {
-    for (const id of asList(stage.produces)) out.set(id, stage.id);
-  }
-  return out;
-}
-
-/** Flattened workflow produces order — the declared artifact order contract. */
-function declaredOrderOf(workflow: WorkflowName): string[] {
-  let profile;
-  try {
-    profile = loadProfile(workflow);
-  } catch {
-    profile = null;
-  }
-  const order: string[] = [];
-  for (const stage of profile?.stages ?? []) order.push(...asList(stage.produces));
-  return order;
-}
-
-// ── Safe file access ─────────────────────────────────────────────────────────
-
-/** Real path of the workspace's `.work-state` root (boundary for escapes). */
-function workStateRealRoot(cwd: string): string {
-  const ws = resolve(cwd, WORK_STATE_DIR);
-  try {
-    return existsSync(ws) ? realpathSync(ws) : ws;
-  } catch {
-    return ws;
-  }
-}
+const MAX_STATE_BYTES = 512 * 1024;
 
 /**
- * Validate a declared artifact reference: safe relative path inside
- * `.work-state`, no escapes, not an excluded input. Returns the resolved
- * absolute path + safe relative label, or a rejection reason.
+ * Validate a declared artifact reference as a bounded path inside `.work-state`.
+ * The storage authority performs the canonical root, symlink and traversal
+ * checks; this layer only enforces the report input namespace and exclusions.
  */
 function resolveDeclaredPath(
-  cwd: string,
+  storage: ReportStorageAuthority,
   ref: string,
-): { absPath: string; label: string } | { invalid: "unsafe-path" | "excluded-path" } {
-  if (isAbsolute(ref) || /^[A-Za-z]:[\\/]/.test(ref) || ref.includes("\\")) return { invalid: "unsafe-path" };
-  const segments = ref.split("/");
-  if (segments.some((s) => s === "" || s === "." || s === "..")) return { invalid: "unsafe-path" };
-  const absPath = resolve(cwd, ref);
-  const wsRoot = resolve(cwd, WORK_STATE_DIR);
-  const rel = relative(wsRoot, absPath);
-  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return { invalid: "unsafe-path" };
-  if (isExcludedSourcePath(cwd, absPath)) return { invalid: "excluded-path" };
-  return { absPath, label: cwdRelativeLabel(cwd, absPath) };
+): { relativePath: string; label: string } | { invalid: "unsafe-path" | "excluded-path" } {
+  let relativePath: string;
+  try {
+    relativePath = storagePath(ref);
+  } catch {
+    return { invalid: "unsafe-path" };
+  }
+  if (relativePath !== WORK_STATE_DIR && !relativePath.startsWith(`${WORK_STATE_DIR}/`)) {
+    return { invalid: "unsafe-path" };
+  }
+  if (isExcludedSourcePath(relativePath)) return { invalid: "excluded-path" };
+  return { relativePath, label: relativePath };
 }
 
 /**
- * True when the artifact file escapes the workspace via a symlink — the file
- * exists but its realpath leaves the real work-state root.
+ * Read one bounded text window after metadata confirms a regular file.
+ * Missing, malformed or inaccessible inputs are reported as null so a single
+ * artifact cannot abort the complete snapshot.
  */
-function escapesViaSymlink(cwd: string, absPath: string): boolean {
-  if (!existsSync(absPath)) return false;
-  let real: string;
+function readBoundedText(
+  storage: ReportStorageAuthority,
+  relativePath: string,
+  maxBytes: number,
+): string | null {
   try {
-    real = realpathSync(absPath);
-  } catch {
-    return true; // broken symlink — unusable
-  }
-  const root = workStateRealRoot(cwd);
-  const rel = relative(root, real);
-  return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
-}
-
-/** Total byte size of an existing file; null when absent/unstatable. */
-function statSizeOf(absPath: string): number | null {
-  try {
-    return statSync(absPath).size;
+    const stat = statStorage(storage, relativePath);
+    if (!stat.exists || stat.kind !== "file") return null;
+    return decodeStorageText(readStorageBytes(storage, relativePath, maxBytes));
   } catch {
     return null;
   }
 }
 
-/**
- * Read at most `maxBytes` from the head of a file. Returns the bounded head
- * text; null on any read error. The caller has already stat'ed the file, so
- * this is the single read of the artifact's bounded head window.
- */
-function readBoundedHead(filePath: string, maxBytes: number): string | null {
+/** Total byte size of an existing authority-relative entry. */
+function statSizeOf(storage: ReportStorageAuthority, relativePath: string): number | null {
   try {
-    const fd = openSync(filePath, "r");
-    try {
-      const size = statSync(filePath).size;
-      const want = Math.min(size, Math.max(0, maxBytes));
-      const buf = Buffer.allocUnsafe(Math.max(0, want));
-      const got = want > 0 ? readSync(fd, buf, 0, want, 0) : 0;
-      return got > 0 ? buf.subarray(0, got).toString("utf8") : "";
-    } finally {
-      try {
-        closeSync(fd);
-      } catch {
-        // descriptor already released — ignore
-      }
-    }
+    const stat = statStorage(storage, relativePath);
+    return stat.exists ? stat.size_bytes : null;
   } catch {
     return null;
   }
 }
+/** The storage seam labels symlink rejection distinctly without exposing a path. */
+function isSymlinkStorageFailure(error: unknown): boolean {
+  return error instanceof ReportStorageError
+    && error.reason === "UNSAFE_PATH"
+    && error.message.toLowerCase().includes("symlink");
+}
 
-// ── State content (one read, raw bytes) ──────────────────────────────────────
+// ── State content (one bounded read, raw bytes) ──────────────────────────────
 
 interface StateRead {
   /** Canonical state text exactly as read (digest input). */
@@ -275,41 +442,35 @@ interface StateRead {
   format: "json" | "markdown";
 }
 
-/** Deterministic canonical state text for a session entry (one raw read). */
-function readStateContent(cwd: string, entry: SessionSourceEntry): StateRead {
+/** Deterministic canonical state text for a session entry (one bounded read). */
+function readStateContent(storage: ReportStorageAuthority, entry: SessionSourceEntry): StateRead {
   if (entry.kind === "do-work") {
-    if (entry.statePath && existsSync(entry.statePath)) {
-      try {
-        return { text: readFileSync(entry.statePath, "utf8"), label: cwdRelativeLabel(cwd, entry.statePath), format: "json" };
-      } catch {
-        // fall through — unreadable state yields an empty canonical text
-      }
+    if (entry.statePath) {
+      const text = readBoundedText(storage, entry.statePath, MAX_STATE_BYTES);
+      if (text !== null) return { text, label: entry.statePath, format: "json" };
     }
-    return { text: "", label: entry.statePath ? cwdRelativeLabel(cwd, entry.statePath) : ".work-state", format: "json" };
+    return { text: "", label: entry.statePath ?? WORK_STATE_DIR, format: "json" };
   }
   // CTO: state.json first; markdown-state runs use the evidence/finish files.
-  if (entry.statePath && existsSync(entry.statePath)) {
-    try {
-      return { text: readFileSync(entry.statePath, "utf8"), label: cwdRelativeLabel(cwd, entry.statePath), format: "json" };
-    } catch {
-      // fall through to the markdown candidates
-    }
+  if (entry.statePath) {
+    const text = readBoundedText(storage, entry.statePath, MAX_STATE_BYTES);
+    if (text !== null) return { text, label: entry.statePath, format: "json" };
   }
   const candidates = entry.terminalMarkdown ? [...CTO_MD_FINISH_MARKERS] : [...CTO_MD_EVIDENCE];
   for (const name of candidates) {
-    const p = join(entry.runDir, name);
-    if (existsSync(p)) {
-      try {
-        return { text: readFileSync(p, "utf8"), label: `.work-state/cto/${entry.id}`, format: "markdown" };
-      } catch {
-        continue;
-      }
+    let path: string;
+    try {
+      path = storagePath(entry.runDir, name);
+    } catch {
+      continue;
     }
+    const text = readBoundedText(storage, path, MAX_STATE_BYTES);
+    if (text !== null) return { text, label: entry.runDir, format: "markdown" };
   }
-  return { text: "", label: `.work-state/cto/${entry.id}`, format: "markdown" };
+  return { text: "", label: entry.runDir, format: "markdown" };
 }
 
-/** First `# ` heading of a markdown state text — the run task (like markdownCtoState). */
+/** First `# ` heading of a markdown state text — the run task. */
 function markdownTask(text: string): string {
   const line = text.split("\n").find((l) => l.startsWith("# "));
   return line ? line.replace(/^#\s+/, "").trim() : "";
@@ -317,19 +478,20 @@ function markdownTask(text: string): string {
 
 /**
  * Task for a terminal markdown run: derived from the evidence files exactly
- * like markdownCtoState (cto_discovery.md first, then team-plan.md) — the
- * finish-marker state text (summary.md) is the digest source, not the task.
+ * like markdownCtoState; the finish-marker state text is the digest source.
  */
-function terminalMarkdownTask(runDir: string): string {
+function terminalMarkdownTask(storage: ReportStorageAuthority, runDir: string): string {
   for (const name of ["cto_discovery.md", "team-plan.md"]) {
-    const p = join(runDir, name);
-    if (!existsSync(p)) continue;
+    let path: string;
     try {
-      const task = markdownTask(readFileSync(p, "utf8"));
-      if (task !== "") return task;
+      path = storagePath(runDir, name);
     } catch {
-      // unreadable — try the next evidence file
+      continue;
     }
+    const text = readBoundedText(storage, path, MAX_STATE_BYTES);
+    if (text === null) continue;
+    const task = markdownTask(text);
+    if (task !== "") return task;
   }
   return "";
 }
@@ -346,48 +508,61 @@ interface ArtifactPlan {
   slotFor?: string;
   /** Rejection reason; the artifact is never read when set. */
   invalid?: "unsafe-id" | "unsafe-path" | "excluded-path";
-  /** Resolved absolute path (may not exist → missing/pending/skipped). */
-  absPath?: string;
+  /** Authority-relative path (may not exist → missing/pending/skipped). */
+  relativePath?: string;
   /** Safe relative source label (never absolute, never escaping). */
   label?: string;
 }
 
 /** Deterministic top-level scan of a directory for JSON artifact files. */
 function scanJsonArtifacts(
-  cwd: string,
+  storage: ReportStorageAuthority,
   dir: string,
-  onEntry: (id: string, absPath: string) => void,
+  onEntry: (id: string, relativePath: string) => void,
 ): void {
-  let names: string[];
+  let entries: readonly { name: string; relative_path: string }[];
   try {
-    names = readdirSync(dir);
+    entries = listStorageEntries(storage, dir, MAX_STORAGE_ENTRIES);
   } catch {
     return;
   }
-  names.sort();
-  for (const name of names) {
+  const ordered = [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const entry of ordered) {
+    const { name, relative_path: relativePath } = entry;
     if (EXCLUDED_SOURCE_NAMES[name]) continue;
     if (!name.endsWith(".json")) continue;
-    const absPath = join(dir, name);
+    if (isExcludedSourcePath(relativePath)) continue;
     try {
-      if (!statSync(absPath).isFile()) continue;
+      const stat = statStorage(storage, relativePath);
+      if (!stat.exists || stat.kind !== "file") continue;
     } catch {
       continue;
     }
-    if (isExcludedSourcePath(cwd, absPath)) continue;
-    onEntry(name.slice(0, -".json".length), absPath);
+    onEntry(name.slice(0, -".json".length), relativePath);
   }
 }
 
+
 /** Do-work artifact plan: state.artifacts (declared) + artifacts dir extras. */
 function planDoWorkArtifacts(
-  cwd: string,
+  storage: ReportStorageAuthority,
   entry: Extract<SessionSourceEntry, { kind: "do-work" }>,
   state: TeamState,
+  profile: Readonly<Profile>,
 ): { plans: ArtifactPlan[]; declaredOrder: string[] } {
-  const workflow = state.classification.workflow;
-  const declaredOrder = declaredOrderOf(workflow);
-  const producesByStage = producesByStageOf(workflow);
+  const declaredOrder: string[] = [];
+  const declaredIds = new Set<string>();
+  const producesByStage = new Map<string, string>();
+  for (const stage of profile.stages) {
+    const produced = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
+    for (const id of produced) {
+      if (!declaredIds.has(id)) {
+        declaredIds.add(id);
+        declaredOrder.push(id);
+      }
+      producesByStage.set(id, stage.id);
+    }
+  }
   const declared = new Set(Object.keys(state.artifacts ?? {}));
   const plans = new Map<string, ArtifactPlan>();
 
@@ -397,21 +572,28 @@ function planDoWorkArtifacts(
       plans.set(id, { id, declared: true, owner, invalid: "unsafe-id" });
       continue;
     }
-    const resolved = resolveDeclaredPath(cwd, ref);
+    const resolved = resolveDeclaredPath(storage, ref);
     if ("invalid" in resolved) {
       plans.set(id, { id, declared: true, owner, invalid: resolved.invalid });
       continue;
     }
-    plans.set(id, { id, declared: true, owner, absPath: resolved.absPath, label: resolved.label });
+    plans.set(id, { id, declared: true, owner, relativePath: resolved.relativePath, label: resolved.label });
   }
 
   // Discovered extras: slot files attach to their declared base, anything
   // else stays unclaimed. Excluded inputs are never discovered.
-  scanJsonArtifacts(cwd, entry.artifactsDir, (id, absPath) => {
+  scanJsonArtifacts(storage, entry.artifactsDir, (id, relativePath) => {
     if (declared.has(id)) return;
     const base = slotBaseOf(id, declared);
     const owner = base ? (producesByStage.get(base) ?? "") : "";
-    plans.set(id, { id, declared: false, owner, ...(base ? { slotFor: base } : {}), absPath, label: cwdRelativeLabel(cwd, absPath) });
+    plans.set(id, {
+      id,
+      declared: false,
+      owner,
+      ...(base ? { slotFor: base } : {}),
+      relativePath,
+      label: relativePath,
+    });
   });
 
   return { plans: [...plans.values()], declaredOrder };
@@ -419,46 +601,65 @@ function planDoWorkArtifacts(
 
 /** CTO artifact plan: run-local + team compatibility + validated dod_path. */
 function planCtoArtifacts(
-  cwd: string,
+  storage: ReportStorageAuthority,
   entry: Extract<SessionSourceEntry, { kind: "cto" }>,
   state: CtoState,
   warnings: string[],
+  profile: Readonly<Profile>,
 ): { plans: ArtifactPlan[]; declaredOrder: string[] } {
-  const declaredOrder = declaredOrderOf("cto");
-  const plans = new Map<string, ArtifactPlan>();
-  const add = (id: string, owner: string, absPath: string, label: string): void => {
+  const declaredOrder: string[] = [];
+  const declaredIds = new Set<string>();
+  for (const stage of profile.stages) {
+    const produced = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
+    for (const id of produced) {
+      if (declaredIds.has(id)) continue;
+      declaredIds.add(id);
+      declaredOrder.push(id);
+    }
+  }
+  const plans: Map<string, ArtifactPlan> = new Map();
+  const add = (id: string, owner: string, relativePath: string, label: string): void => {
     if (plans.has(id)) {
       warnings.push(`artifact ${id} exists in multiple locations: first resolution wins`);
       return;
     }
-    plans.set(id, { id, declared: true, owner, absPath, label });
+    plans.set(id, { id, declared: true, owner, relativePath, label });
   };
 
   // 1. Run-local artifacts: .work-state/cto/<runId>/artifacts/*.json.
-  scanJsonArtifacts(cwd, join(entry.runDir, "artifacts"), (id, absPath) => {
-    add(id, "", absPath, cwdRelativeLabel(cwd, absPath));
+  const runArtifacts = storagePath(entry.runDir, "artifacts");
+  scanJsonArtifacts(storage, runArtifacts, (id, relativePath) => {
+    add(id, "", relativePath, relativePath);
   });
 
   // 2. Team compatibility dirs: .work-state/artifacts/<teamId>/*.json.
   for (const team of state.teams ?? []) {
-    scanJsonArtifacts(cwd, ctoTeamArtifactsDir(cwd, team.id), (id, absPath) => {
-      add(id, team.id, absPath, cwdRelativeLabel(cwd, absPath));
+    let teamDir: string;
+    try {
+      teamDir = ctoTeamArtifactsDir(team.id);
+    } catch {
+      warnings.push(`unsafe team id ${team.id}: excluded from rendering`);
+      continue;
+    }
+    scanJsonArtifacts(storage, teamDir, (id, relativePath) => {
+      add(id, team.id, relativePath, relativePath);
     });
   }
 
   // 3. Validated dod_path per team (id "dod"; first resolution wins).
   for (const team of state.teams ?? []) {
     if (!team.dod_path) continue;
-    const resolved = resolveDeclaredPath(cwd, team.dod_path);
+    const resolved = resolveDeclaredPath(storage, team.dod_path);
     if ("invalid" in resolved) {
       warnings.push(`declared path for dod is not a safe relative path: excluded from rendering`);
       continue;
     }
-    add("dod", team.id, resolved.absPath, resolved.label);
+    add("dod", team.id, resolved.relativePath, resolved.label);
   }
 
   return { plans: [...plans.values()], declaredOrder };
 }
+
 
 /** Deterministic model id order: declared produces order → slots → extras. */
 function orderedIds(plans: ArtifactPlan[], declaredOrder: readonly string[]): string[] {
@@ -568,7 +769,7 @@ function buildBody(text: string, originalBytes: number, windowBytes: number, cap
 // ── Artifact model construction ──────────────────────────────────────────────
 
 interface BuildContext {
-  cwd: string;
+  storage: ReportStorageAuthority;
   renderConfig: RenderConfig;
   stageStatuses: Map<string, string>;
   warnings: string[];
@@ -594,7 +795,7 @@ function absentStatusOf(
 }
 
 function buildArtifactModel(plans: ArtifactPlan[], declaredOrder: readonly string[], ctx: BuildContext): VisualizationArtifact[] {
-  const { cwd, renderConfig, stageStatuses, warnings, contributions } = ctx;
+  const { storage, renderConfig, stageStatuses, warnings, contributions } = ctx;
   const windowBytes = renderConfig.options.readWindowBytes;
   const capBytes = renderConfig.options.bodyCapBytes;
   const bodiesEnabled = renderConfig.bodiesEnabled;
@@ -620,8 +821,13 @@ function buildArtifactModel(plans: ArtifactPlan[], declaredOrder: readonly strin
     // Rejected ids are skipped and never read (unsafe id / unsafe path).
     if (plan.invalid === "unsafe-id") {
       warnings.push(`artifact id "${id}" is not a safe path key: skipped`);
-      const size = plan.absPath ? statSizeOf(plan.absPath) : null;
-      contributions.set(id, { id, present: size !== null, sizeBytes: size ?? 0, readBytes: size === null ? 0 : Math.min(size, windowBytes) });
+      const size = plan.relativePath ? statSizeOf(storage, plan.relativePath) : null;
+      contributions.set(id, {
+        id,
+        present: size !== null,
+        sizeBytes: size ?? 0,
+        readBytes: size === null ? 0 : Math.min(size, windowBytes),
+      });
       artifacts.push({ id, owner: plan.owner, status: "skipped", ...slotOf(id) });
       continue;
     }
@@ -632,14 +838,29 @@ function buildArtifactModel(plans: ArtifactPlan[], declaredOrder: readonly strin
       continue;
     }
 
-    const absPath = plan.absPath;
-    if (!absPath) {
+    const relativePath = plan.relativePath;
+    if (!relativePath) {
       contributions.set(id, { id, present: false, sizeBytes: 0, readBytes: 0 });
       artifacts.push({ id, owner: plan.owner, status: "missing", ...slotOf(id) });
       continue;
     }
 
-    const size = statSizeOf(absPath);
+    let stat: StorageStat | null = null;
+    try {
+      stat = statStorage(storage, relativePath);
+    } catch (error) {
+      if (error instanceof ReportStorageError && error.reason === "UNSAFE_PATH") {
+        warnings.push(
+          isSymlinkStorageFailure(error)
+            ? `artifact ${id} escapes the workspace via symlink: skipped`
+            : `artifact ${id} escapes the workspace via an unsafe storage path: skipped`,
+        );
+        contributions.set(id, { id, present: true, sizeBytes: 0, readBytes: 0 });
+        artifacts.push({ id, owner: plan.owner, status: "skipped", ...slotOf(id) });
+        continue;
+      }
+    }
+    const size = stat?.exists ? stat.size_bytes : null;
     if (size === null) {
       // Absent (or unstatable) — declared rules apply; never unreadable.
       const status = absentStatusOf(plan, slotsOfBase, stageStatuses);
@@ -653,15 +874,22 @@ function buildArtifactModel(plans: ArtifactPlan[], declaredOrder: readonly strin
       continue;
     }
 
-    // Symlink/boundary escape on a resolvable file — rejected, never read.
-    if (escapesViaSymlink(cwd, absPath)) {
-      warnings.push(`artifact ${id} escapes the workspace via symlink: skipped`);
-      contributions.set(id, { id, present: true, sizeBytes: size, readBytes: Math.min(size, windowBytes) });
-      artifacts.push({ id, owner: plan.owner, status: "skipped", ...slotOf(id) });
-      continue;
+    let text: string | null;
+    try {
+      text = decodeStorageText(readStorageBytes(storage, relativePath, windowBytes));
+    } catch (error) {
+      if (error instanceof ReportStorageError && error.reason === "UNSAFE_PATH") {
+        warnings.push(
+          isSymlinkStorageFailure(error)
+            ? `artifact ${id} escapes the workspace via symlink: skipped`
+            : `artifact ${id} escapes the workspace via an unsafe storage path: skipped`,
+        );
+        contributions.set(id, { id, present: true, sizeBytes: size, readBytes: 0 });
+        artifacts.push({ id, owner: plan.owner, status: "skipped", ...slotOf(id) });
+        continue;
+      }
+      text = null;
     }
-
-    const text = readBoundedHead(absPath, windowBytes);
     if (text === null) {
       // Read failure (IO) — unreadable within the window.
       warnings.push(`artifact ${id} is unreadable: read error`);
@@ -796,26 +1024,113 @@ function identityBaseOf(entry: SessionSourceEntry): {
     pathKey: kind === "legacy" ? LEGACY_ROOT_PATH_KEY : entry.id,
   };
 }
+function sameProjectIdentity(left: ProjectIdentity, right: ProjectIdentity): boolean {
+  return (
+    left.root_instance_id === right.root_instance_id
+    && left.provider_id === right.provider_id
+    && left.descriptor_fingerprint === right.descriptor_fingerprint
+    && left.executable_provenance.build_fingerprint === right.executable_provenance.build_fingerprint
+    && left.executable_provenance.runtime_fingerprint === right.executable_provenance.runtime_fingerprint
+    && left.catalog_content_digest === right.catalog_content_digest
+    && left.config_byte_sha256 === right.config_byte_sha256
+    && left.config_semantic_sha256 === right.config_semantic_sha256
+    && left.session.session_id === right.session.session_id
+    && left.session.lifecycle_id === right.session.lifecycle_id
+  );
+}
+function sameWorkflowRunIdentity(left: WorkflowRunIdentity, right: WorkflowRunIdentity): boolean {
+  return (
+    left.run_id === right.run_id
+    && left.profile_identity.id === right.profile_identity.id
+    && left.profile_identity.fingerprint === right.profile_identity.fingerprint
+    && sameProjectIdentity(left, right)
+  );
+}
+
+
+function runIdentityForSnapshot(
+  context: BuildSessionSnapshotContext,
+  entry: SessionSourceEntry,
+): WorkflowRunIdentity {
+  const candidate = isDiagnosticEvidenceRecord(entry.state) ? entry.state.run_identity : undefined;
+  const result = validateWorkflowRunIdentity(candidate);
+  if (!result.ok) throw new VisualizationContextError(result.diagnostics);
+  const runIdentity = result.value;
+  if (!sameProjectIdentity(runIdentity, context.project_identity)) {
+    return contextFailure("IDENTITY_MISMATCH", "The persisted run identity does not match the admitted project identity.", {
+      provider_id: context.project_identity.provider_id,
+      run_id: runIdentity.run_id,
+    });
+  }
+  if (entry.kind === "do-work") {
+    const state = entry.state;
+    if (!isDiagnosticEvidenceRecord(state)) {
+      return contextFailure("MIGRATION_REQUIRED", "The workflow state must carry a durable run identity.", {
+        provider_id: runIdentity.provider_id,
+        run_id: runIdentity.run_id,
+      });
+    }
+    const stateProject = validateProjectIdentity(state.project_identity);
+    if (!stateProject.ok) throw new VisualizationContextError(stateProject.diagnostics);
+    if (!sameProjectIdentity(stateProject.value, context.project_identity)) {
+      return contextFailure("IDENTITY_MISMATCH", "The persisted workflow project identity does not match the admitted project identity.", {
+        provider_id: context.project_identity.provider_id,
+        run_id: runIdentity.run_id,
+      });
+    }
+  } else {
+    const state = entry.state;
+    if (!isDiagnosticEvidenceRecord(state) || !isDiagnosticEvidenceRecord(state.plan) || !Array.isArray(state.teams)) {
+      return contextFailure("MIGRATION_REQUIRED", "The CTO state must carry run identities for its plan and teams.", {
+        provider_id: runIdentity.provider_id,
+        run_id: runIdentity.run_id,
+      });
+    }
+    const nested = [
+      state.plan.run_identity,
+      ...state.teams.map((team) => (isDiagnosticEvidenceRecord(team) ? team.run_identity : undefined)),
+    ];
+    for (const candidateIdentity of nested) {
+      const nestedResult = validateWorkflowRunIdentity(candidateIdentity);
+      if (!nestedResult.ok) throw new VisualizationContextError(nestedResult.diagnostics);
+      if (!sameWorkflowRunIdentity(nestedResult.value, runIdentity)) {
+        return contextFailure("IDENTITY_MISMATCH", "Every persisted CTO record must carry the exact run identity.", {
+          provider_id: runIdentity.provider_id,
+          run_id: runIdentity.run_id,
+        });
+      }
+    }
+    if (runIdentity.run_id !== entry.id) {
+      return contextFailure("IDENTITY_MISMATCH", "The persisted CTO run identity does not match the selected run id.", {
+        provider_id: runIdentity.provider_id,
+        run_id: runIdentity.run_id,
+        selected_run_id: entry.id,
+      });
+    }
+  }
+  return runIdentity;
+}
 
 /**
  * Build the immutable normalized session model for one discovered session
  * entry. Never mutates canonical state; never throws for corrupt peers.
  */
 export function buildSessionSnapshot(
-  cwd: string,
+  storage: ReportStorageAuthority,
   entry: SessionSourceEntry,
   generatedAt: string,
-  opts?: BuildSessionSnapshotOptions,
+  opts: BuildSessionSnapshotOptions,
 ): VisualizationSession {
+  const authority = requireReportStorage(storage);
   const identityBase = identityBaseOf(entry);
   const warnings: string[] = [];
   const contributions = new Map<string, DigestArtifactContribution>();
-  const stateRead = readStateContent(cwd, entry);
   const workflow: WorkflowName =
     entry.kind === "cto" ? "cto" : (entry.state?.classification?.workflow ?? "standard");
-  const renderConfig = opts?.renderConfig ?? resolveRenderConfig(workflow, opts?.full ?? false);
+  const snapshotContext = requireSnapshotContext(opts, workflow);
+  const stateRead = readStateContent(authority, entry);
+  const renderConfig = opts.renderConfig ?? resolveRenderConfig(workflow, opts.full ?? false);
   const windowBytes = renderConfig.options.readWindowBytes;
-
   const stateBytes = Buffer.byteLength(stateRead.text, "utf8");
   const provenanceFor = (sourceUpdatedAt: string | undefined, profileHash: string | undefined): VisualizationSession["provenance"] => ({
     ...(sourceUpdatedAt !== undefined ? { sourceUpdatedAt } : {}),
@@ -850,7 +1165,7 @@ export function buildSessionSnapshot(
           title: sessionTitleFor(identityBase.kind, identityBase.id),
           task:
             entry.kind === "cto" && entry.terminalMarkdown === true
-              ? terminalMarkdownTask(entry.runDir)
+              ? terminalMarkdownTask(authority, entry.runDir)
               : "",
           workflow,
           sourceFormat: stateRead.format,
@@ -866,6 +1181,9 @@ export function buildSessionSnapshot(
         degradedReasons,
       };
     }
+    const runIdentity = runIdentityForSnapshot(snapshotContext, entry);
+    const profile = profileForSnapshot(snapshotContext, runIdentity, workflow);
+
 
     // ── Readable state: normal model construction. ─────────────────────────
     const stageStatuses = new Map<string, string>();
@@ -874,31 +1192,38 @@ export function buildSessionSnapshot(
     let declaredOrder: readonly string[] = [];
     let task = "";
     let sourceUpdatedAt: string | undefined;
-    let profileHash: string | undefined;
+    const profileHash = runIdentity.profile_identity.fingerprint;
 
     if (entry.kind === "do-work") {
       const state = entry.state as TeamState;
+      task = state.task;
       for (const s of state.stages ?? []) stageStatuses.set(s.id, s.status);
-      const planned = planDoWorkArtifacts(cwd, entry, state);
+      const planned = planDoWorkArtifacts(authority, entry, state, profile);
       declaredOrder = planned.declaredOrder;
       artifacts = buildArtifactModel(planned.plans, declaredOrder, {
-        cwd,
+        storage: authority,
         renderConfig,
         stageStatuses,
         warnings,
         contributions,
       });
       stagesModel = buildStages(state, artifacts, declaredOrder);
-      task = state.task ?? "";
       if (stateRead.format === "json") sourceUpdatedAt = state.updated_at;
-      if (state.profile_hash) profileHash = state.profile_hash;
+      if (state.profile_hash && state.profile_hash !== profileHash) {
+        return contextFailure("IDENTITY_MISMATCH", "The persisted workflow profile hash does not match the run profile identity.", {
+          provider_id: runIdentity.provider_id,
+          run_id: runIdentity.run_id,
+          expected_digest: profileHash,
+          actual_digest: state.profile_hash,
+        });
+      }
       if (artifacts.length === 0) warnings.push("no artifacts yet");
     } else {
       const state = entry.state as CtoState;
-      const planned = planCtoArtifacts(cwd, entry, state, warnings);
+      const planned = planCtoArtifacts(authority, entry, state, warnings, profile);
       declaredOrder = planned.declaredOrder;
       artifacts = buildArtifactModel(planned.plans, declaredOrder, {
-        cwd,
+        storage: authority,
         renderConfig,
         stageStatuses,
         warnings,
@@ -975,16 +1300,33 @@ function contentUpdatedAtOf(entry: SessionSourceEntry): string | undefined {
  * kind, then id — identical to the manifest's `sourceUpdatedAt` order.
  */
 export function buildSessionSnapshots(
-  cwd: string,
+  storage: ReportStorageAuthority,
   entries: SessionSourceEntry[],
   generatedAt: string,
-  opts?: BuildSessionSnapshotOptions,
+  opts: BuildSessionSnapshotsOptions,
 ): VisualizationSession[] {
-  const sorted = [...entries].sort((a, b) =>
+  const authority = requireReportStorage(storage);
+  if (opts === null || typeof opts !== "object" || Array.isArray(opts)) {
+    return contextFailure("MIGRATION_REQUIRED", "Pass visualization options with an admitted context or contextForEntry resolver.");
+  }
+  if (opts.context === undefined && opts.contextForEntry === undefined) {
+    return contextFailure("MIGRATION_REQUIRED", "Pass an admitted context or contextForEntry resolver to visualization.");
+  }
+  const sorted: SessionSourceEntry[] = [...entries].sort((a, b) =>
     compareSessions(
       { updatedAt: contentUpdatedAtOf(a), kind: sessionKindOf(a), id: a.id },
       { updatedAt: contentUpdatedAtOf(b), kind: sessionKindOf(b), id: b.id },
     ),
   );
-  return sorted.map((entry) => buildSessionSnapshot(cwd, entry, generatedAt, opts));
+  const snapshotOptions: Omit<BuildSessionSnapshotOptions, "context"> = {
+    ...(opts.full === undefined ? {} : { full: opts.full }),
+    ...(opts.renderConfig === undefined ? {} : { renderConfig: opts.renderConfig }),
+  };
+  const resolved: Array<{ entry: SessionSourceEntry; context: BuildSessionSnapshotContext }> = sorted.map((entry) => ({
+    entry,
+    context: contextForSnapshotEntry(opts, entry),
+  }));
+  return resolved.map(({ entry, context }) =>
+    buildSessionSnapshot(authority, entry, generatedAt, { ...snapshotOptions, context }),
+  );
 }

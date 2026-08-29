@@ -23,9 +23,12 @@ import {
 } from "./types.js";
 import { validateTypedControlPlane } from "../engine/workflow-contract.js";
 import type { ControlPlaneProvenance, WorkIdentity } from "../engine/types.js";
+import { createDiagnostic, failureResult, successResult } from "../workflow-v2/diagnostics.js";
+import { validateWorkflowRunIdentity, isProviderId, isSafeCtoId, isWorkflowV2Digest } from "../workflow-v2/identity.js";
+import type { DiagnosticResult, ProjectIdentity, WorkflowRunIdentity, AgentRef, ProfileIdentity } from "../workflow-v2/types.js";
 
 export function ctoStateDir(runId: string, root: string): string {
-  if (!runId || runId === "." || runId === ".." || !/^[A-Za-z0-9._-]+$/.test(runId)) throw new Error("unsafe CTO run id");
+  if (!isSafeCtoId(runId)) throw new Error("unsafe CTO run id");
   const workState = resolve(root, ".work-state");
   const ctoRoot = join(workState, "cto");
   const runDir = join(ctoRoot, runId);
@@ -45,6 +48,102 @@ export function ctoStateDir(runId: string, root: string): string {
   return runDir;
 }
 
+function projectIdentityBindingKey(identity: ProjectIdentity): string {
+  return JSON.stringify([
+    identity.root_instance_id,
+    identity.provider_id,
+    identity.descriptor_fingerprint,
+    identity.executable_provenance.build_fingerprint,
+    identity.executable_provenance.runtime_fingerprint,
+    identity.catalog_content_digest,
+    identity.config_byte_sha256,
+    identity.config_semantic_sha256,
+    identity.session.session_id,
+    identity.session.lifecycle_id,
+  ]);
+}
+
+function runIdentityBindingKey(identity: WorkflowRunIdentity): string {
+  return JSON.stringify([
+    projectIdentityBindingKey(identity),
+    identity.run_id,
+    identity.profile_identity.id,
+    identity.profile_identity.fingerprint,
+  ]);
+}
+
+/** Compare complete project/provider pins, excluding run and profile selection. */
+export function sameCtoProjectIdentity(left: ProjectIdentity, right: ProjectIdentity): boolean {
+  return projectIdentityBindingKey(left) === projectIdentityBindingKey(right);
+}
+
+/** Compare complete durable run identity, including exact catalog profile. */
+export function sameCtoRunIdentity(left: WorkflowRunIdentity, right: WorkflowRunIdentity): boolean {
+  return runIdentityBindingKey(left) === runIdentityBindingKey(right);
+}
+
+/** Validate a durable CTO run identity and reject old/unattributed state. */
+export function validateCtoRunIdentity(
+  current: unknown,
+  expected?: WorkflowRunIdentity,
+): DiagnosticResult<WorkflowRunIdentity> {
+  if (current === undefined || current === null) {
+    return failureResult(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      evidence: { field: "cto.run_identity" },
+      remediation: "Start a fresh CTO lifecycle with the run identity returned by workflow_prepare.",
+    }));
+  }
+  const validated = validateWorkflowRunIdentity(current);
+  if (!validated.ok) return validated;
+  if (expected) {
+    const expectedResult = validateWorkflowRunIdentity(expected);
+    if (!expectedResult.ok) return expectedResult;
+    if (!sameCtoRunIdentity(validated.value, expectedResult.value)) {
+      return failureResult(createDiagnostic({
+        code: "IDENTITY_MISMATCH",
+        operation: "runtime.activate",
+        evidence: {
+          field: "cto.run_identity",
+          provider_id: expectedResult.value.provider_id,
+          run_id: expectedResult.value.run_id,
+        },
+        remediation: "Start a fresh CTO lifecycle for the changed project, provider, catalog, config, session, run, or profile identity.",
+      }));
+    }
+  }
+  return successResult(validated.value);
+}
+
+function assertCtoRunIdentity(current: unknown, expected?: WorkflowRunIdentity): WorkflowRunIdentity {
+  const checked = validateCtoRunIdentity(current, expected);
+  if (!checked.ok) throw new Error(checked.diagnostics.map((diagnostic) => diagnostic.code).join(","));
+  return checked.value;
+}
+
+function validProfileIdentity(value: unknown): value is ProfileIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const profile = value as Record<string, unknown>;
+  return typeof profile.id === "string"
+    && profile.id.length > 0
+    && profile.id === profile.id.trim()
+    && /^[A-Za-z0-9@._:/#-]+$/u.test(profile.id)
+    && isWorkflowV2Digest(profile.fingerprint);
+}
+
+function validAgentRef(value: unknown, providerId: string): value is AgentRef {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const agent = value as Record<string, unknown>;
+  return typeof agent.registered_name === "string"
+    && agent.registered_name.length > 0
+    && agent.registered_name === agent.registered_name.trim()
+    && /^[A-Za-z0-9@._:/#-]+$/u.test(agent.registered_name)
+    && isProviderId(agent.provider_id)
+    && agent.provider_id === providerId
+    && isWorkflowV2Digest(agent.source_fingerprint);
+}
+
 export function ctoStatePath(runId: string, root: string): string {
   return join(ctoStateDir(runId, root), "state.json");
 }
@@ -56,26 +155,27 @@ export function newCtoState(opts: {
   autonomous: boolean;
   /**
    * Model-first PHASE-0 classification (authority for `autonomous`). When
-   * present, `classification.autonomous` is the decision and the top-level
-   * `autonomous` field is mirrored from it for legacy readers — the two can
-   * never disagree by construction. Legacy callers and engine-created
-   * standby runs omit it and keep the explicit top-level flag verbatim.
+   * present, it is persisted and mirrored into the top-level field.
    */
   classification?: ModelClassification;
   plan: TeamPlan;
+  /** Exact run identity allocated by workflow_prepare for this CTO run. */
+  run_identity: WorkflowRunIdentity;
   /** Standby runs are adoptable cross-session (inbox continuity). */
   standby?: boolean;
   /** Session that owns this interactive task run (foreign sessions do not amend it). */
   owner_session?: string;
 }): CtoState {
-  // Model-first: a well-formed classification carries ALL four PHASE-0
-  // fields — string `type`/`complexity`/`confidence` and boolean
-  // `autonomous` — and is the AUTHORITY, mirrored into the top-level field.
-  // A malformed/partial runtime classification object — e.g. loosely typed
-  // JSON parse missing any of the four or with a non-boolean `autonomous` —
-  // must NOT hijack the flag: the explicit caller fallback (opts.autonomous)
-  // applies and the malformed classification is not persisted (mirrors
-  // isStructuredClassification on the markdown path).
+  const runIdentity = assertCtoRunIdentity(opts.run_identity);
+  if (opts.id !== runIdentity.run_id || opts.plan.id !== runIdentity.run_id) {
+    throw new Error("IDENTITY_MISMATCH: CTO run id does not match workflow run identity");
+  }
+  if (!sameCtoRunIdentity(opts.plan.run_identity, runIdentity)) {
+    throw new Error("IDENTITY_MISMATCH: CTO plan is not bound to the workflow run identity");
+  }
+  if (opts.owner_session && opts.owner_session !== runIdentity.session.session_id) {
+    throw new Error("IDENTITY_MISMATCH");
+  }
   const classification =
     opts.classification &&
     typeof opts.classification.type === "string" &&
@@ -91,21 +191,46 @@ export function newCtoState(opts: {
     branch: opts.branch,
     autonomous: classification ? classification.autonomous : opts.autonomous,
     ...(classification ? { classification } : {}),
+    run_identity: runIdentity,
     plan: opts.plan,
-    teams: opts.plan.teams.map((t) => ({ id: t.team, status: "pending", escalations: {} })),
+    teams: opts.plan.teams.map((t) => {
+      if (!t.run_identity || !t.profile_identity || !t.lead_ref || !t.roster_refs) {
+        throw new Error(`MIGRATION_REQUIRED: team '${t.team}' lacks run, catalog, or qualified agent bindings`);
+      }
+      const teamRunIdentity = assertCtoRunIdentity(t.run_identity, runIdentity);
+      if (!validProfileIdentity(t.profile_identity)
+        || t.profile !== t.profile_identity.id) {
+        throw new Error(`IDENTITY_MISMATCH: team '${t.team}' profile binding is not catalog-qualified`);
+      }
+      if (!validAgentRef(t.lead_ref, teamRunIdentity.provider_id)) {
+        throw new Error(`MIGRATION_REQUIRED: team '${t.team}' lead binding is not provider-qualified`);
+      }
+      if (!Array.isArray(t.roster_refs) || !t.roster_refs.every((agent) => validAgentRef(agent, teamRunIdentity.provider_id))) {
+        throw new Error(`MIGRATION_REQUIRED: team '${t.team}' roster binding is not provider-qualified`);
+      }
+      const rosterKeys = new Set(t.roster_refs.map((agent) => `${agent.registered_name}\u0000${agent.provider_id}\u0000${agent.source_fingerprint}`));
+      if (rosterKeys.size !== t.roster_refs.length) {
+        throw new Error(`MIGRATION_REQUIRED: team '${t.team}' roster contains duplicate agent bindings`);
+      }
+      return {
+        id: t.team,
+        status: "pending" as const,
+        escalations: {},
+        run_identity: teamRunIdentity,
+        profile_identity: t.profile_identity,
+        lead_ref: t.lead_ref,
+        roster_refs: t.roster_refs,
+      };
+    }),
     integration: { status: "pending" },
     pause: { kind: "none", reason: "" },
     updated_at: new Date().toISOString(),
     ...(opts.standby === true ? { standby: true } : {}),
     ...(opts.owner_session ? { owner_session: opts.owner_session } : {}),
-    // ── schema-2 defaults (br-zps.1): health/scheduler stay undefined until their owning teams write them ──
     budget: defaultBudgetShape(),
     leases: {},
     decisions: [],
     inbox_quarantine: {},
-    // ── resident control-plane (cto-core): waves accumulate from wave 0; the
-    // dispatcher/resolver owners set active_wave_id/channel_profile, never the
-    // constructor (a fresh run has no wave and no resolved channel yet) ──
     wave_history: [],
   };
 }
@@ -118,27 +243,51 @@ function defaultBudgetShape(): BudgetState {
   };
 }
 
-/** Schema-2 fields a canonical state must carry (default-filled by migrateCtoState). */
-const SCHEMA2_CANONICAL_FIELDS = ["budget", "leases", "decisions", "inbox_quarantine", "wave_history"] as const;
-
 /**
- * Typed control-plane fields are validated (never trusted) on every
- * migration: values present on disk must parse against the shared contract,
- * otherwise they are quarantined behind an `invalid` provenance record.
- * Legacy autonomy/roles/checkpoints stay display/migration inputs — they
- * never become permission here.
+ * Validate the run-bound fields before applying explicit in-memory schema
+ * defaults. This function never annotates an unbound record: callers must
+ * provide the run identity in the raw bytes first.
  */
 function normalizeControlPlaneFields(state: Record<string, unknown>): void {
-  state.control_plane_provenance ??= {
-    completion_intent: "none", checkpoint_policy: "none", roster_policy: "legacy",
-    roster_selection: "none", work_identity: "none", pending: "none",
-    child_join: "none", completion_envelope: "none", legacy_inputs: [],
-    warnings: [], status: "migrated",
-  };
+  const checkedRunIdentity = validateCtoRunIdentity(state.run_identity);
+  if (!checkedRunIdentity.ok) {
+    throw new Error(checkedRunIdentity.diagnostics.map((diagnostic) => diagnostic.code).join(","));
+  }
+  state.run_identity = checkedRunIdentity.value;
+  if (typeof state.id !== "string" || state.id !== checkedRunIdentity.value.run_id) {
+    throw new Error("IDENTITY_MISMATCH: CTO state id does not match workflow run identity");
+  }
+  if (!state.plan || typeof state.plan !== "object" || Array.isArray(state.plan)) {
+    throw new Error("MIGRATION_REQUIRED: CTO state has no run-bound plan");
+  }
+  const planRecord = state.plan as Record<string, unknown>;
+  const checkedPlanIdentity = validateCtoRunIdentity(planRecord.run_identity, checkedRunIdentity.value);
+  if (!checkedPlanIdentity.ok) {
+    throw new Error(checkedPlanIdentity.diagnostics.map((diagnostic) => diagnostic.code).join(","));
+  }
+  planRecord.run_identity = checkedPlanIdentity.value;
+  if (planRecord.id !== checkedRunIdentity.value.run_id) {
+    throw new Error("IDENTITY_MISMATCH: CTO plan id does not match workflow run identity");
+  }
+  if (!Array.isArray(state.teams)) {
+    throw new Error("CONFIG_MALFORMED: CTO teams are malformed");
+  }
+  for (const team of state.teams) {
+    if (!team || typeof team !== "object" || Array.isArray(team)) {
+      throw new Error("CONFIG_MALFORMED: CTO team state is malformed");
+    }
+    const teamRecord = team as Record<string, unknown>;
+    const checkedTeamIdentity = validateCtoRunIdentity(teamRecord.run_identity, checkedRunIdentity.value);
+    if (!checkedTeamIdentity.ok) {
+      throw new Error(checkedTeamIdentity.diagnostics.map((diagnostic) => diagnostic.code).join(","));
+    }
+    teamRecord.run_identity = checkedTeamIdentity.value;
+  }
   const validation = validateTypedControlPlane(state);
   if (!validation.ok) {
+    const prior = state.control_plane_provenance;
     state.control_plane_provenance = {
-      ...(state.control_plane_provenance as ControlPlaneProvenance),
+      ...(prior && typeof prior === "object" ? prior as ControlPlaneProvenance : {}),
       warnings: validation.issues.map((issue) => `${issue.path} ${issue.message}`),
       status: "invalid",
     };
@@ -146,19 +295,15 @@ function normalizeControlPlaneFields(state: Record<string, unknown>): void {
 }
 
 /**
- * Additive, backward-compatible schema migration (br-zps.1, architecture 3.3):
- * ANY input — schema 1, missing schema, or a partial schema-2 state written
- * directly by a standby/legacy writer — becomes schema 2 with the schema-2
- * fields (`budget`, `leases`, `decisions`, `inbox_quarantine`, `wave_history`)
- * default-filled when absent. Present values are preserved untouched, so a
- * complete canonical state passes through unchanged. `health`/`scheduler`
- * stay undefined until their owning teams write them. `active_wave_id` and
- * `channel_profile` are deliberately NOT default-filled: they are set only by
- * their owners (wave lifecycle / channel resolver).
+ * Explicit, in-memory schema migration for an already run-bound state.
+ * Missing/changed identity is rejected; this function never adds identity to
+ * legacy bytes and readCtoState never calls it without validating the bytes.
  */
 export function migrateCtoState(raw: Record<string, unknown>): CtoState {
-  const schema = typeof raw.schema === "number" ? raw.schema : 1;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("CONFIG_MALFORMED");
   const state: Record<string, unknown> = { ...raw };
+  const schema = typeof state.schema === "number" ? state.schema : 1;
+  if (schema > 2) throw new Error("UNSUPPORTED_SCHEMA");
   if (schema < 2) state.schema = 2;
   if (state.budget === undefined) state.budget = defaultBudgetShape();
   if (state.leases === undefined) state.leases = {};
@@ -170,41 +315,127 @@ export function migrateCtoState(raw: Record<string, unknown>): CtoState {
   return state as unknown as CtoState;
 }
 
-/**
- * Canonicalize a run's state on disk (architecture 3.1/3.3): read →
- * migrate → re-write via writeCtoState ONLY when the stored state is not
- * yet canonical — schema below 2, or any schema-2 field missing (a partial
- * schema-2 state written directly by a standby writer). Idempotent: a
- * second call on an already-canonical state performs no write.
- */
-export function canonicalizeState(runId: string, root: string): CtoState {
-  const state = readCtoState(runId, root);
-  if (!state) {
-    throw new Error(`canonicalizeState: no readable CtoState at ${ctoStatePath(runId, root)}`);
-  }
-  let needsWrite = true;
+export function readCtoState(
+  runId: string,
+  root: string,
+  expectedIdentity: WorkflowRunIdentity,
+): CtoState | null {
   try {
     const raw = JSON.parse(readFileSync(ctoStatePath(runId, root), "utf8")) as Record<string, unknown>;
-    const schema = typeof raw.schema === "number" ? raw.schema : 1;
-    needsWrite = schema < 2 || SCHEMA2_CANONICAL_FIELDS.some((field) => raw[field] === undefined);
-  } catch {
-    // unreadable file — persist the migrated in-memory state
-  }
-  if (needsWrite) writeCtoState(state, root);
-  return state;
-}
-
-export function readCtoState(runId: string, root: string): CtoState | null {
-  try {
-    const raw = JSON.parse(readFileSync(ctoStatePath(runId, root), "utf8")) as Record<string, unknown>;
-    return migrateCtoState(raw);
+    if (raw.id !== runId) return null;
+    const checkedIdentity = validateCtoRunIdentity(raw.run_identity, expectedIdentity);
+    if (!checkedIdentity.ok) return null;
+    if (!raw.plan || typeof raw.plan !== "object" || Array.isArray(raw.plan)) return null;
+    const checkedPlanIdentity = validateCtoRunIdentity(
+      (raw.plan as Record<string, unknown>).run_identity,
+      checkedIdentity.value,
+    );
+    if (!checkedPlanIdentity.ok) return null;
+    const state = migrateCtoState(raw);
+    if (state.control_plane_provenance?.status === "invalid") return null;
+    return state;
   } catch {
     return null;
   }
 }
 
-export function writeCtoState(state: CtoState, root: string): string {
+/** Read a CTO run with a required identity and typed diagnostics. */
+export function readBoundCtoState(
+  runId: string,
+  root: string,
+  expectedIdentity: WorkflowRunIdentity,
+): DiagnosticResult<CtoState> {
+  const path = ctoStatePath(runId, root);
+  let raw: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return failureResult(createDiagnostic({
+        code: "CONFIG_MALFORMED",
+        operation: "runtime.activate",
+        evidence: { path },
+        remediation: "Repair the persisted CTO state through an explicit v2 lifecycle.",
+      }));
+    }
+    raw = parsed as Record<string, unknown>;
+  } catch {
+    return failureResult(createDiagnostic({
+      code: "CONFIG_MALFORMED",
+      operation: "runtime.activate",
+      evidence: { path },
+      remediation: "Repair the persisted CTO state through an explicit v2 lifecycle.",
+    }));
+  }
+  if (raw.id !== runId) {
+    return failureResult(createDiagnostic({
+      code: "IDENTITY_MISMATCH",
+      operation: "runtime.activate",
+      evidence: { path, run_id: runId },
+      remediation: "Start a fresh CTO lifecycle for the changed run identity.",
+    }));
+  }
+  const checkedIdentity = validateCtoRunIdentity(raw.run_identity, expectedIdentity);
+  if (!checkedIdentity.ok) return checkedIdentity;
+  if (!raw.plan || typeof raw.plan !== "object" || Array.isArray(raw.plan)) {
+    return failureResult(createDiagnostic({
+      code: "CONFIG_MALFORMED",
+      operation: "runtime.activate",
+      evidence: { path },
+      remediation: "Repair the persisted CTO plan through an explicit v2 lifecycle.",
+    }));
+  }
+  const checkedPlanIdentity = validateCtoRunIdentity(
+    (raw.plan as Record<string, unknown>).run_identity,
+    checkedIdentity.value,
+  );
+  if (!checkedPlanIdentity.ok) return checkedPlanIdentity;
+  let state: CtoState;
+  try {
+    state = migrateCtoState(raw);
+  } catch {
+    return failureResult(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      evidence: { path, run_id: runId },
+      remediation: "Migrate the persisted CTO control plane through an explicit run-bound lifecycle.",
+    }));
+  }
+  if (state.control_plane_provenance?.status === "invalid") {
+    return failureResult(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      evidence: { path },
+      remediation: "Migrate the persisted CTO control plane before resuming.",
+    }));
+  }
+  return successResult(state);
+}
+
+export function writeCtoState(
+  state: CtoState,
+  root: string,
+  expectedIdentity?: WorkflowRunIdentity,
+): string {
+  const identity = assertCtoRunIdentity(state.run_identity, expectedIdentity);
+  if (state.id !== identity.run_id || state.plan.id !== identity.run_id || !sameCtoRunIdentity(state.plan.run_identity, identity)) {
+    throw new Error("IDENTITY_MISMATCH: CTO state does not match workflow run identity");
+  }
+  for (const team of state.teams) assertCtoRunIdentity(team.run_identity, identity);
+  if (state.control_plane_provenance?.status === "invalid") throw new Error("MIGRATION_REQUIRED");
   const path = ctoStatePath(state.id, root);
+  if (existsSync(path)) {
+    let existing: unknown;
+    try {
+      existing = JSON.parse(readFileSync(path, "utf8"));
+    } catch {
+      throw new Error("CONFIG_MALFORMED: existing CTO state is unreadable");
+    }
+    if (!existing || typeof existing !== "object" || Array.isArray(existing)) {
+      throw new Error("CONFIG_MALFORMED: existing CTO state is malformed");
+    }
+    const checkedExisting = validateCtoRunIdentity((existing as Record<string, unknown>).run_identity, identity);
+    if (!checkedExisting.ok) throw new Error(checkedExisting.diagnostics.map((diagnostic) => diagnostic.code).join(","));
+  }
   const dir = ctoStateDir(state.id, root);
   mkdirSync(dir, { recursive: true });
   state.updated_at = new Date().toISOString();
@@ -243,13 +474,22 @@ export function resolveCtoAutonomous(state: Pick<CtoState, "classification" | "a
 function teamOf(state: CtoState, teamId: string): CtoState["teams"][number] | undefined {
   return state.teams.find((t) => t.id === teamId);
 }
-
 /** Transition one team's run status; persists when a root is given. */
-export function setTeamStatus(state: CtoState, teamId: string, status: TeamRunStatus, root: string | null = null): CtoState {
+export function setTeamStatus(
+  state: CtoState,
+  teamId: string,
+  status: TeamRunStatus,
+  root: string | null = null,
+  runIdentity?: WorkflowRunIdentity,
+): CtoState {
+  const identity = assertCtoRunIdentity(state.run_identity, runIdentity);
   const team = teamOf(state, teamId);
-  if (team) team.status = status;
+  if (team) {
+    assertCtoRunIdentity(team.run_identity, identity);
+    team.status = status;
+  }
   if (root) {
-    writeCtoState(state, root);
+    writeCtoState(state, root, identity);
     try {
       recordStageTransition(root, { stageId: teamId, stageStatus: status, runId: state.id });
     } catch {
@@ -266,10 +506,15 @@ export function setEscalation(
   escId: string,
   record: EscalationRecord,
   root: string | null = null,
+  runIdentity?: WorkflowRunIdentity,
 ): CtoState {
+  const identity = assertCtoRunIdentity(state.run_identity, runIdentity);
   const team = teamOf(state, teamId);
-  if (team) team.escalations[escId] = record;
-  if (root) writeCtoState(state, root);
+  if (team) {
+    assertCtoRunIdentity(team.run_identity, identity);
+    team.escalations[escId] = record;
+  }
+  if (root) writeCtoState(state, root, identity);
   return state;
 }
 
@@ -279,11 +524,16 @@ export function setEscalationStatus(
   escId: string,
   status: EscalationStatus,
   root: string | null = null,
+  runIdentity?: WorkflowRunIdentity,
 ): CtoState {
+  const identity = assertCtoRunIdentity(state.run_identity, runIdentity);
   const team = teamOf(state, teamId);
-  const record = team?.escalations[escId];
-  if (team && record) record.status = status;
-  if (root) writeCtoState(state, root);
+  if (team) {
+    assertCtoRunIdentity(team.run_identity, identity);
+    const record = team.escalations[escId];
+    if (record) record.status = status;
+  }
+  if (root) writeCtoState(state, root, identity);
   return state;
 }
 
@@ -293,9 +543,11 @@ export function setIntegration(
   status: CtoState["integration"]["status"],
   note: string | undefined,
   root: string | null = null,
+  runIdentity?: WorkflowRunIdentity,
 ): CtoState {
+  const identity = assertCtoRunIdentity(state.run_identity, runIdentity);
   state.integration = { status, note };
-  if (root) writeCtoState(state, root);
+  if (root) writeCtoState(state, root, identity);
   return state;
 }
 
@@ -304,16 +556,23 @@ export function setCtoPause(
   kind: CtoState["pause"]["kind"],
   reason: string,
   root: string | null = null,
+  runIdentity?: WorkflowRunIdentity,
 ): CtoState {
+  const identity = assertCtoRunIdentity(state.run_identity, runIdentity);
   state.pause = { kind, reason };
-  if (root) writeCtoState(state, root);
+  if (root) writeCtoState(state, root, identity);
   return state;
 }
 
 /** Stamp a mid-run amendment (br-k19); persists when a root is given. */
-export function markAmended(state: CtoState, root: string | null = null): CtoState {
+export function markAmended(
+  state: CtoState,
+  root: string | null = null,
+  runIdentity?: WorkflowRunIdentity,
+): CtoState {
+  const identity = assertCtoRunIdentity(state.run_identity, runIdentity);
   state.amended_at = new Date().toISOString();
-  if (root) writeCtoState(state, root);
+  if (root) writeCtoState(state, root, identity);
   return state;
 }
 
@@ -335,18 +594,20 @@ function assignDefined(target: Record<string, unknown>, patch: Record<string, un
 /**
  * Merge a contract-valid typed control-plane projection into run state;
  * persists when a root is given. Undefined patch entries never erase an
- * existing field. Validation runs BEFORE the merge so an invalid update
- * cannot poison persisted state — legacy autonomy/prose stays display input
- * and never becomes permission here.
+ * existing field. Validation runs BEFORE the merge.
  */
 export function setCtoControlPlane(
   state: CtoState,
   fields: Partial<CtoControlPlaneFields>,
   root: string | null = null,
+  runIdentity?: WorkflowRunIdentity,
 ): CtoState {
+  const requestedIdentity = fields.run_identity ?? runIdentity;
+  const identity = assertCtoRunIdentity(state.run_identity, requestedIdentity);
+  if (fields.run_identity) assertCtoRunIdentity(fields.run_identity, identity);
   assertTypedControlPlane({ ...state, ...fields });
   assignDefined(state as unknown as Record<string, unknown>, fields as Record<string, unknown>);
-  if (root) writeCtoState(state, root);
+  if (root) writeCtoState(state, root, identity);
   return state;
 }
 
@@ -360,12 +621,17 @@ export function setTeamControlPlane(
   teamId: string,
   fields: Partial<Omit<CtoControlPlaneFields, "child_joins" | "migration" | "control_plane_provenance" | "control_plane_status">>,
   root: string | null = null,
+  runIdentity?: WorkflowRunIdentity,
 ): CtoState {
   const team = teamOf(state, teamId);
   if (!team) return state;
+  const requestedIdentity = fields.run_identity ?? runIdentity;
+  const identity = assertCtoRunIdentity(state.run_identity, requestedIdentity);
+  assertCtoRunIdentity(team.run_identity, identity);
+  if (fields.run_identity) assertCtoRunIdentity(fields.run_identity, identity);
   assertTypedControlPlane({ ...team, ...fields });
   assignDefined(team as unknown as Record<string, unknown>, fields as Record<string, unknown>);
-  if (root) writeCtoState(state, root);
+  if (root) writeCtoState(state, root, identity);
   return state;
 }
 
@@ -390,9 +656,19 @@ export function isCtoResident(state: Pick<CtoState, "standby">): boolean {
  */
 export function appendWave(
   state: CtoState,
-  opts: { id: string; source: string; source_id: string; task: string; slice_ids?: string[]; work_identity?: WorkIdentity; now?: string },
+  opts: {
+    id: string;
+    source: string;
+    source_id: string;
+    task: string;
+    slice_ids?: string[];
+    work_identity?: WorkIdentity;
+    run_identity: WorkflowRunIdentity;
+    now?: string;
+  },
   root: string | null = null,
 ): CtoState {
+  const identity = assertCtoRunIdentity(state.run_identity, opts.run_identity);
   const history = state.wave_history ?? [];
   if (history.some((w) => w.source_id === opts.source_id)) return state;
   if (opts.work_identity) assertTypedControlPlane({ work_identity: opts.work_identity });
@@ -405,31 +681,28 @@ export function appendWave(
     status: "active",
     started_at: opts.now ?? new Date().toISOString(),
     ...(opts.work_identity ? { work_identity: opts.work_identity } : {}),
+    run_identity: identity,
   };
   history.push(record);
   state.wave_history = history;
   state.active_wave_id = opts.id;
-  if (root) writeCtoState(state, root);
+  if (root) writeCtoState(state, root, identity);
   return state;
 }
 
-/**
- * Close a wave: stamp `finished_at` + status ("done" | "failed") and clear
- * `active_wave_id` when it points at this wave. Unknown id → return unchanged
- * (never throws). The run itself stays active when resident — the resident
- * carve-out lives in isCtoRunTerminal. Persists when a root is given.
- */
 export function finishWave(
   state: CtoState,
-  opts: { id: string; status: "done" | "failed"; now?: string },
+  opts: { id: string; status: "done" | "failed"; run_identity: WorkflowRunIdentity; now?: string },
   root: string | null = null,
 ): CtoState {
+  const identity = assertCtoRunIdentity(state.run_identity, opts.run_identity);
   const record = (state.wave_history ?? []).find((w) => w.id === opts.id);
   if (!record) return state;
+  assertCtoRunIdentity(record.run_identity, identity);
   record.status = opts.status;
   record.finished_at = opts.now ?? new Date().toISOString();
   if (state.active_wave_id === opts.id) delete state.active_wave_id;
-  if (root) writeCtoState(state, root);
+  if (root) writeCtoState(state, root, identity);
   return state;
 }
 

@@ -12,32 +12,40 @@
  * bounded rollup + per-kind counts, and artifact bodies are redacted and
  * byte-capped.
  */
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core --> */
 
 import {
-  chmodSync,
-  closeSync,
-  existsSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readdirSync,
-  readSync,
-  realpathSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+  decodeStorageText,
+  listStorageEntries,
+  readStorageBytes,
+  requireReportStorage,
+  statStorage,
+  storagePath,
+  writeStorageAtomic,
+  ReportStorageError,
+  type ReportStorageAuthority,
+} from "./storage.js";
 
-import { loadProfile } from "../engine/profile.js";
-import { resolveConfig, resolveAgentForRole } from "../engine/config.js";
-import type { Profile, RoleConfig, StageDef, StageStatus, TeamState } from "../engine/types.js";
+import { createDiagnostic, isDiagnosticEvidenceRecord } from "../workflow-v2/diagnostics.js";
+import { isProviderId, isWorkflowV2Digest, validateProjectIdentity, validateWorkflowRunIdentity } from "../workflow-v2/identity.js";
+import type {
+  AgentRef,
+  EffectivePolicy,
+  PolicySnapshot,
+  ProjectIdentity,
+  ProviderCatalog,
+  WorkflowRunIdentity,
+  WorkflowV2Diagnostic,
+} from "../workflow-v2/types.js";
+import type { Profile, StageDef, TeamState } from "../engine/types.js";
+import { loadProfileByIdentity } from "../engine/profile.js";
 import { assessRunHealth } from "../cto/health.js";
-import { loadTeamDefs } from "../cto/plan.js";
-import type { CtoState, RunHealth, TeamDef, TeamRunStatus } from "../cto/types.js";
-import { readObservabilityPointer } from "../observability/recorder.js";
+import type { CtoState, RunHealth, TeamRunStatus } from "../cto/types.js";
 import type { ObservabilityEvent, ObservabilityPointer } from "../observability/events.js";
+import { rollupFromEvents } from "../observability/recorder.js";
 import { redactReportBody } from "./redact.js";
 import {
+  projectReportWorkflowRunIdentity,
   resolveCtoSource,
   resolveDoWorkSource,
   TEAM_ARTIFACTS_DIR,
@@ -67,7 +75,273 @@ const DEFAULT_MAX_ARTIFACT_BYTES = 16 * 1024;
 const MAX_EVENT_BYTES = 2 * 1024 * 1024;
 const MAX_EVENT_LINES = 5000;
 const SUMMARY_CAP_FACTOR = 4;
+const MAX_REPORT_IDENTITY_CHARS = 512;
+const SAFE_REPORT_IDENTITY_PATTERN = /^[A-Za-z0-9@._:/#-]+$/u;
 
+
+/**
+ * Identity text may be copied into a report diagnostic, so keep the same
+ * bounded identifier vocabulary as the canonical identity validator.
+ */
+function isSafeReportIdentityText(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= MAX_REPORT_IDENTITY_CHARS
+    && value === value.trim()
+    && SAFE_REPORT_IDENTITY_PATTERN.test(value);
+}
+
+function redactedReportIdentityText(value: unknown): string {
+  return isSafeReportIdentityText(value) ? value : "[redacted]";
+}
+
+
+export interface ReportAssemblyContext {
+  readonly policySnapshot: Readonly<PolicySnapshot>;
+  readonly effectivePolicy: Readonly<EffectivePolicy>;
+  readonly catalog: Readonly<ProviderCatalog>;
+  readonly project_identity: Readonly<ProjectIdentity>;
+  readonly agentInventory: readonly AgentRef[];
+}
+
+function sameProjectIdentity(
+  left: ProjectIdentity,
+  right: ProjectIdentity,
+): boolean {
+  return left.root_instance_id === right.root_instance_id
+    && left.provider_id === right.provider_id
+    && left.descriptor_fingerprint === right.descriptor_fingerprint
+    && left.executable_provenance.build_fingerprint === right.executable_provenance.build_fingerprint
+    && left.executable_provenance.runtime_fingerprint === right.executable_provenance.runtime_fingerprint
+    && left.catalog_content_digest === right.catalog_content_digest
+    && left.config_byte_sha256 === right.config_byte_sha256
+    && left.config_semantic_sha256 === right.config_semantic_sha256
+    && left.session.session_id === right.session.session_id
+    && left.session.lifecycle_id === right.session.lifecycle_id;
+}
+function sameWorkflowRunIdentity(left: WorkflowRunIdentity, right: WorkflowRunIdentity): boolean {
+  return left.run_id === right.run_id
+    && left.profile_identity.id === right.profile_identity.id
+    && left.profile_identity.fingerprint === right.profile_identity.fingerprint
+    && sameProjectIdentity(left, right);
+}
+
+
+export class ReportAssemblyError extends Error {
+  readonly diagnostic: WorkflowV2Diagnostic;
+
+  constructor(
+    code: WorkflowV2Diagnostic["code"],
+    message: string,
+    field: string,
+  ) {
+    super(`${code}: ${message}`);
+    this.name = "ReportAssemblyError";
+    this.diagnostic = createDiagnostic({
+      code,
+      operation: "management.status",
+      evidence: { field },
+      remediation: message,
+    });
+  }
+}
+
+
+/**
+ * Report options carry the same immutable admission context as the runtime.
+ * The context is required at the type boundary and is revalidated at runtime
+ * so JavaScript callers cannot fall back to cwd/config discovery.
+ */
+export type ReportAssemblyOptions = BuildSessionReportOptions & ReportAssemblyContext;
+
+function requireReportContext(options: ReportAssemblyOptions): ReportAssemblyContext {
+  const { policySnapshot, effectivePolicy, catalog, project_identity, agentInventory } = options;
+  if (!policySnapshot || !effectivePolicy || !catalog || !project_identity || !Array.isArray(agentInventory)) {
+    throw new ReportAssemblyError(
+      "MIGRATION_REQUIRED",
+      "session reports require the admitted provider policy, catalog, inventory, and project identity",
+      "report_context",
+    );
+  }
+  const checked = validateProjectIdentity(project_identity);
+  if (!checked.ok) {
+    throw new ReportAssemblyError(
+      "IDENTITY_MISMATCH",
+      "session report project identity is malformed",
+      "project_identity",
+    );
+  }
+  const provider = effectivePolicy.provider;
+  const documentProvider = policySnapshot.document?.provider;
+  if (
+    !provider
+    || !documentProvider
+    || !isProviderId(provider.id)
+    || provider.protocol_version !== 2
+    || !isWorkflowV2Digest(provider.descriptor_fingerprint)
+    || !isWorkflowV2Digest(provider.catalog_content_digest)
+    || provider.id !== documentProvider.id
+    || provider.protocol_version !== documentProvider.protocol_version
+    || provider.descriptor_fingerprint !== documentProvider.descriptor_fingerprint
+    || provider.catalog_content_digest !== documentProvider.catalog_content_digest
+    || provider.id !== checked.value.provider_id
+    || provider.descriptor_fingerprint !== checked.value.descriptor_fingerprint
+    || provider.catalog_content_digest !== checked.value.catalog_content_digest
+    || !isWorkflowV2Digest(catalog.content_digest)
+    || catalog.content_digest !== checked.value.catalog_content_digest
+    || policySnapshot.byte_sha256 !== checked.value.config_byte_sha256
+    || policySnapshot.semantic_sha256 !== checked.value.config_semantic_sha256
+  ) {
+    throw new ReportAssemblyError(
+      "IDENTITY_MISMATCH",
+      "session report admission context is not one immutable provider/config selection",
+      "provider",
+    );
+  }
+  const selection = effectivePolicy.workflow;
+  if (!selection || (selection.selection !== "fixed" && selection.selection !== "matrix")) {
+    throw new ReportAssemblyError(
+      "CONFIG_MALFORMED",
+      "session report requires a typed matrix/fixed workflow selection",
+      "effectivePolicy.workflow",
+    );
+  }
+  if (selection.selection === "fixed") {
+    const profile = selection.profile_identity;
+    if (
+      !isDiagnosticEvidenceRecord(profile)
+      || !isSafeReportIdentityText(profile.id)
+      || !isWorkflowV2Digest(profile.fingerprint)
+      || !catalog.profiles.some((candidate) =>
+        candidate.identity.id === profile.id
+        && candidate.identity.fingerprint === profile.fingerprint
+      )
+    ) {
+      throw new ReportAssemblyError(
+        "PROFILE_UNAVAILABLE",
+        "fixed effective policy profile is not present in the admitted catalog",
+        "effectivePolicy.workflow.profile_identity",
+      );
+    }
+  } else if (Object.prototype.hasOwnProperty.call(selection, "profile_identity")) {
+    throw new ReportAssemblyError(
+      "CONFIG_MALFORMED",
+      "matrix effective policy cannot carry a profile identity",
+      "effectivePolicy.workflow.profile_identity",
+    );
+  }
+  const byName = new Map<string, AgentRef>();
+  for (const candidate of agentInventory) {
+    if (
+      !candidate
+      || typeof candidate.registered_name !== "string"
+      || candidate.registered_name.trim().length === 0
+      || !isProviderId(candidate.provider_id)
+      || !isWorkflowV2Digest(candidate.source_fingerprint)
+      || candidate.provider_id !== checked.value.provider_id
+    ) {
+      throw new ReportAssemblyError(
+        "AGENT_COLLISION",
+        "session report inventory contains an invalid or unselected-provider identity",
+        "agentInventory",
+      );
+    }
+    const prior = byName.get(candidate.registered_name);
+    if (prior && (
+      prior.provider_id !== candidate.provider_id
+      || prior.source_fingerprint !== candidate.source_fingerprint
+    )) {
+      throw new ReportAssemblyError(
+        "AGENT_COLLISION",
+        "session report inventory maps one registered name to multiple identities",
+        "agentInventory",
+      );
+    }
+    byName.set(candidate.registered_name, candidate);
+  }
+  for (const [role, ref] of Object.entries(effectivePolicy.roles ?? {})) {
+    if (
+      !ref
+      || !isProviderId(ref.provider_id)
+      || !isWorkflowV2Digest(ref.source_fingerprint)
+      || ref.provider_id !== checked.value.provider_id
+      || byName.get(ref.registered_name)?.source_fingerprint !== ref.source_fingerprint
+    ) {
+      throw new ReportAssemblyError(
+        "CONFIG_MALFORMED",
+        `session report policy role '${redactedReportIdentityText(role)}' is absent from the admitted provider inventory`,
+        `role:${redactedReportIdentityText(role)}`,
+      );
+    }
+  }
+  for (const [index, rule] of (effectivePolicy.scope_map ?? []).entries()) {
+    const ref = rule?.dev_agent;
+    if (
+      !ref
+      || !isProviderId(ref.provider_id)
+      || !isWorkflowV2Digest(ref.source_fingerprint)
+      || ref.provider_id !== checked.value.provider_id
+      || byName.get(ref.registered_name)?.source_fingerprint !== ref.source_fingerprint
+    ) {
+      throw new ReportAssemblyError(
+        "CONFIG_MALFORMED",
+        `session report scope mapping '${index}' is absent from the admitted provider inventory`,
+        `scope_map:${index}`,
+      );
+    }
+  }
+  return {
+    policySnapshot,
+    effectivePolicy,
+    catalog,
+    project_identity: checked.value,
+    agentInventory,
+  };
+}
+function profileForContext(
+  context: ReportAssemblyContext,
+  runIdentity: WorkflowRunIdentity,
+  workflow: string,
+): Profile {
+  const identity = runIdentity.profile_identity;
+  if (identity.id !== workflow) {
+    throw new ReportAssemblyError(
+      "IDENTITY_MISMATCH",
+      `session workflow '${redactedReportIdentityText(workflow)}' differs from the selected run profile`,
+      "state.run_identity.profile_identity",
+    );
+  }
+  const selection = context.effectivePolicy.workflow;
+  if (
+    selection.selection === "fixed"
+    && (
+      selection.profile_identity.id !== identity.id
+      || selection.profile_identity.fingerprint !== identity.fingerprint
+    )
+  ) {
+    throw new ReportAssemblyError(
+      "IDENTITY_MISMATCH",
+      "session run profile differs from the fixed effective-policy profile",
+      "state.run_identity.profile_identity",
+    );
+  }
+  const loaded = loadProfileByIdentity(context.catalog, identity);
+  if (!loaded.ok) {
+    throw new ReportAssemblyError(
+      "PROFILE_UNAVAILABLE",
+      `session workflow '${redactedReportIdentityText(workflow)}' is unavailable in the selected provider catalog`,
+      "state.run_identity.profile_identity",
+    );
+  }
+  if (loaded.value.name !== workflow) {
+    throw new ReportAssemblyError(
+      "IDENTITY_MISMATCH",
+      `catalog profile '${redactedReportIdentityText(identity.id)}' has workflow '${redactedReportIdentityText(loaded.value.name)}'`,
+      "state.run_identity.profile_identity",
+    );
+  }
+  return loaded.value;
+}
 // ── Session selection ───────────────────────────────────────────────────────
 
 interface DoWorkResolved {
@@ -88,65 +362,71 @@ interface CtoResolved {
   format: "json" | "markdown";
 }
 
-/** Resolve a do-work TeamState; null when not found (id probe or empty work-state). */
-function resolveDoWork(cwd: string, id?: string): DoWorkResolved | null {
-  // Delegated: deterministic feature/legacy/latest discovery with the exact
-  // report selectors lives in session-source.ts (architecture-2).
-  return resolveDoWorkSource(cwd, id);
+/** Resolve a do-work TeamState; null when not found. */
+function resolveDoWork(storage: ReportStorageAuthority, id?: string): DoWorkResolved | null {
+  return resolveDoWorkSource(storage, id);
 }
 
-/** Resolve a CTO run; null when not found (id probe or no runs). */
-function resolveCto(cwd: string, id?: string): CtoResolved | null {
-  // Delegated: deterministic JSON-first/markdown-fallback discovery with the
-  // exact report selectors lives in session-source.ts (architecture-2).
-  return resolveCtoSource(cwd, id);
+/** Resolve a CTO run; null when not found. */
+function resolveCto(storage: ReportStorageAuthority, id?: string): CtoResolved | null {
+  return resolveCtoSource(storage, id);
 }
 
-/** Auto-detect: the newest of the best do-work state and best CTO run. */
-function guessKind(cwd: string, id?: string): SessionKind {
+/** Auto-detect the newest of the best do-work state and best CTO run. */
+function guessKind(storage: ReportStorageAuthority, id?: string): SessionKind {
   if (id) {
-    if (resolveDoWork(cwd, id)) return "do-work";
-    if (resolveCto(cwd, id)) return "cto";
-    throw new Error(`no do-work or cto session found for id "${id}" under ${resolve(cwd, WORK_STATE_DIR)}`);
+    if (resolveDoWork(storage, id)) return "do-work";
+    if (resolveCto(storage, id)) return "cto";
+    throw new Error(`no do-work or cto session found for id "${redactedReportIdentityText(id)}" under ${WORK_STATE_DIR}`);
   }
-  const dw = resolveDoWork(cwd);
-  const cto = resolveCto(cwd);
+  const dw = resolveDoWork(storage);
+  const cto = resolveCto(storage);
   if (dw && cto) return cto.state.updated_at > dw.state.updated_at ? "cto" : "do-work";
   if (dw) return "do-work";
   if (cto) return "cto";
-  throw new Error(`no do-work or cto session found under ${resolve(cwd, WORK_STATE_DIR)}`);
+  throw new Error(`no do-work or cto session found under ${WORK_STATE_DIR}`);
+}
+
+function storageDiagnosticCode(error: ReportStorageError): WorkflowV2Diagnostic["code"] {
+  return error.reason === "CAPABILITY_MISSING"
+    || error.reason === "IDENTITY_MISMATCH"
+    || error.reason === "UNSAFE_PATH"
+    ? error.reason
+    : "MIGRATION_REQUIRED";
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 export function buildSessionReport(
-  cwd: string,
+  storage: ReportStorageAuthority,
   selector: SessionSelector = {},
-  options: BuildSessionReportOptions = {},
+  options: ReportAssemblyOptions,
 ): SessionReport {
-  const kind = selector.kind ?? guessKind(cwd, selector.id);
-  if (kind === "cto") {
-    const run = resolveCto(cwd, selector.id);
-    if (!run) {
-      const id = selector.id ?? "latest";
-      throw new Error(`cto session "${id}" not found (no state.json and no markdown fallback)`);
+  const authority = requireReportStorage(storage);
+  try {
+    const context = requireReportContext(options);
+    const kind = selector.kind ?? guessKind(authority, selector.id);
+    if (kind === "cto") {
+      const run = resolveCto(authority, selector.id);
+      if (!run) {
+        const id = selector.id ?? "latest";
+        throw new Error(`cto session "${id}" not found (no state.json and no markdown fallback)`);
+      }
+      return assembleCto(authority, run, options, context);
     }
-    return assembleCto(cwd, run, options);
+    const dw = resolveDoWork(authority, selector.id);
+    if (!dw) {
+      const id = selector.id ?? "latest";
+      throw new Error(`do-work session "${id}" not found (no per-feature or legacy state.json)`);
+    }
+    return assembleDoWork(authority, dw, options, context);
+  } catch (error) {
+    if (error instanceof ReportStorageError) {
+      throw new ReportAssemblyError(storageDiagnosticCode(error), error.message, "storage");
+    }
+    throw error;
   }
-  const dw = resolveDoWork(cwd, selector.id);
-  if (!dw) {
-    const id = selector.id ?? "latest";
-    throw new Error(`do-work session "${id}" not found (no per-feature or legacy state.json)`);
-  }
-  return assembleDoWork(cwd, dw, options);
 }
-
-// ── Stage provenance (agents / inputs / outputs) ────────────────────────────
-
-/**
- * Truthful entry for orchestrator stages: they run in the main session, not
- * via a spawned role. The literal descriptor avoids inventing an agent/model.
- */
 const ORCHESTRATOR_AGENT: StageAgentInfo = { name: "main session", role: "orchestrator", source: "workflow" };
 
 /**
@@ -228,77 +508,113 @@ function stagePromptPreview(def: StageDef, task: string, agents: StageAgentInfo[
 }
 
 /**
- * Provenance for a profile stage. `source` is always "workflow": the entry
- * is derived from the loaded profile + resolved role config. Runtime
- * observations (global agent/tool counts) are never stage-correlated here
- * and are therefore never claimed. Returns undefined when no truthful roster
- * exists (custom/legacy stages, def without roles, or a roster of only
- * unresolved template roles).
+ * Provenance for a profile stage. Every emitted agent comes from the exact
+ * role key in the admitted effective policy and an unchanged inventory entry.
+ * A missing qualified mapping makes the roster unavailable; no flat or cwd
+ * configuration lookup is permitted in report assembly.
  */
-function stageAgents(def: StageDef, config: RoleConfig): StageAgentInfo[] | undefined {
+function stageAgents(def: StageDef, context: ReportAssemblyContext): StageAgentInfo[] | undefined {
   if (def.type === "orchestrator") return [ORCHESTRATOR_AGENT];
-  const roster = effectiveRoster(def, config);
+  const roster = effectiveRoster(def);
   if (roster.length === 0) return undefined;
-  return roster.map((role) => ({
-    name: resolveAgentForRole(role, config),
-    role,
-    source: "workflow" as const,
-  }));
-}
-
-/**
- * Effective role roster for a stage: profile roles (consilium `roles` /
- * single `role`) + configured `roster_overrides` (replace/add/remove) from
- * team.config.json. Profile `conditional` additions (`if: scope.has_…`) are
- * NOT evaluated — scope needs a file scan the report does not have, so they
- * are only applied when the project config declares them statically. Roles
- * that remain unresolved `${scope.*}` templates are dropped for the same
- * reason: the report cannot claim an agent it has no scope evidence for.
- */
-function effectiveRoster(def: StageDef, config: RoleConfig): string[] {
-  let roster: string[];
-  if (def.roles && def.roles.length > 0) roster = [...def.roles];
-  else if (def.role) roster = [def.role];
-  else return [];
-  const override = config.roster_overrides?.[def.id];
-  if (override) {
-    if (Array.isArray(override.replace)) roster = [...override.replace];
-    if (Array.isArray(override.add)) roster.push(...override.add);
-    if (Array.isArray(override.remove)) roster = roster.filter((r) => !override.remove!.includes(r));
+  const agents: StageAgentInfo[] = [];
+  for (const role of roster) {
+    const ref = context.effectivePolicy.roles[role];
+    if (!ref) return undefined;
+    const observed = context.agentInventory.find((candidate) =>
+      candidate.registered_name === ref.registered_name
+      && candidate.provider_id === ref.provider_id
+      && candidate.source_fingerprint === ref.source_fingerprint
+    );
+    if (!observed) return undefined;
+    agents.push({ name: ref.registered_name, role, source: "workflow" });
   }
-  return roster.filter((r) => !isUnresolvedTemplateRole(r));
+  return agents;
 }
 
 /**
- * Lead provenance for a CTO team stage, from the consumer-owned
- * `.omp/teams.json` registry (`loadTeamDefs` — missing/malformed → no
- * entries, never throws). No registry entry → undefined: the lead agent is
- * not invented. The `lead` is a configured agent name, never a model claim.
+ * Return only profile-declared roles. Effective roster patches are already
+ * applied by host admission/engine dispatch; this read-only report view never
+ * reconstructs them from a legacy map.
  */
-function teamLeadAgents(teamId: string, teamDefs: Map<string, TeamDef>): StageAgentInfo[] | undefined {
-  const def = teamDefs.get(teamId);
-  if (!def) return undefined;
-  return [{ name: def.lead, role: "team-lead", source: "workflow" as const }];
+function effectiveRoster(def: StageDef): string[] {
+  const roster = def.roles && def.roles.length > 0
+    ? [...def.roles]
+    : def.role
+      ? [def.role]
+      : [];
+  return roster.filter((role) => !isUnresolvedTemplateRole(role));
+}
+
+/** CTO team provenance is taken from the persisted qualified plan/state refs. */
+function teamLeadAgents(teamId: string, state: CtoState, context: ReportAssemblyContext): StageAgentInfo[] | undefined {
+  const team = state.teams.find((candidate) => candidate.id === teamId);
+  const plan = state.plan.teams.find((candidate) => candidate.team === teamId);
+  const ref = team?.lead_ref ?? plan?.lead_ref;
+  if (!ref || ref.provider_id !== context.project_identity.provider_id) return undefined;
+  const observed = context.agentInventory.find((candidate) =>
+    candidate.registered_name === ref.registered_name
+    && candidate.provider_id === ref.provider_id
+    && candidate.source_fingerprint === ref.source_fingerprint
+  );
+  if (!observed) return undefined;
+  return [{ name: ref.registered_name, role: "team-lead", source: "workflow" as const }];
 }
 
 // ── do-work assembly ────────────────────────────────────────────────────────
 
-function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionReportOptions): SessionReport {
+function assembleDoWork(
+  storage: ReportStorageAuthority,
+  r: DoWorkResolved,
+  options: ReportAssemblyOptions,
+  context: ReportAssemblyContext,
+): SessionReport {
   const warnings: string[] = [];
   const state = r.state;
-  const profile = loadProfile(state.classification.workflow);
+  if (r.isLegacy) {
+    throw new ReportAssemblyError(
+      "MIGRATION_REQUIRED",
+      "legacy do-work state is not a report authority",
+      "state",
+    );
+  }
+  const stateProject = validateProjectIdentity(state.project_identity);
+  if (!stateProject.ok || !sameProjectIdentity(stateProject.value, context.project_identity)) {
+    throw new ReportAssemblyError(
+      "IDENTITY_MISMATCH",
+      "STATE_STALE: do-work state project identity differs from report admission",
+      "state.project_identity",
+    );
+  }
+  const runIdentityValue = state.run_identity;
+  if (!runIdentityValue) {
+    throw new ReportAssemblyError(
+      "MIGRATION_REQUIRED",
+      "do-work state has no workflow run identity",
+      "state.run_identity",
+    );
+  }
+  const stateIdentity = validateWorkflowRunIdentity(runIdentityValue);
+  if (!stateIdentity.ok || !sameProjectIdentity(stateIdentity.value, context.project_identity)) {
+    throw new ReportAssemblyError(
+      "IDENTITY_MISMATCH",
+      "STATE_STALE: do-work state run identity differs from report admission project identity",
+      "state.run_identity",
+    );
+  }
+  const profile = profileForContext(context, stateIdentity.value, state.classification.workflow);
   const stageDefs = new Map<string, StageDef>();
-  if (profile) for (const s of profile.stages) stageDefs.set(s.id, s);
-  const config = resolveConfig(cwd);
-
-  const { telemetry, events } = doWorkTelemetry(cwd, r, warnings);
+  for (const stage of profile.stages) {
+    stageDefs.set(stage.id, stage);
+  }
+  const { telemetry, events } = doWorkTelemetry(storage, r, warnings);
   const stageEventTimes = latestTransitionTimes(events, (e) => e.stageId);
   const artifactEventTimes = latestTransitionTimes(events, (e) => e.artifactId);
 
   // Artifacts first — stage `at` falls back to the produced artifact's time.
   const declaredProduces = new Map<string, string>(); // artifactId -> owner stage
-  if (profile) {
-    for (const s of profile.stages) for (const id of asList(s.produces)) declaredProduces.set(id, s.id);
+  for (const stage of profile.stages) {
+    for (const id of asList(stage.produces)) declaredProduces.set(id, stage.id);
   }
   const artifacts: ReportArtifact[] = [];
   const artifactMtimes = new Map<string, string>(); // artifactId -> iso
@@ -307,37 +623,36 @@ function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionRep
   const pushArtifact = (input: ArtifactInput) => {
     if (builtIds.has(input.id)) return;
     builtIds.add(input.id);
-    const art = buildArtifact(input, options, warnings);
+    const art = buildArtifact(storage, input, options, warnings);
     artifacts.push(art);
     if (art.mtime) artifactMtimes.set(input.id, art.mtime);
   };
 
   for (const [artifactId, ownerStage] of declaredProduces) {
     const stageStatus = state.stages.find((s) => s.id === ownerStage)?.status ?? "pending";
-    const filePath = artifactFilePath(cwd, r, artifactId);
+    const relativePath = artifactFilePath(storage, r, artifactId);
+    const present = relativePath !== null && statStorage(storage, relativePath).kind === "file";
     pushArtifact({
       id: artifactId,
       owner: ownerStage,
-      filePath,
-      status: !filePath || !existsSync(filePath) ? (stageStatus === "skipped" ? "skipped" : "missing") : "produced",
+      relativePath,
+      status: !present ? (stageStatus === "skipped" ? "skipped" : "missing") : "produced",
     });
   }
   // Undeclared artifacts agents wrote directly (honest extras).
-  if (existsSync(r.artifactsDir)) {
-    try {
-      for (const file of readdirSync(r.artifactsDir)) {
-        if (!file.endsWith(".json")) continue;
-        const artifactId = file.replace(/\.json$/, "");
-        if (declaredProduces.has(artifactId)) continue;
-        pushArtifact({
-          id: artifactId,
-          owner: "extra",
-          filePath: join(r.artifactsDir, file),
-          status: "produced",
-        });
-      }
-    } catch {
-      warnings.push(`artifacts dir unreadable: ${r.artifactsDir}`);
+  const artifactsStat = statStorage(storage, r.artifactsDir);
+  if (artifactsStat.exists && artifactsStat.kind === "directory") {
+    for (const entry of listStorageEntries(storage, r.artifactsDir, 4096)) {
+      const file = entry.name;
+      if (!file.endsWith(".json")) continue;
+      const artifactId = file.replace(/\.json$/u, "");
+      if (declaredProduces.has(artifactId)) continue;
+      pushArtifact({
+        id: artifactId,
+        owner: "extra",
+        relativePath: entry.relative_path,
+        status: "produced",
+      });
     }
   }
 
@@ -347,7 +662,7 @@ function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionRep
       ? [...declaredProduces.entries()].filter(([, owner]) => owner === s.id).map(([id]) => id)
       : [];
     const artifactTime = produced.map((id) => artifactEventTimes.get(id) ?? artifactMtimes.get(id)).find(Boolean);
-    const agents = def ? stageAgents(def, config) : undefined;
+    const agents = def ? stageAgents(def, context) : undefined;
     return {
       id: s.id,
       title: def?.title,
@@ -454,16 +769,56 @@ function doWorkEdges(state: TeamState, profile: Profile | null): SessionEdge[] {
 
 // ── CTO assembly ────────────────────────────────────────────────────────────
 
-function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOptions): SessionReport {
+function assembleCto(
+  storage: ReportStorageAuthority,
+  r: CtoResolved,
+  options: ReportAssemblyOptions,
+  context: ReportAssemblyContext,
+): SessionReport {
   const warnings: string[] = [];
   const state = r.state;
-  const profile = loadProfile("cto");
+  const runIdentityValue = state.run_identity;
+  if (!runIdentityValue) {
+    throw new ReportAssemblyError(
+      "MIGRATION_REQUIRED",
+      "CTO state has no workflow run identity",
+      "state.run_identity",
+    );
+  }
+  const stateIdentity = projectReportWorkflowRunIdentity(runIdentityValue);
+  if (
+    !stateIdentity
+    || stateIdentity.run_id !== r.id
+    || !sameProjectIdentity(stateIdentity, context.project_identity)
+  ) {
+    throw new ReportAssemblyError(
+      "IDENTITY_MISMATCH",
+      "STATE_STALE: CTO state run identity differs from report admission project identity",
+      "state.run_identity",
+    );
+  }
+  const planIdentity = projectReportWorkflowRunIdentity(state.plan.run_identity);
+  if (!planIdentity || !sameWorkflowRunIdentity(planIdentity, stateIdentity)) {
+    throw new ReportAssemblyError(
+      "IDENTITY_MISMATCH",
+      "STATE_STALE: CTO plan run identity differs from CTO state identity",
+      "state.plan.run_identity",
+    );
+  }
+  for (const [index, team] of state.teams.entries()) {
+    const teamIdentity = projectReportWorkflowRunIdentity(team.run_identity);
+    if (!teamIdentity || !sameWorkflowRunIdentity(teamIdentity, stateIdentity)) {
+      throw new ReportAssemblyError(
+        "IDENTITY_MISMATCH",
+        "STATE_STALE: CTO team run identity differs from CTO state identity",
+        `state.teams[${index}].run_identity`,
+      );
+    }
+  }
+  const profile = profileForContext(context, stateIdentity, "cto");
   const stageDefs = new Map<string, StageDef>();
-  if (profile) for (const s of profile.stages) stageDefs.set(s.id, s);
-  const config = resolveConfig(cwd);
-  const teamDefs = new Map(loadTeamDefs(cwd).map((d) => [d.id, d]));
-
-  const { telemetry, events } = ctoTelemetry(cwd, r, warnings);
+  for (const s of profile.stages) stageDefs.set(s.id, s);
+  const { telemetry, events } = ctoTelemetry(storage, r, warnings);
   const teamIds = new Set(state.teams.map((t) => t.id));
   const relevant = events.filter(
     (e) => e.runId === r.id || (e.runId === undefined && teamIds.has(e.stageId ?? "")),
@@ -492,7 +847,7 @@ function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOpt
 
   const stages: StageInfo[] = [];
   for (const def of profile?.stages ?? []) {
-    const agents = stageAgents(def, config);
+    const agents = stageAgents(def, context);
     stages.push({
       id: def.id,
       title: def.title,
@@ -508,7 +863,7 @@ function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOpt
     });
   }
   for (const t of state.teams) {
-    const agents = teamLeadAgents(t.id, teamDefs);
+    const agents = teamLeadAgents(t.id, state, context);
     stages.push({
       id: `team:${t.id}`,
       title: `Team ${t.id}`,
@@ -522,8 +877,7 @@ function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOpt
   }
 
   const edges = ctoEdges(state, profile);
-
-  const { artifacts, artifactMtimes } = ctoArtifacts(cwd, state, options, warnings);
+  const { artifacts, artifactMtimes } = ctoArtifacts(storage, state, options, warnings);
 
   const meta: ReportMeta = {
     title: taskTitle(state.task, null),
@@ -644,9 +998,9 @@ function ctoEdges(state: CtoState, profile: Profile | null): SessionEdge[] {
   return edges;
 }
 
-/** Team artifacts under `.work-state/artifacts/<teamId>/` + each team's dod_path. */
+/** Team artifacts under `.work-state/artifacts/<teamId>` plus each dod_path. */
 function ctoArtifacts(
-  cwd: string,
+  storage: ReportStorageAuthority,
   state: CtoState,
   options: BuildSessionReportOptions,
   warnings: string[],
@@ -655,34 +1009,37 @@ function ctoArtifacts(
   const artifactMtimes = new Map<string, string>();
   const seen = new Set<string>();
   for (const team of state.teams) {
-    const dir = join(cwd, WORK_STATE_DIR, TEAM_ARTIFACTS_DIR, team.id);
-    if (existsSync(dir)) {
-      try {
-        for (const file of readdirSync(dir)) {
-          if (!file.endsWith(".json")) continue;
-          const artifactId = file.replace(/\.json$/, "");
-          const key = `${team.id}/${artifactId}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const filePath = join(dir, file);
-          const art = buildArtifact({ id: artifactId, owner: team.id, filePath, status: "produced" }, options, warnings);
-          artifacts.push(art);
-          if (art.mtime) artifactMtimes.set(artifactId, art.mtime);
-        }
-      } catch {
-        warnings.push(`team artifacts dir unreadable: ${dir}`);
+    const dir = storagePath(WORK_STATE_DIR, TEAM_ARTIFACTS_DIR, team.id);
+    const dirStat = statStorage(storage, dir);
+    if (dirStat.exists && dirStat.kind === "directory") {
+      for (const entry of listStorageEntries(storage, dir, 4096)) {
+        const file = entry.name;
+        if (!file.endsWith(".json")) continue;
+        const artifactId = file.replace(/\.json$/u, "");
+        const key = `${team.id}/${artifactId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const art = buildArtifact(
+          storage,
+          { id: artifactId, owner: team.id, relativePath: entry.relative_path, status: "produced" },
+          options,
+          warnings,
+        );
+        artifacts.push(art);
+        if (art.mtime) artifactMtimes.set(artifactId, art.mtime);
       }
     }
     if (team.dod_path) {
       const key = `${team.id}/dod`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const filePath = resolve(cwd, team.dod_path);
-      if (existsSync(filePath)) {
-        const art = buildArtifact({ id: "dod", owner: team.id, filePath, status: "produced" }, options, warnings);
-        artifacts.push(art);
-        if (art.mtime) artifactMtimes.set("dod", art.mtime);
-      }
+      const relativePath = resolveArtifactPath(team.dod_path);
+      if (!relativePath) continue;
+      const stat = statStorage(storage, relativePath);
+      if (!stat.exists || stat.kind !== "file") continue;
+      const art = buildArtifact(storage, { id: "dod", owner: team.id, relativePath, status: "produced" }, options, warnings);
+      artifacts.push(art);
+      if (art.mtime) artifactMtimes.set("dod", art.mtime);
     }
   }
   return { artifacts, artifactMtimes };
@@ -705,43 +1062,42 @@ function mapHealth(h: RunHealth): ReportHealth {
 interface ArtifactInput {
   id: string;
   owner: string;
-  filePath: string | null;
+  relativePath: string | null;
   status: "produced" | "missing" | "skipped";
 }
 
 function buildArtifact(
+  storage: ReportStorageAuthority,
   input: ArtifactInput,
   options: BuildSessionReportOptions,
   warnings: string[],
 ): ReportArtifact {
-  const maxBytes = options.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES;
+  const requestedMax = options.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES;
+  const maxBytes = Number.isSafeInteger(requestedMax) && requestedMax >= 0
+    ? Math.min(requestedMax, MAX_EVENT_BYTES)
+    : DEFAULT_MAX_ARTIFACT_BYTES;
   const base: ReportArtifact = {
     id: input.id,
-    path: input.filePath ?? input.id,
+    path: input.relativePath ?? input.id,
     owner: input.owner,
     status: input.status,
   };
-  if (!input.filePath || !existsSync(input.filePath)) {
+  if (!input.relativePath) {
     base.summary = input.status === "skipped" ? "skipped — artifact not produced" : "not produced";
     return base;
   }
-  let size = 0;
-  try {
-    size = statSync(input.filePath).size;
-  } catch {
-    warnings.push(`artifact ${input.id} (${input.owner}) unreadable`);
-    base.summary = "unreadable artifact";
+  const metadata = statStorage(storage, input.relativePath);
+  if (!metadata.exists || metadata.kind !== "file") {
+    base.summary = input.status === "skipped" ? "skipped — artifact not produced" : "not produced";
     return base;
   }
+  const size = metadata.size_bytes;
   base.bytes = size;
-  try {
-    base.mtime = new Date(statSync(input.filePath).mtimeMs).toISOString();
-  } catch {
-    // mtime best-effort
-  }
+  base.mtime = new Date(metadata.mtime_ms).toISOString();
 
-  const summaryCap = Math.max(maxBytes * SUMMARY_CAP_FACTOR, 64 * 1024);
-  const raw = readBounded(input.filePath, summaryCap);
+  const summaryCap = Math.min(Math.max(maxBytes * SUMMARY_CAP_FACTOR, 64 * 1024), MAX_EVENT_BYTES);
+  const rawBytes = readStorageBytes(storage, input.relativePath, summaryCap);
+  const raw = decodeStorageText(rawBytes);
   if (raw === null) {
     warnings.push(`artifact ${input.id} (${input.owner}) unreadable`);
     base.summary = "unreadable artifact";
@@ -760,41 +1116,28 @@ function buildArtifact(
   if (type) base.type = type;
   if (keys && keys.length > 0) base.keys = keys;
   if (options.includeFullArtifacts) {
-    if (size > maxBytes) {
-      warnings.push(`artifact ${input.id} truncated to ${maxBytes} bytes (maxArtifactBytes)`);
-    }
+    if (size > maxBytes) warnings.push(`artifact ${input.id} truncated to ${maxBytes} bytes (maxArtifactBytes)`);
     base.body = redactReportBody(raw, maxBytes);
   }
   return base;
 }
 
-function artifactFilePath(cwd: string, r: DoWorkResolved, artifactId: string): string | null {
+function artifactFilePath(storage: ReportStorageAuthority, r: DoWorkResolved, artifactId: string): string | null {
   const mapped = r.state.artifacts?.[artifactId];
-  if (mapped) return resolveArtifactPath(cwd, mapped);
-  return join(r.artifactsDir, `${artifactId}.json`);
+  if (mapped) return resolveArtifactPath(mapped);
+  return storagePath(r.artifactsDir, `${artifactId}.json`);
 }
 
 /**
- * Resolve a persisted artifact reference from `TeamState.artifacts`.
- *
- * The do-work orchestration stamps state-relative refs
- * (`features/<slug>/artifacts/<id>.json`, `artifacts/<id>.json`) rooted at
- * `.work-state` — the engine's per-feature layout (`writeState`). Accepted:
- * - absolute paths — kept as-is;
- * - `.work-state/…` — cwd-relative (CTO `dod_path` / legacy-root style);
- * - any other relative form — resolved against `.work-state`.
- * References escaping `.work-state` (e.g. `../../…`) are rejected (null).
+ * Resolve persisted artifact references into safe `.work-state` relative
+ * paths. Absolute paths and traversal-shaped references are rejected.
  */
-function resolveArtifactPath(cwd: string, ref: string): string | null {
-  if (isAbsolute(ref)) return ref;
-  if (ref === WORK_STATE_DIR || ref.startsWith(`${WORK_STATE_DIR}/`) || ref.startsWith(`${WORK_STATE_DIR}${sep}`)) {
-    return resolve(cwd, ref);
-  }
-  const wsRoot = resolve(cwd, WORK_STATE_DIR);
-  const candidate = resolve(wsRoot, ref);
-  const rel = relative(wsRoot, candidate);
-  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
-  return candidate;
+function resolveArtifactPath(ref: string): string | null {
+  if (typeof ref !== "string" || !ref || ref.includes("\\")) return null;
+  const pieces = ref.split("/");
+  if (pieces.some((piece) => !piece || piece === "." || piece === "..")) return null;
+  if (pieces[0] === WORK_STATE_DIR) return storagePath(...pieces);
+  return storagePath(WORK_STATE_DIR, ...pieces);
 }
 
 function summarizeArtifact(data: unknown): { summary: string; type?: string; keys?: string[] } {
@@ -804,12 +1147,11 @@ function summarizeArtifact(data: unknown): { summary: string; type?: string; key
     return { summary: t ? (t.length > 200 ? `${t.slice(0, 200)}…` : t) : "empty artifact" };
   }
   if (Array.isArray(data)) return { summary: `array (${data.length} items)` };
-  if (typeof data === "object") {
-    const obj = data as Record<string, unknown>;
-    const type = typeof obj.type === "string" && obj.type ? obj.type : undefined;
-    const keys = Object.keys(obj).slice(0, 16);
-    const title = typeof obj.title === "string" ? obj.title : undefined;
-    const own = typeof obj.summary === "string" ? obj.summary : undefined;
+  if (isDiagnosticEvidenceRecord(data)) {
+    const type = typeof data.type === "string" && data.type ? data.type : undefined;
+    const keys = Object.keys(data).slice(0, 16);
+    const title = typeof data.title === "string" ? data.title : undefined;
+    const own = typeof data.summary === "string" ? data.summary : undefined;
     return {
       summary: title ?? own ?? (type ? `${type} artifact (${keys.length} fields)` : `artifact (${keys.length} fields)`),
       ...(type ? { type } : {}),
@@ -821,46 +1163,132 @@ function summarizeArtifact(data: unknown): { summary: string; type?: string; key
 
 // ── Telemetry (bounded; never raw events) ───────────────────────────────────
 
+function readSafeObservabilityPointer(
+  storage: ReportStorageAuthority,
+  featureSlug: string,
+): ObservabilityPointer | null {
+  const eventsPath = storagePath(WORK_STATE_DIR, "features", featureSlug, "observability", "events.jsonl");
+  const metadata = statStorage(storage, eventsPath);
+  if (!metadata.exists || metadata.kind !== "file") return null;
+  const events = readEventsBounded(storage, eventsPath, []);
+  const last = events[events.length - 1];
+  return {
+    eventsPath: "observability/events.jsonl",
+    lastEventId: last?.id ?? "",
+    rollupThroughId: last?.id ?? "",
+    rollup: rollupFromEvents(events),
+  };
+}
+
+const OBSERVABILITY_EVENT_KINDS: readonly string[] = [
+  "session_start",
+  "session_stop",
+  "before_agent_start",
+  "agent_start",
+  "agent_end",
+  "tool_call",
+  "tool_result",
+  "stage_transition",
+  "artifact_written",
+  "work_pending",
+  "work_terminal",
+];
+
+function isObservabilityEvent(value: unknown): value is ObservabilityEvent {
+  if (!isDiagnosticEvidenceRecord(value)) return false;
+  if (
+    typeof value.id !== "string"
+    || typeof value.ts !== "string"
+    || typeof value.branch !== "string"
+    || typeof value.kind !== "string"
+    || !OBSERVABILITY_EVENT_KINDS.includes(value.kind)
+  ) {
+    return false;
+  }
+  for (const field of [
+    "sessionId",
+    "toolCallId",
+    "toolName",
+    "gateReason",
+    "subagent",
+    "stageId",
+    "stageStatus",
+    "artifactId",
+    "artifactPath",
+    "artifactSha256",
+    "runId",
+  ]) {
+    if (value[field] !== undefined && typeof value[field] !== "string") return false;
+  }
+  for (const field of ["stageId", "artifactId", "runId"]) {
+    if (value[field] !== undefined && !isSafeReportIdentityText(value[field])) return false;
+  }
+  if (value.isError !== undefined && typeof value.isError !== "boolean") return false;
+  if (
+    value.gateDecision !== undefined
+    && value.gateDecision !== "allowed"
+    && value.gateDecision !== "blocked"
+  ) {
+    return false;
+  }
+  for (const field of ["subagentTaskChars", "agentStartMs", "messageCount", "artifactBytes"]) {
+    if (
+      value[field] !== undefined
+      && (typeof value[field] !== "number" || !Number.isFinite(value[field]))
+    ) {
+      return false;
+    }
+  }
+  if (
+    value.skills !== undefined
+    && (!Array.isArray(value.skills) || value.skills.some((entry) => typeof entry !== "string"))
+  ) {
+    return false;
+  }
+  if (value.artifact_summaries !== undefined && !Array.isArray(value.artifact_summaries)) return false;
+  return true;
+}
+
 function doWorkTelemetry(
-  cwd: string,
+  storage: ReportStorageAuthority,
   r: DoWorkResolved,
   warnings: string[],
 ): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
   const slug = r.isLegacy ? (deriveFeatureSlug(r.state.branch) ?? "default") : r.id;
-  const pointer = r.state.observability ?? readObservabilityPointer(cwd, slug);
+  const pointer = readSafeObservabilityPointer(storage, slug);
   if (!pointer) {
     warnings.push("no telemetry available for this session");
     return { telemetry: { rollup: null }, events: [] };
   }
-  return buildTelemetry(cwd, slug, pointer, warnings);
+  return buildTelemetry(storage, slug, pointer, warnings);
 }
 
 function ctoTelemetry(
-  cwd: string,
+  storage: ReportStorageAuthority,
   r: CtoResolved,
   warnings: string[],
 ): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
   // CTO runs have no observability pointer of their own; the recorder is
   // feature-scoped and falls back to "default" for CTO sessions. This is
   // coarse session-level telemetry — flagged in the report.
-  const pointer = readObservabilityPointer(cwd, "default");
+  const pointer = readSafeObservabilityPointer(storage, "default");
   if (!pointer) {
     warnings.push("no telemetry available for this CTO run (session-level events only)");
     return { telemetry: { rollup: null }, events: [] };
   }
-  const result = buildTelemetry(cwd, "default", pointer, warnings);
+  const result = buildTelemetry(storage, "default", pointer, warnings);
   warnings.push("CTO telemetry is session-level (no per-run event stream); chronology falls back to state");
   return result;
 }
 
 function buildTelemetry(
-  cwd: string,
+  storage: ReportStorageAuthority,
   slug: string,
   pointer: ObservabilityPointer,
   warnings: string[],
 ): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
-  const eventsPath = resolve(cwd, WORK_STATE_DIR, "features", slug, pointer.eventsPath);
-  const events = readEventsBounded(eventsPath, warnings);
+  const eventsPath = storagePath(WORK_STATE_DIR, "features", slug, pointer.eventsPath);
+  const events = readEventsBounded(storage, eventsPath, warnings);
   const eventCounts: Record<string, number> = {};
   for (const e of events) eventCounts[e.kind] = (eventCounts[e.kind] ?? 0) + 1;
   return {
@@ -874,43 +1302,37 @@ function buildTelemetry(
   };
 }
 
-function readEventsBounded(eventsPath: string, warnings: string[]): ObservabilityEvent[] {
-  if (!existsSync(eventsPath)) {
+function readEventsBounded(
+  storage: ReportStorageAuthority,
+  eventsPath: string,
+  warnings: string[],
+): ObservabilityEvent[] {
+  const metadata = statStorage(storage, eventsPath);
+  if (!metadata.exists || metadata.kind !== "file") {
     warnings.push("event log missing — chronology falls back to artifact mtime/state timestamps");
     return [];
   }
-  let text: string;
-  let startsMidLine = false;
-  try {
-    const size = statSync(eventsPath).size;
-    if (size > MAX_EVENT_BYTES) {
-      // Chronology/event counts need the MOST RECENT events, so read the
-      // final window (tail), not the head.
-      const tail = readBoundedTail(eventsPath, MAX_EVENT_BYTES);
-      text = tail?.text ?? "";
-      startsMidLine = tail?.startsMidLine ?? false;
-      warnings.push(`event log exceeds the telemetry cap — only the final ${MAX_EVENT_BYTES} bytes (tail) were read`);
-    } else {
-      text = readFileSync(eventsPath, "utf8");
-    }
-  } catch {
+  const bytes = readStorageBytes(storage, eventsPath, MAX_EVENT_BYTES);
+  if (bytes === null) {
     warnings.push("event log unreadable — chronology falls back to artifact mtime/state timestamps");
     return [];
   }
+  if (metadata.size_bytes > MAX_EVENT_BYTES) {
+    warnings.push(`event log exceeds the telemetry cap — only the first ${MAX_EVENT_BYTES} bytes were read`);
+  }
   const out: ObservabilityEvent[] = [];
   let corrupt = 0;
+  const text = decodeStorageText(bytes);
+  if (text === null) {
+    warnings.push("event log unreadable — chronology falls back to artifact mtime/state timestamps");
+    return [];
+  }
   for (const line of text.split("\n")) {
-    // A tail window can begin mid-line: the first fragment is a partial
-    // JSONL line — an artifact of the byte cap, not corruption. Drop it.
-    if (startsMidLine) {
-      startsMidLine = false;
-      continue;
-    }
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
-      const parsed = JSON.parse(trimmed) as ObservabilityEvent;
-      if (parsed && typeof parsed === "object" && typeof parsed.ts === "string" && typeof parsed.kind === "string") {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (isObservabilityEvent(parsed)) {
         out.push(parsed);
       } else {
         corrupt += 1;
@@ -951,53 +1373,31 @@ function sortedChronology(entries: ChronologyEvent[]): ChronologyEvent[] {
   return [...timed, ...untimed.map((e) => ({ ...e, source: "ordinal" as const }))];
 }
 
-// ── Report writer (containment + 0600) ──────────────────────────────────────
+// ── Report writer ────────────────────────────────────────────────────────────
 
 /**
- * Write the report HTML under `.work-state`. Rejects any target outside
- * `.work-state` (lexically AND through symlinked parents), creates parent
- * dirs, and applies mode 0600. Returns the absolute target path.
+ * Atomically publish report HTML under the descriptor-relative work-state
+ * namespace. The storage authority owns parent creation, symlink checks, file
+ * mode and replacement semantics; this function only validates the relative
+ * target and encodes the body.
  */
-export function writeReport(cwd: string, targetPath: string, html: string): string {
-  const wsRoot = resolve(cwd, WORK_STATE_DIR);
-  const target = resolve(cwd, targetPath);
-  if (!isUnderWorkState(wsRoot, target)) {
-    throw new Error(`writeReport: target must be under ${wsRoot} (got ${targetPath})`);
+export function writeReport(storage: ReportStorageAuthority, targetPath: string, html: string): string {
+  const authority = requireReportStorage(storage);
+  if (typeof html !== "string") {
+    throw new ReportStorageError("IO", "report output must be text");
   }
-  mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, html, { encoding: "utf8", mode: 0o600 });
-  chmodSync(target, 0o600);
+  const target = normalizeReportTarget(targetPath);
+  const bytes = new TextEncoder().encode(html);
+  writeStorageAtomic(authority, target, bytes);
   return target;
 }
 
-function isUnderWorkState(wsRoot: string, target: string): boolean {
-  // Resolve real paths for BOTH sides (deepest existing ancestor + missing
-  // suffix) so symlinked parents that escape `.work-state` are rejected, and
-  // platforms where the tmp root itself is a symlink (/var → /private/var on
-  // macOS) compare consistently.
-  const rootReal = realish(wsRoot);
-  const candidate = join(realish(dirname(target)), basename(target));
-  const rel = relative(rootReal, candidate);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
-/** Realpath the deepest existing ancestor, appending the missing suffix. */
-function realish(p: string): string {
-  let ancestor = p;
-  const missing: string[] = [];
-  while (!existsSync(ancestor)) {
-    const parent = dirname(ancestor);
-    if (parent === ancestor) break;
-    missing.unshift(basename(ancestor));
-    ancestor = parent;
+function normalizeReportTarget(targetPath: string): string {
+  const target = storagePath(targetPath);
+  if (target !== WORK_STATE_DIR && !target.startsWith(`${WORK_STATE_DIR}/`)) {
+    throw new ReportStorageError("UNSAFE_PATH", "report target must remain under .work-state");
   }
-  let ancestorReal = ancestor;
-  try {
-    ancestorReal = realpathSync(ancestor);
-  } catch {
-    // keep lexical
-  }
-  return join(ancestorReal, ...missing);
+  return target;
 }
 
 // ── Small helpers ───────────────────────────────────────────────────────────
@@ -1018,52 +1418,3 @@ function deriveFeatureSlug(branch: string): string | null {
   return branch.replace(/\//g, "-").replace(/[^a-z0-9._-]/gi, "-").toLowerCase();
 }
 
-/** Read at most `maxBytes` from the head of a file; null on any error. */
-function readBounded(filePath: string, maxBytes: number): string | null {
-  try {
-    const size = statSync(filePath).size;
-    const fd = openSync(filePath, "r");
-    try {
-      const len = Math.min(size, maxBytes);
-      const buf = Buffer.alloc(len);
-      const n = readSync(fd, buf, 0, len, 0);
-      return buf.subarray(0, n).toString("utf8");
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Read the final `maxBytes` window of a file (tail), reporting whether the
- * window begins mid-line (its first line is then a partial JSONL fragment).
- * Null on any error.
- */
-function readBoundedTail(
-  filePath: string,
-  maxBytes: number,
-): { text: string; startsMidLine: boolean } | null {
-  try {
-    const size = statSync(filePath).size;
-    const fd = openSync(filePath, "r");
-    try {
-      const offset = Math.max(0, size - maxBytes);
-      // Read one byte before the window so we can tell whether it starts at
-      // a line boundary; that byte is skipped when decoding the window.
-      const windowStart = offset > 0 ? offset - 1 : 0;
-      const len = size - windowStart;
-      const buf = Buffer.alloc(len);
-      const n = readSync(fd, buf, 0, len, windowStart);
-      const bytes = buf.subarray(0, n);
-      const startsMidLine = offset > 0 && bytes[0] !== 0x0a;
-      const text = bytes.subarray(offset > 0 ? 1 : 0).toString("utf8");
-      return { text, startsMidLine };
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    return null;
-  }
-}

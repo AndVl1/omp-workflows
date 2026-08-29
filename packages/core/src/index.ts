@@ -1,29 +1,24 @@
 /**
  * @andvl1/omp-workflows-core — public API surface.
  *
- * Workflow engine: 7 slash commands, 4 event handlers, 8 declarative
- * JSON profiles, typed artifact schemas, state machine, role/scope
- * resolution, DoD lifecycle, plus runtime observability (event log +
- * rollup). No agents, no skills — bundles ship those.
- *
- * Example minimal bundle:
- *
- *   import { registerTeamWorkflow } from "@andvl1/omp-workflows-core";
- *   export default function (pi: ExtensionAPI) {
- *     registerTeamWorkflow(pi, {
- *       label: "omp-workflows-custom",
- *       roles: { developer: "developer" },
- *     });
- *   }
+ * The v2 host is the sole owner of canonical workflow commands and tools.
+ * Core keeps the engine, gates, observability and CTO contracts available
+ * behind the validated provider/runtime boundary.
+ * <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core -->
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import type {
+  BeforeAgentStartEvent,
+  ExtensionAPI,
+  SessionStopEvent,
+  ToolCallEvent,
+  ToolResultEvent,
+} from "@oh-my-pi/pi-coding-agent";
 import { orchestratorWriteGate, workerWriteScopeGate } from "./gates/orchestrator-write.js";
 import { dispatchGate, trustedDispatchRequests } from "./gates/dispatch.js";
-import type { ExtensionAPI, BeforeAgentStartEvent, SessionStopEvent, ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
 import { classificationGate, classificationToolGate } from "./gates/classification.js";
+import type { WorkflowGateContext } from "./gates/classification.js";
 import { monotonicGate } from "./gates/monotonic.js";
 import { dodBackstop } from "./gates/dod-backstop.js";
 import { safetyGuard } from "./gates/safety.js";
@@ -31,223 +26,431 @@ import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { outboxEnforcementGate } from "./gates/outbox.js";
 import { ctoSliceTaskGate } from "./cto/slice-gate.js";
 import { registerObservabilityHooks, recordToolCallAttempt } from "./observability/index.js";
-import { authorizeDispatchTrusted, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, recordCheckpointDecision } from "./engine/durable.js";
-import { registerWorkflowProfiles } from "./engine/profile.js";
-import { prepareWorkflowState, type ModelClassification, type WorkflowPrepareOptions } from "./engine/run.js";
-import { resolveState } from "./engine/state.js";
-import { resolveWorkflowContract } from "./engine/workflow-contract.js";
-import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
-import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof } from "./engine/types.js";
+import {
+  authorizeDispatchTrusted,
+  reconcileTrustedTaskResult,
+} from "./engine/durable.js";
+import { registerWorkflowV2Host, validateInvocation } from "./workflow-v2/host.js";
+import {
+  createCanonicalRoot,
+  projectRuntimeKeyFor,
+  validateProjectIdentity,
+} from "./workflow-v2/identity.js";
+import { createDiagnostic, failureResult } from "./workflow-v2/diagnostics.js";
+import type {
+  CanonicalRoot,
+  DiagnosticResult,
+  HostCapability,
+  ProjectIdentity,
+  ProjectRuntimeKey,
+  WorkflowHost,
+  WorkflowHostOptions,
+  WorkflowOwnerClaim,
+  WorkflowOwnerIdentity,
+  WorkflowOwnerClaimResult,
+  WorkflowRunIdentity,
+  WorkflowV2Diagnostic,
+} from "./workflow-v2/types.js";
 import type { WorkerWriteScope } from "./gates/orchestrator-write.js";
-import type { ScopeRuntimeClassTable } from "./engine/scope.js";
-import type { DispatchAuth } from "./engine/durable.js";
-export type WorkflowCapability = "workflow_registration" | "workflow_tools" | "config_writer";
 
-export type WorkflowOwnerKind = "fullstack" | "private_omp" | (string & {});
+export type { WorkflowOwnerClaim, WorkflowOwnerClaimResult, WorkflowOwnerIdentity };
 
-export interface WorkflowOwnerProvenance {
-  package: string;
-  entrypoint: string;
-  cwd: string;
-  config_path?: string;
-}
-
-export interface WorkflowOwnerIdentity {
-  owner_id: string;
-  bundle_id: string;
-  owner_kind: WorkflowOwnerKind;
-  activation_marker: string;
-  host_range: string;
-  provenance: WorkflowOwnerProvenance;
-}
-
-export interface WorkflowOwnerClaim {
-  project_root: string;
-  capability: WorkflowCapability;
-  fingerprint: string;
-  owner: WorkflowOwnerIdentity;
-}
-
-export type WorkflowOwnerClaimResult =
-  | { ok: true; claim: WorkflowOwnerClaim; idempotent: boolean }
-  | { ok: false; code: "owner_invalid" | "owner_conflict"; error: string; claim?: WorkflowOwnerClaim };
-
-export type WorkflowOwnerSource =
-  | WorkflowOwnerIdentity
-  | ((projectRoot: string) => WorkflowOwnerIdentity);
-
-const workflowOwners = new Map<string, Map<WorkflowCapability, WorkflowOwnerClaim>>();
-
-/**
- * Match the cwd identity used by config and mapping readers: an existing
- * project/worktree is keyed by its physical path, while a not-yet-created
- * root keeps its resolved lexical path until it exists.
- */
-function canonicalProjectRoot(projectRoot: string): string {
-  const resolved = resolve(projectRoot);
-  return existsSync(resolved) ? realpathSync(resolved) : resolved;
-}
-
-/**
- * Config paths are derived from the canonical project root even when the
- * `.omp` directory or config file does not exist yet. This keeps owner
- * provenance stable across a symlink alias during eager registration.
- */
-function canonicalConfigPath(configPath: string): string {
-  const resolved = resolve(configPath);
-  if (basename(resolved) !== "team.config.json" || basename(dirname(resolved)) !== ".omp") return resolved;
-  return join(canonicalProjectRoot(dirname(dirname(resolved))), ".omp", "team.config.json");
-}
+type OwnerClaims = Map<HostCapability, WorkflowOwnerClaim>;
+const workflowOwners = new Map<ProjectRuntimeKey, OwnerClaims>();
 
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([key, entry]) => [key, canonicalize(entry)]));
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, canonicalize(entry)]),
+    );
   }
   return value;
 }
 
-function ownerFingerprint(owner: WorkflowOwnerIdentity): string {
-  return createHash("sha256").update(JSON.stringify(canonicalize(owner))).digest("hex");
+function ownerFingerprint(owner: WorkflowOwnerIdentity): `sha256:${string}` {
+  const bytes = JSON.stringify(canonicalize(owner));
+  const digest = createHash("sha256").update(bytes, "utf8").digest("hex");
+  return `sha256:${digest}`;
 }
 
-function invalidOwner(root: string, owner: WorkflowOwnerIdentity): string | null {
-  const required = [
-    ["owner_id", owner.owner_id],
-    ["bundle_id", owner.bundle_id],
-    ["owner_kind", owner.owner_kind],
-    ["activation_marker", owner.activation_marker],
-    ["host_range", owner.host_range],
-    ["provenance.package", owner.provenance?.package],
-    ["provenance.entrypoint", owner.provenance?.entrypoint],
-    ["provenance.cwd", owner.provenance?.cwd],
-  ] as const;
-  const missing = required.find(([, value]) => typeof value !== "string" || value.trim().length === 0);
-  if (missing) return `${missing[0]} is required`;
-  if (canonicalProjectRoot(owner.provenance.cwd) !== root) return "owner provenance cwd does not match project root";
-  if (owner.provenance.config_path && canonicalConfigPath(owner.provenance.config_path) !== join(root, ".omp", "team.config.json")) {
-    return "owner provenance config_path does not belong to project root";
+function ownerDiagnostic(
+  field: string,
+  remediation: string,
+  evidence: Record<string, string | number | boolean | null | readonly string[]> = {},
+) {
+  return createDiagnostic({
+    code: "OWNER_CONFLICT",
+    operation: "admission",
+    evidence: { field, ...evidence },
+    remediation,
+  });
+}
+
+function validateOwner(
+  owner: WorkflowOwnerIdentity,
+): DiagnosticResult<{ readonly owner: WorkflowOwnerIdentity; readonly projectRoot: CanonicalRoot }> {
+  if (!owner || typeof owner !== "object") {
+    return failureResult(ownerDiagnostic("owner", "Provide a complete v2 owner identity."));
   }
-  return null;
-}
-
-function normalizeOwner(owner: WorkflowOwnerIdentity): WorkflowOwnerIdentity {
-  const provenance: WorkflowOwnerProvenance = {
-    ...owner.provenance,
-    cwd: canonicalProjectRoot(owner.provenance.cwd),
+  const candidate = owner as unknown as Record<string, unknown>;
+  const provenance =
+    candidate.provenance && typeof candidate.provenance === "object"
+      ? (candidate.provenance as Record<string, unknown>)
+      : undefined;
+  const required: readonly [string, unknown][] = [
+    ["owner_id", candidate.owner_id],
+    ["bundle_id", candidate.bundle_id],
+    ["owner_kind", candidate.owner_kind],
+    ["activation_marker", candidate.activation_marker],
+    ["host_range", candidate.host_range],
+    ["provenance.package", provenance?.package],
+    ["provenance.entrypoint", provenance?.entrypoint],
+    ["provenance.cwd", provenance?.cwd],
+  ];
+  const missing = required.find(([, value]) => typeof value !== "string" || value.trim().length === 0);
+  if (missing) {
+    return failureResult(ownerDiagnostic(missing[0], "Provide every owner and package provenance field."));
+  }
+  const projectRoot = createCanonicalRoot(provenance?.cwd as string);
+  if (!projectRoot) {
+    return failureResult(ownerDiagnostic("provenance.cwd", "Use the manager-resolved absolute canonical project root."));
+  }
+  const normalized: WorkflowOwnerIdentity = Object.freeze({
+    owner_id: candidate.owner_id as string,
+    bundle_id: candidate.bundle_id as string,
+    owner_kind: candidate.owner_kind as WorkflowOwnerIdentity["owner_kind"],
+    activation_marker: candidate.activation_marker as string,
+    host_range: candidate.host_range as string,
+    provenance: Object.freeze({
+      package: provenance?.package as string,
+      entrypoint: provenance?.entrypoint as string,
+      cwd: projectRoot,
+      ...(typeof provenance?.config_path === "string" ? { config_path: provenance.config_path } : {}),
+    }),
+  });
+  return {
+    ok: true,
+    value: { owner: normalized, projectRoot },
+    diagnostics: [],
   };
-  if (owner.provenance.config_path) provenance.config_path = canonicalConfigPath(owner.provenance.config_path);
-  return { ...owner, provenance };
 }
 
 /**
- * Atomically claim one or more generic workflow capabilities for a bundle.
- * The registry is keyed by the canonical physical project/worktree root.
- * A repeated claim with the same fingerprint is idempotent; any differing
- * owner fails before the registry is mutated.
+ * Bind host ownership to a complete project-level identity. Cwd-only
+ * ownership is intentionally impossible: provider, config, catalog,
+ * executable or worktree identity changes get a distinct runtime key.
  */
 export function claimWorkflowOwners(
-  projectRoot: string,
-  capabilities: readonly WorkflowCapability[],
+  projectIdentity: ProjectIdentity,
+  capabilities: readonly HostCapability[],
   owner: WorkflowOwnerIdentity,
 ): WorkflowOwnerClaimResult {
-  const root = canonicalProjectRoot(projectRoot);
-  const invalid = invalidOwner(root, owner);
-  if (invalid) return { ok: false, code: "owner_invalid", error: invalid };
-  const normalizedOwner = normalizeOwner(owner);
-  const fingerprint = ownerFingerprint(normalizedOwner);
+  const checkedIdentity = validateProjectIdentity(projectIdentity);
+  if (!checkedIdentity.ok) return { ok: false, diagnostics: checkedIdentity.diagnostics };
+  const checkedOwner = validateOwner(owner);
+  if (!checkedOwner.ok) return { ok: false, diagnostics: checkedOwner.diagnostics };
   const requested = [...new Set(capabilities)];
-  const existing = workflowOwners.get(root);
+  if (requested.length === 0) {
+    return { ok: false, diagnostics: [ownerDiagnostic("capabilities", "Claim at least one host capability.")] };
+  }
+  const fingerprint = ownerFingerprint(checkedOwner.value.owner);
+  const runtimeKey = projectRuntimeKeyFor(checkedIdentity.value);
+  const existing = workflowOwners.get(runtimeKey);
   for (const capability of requested) {
     const prior = existing?.get(capability);
-    if (prior && prior.fingerprint !== fingerprint) {
+    if (prior && ownerFingerprint(prior.owner) !== fingerprint) {
       return {
         ok: false,
-        code: "owner_conflict",
-        error: `generic workflow capability '${capability}' is already owned by '${prior.owner.owner_id}'`,
+        diagnostics: [
+          ownerDiagnostic(
+            "owner",
+            "Restart the host and remove the competing canonical owner before claiming this project identity.",
+            { owner_id: prior.owner.owner_id, capability },
+          ),
+        ],
         claim: prior,
       };
     }
   }
-  const registry = existing ?? new Map<WorkflowCapability, WorkflowOwnerClaim>();
+  const registry = existing ?? new Map<HostCapability, WorkflowOwnerClaim>();
   let idempotent = true;
   for (const capability of requested) {
-    if (!registry.has(capability)) {
-      idempotent = false;
-      registry.set(capability, { project_root: root, capability, fingerprint, owner: structuredClone(normalizedOwner) });
-    }
+    if (registry.has(capability)) continue;
+    idempotent = false;
+    registry.set(
+      capability,
+      Object.freeze({
+        project_root: checkedOwner.value.projectRoot,
+        capability,
+        project_runtime_key: runtimeKey,
+        owner: checkedOwner.value.owner,
+        project_identity: checkedIdentity.value,
+      }),
+    );
   }
-  if (!existing) workflowOwners.set(root, registry);
-  const first = requested[0];
-  const claim = first ? registry.get(first) : undefined;
-  if (!claim) return { ok: false, code: "owner_invalid", error: "at least one workflow capability is required" };
-  return { ok: true, claim, idempotent };
+  if (!existing) workflowOwners.set(runtimeKey, registry);
+  const firstCapability = requested[0];
+  if (firstCapability === undefined) {
+    return { ok: false, diagnostics: [ownerDiagnostic("claim", "Claim at least one host capability.")] };
+  }
+  const claim = registry.get(firstCapability);
+  if (!claim) {
+    return { ok: false, diagnostics: [ownerDiagnostic("claim", "Claim at least one host capability.")] };
+  }
+  return {
+    ok: true,
+    claim,
+    idempotent,
+    diagnostics: [],
+  };
 }
 
 export function claimWorkflowOwner(
-  projectRoot: string,
-  capability: WorkflowCapability,
+  projectIdentity: ProjectIdentity,
+  capability: HostCapability,
   owner: WorkflowOwnerIdentity,
 ): WorkflowOwnerClaimResult {
-  return claimWorkflowOwners(projectRoot, [capability], owner);
+  return claimWorkflowOwners(projectIdentity, [capability], owner);
 }
 
-/** Read-only diagnostic used by host adapters and focused owner tests. */
-export function workflowOwnerFor(projectRoot: string, capability: WorkflowCapability): WorkflowOwnerClaim | undefined {
-  return workflowOwners.get(canonicalProjectRoot(projectRoot))?.get(capability);
+/** Read-only project-identity-bound claim lookup for host/tests. */
+export function workflowOwnerFor(
+  projectIdentity: ProjectIdentity,
+  capability: HostCapability,
+): WorkflowOwnerClaim | undefined {
+  const checked = validateProjectIdentity(projectIdentity);
+  if (!checked.ok) return undefined;
+  return workflowOwners.get(projectRuntimeKeyFor(checked.value))?.get(capability);
 }
 
-/** Clear only the in-memory registry; intended for isolated host/test lifecycles. */
-export function resetWorkflowOwners(projectRoot?: string): void {
-  if (projectRoot === undefined) workflowOwners.clear();
-  else workflowOwners.delete(canonicalProjectRoot(projectRoot));
+/**
+ * Test-only fresh-lifecycle disposal. Production code must never use an
+ * in-place identity reset or hot provider switch.
+ */
+export function resetWorkflowOwners(projectIdentity?: ProjectIdentity): void {
+  if (projectIdentity === undefined) {
+    workflowOwners.clear();
+    return;
+  }
+  const checked = validateProjectIdentity(projectIdentity);
+  if (checked.ok) workflowOwners.delete(projectRuntimeKeyFor(checked.value));
 }
 
-export interface RegisterOptions {
-  label?: string;
-  roles?: RoleConfig["roles"];
-  rosterOverrides?: RoleConfig["roster_overrides"];
-  scopeMap?: RoleConfig["scope_map"];
-  flags?: RoleConfig["flags"];
-  /** Caller-supplied scope → runtime classification table (no core defaults exist). */
-  scopeRuntimeClasses?: ScopeRuntimeClassTable;
-  /** Caller-supplied scope → UI marker table (no core defaults exist). */
-  scopeUiClasses?: ScopeRuntimeClassTable;
-  designSystem?: string | null;
-  workflowProfiles?: Profile[];
-  observability?: boolean;
-  /** Explicit project/worktree root for eager owner/config registration. */
-  cwd?: string;
-  /** Session-aware cwd resolver; no process cwd fallback is used when supplied. */
-  resolveCwd?: (ctx: unknown) => string | undefined;
-  owner?: WorkflowOwnerSource;
+export interface RegisterOptions extends WorkflowHostOptions {
+  readonly observability?: boolean;
+  readonly writeScope?: WorkerWriteScope;
+}
+
+/**
+ * Register the single v2 host and the generic core gates. The host performs
+ * synchronous admission and owns all canonical command/tool registration;
+ * this wrapper has no policy/config writer or session-start seed path.
+ */
+export function registerTeamWorkflow(pi: ExtensionAPI, options: RegisterOptions): WorkflowHost {
+  const host = registerWorkflowV2Host(pi, options);
+  type ValidatedGateContext = WorkflowGateContext & {
+    readonly cwd: string;
+    readonly project_identity: ProjectIdentity;
+    readonly run_identity: WorkflowRunIdentity;
+    readonly catalog: NonNullable<WorkflowGateContext["catalog"]>;
+    readonly effective_policy: NonNullable<WorkflowGateContext["effective_policy"]>;
+    readonly agent_inventory: NonNullable<WorkflowGateContext["agent_inventory"]>;
+  };
+  type GateBlock = {
+    readonly block: true;
+    readonly reason: string;
+    readonly diagnostic?: WorkflowV2Diagnostic;
+  };
+  type GateContextResult =
+    | { readonly ok: true; readonly context: ValidatedGateContext }
+    | { readonly ok: false; readonly blocked: GateBlock };
+
+  const gateBlock = (diagnostics: readonly WorkflowV2Diagnostic[]): GateBlock => {
+    const diagnostic = diagnostics[0] ?? createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "tool.dispatch",
+      remediation: "Re-admit the workflow through the protocol-v2 host before invoking a core gate.",
+    });
+    return {
+      block: true,
+      reason: `BLOCK (v2): ${diagnostic.code} — ${diagnostic.remediation}`,
+      diagnostic,
+    };
+  };
   /**
-   * Bounded write_scope experiment: when enabled, worker source writes are
-   * narrowed to the declared scope after the orchestrator gate. Off by
-   * default — shipped workflows keep the single-writer model.
+   * Hook payloads are untrusted and contain no workflow identity. Acquire a
+   * complete project/run context through the host's read-only validation
+   * boundary instead of copying cwd or identity-shaped values from payloads.
    */
-  writeScope?: WorkerWriteScope;
+  const validatedGateContext = (ctx: unknown): GateContextResult => {
+    const validated = validateInvocation({
+      operation: "tool",
+      name: "workflow_status",
+      args: {},
+      context: ctx,
+    }, options);
+    if (!validated.ok) return { ok: false, blocked: gateBlock(validated.diagnostics) };
+    const value = validated.value;
+    if (value.identity_level !== "run") {
+      return {
+        ok: false,
+        blocked: gateBlock([
+          createDiagnostic({
+            code: "MIGRATION_REQUIRED",
+            operation: "tool.dispatch",
+            remediation: "Prepare and persist a WorkflowRunIdentity before invoking durable workflow gates.",
+          }),
+        ]),
+      };
+    }
+    return {
+      ok: true,
+      context: {
+        cwd: value.snapshot.root,
+        project_identity: value.project_identity,
+        run_identity: value.run_identity,
+        catalog: value.catalog,
+        effective_policy: value.effective_policy,
+        agent_inventory: value.agent_inventory,
+      },
+    };
+  };
+
+  // @ts-expect-error -- ExtensionAPI event overloads are narrower than the
+  // structural gate handlers, but OMP dispatches these callbacks by name.
+  pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx: unknown) => {
+    const checked = validatedGateContext(ctx);
+    if (!checked.ok) return checked.blocked;
+    const c = checked.context;
+    const r1 = classificationGate(
+      event as unknown as Parameters<typeof classificationGate>[0],
+      c as Parameters<typeof classificationGate>[1],
+    );
+    if (r1?.block) return r1;
+    const r2 = monotonicGate(event, c as Parameters<typeof monotonicGate>[1]);
+    if (r2?.block) return r2;
+  });
+  pi.on("session_stop", (event: SessionStopEvent, ctx: unknown) => {
+    const checked = validatedGateContext(ctx);
+    if (!checked.ok) return { decision: "block", reason: checked.blocked.reason };
+    return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], checked.context);
+  });
+  pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
+    const checked = validatedGateContext(ctx);
+    if (!checked.ok) return checked.blocked;
+    const c = checked.context;
+    let result: { block?: boolean; reason?: string } | undefined;
+    const run = (candidate: { block?: boolean; reason?: string } | void) => {
+      if (!result && candidate?.block) result = candidate;
+    };
+    if (!result) run(ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]));
+    if (!result) run(outboxEnforcementGate(
+      event as unknown as Parameters<typeof outboxEnforcementGate>[0],
+      c as Parameters<typeof outboxEnforcementGate>[1],
+    ));
+    if (!result) run(classificationToolGate(
+      event as unknown as Parameters<typeof classificationToolGate>[0],
+      c as Parameters<typeof classificationToolGate>[1],
+    ));
+    if (!result) run(orchestratorWriteGate(
+      event as unknown as Parameters<typeof orchestratorWriteGate>[0],
+      c as Parameters<typeof orchestratorWriteGate>[1],
+    ));
+    if (!result) run(workerWriteScopeGate(
+      event as unknown as Parameters<typeof workerWriteScopeGate>[0],
+      {
+        ...c,
+        writeScope: options.writeScope,
+      } as Parameters<typeof workerWriteScopeGate>[1],
+    ));
+    if (!result) run(ctoSliceTaskGate(
+      event as unknown as Parameters<typeof ctoSliceTaskGate>[0],
+      c as Parameters<typeof ctoSliceTaskGate>[1],
+    ));
+    if (!result) run(safetyGuard(
+      event as unknown as Parameters<typeof safetyGuard>[0],
+      c as Parameters<typeof safetyGuard>[1],
+    ));
+    if (!result) run(dispatchGate(
+      event as unknown as Parameters<typeof dispatchGate>[0],
+      c as Parameters<typeof dispatchGate>[1],
+    ));
+    if (!result && event.toolName === "task") {
+      const authorization = trustedDispatchRequests(
+        event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
+        c as Parameters<typeof trustedDispatchRequests>[1],
+      );
+      if (!authorization.ok) {
+        run({ block: true, reason: authorization.reason });
+      } else {
+        for (const request of authorization.requests) {
+          const policyAgentRef = c.effective_policy.roles[request.role];
+          const inventoryMatches = c.agent_inventory.filter((entry) => entry.registered_name === request.agent);
+          const agentRef = policyAgentRef ?? (inventoryMatches.length === 1 ? inventoryMatches[0] : undefined);
+          if (!agentRef) {
+            run({
+              block: true,
+              reason: "MIGRATION_REQUIRED: task authorization requires a provider-qualified agent identity.",
+            });
+            break;
+          }
+          const authorized = authorizeDispatchTrusted(c.cwd, {
+            ...request,
+            project_identity: c.project_identity,
+            run_identity: c.run_identity,
+            agent_ref: agentRef,
+          });
+          if (!authorized.ok) {
+            run({ block: true, reason: `dispatch authorization failed: ${authorized.error}` });
+            break;
+          }
+        }
+      }
+    }
+    if (options.observability !== false) {
+      recordToolCallAttempt(
+        c.cwd,
+        event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
+        result ? "blocked" : "allowed",
+        result?.reason,
+      );
+    }
+    return result;
+  });
+  pi.on("tool_result", (event: ToolResultEvent, ctx: unknown) => {
+    if (event.toolName !== "task") return;
+    const details = (event as unknown as { details?: { async?: { state?: string } } }).details;
+    const asyncState = details?.async?.state;
+    if (asyncState === "running" || asyncState === "spawned" || asyncState === "scheduled") return;
+    const checked = validatedGateContext(ctx);
+    if (!checked.ok) return;
+    const c = checked.context;
+    const content = event.content
+      .filter((part): part is { type: "text"; text: string } => part.type === "text")
+      .map((part) => part.text)
+      .join("\n")
+      .trim();
+    const evidence = content || (event.isError ? "native task failed" : "native task completed");
+    const reconciled = reconcileTrustedTaskResult(c.cwd, {
+      project_identity: c.project_identity,
+      run_identity: c.run_identity,
+      tool_call_id: event.toolCallId,
+      outcome: event.isError ? "failed" : "succeeded",
+      evidence,
+      pending: false,
+    });
+    if (!reconciled.ok && !reconciled.error.includes("unknown or already reconciled")) {
+      console.warn(`omp workflow task reconciliation failed: ${reconciled.error}`);
+    }
+  });
+  registerObservabilityHooks(pi, { enabled: options.observability, toolCall: false });
+  return host;
 }
 
-export type CommandId = "do-work" | "team" | "cto" | "init-team" | "interview" | "omp-model-roles";
-
-export interface WorkflowToolAdapterOptions {
-  cwd?: string;
-  resolveCwd?: (ctx: unknown) => string | undefined;
-  owner?: WorkflowOwnerSource;
-  isMainSession?: (ctx: unknown) => boolean;
-  beforeBegin?: (cwd: string) => void | Promise<void>;
-  mappingSummary?: (cwd: string) => unknown;
-}
-
-export interface WorkflowToolAdapter {
-  readonly capabilities: readonly ["workflow_tools"];
-  register(pi: ExtensionAPI): void;
-}
-
-// ── Generic model-role contracts (bundle taxonomy is intentionally absent) ──
+export * from "./workflow-v2/index.js";
 export {
   resolveRoleChain,
   isResearchRequest,
@@ -261,535 +464,24 @@ export type {
   ModelRolePreset,
   InventoryModel,
   RoleLookup,
-  RoleResolution,
   RoleResolutionStatus,
+  RoleResolution,
   ResearchRequest,
-  ResearchResponse,
   BenchmarkSource,
   ResearchRecommendation,
+  ResearchResponse,
 } from "./model-roles.js";
+export type { SessionIdentity } from "./workflow-v2/types.js";
+export { resolveWorkflow } from "./engine/profile.js";
 
-/**
- * Wire the engine into omp's ExtensionAPI. Bundles call this from their
- * default export. The engine consults `.omp/team.config.json` (or the
- * `roles`/`scopeMap` overrides) at runtime to resolve workflow roles to agents.
- *
- * Extension-side responsibilities:
- * - Register gates (classification, monotonic, dod-backstop, safety).
- * - Write runtime config (roles, scope, flags) for custom-TS commands.
- * - Register observability hooks (event log + rollup in `.work-state/features/<slug>/observability/`).
- *
- * Slash commands are NOT registered here. Since OMP 17.x, the `task` tool
- * lives on the main agent only — `ExtensionCommandContext` exposes no
- * subagent-dispatch affordance. Workflow commands ship as OMP custom-TS
- * commands in `packages/fullstack/commands/<name>/index.ts`; they receive
- * a `HookCommandContext` that can read `cwd`, `ui`, `sessionManager`, and
- * `modelRegistry`, and rely on `ctx.sendUserMessage(prompt)` to hand the
- * profile-driven workflow to the main agent's own `task` tool.
- */
-function resolveCwdFromContext(ctx: unknown): string | undefined {
-  if (!ctx || typeof ctx !== "object") return undefined;
-  const value = ctx as { cwd?: unknown; sessionManager?: unknown };
-  const manager = value.sessionManager;
-  if (manager && typeof manager === "object" && "getCwd" in manager && typeof manager.getCwd === "function") {
-    try {
-      const cwd = manager.getCwd();
-      if (typeof cwd === "string" && cwd.length > 0) return cwd;
-    } catch {
-      // Fall through to the context cwd.
-    }
-  }
-  return typeof value.cwd === "string" && value.cwd.length > 0 ? value.cwd : undefined;
-}
-
-function ownerAtCwd(source: WorkflowOwnerSource, cwd: string): WorkflowOwnerIdentity {
-  return typeof source === "function" ? source(canonicalProjectRoot(cwd)) : source;
-}
-
-function assertOwner(
-  cwd: string,
-  capabilities: readonly WorkflowCapability[],
-  source: WorkflowOwnerSource | undefined,
-): void {
-  if (!source) return;
-  const result = claimWorkflowOwners(cwd, capabilities, ownerAtCwd(source, cwd));
-  if (!result.ok) throw new Error(`${result.code}: ${result.error}`);
-}
-
-/**
- * Write caller-supplied runtime configuration against an explicit session
- * cwd. Core never substitutes a fullstack preset and never falls back to the
- * process cwd when this seam is invoked without a known session root.
- */
-export function writeRuntimeConfig(opts: RegisterOptions, cwd = opts.cwd): string | null {
-  const hasOverride = Boolean(
-    opts.roles
-    || opts.scopeMap
-    || opts.flags
-    || opts.rosterOverrides
-    || opts.scopeRuntimeClasses
-    || opts.scopeUiClasses
-    || opts.designSystem !== undefined,
-  );
-  if (!hasOverride || !cwd) return null;
-  assertOwner(cwd, ["config_writer"], opts.owner);
-  const path = resolveRuntimeConfigPath(cwd);
-  if (!path) return null;
-  // Seed-if-absent only. The session seed must never overwrite an existing
-  // config: users and /init-team own the file content after the first
-  // creation, and a per-session preset merge would silently revert every
-  // customization (roles, scope_map) on each omp restart.
-  if (existsSync(path)) return path;
-  writeConfig(path, {
-    roles: opts.roles ?? {},
-    roster_overrides: opts.rosterOverrides ?? {},
-    scope_map: opts.scopeMap ?? [],
-    flags: opts.flags ?? {},
-    scope_runtime_classes: opts.scopeRuntimeClasses ?? {},
-    scope_ui_classes: opts.scopeUiClasses ?? {},
-    design_system: opts.designSystem ?? null,
-  });
-  return path;
-}
-
-/**
- * Wire the generic engine into OMP. Domain bundles provide role/scope/flag
- * presets and an owner identity; core only registers reusable gates and
- * caller-supplied runtime data.
- */
-export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {}): void {
-  if (opts.cwd && opts.owner) {
-    assertOwner(opts.cwd, ["workflow_registration", "config_writer"], opts.owner);
-  }
-  const label = opts.label ?? "omp-workflows";
-  pi.setLabel(label);
-  if (opts.workflowProfiles?.length) registerWorkflowProfiles(opts.workflowProfiles);
-
-  const resolveCwd = opts.resolveCwd ?? resolveCwdFromContext;
-  const bindSession = (ctx: unknown): void => {
-    const cwd = opts.cwd ?? resolveCwd(ctx);
-    if (!cwd) return;
-    assertOwner(cwd, ["workflow_registration", "config_writer"], opts.owner);
-    writeRuntimeConfig(opts, cwd);
-  };
-  if (opts.cwd) bindSession({ cwd: opts.cwd });
-  else if ((opts.owner || opts.roles || opts.scopeMap || opts.flags || opts.rosterOverrides) && typeof pi.on === "function") {
-    pi.on("session_start", (_event: unknown, ctx: unknown) => bindSession(ctx));
-  }
-
-  // @ts-expect-error -- ExtensionAPI.on(string, handler) overload is enough at runtime; we type the handler explicitly.
-  pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string };
-    const r1 = classificationGate(event as unknown as Parameters<typeof classificationGate>[0], c);
-    if (r1?.block) return r1;
-    const r2 = monotonicGate(event, c);
-    if (r2?.block) return r2;
-  });
-  pi.on("session_stop", (event: SessionStopEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string };
-    return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], c);
-  });
-  pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string; hasUI?: boolean; actor?: "orchestrator" | "worker" | "lead" };
-    let result: { block?: boolean; reason?: string } | undefined;
-    const run = (candidate: { block?: boolean; reason?: string } | void) => { if (!result && candidate?.block) result = candidate; };
-    run(ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]));
-    run(outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], c));
-    run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c));
-    run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], c));
-    run(workerWriteScopeGate(event as unknown as Parameters<typeof workerWriteScopeGate>[0], { ...c, writeScope: opts.writeScope }));
-    run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c));
-    run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c));
-    run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], c));
-    if (!result && event.toolName === "task") {
-      const authorization = trustedDispatchRequests(
-        event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
-        c,
-      );
-      if (!authorization.ok) {
-        run({ block: true, reason: authorization.reason });
-      } else {
-        for (const request of authorization.requests) {
-          const authorized = authorizeDispatchTrusted(c.cwd, request);
-          if (!authorized.ok) {
-            run({ block: true, reason: `dispatch authorization failed: ${authorized.error}` });
-            break;
-          }
-        }
-      }
-    }
-    if (!result && opts.observability !== false) {
-      recordToolCallAttempt(c.cwd, event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }, "allowed");
-    } else if (opts.observability !== false) {
-      recordToolCallAttempt(c.cwd, event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }, "blocked", result?.reason);
-    }
-    return result;
-  });
-  pi.on("tool_result", (event: ToolResultEvent, ctx: unknown) => {
-    if (event.toolName !== "task") return;
-    const c = ctx as { cwd?: string };
-    if (!c.cwd) return;
-    const details = (event as unknown as { details?: { async?: { state?: string } } }).details;
-    const asyncState = details?.async?.state;
-    if (asyncState === "running" || asyncState === "spawned" || asyncState === "scheduled") return;
-    const content = event.content
-      .filter((part): part is { type: "text"; text: string } => part.type === "text")
-      .map((part) => part.text)
-      .join("\n")
-      .trim();
-    const evidence = content || (event.isError ? "native task failed" : "native task completed");
-    const reconciled = reconcileTrustedTaskResult(c.cwd, {
-      tool_call_id: event.toolCallId,
-      outcome: event.isError ? "failed" : "succeeded",
-      evidence,
-    });
-    if (!reconciled.ok && !reconciled.error.includes("unknown or already reconciled")) {
-      console.warn(`omp workflow task reconciliation failed: ${reconciled.error}`);
-    }
-  });
-  registerObservabilityHooks(pi, { enabled: opts.observability, toolCall: false });
-}
-function defaultMainSession(ctx: unknown): boolean {
-  if (!ctx || typeof ctx !== "object" || !("hasUI" in ctx)) return true;
-  return (ctx as { hasUI?: unknown }).hasUI !== false;
-}
-
-type WorkflowToolResult = { content: [{ type: "text"; text: string }]; details: unknown };
-
-function toolResult(value: unknown): WorkflowToolResult {
-  return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
-}
-
-function workflowStateSummary(cwd: string, mappingSummary?: (cwd: string) => unknown): unknown {
-  const resolved = resolveState(cwd);
-  if (resolved.invalid) return { ok: false, code: "WORKFLOW_STATE_INVALID", error: "workflow state path is invalid or unsafe" };
-  if (!resolved.state) return { ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow state not found" };
-  const state = resolved.state;
-  const capability = state.dispatch_capability;
-  return {
-    ok: true,
-    branch: state.branch,
-    workflow: state.classification?.workflow,
-    stage_cursor: state.stage_cursor,
-    cursor_epoch: state.cursor_epoch,
-    stages: state.stages,
-    pause: state.pause,
-    agent_mapping: mappingSummary?.(cwd) ?? null,
-    join_summary: state.join_summary,
-    capability: capability
-      ? {
-          capability_id: capability.capability_id,
-          kind: capability.kind,
-          status: capability.status,
-          expected_roles: capability.expected_roles,
-          dispatches: (capability.dispatches ?? []).map(dispatch => ({
-            id: dispatch.id,
-            role: dispatch.role,
-            agent: dispatch.agent,
-            tool_call_id: dispatch.tool_call_id,
-            status: dispatch.status,
-            completed: Boolean(dispatch.completion),
-            completed_by: dispatch.completion?.completed_by,
-            artifact_ids: dispatch.completion?.artifact_ids ?? [],
-            outcome: dispatch.completion?.outcome,
-          })),
-        }
-      : null,
-  };
-}
-
-/**
- * Core-owned typed workflow tool registration. Bundles adapt only cwd,
- * mapping and owner identity; preparation, checkpoint, completion and cursor
- * transitions remain one engine implementation.
- */
-export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAdapterOptions = {}): void {
-  if (!pi.zod) return;
-  if (options.cwd && options.owner) assertOwner(options.cwd, ["workflow_tools"], options.owner);
-  const { z } = pi.zod;
-  const emptyParameters = z.object({}) as never;
-  const resolveCwd = options.resolveCwd ?? resolveCwdFromContext;
-  const contextError = (ctx: unknown): WorkflowToolResult | null => {
-    if ((options.isMainSession ?? defaultMainSession)(ctx) === false) {
-      return toolResult({
-        ok: false,
-        code: "WORKFLOW_CONTEXT_REJECTED",
-        error: "workflow control tools are available only in the main session",
-      });
-    }
-    const cwd = options.cwd ?? resolveCwd(ctx);
-    if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-    try {
-      assertOwner(cwd, ["workflow_tools"], options.owner);
-    } catch (error) {
-      return toolResult({ ok: false, code: "WORKFLOW_OWNER_REJECTED", error: String(error) });
-    }
-    return null;
-  };
-  const currentCwd = (ctx: unknown): string | undefined => options.cwd ?? resolveCwd(ctx);
-  const classificationParameters = z.object({
-    type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"]),
-    complexity: z.enum(["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"]),
-    confidence: z.enum(["HIGH", "MEDIUM", "LOW"]),
-    autonomous: z.boolean(),
-    autonomous_reason: z.string().optional(),
-    workflow: z.string().optional(),
-  });
-  pi.registerTool({
-    name: "workflow_prepare",
-    label: "Prepare workflow state",
-    description: "Persist PHASE-0 classification and initialize or reopen engine-owned workflow state.",
-    parameters: z.object({
-      task: z.string().min(1),
-      branch: z.string().min(1),
-      classification: classificationParameters.optional(),
-      files: z.array(z.string().min(1)).default(() => []),
-      issue: z.union([z.number().int(), z.object({ number: z.number().int(), url: z.string().optional() })]).nullable().default(null),
-      continuation: z.object({ feedback: z.string().min(1), stageId: z.string().min(1) }).optional(),
-    }) as never,
-    async execute(_id, params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = currentCwd(ctx);
-      if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      const input = params as {
-        task: string;
-        branch: string;
-        classification?: ModelClassification;
-        files?: string[];
-        issue?: number | { number: number; url?: string } | null;
-        continuation?: { feedback: string; stageId: string };
-      };
-      if (!input.continuation && !input.classification) {
-        return toolResult({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: "new workflow preparation requires a complete classification" });
-      }
-      try {
-        const prepared = prepareWorkflowState({
-          task: input.task,
-          cwd,
-          branch: input.branch,
-          autonomous: input.classification?.autonomous ?? false,
-          classification: input.classification,
-          files: input.files,
-          issue: typeof input.issue === "number" ? { number: input.issue } : input.issue ?? null,
-          continuation: input.continuation,
-        } satisfies WorkflowPrepareOptions);
-        return toolResult({
-          ok: true,
-          transition: "prepare",
-          state_path: prepared.statePath,
-          artifacts_dir: prepared.artifactsDir,
-          workflow: prepared.profile.name,
-          classification: prepared.classification,
-          state: workflowStateSummary(cwd, options.mappingSummary),
-        });
-      } catch (error) {
-        return toolResult({ ok: false, code: "WORKFLOW_PREPARE_FAILED", error: String(error) });
-      }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_begin",
-    label: "Begin workflow stage",
-    description: "Issue a durable opaque capability for the current workflow stage.",
-    parameters: emptyParameters,
-    async execute(_id, _params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = currentCwd(ctx);
-      if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      try {
-        await options.beforeBegin?.(cwd);
-        const transition = beginCapability(cwd);
-        if (!transition.ok) return toolResult({ ok: false, code: "WORKFLOW_BEGIN_REJECTED", error: transition.error, state: transition.state ? workflowStateSummary(cwd, options.mappingSummary) : undefined });
-        return toolResult({ ok: true, transition: "begin", handoff: transition.handoff, state: workflowStateSummary(cwd, options.mappingSummary) });
-      } catch (error) {
-        return toolResult({ ok: false, code: "WORKFLOW_BEGIN_FAILED", error: String(error) });
-      }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_status",
-    label: "Workflow status",
-    description: "Read the current durable workflow stage and dispatch status.",
-    parameters: emptyParameters,
-    async execute(_id, _params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = currentCwd(ctx);
-      return toolResult(cwd ? workflowStateSummary(cwd, options.mappingSummary) : { ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-    },
-  });
-  pi.registerTool({
-    name: "workflow_instructions",
-    label: "Workflow instructions",
-    description: "Read the current structured workflow stage contract.",
-    parameters: emptyParameters,
-    async execute(_id, _params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = currentCwd(ctx);
-      if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      try {
-        return toolResult(resolveWorkflowContract(cwd));
-      } catch (error) {
-        return toolResult({ ok: false, code: "WORKFLOW_RESOLUTION_FAILED", error: String(error) });
-      }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_complete",
-    label: "Complete workflow dispatch",
-    description: "Record durable completion for an authorized workflow dispatch. Copy the compact profile_hash fingerprint exactly from the current workflow handoff; do not abbreviate or reconstruct it.",
-    parameters: z.object({
-      dispatch_id: z.string().min(1),
-      token: z.string().min(1),
-      capability_id: z.string().min(1),
-      run_key: z.string().min(1),
-      branch: z.string().min(1),
-      workflow: z.string().min(1),
-      profile_hash: z.string().min(1),
-      stage_cursor: z.string().min(1),
-      cursor_epoch: z.string().min(1),
-      evidence: z.string().min(1),
-      artifact_ids: z.array(z.string().min(1)).default(() => []),
-      outcome: z.enum(["succeeded", "failed", "cancelled"]).default("succeeded"),
-    }) as never,
-    async execute(_id, params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = currentCwd(ctx);
-      if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      const input = params as DispatchAuth & { dispatch_id: string; evidence: string; artifact_ids?: string[]; outcome: "succeeded" | "failed" | "cancelled" };
-      try {
-        const transition = completeDispatch(cwd, { ...input, completed_by: "workflow_complete" });
-        return transition.ok
-          ? toolResult({ ok: true, transition: "complete", dispatch_id: input.dispatch_id, state: transition.state, record: transition.record })
-          : toolResult({ ok: false, code: "WORKFLOW_COMPLETE_REJECTED", error: transition.error, dispatch_id: input.dispatch_id });
-      } catch (error) {
-        return toolResult({ ok: false, code: "WORKFLOW_COMPLETE_FAILED", error: String(error), dispatch_id: input.dispatch_id });
-      }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_checkpoint",
-    label: "Record checkpoint decision",
-    description: "Persist a typed, policy-bound decision envelope for a declared stage checkpoint. Human authorization requires a durable terminal/escalation answer proof; legacy mode/actor fields never authorize a transition.",
-    parameters: z.object({
-      token: z.string().min(1),
-      capability_id: z.string().min(1),
-      run_key: z.string().min(1),
-      branch: z.string().min(1),
-      workflow: z.string().min(1),
-      profile_hash: z.string().min(1),
-      stage_cursor: z.string().min(1),
-      cursor_epoch: z.string().min(1),
-      checkpoint: z.string().min(1),
-      checkpoint_id: z.string().min(1),
-      checkpoint_kind: z.string().min(1),
-      authorization: z.enum(["human", "policy_auto"]),
-      actor_provenance: z.object({
-        kind: z.enum(["user", "orchestrator", "system"]),
-        ref: z.string().min(1),
-        proof: z.object({
-          answer_id: z.string().min(1),
-          nonce: z.string().min(1),
-          channel: z.enum(["terminal", "escalation"]),
-          reference: z.string().min(1),
-          binding: z.string().min(1),
-        }).strict().optional(),
-      }).strict(),
-      decision: z.string().min(1),
-      rationale: z.string().default(""),
-      run_id: z.string().min(1).optional(),
-    }).strict() as never,
-    async execute(_id, params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = currentCwd(ctx);
-      if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      const input = params as DispatchAuth & {
-        checkpoint: string;
-        checkpoint_id: string;
-        checkpoint_kind: CheckpointRuleKind;
-        authorization: "human" | "policy_auto";
-        actor_provenance: { kind: "user" | "orchestrator" | "system"; ref: string; proof?: CheckpointAnswerProof };
-        decision: string;
-        rationale: string;
-        run_id?: string;
-      };
-      try {
-        const transition = recordCheckpointDecision(cwd, input);
-        return transition.ok
-          ? toolResult({ ok: true, transition: "checkpoint", checkpoint: input.checkpoint, state: workflowStateSummary(cwd, options.mappingSummary) })
-          : toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_REJECTED", error: transition.error });
-      } catch (error) {
-        return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_FAILED", error: String(error) });
-      }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_advance",
-    label: "Advance workflow",
-    description: "Join the current stage and advance its durable cursor after all dispatches complete.",
-    parameters: z.object({
-      token: z.string().min(1),
-      capability_id: z.string().min(1),
-      run_key: z.string().min(1),
-      branch: z.string().min(1),
-      workflow: z.string().min(1),
-      profile_hash: z.string().min(1),
-      stage_cursor: z.string().min(1),
-      cursor_epoch: z.string().min(1),
-      evidence: z.string().min(1),
-    }) as never,
-    async execute(_id, params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = currentCwd(ctx);
-      if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      const input = params as DispatchAuth & { evidence: string };
-      try {
-        const transition = advanceCursor(cwd, input);
-        return transition.ok
-          ? toolResult({ ok: true, transition: "advance", stage_cursor: transition.state.stage_cursor, cursor_epoch: transition.state.cursor_epoch, handoff: transition.handoff, state: workflowStateSummary(cwd, options.mappingSummary) })
-          : toolResult({ ok: false, code: "WORKFLOW_ADVANCE_REJECTED", error: transition.error });
-      } catch (error) {
-        return toolResult({ ok: false, code: "WORKFLOW_ADVANCE_FAILED", error: String(error) });
-      }
-    },
-  });
-}
-
-export function createWorkflowToolAdapter(options: WorkflowToolAdapterOptions = {}): WorkflowToolAdapter {
-  return {
-    capabilities: ["workflow_tools"],
-    register: (pi: ExtensionAPI) => registerWorkflowTools(pi, options),
-  };
-}
-
-export { teamCommand } from "./commands/team.js";
 export { dispatchGate, buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests, type DispatchAuthorizationRequest } from "./gates/dispatch.js";
 export {
-  findProfileDir,
-  resolveWorkflowProfilePath,
-  loadAllProfiles,
-  loadProfile,
-  isRegisteredWorkflow,
-  matchesProfile,
-  registerWorkflowProfiles,
-  resolveWorkflow,
-  selectProfile,
-} from "./engine/profile.js";
-export {
-  hashDispatchSecret,
   createCapability,
   beginCapability,
   authorizeDispatch,
   authorizeDispatchTrusted,
   completeDispatch,
   reconcileTrustedTaskResult,
-  advanceCursor,
   reconcileTaskResult,
   recordCheckpointDecision,
   setArtifactContractPolicy,
@@ -879,39 +571,6 @@ export {
   type WorkflowStageContract,
 } from "./engine/workflow-contract.js";
 export {
-  resolveConfig,
-  resolveAgentForRole,
-  agentMappingIssueForRole,
-  type ConfigPreset,
-  type ConfigSource,
-  type ConfigDiagnosticCode,
-  type ConfigDiagnostic,
-  type ConfigProvenance,
-  type ResolvedConfig,
-} from "./engine/config.js";
-export {
-  RuntimeConfigError,
-  resolveRuntimeConfigPath,
-  writeConfig,
-  type RuntimeConfigErrorCode,
-  type RuntimeConfigWriteOptions,
-} from "./runtime-config.js";
-export {
-  AGENT_MAPPING_SCHEMA,
-  DEFAULT_GENERIC_AGENT,
-  agentMappingPath,
-  buildAgentMapping,
-  mappingPreferencesHash,
-  readAgentMapping,
-  writeAgentMapping,
-  type AgentMappingDiagnostic,
-  type AgentMappingExpectation,
-  type AgentMappingOptions,
-  type AgentMappingState,
-  type AgentMappingStatus,
-  type MappingPreferencesProvenance,
-} from "./engine/agent-mapping.js";
-export {
   resolveScope,
   applyConditional,
   shouldSkip,
@@ -957,16 +616,15 @@ export {
   type ModelClassification,
 } from "./engine/run.js";
 export {
-	walkProfile,
-	runStage,
-	createTaskCaller,
-	spawnLabel,
-	DevAgentUnavailableError,
-	type TaskCaller,
-	type TaskResult,
-	type TaskToolLike,
-	type StageContext,
-	type StageOutcome,
+  runStage,
+  createTaskCaller,
+  spawnLabel,
+  DevAgentUnavailableError,
+  type TaskCaller,
+  type TaskResult,
+  type TaskToolLike,
+  type StageContext,
+  type StageOutcome,
 } from "./engine/stage.js";
 export type {
   Profile,
@@ -980,12 +638,11 @@ export type {
   WorkflowName,
   Classification,
   TeamState,
-  RoleConfig,
   DoD,
   DoDItem,
   DispatchCompletion,
   DispatchRecord,
-  DispatchCapabilityState,
+  RetiredCapability,
   JoinSummary,
   CheckpointDecision,
   TypedCheckpointDecision,
@@ -1015,6 +672,7 @@ export type {
   RosterOmittedEntry,
   RosterSelection,
   WorkIdentity,
+  WorkIdentityScope,
   PendingReason,
   PendingLease,
   PendingState,
@@ -1070,7 +728,7 @@ export {
 	ctoStateDir,
 	ctoStatePath,
 	newCtoState,
-	readCtoState,
+	readBoundCtoState,
 	writeCtoState,
 	setTeamStatus,
 	setEscalation,
@@ -1101,7 +759,6 @@ export {
   buildAmendPrompt,
   buildStandbyCtoPrompt,
   renderChannelSection,
-  findActiveCtoRun,
   type ParsedCtoEnvelope,
   type CtoPromptOptions,
 } from "./commands/cto.js";
@@ -1113,14 +770,9 @@ export {
 	type BuildResult,
 } from "./cto/plan.js";
 export {
-	registerWorkflowCommands,
-	type WorkflowCommandOptions,
-} from "./commands/register.js";
-export {
   parseWorkEnvelope,
   buildDoWorkPrompt,
   type ParsedWorkEnvelope,
-  type WorkTeamConfig,
 } from "./commands/do-work.js";
 export {
   parseAutonomousDirective,
@@ -1150,18 +802,8 @@ export type {
   EventKind,
 } from "./observability/events.js";
 
-/**
- * Marker exported so custom-TS commands can detect that the engine was
- * wired in this package (i.e. the bundle is `omp-workflows-fullstack` or
- * a derivative that calls `registerTeamWorkflow`). Used by the bundled
- * commands to short-circuit when no engine is present.
- */
-export const CORE_ENGINE_MARKER = "omp-workflows-core/0.8.0";
-
-// ── cto-core (br-zps.1, br-zps.3, br-zps.11) ────────────────────────────────
 export {
 	migrateCtoState,
-	canonicalizeState,
 } from "./cto/state.js";
 export {
 	acquireLease,
@@ -1190,10 +832,7 @@ export type {
 
 // ── cto resident control-plane (channel policy, slice gate) ────────────────
 export {
-	resolveChannelProfile,
-	normalizeChannelConfig,
-	hasRwPrimary,
-	loadEscalationConfigRaw,
+  resolveBoundChannelProfile,
 } from "./cto/channels.js";
 export type { ExplicitChannelConfig, ChannelCapabilities } from "./cto/channels.js";
 export {
@@ -1229,9 +868,30 @@ export { dissentGate } from "./cto/gates.js";
 
 // ── Session-state visualization (pragmatic architecture) ───────────────────
 export {
-	buildSessionReport,
-	writeReport,
+  buildSessionReport,
+  writeReport,
 } from "./report/assemble.js";
+export {
+	createReportStorageAuthority,
+	isReportStorageAuthority,
+	isReportTreeStorageAuthority,
+	replaceStorageTreeAtomic,
+} from "./report/storage.js";
+export type {
+	ReportStorageAuthority,
+	ReportStorageOperations,
+	ReportTreeStorageAuthority,
+	ReportTreeStorageOperations,
+	StorageEntry,
+	StorageFailure,
+	StorageFailureReason,
+	StorageResult,
+	StorageStat,
+	StorageTreeEntry,
+	StorageTreeLimits,
+	StorageTreePublishResult,
+} from "./report/storage.js";
+export { findActiveCtoRun } from "./report/session-source.js";
 export { renderReportHtml } from "./report/html.js";
 export { renderMarkdownDocumentHtml } from "./report/markdown.js";
 export type { MarkdownDocumentOptions } from "./report/markdown.js";

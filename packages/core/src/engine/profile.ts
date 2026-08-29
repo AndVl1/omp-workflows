@@ -1,14 +1,24 @@
-import { createHash } from "node:crypto";
 /**
- * Profile loader and classification resolver.
+ * Provider-catalog profile validation and digest-pinned loading.
  *
- * Same model as claude-plugin: same JSON profile format, same selection order,
- * same Type x Complexity -> Workflow table.
+ * Profile selection is owned by a validated provider catalog. This module keeps
+ * the profile DSL/control-plane validation helpers, but never discovers or
+ * selects profiles from process-global or filesystem state.
  */
 
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import {
+  computeProfileContentDigest,
+  computeCatalogContentDigest,
+  validateProviderCatalog,
+} from "../workflow-v2/descriptor.js";
+import { createDiagnostic, failureResult, successResult } from "../workflow-v2/diagnostics.js";
+import { isWorkflowV2Digest } from "../workflow-v2/identity.js";
+import type {
+  CatalogProfile,
+  DiagnosticResult,
+  ProfileIdentity,
+  ProviderCatalog,
+} from "../workflow-v2/types.js";
 import { validateProfileExpressions } from "./predicate.js";
 import { validateStageFanInResolutions } from "./fan-in.js";
 import type {
@@ -23,22 +33,6 @@ import type {
   WorkflowName,
 } from "./types.js";
 
-/** Selection order — first match wins. */
-const SELECTION_ORDER: WorkflowName[] = [
-  "full-feature",
-  "debug-cycle",
-  "bug-fix",
-  "standard",
-  "lightweight",
-  "research",
-  "product-discovery",
-  "spec-preparation",
-  "feature-regression",
-  "review",
-  "emergency",
-];
-const registeredProfiles = new Map<string, Profile>();
-
 type UnknownRecord = Record<string, unknown>;
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -51,6 +45,9 @@ function hasOwn(value: UnknownRecord, key: string): boolean {
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+function optionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
 }
 
 function issue(issues: string[], path: string, message: string): void {
@@ -71,6 +68,9 @@ function stringArray(value: unknown, path: string, issues: string[], allowEmpty 
   if (!allowEmpty && value.length === 0) issue(issues, path, "must not be empty");
   return true;
 }
+function isNonEmptyStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry): entry is string => nonEmptyString(entry));
+}
 
 function enumValue(value: unknown, allowed: readonly string[], path: string, issues: string[]): boolean {
   if (typeof value !== "string" || !allowed.includes(value)) {
@@ -85,7 +85,8 @@ function requiredString(value: UnknownRecord, key: string, path: string, issues:
 }
 
 function requiredInteger(value: UnknownRecord, key: string, path: string, issues: string[], minimum = 0): void {
-  if (!Number.isInteger(value[key]) || (value[key] as number) < minimum) {
+  const candidate = value[key];
+  if (typeof candidate !== "number" || !Number.isInteger(candidate) || candidate < minimum) {
     issue(issues, `${path}.${key}`, `must be an integer >= ${minimum}`);
   }
 }
@@ -101,7 +102,7 @@ function validateCompletionIntent(value: unknown, path: string, issues: string[]
   enumValue(value.source, ["user", "workflow_policy", "migration"], `${path}.source`, issues);
   requiredString(value, "rationale", path, issues);
 }
-const CHECKPOINT_KINDS = [
+const CHECKPOINT_KINDS: readonly string[] = [
   "product_approval",
   "clarification",
   "architecture_choice",
@@ -115,8 +116,8 @@ const CHECKPOINT_KINDS = [
   "bundle_activation",
   "migration_cutover",
   "custom",
-] as const;
-const HARD_HUMAN_KINDS = [
+];
+const HARD_HUMAN_KINDS: readonly string[] = [
   "product_approval",
   "security",
   "destructive_side_effect",
@@ -124,7 +125,7 @@ const HARD_HUMAN_KINDS = [
   "bundle_activation",
   "migration_cutover",
   "custom",
-] as const;
+];
 
 function validateCheckpointRule(value: unknown, path: string, issues: string[], hardHuman: readonly string[], allowPendingDecisions = false): void {
   if (!isRecord(value)) {
@@ -153,10 +154,11 @@ function validateCheckpointPolicy(value: unknown, path: string, issues: string[]
   unknownKeys(value, ["default", "scope", "hard_human", "rules", "source", "policy_version", "rationale"], path, issues);
   enumValue(value.default, ["required_human", "autonomous_allowed"], `${path}.default`, issues);
   enumValue(value.scope, ["decision"], `${path}.scope`, issues);
-  const hardHumanValid = stringArray(value.hard_human, `${path}.hard_human`, issues);
-  const hardHuman = hardHumanValid ? value.hard_human as string[] : [];
+  const hardHumanValue = value.hard_human;
+  const hardHumanValid = stringArray(hardHumanValue, `${path}.hard_human`, issues);
+  const hardHuman = hardHumanValid ? hardHumanValue : [];
   for (const kind of hardHuman) {
-    if (!HARD_HUMAN_KINDS.includes(kind as (typeof HARD_HUMAN_KINDS)[number])) issue(issues, `${path}.hard_human`, "unknown hard-human class");
+    if (!HARD_HUMAN_KINDS.includes(kind)) issue(issues, `${path}.hard_human`, "unknown hard-human class");
   }
   if (!isRecord(value.rules)) {
     issue(issues, `${path}.rules`, "must be an object");
@@ -188,10 +190,12 @@ function validateRosterPolicy(value: unknown, path: string, issues: string[]): v
     "triggers",
     "budget",
   ], path, issues);
-  const allowedValid = stringArray(value.allowed_roles, `${path}.allowed_roles`, issues, false);
-  const allowedRoles = allowedValid ? value.allowed_roles as string[] : [];
-  const requiredRolesValid = stringArray(value.required_roles, `${path}.required_roles`, issues);
-  const requiredRoles = requiredRolesValid ? value.required_roles as string[] : [];
+  const allowedRolesValue = value.allowed_roles;
+  const allowedValid = stringArray(allowedRolesValue, `${path}.allowed_roles`, issues, false);
+  const allowedRoles = allowedValid ? allowedRolesValue : [];
+  const requiredRolesValue = value.required_roles;
+  const requiredRolesValid = stringArray(requiredRolesValue, `${path}.required_roles`, issues);
+  const requiredRoles = requiredRolesValid ? requiredRolesValue : [];
   const requiredFacetsValid = stringArray(value.required_facets, `${path}.required_facets`, issues);
   requiredInteger(value, "min_workers", path, issues);
   requiredInteger(value, "max_workers", path, issues);
@@ -236,12 +240,14 @@ function validateRosterPolicy(value: unknown, path: string, issues: string[]): v
     issue(issues, `${path}.triggers`, "must be an object");
   } else {
     unknownKeys(value.triggers, ["complexity", "confidence", "scope_flags", "evidence"], `${path}.triggers`, issues);
-    const complexityValid = stringArray(value.triggers.complexity, `${path}.triggers.complexity`, issues);
-    const confidenceValid = stringArray(value.triggers.confidence, `${path}.triggers.confidence`, issues);
+    const complexityValue = value.triggers.complexity;
+    const confidenceValue = value.triggers.confidence;
+    const complexityValid = stringArray(complexityValue, `${path}.triggers.complexity`, issues);
+    const confidenceValid = stringArray(confidenceValue, `${path}.triggers.confidence`, issues);
     stringArray(value.triggers.scope_flags, `${path}.triggers.scope_flags`, issues);
     stringArray(value.triggers.evidence, `${path}.triggers.evidence`, issues);
-    const complexities = complexityValid ? value.triggers.complexity as string[] : [];
-    const confidences = confidenceValid ? value.triggers.confidence as string[] : [];
+    const complexities = complexityValid ? complexityValue : [];
+    const confidences = confidenceValid ? confidenceValue : [];
     if (complexityValid) for (const item of complexities) enumValue(item, ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"], `${path}.triggers.complexity`, issues);
     if (confidenceValid) for (const item of confidences) enumValue(item, ["HIGH", "MEDIUM", "LOW"], `${path}.triggers.confidence`, issues);
   }
@@ -377,96 +383,232 @@ export function resolveProfileControlPlane(profile: Profile, stageId?: string): 
   };
 }
 
-/** Register bundle-owned profiles for the core interpreter. */
-export function registerWorkflowProfiles(profiles: Profile[]): void {
-  for (const profile of profiles) {
-    if (!profile.name || !profile.stages?.length || !profile.match?.type) {
-      throw new Error(`invalid workflow profile registration: ${JSON.stringify(profile)}`);
+
+
+const STAGE_TYPES: readonly string[] = ["orchestrator", "single", "consilium", "document", "bash", "none", "team"];
+
+function isStageInput(value: unknown): value is Profile["stages"][number] {
+  if (!isRecord(value)
+    || !nonEmptyString(value.id)
+    || !nonEmptyString(value.title)
+    || typeof value.type !== "string"
+    || !STAGE_TYPES.includes(value.type)) return false;
+  for (const key of ["prompt", "description", "role", "profile", "checkpoint", "autonomous", "command", "gate", "skip_if"]) {
+    if (value[key] !== undefined && typeof value[key] !== "string") return false;
+  }
+  for (const names of [value.roles, value.teams, value.consumes]) {
+    if (names !== undefined && !isNonEmptyStringArray(names)) return false;
+  }
+  if (value.produces !== undefined && typeof value.produces !== "string" && !isNonEmptyStringArray(value.produces)) return false;
+  if (value.parallel !== undefined && typeof value.parallel !== "boolean") return false;
+  if (value.integration !== undefined) {
+    if (!isRecord(value.integration)
+      || !nonEmptyString(value.integration.stage)
+      || !nonEmptyString(value.integration.on_failure)) return false;
+  }
+  if (value.document !== undefined && !isRecord(value.document)) return false;
+  if (value.fan_in !== undefined) {
+    if (!isRecord(value.fan_in)
+      || value.fan_in.resolutions !== undefined && !Array.isArray(value.fan_in.resolutions)) return false;
+  }
+  if (value.conditional !== undefined) {
+    if (!Array.isArray(value.conditional)) return false;
+    for (const conditional of value.conditional) {
+      if (!isRecord(conditional)
+        || !nonEmptyString(conditional.if)
+        || !optionalString(conditional.add)
+        || !optionalString(conditional.remove)) return false;
+    }
+  }
+  if (value.loop !== undefined) {
+    if (!isRecord(value.loop)
+      || !nonEmptyString(value.loop.back_to)
+      || !nonEmptyString(value.loop.until)
+      || typeof value.loop.max_iterations !== "number"
+      || !Number.isInteger(value.loop.max_iterations)
+      || value.loop.max_iterations < 0
+      || !nonEmptyString(value.loop.on_exhausted)) return false;
+  }
+  return (value.checkpoint_policy === undefined || isRecord(value.checkpoint_policy))
+    && (value.completion_intent === undefined || isRecord(value.completion_intent))
+    && (value.roster_policy === undefined || isRecord(value.roster_policy));
+}
+
+function isProfileInput(value: unknown): value is Profile {
+  if (!isRecord(value)
+    || !nonEmptyString(value.name)
+    || typeof value.title !== "string"
+    || typeof value.description !== "string"
+    || !isRecord(value.match)
+    || !Array.isArray(value.stages)
+    || value.stages.length === 0) return false;
+  const matchTypes = value.match.type;
+  if (!isNonEmptyStringArray(matchTypes)) return false;
+  const matchComplexity = value.match.complexity;
+  if (matchComplexity !== undefined) {
+    const complexityValues = matchComplexity;
+    if (!isNonEmptyStringArray(complexityValues)) return false;
+  }
+  for (let index = 0; index < value.stages.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(value.stages, index) || !isStageInput(value.stages[index])) return false;
+  }
+  return (value.completion_intent === undefined || isRecord(value.completion_intent))
+    && (value.checkpoint_policy === undefined || isRecord(value.checkpoint_policy))
+    && (value.autoSelect === undefined || typeof value.autoSelect === "boolean");
+}
+
+function isProfileArray(value: unknown): value is readonly Profile[] {
+  if (!Array.isArray(value)) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(value, index) || !isProfileInput(value[index])) return false;
+  }
+  return true;
+}
+
+function isCatalogBuildOptions(value: unknown): value is ProviderCatalogBuildOptions {
+  return isRecord(value)
+    && Object.keys(value).every((key) => key === "profiles")
+    && isProfileArray(value.profiles);
+}
+
+export interface ProviderCatalogBuildOptions {
+  readonly profiles: readonly Profile[];
+}
+
+/** Build an immutable catalog with identities pinned to exact profile content. */
+export function createProviderCatalog(profilesOrOptions: readonly Profile[] | ProviderCatalogBuildOptions): Readonly<ProviderCatalog> {
+  const profiles = isProfileArray(profilesOrOptions)
+    ? profilesOrOptions
+    : isCatalogBuildOptions(profilesOrOptions)
+      ? profilesOrOptions.profiles
+      : (() => {
+        throw new TypeError("cannot create a provider catalog without a profile array");
+      })();
+  const entries: CatalogProfile[] = profiles.map((profile) => {
+    if (!isProfileInput(profile)) {
+      throw new TypeError("cannot create a catalog entry from an invalid workflow profile");
     }
     assertProfileControlPlane(profile);
-    // Reject unsupported DSL at load: an expression that cannot parse must
-    // never silently evaluate to false during a run.
-    const diagnostics = validateProfileExpressions(profile);
-    if (diagnostics.length > 0) {
-      throw new Error(`invalid workflow profile '${profile.name}' expressions: ${diagnostics.join("; ")}`);
+    const expressionDiagnostics = validateProfileExpressions(profile);
+    if (expressionDiagnostics.length > 0) {
+      throw new TypeError(`cannot create a catalog entry from invalid profile '${profile.name}' expressions`);
     }
-    // Reject malformed fan-in resolutions at load: a resolution must
-    // deliberately document exactly how a required-scalar disagreement is
-    // resolved, so it can never resolve a disagreement silently.
     const fanInDiagnostics = profile.stages.flatMap((stage) => validateStageFanInResolutions(stage));
     if (fanInDiagnostics.length > 0) {
-      throw new Error(`invalid workflow profile '${profile.name}' fan-in resolutions: ${fanInDiagnostics.join("; ")}`);
+      throw new TypeError(`cannot create a catalog entry from invalid profile '${profile.name}' fan-in resolutions`);
     }
-    registeredProfiles.set(profile.name, profile);
-  }
-}
-export function isRegisteredWorkflow(name: string): boolean {
-  return registeredProfiles.has(name) || loadAllProfiles().some((profile) => profile.name === name);
-}
-
-export function matchesProfile(name: string, c: Pick<Classification, "type" | "complexity">): boolean {
-  const profile = loadAllProfiles().find((candidate) => candidate.name === name);
-  if (!profile) return false;
-  assertProfileControlPlane(profile);
-  return profile.match.type.includes(c.type) && (!profile.match.complexity || profile.match.complexity.includes(c.complexity));
-}
-
-export function findProfileDir(): string {
-  // Distribution layout: <pkg>/dist/engine/profile.js -> <pkg>/workflows/
-  const here = fileURLToPath(import.meta.url);
-  const pkgRoot = resolve(here, "..", "..", "..");
-  return join(pkgRoot, "workflows");
+    return {
+      identity: {
+        id: profile.name,
+        fingerprint: computeProfileContentDigest(profile),
+      },
+      profile,
+    };
+  });
+  const content_digest = computeCatalogContentDigest({ profiles: entries });
+  const catalog: ProviderCatalog = { content_digest, profiles: entries };
+  const checked = validateProviderCatalog(catalog);
+  if (!checked.ok) throw new TypeError("cannot create an invalid provider catalog");
+  return checked.value;
 }
 
-export function loadAllProfiles(): Profile[] {
-  const dir = findProfileDir();
-  const result = [...registeredProfiles.values()];
-  if (existsSync(dir)) {
-    for (const name of readdirSync(dir)) {
-      if (!name.endsWith(".json")) continue;
-      if (name.startsWith("_") || name === "artifacts-schema.json" || name === "team.config.example.json" || name === "team.config.schema.json") continue;
-      const path = join(dir, name);
-      try {
-        const raw = JSON.parse(readFileSync(path, "utf8")) as Profile;
-        if (raw?.name && raw?.stages && raw?.match) {
-          assertProfileControlPlane(raw);
-          result.push(raw);
-        }
-      } catch (error) {
-        if (error instanceof Error && error.message.startsWith("invalid workflow profile")) throw error;
-        // Non-profile JSON assets are not candidates; malformed profile
-        // candidates are rejected rather than silently authorizing a fallback.
-        if (name.endsWith(".json") && !name.includes("example") && name !== "teams.json") {
-          throw new Error(`invalid workflow profile file '${path}': unreadable or malformed JSON`);
-        }
-      }
-    }
-  }
-  const unique = new Map(result.map((profile) => [profile.name, profile]));
-  return [...unique.values()].sort((a, b) => {
-    const ai = SELECTION_ORDER.indexOf(a.name);
-    const bi = SELECTION_ORDER.indexOf(b.name);
-    return (ai < 0 ? Number.MAX_SAFE_INTEGER : ai) - (bi < 0 ? Number.MAX_SAFE_INTEGER : bi);
+function profileIdentityValid(value: unknown): value is ProfileIdentity {
+  if (!isRecord(value)) return false;
+  return Object.keys(value).length === 2
+    && Object.prototype.hasOwnProperty.call(value, "id")
+    && Object.prototype.hasOwnProperty.call(value, "fingerprint")
+    && typeof value.id === "string"
+    && /^[A-Za-z0-9._:@/#-]+$/u.test(value.id)
+    && value.id.length > 0
+    && isWorkflowV2Digest(value.fingerprint);
+}
+
+function profileDiagnostic(
+  code: "PROFILE_UNAVAILABLE" | "IDENTITY_MISMATCH",
+  profileId: string | undefined,
+  remediation: string,
+  evidence: Record<string, unknown> = {},
+) {
+  return createDiagnostic({
+    code,
+    operation: "profile.resolve",
+    evidence: { ...(profileId === undefined ? {} : { profile_id: profileId }), ...evidence },
+    remediation,
   });
 }
-export function resolveWorkflowProfilePath(name: string, _cwd?: string): string | null {
-  const path = join(findProfileDir(), `${name}.json`);
-  return existsSync(path) ? path : null;
+
+/** Load exactly one profile by id and fingerprint from a validated catalog. */
+export function loadProfileByIdentity(
+  catalog: Readonly<ProviderCatalog>,
+  identity: ProfileIdentity,
+): DiagnosticResult<Profile> {
+  const checked = validateProviderCatalog(catalog);
+  if (!checked.ok) return failureResult(checked.diagnostics);
+  if (!profileIdentityValid(identity)) {
+    return failureResult(profileDiagnostic("IDENTITY_MISMATCH", undefined, "Use the catalog profile id and sha256 fingerprint from the selected policy."));
+  }
+  const entry = checked.value.profiles.find((candidate) => candidate.identity.id === identity.id);
+  if (!entry) {
+    return failureResult(profileDiagnostic("PROFILE_UNAVAILABLE", identity.id, "Select a profile published by the exact provider catalog."));
+  }
+  if (entry.identity.fingerprint !== identity.fingerprint) {
+    return failureResult(profileDiagnostic(
+      "IDENTITY_MISMATCH",
+      identity.id,
+      "Re-read the selected immutable catalog profile and preserve its fingerprint.",
+      { expected_digest: identity.fingerprint, actual_digest: entry.identity.fingerprint },
+    ));
+  }
+  return successResult(entry.profile);
 }
 
-export function loadProfile(name: WorkflowName): Profile | null {
-  return loadAllProfiles().find((p) => p.name === name) ?? null;
+function profileMatchesClassification(
+  profile: Readonly<Profile>,
+  classification: Pick<Classification, "type" | "complexity">,
+): boolean {
+  return profile.match.type.includes(classification.type)
+    && (profile.match.complexity === undefined || profile.match.complexity.includes(classification.complexity));
 }
 
-/** Stable canonical SHA-256 fingerprint used to reject profile drift. */
-export function profileHash(profile: Profile): string {
-  const canonicalize = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map(canonicalize);
-    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonicalize(v)]));
-    return value;
-  };
-  return createHash("sha256").update(JSON.stringify(canonicalize(profile))).digest("hex");
+/**
+ * Resolve exactly one matrix profile from the immutable catalog and a complete
+ * classification. The derived workflow name is only a deterministic tie-break
+ * for catalog entries that explicitly publish it; catalog order is never used
+ * as selection authority.
+ */
+export function resolveProfileForClassification(
+  catalog: Readonly<ProviderCatalog>,
+  classification: Pick<Classification, "type" | "complexity" | "autonomous"> & { workflow?: WorkflowName },
+): DiagnosticResult<CatalogProfile> {
+  const checked = validateProviderCatalog(catalog);
+  if (!checked.ok) return failureResult(checked.diagnostics);
+  let derivedWorkflow: WorkflowName;
+  try {
+    derivedWorkflow = resolveWorkflowForClassification(classification);
+  } catch (error) {
+    return failureResult(profileDiagnostic(
+      "PROFILE_UNAVAILABLE",
+      undefined,
+      error instanceof Error ? error.message : "Provide a valid workflow classification before matrix profile resolution.",
+    ));
+  }
+  const expectedWorkflow = classification.workflow ?? derivedWorkflow;
+  const candidates = checked.value.profiles.filter((entry) => profileMatchesClassification(entry.profile, classification));
+  const exact = candidates.find((entry) => entry.identity.id === expectedWorkflow);
+  if (exact) return successResult(exact);
+  if (candidates.length === 1) return successResult(candidates[0]!);
+  return failureResult(profileDiagnostic(
+    "PROFILE_UNAVAILABLE",
+    expectedWorkflow,
+    candidates.length === 0
+      ? "No catalog profile matches the complete workflow classification."
+      : "Matrix classification matches multiple catalog profiles without one exact deterministic workflow identity.",
+    { candidate_count: candidates.length, classification_type: classification.type, classification_complexity: classification.complexity },
+  ));
 }
+
+
+
 
 /**
  * Resolve a workflow from classification. Mirrors the table in
@@ -482,7 +624,7 @@ export function resolveWorkflow(
   complexity: Complexity,
   autonomous: boolean,
 ): WorkflowName {
-  if (![
+  const validTypes: readonly TaskType[] = [
     "FEATURE",
     "REFACTOR",
     "OPS",
@@ -493,10 +635,12 @@ export function resolveWorkflow(
     "REVIEW",
     "HOTFIX",
     "PRODUCT_DISCOVERY",
-  ].includes(type as string)) {
+  ];
+  if (!validTypes.includes(type)) {
     throw new Error(`invalid workflow classification type '${String(type)}'`);
   }
-  if (!["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"].includes(complexity as string)) {
+  const validComplexities: readonly Complexity[] = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"];
+  if (!validComplexities.includes(complexity)) {
     throw new Error(`invalid workflow classification complexity '${String(complexity)}'`);
   }
   if (typeof autonomous !== "boolean") throw new Error("invalid workflow classification autonomous value");
@@ -536,33 +680,4 @@ export function resolveWorkflowForClassification(
 ): WorkflowName {
   if (!classification || typeof classification !== "object") throw new Error("workflow classification is missing");
   return resolveWorkflow(classification.type, classification.complexity, classification.autonomous);
-}
-
-/**
- * Pick the first profile (in selection order) whose match passes for the
- * classification. Returns null if no profile matches.
- *
- * SPEC, PRODUCT_DISCOVERY and REGRESS are dedicated intents: a
- * model-provided workflow such as `standard` must not silently hijack
- * either intent. The explicit `workflow_override: true` state marker is the
- * intentional escape hatch enforced by the P5 gate; profile selection itself
- * remains safe by falling back to the dedicated profile.
- */
-export function selectProfile(profiles: Profile[], c: Classification): Profile | null {
-  for (const profile of profiles) assertProfileControlPlane(profile);
-  const dedicated =
-    c.type === "SPEC" ? "spec-preparation"
-    : c.type === "PRODUCT_DISCOVERY" ? "product-discovery"
-    : c.type === "REGRESS" ? "feature-regression"
-    : null;
-  const explicit = profiles.find((p) => p.name === c.workflow);
-  if (explicit && (!dedicated || explicit.name === dedicated)) return explicit;
-  for (const name of SELECTION_ORDER) {
-    const p = profiles.find((x) => x.name === name);
-    if (!p) continue;
-    if (!p.match.type.includes(c.type)) continue;
-    if (p.match.complexity && !p.match.complexity.includes(c.complexity)) continue;
-    return p;
-  }
-  return null;
 }

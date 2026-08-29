@@ -1,187 +1,156 @@
-/**
- * Telegram bridge — autonomous messenger bridge that works WITHOUT a live
- * omp session (the case the in-session dispatcher cannot cover: the CTO
- * finished, the session is closed, the user still writes to the bot).
- *
- * Classification of an incoming plain message:
- *   - active CTO run  -> file as a task in the local drop
- *     (`<root>/.omp/inbox/`, the in-session dispatcher picks it up in <=10s)
- *     and do NOT reply (the CTO session owns the conversation);
- *   - no active run, but a FINISHED run with a summary.json -> reply with the
- *     run status built from the summary (no LLM), AND file the message as a
- *     standby task (the user may have meant a new task, not just a status
- *     question — nothing is lost);
- *   - nothing at all -> create a standby run, file the task, reply that it
- *     was saved and will be picked up at the next /cto start.
- *
- * Escalation answers (reply to a mapped escalation / inline button) are
- * written by `TelegramEscalationAdapter.pollOnce` itself; the bridge only
- * needs the plain-message handler.
- *
- * Writes are idempotent (wx) and replies are deduped per message_id in
- * memory, so duplicate getUpdates deliveries never double-send.
- *
- * ONE consumer per bot token: the bridge owns getUpdates. Do not run it
- * together with a live interactive session on the same token unless you
- * accept 2x polling traffic (duplicates are harmless due to idempotency).
- */
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-fullstack --> */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { findActiveCtoRun } from "@andvl1/omp-workflows-core";
-import { ensureStandbyRun, localInboxDrop } from "./adapters/registry.js";
+import { createHash } from "node:crypto";
+import {
+  createDiagnostic,
+  failureResult,
+  isCanonicalRoot,
+  isTrustedFsAuthority,
+  successResult,
+  validateWorkflowRunIdentity,
+  type DiagnosticResult,
+  type EscalationAnswer,
+  type EscalationInboundMessage,
+  type TrustedFsAuthority,
+  type WorkflowRunIdentity,
+} from "@andvl1/omp-workflows-core";
+import {
+  isFullstackStorageAuthority,
+  type FullstackStorageAuthority,
+} from "./storage-authority.js";
+import { validateInboundAnswerRecord, validateInboundTaskRecord } from "./adapters/registry.js";
+import type { AdapterRuntimeContext } from "./adapters/registry.js";
 
-export interface BridgeIncoming {
-  id: string;
-  text: string;
-  at: string;
-  by?: string;
+export interface BridgeRuntimeContext extends AdapterRuntimeContext {
+  readonly run_status: "active" | "completed" | "unavailable";
+  readonly storage: FullstackStorageAuthority;
+  readonly summary?: Record<string, unknown>;
 }
+
+export interface BridgeIncoming extends EscalationInboundMessage { readonly by?: string; }
 
 export interface BridgeResult {
-  action: "active-task" | "completed-status" | "standby-task";
-  /** Reply to send to the user; undefined for active-task (session owns it). */
-  reply?: string;
-  /** Task file written (or null when the write lost the wx race). */
-  filedPath?: string | null;
-  runId?: string;
+  readonly action: "active-task" | "completed-status" | "unavailable";
+  readonly reply?: string;
+  readonly filedPath?: string | null;
+  readonly runId: string;
 }
 
-/** File the message as a task in the local drop (wx-idempotent). */
-export function writeTaskDrop(cwd: string, msg: BridgeIncoming): string | null {
-  return writeInboxTaskFile(localInboxDrop(cwd), `${msg.id.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`, cwd, msg);
+const MAX_RECORD_BYTES = 4 * 1024 * 1024;
+const MAX_JSON_DEPTH = 64;
+
+function sameRun(left: WorkflowRunIdentity, right: WorkflowRunIdentity): boolean {
+  return left.root_instance_id === right.root_instance_id
+    && left.provider_id === right.provider_id
+    && left.descriptor_fingerprint === right.descriptor_fingerprint
+    && left.executable_provenance.build_fingerprint === right.executable_provenance.build_fingerprint
+    && left.executable_provenance.runtime_fingerprint === right.executable_provenance.runtime_fingerprint
+    && left.catalog_content_digest === right.catalog_content_digest
+    && left.config_byte_sha256 === right.config_byte_sha256
+    && left.config_semantic_sha256 === right.config_semantic_sha256
+    && left.session.session_id === right.session.session_id
+    && left.session.lifecycle_id === right.session.lifecycle_id
+    && left.run_id === right.run_id
+    && left.profile_identity.id === right.profile_identity.id
+    && left.profile_identity.fingerprint === right.profile_identity.fingerprint;
 }
 
-/** File the message under a standby run's inbox (wx-idempotent). */
-export function writeStandbyTask(cwd: string, msg: BridgeIncoming, runId?: string): string | null {
-  const resolved = runId ?? ensureStandbyRun(cwd);
-  const dir = join(cwd, ".work-state", "cto", resolved, "inbox");
-  return writeInboxTaskFile(dir, `${msg.id.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`, cwd, msg, resolved);
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  if (!value || typeof value !== "object") throw new TypeError("non-JSON record");
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
 }
 
-function writeInboxTaskFile(dir: string, fileName: string, cwd: string, msg: BridgeIncoming, runId?: string): string | null {
-  const path = join(dir, fileName);
-  try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(path, JSON.stringify({ id: msg.id, text: msg.text, at: msg.at, by: msg.by ?? "telegram-bridge", runId }, null, 2), { flag: "wx" });
-    return path;
-  } catch (error) {
-    if (existsSync(path) && statSync(path).isFile()) return null; // duplicate delivery — already durable
-    throw error; // persistence failure must keep the Telegram update unconfirmed
-  }
+function exactRecord(left: unknown, right: unknown): boolean {
+  try { return canonicalJson(left) === canonicalJson(right); } catch { return false; }
 }
 
-/** Latest finished run summary (summary.json with a verdict), by mtime. */
-export function findCompletedSummary(cwd: string): { runId: string; summary: Record<string, unknown> } | null {
-  const ctoRoot = join(cwd, ".work-state", "cto");
-  if (!existsSync(ctoRoot)) return null;
-  let best: { runId: string; summary: Record<string, unknown> } | null = null;
-  let bestAt = 0;
-  for (const runId of readdirSync(ctoRoot)) {
-    const path = join(ctoRoot, runId, "summary.json");
-    if (!existsSync(path)) continue;
-    try {
-      const summary = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-      const verdict = String(summary.verdict ?? "");
-      if (verdict.length === 0) continue;
-      const at = statSync(path).mtimeMs;
-      if (at > bestAt) {
-        best = { runId, summary };
-        bestAt = at;
-      }
-    } catch {
-      // unreadable/corrupt — skip
-    }
-  }
-  return best;
+function durableFilenameKey(value: string): string {
+  return createHash("sha256").update(Buffer.from(value, "utf8")).digest("hex");
 }
 
-/** Build a human status reply from a run summary (no LLM). */
+function bytesOf(value: unknown): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify(value));
+}
+
+function contextDiagnostic(context: BridgeRuntimeContext): DiagnosticResult<BridgeRuntimeContext> {
+  if (!context || !isCanonicalRoot(context.project_root)) return failureResult(createDiagnostic({ code: "ROOT_UNAVAILABLE", operation: "root.resolve", evidence: { field: "project_root" }, remediation: "Provide the canonical root from the root manager." }));
+  if (!isTrustedFsAuthority(context.filesystem_authority)) return failureResult(createDiagnostic({ code: "CAPABILITY_MISSING", operation: "runtime.activate", evidence: { field: "filesystem_authority" }, remediation: "Provide the launcher-issued trusted filesystem authority." }));
+  if (!isFullstackStorageAuthority(context.storage)) return failureResult(createDiagnostic({ code: "CAPABILITY_MISSING", operation: "runtime.activate", evidence: { field: "storage" }, remediation: "Provide the launcher-issued FullstackStorageAuthority before bridge persistence." }));
+  const run = validateWorkflowRunIdentity(context.run_identity);
+  if (!run.ok) return failureResult(createDiagnostic({ code: "IDENTITY_MISMATCH", operation: "runtime.activate", evidence: { field: "run_identity" }, remediation: "Provide the complete WorkflowRunIdentity selected by workflow_prepare." }));
+  if (context.storage.project_root !== context.project_root || !sameRun(context.storage.run_identity, run.value)) return failureResult(createDiagnostic({ code: "IDENTITY_MISMATCH", operation: "runtime.activate", evidence: { field: "storage" }, remediation: "Pin bridge storage to the exact canonical root and WorkflowRunIdentity." }));
+  return successResult(Object.freeze({ ...context, run_identity: run.value, storage: context.storage }));
+}
+
+function writeExclusiveRecord(storage: FullstackStorageAuthority, relativePath: string, record: unknown): DiagnosticResult<string | null> {
+  const written = storage.writeJsonExclusive(relativePath, bytesOf(record));
+  if (written.ok) return successResult(relativePath);
+  const existing = storage.readJsonBounded(relativePath, MAX_RECORD_BYTES, MAX_JSON_DEPTH);
+  if (existing.ok && existing.value !== null && exactRecord(existing.value, record)) return successResult(null);
+  return failureResult(createDiagnostic({ code: written.reason === "IDENTITY_MISMATCH" ? "IDENTITY_MISMATCH" : written.reason === "CAPABILITY_MISSING" ? "CAPABILITY_MISSING" : written.reason === "MIGRATION_REQUIRED" ? "MIGRATION_REQUIRED" : "ACTIVATION_FAILED", operation: "runtime.activate", evidence: { field: "message.persistence" }, remediation: "Retry after the pinned project inbox becomes writable; conflicting records are rejected." }));
+}
+
+/** Write a plain message into the manager-owned local drop. */
+export function writeTaskDrop(context: BridgeRuntimeContext, msg: BridgeIncoming): DiagnosticResult<string | null> {
+  const checked = contextDiagnostic(context);
+  if (!checked.ok) return checked as DiagnosticResult<string | null>;
+  if (!msg || typeof msg !== "object" || Array.isArray(msg)) return failureResult(createDiagnostic({ code: "CONFIG_MALFORMED", operation: "runtime.activate", evidence: { field: "message" }, remediation: "Provide a structured inbound message envelope." }));
+  const messageRun = validateWorkflowRunIdentity(msg.run_identity);
+  if (!messageRun.ok || !sameRun(messageRun.value, checked.value.run_identity)) return failureResult(createDiagnostic({ code: "IDENTITY_MISMATCH", operation: "runtime.activate", evidence: { field: "message.run_identity" }, remediation: "Route the message using the exact prepared workflow run." }));
+  const record = validateInboundTaskRecord(msg, checked.value.run_identity);
+  if (!record) return failureResult(createDiagnostic({ code: "CONFIG_MALFORMED", operation: "runtime.activate", evidence: { field: "message" }, remediation: "Provide a complete bounded inbound task record before persistence." }));
+  return writeExclusiveRecord(checked.value.storage, `.omp/inbox/task-${durableFilenameKey(record.id)}.json`, record);
+}
+
+/** Build a human-readable status reply from a caller-supplied summary. */
 export function buildStatusReply(runId: string, summary: Record<string, unknown>): string {
   const verdict = String(summary.verdict ?? "?");
-  const lines: string[] = [`CTO run \`${runId}\` is FINISHED (verdict: ${verdict}).`, ""];
+  const lines = [`CTO run \`${runId}\` is FINISHED (verdict: ${verdict}).`, ""];
   const firstSweep = summary.first_sweep;
   if (firstSweep && typeof firstSweep === "object" && !Array.isArray(firstSweep)) {
     lines.push("Status per item:");
     for (const [key, value] of Object.entries(firstSweep as Record<string, unknown>)) {
-      if (!value || typeof value !== "object") continue;
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
       const item = value as Record<string, unknown>;
       const action = String(item.action ?? "");
       const state = String(item.state ?? "");
       lines.push(`- ${key}: ${action}${state ? ` — ${state}` : ""}`);
     }
-  } else {
-    lines.push(`Details: .work-state/cto/${runId}/summary.json`);
-  }
+  } else lines.push(`Details: .work-state/cto/${runId}/summary.json`);
   return lines.join("\n");
 }
-
-/** Classify an incoming plain message and file it; returns the reply (if any). */
-export function classifyIncoming(cwd: string, msg: BridgeIncoming): BridgeResult {
-  const active = findActiveCtoRun(cwd);
-  if (active) {
-    return { action: "active-task", filedPath: writeTaskDrop(cwd, msg), runId: active.runId };
+export function classifyIncoming(context: BridgeRuntimeContext, msg: BridgeIncoming): BridgeResult {
+  const checked = contextDiagnostic(context);
+  const contextRunId = context && typeof context === "object" && context.run_identity && typeof context.run_identity.run_id === "string" ? context.run_identity.run_id : "";
+  if (!msg || typeof msg !== "object" || Array.isArray(msg)) return { action: "unavailable", reply: "The message could not be associated with the exact prepared CTO run.", runId: contextRunId };
+  const messageRun = validateWorkflowRunIdentity(msg.run_identity);
+  if (!checked.ok || !messageRun.ok || !context.run_identity || !sameRun(messageRun.value, context.run_identity)) return { action: "unavailable", reply: "The message could not be associated with the exact prepared CTO run.", runId: contextRunId };
+  if (context.run_status === "active") {
+    const filed = writeTaskDrop(context, msg);
+    return { action: "active-task", filedPath: filed.ok ? filed.value : null, runId: contextRunId };
   }
-  const completed = findCompletedSummary(cwd);
-  if (completed) {
-    return {
-      action: "completed-status",
-      reply: buildStatusReply(completed.runId, completed.summary),
-      filedPath: writeStandbyTask(cwd, msg),
-      runId: completed.runId,
-    };
+  if (context.run_status === "completed" && context.summary) {
+    const filed = writeTaskDrop(context, msg);
+    return { action: "completed-status", reply: buildStatusReply(context.run_identity.run_id, context.summary), filedPath: filed.ok ? filed.value : null, runId: contextRunId };
   }
-  const runId = ensureStandbyRun(cwd);
-  return {
-    action: "standby-task",
-    reply:
-      "CTO is not active right now and no finished run has a summary to report. " +
-      `Your message was saved as a task in standby run \`${runId}\` and will be picked up ` +
-      "when a CTO session starts (/cto).",
-    filedPath: writeStandbyTask(cwd, msg, runId),
-    runId,
-  };
+  return { action: "unavailable", reply: "No prepared CTO run is available for this message. Start /cto before sending tasks.", runId: contextRunId };
 }
 
-/** Send a plain text message (no reply markup) — used for bridge replies. */
-export async function sendTelegramText(
-  token: string,
-  chatId: string,
-  text: string,
-  fetchImpl: typeof fetch = fetch,
-): Promise<boolean> {
-  try {
-    const response = await fetchImpl(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text }),
-    });
-    if (!response.ok) return false;
-    const body = (await response.json()) as { ok?: boolean };
-    return body.ok === true;
-  } catch {
-    return false;
-  }
+/** Write a run-bound answer marker; polling routes it to onAnswer, never onTask. */
+export function writeAnswerMarker(context: BridgeRuntimeContext, answer: EscalationAnswer): DiagnosticResult<string | null> {
+  const checked = contextDiagnostic(context);
+  if (!checked.ok) return checked as DiagnosticResult<string | null>;
+  if (!answer || typeof answer !== "object" || Array.isArray(answer)) return failureResult(createDiagnostic({ code: "CONFIG_MALFORMED", operation: "runtime.activate", evidence: { field: "answer" }, remediation: "Provide a structured answer envelope." }));
+  const answerRun = validateWorkflowRunIdentity(answer.run_identity);
+  if (!answerRun.ok || !sameRun(answerRun.value, checked.value.run_identity)) return failureResult(createDiagnostic({ code: "IDENTITY_MISMATCH", operation: "runtime.activate", evidence: { field: "answer.run_identity" }, remediation: "Write answer markers only for the exact prepared workflow run." }));
+  const validated = validateInboundAnswerRecord(answer, checked.value.run_identity);
+  if (!validated) return failureResult(createDiagnostic({ code: "CONFIG_MALFORMED", operation: "runtime.activate", evidence: { field: "answer" }, remediation: "Provide a complete bounded answer record before persistence." }));
+  const record = { kind: "answer" as const, id: validated.id, text: validated.answer, answer: validated.answer, at: validated.at, by: validated.by, run_identity: checked.value.run_identity };
+  return writeExclusiveRecord(checked.value.storage, `.omp/inbox/answer-${durableFilenameKey(validated.id)}.json`, record);
 }
 
-/**
- * File an answer marker in the local drop ({ kind: "answer" }) so a live
- * session wakes [CTO-ANSWER] even though it does not poll telegram while the
- * bridge owns the bot. Deterministic name by esc id (wx) — no duplicates.
- */
-export function writeAnswerMarker(cwd: string, answer: { id: string; answer: string }): string | null {
-  const file = `${answer.id.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`;
-  try {
-    const dir = localInboxDrop(cwd);
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, file);
-    writeFileSync(
-      path,
-      JSON.stringify({ kind: "answer", id: answer.id, text: answer.answer, at: new Date().toISOString(), by: "telegram-bridge" }, null, 2),
-      { flag: "wx" },
-    );
-    return path;
-  } catch {
-    return null; // already filed (duplicate) or IO error
-  }
-}
+export type BridgeFilesystemAuthority = FullstackStorageAuthority;

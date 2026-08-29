@@ -10,12 +10,19 @@
 import { isAbsolute, relative, resolve, dirname, join, sep } from "node:path";
 import { existsSync, realpathSync } from "node:fs";
 import { resolveState } from "../engine/state.js";
+import { validateWorkflowRunIdentity } from "../workflow-v2/identity.js";
+import type { WorkflowRunIdentity } from "../workflow-v2/types.js";
 
 interface ToolCallEvent {
   toolName: string;
   input?: Record<string, unknown> | string;
 }
-interface ToolCallContext { cwd: string; hasUI?: boolean; actor?: Actor }
+interface ToolCallContext {
+  cwd: string;
+  hasUI?: boolean;
+  actor?: Actor;
+  run_identity?: WorkflowRunIdentity;
+}
 
 type Actor = "orchestrator" | "worker" | "lead";
 
@@ -23,11 +30,23 @@ export function orchestratorWriteGate(
   event: ToolCallEvent,
   ctx: ToolCallContext,
 ): { block?: boolean; reason?: string } | void {
-  if (!hasStrictOrchestratorState(ctx.cwd)) return;
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
   // The host invokes mounted `xd://` devices through the generic write
   // transport. That transport is not a project filesystem mutation.
   if (event.toolName !== "bash" && isMountedToolRouteInput(event.input)) return;
+  if (existsSync(resolve(ctx.cwd, ".work-state")) && !ctx.run_identity) {
+    return {
+      block: true,
+      reason: "orchestrator policy: MIGRATION_REQUIRED — a WorkflowRunIdentity is required for strict workflow writes",
+    };
+  }
+  if (ctx.run_identity !== undefined && !validateWorkflowRunIdentity(ctx.run_identity).ok) {
+    return {
+      block: true,
+      reason: "orchestrator policy: MIGRATION_REQUIRED — the supplied WorkflowRunIdentity is incomplete or invalid",
+    };
+  }
+  if (!hasStrictOrchestratorState(ctx.cwd, ctx.run_identity)) return;
   const actor = trustedActorOf(ctx);
 
   if (event.toolName === "bash") {
@@ -216,10 +235,20 @@ function looksLikeSourceMutation(command: string): boolean {
     || SWITCH_FORCE_BRANCH_MUTATION.test(command);
 }
 
-export function hasStrictOrchestratorState(cwd: string): boolean {
-  const resolved = resolveState(cwd);
+export function hasStrictOrchestratorState(cwd: string, runIdentity?: WorkflowRunIdentity): boolean {
+  if (runIdentity === undefined) return existsSync(resolve(cwd, ".work-state"));
+  if (!validateWorkflowRunIdentity(runIdentity).ok) return true;
+  const resolved = resolveState(cwd, undefined, runIdentity);
   if (resolved.invalid) return true;
-  return resolved.state?.policy?.strict_orchestrator === true;
+  const state = resolved.state;
+  if (!state) return false;
+  const persistedRun = (state as unknown as { run_identity?: unknown }).run_identity;
+  const checked = validateWorkflowRunIdentity(persistedRun);
+  if (!checked.ok) return true;
+  return checked.value.run_id === runIdentity.run_id
+    && checked.value.profile_identity.id === runIdentity.profile_identity.id
+    && checked.value.profile_identity.fingerprint === runIdentity.profile_identity.fingerprint
+    && state.policy?.strict_orchestrator === true;
 }
 
 // ── Bounded write_scope experiment (scope 7) ───────────────────────────────

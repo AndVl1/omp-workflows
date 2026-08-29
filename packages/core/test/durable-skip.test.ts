@@ -1,4 +1,5 @@
 /**
+ * <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core -->
  * WF-3: native skip_if blocker (durable advance).
  *
  * A native durable advance evaluates the next stage's `skip_if` with the
@@ -36,7 +37,8 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
+import { workflowV2Fixture, qualifiedRoster, workIdentityScopeFixture, type WorkflowV2CapabilityContext, type WorkflowV2TestFixture } from "./workflow-v2-fixtures.js";
+import type { IssuedCapability } from "../src/engine/durable.js";
 import { createCapability, authorizeDispatch, completeDispatch, advanceCursor, type CapabilityHandoff } from "../src/engine/durable.js";
 import { writeState, checkMonotonic } from "../src/engine/state.js";
 import { buildDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
@@ -60,20 +62,31 @@ function setup(
   roster: Array<{ role: string; agent: string }>,
   flags: ScopeFlags,
   preArtifacts: Record<string, unknown> = {},
-): { issued: ReturnType<typeof createCapability>; root: string } {
+  featureSlug = "skip",
+): { issued: IssuedCapability; root: string; context: WorkflowV2CapabilityContext; fixture: WorkflowV2TestFixture } {
   const root = mkdtempSync(join(tmpdir(), `w3-skip-${branch}-`));
   initGit(root, branch);
-  registerWorkflowProfiles([profile]);
-  const persistedHash = profileHash(profile);
+  const fixture = workflowV2Fixture(profile);
+  const persistedHash = fixture.profile_identity.fingerprint;
+  const qualified = qualifiedRoster(fixture, roster);
+  const work_identity_scope = workIdentityScopeFixture(fixture, {
+    workflow: profile.name,
+    stage_id: currentStageId,
+    slot_id: roster[0]?.role ?? currentStageId,
+  });
   const issued = createCapability({
     run_key: branch, branch, workflow: profile.name, profile_hash: persistedHash,
-    stage_cursor: currentStageId, kind, expected_roster: roster,
+    stage_cursor: currentStageId, kind, expected_roster: qualified,
+    work_identity_scope,
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
   });
   writeState(root, {
     schema: 1,
     branch,
     run_key: branch,
     classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: profile.name },
+    workflow: profile.name,
     task: "skip regression",
     workflow_override: false,
     issue: null,
@@ -82,25 +95,38 @@ function setup(
     artifacts: {},
     pause: { kind: "none" as const, reason: "" },
     policy: { strict_orchestrator: true },
-    profile_hash: persistedHash,
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    profile_hash: fixture.profile_identity.fingerprint,
+    work_identity: issued.work_identity,
     scope: flags,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
-  }, { featureSlug: "skip" });
-  const artifactsDir = join(root, ".work-state", "features", "skip", "artifacts");
+  }, { featureSlug });
+  const artifactsDir = join(root, ".work-state", "features", featureSlug, "artifacts");
   mkdirSync(artifactsDir, { recursive: true });
   for (const [id, value] of Object.entries(preArtifacts)) {
     writeFileSync(join(artifactsDir, `${id}.json`), JSON.stringify(value));
   }
-  return { issued, root };
+  return {
+    issued,
+    root,
+    fixture,
+    context: {
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
+      catalog: fixture.catalog,
+      effective_policy: fixture.effective_policy,
+      agent_inventory: fixture.agent_inventory,
+    },
+  };
 }
 
 function readState(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "features", "skip", "state.json"), "utf8")) as TeamState;
 }
-
-function advanceAuth(issued: ReturnType<typeof createCapability>) {
+function advanceAuth(issued: IssuedCapability) {
   return {
     token: issued.advance_token,
     capability_id: issued.capability_id,
@@ -110,6 +136,8 @@ function advanceAuth(issued: ReturnType<typeof createCapability>) {
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    project_identity: issued.state.issued_for!.project_identity,
+    run_identity: issued.state.issued_for!.run_identity,
   };
 }
 
@@ -123,6 +151,8 @@ function dispatchAuth(handoff: CapabilityHandoff) {
     profile_hash: handoff.profile_hash,
     stage_cursor: handoff.stage_cursor,
     cursor_epoch: handoff.cursor_epoch,
+    project_identity: handoff.project_identity,
+    run_identity: handoff.run_identity,
   };
 }
 
@@ -166,9 +196,9 @@ const ALL_SKIP_PROFILE: Profile = {
 };
 
 test("WF-3: advance with a true next-stage skip_if skips it and atomically arms the next runnable stage", () => {
-  const { issued, root } = setup("single", SKIP_PROFILE, "discovery", "none", [], NO_RUNTIME);
+  const { issued, root, context } = setup("single", SKIP_PROFILE, "discovery", "none", [], NO_RUNTIME);
   try {
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "discovery completed" });
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "discovery completed" }, context);
     assert.equal(advanced.ok, true);
     if (!advanced.ok || !advanced.handoff) return;
     const state = advanced.state;
@@ -181,14 +211,14 @@ test("WF-3: advance with a true next-stage skip_if skips it and atomically arms 
     assert.equal(state.dispatch_capability?.issued_for?.stage_cursor, "qa_tests");
     assert.equal(state.dispatch_capability?.status, "ready");
     assert.equal(state.dispatch_capability?.expected_count, 1, "the skipped stage is not counted as an expected dispatch");
-    assert.deepEqual(state.dispatch_capability?.expected_roster, [{ role: "qa", agent: "qa" }]);
+    assert.deepEqual(state.dispatch_capability?.expected_roster?.map(({ role, agent }) => ({ role, agent })), [{ role: "qa", agent: "qa" }]);
     assert.ok(checkMonotonic(state).ok, "skipped statuses keep stage progress monotonic");
     assert.equal(state.join_summary?.stage_id, "discovery", "join history still records the advancing stage");
 
     // The skipped stage is not dispatchable through the armed capability.
     const manualQa = SKIP_PROFILE.stages[1]!;
     const marker = buildDispatchMarker(advanced.handoff.run_key, manualQa, undefined, "manual-qa", advanced.handoff.cursor_epoch);
-    const blocked = dispatchGate({ toolName: "task", input: { tasks: [{ agent: "manual-qa", task: marker }] } }, { cwd: root });
+    const blocked = dispatchGate({ toolName: "task", input: { tasks: [{ agent: "manual-qa", task: marker }] } }, { cwd: root, ...context });
     assert.ok(blocked, "a dispatch marker bound to the skipped stage is rejected");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -196,7 +226,7 @@ test("WF-3: advance with a true next-stage skip_if skips it and atomically arms 
 });
 
 test("WF-3: consecutive skipped stages are all marked skipped; the native walk then runs the remaining stages to completion", () => {
-  const { issued, root } = setup(
+  const { issued, root, context } = setup(
     "walk",
     FULL_SKIP_PROFILE,
     "discovery",
@@ -208,7 +238,7 @@ test("WF-3: consecutive skipped stages are all marked skipped; the native walk t
   try {
     // review_fixes (review.findings == []) and manual_qa (!scope.has_runtime)
     // are both skipped in one atomic advance; qa_tests is armed.
-    const advanced1 = advanceCursor(root, { ...advanceAuth(issued), evidence: "discovery completed" });
+    const advanced1 = advanceCursor(root, { ...advanceAuth(issued), evidence: "discovery completed" }, context);
     assert.equal(advanced1.ok, true);
     if (!advanced1.ok || !advanced1.handoff) return;
     assert.equal(advanced1.state.stage_cursor, "qa_tests");
@@ -217,20 +247,25 @@ test("WF-3: consecutive skipped stages are all marked skipped; the native walk t
     assert.equal(advanced1.state.stages.find((s) => s.id === "qa_tests")?.status, "in_progress");
 
     // Dispatch and complete qa_tests, then advance to summary.
-    const qaAuth = dispatchAuth(advanced1.handoff);
-    const authorized = authorizeDispatch(root, { ...qaAuth, role: "qa", agent: "qa" });
+    const qaAuth = {
+      ...dispatchAuth(advanced1.handoff),
+      role: "qa",
+      agent: "qa",
+      agent_ref: context.effective_policy.roles.qa!,
+    };
+    const authorized = authorizeDispatch(root, qaAuth);
     assert.equal(authorized.ok, true);
     if (!authorized.ok || !authorized.record) return;
-    const completed = completeDispatch(root, { ...qaAuth, role: "qa", agent: "qa", dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "qa passed", artifact_ids: [] });
+    const completed = completeDispatch(root, { ...qaAuth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "qa passed", artifact_ids: [] });
     assert.equal(completed.ok, true);
-    const advanced2 = advanceCursor(root, { ...qaAuth, token: advanced1.handoff.advance_token, evidence: "qa completed" });
+    const advanced2 = advanceCursor(root, { ...qaAuth, token: advanced1.handoff.advance_token, evidence: "qa completed" }, context);
     assert.equal(advanced2.ok, true);
     if (!advanced2.ok || !advanced2.handoff) return;
     assert.equal(advanced2.state.stage_cursor, "summary");
     assert.equal(advanced2.state.stages.find((s) => s.id === "qa_tests")?.status, "done");
 
     // Summary (orchestrator) advances to end-of-workflow.
-    const advanced3 = advanceCursor(root, { ...dispatchAuth(advanced2.handoff), token: advanced2.handoff.advance_token, evidence: "summary completed" });
+    const advanced3 = advanceCursor(root, { ...dispatchAuth(advanced2.handoff), token: advanced2.handoff.advance_token, evidence: "summary completed" }, context);
     assert.equal(advanced3.ok, true);
     if (!advanced3.ok) return;
     assert.equal(advanced3.handoff, undefined, "no handoff when the workflow completes");
@@ -254,9 +289,9 @@ test("WF-3: consecutive skipped stages are all marked skipped; the native walk t
 });
 
 test("WF-3: advance completes the workflow when every remaining stage is skipped", () => {
-  const { issued, root } = setup("allskip", ALL_SKIP_PROFILE, "discovery", "none", [], NO_RUNTIME);
+  const { issued, root, context } = setup("allskip", ALL_SKIP_PROFILE, "discovery", "none", [], NO_RUNTIME);
   try {
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "discovery completed" });
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "discovery completed" }, context);
     assert.equal(advanced.ok, true);
     if (!advanced.ok) return;
     assert.equal(advanced.handoff, undefined, "nothing remains runnable: no capability is handed off");
@@ -275,9 +310,9 @@ test("WF-3: advance completes the workflow when every remaining stage is skipped
 
 test("WF-3: a false skip_if predicate arms the next stage normally (scope-flag and artifact-compare forms)", () => {
   // Scope-flag form: has_runtime is true, so manual_qa is NOT skipped.
-  const { issued, root } = setup("falseflag", SKIP_PROFILE, "discovery", "none", [], WITH_RUNTIME);
+  const { issued, root, context } = setup("falseflag", SKIP_PROFILE, "discovery", "none", [], WITH_RUNTIME);
   try {
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "discovery completed" });
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "discovery completed" }, context);
     assert.equal(advanced.ok, true);
     if (!advanced.ok || !advanced.handoff) return;
     assert.equal(advanced.handoff.stage_cursor, "manual_qa");
@@ -289,7 +324,7 @@ test("WF-3: a false skip_if predicate arms the next stage normally (scope-flag a
   }
 
   // Artifact-compare form: non-empty findings, so review_fixes is NOT skipped.
-  const { issued: issued2, root: root2 } = setup(
+  const { issued: issued2, root: root2, context: context2 } = setup(
     "falsefindings",
     FULL_SKIP_PROFILE,
     "discovery",
@@ -299,7 +334,7 @@ test("WF-3: a false skip_if predicate arms the next stage normally (scope-flag a
     { review: { verdict: "needs_changes", findings: [{ title: "x", severity: "HIGH", confidence: 90, zone: "backend-kotlin" }] } },
   );
   try {
-    const advanced = advanceCursor(root2, { ...advanceAuth(issued2), evidence: "discovery completed" });
+    const advanced = advanceCursor(root2, { ...advanceAuth(issued2), evidence: "discovery completed" }, context2);
     assert.equal(advanced.ok, true);
     if (!advanced.ok || !advanced.handoff) return;
     assert.equal(advanced.handoff.stage_cursor, "review_fixes", "non-empty findings must not skip review_fixes");
@@ -313,9 +348,9 @@ test("WF-3: skip_if evaluation failures fail closed — nothing is skipped, arme
   // The shipped `review.findings == []` expression fails closed when the
   // referenced artifact is missing at advance time (evaluation error), even
   // though the expression itself parses and registers.
-  const { issued, root } = setup("evalfail", FULL_SKIP_PROFILE, "discovery", "none", [], WITH_RUNTIME);
+  const { issued, root, context } = setup("evalfail", FULL_SKIP_PROFILE, "discovery", "none", [], WITH_RUNTIME);
   try {
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "discovery completed" });
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "discovery completed" }, context);
     assert.equal(advanced.ok, false, "an unevaluable skip_if blocks advance");
     if (advanced.ok) return;
     assert.match(advanced.error, /next stage 'review_fixes' skip_if evaluation failed: artifact 'review' referenced by expression is missing/);
@@ -342,9 +377,9 @@ test("WF-3: skip_if evaluation failures fail closed — nothing is skipped, arme
       { id: "named", title: "Named", type: "single", role: "dev", skip_if: "autonomous" },
     ],
   };
-  const { issued: issued2, root: root2 } = setup("unsupported", unsupportedProfile, "discovery", "none", [], WITH_RUNTIME);
+  const { issued: issued2, root: root2, context: context2 } = setup("unsupported", unsupportedProfile, "discovery", "none", [], WITH_RUNTIME);
   try {
-    const advanced = advanceCursor(root2, { ...advanceAuth(issued2), evidence: "discovery completed" });
+    const advanced = advanceCursor(root2, { ...advanceAuth(issued2), evidence: "discovery completed" }, context2);
     assert.equal(advanced.ok, false, "unsupported skip_if blocks advance instead of silently running or skipping");
     if (advanced.ok) return;
     assert.match(advanced.error, /unsupported predicate 'autonomous'/);
@@ -355,25 +390,22 @@ test("WF-3: skip_if evaluation failures fail closed — nothing is skipped, arme
     rmSync(root2, { recursive: true, force: true });
   }
 });
-
 test("WF-3: interpreter parity — run() skips the skip_if stage without dispatching it and completes through the durable advance", async () => {
-  const root = mkdtempSync(join(tmpdir(), "w3-skip-interp-"));
   const branch = "interp-skip";
+  const interpProfile: Profile = {
+    name: "skip-interp",
+    title: "Skip interp",
+    description: "orchestrator -> skipped review_fixes -> qa_tests -> orchestrator summary",
+    match: { type: ["FEATURE"] },
+    stages: [
+      { id: "discovery", title: "Discovery", type: "orchestrator" },
+      { id: "review_fixes", title: "Review Fixes", type: "single", role: "dev", consumes: ["review"], skip_if: "review.findings == []" },
+      { id: "qa_tests", title: "QA Tests", type: "single", role: "qa", produces: "qa_tests" },
+      { id: "summary", title: "Summary", type: "orchestrator" },
+    ],
+  };
+  const { root, fixture } = setup(branch, interpProfile, "discovery", "none", [], NO_RUNTIME, {}, branch);
   try {
-    initGit(root, branch);
-    const interpProfile: Profile = {
-      name: "skip-interp",
-      title: "Skip interp",
-      description: "orchestrator -> skipped review_fixes -> qa_tests -> orchestrator summary",
-      match: { type: ["FEATURE"] },
-      stages: [
-        { id: "discovery", title: "Discovery", type: "orchestrator" },
-        { id: "review_fixes", title: "Review Fixes", type: "single", role: "dev", consumes: ["review"], skip_if: "review.findings == []" },
-        { id: "qa_tests", title: "QA Tests", type: "single", role: "qa", produces: "qa_tests" },
-        { id: "summary", title: "Summary", type: "orchestrator" },
-      ],
-    };
-    registerWorkflowProfiles([interpProfile]);
     // The artifact the skip_if reads must exist when the walk evaluates it.
     const artifactsDir = join(root, ".work-state", "features", branch, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
@@ -398,6 +430,17 @@ test("WF-3: interpreter parity — run() skips the skip_if stage without dispatc
       branch,
       autonomous: true,
       classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: true, workflow: "skip-interp" },
+      continuation: { feedback: "interpreter skip", stageId: "discovery" },
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
+      catalog: fixture.catalog,
+      effective_policy: fixture.effective_policy,
+      agent_inventory: fixture.agent_inventory,
+      work_identity_scope: workIdentityScopeFixture(fixture, {
+        workflow: "skip-interp",
+        stage_id: "discovery",
+        slot_id: "discovery",
+      }),
       taskTool,
     });
     assert.equal(result.outcomes.some((o) => o.status === "failed"), false, "the run completes without failures");

@@ -27,7 +27,14 @@
 
 export * from "./types.js";
 export { resolveRenderConfig, type RenderConfig } from "./render-config.js";
-export { buildSessionSnapshot, buildSessionSnapshots, type BuildSessionSnapshotOptions } from "./snapshot.js";
+export {
+  buildSessionSnapshot,
+  buildSessionSnapshots,
+  VisualizationContextError,
+  type BuildSessionSnapshotOptions,
+  type BuildSessionSnapshotContext,
+  type BuildSessionSnapshotsOptions,
+} from "./snapshot.js";
 export {
   ARTIFACT_HEADING_LEVEL,
   boundedText,
@@ -88,11 +95,9 @@ export { allGeneratedPages, buildManifest, preflightLinks, resolvePageHref, type
 export {
   VisualizePublishError,
   publishVisualize,
-  type PublishVisualizeOptions,
   type VisualizeBundleFile,
   type VisualizePublishCounters,
   type VisualizePublishErrorCode,
-  type VisualizePublishHooks,
   type VisualizePublishResult,
   type VisualizePublishStatus,
 } from "./writer.js";

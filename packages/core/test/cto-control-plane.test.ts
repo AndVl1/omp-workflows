@@ -1,3 +1,5 @@
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core --> */
+
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -11,14 +13,22 @@ import {
   setTeamControlPlane,
 } from "../src/cto/state.js";
 import { writeState } from "../src/engine/state.js";
-import type { CtoState, TeamPlan } from "../src/cto/types.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
+import type { WorkflowV2TestFixture } from "./workflow-v2-fixtures.js";
 import type { CompletionIntent, WorkIdentity, TeamState } from "../src/engine/types.js";
+import type { CtoState, TeamPlan } from "../src/cto/types.js";
+
+const fixture: WorkflowV2TestFixture = workflowV2Fixture(readWorkflowProfile("standard"), {
+  roleAgents: { "team-lead": "team-lead", backend: "backend", frontend: "frontend" },
+  agentNames: ["team-lead", "backend", "frontend"],
+  runId: "run-control-plane",
+});
 
 const identity: WorkIdentity = {
-  run_id: "run-control-plane",
+  run_id: fixture.run_identity.run_id,
   wave_id: "wave-1",
   slice_id: "slice-1",
-  session_id: "session-1",
+  session_id: fixture.project_identity.session.session_id,
   workflow: "standard",
   stage_id: "implementation",
   stage_cursor: "implementation",
@@ -38,6 +48,8 @@ const completionIntent: CompletionIntent = {
   rationale: "The workflow records a completed outcome independently from consent.",
 };
 
+const run_identity = fixture.run_identity;
+
 const plan: TeamPlan = {
   id: "run-control-plane",
   task: "control-plane fixture",
@@ -47,6 +59,10 @@ const plan: TeamPlan = {
       scope: ["backend"],
       slice: "backend slice",
       profile: "standard",
+      profile_identity: fixture.profile_identity,
+      lead_ref: fixture.effective_policy.roles["team-lead"]!,
+      roster_refs: [fixture.effective_policy.roles.backend!],
+      run_identity,
       worktree: "same_branch",
       depends_on: [],
     },
@@ -55,11 +71,16 @@ const plan: TeamPlan = {
       scope: ["frontend"],
       slice: "frontend slice",
       profile: "standard",
+      profile_identity: fixture.profile_identity,
+      lead_ref: fixture.effective_policy.roles["team-lead"]!,
+      roster_refs: [fixture.effective_policy.roles.frontend!],
+      run_identity,
       worktree: "same_branch",
       depends_on: [],
     },
   ],
   created_at: "2026-08-25T00:00:00.000Z",
+  run_identity,
 };
 
 function freshState(): CtoState {
@@ -69,6 +90,7 @@ function freshState(): CtoState {
     branch: "main",
     autonomous: false,
     plan,
+    run_identity,
   });
 }
 
@@ -116,7 +138,6 @@ test("cto control-plane: valid setters merge and undefined metadata patches do n
   assert.deepEqual(state.teams.find((team) => team.id === "backend")?.work_identity, identity);
   assert.equal(state.teams.find((team) => team.id === "frontend")?.work_identity, undefined);
 });
-
 test("cto control-plane: appendWave validates and stamps work identity, then deduplicates source_id", () => {
   const state = freshState();
   appendWave(state, {
@@ -125,6 +146,7 @@ test("cto control-plane: appendWave validates and stamps work identity, then ded
     source_id: "message-1",
     task: "wave task",
     work_identity: identity,
+    run_identity,
     now: "2026-08-25T00:00:01.000Z",
   });
   assert.deepEqual(state.wave_history?.[0]?.work_identity, identity);
@@ -136,6 +158,7 @@ test("cto control-plane: appendWave validates and stamps work identity, then ded
     source_id: "message-1",
     task: "duplicate task",
     work_identity: { ...identity, wave_id: "wave-duplicate" },
+    run_identity,
     now: "2026-08-25T00:00:02.000Z",
   });
   assert.equal(JSON.stringify(state.wave_history), historyAfterFirst, "duplicate transport source must be idempotent");
@@ -147,6 +170,7 @@ test("cto control-plane: appendWave validates and stamps work identity, then ded
       source_id: "message-2",
       task: "invalid identity",
       work_identity: { ...identity, attempt: 0 },
+      run_identity,
     }),
     /invalid typed control-plane update/,
   );
@@ -156,6 +180,9 @@ function engineStateFixture(): TeamState {
   return {
     schema: 1,
     branch: "main",
+    run_key: "main",
+    project_identity: fixture.project_identity,
+    run_identity,
     classification: {
       type: "FEATURE",
       complexity: "MEDIUM",
@@ -163,15 +190,16 @@ function engineStateFixture(): TeamState {
       workflow: "standard",
       autonomous: false,
     },
+    workflow: "standard",
     task: "write-state typed rejection fixture",
     workflow_override: false,
     issue: null,
-    stage_cursor: "",
+    stage_cursor: "implementation",
+    cursor_epoch: "control-plane-epoch",
     stages: [],
     artifacts: {},
     pause: { kind: "none", reason: "" },
     updated_at: "2026-08-25T00:00:00.000Z",
-    run_key: "main",
   };
 }
 

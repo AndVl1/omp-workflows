@@ -27,9 +27,15 @@ import {
   type CtoState,
   type ModelClassification,
 } from "@andvl1/omp-workflows-core";
+import { readWorkflowProfile, workflowV2Fixture, type WorkflowV2TestFixture } from "./workflow-v2-fixtures.js";
 
 const CLASSIFICATION: ModelClassification = { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: true };
+const fixture = workflowV2Fixture(readWorkflowProfile("standard"), {
+  roleAgents: { "team-lead": "team-lead" },
+  agentNames: ["team-lead"],
+});
 const EXPECTED_WORKFLOW = resolveWorkflow(CLASSIFICATION.type, CLASSIFICATION.complexity, CLASSIFICATION.autonomous); // "standard"
+
 
 interface RunFixture {
   root: string;
@@ -37,10 +43,16 @@ interface RunFixture {
   runId: string;
   sliceId: string;
   teamId: string;
+  fixture: WorkflowV2TestFixture;
 }
 
 /** Build a fully valid resident run: active wave + per-slice classification + workflow + DoD. */
 function validRun(runId = "run-1", sliceId = "slice-1", teamId = "lead-a"): RunFixture {
+  const runFixture = workflowV2Fixture(readWorkflowProfile("standard"), {
+    roleAgents: { "team-lead": "team-lead" },
+    agentNames: ["team-lead"],
+    runId,
+  });
   const root = mkdtempSync(join(tmpdir(), "cto-slice-gate-"));
   const now = new Date().toISOString();
   const state = newCtoState({
@@ -49,18 +61,38 @@ function validRun(runId = "run-1", sliceId = "slice-1", teamId = "lead-a"): RunF
     branch: "main",
     autonomous: true,
     standby: true,
+    run_identity: runFixture.run_identity,
     plan: {
       id: runId,
       task: "wave task",
-      teams: [{ team: teamId, scope: ["backend-kotlin"], slice: sliceId, profile: "lightweight", worktree: "same_branch", depends_on: [] }],
+      teams: [{
+        team: teamId,
+        scope: ["backend-kotlin"],
+        slice: sliceId,
+        profile: "standard",
+        worktree: "same_branch",
+        depends_on: [],
+        profile_identity: runFixture.profile_identity,
+        lead_ref: runFixture.effective_policy.roles["team-lead"]!,
+        roster_refs: [runFixture.effective_policy.roles["team-lead"]!],
+        run_identity: runFixture.run_identity,
+      }],
       created_at: now,
+      run_identity: runFixture.run_identity,
     },
   });
   const team = state.teams[0]!;
   team.slice_id = sliceId;
   team.classification = CLASSIFICATION;
   team.workflow = EXPECTED_WORKFLOW;
-  appendWave(state, { id: "wave-1", source: "inbox", source_id: "m1", task: "t", slice_ids: [sliceId] });
+  appendWave(state, {
+    id: "wave-1",
+    source: "inbox",
+    source_id: "m1",
+    task: "t",
+    slice_ids: [sliceId],
+    run_identity: runFixture.run_identity,
+  });
   const dodDir = join(root, ".work-state", "artifacts", teamId);
   mkdirSync(dodDir, { recursive: true });
   writeFileSync(
@@ -72,7 +104,7 @@ function validRun(runId = "run-1", sliceId = "slice-1", teamId = "lead-a"): RunF
     }),
   );
   writeCtoState(state, root);
-  return { root, state, runId, sliceId, teamId };
+  return { root, state, runId, sliceId, teamId, fixture: runFixture };
 }
 
 function cleanup(f: RunFixture): void {
@@ -87,6 +119,25 @@ function blockReason(r: { ok: true } | { ok: false; reason: string }): string {
 
 function markerInput(runId: string, sliceId: string): { task: string; agent: string } {
   return { task: `${buildCtoSliceMarker(runId, sliceId)}\nImplement ${sliceId}`, agent: "team-lead" };
+}
+function gateContext(f: RunFixture): { cwd: string; project_identity: WorkflowV2TestFixture["project_identity"]; run_identity: WorkflowV2TestFixture["run_identity"] } {
+  return {
+    cwd: f.root,
+    project_identity: f.fixture.project_identity,
+    run_identity: f.fixture.run_identity,
+  };
+}
+
+function dispatchOptions(
+  f: RunFixture,
+  overrides: { markerRunId?: string; sliceId?: string } = {},
+): { sliceId: string; root: string; markerRunId?: string; runIdentity: WorkflowV2TestFixture["run_identity"] } {
+  return {
+    sliceId: overrides.sliceId ?? f.sliceId,
+    root: f.root,
+    runIdentity: f.fixture.run_identity,
+    ...(overrides.markerRunId === undefined ? {} : { markerRunId: overrides.markerRunId }),
+  };
 }
 
 test("cto-slice-gate: build/parse round-trip and prefix", () => {
@@ -118,9 +169,26 @@ test("cto-slice-gate: marker parsing is bounded, exact-format, and rejects unsaf
 test("cto-slice-gate: fully valid per-slice state dispatches (allow)", () => {
   const f = validRun();
   try {
-    assert.deepEqual(assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root, markerRunId: f.runId }), { ok: true });
-    const res = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, { cwd: f.root });
+    assert.deepEqual(assertCtoSliceDispatchable(f.state, dispatchOptions(f, { markerRunId: f.runId })), { ok: true });
+    const res = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, gateContext(f));
     assert.equal(res, undefined, "valid state allows the task call");
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("cto-slice-gate: missing context identity fails closed for marker and active-wave routing", () => {
+  const f = validRun();
+  try {
+    const marker = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, { cwd: f.root });
+    assert.equal(marker?.block, true, "marker dispatch requires an admitted identity");
+    assert.match(marker?.reason ?? "", /MIGRATION_REQUIRED/);
+    assert.match(marker?.reason ?? "", /identity/);
+
+    const noMarker = ctoSliceTaskGate({ toolName: "task", input: { task: "legacy task" } }, { cwd: f.root });
+    assert.equal(noMarker?.block, true, "active-wave routing requires an admitted identity");
+    assert.match(noMarker?.reason ?? "", /MIGRATION_REQUIRED/);
+    assert.match(noMarker?.reason ?? "", /identity/);
   } finally {
     cleanup(f);
   }
@@ -131,7 +199,7 @@ test("cto-slice-gate: marker run mismatch blocks", () => {
   try {
     // markerRunId is validated against the canonical state id; a stale marker
     // that points at a different run is a routing failure, not a new run.
-    const r = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root, markerRunId: "other-run" });
+    const r = assertCtoSliceDispatchable(f.state, dispatchOptions(f, { markerRunId: "other-run" }));
     assert.match(blockReason(r), /marker run mismatch: expected run-1, marker says other-run/);
   } finally {
     cleanup(f);
@@ -142,18 +210,18 @@ test("cto-slice-gate: missing active wave blocks (unset and finished variants)",
   const f = validRun();
   try {
     const noWave = { ...f.state, active_wave_id: undefined };
-    const r1 = assertCtoSliceDispatchable(noWave, { sliceId: f.sliceId, root: f.root });
+    const r1 = assertCtoSliceDispatchable(noWave, dispatchOptions(f));
     assert.match(blockReason(r1), /no active wave: active_wave_id is unset/);
 
-    finishWave(f.state, { id: "wave-1", status: "done" });
+    finishWave(f.state, { id: "wave-1", status: "done", run_identity: f.fixture.run_identity });
     f.state.active_wave_id = "wave-1"; // stale pointer to a finished wave
-    const r2 = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+    const r2 = assertCtoSliceDispatchable(f.state, dispatchOptions(f));
     assert.match(blockReason(r2), /no active wave: wave wave-1 is not active/);
 
     // the tool_call gate reads canonical state from disk — persist the broken
     // wave state so the gate observes the same failure
     writeCtoState(f.state, f.root);
-    const gateRes = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, { cwd: f.root });
+    const gateRes = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, gateContext(f));
     assert.equal(gateRes?.block, true);
     assert.match(gateRes?.reason ?? "", /no active wave/);
   } finally {
@@ -166,12 +234,12 @@ test("cto-slice-gate: slice must be uniquely mapped and admitted by the active w
   const f = validRun();
   try {
     f.state.wave_history![0]!.slice_ids = ["other-slice"];
-    const notAdmitted = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+    const notAdmitted = assertCtoSliceDispatchable(f.state, dispatchOptions(f));
     assert.match(blockReason(notAdmitted), /not uniquely admitted by active wave/);
 
     f.state.wave_history![0]!.slice_ids = [f.sliceId];
     f.state.teams.push({ ...f.state.teams[0]!, id: "lead-b" });
-    const ambiguous = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+    const ambiguous = assertCtoSliceDispatchable(f.state, dispatchOptions(f));
     assert.match(blockReason(ambiguous), /ambiguous slice slice-1/);
   } finally {
     cleanup(f);
@@ -181,13 +249,13 @@ test("cto-slice-gate: slice must be uniquely mapped and admitted by the active w
 test("cto-slice-gate: unsafe ids and DoD paths fail closed without echoing untrusted values", () => {
   const f = validRun();
   try {
-    const unsafeSlice = assertCtoSliceDispatchable(f.state, { sliceId: "..", root: f.root });
+    const unsafeSlice = assertCtoSliceDispatchable(f.state, dispatchOptions(f, { sliceId: ".." }));
     assert.match(blockReason(unsafeSlice), /unsafe slice id/);
-    const unsafeRun = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root, markerRunId: "../escape" });
+    const unsafeRun = assertCtoSliceDispatchable(f.state, dispatchOptions(f, { markerRunId: "../escape" }));
     assert.match(blockReason(unsafeRun), /unsafe marker run id/);
     assert.doesNotMatch(blockReason(unsafeRun), /\.\.\/escape/);
     f.state.teams[0]!.dod_path = "../escape";
-    const unsafeDod = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+    const unsafeDod = assertCtoSliceDispatchable(f.state, dispatchOptions(f));
     assert.match(blockReason(unsafeDod), /slice DoD path invalid/);
     assert.doesNotMatch(blockReason(unsafeDod), /\.\.\/escape/);
   } finally {
@@ -197,7 +265,7 @@ test("cto-slice-gate: unsafe ids and DoD paths fail closed without echoing untru
 test("cto-slice-gate: unknown slice blocks", () => {
   const f = validRun();
   try {
-    const r = assertCtoSliceDispatchable(f.state, { sliceId: "nope", root: f.root });
+    const r = assertCtoSliceDispatchable(f.state, dispatchOptions(f, { sliceId: "nope" }));
     assert.match(blockReason(r), /unknown slice nope: no team with slice_id or id matching/);
   } finally {
     cleanup(f);
@@ -220,7 +288,7 @@ test("cto-slice-gate: each missing classification field blocks with the field na
       // deliberate — we are writing an invalid value into a typed fixture.
       const corrupted = { ...(team.classification as ModelClassification), [c.key]: c.value } as unknown as ModelClassification;
       team.classification = corrupted;
-      const r = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+      const r = assertCtoSliceDispatchable(f.state, dispatchOptions(f));
       assert.match(blockReason(r), new RegExp(c.field), `${c.label} names the field`);
     } finally {
       cleanup(f);
@@ -231,7 +299,7 @@ test("cto-slice-gate: each missing classification field blocks with the field na
   const f = validRun();
   try {
     delete f.state.teams[0]!.classification;
-    const r = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+    const r = assertCtoSliceDispatchable(f.state, dispatchOptions(f));
     const reason = blockReason(r);
     assert.ok(reason.includes("type") && reason.includes("complexity") && reason.includes("confidence") && reason.includes("autonomous"), "all four missing fields listed");
   } finally {
@@ -247,7 +315,7 @@ test("cto-slice-gate: workflow mismatch vs matrix blocks with expected name (BUG
     team.workflow = "bug-fix"; // WRONG: autonomous BUG_FIX resolves to debug-cycle
     const expected = resolveWorkflow("BUG_FIX", "QUICK", true);
     assert.equal(expected, "debug-cycle");
-    const r = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+    const r = assertCtoSliceDispatchable(f.state, dispatchOptions(f));
     assert.match(blockReason(r), /workflow mismatch: expected debug-cycle, got bug-fix/);
   } finally {
     cleanup(f);
@@ -261,7 +329,7 @@ test("cto-slice-gate: SPEC and REGRESS reject any workflow that disagrees with t
       team.classification = { type, complexity: "CRITICAL", confidence: "HIGH", autonomous: true };
       team.workflow = type === "SPEC" ? "feature-regression" : "spec-preparation";
       const expected = resolveWorkflow(type, "CRITICAL", true);
-      const r = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+      const r = assertCtoSliceDispatchable(f.state, dispatchOptions(f));
       assert.equal(expected, type === "SPEC" ? "spec-preparation" : "feature-regression");
       assert.match(blockReason(r), new RegExp(`workflow mismatch: expected ${expected}`));
     } finally {
@@ -275,7 +343,7 @@ test("cto-slice-gate: missing/unreadable/empty per-slice DoD blocks", () => {
   const f1 = validRun();
   try {
     rmSync(join(f1.root, ".work-state", "artifacts", f1.teamId), { recursive: true, force: true });
-    const r = assertCtoSliceDispatchable(f1.state, { sliceId: f1.sliceId, root: f1.root });
+    const r = assertCtoSliceDispatchable(f1.state, dispatchOptions(f1));
     assert.match(blockReason(r), /slice DoD unreadable: no dod\.json at/);
   } finally {
     cleanup(f1);
@@ -284,7 +352,7 @@ test("cto-slice-gate: missing/unreadable/empty per-slice DoD blocks", () => {
   const f2 = validRun();
   try {
     writeFileSync(join(f2.root, ".work-state", "artifacts", f2.teamId, "dod.json"), "{ nope !!");
-    const r = assertCtoSliceDispatchable(f2.state, { sliceId: f2.sliceId, root: f2.root });
+    const r = assertCtoSliceDispatchable(f2.state, dispatchOptions(f2));
     assert.match(blockReason(r), /slice DoD unreadable/);
   } finally {
     cleanup(f2);
@@ -296,7 +364,7 @@ test("cto-slice-gate: missing/unreadable/empty per-slice DoD blocks", () => {
       join(f3.root, ".work-state", "artifacts", f3.teamId, "dod.json"),
       JSON.stringify({ items: [], type_requirements_met: false, updated_at: new Date().toISOString() }),
     );
-    const r = assertCtoSliceDispatchable(f3.state, { sliceId: f3.sliceId, root: f3.root });
+    const r = assertCtoSliceDispatchable(f3.state, dispatchOptions(f3));
     assert.match(blockReason(r), /slice DoD empty: .* has no items/);
   } finally {
     cleanup(f3);
@@ -313,7 +381,7 @@ test("cto-slice-gate: team dod_path (relative to root) is honored when set", () 
       JSON.stringify({ items: [{ id: "c1", source: "test", criterion: "c", verify_method: "v", status: "pending", evidence: "" }], type_requirements_met: true, updated_at: new Date().toISOString() }),
     );
     f.state.teams[0]!.dod_path = customDir;
-    const r = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
+    const r = assertCtoSliceDispatchable(f.state, dispatchOptions(f));
     assert.deepEqual(r, { ok: true });
   } finally {
     cleanup(f);
@@ -323,7 +391,10 @@ test("cto-slice-gate: team dod_path (relative to root) is honored when set", () 
 test("cto-slice-gate: marker present but CtoState missing → block with actionable reason", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-slice-gate-"));
   try {
-    const res = ctoSliceTaskGate({ toolName: "task", input: markerInput("ghost-run", "slice-1") }, { cwd: root });
+    const res = ctoSliceTaskGate(
+      { toolName: "task", input: markerInput("ghost-run", "slice-1") },
+      { cwd: root, project_identity: fixture.project_identity, run_identity: fixture.run_identity },
+    );
     assert.equal(res?.block, true);
     assert.match(res?.reason ?? "", /no CtoState for run ghost-run at \.work-state\/cto\/ghost-run\/state\.json — cannot dispatch CTO slice slice-1/);
   } finally {
@@ -334,10 +405,30 @@ test("cto-slice-gate: marker present but CtoState missing → block with actiona
 test("cto-slice-gate: no marker during an active wave blocks with the marker format", () => {
   const f = validRun();
   try {
-    const res = ctoSliceTaskGate({ toolName: "task", input: { task: "ordinary task without marker", agent: "team-lead" } }, { cwd: f.root });
+    const res = ctoSliceTaskGate({ toolName: "task", input: { task: "ordinary task without marker", agent: "team-lead" } }, gateContext(f));
     assert.equal(res?.block, true, "no-marker task call blocks during an active wave");
     assert.match(res?.reason ?? "", /active wave wave-1 in run run-1/, "reason names the wave and the run");
     assert.match(res?.reason ?? "", /omp-cto-slice/, "reason names the required marker format");
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("cto-slice-gate: raw active wave with a mismatched identity blocks closed", () => {
+  const f = validRun();
+  const mismatchedFixture = workflowV2Fixture(readWorkflowProfile("standard"), {
+    rootDigest: `sha256:${"e".repeat(64)}` as typeof fixture.project_identity.root_instance_id,
+    runId: f.runId,
+  });
+  try {
+    const res = ctoSliceTaskGate(
+      { toolName: "task", input: { task: "ordinary task without marker", agent: "team-lead" } },
+      { cwd: f.root, project_identity: mismatchedFixture.project_identity, run_identity: mismatchedFixture.run_identity },
+    );
+    assert.equal(res?.block, true, "mismatched identity must not treat the active wave as absent");
+    assert.match(res?.reason ?? "", /IDENTITY_MISMATCH/);
+    assert.match(res?.reason ?? "", /MIGRATION_REQUIRED/);
+    assert.match(res?.reason ?? "", /active wave wave-1 in run run-1/);
   } finally {
     cleanup(f);
   }
@@ -347,7 +438,7 @@ test("cto-slice-gate: wave-less state with no marker → allow; non-task tools �
   const f = validRun();
   try {
     // genuinely wave-less: finish the wave and persist (active_wave_id cleared)
-    finishWave(f.state, { id: "wave-1", status: "done" });
+    finishWave(f.state, { id: "wave-1", status: "done", run_identity: f.fixture.run_identity });
     writeCtoState(f.state, f.root);
     const res = ctoSliceTaskGate({ toolName: "task", input: { task: "legacy flow" } }, { cwd: f.root });
     assert.equal(res, undefined, "no active wave → no-marker task call allowed");
@@ -388,7 +479,7 @@ test("cto-slice-gate: malformed/odd input never throws — blocks during an acti
       },
     ];
     for (const c of cases) {
-      const res = ctoSliceTaskGate(c.event, { cwd: f.root });
+      const res = ctoSliceTaskGate(c.event, gateContext(f));
       assert.equal(res?.block, true, `${c.label}: block during active wave`);
       assert.match(res?.reason ?? "", /active wave/, `${c.label}: reason names the wave`);
     }
@@ -436,7 +527,7 @@ test("cto-slice-gate: marker outside the task payload does not count during an a
           task: "plain task",
         },
       },
-      { cwd: f.root },
+      gateContext(f),
     );
     assert.equal(res?.block, true, "marker in a non-task field is not a valid payload marker");
     assert.match(res?.reason ?? "", /active wave/);
@@ -449,7 +540,7 @@ test("cto-slice-gate: malformed marker attempt blocks during an active wave, all
   const malformed = "<!-- omp-cto-slice run=run-1 slice=s1"; // unterminated
   const f = validRun();
   try {
-    const res = ctoSliceTaskGate({ toolName: "task", input: { task: malformed } }, { cwd: f.root });
+    const res = ctoSliceTaskGate({ toolName: "task", input: { task: malformed } }, gateContext(f));
     assert.equal(res?.block, true, "malformed marker attempt blocks during an active wave");
     assert.match(res?.reason ?? "", /malformed CTO slice marker/, "reason says the marker is malformed");
     assert.match(res?.reason ?? "", /omp-cto-slice/, "reason names the expected format");
@@ -478,7 +569,7 @@ test("cto-slice-gate: batch — every item with a valid marker against valid sta
           ],
         },
       },
-      { cwd: f.root },
+      gateContext(f),
     );
     assert.equal(res, undefined, "batch with all-valid markers allows");
   } finally {
@@ -499,7 +590,7 @@ test("cto-slice-gate: batch items are independently admitted and failing item is
           ],
         },
       },
-      { cwd: f.root },
+      gateContext(f),
     );
     assert.equal(res?.block, true);
     assert.match(res?.reason ?? "", /unknown slice not-in-wave/);
@@ -515,12 +606,12 @@ test("cto-slice-gate: ambiguous or empty batch shapes fail closed only during an
     const marker = buildCtoSliceMarker(f.runId, f.sliceId);
     const ambiguous = ctoSliceTaskGate(
       { toolName: "task", input: { task: marker, tasks: [{ task: marker }] } },
-      { cwd: f.root },
+      gateContext(f),
     );
     assert.equal(ambiguous?.block, true);
     assert.match(ambiguous?.reason ?? "", /both task and tasks fields/);
 
-    const empty = ctoSliceTaskGate({ toolName: "task", input: { tasks: [] } }, { cwd: f.root });
+    const empty = ctoSliceTaskGate({ toolName: "task", input: { tasks: [] } }, gateContext(f));
     assert.equal(empty?.block, true);
     assert.match(empty?.reason ?? "", /without a CTO slice marker/);
   } finally {
@@ -543,7 +634,7 @@ test("cto-slice-gate: batch — one item lacking a marker blocks naming the item
         toolName: "task",
         input: { tasks: [markerInput(f.runId, f.sliceId), { task: "plain unmarked task", agent: "team-lead" }] },
       },
-      { cwd: f.root },
+      gateContext(f),
     );
     assert.equal(res?.block, true, "batch with an unmarked item blocks during an active wave");
     assert.match(res?.reason ?? "", /batch task item 1/, "block names the failing item");
@@ -568,7 +659,7 @@ test("cto-slice-gate: timing sanity — small valid state completes < 50ms (arch
   const f = validRun();
   try {
     const start = performance.now();
-    const res = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, { cwd: f.root });
+    const res = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, gateContext(f));
     const elapsed = performance.now() - start;
     assert.equal(res, undefined, "valid state allows");
     // architecture-1 budget: the classification gate is a sync read of a

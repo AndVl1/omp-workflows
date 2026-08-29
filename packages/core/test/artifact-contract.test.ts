@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile } from "../src/engine/profile.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
 import {
   validateProducedArtifact,
   validateConsumedArtifacts,
@@ -24,6 +24,9 @@ import {
   type ArtifactContractPolicy,
 } from "../src/engine/artifact-contract.js";
 import type { StageDef, TeamState } from "../src/engine/types.js";
+
+const FULL_FEATURE_FIXTURE = workflowV2Fixture(readWorkflowProfile("full-feature"));
+
 
 function state(overrides: Partial<TeamState> = {}): TeamState {
   return {
@@ -127,8 +130,8 @@ test("artifact contract: consumed artifacts are prevalidated; present-but-invali
   try {
     const artifactsDir = join(root, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
-    const profile = loadProfile("full-feature");
-    assert.ok(profile);
+    const profile = FULL_FEATURE_FIXTURE.profile;
+    assert.equal(FULL_FEATURE_FIXTURE.profile_identity.id, profile.name);
     const stage: StageDef = { id: "architecture", title: "Architecture", type: "single", role: "architect", consumes: ["exploration", "clarifications"] };
     writeFileSync(join(artifactsDir, "exploration.json"), JSON.stringify({ files_to_read: [], summary: "s" }));
     writeFileSync(join(artifactsDir, "clarifications.json"), JSON.stringify({ questions: ["q"], answers: ["a"] }));
@@ -153,8 +156,8 @@ test("artifact contract: missing consumed artifact blocks only when its producer
   try {
     const artifactsDir = join(root, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
-    const profile = loadProfile("full-feature");
-    assert.ok(profile);
+    const profile = FULL_FEATURE_FIXTURE.profile;
+    assert.equal(FULL_FEATURE_FIXTURE.profile_identity.id, profile.name);
     const stage: StageDef = { id: "manual_qa", title: "Manual QA", type: "single", role: "manual-qa", consumes: ["review", "feature_spec"] };
     const withProducerDone = state({
       stages: [

@@ -54,9 +54,9 @@ test("core peer range is pinned to core's own minor line, not a wildcard", () =>
 	assert.equal(corePeer, `^${coreMinor}.0`, `core peer must match the workspace core minor line (${coreManifest.version})`);
 });
 
-test("pi-coding-agent peer range matches the declared host_range (INT-003)", () => {
-	// Install-time metadata only; runtime enforcement is the fail-closed
-	// activation gate (markers + owner claim + core capability detection).
+test("pi-coding-agent peer range matches the host integration contract", () => {
+	// Install-time metadata only; runtime publication still requires explicit
+	// launcher root, registry, runtime and authority inputs.
 	assert.equal(manifest.peerDependencies?.["@oh-my-pi/pi-coding-agent"], ">=17.3 <19");
 });
 

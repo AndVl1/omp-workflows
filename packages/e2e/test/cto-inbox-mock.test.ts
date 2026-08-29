@@ -1,26 +1,27 @@
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-fullstack --> */
 import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { inboxDir, startDispatcher } from '../../fullstack/src/adapters/registry.js';
+import type {
+  Escalation,
+  EscalationAdapter,
+  EscalationAnswer,
+  EscalationInboundMessage,
+  EscalationReceipt,
+  WorkflowRunIdentity,
+} from '@andvl1/omp-workflows-core';
+import { startDispatcher, type DispatcherHandle, type InboxTask } from '../../fullstack/src/adapters/registry.js';
+import { runtimeFixture } from '../../fullstack/test/runtime-fixtures.js';
 import { WsDriver, waitFor } from '../src/driver.js';
 import { startTestSession, type TestSession } from '../src/server.js';
 
-interface InboxTask {
-  readonly id: string;
-  readonly text: string;
-  readonly at: string;
-  readonly by?: string;
-}
-
-interface PlainMessageHandler {
-  (task: InboxTask): void;
-}
+type PlainMessageHandler = (task: EscalationInboundMessage) => Promise<void>;
 
 /** Deterministic Telegram-shaped transport; no network or LLM is involved. */
-class MockInboundAdapter {
+class MockInboundAdapter implements EscalationAdapter {
   readonly kind = 'telegram';
   private handler: PlainMessageHandler | undefined;
   private readonly pending: InboxTask[] = [];
@@ -28,32 +29,41 @@ class MockInboundAdapter {
   maxConcurrentPolls = 0;
   pollCount = 0;
 
+  constructor(private readonly runIdentity: WorkflowRunIdentity) {}
+
   setPlainMessageHandler(handler: PlainMessageHandler): void {
     this.handler = handler;
   }
 
   push(id: string, text: string): void {
-    this.pending.push({ id, text, at: new Date().toISOString(), by: 'mock-telegram' });
+    this.pending.push({ id, text, at: new Date().toISOString(), by: 'mock-telegram', run_identity: this.runIdentity });
   }
 
-  async pollOnce(): Promise<[]> {
+  async pollOnce(): Promise<EscalationAnswer[]> {
     this.activePolls += 1;
     this.maxConcurrentPolls = Math.max(this.maxConcurrentPolls, this.activePolls);
     this.pollCount += 1;
     try {
       const batch = this.pending.splice(0);
-      for (const task of batch) this.handler?.(task);
+      for (let index = 0; index < batch.length; index += 1) {
+        try {
+          await this.handler?.(batch[index]!);
+        } catch (error) {
+          this.pending.unshift(...batch.slice(index));
+          throw error;
+        }
+      }
       return [];
     } finally {
       this.activePolls -= 1;
     }
   }
 
-  async send(): Promise<{ sent: true }> {
-    return { sent: true };
+  async send(_escalation: Escalation): Promise<EscalationReceipt> {
+    return { sent: true, run_identity: this.runIdentity };
   }
 
-  async cancel(): Promise<void> {
+  async cancel(_id: string): Promise<void> {
     // No outbound channel is needed for this scenario.
   }
 }
@@ -80,10 +90,10 @@ class MockResidentCto {
     return this.send(`MOCK_WAVE_1_STARTED:${taskNames.join(',')}`);
   }
 
-  acceptInboxTask(task: InboxTask): void {
+  async acceptInboxTask(task: InboxTask): Promise<void> {
     assert.equal(this.activeWave, 1, 'inbox task arrives while the current wave is active');
     this.received.push(task);
-    void this.send(`[CTO-INBOX] ${task.id}: ${task.text}`);
+    await this.send(`[CTO-INBOX] ${task.id}: ${task.text}`);
   }
 
   async finishWaveAndStartNext(): Promise<void> {
@@ -160,6 +170,10 @@ function writeActiveRun(root: string): void {
   );
 }
 
+function inboxRecordName(id: string): string {
+  return `${Buffer.from(id, 'utf8').toString('base64url')}.json`;
+}
+
 test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2', async t => {
   // GIVEN: a real E2E PTY/WS session, an active CTO run with several teams,
   // and a deterministic Telegram-shaped inbound transport.
@@ -170,7 +184,7 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
 
   let session: TestSession | null = null;
   let driver: WsDriver | null = null;
-  let stopDispatcher: (() => void) | null = null;
+  let dispatcher: DispatcherHandle | null = null;
   try {
     session = await startTestSession({
       cwd: scratch,
@@ -196,12 +210,19 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
     await resident.flush();
     await waitFor(async () => (await driver!.readScreen()).includes('MOCK_WAVE_1_STARTED'), { label: 'wave 1 started' });
 
-    const adapter = new MockInboundAdapter();
-    stopDispatcher = startDispatcher(scratch, adapter as unknown as Parameters<typeof startDispatcher>[1], 5, {
+    const fixture = runtimeFixture(scratch, { runId: 'run-active' });
+    const adapter = new MockInboundAdapter(fixture.run_identity);
+    const started = startDispatcher(fixture.context, adapter, {
+      intervalMs: 5,
       // This mirrors the production main-session callback: the resident CTO is
       // woken through a user message, not by starting another CTO session.
-      onTask: task => resident.acceptInboxTask(task),
+      onTask: async task => {
+        await resident.acceptInboxTask(task);
+      },
     });
+    assert.equal(started.ok, true);
+    if (!started.ok) throw new Error('mock dispatcher should start');
+    dispatcher = started.value;
 
     // WHEN: two new tasks arrive while wave 1 is still active.
     adapter.push('tg:inbox-1', 'add the export endpoint');
@@ -213,8 +234,10 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
     // resident CTO, and no poll overlap occurs.
     assert.equal(resident.activeWave, 1);
     assert.deepEqual(
-      readdirSync(inboxDir('run-active', scratch)).filter(name => name.endsWith('.json')).sort(),
-      ['tg-inbox-1.json', 'tg-inbox-2.json'],
+      readdirSync(join(fixture.project_root, '.work-state', 'cto', fixture.run_identity.run_id, 'inbox', 'processed'))
+        .filter(name => name.endsWith('.json'))
+        .sort(),
+      [inboxRecordName('tg:inbox-1'), inboxRecordName('tg:inbox-2')].sort(),
     );
     assert.deepEqual(resident.received.map(task => task.text), ['add the export endpoint', 'update the mobile copy']);
     assert.equal(adapter.maxConcurrentPolls, 1, 'mock Telegram polling never overlaps');
@@ -235,14 +258,16 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
       timeoutMs: 3000,
     });
     assert.equal(resident.activeWave, 2);
-    const files = readdirSync(inboxDir('run-active', scratch)).filter(name => name.endsWith('.json'));
+    const processedInbox = join(fixture.project_root, '.work-state', 'cto', fixture.run_identity.run_id, 'inbox', 'processed');
+    const files = readdirSync(processedInbox).filter(name => name.endsWith('.json'));
     assert.equal(files.length, 2);
-    assert.deepEqual(
-      JSON.parse(readFileSync(join(inboxDir('run-active', scratch), 'tg-inbox-1.json'), 'utf8')).runId,
-      'run-active',
-    );
+    const first = JSON.parse(readFileSync(join(processedInbox, inboxRecordName('tg:inbox-1')), 'utf8')) as {
+      run_identity?: WorkflowRunIdentity;
+    };
+    assert.equal(first.run_identity?.run_id, 'run-active');
+    assert.deepEqual(first.run_identity, fixture.run_identity);
   } finally {
-    stopDispatcher?.();
+    await dispatcher?.stop();
     await driver?.close();
     await session?.close();
     rmSync(scratch, { recursive: true, force: true });

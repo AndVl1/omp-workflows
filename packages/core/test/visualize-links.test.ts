@@ -32,6 +32,7 @@ import {
   DEFAULT_RENDERER_IDENTITY,
   REGENERATE_HINT,
   VISUALIZE_OUTPUT_FILES,
+  compareSessions,
   fragmentForSession,
   isSafePathKey,
   sessionPagePath,
@@ -42,6 +43,7 @@ import {
 } from "../src/visualize/types.js";
 import { buildSessionSnapshots } from "../src/visualize/snapshot.js";
 import { resolveDoWorkSource } from "../src/report/session-source.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
 import {
   FIXED_GENERATED_AT,
   buildExpectedBugFixSession,
@@ -53,6 +55,7 @@ import {
   buildSelectedManifest,
   type CanonicalSessionInput,
 } from "./fixtures/visualize-fixtures.js";
+import { reportStorageFor } from "./report-storage-fixtures.js";
 
 // ── Harness ──────────────────────────────────────────────────────────────────
 
@@ -377,8 +380,38 @@ test("links: real canonical inputs → snapshots → manifest → pages → zero
 
     materialize(cwd, spec.input);
     materialize(cwd, bugfix.input);
-    const entries = [resolveDoWorkSource(cwd, spec.input.id), resolveDoWorkSource(cwd, bugfix.input.id)];
-    const sessions = buildSessionSnapshots(cwd, entries, FIXED_GENERATED_AT);
+    const specProfile = readWorkflowProfile("spec-preparation");
+    const bugfixProfile = readWorkflowProfile("bug-fix");
+    // Each canonical state was built with its workflow's single-profile catalog.
+    // Keep the admitted context on that exact catalog so identity validation
+    // does not degrade the snapshot before ordering is asserted.
+    const specFixture = workflowV2Fixture(specProfile);
+    const bugfixFixture = workflowV2Fixture(bugfixProfile);
+    const storage = reportStorageFor(cwd);
+    const specEntry = resolveDoWorkSource(storage, spec.input.id);
+    const bugfixEntry = resolveDoWorkSource(storage, bugfix.input.id);
+    if (!specEntry || !bugfixEntry) throw new Error("missing fixture sources");
+
+    const specSessions = buildSessionSnapshots(storage, [specEntry], FIXED_GENERATED_AT, {
+      context: {
+        project_identity: specFixture.project_identity,
+        catalog: specFixture.catalog,
+        effective_policy: specFixture.effective_policy,
+      },
+    });
+    const bugfixSessions = buildSessionSnapshots(storage, [bugfixEntry], FIXED_GENERATED_AT, {
+      context: {
+        project_identity: bugfixFixture.project_identity,
+        catalog: bugfixFixture.catalog,
+        effective_policy: bugfixFixture.effective_policy,
+      },
+    });
+    const sessions = [...specSessions, ...bugfixSessions].sort((a, b) =>
+      compareSessions(
+        { updatedAt: a.provenance.sourceUpdatedAt, kind: a.identity.kind, id: a.identity.id },
+        { updatedAt: b.provenance.sourceUpdatedAt, kind: b.identity.kind, id: b.identity.id },
+      ),
+    );
     assert.equal(sessions.length, 2);
     assert.equal(sessions[0].identity.id, "visualize", "deterministic session order (updated_at desc)");
 

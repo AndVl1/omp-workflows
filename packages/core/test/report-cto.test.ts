@@ -2,18 +2,82 @@
  * Session-report assembly: CTO (CtoState schema 2) normalization — derived
  * workflow stages, team statuses (parked/failed/done), depends_on edges,
  * integration/health, per-team artifacts, and the markdown fallback reader.
+ * <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core -->
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildSessionReport } from "../src/report/assemble.js";
+import { buildSessionReport, type ReportAssemblyOptions } from "../src/report/assemble.js";
 import type { CtoState } from "../src/cto/types.js";
+import {
+  agentRef,
+  profileIdentity,
+  readWorkflowProfile,
+  workflowV2Fixture,
+  type WorkflowV2TestFixture,
+} from "./workflow-v2-fixtures.js";
+import { reportStorageFor } from "./report-storage-fixtures.js";
+import type {
+  CanonicalRoot,
+  PolicyDocument,
+  WorkflowPolicy,
+} from "../src/workflow-v2/types.js";
+
+const CTO_PROFILE = readWorkflowProfile("cto");
+const STANDARD_PROFILE = readWorkflowProfile("standard");
+const CTO_FIXTURE: WorkflowV2TestFixture = workflowV2Fixture(CTO_PROFILE, {
+  catalogProfiles: [CTO_PROFILE, STANDARD_PROFILE],
+  agentNames: [
+    "architect",
+    "code-reviewer",
+    "developer-kotlin",
+    "team-lead-alpha",
+    "team-lead-beta",
+  ],
+  runId: "run-1",
+});
+const STANDARD_PROFILE_IDENTITY = profileIdentity(CTO_FIXTURE.catalog, "standard");
+
+function reportOptions(cwd: string, fixture: WorkflowV2TestFixture = CTO_FIXTURE): ReportAssemblyOptions {
+  const provider = fixture.effective_policy.provider;
+  const policy: WorkflowPolicy = {
+    roles: fixture.effective_policy.roles,
+    scope_map: [],
+    roster_overrides: [],
+    flags: {},
+    runtime_classes: {},
+    ui_classes: {},
+    design_system: null,
+    commands: fixture.effective_policy.commands,
+    workflow: fixture.effective_policy.workflow,
+    prompt_context: {},
+    required_capabilities: [],
+  };
+  const document: PolicyDocument = { schema_version: 2, provider, policy };
+  const policySnapshot = {
+    root: cwd as CanonicalRoot,
+    document,
+    byte_sha256: fixture.project_identity.config_byte_sha256,
+    semantic_sha256: fixture.project_identity.config_semantic_sha256,
+    byte_length: 0,
+  };
+  return {
+    policySnapshot,
+    effectivePolicy: fixture.effective_policy,
+    catalog: fixture.catalog,
+    project_identity: fixture.project_identity,
+    agentInventory: fixture.agent_inventory,
+  };
+}
 
 function makeCtoState(overrides: Partial<CtoState> = {}): CtoState {
+  const runIdentity = CTO_FIXTURE.run_identity;
+  const alphaLead = agentRef("team-lead-alpha");
+  const betaLead = agentRef("team-lead-beta");
   return {
     schema: 2,
     id: "run-1",
@@ -21,18 +85,59 @@ function makeCtoState(overrides: Partial<CtoState> = {}): CtoState {
     branch: "feat/cto-run",
     autonomous: true,
     classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: true },
+    run_identity: runIdentity,
     plan: {
       id: "run-1",
       task: "Build the report feature",
       teams: [
-        { team: "alpha", scope: ["backend"], slice: "api", profile: "standard", worktree: "same_branch", depends_on: [] },
-        { team: "beta", scope: ["frontend"], slice: "ui", profile: "standard", worktree: "same_branch", depends_on: ["alpha"] },
+        {
+          team: "alpha",
+          scope: ["backend"],
+          slice: "api",
+          profile: "standard",
+          worktree: "same_branch",
+          depends_on: [],
+          profile_identity: STANDARD_PROFILE_IDENTITY,
+          lead_ref: alphaLead,
+          roster_refs: [],
+          run_identity: runIdentity,
+        },
+        {
+          team: "beta",
+          scope: ["frontend"],
+          slice: "ui",
+          profile: "standard",
+          worktree: "same_branch",
+          depends_on: ["alpha"],
+          profile_identity: STANDARD_PROFILE_IDENTITY,
+          lead_ref: betaLead,
+          roster_refs: [],
+          run_identity: runIdentity,
+        },
       ],
       created_at: "2026-08-08T09:00:00.000Z",
+      run_identity: runIdentity,
     },
     teams: [
-      { id: "alpha", status: "done", escalations: {}, dod_path: ".work-state/artifacts/alpha/dod.json" },
-      { id: "beta", status: "parked", escalations: { e1: { status: "pending" } } },
+      {
+        id: "alpha",
+        status: "done",
+        escalations: {},
+        dod_path: ".work-state/artifacts/alpha/dod.json",
+        run_identity: runIdentity,
+        profile_identity: STANDARD_PROFILE_IDENTITY,
+        lead_ref: alphaLead,
+        roster_refs: [],
+      },
+      {
+        id: "beta",
+        status: "parked",
+        escalations: { e1: { status: "pending" } },
+        run_identity: runIdentity,
+        profile_identity: STANDARD_PROFILE_IDENTITY,
+        lead_ref: betaLead,
+        roster_refs: [],
+      },
     ],
     integration: { status: "failed", note: "verdict reject" },
     pause: { kind: "background_wait", reason: "waiting on beta answer" },
@@ -40,7 +145,6 @@ function makeCtoState(overrides: Partial<CtoState> = {}): CtoState {
     ...overrides,
   };
 }
-
 function writeRun(cwd: string, state: CtoState): void {
   const dir = join(cwd, ".work-state", "cto", state.id);
   mkdirSync(dir, { recursive: true });
@@ -56,7 +160,7 @@ test("cto: normalizes CtoState schema 2 with derived stages, teams, integration,
   try {
     writeRun(cwd, makeCtoState());
 
-    const report = buildSessionReport(cwd, { kind: "cto" });
+    const report = buildSessionReport(reportStorageFor(cwd), { kind: "cto" }, reportOptions(cwd, CTO_FIXTURE));
 
     assert.equal(report.kind, "cto");
     assert.equal(report.meta.task, "Build the report feature");
@@ -64,7 +168,7 @@ test("cto: normalizes CtoState schema 2 with derived stages, teams, integration,
     assert.equal(report.meta.autonomous, true);
     assert.equal(report.source.id, "run-1");
     assert.equal(report.source.format, "json");
-    assert.equal(report.source.statePath, join(cwd, ".work-state", "cto", "run-1", "state.json"));
+    assert.equal(report.source.statePath, join(".work-state", "cto", "run-1", "state.json"));
 
     // Derived workflow stages.
     assert.ok(report.stages.some((s) => s.id === "cto_discovery" && s.status === "done"));
@@ -105,6 +209,42 @@ test("cto: normalizes CtoState schema 2 with derived stages, teams, integration,
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+test("cto report requires run identity on state, plan, and every team record", () => {
+  const cwd = tmpWorkspace();
+  try {
+    const options = reportOptions(cwd, CTO_FIXTURE);
+    const state = makeCtoState();
+
+    writeRun(cwd, { ...state, run_identity: undefined } as unknown as CtoState);
+    assert.throws(
+      () => buildSessionReport(reportStorageFor(cwd), { kind: "cto", id: "run-1" }, options),
+      /cto session "run-1" not found/,
+    );
+
+    writeRun(
+      cwd,
+      { ...state, plan: { ...state.plan, run_identity: undefined } } as unknown as CtoState,
+    );
+    assert.throws(
+      () => buildSessionReport(reportStorageFor(cwd), { kind: "cto" }, options),
+      /STATE_STALE: CTO plan run identity differs/,
+    );
+
+    writeRun(
+      cwd,
+      {
+        ...state,
+        teams: state.teams.map((team, index) => index === 0 ? { ...team, run_identity: undefined } : team),
+      } as unknown as CtoState,
+    );
+    assert.throws(
+      () => buildSessionReport(reportStorageFor(cwd), { kind: "cto" }, options),
+      /STATE_STALE: CTO team run identity differs/,
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test("cto: team artifacts under .work-state/artifacts/<team>/ are navigable result nodes", () => {
   const cwd = tmpWorkspace();
@@ -115,7 +255,7 @@ test("cto: team artifacts under .work-state/artifacts/<team>/ are navigable resu
     writeFileSync(join(alphaDir, "dod.json"), JSON.stringify({ type: "dod", items: [] }, null, 2));
     writeFileSync(join(alphaDir, "api_contract.json"), JSON.stringify({ type: "architecture", title: "API contract" }, null, 2));
 
-    const report = buildSessionReport(cwd, { kind: "cto" });
+    const report = buildSessionReport(reportStorageFor(cwd), { kind: "cto" }, reportOptions(cwd, CTO_FIXTURE));
 
     const dod = report.artifacts.find((a) => a.id === "dod" && a.owner === "alpha");
     assert.equal(dod?.status, "produced");
@@ -129,7 +269,7 @@ test("cto: team artifacts under .work-state/artifacts/<team>/ are navigable resu
   }
 });
 
-test("cto: markdown fallback reader produces a report for agent-written runs", () => {
+test("cto: markdown fallback reader has no v2 report authority", () => {
   const cwd = tmpWorkspace();
   try {
     const runDir = join(cwd, ".work-state", "cto", "md-run");
@@ -144,15 +284,11 @@ test("cto: markdown fallback reader produces a report for agent-written runs", (
       ].join("\n"),
     );
 
-    const report = buildSessionReport(cwd, { kind: "cto", id: "md-run" });
-
-    assert.equal(report.source.format, "markdown");
-    assert.equal(report.source.statePath, null);
-    assert.equal(report.meta.task, "CTO Discovery");
-    const alpha = report.teams?.find((t) => t.id === "alpha");
-    assert.equal(alpha?.status, "in_progress");
-    assert.equal(report.stages.find((s) => s.id === "team:alpha")?.status, "in_progress");
-    assert.ok(report.warnings.length >= 0);
+    // Markdown discovery is observational only; it has no v2 authority for report assembly.
+    assert.throws(
+      () => buildSessionReport(reportStorageFor(cwd), { kind: "cto", id: "md-run" }, reportOptions(cwd, CTO_FIXTURE)),
+      /cto session "md-run" not found/,
+    );
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -181,7 +317,7 @@ test("cto: auto-detect picks the CTO run when it is newer than the do-work state
       }),
     );
 
-    const report = buildSessionReport(cwd);
+    const report = buildSessionReport(reportStorageFor(cwd), {}, reportOptions(cwd, CTO_FIXTURE));
     assert.equal(report.kind, "cto");
     assert.equal(report.source.id, "run-1");
   } finally {
@@ -193,7 +329,7 @@ test("cto: explicit unknown run id throws a clear error", () => {
   const cwd = tmpWorkspace();
   try {
     writeRun(cwd, makeCtoState());
-    assert.throws(() => buildSessionReport(cwd, { kind: "cto", id: "ghost" }), /cto session "ghost" not found/);
+    assert.throws(() => buildSessionReport(reportStorageFor(cwd), { kind: "cto", id: "ghost" }, reportOptions(cwd, CTO_FIXTURE)), /cto session "ghost" not found/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -211,7 +347,7 @@ test("cto: absent observability → null rollup, CTO-specific warning, chronolog
     // chronology falls back to state-sourced entries (no event stream).
     writeRun(cwd, makeCtoState());
 
-    const report = buildSessionReport(cwd, { kind: "cto" });
+    const report = buildSessionReport(reportStorageFor(cwd), { kind: "cto" }, reportOptions(cwd, CTO_FIXTURE));
 
     assert.equal(report.telemetry.rollup, null, "no rollup when observability is absent");
     assert.ok(
@@ -233,21 +369,12 @@ test("cto: absent observability → null rollup, CTO-specific warning, chronolog
 
 // ── Stage provenance (agents / inputs / outputs) ────────────────────────────
 
-test("cto: workflow stages carry profile agents/inputs/outputs; team stages carry lead provenance", () => {
+test("cto: workflow stages carry profile agents/inputs/outputs; persisted qualified team refs carry lead provenance", () => {
   const cwd = tmpWorkspace();
   try {
     writeRun(cwd, makeCtoState());
-    const ompDir = join(cwd, ".omp");
-    mkdirSync(ompDir, { recursive: true });
-    writeFileSync(
-      join(ompDir, "teams.json"),
-      JSON.stringify([
-        { id: "alpha", name: "Alpha", scope: ["backend"], profile: "standard", lead: "team-lead-alpha", roster: ["developer-kotlin"] },
-        { id: "beta", name: "Beta", scope: ["frontend"], profile: "standard", lead: "team-lead-beta", roster: ["frontend"] },
-      ]),
-    );
 
-    const report = buildSessionReport(cwd, { kind: "cto" });
+    const report = buildSessionReport(reportStorageFor(cwd), { kind: "cto" }, reportOptions(cwd, CTO_FIXTURE));
 
     // Single stage: resolved agent + original role.
     const arch = report.stages.find((s) => s.id === "architecture");
@@ -276,7 +403,7 @@ test("cto: workflow stages carry profile agents/inputs/outputs; team stages carr
     assert.deepEqual(teams?.inputs, ["architecture"]);
     assert.deepEqual(teams?.outputs, ["team_artifacts"]);
 
-    // CTO team stages: lead provenance from the teams.json registry.
+    // CTO team stages: lead provenance from persisted qualified plan/state refs.
     assert.deepEqual(report.stages.find((s) => s.id === "team:alpha")?.agents, [
       { name: "team-lead-alpha", role: "team-lead", source: "workflow" },
     ]);
@@ -320,7 +447,7 @@ test("cto: profile-backed workflow stages carry a reconstructed promptPreview; d
   try {
     writeRun(cwd, makeCtoState());
 
-    const report = buildSessionReport(cwd, { kind: "cto" });
+    const report = buildSessionReport(reportStorageFor(cwd), { kind: "cto" }, reportOptions(cwd, CTO_FIXTURE));
 
     // Representative orchestrator stage: title/id/type, session task,
     // truthful main-session descriptor, declared outputs + profile metadata.
@@ -364,21 +491,20 @@ test("cto: profile-backed workflow stages carry a reconstructed promptPreview; d
   }
 });
 
-test("cto: without a teams.json registry, team stages claim no lead (never invented)", () => {
+test("cto: team stages use persisted qualified lead refs without a cwd registry", () => {
   const cwd = tmpWorkspace();
   try {
     writeRun(cwd, makeCtoState());
 
-    const report = buildSessionReport(cwd, { kind: "cto" });
+    const report = buildSessionReport(reportStorageFor(cwd), { kind: "cto" }, reportOptions(cwd, CTO_FIXTURE));
 
     const alpha = report.stages.find((s) => s.id === "team:alpha");
-    assert.equal(alpha?.agents, undefined, "no registry entry → no invented lead/model");
+    assert.deepEqual(alpha?.agents, [{ name: "team-lead-alpha", role: "team-lead", source: "workflow" }]);
     assert.equal(alpha?.inputs, undefined, "team stages are derived, not def-backed → no input claim");
     assert.equal(alpha?.outputs, undefined);
     assert.equal(alpha?.promptPreview, undefined, "derived team stages have no StageDef → no preview");
-    // Existing fields still intact.
-    assert.equal(alpha?.status, "done");
-    assert.equal(alpha?.team, "alpha");
+    const beta = report.stages.find((s) => s.id === "team:beta");
+    assert.deepEqual(beta?.agents, [{ name: "team-lead-beta", role: "team-lead", source: "workflow" }]);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -394,12 +520,18 @@ test("cto: standby run derives pending cto_discovery and decomposition stages", 
       cwd,
       makeCtoState({
         standby: true,
-        plan: { id: "run-1", task: "Build the report feature", teams: [], created_at: "2026-08-08T09:00:00.000Z" },
+        plan: {
+          id: "run-1",
+          task: "Build the report feature",
+          teams: [],
+          created_at: "2026-08-08T09:00:00.000Z",
+          run_identity: CTO_FIXTURE.run_identity,
+        },
         teams: [],
       }),
     );
 
-    const report = buildSessionReport(cwd, { kind: "cto" });
+    const report = buildSessionReport(reportStorageFor(cwd), { kind: "cto" }, reportOptions(cwd, CTO_FIXTURE));
 
     assert.equal(report.stages.find((s) => s.id === "cto_discovery")?.status, "pending", "standby keeps discovery pending");
     assert.equal(report.stages.find((s) => s.id === "decomposition")?.status, "pending", "standby with no teams keeps decomposition pending");

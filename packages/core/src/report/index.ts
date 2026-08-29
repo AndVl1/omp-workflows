@@ -1,19 +1,36 @@
 /**
- * Session-report public surface (pragmatic architecture).
+ * Session-report public surface.
  *
- * build → render → write, all dependency-free:
- * - `buildSessionReport` reads + normalizes TeamState/CtoState into
- *   `SessionReport` (state-first; bounded optional telemetry).
- * - `renderReportHtml` is the pure, self-contained HTML renderer
- *   (implemented in html.ts, exported through this barrel).
- * - `writeReport` persists the HTML under `.work-state` with mode 0600 and
- *   rejects any target outside `.work-state`.
+ * Report assembly and publication consume an instance-issued,
+ * descriptor-relative storage authority. Callers must adapt their owning
+ * project/run authority through `createReportStorageAuthority`; report code
+ * never discovers a root or accepts a pathname authority.
  */
 
 export {
   buildSessionReport,
   writeReport,
 } from "./assemble.js";
+export {
+  createReportStorageAuthority,
+  isReportStorageAuthority,
+  isReportTreeStorageAuthority,
+  replaceStorageTreeAtomic,
+} from "./storage.js";
+export type {
+  ReportStorageAuthority,
+  ReportStorageOperations,
+  ReportTreeStorageAuthority,
+  ReportTreeStorageOperations,
+  StorageEntry,
+  StorageFailure,
+  StorageFailureReason,
+  StorageResult,
+  StorageStat,
+  StorageTreeEntry,
+  StorageTreeLimits,
+  StorageTreePublishResult,
+} from "./storage.js";
 export { renderReportHtml } from "./html.js";
 export { renderMarkdownDocumentHtml } from "./markdown.js";
 export type { MarkdownDocumentOptions } from "./markdown.js";

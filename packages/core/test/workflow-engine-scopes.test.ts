@@ -1,3 +1,4 @@
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core --> */
 /**
  * Durable checkpoint decisions and bounded loop re-entry (scopes 4-5):
  *   - interactive and routing-autonomy checkpoint attempts persist no
@@ -15,14 +16,80 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { createCapability, authorizeDispatch, completeDispatch, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
+import { agentRef, qualifiedRoster, readWorkflowProfile, workIdentityScopeFixture, workflowV2Fixture, type WorkflowV2TestFixture } from "./workflow-v2-fixtures.js";
+import { validateWorkflowRunIdentity } from "../src/workflow-v2/identity.js";
+import { createCapability, authorizeDispatch, completeDispatch, advanceCursor as advanceCursorRaw, recordCheckpointDecision, type CapabilityContext, type DispatchAuth, type IssuedCapability, type TransitionResult } from "../src/engine/durable.js";
+import { validateTypedControlPlane } from "../src/engine/workflow-contract.js";
+import { resolveProfileControlPlane } from "../src/engine/profile.js";
 import { appendCheckpointDecision, checkpointAnswerBinding, checkpointPolicyHash, recordTrustedCheckpointAnswer, validateCheckpointDecision } from "../src/engine/checkpoints.js";
 import { writeState } from "../src/engine/state.js";
 import { run } from "../src/engine/run.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TaskCaller } from "../src/engine/stage.js";
+
+const FIXTURES = new Map<string, WorkflowV2TestFixture>();
+
+function fixtureFor(profile: Profile): WorkflowV2TestFixture {
+  return workflowV2Fixture(profile);
+}
+function sameRunIdentity(left: WorkflowV2TestFixture["run_identity"], right: WorkflowV2TestFixture["run_identity"]): boolean {
+  const leftKey = [
+    left.root_instance_id,
+    left.provider_id,
+    left.descriptor_fingerprint,
+    left.executable_provenance.build_fingerprint,
+    left.executable_provenance.runtime_fingerprint,
+    left.catalog_content_digest,
+    left.config_byte_sha256,
+    left.config_semantic_sha256,
+    left.session.session_id,
+    left.session.lifecycle_id,
+    left.run_id,
+    left.profile_identity.id,
+    left.profile_identity.fingerprint,
+  ];
+  const rightKey = [
+    right.root_instance_id,
+    right.provider_id,
+    right.descriptor_fingerprint,
+    right.executable_provenance.build_fingerprint,
+    right.executable_provenance.runtime_fingerprint,
+    right.catalog_content_digest,
+    right.config_byte_sha256,
+    right.config_semantic_sha256,
+    right.session.session_id,
+    right.session.lifecycle_id,
+    right.run_id,
+    right.profile_identity.id,
+    right.profile_identity.fingerprint,
+  ];
+  return JSON.stringify(leftKey) === JSON.stringify(rightKey);
+}
+
+function contextFor(issued: IssuedCapability): CapabilityContext {
+  const fixture = FIXTURES.get(issued.capability_id);
+  assert.ok(fixture, "capability fixture must be registered before dispatch");
+  return {
+    project_identity: fixture.project_identity,
+    run_identity: issued.state.issued_for!.run_identity,
+    catalog: fixture.catalog,
+    effective_policy: fixture.effective_policy,
+    agent_inventory: fixture.agent_inventory,
+  };
+}
+
+function advanceCursor(root: string, input: DispatchAuth): TransitionResult {
+  const fixture = FIXTURES.get(input.capability_id);
+  assert.ok(fixture, "capability fixture must be registered before cursor advancement");
+  return advanceCursorRaw(root, input, {
+    project_identity: input.project_identity,
+    run_identity: input.run_identity,
+    catalog: fixture.catalog,
+    effective_policy: fixture.effective_policy,
+    agent_inventory: fixture.agent_inventory,
+  });
+}
 
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
 
@@ -41,24 +108,55 @@ function setupStage(
   stageId: string,
   kind: "single" | "consilium",
   roster: Array<{ role: string; agent: string }>,
-): { issued: ReturnType<typeof createCapability>; artifactsDir: string } {
-  const persistedHash = profileHash(profile);
-  const issued = createCapability({
-    run_key: branch, branch, workflow: profile.name, profile_hash: persistedHash,
-    stage_cursor: stageId, kind, expected_roster: roster,
+): { issued: IssuedCapability; artifactsDir: string } {
+  const fixture = fixtureFor(profile);
+  const work_identity_scope = workIdentityScopeFixture(fixture, {
+    workflow: profile.name,
+    stage_id: stageId,
+    slot_id: roster[0]!.role,
   });
+  const checkpointPolicy = resolveProfileControlPlane(profile, stageId).checkpoint_policy;
+  const persistedHash = fixture.profile_identity.fingerprint;
+  const issued = createCapability({
+    run_key: branch,
+    branch,
+    workflow: profile.name,
+    profile_hash: persistedHash,
+    stage_cursor: stageId,
+    kind,
+    expected_roster: qualifiedRoster(fixture, roster),
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    work_identity_scope,
+  });
+  FIXTURES.set(issued.capability_id, fixture);
   // Preserve durable loop/checkpoint/fan-in state across stage transitions
   // (advanceCursor carries it forward; the test helper must not wipe it).
   const existingPath = join(root, ".work-state", "features", "loop", "state.json");
-  let carried: Partial<Pick<TeamState, "loop_state" | "checkpoint_decisions" | "slot_artifacts" | "join_summary">> = {};
+  let carried: Partial<Pick<TeamState, "loop_state" | "checkpoint_decisions" | "slot_artifacts" | "join_summary" | "retired_capabilities">> = {};
   try {
     const existing = JSON.parse(readFileSync(existingPath, "utf8")) as TeamState;
+    const hasJoinSummary = Object.prototype.hasOwnProperty.call(existing, "join_summary");
+    const existingJoinSummary = existing.join_summary as unknown;
+    const summaryRecord = existingJoinSummary !== null
+      && typeof existingJoinSummary === "object"
+      && !Array.isArray(existingJoinSummary)
+      ? existingJoinSummary as { run_identity?: unknown }
+      : null;
+    const summaryRun = summaryRecord ? validateWorkflowRunIdentity(summaryRecord.run_identity) : null;
+    const summaryValidation = hasJoinSummary
+      ? validateTypedControlPlane({ join_summary: existingJoinSummary })
+      : null;
     carried = {
       ...(existing.loop_state ? { loop_state: existing.loop_state } : {}),
       ...(existing.checkpoint_decisions ? { checkpoint_decisions: existing.checkpoint_decisions } : {}),
       ...(existing.slot_artifacts ? { slot_artifacts: existing.slot_artifacts } : {}),
-      ...(existing.join_summary ? { join_summary: existing.join_summary } : {}),
+      ...(hasJoinSummary ? { join_summary: existing.join_summary } : {}),
+      ...(existing.retired_capabilities !== undefined ? { retired_capabilities: existing.retired_capabilities } : {}),
     };
+    if (summaryValidation?.ok && summaryRun?.ok && !sameRunIdentity(summaryRun.value, fixture.run_identity)) {
+      delete carried.join_summary;
+    }
   } catch {
     // first stage setup: nothing to carry
   }
@@ -66,7 +164,10 @@ function setupStage(
     schema: 1,
     branch,
     run_key: branch,
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
     classification: classification(profile.name, false),
+    workflow: profile.name,
     task: "loop test",
     workflow_override: false,
     issue: null,
@@ -75,6 +176,8 @@ function setupStage(
     artifacts: {},
     pause: { kind: "none", reason: "" },
     policy: { strict_orchestrator: true },
+    ...(checkpointPolicy ? { checkpoint_policy: checkpointPolicy } : {}),
+    work_identity: issued.work_identity,
     profile_hash: persistedHash,
     scope: NO_SCOPE,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
@@ -87,7 +190,7 @@ function setupStage(
   return { issued, artifactsDir };
 }
 
-function authOf(issued: ReturnType<typeof createCapability>, role: string, agent: string) {
+function authOf(issued: IssuedCapability, role: string, agent: string) {
   return {
     token: issued.dispatch_token,
     capability_id: issued.capability_id,
@@ -97,12 +200,14 @@ function authOf(issued: ReturnType<typeof createCapability>, role: string, agent
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    project_identity: issued.state.project_identity,
+    run_identity: issued.state.run_identity,
     role,
     agent,
+    agent_ref: agentRef(agent),
   };
 }
-
-function advanceAuth(issued: ReturnType<typeof createCapability>) {
+function advanceAuth(issued: IssuedCapability): DispatchAuth {
   return {
     token: issued.advance_token,
     capability_id: issued.capability_id,
@@ -112,8 +217,12 @@ function advanceAuth(issued: ReturnType<typeof createCapability>) {
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    project_identity: issued.state.project_identity,
+    run_identity: issued.state.run_identity,
   };
 }
+
+
 
 function readState(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "features", "loop", "state.json"), "utf8")) as TeamState;
@@ -125,6 +234,8 @@ function typedCheckpoint(root: string, stageId: string, checkpointId: string, de
   const capability = state.dispatch_capability;
   assert.ok(policy, "checkpoint test state must carry a typed policy");
   assert.ok(capability?.capability_id && capability.issued_for?.cursor_epoch, "checkpoint test state must carry capability binding");
+  const work_identity = state.work_identity;
+  assert.ok(work_identity?.run_id, "checkpoint test state must carry canonical work identity");
   const rule = policy.rules[checkpointId];
   assert.ok(rule, `checkpoint test policy must define ${checkpointId}`);
   const trusted = recordTrustedCheckpointAnswer(state, {
@@ -137,7 +248,8 @@ function typedCheckpoint(root: string, stageId: string, checkpointId: string, de
   });
   writeState(root, trusted.state, { featureSlug: "loop" });
   return {
-    run_id: state.work_identity?.run_id ?? state.run_key ?? state.branch,
+    run_identity: state.run_identity,
+    run_id: work_identity.run_id,
     stage_id: stageId,
     checkpoint_id: checkpointId,
     checkpoint_kind: rule.kind,
@@ -203,8 +315,7 @@ test("checkpoint: unresolved declared checkpoint blocks advance; an explicit typ
   const root = mkdtempSync(join(tmpdir(), "ck-block-"));
   try {
     initGit(root, "feat/ck");
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
+    const profile = readWorkflowProfile("lightweight");
     const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
     const { issued, artifactsDir } = setupStage(root, "feat/ck", profile, "implementation", "single", roster);
     writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "evidence", files_touched: ["x"] }));
@@ -241,8 +352,7 @@ test("checkpoint: hard-human authorization requires a durable answer proof, not 
   const root = mkdtempSync(join(tmpdir(), "ck-provenance-"));
   try {
     initGit(root, "feat/ck-provenance");
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
+    const profile = readWorkflowProfile("lightweight");
     const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
     setupStage(root, "feat/ck-provenance", profile, "implementation", "single", roster);
 
@@ -301,7 +411,7 @@ test("checkpoint: hard-human authorization requires a durable answer proof, not 
     for (const candidate of mismatches) {
       const rejected = validateCheckpointDecision(state, candidate, { stage });
       assert.equal(rejected.ok, false, "mismatched durable answer context must fail closed");
-      if (!rejected.ok) assert.equal(rejected.code, "checkpoint_unverified");
+      if (!rejected.ok) assert.equal(rejected.code, candidate.run_id === "stale-run" ? "IDENTITY_MISMATCH" : "checkpoint_unverified");
     }
 
     const persisted = appendCheckpointDecision(state, valid);
@@ -324,8 +434,7 @@ test("checkpoint: routing autonomy stays orthogonal to profile consent; migratio
   const root = mkdtempSync(join(tmpdir(), "ck-policy-orthogonal-"));
   try {
     initGit(root, "feat/ck-policy");
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
+    const profile = readWorkflowProfile("lightweight");
     const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
     const { issued, artifactsDir } = setupStage(root, "feat/ck-policy", profile, "implementation", "single", roster);
     writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "evidence", files_touched: ["x"] }));
@@ -383,8 +492,7 @@ test("checkpoint: typed recording is idempotent; conflicting decisions fail and 
   const root = mkdtempSync(join(tmpdir(), "ck-replace-"));
   try {
     initGit(root, "feat/ck");
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
+    const profile = readWorkflowProfile("lightweight");
     const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
     const { issued } = setupStage(root, "feat/ck", profile, "implementation", "single", roster);
     const typed = typedCheckpoint(root, "implementation", "approve_implementation");
@@ -398,7 +506,7 @@ test("checkpoint: typed recording is idempotent; conflicting decisions fail and 
       /migration_conflict/,
       "a second answer cannot replace an existing checkpoint decision",
     );
-    const wrongName = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "bogus", mode: "interactive", decision: "x", actor: "user", rationale: "r" });
+    const wrongName = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "bogus", mode: "interactive", decision: "x", actor: "user", rationale: "r" }, contextFor(issued));
     assert.equal(wrongName.ok, false);
     if (!wrongName.ok) assert.match(wrongName.error, /typed checkpoint authorization and actor provenance/);
   } finally {
@@ -411,9 +519,7 @@ test("loop: FAIL until re-enters back_to with a fresh capability and durable his
   const root = mkdtempSync(join(tmpdir(), "loop-reenter-"));
   try {
     initGit(root, "feat/loop");
-    registerWorkflowProfiles([LOOP_PROFILE]);
-    const profile = loadProfile("loop-regression");
-    assert.ok(profile);
+    const profile = LOOP_PROFILE;
 
     const verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
       writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "cause", explanation: "why" }));
@@ -430,7 +536,11 @@ test("loop: FAIL until re-enters back_to with a fresh capability and durable his
     assert.equal(state.stages.find((s) => s.id === "diagnose")?.status, "in_progress");
     assert.equal(state.dispatch_capability?.status, "ready", "re-entry arms a fresh ready capability");
     assert.equal(state.dispatch_capability?.kind, "single");
-    assert.deepEqual(state.dispatch_capability?.expected_roster, [{ role: "diagnostics", agent: "diagnostics" }]);
+    assert.deepEqual(state.dispatch_capability?.expected_roster, [{
+      role: "diagnostics",
+      agent: "diagnostics",
+      agent_ref: agentRef("diagnostics"),
+    }], "re-entry keeps the provider-qualified roster");
     assert.equal(state.loop_state?.reentries, 1);
     assert.equal(state.loop_state?.status, "running");
     assert.equal(state.loop_state?.history.length, 1);
@@ -452,9 +562,7 @@ test("loop: full debug cycle re-enters twice, then exhausts to needs_human", () 
   const root = mkdtempSync(join(tmpdir(), "loop-exhaust-"));
   try {
     initGit(root, "feat/loop");
-    registerWorkflowProfiles([LOOP_PROFILE]);
-    const profile = loadProfile("loop-regression");
-    assert.ok(profile);
+    const profile = LOOP_PROFILE;
 
     // Iteration 1: verify FAIL -> re-enter diagnose (reentries 1).
     let verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
@@ -510,9 +618,7 @@ test("loop: until PASS exits the loop and advances normally; on_exhausted failed
   const root = mkdtempSync(join(tmpdir(), "loop-pass-"));
   try {
     initGit(root, "feat/loop");
-    registerWorkflowProfiles([LOOP_PROFILE]);
-    const profile = loadProfile("loop-regression");
-    assert.ok(profile);
+    const profile = LOOP_PROFILE;
 
     // First FAIL -> re-enter.
     let verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
@@ -548,9 +654,7 @@ test("loop: until PASS exits the loop and advances normally; on_exhausted failed
       name: "loop-fail-regression",
       stages: LOOP_PROFILE.stages.map((s) => s.id === "verify" ? { ...s, loop: { ...s.loop!, on_exhausted: "failed", max_iterations: 1 } } : s),
     };
-    registerWorkflowProfiles([failProfile]);
-    const failP = loadProfile("loop-fail-regression");
-    assert.ok(failP);
+    const failP = failProfile;
     const verifyF = runSingleStage(root, failP, "verify", ["debug"], (dir) => {
       writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c", explanation: "e" }));
       writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" }));
@@ -584,15 +688,17 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
   const branch = "feat/interp";
   try {
     initGit(root, branch);
-    registerWorkflowProfiles([LOOP_PROFILE]);
-    const profile = loadProfile("loop-regression");
-    assert.ok(profile);
     const checkpointProfile: Profile = {
       ...LOOP_PROFILE,
       name: "interp-checkpoint",
       stages: LOOP_PROFILE.stages.map((s) => s.id === "diagnose" ? { ...s, checkpoint: "approve_diagnosis" } : s),
     };
-    registerWorkflowProfiles([checkpointProfile]);
+    const checkpointFixture = fixtureFor(checkpointProfile);
+    const checkpointWorkIdentityScope = workIdentityScopeFixture(checkpointFixture, {
+      workflow: "interp-checkpoint",
+      stage_id: "diagnose",
+      slot_id: "diagnostics",
+    });
 
     const interactive: TaskCaller = {
       async call(args) {
@@ -604,10 +710,16 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
     const interactiveResult = await run({
       task: "interactive checkpoint",
       cwd: root,
+      run_identity: checkpointFixture.run_identity,
+      work_identity_scope: checkpointWorkIdentityScope,
       branch,
       autonomous: false,
       classification: { type: "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "interp-checkpoint" },
       taskTool: interactive,
+      project_identity: checkpointFixture.project_identity,
+      catalog: checkpointFixture.catalog,
+      effective_policy: checkpointFixture.effective_policy,
+      agent_inventory: checkpointFixture.agent_inventory,
     });
     assert.ok(
       interactiveResult.outcomes.some((o) => o.status === "failed" && /checkpoint 'approve_diagnosis'/.test(o.note)),
@@ -640,10 +752,16 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
       const autoResult = await run({
         task: "autonomous checkpoint",
         cwd: root2,
+        run_identity: checkpointFixture.run_identity,
+        work_identity_scope: checkpointWorkIdentityScope,
         branch,
         autonomous: true,
         classification: { type: "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: true, workflow: "interp-checkpoint" },
         taskTool: autonomous,
+        project_identity: checkpointFixture.project_identity,
+        catalog: checkpointFixture.catalog,
+        effective_policy: checkpointFixture.effective_policy,
+        agent_inventory: checkpointFixture.agent_inventory,
       });
       assert.equal(autoResult.outcomes.some((o) => o.status === "failed"), true, "routing autonomy cannot auto-proceed");
       const state = JSON.parse(readFileSync(autoResult.statePath!, "utf8")) as TeamState;
@@ -682,11 +800,16 @@ test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash
         { id: "noop", title: "Noop", type: "none" },
       ],
     };
-    registerWorkflowProfiles([allTypesProfile]);
+    const allTypesFixture = fixtureFor(allTypesProfile);
     const taskTool: TaskCaller = {
       async call() { return { id: "x", output: "ok", artifacts: {}, exitCode: 0 }; },
       async batch() { return []; },
     };
+    const allTypesWorkIdentityScope = workIdentityScopeFixture(allTypesFixture, {
+      workflow: "interp-checkpoint-all-types",
+      stage_id: "discovery",
+      slot_id: "discovery",
+    });
     const baseClassification = { type: "FEATURE" as const, complexity: "MEDIUM" as const, confidence: "HIGH" as const };
 
     // Interactive: the orchestrator's declared checkpoint blocks advance and
@@ -694,10 +817,16 @@ test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash
     const interactiveResult = await run({
       task: "interactive all-types",
       cwd: root,
+      run_identity: allTypesFixture.run_identity,
+      work_identity_scope: allTypesWorkIdentityScope,
       branch,
       autonomous: false,
       classification: { ...baseClassification, autonomous: false, workflow: "interp-checkpoint-all-types" },
       taskTool,
+      project_identity: allTypesFixture.project_identity,
+      catalog: allTypesFixture.catalog,
+      effective_policy: allTypesFixture.effective_policy,
+      agent_inventory: allTypesFixture.agent_inventory,
     });
     assert.ok(
       interactiveResult.outcomes.some((o) => o.status === "failed" && /checkpoint 'confirm_understanding' for stage 'discovery' is unresolved/.test(o.note)),
@@ -715,12 +844,18 @@ test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash
     try {
       initGit(root2, branch);
       const autoResult = await run({
+        run_identity: allTypesFixture.run_identity,
+        work_identity_scope: allTypesWorkIdentityScope,
         task: "autonomous all-types",
         cwd: root2,
         branch,
         autonomous: true,
         classification: { ...baseClassification, autonomous: true, workflow: "interp-checkpoint-all-types" },
         taskTool,
+        project_identity: allTypesFixture.project_identity,
+        catalog: allTypesFixture.catalog,
+        effective_policy: allTypesFixture.effective_policy,
+        agent_inventory: allTypesFixture.agent_inventory,
       });
       assert.equal(autoResult.outcomes.some((o) => o.status === "failed"), true, "autonomous routing cannot auto-proceed");
       const autoState = JSON.parse(readFileSync(autoResult.statePath!, "utf8")) as TeamState;

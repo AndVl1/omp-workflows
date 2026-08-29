@@ -19,8 +19,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { createCapability, authorizeDispatch, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
+import { agentRef, readWorkflowProfile, workIdentityScopeFixture, workflowV2Fixture } from "./workflow-v2-fixtures.js";
+import { createCapability, authorizeDispatch, completeDispatch, reconcileTrustedTaskResult, advanceCursor, type CapabilityContext, type DispatchAuth, type IssuedCapability, type TransitionResult } from "../src/engine/durable.js";
 import {
   namespacedArtifactId,
   sanitizeSlot,
@@ -37,29 +37,60 @@ import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TaskCaller } from "../src/engine/stage.js";
 
+function fixtureFor(profileName: string) {
+  return workflowV2Fixture(readWorkflowProfile(profileName));
+}
+
+function contextFor(issued: IssuedCapability): CapabilityContext {
+  const fixture = fixtureFor(issued.state.issued_for!.run_identity.profile_identity.id);
+  return {
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    catalog: fixture.catalog,
+    effective_policy: fixture.effective_policy,
+    agent_inventory: fixture.agent_inventory,
+  };
+}
+
+function advance(root: string, issued: IssuedCapability, input: DispatchAuth): TransitionResult {
+  return advanceCursor(root, input, contextFor(issued));
+}
+
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
 }
 
-function writeFixtureState(root: string, profileName: string, stageId: string): ReturnType<typeof createCapability> {
-  const profile = loadProfile(profileName);
-  assert.ok(profile);
-  const persistedHash = profileHash(profile);
+function writeFixtureState(root: string, profileName: string, stageId: string): IssuedCapability {
+  const fixture = fixtureFor(profileName);
+  const profile = fixture.profile;
+  const persistedHash = fixture.profile_identity.fingerprint;
+  const expectedRoster = [
+    { role: "analyst#1", agent: "analyst", agent_ref: agentRef("analyst") },
+    { role: "tech-researcher", agent: "tech-researcher", agent_ref: agentRef("tech-researcher") },
+    { role: "analyst#2", agent: "analyst", agent_ref: agentRef("analyst") },
+  ];
+  const work_identity_scope = workIdentityScopeFixture(fixture, { workflow: profile.name, stage_id: stageId, slot_id: expectedRoster[0]!.role });
   const issued = createCapability({
-    run_key: "feat/fan", branch: "feat/fan", workflow: profile.name, profile_hash: persistedHash,
-    stage_cursor: stageId, kind: "consilium",
-    expected_roster: [
-      { role: "analyst#1", agent: "analyst" },
-      { role: "tech-researcher", agent: "tech-researcher" },
-      { role: "analyst#2", agent: "analyst" },
-    ],
+    run_key: "feat/fan",
+    branch: "feat/fan",
+    workflow: profile.name,
+    profile_hash: persistedHash,
+    stage_cursor: stageId,
+    kind: "consilium",
+    expected_roster: expectedRoster,
+    work_identity_scope,
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
   });
   writeState(root, {
     schema: 1,
     branch: "feat/fan",
     run_key: "feat/fan",
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    workflow: profile.name,
     classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: profileName },
     task: "fan-in",
     workflow_override: false,
@@ -71,33 +102,41 @@ function writeFixtureState(root: string, profileName: string, stageId: string): 
     policy: { strict_orchestrator: true },
     profile_hash: persistedHash,
     scope: NO_SCOPE,
+    work_identity: issued.work_identity,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
   }, { featureSlug: "fan" });
   return issued;
 }
-
-function writeSpecFixtureState(root: string): ReturnType<typeof createCapability> {
-  const profile = loadProfile("spec-preparation");
-  assert.ok(profile);
-  const persistedHash = profileHash(profile);
+function writeSpecFixtureState(root: string): IssuedCapability {
+  const fixture = fixtureFor("spec-preparation");
+  const profile = fixture.profile;
+  const persistedHash = fixture.profile_identity.fingerprint;
+  const expectedRoster = [
+    { role: "analyst", agent: "analyst", agent_ref: agentRef("analyst") },
+    { role: "tech-researcher", agent: "tech-researcher", agent_ref: agentRef("tech-researcher") },
+  ];
+  const work_identity_scope = workIdentityScopeFixture(fixture, { workflow: profile.name, stage_id: "intake_repo_map", slot_id: expectedRoster[0]!.role });
   const issued = createCapability({
     run_key: "main",
     branch: "main",
-    workflow: "spec-preparation",
+    workflow: profile.name,
     profile_hash: persistedHash,
     stage_cursor: "intake_repo_map",
     kind: "consilium",
-    expected_roster: [
-      { role: "analyst", agent: "analyst" },
-      { role: "tech-researcher", agent: "tech-researcher" },
-    ],
+    expected_roster: expectedRoster,
+    work_identity_scope,
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
   });
   writeState(root, {
     schema: 1,
     branch: "main",
     run_key: "main",
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+    workflow: profile.name,
     classification: { type: "SPEC", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "spec-preparation" },
     task: "spec intake",
     workflow_override: false,
@@ -109,12 +148,15 @@ function writeSpecFixtureState(root: string): ReturnType<typeof createCapability
     policy: { strict_orchestrator: true },
     profile_hash: persistedHash,
     scope: NO_SCOPE,
+    work_identity: issued.work_identity,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
   }, { featureSlug: "spec" });
   return issued;
 }
+
+
 
 function artifactsDir(root: string): string {
   const dir = join(root, ".work-state", "features", "fan", "artifacts");
@@ -131,7 +173,7 @@ function specArtifactsDir(root: string): string {
   return dir;
 }
 
-function completeSlot(root: string, issued: ReturnType<typeof createCapability>, role: string, agent: string, artifactIds: string[]): void {
+function completeSlot(root: string, issued: IssuedCapability, role: string, agent: string, artifactIds: string[]): void {
   const auth = {
     token: issued.dispatch_token,
     capability_id: issued.capability_id,
@@ -141,8 +183,11 @@ function completeSlot(root: string, issued: ReturnType<typeof createCapability>,
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    project_identity: issued.state.project_identity,
+    run_identity: issued.state.run_identity,
     role,
     agent,
+    agent_ref: agentRef(agent),
   };
   const authorized = authorizeDispatch(root, auth);
   assert.equal(authorized.ok, true, `authorize ${role}`);
@@ -152,7 +197,7 @@ function completeSlot(root: string, issued: ReturnType<typeof createCapability>,
   if (!completed.ok) throw new Error(`complete failed: ${completed.error}`);
 }
 
-function authorizeSlot(root: string, issued: ReturnType<typeof createCapability>, role: string, agent: string, toolCallId: string): void {
+function authorizeSlot(root: string, issued: IssuedCapability, role: string, agent: string, toolCallId: string): void {
   const auth = {
     token: issued.dispatch_token,
     capability_id: issued.capability_id,
@@ -162,8 +207,11 @@ function authorizeSlot(root: string, issued: ReturnType<typeof createCapability>
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    project_identity: issued.state.project_identity,
+    run_identity: issued.state.run_identity,
     role,
     agent,
+    agent_ref: agentRef(agent),
     tool_call_id: toolCallId,
   };
   const authorized = authorizeDispatch(root, auth);
@@ -279,9 +327,12 @@ test("fan-in: advance recovers native completions after slots wrote declared fil
     ] as const) {
       authorizeSlot(root, issued, role, agent, toolCallId);
       const reconciled = reconcileTrustedTaskResult(root, {
+        project_identity: issued.state.project_identity,
+        run_identity: issued.state.run_identity,
         tool_call_id: toolCallId,
         outcome: "succeeded",
         evidence: `${role} native result`,
+        pending: false,
       });
       assert.equal(reconciled.ok, true, `native reconciliation for ${role}`);
     }
@@ -291,7 +342,7 @@ test("fan-in: advance recovers native completions after slots wrote declared fil
     writeFileSync(join(dir, "exploration-analyst-2.json"), JSON.stringify(EXPLORATION("three", ["c.ts"])));
     writeFileSync(join(dir, "dod-analyst-1.json"), JSON.stringify({ items: [{ criterion: "c", verify_method: "v", status: "pending" }] }));
 
-    const advanced = advanceCursor(root, {
+    const advanced = advance(root, issued, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: issued.state.issued_for!.run_key,
@@ -300,6 +351,8 @@ test("fan-in: advance recovers native completions after slots wrote declared fil
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      project_identity: issued.state.project_identity,
+      run_identity: issued.state.run_identity,
       evidence: "native consilium outputs reconciled",
     });
     assert.equal(advanced.ok, true, "native completion without ids is repaired from slot-scoped files");
@@ -326,16 +379,19 @@ test("spec-preparation: native consilium completion advances from slot-scoped ou
     ] as const) {
       authorizeSlot(root, issued, role, agent, toolCallId);
       const reconciled = reconcileTrustedTaskResult(root, {
+        project_identity: issued.state.project_identity,
+        run_identity: issued.state.run_identity,
         tool_call_id: toolCallId,
         outcome: "succeeded",
         evidence: `${role} native result`,
+        pending: false,
       });
       assert.equal(reconciled.ok, true, `native reconciliation for ${role}`);
     }
     writeFileSync(join(dir, "spec_intake_repo_map-analyst.json"), JSON.stringify({ facts: [{ source: "analyst" }] }));
     writeFileSync(join(dir, "spec_intake_repo_map-tech-researcher.json"), JSON.stringify({ facts: [{ source: "research" }] }));
 
-    const advanced = advanceCursor(root, {
+    const advanced = advance(root, issued, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: issued.state.issued_for!.run_key,
@@ -344,6 +400,8 @@ test("spec-preparation: native consilium completion advances from slot-scoped ou
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      project_identity: issued.state.project_identity,
+      run_identity: issued.state.run_identity,
       evidence: "spec intake complete",
     });
     assert.equal(advanced.ok, true, "spec-preparation intake transition succeeds");
@@ -373,6 +431,9 @@ test("fan-in: native artifact ids can bind before a slot file becomes readable",
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      project_identity: issued.state.project_identity,
+      run_identity: issued.state.run_identity,
+      agent_ref: agentRef("analyst"),
       role: "analyst",
       agent: "analyst",
       tool_call_id: "tool-spec-delayed-analyst",
@@ -381,9 +442,12 @@ test("fan-in: native artifact ids can bind before a slot file becomes readable",
     assert.equal(analystDispatch.ok, true);
     assert.ok(analystDispatch.ok && analystDispatch.record);
     const analystNative = reconcileTrustedTaskResult(root, {
+      project_identity: issued.state.project_identity,
+      run_identity: issued.state.run_identity,
       tool_call_id: analystAuth.tool_call_id,
       outcome: "succeeded",
       evidence: "analyst native result",
+      pending: false,
     });
     assert.equal(analystNative.ok, true);
 
@@ -408,14 +472,18 @@ test("fan-in: native artifact ids can bind before a slot file becomes readable",
       ...analystAuth,
       role: "tech-researcher",
       agent: "tech-researcher",
+      agent_ref: agentRef("tech-researcher"),
       tool_call_id: "tool-spec-delayed-researcher",
     };
     const researcherDispatch = authorizeDispatch(root, researcherAuth);
     assert.equal(researcherDispatch.ok, true);
     const researcherNative = reconcileTrustedTaskResult(root, {
+      project_identity: issued.state.project_identity,
+      run_identity: issued.state.run_identity,
       tool_call_id: researcherAuth.tool_call_id,
       outcome: "succeeded",
       evidence: "researcher native result",
+      pending: false,
     });
     assert.equal(researcherNative.ok, true);
 
@@ -423,7 +491,7 @@ test("fan-in: native artifact ids can bind before a slot file becomes readable",
     // snapshot the already-bound analyst id and infer the still-empty slot.
     writeFileSync(join(dir, `${sharedId}.json`), JSON.stringify({ facts: [{ source: "analyst" }] }));
     writeFileSync(join(dir, `${sharedId}-tech-researcher.json`), JSON.stringify({ facts: [{ source: "research" }] }));
-    const advanced = advanceCursor(root, {
+    const advanced = advance(root, issued, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: issued.state.issued_for!.run_key,
@@ -432,6 +500,8 @@ test("fan-in: native artifact ids can bind before a slot file becomes readable",
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      project_identity: issued.state.project_identity,
+      run_identity: issued.state.run_identity,
       evidence: "delayed native artifacts recovered",
     });
     assert.equal(advanced.ok, true, advanced.ok ? "" : advanced.error);
@@ -575,7 +645,7 @@ test("fan-in: missing slot results block advance end to end", () => {
     completeSlot(root, issued, "tech-researcher", "tech-researcher", ["exploration-tech-researcher"]);
     // analyst#2 completed with NO artifacts -> empty slot -> advance blocked.
     completeSlot(root, issued, "analyst#2", "analyst", []);
-    const advanced = advanceCursor(root, {
+    const advanced = advance(root, issued, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: issued.state.issued_for!.run_key,
@@ -584,6 +654,8 @@ test("fan-in: missing slot results block advance end to end", () => {
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      project_identity: issued.state.project_identity,
+      run_identity: issued.state.run_identity,
       evidence: "exploration done",
     });
     assert.equal(advanced.ok, false, "empty slot blocks the handoff");
@@ -619,8 +691,11 @@ test("fan-in: collision (same slot writing the same artifact twice with differen
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      project_identity: issued.state.project_identity,
+      run_identity: issued.state.run_identity,
       role: "analyst#1",
       agent: "analyst",
+      agent_ref: agentRef("analyst"),
     };
     const authorized = authorizeDispatch(root, auth);
     assert.equal(authorized.ok, false, "role already dispatched (failed/cancelled required before re-dispatch)");
@@ -656,7 +731,7 @@ test("fan-in: a zero-artifact slot never inherits foreign shared content as its 
         { id: "summary", title: "Summary", type: "orchestrator", consumes: ["exploration"] },
       ],
     };
-    registerWorkflowProfiles([profile]);
+    const fixture = workflowV2Fixture(profile);
     const taskTool: TaskCaller = {
       async call() { return { id: "x", output: "ok", artifacts: {}, exitCode: 0 }; },
       async batch() {
@@ -675,6 +750,12 @@ test("fan-in: a zero-artifact slot never inherits foreign shared content as its 
       autonomous: false,
       classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "fan-free-rider" },
       taskTool,
+      project_identity: fixture.project_identity,
+      run_identity: fixture.run_identity,
+      catalog: fixture.catalog,
+      effective_policy: fixture.effective_policy,
+      agent_inventory: fixture.agent_inventory,
+      work_identity_scope: workIdentityScopeFixture(fixture, { workflow: profile.name, stage_id: "exploration", slot_id: "orchestrator" }),
     });
     const exploration = result.outcomes.find((o) => o.stageId === "exploration");
     assert.equal(exploration?.status, "failed", "a zero-artifact slot must fail the consilium stage");

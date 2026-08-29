@@ -24,7 +24,7 @@
  * weakens the nested-CTO prohibition.
  */
 
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { readDoD } from "../engine/dod.js";
 import { resolveWorkflow } from "../engine/profile.js";
@@ -32,15 +32,15 @@ import type { ModelClassification } from "../engine/run.js";
 import type { Complexity, Confidence, DoD, TaskType } from "../engine/types.js";
 import { activeWave, readCtoState } from "./state.js";
 import type { CtoState } from "./types.js";
+import { projectRuntimeKeyFor, isSafeCtoId, validateProjectIdentity, validateWorkflowRunIdentity } from "../workflow-v2/identity.js";
+import type { ProjectIdentity, WorkflowRunIdentity } from "../workflow-v2/types.js";
 
 /** Routing-marker prefix — a CTO slice task call carries `<!-- omp-cto-slice ... -->`. */
 export const CTO_SLICE_MARKER_PREFIX = "<!-- omp-cto-slice";
 
 const MAX_MARKER_TEXT_LENGTH = 16_384;
-const MAX_CTO_ID_LENGTH = 128;
 const MAX_WORKFLOW_LABEL_LENGTH = 64;
 const MAX_DOD_PATH_LENGTH = 512;
-const SAFE_CTO_ID_RE = /^[A-Za-z0-9._-]+$/;
 const SAFE_WORKFLOW_LABEL_RE = /^[A-Za-z0-9_-]+$/;
 
 const TASK_TYPES: readonly TaskType[] = ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"];
@@ -56,17 +56,6 @@ const SLICE_MARKER_RE = /<!-- omp-cto-slice run=([A-Za-z0-9._-]{1,128}) slice=([
 const SLICE_MARKER_GLOBAL_RE = /<!-- omp-cto-slice run=([A-Za-z0-9._-]{1,128}) slice=([A-Za-z0-9._-]{1,128}) -->/g;
 const MARKER_ATTEMPT_RE = /<!--\s*omp-cto-slice/;
 const MARKER_ATTEMPT_GLOBAL_RE = /<!--\s*omp-cto-slice/g;
-
-function isSafeCtoId(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    value.length <= MAX_CTO_ID_LENGTH &&
-    value !== "." &&
-    value !== ".." &&
-    SAFE_CTO_ID_RE.test(value)
-  );
-}
 
 function markerPrefixAttempted(text: string): boolean {
   if (text.length > MAX_MARKER_TEXT_LENGTH) return false;
@@ -226,12 +215,39 @@ export function validateSliceDoD(state: CtoState, teamId: string, root: string):
  *   5. the team's workflow passes validateSliceWorkflow;
  *   6. the team's per-slice DoD passes validateSliceDoD.
  */
+function ctoRunIdentityKey(identity: WorkflowRunIdentity): string {
+  return JSON.stringify([
+    projectRuntimeKeyFor(identity),
+    identity.run_id,
+    identity.profile_identity.id,
+    identity.profile_identity.fingerprint,
+  ]);
+}
+
 export function assertCtoSliceDispatchable(
   state: CtoState,
-  opts: { sliceId: string; root: string; markerRunId?: string },
+  opts: { sliceId: string; root: string; markerRunId?: string; runIdentity: WorkflowRunIdentity },
 ): { ok: true } | { ok: false; reason: string } {
   if (!state || typeof state !== "object" || !isSafeCtoId(state.id)) {
     return { ok: false, reason: "invalid canonical CtoState: unsafe or missing run id" };
+  }
+  const stateRun = validateWorkflowRunIdentity((state as unknown as { run_identity?: unknown }).run_identity);
+  const expectedRun = validateWorkflowRunIdentity(opts?.runIdentity);
+  if (!stateRun.ok || !expectedRun.ok) {
+    return {
+      ok: false,
+      reason: "MIGRATION_REQUIRED: CTO dispatch requires complete persisted and admitted WorkflowRunIdentity records",
+    };
+  }
+  try {
+    if (ctoRunIdentityKey(stateRun.value) !== ctoRunIdentityKey(expectedRun.value)) {
+      return {
+        ok: false,
+        reason: `IDENTITY_MISMATCH: CTO state run ${displayCtoId(state.id)} is not bound to the admitted workflow run identity`,
+      };
+    }
+  } catch {
+    return { ok: false, reason: "MIGRATION_REQUIRED: CTO run identity could not be validated" };
   }
   if (!opts || typeof opts !== "object" || !isSafeCtoId(opts.sliceId)) {
     return { ok: false, reason: "unsafe slice id: refusing CTO slice dispatch" };
@@ -357,20 +373,41 @@ function extractTaskMarkers(
 }
 
 /**
- * Find the active CTO wave anywhere in the workspace: scan
- * `<root>/.work-state/cto/<runId>/state.json` (guarded by existsSync;
- * unreadable/corrupt state skipped) for a run whose activeWave() is
- * non-null. Multiple active runs → the one with the latest `updated_at`,
- * breaking ties by run id. No active wave anywhere → null.
+ * Find the active CTO wave anywhere in the workspace. Raw bytes are used only
+ * to discover a candidate run identity; `readCtoState` then validates the
+ * complete state under that exact run identity before the wave is observed.
+ * A project identity narrows discovery to its bound project, while a run
+ * identity is required for authorization by the caller.
  */
-function findActiveWave(root: string): { runId: string; waveId: string } | null {
+function findActiveWave(
+  root: string,
+  expectedProjectIdentity?: ProjectIdentity,
+  expectedRunIdentity?: WorkflowRunIdentity,
+): { runId: string; waveId: string } | null {
   const ctoDir = join(root, ".work-state", "cto");
   if (!existsSync(ctoDir)) return null;
   let best: { runId: string; waveId: string; updatedAt: string } | null = null;
   for (const entry of readdirSync(ctoDir, { withFileTypes: true })) {
     if (!entry.isDirectory() || !isSafeCtoId(entry.name)) continue;
-    const state = readCtoState(entry.name, root);
-    if (!state) continue; // unreadable/corrupt — skip
+    let raw: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(join(ctoDir, entry.name, "state.json"), "utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      raw = parsed as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (raw.id !== entry.name) continue;
+    const checkedRun = validateWorkflowRunIdentity(raw.run_identity);
+    if (!checkedRun.ok) continue;
+    try {
+      if (expectedProjectIdentity && projectRuntimeKeyFor(checkedRun.value) !== projectRuntimeKeyFor(expectedProjectIdentity)) continue;
+      if (expectedRunIdentity && ctoRunIdentityKey(checkedRun.value) !== ctoRunIdentityKey(expectedRunIdentity)) continue;
+    } catch {
+      continue;
+    }
+    const state = readCtoState(entry.name, root, checkedRun.value);
+    if (!state) continue;
     const wave = activeWave(state);
     if (!wave) continue;
     const waveId = isSafeCtoId(wave.id) ? wave.id : "<invalid>";
@@ -386,6 +423,33 @@ function findActiveWave(root: string): { runId: string; waveId: string } | null 
   return best ? { runId: best.runId, waveId: best.waveId } : null;
 }
 
+interface ActiveWaveRouting {
+  runId: string;
+  waveId: string;
+  /** True only when the exact admitted run identity authorized observation. */
+  identityMatched: boolean;
+}
+
+/**
+ * Resolve a wave for no-marker routing without granting raw state authority.
+ * Project identity narrows discovery, but only the exact run identity can
+ * authorize a dispatch.
+ */
+function findActiveWaveForRouting(
+  root: string,
+  expectedProjectIdentity?: ProjectIdentity,
+  expectedRunIdentity?: WorkflowRunIdentity,
+): ActiveWaveRouting | null {
+  if (expectedRunIdentity) {
+    const bound = findActiveWave(root, expectedProjectIdentity, expectedRunIdentity);
+    if (bound) return { ...bound, identityMatched: true };
+  }
+  const observed = findActiveWave(root, expectedProjectIdentity);
+  if (observed) return { ...observed, identityMatched: false };
+  const raw = findActiveWave(root);
+  return raw ? { ...raw, identityMatched: false } : null;
+}
+
 /** Block reason for a task call whose payload carries no VALID marker. */
 function noMarkerBlockReason(active: { runId: string; waveId: string }, attempted: boolean, item: number | undefined): string {
   const expected = `<!-- omp-cto-slice run=${active.runId} slice=<sliceId> -->`;
@@ -395,6 +459,43 @@ function noMarkerBlockReason(active: { runId: string; waveId: string }, attempte
   }
   return `cto slice gate: active wave ${active.waveId} in run ${active.runId} — task tool call without a CTO slice marker${where}; add "${expected}" to the task payload or fold the work into the wave`;
 }
+
+/** Block a marker-bearing call when the host did not provide the v2 identity. */
+function identityRequiredForMarker(runId: string, sliceId: string, item: number | undefined): string {
+  const where = item !== undefined ? ` (batch task item ${item})` : "";
+  return `cto slice gate: MIGRATION_REQUIRED — workflow identity is required to dispatch CTO slice ${sliceId} for run ${runId}${where}; refusing legacy or unbound CTO routing`;
+}
+
+/** Block legacy/no-marker routing when an active wave cannot be identity-bound. */
+function identityRequiredForActiveWave(active: { runId: string; waveId: string }, item: number | undefined): string {
+  const where = item !== undefined ? ` (batch task item ${item})` : "";
+  return `cto slice gate: MIGRATION_REQUIRED — workflow identity is required to route active wave ${active.waveId} in run ${active.runId}${where}; refusing legacy or unbound CTO routing`;
+}
+
+/** Raw-only presence is a security guard: it can report identity drift, never authorize dispatch. */
+function identityMismatchForActiveWave(active: ActiveWaveRouting, item: number | undefined): string {
+  const where = item !== undefined ? ` (batch task item ${item})` : "";
+  return `cto slice gate: IDENTITY_MISMATCH — MIGRATION_REQUIRED: active wave ${active.waveId} in run ${active.runId}${where} is not bound to the admitted workflow identity; migrate the persisted state or start a fresh CTO lifecycle before routing work`;
+}
+
+/** Return the identity failure for raw/missing-context active-wave observations. */
+function activeWaveIdentityBlockReason(
+  active: ActiveWaveRouting,
+  expectedProjectIdentity: ProjectIdentity | undefined,
+  expectedRunIdentity: WorkflowRunIdentity | undefined,
+  item: number | undefined,
+): string | undefined {
+  if (!expectedProjectIdentity || !expectedRunIdentity) return identityRequiredForActiveWave(active, item);
+  if (!active.identityMatched) return identityMismatchForActiveWave(active, item);
+  return undefined;
+}
+
+/** Preserve the actionable path while identifying an unbound/mismatched state. */
+function noCtoStateBlockReason(runId: string, sliceId: string, item: number | undefined): string {
+  const where = item !== undefined ? ` (batch task item ${item})` : "";
+  return `no CtoState for run ${runId} at .work-state/cto/${runId}/state.json — cannot dispatch CTO slice ${sliceId}${where}; MIGRATION_REQUIRED: admitted workflow identity is required and must match persisted state`;
+}
+
 
 /**
  * `tool_call` gate wired into the chain AFTER classificationToolGate and
@@ -411,73 +512,149 @@ function noMarkerBlockReason(active: { runId: string; waveId: string }, attempte
  *   required marker format. A payload that attempts the marker prefix but
  *   fails parseCtoSliceMarker blocks with the expected format named. No
  *   active wave anywhere (standby runs, finished waves, no .work-state/cto
- *   dir, non-CTO projects) → undefined (allow).
+ *   dir, non-CTO projects) → undefined (allow). If only a raw wave is
+ *   observable, it is reported as an identity mismatch and never authorizes
+ *   dispatch.
  * - VALID marker present → the canonical CtoState for marker.runId is loaded
- *   and assertCtoSliceDispatchable decides; unreadable state with a clearly
+ *   with the admitted v2 identity; missing, mismatched, or unbound identity
+ *   blocks with MIGRATION_REQUIRED rather than dispatching.
+ *   assertCtoSliceDispatchable then decides; unreadable state with a clearly
  *   present marker blocks ("no CtoState ... cannot dispatch CTO slice").
  *   Batches validate EVERY item: the first item without a valid marker takes
  *   the fail-closed path (blocked when an active wave exists, item named); a
  *   batch is allowed only when every item's marker passes canonical
  *   validation (first failing item blocks with its run/slice named).
+ * - Active-wave discovery first attempts the context-bound identity. A raw
+ *   active wave found without a matching context identity blocks with
+ *   MIGRATION_REQUIRED/IDENTITY_MISMATCH instead of allowing legacy routing;
+ *   no active wave still preserves the ordinary no-marker allow path.
  * - Malformed input or state errors fail closed and block the task launch.
  */
 export function ctoSliceTaskGate(
   event: { toolName?: string; input?: unknown },
-  ctx: { cwd: string },
+  ctx: { cwd: string; project_identity?: ProjectIdentity; run_identity?: WorkflowRunIdentity },
 ): { block: true; reason: string } | undefined {
   try {
     if (event?.toolName !== "task") return undefined;
 
+    let projectIdentity: ProjectIdentity | undefined;
+    let runIdentity: WorkflowRunIdentity | undefined;
+    let contextIdentityMismatch = false;
+    const projectResult = validateProjectIdentity(ctx?.project_identity);
+    if (projectResult.ok) projectIdentity = projectResult.value;
+    const runResult = validateWorkflowRunIdentity(ctx?.run_identity);
+    if (runResult.ok) runIdentity = runResult.value;
+    if (projectIdentity && runIdentity) {
+      try {
+        contextIdentityMismatch = projectRuntimeKeyFor(projectIdentity) !== projectRuntimeKeyFor(runIdentity);
+      } catch {
+        contextIdentityMismatch = true;
+      }
+    }
+
     const parsed = extractTaskMarkers(event.input);
+
+    const activeReason = (
+      active: ActiveWaveRouting,
+      item: number | undefined,
+    ): string | undefined => {
+      if (contextIdentityMismatch) {
+        const where = item !== undefined ? ` (batch task item ${item})` : "";
+        return `cto slice gate: IDENTITY_MISMATCH — admitted project identity does not match the supplied workflow run identity${where}`;
+      }
+      return activeWaveIdentityBlockReason(active, projectIdentity, runIdentity, item);
+    };
 
     if (parsed.kind === "single") {
       if (!parsed.marker) {
-        const active = findActiveWave(ctx.cwd);
-        return active ? { block: true, reason: noMarkerBlockReason(active, parsed.attempted, undefined) } : undefined;
+        const active = findActiveWaveForRouting(ctx.cwd, projectIdentity, runIdentity);
+        if (!active) return undefined;
+        const identityReason = activeReason(active, undefined);
+        if (identityReason) return { block: true, reason: identityReason };
+        return { block: true, reason: noMarkerBlockReason(active, parsed.attempted, undefined) };
       }
-      const state = readCtoState(parsed.marker.runId, ctx.cwd);
+      if (contextIdentityMismatch) {
+        return {
+          block: true,
+          reason: `cto slice gate: IDENTITY_MISMATCH — admitted project identity does not match the supplied workflow run identity for CTO slice ${parsed.marker.sliceId}`,
+        };
+      }
+      if (!projectIdentity || !runIdentity) {
+        return { block: true, reason: identityRequiredForMarker(parsed.marker.runId, parsed.marker.sliceId, undefined) };
+      }
+      const state = readCtoState(parsed.marker.runId, ctx.cwd, runIdentity);
       if (!state) {
         return {
           block: true,
-          reason: `no CtoState for run ${parsed.marker.runId} at .work-state/cto/${parsed.marker.runId}/state.json — cannot dispatch CTO slice ${parsed.marker.sliceId}`,
+          reason: noCtoStateBlockReason(parsed.marker.runId, parsed.marker.sliceId, undefined),
         };
       }
-      const res = assertCtoSliceDispatchable(state, { sliceId: parsed.marker.sliceId, root: ctx.cwd, markerRunId: parsed.marker.runId });
+      const res = assertCtoSliceDispatchable(state, {
+        sliceId: parsed.marker.sliceId,
+        root: ctx.cwd,
+        markerRunId: parsed.marker.runId,
+        runIdentity,
+      });
       if (!res.ok) return { block: true, reason: `cto slice gate: ${res.reason}` };
       return undefined;
     }
 
     if (parsed.kind === "batch") {
       if (parsed.items.length === 0) {
-        const active = findActiveWave(ctx.cwd);
-        return active ? { block: true, reason: noMarkerBlockReason(active, false, undefined) } : undefined;
+        const active = findActiveWaveForRouting(ctx.cwd, projectIdentity, runIdentity);
+        if (!active) return undefined;
+        const identityReason = activeReason(active, undefined);
+        if (identityReason) return { block: true, reason: identityReason };
+        return { block: true, reason: noMarkerBlockReason(active, false, undefined) };
       }
       const missingIndex = parsed.items.findIndex((item) => item.marker === null);
-      const activeForMissing = missingIndex >= 0 ? findActiveWave(ctx.cwd) : null;
+      const activeForMissing = missingIndex >= 0
+        ? findActiveWaveForRouting(ctx.cwd, projectIdentity, runIdentity)
+        : null;
       if (missingIndex >= 0 && !activeForMissing) return undefined;
       for (let index = 0; index < parsed.items.length; index += 1) {
         const item = parsed.items[index]!;
         if (!item.marker) {
-          if (activeForMissing) return { block: true, reason: noMarkerBlockReason(activeForMissing, item.attempted, index) };
+          if (activeForMissing) {
+            const identityReason = activeReason(activeForMissing, index);
+            if (identityReason) return { block: true, reason: identityReason };
+            return { block: true, reason: noMarkerBlockReason(activeForMissing, item.attempted, index) };
+          }
           continue;
         }
         const marker = item.marker;
-        const state = readCtoState(marker.runId, ctx.cwd);
+        if (contextIdentityMismatch) {
+          return {
+            block: true,
+            reason: `cto slice gate: IDENTITY_MISMATCH — admitted project identity does not match the supplied workflow run identity for CTO slice ${marker.sliceId} (batch task item ${marker.item})`,
+          };
+        }
+        if (!projectIdentity || !runIdentity) {
+          return { block: true, reason: identityRequiredForMarker(marker.runId, marker.sliceId, index) };
+        }
+        const state = readCtoState(marker.runId, ctx.cwd, runIdentity);
         if (!state) {
           return {
             block: true,
-            reason: `no CtoState for run ${marker.runId} at .work-state/cto/${marker.runId}/state.json — cannot dispatch CTO slice ${marker.sliceId} (batch task item ${marker.item})`,
+            reason: noCtoStateBlockReason(marker.runId, marker.sliceId, marker.item),
           };
         }
-        const res = assertCtoSliceDispatchable(state, { sliceId: marker.sliceId, root: ctx.cwd, markerRunId: marker.runId });
+        const res = assertCtoSliceDispatchable(state, {
+          sliceId: marker.sliceId,
+          root: ctx.cwd,
+          markerRunId: marker.runId,
+          runIdentity,
+        });
         if (!res.ok) return { block: true, reason: `cto slice gate: ${res.reason} (batch task item ${marker.item})` };
       }
       return undefined;
     }
 
     if (parsed.kind === "ambiguous") {
-      const active = findActiveWave(ctx.cwd);
+      const active = findActiveWaveForRouting(ctx.cwd, projectIdentity, runIdentity);
       if (!active) return undefined;
+      const identityReason = activeReason(active, undefined);
+      if (identityReason) return { block: true, reason: identityReason };
       return {
         block: true,
         reason: `cto slice gate: active wave ${active.waveId} in run ${active.runId} — ambiguous task payload has both task and tasks fields; provide exactly one marker-bearing shape or fold the work into the wave`,
@@ -485,8 +662,11 @@ export function ctoSliceTaskGate(
     }
 
     // No task payload at all — fail closed while a wave is active.
-    const active = findActiveWave(ctx.cwd);
-    return active ? { block: true, reason: noMarkerBlockReason(active, false, undefined) } : undefined;
+    const active = findActiveWaveForRouting(ctx.cwd, projectIdentity, runIdentity);
+    if (!active) return undefined;
+    const identityReason = activeReason(active, undefined);
+    if (identityReason) return { block: true, reason: identityReason };
+    return { block: true, reason: noMarkerBlockReason(active, false, undefined) };
   } catch {
     return { block: true, reason: "cto slice gate: malformed dispatch input or unreadable state — refusing task launch" };
   }

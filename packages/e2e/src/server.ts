@@ -20,11 +20,26 @@
 
 import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
-import { basename, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
@@ -75,31 +90,122 @@ export function buildPtyEnv(
 }
 
 /**
- * Perm tightening for the session evidence files. The default umask is
- * 0o022, which leaves session.json + transcript.jsonl world-readable on
- * multi-user hosts — exposing the bearer token and the full PTY I/O.
- * writeFileSync({mode:0o600}) pins the mode at create time; chmodSync
- * is the belt-and-braces second pass because umask can still narrow
- * the effective bits on some platforms.
+ * Loader/preload/search-path injection variables stripped from
+ * DIAGNOSTIC (operator-trusted pair) launches. Exact names below; whole
+ * families (NODE_/BUN_/DYLD_ prefixes — loader, compile-cache and config
+ * hooks) are stripped by prefix. Stripping runs AFTER explicit
+ * overrides are applied, so nothing — not even a caller override — can
+ * reintroduce an injection vector.
+ */
+export const INJECTION_ENV_KEYS = [
+  'LD_PRELOAD',
+  'LD_LIBRARY_PATH',
+  'LIBPATH',
+  'PYTHONPATH',
+  'PYTHONHOME',
+  'RUBYOPT',
+  'RUBYLIB',
+  'PERL5OPT',
+  'PERL5LIB',
+] as const;
+export const INJECTION_ENV_PREFIXES = ['NODE_', 'BUN_', 'DYLD_'] as const;
+
+function isInjectionEnvKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  return (
+    (INJECTION_ENV_KEYS as readonly string[]).includes(upper) ||
+    INJECTION_ENV_PREFIXES.some(prefix => upper.startsWith(prefix))
+  );
+}
+
+/** Return a copy of `env` without loader/preload/search injection variables. */
+export function stripInjectionEnv(env: Readonly<Record<string, string>>): Record<string, string> {
+  const out: Record<string, string> = { ...env };
+  for (const key of Object.keys(out)) {
+    if (isInjectionEnvKey(key)) delete out[key];
+  }
+  return out;
+}
+
+/**
+ * Build the env for a DIAGNOSTIC launch (operator-trusted pair present).
+ * Minimal by construction: safe PATH/HOME/TMPDIR so the host binary and
+ * its subprocesses resolve, pinned TERM, then explicit caller overrides —
+ * finally the injection strip. Ambient vars (shell hooks, proxies,
+ * loader config, package-manager state) are NOT forwarded. Generic
+ * (non-diagnostic) launches keep `buildPtyEnv`.
+ */
+export function buildDiagnosticEnv(
+  baseEnv: Readonly<Record<string, string | undefined>>,
+  overrides: Readonly<Record<string, string>> | undefined,
+): Record<string, string> {
+  const env: Record<string, string> = { TERM: 'xterm-256color' };
+  for (const key of ['PATH', 'HOME', 'TMPDIR'] as const) {
+    const value = baseEnv[key];
+    if (value !== undefined && value.length > 0) env[key] = value;
+  }
+  Object.assign(env, overrides ?? {});
+  return stripInjectionEnv(env);
+}
+
+/**
+ * Perm tightening + no-follow for the session evidence files. The default
+ * umask is 0o022, which leaves session.json + transcript.jsonl
+ * world-readable on multi-user hosts — exposing the bearer token and the
+ * full PTY I/O. Evidence files are therefore written through a raw
+ * O_NOFOLLOW descriptor created 0600 (a symlinked leaf is rejected with
+ * ELOOP instead of followed), the mode is re-pinned via fchmod on the
+ * open descriptor, and fstat requires a REGULAR file. This is harness
+ * evidence hygiene only — it is NOT descriptor-relative workflow-storage
+ * authority.
  */
 export const SESSION_FILE_MODE = 0o600;
 export const SESSION_DIR_MODE = 0o700;
 
-function writeSessionFile(path: string, body: string): void {
-  writeFileSync(path, body, { mode: SESSION_FILE_MODE });
+/**
+ * Open an evidence file securely: O_NOFOLLOW where the platform defines
+ * it, 0600 creation mode, descriptor-level fchmod, regular-file fstat.
+ * `append: false` truncates (session.json rewrite); `append: true`
+ * positions at EOF (transcript / detach log). Returns the caller-owned
+ * descriptor.
+ */
+export function openEvidenceFd(path: string, append: boolean): number {
+  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+  const flags = append
+    ? fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | noFollow
+    : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | noFollow;
+  const fd = openSync(path, flags, SESSION_FILE_MODE);
   try {
-    chmodSync(path, SESSION_FILE_MODE);
-  } catch {
-    /* filesystem may not support chmod (e.g. some Windows volumes) — best-effort. */
+    try {
+      fchmodSync(fd, SESSION_FILE_MODE);
+    } catch {
+      /* filesystem may not support chmod (e.g. some Windows volumes) — best-effort. */
+    }
+    if (!fstatSync(fd).isFile()) {
+      throw new Error(`ux-e2e: evidence path must be a regular file: ${path}`);
+    }
+    return fd;
+  } catch (err) {
+    closeSync(fd);
+    throw err;
+  }
+}
+
+function writeSessionFile(path: string, body: string): void {
+  const fd = openEvidenceFd(path, false);
+  try {
+    writeFileSync(fd, body);
+  } finally {
+    closeSync(fd);
   }
 }
 
 function appendSessionFile(path: string, body: string): void {
-  appendFileSync(path, body, { mode: SESSION_FILE_MODE });
+  const fd = openEvidenceFd(path, true);
   try {
-    chmodSync(path, SESSION_FILE_MODE);
-  } catch {
-    /* best-effort. */
+    appendFileSync(fd, body);
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -331,8 +437,170 @@ export interface OmpLaunchConfig {
    * `--config` is emitted.
    */
   readonly userConfigDefaultPath: string;
+  /**
+   * Operator-trusted DIAGNOSTIC ordered pair — NOT host/policy admission
+   * and NOT selected-provider activation.
+   *
+   * `coreModule` + `providerModule` — BOTH required when either is
+   * present: two distinct absolute paths. Emitted as repeated
+   * `--trusted-extension` flags, core position FIRST, provider position
+   * second. Active omp honors repeated `--trusted-extension` flags in
+   * supplied order and disables ALL ambient extension discovery. This
+   * is diagnostic allowlist/load-order EVIDENCE only: loading a module
+   * under these flags is not activation, and the installed OMP issues
+   * no host-issued admission of any kind.
+   *
+   * A PARTIAL pair is never accepted: `resolveTrustedPair` rejects
+   * partial, relative (no cwd inference), and equal-requested
+   * selections before any argv is built or a process is spawned. At
+   * the spawn boundary both entries are additionally canonicalized
+   * with `realpathSync.native`, kind-checked with native stat (regular
+   * file), and alias-rejected by canonical equality — see
+   * `canonicalizeTrustedPair`. Selection is always caller-supplied —
+   * never inferred from cwd or package order. When nothing is selected
+   * the launch is the generic NON-admission ux-e2e harness mode
+   * (ambient discovery per operator config). Explicit-root mode
+   * (`--no-extensions`/`--extension`, coreRoot/providerRoot) was
+   * REMOVED: package-root expansion is nondeterministic and not an
+   * exact allowlist.
+   */
+  readonly coreModule?: string;
+  readonly providerModule?: string;
 }
 
+/** Evidence role within the operator-trusted diagnostic ordered pair. */
+export type TrustedPairRole = 'core' | 'provider';
+
+/**
+ * One operator-trusted diagnostic module identity. `path` is the exact
+ * operator-requested absolute path (any normalized absolute spelling is
+ * accepted verbatim). `canonical`/`identity` are filled ONLY at the
+ * pre-spawn boundary by `canonicalizeTrustedPair` (realpathSync.native +
+ * native stat), never at syntax time.
+ */
+export interface TrustedPairModule {
+  readonly role: TrustedPairRole;
+  readonly path: string;
+  readonly canonical: string | null;
+  /** Native stat identity of the canonical target (dev/ino), or null before canonicalization. */
+  readonly identity: { readonly dev: number; readonly ino: number } | null;
+}
+
+/**
+ * A complete operator-trusted DIAGNOSTIC ordered pair — core position
+ * FIRST, provider position second. Load-order evidence for E2E
+ * diagnostics ONLY: this is NOT host-issued or policy admission, and
+ * loading a module is NOT selected-provider activation. The installed
+ * OMP exposes no host-issued admission capability at all.
+ */
+export interface TrustedDiagnosticPair {
+  readonly modules: readonly [TrustedPairModule, TrustedPairModule];
+}
+
+/** Raw diagnostic pair inputs; ANY selection switches diagnostic semantics on. */
+export interface TrustedPairInput {
+  readonly coreModule?: string;
+  readonly providerModule?: string;
+}
+
+/**
+ * Resolve the operator-trusted diagnostic pair. Returns null when
+ * NOTHING is selected (generic NON-admission harness launch). Any
+ * selection switches diagnostic semantics on and must form a COMPLETE
+ * pair: `coreModule` + `providerModule`. Partial pairs, relative paths
+ * (no cwd inference — `isAbsolute` is the syntax gate, so normalized
+ * absolute spellings like `/tmp/./x.mjs` or `/tmp/x.mjs/` pass), and
+ * equal requested paths all throw BEFORE any argv is built or a
+ * process is spawned. Callers performing a real spawn additionally
+ * canonicalize both entries and reject aliasing — see
+ * `canonicalizeTrustedPair`.
+ */
+export function resolveTrustedPair(input: TrustedPairInput): TrustedDiagnosticPair | null {
+  // Empty strings are treated as unset (same convention as userConfigPath).
+  const coreModule = typeof input.coreModule === 'string' && input.coreModule.length > 0 ? input.coreModule : undefined;
+  const providerModule =
+    typeof input.providerModule === 'string' && input.providerModule.length > 0 ? input.providerModule : undefined;
+  if (coreModule === undefined && providerModule === undefined) return null;
+  if (coreModule === undefined || providerModule === undefined) {
+    throw new Error(
+      `ux-e2e: incomplete diagnostic pair — BOTH coreModule and providerModule are required for an OMP launch (coreModule=${coreModule ?? 'unset'}, providerModule=${providerModule ?? 'unset'})`,
+    );
+  }
+  for (const [role, value] of [
+    ['core', coreModule],
+    ['provider', providerModule],
+  ] as const) {
+    if (!isAbsolute(value)) {
+      throw new Error(
+        `ux-e2e: diagnostic ${role} module must be an ABSOLUTE path (relative paths are never resolved against cwd): ${value}`,
+      );
+    }
+  }
+  if (coreModule === providerModule) {
+    throw new Error(
+      `ux-e2e: diagnostic pair requires two DISTINCT module paths — coreModule and providerModule are equal: ${coreModule}`,
+    );
+  }
+  return {
+    modules: [
+      { role: 'core', path: coreModule, canonical: null, identity: null },
+      { role: 'provider', path: providerModule, canonical: null, identity: null },
+    ],
+  };
+}
+
+/**
+ * Pre-spawn boundary validation for a resolved pair. For each entry:
+ * canonicalize the requested path with `realpathSync.native`, require
+ * the canonical target to be a REGULAR file via native stat kind, and
+ * record its dev/ino identity. Then reject canonical-equal entries:
+ * two different spellings (e.g. symlink aliases) that resolve to ONE
+ * target would let a single module occupy both ordered positions once
+ * OMP canonicalizes trusted modules itself, so the pair is rejected.
+ * This closes alias collapse INSIDE the harness boundary; it does NOT
+ * close the host-side window before OMP's own import, bind a digest,
+ * or provide descriptor-relative workflow-storage authority.
+ */
+export function canonicalizeTrustedPair(pair: TrustedDiagnosticPair): TrustedDiagnosticPair {
+  const canonicalized = pair.modules.map(module => {
+    let canonical: string;
+    try {
+      canonical = realpathSync.native(module.path);
+    } catch (err) {
+      throw new Error(
+        `ux-e2e: diagnostic ${module.role} module must be an existing module file: ${module.path} (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+    if (!statSync(canonical).isFile()) {
+      throw new Error(
+        `ux-e2e: diagnostic ${module.role} module must be an existing module file (native stat kind): ${module.path} -> ${canonical}`,
+      );
+    }
+    const identity = statSync(canonical);
+    return { role: module.role, path: module.path, canonical, identity: { dev: identity.dev, ino: identity.ino } };
+  });
+  const core = canonicalized[0]!;
+  const provider = canonicalized[1]!;
+  if (core.canonical === provider.canonical) {
+    throw new Error(
+      `ux-e2e: diagnostic pair entries must resolve to DISTINCT targets — core ${core.path} and provider ${provider.path} both canonicalize to ${core.canonical} (symlink alias rejected)`,
+    );
+  }
+  // Hard-link aliases share one inode under different canonical paths —
+  // compare the native stat identities too, or one module file could
+  // still occupy both ordered positions.
+  if (
+    core.identity !== null &&
+    provider.identity !== null &&
+    core.identity.dev === provider.identity.dev &&
+    core.identity.ino === provider.identity.ino
+  ) {
+    throw new Error(
+      `ux-e2e: diagnostic pair entries must resolve to DISTINCT filesystem identities — core ${core.path} and provider ${provider.path} share dev/ino ${String(core.identity.dev)}/${String(core.identity.ino)} (hard-link alias rejected)`,
+    );
+  }
+  return { modules: [core, provider] };
+}
 /**
  * Build the omp argument vector. NEVER passes `-p`/`--print` and NEVER
  * `--no-pty` — the session must be a real interactive PTY.
@@ -348,6 +616,16 @@ export interface OmpLaunchConfig {
  *   2. `configPath` (the regenerated ux-e2e overlay)
  *   3. `userConfigPath` (operator-supplied `<scratchDir>/.omp/ux-e2e-overlay.user.json`
  *      when present — third overlay so it overrides everything)
+ * Operator-trusted DIAGNOSTIC pair (load-order evidence, NOT
+ * admission/activation): the pair is mandatory and complete — repeated
+ * `--trusted-extension <coreModule> --trusted-extension
+ * <providerModule>`, core position FIRST, provider position second;
+ * all ambient discovery off. Partial, relative, and equal-requested
+ * selections throw via `resolveTrustedPair` before argv construction;
+ * a real spawn canonicalizes + alias-checks both entries first
+ * (canonical paths are emitted when known). Explicit-root mode
+ * (`--no-extensions`/`--extension`) was REMOVED. Nothing selected =
+ * generic NON-admission harness launch.
  */
 export function buildOmpArgs(cfg: OmpLaunchConfig): string[] {
   const maxMinutes = Math.max(1, Math.round(cfg.maxTimeSec / 60));
@@ -368,6 +646,20 @@ export function buildOmpArgs(cfg: OmpLaunchConfig): string[] {
     '--max-time', `${maxMinutes}m`,
     '--approval-mode', cfg.approvalMode,
   );
+  // Operator-trusted diagnostic pair: validated and ordered BEFORE any
+  // argv exists (see resolveTrustedPair). Empty strings are treated as
+  // unset (same convention as userConfigPath above).
+  const pair = resolveTrustedPair(cfg);
+  if (pair !== null) {
+    const [core, provider] = pair.modules;
+    // omp --trusted-extension: exact module-file allowlist, repeated
+    // per entry in SUPPLIED ORDER; omp itself disables ALL ambient
+    // extension discovery. Core position FIRST, provider second.
+    // Diagnostic load-order evidence ONLY — never admission or
+    // selected-provider activation. NEVER emit --no-extensions or
+    // --extension (explicit-root mode was removed).
+    args.push('--trusted-extension', core.canonical ?? core.path, '--trusted-extension', provider.canonical ?? provider.path);
+  }
   return args;
 }
 
@@ -512,6 +804,15 @@ export interface TestSessionOptions {
    * from MITMing LLM/API calls. Pass true to opt out.
    */
   readonly keepProxyEnv?: boolean;
+  /**
+   * Operator-trusted DIAGNOSTIC ordered pair (see `OmpLaunchConfig` —
+   * `coreModule` + `providerModule`, BOTH required when either is
+   * present). Load-order evidence ONLY — NOT host/policy admission and
+   * NOT selected-provider activation. Nothing selected = generic
+   * NON-admission harness launch. Explicit-root mode was removed.
+   */
+  readonly coreModule?: string;
+  readonly providerModule?: string;
 }
 
 /** Handle to a running test session. */
@@ -543,7 +844,14 @@ export type TranscriptFrame =
 /* ------------------------------------------------------------------ */
 
 export interface SessionInfo {
+  /** The OMP PTY process pid — NOT the supervisor. */
   readonly pid: number | null;
+  /**
+   * The node process hosting the HTTP+WS server (the session supervisor).
+   * Distinct from `pid`: it can outlive the PTY, and `stop` uses it to
+   * close the server even after the OMP process exited.
+   */
+  readonly supervisorPid: number | null;
   readonly startedAt: string | null;
   readonly path: string;
 }
@@ -553,9 +861,14 @@ export function readSessionInfo(scratchDir: string): SessionInfo | null {
   const p = join(scratchDir, '.work-state', 'ux-e2e', 'session.json');
   if (!existsSync(p)) return null;
   try {
-    const j = JSON.parse(readFileSync(p, 'utf8')) as { pid?: unknown; started_at?: unknown };
+    const j = JSON.parse(readFileSync(p, 'utf8')) as {
+      pid?: unknown;
+      supervisor_pid?: unknown;
+      started_at?: unknown;
+    };
     return {
       pid: typeof j.pid === 'number' ? j.pid : null,
+      supervisorPid: typeof j.supervisor_pid === 'number' ? j.supervisor_pid : null,
       startedAt: typeof j.started_at === 'string' ? j.started_at : null,
       path: p,
     };
@@ -996,11 +1309,18 @@ function deriveSlug(scratchDir: string): string {
   return base.startsWith(PREFIX) ? base.slice(PREFIX.length) : base;
 }
 
-async function resolveOmpVersion(binary: string): Promise<string> {
+async function resolveOmpVersion(binary: string, env?: Record<string, string>): Promise<string> {
   try {
     const { promise, resolve: done, reject: fail } = deferred<string>();
     // stdin ignored: a fake test command must not block on --version.
-    const child = spawn(binary, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 });
+    // A diagnostic pair launch passes its hardened env so ambient
+    // NODE_OPTIONS/preload cannot execute in the candidate OMP process;
+    // generic launches omit env and inherit as before.
+    const child = spawn(binary, ['--version'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5000,
+      ...(env !== undefined ? { env } : {}),
+    });
     let out = '';
     if (child.stdout !== null) {
       child.stdout.on('data', (chunk: Buffer) => {
@@ -1055,15 +1375,43 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   const maxTimeSec = opts.maxTimeSec ?? 1800;
   const approvalMode = opts.approvalMode ?? 'yolo';
   const token = opts.token ?? mintToken();
+  // Operator-trusted DIAGNOSTIC pair (NOT admission): resolved BEFORE
+  // the HTTP server starts and before any omp process is spawned. ANY
+  // selection switches diagnostic semantics on and must form a COMPLETE
+  // pair — partial, relative, and equal-requested selections throw
+  // inside resolveTrustedPair. A real spawn additionally canonicalizes
+  // both entries (realpathSync.native + native stat kind) and rejects
+  // symlink aliases by canonical equality, fail-closed BEFORE
+  // pty.spawn. Requested and canonical identities are recorded in
+  // session.json evidence. No selection = generic NON-admission
+  // harness launch.
+  const requestedPair = resolveTrustedPair(opts);
+  const pair = requestedPair !== null ? canonicalizeTrustedPair(requestedPair) : null;
 
   const stateDir = stateDirOf(scratchDir);
+  // 0700 evidence dir: recursive mkdir applies the mode at creation;
+  // chmod covers pre-existing dirs. The leaf must be a REAL directory
+  // (lstat — a symlinked state dir is rejected). Symlink components
+  // higher up are not rejected: standard temp roots (e.g. /var ->
+  // /private/var) ARE symlink chains, and the scratch dir is
+  // operator-provided.
   mkdirSync(stateDir, { recursive: true, mode: SESSION_DIR_MODE });
+  // Reject a symlinked state-dir leaf BEFORE any chmod could follow it,
+  // then pin 0700 (chmod is the belt-and-braces pass for pre-existing dirs).
+  if (!lstatSync(stateDir).isDirectory()) {
+    throw new Error(`ux-e2e: state dir must be a real directory, not a symlink: ${stateDir}`);
+  }
+  try {
+    chmodSync(stateDir, SESSION_DIR_MODE);
+  } catch {
+    /* best-effort */
+  }
   const transcriptPath = join(stateDir, 'transcript.jsonl');
   const sessionJsonPath = join(stateDir, 'session.json');
   // Truncate the transcript — a fresh session starts with a clean evidence file.
   writeSessionFile(transcriptPath, '');
 
-  const ompVersion = await resolveOmpVersion(ompBinary);
+  const ompVersion = await resolveOmpVersion(ompBinary, pair !== null ? buildDiagnosticEnv(process.env, undefined) : undefined);
 
   const httpServer: Server = createServer();
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_INBOUND_WS_BYTES });
@@ -1110,7 +1458,13 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     // binary may be missing on some platforms — noPty test sessions must
     // still work when the native module cannot load.
     const ptyMod = await import('node-pty');
-    const env = buildPtyEnv(process.env, opts.env, { keepProxyEnv: opts.keepProxyEnv });
+    // Diagnostic launches (operator-trusted pair present) run with the
+    // hardened injection-stripped environment; generic launches keep
+    // the legacy proxy-stripped env.
+    const env =
+      pair !== null
+        ? buildDiagnosticEnv(process.env, opts.env)
+        : buildPtyEnv(process.env, opts.env, { keepProxyEnv: opts.keepProxyEnv });
     const args = buildOmpArgs({
       ompProfile,
       maxTimeSec,
@@ -1120,6 +1474,12 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
       userConfigDefaultPath,
       ...(hostConfig.path !== null ? { hostConfigPath: hostConfig.path } : {}),
       ...(userConfigPath !== null ? { userConfigPath } : {}),
+      ...(pair !== null
+        ? {
+            coreModule: pair.modules[0].canonical ?? pair.modules[0].path,
+            providerModule: pair.modules[1].canonical ?? pair.modules[1].path,
+          }
+        : {}),
     });
     try {
       // omp is spawned directly (never wrapped in a shell), which is
@@ -1136,6 +1496,10 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     url,
     token,
     wsPath,
+    // The node process hosting the HTTP+WS server (the session supervisor)
+    // — recorded SEPARATELY from the OMP PTY pid so `stop` can close the
+    // server even after the PTY process exited.
+    supervisor_pid: process.pid,
     pid: ptyProc?.pid ?? null,
     started_at: new Date().toISOString(),
     omp_version: ompVersion,
@@ -1152,6 +1516,25 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
       path: userConfigPath,
       default_path: userConfigDefaultPath,
     },
+    // Operator-trusted diagnostic pair evidence: BOTH ordered identities
+    // (core position first, provider second) with requested AND canonical
+    // paths plus canonical dev/ino. Load-order evidence only — this is
+    // NOT host/policy admission and NOT selected-provider activation.
+    trusted_pair:
+      pair === null
+        ? null
+        : {
+            purpose:
+              'operator-trusted diagnostic ordered pair — load-order evidence only; NOT host/policy admission, NOT selected-provider activation',
+            mode: 'trusted-module',
+            extensions: pair.modules.map(module => ({
+              role: module.role,
+              requested_path: module.path,
+              canonical_path: module.canonical,
+              canonical_dev: module.identity?.dev ?? null,
+              canonical_ino: module.identity?.ino ?? null,
+            })),
+          },
   };
   writeSessionFile(sessionJsonPath, JSON.stringify(sessionJson, null, 2) + '\n');
   // ---- HTTP: security headers + static page -------------------------

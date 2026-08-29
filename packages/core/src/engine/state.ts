@@ -28,23 +28,57 @@ import { readObservabilityPointer } from "../observability/recorder.js";
 import { recordStageTransition } from "../observability/hooks.js";
 import { activeWave, readCtoState } from "../cto/state.js";
 import {
-  loadProfile,
-  profileHash,
-  resolveProfileControlPlane,
   validateProfileControlPlane,
 } from "./profile.js";
+import { createDiagnostic } from "../workflow-v2/diagnostics.js";
+import { validateProjectIdentity, validateWorkflowRunIdentity, isProviderId, isWorkflowV2Digest } from "../workflow-v2/identity.js";
+import type {
+  ProjectIdentity,
+  WorkflowRunIdentity,
+  WorkflowV2Diagnostic,
+} from "../workflow-v2/types.js";
+import { WorkflowLifecycleError } from "./types.js";
 import type {
   CheckpointPolicy,
+  CompletionArtifactRef,
   CompletionEnvelope,
-  CompletionIntent,
   ControlPlaneProvenance,
+  DispatchCapabilityState,
+  DispatchCompletion,
+  DispatchRecord,
   MigrationReceipt,
   PauseKind,
   PendingState,
+  RetiredCapability,
   StageStatus,
   TeamState,
   WorkIdentity,
 } from "./types.js";
+function validateRunIdentity(value: unknown, path: string, issues: string[]): void {
+  const checked = validateWorkflowRunIdentity(value);
+  if (!checked.ok) {
+    for (const diagnostic of checked.diagnostics) issues.push(`${path} ${diagnostic.code}`);
+  }
+}
+function sameProjectIdentity(left: ProjectIdentity, right: ProjectIdentity): boolean {
+  return left.root_instance_id === right.root_instance_id
+    && left.provider_id === right.provider_id
+    && left.descriptor_fingerprint === right.descriptor_fingerprint
+    && left.executable_provenance.build_fingerprint === right.executable_provenance.build_fingerprint
+    && left.executable_provenance.runtime_fingerprint === right.executable_provenance.runtime_fingerprint
+    && left.catalog_content_digest === right.catalog_content_digest
+    && left.config_byte_sha256 === right.config_byte_sha256
+    && left.config_semantic_sha256 === right.config_semantic_sha256
+    && left.session.session_id === right.session.session_id
+    && left.session.lifecycle_id === right.session.lifecycle_id;
+}
+
+function sameRunIdentity(left: WorkflowRunIdentity, right: WorkflowRunIdentity): boolean {
+  return sameProjectIdentity(left, right)
+    && left.run_id === right.run_id
+    && left.profile_identity.id === right.profile_identity.id
+    && left.profile_identity.fingerprint === right.profile_identity.fingerprint;
+}
 
 export const DETACHED_BRANCH = "__omp_detached_head__";
 export const NO_GIT_BRANCH = "__omp_no_git__";
@@ -69,6 +103,22 @@ export function resolveActiveBranch(cwd: string): string {
   } catch {
     return NO_GIT_BRANCH;
   }
+}
+function sameWorkIdentity(left: WorkIdentity, right: WorkIdentity): boolean {
+  return left.run_id === right.run_id
+    && left.wave_id === right.wave_id
+    && left.slice_id === right.slice_id
+    && left.session_id === right.session_id
+    && left.workflow === right.workflow
+    && left.stage_id === right.stage_id
+    && left.stage_cursor === right.stage_cursor
+    && left.capability_id === right.capability_id
+    && left.capability_epoch === right.capability_epoch
+    && left.slot_id === right.slot_id
+    && left.task_id === right.task_id
+    && left.dispatch_id === right.dispatch_id
+    && left.attempt === right.attempt
+    && left.worker_id === right.worker_id;
 }
 
 const WORK_STATE_DIR = ".work-state";
@@ -185,14 +235,15 @@ function validateStateSelection(value: unknown, path: string, issues: string[]):
     });
   }
 }
-
 function validateStatePending(value: unknown, path: string, issues: string[]): void {
   if (!isStateRecord(value)) {
     issues.push(`${path} must be an object`);
     return;
   }
-  strictStateKeys(value, ["identity", "status", "pending_reason", "provider_ref", "lease", "terminal_signal", "retry_of", "updated_at"], path, issues);
+  strictStateKeys(value, ["identity", "run_identity", "status", "pending_reason", "provider_ref", "lease", "terminal_signal", "retry_of", "updated_at"], path, issues);
   validateStateIdentity(value.identity, `${path}.identity`, issues);
+  if (!Object.prototype.hasOwnProperty.call(value, "run_identity")) issues.push(`${path}.run_identity is required`);
+  else validateRunIdentity(value.run_identity, `${path}.run_identity`, issues);
   if (!["authorized", "running", "pending", "succeeded", "failed", "cancelled"].includes(String(value.status))) issues.push(`${path}.status has an unknown value`);
   if (value.pending_reason !== undefined && !["provider_running", "awaiting_result", "transport_reconnect"].includes(String(value.pending_reason))) issues.push(`${path}.pending_reason has an unknown value`);
   if (value.provider_ref !== undefined && !nonEmptyStateString(value.provider_ref)) issues.push(`${path}.provider_ref must be a non-empty string`);
@@ -210,13 +261,14 @@ function validateStatePending(value: unknown, path: string, issues: string[]): v
   if (!nonEmptyStateString(value.updated_at)) issues.push(`${path}.updated_at must be a non-empty string`);
   if (value.status === "pending" && value.terminal_signal !== undefined && value.terminal_signal !== null) issues.push(`${path}.terminal_signal cannot be terminal for pending work`);
 }
-
 function validateStateChildJoin(value: unknown, path: string, issues: string[]): void {
   if (!isStateRecord(value)) {
     issues.push(`${path} must be an object`);
     return;
   }
-  strictStateKeys(value, ["parent", "child", "state", "expected_artifact_ids", "completion_envelope_ref", "attempt", "created_at", "joined_at"], path, issues);
+  strictStateKeys(value, ["run_identity", "parent", "child", "state", "expected_artifact_ids", "completion_envelope_ref", "attempt", "created_at", "joined_at"], path, issues);
+  if (!Object.prototype.hasOwnProperty.call(value, "run_identity")) issues.push(`${path}.run_identity is required`);
+  else validateRunIdentity(value.run_identity, `${path}.run_identity`, issues);
   validateStateIdentity(value.parent, `${path}.parent`, issues);
   validateStateIdentity(value.child, `${path}.child`, issues);
   if (!["planned", "authorized", "pending", "succeeded", "failed", "cancelled", "conflict"].includes(String(value.state))) issues.push(`${path}.state has an unknown value`);
@@ -225,17 +277,19 @@ function validateStateChildJoin(value: unknown, path: string, issues: string[]):
   if (!Number.isInteger(value.attempt) || (value.attempt as number) < 1) issues.push(`${path}.attempt must be an integer >= 1`);
   for (const key of ["created_at", "joined_at"]) if (!nonEmptyStateString(value[key])) issues.push(`${path}.${key} must be a non-empty string`);
 }
-
 function validateStateCompletion(value: unknown, path: string, issues: string[]): void {
   if (!isStateRecord(value)) {
     issues.push(`${path} must be an object`);
     return;
   }
-  strictStateKeys(value, ["schema_version", "identity", "outcome", "terminal_signal", "artifact_refs", "evidence_ref", "conflict_ref", "completed_by", "emitted_at"], path, issues);
+  strictStateKeys(value, ["schema_version", "identity", "run_identity", "outcome", "terminal_signal", "artifact_refs", "evidence_ref", "conflict_ref", "completed_by", "emitted_at"], path, issues);
   if (value.schema_version !== 1) issues.push(`${path}.schema_version must be 1`);
   validateStateIdentity(value.identity, `${path}.identity`, issues);
+  if (!Object.prototype.hasOwnProperty.call(value, "run_identity")) issues.push(`${path}.run_identity is required`);
+  else validateRunIdentity(value.run_identity, `${path}.run_identity`, issues);
   if (!["pending", "succeeded", "failed", "cancelled"].includes(String(value.outcome))) issues.push(`${path}.outcome has an unknown value`);
-  if (value.terminal_signal !== null && value.terminal_signal !== undefined && !["workflow_complete", "native_tool_result", "provider_terminal", "contract_failure"].includes(String(value.terminal_signal))) issues.push(`${path}.terminal_signal has an unknown value`);
+  if (Object.prototype.hasOwnProperty.call(value, "terminal_signal") && value.terminal_signal === undefined) issues.push(`${path}.terminal_signal must not be undefined`);
+  else if (value.terminal_signal !== null && value.terminal_signal !== undefined && !["workflow_complete", "native_tool_result", "provider_terminal", "contract_failure"].includes(String(value.terminal_signal))) issues.push(`${path}.terminal_signal has an unknown value`);
   if (!Array.isArray(value.artifact_refs)) {
     issues.push(`${path}.artifact_refs must be an array`);
   } else {
@@ -258,6 +312,193 @@ function validateStateCompletion(value: unknown, path: string, issues: string[])
   if (value.outcome === "pending" && (value.terminal_signal !== null && value.terminal_signal !== undefined || Array.isArray(value.artifact_refs) && value.artifact_refs.length > 0)) issues.push(`${path} pending envelope cannot claim terminal data`);
   if (value.outcome !== "pending" && value.terminal_signal === null) issues.push(`${path}.terminal_signal is required for terminal outcomes`);
 }
+function validateStateAgentRef(value: unknown, path: string, issues: string[]): void {
+  if (!isStateRecord(value)) {
+    issues.push(`${path} must be an object`);
+    return;
+  }
+  strictStateKeys(value, ["registered_name", "provider_id", "source_fingerprint"], path, issues);
+  if (!nonEmptyStateString(value.registered_name)) issues.push(`${path}.registered_name must be a non-empty string`);
+  if (!isProviderId(value.provider_id)) issues.push(`${path}.provider_id must be a provider id`);
+  if (!isWorkflowV2Digest(value.source_fingerprint)) issues.push(`${path}.source_fingerprint must be a sha256 digest`);
+}
+
+function validateStateDispatchCompletion(value: unknown, path: string, issues: string[]): void {
+  if (!isStateRecord(value)) {
+    issues.push(`${path} must be an object`);
+    return;
+  }
+  strictStateKeys(value, [
+    "dispatch_id", "cursor_epoch", "outcome", "artifact_ids", "evidence",
+    "completed_by", "completed_at", "run_identity", "work_identity",
+  ], path, issues);
+  for (const key of ["dispatch_id", "cursor_epoch", "evidence", "completed_at"]) {
+    if (!nonEmptyStateString(value[key])) issues.push(`${path}.${key} must be a non-empty string`);
+  }
+  if (!["succeeded", "failed", "cancelled"].includes(String(value.outcome))) issues.push(`${path}.outcome has an unknown value`);
+  if (!Array.isArray(value.artifact_ids) || value.artifact_ids.some((id) => !nonEmptyStateString(id) || !isSafeStateSegment(String(id)))) {
+    issues.push(`${path}.artifact_ids must be an array of safe non-empty strings`);
+  }
+  if (!["workflow_complete", "synchronous_tool_result", "engine_task_caller"].includes(String(value.completed_by))) {
+    issues.push(`${path}.completed_by has an unknown value`);
+  }
+  if (!Object.prototype.hasOwnProperty.call(value, "run_identity")) issues.push(`${path}.run_identity is required`);
+  else validateRunIdentity(value.run_identity, `${path}.run_identity`, issues);
+  if (Object.prototype.hasOwnProperty.call(value, "work_identity")) {
+    if (value.work_identity === undefined) issues.push(`${path}.work_identity must not be undefined`);
+    else validateStateIdentity(value.work_identity, `${path}.work_identity`, issues);
+  }
+}
+
+function validateStateDispatchRecord(value: unknown, path: string, issues: string[]): void {
+  if (!isStateRecord(value)) {
+    issues.push(`${path} must be an object`);
+    return;
+  }
+  strictStateKeys(value, [
+    "id", "role", "agent", "agent_ref", "tool_call_id", "status", "attempt",
+    "created_at", "completed_at", "completion", "run_identity",
+    "work_identity", "pending", "completion_envelope",
+  ], path, issues);
+  for (const key of ["id", "role", "agent", "created_at"]) {
+    if (!nonEmptyStateString(value[key])) issues.push(`${path}.${key} must be a non-empty string`);
+  }
+  if (!["authorized", "running", "pending", "succeeded", "failed", "cancelled"].includes(String(value.status))) {
+    issues.push(`${path}.status has an unknown value`);
+  }
+  if (!Number.isInteger(value.attempt) || (value.attempt as number) < 1) issues.push(`${path}.attempt must be an integer >= 1`);
+  if (Object.prototype.hasOwnProperty.call(value, "agent_ref")) {
+    if (value.agent_ref === undefined) issues.push(`${path}.agent_ref must not be undefined`);
+    else validateStateAgentRef(value.agent_ref, `${path}.agent_ref`, issues);
+  }
+  for (const key of ["tool_call_id", "completed_at"]) {
+    if (Object.prototype.hasOwnProperty.call(value, key) && value[key] === undefined) issues.push(`${path}.${key} must not be undefined`);
+    else if (value[key] !== undefined && !nonEmptyStateString(value[key])) issues.push(`${path}.${key} must be a non-empty string`);
+  }
+  if (!Object.prototype.hasOwnProperty.call(value, "run_identity")) issues.push(`${path}.run_identity is required`);
+  else validateRunIdentity(value.run_identity, `${path}.run_identity`, issues);
+  if (!Object.prototype.hasOwnProperty.call(value, "work_identity")) issues.push(`${path}.work_identity is required`);
+  else validateStateIdentity(value.work_identity, `${path}.work_identity`, issues);
+  for (const key of ["pending", "completion", "completion_envelope"]) {
+    if (Object.prototype.hasOwnProperty.call(value, key) && value[key] === undefined) issues.push(`${path}.${key} must not be undefined`);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "pending") && value.pending !== undefined) validateStatePending(value.pending, `${path}.pending`, issues);
+  if (Object.prototype.hasOwnProperty.call(value, "completion") && value.completion !== undefined) validateStateDispatchCompletion(value.completion, `${path}.completion`, issues);
+  if (Object.prototype.hasOwnProperty.call(value, "completion_envelope") && value.completion_envelope !== undefined) validateStateCompletion(value.completion_envelope, `${path}.completion_envelope`, issues);
+}
+
+function validateStateCapability(value: unknown, path: string, issues: string[]): void {
+  if (!isStateRecord(value)) {
+    issues.push(`${path} must be an object`);
+    return;
+  }
+  strictStateKeys(value, [
+    "capability_id", "dispatch_token_hash", "advance_token_hash", "issued_for", "kind",
+    "project_identity", "run_identity", "expected_roles", "expected_count", "expected_roster",
+    "roster_selection", "work_identity", "pending", "status", "dispatches",
+  ], path, issues);
+  for (const key of ["capability_id", "dispatch_token_hash", "advance_token_hash"]) {
+    if (!nonEmptyStateString(value[key])) issues.push(`${path}.${key} must be a non-empty string`);
+  }
+  for (const key of ["dispatch_token_hash", "advance_token_hash"]) {
+    if (typeof value[key] === "string" && !/^[0-9a-f]{64}$/.test(value[key])) issues.push(`${path}.${key} must be a lowercase sha256 hash`);
+  }
+  const project = Object.prototype.hasOwnProperty.call(value, "project_identity")
+    ? validateProjectIdentity(value.project_identity)
+    : null;
+  const run = Object.prototype.hasOwnProperty.call(value, "run_identity")
+    ? validateWorkflowRunIdentity(value.run_identity)
+    : null;
+  if (!project?.ok) issues.push(`${path}.project_identity is malformed`);
+  if (!run?.ok) issues.push(`${path}.run_identity is malformed`);
+  if (project?.ok && run?.ok && !sameProjectIdentity(project.value, run.value)) issues.push(`${path}.run_identity must inherit project_identity`);
+  if (!isStateRecord(value.issued_for)) {
+    issues.push(`${path}.issued_for must be an object`);
+  } else {
+    const issued = value.issued_for;
+    strictStateKeys(issued, [
+      "run_key", "branch", "workflow", "profile_hash", "stage_cursor", "cursor_epoch",
+      "project_identity", "run_identity",
+    ], `${path}.issued_for`, issues);
+    for (const key of ["run_key", "branch", "workflow", "profile_hash", "stage_cursor", "cursor_epoch"]) {
+      if (!nonEmptyStateString(issued[key])) issues.push(`${path}.issued_for.${key} must be a non-empty string`);
+    }
+    const issuedProject = Object.prototype.hasOwnProperty.call(issued, "project_identity")
+      ? validateProjectIdentity(issued.project_identity)
+      : null;
+    const issuedRun = Object.prototype.hasOwnProperty.call(issued, "run_identity")
+      ? validateWorkflowRunIdentity(issued.run_identity)
+      : null;
+    if (!issuedProject?.ok) issues.push(`${path}.issued_for.project_identity is malformed`);
+    if (!issuedRun?.ok) issues.push(`${path}.issued_for.run_identity is malformed`);
+    if (issuedProject?.ok && issuedRun?.ok && !sameProjectIdentity(issuedProject.value, issuedRun.value)) {
+      issues.push(`${path}.issued_for.run_identity must inherit issued_for.project_identity`);
+    }
+    if (project?.ok && issuedProject?.ok && !sameProjectIdentity(project.value, issuedProject.value)) {
+      issues.push(`${path}.issued_for.project_identity must match project_identity`);
+    }
+    if (run?.ok && issuedRun?.ok && !sameRunIdentity(run.value, issuedRun.value)) {
+      issues.push(`${path}.issued_for.run_identity must match run_identity`);
+    }
+  }
+  if (!["none", "single", "consilium"].includes(String(value.kind))) issues.push(`${path}.kind has an unknown value`);
+  if (!Array.isArray(value.expected_roles) || value.expected_roles.some((role) => !nonEmptyStateString(role))) {
+    issues.push(`${path}.expected_roles must be an array of non-empty strings`);
+  }
+  if (!Number.isInteger(value.expected_count) || (value.expected_count as number) < 0) issues.push(`${path}.expected_count must be an integer >= 0`);
+  if (!Array.isArray(value.expected_roster)) {
+    issues.push(`${path}.expected_roster must be an array`);
+  } else {
+    const roles = new Set<string>();
+    value.expected_roster.forEach((entry, index) => {
+      const entryPath = `${path}.expected_roster[${index}]`;
+      if (!isStateRecord(entry)) {
+        issues.push(`${entryPath} must be an object`);
+        return;
+      }
+      strictStateKeys(entry, ["role", "agent", "agent_ref", "slot_id", "semantic_role", "occurrence", "facet"], entryPath, issues);
+      for (const key of ["role", "agent"]) if (!nonEmptyStateString(entry[key])) issues.push(`${entryPath}.${key} must be a non-empty string`);
+      if (roles.has(String(entry.role))) issues.push(`${entryPath}.role is duplicated`);
+      roles.add(String(entry.role));
+      if (!Object.prototype.hasOwnProperty.call(entry, "agent_ref") || entry.agent_ref === undefined) issues.push(`${entryPath}.agent_ref is required`);
+      else {
+        validateStateAgentRef(entry.agent_ref, `${entryPath}.agent_ref`, issues);
+        if (project?.ok && isStateRecord(entry.agent_ref) && entry.agent_ref.provider_id !== project.value.provider_id) {
+          issues.push(`${entryPath}.agent_ref.provider_id must match project_identity.provider_id`);
+        }
+        if (isStateRecord(entry.agent_ref) && entry.agent_ref.registered_name !== entry.agent) {
+          issues.push(`${entryPath}.agent_ref.registered_name must match agent`);
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(entry, "slot_id") && entry.slot_id === undefined) issues.push(`${entryPath}.slot_id must not be undefined`);
+      else if (entry.slot_id !== undefined && !nonEmptyStateString(entry.slot_id)) issues.push(`${entryPath}.slot_id must be a non-empty string`);
+      if (Object.prototype.hasOwnProperty.call(entry, "semantic_role") && entry.semantic_role === undefined) issues.push(`${entryPath}.semantic_role must not be undefined`);
+      else if (entry.semantic_role !== undefined && !nonEmptyStateString(entry.semantic_role)) issues.push(`${entryPath}.semantic_role must be a non-empty string`);
+      if (Object.prototype.hasOwnProperty.call(entry, "occurrence") && entry.occurrence === undefined) issues.push(`${entryPath}.occurrence must not be undefined`);
+      else if (entry.occurrence !== undefined && (!Number.isInteger(entry.occurrence) || (entry.occurrence as number) < 1)) issues.push(`${entryPath}.occurrence must be an integer >= 1`);
+      if (Object.prototype.hasOwnProperty.call(entry, "facet") && entry.facet === undefined) issues.push(`${entryPath}.facet must be a non-empty string or null`);
+      else if (entry.facet !== undefined && entry.facet !== null && !nonEmptyStateString(entry.facet)) issues.push(`${entryPath}.facet must be a non-empty string or null`);
+    });
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "roster_selection")) {
+    if (value.roster_selection === undefined) issues.push(`${path}.roster_selection must not be undefined`);
+    else validateStateSelection(value.roster_selection, `${path}.roster_selection`, issues);
+  }
+  if (!Object.prototype.hasOwnProperty.call(value, "work_identity")) issues.push(`${path}.work_identity is required`);
+  else validateStateIdentity(value.work_identity, `${path}.work_identity`, issues);
+  if (Object.prototype.hasOwnProperty.call(value, "pending")) {
+    if (value.pending === undefined) issues.push(`${path}.pending must not be undefined`);
+    else if (!Array.isArray(value.pending)) issues.push(`${path}.pending must be an array`);
+    else value.pending.forEach((entry, index) => validateStatePending(entry, `${path}.pending[${index}]`, issues));
+  }
+  if (!["ready", "dispatched", "joining", "complete", "invalidated"].includes(String(value.status))) issues.push(`${path}.status has an unknown value`);
+  if (!Array.isArray(value.dispatches)) {
+    issues.push(`${path}.dispatches must be an array`);
+  } else {
+    value.dispatches.forEach((entry, index) => validateStateDispatchRecord(entry, `${path}.dispatches[${index}]`, issues));
+  }
+}
+
 
 function validateStateTrustedCheckpointAnswers(value: unknown, path: string, issues: string[]): void {
   if (!Array.isArray(value)) {
@@ -300,8 +541,231 @@ function validateStateMigration(value: unknown, path: string, issues: string[]):
   if (!["complete", "blocked"].includes(String(value.status))) issues.push(`${path}.status has an unknown value`);
 }
 
+function validateStateRetiredCapabilities(value: unknown, path: string, issues: string[]): void {
+  if (!Array.isArray(value)) {
+    issues.push(`${path} must be an array`);
+    return;
+  }
+  if (value.length > 128) issues.push(`${path} must contain at most 128 entries per run`);
+  const keys = new Set<string>();
+  value.forEach((entry, index) => {
+    const entryPath = `${path}[${index}]`;
+    if (!isStateRecord(entry)) {
+      issues.push(`${entryPath} must be an object`);
+      return;
+    }
+    strictStateKeys(entry, [
+      "capability_id", "capability_epoch", "run_identity", "work_identity",
+      "dispatch_capability", "completion_outcome", "completion_envelope", "reason", "retired_at",
+    ], entryPath, issues);
+    for (const key of ["capability_id", "capability_epoch", "reason", "retired_at"]) {
+      if (!nonEmptyStateString(entry[key])) issues.push(`${entryPath}.${key} must be a non-empty string`);
+    }
+    const key = `${String(entry.capability_id)}:${String(entry.capability_epoch)}`;
+    if (keys.has(key)) issues.push(`${entryPath} duplicates capability_id+capability_epoch`);
+    keys.add(key);
+    if (!Object.prototype.hasOwnProperty.call(entry, "run_identity")) issues.push(`${entryPath}.run_identity is required`);
+    else validateRunIdentity(entry.run_identity, `${entryPath}.run_identity`, issues);
+    validateStateIdentity(entry.work_identity, `${entryPath}.work_identity`, issues);
+    if (!Object.prototype.hasOwnProperty.call(entry, "dispatch_capability")) issues.push(`${entryPath}.dispatch_capability is required`);
+    else if (entry.dispatch_capability === undefined) issues.push(`${entryPath}.dispatch_capability must not be undefined`);
+    else validateStateCapability(entry.dispatch_capability, `${entryPath}.dispatch_capability`, issues);
+    if (!Object.prototype.hasOwnProperty.call(entry, "completion_outcome")) {
+      issues.push(`${entryPath}.completion_outcome is required`);
+    } else if (entry.completion_outcome !== null && !["pending", "succeeded", "failed", "cancelled"].includes(String(entry.completion_outcome))) {
+      issues.push(`${entryPath}.completion_outcome has an unknown value`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(entry, "completion_envelope")) {
+      issues.push(`${entryPath}.completion_envelope is required`);
+    } else if (entry.completion_envelope === undefined) {
+      issues.push(`${entryPath}.completion_envelope must be null or a valid envelope`);
+    } else if (entry.completion_envelope !== null) {
+      validateStateCompletion(entry.completion_envelope, `${entryPath}.completion_envelope`, issues);
+    }
+    const capability = isStateRecord(entry.dispatch_capability) ? entry.dispatch_capability : null;
+    const entryRun = validateWorkflowRunIdentity(entry.run_identity);
+    const entryIdentity = isStateRecord(entry.work_identity) ? entry.work_identity : null;
+    const capabilityIdentity = capability && isStateRecord(capability.work_identity) ? capability.work_identity : null;
+    const capabilityRun = capability ? validateWorkflowRunIdentity(capability.run_identity) : null;
+    if (entryRun?.ok && capabilityRun?.ok && !sameRunIdentity(entryRun.value, capabilityRun.value)) {
+      issues.push(`${entryPath}.dispatch_capability.run_identity must match run_identity`);
+    }
+    if (entryIdentity && capabilityIdentity && !sameWorkIdentity(entryIdentity as unknown as WorkIdentity, capabilityIdentity as unknown as WorkIdentity)) {
+      issues.push(`${entryPath}.dispatch_capability.work_identity must match work_identity`);
+    }
+    if (capability && String(capability.capability_id) !== String(entry.capability_id)) issues.push(`${entryPath}.capability_id must match dispatch_capability.capability_id`);
+    if (capability && isStateRecord(capability.issued_for) && String(capability.issued_for.cursor_epoch) !== String(entry.capability_epoch)) {
+      issues.push(`${entryPath}.capability_epoch must match dispatch_capability.issued_for.cursor_epoch`);
+    }
+    if (capabilityIdentity && String(capabilityIdentity.capability_epoch) !== String(entry.capability_epoch)) {
+      issues.push(`${entryPath}.capability_epoch must match dispatch_capability.work_identity.capability_epoch`);
+    }
+    const envelope = entry.completion_envelope;
+    if (envelope && isStateRecord(envelope)) {
+      if (String(envelope.outcome) !== String(entry.completion_outcome)) issues.push(`${entryPath}.completion_outcome must match completion_envelope.outcome`);
+      if (entryIdentity && isStateRecord(envelope.identity) && !sameWorkIdentity(entryIdentity as unknown as WorkIdentity, envelope.identity as unknown as WorkIdentity)) {
+        issues.push(`${entryPath}.completion_envelope.identity must match work_identity`);
+      }
+      if (entryRun?.ok) {
+        const envelopeRun = validateWorkflowRunIdentity(envelope.run_identity);
+        if (envelopeRun.ok && !sameRunIdentity(entryRun.value, envelopeRun.value)) issues.push(`${entryPath}.completion_envelope.run_identity must match run_identity`);
+      }
+    } else if (entry.completion_outcome !== null) {
+      issues.push(`${entryPath}.completion_envelope is required when completion_outcome is not null`);
+    }
+  });
+}
+
+function validateStateIdentityCoherence(state: StateRecord, issues: string[]): void {
+  const checkedRun = validateWorkflowRunIdentity(state.run_identity);
+  if (!checkedRun.ok) return;
+  const run = checkedRun.value;
+  const workflow = typeof state.workflow === "string" ? state.workflow : null;
+  const classification = isStateRecord(state.classification) ? state.classification : null;
+  const classificationWorkflow = classification && typeof classification.workflow === "string" ? classification.workflow : null;
+  const stageCursor = typeof state.stage_cursor === "string" ? state.stage_cursor : null;
+  const validateIdentityBinding = (value: unknown, path: string, requireStage = false): void => {
+    if (!isStateRecord(value)) return;
+    if (value.run_id !== run.run_id) issues.push(`${path}.run_id does not match $.run_identity.run_id`);
+    if (value.session_id !== run.session.session_id) issues.push(`${path}.session_id does not match $.run_identity.session.session_id`);
+    if (workflow && value.workflow !== workflow) issues.push(`${path}.workflow does not match $.workflow`);
+    if (classificationWorkflow && value.workflow !== classificationWorkflow) issues.push(`${path}.workflow does not match $.classification.workflow`);
+    if (requireStage && stageCursor && (value.stage_id !== stageCursor || value.stage_cursor !== stageCursor)) {
+      issues.push(`${path}.stage_id/stage_cursor does not match $.stage_cursor`);
+    }
+  };
+  if (isStateRecord(state.work_identity)) validateIdentityBinding(state.work_identity, "$.work_identity", true);
+  if (isStateRecord(state.pending)) {
+    validateIdentityBinding(state.pending.identity, "$.pending.identity", true);
+    const pendingRun = validateWorkflowRunIdentity(state.pending.run_identity);
+    if (pendingRun.ok && !sameRunIdentity(run, pendingRun.value)) issues.push("$.pending.run_identity does not match $.run_identity");
+    if (isStateRecord(state.work_identity) && isStateRecord(state.pending.identity) && !sameWorkIdentity(state.work_identity as unknown as WorkIdentity, state.pending.identity as unknown as WorkIdentity)) {
+      issues.push("$.pending.identity does not match $.work_identity");
+    }
+  }
+  if (isStateRecord(state.completion_envelope)) {
+    validateIdentityBinding(state.completion_envelope.identity, "$.completion_envelope.identity", true);
+    const envelopeRun = validateWorkflowRunIdentity(state.completion_envelope.run_identity);
+    if (envelopeRun.ok && !sameRunIdentity(run, envelopeRun.value)) issues.push("$.completion_envelope.run_identity does not match $.run_identity");
+    if (isStateRecord(state.work_identity) && isStateRecord(state.completion_envelope.identity) && !sameWorkIdentity(state.work_identity as unknown as WorkIdentity, state.completion_envelope.identity as unknown as WorkIdentity)) {
+      issues.push("$.completion_envelope.identity does not match $.work_identity");
+    }
+  }
+  const validateChild = (value: unknown, path: string): void => {
+    if (!isStateRecord(value)) return;
+    const childRun = validateWorkflowRunIdentity(value.run_identity);
+    if (childRun.ok && !sameRunIdentity(run, childRun.value)) issues.push(`${path}.run_identity does not match $.run_identity`);
+    validateIdentityBinding(value.parent, `${path}.parent`);
+    validateIdentityBinding(value.child, `${path}.child`);
+  };
+  if (Object.prototype.hasOwnProperty.call(state, "child_join")) validateChild(state.child_join, "$.child_join");
+  if (Array.isArray(state.child_joins)) state.child_joins.forEach((join, index) => validateChild(join, `$.child_joins[${index}]`));
+  if (isStateRecord(state.join_summary)) {
+    const summaryRun = validateWorkflowRunIdentity(state.join_summary.run_identity);
+    if (summaryRun.ok && !sameRunIdentity(run, summaryRun.value)) issues.push("$.join_summary.run_identity does not match $.run_identity");
+    if (isStateRecord(state.join_summary.work_identity)) validateIdentityBinding(state.join_summary.work_identity, "$.join_summary.work_identity");
+  }
+  if (Array.isArray(state.typed_checkpoint_decisions)) {
+    state.typed_checkpoint_decisions.forEach((decision, index) => {
+      if (!isStateRecord(decision)) return;
+      if (decision.run_id !== run.run_id) issues.push(`$.typed_checkpoint_decisions[${index}].run_id does not match $.run_identity.run_id`);
+      const decisionRun = validateWorkflowRunIdentity(decision.run_identity);
+      if (decisionRun.ok && !sameRunIdentity(run, decisionRun.value)) issues.push(`$.typed_checkpoint_decisions[${index}].run_identity does not match $.run_identity`);
+    });
+  }
+  if (Array.isArray(state.checkpoint_decisions)) {
+    state.checkpoint_decisions.forEach((decision, index) => {
+      if (!isStateRecord(decision)) return;
+      if (decision.run_id !== undefined && decision.run_id !== run.run_id) issues.push(`$.checkpoint_decisions[${index}].run_id does not match $.run_identity.run_id`);
+      if (decision.run_identity !== undefined) {
+        const decisionRun = validateWorkflowRunIdentity(decision.run_identity);
+        if (decisionRun.ok && !sameRunIdentity(run, decisionRun.value)) issues.push(`$.checkpoint_decisions[${index}].run_identity does not match $.run_identity`);
+      }
+      if (decision.work_identity !== undefined) validateIdentityBinding(decision.work_identity, `$.checkpoint_decisions[${index}].work_identity`);
+    });
+  }
+  if (Array.isArray(state.trusted_checkpoint_answers)) {
+    state.trusted_checkpoint_answers.forEach((answer, index) => {
+      if (isStateRecord(answer) && answer.run_id !== run.run_id) issues.push(`$.trusted_checkpoint_answers[${index}].run_id does not match $.run_identity.run_id`);
+    });
+  }
+  if (isStateRecord(state.roster_selection)) {
+    if (state.roster_selection.session_id !== run.session.session_id) issues.push("$.roster_selection.session_id does not match $.run_identity.session.session_id");
+    if (workflow && state.roster_selection.workflow !== workflow) issues.push("$.roster_selection.workflow does not match $.workflow");
+    if (classificationWorkflow && state.roster_selection.workflow !== classificationWorkflow) issues.push("$.roster_selection.workflow does not match $.classification.workflow");
+    if (stageCursor && state.roster_selection.stage_id !== stageCursor) issues.push("$.roster_selection.stage_id does not match $.stage_cursor");
+  }
+  if (isStateRecord(state.dispatch_capability)) {
+    const capabilityRun = validateWorkflowRunIdentity(state.dispatch_capability.run_identity);
+    if (capabilityRun.ok && !sameRunIdentity(run, capabilityRun.value)) issues.push("$.dispatch_capability.run_identity does not match $.run_identity");
+    const issued = isStateRecord(state.dispatch_capability.issued_for) ? state.dispatch_capability.issued_for : null;
+    const issuedRun = issued ? validateWorkflowRunIdentity(issued.run_identity) : null;
+    if (issuedRun?.ok && !sameRunIdentity(run, issuedRun.value)) issues.push("$.dispatch_capability.issued_for.run_identity does not match $.run_identity");
+    if (isStateRecord(state.work_identity) && isStateRecord(state.dispatch_capability.work_identity) && !sameWorkIdentity(state.work_identity as unknown as WorkIdentity, state.dispatch_capability.work_identity as unknown as WorkIdentity)) {
+      issues.push("$.dispatch_capability.work_identity does not match $.work_identity");
+    }
+    if (isStateRecord(state.dispatch_capability.work_identity)) validateIdentityBinding(state.dispatch_capability.work_identity, "$.dispatch_capability.work_identity", true);
+    if (Array.isArray(state.dispatch_capability.pending)) {
+      state.dispatch_capability.pending.forEach((pending, index) => {
+        if (!isStateRecord(pending)) return;
+        const pendingRun = validateWorkflowRunIdentity(pending.run_identity);
+        if (pendingRun.ok && !sameRunIdentity(run, pendingRun.value)) issues.push(`$.dispatch_capability.pending[${index}].run_identity does not match $.run_identity`);
+        validateIdentityBinding(pending.identity, `$.dispatch_capability.pending[${index}].identity`);
+      });
+    }
+    if (Array.isArray(state.dispatch_capability.dispatches)) {
+      state.dispatch_capability.dispatches.forEach((record, index) => {
+        if (!isStateRecord(record)) return;
+        const recordRun = validateWorkflowRunIdentity(record.run_identity);
+        if (recordRun.ok && !sameRunIdentity(run, recordRun.value)) issues.push(`$.dispatch_capability.dispatches[${index}].run_identity does not match $.run_identity`);
+        validateIdentityBinding(record.work_identity, `$.dispatch_capability.dispatches[${index}].work_identity`);
+        if (isStateRecord(record.pending)) {
+          const pendingRun = validateWorkflowRunIdentity(record.pending.run_identity);
+          if (pendingRun.ok && !sameRunIdentity(run, pendingRun.value)) issues.push(`$.dispatch_capability.dispatches[${index}].pending.run_identity does not match $.run_identity`);
+          if (isStateRecord(record.work_identity) && isStateRecord(record.pending.identity) && !sameWorkIdentity(record.work_identity as unknown as WorkIdentity, record.pending.identity as unknown as WorkIdentity)) {
+            issues.push(`$.dispatch_capability.dispatches[${index}].pending.identity does not match dispatch work_identity`);
+          }
+        }
+        if (isStateRecord(record.completion)) {
+          const completionRun = validateWorkflowRunIdentity(record.completion.run_identity);
+          if (completionRun.ok && !sameRunIdentity(run, completionRun.value)) issues.push(`$.dispatch_capability.dispatches[${index}].completion.run_identity does not match $.run_identity`);
+          if (isStateRecord(record.work_identity) && isStateRecord(record.completion.work_identity) && !sameWorkIdentity(record.work_identity as unknown as WorkIdentity, record.completion.work_identity as unknown as WorkIdentity)) {
+            issues.push(`$.dispatch_capability.dispatches[${index}].completion.work_identity does not match dispatch work_identity`);
+          }
+        }
+        if (isStateRecord(record.completion_envelope)) {
+          const envelopeRun = validateWorkflowRunIdentity(record.completion_envelope.run_identity);
+          if (envelopeRun.ok && !sameRunIdentity(run, envelopeRun.value)) issues.push(`$.dispatch_capability.dispatches[${index}].completion_envelope.run_identity does not match $.run_identity`);
+          if (isStateRecord(record.work_identity) && isStateRecord(record.completion_envelope.identity) && !sameWorkIdentity(record.work_identity as unknown as WorkIdentity, record.completion_envelope.identity as unknown as WorkIdentity)) {
+            issues.push(`$.dispatch_capability.dispatches[${index}].completion_envelope.identity does not match dispatch work_identity`);
+          }
+        }
+      });
+    }
+  }
+}
+
 function validateTypedStateFields(state: StateRecord): string[] {
   const issues: string[] = [];
+  for (const retired of ["identity", "profile_identity"]) {
+    if (Object.prototype.hasOwnProperty.call(state, retired)) issues.push(`$.${retired} is retired; persist project_identity and run_identity instead`);
+  }
+  if (!Object.prototype.hasOwnProperty.call(state, "project_identity")) {
+    issues.push("$.project_identity is required for an active v2 lifecycle");
+  }
+  if (!Object.prototype.hasOwnProperty.call(state, "run_identity")) {
+    issues.push("$.run_identity is required for an active v2 lifecycle");
+  }
+  const project = validateProjectIdentity(state.project_identity);
+  if (!project.ok) issues.push(...project.diagnostics.map((diagnostic) => `$.project_identity ${diagnostic.code}`));
+  const run = validateWorkflowRunIdentity(state.run_identity);
+  if (!run.ok) issues.push(...run.diagnostics.map((diagnostic) => `$.run_identity ${diagnostic.code}`));
+  if (project.ok && run.ok && !sameProjectIdentity(project.value, run.value)) {
+    issues.push("$.run_identity project pins do not match $.project_identity");
+  }
+  for (const key of ["workflow", "stage_cursor", "cursor_epoch"]) {
+    if (!nonEmptyStateString(state[key])) issues.push(`$.${key} must be a non-empty string`);
+  }
   const profileFields: StateRecord = {};
   for (const key of ["completion_intent", "checkpoint_policy", "roster_policy"]) {
     if (Object.prototype.hasOwnProperty.call(state, key)) profileFields[key] = state[key];
@@ -325,6 +789,13 @@ function validateTypedStateFields(state: StateRecord): string[] {
   }
   if (Object.prototype.hasOwnProperty.call(state, "completion_envelope")) validateStateCompletion(state.completion_envelope, "$.completion_envelope", issues);
   if (Object.prototype.hasOwnProperty.call(state, "migration")) validateStateMigration(state.migration, "$.migration", issues);
+  if (Object.prototype.hasOwnProperty.call(state, "dispatch_capability")) {
+    if (state.dispatch_capability === undefined) issues.push("$.dispatch_capability must not be undefined");
+    else validateStateCapability(state.dispatch_capability, "$.dispatch_capability", issues);
+  }
+  if (Object.prototype.hasOwnProperty.call(state, "retired_capabilities")) {
+    validateStateRetiredCapabilities(state.retired_capabilities, "$.retired_capabilities", issues);
+  }
   const classification = isStateRecord(state.classification) ? state.classification : null;
   if (classification) {
     const classificationFields: StateRecord = {};
@@ -332,6 +803,26 @@ function validateTypedStateFields(state: StateRecord): string[] {
     const classificationValidation = validateProfileControlPlane(classificationFields);
     if (!classificationValidation.ok) issues.push(...classificationValidation.issues.map((entry) => `classification${entry.slice(1)}`));
   }
+  if (
+    Object.prototype.hasOwnProperty.call(state, "completion_intent")
+    && classification
+    && Object.prototype.hasOwnProperty.call(classification, "completion_intent")
+  ) {
+    const rootCompletionValidation = validateProfileControlPlane({
+      completion_intent: state.completion_intent,
+    });
+    const classificationCompletionValidation = validateProfileControlPlane({
+      completion_intent: classification.completion_intent,
+    });
+    if (
+      rootCompletionValidation.ok
+      && classificationCompletionValidation.ok
+      && stableStateHash(state.completion_intent) !== stableStateHash(classification.completion_intent)
+    ) {
+      issues.push("classification.completion_intent conflicts with completion_intent");
+    }
+  }
+  validateStateIdentityCoherence(state, issues);
   return issues;
 }
 
@@ -343,59 +834,168 @@ function stableStateHash(value: unknown): string {
   };
   return createHash("sha256").update(JSON.stringify(canonicalize(value))).digest("hex");
 }
+const MAX_RETIRED_CAPABILITIES = 128;
 
-function migrationIntent(): CompletionIntent {
+function clonedStateValue<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function lifecycleDiagnostic(
+  code: "IDENTITY_MISMATCH" | "MIGRATION_REQUIRED",
+  operation: "runtime.activate" | "binding.write",
+  field: string,
+  remediation: string,
+): WorkflowLifecycleError {
+  return new WorkflowLifecycleError(createDiagnostic({
+    code,
+    operation,
+    severity: "error",
+    evidence: { field },
+    remediation,
+  }));
+}
+
+/**
+ * Append an immutable retirement record. Duplicate capability id/epoch
+ * replays are accepted only when the complete archived entry is equivalent.
+ */
+export function appendRetiredCapability(state: TeamState, entry: RetiredCapability): TeamState {
+  const history = state.retired_capabilities ?? [];
+  if (!Array.isArray(history)) {
+    throw lifecycleDiagnostic("MIGRATION_REQUIRED", "binding.write", "retired_capabilities", "Migrate the retired capability ledger to the strict bounded array shape.");
+  }
+  const key = `${entry.capability_id}:${entry.capability_epoch}`;
+  const existing = history.find((candidate) => `${candidate.capability_id}:${candidate.capability_epoch}` === key);
+  if (existing) {
+    if (stableStateHash(existing) !== stableStateHash(entry)) {
+      throw lifecycleDiagnostic("MIGRATION_REQUIRED", "binding.write", "retired_capabilities", "Archive the conflicting capability history before retrying the lifecycle transition.");
+    }
+    return state;
+  }
+  if (history.length >= MAX_RETIRED_CAPABILITIES) {
+    throw lifecycleDiagnostic("MIGRATION_REQUIRED", "binding.write", "retired_capabilities", "Archive or migrate the retired capability ledger before issuing another capability; the per-run limit is 128.");
+  }
   return {
-    mode: "complete_outcome",
-    acceptance: "dod_and_artifacts",
-    source: "migration",
-    rationale: "Legacy workflow runs requested a completed outcome; this default grants no checkpoint permission.",
+    ...state,
+    retired_capabilities: [...history, clonedStateValue(entry)],
   };
 }
 
-function migrationPolicy(checkpoint: string): CheckpointPolicy {
-  const product = checkpoint === "product_approval";
+/** Remove all current capability-bound fields without creating own undefined keys. */
+export function clearCurrentIdentityFields(state: TeamState): TeamState {
+  const cleared: StateRecord = { ...state };
+  for (const key of ["dispatch_capability", "work_identity", "pending", "completion_envelope", "child_join", "join_summary", "roster_selection"]) {
+    delete cleared[key];
+  }
+  return cleared as unknown as TeamState;
+}
+
+/**
+ * Retire the currently armed capability and clear all current authority. An
+ * unarmed state with no current work identity is already reset; a work
+ * identity without its capability is unrecoverable and fails closed.
+ */
+export function retireCurrentCapability(state: TeamState, reason: string): TeamState {
+  const hasCapability = Object.prototype.hasOwnProperty.call(state, "dispatch_capability");
+  const hasWorkIdentity = Object.prototype.hasOwnProperty.call(state, "work_identity");
+  if (!hasCapability) {
+    if (hasWorkIdentity || Object.prototype.hasOwnProperty.call(state, "pending") || Object.prototype.hasOwnProperty.call(state, "completion_envelope")) {
+      throw lifecycleDiagnostic("MIGRATION_REQUIRED", "runtime.activate", "dispatch_capability", "The current work identity has no capability snapshot to retire; migrate or recreate the workflow before rotating it.");
+    }
+    return clearCurrentIdentityFields(state);
+  }
+  if (state.dispatch_capability === undefined || !isStateRecord(state.dispatch_capability)) {
+    throw lifecycleDiagnostic("MIGRATION_REQUIRED", "runtime.activate", "dispatch_capability", "The current dispatch capability is malformed and cannot be retired safely.");
+  }
+  const capabilityIssues: string[] = [];
+  validateStateCapability(state.dispatch_capability, "$.dispatch_capability", capabilityIssues);
+  if (capabilityIssues.length > 0) {
+    throw lifecycleDiagnostic("MIGRATION_REQUIRED", "runtime.activate", "dispatch_capability", "The current dispatch capability is malformed and cannot be retired safely.");
+  }
+  if (!isStateRecord(state.work_identity)) {
+    throw lifecycleDiagnostic("MIGRATION_REQUIRED", "runtime.activate", "work_identity", "The current capability has no complete top-level work identity to archive.");
+  }
+  const identityIssues: string[] = [];
+  validateStateIdentity(state.work_identity, "$.work_identity", identityIssues);
+  if (identityIssues.length > 0) {
+    throw lifecycleDiagnostic("MIGRATION_REQUIRED", "runtime.activate", "work_identity", "The current capability has no complete top-level work identity to archive.");
+  }
+  const capability = state.dispatch_capability as unknown as DispatchCapabilityState;
+  const identity = state.work_identity as unknown as WorkIdentity;
+  if (!isStateRecord(capability.work_identity) || !sameWorkIdentity(identity, capability.work_identity as unknown as WorkIdentity)) {
+    throw lifecycleDiagnostic("IDENTITY_MISMATCH", "runtime.activate", "work_identity", "The top-level and capability work identities must match before retirement.");
+  }
+  const run = validateWorkflowRunIdentity(state.run_identity);
+  const capabilityRun = validateWorkflowRunIdentity(capability.run_identity);
+  if (!run.ok || !capabilityRun.ok || !sameRunIdentity(run.value, capabilityRun.value) || identity.run_id !== run.value.run_id) {
+    throw lifecycleDiagnostic("IDENTITY_MISMATCH", "runtime.activate", "run_identity", "The current capability and work identity must belong to the active workflow run before retirement.");
+  }
+  const completion = Object.prototype.hasOwnProperty.call(state, "completion_envelope")
+    ? state.completion_envelope
+    : null;
+  if (completion !== null && completion !== undefined) {
+    const completionIssues: string[] = [];
+    validateStateCompletion(completion, "$.completion_envelope", completionIssues);
+    if (completionIssues.length > 0) {
+      throw lifecycleDiagnostic("MIGRATION_REQUIRED", "runtime.activate", "completion_envelope", "The current completion envelope is malformed and cannot be archived safely.");
+    }
+    const completionRecord = isStateRecord(completion) ? completion : null;
+    if (completionRecord === null) {
+      throw lifecycleDiagnostic("MIGRATION_REQUIRED", "runtime.activate", "completion_envelope", "The current completion envelope is malformed and cannot be archived safely.");
+    }
+    const completionRun = validateWorkflowRunIdentity(completionRecord.run_identity);
+    if (
+      !completionRun.ok
+      || !sameRunIdentity(run.value, completionRun.value)
+      || !isStateRecord(completionRecord.identity)
+      || !sameWorkIdentity(identity, completionRecord.identity as unknown as WorkIdentity)
+      || completionRecord.outcome === "pending"
+    ) {
+      throw lifecycleDiagnostic("IDENTITY_MISMATCH", "runtime.activate", "completion_envelope", "The current completion envelope must be a terminal envelope for the active work identity before retirement.");
+    }
+  }
+  const entry: RetiredCapability = {
+    capability_id: capability.capability_id,
+    capability_epoch: capability.work_identity.capability_epoch,
+    run_identity: clonedStateValue(run.value),
+    work_identity: clonedStateValue(identity),
+    dispatch_capability: clonedStateValue(capability),
+    completion_outcome: completion && isStateRecord(completion) ? completion.outcome as RetiredCapability["completion_outcome"] : null,
+    completion_envelope: completion && isStateRecord(completion) ? clonedStateValue(completion) : null,
+    reason: reason.trim(),
+    retired_at: new Date().toISOString(),
+  };
+  if (!entry.reason) {
+    throw lifecycleDiagnostic("MIGRATION_REQUIRED", "runtime.activate", "retired_capabilities.reason", "Retirements require a non-empty reason.");
+  }
+  const appended = appendRetiredCapability(state, entry);
   return {
-    default: "required_human",
-    scope: "decision",
-    hard_human: product ? ["product_approval"] : [],
-    rules: {
-      [checkpoint]: {
-        kind: product ? "product_approval" : "custom",
-        default: "required_human",
-        allowed_decisions: product ? ["proceed", "needs_more_validation", "defer", "reject"] : [],
-        phase: "before_advance",
-        rationale: "Legacy checkpoint declaration is migration input only; no autonomous decision is inferred.",
-      },
-    },
-    source: "migration",
-    policy_version: 1,
-    rationale: "No typed checkpoint policy was persisted; unresolved consent remains human-required.",
+    ...clearCurrentIdentityFields(appended),
+    cursor_epoch: randomUUID(),
   };
 }
 
-function legacyIdentity(state: StateRecord, workflow: string, stageId: string, capability: StateRecord | null): WorkIdentity {
-  const seed = `${String(state.run_key ?? state.branch)}|${String(state.branch)}|${workflow}|${stageId}`;
-  const digest = stableStateHash(seed).slice(0, 24);
-  const capabilityId = capability && nonEmptyStateString(capability.capability_id) ? capability.capability_id : `legacy-capability-${digest}`;
-  const epoch = nonEmptyStateString(state.cursor_epoch) ? state.cursor_epoch : `legacy-epoch-${digest}`;
-  return {
-    run_id: nonEmptyStateString(state.run_key) ? state.run_key : String(state.branch),
-    wave_id: `legacy-wave-${digest}`,
-    slice_id: `legacy-slice-${stageId}`,
-    session_id: `legacy-session-${digest}`,
-    workflow: workflow as TeamState["classification"]["workflow"],
-    stage_id: stageId,
-    stage_cursor: stageId,
-    capability_id: capabilityId,
-    capability_epoch: epoch,
-    slot_id: "orchestrator",
-    task_id: `legacy-task-${digest}`,
-    dispatch_id: `legacy-dispatch-${digest}`,
-    attempt: 1,
-    worker_id: "engine",
-  };
+/**
+ * Remove target/downstream roster and slot bindings while preserving upstream
+ * artifacts and all checkpoint/audit ledgers.
+ */
+export function clearStageBindings(state: TeamState, clearedStageIds: ReadonlySet<string>): TeamState {
+  const cleared = clearCurrentIdentityFields(state) as unknown as StateRecord;
+  const selections = state.roster_selections;
+  if (selections) {
+    const retainedSelections = Object.fromEntries(Object.entries(selections).filter(([stageId]) => !clearedStageIds.has(stageId)));
+    if (Object.keys(retainedSelections).length > 0) cleared.roster_selections = retainedSelections;
+    else delete cleared.roster_selections;
+  }
+  const slotArtifacts = state.slot_artifacts;
+  if (slotArtifacts) {
+    const retainedSlotArtifacts = Object.fromEntries(Object.entries(slotArtifacts).filter(([stageId]) => !clearedStageIds.has(stageId)));
+    if (Object.keys(retainedSlotArtifacts).length > 0) cleared.slot_artifacts = retainedSlotArtifacts;
+    else delete cleared.slot_artifacts;
+  }
+  return cleared as unknown as TeamState;
 }
+
 
 export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]): TeamState | null {
   if (!isStateRecord(raw)) return null;
@@ -403,22 +1003,18 @@ export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]
   const rawClassification = state.classification;
   const classification = isStateRecord(rawClassification) ? { ...rawClassification } : null;
   const legacyWorkflow = nonEmptyStateString(state.workflow) ? state.workflow : null;
-  if (classification && !nonEmptyStateString(classification.workflow) && legacyWorkflow) {
-    classification.workflow = legacyWorkflow;
-    state.classification = classification;
-  }
 
-  const initialIssues = validateTypedStateFields(state);
-  if (initialIssues.length > 0) {
-    rejectionIssues?.push(...initialIssues);
-    return null;
-  }
-
+  /*
+   * Structural normalization is intentionally limited to fields that describe
+   * the old cursor shape. It does not resolve a profile, project policy, or
+   * identity from process-global/filesystem state. Such records remain
+   * migration input and are never eligible for a v2 resume.
+   */
   const hasLegacyCursor = Array.isArray(state.pending_stages) || typeof state.status === "string";
   const hasDurableCursor = Array.isArray(state.stages) && typeof state.stage_cursor === "string";
   if (classification && legacyWorkflow && hasLegacyCursor && !hasDurableCursor) {
     state.schema = 1;
-    state.run_key = nonEmptyStateString(state.run_key) ? state.run_key : typeof state.branch === "string" ? state.branch : undefined;
+    if (!nonEmptyStateString(state.run_key)) delete state.run_key;
     state.stage_cursor = "";
     state.stages = [];
     const rawArtifacts = state.artifacts;
@@ -430,38 +1026,64 @@ export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]
     state.updated_at = nonEmptyStateString(state.updated_at) ? state.updated_at : new Date().toISOString();
   }
 
-  if (!classification || !nonEmptyStateString(classification.workflow)) return state as unknown as TeamState;
-  const workflow = classification.workflow;
-  const stageId = nonEmptyStateString(state.stage_cursor) ? state.stage_cursor : "";
-  const profile = loadProfile(workflow);
-  const stage = profile?.stages.find((candidate) => candidate.id === stageId);
-  const projection = profile && stageId ? resolveProfileControlPlane(profile, stageId) : null;
-  const legacyInputs: string[] = [];
-  if (typeof classification.autonomous === "boolean") legacyInputs.push("classification.autonomous");
-  if (typeof state.autonomous === "boolean") legacyInputs.push("TeamState.autonomous");
-  if (stage?.autonomous) legacyInputs.push("stage.autonomous");
-  const typedCompletion = state.completion_intent;
-  const completion_intent = typedCompletion ?? projection?.completion_intent ?? migrationIntent();
-  if (classification.completion_intent && stableStateHash(classification.completion_intent) !== stableStateHash(completion_intent)) {
-    rejectionIssues?.push("$.classification.completion_intent conflicts with the resolved completion intent");
+  const initialIssues = validateTypedStateFields(state);
+  if (initialIssues.length > 0) {
+    rejectionIssues?.push(...initialIssues);
     return null;
   }
-  state.completion_intent = completion_intent;
-  const typedPolicy = state.checkpoint_policy;
-  const checkpoint_policy = typedPolicy
-    ?? projection?.checkpoint_policy
-    ?? (stage?.checkpoint ? migrationPolicy(stage.checkpoint) : undefined);
-  if (checkpoint_policy) state.checkpoint_policy = checkpoint_policy;
-  if (stage?.roster_policy && state.roster_policy === undefined) state.roster_policy = stage.roster_policy;
 
-  const capability = isStateRecord(state.dispatch_capability) ? state.dispatch_capability : null;
-  const capabilityIdentity = capability?.work_identity;
-  if (state.work_identity === undefined && capabilityIdentity !== undefined) state.work_identity = capabilityIdentity;
-  else if (state.work_identity !== undefined && capabilityIdentity !== undefined && stableStateHash(state.work_identity) !== stableStateHash(capabilityIdentity)) {
-    rejectionIssues?.push("$.work_identity conflicts with dispatch_capability.work_identity");
-    return null;
+  /*
+   * An armed dispatch capability is itself a durable authorization boundary.
+   * Its work identity and top-level work identity must both be complete and
+   * exactly synchronized. Never repair either side from the other.
+   */
+  const rawCapability = state.dispatch_capability;
+  if (rawCapability !== undefined) {
+    if (!isStateRecord(rawCapability)) {
+      rejectionIssues?.push("$.dispatch_capability must be an object when present");
+      return null;
+    }
+    const capabilityIdentity = rawCapability.work_identity;
+    if (!Object.prototype.hasOwnProperty.call(rawCapability, "work_identity") || capabilityIdentity === undefined) {
+      rejectionIssues?.push("$.dispatch_capability.work_identity is required for an armed capability");
+      return null;
+    }
+    const capabilityIdentityIssues: string[] = [];
+    validateStateIdentity(capabilityIdentity, "$.dispatch_capability.work_identity", capabilityIdentityIssues);
+    if (capabilityIdentityIssues.length > 0) {
+      rejectionIssues?.push(...capabilityIdentityIssues);
+      return null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(state, "work_identity") || state.work_identity === undefined) {
+      rejectionIssues?.push("$.work_identity is required when dispatch_capability is present");
+      return null;
+    }
+    if (stableStateHash(state.work_identity) !== stableStateHash(capabilityIdentity)) {
+      rejectionIssues?.push("$.work_identity conflicts with dispatch_capability.work_identity");
+      return null;
+    }
   }
-  if (state.work_identity === undefined && stageId && nonEmptyStateString(state.run_key ?? state.branch)) state.work_identity = legacyIdentity(state, workflow, stageId, capability);
+
+  if (isStateRecord(state.dispatch_capability)) {
+    const capability = state.dispatch_capability;
+    const capabilityRun = capability.run_identity;
+    if (capabilityRun !== undefined) {
+      const checkedCapabilityRun = validateWorkflowRunIdentity(capabilityRun);
+      if (!checkedCapabilityRun.ok) {
+        rejectionIssues?.push("$.dispatch_capability.run_identity is malformed");
+        return null;
+      }
+      const stateRun = state.run_identity;
+      if (stateRun !== undefined) {
+        const checkedStateRun = validateWorkflowRunIdentity(stateRun);
+        if (!checkedStateRun.ok || !sameRunIdentity(checkedStateRun.value, checkedCapabilityRun.value)) {
+          rejectionIssues?.push("$.run_identity conflicts with dispatch_capability.run_identity");
+          return null;
+        }
+      }
+    }
+  }
+
   const identity = isStateRecord(state.work_identity) ? state.work_identity : null;
   for (const candidate of [state.pending, state.completion_envelope]) {
     if (!candidate || !isStateRecord(candidate) || !identity || !isStateRecord(candidate.identity)) continue;
@@ -477,51 +1099,12 @@ export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]
     }
   }
 
-  const targetProfileHash = profile ? profileHash(profile) : (nonEmptyStateString(state.profile_hash) ? state.profile_hash : "unresolved-profile");
-  if (!state.profile_hash && profile) state.profile_hash = targetProfileHash;
-  const targetPolicyHash = stableStateHash(checkpoint_policy ?? { default: "required_human", scope: "decision", rules: {} });
-  const migration = state.migration as StateRecord | undefined;
-  if (!migration) {
-    const receipt: MigrationReceipt = {
-      id: `migration-${stableStateHash(`${String(state.run_key ?? state.branch)}|${workflow}`).slice(0, 24)}`,
-      from_schema: 1,
-      to_schema: 2,
-      source_profile_hash: nonEmptyStateString(state.profile_hash) ? state.profile_hash : "unresolved-profile",
-      target_profile_hash: targetProfileHash,
-      source_policy_hash: null,
-      target_policy_hash: targetPolicyHash,
-      legacy_inputs: [...new Set(legacyInputs)],
-      warnings: [
-        !typedCompletion ? "completion_intent projected from typed profile or conservative migration default" : null,
-        !typedPolicy && stage?.checkpoint ? "checkpoint_policy projected from typed profile or conservative human-required migration policy" : null,
-        stage?.autonomous ? "stage.autonomous is display/migration input only" : null,
-      ].filter((warning): warning is string => warning !== null),
-      status: "complete",
-      migrated_at: new Date().toISOString(),
-    };
-    state.migration = receipt;
-  }
-  const provenance: ControlPlaneProvenance = {
-    completion_intent: typedCompletion ? "state" : projection?.completion_intent ? "profile" : "migration",
-    checkpoint_policy: typedPolicy ? "state" : projection?.checkpoint_policy ? "profile" : stage?.checkpoint ? "migration" : "none",
-    roster_policy: stage?.roster_policy || state.roster_policy ? "profile" : "legacy",
-    roster_selection: state.roster_selection ? "state" : "none",
-    work_identity: state.work_identity ? (capabilityIdentity ? "typed" : "migration") : "none",
-    pending: state.pending ? "state" : "none",
-    child_join: state.child_join ? "state" : "none",
-    completion_envelope: state.completion_envelope ? "state" : "none",
-    legacy_inputs: [...new Set(legacyInputs)],
-    warnings: stage?.autonomous ? ["stage.autonomous is display/migration input only"] : [],
-    status: legacyInputs.length > 0 || !typedCompletion || !typedPolicy ? "migrated" : "typed",
-  };
-  state.control_plane_provenance = provenance;
-
   const finalIssues = validateTypedStateFields(state);
   if (finalIssues.length > 0) {
     rejectionIssues?.push(...finalIssues);
     return null;
   }
-  return (state as unknown as TeamState);
+  return state as unknown as TeamState;
 }
 
 
@@ -534,36 +1117,48 @@ export interface ResolvedState {
   isLegacy: boolean;
   isStale: boolean;
   invalid?: boolean;
+  /** Typed reason when a persisted state is not eligible for runtime use. */
+  diagnostics?: readonly WorkflowV2Diagnostic[];
 }
 
-/**
- * A stale `.active-feature` pointer can survive an upgrade while the
- * orchestrator writes the current classification to the legacy root state.
- * Use that root only when the pointed feature state is incomplete and the
- * root state is a complete, branch-compatible workflow state. A complete
- * feature state remains authoritative; malformed or foreign root state never
- * becomes a fallback.
- */
-function resolveLegacyWorkflowFallback(cwd: string, wsDir: string, currentBranch?: string): ResolvedState | null {
-  const legacyPath = join(wsDir, LEGACY_STATE);
-  if (!existsSync(legacyPath)) return null;
-  try {
-    const realWorkState = realpathSync(wsDir);
-    if (!isWithin(realpathSync(cwd), realWorkState) || !isWithin(realWorkState, realpathSync(legacyPath))) return null;
-    const artifactsPath = join(wsDir, "artifacts");
-    if (existsSync(artifactsPath) && !isWithin(realWorkState, realpathSync(artifactsPath))) return null;
-    const state = normalizePersistedState(JSON.parse(readFileSync(legacyPath, "utf8")));
-    if (!state || !state.classification || typeof state.classification.workflow !== "string" || !state.classification.workflow || typeof state.branch !== "string" || !state.branch) return null;
-    if (currentBranch && state.branch !== currentBranch) return null;
-    return { state, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: false };
-  } catch {
-    return null;
-  }
+function resolutionDiagnostic(
+  code: "MIGRATION_REQUIRED" | "IDENTITY_MISMATCH" | "UNSAFE_PATH",
+  statePath: string | null,
+  evidence: Record<string, unknown>,
+): WorkflowV2Diagnostic {
+  return createDiagnostic({
+    code,
+    operation: "runtime.activate",
+    evidence: { ...(statePath ? { path: statePath } : {}), ...evidence },
+    remediation: code === "IDENTITY_MISMATCH"
+      ? "Start a fresh workflow lifecycle for the current root, provider, catalog, config, profile, and session identity."
+      : "Migrate the persisted state explicitly before attempting to resume it.",
+  });
+}
+
+function invalidResolution(
+  statePath: string | null,
+  stateDir: string | null,
+  artifactsDir: string | null,
+  code: "MIGRATION_REQUIRED" | "IDENTITY_MISMATCH" | "UNSAFE_PATH",
+  evidence: Record<string, unknown> = {},
+  state: TeamState | null = null,
+): ResolvedState {
+  return {
+    state,
+    statePath,
+    stateDir,
+    artifactsDir,
+    isLegacy: false,
+    isStale: false,
+    invalid: true,
+    diagnostics: [resolutionDiagnostic(code, statePath, evidence)],
+  };
 }
 
 export type StateSelector = { kind?: "auto" | "team" | "cto-slice"; runId?: string; sliceId?: string; capabilityId?: string };
 export interface ResolvedActiveRun extends ResolvedState {
-  kind: "legacy-root" | "feature" | "cto-slice";
+  kind: "feature" | "cto-slice";
   runKey: string;
   branch: string;
   workflow: string;
@@ -575,138 +1170,285 @@ export interface ResolvedActiveRun extends ResolvedState {
   selectedTeam?: unknown;
 }
 
-/** Resolve the one authoritative persisted run. Explicit CTO selectors fail closed.
- * A stale active-feature pointer may use a complete, branch-compatible legacy
- * root only when the pointed feature state is incomplete. */
-export function resolveCanonicalRun(cwd: string, selector: StateSelector = {}, currentBranch?: string): ResolvedActiveRun | null {
+/** Resolve the one authoritative persisted run. Explicit CTO selectors fail closed. */
+export function resolveCanonicalRun(
+  cwd: string,
+  expectedRunIdentity: WorkflowRunIdentity,
+  selector: StateSelector = {},
+  currentBranch?: string,
+): ResolvedActiveRun | null {
+  const identity = validateWorkflowRunIdentity(expectedRunIdentity);
+  if (!identity.ok) {
+    throw new WorkflowLifecycleError(identity.diagnostics[0] ?? createDiagnostic({
+      code: "IDENTITY_MISMATCH",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { field: "expected_run_identity" },
+      remediation: "Provide a complete prepared workflow run identity before resolving a canonical run.",
+    }));
+  }
+  const runIdentity = identity.value;
   const branch = currentBranch;
   if (selector.kind === "cto-slice" || selector.runId || selector.sliceId) {
     if (!selector.runId || !selector.sliceId) throw new Error("cto-slice selector requires runId and sliceId");
-    const runId = selector.runId, sliceId = selector.sliceId;
-    if (!isSafeStateSegment(runId) || !isSafeStateSegment(sliceId)) throw new Error("cto-slice selector contains an unsafe path segment");
-    const cto = readCtoState(runId, cwd);
-    if (!cto) throw new Error(`CTO run '${runId}' is missing or unreadable`);
+    const runId = selector.runId;
+    const sliceId = selector.sliceId;
+    const cto = readCtoState(runId, cwd, runIdentity);
+    if (!cto) throw new WorkflowLifecycleError(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { run_id: runId },
+      remediation: "Migrate or recreate the CTO run with a complete prepared run identity.",
+    }));
+    if (!cto.run_identity) throw new WorkflowLifecycleError(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { run_id: runId, field: "run_identity" },
+      remediation: "Migrate or recreate the CTO run with a complete prepared run identity.",
+    }));
     const wave = activeWave(cto);
     if (!wave) throw new Error(`CTO run '${runId}' has no active wave`);
     const matches = cto.teams.filter((team) => team.slice_id === sliceId);
     if (matches.length !== 1) throw new Error(`CTO slice '${sliceId}' must map to exactly one active team`);
     const team = matches[0]!;
-    const execution = (team as unknown as { execution?: unknown }).execution;
-    if (!execution) throw new Error(`CTO slice '${sliceId}' has no shared execution capability`);
+    const teamRecord = team as unknown as Record<string, unknown>;
+    const execution = teamRecord.execution;
+    if (!execution || typeof execution !== "object") {
+      throw new WorkflowLifecycleError(createDiagnostic({
+        code: "MIGRATION_REQUIRED",
+        operation: "runtime.activate",
+        severity: "error",
+        evidence: { run_id: runId, slice_id: sliceId, field: "execution" },
+        remediation: "Migrate the CTO slice with a canonical shared execution capability.",
+      }));
+    }
+    const executionRecord = execution as Record<string, unknown>;
+    const runKey = typeof executionRecord.run_key === "string" && executionRecord.run_key.trim() ? executionRecord.run_key : null;
+    const workflow = typeof team.workflow === "string" && team.workflow.trim() ? team.workflow : null;
+    const profileHash = typeof executionRecord.profile_hash === "string" && executionRecord.profile_hash.trim() ? executionRecord.profile_hash : null;
+    const stageCursor = typeof executionRecord.stage_cursor === "string" && executionRecord.stage_cursor.trim() ? executionRecord.stage_cursor : null;
+    const cursorEpoch = typeof executionRecord.cursor_epoch === "string" && executionRecord.cursor_epoch.trim() ? executionRecord.cursor_epoch : null;
+    if (!runKey || !workflow || !profileHash || !stageCursor || !cursorEpoch) {
+      throw new WorkflowLifecycleError(createDiagnostic({
+        code: "MIGRATION_REQUIRED",
+        operation: "runtime.activate",
+        severity: "error",
+        evidence: { run_id: runId, slice_id: sliceId, field: "execution" },
+        remediation: "Migrate the CTO slice with canonical run, workflow, profile, stage, and cursor bindings.",
+      }));
+    }
     const staleReason = branch && cto.branch !== branch ? `branch mismatch: persisted '${cto.branch}', current '${branch}'` : null;
-    return { state: cto as any, statePath: join(cwd, WORK_STATE_DIR, "cto", cto.id, "state.json"), stateDir: join(cwd, WORK_STATE_DIR, "cto", cto.id), artifactsDir: join(cwd, WORK_STATE_DIR, "cto", cto.id, "artifacts"), isLegacy: false, isStale: Boolean(staleReason), kind: "cto-slice", runKey: `cto:${cto.id}:${sliceId}`, branch: cto.branch, workflow: team.workflow ?? "cto", profileHash: String((execution as any).profile_hash ?? ""), stageCursor: String((execution as any).stage_cursor ?? ""), cursorEpoch: String((execution as any).cursor_epoch ?? ""), dispatch: execution, staleReason, selectedTeam: team };
+    return {
+      state: null,
+      statePath: join(cwd, WORK_STATE_DIR, "cto", cto.id, "state.json"),
+      stateDir: join(cwd, WORK_STATE_DIR, "cto", cto.id),
+      artifactsDir: join(cwd, WORK_STATE_DIR, "cto", cto.id, "artifacts"),
+      isLegacy: false,
+      isStale: Boolean(staleReason),
+      kind: "cto-slice",
+      runKey,
+      branch: cto.branch,
+      workflow,
+      profileHash,
+      stageCursor,
+      cursorEpoch,
+      dispatch: execution,
+      staleReason,
+      selectedTeam: team,
+    };
   }
-  const resolved = resolveState(cwd, branch);
-  if (resolved.invalid) throw new Error("workflow state is invalid or unsafe");
+  const resolved = resolveState(cwd, branch, runIdentity);
+  if (resolved.invalid) {
+    const code = resolved.diagnostics?.[0]?.code ?? "MIGRATION_REQUIRED";
+    const diagnostic = resolved.diagnostics?.[0] ?? createDiagnostic({
+      code,
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { field: "state" },
+      remediation: "Migrate or recreate the persisted state before runtime activation.",
+    });
+    throw new WorkflowLifecycleError(diagnostic);
+  }
   if (!resolved.state || !resolved.statePath) return null;
   const state = resolved.state;
-  const kind = resolved.isLegacy ? "legacy-root" : "feature";
-  return { ...resolved, kind, runKey: resolved.isLegacy ? `team:${state.branch}:root` : `team:${state.branch}:${basename(resolved.stateDir ?? "")}`, branch: state.branch, workflow: state.classification.workflow, profileHash: state.profile_hash ?? "", stageCursor: state.stage_cursor, cursorEpoch: state.cursor_epoch ?? "", dispatch: state.dispatch_capability ?? null, staleReason: resolved.isStale ? `branch mismatch: persisted '${state.branch}', current '${branch ?? "unknown"}'` : null };
+  if (!state.project_identity || !state.run_identity || !state.run_key || !state.profile_hash || !state.cursor_epoch || !state.classification?.workflow) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { field: "project_identity_or_run_binding" },
+      remediation: "Persist complete project and run identities, run key, workflow, profile fingerprint, and cursor epoch before activation.",
+    }));
+  }
+  return {
+    ...resolved,
+    kind: "feature",
+    runKey: state.run_key,
+    branch: state.branch,
+    workflow: state.classification.workflow,
+    profileHash: state.profile_hash,
+    stageCursor: state.stage_cursor,
+    cursorEpoch: state.cursor_epoch,
+    dispatch: state.dispatch_capability ?? null,
+    staleReason: resolved.isStale ? `branch mismatch: persisted '${state.branch}', current '${branch ?? "unknown"}'` : null,
+  };
 }
 
-export function resolveState(cwd: string, currentBranch?: string): ResolvedState {
+export function resolveState(
+  cwd: string,
+  currentBranch?: string,
+  expectedRunIdentity?: WorkflowRunIdentity,
+): ResolvedState {
+  const checkedExpected = expectedRunIdentity === undefined
+    ? null
+    : validateWorkflowRunIdentity(expectedRunIdentity);
+  if (checkedExpected && !checkedExpected.ok) {
+    return invalidResolution(null, null, null, "IDENTITY_MISMATCH", { field: "expected_run_identity" });
+  }
   const wsDir = resolve(cwd, WORK_STATE_DIR);
   if (!existsSync(wsDir)) {
     return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false };
   }
   try {
     if (!isWithin(realpathSync(cwd), realpathSync(wsDir))) {
-      return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false, invalid: true };
+      return invalidResolution(null, null, null, "UNSAFE_PATH", { field: "work_state" });
     }
   } catch {
-    return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false, invalid: true };
+    return invalidResolution(wsDir, wsDir, null, "UNSAFE_PATH", { field: "work_state" });
   }
 
   const activeFile = join(wsDir, ACTIVE_FEATURE);
   if (existsSync(activeFile)) {
     const slug = readFileSync(activeFile, "utf8").trim();
     if (!isSafeStateSegment(slug)) {
-      return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false, invalid: true };
+      return invalidResolution(activeFile, null, null, "UNSAFE_PATH", { field: "active_feature" });
     }
     const featuresDir = join(wsDir, "features");
     const featureDir = join(featuresDir, slug);
     const statePath = join(featureDir, "state.json");
-    if (!existsSync(featuresDir)) return { state: null, statePath: null, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false };
+    const artifactsPath = join(featureDir, "artifacts");
+    if (!existsSync(featuresDir)) {
+      return { state: null, statePath: null, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: false };
+    }
     try {
       const realWorkState = realpathSync(wsDir);
       const realFeatures = realpathSync(featuresDir);
-      if (!isWithin(realpathSync(cwd), realWorkState) || !isWithin(realWorkState, realFeatures) || (existsSync(featureDir) && !isWithin(realFeatures, realpathSync(featureDir)))) {
-        return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false, invalid: true };
+      if (
+        !isWithin(realpathSync(cwd), realWorkState)
+        || !isWithin(realWorkState, realFeatures)
+        || (existsSync(featureDir) && !isWithin(realFeatures, realpathSync(featureDir)))
+      ) {
+        return invalidResolution(statePath, featureDir, artifactsPath, "UNSAFE_PATH", { field: "feature" });
       }
     } catch {
-      return { state: null, statePath, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false, invalid: true };
+      return invalidResolution(statePath, featureDir, artifactsPath, "UNSAFE_PATH", { field: "feature" });
     }
-    if (!existsSync(statePath)) return { state: null, statePath: null, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false };
+    if (!existsSync(statePath)) {
+      return { state: null, statePath: null, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: false };
+    }
     try {
       const realFeature = realpathSync(featureDir);
       if (!isWithin(realFeature, realpathSync(statePath))) {
-        return { state: null, statePath, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false, invalid: true };
+        return invalidResolution(statePath, featureDir, artifactsPath, "UNSAFE_PATH", { field: "state" });
       }
-      const artifactsPath = join(featureDir, "artifacts");
       if (existsSync(artifactsPath) && !isWithin(realFeature, realpathSync(artifactsPath))) {
-        return { state: null, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: false, invalid: true };
+        return invalidResolution(statePath, featureDir, artifactsPath, "UNSAFE_PATH", { field: "artifacts" });
       }
       const state = normalizePersistedState(JSON.parse(readFileSync(statePath, "utf8")));
       if (!state) {
-        const legacyFallback = resolveLegacyWorkflowFallback(cwd, wsDir, currentBranch);
-        if (legacyFallback) return legacyFallback;
-        return { state: null, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: false, invalid: true };
+        return invalidResolution(statePath, featureDir, artifactsPath, "MIGRATION_REQUIRED", { field: "state" });
+      }
+      const stale = currentBranch ? state.branch !== currentBranch : false;
+      const stateRun = validateWorkflowRunIdentity(state.run_identity);
+      const stateProject = validateProjectIdentity(state.project_identity);
+      if (!stateRun.ok || !stateProject.ok) {
+        return invalidResolution(statePath, featureDir, artifactsPath, "MIGRATION_REQUIRED", { field: "project_identity_or_run_identity" }, state);
+      }
+      if (!sameProjectIdentity(stateProject.value, stateRun.value)) {
+        return invalidResolution(statePath, featureDir, artifactsPath, "IDENTITY_MISMATCH", { field: "project_identity" }, state);
+      }
+      if (checkedExpected && !sameRunIdentity(stateRun.value, checkedExpected.value)) {
+        return invalidResolution(statePath, featureDir, artifactsPath, "IDENTITY_MISMATCH", { field: "run_identity" }, state);
       }
       if (!state.classification || typeof state.classification.workflow !== "string" || !state.classification.workflow) {
-        const legacyFallback = resolveLegacyWorkflowFallback(cwd, wsDir, currentBranch);
-        if (legacyFallback) return legacyFallback;
+        return invalidResolution(statePath, featureDir, artifactsPath, "MIGRATION_REQUIRED", { field: "classification" }, state);
       }
-      return { state, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: currentBranch ? state.branch !== currentBranch : false };
+      if (!nonEmptyStateString(state.workflow) || state.workflow !== state.classification.workflow) {
+        return invalidResolution(statePath, featureDir, artifactsPath, "IDENTITY_MISMATCH", { field: "workflow" }, state);
+      }
+      return { state, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: stale };
     } catch {
-      return { state: null, statePath, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false, invalid: true };
+      return invalidResolution(statePath, featureDir, artifactsPath, "MIGRATION_REQUIRED", { field: "state" });
     }
   }
 
+  /*
+   * The root `team-state.json` is a v1 migration input, never a runtime
+   * fallback. Keep its location in the diagnostic so management can explain
+   * what must be migrated without reading or rewriting it here.
+   */
   const legacyPath = join(wsDir, LEGACY_STATE);
   if (existsSync(legacyPath)) {
-    try {
-      const realWorkState = realpathSync(wsDir);
-      if (!isWithin(realpathSync(cwd), realWorkState) || !isWithin(realWorkState, realpathSync(legacyPath))) {
-        return { state: null, statePath: legacyPath, stateDir: wsDir, artifactsDir: join(wsDir, "artifacts"), isLegacy: true, isStale: false, invalid: true };
-      }
-      const artifactsPath = join(wsDir, "artifacts");
-      if (existsSync(artifactsPath) && !isWithin(realWorkState, realpathSync(artifactsPath))) {
-        return { state: null, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: false, invalid: true };
-      }
-      const state = normalizePersistedState(JSON.parse(readFileSync(legacyPath, "utf8")));
-      if (!state) return { state: null, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: false, invalid: true };
-      return { state, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: currentBranch ? state.branch !== currentBranch : false };
-    } catch {
-      return { state: null, statePath: legacyPath, stateDir: wsDir, artifactsDir: join(wsDir, "artifacts"), isLegacy: true, isStale: false, invalid: true };
-    }
+    const rejected = invalidResolution(legacyPath, wsDir, join(wsDir, "artifacts"), "MIGRATION_REQUIRED", { field: "legacy_root_state" });
+    return { ...rejected, isLegacy: true };
   }
   return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false };
 }
-
 export function writeState(
   cwd: string,
   state: TeamState,
   opts: { featureSlug?: string; target?: ResolvedState } = {},
 ): { statePath: string; artifactsDir: string } {
+  const project = validateProjectIdentity(state.project_identity);
+  const run = validateWorkflowRunIdentity(state.run_identity);
+  if (!project.ok || !run.ok) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "binding.write",
+      severity: "error",
+      evidence: { field: !project.ok ? "project_identity" : "run_identity" },
+      remediation: "Persist complete project and run identities before writing lifecycle state.",
+    }));
+  }
+  if (!sameProjectIdentity(project.value, run.value)) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "IDENTITY_MISMATCH",
+      operation: "binding.write",
+      severity: "error",
+      evidence: { field: "project_identity" },
+      remediation: "Persist a run identity inherited from the same project identity.",
+    }));
+  }
   const wsDir = resolve(cwd, WORK_STATE_DIR);
   mkdirSync(wsDir, { recursive: true });
   const realWorkState = realpathSync(wsDir);
-  if (!isWithin(realpathSync(cwd), realWorkState)) throw new Error("workflow state path escapes project root");
+  if (!isWithin(realpathSync(cwd), realWorkState)) throw new Error("UNSAFE_PATH: workflow state path escapes project root");
   const target = opts.target;
-  if (target?.invalid) throw new Error("cannot write through an invalid workflow state target");
-  if (target && (!target.stateDir || !target.statePath || !target.artifactsDir)) throw new Error("workflow state target is incomplete");
+  if (target?.isLegacy) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "binding.write",
+      severity: "error",
+      evidence: { field: "legacy_root_state" },
+      remediation: "Migrate legacy root state explicitly; it cannot be rewritten as v2 state.",
+    }));
+  }
+  if (target?.invalid) throw new Error("MIGRATION_REQUIRED: cannot write through an invalid workflow state target");
+  if (target && (!target.stateDir || !target.statePath || !target.artifactsDir)) throw new Error("MIGRATION_REQUIRED: workflow state target is incomplete");
   if (target) {
     const targetStateDir = realpathSync(target.stateDir!);
-    if (!isWithinTree(realWorkState, targetStateDir)) throw new Error("workflow state target escapes .work-state");
+    if (!isWithinTree(realWorkState, targetStateDir)) throw new Error("UNSAFE_PATH: workflow state target escapes .work-state");
     if (existsSync(target.statePath!) && !isWithin(targetStateDir, realpathSync(target.statePath!))) {
-      throw new Error("workflow state target escapes its state directory");
+      throw new Error("UNSAFE_PATH: workflow state target escapes its state directory");
     }
   }
 
   const featureSlug = target
-    ? target.isLegacy ? null : basename(target.stateDir!)
-    : opts.featureSlug ?? deriveFeatureSlugFromBranch(state.branch) ?? "default";
-  if (featureSlug && !isSafeStateSegment(featureSlug)) throw new Error("unsafe workflow feature slug");
+    ? basename(target.stateDir!)
+    : opts.featureSlug ?? deriveFeatureSlugFromBranch(state.branch);
+  if (!featureSlug || !isSafeStateSegment(featureSlug)) throw new Error("MIGRATION_REQUIRED: workflow feature slug is required");
   let stateDir: string;
   let statePath: string;
   let artifactsDir: string;
@@ -715,25 +1457,17 @@ export function writeState(
     stateDir = target.stateDir!;
     statePath = target.statePath!;
     artifactsDir = target.artifactsDir!;
-  } else if (featureSlug) {
+  } else {
     stateDir = join(wsDir, "features", featureSlug);
     statePath = join(stateDir, "state.json");
     artifactsDir = join(stateDir, "artifacts");
-  } else {
-    stateDir = wsDir;
-    statePath = join(wsDir, LEGACY_STATE);
-    artifactsDir = join(wsDir, "artifacts");
   }
-  if (featureSlug) {
-    const featuresDir = join(wsDir, "features");
-    mkdirSync(featuresDir, { recursive: true });
-    const realFeatures = realpathSync(featuresDir);
-    if (!isWithin(realWorkState, realFeatures)) throw new Error("workflow feature path escapes .work-state/features");
-    mkdirSync(stateDir, { recursive: true });
-    if (!isWithin(realFeatures, realpathSync(stateDir))) throw new Error("workflow feature path escapes .work-state/features");
-  } else {
-    mkdirSync(stateDir, { recursive: true });
-  }
+  const featuresDir = join(wsDir, "features");
+  mkdirSync(featuresDir, { recursive: true });
+  const realFeatures = realpathSync(featuresDir);
+  if (!isWithin(realWorkState, realFeatures)) throw new Error("UNSAFE_PATH: workflow feature path escapes .work-state/features");
+  mkdirSync(stateDir, { recursive: true });
+  if (!isWithin(realFeatures, realpathSync(stateDir))) throw new Error("UNSAFE_PATH: workflow feature path escapes .work-state/features");
 
   const realStateDir = realpathSync(stateDir);
   if (!isWithinTree(realWorkState, realStateDir)) throw new Error("workflow state directory escapes .work-state");
@@ -745,6 +1479,7 @@ export function writeState(
   const rejectionIssues: string[] = [];
   const normalized = normalizePersistedState(state, rejectionIssues);
   if (!normalized) throw new Error(`workflow state contains malformed or conflicting typed control-plane fields: ${rejectionIssues.join("; ") || "unrecognized shape"}`);
+  assertRetiredHistoryAppendOnly(statePath, normalized);
   const stamped: TeamState = { ...normalized, updated_at: new Date().toISOString() };
   // Embed the observability pointer (best-effort: a missing event log is
   // fine for pre-observability features). The recorder file lives under
@@ -927,19 +1662,25 @@ export function reopenFromFeedback(
   feedback: string,
   stageId: string,
 ): TeamState {
-  const target = stageId;
-  const index = state.stages.findIndex((stage) => stage.id === target);
-  if (index < 0) throw new Error(`cannot reopen unknown stage: ${target}`);
+  const index = state.stages.findIndex((stage) => stage.id === stageId);
+  if (index < 0) throw new Error(`cannot reopen unknown stage: ${stageId}`);
   const history = [...(state.history ?? []), { task: state.task, feedback, at: new Date().toISOString() }];
-  const stages = state.stages.map((stage, i) =>
-    i >= index ? { ...stage, status: "pending" as const } : stage,
+  const stages = state.stages.map((stage, stageIndex) =>
+    stageIndex >= index ? { ...stage, status: "pending" as const } : stage,
   );
-  return {
+  const reopened = {
     ...state,
     task: `${state.task}\n\nUser feedback: ${feedback}`,
     history,
     stages,
-    stage_cursor: target,
+    stage_cursor: stageId,
+    pause: { kind: "none" as const, reason: "" },
+  };
+  const retired = retireCurrentCapability(reopened, "reopen_from_feedback");
+  const cleared = clearStageBindings(retired, new Set(stages.slice(index).map((stage) => stage.id)));
+  return {
+    ...cleared,
+    stage_cursor: stageId,
     pause: { kind: "none", reason: "" },
     updated_at: new Date().toISOString(),
   };
@@ -980,10 +1721,31 @@ export function archiveStaleState(statePath: string, state: TeamState): void {
   }
 }
 
+function assertRetiredHistoryAppendOnly(statePath: string, state: TeamState): void {
+  if (!existsSync(statePath)) return;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(statePath, "utf8"));
+  } catch {
+    throw lifecycleDiagnostic("MIGRATION_REQUIRED", "binding.write", "retired_capabilities", "The existing workflow state cannot be read safely before appending retired capability history.");
+  }
+  if (!isStateRecord(raw) || !Object.prototype.hasOwnProperty.call(raw, "retired_capabilities")) return;
+  const previous = raw.retired_capabilities;
+  const next = state.retired_capabilities;
+  if (!Array.isArray(previous) || !Array.isArray(next) || next.length < previous.length) {
+    throw lifecycleDiagnostic("MIGRATION_REQUIRED", "binding.write", "retired_capabilities", "Retired capability history is append-only; archive or migrate the existing ledger before writing.");
+  }
+  for (let index = 0; index < previous.length; index += 1) {
+    if (stableStateHash(previous[index]) !== stableStateHash(next[index])) {
+      throw lifecycleDiagnostic("MIGRATION_REQUIRED", "binding.write", "retired_capabilities", "Retired capability history is immutable; archive or migrate the conflicting ledger before writing.");
+    }
+  }
+}
 export function listFeatures(cwd: string): string[] {
   const wsDir = resolve(cwd, WORK_STATE_DIR);
   const featuresDir = join(wsDir, "features");
   if (!existsSync(featuresDir)) return [];
+
   return readdirSync(featuresDir).filter((name) => {
     if (!isSafeStateSegment(name)) return false;
     const statePath = join(featuresDir, name, "state.json");

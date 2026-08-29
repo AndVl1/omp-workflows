@@ -1,3 +1,5 @@
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core --> */
+
 /**
  * Visualize OPT-A — fixture inventory (architecture-1).
  *
@@ -13,11 +15,13 @@
  * and prove they never enter the digest, the model or any rendered field.
  *
  * No fixture imports generated output, events.jsonl or vibe-report; the only
- * source import is the frozen contract module plus the existing report
- * redactor used to compute truthful golden body text.
+ * source imports are the frozen contract modules, shared workflow-v2 fixture
+ * helpers, and the existing report redactor used to compute truthful golden
+ * body text.
  */
 
 import { createHash } from "node:crypto";
+import { readWorkflowProfile, workflowV2Fixture } from "../workflow-v2-fixtures.js";
 import { redactReportBody } from "../../src/report/redact.js";
 import {
   BOUNDED_DIGEST_LENGTH,
@@ -47,9 +51,38 @@ import {
   type VisualizationSnapshot,
   type WorkflowName,
 } from "../../src/visualize/types.js";
+import type { ProjectIdentity, WorkflowRunIdentity } from "../../src/workflow-v2/types.js";
+import type { WorkflowV2TestFixture } from "../workflow-v2-fixtures.js";
 
 /** Fixed clock for every golden expectation (determinism tests). */
 export const FIXED_GENERATED_AT = "2026-08-19T12:00:00.000Z";
+
+const WORKFLOW_FIXTURES = new Map<string, WorkflowV2TestFixture>();
+
+/**
+ * Resolve a deterministic project/run identity from the same catalog fixture
+ * used by workflow-v2 tests. Project pins stay profile-free; the run identity
+ * adds the exact catalog profile and durable run id.
+ */
+function workflowFixtureFor(workflow: WorkflowName, runId: string): WorkflowV2TestFixture {
+  const key = `${workflow}\u0000${runId}`;
+  const cached = WORKFLOW_FIXTURES.get(key);
+  if (cached) return cached;
+  const fixture = workflowV2Fixture(readWorkflowProfile(workflow), { runId });
+  WORKFLOW_FIXTURES.set(key, fixture);
+  return fixture;
+}
+
+function identitiesFor(workflow: WorkflowName, runId: string): {
+  project_identity: ProjectIdentity;
+  run_identity: WorkflowRunIdentity;
+} {
+  const fixture = workflowFixtureFor(workflow, runId);
+  return {
+    project_identity: fixture.project_identity,
+    run_identity: fixture.run_identity,
+  };
+}
 
 export type StageStatus = "pending" | "in_progress" | "done" | "skipped" | "failed";
 
@@ -264,10 +297,19 @@ export function featureStateJson(opts: {
   stages: ReadonlyArray<{ id: string; status: StageStatus }>;
   artifacts: Record<string, string>;
   profileHash?: string;
+  runId?: string;
+  project_identity?: ProjectIdentity;
+  run_identity?: WorkflowRunIdentity;
 }): string {
+  const fallback = identitiesFor(opts.workflow, opts.runId ?? "visualize");
+  const project_identity = opts.project_identity ?? fallback.project_identity;
+  const run_identity = opts.run_identity ?? fallback.run_identity;
   const state = {
     schema: 1,
+    project_identity,
+    run_identity,
     branch: "visualize",
+    workflow: opts.workflow,
     classification: {
       type: "SPEC",
       complexity: "MEDIUM",
@@ -279,11 +321,12 @@ export function featureStateJson(opts: {
     workflow_override: false,
     issue: null,
     stage_cursor: opts.stages[opts.stages.length - 1]?.id ?? "",
+    cursor_epoch: "visualize-cursor-epoch",
     stages: opts.stages,
     artifacts: opts.artifacts,
     pause: { kind: "none", reason: "" },
     updated_at: opts.updatedAt,
-    ...(opts.profileHash ? { profile_hash: opts.profileHash } : {}),
+    ...(opts.profileHash !== undefined ? { profile_hash: run_identity.profile_identity.fingerprint } : {}),
   };
   return JSON.stringify(state, null, 2);
 }
@@ -302,6 +345,10 @@ export function featureSession(opts: {
   expected: ExpectedSession;
   stateMtime?: string;
 }): CanonicalSessionInput {
+  const identities = identitiesFor(opts.workflow, opts.id);
+  const profileHash = opts.profileHash === undefined
+    ? undefined
+    : identities.run_identity.profile_identity.fingerprint;
   return {
     kind: "feature",
     id: opts.id,
@@ -314,7 +361,10 @@ export function featureSession(opts: {
         updatedAt: opts.updatedAt,
         stages: opts.stages,
         artifacts: opts.declared,
-        profileHash: opts.profileHash,
+        profileHash,
+        runId: opts.id,
+        project_identity: identities.project_identity,
+        run_identity: identities.run_identity,
       }),
       updatedAt: opts.updatedAt,
       mtime: opts.stateMtime,
@@ -323,7 +373,7 @@ export function featureSession(opts: {
     declaredArtifacts: opts.declared,
     artifacts: opts.files ?? [],
     excludedPaths: opts.excludedPaths ?? [],
-    profileHash: opts.profileHash,
+    profileHash,
     expected: opts.expected,
   };
 }
@@ -334,7 +384,16 @@ export function ctoStateJson(opts: {
   updatedAt: string;
   teams: ReadonlyArray<{ id: string; status: string; dodPath?: string }>;
   integrationStatus?: "pending" | "in_progress" | "done" | "failed";
+  project_identity?: ProjectIdentity;
+  run_identity?: WorkflowRunIdentity;
 }): string {
+  const fallback = identitiesFor("cto", opts.id);
+  const project_identity = opts.project_identity ?? fallback.project_identity;
+  const run_identity = opts.run_identity ?? fallback.run_identity;
+  const ctoFixture = workflowFixtureFor("cto", opts.id);
+  const teamProfileIdentity = workflowFixtureFor("standard", "fixture-profile").profile_identity;
+  const leadRef = ctoFixture.effective_policy.roles.architect;
+  const rosterRefs = [leadRef];
   const state = {
     schema: 2,
     id: opts.id,
@@ -348,16 +407,34 @@ export function ctoStateJson(opts: {
       workflow: "cto",
       autonomous: true,
     },
+    project_identity,
+    run_identity,
     plan: {
       id: opts.id,
       task: opts.task,
       created_at: "2026-08-19T09:00:00.000Z",
-      teams: opts.teams.map((t) => ({ team: t.id, scope: ["core"], slice: t.id, profile: "standard", worktree: "same_branch", depends_on: [] })),
+      run_identity,
+      teams: opts.teams.map((t) => ({
+        team: t.id,
+        scope: ["core"],
+        slice: t.id,
+        profile: "standard",
+        profile_identity: teamProfileIdentity,
+        lead_ref: leadRef,
+        roster_refs: rosterRefs,
+        run_identity,
+        worktree: "same_branch",
+        depends_on: [],
+      })),
     },
     teams: opts.teams.map((t) => ({
       id: t.id,
       status: t.status,
       escalations: {},
+      run_identity,
+      profile_identity: teamProfileIdentity,
+      lead_ref: leadRef,
+      roster_refs: rosterRefs,
       ...(t.dodPath ? { dod_path: t.dodPath } : {}),
     })),
     integration: { status: opts.integrationStatus ?? "pending", note: "integration review pending" },
@@ -641,7 +718,7 @@ export function buildFixtureInventory(): FixtureInventory {
       task: "Visualize workflow specs: readable overview + internal navigation.",
       workflow: "spec-preparation",
       updatedAt: "2026-08-19T10:00:00.000Z",
-      profileHash: "p-visualize-1",
+      profileHash: "fixture-profile",
       stages: [
         { id: "intake_repo_map", status: "done" },
         { id: "requirements_edge_cases", status: "done" },
@@ -794,6 +871,7 @@ export function buildFixtureInventory(): FixtureInventory {
         content: featureStateJson({
           task: "Legacy do-work run.",
           workflow: "standard",
+          runId: LEGACY_SESSION_ID,
           updatedAt: "2026-08-19T13:00:00.000Z",
           stages: [
             { id: "discovery", status: "done" },
@@ -1265,6 +1343,7 @@ export function buildFixtureInventory(): FixtureInventory {
         content: featureStateJson({
           task: "Session with excluded inputs on disk.",
           workflow: "standard",
+          runId: "noisy",
           updatedAt: "2026-08-18T21:00:00.000Z",
           stages: [{ id: "discovery", status: "done" }],
           artifacts: {},

@@ -15,7 +15,6 @@ import {
   migrateCtoState,
   newCtoState,
   writeCtoState,
-  readCtoState,
   appendWave,
   finishWave,
   activeWave,
@@ -26,28 +25,66 @@ import {
   setIntegration,
   setCtoPause,
   type TeamPlan,
+  type CtoState,
 } from "@andvl1/omp-workflows-core";
+import { readCtoState } from "../src/cto/state.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
+
+const fixture = workflowV2Fixture(readWorkflowProfile("lightweight"), {
+  roleAgents: { "team-lead": "team-lead", "backend-kotlin": "backend-kotlin", frontend: "frontend" },
+  agentNames: ["team-lead", "backend-kotlin", "frontend"],
+});
+
+function runIdentity(id: string) {
+  return { ...fixture.run_identity, run_id: id };
+}
 
 function samplePlan(id = "run-1"): TeamPlan {
+  const run_identity = runIdentity(id);
   return {
     id,
     task: "resident wave test",
+    run_identity,
     teams: [
-      { team: "backend", scope: ["backend-kotlin"], slice: "s1", profile: "lightweight", worktree: "same_branch", depends_on: [] },
-      { team: "frontend", scope: ["frontend"], slice: "s2", profile: "lightweight", worktree: "same_branch", depends_on: [] },
+      {
+        team: "backend",
+        scope: ["backend-kotlin"],
+        slice: "s1",
+        profile: "lightweight",
+        profile_identity: fixture.profile_identity,
+        lead_ref: fixture.effective_policy.roles["team-lead"]!,
+        roster_refs: [fixture.effective_policy.roles["backend-kotlin"]!],
+        run_identity,
+        worktree: "same_branch",
+        depends_on: [],
+      },
+      {
+        team: "frontend",
+        scope: ["frontend"],
+        slice: "s2",
+        profile: "lightweight",
+        profile_identity: fixture.profile_identity,
+        lead_ref: fixture.effective_policy.roles["team-lead"]!,
+        roster_refs: [fixture.effective_policy.roles.frontend!],
+        run_identity,
+        worktree: "same_branch",
+        depends_on: [],
+      },
     ],
     created_at: new Date().toISOString(),
   };
 }
 
-function makeStandby(id = "run-sb"): ReturnType<typeof newCtoState> {
+function makeStandby(id = "run-sb"): CtoState {
+  const run_identity = runIdentity(id);
   return newCtoState({
     id,
     task: "standby — awaiting inbox tasks",
     branch: "",
     autonomous: true,
     standby: true,
-    plan: { id, task: "standby — awaiting inbox tasks", teams: [], created_at: new Date().toISOString() },
+    run_identity,
+    plan: { id, task: "standby — awaiting inbox tasks", teams: [], created_at: new Date().toISOString(), run_identity },
   });
 }
 
@@ -66,14 +103,16 @@ test("cto-resident: newCtoState carries wave_history: [] and no active_wave_id/c
 });
 
 test("cto-resident: migrateCtoState default-fills wave_history additively (schema stays 2, fields preserved)", () => {
+  const run_identity = runIdentity("legacy");
   const schema1 = {
     schema: 1,
     id: "legacy",
     task: "t",
     branch: "b",
     autonomous: false,
-    plan: { id: "legacy", task: "t", teams: [], created_at: "2026-01-01T00:00:00Z" },
-    teams: [{ id: "a", status: "pending", escalations: {} }],
+    run_identity,
+    plan: { id: "legacy", task: "t", teams: [], created_at: "2026-01-01T00:00:00Z", run_identity },
+    teams: [{ id: "a", status: "pending", escalations: {}, run_identity, profile_identity: fixture.profile_identity, lead_ref: fixture.effective_policy.roles["team-lead"]!, roster_refs: [] }],
     integration: { status: "pending" },
     pause: { kind: "none", reason: "" },
     updated_at: "2026-01-01T00:00:00Z",
@@ -103,7 +142,7 @@ test("cto-resident: migrateCtoState default-fills wave_history additively (schem
   const withHistory = {
     ...schema1,
     schema: 2,
-    wave_history: [{ id: "w1", source: "inbox", source_id: "m1", task: "t", slice_ids: [], status: "active", started_at: "2026-01-01T00:00:00Z" }],
+    wave_history: [{ id: "w1", source: "inbox", source_id: "m1", task: "t", slice_ids: [], status: "active", started_at: "2026-01-01T00:00:00Z", run_identity }],
   };
   const migrated3 = migrateCtoState(withHistory);
   assert.equal(migrated3.wave_history?.length, 1, "existing wave_history untouched");
@@ -116,7 +155,7 @@ test("cto-resident: appendWave appends, sets active_wave_id and persists when ro
     const state = makeStandby("run-w1");
     writeCtoState(state, root);
     const now = "2026-08-09T00:00:00.000Z";
-    const next = appendWave(state, { id: "wave-1", source: "telegram", source_id: "msg-42", task: "Do the thing", slice_ids: ["s1", "s2"], now }, root);
+    const next = appendWave(state, { id: "wave-1", source: "telegram", source_id: "msg-42", task: "Do the thing", slice_ids: ["s1", "s2"], run_identity: state.run_identity, now }, root);
     assert.equal(next.active_wave_id, "wave-1");
     assert.equal(next.wave_history?.length, 1);
     const record = next.wave_history?.[0];
@@ -128,7 +167,7 @@ test("cto-resident: appendWave appends, sets active_wave_id and persists when ro
     assert.equal(record?.finished_at, undefined);
     assert.equal(record?.slice_ids.length, 2);
 
-    const persisted = readCtoState("run-w1", root);
+    const persisted = readCtoState("run-w1", root, state.run_identity);
     assert.equal(persisted?.active_wave_id, "wave-1", "active_wave_id persisted");
     assert.equal(persisted?.wave_history?.length, 1, "wave_history persisted");
   } finally {
@@ -138,8 +177,8 @@ test("cto-resident: appendWave appends, sets active_wave_id and persists when ro
 
 test("cto-resident: appendWave with duplicate source_id is a no-op (idempotent admission)", () => {
   const state = makeStandby();
-  appendWave(state, { id: "wave-1", source: "telegram", source_id: "msg-42", task: "first" });
-  const next = appendWave(state, { id: "wave-2", source: "telegram", source_id: "msg-42", task: "duplicate" });
+  appendWave(state, { id: "wave-1", source: "telegram", source_id: "msg-42", task: "first", run_identity: state.run_identity });
+  const next = appendWave(state, { id: "wave-2", source: "telegram", source_id: "msg-42", task: "duplicate", run_identity: state.run_identity });
   assert.equal(next, state, "returns the same state object unchanged");
   assert.equal(next.active_wave_id, "wave-1", "active_wave_id untouched by duplicate");
   assert.equal(next.wave_history?.length, 1, "no second record");
@@ -148,8 +187,8 @@ test("cto-resident: appendWave with duplicate source_id is a no-op (idempotent a
 
 test("cto-resident: finishWave stamps finished_at and clears active_wave_id", () => {
   const state = makeStandby();
-  appendWave(state, { id: "wave-1", source: "inbox", source_id: "m1", task: "t", now: "2026-08-09T00:00:00.000Z" });
-  const done = finishWave(state, { id: "wave-1", status: "done", now: "2026-08-09T01:00:00.000Z" });
+  appendWave(state, { id: "wave-1", source: "inbox", source_id: "m1", task: "t", run_identity: state.run_identity, now: "2026-08-09T00:00:00.000Z" });
+  const done = finishWave(state, { id: "wave-1", status: "done", run_identity: state.run_identity, now: "2026-08-09T01:00:00.000Z" });
   assert.equal(done.active_wave_id, undefined, "active_wave_id cleared");
   assert.equal(done.wave_history?.[0]?.status, "done");
   assert.equal(done.wave_history?.[0]?.finished_at, "2026-08-09T01:00:00.000Z");
@@ -158,8 +197,8 @@ test("cto-resident: finishWave stamps finished_at and clears active_wave_id", ()
 
 test("cto-resident: finishWave with unknown id is a no-op", () => {
   const state = makeStandby();
-  appendWave(state, { id: "wave-1", source: "inbox", source_id: "m1", task: "t" });
-  const next = finishWave(state, { id: "ghost", status: "failed" });
+  appendWave(state, { id: "wave-1", source: "inbox", source_id: "m1", task: "t", run_identity: state.run_identity });
+  const next = finishWave(state, { id: "ghost", status: "failed", run_identity: state.run_identity });
   assert.equal(next, state);
   assert.equal(next.active_wave_id, "wave-1");
   assert.equal(next.wave_history?.[0]?.status, "active");
@@ -169,11 +208,11 @@ test("cto-resident: finishWave with unknown id is a no-op", () => {
 test("cto-resident: activeWave and findWaveBySourceId resolve correctly", () => {
   const state = makeStandby();
   assert.equal(activeWave(state), null, "no active_wave_id → null");
-  appendWave(state, { id: "wave-1", source: "inbox", source_id: "m1", task: "t" });
+  appendWave(state, { id: "wave-1", source: "inbox", source_id: "m1", task: "t", run_identity: state.run_identity });
   const active = activeWave(state);
   assert.equal(active?.id, "wave-1");
   assert.equal(active?.status, "active");
-  finishWave(state, { id: "wave-1", status: "done" });
+  finishWave(state, { id: "wave-1", status: "done", run_identity: state.run_identity });
   assert.equal(activeWave(state), null, "finished wave is not active");
   const found = findWaveBySourceId(state, "m1");
   assert.equal(found?.id, "wave-1");
@@ -181,26 +220,28 @@ test("cto-resident: activeWave and findWaveBySourceId resolve correctly", () => 
 });
 
 test("cto-resident: standby run stays ACTIVE after wave completion; pause done/failed IS terminal even for standby", () => {
-  const plan = samplePlan("run-sb");
-  const taskRun = newCtoState({ id: "run-sb", task: "task", branch: "main", autonomous: true, standby: true, plan });
+  const taskPlan = samplePlan("run-sb");
+  const taskRun = newCtoState({ id: "run-sb", task: "task", branch: "main", autonomous: true, standby: true, run_identity: runIdentity("run-sb"), plan: taskPlan });
   setTeamStatus(taskRun, "backend", "done");
   setTeamStatus(taskRun, "frontend", "done");
   setIntegration(taskRun, "done", "wave complete");
   assert.equal(isCtoResident(taskRun), true);
   assert.equal(isCtoRunTerminal(taskRun), false, "standby run survives wave completion (resident carve-out)");
 
-  const stopped = newCtoState({ id: "run-sb2", task: "task", branch: "main", autonomous: true, standby: true, plan });
+  const stoppedPlan = samplePlan("run-sb2");
+  const stopped = newCtoState({ id: "run-sb2", task: "task", branch: "main", autonomous: true, standby: true, run_identity: runIdentity("run-sb2"), plan: stoppedPlan });
   setCtoPause(stopped, "done", "explicit stop");
   assert.equal(isCtoRunTerminal(stopped), true, "pause done is terminal even for standby");
 
-  const failed = newCtoState({ id: "run-sb3", task: "task", branch: "main", autonomous: true, standby: true, plan });
+  const failedPlan = samplePlan("run-sb3");
+  const failed = newCtoState({ id: "run-sb3", task: "task", branch: "main", autonomous: true, standby: true, run_identity: runIdentity("run-sb3"), plan: failedPlan });
   setCtoPause(failed, "failed", "explicit failure");
   assert.equal(isCtoRunTerminal(failed), true, "pause failed is terminal even for standby");
 });
 
 test("cto-resident: non-standby runs keep legacy terminality (regression)", () => {
   const plan = samplePlan("run-legacy");
-  const run = newCtoState({ id: "run-legacy", task: "task", branch: "main", autonomous: false, plan });
+  const run = newCtoState({ id: "run-legacy", task: "task", branch: "main", autonomous: false, run_identity: runIdentity("run-legacy"), plan });
   assert.equal(isCtoResident(run), false);
   assert.equal(isCtoRunTerminal(run), false, "fresh run is not terminal");
   setTeamStatus(run, "backend", "done");

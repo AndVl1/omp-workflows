@@ -1,7 +1,8 @@
 /**
  * CTO-safety outbox gate (br-zps.5): `ask` is blocked when a bidirectional
- * messenger channel is configured in `.omp/escalation.json`; every other
- * tool and every non-bidirectional/missing config passes through.
+ * messenger channel is configured and a valid workflow identity is supplied;
+ * every other tool and every non-bidirectional/missing config passes through,
+ * while missing or invalid identity fails closed with MIGRATION_REQUIRED.
  */
 
 import { test } from "node:test";
@@ -11,6 +12,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { outboxEnforcementGate } from "@andvl1/omp-workflows-core";
+import type { WorkflowRunIdentity } from "../src/workflow-v2/types.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
+
+const testFixture = workflowV2Fixture(readWorkflowProfile("lightweight"));
+const testRunIdentity: WorkflowRunIdentity = testFixture.run_identity;
 
 function makeCwd(config: unknown): string {
   const cwd = mkdtempSync(join(tmpdir(), "outbox-gate-"));
@@ -30,7 +36,7 @@ const ask = { toolName: "ask", input: { question: "Which option?" } };
 test("ask is blocked when escalation.json has bidirectional: true (reason returned, block true)", () => {
   const cwd = makeCwd({ adapter: "mock", bidirectional: true });
   try {
-    const result = outboxEnforcementGate(ask, { cwd });
+    const result = outboxEnforcementGate(ask, { cwd, run_identity: testRunIdentity });
     assert.ok(result, "expected a block");
     assert.equal(result.block, true);
     assert.match(result.reason, /cto-safety outbox gate/);
@@ -43,9 +49,38 @@ test("ask is blocked when escalation.json has bidirectional: true (reason return
 test("ask is blocked when adapter is telegram (bidirectional by definition)", () => {
   const cwd = makeCwd({ adapter: "telegram" });
   try {
-    const result = outboxEnforcementGate(ask, { cwd });
+    const result = outboxEnforcementGate(ask, { cwd, run_identity: testRunIdentity });
     assert.ok(result, "expected a block");
     assert.equal(result.block, true);
+  } finally {
+    cleanup(cwd);
+  }
+});
+
+test("ask fails closed when workflow identity is missing", () => {
+  const cwd = makeCwd({ adapter: "telegram" });
+  try {
+    const result = outboxEnforcementGate(ask, { cwd });
+    assert.ok(result, "expected a migration-required block");
+    assert.equal(result.block, true);
+    assert.match(result.reason, /MIGRATION_REQUIRED/);
+    assert.match(result.reason, /WorkflowRunIdentity/);
+  } finally {
+    cleanup(cwd);
+  }
+});
+
+test("ask fails closed when workflow identity is invalid", () => {
+  const cwd = makeCwd({ adapter: "telegram" });
+  try {
+    const result = outboxEnforcementGate(ask, {
+      cwd,
+      run_identity: { ...testRunIdentity, provider_id: "INVALID PROVIDER" } as unknown as WorkflowRunIdentity,
+    });
+    assert.ok(result, "expected a migration-required block");
+    assert.equal(result.block, true);
+    assert.match(result.reason, /MIGRATION_REQUIRED/);
+    assert.match(result.reason, /WorkflowRunIdentity/);
   } finally {
     cleanup(cwd);
   }
@@ -54,7 +89,7 @@ test("ask is blocked when adapter is telegram (bidirectional by definition)", ()
 test("ask passes when no .omp/escalation.json exists", () => {
   const cwd = makeCwd(undefined);
   try {
-    assert.equal(outboxEnforcementGate(ask, { cwd }), undefined);
+    assert.equal(outboxEnforcementGate(ask, { cwd, run_identity: testRunIdentity }), undefined);
   } finally {
     cleanup(cwd);
   }
@@ -63,7 +98,7 @@ test("ask passes when no .omp/escalation.json exists", () => {
 test("ask passes when adapter is http (push-only, no bidirectional flag)", () => {
   const cwd = makeCwd({ adapter: "http" });
   try {
-    assert.equal(outboxEnforcementGate(ask, { cwd }), undefined);
+    assert.equal(outboxEnforcementGate(ask, { cwd, run_identity: testRunIdentity }), undefined);
   } finally {
     cleanup(cwd);
   }
@@ -85,7 +120,7 @@ test("malformed escalation.json passes, never throws", () => {
   try {
     mkdirSync(join(cwd, ".omp"), { recursive: true });
     writeFileSync(join(cwd, ".omp", "escalation.json"), "{ not json !!");
-    assert.equal(outboxEnforcementGate(ask, { cwd }), undefined);
+    assert.equal(outboxEnforcementGate(ask, { cwd, run_identity: testRunIdentity }), undefined);
   } finally {
     cleanup(cwd);
   }
@@ -93,20 +128,17 @@ test("malformed escalation.json passes, never throws", () => {
 
 test("missing cwd path passes, never throws", () => {
   const cwd = join(tmpdir(), "outbox-gate-does-not-exist-" + Date.now());
-  assert.equal(outboxEnforcementGate(ask, { cwd }), undefined);
+  assert.equal(outboxEnforcementGate(ask, { cwd, run_identity: testRunIdentity }), undefined);
 });
 
-// ── Explicit channels[] (architecture-4): hasBidirectionalChannel now
+// ── Explicit channels[] (architecture-4): the identity-bound resolver now
 // resolves through the shared normalizer (cto/channels.ts), so a
 // capability-validated RW primary blocks ask and a declared-rw incapable
-// kind (http, no inbound) downgrades to ro and passes. Guards against
-// reverting hasBidirectionalChannel to the legacy direct-read, which would
-// silently drop explicit-channels support at this boundary while leaving
-// every other test green.
+// kind (http, no inbound) downgrades to ro and passes.
 test("ask is blocked for an explicit validated RW primary channel (explicit channels[])", () => {
   const cwd = makeCwd({ channels: [{ id: "control", adapter: "mock", direction: "read-write", primary: true }] });
   try {
-    const result = outboxEnforcementGate(ask, { cwd });
+    const result = outboxEnforcementGate(ask, { cwd, run_identity: testRunIdentity });
     assert.ok(result, "expected a block for a validated RW primary");
     assert.equal(result.block, true);
   } finally {
@@ -117,7 +149,7 @@ test("ask is blocked for an explicit validated RW primary channel (explicit chan
 test("ask passes for an explicit declared-rw incapable kind (http downgrades to ro)", () => {
   const cwd = makeCwd({ channels: [{ id: "sink", adapter: "http", direction: "read-write" }] });
   try {
-    assert.equal(outboxEnforcementGate(ask, { cwd }), undefined, "http has no inbound -> ro -> ask passes");
+    assert.equal(outboxEnforcementGate(ask, { cwd, run_identity: testRunIdentity }), undefined, "http has no inbound -> ro -> ask passes");
   } finally {
     cleanup(cwd);
   }

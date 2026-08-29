@@ -1,12 +1,12 @@
+/* <!-- omp-cto-slice run=01a03ee4-7dd6-7580-8ad7-16d26dc886ba slice=workflow-v2-core --> */
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
-import { loadProfile, profileHash } from "./profile.js";
-import { resolveState, writeState, isSafeStateSegment, resolveActiveBranch, type ResolvedState } from "./state.js";
-import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole } from "./config.js";
-import type { AgentMappingDiagnostic } from "./agent-mapping.js";
-import { resolveScope, type ScopeFlags } from "./scope.js";
-import { resolveStageDispatchSlots, selectRoster, type RosterSelectionContext } from "./stage.js";
+import { loadProfileByIdentity } from "./profile.js";
+import { isProviderId, isWorkflowV2Digest, validateProjectIdentity, validateWorkflowRunIdentity } from "../workflow-v2/identity.js";
+import { createDiagnostic } from "../workflow-v2/diagnostics.js";
+import { resolveState, writeState, isSafeStateSegment, resolveActiveBranch, type ResolvedState, retireCurrentCapability, clearStageBindings } from "./state.js";
+import { resolveStageDispatchSlots, selectRoster, type RosterSelectionContext, type RosterSelectionResult } from "./stage.js";
 import { readArtifact, writeArtifact } from "./artifacts.js";
 import { isDoDComplete, isRootCauseDocumented, readDoD } from "./dod.js";
 import { validationGate } from "../gates/validation.js";
@@ -36,18 +36,34 @@ import {
   type ArtifactContractPolicy,
 } from "./artifact-contract.js";
 import type {
-  CheckpointDecision,
-  ChildJoin,
-  CompletionArtifactRef,
-  CompletionEnvelope,
-  DispatchCompletion,
-  DispatchRecord,
-  LoopState,
-  PendingState,
-  StageDef,
-  TeamState,
-  TypedCheckpointDecision,
-  WorkIdentity,
+  AgentRef,
+  EffectivePolicy,
+  ProfileIdentity,
+  ProjectIdentity,
+  ProviderCatalog,
+  WorkflowRunIdentity,
+  WorkflowV2Diagnostic,
+} from "../workflow-v2/types.js";
+import type { ScopeFlags } from "./scope.js";
+import {
+  WorkflowLifecycleError,
+  type CapabilityRosterEntry,
+  type CheckpointDecision,
+  type ChildJoin,
+  type CompletionArtifactRef,
+  type CompletionEnvelope,
+  type DispatchCapabilityState,
+  type DispatchCompletion,
+  type DispatchRecord,
+  type DispatchSlot,
+  type LoopState,
+  type PendingState,
+  type Profile,
+  type StageDef,
+  type TeamState,
+  type TypedCheckpointDecision,
+  type WorkIdentity,
+  type WorkIdentityScope,
 } from "./types.js";
 import { PRD_SOURCE_ARTIFACT_IDS, writeProductPrdDocument } from "./product-prd.js";
 
@@ -60,159 +76,560 @@ export type DispatchAuth = {
   profile_hash: string;
   stage_cursor: string;
   cursor_epoch: string;
+  /** Complete profile-free project binding and required run identity. */
+  project_identity: ProjectIdentity;
+  run_identity: WorkflowRunIdentity;
   role?: string;
   slot_id?: string;
   task_id?: string;
   retry_of?: string;
   evidence?: string;
   agent?: string;
+  agent_ref?: AgentRef;
   expected_count?: number;
   tool_call_id?: string;
   pending?: boolean;
   pending_reason?: PendingState["pending_reason"];
   provider_ref?: string;
 };
-type ActiveCapability = {
-  capability_id: string; dispatch_token_hash: string; advance_token_hash: string;
-  issued_for: { run_key: string; branch: string; workflow: TeamState["classification"]["workflow"]; profile_hash: string; stage_cursor: string; cursor_epoch: string };
-  kind: "none" | "single" | "consilium"; expected_roles: string[]; expected_count: number;
-  expected_roster: Array<{ role: string; agent: string }>;
-  status: "ready" | "dispatched" | "joining" | "complete" | "invalidated"; dispatches: DispatchRecord[]; pending?: PendingState[];
-};
+
+export interface CapabilityContext {
+  readonly project_identity: ProjectIdentity;
+  readonly run_identity: WorkflowRunIdentity;
+  readonly catalog: Readonly<ProviderCatalog>;
+  readonly effective_policy: Readonly<EffectivePolicy>;
+  readonly agent_inventory: readonly AgentRef[];
+  /** Caller-bound scope required when a prepared state is not yet armed. */
+  readonly work_identity_scope?: WorkIdentityScope;
+}
+
+type ActiveCapability = DispatchCapabilityState;
 /**
- * Keep the profile binding model-safe without weakening its identity.
- *
- * The full SHA-256 remains persisted in state. Workflow control calls carry a
- * compact first-30/last-2 fingerprint because long hashes are routinely
- * abbreviated by an LLM when copied through a long-running session.
+ * Project pins and run identity are validated independently.  Runtime
+ * activation is project-level; durable authorization additionally requires
+ * the exact run id and profile identity selected during workflow_prepare.
  */
-const profileHashFingerprint = (value: string): string =>
-  value.length > 32 ? `${value.slice(0, 30)}${value.slice(-2)}` : value;
+function projectIdentityRouteKey(identity: ProjectIdentity): string {
+  return JSON.stringify([
+    identity.root_instance_id,
+    identity.provider_id,
+    identity.descriptor_fingerprint,
+    identity.executable_provenance.build_fingerprint,
+    identity.executable_provenance.runtime_fingerprint,
+    identity.catalog_content_digest,
+    identity.config_byte_sha256,
+    identity.config_semantic_sha256,
+    identity.session.session_id,
+    identity.session.lifecycle_id,
+  ]);
+}
 
-const profileHashMatches = (expected: string, provided: string): boolean =>
-  provided === expected || provided === profileHashFingerprint(expected);
+function projectIdentityOf(identity: WorkflowRunIdentity): ProjectIdentity {
+  return {
+    root_instance_id: identity.root_instance_id,
+    provider_id: identity.provider_id,
+    descriptor_fingerprint: identity.descriptor_fingerprint,
+    executable_provenance: identity.executable_provenance,
+    catalog_content_digest: identity.catalog_content_digest,
+    config_byte_sha256: identity.config_byte_sha256,
+    config_semantic_sha256: identity.config_semantic_sha256,
+    session: identity.session,
+  };
+}
 
-const activeCapability = (value: TeamState["dispatch_capability"]): ActiveCapability | null => {
+function profileIdentityMatches(left: ProfileIdentity, right: ProfileIdentity): boolean {
+  return left.id === right.id && left.fingerprint === right.fingerprint;
+}
+
+function projectIdentityMatches(expected: ProjectIdentity | undefined, provided: ProjectIdentity | undefined): boolean {
+  if (!expected || !provided) return false;
+  const expectedChecked = validateProjectIdentity(expected);
+  const providedChecked = validateProjectIdentity(provided);
+  return expectedChecked.ok && providedChecked.ok && projectIdentityRouteKey(expectedChecked.value) === projectIdentityRouteKey(providedChecked.value);
+}
+
+function runIdentityMatches(expected: WorkflowRunIdentity | undefined, provided: WorkflowRunIdentity | undefined): boolean {
+  if (!expected || !provided) return false;
+  const expectedChecked = validateWorkflowRunIdentity(expected);
+  const providedChecked = validateWorkflowRunIdentity(provided);
+  return expectedChecked.ok
+    && providedChecked.ok
+    && projectIdentityMatches(projectIdentityOf(expectedChecked.value), projectIdentityOf(providedChecked.value))
+    && expectedChecked.value.run_id === providedChecked.value.run_id
+    && profileIdentityMatches(expectedChecked.value.profile_identity, providedChecked.value.profile_identity);
+}
+
+function requireProjectIdentity(value: ProjectIdentity | undefined, operation: string): ProjectIdentity {
+  const checked = validateProjectIdentity(value);
+  if (!checked.ok) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { operation, identity_level: "project" },
+      remediation: `${operation} requires a complete profile-free project identity`,
+    }));
+  }
+  return checked.value;
+}
+
+function requireRunIdentity(value: WorkflowRunIdentity | undefined, operation: string): WorkflowRunIdentity {
+  const checked = validateWorkflowRunIdentity(value);
+  if (!checked.ok) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { operation, identity_level: "run" },
+      remediation: `${operation} requires a complete workflow run identity with exact profile identity`,
+    }));
+  }
+  return checked.value;
+}
+
+function identityMatches(
+  expectedProject: ProjectIdentity | undefined,
+  expectedRun: WorkflowRunIdentity | undefined,
+  providedProject: ProjectIdentity | undefined,
+  providedRun: WorkflowRunIdentity | undefined,
+): boolean {
+  return projectIdentityMatches(expectedProject, providedProject)
+    && runIdentityMatches(expectedRun, providedRun)
+    && expectedRun !== undefined
+    && providedRun !== undefined
+    && projectIdentityMatches(expectedProject, projectIdentityOf(expectedRun))
+    && projectIdentityMatches(providedProject, projectIdentityOf(providedRun));
+}
+
+function requireIdentity(
+  projectIdentity: ProjectIdentity | undefined,
+  runIdentity: WorkflowRunIdentity | undefined,
+  operation: string,
+): { project_identity: ProjectIdentity; run_identity: WorkflowRunIdentity } {
+  const project = requireProjectIdentity(projectIdentity, operation);
+  const run = requireRunIdentity(runIdentity, operation);
+  if (!projectIdentityMatches(project, projectIdentityOf(run))) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "IDENTITY_MISMATCH",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { operation, identity_level: "project" },
+      remediation: `${operation} requires inherited project pins to match the run identity`,
+    }));
+  }
+  return { project_identity: project, run_identity: run };
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isWorkflowName(value: unknown): value is TeamState["classification"]["workflow"] {
+  return isNonEmptyString(value);
+}
+
+function isCapabilityKind(value: unknown): value is DispatchCapabilityState["kind"] {
+  return value === "none" || value === "single" || value === "consilium";
+}
+
+function isCapabilityStatus(value: unknown): value is DispatchCapabilityState["status"] {
+  return value === "ready"
+    || value === "dispatched"
+    || value === "joining"
+    || value === "complete"
+    || value === "invalidated";
+}
+
+function isDispatchStatus(value: unknown): value is DispatchRecord["status"] {
+  return value === "authorized"
+    || value === "running"
+    || value === "pending"
+    || value === "succeeded"
+    || value === "failed"
+    || value === "cancelled";
+}
+
+function isCompletionOutcome(value: unknown): value is CompletionEnvelope["outcome"] {
+  return value === "pending" || value === "succeeded" || value === "failed" || value === "cancelled";
+}
+
+function isCompletionTerminalSignal(value: unknown): value is Exclude<CompletionEnvelope["terminal_signal"], null> {
+  return value === "workflow_complete"
+    || value === "native_tool_result"
+    || value === "provider_terminal"
+    || value === "contract_failure";
+}
+
+function isCompletedBy(value: unknown): value is CompletionEnvelope["completed_by"] {
+  return value === "workflow_complete"
+    || value === "synchronous_tool_result"
+    || value === "engine_task_caller";
+}
+
+function isAgentRef(value: unknown): value is AgentRef {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === 3
+    && keys.every((key) => ["registered_name", "provider_id", "source_fingerprint"].includes(key))
+    && isNonEmptyString(value.registered_name)
+    && isProviderId(value.provider_id)
+    && isWorkflowV2Digest(value.source_fingerprint);
+}
+
+function isWorkIdentity(value: unknown): value is WorkIdentity {
+  if (!isRecord(value)) return false;
+  const keys = [
+    "run_id", "wave_id", "slice_id", "session_id", "workflow", "stage_id", "stage_cursor",
+    "capability_id", "capability_epoch", "slot_id", "task_id", "dispatch_id", "attempt", "worker_id",
+  ] as const;
+  if (Object.keys(value).length !== keys.length || !keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))) return false;
+  const requiredStrings = keys.filter((key) => key !== "attempt").map((key) => value[key]);
+  return requiredStrings.every(isNonEmptyString) && isWorkflowName(value.workflow) && isPositiveInteger(value.attempt);
+}
+function isCapabilityRosterEntry(value: unknown): value is CapabilityRosterEntry {
+  if (!isRecord(value) || !isNonEmptyString(value.role) || !isNonEmptyString(value.agent) || !isAgentRef(value.agent_ref)) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "slot_id") && value.slot_id === undefined) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "semantic_role") && value.semantic_role === undefined) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "occurrence") && value.occurrence === undefined) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "facet") && value.facet === undefined) return false;
+  if (value.agent_ref.registered_name !== value.agent) return false;
+  if (value.slot_id !== undefined && !isNonEmptyString(value.slot_id)) return false;
+  if (value.semantic_role !== undefined && !isNonEmptyString(value.semantic_role)) return false;
+  if (value.occurrence !== undefined && !isPositiveInteger(value.occurrence)) return false;
+  return value.facet === undefined || value.facet === null || isNonEmptyString(value.facet);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(isNonEmptyString);
+}
+
+function isCapabilityRosterArray(value: unknown): value is CapabilityRosterEntry[] {
+  return Array.isArray(value) && value.every(isCapabilityRosterEntry);
+}
+
+function isPendingState(value: unknown): value is PendingState {
+  if (!isRecord(value) || !isWorkIdentity(value.identity) || !isNonEmptyString(value.updated_at)) return false;
+  const run = validateWorkflowRunIdentity(value.run_identity);
+  if (!run.ok || !isDispatchStatus(value.status)) return false;
+  if (run.value.run_id !== value.identity.run_id || run.value.session.session_id !== value.identity.session_id) return false;
   if (
-    !value?.issued_for
-    || typeof value.issued_for !== "object"
-    || typeof value.capability_id !== "string"
-    || !value.capability_id
-    || typeof value.dispatch_token_hash !== "string"
-    || !/^[0-9a-f]{64}$/.test(value.dispatch_token_hash)
-    || typeof value.advance_token_hash !== "string"
-    || !/^[0-9a-f]{64}$/.test(value.advance_token_hash)
-    || !Array.isArray(value.dispatches)
-    || !Array.isArray(value.expected_roles)
-    || value.expected_count === undefined
-    || !Number.isInteger(value.expected_count)
-    || !Array.isArray(value.expected_roster)
-    || !value.status
-  ) return null;
+    value.pending_reason !== undefined
+    && value.pending_reason !== "provider_running"
+    && value.pending_reason !== "awaiting_result"
+    && value.pending_reason !== "transport_reconnect"
+  ) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "pending_reason") && value.pending_reason === undefined) return false;
+  if (value.provider_ref !== undefined && !isNonEmptyString(value.provider_ref)) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "provider_ref") && value.provider_ref === undefined) return false;
+  if (value.lease !== undefined) {
+    if (!isRecord(value.lease) || !isNonEmptyString(value.lease.token) || !isNonEmptyString(value.lease.observed_at)) return false;
+    if (value.lease.revoked_at !== null && !isNonEmptyString(value.lease.revoked_at)) return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "lease") && value.lease === undefined) return false;
+  if (
+    value.terminal_signal !== undefined
+    && value.terminal_signal !== null
+    && !isCompletionTerminalSignal(value.terminal_signal)
+  ) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "terminal_signal") && value.terminal_signal === undefined) return false;
+  if (value.retry_of !== undefined && value.retry_of !== null && !isNonEmptyString(value.retry_of)) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "retry_of") && value.retry_of === undefined) return false;
+  return value.status !== "pending" || value.terminal_signal === undefined || value.terminal_signal === null;
+}
+
+function isPendingStateArray(value: unknown): value is PendingState[] {
+  return Array.isArray(value) && value.every(isPendingState);
+}
+
+function isCompletionArtifactRef(value: unknown): value is CompletionArtifactRef {
+  if (!isRecord(value)) return false;
+  const artifactId = value.artifact_id;
+  const path = value.path;
+  const sha256 = value.sha256;
+  const schemaStatus = value.schema_status;
+  const dodStatus = value.dod_status;
+  return isNonEmptyString(artifactId)
+    && isNonEmptyString(path)
+    && typeof sha256 === "string"
+    && /^[0-9a-f]{64}$/.test(sha256)
+    && (schemaStatus === "met" || schemaStatus === "failed")
+    && (dodStatus === "met" || dodStatus === "pending" || dodStatus === "failed");
+}
+
+function isCompletionEnvelope(value: unknown): value is CompletionEnvelope {
+  if (!isRecord(value)) return false;
+  const identity = value.identity;
+  const runIdentity = value.run_identity;
+  const outcome = value.outcome;
+  const terminalSignal = value.terminal_signal;
+  const artifactRefs = value.artifact_refs;
+  const run = validateWorkflowRunIdentity(runIdentity);
+  if (
+    value.schema_version !== 1
+    || !isWorkIdentity(identity)
+    || !run.ok
+    || run.value.run_id !== identity.run_id
+    || run.value.session.session_id !== identity.session_id
+    || !isCompletionOutcome(outcome)
+    || (terminalSignal !== null && !isCompletionTerminalSignal(terminalSignal))
+    || (Object.prototype.hasOwnProperty.call(value, "terminal_signal") && terminalSignal === undefined)
+    || !Array.isArray(artifactRefs)
+    || !artifactRefs.every(isCompletionArtifactRef)
+    || (value.evidence_ref !== null && !isNonEmptyString(value.evidence_ref))
+    || (value.conflict_ref !== null && !isNonEmptyString(value.conflict_ref))
+    || !isCompletedBy(value.completed_by)
+    || !isNonEmptyString(value.emitted_at)
+  ) return false;
+  return true;
+}
+
+function isDispatchCompletion(value: unknown): value is DispatchCompletion {
+  if (!isRecord(value)) return false;
+  const outcome = value.outcome;
+  const artifactIds = value.artifact_ids;
+  const runIdentity = value.run_identity;
+  const run = validateWorkflowRunIdentity(runIdentity);
+  if (
+    !isNonEmptyString(value.dispatch_id)
+    || !isNonEmptyString(value.cursor_epoch)
+    || !isCompletionOutcome(outcome)
+    || outcome === "pending"
+    || !isStringArray(artifactIds)
+    || artifactIds.some((id) => !isSafeStateSegment(id))
+    || !isNonEmptyString(value.evidence)
+    || !isCompletedBy(value.completed_by)
+    || !isNonEmptyString(value.completed_at)
+    || !run.ok
+    || (Object.prototype.hasOwnProperty.call(value, "work_identity") && value.work_identity === undefined)
+  ) return false;
+  if (value.work_identity !== undefined) {
+    if (!isWorkIdentity(value.work_identity)) return false;
+    if (run.value.run_id !== value.work_identity.run_id || run.value.session.session_id !== value.work_identity.session_id) return false;
+  }
+  return true;
+}
+
+function isDispatchRecord(value: unknown): value is DispatchRecord {
+  if (!isRecord(value)) return false;
+  const run = validateWorkflowRunIdentity(value.run_identity);
+  if (
+    !isNonEmptyString(value.id)
+    || !isNonEmptyString(value.role)
+    || !isNonEmptyString(value.agent)
+    || !isDispatchStatus(value.status)
+    || !isPositiveInteger(value.attempt)
+    || !isNonEmptyString(value.created_at)
+    || !run.ok
+    || !isWorkIdentity(value.work_identity)
+    || run.value.run_id !== value.work_identity.run_id
+    || run.value.session.session_id !== value.work_identity.session_id
+  ) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "agent_ref") && value.agent_ref === undefined) return false;
+  if (value.agent_ref !== undefined && !isAgentRef(value.agent_ref)) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "tool_call_id") && value.tool_call_id === undefined) return false;
+  if (value.tool_call_id !== undefined && !isNonEmptyString(value.tool_call_id)) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "completed_at") && value.completed_at === undefined) return false;
+  if (value.completed_at !== undefined && !isNonEmptyString(value.completed_at)) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "pending") && value.pending === undefined) return false;
+  if (value.pending !== undefined && !isPendingState(value.pending)) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "completion") && value.completion === undefined) return false;
+  if (value.completion !== undefined && !isDispatchCompletion(value.completion)) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "completion_envelope") && value.completion_envelope === undefined) return false;
+  if (value.completion_envelope !== undefined && !isCompletionEnvelope(value.completion_envelope)) return false;
+  return true;
+}
+
+function isDispatchRecordArray(value: unknown): value is DispatchRecord[] {
+  return Array.isArray(value) && value.every(isDispatchRecord);
+}
+
+function isDispatchCapabilityState(value: unknown): value is DispatchCapabilityState {
+  if (!isRecord(value)) return false;
   const issued = value.issued_for;
-  const expectedRoles = value.expected_roles;
-  const expectedRoster = value.expected_roster;
-  const expectedCount = value.expected_count;
+  if (!isRecord(issued)) return false;
+  const project = validateProjectIdentity(value.project_identity);
+  const run = validateWorkflowRunIdentity(value.run_identity);
+  const issuedProject = validateProjectIdentity(issued.project_identity);
+  const issuedRun = validateWorkflowRunIdentity(issued.run_identity);
   if (
-    !["none", "single", "consilium"].includes(value.kind)
-    || !["ready", "dispatched", "joining", "complete", "invalidated"].includes(value.status)
-    || [issued.run_key, issued.branch, issued.workflow, issued.profile_hash, issued.stage_cursor, issued.cursor_epoch].some((field) => typeof field !== "string" || !field)
-  ) return null;
-  if ((value.kind === "none" ? expectedCount !== 0 : expectedCount <= 0) || expectedCount !== expectedRoles.length || expectedCount !== expectedRoster.length) return null;
+    !project.ok
+    || !run.ok
+    || !issuedProject.ok
+    || !issuedRun.ok
+    || !projectIdentityMatches(project.value, issuedProject.value)
+    || !runIdentityMatches(run.value, issuedRun.value)
+    || !projectIdentityMatches(project.value, projectIdentityOf(run.value))
+    || !projectIdentityMatches(issuedProject.value, projectIdentityOf(issuedRun.value))
+  ) return false;
+  const capabilityId = value.capability_id;
+  const dispatchTokenHash = value.dispatch_token_hash;
+  const advanceTokenHash = value.advance_token_hash;
   if (
-    expectedRoles.some((role) => typeof role !== "string" || !role)
-    || expectedRoster.some((entry) => !entry || typeof entry !== "object" || typeof entry.role !== "string" || !entry.role || typeof entry.agent !== "string" || !entry.agent)
+    !isNonEmptyString(capabilityId)
+    || typeof dispatchTokenHash !== "string"
+    || !/^[0-9a-f]{64}$/.test(dispatchTokenHash)
+    || typeof advanceTokenHash !== "string"
+    || !/^[0-9a-f]{64}$/.test(advanceTokenHash)
+    || !isCapabilityKind(value.kind)
+    || !isCapabilityStatus(value.status)
+  ) return false;
+  const issuedStrings = [issued.run_key, issued.branch, issued.profile_hash, issued.stage_cursor, issued.cursor_epoch];
+  const issuedWorkflowValue = issued.workflow;
+  if (!issuedStrings.every(isNonEmptyString) || !isWorkflowName(issuedWorkflowValue)) return false;
+  const issuedWorkflow = issuedWorkflowValue;
+  if (
+    issued.profile_hash !== run.value.profile_identity.fingerprint
+    || issuedRun.value.run_id !== run.value.run_id
+    || issuedRun.value.profile_identity.id !== run.value.profile_identity.id
+    || issuedRun.value.profile_identity.fingerprint !== run.value.profile_identity.fingerprint
+  ) return false;
+  const expectedRolesValue = value.expected_roles;
+  const expectedRosterValue = value.expected_roster;
+  const expectedCountValue = value.expected_count;
+  const dispatchesValue = value.dispatches;
+  if (
+    !isStringArray(expectedRolesValue)
+    || !isNonNegativeInteger(expectedCountValue)
+    || !isCapabilityRosterArray(expectedRosterValue)
+    || !isDispatchRecordArray(dispatchesValue)
+  ) return false;
+  const expectedRoles = expectedRolesValue;
+  const expectedRoster = expectedRosterValue;
+  const expectedCount = expectedCountValue;
+  const dispatches = dispatchesValue;
+  if (
+    (value.kind === "none" ? expectedCount !== 0 : expectedCount <= 0)
+    || expectedCount !== expectedRoles.length
+    || expectedCount !== expectedRoster.length
     || new Set(expectedRoles).size !== expectedRoles.length
     || new Set(expectedRoster.map((entry) => entry.role)).size !== expectedRoster.length
     || expectedRoles.some((role) => !expectedRoster.some((entry) => entry.role === role))
-  ) return null;
-  const terminalStatuses = new Set(["succeeded", "failed", "cancelled"]);
-  const identityValid = (identity: WorkIdentity, role: string, dispatchId: string, attempt: number): boolean =>
-    Boolean(identity.run_id)
-    && identity.slot_id === role
-    && identity.capability_id === value.capability_id
+    || expectedRoster.some((entry) => {
+      const agentRef = entry.agent_ref;
+      return !isAgentRef(agentRef) || agentRef.provider_id !== project.value.provider_id;
+    })
+  ) return false;
+  if (value.pending !== undefined && (!isPendingStateArray(value.pending) || value.pending.some((pending) =>
+    !runIdentityMatches(run.value, pending.run_identity)
+    || pending.identity.workflow !== issuedWorkflow
+    || pending.identity.stage_id !== issued.stage_cursor
+    || pending.identity.stage_cursor !== issued.stage_cursor
+    || pending.identity.capability_id !== capabilityId
+    || pending.identity.capability_epoch !== issued.cursor_epoch
+  ))) return false;
+  if (value.work_identity !== undefined && !isWorkIdentity(value.work_identity)) return false;
+  const identityValid = (identity: WorkIdentity, record: DispatchRecord): boolean =>
+    identity.run_id === run.value.run_id
+    && identity.workflow === issuedWorkflow
+    && identity.stage_id === issued.stage_cursor
+    && identity.stage_cursor === issued.stage_cursor
+    && identity.capability_id === capabilityId
     && identity.capability_epoch === issued.cursor_epoch
-    && identity.dispatch_id === dispatchId
-    && identity.attempt === attempt
-    && Boolean(identity.task_id)
-    && Boolean(identity.worker_id);
-  const envelopeValid = (envelope: CompletionEnvelope | undefined, identity: WorkIdentity, outcome: CompletionEnvelope["outcome"]): boolean =>
-    envelope !== undefined
+    && identity.slot_id === record.role
+    && identity.task_id.length > 0
+    && identity.dispatch_id === record.id
+    && identity.attempt === record.attempt
+    && identity.worker_id === record.agent;
+  const recordIdentityValid = (record: DispatchRecord): boolean => {
+    const recordRun = validateWorkflowRunIdentity(record.run_identity);
+    return recordRun.ok && runIdentityMatches(run.value, recordRun.value);
+  };
+  const envelopeValid = (
+    envelope: CompletionEnvelope | undefined,
+    identity: WorkIdentity,
+    outcome: CompletionEnvelope["outcome"],
+  ): boolean => envelope !== undefined
     && envelope.schema_version === 1
     && sameIdentity(envelope.identity, identity)
+    && runIdentityMatches(run.value, envelope.run_identity)
     && envelope.outcome === outcome
-    && (outcome === "pending" ? envelope.terminal_signal === null : envelope.terminal_signal !== null)
-    && Array.isArray(envelope.artifact_refs)
-    && typeof envelope.emitted_at === "string";
-  if (
-    new Set(value.dispatches.map((record) => record?.id)).size !== value.dispatches.length
-    || value.dispatches.some((record) => {
+    && (outcome === "pending" ? envelope.terminal_signal === null : envelope.terminal_signal !== null);
+  for (const record of dispatches) {
+    const identity = record.work_identity;
+    if (
+      !identity
+      || !recordIdentityValid(record)
+      || !identityValid(identity, record)
+      || !expectedRoles.includes(record.role)
+    ) return false;
+    const expected = expectedRoster.find((entry) => entry.role === record.role);
+    if (
+      !expected
+      || !record.agent_ref
+      || expected.agent !== record.agent
+      || expected.agent_ref?.registered_name !== record.agent_ref.registered_name
+      || expected.agent_ref?.provider_id !== record.agent_ref.provider_id
+      || expected.agent_ref?.source_fingerprint !== record.agent_ref.source_fingerprint
+    ) return false;
+    const completion = record.completion;
+    if (record.status !== "succeeded" && record.status !== "failed" && record.status !== "cancelled") {
+      if (completion !== undefined || !envelopeValid(record.completion_envelope, identity, "pending")) return false;
+      const pending = record.pending;
       if (
-        !record
-        || typeof record.id !== "string"
-        || !record.id
-        || typeof record.role !== "string"
-        || !record.role
-        || !expectedRoles.includes(record.role)
-        || typeof record.agent !== "string"
-        || !record.agent
-        || !expectedRoster.some((entry) => entry.role === record.role && entry.agent === record.agent)
-        || !["authorized", "running", "pending", "succeeded", "failed", "cancelled"].includes(record.status)
-        || !Number.isInteger(record.attempt)
-        || record.attempt < 1
-        || typeof record.created_at !== "string"
-        || (record.tool_call_id !== undefined && (typeof record.tool_call_id !== "string" || !record.tool_call_id))
-        || !record.work_identity
-        || !identityValid(record.work_identity, record.role, record.id, record.attempt)
-      ) return true;
-      const completion = record.completion;
-      if (!terminalStatuses.has(record.status)) {
-        if (completion !== undefined) return true;
-        if (!envelopeValid(record.completion_envelope, record.work_identity, record.status === "pending" ? "pending" : "pending")) return true;
-        if (record.pending !== undefined && (
-          record.pending.identity.dispatch_id !== record.id
-          || record.pending.identity.slot_id !== record.role
-          || record.pending.status !== record.status
-          || (record.status === "pending" && record.pending.terminal_signal !== undefined && record.pending.terminal_signal !== null)
-        )) return true;
-        return false;
-      }
-      return !completion
-        || typeof completion !== "object"
-        || completion.dispatch_id !== record.id
-        || completion.cursor_epoch !== issued.cursor_epoch
-        || completion.outcome !== record.status
-        || typeof completion.evidence !== "string"
-        || !completion.evidence.trim()
-        || !Array.isArray(completion.artifact_ids)
-        || new Set(completion.artifact_ids).size !== completion.artifact_ids.length
-        || completion.artifact_ids.some((id) => typeof id !== "string" || !isSafeStateSegment(id))
-        || !["workflow_complete", "synchronous_tool_result", "engine_task_caller"].includes(completion.completed_by)
-        || typeof completion.completed_at !== "string"
-        || record.completed_at !== completion.completed_at
-        || !completion.work_identity
-        || !sameIdentity(completion.work_identity, record.work_identity)
-        || !envelopeValid(record.completion_envelope, record.work_identity, record.status);
-    })
-  ) return null;
+        pending !== undefined
+        && (
+          !runIdentityMatches(run.value, pending.run_identity)
+          || pending.identity.dispatch_id !== record.id
+          || pending.identity.slot_id !== record.role
+          || pending.identity.workflow !== identity.workflow
+          || pending.identity.stage_id !== identity.stage_id
+          || pending.identity.stage_cursor !== identity.stage_cursor
+          || pending.identity.capability_id !== identity.capability_id
+          || pending.identity.capability_epoch !== identity.capability_epoch
+          || pending.status !== record.status
+          || (record.status === "pending" && pending.terminal_signal !== undefined && pending.terminal_signal !== null)
+        )
+      ) return false;
+      continue;
+    }
+    if (
+      !completion
+      || completion.dispatch_id !== record.id
+      || completion.cursor_epoch !== issued.cursor_epoch
+      || completion.outcome !== record.status
+      || !completion.evidence.trim()
+      || !completion.artifact_ids.every((id) => isSafeStateSegment(id))
+      || record.completed_at !== completion.completed_at
+      || !completion.work_identity
+      || !sameIdentity(completion.work_identity, identity)
+      || !runIdentityMatches(run.value, completion.run_identity)
+      || !envelopeValid(record.completion_envelope, identity, record.status)
+    ) return false;
+  }
   const latestByRole = new Map<string, DispatchRecord>();
-  for (const record of value.dispatches) {
+  for (const record of dispatches) {
     const previous = latestByRole.get(record.role);
-    if (previous && previous.status !== "failed" && previous.status !== "cancelled") return null;
+    if (previous && previous.status !== "failed" && previous.status !== "cancelled") return false;
     latestByRole.set(record.role, record);
   }
-  return value as ActiveCapability;
-};
+  return true;
+}
 
+const activeCapability = (value: unknown): ActiveCapability | null =>
+  isDispatchCapabilityState(value) ? value : null;
 /** Issued capability secrets plus the persisted capability state (see createCapability). */
 export type IssuedCapability = {
   capability_id: string;
   dispatch_token: string;
   advance_token: string;
-  state: NonNullable<TeamState["dispatch_capability"]>;
+  work_identity: WorkIdentity;
+  state: DispatchCapabilityState;
 };
 
-export type TransitionResult = { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff; child_join?: ChildJoin } | { ok: false; error: string; state?: TeamState; child_join?: ChildJoin };
+export type TransitionResult =
+  | { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff; child_join?: ChildJoin }
+  | { ok: false; error: string; state?: TeamState; child_join?: ChildJoin; diagnostic?: WorkflowV2Diagnostic };
 
 export interface CapabilityHandoff {
   capability_id: string;
@@ -221,7 +638,11 @@ export interface CapabilityHandoff {
   run_key: string;
   branch: string;
   workflow: TeamState["classification"]["workflow"];
-  /** Compact first-30/last-2 binding fingerprint; the full hash stays state-only. */
+  /** Complete profile-free project identity used for runtime preflight. */
+  project_identity: ProjectIdentity;
+  /** Exact profile/run identity selected during workflow_prepare. */
+  run_identity: WorkflowRunIdentity;
+  /** Complete profile fingerprint from the selected catalog identity. */
   profile_hash: string;
   stage_cursor: string;
   cursor_epoch: string;
@@ -236,7 +657,7 @@ function handoffFromState(
   stage: StageDef,
 ): CapabilityHandoff | undefined {
   const cap = activeCapability(state.dispatch_capability);
-  if (!cap) return undefined;
+  if (!cap || cap.capability_id !== secrets.capability_id) return undefined;
   const roles = cap.expected_roster.map(({ role }) => role);
   const dispatch_markers = cap.kind === "none"
     ? []
@@ -261,53 +682,84 @@ function handoffFromState(
     run_key: cap.issued_for.run_key,
     branch: cap.issued_for.branch,
     workflow: cap.issued_for.workflow,
-    profile_hash: profileHashFingerprint(cap.issued_for.profile_hash),
+    project_identity: cap.project_identity,
+    run_identity: cap.run_identity,
+    profile_hash: cap.issued_for.profile_hash,
     stage_cursor: cap.issued_for.stage_cursor,
     cursor_epoch: cap.issued_for.cursor_epoch,
     kind: cap.kind,
-    expected_roster: cap.expected_roster,
+    expected_roster: cap.expected_roster.map(({ role, agent }) => ({ role, agent })),
     dispatch_markers,
   };
 }
-
-
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
 const now = (): string => new Date().toISOString();
-const current = (cwd: string): { state: TeamState; target: ResolvedState } | null => {
-  const target = resolveState(cwd, resolveActiveBranch(cwd));
+type StageStateEntry = TeamState["stages"][number];
+function stageWithStatus(entry: StageStateEntry, status: StageStateEntry["status"]): StageStateEntry {
+  return { ...entry, status };
+}
+const current = (cwd: string, expectedRunIdentity: WorkflowRunIdentity): { state: TeamState; target: ResolvedState } | null => {
+  const target = resolveState(cwd, resolveActiveBranch(cwd), expectedRunIdentity);
   return target.state ? { state: target.state, target } : null;
 };
 const persist = (cwd: string, state: TeamState, target: ResolvedState): void => {
   if (!target.statePath || !target.stateDir || !target.artifactsDir) throw new Error("state target missing");
   writeState(cwd, state, { target });
 };
-function stableIdentitySeed(state: TeamState, cap: Pick<ActiveCapability, "issued_for" | "capability_id">): string {
-  return `${cap.capability_id}|${cap.issued_for.run_key}|${cap.issued_for.branch}|${cap.issued_for.workflow}|${cap.issued_for.stage_cursor}`;
-}
 
+function transitionFailure(
+  code: WorkflowV2Diagnostic["code"],
+  operation: WorkflowV2Diagnostic["operation"],
+  remediation: string,
+  state?: TeamState,
+  evidence: Record<string, unknown> = {},
+): TransitionResult {
+  const diagnostic = createDiagnostic({ code, operation, severity: "error", evidence, remediation });
+  return { ok: false, error: `${code}: ${remediation}`, ...(state ? { state } : {}), diagnostic };
+}
 function workIdentityFor(
   state: TeamState,
-  cap: Pick<ActiveCapability, "issued_for" | "capability_id">,
+  cap: Pick<ActiveCapability, "issued_for" | "capability_id" | "work_identity">,
   role: string,
   agent: string,
   dispatchId: string,
   attempt: number,
   taskId?: string,
 ): WorkIdentity {
-  const base = state.work_identity;
-  const seed = stableIdentitySeed(state, cap);
+  const stateIdentity = state.work_identity;
+  const capIdentity = cap.work_identity;
+  if (!isWorkIdentity(stateIdentity) || !isWorkIdentity(capIdentity)) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { field: "work_identity" },
+      remediation: "The workflow caller must issue matching complete work identities before dispatch.",
+    }));
+  }
+  const identityFields = [
+    "run_id", "wave_id", "slice_id", "session_id", "workflow", "stage_id",
+    "stage_cursor", "capability_id", "capability_epoch", "slot_id", "task_id",
+    "dispatch_id", "attempt", "worker_id",
+  ] as const;
+  if (identityFields.some((field) => stateIdentity[field] !== capIdentity[field])) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "IDENTITY_MISMATCH",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { field: "work_identity" },
+      remediation: "The persisted dispatch work identities do not match; migrate the workflow before dispatch.",
+    }));
+  }
   return {
-    run_id: base?.run_id ?? cap.issued_for.run_key,
-    wave_id: base?.wave_id ?? `wave-${hash(seed).slice(0, 20)}`,
-    slice_id: base?.slice_id ?? cap.issued_for.stage_cursor,
-    session_id: base?.session_id ?? `session-${hash(`${seed}|session`).slice(0, 20)}`,
+    ...capIdentity,
     workflow: cap.issued_for.workflow,
     stage_id: cap.issued_for.stage_cursor,
     stage_cursor: cap.issued_for.stage_cursor,
     capability_id: cap.capability_id,
     capability_epoch: cap.issued_for.cursor_epoch,
     slot_id: role,
-    task_id: taskId ?? dispatchTaskId(cap.capability_id, cap.issued_for.run_key, cap.issued_for.branch, cap.issued_for.workflow, cap.issued_for.stage_cursor, role),
+    task_id: taskId ?? capIdentity.task_id,
     dispatch_id: dispatchId,
     attempt,
     worker_id: agent,
@@ -316,6 +768,7 @@ function workIdentityFor(
 
 function pendingFor(
   identity: WorkIdentity,
+  runIdentity: WorkflowRunIdentity,
   status: PendingState["status"],
   reason?: PendingState["pending_reason"],
   providerRef?: string,
@@ -323,12 +776,12 @@ function pendingFor(
 ): PendingState {
   return {
     identity,
+    run_identity: runIdentity,
     status,
     ...(reason ? { pending_reason: reason } : {}),
     ...(providerRef ? { provider_ref: providerRef } : {}),
-    ...(status === "pending" ? { lease: { token: randomUUID(), observed_at: now(), revoked_at: null } } : {}),
-    terminal_signal: status === "pending" ? null : undefined,
-    retry_of: retryOf ?? null,
+    ...(status === "pending" ? { lease: { token: randomUUID(), observed_at: now(), revoked_at: null }, terminal_signal: null } : {}),
+    ...(retryOf !== undefined ? { retry_of: retryOf } : {}),
     updated_at: now(),
   };
 }
@@ -348,9 +801,9 @@ function completionArtifactRefs(
     };
   });
 }
-
 function completionEnvelopeFor(
   identity: WorkIdentity,
+  runIdentity: WorkflowRunIdentity,
   outcome: CompletionEnvelope["outcome"],
   terminalSignal: CompletionEnvelope["terminal_signal"],
   artifactRefs: CompletionArtifactRef[],
@@ -360,6 +813,7 @@ function completionEnvelopeFor(
   return {
     schema_version: 1,
     identity,
+    run_identity: runIdentity,
     outcome,
     terminal_signal: terminalSignal,
     artifact_refs: artifactRefs,
@@ -370,39 +824,182 @@ function completionEnvelopeFor(
   };
 }
 
-export function hashDispatchSecret(secret: string): string { return hash(secret); }
+function workIdentityScopeForStage(state: TeamState, stageId: string): WorkIdentityScope {
+  const identity = state.work_identity;
+  if (!isWorkIdentity(identity)) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { field: "work_identity" },
+      remediation: "The persisted workflow must carry a complete work identity before capability creation.",
+    }));
+  }
+  const { capability_id: _capability_id, capability_epoch: _capability_epoch, ...scope } = identity;
+  return { ...scope, stage_id: stageId, stage_cursor: stageId };
+}
+
+const WORK_IDENTITY_SCOPE_KEYS = [
+  "run_id",
+  "wave_id",
+  "slice_id",
+  "session_id",
+  "workflow",
+  "stage_id",
+  "stage_cursor",
+  "slot_id",
+  "task_id",
+  "dispatch_id",
+  "attempt",
+  "worker_id",
+] as const;
+
+function isWorkIdentityScope(value: unknown): value is WorkIdentityScope {
+  if (!isRecord(value) || Object.keys(value).length !== WORK_IDENTITY_SCOPE_KEYS.length) return false;
+  if (!WORK_IDENTITY_SCOPE_KEYS.every((key) => Object.prototype.hasOwnProperty.call(value, key))) return false;
+  return WORK_IDENTITY_SCOPE_KEYS.filter((key) => key !== "attempt").every((key) => isNonEmptyString(value[key]))
+    && isWorkflowName(value.workflow)
+    && isPositiveInteger(value.attempt);
+}
 
 export function createCapability(input: {
-  run_key: string; branch: string; workflow: TeamState["classification"]["workflow"]; profile_hash: string;
-  stage_cursor: string; cursor_epoch?: string; kind: "none" | "single" | "consilium"; expected_roles?: string[];
-  dispatch_secret?: string; advance_secret?: string;
-  expected_roster?: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }>;
+  run_key: string;
+  branch: string;
+  workflow: TeamState["classification"]["workflow"];
+  profile_hash: string;
+  stage_cursor: string;
+  kind: "none" | "single" | "consilium";
+  expected_roles?: string[];
+  expected_roster?: Array<{
+    role: string;
+    agent: string;
+    agent_ref: AgentRef;
+    slot_id?: string;
+    semantic_role?: string;
+    occurrence?: number;
+    facet?: string | null;
+  }>;
   roster_selection?: TeamState["roster_selection"];
-  work_identity?: WorkIdentity;
+  work_identity_scope: WorkIdentityScope;
+  project_identity: ProjectIdentity;
+  run_identity: WorkflowRunIdentity;
 }): IssuedCapability {
-  if (!input.run_key || !input.branch || !input.workflow || !input.profile_hash || !input.stage_cursor) throw new Error("invalid capability binding");
-  const cursor_epoch = input.cursor_epoch ?? randomUUID();
-  const dispatch_token = input.dispatch_secret ?? randomUUID();
-  const advance_token = input.advance_secret ?? randomUUID();
-  const roster = (input.expected_roster ?? (input.expected_roles ?? []).map((role) => ({ role, agent: role }))).map((entry) => ({ ...entry, role: entry.role, agent: entry.agent }));
-  const expected_roles = roster.map((entry) => entry.role);
-  if ((input.kind === "none" && roster.length !== 0) || (input.kind === "single" && roster.length !== 1) || (input.kind === "consilium" && roster.length === 0)) throw new Error("capability roster does not match dispatch kind");
-  if (new Set(expected_roles).size !== expected_roles.length || roster.some((entry) => !entry.role || !entry.agent)) throw new Error("invalid capability roster");
-  const state = {
-    capability_id: randomUUID(),
+  const { project_identity, run_identity } = requireIdentity(input.project_identity, input.run_identity, "capability creation");
+  const scope = input.work_identity_scope;
+  if (
+    !input.run_key
+    || !input.branch
+    || !input.workflow
+    || !input.stage_cursor
+    || !input.profile_hash
+    || input.profile_hash !== run_identity.profile_identity.fingerprint
+  ) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "IDENTITY_MISMATCH",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { operation: "capability creation", run_id: run_identity.run_id, profile_id: run_identity.profile_identity.id },
+      remediation: "Use the selected catalog run identity and its complete profile fingerprint for the capability.",
+    }));
+  }
+  if (!isWorkIdentityScope(scope)) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { operation: "capability work identity", field: "work_identity_scope" },
+      remediation: "The workflow caller must provide an exact twelve-field work identity scope before dispatch.",
+    }));
+  }
+  if (
+    scope.run_id !== run_identity.run_id
+    || scope.session_id !== run_identity.session.session_id
+    || scope.workflow !== input.workflow
+    || scope.stage_id !== input.stage_cursor
+    || scope.stage_cursor !== input.stage_cursor
+  ) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "IDENTITY_MISMATCH",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: {
+        operation: "capability work identity",
+        run_id: run_identity.run_id,
+        stage_cursor: input.stage_cursor,
+      },
+      remediation: "Bind the capability to the exact prepared run, session, workflow, and target stage.",
+    }));
+  }
+  const capability_id = randomUUID();
+  const capability_epoch = randomUUID();
+  const dispatch_token = randomUUID();
+  const advance_token = randomUUID();
+  const work_identity: WorkIdentity = {
+    ...scope,
+    capability_id,
+    capability_epoch,
+  };
+  const roster: CapabilityRosterEntry[] = (input.expected_roster ?? []).map((entry) => ({
+    role: entry.role,
+    agent: entry.agent,
+    agent_ref: entry.agent_ref,
+    ...(entry.slot_id !== undefined ? { slot_id: entry.slot_id } : {}),
+    ...(entry.semantic_role !== undefined ? { semantic_role: entry.semantic_role } : {}),
+    ...(entry.occurrence !== undefined ? { occurrence: entry.occurrence } : {}),
+    ...(entry.facet !== undefined ? { facet: entry.facet } : {}),
+  }));
+  if ((input.kind === "none" && roster.length !== 0) || (input.kind === "single" && roster.length !== 1) || (input.kind === "consilium" && roster.length === 0)) {
+    throw new Error("capability roster does not match dispatch kind");
+  }
+  const expected_roles = input.expected_roles ?? roster.map((entry) => entry.role);
+  if (
+    !isStringArray(expected_roles)
+    || new Set(expected_roles).size !== expected_roles.length
+    || expected_roles.length !== roster.length
+    || expected_roles.some((role, index) => role !== roster[index]?.role)
+    || roster.some((entry) =>
+      !entry.role
+      || !entry.agent
+      || !entry.agent_ref
+      || entry.agent_ref.registered_name !== entry.agent
+      || entry.agent_ref.provider_id !== project_identity.provider_id
+      || !isProviderId(entry.agent_ref.provider_id)
+      || !isWorkflowV2Digest(entry.agent_ref.source_fingerprint))
+  ) {
+    throw new WorkflowLifecycleError(createDiagnostic({
+      code: "MIGRATION_REQUIRED",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { operation: "capability roster" },
+      remediation: "Persist provider-qualified agent references for every dispatch slot.",
+    }));
+  }
+  const state: DispatchCapabilityState = {
+    capability_id,
     dispatch_token_hash: hash(dispatch_token),
     advance_token_hash: hash(advance_token),
-    issued_for: { run_key: input.run_key, branch: input.branch, workflow: input.workflow, profile_hash: input.profile_hash, stage_cursor: input.stage_cursor, cursor_epoch },
+    issued_for: {
+      run_key: input.run_key,
+      branch: input.branch,
+      workflow: input.workflow,
+      profile_hash: input.profile_hash,
+      stage_cursor: input.stage_cursor,
+      cursor_epoch: capability_epoch,
+      project_identity,
+      run_identity,
+    },
     kind: input.kind,
+    project_identity,
+    run_identity,
     expected_roles,
     expected_count: roster.length,
     expected_roster: roster,
     ...(input.roster_selection ? { roster_selection: input.roster_selection } : {}),
-    ...(input.work_identity ? { work_identity: input.work_identity } : {}),
-    status: "ready" as const,
+    work_identity,
+    status: "ready",
     dispatches: [],
   };
-  return { capability_id: state.capability_id, dispatch_token, advance_token, state };
+  return { capability_id, dispatch_token, advance_token, work_identity, state };
 }
 function reissueActiveCapability(cap: ActiveCapability): IssuedCapability {
   const dispatch_token = randomUUID();
@@ -411,6 +1008,7 @@ function reissueActiveCapability(cap: ActiveCapability): IssuedCapability {
     capability_id: cap.capability_id,
     dispatch_token,
     advance_token,
+    work_identity: cap.work_identity,
     state: {
       ...cap,
       dispatch_token_hash: hash(dispatch_token),
@@ -438,7 +1036,7 @@ function removeClearedArtifactFile(target: ResolvedState, candidate: string): vo
 function resetReopenedStageState(
   state: TeamState,
   target: ResolvedState,
-  profile: NonNullable<ReturnType<typeof loadProfile>>,
+  profile: Profile,
   stageId: string,
   existing: ActiveCapability | null,
 ): TeamState {
@@ -480,66 +1078,211 @@ function resetReopenedStageState(
   const retainedArtifacts = Object.fromEntries(
     Object.entries(state.artifacts ?? {}).filter(([id]) => !clearedArtifactIds.has(id)),
   );
-  return {
+  const retainedState: TeamState = {
     ...state,
     artifacts: retainedArtifacts,
-    slot_artifacts: Object.keys(retainedSlotArtifacts).length > 0 ? retainedSlotArtifacts : undefined,
+    ...(Object.keys(retainedSlotArtifacts).length > 0 ? { slot_artifacts: retainedSlotArtifacts } : {}),
   };
+  const retired = retireCurrentCapability(retainedState, "reopen_from_feedback");
+  return clearStageBindings(retired, clearedStageIds);
+}
+/**
+ * Resolve the selected profile strictly from the caller-provided catalog.
+ * Configuration and process-global registries are never consulted here.
+ */
+type ContextProfileResult =
+  | { profile: Profile; profile_identity: ProfileIdentity }
+  | { error: string; diagnostic: WorkflowV2Diagnostic };
+
+function contextProfile(context: CapabilityContext): ContextProfileResult {
+  const { project_identity, run_identity } = requireIdentity(context.project_identity, context.run_identity, "workflow dispatch");
+  if (
+    context.effective_policy.provider.id !== project_identity.provider_id
+    || context.effective_policy.provider.descriptor_fingerprint !== project_identity.descriptor_fingerprint
+    || context.effective_policy.provider.catalog_content_digest !== project_identity.catalog_content_digest
+    || context.catalog.content_digest !== project_identity.catalog_content_digest
+  ) {
+    const diagnostic = createDiagnostic({
+      code: "IDENTITY_MISMATCH",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { operation: "workflow dispatch" },
+      remediation: "Use the provider catalog and effective policy selected by this workflow run identity.",
+    });
+    return { error: `${diagnostic.code}: ${diagnostic.remediation}`, diagnostic };
+  }
+  if (context.effective_policy.workflow.selection === "fixed"
+    && context.effective_policy.workflow.profile_identity !== undefined
+    && (
+      context.effective_policy.workflow.profile_identity.id !== run_identity.profile_identity.id
+      || context.effective_policy.workflow.profile_identity.fingerprint !== run_identity.profile_identity.fingerprint
+    )) {
+    const diagnostic = createDiagnostic({
+      code: "IDENTITY_MISMATCH",
+      operation: "runtime.activate",
+      severity: "error",
+      evidence: { operation: "fixed workflow profile", profile: run_identity.profile_identity.id },
+      remediation: "Use the fixed workflow profile identity selected for this run.",
+    });
+    return { error: `${diagnostic.code}: ${diagnostic.remediation}`, diagnostic };
+  }
+  const loaded = loadProfileByIdentity(context.catalog, run_identity.profile_identity);
+  if (!loaded.ok) {
+    const diagnostic = createDiagnostic({
+      code: "PROFILE_UNAVAILABLE",
+      operation: "profile.resolve",
+      severity: "error",
+      evidence: { operation: "workflow dispatch", profile: run_identity.profile_identity.id },
+      remediation: "Re-select a profile from the current provider catalog before dispatch.",
+    });
+    return { error: `${diagnostic.code}: ${diagnostic.remediation}`, diagnostic };
+  }
+  return { profile: loaded.value, profile_identity: run_identity.profile_identity };
 }
 
-/**
- * Create the opaque dispatch capability after the model has persisted the
- * classification and stage list. This is the entry point for the native
- * `/do-work` prompt; the interpreter path uses `createCapability` directly.
- */
-export function beginCapability(cwd: string): TransitionResult {
+function qualifiedAgentForRole(
+  role: string,
+  context: CapabilityContext,
+): AgentRef | undefined {
+  const ref = context.effective_policy.roles[role];
+  if (!ref || ref.provider_id !== context.project_identity.provider_id) return undefined;
+  const observed = context.agent_inventory.find((candidate) =>
+    candidate.registered_name === ref.registered_name
+    && candidate.provider_id === ref.provider_id
+    && candidate.source_fingerprint === ref.source_fingerprint);
+  return observed ? ref : undefined;
+}
+
+
+function rosterWithQualifiedAgents(
+  slots: DispatchSlot[],
+  context: CapabilityContext,
+): Array<{ role: string; agent: string; agent_ref: AgentRef }> | undefined {
+  const roster: Array<{ role: string; agent: string; agent_ref: AgentRef }> = [];
+  for (const slot of slots) {
+    const agent_ref = qualifiedAgentForRole(slot.role, context);
+    if (!agent_ref) return undefined;
+    roster.push({ role: slot.slot, agent: agent_ref.registered_name, agent_ref });
+  }
+  return roster;
+}
+
+
+export function beginCapability(cwd: string, context: CapabilityContext): TransitionResult {
+  const identity = requireIdentity(context.project_identity, context.run_identity, "workflow dispatch");
   const branch = resolveActiveBranch(cwd);
-  const target = resolveState(cwd, branch);
-  if (target.invalid) return { ok: false, error: "workflow state is invalid or unsafe" };
+  const target = resolveState(cwd, branch, identity.run_identity);
+  if (target.invalid) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "workflow state is invalid or requires explicit migration", target.state ?? undefined);
   if (!target.state || !target.statePath) return { ok: false, error: "workflow state not found" };
   if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state: target.state };
-
   const state = target.state;
+  if (!state.project_identity || !state.run_identity) {
+    return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "workflow state has no canonical project/run identity", state, { field: "run_identity" });
+  }
+  if (!identityMatches(state.project_identity, state.run_identity, identity.project_identity, identity.run_identity)) {
+    return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "workflow state belongs to a different provider/config/run identity", state);
+  }
+  const selected = contextProfile(context);
+  if ("error" in selected) return { ok: false, error: selected.error, state, diagnostic: selected.diagnostic };
+  const { profile, profile_identity } = selected;
   const workflow = state.classification?.workflow;
-  if (!workflow) return { ok: false, error: "workflow classification is missing", state };
-  const profile = loadProfile(workflow);
-  if (!profile) return { ok: false, error: `workflow '${workflow}' is unavailable`, state };
-  const persistedHash = profileHash(profile);
-  if (state.profile_hash && state.profile_hash !== persistedHash) return { ok: false, error: "workflow profile hash is stale", state };
-  if (!Array.isArray(state.stages)) return { ok: false, error: "workflow stages are missing", state };
-  const stages = state.stages.length > 0
-    ? state.stages
-    : profile.stages.map((candidate) => ({ id: candidate.id, status: "pending" as const }));
-  const stageId = state.stage_cursor || profile.stages[0]?.id;
+  if (!workflow) {
+    return transitionFailure(
+      "MIGRATION_REQUIRED",
+      "runtime.activate",
+      "workflow classification is missing from the persisted v2 state",
+      state,
+      { field: "classification.workflow" },
+    );
+  }
+  if (workflow !== profile.name || profile_identity.id !== workflow) {
+    return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "workflow profile does not match selected catalog identity", state);
+  }
+  if (!Array.isArray(state.stages) || state.stages.length === 0) {
+    return transitionFailure(
+      "MIGRATION_REQUIRED",
+      "runtime.activate",
+      "workflow stages are missing from the persisted v2 state",
+      state,
+      { field: "stages" },
+    );
+  }
+  const stages = state.stages;
+  const stageId = typeof state.stage_cursor === "string" && state.stage_cursor.trim() ? state.stage_cursor : null;
+  if (!stageId) {
+    return transitionFailure(
+      "MIGRATION_REQUIRED",
+      "runtime.activate",
+      "workflow stage cursor is missing from the persisted v2 state",
+      state,
+      { field: "stage_cursor" },
+    );
+  }
   const stage = profile.stages.find((candidate) => candidate.id === stageId);
-  if (!stage) return { ok: false, error: `workflow stage '${stageId ?? ""}' is unavailable`, state };
-  const stageEntry = stages.find((candidate) => candidate.id === stage.id);
-  if (!stageEntry) return { ok: false, error: `workflow stage '${stage.id}' is not persisted`, state };
-  if (stageEntry.status === "done" || stageEntry.status === "skipped") return { ok: false, error: `workflow stage '${stage.id}' is already ${stageEntry.status}`, state };
-
+  if (!stage) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "workflow stage cursor is not present in the selected profile", state);
+  const stageEntry = stages.find((entry) => entry.id === stage.id);
+  if (!stageEntry) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "workflow stage cursor is not present in persisted stages", state, { field: "stages" });
+  const workIdentityScope = isWorkIdentity(state.work_identity)
+    ? workIdentityScopeForStage(state, stage.id)
+    : context.work_identity_scope;
+  if (
+    !isWorkIdentityScope(workIdentityScope)
+    || workIdentityScope.run_id !== identity.run_identity.run_id
+    || workIdentityScope.session_id !== identity.run_identity.session.session_id
+    || workIdentityScope.workflow !== workflow
+    || workIdentityScope.stage_id !== stage.id
+    || workIdentityScope.stage_cursor !== stage.id
+  ) {
+    return transitionFailure(
+      "IDENTITY_MISMATCH",
+      "runtime.activate",
+      "capability creation requires a caller-bound work identity for the selected stage",
+      state,
+      { field: "work_identity_scope" },
+    );
+  }
   const existing = activeCapability(state.dispatch_capability);
-  if (state.policy?.strict_orchestrator === true && state.dispatch_capability && !existing) return { ok: false, error: "workflow dispatch capability is malformed", state };
+  const runKey = typeof state.run_key === "string" && state.run_key.trim() ? state.run_key : null;
+  if (!runKey) {
+    return transitionFailure(
+      "MIGRATION_REQUIRED",
+      "runtime.activate",
+      "workflow state must carry a canonical run key before dispatch",
+      state,
+      { field: "run_key" },
+    );
+  }
+  const capabilityEpoch = existing?.issued_for.stage_cursor === stage.id
+    ? existing.issued_for.cursor_epoch
+    : typeof state.cursor_epoch === "string" && state.cursor_epoch.trim() ? state.cursor_epoch : null;
+  if (!capabilityEpoch) {
+    return transitionFailure(
+      "MIGRATION_REQUIRED",
+      "runtime.activate",
+      "workflow state must carry a canonical cursor epoch before dispatch",
+      state,
+      { field: "cursor_epoch" },
+    );
+  }
   const existingDispatches = existing?.issued_for.stage_cursor === stage.id ? existing.dispatches : [];
-  const config = resolveConfig(cwd);
-  const flags = state.scope ?? resolveScope([], config);
-  const kind: "none" | "single" | "consilium" = stage.type === "single" || stage.type === "consilium" ? stage.type : "none";
+  const flags = state.scope;
+  if (!flags) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "workflow scope must be bound before dispatch", state, { field: "scope" });
+  const kind: "none" | "single" | "consilium" =
+    stage.type === "single" ? "single" : stage.type === "consilium" ? "consilium" : "none";
   const reuseSelection = stage.roster_policy
     ? state.roster_selection?.stage_id === stage.id
       ? state.roster_selection
       : state.roster_selections?.[stage.id]
     : undefined;
-  const capabilityEpoch = existing?.issued_for.stage_cursor === stage.id
-    ? existing.issued_for.cursor_epoch
-    : state.cursor_epoch ?? randomUUID();
   let rosterSelection = reuseSelection;
-  let slots: ReturnType<typeof resolveStageDispatchSlots> = [];
-  let expectedRoster: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
+  let slots: DispatchSlot[] = [];
+  let expectedRoster: Array<{ role: string; agent: string; agent_ref: AgentRef; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
   if (kind === "none") {
     slots = [];
   } else if (stage.roster_policy) {
-    const selection = reuseSelection && reuseSelection.capability_epoch === capabilityEpoch
+    const selection: RosterSelectionResult = reuseSelection && reuseSelection.capability_epoch === capabilityEpoch
       ? {
-          ok: true as const,
+          ok: true,
           selection: reuseSelection,
           slots: reuseSelection.selected.map((entry) => ({ slot: entry.slot_id, slot_id: entry.slot_id, role: entry.role, occurrence: entry.occurrence, facet: entry.facet })),
           expected_roster: reuseSelection.selected.map((entry) => ({ role: entry.slot_id, agent: entry.agent })),
@@ -547,55 +1290,95 @@ export function beginCapability(cwd: string): TransitionResult {
       : selectRoster(stage, {
           cwd,
           flags,
+          project_identity: context.project_identity,
+          run_identity: context.run_identity,
+          catalog: context.catalog,
+          effectivePolicy: context.effective_policy,
+          agentInventory: context.agent_inventory,
           resolveDevAgent: () => flags.dev_agent,
           state,
-          profile_hash: persistedHash,
-          run_key: state.run_key ?? state.branch,
+          profile_hash: profile_identity.fingerprint,
+          run_key: runKey,
           workflow,
           capability_epoch: capabilityEpoch,
-          resolveAgent: (role) => resolveAgentForRole(role, config),
+          resolveAgent: (role) => qualifiedAgentForRole(role, context)?.registered_name ?? "",
         } satisfies RosterSelectionContext);
     if (selection.ok === false) return { ok: false, error: `workflow stage '${stage.id}' roster selection failed: ${selection.error}`, state };
+    if (!selection.selection) return { ok: false, error: `workflow stage '${stage.id}' roster selection is missing`, state };
     rosterSelection = selection.selection;
     slots = selection.slots;
-    expectedRoster = selection.expected_roster;
+    const qualifiedRoster: Array<{ role: string; agent: string; agent_ref: AgentRef }> = [];
+    for (const entry of selection.expected_roster) {
+      const slot = slots.find((candidate) => candidate.slot === entry.role);
+      const agent_ref = qualifiedAgentForRole(slot?.role ?? entry.role, context);
+      if (!agent_ref) {
+        return { ok: false, error: `workflow stage '${stage.id}' roster contains an unqualified agent`, state };
+      }
+      qualifiedRoster.push({ ...entry, agent: agent_ref.registered_name, agent_ref });
+    }
+    expectedRoster = qualifiedRoster;
   } else {
     try {
-      slots = resolveStageDispatchSlots(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
-      expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+      slots = resolveStageDispatchSlots(stage, {
+        cwd,
+        flags,
+        project_identity: context.project_identity,
+        run_identity: context.run_identity,
+        catalog: context.catalog,
+        resolveDevAgent: () => flags.dev_agent,
+        effectivePolicy: context.effective_policy,
+        agentInventory: context.agent_inventory,
+        state,
+      });
+      expectedRoster = rosterWithQualifiedAgents(slots, context) ?? [];
     } catch (error) {
       return { ok: false, error: `workflow stage '${stage.id}' dispatch roster unresolved: ${String(error)}`, state };
     }
   }
-  if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) return { ok: false, error: `workflow stage '${stage.id}' has an invalid dispatch roster`, state };
-  const mappingIssues: Array<{ role: string; diagnostic: AgentMappingDiagnostic }> = [];
-  for (const slot of slots) {
-    const diagnostic = agentMappingIssueForRole(slot.role, config);
-    if (diagnostic) mappingIssues.push({ role: slot.role, diagnostic });
+  if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) {
+    return { ok: false, error: `workflow stage '${stage.id}' has an invalid dispatch roster`, state };
   }
-  if (mappingIssues.length > 0) {
-    const details = mappingIssues.map(({ role, diagnostic }) => `role '${role}' requested '${diagnostic.requested}' (candidates: ${diagnostic.candidates.join(", ")})`).join("; ");
-    return { ok: false, error: `workflow stage '${stage.id}' has no available agent mapping: ${details}`, state };
+  if (kind !== "none" && expectedRoster.length !== slots.length) {
+    return { ok: false, error: `workflow stage '${stage.id}' has no complete qualified agent roster`, state };
   }
-  if (expectedRoster.length !== slots.length) expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
 
-  if (existing && existing.issued_for.stage_cursor === stage.id && stageEntry.status === "in_progress" && existing.status !== "complete" && existing.status !== "invalidated") {
+  if (
+    existing
+    && existing.issued_for.stage_cursor === stage.id
+    && stageEntry.status === "in_progress"
+    && existing.status !== "complete"
+    && existing.status !== "invalidated"
+  ) {
     const rosterChanged = JSON.stringify(existing.expected_roster) !== JSON.stringify(expectedRoster);
     if (existingDispatches.length > 0 && rosterChanged) return { ok: false, error: "active dispatch capability roster is inconsistent", state };
     if (!rosterChanged) {
+      const identityFields = [
+        "run_id", "wave_id", "slice_id", "session_id", "workflow", "stage_id", "stage_cursor", "capability_id", "capability_epoch",
+      ] as const;
+      if (!isWorkIdentity(state.work_identity) || !isWorkIdentity(existing.work_identity)
+        || identityFields.some((field) =>
+          state.work_identity?.[field] !== existing.work_identity?.[field])) {
+        return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "active capability work identity is missing or mismatched", state);
+      }
       const reissued = reissueActiveCapability(existing);
-      const pendingActive = (reissued.state.dispatches ?? []).some((record) => record.status === "pending" || record.status === "running");
+      const pendingActive = reissued.state.dispatches.some((record) => record.status === "pending" || record.status === "running");
+      const resumedCapability: DispatchCapabilityState = {
+        ...reissued.state,
+        roster_selection: rosterSelection ?? reissued.state.roster_selection,
+      };
       const next: TeamState = {
         ...state,
-        run_key: state.run_key ?? state.branch,
-        profile_hash: persistedHash,
-        cursor_epoch: reissued.state.issued_for!.cursor_epoch,
+        project_identity: identity.project_identity,
+        run_identity: identity.run_identity,
+        run_key: runKey,
+        profile_hash: profile_identity.fingerprint,
+        cursor_epoch: reissued.state.issued_for.cursor_epoch,
         stage_cursor: stage.id,
         scope: flags,
         policy: { ...(state.policy ?? {}), strict_orchestrator: true },
-        stages: stages.map((entry) => entry.id === stage.id ? { ...entry, status: "in_progress" as const } : entry),
+        stages: stages.map((entry) => entry.id === stage.id ? stageWithStatus(entry, "in_progress") : entry),
         ...(rosterSelection ? { roster_selection: rosterSelection, roster_selections: { ...(state.roster_selections ?? {}), [stage.id]: rosterSelection } } : {}),
-        dispatch_capability: { ...reissued.state, roster_selection: rosterSelection ?? reissued.state.roster_selection },
+        dispatch_capability: resumedCapability,
         pause: pendingActive ? { kind: "background_wait", reason: "provider work remains pending" } : { kind: "none", reason: "" },
         updated_at: now(),
       };
@@ -606,27 +1389,36 @@ export function beginCapability(cwd: string): TransitionResult {
   const resetState = stageEntry.status === "in_progress" ? state : resetReopenedStageState(state, target, profile, stage.id, existing);
   const retainedDispatches = stageEntry.status === "in_progress" ? existingDispatches : [];
   const issued = createCapability({
-    run_key: resetState.run_key ?? resetState.branch,
+    run_key: runKey,
     branch: resetState.branch,
     workflow,
-    profile_hash: persistedHash,
+    profile_hash: profile_identity.fingerprint,
     stage_cursor: stage.id,
-    cursor_epoch: capabilityEpoch,
     kind,
     expected_roster: expectedRoster,
     roster_selection: rosterSelection,
+    work_identity_scope: workIdentityScope,
+    project_identity: identity.project_identity,
+    run_identity: identity.run_identity,
   });
+  const armedCapability: DispatchCapabilityState = {
+    ...issued.state,
+    status: retainedDispatches.length > 0 ? "dispatched" : "ready",
+    dispatches: retainedDispatches,
+  };
   const next: TeamState = {
     ...resetState,
-    run_key: resetState.run_key ?? resetState.branch,
-    profile_hash: persistedHash,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    project_identity: identity.project_identity,
+    run_identity: identity.run_identity,
+    run_key: runKey,
+    profile_hash: profile_identity.fingerprint,
+    cursor_epoch: issued.state.issued_for.cursor_epoch,
     stage_cursor: stage.id,
     scope: flags,
     policy: { ...(resetState.policy ?? {}), strict_orchestrator: true },
-    stages: stages.map((entry) => entry.id === stage.id ? { ...entry, status: "in_progress" as const } : entry),
+    work_identity: issued.work_identity,
     ...(rosterSelection ? { roster_selection: rosterSelection, roster_selections: { ...(resetState.roster_selections ?? {}), [stage.id]: rosterSelection } } : {}),
-    dispatch_capability: { ...issued.state, status: retainedDispatches.length > 0 ? "dispatched" as const : "ready" as const, dispatches: retainedDispatches },
+    dispatch_capability: armedCapability,
     pause: { kind: "none", reason: "" },
     updated_at: now(),
   };
@@ -639,10 +1431,23 @@ export function beginCapability(cwd: string): TransitionResult {
 }
 function auth(cap: ActiveCapability, a: DispatchAuth, secretHash: string): string | null {
   if (!a.capability_id || a.capability_id !== cap.capability_id) return "capability identity mismatch";
+  if (!identityMatches(cap.project_identity, cap.run_identity, a.project_identity, a.run_identity)) return "workflow run identity mismatch";
   if (!a.token || hash(a.token) !== secretHash) return "invalid secret";
   const b = cap.issued_for;
-  if (a.run_key !== b.run_key || a.branch !== b.branch || a.workflow !== b.workflow || !profileHashMatches(b.profile_hash, a.profile_hash) || a.stage_cursor !== b.stage_cursor || a.cursor_epoch !== b.cursor_epoch) return "capability binding mismatch";
+  if (a.run_key !== b.run_key || a.branch !== b.branch || a.workflow !== b.workflow || a.profile_hash !== b.profile_hash || a.stage_cursor !== b.stage_cursor || a.cursor_epoch !== b.cursor_epoch) return "capability binding mismatch";
+  if (a.agent_ref !== undefined && a.agent_ref.provider_id !== cap.project_identity.provider_id) return "qualified agent provider mismatch";
   return null;
+}
+
+function authFailure(error: string, state: TeamState): TransitionResult {
+  const identityError = error === "workflow run identity mismatch" || error === "capability identity mismatch" || error === "capability binding mismatch";
+  return transitionFailure(
+    identityError ? "IDENTITY_MISMATCH" : "ACTIVATION_FAILED",
+    "runtime.activate",
+    error,
+    state,
+    { boundary: "dispatch authorization" },
+  );
 }
 
 function expectedTaskId(cap: ActiveCapability, role: string): string {
@@ -660,6 +1465,13 @@ function authorizeBoundRecord(
   const role = input.slot_id ?? input.role ?? "";
   const rosterEntry = cap.expected_roster.find((entry) => entry.role === role);
   if (!rosterEntry) return { ok: false, error: "role/slot not expected", state };
+  if (
+    !input.agent_ref
+    || input.agent_ref.provider_id !== cap.project_identity.provider_id
+    || input.agent_ref.registered_name !== rosterEntry.agent
+    || input.agent_ref.provider_id !== rosterEntry.agent_ref?.provider_id
+    || input.agent_ref.source_fingerprint !== rosterEntry.agent_ref?.source_fingerprint
+  ) return { ok: false, error: "qualified agent identity mismatch", state };
   if (input.role !== undefined && input.role !== role) return { ok: false, error: "slot identity mismatch", state };
   if (input.expected_count !== undefined && input.expected_count !== cap.expected_count) return { ok: false, error: "cardinality mismatch", state };
   const taskId = expectedTaskId(cap, role);
@@ -671,9 +1483,13 @@ function authorizeBoundRecord(
     const sameTask = Boolean(input.task_id && latest.work_identity?.task_id === input.task_id);
     if (sameTask && !latest.tool_call_id && input.tool_call_id) {
       const rebound: DispatchRecord = { ...latest, tool_call_id: input.tool_call_id };
+      const reboundCapability: DispatchCapabilityState = {
+        ...cap,
+        dispatches: cap.dispatches.map((candidate) => candidate.id === latest.id ? rebound : candidate),
+      };
       const reboundState: TeamState = {
         ...state,
-        dispatch_capability: { ...cap, dispatches: cap.dispatches.map((candidate) => candidate.id === latest.id ? rebound : candidate) },
+        dispatch_capability: reboundCapability,
         updated_at: now(),
       };
       persist(cwd, reboundState, target);
@@ -687,29 +1503,33 @@ function authorizeBoundRecord(
   const dispatchId = randomUUID();
   const attempt = latest ? latest.attempt + 1 : 1;
   const identity = workIdentityFor(state, cap, role, rosterEntry.agent, dispatchId, attempt, taskId);
-  const pending = pendingFor(identity, "authorized", undefined, undefined, latest?.id ?? null);
+  const pending = pendingFor(identity, cap.issued_for.run_identity, "authorized", undefined, undefined, latest?.id ?? null);
   const record: DispatchRecord = {
     id: dispatchId,
     role,
     agent: rosterEntry.agent,
-    tool_call_id: input.tool_call_id,
+    ...(rosterEntry.agent_ref !== undefined ? { agent_ref: rosterEntry.agent_ref } : {}),
+    ...(input.tool_call_id !== undefined ? { tool_call_id: input.tool_call_id } : {}),
     status: "authorized",
     attempt,
     created_at: now(),
+    run_identity: cap.issued_for.run_identity,
     work_identity: identity,
     pending,
-    completion_envelope: completionEnvelopeFor(identity, "pending", null, [], "authorized", "engine_task_caller"),
+    completion_envelope: completionEnvelopeFor(identity, cap.issued_for.run_identity, "pending", null, [], "authorized", "engine_task_caller"),
+  };
+  const authorizedCapability: DispatchCapabilityState = {
+    ...cap,
+    status: "dispatched",
+    work_identity: identity,
+    dispatches: [...cap.dispatches, record],
+    pending: [...(cap.pending ?? []), pending],
   };
   const next: TeamState = {
     ...state,
     work_identity: identity,
-    completion_envelope: completionEnvelopeFor(identity, "pending", null, [], "authorized", "engine_task_caller"),
-    dispatch_capability: {
-      ...cap,
-      status: "dispatched",
-      dispatches: [...cap.dispatches, record],
-      pending: [...(cap.pending ?? []), pending],
-    },
+    completion_envelope: completionEnvelopeFor(identity, cap.issued_for.run_identity, "pending", null, [], "authorized", "engine_task_caller"),
+    dispatch_capability: authorizedCapability,
   };
   persist(cwd, next, target);
   return { ok: true, state: next, record };
@@ -717,14 +1537,15 @@ function authorizeBoundRecord(
 
 /** Persist authorization before any native task is executed. */
 export function authorizeDispatch(cwd: string, authInput: DispatchAuth): TransitionResult {
-  const found = current(cwd);
-  if (!found) return { ok: false, error: "state not found" };
+  const found = current(cwd, authInput.run_identity);
+  if (!found) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "dispatch state requires a bound project/run identity");
   const { state, target } = found;
+  if (target.invalid) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "dispatch state identity does not match the authorization run identity", state);
   if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state };
   const cap = activeCapability(state.dispatch_capability);
-  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  if (!cap) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "dispatch capability is unavailable or not v2-bound", state);
   const error = auth(cap, authInput, cap.dispatch_token_hash);
-  if (error) return { ok: false, error, state };
+  if (error) return authFailure(error, state);
   return authorizeBoundRecord(cwd, state, target, cap, authInput);
 }
 
@@ -736,33 +1557,36 @@ export interface TrustedDispatchInput {
   profile_hash: string;
   stage_cursor: string;
   cursor_epoch: string;
+  project_identity: ProjectIdentity;
+  run_identity: WorkflowRunIdentity;
   role: string;
   slot_id?: string;
   task_id?: string;
   agent: string;
+  agent_ref: AgentRef;
   tool_call_id: string;
   expected_count?: number;
   retry_of?: string;
 }
-
-/** Authorize a task after the trusted runtime gate validated its marker. */
 export function authorizeDispatchTrusted(cwd: string, input: TrustedDispatchInput): TransitionResult {
-  const found = current(cwd);
-  if (!found) return { ok: false, error: "state not found" };
+  const found = current(cwd, input.run_identity);
+  if (!found) return transitionFailure("MIGRATION_REQUIRED", "tool.dispatch", "trusted dispatch requires a bound project/run state");
   const { state, target } = found;
+  if (target.invalid) return transitionFailure("IDENTITY_MISMATCH", "tool.dispatch", "trusted dispatch identity does not match the persisted workflow state", state);
   if (resolveActiveBranch(cwd) !== state.branch) return { ok: false, error: "workflow state is stale for the active branch", state };
   const cap = activeCapability(state.dispatch_capability);
-  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  if (!cap) return transitionFailure("MIGRATION_REQUIRED", "tool.dispatch", "dispatch capability is unavailable or not v2-bound", state);
   const binding = cap.issued_for;
   if (
     input.capability_id !== cap.capability_id
+    || !identityMatches(cap.project_identity, cap.run_identity, input.project_identity, input.run_identity)
     || input.run_key !== binding.run_key
     || input.branch !== binding.branch
     || input.workflow !== binding.workflow
     || input.profile_hash !== binding.profile_hash
     || input.stage_cursor !== binding.stage_cursor
     || input.cursor_epoch !== binding.cursor_epoch
-  ) return { ok: false, error: "capability binding mismatch", state };
+  ) return transitionFailure("IDENTITY_MISMATCH", "tool.dispatch", "trusted dispatch capability binding does not match the persisted capability", state);
   if (!input.tool_call_id) return { ok: false, error: "tool call identity required", state };
   return authorizeBoundRecord(cwd, state, target, cap, {
     token: "__trusted_gate__",
@@ -773,10 +1597,13 @@ export function authorizeDispatchTrusted(cwd: string, input: TrustedDispatchInpu
     profile_hash: input.profile_hash,
     stage_cursor: input.stage_cursor,
     cursor_epoch: input.cursor_epoch,
+    project_identity: input.project_identity,
+    run_identity: input.run_identity,
     role: input.role,
     slot_id: input.slot_id,
     task_id: input.task_id,
     agent: input.agent,
+    agent_ref: input.agent_ref,
     tool_call_id: input.tool_call_id,
     expected_count: input.expected_count,
     retry_of: input.retry_of,
@@ -801,22 +1628,32 @@ function pendingRecord(
   providerRef?: string,
 ): TransitionResult {
   if (record.status === "succeeded" || record.status === "failed" || record.status === "cancelled") return { ok: false, error: "terminal dispatch cannot become pending", state };
-  const identity = record.work_identity ?? workIdentityFor(state, cap, record.role, record.agent, record.id, record.attempt);
+  const identity = record.work_identity;
+  if (!identity) {
+    return transitionFailure(
+      "MIGRATION_REQUIRED",
+      "runtime.activate",
+      "pending dispatch requires the persisted work identity",
+      state,
+      { field: "work_identity" },
+    );
+  }
   const previous = record.pending;
   if (previous?.status === "pending" && previous.provider_ref === providerRef && previous.pending_reason === reason) return { ok: true, state, record };
   if (previous?.status === "pending" && previous.provider_ref !== providerRef) return { ok: false, error: "conflicting pending replay", state };
-  const pending = pendingFor(identity, "pending", reason, providerRef, previous?.retry_of ?? null);
-  const envelope = completionEnvelopeFor(identity, "pending", null, [], providerRef ?? reason, "engine_task_caller");
+  const pending = pendingFor(identity, cap.issued_for.run_identity, "pending", reason, providerRef, previous?.retry_of ?? null);
+  const envelope = completionEnvelopeFor(identity, cap.issued_for.run_identity, "pending", null, [], providerRef ?? reason, "engine_task_caller");
   const updated: DispatchRecord = {
     ...record,
     status: "pending",
+    run_identity: cap.issued_for.run_identity,
     work_identity: identity,
     pending,
     completion_envelope: envelope,
   };
-  const nextCapability = {
+  const nextCapability: DispatchCapabilityState = {
     ...cap,
-    status: "dispatched" as const,
+    status: "dispatched",
     dispatches: cap.dispatches.map((candidate) => candidate.id === record.id ? updated : candidate),
     pending: [...(cap.pending ?? []).filter((candidate) => candidate.identity.dispatch_id !== record.id), pending],
   };
@@ -838,22 +1675,51 @@ export function persistPendingDispatch(
   cwd: string,
   input: DispatchAuth & { dispatch_id: string; pending_reason?: PendingState["pending_reason"]; provider_ref?: string },
 ): TransitionResult {
-  const found = current(cwd);
-  if (!found) return { ok: false, error: "state not found" };
+  const found = current(cwd, input.run_identity);
+  if (!found) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "pending dispatch requires a bound project/run state");
   const { state, target } = found;
+  if (target.invalid) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "pending dispatch identity does not match the persisted workflow state", state);
   if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state };
   const cap = activeCapability(state.dispatch_capability);
-  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  if (!cap) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "dispatch capability is unavailable or not v2-bound", state);
   const error = auth(cap, input, cap.dispatch_token_hash);
-  if (error) return { ok: false, error, state };
+  if (error) return authFailure(error, state);
   const record = cap.dispatches.find((candidate) => candidate.id === input.dispatch_id);
   if (!record) return { ok: false, error: "unknown dispatch", state };
   if (input.role !== undefined && input.role !== record.role) return { ok: false, error: "dispatch slot mismatch", state };
   return pendingRecord(cwd, state, target, cap, record, input.pending_reason, input.provider_ref);
 }
 
-/** Alias retained for adapters that name the transition as a lifecycle update. */
-export const markDispatchPending = persistPendingDispatch;
+
+function withoutTopLevelPendingCompletion(state: TeamState): TeamState {
+  const next = { ...state };
+  delete next.pending;
+  delete next.completion_envelope;
+  return next;
+}
+
+function normalizeTopLevelCompletionState(
+  state: TeamState,
+  capability: DispatchCapabilityState,
+  completedIdentity: WorkIdentity,
+  completedEnvelope: CompletionEnvelope | undefined,
+): TeamState {
+  const normalized = withoutTopLevelPendingCompletion(state);
+  const active = capability.dispatches.find((candidate) =>
+    (candidate.status === "pending" || candidate.status === "running") && candidate.pending !== undefined);
+  if (active?.pending) {
+    return {
+      ...normalized,
+      work_identity: active.work_identity,
+      pending: active.pending,
+    };
+  }
+  return {
+    ...normalized,
+    work_identity: completedIdentity,
+    ...(completedEnvelope ? { completion_envelope: completedEnvelope } : {}),
+  };
+}
 
 function completeRecord(
   cwd: string,
@@ -865,6 +1731,16 @@ function completeRecord(
 ): TransitionResult {
   if (cap.status === "invalidated" || cap.status === "complete") return { ok: false, error: "capability invalidated", state };
   if (!input.evidence.trim()) return { ok: false, error: "completion evidence required", state };
+  const identity = record.work_identity;
+  if (!identity) {
+    return transitionFailure(
+      "MIGRATION_REQUIRED",
+      "runtime.activate",
+      "completion requires the persisted work identity",
+      state,
+      { field: "work_identity" },
+    );
+  }
   const artifact_ids = input.artifact_ids ?? [];
   const artifactDir = target.artifactsDir ?? "";
   const declaredArtifacts = state.artifacts ?? {};
@@ -879,26 +1755,27 @@ function completeRecord(
   const missingArtifacts = artifact_ids.some((id) => !existsSync(join(artifactDir, `${id}.json`)) && !Object.prototype.hasOwnProperty.call(declaredArtifacts, id));
   if (unsafeArtifacts || (missingArtifacts && !deferredNativeArtifacts)) return { ok: false, error: "declared artifact missing or unsafe", state };
   if (previousCompletion && !(sameOutcome && sameArtifacts) && !deferredNativeArtifacts) return { ok: false, error: "conflicting replay", state };
-  const identity = record.work_identity ?? workIdentityFor(state, cap, record.role, record.agent, record.id, record.attempt);
   const completedBy = input.completed_by ?? "workflow_complete";
   const terminalSignal = input.terminal_signal ?? (completedBy === "synchronous_tool_result" ? "native_tool_result" : "workflow_complete");
   const snapshotted = snapshotSlotArtifacts(state, cap, record, artifact_ids, artifactDir);
   if (snapshotted.ok === false) {
     if (snapshotted.retryable && previousCompletion) {
-      const identity = record.work_identity ?? workIdentityFor(state, cap, record.role, record.agent, record.id, record.attempt);
       const deferredCompletion: DispatchCompletion = {
         ...previousCompletion,
         artifact_ids,
         evidence: input.evidence,
         work_identity: identity,
       };
-      const deferredEnvelope = completionEnvelopeFor(identity, input.outcome, "native_tool_result", completionArtifactRefs(artifactDir, artifact_ids), input.evidence, "synchronous_tool_result");
-      const deferredRecord: DispatchRecord = { ...record, work_identity: identity, completion: deferredCompletion, completion_envelope: deferredEnvelope };
-      const deferredState: TeamState = {
-        ...state,
+      const deferredEnvelope = completionEnvelopeFor(identity, cap.issued_for.run_identity, input.outcome, "native_tool_result", completionArtifactRefs(artifactDir, artifact_ids), input.evidence, "synchronous_tool_result");
+      const deferredRecord: DispatchRecord = { ...record, run_identity: cap.issued_for.run_identity, work_identity: identity, completion: deferredCompletion, completion_envelope: deferredEnvelope };
+      const deferredCapability: DispatchCapabilityState = {
+        ...cap,
         work_identity: identity,
-        completion_envelope: deferredEnvelope,
-        dispatch_capability: { ...cap, dispatches: cap.dispatches.map((candidate) => candidate.id === record.id ? deferredRecord : candidate) },
+        dispatches: cap.dispatches.map((candidate) => candidate.id === record.id ? deferredRecord : candidate),
+      };
+      const deferredState: TeamState = {
+        ...normalizeTopLevelCompletionState(state, deferredCapability, identity, deferredEnvelope),
+        dispatch_capability: deferredCapability,
         updated_at: now(),
       };
       persist(cwd, deferredState, target);
@@ -908,12 +1785,14 @@ function completeRecord(
   }
   if (previousCompletion && sameOutcome && sameArtifacts) {
     const replayedRecord: DispatchRecord = { ...record, work_identity: identity };
-    const replayedState: TeamState = {
-      ...snapshotted.state,
+    const replayedCapability: DispatchCapabilityState = {
+      ...cap,
       work_identity: identity,
-      ...(snapshotted.state.pending ? { pending: snapshotted.state.pending } : {}),
-      ...(record.completion_envelope ? { completion_envelope: record.completion_envelope } : {}),
-      dispatch_capability: { ...cap, dispatches: cap.dispatches.map((candidate) => candidate.id === record.id ? replayedRecord : candidate) },
+      dispatches: cap.dispatches.map((candidate) => candidate.id === record.id ? replayedRecord : candidate),
+    };
+    const replayedState: TeamState = {
+      ...normalizeTopLevelCompletionState(snapshotted.state, replayedCapability, identity, record.completion_envelope),
+      dispatch_capability: replayedCapability,
       updated_at: now(),
     };
     persist(cwd, replayedState, target);
@@ -927,31 +1806,36 @@ function completeRecord(
     artifact_ids,
     evidence: input.evidence,
     completed_by: completedBy,
+    run_identity: cap.issued_for.run_identity,
     completed_at: completedAt,
     work_identity: identity,
   };
-  const envelope = completionEnvelopeFor(identity, input.outcome, terminalSignal, completionArtifactRefs(artifactDir, artifact_ids), input.evidence, completedBy);
-  const terminalPending = pendingFor(identity, input.outcome, undefined, undefined, record.pending?.retry_of ?? null);
+  const envelope = completionEnvelopeFor(identity, cap.issued_for.run_identity, input.outcome, terminalSignal, completionArtifactRefs(artifactDir, artifact_ids), input.evidence, completedBy);
+  const terminalPending = pendingFor(identity, cap.issued_for.run_identity, input.outcome, undefined, undefined, record.pending?.retry_of ?? null);
   const updated: DispatchRecord = {
     ...record,
     status: input.outcome,
     completed_at: completedAt,
-    work_identity: identity,
+    run_identity: cap.issued_for.run_identity,
     pending: terminalPending,
     completion,
     completion_envelope: envelope,
   };
-  const nextCapability = {
+  const nextCapabilityRaw: DispatchCapabilityState = {
     ...cap,
+    work_identity: identity,
     dispatches: cap.dispatches.map((candidate) => candidate.id === record.id ? updated : candidate),
     pending: [...(cap.pending ?? []).filter((candidate) => candidate.identity.dispatch_id !== record.id), terminalPending],
   };
+  const activePendingRecord = nextCapabilityRaw.dispatches.find((candidate) =>
+    (candidate.status === "pending" || candidate.status === "running") && candidate.pending !== undefined);
+  const nextCapability: DispatchCapabilityState = {
+    ...nextCapabilityRaw,
+    work_identity: activePendingRecord?.work_identity ?? identity,
+  };
   const activePending = nextCapability.dispatches.some((candidate) => candidate.status === "pending" || candidate.status === "running");
   const next: TeamState = {
-    ...snapshotted.state,
-    work_identity: identity,
-    ...(activePending ? { pending: nextCapability.dispatches.find((candidate) => candidate.status === "pending")?.pending } : {}),
-    completion_envelope: envelope,
+    ...normalizeTopLevelCompletionState(snapshotted.state, nextCapability, identity, envelope),
     dispatch_capability: nextCapability,
     pause: activePending ? { kind: "background_wait", reason: "provider work remains pending" } : { kind: "none", reason: "" },
     updated_at: now(),
@@ -1016,11 +1900,15 @@ function hashValue(value: unknown): string {
   return hash(JSON.stringify(value));
 }
 export function completeDispatch(cwd: string, input: DispatchAuth & { dispatch_id: string } & Partial<CompletionInput>): TransitionResult {
-  const found = current(cwd); if (!found) return { ok: false, error: "state not found" };
+  const found = current(cwd, input.run_identity);
+  if (!found) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "completion requires a bound project/run state");
   const { state, target } = found;
+  if (target.invalid) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "completion identity does not match the persisted workflow state", state);
   if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state };
-  const cap = activeCapability(state.dispatch_capability); if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
-  const error = auth(cap, input, cap.dispatch_token_hash); if (error) return { ok: false, error, state };
+  const cap = activeCapability(state.dispatch_capability);
+  if (!cap) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "dispatch capability is unavailable or not v2-bound", state);
+  const error = auth(cap, input, cap.dispatch_token_hash);
+  if (error) return authFailure(error, state);
   const record = cap.dispatches.find((d) => d.id === input.dispatch_id);
   if (!record) return { ok: false, error: "unknown dispatch", state };
   if (input.role !== undefined && input.role !== record.role) return { ok: false, error: "dispatch role mismatch", state };
@@ -1029,12 +1917,23 @@ export function completeDispatch(cwd: string, input: DispatchAuth & { dispatch_i
   if (input.agent !== undefined && input.agent !== record.agent) return { ok: false, error: "dispatch agent mismatch", state };
   if (input.tool_call_id !== undefined && record.tool_call_id !== undefined && input.tool_call_id !== record.tool_call_id) return { ok: false, error: "dispatch tool-call mismatch", state };
   if (input.pending === true) return pendingRecord(cwd, state, target, cap, record, input.pending_reason, input.provider_ref);
-  if (!input.outcome || !input.evidence) return { ok: false, error: "terminal completion outcome and evidence are required", state };
-  return completeRecord(cwd, state, target, cap, record, input as CompletionInput);
+  const outcome = input.outcome;
+  const evidence = input.evidence;
+  if (!outcome || !evidence) return { ok: false, error: "terminal completion outcome and evidence are required", state };
+  const completionInput: CompletionInput = {
+    outcome,
+    evidence,
+    ...(input.artifact_ids !== undefined ? { artifact_ids: input.artifact_ids } : {}),
+    ...(input.completed_by !== undefined ? { completed_by: input.completed_by } : {}),
+    ...(input.terminal_signal !== undefined ? { terminal_signal: input.terminal_signal } : {}),
+  };
+  return completeRecord(cwd, state, target, cap, record, completionInput);
 }
 
 /** Reconcile a native task result without exposing capability secrets to hooks. */
 export function reconcileTrustedTaskResult(cwd: string, input: {
+  project_identity: ProjectIdentity;
+  run_identity: WorkflowRunIdentity;
   tool_call_id?: string;
   capability_id?: string;
   cursor_epoch?: string;
@@ -1052,14 +1951,19 @@ export function reconcileTrustedTaskResult(cwd: string, input: {
   terminal_signal?: CompletionEnvelope["terminal_signal"];
 }): TransitionResult {
   if (!input.tool_call_id && !input.dispatch_id && !input.work_identity) return { ok: false, error: "dispatch identity required" };
-  const found = current(cwd);
-  if (!found) return { ok: false, error: "state not found" };
+  const found = current(cwd, input.run_identity);
+  if (!found) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "trusted result requires a bound workflow state");
+  if (found.target.invalid) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "trusted result identity does not match the persisted workflow state", found.state);
   if (resolveActiveBranch(cwd) !== found.state.branch) return { ok: false, error: "workflow state is stale for the active branch", state: found.state };
+  if (!found.state.project_identity || !found.state.run_identity || !identityMatches(found.state.project_identity, found.state.run_identity, input.project_identity, input.run_identity)) {
+    return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "trusted result lacks the active project/run identity", found.state);
+  }
   const cap = activeCapability(found.state.dispatch_capability);
-  if (!cap) return { ok: false, error: "dispatch capability unavailable", state: found.state };
-  if (input.capability_id && input.capability_id !== cap.capability_id) return { ok: false, error: "capability identity mismatch", state: found.state };
-  if (input.cursor_epoch && input.cursor_epoch !== cap.issued_for.cursor_epoch) return { ok: false, error: "cursor epoch mismatch", state: found.state };
-  let candidates = cap.dispatches.filter((record) => {
+  if (!cap) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "dispatch capability is unavailable or not v2-bound", found.state);
+  if (!identityMatches(cap.project_identity, cap.run_identity, input.project_identity, input.run_identity)) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "trusted result run identity mismatches the active capability", found.state);
+  if (input.capability_id && input.capability_id !== cap.capability_id) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "trusted result capability id mismatches the active capability", found.state);
+  if (input.cursor_epoch && input.cursor_epoch !== cap.issued_for.cursor_epoch) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "trusted result cursor epoch mismatches the active capability", found.state);
+  const candidates = cap.dispatches.filter((record) => {
     if (input.dispatch_id && record.id !== input.dispatch_id) return false;
     if (input.tool_call_id && record.tool_call_id !== input.tool_call_id) return false;
     if (input.slot_id && input.slot_id !== record.role && input.slot_id !== record.work_identity?.slot_id) return false;
@@ -1142,7 +2046,8 @@ function recoverSynchronousArtifactIds(
 
 function objectArtifact(artifactsDir: string, id: string): Record<string, unknown> | null {
   const value = readArtifact(artifactsDir, id);
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  if (!isRecord(value)) return null;
+  return value;
 }
 
 function evaluateStageGate(stage: StageDef, state: TeamState, artifactsDir: string, flags: ScopeFlags): string | null {
@@ -1246,7 +2151,7 @@ function validateStageCompletion(
   target: ResolvedState,
   evidence: string,
   flags: ScopeFlags,
-  profile: NonNullable<ReturnType<typeof loadProfile>>,
+  profile: Profile,
 ): StageCompletionResult {
   if (!evidence.trim()) return { ok: false, error: "stage completion evidence required" };
   const artifactsDir = target.artifactsDir ?? "";
@@ -1305,25 +2210,34 @@ function renderStageDocument(stage: StageDef, target: ResolvedState): { ok: true
   return { ok: true };
 }
 
-export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResult {
-  const found = current(cwd);
-  if (!found) return { ok: false, error: "state not found" };
+export function advanceCursor(cwd: string, input: DispatchAuth, context: CapabilityContext): TransitionResult {
+  const identity = requireIdentity(context.project_identity, context.run_identity, "workflow advance");
+  const found = current(cwd, identity.run_identity);
+  if (!found) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "advance requires a bound workflow state");
   const { state: rawState, target } = found;
+  if (target.invalid) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "advance identity does not match the persisted workflow state", rawState);
   if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state: rawState };
+  if (!rawState.project_identity || !rawState.run_identity || !identityMatches(rawState.project_identity, rawState.run_identity, identity.project_identity, identity.run_identity)) {
+    return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "workflow state project/run identity does not match the advance context", rawState);
+  }
   const cap = activeCapability(rawState.dispatch_capability);
-  if (!cap) return { ok: false, error: "dispatch capability unavailable", state: rawState };
+  if (!cap) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "dispatch capability is unavailable or not v2-bound", rawState);
   const error = auth(cap, input, cap.advance_token_hash);
-  if (error) return { ok: false, error, state: rawState };
+  if (error) return authFailure(error, rawState);
   if (cap.status === "invalidated" || cap.status === "complete") return { ok: false, error: "capability invalidated", state: rawState };
   if (input.cursor_epoch !== cap.issued_for.cursor_epoch || rawState.stage_cursor !== cap.issued_for.stage_cursor || rawState.cursor_epoch !== cap.issued_for.cursor_epoch) return { ok: false, error: "stale cursor binding", state: rawState };
   if (typeof input.evidence !== "string" || !input.evidence.trim()) return { ok: false, error: "stage advancement evidence required", state: rawState };
-  const profile = loadProfile(cap.issued_for.workflow);
-  if (!profile || profileHash(profile) !== cap.issued_for.profile_hash) return { ok: false, error: "workflow profile is missing or stale", state: rawState };
+  const selected = contextProfile(context);
+  if ("error" in selected) return { ok: false, error: selected.error, state: rawState, diagnostic: selected.diagnostic };
+  const { profile, profile_identity } = selected;
+  if (profile.name !== cap.issued_for.workflow || profile_identity.fingerprint !== cap.issued_for.profile_hash) {
+    return { ok: false, error: "workflow profile is missing or stale", state: rawState };
+  }
   const currentStage = profile.stages.find((candidate) => candidate.id === rawState.stage_cursor);
   if (!currentStage) return { ok: false, error: "current workflow stage unavailable", state: rawState };
 
-  const config = resolveConfig(cwd);
-  const flags = rawState.scope ?? resolveScope([], config);
+  const flags = rawState.scope;
+  if (!flags) return { ok: false, error: "MIGRATION_REQUIRED: workflow scope must be bound before advance", state: rawState };
   const recovered = recoverSynchronousArtifactIds(cwd, rawState, target, cap, currentStage);
   if (!recovered.ok) return { ok: false, error: recovered.error, state: rawState };
   let state = recovered.state;
@@ -1358,6 +2272,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
   const joinSummary = {
     stage_id: rawState.stage_cursor,
     cursor_epoch: cap.issued_for.cursor_epoch,
+    run_identity: cap.issued_for.run_identity,
     dispatch_ids: records.map((r) => r.id),
     roles: records.map((r) => r.role),
     evidence: input.evidence.trim(),
@@ -1448,23 +2363,29 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
           outcome: kind,
           ended_at: now(),
         };
+        const exhaustedCapability: DispatchCapabilityState = {
+          ...cap,
+          status: "complete",
+          dispatches: [],
+        };
         const next: TeamState = {
           ...state,
           loop_state: exhausted,
           pause: { kind, reason: `loop '${currentStage.id}' exhausted after ${currentStage.loop.max_iterations} iteration(s)` },
-          stages: state.stages.map((s) => (s.id === currentStage.id ? { ...s, status: "done" as const } : s)),
+          stages: state.stages.map((s) => s.id === currentStage.id ? stageWithStatus(s, "done") : s),
           join_summary: joinSummary,
-          dispatch_capability: { ...cap, status: "complete" as const, dispatches: [] },
+          dispatch_capability: exhaustedCapability,
           updated_at: now(),
         };
         persist(cwd, next, target);
         return { ok: true, state: next };
       }
-      return reenterLoop(cwd, state, target, profile, cap, currentStage, records, joinSummary, decision.reentries, flags, config);
+      return reenterLoop(cwd, state, target, profile, cap, currentStage, records, joinSummary, decision.reentries, flags, context);
     }
     const existingLoop = loopStateFor(state, currentStage.id);
     if (existingLoop) {
-      state = { ...state, loop_state: { ...existingLoop, status: "complete" as const, ended_at: now() } };
+      const completedLoop: LoopState = { ...existingLoop, status: "complete", ended_at: now() };
+      state = { ...state, loop_state: completedLoop };
     }
   }
 
@@ -1505,33 +2426,49 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
   }
   const epoch = randomUUID();
   let handoffSecrets: { capability_id: string; dispatch_token: string; advance_token: string } | undefined;
-  let nextCap: NonNullable<TeamState["dispatch_capability"]>;
+  let nextCap: DispatchCapabilityState;
   let nextSelection: TeamState["roster_selection"];
   if (nextStage) {
     const nextKind: "none" | "single" | "consilium" =
       nextStage.type === "single" || nextStage.type === "consilium" ? nextStage.type : "none";
-    let slots: ReturnType<typeof resolveStageDispatchSlots> = [];
-    let expectedRoster: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
+    let slots: DispatchSlot[] = [];
+    let expectedRoster: Array<{ role: string; agent: string; agent_ref: AgentRef; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
     if (nextKind !== "none" && nextStage.roster_policy) {
       const selection = selectRoster(nextStage, {
         cwd,
         flags,
+        project_identity: context.project_identity,
+        run_identity: context.run_identity,
+        catalog: context.catalog,
+        effectivePolicy: context.effective_policy,
+        agentInventory: context.agent_inventory,
         resolveDevAgent: () => flags.dev_agent,
         state,
         profile_hash: cap.issued_for.profile_hash,
         run_key: cap.issued_for.run_key,
         workflow: cap.issued_for.workflow,
         capability_epoch: epoch,
-        resolveAgent: (role) => resolveAgentForRole(role, config),
+        resolveAgent: (role) => qualifiedAgentForRole(role, context)?.registered_name ?? "",
       } satisfies RosterSelectionContext);
       if (selection.ok === false) return { ok: false, error: `next stage '${nextStage.id}' roster selection failed: ${selection.error}`, state };
+      if (!selection.selection) return { ok: false, error: `next stage '${nextStage.id}' roster selection is missing`, state };
       nextSelection = selection.selection;
       slots = selection.slots;
-      expectedRoster = selection.expected_roster;
+      expectedRoster = rosterWithQualifiedAgents(slots, context) ?? [];
     } else if (nextKind !== "none") {
       try {
-        slots = resolveStageDispatchSlots(nextStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent, state });
-        expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+        slots = resolveStageDispatchSlots(nextStage, {
+          cwd,
+          flags,
+          project_identity: context.project_identity,
+          run_identity: context.run_identity,
+          catalog: context.catalog,
+          resolveDevAgent: () => flags.dev_agent,
+          effectivePolicy: context.effective_policy,
+          agentInventory: context.agent_inventory,
+          state,
+        });
+        expectedRoster = rosterWithQualifiedAgents(slots, context) ?? [];
       } catch (error) {
         return { ok: false, error: `next stage '${nextStage.id}' dispatch roster unresolved: ${String(error)}`, state };
       }
@@ -1539,41 +2476,58 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
     if ((nextKind === "single" && slots.length !== 1) || (nextKind === "consilium" && slots.length === 0)) {
       return { ok: false, error: `next stage '${nextStage.id}' has an invalid dispatch roster`, state };
     }
+    if (nextKind !== "none" && expectedRoster.length !== slots.length) {
+      return { ok: false, error: `next stage '${nextStage.id}' has no complete qualified agent roster`, state };
+    }
+    const nextWorkIdentityScope = workIdentityScopeForStage(state, nextStage.id);
+    state = retireCurrentCapability(state, "advance");
     const issued = createCapability({
       run_key: cap.issued_for.run_key,
       branch: cap.issued_for.branch,
       workflow: cap.issued_for.workflow,
       profile_hash: cap.issued_for.profile_hash,
       stage_cursor: nextStage.id,
-      cursor_epoch: epoch,
       kind: nextKind,
       expected_roster: expectedRoster,
       roster_selection: nextSelection,
+      work_identity_scope: nextWorkIdentityScope,
+      project_identity: cap.project_identity,
+      run_identity: cap.run_identity,
     });
     nextCap = issued.state;
     handoffSecrets = { capability_id: issued.capability_id, dispatch_token: issued.dispatch_token, advance_token: issued.advance_token };
   } else {
-    nextCap = { ...cap, status: "complete" as const, dispatches: [] };
+    nextCap = { ...cap, status: "complete" };
   }
+  const nextRosterState = nextSelection && nextStage
+    ? {
+        roster_selection: nextSelection,
+        roster_selections: { ...(state.roster_selections ?? {}), [nextStage.id]: nextSelection },
+      }
+    : {};
+  const base = nextStage
+    ? state
+    : normalizeTopLevelCompletionState(state, nextCap, cap.work_identity, state.completion_envelope);
   const next: TeamState = {
-    ...state,
+    ...base,
     stage_cursor: nextStage?.id ?? state.stage_cursor,
-    cursor_epoch: epoch,
+    cursor_epoch: nextStage ? nextCap.issued_for.cursor_epoch : cap.issued_for.cursor_epoch,
+    work_identity: nextCap.work_identity,
     // The newly armed ready capability must never be persisted while its
     // stage cursor is still pending: mark the next stage in_progress in the
     // same atomic state update that arms the capability, so a resumed run
     // can dispatch against it immediately. Consecutive skip_if stages are
     // marked terminal `skipped` in the same update; they are never armed.
     stages: state.stages.map((s) => {
-      if (s.id === state.stage_cursor) return { ...s, status: "done" as const };
-      if (skippedStageIds.includes(s.id)) return { ...s, status: "skipped" as const };
-      if (nextStage && s.id === nextStage.id) return { ...s, status: "in_progress" as const };
+      if (s.id === state.stage_cursor) return stageWithStatus(s, "done");
+      if (skippedStageIds.includes(s.id)) return stageWithStatus(s, "skipped");
+      if (nextStage && s.id === nextStage.id) return stageWithStatus(s, "in_progress");
       return s;
     }),
     join_summary: joinSummary,
-    ...(nextSelection ? { roster_selection: nextSelection, roster_selections: { ...(state.roster_selections ?? {}), [nextStage!.id]: nextSelection } } : {}),
+    ...nextRosterState,
     dispatch_capability: nextCap,
-    pause: nextStage ? state.pause : { kind: "done", reason: "" },
+    pause: nextStage ? { kind: "none", reason: "" } : { kind: "done", reason: "" },
   };
   persist(cwd, next, target);
   return { ok: true, state: next, handoff: nextStage && handoffSecrets ? handoffFromState(next, handoffSecrets, nextStage) : undefined };
@@ -1589,44 +2543,61 @@ function reenterLoop(
   cwd: string,
   state: TeamState,
   target: ResolvedState,
-  profile: NonNullable<ReturnType<typeof loadProfile>>,
+  profile: Profile,
   cap: ActiveCapability,
   currentStage: StageDef,
   records: DispatchRecord[],
   joinSummary: TeamState["join_summary"],
   reentries: number,
   flags: ScopeFlags,
-  config: ReturnType<typeof resolveConfig>,
+  context: CapabilityContext,
 ): TransitionResult {
-  const loop = currentStage.loop!;
+  const loop = currentStage.loop;
+  if (!loop) return { ok: false, error: "loop definition is missing for the current stage", state };
   const backToStage = resolveBackToStage(profile, loop.back_to);
   if (!backToStage) return { ok: false, error: `loop back_to '${loop.back_to}' is not a stage in the profile`, state };
   const kind: "none" | "single" | "consilium" =
     backToStage.type === "single" || backToStage.type === "consilium" ? backToStage.type : "none";
   const epoch = randomUUID();
   let rosterSelection: TeamState["roster_selection"];
-  let slots: ReturnType<typeof resolveStageDispatchSlots> = [];
-  let expectedRoster: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
+  let slots: DispatchSlot[] = [];
+  let expectedRoster: Array<{ role: string; agent: string; agent_ref: AgentRef; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
   if (kind !== "none" && backToStage.roster_policy) {
     const selection = selectRoster(backToStage, {
       cwd,
       flags,
+      project_identity: context.project_identity,
+      run_identity: context.run_identity,
+      catalog: context.catalog,
+      effectivePolicy: context.effective_policy,
+      agentInventory: context.agent_inventory,
       resolveDevAgent: () => flags.dev_agent,
       state,
       profile_hash: cap.issued_for.profile_hash,
       run_key: cap.issued_for.run_key,
       workflow: cap.issued_for.workflow,
       capability_epoch: epoch,
-      resolveAgent: (role) => resolveAgentForRole(role, config),
+      resolveAgent: (role) => qualifiedAgentForRole(role, context)?.registered_name ?? "",
     } satisfies RosterSelectionContext);
     if (selection.ok === false) return { ok: false, error: `loop target stage '${backToStage.id}' roster selection failed: ${selection.error}`, state };
+    if (!selection.selection) return { ok: false, error: `loop target stage '${backToStage.id}' roster selection is missing`, state };
     rosterSelection = selection.selection;
     slots = selection.slots;
-    expectedRoster = selection.expected_roster;
+    expectedRoster = rosterWithQualifiedAgents(slots, context) ?? [];
   } else if (kind !== "none") {
     try {
-      slots = resolveStageDispatchSlots(backToStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent, state });
-      expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+      slots = resolveStageDispatchSlots(backToStage, {
+        cwd,
+        flags,
+        project_identity: context.project_identity,
+        run_identity: context.run_identity,
+        catalog: context.catalog,
+        resolveDevAgent: () => flags.dev_agent,
+        effectivePolicy: context.effective_policy,
+        agentInventory: context.agent_inventory,
+        state,
+      });
+      expectedRoster = rosterWithQualifiedAgents(slots, context) ?? [];
     } catch (error) {
       return { ok: false, error: `loop target stage '${backToStage.id}' dispatch roster unresolved: ${String(error)}`, state };
     }
@@ -1634,18 +2605,26 @@ function reenterLoop(
   if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) {
     return { ok: false, error: `loop target stage '${backToStage.id}' has an invalid dispatch roster`, state };
   }
+  if (kind !== "none" && expectedRoster.length !== slots.length) {
+    return { ok: false, error: `loop target stage '${backToStage.id}' has no complete qualified agent roster`, state };
+  }
+  const nextWorkIdentityScope = workIdentityScopeForStage(state, backToStage.id);
+  state = retireCurrentCapability(state, "loop_reentry");
   const issued = createCapability({
     run_key: cap.issued_for.run_key,
     branch: cap.issued_for.branch,
     workflow: cap.issued_for.workflow,
     profile_hash: cap.issued_for.profile_hash,
     stage_cursor: backToStage.id,
-    cursor_epoch: epoch,
     kind,
     expected_roster: expectedRoster,
     roster_selection: rosterSelection,
+    work_identity_scope: nextWorkIdentityScope,
+    project_identity: cap.project_identity,
+    run_identity: cap.run_identity,
   });
   const iteration = reentries + 1;
+  const issuedEpoch = issued.state.issued_for.cursor_epoch;
   const loopState: LoopState = {
     stage_id: currentStage.id,
     back_to: loop.back_to,
@@ -1653,28 +2632,33 @@ function reenterLoop(
     max_iterations: loop.max_iterations,
     on_exhausted: loop.on_exhausted,
     reentries: iteration,
-    epoch,
+    epoch: issuedEpoch,
     status: "running",
     history: [
       ...(loopStateFor(state, currentStage.id)?.history ?? []),
-      loopIterationRecord(iteration, cap.issued_for.cursor_epoch, epoch, false),
+      loopIterationRecord(iteration, cap.issued_for.cursor_epoch, issuedEpoch, false),
     ],
+  };
+  const loopCapability: DispatchCapabilityState = {
+    ...issued.state,
+    status: "ready",
+    dispatches: [],
   };
   const next: TeamState = {
     ...state,
     stage_cursor: backToStage.id,
-    cursor_epoch: epoch,
+    cursor_epoch: issuedEpoch,
+    work_identity: issued.work_identity,
     loop_state: loopState,
     stages: state.stages.map((s) =>
       s.id === currentStage.id
-        ? { ...s, status: "done" as const }
+        ? stageWithStatus(s, "done")
         : s.id === backToStage.id
-          ? { ...s, status: "in_progress" as const }
+          ? stageWithStatus(s, "in_progress")
           : s,
     ),
     join_summary: joinSummary,
-    ...(rosterSelection ? { roster_selection: rosterSelection, roster_selections: { ...(state.roster_selections ?? {}), [backToStage.id]: rosterSelection } } : {}),
-    dispatch_capability: { ...issued.state, status: "ready" as const, dispatches: [] },
+    dispatch_capability: loopCapability,
     updated_at: now(),
   };
   persist(cwd, next, target);
@@ -1690,6 +2674,9 @@ function reenterLoop(
 }
 
 export interface ChildJoinInput {
+  /** The parent and child result must be bound to this exact workflow run identity. */
+  project_identity: ProjectIdentity;
+  run_identity: WorkflowRunIdentity;
   parent: WorkIdentity;
   child: WorkIdentity;
   state: ChildJoin["state"];
@@ -1705,31 +2692,38 @@ function sameIdentity(left: WorkIdentity | undefined, right: WorkIdentity | unde
 
 /** Append a child result to the durable parent ledger without positional joins. */
 export function appendChildJoin(cwd: string, input: ChildJoinInput): TransitionResult {
-  const found = current(cwd);
-  if (!found) return { ok: false, error: "state not found" };
+  const found = current(cwd, input.run_identity);
+  if (!found) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "child join requires a bound project/run state");
   const { state, target } = found;
+  if (target.invalid) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "child join identity does not match the persisted workflow state", state);
   if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state };
   const cap = activeCapability(state.dispatch_capability);
-  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  if (!cap) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "dispatch capability is unavailable or not v2-bound", state);
+  if (!state.project_identity || !state.run_identity || !identityMatches(state.project_identity, state.run_identity, input.project_identity, input.run_identity) || !identityMatches(cap.project_identity, cap.run_identity, input.project_identity, input.run_identity)) {
+    return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "child join identity does not match the active capability", state);
+  }
+  if (!input.parent.run_id || input.parent.run_id !== input.run_identity.run_id || !input.child.run_id || input.child.run_id !== input.run_identity.run_id || !input.child.task_id || !input.child.dispatch_id || !input.child.worker_id) return { ok: false, error: "child identity is incomplete or belongs to another run", state };
+  if (sameIdentity(input.parent, state.work_identity) && input.parent.run_id !== input.run_identity.run_id) return { ok: false, error: "parent identity belongs to another run", state };
   if (!sameIdentity(input.parent, state.work_identity) && (
     input.parent.capability_id !== cap.capability_id
     || input.parent.capability_epoch !== cap.issued_for.cursor_epoch
   )) return { ok: false, error: "parent identity is not bound to the active capability", state };
-  if (!input.child.run_id || !input.child.task_id || !input.child.dispatch_id || !input.child.worker_id) return { ok: false, error: "child identity is incomplete", state };
   if (sameIdentity(input.parent, input.child)) return { ok: false, error: "parent and child identities must differ", state };
   if (!Number.isInteger(input.attempt) || input.attempt < 1) return { ok: false, error: "child attempt must be a positive integer", state };
   if (new Set(input.expected_artifact_ids).size !== input.expected_artifact_ids.length || input.expected_artifact_ids.some((id) => !isSafeStateSegment(id))) {
     return { ok: false, error: "child artifact ids are unsafe or duplicated", state };
   }
+  const terminal = input.state === "succeeded" || input.state === "failed" || input.state === "cancelled";
   if (input.completion_envelope) {
-    const terminal = input.state === "succeeded" || input.state === "failed" || input.state === "cancelled";
     if (
       !sameIdentity(input.completion_envelope.identity, input.child)
+      || !input.completion_envelope.run_identity
+      || !runIdentityMatches(input.completion_envelope.run_identity, input.run_identity)
       || input.completion_envelope.outcome !== (terminal ? input.state : "pending")
       || (terminal ? input.completion_envelope.terminal_signal === null : input.completion_envelope.terminal_signal !== null)
     ) return { ok: false, error: "child completion envelope is not a validated terminal/pending envelope", state };
   }
-  if ((input.state === "succeeded" || input.state === "failed" || input.state === "cancelled") && !input.completion_envelope) {
+  if (terminal && !input.completion_envelope) {
     return { ok: false, error: "terminal child join requires a completion envelope", state };
   }
   const existing = (state.child_joins ?? []).find((join) => sameIdentity(join.parent, input.parent) && sameIdentity(join.child, input.child));
@@ -1738,9 +2732,9 @@ export function appendChildJoin(cwd: string, input: ChildJoinInput): TransitionR
       && existing.attempt === input.attempt
       && existing.completion_envelope_ref === input.completion_envelope_ref
       && JSON.stringify(existing.expected_artifact_ids) === JSON.stringify(input.expected_artifact_ids);
-    if (exact) return { ok: true, state, child_join: existing };
     const conflictRef = `conflict:${hash(JSON.stringify({ existing, input }))}`;
     const conflict: ChildJoin = {
+      run_identity: input.run_identity,
       parent: input.parent,
       child: input.child,
       state: "conflict",
@@ -1760,6 +2754,7 @@ export function appendChildJoin(cwd: string, input: ChildJoinInput): TransitionR
   }
   if (priorChild && input.attempt <= priorChild.attempt) return { ok: false, error: "child replacement attempt must increase", state };
   const joined: ChildJoin = {
+    run_identity: input.run_identity,
     parent: input.parent,
     child: input.child,
     state: input.state,
@@ -1796,23 +2791,35 @@ export interface CheckpointDecisionInput extends DispatchAuth {
 }
 
 /** Persist a policy-bound typed checkpoint decision. */
-export function recordCheckpointDecision(cwd: string, input: CheckpointDecisionInput): TransitionResult {
-  const found = current(cwd);
-  if (!found) return { ok: false, error: "state not found" };
+export function recordCheckpointDecision(
+  cwd: string,
+  input: CheckpointDecisionInput,
+  context: CapabilityContext,
+): TransitionResult {
+  const found = current(cwd, context.run_identity);
+  if (!found) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "checkpoint requires a bound project/run state");
   const { state, target } = found;
+  if (target.invalid) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "checkpoint identity does not match the persisted workflow state", state);
   if (target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state };
+  if (!state.project_identity || !state.run_identity || !identityMatches(state.project_identity, state.run_identity, context.project_identity, context.run_identity)) {
+    return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "workflow state project/run identity is not bound to the checkpoint context", state);
+  }
   const cap = activeCapability(state.dispatch_capability);
-  if (!cap) return { ok: false, error: "dispatch capability unavailable", state };
+  if (!cap) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "dispatch capability is unavailable or not v2-bound", state);
   const error = auth(cap, input, cap.advance_token_hash);
-  if (error) return { ok: false, error, state };
+  if (error) return authFailure(error, state);
   if (cap.status === "invalidated" || cap.status === "complete") return { ok: false, error: "capability invalidated", state };
   if (input.stage_cursor !== cap.issued_for.stage_cursor) return { ok: false, error: "checkpoint stage does not match the active capability", state };
   if (!input.checkpoint.trim() || !input.decision.trim()) return { ok: false, error: "checkpoint name and decision are required", state };
   if (!input.authorization || !input.actor_provenance) {
     return { ok: false, error: "typed checkpoint authorization and actor provenance are required; legacy mode/actor fields cannot authorize", state };
   }
-  const profile = loadProfile(cap.issued_for.workflow);
-  const stage = profile?.stages.find((candidate) => candidate.id === cap.issued_for.stage_cursor);
+  const selected = contextProfile(context);
+  if ("error" in selected) return { ok: false, error: selected.error, state, diagnostic: selected.diagnostic };
+  if (selected.profile_identity.fingerprint !== cap.issued_for.profile_hash) {
+    return { ok: false, error: "IDENTITY_MISMATCH: checkpoint profile is stale", state };
+  }
+  const stage = selected.profile.stages.find((candidate) => candidate.id === cap.issued_for.stage_cursor);
   if (!stage?.checkpoint) return { ok: false, error: `stage '${cap.issued_for.stage_cursor}' declares no checkpoint`, state };
   if (input.checkpoint !== stage.checkpoint || (input.checkpoint_id && input.checkpoint_id !== input.checkpoint)) {
     return { ok: false, error: `checkpoint '${input.checkpoint}' does not match declared checkpoint '${stage.checkpoint}'`, state };
@@ -1821,8 +2828,12 @@ export function recordCheckpointDecision(cwd: string, input: CheckpointDecisionI
   if (!policy) return { ok: false, error: `checkpoint '${input.checkpoint}' has no policy`, state };
   const rule = policy.rules[input.checkpoint];
   if (!rule) return { ok: false, error: `checkpoint policy has no rule for '${input.checkpoint}'`, state };
+  if (input.run_id !== undefined && input.run_id !== context.run_identity.run_id) {
+    return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "checkpoint scalar run id does not match the required run identity", state);
+  }
   const decision: TypedCheckpointDecision = {
-    run_id: input.run_id ?? state.work_identity?.run_id ?? state.run_key ?? state.branch,
+    run_id: context.run_identity.run_id,
+    run_identity: cap.issued_for.run_identity,
     stage_id: stage.id,
     checkpoint_id: input.checkpoint,
     checkpoint_kind: input.checkpoint_kind ?? rule.kind,
@@ -1837,15 +2848,14 @@ export function recordCheckpointDecision(cwd: string, input: CheckpointDecisionI
   };
   const validated = validateCheckpointDecision(state, decision, { stage, policy });
   if (!validated.ok) return { ok: false, error: `${validated.code}: ${validated.error}`, state };
-  try {
-    const next = appendCheckpointDecision(state, validated.decision);
-    persist(cwd, next, target);
-    return { ok: true, state: next };
-  } catch (appendError) {
-    return { ok: false, error: appendError instanceof Error ? appendError.message : String(appendError), state };
-  }
+  const next = appendCheckpointDecision(state, decision);
+  next.updated_at = now();
+  persist(cwd, next, target);
+  return { ok: true, state: next };
 }
 export function reconcileTaskResult(cwd: string, input: {
+  project_identity: ProjectIdentity;
+  run_identity: WorkflowRunIdentity;
   dispatch_id?: string;
   tool_call_id?: string;
   slot_id?: string;
@@ -1859,11 +2869,17 @@ export function reconcileTaskResult(cwd: string, input: {
 }): TransitionResult {
   if (!input.dispatch_id && !input.tool_call_id) return { ok: false, error: "dispatch identity required" };
   if (!input.token) return { ok: false, error: "dispatch token required" };
-  const found = current(cwd);
-  if (!found) return { ok: false, error: "state not found" };
+  const found = current(cwd, input.run_identity);
+  if (!found) return transitionFailure("MIGRATION_REQUIRED", "runtime.activate", "task reconciliation requires a bound project/run state");
+  if (found.target.invalid) return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "task result identity does not match the persisted workflow state", found.state);
   if (found.target.isStale) return { ok: false, error: "workflow state is stale for the active branch", state: found.state };
+  if (!found.state.project_identity || !found.state.run_identity || !identityMatches(found.state.project_identity, found.state.run_identity, input.project_identity, input.run_identity)) {
+    return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "task result identity does not match the active project/run identity", found.state);
+  }
   const cap = activeCapability(found.state.dispatch_capability);
-  if (!cap || cap.capability_id !== input.capability_id || (input.cursor_epoch && cap.issued_for.cursor_epoch !== input.cursor_epoch)) return { ok: false, error: "capability binding mismatch", state: found.state };
+  if (!cap || cap.capability_id !== input.capability_id || !identityMatches(cap.project_identity, cap.run_identity, input.project_identity, input.run_identity) || (input.cursor_epoch && cap.issued_for.cursor_epoch !== input.cursor_epoch)) {
+    return transitionFailure("IDENTITY_MISMATCH", "runtime.activate", "task result capability binding mismatch", found.state);
+  }
   const records = cap.dispatches.filter((record) =>
     !record.completion
     && (input.dispatch_id ? record.id === input.dispatch_id : record.tool_call_id === input.tool_call_id)
@@ -1886,6 +2902,8 @@ export function reconcileTaskResult(cwd: string, input: {
       profile_hash: cap.issued_for.profile_hash,
       stage_cursor: cap.issued_for.stage_cursor,
       cursor_epoch: cap.issued_for.cursor_epoch,
+      project_identity: input.project_identity,
+      run_identity: input.run_identity,
       role: record.role,
       slot_id: record.work_identity?.slot_id,
       task_id: record.work_identity?.task_id,
@@ -1907,6 +2925,8 @@ export function reconcileTaskResult(cwd: string, input: {
     profile_hash: cap.issued_for.profile_hash,
     stage_cursor: cap.issued_for.stage_cursor,
     cursor_epoch: cap.issued_for.cursor_epoch,
+    project_identity: input.project_identity,
+    run_identity: input.run_identity,
     role: record.role,
     slot_id: record.work_identity?.slot_id,
     task_id: record.work_identity?.task_id,

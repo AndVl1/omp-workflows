@@ -1,12 +1,9 @@
 /**
- * Bundle-owned workflow profile assets.
+ * Immutable catalog inputs shipped by the private provider.
  *
- * Profiles live in workflows/*.json and are registered into the core
- * interpreter via `registerTeamWorkflow({ workflowProfiles })`. Loaded from
- * disk relative to this module (one directory below the package root in both
- * src/ and dist/ layouts) so no static JSON import is needed. Structural
- * validation is local because the core control-plane validator is not part of
- * the public core surface; registration remains fail-closed either way.
+ * These files are provider data, not project policy or runtime authority.
+ * The provider module reads them once and pins their exact identities with
+ * core's canonical catalog builder before publication.
  */
 
 import { readFileSync } from "node:fs";
@@ -15,60 +12,66 @@ import { fileURLToPath } from "node:url";
 
 import type { Profile } from "@andvl1/omp-workflows-core";
 
-const PROFILE_ASSETS = ["omp-feature.json", "omp-validate.json"] as const;
+const INTERNAL_PROFILE_ASSETS = ["omp-feature.json", "omp-validate.json"] as const;
 
 /**
- * Load and structurally validate the bundle profiles. Throws on any defect so
- * callers can fail closed BEFORE claiming owners or registering tools.
+ * Read the two immutable profile assets from this package.
+ *
+ * The package root is derived from this module URL, never from process cwd or
+ * a project-local configuration path.
  */
-export function loadOmpWorkflowProfiles(): Profile[] {
-	// One directory below the package root in both src/ and dist/ layouts.
+export function readInternalWorkflowProfiles(): readonly Profile[] {
 	const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-	return PROFILE_ASSETS.map((asset) => {
-		const path = join(packageRoot, "workflows", asset);
-		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		assertValidProfileAsset(asset, parsed);
-		return parsed as Profile;
-	});
+	return Object.freeze(
+		INTERNAL_PROFILE_ASSETS.map((asset) => {
+			const parsed: unknown = JSON.parse(readFileSync(join(packageRoot, "workflows", asset), "utf8"));
+			assertValidProfileAsset(asset, parsed);
+			return parsed;
+		}),
+	);
 }
 
-function assertValidProfileAsset(asset: string, parsed: unknown): void {
+function assertValidProfileAsset(asset: string, parsed: unknown): asserts parsed is Profile {
 	const issues: string[] = [];
-	const profile = parsed as Profile | null;
-	if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
-		throw new Error(`invalid workflow profile asset '${asset}': not an object`);
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error(`invalid provider profile asset '${asset}': not an object`);
 	}
-	if (typeof profile?.name !== "string" || profile.name.length === 0) {
+	const profile = parsed as Partial<Profile>;
+	if (typeof profile.name !== "string" || profile.name.length === 0) {
 		issues.push("$.name must be a non-empty string");
 	}
-	if (!Array.isArray(profile?.stages)) {
-		issues.push("$.stages must be an array");
+	if (!Array.isArray(profile.stages) || profile.stages.length === 0) {
+		issues.push("$.stages must be a non-empty array");
 	}
-	if (!profile?.match || typeof profile.match !== "object") {
+	if (!profile.match || typeof profile.match !== "object" || Array.isArray(profile.match)) {
 		issues.push("$.match must be an object");
 	}
-	if (issues.length > 0) throw new Error(`invalid workflow profile asset '${asset}': ${issues.join("; ")}`);
+	if (issues.length > 0) throw new Error(`invalid provider profile asset '${asset}': ${issues.join("; ")}`);
+
+	const stages = profile.stages;
+	if (!Array.isArray(stages) || stages.length === 0) {
+		throw new Error(`invalid provider profile asset '${asset}': $.stages must be a non-empty array`);
+	}
 
 	const stageIds = new Set<string>();
-	for (const [index, stage] of profile.stages.entries()) {
-		if (!stage || typeof stage !== "object") {
+	for (const [index, stage] of stages.entries()) {
+		if (!stage || typeof stage !== "object" || Array.isArray(stage)) {
 			issues.push(`$.stages[${index}] must be an object`);
 			continue;
 		}
-		if (typeof stage.id !== "string" || stage.id.length === 0) {
+		const candidate = stage as { id?: unknown; checkpoint?: unknown };
+		if (typeof candidate.id !== "string" || candidate.id.length === 0) {
 			issues.push(`$.stages[${index}].id must be a non-empty string`);
 			continue;
 		}
-		if (stageIds.has(stage.id)) issues.push(`$.stages[${index}].id duplicates '${stage.id}'`);
-		stageIds.add(stage.id);
-		if (stage.checkpoint && typeof stage.checkpoint === "string") {
+		if (stageIds.has(candidate.id)) issues.push(`$.stages[${index}].id duplicates '${candidate.id}'`);
+		stageIds.add(candidate.id);
+		if (typeof candidate.checkpoint === "string") {
 			const rules = profile.checkpoint_policy?.rules;
-			if (profile.checkpoint_policy && (!rules || !(stage.checkpoint in rules))) {
-				issues.push(`$.checkpoint_policy.rules.${stage.checkpoint} missing for declared checkpoint`);
+			if (profile.checkpoint_policy && (!rules || !(candidate.checkpoint in rules))) {
+				issues.push(`$.checkpoint_policy.rules.${candidate.checkpoint} missing for declared checkpoint`);
 			}
 		}
 	}
-	if (issues.length > 0) {
-		throw new Error(`invalid workflow profile asset '${asset}': ${issues.join("; ")}`);
-	}
+	if (issues.length > 0) throw new Error(`invalid provider profile asset '${asset}': ${issues.join("; ")}`);
 }

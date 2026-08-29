@@ -1,9 +1,8 @@
 /**
- * Channel normalizer tests (cto-core, architecture-2/4): one resolved
  * ChannelProfile from legacy single-adapter AND explicit multi-channel
  * configs; the capability rule (declared rw needs inbound+outbound, ro never
- * upgrades); never-throws behavior; and the renderChannelSection modes the
- * /cto prompts rely on (discovery-1).
+ * upgrades); never-throws behavior; and the host-managed
+ * renderChannelSection identity contract.
  */
 
 import { test } from "node:test";
@@ -12,14 +11,42 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { renderChannelSection } from "../src/commands/cto.js";
 import {
   normalizeChannelConfig,
   resolveChannelProfile,
+  resolveBoundChannelProfile,
+  validateChannelProfileIdentity,
   hasRwPrimary,
   loadEscalationConfigRaw,
-  renderChannelSection,
   type ChannelCapabilities,
-} from "@andvl1/omp-workflows-core";
+} from "../src/cto/channels.js";
+import type {
+  ProjectIdentity,
+  WorkflowRunIdentity,
+  WorkflowV2Digest,
+} from "../src/workflow-v2/types.js";
+import type { ChannelProfile } from "../src/cto/types.js";
+import type { WorkflowCommandContext } from "../src/commands/envelope.js";
+import { readWorkflowProfile, workflowV2Fixture } from "./workflow-v2-fixtures.js";
+
+const channelFixture = workflowV2Fixture(readWorkflowProfile("lightweight"), {
+  session: { session_id: "channels-session", lifecycle_id: "channels-lifecycle" },
+  runId: "channels-run",
+});
+
+const testDigest = (seed: string): WorkflowV2Digest => `sha256:${seed.repeat(64)}` as WorkflowV2Digest;
+const testProjectIdentity: ProjectIdentity = channelFixture.project_identity;
+const testIdentity: WorkflowRunIdentity = channelFixture.run_identity;
+
+const workflowContext: WorkflowCommandContext = {
+  branch: "main",
+  project_identity: channelFixture.project_identity,
+  run_identity: channelFixture.run_identity,
+  effectivePolicy: channelFixture.effective_policy,
+  catalog: channelFixture.catalog,
+  agentInventory: channelFixture.agent_inventory,
+};
 
 function makeCwd(config?: unknown): string {
   const cwd = mkdtempSync(join(tmpdir(), "channels-"));
@@ -41,6 +68,58 @@ test("channels: no config → direction none, empty normalization", () => {
     assert.equal(loadEscalationConfigRaw(cwd), null);
     assert.deepEqual(resolveChannelProfile(cwd), { direction: "none" });
     assert.equal(hasRwPrimary(cwd), false);
+  } finally {
+    cleanup(cwd);
+  }
+});
+
+test("channels: bound resolver validates and stamps the required run identity", () => {
+  const cwd = makeCwd({ adapter: "telegram", telegram: { chatId: "chat-bound" } });
+  try {
+    const resolved = resolveBoundChannelProfile(cwd, testIdentity);
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    assert.equal(resolved.value.direction, "rw");
+    assert.equal(resolved.value.ackTarget, "chat-bound");
+    assert.deepEqual(resolved.value.run_identity, testIdentity);
+  } finally {
+    cleanup(cwd);
+  }
+});
+
+test("channels: unbound profiles cannot authorize and identity mismatches fail closed", () => {
+  const cwd = makeCwd({ adapter: "telegram", telegram: { chatId: "chat-bound" } });
+  try {
+    const unbound = resolveChannelProfile(cwd);
+    assert.equal("run_identity" in unbound, false);
+    const missing = validateChannelProfileIdentity(unbound as ChannelProfile, testIdentity);
+    assert.equal(missing.ok, false);
+    if (!missing.ok) assert.equal(missing.diagnostics[0]?.code, "MIGRATION_REQUIRED");
+
+    const bound = resolveBoundChannelProfile(cwd, testIdentity);
+    assert.equal(bound.ok, true);
+    if (!bound.ok) return;
+    const changedProject = {
+      ...testIdentity,
+      executable_provenance: {
+        ...testIdentity.executable_provenance,
+        runtime_fingerprint: testDigest("9"),
+      },
+    };
+    const changedPins = validateChannelProfileIdentity(bound.value, changedProject);
+    assert.equal(changedPins.ok, false);
+    if (!changedPins.ok) assert.equal(changedPins.diagnostics[0]?.code, "IDENTITY_MISMATCH");
+
+    const changedProfile = {
+      ...testIdentity,
+      profile_identity: {
+        ...testIdentity.profile_identity,
+        fingerprint: testDigest("8"),
+      },
+    };
+    const changedRun = validateChannelProfileIdentity(bound.value, changedProfile);
+    assert.equal(changedRun.ok, false);
+    if (!changedRun.ok) assert.equal(changedRun.diagnostics[0]?.code, "IDENTITY_MISMATCH");
   } finally {
     cleanup(cwd);
   }
@@ -176,30 +255,13 @@ test("channels: resolveChannelProfile never throws on malformed JSON or missing 
   assert.deepEqual(resolveChannelProfile(missing), { direction: "none" });
 });
 
-test("channels: renderChannelSection distinguishes none / RW-primary / RO-report modes (discovery-1)", () => {
-  const root = makeCwd();
-  try {
-    mkdirSync(join(root, ".omp"), { recursive: true });
-    assert.ok(renderChannelSection(root).includes("### User channel (none)"), "none mode");
-    assert.ok(renderChannelSection(root).includes("TERMINAL-ONLY"), "none mode named TERMINAL-ONLY");
-
-    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ channels: [{ id: "c", adapter: "telegram", direction: "read-write", primary: true }] }));
-    const rw = renderChannelSection(root);
-    assert.ok(rw.includes("BIDIRECTIONAL"), "rw mode marks BIDIRECTIONAL");
-    assert.ok(rw.includes("VALIDATED RW-PRIMARY"), "rw mode named VALIDATED RW-PRIMARY");
-    assert.ok(rw.includes("NEVER use the `ask` tool"), "rw mode bans ask");
-    assert.ok(rw.includes("outbox"), "rw mode routes via outbox");
-    assert.ok(rw.includes("USER COMMAND"), "rw mode keeps the USER COMMAND contract");
-
-    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ channels: [{ id: "a", adapter: "http", direction: "read-only" }] }));
-    const ro = renderChannelSection(root);
-    assert.ok(ro.includes("push-only"), "ro mode marks push-only");
-    assert.ok(ro.includes("RO-REPORT"), "ro mode named RO-REPORT");
-    assert.ok(ro.includes("Use `ask`"), "ro mode keeps ask for checkpoints");
-    assert.ok(!ro.includes("BIDIRECTIONAL"), "ro mode is not messenger mode");
-  } finally {
-    cleanup(root);
-  }
+test("channels: renderChannelSection uses the host-managed identity context", () => {
+  const rendered = renderChannelSection(workflowContext);
+  assert.match(rendered, /### User channel \(host-managed\)/);
+  assert.match(rendered, new RegExp("Provider: `" + testProjectIdentity.provider_id + "`"));
+  assert.match(rendered, /Session: `channels-session`/);
+  assert.match(rendered, /Use only the validated host channel/);
+  assert.match(rendered, /Do not inspect channel files/);
 });
 
 test("channels: two explicit same-kind id-less entries are BOTH excluded (ambiguous, fail-closed)", () => {

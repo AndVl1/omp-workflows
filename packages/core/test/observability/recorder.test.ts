@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { EventRecorder, rollupFromEvents, readObservabilityPointer } from "../../src/observability/recorder.js";
 import type { ObservabilityEvent } from "../../src/observability/events.js";
 import type { CompletionEnvelope, WorkIdentity } from "../../src/engine/types.js";
+import { readWorkflowProfile, workflowV2Fixture } from "../workflow-v2-fixtures.js";
 
 function withTempDir(): { cwd: string; cleanup: () => void } {
   const cwd = mkdtempSync(join(tmpdir(), "omp-obs-"));
@@ -46,6 +47,11 @@ const workIdentity: WorkIdentity = {
   worker_id: "worker-1",
 };
 
+const workflowFixture = workflowV2Fixture(readWorkflowProfile(workIdentity.workflow), {
+  runId: workIdentity.run_id,
+  session: { session_id: workIdentity.session_id, lifecycle_id: "lifecycle-1" },
+});
+
 function completionEnvelope(
   identity: WorkIdentity,
   outcome: CompletionEnvelope["outcome"],
@@ -54,6 +60,7 @@ function completionEnvelope(
   return {
     schema_version: 1,
     identity,
+    run_identity: workflowFixture.run_identity,
     outcome,
     terminal_signal: terminalSignal,
     artifact_refs: outcome === "pending"
@@ -304,8 +311,8 @@ test("recorder: terminal replacement requires identity evidence or explicit retr
       }),
       /identity-bound completion envelope or retry_of/,
     );
-    await assert.rejects(
-      r.append({
+    assert.throws(
+      () => r.append({
         kind: "work_terminal",
         ts: ts(20),
         work_identity: retryIdentity,
@@ -314,7 +321,7 @@ test("recorder: terminal replacement requires identity evidence or explicit retr
         terminal_signal: "contract_failure",
         completion_envelope: completionEnvelope(workIdentity, "failed", "contract_failure"),
       }),
-      /identity mismatch/,
+      (error: unknown) => error instanceof Error && error.message === "completion envelope identity mismatch",
     );
     await r.append({
       kind: "work_terminal",

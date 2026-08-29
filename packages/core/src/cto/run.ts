@@ -7,13 +7,13 @@
  * mechanically through its own `task`/`hub`. Every step the agent takes is
  * checked against this state by the engine helpers.
  */
-
 import { buildTeamPlan, validateDecompositionDepth, type PlanTeamInput } from "./plan.js";
 import { newCtoState, writeCtoState } from "./state.js";
 import type { ModelClassification } from "../engine/run.js";
-import type { CtoState, TeamDef, TeamPlan } from "./types.js";
-
-export interface RunCtoOptions {
+import type { WorkflowRunIdentity } from "../workflow-v2/types.js";
+import type { CtoExecutionContext, CtoState, TeamDef, TeamPlan } from "./types.js";
+import { validateWorkflowRunIdentity } from "../workflow-v2/identity.js";
+export interface RunCtoOptions extends CtoExecutionContext {
   task: string;
   cwd: string;
   branch: string;
@@ -27,6 +27,8 @@ export interface RunCtoOptions {
   classification?: ModelClassification;
   /** Proposed decomposition (from the CTO agent / consumer orchestrator). */
   teams: PlanTeamInput[];
+  /** Exact run identity allocated and persisted by workflow_prepare. */
+  run_identity: WorkflowRunIdentity;
   /** TeamDef registry (consumer-owned). */
   defs: Record<string, TeamDef> | Map<string, TeamDef>;
   /** Optional: sub-profile depth (team stages inside each profile), for the depth cap. */
@@ -57,7 +59,24 @@ export function ctoRunId(task: string): string {
 }
 
 export function runCto(opts: RunCtoOptions): RunCtoResult {
-  const built = buildTeamPlan({ id: ctoRunId(opts.task), task: opts.task, teams: opts.teams }, opts.defs);
+  const checkedRunIdentity = validateWorkflowRunIdentity(opts.run_identity);
+  if (!checkedRunIdentity.ok) {
+    return { ok: false, reason: `${checkedRunIdentity.diagnostics[0]?.code ?? "IDENTITY_MISMATCH"}: invalid workflow run identity` };
+  }
+  const runIdentity = checkedRunIdentity.value;
+  if (opts.owner_session !== undefined && opts.owner_session !== runIdentity.session.session_id) {
+    return { ok: false, reason: "IDENTITY_MISMATCH: owner session does not match workflow run identity" };
+  }
+  const built = buildTeamPlan({
+    id: runIdentity.run_id,
+    task: opts.task,
+    teams: opts.teams,
+    project_identity: opts.project_identity,
+    run_identity: runIdentity,
+    catalog: opts.catalog,
+    effective_policy: opts.effective_policy,
+    agent_inventory: opts.agent_inventory,
+  }, opts.defs);
   if (!built.ok) return built;
 
   const depth = validateDecompositionDepth(built.plan, opts.profileDepth);
@@ -70,6 +89,7 @@ export function runCto(opts: RunCtoOptions): RunCtoResult {
     autonomous: opts.autonomous,
     classification: opts.classification,
     plan: built.plan,
+    run_identity: runIdentity,
     ...(opts.standby === true ? { standby: true } : {}),
     ...(opts.owner_session ? { owner_session: opts.owner_session } : {}),
   });

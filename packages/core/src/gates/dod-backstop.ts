@@ -6,7 +6,8 @@
  * `session_stop`) when the DoD artifact has unmet or evidence-less items.
  *
  * Allows Stop in every legitimate pause:
- *   - no JSON state / no .work-state
+ *   - no admitted workflow identity (state is never inspected)
+ *   - no identity-bound JSON state / no .work-state
  *   - stale state (branch != current)
  *   - typed neutral runtime state (pending/active/Still Running/nested wait/polling/
  *     temporary artifact absence)
@@ -16,8 +17,11 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { resolve, join } from "node:path";
-import { isSafeStateSegment } from "../engine/state.js";
+import { join } from "node:path";
+import { resolveState } from "../engine/state.js";
+import type { TeamState } from "../engine/types.js";
+import { validateWorkflowRunIdentity } from "../workflow-v2/identity.js";
+import type { WorkflowRunIdentity } from "../workflow-v2/types.js";
 const WORK_STATE_DIR = ".work-state";
 
 export interface SessionStopEvent {
@@ -26,6 +30,7 @@ export interface SessionStopEvent {
 
 export interface SessionStopContext {
   cwd: string;
+  run_identity?: WorkflowRunIdentity;
 }
 
 export interface DoDItem {
@@ -44,13 +49,6 @@ export type DoDValidation =
   | { ok: true; value: DoD }
   | { ok: false; error: string };
 
-interface TeamState {
-  classification?: { workflow?: string };
-  pause?: { kind?: string };
-  stage_cursor?: string;
-  branch?: string;
-}
-
 const NEUTRAL_RUNTIME_STATES: Record<string, true> = {
   background_wait: true,
   user_checkpoint: true,
@@ -68,6 +66,7 @@ const NEUTRAL_RUNTIME_STATES: Record<string, true> = {
   temporary_artifact_missing: true,
   artifact_temporary_absence: true,
 };
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -154,17 +153,61 @@ export function validateTypedDoD(input: unknown): DoDValidation {
 }
 
 
+function runIdentityKey(identity: WorkflowRunIdentity): string {
+  return JSON.stringify([
+    identity.root_instance_id,
+    identity.provider_id,
+    identity.descriptor_fingerprint,
+    identity.executable_provenance.build_fingerprint,
+    identity.executable_provenance.runtime_fingerprint,
+    identity.catalog_content_digest,
+    identity.config_byte_sha256,
+    identity.config_semantic_sha256,
+    identity.session.session_id,
+    identity.session.lifecycle_id,
+    identity.run_id,
+    identity.profile_identity.id,
+    identity.profile_identity.fingerprint,
+  ]);
+}
+
 export function dodBackstop(event: SessionStopEvent, ctx: SessionStopContext): { decision: "block"; reason: string } | { continue: true } | void {
   if (event.stop_hook_active) return;
-  const statePath = resolveStatePath(ctx.cwd);
-  if (!statePath) return;
-  let state: TeamState;
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(statePath, "utf8"));
-    if (!isRecord(parsed)) return;
-    state = parsed as TeamState;
-  } catch {
-    return;
+  if (!ctx.run_identity) return;
+  const checkedRun = validateWorkflowRunIdentity(ctx.run_identity);
+  if (!checkedRun.ok) {
+    return {
+      decision: "block",
+      reason: "MIGRATION_REQUIRED: supplied WorkflowRunIdentity is incomplete or invalid; re-admit the workflow before claiming done.",
+    };
+  }
+
+  const resolved = resolveState(ctx.cwd, undefined, checkedRun.value);
+  if (resolved.invalid) {
+    if (!resolved.state && !resolved.statePath && !resolved.artifactsDir) return;
+    const diagnostic = resolved.diagnostics?.[0];
+    return {
+      decision: "block",
+      reason: `${diagnostic?.code ?? "MIGRATION_REQUIRED"}: ${diagnostic?.remediation ?? "Migrate the persisted workflow state into a required WorkflowRunIdentity before claiming done."}`,
+    };
+  }
+
+  const state = resolved.state;
+  const artifactsDir = resolved.artifactsDir;
+  if (!state || !artifactsDir) return;
+  const persistedRun = (state as unknown as { run_identity?: unknown }).run_identity;
+  const checkedPersistedRun = validateWorkflowRunIdentity(persistedRun);
+  if (!checkedPersistedRun.ok) {
+    return {
+      decision: "block",
+      reason: "MIGRATION_REQUIRED: persisted workflow state has no complete WorkflowRunIdentity; migrate it before claiming done.",
+    };
+  }
+  if (runIdentityKey(checkedPersistedRun.value) !== runIdentityKey(checkedRun.value)) {
+    return {
+      decision: "block",
+      reason: "IDENTITY_MISMATCH: persisted workflow state run/profile identity differs from the admitted WorkflowRunIdentity; retain prior state and start a fresh run.",
+    };
   }
 
   if (existsSync(join(ctx.cwd, WORK_STATE_DIR, ".dod-override"))) return;
@@ -178,7 +221,7 @@ export function dodBackstop(event: SessionStopEvent, ctx: SessionStopContext): {
   const claimingDone = pause === "done" || cursor === "summary";
   if (!claimingDone) return;
 
-  const pendingDispatches = (state as TeamState & { dispatch_capability?: { dispatches?: Array<{ id: string; status?: string }> } }).dispatch_capability?.dispatches?.filter((d) => d.status === "authorized" || d.status === "running") ?? [];
+  const pendingDispatches = state.dispatch_capability?.dispatches?.filter((d) => d.status === "authorized" || d.status === "running") ?? [];
   if (pendingDispatches.length > 0) {
     return {
       decision: "block",
@@ -186,7 +229,7 @@ export function dodBackstop(event: SessionStopEvent, ctx: SessionStopContext): {
     };
   }
 
-  const dodPath = resolveDoDPath(statePath);
+  const dodPath = join(artifactsDir, "dod.json");
   const dodResult = readDoD(dodPath);
   if (!dodResult.value) {
     const reason = dodResult.error
@@ -214,27 +257,6 @@ export function dodBackstop(event: SessionStopEvent, ctx: SessionStopContext): {
     };
   }
   return { continue: true };
-}
-
-function resolveStatePath(cwd: string): string | null {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  if (!existsSync(wsDir)) return null;
-  const active = join(wsDir, ".active-feature");
-  if (existsSync(active)) {
-    const slug = readFileSync(active, "utf8").trim();
-    if (!isSafeStateSegment(slug)) return null;
-    const path = join(wsDir, "features", slug, "state.json");
-    if (existsSync(path)) return path;
-  }
-  const legacy = join(wsDir, "team-state.json");
-  if (existsSync(legacy)) return legacy;
-  return null;
-}
-
-function resolveDoDPath(statePath: string): string {
-  // artifacts sit next to state.json: <dir>/state.json -> <dir>/artifacts/dod.json
-  const dir = statePath.replace(/team-state\.json$/, "").replace(/state\.json$/, "");
-  return `${dir}artifacts/dod.json`;
 }
 
 function readDoD(path: string): { value: DoD | null; error?: string } {
