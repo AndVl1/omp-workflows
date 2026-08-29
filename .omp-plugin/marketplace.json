@@ -5,14 +5,14 @@
     "name": "AndVl1"
   },
   "metadata": {
-    "description": "Declarative multi-stage workflow engine for omp — 21 specialized agents, 28 domain skills, 13 declarative JSON profiles, role-driven DoD gate, profile-driven workflow engine. Native omp plugin (no Claude Code hooks).",
+    "description": "Declarative multi-stage workflow engine for omp — 21 specialized agents, 28 domain skills, 12 declarative JSON profiles, role-driven DoD gate, profile-driven workflow engine. Native omp plugin (no Claude Code hooks).",
     "version": "0.25.1",
     "pluginRoot": "packages/fullstack"
   },
   "plugins": [
     {
       "name": "omp-workflows",
-      "description": "Profile-driven workflow engine for omp. /do-work runs a deterministic 7-phase feature pipeline, /team ships as an alias for /do-work. 21 agents, 28 skills, 13 JSON profiles, typed DoD artifact with backstop gate.",
+      "description": "Profile-driven workflow engine for omp. /do-work runs a classification-first adaptive workflow, /team ships as an alias for /do-work. 21 agents, 28 skills, 12 JSON profiles, typed DoD artifact with backstop gate.",
       "source": "./",
       "category": "development",
       "keywords": [
