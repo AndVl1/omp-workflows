@@ -191,6 +191,60 @@ test("custom resolveCwd remains the prompt root when session context drifts to a
   }
 });
 
+test("wave-001 regression: a configured resolveCwd returning undefined claims zero owners and never falls through to the context cwd", async () => {
+  const contextRoot = mkdtempSync(join(tmpdir(), "omp-command-undefined-resolver-"));
+  try {
+    const harness = commandHarness();
+    let resolverCalls = 0;
+    registerWorkflowCommands(harness.pi as never, {
+      owner: owner("bundle-gated", contextRoot),
+      resolveCwd: () => {
+        resolverCalls += 1;
+        return undefined;
+      },
+      buildDoWorkPrompt: (_envelope, cwd) => `effective-root:${cwd}`,
+    });
+    assert.equal(harness.sessionStarts.length, 1);
+    assert.equal(workflowOwnerFor(contextRoot, "workflow_registration"), undefined, "extension load claims nothing");
+
+    // session_start: undefined custom resolution is final — the gated owner
+    // source is never invoked and the context cwd is not adopted.
+    harness.sessionStarts[0]?.({}, {
+      cwd: contextRoot,
+      sessionManager: { getCwd: () => contextRoot },
+    });
+    assert.equal(resolverCalls, 1);
+    assert.equal(
+      workflowOwnerFor(contextRoot, "workflow_registration"),
+      undefined,
+      "undefined custom resolution makes zero owner claims",
+    );
+
+    // Handler path: undefined cwd fails closed instead of claiming or
+    // prompting through the context cwd.
+    const handler = harness.commands.get("do-work")?.handler;
+    assert.ok(handler);
+    await assert.rejects(
+      handler("gated task", {
+        cwd: contextRoot,
+        sessionManager: { getCwd: () => contextRoot },
+        ui: { notify() {} },
+      }),
+      /workflow cwd unavailable/,
+    );
+    assert.equal(resolverCalls, 2);
+    assert.deepEqual(harness.prompts, [], "no prompt may be built from the context cwd");
+    assert.equal(
+      workflowOwnerFor(contextRoot, "workflow_registration"),
+      undefined,
+      "no side-effect claim through the context cwd",
+    );
+  } finally {
+    resetWorkflowOwners(contextRoot);
+    rmSync(contextRoot, { recursive: true, force: true });
+  }
+});
+
 test("owner-aware command handlers remain fail-closed after an owner conflict", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-command-handler-owner-"));
   const alias = join(tmpdir(), `omp-command-handler-alias-${process.pid}-${Date.now()}`);

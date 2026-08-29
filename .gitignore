@@ -16,6 +16,10 @@ coverage
 .omp/*
 !/.omp/skills/
 !/.omp/skills/**
+# Portable project policy — tracked (internal extension wiring / omp-* pool).
+!/.omp/settings.json
+!/.omp/team.config.json
+!/.omp/teams.json
 
 .work-state/
 

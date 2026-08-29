@@ -15,6 +15,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
+import { resolveConfig } from "../src/engine/config.js";
+import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { appendCheckpointDecision, checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
@@ -40,6 +42,22 @@ function writeWorkflowState(root: string, state: Record<string, unknown>): void 
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
+}
+
+const trustedIntakeRoles = { analyst: "analyst", "tech-researcher": "tech-researcher" } as const;
+
+/** Publish a trusted live agent mapping covering the spec-preparation intake pool. */
+function publishMapping(root: string): void {
+  mkdirSync(join(root, ".omp"), { recursive: true });
+  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: trustedIntakeRoles }) + "\n");
+  const config = resolveConfig(root);
+  const mapping = buildAgentMapping({
+    roles: config.roles,
+    availableAgents: Object.values(trustedIntakeRoles),
+    extraRoles: config.scope_map.map((entry) => entry.dev_agent),
+    genericFallbackRoles: Object.keys(trustedIntakeRoles),
+  });
+  writeAgentMapping(root, mapping);
 }
 function recordTypedCheckpoint(root: string, stageId: string, checkpointId: string): void {
   const resolved = resolveState(root);
@@ -169,7 +187,7 @@ test("resolveState: complete legacy classification wins over an incomplete activ
     assert.equal(resolved.isLegacy, true);
     assert.equal(resolved.statePath, join(root, ".work-state", "team-state.json"));
     assert.equal(resolved.state?.classification.workflow, "spec-preparation");
-
+    publishMapping(root);
     const begun = beginCapability(root);
     assert.equal(begun.ok, true);
   } finally {
@@ -198,7 +216,7 @@ test("beginCapability: migrates pre-durable top-level workflow state", () => {
     const resolved = resolveState(root, "main");
     assert.equal(resolved.state?.classification.workflow, "spec-preparation");
     assert.deepEqual(resolved.state?.stages, []);
-
+    publishMapping(root);
     const begun = beginCapability(root);
     assert.equal(begun.ok, true);
     assert.equal(begun.state?.stage_cursor, "intake_repo_map");
@@ -774,7 +792,8 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     const prompt = buildDoWorkPrompt(parseWorkEnvelope("Fix login bug", root), root);
 
     // Step 1 must be an explicit tool-only sequence: workflow_prepare first,
-    // then workflow_begin and workflow_instructions as the ONLY workflow instruction source.
+    // then workflow_instructions read BEFORE workflow_begin, a re-read after begin,
+    // and workflow_instructions as the ONLY workflow instruction source.
     assert.ok(
       prompt.includes("workflow_prepare"),
       "prompt must require workflow_prepare before state transitions",
@@ -784,8 +803,13 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
       "workflow_prepare must precede workflow_begin in the tool sequence",
     );
     assert.ok(
-      prompt.indexOf("workflow_begin") < prompt.indexOf("workflow_instructions"),
-      "workflow_begin must precede workflow_instructions in the tool sequence",
+      prompt.indexOf("workflow_instructions") < prompt.indexOf("workflow_begin"),
+      "workflow_instructions must be read before workflow_begin in the tool sequence",
+    );
+    assert.match(
+      prompt,
+      /re-read `workflow_instructions`/,
+      "prompt must require re-reading workflow_instructions after begin",
     );
     assert.match(prompt, /ONLY supported state initialization\/update path/);
     assert.doesNotMatch(prompt, /Then write `.work-state\/team-state\.json`/);
@@ -821,19 +845,20 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     rmSync(root, { recursive: true, force: true });
   }
 });
-test("do-work: resume guidance is exactly seven ordered steps with no-micromanagement and typed marker discipline", () => {
+test("do-work: resume guidance is exactly eight ordered steps with no-micromanagement and typed marker discipline", () => {
   const root = mkdtempSync(join(tmpdir(), "do-work-resume-contract-"));
   try {
     const prompt = buildDoWorkPrompt(parseWorkEnvelope("Continue the previous fix", root), root);
-    const resumeStart = prompt.indexOf("### Seven-step resume-from-disk contract");
+    const resumeStart = prompt.indexOf("### Eight-step resume-from-disk contract");
     const workerPolicyStart = prompt.indexOf("### NO-MICROMANAGEMENT WORKER POLICY");
     assert.ok(resumeStart >= 0);
     assert.ok(workerPolicyStart > resumeStart);
     const resumeSection = prompt.slice(resumeStart, workerPolicyStart);
-    assert.deepEqual(resumeSection.match(/^\d+\. /gm), ["1. ", "2. ", "3. ", "4. ", "5. ", "6. ", "7. "]);
+    assert.deepEqual(resumeSection.match(/^\d+\. /gm), ["1. ", "2. ", "3. ", "4. ", "5. ", "6. ", "7. ", "8. "]);
     for (const label of [
       "**Prepare**",
-      "**Resolve and validate selection**",
+      "**Read instructions and compose selection**",
+      "**Resolve and validate begin**",
       "**Freeze snapshot/capability**",
       "**Authorize identity**",
       "**Reconcile pending/terminal**",

@@ -39,7 +39,18 @@
       "id": "exploration",
       "title": "Codebase Exploration",
       "type": "consilium",
-      "roles": ["analyst", "tech-researcher", "analyst"],
+      "roster_policy": {
+        "allowed_roles": ["analyst", "tech-researcher"],
+        "required_roles": [],
+        "required_facets": [],
+        "min_workers": 1,
+        "max_workers": 3,
+        "multiplicity": { "analyst": { "min": 0, "max": 3 }, "tech-researcher": { "min": 0, "max": 3 } },
+        "prefer_distinct_agents": true,
+        "selection_mode": "pre_dispatch_minimum_valid",
+        "triggers": { "complexity": ["COMPLEX"], "confidence": ["LOW"], "scope_flags": [], "evidence": [] },
+        "budget": { "token_limit": null, "dollar_limit": null }
+      },
       "parallel": true,
       "consumes": ["discovery"],
       "produces": ["exploration", "dod"],
@@ -67,7 +78,18 @@
       "id": "architecture",
       "title": "Architecture Design",
       "type": "consilium",
-      "roles": ["architect_minimal", "architect_clean", "architect_pragmatic"],
+      "roster_policy": {
+        "allowed_roles": ["architect"],
+        "required_roles": ["architect"],
+        "required_facets": [],
+        "min_workers": 1,
+        "max_workers": 3,
+        "multiplicity": { "architect": { "min": 1, "max": 3 } },
+        "prefer_distinct_agents": true,
+        "selection_mode": "pre_dispatch_minimum_valid",
+        "triggers": { "complexity": [], "confidence": [], "scope_flags": [], "evidence": [] },
+        "budget": { "token_limit": null, "dollar_limit": null }
+      },
       "parallel": true,
       "consumes": ["exploration", "clarifications"],
       "checkpoint": "user_choice",
@@ -79,7 +101,7 @@
             "artifact": "architecture",
             "field": "chosen",
             "strategy": "first_slot",
-            "rationale": "Deliberate multi-option architecture consilium: each slot presents an option and the required 'chosen' scalar is resolved deterministically to the first roster slot's choice so the shared artifact can hand off. The immediately following 'user_choice' checkpoint is the authoritative decision point — interactive runs confirm or override it, autonomous runs record the documented default (option #1). Every disagreement is recorded in the synthesis provenance (conflicts) with the winning slot and losing values; no option is discarded silently."
+            "rationale": "Architecture consilium over a situational architect pool (1..3 occurrences): each selected slot presents an option, optionally under its own facet/focus (for example minimal-change, clean-architecture, pragmatic-balance), and the required 'chosen' scalar is resolved deterministically to the first roster slot's choice so the shared artifact can hand off. The immediately following 'user_choice' checkpoint is the authoritative decision point — interactive runs confirm or override it, autonomous runs record the documented default (the first slot's option). Every disagreement is recorded in the synthesis provenance (conflicts) with the winning slot and losing values; no option is discarded silently."
           }
         ]
       }

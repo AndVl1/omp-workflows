@@ -3,8 +3,8 @@ import { existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { loadProfile, profileHash } from "./profile.js";
 import { resolveState, writeState, isSafeStateSegment, resolveActiveBranch, type ResolvedState } from "./state.js";
-import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole } from "./config.js";
-import type { AgentMappingDiagnostic } from "./agent-mapping.js";
+import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole, type ResolvedConfig } from "./config.js";
+import { validateAgentMappingState, type AgentMappingDiagnostic, type AgentMappingState } from "./agent-mapping.js";
 import { resolveScope, type ScopeFlags } from "./scope.js";
 import { resolveStageDispatchSlots, selectRoster, type RosterSelectionContext } from "./stage.js";
 import { readArtifact, writeArtifact } from "./artifacts.js";
@@ -44,6 +44,7 @@ import type {
   DispatchRecord,
   LoopState,
   PendingState,
+  RosterSelection,
   StageDef,
   TeamState,
   TypedCheckpointDecision,
@@ -72,11 +73,30 @@ export type DispatchAuth = {
   pending_reason?: PendingState["pending_reason"];
   provider_ref?: string;
 };
+
+/**
+ * Semantic roster selection accepted at capability begin: role, facet, focus
+ * and reason occurrences drawn from the stage's allowed pool. Concrete agent
+ * ids are never caller authority — every selected role must resolve through
+ * the live registered agent mapping before dispatch.
+ */
+export type RosterBeginSelection = {
+  rationale?: string;
+  evidence?: string[];
+  occurrences: Array<{
+    role: string;
+    facet?: string | null;
+    focus?: string;
+    reason?: string;
+  }>;
+};
 type ActiveCapability = {
   capability_id: string; dispatch_token_hash: string; advance_token_hash: string;
   issued_for: { run_key: string; branch: string; workflow: TeamState["classification"]["workflow"]; profile_hash: string; stage_cursor: string; cursor_epoch: string };
   kind: "none" | "single" | "consilium"; expected_roles: string[]; expected_count: number;
   expected_roster: Array<{ role: string; agent: string }>;
+  /** Frozen selection carried by roster-policy capabilities (masked on completion). */
+  roster_selection?: RosterSelection;
   status: "ready" | "dispatched" | "joining" | "complete" | "invalidated"; dispatches: DispatchRecord[]; pending?: PendingState[];
 };
 /**
@@ -488,11 +508,112 @@ function resetReopenedStageState(
 }
 
 /**
+ * Strict role -> agent resolution for roster-policy stages: only a trusted
+ * live registered mapping may name the concrete agent. An empty string means
+ * "no registered agent" and fails closed downstream — project config
+ * fallbacks and identity (role-name-as-agent) fallbacks never apply here.
+ */
+function liveRosterAgent(config: ResolvedConfig, role: string): string {
+  return config.agent_mapping?.resolved_roles[role] ?? "";
+}
+
+/**
+ * Optional trusted live agent-mapping handoff (additive). When supplied, the
+ * in-memory mapping from host discovery is authoritative for role
+ * availability: the persisted workspace mapping file is never consulted for
+ * this transition, and a malformed handoff fails closed instead of silently
+ * falling back to the persisted file.
+ */
+export type TrustedMappingOptions = { trustedMapping?: AgentMappingState };
+/**
+ * Bind the trusted handoff over the resolved workspace configuration: the
+ * persisted `agent_mapping` is replaced in memory, never re-read. Only an
+ * explicit `undefined` means "no handoff" and keeps the persisted-mapping
+ * fallback; any other value — including runtime `null` — is treated as a
+ * handoff attempt and must pass the one complete `AgentMappingState`
+ * validator (resolved agents present in `available_agents`, diagnostics and
+ * `unresolved_roles` invariants) or the transition fails closed. `trusted`
+ * records whether a handoff is bound: when it is, every role resolution of
+ * this transition is strict to the handoff's `resolved_roles`.
+ */
+function bindTrustedMapping(
+  config: ResolvedConfig,
+  trustedMapping: unknown,
+): { ok: true; config: ResolvedConfig; trusted: boolean } | { ok: false; error: string } {
+  if (trustedMapping === undefined) return { ok: true, config, trusted: false };
+  const validated = validateAgentMappingState(trustedMapping);
+  if (!validated.ok) {
+    return {
+      ok: false,
+      error: `trusted agent mapping handoff is malformed (${validated.error}); refusing to fall back to the persisted workspace mapping`,
+    };
+  }
+  return { ok: true, config: { ...config, agent_mapping: validated.mapping }, trusted: true };
+}
+
+/**
+ * Dispatch-slot agent resolution at the trusted boundary. With a handoff
+ * bound, the slot role must resolve through the handoff's `resolved_roles`
+ * (`available_agents` membership is already guaranteed by the shared
+ * validator) — a missing or unavailable role returns `null` and the caller
+ * fails closed instead of falling back to config or the role name. Without
+ * a handoff the persisted-mapping fallback stays valid.
+ */
+function trustedSlotAgent(role: string, config: ResolvedConfig, trusted: boolean): string | null {
+  if (!trusted) return resolveAgentForRole(role, config);
+  return liveRosterAgent(config, role) || null;
+}
+
+/**
+ * Prefix match between a caller's requested semantic composition and the
+ * frozen selection. Slots the engine deterministically appends (minimum
+ * worker bound, risk triggers) are engine-owned, so a requested composition
+ * matches when it is a prefix of the frozen one; any other difference is a
+ * changed selection. Occurrences are numbered by position among same-role
+ * entries, exactly as `selectRoster` freezes them.
+ */
+function selectionCompositionMatchesFrozen(
+  requested: Array<{ role: string; facet?: string | null }>,
+  frozen: Array<{ role: string; occurrence: number; facet: string | null }>,
+): boolean {
+  if (requested.length > frozen.length) return false;
+  const seen = new Map<string, number>();
+  return requested.every((occurrence, index) => {
+    const entry = frozen[index];
+    if (!entry) return false;
+    const occurrenceNumber = (seen.get(occurrence.role) ?? 0) + 1;
+    seen.set(occurrence.role, occurrenceNumber);
+    return entry.role === occurrence.role
+      && entry.occurrence === occurrenceNumber
+      && (entry.facet ?? null) === (occurrence.facet ?? null);
+  });
+}
+
+/** Live registered agent for a role, or null when the mapping does not name one. */
+function requestedSelectionOccurrences(selection: RosterBeginSelection): RosterSelectionContext["selected_occurrences"] {
+  return selection.occurrences.map((occurrence) => ({
+    role: occurrence.role,
+    facet: occurrence.facet ?? null,
+    ...(occurrence.focus !== undefined ? { focus: occurrence.focus } : {}),
+    ...(occurrence.reason !== undefined ? { reason: occurrence.reason } : {}),
+  }));
+}
+
+/**
  * Create the opaque dispatch capability after the model has persisted the
  * classification and stage list. This is the entry point for the native
  * `/do-work` prompt; the interpreter path uses `createCapability` directly.
+ * An optional semantic roster selection (never concrete agent ids) is
+ * validated against the stage's allowed pool and the live registered agent
+ * mapping, then frozen on the issued capability.
+ *
+ * `options.trustedMapping` carries a fresh in-memory `AgentMappingState`
+ * from host discovery straight into begin authorization: when supplied it
+ * replaces the persisted workspace mapping for every role-availability
+ * decision here, and a malformed handoff fails closed. Callers without a
+ * handoff keep the persisted-mapping fallback.
  */
-export function beginCapability(cwd: string): TransitionResult {
+export function beginCapability(cwd: string, requested?: RosterBeginSelection, options?: TrustedMappingOptions): TransitionResult {
   const branch = resolveActiveBranch(cwd);
   const target = resolveState(cwd, branch);
   if (target.invalid) return { ok: false, error: "workflow state is invalid or unsafe" };
@@ -521,6 +642,9 @@ export function beginCapability(cwd: string): TransitionResult {
   if (state.policy?.strict_orchestrator === true && state.dispatch_capability && !existing) return { ok: false, error: "workflow dispatch capability is malformed", state };
   const existingDispatches = existing?.issued_for.stage_cursor === stage.id ? existing.dispatches : [];
   const config = resolveConfig(cwd);
+  const trusted = bindTrustedMapping(config, options?.trustedMapping);
+  if (!trusted.ok) return { ok: false, error: trusted.error, state };
+  const effectiveConfig = trusted.config;
   const flags = state.scope ?? resolveScope([], config);
   const kind: "none" | "single" | "consilium" = stage.type === "single" || stage.type === "consilium" ? stage.type : "none";
   const reuseSelection = stage.roster_policy
@@ -537,14 +661,43 @@ export function beginCapability(cwd: string): TransitionResult {
   if (kind === "none") {
     slots = [];
   } else if (stage.roster_policy) {
-    const selection = reuseSelection && reuseSelection.capability_epoch === capabilityEpoch
-      ? {
-          ok: true as const,
-          selection: reuseSelection,
-          slots: reuseSelection.selected.map((entry) => ({ slot: entry.slot_id, slot_id: entry.slot_id, role: entry.role, occurrence: entry.occurrence, facet: entry.facet })),
-          expected_roster: reuseSelection.selected.map((entry) => ({ role: entry.slot_id, agent: entry.agent })),
-        }
-      : selectRoster(stage, {
+    if (!effectiveConfig.agent_mapping) {
+      return {
+        ok: false,
+        error: `workflow stage '${stage.id}' requires a live registered agent mapping before dispatch; none is trusted for the current configuration (regenerate the agent mapping from host discovery)`,
+        state,
+      };
+    }
+    if (requested) {
+      if (requested.occurrences.some((occurrence) => "agent" in occurrence)) {
+        return { ok: false, error: `workflow stage '${stage.id}' accepts only semantic role/facet/reason selections; concrete agent ids are never caller authority`, state };
+      }
+      if (requested.occurrences.some((occurrence) => typeof occurrence.role !== "string" || occurrence.role.trim() === "")) {
+        return { ok: false, error: `workflow stage '${stage.id}' roster selection requires a non-empty semantic role for every occurrence`, state };
+      }
+      const unmapped = [...new Set(requested.occurrences.map((occurrence) => occurrence.role))].filter((role) => !effectiveConfig.agent_mapping?.resolved_roles[role]);
+      if (unmapped.length > 0) {
+        return { ok: false, error: `workflow stage '${stage.id}' selected roles have no live registered agent mapping: ${unmapped.map((role) => `'${role}'`).join(", ")}`, state };
+      }
+    }
+    const frozen = reuseSelection;
+    const frozenActive = Boolean(
+      frozen
+      && frozen.capability_epoch === capabilityEpoch
+      && existing?.issued_for.stage_cursor === stage.id
+      && existing.status !== "complete"
+      && existing.status !== "invalidated",
+    );
+    if (frozenActive && frozen && requested && !selectionCompositionMatchesFrozen(requested.occurrences, frozen.selected)) {
+      return {
+        ok: false,
+        error: `workflow stage '${stage.id}' roster selection is frozen for the active capability (snapshot '${frozen.snapshot_id}'); a changed selection is rejected — re-issue the identical semantic selection or wait for the capability to complete`,
+        state,
+      };
+    }
+    const requestedOccurrences = requested && !frozenActive ? requestedSelectionOccurrences(requested) : undefined;
+    const selection = requestedOccurrences
+      ? selectRoster(stage, {
           cwd,
           flags,
           resolveDevAgent: () => flags.dev_agent,
@@ -553,8 +706,29 @@ export function beginCapability(cwd: string): TransitionResult {
           run_key: state.run_key ?? state.branch,
           workflow,
           capability_epoch: capabilityEpoch,
-          resolveAgent: (role) => resolveAgentForRole(role, config),
-        } satisfies RosterSelectionContext);
+          resolveAgent: (role) => liveRosterAgent(effectiveConfig, role),
+          selected_occurrences: requestedOccurrences,
+          ...(requested?.rationale !== undefined ? { rationale: requested.rationale } : {}),
+          ...(requested?.evidence !== undefined ? { evidence: requested.evidence } : {}),
+        } satisfies RosterSelectionContext)
+      : reuseSelection && reuseSelection.capability_epoch === capabilityEpoch
+        ? {
+            ok: true as const,
+            selection: reuseSelection,
+            slots: reuseSelection.selected.map((entry) => ({ slot: entry.slot_id, slot_id: entry.slot_id, role: entry.role, occurrence: entry.occurrence, facet: entry.facet })),
+            expected_roster: reuseSelection.selected.map((entry) => ({ role: entry.slot_id, agent: entry.agent })),
+          }
+        : selectRoster(stage, {
+            cwd,
+            flags,
+            resolveDevAgent: () => flags.dev_agent,
+            state,
+            profile_hash: persistedHash,
+            run_key: state.run_key ?? state.branch,
+            workflow,
+            capability_epoch: capabilityEpoch,
+            resolveAgent: (role) => liveRosterAgent(effectiveConfig, role),
+          } satisfies RosterSelectionContext);
     if (selection.ok === false) return { ok: false, error: `workflow stage '${stage.id}' roster selection failed: ${selection.error}`, state };
     rosterSelection = selection.selection;
     slots = selection.slots;
@@ -562,7 +736,17 @@ export function beginCapability(cwd: string): TransitionResult {
   } else {
     try {
       slots = resolveStageDispatchSlots(stage, { cwd, flags, resolveDevAgent: () => flags.dev_agent });
-      expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+      for (const slot of slots) {
+        const agent = trustedSlotAgent(slot.role, effectiveConfig, trusted.trusted);
+        if (agent === null) {
+          return {
+            ok: false,
+            error: `workflow stage '${stage.id}' dispatch roster unresolved: role '${slot.role}' is missing or unavailable in the trusted agent mapping handoff's resolved_roles`,
+            state,
+          };
+        }
+        expectedRoster.push({ role: slot.slot, agent });
+      }
     } catch (error) {
       return { ok: false, error: `workflow stage '${stage.id}' dispatch roster unresolved: ${String(error)}`, state };
     }
@@ -570,14 +754,13 @@ export function beginCapability(cwd: string): TransitionResult {
   if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) return { ok: false, error: `workflow stage '${stage.id}' has an invalid dispatch roster`, state };
   const mappingIssues: Array<{ role: string; diagnostic: AgentMappingDiagnostic }> = [];
   for (const slot of slots) {
-    const diagnostic = agentMappingIssueForRole(slot.role, config);
+    const diagnostic = agentMappingIssueForRole(slot.role, effectiveConfig);
     if (diagnostic) mappingIssues.push({ role: slot.role, diagnostic });
   }
   if (mappingIssues.length > 0) {
     const details = mappingIssues.map(({ role, diagnostic }) => `role '${role}' requested '${diagnostic.requested}' (candidates: ${diagnostic.candidates.join(", ")})`).join("; ");
     return { ok: false, error: `workflow stage '${stage.id}' has no available agent mapping: ${details}`, state };
   }
-  if (expectedRoster.length !== slots.length) expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
 
   if (existing && existing.issued_for.stage_cursor === stage.id && stageEntry.status === "in_progress" && existing.status !== "complete" && existing.status !== "invalidated") {
     const rosterChanged = JSON.stringify(existing.expected_roster) !== JSON.stringify(expectedRoster);
@@ -1305,7 +1488,7 @@ function renderStageDocument(stage: StageDef, target: ResolvedState): { ok: true
   return { ok: true };
 }
 
-export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResult {
+export function advanceCursor(cwd: string, input: DispatchAuth, options?: TrustedMappingOptions): TransitionResult {
   const found = current(cwd);
   if (!found) return { ok: false, error: "state not found" };
   const { state: rawState, target } = found;
@@ -1323,6 +1506,9 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
   if (!currentStage) return { ok: false, error: "current workflow stage unavailable", state: rawState };
 
   const config = resolveConfig(cwd);
+  const trusted = bindTrustedMapping(config, options?.trustedMapping);
+  if (!trusted.ok) return { ok: false, error: trusted.error, state: rawState };
+  const effectiveConfig = trusted.config;
   const flags = rawState.scope ?? resolveScope([], config);
   const recovered = recoverSynchronousArtifactIds(cwd, rawState, target, cap, currentStage);
   if (!recovered.ok) return { ok: false, error: recovered.error, state: rawState };
@@ -1460,7 +1646,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
         persist(cwd, next, target);
         return { ok: true, state: next };
       }
-      return reenterLoop(cwd, state, target, profile, cap, currentStage, records, joinSummary, decision.reentries, flags, config);
+      return reenterLoop(cwd, state, target, profile, cap, currentStage, records, joinSummary, decision.reentries, flags, effectiveConfig, trusted.trusted);
     }
     const existingLoop = loopStateFor(state, currentStage.id);
     if (existingLoop) {
@@ -1505,85 +1691,95 @@ export function advanceCursor(cwd: string, input: DispatchAuth): TransitionResul
   }
   const epoch = randomUUID();
   let handoffSecrets: { capability_id: string; dispatch_token: string; advance_token: string } | undefined;
-  let nextCap: NonNullable<TeamState["dispatch_capability"]>;
-  let nextSelection: TeamState["roster_selection"];
+  // Automatic capability issuance during advance never freezes a roster for
+  // a roster-policy stage: such a next stage stays semantically unselected
+  // and pending until its explicit workflow_begin freezes a selection from
+  // the trusted or persisted live registered mapping. Only a non-roster
+  // stage — executable, or an orchestrator shell — is atomically armed here.
+  let armedStage: StageDef | undefined;
+  const { roster_selection: _completedSelection, ...completedCap } = cap;
+  let nextCap: NonNullable<TeamState["dispatch_capability"]> = { ...completedCap, status: "complete" as const, dispatches: [] };
   if (nextStage) {
     const nextKind: "none" | "single" | "consilium" =
       nextStage.type === "single" || nextStage.type === "consilium" ? nextStage.type : "none";
-    let slots: ReturnType<typeof resolveStageDispatchSlots> = [];
-    let expectedRoster: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
-    if (nextKind !== "none" && nextStage.roster_policy) {
-      const selection = selectRoster(nextStage, {
-        cwd,
-        flags,
-        resolveDevAgent: () => flags.dev_agent,
-        state,
-        profile_hash: cap.issued_for.profile_hash,
-        run_key: cap.issued_for.run_key,
-        workflow: cap.issued_for.workflow,
-        capability_epoch: epoch,
-        resolveAgent: (role) => resolveAgentForRole(role, config),
-      } satisfies RosterSelectionContext);
-      if (selection.ok === false) return { ok: false, error: `next stage '${nextStage.id}' roster selection failed: ${selection.error}`, state };
-      nextSelection = selection.selection;
-      slots = selection.slots;
-      expectedRoster = selection.expected_roster;
-    } else if (nextKind !== "none") {
-      try {
-        slots = resolveStageDispatchSlots(nextStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent, state });
-        expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
-      } catch (error) {
-        return { ok: false, error: `next stage '${nextStage.id}' dispatch roster unresolved: ${String(error)}`, state };
+    if (!nextStage.roster_policy) {
+      let slots: ReturnType<typeof resolveStageDispatchSlots> = [];
+      let expectedRoster: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
+      if (nextKind !== "none") {
+        try {
+          slots = resolveStageDispatchSlots(nextStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent, state });
+          for (const slot of slots) {
+            const agent = trustedSlotAgent(slot.role, effectiveConfig, trusted.trusted);
+            if (agent === null) {
+              return {
+                ok: false,
+                error: `next stage '${nextStage.id}' dispatch roster unresolved: role '${slot.role}' is missing or unavailable in the trusted agent mapping handoff's resolved_roles`,
+                state,
+              };
+            }
+            expectedRoster.push({ role: slot.slot, agent });
+          }
+        } catch (error) {
+          return { ok: false, error: `next stage '${nextStage.id}' dispatch roster unresolved: ${String(error)}`, state };
+        }
+        if ((nextKind === "single" && slots.length !== 1) || (nextKind === "consilium" && slots.length === 0)) {
+          return { ok: false, error: `next stage '${nextStage.id}' has an invalid dispatch roster`, state };
+        }
       }
+      const issued = createCapability({
+        run_key: cap.issued_for.run_key,
+        branch: cap.issued_for.branch,
+        workflow: cap.issued_for.workflow,
+        profile_hash: cap.issued_for.profile_hash,
+        stage_cursor: nextStage.id,
+        cursor_epoch: epoch,
+        kind: nextKind,
+        expected_roster: expectedRoster,
+      });
+      nextCap = issued.state;
+      armedStage = nextStage;
+      handoffSecrets = { capability_id: issued.capability_id, dispatch_token: issued.dispatch_token, advance_token: issued.advance_token };
     }
-    if ((nextKind === "single" && slots.length !== 1) || (nextKind === "consilium" && slots.length === 0)) {
-      return { ok: false, error: `next stage '${nextStage.id}' has an invalid dispatch roster`, state };
-    }
-    const issued = createCapability({
-      run_key: cap.issued_for.run_key,
-      branch: cap.issued_for.branch,
-      workflow: cap.issued_for.workflow,
-      profile_hash: cap.issued_for.profile_hash,
-      stage_cursor: nextStage.id,
-      cursor_epoch: epoch,
-      kind: nextKind,
-      expected_roster: expectedRoster,
-      roster_selection: nextSelection,
-    });
-    nextCap = issued.state;
-    handoffSecrets = { capability_id: issued.capability_id, dispatch_token: issued.dispatch_token, advance_token: issued.advance_token };
-  } else {
-    nextCap = { ...cap, status: "complete" as const, dispatches: [] };
   }
+  // Deferral/completion masking: a frozen selection is data of the stage it
+  // was frozen for. When the cursor leaves that stage the top-level mirror
+  // is dropped (the per-stage `roster_selections` history retains it), so a
+  // prior stage's selection can never leak into a later stage's contract.
+  const priorSelection = state.roster_selection;
+  const selectionStays = Boolean(priorSelection && nextStage && priorSelection.stage_id === nextStage.id);
+  const { roster_selection: _carriedSelection, ...carriedState } = state;
   const next: TeamState = {
-    ...state,
+    ...carriedState,
     stage_cursor: nextStage?.id ?? state.stage_cursor,
     cursor_epoch: epoch,
-    // The newly armed ready capability must never be persisted while its
-    // stage cursor is still pending: mark the next stage in_progress in the
-    // same atomic state update that arms the capability, so a resumed run
-    // can dispatch against it immediately. Consecutive skip_if stages are
-    // marked terminal `skipped` in the same update; they are never armed.
+    // Only an atomically armed non-roster capability coexists with an
+    // in_progress stage cursor. A deferred roster-policy next stage stays
+    // pending — nothing can dispatch against it until workflow_begin arms
+    // the selected capability. Consecutive skip_if stages are marked
+    // terminal `skipped` in the same update; they are never armed.
     stages: state.stages.map((s) => {
       if (s.id === state.stage_cursor) return { ...s, status: "done" as const };
       if (skippedStageIds.includes(s.id)) return { ...s, status: "skipped" as const };
-      if (nextStage && s.id === nextStage.id) return { ...s, status: "in_progress" as const };
+      if (armedStage && s.id === armedStage.id) return { ...s, status: "in_progress" as const };
       return s;
     }),
     join_summary: joinSummary,
-    ...(nextSelection ? { roster_selection: nextSelection, roster_selections: { ...(state.roster_selections ?? {}), [nextStage!.id]: nextSelection } } : {}),
+    ...(selectionStays && priorSelection ? { roster_selection: priorSelection } : {}),
     dispatch_capability: nextCap,
     pause: nextStage ? state.pause : { kind: "done", reason: "" },
   };
   persist(cwd, next, target);
-  return { ok: true, state: next, handoff: nextStage && handoffSecrets ? handoffFromState(next, handoffSecrets, nextStage) : undefined };
+  return { ok: true, state: next, handoff: armedStage && handoffSecrets ? handoffFromState(next, handoffSecrets, armedStage) : undefined };
 }
 
 /**
  * Loop re-entry: point the cursor back at the loop's `back_to` stage and
- * issue a fresh capability with a fresh cursor epoch. Old epochs can never
- * authorize a re-entered iteration — the durable binding rotates with every
- * loop-back. Iteration history is appended durably.
+ * rotate to a fresh cursor epoch. Old epochs can never authorize a
+ * re-entered iteration — the durable binding rotates with every loop-back.
+ * Iteration history is appended durably. An executable non-roster target is
+ * armed immediately; a roster-policy target stays semantically unselected
+ * and pending until its explicit workflow_begin freezes the iteration's
+ * roster from the trusted or persisted live mapping.
  */
 function reenterLoop(
   cwd: string,
@@ -1596,7 +1792,8 @@ function reenterLoop(
   joinSummary: TeamState["join_summary"],
   reentries: number,
   flags: ScopeFlags,
-  config: ReturnType<typeof resolveConfig>,
+  config: ResolvedConfig,
+  trusted: boolean,
 ): TransitionResult {
   const loop = currentStage.loop!;
   const backToStage = resolveBackToStage(profile, loop.back_to);
@@ -1604,47 +1801,48 @@ function reenterLoop(
   const kind: "none" | "single" | "consilium" =
     backToStage.type === "single" || backToStage.type === "consilium" ? backToStage.type : "none";
   const epoch = randomUUID();
+  // Same invariant as the linear advance path: a roster-policy loop target
+  // is never roster-resolved here. Re-entry rotates the cursor epoch,
+  // records the iteration history, and parks the stage pending until its
+  // explicit workflow_begin freezes the iteration's selection.
+  const deferredRoster = kind !== "none" && !!backToStage.roster_policy;
   let rosterSelection: TeamState["roster_selection"];
   let slots: ReturnType<typeof resolveStageDispatchSlots> = [];
   let expectedRoster: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }> = [];
-  if (kind !== "none" && backToStage.roster_policy) {
-    const selection = selectRoster(backToStage, {
-      cwd,
-      flags,
-      resolveDevAgent: () => flags.dev_agent,
-      state,
-      profile_hash: cap.issued_for.profile_hash,
-      run_key: cap.issued_for.run_key,
-      workflow: cap.issued_for.workflow,
-      capability_epoch: epoch,
-      resolveAgent: (role) => resolveAgentForRole(role, config),
-    } satisfies RosterSelectionContext);
-    if (selection.ok === false) return { ok: false, error: `loop target stage '${backToStage.id}' roster selection failed: ${selection.error}`, state };
-    rosterSelection = selection.selection;
-    slots = selection.slots;
-    expectedRoster = selection.expected_roster;
-  } else if (kind !== "none") {
+  if (!deferredRoster && kind !== "none") {
     try {
       slots = resolveStageDispatchSlots(backToStage, { cwd, flags, resolveDevAgent: () => flags.dev_agent, state });
-      expectedRoster = slots.map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+      for (const slot of slots) {
+        const agent = trustedSlotAgent(slot.role, config, trusted);
+        if (agent === null) {
+          return {
+            ok: false,
+            error: `loop target stage '${backToStage.id}' dispatch roster unresolved: role '${slot.role}' is missing or unavailable in the trusted agent mapping handoff's resolved_roles`,
+            state,
+          };
+        }
+        expectedRoster.push({ role: slot.slot, agent });
+      }
     } catch (error) {
       return { ok: false, error: `loop target stage '${backToStage.id}' dispatch roster unresolved: ${String(error)}`, state };
     }
   }
-  if ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0)) {
+  if (!deferredRoster && ((kind === "single" && slots.length !== 1) || (kind === "consilium" && slots.length === 0))) {
     return { ok: false, error: `loop target stage '${backToStage.id}' has an invalid dispatch roster`, state };
   }
-  const issued = createCapability({
-    run_key: cap.issued_for.run_key,
-    branch: cap.issued_for.branch,
-    workflow: cap.issued_for.workflow,
-    profile_hash: cap.issued_for.profile_hash,
-    stage_cursor: backToStage.id,
-    cursor_epoch: epoch,
-    kind,
-    expected_roster: expectedRoster,
-    roster_selection: rosterSelection,
-  });
+  const issued = deferredRoster
+    ? undefined
+    : createCapability({
+        run_key: cap.issued_for.run_key,
+        branch: cap.issued_for.branch,
+        workflow: cap.issued_for.workflow,
+        profile_hash: cap.issued_for.profile_hash,
+        stage_cursor: backToStage.id,
+        cursor_epoch: epoch,
+        kind,
+        expected_roster: expectedRoster,
+        roster_selection: rosterSelection,
+      });
   const iteration = reentries + 1;
   const loopState: LoopState = {
     stage_id: currentStage.id,
@@ -1660,8 +1858,15 @@ function reenterLoop(
       loopIterationRecord(iteration, cap.issued_for.cursor_epoch, epoch, false),
     ],
   };
+  // Masking mirrors the linear advance: the completed iteration's frozen
+  // selection belongs to the stage it was frozen for and is dropped from
+  // both the state mirror and the completed capability. The per-stage
+  // `roster_selections` history retains it for audit.
+  const priorLoopSelection = state.roster_selection?.stage_id === backToStage.id ? state.roster_selection : undefined;
+  const { roster_selection: _carriedLoopSelection, ...carriedLoopState } = state;
+  const { roster_selection: _completedLoopSelection, ...completedLoopCap } = cap;
   const next: TeamState = {
-    ...state,
+    ...carriedLoopState,
     stage_cursor: backToStage.id,
     cursor_epoch: epoch,
     loop_state: loopState,
@@ -1669,24 +1874,30 @@ function reenterLoop(
       s.id === currentStage.id
         ? { ...s, status: "done" as const }
         : s.id === backToStage.id
-          ? { ...s, status: "in_progress" as const }
+          ? deferredRoster
+            ? { ...s, status: "pending" as const }
+            : { ...s, status: "in_progress" as const }
           : s,
     ),
     join_summary: joinSummary,
-    ...(rosterSelection ? { roster_selection: rosterSelection, roster_selections: { ...(state.roster_selections ?? {}), [backToStage.id]: rosterSelection } } : {}),
-    dispatch_capability: { ...issued.state, status: "ready" as const, dispatches: [] },
+    ...(priorLoopSelection ? { roster_selection: priorLoopSelection } : {}),
+    dispatch_capability: issued
+      ? { ...issued.state, status: "ready" as const, dispatches: [] }
+      : { ...completedLoopCap, status: "complete" as const, dispatches: [] },
     updated_at: now(),
   };
   persist(cwd, next, target);
-  return {
-    ok: true,
-    state: next,
-    handoff: handoffFromState(next, {
-      capability_id: issued.capability_id,
-      dispatch_token: issued.dispatch_token,
-      advance_token: issued.advance_token,
-    }, backToStage),
-  };
+  return issued
+    ? {
+        ok: true,
+        state: next,
+        handoff: handoffFromState(next, {
+          capability_id: issued.capability_id,
+          dispatch_token: issued.dispatch_token,
+          advance_token: issued.advance_token,
+        }, backToStage),
+      }
+    : { ok: true, state: next };
 }
 
 export interface ChildJoinInput {

@@ -10,67 +10,53 @@
 
 ### PHASE 4: ARCHITECTURE DESIGN
 
-**Architect count — conditional on complexity (design choice C):**
+**Architect count — situational, not fixed (design choice C, pool semantics):**
 
-| complexity | profile | architects |
-|-----------|---------|-----------|
-| MEDIUM | `standard` | **1** — single `architect`, proposes one design |
-| COMPLEX / CRITICAL | `full-feature` | **3** — a parallel consilium of named variants |
+The stage declares an **allowed pool** — role `architect`, 1..3 occurrences — not a fixed
+one-agent-per-role recipe. The orchestrator composes the consilium at `workflow_begin` with a
+**semantic selection**: `occurrences: [{ role: "architect", facet, focus, reason }, ...]`.
+Concrete agent ids are never part of the selection; the live registered mapping resolves every
+selected role, and a missing/disabled registration fails closed.
 
-The three variants are distinct **roles** — `architect_minimal`, `architect_clean`,
-`architect_pragmatic` — that all resolve to the same `architect` agent (see the `roles` map in
-`team.config.example.json`). They differ only by the prompt/focus below. Naming them (instead of
-repeating `"architect"` three times) makes the consilium self-documenting and lets a project
-remap or drop a variant without touching the profile's shape.
+| situation | composition |
+|-----------|-------------|
+| default (no selection) | **1** — single `architect`, one design (deterministic engine default) |
+| contested design space | **2** — two `architect` slots with distinct facets |
+| COMPLEX / high-stakes (`full-feature`) | **up to 3** — parallel option consilium |
 
-**Goal**: Design multiple approaches, let user choose (COMPLEX); or propose one (MEDIUM).
+Facets are free-form situational labels. The canonical option trio (used as facet/focus, not
+roles):
 
-**Actions**:
-1. Launch the architect agent(s). For `full-feature`, launch all three variants **IN PARALLEL**:
+```
+{ "role": "architect", "facet": "minimal-change", "focus": "Smallest change, maximum reuse of existing code." }
+{ "role": "architect", "facet": "clean-architecture", "focus": "Maintainability, elegant abstractions, testability." }
+{ "role": "architect", "facet": "pragmatic-balance", "focus": "Speed + quality balance, reasonable abstractions." }
+```
 
-   ```
-   architect_minimal:
-   "Design [feature] with MINIMAL CHANGES approach.
-    Focus: Smallest change, maximum reuse of existing code.
-    Provide: Component design, files to modify, implementation steps."
+The selection freezes at issuance: re-issuing the identical selection is idempotent; a changed
+selection for an active capability is rejected — finish the stage first. Dispatch each frozen
+slot (`architect`, `architect#2`, `architect#3`) with its own marker from the handoff.
 
-   architect_clean:
-   "Design [feature] with CLEAN ARCHITECTURE approach.
-    Focus: Maintainability, elegant abstractions, testability.
-    Provide: Component design, files to create/modify, implementation steps."
+**Goal**: Design one or several approaches, let the user choose (multi-slot); or propose one (single slot).
 
-   architect_pragmatic:
-   "Design [feature] with PRAGMATIC BALANCE approach.
-    Focus: Speed + quality balance, reasonable abstractions.
-    Provide: Component design, files to modify, implementation steps."
-   ```
-
-   For `standard` (MEDIUM), launch a single `architect` producing one design (no consilium).
-
-2. Review all approaches
-3. Form your recommendation based on:
+1. Review all approaches
+2. Form your recommendation based on:
    - Codebase findings
    - User's constraints
    - Task complexity
    - Team context
 
-4. Present to user:
+3. Present to user (one section per frozen slot, in slot order):
    ```
-   I've designed 3 approaches:
+   I've designed N approach(es):
 
-   APPROACH 1: Minimal Changes
+   APPROACH 1: [<facet or slot architect>]
    - [Summary]
    - Pros: [...]
    - Cons: [...]
    - Files: [list]
 
-   APPROACH 2: Clean Architecture
-   - [Summary]
-   - Pros: [...]
-   - Cons: [...]
-   - Files: [list]
-
-   APPROACH 3: Pragmatic Balance
+   APPROACH 2: [<facet or slot architect#2>]
    - [Summary]
    - Pros: [...]
    - Cons: [...]

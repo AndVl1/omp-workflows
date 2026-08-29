@@ -1,0 +1,73 @@
+{
+  "roles": {
+    "team-lead": "omp-team-lead",
+    "analyst": "omp-analyst",
+    "tech-researcher": "omp-tech-researcher",
+    "diagnostics": "omp-diagnostics",
+    "architect": "omp-architect",
+    "developer": "omp-engine-specialist",
+    "qa": "omp-qa",
+    "manual-qa": "omp-manual-qa",
+    "code-reviewer": "omp-code-reviewer",
+    "security-tester": "omp-security-tester",
+    "devops": "omp-devops",
+    "plugin-developer": "omp-plugin-developer",
+    "host-integration": "omp-host-integration-specialist",
+    "package-release": "omp-package-release-specialist",
+    "regression-planner": "omp-analyst",
+    "regression-executor": "omp-manual-qa",
+    "regression-oracle": "omp-qa",
+    "product-analyst": "product-analyst",
+    "product-researcher": "product-researcher",
+    "product-critic": "product-critic",
+    "product-strategist": "product-strategist"
+  },
+  "roster_overrides": {},
+  "scope_map": [
+    {
+      "glob": [
+        "**/Dockerfile",
+        "**/*.yaml",
+        "**/*.yml",
+        "**/helm/**",
+        "**/.github/workflows/**"
+      ],
+      "scope": "devops",
+      "dev_agent": "omp-devops"
+    },
+    {
+      "glob": [
+        "packages/**/*.ts",
+        "*.ts",
+        "*.json"
+      ],
+      "scope": "dev",
+      "dev_agent": "omp-engine-specialist"
+    }
+  ],
+  "flags": {
+    "has_security": [
+      "**/auth/**",
+      "**/security/**",
+      "**/*crypto*",
+      "**/*Secret*",
+      "**/*Token*"
+    ],
+    "has_infra": [
+      "**/Dockerfile",
+      "**/helm/**",
+      "**/k8s/**",
+      "**/.github/workflows/**"
+    ]
+  },
+  "scope_runtime_classes": {
+    "devops": "runtime",
+    "dev": "runtime"
+  },
+  "scope_ui_classes": {},
+  "design_system": null,
+  "metadata": {
+    "managed_by": "@andvl1/omp-workflows-internal",
+    "note": "Roles/scope map the omp-* internal pool (defaultOmpInternalRoles/defaultOmpInternalScopeMap); regression-* project-local roles remapped onto the pool, product-* custom external plugin agents preserved verbatim. Fullstack domain-writer roles (developer-kotlin/go/frontend/mobile) intentionally absent — fail-closed dispatch replaces wrong-stack fallbacks."
+  }
+}

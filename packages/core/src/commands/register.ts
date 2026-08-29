@@ -12,10 +12,15 @@ import {
 	type WorkflowOwnerSource,
 } from "../index.js";
 
-const DO_WORK_DESCRIPTION = "Run a profile-driven workflow. /do-work <task>. (Alias: /team.)";
-const TEAM_DESCRIPTION = "Alias for /do-work. Prefer /do-work in new code.";
-const CTO_DESCRIPTION =
-	"CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /cto <task>; /cto alone starts STANDBY (tasks arrive via messenger inbox). Runs in-session — never task(agent=cto)";
+function doWorkDescription(doWork: string, team: string): string {
+	return `Run a profile-driven workflow. /${doWork} <task>. (Alias: /${team}.)`;
+}
+function teamDescription(doWork: string): string {
+	return `Alias for /${doWork}. Prefer /${doWork} in new code.`;
+}
+function ctoDescription(cto: string): string {
+	return `CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /${cto} <task>; /${cto} alone starts STANDBY (tasks arrive via messenger inbox). Runs in-session — never task(agent=cto)`;
+}
 
 export interface WorkflowCommandOptions {
 	buildDoWorkPrompt?: (envelope: ParsedWorkEnvelope, cwd: string) => string;
@@ -25,6 +30,11 @@ export interface WorkflowCommandOptions {
 	namespace?: string;
 	commandPrefix?: string;
 	cwd?: string;
+	/**
+	 * Authoritative cwd override: when configured, its result — including
+	 * `undefined` — is used as-is; the context/session fallback only applies
+	 * when no resolver is configured.
+	 */
 	resolveCwd?: (ctx: unknown) => string | undefined;
 	owner?: WorkflowOwnerSource;
 }
@@ -73,41 +83,43 @@ function registerPromptCommand(
 function buildDoWorkCommandPrompt(
 	args: string,
 	ctx: ExtensionCommandContext,
-	commandName: "do-work" | "team",
+	variant: "do-work" | "team",
+	display: { doWork: string; team: string },
 	promptBuilder: (envelope: ParsedWorkEnvelope, cwd: string) => string,
 	cwd: string | undefined,
 ): string {
+	const displayName = variant === "do-work" ? display.doWork : display.team;
 	if (!args) {
-		return commandName === "do-work"
+		return variant === "do-work"
 			? [
-					"Usage: /do-work <task description>",
+					`Usage: /${display.doWork} <task description>`,
 					"",
 					"Examples:",
-					"  /do-work Add OAuth authentication with Google and GitHub",
-					"  /do-work [AUTONOMOUS] Fix the 500 error on /api/users issue=#42",
+					`  /${display.doWork} Add OAuth authentication with Google and GitHub`,
+					`  /${display.doWork} [AUTONOMOUS] Fix the 500 error on /api/users issue=#42`,
 					"",
-					"Alias: `/team` works too.",
+					`Alias: \`/${display.team}\` works too.`,
 				].join("\n")
 			: [
-					"Usage: /team <task description>  (alias for /do-work)",
+					`Usage: /${display.team} <task description>  (alias for /${display.doWork})`,
 					"",
 					"Examples:",
-					"  /team Add OAuth authentication with Google and GitHub",
-					"  /team [AUTONOMOUS] Fix the 500 error on /api/users issue=#42",
+					`  /${display.team} Add OAuth authentication with Google and GitHub`,
+					`  /${display.team} [AUTONOMOUS] Fix the 500 error on /api/users issue=#42`,
 				].join("\n");
 	}
 
 	if (!cwd) return "ERROR: workflow cwd unavailable.";
 	const envelope = parseWorkEnvelope(args, cwd);
 	if (!envelope.task) return "ERROR: empty task after stripping prefix.";
-	ctx.ui.notify(`${commandName}: ${envelope.task.slice(0, 60)} (workflow pending)`, "info");
+	ctx.ui.notify(`${displayName}: ${envelope.task.slice(0, 60)} (workflow pending)`, "info");
 	return promptBuilder(envelope, cwd);
 }
 
-function buildCtoCommandPrompt(args: string, ctx: ExtensionCommandContext, cwd: string | undefined): string {
+function buildCtoCommandPrompt(args: string, ctx: ExtensionCommandContext, ctoName: string, cwd: string | undefined): string {
 	if (!cwd) return "ERROR: workflow cwd unavailable.";
 	if (!args) {
-		ctx.ui.notify("cto: standby mode — awaiting tasks via messenger inbox", "info");
+		ctx.ui.notify(`${ctoName}: standby mode — awaiting tasks via messenger inbox`, "info");
 		return buildStandbyCtoPrompt(cwd);
 	}
 
@@ -116,10 +128,10 @@ function buildCtoCommandPrompt(args: string, ctx: ExtensionCommandContext, cwd: 
 	if (!envelope.task) return "ERROR: empty task after stripping prefix.";
 	const active = findActiveCtoRun(cwd, { sessionId });
 	if (active) {
-		ctx.ui.notify(`cto: amending run ${active.runId} with: ${envelope.task.slice(0, 50)}`, "info");
+		ctx.ui.notify(`${ctoName}: amending run ${active.runId} with: ${envelope.task.slice(0, 50)}`, "info");
 		return buildAmendPrompt(envelope, cwd, active, { sessionId });
 	}
-	ctx.ui.notify(`cto: ${envelope.task.slice(0, 60)} (decomposition pending)`, "info");
+	ctx.ui.notify(`${ctoName}: ${envelope.task.slice(0, 60)} (decomposition pending)`, "info");
 	return buildCtoPrompt(envelope, cwd, { sessionId });
 }
 function commandName(prefix: string | undefined, base: "do-work" | "team" | "cto"): string {
@@ -146,8 +158,10 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 	const promptBuilder = options.buildDoWorkPrompt ?? buildDoWorkPrompt;
 	const resolveEffectiveCwd = (ctx: ExtensionCommandContext): string | undefined => {
 		if (options.cwd !== undefined) return options.cwd;
-		const resolvedCwd = options.resolveCwd?.(ctx);
-		if (resolvedCwd !== undefined) return resolvedCwd;
+		// An explicitly configured resolver is authoritative even when it returns
+		// undefined (e.g. a marker gate): no fallthrough to the context cwd.
+		// The context fallback applies only when no custom resolver is configured.
+		if (options.resolveCwd) return options.resolveCwd(ctx);
 		return resolveCommandCwd(ctx);
 	};
 	const claimForCommand = options.owner
@@ -163,24 +177,24 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 		registerPromptCommand(
 			pi,
 			names.doWork,
-			options.doWorkDescription ?? DO_WORK_DESCRIPTION,
-			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "do-work", promptBuilder, cwd),
+			options.doWorkDescription ?? doWorkDescription(names.doWork, names.team),
+			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "do-work", names, promptBuilder, cwd),
 			resolveEffectiveCwd,
 			claimForCommand,
 		);
 		registerPromptCommand(
 			pi,
 			names.team,
-			options.teamDescription ?? TEAM_DESCRIPTION,
-			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "team", promptBuilder, cwd),
+			options.teamDescription ?? teamDescription(names.doWork),
+			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "team", names, promptBuilder, cwd),
 			resolveEffectiveCwd,
 			claimForCommand,
 		);
 		registerPromptCommand(
 			pi,
 			names.cto,
-			options.ctoDescription ?? CTO_DESCRIPTION,
-			(args, ctx, cwd) => buildCtoCommandPrompt(args, ctx, cwd),
+			options.ctoDescription ?? ctoDescription(names.cto),
+			(args, ctx, cwd) => buildCtoCommandPrompt(args, ctx, names.cto, cwd),
 			resolveEffectiveCwd,
 			claimForCommand,
 		);

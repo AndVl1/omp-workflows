@@ -41,7 +41,7 @@ Borrowed from harnest. Every stage is exactly one of:
 |------|---------|
 | `orchestrator` | Main context performs it directly (no subagent). E.g. discovery, summary, clarifying questions. |
 | `single` | Exactly one subagent. Role resolved via `.omp/team.config.json` (fallback: legacy `.claude/team.config.json`) or file scope. |
-| `consilium` | N subagents in parallel (`roles[]`). E.g. exploration, architecture options, review. |
+| `consilium` | N subagents in parallel. With a `roster_policy` the role list is an allowed pool (see **Roster policy** below); legacy `roles[]` stays an exact manifest. |
 | `document` | Deterministic engine-rendered document (see the `document` field: format/renderer/path). No model, no dispatch — the engine renders at the advance boundary. The shipped product PRD is human-first: executive summary, detailed product direction, then critique/evidence/problem framing/intake and metadata; rendering stays deterministic and engine-owned. |
 | `bash` | Deterministic shell step, no model. |
 | `none` | Placeholder / skip. |
@@ -212,6 +212,70 @@ as the Task `agent`, so it can be **any registered agent**:
 New role keys beyond the built-in set are allowed — reference them from a custom profile or a
 roster override. Note: a hook cannot verify an agent exists, so a wrong name fails at the Task
 call (not at a gate).
+
+
+## Roster policy (semantic selection pools)
+
+A stage MAY declare a typed `roster_policy` instead of a fixed role manifest. The policy turns
+the stage's role list into an **allowed pool**: the orchestrator composes 1..N dispatch slots
+situational, instead of one agent per declared role.
+
+```jsonc
+"roster_policy": {
+  "allowed_roles": ["analyst", "tech-researcher"], // the pool — the only selectable roles
+  "required_roles": [],                            // forced coverage (subset of allowed)
+  "required_facets": [],                           // forced facet coverage
+  "min_workers": 1, "max_workers": 3,              // total slot bounds
+  "multiplicity": { "analyst": { "min": 0, "max": 3 }, "tech-researcher": { "min": 0, "max": 3 } },
+  "prefer_distinct_agents": true,
+  "selection_mode": "pre_dispatch_minimum_valid",
+  "triggers": { "complexity": [], "confidence": [], "scope_flags": [], "evidence": [] },
+  "budget": { "token_limit": null, "dollar_limit": null }
+}
+```
+
+### Protocol (durable engine)
+
+1. **Instructions before capability.** `workflow_instructions` is readable any time after
+   `workflow_prepare`; for a roster stage it returns the stage contract including
+   `roster_policy` (the pool) before any capability exists.
+2. **Semantic selection at begin.** `workflow_begin` accepts an optional
+   `selection: { rationale?, evidence?, occurrences: [{ role, facet?, focus?, reason? }] }`.
+   Occurrences are semantic only — **concrete agent ids are rejected** (zod `.strict()` at the
+   tool boundary and a runtime guard in the engine).
+3. **Validation before dispatch.** The engine validates allowed roles, per-role multiplicity,
+   total bounds, and budget; every selected role must resolve through the **live registered
+   agent mapping** (`.work-state/runtime/agent-mapping.json`, trusted only when its
+   preferences hash matches the current configuration). A stage with no trusted live mapping
+   fails closed; a selected role without a registered agent fails with a named-role diagnostic.
+   There is no identity fallback (`role → role`) and no unrelated-stack fallback for roster
+   stages — legacy manifest stages keep the documented fallback behavior.
+4. **Freeze.** The validated selection is frozen on the issued capability
+   (`roster_selection`, with `snapshot_id`, per-slot `agent`, and `capability_epoch`).
+   **Advancing INTO a roster-policy stage defers selection and capability issuance:**
+   `workflow_advance` marks the next roster stage `pending` without arming it — no
+   composition is preselected or frozen at the advance boundary — and only an explicit
+   `workflow_begin` issues (and freezes) that stage's capability. Non-roster stages arm
+   normally at advance; a loop `back_to` a roster stage defers the same way.
+5. **Idempotent re-issue, rejection of change.** Re-beginning the same stage with the identical
+   semantic composition is idempotent (the frozen selection is reissued). A changed
+   composition for an active capability is rejected with the frozen `snapshot_id` named —
+   finish the stage first. A composition that is a **prefix** of the frozen one counts as
+   identical: engine-appended slots (minimum-bound fillers, risk-trigger additions) are
+   engine-owned. Facet is part of the frozen identity; `focus`/`reason`/`rationale` are
+   provenance and never re-open the freeze.
+6. **Deterministic defaults.** `workflow_begin` without a selection picks the minimum valid
+   set at arm time: required roles, then minimum-bound fill, then at most one risk-trigger
+   addition (`prefer_distinct_agents` respected when the pool offers distinct agents). The
+   default is never applied implicitly by `workflow_advance` — a deferred roster stage waits
+   for the explicit begin.
+
+Shipped pools: `full-feature` `exploration` (pool `analyst` + `tech-researcher`, 1..3;
+complex/low-confidence runs default to the two-role pair) and `full-feature` `architecture`
+(pool `architect` ×1..3; situational option consilium composed via facet/focus — see
+`stages/architecture.md`). The former fixed `architect_minimal` / `architect_clean` /
+`architect_pragmatic` alias roles are removed; per-option emphasis is now facet/focus on
+repeated `architect` occurrences, not role names.
 
 ## Agent capability tiers
 

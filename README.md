@@ -153,6 +153,22 @@ OMP 17.x exposes the `task` tool only to the main agent. Workflow commands there
 - **Compatibility path:** `packages/fullstack/commands/<name>/index.ts` contains the thin custom-TS adapters. `copy-commands.mjs` and the `session_start` SHA-256 sync materialize them under `<project>/.omp/commands/` for runtimes that still rely on disk discovery. These copies are not an override API; same-name external extension commands use OMP's normal load-order rule, and Claude marketplace commands stay namespaced.
 
 
+### Private OMP internal bundle (this monorepo)
+
+This repository activates a private, workspace-marker-gated bundle — `@andvl1/omp-workflows-internal` — through OMP 18.x's supported project extension setting (`.omp/settings.json#extensions`, resolved relative to the project root). The project extension setting activates **only** `node_modules/@andvl1/omp-workflows-internal`; this monorepo's own development workflow runs entirely on the internal roster (the `omp-*` agent pool — 14 agents, the `omp-feature` / `omp-validate` workflow profiles, and this project's `.omp/team.config.json` / `.omp/teams.json` roster mapping every workflow role onto that pool). Bare `/do-work` `/team` `/cto` come only from a separately installed and active fullstack plugin: when one is present in the host, those bare names still appear in the command inventory next to the `omp-*` names (observed on OMP 18.0.6: `omp-workflow-team`, `omp-do-work`, `omp-team`, `omp-cto` plus `do-work`, `team`, `cto` from the fullstack plugin) — this bundle never registers, owns, or shadows the bare names.
+
+**Activation contract.** The extension loads in every host that reads this project's settings, but workflow-engine registration happens ONLY when the session project root contains all three workspace markers (`package.json` + `packages/core/` + `packages/fullstack/`) — detection is physical-layout only (symlinked markers count as missing) and everything fails closed: no tools, no gates, no runtime-config writes, no owner claims. `/omp-workflow-team validate` is the read-only diagnostic that reports exactly why activation did or did not happen (marker check, current owner claims, agent pool).
+
+**Command surface.**
+
+- `/omp-workflow-team <task>` — bundle-local dispatch; `/omp-workflow-team validate` is strictly read-only.
+- `/omp-do-work <task>` (alias `/omp-team`) — the core profile-driven workflow entry point, namespaced for this bundle.
+- `/omp-cto <task>` — CTO sub-orchestration; `/omp-cto` alone starts STANDBY.
+
+The namespaced descriptors publish eagerly during extension load (so slash autocomplete sees them), but they are marker-gated: outside a marked workspace the command resolver yields no cwd and the gated owner source refuses the claim, so session start and handlers register **zero** owners and never dispatch a workflow. Inside a marked workspace, `workflow_registration` is claimed first by the command layer and the engine then idempotently claims `workflow_registration`, `workflow_tools`, and `config_writer` under the single `private_omp` owner. Bare `/do-work`, `/team`, and `/cto` names are never registered by this bundle — they stay owned by the external fullstack plugin — and `omp-model-roles` is never shadowed.
+
+**Config ownership.** `.omp/team.config.json` maps roles onto the `omp-*` pool (project-local `regression-*` roles included, remapped onto the pool; custom external plugin agents such as `product-*` preserved verbatim). The engine seeds this file only if absent — user and `/init-team` edits are never overwritten by a session.
+
 ## Usage
 
 /cto Implement a cross-team feature

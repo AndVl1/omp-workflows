@@ -18,6 +18,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { isSafeStateSegment } from "../engine/state.js";
+import { readDoDFileSafe } from "../engine/dod.js";
 const WORK_STATE_DIR = ".work-state";
 
 export interface SessionStopEvent {
@@ -187,7 +188,9 @@ export function dodBackstop(event: SessionStopEvent, ctx: SessionStopContext): {
   }
 
   const dodPath = resolveDoDPath(statePath);
-  const dodResult = readDoD(dodPath);
+  // Single safe read (O_NOFOLLOW, regular-file, fd/path bind, cwd containment):
+  // a dod.json swapped for a symlink cannot leak outside the workspace here.
+  const dodResult = readDoD(ctx.cwd, dodPath);
   if (!dodResult.value) {
     const reason = dodResult.error
       ? `DoD: malformed typed artifact at ${dodPath}: ${dodResult.error}. Each item requires criterion, verify_method, status (pending|met), and optional evidence.`
@@ -237,11 +240,15 @@ function resolveDoDPath(statePath: string): string {
   return `${dir}artifacts/dod.json`;
 }
 
-function readDoD(path: string): { value: DoD | null; error?: string } {
-  if (!existsSync(path)) return { value: null };
+function readDoD(cwd: string, path: string): { value: DoD | null; error?: string } {
+  const read = readDoDFileSafe(cwd, path);
+  if (!read.ok) {
+    if (read.kind === "missing") return { value: null };
+    return { value: null, error: read.reason };
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    parsed = JSON.parse(read.raw) as unknown;
   } catch {
     return { value: null, error: "invalid JSON" };
   }

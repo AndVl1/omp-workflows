@@ -10,6 +10,8 @@ import { join, resolve } from "node:path";
 
 import type { WorkflowOwnerIdentity } from "@andvl1/omp-workflows-core";
 
+import { detectWorkspaceMarkers } from "./activation.js";
+
 /** Bundle identity — also the npm package name. */
 export const OMP_INTERNAL_BUNDLE_ID = "@andvl1/omp-workflows-internal";
 
@@ -48,4 +50,24 @@ export function privateOmpOwnerForCwd(cwd: string): WorkflowOwnerIdentity {
 			config_path: join(root, ".omp", "team.config.json"),
 		},
 	};
+}
+
+/**
+ * Owner source for the namespaced command surface.
+ *
+ * Core's command seam resolves an effective cwd and then claims
+ * `workflow_registration` for it before executing a handler. When the session
+ * cwd is NOT a marked internal workspace, that claim must never happen with
+ * the private identity — otherwise the bundle would register itself as the
+ * workflow-registration owner of an arbitrary unmarked project (and a later
+ * fullstack activation there would hit a bogus owner conflict). Throwing
+ * from the owner source aborts core's claim path before the registry is
+ * touched, which keeps fail-closed semantics: zero owners outside the
+ * marked workspace, and the typed marker code as the diagnostic.
+ */
+export function privateOmpOwnerForMarkedWorkspace(cwd: string): WorkflowOwnerIdentity {
+	if (!detectWorkspaceMarkers(cwd).ok) {
+		throw new Error(`activation_markers_missing: ${OMP_INTERNAL_ACTIVATION_MARKER}`);
+	}
+	return privateOmpOwnerForCwd(cwd);
 }

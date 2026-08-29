@@ -40,7 +40,8 @@ import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
 import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof } from "./engine/types.js";
 import type { WorkerWriteScope } from "./gates/orchestrator-write.js";
 import type { ScopeRuntimeClassTable } from "./engine/scope.js";
-import type { DispatchAuth } from "./engine/durable.js";
+import type { DispatchAuth, RosterBeginSelection } from "./engine/durable.js";
+import type { AgentMappingState } from "./engine/agent-mapping.js";
 export type WorkflowCapability = "workflow_registration" | "workflow_tools" | "config_writer";
 
 export type WorkflowOwnerKind = "fullstack" | "private_omp" | (string & {});
@@ -238,7 +239,19 @@ export interface WorkflowToolAdapterOptions {
   resolveCwd?: (ctx: unknown) => string | undefined;
   owner?: WorkflowOwnerSource;
   isMainSession?: (ctx: unknown) => boolean;
-  beforeBegin?: (cwd: string) => void | Promise<void>;
+  /**
+   * Optional trusted live agent-mapping handoff, invoked fresh for EVERY
+   * agent-resolving transition (each workflow_begin and each
+   * workflow_advance) with that transition's exact current cwd — never a
+   * cached mapping from another transition or project. When the callback
+   * resolves with a well-formed `AgentMappingState`, the transition consumes
+   * it in memory for role availability and the persisted workspace mapping
+   * file is never consulted. Only an explicit `undefined` keeps the
+   * persisted mapping fallback; runtime null or any other malformed value
+   * fails the transition closed. Discovery failures must throw so the
+   * transition fails closed.
+   */
+  beforeBegin?: (cwd: string) => void | AgentMappingState | undefined | Promise<void | AgentMappingState | undefined>;
   mappingSummary?: (cwd: string) => unknown;
 }
 
@@ -591,16 +604,35 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_begin",
     label: "Begin workflow stage",
-    description: "Issue a durable opaque capability for the current workflow stage.",
-    parameters: emptyParameters,
-    async execute(_id, _params, _signal, _update, ctx) {
+    description: "Issue a durable opaque capability for the current workflow stage. Stages with a roster policy accept an optional semantic selection — role/facet/focus/reason occurrences only; concrete agent ids are rejected. The selection is validated against the allowed roles, multiplicity and the live registered agent mapping, then frozen: an identical re-issue is idempotent, a changed selection for an active capability is rejected.",
+    parameters: z.object({
+      selection: z.object({
+        rationale: z.string().min(1).optional(),
+        evidence: z.array(z.string().min(1)).max(8).optional(),
+        occurrences: z.array(z.object({
+          role: z.string().min(1),
+          facet: z.string().min(1).nullable().optional(),
+          focus: z.string().min(1).optional(),
+          reason: z.string().min(1).optional(),
+        }).strict()).min(1).max(8),
+      }).strict().optional(),
+    }) as never,
+    async execute(_id, params, _signal, _update, ctx) {
       const denied = contextError(ctx);
       if (denied) return denied;
       const cwd = currentCwd(ctx);
       if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      const input = params as { selection?: RosterBeginSelection };
       try {
-        await options.beforeBegin?.(cwd);
-        const transition = beginCapability(cwd);
+        // Per-transition trusted handoff, resolved for this exact cwd: only
+        // an explicit undefined means "no handoff" and keeps the persisted
+        // mapping. Any other value — including runtime null — is a handoff
+        // attempt that must clear the engine's structural gate or
+        // workflow_begin fails closed; it never silently selects the
+        // persisted mapping.
+        const handoff = await options.beforeBegin?.(cwd);
+        const trustedMapping = handoff === undefined ? undefined : handoff as unknown as AgentMappingState;
+        const transition = beginCapability(cwd, input.selection, trustedMapping !== undefined ? { trustedMapping } : undefined);
         if (!transition.ok) return toolResult({ ok: false, code: "WORKFLOW_BEGIN_REJECTED", error: transition.error, state: transition.state ? workflowStateSummary(cwd, options.mappingSummary) : undefined });
         return toolResult({ ok: true, transition: "begin", handoff: transition.handoff, state: workflowStateSummary(cwd, options.mappingSummary) });
       } catch (error) {
@@ -750,7 +782,13 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
       const input = params as DispatchAuth & { evidence: string };
       try {
-        const transition = advanceCursor(cwd, input);
+        // Per-transition trusted handoff for this exact cwd — never a cached
+        // mapping from another transition or project: only an explicit
+        // undefined keeps the persisted mapping; runtime null or a value
+        // failing the engine's structural gate fails the advance closed.
+        const handoff = await options.beforeBegin?.(cwd);
+        const trustedMapping = handoff === undefined ? undefined : handoff as unknown as AgentMappingState;
+        const transition = advanceCursor(cwd, input, trustedMapping !== undefined ? { trustedMapping } : undefined);
         return transition.ok
           ? toolResult({ ok: true, transition: "advance", stage_cursor: transition.state.stage_cursor, cursor_epoch: transition.state.cursor_epoch, handoff: transition.handoff, state: workflowStateSummary(cwd, options.mappingSummary) })
           : toolResult({ ok: false, code: "WORKFLOW_ADVANCE_REJECTED", error: transition.error });
@@ -799,6 +837,7 @@ export {
   type TrustedDispatchInput,
   type CapabilityHandoff,
   type TransitionResult,
+  type TrustedMappingOptions,
 } from "./engine/durable.js";
 export {
   parseExpression,
@@ -903,11 +942,13 @@ export {
   buildAgentMapping,
   mappingPreferencesHash,
   readAgentMapping,
+  validateAgentMappingState,
   writeAgentMapping,
   type AgentMappingDiagnostic,
   type AgentMappingExpectation,
   type AgentMappingOptions,
   type AgentMappingState,
+  type AgentMappingStateValidation,
   type AgentMappingStatus,
   type MappingPreferencesProvenance,
 } from "./engine/agent-mapping.js";

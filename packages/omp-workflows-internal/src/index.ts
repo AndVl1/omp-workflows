@@ -17,10 +17,15 @@
  * `/omp-workflow-team` is always registered — it is the surface that reports
  * WHY activation did or did not happen.
  *
- * Command surface: exactly one command, hyphen-named `omp-workflow-team`.
- * Bare `do-work` / `team` / `cto` names are never registered and
- * `omp-model-roles` is never shadowed. `omp-workflow-team validate` is a
- * strictly read-only mode.
+ * Command surface: the always-registered diagnostic command
+ * `omp-workflow-team` (its `validate` mode is strictly read-only) plus the
+ * core registration surface namespaced as `omp-do-work` / `omp-team` /
+ * `omp-cto`. The namespaced descriptors publish eagerly during extension
+ * load for slash-discovery, but they are marker-gated: outside a marked
+ * internal workspace the resolver yields no cwd and the gated owner source
+ * refuses to claim, so session_start and handlers register ZERO owners.
+ * Bare `do-work` / `team` / `cto` names are never registered (they belong
+ * to the external fullstack plugin) and `omp-model-roles` is never shadowed.
  */
 
 import type {
@@ -33,6 +38,8 @@ import {
 	createWorkflowToolAdapter,
 	parseWorkEnvelope,
 	registerTeamWorkflow,
+	registerWorkflowCommands,
+	writeRuntimeConfig,
 	workflowOwnerFor,
 	type WorkflowCapability,
 	type WorkflowToolAdapter,
@@ -44,6 +51,7 @@ import {
 	OMP_INTERNAL_BUNDLE_ID,
 	OMP_INTERNAL_OWNER_KIND,
 	privateOmpOwnerForCwd,
+	privateOmpOwnerForMarkedWorkspace,
 } from "./identity.js";
 import {
 	ALLOWED_POOL_AGENTS,
@@ -52,6 +60,8 @@ import {
 	defaultOmpInternalScopeMap,
 	defaultOmpInternalScopeRuntimeClasses,
 	defaultOmpInternalScopeUiClasses,
+	refreshInternalAgentMappings,
+	waitForInternalAgentMappings,
 } from "./pool.js";
 import { loadOmpWorkflowProfiles } from "./profiles.js";
 
@@ -62,6 +72,21 @@ const ALL_CAPABILITIES: readonly WorkflowCapability[] = [
 ];
 
 const COMMAND_NAME = "omp-workflow-team";
+
+/** Namespace for the core registration surface exposed by this bundle. */
+const COMMAND_NAMESPACE = "omp";
+
+/**
+ * Namespace-aware descriptions. Core ships bare-command copy (`/do-work`,
+ * `/team`); under the `omp` namespace the discovery surface must advertise
+ * the names this bundle actually registers.
+ */
+const NAMESPACED_DESCRIPTIONS = {
+	doWorkDescription: "Run a profile-driven workflow. /omp-do-work <task>. (Alias: /omp-team.)",
+	teamDescription: "Alias for /omp-do-work. Prefer /omp-do-work in new code.",
+	ctoDescription:
+		"CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /omp-cto <task>; /omp-cto alone starts STANDBY (tasks arrive via messenger inbox). Runs in-session — never task(agent=cto)",
+} as const;
 
 /** Entry points already wired for a given pi instance (idempotent per host). */
 const activatedEngines = new WeakSet<object>();
@@ -91,6 +116,23 @@ export function resolveSessionCwd(ctx: unknown): string | undefined {
 	return typeof objectContext.cwd === "string" && objectContext.cwd.length > 0 ? objectContext.cwd : undefined;
 }
 
+/**
+ * Session-cwd resolver for the namespaced command surface.
+ *
+ * Returns the session cwd ONLY when `detectWorkspaceMarkers(cwd).ok` holds:
+ * an unmarked or unavailable session root resolves to `undefined`. Core's
+ * command seam consults this resolver first and then fails closed through
+ * the gated owner source (`privateOmpOwnerForMarkedWorkspace`), so the
+ * namespaced descriptors can publish eagerly for slash-discovery while a
+ * session outside the marked workspace still ends up with zero claims and
+ * no workflow dispatch.
+ */
+export function resolveGatedCommandCwd(ctx: unknown): string | undefined {
+	const cwd = resolveSessionCwd(ctx);
+	if (!cwd) return undefined;
+	return detectWorkspaceMarkers(cwd).ok ? cwd : undefined;
+}
+
 export type ActivationOutcome =
 	| { ok: true }
 	| { ok: false; code: "activation_markers_missing"; missing: string[] }
@@ -104,7 +146,12 @@ export type ActivationOutcome =
  *  1. markers must all be present;
  *  2. bundle profiles must load and validate;
  *  3. the atomic multi-capability owner claim must succeed — any conflict
- *     aborts before the registry mutates and before ANY engine registration.
+ *     aborts before the registry mutates and before ANY engine registration;
+ *  4. the runtime config is seeded write-if-absent — synchronously, BEFORE
+ *     the idempotence short-circuit and before any discovery refresh can
+ *     resolve roles, so a clean marked workspace carries the default omp-*
+ *     role config on its very first session (never overwrites a custom one);
+ *  5. engine registration and adapter wiring.
  */
 export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): ActivationOutcome {
 	const gate = detectWorkspaceMarkers(cwd);
@@ -123,26 +170,55 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): Activatio
 	if (!claim.ok) {
 		return { ok: false, code: claim.code, error: claim.error };
 	}
+
+	// Registration presets shared verbatim by engine wiring and the config
+	// seed: core's writeRuntimeConfig writes exactly these values when the
+	// file is absent and returns untouched when it exists.
+	const registrationOpts = {
+		label: OMP_INTERNAL_BUNDLE_ID,
+		roles: defaultOmpInternalRoles,
+		scopeMap: defaultOmpInternalScopeMap,
+		scopeRuntimeClasses: defaultOmpInternalScopeRuntimeClasses,
+		scopeUiClasses: defaultOmpInternalScopeUiClasses,
+		flags: defaultOmpInternalFlags,
+		workflowProfiles: profiles,
+		resolveCwd: resolveSessionCwd,
+		owner: privateOmpOwnerForCwd,
+	};
+
+	// Seed-if-absent BEFORE the short-circuit and before ANY discovery
+	// refresh resolves roles: core registers its config-writer as a
+	// session_start callback, which cannot seed the CURRENT event, so a
+	// clean marked workspace (no .omp/team.config.json) previously reached
+	// the live roster refresh with empty config roles — required profile
+	// roles mapped to unprefixed names and the first session failed closed
+	// until a second session_start. Synchronous here means the seed always
+	// precedes the refresh kickoff and the first begin's beforeBegin.
+	try {
+		writeRuntimeConfig(registrationOpts, cwd);
+	} catch (error) {
+		return {
+			ok: false,
+			code: "registration_failed",
+			error: String(error instanceof Error ? error.message : error),
+		};
+	}
+
 	if (activatedEngines.has(pi)) return { ok: true };
 
 	// Registration is the last step and the WeakSet mark lands only AFTER it
 	// succeeds (SEC-BUNDLE-001): a throw mid-registration must not leave the
 	// host silently marked as wired while zero tools/gates are registered.
 	try {
-		registerTeamWorkflow(pi, {
-			label: OMP_INTERNAL_BUNDLE_ID,
-			roles: defaultOmpInternalRoles,
-			scopeMap: defaultOmpInternalScopeMap,
-			scopeRuntimeClasses: defaultOmpInternalScopeRuntimeClasses,
-			scopeUiClasses: defaultOmpInternalScopeUiClasses,
-			flags: defaultOmpInternalFlags,
-			workflowProfiles: profiles,
-			resolveCwd: resolveSessionCwd,
-			owner: privateOmpOwnerForCwd,
-		});
+		registerTeamWorkflow(pi, registrationOpts);
 		const adapter: WorkflowToolAdapter = createWorkflowToolAdapter({
 			resolveCwd: resolveSessionCwd,
 			owner: privateOmpOwnerForCwd,
+			// Hand the fresh, provenance-checked mapping to core so workflow_begin
+			// authorizes from this session's discovery — in memory, never from the
+			// persisted mapping file. A failed refresh rejects here, which blocks
+			// the begin (fail closed) instead of letting a stale roster stand in.
+			beforeBegin: (cwd) => waitForInternalAgentMappings(cwd),
 		});
 		adapter.register(pi);
 	} catch (error) {
@@ -252,9 +328,30 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 		},
 	});
 
+	// Namespaced core registration surface: `/omp-do-work`, `/omp-team`,
+	// `/omp-cto`. Descriptors publish eagerly during extension load so OMP's
+	// slash-suggestion snapshot sees them; the marker gate lives in the
+	// resolver (`resolveGatedCommandCwd`) and in the owner source
+	// (`privateOmpOwnerForMarkedWorkspace`), so an unmarked session claims
+	// zero owners and never receives a workflow dispatch. Core registers its
+	// own session_start claim handler here — it must run BEFORE the
+	// engine-activation handler below so `workflow_registration` is claimed
+	// first and `ensureEngineActivation` then idempotently claims all three
+	// capabilities under the single private owner.
+	registerWorkflowCommands(pi, {
+		namespace: COMMAND_NAMESPACE,
+		...NAMESPACED_DESCRIPTIONS,
+		owner: privateOmpOwnerForMarkedWorkspace,
+		resolveCwd: resolveGatedCommandCwd,
+	});
+
 	pi.on("session_start", (_event: unknown, ctx: unknown) => {
 		const cwd = resolveSessionCwd(ctx);
 		if (!cwd) return;
+		// Activation FIRST: on a clean marked workspace it synchronously seeds
+		// the default omp-* role config (write-if-absent), so the refresh
+		// kicked below resolves real roles on the very first session instead
+		// of failing closed on empty config until a second session_start.
 		const outcome = ensureEngineActivation(pi, cwd);
 		if (!outcome.ok) {
 			// SEC-BUNDLE-003: no absolute paths in host logs — marker names and
@@ -264,6 +361,24 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 					? { code: outcome.code, missing: outcome.missing.map((path) => path.slice(cwd.length + 1)) }
 					: { code: outcome.code, error: outcome.error };
 			console.warn(`[${COMMAND_NAME}]`, JSON.stringify({ bundle: OMP_INTERNAL_BUNDLE_ID, ...detail }));
+		}
+		// Bundle-owned live roster refresh: lazily discovers the host agents and
+		// republishes the exact omp-* role mapping. Marker-gated (fails closed
+		// outside the marked workspace), deduped per root, joined by the
+		// workflow tool adapter in beforeBegin, and kicked only AFTER
+		// activation + config seed so discovery never races an unseeded
+		// resolveConfig. Fire and forget — a rejected refresh fails closed
+		// without blocking activation.
+		if (detectWorkspaceMarkers(cwd).ok) {
+			void refreshInternalAgentMappings(cwd).catch((error: unknown) => {
+				// SEC-BUNDLE-003: no absolute paths in host logs — typed code plus
+				// the typed error text (agent names) only.
+				console.warn(`[${COMMAND_NAME}]`, JSON.stringify({
+					bundle: OMP_INTERNAL_BUNDLE_ID,
+					code: "agent_mapping_refresh_failed",
+					error: String(error instanceof Error ? error.message : error),
+				}));
+			});
 		}
 	});
 }

@@ -11,7 +11,9 @@ import {
   createCapability,
   authorizeDispatch,
   completeDispatch,
+  buildAgentMapping,
   loadProfile,
+  resolveConfig,
   claimWorkflowOwner,
   resetWorkflowOwners,
   workflowOwnerFor,
@@ -20,6 +22,7 @@ import {
   recordWorkPending,
   recordWorkTerminal,
   writeConfig,
+  writeAgentMapping,
 } from "@andvl1/omp-workflows-core";
 import {
   FULLSTACK_BUNDLE_ID,
@@ -104,11 +107,28 @@ function writeConsiliumBeginFixture(root: string): void {
   }) + "\n");
 }
 
+const trustedIntakeRoles = { analyst: "analyst", "tech-researcher": "tech-researcher" } as const;
+
+/** Publish a trusted live agent mapping covering the spec-preparation intake pool. */
+function publishMapping(root: string): void {
+  mkdirSync(join(root, ".omp"), { recursive: true });
+  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: trustedIntakeRoles }) + "\n");
+  const config = resolveConfig(root);
+  const mapping = buildAgentMapping({
+    roles: config.roles,
+    availableAgents: Object.values(trustedIntakeRoles),
+    extraRoles: config.scope_map.map((entry) => entry.dev_agent),
+    genericFallbackRoles: Object.keys(trustedIntakeRoles),
+  });
+  writeAgentMapping(root, mapping);
+}
+
 test("fullstack: workflow_begin exposes role-bound dispatch markers", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-workflow-marker-handoff-"));
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     writeConsiliumBeginFixture(root);
+    publishMapping(root);
     const tools = new Map<string, RegisteredTool>();
     registerWorkflowTools({
       zod: { z },
