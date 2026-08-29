@@ -29,10 +29,10 @@ import {
   fullstackOwnerForCwd,
   fullstackPreset,
   registerWorkflowTools,
-  registerLectureAcquireTool,
   resolveSessionCwd,
   isMainSessionContext,
 } from "../src/index.js";
+import { registerLectureAcquireTool } from "../src/tools/lecture-acquire.js";
 
 function profileHash(profile: unknown): string {
   const canonicalize = (value: unknown): unknown => {
@@ -332,7 +332,7 @@ test("fullstack: workflow tools register and fail closed with structured respons
     registerTool(tool: RegisteredTool) {
       tools.set(tool.name, tool);
     },
-  } as never, { z }, { resolveSessionCwd, isMainSessionContext });
+  } as never, z, { resolveSessionCwd, isMainSessionContext });
 
   assert.deepEqual([...tools.keys()], ["workflow_prepare", "workflow_begin", "workflow_status", "workflow_instructions", "workflow_complete", "workflow_checkpoint", "workflow_advance", "lecture_acquire"]);
   for (const name of tools.keys()) {

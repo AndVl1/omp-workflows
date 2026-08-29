@@ -623,7 +623,7 @@ test("lecture-research: DoD backstop exempts lecture-research done-claims", () =
     assert.ok(blocked, "control: a non-exempt workflow claiming done is blocked");
     if (!blocked || !("reason" in blocked)) assert.fail("blocked result carries a reason");
     assert.equal(blocked.decision, "block");
-    assert.match(blocked.reason, /dod\.json is missing/, "the block is the missing-DoD block, proving the exemption is what allowed the stop above");
+    assert.match(blocked.reason, /dod\.json: file is missing/, "the block is the missing-DoD block, proving the exemption is what allowed the stop above");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

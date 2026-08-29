@@ -491,6 +491,7 @@ export function resolveWorkflow(
     "SPEC",
     "REGRESS",
     "INVESTIGATION",
+    "LECTURE_RESEARCH",
     "REVIEW",
     "HOTFIX",
     "PRODUCT_DISCOVERY",
