@@ -11,6 +11,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./lecture-acquisition/eval": {
+      "types": "./dist/lecture-acquisition/eval.d.ts",
+      "import": "./dist/lecture-acquisition/eval.js"
+    },
     "./commands": "./commands/",
     "./commands/*": "./commands/*"
   },
@@ -21,6 +25,7 @@
   },
   "files": [
     "dist",
+    "evals",
     "agents",
     "skills",
     "commands",

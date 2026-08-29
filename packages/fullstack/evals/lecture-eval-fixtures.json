@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "schemaVersion": 1,
+      "id": "synthetic-english-causality",
+      "rightsStatus": "synthetic-fixture",
+      "rightsNotes": "Synthetic English transcript authored for deterministic evaluation tests; no media, URLs, provider responses, or credentials are included.",
+      "language": "en",
+      "durationSeconds": 12,
+      "referenceTranscript": [
+        { "segmentId": "en-0", "text": "A bounded experiment changes one variable.", "startSeconds": 0, "endSeconds": 4, "language": "en" },
+        { "segmentId": "en-1", "text": "The control group shows whether the change matters.", "startSeconds": 4, "endSeconds": 8, "language": "en" },
+        { "segmentId": "en-2", "text": "Clear notes make the result reproducible.", "startSeconds": 8, "endSeconds": 12, "language": "en" }
+      ],
+      "referenceClaims": [
+        { "id": "en-claim-1", "text": "A bounded experiment changes one variable.", "startSeconds": 0, "endSeconds": 4 },
+        { "id": "en-claim-2", "text": "The control group shows whether the change matters.", "startSeconds": 4, "endSeconds": 8 }
+      ],
+      "referenceProposalTerms": ["bounded experiment", "control group", "reproducible notes"]
+    },
+    {
+      "schemaVersion": 1,
+      "id": "synthetic-russian-observation",
+      "rightsStatus": "synthetic-fixture",
+      "rightsNotes": "Synthetic Russian transcript authored for deterministic evaluation tests; no media, URLs, provider responses, or credentials are included.",
+      "language": "ru",
+      "durationSeconds": 10,
+      "referenceTranscript": [
+        { "segmentId": "ru-0", "text": "Наблюдение начинается с ясного вопроса.", "startSeconds": 0, "endSeconds": 5, "language": "ru" },
+        { "segmentId": "ru-1", "text": "Повторяемый протокол помогает проверить вывод.", "startSeconds": 5, "endSeconds": 10, "language": "ru" }
+      ],
+      "referenceClaims": [
+        { "id": "ru-claim-1", "text": "Наблюдение начинается с ясного вопроса.", "startSeconds": 0, "endSeconds": 5 },
+        { "id": "ru-claim-2", "text": "Повторяемый протокол помогает проверить вывод.", "startSeconds": 5, "endSeconds": 10 }
+      ],
+      "referenceProposalTerms": ["ясный вопрос", "повторяемый протокол"]
+    }
+  ]
+}

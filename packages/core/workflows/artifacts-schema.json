@@ -130,14 +130,15 @@
     },
     "manual_qa": {
       "type": "object",
-      "description": "Manual runtime-verification verdict, produced by the manual-qa agent AFTER review_fixes — it exercises the code that will actually ship, not a pre-fix snapshot. NOT UI-only: on a UI scope it drives the real UI through OMP browser or configured device automation; on a backend/CLI scope it runs the app, hits endpoints, and reads logs/output. Gated on scope.has_runtime (skipped only for pure docs/config work). Consumed by qa_tests (evidence → automated regression tests) and by summary. Replaces the old string field inside `debug`.",
+      "description": "Manual runtime-verification verdict, produced by the manual-qa agent AFTER review_fixes — it exercises the code that will actually ship, not a pre-fix snapshot. NOT UI-only: on a UI scope it drives the real UI through OMP browser or configured device automation; on a backend/CLI scope it runs the app, hits endpoints, and reads logs/output. Gated on scope.has_runtime (skipped only for pure docs/config work). PASS requires every acceptance criterion to be observed at runtime. CONDITIONAL is terminal only when deterministic/runtime checks produced real evidence but one or more required criteria are unavailable because an explicit capability, credential, or configuration blocker is recorded in blocked_prerequisites. FAIL means an observed failure. Missing or unknown verdicts fail closed. Consumed by qa_tests (evidence → automated regression tests) and by summary. Replaces the old string field inside `debug`.",
       "required": ["verdict", "evidence"],
       "properties": {
-        "verdict": { "enum": ["PASS", "FAIL"], "description": "PASS only if every acceptance criterion was observed working at runtime. A missing/unknown verdict is treated as FAIL — it never auto-passes." },
+        "verdict": { "enum": ["PASS", "CONDITIONAL", "FAIL"], "description": "PASS only if every acceptance criterion was observed working at runtime. CONDITIONAL only when deterministic/runtime checks produced real evidence but a required criterion is unobservable because an explicit capability, credential, or configuration blocker is recorded in blocked_prerequisites. FAIL means an observed failure. A missing/unknown verdict is treated as FAIL — it never auto-passes." },
         "evidence": {
           "type": "array",
+          "minItems": 1,
           "items": { "type": "string" },
-          "description": "Concrete observations. UI: screenshot path + WHAT IS VISIBLE on it. Backend/CLI: the command/curl run + the actual response/exit code, and the relevant log lines. A bare 'looks good' is not evidence."
+          "description": "At least one concrete observation is required for every terminal verdict. UI: screenshot path + WHAT IS VISIBLE on it. Backend/CLI: the command/curl run + the actual response/exit code, and the relevant log lines. A bare 'looks good' is not evidence."
         },
         "mode": { "enum": ["ui", "runtime"], "description": "Which verification mode was used: 'ui' (OMP browser for web or configured device automation for the app) when scope.has_ui, else 'runtime' (run/curl/logs)." },
         "dod_additions": {
@@ -155,12 +156,17 @@
             }
           }
         },
-        "regressions": { "type": "array", "items": { "type": "string" }, "description": "Pre-existing behavior that broke during testing — empty array if none." }
+        "regressions": { "type": "array", "items": { "type": "string" }, "description": "Pre-existing behavior that broke during testing — empty array if none." },
+        "blocked_prerequisites": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional explicit capability, credential, or configuration blockers that make required acceptance criteria unobservable. Required evidence for a CONDITIONAL verdict: identify the unavailable criterion and the blocker without including secrets, raw provider/media data, or fabricated positive live evidence."
+        }
       }
     },
     "qa_tests": {
       "type": "object",
-      "description": "Automated tests written by the qa agent AFTER manual_qa, encoding the manually-observed behavior (manual_qa.evidence) as durable regression tests. Only accepted when manual_qa.verdict == PASS, or when the task has no UI (!scope.has_ui) so manual_qa was skipped.",
+      "description": "Automated tests written by the qa agent AFTER manual_qa, encoding the manually-observed behavior (manual_qa.evidence) as durable regression tests. Accepted when manual_qa.verdict is PASS or CONDITIONAL while runtime exists, or when the task has no runtime (!scope.has_runtime) and manual_qa was skipped. CONDITIONAL permits deterministic regression tests to proceed but does not prove blocked live criteria; a FAIL verdict with runtime never passes this gate.",
       "required": ["tests_added", "build_status"],
       "properties": {
         "tests_added": { "type": "array", "items": { "type": "string" }, "description": "Test files/cases added or updated." },
@@ -434,6 +440,322 @@
         "findings": { "type": "array", "items": { "type": "string" } },
         "merged_branches": { "type": "array", "items": { "type": "string" } },
         "note": { "type": "string" }
+      }
+    },
+    "lecture_acquisition": {
+      "type": "object",
+      "description": "Provider-neutral, bounded URL acquisition handoff. The consumer-owned lecture_acquire tool writes this artifact after parsing one video/playlist URL and normalizing provider evidence; core does not fetch URLs. status=failed may have an empty evidence array and cannot advance. status=partial may advance only when evidence contains at least one valid segment, and failures must preserve every unresolved source or provider warning.",
+      "required": ["schemaVersion", "status", "request", "sourceSet", "evidence", "failures", "provider", "startedAt", "completedAt"],
+      "properties": {
+        "schemaVersion": { "type": "integer", "enum": [1], "description": "Version of the provider-neutral acquisition artifact." },
+        "status": { "enum": ["succeeded", "partial", "failed"], "description": "succeeded means all bounded sources acquired; partial means valid evidence exists but failures/gaps remain; failed cannot pass the acquisition gate." },
+        "request": {
+          "type": "object",
+          "description": "The one URL plus natural-language prompt extracted at intake. No transcript or media prerequisite is implied.",
+          "required": ["sourceUrl", "sourceKind", "prompt", "limits"],
+          "properties": {
+            "sourceUrl": { "type": "string", "description": "The single user-provided public video or playlist URL; provider adapters must revalidate and canonicalize it." },
+            "canonicalUrl": { "type": "string", "description": "Canonical allowlisted video/playlist URL, when parsing succeeded." },
+            "sourceKind": { "enum": ["video", "playlist"], "description": "Parsed URL kind." },
+            "prompt": { "type": "string", "description": "Non-empty natural-language research prompt; do not request a user transcript." },
+            "limits": {
+              "type": "object",
+              "description": "Finite bounds. Consumer-supplied limits may tighten configured values but must never exceed hard caps.",
+              "required": ["maxItems", "maxPages", "deadlineMs", "maxAttempts", "maxResponseBytes", "maxEvidenceSegmentsPerSource"],
+              "properties": {
+                "maxItems": { "type": "integer", "minimum": 1, "description": "Maximum videos resolved from a request." },
+                "maxPages": { "type": "integer", "minimum": 1, "description": "Maximum playlist pagination pages." },
+                "maxDurationSeconds": { "type": "number", "minimum": 0, "description": "Optional trusted duration bound; never inferred from a URL alone." },
+                "deadlineMs": { "type": "integer", "minimum": 1, "description": "Overall bounded acquisition deadline in milliseconds." },
+                "maxAttempts": { "type": "integer", "minimum": 1, "description": "Maximum attempts per provider call." },
+                "maxResponseBytes": { "type": "integer", "minimum": 1, "description": "Maximum accepted provider response size." },
+                "maxEvidenceSegmentsPerSource": { "type": "integer", "minimum": 1, "description": "Maximum normalized evidence segments retained for one source." },
+                "maxAudioBytes": { "type": "integer", "minimum": 1, "description": "Maximum ephemeral audio bytes." },
+                "maxTranscriptCharacters": { "type": "integer", "minimum": 1, "description": "Maximum transcript characters held in memory." },
+                "maxTranscriptSegments": { "type": "integer", "minimum": 1, "description": "Maximum normalized transcript segments accepted from one ASR response." },
+                "maxChunkCharacters": { "type": "integer", "minimum": 1, "description": "Maximum transcript characters sent in one analysis chunk." },
+                "maxChunksPerSource": { "type": "integer", "minimum": 1, "description": "Maximum analysis chunks per source." },
+                "maxAnalysisOutputBytes": { "type": "integer", "minimum": 1, "description": "Maximum analysis response bytes." },
+                "maxProviderCostCents": { "type": "integer", "minimum": 0, "description": "Optional estimated provider budget." }
+              }
+            }
+          }
+        },
+        "sourceSet": {
+          "type": "object",
+          "description": "The bounded, stable-order source set resolved from the parsed URL. A truncated playlist must remain visibly partial.",
+          "required": ["requested", "items", "truncated", "failures"],
+          "properties": {
+            "requested": {
+              "type": "object",
+              "required": ["kind", "canonicalUrl"],
+              "properties": {
+                "kind": { "enum": ["video", "playlist"] },
+                "videoId": { "type": "string" },
+                "playlistId": { "type": "string" },
+                "canonicalUrl": { "type": "string" }
+              }
+            },
+            "items": {
+              "type": "array",
+              "description": "Resolved video sources in deterministic order; duplicate video ids are first-wins.",
+              "items": {
+                "type": "object",
+                "required": ["sourceId", "videoId", "canonicalUrl"],
+                "properties": {
+                  "sourceId": { "type": "string", "description": "Stable source id used by evidence and mapping citations." },
+                  "videoId": { "type": "string" },
+                  "canonicalUrl": { "type": "string" },
+                  "playlistId": { "type": "string" },
+                  "position": { "type": "integer", "minimum": 0 },
+                  "title": { "type": "string" },
+                  "durationSeconds": { "type": "number", "minimum": 0 }
+                }
+              }
+            },
+            "truncated": { "type": "boolean", "description": "True when bounds prevented claiming complete playlist coverage." },
+            "totalKnown": { "type": "integer", "minimum": 0, "description": "Optional provider-reported total before bounded truncation." },
+            "failures": {
+              "type": "array",
+              "description": "Source-resolution failures retained even when some sources succeed.",
+              "items": {
+                "type": "object",
+                "required": ["code", "message", "retryable", "attempts", "severity"],
+                "properties": {
+                  "code": { "enum": ["INVALID_URL", "UNSUPPORTED_URL", "VIDEO_NOT_FOUND", "PLAYLIST_NOT_FOUND", "PRIVATE_OR_UNLISTED", "PLAYLIST_TOO_LARGE", "CAPTIONS_UNAVAILABLE", "MEDIA_NOT_ACCESSIBLE", "RIGHTS_REQUIRED", "PROVIDER_AUTH_MISSING", "QUOTA_EXCEEDED", "PROVIDER_TIMEOUT", "NETWORK_ERROR", "TRANSCRIPT_FAILED", "ANALYSIS_FAILED", "INVALID_PROVIDER_RESPONSE", "LIMIT_EXCEEDED", "PARTIAL_SOURCE_SET", "OMP_RUNTIME_UNAVAILABLE"] },
+                  "sourceId": { "type": "string" },
+                  "provider": { "type": "string" },
+                  "message": { "type": "string", "description": "Sanitized diagnostic; never include provider payloads, keys, or headers." },
+                  "retryable": { "type": "boolean" },
+                  "attempts": { "type": "integer", "minimum": 0 },
+                  "severity": { "enum": ["warning", "error"] }
+                }
+              }
+            }
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "description": "Only normalized, bounded evidence segments may reach mapping. Every segment needs finite startSeconds >= 0 and endSeconds strictly greater than startSeconds; core enforces this cross-field invariant.",
+          "items": {
+            "type": "object",
+            "required": ["evidenceId", "sourceId", "location", "provider", "kind", "quote", "startSeconds", "endSeconds"],
+            "properties": {
+              "evidenceId": { "type": "string", "description": "Deterministic evidence identity." },
+              "sourceId": { "type": "string" },
+              "location": { "type": "string", "description": "Canonical source URL." },
+              "provider": { "type": "string" },
+              "kind": { "enum": ["transcript_excerpt", "audio_observation", "visual_observation"] },
+              "quote": { "type": "string", "description": "Bounded provider excerpt or observation; raw provider output is forbidden." },
+              "startSeconds": { "type": "number", "minimum": 0, "description": "Finite timestamp start in seconds." },
+              "endSeconds": { "type": "number", "minimum": 0, "description": "Finite timestamp end in seconds; must be strictly greater than startSeconds." },
+              "language": { "type": "string" },
+              "confidence": { "enum": ["low", "medium", "high"] }
+            }
+          }
+        },
+        "failures": {
+          "type": "array",
+          "description": "All acquisition failures and warnings. Partial results must preserve failures instead of implying complete coverage.",
+          "items": {
+            "type": "object",
+            "required": ["code", "message", "retryable", "attempts", "severity"],
+            "properties": {
+              "code": { "enum": ["INVALID_URL", "UNSUPPORTED_URL", "VIDEO_NOT_FOUND", "PLAYLIST_NOT_FOUND", "PRIVATE_OR_UNLISTED", "PLAYLIST_TOO_LARGE", "CAPTIONS_UNAVAILABLE", "MEDIA_NOT_ACCESSIBLE", "RIGHTS_REQUIRED", "PROVIDER_AUTH_MISSING", "QUOTA_EXCEEDED", "PROVIDER_TIMEOUT", "NETWORK_ERROR", "TRANSCRIPT_FAILED", "ANALYSIS_FAILED", "INVALID_PROVIDER_RESPONSE", "LIMIT_EXCEEDED", "PARTIAL_SOURCE_SET", "OMP_RUNTIME_UNAVAILABLE"] },
+              "sourceId": { "type": "string" },
+              "provider": { "type": "string" },
+              "message": { "type": "string", "description": "Sanitized diagnostic; never include provider payloads, keys, or headers." },
+              "retryable": { "type": "boolean" },
+              "attempts": { "type": "integer", "minimum": 0 },
+              "severity": { "enum": ["warning", "error"] }
+            }
+          }
+        },
+        "provider": {
+          "type": "object",
+          "required": ["id"],
+          "description": "Provider-neutral identity and optional model label. Never store credentials, headers, or raw payloads.",
+          "properties": {
+            "id": { "type": "string" },
+            "model": { "type": "string" }
+          }
+        },
+        "pipeline": {
+          "type": "object",
+          "description": "Optional stage provider metadata; never contains endpoints, credentials, media, transcripts, or raw provider responses.",
+          "properties": {
+            "media": { "type": "object", "required": ["id", "mode"], "properties": { "id": { "type": "string" }, "mode": { "enum": ["metadata-only", "owned-audio"] } } },
+            "asr": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" }, "model": { "type": "string" }, "timestampMode": { "enum": ["provider", "estimated"], "description": "Timestamp provenance. Estimated intervals are bounded navigation hints, not provider timecodes." } } },
+            "analysis": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" }, "model": { "type": "string" }, "route": { "type": "string" } } },
+            "fallbackUsed": { "type": "boolean" }
+          }
+        },
+        "startedAt": { "type": "string", "description": "ISO-8601 acquisition start timestamp." },
+        "completedAt": { "type": "string", "description": "ISO-8601 completion timestamp; must not precede startedAt." }
+      }
+    },
+    "lecture_intake": {
+      "type": "object",
+      "description": "URL-first intake for lecture-research: extract exactly one public video/playlist URL plus the natural-language research prompt. The URL is the only source prerequisite; no user transcript, captions, or media file is requested. Produced by the intake (orchestrator) stage with acquisition-pending provenance.",
+      "required": ["task", "sources"],
+      "properties": {
+        "task": { "type": "string", "description": "The research question/goal the user asked about the lectures/playlist." },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Every lecture/playlist source the research may use. Each entry requires observable provenance so downstream evidence can be traced.",
+          "items": {
+            "type": "object",
+            "required": ["id", "kind", "location", "provenance"],
+            "properties": {
+              "id": { "type": "string", "description": "Stable source id (e.g. lecture-01) referenced by every downstream evidence field." },
+              "kind": { "enum": ["transcript", "playlist", "audio", "video", "notes", "document", "url", "other"], "description": "What the source material is." },
+              "location": { "type": "string", "description": "Where the source lives: file path, URL, or playlist id." },
+              "provenance": { "type": "string", "description": "How/where the source was obtained (downloaded, provided file, linked in task) and any timecode/indexing available." },
+              "constraints": { "type": "array", "items": { "type": "string" }, "description": "Per-source boundaries (language, allowed segments, redactions)." }
+            }
+          }
+        },
+        "rights": {
+          "type": "object",
+          "description": "Explicit rights declarations. Absence is fail-closed.",
+          "properties": {
+            "automatedPublicVideoAnalysisApproved": { "type": "boolean" },
+            "ownedCaptionAccessApproved": { "type": "boolean" },
+            "ownedMediaAudioAccessApproved": { "type": "boolean" },
+            "ownedMediaAccessApproved": { "type": "boolean" },
+            "externalTranscriptAnalysisApproved": { "type": "boolean" }
+          }
+        },
+        "mediaMode": { "enum": ["metadata-only", "owned-audio"] },
+        "constraints": { "type": "array", "items": { "type": "string" }, "description": "Boundaries from the request (language, scope, which lectures matter)." }
+      }
+    },
+    "lecture_mapping": {
+      "type": "object",
+      "description": "Bounded parallel mapping of normalized lecture_acquisition evidence. Mapping consumes the acquisition artifact and performs no network access or URL fetching. URL-derived units retain human-readable evidence and may carry structured evidence_refs for precise timestamped citations. Produced by the lecture_mapping (consilium) stage; the required 'lectures' array merges deterministically across slots (concat + JSON-identity dedupe), the required 'coverage' scalar resolves via the declared fan_in resolution.",
+      "required": ["lectures", "coverage"],
+      "properties": {
+        "coverage": { "type": "string", "description": "What was mapped vs. what remains unknown across the assigned source slice (deterministic first-slot synthesis of the parallel contributions)." },
+        "lectures": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "title", "source_id", "evidence"],
+            "properties": {
+              "id": { "type": "string", "description": "Stable unit id (e.g. lecture-01-unit-3)." },
+              "title": { "type": "string", "description": "Short title of the mapped unit." },
+              "source_id": { "type": "string", "description": "Intake source id this unit was mapped from." },
+              "evidence": { "type": "string", "description": "Quoted transcript/source evidence with timecode where available — required, entries without evidence are rejected." },
+              "evidence_refs": {
+                "type": "array",
+                "description": "Structured citations for URL-derived units. Each ref must point to a normalized acquisition evidence segment; timestamps are finite with end_seconds strictly greater than start_seconds. Existing human-readable evidence remains required for compatibility.",
+                "items": {
+                  "type": "object",
+                  "required": ["evidence_id", "source_id", "location", "quote", "start_seconds", "end_seconds"],
+                  "properties": {
+                    "evidence_id": { "type": "string", "description": "lecture_acquisition.evidence.evidenceId." },
+                    "source_id": { "type": "string", "description": "lecture_acquisition sourceSet item id." },
+                    "location": { "type": "string", "description": "Canonical source URL." },
+                    "quote": { "type": "string", "description": "Bounded quoted evidence retained alongside the readable evidence field." },
+                    "start_seconds": { "type": "number", "minimum": 0, "description": "Finite segment start in seconds." },
+                    "end_seconds": { "type": "number", "minimum": 0, "description": "Finite segment end in seconds; must be strictly greater than start_seconds." }
+                  }
+                }
+              },
+              "claims": { "type": "array", "items": { "type": "string" }, "description": "Claims made in this unit." },
+              "concepts": { "type": "array", "items": { "type": "string" }, "description": "Key concepts covered." },
+              "uncertainty": { "type": "string", "description": "What is unknown/ambiguous in this unit." }
+            }
+          }
+        },
+        "gaps": { "type": "array", "items": { "type": "string" }, "description": "Sources or segments that could not be mapped, and why." },
+        "sources_consulted": { "type": "array", "items": { "type": "string" }, "description": "Intake source ids actually mapped (mergeable by fan-in)." }
+      }
+    },
+    "lecture_candidates": {
+      "type": "object",
+      "description": "Synthesized, deduplicated candidate findings produced by the synthesis (single analyst) stage. Each candidate is grounded in quoted evidence sources and records its dedupe/conflict history.",
+      "required": ["candidates"],
+      "properties": {
+        "candidates": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "topic", "evidence_sources", "conflicts"],
+            "properties": {
+              "id": { "type": "string", "description": "Stable candidate id (e.g. candidate-1)." },
+              "topic": { "type": "string", "description": "One synthesized finding: a deduped claim/insight grounded in the mapped lectures." },
+              "evidence_sources": {
+                "type": "array",
+                "minItems": 1,
+                "description": "Provenance: every claim is backed by these intake sources.",
+                "items": {
+                  "type": "object",
+                  "required": ["source_id", "evidence"],
+                  "properties": {
+                    "source_id": { "type": "string", "description": "Intake source id providing this evidence." },
+                    "evidence": { "type": "string", "description": "Quoted evidence / timecode backing this candidate." }
+                  }
+                }
+              },
+              "conflicts": {
+                "type": "array",
+                "description": "Dedupe/conflict record: overlapping claims merged here, disagreements listed with the winning source and the losing sources — never discarded silently. Empty array when no conflicts arose.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "claim": { "type": "string", "description": "The disputed claim." },
+                    "winner": { "type": "string", "description": "source_id that won the disagreement." },
+                    "losers": { "type": "array", "items": { "type": "string" }, "description": "source_ids whose versions lost." }
+                  }
+                }
+              },
+              "relevance": { "type": "string", "description": "Why this candidate matters for the intake task question." }
+            }
+          }
+        },
+        "deduped_count": { "type": "integer", "description": "Number of mapping units merged away during synthesis." }
+      }
+    },
+    "lecture_repo_fit": {
+      "type": "object",
+      "description": "Read-only repo-fit plus security/IP review of the candidates. Produced by the repo_fit (consilium) stage; the required 'findings' array merges deterministically across slots. Verdict is an optional per-slot summary — the approval stage is the authoritative decision point.",
+      "required": ["findings"],
+      "properties": {
+        "findings": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Repo-fit/security/IP findings, each grounded in observable evidence.",
+          "items": {
+            "type": "object",
+            "required": ["title", "category", "evidence"],
+            "properties": {
+              "title": { "type": "string", "description": "Short finding title." },
+              "category": { "enum": ["repo_fit", "mismatch", "security", "ip", "gap"], "description": "repo_fit = claim matches the codebase; mismatch = claim contradicts it; security/ip = review findings; gap = claim with no repo anchor." },
+              "evidence": { "type": "string", "description": "Concrete observable evidence: quoted source evidence, commit hash, file path, symbol." },
+              "files": { "type": "array", "items": { "type": "string" }, "description": "Repo file paths the finding cites." },
+              "symbols": { "type": "array", "items": { "type": "string" }, "description": "Repo symbols/APIs the finding cites." },
+              "commits": { "type": "array", "items": { "type": "string" }, "description": "Commit hashes the finding cites." },
+              "severity": { "enum": ["info", "warning", "critical"] }
+            }
+          }
+        },
+        "verdict": { "enum": ["fit", "needs_rework", "rejected"], "description": "Optional per-slot summary verdict; not a gate input." },
+        "unverified_claims": { "type": "array", "items": { "type": "string" }, "description": "Candidate claims the repository neither supports nor refutes." }
+      }
+    },
+    "lecture_decision": {
+      "type": "object",
+      "description": "Explicit human decision on the research findings, produced by the approval (orchestrator) stage. The approval gate completes for either an explicit 'approved' or 'rejected' verdict — both are terminal research outcomes and neither launches implementation. This workflow is research-only and never implements.",
+      "required": ["verdict"],
+      "properties": {
+        "verdict": { "enum": ["approved", "rejected"], "description": "Explicit decision. Gate: approval stage completes on 'approved' or 'rejected' — both terminal, neither starts implementation." },
+        "rationale": { "type": "string", "description": "Why approved/rejected (user words, or the documented autonomous decision)." },
+        "approved_candidates": { "type": "array", "items": { "type": "string" }, "description": "Candidate ids accepted for any follow-up." },
+        "next_steps": { "type": "array", "items": { "type": "string" }, "description": "Notes for a future, separately-classified slice — never started by this workflow." }
       }
     }
   }

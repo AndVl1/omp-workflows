@@ -50,18 +50,24 @@ durable automated tests.
     For each criterion record concrete evidence. Check for regressions in adjacent flows.
 
     Produce the `manual_qa` artifact (schema `manual_qa`):
-    - verdict: PASS only if every criterion was observed working at runtime
+    - verdict: PASS only if every acceptance criterion was observed working at runtime
+    - verdict: CONDITIONAL only when deterministic/runtime checks produced real evidence but one or more required criteria are unavailable because of an explicit capability, credential, or configuration blocker
+    - verdict: FAIL for an observed failure; missing or unknown remains fail-closed
     - mode: ui | runtime
     - evidence: array of concrete observations (screenshot+what's visible, or curl+response+logs)
+    - blocked_prerequisites: for CONDITIONAL, identify each unavailable criterion and its blocker; never include secrets, raw provider/media data, or fabricated positive live evidence
     - regressions: anything pre-existing that broke (empty if none)
-    - dod_additions: acceptance criteria to append to dod.json (source: manual_qa)"
+    - dod_additions: acceptance criteria to append to dod.json (source: manual_qa)
    ```
 
 2. Write `.work-state/artifacts/manual_qa.json`.
 
 **Gate** (`manual_qa.verdict != FAIL`): a `FAIL` verdict blocks progress — loop back to
-`review_fixes`/implementation with the failing evidence, or escalate to the user. A missing
-verdict is treated as FAIL (never auto-pass).
+`review_fixes`/implementation with the failing evidence, or escalate to the user. `PASS`
+requires all acceptance criteria to be observed at runtime. `CONDITIONAL` is terminal only
+when the runtime/deterministic evidence is real and an explicit capability, credential, or
+configuration blocker makes one or more required criteria unobservable; preserve that blocker
+in `blocked_prerequisites`. A missing or unknown verdict is treated as FAIL (never auto-pass).
 
 **Feeds**: `qa_tests` consumes `manual_qa.evidence`; `summary` consumes the verdict.
 

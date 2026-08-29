@@ -42,7 +42,7 @@ const MAX_WORKFLOW_LABEL_LENGTH = 64;
 const SAFE_CTO_ID_RE = /^[A-Za-z0-9._-]+$/;
 const SAFE_WORKFLOW_LABEL_RE = /^[A-Za-z0-9_-]+$/;
 
-const TASK_TYPES: readonly TaskType[] = ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"];
+const TASK_TYPES: readonly TaskType[] = ["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "LECTURE_RESEARCH", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"];
 const COMPLEXITIES: readonly Complexity[] = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"];
 const CONFIDENCES: readonly Confidence[] = ["HIGH", "MEDIUM", "LOW"];
 

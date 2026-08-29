@@ -543,6 +543,8 @@ test("do-work: full-feature stages carry resolved agents, original roles, and de
 
     const manualQa = report.stages.find((s) => s.id === "manual_qa");
     assert.equal(manualQa?.gate, "manual_qa.verdict != FAIL");
+    const qaTests = report.stages.find((s) => s.id === "qa_tests");
+    assert.equal(qaTests?.gate, "manual_qa.verdict != FAIL || !scope.has_runtime");
 
     // Stages that declare none of the metadata keep every field absent.
     assert.equal(exploration?.description, undefined);
@@ -731,7 +733,7 @@ test("do-work: profile-backed stages carry a bounded reconstructed promptPreview
     assert.ok(qa.promptPreview!.includes("agents: qa"), "resolved agent/role present");
     assert.ok(qa.promptPreview!.includes("inputs: manual_qa, implementation, architecture"), "declared inputs");
     assert.ok(qa.promptPreview!.includes("outputs: qa_tests"), "declared outputs");
-    assert.ok(qa.promptPreview!.includes("gate: manual_qa.verdict == PASS"), "profile gate metadata");
+    assert.ok(qa.promptPreview!.includes("gate: manual_qa.verdict != FAIL || !scope.has_runtime"), "profile gate metadata");
     assert.ok(qa.promptPreview!.length <= 4096, "normal-size preview stays within the strict cap");
 
     // Pool stage: preview makes no agent claim (roster_policy selection is

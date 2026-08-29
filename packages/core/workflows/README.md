@@ -61,11 +61,12 @@ OR `match.complexity` is absent).
 4. `standard`
 5. `lightweight`
 6. `research`
-7. `product-discovery`
-8. `spec-preparation`
-9. `feature-regression`
-10. `review`
-11. `emergency`
+7. `lecture-research`
+8. `product-discovery`
+9. `spec-preparation`
+10. `feature-regression`
+11. `review`
+12. `emergency`
 
 Resulting table (every Type × Complexity resolves):
 
@@ -76,6 +77,7 @@ Resulting table (every Type × Complexity resolves):
 | OPS | lightweight | standard | standard | standard |
 | BUG_FIX | bug-fix | debug-cycle | debug-cycle | debug-cycle |
 | INVESTIGATION | research | research | research | research |
+| LECTURE_RESEARCH | lecture-research | lecture-research | lecture-research | lecture-research |
 | REVIEW | review | review | review | review |
 | HOTFIX | emergency | emergency | emergency | emergency |
 | SPEC | spec-preparation | spec-preparation | spec-preparation | spec-preparation |
@@ -105,8 +107,75 @@ of complexity (the diagnostics ↔ manual-qa loop is how a hypothesis is formed 
   completeness gate. Its intake stage optionally consumes `product_spec` as approved product
   context; the absence of that artifact never blocks a standalone SPEC.
 
+**Dedicated research intent:** `LECTURE_RESEARCH` (one public video/playlist URL plus a
+natural-language prompt) is a first-class type DISTINCT from generic `INVESTIGATION` →
+`research`. The URL is the only user content prerequisite: no transcript, captions, recording,
+notes, or media file is requested. It resolves to `lecture-research` at EVERY complexity and
+autonomy and is never routed to an implementation profile (research-only, human approval gate).
+
 This table is mirrored in `hooks/validate-state.sh` (P5) — the classification gate blocks
 launching agents if `team-state.json`'s `workflow` does not match its `classification`.
+
+## Lecture research workflow (`lecture-research`)
+
+Dedicated URL-first, research-only profile for semantic type `LECTURE_RESEARCH`. It turns one
+public video/playlist URL plus a natural-language prompt into bounded, evidence-grounded,
+verifiable findings — **never into code**. Provider/API setup is owned by the consumer that
+registers `lecture_acquire`; core declares the boundary and does not fetch URLs.
+
+**Deterministic resolution.** `resolveWorkflow("LECTURE_RESEARCH", <any complexity>, <any
+autonomous>) === "lecture-research"` — one profile for the whole type, regardless of complexity
+or autonomy. It is a first-class intent DISTINCT from generic `INVESTIGATION` → `research` and
+ends at an explicit human approval gate.
+
+**Stages** (the exact stage list, gates and checkpoint definitions live in
+`lecture-research.json`):
+
+1. **URL-first intake** (orchestrator) — extract exactly one public video/playlist URL and the
+   non-empty research prompt. Record `lecture_intake` with acquisition-pending provenance. Do not
+   ask for a transcript or other source material; no network access or summarization yet.
+2. **Automatic acquisition** (orchestrator) — invoke the consumer-provided main-session
+   `lecture_acquire` tool and persist `lecture_acquisition`. The tool resolves bounded sources,
+   normalizes timestamped evidence, and preserves failures. Only `succeeded` or evidence-bearing
+   `partial` acquisition advances; failed/missing acquisition stops the workflow.
+3. **Lecture mapping** (consilium, bounded parallel roster) — consume only normalized
+   `lecture_acquisition` evidence; **perform no network access, URL fetching, or provider calls**.
+   Every URL-derived unit retains human-readable evidence and adds structured `evidence_refs`
+   (source, canonical location, quote, start/end timestamps). Produces `lecture_mapping`.
+4. **Synthesis & dedupe** (single `analyst`) — merge overlapping claims across sources, record
+   conflicts explicitly with the winning source and losing sources/claims, and produce deduplicated
+   candidate findings. Preserve partial-acquisition failures and gaps. Produces `lecture_candidates`.
+5. **Repo fit & security review** (consilium, parallel, read-only) — `architect` checks candidate
+   claims against the codebase with concrete repo evidence; `security-tester` reviews security and
+   IP/licensing risks. No fixes or edits. Produces `lecture_repo_fit`.
+6. **Approval** (orchestrator, explicit human checkpoint) — pause, record the verdict, and complete
+   on either explicit `approved` or `rejected`. No implementation, task creation, or code work
+   starts before approval; approval never launches implementation. Produces `lecture_decision`.
+
+**Artifacts.** Every stage writes typed artifacts to `.work-state/artifacts/<id>.json` per
+`artifacts-schema.json`: URL intake, provider-neutral acquisition, evidence-grounded mapping,
+synthesis with conflicts, repo-fit/security findings, and the explicit decision. The profile
+never produces source code.
+
+**Acquisition boundary.** Core cannot auto-acquire by itself. A consumer must register
+`lecture_acquire` (or route direct `core.run()` orchestration through `LectureAcquisitionPort`).
+Provider credentials, rights, and API configuration are installation concerns, never task UX.
+If the tool/provider is unavailable, fail closed; do not ask the user to prepare a transcript.
+
+**Human gate.** Approval is the terminal decision point: the run waits for an explicit human
+decision before anything beyond findings is allowed. Neither decision path starts implementation —
+implementing an approved finding is a NEW task with its own classification, workflow, and DoD.
+
+**Entry points.** Both `/do-work` and `/cto` route through the same classification contract and
+matrix — there is no new slash command. `/do-work` classifies the task (PHASE-0 type
+`LECTURE_RESEARCH`), resolves the profile deterministically and walks it stage by stage. `/cto`
+resolves per-slice workflows from the same matrix: a `LECTURE_RESEARCH` slice is staffed with
+the profile's research-only roster — `analyst`, `tech-researcher`, `diagnostics` for the
+parallel lecture mapping, then `architect` + `security-tester` for the read-only repo-fit and
+security review — keeps provenance/timecoded evidence, and ends at the human approval gate — no
+implementation before approval. Both surfaces resolve the current stage through the opaque
+workflow-tools contract (`resolveWorkflowContract` / `resolveStageInstructions`), which
+validates persisted state, profile hash and dispatch capability before any stage runs.
 
 ## Interpreter contract (how `/team` walks a profile)
 

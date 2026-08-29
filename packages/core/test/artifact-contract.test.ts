@@ -44,12 +44,84 @@ function state(overrides: Partial<TeamState> = {}): TeamState {
 
 test("artifact contract: shipped schema registry covers every workflow artifact id", () => {
   const schemas = loadArtifactSchemas();
-  for (const id of ["discovery", "exploration", "clarifications", "architecture", "diagnosis", "implementation", "debug", "review", "summary", "manual_qa", "qa_tests", "feature_spec", "dod", "cto_discovery", "team_plan", "team_artifacts", "integration_review"]) {
+  for (const id of ["discovery", "exploration", "clarifications", "architecture", "diagnosis", "implementation", "debug", "review", "summary", "manual_qa", "qa_tests", "feature_spec", "dod", "cto_discovery", "team_plan", "team_artifacts", "integration_review", "lecture_acquisition"]) {
     assert.ok(schemas[id], `schema for '${id}' must exist`);
   }
   assert.deepEqual(requiredFieldsOf("implementation"), ["files_touched"]);
   assert.deepEqual(requiredFieldsOf("debug"), ["verdict", "iterations"]);
   assert.equal(requiredFieldsOf("regression_intake"), null, "ids without a schema definition are unconstrained");
+});
+
+test("artifact contract: lecture acquisition failure collections remain draft-07 arrays", () => {
+  const schema = loadArtifactSchemas()["lecture_acquisition"] as {
+    properties: Record<string, { properties?: Record<string, { type?: string }> }>;
+  };
+  assert.equal(schema.properties.sourceSet?.properties?.failures?.type, "array");
+  assert.equal(schema.properties.failures?.type, "array");
+});
+
+test("artifact contract: manual_qa requires evidence and explained CONDITIONAL blockers", () => {
+  const pass = validateProducedArtifact("manual_qa", {
+    verdict: "PASS",
+    mode: "runtime",
+    evidence: ["focused runtime checks passed"],
+  });
+  assert.deepEqual(pass, { ok: true }, "PASS with evidence is valid");
+
+  const conditional = validateProducedArtifact("manual_qa", {
+    verdict: "CONDITIONAL",
+    mode: "runtime",
+    evidence: ["deterministic preflight passed; live provider unavailable"],
+    blocked_prerequisites: ["provider credential is not configured"],
+    regressions: [],
+  });
+  assert.deepEqual(conditional, { ok: true }, "CONDITIONAL requires and accepts a concrete blocker");
+
+  const fail = validateProducedArtifact("manual_qa", {
+    verdict: "FAIL",
+    mode: "runtime",
+    evidence: ["runtime check failed"],
+  });
+  assert.deepEqual(fail, { ok: true }, "FAIL remains a valid observed verdict; workflow gates block it");
+
+  for (const verdict of ["PASS", "CONDITIONAL", "FAIL"] as const) {
+    const emptyEvidence = validateProducedArtifact("manual_qa", { verdict, evidence: [] });
+    assert.equal(emptyEvidence.ok, false, `${verdict} with empty evidence must fail closed`);
+    if (!emptyEvidence.ok) assert.ok(emptyEvidence.issues.some((issue) => issue.field === "$.evidence"));
+  }
+
+  const conditionalWithoutBlockers = validateProducedArtifact("manual_qa", {
+    verdict: "CONDITIONAL",
+    evidence: ["deterministic checks passed"],
+  });
+  assert.equal(conditionalWithoutBlockers.ok, false, "an unexplained CONDITIONAL must not pass");
+  if (!conditionalWithoutBlockers.ok) {
+    assert.ok(conditionalWithoutBlockers.issues.some((issue) => issue.field === "$.blocked_prerequisites"));
+  }
+
+  const conditionalWithEmptyBlocker = validateProducedArtifact("manual_qa", {
+    verdict: "CONDITIONAL",
+    evidence: ["deterministic checks passed"],
+    blocked_prerequisites: ["  "],
+  });
+  assert.equal(conditionalWithEmptyBlocker.ok, false, "a whitespace-only blocker does not explain CONDITIONAL");
+
+  const conditionalWithTypedBlocker = validateProducedArtifact("manual_qa", {
+    verdict: "CONDITIONAL",
+    evidence: ["deterministic checks passed"],
+    blocked_prerequisites: [42],
+  });
+  assert.equal(conditionalWithTypedBlocker.ok, false, "blocked_prerequisites must be a typed string array");
+
+  const missingVerdict = validateProducedArtifact("manual_qa", { evidence: ["observed"] });
+  assert.equal(missingVerdict.ok, false, "missing verdict remains fail closed");
+
+  const unknown = validateProducedArtifact("manual_qa", {
+    verdict: "MAYBE",
+    evidence: ["unknown verdict must fail closed"],
+  });
+  assert.equal(unknown.ok, false);
+  if (!unknown.ok) assert.match(unknown.issues[0]!.message, /not one of/);
 });
 
 test("artifact contract: valid produced artifacts pass; invalid block with field diagnostics", () => {
@@ -143,6 +215,26 @@ test("artifact contract: consumed artifacts are prevalidated; present-but-invali
       assert.match(invalid.error, /exploration/);
       assert.match(invalid.error, /expected type array/);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("artifact contract: consumed manual_qa enforces CONDITIONAL blocker semantics", () => {
+  const root = mkdtempSync(join(tmpdir(), "ac-manual-qa-"));
+  try {
+    const artifactsDir = join(root, "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    const profile = loadProfile("full-feature");
+    assert.ok(profile);
+    writeFileSync(join(artifactsDir, "manual_qa.json"), JSON.stringify({
+      verdict: "CONDITIONAL",
+      evidence: ["deterministic checks passed"],
+    }));
+    const stage: StageDef = { id: "qa_tests", title: "QA", type: "single", role: "qa", consumes: ["manual_qa"] };
+    const result = validateConsumedArtifacts(stage, artifactsDir, state(), profile);
+    assert.equal(result.ok, false, "an unexplained CONDITIONAL must block consuming stages");
+    if (!result.ok) assert.match(result.error, /blocked_prerequisites/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
