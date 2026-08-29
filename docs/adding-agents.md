@@ -108,23 +108,76 @@ task, advisor) — знание OMP-харнесса; core OMP-agnostic. Есл�
 
 ## 4. Регистрация workflow
 
-`registerTeamWorkflow(pi, opts)` из core подключает движок стадий, гейты
-и observability. Опции (`RegisterOptions`, `core/src/index.ts:28-41`):
+У workflow-бандла три независимых слоя. `registerTeamWorkflow` подключает
+гейты, observability и seed-if-absent runtime config, но сам по себе **не**
+регистрирует ни `workflow_*` tools, ни slash-команды:
 
 ```typescript
+import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { registerTeamWorkflow } from "@andvl1/omp-workflows-core";
+import {
+  createWorkflowToolAdapter,
+  registerTeamWorkflow,
+  registerWorkflowCommands,
+  type WorkflowOwnerIdentity,
+} from "@andvl1/omp-workflows-core";
+
+const BUNDLE_ID = "@acme/omp-workflows-rust";
+
+// Реализация должна брать cwd из session context/sessionManager и никогда не
+// подменять отсутствующее значение на process.cwd().
+const resolveSessionCwd = (ctx: unknown): string | undefined => {
+  if (!ctx || typeof ctx !== "object") return undefined;
+  const value = (ctx as { cwd?: unknown }).cwd;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+};
+
+const ownerForCwd = (cwd: string): WorkflowOwnerIdentity => ({
+  owner_id: BUNDLE_ID,
+  bundle_id: BUNDLE_ID,
+  owner_kind: "rust",
+  activation_marker: "omp-rust",
+  host_range: ">=18 <19",
+  provenance: {
+    package: BUNDLE_ID,
+    entrypoint: "dist/index.js",
+    cwd,
+    config_path: join(cwd, ".omp", "team.config.json"),
+  },
+});
 
 export default function (pi: ExtensionAPI) {
-  registerTeamWorkflow(pi, {
-    label: "omp-workflows-rust",
+  const registration = {
+    label: BUNDLE_ID,
     roles: { /* workflow-роль → имя агента */ },
     scopeMap: [ /* glob → scope + dev_agent */ ],
     flags: { /* флаг → glob-список */ },
     designSystem: null,
+    resolveCwd: resolveSessionCwd,
+    owner: ownerForCwd,
+  };
+
+  registerTeamWorkflow(pi, registration);
+
+  createWorkflowToolAdapter({
+    resolveCwd: resolveSessionCwd,
+    owner: ownerForCwd,
+    // Вернуть свежий AgentMappingState; ошибка должна блокировать begin.
+    beforeBegin: refreshAndReturnLiveAgentMapping,
+  }).register(pi);
+
+  registerWorkflowCommands(pi, {
+    resolveCwd: resolveSessionCwd,
+    owner: ownerForCwd,
   });
 }
 ```
+
+Все три вызова используют один owner identity. Core разрешает ровно одного
+владельца на canonical worktree для `workflow_registration`,
+`workflow_tools` и `config_writer`; другой bundle получает `owner_conflict`.
+Полная замена поэтому делается отключением старого extension, а не ставкой на
+порядок загрузки двух bundles.
 
 ### roles — маппинг workflow-ролей на агентов
 
@@ -207,11 +260,46 @@ flags: {
 
 ## 5. Slash-команды
 
-Два пути:
+### Extension-команды — основной workflow surface
 
-### Custom-TS команды (как fullstack `/omp-model-roles`)
+`registerWorkflowCommands` регистрирует `/do-work`, `/team` и `/cto` через
+`ExtensionAPI.registerCommand`. Handler:
 
-Файл `.omp/commands/<name>/index.ts` (или в `commands/` пакета + bootstrap):
+1. один раз определяет session cwd;
+2. проверяет owner claim;
+3. строит workflow prompt;
+4. отправляет его через `pi.sendUserMessage`.
+
+Команда не спавнит субагента напрямую: prompt проходит обычные
+`before_agent_start` / `context` hooks, затем resident main agent вызывает
+`workflow_*` tools активного owner.
+
+Для безопасного сосуществования bundles используй namespace:
+
+```typescript
+registerWorkflowCommands(pi, {
+  commandPrefix: "rust",
+  resolveCwd: resolveSessionCwd,
+  owner: ownerForCwd,
+  buildDoWorkPrompt: buildRustDoWorkPrompt, // optional; do-work + team
+});
+```
+
+Это публикует `/rust-do-work`, `/rust-team`, `/rust-cto`. `namespace` —
+legacy-алиас `commandPrefix`. Для полного изменения CTO prompt отдельного
+builder option нет: регистрируй собственную extension-команду либо добавляй
+инструкции через hooks.
+
+Поздний extension может заменить handler с тем же именем в command map OMP,
+но это **не** передаёт ему workflow capabilities. Если его handler использует
+другой owner, выполнение блокируется `owner_conflict` до отправки prompt.
+Надёжная полная замена — не загружать исходный bundle; частичное
+сосуществование — использовать `commandPrefix`.
+
+### Custom-TS команды
+
+Файл `.omp/commands/<name>/index.ts` подходит для уникальных вспомогательных
+команд (`/init-team`, `/session-report` и т.п.) и старых runtimes:
 
 ```typescript
 import type { CustomCommand, CustomCommandAPI } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/types";
@@ -227,25 +315,23 @@ const factory = (_api: CustomCommandAPI): CustomCommand => ({
 export default factory;
 ```
 
-Omp находит их из `<cwd>/.omp/commands/<name>/index.ts` на старте сессии.
-Extension-пакет копирует свои команды через `copy-commands` (см. fullstack
-`src/copy-commands.ts` + `postinstall`).
+Зарегистрированная extension-команда имеет приоритет над одноимённой
+project-local custom-TS копией. Поэтому правка
+`.omp/commands/do-work|team|cto` не является override API.
 
-### Extension-хуки (`before_agent_start`, `input`, ...)
+### Extension-хуки (`before_agent_start`, `context`, ...)
 
-В `src/index.ts` бандла:
+Если нужно дополнить стандартный prompt, не копируя command handler:
 
 ```typescript
 pi.on("before_agent_start", (event) => {
-  // детект маркера, инжект developer-инструкции — см. fullstack
-  // src/before-agent-start-marker.ts (strict recommendations, vp9)
+  // Инжект project policy/context; стандартный workflow prompt уже проходит
+  // через normal OMP lifecycle.
 });
 ```
 
-`HookCommandContext` (custom-TS) НЕ имеет `task`-тула — команды не могут
-спавнить субагентов сами. Для гарантированной делегации из команды —
-паттерн маркер + `before_agent_start` hook (developer-attributed сообщение),
-как в `/omp-model-roles recommendations`.
+`HookCommandContext` custom-TS команды не имеет `task`-тула. Гарантированную
+делегацию выполняет resident main agent после получения prompt.
 
 ---
 
@@ -257,9 +343,14 @@ npm run typecheck && npm run build && npm test
 
 - Команда `validate` своего бандла должна проверить: frontmatter каждого
   агента (name/description/tools/model), модель-роли из `modelRoles` юзера,
-  отсутствие коллизий с `BUILTIN_ROLES`, инвентарь моделей.
-- Live-smoke: `omp -p "/my-cmd validate"` в scratch-проекте с
-  `node_modules/@andvl1/omp-workflows-<bundle>` (npm link на монорепо).
+  отсутствие коллизий с `BUILTIN_ROLES`, live mapping и владельцев всех трёх
+  workflow capabilities.
+- Slash inventory должен содержать ровно выбранный surface (bare либо
+  namespaced); same-name handler другого owner обязан fail-closed дать
+  `owner_conflict`.
+- Live-smoke: штатная workflow-команда должна пройти
+  `workflow_prepare → workflow_instructions → workflow_begin`; отдельная
+  `validate`-команда проверяет mapping/owner без изменения canonical state.
 
 ---
 
@@ -267,16 +358,18 @@ npm run typecheck && npm run build && npm test
 
 ```
 omp-workflows-rust/
-├── package.json          # files: ["dist", "agents", "commands", "README.md"]
+├── package.json          # omp.extensions: ["./dist/index.js"]
 ├── src/
-│   └── index.ts          # registerTeamWorkflow(pi, { label, roles, scopeMap, flags })
+│   ├── index.ts          # workflow + tool adapter + slash commands, один owner
+│   ├── identity.ts       # WorkflowOwnerIdentity для canonical cwd
+│   └── agent-mapping.ts  # live discovery → AgentMappingState
 ├── agents/
 │   ├── rust-architect.md
 │   ├── rust-developer.md
 │   └── rust-qa.md
-├── commands/
+├── commands/             # только уникальные auxiliary custom-TS команды
 │   └── rust-model-roles/
-│       ├── index.ts      # CustomCommand (validate + рекомендации)
+│       ├── index.ts      # validate + рекомендации
 │       └── _roles.ts     # RUST_MODEL_ROLES: ModelRoleEntry[]
 └── tsconfig.json
 ```

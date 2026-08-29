@@ -20,32 +20,43 @@ On `omp plugin install`, `session_start` performs a SHA-256-aware compatibility 
 
 ## What it does
 
-`@andvl1/omp-workflows-fullstack` is a thin wrapper that calls `registerTeamWorkflow(pi, opts)` with the fullstack defaults:
+`@andvl1/omp-workflows-fullstack` composes three separate core seams with one
+fullstack owner identity:
 
-```typescript
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import {
-  defaultFullstackFlags,
-  defaultFullstackModelRoles,
-  defaultFullstackRoles,
-  defaultFullstackScopeMap,
-  registerTeamWorkflow,
-} from "@andvl1/omp-workflows-core";
+1. `registerTeamWorkflow(...)` — gates, observability, and seed-if-absent
+   runtime configuration;
+2. `createWorkflowToolAdapter(...).register(pi)` — the `workflow_*` tools and
+   live agent-mapping handoff;
+3. `registerWorkflowCommands(pi)` — `/do-work`, `/team`, and `/cto`.
 
-export default function (pi: ExtensionAPI) {
-  registerTeamWorkflow(pi, {
-    label: "omp-workflows-fullstack",
-    roles: defaultFullstackRoles,
-    scopeMap: defaultFullstackScopeMap,
-    flags: defaultFullstackFlags,
-  });
-}
-```
+Calling `registerTeamWorkflow` alone does **not** publish the slash commands or
+the workflow tool adapter. A custom bundle must wire all three layers; see
+[`../../docs/adding-agents.md`](../../docs/adding-agents.md#4-регистрация-workflow).
 
-The taxonomy that backs the bundled `/omp-model-roles validate` command (`defaultFullstackModelRoles`,
-14 entries) is imported from `@andvl1/omp-workflows-core` so any other bundle can compose the same
-helpers (`resolveRoleChain`, `isResearchRequest`, `isResearchResponse`) against its own `ModelRoleEntry[]`.
-The extension registers the workflow gates, writes `.omp/team.config.json`, and registers `/do-work`, `/team`, and `/cto` as authoritative extension commands. Their prompts still pass through OMP's normal user-message lifecycle, so external `before_agent_start`/`context` hooks continue to run. The `commands/` adapters remain the compatibility path for runtimes that only discover custom-TS files from disk; same-name project files are not an override API.
+The command handlers resolve and authorize the session cwd, generate a prompt,
+and pass it to `pi.sendUserMessage(...)`. They do not spawn subagents directly.
+The prompt still traverses OMP's normal `before_agent_start` / `context`
+lifecycle before the resident main agent invokes the active owner's
+`workflow_*` tools.
+
+Command names and workflow ownership are independent. A later extension can
+replace a same-name handler in OMP's command map, but it does not replace the
+bundle holding `workflow_registration`, `workflow_tools`, or `config_writer`;
+an owner-aware handler from another bundle fails closed with `owner_conflict`.
+For a complete replacement, disable this bundle and load only the custom
+bundle. For coexistence, register a prefix such as `commandPrefix: "rust"`.
+
+The taxonomy that backs the bundled `/omp-model-roles validate` command
+(`defaultFullstackModelRoles`, 14 entries) is imported from
+`@andvl1/omp-workflows-core` so another bundle can compose the same helpers
+(`resolveRoleChain`, `isResearchRequest`, `isResearchResponse`) against its own
+`ModelRoleEntry[]`.
+
+The extension writes `.omp/team.config.json` only when it is absent. Editing
+that file changes role/scope/roster resolution without replacing commands.
+The `commands/` adapters remain a compatibility path for runtimes that only
+discover custom-TS files from disk; same-name project files are not an override
+API.
 
 The `agents/` and `skills/` directories are picked up by OMP's discovery automatically.
 

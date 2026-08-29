@@ -124,7 +124,7 @@ omp-workflows-monorepo/
 │   │   ├── src/
 │   │   │   ├── commands/     # do-work, CTO, shared command contracts
 │   │   │   ├── runtime-config.ts
-│   │   │   └── index.ts      # public API: registerTeamWorkflow(pi, opts)
+│   │   │   └── index.ts      # public APIs: workflow, tool adapter, commands, ownership
 │   │   ├── workflows/        # generic declarative profiles + schemas
 │   │   ├── test/             # smoke + integration tests
 │   │   └── package.json
@@ -168,6 +168,54 @@ This repository activates a private, workspace-marker-gated bundle — `@andvl1/
 The namespaced descriptors publish eagerly during extension load (so slash autocomplete sees them), but they are marker-gated: outside a marked workspace the command resolver yields no cwd and the gated owner source refuses the claim, so session start and handlers register **zero** owners and never dispatch a workflow. Inside a marked workspace, `workflow_registration` is claimed first by the command layer and the engine then idempotently claims `workflow_registration`, `workflow_tools`, and `config_writer` under the single `private_omp` owner. Bare `/do-work`, `/team`, and `/cto` names are never registered by this bundle — they stay owned by the external fullstack plugin — and `omp-model-roles` is never shadowed.
 
 **Config ownership.** `.omp/team.config.json` maps roles onto the `omp-*` pool (project-local `regression-*` roles included, remapped onto the pool; custom external plugin agents such as `product-*` preserved verbatim). The engine seeds this file only if absent — user and `/init-team` edits are never overwritten by a session.
+
+### Command routing and consumer overrides
+
+Workflow entry points have two independent ownership layers:
+
+1. **OMP command registry** — maps a slash name to one extension handler. A later
+   extension registration can replace the handler for the same canonical name.
+2. **Workflow capability registry** — grants one bundle per canonical worktree
+   exclusive ownership of `workflow_registration`, `workflow_tools`, and
+   `config_writer`. A different bundle cannot replace that owner by registering
+   the same slash name; its owner-aware handler fails closed with
+   `owner_conflict`.
+
+The standard handlers do not spawn a subagent directly. They resolve and
+authorize the session cwd, build a workflow prompt, and call
+`pi.sendUserMessage(...)`. The prompt then passes through OMP's normal
+`before_agent_start` / `context` lifecycle, after which the resident main agent
+uses the active owner's `workflow_*` tools.
+
+| Setup | Canonical commands |
+|---|---|
+| Fullstack bundle only | `/do-work`, `/team`, `/cto` |
+| This marked monorepo | `/omp-do-work`, `/omp-team`, `/omp-cto`; `/omp-workflow-team validate` diagnoses the internal owner |
+| Two bundles that must coexist | Give each command surface a distinct `commandPrefix` |
+
+In this monorepo a separately installed fullstack extension may make the bare
+names visible in autocomplete, but those handlers are not a fallback for the
+active internal engine: their fullstack owner claim conflicts with the
+`private_omp` owner. Use the `/omp-*` surface here.
+
+Consumer choices:
+
+- Change agents without changing commands through `.omp/team.config.json`
+  (`roles`, `scope_map`, `flags`, `roster_overrides`).
+- Add a non-conflicting surface with
+  `registerWorkflowCommands(pi, { commandPrefix: "rust", ... })`, producing
+  `/rust-do-work`, `/rust-team`, and `/rust-cto`.
+- Fully replace the default bundle by loading only the custom extension and
+  wiring all three core seams: `registerTeamWorkflow`,
+  `createWorkflowToolAdapter(...).register(pi)`, and
+  `registerWorkflowCommands`. Do not load two different workflow owners and
+  depend on extension load order.
+- Augment the generated prompt with OMP hooks. Editing copied
+  `.omp/commands/do-work`, `team`, or `cto` adapters is not an override API.
+
+The complete custom-bundle recipe is in
+[`docs/adding-agents.md`](docs/adding-agents.md#4-регистрация-workflow).
+
 
 ## Usage
 
@@ -352,24 +400,11 @@ of that surface (see `hooks/types.ts:178-191`). For a real
 provider probe, run the agent and read its `Degraded Notices` block.
 
 
-```typescript
-// your-package/src/index.ts
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { registerTeamWorkflow } from "@andvl1/omp-workflows-core";
-
-const MY_ROLES = {
-  architect: "my-architect",
-  backend: "my-go-backend",
-  tester: "my-qa",
-};
-
-export default function (pi: ExtensionAPI) {
-  registerTeamWorkflow(pi, {
-    label: "my-team",
-    roles: MY_ROLES,
-  });
-}
-```
+For a custom bundle, do not treat `registerTeamWorkflow` as the complete
+extension entry point: it wires gates/config/observability, but not the
+`workflow_*` tools or slash commands. Compose all three seams under one owner
+identity as shown in
+[`docs/adding-agents.md`](docs/adding-agents.md#4-регистрация-workflow).
 
 ## Observability (v0.7.0+)
 
@@ -456,31 +491,14 @@ The orchestrator (the main agent driving the workflow) is a
 
 These rules are documented in the `/do-work` command prompt and injected
 into the stage prompt for every executor via `buildStagePrompt`.
-</input>
 
 ## Migration from `claude-plugin`
-</input>
 
-```typescript
-// your-package/src/index.ts
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { registerTeamWorkflow } from "@andvl1/omp-workflows-core";
-
-const MY_ROLES = {
-  architect: "my-architect",
-  backend: "my-go-backend",
-  tester: "my-qa",
-};
-
-export default function (pi: ExtensionAPI) {
-  registerTeamWorkflow(pi, {
-    label: "my-team",
-    roles: MY_ROLES,
-  });
-}
-```
-
-## Migration from `claude-plugin`
+A custom replacement for the fullstack bundle must own the complete workflow
+surface — gates/config, tool adapter, and commands — rather than calling only
+`registerTeamWorkflow`. Follow the
+[`custom-bundle registration recipe`](docs/adding-agents.md#4-регистрация-workflow)
+and disable the old bundle instead of relying on same-name command load order.
 
 Same data (JSON profiles, typed artifacts, agent names, skill names) — same `.work-state/` files. The interpretive prose (`commands/team.md`, 830 lines) is now TypeScript in `core/src/`. The bash hooks (`validate-state.sh`, `dod-gate.sh`, `safety-guard.sh`) are now event handlers in `core/src/gates/`. Documented in `vibe-report/omp-workflows-migration-2026-07-31.md`.
 
