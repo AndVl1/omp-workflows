@@ -110,6 +110,45 @@ As an existing user, I want JSON-only or interrupted specification runs handled 
 2. **Given** a legacy run that cannot be mapped safely, **When** migration is attempted, **Then** the workflow leaves the original data unchanged and reports the exact missing or incompatible information.
 3. **Given** a partially completed new workflow, **When** it resumes after interruption, **Then** previously approved artifacts and checkpoint decisions remain intact and no phase is duplicated.
 
+---
+
+### User Story 7 - Execute approved specifications through CTO mode (Priority: P2)
+
+As a developer with one or more approved feature specifications, I want CTO mode to execute their task graphs through parallel teams when safe, so coordinated implementation can scale without discarding specification decisions or traceability.
+
+**Why this priority**: The implementation handoff should be executor-neutral. CTO mode can add value for broad or multi-team work, but only if it preserves the approved contract and does not reinterpret or duplicate it.
+
+**Independent Test**: Give CTO mode two implementation-ready specifications containing both independent and dependent tasks, then verify that it validates the handoffs, presents a traceable team mapping for approval, runs only independent slices in parallel, and reports results against each original specification.
+
+**Acceptance Scenarios**:
+
+1. **Given** one or more explicitly selected implementation-ready feature workspaces, **When** CTO mode prepares a run, **Then** it validates their identity, current approvals, artifact versions, dependencies, and execution availability before creating a team plan.
+2. **Given** approved tasks with non-overlapping ownership and no dependency between them, **When** CTO mode decomposes the work, **Then** it may assign them to parallel team slices while preserving requirement, task, and verification links.
+3. **Given** tasks that share contracts, files, migrations, destructive steps, or ordering dependencies, **When** CTO mode decomposes the work, **Then** it establishes a shared contract or serial order before dispatch instead of forcing parallel execution.
+4. **Given** a proposed specification-to-team mapping, **When** CTO mode reaches plan confirmation, **Then** the user can review the selected specifications, frozen versions, team slices, dependencies, and parallelization decisions before any implementation worker starts.
+5. **Given** a selected workspace that is partial, stale, ambiguous, conflicting, or already being executed elsewhere, **When** CTO mode performs preflight, **Then** it dispatches no implementation work and reports the exact revision, selection, or ownership action required.
+6. **Given** a CTO execution wave completes or partially fails, **When** results are summarized, **Then** each outcome maps back to its specification requirements and tasks, failures remain isolated, and CTO mode does not rewrite specification approvals.
+
+---
+
+### User Story 8 - Prepare specifications through CTO mode (Priority: P3)
+
+As a user with several independent feature ideas or a broad initiative, I want CTO mode to coordinate specification preparation and return the resulting documents for my review, so research and drafting can proceed in parallel without creating a separate specification system.
+
+**Why this priority**: This is useful for portfolios of work, but it must reuse the standard specification workflow and preserve human approval rather than adding a second CTO-specific format or autonomous approval path.
+
+**Independent Test**: Ask CTO mode to prepare two independent specifications and one multi-facet specification, then verify that it creates standard feature workspaces, parallelizes only independent preparation, presents per-specification checkpoints to the user, and starts no implementation after final approval without a new explicit request.
+
+**Acceptance Scenarios**:
+
+1. **Given** several independent feature requests, **When** CTO mode prepares specifications, **Then** each request receives a distinct feature workspace and standard specification workflow; facets of the same feature remain in one workspace with coordinated contributors.
+2. **Given** CTO-coordinated preparation, **When** phase artifacts are produced, **Then** they use the same templates, selected language, validation rules, traceability, and durable state as directly invoked specification work.
+3. **Given** one or more prepared phase artifacts reach checkpoints, **When** CTO mode asks for review, **Then** it presents a readable review packet and records an explicit user decision for every specification and phase; neither CTO nor a team lead can approve on the user's behalf.
+4. **Given** the user approves some specifications and requests changes to others, **When** preparation resumes, **Then** only eligible specifications advance while revisions remain on their affected phase and re-enter validation.
+5. **Given** the Tasks phase receives final human approval, **When** specification preparation completes, **Then** CTO mode returns implementation-ready handoffs and waits; implementation requires a separate explicit CTO execution request or wave.
+6. **Given** a resident CTO run is already active, **When** new specification preparation is requested, **Then** it is folded into that single run when capacity and phase allow, or queued with a visible reason; a nested CTO is never created.
+7. **Given** one specification preparation slice fails or blocks, **When** other slices complete, **Then** completed specifications remain reviewable and the failed slice retains enough durable state for targeted resume.
+
 ### Edge Cases
 
 - Two features normalize to the same short name or the user starts the same feature twice.
@@ -126,6 +165,17 @@ As an existing user, I want JSON-only or interrupted specification runs handled 
 - Concurrent sessions attempt to revise or approve the same phase.
 - A nested specification run is already active when `/do-work` is invoked again.
 - Existing JSON contains secrets or untrusted text that must not be exposed unsafely in rendered documents.
+- The same specification is selected concurrently by `/do-work` and CTO mode, or by two CTO runs.
+- A specification changes after CTO plan confirmation but before or during execution.
+- Multiple specifications contain cross-feature dependencies, shared-file ownership, incompatible architecture decisions, or competing migration order.
+- A CTO run has reached its team cap, decomposition-depth cap, or integration phase when another specification is submitted.
+- A batched CTO review contains a mixture of approve-and-continue, request-changes, and approve-and-stop decisions.
+- Parallel specification preparation requests normalize to the same feature identity or target the same workspace.
+- CTO-coordinated specifications use different document languages while sharing an architecture contract.
+- A selected feature workspace belongs to another repository, resolves outside the authorized project root, or contains untrusted links.
+- A hard-human security, production, destructive, or migration decision appears inside a batched CTO review.
+- A CTO result attempts to mark specification approval, validation, or task completion without the corresponding specification-bound evidence.
+- A specification's required branch or worktree strategy conflicts with the active CTO run.
 
 ## Requirements *(mandatory)*
 
@@ -163,7 +213,27 @@ As an existing user, I want JSON-only or interrupted specification runs handled 
 - **FR-030**: Legacy JSON-only runs MUST be migrated deterministically when sufficient information exists, retain provenance, require fresh human approval, and preserve original data on migration failure.
 - **FR-031**: The redesign MUST preserve domain-agnostic workflow contracts and allow authorized workflow owners to supply templates and defaults without creating a second state machine or bypassing required gates.
 - **FR-032**: Runtime-facing command, checkpoint, state, artifact, and handoff behavior MUST be verifiable through the real plugin workflow, including successful, blocked, stale, resume, and migration paths.
-- **FR-033**: The final handoff MUST summarize approved scope, decisions, task order, validation status, open risks, selected language, and the exact next `/do-work` action in human-readable form.
+- **FR-033**: The final handoff MUST summarize approved scope, decisions, task order, validation status, open risks, selected language, supported execution choices, and the exact next user action in human-readable form.
+- **FR-034**: The implementation handoff MUST be executor-neutral so the user can explicitly select `/do-work` or CTO mode without changing the approved specification format or meaning.
+- **FR-035**: CTO mode MUST accept an explicit selection of one or more implementation-ready feature workspaces as input to a run or wave.
+- **FR-036**: Before CTO dispatch, every selected workspace MUST pass preflight for identity, current artifact versions, required approvals, validation, constitution compliance, dependencies, project boundary, and conflicting execution ownership.
+- **FR-037**: CTO plan confirmation MUST bind execution to exact approved artifact versions; a later semantic change MUST pause affected work and require revalidation and re-planning rather than silently changing the running contract.
+- **FR-038**: The CTO team plan MUST map every selected specification task to its originating requirements, assigned slice, team ownership, dependencies, and completion evidence.
+- **FR-039**: CTO mode MUST parallelize only slices whose dependency, ownership, worktree, and shared-contract constraints permit concurrent execution.
+- **FR-040**: Shared interfaces, migrations, destructive steps, and cross-specification dependencies MUST receive an approved common contract or explicit serial order before implementation dispatch.
+- **FR-041**: The user MUST explicitly confirm the specification-to-team mapping and parallelization plan before CTO mode starts implementation workers.
+- **FR-042**: CTO support MUST retain the single resident main-session CTO and existing CTO → lead → worker hierarchy; it MUST NOT spawn a nested CTO to prepare or execute specifications.
+- **FR-043**: A specification version MUST have at most one active execution owner; concurrent `/do-work` and CTO execution attempts MUST fail closed or queue without duplicate work.
+- **FR-044**: CTO execution results MUST preserve per-specification traceability and failure isolation and MUST NOT mutate human approvals or validation outcomes.
+- **FR-045**: CTO mode MUST be able to accept a specification-preparation request and coordinate the standard specification workflow as one or more bounded SPEC slices.
+- **FR-046**: Parallel specification preparation MUST use distinct feature identities and workspaces; multiple contributors to the same feature MUST converge into one standard workspace rather than competing documents.
+- **FR-047**: CTO-coordinated preparation MUST use the same templates, language resolution, validation, checkpoints, artifact versions, and implementation handoff as direct preparation.
+- **FR-048**: CTO and team leads MUST NOT authorize human checkpoints; CTO mode MUST fan in completed phase artifacts and obtain an explicit user decision for each specification and phase.
+- **FR-049**: A batched review MUST preserve per-specification decisions so approving one artifact never implies approval of another.
+- **FR-050**: Completing specification preparation through CTO mode MUST NOT start implementation automatically; execution requires a separate explicit request and a new or amended execution wave.
+- **FR-051**: CTO-coordinated preparation MUST isolate blocked or failed specifications while allowing independent completed specifications to reach user review and preserving resumable state for failures.
+- **FR-052**: Requests that exceed CTO team, depth, ownership, or active-phase limits MUST be queued or split with a visible reason rather than silently dropped or forced into the active wave.
+- **FR-053**: CTO support MUST reuse the shared implementation handoff and specification workflow contracts and MUST NOT introduce a CTO-specific specification format, duplicate state machine, or alternate approval semantics.
 
 ### Requirement Acceptance Map
 
@@ -179,6 +249,8 @@ As an existing user, I want JSON-only or interrupted specification runs handled 
 | FR-030 | User Story 6 scenarios 1–3 |
 | FR-031 | User Story 5 scenario 3 plus constitution-compliance validation |
 | FR-032–FR-033 | User Story 3 scenarios 1–4 and SC-010 |
+| FR-034–FR-044 | User Story 7 scenarios 1–6 |
+| FR-045–FR-053 | User Story 8 scenarios 1–7; User Story 7 scenarios 4–6 |
 
 ### Key Entities
 
@@ -188,9 +260,12 @@ As an existing user, I want JSON-only or interrupted specification runs handled 
 - **Validation Result**: A phase-specific set of passed and failed quality criteria, actionable findings, artifact version, and timestamp.
 - **Checkpoint Decision**: An attributable user choice to approve and continue, request changes, or approve and stop, bound to one validated artifact version.
 - **Traceability Link**: A relationship connecting a requirement to acceptance scenarios, plan decisions, tasks, and verification evidence.
-- **Implementation Handoff**: The current approved contract that allows `/do-work` to begin implementation without repeating specification work.
+- **Implementation Handoff**: The current approved, executor-neutral contract that allows `/do-work` or CTO mode to begin implementation without repeating specification work.
 - **Language Preference**: The selected document language, its source, and the artifact versions to which it applies.
 - **Legacy Specification Run**: Existing JSON-only or prior-format state that may be migrated but is never assumed approved merely because it completed under an older workflow.
+- **Execution Claim**: A durable, exclusive binding between one approved specification version and its active executor, preventing duplicate `/do-work` or CTO execution.
+- **CTO Specification Mapping**: The reviewed mapping from specification requirements and tasks to CTO teams, slices, dependencies, worktree strategy, and completion evidence.
+- **CTO Review Packet**: A readable fan-in of one or more phase artifacts with separate checkpoint decisions for every specification and phase.
 
 ### Reference-Informed Product Direction
 
@@ -199,6 +274,7 @@ As an existing user, I want JSON-only or interrupted specification runs handled 
 - Adopt Superpowers' practice of presenting reviewable chunks and requiring sign-off before deeper planning or execution.
 - Adopt XPowers' separation of planning, execution, review, and verification, with one canonical task handoff instead of parallel task sources.
 - Adopt BMAD's right-sized process: simple work avoids ceremony, while ambiguous or high-risk work receives deeper collaborative planning.
+- Keep the implementation handoff executor-neutral: CTO mode consumes or coordinates the same specification contract instead of creating a CTO-specific document hierarchy.
 - Do not adopt an implicit-only workflow, JSON-only user contract, universal heavyweight path, or any design where approval, continuation, and validation are inferred from free text.
 
 ## Success Criteria *(mandatory)*
@@ -215,6 +291,9 @@ As an existing user, I want JSON-only or interrupted specification runs handled 
 - **SC-008**: 100% of upstream revisions that change approved meaning either invalidate all affected downstream approvals or produce explicit evidence that no downstream dependency changed.
 - **SC-009**: 100% of compatible legacy fixtures migrate without data loss, and 100% of incompatible fixtures remain unchanged while producing actionable diagnostics.
 - **SC-010**: Across interrupted sessions and representative success, blocked, stale, resume, migration, and handoff cases, users receive the expected next action in 100% of acceptance tests and no invalid state begins implementation.
+- **SC-011**: In representative single- and multi-specification CTO runs, 100% of dispatched slices retain requirement and task traceability, all declared dependencies preserve their order, and every eligible independent slice can start without waiting for unrelated work.
+- **SC-012**: In CTO-coordinated preparation tests, 100% of outputs use standard feature workspaces and checkpoints, every approval is attributable to the user, and zero implementations start solely because specification preparation completed.
+- **SC-013**: Across concurrent executor, changed-version, ambiguous-workspace, team-cap, and cross-specification conflict scenarios, 100% of unsafe CTO dispatch attempts fail closed or queue with an actionable reason and produce no duplicate work.
 
 ## Assumptions
 
@@ -223,6 +302,9 @@ As an existing user, I want JSON-only or interrupted specification runs handled 
 - Explicit phase commands and checkpoint-driven continuation coexist: users may invoke each phase manually, while approve-and-continue provides a deliberate convenience path.
 - Human approval is required at all three phase boundaries for the full workflow; autonomous implementation does not imply autonomous specification approval.
 - The current project constitution remains authoritative, and every template and validation profile includes an explicit constitution-compliance check.
-- Existing workflow owners and command-registration boundaries remain in force; this feature changes the specification experience and `/do-work` handoff, not ownership semantics.
+- Existing workflow owners and command-registration boundaries remain in force; this feature changes the specification experience and shared execution handoff, not ownership semantics.
 - Research of Spec Kit, OpenSpec, Superpowers, XPowers, and BMAD informs planning, but the plugin keeps its own domain-agnostic, durable workflow engine rather than embedding another framework.
-- Bug-fix, emergency, research-only, CTO, and product-discovery workflows are outside this feature except where they intentionally invoke or consume the shared specification handoff contract.
+- Bug-fix, emergency, research-only, and product-discovery workflows are outside this feature except where they intentionally invoke or consume the shared specification handoff contract.
+- CTO support is deliberately contract-level: CTO mode may consume ready handoffs or coordinate the standard specification workflow, but ownership, escalation transport, team caps, decomposition depth, and the single-resident-CTO model remain unchanged.
+- The initial CTO support scope is one authorized repository and its worktrees; cross-repository specification stores and distributed execution are deferred.
+- CTO and leads remain coordinators that write only authorized workflow state and declared artifacts; specification documents are produced through the standard phase workers into their declared feature workspaces.

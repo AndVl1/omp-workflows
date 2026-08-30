@@ -34,3 +34,6 @@
 - Validation iteration 1 found two issues: requirement acceptance evidence was implicit, and SC-010 described a runtime verification method rather than a user-visible outcome.
 - Added the Requirement Acceptance Map and rewrote SC-010 as a measurable user outcome.
 - Validation iteration 2 passed all checklist items. Product command names, feature workspaces, and document formats are retained only where they are observable user-facing contracts.
+- Validation iteration 3 added contract-level CTO support after reviewing the current CTO profile, main-session orchestration contract, amend behavior, team limits, and nested-CTO guard.
+- The CTO review found and corrected three executor-specific assumptions: the final handoff action, Implementation Handoff entity, and ownership-boundary wording are now executor-neutral.
+- Revalidation passed all checklist items. The acceptance map covers FR-001–FR-053, including prepared-spec execution and CTO-coordinated preparation.
