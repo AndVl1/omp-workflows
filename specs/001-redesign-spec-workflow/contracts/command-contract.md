@@ -14,6 +14,50 @@ A workflow-owner prefix is applied through the existing `commandName(prefix, bas
 4. Validation reaches a terminal result before a checkpoint is presented.
 5. Checkpoints are synchronous hard-human decisions. Neither an agent, CTO, lead, policy default, validation pass, nor external status can approve.
 6. Any ambiguous, stale, invalid, conflicting, unauthorized, or already-claimed input performs no implementation dispatch.
+7. Native Specify generation and external compatibility validation require a current successful shared constitution prerequisite.
+8. Constitution bootstrap reuses the canonical constitution workflow and its document/template/validation/persistence contracts; entry points cannot author or store a second constitution.
+9. Every validation, approval, compatibility decision, readiness result, and handoff binds the exact constitution version and content fingerprint used.
+
+## Shared Constitution Prerequisite
+
+`ensure_project_constitution(origin)` is one engine-owned prerequisite invoked by:
+
+- direct `/specify`
+- the full native profile entered from `/do-work`
+- every CTO-coordinated native preparation workspace
+- `/spec-import` immediately before compatibility validation
+
+`origin` binds the authorized project, originating run key, capability epoch, and exact resume target
+(`specify` or `compatibility_validation`). The prerequisite is idempotent and its resume marker can
+be consumed exactly once.
+
+Usability checks are deterministic and classify the canonical constitution as:
+
+- `usable`: file exists, is non-empty, has no unresolved template markers, and passes mandatory structural validation
+- `constitution_required`: file is missing, empty, contains unresolved template markers, or fails mandatory structure
+- `blocked`: the path, workflow owner, profile, or persisted prerequisite state is invalid or ambiguous
+
+A usable constitution is fingerprinted, bound to the origin, and resumes it without a checkpoint.
+Warnings and a version difference alone do not require generation or reapproval.
+
+`constitution_required` invokes the registered canonical constitution workflow as a blocking child
+workflow. That workflow remains the only owner of template resolution, drafting, revision,
+validation, semantic versioning, and persistence of `.specify/memory/constitution.md`. Once its
+draft passes validation, the prerequisite presents exactly:
+
+| Decision | Required payload | Durable effect | Coordinator effect |
+| --- | --- | --- | --- |
+| `approve_continue` | Current trusted user answer proof | Approves and fingerprints the current constitution version | Consumes the resume marker and enters the exact originating target once |
+| `request_changes` | Trusted proof plus non-empty feedback | Reopens the same constitution draft identity with a new artifact version | Re-dispatches the canonical workflow, revalidates, and repeats this checkpoint |
+
+There is no `approve_stop` constitution-bootstrap decision because the originating flow remains
+blocked until a current constitution is approved. Interruption safely resumes the prerequisite;
+it does not re-create the draft or re-run the originating command.
+
+When a previously bound constitution fingerprint changes, readiness invokes a versioned semantic
+impact assessment before any new dispatch. Only `affected` artifacts and their dependency closure
+become stale. `no_impact` preserves approval only with artifact-scoped evidence; an unassessed,
+ambiguous, or failed assessment blocks execution.
 
 ## User Commands
 
@@ -30,11 +74,12 @@ Preconditions:
 
 Behavior:
 
-1. Prepare/resume the standard native specification profile.
-2. Dispatch the declared Specify subagent roster.
-3. Persist typed output, materialize `spec.md` and `status.md`, and run validation.
-4. On failure, report actionable findings and remain on Specify.
-5. On pass, present the three-decision checkpoint.
+1. Run the shared constitution prerequisite; if bootstrap is required, wait for its two-decision checkpoint and resume this exact Specify origin only after approval.
+2. Prepare/resume the standard native specification profile.
+3. Dispatch the declared Specify subagent roster.
+4. Persist typed output, materialize `spec.md` and `status.md`, and run validation bound to the current constitution fingerprint.
+5. On failure, report actionable findings and remain on Specify.
+6. On pass, present the three-decision phase checkpoint.
 
 ### `/spec-plan --feature <feature-id>`
 
@@ -82,11 +127,12 @@ Behavior:
 1. Discover candidates without executing source instructions.
 2. If recognition or document selection is ambiguous, return candidates and require explicit selection.
 3. Fingerprint exact selected files and create an immutable import snapshot.
-4. Apply the registered framework recognizer or generic conformance mapping.
-5. Render a compatibility report with ready/supplement-required/blocked/unsupported status.
-6. If ready, or once a local supplement closes all gaps, present one synchronous compatibility checkpoint.
-7. On approval, produce the same implementation-handoff schema used by native workspaces.
-8. Re-hash selected sources before return; a changed source blocks approval and leaves source files untouched.
+4. Run the shared constitution prerequisite before compatibility validation. If bootstrap is required, preserve the import snapshot and resume this exact import at compatibility validation only after approval.
+5. Apply the registered framework recognizer or generic conformance mapping.
+6. Render a compatibility report with ready/supplement-required/blocked/unsupported status, bound to the current constitution fingerprint.
+7. If ready, or once a local supplement closes all gaps, present one synchronous compatibility checkpoint.
+8. On approval, produce the same implementation-handoff schema used by native workspaces.
+9. Re-hash selected sources and the constitution before return; a changed source or unassessed constitution change blocks approval and leaves source files untouched.
 
 ### `/do-work [--spec <feature-id|workspace-path>] <task>`
 
@@ -94,9 +140,9 @@ Preflight order:
 
 1. Resolve an explicit `--spec` selection when present.
 2. Otherwise detect only a unique workspace whose approved scope matches the task.
-3. If a ready current handoff exists, acquire its execution claim and start the selected implementation profile without product/requirements/architecture rediscovery.
-4. If a matching workspace is partial, stale, conflicting, invalid, or ambiguous, dispatch no implementation and route to the earliest affected specification phase or required selection.
-5. If no workspace matches, choose lightweight, bounded Specify, or full specification preparation from complexity, confidence, and risk.
+3. If a ready current handoff exists, verify its constitution binding (including any required impact assessment), acquire its execution claim, and start the selected implementation profile without product/requirements/architecture rediscovery.
+4. If a matching workspace is partial, stale, conflicting, invalid, ambiguously affected by constitution drift, or ambiguous, dispatch no implementation and route to the earliest affected specification phase or required selection.
+5. If no workspace matches, choose lightweight, bounded Specify, or full specification preparation from complexity, confidence, and risk; run the shared constitution prerequisite before any full native Specify dispatch.
 
 A full nested specification preparation invokes the same native profile and subagents as the direct commands. After the Tasks checkpoint:
 
@@ -111,6 +157,7 @@ CTO preparation and execution share the resident CTO and existing CTO â†’ lead â
 Execution contract:
 
 - Resolve every selected workspace and run the common readiness predicate.
+- Verify every handoff's current constitution binding and block affected or unassessed drift before freezing the team plan.
 - Freeze exact handoff digests into the CTO team plan.
 - Acquire claims before implementation dispatch.
 - Map every implementation task to one team/slice, dependencies, shared contracts, and completion evidence.
@@ -120,6 +167,7 @@ Execution contract:
 Preparation contract:
 
 - Each feature uses the standard native specification profile and its explicit run identity.
+- Run the shared constitution prerequisite for each feature before its first Specify dispatch; independent prerequisite runs may progress separately, but each retains its own exact origin.
 - Content generation is delegated to bounded phase subagents.
 - One readable review packet may fan in several workspaces, but every phase decision is recorded separately in the corresponding workspace.
 - Final approval returns handoffs and ends the preparation wave. A separate explicit CTO execution wave is required.
@@ -137,6 +185,10 @@ Every native phase checkpoint has exactly these decisions:
 
 A failed validation never opens the checkpoint. A checkpoint decision cannot be changed in the same capability epoch; revision creates a new epoch and artifact version.
 
+The shared constitution prerequisite uses the separate two-decision contract defined above. It
+cannot be widened to the phase checkpoint's three decisions, and a phase approval cannot satisfy
+constitution approval.
+
 ## Phase Worker Result Contract
 
 A content-producing worker returns typed artifacts through the task result; it does not write human-readable workspace documents.
@@ -151,6 +203,7 @@ Required envelope fields:
 - stable requirement/decision/task/verification identifiers and links appropriate to the phase
 - explicit assumptions and unresolved items
 - phase-local semantic validation findings
+- exact `ConstitutionBinding` used to generate and validate the result
 - source/provenance references
 
 The engine rejects undeclared artifacts, missing required fields, invalid identifiers, mismatched dispatch identity, or output for a different feature/phase. Only the engine may persist the canonical version and materialize Markdown.
@@ -163,7 +216,7 @@ The common readiness result is one of:
 - `incomplete`: a named phase/import requirement is not complete.
 - `stale`: one or more bound versions/hashes no longer match.
 - `ambiguous`: workspace, source mapping, or task scope requires explicit selection.
-- `blocked`: validation, constitution, security, ownership, or claim conflict prevents execution.
+- `blocked`: validation, constitution usability or unassessed impact, security, ownership, or claim conflict prevents execution.
 
 A non-ready result includes:
 
@@ -209,6 +262,10 @@ Recognizers cannot execute source commands, fetch remote content, mutate source,
 | `SPEC_EXECUTION_CLAIMED` | Another active executor owns the same handoff digest. |
 | `SPEC_PROFILE_MISMATCH` | Persisted profile/version cannot be safely resumed without migration. |
 | `SPEC_MIGRATION_BLOCKED` | Legacy state cannot be mapped without loss or unsafe inference. |
+| `SPEC_CONSTITUTION_REQUIRED` | The canonical constitution is missing, empty, unresolved, or structurally invalid; the prerequisite must complete. |
+| `SPEC_CONSTITUTION_APPROVAL_REQUIRED` | A generated/corrected constitution passed validation but lacks a current trusted two-decision checkpoint answer. |
+| `SPEC_CONSTITUTION_CHANGED` | The exact constitution fingerprint differs from a bound validation, approval, compatibility decision, or handoff. |
+| `SPEC_CONSTITUTION_IMPACT_PENDING` | Semantic impact is missing, ambiguous, or failed; affected execution remains blocked. |
 
 All errors are fail-closed and preserve canonical state unless the documented operation is an explicit migration, revision, or claim-state transition.
 

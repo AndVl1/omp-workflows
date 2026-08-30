@@ -45,6 +45,7 @@ Expected outcomes:
 - New persisted state is accepted only through the migration/normalization path.
 - Existing workflow owner, capability, checkpoint, document renderer, CTO, and command tests remain green.
 - Focused tests cover success and fail-closed cases; source-text assertions are not accepted as behavioral evidence.
+- Constitution fixtures prove identical prerequisite behavior for every required entry point, the exact two-decision bootstrap checkpoint, idempotent resume, exact fingerprint bindings, and targeted semantic impact.
 
 ## Runtime Harness Setup
 
@@ -83,6 +84,36 @@ npm run e2e -- stop /tmp/omp-ux-e2e-readable-spec-workflow
 ```
 
 For the harness web surface, follow repository policy and drive it with `playwright-cli`; do not substitute another browser tool.
+
+## Scenario 0: Constitution Prerequisite and Exact Resume
+
+Run each entry point against separate scratch fixtures:
+
+- direct `/specify`
+- full native preparation nested from `/do-work`
+- CTO-coordinated specification preparation
+- `/spec-import` with compatibility validation pending
+
+For every entry point, exercise a missing file, empty file, unresolved-template document,
+structurally invalid document, valid document with warnings, and valid document whose version
+differs from the last observed version.
+
+For an unusable constitution:
+
+1. Confirm the originating flow stops before native Specify generation or external compatibility validation.
+2. Confirm the canonical constitution workflow creates or corrects one readable draft.
+3. Inspect the checkpoint and choose `request_changes` with concrete feedback.
+4. Confirm the same draft identity is revised through a new version, revalidated, and presented at the same checkpoint.
+5. Choose `approve_continue`.
+6. Interrupt and resume once between approval recording and origin dispatch to exercise idempotency.
+
+Expected outcomes:
+
+- Missing, empty, unresolved-template, and structurally invalid fixtures invoke the same canonical workflow and present exactly `approve_continue` and `request_changes`.
+- A valid constitution proceeds without generation or reapproval; warning-only and version-only differences do not block.
+- Approval is attributable, binds the exact version and content fingerprint, and resumes the exact native Specify or external compatibility-validation origin exactly once.
+- Requested changes never create a second constitution workflow, draft identity, checkpoint authority, or persistence path.
+- No specification worker, compatibility validator, implementation worker, or CTO implementation slice starts while the prerequisite is unresolved.
 
 ## Scenario 1: Explicit Specify → Plan → Tasks
 
@@ -128,6 +159,23 @@ Expected outcomes:
 - A semantic Specify change marks Plan, Tasks, and the handoff stale before any implementation can dispatch.
 - The status view identifies the earliest phase to revalidate.
 - No asynchronous reviewer appears after the checkpoint or mutates the decision.
+
+## Scenario 2A: Constitution Change Impact
+
+1. Prepare multiple approved native and imported handoffs bound to the same constitution fingerprint.
+2. Apply a formatting-only constitution edit and run readiness for `/do-work` and CTO.
+3. Apply a semantic amendment that affects only one requirement/decision subset.
+4. Apply a semantic amendment that affects every approved workspace.
+5. Attempt execution before and after the required targeted revalidation and reapproval.
+
+Expected outcomes:
+
+- Every validation, approval, compatibility decision, and handoff exposes the exact constitution version and content fingerprint used.
+- Formatting-only changes retain approvals only with recorded artifact-scoped `no_impact` evidence.
+- A partial semantic amendment stales only affected phase artifacts, imported handoffs, and their dependency closure; unaffected artifacts retain approval with explicit evidence.
+- A global semantic amendment stales every affected handoff before `/do-work` or CTO acquires a claim.
+- Missing, ambiguous, or failed impact analysis blocks dispatch with an actionable diagnostic; it never defaults to no impact or unconditional reapproval.
+- Revalidation and reapproval create bindings to the new fingerprint without rewriting external source files.
 
 ## Scenario 3: Approved Handoff Consumption by `/do-work`
 
@@ -282,6 +330,7 @@ For every runtime scenario, retain:
 - canonical event evidence showing worker dispatch identity for phase content
 - pre/post external source hashes for import scenarios
 - claim/preflight result for `/do-work` and CTO scenarios
+- constitution usability, two-decision checkpoint, exact-origin resume, binding, and semantic-impact records
 - screenshots for the real OMP UI surface
 - focused package/process test output
 

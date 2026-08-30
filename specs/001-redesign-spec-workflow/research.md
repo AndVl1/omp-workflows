@@ -10,6 +10,12 @@ Repository research covered the current durable engine, `/do-work` routing, CTO 
 - `packages/core/src/cto/` for plans, leases, waves, slice gates, and resident-CTO behavior
 - `packages/e2e/` for real OMP PTY scenarios and deterministic process-boundary tests
 
+The existing project-local Spec Kit integration also establishes the canonical constitution surface:
+
+- `.omp/commands/speckit.constitution.md` owns constitution drafting, revision, structural validation, semantic versioning, and persistence to `.specify/memory/constitution.md`
+- `.specify/templates/constitution-template.md` and the shared template resolver define the active scaffold
+- `.specify/templates/plan-template.md` already requires a constitution gate before research and a post-design re-check
+
 External practices were checked against current primary repositories and repository-grounded documentation:
 
 - Spec Kit: <https://github.com/github/spec-kit>
@@ -164,11 +170,50 @@ No unresolved `NEEDS CLARIFICATION` remains. Where an external claim could not b
 - Delete or rewrite incompatible legacy state — rejected because migration must not lose source evidence.
 - Maintain both old and new runtime paths indefinitely — rejected; legacy shapes are migration inputs, followed by a clean cutover.
 
+## Decision 13: Reuse One Canonical Constitution Workflow as a Blocking Prerequisite
+
+**Decision**: Add one reusable `ensure_project_constitution` prerequisite contract to the existing durable engine. Direct native preparation, full preparation nested from `/do-work`, CTO-coordinated preparation, and external intake all call this prerequisite instead of implementing entry-point-specific constitution logic. A usable constitution binds the originating run and continues without a checkpoint. A missing, empty, unresolved-template, or structurally invalid constitution invokes the canonical constitution workflow, whose existing drafting, revision, validation, template resolution, versioning, and persistence behavior remains authoritative. The durable integration adds the required two-decision human checkpoint and an idempotent continuation back to the exact originating stage.
+
+**Rationale**: The repository already has one constitution authoring contract in `.omp/commands/speckit.constitution.md`; the new requirement is orchestration, proof binding, and resume safety, not another document generator. A shared prerequisite is also the only design that can apply identical usability criteria and approval semantics to native generation and external compatibility validation without duplicating state machines.
+
+**Repository seams**:
+
+- Implement the deterministic usability check beside `packages/core/src/gates/validation.ts`; the existing Spec Kit prerequisite shell script does not check constitution usability and must not become a second untested implementation.
+- A thin `packages/core/workflows/constitution.json` wrapper invokes the registered `.omp/commands/speckit.constitution.md` as the sole writer, then uses the existing `checkpoint_policy.rules` → typed `workflow_checkpoint` → trusted-answer ledger path. No constitution-specific checkpoint automaton is needed.
+- Because the prerequisite can run before an originating specification workflow exists, persist an explicit origin descriptor (entry kind, run/workspace or import snapshot identity, arguments, capability epoch) and consume its continuation marker exactly once.
+- Model the bootstrap rule as hard-human `constitution_approval` with only `approve_continue` and `request_changes`; keep it distinct from the three-decision phase policy.
+
+**Alternatives considered**:
+
+- Copy constitution generation into Specify and import profiles — rejected because revisions, validation, approval, and persistence would diverge immediately.
+- Require constitution approval on every start — rejected because a current structurally usable constitution must proceed without ceremony; warning-only and version-only differences are not blocking.
+- Reuse the normal three-decision phase checkpoint — rejected because the constitution bootstrap has exactly `approve_continue` and `request_changes`; there is no approve-and-stop outcome while the originating flow is blocked.
+- Resume from prompt history or re-run the entry command — rejected because interruption between approval and resume would duplicate drafts, decisions, or downstream dispatch.
+
+## Decision 14: Bind Exact Constitution Content and Propagate Only Proven Semantic Impact
+
+**Decision**: Every phase validation, phase approval, compatibility decision, and implementation handoff records a `ConstitutionBinding` containing the constitution version, exact content SHA-256, semantic hash, and validation reference. When the exact content fingerprint changes, the engine runs one versioned semantic impact assessment over the dependency graph. Each bound artifact receives an explicit `affected` or `no_impact` result with evidence; only affected artifacts and dependent handoffs become stale. Formatting-only changes retain approvals when stable semantic-section hashes prove no impact.
+
+**Rationale**: Exact fingerprints provide deterministic drift detection, while semantic hashes and recorded impact evidence prevent a harmless formatting change from invalidating every approved feature. The existing immutable artifact/version model and dependency-based stale propagation are the correct substrate; the assessment becomes another typed, attributable engine artifact rather than an implicit model judgment.
+
+**Repository seams**:
+
+- Reuse `writeArtifact` and `CompletionEnvelope.artifact_refs` for immutable `constitution-impact.vN` evidence in the existing feature artifact directory.
+- Reuse the `product-prd.ts` content/source hash revalidation pattern and existing phase dependency closure rather than adding a project-wide invalidation store.
+- Extend strict persisted-state validation, artifact schemas, producers, consumers, and `MigrationReceipt` together. A migrated workspace with no current constitution binding fails closed on first use until impact/revalidation establishes one.
+
+**Alternatives considered**:
+
+- Invalidate every workspace after any constitution byte change — rejected by FR-078 and because it creates unnecessary reapproval for formatting-only amendments.
+- Trust only the semantic version string — rejected because content can change without a correct bump and the same version can otherwise bind different policy.
+- Let each executor re-interpret constitution drift — rejected because `/do-work` and CTO would produce inconsistent readiness decisions.
+- Preserve approvals without explicit no-impact evidence — rejected because an unassessed policy change must fail closed.
+
 ## Reference Practices Adopted and Rejected
 
 | Reference | Adopt | Reject |
 | --- | --- | --- |
-| Spec Kit | Explicit Specify → Plan → Tasks progression, feature-scoped readable documents, plan auxiliaries, templates, lean path | Branch identity as workspace authority; toolkit-coupled executor; implicit review between commands |
+| Spec Kit | Explicit Constitution → Specify → Plan → Tasks progression, one canonical constitution document/workflow, feature-scoped readable documents, plan auxiliaries, templates, lean path | Branch identity as workspace authority; toolkit-coupled executor; implicit review between commands; duplicated constitution logic in downstream phases |
 | OpenSpec | Readable change workspace, structural conformance, preserved history, explicit verification | Unrecorded “review by editing Markdown”; write-back/sync as part of initial interoperability |
 | Superpowers | Subagent-driven drafting, file-based briefs, reviewable phase packets | Main-session authorship and execution-phase background review as specification approval |
 | XPowers | One canonical task source, immutable approved requirements during execution | Parallel reviewer agents as a human checkpoint substitute |

@@ -13,6 +13,8 @@
     "state_path",
     "profile_name",
     "profile_hash",
+    "constitution_gate_ref",
+    "constitution_binding",
     "language",
     "template_set",
     "phases",
@@ -49,6 +51,49 @@
     },
     "profile_hash": {
       "type": "string"
+    },
+    "constitution_gate_ref": {
+      "type": ["string", "null"]
+    },
+    "constitution_binding": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "path",
+            "version",
+            "content_sha256",
+            "semantic_hash",
+            "validation_ref",
+            "bound_at"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "content_sha256": {
+              "type": "string"
+            },
+            "semantic_hash": {
+              "type": "string"
+            },
+            "validation_ref": {
+              "type": "string"
+            },
+            "bound_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        }
+      ]
     },
     "language": {
       "type": "object",

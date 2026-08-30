@@ -9,6 +9,7 @@ The model extends the existing `TeamState`; it does not introduce a second state
 - `.work-state/features/<feature-id>/artifacts/*.json` contains immutable, versioned typed artifacts returned by subagents and derived engine records.
 - Trusted checkpoint answers retain the current engine-owned answer ledger and capability binding.
 - External source files are never part of the writable workspace.
+- `.specify/memory/constitution.md` remains the single human-readable project policy owned by the canonical constitution workflow; specification code stores bindings and impact evidence, not a copied constitution.
 
 ## Entities
 
@@ -26,6 +27,8 @@ The stable aggregate for one native, imported, or migrated feature.
 | `workspace_path` | project-relative path | Exactly `specs/<feature-id>` for the default resolver. |
 | `state_path` | project-relative path | Exactly `.work-state/features/<feature-id>/state.json`. |
 | `profile_name` / `profile_hash` | string | Bind the aggregate to the active declarative profile version. |
+| `constitution_gate_ref` | artifact id or null | Required before native Specify generation or external compatibility validation. |
+| `constitution_binding` | `ConstitutionBinding` or null | Current approved/usable constitution bound to this workspace; null only while the prerequisite is unresolved. |
 | `language` | `LanguageSelection` | Required for every generated readable artifact. |
 | `template_set` | `TemplateSelection` | Required for native and migrated rendering. |
 | `phases` | three `PhaseRecord`s | Exactly Specify, Plan, and Tasks for native workspaces. Imported workspaces retain equivalent normalized records. |
@@ -42,6 +45,57 @@ Relationships:
 - Owns many immutable `PhaseArtifactVersion`, `ValidationResult`, and `CheckpointDecision` records.
 - Owns at most one current `ImplementationHandoff` and one active `ExecutionClaim`.
 - Optionally owns one current `ImportSnapshot`, `CompatibilityReport`, and `CompatibilitySupplement`.
+- References one current `ConstitutionGateRecord`; owns immutable constitution bindings and impact assessments relevant to its artifacts.
+
+### ConstitutionGateRecord
+
+The durable prerequisite record shared by native preparation and external intake. It coordinates the
+canonical constitution workflow but does not author or persist constitution content itself.
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `gate_id` | string | Idempotency key derived from project, originating run, entry point, and capability epoch. |
+| `origin_kind` | `native_direct \| do_work_nested \| cto_preparation \| external_import` | Determines the exact resume target. |
+| `origin_run_key` / `origin_stage` | engine identity | Must resolve to the still-current originating cursor before resume. |
+| `status` | `checking \| usable \| constitution_required \| awaiting_approval \| approved \| blocked` | Uses the transition table below. |
+| `usability_result` | typed result | Records missing, empty, unresolved-template, structurally-invalid, or usable plus warnings. |
+| `constitution_workflow_ref` | run/artifact reference or null | Required when the canonical workflow is invoked. |
+| `checkpoint_ref` | checkpoint id or null | Required only when a generated or corrected constitution is approved. |
+| `binding` | `ConstitutionBinding` or null | Required before the originating flow can resume. |
+| `resume_marker` | dispatch/idempotency marker | Consumed exactly once; replay returns the established continuation result. |
+
+An already usable constitution transitions directly to `usable` and opens no checkpoint. A required
+bootstrap checkpoint allows only `approve_continue` or `request_changes`; the three-decision phase
+checkpoint contract does not apply.
+
+### ConstitutionBinding
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `path` | project-relative path | Canonical policy path, realpath-bounded to the authorized project. |
+| `version` | semantic version string | Parsed from the validated constitution; never trusted without the fingerprint. |
+| `content_sha256` | SHA-256 | Exact bytes used for validation or approval. |
+| `semantic_hash` | SHA-256 | Hash of normalized policy sections used only for impact comparison. |
+| `validation_ref` | artifact id | Proves mandatory structure and unresolved-template checks passed. |
+| `bound_at` | timestamp | Audit only; excluded from content hashes. |
+
+The binding is embedded in every phase validation, phase approval, compatibility decision, and
+implementation handoff. A version label alone never establishes identity.
+
+### ConstitutionImpactAssessment
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `assessment_id` | string | Immutable and idempotent for old/new content fingerprints plus evaluator version. |
+| `previous_binding` / `current_binding` | `ConstitutionBinding` | Exact compared policy versions. |
+| `evaluator_version` | string/hash | Makes the assessment reproducible and attributable. |
+| `artifact_results` | artifact → result array | Every previously approved bound artifact is `affected` or `no_impact`; no omission is treated as current. |
+| `evidence` | section/rule/dependency references | Required for both affected and no-impact outcomes. |
+| `status` | `pass \| blocked` | `blocked` when impact cannot be established safely. |
+
+`affected` marks only that artifact and its dependants stale. `no_impact` preserves approval while
+recording the new binding and evidence. A formatting-only change is no-impact only when stable
+semantic-section hashes prove equivalence; otherwise the assessment fails closed.
 
 ### LanguageSelection
 
@@ -100,6 +154,7 @@ Immutable content/provenance for one phase revision.
 | `template_hash` / `language_hash` | SHA-256 | Required for generated documents. |
 | `upstream_versions` | version bindings | Exact artifact id, version, and hash for every dependency. |
 | `created_at` | timestamp | Audit only; not included in deterministic content hashes. |
+| `constitution_binding` | `ConstitutionBinding` | Exact policy version and content fingerprint used to create/validate this phase version. |
 
 On replacement, the previous readable projection moves to `history/<phase>/v<version>.md` before the new projection becomes current.
 
@@ -115,7 +170,7 @@ Readable and machine-readable phase validation bound to one artifact version.
 | `checks` | check result array | Includes criterion id, status, evidence, and actionable remediation. |
 | `blocking_findings` | finding array | Empty when status is `pass`. |
 | `warnings` | finding array | Non-blocking and visible. |
-| `constitution` | per-principle result | Required for every phase; full re-check required after Plan. |
+| `constitution` | per-principle result plus `ConstitutionBinding` | Required for every phase; full re-check required after Plan. |
 | `traceability_summary` | counts/missing ids | Required after Plan and Tasks. |
 | `validator_version` | string/hash | Makes revalidation deterministic and attributable. |
 
@@ -129,7 +184,7 @@ The existing typed checkpoint record is reused. Specification rules add exactly 
 - `request_changes`
 - `approve_stop`
 
-The decision remains bound to run, stage, checkpoint, work identity, capability id/epoch, policy hash, user actor, and trusted terminal/escalation answer proof. For `request_changes`, the rationale contains non-empty revision feedback. Agent, CTO, lead, and policy-auto actors cannot authorize these checkpoints.
+The decision remains bound to run, stage, checkpoint, work identity, capability id/epoch, policy hash, user actor, trusted terminal/escalation answer proof, and the exact `ConstitutionBinding`. For `request_changes`, the rationale contains non-empty revision feedback. Agent, CTO, lead, and policy-auto actors cannot authorize these checkpoints.
 
 ### TraceabilityLink
 
@@ -174,7 +229,7 @@ Frozen executor-neutral implementation contract.
 | `tasks` | `ImplementationTask[]` | Valid acyclic task graph. |
 | `verification` | evidence contracts | Covers all required tasks and requirements. |
 | `validation_refs` / `approval_refs` | id arrays | All current, passing, and human-authorized. |
-| `language` / `constitution_status` | metadata | Visible to executors and reviewers. |
+| `constitution_binding` / `constitution_impact_ref` | metadata / artifact id or null | Exact approved policy fingerprint and any later no-impact evidence; an affected or unassessed change makes the handoff non-ready. |
 | `risks` / `open_decisions` | arrays | Open blocking decisions must be empty when ready. |
 | `execution_choices` | executor enum array | `do-work`, `cto`, or both. |
 | `status` | `candidate \| ready \| stale` | Derived from current bindings. |
@@ -259,6 +314,26 @@ A rendering-only fan-in of phase artifacts. It contains a section per feature an
 
 ## State Transitions
 
+### Constitution Prerequisite State
+
+```text
+entry_requested
+    -> checking
+checking
+    -> usable                  (current constitution passes mandatory checks; resume origin)
+    -> constitution_required   (missing, empty, unresolved template, or structural failure)
+constitution_required
+    -> awaiting_approval       (canonical workflow generated/corrected and validated one draft)
+awaiting_approval
+    -> approved                (approve_continue; bind policy and resume origin exactly once)
+    -> constitution_required   (request_changes; revise/revalidate the same draft identity)
+approved
+    -> usable                  (idempotent established result)
+```
+
+Warnings and version differences do not enter `constitution_required` when mandatory structure
+passes. Native origins resume at Specify; external origins resume at compatibility validation.
+
 ### Phase State
 
 ```text
@@ -299,6 +374,7 @@ created -> in_progress -> implementation_ready -> claimed -> executing -> comple
 - `implementation_ready` is derived from the handoff readiness predicate.
 - Imported workspaces reach the same status through compatibility approval rather than native phase approval.
 - Any changed bound artifact moves `implementation_ready`, `claimed`, or `executing` to `stale`/`blocked` before new dispatch.
+- If the current constitution fingerprint differs from a bound handoff, readiness remains blocked until a current impact assessment marks the handoff `no_impact` or targeted revalidation/reapproval produces a new handoff.
 
 ### Import Status
 
@@ -335,3 +411,6 @@ A second active owner receives a conflict or queue result and performs no dispat
 10. External sources remain byte-for-byte unchanged; import output, supplements, state, claims, and progress are stored separately.
 11. CTO review packets are projections; every approval remains a separate feature-bound checkpoint decision.
 12. No asynchronous review result can change validation, approval, current version, handoff readiness, or workflow cursor.
+13. No native Specify generation or external compatibility validation begins without a current successful `ConstitutionGateRecord`.
+14. Every validation, approval, compatibility decision, and handoff binds the exact constitution version and content fingerprint used.
+15. A changed constitution preserves an approval only with explicit artifact-scoped `no_impact` evidence; unassessed or affected bindings fail closed and stale only their dependency closure.

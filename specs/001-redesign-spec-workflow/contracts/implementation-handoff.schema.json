@@ -18,7 +18,8 @@
     "validation_refs",
     "approval_refs",
     "language",
-    "constitution_status",
+    "constitution_binding",
+    "constitution_impact_ref",
     "risks",
     "open_decisions",
     "execution_choices",
@@ -259,9 +260,41 @@
     "language": {
       "type": "string"
     },
-    "constitution_status": {
-      "type": "string",
-      "enum": ["pass"]
+    "constitution_binding": {
+      "type": "object",
+      "required": [
+        "path",
+        "version",
+        "content_sha256",
+        "semantic_hash",
+        "validation_ref",
+        "bound_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "content_sha256": {
+          "type": "string"
+        },
+        "semantic_hash": {
+          "type": "string"
+        },
+        "validation_ref": {
+          "type": "string"
+        },
+        "bound_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "constitution_impact_ref": {
+      "type": ["string", "null"]
     },
     "risks": {
       "type": "array",
