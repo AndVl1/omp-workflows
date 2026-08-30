@@ -15,7 +15,8 @@
 - Q: Какие решения должен предлагать нулевой чекпоинт после генерации конституции проекта? → A: «Одобрить и продолжить» или «Запросить изменения»; в нативном потоке одобрение сразу запускает Specify.
 - Q: Когда существующую конституцию нужно считать непригодной и направлять в цикл генерации и одобрения? → A: Когда файл отсутствует, пуст, содержит незаполненные шаблонные маркеры или не проходит обязательную структурную проверку.
 - Q: В каких точках входа нужно выполнять нулевую проверку конституции? → A: Во всех нативных потоках и при импорте внешней спецификации перед compatibility validation.
-- Q: Как нулевой шаг должен создавать или исправлять конституцию? → A: Переиспользовать существующий constitution workflow как блокирующий prerequisite и продолжить после его одобрения.
+- Q: Как нулевой шаг должен создавать или исправлять конституцию? → A: Использовать поставляемый плагином constitution workflow как блокирующий prerequisite; генерация, валидация, revision loop и approval не зависят от установленного Spec Kit или другого внешнего фреймворка.
+- Q: Где хранится конституция и как учитывается существующий файл Spec Kit? → A: Разрешать путь в порядке explicit `constitution.path` → ровно один найденный provider → нативный `CONSTITUTION.md` в корне проекта; Spec Kit может предоставить только опциональный file provider, несколько кандидатов блокируют поток до явного выбора.
 - Q: Что должно происходить с уже одобренными спецификациями и implementation handoff после смыслового изменения конституции? → A: Выполнять impact analysis, помечать stale только затронутые артефакты и требовать их повторную валидацию и одобрение.
 
 ## User Scenarios & Testing *(mandatory)*
@@ -39,6 +40,8 @@ As a developer, I want specification work split into explicit Specify, Plan, and
 7. **Given** an approved specification, **When** the Plan phase completes, **Then** the feature workspace contains a readable plan that traces design decisions and verification strategy back to approved requirements.
 8. **Given** an approved plan, **When** the Tasks phase completes, **Then** the workspace contains a dependency-aware task list whose tasks trace to requirements and state observable completion evidence.
 9. **Given** a completed feature workspace, **When** a reviewer opens it, **Then** the phase order, current status, approvals, validation results, and next valid action are visible without parsing JSON.
+10. **Given** no constitution, no configured path, and no external specification framework installed, **When** constitution bootstrap runs, **Then** the plugin's native constitution workflow delegates draft generation to a declared subagent, materializes `CONSTITUTION.md` from the shipped framework-neutral template, validates it, and reaches the two-decision checkpoint without invoking or installing external tooling.
+11. **Given** an explicit constitution path, one existing registered provider, no existing provider, or multiple existing providers, **When** constitution resolution runs, **Then** it uses explicit override first, otherwise the single provider, otherwise root `CONSTITUTION.md`, and fails closed for explicit selection when several candidates exist.
 
 ---
 
@@ -302,12 +305,13 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **FR-070**: The user MUST be able to inspect the supported-format and conformance result, including which framework-specific mapping was used, which artifacts were ignored, and whether generic intake remains available.
 - **FR-071**: Every content-producing Specify, Plan, and Tasks stage, including a full specification workflow nested from `/do-work`, MUST execute through a declared subagent dispatch; the main session MAY coordinate, validate, materialize a worker's typed result, and present checkpoints, but MUST NOT author phase content.
 - **FR-072**: Phase validation and review MUST finish as a blocking part of the active phase before its human checkpoint; detached or asynchronous reviewers MUST NOT alter the verdict, authorize a checkpoint, or advance the workflow after the checkpoint is presented.
-- **FR-073**: Before any flow can enter native Specify or external compatibility validation, the system MUST check for a usable project constitution and MUST treat a missing, empty, structurally invalid, or unresolved-template document as unusable; if the check fails, it MUST invoke the canonical constitution workflow as a blocking prerequisite and MUST NOT continue the originating flow until that workflow returns an approved constitution. Warnings or version differences that do not violate mandatory structure MUST NOT force reapproval by themselves.
+- **FR-073**: Before any flow can enter native Specify or external compatibility validation, the system MUST resolve and check a usable project constitution and MUST treat a missing, empty, structurally invalid, or unresolved-template document as unusable; if the check fails, it MUST invoke the plugin-shipped constitution workflow as a blocking prerequisite and MUST NOT continue the originating flow until that workflow returns an approved constitution. Warnings or version differences that do not violate mandatory structure MUST NOT force reapproval by themselves.
 - **FR-074**: A generated-constitution checkpoint MUST offer exactly approve and continue or request changes; approval MUST be attributable and immediately resume the originating flow, while requested changes MUST revise and revalidate the same draft before repeating the checkpoint.
 - **FR-075**: The constitution gate MUST apply to explicitly invoked native specification preparation, a full native workflow nested from `/do-work`, CTO-coordinated specification preparation, and external specification intake; after approval it MUST resume the exact originating entry point, entering Specify for native flows or compatibility validation for external intake.
-- **FR-076**: Specification preparation and external intake MUST reuse the canonical constitution workflow's generation, validation, revision, approval, and persistence contracts; they MUST NOT implement a second constitution generator, writer, checkpoint state machine, or approval path.
-- **FR-077**: Every phase validation, phase approval, compatibility decision, and implementation handoff MUST record the exact project constitution version and content fingerprint against which it was evaluated.
+- **FR-076**: The plugin MUST ship one constitution workflow, framework-neutral template, typed subagent drafting contract, deterministic materializer/validator, revision loop, checkpoint policy, and persistence contract that work without Spec Kit or any other external framework; specification preparation, external intake, and provider adapters MUST reuse these contracts and MUST NOT implement a second generator, writer, checkpoint state machine, or approval path.
+- **FR-077**: Every phase validation, phase approval, compatibility decision, and implementation handoff MUST record the exact project constitution provider, resolved path, version, and content fingerprint against which it was evaluated.
 - **FR-078**: When the constitution changes, the workflow MUST perform semantic impact analysis, mark only affected specification artifacts and handoffs stale, and block their use until revalidated and reapproved; artifacts with recorded no-impact evidence MUST retain approval, and non-semantic file changes MUST NOT invalidate them.
+- **FR-079**: Constitution resolution MUST use this precedence: authorized explicit `constitution.path`, exactly one existing registered provider, then native project-root `CONSTITUTION.md`; multiple plausible providers, unsafe paths, or invalid provider contracts MUST fail closed before validation or generation, and provider discovery MUST NOT invoke external commands, CLIs, installers, package managers, or network services.
 
 ### Requirement Acceptance Map
 
@@ -327,8 +331,9 @@ As a user with several independent feature ideas or a broad initiative, I want C
 | FR-045–FR-053 | User Story 9 scenarios 1–7; User Story 8 scenarios 4–6 |
 | FR-054–FR-070 | User Story 4 scenarios 1–8 |
 | FR-071–FR-072 | User Story 1 scenarios 6–8; User Story 2 scenarios 1–3; User Story 5 scenarios 3–4 |
-| FR-073–FR-076 | User Story 1 scenarios 1–5; User Story 4 scenario 9; SC-020 |
+| FR-073–FR-076 | User Story 1 scenarios 1–5 and 10; User Story 4 scenario 9; SC-020 |
 | FR-077–FR-078 | User Story 2 scenario 6; SC-021 |
+| FR-079 | User Story 1 scenarios 10–11; SC-022 |
 
 ### Key Entities
 
@@ -340,6 +345,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **Traceability Link**: A relationship connecting a requirement to acceptance scenarios, plan decisions, tasks, and verification evidence.
 - **Implementation Handoff**: The current approved, executor-neutral contract that allows `/do-work` or CTO mode to begin implementation without repeating specification work.
 - **Constitution Binding**: The project constitution version and content fingerprint used for a validation, approval, compatibility decision, or implementation handoff, plus any later semantic impact result.
+- **Constitution Provider Selection**: The immutable provider id, resolved project-relative path, template source, selection provenance, and fingerprint chosen by explicit override, unique discovery, or the native default.
 - **Language Preference**: The selected document language, its source, and the artifact versions to which it applies.
 - **Legacy Specification Run**: Existing JSON-only or prior-format state that may be migrated but is never assumed approved merely because it completed under an older workflow.
 - **Execution Claim**: A durable, exclusive binding between one approved specification version and its active executor, preventing duplicate `/do-work` or CTO execution.
@@ -353,7 +359,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 
 ### Reference-Informed Product Direction
 
-- Adopt Spec Kit's explicit Specify → Plan → Tasks progression, stable templates, and feature-scoped document organization.
+- Adopt Spec Kit's explicit Constitution → Specify → Plan → Tasks progression, stable templates, and feature-scoped document organization, while keeping constitution generation plugin-native and treating Spec Kit only as an optional provider/reference.
 - Adopt OpenSpec's readable change workspace, brownfield orientation, editable artifacts, explicit verification, and preserved history rather than treating a completed document as disposable.
 - Adopt Superpowers' practice of presenting reviewable chunks and requiring sign-off before deeper planning or execution.
 - Adopt XPowers' separation of planning, execution, review, and verification, with one canonical task handoff instead of parallel task sources.
@@ -388,6 +394,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **SC-019**: Across every native-preparation and external-intake entry point plus missing, empty, unresolved-template, structurally invalid, warning-only, and version-difference constitution fixtures, 100% of unusable constitutions block the originating flow until the generated draft is explicitly approved, while every usable constitution proceeds without reapproval; each approval resumes the originating entry point and each requested change returns to the same constitution checkpoint.
 - **SC-020**: In 100% of starts with a missing or unusable constitution, the user sees one canonical constitution draft and checkpoint sequence, the originating flow remains blocked until approval, approval resumes that flow exactly once, and no duplicate constitution draft or approval is created.
 - **SC-021**: Across semantic constitution amendments that affect none, some, or all approved artifacts plus formatting-only changes, 100% of affected specifications and handoffs become stale before use, 100% of unaffected artifacts retain approval with no-impact evidence, and zero formatting-only changes trigger reapproval.
+- **SC-022**: Across projects with no external framework, an explicit constitution override, one discovered provider, multiple providers, and an unsafe provider path, 100% of native bootstraps use the required precedence, create or update exactly one selected readable constitution, block every ambiguous/unsafe selection, and invoke zero external commands, CLIs, installers, package managers, or network services.
 
 ## Assumptions
 
@@ -396,7 +403,8 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - Explicit phase commands and checkpoint-driven continuation coexist: users may invoke each phase manually, while approve-and-continue provides a deliberate convenience path.
 - Human approval is required at all three phase boundaries for the full workflow; autonomous implementation does not imply autonomous specification approval.
 - Direct and `/do-work`-nested specification drafting is always delegated to declared subagents. The main session remains a coordinator for durable control, deterministic materialization, validation, and synchronous human checkpoints; it does not become the specification author or host detached review work.
-- The workflow checks for a usable project constitution before entering native Specify or external compatibility validation. When none exists, it invokes the canonical constitution workflow as the blocking prerequisite defined by FR-073–FR-076; once approved, the constitution remains authoritative and every template and validation profile includes an explicit constitution-compliance check.
+- The workflow checks for a usable project constitution before entering native Specify or external compatibility validation. When none exists, it invokes the plugin-shipped constitution workflow as the blocking prerequisite defined by FR-073–FR-076; once approved, the constitution remains authoritative and every template and validation profile includes an explicit constitution-compliance check.
+- Constitution resolution uses explicit `constitution.path`, one discovered provider, or native root `CONSTITUTION.md`; Spec Kit may expose an existing Markdown path through an optional adapter but is never installed, invoked, or required by constitution generation.
 - Approved native and imported artifacts remain bound to the exact constitution version and fingerprint used for validation; later constitution changes follow the targeted stale-impact rules in FR-077–FR-078 rather than unconditional invalidation.
 - Existing workflow owners and command-registration boundaries remain in force; this feature changes the specification experience and shared execution handoff, not ownership semantics.
 - Research of Spec Kit, OpenSpec, Superpowers, XPowers, and BMAD informs planning, but the plugin keeps its own domain-agnostic, durable workflow engine rather than embedding another framework.
