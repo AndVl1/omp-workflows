@@ -109,6 +109,23 @@ test("cto-cmd: buildCtoPrompt renders teams from .omp/teams.json", () => {
   }
 });
 
+test("cto-cmd: buildCtoPrompt rejects malformed team definitions without throwing", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-core-malformed-team-"));
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(
+      join(root, ".omp", "teams.json"),
+      JSON.stringify([{ ...TEAMS_JSON[0], scope: "backend-kotlin" }]),
+    );
+
+    const prompt = buildCtoPrompt(parseCtoEnvelope("Add OAuth", root), root);
+    assert.ok(prompt.includes("(no teams configured)"), "malformed team is excluded from the registry");
+    assert.ok(!prompt.includes("| `kotlin-backend` |"), "malformed team is not rendered");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("cto-cmd: buildCtoPrompt includes the COMPLETE workflow matrix (REVIEW/HOTFIX + P5 rule)", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-core-matrix-"));
   try {
