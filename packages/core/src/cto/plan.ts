@@ -39,11 +39,17 @@ export function loadTeamDefs(cwd: string): TeamDef[] {
     const raw = JSON.parse(readFileSync(join(cwd, ".omp", "teams.json"), "utf8")) as unknown;
     if (!Array.isArray(raw)) return [];
     return raw.filter((entry): entry is TeamDef => {
+      if (typeof entry !== "object" || entry === null) return false;
+      const team = entry as Record<string, unknown>;
       return (
-        typeof entry === "object" &&
-        entry !== null &&
-        typeof (entry as TeamDef).id === "string" &&
-        typeof (entry as TeamDef).name === "string"
+        typeof team.id === "string" &&
+        typeof team.name === "string" &&
+        Array.isArray(team.scope) &&
+        team.scope.every((scope) => typeof scope === "string") &&
+        typeof team.profile === "string" &&
+        typeof team.lead === "string" &&
+        Array.isArray(team.roster) &&
+        team.roster.every((role) => typeof role === "string")
       );
     });
   } catch {

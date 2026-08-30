@@ -2,7 +2,7 @@
   {
     "id": "workflow-platform",
     "name": "Workflow Platform",
-    "scope": "Plugin command publication, project override materialization, command discovery tests, and related monorepo packaging under packages/core, packages/fullstack, packages/omp-workflows-internal, packages/e2e, and .omp/commands",
+    "scope": ["dev"],
     "profile": "feature-regression",
     "lead": "team-lead",
     "roster": [
