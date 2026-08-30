@@ -8,6 +8,16 @@
 
 **Input**: User description: "Redesign the plugin's specification-generation workflow so that specification, plan, and tasks are readable, structured, explicitly reviewable, language-configurable, and ready for reliable execution through `/do-work` or CTO mode; support read-only execution of specifications prepared by other frameworks; use Spec Kit as the primary reference and assess useful practices from OpenSpec, Superpowers, XPowers, and BMAD."
 
+## Clarifications
+
+### Session 2026-08-30
+
+- Q: Какие решения должен предлагать нулевой чекпоинт после генерации конституции проекта? → A: «Одобрить и продолжить» или «Запросить изменения»; в нативном потоке одобрение сразу запускает Specify.
+- Q: Когда существующую конституцию нужно считать непригодной и направлять в цикл генерации и одобрения? → A: Когда файл отсутствует, пуст, содержит незаполненные шаблонные маркеры или не проходит обязательную структурную проверку.
+- Q: В каких точках входа нужно выполнять нулевую проверку конституции? → A: Во всех нативных потоках и при импорте внешней спецификации перед compatibility validation.
+- Q: Как нулевой шаг должен создавать или исправлять конституцию? → A: Переиспользовать существующий constitution workflow как блокирующий prerequisite и продолжить после его одобрения.
+- Q: Что должно происходить с уже одобренными спецификациями и implementation handoff после смыслового изменения конституции? → A: Выполнять impact analysis, помечать stale только затронутые артефакты и требовать их повторную валидацию и одобрение.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Create a readable implementation-ready specification (Priority: P1)
@@ -20,10 +30,15 @@ As a developer, I want specification work split into explicit Specify, Plan, and
 
 **Acceptance Scenarios**:
 
-1. **Given** a new feature request, **When** the user starts the Specify phase, **Then** the workflow creates one discoverable feature workspace with a structured specification document based on the active template.
-2. **Given** an approved specification, **When** the Plan phase completes, **Then** the feature workspace contains a readable plan that traces design decisions and verification strategy back to approved requirements.
-3. **Given** an approved plan, **When** the Tasks phase completes, **Then** the workspace contains a dependency-aware task list whose tasks trace to requirements and state observable completion evidence.
-4. **Given** a completed feature workspace, **When** a reviewer opens it, **Then** the phase order, current status, approvals, validation results, and next valid action are visible without parsing JSON.
+1. **Given** a specification-generation request, **When** the workflow prepares to enter Specify, **Then** it checks whether the project has a usable constitution before creating the specification artifact.
+2. **Given** a non-empty project constitution with no unresolved template markers that passes mandatory structural checks, **When** the constitution check completes, **Then** the workflow continues to Specify without generating or reapproving the constitution.
+3. **Given** a missing, empty, structurally invalid, or unfilled template constitution, **When** the optional bootstrap step is required, **Then** the workflow invokes the canonical constitution workflow to generate or correct a readable draft, presents exactly approve-and-continue and request-changes decisions, and does not enter Specify yet.
+4. **Given** the user requests constitution changes, **When** feedback is supplied, **Then** the canonical constitution workflow revises and revalidates the same draft and presents the same checkpoint again.
+5. **Given** the user approves the generated constitution, **When** the attributable decision is recorded, **Then** the constitution becomes the current project policy and Specify starts immediately.
+6. **Given** a completed constitution check, **When** the Specify phase completes, **Then** the workflow creates one discoverable feature workspace with a structured specification document based on the active template.
+7. **Given** an approved specification, **When** the Plan phase completes, **Then** the feature workspace contains a readable plan that traces design decisions and verification strategy back to approved requirements.
+8. **Given** an approved plan, **When** the Tasks phase completes, **Then** the workspace contains a dependency-aware task list whose tasks trace to requirements and state observable completion evidence.
+9. **Given** a completed feature workspace, **When** a reviewer opens it, **Then** the phase order, current status, approvals, validation results, and next valid action are visible without parsing JSON.
 
 ---
 
@@ -42,6 +57,7 @@ As a reviewer, I want an explicit checkpoint after Specify, Plan, and Tasks, so 
 3. **Given** the user chooses request changes, **When** feedback is supplied, **Then** the workflow remains on the current phase, updates only the affected content, re-runs validation, and presents the checkpoint again.
 4. **Given** the user chooses approve and stop, **When** the session ends, **Then** a later explicit phase command resumes from the first unapproved phase without repeating approved work.
 5. **Given** an approved upstream artifact is revised later, **When** the revision changes a downstream dependency, **Then** affected downstream approvals are marked stale and cannot be used for implementation until revalidated and reapproved.
+6. **Given** the current constitution differs from the version bound to an approved artifact or handoff, **When** semantic impact analysis runs, **Then** only affected specifications, plans, tasks, and handoffs become stale and require revalidation and reapproval, while unaffected artifacts retain approval with recorded no-impact evidence.
 
 ---
 
@@ -80,6 +96,7 @@ As a developer with a completed specification from another framework, I want to 
 6. **Given** an approved imported handoff whose external source later changes, **When** execution or resume is attempted, **Then** the handoff becomes stale and requires re-import, impact review, and renewed approval.
 7. **Given** framework-specific metadata is unknown or unavailable but the documents are readable, **When** the user identifies the relevant files, **Then** the generic intake path applies the same conformance validation without requiring that framework to be installed.
 8. **Given** external documents contain embedded instructions, unsafe links, secrets, unsupported files, or paths outside the authorized project boundary, **When** intake evaluates them, **Then** it treats content as untrusted data, redacts or rejects unsafe material, and performs no unauthorized action.
+9. **Given** any external specification intake, **When** the workflow prepares to run compatibility validation, **Then** it applies the same constitution gate as native specification preparation and resumes the original intake only after any required constitution approval.
 
 ---
 
@@ -285,13 +302,19 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **FR-070**: The user MUST be able to inspect the supported-format and conformance result, including which framework-specific mapping was used, which artifacts were ignored, and whether generic intake remains available.
 - **FR-071**: Every content-producing Specify, Plan, and Tasks stage, including a full specification workflow nested from `/do-work`, MUST execute through a declared subagent dispatch; the main session MAY coordinate, validate, materialize a worker's typed result, and present checkpoints, but MUST NOT author phase content.
 - **FR-072**: Phase validation and review MUST finish as a blocking part of the active phase before its human checkpoint; detached or asynchronous reviewers MUST NOT alter the verdict, authorize a checkpoint, or advance the workflow after the checkpoint is presented.
+- **FR-073**: Before any flow can enter native Specify or external compatibility validation, the system MUST check for a usable project constitution and MUST treat a missing, empty, structurally invalid, or unresolved-template document as unusable; if the check fails, it MUST invoke the canonical constitution workflow as a blocking prerequisite and MUST NOT continue the originating flow until that workflow returns an approved constitution. Warnings or version differences that do not violate mandatory structure MUST NOT force reapproval by themselves.
+- **FR-074**: A generated-constitution checkpoint MUST offer exactly approve and continue or request changes; approval MUST be attributable and immediately resume the originating flow, while requested changes MUST revise and revalidate the same draft before repeating the checkpoint.
+- **FR-075**: The constitution gate MUST apply to explicitly invoked native specification preparation, a full native workflow nested from `/do-work`, CTO-coordinated specification preparation, and external specification intake; after approval it MUST resume the exact originating entry point, entering Specify for native flows or compatibility validation for external intake.
+- **FR-076**: Specification preparation and external intake MUST reuse the canonical constitution workflow's generation, validation, revision, approval, and persistence contracts; they MUST NOT implement a second constitution generator, writer, checkpoint state machine, or approval path.
+- **FR-077**: Every phase validation, phase approval, compatibility decision, and implementation handoff MUST record the exact project constitution version and content fingerprint against which it was evaluated.
+- **FR-078**: When the constitution changes, the workflow MUST perform semantic impact analysis, mark only affected specification artifacts and handoffs stale, and block their use until revalidated and reapproved; artifacts with recorded no-impact evidence MUST retain approval, and non-semantic file changes MUST NOT invalidate them.
 
 ### Requirement Acceptance Map
 
 | Requirements | Acceptance evidence |
 | --- | --- |
-| FR-001–FR-005 | User Story 1 scenarios 1 and 4; User Story 6 scenario 3 |
-| FR-006–FR-009 | User Story 1 scenarios 1–3; User Story 3 scenario 1 |
+| FR-001–FR-005 | User Story 1 scenarios 6 and 9; User Story 6 scenario 3 |
+| FR-006–FR-009 | User Story 1 scenarios 6–8; User Story 3 scenario 1 |
 | FR-010–FR-017 | User Story 2 scenarios 1–5 |
 | FR-018–FR-020 | User Story 6 scenarios 1–4 |
 | FR-021–FR-025 | User Story 3 scenarios 1–4; User Story 4 scenarios 2–6 |
@@ -303,7 +326,9 @@ As a user with several independent feature ideas or a broad initiative, I want C
 | FR-034–FR-044 | User Story 8 scenarios 1–6 |
 | FR-045–FR-053 | User Story 9 scenarios 1–7; User Story 8 scenarios 4–6 |
 | FR-054–FR-070 | User Story 4 scenarios 1–8 |
-| FR-071–FR-072 | User Story 1 scenarios 1–3; User Story 2 scenarios 1–3; User Story 5 scenarios 3–4 |
+| FR-071–FR-072 | User Story 1 scenarios 6–8; User Story 2 scenarios 1–3; User Story 5 scenarios 3–4 |
+| FR-073–FR-076 | User Story 1 scenarios 1–5; User Story 4 scenario 9; SC-020 |
+| FR-077–FR-078 | User Story 2 scenario 6; SC-021 |
 
 ### Key Entities
 
@@ -314,6 +339,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **Checkpoint Decision**: An attributable user choice to approve and continue, request changes, or approve and stop, bound to one validated artifact version.
 - **Traceability Link**: A relationship connecting a requirement to acceptance scenarios, plan decisions, tasks, and verification evidence.
 - **Implementation Handoff**: The current approved, executor-neutral contract that allows `/do-work` or CTO mode to begin implementation without repeating specification work.
+- **Constitution Binding**: The project constitution version and content fingerprint used for a validation, approval, compatibility decision, or implementation handoff, plus any later semantic impact result.
 - **Language Preference**: The selected document language, its source, and the artifact versions to which it applies.
 - **Legacy Specification Run**: Existing JSON-only or prior-format state that may be migrated but is never assumed approved merely because it completed under an older workflow.
 - **Execution Claim**: A durable, exclusive binding between one approved specification version and its active executor, preventing duplicate `/do-work` or CTO execution.
@@ -359,6 +385,9 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **SC-016**: 100% of approved imported handoffs become stale before further dispatch when any bound external source or compatibility supplement changes.
 - **SC-017**: A user can select a complete external bundle, inspect its compatibility report, and reach the approval checkpoint in one intake invocation without repeating internal specification phases.
 - **SC-018**: In direct and `/do-work`-nested specification runtime traces, 100% of phase-content outputs are attributable to declared subagent dispatches, every checkpoint is presented only after validation completes, and zero detached review result can mutate or advance the phase.
+- **SC-019**: Across every native-preparation and external-intake entry point plus missing, empty, unresolved-template, structurally invalid, warning-only, and version-difference constitution fixtures, 100% of unusable constitutions block the originating flow until the generated draft is explicitly approved, while every usable constitution proceeds without reapproval; each approval resumes the originating entry point and each requested change returns to the same constitution checkpoint.
+- **SC-020**: In 100% of starts with a missing or unusable constitution, the user sees one canonical constitution draft and checkpoint sequence, the originating flow remains blocked until approval, approval resumes that flow exactly once, and no duplicate constitution draft or approval is created.
+- **SC-021**: Across semantic constitution amendments that affect none, some, or all approved artifacts plus formatting-only changes, 100% of affected specifications and handoffs become stale before use, 100% of unaffected artifacts retain approval with no-impact evidence, and zero formatting-only changes trigger reapproval.
 
 ## Assumptions
 
@@ -367,7 +396,8 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - Explicit phase commands and checkpoint-driven continuation coexist: users may invoke each phase manually, while approve-and-continue provides a deliberate convenience path.
 - Human approval is required at all three phase boundaries for the full workflow; autonomous implementation does not imply autonomous specification approval.
 - Direct and `/do-work`-nested specification drafting is always delegated to declared subagents. The main session remains a coordinator for durable control, deterministic materialization, validation, and synchronous human checkpoints; it does not become the specification author or host detached review work.
-- The current project constitution remains authoritative, and every template and validation profile includes an explicit constitution-compliance check.
+- The workflow checks for a usable project constitution before entering native Specify or external compatibility validation. When none exists, it invokes the canonical constitution workflow as the blocking prerequisite defined by FR-073–FR-076; once approved, the constitution remains authoritative and every template and validation profile includes an explicit constitution-compliance check.
+- Approved native and imported artifacts remain bound to the exact constitution version and fingerprint used for validation; later constitution changes follow the targeted stale-impact rules in FR-077–FR-078 rather than unconditional invalidation.
 - Existing workflow owners and command-registration boundaries remain in force; this feature changes the specification experience and shared execution handoff, not ownership semantics.
 - Research of Spec Kit, OpenSpec, Superpowers, XPowers, and BMAD informs planning, but the plugin keeps its own domain-agnostic, durable workflow engine rather than embedding another framework.
 - Bug-fix, emergency, research-only, and product-discovery workflows are outside this feature except where they intentionally invoke or consume the shared specification handoff contract.
