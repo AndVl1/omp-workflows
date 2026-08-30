@@ -18,6 +18,7 @@
 - Q: Как нулевой шаг должен создавать или исправлять конституцию? → A: Использовать поставляемый плагином constitution workflow как блокирующий prerequisite; генерация, валидация, revision loop и approval не зависят от установленного Spec Kit или другого внешнего фреймворка.
 - Q: Где хранится конституция и как учитывается существующий файл Spec Kit? → A: Разрешать путь в порядке explicit `constitution.path` → ровно один найденный provider → нативный `CONSTITUTION.md` в корне проекта; Spec Kit может предоставить только опциональный file provider, несколько кандидатов блокируют поток до явного выбора.
 - Q: Что должно происходить с уже одобренными спецификациями и implementation handoff после смыслового изменения конституции? → A: Выполнять impact analysis, помечать stale только затронутые артефакты и требовать их повторную валидацию и одобрение.
+- Q: Какой контракт должен блокировать завершение реализации, если спецификация уже одобрена? → A: Одобренная спецификация остаётся единственным feature-specific контрактом: каждое требование закрывается доказательствами ревью и, для проверяемого поведения, выполненных тестов; расхождения блокируют завершение, общепроектные quality gates сохраняются, отдельный feature DoD не создаётся.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -38,7 +39,7 @@ As a developer, I want specification work split into explicit Specify, Plan, and
 5. **Given** the user approves the generated constitution, **When** the attributable decision is recorded, **Then** the constitution becomes the current project policy and Specify starts immediately.
 6. **Given** a completed constitution check, **When** the Specify phase completes, **Then** the workflow creates one discoverable feature workspace with a structured specification document based on the active template.
 7. **Given** an approved specification, **When** the Plan phase completes, **Then** the feature workspace contains a readable plan that traces design decisions and verification strategy back to approved requirements.
-8. **Given** an approved plan, **When** the Tasks phase completes, **Then** the workspace contains a dependency-aware task list whose tasks trace to requirements and state observable completion evidence.
+8. **Given** an approved plan, **When** the Tasks phase completes, **Then** the workspace contains a dependency-aware task list whose tasks trace to requirements and state the observable evidence required to prove completion.
 9. **Given** a completed feature workspace, **When** a reviewer opens it, **Then** the phase order, current status, approvals, validation results, and next valid action are visible without parsing JSON.
 10. **Given** no constitution, no configured path, and no external specification framework installed, **When** constitution bootstrap runs, **Then** the plugin's native constitution workflow delegates draft generation to a declared subagent, materializes `CONSTITUTION.md` from the shipped framework-neutral template, validates it, and reaches the two-decision checkpoint without invoking or installing external tooling.
 11. **Given** an explicit constitution path, one existing registered provider, no existing provider, or multiple existing providers, **When** constitution resolution runs, **Then** it uses explicit override first, otherwise the single provider, otherwise root `CONSTITUTION.md`, and fails closed for explicit selection when several candidates exist.
@@ -51,7 +52,7 @@ As a reviewer, I want an explicit checkpoint after Specify, Plan, and Tasks, so 
 
 **Why this priority**: A specification workflow is not trustworthy if phase transitions are implicit or if approval cannot be distinguished from continuation.
 
-**Independent Test**: Exercise all three checkpoint decisions at each phase and verify that the workflow advances, revises, or pauses exactly as selected while preserving durable state across a new session.
+**Independent Test**: Validate complete, incomplete, contradictory, untestable, and constitution-conflicting phase artifacts, then exercise all three checkpoint decisions for valid artifacts and verify that only valid artifacts reach a checkpoint while durable decisions resume correctly in a new session.
 
 **Acceptance Scenarios**:
 
@@ -61,6 +62,7 @@ As a reviewer, I want an explicit checkpoint after Specify, Plan, and Tasks, so 
 4. **Given** the user chooses approve and stop, **When** the session ends, **Then** a later explicit phase command resumes from the first unapproved phase without repeating approved work.
 5. **Given** an approved upstream artifact is revised later, **When** the revision changes a downstream dependency, **Then** affected downstream approvals are marked stale and cannot be used for implementation until revalidated and reapproved.
 6. **Given** the current constitution differs from the version bound to an approved artifact or handoff, **When** semantic impact analysis runs, **Then** only affected specifications, plans, tasks, and handoffs become stale and require revalidation and reapproval, while unaffected artifacts retain approval with recorded no-impact evidence.
+7. **Given** a phase artifact contains mutually inconsistent statements, untestable acceptance outcomes, broken traceability, or a constitution conflict, **When** phase validation runs, **Then** it blocks the checkpoint and reports the conflicting locations, violated criteria, and required correction path.
 
 ---
 
@@ -70,7 +72,7 @@ As a developer, I want `/do-work` to recognize a complete specification workspac
 
 **Why this priority**: The specification workflow delivers value only when it removes ambiguity and redundant discovery from implementation while retaining validation and safety gates.
 
-**Independent Test**: Invoke `/do-work` for a feature whose Specify, Plan, and Tasks phases are approved and verify that implementation begins from the approved task set, with requirement and verification context preserved.
+**Independent Test**: Invoke `/do-work` for a feature whose Specify, Plan, and Tasks phases are approved, implement it from the approved task set, and verify that completion remains blocked until every requirement and acceptance scenario has traceable review evidence and every observable behavior has passing executed test evidence.
 
 **Acceptance Scenarios**:
 
@@ -78,6 +80,7 @@ As a developer, I want `/do-work` to recognize a complete specification workspac
 2. **Given** an approved implementation contract, **When** `/do-work` prepares execution, **Then** it skips redundant product discovery, requirements elicitation, and architecture selection while retaining implementation, review, testing, and completion gates.
 3. **Given** the requested implementation conflicts with an approved artifact, **When** `/do-work` detects the conflict, **Then** it pauses and routes the user back to the earliest affected specification phase rather than silently changing scope.
 4. **Given** a partial or stale feature workspace, **When** `/do-work` is invoked, **Then** it resumes or requests completion of the earliest incomplete phase and does not begin implementation.
+5. **Given** implementation work is reported complete, **When** final conformance validation runs, **Then** every approved requirement and acceptance scenario must have traceable implementation evidence and a passing review verdict, every observable behavior must also have passing executed test evidence, and any missing, failed, stale, or contradictory evidence blocks completion.
 
 ---
 
@@ -240,10 +243,10 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **FR-005**: Each phase MUST resolve and apply a versioned template that defines mandatory sections and permits project-level customization without removing required contracts.
 - **FR-006**: Specify MUST capture the problem, actors, user journeys, scope, non-goals, constraints, testable requirements, edge cases, assumptions, dependencies, and measurable success criteria.
 - **FR-007**: Plan MUST capture repository-grounded context, considered options, selected decisions and rationale, boundaries, contracts, data and control flow, compatibility and migration impact, security and operational concerns, and verification strategy.
-- **FR-008**: Tasks MUST produce dependency-aware, independently verifiable work items that identify their originating requirements, expected outcome, affected scope, and completion evidence.
-- **FR-009**: Every functional requirement MUST trace to acceptance scenarios, plan decisions, one or more implementation tasks, and verification evidence before the feature is marked implementation-ready.
+- **FR-008**: Tasks MUST produce dependency-aware, independently verifiable work items that identify their originating requirements, expected outcome, affected scope, and evidence required to prove completion.
+- **FR-009**: Before a feature is marked implementation-ready, every functional requirement MUST trace to acceptance scenarios, plan decisions, one or more implementation tasks, and an explicit verification obligation; executed implementation and test evidence is recorded later by the requirement-closure matrix in FR-080 and FR-081.
 - **FR-010**: The workflow MUST validate each phase before presenting its human checkpoint and MUST show pass/fail status with actionable findings in a readable form.
-- **FR-011**: Validation MUST cover required sections, unresolved clarifications, contradictions, scope bounds, traceability, stale dependencies, constitution compliance, and implementation readiness appropriate to the current phase.
+- **FR-011**: Validation MUST cover semantic validity, internal consistency across actors, scenarios, requirements, entities, and success criteria, required sections, unresolved clarifications, scope bounds, acceptance testability, traceability, stale dependencies, constitution compliance, and implementation readiness appropriate to the current phase.
 - **FR-012**: A failed mandatory validation MUST block approval and continuation; the user MUST receive the specific failing criteria and a path to revise the artifact.
 - **FR-013**: After a phase passes validation, the checkpoint MUST offer exactly three decisions: approve and continue, request changes, and approve and stop.
 - **FR-014**: A request-changes decision MUST capture the user's feedback, revise only the affected phase and dependencies, re-run validation, and return to the same checkpoint.
@@ -312,6 +315,9 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **FR-077**: Every phase validation, phase approval, compatibility decision, and implementation handoff MUST record the exact project constitution provider, resolved path, version, and content fingerprint against which it was evaluated.
 - **FR-078**: When the constitution changes, the workflow MUST perform semantic impact analysis, mark only affected specification artifacts and handoffs stale, and block their use until revalidated and reapproved; artifacts with recorded no-impact evidence MUST retain approval, and non-semantic file changes MUST NOT invalidate them.
 - **FR-079**: Constitution resolution MUST use this precedence: authorized explicit `constitution.path`, exactly one existing registered provider, then native project-root `CONSTITUTION.md`; multiple plausible providers, unsafe paths, or invalid provider contracts MUST fail closed before validation or generation, and provider discovery MUST NOT invoke external commands, CLIs, installers, package managers, or network services.
+- **FR-080**: Before `/do-work`, CTO mode, or another executor marks a feature complete, it MUST validate the implementation against the exact approved implementation handoff and produce a readable requirement-closure matrix.
+- **FR-081**: The requirement-closure matrix MUST give every approved functional requirement and acceptance scenario traceable implementation evidence and a passing review verdict; every observable behavior MUST also have passing executed test evidence. Missing, failed, stale, or contradictory evidence MUST block completion, and changed intent MUST return to the earliest affected specification phase instead of changing the approved contract during implementation.
+- **FR-082**: The approved specification plus quality gates mandated by the project constitution and selected execution profile MUST form the complete completion contract. The workflow MUST NOT require a separate feature-specific Definition of Done that duplicates or reinterprets specification requirements, and generic quality gates MUST NOT authorize completion without satisfying FR-080 and FR-081.
 
 ### Requirement Acceptance Map
 
@@ -319,7 +325,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 | --- | --- |
 | FR-001–FR-005 | User Story 1 scenarios 6 and 9; User Story 6 scenario 3 |
 | FR-006–FR-009 | User Story 1 scenarios 6–8; User Story 3 scenario 1 |
-| FR-010–FR-017 | User Story 2 scenarios 1–5 |
+| FR-010–FR-017 | User Story 2 scenarios 1–7; SC-023 |
 | FR-018–FR-020 | User Story 6 scenarios 1–4 |
 | FR-021–FR-025 | User Story 3 scenarios 1–4; User Story 4 scenarios 2–6 |
 | FR-026–FR-028 | User Story 5 scenarios 1–4 |
@@ -334,6 +340,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 | FR-073–FR-076 | User Story 1 scenarios 1–5 and 10; User Story 4 scenario 9; SC-020 |
 | FR-077–FR-078 | User Story 2 scenario 6; SC-021 |
 | FR-079 | User Story 1 scenarios 10–11; SC-022 |
+| FR-080–FR-082 | User Story 3 scenario 5; SC-024 |
 
 ### Key Entities
 
@@ -342,7 +349,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **Template Set**: The mandatory structure and guidance used to create each phase artifact, with a resolved source and version.
 - **Validation Result**: A phase-specific set of passed and failed quality criteria, actionable findings, artifact version, and timestamp.
 - **Checkpoint Decision**: An attributable user choice to approve and continue, request changes, or approve and stop, bound to one validated artifact version.
-- **Traceability Link**: A relationship connecting a requirement to acceptance scenarios, plan decisions, tasks, and verification evidence.
+- **Traceability Link**: A relationship connecting a requirement to acceptance scenarios, plan decisions, tasks, pre-implementation verification obligations, and post-implementation review and test evidence.
 - **Implementation Handoff**: The current approved, executor-neutral contract that allows `/do-work` or CTO mode to begin implementation without repeating specification work.
 - **Constitution Binding**: The project constitution version and content fingerprint used for a validation, approval, compatibility decision, or implementation handoff, plus any later semantic impact result.
 - **Constitution Provider Selection**: The immutable provider id, resolved project-relative path, template source, selection provenance, and fingerprint chosen by explicit override, unique discovery, or the native default.
@@ -356,6 +363,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **Compatibility Report**: The readable mapping from external artifacts to required implementation-contract concepts, including readiness status, ignored content, warnings, and blocking gaps.
 - **Compatibility Supplement**: A local, attributable document containing only information required to close gaps in an external bundle without changing the original source.
 - **Format Recognition Result**: The declared or detected external convention, confidence, selected source artifacts, ignored candidates, and whether generic intake was used.
+- **Implementation Conformance Result**: A version-bound requirement-closure matrix that maps every approved requirement and acceptance scenario to implementation evidence, review verdicts, executed test evidence where behavior is observable, and an overall pass or blocking result.
 
 ### Reference-Informed Product Direction
 
@@ -395,6 +403,8 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **SC-020**: In 100% of starts with a missing or unusable constitution, the user sees one canonical constitution draft and checkpoint sequence, the originating flow remains blocked until approval, approval resumes that flow exactly once, and no duplicate constitution draft or approval is created.
 - **SC-021**: Across semantic constitution amendments that affect none, some, or all approved artifacts plus formatting-only changes, 100% of affected specifications and handoffs become stale before use, 100% of unaffected artifacts retain approval with no-impact evidence, and zero formatting-only changes trigger reapproval.
 - **SC-022**: Across projects with no external framework, an explicit constitution override, one discovered provider, multiple providers, and an unsafe provider path, 100% of native bootstraps use the required precedence, create or update exactly one selected readable constitution, block every ambiguous/unsafe selection, and invoke zero external commands, CLIs, installers, package managers, or network services.
+- **SC-023**: Across complete, incomplete, contradictory, untestable, broken-traceability, and constitution-conflicting phase fixtures, 100% of invalid artifacts are blocked before checkpoint presentation with actionable findings, while 100% of valid artifacts reach the expected checkpoint without false blockers.
+- **SC-024**: Across complete, partially implemented, review-rejected, test-failing, stale-evidence, and changed-intent implementations executed through `/do-work` and CTO mode, 100% of feature completions require a passing closure entry for every approved requirement and acceptance scenario, every observable behavior has passing executed test evidence, and zero separate feature-specific DoD can override the verdict.
 
 ## Assumptions
 
@@ -416,3 +426,4 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - The external bundle remains immutable source evidence; the import snapshot and any local supplement form this plugin's execution contract and never claim to replace the source framework's own state.
 - Initial interoperability covers authorized local text artifacts. Remote fetching, binary document extraction, external-framework installation, write-back, export, and bidirectional synchronization are out of scope.
 - Spec Kit, OpenSpec, BMAD, Superpowers, and XPowers are compatibility fixtures and design references, not core dependencies; unknown frameworks remain eligible through generic conformance validation.
+- Feature completion is governed by the approved specification and existing project or execution-profile quality gates. Review and testing populate one requirement-closure matrix; a separate feature-specific Definition of Done is intentionally out of scope because it would create a second acceptance contract.
