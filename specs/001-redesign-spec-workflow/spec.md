@@ -283,6 +283,8 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **FR-068**: `/do-work` MUST be able to consume one approved imported handoff, and CTO mode MUST be able to consume one or more approved imported handoffs through the same execution claims, preflight, traceability, and fail-closed rules as native specifications.
 - **FR-069**: External source files MUST remain unchanged during import and execution; local supplements, workflow state, progress, and results MUST be stored separately, and external-framework write-back or export is outside this feature.
 - **FR-070**: The user MUST be able to inspect the supported-format and conformance result, including which framework-specific mapping was used, which artifacts were ignored, and whether generic intake remains available.
+- **FR-071**: Every content-producing Specify, Plan, and Tasks stage, including a full specification workflow nested from `/do-work`, MUST execute through a declared subagent dispatch; the main session MAY coordinate, validate, materialize a worker's typed result, and present checkpoints, but MUST NOT author phase content.
+- **FR-072**: Phase validation and review MUST finish as a blocking part of the active phase before its human checkpoint; detached or asynchronous reviewers MUST NOT alter the verdict, authorize a checkpoint, or advance the workflow after the checkpoint is presented.
 
 ### Requirement Acceptance Map
 
@@ -301,6 +303,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 | FR-034–FR-044 | User Story 8 scenarios 1–6 |
 | FR-045–FR-053 | User Story 9 scenarios 1–7; User Story 8 scenarios 4–6 |
 | FR-054–FR-070 | User Story 4 scenarios 1–8 |
+| FR-071–FR-072 | User Story 1 scenarios 1–3; User Story 2 scenarios 1–3; User Story 5 scenarios 3–4 |
 
 ### Key Entities
 
@@ -355,6 +358,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **SC-015**: Across incomplete, ambiguous, delta-only, unsupported, and hostile external bundles, 100% of blocking gaps are reported before implementation and zero unsafe bundles reach an executor.
 - **SC-016**: 100% of approved imported handoffs become stale before further dispatch when any bound external source or compatibility supplement changes.
 - **SC-017**: A user can select a complete external bundle, inspect its compatibility report, and reach the approval checkpoint in one intake invocation without repeating internal specification phases.
+- **SC-018**: In direct and `/do-work`-nested specification runtime traces, 100% of phase-content outputs are attributable to declared subagent dispatches, every checkpoint is presented only after validation completes, and zero detached review result can mutate or advance the phase.
 
 ## Assumptions
 
@@ -362,6 +366,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - The preferred baseline workspace contains one readable document per phase and a readable status or handoff view; exact auxiliary filenames are finalized during planning as long as discoverability remains stable.
 - Explicit phase commands and checkpoint-driven continuation coexist: users may invoke each phase manually, while approve-and-continue provides a deliberate convenience path.
 - Human approval is required at all three phase boundaries for the full workflow; autonomous implementation does not imply autonomous specification approval.
+- Direct and `/do-work`-nested specification drafting is always delegated to declared subagents. The main session remains a coordinator for durable control, deterministic materialization, validation, and synchronous human checkpoints; it does not become the specification author or host detached review work.
 - The current project constitution remains authoritative, and every template and validation profile includes an explicit constitution-compliance check.
 - Existing workflow owners and command-registration boundaries remain in force; this feature changes the specification experience and shared execution handoff, not ownership semantics.
 - Research of Spec Kit, OpenSpec, Superpowers, XPowers, and BMAD informs planning, but the plugin keeps its own domain-agnostic, durable workflow engine rather than embedding another framework.

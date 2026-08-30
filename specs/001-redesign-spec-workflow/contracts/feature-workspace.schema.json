@@ -1,0 +1,217 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://andvl1.dev/omp-workflows/specification/feature-workspace.schema.json",
+  "title": "Feature Workspace State",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "feature_id",
+    "display_name",
+    "source_kind",
+    "project_root",
+    "workspace_path",
+    "state_path",
+    "profile_name",
+    "profile_hash",
+    "language",
+    "template_set",
+    "phases",
+    "status",
+    "next_action"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "feature_id": {
+      "type": "string"
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": ["native", "external", "legacy"]
+    },
+    "project_root": {
+      "type": "string"
+    },
+    "workspace_path": {
+      "type": "string"
+    },
+    "state_path": {
+      "type": "string"
+    },
+    "profile_name": {
+      "type": "string"
+    },
+    "profile_hash": {
+      "type": "string"
+    },
+    "language": {
+      "type": "object",
+      "required": ["language", "source", "selection_hash"],
+      "additionalProperties": false,
+      "properties": {
+        "language": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string",
+          "enum": ["feature_override", "project_default", "request_language"]
+        },
+        "selection_hash": {
+          "type": "string"
+        }
+      }
+    },
+    "template_set": {
+      "type": "object",
+      "required": ["template_set_id", "source", "content_hash", "required_markers"],
+      "additionalProperties": false,
+      "properties": {
+        "template_set_id": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string",
+          "enum": ["feature_override", "project_default", "shipped_default"]
+        },
+        "content_hash": {
+          "type": "string"
+        },
+        "required_markers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": [
+          "phase",
+          "status",
+          "current_version",
+          "approved_version",
+          "validation_ref",
+          "checkpoint_ref",
+          "upstream_versions",
+          "stale_reason",
+          "last_feedback"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "phase": {
+            "type": "string",
+            "enum": ["specify", "plan", "tasks"]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "not_started",
+              "generating",
+              "materialized",
+              "validating",
+              "awaiting_approval",
+              "revision_required",
+              "approved",
+              "stale",
+              "blocked"
+            ]
+          },
+          "current_version": {
+            "type": ["integer", "null"],
+            "minimum": 1
+          },
+          "approved_version": {
+            "type": ["integer", "null"],
+            "minimum": 1
+          },
+          "validation_ref": {
+            "type": ["string", "null"]
+          },
+          "checkpoint_ref": {
+            "type": ["string", "null"]
+          },
+          "upstream_versions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["phase", "version", "hash"],
+              "additionalProperties": false,
+              "properties": {
+                "phase": {
+                  "type": "string",
+                  "enum": ["specify", "plan", "tasks"]
+                },
+                "version": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "hash": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "stale_reason": {
+            "type": ["string", "null"]
+          },
+          "last_feedback": {
+            "type": ["string", "null"]
+          }
+        }
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "created",
+        "in_progress",
+        "implementation_ready",
+        "claimed",
+        "executing",
+        "completed",
+        "blocked",
+        "stale"
+      ]
+    },
+    "next_action": {
+      "type": "object",
+      "required": ["kind", "command", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["command", "checkpoint", "remediation", "none"]
+        },
+        "command": {
+          "type": ["string", "null"]
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    "handoff_ref": {
+      "type": ["string", "null"]
+    },
+    "execution_claim_ref": {
+      "type": ["string", "null"]
+    },
+    "import_ref": {
+      "type": ["string", "null"]
+    },
+    "migration_receipt_ref": {
+      "type": ["string", "null"]
+    }
+  }
+}

@@ -40,3 +40,5 @@
 - Validation iteration 4 added read-only intake and execution of external specification bundles as the first interoperability slice.
 - The review made native and imported readiness explicit, restored priority ordering across all user stories, and bounded external content as untrusted, immutable source evidence.
 - Revalidation passed all checklist items. User Stories 1–9, FR-001–FR-070, SC-001–SC-017, and the external-spec acceptance mapping are complete and contiguous.
+- Validation iteration 5 added FR-071–FR-072 and SC-018 for subagent-only phase authorship, blocking validation, and synchronous checkpoints with no detached review.
+- Revalidation passed all checklist items. The acceptance map now covers FR-001–FR-072 and SC-001–SC-018.
