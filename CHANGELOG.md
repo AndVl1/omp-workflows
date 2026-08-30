@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.27.1] — 2026-08-31
+### Fixed
+- **Fail-closed `TeamDef` registry loading for `/cto`** — `.omp/teams.json` entries are now validated against the complete runtime shape before use, so malformed `scope`, `profile`, `lead`, or `roster` values are excluded instead of reaching command rendering and crashing on `scope.join(...)`; this repository's team registry now uses the canonical `scope: ["dev"]` identifier array.
+
 ## [0.27.0] — 2026-08-30
 ### Added
 - **Dedicated `LECTURE_RESEARCH` intent and `lecture-research` profile** — a first-class PHASE-0 task type (one public YouTube video/playlist URL plus a natural-language prompt is the only user content prerequisite; no transcript is requested) that resolves deterministically to the research-only, human-gated `lecture-research` profile at EVERY complexity and autonomy, distinct from generic `INVESTIGATION` → `research`. A model-provided workflow cannot hijack the dedicated intent — the classification gate fails closed (`LECTURE_RESEARCH` must resolve to `lecture-research`). The six-stage sequence is intake → acquisition → lecture mapping → synthesis → read-only repo-fit plus security/IP review → explicit human approval/stop gate; `/do-work` and `/cto` resolve it from the same workflow matrix (no new slash command), with CTO research-only staffing (`analyst`, `tech-researcher`, `diagnostics` for parallel mapping, then `architect` + `security-tester`).
