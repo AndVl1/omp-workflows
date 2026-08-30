@@ -37,3 +37,6 @@
 - Validation iteration 3 added contract-level CTO support after reviewing the current CTO profile, main-session orchestration contract, amend behavior, team limits, and nested-CTO guard.
 - The CTO review found and corrected three executor-specific assumptions: the final handoff action, Implementation Handoff entity, and ownership-boundary wording are now executor-neutral.
 - Revalidation passed all checklist items. The acceptance map covers FR-001–FR-053, including prepared-spec execution and CTO-coordinated preparation.
+- Validation iteration 4 added read-only intake and execution of external specification bundles as the first interoperability slice.
+- The review made native and imported readiness explicit, restored priority ordering across all user stories, and bounded external content as untrusted, immutable source evidence.
+- Revalidation passed all checklist items. User Stories 1–9, FR-001–FR-070, SC-001–SC-017, and the external-spec acceptance mapping are complete and contiguous.

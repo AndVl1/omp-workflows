@@ -6,7 +6,7 @@
 
 **Status**: Draft
 
-**Input**: User description: "Redesign the plugin's specification-generation workflow so that specification, plan, and tasks are readable, structured, explicitly reviewable, language-configurable, and ready for a reliable handoff to `/do-work`; use Spec Kit as the primary reference and assess useful practices from OpenSpec, Superpowers, XPowers, and BMAD."
+**Input**: User description: "Redesign the plugin's specification-generation workflow so that specification, plan, and tasks are readable, structured, explicitly reviewable, language-configurable, and ready for reliable execution through `/do-work` or CTO mode; support read-only execution of specifications prepared by other frameworks; use Spec Kit as the primary reference and assess useful practices from OpenSpec, Superpowers, XPowers, and BMAD."
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -62,7 +62,29 @@ As a developer, I want `/do-work` to recognize a complete specification workspac
 
 ---
 
-### User Story 4 - Right-size work when no specification exists (Priority: P2)
+### User Story 4 - Execute specifications from other frameworks (Priority: P1)
+
+As a developer with a completed specification from another framework, I want to validate and execute it through this plugin without rewriting it into a new format, so existing planning work can reach `/do-work` or CTO mode quickly and safely.
+
+**Why this priority**: Read-only intake of an already prepared specification is the smallest useful interoperability slice. It can deliver implementation value before the redesigned generation workflow is complete, provided the plugin normalizes and validates the external contract instead of trusting folder names or framework status.
+
+**Independent Test**: Select representative Spec Kit, OpenSpec, BMAD, Superpowers/XPowers-style, and generic Markdown specification bundles, then verify that complete bundles reach one explicit compatibility checkpoint and execute through the standard handoff while incomplete, changed, ambiguous, or unsafe bundles remain blocked with actionable findings.
+
+**Acceptance Scenarios**:
+
+1. **Given** an explicit path to an external specification bundle, **When** intake starts, **Then** the workflow discovers candidate requirements, plan, task, decision, and validation artifacts read-only and records their framework, source paths, source revision, and content fingerprint.
+2. **Given** an external bundle that contains the required implementation contract, **When** compatibility validation passes, **Then** the workflow produces the same executor-neutral implementation handoff used by native specifications plus a readable source-to-handoff mapping.
+3. **Given** a complete external handoff, **When** the user approves the compatibility checkpoint, **Then** `/do-work` or CTO mode can begin from the imported tasks without repeating internal Specify, Plan, and Tasks phases.
+4. **Given** an external bundle with missing or ambiguous required information, **When** compatibility validation runs, **Then** it separates blocking gaps from warnings, proposes only the necessary local supplement, and starts no implementation.
+5. **Given** the user approves a compatibility supplement, **When** the external source and supplement together satisfy readiness, **Then** they form one versioned handoff while the original external files remain unchanged.
+6. **Given** an approved imported handoff whose external source later changes, **When** execution or resume is attempted, **Then** the handoff becomes stale and requires re-import, impact review, and renewed approval.
+7. **Given** framework-specific metadata is unknown or unavailable but the documents are readable, **When** the user identifies the relevant files, **Then** the generic intake path applies the same conformance validation without requiring that framework to be installed.
+8. **Given** external documents contain embedded instructions, unsafe links, secrets, unsupported files, or paths outside the authorized project boundary, **When** intake evaluates them, **Then** it treats content as untrusted data, redacts or rejects unsafe material, and performs no unauthorized action.
+
+---
+
+
+### User Story 5 - Right-size work when no specification exists (Priority: P2)
 
 As a developer, I want `/do-work` to adapt its preparation depth when no specification exists, so small changes remain efficient while complex or risky features receive deliberate specification and human validation.
 
@@ -79,7 +101,7 @@ As a developer, I want `/do-work` to adapt its preparation depth when no specifi
 
 ---
 
-### User Story 5 - Select language and adapt templates (Priority: P2)
+### User Story 6 - Select language and adapt templates (Priority: P2)
 
 As a plugin user or workflow owner, I want to select the language of specification documents and use project-appropriate templates, so artifacts are readable to their intended audience without losing a stable phase contract.
 
@@ -96,7 +118,7 @@ As a plugin user or workflow owner, I want to select the language of specificati
 
 ---
 
-### User Story 6 - Recover and migrate existing specification runs (Priority: P3)
+### User Story 7 - Recover and migrate existing specification runs (Priority: P2)
 
 As an existing user, I want JSON-only or interrupted specification runs handled explicitly, so the redesign does not silently lose work or incorrectly declare old artifacts implementation-ready.
 
@@ -112,7 +134,7 @@ As an existing user, I want JSON-only or interrupted specification runs handled 
 
 ---
 
-### User Story 7 - Execute approved specifications through CTO mode (Priority: P2)
+### User Story 8 - Execute approved specifications through CTO mode (Priority: P2)
 
 As a developer with one or more approved feature specifications, I want CTO mode to execute their task graphs through parallel teams when safe, so coordinated implementation can scale without discarding specification decisions or traceability.
 
@@ -131,7 +153,7 @@ As a developer with one or more approved feature specifications, I want CTO mode
 
 ---
 
-### User Story 8 - Prepare specifications through CTO mode (Priority: P3)
+### User Story 9 - Prepare specifications through CTO mode (Priority: P3)
 
 As a user with several independent feature ideas or a broad initiative, I want CTO mode to coordinate specification preparation and return the resulting documents for my review, so research and drafting can proceed in parallel without creating a separate specification system.
 
@@ -176,6 +198,16 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - A hard-human security, production, destructive, or migration decision appears inside a batched CTO review.
 - A CTO result attempts to mark specification approval, validation, or task completion without the corresponding specification-bound evidence.
 - A specification's required branch or worktree strategy conflicts with the active CTO run.
+- An external framework marks tasks complete or approved but provides no attributable evidence accepted by this plugin.
+- An external change bundle contains only deltas and references a missing or incompatible baseline specification.
+- Several external frameworks or candidate document sets exist in the same directory and automatic detection is ambiguous.
+- An external bundle has requirements and design but no executable task graph, or tasks have duplicate or unstable identifiers.
+- External documents change between discovery, compatibility approval, CTO plan confirmation, and implementation dispatch.
+- A generic Markdown bundle mixes languages, terminology, generated code, implementation progress, and unresolved decisions.
+- External documents reference remote files, symlinks, binaries, oversized content, or paths outside the authorized project root.
+- External text contains prompt-injection instructions, secrets, executable snippets, or claims that conflict with repository evidence.
+- A compatibility supplement drifts from or contradicts the external source on a later import.
+- The source framework is upgraded and its artifact layout changes while an imported handoff is resumable.
 
 ## Requirements *(mandatory)*
 
@@ -201,7 +233,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **FR-018**: The user MUST be able to select a feature document language, and the workflow MUST resolve it using this precedence: feature override, project default, initiating-request language.
 - **FR-019**: The selected language MUST apply consistently to generated prose across all phase documents, validation findings, and handoff summaries while preserving technical identifiers and authoritative quotations where appropriate.
 - **FR-020**: The language choice and its source MUST be visible in the feature workspace; changing it after approval MUST trigger regeneration, validation, and approval of affected artifacts.
-- **FR-021**: A feature MUST be marked implementation-ready only when Specify, Plan, and Tasks are current, pass validation, and carry explicit human approval.
+- **FR-021**: A native feature MUST be marked implementation-ready only when Specify, Plan, and Tasks are current, pass validation, and carry explicit human approval; imported specifications MUST satisfy the equivalent compatibility requirements in FR-054–FR-070.
 - **FR-022**: `/do-work` MUST detect an unambiguous implementation-ready feature workspace and use its approved documents and traceability as the authoritative implementation contract.
 - **FR-023**: When an implementation-ready workspace exists, `/do-work` MUST skip redundant discovery and planning stages while retaining all implementation, review, testing, security, and completion gates required by the selected execution profile.
 - **FR-024**: If `/do-work` receives a request that conflicts with approved scope or decisions, it MUST fail closed and route revision to the earliest affected specification phase.
@@ -234,23 +266,41 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **FR-051**: CTO-coordinated preparation MUST isolate blocked or failed specifications while allowing independent completed specifications to reach user review and preserving resumable state for failures.
 - **FR-052**: Requests that exceed CTO team, depth, ownership, or active-phase limits MUST be queued or split with a visible reason rather than silently dropped or forced into the active wave.
 - **FR-053**: CTO support MUST reuse the shared implementation handoff and specification workflow contracts and MUST NOT introduce a CTO-specific specification format, duplicate state machine, or alternate approval semantics.
+- **FR-054**: The system MUST accept an explicitly selected external specification bundle from an authorized local project path without requiring the source framework to be installed.
+- **FR-055**: External intake MUST discover candidate requirements, plan, task, decision, and validation artifacts read-only and MUST require user selection when multiple interpretations are plausible.
+- **FR-056**: Every import MUST record detected or declared framework, source paths, source revision when available, content fingerprints, document language, and provenance for the exact files used.
+- **FR-057**: External documents MUST be treated as untrusted data: embedded instructions MUST NOT execute, paths and links MUST be bounded to authorized roots, and secrets or unsafe content MUST be redacted or rejected before rendering or delegation.
+- **FR-058**: External intake MUST normalize source content into one versioned, framework-neutral import snapshot and the same executor-neutral implementation handoff used by native specifications, without creating another workflow state machine.
+- **FR-059**: The system MUST produce a readable compatibility report that maps each source artifact to normalized scope, requirements, decisions, tasks, dependencies, verification evidence, assumptions, and unresolved gaps.
+- **FR-060**: Compatibility validation MUST require bounded scope, testable requirements and acceptance outcomes, relevant constraints and decisions, an executable task graph with dependencies, verification expectations, and explicit unresolved decisions; requirements irrelevant to the selected task MUST be identified rather than silently discarded.
+- **FR-061**: Compatibility validation MUST classify the result as ready, supplement-required, blocked, or unsupported and MUST explain every non-ready result with actionable findings.
+- **FR-062**: A ready external bundle MUST be able to reach implementation after one explicit compatibility checkpoint without re-running internal Specify, Plan, and Tasks phases.
+- **FR-063**: Approval or completion metadata from an external framework MAY be preserved as provenance but MUST NOT authorize implementation without an explicit current-user compatibility decision in this plugin.
+- **FR-064**: A compatibility supplement MUST contain only missing or conflicting information required for readiness, remain readable and separately attributable, and MUST NOT rewrite or impersonate the external source.
+- **FR-065**: An approved imported handoff MUST bind the external snapshot and any supplement into one frozen version; any subsequent source or supplement change MUST mark it stale and require impact review and renewed approval.
+- **FR-066**: Re-importing unchanged sources with the same user selections MUST be idempotent and MUST return the established snapshot, compatibility result, and approval state without duplicate workspaces or handoffs.
+- **FR-067**: Recognized framework conventions MAY improve automatic artifact discovery and mapping, but an unknown framework with readable documents MUST have a generic conformance path, and format recognition MUST NOT weaken workflow gates or approval semantics.
+- **FR-068**: `/do-work` MUST be able to consume one approved imported handoff, and CTO mode MUST be able to consume one or more approved imported handoffs through the same execution claims, preflight, traceability, and fail-closed rules as native specifications.
+- **FR-069**: External source files MUST remain unchanged during import and execution; local supplements, workflow state, progress, and results MUST be stored separately, and external-framework write-back or export is outside this feature.
+- **FR-070**: The user MUST be able to inspect the supported-format and conformance result, including which framework-specific mapping was used, which artifacts were ignored, and whether generic intake remains available.
 
 ### Requirement Acceptance Map
 
 | Requirements | Acceptance evidence |
 | --- | --- |
-| FR-001–FR-005 | User Story 1 scenarios 1 and 4; User Story 5 scenario 3 |
+| FR-001–FR-005 | User Story 1 scenarios 1 and 4; User Story 6 scenario 3 |
 | FR-006–FR-009 | User Story 1 scenarios 1–3; User Story 3 scenario 1 |
 | FR-010–FR-017 | User Story 2 scenarios 1–5 |
-| FR-018–FR-020 | User Story 5 scenarios 1–4 |
-| FR-021–FR-025 | User Story 3 scenarios 1–4 |
-| FR-026–FR-028 | User Story 4 scenarios 1–4 |
+| FR-018–FR-020 | User Story 6 scenarios 1–4 |
+| FR-021–FR-025 | User Story 3 scenarios 1–4; User Story 4 scenarios 2–6 |
+| FR-026–FR-028 | User Story 5 scenarios 1–4 |
 | FR-029 | Concurrent-session, duplicate-feature, and duplicate-nested-run edge cases |
-| FR-030 | User Story 6 scenarios 1–3 |
-| FR-031 | User Story 5 scenario 3 plus constitution-compliance validation |
-| FR-032–FR-033 | User Story 3 scenarios 1–4 and SC-010 |
-| FR-034–FR-044 | User Story 7 scenarios 1–6 |
-| FR-045–FR-053 | User Story 8 scenarios 1–7; User Story 7 scenarios 4–6 |
+| FR-030 | User Story 7 scenarios 1–3 |
+| FR-031 | User Story 6 scenario 3 plus constitution-compliance validation |
+| FR-032–FR-033 | User Story 3 scenarios 1–4; User Story 4 scenarios 2–6; SC-010 |
+| FR-034–FR-044 | User Story 8 scenarios 1–6 |
+| FR-045–FR-053 | User Story 9 scenarios 1–7; User Story 8 scenarios 4–6 |
+| FR-054–FR-070 | User Story 4 scenarios 1–8 |
 
 ### Key Entities
 
@@ -266,6 +316,11 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **Execution Claim**: A durable, exclusive binding between one approved specification version and its active executor, preventing duplicate `/do-work` or CTO execution.
 - **CTO Specification Mapping**: The reviewed mapping from specification requirements and tasks to CTO teams, slices, dependencies, worktree strategy, and completion evidence.
 - **CTO Review Packet**: A readable fan-in of one or more phase artifacts with separate checkpoint decisions for every specification and phase.
+- **External Specification Bundle**: An explicitly selected, read-only set of artifacts produced outside this workflow and considered together for compatibility validation.
+- **Import Snapshot**: A framework-neutral, fingerprinted normalization of the exact external source versions used to construct an implementation handoff.
+- **Compatibility Report**: The readable mapping from external artifacts to required implementation-contract concepts, including readiness status, ignored content, warnings, and blocking gaps.
+- **Compatibility Supplement**: A local, attributable document containing only information required to close gaps in an external bundle without changing the original source.
+- **Format Recognition Result**: The declared or detected external convention, confidence, selected source artifacts, ignored candidates, and whether generic intake was used.
 
 ### Reference-Informed Product Direction
 
@@ -275,6 +330,8 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - Adopt XPowers' separation of planning, execution, review, and verification, with one canonical task handoff instead of parallel task sources.
 - Adopt BMAD's right-sized process: simple work avoids ceremony, while ambiguous or high-risk work receives deeper collaborative planning.
 - Keep the implementation handoff executor-neutral: CTO mode consumes or coordinates the same specification contract instead of creating a CTO-specific document hierarchy.
+- Prioritize read-only execution of ready external specifications as the first interoperability slice; generation, write-back, and bidirectional synchronization can follow only if separately justified.
+- Provide one consistent intake, validation, and approval experience across formats so framework recognition does not fragment user-visible workflow behavior.
 - Do not adopt an implicit-only workflow, JSON-only user contract, universal heavyweight path, or any design where approval, continuation, and validation are inferred from free text.
 
 ## Success Criteria *(mandatory)*
@@ -294,6 +351,10 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - **SC-011**: In representative single- and multi-specification CTO runs, 100% of dispatched slices retain requirement and task traceability, all declared dependencies preserve their order, and every eligible independent slice can start without waiting for unrelated work.
 - **SC-012**: In CTO-coordinated preparation tests, 100% of outputs use standard feature workspaces and checkpoints, every approval is attributable to the user, and zero implementations start solely because specification preparation completed.
 - **SC-013**: Across concurrent executor, changed-version, ambiguous-workspace, team-cap, and cross-specification conflict scenarios, 100% of unsafe CTO dispatch attempts fail closed or queue with an actionable reason and produce no duplicate work.
+- **SC-014**: Across representative Spec Kit, OpenSpec, BMAD, Superpowers/XPowers-style, and generic Markdown fixtures, 100% of complete external bundles produce traceable import snapshots and approved handoffs while their source files remain byte-for-byte unchanged.
+- **SC-015**: Across incomplete, ambiguous, delta-only, unsupported, and hostile external bundles, 100% of blocking gaps are reported before implementation and zero unsafe bundles reach an executor.
+- **SC-016**: 100% of approved imported handoffs become stale before further dispatch when any bound external source or compatibility supplement changes.
+- **SC-017**: A user can select a complete external bundle, inspect its compatibility report, and reach the approval checkpoint in one intake invocation without repeating internal specification phases.
 
 ## Assumptions
 
@@ -308,3 +369,7 @@ As a user with several independent feature ideas or a broad initiative, I want C
 - CTO support is deliberately contract-level: CTO mode may consume ready handoffs or coordinate the standard specification workflow, but ownership, escalation transport, team caps, decomposition depth, and the single-resident-CTO model remain unchanged.
 - The initial CTO support scope is one authorized repository and its worktrees; cross-repository specification stores and distributed execution are deferred.
 - CTO and leads remain coordinators that write only authorized workflow state and declared artifacts; specification documents are produced through the standard phase workers into their declared feature workspaces.
+- Read-only intake and implementation of ready external specifications is the preferred first delivery slice because it reuses validation, handoff, `/do-work`, and CTO execution contracts without depending on the new generation experience.
+- The external bundle remains immutable source evidence; the import snapshot and any local supplement form this plugin's execution contract and never claim to replace the source framework's own state.
+- Initial interoperability covers authorized local text artifacts. Remote fetching, binary document extraction, external-framework installation, write-back, export, and bidirectional synchronization are out of scope.
+- Spec Kit, OpenSpec, BMAD, Superpowers, and XPowers are compatibility fixtures and design references, not core dependencies; unknown frameworks remain eligible through generic conformance validation.
