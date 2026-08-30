@@ -9,6 +9,7 @@ This guide is for validating the implemented feature end to end. It does not rep
 - An OMP runtime compatible with the package peer range
 - An authorized scratch repository for runtime scenarios
 - The fullstack bundle, or the private monorepo bundle, registered as the single workflow owner
+- Spec Kit and every other external specification framework absent for the native zero-dependency constitution scenario
 - No production deployment or publication is required for this feature validation
 
 From the repository root:
@@ -45,7 +46,7 @@ Expected outcomes:
 - New persisted state is accepted only through the migration/normalization path.
 - Existing workflow owner, capability, checkpoint, document renderer, CTO, and command tests remain green.
 - Focused tests cover success and fail-closed cases; source-text assertions are not accepted as behavioral evidence.
-- Constitution fixtures prove identical prerequisite behavior for every required entry point, the exact two-decision bootstrap checkpoint, idempotent resume, exact fingerprint bindings, and targeted semantic impact.
+- Constitution fixtures prove zero-dependency native generation, provider precedence/ambiguity, identical prerequisite behavior for every required entry point, the exact two-decision bootstrap checkpoint, idempotent resume, exact provider/fingerprint bindings, and targeted semantic impact.
 
 ## Runtime Harness Setup
 
@@ -94,6 +95,14 @@ Run each entry point against separate scratch fixtures:
 - CTO-coordinated specification preparation
 - `/spec-import` with compatibility validation pending
 
+Exercise provider resolution separately:
+
+- no configured path, no existing provider, and no Spec Kit installation → native `CONSTITUTION.md`
+- explicit authorized `constitution.path` → exact configured path
+- only an existing `.specify/memory/constitution.md` fixture, with no Spec Kit executable installed → optional `speckit` file provider
+- both `CONSTITUTION.md` and `.specify/memory/constitution.md` present with no override → ambiguity failure
+- escaping, unreadable, or unsafe configured path → provider validation failure
+
 For every entry point, exercise a missing file, empty file, unresolved-template document,
 structurally invalid document, valid document with warnings, and valid document whose version
 differs from the last observed version.
@@ -101,7 +110,7 @@ differs from the last observed version.
 For an unusable constitution:
 
 1. Confirm the originating flow stops before native Specify generation or external compatibility validation.
-2. Confirm the canonical constitution workflow creates or corrects one readable draft.
+2. Confirm the plugin-native `constitution.json` workflow dispatches a declared content subagent, receives a typed draft, and materializes one readable file through the selected provider.
 3. Inspect the checkpoint and choose `request_changes` with concrete feedback.
 4. Confirm the same draft identity is revised through a new version, revalidated, and presented at the same checkpoint.
 5. Choose `approve_continue`.
@@ -109,9 +118,11 @@ For an unusable constitution:
 
 Expected outcomes:
 
-- Missing, empty, unresolved-template, and structurally invalid fixtures invoke the same canonical workflow and present exactly `approve_continue` and `request_changes`.
+- Missing, empty, unresolved-template, and structurally invalid fixtures invoke the same plugin-native workflow and present exactly `approve_continue` and `request_changes`.
+- With no external framework installed, the shipped template/provider produces root `CONSTITUTION.md`; no `/speckit.constitution`, CLI, package installation, or remote access occurs.
+- Provider precedence is explicit override → exactly one discovered provider → native default. Multiple candidates fail closed with `SPEC_CONSTITUTION_SOURCE_AMBIGUOUS`.
 - A valid constitution proceeds without generation or reapproval; warning-only and version-only differences do not block.
-- Approval is attributable, binds the exact version and content fingerprint, and resumes the exact native Specify or external compatibility-validation origin exactly once.
+- Approval is attributable, binds provider id, resolved path, exact version and content fingerprint, and resumes the exact native Specify or external compatibility-validation origin exactly once.
 - Requested changes never create a second constitution workflow, draft identity, checkpoint authority, or persistence path.
 - No specification worker, compatibility validator, implementation worker, or CTO implementation slice starts while the prerequisite is unresolved.
 
@@ -330,7 +341,7 @@ For every runtime scenario, retain:
 - canonical event evidence showing worker dispatch identity for phase content
 - pre/post external source hashes for import scenarios
 - claim/preflight result for `/do-work` and CTO scenarios
-- constitution usability, two-decision checkpoint, exact-origin resume, binding, and semantic-impact records
+- constitution provider selection, usability, typed-draft dispatch, two-decision checkpoint, exact-origin resume, binding, and semantic-impact records
 - screenshots for the real OMP UI surface
 - focused package/process test output
 

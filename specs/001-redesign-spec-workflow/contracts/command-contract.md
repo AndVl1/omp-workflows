@@ -10,13 +10,13 @@ A workflow-owner prefix is applied through the existing `commandName(prefix, bas
 
 1. Every state-changing call identifies the authorized project and explicit `feature_id`/`run_key`.
 2. Capability id, cursor epoch, profile hash, work identity, and dispatch marker remain mandatory after `workflow_begin`.
-3. Specify, Plan, and Tasks content originates from declared subagent dispatches. The main session may coordinate, pass exact typed results to engine tools, render deterministic status, and ask for a checkpoint decision; it cannot author phase content.
+3. Constitution, Specify, Plan, and Tasks content originates from declared subagent dispatches. The main session may coordinate, pass exact typed results to engine tools, render deterministic documents/status, and ask for checkpoint decisions; it cannot author semantic content.
 4. Validation reaches a terminal result before a checkpoint is presented.
 5. Checkpoints are synchronous hard-human decisions. Neither an agent, CTO, lead, policy default, validation pass, nor external status can approve.
 6. Any ambiguous, stale, invalid, conflicting, unauthorized, or already-claimed input performs no implementation dispatch.
 7. Native Specify generation and external compatibility validation require a current successful shared constitution prerequisite.
-8. Constitution bootstrap reuses the canonical constitution workflow and its document/template/validation/persistence contracts; entry points cannot author or store a second constitution.
-9. Every validation, approval, compatibility decision, readiness result, and handoff binds the exact constitution version and content fingerprint used.
+8. Constitution bootstrap uses the plugin-shipped workflow, template, provider resolver, deterministic validation, materialization, and checkpoint contract; entry points and external adapters cannot replace or duplicate it.
+9. Every validation, approval, compatibility decision, readiness result, and handoff binds the exact constitution provider, resolved path, version, and content fingerprint used.
 
 ## Shared Constitution Prerequisite
 
@@ -31,6 +31,17 @@ A workflow-owner prefix is applied through the existing `commandName(prefix, bas
 (`specify` or `compatibility_validation`). The prerequisite is idempotent and its resume marker can
 be consumed exactly once.
 
+Provider resolution is deterministic:
+
+1. Use an explicit authorized project `constitution.path` when configured.
+2. Otherwise select exactly one existing path reported by registered providers.
+3. If no provider path exists, select the native provider at project-root `CONSTITUTION.md`.
+4. If several existing providers are plausible, return `SPEC_CONSTITUTION_SOURCE_AMBIGUOUS` and require an explicit path; do not choose by registration order or framework confidence.
+
+The shipped native provider, profile, template, renderer, and validator are always available.
+Registered providers contribute bounded path/template metadata only. Discovery never invokes a
+framework command, CLI, package manager, remote service, or prompt.
+
 Usability checks are deterministic and classify the canonical constitution as:
 
 - `usable`: file exists, is non-empty, has no unresolved template markers, and passes mandatory structural validation
@@ -40,15 +51,16 @@ Usability checks are deterministic and classify the canonical constitution as:
 A usable constitution is fingerprinted, bound to the origin, and resumes it without a checkpoint.
 Warnings and a version difference alone do not require generation or reapproval.
 
-`constitution_required` invokes the registered canonical constitution workflow as a blocking child
-workflow. That workflow remains the only owner of template resolution, drafting, revision,
-validation, semantic versioning, and persistence of `.specify/memory/constitution.md`. Once its
-draft passes validation, the prerequisite presents exactly:
+`constitution_required` invokes the plugin-shipped `constitution.json` profile as a blocking child
+workflow. A declared subagent returns a typed `ConstitutionDraft`; the engine resolves the selected
+template, materializes the provider path, performs authoritative deterministic validation, versions
+the draft, and persists it. This works when no external framework is installed. Once the draft
+passes validation, the prerequisite presents exactly:
 
 | Decision | Required payload | Durable effect | Coordinator effect |
 | --- | --- | --- | --- |
 | `approve_continue` | Current trusted user answer proof | Approves and fingerprints the current constitution version | Consumes the resume marker and enters the exact originating target once |
-| `request_changes` | Trusted proof plus non-empty feedback | Reopens the same constitution draft identity with a new artifact version | Re-dispatches the canonical workflow, revalidates, and repeats this checkpoint |
+| `request_changes` | Trusted proof plus non-empty feedback | Reopens the same constitution draft identity with a new artifact version | Re-dispatches the native content worker with feedback, revalidates, and repeats this checkpoint |
 
 There is no `approve_stop` constitution-bootstrap decision because the originating flow remains
 blocked until a current constitution is approved. Interruption safely resumes the prerequisite;
@@ -228,6 +240,22 @@ A non-ready result includes:
 
 ## Bundle Extension Seams
 
+### Constitution Provider
+
+Core always registers the native provider:
+
+- `provider_id`: `native`
+- default path: `CONSTITUTION.md`
+- framework-neutral shipped template
+- engine-owned materialization through safe, atomic writes
+
+An optional bundle adapter may report an existing project constitution such as
+`.specify/memory/constitution.md` and, when explicitly selected, a compatible template override.
+Providers return data only: stable id/version, bounded candidate path, detection evidence, template
+metadata, and safe-write capability. They cannot generate content, invoke external commands or
+CLIs, approve checkpoints, change validation, select themselves when another candidate exists, or
+introduce provider-specific state machines. Spec Kit installation is never a prerequisite.
+
 ### Template Provider
 
 A workflow owner may register versioned phase templates and a project default language. Providers return template id, phase, content hash, semantic markers, supported language metadata, and source provenance. Registration cannot remove required markers, replace checkpoint policy, change the readiness predicate, or write project configuration after user ownership begins.
@@ -262,6 +290,8 @@ Recognizers cannot execute source commands, fetch remote content, mutate source,
 | `SPEC_EXECUTION_CLAIMED` | Another active executor owns the same handoff digest. |
 | `SPEC_PROFILE_MISMATCH` | Persisted profile/version cannot be safely resumed without migration. |
 | `SPEC_MIGRATION_BLOCKED` | Legacy state cannot be mapped without loss or unsafe inference. |
+| `SPEC_CONSTITUTION_SOURCE_AMBIGUOUS` | More than one existing constitution provider/path is plausible; configure `constitution.path`. |
+| `SPEC_CONSTITUTION_PROVIDER_INVALID` | The selected provider, path, template, or safe-write contract is missing, unauthorized, or invalid. |
 | `SPEC_CONSTITUTION_REQUIRED` | The canonical constitution is missing, empty, unresolved, or structurally invalid; the prerequisite must complete. |
 | `SPEC_CONSTITUTION_APPROVAL_REQUIRED` | A generated/corrected constitution passed validation but lacks a current trusted two-decision checkpoint answer. |
 | `SPEC_CONSTITUTION_CHANGED` | The exact constitution fingerprint differs from a bound validation, approval, compatibility decision, or handoff. |
@@ -272,6 +302,7 @@ All errors are fail-closed and preserve canonical state unless the documented op
 ## Versioning and Cutover
 
 - Persisted and exported contract additions are versioned together with profile schemas, artifact schemas, producers, consumers, tests, and docs.
+- The native constitution profile/template/provider are shipped and tested as the zero-dependency path; Spec Kit and other provider adapters remain optional and cannot become peer/runtime dependencies.
 - Legacy branch-derived and JSON-only shapes are accepted only by the migration reader.
 - Successful migration records provenance and requires new validation plus human approval.
 - After the migration window, no command, alias, or renderer may continue the old JSON-only specification path.

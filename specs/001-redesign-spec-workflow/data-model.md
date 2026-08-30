@@ -8,8 +8,8 @@ The model extends the existing `TeamState`; it does not introduce a second state
 - `.work-state/features/<feature-id>/state.json` is the canonical aggregate state.
 - `.work-state/features/<feature-id>/artifacts/*.json` contains immutable, versioned typed artifacts returned by subagents and derived engine records.
 - Trusted checkpoint answers retain the current engine-owned answer ledger and capability binding.
-- External source files are never part of the writable workspace.
-- `.specify/memory/constitution.md` remains the single human-readable project policy owned by the canonical constitution workflow; specification code stores bindings and impact evidence, not a copied constitution.
+- External specification bundle source files are never part of the writable workspace; a separately selected constitution provider path is project policy, not an imported specification source.
+- The resolved `ConstitutionProviderSelection` owns one human-readable project policy: explicit override, exactly one discovered existing provider, or the native root `CONSTITUTION.md` default. Spec Kit is only an optional file-layout provider.
 
 ## Entities
 
@@ -47,6 +47,25 @@ Relationships:
 - Optionally owns one current `ImportSnapshot`, `CompatibilityReport`, and `CompatibilitySupplement`.
 - References one current `ConstitutionGateRecord`; owns immutable constitution bindings and impact assessments relevant to its artifacts.
 
+### ConstitutionProviderSelection
+
+The immutable resolution result for the project policy location and template source.
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `provider_id` | string | `native` for the shipped provider or a registered adapter id such as `speckit`; never inferred from document content alone. |
+| `source` | `explicit_override \| discovered_provider \| native_default` | Enforces resolver precedence. |
+| `path` | project-relative path | Realpath-bounded to the authorized project; defaults to `CONSTITUTION.md`. |
+| `template_ref` / `template_hash` | reference / SHA-256 | Shipped framework-neutral template unless an explicitly selected provider supplies a valid override. |
+| `selection_hash` | SHA-256 | Binds provider id, path, template, configuration, and discovery evidence. |
+| `selected_at` | timestamp | Audit only. |
+
+Resolution order is explicit project `constitution.path`, exactly one discovered registered
+provider, then the native default. Multiple existing provider candidates are `blocked`; the engine
+must not choose by load order, filename preference, or framework detection confidence. Provider
+discovery is local metadata/file inspection and never invokes a command, CLI, or remote service.
+
+
 ### ConstitutionGateRecord
 
 The durable prerequisite record shared by native preparation and external intake. It coordinates the
@@ -59,19 +78,23 @@ canonical constitution workflow but does not author or persist constitution cont
 | `origin_run_key` / `origin_stage` | engine identity | Must resolve to the still-current originating cursor before resume. |
 | `status` | `checking \| usable \| constitution_required \| awaiting_approval \| approved \| blocked` | Uses the transition table below. |
 | `usability_result` | typed result | Records missing, empty, unresolved-template, structurally-invalid, or usable plus warnings. |
-| `constitution_workflow_ref` | run/artifact reference or null | Required when the canonical workflow is invoked. |
+| `provider` | `ConstitutionProviderSelection` or null | Required before usability validation or generation. |
+| `constitution_workflow_ref` | run/artifact reference or null | Required when the plugin-native `constitution.json` workflow is invoked. |
 | `checkpoint_ref` | checkpoint id or null | Required only when a generated or corrected constitution is approved. |
 | `binding` | `ConstitutionBinding` or null | Required before the originating flow can resume. |
 | `resume_marker` | dispatch/idempotency marker | Consumed exactly once; replay returns the established continuation result. |
 
 An already usable constitution transitions directly to `usable` and opens no checkpoint. A required
-bootstrap checkpoint allows only `approve_continue` or `request_changes`; the three-decision phase
-checkpoint contract does not apply.
+bootstrap dispatches a declared subagent for typed draft semantics; the engine materializes through
+the selected provider and performs authoritative validation. Its checkpoint allows only
+`approve_continue` or `request_changes`; the three-decision phase checkpoint contract does not
+apply.
 
 ### ConstitutionBinding
 
 | Field | Type | Rules |
 | --- | --- | --- |
+| `provider_id` | string | Must match the immutable `ConstitutionProviderSelection` used to resolve the path. |
 | `path` | project-relative path | Canonical policy path, realpath-bounded to the authorized project. |
 | `version` | semantic version string | Parsed from the validated constitution; never trusted without the fingerprint. |
 | `content_sha256` | SHA-256 | Exact bytes used for validation or approval. |
@@ -414,3 +437,5 @@ A second active owner receives a conflict or queue result and performs no dispat
 13. No native Specify generation or external compatibility validation begins without a current successful `ConstitutionGateRecord`.
 14. Every validation, approval, compatibility decision, and handoff binds the exact constitution version and content fingerprint used.
 15. A changed constitution preserves an approval only with explicit artifact-scoped `no_impact` evidence; unassessed or affected bindings fail closed and stale only their dependency closure.
+16. Constitution generation works through the shipped profile/provider when no external framework is installed; provider adapters cannot invoke external commands or replace approval semantics.
+17. More than one discovered constitution source blocks before usability validation, generation, or downstream dispatch until `constitution.path` selects one.

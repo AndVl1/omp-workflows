@@ -263,6 +263,7 @@
     "constitution_binding": {
       "type": "object",
       "required": [
+        "provider_id",
         "path",
         "version",
         "content_sha256",
@@ -272,6 +273,9 @@
       ],
       "additionalProperties": false,
       "properties": {
+        "provider_id": {
+          "type": "string"
+        },
         "path": {
           "type": "string"
         },
