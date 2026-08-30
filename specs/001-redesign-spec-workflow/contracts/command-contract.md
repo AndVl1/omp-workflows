@@ -17,6 +17,7 @@ A workflow-owner prefix is applied through the existing `commandName(prefix, bas
 7. Native Specify generation and external compatibility validation require a current successful shared constitution prerequisite.
 8. Constitution bootstrap uses the plugin-shipped workflow, template, provider resolver, deterministic validation, materialization, and checkpoint contract; entry points and external adapters cannot replace or duplicate it.
 9. Every validation, approval, compatibility decision, readiness result, and handoff binds the exact constitution provider, resolved path, version, and content fingerprint used.
+10. A specification-backed execution cannot become complete until one current handoff-bound implementation-conformance matrix passes; generic quality gates, task/team completion, or human acknowledgement cannot waive missing closure evidence.
 
 ## Shared Constitution Prerequisite
 
@@ -161,6 +162,7 @@ A full nested specification preparation invokes the same native profile and suba
 - `approve_continue` may continue into implementation because the initiating command already expressed implementation intent and the handoff claim is acquired first.
 - `approve_stop` returns an implementation-ready handoff without implementation.
 - `request_changes` remains in the Tasks revision loop.
+- Terminal advancement runs the shared implementation-conformance gate over the exact handoff and active claim. The run, claim, and workspace complete only when every requirement/scenario row and mandatory quality gate passes.
 
 ### `/cto <request containing explicit feature workspace selections>`
 
@@ -175,6 +177,7 @@ Execution contract:
 - Map every implementation task to one team/slice, dependencies, shared contracts, and completion evidence.
 - Present the mapping for current-user confirmation.
 - Parallelize only admitted dependency- and ownership-safe slices; conflicts serialize or block.
+- Team completion evidence is partitioned by frozen handoff digest and evaluated through the same shared implementation-conformance gate. A passing feature may complete independently; a blocked feature retains its claim and cannot borrow evidence from another specification.
 
 Preparation contract:
 
@@ -238,6 +241,37 @@ A non-ready result includes:
 - actionable next command or user decision
 - confirmation that no implementation dispatch occurred
 
+## Shared Completion Conformance Contract
+
+This contract applies to every execution that acquired a specification handoff, regardless of
+whether `/do-work`, CTO mode, or a future executor owns the claim.
+
+1. After implementation, review, testing, and selected-profile quality gates finish, the executor
+   submits only typed artifact references already attributable to the active run and claim.
+2. Core loads the exact approved handoff and derives the complete closure subject set. Executors
+   cannot add, remove, rename, reinterpret, or waive requirements or acceptance scenarios.
+3. Core creates exactly one `RequirementClosureEntry` for each approved requirement and each
+   acceptance scenario. Every entry requires implementation evidence and a passing review verdict;
+   an entry whose frozen verification obligation has `observable_behavior: true` also requires
+   current passing executed-test or runtime-scenario evidence.
+4. Constitution- and profile-mandated quality gates are evaluated as additional required rows.
+   They cannot substitute for a missing or failed specification row.
+5. The immutable result binds `feature_id`, `handoff_id`, `handoff_digest`, active claim, execution
+   owner/run, and profile hash. Evidence from another handoff, claim, feature, or stale run is
+   rejected.
+6. `pass` permits terminal `workflow_advance`, completes the claim and workspace, and idempotently
+   returns the established matrix on replay. `blocked` keeps the current claim active and reports
+   exact implementation/review/test remediation. `changed_intent` blocks the claim and routes to
+   the earliest affected specification phase.
+7. `workflow_complete` remains dispatch completion evidence only. It cannot mark the feature,
+   claim, do-work run, or CTO mapping complete without the conformance gate.
+8. No separate feature-specific Definition of Done or completion override is accepted. The approved
+   specification plus required constitution/profile quality gates is the complete contract.
+
+The readable projection is written to
+`specs/<feature-id>/validation/implementation-conformance.md`; canonical state stores only the
+immutable typed result reference and derived status.
+
 ## Bundle Extension Seams
 
 ### Constitution Provider
@@ -296,6 +330,8 @@ Recognizers cannot execute source commands, fetch remote content, mutate source,
 | `SPEC_CONSTITUTION_APPROVAL_REQUIRED` | A generated/corrected constitution passed validation but lacks a current trusted two-decision checkpoint answer. |
 | `SPEC_CONSTITUTION_CHANGED` | The exact constitution fingerprint differs from a bound validation, approval, compatibility decision, or handoff. |
 | `SPEC_CONSTITUTION_IMPACT_PENDING` | Semantic impact is missing, ambiguous, or failed; affected execution remains blocked. |
+| `SPEC_IMPLEMENTATION_CONFORMANCE_FAILED` | Requirement closure is missing, failed, stale, contradictory, or lacks mandatory review/test evidence; terminal advancement is blocked. |
+| `SPEC_IMPLEMENTATION_INTENT_CHANGED` | Submitted implementation evidence conflicts with the approved handoff; revise the earliest affected specification phase. |
 
 All errors are fail-closed and preserve canonical state unless the documented operation is an explicit migration, revision, or claim-state transition.
 
@@ -303,6 +339,7 @@ All errors are fail-closed and preserve canonical state unless the documented op
 
 - Persisted and exported contract additions are versioned together with profile schemas, artifact schemas, producers, consumers, tests, and docs.
 - The native constitution profile/template/provider are shipped and tested as the zero-dependency path; Spec Kit and other provider adapters remain optional and cannot become peer/runtime dependencies.
+- Every public/persisted DoD-labelled generic completion contract is cleanly renamed: `dod_and_artifacts` → `quality_gates_and_artifacts`, `CompletionDodStatus` → `CompletionQualityGateStatus`, and `CompletionArtifactRef.dod_status` → `quality_gate_status`. The migration reader maps legacy values/fields once, records provenance, and leaves no alias in active schemas, prompts, profiles, or runtime output; the exported/persisted cutover receives a semantic-version bump and consumer migration note.
 - Legacy branch-derived and JSON-only shapes are accepted only by the migration reader.
 - Successful migration records provenance and requires new validation plus human approval.
 - After the migration window, no command, alias, or renderer may continue the old JSON-only specification path.

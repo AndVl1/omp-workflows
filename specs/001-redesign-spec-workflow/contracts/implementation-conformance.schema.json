@@ -1,0 +1,365 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://andvl1.dev/omp-workflows/specification/implementation-conformance.schema.json",
+  "title": "Implementation Conformance Result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "conformance_id",
+    "matrix_digest",
+    "feature_id",
+    "handoff_id",
+    "handoff_digest",
+    "execution_claim_id",
+    "execution_owner",
+    "execution_run_id",
+    "profile_hash",
+    "evaluated_at",
+    "entries",
+    "quality_gate_results",
+    "overall_status",
+    "blocking_findings",
+    "next_action"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "conformance_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "matrix_digest": {
+      "$ref": "#/definitions/sha256"
+    },
+    "feature_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "handoff_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "handoff_digest": {
+      "$ref": "#/definitions/sha256"
+    },
+    "execution_claim_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "execution_owner": {
+      "type": "string",
+      "enum": ["do_work", "cto"]
+    },
+    "execution_run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "profile_hash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evaluated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/definitions/closureEntry"
+      }
+    },
+    "quality_gate_results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/qualityGateResult"
+      }
+    },
+    "overall_status": {
+      "type": "string",
+      "enum": ["pass", "blocked", "changed_intent"]
+    },
+    "blocking_findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/finding"
+      }
+    },
+    "next_action": {
+      "type": "string",
+      "enum": [
+        "complete_feature",
+        "repair_implementation",
+        "repeat_review",
+        "repeat_tests",
+        "repair_quality_gate",
+        "revise_specification"
+      ]
+    }
+  },
+  "definitions": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "artifactRef": {
+      "type": "object",
+      "required": [
+        "artifact_id",
+        "path",
+        "sha256",
+        "schema_status",
+        "quality_gate_status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/definitions/sha256"
+        },
+        "schema_status": {
+          "type": "string",
+          "enum": ["met", "failed"]
+        },
+        "quality_gate_status": {
+          "type": "string",
+          "enum": ["met", "pending", "failed"]
+        }
+      }
+    },
+    "testEvidence": {
+      "type": "object",
+      "required": ["evidence_ref", "test_kind", "status", "executed_at"],
+      "additionalProperties": false,
+      "properties": {
+        "evidence_ref": {
+          "$ref": "#/definitions/artifactRef"
+        },
+        "test_kind": {
+          "type": "string",
+          "enum": ["unit", "integration", "e2e", "runtime"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pass", "fail"]
+        },
+        "executed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": ["code", "message", "evidence_refs"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "subject_id": {
+          "type": ["string", "null"]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "closureEntry": {
+      "type": "object",
+      "required": [
+        "entry_id",
+        "subject_kind",
+        "subject_id",
+        "requirement_id",
+        "observable_behavior",
+        "implementation_evidence_refs",
+        "review_verdict",
+        "review_evidence_refs",
+        "test_evidence",
+        "status",
+        "findings"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "entry_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "subject_kind": {
+          "type": "string",
+          "enum": ["requirement", "acceptance_scenario"]
+        },
+        "subject_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requirement_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "observable_behavior": {
+          "type": "boolean"
+        },
+        "implementation_evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/artifactRef"
+          }
+        },
+        "review_verdict": {
+          "type": "string",
+          "enum": ["pass", "fail", "missing"]
+        },
+        "review_evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/artifactRef"
+          }
+        },
+        "test_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/testEvidence"
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pass", "blocked", "changed_intent"]
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/finding"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "pass"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "implementation_evidence_refs": {
+                "minItems": 1
+              },
+              "review_verdict": {
+                "const": "pass"
+              },
+              "review_evidence_refs": {
+                "minItems": 1
+              },
+              "findings": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "pass"
+              },
+              "observable_behavior": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "test_evidence": {
+                "minItems": 1,
+                "contains": {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {
+                    "status": {
+                      "const": "pass"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "qualityGateResult": {
+      "type": "object",
+      "required": ["gate_id", "source", "status", "evidence_refs", "findings"],
+      "additionalProperties": false,
+      "properties": {
+        "gate_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "enum": ["project_constitution", "execution_profile"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pass", "fail"]
+        },
+        "evidence_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/artifactRef"
+          }
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/finding"
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "overall_status": {
+            "const": "pass"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "blocking_findings": {
+            "maxItems": 0
+          },
+          "next_action": {
+            "const": "complete_feature"
+          }
+        }
+      }
+    }
+  ]
+}

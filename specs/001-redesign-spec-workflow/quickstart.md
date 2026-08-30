@@ -42,11 +42,12 @@ npm run test -w @andvl1/omp-workflows-e2e
 Expected outcomes:
 
 - All shipped profile JSON files validate against `packages/core/workflows/_schema.json`.
-- Both schemas in `specs/001-redesign-spec-workflow/contracts/` parse as JSON and are represented by executable artifact-contract tests.
+- Every JSON Schema in `specs/001-redesign-spec-workflow/contracts/` parses and is represented by executable artifact-contract tests.
 - New persisted state is accepted only through the migration/normalization path.
 - Existing workflow owner, capability, checkpoint, document renderer, CTO, and command tests remain green.
 - Focused tests cover success and fail-closed cases; source-text assertions are not accepted as behavioral evidence.
 - Constitution fixtures prove zero-dependency native generation, provider precedence/ambiguity, identical prerequisite behavior for every required entry point, the exact two-decision bootstrap checkpoint, idempotent resume, exact provider/fingerprint bindings, and targeted semantic impact.
+- Completion fixtures prove the `quality_gates_and_artifacts` migration, exact handoff/claim binding, complete matrix success, missing implementation evidence, review rejection, test failure, stale or contradictory evidence, changed intent, CTO per-feature isolation, and rejection of any separate DoD or human completion override.
 
 ## Runtime Harness Setup
 
@@ -205,6 +206,38 @@ Expected outcomes:
 - A second `/do-work` or CTO execution attempt for the same digest fails closed or queues with `SPEC_EXECUTION_CLAIMED`.
 - If the task text conflicts with approved scope, no implementation dispatch occurs and the response routes to the earliest affected specification phase.
 
+## Scenario 3A: Requirement Closure Blocks Feature Completion
+
+Use the same approved handoff and execute these fixtures independently through `/do-work` and CTO:
+
+1. Complete every approved task and provide implementation evidence plus a passing review artifact
+   for every requirement and acceptance scenario; provide passing executed-test or runtime evidence
+   for every row marked `observable_behavior`.
+2. Remove implementation evidence from one requirement row.
+3. Return a failing review verdict for one acceptance scenario.
+4. Return green generic quality gates but failing executed-test evidence for one observable behavior.
+5. Reuse otherwise-passing evidence from an older handoff digest or another CTO feature.
+6. Submit evidence showing that the implementation intentionally differs from approved scope.
+7. Attempt to finish by supplying a separate feature DoD or an explicit human completion
+   acknowledgement.
+
+Expected outcomes:
+
+- The complete fixture creates one immutable typed result and readable
+  `validation/implementation-conformance.md` containing exactly one row per approved requirement and
+  acceptance scenario, then completes the claim and workspace.
+- Missing implementation evidence, a failed review, a failed or absent required executed test,
+  stale/cross-feature evidence, or contradictory evidence returns
+  `SPEC_IMPLEMENTATION_CONFORMANCE_FAILED`, keeps the active owner claim, and names the exact
+  remediation.
+- Green project/profile gates do not close a missing specification row.
+- `changed_intent` returns `SPEC_IMPLEMENTATION_INTENT_CHANGED`, blocks the claim, and routes to the
+  earliest affected specification phase instead of accepting the implementation as a silent spec
+  revision.
+- Neither a separate feature DoD nor a human acknowledgement changes a blocking verdict.
+- Replaying identical passing inputs returns the established conformance result without duplicating
+  a matrix, claim transition, or completion event.
+
 ## Scenario 4: Adaptive `/do-work` Without a Workspace
 
 Exercise one request in each class:
@@ -304,6 +337,7 @@ Expected outcomes:
 - Independent slices may run in parallel; dependent/shared-file/migration slices serialize.
 - Results map back to the original requirement and task ids.
 - CTO never changes specification approvals or validation outcomes.
+- CTO builds and validates one closure matrix per frozen handoff digest; a blocked feature retains its claim while independent passing features may complete.
 
 ## Scenario 9: CTO Prepares Specifications
 
@@ -342,6 +376,7 @@ For every runtime scenario, retain:
 - pre/post external source hashes for import scenarios
 - claim/preflight result for `/do-work` and CTO scenarios
 - constitution provider selection, usability, typed-draft dispatch, two-decision checkpoint, exact-origin resume, binding, and semantic-impact records
+- per-handoff implementation-conformance result, readable closure matrix, review/test/quality-gate evidence references, and terminal claim/workspace transition
 - screenshots for the real OMP UI surface
 - focused package/process test output
 
@@ -353,4 +388,4 @@ npm run e2e -- report /tmp/omp-ux-e2e-readable-spec-workflow \
   --copy-evidence
 ```
 
-A passing result requires all expected behaviors above and zero implementation dispatch from an incomplete, stale, ambiguous, unsafe, unapproved, or already-claimed handoff.
+A passing result requires all expected behaviors above, zero implementation dispatch from an incomplete, stale, ambiguous, unsafe, unapproved, or already-claimed handoff, and zero feature completion without a current passing requirement-closure matrix bound to the exact approved handoff and execution claim.

@@ -217,7 +217,14 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["verification_id", "requirement_ids", "task_ids", "expected_evidence"],
+        "required": [
+          "verification_id",
+          "requirement_ids",
+          "acceptance_ids",
+          "task_ids",
+          "observable_behavior",
+          "expected_evidence"
+        ],
         "additionalProperties": false,
         "properties": {
           "verification_id": {
@@ -230,12 +237,22 @@
               "type": "string"
             }
           },
+          "acceptance_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
           "task_ids": {
             "type": "array",
             "minItems": 1,
             "items": {
               "type": "string"
             }
+          },
+          "observable_behavior": {
+            "type": "boolean"
           },
           "expected_evidence": {
             "type": "string"

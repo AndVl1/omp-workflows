@@ -8,25 +8,29 @@
 
 Replace the JSON-only `spec-preparation` experience with one branch-independent feature workspace whose current state, validation, approvals, constitution binding, and next action are readable in Markdown. Before any native Specify generation or external compatibility validation, one shared prerequisite resolves and verifies the project constitution and, when unusable, blocks the origin behind the plugin-native constitution workflow's two-decision approval loop before resuming it exactly once. The workflow is shipped by this plugin, delegates draft content to a declared subagent, and requires no Spec Kit installation; external frameworks may only register optional constitution providers. Specify, Plan, and Tasks content is likewise produced by capability-bound subagents. The engine persists typed artifacts, materializes versioned documents deterministically, completes validation, and only then presents synchronous hard-human checkpoints. Direct phase commands, `/do-work`, CTO mode, legacy migration, and read-only external imports all reuse the existing durable engine, exact constitution bindings with targeted semantic-impact staleness, and one executor-neutral implementation handoff.
 
+Implementation completion uses the same approved handoff as its only feature-specific acceptance contract. `/do-work`, CTO mode, and any future executor must materialize one readable requirement-closure matrix before completion: every approved requirement and acceptance scenario needs implementation evidence and a passing review verdict, every observable behavior additionally needs passing executed-test evidence, and all evidence must bind the current handoff digest. Project-constitution and execution-profile quality gates remain mandatory but cannot substitute for closure; no separate feature Definition of Done is introduced.
+
 ## Technical Context
 
 **Language/Version**: TypeScript 5.6+, ESM, Node.js 20+
 
-**Primary Dependencies**: Existing `@andvl1/omp-workflows-core` state/capability/checkpoint/artifact engine, plugin-shipped constitution profile/template/provider resolver, `@oh-my-pi/pi-coding-agent` runtime contract, Node.js `fs`/`path`/`crypto`; Spec Kit and other external frameworks are optional adapters, not runtime dependencies
+**Primary Dependencies**: Existing `@andvl1/omp-workflows-core` state/capability/checkpoint/artifact engine and artifact-contract gates, plugin-shipped constitution profile/template/provider resolver, `@oh-my-pi/pi-coding-agent` runtime contract, Node.js `fs`/`path`/`crypto`, and existing Markdown rendering through `marked`; Spec Kit and other external frameworks are optional adapters, not runtime dependencies
 
-**Storage**: Human-readable feature Markdown under `specs/<feature-id>/`; the resolved project constitution path (explicit override, one discovered provider, or the native `CONSTITUTION.md` default); canonical machine state, provider selection, versioned typed artifacts, prerequisite continuations, constitution bindings/impact assessments, answer proofs, and execution claims in the existing `.work-state` engine storage
+**Storage**: Human-readable feature Markdown under `specs/<feature-id>/`, including validation and final requirement-closure projections; the resolved project constitution path (explicit override, one discovered provider, or the native `CONSTITUTION.md` default); canonical machine state, provider selection, versioned typed artifacts, prerequisite continuations, constitution bindings/impact assessments, answer proofs, execution claims, and immutable implementation-conformance results in the existing `.work-state` engine storage
 
-**Testing**: `node:test` through `tsx` for core/fullstack/internal packages; deterministic child-process tests and the real OMP PTY harness in `packages/e2e`
+**Testing**: `node:test` through `tsx` for core/fullstack/internal packages; deterministic child-process tests and the real OMP PTY harness in `packages/e2e`; completion fixtures must cover complete, missing, failed, stale, contradictory, and changed-intent implementation evidence for both `/do-work` and CTO execution
 
 **Target Platform**: Local OMP plugin runtime on Node.js 20+ across authorized project worktrees
 
 **Project Type**: TypeScript monorepo containing reusable core, default fullstack bundle, private monorepo bundle, and E2E harness
 
-**Performance Goals**: Idempotent replay with no duplicate constitution drafts, origin resumes, phase versions, or dispatches; content-addressed staleness and constitution-impact checks proportional to the bound artifact set; no network access during native generation or local external intake; concurrency bounded by existing roster and CTO team caps
+**Performance Goals**: Idempotent replay with no duplicate constitution drafts, origin resumes, phase versions, dispatches, claims, or conformance matrices; content-addressed staleness and constitution-impact checks proportional to the bound artifact set; completion validation linear in handoff traceability links plus submitted evidence; no network access during native generation or local external intake; concurrency bounded by existing roster and CTO team caps
 
 **Constraints**: One domain-agnostic engine and one workflow owner; one plugin-native constitution generation/validation/checkpoint workflow; framework-neutral default `CONSTITUTION.md` with explicit path override and optional discovered providers; no dependency on Spec Kit commands, CLI, templates, or installation; ambiguous constitution sources fail closed; branch-independent feature identity; no native Specify or external compatibility validation before a usable constitution; bootstrap has exactly `approve_continue`/`request_changes` and resumes the exact origin once; constitution and phase content authored only by declared subagents; deterministic engine materialization is permitted but main-session authorship is not; validation finishes before the checkpoint; no detached/asynchronous review; exact three-decision phase checkpoints; every validation/approval/compatibility decision/handoff binds the constitution provider, version, and content fingerprint; constitution changes stale only artifacts proven affected; external specification sources remain read-only and untrusted; fail closed on ambiguity, stale/unassessed impact, path escape, owner conflict, or missing approval
 
-**Scale/Scope**: 79 functional requirements and 22 measurable outcomes across the shared constitution prerequisite and provider resolution, impact analysis, native generation, direct and nested `/do-work`, read-only imports, CTO consumption/preparation, language/templates, and legacy migration; one repository with multiple feature workspaces and up to the existing CTO cap of eight teams per wave
+For specification-backed execution, terminal advancement is fail-closed until a deterministic conformance gate validates one immutable matrix against the exact approved handoff. The matrix is derived from approved requirements, acceptance scenarios, verification obligations, review artifacts, and executed-test artifacts; it is not a second task list or feature-specific Definition of Done. Existing generic DoD-labelled completion contracts are cleanly cut over: `dod_and_artifacts` becomes `quality_gates_and_artifacts`, `CompletionDodStatus` becomes `CompletionQualityGateStatus`, and `CompletionArtifactRef.dod_status` becomes `quality_gate_status`, with deterministic persisted-schema migration and no active aliases.
+
+**Scale/Scope**: 82 functional requirements and 24 measurable outcomes across the shared constitution prerequisite and provider resolution, impact analysis, native generation, direct and nested `/do-work`, read-only imports, CTO consumption/preparation, language/templates, legacy migration, and implementation conformance; one repository with multiple feature workspaces and up to the existing CTO cap of eight teams per wave
 
 ## Constitution Check
 
@@ -36,18 +40,22 @@ Replace the JSON-only `spec-preparation` experience with one branch-independent 
 
 | Principle | Status | Plan obligation |
 | --- | --- | --- |
-| I. Domain-Agnostic Core | PASS | Core gains reusable constitution-provider resolution, prerequisite continuation, governance binding/impact, workspace, artifact, checkpoint, materialization, readiness, and claim contracts. The native provider is framework-neutral; Spec Kit and other adapters register through public seams. |
-| II. Single Owner and Fail-Closed Boundaries | PASS | The plugin-native constitution profile and existing owner claims remain authoritative. Every provider selection, prerequisite origin, feature, capability, binding, handoff, and execution claim is explicit; multiple candidate constitutions, unusable policy, ambiguous impact, or conflict performs no downstream mutation. |
-| III. Contract-First Compatibility | PASS | Provider interfaces/adapters, persisted schemas, public tool behavior, producers, consumers, tests, docs, and migration receipts change together. Entry points call one prerequisite; framework adapters cannot replace generation, validation, checkpoint, or persistence semantics. |
-| IV. Deterministic State and Durable Dispatch | PASS | Existing capability epochs, trusted answer ledger, atomic writes, profile hashes, and idempotent completion remain the only transition path. Provider selection, constitution usability, two-decision approval, exact-origin resume, and semantic-impact results are persisted typed records; Markdown remains a deterministic projection. |
-| V. Runtime-Backed Verification | PASS | Each slice requires affected package tests plus real command/process coverage with and without Spec Kit, provider ambiguity/override, constitution fixtures and resume, checkpoints, stale/no-impact policy changes, claims, imports, and CTO dispatch. |
-| Package and Runtime Constraints | PASS | ESM TypeScript and Node.js 20+ remain unchanged; the native constitution profile/template ship with core, adapters use public provider contracts, and no external framework or deep import is required. |
+| I. Domain-Agnostic Core | PASS | Core gains reusable constitution-provider resolution, prerequisite continuation, governance binding/impact, workspace, artifact, checkpoint, materialization, readiness, claim, and implementation-conformance contracts. The native provider and terminal conformance join are executor/framework-neutral; bundle adapters register only through public seams. |
+| II. Single Owner and Fail-Closed Boundaries | PASS | The plugin-native constitution profile and existing owner claims remain authoritative. Every provider selection, prerequisite origin, feature, capability, binding, handoff, execution claim, evidence reference, and terminal result is explicit; ambiguity, invalidity, stale evidence, failed closure, or ownership conflict performs no unauthorized advancement or completion mutation. |
+| III. Contract-First Compatibility | PASS | Provider interfaces/adapters, persisted schemas, DoD-labelled completion-contract cutover, public tool behavior, producers, consumers, tests, docs, migration receipts, and conformance-result contract change together. The exported/persisted rename receives the required semantic-version bump and documented migration; no active compatibility alias or second completion implementation remains. |
+| IV. Deterministic State and Durable Dispatch | PASS | Existing capability epochs, trusted answer ledger, atomic writes, profile hashes, immutable artifacts, and idempotent advancement remain the only transition path. Provider selection, constitution usability, approval, exact-origin resume, semantic impact, claims, and handoff-bound conformance results are persisted typed records; Markdown remains a deterministic projection. |
+| V. Runtime-Backed Verification | PASS | Each slice requires affected package tests plus real command/process coverage with and without Spec Kit, provider ambiguity/override, constitution fixtures and resume, checkpoints, stale/no-impact policy changes, claims, imports, CTO dispatch, completion-contract migration, and fail-closed requirement closure before completion. |
+| Package and Runtime Constraints | PASS | ESM TypeScript and Node.js 20+ remain unchanged; the native constitution profile/template and conformance schema ship with core, adapters use public contracts, external evidence/paths are validated before use, and no external framework or deep import is required. |
 
 No constitutional exception is required.
 
 ### Post-Design Re-check
 
 PASS. The design extends `TeamState`, provider selection, prerequisite continuation, `StageDef` document rendering, artifact schemas, checkpoint policy, and workflow contracts additively, then performs a clean profile/command cutover. One plugin-native constitution workflow owns generation, deterministic validation, materialization, revision, and approval regardless of installed external tooling. Provider resolution selects an explicit path, one discovered existing provider, or `CONSTITUTION.md`; ambiguity fails closed. Exact content bindings plus typed, artifact-scoped impact evidence prevent both unsafe stale approvals and blanket formatting-only invalidation. Direct commands, `/do-work`, and CTO mode consume the same workspace and handoff; Spec Kit and other format adapters cannot bypass or replace the native constitution contract; human approval remains proof-bound and synchronous. No constitutional exception is required.
+
+The final execution design also passes the re-check: a deterministic core conformance gate consumes evidence already produced by implementation, review, testing, and project/profile quality gates, binds its result to the frozen handoff digest, and blocks terminal state on any missing, failed, stale, or contradictory row. It applies identically to `/do-work` and CTO fan-in and replaces ambiguous `dod_and_artifacts` terminology rather than creating another acceptance contract.
+
+The only breaking public/persisted change is the removal of DoD-labelled generic completion names. It is explicitly versioned, migrated once with provenance, documented for consumers, and removed cleanly from active producers and readers. All other new specification and conformance fields are versioned schema additions with fail-closed migration for missing bindings.
 
 ## Project Structure
 
@@ -62,7 +70,8 @@ specs/001-redesign-spec-workflow/
 ├── contracts/
 │   ├── command-contract.md
 │   ├── feature-workspace.schema.json
-│   └── implementation-handoff.schema.json
+│   ├── implementation-handoff.schema.json
+│   └── implementation-conformance.schema.json
 └── tasks.md                        # Created later by the Tasks phase, not by this command
 ```
 
@@ -82,7 +91,8 @@ specs/<feature-id>/
 │   ├── specify.md
 │   ├── plan.md
 │   ├── tasks.md
-│   └── constitution-impact.md      # Current binding/impact evidence when policy changed
+│   ├── constitution-impact.md      # Current binding/impact evidence when policy changed
+│   └── implementation-conformance.md # Final requirement-closure matrix
 ├── history/                        # Prior readable revisions, written on replacement
 └── handoff.md                      # Readable projection of the frozen handoff
 
@@ -115,7 +125,8 @@ packages/core/
 │   │   ├── validation.ts
 │   │   ├── handoff.ts
 │   │   ├── claims.ts
-│   │   └── import.ts
+│   │   ├── import.ts
+│   │   └── conformance.ts          # Shared terminal requirement-closure gate
 │   └── commands/
 │       ├── register.ts
 │       ├── do-work.ts
@@ -150,6 +161,8 @@ packages/e2e/
 ```
 
 **Structure Decision**: Keep canonical workflow state in the existing engine and add a focused `specification` subsystem for reusable aggregate logic. The pure constitution usability check lives with existing core gates; provider selection and durable origin continuation reuse `TeamState`, pause, capability, and checkpoint records. Core ships `constitution.json`, a framework-neutral template, the native `CONSTITUTION.md` provider, typed `ConstitutionDraft`, deterministic renderer, and validation rules. A declared subagent produces draft semantics; the engine alone materializes and approves the file. The resolver applies explicit `constitution.path` → exactly one discovered provider → native default. Multiple existing providers fail closed for user selection. Fullstack may register an optional Spec Kit existing-file provider, but never invokes `/speckit.constitution`, its CLI, or its template resolver. Native preparation and import profiles reference the same prerequisite rather than copying its stages. `.active-feature` remains a convenience pointer only—every transition resolves an explicit `feature_id`/`run_key` and is capability-bound.
+
+Implementation conformance is another reusable aggregate in that subsystem, not a new executor or state machine: execution profiles submit typed evidence references, core deterministically joins them to the frozen handoff traceability graph, and the engine permits terminal advancement only for a current passing result.
 
 ## Design
 
@@ -212,7 +225,31 @@ Template resolution order is feature override, project/workflow-owner default, t
 
 ### Handoff and Execution Claim
 
-One versioned implementation handoff contains approved scope, requirement/decision/task/verification traceability, validation status, exact constitution binding and any no-impact evidence, risks, language, source provenance, and exact bound phase versions. `/do-work` and CTO preflight call one readiness predicate over this contract. A constitution change that is affected or not yet assessed makes the handoff non-ready before claim acquisition. A durable execution claim is keyed by handoff digest and permits one active owner (`do-work` run or CTO wave); conflicts fail closed or queue. Claims never grant approval and cannot survive a changed handoff.
+One versioned implementation handoff contains approved scope, requirement/acceptance/decision/task/verification traceability, validation status, exact constitution binding and any no-impact evidence, risks, language, source provenance, and exact bound phase versions. Verification obligations identify the covered acceptance scenarios and whether they describe observable behavior. `/do-work` and CTO preflight call one readiness predicate over this contract. A constitution change that is affected or not yet assessed makes the handoff non-ready before claim acquisition. A durable execution claim is keyed by handoff digest and permits one active owner (`do-work` run or CTO wave); conflicts fail closed or queue. Claims never grant approval and cannot survive a changed handoff.
+
+### Implementation Completion Conformance
+
+Every specification-backed execution ends with the same blocking `implementation_conformance`
+gate before the workspace, execution claim, do-work run, or CTO wave can become complete. The gate
+loads the frozen handoff, current claim, implementation artifacts, reviewer verdicts, executed-test
+artifacts, and constitution/profile quality-gate results. It deterministically emits one immutable
+`ImplementationConformanceResult` and renders
+`validation/implementation-conformance.md`.
+
+The matrix contains one closure row for every approved functional requirement and every acceptance
+scenario. Each row must cite implementation evidence and a passing review verdict; rows marked as
+observable behavior must also cite at least one passing executed test or runtime scenario. Evidence
+must be attributable, current, inside the authorized project/run, and bound to the exact handoff
+digest. Missing, failed, stale, contradictory, or unbound evidence produces `blocked`, keeps the
+execution claim with the current owner for repair, and exposes the precise next action. A finding
+that implementation intent differs from the handoff produces `changed_intent`, blocks completion,
+and routes to the earliest affected specification phase.
+
+Project-constitution and selected-profile quality gates are additional required rows, but they
+cannot close a specification requirement. The matrix is derived from the approved specification
+contract and therefore must not accept a second feature-specific DoD, executor-authored acceptance
+criteria, or human override. `workflow_advance` may finish the terminal execution stage only after
+the shared gate returns a current `pass`; idempotent replay returns the established result.
 
 ### External Intake
 
@@ -220,26 +257,28 @@ One versioned implementation handoff contains approved scope, requirement/decisi
 
 ### `/do-work` and CTO Integration
 
-- `/do-work` first resolves an explicit or uniquely matching ready handoff, then verifies its current constitution binding/impact before claim acquisition. A ready handoff skips product/requirements/architecture rediscovery; a partial, stale, constitution-affected/unassessed, conflicting, or ambiguous workspace routes to the earliest affected phase and dispatches no implementation.
+- `/do-work` first resolves an explicit or uniquely matching ready handoff, then verifies its current constitution binding/impact before claim acquisition. A ready handoff skips product/requirements/architecture rediscovery; a partial, stale, constitution-affected/unassessed, conflicting, or ambiguous workspace routes to the earliest affected phase and dispatches no implementation. After implementation, review, testing, and profile gates, the shared conformance gate must pass before the run, claim, and workspace can complete.
 - Without a handoff, quick low-risk work retains the lightweight profile, medium work may run focused clarification or bounded Specify, and complex/critical/low-confidence/security/infrastructure work enters the full three-phase profile. Every path that actually enters native Specify first runs the shared constitution prerequisite.
-- CTO execution freezes selected handoff versions and current constitution impact results into the existing team plan, obtains the current user’s mapping confirmation, then parallelizes only dependency- and ownership-safe slices.
+- CTO execution freezes selected handoff versions and current constitution impact results into the existing team plan, obtains the current user’s mapping confirmation, then parallelizes only dependency- and ownership-safe slices. Team results fan into separate per-handoff conformance matrices; one feature may complete only when its own matrix passes, so a failed feature remains isolated from independent passing features.
 - CTO preparation delegates each feature to the standard specification profile after its own shared prerequisite succeeds. Independent feature workspaces may run in parallel when their explicit run identities and write scopes do not overlap; facets of one feature serialize behind one phase writer. CTO renders one review packet but records a separate synchronous checkpoint decision in each feature state. Final Tasks approval ends preparation; implementation requires a separate explicit CTO execution wave.
 
 ## Implementation Sequence
 
-1. **Addressable workspace and binding foundation** — add branch-independent feature identity, explicit run selection, additive state migration, immutable version pointers, safe paths, typed artifact schemas, and reusable exact-content bindings.
+1. **Addressable workspace and binding foundation** — add branch-independent feature identity, explicit run selection, additive state migration, immutable version pointers, safe paths, typed artifact schemas, reusable exact-content bindings, and the completion-contract cutover (`quality_gates_and_artifacts`, `CompletionQualityGateStatus`, `quality_gate_status`) with deterministic migration from legacy DoD-labelled values/fields.
 2. **Plugin-native constitution prerequisite** — add the pure TypeScript usability gate, provider interface/resolver, native `CONSTITUTION.md` default, explicit override, ambiguity handling, durable origin descriptor, shipped template and `constitution.json` profile; delegate typed draft/revision content to a declared subagent and add deterministic materialization/validation, proof-bound two-decision approval, and idempotent continuation without any Spec Kit dependency.
 3. **Constitution impact propagation** — bind validations/approvals/compatibility decisions/handoffs to exact version and fingerprint; add versioned semantic-impact assessment, artifact-scoped no-impact evidence, targeted stale dependency closure, and fail-closed readiness.
 4. **Phase materialization and gates** — add generic registered renderers/templates, versioned Markdown/history/status projections, validation records, semantic staleness propagation, and the exact three-decision phase checkpoint behavior.
-5. **Shared handoff and claim** — define the executor-neutral handoff, one readiness predicate including constitution bindings, conflict routing, and an exclusive handoff-version execution claim before integrating any executor.
-6. **First vertical slice: native constitution gate + external intake → `/do-work`** — prove constitution generation in a project with no Spec Kit, then implement generic read-only specification import, one optional Spec Kit fixture adapter, compatibility checkpoint, and single-spec `/do-work` execution. This delivers the preferred interoperability slice while proving exact external resume and the shared handoff early.
+5. **Shared handoff, claim, and completion conformance** — define the executor-neutral handoff, acceptance-scenario and observability verification obligations, one readiness predicate including constitution bindings, conflict routing, an exclusive handoff-version execution claim, the immutable requirement-closure result, and the fail-closed terminal gate before integrating any executor.
+6. **First vertical slice: native constitution gate + external intake → `/do-work`** — prove constitution generation in a project with no Spec Kit, then implement generic read-only specification import, one optional Spec Kit fixture adapter, compatibility checkpoint, single-spec `/do-work` execution, and passing/blocked completion matrices. This delivers the preferred interoperability slice while proving exact external resume, shared handoff, and end-to-end conformance early.
 7. **Native explicit phases** — replace `spec-preparation.json` with delegated Specify/Plan/Tasks stages, shared constitution prerequisite, deterministic materialization, synchronous checkpoints, baseline templates, language precedence, and direct phase commands.
-8. **Adaptive `/do-work` preparation** — consume ready native handoffs, add quick/medium/full routing, and make the full nested path call the same prerequisite and subagent stages without main-session authorship.
-9. **CTO handoff execution and preparation** — add multi-workspace preflight, frozen specification-to-team/constitution mappings, per-version claims, dependency-safe parallelization, mapping confirmation, bounded standard-profile preparation slices, per-feature synchronous checkpoint fan-in, queue reasons, and the hard stop before implementation.
-10. **Remaining compatibility and migration** — add OpenSpec/BMAD/Superpowers/XPowers recognizers, additional optional constitution providers only where justified, generic hostile/unknown/ambiguous-provider fixtures, legacy JSON materialization with fresh approval and current bindings, and final cross-profile migration removal.
+8. **Adaptive `/do-work` preparation** — consume ready native handoffs, add quick/medium/full routing, make the full nested path call the same prerequisite and subagent stages without main-session authorship, and require the shared conformance result for every specification-backed terminal outcome.
+9. **CTO handoff execution and preparation** — add multi-workspace preflight, frozen specification-to-team/constitution mappings, per-version claims, dependency-safe parallelization, mapping confirmation, bounded standard-profile preparation slices, per-feature synchronous checkpoint fan-in, per-handoff completion matrices, queue reasons, and the hard stop before implementation.
+10. **Remaining compatibility and migration** — add OpenSpec/BMAD/Superpowers/XPowers recognizers, additional optional constitution providers only where justified, generic hostile/unknown/ambiguous-provider fixtures, legacy JSON materialization with fresh approval and current bindings, persisted completion-intent migration, and final cross-profile migration removal.
 
-Tests, runtime scenarios, consumer documentation, and changelog entries land with the slice whose observable contract they protect; they are not deferred to a cleanup-only final phase.
+Tests, runtime scenarios, consumer documentation, migration guidance, changelog entries, and the semantic-version bump for the completion-contract cutover land with the slice whose observable contract they protect; they are not deferred to a cleanup-only final phase.
 
 ## Complexity Tracking
 
 No constitution violation is accepted. The `specification` directory is a cohesive reusable subsystem inside the existing core, not a second engine. The plugin ships the one canonical constitution profile, template, renderer, validator, and native `CONSTITUTION.md` provider; external integrations may locate an existing policy file but cannot replace workflow semantics or become required dependencies. Exact content bindings plus evidence-backed semantic impact avoid both under-invalidation and blanket stale churn. The separate `spec-import` profile is a declarative entry path that terminates in the same workspace, provider authority, checkpoint ledger, readiness predicate, and handoff.
+
+The implementation-conformance artifact is deliberately not a second feature contract. It is a deterministic closure projection of the approved handoff plus existing project/profile gates. Executors may contribute evidence, but cannot add, remove, reinterpret, or waive acceptance subjects; any changed intent returns to specification revision.

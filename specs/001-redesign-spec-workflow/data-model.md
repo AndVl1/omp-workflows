@@ -217,7 +217,7 @@ The decision remains bound to run, stage, checkpoint, work identity, capability 
 | `acceptance_ids` | string array | At least one per functional requirement. |
 | `decision_ids` | string array | At least one relevant Plan decision before readiness. |
 | `task_ids` | string array | At least one before readiness. |
-| `verification_ids` | string array | At least one expected evidence item before readiness. |
+| `verification_ids` | string array | At least one pre-implementation obligation before readiness; each obligation identifies covered acceptance scenarios and whether it proves observable behavior. |
 | `source_refs` | path/anchor array | Required for imported material and supplements. |
 
 A native handoff is not ready while any required link is incomplete or stale.
@@ -250,12 +250,50 @@ Frozen executor-neutral implementation contract.
 | `artifact_versions` | phase/import bindings | Exact approved versions and hashes. |
 | `scope` / `requirements` / `decisions` | normalized content | Must be complete and conflict-free. |
 | `tasks` | `ImplementationTask[]` | Valid acyclic task graph. |
-| `verification` | evidence contracts | Covers all required tasks and requirements. |
+| `verification` | evidence obligations | Covers all required tasks, requirements, and acceptance scenarios; each item declares `observable_behavior` so terminal conformance knows when passing executed-test evidence is mandatory. |
 | `validation_refs` / `approval_refs` | id arrays | All current, passing, and human-authorized. |
 | `constitution_binding` / `constitution_impact_ref` | metadata / artifact id or null | Exact approved policy fingerprint and any later no-impact evidence; an affected or unassessed change makes the handoff non-ready. |
 | `risks` / `open_decisions` | arrays | Open blocking decisions must be empty when ready. |
 | `execution_choices` | executor enum array | `do-work`, `cto`, or both. |
 | `status` | `candidate \| ready \| stale` | Derived from current bindings. |
+
+### RequirementClosureEntry
+
+One immutable matrix row for an approved requirement or acceptance scenario.
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `entry_id` | string | Stable within the conformance result. |
+| `subject_kind` | `requirement \| acceptance_scenario` | Both kinds are required in a complete matrix. |
+| `subject_id` | string | Exact approved requirement or acceptance id from the handoff. |
+| `requirement_id` | string | Self for a requirement row; owning requirement for an acceptance row. |
+| `observable_behavior` | boolean | Copied from the frozen verification obligations, never inferred from submitted evidence. |
+| `implementation_evidence_refs` | artifact ref array | Attributable, current, and bound to the execution claim/handoff; non-empty for `pass`, empty only when a blocking finding records missing evidence. |
+| `review_verdict` | `pass \| fail \| missing` | A row cannot pass without `pass`. |
+| `review_evidence_refs` | artifact ref array | Produced by the selected execution profile's review path; non-empty for `pass`, empty only with a blocking missing-review finding. |
+| `test_evidence_refs` | executed evidence ref array | A passing observable row has at least one current passing executed test or runtime scenario; blocked rows may be empty to represent the missing evidence explicitly. |
+| `status` | `pass \| blocked \| changed_intent` | Derived deterministically; never supplied as an override. |
+| `findings` | finding array | Exact missing, failed, stale, contradictory, or intent-conflict evidence. |
+
+### ImplementationConformanceResult
+
+The executor-neutral requirement-closure matrix that gates terminal feature completion.
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `conformance_id` / `matrix_digest` | string / SHA-256 | Immutable, content-addressed, and idempotent for the same inputs. |
+| `feature_id` / `handoff_id` / `handoff_digest` | exact bindings | Must identify the current approved implementation contract. |
+| `execution_claim_id` / `execution_owner` / `execution_run_id` | claim bindings | Evidence must belong to the active owner and run. |
+| `profile_hash` | SHA-256 | Binds the quality-gate and review/test policy used. |
+| `entries` | `RequirementClosureEntry[]` | Exactly one row for every approved requirement and every acceptance scenario; no extra or duplicate subjects. |
+| `quality_gate_results` | gate result array | Every constitution- or selected-profile-mandated gate is present with current evidence; these rows cannot replace requirement closure. |
+| `overall_status` | `pass \| blocked \| changed_intent` | `pass` only when every closure and quality-gate row passes. |
+| `blocking_findings` | finding array | Empty only for `pass`; grouped by subject and evidence type. |
+| `next_action` | typed action | Complete, repair implementation, repeat review/test, or revise the earliest affected specification phase. |
+| `evaluated_at` | timestamp | Audit metadata; not freshness proof by itself. |
+
+The engine derives the subject set from the handoff. Executors can submit evidence but cannot add,
+remove, reinterpret, or waive rows. A human answer cannot override a non-passing result.
 
 ### ExecutionClaim
 
@@ -270,6 +308,11 @@ Exclusive ownership of one ready handoff version.
 | `status` | `active \| completed \| released \| blocked` | No automatic takeover of a live claim. |
 | `acquired_at` / `updated_at` | timestamps | Audit and liveness diagnostics. |
 | `release_reason` | string or null | Required for release/block. |
+
+A claim becomes `completed` only after the bound `ImplementationConformanceResult` passes. Missing,
+failed, stale, or contradictory evidence leaves the claim active for the current owner while it
+repairs the same implementation. `changed_intent` blocks the claim and routes revision to the
+earliest affected specification phase.
 
 A changed handoff invalidates the claim for further dispatch. It does not silently transfer ownership.
 
@@ -388,16 +431,25 @@ blocked
 ### Workspace Status
 
 ```text
-created -> in_progress -> implementation_ready -> claimed -> executing -> completed
-                  |                |              |
-                  v                v              v
-               blocked           stale          blocked
-```
+created -> in_progress -> implementation_ready -> claimed -> executing
+                                                        -> completion_validating -> completed
+                                                                     |
+                                                                     v
+                                                            completion_blocked
+                                                                     |
+                                                                     +-> executing
+
+implementation_ready | claimed | executing | completion_validating
+                  -> stale | blocked
 
 - `implementation_ready` is derived from the handoff readiness predicate.
 - Imported workspaces reach the same status through compatibility approval rather than native phase approval.
 - Any changed bound artifact moves `implementation_ready`, `claimed`, or `executing` to `stale`/`blocked` before new dispatch.
 - If the current constitution fingerprint differs from a bound handoff, readiness remains blocked until a current impact assessment marks the handoff `no_impact` or targeted revalidation/reapproval produces a new handoff.
+- `completion_validating` is entered only with the exact active claim and handoff digest.
+- `completion_blocked` retains the active owner and exposes evidence remediation; a later idempotent evaluation may pass after new current evidence.
+- `changed_intent` never enters `completion_blocked`; it marks the affected contract stale and routes to specification revision.
+- `completed` requires a current passing `ImplementationConformanceResult`. Generic quality gates, task completion, team status, or human acknowledgement cannot produce it.
 
 ### Import Status
 
@@ -413,10 +465,11 @@ ready -> awaiting_compatibility_approval -> implementation_ready
 ### Execution Claim Status
 
 ```text
-(unclaimed) -> active -> completed
+(unclaimed) -> active -> completed   (current conformance result passes)
                      -> released
-                     -> blocked    (handoff changed or owner cannot continue)
-```
+                     -> blocked      (handoff changed, intent changed, or owner cannot continue)
+
+Evidence-remediation failures leave the claim `active`; they do not release it for duplicate execution.
 
 A second active owner receives a conflict or queue result and performs no dispatch.
 
@@ -439,3 +492,7 @@ A second active owner receives a conflict or queue result and performs no dispat
 15. A changed constitution preserves an approval only with explicit artifact-scoped `no_impact` evidence; unassessed or affected bindings fail closed and stale only their dependency closure.
 16. Constitution generation works through the shipped profile/provider when no external framework is installed; provider adapters cannot invoke external commands or replace approval semantics.
 17. More than one discovered constitution source blocks before usability validation, generation, or downstream dispatch until `constitution.path` selects one.
+18. Every approved requirement and acceptance scenario appears exactly once in the final requirement-closure matrix.
+19. Every closure row has attributable implementation evidence and a passing review verdict; every observable-behavior row also has current passing executed-test evidence.
+20. A workspace and execution claim become completed only with a current passing conformance result bound to their exact handoff digest and active owner.
+21. Constitution/profile quality gates are mandatory additional evidence but cannot close missing specification rows; no separate feature-specific DoD or human override can replace the matrix.

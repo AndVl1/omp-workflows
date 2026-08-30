@@ -214,6 +214,64 @@ No unresolved `NEEDS CLARIFICATION` remains. Where an external claim could not b
 - Let each executor re-interpret constitution drift — rejected because `/do-work` and CTO would produce inconsistent readiness decisions.
 - Preserve approvals without explicit no-impact evidence — rejected because an unassessed policy change must fail closed.
 
+## Decision 15: Derive One Completion Matrix from the Approved Handoff
+
+**Decision**: Add one shared, deterministic implementation-conformance gate for every
+specification-backed executor. The gate joins the frozen handoff traceability graph with
+attributable implementation artifacts, reviewer verdicts, executed-test evidence, and mandatory
+project/profile quality-gate results. It emits one immutable
+`ImplementationConformanceResult` and permits completion only when every approved requirement and
+acceptance scenario has implementation evidence and a passing review verdict, every observable
+behavior has passing executed-test evidence, and every reference is current and bound to the same
+handoff digest.
+
+**Rationale**: The approved specification already defines feature intent and acceptance. A separate
+feature DoD would duplicate that contract and could disagree with it; generic quality gates alone
+can prove code quality without proving that approved behavior was implemented. The repository
+already has immutable artifact references, profile-bound completion intent, artifact-contract
+validation, durable advancement, and CTO fan-in. The missing capability is a handoff-bound closure
+join that both executors must pass. Keeping the join deterministic prevents an executor, reviewer,
+or human completion signal from silently removing acceptance subjects.
+
+**Repository seams**:
+
+- Add the reusable join and validator under `packages/core/src/specification/conformance.ts`; store
+  the typed result through the existing artifact store and render its Markdown projection with the
+  existing document machinery.
+- Run the gate from the terminal execution advancement path after implementation, review, test, and
+  profile quality-gate artifacts exist. Do not overload `workflow_complete`: that tool proves one
+  dispatch completed, not that the feature contract is closed.
+- `/do-work` supplies evidence from its implementation/review/QA stages. CTO fan-in partitions team
+  evidence by frozen handoff digest and evaluates one matrix per selected feature, preserving failure
+  isolation.
+- Keep the current execution claim active when closure is blocked so another executor cannot
+  duplicate remedial work. Complete the claim and workspace only with a current passing matrix;
+  route `changed_intent` to the earliest affected specification phase.
+- Cleanly rename every public and persisted generic completion contract that implies a separate
+  DoD: `dod_and_artifacts` becomes `quality_gates_and_artifacts`, `CompletionDodStatus` becomes
+  `CompletionQualityGateStatus`, and `CompletionArtifactRef.dod_status` becomes
+  `quality_gate_status`. Update engine types, profile/state/workflow validators, classification
+  output, producers, consumers, tests, and docs together. The migration reader maps legacy
+  values/fields once and records provenance; active schemas keep no aliases. Because the cutover
+  changes exported and persisted contracts, it ships with the constitution-required semantic-version
+  bump and consumer migration note. Generic quality-gate completion remains necessary but is
+  insufficient by itself for a specification-backed run.
+
+**Alternatives considered**:
+
+- Add a feature-specific Definition of Done — rejected because it creates a second acceptance
+  contract and violates FR-082.
+- Treat green project/profile gates as feature completion — rejected because generic gates do not
+  establish closure for every approved requirement and scenario.
+- Require tests for every matrix row — rejected because non-behavioral requirements may be proven
+  by bounded inspection or artifacts; tests remain mandatory for every observable behavior.
+- Trust task completion or CTO team `done` state — rejected because task/process state is not
+  attributable review and test evidence for the approved handoff.
+- Let the executor add or waive closure rows — rejected because changed intent belongs in the
+  earliest affected specification phase, not in implementation finalization.
+- Allow an explicit human completion override — rejected because approval cannot make missing,
+  failed, stale, or contradictory implementation evidence true.
+
 ## Reference Practices Adopted and Rejected
 
 | Reference | Adopt | Reject |

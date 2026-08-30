@@ -19,6 +19,7 @@
     "template_set",
     "phases",
     "status",
+    "implementation_conformance_ref",
     "next_action"
   ],
   "additionalProperties": false,
@@ -228,6 +229,8 @@
         "implementation_ready",
         "claimed",
         "executing",
+        "completion_validating",
+        "completion_blocked",
         "completed",
         "blocked",
         "stale"
@@ -254,6 +257,9 @@
       "type": ["string", "null"]
     },
     "execution_claim_ref": {
+      "type": ["string", "null"]
+    },
+    "implementation_conformance_ref": {
       "type": ["string", "null"]
     },
     "import_ref": {
