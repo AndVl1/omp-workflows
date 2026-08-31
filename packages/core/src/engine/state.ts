@@ -600,6 +600,37 @@ function resolveLegacyWorkflowFallback(cwd: string, wsDir: string, currentBranch
   }
 }
 
+/**
+ * Probe the current branch's own derived feature state. A stale slot must
+ * never hide it: when this state exists, parses and belongs to the current
+ * branch, it is the authoritative resolution (branch-owned state outranks a
+ * stale .active-feature pointer or legacy root). Malformed, foreign-branch
+ * or containment-violating files are never adopted — the stale slot stands
+ * and the transaction-level fail-closed checks still apply.
+ */
+function resolveBranchOwnedFeatureState(wsDir: string, currentBranch: string): ResolvedState | null {
+  const slug = deriveFeatureSlugFromBranch(currentBranch);
+  if (!slug || !isSafeStateSegment(slug)) return null;
+  const featuresDir = join(wsDir, "features");
+  const featureDir = join(featuresDir, slug);
+  const statePath = join(featureDir, "state.json");
+  if (!existsSync(statePath)) return null;
+  try {
+    const realWorkState = realpathSync(wsDir);
+    const realFeatures = realpathSync(featuresDir);
+    const realFeature = realpathSync(featureDir);
+    if (!isWithin(realWorkState, realFeatures) || !isWithin(realFeatures, realFeature)) return null;
+    if (!isWithin(realFeature, realpathSync(statePath))) return null;
+    const artifactsPath = join(featureDir, "artifacts");
+    if (existsSync(artifactsPath) && !isWithin(realFeature, realpathSync(artifactsPath))) return null;
+    const state = normalizePersistedState(JSON.parse(readFileSync(statePath, "utf8")));
+    if (!state || state.branch !== currentBranch) return null;
+    return { state, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: false };
+  } catch {
+    return null;
+  }
+}
+
 export type StateSelector = { kind?: "auto" | "team" | "cto-slice"; runId?: string; sliceId?: string; capabilityId?: string };
 export interface ResolvedActiveRun extends ResolvedState {
   kind: "legacy-root" | "feature" | "cto-slice";
@@ -695,7 +726,15 @@ export function resolveState(cwd: string, currentBranch?: string): ResolvedState
         const legacyFallback = resolveLegacyWorkflowFallback(cwd, wsDir, currentBranch);
         if (legacyFallback) return legacyFallback;
       }
-      return { state, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: currentBranch ? state.branch !== currentBranch : false };
+      const staleForBranch = Boolean(currentBranch) && state.branch !== currentBranch;
+      if (currentBranch && staleForBranch) {
+        // Branch-owned state outranks a stale slot: the current branch's own
+        // derived feature state is authoritative over a pointer that belongs
+        // to another branch.
+        const own = resolveBranchOwnedFeatureState(wsDir, currentBranch);
+        if (own) return own;
+      }
+      return { state, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: staleForBranch };
     } catch {
       return { state: null, statePath, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false, invalid: true };
     }
@@ -714,7 +753,14 @@ export function resolveState(cwd: string, currentBranch?: string): ResolvedState
       }
       const state = normalizePersistedState(JSON.parse(readFileSync(legacyPath, "utf8")));
       if (!state) return { state: null, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: false, invalid: true };
-      return { state, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: currentBranch ? state.branch !== currentBranch : false };
+      const staleForBranch = Boolean(currentBranch) && state.branch !== currentBranch;
+      if (currentBranch && staleForBranch) {
+        // Same ownership rule as the pointer path: the branch's own derived
+        // feature state outranks a legacy root from another branch.
+        const own = resolveBranchOwnedFeatureState(wsDir, currentBranch);
+        if (own) return own;
+      }
+      return { state, statePath: legacyPath, stateDir: wsDir, artifactsDir: artifactsPath, isLegacy: true, isStale: staleForBranch };
     } catch {
       return { state: null, statePath: legacyPath, stateDir: wsDir, artifactsDir: join(wsDir, "artifacts"), isLegacy: true, isStale: false, invalid: true };
     }
@@ -1376,6 +1422,12 @@ function transactionTarget(
   };
 }
 
+/** The feature destination a branch-retargeting transaction would commit to. */
+function featureDestinationPath(wsDir: string, branch: string, featureSlug?: string): string {
+  const slug = featureSlug ?? deriveFeatureSlugFromBranch(branch) ?? "default";
+  return join(wsDir, "features", slug, "state.json");
+}
+
 function casConflict(observed: RawStateRead, current: RawStateRead): string | null {
   if (current.kind === "invalid") return current.error;
   if (observed.kind === "invalid") return observed.error;
@@ -1435,6 +1487,14 @@ export function updateStateAtomically<T>(
     } catch (error) {
       return { ok: false, code: "state_invalid", error: (error as Error).message };
     }
+    // Snapshot the candidate retarget destination at initial resolution so
+    // the pre-CAS check can distinguish a pre-existing own-branch state
+    // (honest already-exists conflict) from a destination that appeared or
+    // changed mid-transaction (fail-closed foreign-creation conflict).
+    const candidateDestinationPath = featureDestinationPath(wsDir, branch, opts.featureSlug);
+    const destinationAtResolution = candidateDestinationPath !== initial.prepared.statePath
+      ? readRawStateSnapshot(candidateDestinationPath)
+      : null;
     stateTransactionTestHooks?.afterTargetResolution?.({
       statePath: initial.prepared.statePath,
       stateDir: initial.prepared.stateDir,
@@ -1461,7 +1521,9 @@ export function updateStateAtomically<T>(
 
     // Resolve the final destination before either CAS. A stale active feature
     // retargets by the mutation's branch, but an existing future destination
-    // is always a conflict — it is never adopted or overwritten.
+    // is always a conflict — it is never adopted or overwritten; only the
+    // classification (honest own-branch already-exists vs mid-transaction
+    // creation) is decided from the resolution-time destination snapshot.
     const staleForBranch = state !== null
       && target.isStale
       && typeof mutation.state.branch === "string"
@@ -1486,7 +1548,27 @@ export function updateStateAtomically<T>(
       const destination = readRawStateSnapshot(prepared.statePath);
       if (destination.kind === "invalid") return { ok: false, code: "state_conflict", error: destination.error };
       if (destination.kind === "present") {
-        return { ok: false, code: "state_conflict", error: "workflow state was created at the future destination during the transaction" };
+        // Timing + ownership: a destination that already existed at initial
+        // resolution, is unchanged since, and belongs to the mutation's
+        // branch is the run's own pre-existing state — report the honest,
+        // recoverable conflict. A destination that appeared or changed
+        // mid-transaction, or is owned by another branch, is never adopted
+        // or overwritten and keeps the fail-closed creation conflict.
+        const atResolution = destinationAtResolution;
+        const preExistingOwnBranch = atResolution !== null
+          && atResolution.kind === "present"
+          && prepared.statePath === candidateDestinationPath
+          && atResolution.revision === destination.revision
+          && atResolution.raw_hash === destination.raw_hash
+          && typeof mutation.state.branch === "string"
+          && destination.state.branch === mutation.state.branch;
+        return {
+          ok: false,
+          code: "state_conflict",
+          error: preExistingOwnBranch
+            ? "workflow state already exists for this branch; use continuation mode"
+            : "workflow state was created at the future destination during the transaction",
+        };
       }
     }
 

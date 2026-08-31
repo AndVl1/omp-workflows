@@ -1074,6 +1074,119 @@ test("review: creation at a stale target's future branch destination is never ov
   }
 });
 
+test("review: pre-existing own-branch future destination reports the honest already-exists conflict", () => {
+  const root = mkdtempSync(join(tmpdir(), "review-own-destination-"));
+  try {
+    initGit(root);
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    seedState(root, { profile, stageCursor: "discovery", slug: "old" });
+    const oldPath = statePathOf(root, "old");
+    const old = JSON.parse(readFileSync(oldPath, "utf8")) as TeamState;
+    writeFileSync(oldPath, JSON.stringify({ ...old, branch: "foreign" }, null, 2) + "\n");
+    // Resolve the stale slot BEFORE the own destination exists: the
+    // transaction then arrives with a target that no longer describes where
+    // the mutation will commit.
+    const staleSlot = resolveState(root, "main");
+    assert.equal(staleSlot.isStale, true);
+    mkdirSync(join(root, ".work-state", "features", "main"), { recursive: true });
+    const own = { ...old, branch: "main", task: "the branch's own earlier run", state_revision: 7 };
+    const ownBytes = JSON.stringify(own, null, 2) + "\n";
+    writeFileSync(statePathOf(root, "main"), ownBytes);
+    const staleSlotBytes = readFileSync(oldPath, "utf8");
+
+    const updated = updateStateAtomically(root, (snapshot) => ({
+      op: "commit",
+      state: { ...snapshot.state!, branch: "main", task: "fresh create" },
+    }), { target: staleSlot, branch: "main" });
+    assert.equal(updated.ok, false);
+    if (!updated.ok) {
+      assert.equal(updated.code, "state_conflict");
+      assert.match(updated.error, /workflow state already exists for this branch; use continuation mode/);
+      assert.doesNotMatch(updated.error, /created at the future destination/);
+    }
+    assert.equal(readFileSync(statePathOf(root, "main"), "utf8"), ownBytes, "a pre-existing own-branch destination is never overwritten");
+    assert.equal(readFileSync(oldPath, "utf8"), staleSlotBytes, "the stale slot is never rewritten by the failed transaction");
+  } finally {
+    setStateTransactionTestHooks(null);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("review: foreign pre-existing state at a stale target's future destination stays fail-closed", () => {
+  const root = mkdtempSync(join(tmpdir(), "review-foreign-destination-"));
+  try {
+    initGit(root);
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    seedState(root, { profile, stageCursor: "discovery", slug: "old" });
+    const oldPath = statePathOf(root, "old");
+    const old = JSON.parse(readFileSync(oldPath, "utf8")) as TeamState;
+    writeFileSync(oldPath, JSON.stringify({ ...old, branch: "foreign" }, null, 2) + "\n");
+    mkdirSync(join(root, ".work-state", "features", "main"), { recursive: true });
+    const foreign = { ...old, branch: "other-branch", task: "another branch's run" };
+    const foreignBytes = JSON.stringify(foreign, null, 2) + "\n";
+    writeFileSync(statePathOf(root, "main"), foreignBytes);
+    const staleSlotBytes = readFileSync(oldPath, "utf8");
+
+    const updated = updateStateAtomically(root, (snapshot) => ({
+      op: "commit",
+      state: { ...snapshot.state!, branch: "main" },
+    }), { branch: "main" });
+    assert.equal(updated.ok, false);
+    if (!updated.ok) {
+      assert.equal(updated.code, "state_conflict");
+      assert.match(updated.error, /workflow state was created at the future destination during the transaction/);
+      assert.doesNotMatch(updated.error, /already exists for this branch/);
+    }
+    assert.equal(readFileSync(statePathOf(root, "main"), "utf8"), foreignBytes, "the foreign destination is byte-untouched");
+    assert.equal(readFileSync(oldPath, "utf8"), staleSlotBytes, "the stale slot is byte-untouched");
+  } finally {
+    setStateTransactionTestHooks(null);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("review: a future destination changed after initial resolution is never overwritten", () => {
+  const root = mkdtempSync(join(tmpdir(), "review-destination-changed-"));
+  try {
+    initGit(root);
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    seedState(root, { profile, stageCursor: "discovery", slug: "old" });
+    const oldPath = statePathOf(root, "old");
+    const old = JSON.parse(readFileSync(oldPath, "utf8")) as TeamState;
+    writeFileSync(oldPath, JSON.stringify({ ...old, branch: "foreign" }, null, 2) + "\n");
+    const staleSlot = resolveState(root, "main");
+    assert.equal(staleSlot.isStale, true);
+    mkdirSync(join(root, ".work-state", "features", "main"), { recursive: true });
+    const own = { ...old, branch: "main", task: "the branch's own earlier run" };
+    writeFileSync(statePathOf(root, "main"), JSON.stringify(own, null, 2) + "\n");
+    let changedBytes = "";
+    setStateTransactionTestHooks({
+      beforeCas: ({ destinationPath }) => {
+        const current = JSON.parse(readFileSync(destinationPath, "utf8")) as TeamState;
+        changedBytes = JSON.stringify({ ...current, task: "changed mid-transaction" }, null, 2) + "\n";
+        writeFileSync(destinationPath, changedBytes);
+      },
+    });
+    const updated = updateStateAtomically(root, (snapshot) => ({
+      op: "commit",
+      state: { ...snapshot.state!, branch: "main" },
+    }), { target: staleSlot, branch: "main" });
+    assert.equal(updated.ok, false);
+    if (!updated.ok) {
+      assert.equal(updated.code, "state_conflict");
+      assert.match(updated.error, /workflow state was created at the future destination during the transaction/);
+      assert.doesNotMatch(updated.error, /already exists for this branch/);
+    }
+    assert.equal(readFileSync(statePathOf(root, "main"), "utf8"), changedBytes, "the transaction never writes over a destination it did not base its revision on");
+  } finally {
+    setStateTransactionTestHooks(null);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("review: state.md fault rolls artifact writes back before releasing the state lock", () => {
   const root = mkdtempSync(join(tmpdir(), "review-state-md-fault-"));
   try {
