@@ -20,12 +20,19 @@
  *   2. .work-state/team-state.json (legacy)
  *   3. undefined (no state yet)
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, readdirSync, realpathSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, readdirSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { readObservabilityPointer } from "../observability/recorder.js";
 import { recordStageTransition } from "../observability/hooks.js";
+import {
+  beginArtifactJournal,
+  commitArtifactJournal,
+  endArtifactJournal,
+  publishAfterStateCommit,
+  rollbackArtifactJournal,
+} from "./artifacts.js";
 import { activeWave, readCtoState } from "../cto/state.js";
 import {
   loadProfile,
@@ -33,8 +40,19 @@ import {
   resolveProfileControlPlane,
   validateProfileControlPlane,
 } from "./profile.js";
+import {
+  validateActiveDispatchCapabilityValue,
+  validateCheckpointDecisionValue,
+  validateCheckpointPolicyValue,
+  validateTypedCheckpointDecisionValue,
+  validateDispatchCapabilityValue,
+  validatePendingStateValue,
+  validateTrustedCheckpointAnswerValue,
+  validateWorkIdentityValue,
+} from "./control-plane-contract.js";
 import type {
   CheckpointPolicy,
+  CheckpointPolicyBinding,
   CompletionEnvelope,
   CompletionIntent,
   ControlPlaneProvenance,
@@ -114,22 +132,8 @@ function nonEmptyStateString(value: unknown): value is string {
 }
 
 function validateStateIdentity(value: unknown, path: string, issues: string[]): void {
-  if (!isStateRecord(value)) {
-    issues.push(`${path} must be an object`);
-    return;
-  }
-  const keys = [
-    "run_id", "wave_id", "slice_id", "session_id", "workflow", "stage_id", "stage_cursor",
-    "capability_id", "capability_epoch", "slot_id", "task_id", "dispatch_id", "attempt", "worker_id",
-  ] as const;
-  strictStateKeys(value, keys, path, issues);
-  for (const key of keys) {
-    if (key === "attempt") {
-      if (!Number.isInteger(value[key]) || (value[key] as number) < 1) issues.push(`${path}.attempt must be an integer >= 1`);
-    } else if (!nonEmptyStateString(value[key])) {
-      issues.push(`${path}.${key} must be a non-empty string`);
-    }
-  }
+  const result = validateWorkIdentityValue(value, path);
+  if (!result.ok) issues.push(...result.issues.map((issue) => `${issue.path} ${issue.message}`));
 }
 
 function validateStateSelection(value: unknown, path: string, issues: string[]): void {
@@ -187,28 +191,8 @@ function validateStateSelection(value: unknown, path: string, issues: string[]):
 }
 
 function validateStatePending(value: unknown, path: string, issues: string[]): void {
-  if (!isStateRecord(value)) {
-    issues.push(`${path} must be an object`);
-    return;
-  }
-  strictStateKeys(value, ["identity", "status", "pending_reason", "provider_ref", "lease", "terminal_signal", "retry_of", "updated_at"], path, issues);
-  validateStateIdentity(value.identity, `${path}.identity`, issues);
-  if (!["authorized", "running", "pending", "succeeded", "failed", "cancelled"].includes(String(value.status))) issues.push(`${path}.status has an unknown value`);
-  if (value.pending_reason !== undefined && !["provider_running", "awaiting_result", "transport_reconnect"].includes(String(value.pending_reason))) issues.push(`${path}.pending_reason has an unknown value`);
-  if (value.provider_ref !== undefined && !nonEmptyStateString(value.provider_ref)) issues.push(`${path}.provider_ref must be a non-empty string`);
-  if (value.lease !== undefined) {
-    if (!isStateRecord(value.lease)) issues.push(`${path}.lease must be an object`);
-    else {
-      strictStateKeys(value.lease, ["token", "observed_at", "revoked_at"], `${path}.lease`, issues);
-      if (!nonEmptyStateString(value.lease.token)) issues.push(`${path}.lease.token must be a non-empty string`);
-      if (!nonEmptyStateString(value.lease.observed_at)) issues.push(`${path}.lease.observed_at must be a non-empty string`);
-      if (!Object.prototype.hasOwnProperty.call(value.lease, "revoked_at") || (value.lease.revoked_at !== null && !nonEmptyStateString(value.lease.revoked_at))) issues.push(`${path}.lease.revoked_at must be a non-empty string or null`);
-    }
-  }
-  if (value.terminal_signal !== undefined && value.terminal_signal !== null && !nonEmptyStateString(value.terminal_signal)) issues.push(`${path}.terminal_signal must be a non-empty string or null`);
-  if (value.retry_of !== undefined && value.retry_of !== null && !nonEmptyStateString(value.retry_of)) issues.push(`${path}.retry_of must be a non-empty string or null`);
-  if (!nonEmptyStateString(value.updated_at)) issues.push(`${path}.updated_at must be a non-empty string`);
-  if (value.status === "pending" && value.terminal_signal !== undefined && value.terminal_signal !== null) issues.push(`${path}.terminal_signal cannot be terminal for pending work`);
+  const result = validatePendingStateValue(value, path, "single");
+  if (!result.ok) issues.push(...result.issues.map((issue) => `${issue.path} ${issue.message}`));
 }
 
 function validateStateChildJoin(value: unknown, path: string, issues: string[]): void {
@@ -265,25 +249,8 @@ function validateStateTrustedCheckpointAnswers(value: unknown, path: string, iss
     return;
   }
   value.forEach((entry, index) => {
-    const entryPath = `${path}[${index}]`;
-    if (!isStateRecord(entry)) {
-      issues.push(`${entryPath} must be an object`);
-      return;
-    }
-    strictStateKeys(entry, [
-      "answer_id", "nonce", "channel", "reference", "run_id", "stage_id", "checkpoint_id",
-      "work_identity_hash", "capability_id", "capability_epoch", "policy_hash", "decision",
-      "binding", "issued_at", "consumed_at",
-    ], entryPath, issues);
-    for (const key of [
-      "answer_id", "nonce", "reference", "run_id", "stage_id", "checkpoint_id",
-      "work_identity_hash", "capability_id", "capability_epoch", "policy_hash",
-      "decision", "binding", "issued_at",
-    ]) {
-      if (!nonEmptyStateString(entry[key])) issues.push(`${entryPath}.${key} must be a non-empty string`);
-    }
-    if (!["terminal", "escalation"].includes(String(entry.channel))) issues.push(`${entryPath}.channel has an unknown value`);
-    if (entry.consumed_at !== undefined && !nonEmptyStateString(entry.consumed_at)) issues.push(`${entryPath}.consumed_at must be a non-empty string`);
+    const result = validateTrustedCheckpointAnswerValue(entry, `${path}[${index}]`);
+    if (!result.ok) issues.push(...result.issues.map((issue) => `${issue.path} ${issue.message}`));
   });
 }
 
@@ -300,14 +267,64 @@ function validateStateMigration(value: unknown, path: string, issues: string[]):
   if (!["complete", "blocked"].includes(String(value.status))) issues.push(`${path}.status has an unknown value`);
 }
 
+/**
+ * Active-stage policy binding: shape plus consistency with the mirrored
+ * `checkpoint_policy`. A binding for a stage other than the cursor is a
+ * prior-stage projection — normalization drops it instead of rejecting.
+ */
+function validatePolicyBinding(value: unknown, state: StateRecord, path: string, issues: string[]): void {
+  if (!isStateRecord(value)) {
+    issues.push(`${path} must be an object`);
+    return;
+  }
+  strictStateKeys(value, ["stage_id", "profile_hash", "policy_hash"], path, issues);
+  for (const key of ["stage_id", "profile_hash", "policy_hash"]) {
+    if (!nonEmptyStateString(value[key])) issues.push(`${path}.${key} must be a non-empty string`);
+  }
+  const currentStage = state.stage_cursor;
+  if (value.stage_id !== currentStage) return; // prior-stage projection: dropped by normalization
+  if (nonEmptyStateString(value.policy_hash)
+    && isStateRecord(state.checkpoint_policy)
+    && Object.prototype.hasOwnProperty.call(state, "checkpoint_policy")
+    && stableStateHash(state.checkpoint_policy) !== value.policy_hash) {
+    issues.push(`${path}.policy_hash does not match the persisted checkpoint_policy`);
+  }
+}
+
 function validateTypedStateFields(state: StateRecord): string[] {
   const issues: string[] = [];
   const profileFields: StateRecord = {};
-  for (const key of ["completion_intent", "checkpoint_policy", "roster_policy"]) {
+  for (const key of ["completion_intent", "roster_policy"]) {
     if (Object.prototype.hasOwnProperty.call(state, key)) profileFields[key] = state[key];
   }
   const profileValidation = validateProfileControlPlane(profileFields);
   if (!profileValidation.ok) issues.push(...profileValidation.issues.map((entry) => `state${entry.slice(1)}`));
+  if (Object.prototype.hasOwnProperty.call(state, "checkpoint_policy")) {
+    const policyIssues = validateCheckpointPolicyValue(state.checkpoint_policy, "$.checkpoint_policy");
+    if (!policyIssues.ok) issues.push(...policyIssues.issues.map((issue) => `${issue.path} ${issue.message}`));
+  }
+  if (Object.prototype.hasOwnProperty.call(state, "state_revision")
+    && (!Number.isInteger(state.state_revision) || (state.state_revision as number) < 0)) {
+    issues.push("$.state_revision must be an integer >= 0");
+  }
+  if (Object.prototype.hasOwnProperty.call(state, "checkpoint_policy_binding")) {
+    validatePolicyBinding(state.checkpoint_policy_binding, state, "$.checkpoint_policy_binding", issues);
+  }
+  if (Object.prototype.hasOwnProperty.call(state, "typed_checkpoint_decisions")) {
+    if (!Array.isArray(state.typed_checkpoint_decisions)) issues.push("$.typed_checkpoint_decisions must be an array");
+    else state.typed_checkpoint_decisions.forEach((entry, index) => {
+      // Persisted decisions from before the loop-scoped ledger keep their
+      // audit readability: loop_iteration may be absent at the state-field
+      // boundary. Authorizing with such a record still requires it — the
+      // ledger boundary enforces the scope.
+      const result = validateTypedCheckpointDecisionValue(entry, `$.typed_checkpoint_decisions[${index}]`, { allowLegacyLoopScope: true });
+      if (!result.ok) issues.push(...result.issues.map((issue) => `${issue.path} ${issue.message}`));
+    });
+  }
+  if (Object.prototype.hasOwnProperty.call(state, "dispatch_capability")) {
+    const capabilityIssues = validateDispatchCapabilityValue(state.dispatch_capability, "$.dispatch_capability");
+    if (!capabilityIssues.ok) issues.push(...capabilityIssues.issues.map((issue) => `${issue.path} ${issue.message}`));
+  }
   if (Object.prototype.hasOwnProperty.call(state, "roster_selection")) validateStateSelection(state.roster_selection, "$.roster_selection", issues);
   if (Object.prototype.hasOwnProperty.call(state, "roster_selections")) {
     if (!isStateRecord(state.roster_selections)) issues.push("$.roster_selections must be an object");
@@ -408,6 +425,18 @@ export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]
     state.classification = classification;
   }
 
+  // A policy binding naming another cursor is a prior-stage projection. Drop
+  // the mirror WITH the binding: retaining the old policy would let the
+  // current stage inherit it as if it were typed for this declaration.
+  // Current-stage projection below may then re-materialize only the profile
+  // declaration that actually belongs to the live cursor.
+  const staleBinding = isStateRecord(state.checkpoint_policy_binding)
+    && state.checkpoint_policy_binding.stage_id !== state.stage_cursor;
+  if (staleBinding) {
+    delete state.checkpoint_policy_binding;
+    delete state.checkpoint_policy;
+  }
+
   const initialIssues = validateTypedStateFields(state);
   if (initialIssues.length > 0) {
     rejectionIssues?.push(...initialIssues);
@@ -447,21 +476,31 @@ export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]
     return null;
   }
   state.completion_intent = completion_intent;
+  // The policy mirror describes the ACTIVE stage's declaration only: a
+  // stage without a checkpoint carries no checkpoint policy at all, so the
+  // profile-level projection must never pin a mirror onto it (transitions
+  // delete the mirror by key there — normalization must not resurrect it).
   const typedPolicy = state.checkpoint_policy;
   const checkpoint_policy = typedPolicy
-    ?? projection?.checkpoint_policy
-    ?? (stage?.checkpoint ? migrationPolicy(stage.checkpoint) : undefined);
+    ?? (stage?.checkpoint ? projection?.checkpoint_policy ?? migrationPolicy(stage.checkpoint) : undefined);
   if (checkpoint_policy) state.checkpoint_policy = checkpoint_policy;
+  else delete state.checkpoint_policy;
   if (stage?.roster_policy && state.roster_policy === undefined) state.roster_policy = stage.roster_policy;
 
   const capability = isStateRecord(state.dispatch_capability) ? state.dispatch_capability : null;
   const capabilityIdentity = capability?.work_identity;
-  if (state.work_identity === undefined && capabilityIdentity !== undefined) state.work_identity = capabilityIdentity;
+  if (state.work_identity === undefined && capabilityIdentity !== undefined && !validateActiveDispatchCapabilityValue(capability).ok) {
+    state.work_identity = capabilityIdentity;
+  }
   else if (state.work_identity !== undefined && capabilityIdentity !== undefined && stableStateHash(state.work_identity) !== stableStateHash(capabilityIdentity)) {
     rejectionIssues?.push("$.work_identity conflicts with dispatch_capability.work_identity");
     return null;
   }
-  if (state.work_identity === undefined && stageId && nonEmptyStateString(state.run_key ?? state.branch)) state.work_identity = legacyIdentity(state, workflow, stageId, capability);
+  // Legacy identity synthesis is migration-only: once a durable capability
+  // exists, a cleared top-level identity must stay cleared — the next
+  // dispatch re-binds it, and a synthesized stale-stage identity could
+  // silently bind new proofs to a prior stage.
+  if (state.work_identity === undefined && !capability && stageId && nonEmptyStateString(state.run_key ?? state.branch)) state.work_identity = legacyIdentity(state, workflow, stageId, capability);
   const identity = isStateRecord(state.work_identity) ? state.work_identity : null;
   for (const candidate of [state.pending, state.completion_envelope]) {
     if (!candidate || !isStateRecord(candidate) || !identity || !isStateRecord(candidate.identity)) continue;
@@ -485,7 +524,7 @@ export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]
     const receipt: MigrationReceipt = {
       id: `migration-${stableStateHash(`${String(state.run_key ?? state.branch)}|${workflow}`).slice(0, 24)}`,
       from_schema: 1,
-      to_schema: 2,
+      to_schema: 3,
       source_profile_hash: nonEmptyStateString(state.profile_hash) ? state.profile_hash : "unresolved-profile",
       target_profile_hash: targetProfileHash,
       source_policy_hash: null,
@@ -503,7 +542,7 @@ export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]
   }
   const provenance: ControlPlaneProvenance = {
     completion_intent: typedCompletion ? "state" : projection?.completion_intent ? "profile" : "migration",
-    checkpoint_policy: typedPolicy ? "state" : projection?.checkpoint_policy ? "profile" : stage?.checkpoint ? "migration" : "none",
+    checkpoint_policy: typedPolicy ? "state" : stage?.checkpoint ? (projection?.checkpoint_policy ? "profile" : "migration") : "none",
     roster_policy: stage?.roster_policy || state.roster_policy ? "profile" : "legacy",
     roster_selection: state.roster_selection ? "state" : "none",
     work_identity: state.work_identity ? (capabilityIdentity ? "typed" : "migration") : "none",
@@ -683,7 +722,12 @@ export function resolveState(cwd: string, currentBranch?: string): ResolvedState
   return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false };
 }
 
-export function writeState(
+/**
+ * Internal fixture/bootstrap writer. It is intentionally absent from the
+ * package index: production mutations must use updateStateAtomically so an
+ * existing run is always read and changed under the workspace lock.
+ */
+export function writeStateBootstrap(
   cwd: string,
   state: TeamState,
   opts: { featureSlug?: string; target?: ResolvedState } = {},
@@ -692,6 +736,27 @@ export function writeState(
   mkdirSync(wsDir, { recursive: true });
   const realWorkState = realpathSync(wsDir);
   if (!isWithin(realpathSync(cwd), realWorkState)) throw new Error("workflow state path escapes project root");
+  const prepared = prepareStateTarget(cwd, realWorkState, wsDir, state, opts);
+  const previous = readRawStateSnapshot(prepared.statePath);
+  if (previous.kind === "invalid") throw new Error(previous.error);
+  const previousRevision = previous.kind === "present" ? previous.revision : 0;
+  return commitState(cwd, prepared, state, previousRevision + 1);
+}
+
+interface PreparedStateTarget {
+  stateDir: string;
+  statePath: string;
+  artifactsDir: string;
+  featureSlug: string | null;
+}
+
+function prepareStateTarget(
+  cwd: string,
+  realWorkState: string,
+  wsDir: string,
+  state: Pick<TeamState, "branch">,
+  opts: { featureSlug?: string; target?: ResolvedState },
+): PreparedStateTarget {
   const target = opts.target;
   if (target?.invalid) throw new Error("cannot write through an invalid workflow state target");
   if (target && (!target.stateDir || !target.statePath || !target.artifactsDir)) throw new Error("workflow state target is incomplete");
@@ -724,6 +789,12 @@ export function writeState(
     statePath = join(wsDir, LEGACY_STATE);
     artifactsDir = join(wsDir, "artifacts");
   }
+  return validatePreparedTarget(realWorkState, wsDir, { stateDir, statePath, artifactsDir, featureSlug: featureSlug ?? null });
+}
+
+/** Run the containment and directory-creation checks for one prepared target. */
+function validatePreparedTarget(realWorkState: string, wsDir: string, prepared: PreparedStateTarget): PreparedStateTarget {
+  const { stateDir, statePath, artifactsDir, featureSlug } = prepared;
   if (featureSlug) {
     const featuresDir = join(wsDir, "features");
     mkdirSync(featuresDir, { recursive: true });
@@ -741,27 +812,706 @@ export function writeState(
   if (!isWithin(realStateDir, realpathSync(dirname(artifactsDir)))) throw new Error("workflow artifacts path escapes its state directory");
   mkdirSync(artifactsDir, { recursive: true });
   if (!isWithin(realStateDir, realpathSync(artifactsDir))) throw new Error("workflow artifacts path escapes its state directory");
+  return { stateDir, statePath, artifactsDir, featureSlug };
+}
 
+/** Reuse a resolved state's exact paths for a transactional commit. */
+function prepareExistingTarget(realWorkState: string, wsDir: string, target: ResolvedState): PreparedStateTarget {
+  if (!target.stateDir || !target.statePath || !target.artifactsDir) {
+    throw new Error("workflow state target is incomplete");
+  }
+  const prepared = validatePreparedTarget(realWorkState, wsDir, {
+    stateDir: target.stateDir,
+    statePath: target.statePath,
+    artifactsDir: target.artifactsDir,
+    featureSlug: target.isLegacy ? null : basename(target.stateDir),
+  });
+  if (existsSync(prepared.statePath) && !isWithin(realpathSync(prepared.stateDir), realpathSync(prepared.statePath))) {
+    throw new Error("workflow state target escapes its state directory");
+  }
+  return prepared;
+}
+
+interface PreparedFileWrite {
+  path: string;
+  tempPath: string;
+}
+
+function prepareFileWrite(path: string, content: string): PreparedFileWrite {
+  mkdirSync(dirname(path), { recursive: true });
+  const tempPath = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+  writeFileSync(tempPath, content, "utf8");
+  return { path, tempPath };
+}
+
+function cleanupPreparedWrite(write: PreparedFileWrite): void {
+  try {
+    unlinkSync(write.tempPath);
+  } catch {
+    // The temp was published or already cleaned up.
+  }
+}
+
+function readRegularFileNoFollow(path: string): string | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const before = fstatSync(fd);
+    if (!before.isFile()) throw new Error(`workflow sidecar is not a regular file: ${path}`);
+    const raw = readFileSync(fd, "utf8");
+    const after = fstatSync(fd);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+      throw new Error(`workflow sidecar changed while being read: ${path}`);
+    }
+    return raw;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function restoreSidecar(path: string, previous: string | null, published: string): void {
+  let current: string | null;
+  try {
+    current = readRegularFileNoFollow(path);
+  } catch {
+    return;
+  }
+  if (current !== published) return;
+  if (previous === null) {
+    unlinkSync(path);
+  } else {
+    atomicWrite(path, previous);
+  }
+}
+interface CommittedState {
+  statePath: string;
+  artifactsDir: string;
+  state: TeamState;
+}
+
+
+function commitState(
+  cwd: string,
+  prepared: PreparedStateTarget,
+  state: TeamState,
+  stateRevision: number,
+): CommittedState {
+  const { stateDir, statePath, artifactsDir, featureSlug } = prepared;
   const rejectionIssues: string[] = [];
   const normalized = normalizePersistedState(state, rejectionIssues);
   if (!normalized) throw new Error(`workflow state contains malformed or conflicting typed control-plane fields: ${rejectionIssues.join("; ") || "unrecognized shape"}`);
-  const stamped: TeamState = { ...normalized, updated_at: new Date().toISOString() };
-  // Embed the observability pointer (best-effort: a missing event log is
-  // fine for pre-observability features). The recorder file lives under
-  // `<featureDir>/observability/events.jsonl`; we read it synchronously
-  // here because `writeState` is itself sync and the file is bounded by
-  // session length.
+  const stamped: TeamState = { ...normalized, state_revision: stateRevision, updated_at: new Date().toISOString() };
   const obsPointer = featureSlug ? readObservabilityPointerSafe(cwd, featureSlug) : null;
   if (obsPointer) {
     stamped.observability = obsPointer;
   } else {
     delete stamped.observability;
   }
-  atomicWrite(statePath, JSON.stringify(stamped, null, 2) + "\n");
-  writeStateMd(stateDir, stamped);
-  if (featureSlug) atomicWrite(join(wsDir, ACTIVE_FEATURE), featureSlug + "\n");
 
-  return { statePath, artifactsDir };
+  const stateContent = JSON.stringify(stamped, null, 2) + "\n";
+  const stateMdPath = join(stateDir, STATE_MD);
+  const stateMdContent = renderStateMd(stamped);
+  const activePath = featureSlug ? join(resolve(cwd, WORK_STATE_DIR), ACTIVE_FEATURE) : null;
+  const activeContent = featureSlug ? featureSlug + "\n" : null;
+  // All potentially fallible content generation, old-byte snapshots and temp
+  // writes complete before publication. Sidecars publish first; state.json is
+  // the single authoritative commit point and is replaced last.
+  const previousStateMd = readRegularFileNoFollow(stateMdPath);
+  const previousActive = activePath ? readRegularFileNoFollow(activePath) : null;
+  const stateMdWrite = prepareFileWrite(stateMdPath, stateMdContent);
+  let activeWrite: PreparedFileWrite | null = null;
+  let stateWrite: PreparedFileWrite | null = null;
+  let stateMdPublished = false;
+  let activePublished = false;
+  try {
+    if (activePath && activeContent !== null) activeWrite = prepareFileWrite(activePath, activeContent);
+    stateWrite = prepareFileWrite(statePath, stateContent);
+    renameSync(stateMdWrite.tempPath, stateMdPath);
+    stateMdPublished = true;
+    if (activeWrite && activePath) {
+      renameSync(activeWrite.tempPath, activePath);
+      activePublished = true;
+    }
+    // Authoritative commit point. Nothing after this rename may request or
+    // signal rollback of state/artifact effects.
+    renameSync(stateWrite.tempPath, statePath);
+  } catch (error) {
+    if (activePublished && activePath && activeContent !== null) restoreSidecar(activePath, previousActive, activeContent);
+    if (stateMdPublished) restoreSidecar(stateMdPath, previousStateMd, stateMdContent);
+    throw error;
+  } finally {
+    cleanupPreparedWrite(stateMdWrite);
+    if (activeWrite) cleanupPreparedWrite(activeWrite);
+    if (stateWrite) cleanupPreparedWrite(stateWrite);
+  }
+  return { statePath, artifactsDir, state: stamped };
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process state transaction: workspace lock + revision/raw-hash CAS.
+//
+// `updateStateAtomically` is THE seam for every state change that must not
+// lose a concurrent writer (checkpoint answers, decisions, cursor moves).
+// It serializes on `.work-state/.state.lock`, re-reads the latest state
+// under the lock (never a pre-await snapshot), runs the mutation against
+// that snapshot, and commits only when the file still carries the observed
+// revision and raw hash — otherwise it fails `state_conflict` without
+// writing. There is no event-loop assumption: a lock holder in another
+// process is waited for (bounded), a dead holder is reclaimed, and a
+// malformed or live-but-unverifiable holder is never stolen.
+// ---------------------------------------------------------------------------
+
+const STATE_LOCK_FILE = ".state.lock";
+const STATE_LOCK_RETRY_MS = 25;
+const STATE_LOCK_DEFAULT_TIMEOUT_MS = 10_000;
+const STATE_LOCK_RECLAIM_PREFIX = `${STATE_LOCK_FILE}.reclaim.`;
+
+export type StateTxErrorCode =
+  | "state_invalid"
+  | "state_missing"
+  | "state_conflict"
+  | "state_lock_unavailable";
+
+export interface StateSnapshot {
+  /** Latest normalized state, or null when the run has not been created yet. */
+  state: TeamState | null;
+  target: ResolvedState;
+  /** Canonical CAS revision (legacy inputs read as 0). */
+  revision: number;
+  /** SHA-256 over the raw persisted bytes backing the snapshot. */
+  raw_hash: string;
+}
+
+/**
+ * A mutation may fail with its own domain code (e.g. a typed checkpoint
+ * code); the transaction itself only ever surfaces the four
+ * `StateTxErrorCode` values. The domain code always rides in `code` and its
+ * explanation in `error`.
+ */
+export type StateMutationCode = StateTxErrorCode | (string & {});
+
+export type StateMutation<T> =
+  | { op: "commit"; state: TeamState; value?: T }
+  | { op: "discard"; value?: T }
+  | { op: "fail"; code: StateMutationCode; error: string };
+
+export type StateUpdateResult<T> =
+  | { ok: true; state: TeamState | null; target: ResolvedState; revision: number; committed: boolean; value?: T }
+  // Transaction-level failures always carry one of the four StateTxErrorCode
+  // values; a domain `op: "fail"` passes its own code through verbatim.
+  | { ok: false; code: StateMutationCode; error: string };
+
+interface StateLockOwner {
+  pid: number;
+  token: string;
+  acquired_at: string;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error) {
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+    return true;
+  }
+}
+
+function sleepSync(ms: number): void {
+  // Prefer a parked wait; fall back to a bounded spin so worker-thread
+  // environments (where Atomics.wait throws) still block safely.
+  try {
+    const signal = new Int32Array(new SharedArrayBuffer(4));
+    const result = Atomics.wait(signal, 0, 0, ms);
+    if (result === "timed-out" || result === "ok") return;
+  } catch {
+    // fall through to spinning
+  }
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    // busy-wait
+  }
+}
+
+type LockCreateOutcome = { created: true } | { created: false; reason: "exists" } | { created: false; reason: "error"; error: string };
+
+/**
+ * Publish the lock owner ATOMICALLY: the complete owner JSON is written to a
+ * private temp file first and then hard-linked into place. `linkSync` is an
+ * exclusive-create, so "the lock file exists" and "its owner metadata is
+ * complete" become the same instant — a concurrent inspector can never
+ * observe the exclusive-create-to-metadata window as a partial or empty
+ * owner (which previously surfaced as a spurious immediate
+ * `state_lock_unavailable` for a perfectly live lock).
+ */
+function tryCreateLock(lockPath: string, owner: StateLockOwner): LockCreateOutcome {
+  const tmp = `${lockPath}.${randomUUID()}.owner-tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(owner));
+    try {
+      linkSync(tmp, lockPath);
+      return { created: true };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return { created: false, reason: "exists" };
+      return { created: false, reason: "error", error: `state lock unavailable: ${(error as Error).message}` };
+    }
+  } catch (error) {
+    return { created: false, reason: "error", error: `state lock unavailable: ${(error as Error).message}` };
+  } finally {
+    // Drop our temp directory entry; the link at lockPath (when created)
+    // keeps the inode alive with the full owner content.
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // best-effort cleanup
+    }
+  }
+}
+
+interface LockInspection {
+  /** inode of the lock file the owner content was read from. */
+  ino: number;
+  /** Parsed owner, or null when the content is unreadable/malformed. */
+  owner: StateLockOwner | null;
+}
+
+/**
+ * Inspect the current lock holder through ONE file descriptor, so the inode
+ * and the owner metadata always describe the same generation even if a
+ * concurrent reclaimer replaces the file between the open and the read.
+ */
+function inspectLock(lockPath: string): LockInspection | null {
+  let fd: number;
+  try {
+    fd = openSync(lockPath, "r");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  try {
+    const ino = fstatSync(fd).ino;
+    let owner: StateLockOwner | null = null;
+    try {
+      const parsed = JSON.parse(readFileSync(fd, "utf8")) as StateLockOwner;
+      if (parsed && Number.isInteger(parsed.pid) && typeof parsed.token === "string") owner = parsed;
+    } catch {
+      owner = null;
+    }
+    return { ino, owner };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Reclaim a verified-dead lock WITHOUT ever unlinking the live lock path.
+ *
+ * The current file is RENAMED to a private quarantine name — an atomic
+ * move — and only the quarantined inode is ever unlinked, and only when it
+ * is still the exact inode whose dead owner this waiter inspected. A waiter
+ * that observed an older stale generation can therefore never delete a live
+ * lock created after its snapshot:
+ *   - the rename moves whatever is at the path NOW;
+ *   - an inode mismatch means a newer (live) lock was displaced — it is
+ *     restored with a hard link back to the path (exclusive-create checked)
+ *     and this waiter simply retries;
+ *   - an inode match means the dead lock itself was quarantined, and only
+ *     its private quarantine name is removed.
+ */
+function reclaimStaleLock(lockPath: string, wsDir: string, observed: LockInspection): string | null {
+  const token = randomUUID();
+  const guardPath = join(wsDir, `${STATE_LOCK_RECLAIM_PREFIX}${token}`);
+  const guard = tryCreateLock(guardPath, {
+    pid: process.pid,
+    token,
+    acquired_at: new Date().toISOString(),
+  });
+  if (!guard.created) {
+    return guard.reason === "error" ? guard.error : "state lock reclaim guard collision";
+  }
+  try {
+    const guards = inspectReclaimGuards(wsDir, token);
+    if (guards.error) return guards.error;
+    if (guards.blocked) return null;
+
+    // The guard closes the inspect-to-rename gap. Every conforming creator
+    // checks for a live guard before publishing a generation; a creator that
+    // passed that check before our guard can only (a) fail while the stale
+    // generation is still present, or (b) publish after this rename. Re-read
+    // through one fd after publishing the guard so a newer live generation
+    // observed before the rename is never displaced.
+    const current = inspectLock(lockPath);
+    if (
+      current === null
+      || current.ino !== observed.ino
+      || !current.owner
+      || !observed.owner
+      || current.owner.token !== observed.owner.token
+      || current.owner.pid !== observed.owner.pid
+      || pidAlive(current.owner.pid)
+    ) {
+      return null;
+    }
+
+    const quarantine = `${lockPath}.${randomUUID()}.stale`;
+    try {
+      renameSync(lockPath, quarantine);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      return `state lock unavailable: ${(error as Error).message}`;
+    }
+    try {
+      if (statSync(quarantine).ino !== observed.ino) {
+        // Non-conforming external writers are outside the advisory protocol;
+        // restore their generation if one appeared despite the guarded
+        // re-read. Protocol participants cannot reach this branch.
+        try {
+          linkSync(quarantine, lockPath);
+        } catch {
+          // A still newer generation already occupies the authoritative path.
+        }
+        return "state lock generation changed during guarded reclaim";
+      }
+    } finally {
+      try {
+        unlinkSync(quarantine);
+      } catch {
+        // The quarantine name is never authoritative.
+      }
+    }
+    return null;
+  } finally {
+    try {
+      unlinkSync(guardPath);
+    } catch {
+      // The unique guard path is best-effort cleanup after ownership ends.
+    }
+  }
+}
+
+/**
+ * Inspect immutable, uniquely-named reclaim guards. Dead guards are safe to
+ * remove because their UUID path is never reused; unlike the authoritative
+ * lock path, cleanup can therefore never unlink a newer generation.
+ */
+function inspectReclaimGuards(wsDir: string, ownToken?: string): { blocked: boolean; error?: string } {
+  let entries: string[];
+  try {
+    entries = readdirSync(wsDir).filter((entry) => entry.startsWith(STATE_LOCK_RECLAIM_PREFIX));
+  } catch (error) {
+    return { blocked: false, error: `state lock unavailable: ${(error as Error).message}` };
+  }
+  for (const entry of entries) {
+    const guardPath = join(wsDir, entry);
+    let inspection: LockInspection | null;
+    try {
+      inspection = inspectLock(guardPath);
+    } catch (error) {
+      return { blocked: false, error: `state lock unavailable: ${(error as Error).message}` };
+    }
+    if (inspection === null) continue;
+    const owner = inspection.owner;
+    if (!owner) return { blocked: false, error: "state lock reclaim guard has an unreadable owner" };
+    if (owner.token === ownToken) continue;
+    if (pidAlive(owner.pid)) return { blocked: true };
+    try {
+      unlinkSync(guardPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return { blocked: false, error: `state lock unavailable: ${(error as Error).message}` };
+      }
+    }
+  }
+  return { blocked: false };
+}
+
+function acquireStateLock(wsDir: string, timeoutMs: number): { token: string } | { error: string } {
+  const lockPath = join(wsDir, STATE_LOCK_FILE);
+  const startedAt = Date.now();
+  for (;;) {
+    mkdirSync(wsDir, { recursive: true });
+    const guards = inspectReclaimGuards(wsDir);
+    if (guards.error) return { error: guards.error };
+    if (!guards.blocked) {
+      const token = randomUUID();
+      const created = tryCreateLock(lockPath, { pid: process.pid, token, acquired_at: new Date().toISOString() });
+      if (created.created) return { token };
+      if (created.reason === "error") return { error: created.error };
+      let inspection: LockInspection | null = null;
+      try {
+        inspection = inspectLock(lockPath);
+      } catch (error) {
+        return { error: `state lock unavailable: ${(error as Error).message}` };
+      }
+      if (inspection === null) continue;
+      if (inspection.owner && pidAlive(inspection.owner.pid)) {
+        // Live owner in another process: never stolen, only waited for.
+      } else if (inspection.owner) {
+        const reclaimError = reclaimStaleLock(lockPath, wsDir, inspection);
+        if (reclaimError) return { error: reclaimError };
+      } else {
+        // With atomic owner publication a partial owner cannot occur, so an
+        // unreadable owner is foreign corruption: it is not verifiably dead
+        // and is never stolen. Waiting cannot help because there is no owner
+        // to liveness-check. Fail closed immediately.
+        return { error: "state lock is held by an unreadable owner; refusing to steal it" };
+      }
+    }
+    if (Date.now() >= startedAt + timeoutMs) {
+      return { error: "state lock wait timeout exceeded" };
+    }
+    sleepSync(STATE_LOCK_RETRY_MS);
+  }
+}
+
+function releaseStateLock(wsDir: string, token: string): void {
+  const lockPath = join(wsDir, STATE_LOCK_FILE);
+  try {
+    const owner = JSON.parse(readFileSync(lockPath, "utf8")) as StateLockOwner;
+    if (owner.token === token) unlinkSync(lockPath);
+  } catch {
+    // The lock vanished or is no longer ours; nothing to release.
+  }
+}
+
+interface RawStateSnapshot {
+  kind: "present";
+  state: TeamState;
+  revision: number;
+  raw_hash: string;
+}
+
+type RawStateRead =
+  | RawStateSnapshot
+  | { kind: "absent" }
+  | { kind: "invalid"; error: string };
+
+export interface StateTransactionTestHooks {
+  afterTargetResolution?: (paths: { statePath: string; stateDir: string; artifactsDir: string }) => void;
+  beforeCas?: (paths: { sourcePath: string; destinationPath: string }) => void;
+  afterJournalFinalize?: (outcome: { committed: boolean; lockPath: string }) => void;
+}
+
+let stateTransactionTestHooks: StateTransactionTestHooks | null = null;
+
+/** Internal deterministic race/fault seam; not exported from the package index. */
+export function setStateTransactionTestHooks(hooks: StateTransactionTestHooks | null): void {
+  stateTransactionTestHooks = hooks;
+}
+
+
+function hashRawState(raw: string): string {
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+/**
+ * Read persisted bytes exactly once and derive normalization, revision and
+ * hash from that same byte string. ENOENT is the only absent state; malformed
+ * or otherwise unreadable files fail closed instead of masquerading as absence.
+ */
+function readRawStateSnapshot(statePath: string | null | undefined): RawStateRead {
+  if (!statePath) return { kind: "absent" };
+  let raw: string;
+  try {
+    raw = readFileSync(statePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+    return { kind: "invalid", error: `workflow state is unreadable: ${(error as Error).message}` };
+  }
+  try {
+    const parsed = JSON.parse(raw) as { state_revision?: unknown };
+    const issues: string[] = [];
+    const state = normalizePersistedState(parsed, issues);
+    if (!state) {
+      return { kind: "invalid", error: `workflow state is malformed: ${issues.join("; ") || "unrecognized shape"}` };
+    }
+    const revision = Number.isInteger(parsed?.state_revision) && (parsed.state_revision as number) >= 0
+      ? parsed.state_revision as number
+      : 0;
+    return { kind: "present", state, revision, raw_hash: hashRawState(raw) };
+  } catch (error) {
+    return { kind: "invalid", error: `workflow state is malformed: ${(error as Error).message}` };
+  }
+}
+
+interface TransactionTargetResolution {
+  prepared: PreparedStateTarget;
+  target: ResolvedState;
+}
+
+function transactionTarget(
+  cwd: string,
+  realWorkState: string,
+  wsDir: string,
+  resolved: ResolvedState,
+  branch: string,
+  featureSlug?: string,
+): TransactionTargetResolution {
+  if (resolved.invalid && !resolved.stateDir && !resolved.statePath && !resolved.artifactsDir) {
+    throw new Error("workflow state is invalid or unsafe");
+  }
+  if (resolved.stateDir || resolved.statePath || resolved.artifactsDir) {
+    if (!resolved.stateDir || !resolved.artifactsDir) throw new Error("workflow state target is incomplete");
+    const statePath = resolved.statePath
+      ?? (resolved.isLegacy ? join(wsDir, LEGACY_STATE) : join(resolved.stateDir, "state.json"));
+    const target: ResolvedState = { ...resolved, state: null, statePath, invalid: undefined };
+    return { prepared: prepareExistingTarget(realWorkState, wsDir, target), target };
+  }
+  const prepared = prepareStateTarget(cwd, realWorkState, wsDir, { branch }, { featureSlug });
+  return {
+    prepared,
+    target: {
+      state: null,
+      statePath: prepared.statePath,
+      stateDir: prepared.stateDir,
+      artifactsDir: prepared.artifactsDir,
+      isLegacy: prepared.featureSlug === null,
+      isStale: false,
+    },
+  };
+}
+
+function casConflict(observed: RawStateRead, current: RawStateRead): string | null {
+  if (current.kind === "invalid") return current.error;
+  if (observed.kind === "invalid") return observed.error;
+  if (observed.kind !== current.kind) {
+    return observed.kind === "present"
+      ? "workflow state was deleted during the transaction"
+      : "workflow state was created during the transaction";
+  }
+  if (observed.kind === "present" && current.kind === "present"
+    && (observed.revision !== current.revision || observed.raw_hash !== current.raw_hash)) {
+    return `workflow state moved during the transaction (snapshot revision ${observed.revision}, found ${current.revision})`;
+  }
+  return null;
+}
+
+/**
+ * Run one state mutation as a cross-process transaction.
+ *
+ * The mutation ALWAYS runs against the latest persisted state — never a
+ * snapshot taken before an await — and its commit is guarded by a
+ * revision + raw-hash CAS plus the workspace lock, so a concurrent writer
+ * can neither be clobbered nor lost. Unrelated concurrent fields survive:
+ * the mutation spreads the fresh snapshot, not its own stale copy.
+ */
+export function updateStateAtomically<T>(
+  cwd: string,
+  mutate: (snapshot: StateSnapshot) => StateMutation<T>,
+  opts: { lockTimeoutMs?: number; target?: ResolvedState; branch?: string; featureSlug?: string } = {},
+): StateUpdateResult<T> {
+  const wsDir = resolve(cwd, WORK_STATE_DIR);
+  mkdirSync(wsDir, { recursive: true });
+  const realWorkState = realpathSync(wsDir);
+  if (!isWithin(realpathSync(cwd), realWorkState)) {
+    return { ok: false, code: "state_invalid", error: "workflow state path escapes project root" };
+  }
+  const lock = acquireStateLock(wsDir, opts.lockTimeoutMs ?? STATE_LOCK_DEFAULT_TIMEOUT_MS);
+  if ("error" in lock) return { ok: false, code: "state_lock_unavailable", error: lock.error };
+  beginArtifactJournal();
+  let journalFinalized = false;
+  const finalizeJournal = (committed: boolean): void => {
+    if (journalFinalized) return;
+    const journal = endArtifactJournal();
+    journalFinalized = true;
+    if (committed) commitArtifactJournal(journal);
+    else rollbackArtifactJournal(journal);
+    stateTransactionTestHooks?.afterJournalFinalize?.({
+      committed,
+      lockPath: join(wsDir, STATE_LOCK_FILE),
+    });
+  };
+  try {
+    const branch = opts.branch ?? resolveActiveBranch(cwd);
+    const resolution = opts.target ?? resolveState(cwd, branch);
+    let initial: TransactionTargetResolution;
+    try {
+      initial = transactionTarget(cwd, realWorkState, wsDir, resolution, branch, opts.featureSlug);
+    } catch (error) {
+      return { ok: false, code: "state_invalid", error: (error as Error).message };
+    }
+    stateTransactionTestHooks?.afterTargetResolution?.({
+      statePath: initial.prepared.statePath,
+      stateDir: initial.prepared.stateDir,
+      artifactsDir: initial.prepared.artifactsDir,
+    });
+    const raw = readRawStateSnapshot(initial.prepared.statePath);
+    if (raw.kind === "invalid") return { ok: false, code: "state_invalid", error: raw.error };
+    const state = raw.kind === "present" ? raw.state : null;
+    const revision = raw.kind === "present" ? raw.revision : 0;
+    const rawHash = raw.kind === "present" ? raw.raw_hash : "";
+    // opts.target.state and resolveState's parsed object are deliberately
+    // ignored: the transaction state, revision and hash all come from `raw`.
+    const target: ResolvedState = {
+      ...initial.target,
+      state,
+      isStale: state !== null ? state.branch !== branch : false,
+    };
+    const snapshot: StateSnapshot = { state, target, revision, raw_hash: rawHash };
+    const mutation = mutate(snapshot);
+    if (mutation.op === "fail") return { ok: false, code: mutation.code, error: mutation.error };
+    if (mutation.op === "discard") {
+      return { ok: true, state, target, revision, committed: false, value: mutation.value };
+    }
+
+    // Resolve the final destination before either CAS. A stale active feature
+    // retargets by the mutation's branch, but an existing future destination
+    // is always a conflict — it is never adopted or overwritten.
+    const staleForBranch = state !== null
+      && target.isStale
+      && typeof mutation.state.branch === "string"
+      && mutation.state.branch !== state.branch;
+    let prepared: PreparedStateTarget;
+    try {
+      prepared = staleForBranch
+        ? prepareStateTarget(cwd, realWorkState, wsDir, mutation.state, { featureSlug: opts.featureSlug })
+        : initial.prepared;
+    } catch (error) {
+      return { ok: false, code: "state_invalid", error: (error as Error).message };
+    }
+
+    stateTransactionTestHooks?.beforeCas?.({
+      sourcePath: initial.prepared.statePath,
+      destinationPath: prepared.statePath,
+    });
+    const sourceCurrent = readRawStateSnapshot(initial.prepared.statePath);
+    const sourceConflict = casConflict(raw, sourceCurrent);
+    if (sourceConflict) return { ok: false, code: "state_conflict", error: sourceConflict };
+    if (prepared.statePath !== initial.prepared.statePath) {
+      const destination = readRawStateSnapshot(prepared.statePath);
+      if (destination.kind === "invalid") return { ok: false, code: "state_conflict", error: destination.error };
+      if (destination.kind === "present") {
+        return { ok: false, code: "state_conflict", error: "workflow state was created at the future destination during the transaction" };
+      }
+    }
+
+    let committed: CommittedState;
+    try {
+      committed = commitState(cwd, prepared, mutation.state, revision + 1);
+    } catch (error) {
+      return { ok: false, code: "state_invalid", error: `workflow state commit failed: ${(error as Error).message}` };
+    }
+    // state.json is authoritative now. Publish buffered observability while
+    // still holding the same lock; commit hooks can never request rollback.
+    finalizeJournal(true);
+    const committedTarget: ResolvedState = {
+      state: committed.state,
+      statePath: prepared.statePath,
+      stateDir: prepared.stateDir,
+      artifactsDir: prepared.artifactsDir,
+      isLegacy: prepared.featureSlug === null,
+      isStale: false,
+    };
+    return { ok: true, state: committed.state, target: committedTarget, revision: revision + 1, committed: true, value: mutation.value };
+  } finally {
+    finalizeJournal(false);
+    releaseStateLock(wsDir, lock.token);
+  }
 }
 
 function atomicWrite(path: string, content: string): void {
@@ -787,7 +1537,7 @@ function readObservabilityPointerSafe(cwd: string, featureSlug: string) {
   }
 }
 
-export function writeStateMd(stateDir: string, state: TeamState): void {
+function renderStateMd(state: TeamState): string {
   const lines: string[] = [];
   lines.push("# TEAM STATE");
   lines.push("");
@@ -892,7 +1642,11 @@ export function writeStateMd(stateDir: string, state: TeamState): void {
     lines.push("");
   }
 
-  atomicWrite(join(stateDir, STATE_MD), lines.join("\n"));
+  return lines.join("\n");
+}
+
+export function writeStateMd(stateDir: string, state: TeamState): void {
+  atomicWrite(join(stateDir, STATE_MD), renderStateMd(state));
 }
 
 export function setPause(state: TeamState, kind: PauseKind, reason = ""): TeamState {
@@ -909,11 +1663,13 @@ export function setStageStatus(
   const stages = state.stages.map((s) => (s.id === stageId ? { ...s, status } : s));
   const cursor = status === "in_progress" ? stageId : state.stage_cursor;
   if (cwd) {
-    try {
-      recordStageTransition(cwd, { stageId, stageStatus: status });
-    } catch {
-      // best-effort telemetry — never blocks the state transition
-    }
+    publishAfterStateCommit(() => {
+      try {
+        recordStageTransition(cwd, { stageId, stageStatus: status });
+      } catch {
+        // best-effort telemetry — never blocks the state transition
+      }
+    });
   }
   return { ...state, stages, stage_cursor: cursor, updated_at: new Date().toISOString() };
 }

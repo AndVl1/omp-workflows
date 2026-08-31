@@ -39,7 +39,16 @@ export interface PredicateAst {
 }
 
 export type PredicateParseResult = { ok: true; ast: PredicateAst } | { ok: false; error: string };
-export type PredicateResult = { ok: true; value: boolean } | { ok: false; error: string };
+/**
+ * A satisfied expression yields `{ ok: true, value: true }`. An unsatisfied
+ * one yields `{ ok: true, value: false }` plus `detail` when a named gate
+ * failed: that gate's concrete reason, so callers can reject with the real
+ * cause instead of a generic "not satisfied". Absent for flag/compare terms
+ * and for negated named terms (negation failing means the gate HOLDS).
+ */
+export type PredicateResult =
+  | { ok: true; value: boolean; detail?: string }
+  | { ok: false; error: string };
 
 const FLAG_KEYS: ReadonlySet<keyof ScopeFlags> = new Set(["has_security", "has_infra", "has_ui", "has_runtime"]);
 
@@ -138,9 +147,12 @@ export function evaluatePredicate(expression: string, ctx: PredicateContext): Pr
  * satisfied term passes; evaluation errors surface only when no term is
  * satisfied, so a satisfied fallback term (e.g. `|| !scope.has_runtime`)
  * keeps the expression passing when the artifact it references is missing.
+ * When the whole expression is unsatisfied, `detail` carries the first
+ * named gate's concrete failure reason.
  */
 export function evaluateExpression(ast: PredicateAst, ctx: PredicateContext): PredicateResult {
   let firstError: string | null = null;
+  let firstDetail: string | undefined;
   for (const term of ast.terms) {
     const evaluated = evaluateTerm(term, ctx, ast.source);
     if (!evaluated.ok) {
@@ -148,9 +160,10 @@ export function evaluateExpression(ast: PredicateAst, ctx: PredicateContext): Pr
       continue;
     }
     if (evaluated.value) return { ok: true, value: true };
+    if (firstDetail === undefined && evaluated.detail !== undefined) firstDetail = evaluated.detail;
   }
   if (firstError !== null) return { ok: false, error: firstError };
-  return { ok: true, value: false };
+  return firstDetail !== undefined ? { ok: true, value: false, detail: firstDetail } : { ok: true, value: false };
 }
 
 function evaluateTerm(term: PredicateTerm, ctx: PredicateContext, source: string): PredicateResult {
@@ -168,8 +181,13 @@ function evaluateTerm(term: PredicateTerm, ctx: PredicateContext, source: string
       if (result === undefined) {
         return { ok: false, error: `unsupported predicate '${term.name}' in '${source}'` };
       }
-      value = result === null;
-      break;
+      const holds = result === null;
+      // A failing named gate carries its concrete reason for the caller.
+      // Negation inverts satisfaction: a failing gate satisfies `!gate`,
+      // and a holding gate fails it — with no reason to surface, because
+      // the gate itself holds.
+      if (!holds && !term.negated) return { ok: true, value: false, detail: result };
+      return { ok: true, value: term.negated ? !holds : holds };
     }
     case "compare": {
       const resolved = resolveCompareOperand(term, ctx);

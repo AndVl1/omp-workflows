@@ -28,7 +28,7 @@ import { resolveConfig } from "../src/engine/config.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildAgentMapping, writeAgentMapping, type AgentMappingState } from "../src/engine/agent-mapping.js";
 import { buildDispatchMarker, parseDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
-import { writeState, resolveState } from "../src/engine/state.js";
+import { writeStateBootstrap, resolveState } from "../src/engine/state.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TeamState } from "../src/engine/types.js";
 
@@ -51,7 +51,7 @@ function trustedCheckpoint(root: string, stageId: string, checkpointId: string, 
     checkpoint_id: checkpointId,
     decision,
   });
-  writeState(root, trusted.state, { target: resolved });
+  writeStateBootstrap(root, trusted.state, { target: resolved });
 
   return trusted;
 }
@@ -188,7 +188,7 @@ test("br-eu6: full-feature exploration issues a valid consilium capability; mark
     const persistedProfileHash = profileHash(profile);
     const exploration = profile.stages.find((stage) => stage.id === "exploration");
     assert.ok(exploration);
-    writeState(root, {
+    writeStateBootstrap(root, {
       schema: 1,
       branch: "feat/repeat",
       run_key: "feat/repeat",
@@ -254,7 +254,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       run_key: "feat/repeat", branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
       stage_cursor: "discovery", kind: "none", expected_roster: [],
     });
-    writeState(root, {
+    writeStateBootstrap(root, {
       schema: 1,
       branch: "feat/repeat",
       run_key: "feat/repeat",
@@ -292,7 +292,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/repeat", branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "discovery", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      stage_cursor: "discovery", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
       checkpoint: "confirm_understanding",
       checkpoint_id: "confirm_understanding",
       checkpoint_kind: discoveryRule.kind,
@@ -308,7 +308,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/repeat", branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "discovery", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      stage_cursor: "discovery", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
       evidence: "discovery completed",
     });
     assert.equal(advanced.ok, true);
@@ -318,15 +318,14 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
     // the cursor parks on a pending stage with no capability and no frozen
     // selection until the explicit workflow_begin freezes the roster.
     assert.equal(advanced.handoff, undefined, "advance into a roster-policy stage issues no dispatch handoff");
-    assert.equal(advanced.state.dispatch_capability?.status, "complete", "the completed stage capability cannot authorize further dispatch");
-    assert.equal(advanced.state.dispatch_capability?.issued_for.stage_cursor, "discovery");
+    assert.equal(advanced.state.dispatch_capability, undefined, "the deferred-roster advance deletes the completed prior capability: strict state<->capability coherence forbids carrying a stale stage/epoch binding");
     assert.equal(advanced.state.stages.find((s) => s.id === "exploration")?.status, "pending", "the roster-policy stage stays semantically unselected");
     assert.equal(advanced.state.roster_selection, undefined, "no default roster is frozen before begin");
     const staleDispatch = authorizeDispatch(root, {
       token: issued.dispatch_token,
       capability_id: issued.capability_id,
       run_key: "feat/repeat", branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "exploration", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      stage_cursor: "exploration", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
       role: "analyst", agent: "analyst",
     });
     assert.equal(staleDispatch.ok, false, "dispatch before workflow_begin fails closed");
@@ -349,6 +348,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       profile_hash: begun.handoff.profile_hash,
       stage_cursor: begun.handoff.stage_cursor,
       cursor_epoch: begun.handoff.cursor_epoch,
+      loop_iteration: begun.handoff.loop_iteration,
     };
     const a1 = authorizeDispatch(root, { ...auth, role: "analyst", agent: "analyst" });
     const tr = authorizeDispatch(root, { ...auth, role: "tech-researcher", agent: "tech-researcher" });
@@ -395,7 +395,7 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
       run_key: "feat/single", branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }],
     });
-    writeState(root, {
+    writeStateBootstrap(root, {
       schema: 1,
       branch: "feat/single",
       run_key: "feat/single",
@@ -425,7 +425,7 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
       token: issued.dispatch_token,
       capability_id: issued.capability_id,
       run_key: "feat/single", branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
-      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
       role: "${scope.dev_agent}", agent: "developer-kotlin",
     };
     const authorized = authorizeDispatch(root, auth);
@@ -446,7 +446,7 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/single", branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
-      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
       checkpoint: "approve_implementation",
       checkpoint_id: "approve_implementation",
       checkpoint_kind: implementationRule.kind,
@@ -517,7 +517,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
     };
-    writeState(root, initialState, { featureSlug: "reopen" });
+    writeStateBootstrap(root, initialState, { featureSlug: "reopen" });
     publishMapping(root);
     const artifactsDir = join(root, ".work-state", "features", "reopen", "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
@@ -546,6 +546,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       profile_hash: persistedProfileHash,
       stage_cursor: "exploration",
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      loop_iteration: issued.state.issued_for!.loop_iteration,
     };
     const oldRecords: Array<{ role: string; agent: string; id: string }> = [];
     for (const item of oldArtifacts) {
@@ -578,7 +579,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     oldExplorationSlots.outside = { path: outsidePath, hash: "outside" };
     const downstreamPath = join(artifactsDir, "architecture-architect-2.json");
     writeFileSync(downstreamPath, "downstream");
-    writeState(root, staleState, { featureSlug: "reopen" });
+    writeStateBootstrap(root, staleState, { featureSlug: "reopen" });
 
     const begun = beginCapability(root, THREE_SLOT_SELECTION);
     assert.equal(begun.ok, true);
@@ -614,6 +615,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       profile_hash: fresh.profile_hash,
       stage_cursor: fresh.stage_cursor,
       cursor_epoch: fresh.cursor_epoch,
+      loop_iteration: fresh.loop_iteration,
     };
     writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "reopen stale bindings", branch }));
     const first = oldArtifacts[0]!;
@@ -703,7 +705,7 @@ test("wave-004: advance into architecture stays semantically unselected; workflo
       run_key: "feat/arch", branch: "feat/arch", workflow: "full-feature", profile_hash: persistedProfileHash,
       stage_cursor: "clarify", kind: "none", expected_roster: [],
     });
-    writeState(root, {
+    writeStateBootstrap(root, {
       schema: 1,
       branch: "feat/arch",
       run_key: "feat/arch",
@@ -740,7 +742,7 @@ test("wave-004: advance into architecture stays semantically unselected; workflo
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/arch", branch: "feat/arch", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
       checkpoint: "user_answers",
       checkpoint_id: "user_answers",
       checkpoint_kind: rule.kind,
@@ -756,14 +758,14 @@ test("wave-004: advance into architecture stays semantically unselected; workflo
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/arch", branch: "feat/arch", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
       evidence: "clarify completed",
     });
     assert.equal(advanced.ok, true, advanced.ok ? "clarify-to-architecture advance ok" : advanced.error);
     if (!advanced.ok) return;
     assert.equal(advanced.state.stage_cursor, "architecture");
     assert.equal(advanced.handoff, undefined, "no handoff and no default roster before the explicit begin");
-    assert.equal(advanced.state.dispatch_capability?.status, "complete", "only the completed stage capability remains");
+    assert.equal(advanced.state.dispatch_capability, undefined, "the deferred-roster advance leaves no capability behind: begin issues the deferred stage's own capability");
     assert.equal(advanced.state.stages.find((s) => s.id === "architecture")?.status, "pending", "architecture is not armed by advance");
     assert.equal(advanced.state.roster_selection, undefined, "no default architect roster is frozen before begin");
 
@@ -785,6 +787,7 @@ test("wave-004: advance into architecture stays semantically unselected; workflo
       profile_hash: begun.handoff.profile_hash,
       stage_cursor: begun.handoff.stage_cursor,
       cursor_epoch: begun.handoff.cursor_epoch,
+      loop_iteration: begun.handoff.loop_iteration,
     };
     const slot1 = authorizeDispatch(root, { ...auth, role: "architect#1", agent: "architect" });
     const slot2 = authorizeDispatch(root, { ...auth, role: "architect#2", agent: "architect" });
@@ -801,11 +804,7 @@ function writeArchitectureFixture(root: string, branch: string, slug: string): v
   const profile = loadProfile("full-feature");
   assert.ok(profile);
   const persistedProfileHash = profileHash(profile);
-  const issued = createCapability({
-    run_key: branch, branch, workflow: "full-feature", profile_hash: persistedProfileHash,
-    stage_cursor: "clarify", kind: "none", expected_roster: [],
-  });
-  writeState(root, {
+  writeStateBootstrap(root, {
     schema: 1,
     branch,
     run_key: branch,
@@ -820,8 +819,6 @@ function writeArchitectureFixture(root: string, branch: string, slug: string): v
     policy: { strict_orchestrator: true },
     profile_hash: persistedProfileHash,
     scope: NO_SCOPE,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
   }, { featureSlug: slug });
 }
@@ -879,7 +876,7 @@ test("wave-004: non-roster advance arming consumes the trusted mapping override"
       run_key: "feat/trusted-advance", branch: "feat/trusted-advance", workflow: "lightweight", profile_hash: persistedProfileHash,
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }],
     });
-    writeState(root, {
+    writeStateBootstrap(root, {
       schema: 1,
       branch: "feat/trusted-advance",
       run_key: "feat/trusted-advance",
@@ -907,7 +904,7 @@ test("wave-004: non-roster advance arming consumes the trusted mapping override"
       token: issued.dispatch_token,
       capability_id: issued.capability_id,
       run_key: "feat/trusted-advance", branch: "feat/trusted-advance", workflow: "lightweight", profile_hash: persistedProfileHash,
-      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
       role: "${scope.dev_agent}", agent: "developer-kotlin",
     };
     const authorized = authorizeDispatch(root, auth);
@@ -983,7 +980,7 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
     const profile = loadProfile("loop-roster-regression");
     assert.ok(profile);
     const persistedProfileHash = profileHash(profile);
-    writeState(root, {
+    writeStateBootstrap(root, {
       schema: 1,
       branch: "feat/loop-roster",
       run_key: "feat/loop-roster",
@@ -1018,6 +1015,7 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
       profile_hash: begun.handoff.profile_hash,
       stage_cursor: begun.handoff.stage_cursor,
       cursor_epoch: begun.handoff.cursor_epoch,
+      loop_iteration: begun.handoff.loop_iteration,
     };
     const designDispatch = authorizeDispatch(root, { ...designAuth, role: "architect", agent: "architect" });
     assert.equal(designDispatch.ok, true);
@@ -1036,6 +1034,7 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
       profile_hash: armed.handoff.profile_hash,
       stage_cursor: armed.handoff.stage_cursor,
       cursor_epoch: armed.handoff.cursor_epoch,
+      loop_iteration: armed.handoff.loop_iteration,
     };
     writeFileSync(join(artifactsDir, "review.json"), JSON.stringify({
       verdict: "needs_changes",
@@ -1052,7 +1051,7 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
     if (!reentered.ok) return;
     assert.equal(reentered.state.stage_cursor, "design", "cursor re-enters the roster-policy target");
     assert.equal(reentered.handoff, undefined, "roster-policy loop re-entry issues no handoff");
-    assert.equal(reentered.state.dispatch_capability?.status, "complete", "only the completed review capability remains");
+    assert.equal(reentered.state.dispatch_capability, undefined, "the deferred-roster loop re-entry leaves no capability behind");
     assert.equal(reentered.state.stages.find((s) => s.id === "design")?.status, "pending", "the loop target stays pending");
     assert.equal(reentered.state.loop_state?.status, "running");
     assert.equal(reentered.state.loop_state?.reentries, 1, "iteration history is recorded");
@@ -1072,6 +1071,7 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
       profile_hash: rebegun.handoff.profile_hash,
       stage_cursor: rebegun.handoff.stage_cursor,
       cursor_epoch: rebegun.handoff.cursor_epoch,
+      loop_iteration: rebegun.handoff.loop_iteration,
       role: "architect", agent: "architect",
     });
     assert.equal(slot.ok, true, slot.ok ? "reselected loop iteration is executable" : slot.error);
@@ -1087,7 +1087,7 @@ test("wave-004: workflow tools invoke beforeBegin per transition with the exact 
     initGit(root, "feat/tool-hook");
     const profile = loadProfile("lightweight");
     assert.ok(profile);
-    writeState(root, {
+    writeStateBootstrap(root, {
       schema: 1,
       branch: "feat/tool-hook",
       run_key: "feat/tool-hook",
@@ -1139,7 +1139,7 @@ test("wave-004: workflow tools invoke beforeBegin per transition with the exact 
     const advancedOther = await advanceTool.execute("id", {
       token: handoff.advance_token, capability_id: handoff.capability_id, run_key: handoff.run_key,
       branch: handoff.branch, workflow: handoff.workflow, profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor, cursor_epoch: handoff.cursor_epoch, evidence: "stage completed",
+      stage_cursor: handoff.stage_cursor, cursor_epoch: handoff.cursor_epoch, loop_iteration: handoff.loop_iteration, evidence: "stage completed",
     }, undefined, undefined, { cwd: otherRoot });
     assert.deepEqual(calls, [root, otherRoot], "advance re-invoked the hook with its own cwd");
     assert.equal(advancedOther.details.ok, false, "the other project has no workflow state");
@@ -1148,7 +1148,7 @@ test("wave-004: workflow tools invoke beforeBegin per transition with the exact 
     const advancedNull = await advanceTool.execute("id", {
       token: handoff.advance_token, capability_id: handoff.capability_id, run_key: handoff.run_key,
       branch: handoff.branch, workflow: handoff.workflow, profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor, cursor_epoch: handoff.cursor_epoch, evidence: "stage completed",
+      stage_cursor: handoff.stage_cursor, cursor_epoch: handoff.cursor_epoch, loop_iteration: handoff.loop_iteration, evidence: "stage completed",
     }, undefined, undefined, { cwd: root });
     assert.deepEqual(calls, [root, otherRoot, root], "null case re-invoked the hook");
     assert.equal(advancedNull.details.ok, false);
@@ -1159,7 +1159,7 @@ test("wave-004: workflow tools invoke beforeBegin per transition with the exact 
     const advancedThrow = await advanceTool.execute("id", {
       token: handoff.advance_token, capability_id: handoff.capability_id, run_key: handoff.run_key,
       branch: handoff.branch, workflow: handoff.workflow, profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor, cursor_epoch: handoff.cursor_epoch, evidence: "stage completed",
+      stage_cursor: handoff.stage_cursor, cursor_epoch: handoff.cursor_epoch, loop_iteration: handoff.loop_iteration, evidence: "stage completed",
     }, undefined, undefined, { cwd: root });
     assert.equal(advancedThrow.details.ok, false);
     assert.match(advancedThrow.details.error ?? "", /stale discovery markers/);
@@ -1223,8 +1223,7 @@ test("wave-004: a malicious outer-valid trusted handoff fails closed before any 
     // Every rejection left the persisted workflow state untouched.
     const untouched = resolveState(root);
     assert.equal(untouched.state?.stage_cursor, "architecture");
-    assert.equal(untouched.state?.dispatch_capability?.status, "ready");
-    assert.equal(untouched.state?.dispatch_capability?.expected_roster.length, 0);
+    assert.equal(untouched.state?.dispatch_capability, undefined, "the fixture started deferred and rejection must not mint a capability");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1241,7 +1240,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
       run_key: "feat/missing-next-role", branch: "feat/missing-next-role", workflow: "lightweight", profile_hash: persistedProfileHash,
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }],
     });
-    writeState(root, {
+    writeStateBootstrap(root, {
       schema: 1,
       branch: "feat/missing-next-role",
       run_key: "feat/missing-next-role",
@@ -1269,7 +1268,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
       token: issued.dispatch_token,
       capability_id: issued.capability_id,
       run_key: "feat/missing-next-role", branch: "feat/missing-next-role", workflow: "lightweight", profile_hash: persistedProfileHash,
-      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
       role: "${scope.dev_agent}", agent: "developer-kotlin",
     };
     const authorized = authorizeDispatch(root, auth);
@@ -1341,7 +1340,7 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
       run_key: "feat/loop-missing-role", branch: "feat/loop-missing-role", workflow: "loop-non-roster-regression", profile_hash: persistedProfileHash,
       stage_cursor: "build", kind: "single", expected_roster: [{ role: "builder", agent: "builder" }],
     });
-    writeState(root, {
+    writeStateBootstrap(root, {
       schema: 1,
       branch: "feat/loop-missing-role",
       run_key: "feat/loop-missing-role",
@@ -1387,6 +1386,7 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
       profile_hash: fallbackBegin.handoff.profile_hash,
       stage_cursor: fallbackBegin.handoff.stage_cursor,
       cursor_epoch: fallbackBegin.handoff.cursor_epoch,
+      loop_iteration: fallbackBegin.handoff.loop_iteration,
     };
     const buildDispatch = authorizeDispatch(root, { ...buildAuth, role: "builder", agent: "builder" });
     assert.equal(buildDispatch.ok, true);
@@ -1408,6 +1408,7 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
       profile_hash: armed.handoff.profile_hash,
       stage_cursor: armed.handoff.stage_cursor,
       cursor_epoch: armed.handoff.cursor_epoch,
+      loop_iteration: armed.handoff.loop_iteration,
     };
     const checkDispatch = authorizeDispatch(root, { ...checkAuth, role: "checker", agent: "checker" });
     assert.equal(checkDispatch.ok, true);
@@ -1467,7 +1468,7 @@ test("wave-004: deferred roster advance masks the prior stage selection until be
       run_key: "feat/deferred-mask", branch: "feat/deferred-mask", workflow: "full-feature", profile_hash: persistedProfileHash,
       stage_cursor: "clarify", kind: "none", expected_roster: [],
     });
-    writeState(root, {
+    writeStateBootstrap(root, {
       schema: 1,
       branch: "feat/deferred-mask",
       run_key: "feat/deferred-mask",
@@ -1506,7 +1507,7 @@ test("wave-004: deferred roster advance masks the prior stage selection until be
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/deferred-mask", branch: "feat/deferred-mask", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
       checkpoint: "user_answers",
       checkpoint_id: "user_answers",
       checkpoint_kind: rule.kind,
@@ -1522,7 +1523,7 @@ test("wave-004: deferred roster advance masks the prior stage selection until be
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/deferred-mask", branch: "feat/deferred-mask", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
       evidence: "clarify completed",
     });
     assert.equal(advanced.ok, true, advanced.ok ? "clarify-to-architecture advance ok" : advanced.error);

@@ -13,6 +13,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
 import { resolveConfig } from "../src/engine/config.js";
@@ -21,8 +22,8 @@ import { appendCheckpointDecision, checkpointPolicyHash, recordTrustedCheckpoint
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
-import { registerTeamWorkflow } from "../src/index.js";
-import { resolveState, writeState } from "../src/engine/state.js";
+import { registerTeamWorkflow, registerWorkflowTools } from "../src/index.js";
+import { resolveState, writeStateBootstrap } from "../src/engine/state.js";
 
 import {
   parseWorkEnvelope,
@@ -88,11 +89,14 @@ function recordTypedCheckpoint(root: string, stageId: string, checkpointId: stri
     actor: { kind: "user" as const, ref: trusted.answer.reference, proof: trusted.proof },
     capability_id: capability.capability_id,
     capability_epoch: capability.issued_for!.cursor_epoch,
+    loop_iteration: capability.issued_for!.loop_iteration,
     policy_hash: checkpointPolicyHash(policy),
     rationale: "explicit typed fixture answer",
     decided_at: new Date().toISOString(),
   };
-  writeState(root, appendCheckpointDecision(trusted.state, typed), { target: resolved });
+  const appended = appendCheckpointDecision(trusted.state, typed);
+  assert.equal(appended.ok, true, appended.ok ? "checkpoint recorded" : `checkpoint append failed: ${appended.code}: ${appended.error}`);
+  writeStateBootstrap(root, appended.state, { target: resolved });
 }
 test("do-work: matching-branch state prompt is resumable", () => {
   const root = mkdtempSync(join(tmpdir(), "do-work-resume-match-"));
@@ -149,6 +153,62 @@ test("workflow_prepare: stale active-feature state is replaced for the current b
     assert.equal(readFileSync(join(root, ".work-state", ".active-feature"), "utf8"), "main\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare: public tool rejects branch drift, detached HEAD, and non-git cwd before writes", async () => {
+  const mismatch = mkdtempSync(join(tmpdir(), "workflow-prepare-mismatch-"));
+  const detached = mkdtempSync(join(tmpdir(), "workflow-prepare-detached-"));
+  const noGit = mkdtempSync(join(tmpdir(), "workflow-prepare-no-git-"));
+  try {
+    initGit(mismatch, "main");
+    initGit(detached, "main");
+    execFileSync("git", [
+      "-C", detached,
+      "-c", "user.name=Workflow Test",
+      "-c", "user.email=workflow@example.invalid",
+      "commit", "--quiet", "--allow-empty", "-m", "fixture",
+    ], { stdio: "ignore" });
+    execFileSync("git", ["-C", detached, "checkout", "--quiet", "--detach"], { stdio: "ignore" });
+    const scenarios = [
+      { label: "model branch mismatch", root: mismatch, branch: "feat/model", error: /branch mismatch/ },
+      { label: "detached HEAD", root: detached, branch: "main", error: /detached HEAD/ },
+      { label: "non-git cwd", root: noGit, branch: "main", error: /outside a git worktree/ },
+    ];
+    for (const scenario of scenarios) {
+      type PrepareTool = {
+        execute: (...args: never[]) => Promise<{ details: unknown }>;
+      };
+      const tools = new Map<string, PrepareTool>();
+      registerWorkflowTools({
+        zod: { z },
+        registerTool(tool: PrepareTool & { name: string }) {
+          tools.set(tool.name, tool);
+        },
+      } as never, { cwd: scenario.root, isMainSession: () => true });
+      const response = await tools.get("workflow_prepare")!.execute(
+        "test",
+        {
+          task: "must reject before state ingress",
+          branch: scenario.branch,
+          classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false },
+          files: [],
+          issue: null,
+        },
+        undefined,
+        undefined,
+        { cwd: scenario.root, hasUI: true },
+      );
+      const details = response.details as { ok?: boolean; code?: string; error?: string };
+      assert.equal(details.ok, false, scenario.label);
+      assert.equal(details.code, "WORKFLOW_PREPARE_FAILED", scenario.label);
+      assert.match(details.error ?? "", scenario.error, scenario.label);
+      assert.equal(existsSync(join(scenario.root, ".work-state")), false, `${scenario.label} writes no workflow state`);
+    }
+  } finally {
+    rmSync(mismatch, { recursive: true, force: true });
+    rmSync(detached, { recursive: true, force: true });
+    rmSync(noGit, { recursive: true, force: true });
   }
 });
 test("resolveState: complete legacy classification wins over an incomplete active feature", () => {
@@ -1040,6 +1100,7 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
       profile_hash: wrongProfileHash,
       stage_cursor: handoff.stage_cursor,
       cursor_epoch: handoff.cursor_epoch,
+      loop_iteration: handoff.loop_iteration,
       role: "developer-kotlin",
       agent: "developer-kotlin",
     });
@@ -1070,6 +1131,7 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
       profile_hash: handoff.profile_hash,
       stage_cursor: handoff.stage_cursor,
       cursor_epoch: handoff.cursor_epoch,
+      loop_iteration: handoff.loop_iteration,
       role: "developer-kotlin",
       agent: "developer-kotlin",
     });
@@ -1106,6 +1168,7 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
       profile_hash: handoff.profile_hash,
       stage_cursor: handoff.stage_cursor,
       cursor_epoch: handoff.cursor_epoch,
+      loop_iteration: handoff.loop_iteration,
       role: "developer-kotlin",
       agent: "developer-kotlin",
       tool_call_id: "tool-1",
@@ -1130,6 +1193,7 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
       profile_hash: handoff.profile_hash,
       stage_cursor: handoff.stage_cursor,
       cursor_epoch: handoff.cursor_epoch,
+      loop_iteration: handoff.loop_iteration,
       evidence: "implementation completed",
     });
     assert.equal(advanced.ok, true, advanced.ok ? undefined : advanced.error);
@@ -1174,6 +1238,7 @@ test("beginCapability reissues secrets for an active dispatch without losing its
       profile_hash: first.handoff.profile_hash,
       stage_cursor: first.handoff.stage_cursor,
       cursor_epoch: first.handoff.cursor_epoch,
+      loop_iteration: first.handoff.loop_iteration,
       role: "developer-kotlin",
       agent: "developer-kotlin",
     };
@@ -1369,7 +1434,7 @@ test("advance handoff resolves the next stage roster", () => {
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
     };
-    writeState(root, state, { featureSlug: "handoff" });
+    writeStateBootstrap(root, state, { featureSlug: "handoff" });
     mkdirSync(join(root, ".work-state", "features", "handoff", "artifacts"), { recursive: true });
     writeFileSync(join(root, ".work-state", "features", "handoff", "artifacts", "implementation.json"), JSON.stringify({
       ready: true,
@@ -1386,6 +1451,7 @@ test("advance handoff resolves the next stage roster", () => {
       profile_hash: persistedProfileHash,
       stage_cursor: "implementation",
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      loop_iteration: issued.state.issued_for!.loop_iteration,
       role: "${scope.dev_agent}",
       agent: "developer-kotlin",
     };

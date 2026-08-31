@@ -91,6 +91,59 @@ export interface CheckpointPolicy {
   rationale: string;
 }
 
+/**
+ * Canonical loop-scoped binding carried by every issued dispatch capability.
+ * `loop_iteration` (1-based) and `checkpoint_policy_hash` make the capability,
+ * every trusted answer and every typed decision refer to exactly one active
+ * (epoch, iteration, policy) window; a prior stage or a prior loop iteration
+ * can never re-authorize against it.
+ */
+export interface CapabilityBinding {
+  run_key: string;
+  branch: string;
+  workflow: WorkflowName;
+  /** Full profile hash; workflow calls may carry the compact fingerprint. */
+  profile_hash: string;
+  stage_cursor: string;
+  cursor_epoch: string;
+  /** 1-based; 1 on the first pass, `loop_state.reentries + 1` after a loop-back. */
+  loop_iteration: number;
+  /** Hash of the active-stage checkpoint policy declaration; null when none. */
+  checkpoint_policy_hash: string | null;
+}
+
+/**
+ * Active-stage projection record for `TeamState.checkpoint_policy`. A binding
+ * names exactly one stage; anything else is a prior-stage projection and is
+ * ignored/cleared at the next transition.
+ */
+export interface CheckpointPolicyBinding {
+  stage_id: string;
+  profile_hash: string;
+  policy_hash: string;
+}
+
+/** Fully resolved current decision window; the unit of ledger uniqueness. */
+export interface CheckpointScope {
+  run_id: string;
+  stage_id: string;
+  checkpoint_id: string;
+  checkpoint_kind: CheckpointRuleKind;
+  capability_id: string;
+  capability_epoch: string;
+  loop_iteration: number;
+  policy_hash: string;
+}
+
+/** Non-throwing resolution of the authoritative checkpoint policy for a stage. */
+export interface CheckpointDeclaration {
+  stage_id: string;
+  checkpoint_id: string;
+  policy: CheckpointPolicy;
+  rule: CheckpointRule;
+  policy_hash: string;
+}
+
 export type CheckpointActorKind = "user" | "orchestrator" | "system";
 export type CheckpointAnswerChannel = "terminal" | "escalation";
 
@@ -127,7 +180,18 @@ export interface TrustedCheckpointAnswer {
   decision: string;
   binding: string;
   issued_at: string;
+  /** 1-based loop iteration of the minting capability; legacy answers omit it. */
+  loop_iteration?: number;
   consumed_at?: string;
+  /**
+   * Why the answer stopped being live. `superseded` proofs never authorize;
+   * `finalized` proofs authorize only the exact immutable decision they were
+   * consumed for (`finalized_decision_key`). A legacy record carrying only
+   * `consumed_at` stays non-authorizing until an exact final decision can be
+   * proven in the ledger; otherwise it is treated as superseded.
+   */
+  consumed_reason?: "finalized" | "superseded";
+  finalized_decision_key?: string;
 }
 
 export interface CheckpointActor {
@@ -235,6 +299,8 @@ export interface WorkIdentity {
   stage_cursor: string;
   capability_id: string;
   capability_epoch: string;
+  /** 1-based loop iteration of the minting capability; pre-loop-scope identities omit it. */
+  loop_iteration?: number;
   slot_id: string;
   task_id: string;
   dispatch_id: string;
@@ -538,7 +604,7 @@ export interface DispatchCapabilityState {
   capability_id?: string;
   dispatch_token_hash?: string;
   advance_token_hash?: string;
-  issued_for?: { run_key: string; branch: string; workflow: WorkflowName; profile_hash: string; stage_cursor: string; cursor_epoch: string };
+  issued_for?: CapabilityBinding;
   kind: "none" | "single" | "consilium";
   expected_roles?: string[];
   expected_count?: number;
@@ -582,6 +648,8 @@ export interface CheckpointDecision {
   actor_provenance?: CheckpointActor;
   capability_id?: string;
   capability_epoch?: string;
+  /** Migration mirror of the typed loop scope; unscoped legacy records cannot authorize. */
+  loop_iteration?: number;
   policy_hash?: string;
   work_identity?: WorkIdentity;
 }
@@ -600,6 +668,8 @@ export interface TypedCheckpointDecision {
   actor: CheckpointActor;
   capability_id: string;
   capability_epoch: string;
+  /** 1-based loop iteration of the minting capability. */
+  loop_iteration: number;
   policy_hash: string;
   rationale: string;
   decided_at: string;
@@ -705,8 +775,21 @@ export interface TeamState {
   workflow_override: boolean;
   /** Persisted terminal-outcome intent; never checkpoint permission. */
   completion_intent?: CompletionIntent;
-  /** Persisted typed checkpoint policy; malformed values fail closed. */
+  /**
+   * Active-stage checkpoint policy projection. Authoritative policy lives in
+   * the declaring profile/stage; this mirror is valid only while
+   * `checkpoint_policy_binding` names the current stage, and both fields are
+   * cleared on transition to a stage without a checkpoint.
+   */
   checkpoint_policy?: CheckpointPolicy;
+  /** Stage binding for the `checkpoint_policy` projection; rebound per transition. */
+  checkpoint_policy_binding?: CheckpointPolicyBinding;
+  /**
+   * Canonical cross-process CAS revision. Legacy inputs may omit it (read as
+   * 0); every durable commit writes the previous revision plus one. Display
+   * `updated_at` never participates in the CAS.
+   */
+  state_revision?: number;
   issue: { number: number; url?: string } | null;
   stage_cursor: string;
   stages: Array<{ id: string; status: StageStatus }>;

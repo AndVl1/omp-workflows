@@ -27,9 +27,18 @@ import { readFileSync } from "node:fs";
 import { loadAllProfiles, profileHash, resolveWorkflow, selectProfile } from "./profile.js";
 import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope, type ScopeFlags } from "./scope.js";
-import { writeState, setStageStatus, setPause, resolveState, reopenFromFeedback, type ResolvedState } from "./state.js";
-import { authorizeDispatch, completeDispatch, advanceCursor, createCapability } from "./durable.js";
-import { validateCheckpointForAdvance } from "./checkpoints.js";
+import {
+  DETACHED_BRANCH,
+  NO_GIT_BRANCH,
+  resolveActiveBranch,
+  reopenFromFeedback,
+  resolveState,
+  setStageStatus,
+  updateStateAtomically,
+} from "./state.js";
+import { authorizeDispatch, completeDispatch, advanceCursor, createCapability, type IssuedCapability } from "./durable.js";
+import { resolveCheckpointDeclaration } from "./checkpoints.js";
+import { loopIterationForStage } from "./loops.js";
 import { keywordClassify } from "./classify.js";
 import type { Classification, Complexity, Confidence, Profile, RoleConfig, TaskType, TeamState, WorkflowName } from "./types.js";
 import { walkProfile, resolveStageDispatchSlots, type StageContext, type TaskCaller } from "./stage.js";
@@ -136,7 +145,6 @@ export interface PreparedWorkflowState {
   state: TeamState;
   statePath: string;
   artifactsDir: string;
-  stateTarget: { target?: ResolvedState };
   expectedRoster: (stage: NonNullable<Profile["stages"][number]>) => Array<{ role: string; agent: string }>;
 }
 
@@ -146,13 +154,26 @@ export interface PreparedWorkflowState {
  * instead of editing canonical `.work-state` files directly.
  */
 export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWorkflowState {
+  // Host git state is the ingress authority. Reject detached/non-git roots
+  // and model-supplied branch drift before resolveState/updateStateAtomically
+  // can create `.work-state` or write an active pointer.
+  const activeBranch = resolveActiveBranch(opts.cwd);
+  if (activeBranch === DETACHED_BRANCH) {
+    throw new Error("cannot prepare workflow state from detached HEAD");
+  }
+  if (activeBranch === NO_GIT_BRANCH) {
+    throw new Error("cannot prepare workflow state outside a git worktree");
+  }
+  if (opts.branch !== activeBranch) {
+    throw new Error(`workflow branch mismatch: host is '${activeBranch}', request supplied '${opts.branch}'`);
+  }
   const config = resolveConfig(opts.cwd);
   const profiles = loadAllProfiles();
-  const existing = resolveState(opts.cwd, opts.branch);
+  const existing = resolveState(opts.cwd, activeBranch);
   const isContinuation = Boolean(opts.continuation);
   if (existing.invalid) throw new Error("workflow state is invalid or unsafe");
   if (isContinuation && (!existing.state || existing.isStale)) {
-    throw new Error(`cannot continue workflow: no non-stale state for branch ${opts.branch}`);
+    throw new Error(`cannot continue workflow: no non-stale state for branch ${activeBranch}`);
   }
   if (!isContinuation && existing.state && !existing.isStale) {
     throw new Error("workflow state already exists for this branch; use continuation mode");
@@ -175,39 +196,69 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
   const expectedRoster = (stage: NonNullable<Profile["stages"][number]>): Array<{ role: string; agent: string }> =>
     resolveSlots(stage).map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
 
-  const reopened = opts.continuation
-    ? reopenFromFeedback(existing.state!, opts.continuation.feedback, opts.continuation.stageId)
-    : null;
-  const state: TeamState = reopened
-    ? { ...reopened, dispatch_capability: undefined, cursor_epoch: undefined, scope: flags, policy: { ...(reopened.policy ?? {}), strict_orchestrator: true } }
-    : {
-        schema: 1,
-        branch: opts.branch,
-        classification,
-        task: opts.task,
-        workflow_override: opts.classification?.workflow !== undefined,
-        issue: opts.issue ?? null,
-        stage_cursor: profile.stages[0]?.id ?? "",
-        stages: profile.stages.map((s) => ({ id: s.id, status: "pending" as const })),
-        pause: { kind: "none" as const, reason: "" },
-        artifacts: {},
-        scope: flags,
-        policy: { strict_orchestrator: true },
-        profile_hash: profileHash(profile),
-        run_key: opts.branch,
-        updated_at: new Date().toISOString(),
-      } satisfies TeamState;
-  const stateTarget = isContinuation ? { target: existing } : {};
-  const { statePath, artifactsDir } = writeState(opts.cwd, state, stateTarget);
-  return { config, profile, flags, classification, state, statePath, artifactsDir, stateTarget, expectedRoster };
+  // The classification write is ONE cross-process transaction: the
+  // already-exists gate and the continuation gate run against the freshly
+  // persisted state under the workspace lock, never a pre-lock snapshot.
+  const outcome = updateStateAtomically<{ state: TeamState }>(opts.cwd, (snapshot) => {
+    if (isContinuation) {
+      if (!snapshot.state || snapshot.target.isStale) {
+        return { op: "fail", code: "state_missing", error: `cannot continue workflow: no non-stale state for branch ${activeBranch}` };
+      }
+      const reopened = reopenFromFeedback(snapshot.state, opts.continuation!.feedback, opts.continuation!.stageId);
+      const next: TeamState = { ...reopened, scope: flags, policy: { ...(reopened.policy ?? {}), strict_orchestrator: true } };
+      // Continuation re-arms stages through the durable transitions: the prior
+      // run's capability mirrors are cleared by DELETING their keys — an own
+      // undefined value would fail persisted-state normalization and every
+      // continuation of a durable run would throw at write time.
+      delete next.dispatch_capability;
+      delete next.cursor_epoch;
+      return { op: "commit", state: next, value: { state: next } };
+    }
+    if (snapshot.state && !snapshot.target.isStale) {
+      return { op: "fail", code: "state_conflict", error: "workflow state already exists for this branch; use continuation mode" };
+    }
+    const fresh: TeamState = {
+      schema: 1,
+      branch: activeBranch,
+      classification,
+      task: opts.task,
+      workflow_override: opts.classification?.workflow !== undefined,
+      issue: opts.issue ?? null,
+      stage_cursor: profile.stages[0]?.id ?? "",
+      stages: profile.stages.map((s) => ({ id: s.id, status: "pending" as const })),
+      pause: { kind: "none" as const, reason: "" },
+      artifacts: {},
+      scope: flags,
+      policy: { strict_orchestrator: true },
+      profile_hash: profileHash(profile),
+      run_key: activeBranch,
+      updated_at: new Date().toISOString(),
+    } satisfies TeamState;
+    return { op: "commit", state: fresh, value: { state: fresh } };
+  }, { branch: activeBranch });
+  if (!outcome.ok) throw new Error(outcome.error);
+  if (!outcome.value) throw new Error("workflow state transaction completed without a result");
+  // The prepared state is the COMMITTED, normalized and revision-stamped
+  // state on disk — never the pre-normalization mutation output.
+  const state = outcome.committed && outcome.state ? outcome.state : outcome.value.state;
+  // A fresh run can commit either from an absent target or by retargeting a
+  // stale active feature to the current branch. In both cases the
+  // transaction's resolved target does not describe the committed file, so
+  // resolve it again after the commit.
+  const committedTarget = outcome.target.statePath && !outcome.target.isStale
+    ? outcome.target
+    : resolveState(opts.cwd, activeBranch);
+  const statePath = committedTarget.statePath ?? "";
+  const artifactsDir = committedTarget.artifactsDir ?? "";
+  return { config, profile, flags, classification, state, statePath, artifactsDir, expectedRoster };
 }
 
 export async function run(opts: RunOptions): Promise<RunResult> {
   const prepared = prepareWorkflowState(opts);
-  const { config, profile, flags, classification, state: initialState, statePath, artifactsDir, stateTarget, expectedRoster } = prepared;
+  const { config, profile, flags, classification, state: initialState, statePath, artifactsDir, expectedRoster } = prepared;
   const completed = new Set(initialState.stages.filter((s) => s.status === "done" || s.status === "skipped").map((s) => s.id));
   const runnableProfile = completed.size === 0 ? profile : { ...profile, stages: profile.stages.filter((s) => !completed.has(s.id)) };
-  let durableStage: { stageId: string; dispatchToken: string; advanceToken: string; epoch: string } | null = null;
+  let durableStage: { stageId: string; dispatchToken: string; advanceToken: string; epoch: string; loopIteration?: number } | null = null;
   const ctx: StageContext = {
     cwd: opts.cwd,
     state: initialState,
@@ -220,55 +271,113 @@ export async function run(opts: RunOptions): Promise<RunResult> {
       : undefined,
     pause: opts.pause ?? (async () => undefined),
     onStageStart: (stageId) => {
-      const current = readState(statePath);
-      // A durable advance (normal or loop re-entry) already armed this stage
-      // with a ready capability and the handoff secrets live in durableStage.
-      // Reuse it so loop re-entry keeps the fresh epoch issued by
-      // advanceCursor; do not re-mint a second capability for the same stage.
-      const armed = current.dispatch_capability;
-      if (
-        durableStage &&
-        durableStage.stageId === stageId &&
-        armed?.issued_for?.stage_cursor === stageId &&
-        (armed.status === "ready" || armed.status === "dispatched")
-      ) {
+      // One cross-process transaction: the stage flips to in_progress and
+      // its capability is armed against the freshly persisted state under
+      // the workspace lock — never a pre-lock snapshot.
+      const outcome = updateStateAtomically<{ issued: IssuedCapability | null; reuse: boolean }>(opts.cwd, (snapshot) => {
+        if (!snapshot.state) return { op: "fail", code: "state_missing", error: "workflow state missing" };
+        const current = snapshot.state;
+        // A durable advance (normal or loop re-entry) already armed this stage
+        // with a ready capability and the handoff secrets live in durableStage.
+        // Reuse it so loop re-entry keeps the fresh epoch issued by
+        // advanceCursor; do not re-mint a second capability for the same stage.
+        const armed = current.dispatch_capability;
+        if (
+          durableStage &&
+          durableStage.stageId === stageId &&
+          armed?.issued_for?.stage_cursor === stageId &&
+          (armed.status === "ready" || armed.status === "dispatched")
+        ) {
+          return { op: "commit", state: setStageStatus(current, stageId, "in_progress", opts.cwd), value: { issued: null, reuse: true } };
+        }
+        const stage = profile.stages.find((candidate) => candidate.id === stageId);
+        // Checkpoint scope and loop iteration are part of the capability
+        // binding even in interpreter mode. Issue the same fully scoped
+        // capability that workflow_begin would issue; otherwise the
+        // interpreter either bypasses the declared checkpoint projection or
+        // fails later with an unrelated capability-drift error.
+        const kind: "single" | "consilium" | "none" = stage?.type === "single" ? "single" : stage?.type === "consilium" ? "consilium" : "none";
         const next = setStageStatus(current, stageId, "in_progress", opts.cwd);
-        ctx.state = next;
-        writeState(opts.cwd, next, stateTarget);
-        return;
+        if (!stage) {
+          const nextState: TeamState = { ...next, run_key: next.run_key ?? next.branch, profile_hash: profileHash(profile) };
+          delete nextState.cursor_epoch;
+          delete nextState.dispatch_capability;
+          delete nextState.checkpoint_policy;
+          delete nextState.checkpoint_policy_binding;
+          return { op: "commit", state: nextState, value: { issued: null, reuse: false } };
+        }
+        const iteration = loopIterationForStage(next, profile, stage.id);
+        if (!iteration.ok) return { op: "fail", code: "loop_scope_invalid", error: iteration.error };
+        const declaration = resolveCheckpointDeclaration(stage, profile.checkpoint_policy, next, "rebind");
+        if (!declaration.ok) return { op: "fail", code: declaration.code, error: declaration.error };
+        const persistedProfileHash = profileHash(profile);
+        const issued = createCapability({
+          run_key: next.run_key ?? next.branch,
+          branch: next.branch,
+          workflow: profile.name,
+          profile_hash: persistedProfileHash,
+          stage_cursor: stage.id,
+          kind,
+          expected_roster: kind === "none" ? [] : expectedRoster(stage),
+          loop_iteration: iteration.iteration,
+          checkpoint_policy_hash: declaration.declaration?.policy_hash ?? null,
+        });
+        const nextState: TeamState = {
+          ...next,
+          run_key: next.run_key ?? next.branch,
+          cursor_epoch: issued.state.issued_for!.cursor_epoch,
+          profile_hash: persistedProfileHash,
+          dispatch_capability: issued.state,
+        };
+        if (declaration.declaration) {
+          nextState.checkpoint_policy = declaration.declaration.policy;
+          nextState.checkpoint_policy_binding = {
+            stage_id: stage.id,
+            profile_hash: persistedProfileHash,
+            policy_hash: declaration.declaration.policy_hash,
+          };
+        } else {
+          delete nextState.checkpoint_policy;
+          delete nextState.checkpoint_policy_binding;
+        }
+        if (
+          nextState.work_identity
+          && (
+            nextState.work_identity.capability_id !== issued.capability_id
+            || nextState.work_identity.capability_epoch !== issued.state.issued_for!.cursor_epoch
+            || nextState.work_identity.stage_id !== stage.id
+            || nextState.work_identity.loop_iteration !== issued.state.issued_for!.loop_iteration
+          )
+        ) {
+          delete nextState.work_identity;
+        }
+        return { op: "commit", state: nextState, value: { issued, reuse: false } };
+      });
+      if (!outcome.ok || !outcome.committed) throw new Error(outcome.ok ? "workflow stage start did not commit" : outcome.error);
+      const issued = outcome.value?.issued ?? null;
+      if (issued) {
+        durableStage = { stageId, dispatchToken: issued.dispatch_token, advanceToken: issued.advance_token, epoch: issued.state.issued_for!.cursor_epoch, loopIteration: issued.state.issued_for!.loop_iteration };
+      } else if (!outcome.value?.reuse) {
+        durableStage = null;
       }
-      const stage = profile.stages.find((candidate) => candidate.id === stageId);
-      // (checkpoint enforcement and atomic arming of the next stage) is
-      // available for orchestrator/bash/none stages exactly as it is for
-      // single/consilium. Non-dispatch stages get kind "none" with an empty
-      // roster, mirroring beginCapability.
-      const kind: "single" | "consilium" | "none" = stage?.type === "single" ? "single" : stage?.type === "consilium" ? "consilium" : "none";
-      const next = setStageStatus(current, stageId, "in_progress", opts.cwd);
-      const issued = stage
-        ? createCapability({ run_key: next.run_key ?? next.branch, branch: next.branch, workflow: profile.name, profile_hash: profileHash(profile), stage_cursor: stage.id, kind, expected_roster: kind === "none" ? [] : expectedRoster(stage) })
-        : null;
-      const nextState: TeamState = issued
-        ? { ...next, run_key: next.run_key ?? next.branch, cursor_epoch: issued.state.issued_for!.cursor_epoch, profile_hash: profileHash(profile), dispatch_capability: issued.state }
-        : { ...next, cursor_epoch: undefined, dispatch_capability: undefined };
-      ctx.state = nextState;
-      if (issued) durableStage = { stageId, dispatchToken: issued.dispatch_token, advanceToken: issued.advance_token, epoch: issued.state.issued_for!.cursor_epoch };
-      else durableStage = null;
-      writeState(opts.cwd, nextState, stateTarget);
+      ctx.state = outcome.state!;
     },
     onStageComplete: (stageId, status) => {
-      const current = readState(statePath);
-      // A missing/invalid checkpoint is a resumable pause, not a failed stage.
-      // Keep the stage pending so continuation can answer the same checkpoint.
-      if (
-        status === "failed"
-        && (current.pause?.kind === "user_checkpoint" || current.pause?.kind === "needs_human" || current.pause?.kind === "background_wait")
-      ) {
-        ctx.state = current;
-        return;
-      }
-      const next = setStageStatus(current, stageId, status, opts.cwd);
-      ctx.state = next;
-      writeState(opts.cwd, next, stateTarget);
+      const outcome = updateStateAtomically(opts.cwd, (snapshot) => {
+        if (!snapshot.state) return { op: "fail", code: "state_missing", error: "workflow state missing" };
+        const current = snapshot.state;
+        // A missing/invalid checkpoint is a resumable pause, not a failed stage.
+        // Keep the stage pending so continuation can answer the same checkpoint.
+        if (
+          status === "failed"
+          && (current.pause?.kind === "user_checkpoint" || current.pause?.kind === "needs_human" || current.pause?.kind === "background_wait")
+        ) {
+          return { op: "discard" };
+        }
+        return { op: "commit", state: setStageStatus(current, stageId, status, opts.cwd) };
+      });
+      if (!outcome.ok) throw new Error(outcome.error);
+      ctx.state = outcome.state ?? ctx.state;
     },
     log: opts.log ?? (() => undefined),
     resolveDevAgent: () => flags.dev_agent,
@@ -276,54 +385,76 @@ export async function run(opts: RunOptions): Promise<RunResult> {
       authorize: (role, agent) => {
         if (!durableStage) return { ok: false, error: "durable stage unavailable" };
         const current = readState(statePath);
-        const r = authorizeDispatch(opts.cwd, { token: durableStage.dispatchToken, capability_id: current.dispatch_capability?.capability_id ?? "", run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, role, agent });
+        const r = authorizeDispatch(opts.cwd, { token: durableStage.dispatchToken, capability_id: current.dispatch_capability?.capability_id ?? "", run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, loop_iteration: durableStage.loopIteration, role, agent });
         if (r.ok) ctx.state = r.state;
         return r.ok && r.record ? { ok: true, dispatchId: r.record.id } : { ok: false, error: r.ok ? "missing dispatch record" : r.error };
       },
       complete: (dispatchId, output, outcome, artifactIds) => {
         if (!durableStage) return { ok: false, error: "durable stage unavailable" };
         const current = readState(statePath);
-        const r = completeDispatch(opts.cwd, { token: durableStage.dispatchToken, capability_id: current.dispatch_capability?.capability_id ?? "", dispatch_id: dispatchId, run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, outcome, evidence: output || (outcome === "failed" ? "task failed" : "task completed"), artifact_ids: artifactIds });
+        const r = completeDispatch(opts.cwd, { token: durableStage.dispatchToken, capability_id: current.dispatch_capability?.capability_id ?? "", dispatch_id: dispatchId, run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, loop_iteration: durableStage.loopIteration, outcome, evidence: output || (outcome === "failed" ? "task failed" : "task completed"), artifact_ids: artifactIds });
         if (r.ok) ctx.state = r.state;
         return r.ok ? { ok: true } : { ok: false, error: r.error };
       },
       advance: (evidence) => {
         if (!durableStage) return { ok: false, error: "durable stage unavailable" };
         const current = readState(statePath);
-        const stageDef = profile.stages.find((candidate) => candidate.id === durableStage!.stageId);
-        if (stageDef?.checkpoint) {
-          const checkpoint = validateCheckpointForAdvance(stageDef, current);
-          if (!checkpoint.ok) {
-            const pauseKind = checkpoint.pauseKind ?? (checkpoint.code === "checkpoint_unresolved" ? "user_checkpoint" : "needs_human");
-            const paused = setPause(current, pauseKind, checkpoint.error);
-            ctx.state = paused;
-            writeState(opts.cwd, paused, stateTarget);
-            return { ok: false, error: `${checkpoint.code}: ${checkpoint.error}` };
-          }
-        }
-        const r = advanceCursor(opts.cwd, { token: durableStage.advanceToken, capability_id: current.dispatch_capability?.capability_id ?? "", run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, evidence });
+        // advanceCursor performs checkpoint resolution, pause selection and
+        // the cursor move inside its own fresh-state transaction. A decision
+        // recorded after this adapter read is therefore observed rather than
+        // overwritten by a stale pause decision.
+        const r = advanceCursor(opts.cwd, {
+          token: durableStage.advanceToken,
+          capability_id: current.dispatch_capability?.capability_id ?? "",
+          run_key: current.run_key ?? current.branch,
+          branch: current.branch,
+          workflow: profile.name,
+          profile_hash: current.profile_hash ?? profileHash(profile),
+          stage_cursor: durableStage.stageId,
+          cursor_epoch: durableStage.epoch,
+          loop_iteration: durableStage.loopIteration,
+          evidence,
+        });
         if (!r.ok) return { ok: false, error: `${r.error}: ${evidence}` };
         ctx.state = r.state;
-        if (r.handoff) durableStage = { stageId: r.state.stage_cursor, dispatchToken: r.handoff.dispatch_token, advanceToken: r.handoff.advance_token, epoch: r.handoff.cursor_epoch };
+        if (r.handoff) durableStage = { stageId: r.state.stage_cursor, dispatchToken: r.handoff.dispatch_token, advanceToken: r.handoff.advance_token, epoch: r.handoff.cursor_epoch, loopIteration: r.handoff.loop_iteration };
         return { ok: true, handoff: r.handoff };
       },
     },
   };
   opts.log?.(`walking profile: ${profile.name} (${runnableProfile.stages.length} stages)`);
   const outcomes = await walkProfile(profile, ctx);
-  const final = readState(statePath);
-  const done = final.stages.every((s) => s.status === "done" || s.status === "skipped");
-  // A loop-exhaustion or checkpoint pause is the durable outcome of the run;
-  // do not overwrite it with a generic status.
-  const resumablePause = final.pause.kind === "user_checkpoint"
-    || final.pause.kind === "needs_human"
-    || final.pause.kind === "background_wait"
-    || final.pause.kind === "failed";
-  const terminal = resumablePause
-    ? final
-    : setPause(final, done ? "done" : "failed", done ? "" : "one or more stages failed");
-  writeState(opts.cwd, terminal, stateTarget);
+  finalizeWorkflowRun(opts.cwd);
   return { classification, profile, outcomes: outcomes.map((o) => ({ stageId: o.stageId, status: o.status, note: o.note })), statePath };
+}
+
+/**
+ * Resolve the terminal lifecycle from the state that is current under the
+ * transaction lock. Kept as a named engine boundary so adapters and race
+ * tests exercise the same fresh-state decision used by run().
+ */
+export function finalizeWorkflowRun(cwd: string): TeamState {
+  const terminal = updateStateAtomically(cwd, (snapshot) => {
+    if (!snapshot.state) return { op: "fail", code: "state_missing", error: "workflow state missing" };
+    const current = snapshot.state;
+    const resumablePause = current.pause.kind === "user_checkpoint"
+      || current.pause.kind === "needs_human"
+      || current.pause.kind === "background_wait"
+      || current.pause.kind === "failed";
+    if (resumablePause) return { op: "discard" };
+    const done = current.stages.every((stage) => stage.status === "done" || stage.status === "skipped");
+    return {
+      op: "commit",
+      state: {
+        ...current,
+        pause: { kind: done ? "done" : "failed", reason: done ? "" : "one or more stages failed" },
+        updated_at: new Date().toISOString(),
+      },
+    };
+  });
+  if (!terminal.ok) throw new Error(terminal.error);
+  if (!terminal.state) throw new Error("workflow state missing after terminal transaction");
+  return terminal.state;
 }
 
 function readState(path: string): TeamState {

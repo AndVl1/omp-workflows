@@ -206,7 +206,18 @@ test("predicate: named gates resolve through the caller's resolver and fail clos
     );
     assert.deepEqual(
       evaluatePredicate("branch_created", { flags: FLAGS, artifactsDir, state: state(), namedGate }),
+      { ok: true, value: false, detail: "branch missing" },
+      "an unsatisfied named gate reports its concrete failure reason",
+    );
+    assert.deepEqual(
+      evaluatePredicate("!branch_created", { flags: FLAGS, artifactsDir, state: state(), namedGate }),
+      { ok: true, value: true },
+      "a failing named gate satisfies its negation",
+    );
+    assert.deepEqual(
+      evaluatePredicate("!dod_complete", { flags: FLAGS, artifactsDir, state: state(), namedGate }),
       { ok: true, value: false },
+      "a holding named gate fails its negation with no reason to surface",
     );
     const unsupported = evaluatePredicate("mystery_gate", { flags: FLAGS, artifactsDir, state: state(), namedGate });
     assert.equal(unsupported.ok, false);

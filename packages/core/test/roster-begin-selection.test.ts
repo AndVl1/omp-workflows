@@ -21,7 +21,7 @@ import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { beginCapability, type RosterBeginSelection } from "../src/engine/durable.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
-import { writeState, resolveState } from "../src/engine/state.js";
+import { writeStateBootstrap, resolveState } from "../src/engine/state.js";
 import { resolveConfig } from "../src/engine/config.js";
 import { buildAgentMapping, validateAgentMappingState, writeAgentMapping, type AgentMappingState } from "../src/engine/agent-mapping.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
@@ -72,7 +72,7 @@ function writeFreshState(root: string): void {
     scope: NO_SCOPE,
     updated_at: new Date().toISOString(),
   };
-  writeState(root, state, { featureSlug: "seam" });
+  writeStateBootstrap(root, state, { featureSlug: "seam" });
 }
 
 function frozenSelection(root: string): NonNullable<TeamState["roster_selection"]> | undefined {
@@ -253,7 +253,7 @@ test("the contract exposes a frozen selection only for the current stage and cur
     const stageResolved = resolveState(root);
     assert.ok(stageResolved.state && stageResolved.statePath);
     const staleStageSelection = { ...frozen!, stage_id: "discovery" };
-    writeState(root, {
+    writeStateBootstrap(root, {
       ...stageResolved.state,
       roster_selection: staleStageSelection,
       dispatch_capability: { ...stageResolved.state.dispatch_capability!, roster_selection: staleStageSelection },
@@ -268,7 +268,7 @@ test("the contract exposes a frozen selection only for the current stage and cur
     const epochResolved = resolveState(root);
     assert.ok(epochResolved.state && epochResolved.statePath);
     const staleEpochSelection = { ...frozen!, capability_epoch: "rotated-epoch" };
-    writeState(root, {
+    writeStateBootstrap(root, {
       ...epochResolved.state,
       roster_selection: staleEpochSelection,
       dispatch_capability: { ...epochResolved.state.dispatch_capability!, roster_selection: staleEpochSelection },
@@ -280,7 +280,7 @@ test("the contract exposes a frozen selection only for the current stage and cur
     // The current selection (own stage, live epoch) stays fully exposed.
     const restored = resolveState(root);
     assert.ok(restored.state && restored.statePath);
-    writeState(root, {
+    writeStateBootstrap(root, {
       ...restored.state,
       roster_selection: frozen,
       dispatch_capability: { ...restored.state.dispatch_capability!, roster_selection: frozen },
@@ -391,7 +391,7 @@ test("a legacy state without a top-level cursor epoch masks any selection, whate
     const { cursor_epoch: _droppedEpoch, ...legacyState } = arbitraryResolved.state;
     assert.equal(legacyState.cursor_epoch, undefined, "fixture is the legacy shape without a top-level cursor epoch");
     const arbitrarySelection = { ...legacyState.roster_selection!, capability_epoch: "arbitrary-legacy-epoch" };
-    writeState(root, {
+    writeStateBootstrap(root, {
       ...legacyState,
       roster_selection: arbitrarySelection,
       dispatch_capability: { ...legacyState.dispatch_capability!, roster_selection: arbitrarySelection },
@@ -408,7 +408,7 @@ test("a legacy state without a top-level cursor epoch masks any selection, whate
     assert.ok(capBoundResolved.state && capBoundResolved.statePath);
     const { cursor_epoch: _droppedCapEpoch, ...legacyState2 } = capBoundResolved.state;
     const capBoundSelection = { ...legacyState2.roster_selection!, capability_epoch: capEpoch };
-    writeState(root, {
+    writeStateBootstrap(root, {
       ...legacyState2,
       roster_selection: capBoundSelection,
       dispatch_capability: { ...legacyState2.dispatch_capability!, roster_selection: capBoundSelection },
@@ -422,7 +422,7 @@ test("a legacy state without a top-level cursor epoch masks any selection, whate
     const modernResolved = resolveState(root);
     assert.ok(modernResolved.state && modernResolved.statePath);
     const modernSelection = { ...modernResolved.state.roster_selection!, capability_epoch: capEpoch };
-    writeState(root, {
+    writeStateBootstrap(root, {
       ...modernResolved.state,
       cursor_epoch: capEpoch,
       roster_selection: modernSelection,

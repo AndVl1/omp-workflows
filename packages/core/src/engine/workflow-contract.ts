@@ -7,7 +7,29 @@ import { resolveActiveBranch, resolveState } from "./state.js";
 import { resolveStageDispatchSlots } from "./stage.js";
 import { sanitizeSlot } from "./fan-in.js";
 import { artifactSchemaFor, type JsonSchemaDef } from "./artifact-contract.js";
+import {
+  checkpointPolicyHash,
+  findCurrentCheckpointDecision,
+  resolveCheckpointDeclaration,
+  type CheckpointDeclarationResolution,
+} from "./checkpoints.js";
+import {
+  isRecord,
+  validateActiveCapabilityStateBinding,
+  validateActiveDispatchCapabilityValue,
+  validateCheckpointAnswerProofValue,
+  validateCheckpointDecisionValue,
+  validateCheckpointPolicyValue,
+  validateCheckpointRuleValue,
+  validateTypedCheckpointDecisionValue,
+  validateTrustedCheckpointAnswerValue,
+  validateDispatchCapabilityValue,
+  validatePendingStateValue,
+  validateWorkIdentityValue,
+  type ControlPlaneIssue,
+} from "./control-plane-contract.js";
 import type {
+  CheckpointDeclaration,
   CheckpointPolicy,
   CheckpointRule,
   CheckpointRuleKind,
@@ -41,16 +63,17 @@ export type TypedContractValidationResult =
 
 type UnknownRecord = Record<string, unknown>;
 
-function isRecord(value: unknown): value is UnknownRecord {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 function hasOwn(value: UnknownRecord, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
 function addIssue(issues: TypedContractIssue[], path: string, message: string): void {
   issues.push({ path, message });
+}
+
+/** Push the shared control-plane validation result into the local issue list. */
+function pushShared(issues: TypedContractIssue[], result: { ok: true } | { ok: false; issues: ControlPlaneIssue[] }): void {
+  if (!result.ok) issues.push(...result.issues);
 }
 
 function unknownKeys(value: UnknownRecord, allowed: readonly string[], path: string, issues: TypedContractIssue[]): void {
@@ -132,51 +155,11 @@ function validateCheckpointRule(
   hardHuman: readonly string[],
   allowPendingDecisions = false,
 ): void {
-  if (!isRecord(value)) {
-    addIssue(issues, path, "must be an object");
-    return;
-  }
-  unknownKeys(value, ["kind", "default", "allowed_decisions", "phase", "rationale"], path, issues);
-  requireEnum(value, "kind", CHECKPOINT_KINDS, path, issues);
-  requireEnum(value, "default", ["required_human", "autonomous_allowed"], path, issues);
-  const decisions = stringArray(value.allowed_decisions, `${path}.allowed_decisions`, issues);
-  // Migration-generated rules may legitimately carry no decisions yet;
-  // unresolved consent remains human-required until typed decisions exist.
-  if (decisions && decisions.length === 0 && !allowPendingDecisions) {
-    addIssue(issues, `${path}.allowed_decisions`, "must not be empty for a typed rule");
-  }
-  requireEnum(value, "phase", ["before_dispatch", "before_advance"], path, issues);
-  requireString(value, "rationale", path, issues);
-  if (value.default === "autonomous_allowed" && typeof value.kind === "string" && hardHuman.includes(value.kind)) {
-    addIssue(issues, path, "hard-human rule cannot allow autonomous decisions");
-  }
+  pushShared(issues, validateCheckpointRuleValue(value, path, { allowPendingDecisions, hardHuman }));
 }
 
 function validateCheckpointPolicy(value: unknown, path: string, issues: TypedContractIssue[]): void {
-  if (!isRecord(value)) {
-    addIssue(issues, path, "must be an object");
-    return;
-  }
-  unknownKeys(value, ["default", "scope", "hard_human", "rules", "source", "policy_version", "rationale"], path, issues);
-  requireEnum(value, "default", ["required_human", "autonomous_allowed"], path, issues);
-  requireEnum(value, "scope", ["decision"], path, issues);
-  const hardHuman = stringArray(value.hard_human, `${path}.hard_human`, issues);
-  if (hardHuman) {
-    for (let index = 0; index < hardHuman.length; index += 1) {
-      if (!HARD_HUMAN_KINDS.includes(hardHuman[index]!)) addIssue(issues, `${path}.hard_human[${index}]`, "unknown hard-human class");
-    }
-  }
-  if (!isRecord(value.rules)) {
-    addIssue(issues, `${path}.rules`, "must be an object");
-  } else {
-    for (const [checkpointId, rule] of Object.entries(value.rules)) {
-      if (!nonEmptyString(checkpointId)) addIssue(issues, `${path}.rules`, "checkpoint ids must be non-empty");
-      validateCheckpointRule(rule, `${path}.rules.${checkpointId}`, issues, hardHuman ?? [], value.source === "migration");
-    }
-  }
-  requireEnum(value, "source", ["profile", "user", "migration"], path, issues);
-  requireInteger(value, "policy_version", path, issues, 1);
-  requireString(value, "rationale", path, issues);
+  pushShared(issues, validateCheckpointPolicyValue(value, path));
 }
 
 function validateRosterPolicy(value: unknown, path: string, issues: TypedContractIssue[]): void {
@@ -251,19 +234,7 @@ function validateRosterPolicy(value: unknown, path: string, issues: TypedContrac
 }
 
 function validateWorkIdentity(value: unknown, path: string, issues: TypedContractIssue[]): void {
-  if (!isRecord(value)) {
-    addIssue(issues, path, "must be an object");
-    return;
-  }
-  unknownKeys(value, [
-    "run_id", "wave_id", "slice_id", "session_id", "workflow", "stage_id", "stage_cursor",
-    "capability_id", "capability_epoch", "slot_id", "task_id", "dispatch_id", "attempt", "worker_id",
-  ], path, issues);
-  for (const key of [
-    "run_id", "wave_id", "slice_id", "session_id", "workflow", "stage_id", "stage_cursor",
-    "capability_id", "capability_epoch", "slot_id", "task_id", "dispatch_id", "worker_id",
-  ]) requireString(value, key, path, issues);
-  requireInteger(value, "attempt", path, issues, 1);
+  pushShared(issues, validateWorkIdentityValue(value, path));
 }
 
 function validateRosterSelection(value: unknown, path: string, issues: TypedContractIssue[]): void {
@@ -322,32 +293,7 @@ function validateRosterSelection(value: unknown, path: string, issues: TypedCont
 }
 
 function validatePendingState(value: unknown, path: string, issues: TypedContractIssue[]): void {
-  if (!isRecord(value)) {
-    addIssue(issues, path, "must be an object");
-    return;
-  }
-  unknownKeys(value, ["identity", "status", "pending_reason", "provider_ref", "lease", "terminal_signal", "retry_of", "updated_at"], path, issues);
-  validateWorkIdentity(value.identity, `${path}.identity`, issues);
-  requireEnum(value, "status", ["authorized", "running", "pending", "succeeded", "failed", "cancelled"], path, issues);
-  if (value.pending_reason !== undefined && (typeof value.pending_reason !== "string" || !["provider_running", "awaiting_result", "transport_reconnect"].includes(value.pending_reason))) {
-    addIssue(issues, `${path}.pending_reason`, "unknown pending reason");
-  }
-  if (value.provider_ref !== undefined && !nonEmptyString(value.provider_ref)) addIssue(issues, `${path}.provider_ref`, "must be a non-empty string");
-  if (value.lease !== undefined) {
-    if (!isRecord(value.lease)) addIssue(issues, `${path}.lease`, "must be an object");
-    else {
-      unknownKeys(value.lease, ["token", "observed_at", "revoked_at"], `${path}.lease`, issues);
-      requireString(value.lease, "token", `${path}.lease`, issues);
-      requireString(value.lease, "observed_at", `${path}.lease`, issues);
-      if (!hasOwn(value.lease, "revoked_at") || (value.lease.revoked_at !== null && !nonEmptyString(value.lease.revoked_at))) addIssue(issues, `${path}.lease.revoked_at`, "must be a non-empty string or null");
-    }
-  }
-  if (value.terminal_signal !== undefined && value.terminal_signal !== null && !nonEmptyString(value.terminal_signal)) addIssue(issues, `${path}.terminal_signal`, "must be a non-empty string or null");
-  if (value.retry_of !== undefined && value.retry_of !== null && !nonEmptyString(value.retry_of)) addIssue(issues, `${path}.retry_of`, "must be a non-empty string or null");
-  requireString(value, "updated_at", path, issues);
-  if (value.status === "pending" && value.terminal_signal !== undefined && value.terminal_signal !== null) {
-    addIssue(issues, `${path}.terminal_signal`, "pending work cannot claim a terminal signal");
-  }
+  pushShared(issues, validatePendingStateValue(value, path, "single"));
 }
 
 function validateChildJoin(value: unknown, path: string, issues: TypedContractIssue[]): void {
@@ -410,88 +356,26 @@ function validateCompletionEnvelope(value: unknown, path: string, issues: TypedC
 }
 
 function validateCheckpointAnswerProof(value: unknown, path: string, issues: TypedContractIssue[]): void {
-  if (!isRecord(value)) {
-    addIssue(issues, path, "must be an object");
-    return;
-  }
-  unknownKeys(value, ["answer_id", "nonce", "channel", "reference", "binding"], path, issues);
-  for (const key of ["answer_id", "nonce", "reference", "binding"]) requireString(value, key, path, issues);
-  requireEnum(value, "channel", ["terminal", "escalation"], path, issues);
+  pushShared(issues, validateCheckpointAnswerProofValue(value, path));
 }
+
 function validateTrustedCheckpointAnswer(value: unknown, path: string, issues: TypedContractIssue[]): void {
-  if (!isRecord(value)) {
-    addIssue(issues, path, "must be an object");
-    return;
-  }
-  unknownKeys(value, [
-    "answer_id", "nonce", "channel", "reference", "run_id", "stage_id", "checkpoint_id",
-    "work_identity_hash", "capability_id", "capability_epoch", "policy_hash", "decision",
-    "binding", "issued_at", "consumed_at",
-  ], path, issues);
-  for (const key of [
-    "answer_id", "nonce", "reference", "run_id", "stage_id", "checkpoint_id",
-    "work_identity_hash", "capability_id", "capability_epoch", "policy_hash",
-    "decision", "binding", "issued_at",
-  ]) requireString(value, key, path, issues);
-  requireEnum(value, "channel", ["terminal", "escalation"], path, issues);
-  if (value.consumed_at !== undefined) requireString(value, "consumed_at", path, issues);
+  pushShared(issues, validateTrustedCheckpointAnswerValue(value, path));
 }
 
 function validateCheckpointDecision(value: unknown, path: string, issues: TypedContractIssue[]): void {
-  if (!isRecord(value)) {
-    addIssue(issues, path, "must be an object");
-    return;
-  }
-  unknownKeys(value, [
-    "stage_id", "checkpoint", "mode", "decision", "actor", "rationale", "decided_at",
-    "run_id", "checkpoint_id", "checkpoint_kind", "authorization", "actor_provenance",
-    "capability_id", "capability_epoch", "policy_hash", "work_identity",
-  ], path, issues);
-  for (const key of ["stage_id", "checkpoint", "decision", "actor", "rationale", "decided_at"]) requireString(value, key, path, issues);
-  requireEnum(value, "mode", ["interactive", "autonomous"], path, issues);
-  if (value.checkpoint_kind !== undefined) requireEnum(value, "checkpoint_kind", CHECKPOINT_KINDS, path, issues);
-  if (value.authorization !== undefined) requireEnum(value, "authorization", ["human", "policy_auto"], path, issues);
-  if (value.actor_provenance !== undefined) {
-    if (!isRecord(value.actor_provenance)) addIssue(issues, `${path}.actor_provenance`, "must be an object");
-    else {
-      unknownKeys(value.actor_provenance, ["kind", "ref", "proof"], `${path}.actor_provenance`, issues);
-      requireEnum(value.actor_provenance, "kind", ["user", "orchestrator", "system"], `${path}.actor_provenance`, issues);
-      requireString(value.actor_provenance, "ref", `${path}.actor_provenance`, issues);
-      if (value.actor_provenance.proof !== undefined) {
-        validateCheckpointAnswerProof(value.actor_provenance.proof, `${path}.actor_provenance.proof`, issues);
-      }
-    }
-  }
-  for (const key of ["run_id", "checkpoint_id", "capability_id", "capability_epoch", "policy_hash"]) {
-    if (value[key] !== undefined && !nonEmptyString(value[key])) addIssue(issues, `${path}.${key}`, "must be a non-empty string");
-  }
-  if (value.work_identity !== undefined) validateWorkIdentity(value.work_identity, `${path}.work_identity`, issues);
-  if (value.authorization === "policy_auto" && value.mode === "interactive") addIssue(issues, `${path}.authorization`, "policy_auto cannot use interactive mode");
-  if (value.authorization === "human" && value.mode === "autonomous") addIssue(issues, `${path}.authorization`, "human authorization cannot use autonomous mode");
-}
-function validateTypedCheckpointDecision(value: unknown, path: string, issues: TypedContractIssue[]): void {
-  if (!isRecord(value)) {
-    addIssue(issues, path, "must be an object");
-    return;
-  }
-  unknownKeys(value, [
-    "run_id", "stage_id", "checkpoint_id", "checkpoint_kind", "decision", "authorization",
-    "actor", "capability_id", "capability_epoch", "policy_hash", "rationale", "decided_at",
-  ], path, issues);
-  for (const key of ["run_id", "stage_id", "checkpoint_id", "decision", "capability_id", "capability_epoch", "policy_hash", "rationale", "decided_at"]) {
-    requireString(value, key, path, issues);
-  }
-  requireEnum(value, "checkpoint_kind", CHECKPOINT_KINDS, path, issues);
-  requireEnum(value, "authorization", ["human", "policy_auto"], path, issues);
-  if (!isRecord(value.actor)) addIssue(issues, `${path}.actor`, "must be an object");
-  else {
-    unknownKeys(value.actor, ["kind", "ref", "proof"], `${path}.actor`, issues);
-    requireEnum(value.actor, "kind", ["user", "orchestrator", "system"], `${path}.actor`, issues);
-    requireString(value.actor, "ref", `${path}.actor`, issues);
-    if (value.actor.proof !== undefined) validateCheckpointAnswerProof(value.actor.proof, `${path}.actor.proof`, issues);
-  }
+  pushShared(issues, validateCheckpointDecisionValue(value, path));
 }
 
+function validateTypedCheckpointDecision(value: unknown, path: string, issues: TypedContractIssue[]): void {
+  // Persisted decisions from before the loop-scoped ledger keep their audit
+  // readability (the same allowance the state-field boundary applies):
+  // `loop_iteration` may be absent on such records. They never authorize —
+  // the ledger boundary enforces the full scope on every authorizing read —
+  // but a readable pre-loop state must not be rejected as POLICY_INVALID
+  // merely for missing additive fields.
+  pushShared(issues, validateTypedCheckpointDecisionValue(value, path, { allowLegacyLoopScope: true }));
+}
 
 function validateMigrationReceipt(value: unknown, path: string, issues: TypedContractIssue[]): void {
   if (!isRecord(value)) {
@@ -508,6 +392,30 @@ function validateMigrationReceipt(value: unknown, path: string, issues: TypedCon
   stringArray(value.warnings, `${path}.warnings`, issues);
   requireEnum(value, "status", ["complete", "blocked"], path, issues);
   requireString(value, "migrated_at", path, issues);
+}
+
+/**
+ * The nested dispatch-capability contract, single-sourced in
+ * `control-plane-contract.ts`. Deliberately distinct from the root-state
+ * contract: `pending` is the capability's `PendingState[]` lifecycle log
+ * here, while the root state keeps a single `PendingState` object.
+ */
+function validateDispatchCapabilityFields(value: unknown, path: string, issues: TypedContractIssue[]): void {
+  pushShared(issues, validateDispatchCapabilityValue(value, path));
+}
+
+/**
+ * Standalone validation of a persisted dispatch capability under the
+ * array-aware nested contract. The root-state contract
+ * (`validateTypedControlPlane`) must never be applied to a bare capability:
+ * its `pending` is a legal `PendingState[]` lifecycle log.
+ *
+ * API boundary: intentionally NOT re-exported from the package barrel.
+ */
+export function validateDispatchCapability(value: unknown): TypedContractValidationResult {
+  const issues: TypedContractIssue[] = [];
+  validateDispatchCapabilityFields(value, "$", issues);
+  return issues.length > 0 ? { ok: false, issues } : { ok: true };
 }
 
 /**
@@ -547,30 +455,7 @@ export function validateTypedControlPlane(value: unknown): TypedContractValidati
     else value.checkpoint_decisions.forEach((decision, index) => validateCheckpointDecision(decision, `$.checkpoint_decisions[${index}]`, issues));
   }
   if (hasOwn(value, "dispatch_capability")) {
-    if (!isRecord(value.dispatch_capability)) {
-      addIssue(issues, "$.dispatch_capability", "must be an object");
-    } else {
-      const capability = value.dispatch_capability;
-      if (hasOwn(capability, "roster_selection")) validateRosterSelection(capability.roster_selection, "$.dispatch_capability.roster_selection", issues);
-      if (hasOwn(capability, "work_identity")) validateWorkIdentity(capability.work_identity, "$.dispatch_capability.work_identity", issues);
-      if (hasOwn(capability, "pending")) {
-        if (!Array.isArray(capability.pending)) addIssue(issues, "$.dispatch_capability.pending", "must be an array");
-        else capability.pending.forEach((pending, index) => validatePendingState(pending, `$.dispatch_capability.pending[${index}]`, issues));
-      }
-      if (hasOwn(capability, "dispatches")) {
-        if (!Array.isArray(capability.dispatches)) addIssue(issues, "$.dispatch_capability.dispatches", "must be an array");
-        else capability.dispatches.forEach((record, index) => {
-          const recordPath = `$.dispatch_capability.dispatches[${index}]`;
-          if (!isRecord(record)) {
-            addIssue(issues, recordPath, "must be an object");
-            return;
-          }
-          if (hasOwn(record, "work_identity")) validateWorkIdentity(record.work_identity, `${recordPath}.work_identity`, issues);
-          if (hasOwn(record, "pending")) validatePendingState(record.pending, `${recordPath}.pending`, issues);
-          if (hasOwn(record, "completion_envelope")) validateCompletionEnvelope(record.completion_envelope, `${recordPath}.completion_envelope`, issues);
-        });
-      }
-    }
+    validateDispatchCapabilityFields(value.dispatch_capability, "$.dispatch_capability", issues);
   }
   return issues.length > 0 ? { ok: false, issues } : { ok: true };
 }
@@ -893,7 +778,10 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     ?? profile.stages.map(item => ({ id: item.id, status: "pending" }));
   const capability = state?.dispatch_capability;
   if (capability) {
-    const capabilityValidation = validateTypedControlPlane(capability);
+    // The nested capability contract, never the root-state contract: the
+    // capability's `pending` is a legal `PendingState[]` lifecycle log and
+    // must not be revalidated as the root state's single object.
+    const capabilityValidation = validateDispatchCapability(capability);
     if (!capabilityValidation.ok) throw new WorkflowContractError("POLICY_INVALID", validationMessage("dispatch capability typed contract", capabilityValidation));
   }
 
@@ -905,33 +793,62 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
       ? "profile"
       : "migration";
 
-  const policyCandidate = state?.checkpoint_policy ?? stage.checkpoint_policy ?? profile.checkpoint_policy;
+  // The CURRENT stage/profile declaration is authoritative for exposure: it
+  // is resolved through resolveCheckpointDeclaration, which honors the
+  // persisted mirror only while its binding names THIS stage with the
+  // current profile hash. A prior-stage (or unbound) mirror is stale data
+  // and is never reported as this stage's policy — a prior iteration/epoch
+  // cannot dress up as the current contract.
+  let currentDeclaration: CheckpointDeclaration | null = null;
+  let declarationConflict = false;
+  if (stage.checkpoint) {
+    let resolution: CheckpointDeclarationResolution;
+    if (!state) {
+      const declared = stage.checkpoint_policy ?? profile.checkpoint_policy ?? null;
+      resolution = declared
+        ? { ok: true, declaration: { stage_id: stage.id, checkpoint_id: stage.checkpoint, policy: declared, rule: declared.rules[stage.checkpoint]!, policy_hash: checkpointPolicyHash(declared) } }
+        : { ok: true, declaration: null };
+    } else {
+      resolution = resolveCheckpointDeclaration(stage, profile.checkpoint_policy, state, "authorize");
+    }
+    if (resolution.ok) {
+      currentDeclaration = resolution.declaration;
+    } else if (resolution.code === "policy_conflict") {
+      // Read paths stay audit-readable: an ACTIVE binding that contradicts
+      // the declared policy surfaces the declared policy plus an explicit
+      // warning here. The engine still fails closed (policy_conflict) on
+      // every authorizing use of that state.
+      declarationConflict = true;
+      const declared = stage.checkpoint_policy ?? profile.checkpoint_policy ?? migrationCheckpointPolicy(stage.checkpoint);
+      currentDeclaration = { stage_id: stage.id, checkpoint_id: stage.checkpoint, policy: declared, rule: declared.rules[stage.checkpoint]!, policy_hash: checkpointPolicyHash(declared) };
+    } else {
+      throw new WorkflowContractError("POLICY_INVALID", `${resolution.code}: ${resolution.error}`);
+    }
+  }
+  const policyCandidate = stage.checkpoint
+    ? currentDeclaration?.policy ?? null
+    : stage.checkpoint_policy ?? profile.checkpoint_policy ?? null;
   const checkpoint_policy = policyCandidate ?? (stage.checkpoint ? migrationCheckpointPolicy(stage.checkpoint) : null);
-  const checkpointPolicySource: ControlPlaneFieldSource = state?.checkpoint_policy
-    ? "state"
-    : stage.checkpoint_policy || profile.checkpoint_policy
-      ? "profile"
-      : stage.checkpoint
-        ? "migration"
-        : "none";
+  const checkpointPolicySource: ControlPlaneFieldSource = currentDeclaration
+    ? (state?.checkpoint_policy && currentDeclaration.policy === state.checkpoint_policy ? "state" : "profile")
+    : stage.checkpoint
+      ? "migration"
+      : "none";
   // Classification.autonomous is legacy/model routing input, not a checkpoint
   // permission field. A typed profile/state policy therefore remains valid
   // alongside it; provenance records the legacy input without comparing
   // unrelated semantics or granting autonomous authorization.
   const checkpoint_rule = stage.checkpoint
-    ? checkpoint_policy?.rules[stage.checkpoint] ?? null
+    ? currentDeclaration?.rule ?? checkpoint_policy?.rules[stage.checkpoint] ?? null
     : null;
-  const typedCheckpointDecision = stage.checkpoint
-    ? state?.typed_checkpoint_decisions?.find((decision) =>
-      decision.stage_id === stage.id && decision.checkpoint_id === stage.checkpoint,
-    ) ?? null
+  // Only a VALIDATED CURRENT-SCOPE decision is exposed: same stage, same
+  // checkpoint, bound to the active capability epoch, loop iteration and
+  // policy hash. Records from prior epochs/iterations/stages are audit
+  // history — the typed lookup is stage/checkpoint/epoch-complete, never
+  // stage/checkpoint-only.
+  const checkpoint_decision: CheckpointDecision | TypedCheckpointDecision | null = stage.checkpoint && state
+    ? findCurrentCheckpointDecision(state, stage, currentDeclaration ?? undefined)
     : null;
-  const checkpoint_decision: CheckpointDecision | TypedCheckpointDecision | null = typedCheckpointDecision
-    ?? (stage.checkpoint
-      ? state?.checkpoint_decisions?.find((decision) =>
-        decision.stage_id === stage.id && decision.checkpoint === stage.checkpoint,
-      ) ?? null
-      : null);
   if (stage.checkpoint && !checkpoint_rule) {
     throw new WorkflowContractError("POLICY_INVALID", `checkpoint policy has no rule for '${stage.checkpoint}'`);
   }
@@ -958,31 +875,54 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   const staleSelection = rawSelection !== null && roster_selection === null ? rawSelection : null;
   const capabilityIdentity = capability?.work_identity ?? null;
   const stateIdentity = state?.work_identity ?? null;
+  const capabilityHasSingularIdentity = capability === undefined
+    || capability === null
+    || (capability.kind === "single" && capability.expected_count === 1);
+  if (!capabilityHasSingularIdentity && (stateIdentity || capabilityIdentity)) {
+    throw new WorkflowContractError("MIGRATION_CONFLICT", "non-single capability cannot project one dispatch work_identity");
+  }
   if (stateIdentity && capabilityIdentity && hash(stateIdentity) !== hash(capabilityIdentity)) {
     throw new WorkflowContractError("MIGRATION_CONFLICT", "state work_identity conflicts with capability work_identity");
   }
-  const work_identity = stateIdentity ?? capabilityIdentity;
-  const capabilityPending = capability?.pending ?? [];
-  if (capabilityPending.length > 1 && !state?.pending && !capabilityIdentity) {
+  const work_identity = capabilityHasSingularIdentity ? stateIdentity ?? capabilityIdentity : null;
+  // Root lifecycle fields are singular projections. A consilium keeps every
+  // independent slot lifecycle in capability.pending/dispatches and exposes
+  // no arbitrarily selected root pending or completion envelope.
+  const capabilityPending = (capability?.pending ?? []).filter((candidate) =>
+    candidate.status === "authorized" || candidate.status === "running" || candidate.status === "pending");
+  if (!capabilityHasSingularIdentity && (state?.pending || state?.completion_envelope)) {
+    throw new WorkflowContractError("MIGRATION_CONFLICT", "non-single capability cannot project one dispatch lifecycle onto the root state");
+  }
+  if (capabilityHasSingularIdentity && capabilityPending.length > 1 && !state?.pending && !capabilityIdentity) {
     throw new WorkflowContractError("MIGRATION_CONFLICT", "capability pending lifecycle is ambiguous without work_identity");
   }
-  const pending = state?.pending
-    ?? capabilityPending.find((candidate) => !capabilityIdentity || candidate.identity.dispatch_id === capabilityIdentity.dispatch_id)
-    ?? null;
-  if (capabilityIdentity && capabilityPending.length > 0 && !pending) {
+  const pending = capabilityHasSingularIdentity
+    ? state?.pending
+      ?? capabilityPending.find((candidate) => !capabilityIdentity || candidate.identity.dispatch_id === capabilityIdentity.dispatch_id)
+      ?? null
+    : null;
+  if (capabilityHasSingularIdentity && capabilityIdentity && capabilityPending.length > 0 && !pending) {
     throw new WorkflowContractError("MIGRATION_CONFLICT", "capability pending lifecycle has no matching work_identity");
   }
   const child_join = state?.child_join ?? null;
-  const completion_envelope = state?.completion_envelope ?? null;
+  const completion_envelope = capabilityHasSingularIdentity ? state?.completion_envelope ?? null : null;
   if (pending && completion_envelope && (pending.status === "pending") !== (completion_envelope.outcome === "pending")) {
     throw new WorkflowContractError("MIGRATION_CONFLICT", "pending lifecycle and completion_envelope outcomes conflict");
   }
   const selectionRequired = roster_policy !== null;
   const selectionReady = !selectionRequired || roster_selection !== null;
-  const capabilityStatus = capability?.status;
+  // Dispatch permission requires the STRICT active capability contract: a
+  // partial, shape-valid-but-incomplete or state-mismatched capability is
+  // never advertised as dispatchable — the capability must pass the full
+  // active validation and be strictly bound to the persisted state.
+  const capabilityActive = capability !== undefined && capability !== null
+    && validateActiveDispatchCapabilityValue(capability).ok
+    && validateActiveCapabilityStateBinding(state).ok;
+  const capabilityStatus = capabilityActive ? capability?.status : undefined;
   const dispatchAllowed = state !== null &&
     kind !== null &&
     selectionReady &&
+    capabilityActive &&
     (capabilityStatus === "ready" || capabilityStatus === "dispatched");
   const selectedRoleAgents = roster_selection?.selected.map((entry) => ({ role: entry.slot_id, agent: entry.agent })) ?? [];
   const configuredRoleAgents = slots.map(slot => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
@@ -1001,6 +941,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     !roster_policy && (stage.roles || stage.role) ? "legacy roles/role manifest remains exact and is not adaptive selection" : null,
     !roster_selection && roster_policy ? "adaptive stage awaits a frozen roster_selection before dispatch" : null,
     staleSelection ? `stale roster_selection (stage '${staleSelection.stage_id}', epoch '${staleSelection.capability_epoch}') is masked for the current stage cursor` : null,
+    declarationConflict ? `persisted checkpoint_policy conflicts with the declared policy for stage '${stage.id}'; the declared policy is shown and every authorizing use fails closed until workflow_begin re-projects the mirror` : null,
   ].filter((warning): warning is string => warning !== null);
   const control_plane = controlPlaneProvenance(
     intentSource,

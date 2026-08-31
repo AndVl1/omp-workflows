@@ -22,13 +22,20 @@ Agent (diagnostics):
 
 **Root-cause gate (`root_cause_documented`) — MANDATORY before implementation:**
 
+The gate enforces ONE explicit diagnosis contract, identical to
+`workflows/artifacts-schema.json` (both fields are schema-required):
+
 - Write `diagnosis.root_cause` to `.work-state/artifacts/diagnosis.json`: **what** the root
-  cause is and **why** the proposed fix closes it rather than masking the symptom.
+  cause is.
+- Write `diagnosis.explanation` to the same artifact: **why** the proposed fix closes that
+  cause rather than masking the symptom.
+- Both must be non-empty; the gate rejects the advance with the exact offending field
+  (`diagnosis.root_cause is empty` / `diagnosis.explanation is empty`).
 - Do at least **2 iterations** of repro/log evidence before proposing the fix.
 - This directly answers the "опять мимо" (fix-the-symptom) failure mode. The workflow's
   root-cause gate blocks implementation until the evidence is recorded.
 
-**Produces**: `diagnosis` (root_cause, evidence, proposed_fix, verification_checklist) and
-`dod` (the Definition of Done — for a bug, minimum items: root cause named; repro-before
-reproduces; repro-after does not; affected scenario checked in manual-qa). See
-`workflows/artifacts-schema.json`.
+**Produces**: `diagnosis` (root_cause, explanation, evidence, proposed_fix,
+verification_checklist) and `dod` (the Definition of Done — for a bug, minimum items:
+root cause named; repro-before reproduces; repro-after does not; affected scenario
+checked in manual-qa). See `workflows/artifacts-schema.json`.

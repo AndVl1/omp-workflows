@@ -10,7 +10,7 @@
  * Storage strategy:
  *   - events.jsonl: line-delimited JSON, one event per line, append-only
  *   - rollup: in-memory only here; persisted via TeamState.observability
- *     by the engine's `writeState`. The recorder is the producer, the engine
+ *     by the engine state commit. The recorder is the producer, the engine
  *     is the persister.
  *
  * Concurrency: appendFileSync is atomic for small writes (< PIPE_BUF on
@@ -723,7 +723,7 @@ export function readObservabilityPointer(
   };
 }
 
-/** Write the pointer inside the feature's `state.json` (called by `writeState`). */
+/** Write the pointer inside the feature's `state.json` during state commit. */
 export function writePointerSync(
   cwd: string,
   featureSlug: string,

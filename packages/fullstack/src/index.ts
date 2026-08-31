@@ -253,11 +253,18 @@ const subagentTreeRef: { current: SubagentTreeController | null } = { current: n
 const dispatcherStopsByCwd = new Map<string, () => void>();
 
 /**
- * Task subagents run with `hasUI: false` and load the same extension. Only the
- * interactive main session may own the product messenger dispatcher; otherwise
- * every lead/worker creates another getUpdates consumer with its own offset.
- * Unknown contexts are treated as main for compatibility with older OMP/test
- * runtimes that did not expose `hasUI` on session_start.
+ * Session-level main-session classification for fullstack-owned event
+ * surfaces (session_start/session_shutdown, the messenger dispatcher,
+ * widget binding). The installed host derives these event contexts from the
+ * extension runner's UI context, so trusted RPC main sessions report
+ * hasUI=true here even though `--mode rpc` deliberately leaves TOOL-call
+ * contexts UI-less — per-call tool eligibility is decided by core's
+ * captured session profile, not by this helper. Task subagents run with
+ * `hasUI: false` and load the same extension; only the interactive main
+ * session may own the product messenger dispatcher, otherwise every
+ * lead/worker creates another getUpdates consumer with its own offset.
+ * Unknown contexts are treated as main for compatibility with older
+ * OMP/test runtimes that did not expose `hasUI` on session_start.
  */
 export function isMainSessionContext(ctx: unknown): boolean {
 	if (!ctx || typeof ctx !== "object") return true;
