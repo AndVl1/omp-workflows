@@ -6,7 +6,7 @@
  *   1. The event log captures every kind.
  *   2. The rollup reflects subagent spawns (toolName="task" → subagent).
  *   3. Skills are extracted from before_agent_start systemPrompt.
- *   4. The `writeState` engine call picks up the pointer and embeds it in
+ *   4. The bootstrap fixture writer picks up the pointer and embeds it in
  *      `TeamState.observability` for lightweight status consumers.
  *
  * Tests use `flushRecorder(cwd)` to drain the in-memory write queue
@@ -15,10 +15,11 @@
  *
  * Test isolation note: the recorder resolves the active feature slug from
  * `.work-state/.active-feature`. The test setup writes that pointer so
- * `writeState` (which derives the feature from the branch in the state)
- * and the recorder agree on the same directory. Without the pin, the
- * recorder would write to `features/default/...` while `writeState` reads
- * from `features/<branch-slug>/...` and the pointer would be missing.
+ * `writeStateBootstrap` (which derives the feature from the branch in the
+ * state) and the recorder agree on the same directory. Without the pin,
+ * the recorder would write to `features/default/...` while the fixture
+ * writer reads from `features/<branch-slug>/...` and the pointer would be
+ * missing.
  */
 
 import { test } from "node:test";
@@ -35,7 +36,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { observabilityHooks, flushRecorder } from "../../src/observability/hooks.js";
-import { writeState } from "../../src/engine/state.js";
+import { writeStateBootstrap } from "../../src/engine/state.js";
 import type { TeamState } from "../../src/engine/types.js";
 
 function withTempDir(): { cwd: string; cleanup: () => void } {
@@ -116,9 +117,9 @@ test("integration: full lifecycle — 3 agents, 1 subagent, 2 skills, 1 error", 
     // Drain the queue deterministically — no setTimeout, no real wait.
     await flushRecorder(cwd);
 
-    // 5. writeState — should pick up the pointer
+    // 5. Bootstrap fixture write — should pick up the pointer
     const state = makeInitialState("main");
-    const { statePath } = writeState(cwd, state);
+    const { statePath } = writeStateBootstrap(cwd, state);
     const onDisk = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
     assert.ok(onDisk.observability, "TeamState.observability is populated");
     const obs = onDisk.observability!;
@@ -151,12 +152,12 @@ test("integration: writes the jsonl log under .work-state/features/default/obser
   }
 });
 
-test("integration: writeState without an event log still produces valid state", () => {
+test("integration: bootstrap fixture write without an event log still produces valid state", () => {
   const { cwd, cleanup } = withTempDir();
   try {
-    // No hooks fired. writeState must still succeed; observability is omitted.
+    // No hooks fired. The fixture write must still succeed; observability is omitted.
     const state = makeInitialState("featureless");
-    const { statePath } = writeState(cwd, state);
+    const { statePath } = writeStateBootstrap(cwd, state);
     const onDisk = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
     assert.equal(onDisk.observability, undefined);
   } finally {
@@ -196,7 +197,7 @@ test("integration: subagent task tool with batch input captures the first agent 
     await flushRecorder(cwd);
 
     const state = makeInitialState("main");
-    const { statePath } = writeState(cwd, state);
+    const { statePath } = writeStateBootstrap(cwd, state);
     const onDisk = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
     const obs = onDisk.observability!;
     // Only the first agent in the batch is attributed to the rollup;

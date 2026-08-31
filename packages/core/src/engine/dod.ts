@@ -37,6 +37,7 @@ import {
   type Stats,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { readArtifact } from "./artifacts.js";
 import type { DoD, DoDItem } from "./types.js";
 
 /** Canonical DoD file name inside an artifacts directory. */
@@ -399,20 +400,28 @@ function mergeContribution(
 }
 
 /**
- * For BUG_FIX: gate BEFORE first code edit. The root_cause must be a non-empty
- * string in the diagnosis artifact and explain WHY the fix closes the cause.
+ * For BUG_FIX: gate BEFORE first code edit. The explicit diagnosis contract
+ * (shared with `workflows/artifacts-schema.json` and the diagnose-stage
+ * instructions) requires a non-empty `root_cause` (WHAT the cause is) AND a
+ * non-empty `explanation` (WHY the proposed fix closes it rather than
+ * masking the symptom). Read through the canonical artifact primitive:
+ * missing, unsafe or unparseable files fail closed with a reason instead of
+ * throwing through the advance boundary.
  */
 export function isRootCauseDocumented(
   artifactsDir: string,
 ): { ok: true; diagnosis: { root_cause: string; explanation: string } } | { ok: false; reason: string } {
-  const path = join(artifactsDir, "diagnosis.json");
-  if (!existsSync(path)) return { ok: false, reason: "diagnosis.json missing" };
-  const diagnosis = JSON.parse(readFileSync(path, "utf8")) as { root_cause?: string; explanation?: string };
-  if (!diagnosis.root_cause || !diagnosis.root_cause.trim()) {
+  const diagnosis = readArtifact<Record<string, unknown>>(artifactsDir, "diagnosis");
+  if (diagnosis === null || typeof diagnosis !== "object" || Array.isArray(diagnosis)) {
+    return { ok: false, reason: "diagnosis.json missing or invalid" };
+  }
+  const rootCause = diagnosis.root_cause;
+  if (typeof rootCause !== "string" || !rootCause.trim()) {
     return { ok: false, reason: "diagnosis.root_cause is empty" };
   }
-  if (!diagnosis.explanation || !diagnosis.explanation.trim()) {
+  const explanation = diagnosis.explanation;
+  if (typeof explanation !== "string" || !explanation.trim()) {
     return { ok: false, reason: "diagnosis.explanation is empty (why does this fix close the root cause?)" };
   }
-  return { ok: true, diagnosis: { root_cause: diagnosis.root_cause, explanation: diagnosis.explanation } };
+  return { ok: true, diagnosis: { root_cause: rootCause, explanation } };
 }

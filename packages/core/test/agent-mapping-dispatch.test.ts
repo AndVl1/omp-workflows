@@ -21,7 +21,7 @@ function initGit(root: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
 }
 
-function writeState(root: string, capability: NonNullable<TeamState["dispatch_capability"]>, profileHashValue: string): void {
+function writeStateFixture(root: string, capability: NonNullable<TeamState["dispatch_capability"]>, profileHashValue: string): void {
   const profile = loadProfile("feature-regression");
   assert.ok(profile);
   writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
@@ -76,7 +76,7 @@ test("beginCapability reissues an undispatched capability after mapping refresh"
       expected_roster: [{ role: "regression-planner", agent: "regression-planner" }],
     });
     publishMapping(root, ["analyst"]);
-    writeState(root, stale.state, persistedHash);
+    writeStateFixture(root, stale.state, persistedHash);
 
     const begun = beginCapability(root);
     assert.equal(begun.ok, true);
@@ -96,7 +96,7 @@ test("beginCapability fails closed when no eligible or generic agent exists", ()
     assert.ok(profile);
     const persistedHash = profileHash(profile);
     publishMapping(root, ["scout"]);
-    writeState(root, createCapability({
+    writeStateFixture(root, createCapability({
       run_key: "main",
       branch: "main",
       workflow: "feature-regression",

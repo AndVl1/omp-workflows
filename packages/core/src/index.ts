@@ -31,10 +31,11 @@ import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { outboxEnforcementGate } from "./gates/outbox.js";
 import { ctoSliceTaskGate } from "./cto/slice-gate.js";
 import { registerObservabilityHooks, recordToolCallAttempt } from "./observability/index.js";
-import { authorizeDispatchTrusted, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, recordCheckpointDecision } from "./engine/durable.js";
-import { registerWorkflowProfiles } from "./engine/profile.js";
+import { authorizeDispatchTrusted, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, recordCheckpointDecision, validateCheckpointAsk, commitCheckpointAnswer, hashDispatchSecret } from "./engine/durable.js";
+import { loadProfile, registerWorkflowProfiles } from "./engine/profile.js";
 import { prepareWorkflowState, type ModelClassification, type WorkflowPrepareOptions } from "./engine/run.js";
-import { resolveState } from "./engine/state.js";
+import { resolveActiveBranch, resolveState } from "./engine/state.js";
+import { findCurrentCheckpointDecision } from "./engine/checkpoints.js";
 import { resolveWorkflowContract } from "./engine/workflow-contract.js";
 import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
 import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof } from "./engine/types.js";
@@ -238,6 +239,16 @@ export interface WorkflowToolAdapterOptions {
   cwd?: string;
   resolveCwd?: (ctx: unknown) => string | undefined;
   owner?: WorkflowOwnerSource;
+  /**
+   * Legacy per-call main-session classifier, consulted only when no
+   * session_start host profile was captured (older OMP runtimes and direct
+   * tool harnesses). With a captured profile, session ownership is decided
+   * authoritatively from the host mode: trusted interactive sessions
+   * (terminal TUI or connected RPC client) own the workflow tools; print,
+   * json and Task subagent sessions never do. Per-call tool contexts
+   * cannot make this decision — plain-rpc main sessions deliberately
+   * report hasUI=false on them.
+   */
   isMainSession?: (ctx: unknown) => boolean;
   /**
    * Optional trusted live agent-mapping handoff, invoked fresh for EVERY
@@ -462,9 +473,49 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
   });
   registerObservabilityHooks(pi, { enabled: opts.observability, toolCall: false });
 }
+/**
+ * Legacy per-call main-session heuristic. Consulted ONLY when no
+ * session_start host profile was captured (older OMP runtimes without a
+ * session context, and direct tool harnesses). Installed OMP deliberately
+ * leaves tool-call contexts without a mode or UI in plain rpc mode
+ * (main.ts passes no setToolUIContext for `--mode rpc`), so a per-call
+ * `hasUI=false` cannot distinguish a main RPC session from a Task subagent
+ * — authoritative session ownership comes from the captured profile.
+ */
 function defaultMainSession(ctx: unknown): boolean {
   if (!ctx || typeof ctx !== "object" || !("hasUI" in ctx)) return true;
   return (ctx as { hasUI?: unknown }).hasUI !== false;
+}
+
+/**
+ * Host-authored UI surface used for trusted checkpoint prompting. Only
+ * objects the host itself attached to a context qualify (the tool-call
+ * `ui` or the session_start profile `ui`); nothing model-supplied is ever
+ * consulted.
+ */
+interface HostAskSurface {
+  askDialog?(questions: Array<{ id: string; question: string; header?: string; options: Array<{ label: string }>; multi?: boolean }>, dialogOptions?: { signal?: AbortSignal }): Promise<{
+    kind: "submit";
+    results: Array<Record<string, unknown>>;
+  } | { kind: "chat" } | undefined>;
+  select?(title: string, options: string[], dialogOptions?: { helpText?: string; signal?: AbortSignal }): Promise<string | undefined>;
+}
+
+/**
+ * Authoritative host session identity captured from the session_start event
+ * context. The installed host emits session_start only after the extension
+ * runner is initialized with the runtime mode (`ExtensionMode` = "tui" |
+ * "rpc" | "json" | "print") and the mode's UI context, so this profile is
+ * the authoritative host mode: interactive TUI sessions report mode "tui"
+ * with a live dialog UI, `--mode rpc`/`--mode rpc-ui` sessions report mode
+ * "rpc" with the connected RPC client's UI (live select bridge, no
+ * askDialog), while print/json runs and Task subagent sessions report mode
+ * "print" with no UI.
+ */
+interface HostSessionProfile {
+  mode: string;
+  hasUI: boolean;
+  ui: unknown;
 }
 
 type WorkflowToolResult = { content: [{ type: "text"; text: string }]; details: unknown };
@@ -522,12 +573,43 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   const { z } = pi.zod;
   const emptyParameters = z.object({}) as never;
   const resolveCwd = options.resolveCwd ?? resolveCwdFromContext;
+  // Authoritative host session profile, captured once per session: the host
+  // fires session_start only after the runner is initialized with the
+  // runtime mode and the mode's UI context, so the handler observes the
+  // final values.
+  let hostSession: HostSessionProfile | null = null;
+  if (typeof (pi as { on?: unknown }).on === "function") {
+    pi.on("session_start", (_event: unknown, ctx: unknown) => {
+      const c = ctx as { mode?: unknown; hasUI?: unknown; ui?: unknown } | undefined;
+      hostSession = {
+        mode: typeof c?.mode === "string" ? c.mode : "print",
+        hasUI: c?.hasUI === true,
+        ui: c?.ui,
+      };
+    });
+  }
+  /**
+   * The captured profile, but only when it names a trusted interactive
+   * surface: a terminal TUI or a connected RPC client with a UI. json/print
+   * headless runs and Task subagent/worker sessions (mode "print", no UI)
+   * never qualify.
+   */
+  const trustedInteractiveProfile = (): HostSessionProfile | null =>
+    hostSession !== null && hostSession.hasUI && (hostSession.mode === "tui" || hostSession.mode === "rpc") ? hostSession : null;
   const contextError = (ctx: unknown): WorkflowToolResult | null => {
-    if ((options.isMainSession ?? defaultMainSession)(ctx) === false) {
+    // Session ownership: the captured host profile is authoritative. The
+    // per-call context cannot make this call — a plain-rpc main session and
+    // a Task subagent report identical tool contexts (hasUI=false, no ui).
+    // The bundle callback (or the legacy per-call heuristic) decides only
+    // when no session_start profile was captured.
+    const ownsTools = hostSession !== null
+      ? trustedInteractiveProfile() !== null
+      : (options.isMainSession ?? defaultMainSession)(ctx);
+    if (!ownsTools) {
       return toolResult({
         ok: false,
         code: "WORKFLOW_CONTEXT_REJECTED",
-        error: "workflow control tools are available only in the main session",
+        error: "workflow control tools are available only in the interactive main session (terminal TUI or connected RPC client)",
       });
     }
     const cwd = options.cwd ?? resolveCwd(ctx);
@@ -672,7 +754,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_complete",
     label: "Complete workflow dispatch",
-    description: "Record durable completion for an authorized workflow dispatch. Copy the compact profile_hash fingerprint exactly from the current workflow handoff; do not abbreviate or reconstruct it.",
+    description: "Record durable completion for an authorized workflow dispatch. Copy the compact profile_hash fingerprint and the handoff loop_iteration exactly from the current workflow handoff; do not abbreviate or reconstruct either.",
     parameters: z.object({
       dispatch_id: z.string().min(1),
       token: z.string().min(1),
@@ -683,6 +765,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       profile_hash: z.string().min(1),
       stage_cursor: z.string().min(1),
       cursor_epoch: z.string().min(1),
+      loop_iteration: z.number().int().min(1),
       evidence: z.string().min(1),
       artifact_ids: z.array(z.string().min(1)).default(() => []),
       outcome: z.enum(["succeeded", "failed", "cancelled"]).default("succeeded"),
@@ -706,7 +789,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_checkpoint",
     label: "Record checkpoint decision",
-    description: "Persist a typed, policy-bound decision envelope for a declared stage checkpoint. Human authorization requires a durable terminal/escalation answer proof; legacy mode/actor fields never authorize a transition.",
+    description: "Persist a typed, policy-bound decision envelope for a declared stage checkpoint. Human authorization requires a durable terminal/escalation answer proof from workflow_checkpoint_ask: copy the returned proof, decision, checkpoint_kind, and loop_iteration binding verbatim — any reconstructed or abbreviated value rejects. Legacy mode/actor fields never authorize a transition.",
     parameters: z.object({
       token: z.string().min(1),
       capability_id: z.string().min(1),
@@ -719,6 +802,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       checkpoint: z.string().min(1),
       checkpoint_id: z.string().min(1),
       checkpoint_kind: z.string().min(1),
+      loop_iteration: z.number().int().min(1),
       authorization: z.enum(["human", "policy_auto"]),
       actor_provenance: z.object({
         kind: z.enum(["user", "orchestrator", "system"]),
@@ -761,9 +845,256 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
     },
   });
   pi.registerTool({
+    name: "workflow_checkpoint_ask",
+    label: "Ask human to authorize checkpoint",
+    description: "Trusted terminal ingest for the current stage checkpoint: validates the active capability and the unresolved checkpoint, asks the human at the live UI surface (terminal dialog or connected RPC client), and commits the answer through the engine's durable checkpoint ledger in one cross-process transaction (fresh-state revalidation, live-proof supersession, and the CAS commit are engine-owned). Returns the proof plus actor_provenance for the follow-up workflow_checkpoint call — copy the returned proof, decision, checkpoint_kind, and loop_iteration verbatim; never reconstruct them. The human's selection is the only source of the recorded decision — never guess or fabricate it. Fails closed without an interactive UI surface; Esc, timeout, and custom free-text answers record nothing; cancellation and any state/capability/policy transition while the dialog is open reject without persisting.",
+    parameters: z.object({
+      token: z.string().min(1),
+      capability_id: z.string().min(1),
+      run_key: z.string().min(1),
+      branch: z.string().min(1),
+      workflow: z.string().min(1),
+      stage_cursor: z.string().min(1),
+      cursor_epoch: z.string().min(1),
+      checkpoint: z.string().min(1),
+      checkpoint_id: z.string().min(1),
+      checkpoint_kind: z.string().min(1),
+      loop_iteration: z.number().int().min(1),
+      question: z.string().min(1).max(2000).optional(),
+    }).strict() as never,
+    async execute(_id, params, signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      const cwd = currentCwd(ctx);
+      if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      const input = params as {
+        token: string;
+        capability_id: string;
+        run_key: string;
+        branch: string;
+        workflow: string;
+        stage_cursor: string;
+        cursor_epoch: string;
+        checkpoint: string;
+        checkpoint_id: string;
+        checkpoint_kind: string;
+        loop_iteration: number;
+        question?: string;
+      };
+      const abortedResult = () => toolResult({
+        ok: false,
+        code: "WORKFLOW_CHECKPOINT_ASK_ABORTED",
+        error: "workflow_checkpoint_ask was canceled; no human answer is minted and nothing was recorded",
+      });
+      try {
+        if (signal?.aborted) return abortedResult();
+        // Read-only preflight before any human prompt: the dialog is never
+        // presented for an unauthenticated, stale, malformed, or
+        // already-resolved request. The same validation runs again on the
+        // freshly persisted state after the dialog resolves.
+        const preflight = validateCheckpointAsk(cwd, input);
+        if (!preflight.ok) return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_REJECTED", error: preflight.error });
+        const { stage, rule, allowed } = preflight.context;
+        const existing = findCurrentCheckpointDecision(preflight.context.state, stage);
+        if (existing) {
+          return toolResult({
+            ok: true,
+            transition: "checkpoint_answer",
+            checkpoint: input.checkpoint,
+            decision: existing.decision,
+            already_recorded: true,
+            next: "decision already recorded; resume with workflow_advance using the current handoff",
+            state: workflowStateSummary(cwd, options.mappingSummary),
+          });
+        }
+        // Privileged ingest boundary: the answer may come only from a real
+        // host UI surface — never from anything model-supplied. The
+        // installed host wires the prompt capability through two
+        // host-authored carriers: the per-call tool context (wired with
+        // hasUI=true by the interactive TUI and by `--mode rpc-ui`) and the
+        // session_start host profile (`--mode rpc` deliberately leaves the
+        // tool-call context UI-less while the session context carries the
+        // connected RPC client's live select bridge). Trusted interactive
+        // session ownership is re-checked here, so json/print/headless
+        // contexts and Task subagent/worker sessions fail closed before any
+        // dialog is raised.
+        const toolCtx = ctx as unknown as { hasUI?: boolean; ui?: HostAskSurface };
+        const toolSurface = toolCtx.hasUI === true && toolCtx.ui ? toolCtx.ui : undefined;
+        const profileSurface = trustedInteractiveProfile();
+        const surface: HostAskSurface | undefined = toolSurface ?? (profileSurface?.ui as HostAskSurface | undefined);
+        const askDialog = typeof surface?.askDialog === "function" ? surface.askDialog.bind(surface) : null;
+        const select = typeof surface?.select === "function" ? surface.select.bind(surface) : null;
+        if (!askDialog && !select) {
+          return toolResult({
+            ok: false,
+            code: "WORKFLOW_CHECKPOINT_ASK_UNAVAILABLE",
+            error: `checkpoint '${input.checkpoint}' requires an interactive terminal answer and no UI surface is available in this session; rerun in an interactive session (escalation channels expose no workflow-checkpoint ingest)`,
+          });
+        }
+        const dialogQuestion = [
+          `Human authorization required — checkpoint '${input.checkpoint}' (${rule.kind}) at stage '${stage.id}' of workflow '${input.workflow}'.`,
+          ...(input.question ? [`Orchestrator context: ${input.question}`] : []),
+          "Select exactly one policy-allowed decision. Esc, timeout, or a custom answer records nothing.",
+        ].join("\n");
+        const questionId = `checkpoint:${input.checkpoint}`;
+        const declined = (error: string) => toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_DECLINED", error });
+        let selected: string | undefined;
+        try {
+          if (askDialog) {
+            const result = await askDialog(
+              [{
+                id: questionId,
+                question: dialogQuestion,
+                header: `${input.workflow}/${stage.id}`,
+                options: allowed.map((label) => ({ label })),
+                multi: false,
+              }],
+              { signal },
+            );
+            if (signal?.aborted) return abortedResult();
+            if (!result) return declined("no human answer was recorded (dialog declined); the checkpoint remains unresolved");
+            if (result.kind !== "submit") {
+              return declined("the dialog redirected to chat; a chat redirect never authorizes a policy-bound checkpoint");
+            }
+            // Strict installed-host result contract: exactly one answer item
+            // echoing the exact question asked (id, text, options), strict
+            // single-select, exactly one string selection, no timeout, no
+            // custom text, and no metadata outside the installed host's
+            // declared ExtensionAskDialogResultItem fields. Anything else is
+            // a malformed host result and records nothing.
+            const results = Array.isArray(result.results) ? result.results : [];
+            if (results.length !== 1) {
+              return declined(`malformed ask result: expected exactly one answer item, received ${results.length}`);
+            }
+            const item = results[0];
+            if (!item || typeof item !== "object" || Array.isArray(item)) {
+              return declined("malformed ask result: the answer item is not an object");
+            }
+            const knownKeys: Record<string, true> = { id: true, question: true, options: true, multi: true, selectedOptions: true, customInput: true, note: true, timedOut: true };
+            const unknownKeys = Object.keys(item).filter((key) => knownKeys[key] !== true);
+            if (unknownKeys.length > 0) {
+              return declined(`malformed ask result: unknown answer metadata (${unknownKeys.join(", ")})`);
+            }
+            if (typeof item.id !== "string" || item.id !== questionId) {
+              return declined("malformed ask result: the answer does not identify the checkpoint question");
+            }
+            if (typeof item.question !== "string" || item.question !== dialogQuestion) {
+              return declined("malformed ask result: the answer does not echo the checkpoint question");
+            }
+            if (!Array.isArray(item.options) || item.options.length !== allowed.length || item.options.some((option, index) => typeof option !== "string" || option !== allowed[index])) {
+              return declined("malformed ask result: the answer does not echo the policy-allowed options");
+            }
+            if (item.multi !== false) {
+              return declined("malformed ask result: the checkpoint question is single-select");
+            }
+            if (item.timedOut !== undefined && typeof item.timedOut !== "boolean") {
+              return declined("malformed ask result: the timedOut flag must be a boolean");
+            }
+            if (item.timedOut === true) {
+              return declined("the ask dialog timed out; timeout auto-selection is never recorded as human authorization");
+            }
+            if (item.customInput !== undefined && typeof item.customInput !== "string") {
+              return declined("malformed ask result: the custom input must be a string");
+            }
+            if (typeof item.customInput === "string" && item.customInput.trim().length > 0) {
+              return declined("custom free-text answers cannot authorize a policy-bound checkpoint; call workflow_checkpoint_ask again to select one of the allowed decisions");
+            }
+            if (item.note !== undefined && typeof item.note !== "string") {
+              return declined("malformed ask result: the answer note must be a string");
+            }
+            const selections = item.selectedOptions;
+            if (!Array.isArray(selections) || selections.length !== 1 || typeof selections[0] !== "string") {
+              return declined(`expected exactly one string selected policy-allowed decision, received ${Array.isArray(selections) ? String(selections.length) : "a non-array selection"}`);
+            }
+            selected = selections[0];
+          } else if (select) {
+            selected = await select(`Authorize checkpoint '${input.checkpoint}' (${rule.kind}) — stage '${stage.id}'`, allowed, { helpText: dialogQuestion, signal });
+            if (signal?.aborted) return abortedResult();
+          }
+        } catch (dialogError) {
+          if (signal?.aborted) return abortedResult();
+          throw dialogError;
+        }
+        if (selected !== undefined && !allowed.includes(selected)) {
+          return declined("the selected label is not a policy-allowed decision; nothing was recorded");
+        }
+        if (!selected) {
+          return declined("no human answer was recorded (dialog declined); the checkpoint remains unresolved");
+        }
+        // Last cancellation gate before the durable commit: the engine commit
+        // below is fully synchronous (no await between the gate and the
+        // ledger write), so a canceled call can never reach the ledger past
+        // this point.
+        if (signal?.aborted) return abortedResult();
+        // One engine-owned durable commit: commitCheckpointAnswer re-runs the
+        // full state<->capability<->profile<->policy validation against the
+        // freshly persisted state inside a cross-process lock+CAS
+        // transaction, resolves the recorded/live-answer races
+        // (already_finalized / conflict / exact live reuse), and either
+        // supersedes every stale live proof and mints one engine-UUID answer
+        // or reuses the exact live proof — always in the same commit.
+        const committed = commitCheckpointAnswer(cwd, {
+          token: input.token,
+          capability_id: input.capability_id,
+          run_key: input.run_key,
+          branch: input.branch,
+          workflow: input.workflow,
+          stage_cursor: input.stage_cursor,
+          cursor_epoch: input.cursor_epoch,
+          checkpoint: input.checkpoint,
+          checkpoint_id: input.checkpoint_id,
+          checkpoint_kind: input.checkpoint_kind,
+          loop_iteration: input.loop_iteration,
+          decision: selected,
+        });
+        if (!committed.ok) {
+          // Honest engine mapping: a conflict already carries the
+          // dialog-aware text; a policy drift keeps its dedicated message;
+          // every other post-dialog failure means the workflow world moved
+          // while the dialog was open.
+          const detail = committed.code === "policy_conflict"
+            ? `checkpoint policy drifted between the workflow state and the declaring profile (${committed.error})`
+            : committed.error;
+          const error = committed.kind === "conflict"
+            ? detail
+            : `workflow state changed while the dialog was open: ${detail}`;
+          return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_REJECTED", error });
+        }
+        if (committed.outcome === "already_finalized") {
+          return toolResult({
+            ok: true,
+            transition: "checkpoint_answer",
+            checkpoint: input.checkpoint,
+            decision: committed.decision,
+            already_recorded: true,
+            next: "decision already recorded; resume with workflow_advance using the current handoff",
+            state: workflowStateSummary(cwd, options.mappingSummary),
+          });
+        }
+        if (!committed.answer || !committed.proof) {
+          return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_FAILED", error: "checkpoint ledger committed without a durable answer identity" });
+        }
+        return toolResult({
+          ok: true,
+          transition: "checkpoint_answer",
+          checkpoint: input.checkpoint,
+          checkpoint_kind: committed.checkpoint_kind,
+          decision: committed.decision,
+          channel: "terminal",
+          loop_iteration: input.loop_iteration,
+          actor_provenance: { kind: "user", ref: committed.answer.reference, proof: committed.proof },
+          next: "call workflow_checkpoint now with authorization='human', this exact actor_provenance and decision, checkpoint_kind, rationale, loop_iteration, and the handoff identity fields — copy each returned value verbatim",
+          state: workflowStateSummary(cwd, options.mappingSummary),
+        });
+      } catch (error) {
+        return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_FAILED", error: String(error) });
+      }
+    },
+  });
+  pi.registerTool({
     name: "workflow_advance",
     label: "Advance workflow",
-    description: "Join the current stage and advance its durable cursor after all dispatches complete.",
+    description: "Join the current stage and advance its durable cursor after all dispatches complete. Pass the handoff binding including loop_iteration verbatim; a binding replayed from a prior loop iteration rejects.",
     parameters: z.object({
       token: z.string().min(1),
       capability_id: z.string().min(1),
@@ -773,6 +1104,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       profile_hash: z.string().min(1),
       stage_cursor: z.string().min(1),
       cursor_epoch: z.string().min(1),
+      loop_iteration: z.number().int().min(1),
       evidence: z.string().min(1),
     }) as never,
     async execute(_id, params, _signal, _update, ctx) {
@@ -838,6 +1170,7 @@ export {
   type CapabilityHandoff,
   type TransitionResult,
   type TrustedMappingOptions,
+  type IssuedCapability,
 } from "./engine/durable.js";
 export {
   parseExpression,
@@ -867,8 +1200,8 @@ export {
   type JsonSchemaDef,
 } from "./engine/artifact-contract.js";
 export {
-  findCheckpointDecision,
-  hasCheckpointDecision,
+  findCurrentCheckpointDecision,
+  findHistoricalCheckpointDecision,
   appendCheckpointDecision,
   unresolvedCheckpointError,
 } from "./engine/checkpoints.js";
@@ -965,7 +1298,7 @@ export {
   type ScopeResolutionOptions,
 } from "./engine/scope.js";
 export {
-  writeState,
+  updateStateAtomically,
   setStageStatus,
   setPause,
   checkMonotonic,
@@ -973,6 +1306,10 @@ export {
   resolveCanonicalRun,
   type ResolvedActiveRun,
   type StateSelector,
+  type StateSnapshot,
+  type StateMutation,
+  type StateUpdateResult,
+  type StateTxErrorCode,
   reopenFromFeedback,
 } from "./engine/state.js";
 export {

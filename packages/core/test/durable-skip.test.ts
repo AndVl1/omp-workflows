@@ -38,7 +38,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
 import { createCapability, authorizeDispatch, completeDispatch, advanceCursor, type CapabilityHandoff } from "../src/engine/durable.js";
-import { writeState, checkMonotonic } from "../src/engine/state.js";
+import { writeStateBootstrap, checkMonotonic } from "../src/engine/state.js";
 import { buildDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
 import { run } from "../src/engine/run.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
@@ -69,7 +69,7 @@ function setup(
     run_key: branch, branch, workflow: profile.name, profile_hash: persistedHash,
     stage_cursor: currentStageId, kind, expected_roster: roster,
   });
-  writeState(root, {
+  writeStateBootstrap(root, {
     schema: 1,
     branch,
     run_key: branch,
@@ -110,6 +110,7 @@ function advanceAuth(issued: ReturnType<typeof createCapability>) {
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: issued.state.issued_for!.loop_iteration,
   };
 }
 
@@ -123,6 +124,7 @@ function dispatchAuth(handoff: CapabilityHandoff) {
     profile_hash: handoff.profile_hash,
     stage_cursor: handoff.stage_cursor,
     cursor_epoch: handoff.cursor_epoch,
+    loop_iteration: handoff.loop_iteration,
   };
 }
 

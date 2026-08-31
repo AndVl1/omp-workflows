@@ -30,7 +30,8 @@ import {
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
 import { createCapability, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
 import { checkpointPolicyHash, recordTrustedCheckpointAnswer, unresolvedCheckpointError } from "../src/engine/checkpoints.js";
-import { writeState } from "../src/engine/state.js";
+import { migrationCheckpointPolicy } from "../src/engine/workflow-contract.js";
+import { writeStateBootstrap } from "../src/engine/state.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 
@@ -78,11 +79,16 @@ function advanceAuth(issued: ReturnType<typeof createCapability>) {
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: issued.state.issued_for!.loop_iteration,
   };
 }
 
 function setupApprovalStage(root: string, branch: string, profile: Profile): { issued: ReturnType<typeof createCapability>; artifactsDir: string } {
   const persistedHash = profileHash(profile);
+  const policy = profile.stages.find((stage) => stage.id === "product_approval")?.checkpoint_policy
+    ?? profile.checkpoint_policy
+    ?? migrationCheckpointPolicy("product_approval");
+  const policyHash = checkpointPolicyHash(policy);
   const issued = createCapability({
     run_key: branch,
     branch,
@@ -91,8 +97,9 @@ function setupApprovalStage(root: string, branch: string, profile: Profile): { i
     stage_cursor: "product_approval",
     kind: "none", // orchestrator stages are non-dispatch: empty roster
     expected_roster: [],
+    checkpoint_policy_hash: policyHash,
   });
-  const { artifactsDir } = writeState(root, {
+  const { artifactsDir } = writeStateBootstrap(root, {
     schema: 1,
     branch,
     run_key: branch,
@@ -106,6 +113,8 @@ function setupApprovalStage(root: string, branch: string, profile: Profile): { i
     pause: { kind: "none", reason: "" },
     policy: { strict_orchestrator: true },
     profile_hash: persistedHash,
+    checkpoint_policy: policy,
+    checkpoint_policy_binding: { stage_id: "product_approval", profile_hash: persistedHash, policy_hash: policyHash },
     scope: NO_SCOPE,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
@@ -440,7 +449,7 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
     const unresolved = unresolvedCheckpointError(profile.stages.find((stage) => stage.id === "product_approval")!, unresolvedState);
     assert.match(unresolved ?? "", /checkpoint_unresolved/);
     assert.equal(unresolvedState.pause.kind, "needs_human");
-    writeState(root, unresolvedState, { featureSlug: "product-approval" });
+    writeStateBootstrap(root, unresolvedState, { featureSlug: "product-approval" });
     assert.equal(readState(root).pause.kind, "needs_human");
 
     // 3. An interactive answer must carry typed human provenance. The
@@ -455,7 +464,7 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
       checkpoint_id: "product_approval",
       decision: "proceed",
     });
-    writeState(root, trusted.state, { featureSlug: "product-approval" });
+    writeStateBootstrap(root, trusted.state, { featureSlug: "product-approval" });
     const expectedEpoch = beforeInteractive.dispatch_capability!.issued_for!.cursor_epoch;
     const interactive = recordCheckpointDecision(root, {
       ...advanceAuth(issued),

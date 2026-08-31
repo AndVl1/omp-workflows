@@ -10,7 +10,7 @@ import {
   setCtoControlPlane,
   setTeamControlPlane,
 } from "../src/cto/state.js";
-import { writeState } from "../src/engine/state.js";
+import { writeStateBootstrap } from "../src/engine/state.js";
 import type { CtoState, TeamPlan } from "../src/cto/types.js";
 import type { CompletionIntent, WorkIdentity, TeamState } from "../src/engine/types.js";
 
@@ -175,13 +175,13 @@ function engineStateFixture(): TeamState {
   };
 }
 
-test("engine writeState: malformed and conflicting typed control-plane state throws concrete rejection reasons", () => {
+test("engine bootstrap fixture writer: malformed and conflicting typed state throws concrete rejection reasons", () => {
   const malformedRoot = mkdtempSync(join(tmpdir(), "write-state-malformed-"));
   try {
     const malformed = engineStateFixture();
     malformed.completion_intent = { mode: "invalid" } as unknown as CompletionIntent;
     assert.throws(
-      () => writeState(malformedRoot, malformed, { featureSlug: "malformed" }),
+      () => writeStateBootstrap(malformedRoot, malformed, { featureSlug: "malformed" }),
       /state\.completion_intent\.mode/,
     );
   } finally {
@@ -198,7 +198,7 @@ test("engine writeState: malformed and conflicting typed control-plane state thr
       rationale: "A conflicting classification projection must fail closed.",
     };
     assert.throws(
-      () => writeState(conflictRoot, conflicting, { featureSlug: "conflicting" }),
+      () => writeStateBootstrap(conflictRoot, conflicting, { featureSlug: "conflicting" }),
       /classification\.completion_intent conflicts/,
     );
   } finally {

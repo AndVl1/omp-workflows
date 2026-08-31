@@ -200,6 +200,8 @@ export interface DispatchAuthorizationRequest {
   profile_hash: string;
   stage_cursor: string;
   cursor_epoch: string;
+  /** Loop iteration of the live capability binding; present on modern capabilities. */
+  loop_iteration?: number;
   role: string;
   slot_id: string;
   task_id: string;
@@ -251,6 +253,7 @@ export function trustedDispatchRequests(
       profile_hash: issued.profile_hash,
       stage_cursor: issued.stage_cursor,
       cursor_epoch: issued.cursor_epoch,
+      ...(Number.isInteger(issued.loop_iteration) ? { loop_iteration: issued.loop_iteration as number } : {}),
       role: slotId,
       slot_id: slotId,
       task_id: marker.task_id ?? dispatchTaskId(capabilityId, issued.run_key, issued.branch, issued.workflow, issued.stage_cursor, slotId),

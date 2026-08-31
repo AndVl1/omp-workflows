@@ -17,8 +17,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
 import { createCapability, authorizeDispatch, completeDispatch, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
+import { loopIterationForStage } from "../src/engine/loops.js";
 import { appendCheckpointDecision, checkpointAnswerBinding, checkpointPolicyHash, recordTrustedCheckpointAnswer, validateCheckpointDecision } from "../src/engine/checkpoints.js";
-import { writeState } from "../src/engine/state.js";
+import { writeStateBootstrap } from "../src/engine/state.js";
 import { run } from "../src/engine/run.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
@@ -43,16 +44,14 @@ function setupStage(
   roster: Array<{ role: string; agent: string }>,
 ): { issued: ReturnType<typeof createCapability>; artifactsDir: string } {
   const persistedHash = profileHash(profile);
-  const issued = createCapability({
-    run_key: branch, branch, workflow: profile.name, profile_hash: persistedHash,
-    stage_cursor: stageId, kind, expected_roster: roster,
-  });
   // Preserve durable loop/checkpoint/fan-in state across stage transitions
   // (advanceCursor carries it forward; the test helper must not wipe it).
   const existingPath = join(root, ".work-state", "features", "loop", "state.json");
   let carried: Partial<Pick<TeamState, "loop_state" | "checkpoint_decisions" | "slot_artifacts" | "join_summary">> = {};
+  let carriedState: TeamState | null = null;
   try {
     const existing = JSON.parse(readFileSync(existingPath, "utf8")) as TeamState;
+    carriedState = existing;
     carried = {
       ...(existing.loop_state ? { loop_state: existing.loop_state } : {}),
       ...(existing.checkpoint_decisions ? { checkpoint_decisions: existing.checkpoint_decisions } : {}),
@@ -62,7 +61,19 @@ function setupStage(
   } catch {
     // first stage setup: nothing to carry
   }
-  writeState(root, {
+  // The minted capability must carry the ACTIVE loop iteration of the stage
+  // window (loopIterationForStage over the carried durable state): an
+  // iteration-less capability can never authorize a re-entered window.
+  const stageIteration = carriedState
+    ? loopIterationForStage(carriedState, profile, stageId)
+    : { ok: true as const, iteration: 1 };
+  assert.ok(stageIteration.ok, `loop iteration for ${stageId}: ${stageIteration.ok ? "" : stageIteration.error}`);
+  const issued = createCapability({
+    run_key: branch, branch, workflow: profile.name, profile_hash: persistedHash,
+    stage_cursor: stageId, kind, expected_roster: roster,
+    loop_iteration: stageIteration.ok ? stageIteration.iteration : 1,
+  });
+  writeStateBootstrap(root, {
     schema: 1,
     branch,
     run_key: branch,
@@ -97,6 +108,7 @@ function authOf(issued: ReturnType<typeof createCapability>, role: string, agent
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: issued.state.issued_for!.loop_iteration,
     role,
     agent,
   };
@@ -112,6 +124,7 @@ function advanceAuth(issued: ReturnType<typeof createCapability>) {
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: issued.state.issued_for!.loop_iteration,
   };
 }
 
@@ -119,7 +132,7 @@ function readState(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "features", "loop", "state.json"), "utf8")) as TeamState;
 }
 
-function typedCheckpoint(root: string, stageId: string, checkpointId: string, decision = "proceed") {
+function typedCheckpoint(root: string, stageId: string, checkpointId: string, decision = "proceed", answerSuffix = "") {
   const state = readState(root);
   const policy = state.checkpoint_policy;
   const capability = state.dispatch_capability;
@@ -128,14 +141,14 @@ function typedCheckpoint(root: string, stageId: string, checkpointId: string, de
   const rule = policy.rules[checkpointId];
   assert.ok(rule, `checkpoint test policy must define ${checkpointId}`);
   const trusted = recordTrustedCheckpointAnswer(state, {
-    answer_id: `scope-test/${stageId}/${checkpointId}`,
+    answer_id: `scope-test/${stageId}/${checkpointId}${answerSuffix}`,
     channel: "terminal",
-    reference: `terminal-answer/scope-test/${stageId}/${checkpointId}`,
+    reference: `terminal-answer/scope-test/${stageId}/${checkpointId}${answerSuffix}`,
     stage_id: stageId,
     checkpoint_id: checkpointId,
     decision,
   });
-  writeState(root, trusted.state, { featureSlug: "loop" });
+  writeStateBootstrap(root, trusted.state, { featureSlug: "loop" });
   return {
     run_id: state.work_identity?.run_id ?? state.run_key ?? state.branch,
     stage_id: stageId,
@@ -146,6 +159,7 @@ function typedCheckpoint(root: string, stageId: string, checkpointId: string, de
     actor: { kind: "user" as const, ref: trusted.answer.reference, proof: trusted.proof },
     capability_id: capability.capability_id,
     capability_epoch: capability.issued_for!.cursor_epoch,
+    loop_iteration: capability.issued_for!.loop_iteration,
     policy_hash: checkpointPolicyHash(policy),
     rationale: "explicit typed test answer",
     decided_at: new Date().toISOString(),
@@ -154,7 +168,9 @@ function typedCheckpoint(root: string, stageId: string, checkpointId: string, de
 
 function persistTypedCheckpoint(root: string, stageId: string, checkpointId: string, decision = "proceed"): void {
   const typed = typedCheckpoint(root, stageId, checkpointId, decision);
-  writeState(root, appendCheckpointDecision(readState(root), typed), { featureSlug: "loop" });
+  const appended = appendCheckpointDecision(readState(root), typed);
+  assert.equal(appended.ok, true, appended.ok ? "checkpoint recorded" : `checkpoint append failed: ${appended.code}: ${appended.error}`);
+  writeStateBootstrap(root, appended.state, { featureSlug: "loop" });
 }
 
 const LOOP_PROFILE: Profile = {
@@ -305,15 +321,15 @@ test("checkpoint: hard-human authorization requires a durable answer proof, not 
     }
 
     const persisted = appendCheckpointDecision(state, valid);
-    assert.equal(persisted.typed_checkpoint_decisions?.length, 1);
-    assert.equal(persisted.trusted_checkpoint_answers?.[0]?.consumed_at !== undefined, true, "answer consumption is durable");
-    assert.deepEqual(persisted.artifacts, state.artifacts, "checkpoint authorization does not overwrite artifacts");
-    assert.equal(validateCheckpointDecision(persisted, valid, { stage }).ok, true, "exact replay is idempotent");
-    assert.throws(
-      () => appendCheckpointDecision(persisted, { ...valid, decision: "reject" }),
-      /checkpoint_unverified|migration_conflict/,
-      "a replayed answer cannot authorize a different decision",
-    );
+    assert.equal(persisted.ok, true);
+    assert.equal(persisted.state.typed_checkpoint_decisions?.length, 1);
+    assert.equal(persisted.state.trusted_checkpoint_answers?.[0]?.consumed_at !== undefined, true, "answer consumption is durable");
+    assert.equal(persisted.state.trusted_checkpoint_answers?.[0]?.consumed_reason, "finalized", "finalization reason is durable");
+    assert.deepEqual(persisted.state.artifacts, state.artifacts, "checkpoint authorization does not overwrite artifacts");
+    assert.equal(validateCheckpointDecision(persisted.state, valid, { stage }).ok, true, "exact replay is idempotent");
+    const conflicting = appendCheckpointDecision(persisted.state, { ...valid, decision: "reject" });
+    assert.equal(conflicting.ok, false, "a replayed answer cannot authorize a different decision");
+    if (!conflicting.ok) assert.equal(conflicting.code, "checkpoint_unverified");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -337,7 +353,7 @@ test("checkpoint: routing autonomy stays orthogonal to profile consent; migratio
 
     const profileState = readState(root);
     assert.equal(profileState.checkpoint_policy?.source, "profile");
-    writeState(root, { ...profileState, classification: { ...profileState.classification, autonomous: true } }, { featureSlug: "loop" });
+    writeStateBootstrap(root, { ...profileState, classification: { ...profileState.classification, autonomous: true } }, { featureSlug: "loop" });
     persistTypedCheckpoint(root, "implementation", "approve_implementation");
     const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "typed human consent" });
     assert.equal(advanced.ok, true, "routing autonomous=true must not conflict with a profile-source human policy");
@@ -362,11 +378,10 @@ test("checkpoint: routing autonomy stays orthogonal to profile consent; migratio
         classification: { ...migrationState.classification, autonomous: false },
         checkpoint_policy: migrationPolicy,
       };
-      writeState(migrationRoot, conflictingState, { featureSlug: "loop" });
+      writeStateBootstrap(migrationRoot, conflictingState, { featureSlug: "loop" });
       const typed = typedCheckpoint(migrationRoot, "implementation", "approve_implementation");
       const conflict = validateCheckpointDecision(readState(migrationRoot), typed, {
         stage: { id: "implementation", checkpoint: "approve_implementation", checkpoint_policy: migrationPolicy },
-        policy: migrationPolicy,
       });
       assert.equal(conflict.ok, false);
       if (!conflict.ok) assert.equal(conflict.code, "migration_conflict");
@@ -388,16 +403,23 @@ test("checkpoint: typed recording is idempotent; conflicting decisions fail and 
     const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
     const { issued } = setupStage(root, "feat/ck", profile, "implementation", "single", roster);
     const typed = typedCheckpoint(root, "implementation", "approve_implementation");
-    writeState(root, appendCheckpointDecision(readState(root), typed), { featureSlug: "loop" });
-    writeState(root, appendCheckpointDecision(readState(root), typed), { featureSlug: "loop" });
+    const firstAppend = appendCheckpointDecision(readState(root), typed);
+    assert.equal(firstAppend.ok, true, firstAppend.ok ? "first append" : `${firstAppend.code}: ${firstAppend.error}`);
+    writeStateBootstrap(root, firstAppend.state, { featureSlug: "loop" });
+    const secondAppend = appendCheckpointDecision(readState(root), typed);
+    assert.equal(secondAppend.ok, true);
+    writeStateBootstrap(root, secondAppend.state, { featureSlug: "loop" });
+    const replay = appendCheckpointDecision(readState(root), typed);
+    assert.equal(replay.ok, true);
+    assert.equal(replay.idempotent, true, "identical typed decision is idempotent");
+    writeStateBootstrap(root, replay.state, { featureSlug: "loop" });
     const decisions = readState(root);
     assert.equal(decisions.typed_checkpoint_decisions?.length, 1, "identical typed decision is idempotent");
     assert.equal(decisions.checkpoint_decisions?.length, 1, "typed mirror remains singular");
-    assert.throws(
-      () => appendCheckpointDecision(readState(root), { ...typed, rationale: "conflicting answer" }),
-      /migration_conflict/,
-      "a second answer cannot replace an existing checkpoint decision",
-    );
+    const conflictingTyped = typedCheckpoint(root, "implementation", "approve_implementation", "proceed", "/conflict");
+    const conflicting = appendCheckpointDecision(readState(root), { ...conflictingTyped, rationale: "conflicting answer" });
+    assert.equal(conflicting.ok, false, "a separately proven second answer cannot replace an existing checkpoint decision");
+    if (!conflicting.ok) assert.equal(conflicting.code, "decision_conflict");
     const wrongName = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "bogus", mode: "interactive", decision: "x", actor: "user", rationale: "r" });
     assert.equal(wrongName.ok, false);
     if (!wrongName.ok) assert.match(wrongName.error, /typed checkpoint authorization and actor provenance/);
@@ -434,7 +456,12 @@ test("loop: FAIL until re-enters back_to with a fresh capability and durable his
     assert.equal(state.loop_state?.reentries, 1);
     assert.equal(state.loop_state?.status, "running");
     assert.equal(state.loop_state?.history.length, 1);
-    assert.equal(state.loop_state?.history[0]!.iteration, 1);
+    // The history entry labels the execution iteration the loop-back
+    // ENTERS (loop_state.reentries + 1) — the same number the re-armed
+    // capability and its handoff carry, so re-entry count and execution
+    // iteration can never be conflated.
+    assert.equal(state.loop_state?.history[0]!.iteration, 2);
+    assert.equal(state.dispatch_capability?.issued_for?.loop_iteration, 2);
     assert.equal(state.loop_state?.history[0]!.from_epoch, verify.state.issued_for!.cursor_epoch);
     assert.equal(state.loop_state?.history[0]!.to_epoch, state.cursor_epoch);
     assert.notEqual(state.cursor_epoch, verify.state.issued_for!.cursor_epoch, "fresh cursor epoch per iteration");

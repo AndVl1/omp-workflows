@@ -826,7 +826,7 @@ function artifactFilePath(cwd: string, r: DoWorkResolved, artifactId: string): s
  *
  * The do-work orchestration stamps state-relative refs
  * (`features/<slug>/artifacts/<id>.json`, `artifacts/<id>.json`) rooted at
- * `.work-state` — the engine's per-feature layout (`writeState`). Accepted:
+ * `.work-state` — the engine's per-feature state layout. Accepted:
  * - absolute paths — kept as-is;
  * - `.work-state/…` — cwd-relative (CTO `dod_path` / legacy-root style);
  * - any other relative form — resolved against `.work-state`.

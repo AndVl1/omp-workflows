@@ -21,7 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
 import { createCapability, advanceCursor, type IssuedCapability } from "../src/engine/durable.js";
-import { writeState } from "../src/engine/state.js";
+import { writeStateBootstrap } from "../src/engine/state.js";
 import { validateProductPrdDocument } from "../src/engine/product-prd.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
@@ -99,7 +99,7 @@ function setupDocumentStage(preArtifacts: Record<string, unknown>): {
     run_key: branch, branch, workflow: profile.name, profile_hash: persistedHash,
     stage_cursor: currentStageId, kind: "none", expected_roster: [],
   });
-  writeState(root, {
+  writeStateBootstrap(root, {
     schema: 1,
     branch,
     run_key: branch,
@@ -141,6 +141,7 @@ function advanceAuth(issued: IssuedCapability) {
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: issued.state.issued_for!.loop_iteration,
   };
 }
 

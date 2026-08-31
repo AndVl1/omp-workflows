@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { run } from "../src/engine/run.js";
 import { registerWorkflowProfiles } from "../src/engine/profile.js";
-import { writeState } from "../src/engine/state.js";
+import { writeStateBootstrap } from "../src/engine/state.js";
 import type { Profile, TaskType, TeamState } from "../src/engine/types.js";
 import type { TaskCaller, TaskResult } from "../src/engine/stage.js";
 
@@ -78,7 +78,8 @@ function options(root: string, branch: string, taskTool: TaskCaller, continuatio
 test("run continuation rejects stale branch before task calls", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-run-stale-"));
   try {
-    writeState(root, fixtureState("feature/original", ["done", "done", "done"]));
+    initGit(root, "feature/other");
+    writeStateBootstrap(root, fixtureState("feature/original", ["done", "done", "done"]));
     let calls = 0;
     const taskTool: TaskCaller = {
       async call() { calls += 1; return taskResult("call"); },
@@ -100,7 +101,7 @@ test("run continuation preserves persisted classification, upstream state, artif
   const branch = "feature/continuation";
   try {
     initGit(root, branch);
-    writeState(root, fixtureState(branch, ["done", "done", "done"]));
+    writeStateBootstrap(root, fixtureState(branch, ["done", "done", "done"]));
     const calls: string[] = [];
     const taskTool: TaskCaller = {
       async call(args) {
@@ -155,7 +156,7 @@ test("run continuation keeps explicit custom feature state and artifacts layout"
     mkdirSync(join(customDir, "artifacts"), { recursive: true });
     writeFileSync(join(root, ".work-state", ".active-feature"), "custom\n");
     writeFileSync(join(customDir, "artifacts", "upstream.json"), JSON.stringify({ source: "custom" }));
-    writeState(root, fixtureState(branch, ["done", "done", "done"]), { featureSlug: "custom" });
+    writeStateBootstrap(root, fixtureState(branch, ["done", "done", "done"]), { featureSlug: "custom" });
     writeFileSync(join(customDir, "artifacts", "upstream.json"), JSON.stringify({ source: "custom" }));
     const prompts: string[] = [];
     const taskTool: TaskCaller = {

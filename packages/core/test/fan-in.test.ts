@@ -31,7 +31,7 @@ import {
   DEFAULT_FAN_IN_POLICY,
   type FanInPolicy,
 } from "../src/engine/fan-in.js";
-import { writeState } from "../src/engine/state.js";
+import { writeStateBootstrap } from "../src/engine/state.js";
 import { resolveConfig } from "../src/engine/config.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { run } from "../src/engine/run.js";
@@ -58,7 +58,7 @@ function writeFixtureState(root: string, profileName: string, stageId: string): 
       { role: "analyst#2", agent: "analyst" },
     ],
   });
-  writeState(root, {
+  writeStateBootstrap(root, {
     schema: 1,
     branch: "feat/fan",
     run_key: "feat/fan",
@@ -96,7 +96,7 @@ function writeSpecFixtureState(root: string): ReturnType<typeof createCapability
       { role: "tech-researcher", agent: "tech-researcher" },
     ],
   });
-  writeState(root, {
+  writeStateBootstrap(root, {
     schema: 1,
     branch: "main",
     run_key: "main",
@@ -159,6 +159,7 @@ function completeSlot(root: string, issued: ReturnType<typeof createCapability>,
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: issued.state.issued_for!.loop_iteration,
     role,
     agent,
   };
@@ -180,6 +181,7 @@ function authorizeSlot(root: string, issued: ReturnType<typeof createCapability>
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: issued.state.issued_for!.loop_iteration,
     role,
     agent,
     tool_call_id: toolCallId,
@@ -318,6 +320,7 @@ test("fan-in: advance recovers native completions after slots wrote declared fil
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      loop_iteration: issued.state.issued_for!.loop_iteration,
       evidence: "native consilium outputs reconciled",
     });
     assert.equal(advanced.ok, true, "native completion without ids is repaired from slot-scoped files");
@@ -363,6 +366,7 @@ test("spec-preparation: native consilium completion advances from slot-scoped ou
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      loop_iteration: issued.state.issued_for!.loop_iteration,
       evidence: "spec intake complete",
     });
     assert.equal(advanced.ok, true, "spec-preparation intake transition succeeds");
@@ -393,6 +397,7 @@ test("fan-in: native artifact ids can bind before a slot file becomes readable",
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      loop_iteration: issued.state.issued_for!.loop_iteration,
       role: "analyst",
       agent: "analyst",
       tool_call_id: "tool-spec-delayed-analyst",
@@ -452,6 +457,7 @@ test("fan-in: native artifact ids can bind before a slot file becomes readable",
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      loop_iteration: issued.state.issued_for!.loop_iteration,
       evidence: "delayed native artifacts recovered",
     });
     assert.equal(advanced.ok, true, advanced.ok ? "" : advanced.error);
@@ -604,6 +610,7 @@ test("fan-in: missing slot results block advance end to end", () => {
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      loop_iteration: issued.state.issued_for!.loop_iteration,
       evidence: "exploration done",
     });
     assert.equal(advanced.ok, false, "empty slot blocks the handoff");
@@ -639,6 +646,7 @@ test("fan-in: collision (same slot writing the same artifact twice with differen
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      loop_iteration: issued.state.issued_for!.loop_iteration,
       role: "analyst#1",
       agent: "analyst",
     };
