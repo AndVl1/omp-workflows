@@ -2,6 +2,18 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.28.0] — 2026-08-31
+### Added
+- **Host-mediated human checkpoints** — `workflow_checkpoint_ask` now ingests trusted terminal/RPC answers and records checkpoint proofs bound to the capability epoch, loop iteration, checkpoint policy, and stable work identity, preventing fabricated, cross-scope, or replayed approvals.
+
+### Changed
+- **Transactional durable control plane** — canonical state, artifact and sidecar publication, and observability mutations now use lock/CAS-safe transactions across processes; consilium dispatch and completion semantics are keyed to stable work identity so repeated roles and concurrent sessions cannot alias one another.
+
+### Fixed
+- **Nested pending capability validation** — legal `DispatchCapability.pending[]` lifecycles now validate independently from the root pending record without weakening root-level invariants.
+- **Diagnosis gate contract and evidence** — diagnosis artifacts align with root-cause gate requirements and retain concrete gate-failure detail instead of collapsing actionable evidence.
+- **Branch and authorization correctness** — canonical branch preparation, historical approval selection, and stale authorization behavior now fail closed; legacy checkpoint observations cannot authorize current work.
+
 ## [0.27.1] — 2026-08-31
 ### Fixed
 - **Fail-closed `TeamDef` registry loading for `/cto`** — `.omp/teams.json` entries are now validated against the complete runtime shape before use, so malformed `scope`, `profile`, `lead`, or `roster` values are excluded instead of reaching command rendering and crashing on `scope.join(...)`; this repository's team registry now uses the canonical `scope: ["dev"]` identifier array.
