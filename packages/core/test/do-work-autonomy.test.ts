@@ -24,6 +24,7 @@ import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } fro
 import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
 import { registerTeamWorkflow, registerWorkflowTools } from "../src/index.js";
 import { resolveState, writeStateBootstrap } from "../src/engine/state.js";
+import { prepareWorkflowState } from "../src/engine/run.js";
 
 import {
   parseWorkEnvelope,
@@ -31,7 +32,6 @@ import {
   keywordClassify,
   resolveWorkflow,
   resolveClassification,
-  prepareWorkflowState,
   classificationGate,
   buildCtoPrompt,
 } from "@andvl1/omp-workflows-core";
@@ -151,6 +151,134 @@ test("workflow_prepare: stale active-feature state is replaced for the current b
     assert.equal(prepared.statePath, join(root, ".work-state", "features", "main", "state.json"));
     assert.equal(resolveState(root, "main").state?.branch, "main");
     assert.equal(readFileSync(join(root, ".work-state", ".active-feature"), "utf8"), "main\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** Incident shape: the branch's own state at the derived slug plus a stale
+ * legacy root from an older branch; no .active-feature pointer. */
+function seedOwnStateBehindStaleLegacyRoot(root: string, branch: string, slug: string): { ownPath: string; legacyPath: string; ownBytes: string; legacyBytes: string } {
+  const ownPath = join(root, ".work-state", "features", slug, "state.json");
+  const legacyPath = join(root, ".work-state", "team-state.json");
+  mkdirSync(join(root, ".work-state", "features", slug), { recursive: true });
+  const ownState = {
+    schema: 1 as const,
+    state_revision: 5,
+    branch,
+    run_key: branch,
+    task: "fix PR remarks",
+    workflow_override: false,
+    classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "bug-fix" },
+    stage_cursor: "implementation",
+    stages: [{ id: "implementation", status: "in_progress" }],
+    artifacts: {},
+    pause: { kind: "none" as const, reason: "" },
+    history: [{ task: "fix PR remarks", feedback: "first pass", at: "2026-08-30T00:00:00.000Z" }],
+  };
+  const ownBytes = JSON.stringify(ownState, null, 2) + "\n";
+  writeFileSync(ownPath, ownBytes);
+  const legacyBytes = JSON.stringify({ ...ownState, branch: "feat/older", task: "older branch run", state_revision: 3 }, null, 2) + "\n";
+  writeFileSync(legacyPath, legacyBytes);
+  return { ownPath, legacyPath, ownBytes, legacyBytes };
+}
+
+test("workflow_prepare: own branch state hidden by a stale legacy root gets the honest already-exists gate", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-own-state-fresh-"));
+  try {
+    const branch = "feat/CRADS-000/preview-slot-lifecycle";
+    initGit(root, branch);
+    const { ownPath, legacyPath, ownBytes, legacyBytes } = seedOwnStateBehindStaleLegacyRoot(root, branch, "feat-crads-000-preview-slot-lifecycle");
+
+    assert.throws(
+      () => prepareWorkflowState({
+        task: "fix remaining PR remarks",
+        cwd: root,
+        branch,
+        autonomous: false,
+        classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false },
+        files: [],
+        issue: null,
+      }),
+      /workflow state already exists for this branch; use continuation mode/,
+    );
+    assert.equal(readFileSync(ownPath, "utf8"), ownBytes, "the own state is byte-untouched by the failed fresh prepare");
+    assert.equal(readFileSync(legacyPath, "utf8"), legacyBytes, "the stale legacy root is byte-untouched");
+    assert.equal(existsSync(join(root, ".work-state", ".active-feature")), false, "no pointer is published for a failed prepare");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare: continuation reopens the own branch state hidden by a stale legacy root in place", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-own-state-continue-"));
+  try {
+    const branch = "feat/CRADS-000/preview-slot-lifecycle";
+    initGit(root, branch);
+    const slug = "feat-crads-000-preview-slot-lifecycle";
+    const { ownPath, legacyPath, legacyBytes } = seedOwnStateBehindStaleLegacyRoot(root, branch, slug);
+
+    const prepared = prepareWorkflowState({
+      task: "feedback pass",
+      cwd: root,
+      branch,
+      autonomous: false,
+      files: [],
+      issue: null,
+      continuation: { feedback: "reopen implementation", stageId: "implementation" },
+    });
+
+    assert.equal(prepared.statePath, ownPath, "continuation reopens the own state in place — no relocation");
+    assert.equal(prepared.state.branch, branch);
+    assert.equal(prepared.state.state_revision, 6, "revision continues from the reopened state's own revision");
+    assert.equal(prepared.state.history?.length, 2);
+    assert.match(prepared.state.task, /User feedback: reopen implementation/);
+    assert.equal(prepared.state.stages[0]?.status, "pending", "the reopened stage is re-armed");
+    assert.equal((JSON.parse(readFileSync(ownPath, "utf8")) as { state_revision?: number }).state_revision, 6);
+    assert.equal(readFileSync(legacyPath, "utf8"), legacyBytes, "the stale legacy root is never rewritten by the continuation");
+    assert.equal(readFileSync(join(root, ".work-state", ".active-feature"), "utf8"), `${slug}\n`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare: foreign state at the derived destination stays fail-closed and untouched", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-foreign-dest-"));
+  try {
+    const branch = "feat/own-work";
+    initGit(root, branch);
+    const destinationPath = join(root, ".work-state", "features", "feat-own-work", "state.json");
+    mkdirSync(join(root, ".work-state", "features", "feat-own-work"), { recursive: true });
+    const foreignState = {
+      schema: 1 as const,
+      state_revision: 2,
+      branch: "feat/other-run",
+      run_key: "feat/other-run",
+      task: "another branch's run",
+      workflow_override: false,
+      classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "standard" },
+      stage_cursor: "discovery",
+      stages: [{ id: "discovery", status: "in_progress" }],
+      artifacts: {},
+      pause: { kind: "none" as const, reason: "" },
+    };
+    const foreignBytes = JSON.stringify(foreignState, null, 2) + "\n";
+    writeFileSync(destinationPath, foreignBytes);
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ ...foreignState, branch: "feat/older", state_revision: 3 }));
+
+    assert.throws(
+      () => prepareWorkflowState({
+        task: "start the own workflow",
+        cwd: root,
+        branch,
+        autonomous: false,
+        classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false },
+        files: [],
+        issue: null,
+      }),
+      /workflow state was created at the future destination during the transaction/,
+    );
+    assert.equal(readFileSync(destinationPath, "utf8"), foreignBytes, "the foreign destination is byte-untouched by the failed prepare");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
