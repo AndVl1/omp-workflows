@@ -2,6 +2,11 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.28.1] — 2026-09-01
+### Fixed
+- **Branch-owned state recovery over stale slots** — workflow recovery now prefers branch-owned durable state over stale slot records, preventing unrelated slot data from hijacking resume decisions.
+- **Honest destination classification** — same-branch and foreign-new/changed destinations are classified from repository state while preserving fail-closed behavior for ambiguous or unsafe destinations.
+
 ## [0.28.0] — 2026-08-31
 ### Added
 - **Host-mediated human checkpoints** — `workflow_checkpoint_ask` now ingests trusted terminal/RPC answers and records checkpoint proofs bound to the capability epoch, loop iteration, checkpoint policy, and stable work identity, preventing fabricated, cross-scope, or replayed approvals.
