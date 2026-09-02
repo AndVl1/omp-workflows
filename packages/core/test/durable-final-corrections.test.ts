@@ -1019,6 +1019,7 @@ test("review: concurrent creation at an absent final destination is a CAS confli
     assert.ok(profile);
     seedState(root, { profile, stageCursor: "discovery", slug: "final" });
     const seedBytes = readFileSync(statePathOf(root, "final"), "utf8");
+    const destinationPath = statePathOf(root, "main");
     rmSync(statePathOf(root, "final"));
     setStateTransactionTestHooks({
       beforeCas: ({ destinationPath }) => {
@@ -1034,7 +1035,7 @@ test("review: concurrent creation at an absent final destination is a CAS confli
       assert.equal(updated.code, "state_conflict");
       assert.match(updated.error, /created during the transaction/);
     }
-    assert.equal(readFileSync(statePathOf(root, "final"), "utf8"), seedBytes);
+    assert.equal(readFileSync(destinationPath, "utf8"), seedBytes);
   } finally {
     setStateTransactionTestHooks(null);
     rmSync(root, { recursive: true, force: true });
@@ -1313,3 +1314,32 @@ function busySpin(ms: number): void {
     // bounded spin until the observed deadline
   }
 }
+
+test("review: foreign pointerless same-path state stays fail-closed and untouched", () => {
+  const root = mkdtempSync(join(tmpdir(), "review-pointerless-foreign-same-path-"));
+  try {
+    initGit(root);
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    seedState(root, { profile, stageCursor: "discovery", slug: "main" });
+    rmSync(join(root, ".work-state", ".active-feature"), { force: true });
+    const destinationPath = statePathOf(root, "main");
+    const existing = JSON.parse(readFileSync(destinationPath, "utf8")) as TeamState;
+    const foreignBytes = JSON.stringify({ ...existing, branch: "foreign", run_key: "foreign" }, null, 2) + "\n";
+    writeFileSync(destinationPath, foreignBytes);
+
+    const updated = updateStateAtomically(root, (snapshot) => ({
+      op: "commit",
+      state: { ...snapshot.state!, branch: "main", task: "would-clobber" },
+    }), { branch: "main" });
+    assert.equal(updated.ok, false);
+    if (!updated.ok) {
+      assert.equal(updated.code, "state_conflict");
+      assert.match(updated.error, /workflow state was created at the future destination during the transaction/);
+    }
+    assert.equal(readFileSync(destinationPath, "utf8"), foreignBytes, "the foreign same-path state is byte-untouched");
+  } finally {
+    setStateTransactionTestHooks(null);
+    rmSync(root, { recursive: true, force: true });
+  }
+});

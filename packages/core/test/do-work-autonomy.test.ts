@@ -1658,3 +1658,174 @@ test("workflow contract exposes the active feature artifact directory", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+function seedPointerlessOwnState(root: string, branch: string, slug: string): { ownPath: string; ownBytes: string } {
+  const seeded = seedOwnStateBehindStaleLegacyRoot(root, branch, slug);
+  rmSync(seeded.legacyPath, { force: true });
+  return { ownPath: seeded.ownPath, ownBytes: seeded.ownBytes };
+}
+
+test("resolveState: pointerless own branch feature state is adopted", () => {
+  const root = mkdtempSync(join(tmpdir(), "resolve-pointerless-own-"));
+  try {
+    const branch = "feat/CRADS-000/preview-slot-lifecycle";
+    initGit(root, branch);
+    const { ownPath } = seedPointerlessOwnState(root, branch, "feat-crads-000-preview-slot-lifecycle");
+
+    const resolved = resolveState(root, branch);
+    assert.equal(resolved.statePath, ownPath);
+    assert.equal(resolved.state?.branch, branch);
+    assert.equal(resolved.isLegacy, false);
+    assert.equal(resolved.isStale, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare: continuation reopens a pointerless own branch state in place", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-pointerless-continue-"));
+  try {
+    const branch = "feat/CRADS-000/preview-slot-lifecycle";
+    initGit(root, branch);
+    const slug = "feat-crads-000-preview-slot-lifecycle";
+    const { ownPath } = seedPointerlessOwnState(root, branch, slug);
+    assert.equal(existsSync(join(root, ".work-state", ".active-feature")), false);
+
+    const prepared = prepareWorkflowState({
+      task: "feedback pass",
+      cwd: root,
+      branch,
+      autonomous: false,
+      files: [],
+      issue: null,
+      continuation: { feedback: "reopen implementation", stageId: "implementation" },
+    });
+
+    assert.equal(prepared.statePath, ownPath, "continuation reopens the pointerless state in place");
+    assert.equal(prepared.state.branch, branch);
+    assert.equal(prepared.state.state_revision, 6);
+    assert.equal(prepared.state.history?.length, 2);
+    assert.match(prepared.state.task, /User feedback: reopen implementation/);
+    assert.equal(prepared.state.stages[0]?.status, "pending");
+    assert.equal(readFileSync(join(root, ".work-state", ".active-feature"), "utf8"), slug + "\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare: pointerless own branch state gets honest already-exists gate", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-pointerless-own-fresh-"));
+  try {
+    const branch = "feat/CRADS-000/preview-slot-lifecycle";
+    initGit(root, branch);
+    const { ownPath, ownBytes } = seedPointerlessOwnState(root, branch, "feat-crads-000-preview-slot-lifecycle");
+
+    assert.throws(
+      () => prepareWorkflowState({
+        task: "start another own workflow",
+        cwd: root,
+        branch,
+        autonomous: false,
+        classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false },
+        files: [],
+        issue: null,
+      }),
+      /workflow state already exists for this branch; use continuation mode/,
+    );
+    assert.equal(readFileSync(ownPath, "utf8"), ownBytes, "the own pointerless state is byte-untouched");
+    assert.equal(existsSync(join(root, ".work-state", ".active-feature")), false, "failed prepare does not publish a pointer");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveState: malformed pointerless branch state is invalid", () => {
+  const root = mkdtempSync(join(tmpdir(), "resolve-pointerless-malformed-"));
+  try {
+    const branch = "feat/pointerless-malformed";
+    initGit(root, branch);
+    const statePath = join(root, ".work-state", "features", "feat-pointerless-malformed", "state.json");
+    mkdirSync(join(root, ".work-state", "features", "feat-pointerless-malformed"), { recursive: true });
+    writeFileSync(statePath, "{ malformed\n");
+
+    const resolved = resolveState(root, branch);
+    assert.equal(resolved.state, null);
+    assert.equal(resolved.statePath, statePath);
+    assert.equal(resolved.invalid, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare: foreign pointerless derived state stays fail-closed and untouched", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-pointerless-foreign-"));
+  try {
+    const branch = "feat/CRADS-000/preview-slot-lifecycle";
+    initGit(root, branch);
+    const slug = "feat-crads-000-preview-slot-lifecycle";
+    const { ownPath, ownBytes } = seedPointerlessOwnState(root, branch, slug);
+    const foreignBytes = JSON.stringify({ ...JSON.parse(ownBytes), branch: "feat/other-run", run_key: "feat/other-run" }, null, 2) + "\n";
+    writeFileSync(ownPath, foreignBytes);
+    assert.equal(resolveState(root, branch).state, null);
+
+    assert.throws(
+      () => prepareWorkflowState({
+        task: "start the own workflow",
+        cwd: root,
+        branch,
+        autonomous: false,
+        classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false },
+        files: [],
+        issue: null,
+      }),
+      /workflow state was created at the future destination during the transaction/,
+    );
+    assert.equal(readFileSync(ownPath, "utf8"), foreignBytes);
+    assert.equal(existsSync(join(root, ".work-state", ".active-feature")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveState: missing stale pointer target yields to current own state", () => {
+  const root = mkdtempSync(join(tmpdir(), "resolve-missing-stale-own-"));
+  try {
+    const branch = "feat/CRADS-000/preview-slot-lifecycle";
+    initGit(root, branch);
+    const slug = "feat-crads-000-preview-slot-lifecycle";
+    const { ownPath } = seedPointerlessOwnState(root, branch, slug);
+    mkdirSync(join(root, ".work-state", "features", "old"), { recursive: true });
+    writeFileSync(join(root, ".work-state", ".active-feature"), "old\n");
+
+    const resolved = resolveState(root, branch);
+    assert.equal(resolved.statePath, ownPath);
+    assert.equal(resolved.state?.branch, branch);
+    assert.equal(resolved.isStale, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare: missing stale pointer target writes current branch slug", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-missing-stale-pointer-"));
+  try {
+    initGit(root, "main");
+    mkdirSync(join(root, ".work-state", "features", "old"), { recursive: true });
+    writeFileSync(join(root, ".work-state", ".active-feature"), "old\n");
+
+    const prepared = prepareWorkflowState({
+      task: "current branch fix",
+      cwd: root,
+      branch: "main",
+      autonomous: false,
+      classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false },
+      files: [],
+      issue: null,
+    });
+    assert.equal(prepared.statePath, join(root, ".work-state", "features", "main", "state.json"));
+    assert.equal(prepared.state.branch, "main");
+    assert.equal(existsSync(join(root, ".work-state", "features", "old", "state.json")), false);
+    assert.equal(readFileSync(join(root, ".work-state", ".active-feature"), "utf8"), "main\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
