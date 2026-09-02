@@ -638,7 +638,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       task: z.string().min(1),
       branch: z.string().min(1),
       classification: classificationParameters.optional(),
-      files: z.array(z.string().min(1)).default(() => []),
+      files: z.array(z.string().min(1)).optional(),
       issue: z.union([z.number().int(), z.object({ number: z.number().int(), url: z.string().optional() })]).nullable().default(null),
       continuation: z.object({ feedback: z.string().min(1), stageId: z.string().min(1) }).optional(),
     }) as never,

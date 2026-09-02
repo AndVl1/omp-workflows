@@ -60,6 +60,155 @@ function publishMapping(root: string): void {
   });
   writeAgentMapping(root, mapping);
 }
+type RegisteredWorkflowTool = {
+  name: string;
+  parameters: unknown;
+  execute: (...args: never[]) => Promise<{ details: unknown }>;
+};
+
+function registeredWorkflowTools(root: string): Map<string, RegisteredWorkflowTool> {
+  const tools = new Map<string, RegisteredWorkflowTool>();
+  registerWorkflowTools({
+    zod: { z },
+    registerTool(tool: RegisteredWorkflowTool) {
+      tools.set(tool.name, tool);
+    },
+  } as never, { cwd: root, isMainSession: () => true });
+  return tools;
+}
+
+function writeImplementationState(root: string): void {
+  const profile = loadProfile("debug-cycle");
+  assert.ok(profile, "debug-cycle profile must be available for scope regressions");
+  writeWorkflowState(root, {
+    schema: 1,
+    branch: "main",
+    run_key: "main",
+    classification: { type: "BUG_FIX", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "debug-cycle" },
+    task: "scope preservation regression",
+    workflow_override: false,
+    issue: null,
+    stage_cursor: "implementation",
+    stages: profile.stages.map((stage) => ({
+      id: stage.id,
+      status: stage.id === "discovery" || stage.id === "diagnose" ? "done" : stage.id === "implementation" ? "in_progress" : "pending",
+    })),
+    artifacts: {},
+    scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
+    policy: { strict_orchestrator: true },
+    profile_hash: profileHash(profile),
+    pause: { kind: "none", reason: "" },
+    updated_at: new Date().toISOString(),
+  });
+}
+
+function parsePrepareInput(tool: RegisteredWorkflowTool, input: unknown): Record<string, unknown> {
+  const schema = tool.parameters as { safeParse(value: unknown): { success: boolean; data?: unknown } };
+  const parsed = schema.safeParse(input);
+  assert.equal(parsed.success, true, "workflow_prepare input must satisfy its exported schema");
+  assert.ok(parsed.data && typeof parsed.data === "object");
+  return parsed.data as Record<string, unknown>;
+}
+
+test("workflow_prepare: continuation omitting files preserves scope for implementation instructions", async () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-scope-preserved-"));
+  try {
+    initGit(root, "main");
+    writeImplementationState(root);
+    const tools = registeredWorkflowTools(root);
+    const prepare = tools.get("workflow_prepare")!;
+    const input = parsePrepareInput(prepare, {
+      task: "continue scope preservation regression",
+      branch: "main",
+      continuation: { feedback: "resume implementation", stageId: "implementation" },
+    });
+    assert.equal(input.files, undefined, "omitted files must remain undefined after schema parsing");
+    const prepared = await prepare.execute("test", input, undefined, undefined, { cwd: root, hasUI: true } as never);
+    assert.equal((prepared.details as { ok?: boolean }).ok, true);
+
+    const state = JSON.parse(readFileSync(join(root, ".work-state", "team-state.json"), "utf8")) as {
+      scope?: { scope?: string[]; dev_agent?: string | null };
+    };
+    assert.deepEqual(state.scope?.scope, ["backend-kotlin"]);
+    assert.equal(state.scope?.dev_agent, "developer-kotlin");
+
+    const instructions = tools.get("workflow_instructions")!;
+    const response = await instructions.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
+    const contract = response.details as { workflow?: string; stage?: { id?: string; roles?: Array<{ role?: string; agent?: string }> } };
+    assert.equal(contract.workflow, "debug-cycle");
+    assert.equal(contract.stage?.id, "implementation");
+    assert.deepEqual(contract.stage?.roles, [{ role: "developer-kotlin", agent: "developer-kotlin" }]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare: explicit empty files keep implementation scope resolution fail-closed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-scope-empty-"));
+  try {
+    initGit(root, "main");
+    writeImplementationState(root);
+    const tools = registeredWorkflowTools(root);
+    const prepare = tools.get("workflow_prepare")!;
+    const input = parsePrepareInput(prepare, {
+      task: "continue with no changed files",
+      branch: "main",
+      files: [],
+      continuation: { feedback: "resume without scope", stageId: "implementation" },
+    });
+    assert.deepEqual(input.files, []);
+    const prepared = await prepare.execute("test", input, undefined, undefined, { cwd: root, hasUI: true } as never);
+    assert.equal((prepared.details as { ok?: boolean }).ok, true);
+
+    const state = JSON.parse(readFileSync(join(root, ".work-state", "team-state.json"), "utf8")) as {
+      scope?: { scope?: string[]; dev_agent?: string | null };
+    };
+    assert.deepEqual(state.scope?.scope, []);
+    assert.equal(state.scope?.dev_agent, null);
+
+    const instructions = tools.get("workflow_instructions")!;
+    const response = await instructions.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
+    const details = response.details as { ok?: boolean; code?: string; error?: string };
+    assert.equal(details.ok, false);
+    assert.equal(details.code, "WORKFLOW_RESOLUTION_FAILED");
+    assert.match(details.error ?? "", /stage 'implementation' references \$\{scope\.dev_agent\}/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare: absent or invalid scope mappings still fail closed", async () => {
+  for (const mapping of ["absent", "invalid"] as const) {
+    const root = mkdtempSync(join(tmpdir(), `workflow-prepare-scope-${mapping}-`));
+    try {
+      initGit(root, "main");
+      writeImplementationState(root);
+      if (mapping === "invalid") {
+        mkdirSync(join(root, ".omp"), { recursive: true });
+        writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ scope_map: [{ glob: ["**/*.kt"], scope: "backend-kotlin" }] }) + "\n");
+      }
+      const tools = registeredWorkflowTools(root);
+      const prepare = tools.get("workflow_prepare")!;
+      const input = parsePrepareInput(prepare, {
+        task: `continue with ${mapping} scope mapping`,
+        branch: "main",
+        files: ["src/main/App.kt"],
+        continuation: { feedback: "resolve implementation", stageId: "implementation" },
+      });
+      const prepared = await prepare.execute("test", input, undefined, undefined, { cwd: root, hasUI: true } as never);
+      assert.equal((prepared.details as { ok?: boolean }).ok, true);
+      const instructions = tools.get("workflow_instructions")!;
+      const response = await instructions.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
+      const details = response.details as { ok?: boolean; code?: string; error?: string };
+      assert.equal(details.ok, false, mapping);
+      assert.equal(details.code, "WORKFLOW_RESOLUTION_FAILED", mapping);
+      assert.match(details.error ?? "", /stage 'implementation' references \$\{scope\.dev_agent\}/, mapping);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 function recordTypedCheckpoint(root: string, stageId: string, checkpointId: string): void {
   const resolved = resolveState(root);
   assert.ok(resolved.state, "checkpoint fixture state must resolve");
