@@ -18,9 +18,10 @@
  * Resolution order on read:
  *   1. .work-state/.active-feature -> features/<slug>/state.json
  *   2. .work-state/team-state.json (legacy)
- *   3. undefined (no state yet)
+ *   3. exact current-branch derived state when currentBranch is supplied
+ *   4. undefined (no state yet)
  */
-import { closeSync, constants, existsSync, fstatSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, readdirSync, realpathSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, readdirSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -614,20 +615,29 @@ function resolveBranchOwnedFeatureState(wsDir: string, currentBranch: string): R
   const featuresDir = join(wsDir, "features");
   const featureDir = join(featuresDir, slug);
   const statePath = join(featureDir, "state.json");
-  if (!existsSync(statePath)) return null;
+  const artifactsPath = join(featureDir, "artifacts");
+  const invalid = (): ResolvedState => ({ state: null, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: false, invalid: true });
+  try {
+    lstatSync(featuresDir);
+    lstatSync(featureDir);
+    lstatSync(statePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    return invalid();
+  }
   try {
     const realWorkState = realpathSync(wsDir);
     const realFeatures = realpathSync(featuresDir);
     const realFeature = realpathSync(featureDir);
-    if (!isWithin(realWorkState, realFeatures) || !isWithin(realFeatures, realFeature)) return null;
-    if (!isWithin(realFeature, realpathSync(statePath))) return null;
-    const artifactsPath = join(featureDir, "artifacts");
-    if (existsSync(artifactsPath) && !isWithin(realFeature, realpathSync(artifactsPath))) return null;
+    if (!isWithin(realWorkState, realFeatures) || !isWithin(realFeatures, realFeature)) return invalid();
+    if (!isWithin(realFeature, realpathSync(statePath))) return invalid();
+    if (existsSync(artifactsPath) && !isWithin(realFeature, realpathSync(artifactsPath))) return invalid();
     const state = normalizePersistedState(JSON.parse(readFileSync(statePath, "utf8")));
-    if (!state || state.branch !== currentBranch) return null;
+    if (!state) return invalid();
+    if (state.branch !== currentBranch) return null;
     return { state, statePath, stateDir: featureDir, artifactsDir: artifactsPath, isLegacy: false, isStale: false };
   } catch {
-    return null;
+    return invalid();
   }
 }
 
@@ -676,8 +686,9 @@ export function resolveCanonicalRun(cwd: string, selector: StateSelector = {}, c
 
 export function resolveState(cwd: string, currentBranch?: string): ResolvedState {
   const wsDir = resolve(cwd, WORK_STATE_DIR);
+  const none = (): ResolvedState => ({ state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false });
   if (!existsSync(wsDir)) {
-    return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false };
+    return none();
   }
   try {
     if (!isWithin(realpathSync(cwd), realpathSync(wsDir))) {
@@ -696,7 +707,10 @@ export function resolveState(cwd: string, currentBranch?: string): ResolvedState
     const featuresDir = join(wsDir, "features");
     const featureDir = join(featuresDir, slug);
     const statePath = join(featureDir, "state.json");
-    if (!existsSync(featuresDir)) return { state: null, statePath: null, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false };
+    const staleTarget = (): ResolvedState => currentBranch
+      ? none()
+      : { state: null, statePath, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false };
+    if (!existsSync(featuresDir)) return staleTarget();
     try {
       const realWorkState = realpathSync(wsDir);
       const realFeatures = realpathSync(featuresDir);
@@ -706,7 +720,15 @@ export function resolveState(cwd: string, currentBranch?: string): ResolvedState
     } catch {
       return { state: null, statePath, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false, invalid: true };
     }
-    if (!existsSync(statePath)) return { state: null, statePath: null, stateDir: featureDir, artifactsDir: join(featureDir, "artifacts"), isLegacy: false, isStale: false };
+    if (!existsSync(statePath)) {
+      if (currentBranch) {
+        const own = resolveBranchOwnedFeatureState(wsDir, currentBranch);
+        if (own) return own;
+      }
+      const legacyFallback = resolveLegacyWorkflowFallback(cwd, wsDir, currentBranch);
+      if (legacyFallback) return legacyFallback;
+      return staleTarget();
+    }
     try {
       const realFeature = realpathSync(featureDir);
       if (!isWithin(realFeature, realpathSync(statePath))) {
@@ -765,7 +787,11 @@ export function resolveState(cwd: string, currentBranch?: string): ResolvedState
       return { state: null, statePath: legacyPath, stateDir: wsDir, artifactsDir: join(wsDir, "artifacts"), isLegacy: true, isStale: false, invalid: true };
     }
   }
-  return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false };
+  if (currentBranch) {
+    const own = resolveBranchOwnedFeatureState(wsDir, currentBranch);
+    if (own) return own;
+  }
+  return none();
 }
 
 /**
@@ -1544,7 +1570,7 @@ export function updateStateAtomically<T>(
     const sourceCurrent = readRawStateSnapshot(initial.prepared.statePath);
     const sourceConflict = casConflict(raw, sourceCurrent);
     if (sourceConflict) return { ok: false, code: "state_conflict", error: sourceConflict };
-    if (prepared.statePath !== initial.prepared.statePath) {
+    if (prepared.statePath !== initial.prepared.statePath || target.isStale || raw.kind !== "present") {
       const destination = readRawStateSnapshot(prepared.statePath);
       if (destination.kind === "invalid") return { ok: false, code: "state_conflict", error: destination.error };
       if (destination.kind === "present") {
