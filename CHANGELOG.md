@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.28.3] — 2026-09-02
+### Fixed
+- **Continuation scope preservation** — omitting `workflow_prepare.files` preserves persisted `scope` and `dev_agent`; explicit empty files and missing or invalid mappings remain fail-closed.
+
 ## [0.28.2] — 2026-09-02
 ### Fixed
 - **Pointerless and stale-selector recovery** — branch-owned workflow state remains resumable when the active pointer or legacy selectors are absent, stale, or missing.
