@@ -2,6 +2,12 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [0.28.2] — 2026-09-02
+### Fixed
+- **Pointerless and stale-selector recovery** — branch-owned workflow state remains resumable when the active pointer or legacy selectors are absent, stale, or missing.
+- **Current-branch preparation** — a fresh prepare targets the current branch instead of reusing a stale slot.
+- **Fail-closed destination handling** — malformed or foreign destinations remain untouched rather than being claimed or overwritten.
+
 ## [0.28.1] — 2026-09-01
 ### Fixed
 - **Branch-owned state recovery over stale slots** — workflow recovery now prefers branch-owned durable state over stale slot records, preventing unrelated slot data from hijacking resume decisions.
