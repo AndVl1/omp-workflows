@@ -108,6 +108,18 @@ test("cto-cmd: buildCtoPrompt renders teams from .omp/teams.json", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("cto-cmd: distinguishes CTO CtoState id from workflow_prepare TeamState run_key", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-core-state-boundary-"));
+  try {
+    const prompt = buildCtoPrompt(parseCtoEnvelope("Dispatch a slice", root), root);
+    assert.ok(prompt.includes("canonical top-level `id` MUST equal"), "CTO state identity is explicit");
+    assert.ok(prompt.includes("use `id`, never `run_id` or `run_key`"), "workflow identity aliases are rejected");
+    assert.ok(prompt.includes("separate from `/do-work`'s `.work-state/features/.../state.json`"), "state families are separated");
+    assert.ok(prompt.includes("never use a workflow `run_key` or branch as a CTO slice marker run id"), "marker identity cannot come from workflow state");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("cto-cmd: buildCtoPrompt rejects malformed team definitions without throwing", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-core-malformed-team-"));
