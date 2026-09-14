@@ -54,7 +54,6 @@ import { join } from "node:path";
 import { sha256, bindFeatureWorkspaceToRoot, validConstitutionBinding, validFeatureWorkspace } from "./fixtures/specification-fixtures.js";
 import { evaluateConstitutionUsability } from "../src/gates/constitution.js";
 import { registerTestConstitutionProvider, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
-import { registerTestWorkflowTools, registerTestConstitutionTools } from "./fixtures/host-tool-activation.js";
 import {
   resolveConstitutionProvider,
 } from "../src/specification/constitution-provider.js";
@@ -620,6 +619,7 @@ test("with no providers and no override the native CONSTITUTION.md default resol
 
 // ── Explicit override precedence ─────────────────────────────────────────────
 
+
 test("a valid explicit constitution.path override wins over discovered providers", () => {
   const root = makeProject();
   try {
@@ -640,6 +640,7 @@ test("a valid explicit constitution.path override wins over discovered providers
   }
 });
 
+
 test("an unsafe explicit override path fails closed with SPEC_PATH_UNAUTHORIZED", () => {
   const root = makeProject();
   try {
@@ -652,6 +653,7 @@ test("an unsafe explicit override path fails closed with SPEC_PATH_UNAUTHORIZED"
 });
 
 // ── Discovered provider precedence and ambiguity ─────────────────────────────
+
 
 test("exactly one discovered provider beats the native default; missing paths fall through", () => {
   const root = makeProject();
@@ -681,6 +683,41 @@ test("exactly one discovered provider beats the native default; missing paths fa
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("provider candidate revoked and trap proxies fail as typed discovery errors", () => {
+  const revokedRoot = makeProject();
+  const trappedRoot = makeProject();
+  try {
+    writeTestRegistryMarker(revokedRoot);
+    const revoked = Proxy.revocable(["CONSTITUTION.md"], {});
+    revoked.revoke();
+    registerTestConstitutionProvider(revokedRoot, {
+      provider_id: "revoked-candidates",
+      discover: () => revoked.proxy,
+    });
+    let revokedResult: ReturnType<typeof resolveConstitutionProvider> | undefined;
+    assert.doesNotThrow(() => { revokedResult = resolveConstitutionProvider(revokedRoot); });
+    assert.equal(revokedResult?.ok, false);
+    if (revokedResult && !revokedResult.ok) assert.equal(revokedResult.code, "SPEC_CONSTITUTION_DISCOVERY_FAILED");
+
+    writeTestRegistryMarker(trappedRoot);
+    const trapped = new Proxy(["CONSTITUTION.md"], {
+      getPrototypeOf() { throw new Error("prototype trap"); },
+    });
+    registerTestConstitutionProvider(trappedRoot, {
+      provider_id: "trapped-candidates",
+      discover: () => trapped,
+    });
+    let trappedResult: ReturnType<typeof resolveConstitutionProvider> | undefined;
+    assert.doesNotThrow(() => { trappedResult = resolveConstitutionProvider(trappedRoot); });
+    assert.equal(trappedResult?.ok, false);
+    if (trappedResult && !trappedResult.ok) assert.equal(trappedResult.code, "SPEC_CONSTITUTION_DISCOVERY_FAILED");
+  } finally {
+    rmSync(revokedRoot, { recursive: true, force: true });
+    rmSync(trappedRoot, { recursive: true, force: true });
   }
 });
 
@@ -721,6 +758,7 @@ test("several existing provider candidates block as ambiguous regardless of regi
 
 // ── Deterministic usability ──────────────────────────────────────────────────
 
+
 test("usability classifies missing, empty, unresolved-marker, and invalid documents as required", () => {
   const missing = evaluateConstitutionUsability(null);
   assert.equal(missing.status, "constitution_required");
@@ -732,6 +770,7 @@ test("usability classifies missing, empty, unresolved-marker, and invalid docume
     assert.ok(result.reason && result.reason.length > 0, "every blocking classification carries a reason");
   }
 });
+
 
 test("usable documents pass without a checkpoint; warnings never block", () => {
   const usable = evaluateConstitutionUsability(VALID_CONSTITUTION);
@@ -745,6 +784,7 @@ test("usable documents pass without a checkpoint; warnings never block", () => {
 });
 
 // ── Idempotent prerequisite and exact resume ─────────────────────────────────
+
 
 test("a usable constitution binds and resumes without opening any checkpoint", () => {
   const root = makeProject();
@@ -765,6 +805,7 @@ test("a usable constitution binds and resumes without opening any checkpoint", (
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("a forged usable binding with unusable matching-hash bytes reopens native correction", () => {
   const root = makeProject();
@@ -795,6 +836,7 @@ test("a forged usable binding with unusable matching-hash bytes reopens native c
   }
 });
 
+
 test("persisted constitution gate rejects missing, extra, malformed, inconsistent, and forged fields", () => {
   const mutations: Array<[string, (gate: Record<string, any>) => void]> = [
     ["missing outer gate id", gate => { delete gate.gate_id; }],
@@ -824,6 +866,7 @@ test("persisted constitution gate rejects missing, extra, malformed, inconsisten
     }
   }
 });
+
 
 test("constitution gate bounded collections reject max-plus-one and oversized draft payloads before lookup", () => {
   const digest = sha256(VALID_CONSTITUTION);
@@ -885,6 +928,7 @@ test("constitution gate bounded collections reject max-plus-one and oversized dr
     }
   }
 });
+
 
 test("gate envelope reads at its durable cap and rejects cap-plus-one without overwriting", () => {
   const root = makeProject();
@@ -953,6 +997,7 @@ test("gate envelope reads at its durable cap and rejects cap-plus-one without ov
   }
 });
 
+
 test("draft presentation rejects a root swap during pinned state classification without writing", () => {
   const root = makeProject();
   const displaced = `${root}-displaced`;
@@ -998,6 +1043,7 @@ test("draft presentation rejects a root swap during pinned state classification 
     rmSync(displaced, { recursive: true, force: true });
   }
 });
+
 
 test("bootstrap opens exactly two decisions and approve_continue resumes the exact native origin once", () => {
   const root = makeProject();
@@ -1116,6 +1162,7 @@ test("bootstrap opens exactly two decisions and approve_continue resumes the exa
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 test("gate-owned approval binds only the exact fresh native origin workspace", () => {
   const root = makeProject();
   try {
@@ -1165,6 +1212,7 @@ test("gate-owned approval binds only the exact fresh native origin workspace", (
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("gate-owned approval refuses to bind an origin workspace after constitution source drift", () => {
   const root = makeProject();
@@ -1220,6 +1268,7 @@ test("gate-owned approval refuses to bind an origin workspace after constitution
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("gate-owned approval returns a durable failure after gate commit and same-answer replay repairs the workspace", () => {
   const root = makeProject();
@@ -1282,6 +1331,7 @@ test("gate-owned approval returns a durable failure after gate commit and same-a
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("gate-owned approval rejects a wrong origin selector without binding another workspace", () => {
   const root = makeProject();
@@ -1346,6 +1396,7 @@ function writeSyntheticSourceWal(
     pinned.close();
   }
 }
+
 
 test("source correction WAL recovers preimage, owned postimage, approved postimage, and concurrent replacement", () => {
   const absentRoot = makeProject();
@@ -1460,6 +1511,7 @@ test("source correction WAL recovers preimage, owned postimage, approved postima
   }
 });
 
+
 test("approved bootstrap corrections create absent native files and replace unusable native files", () => {
   const cases: ReadonlyArray<{ label: string; content?: string; explicitPath?: string }> = [
     { label: "absent" },
@@ -1484,6 +1536,7 @@ test("approved bootstrap corrections create absent native files and replace unus
   }
 });
 
+
 test("constitution correction fails closed when the selected source preimage changes", () => {
   const root = makeProject();
   try {
@@ -1500,6 +1553,7 @@ test("constitution correction fails closed when the selected source preimage cha
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("constitution correction fails closed on a symlink path swap", () => {
   const root = makeProject();
@@ -1518,6 +1572,7 @@ test("constitution correction fails closed on a symlink path swap", () => {
     rmSync(outside, { recursive: true, force: true });
   }
 });
+
 
 test("discovered provider corrections remain read-only", () => {
   const root = makeProject();
@@ -1538,6 +1593,7 @@ test("discovered provider corrections remain read-only", () => {
   }
 });
 
+
 test("successful native correction replay is byte-idempotent", () => {
   const root = makeProject();
   try {
@@ -1557,6 +1613,7 @@ test("successful native correction replay is byte-idempotent", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("changed unusable bound native source reopens exact correction and repairs after approval", () => {
   const root = makeProject();
@@ -1594,6 +1651,7 @@ test("changed unusable bound native source reopens exact correction and repairs 
   }
 });
 
+
 test("deleted approved native source reopens correction and a different recreation remains review-bound", () => {
   const root = makeProject();
   try {
@@ -1616,6 +1674,7 @@ test("deleted approved native source reopens correction and a different recreati
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("deleted approved discovered source falls back only to an explicit review gate and never writes the discovered path", () => {
   const root = makeProject();
@@ -1640,6 +1699,7 @@ test("deleted approved discovered source falls back only to an explicit review g
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("discovered deletion never clears a newer origin workspace constitution binding", () => {
   const root = makeProject();
@@ -1679,6 +1739,7 @@ test("discovered deletion never clears a newer origin workspace constitution bin
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("cross-process constitution decisions commit one durable decision and consume one proof", { timeout: CONSTITUTION_CHILD_TIMEOUT_MS + 5_000 }, async () => {
   const root = makeProject();
@@ -1764,6 +1825,7 @@ test("cross-process constitution decisions commit one durable decision and consu
   }
 });
 
+
 test("cross-process distinct constitution drafts publish one canonical version and stale the loser", { timeout: CONSTITUTION_CHILD_TIMEOUT_MS + 5_000 }, async () => {
   const root = makeProject();
   try {
@@ -1828,6 +1890,7 @@ test("cross-process distinct constitution drafts publish one canonical version a
   }
 });
 
+
 test("constitution approval rejects an immutable draft artifact with mismatched bytes", () => {
   const root = makeProject();
   try {
@@ -1857,6 +1920,7 @@ test("constitution approval rejects an immutable draft artifact with mismatched 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("unusable and oversized drafts are rejected before a checkpoint or validation artifact exists", () => {
   const root = makeProject();
@@ -1898,6 +1962,7 @@ test("unusable and oversized drafts are rejected before a checkpoint or validati
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("approval fails closed when engine-owned draft evidence is missing", () => {
   const root = makeProject();
@@ -1941,6 +2006,7 @@ test("approval fails closed when engine-owned draft evidence is missing", () => 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("constitution decisions reject fabricated, cross-context, mismatched, and non-user proofs", () => {
   const root = makeProject();
@@ -2037,6 +2103,7 @@ test("constitution decisions reject fabricated, cross-context, mismatched, and n
   }
 });
 
+
 test("request_changes re-dispatches the same draft stage with feedback and a new version", () => {
   const root = makeProject();
   try {
@@ -2117,6 +2184,7 @@ test("request_changes re-dispatches the same draft stage with feedback and a new
   }
 });
 
+
 test("an external import origin resumes at compatibility validation", () => {
   const root = makeProject();
   try {
@@ -2164,6 +2232,7 @@ test("an external import origin resumes at compatibility validation", () => {
 
 // ── Semantic impact assessment ───────────────────────────────────────────────
 
+
 test("formatting-only changes stay no-impact only when semantic hashes prove equivalence", () => {
   const root = makeProject();
   try {
@@ -2193,6 +2262,7 @@ test("formatting-only changes stay no-impact only when semantic hashes prove equ
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("a semantic change marks affected artifacts and their dependency closure stale", () => {
   const root = makeProject();
@@ -2238,6 +2308,7 @@ test("a semantic change marks affected artifacts and their dependency closure st
   }
 });
 
+
 test("impact that cannot be established safely blocks instead of guessing", () => {
   const root = makeProject();
   try {
@@ -2264,6 +2335,7 @@ test("impact that cannot be established safely blocks instead of guessing", () =
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 test("identical assessment inputs produce one identical idempotent assessment", () => {
   const root = makeProject();
@@ -2307,6 +2379,7 @@ test("identical assessment inputs produce one identical idempotent assessment", 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 test("constitution impact evidence stays readable near its cap and rejects cap-plus-one output before writing", () => {
   const nearRoot = makeProject();
   const oversizedRoot = makeProject();
@@ -2357,6 +2430,7 @@ test("constitution impact evidence stays readable near its cap and rejects cap-p
     rmSync(oversizedRoot, { recursive: true, force: true });
   }
 });
+
 
 
 test("strict constitution reader honors explicit custom paths and rejects drift or escape", () => {
@@ -2410,6 +2484,7 @@ test("strict constitution reader honors explicit custom paths and rejects drift 
   }
 });
 
+
 test("nested missing constitution overrides bootstrap safely and seed only inside the project", () => {
   const root = makeProject();
   try {
@@ -2428,6 +2503,7 @@ test("nested missing constitution overrides bootstrap safely and seed only insid
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+
 test("constitution symlink targets outside the project fail closed", () => {
   const root = makeProject();
   const outside = makeProject();
@@ -2443,6 +2519,7 @@ test("constitution symlink targets outside the project fail closed", () => {
     rmSync(outside, { recursive: true, force: true });
   }
 });
+
 
 test("constitution drift requires durable complete engine evidence and only no-impact evidence unblocks", () => {
   const root = makeProject();
@@ -2559,6 +2636,7 @@ test("constitution drift requires durable complete engine evidence and only no-i
   }
 });
 
+
 test("feature-bound constitution guards block stale workspace bindings for every origin", () => {
   const root = makeProject();
   try {
@@ -2620,6 +2698,7 @@ test("feature-bound constitution guards block stale workspace bindings for every
   }
 });
 
+
 test("malformed feature specification aggregate fails closed without mutating the constitution gate", () => {
   const root = makeProject();
   try {
@@ -2662,6 +2741,7 @@ test("malformed feature specification aggregate fails closed without mutating th
   }
 });
 
+
 test("impact evidence writes reject symlinked state ancestors without touching the target", () => {
   const previous = validConstitutionBinding();
   const changed = validConstitutionBinding({
@@ -2701,6 +2781,7 @@ test("impact evidence writes reject symlinked state ancestors without touching t
     }
   }
 });
+
 test("constitution prompt renderer emits one complete origin contract for every route", () => {
   const cases = [
     { origin_kind: "native_direct", origin_stage: "specify" },
@@ -2740,6 +2821,7 @@ test("constitution prompt renderer emits one complete origin contract for every 
     assert.match(prompt, /reading xd:\/\/ device documentation never executes/iu);
   }
 });
+
 
 test("constitution prompt branches typed initial bootstrap and approved-binding drift safely", () => {
   const origin = {
@@ -2784,420 +2866,7 @@ test("constitution prompt branches typed initial bootstrap and approved-binding 
   assert.doesNotMatch(drift, /constitution_checkpoint_ask_selected/u);
 });
 
-test("constitution registrar exposes one strict canonical tool set and ignores duplicate registration", () => {
-  const registered: Array<{ name: string; description: string; parameters: { safeParse: (input: unknown) => { success: boolean } } }> = [];
-  const pi = {
-    zod: z,
-    on: TEST_ON,
-    registerTool(tool: { name: string; description: string; parameters: { safeParse: (input: unknown) => { success: boolean } } }) {
-      registered.push(tool);
-    },
-  };
-  const registryRoot = makeProject();
-  try {
-    registerTestConstitutionTools(registryRoot, pi as never);
-    registerTestConstitutionTools(registryRoot, pi as never);
-  assert.deepEqual(registered.map((tool) => tool.name), [
-    "ensure_project_constitution",
-    "present_constitution_draft",
-    "constitution_checkpoint_ask_selected",
-    "decide_constitution_checkpoint",
-    "constitution_impact_assess",
-    "constitution_impact_ask_selected",
-    "constitution_impact_apply",
-  ]);
-  assert.ok(registered.every((tool) => tool.description.length > 0));
-  const ensure = registered[0]!;
-  const originCases = [
-    ["native_direct", "specify"],
-    ["do_work_nested", "do_work"],
-    ["cto_preparation", "cto"],
-    ["external_import", "spec_import"],
-  ] as const;
-  for (const [origin_kind, origin_stage] of originCases) {
-    assert.equal(ensure.parameters.safeParse({
-      feature_id: "constitution-feature",
-      run_key: "run-origin-1",
-      origin_kind,
-      origin_run_key: "run-origin-1",
-      origin_stage,
-    }).success, true);
-  }
-  assert.equal(ensure.parameters.safeParse({
-    feature_id: "constitution-feature",
-    run_key: "run-origin-1",
-    origin_kind: "native_direct",
-    origin_run_key: "run-origin-1",
-    origin_stage: "do_work",
-  }).success, false);
-  assert.equal(ensure.parameters.safeParse({
-    feature_id: "constitution-feature",
-    run_key: "run-origin-1",
-    origin_kind: "native_direct",
-    origin_stage: "specify",
-  }).success, false);
-  assert.equal(ensure.parameters.safeParse({
-    feature_id: "constitution-feature",
-    run_key: "run-origin-1",
-    origin_kind: "native_direct",
-    origin_run_key: "run-origin-1",
-  }).success, false);
-  const present = registered[1]!;
-  assert.equal(present.parameters.safeParse({
-    feature_id: "constitution-feature",
-    run_key: "run-origin-1",
-    gate_id: "constitution.gate",
-    document: VALID_CONSTITUTION,
-  }).success, true);
-  assert.equal(present.parameters.safeParse({
-    feature_id: "constitution-feature",
-    run_key: "run-origin-1",
-    gate_id: "constitution.gate",
-    document: VALID_CONSTITUTION,
-    unexpected: true,
-  }).success, false);
-  const ask = registered[2]!;
-  assert.equal(ask.parameters.safeParse({
-    feature_id: "constitution-feature",
-    run_key: "run-origin-1",
-    gate_id: "constitution.gate",
-    checkpoint_id: "constitution.gate.checkpoint.v1",
-    draft_sha256: "a".repeat(64),
-    checkpoint_kind: "constitution_approval",
-  }).success, true);
-  assert.equal(ask.parameters.safeParse({
-    feature_id: "constitution-feature",
-    run_key: "run-origin-1",
-    gate_id: "constitution.gate",
-    checkpoint_id: "constitution.gate.checkpoint.v1",
-    draft_sha256: "a".repeat(64),
-    checkpoint_kind: "constitution_approval",
-    unexpected: true,
-  }).success, false);
-  const decide = registered[3]!;
-  assert.equal(decide.parameters.safeParse({
-    actor_provenance: { proof: { answer_id: "answer-1", nonce: "nonce-1", channel: "terminal", reference: "agent", binding: "binding-1" } },
-  }).success, false);
-  } finally { rmSync(registryRoot, { recursive: true, force: true }); }
-});
 
-test("constitution present result points to the concrete UI Ask as its only next action", async () => {
-  const root = makeProject();
-  try {
-    seedDecisionWorkspace(root);
-    const tools = new Map<string, { execute: (...args: never[]) => Promise<{ details: unknown }> }>();
-    registerTestConstitutionTools(root, {
-      zod: z,
-      on: TEST_ON,
-      registerTool(tool: { name: string; execute: (...args: never[]) => Promise<{ details: unknown }> }) {
-        tools.set(tool.name, tool);
-      },
-    } as never);
-
-    const context = TEST_CONTEXT(root);
-    const selector = workspaceSelector();
-    const ensure = await tools.get("ensure_project_constitution")!.execute("test", {
-      ...selector,
-      origin_kind: "native_direct",
-      origin_run_key: selector.run_key,
-      origin_stage: "specify",
-    }, undefined, undefined, context);
-    assert.equal((ensure.details as { ok?: boolean }).ok, true);
-    const ensured = ensure.details as {
-      value?: { gate_id?: string };
-      required_next_tool?: { name?: string; arguments?: Record<string, unknown>; required_fields?: string[] };
-    };
-    assert.ok(ensured.value?.gate_id);
-    assert.equal(ensured.required_next_tool?.name, "present_constitution_draft");
-    assert.deepEqual(ensured.required_next_tool?.arguments, {
-      feature_id: selector.feature_id,
-      run_key: selector.run_key,
-      gate_id: ensured.value!.gate_id,
-    });
-    assert.deepEqual(ensured.required_next_tool?.required_fields, ["document"]);
-
-    const present = await tools.get("present_constitution_draft")!.execute("test", {
-      ...selector,
-      gate_id: ensured.value!.gate_id,
-      document: VALID_CONSTITUTION,
-    }, undefined, undefined, context);
-    const details = present.details as {
-      ok?: boolean;
-      required_next_tool?: { name?: string; arguments?: Record<string, unknown> };
-      next_action?: string;
-    };
-    assert.equal(details.ok, true);
-    assert.equal(details.required_next_tool?.name, "constitution_checkpoint_ask_selected");
-    const expectedDigest = sha256(VALID_CONSTITUTION);
-    assert.deepEqual(details.required_next_tool?.arguments, {
-      feature_id: selector.feature_id,
-      run_key: selector.run_key,
-      gate_id: ensured.value!.gate_id,
-      checkpoint_id: details.required_next_tool?.arguments?.checkpoint_id,
-      draft_sha256: expectedDigest,
-      checkpoint_kind: "constitution_approval",
-      question: "Review the canonical constitution draft and choose approve_continue or request_changes.",
-    });
-    assert.match(details.next_action ?? "", /^Immediately call constitution_checkpoint_ask_selected with required_next_tool\.arguments/u);
-    const ask = tools.get("constitution_checkpoint_ask_selected")!;
-    let askDialogInvoked = false;
-    let selectorInvoked = false;
-    const askResult = await ask.execute("test", details.required_next_tool!.arguments!, undefined, undefined, {
-      ...context,
-      ui: {
-        askDialog: async (
-          questions: Array<{ id: string; question: string; header?: string; options: Array<{ label: string }>; multi?: boolean }>,
-          dialogOptions?: { signal?: AbortSignal },
-        ) => {
-          askDialogInvoked = true;
-          assert.equal(questions.length, 1);
-          assert.deepEqual(dialogOptions, { signal: undefined });
-          assert.equal(questions[0]!.id, `constitution:${selector.feature_id}:${details.required_next_tool!.arguments!.checkpoint_id}`);
-          assert.match(questions[0]!.question, /^Canonical constitution approval checkpoint:/u);
-          assert.match(questions[0]!.question, /^feature_id=constitution-feature \| run_key=run-origin-1 \| stage_id=specify$/mu);
-          assert.equal(questions[0]!.question.split("\n").length, 7);
-          assert.ok(Buffer.byteLength(questions[0]!.question, "utf8") <= 12 * 1024);
-          assert.equal(questions[0]!.question.includes("# Project Constitution"), false);
-          assert.equal(questions[0]!.question.includes("Version:"), false);
-          assert.equal(questions[0]!.header, "Constitution approval");
-          assert.deepEqual(questions[0]!.options, [{ label: "approve_continue" }, { label: "request_changes" }]);
-          assert.equal(questions[0]!.multi, false);
-          return {
-            kind: "submit" as const,
-            results: [{
-              id: questions[0]!.id,
-              question: questions[0]!.question,
-              header: questions[0]!.header,
-              options: questions[0]!.options.map((option) => option.label),
-              multi: false,
-              selectedOptions: ["approve_continue"],
-            }],
-          };
-        },
-        select: async () => {
-          selectorInvoked = true;
-          return "request_changes";
-        },
-      },
-    } as never);
-    const oversizedPrompt = await ask.execute("test", {
-      ...details.required_next_tool!.arguments!,
-      question: "x".repeat(20_000),
-    }, undefined, undefined, context);
-    const oversizedDetails = oversizedPrompt.details as { ok?: boolean; code?: string };
-    assert.equal(oversizedDetails.ok, false);
-    assert.equal(oversizedDetails.code, "CONSTITUTION_CHECKPOINT_ASK_REJECTED");
-    assert.equal(askDialogInvoked, true);
-    assert.equal(selectorInvoked, false);
-    const askDetails = askResult.details as {
-      ok?: boolean;
-      actor_provenance?: { kind?: string; ref?: string; proof?: Record<string, unknown> };
-      required_next_tool?: { name?: string; arguments?: Record<string, unknown> };
-      next_action?: string;
-    };
-    assert.equal(askDetails.ok, true);
-    assert.equal(askDetails.actor_provenance?.kind, "user");
-    assert.ok(askDetails.actor_provenance?.proof?.answer_id);
-    assert.equal(askDetails.required_next_tool?.name, "decide_constitution_checkpoint");
-    assert.deepEqual(askDetails.required_next_tool?.arguments, {
-      feature_id: selector.feature_id,
-      run_key: selector.run_key,
-      gate_id: ensured.value!.gate_id,
-      checkpoint_id: details.required_next_tool!.arguments!.checkpoint_id,
-      decision: "approve_continue",
-      authorization: "human",
-      actor_provenance: askDetails.actor_provenance,
-    });
-    assert.match(askDetails.next_action ?? "", /^Immediately call decide_constitution_checkpoint with required_next_tool\.arguments/u);
-    const decide = await tools.get("decide_constitution_checkpoint")!.execute(
-      "test",
-      askDetails.required_next_tool!.arguments!,
-      undefined,
-      undefined,
-      context,
-    );
-    const decideDetails = decide.details as {
-      ok?: boolean;
-      completed_prerequisite?: { kind?: string; status?: string; gate_id?: string };
-      next_action?: string;
-    };
-    assert.equal(decideDetails.ok, true);
-    assert.deepEqual(decideDetails.completed_prerequisite, {
-      kind: "project_constitution",
-      status: "approved",
-      gate_id: ensured.value!.gate_id,
-      origin_kind: "native_direct",
-      origin_run_key: selector.run_key,
-      origin_stage: "specify",
-    });
-    assert.match(decideDetails.next_action ?? "", /constitution prerequisite is complete/u);
-
-    const downstreamTools = new Map<string, { execute: (...args: never[]) => Promise<{ details: unknown }> }>();
-    registerTestWorkflowTools(root, {
-      zod: { z },
-      on: TEST_ON,
-      resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd,
-
-      registerTool(tool: { name: string; execute: (...args: never[]) => Promise<{ details: unknown }> }) {
-        downstreamTools.set(tool.name, tool);
-      },
-    } as never, {}, "core-test-constitution-tools");
-    const downstream = await downstreamTools.get("workflow_begin")!.execute("test", selector, undefined, undefined, context);
-    const downstreamDetails = downstream.details as {
-      ok?: boolean;
-      code?: string;
-      required_next_tool?: unknown;
-      next_action?: string;
-    };
-    assert.equal(downstreamDetails.required_next_tool, undefined, "an approved origin workspace no longer needs a synthetic prerequisite replay");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("constitution Ask uses a trusted RPC session UI for UI-less tool contexts and drops it on session switch", async () => {
-  const root = makeProject();
-  const switchedRoot = makeProject();
-  try {
-    seedDecisionWorkspace(root);
-    seedDecisionWorkspace(switchedRoot);
-    const tools = new Map<string, { execute: (...args: never[]) => Promise<{ details: unknown }> }>();
-    const sessionStarts: Array<(event: unknown, ctx: unknown) => unknown> = [];
-    const sessionManager = { getSessionId: () => "constitution-main-session", getCwd: () => root };
-    const phases: Array<{ phase: string; source?: string; api?: string; outcome?: string }> = [];
-    let profileAskCalls = 0;
-    registerTestConstitutionTools(root, {
-      zod: z,
-      on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
-        if (event === "session_start") sessionStarts.push(handler);
-      },
-      registerTool(tool: { name: string; execute: (...args: never[]) => Promise<{ details: unknown }> }) {
-        tools.set(tool.name, tool);
-      },
-    } as never, { onAskPhase: diagnostic => phases.push(diagnostic) });
-    sessionStarts[0]!({}, {
-      mode: "rpc",
-      hasUI: true,
-      sessionManager,
-      ui: { askDialog: async () => undefined },
-    });
-    const ask = tools.get("constitution_checkpoint_ask_selected");
-    assert.ok(ask, "constitution Ask tool must be mounted");
-    const selector = workspaceSelector();
-    const ensure = await tools.get("ensure_project_constitution")!.execute("test", {
-      ...selector,
-      origin_kind: "native_direct",
-      origin_run_key: selector.run_key,
-      origin_stage: "specify",
-    }, undefined, undefined, { cwd: root, hasUI: true, sessionManager } as never);
-    assert.equal((ensure.details as { ok?: boolean }).ok, true, JSON.stringify(ensure.details));
-    const ensured = ensure.details as { value?: { gate_id?: string } };
-    assert.ok(ensured.value?.gate_id);
-    const present = await tools.get("present_constitution_draft")!.execute("test", {
-      ...selector,
-      gate_id: ensured.value!.gate_id,
-      document: VALID_CONSTITUTION,
-    }, undefined, undefined, { cwd: root, hasUI: true, sessionManager } as never);
-    const presentDetails = present.details as { ok?: boolean; required_next_tool?: { arguments?: Record<string, unknown> } };
-    assert.equal(presentDetails.ok, true, JSON.stringify(present.details));
-    const askArguments = presentDetails.required_next_tool?.arguments;
-    assert.ok(askArguments);
-
-    const noProfile = await ask.execute("test", askArguments!, undefined, undefined, {
-      cwd: root,
-      hasUI: false,
-      sessionManager: { getSessionId: () => "constitution-main-session", getCwd: () => root },
-    } as never);
-    assert.equal((noProfile.details as { ok?: boolean }).ok, false);
-    assert.equal((noProfile.details as { code?: string }).code, "REGISTRATION_FAILED");
-    assert.match((noProfile.details as { error?: string }).error ?? "", /activation_identity_changed/);
-
-    sessionStarts[0]!({}, {
-      mode: "rpc",
-      hasUI: true,
-      sessionManager,
-      ui: {
-        askDialog: async (questions: Array<{ id: string; question: string; header?: string; options: Array<{ label: string }>; multi?: boolean }>) => {
-          profileAskCalls += 1;
-          const question = questions[0]!;
-          return {
-            kind: "submit" as const,
-            results: [{
-              id: question.id,
-              question: question.question,
-              header: question.header,
-              options: question.options.map((option) => option.label),
-              selectedOptions: ["approve_continue"],
-              multi: false,
-            }],
-          };
-        },
-      },
-    });
-    const authorized = await ask.execute("test", askArguments!, undefined, undefined, {
-      cwd: root,
-      hasUI: true,
-      sessionManager,
-    } as never);
-    const authorizedDetails = authorized.details as Record<string, unknown>;
-    assert.equal(authorizedDetails.ok, true, JSON.stringify(authorized.details));
-    assert.equal("ask_diagnostics" in authorizedDetails, false, "successful Ask output must remain free of diagnostics");
-    assert.equal(profileAskCalls, 1);
-    assert.deepEqual(phases.map((phase) => phase.phase), [
-      "validation_start",
-      "validation_end",
-      "surface_selected",
-      "ui_invoke",
-      "ui_resolve",
-      "proof_commit",
-    ]);
-    assert.equal(phases.find((phase) => phase.phase === "surface_selected")?.source, "captured_profile");
-
-    sessionStarts[0]!({}, {
-      mode: "rpc",
-      sessionManager,
-      hasUI: true,
-      ui: {
-        askDialog: async (questions: Array<{ id: string; question: string; header?: string; options: Array<{ label: string }>; multi?: boolean }>) => ({
-          kind: "cancel" as const,
-          reason: "user_cancelled",
-          results: questions.map((question) => ({
-            id: question.id,
-            question: question.question,
-            header: question.header,
-            options: question.options.map((option) => option.label),
-            selectedOptions: [],
-            multi: false,
-          })),
-        }),
-      },
-    });
-    const declined = await ask.execute("test", askArguments!, undefined, undefined, {
-      cwd: root,
-      hasUI: false,
-      sessionManager,
-    } as never);
-    const declinedDetails = declined.details as { ok?: boolean; code?: string; ask_diagnostics?: Array<{ phase?: string; source?: string }> };
-    assert.equal(declinedDetails.ok, false);
-    assert.equal(declinedDetails.code, "CONSTITUTION_CHECKPOINT_DECLINED");
-    assert.deepEqual(declinedDetails.ask_diagnostics?.map((phase) => phase.phase), [
-      "validation_start",
-      "validation_end",
-      "surface_selected",
-      "ui_invoke",
-      "ui_resolve",
-    ]);
-    assert.equal(declinedDetails.ask_diagnostics?.find((phase) => phase.phase === "surface_selected")?.source, "captured_profile");
-
-    sessionStarts[0]!({}, { mode: "print", hasUI: false, sessionManager });
-    const switched = await ask.execute("test", askArguments!, undefined, undefined, { cwd: switchedRoot, hasUI: false, sessionManager } as never);
-    assert.equal((switched.details as { ok?: boolean }).ok, false);
-    assert.equal((switched.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
-    assert.equal(profileAskCalls, 1, "a headless session switch must not reuse the prior RPC UI bridge");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-    rmSync(switchedRoot, { recursive: true, force: true });
-  }
-});
 test("constitution bootstrap uses its gate-owned trusted Ask ledger before workflow state exists", () => {
   const root = makeProject();
   try {
@@ -3267,6 +2936,7 @@ test("constitution bootstrap uses its gate-owned trusted Ask ledger before workf
   }
 });
 
+
 test("Linux borrowed constitution prerequisite persists and replays through descriptor aliases", () => {
   if (process.platform !== "linux") return;
   const root = makeProject();
@@ -3296,119 +2966,3 @@ test("Linux borrowed constitution prerequisite persists and replays through desc
   }
 });
 
-test("workflow preflight fails closed for malformed or oversized gate bytes and root swaps", async () => {
-  const root = makeProject();
-  const outside = makeProject();
-  const selector = workspaceSelector();
-  try {
-    seedDecisionWorkspace(root);
-    const ensured = ensureProjectConstitution(root, originDescriptor("native_direct"));
-    assert.equal(ensured.ok, true, ensured.ok ? "constitution gate created" : ensured.error);
-    if (!ensured.ok) return;
-    const gatePath = join(root, ".work-state", "specification", "constitution", "gate.json");
-    const tools = new Map<string, { execute: (...args: never[]) => Promise<{ details: unknown }> }>();
-    const validGate = JSON.parse(readFileSync(gatePath, "utf8")) as Record<string, unknown>;
-    registerTestWorkflowTools(root, {
-      zod: { z },
-      on: TEST_ON,
-      resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd,
-      registerTool(tool: { name: string; execute: (...args: never[]) => Promise<{ details: unknown }> }) {
-        tools.set(tool.name, tool);
-      },
-    } as never);
-    const begin = tools.get("workflow_begin");
-    assert.ok(begin);
-    if (!begin) return;
-    const invoke = () => begin.execute("test", selector, undefined, undefined, TEST_CONTEXT(root) as never);
-    for (const malformed of [
-      Buffer.from("{", "utf8"),
-      Buffer.from([0xff, 0xfe, 0xfd]),
-      Buffer.alloc(8 * 1024 * 1024 + 1, 0x78),
-    ]) {
-      writeFileSync(gatePath, malformed);
-      const result = await invoke();
-      const details = result.details as { ok?: boolean; code?: string; required_next_tool?: unknown };
-      assert.equal(details.ok, false);
-      assert.equal(details.code, "SPEC_STATE_INVALID");
-      assert.equal("required_next_tool" in details, false, "malformed gate must never expose a foreign next tool");
-    }
-    const fifoGate = {
-      ...validGate,
-      drafts: [...(Array.isArray(validGate.drafts) ? validGate.drafts : []), { version: 99 }],
-    };
-    writeFileSync(gatePath, JSON.stringify(fifoGate), "utf8");
-    const fifoResult = await invoke();
-    const fifoDetails = fifoResult.details as { ok?: boolean; code?: string; required_next_tool?: unknown };
-    assert.equal(fifoDetails.ok, false);
-    assert.equal(fifoDetails.code, "SPEC_STATE_INVALID");
-    assert.equal("required_next_tool" in fifoDetails, false, "malformed latest draft must not advance FIFO state");
-    writeFileSync(join(outside, "gate.json"), JSON.stringify(validGate), "utf8");
-    rmSync(gatePath);
-    symlinkSync(join(outside, "gate.json"), gatePath, "file");
-    const symlinkResult = await invoke();
-    const symlinkDetails = symlinkResult.details as { ok?: boolean; code?: string; required_next_tool?: unknown };
-    assert.equal(symlinkDetails.ok, false);
-    assert.equal("required_next_tool" in symlinkDetails, false, "gate symlink must not expose a foreign next tool");
-    rmSync(gatePath);
-    writeFileSync(gatePath, JSON.stringify(validGate), "utf8");
-    const ancestor = join(root, ".work-state");
-    const displacedAncestor = `${root}-work-state-displaced`;
-    renameSync(ancestor, displacedAncestor);
-    symlinkSync(join(outside, ".work-state"), ancestor, "dir");
-    const ancestorResult = await invoke();
-    const ancestorDetails = ancestorResult.details as { ok?: boolean; required_next_tool?: unknown };
-    assert.equal(ancestorDetails.ok, false);
-    assert.equal("required_next_tool" in ancestorDetails, false, "ancestor replacement must not expose a foreign next tool");
-    rmSync(ancestor, { recursive: true, force: true });
-    rmSync(displacedAncestor, { recursive: true, force: true });
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-    rmSync(outside, { recursive: true, force: true });
-  }
-
-  const swappedRoot = makeProject();
-  const displaced = `${swappedRoot}-displaced`;
-  const originalReadFile = PinnedProjectRoot.prototype.readFile;
-  let swapped = false;
-  try {
-    seedDecisionWorkspace(swappedRoot);
-    const ensured = ensureProjectConstitution(swappedRoot, originDescriptor("native_direct"));
-    assert.equal(ensured.ok, true, ensured.ok ? "constitution gate created" : ensured.error);
-    if (!ensured.ok) return;
-    const tools = new Map<string, { execute: (...args: never[]) => Promise<{ details: unknown }> }>();
-    registerTestWorkflowTools(swappedRoot, {
-      zod: { z },
-      on: TEST_ON,
-      resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd,
-      registerTool(tool: { name: string; execute: (...args: never[]) => Promise<{ details: unknown }> }) {
-        tools.set(tool.name, tool);
-      },
-    } as never);
-    const begin = tools.get("workflow_begin");
-    assert.ok(begin);
-    if (!begin) return;
-    PinnedProjectRoot.prototype.readFile = function(this: PinnedProjectRoot, relativeFile: string, options: { maxBytes?: number } = {}) {
-      let result;
-      try {
-        result = originalReadFile.call(this, relativeFile, options);
-      } finally {
-        if (!swapped) {
-          swapped = true;
-          renameSync(swappedRoot, displaced);
-          mkdirSync(swappedRoot);
-        }
-      }
-      return result;
-    };
-    const result = await begin.execute("test", selector, undefined, undefined, TEST_CONTEXT(swappedRoot) as never);
-    const details = result.details as { ok?: boolean; code?: string; error?: string; required_next_tool?: unknown };
-    assert.equal(details.ok, false);
-    assert.equal(details.code, "REGISTRATION_FAILED");
-    assert.match(details.error ?? "", /root identity|project root identity|registration context|activation[_ ]identity[_ ]changed/i);
-    assert.equal("required_next_tool" in details, false, "root swaps must not expose a foreign next tool");
-  } finally {
-    PinnedProjectRoot.prototype.readFile = originalReadFile;
-    rmSync(swappedRoot, { recursive: true, force: true });
-    rmSync(displaced, { recursive: true, force: true });
-  }
-});

@@ -96,19 +96,27 @@ const MAX_TEMPLATE_BYTES = 256 * 1024;
 const REGISTRY_FAMILY = "constitution_providers" as const;
 
 function normalizeProviderCandidates(value: unknown): { ok: true; value: string[] } | { ok: false } {
-  if (!Array.isArray(value)) return { ok: false };
-  let length: number;
-  try { length = value.length; } catch { return { ok: false }; }
-  if (!Number.isSafeInteger(length) || length > MAX_CANDIDATES_PER_PROVIDER) return { ok: false };
-  const result: string[] = [];
-  for (let index = 0; index < length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-    if (!descriptor || !Object.hasOwn(descriptor, "value") || typeof descriptor.value !== "string") return { ok: false };
-    result.push(descriptor.value);
+  try {
+    if (!Array.isArray(value)) return { ok: false };
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Array.prototype && prototype !== null) return { ok: false };
+    const descriptors = Object.getOwnPropertyDescriptors(value) as Record<string, PropertyDescriptor>;
+    const lengthDescriptor = descriptors.length;
+    if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, "value") || typeof lengthDescriptor.value !== "number" || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value > MAX_CANDIDATES_PER_PROVIDER) return { ok: false };
+    const length = lengthDescriptor.value;
+    const descriptorKeys = Reflect.ownKeys(descriptors);
+    const keys = Object.keys(descriptors).filter((key) => key !== "length");
+    if (descriptorKeys.some((key) => typeof key === "symbol") || keys.length !== length || descriptorKeys.length !== length + 1 || keys.some((key) => !/^(0|[1-9]\d*)$/u.test(key) || Number(key) >= length)) return { ok: false };
+    const result: string[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (!descriptor || !Object.hasOwn(descriptor, "value") || typeof descriptor.value !== "string") return { ok: false };
+      result.push(descriptor.value);
+    }
+    return { ok: true, value: result };
+  } catch {
+    return { ok: false };
   }
-  if (Object.getPrototypeOf(value) !== Array.prototype && Object.getPrototypeOf(value) !== null) return { ok: false };
-  if (Object.keys(value).some((key) => !/^(0|[1-9]\d*)$/u.test(key) || Number(key) >= length) || Object.getOwnPropertySymbols(value).length > 0) return { ok: false };
-  return { ok: true, value: result };
 }
 
 interface ProviderLease {

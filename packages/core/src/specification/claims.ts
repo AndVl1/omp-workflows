@@ -19,6 +19,7 @@ import type {
 import {
   canonicalJson,
   digestOf,
+  implementationConformanceMatrixDigest,
   isRecord,
   isSafeFeatureId,
   isSafeRelativePath,
