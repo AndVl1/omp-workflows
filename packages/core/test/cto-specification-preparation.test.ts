@@ -62,7 +62,7 @@ import { materializeFeatureDocuments } from "../src/specification/materialize.js
 import { parseConstitutionPrincipleIdentities, renderCanonicalPhaseDocument, type PersistedPhaseResultEnvelope } from "../src/specification/phase.js";
 import { resolveSpecificationLanguage } from "../src/specification/language.js";
 import { resolveSpecificationTemplateSet, SHIPPED_SPECIFICATION_TEMPLATE_IDS } from "../src/specification/templates.js";
-import { ensureProjectConstitution } from "../src/specification/prerequisite.js";
+import { ensureProjectConstitution, readProjectConstitutionGate } from "../src/specification/prerequisite.js";
 
 const CTO_RUN_ID = "cto-preparation-resident";
 const PROFILE_HASH = "a".repeat(64);
@@ -170,7 +170,7 @@ const recordDecisions = recordCtoSpecificationDecisions as unknown as (
 
 const PREPARATION_RUNTIME_SESSION = "cto-spec-preparation-runtime-test-session";
 function openPreparationRuntime(root: string, sessionId = PREPARATION_RUNTIME_SESSION) {
-  const runtime = openTestCtoRuntime(root, sessionId, "cto-spec-preparation-runtime-test");
+  const runtime = openTestCtoRuntime(root, sessionId, "core-test-workflow-tools");
   return { access: runtime.access, release: runtime.close };
 }
 
@@ -809,6 +809,71 @@ function armCanonicalPreparationCheckpoint(root: string, featureId: string, phas
       loop_iteration: 1,
     },
   };
+}
+
+function deriveStagedDecisionWal(
+  root: string,
+  pending: PreparationDecision,
+  mutate?: (transaction: Record<string, unknown>) => void,
+): string {
+  const selected = resolveState(root, undefined, { feature_id: pending.feature_id, run_key: pending.run_key });
+  assert.ok(selected.state && selected.statePath && selected.stateDir && selected.artifactsDir, "staged WAL fixture must resolve the canonical feature state");
+  if (!selected.state || !selected.statePath || !selected.stateDir || !selected.artifactsDir) throw new Error("staged WAL fixture state unavailable");
+  const answerId = pending.trusted_answer_ref;
+  const sourceState: TeamState = {
+    ...selected.state,
+    trusted_checkpoint_answers: (selected.state.trusted_checkpoint_answers ?? []).map((answer) => {
+      if (answer.answer_id !== answerId) return answer;
+      const { consumed_at: _consumedAt, ...unconsumed } = answer;
+      return unconsumed;
+    }),
+  };
+  const sourceContent = `${JSON.stringify(sourceState, null, 2)}\n`;
+  writeFileSync(selected.statePath, sourceContent, "utf8");
+  const transactionDir = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decision-transactions");
+  const transactionFile = readdirSync(transactionDir).find((entry) => entry.endsWith(".json"));
+  assert.ok(transactionFile, "production must publish a decision WAL before staging the fixture");
+  if (!transactionFile) throw new Error("staged WAL fixture transaction is unavailable");
+  const transactionPath = join(transactionDir, transactionFile);
+  const transaction = JSON.parse(readFileSync(transactionPath, "utf8")) as Record<string, unknown>;
+  const comparable = (state: TeamState): TeamState => {
+    const copy = { ...state };
+    delete copy.updated_at;
+    delete copy.state_revision;
+    return copy;
+  };
+  const gate = readProjectConstitutionGate(root);
+  assert.equal(gate.ok, true, gate.ok ? "" : gate.error);
+  if (!gate.ok || !gate.value.binding || !gate.value.provider) throw new Error("staged WAL fixture constitution gate is unavailable");
+  transaction.constitution_snapshot = {
+    gate_id: gate.value.gate_id,
+    status: gate.value.status,
+    checkpoint_ref: gate.value.checkpoint_ref,
+    resume_marker: gate.value.resume_marker,
+    provider: { ...gate.value.provider },
+    binding: { ...gate.value.binding },
+  };
+  transaction.staged_states = [{
+    feature_id: pending.feature_id,
+    run_key: pending.run_key,
+    mutation_id: `${String(transaction.transaction_id)}:${pending.feature_id}:${pending.run_key}`,
+    state: selected.state,
+    source_content: sourceContent,
+    source_state: sourceState,
+    source_logical_digest: sha256Hex(canonicalJson(comparable(sourceState))),
+    applied: false,
+    target: {
+      statePath: selected.statePath,
+      stateDir: selected.stateDir,
+      artifactsDir: selected.artifactsDir,
+      isLegacy: false,
+    },
+    source_digest: sha256Hex(sourceContent),
+    target_digest: sha256Hex(canonicalJson(comparable(selected.state))),
+  }];
+  mutate?.(transaction);
+  writeFileSync(transactionPath, `${JSON.stringify(transaction, null, 2)}\n`, "utf8");
+  return transactionPath;
 }
 
 /** Issue the same canonical answer and typed decision that generic workflow tools persist. */
@@ -1476,44 +1541,41 @@ describe("CTO specification preparation decisions", () => {
     }
   });
 
-  test("recovers an interrupted multi-feature commit without cross-feature consumption", async () => {
+  test("recovers an interrupted multi-feature selection without cross-feature consumption", async () => {
     const root = freshProject();
+    const firstFeature = "feature-batch-a";
+    const secondFeature = "feature-batch-b";
     try {
-      const first = await issueCanonicalDecision(root, "feature-batch-a", "specify", "approve_continue", "answer-batch-a");
-      const second = await issueCanonicalDecision(root, "feature-batch-b", "specify", "request_changes", "answer-batch-b");
-      let featureWrites = 0;
-      setCtoSpecificationDecisionFailureInjector((point) => {
-        if (point === "before_feature_state_write") {
-          featureWrites += 1;
-          if (featureWrites === 2) throw new Error("injected between feature state writes");
-        }
-      });
-      assert.throws(
-        () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [first, second] }),
-        /injected between feature state writes|CTO_SPEC_DECISION_COMMIT_FAILED/,
-      );
-      setCtoSpecificationDecisionFailureInjector(null);
-
-      const retry = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [first, second] });
-      assert.deepEqual(
-        retry.decisions.map(({ feature_id, decision: value }) => `${feature_id}:${value}`),
-        ["feature-batch-a:approve_continue", "feature-batch-b:request_changes"],
-      );
-      for (const entry of [first, second]) {
-        const selected = resolveState(root, undefined, {
-          feature_id: entry.feature_id,
-          run_key: entry.run_key,
-        });
-        const answer = selected.state?.trusted_checkpoint_answers?.find(
-          (candidate) => candidate.answer_id === entry.trusted_answer_ref,
-        );
-        assert.ok(answer?.consumed_at, `${entry.feature_id} must be consumed after recovery`);
-      }
+      const first = await issueCanonicalDecision(root, firstFeature, "specify", "approve_continue", "answer-batch-a");
+      const firstRecorded = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [first] });
+      assert.equal(firstRecorded.decisions.length, 1);
+      const second = armCanonicalPreparationCheckpoint(root, secondFeature, "specify");
+      let mutated = false;
+      setStateTransactionTestHooks({
+        beforeCas: ({ sourcePath }) => {
+          if (mutated) return;
+          mutated = true;
+          const state = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+          state.updated_at = new Date().toISOString();
+          const temporary = sourcePath + ".foreign";
+          writeFileSync(temporary, JSON.stringify(state, null, 2) + "\n", "utf8");
+          renameSync(temporary, sourcePath);
+        },
+      }, root);
+      const rejected = await mountedPreparationCheckpointAsk(root, second.input, "request_changes", `Review feedback for ${secondFeature}/specify.`);
+      setStateTransactionTestHooks(null, root);
+      assert.equal(rejected.ok, false, "the interrupted later Ask must reject its state race");
+      assert.match(String(rejected.error), /state moved|state transaction|checkpoint_failed|checkpoint_invalid/);
+      assert.equal(resolveState(root, undefined, { feature_id: firstFeature, run_key: `${firstFeature}-run` }).state?.specification?.phases.find((phase) => phase.phase === "specify")?.status, "approved");
+      const freshSecond = await issueCanonicalDecision(root, secondFeature, "specify", "request_changes", "answer-batch-b-fresh");
+      const retry = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [freshSecond] });
+      assert.deepEqual(retry.decisions.map(({ feature_id, decision: value }) => `${feature_id}:${value}`), [`${firstFeature}:approve_continue`, `${secondFeature}:request_changes`]);
     } finally {
-      setCtoSpecificationDecisionFailureInjector(null);
+      setStateTransactionTestHooks(null, root);
       rmSync(root, { recursive: true, force: true });
     }
   });
+
   test("aborts a staged decision on state CAS conflict and permits a fresh proof", async () => {
     const root = freshProject();
     const featureId = "feature-state-conflict";
@@ -1673,39 +1735,35 @@ describe("CTO specification preparation decisions", () => {
         setCtoSpecificationDecisionFailureInjector((point) => {
           if (point !== "after_prepare" || forged) return;
           forged = true;
-          const transactionDir = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decision-transactions");
-          const transactionFile = readdirSync(transactionDir).find((entry) => entry.endsWith(".json"));
-          assert.ok(transactionFile, "decision WAL must be published before forging");
-          const transactionPath = join(transactionDir, transactionFile!);
-          const transaction = JSON.parse(readFileSync(transactionPath, "utf8")) as Record<string, unknown>;
-          const stagedStates = transaction.staged_states as Array<Record<string, unknown>>;
-          const staged = stagedStates[0];
-          assert.ok(staged, "decision WAL must contain one staged feature state");
-          if (forge === "source") {
-            const forgedSource = {
-              ...(staged.source_state as Record<string, unknown>),
-              task: "forged decision source state",
-            };
-            staged.source_state = forgedSource;
-            const digestState = { ...forgedSource };
-            delete digestState.updated_at;
-            delete digestState.state_revision;
-            staged.source_logical_digest = sha256Hex(canonicalJson(digestState));
-          } else if (forge === "postimage") {
-            const forgedState = {
-              ...(staged.state as Record<string, unknown>),
-              task: "forged decision postimage",
-            };
-            staged.state = forgedState;
-            const digestState = { ...forgedState };
-            delete digestState.updated_at;
-            delete digestState.state_revision;
-            staged.target_digest = sha256Hex(canonicalJson(digestState));
-          } else {
-            const target = staged.target as Record<string, unknown>;
-            target.stateDir = join(root, ".work-state", "features", "foreign-target");
-          }
-          writeFileSync(transactionPath, `${JSON.stringify(transaction, null, 2)}\n`, "utf8");
+          deriveStagedDecisionWal(root, pending, (transaction) => {
+            const staged = (transaction.staged_states as Array<Record<string, unknown>>)[0];
+            assert.ok(staged, "derived decision WAL must contain one staged feature state");
+            if (!staged) return;
+            if (forge === "source") {
+              const forgedSource = {
+                ...(staged.source_state as Record<string, unknown>),
+                task: "forged decision source state",
+              };
+              staged.source_state = forgedSource;
+              const digestState = { ...forgedSource };
+              delete digestState.updated_at;
+              delete digestState.state_revision;
+              staged.source_logical_digest = sha256Hex(canonicalJson(digestState));
+            } else if (forge === "postimage") {
+              const forgedState = {
+                ...(staged.state as Record<string, unknown>),
+                task: "forged decision postimage",
+              };
+              staged.state = forgedState;
+              const digestState = { ...forgedState };
+              delete digestState.updated_at;
+              delete digestState.state_revision;
+              staged.target_digest = sha256Hex(canonicalJson(digestState));
+            } else {
+              const target = staged.target as Record<string, unknown>;
+              target.stateDir = join(root, ".work-state", "features", "foreign-target");
+            }
+          });
           throw new Error(`injected forged ${forge} WAL`);
         });
         assert.throws(
@@ -1777,6 +1835,7 @@ describe("CTO specification preparation decisions", () => {
       setCtoSpecificationDecisionFailureInjector((point) => {
         if (point === "after_prepare" && !leftPending) {
           leftPending = true;
+          deriveStagedDecisionWal(root, decisions[0]!);
           throw new Error("leave maximal WAL");
         }
       });
@@ -1819,6 +1878,7 @@ describe("CTO specification preparation decisions", () => {
       setCtoSpecificationDecisionFailureInjector((point) => {
         if (point === "after_prepare" && !leftPending) {
           leftPending = true;
+          deriveStagedDecisionWal(nearRoot, nearDecision);
           throw new Error("leave near-limit WAL");
         }
       });
@@ -1859,13 +1919,11 @@ describe("CTO specification preparation decisions", () => {
       const pendingFile = readdirSync(transactionDir).find((entry) => entry.endsWith(".json"));
       assert.ok(pendingFile);
       const pendingPath = join(transactionDir, pendingFile!);
-      const terminal = JSON.parse(readFileSync(pendingPath, "utf8")) as Record<string, unknown>;
-      terminal.status = "aborted";
+      const pendingTerminal = JSON.parse(readFileSync(pendingPath, "utf8")) as Record<string, unknown>;
+      pendingTerminal.status = "aborted"
       terminal.abort_reason = "decision_conflict";
-      terminal.aborted_at = new Date().toISOString();
-      terminal.terminal_at = new Date().toISOString();
-      terminal.terminal_disposition = "preserved";
-      writeFileSync(pendingPath, `${JSON.stringify(terminal, null, 2)}\n`, "utf8");
+      pendingTerminal.aborted_at = new Date().toISOString();
+            writeFileSync(pendingPath, `${JSON.stringify(terminal, null, 2)}\n`, "utf8");
 
       let replaced = false;
       setCtoSpecificationDecisionFailureInjector((point) => {
@@ -1903,6 +1961,7 @@ describe("CTO specification preparation decisions", () => {
       setCtoSpecificationDecisionFailureInjector((point) => {
         if (!injected && point === "after_prepare") {
           injected = true;
+          deriveStagedDecisionWal(root, pending);
           throw new Error("leave sibling pending");
         }
       });
@@ -1979,31 +2038,45 @@ describe("CTO specification preparation decisions", () => {
     const conflictFeature = "feature-many-terminal-wal";
     try {
       const pending = await issueCanonicalDecision(root, conflictFeature, "specify", "approve_continue", "answer-many-terminal-wal");
-      let mutated = false;
+      let leftPending = false;
       setCtoSpecificationDecisionFailureInjector((point) => {
-        if (point !== "before_feature_state_write" || mutated) return;
-        mutated = true;
-        const updated = updateStateAtomically<null>(
-          root,
-          (snapshot) => snapshot.state
-            ? { op: "commit", state: { ...snapshot.state, task: "newer state before terminal WAL" }, value: null }
-            : { op: "fail", code: "state_missing", error: "state disappeared during terminal WAL setup" },
-          { selector: { feature_id: conflictFeature, run_key: `${conflictFeature}-run` } },
-        );
-        assert.equal(updated.ok, true);
+        if (point !== "after_prepare" || leftPending) return;
+        leftPending = true;
+        deriveStagedDecisionWal(root, pending);
+        throw new Error("leave conflict WAL");
       });
-      assert.throws(() => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [pending] }), /CTO_SPEC_DECISION_ABORTED|CTO_SPEC_DECISION_COMMIT_FAILED/);
+      assert.throws(() => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [pending] }), /leave conflict WAL/);
+      setCtoSpecificationDecisionFailureInjector((point) => {
+        if (point !== "after_feature_state_write") return;
+        throw new Error("leave owned-receipt WAL");
+      });
+      assert.throws(
+        () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [pending] }),
+        /leave owned-receipt WAL/,
+      );
       setCtoSpecificationDecisionFailureInjector(null);
+      const transactionDir = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decision-transactions");
+      const pendingFile = readdirSync(transactionDir).find((entry) => entry.endsWith(".json"));
+      assert.ok(pendingFile, "the interrupted state publication must retain its WAL");
+      const pendingPath = join(transactionDir, pendingFile!);
+      const pendingTerminal = JSON.parse(readFileSync(pendingPath, "utf8")) as Record<string, unknown>;
+      pendingTerminal.status = "aborting";
+      pendingTerminal.abort_reason = "state_conflict";
+      pendingTerminal.aborted_at = new Date().toISOString();
+      pendingTerminal.terminal_at = new Date().toISOString();
+      pendingTerminal.terminal_disposition = "preserved";
+      writeFileSync(pendingPath, `${JSON.stringify(pendingTerminal, null, 2)}\n`, "utf8");
+      const archived = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [] });
+      assert.deepEqual(archived.decisions, []);
 
       const historyDir = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decision-transactions", "history");
       const historyFile = readdirSync(historyDir).find((entry) => entry.endsWith(".json"));
       assert.ok(historyFile, "the conflict must retain one terminal WAL in history");
-      const terminal = JSON.parse(readFileSync(join(historyDir, historyFile!), "utf8")) as Record<string, unknown>;
-      const transactionDir = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decision-transactions");
-      const staged = terminal.staged_states as Array<Record<string, unknown>>;
+      const archivedTerminal = JSON.parse(readFileSync(join(historyDir, historyFile!), "utf8")) as Record<string, unknown>;
+      const staged = archivedTerminal.staged_states as Array<Record<string, unknown>>;
       for (let index = 0; index < 65; index += 1) {
         const transactionId = `legacy-terminal-${index}`;
-        const copy = JSON.parse(JSON.stringify(terminal)) as Record<string, unknown>;
+        const copy = JSON.parse(JSON.stringify(archivedTerminal)) as Record<string, unknown>;
         copy.transaction_id = transactionId;
         copy.staged_states = staged.map((entry) => ({
           ...entry,
@@ -2013,7 +2086,7 @@ describe("CTO specification preparation decisions", () => {
       }
 
       const next = await issueCanonicalDecision(root, "feature-after-terminal-history", "specify", "approve_continue", "answer-after-terminal-history");
-      let leftPending = false;
+      leftPending = false;
       setCtoSpecificationDecisionFailureInjector((point) => {
         if (point === "after_prepare" && !leftPending) {
           leftPending = true;
@@ -2032,7 +2105,6 @@ describe("CTO specification preparation decisions", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
-
   test("recovers a selected Ask after a state transaction abort", async () => {
     const root = freshProject();
     const featureId = "feature-abort-selected-ask";
