@@ -593,6 +593,93 @@ test("supplied-token initial runtime authority rolls back before retry", () => {
   }
 });
 
+test("session binding release only closes the exact current generation", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-runtime-binding-release-"));
+  let seedToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let retryToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  try {
+    writeTestRegistryMarker(root);
+    const seed = openTestRegistry(
+      root,
+      ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"],
+      "runtime-binding-release",
+    );
+    seedToken = seed.token;
+    const pi = { setLabel() {}, on() {} };
+    const manager = (id: string) => ({
+      getCwd: () => root,
+      getSessionId: () => id,
+      getSessionFile: () => join(root, `${id}.jsonl`),
+      getSessionGeneration: () => `generation-${id}`,
+    });
+    const contextA = { cwd: root, sessionManager: manager("release-a") };
+    const contextB = { cwd: root, sessionManager: manager("release-b") };
+    const contextC = { cwd: root, sessionManager: manager("release-c") };
+    let controller: core.TeamSessionBindingController | undefined;
+    const installed = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed.owner,
+      registrationToken: seed.token,
+      initialSessionContext: contextA,
+      onSessionBindingController: candidate => { controller = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    installed?.();
+    seed.retain(true);
+    seedToken = undefined;
+    assert.ok(controller, "initial registration publishes a binding controller");
+    if (!controller) return;
+    const bindingA = controller.current(contextA);
+    assert.ok(bindingA, "initial generation is current");
+    if (!bindingA) return;
+    const bindingB = controller.bind(contextB);
+    assert.ok(bindingB, "rebind publishes the replacement generation");
+    if (!bindingB) return;
+
+    assert.equal(controller.release(bindingA), false, "a stale generation cannot release the replacement");
+    assert.equal(controller.isLive(contextB), true, "stale release leaves replacement live");
+    assert.doesNotThrow(() => bindingB.runtimeAccess.assertLive(), "stale release leaves replacement facade live");
+
+    assert.equal(controller.release(bindingB), true, "the exact generation is released");
+    assert.equal(controller.isLive(contextB), false, "released generation is tombstoned");
+    assert.equal(ctoRuntimeSessionAuthorityForContext(bindingB.registryContext), null, "released generation authority claim is revoked");
+    assert.throws(() => bindingB.runtimeAccess.assertLive(), /activation_revoked|runtime access/i, "released generation facade is closed");
+
+    const retry = beginOwnerRegistry(seed.context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
+    assert.equal(retry.ok, true, "retained owner context can mint a retry transaction");
+    if (!retry.ok) return;
+    retryToken = retry.token;
+    let retryController: core.TeamSessionBindingController | undefined;
+    const retryInstalled = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed.owner,
+      registrationToken: retry.token,
+      initialSessionContext: contextC,
+      onSessionBindingController: candidate => { retryController = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    retryInstalled?.();
+    commitOwnerRegistry(retry.token);
+    retryToken = undefined;
+    assert.ok(retryController, "retry publishes a fresh binding controller");
+    if (!retryController) return;
+    const bindingC = retryController.current(contextC);
+    assert.ok(bindingC, "retry binds a fresh generation");
+    if (!bindingC) return;
+    assert.doesNotThrow(() => bindingC.runtimeAccess.assertLive(), "retry generation runtime facade is live");
+    assert.equal(retryController.release(bindingC), true, "retry generation releases exactly");
+  } finally {
+    if (retryToken) { try { rollbackOwnerRegistry(retryToken); } catch { /* preserve test failure */ } }
+    if (seedToken) { try { rollbackOwnerRegistry(seedToken); } catch { /* preserve test failure */ } }
+    closeRetainedTestRegistrations(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("CTO registrar rejects reentrant mounting and honors explicit cwd", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-cto-owner-"));
   try {

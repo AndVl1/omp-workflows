@@ -775,6 +775,7 @@ export interface TeamSessionRuntimeBinding {
 export interface TeamSessionBindingController {
   bind(ctx: unknown): TeamSessionRuntimeBinding | null;
   current(ctx: unknown): TeamSessionRuntimeBinding | null;
+  release(binding: TeamSessionRuntimeBinding): boolean;
   isLive(ctx: unknown): boolean;
 }
 
@@ -1787,6 +1788,53 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
     }
   };
   revokeSessionBindingController = revokeController;
+  const releaseExactBinding = (binding: TeamSessionRuntimeBinding): boolean => {
+    if (sessionBindingControllerRevoked || !binding || typeof binding !== "object") return false;
+    const current = teamActivationCells.get(originalPi as unknown as object);
+    const currentSession = current ? teamCellSession(current) : null;
+    if (!current || current.state !== "active" || !currentSession
+      || current.registryContext !== binding.registryContext
+      || current.runtimeAuthority !== binding.runtimeAuthority
+      || current.runtimeAccess !== binding.runtimeAccess
+      || current.root !== binding.canonicalRoot || current.rootDev !== binding.rootDev || current.rootIno !== binding.rootIno
+      || !sameHostSession(currentSession, {
+        sessionManager: binding.sessionManager,
+        sessionId: binding.sessionId,
+        ...(binding.sessionFile !== undefined ? { sessionFile: binding.sessionFile } : {}),
+        ...(binding.sessionBasename !== undefined ? { sessionBasename: binding.sessionBasename } : {}),
+        ...(binding.generation !== undefined ? { generation: binding.generation } : {}),
+      })
+      || ctoRuntimeSessionAuthorityForContext(current.registryContext) !== current.runtimeAuthority) return false;
+    try {
+      current.liveGuard?.();
+      current.runtimeAccess.assertProjectRoot(current.root);
+      current.runtimeAccess.assertLive();
+    } catch {
+      return false;
+    }
+    const retiredSessions = [...(current.retiredSessions ?? []), currentSession].slice(-8);
+    clearNativeTaskSelectors();
+    clearHostContextIdentity(originalPi as unknown as object);
+    revokeController();
+    teamActivationCells.set(originalPi as unknown as object, {
+      ...current,
+      state: "failed",
+      recoverableSession: true,
+      liveGuard: undefined,
+      cleanup: undefined,
+      registryContext: undefined,
+      runtimeAuthority: undefined,
+      runtimeAccess: undefined,
+      sessionManager: undefined,
+      sessionId: undefined,
+      sessionFile: undefined,
+      sessionBasename: undefined,
+      sessionGeneration: undefined,
+      retiredSessions,
+    });
+    try { current.cleanup?.(); } catch { /* teardown remains fenced */ }
+    return true;
+  };
   const sessionBindingController: TeamSessionBindingController = Object.freeze({
     bind: (ctx: unknown): TeamSessionRuntimeBinding | null => {
       if (sessionBindingControllerRevoked) return null;
@@ -1799,6 +1847,7 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
       if (sessionBindingControllerRevoked) return null;
       return currentTeamSessionRuntimeBinding(originalPi as unknown as object, ctx);
     },
+    release: (binding: TeamSessionRuntimeBinding): boolean => releaseExactBinding(binding),
     isLive: (ctx: unknown): boolean => currentTeamSessionRuntimeBinding(originalPi as unknown as object, ctx) !== null,
   });
   teamSessionBindingControllerRevokers.set(originalPi as unknown as object, revokeController);
@@ -2292,6 +2341,20 @@ function currentTeamSessionRuntimeBinding(pi: object, ctx: unknown): TeamSession
   } catch {
     return null;
   }
+}
+
+function sameTeamSessionRuntimeBinding(left: TeamSessionRuntimeBinding, right: TeamSessionRuntimeBinding): boolean {
+  return left.registryContext === right.registryContext
+    && left.runtimeAuthority === right.runtimeAuthority
+    && left.runtimeAccess === right.runtimeAccess
+    && left.canonicalRoot === right.canonicalRoot
+    && left.rootDev === right.rootDev
+    && left.rootIno === right.rootIno
+    && left.sessionManager === right.sessionManager
+    && left.sessionId === right.sessionId
+    && left.sessionFile === right.sessionFile
+    && left.sessionBasename === right.sessionBasename
+    && left.generation === right.generation;
 }
 
 type MountedCtoRuntime = {
