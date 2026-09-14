@@ -1755,6 +1755,7 @@ interface CtoRunDeliveryPublicationJournal {
   run_id: string;
   state_revision: number;
   state_sha256: string;
+  proof?: string;
   origin_transition?: CtoRunDeliveryOriginTransitionIntent;
 }
 
@@ -1995,6 +1996,21 @@ function journalAllowsPriorStateProofPinned(
   } catch { return false; }
 }
 
+function legacyJournalExactStateProofPinned(
+  pinnedRoot: PinnedProjectRoot,
+  state: CtoState,
+  journal: CtoRunDeliveryPublicationJournal,
+): boolean {
+  if (journal.schema_version !== 1) return false;
+  try {
+    const bytes = pinnedRoot.readFile(join(".work-state", "cto", state.id, "state.json"), { maxBytes: MAX_CTO_STATE_READ_BYTES }).bytes;
+    return state.state_revision === journal.state_revision
+      && createHash("sha256").update(bytes).digest("hex") === journal.state_sha256
+      && hasValidCtoRuntimeRunOriginPinned(pinnedRoot, state)
+      && hasValidCtoRuntimeStateProofPinned(pinnedRoot, state);
+  } catch { return false; }
+}
+
 function recoverCtoRunDeliveryJournalsForRefreshPinned(pinnedRoot: PinnedProjectRoot): boolean {
   let names: string[];
   try { names = pinnedRoot.listDirectory(ctoRunDeliveryJournalDirectoryRelativePath(), { maxEntries: MAX_CTO_RUN_DELIVERY_INDEX_ENTRIES, maxNameBytes: MAX_CTO_RUN_DISCOVERY_NAME_BYTES }); }
@@ -2015,9 +2031,13 @@ function recoverCtoRunDeliveryJournalsForRefreshPinned(pinnedRoot: PinnedProject
       }
       const bytes = pinnedRoot.readFile(join(".work-state", "cto", runId, "state.json"), { maxBytes: MAX_CTO_STATE_READ_BYTES }).bytes;
       const digest = createHash("sha256").update(bytes).digest("hex");
+      if (journalRead.journal.schema_version === 2 && !journalAuthenticatesPinned(pinnedRoot, journalRead.journal)) return false;
+      if (journalRead.journal.schema_version === 1 && !legacyJournalExactStateProofPinned(pinnedRoot, state, journalRead.journal)) return false;
       if (state.state_revision === journalRead.journal.state_revision && digest !== journalRead.journal.state_sha256) return false;
       if (journalRead.journal.schema_version === 2
-        ? !recoverOriginTransitionFromJournalPinned(pinnedRoot, state, journalRead.journal)
+        ? (journalRead.journal.origin_transition
+          ? !recoverOriginTransitionFromJournalPinned(pinnedRoot, state, journalRead.journal)
+          : !hasValidCtoRuntimeRunOriginPinned(pinnedRoot, state))
         : !hasValidCtoRuntimeRunOriginPinned(pinnedRoot, state)) return false;
       const proofStatus = ctoRuntimeStateProofStatusPinned(pinnedRoot, state);
       if (proofStatus === "invalid") {
@@ -2025,7 +2045,8 @@ function recoverCtoRunDeliveryJournalsForRefreshPinned(pinnedRoot: PinnedProject
         if (!prior || (!validCtoRuntimeStateProofRecordPinned(pinnedRoot, state, prior)
           && !journalAllowsPriorStateProofPinned(pinnedRoot, state, journalRead.journal))) return false;
       }
-      if (!writeCtoRuntimeStateProof(pinnedRoot, state) || !hasValidCtoRuntimeStateProofPinned(pinnedRoot, state)) return false;
+      if (journalRead.journal.schema_version === 2
+        && (!writeCtoRuntimeStateProof(pinnedRoot, state) || !hasValidCtoRuntimeStateProofPinned(pinnedRoot, state))) return false;
       const current = readCtoRunDeliveryIndexSnapshotPinned(pinnedRoot);
       const known = current.index.entries.find((entry) => entry.run_id === runId);
       const nextEntry = ctoRunDeliveryEntry(state, known, pinnedRoot, { reconcileQueueEvidence: true });
@@ -2681,6 +2702,28 @@ function clearCtoRunDeliveryIndexPreimagePinned(pinnedRoot: PinnedProjectRoot, r
     pinnedRoot.removeFileIfMatches(ctoRunDeliveryIndexPreimageRelativePath(runId), expected);
   } catch { /* journal evidence remains for replay */ }
 }
+function ctoRunDeliveryJournalProof(
+  pinnedRoot: PinnedProjectRoot,
+  runId: string,
+  stateRevision: number,
+  stateSha256: string,
+  transition?: CtoRunDeliveryOriginTransitionIntent,
+): string | null {
+  const master = readOrCreateRootRuntimeSecret(pinnedRoot);
+  const key = master ? deriveRuntimeSecretKey(master, "cto-run-delivery-journal-v2") : null;
+  if (!key) return null;
+  const body = JSON.stringify({
+    schema_version: 2,
+    run_id: runId,
+    state_revision: stateRevision,
+    state_sha256: stateSha256,
+    ...(transition ? { origin_transition: transition } : {}),
+  });
+  return createHmac("sha256", key)
+    .update(["omp-cto-run-delivery-journal-v2", pinnedRoot.canonical_root, String(pinnedRoot.dev), String(pinnedRoot.ino), body].join("\u0000"), "utf8")
+    .digest("hex");
+}
+
 function ctoRunDeliveryTransitionProof(
   pinnedRoot: PinnedProjectRoot,
   runId: string,
@@ -2719,6 +2762,15 @@ function journalTransitionAuthenticatesPinned(
   return !!expected && expected === transition.proof;
 }
 
+function journalAuthenticatesPinned(
+  pinnedRoot: PinnedProjectRoot,
+  journal: CtoRunDeliveryPublicationJournal,
+): boolean {
+  if (journal.schema_version !== 2 || typeof journal.proof !== "string") return false;
+  const expected = ctoRunDeliveryJournalProof(pinnedRoot, journal.run_id, journal.state_revision, journal.state_sha256, journal.origin_transition);
+  return !!expected && expected === journal.proof;
+}
+
 function parseCtoRunDeliveryJournal(bytes: Uint8Array): CtoRunDeliveryPublicationJournal {
   let parsed: unknown;
   try {
@@ -2742,24 +2794,36 @@ function parseCtoRunDeliveryJournal(bytes: Uint8Array): CtoRunDeliveryPublicatio
     return { schema_version: 1, run_id: value.run_id, state_revision: value.state_revision as number, state_sha256: value.state_sha256.toLowerCase() };
   }
   if (schema !== CTO_RUN_DELIVERY_JOURNAL_SCHEMA_VERSION
-    || Object.keys(value).sort().join("\u0000") !== [...baseKeys, "origin_transition"].sort().join("\u0000")
+    || (Object.keys(value).sort().join("\u0000") !== [...baseKeys, "proof"].sort().join("\u0000")
+      && Object.keys(value).sort().join("\u0000") !== [...baseKeys, "origin_transition", "proof"].sort().join("\u0000"))
     || !isSafeCtoRunId(value.run_id)
     || !Number.isSafeInteger(value.state_revision)
     || (value.state_revision as number) < 1
     || typeof value.state_sha256 !== "string"
     || !/^[0-9a-f]{64}$/i.test(value.state_sha256)
-    || !value.origin_transition || typeof value.origin_transition !== "object" || Array.isArray(value.origin_transition)) {
+    || typeof value.proof !== "string" || !/^[0-9a-f]{64}$/i.test(value.proof)) {
     throw new Error("CTO run-delivery publication journal is invalid");
   }
-  const raw = value.origin_transition as Record<string, unknown>;
-  const prior = raw.prior;
-  const target = raw.target;
-  const indexPreimage = raw.index_preimage;
-  const proofPreimage = raw.proof_preimage;
+  if (value.origin_transition === undefined) {
+    return {
+      schema_version: 2,
+      run_id: value.run_id as string,
+      state_revision: value.state_revision as number,
+      state_sha256: (value.state_sha256 as string).toLowerCase(),
+      proof: (value.proof as string).toLowerCase(),
+    };
+  }
+  const raw = value.origin_transition;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("CTO run-delivery transition journal is invalid");
+  const transition = raw as Record<string, unknown>;
+  const prior = transition.prior;
+  const target = transition.target;
+  const indexPreimage = transition.index_preimage;
+  const proofPreimage = transition.proof_preimage;
   if (!indexPreimage || typeof indexPreimage !== "object" || Array.isArray(indexPreimage)
     || !proofPreimage || typeof proofPreimage !== "object" || Array.isArray(proofPreimage)
     || !prior || typeof prior !== "object" || Array.isArray(prior) || !target || typeof target !== "object" || Array.isArray(target)
-    || Object.keys(raw).sort().join("\u0000") !== ["index_preimage", "prior", "proof", "proof_preimage", "target"].join("\u0000")) throw new Error("CTO run-delivery transition journal is invalid");
+    || Object.keys(transition).sort().join("\u0000") !== ["index_preimage", "prior", "proof", "proof_preimage", "target"].join("\u0000")) throw new Error("CTO run-delivery transition journal is invalid");
   const ip = indexPreimage as Record<string, unknown>;
   const pp = proofPreimage as Record<string, unknown>;
   const validPreimage = (entry: Record<string, unknown>): boolean => Object.keys(entry).sort().join("\u0000") === ["dev", "ino", "sha256", "size"].join("\u0000")
@@ -2773,18 +2837,19 @@ function parseCtoRunDeliveryJournal(bytes: Uint8Array): CtoRunDeliveryPublicatio
     || typeof p.source_id !== "string" || p.source_id.length === 0 || typeof p.initial_state_sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(p.initial_state_sha256)
     || Object.keys(t).sort().join("\u0000") !== ["identity_sha256", "owner_session", "standby"].join("\u0000")
     || t.standby !== false || typeof t.owner_session !== "string" || t.owner_session.length === 0 || typeof t.identity_sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(t.identity_sha256)
-    || typeof raw.proof !== "string" || !/^[0-9a-f]{64}$/i.test(raw.proof)) throw new Error("CTO run-delivery transition journal is invalid");
+    || typeof transition.proof !== "string" || !/^[0-9a-f]{64}$/i.test(transition.proof)) throw new Error("CTO run-delivery transition journal is invalid");
   return {
     schema_version: 2,
     run_id: value.run_id as string,
     state_revision: value.state_revision as number,
     state_sha256: (value.state_sha256 as string).toLowerCase(),
+    proof: (value.proof as string).toLowerCase(),
     origin_transition: {
       index_preimage: { dev: ip.dev as number, ino: ip.ino as number, size: ip.size as number, sha256: (ip.sha256 as string).toLowerCase() },
       proof_preimage: { dev: pp.dev as number, ino: pp.ino as number, size: pp.size as number, sha256: (pp.sha256 as string).toLowerCase() },
       prior: { standby: true, owner_session: null, identity_sha256: p.identity_sha256.toLowerCase(), source_id: p.source_id as string, initial_state_sha256: p.initial_state_sha256.toLowerCase() },
       target: { standby: false, owner_session: t.owner_session as string, identity_sha256: t.identity_sha256.toLowerCase() },
-      proof: (raw.proof as string).toLowerCase(),
+      proof: (transition.proof as string).toLowerCase(),
     },
   };
 }
@@ -3455,8 +3520,12 @@ function recoverCtoRunDeliveryIndexLocked(
     if (!journalRead) continue;
     const state = readCtoStatePinned(runId, pinnedRoot);
     if (!state) continue;
+    if (journalRead.journal.schema_version === 2 && !journalAuthenticatesPinned(pinnedRoot, journalRead.journal)) throw new Error(`CTO publication journal is not authenticated for '${runId}'`);
+    if (journalRead.journal.schema_version === 1 && !legacyJournalExactStateProofPinned(pinnedRoot, state, journalRead.journal)) throw new Error(`legacy CTO journal is not exactly proved for '${runId}'`);
     if (journalRead.journal.schema_version === 2
-      ? !recoverOriginTransitionFromJournalPinned(pinnedRoot, state, journalRead.journal)
+      ? (journalRead.journal.origin_transition
+        ? !recoverOriginTransitionFromJournalPinned(pinnedRoot, state, journalRead.journal)
+        : !hasValidCtoRuntimeRunOriginPinned(pinnedRoot, state))
       : !hasValidCtoRuntimeRunOriginPinned(pinnedRoot, state)) throw new Error(`CTO runtime origin is not authenticated for journal '${runId}'`);
     const proofStatus = ctoRuntimeStateProofStatusPinned(pinnedRoot, state);
     if (proofStatus === "invalid") {
@@ -3521,8 +3590,12 @@ function recoverCtoRunDeliveryIndexLocked(
     const stateBytes = pinnedRoot.readFile(join(".work-state", "cto", runId, "state.json"), { maxBytes: 8 * 1024 * 1024 }).bytes;
     const digest = createHash("sha256").update(stateBytes).digest("hex");
     if (revision === journalRead.journal.state_revision && digest !== journalRead.journal.state_sha256) throw new Error(`CTO state digest does not match publication journal for '${runId}'`);
+    if (journalRead.journal.schema_version === 2 && !journalAuthenticatesPinned(pinnedRoot, journalRead.journal)) throw new Error(`CTO publication journal is not authenticated for '${runId}'`);
+    if (journalRead.journal.schema_version === 1 && !legacyJournalExactStateProofPinned(pinnedRoot, state, journalRead.journal)) throw new Error(`legacy CTO journal is not exactly proved for '${runId}'`);
     if (journalRead.journal.schema_version === 2
-      ? !recoverOriginTransitionFromJournalPinned(pinnedRoot, state, journalRead.journal)
+      ? (journalRead.journal.origin_transition
+        ? !recoverOriginTransitionFromJournalPinned(pinnedRoot, state, journalRead.journal)
+        : !hasValidCtoRuntimeRunOriginPinned(pinnedRoot, state))
       : !hasValidCtoRuntimeRunOriginPinned(pinnedRoot, state)) throw new Error(`CTO runtime origin is not authenticated for journal '${runId}'`);
     const proofStatus = ctoRuntimeStateProofStatusPinned(pinnedRoot, state);
     if (proofStatus === "invalid") {
@@ -3533,7 +3606,8 @@ function recoverCtoRunDeliveryIndexLocked(
       if (!prior || (!validCtoRuntimeStateProofRecordPinned(pinnedRoot, state, prior)
         && !journalAllowsPriorStateProofPinned(pinnedRoot, state, journalRead.journal))) throw new Error(`CTO state proof is present but invalid for journal '${runId}'`);
     }
-    if (!writeCtoRuntimeStateProof(pinnedRoot, state) || !hasValidCtoRuntimeStateProofPinned(pinnedRoot, state)) throw new Error(`CTO state proof recovery failed for journal '${runId}'`);
+    if (journalRead.journal.schema_version === 2
+      && (!writeCtoRuntimeStateProof(pinnedRoot, state) || !hasValidCtoRuntimeStateProofPinned(pinnedRoot, state))) throw new Error(`CTO state proof recovery failed for journal '${runId}'`);
     const known = current.index.entries.find((entry) => entry.run_id === runId);
     const nextEntry = ctoRunDeliveryEntry(state, known, pinnedRoot, options);
     if (!known || nextEntry.state_revision >= known.state_revision) {
@@ -5221,14 +5295,18 @@ function writeCtoRunDeliveryPublicationJournal(
       identity_sha256: ctoRuntimeRunInitialIdentityDigest(originTransition.target),
     },
   } : undefined;
-  const proof = transition ? ctoRunDeliveryTransitionProof(pinnedRoot, state.id, stateRevision, stateSha256, transition) : null;
-  if (transition && !proof) throw new PinnedRootError("recovery_required", "CTO transition journal authority unavailable");
+  const transitionProof = transition ? ctoRunDeliveryTransitionProof(pinnedRoot, state.id, stateRevision, stateSha256, transition) : null;
+  if (transition && !transitionProof) throw new PinnedRootError("recovery_required", "CTO transition journal authority unavailable");
+  const authenticatedTransition = transition ? { ...transition, proof: transitionProof! } : undefined;
+  const proof = ctoRunDeliveryJournalProof(pinnedRoot, state.id, stateRevision, stateSha256, authenticatedTransition);
+  if (!proof) throw new PinnedRootError("recovery_required", "CTO publication journal authority unavailable");
   const serialized = JSON.stringify({
-    schema_version: transition ? CTO_RUN_DELIVERY_JOURNAL_SCHEMA_VERSION : CTO_RUN_DELIVERY_JOURNAL_LEGACY_SCHEMA_VERSION,
+    schema_version: CTO_RUN_DELIVERY_JOURNAL_SCHEMA_VERSION,
     run_id: state.id,
     state_revision: stateRevision,
     state_sha256: stateSha256,
-    ...(transition ? { origin_transition: { ...transition, proof } } : {}),
+    proof,
+    ...(authenticatedTransition ? { origin_transition: authenticatedTransition } : {}),
   }) + "\n";
   pinnedRoot.ensureDirectories([ctoRunDeliveryJournalDirectoryRelativePath()]);
   return pinnedRoot.writeAtomicWithReceipt(ctoRunDeliveryJournalRelativePath(state.id), serialized);

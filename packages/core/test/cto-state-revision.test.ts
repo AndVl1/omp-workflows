@@ -706,6 +706,56 @@ test("promotion rejects missing index or proof preimages before state CAS", () =
   }
 });
 
+test("legacy v1 publication journal only replays an exact already-proved state", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-legacy-journal-proof-"));
+  const runId = "legacy-journal-proof";
+  try {
+    const state = fixture(runId);
+    persistState(state, root);
+    const statePath = join(root, ".work-state", "cto", runId, "state.json");
+    const proofPath = join(root, ".work-state", "cto", runId, ".runtime-state-proof.json");
+    const journalDir = join(root, ".work-state", "cto", ".active-run-index-journal");
+    const journalPath = join(journalDir, `${runId}.json`);
+    mkdirSync(journalDir, { recursive: true });
+    const exactBytes = readFileSync(statePath);
+    writeFileSync(journalPath, JSON.stringify({ schema_version: 1, run_id: runId, state_revision: state.state_revision, state_sha256: createHash("sha256").update(exactBytes).digest("hex") }) + "\n");
+    readCtoRunDeliveryIndexPage(root);
+    assert.equal(existsSync(journalPath), false, "exact legacy journal may be consumed");
+
+    const changed = JSON.parse(exactBytes.toString("utf8")) as { integration: Record<string, unknown> };
+    changed.integration = { ...changed.integration, note: "forged same-identity postimage" };
+    writeFileSync(statePath, `${JSON.stringify(changed, null, 2)}\n`, "utf8");
+    rmSync(proofPath, { force: true });
+    const forgedBytes = readFileSync(statePath);
+    writeFileSync(journalPath, JSON.stringify({ schema_version: 1, run_id: runId, state_revision: state.state_revision, state_sha256: createHash("sha256").update(forgedBytes).digest("hex") }) + "\n");
+    assert.throws(() => readCtoRunDeliveryIndexPage(root), /legacy CTO journal|authenticated|recovery/u);
+    assert.equal(existsSync(proofPath), false, "legacy v1 recovery must not mint a state proof");
+    assert.equal(existsSync(journalPath), true, "forged legacy journal remains evidence");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("new publication journals always use authenticated v2 base proof", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-v2-journal-base-"));
+  const runId = "v2-journal-base";
+  try {
+    const state = fixture(runId);
+    persistState(state, root);
+    const current = readCtoState(runId, root);
+    assert.ok(current);
+    current!.integration.note = "v2 journal write";
+    const journalPath = join(root, ".work-state", "cto", ".active-run-index-journal", `${runId}.json`);
+    assert.throws(() => writeCtoState(current!, root, { preCommit: () => { throw new Error("observe v2 journal"); } }), /observe v2 journal/u);
+    const published = JSON.parse(readFileSync(journalPath, "utf8")) as Record<string, unknown>;
+    assert.equal(published.schema_version, 2);
+    assert.equal(typeof published.proof, "string");
+    assert.equal("origin_transition" in published, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("terminal CTO runs reject wave append without mutating state or delivery authority", () => {
   for (const pauseKind of ["done", "failed"] as const) {
     const root = mkdtempSync(join(tmpdir(), `cto-wave-terminal-${pauseKind}-`));
