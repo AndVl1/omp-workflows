@@ -7,10 +7,12 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   rmSync,
   utimesSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -53,7 +55,8 @@ import type { CompletionEnvelope, WorkIdentity } from "../src/engine/types.js";
 import { PinnedProjectRoot, PinnedRootError, processStartIdentity } from "../src/specification/pinned-root.js";
 import { canonicalDurableIdFileName, legacyDurableIdFileName } from "../src/cto/durable-id.js";
 import { findActiveCtoRun } from "../src/commands/cto.js";
-import { openWorkflowActivation, releaseWorkflowOwners, type WorkflowOwnerIdentity } from "../src/registry/owner.js";
+import { openWorkflowActivation, releaseWorkflowOwners, requireRegistryContext, type WorkflowOwnerIdentity } from "../src/registry/owner.js";
+import { issueCtoRuntimeSessionAuthority } from "../src/cto/session-authority.js";
 import { openCtoRuntimeAccess } from "../src/cto/runtime-access.js";
 
 const TEST_ACTIVATION_MARKER = '{"schema_version":1,"bundle_id":"@andvl1/omp-workflows-fullstack","entrypoint":"dist/index.js"}\n';
@@ -75,7 +78,15 @@ function trustedAccess(root: string) {
   if (!existsSync(join(root, ".omp", "fullstack.activation.json"))) writeFileSync(join(root, ".omp", "fullstack.activation.json"), TEST_ACTIVATION_MARKER);
   const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], testOwner(root));
   if (activation.ok !== true) throw new Error(activation.error);
-  const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "core-state-revision-test", main: true }, root);
+  const canonicalRoot = realpathSync(root);
+  const rootIdentity = statSync(canonicalRoot);
+  const authority = issueCtoRuntimeSessionAuthority(
+    activation.registry_context,
+    { canonical_root: canonicalRoot, dev: rootIdentity.dev, ino: rootIdentity.ino },
+    { sessionManager: Object.freeze({}), sessionId: "core-state-revision-test" },
+    () => { requireRegistryContext(activation.registry_context, canonicalRoot, "workflow_tools"); },
+  );
+  const opened = openCtoRuntimeAccess(activation.registry_context, authority, root);
   if (opened.ok !== true) {
     releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
     throw new Error(opened.error);
@@ -1629,6 +1640,16 @@ test("run-delivery acknowledgement compacts old terminal entries without droppin
     const currentEntry = current.entries.find((entry) => entry.run_id === finished.id);
     assert.ok(currentEntry);
     if (!currentEntry) throw new Error("retention fixture index entry is missing");
+    // Historical index entries must have canonical state backing; recovery
+    // intentionally drops names that exist only in a forged index image.
+    for (let index = 0; index < 65; index += 1) {
+      const old = fixture(`retention-old-${String(index).padStart(2, "0")}`);
+      persistState(old, root);
+      setCtoPause(old, "done", "historical");
+      persistState(old, root);
+    }
+    const active = fixture("retention-active");
+    persistState(active, root);
     const oldTerminalEntries = Array.from({ length: 65 }, (_, index) => ({
       run_id: `retention-old-${String(index).padStart(2, "0")}`,
       state_revision: 1,
@@ -1739,8 +1760,6 @@ test("obligation-owned terminal survives 64-entry compaction and acknowledgement
 test("run-delivery index pages more than 64 pending entries without wrapping", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-run-delivery-pages-"));
   try {
-    const seed = fixture("delivery-seed");
-    persistState(seed, root);
     const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
     const entries = Array.from({ length: 70 }, (_, i) => ({
       run_id: `delivery-${String(i).padStart(3, "0")}`,
@@ -1751,6 +1770,14 @@ test("run-delivery index pages more than 64 pending entries without wrapping", (
       pending_outbox: true,
       summary_digest: "",
     }));
+    // Delivery index recovery is canonical-state backed. Seed each run and
+    // bounded queue evidence before presenting the 70-entry index image;
+    // otherwise forged names are correctly excluded during reconciliation.
+    for (const entry of entries) {
+      persistState(fixture(entry.run_id), root);
+      mkdirSync(join(root, ".work-state", "cto", entry.run_id, "outbox"), { recursive: true });
+      writeFileSync(join(root, ".work-state", "cto", entry.run_id, "outbox", "pending"), "pending");
+    }
     writeFileSync(indexPath, JSON.stringify({ schema_version: 2, active_run_id: entries[0]!.run_id, entries }) + "\n");
     const first = readCtoRunDeliveryIndexPage(root, { limit: 64 });
     assert.equal(first.entries.length, 64);
@@ -1825,14 +1852,20 @@ test("run-delivery mark and acknowledgement reject stale state revisions", () =>
 test("run-delivery index rejects oversized authority and rebuilds canonical target", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-run-delivery-cap-"));
   try {
-    const state = fixture("cap-seed");
-    persistState(state, root);
     const target = fixture("zzzz-target");
     persistState(target, root);
     setCtoPause(target, "done", "target terminal");
     persistState(target, root);
     const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
-    const entries = Array.from({ length: 4_096 }, (_, i) => ({
+    const entries = [{
+      run_id: target.id,
+      state_revision: target.state_revision,
+      status: "done",
+      updated_at: target.updated_at,
+      pending_summary: true,
+      pending_outbox: false,
+      summary_digest: "",
+    }, ...Array.from({ length: 4_095 }, (_, i) => ({
       run_id: `cap-${String(i).padStart(4, "0")}`,
       state_revision: 1,
       status: "active",
@@ -1840,22 +1873,12 @@ test("run-delivery index rejects oversized authority and rebuilds canonical targ
       pending_summary: true,
       pending_outbox: false,
       summary_digest: "",
-    }));
+    }))];
     writeFileSync(indexPath, JSON.stringify({ schema_version: 2, active_run_id: entries[0]!.run_id, entries }) + "\n");
     rmSync(join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_PROOF_FILE), { force: true });
     assert.ok(readFileSync(indexPath).byteLength <= MAX_CTO_RUN_DELIVERY_INDEX_BYTES, "the maximum valid entry count remains within the shared index byte bound");
-    const delivered: string[] = [];
-    let cursor: string | undefined;
-    for (;;) {
-      const page = readCtoRunDeliveryIndexPage(root, { after_run_id: cursor, limit: 64 });
-      delivered.push(...page.entries.map((entry) => entry.run_id));
-      if (page.next_after_run_id === null) break;
-      cursor = page.next_after_run_id;
-    }
-    assert.equal(delivered.length, 4_096);
-    assert.equal(new Set(delivered).size, 4_096);
-    assert.equal(delivered[0], "cap-0000");
-    assert.equal(delivered.at(-1), "cap-4095");
+    const rebuilt = readCtoRunDeliveryIndexPage(root);
+    assert.deepEqual(rebuilt.entries.map((entry) => entry.run_id), [target.id], "oversized synthetic names are excluded in favor of canonical state");
 
     const oversized = [...entries, {
       run_id: "zzzz-forged-after-cutoff",

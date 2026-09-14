@@ -33,6 +33,8 @@ import {
 } from "../src/engine/dod.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { canonicalCtoDoDDigest } from "../src/cto/dod.js";
+import { ctoRuntimeRunInitialIdentityDigest, newCtoState } from "../src/cto/state.js";
+import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 import { teamDoDComplete as teamDoDCompletePinned } from "../src/cto/gates.js";
 import { validateSliceDoD as validateSliceDoDPinned } from "../src/cto/slice-gate.js";
 import { buildSessionReport } from "../src/report/assemble.js";
@@ -1003,9 +1005,39 @@ test("dod-path: vibe-report canonical dod_path is excluded while the default art
 });
 
 function writeRun(cwd: string, state: CtoState): void {
-  const dir = join(cwd, ".work-state", "cto", state.id);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "state.json"), JSON.stringify(state, null, 2));
+  const base = newCtoState({
+    id: state.id,
+    task: state.task,
+    branch: state.branch,
+    autonomous: state.autonomous,
+    plan: state.plan,
+    owner_session: "dod-path-test-session",
+  });
+  const authenticatedState = {
+    ...base,
+    ...state,
+    teams: state.teams,
+    integration: state.integration,
+    pause: base.pause,
+    state_revision: 0,
+    owner_session: "dod-path-test-session",
+    budget: base.budget,
+    leases: base.leases,
+    decisions: base.decisions,
+    inbox_quarantine: base.inbox_quarantine,
+    wave_history: base.wave_history,
+    pending_delivery_obligations: base.pending_delivery_obligations,
+    terminal_summary_evidence: base.terminal_summary_evidence,
+  };
+  const runtime = openTestCtoRuntime(cwd, "dod-path-test-session", `dod-path-${state.id}`);
+  try {
+    runtime.access.createRun(authenticatedState, {
+      source_id: `dod-path-test-${state.id}`,
+      initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(authenticatedState),
+    });
+  } finally {
+    runtime.close();
+  }
 }
 
 test("pinned DoD read and mutation reject a symlinked artifacts directory outside the root", () => {
