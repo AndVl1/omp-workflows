@@ -2553,27 +2553,6 @@ function clearCtoRunDeliveryIndexPreimagePinned(pinnedRoot: PinnedProjectRoot, r
     pinnedRoot.removeFileIfMatches(ctoRunDeliveryIndexPreimageRelativePath(runId), expected);
   } catch { /* journal evidence remains for replay */ }
 }
-function indexPreimageAuthenticatesCurrentPinned(pinnedRoot: PinnedProjectRoot, runId: string, current: CtoRunDeliveryIndexRead): boolean {
-  if (!current.observed || !current.valid) return false;
-  try {
-    const read = pinnedRoot.readFile(ctoRunDeliveryIndexPreimageRelativePath(runId), { maxBytes: 2 * MAX_CTO_RUN_DELIVERY_INDEX_BYTES });
-    const parsed = JSON.parse(decodeUtf8(read.bytes)) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-    const value = parsed as Record<string, unknown>;
-    if (Object.keys(value).sort().join("\0") !== ["index_base64", "proof_base64", "schema_version"].join("\0") || value.schema_version !== 1 || typeof value.index_base64 !== "string") return false;
-    const indexBytes = Buffer.from(value.index_base64, "base64");
-    const currentBytes = pinnedRoot.readFile(ctoRunDeliveryIndexRelativePath(), { maxBytes: MAX_CTO_RUN_DELIVERY_INDEX_BYTES }).bytes;
-    if (!Buffer.from(indexBytes).equals(Buffer.from(currentBytes))) return false;
-    if (value.proof_base64 === null) return false;
-    if (typeof value.proof_base64 !== "string") return false;
-    const proofBytes = Buffer.from(value.proof_base64, "base64");
-    const currentProof = pinnedRoot.readFile(join(".work-state", "cto", CTO_RUN_DELIVERY_INDEX_PROOF_FILE), { maxBytes: 16 * 1024 }).bytes;
-    return Buffer.from(proofBytes).equals(Buffer.from(currentProof));
-  } catch {
-    return false;
-  }
-}
-
 function parseCtoRunDeliveryJournal(bytes: Uint8Array): CtoRunDeliveryPublicationJournal {
   let parsed: unknown;
   try {
