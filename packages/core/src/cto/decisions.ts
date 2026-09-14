@@ -456,7 +456,7 @@ function readCtoSpecificationDecisionsUnlocked(projectRoot: string, ctoRunId: st
   const path = specificationDecisionsPath(root, ctoRunId, pinnedRoot);
   const pending = readPendingTransactions(root, ctoRunId, pinnedRoot);
   if (pending.length > 0) {
-    const transaction = pending[0]!;
+    const transaction = pending[0]!.transaction;
     if (transaction.status === "quarantined") {
       throw new Error(
         `CTO_SPEC_DECISION_QUARANTINED: durable decision transaction '${transaction.transaction_id}' requires manual recovery: ${transaction.quarantine_reason ?? "unknown reason"}`,
