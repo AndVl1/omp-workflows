@@ -505,8 +505,9 @@ function removeReviewPacketTransaction(
   root: string,
   ctoRunId: string,
   pinnedRoot: PinnedProjectRoot,
-  expected: PinnedRootWriteDescriptor,
+  expected: PinnedRootWriteDescriptor | undefined,
 ): void {
+  if (!expected) return;
   const path = reviewPacketTransactionPath(root, ctoRunId);
   const relativePath = pinnedRoot.relativePath(path);
   if (!relativePath) throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_PATH_INVALID", "review packet transaction path is outside the pinned project root");
@@ -1042,7 +1043,7 @@ function advanceCtoSpecificationPreparationUnlocked(
   state: CtoState,
   commitState: (next: CtoState) => void,
   assertRuntimeLive: () => void,
-  markPacketTransactionCommitted: () => void,
+  markPacketTransactionCommitted: (descriptor: PinnedRootWriteDescriptor) => void,
 ): AdvanceCtoSpecificationPreparationResult {
   assertRuntimeLive();
   recoverReviewPacketTransaction(root, ctoRunId, pinnedRoot);
@@ -1369,7 +1370,9 @@ function advanceCtoSpecificationPreparationUnlocked(
     // The runtime transaction callback has only staged the CTO state here;
     // its outer commit still owns the state/index CAS. Defer WAL removal until
     // that commit returns successfully so any failure retains recovery proof.
-    markPacketTransactionCommitted();
+    const committedDescriptor = packetTransactionDescriptor;
+    if (!committedDescriptor) throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_CONFLICT", "packet publication did not retain its WAL descriptor");
+    markPacketTransactionCommitted(committedDescriptor);
     assertRuntimeLive();
   }
 
@@ -1491,6 +1494,7 @@ export function advanceCtoSpecificationPreparation(
         assertRuntimeLive();
       }
       let packetTransactionCommitted = false;
+      let committedPacketTransactionDescriptor: PinnedRootWriteDescriptor | undefined;
       const result = options.runtimeAccess.withRunTransaction(ctoRunId, (transaction) => {
         assertRuntimeLive();
         const state = transaction.readState();
@@ -1503,13 +1507,15 @@ export function advanceCtoSpecificationPreparation(
           state,
           (next) => { assertRuntimeLive(); transaction.writeState(next); assertRuntimeLive(); },
           assertRuntimeLive,
-          () => { packetTransactionCommitted = true; },
+          (descriptor) => { packetTransactionCommitted = true; committedPacketTransactionDescriptor = descriptor; },
         );
       });
       injectPreparationFailure("after_cto_state_write");
       if (packetTransactionCommitted) {
+        const descriptor = committedPacketTransactionDescriptor;
+        if (!descriptor) throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_CONFLICT", "committed packet publication did not retain its WAL descriptor");
         assertRuntimeLive();
-        removeReviewPacketTransaction(root, ctoRunId, pinnedRoot, packetTransactionDescriptor);
+        removeReviewPacketTransaction(root, ctoRunId, pinnedRoot, descriptor);
         assertRuntimeLive();
       }
       return result;
