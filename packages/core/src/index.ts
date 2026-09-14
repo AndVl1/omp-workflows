@@ -1774,6 +1774,8 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
   const sessionBindingController: TeamSessionBindingController = Object.freeze({
     bind: (ctx: unknown): void => {
       if (sessionBindingControllerRevoked) return;
+      const current = teamActivationCells.get(originalPi as unknown as object);
+      if (!current || (current.state !== "active" && current.state !== "failed")) return;
       bindSession(ctx);
     },
     isLive: (ctx: unknown): boolean => {
