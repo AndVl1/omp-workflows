@@ -7,7 +7,8 @@ import type { RegistryRegistrationContext } from "../registry/owner.js";
  * this module's WeakMaps, so a caller cannot manufacture a session authority
  * by copying a `{ sessionId, main }` DTO or by supplying a getter.
  */
-export type CtoRuntimeSessionAuthority = object & { readonly __cto_runtime_session_authority?: never };
+declare const CTO_RUNTIME_SESSION_AUTHORITY_BRAND: unique symbol;
+export type CtoRuntimeSessionAuthority = { readonly [CTO_RUNTIME_SESSION_AUTHORITY_BRAND]: true };
 
 export type CtoRuntimeSessionAuthorityRoot = {
   readonly canonical_root: string;
@@ -83,14 +84,14 @@ export function issueCtoRuntimeSessionAuthority(
     liveGuard,
     revoked: false,
   };
-  authorityCells.set(authority, cell);
+  authorityCells.set(authority as object, cell);
   contextAuthorities.set(context, authority);
   return authority;
 }
 
 /** Revoke one lifecycle capability; stale copies fail closed immediately. */
 export function revokeCtoRuntimeSessionAuthority(authority: CtoRuntimeSessionAuthority): void {
-  const cell = authority && typeof authority === "object" ? authorityCells.get(authority) : undefined;
+  const cell = authority && typeof authority === "object" ? authorityCells.get(authority as object) : undefined;
   if (!cell || cell.revoked) return;
   cell.revoked = true;
   if (contextAuthorities.get(cell.context) === authority) contextAuthorities.delete(cell.context);
@@ -105,12 +106,12 @@ export function ctoRuntimeSessionAuthorityForContext(
 ): CtoRuntimeSessionAuthority | null {
   if (!context || typeof context !== "object") return null;
   const authority = contextAuthorities.get(context);
-  const cell = authority ? authorityCells.get(authority) : undefined;
+  const cell = authority ? authorityCells.get(authority as object) : undefined;
   if (!authority || !cell || cell.revoked || cell.context !== context) return null;
   try {
     cell.liveGuard();
   } catch {
-    revokeCtoRuntimeSessionAuthority(authority);
+    revokeCtoRuntimeSessionAuthority(authority as CtoRuntimeSessionAuthority);
     return null;
   }
   return authority;
@@ -126,13 +127,13 @@ export function authenticateCtoRuntimeSessionAuthority(
   root: CtoRuntimeSessionAuthorityRoot,
 ): CtoRuntimeSessionAuthorityCell | null {
   if (!authority || typeof authority !== "object" || !context || typeof context !== "object" || !validRoot(root)) return null;
-  const cell = authorityCells.get(authority);
+  const cell = authorityCells.get(authority as object);
   if (!cell || cell.revoked || cell.context !== context
     || cell.root.canonical_root !== root.canonical_root || cell.root.dev !== root.dev || cell.root.ino !== root.ino) return null;
   try {
     cell.liveGuard();
   } catch {
-    revokeCtoRuntimeSessionAuthority(authority);
+    revokeCtoRuntimeSessionAuthority(authority as CtoRuntimeSessionAuthority);
     return null;
   }
   return cell;

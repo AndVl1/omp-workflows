@@ -9,14 +9,30 @@ import { findActiveCtoRun } from "../commands/cto.js";
 import {
   acknowledgeCtoRunDelivery,
   markCtoRunDeliveryPending,
+  mintCtoRuntimeRunOrigin,
+  ctoRuntimeRunInitialIdentityDigest,
+  hasCtoRuntimeRunOriginHandoffPinned,
+  hasValidCtoRuntimeRunOriginPinned,
+  hasValidCtoRuntimeStateProofPinned,
+  writeCtoRuntimeStateProof,
+  refreshCtoRunDeliveryIndexAuthorityPinned,
   newCtoState,
   publishCtoOutboxDelivery,
   readCtoRunDeliveryActiveCandidatesPinned,
   readCtoRunDeliveryCompletedCandidatesPinned,
   readCtoRunDeliveryIndexPage,
+  readCtoRunDeliveryCompletedIndexPage,
   readCtoStatePinned,
+  currentOutboxDeliveryStatusPinned,
+  recordCtoOutboxDeliveryObligation,
+  readCtoOutboxDeliveryObligationsPinned,
+  removeCtoOutboxDeliveryObligation,
   type AppendWaveOptions,
   type CtoOutboxDeliveryPublishInput,
+  type CtoOutboxDeliveryObligationInput,
+  type CtoOutboxDeliveryObligationRead,
+  type CtoCurrentOutboxDeliveryInput,
+  type CtoCurrentOutboxDeliveryStatus,
   type CtoRunDeliveryCandidatesRead,
   type CtoRunDeliveryIndexPage,
   writeCtoState,
@@ -34,9 +50,16 @@ import { loadEscalationConfigRaw, type EscalationConfigInvalidCode, type Escalat
 import { assessRunHealth } from "./health.js";
 import { checkBudget } from "./budget.js";
 import { recallDecisions } from "./decisions.js";
-import { startWaveScheduler } from "./scheduler.js";
+import { startWaveScheduler, type CtoSchedulerStateAdapter } from "./scheduler.js";
 import { PinnedProjectRoot } from "../specification/pinned-root.js";
 import type { CtoState, WaveRecord, ScheduledDigest } from "./types.js";
+import {
+  authenticateCtoRuntimeSessionAuthority,
+  ctoRuntimeSessionAuthorityForContext,
+  revokeCtoRuntimeSessionAuthority,
+  type CtoRuntimeSessionAuthority,
+} from "./session-authority.js";
+export { ctoRuntimeSessionAuthorityForContext };
 
 const RUNTIME_CONTEXT_BRAND = Symbol("omp.cto.runtime-access-context");
 const SENSITIVE_PROJECTION_KEY = /(?:^|_)(?:answer|body|user|by|raw|token)(?:_|$)/iu;
@@ -73,9 +96,12 @@ export class CtoRuntimeAccessError extends Error {
   }
 }
 
-export interface CtoRuntimeAccessSession {
-  readonly sessionId: string;
-  readonly main: true;
+/** Opaque capability issued by the trusted host session lifecycle. */
+export type CtoRuntimeAccessSession = CtoRuntimeSessionAuthority;
+
+export interface CtoRuntimeRunOriginHandoff {
+  readonly source_id: string;
+  readonly initial_state_sha256: string;
 }
 
 export interface CtoRuntimeActiveRunProjection {
@@ -107,12 +133,19 @@ export interface CtoRuntimeAccessFacade {
   stateDirectory(runId: string): string;
   assertProjectRoot(projectRoot: string): void;
   ensureStandbyRun(): string;
+  registerRunOrigin(runId: string, handoff: CtoRuntimeRunOriginHandoff): boolean;
+  createRun(state: CtoState, handoff: CtoRuntimeRunOriginHandoff): CtoState;
   readActiveDeliveryCandidates(): Readonly<CtoRunDeliveryCandidatesRead>;
   readCompletedDeliveryCandidates(): Readonly<CtoRunDeliveryCandidatesRead>;
   readDeliveryIndexPage(options?: { after_run_id?: string; startAfter?: string; limit?: number }): Readonly<CtoRunDeliveryIndexPage>;
+  readCompletedDeliveryIndexPage(options?: { after_run_id?: string; limit?: number }): Readonly<CtoRunDeliveryIndexPage>;
   markDeliveryPending(runId: string, stateRevision?: number, kind?: "outbox" | "summary" | "retry"): boolean;
   publishOutboxDelivery(input: CtoOutboxDeliveryPublishInput): string | null;
+  recordOutboxDeliveryObligation(input: CtoOutboxDeliveryObligationInput): CtoOutboxDeliveryObligationRead | null;
+  readOutboxDeliveryObligations(runId?: string): readonly CtoOutboxDeliveryObligationRead[];
+  removeOutboxDeliveryObligation(runId: string, entryName: string, envelopeId: string): boolean;
   acknowledgeDelivery(runId: string, expectedRevision: number, options?: { drained: true }): boolean;
+  currentOutboxDeliveryStatus(input: CtoCurrentOutboxDeliveryInput): CtoCurrentOutboxDeliveryStatus;
   listEscalationChannelKinds(): readonly string[];
   resolveEscalationChannelSnapshot(): Readonly<CtoRuntimeEscalationChannelSnapshot>;
   resolveEscalationChannelConfigs(kind: string): readonly Readonly<Record<string, unknown>>[];
@@ -123,6 +156,8 @@ export interface CtoRuntimeAccessFacade {
   assertLive(): void;
 }
 
+export type CtoRuntimeAccessProvider = (canonicalRoot: string, sessionId: string) => CtoRuntimeAccessFacade | null;
+
 export type CtoRuntimeAccessOpenResult =
   | { readonly ok: true; readonly access: CtoRuntimeAccessFacade }
   | { readonly ok: false; readonly code: CtoRuntimeAccessFailureCode; readonly error: string };
@@ -132,12 +167,106 @@ type RuntimeCell = {
   snapshot: RegistryContextSnapshot;
   root: PinnedProjectRoot;
   sessionId: string;
+  sessionManager: object;
+  sessionGeneration?: string | number;
   schedulers: Set<() => void>;
   revoked: boolean;
   access?: object;
+  deliveryCapability?: object;
+  authority: CtoRuntimeSessionAuthority;
 };
 
 const runtimeCells = new WeakMap<object, RuntimeCell>();
+const deliveryCapabilities = new WeakMap<object, RuntimeCell>();
+export const MAX_RUNTIME_ACCESS_SCHEDULERS = 8;
+export const MIN_RUNTIME_ACCESS_INTERVAL_MS = 10;
+export const MAX_RUNTIME_ACCESS_INTERVAL_MS = 24 * 60 * 60 * 1000;
+export const MAX_RUNTIME_ACCESS_PROVIDERS = 256;
+
+/** One bounded session identity policy shared by every native CTO mutator. */
+export function isSafeCtoRuntimeSessionId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.trim().length > 0
+    && Buffer.byteLength(value, "utf8") <= MAX_RUNTIME_SESSION_ID_BYTES
+    && !/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
+}
+
+/** Internal verifier used by state.ts; delivery capability is never public. */
+export function isCtoRuntimeDeliveryCapability(value: unknown): boolean {
+  return typeof value === "object" && value !== null && deliveryCapabilities.has(value);
+}
+
+function runtimeCellForFacade(value: unknown): RuntimeCell | null {
+  let current = typeof value === "object" && value !== null ? value : null;
+  const seen = new Set<object>();
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    const cell = runtimeCells.get(current);
+    if (cell) return cell;
+    try { current = Object.getPrototypeOf(current) as object | null; } catch { return null; }
+  }
+  return null;
+}
+
+/** Validates a genuine runtime facade or guarded derived wrapper. */
+export function assertCtoRuntimeAccessFacadeLive(
+  value: unknown,
+  expectedRoot?: string,
+  expectedSessionId?: string,
+): asserts value is CtoRuntimeAccessFacade {
+  const cell = runtimeCellForFacade(value);
+  if (!cell) throw new CtoRuntimeAccessError("runtime_access_invalid", "CTO runtime access is not an authenticated facade");
+  requireLive(cell);
+  if (expectedRoot !== undefined && cell.root.canonical_root !== expectedRoot) {
+    throw new CtoRuntimeAccessError("runtime_access_invalid", "CTO runtime access project root does not match");
+  }
+  if (expectedSessionId !== undefined && (!isSafeCtoRuntimeSessionId(expectedSessionId) || cell.sessionId !== expectedSessionId)) {
+    throw new CtoRuntimeAccessError("runtime_access_invalid", "CTO runtime access session does not match");
+  }
+}
+
+export function isCtoRuntimeAccessFacade(value: unknown): value is CtoRuntimeAccessFacade {
+  return runtimeCellForFacade(value) !== null;
+}
+
+const runtimeAccessProviders = new Set<CtoRuntimeAccessProvider>();
+export function registerCtoRuntimeAccessProvider(provider: CtoRuntimeAccessProvider): () => void {
+  if (typeof provider !== "function") throw new TypeError("CTO runtime access provider must be a function");
+  if (!runtimeAccessProviders.has(provider) && runtimeAccessProviders.size >= MAX_RUNTIME_ACCESS_PROVIDERS) {
+    throw new CtoRuntimeAccessError("runtime_access_invalid", "CTO runtime access provider registry capacity is exhausted");
+  }
+  runtimeAccessProviders.add(provider);
+  let active = true;
+  return () => {
+    if (!active) return;
+    active = false;
+    runtimeAccessProviders.delete(provider);
+  };
+}
+
+/** Resolve exactly one live, same-root runtime capability without accepting model input. */
+export function resolveCtoRuntimeAccessForRoot(root: string, sessionId: string): CtoRuntimeAccessFacade | null {
+  if (typeof root !== "string" || root.length === 0 || !isSafeCtoRuntimeSessionId(sessionId)) return null;
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  if (!pinnedRoot) return null;
+  try {
+    if (!pinnedRoot.isStable()) return null;
+    const canonicalRoot = pinnedRoot.canonical_root;
+    const found = new Map<RuntimeCell, CtoRuntimeAccessFacade>();
+    for (const provider of runtimeAccessProviders) {
+      let candidate: CtoRuntimeAccessFacade | null = null;
+      try { candidate = provider(canonicalRoot, sessionId); } catch { continue; }
+      if (!candidate) continue;
+      try {
+        assertCtoRuntimeAccessFacadeLive(candidate, canonicalRoot, sessionId);
+        const cell = runtimeCellForFacade(candidate);
+        if (cell) found.set(cell, candidate);
+      } catch { /* stale or foreign provider result */ }
+    }
+    if (found.size !== 1 || !pinnedRoot.isStable()) return null;
+    return [...found.values()][0] ?? null;
+  } finally { pinnedRoot.close(); }
+}
 
 function ownString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= MAX_RUNTIME_SESSION_ID_BYTES
@@ -200,6 +329,15 @@ function requireSafeRunId(runId: string): void {
 
 function requireLive(cell: RuntimeCell): void {
   if (cell.revoked) throw runtimeError("activation_revoked", "CTO runtime access has been revoked");
+  const authority = authenticateCtoRuntimeSessionAuthority(cell.authority, cell.context, {
+    canonical_root: cell.snapshot.canonical_root,
+    dev: cell.snapshot.root_dev,
+    ino: cell.snapshot.root_ino,
+  });
+  if (!authority || authority.sessionId !== cell.sessionId || authority.sessionManager !== cell.sessionManager || authority.generation !== cell.sessionGeneration) {
+    revoke(cell);
+    throw runtimeError("activation_revoked", "CTO runtime session authority has been revoked or rebound");
+  }
   let current: RegistryContextSnapshot;
   try {
     current = requireRegistryContext(cell.context, cell.snapshot.canonical_root, "workflow_tools");
@@ -242,6 +380,7 @@ function revoke(cell: RuntimeCell): void {
     return;
   }
   cell.revoked = true;
+  revokeCtoRuntimeSessionAuthority(cell.authority);
   for (const stop of cell.schedulers) {
     try { stop(); } catch { /* scheduler teardown is best effort */ }
   }
@@ -390,6 +529,69 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
         }
       },
     },
+    registerRunOrigin: {
+      enumerable: false,
+      value: (runId: string, handoff: CtoRuntimeRunOriginHandoff): boolean => {
+        requireLive(cell);
+        if (!ownString(runId) || !handoff || !ownString(handoff.source_id) || !/^[0-9a-f]{64}$/u.test(handoff.initial_state_sha256)) return false;
+        return withCtoRunLock(cell.root.canonical_root, runId, () => {
+          requireLive(cell);
+          const state = readCtoStatePinned(runId, cell.root);
+          if (!state || ctoRuntimeRunInitialIdentityDigest(state) !== handoff.initial_state_sha256) return false;
+          return mintCtoRuntimeRunOrigin(cell.root, state, cell.sessionId, handoff.source_id, handoff.initial_state_sha256);
+        }, { pinnedRoot: cell.root });
+      },
+    },
+    createRun: {
+      enumerable: false,
+      value: (state: CtoState, handoff: CtoRuntimeRunOriginHandoff): CtoState => {
+        requireLive(cell);
+        if (!state || typeof state !== "object" || !ownString(state.id) || !handoff || !ownString(handoff.source_id)
+          || !/^[0-9a-f]{64}$/u.test(handoff.initial_state_sha256)
+          || ctoRuntimeRunInitialIdentityDigest(state) !== handoff.initial_state_sha256
+          || (state.standby !== true && state.owner_session !== cell.sessionId)) {
+          throw runtimeError("runtime_access_invalid", "trusted CTO run creation handoff is invalid");
+        }
+        return withCtoRunLock(cell.root.canonical_root, state.id, () => {
+          requireLive(cell);
+          const existing = readCtoStatePinned(state.id, cell.root);
+          if (existing) {
+            if (ctoRuntimeRunInitialIdentityDigest(existing) !== handoff.initial_state_sha256
+              || !hasCtoRuntimeRunOriginHandoffPinned(cell.root, existing, cell.sessionId, handoff.source_id, handoff.initial_state_sha256)) {
+              throw runtimeError("runtime_access_invalid", "CTO run creation conflicts with an existing authenticated origin");
+            }
+            if (!hasValidCtoRuntimeStateProofPinned(cell.root, existing)) {
+              if (!writeCtoRuntimeStateProof(cell.root, existing) || !hasValidCtoRuntimeStateProofPinned(cell.root, existing)) {
+                throw runtimeError("runtime_access_invalid", "CTO run state proof recovery failed");
+              }
+            }
+            if (!refreshCtoRunDeliveryIndexAuthorityPinned(cell.root, cell.deliveryCapability, cell.sessionId)) {
+              throw runtimeError("runtime_access_invalid", "CTO delivery index proof recovery failed");
+            }
+            return existing;
+          }
+          if (!mintCtoRuntimeRunOrigin(cell.root, state, cell.sessionId, handoff.source_id, handoff.initial_state_sha256)) {
+            throw runtimeError("runtime_access_invalid", "CTO run origin proof could not be committed");
+          }
+          writeCtoStateLocked(state, cell.root.canonical_root, {
+            pinnedRoot: cell.root,
+            preCommit: ({ pinnedRoot }) => {
+              requireLive(cell);
+              if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "CTO project root changed before run creation");
+            },
+          });
+          const created = readCtoStatePinned(state.id, cell.root);
+          if (!created || !hasValidCtoRuntimeRunOriginPinned(cell.root, created)
+            || !writeCtoRuntimeStateProof(cell.root, created) || !hasValidCtoRuntimeStateProofPinned(cell.root, created)) {
+            throw runtimeError("runtime_access_invalid", "trusted CTO run origin/state proof failed after creation");
+          }
+          if (!refreshCtoRunDeliveryIndexAuthorityPinned(cell.root, cell.deliveryCapability, cell.sessionId)) {
+            throw runtimeError("runtime_access_invalid", "trusted CTO delivery index proof failed after creation");
+          }
+          return created;
+        }, { pinnedRoot: cell.root });
+      },
+    },
     ensureStandbyRun: {
       enumerable: false,
       value: (): string => {
@@ -436,7 +638,10 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
                   standby: true,
                 });
                 state.pause = { kind: "none", reason: "standby" };
-                writeCtoState(state, cell.root.canonical_root, { pinnedRoot: cell.root });
+                writeCtoState(state, cell.root.canonical_root, { pinnedRoot: cell.root, preCommit: ({ pinnedRoot }) => {
+                  requireLive(cell);
+                  if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "standby project root changed before state commit");
+                } });
                 if (!cell.root.isStable()) throw new Error("standby project root changed after state/index publication");
                 const finalRun = cell.root.pathEntryInfo(runDirectory);
                 const finalInbox = cell.root.pathEntryInfo(inboxDirectory);
@@ -514,6 +719,28 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
         return pageProjection(readCtoRunDeliveryIndexPage(cell.root.canonical_root, copy, cell.root));
       },
     },
+    readCompletedDeliveryIndexPage: {
+      enumerable: false,
+      value: (options: { after_run_id?: string; limit?: number } = {}): Readonly<CtoRunDeliveryIndexPage> => {
+        requireLive(cell);
+        if (!ownRecord(options) || Object.keys(options).some((key) => key !== "after_run_id" && key !== "limit")) {
+          throw runtimeError("runtime_access_invalid", "completed delivery page options are invalid");
+        }
+        const copy: { after_run_id?: string; limit?: number } = {};
+        if (options.after_run_id !== undefined) {
+          if (typeof options.after_run_id !== "string") throw runtimeError("runtime_access_invalid", "completed delivery cursor is invalid");
+          requireSafeRunId(options.after_run_id);
+          copy.after_run_id = options.after_run_id;
+        }
+        if (options.limit !== undefined) {
+          if (!Number.isSafeInteger(options.limit) || options.limit <= 0) throw runtimeError("runtime_access_invalid", "completed delivery page limit is invalid");
+          copy.limit = options.limit;
+        }
+        const page = readCtoRunDeliveryCompletedIndexPage(cell.root.canonical_root, copy, cell.root);
+        requireLive(cell);
+        return detachedProjection(page);
+      },
+    },
     markDeliveryPending: {
       enumerable: false,
       value: (runId: string, stateRevision?: number, kind: "outbox" | "summary" | "retry" = "outbox"): boolean => {
@@ -521,7 +748,7 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
         requireSafeRunId(runId);
         if (kind !== "outbox" && kind !== "summary" && kind !== "retry") throw runtimeError("runtime_access_invalid", "delivery kind is invalid");
         if (stateRevision !== undefined && (!Number.isSafeInteger(stateRevision) || stateRevision < 0)) throw runtimeError("runtime_access_invalid", "delivery state revision is invalid");
-        return markCtoRunDeliveryPending(cell.root.canonical_root, runId, stateRevision, kind, cell.root);
+        return markCtoRunDeliveryPending(cell.root.canonical_root, runId, stateRevision, kind, cell.root, cell.deliveryCapability);
       },
     },
     publishOutboxDelivery: {
@@ -547,7 +774,7 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
           ...(input.legacy_entry_name === undefined ? {} : { legacy_entry_name: input.legacy_entry_name }),
           json,
         };
-        return publishCtoOutboxDelivery(cell.root.canonical_root, copy, cell.root);
+        return publishCtoOutboxDelivery(cell.root.canonical_root, copy, cell.root, cell.deliveryCapability);
       },
     },
     acknowledgeDelivery: {
@@ -556,7 +783,42 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
         requireLive(cell);
         requireSafeRunId(runId);
         if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || !ownRecord(options) || options.drained !== true) throw runtimeError("runtime_access_invalid", "delivery acknowledgement is invalid");
-        return acknowledgeCtoRunDelivery(cell.root.canonical_root, runId, expectedRevision, { drained: true }, cell.root);
+        return acknowledgeCtoRunDelivery(cell.root.canonical_root, runId, expectedRevision, { drained: true }, cell.root, cell.deliveryCapability);
+      },
+    },
+    recordOutboxDeliveryObligation: {
+      enumerable: false,
+      value: (input: CtoOutboxDeliveryObligationInput): CtoOutboxDeliveryObligationRead | null => {
+        requireLive(cell);
+        if (!ownRecord(input)) throw runtimeError("runtime_access_invalid", "outbox obligation input must be a plain object");
+        const result = recordCtoOutboxDeliveryObligation(cell.root.canonical_root, input, cell.root, cell.deliveryCapability);
+        return result ? detachedProjection(result) : null;
+      },
+    },
+    readOutboxDeliveryObligations: {
+      enumerable: false,
+      value: (runId?: string): readonly CtoOutboxDeliveryObligationRead[] => {
+        requireLive(cell);
+        if (runId !== undefined) requireSafeRunId(runId);
+        if (runId === undefined) return Object.freeze([]);
+        return detachedProjection(readCtoOutboxDeliveryObligationsPinned(cell.root.canonical_root, runId, cell.root));
+      },
+    },
+    removeOutboxDeliveryObligation: {
+      enumerable: false,
+      value: (runId: string, entryName: string, envelopeId: string): boolean => {
+        requireLive(cell);
+        requireSafeRunId(runId);
+        if (!ownString(entryName) || !ownString(envelopeId)) throw runtimeError("runtime_access_invalid", "outbox obligation identifiers are invalid");
+        return removeCtoOutboxDeliveryObligation(cell.root.canonical_root, runId, entryName, envelopeId, cell.root, cell.deliveryCapability);
+      },
+    },
+    currentOutboxDeliveryStatus: {
+      enumerable: false,
+      value: (input: CtoCurrentOutboxDeliveryInput): CtoCurrentOutboxDeliveryStatus => {
+        requireLive(cell);
+        if (!ownRecord(input)) throw runtimeError("runtime_access_invalid", "outbox delivery input must be a plain object");
+        return currentOutboxDeliveryStatusPinned(input, cell.root, cell.deliveryCapability);
       },
     },
     listEscalationChannelKinds: {
@@ -624,7 +886,13 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
               value: (next: CtoState): string => {
                 requireTransactionActive(cell, activity);
                 if (!next || typeof next !== "object" || next.id !== runId) throw runtimeError("runtime_access_invalid", "run transaction state identity does not match the bound run");
-                const path = writeCtoStateLocked(next, cell.root.canonical_root, { pinnedRoot: cell.root });
+                const path = writeCtoStateLocked(next, cell.root.canonical_root, {
+                  pinnedRoot: cell.root,
+                  preCommit: ({ pinnedRoot }) => {
+                    requireTransactionActive(cell, activity);
+                    if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "CTO project root changed before state commit");
+                  },
+                });
                 state = next;
                 return path;
               },
@@ -694,7 +962,30 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
             throw error;
           }
         };
-        stop = startWaveScheduler(state, cell.root.canonical_root, intervalMs, guardedOnWave);
+        const schedulerAdapter: CtoSchedulerStateAdapter = {
+          read: (): CtoState => {
+            requireLive(cell);
+            const current = readCtoStatePinned(runId, cell.root);
+            if (!current) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+            return current;
+          },
+          update: (mutator): CtoState => {
+            requireLive(cell);
+            const current = readCtoStatePinned(runId, cell.root);
+            if (!current) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+            const next = mutator(current);
+            if (!next || next.id !== runId) throw runtimeError("runtime_access_invalid", "scheduler state identity does not match the bound run");
+            writeCtoState(next, cell.root.canonical_root, {
+              pinnedRoot: cell.root,
+              preCommit: ({ pinnedRoot }) => {
+                requireLive(cell);
+                if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "CTO project root changed before scheduler commit");
+              },
+            });
+            return next;
+          },
+        };
+        stop = startWaveScheduler(state, schedulerAdapter, intervalMs, guardedOnWave);
         const wrappedStop = (): void => {
           if (stopped) return;
           stopped = true;
@@ -731,8 +1022,8 @@ export function openCtoRuntimeAccess(
   session: CtoRuntimeAccessSession,
   projectRoot: string,
 ): CtoRuntimeAccessOpenResult {
-  if (!session || typeof session !== "object" || !ownString(session.sessionId) || session.main !== true) {
-    return openFailure("runtime_access_invalid", "a non-empty main session is required");
+  if (!session || typeof session !== "object") {
+    return openFailure("runtime_access_invalid", "an opaque main-session authority is required");
   }
   if (typeof projectRoot !== "string" || projectRoot.trim().length === 0) return openFailure("runtime_access_invalid", "project root is required");
   let snapshot: RegistryContextSnapshot;
@@ -747,16 +1038,31 @@ export function openCtoRuntimeAccess(
     root?.close();
     return openFailure("activation_revoked", "project root could not be pinned to the authenticated identity");
   }
+  const authority = authenticateCtoRuntimeSessionAuthority(session, registryContext, {
+    canonical_root: snapshot.canonical_root,
+    dev: snapshot.root_dev,
+    ino: snapshot.root_ino,
+  });
+  if (!authority) {
+    root.close();
+    return openFailure("runtime_access_invalid", "runtime session authority is forged, stale, or bound to another registry context");
+  }
   const cell: RuntimeCell = {
     context: registryContext,
     snapshot,
     root,
-    sessionId: session.sessionId,
+    sessionId: authority.sessionId,
+    sessionManager: authority.sessionManager,
+    ...(authority.generation !== undefined ? { sessionGeneration: authority.generation } : {}),
     schedulers: new Set(),
     revoked: false,
+    authority: session,
   };
   const access = makeFacade(cell);
   cell.access = access as object;
+  const deliveryCapability = Object.freeze({});
+  cell.deliveryCapability = deliveryCapability;
+  deliveryCapabilities.set(deliveryCapability, cell);
   runtimeCells.set(access as object, cell);
   return { ok: true, access };
 }
