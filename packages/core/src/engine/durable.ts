@@ -8459,7 +8459,7 @@ function recordCheckpointDecisionMutation(cwd: string, state: TeamState, target:
   if (!allowNativeComposite && specification?.source_kind === "native" && ["specify", "plan", "tasks"].includes(stage.id)) {
     return { ok: false, error: "NATIVE_COMPOSITE_REQUIRED: native specification checkpoint decisions must be committed through the authenticated selected Ask path", state };
   }
-  if ((specification !== undefined && (specification.source_kind === "external" || nativePhaseCheckpoint))
+  if (specification !== undefined
     || (specification === undefined && input.feature_id !== undefined && input.subject_binding !== undefined)) {
     const subjectKind = nativePhaseCheckpoint ? "native" : specification?.source_kind === "external" ? "external" : "selected";
     const selectedFeatureId = input.feature_id;

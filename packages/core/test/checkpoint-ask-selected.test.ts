@@ -16,6 +16,7 @@ import { resolveState, writeState } from "../src/engine/state.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { CompatibilityReport, FeatureWorkspace, ImportSnapshot } from "../src/specification/types.js";
 import { bindFeatureWorkspaceToRoot, validConstitutionBinding, validFeatureWorkspace } from "./fixtures/specification-fixtures.js";
+import { ensureProjectConstitution } from "../src/specification/prerequisite.js";
 
 
 function initGit(root: string): void {
@@ -113,6 +114,24 @@ function importedState(root: string): { state: TeamState; token: string; dispatc
   assert.ok(profile, "spec-import profile must be available");
   const featureId = "imported-payment-retry";
   const runKey = "import-regression-run";
+  const constitutionText = "# Project Constitution v1.0.0\n\n## I. Quality\n\nShip tested work.\n";
+  mkdirSync(join(root, "specs", featureId), { recursive: true });
+  writeFileSync(join(root, "CONSTITUTION.md"), constitutionText, "utf8");
+  const gate = ensureProjectConstitution(root, {
+    origin_kind: "external_import",
+    origin_run_key: runKey,
+    origin_stage: "spec_import",
+  }, { feature_id: featureId });
+  assert.ok(gate.ok, gate.ok ? "import fixture constitution gate established" : gate.error);
+  if (!gate.ok || !gate.value.binding) throw new Error("import fixture constitution gate unavailable");
+  const specification = bindFeatureWorkspaceToRoot(
+    validFeatureWorkspace({ featureId, projectRoot: root, constitutionBinding: gate.value.binding as never }),
+    root,
+  ) as unknown as FeatureWorkspace;
+  specification.profile_name = profile.name;
+  specification.profile_hash = profileHash(profile);
+  specification.status = "in_progress";
+  specification.constitution_gate_ref = gate.value.gate_id;
   const issued = createCapability({ run_key: runKey, branch: "main", workflow: "spec-import", profile_hash: profileHash(profile), stage_cursor: "compatibility_approval", kind: "none", expected_roster: [], dispatch_secret: "selected-dispatch-token", advance_secret: "selected-advance-token" });
   const state: TeamState = {
     schema: 1,
@@ -129,6 +148,8 @@ function importedState(root: string): { state: TeamState; token: string; dispatc
     profile_hash: profileHash(profile),
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
+    specification,
+    state_revision: 0,
     updated_at: new Date().toISOString(),
   };
   writeState(root, state, { featureSlug: featureId });
