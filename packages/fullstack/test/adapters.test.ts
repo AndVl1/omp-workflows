@@ -199,15 +199,19 @@ function telegramStreamResponse(
 
 
 function withIndexedRun(root: string, runId: string): void {
+  const runtime = runtimeFor(root);
   const state = newCtoState({
     id: runId,
     task: "adapter delivery",
     branch: "main",
     autonomous: true,
+    owner_session: runtime.sessionId,
     plan: { id: runId, task: "adapter delivery", teams: [], created_at: new Date().toISOString() },
   });
-  assert.ok(runtimeFor(root).access.createRun(state, { source_id: `adapters:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
-  assert.equal(runtimeFor(root).access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
+  const sourceId = `adapters:${runId}`;
+  const initialStateSha256 = ctoRuntimeRunInitialIdentityDigest(state);
+  assert.ok(runtime.access.createRun(state, { source_id: sourceId, initial_state_sha256: initialStateSha256 }));
+  assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
 }
 
 function publishTestDelivery(root: string, runId: string, delivery: Record<string, unknown>): string {
@@ -1676,6 +1680,8 @@ test("adapters: telegram callback_query maps to an option answer", async () => {
       }
       throw new Error(`unexpected method: ${method}`);
     }) as typeof fetch;
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "t", chatId: "100" } }));
     withIndexedRun(root, "run-1");
 
     const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
