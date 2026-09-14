@@ -151,6 +151,26 @@ export function assertCtoRuntimeProofAuthorityLive(authority: CtoRuntimeProofAut
   if (!liveCell(authority)) throw new Error("CTO runtime proof authority is unavailable");
 }
 
+/**
+ * Assert that a live proof authority is bound to one exact pinned project
+ * identity. Liveness alone is insufficient when a lexical path has been
+ * replaced by another project; callers must verify the physical root before
+ * using the authority for durable writes.
+ */
+export function assertCtoRuntimeProofAuthorityBound(
+  authority: CtoRuntimeProofAuthority,
+  pinnedRoot: PinnedProjectRoot,
+): void {
+  const cell = liveCell(authority);
+  if (!cell) throw new Error("CTO runtime proof authority is unavailable");
+  if (!pinnedRoot || !pinnedRoot.isStable()
+    || cell.root.canonical_root !== pinnedRoot.canonical_root
+    || cell.root.dev !== pinnedRoot.dev
+    || cell.root.ino !== pinnedRoot.ino) {
+    throw new Error("CTO runtime proof authority root does not match the pinned project root");
+  }
+}
+
 export function signCtoRuntimeProof(
   authority: CtoRuntimeProofAuthority,
   domain: CtoRuntimeProofDomain,

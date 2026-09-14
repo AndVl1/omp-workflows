@@ -71,6 +71,7 @@ import {
 export { ctoRuntimeSessionAuthorityForContext };
 export {
   assertCtoRuntimeProofAuthorityLive,
+  assertCtoRuntimeProofAuthorityBound,
   isCtoRuntimeProofAuthority,
   openCtoRuntimeProofAuthority,
   revokeCtoRuntimeProofAuthority,
@@ -81,6 +82,7 @@ export {
 export type { CtoRuntimeProofAuthority, CtoRuntimeProofDomain } from "./proof-authority.js";
 
 const RUNTIME_CONTEXT_BRAND = Symbol("omp.cto.runtime-access-context");
+const RUNTIME_SERVICE_MUTATION_AUTHORITY_BRAND = Symbol("omp.cto.runtime-service-mutation-authority");
 const SENSITIVE_PROJECTION_KEY = /(?:^|_)(?:answer|body|user|by|raw|token)(?:_|$)/iu;
 const MAX_RUNTIME_SESSION_ID_BYTES = 512;
 const MAX_RUNTIME_CHANNEL_KIND_BYTES = 128;
@@ -117,6 +119,11 @@ export class CtoRuntimeAccessError extends Error {
 
 /** Opaque capability issued by the trusted host session lifecycle. */
 export type CtoRuntimeAccessSession = CtoRuntimeSessionAuthority;
+
+/** Opaque activation-scoped service capability for dispatcher mutations. */
+export interface CtoRuntimeServiceMutationAuthority {
+  readonly [RUNTIME_SERVICE_MUTATION_AUTHORITY_BRAND]: true;
+}
 
 export interface CtoRuntimeRunOriginHandoff {
   readonly source_id: string;
@@ -232,11 +239,22 @@ type RuntimeCell = {
   authorityLease?: () => void;
 };
 
+type ServiceMutationCell = {
+  context: RegistryRegistrationContext;
+  snapshot: RegistryContextSnapshot;
+  root: PinnedProjectRoot;
+  schedulers: Set<() => void>;
+  revoked: boolean;
+};
+
 const runtimeCells = new WeakMap<object, RuntimeCell>();
+const serviceMutationCells = new WeakMap<object, ServiceMutationCell>();
+const serviceMutationAuthoritySet = new Set<ServiceMutationCell>();
 const guardedRuntimeCells = new WeakMap<object, RuntimeCell>();
 const deliveryCapabilities = new WeakMap<object, RuntimeCell>();
 const bridgeDeliveryCapabilities = new WeakSet<object>();
 export const MAX_RUNTIME_ACCESS_SCHEDULERS = 8;
+export const MAX_RUNTIME_SERVICE_AUTHORITIES = 8;
 export const MIN_RUNTIME_ACCESS_INTERVAL_MS = 10;
 export const MAX_RUNTIME_ACCESS_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const MAX_RUNTIME_ACCESS_PROVIDERS = 256;
@@ -329,6 +347,99 @@ export function assertCtoRuntimeAccessFacadeLive(
 
 export function isCtoRuntimeAccessFacade(value: unknown): value is CtoRuntimeAccessFacade {
   return runtimeCellForFacade(value) !== null;
+}
+
+function revokeServiceMutationAuthority(key: object, cell: ServiceMutationCell): void {
+  if (cell.revoked) return;
+  cell.revoked = true;
+  serviceMutationCells.delete(key);
+  serviceMutationAuthoritySet.delete(cell);
+  for (const stop of cell.schedulers) {
+    try { stop(); } catch { /* service scheduler teardown is best effort */ }
+  }
+  cell.schedulers.clear();
+  cell.root.close();
+}
+
+function liveServiceMutationCell(value: unknown): ServiceMutationCell | null {
+  if (!value || typeof value !== "object") return null;
+  const key = value as object;
+  const cell = serviceMutationCells.get(key);
+  if (!cell || cell.revoked) return null;
+  let current: RegistryContextSnapshot;
+  try {
+    current = requireRegistryContext(cell.context, cell.snapshot.canonical_root, "workflow_tools");
+  } catch {
+    revokeServiceMutationAuthority(key, cell);
+    return null;
+  }
+  if (!cell.root.isStable()
+    || current.canonical_root !== cell.snapshot.canonical_root
+    || current.root_dev !== cell.snapshot.root_dev
+    || current.root_ino !== cell.snapshot.root_ino
+    || current.owner_fingerprint !== cell.snapshot.owner_fingerprint
+    || current.principal_fingerprint !== cell.snapshot.principal_fingerprint
+    || current.claim_generation !== cell.snapshot.claim_generation
+    || current.marker_generation !== cell.snapshot.marker_generation
+    || current.marker_digest !== cell.snapshot.marker_digest) {
+    revokeServiceMutationAuthority(key, cell);
+    return null;
+  }
+  return cell;
+}
+
+function requireLiveServiceMutationAuthority(authority: CtoRuntimeServiceMutationAuthority): ServiceMutationCell {
+  const cell = liveServiceMutationCell(authority);
+  if (!cell) throw runtimeError("activation_revoked", "CTO runtime service mutation authority is unavailable");
+  return cell;
+}
+
+/** Open one activation/root-bound capability for trusted dispatcher mutation paths. */
+export function openCtoRuntimeServiceMutationAuthority(
+  registryContext: RegistryRegistrationContext,
+  pinnedRoot: PinnedProjectRoot,
+): CtoRuntimeServiceMutationAuthority | null {
+  if (!registryContext || !pinnedRoot || !pinnedRoot.isStable() || serviceMutationAuthoritySet.size >= MAX_RUNTIME_SERVICE_AUTHORITIES) return null;
+  let snapshot: RegistryContextSnapshot;
+  try { snapshot = requireRegistryContext(registryContext, pinnedRoot.canonical_root, "workflow_tools"); } catch { return null; }
+  if (snapshot.canonical_root !== pinnedRoot.canonical_root || snapshot.root_dev !== pinnedRoot.dev || snapshot.root_ino !== pinnedRoot.ino) return null;
+  const ownedRoot = PinnedProjectRoot.open(snapshot.canonical_root);
+  if (!ownedRoot || ownedRoot.canonical_root !== snapshot.canonical_root || ownedRoot.dev !== pinnedRoot.dev || ownedRoot.ino !== pinnedRoot.ino || !ownedRoot.isStable()) {
+    ownedRoot?.close();
+    return null;
+  }
+  const authority = Object.freeze({}) as CtoRuntimeServiceMutationAuthority;
+  const cell: ServiceMutationCell = { context: registryContext, snapshot, root: ownedRoot, schedulers: new Set(), revoked: false };
+  serviceMutationCells.set(authority as object, cell);
+  serviceMutationAuthoritySet.add(cell);
+  return authority;
+}
+
+/** Return whether a service mutation authority remains activation-live. */
+export function isCtoRuntimeServiceMutationAuthority(value: unknown): value is CtoRuntimeServiceMutationAuthority {
+  return liveServiceMutationCell(value) !== null;
+}
+
+/** Assert that a service mutation authority remains bound to its root identity. */
+export function assertCtoRuntimeServiceMutationAuthorityBound(
+  authority: CtoRuntimeServiceMutationAuthority,
+  pinnedRoot: PinnedProjectRoot,
+): void {
+  const cell = requireLiveServiceMutationAuthority(authority);
+  if (!pinnedRoot || !pinnedRoot.isStable()
+    || cell.root.canonical_root !== pinnedRoot.canonical_root
+    || cell.root.dev !== pinnedRoot.dev
+    || cell.root.ino !== pinnedRoot.ino) {
+    throw runtimeError("runtime_access_invalid", "CTO runtime service mutation authority root does not match the pinned project root");
+  }
+}
+
+/** Revoke one service authority and stop every scheduler it issued. */
+export function revokeCtoRuntimeServiceMutationAuthority(authority: CtoRuntimeServiceMutationAuthority): void {
+  if (!authority || typeof authority !== "object") return;
+  const key = authority as object;
+  const cell = serviceMutationCells.get(key);
+  if (cell) revokeServiceMutationAuthority(key, cell);
 }
 
 const runtimeAccessProviders = new Set<CtoRuntimeAccessProvider>();
@@ -438,6 +549,174 @@ function requireSafeRunId(runId: string): void {
   if (typeof runId !== "string" || !/^[A-Za-z0-9._-]+$/u.test(runId) || runId === "." || runId === ".." || runId.length > 128) {
     throw runtimeError("runtime_access_invalid", "unsafe CTO run id");
   }
+}
+
+function requireOwnedRunState(cell: RuntimeCell, state: CtoState): void {
+  const identity = state.work_identity;
+  if (state.owner_session !== cell.sessionId || !identity || identity.session_id !== cell.sessionId) {
+    throw runtimeError("owner_conflict", "CTO run is owned by a different or unavailable runtime session");
+  }
+}
+
+/**
+ * Run one synchronous, lock-scoped mutation with explicit dispatcher/service
+ * authority. Unlike the owner facade transaction, this path deliberately does
+ * not infer a per-run owner from a session; the opaque authority is the only
+ * cross-run mutation grant.
+ */
+export function withCtoRuntimeServiceTransaction<T>(
+  authority: CtoRuntimeServiceMutationAuthority,
+  runId: string,
+  callback: (transaction: CtoRunTransactionFacade) => T,
+): T {
+  const cell = requireLiveServiceMutationAuthority(authority);
+  requireSafeRunId(runId);
+  if (typeof callback !== "function") throw runtimeError("runtime_access_invalid", "run transaction callback is invalid");
+  return withCtoRunLock(cell.root.canonical_root, runId, () => {
+    requireLiveServiceMutationAuthority(authority);
+    const initial = readCtoStatePinned(runId, cell.root);
+    if (!initial) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+    let state = structuredClone(initial) as CtoState;
+    let dirty = false;
+    const activity = { active: true };
+    const transaction: CtoRunTransactionFacade = Object.create(null) as CtoRunTransactionFacade;
+    const requireActive = (): void => {
+      if (!activity.active) throw runtimeError("activation_revoked", "CTO runtime service transaction is no longer active");
+      requireLiveServiceMutationAuthority(authority);
+    };
+    Object.defineProperties(transaction, {
+      readState: {
+        enumerable: false,
+        value: (): CtoState => {
+          requireActive();
+          return state;
+        },
+      },
+      writeState: {
+        enumerable: false,
+        value: (next: CtoState): string => {
+          requireActive();
+          if (!next || typeof next !== "object" || next.id !== runId) throw runtimeError("runtime_access_invalid", "run transaction state identity does not match the bound run");
+          state = structuredClone(next) as CtoState;
+          dirty = true;
+          return join(cell.root.canonical_root, ".work-state", "cto", runId, "state.json");
+        },
+      },
+      appendWave: {
+        enumerable: false,
+        value: (options: AppendWaveOptions): CtoState => {
+          requireActive();
+          if (!ownRecord(options)) throw runtimeError("runtime_access_invalid", "wave options must be a plain object");
+          const next = appendWave(state, options);
+          if (next !== state) {
+            state = next;
+            dirty = true;
+          }
+          return state;
+        },
+      },
+      findWaveBySourceId: {
+        enumerable: false,
+        value: (sourceId: string): WaveRecord | null => {
+          requireActive();
+          requireSafeRunId(sourceId);
+          const matches = (state.wave_history ?? []).filter((wave) => wave.source_id === sourceId);
+          return matches.length === 1 ? matches[0]! : null;
+        },
+      },
+    });
+    Object.freeze(transaction);
+    try {
+      const result = callback(transaction);
+      let then: unknown;
+      try {
+        if (result !== null && (typeof result === "object" || typeof result === "function")) then = (result as { then?: unknown }).then;
+      } catch {
+        throw runtimeError("runtime_access_invalid", "run transaction result thenable inspection failed");
+      }
+      if (typeof then === "function") throw runtimeError("cto_runtime_transaction_async_unsupported", "CTO run transactions must complete synchronously");
+      if (dirty) {
+        requireActive();
+        writeCtoStateLocked(state, cell.root.canonical_root, {
+          pinnedRoot: cell.root,
+          preCommit: ({ pinnedRoot, current, candidate }) => {
+            requireActive();
+            if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "CTO project root changed before service transaction commit");
+            if (!current || current.id !== runId) throw runtimeError("runtime_access_invalid", "CTO run disappeared before service transaction commit");
+            if (!candidate || candidate.id !== runId) throw runtimeError("runtime_access_invalid", "service transaction state identity does not match the bound run");
+          },
+        });
+      }
+      return result;
+    } finally {
+      activity.active = false;
+    }
+  }, { pinnedRoot: cell.root });
+}
+
+/** Start a scheduler through the explicit service authority for cross-run work. */
+export function startCtoRuntimeServiceScheduler(
+  authority: CtoRuntimeServiceMutationAuthority,
+  runId: string,
+  intervalMs: number,
+  onWave: () => void,
+): () => void {
+  const cell = requireLiveServiceMutationAuthority(authority);
+  requireSafeRunId(runId);
+  if (!Number.isSafeInteger(intervalMs) || intervalMs < MIN_RUNTIME_ACCESS_INTERVAL_MS || intervalMs > MAX_RUNTIME_ACCESS_INTERVAL_MS) throw runtimeError("runtime_access_invalid", "scheduler interval must be an integer between configured bounds");
+  if (typeof onWave !== "function") throw runtimeError("runtime_access_invalid", "scheduler callback is invalid");
+  const state = withCtoRunLock(cell.root.canonical_root, runId, () => {
+    requireLiveServiceMutationAuthority(authority);
+    const current = readCtoStatePinned(runId, cell.root);
+    if (!current) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+    return current;
+  }, { pinnedRoot: cell.root });
+  if (cell.schedulers.size >= MAX_RUNTIME_ACCESS_SCHEDULERS) throw runtimeError("runtime_access_invalid", "runtime service scheduler capacity is exhausted");
+  let stopped = false;
+  let stop: () => void = () => undefined;
+  const guardedOnWave = (): void => {
+    if (stopped) return;
+    try {
+      requireLiveServiceMutationAuthority(authority);
+      onWave();
+    } catch (error) {
+      stop();
+      throw error;
+    }
+  };
+  const schedulerAdapter: CtoSchedulerStateAdapter = {
+    read: (): CtoState => withCtoRunLock(cell.root.canonical_root, runId, () => {
+      requireLiveServiceMutationAuthority(authority);
+      const current = readCtoStatePinned(runId, cell.root);
+      if (!current) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+      return current;
+    }, { pinnedRoot: cell.root }),
+    update: (mutator): CtoState => {
+      requireLiveServiceMutationAuthority(authority);
+      const current = readCtoStatePinned(runId, cell.root);
+      if (!current) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+      const next = mutator(current);
+      if (!next || next.id !== runId) throw runtimeError("runtime_access_invalid", "scheduler state identity does not match the bound run");
+      writeCtoState(next, cell.root.canonical_root, {
+        pinnedRoot: cell.root,
+        preCommit: ({ pinnedRoot, current: canonical, candidate }) => {
+          requireLiveServiceMutationAuthority(authority);
+          if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "CTO project root changed before service scheduler commit");
+          if (!canonical || canonical.id !== runId || !candidate || candidate.id !== runId) throw runtimeError("runtime_access_invalid", "service scheduler state identity does not match the bound run");
+        },
+      });
+      return next;
+    },
+  };
+  stop = startWaveScheduler(state, schedulerAdapter, intervalMs, guardedOnWave);
+  const wrappedStop = (): void => {
+    if (stopped) return;
+    stopped = true;
+    stop();
+    cell.schedulers.delete(wrappedStop);
+  };
+  cell.schedulers.add(wrappedStop);
+  return wrappedStop;
 }
 
 function requireLive(cell: RuntimeCell): void {
@@ -683,6 +962,15 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
           requireLive(cell);
           const state = readCtoStatePinned(runId, cell.root);
           if (!state || ctoRuntimeRunInitialIdentityDigest(state) !== handoff.initial_state_sha256) return false;
+          // A valid immutable origin is an idempotent read, even when the
+          // state is legacy or owned by another session. Never rewrite it.
+          if (hasValidCtoRuntimeRunOriginPinned(cell.root, state)) {
+            return hasCtoRuntimeRunOriginHandoffPinned(cell.root, state, cell.sessionId, handoff.source_id, handoff.initial_state_sha256);
+          }
+          // Proofless states may only acquire an origin from their canonical
+          // owner. Otherwise a foreign facade could mint an origin that does
+          // not bind to state.owner_session.
+          requireOwnedRunState(cell, state);
           return mintCtoRuntimeRunOrigin(cell.root, state, cell.sessionId, handoff.source_id, handoff.initial_state_sha256);
         }, { pinnedRoot: cell.root });
       },
@@ -1055,6 +1343,7 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
           requireLive(cell);
           const initial = readCtoStatePinned(runId, cell.root);
           if (!initial) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+          requireOwnedRunState(cell, initial);
           let state = structuredClone(initial) as CtoState;
           let dirty = false;
           const activity = { active: true };
@@ -1120,9 +1409,15 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
               writeCtoStateLocked(state, cell.root.canonical_root, {
                 pinnedRoot: cell.root,
                 ...(originTransition ? { originTransition } : {}),
-                preCommit: ({ pinnedRoot }) => {
+                preCommit: ({ pinnedRoot, current, candidate }) => {
                   requireTransactionActive(cell, activity);
                   if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "CTO project root changed before transaction commit");
+                  // Revalidate both canonical preimage and candidate while the
+                  // state/index lock is held. A callback cannot transfer the
+                  // run to another owner before publication.
+                  if (!current) throw runtimeError("owner_conflict", "CTO run disappeared before transaction commit");
+                  requireOwnedRunState(cell, current);
+                  requireOwnedRunState(cell, candidate);
                 },
               });
               if (!refreshCtoRunDeliveryIndexAuthorityPinned(cell.root, cell.deliveryCapability, cell.sessionId)) {
@@ -1143,9 +1438,17 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
         requireSafeRunId(runId);
         if (!Number.isSafeInteger(intervalMs) || intervalMs < MIN_RUNTIME_ACCESS_INTERVAL_MS || intervalMs > MAX_RUNTIME_ACCESS_INTERVAL_MS) throw runtimeError("runtime_access_invalid", "scheduler interval must be an integer between configured bounds");
         if (typeof onWave !== "function") throw runtimeError("runtime_access_invalid", "scheduler callback is invalid");
+        // Bind the scheduler only after reading and authenticating the exact
+        // run under its canonical lock. Standby/service runs require a
+        // dedicated service capability rather than this owner facade.
+        const state = withCtoRunLock(cell.root.canonical_root, runId, (handle: CtoRunLockHandle) => {
+          requireLive(cell);
+          const current = readCtoStatePinned(runId, cell.root);
+          if (!current) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+          requireOwnedRunState(cell, current);
+          return current;
+        }, { pinnedRoot: cell.root });
         if (cell.schedulers.size >= MAX_RUNTIME_ACCESS_SCHEDULERS) throw runtimeError("runtime_access_invalid", "runtime scheduler capacity is exhausted");
-        const state = readCtoStatePinned(runId, cell.root);
-        if (!state) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
         let stopped = false;
         let stop: () => void = () => undefined;
         const guardedOnWave = (): void => {
@@ -1161,21 +1464,30 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
         const schedulerAdapter: CtoSchedulerStateAdapter = {
           read: (): CtoState => {
             requireLive(cell);
-            const current = readCtoStatePinned(runId, cell.root);
-            if (!current) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
-            return current;
+            return withCtoRunLock(cell.root.canonical_root, runId, (handle: CtoRunLockHandle) => {
+              requireLive(cell);
+              const current = readCtoStatePinned(runId, cell.root);
+              if (!current) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+              requireOwnedRunState(cell, current);
+              return current;
+            }, { pinnedRoot: cell.root });
           },
           update: (mutator): CtoState => {
             requireLive(cell);
             const current = readCtoStatePinned(runId, cell.root);
             if (!current) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+            requireOwnedRunState(cell, current);
             const next = mutator(current);
             if (!next || next.id !== runId) throw runtimeError("runtime_access_invalid", "scheduler state identity does not match the bound run");
+            requireOwnedRunState(cell, next);
             writeCtoState(next, cell.root.canonical_root, {
               pinnedRoot: cell.root,
-              preCommit: ({ pinnedRoot }) => {
+              preCommit: ({ pinnedRoot, current: canonical, candidate }) => {
                 requireLive(cell);
                 if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "CTO project root changed before scheduler commit");
+                if (!canonical) throw runtimeError("owner_conflict", "CTO run disappeared before scheduler commit");
+                requireOwnedRunState(cell, canonical);
+                requireOwnedRunState(cell, candidate);
               },
             });
             return next;

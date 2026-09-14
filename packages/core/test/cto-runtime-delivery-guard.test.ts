@@ -26,13 +26,30 @@ function openAccess(root: string) {
 }
 
 function makeState(runId: string) {
-  return newCtoState({
+  const state = newCtoState({
     id: runId,
     task: "delivery guard test",
     branch: "main",
     autonomous: false,
     plan: { id: runId, task: "delivery guard test", teams: [], created_at: "" },
   });
+  state.work_identity = {
+    run_id: runId,
+    wave_id: "wave-runtime",
+    slice_id: "slice-runtime",
+    session_id: "main-session",
+    workflow: "developer",
+    stage_id: "execution",
+    stage_cursor: "execution",
+    capability_id: "runtime-capability",
+    capability_epoch: "runtime-epoch",
+    slot_id: "runtime-slot",
+    task_id: "runtime-task",
+    dispatch_id: "runtime-dispatch",
+    attempt: 1,
+    worker_id: "runtime-worker",
+  };
+  return state;
 }
 
 function deliveryInput(runId: string, stateRevision: number, body = "body"): CtoRuntimeOutboxDeliveryInput {

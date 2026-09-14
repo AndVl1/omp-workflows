@@ -19,8 +19,25 @@ function makeProject(): string {
     task,
     branch: "main",
     autonomous: false,
+    owner_session: "main-session",
     plan: { id: "run-one", task, teams: [], created_at: new Date().toISOString() },
   });
+  state.work_identity = {
+    run_id: "run-one",
+    wave_id: "wave-runtime",
+    slice_id: "slice-runtime",
+    session_id: "main-session",
+    workflow: "developer",
+    stage_id: "execution",
+    stage_cursor: "execution",
+    capability_id: "runtime-capability",
+    capability_epoch: "runtime-epoch",
+    slot_id: "runtime-slot",
+    task_id: "runtime-task",
+    dispatch_id: "runtime-dispatch",
+    attempt: 1,
+    worker_id: "runtime-worker",
+  };
   writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => { if (!pinnedRoot.isStable()) throw new Error("runtime fixture root changed before state CAS"); } });
   return root;
 }

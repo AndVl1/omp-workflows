@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -13,6 +13,13 @@ import {
 import {
   CtoRuntimeAccessError,
   assertCtoRuntimeAccessFacadeLive,
+  assertCtoRuntimeProofAuthorityBound,
+  assertCtoRuntimeServiceMutationAuthorityBound,
+  isCtoRuntimeServiceMutationAuthority,
+  openCtoRuntimeServiceMutationAuthority,
+  revokeCtoRuntimeServiceMutationAuthority,
+  startCtoRuntimeServiceScheduler,
+  withCtoRuntimeServiceTransaction,
   createCtoRuntimeAccessGuardedView,
   isCtoRuntimeAccessFacade,
   type CtoRuntimeAccessFacade,
@@ -65,14 +72,30 @@ function activationFor(root: string) {
   return activation;
 }
 
-function stateFor(root: string, runId = "run-one"): void {
+function stateFor(root: string, runId = "run-one", ownerSession = "main-session"): void {
   const plan: TeamPlan = {
     id: runId,
     task: "runtime access test",
     teams: [{ team: "team-one", scope: ["src"], slice: "slice-one", profile: "developer", worktree: "same_branch", depends_on: [] }],
     created_at: new Date().toISOString(),
   };
-  const state = newCtoState({ id: runId, task: plan.task, branch: "main", autonomous: false, owner_session: "main-session", plan });
+  const state = newCtoState({ id: runId, task: plan.task, branch: "main", autonomous: false, owner_session: ownerSession, plan });
+  state.work_identity = {
+    run_id: runId,
+    wave_id: "wave-runtime",
+    slice_id: "slice-one",
+    session_id: ownerSession,
+    workflow: "developer",
+    stage_id: "execution",
+    stage_cursor: "execution",
+    capability_id: "runtime-capability",
+    capability_epoch: "runtime-epoch",
+    slot_id: "runtime-slot",
+    task_id: "runtime-task",
+    dispatch_id: "runtime-dispatch",
+    attempt: 1,
+    worker_id: "runtime-worker",
+  };
   state.decisions = [{ id: "decision-one", at: new Date().toISOString(), decision: "use bounded facade", why: "avoid raw state", tags: ["runtime"], by: "user" }];
   state.inbox_quarantine = {
     inbox: { id: "inbox", hash: "hash", received_at: new Date().toISOString(), by: "user", status: "quarantined", wake_claim: { pid: process.pid, start_identity: "test", token: "secret-token", started_at: new Date().toISOString() } },
@@ -80,7 +103,7 @@ function stateFor(root: string, runId = "run-one"): void {
   const pinnedRoot = PinnedProjectRoot.open(root);
   assert.ok(pinnedRoot);
   try {
-    assert.equal(mintCtoRuntimeRunOrigin(pinnedRoot, state, "main-session", "runtime-access", ctoRuntimeRunInitialIdentityDigest(state)), true);
+    assert.equal(mintCtoRuntimeRunOrigin(pinnedRoot, state, ownerSession, "runtime-access", ctoRuntimeRunInitialIdentityDigest(state)), true);
     writeCtoState(state, root, { pinnedRoot, preCommit: ({ pinnedRoot: candidateRoot }) => candidateRoot.assertStable() });
     const persisted = readCtoState(runId, root);
     assert.ok(persisted);
@@ -118,6 +141,7 @@ function assertRevoked(action: () => unknown): void {
 
 test("opaque proof authority binds allowed domains to the live registry claim", () => {
   const root = makeProject();
+  const foreignRoot = makeProject();
   try {
     const activation = activationFor(root);
     const pinned = PinnedProjectRoot.open(root);
@@ -127,6 +151,15 @@ test("opaque proof authority binds allowed domains to the live registry claim", 
       const authority = openCtoRuntimeProofAuthority(activation.registry_context, pinned);
       assert.ok(authority);
       if (!authority) return;
+      assert.doesNotThrow(() => assertCtoRuntimeProofAuthorityBound(authority, pinned));
+      const foreignPin = PinnedProjectRoot.open(foreignRoot);
+      assert.ok(foreignPin);
+      if (!foreignPin) throw new Error("foreign proof root could not be pinned");
+      try {
+        assert.throws(() => assertCtoRuntimeProofAuthorityBound(authority, foreignPin), /root does not match/i);
+      } finally {
+        foreignPin.close();
+      }
       const payload = JSON.stringify({ schema: 1, identity: "test" });
       const proof = signCtoRuntimeProof(authority, "telegram-mapping-v1", payload);
       assert.match(proof ?? "", /^[0-9a-f]{64}$/u);
@@ -141,6 +174,7 @@ test("opaque proof authority binds allowed domains to the live registry claim", 
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
+    rmSync(foreignRoot, { recursive: true, force: true });
   }
 });
 
@@ -185,6 +219,110 @@ test("runtime scheduler rejects unsafe intervals, caps live timers, and reuses s
     opened.access.close();
     releaseWorkflowOwners(opened.activation.release_token, ["workflow_registration", "workflow_tools"]);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("owner-bound runtime methods reject foreign runs while explicit service authority spans runs", () => {
+  const root = makeProject();
+  let owner: ReturnType<typeof openAccess> | undefined;
+  let foreign: ReturnType<typeof openAccess> | undefined;
+  try {
+    stateFor(root, "run-one", "main-session");
+    stateFor(root, "run-foreign", "foreign-session");
+    owner = openAccess(root, "main-session");
+    foreign = openAccess(root, "foreign-session");
+    const statePath = join(root, ".work-state", "cto", "run-one", "state.json");
+    const originPath = join(root, ".work-state", "cto", "run-one", ".runtime-origin-proof.json");
+    const beforeState = readFileSync(statePath, "utf8");
+    const beforeOrigin = readFileSync(originPath, "utf8");
+    let callbackCalls = 0;
+    assert.throws(
+      () => foreign!.access.withRunTransaction("run-one", (transaction) => {
+        callbackCalls += 1;
+        transaction.writeState(transaction.readState());
+      }),
+      (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "owner_conflict",
+    );
+    assert.equal(callbackCalls, 0, "foreign owner rejection happens before callback execution");
+    assert.equal(readFileSync(statePath, "utf8"), beforeState, "foreign transaction does not mutate state bytes");
+
+    let ticks = 0;
+    assert.throws(
+      () => foreign!.access.startScheduler("run-one", MIN_RUNTIME_ACCESS_INTERVAL_MS, () => { ticks += 1; }),
+      (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "owner_conflict",
+    );
+    assert.equal(ticks, 0, "foreign scheduler never enters its callback");
+    assert.equal(readFileSync(statePath, "utf8"), beforeState, "foreign scheduler does not mutate state bytes");
+
+    const mainState = readCtoState("run-one", root);
+    assert.ok(mainState);
+    const handoff = { source_id: "runtime-access", initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(mainState!) };
+    assert.equal(foreign.access.registerRunOrigin("run-one", handoff), false, "a valid foreign origin remains immutable");
+    assert.equal(readFileSync(originPath, "utf8"), beforeOrigin, "foreign origin registration does not rewrite a valid proof");
+
+    unlinkSync(originPath);
+    assert.throws(
+      () => foreign!.access.registerRunOrigin("run-one", handoff),
+      (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "owner_conflict",
+    );
+    assert.equal(readFileSync(statePath, "utf8"), beforeState, "proofless foreign origin registration does not mutate state");
+    assert.equal(existsSync(originPath), false, "proofless foreign origin registration does not mint a proof");
+
+    const restoredState = readCtoState("run-one", root);
+    assert.ok(restoredState);
+    assert.equal(owner.access.registerRunOrigin("run-one", {
+      source_id: "runtime-access",
+      initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(restoredState!),
+    }), true, "the canonical owner may restore a missing origin proof");
+    owner.access.withRunTransaction("run-one", (transaction) => {
+      const next = transaction.readState();
+      next.integration = { status: "in_progress", note: "owner mutation" };
+      transaction.writeState(next);
+    });
+    assert.equal((readCtoState("run-one", root)?.integration as { note?: string }).note, "owner mutation");
+
+    const pinnedRoot = PinnedProjectRoot.open(root);
+    assert.ok(pinnedRoot);
+    if (!pinnedRoot) throw new Error("service authority root could not be pinned");
+    try {
+      assert.equal(openCtoRuntimeServiceMutationAuthority({} as never, pinnedRoot), null, "unclaimed registry context cannot mint service authority");
+      const service = openCtoRuntimeServiceMutationAuthority(owner.activation.registry_context, pinnedRoot);
+      assert.ok(service);
+      if (!service) throw new Error("service authority could not be opened");
+      assert.equal(isCtoRuntimeServiceMutationAuthority(service), true);
+      assert.doesNotThrow(() => assertCtoRuntimeServiceMutationAuthorityBound(service, pinnedRoot));
+      assert.equal("withCtoRuntimeServiceTransaction" in owner.access, false, "owner facade does not expose service transaction entrypoint");
+      const foreignRoot = mkdtempSync(join(tmpdir(), "omp-cto-runtime-service-foreign-"));
+      const foreignPin = PinnedProjectRoot.open(foreignRoot);
+      assert.ok(foreignPin);
+      if (!foreignPin) throw new Error("foreign service root could not be pinned");
+      try {
+        assert.throws(() => assertCtoRuntimeServiceMutationAuthorityBound(service, foreignPin), /root does not match/i);
+      } finally {
+        foreignPin.close();
+        rmSync(foreignRoot, { recursive: true, force: true });
+      }
+      assert.equal(isCtoRuntimeServiceMutationAuthority({}), false, "forged service authority is rejected");
+      withCtoRuntimeServiceTransaction(service, "run-foreign", (transaction) => {
+        const next = transaction.readState();
+        next.integration = { status: "in_progress", note: "dispatcher service mutation" };
+        transaction.writeState(next);
+      });
+      assert.equal((readCtoState("run-foreign", root)?.integration as { note?: string }).note, "dispatcher service mutation");
+      const stop = startCtoRuntimeServiceScheduler(service, "run-foreign", MIN_RUNTIME_ACCESS_INTERVAL_MS, () => undefined);
+      stop();
+      revokeCtoRuntimeServiceMutationAuthority(service);
+      assert.equal(isCtoRuntimeServiceMutationAuthority(service), false);
+      assert.throws(() => withCtoRuntimeServiceTransaction(service, "run-foreign", () => undefined), /service mutation authority is unavailable/i);
+    } finally {
+      pinnedRoot.close();
+    }
+  } finally {
+    owner?.access.close();
+    foreign?.access.close();
+    if (owner) releaseWorkflowOwners(owner.activation.release_token, ["workflow_registration", "workflow_tools"]);
+    if (foreign) releaseWorkflowOwners(foreign.activation.release_token, ["workflow_registration", "workflow_tools"]);
     rmSync(root, { recursive: true, force: true });
   }
 });
