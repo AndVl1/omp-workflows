@@ -7,7 +7,7 @@ import { setConstitutionContinuationGate } from "../../src/engine/durable.js";
 import { registerConstitutionProvider } from "../../src/specification/constitution-provider.js";
 import { registerDocumentRenderer, registerFormatRecognizer, registerSpecificationRenderer } from "../../src/specification/registry.js";
 import { registerArtifactRenderer, type ArtifactRenderer, type ArtifactRenderLayer } from "../../src/visualize/renderer-registry.js";
-import { openCtoRuntimeAccess, registerCtoRuntimeAccessProvider, type CtoRuntimeAccessFacade } from "../../src/cto/runtime-access.js";
+import { ctoRuntimeSessionAuthorityForContext, openCtoRuntimeAccess, registerCtoRuntimeAccessProvider, type CtoRuntimeAccessFacade } from "../../src/cto/runtime-access.js";
 import { issueCtoRuntimeSessionAuthority } from "../../src/cto/session-authority.js";
 import { closeWorkflowActivation as closeDistWorkflowActivation, openWorkflowActivation as openDistWorkflowActivation, type WorkflowOwnerIdentity as DistWorkflowOwnerIdentity } from "../../src/registry/index.js";
 import type { Profile } from "../../src/engine/types.js";
@@ -94,8 +94,10 @@ export function openTestCtoRuntime(
   ownerId = "core-cto-runtime-test",
 ): {
   readonly access: CtoRuntimeAccessFacade;
+  readonly refreshAccess: () => CtoRuntimeAccessFacade;
   readonly registryContext: OpenedWorkflowActivation["registry_context"];
   readonly owner: DistWorkflowOwnerIdentity;
+  readonly sessionManager: { readonly cwd: string; readonly getSessionId: () => string; readonly getCwd: () => string };
   readonly close: () => void;
 } {
   const marker = writeTestRegistryMarker(root);
@@ -108,11 +110,11 @@ export function openTestCtoRuntime(
     host_range: ">=17.3 <19",
     provenance: { package: "@andvl1/omp-workflows-core", entrypoint: "test", cwd: root },
   };
-  const activated = openDistWorkflowActivation(root, ["workflow_registration", "workflow_tools"], owner);
+  const activated = openDistWorkflowActivation(root, ["workflow_registration", "workflow_tools", "config_writer"], owner);
   if (!activated.ok) throw new Error(`${activated.code}: ${activated.error}`);
   const runtimeRoot = realpathSync(root);
   const runtimeIdentity = statSync(runtimeRoot);
-  const sessionManager = Object.freeze({});
+  const sessionManager = Object.freeze({ cwd: root, getSessionId: () => sessionId, getCwd: () => root });
   const authority = issueCtoRuntimeSessionAuthority(
     activated.registry_context,
     { canonical_root: runtimeRoot, dev: runtimeIdentity.dev, ino: runtimeIdentity.ino },
@@ -124,18 +126,30 @@ export function openTestCtoRuntime(
     closeDistWorkflowActivation(activated);
     throw new Error(`${opened.code}: ${opened.error}`);
   }
+  let currentAccess = opened.access;
   const runtimeKey = `${runtimeRoot}\0${sessionId}`;
-  testRuntimeAccesses.set(runtimeKey, opened.access);
+  testRuntimeAccesses.set(runtimeKey, currentAccess);
+  const refreshAccess = (): CtoRuntimeAccessFacade => {
+    const currentAuthority = ctoRuntimeSessionAuthorityForContext(activated.registry_context);
+    if (!currentAuthority) throw new Error("test runtime session authority is unavailable during refresh");
+    const refreshed = openCtoRuntimeAccess(activated.registry_context, currentAuthority, root);
+    if (!refreshed.ok) throw new Error(`${refreshed.code}: ${refreshed.error}`);
+    currentAccess = refreshed.access;
+    testRuntimeAccesses.set(runtimeKey, currentAccess);
+    return currentAccess;
+  };
   let closed = false;
   return {
-    access: opened.access,
+    get access() { return currentAccess; },
+    refreshAccess,
     registryContext: activated.registry_context,
     owner,
+    sessionManager,
     close: () => {
       if (closed) return;
       closed = true;
       testRuntimeAccesses.delete(runtimeKey);
-      opened.access.close();
+      currentAccess.close();
       closeDistWorkflowActivation(activated);
     },
   };

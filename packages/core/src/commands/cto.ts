@@ -2010,6 +2010,9 @@ function mappingStateDigest(value: unknown): string {
   // Derived migration provenance is normalized while a checkpoint answer is
   // prepared and is not part of the logical state transition image.
   delete copy.control_plane_provenance;
+  // The observability pointer is a derived projection published alongside
+  // state.json; it is not part of the checkpoint state transition image.
+  delete copy.observability;
   return sha256Hex(canonicalJson(copy));
 }
 

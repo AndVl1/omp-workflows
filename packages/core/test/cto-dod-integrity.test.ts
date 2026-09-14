@@ -39,7 +39,7 @@ import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { setCanonicalHandoffReadTestHooks } from "../src/specification/canonical-reader.js";
 import { captureWorkspacePathBinding } from "../src/specification/workspace.js";
 import { ensureProjectConstitution } from "../src/specification/prerequisite.js";
-import { registerCtoTools } from "../src/index.js";
+import { registerCtoTools, registerTeamWorkflow } from "../src/index.js";
 import { beginRegistryRegistration, commitRegistryRegistration, rollbackRegistryRegistration } from "../src/registry/index.js";
 import { digestOf } from "../src/specification/validation.js";
 import { readExecutionClaimStore } from "../src/specification/claims.js";
@@ -226,19 +226,28 @@ type MountedCtoTool = { name: string; execute: (...args: unknown[]) => Promise<{
 
 function mountedCtoAskTool(root: string, runId: string, runtime: ReturnType<typeof openTestCtoRuntime>): MountedCtoTool {
   const registered: MountedCtoTool[] = [];
-  const sessionManager = { cwd: root, getSessionId: () => "integrity-session", getCwd: () => root };
+  const sessionManager = runtime.sessionManager;
   const pi = {
     zod: { z: zod },
     on: (event: string, handler: (event: unknown, context: unknown) => unknown) => {
       if (event === "session_start") handler({}, { cwd: root, mode: "rpc", hasUI: true, sessionManager, ui: { askDialog: async () => undefined } });
     },
     registerTool: (tool: unknown) => registered.push(tool as MountedCtoTool),
+    setLabel: () => undefined,
   };
-  const registration = beginRegistryRegistration(runtime.registryContext, root, ["workflow_tools"]);
+  const sessionContext = { cwd: root, mode: "rpc", hasUI: true, sessionManager, ui: { askDialog: async () => undefined } };
+  const registration = beginRegistryRegistration(runtime.registryContext, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
   if (!registration.ok) throw new Error(`${registration.code}: ${registration.error}`);
   try {
+    registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => runtime.owner,
+      registrationToken: registration.token,
+      initialSessionContext: sessionContext,
+    });
     registerCtoTools(pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd, owner: () => runtime.owner, registrationToken: registration.token });
     commitRegistryRegistration(registration.token);
+    runtime.refreshAccess();
   } catch (error) {
     try { rollbackRegistryRegistration(registration.token); } catch { /* preserve original */ }
     throw error;
