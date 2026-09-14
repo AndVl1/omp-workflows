@@ -3696,11 +3696,15 @@ function activeCtoExecutionContext(root: string, ctoRunId: string, pinnedRoot: P
   const identity = wave.work_identity;
   const ownerSession = state.standby === true ? null : state.owner_session ?? null;
   if (ownerSession === null) return { ok: false, error: "the active execution wave has no authenticated owner session" };
+  const ownerIdentityBound = sessionId !== undefined
+    && state.work_identity !== undefined
+    && canonicalJson(state.work_identity) === canonicalJson(identity)
+    && validateTypedControlPlane({ work_identity: state.work_identity, pending: state.pending, completion_envelope: state.completion_envelope }).ok;
   if (!identity || identity.session_id !== ownerSession || identity.run_id !== ctoRunId || identity.wave_id !== wave.id || identity.stage_id !== "execution" || identity.stage_cursor !== "execution"
     || !wave.slice_ids.includes(identity.slice_id)
     || typeof identity.capability_id !== "string" || identity.capability_id.trim().length === 0
     || typeof identity.capability_epoch !== "string" || identity.capability_epoch.trim().length === 0
-    || (sessionId !== undefined && identity.session_id !== sessionId)) {
+    || (sessionId !== undefined && (!ownerIdentityBound || identity.session_id !== sessionId))) {
     return { ok: false, error: "the active execution wave lacks an exact run/wave/capability identity" };
   }
   return { ok: true, value: { state, wave_id: wave.id, source_id: wave.source_id, stage_id: identity.stage_id, capability_id: identity.capability_id, capability_epoch: identity.capability_epoch } };
@@ -3823,18 +3827,20 @@ function derivePreflightRetry(
 }
 
 /** Preflight, revalidate, freeze, and atomically persist one exact mapping per CTO run. */
-async function preflightCtoSpecificationExecutionUnlocked(projectRoot: string, input: CtoSpecificationExecutionPreflightInput, pinnedRoot: PinnedProjectRoot, assertRuntimeLive: () => void): Promise<CtoSpecificationExecutionPreflightResult> {
+async function preflightCtoSpecificationExecutionUnlocked(projectRoot: string, input: CtoSpecificationExecutionPreflightInput, pinnedRoot: PinnedProjectRoot, assertRuntimeLive: () => void, sessionId?: string): Promise<CtoSpecificationExecutionPreflightResult> {
   assertRuntimeLive();
   if (!pinnedRoot.isStable()) return blockedExecution(["project root changed before CTO preflight"]);
   const root = pinnedRoot.canonical_root;
   if (!input || typeof input.cto_run_id !== "string" || !isSafeCtoRunId(input.cto_run_id)) return blockedExecution(["cto_run_id must be a safe non-empty string"]);
+  const ownerExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, sessionId);
+  if (!ownerExecution.ok) return blockedExecution([ownerExecution.error]);
   try {
     assertRuntimeLive();
     recoverPendingMappingTransactions(root, input.cto_run_id, pinnedRoot);
   } catch (error) {
     return blockedExecution([`mapping recovery failed: ${error instanceof Error ? error.message : String(error)}`]);
   }
-  let execution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot);
+  let execution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, sessionId);
   if (!execution.ok) return blockedExecution([execution.error]);
   const selections: CtoSpecificationExecutionSelection[] = Array.isArray(input.selections)
     ? input.selections.map((selection) => ({ ...selection }))
@@ -3883,7 +3889,7 @@ async function preflightCtoSpecificationExecutionUnlocked(projectRoot: string, i
       const revalidated = await revalidateImportedHandoffForDispatch(revalidationInput);
       assertRuntimeLive();
       if (!pinnedRoot.isStable()) return blockedExecution([`${selection.feature_id}: project root changed during imported handoff revalidation`]);
-      const refreshedExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot);
+      const refreshedExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, sessionId);
       if (!refreshedExecution.ok) return blockedExecution([refreshedExecution.error]);
       if (!sameExecutionContext(execution.value, refreshedExecution.value)) return blockedExecution(["active CTO execution wave/capability changed during handoff revalidation"]);
       execution = refreshedExecution;
@@ -3900,7 +3906,7 @@ async function preflightCtoSpecificationExecutionUnlocked(projectRoot: string, i
     await ctoExecutionAwaitBoundary(root, pinnedRoot, input.cto_run_id);
     assertRuntimeLive();
     if (!pinnedRoot.isStable()) return blockedExecution([`${selection.feature_id}: project root changed after execution await`]);
-    const postAwaitExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot);
+    const postAwaitExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, sessionId);
     if (!postAwaitExecution.ok) return blockedExecution([postAwaitExecution.error]);
     if (!sameExecutionContext(execution.value, postAwaitExecution.value)) return blockedExecution(["active CTO execution wave/capability changed after execution await"]);
     execution = postAwaitExecution;
@@ -4016,6 +4022,8 @@ export async function preflightCtoSpecificationExecution(projectRoot: string, in
     assertRuntimeLive();
     if (!pinnedRoot.isStable()) return blockedExecution(["project root changed before CTO preflight"]);
     if (!input || typeof input.cto_run_id !== "string" || !isSafeCtoRunId(input.cto_run_id)) return blockedExecution(["cto_run_id must be a safe non-empty string"]);
+    const ownerExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, options.sessionId);
+    if (!ownerExecution.ok) return blockedExecution([ownerExecution.error]);
     try {
       assertRuntimeLive();
       recoverPendingMappingTransactions(root, input.cto_run_id, pinnedRoot);
@@ -4028,7 +4036,7 @@ export async function preflightCtoSpecificationExecution(projectRoot: string, in
     assertRuntimeLive();
     const result = await withCtoRunLockAsync(root, input.cto_run_id, () => {
       assertRuntimeLive();
-      return preflightCtoSpecificationExecutionUnlocked(root, input, pinnedRoot, assertRuntimeLive);
+      return preflightCtoSpecificationExecutionUnlocked(root, input, pinnedRoot, assertRuntimeLive, options.sessionId);
     }, { pinnedRoot });
     assertRuntimeLive();
     if (!pinnedRoot.isStable()) return blockedExecution(["project root changed during CTO preflight"]);
@@ -4144,6 +4152,7 @@ function resolveCtoMappingAskContext(
   pinnedRoot: PinnedProjectRoot,
   decision?: CtoSpecificationMappingReviewDecision,
   assertRuntimeLive?: () => void,
+  sessionId?: string,
 ): { ok: true; value: CtoMappingAskContext } | { ok: false; error: string } {
   assertRuntimeLive?.();
   if (!pinnedRoot.isStable()) return { ok: false, error: "project root changed before CTO mapping Ask" };
@@ -4170,7 +4179,7 @@ function resolveCtoMappingAskContext(
   if (!firstSelection || firstSelection.feature_id !== input.feature_id || firstSelection.run_key !== input.run_key) {
     return { ok: false, error: "mapping Ask feature/run must match the first exact frozen selection" };
   }
-  const execution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot);
+  const execution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, sessionId);
   if (!execution.ok) return execution;
   const frozenExecution = (record.mapping as CtoSpecificationMapping & { execution?: { wave_id?: string; source_id?: string; capability_id?: string; capability_epoch?: string } }).execution;
   const activeWave = execution.value.state.wave_history?.find((candidate) => candidate.id === execution.value.wave_id);
@@ -4212,13 +4221,15 @@ export function prepareCtoSpecificationMappingAsk(
       return blockedCtoMappingAsk("mapping Ask requires explicit safe run/mapping/hash/revision/feature/run/stage selectors");
     }
     assertRuntimeLive();
+    const ownerExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, options.sessionId);
+    if (!ownerExecution.ok) return blockedCtoMappingAsk(ownerExecution.error);
     assertRuntimeLive();
     const constitutionFindings = ensureCtoExecutionConstitutions(root, [{ feature_id: input.feature_id, run_key: input.run_key }], pinnedRoot);
     if (constitutionFindings.length > 0) return blockedCtoMappingAsk(...constitutionFindings);
     assertRuntimeLive();
     return withCtoRunLock(root, input.cto_run_id, () => {
       assertRuntimeLive();
-      const resolved = resolveCtoMappingAskContext(root, input, pinnedRoot, undefined, assertRuntimeLive);
+      const resolved = resolveCtoMappingAskContext(root, input, pinnedRoot, undefined, assertRuntimeLive, options.sessionId);
       if (!resolved.ok) return blockedCtoMappingAsk(resolved.error);
       const { record } = resolved.value;
       const questionId = ctoMappingQuestionId(input.cto_run_id, record.mapping.mapping_id, record.mapping.mapping_version);
@@ -4261,6 +4272,8 @@ export function recordCtoSpecificationMappingAsk(
       return blockedCtoMappingAsk("mapping Ask requires explicit safe run/mapping/hash/revision/feature/run/stage selectors");
     }
     assertRuntimeLive();
+    const ownerExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, options.sessionId);
+    if (!ownerExecution.ok) return blockedCtoMappingAsk(ownerExecution.error);
     if (!options.trusted_host || options.trusted_host.session_id !== options.sessionId) return blockedCtoMappingAsk("recovery_required: trusted host session does not match the authenticated CTO runtime session");
     if (input.decision === "request_changes" && !validCtoFeedback(input.feedback)) return blockedCtoMappingAsk("request_changes requires exact non-empty trusted feedback");
     if (input.decision !== "request_changes" && input.feedback !== undefined) return blockedCtoMappingAsk("feedback is only valid for request_changes");
@@ -4269,7 +4282,7 @@ export function recordCtoSpecificationMappingAsk(
     assertRuntimeLive();
     return withCtoRunLock(root, input.cto_run_id, () => {
       assertRuntimeLive();
-      const resolved = resolveCtoMappingAskContext(root, input, pinnedRoot, input.decision, assertRuntimeLive);
+      const resolved = resolveCtoMappingAskContext(root, input, pinnedRoot, input.decision, assertRuntimeLive, options.sessionId);
       if (!resolved.ok) return blockedCtoMappingAsk(resolved.error);
       const { record, execution, selected } = resolved.value;
       const canonicalRecord = canonicalMappingRecord(record);
@@ -4532,6 +4545,8 @@ export function resumeCtoSpecificationMapping(
       return blockedCtoMappingAsk("mapping resume requires explicit safe run/mapping/hash/revision selectors");
     }
     assertRuntimeLive();
+    const ownerExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, options.sessionId);
+    if (!ownerExecution.ok) return blockedCtoMappingAsk(ownerExecution.error);
     try {
       assertRuntimeLive();
       recoverPendingMappingTransactions(root, input.cto_run_id, pinnedRoot);
@@ -4560,7 +4575,7 @@ export function resumeCtoSpecificationMapping(
         }
         const selection = record.selections[0];
         if (!selection) return blockedCtoMappingAsk("mapping has no exact frozen selection");
-        const execution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot);
+        const execution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, options.sessionId);
         if (!execution.ok) return blockedCtoMappingAsk(execution.error);
         return {
           status: "resumed",
@@ -4667,7 +4682,7 @@ export function resumeCtoSpecificationMapping(
 }
 
 /** Confirm one awaiting mapping through the canonical trusted-answer ledger. */
-function confirmCtoSpecificationMappingUnlocked(projectRoot: string, input: CtoSpecificationMappingConfirmationInput, pinnedRoot: PinnedProjectRoot, assertRuntimeLive: () => void): CtoSpecificationMappingConfirmationResult {
+function confirmCtoSpecificationMappingUnlocked(projectRoot: string, input: CtoSpecificationMappingConfirmationInput, pinnedRoot: PinnedProjectRoot, assertRuntimeLive: () => void, sessionId?: string): CtoSpecificationMappingConfirmationResult {
   assertRuntimeLive();
   if (!pinnedRoot.isStable()) return blockedExecution(["project root changed before CTO confirmation"]);
   const root = pinnedRoot.canonical_root;
@@ -4675,6 +4690,8 @@ function confirmCtoSpecificationMappingUnlocked(projectRoot: string, input: CtoS
     || typeof input.answer_id !== "string" || input.answer_id.trim().length === 0) {
     return blockedExecution(["mapping identity and one canonical answer_id must be explicit and safe"]);
   }
+  const ownerExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, sessionId);
+  if (!ownerExecution.ok) return blockedExecution([ownerExecution.error]);
   try {
     assertRuntimeLive();
     recoverPendingMappingTransactions(root, input.cto_run_id, pinnedRoot);
@@ -4688,7 +4705,7 @@ function confirmCtoSpecificationMappingUnlocked(projectRoot: string, input: CtoS
   if (record.mapping.mapping_hash !== input.mapping_hash) return blockedExecution(["mapping hash mismatch"]);
   const firstSelection = record.selections[0];
   if (!firstSelection) return blockedExecution(["mapping has no frozen selection"]);
-  const execution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot);
+  const execution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, sessionId);
   if (!execution.ok) return blockedExecution([execution.error]);
   const frozenExecution = (record.mapping as CtoSpecificationMapping & { execution?: { choice?: string; wave_id?: string; source_id?: string; capability_id?: string; capability_epoch?: string } }).execution;
   const activeWave = execution.value.state.wave_history?.find((candidate) => candidate.id === execution.value.wave_id);
@@ -4858,6 +4875,8 @@ export async function confirmCtoSpecificationMapping(projectRoot: string, input:
     assertRuntimeLive();
     if (!pinnedRoot.isStable()) return blockedExecution(["project root changed before CTO confirmation"]);
     if (!input || !isSafeCtoRunId(input.cto_run_id)) return blockedExecution(["mapping identity must be explicit and non-blank"]);
+    const ownerExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, options.sessionId);
+    if (!ownerExecution.ok) return blockedExecution([ownerExecution.error]);
     const mapping = readMappingRecord(root, input.cto_run_id, input.mapping_id, pinnedRoot);
     if (!mapping.ok) return blockedExecution([mapping.error]);
     const constitutionFindings = ensureCtoExecutionConstitutions(root, mapping.value.selections, pinnedRoot);
@@ -4865,7 +4884,7 @@ export async function confirmCtoSpecificationMapping(projectRoot: string, input:
     assertRuntimeLive();
     const result = await withCtoRunLockAsync(root, input.cto_run_id, async () => {
       assertRuntimeLive();
-      return confirmCtoSpecificationMappingUnlocked(root, input, pinnedRoot, assertRuntimeLive);
+      return confirmCtoSpecificationMappingUnlocked(root, input, pinnedRoot, assertRuntimeLive, options.sessionId);
     }, { pinnedRoot });
     assertRuntimeLive();
     if (!pinnedRoot.isStable()) return blockedExecution(["project root changed during CTO confirmation"]);
@@ -5290,6 +5309,7 @@ function terminalizeCtoDependencyBlockedTeams(
       assertCtoRuntimeAccessFacadeLive(runtimeAccess, root, sessionId);
       const state = transaction.readState();
       if (state.id !== ctoRunId) return { status: "blocked", terminalized_team_ids: [], failed_team_ids: [], findings: ["CTO dependency terminalization run identity does not match authenticated state"] } as CtoDependencyFailureTerminalizationResult;
+      if (state.standby !== true && state.owner_session !== sessionId) return { status: "blocked", terminalized_team_ids: [], failed_team_ids: [], findings: ["CTO dependency terminalization session does not own the canonical run"] } as CtoDependencyFailureTerminalizationResult;
       if (!pinnedRoot.isStable()) return { status: "blocked", terminalized_team_ids: [], failed_team_ids: [], findings: ["project root changed before failed CTO dependency terminalization"] } as CtoDependencyFailureTerminalizationResult;
       const canonicalRecord = readMappingRecord(root, ctoRunId, expected.mapping_id, pinnedRoot);
       if (!canonicalRecord.ok
@@ -5749,7 +5769,7 @@ async function dispatchCtoSpecificationMappingUnlocked(
     if (!finalAdmission.ok) return blockedExecution([finalAdmission.error]);
     admissionSnapshot = finalAdmission.value;
     execution = { ok: true, value: admissionSnapshot.execution };
-    const conformanceExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot);
+    const conformanceExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, sessionId);
     if (!conformanceExecution.ok || !sameExecutionContext(execution.value, conformanceExecution.value)) {
       return blockedExecution([conformanceExecution.ok ? "active CTO execution wave/capability changed before replay conformance binding" : conformanceExecution.error]);
     }
@@ -6008,6 +6028,8 @@ export async function dispatchCtoSpecificationMapping(
     runtimeAccess.assertLive();
     if (!pinnedRoot.isStable()) return blockedExecution(["project root changed before CTO dispatch"]);
     if (!input || !isSafeCtoRunId(input.cto_run_id)) return blockedExecution(["dispatch identity and expected_mapping_hash must be explicit and non-blank"]);
+    const ownerExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, options.sessionId);
+    if (!ownerExecution.ok) return blockedExecution([ownerExecution.error]);
     const mapping = readMappingRecord(root, input.cto_run_id, input.mapping_id, pinnedRoot);
     if (!mapping.ok) return blockedExecution([mapping.error]);
     if (mapping.value.mapping.mapping_hash !== input.expected_mapping_hash) return blockedExecution(["mapping hash mismatch"]);
@@ -6397,7 +6419,11 @@ export function closeCtoSpecificationExecutionWave(
     // Exact terminal replay must validate postimages without attempting to
     // re-enter the now-absent active wave.
     const preflightState = readCtoStatePinned(input.cto_run_id, pinnedRoot);
-    const preflightTerminalWave = preflightState?.wave_history?.find((candidate) => candidate.id === input.wave_id);
+    if (!preflightState || preflightState.id !== input.cto_run_id) return blockedCtoWaveClose(["canonical CTO state for the exact run is unavailable"]);
+    if (options.sessionId !== undefined && preflightState.standby !== true && preflightState.owner_session !== options.sessionId) {
+      return blockedCtoWaveClose(["CTO wave close session does not own the canonical run"]);
+    }
+    const preflightTerminalWave = preflightState.wave_history?.find((candidate) => candidate.id === input.wave_id);
     const terminalReplayCandidate = preflightState?.active_wave_id === undefined && preflightTerminalWave?.status === "done";
     if (!terminalReplayCandidate) {
       const reconciled = reconcileCtoSpecificationExecutionTeams(root, input.cto_run_id, { runtimeAccess, pinnedRoot, sessionId: options.sessionId });
