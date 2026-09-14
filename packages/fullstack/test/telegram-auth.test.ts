@@ -323,13 +323,17 @@ test("auth: reply-to-escalation answers are gated by chat", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
-// A reply-shaped message with no routable target is not a plain CTO task.
-// It surfaces retryable recovery and keeps the Telegram offset unconfirmed.
-test("auth: stale or foreign replies require recovery instead of waking the plain handler", async () => {
+// A syntactically valid reply/callback with no routable target is a
+// terminal rejected update, not retryable mapping recovery. It must not pin
+// later updates behind the Telegram offset.
+test("auth: stale or foreign replies/callbacks are rejected once and later updates continue", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-auth-reply-target-"));
   const calls: Array<{ id: string; text: string; at: string }> = [];
+  const committed: number[] = [];
   try {
     withIndexedRun(root, "run-sec2");
+    withIndexedMapping(root, "run-sec2", "run-sec2/esc-valid-callback", 100);
+    withIndexedMapping(root, "run-sec2", "run-sec2/esc-valid-reply", 101);
     const foreignPartition = createHash("sha256")
       .update("telegram-chat-mapping\u0000", "utf8")
       .update("999", "utf8")
@@ -337,8 +341,17 @@ test("auth: stale or foreign replies require recovery instead of waking the plai
     const foreignMapDir = join(root, ".work-state", "cto", "run-sec2", "telegram-callbacks", foreignPartition);
     mkdirSync(foreignMapDir, { recursive: true });
     writeFileSync(join(foreignMapDir, "tg-map.meta.json"), JSON.stringify({ schema: 2, tenant: "run-sec2", chatId: "999" }));
-    appendFileSync(join(foreignMapDir, "tg-map.jsonl"), `${JSON.stringify({ escId: "run-sec2/esc-foreign", messageId: 100, chatId: "999" })}\n`);
+    appendFileSync(join(foreignMapDir, "tg-map.jsonl"), `${JSON.stringify({ escId: "run-sec2/esc-foreign", messageId: 200, chatId: "999" })}\n`);
     const updates = [
+      {
+        update_id: 19,
+        callback_query: {
+          id: "cq-unknown",
+          from: { id: 111 },
+          message: { message_id: 9999, chat: { id: Number(CONFIGURED_CHAT) } },
+          data: "run-sec2/esc-unknown::yes",
+        },
+      },
       {
         update_id: 20,
         message: {
@@ -354,29 +367,59 @@ test("auth: stale or foreign replies require recovery instead of waking the plai
         message: {
           message_id: 21,
           text: "foreign reply",
-          reply_to_message: { message_id: 100 },
+          reply_to_message: { message_id: 200 },
           chat: { id: Number(CONFIGURED_CHAT) },
           from: { id: 111 },
         },
       },
       {
         update_id: 22,
-        message: { message_id: 22, text: "true plain task", chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } },
+        callback_query: {
+          id: "cq-valid",
+          from: { id: 111 },
+          message: { message_id: 100, chat: { id: Number(CONFIGURED_CHAT) } },
+          data: "run-sec2/esc-valid-callback::yes",
+        },
+      },
+      {
+        update_id: 23,
+        message: {
+          message_id: 23,
+          text: "approved",
+          reply_to_message: { message_id: 101 },
+          chat: { id: Number(CONFIGURED_CHAT) },
+          from: { id: 111 },
+        },
+      },
+      {
+        update_id: 24,
+        message: { message_id: 24, text: "true plain task", chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } },
       },
     ];
     const offsets: number[] = [];
+    let pollRound = 0;
     const adapter = telegramAdapter({
       token: "t",
       chatId: CONFIGURED_CHAT,
       cwd: root,
-      fetchImpl: mockFetch(updates, (offset) => offsets.push(offset)),
+      fetchImpl: mockFetch(() => pollRound++ === 0 ? updates : [], (offset) => offsets.push(offset)),
       onPlainMessage: (m) => calls.push(m),
+      onUpdateCommitted: async (updateId) => { committed.push(updateId); },
     });
-    await assert.rejects(adapter.pollOnce(), (error: unknown) => error instanceof TelegramMappingRecoveryRequiredError
-      && error.code === "telegram_mapping_recovery_required" && error.messageId === 999);
-    assert.deepEqual(offsets, [0], "recovery leaves the Telegram update offset unconfirmed");
-    assert.equal(existsSync(answerPath(root, "run-sec2/esc-foreign")), false, "foreign reply produces no answer file");
-    assert.equal(calls.length, 0, "unresolved reply never wakes the plain handler");
+    const answers = await adapter.pollOnce();
+    assert.equal(answers.length, 2, "later mapped callback and reply are processed after terminal rejects");
+    assert.equal(answers.some((answer) => answer.id === "run-sec2/esc-valid-callback" && answer.answer === "yes"), true);
+    assert.equal(answers.some((answer) => answer.id === "run-sec2/esc-valid-reply" && answer.answer === "approved"), true);
+    assert.deepEqual(committed, [19, 20, 21, 22, 23, 24], "each update is committed exactly once, including poison rows");
+    assert.deepEqual(offsets, [0], "the first poll starts from the initial offset");
+    assert.equal(existsSync(answerPath(root, "run-sec2/esc-unknown")), false, "unknown callback produces no answer");
+    assert.equal(existsSync(answerPath(root, "run-sec2/esc-foreign")), false, "foreign reply produces no answer");
+    assert.equal(calls.length, 1, "a later plain update is still delivered");
+
+    await adapter.pollOnce();
+    assert.deepEqual(offsets, [0, 25], "the committed poison rows are not replayed on a repeated poll");
+    assert.deepEqual(committed, [19, 20, 21, 22, 23, 24], "repeated polling does not re-commit rejected updates");
+    assert.equal(calls.length, 1, "repeated polling does not replay the later plain update");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -798,16 +841,21 @@ test("sec001: poisoned tg-map.jsonl escId on the reply path fails closed without
       JSON.stringify({ escId: "run-sec1/esc-2", messageId: 101 }),
       "",
     ].join("\n"));
+    const offsets: number[] = [];
     const adapter = telegramAdapter({
       token: "t", chatId: CONFIGURED_CHAT, cwd: root,
       legacyMappingMigration: { tenant: "run-sec1", chatId: CONFIGURED_CHAT },
       fetchImpl: mockFetch([
         { update_id: 1, message: { message_id: 12, text: "approved", reply_to_message: { message_id: 101 }, chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } } },
         { update_id: 2, message: { message_id: 13, text: "evil", reply_to_message: { message_id: 100 }, chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } } },
-      ]),
+      ], (offset) => offsets.push(offset)),
     });
     await assert.rejects(adapter.pollOnce(), (error: unknown) => error instanceof TelegramMappingRecoveryRequiredError
       && error.code === "telegram_mapping_recovery_required" && error.messageId === 101, "poisoned mapping requires retryable recovery");
+    assert.deepEqual(offsets, [0], "corrupt mapping keeps its update unconfirmed");
+    await assert.rejects(adapter.pollOnce(), (error: unknown) => error instanceof TelegramMappingRecoveryRequiredError
+      && error.messageId === 101, "corrupt mapping is retried rather than consumed");
+    assert.deepEqual(offsets, [0, 0], "repeated polling retries the same corrupt update");
     assert.equal(existsSync(answerPath(root, "run-sec1/esc-2")), false, "valid records in a poisoned shard are not trusted");
     assert.equal(existsSync(answerPath(root, "run-sec1/../../poison")), false, "poisoned mapping cannot escape the run answers dir");
     assert.equal(existsSync(join(root, ".work-state", "answers")), false, "no ../.. escape on the reply path");

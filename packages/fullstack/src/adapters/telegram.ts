@@ -184,6 +184,11 @@ interface TelegramAnswerTarget {
   readonly status: "active" | "standby" | "done" | "failed";
 }
 
+type TelegramAnswerTargetLookup =
+  | { readonly kind: "matched"; readonly target: TelegramAnswerTarget }
+  | { readonly kind: "terminal_reject" }
+  | { readonly kind: "recoverable_error"; readonly error: unknown };
+
 interface TelegramCorrelationMarker {
   readonly escId: string;
   readonly payloadDigest: string;
@@ -1080,7 +1085,15 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
         this.assertLive(pinnedRoot, lifecycle);
         if (answer) {
           this.assertLive(pinnedRoot, lifecycle);
-          const persisted = this.writeAnswer(answer, pinnedRoot, lifecycle);
+          let persisted: EscalationAnswer | null;
+          try {
+            persisted = this.writeAnswer(answer, pinnedRoot, lifecycle);
+          } catch (error) {
+            if (!(error instanceof TelegramAnswerConflictError)) throw error;
+            // The durable first answer wins. A conflicting later update is a
+            // terminal rejection, so commit it and let Telegram continue.
+            persisted = null;
+          }
           this.assertLive(pinnedRoot, lifecycle);
           if (persisted) {
             await this.onAnswer?.(persisted, pinnedRoot);
@@ -1133,11 +1146,22 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       const sourceChatId = callbackQuery.message.chat?.id;
       if (sourceChatId === undefined) return null;
       const sourceChat = String(sourceChatId);
-      const target = this.answerTargetOfMessage(callbackQuery.message.message_id, sourceChat, pinnedRoot);
-      if (target?.status === "standby" || target?.status === "done" || target?.status === "failed") return null;
-      if (target && TELEGRAM_CALLBACK_TOKEN_RE.test(callbackData)) {
-        const optionId = this.optionIdOfCallback(target.escId, callbackData, sourceChat, pinnedRoot);
+      const targetLookup = this.answerTargetLookup(callbackQuery.message.message_id, sourceChat, pinnedRoot);
+      if (targetLookup.kind === "recoverable_error") throw new TelegramMappingRecoveryRequiredError(callbackQuery.message.message_id);
+      if (targetLookup.kind === "terminal_reject") return null;
+      const target = targetLookup.target;
+      if (target.status === "standby" || target.status === "done" || target.status === "failed") return null;
+      if (TELEGRAM_CALLBACK_TOKEN_RE.test(callbackData)) {
+        const optionFailure: { error?: unknown } = {};
+        let optionId: string | null;
+        try {
+          optionId = this.optionIdOfCallback(target.escId, callbackData, sourceChat, pinnedRoot, optionFailure);
+        } catch {
+          throw new TelegramMappingRecoveryRequiredError(callbackQuery.message.message_id);
+        }
+        if (optionFailure.error !== undefined) throw new TelegramMappingRecoveryRequiredError(callbackQuery.message.message_id);
         if (optionId) return { id: target.escId, run_id: target.runId, answer: optionId, at, by: "telegram:callback" };
+        return null;
       }
       // Accept pre-token callback data for deployed messages during migration.
       if (target) {
@@ -1156,22 +1180,25 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
         }
       }
     }
-    if (callbackQuery?.message) throw new TelegramMappingRecoveryRequiredError(callbackQuery.message.message_id);
+    if (callbackQuery?.message) return null;
     const message = update.message;
     if (message?.reply_to_message) {
       const sourceChatId = message.chat?.id;
       if (sourceChatId === undefined) return null;
       const replyTo = message.reply_to_message;
       const marker = parseTelegramCorrelationMarker(replyTo.text);
-      const target = this.answerTargetOfMessage(replyTo.message_id, String(sourceChatId), pinnedRoot, marker ?? undefined);
-      if (target?.status === "standby" || target?.status === "done" || target?.status === "failed") return null;
-      if (target && isSafeCtoInboundText(message.text)) {
+      const targetLookup = this.answerTargetLookup(replyTo.message_id, String(sourceChatId), pinnedRoot, marker ?? undefined);
+      if (targetLookup.kind === "recoverable_error") throw new TelegramMappingRecoveryRequiredError(replyTo.message_id);
+      if (targetLookup.kind === "terminal_reject") return null;
+      const target = targetLookup.target;
+      if (target.status === "standby" || target.status === "done" || target.status === "failed") return null;
+      if (isSafeCtoInboundText(message.text)) {
         return { id: target.escId, run_id: target.runId, answer: message.text, at, by: "telegram:reply" };
       }
       // A reply-shaped message is never a new plain task when its target is
-      // stale, foreign, or otherwise unavailable. Surface a retryable typed
-      // recovery state and leave the update offset unconfirmed.
-      throw new TelegramMappingRecoveryRequiredError(replyTo.message_id);
+      // stale, foreign, or otherwise unavailable. It is a terminal rejected
+      // inbound update, so the existing commit hook records its consumption.
+      return null;
     }
     // Plain message (no reply target, not a callback) -> CTO inbox task.
     if (message && isSafeCtoInboundText(message.text)) {
@@ -1624,22 +1651,26 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       queue.close();
     }
   }
-  private optionIdOfCallback(escId: string, token: string, chatId = this.chatId, suppliedPin?: PinnedProjectRoot): string | null {
+  private optionIdOfCallback(escId: string, token: string, chatId = this.chatId, suppliedPin?: PinnedProjectRoot, recovery?: { error?: unknown }): string | null {
     const pinnedRoot = suppliedPin ?? PinnedProjectRoot.open(this.cwd);
-    if (!pinnedRoot) return null;
+    if (!pinnedRoot) {
+      if (recovery) recovery.error = new Error("telegram: project root cannot be pinned for callback mapping");
+      return null;
+    }
     if (!suppliedPin) {
-      try { return this.optionIdOfCallbackPinned(escId, token, chatId, pinnedRoot); }
+      try { return this.optionIdOfCallbackPinned(escId, token, chatId, pinnedRoot, recovery); }
       finally { pinnedRoot.close(); }
     }
-    return this.optionIdOfCallbackPinned(escId, token, chatId, pinnedRoot);
+    return this.optionIdOfCallbackPinned(escId, token, chatId, pinnedRoot, recovery);
   }
 
-  private optionIdOfCallbackPinned(escId: string, token: string, chatId: string, suppliedPin: PinnedProjectRoot): string | null {
+  private optionIdOfCallbackPinned(escId: string, token: string, chatId: string, suppliedPin: PinnedProjectRoot, recovery?: { error?: unknown }): string | null {
     const runId = escId.split("/")[0] ?? escId;
     if (!isSafeEscalationId(escId) || !isSafeRunId(runId) || !TELEGRAM_CALLBACK_TOKEN_RE.test(token)) return null;
     try {
       this.ensureChatMappingMigrated(runId, chatId, suppliedPin);
-    } catch {
+    } catch (error) {
+      if (recovery && recovery.error === undefined) recovery.error = error;
       return null;
     }
     const queue = this.openMappingQueue(runId, chatId, false, suppliedPin);
@@ -1650,14 +1681,22 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       const current = readTelegramCallbackBindings(queue, runId, chatId, this.mappingMaxEntryBytes);
       const binding = current?.bindings.find((entry) => entry.token === token && entry.escId === escId && entry.chatId === chatId);
       return binding?.optionId ?? null;
-    } catch {
+    } catch (error) {
+      if (recovery && recovery.error === undefined) recovery.error = error;
       return null;
     } finally {
       if (lock) releaseTelegramMapLock(queue, lock);
       queue.close();
     }
   }
-  private answerTargetOfMessage(messageId: number, chatId = this.chatId, suppliedPin?: PinnedProjectRoot, marker?: TelegramCorrelationMarker): TelegramAnswerTarget | null {
+  private answerTargetLookup(messageId: number, chatId = this.chatId, suppliedPin?: PinnedProjectRoot, marker?: TelegramCorrelationMarker): TelegramAnswerTargetLookup {
+    const recovery: { error?: unknown } = {};
+    const target = this.answerTargetOfMessage(messageId, chatId, suppliedPin, marker, recovery);
+    if (recovery.error !== undefined) return { kind: "recoverable_error", error: recovery.error };
+    return target ? { kind: "matched", target } : { kind: "terminal_reject" };
+  }
+
+  private answerTargetOfMessage(messageId: number, chatId = this.chatId, suppliedPin?: PinnedProjectRoot, marker?: TelegramCorrelationMarker, recovery?: { error?: unknown }): TelegramAnswerTarget | null {
     if (!Number.isSafeInteger(messageId) || messageId <= 0) return null;
     try {
       chatId = boundedTelegramIdentity(chatId, "chatId");
@@ -1716,6 +1755,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
         try {
           this.ensureChatMappingMigrated(entry.run_id, chatId, pinnedRoot);
         } catch (error) {
+          if (recovery && recovery.error === undefined) recovery.error = error;
           this.runtimeAccess!.assertLive();
           return pinnedRoot.isStable();
         }
@@ -1751,6 +1791,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
           }
         } catch (error) {
           if (error instanceof TelegramMapBudgetError) throw error;
+          if (recovery && recovery.error === undefined) recovery.error = error;
           this.runtimeAccess!.assertLive();
           if (!pinnedRoot.isStable()) return false;
           // A corrupt indexed run is unavailable from this lookup; another
@@ -1803,18 +1844,19 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       if (!completed || !pinnedRoot.isStable()) return null;
       this.runtimeAccess.assertLive();
       if (marker && (untrustedMessageEscIds.size === 0 || untrustedMessageEscIds.has(marker.escId))) {
-        const recovered = this.recoverPendingTelegramMapping(marker, messageId, chatId, pinnedRoot);
+        const recovered = this.recoverPendingTelegramMapping(marker, messageId, chatId, pinnedRoot, recovery);
         if (recovered) return recovered;
       }
       return ambiguous ? null : found;
-    } catch {
+    } catch (error) {
+      if (recovery && recovery.error === undefined) recovery.error = error;
       return null;
     } finally {
       if (!suppliedPin) pinnedRoot.close();
     }
   }
 
-  private recoverPendingTelegramMapping(marker: TelegramCorrelationMarker, messageId: number, chatId: string, pinnedRoot: PinnedProjectRoot): TelegramAnswerTarget | null {
+  private recoverPendingTelegramMapping(marker: TelegramCorrelationMarker, messageId: number, chatId: string, pinnedRoot: PinnedProjectRoot, recovery?: { error?: unknown }): TelegramAnswerTarget | null {
     if (!this.runtimeAccess || !isSafeEscalationId(marker.escId) || !Number.isSafeInteger(messageId) || messageId <= 0) return null;
     try { this.assertProofAuthorityLive(); } catch { return null; }
     const runId = marker.escId.split("/")[0];
@@ -1906,7 +1948,8 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
         if (lock) releaseTelegramMapLock(queue, lock);
         queue.close();
       }
-    } catch {
+    } catch (error) {
+      if (recovery && recovery.error === undefined) recovery.error = error;
       return null;
     }
   }

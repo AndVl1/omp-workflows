@@ -117,7 +117,6 @@ import { HttpEscalationAdapter } from "../src/adapters/http.js";
 import { verifyTelegramMappingProof } from "../src/adapters/mapping-secret.js";
 import {
   MAX_TELEGRAM_IDEMPOTENCY_KEY_UTF8_BYTES,
-  TelegramAnswerConflictError,
   TelegramEscalationAdapter,
 } from "../src/adapters/telegram.js";
 import {
@@ -2116,10 +2115,12 @@ test("adapters: Telegram concurrent mapping appends converge through CAS", { tim
     rmSync(root, { recursive: true, force: true });
   }
 });
-test("adapters: Telegram answer conflicts reject without overwriting or waking", async () => {
+test("adapters: Telegram answer conflicts are terminal and continue polling", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-tg-answer-conflict-"));
   const escId = "run-1/team-a/check/1";
   const offsets: number[] = [];
+  const committed: number[] = [];
+  const tasks: string[] = [];
   let round = 0;
   try {
     const fetchImpl = (async (url: unknown, init?: RequestInit) => {
@@ -2138,17 +2139,30 @@ test("adapters: Telegram answer conflicts reject without overwriting or waking",
           : current === 1
             ? [{ update_id: 2, callback_query: { id: "conflicting-callback", from: { id: 100 }, message: { message_id: 7, chat: { id: 100 } }, data: `${escId}::no` } }]
             : current === 2
-              ? [{ update_id: 2, callback_query: { id: "exact-replay", from: { id: 100 }, message: { message_id: 7, chat: { id: 100 } }, data: `${escId}::yes` } }]
+              ? [{ update_id: 3, callback_query: { id: "exact-replay", from: { id: 100 }, message: { message_id: 7, chat: { id: 100 } }, data: `${escId}::yes` } }]
               : current === 3
-                ? [{ update_id: 3, message: { message_id: 101, text: "plain conflict", reply_to_message: { message_id: 7 }, chat: { id: 100 }, from: { id: 100 } } }]
-                : [];
+                ? [{ update_id: 4, message: { message_id: 101, text: "plain conflict", reply_to_message: { message_id: 7 }, chat: { id: 100 }, from: { id: 100 } } }]
+                : current === 4
+                  ? [{ update_id: 5, message: { message_id: 102, text: "later task", chat: { id: 100 }, from: { id: 100 } } }]
+                  : [];
         return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
       }
       throw new Error("unexpected method");
     }) as typeof fetch;
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "fixture-token", chatId: "100" } }));
     withIndexedRun(root, "run-1");
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({
+      token: "t",
+      chatId: "100",
+      cwd: root,
+      proofAuthority: runtimeFor(root).proofAuthority,
+      fetchImpl,
+      runtimeAccess: runtimeFor(root).access,
+      onPlainMessage: (message) => { tasks.push(message.text); },
+      onUpdateCommitted: async (updateId) => { committed.push(updateId); },
+    });
     await adapter.send(sampleEscalation({ id: escId }));
     const first = await adapter.pollOnce();
     assert.equal(first.length, 1);
@@ -2158,25 +2172,26 @@ test("adapters: Telegram answer conflicts reject without overwriting or waking",
     assert.ok(answerFile);
     const firstBytes = readFileSync(join(answerDir, answerFile!), "utf8");
 
-    await assert.rejects(
-      () => adapter.pollOnce(),
-      (error: unknown) => error instanceof TelegramAnswerConflictError && error.code === "TELEGRAM_ANSWER_CONFLICT",
-    );
+    const conflictingCallback = await adapter.pollOnce();
+    assert.deepEqual(conflictingCallback, [], "conflicting callback is a terminal rejection");
     assert.equal(readFileSync(join(answerDir, answerFile!), "utf8"), firstBytes, "conflicting callback preserves the first durable bytes");
 
     const replay = await adapter.pollOnce();
-    assert.equal(replay.length, 1, "exact callback replay returns the verified durable answer");
+    assert.equal(replay.length, 1, "an exact callback replay returns the verified durable answer");
     assert.equal(replay[0]?.answer, "yes");
     assert.equal(replay[0]?.at, first[0]?.at);
     assert.equal(readFileSync(join(answerDir, answerFile!), "utf8"), firstBytes);
 
-    await assert.rejects(
-      () => adapter.pollOnce(),
-      (error: unknown) => error instanceof TelegramAnswerConflictError,
-    );
+    const conflictingReply = await adapter.pollOnce();
+    assert.deepEqual(conflictingReply, [], "conflicting plain reply is a terminal rejection");
     assert.equal(readFileSync(join(answerDir, answerFile!), "utf8"), firstBytes, "conflicting plain reply does not overwrite or wake");
+
     await adapter.pollOnce();
-    assert.deepEqual(offsets, [0, 2, 2, 3, 3], "conflicts keep the unconfirmed Telegram offset for retry");
+    assert.deepEqual(tasks, ["later task"], "a later plain update is processed after the conflict");
+    await adapter.pollOnce();
+    assert.deepEqual(offsets, [0, 2, 3, 4, 5, 6], "terminal conflicts advance the offset and the empty poll starts after the later task");
+    assert.deepEqual(committed, [1, 2, 3, 4, 5], "each update, including conflicts, is committed exactly once");
+    assert.deepEqual(tasks, ["later task"], "repeated polling does not replay the later plain update");
 
     const restarted = readPersistedAnswers(root, "run-1");
     assert.deepEqual(restarted.map((answer) => ({ id: answer.id, answer: answer.answer, at: answer.at, by: answer.by })), [{
