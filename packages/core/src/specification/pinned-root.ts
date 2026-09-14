@@ -2411,6 +2411,12 @@ def abort_prepared_write(payload):
                     rollback_prepared_publication(prepared)
                 except RuntimeError:
                     pass
+            cleanup_temp(parent, prepared.get("backup"))
+            release_conditional_lock(parent, prepared["lock_name"], prepared["lock_token"])
+            fsync_regular(parent)
+            prepared_writes.pop(token, None)
+            if prepared.get("batch_id") is not None and not any(candidate.get("batch_id") == prepared.get("batch_id") for candidate in prepared_writes.values()):
+                remove_batch_journal(3, prepared["batch_journal"], prepared["batch_id"], True)
             return {"ok": True, "aborted": False, "quarantined": True}
         abort_prepared_stage_exact(prepared)
         cleanup_temp(parent, prepared.get("backup"))
@@ -5554,7 +5560,7 @@ export class PinnedProjectRoot {
           const abortResult = this.runDescriptorHelper<{ aborted?: unknown }>("abort_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino });
           aborted = abortResult.aborted === true;
         } catch { abortComplete = false; /* stale lease recovery owns cleanup */ }
-        if (entry.committed && !aborted && !this.rollbackPublishedDescriptor(entry.path, entry.descriptor, entry.preimage)) rollbackComplete = false;
+        if (entry.committed && !this.rollbackPublishedDescriptor(entry.path, entry.descriptor, entry.preimage)) rollbackComplete = false;
       }
       if (durableBatch && abortComplete && rollbackComplete && batchId) removeLiveDarwinBatch(this.rootPathDigest, batchId);
       if (!rollbackComplete) {
