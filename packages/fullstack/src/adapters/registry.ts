@@ -77,8 +77,15 @@ import {
   type WaveRecord,
 } from "@andvl1/omp-workflows-core";
 import { BoundedQueueError, openBoundedQueue, type BoundedQueue, type BoundedQueueEntryExpectation } from "@andvl1/omp-workflows-core/queue";
-import { deriveRuntimeSecretKey, readOrCreateRootRuntimeSecret, hasValidCtoRuntimeStateProofPinned, readCtoStatePinned } from "@andvl1/omp-workflows-core/cto-runtime";
-import { assertCtoRuntimeAccessFacadeLive, isCtoRuntimeAccessFacade } from "@andvl1/omp-workflows-core/cto-runtime";
+import {
+  assertCtoRuntimeAccessFacadeLive,
+  assertCtoRuntimeProofAuthorityLive,
+  isCtoRuntimeAccessFacade,
+  isCtoRuntimeProofAuthority,
+  signCtoRuntimeProof,
+  verifyCtoRuntimeProof,
+  type CtoRuntimeProofAuthority,
+} from "@andvl1/omp-workflows-core/cto-runtime";
 import type { CtoRunDeliveryIndexEntry, CtoRuntimeAccessFacade, CtoRuntimeOutboxDeliveryInput, CtoRunTransactionFacade } from "@andvl1/omp-workflows-core/cto-runtime";
 import type { RegistryContextSnapshot } from "@andvl1/omp-workflows-core/registry";
 import {
@@ -597,7 +604,8 @@ export function queueCtoDelivery(root: string, runId: string, delivery: CtoDeliv
 }
 
 /** Adapter factory for a transport kind (built-in or consumer-registered). */
-export type EscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot?: PinnedProjectRoot, runtimeAccess?: RuntimeAccess) => EscalationAdapter | null;
+export type EscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined) => EscalationAdapter | null;
+type BuiltinEscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority) => EscalationAdapter | null;
 
 /**
  * Capabilities are registered alongside a consumer transport because channel
@@ -622,6 +630,8 @@ interface AdapterRegistrationLease {
 
 interface AdapterRegistration {
   factory: EscalationAdapterFactory;
+  /** Only engine-owned built-ins may receive the opaque proof authority. */
+  proofFactory?: BuiltinEscalationAdapterFactory;
   capabilities?: Readonly<EscalationAdapterCapabilities>;
   /** Built-in cells are permanently reserved and have no consumer principal. */
   builtin: boolean;
@@ -741,7 +751,8 @@ const builtinAdapterFactories = new Map<string, AdapterRegistration>([
   [
     "telegram",
     {
-      factory: (config, cwd, _pinnedRoot, runtimeAccess) =>
+      factory: () => null,
+      proofFactory: (config, cwd, _pinnedRoot, runtimeAccess, proofAuthority) =>
         config.telegram?.token && config.telegram.chatId
           ? new TelegramEscalationAdapter({
               token: config.telegram.token,
@@ -751,7 +762,7 @@ const builtinAdapterFactories = new Map<string, AdapterRegistration>([
               allowedChatIds: config.telegram.allowedChatIds,
               allowedSenderIds: config.telegram.allowedSenderIds,
               legacyMappingMigration: config.telegram.legacyMappingMigration,
-              mappingProofSecret: _pinnedRoot ? readTelegramMappingProofSecret(cwd, _pinnedRoot) ?? undefined : undefined,
+              proofAuthority,
               runtimeAccess,
             })
           : null,
@@ -831,13 +842,16 @@ function invokeAdapterFactory(
   pinnedRoot: PinnedProjectRoot | undefined,
   runtimeAccess: RuntimeAccess | undefined,
   scope: AdapterResolutionScope,
+  proofAuthority: CtoRuntimeProofAuthority,
 ): EscalationAdapter | null {
   if (!registration.builtin && !liveCustomRegistration(registration, scope.root)) return null;
   let adapter: EscalationAdapter | null;
   try {
     if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
     if (!scope.pinnedRoot.isStable()) return null;
-    adapter = registration.factory(config, cwd, scope.pinnedRoot, runtimeAccess);
+    adapter = registration.proofFactory
+      ? registration.proofFactory(config, cwd, scope.pinnedRoot, runtimeAccess, proofAuthority)
+      : registration.factory(config, cwd, scope.pinnedRoot, runtimeAccess);
     if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
   } catch (error) {
     if (error instanceof EscalationConfigError && error.code === "changed") throw error;
@@ -1011,14 +1025,14 @@ export function loadEscalationConfig(cwd: string, options: { pinnedRoot?: Pinned
 }
 
 /** Build the configured adapter; null when the config is unusable. */
-export function createEscalationAdapter(config: EscalationConfig, cwd: string, pinnedRoot?: PinnedProjectRoot, runtimeAccess?: RuntimeAccess): EscalationAdapter | null {
+export function createEscalationAdapter(config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority): EscalationAdapter | null {
   if (!config || typeof config.adapter !== "string") return null;
   const scope = openAdapterResolutionScope(cwd, pinnedRoot);
   if (!scope) return null;
   try {
     const registration = registrationForKind(config.adapter, scope);
     const adapter = registration
-      ? invokeAdapterFactory(registration, config, scope.root.canonical_root, scope.pinnedRoot, runtimeAccess, scope)
+      ? invokeAdapterFactory(registration, config, scope.root.canonical_root, scope.pinnedRoot, runtimeAccess, scope, proofAuthority)
       : null;
     if (adapter && runtimeAccess && !bindEscalationAdapterRouting(adapter, runtimeAccess, scope.pinnedRoot)) return null;
     return adapter;
@@ -1131,7 +1145,7 @@ function sinkProfileIdOf(sink: EscalationAdapter): string {
  * downgraded or accepted as a sink.
  * No profiles -> `{ profiles: [], profile: {direction:"none"}, primary: null, roSinks: [] }`.
  */
-export function createChannelSet(cwd: string, capabilities?: Record<string, ChannelCapabilities>, pinnedRoot?: PinnedProjectRoot, runtimeAccess?: RuntimeAccess): ChannelSet {
+export function createChannelSet(cwd: string, capabilities: Record<string, ChannelCapabilities> | undefined, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority): ChannelSet {
   if (pinnedRoot && !pinnedRoot.isStable()) throw new EscalationConfigError("changed", "escalation channel root changed before construction");
   if (!runtimeAccess) return { profiles: [], profile: { direction: "none" }, primary: null, roSinks: [], legacySingleAdapter: false };
   const scope = openAdapterResolutionScope(cwd, pinnedRoot);
@@ -1282,7 +1296,7 @@ export function createChannelSet(cwd: string, capabilities?: Record<string, Chan
     const entry = entryFor(profile);
     if (!entry) return { adapter: null, capabilityMismatch: false };
     try {
-      const adapter = invokeAdapterFactory(registration, entry as EscalationConfig, scope.root.canonical_root, scope.pinnedRoot, runtimeAccess, scope);
+      const adapter = invokeAdapterFactory(registration, entry as EscalationConfig, scope.root.canonical_root, scope.pinnedRoot, runtimeAccess, scope, proofAuthority);
       if (!adapter) return { adapter: null, capabilityMismatch: false };
       if (!registration.capabilities) return { adapter, capabilityMismatch: false };
       const usable = typeof adapter.send === "function" && typeof adapter.cancel === "function";
@@ -1464,8 +1478,8 @@ export function createChannelSet(cwd: string, capabilities?: Record<string, Chan
  * channel set here also rejects a registered RW claim whose factory does not
  * expose the claimed inbound surface.
  */
-export function isBidirectionalChannel(cwd: string, capabilities?: Record<string, ChannelCapabilities>, pinnedRoot?: PinnedProjectRoot, runtimeAccess?: RuntimeAccess): boolean {
-  const set = createChannelSet(cwd, capabilities, pinnedRoot, runtimeAccess);
+export function isBidirectionalChannel(cwd: string, capabilities: Record<string, ChannelCapabilities> | undefined, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority): boolean {
+  const set = createChannelSet(cwd, capabilities, pinnedRoot, runtimeAccess, proofAuthority);
   return set.profile.direction === "rw" && set.primary !== null;
 }
 
@@ -1552,9 +1566,9 @@ function isSummarizableWave(wave: unknown): wave is RuntimeWaveView {
  *
  * Returns the number of NEW deliveries queued (0 on re-runs). Never throws.
  */
-export function produceWaveDeliveries(root: string, opts: { isOwned?: () => boolean; runEntries?: readonly CtoRunDeliveryIndexEntry[]; pinnedRoot?: PinnedProjectRoot; runtimeAccess?: RuntimeAccess } = {}): number {
+export function produceWaveDeliveries(root: string, opts: { isOwned?: () => boolean; runEntries?: readonly CtoRunDeliveryIndexEntry[]; pinnedRoot?: PinnedProjectRoot; runtimeAccess?: RuntimeAccess; proofAuthority: CtoRuntimeProofAuthority }): number {
   try {
-    const channelSet = createChannelSet(root, undefined, opts.pinnedRoot, opts.runtimeAccess);
+    const channelSet = createChannelSet(root, undefined, opts.pinnedRoot, opts.runtimeAccess, opts.proofAuthority);
     if (channelSet.profiles.length === 0) return 0;
     let queued = 0;
     for (const entry of indexedRunEntriesOrRead(root, opts.runEntries, opts.pinnedRoot, opts.runtimeAccess)) {
@@ -1642,7 +1656,8 @@ export async function drainOutbox(
     retryCursorStore?: Map<string, string | null>;
     retryMatchStateStore?: Map<string, unknown>;
     retryMatchCursorStore?: Map<string, string | null>;
-  } = {},
+    proofAuthority: CtoRuntimeProofAuthority;
+  },
 ): Promise<DrainOutboxResult[]> {
   const roSinks = opts.roSinks ?? [];
   if (!validDrainInputList(opts.roSinks, MAX_DRAIN_RO_SINKS)
@@ -3516,7 +3531,7 @@ function acknowledgeDrainedRuns(root: string, entries: readonly CtoRunDeliveryIn
   }
 }
 
-const BRIDGE_LEASE_PROOF_DOMAIN = "bridge-lease-v1";
+const BRIDGE_LEASE_PROOF_DOMAIN = "bridge-lease-v1" as const;
 
 function bridgeLeaseProofPayload(record: Omit<DispatcherLeaseRecord, "proof">): string {
   return JSON.stringify({
@@ -3545,45 +3560,33 @@ function bridgeLeaseProofPayload(record: Omit<DispatcherLeaseRecord, "proof">): 
   });
 }
 
-function bridgeLeaseProof(root: PinnedProjectRoot, record: Omit<DispatcherLeaseRecord, "proof">): string | null {
-  const master = readOrCreateRootRuntimeSecret(root);
-  const key = master ? deriveRuntimeSecretKey(master, BRIDGE_LEASE_PROOF_DOMAIN) : null;
-  return key ? createHmac("sha256", key).update(bridgeLeaseProofPayload(record), "utf8").digest("hex") : null;
+function bridgeLeaseProof(authority: CtoRuntimeProofAuthority, record: Omit<DispatcherLeaseRecord, "proof">): string | null {
+  return signCtoRuntimeProof(authority, BRIDGE_LEASE_PROOF_DOMAIN, bridgeLeaseProofPayload(record));
 }
 
-function bridgeLeaseProofMatches(root: PinnedProjectRoot, record: DispatcherLeaseRecord): boolean {
-  if (!root.isStable() || typeof record.proof !== "string" || !/^[0-9a-f]{64}$/u.test(record.proof)) return false;
-  const expected = bridgeLeaseProof(root, record);
-  if (!expected) return false;
-  const expectedBytes = Buffer.from(expected, "hex");
-  const actualBytes = Buffer.from(record.proof, "hex");
-  return expectedBytes.length === actualBytes.length && timingSafeEqual(expectedBytes, actualBytes);
+function bridgeLeaseProofMatches(authority: CtoRuntimeProofAuthority, record: DispatcherLeaseRecord): boolean {
+  if (typeof record.proof !== "string" || !/^[0-9a-f]{64}$/u.test(record.proof)) return false;
+  return verifyCtoRuntimeProof(authority, BRIDGE_LEASE_PROOF_DOMAIN, bridgeLeaseProofPayload(record), record.proof);
 }
 
-function signBridgeLease<T extends Omit<DispatcherLeaseRecord, "proof">>(root: PinnedProjectRoot, record: T): T & Pick<DispatcherLeaseRecord, "proof"> | null {
-  const proof = bridgeLeaseProof(root, record);
+function signBridgeLease<T extends Omit<DispatcherLeaseRecord, "proof">>(authority: CtoRuntimeProofAuthority, record: T): T & Pick<DispatcherLeaseRecord, "proof"> | null {
+  const proof = bridgeLeaseProof(authority, record);
   return proof ? { ...record, proof } : null;
 }
 
-const CTO_DISPATCHER_LEASE_PROOF_DOMAIN = "cto-dispatcher-lease-v1";
+const CTO_DISPATCHER_LEASE_PROOF_DOMAIN = "cto-dispatcher-lease-v1" as const;
 
-function dispatcherLeaseProof(root: PinnedProjectRoot, record: Omit<DispatcherLeaseRecord, "proof">): string | null {
-  const master = readOrCreateRootRuntimeSecret(root);
-  const key = master ? deriveRuntimeSecretKey(master, CTO_DISPATCHER_LEASE_PROOF_DOMAIN) : null;
-  return key ? createHmac("sha256", key).update(bridgeLeaseProofPayload(record), "utf8").digest("hex") : null;
+function dispatcherLeaseProof(authority: CtoRuntimeProofAuthority, record: Omit<DispatcherLeaseRecord, "proof">): string | null {
+  return signCtoRuntimeProof(authority, CTO_DISPATCHER_LEASE_PROOF_DOMAIN, bridgeLeaseProofPayload(record));
 }
 
-function dispatcherLeaseProofMatches(root: PinnedProjectRoot, record: DispatcherLeaseRecord): boolean {
-  if (!root.isStable() || typeof record.proof !== "string" || !/^[0-9a-f]{64}$/u.test(record.proof)) return false;
-  const expected = dispatcherLeaseProof(root, record);
-  if (!expected) return false;
-  const expectedBytes = Buffer.from(expected, "hex");
-  const actualBytes = Buffer.from(record.proof, "hex");
-  return expectedBytes.length === actualBytes.length && timingSafeEqual(expectedBytes, actualBytes);
+function dispatcherLeaseProofMatches(authority: CtoRuntimeProofAuthority, record: DispatcherLeaseRecord): boolean {
+  if (typeof record.proof !== "string" || !/^[0-9a-f]{64}$/u.test(record.proof)) return false;
+  return verifyCtoRuntimeProof(authority, CTO_DISPATCHER_LEASE_PROOF_DOMAIN, bridgeLeaseProofPayload(record), record.proof);
 }
 
-function signDispatcherLease<T extends Omit<DispatcherLeaseRecord, "proof">>(root: PinnedProjectRoot, record: T): T & Pick<DispatcherLeaseRecord, "proof"> | null {
-  const proof = dispatcherLeaseProof(root, record);
+function signDispatcherLease<T extends Omit<DispatcherLeaseRecord, "proof">>(authority: CtoRuntimeProofAuthority, record: T): T & Pick<DispatcherLeaseRecord, "proof"> | null {
+  const proof = dispatcherLeaseProof(authority, record);
   return proof ? { ...record, proof } : null;
 }
 
@@ -3656,27 +3659,6 @@ function parseLease(raw: unknown): DispatcherLeaseRecord | null {
     proof,
   };
 }
-/**
- * A legacy lock may be valid UTF-8/JSON but lack the current owner fields.
- * Reclaim it only when its PID is gone or its heartbeat is older than the
- * lease grace period. A live PID with a fresh malformed owner is never taken
- * over; removal still uses the exact observed bytes and inode.
- */
-function malformedLeaseOwnerIsDead(raw: unknown): boolean {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
-  const value = raw as { pid?: unknown; heartbeatAt?: unknown };
-  const pid = value.pid;
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
-  const heartbeatAt = typeof value.heartbeatAt === "string" ? Date.parse(value.heartbeatAt) : Number.NaN;
-  const heartbeatExpired = Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt > DISPATCHER_LEASE_TTL_MS;
-  try {
-    process.kill(pid, 0);
-    return heartbeatExpired;
-  } catch (error) {
-    return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ESRCH";
-  }
-}
-
 function dispatcherRootMatchesPinnedRoot(root: string, pinnedRoot: PinnedProjectRoot, identity: { lexicalRoot: string; canonicalRoot: string; rootDev: number; rootIno: number }): boolean {
   return bridgeRootMatchesPinnedRoot(root, pinnedRoot, identity);
 }
@@ -3699,28 +3681,13 @@ function dispatcherLeaseMatchesPinnedRoot(lease: DispatcherLease, pinnedRoot: Pi
   });
 }
 
-function readDispatcherLeaseAny(root: string, pinnedRoot?: PinnedProjectRoot): { record: DispatcherLeaseRecord | null; read: { dev: number; ino: number; bytes: Uint8Array } } | null {
-  if (pinnedRoot && !pinnedRoot.isStable()) return null;
-  const queue = openControlQueue(root, false, pinnedRoot);
-  if (!queue) return null;
-  try {
-    const read = queue.read("cto-dispatcher.lock");
-    try {
-      const raw = JSON.parse(decodeUtf8(read.bytes)) as unknown;
-      const record = parseLease(raw);
-      if (record && (!pinnedRoot || !dispatcherLeaseProofMatches(pinnedRoot, record))) return { record: null, read };
-      if (!record && !malformedLeaseOwnerIsDead(raw)) return null;
-      return { record, read };
-    } catch {
-      // Invalid UTF-8/JSON cannot be attributed to a dead owner and is never
-      // reclaimed.
-      return null;
-    }
-  } catch {
-    return null;
-  } finally {
-    queue.close();
-  }
+
+type LeaseReadStatus = "missing" | "valid" | "invalid";
+type LeaseReadBytes = { dev: number; ino: number; bytes: Uint8Array };
+interface DispatcherLeaseReadResult {
+  status: LeaseReadStatus;
+  record: DispatcherLeaseRecord | null;
+  read?: LeaseReadBytes;
 }
 
 function isDispatcherLeaseAlive(lease: DispatcherLeaseRecord): boolean {
@@ -3740,15 +3707,37 @@ function leaseWrite(queue: BoundedQueue, name: string, record: DispatcherLeaseRe
   queue.writeExclusive(name, JSON.stringify(record, null, 2));
 }
 
+function readDispatcherLeaseAny(root: string, pinnedRoot?: PinnedProjectRoot, proofAuthority?: CtoRuntimeProofAuthority): DispatcherLeaseReadResult | null {
+  if (pinnedRoot && !pinnedRoot.isStable()) return null;
+  const queue = openControlQueue(root, false, pinnedRoot);
+  if (!queue) return { status: "missing", record: null };
+  try {
+    let read: LeaseReadBytes;
+    try { read = queue.read("cto-dispatcher.lock"); }
+    catch { return { status: "missing", record: null }; }
+    try {
+      const raw = JSON.parse(decodeUtf8(read.bytes)) as unknown;
+      const record = parseLease(raw);
+      if (!record || !proofAuthority || !dispatcherLeaseProofMatches(proofAuthority, record)) return { status: "invalid", record: null, read };
+      return { status: "valid", record, read };
+    } catch {
+      // Malformed/unauthenticated bytes are a split-brain fence, never a dead owner.
+      return { status: "invalid", record: null, read };
+    }
+  } finally {
+    queue.close();
+  }
+}
+
 /** Remove a dispatcher lease only when the exact token/generation still owns the bytes we read. */
-function removeDispatcherLeaseIfOwned(queue: BoundedQueue, pinnedRoot: PinnedProjectRoot, token: string, epoch: number): void {
+function removeDispatcherLeaseIfOwned(queue: BoundedQueue, pinnedRoot: PinnedProjectRoot, token: string, epoch: number, proofAuthority?: CtoRuntimeProofAuthority): void {
   try {
     const observed = queue.read("cto-dispatcher.lock");
     const record = parseLease(JSON.parse(decodeUtf8(observed.bytes)));
     if (!record
       || record.token !== token
       || record.epoch !== epoch
-      || !dispatcherLeaseProofMatches(pinnedRoot, record)
+      || !Boolean(proofAuthority && dispatcherLeaseProofMatches(proofAuthority, record))
       || !dispatcherRecordMatchesPinnedRoot(pinnedRoot.lexical_root, pinnedRoot, record)
       || !pinnedRoot.isStable()) return;
     queue.removeIfMatches("cto-dispatcher.lock", queueExpected(observed));
@@ -3757,7 +3746,7 @@ function removeDispatcherLeaseIfOwned(queue: BoundedQueue, pinnedRoot: PinnedPro
   }
 }
 
-function claimDispatcher(root: string, providedRoot?: PinnedProjectRoot, runtimeAccess?: RuntimeAccess, sessionId?: string, liveGuard?: DispatcherActivationLiveGuard, expectedActivation?: RegistryContextSnapshot): { lease: DispatcherLease; pinnedRoot: PinnedProjectRoot } | null {
+function claimDispatcher(root: string, providedRoot?: PinnedProjectRoot, runtimeAccess?: RuntimeAccess, sessionId?: string, liveGuard?: DispatcherActivationLiveGuard, expectedActivation?: RegistryContextSnapshot, proofAuthority?: CtoRuntimeProofAuthority): { lease: DispatcherLease; pinnedRoot: PinnedProjectRoot } | null {
   const pinnedRoot = providedRoot ?? PinnedProjectRoot.open(root);
   const ownsPin = providedRoot === undefined;
   if (!runtimeAccess || typeof sessionId !== "string" || sessionId.length === 0 || !liveGuard || !pinnedRoot || !pinnedRoot.isStable()) {
@@ -3806,7 +3795,7 @@ function claimDispatcher(root: string, providedRoot?: PinnedProjectRoot, runtime
       outbox_run_id: null,
       outbox_cursor: null,
     };
-    const first = signDispatcherLease(pinnedRoot, firstUnsigned);
+    const first = proofAuthority ? signDispatcherLease(proofAuthority, firstUnsigned) : null;
     if (!first) return null;
     const lease = (record: DispatcherLeaseRecord): DispatcherLease => ({
       root,
@@ -3827,41 +3816,42 @@ function claimDispatcher(root: string, providedRoot?: PinnedProjectRoot, runtime
       wroteFirst = true;
       assertDispatcherActivationLive(runtimeAccess, pinnedRoot, liveGuard, activation);
       if (!dispatcherRootMatchesPinnedRoot(root, pinnedRoot, identity) || !dispatcherRecordMatchesPinnedRoot(root, pinnedRoot, first)) {
-        removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, first.epoch);
+        removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, first.epoch, proofAuthority);
         return null;
       }
       retained = true;
       return { lease: lease(first), pinnedRoot };
     } catch (error) {
-      if (wroteFirst) removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, first.epoch);
+      if (wroteFirst) removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, first.epoch, proofAuthority);
       if (!(error instanceof BoundedQueueError && error.code === "exists")) return null;
     }
-    const current = readDispatcherLeaseAny(root, pinnedRoot);
-    if (!current) return null;
+    const current = readDispatcherLeaseAny(root, pinnedRoot, proofAuthority);
+    if (!current || current.status === "invalid") return null;
     if (current.record && !dispatcherRecordMatchesPinnedRoot(root, pinnedRoot, current.record)) return null;
     if (current.record && isDispatcherLeaseAlive(current.record)) return null;
+    if (current.status === "valid" && !current.read) return null;
     const epoch = current.record ? current.record.epoch + 1 : 1;
     const { proof: _proof, ...firstWithoutProof } = first;
-    const next = signDispatcherLease(pinnedRoot, {
+    const next = proofAuthority ? signDispatcherLease(proofAuthority, {
       ...firstWithoutProof,
       epoch,
       run_cursor: current.record?.run_cursor ?? null,
       outbox_run_id: current.record?.outbox_run_id ?? null,
       outbox_cursor: current.record?.outbox_cursor ?? null,
-    });
+    }) : null;
     if (!next) return null;
     assertDispatcherActivationLive(runtimeAccess, pinnedRoot, liveGuard, activation);
-    queue.removeIfMatches("cto-dispatcher.lock", queueExpected(current.read));
+    queue.removeIfMatches("cto-dispatcher.lock", queueExpected(current.read!));
     assertDispatcherActivationLive(runtimeAccess, pinnedRoot, liveGuard, activation);
     leaseWrite(queue, "cto-dispatcher.lock", next);
     try {
       assertDispatcherActivationLive(runtimeAccess, pinnedRoot, liveGuard, activation);
     } catch (error) {
-      removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, next.epoch);
+      removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, next.epoch, proofAuthority);
       throw error;
     }
     if (!dispatcherRootMatchesPinnedRoot(root, pinnedRoot, identity) || !dispatcherRecordMatchesPinnedRoot(root, pinnedRoot, next)) {
-      removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, next.epoch);
+      removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, next.epoch, proofAuthority);
       return null;
     }
     retained = true;
@@ -3876,14 +3866,14 @@ function claimDispatcher(root: string, providedRoot?: PinnedProjectRoot, runtime
   }
 }
 
-function ownsDispatcherLeasePinned(lease: DispatcherLease, pinnedRoot: PinnedProjectRoot): boolean {
+function ownsDispatcherLeasePinned(lease: DispatcherLease, pinnedRoot: PinnedProjectRoot, proofAuthority: CtoRuntimeProofAuthority): boolean {
   if (!pinnedRoot.isStable() || !dispatcherLeaseMatchesPinnedRoot(lease, pinnedRoot)) return false;
-  const current = readDispatcherLeaseAny(lease.root, pinnedRoot);
+  const current = readDispatcherLeaseAny(lease.root, pinnedRoot, proofAuthority);
   return Boolean(current?.record
     && dispatcherRecordMatchesPinnedRoot(lease.root, pinnedRoot, current.record)
     && current.record.token === lease.token
     && current.record.epoch === lease.epoch
-    && dispatcherLeaseProofMatches(pinnedRoot, current.record)
+    && Boolean(proofAuthority && dispatcherLeaseProofMatches(proofAuthority, current.record))
     && pinnedRoot.isStable());
 }
 
@@ -3895,6 +3885,7 @@ function refreshDispatcherLease(
   outboxCursor?: string | null,
   providedRoot?: PinnedProjectRoot,
   liveGuard?: DispatcherActivationLiveGuard,
+  proofAuthority?: CtoRuntimeProofAuthority,
 ): void {
   const suppliedRoot = providedRoot;
   const pinnedRoot = suppliedRoot ?? PinnedProjectRoot.open(lease.root);
@@ -3905,19 +3896,19 @@ function refreshDispatcherLease(
     assertDispatcherActivationLive(runtimeAccess, pinnedRoot, liveGuard, lease.activation);
     const current = queue.read("cto-dispatcher.lock");
     const record = parseLease(JSON.parse(decodeUtf8(current.bytes)));
-    if (!record || !dispatcherLeaseProofMatches(pinnedRoot, record) || !dispatcherRecordMatchesPinnedRoot(lease.root, pinnedRoot, record) || record.token !== lease.token || record.epoch !== lease.epoch) return;
+    if (!record || !Boolean(proofAuthority && dispatcherLeaseProofMatches(proofAuthority, record)) || !dispatcherRecordMatchesPinnedRoot(lease.root, pinnedRoot, record) || record.token !== lease.token || record.epoch !== lease.epoch) return;
     assertDispatcherActivationLive(runtimeAccess, pinnedRoot, liveGuard, lease.activation);
     const nextRunCursor = runCursor !== undefined ? runCursor : lease.runCursor;
     const nextOutboxRunId = outboxRunId !== undefined ? outboxRunId : lease.directOutboxRunId;
     const nextOutboxCursor = outboxCursor !== undefined ? outboxCursor : lease.directOutboxCursor;
     const { proof: _proof, ...withoutProof } = record;
-    const refreshed = signDispatcherLease(pinnedRoot, {
+    const refreshed = proofAuthority ? signDispatcherLease(proofAuthority, {
       ...withoutProof,
       heartbeatAt: new Date().toISOString(),
       run_cursor: nextRunCursor,
       outbox_run_id: nextOutboxRunId,
       outbox_cursor: nextOutboxCursor,
-    });
+    }) : null;
     if (!refreshed) return;
     queue.replaceIfMatches("cto-dispatcher.lock", queueExpected(current), JSON.stringify(refreshed, null, 2));
     lease.runCursor = nextRunCursor;
@@ -3933,7 +3924,7 @@ function refreshDispatcherLease(
   }
 }
 
-function releaseDispatcherLease(lease: DispatcherLease, providedRoot?: PinnedProjectRoot): void {
+function releaseDispatcherLease(lease: DispatcherLease, providedRoot?: PinnedProjectRoot, proofAuthority?: CtoRuntimeProofAuthority): void {
   const suppliedRoot = providedRoot;
   const pinnedRoot = suppliedRoot ?? PinnedProjectRoot.open(lease.root);
   if (!pinnedRoot || !dispatcherLeaseMatchesPinnedRoot(lease, pinnedRoot)) { if (!suppliedRoot) pinnedRoot?.close(); return; }
@@ -3942,7 +3933,7 @@ function releaseDispatcherLease(lease: DispatcherLease, providedRoot?: PinnedPro
   try {
     const current = queue.read("cto-dispatcher.lock");
     const record = parseLease(JSON.parse(decodeUtf8(current.bytes)));
-    if (!record || !dispatcherLeaseProofMatches(pinnedRoot, record) || !dispatcherRecordMatchesPinnedRoot(lease.root, pinnedRoot, record) || record.token !== lease.token || record.epoch !== lease.epoch || !pinnedRoot.isStable()) return;
+    if (!record || !Boolean(proofAuthority && dispatcherLeaseProofMatches(proofAuthority, record)) || !dispatcherRecordMatchesPinnedRoot(lease.root, pinnedRoot, record) || record.token !== lease.token || record.epoch !== lease.epoch || !pinnedRoot.isStable()) return;
     queue.removeIfMatches("cto-dispatcher.lock", queueExpected(current));
   } catch {
     // Best-effort release; stale fencing handles crashed owners.
@@ -4062,21 +4053,21 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
   const { primary, roSinks, intervalMs, opts } = target;
   const drainAdapter = primary ?? (target.legacySingleAdapter ? (roSinks[0] ?? null) : null);
   if (!opts.runtimeAccess) return dispatcherHandle(false, async () => undefined);
-  const claimed = claimDispatcher(root, opts.pinnedRoot, opts.runtimeAccess, opts.session_id, opts.liveGuard, opts.activation);
+  const claimed = claimDispatcher(root, opts.pinnedRoot, opts.runtimeAccess, opts.session_id, opts.liveGuard, opts.activation, opts.proofAuthority);
   if (!claimed) return dispatcherHandle(false, async () => undefined);
   const { lease, pinnedRoot: dispatcherRoot } = claimed;
   const ownsDispatcherRoot = opts.pinnedRoot === undefined;
   try {
     assertDispatcherActivationLive(opts.runtimeAccess, dispatcherRoot, opts.liveGuard, lease.activation);
   } catch {
-    releaseDispatcherLease(lease, dispatcherRoot);
+    releaseDispatcherLease(lease, dispatcherRoot, opts.proofAuthority);
     if (ownsDispatcherRoot) void dispatcherRoot.closeAsync().catch(() => undefined);
     return dispatcherHandle(false, async () => undefined);
   }
   let requestStop: (() => Promise<void>) | undefined;
   const heartbeat = setInterval(() => {
     try {
-      refreshDispatcherLease(lease, opts.runtimeAccess, undefined, undefined, undefined, dispatcherRoot, opts.liveGuard);
+      refreshDispatcherLease(lease, opts.runtimeAccess, undefined, undefined, undefined, dispatcherRoot, opts.liveGuard, opts.proofAuthority);
     } catch (error) {
       if (isDispatcherActivationFailure(error)) void requestStop?.();
     }
@@ -4117,18 +4108,18 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
   const wakeTask = async (task: InboxTask, pinnedRoot: PinnedProjectRoot = dispatcherRoot): Promise<void> => {
     if (stopped) throw new Error("messenger dispatcher is stopped");
     assertDispatcherActivationLive(opts.runtimeAccess, pinnedRoot, opts.liveGuard, lease.activation);
-    if (!ownsDispatcherLeasePinned(lease, pinnedRoot)) throw new Error("messenger dispatcher lease lost before task wake");
+    if (!ownsDispatcherLeasePinned(lease, pinnedRoot, opts.proofAuthority)) throw new Error("messenger dispatcher lease lost before task wake");
     await onTask?.(task);
     assertDispatcherActivationLive(opts.runtimeAccess, pinnedRoot, opts.liveGuard, lease.activation);
-    if (stopped || !ownsDispatcherLeasePinned(lease, pinnedRoot)) throw new Error("messenger dispatcher lease lost during task wake");
+    if (stopped || !ownsDispatcherLeasePinned(lease, pinnedRoot, opts.proofAuthority)) throw new Error("messenger dispatcher lease lost during task wake");
   };
   const wakeAnswer = async (answer: Pick<EscalationAnswer, "id" | "run_id" | "answer">, pinnedRoot: PinnedProjectRoot = dispatcherRoot): Promise<void> => {
     if (stopped) throw new Error("messenger dispatcher is stopped");
     assertDispatcherActivationLive(opts.runtimeAccess, pinnedRoot, opts.liveGuard, lease.activation);
-    if (!ownsDispatcherLeasePinned(lease, pinnedRoot)) throw new Error("messenger dispatcher lease lost before answer wake");
+    if (!ownsDispatcherLeasePinned(lease, pinnedRoot, opts.proofAuthority)) throw new Error("messenger dispatcher lease lost before answer wake");
     await onAnswer?.(answer);
     assertDispatcherActivationLive(opts.runtimeAccess, pinnedRoot, opts.liveGuard, lease.activation);
-    if (stopped || !ownsDispatcherLeasePinned(lease, pinnedRoot)) throw new Error("messenger dispatcher lease lost during answer wake");
+    if (stopped || !ownsDispatcherLeasePinned(lease, pinnedRoot, opts.proofAuthority)) throw new Error("messenger dispatcher lease lost during answer wake");
   };
   const inboxHandler = (_message: unknown, _callbackRoot?: PinnedProjectRoot): Promise<void> => {
     if (stopped) return Promise.resolve();
@@ -4138,24 +4129,25 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
       if (isDispatcherActivationFailure(error)) void requestStop?.();
       return Promise.resolve();
     }
-    if (!ownsDispatcherLeasePinned(lease, dispatcherRoot)) return Promise.resolve();
+    if (!ownsDispatcherLeasePinned(lease, dispatcherRoot, opts.proofAuthority)) return Promise.resolve();
     const operation = (async (): Promise<void> => {
       assertDispatcherActivationLive(opts.runtimeAccess, dispatcherRoot, opts.liveGuard, lease.activation);
       const task = normalizeInboundTask(_message);
-      if (!task || stopped || !ownsDispatcherLeasePinned(lease, dispatcherRoot)) return;
+      if (!task || stopped || !ownsDispatcherLeasePinned(lease, dispatcherRoot, opts.proofAuthority)) return;
       // Adapters may supply a transport-local pin, but admission is always
       // anchored to the exact session-start descriptor transferred here.
       const callbackPin = dispatcherRoot;
-      if (stopped || !ownsDispatcherLeasePinned(lease, dispatcherRoot)) return;
+      if (stopped || !ownsDispatcherLeasePinned(lease, dispatcherRoot, opts.proofAuthority)) return;
       const outcome = await dispatchInboxTask(root, task, (value) => wakeTask(value, callbackPin), {
         idempotentWake: true,
         wakeEvidence: opts.wakeEvidence,
         pinnedRoot: callbackPin,
         runtimeAccess: opts.runtimeAccess,
+        proofAuthority: opts.proofAuthority,
         isOwned: () => {
           if (stopped) return false;
           assertDispatcherActivationLive(opts.runtimeAccess, callbackPin, opts.liveGuard, lease.activation);
-          return ownsDispatcherLeasePinned(lease, callbackPin);
+          return ownsDispatcherLeasePinned(lease, callbackPin, opts.proofAuthority);
         },
       });
       if (outcome === "retryable") throw new InboxTaskRetryableError();
@@ -4185,7 +4177,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
       if (typeof inboundCapable?.clearPlainMessageHandler === "function") inboundCapable.clearPlainMessageHandler();
       else inboundCapable?.setPlainMessageHandler?.(() => undefined);
     } catch { /* cleanup continues */ }
-    releaseDispatcherLease(lease, dispatcherRoot);
+    releaseDispatcherLease(lease, dispatcherRoot, opts.proofAuthority);
     // A caller-supplied pin remains caller-owned when startup fails. A locally
     // opened pin is released here because no stop handle is returned.
     if (opts.pinnedRoot === undefined) void dispatcherRoot.closeAsync().catch(() => undefined);
@@ -4193,7 +4185,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
   }
   let ticking = false;
   const tick = async (): Promise<void> => {
-    if (stopped || ticking || !ownsDispatcherLeasePinned(lease, dispatcherRoot)) return;
+    if (stopped || ticking || !ownsDispatcherLeasePinned(lease, dispatcherRoot, opts.proofAuthority)) return;
     assertDispatcherActivationLive(opts.runtimeAccess, dispatcherRoot, opts.liveGuard, lease.activation);
     ticking = true;
     const abortController = new AbortController();
@@ -4209,12 +4201,12 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
     let nextOutboxRunId = lease.directOutboxRunId;
     let nextOutboxCursor = lease.directOutboxCursor;
     try {
-      if (!tickPin.isStable() || !ownsDispatcherLeasePinned(lease, tickPin)) return;
+      if (!tickPin.isStable() || !ownsDispatcherLeasePinned(lease, tickPin, opts.proofAuthority)) return;
       const context: DispatcherTickContext = { root, pinnedRoot: tickPin, lease };
       const isOwned = (): boolean => {
         if (stopped) return false;
         assertDispatcherActivationLive(opts.runtimeAccess, context.pinnedRoot, opts.liveGuard, lease.activation);
-        return ownsDispatcherLeasePinned(context.lease, context.pinnedRoot);
+        return ownsDispatcherLeasePinned(context.lease, context.pinnedRoot, opts.proofAuthority);
       };
       assertDispatcherActivationLive(opts.runtimeAccess, tickPin, opts.liveGuard, lease.activation);
       const direct = discoverDirectOutbox(context.root, lease.directOutboxRunId, lease.directOutboxCursor, context.pinnedRoot, opts.runtimeAccess, lifecycle);
@@ -4232,7 +4224,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
       // last tick is queued AND drained in this same tick. Both consumers
       // receive the exact same canonical run page; no directory discovery.
       assertDispatcherActivationLive(opts.runtimeAccess, tickPin, opts.liveGuard, lease.activation);
-      produceWaveDeliveries(context.root, { isOwned, runEntries: entries, pinnedRoot: context.pinnedRoot, runtimeAccess: opts.runtimeAccess });
+      produceWaveDeliveries(context.root, { isOwned, runEntries: entries, pinnedRoot: context.pinnedRoot, runtimeAccess: opts.runtimeAccess, proofAuthority: opts.proofAuthority });
       assertDispatcherActivationLive(opts.runtimeAccess, tickPin, opts.liveGuard, lease.activation);
       const drained = await drainOutbox(context.root, drainAdapter, 3, {
         roSinks,
@@ -4242,6 +4234,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
         runtimeAccess: opts.runtimeAccess,
         lifecycle,
         runEntries: entries,
+        proofAuthority: opts.proofAuthority,
         outboxEntry: directEntry && direct.entryName !== null ? { runId: directEntry.run_id, name: direct.entryName } : undefined,
         retryCursorStore,
         retryMatchStateStore,
@@ -4269,11 +4262,12 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
         wakeEvidence: opts.wakeEvidence,
         pinnedRoot: context.pinnedRoot,
         runtimeAccess: opts.runtimeAccess,
+        proofAuthority: opts.proofAuthority,
         lifecycle,
         retryCursorStore,
       });
     } finally {
-      if (!stopped && ownsDispatcherLeasePinned(lease, tickPin)) refreshDispatcherLease(lease, opts.runtimeAccess, nextCursor, nextOutboxRunId, nextOutboxCursor, tickPin, opts.liveGuard);
+      if (!stopped && ownsDispatcherLeasePinned(lease, tickPin, opts.proofAuthority)) refreshDispatcherLease(lease, opts.runtimeAccess, nextCursor, nextOutboxRunId, nextOutboxCursor, tickPin, opts.liveGuard, opts.proofAuthority);
       if (activeAbortController === abortController) activeAbortController = null;
       ticking = false;
     }
@@ -4304,7 +4298,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
         else inboundCapable?.setPlainMessageHandler?.(() => undefined);
       }
     } catch { /* release/close must still run */ }
-    releaseDispatcherLease(lease, dispatcherRoot);
+    releaseDispatcherLease(lease, dispatcherRoot, opts.proofAuthority);
     stopPromise = (async (): Promise<void> => {
       try {
         const deadline = Date.now() + DISPATCHER_STOP_GRACE_MS;
@@ -4338,7 +4332,7 @@ export function startDispatcher(
   root: string,
   adapter: EscalationAdapter | null,
   intervalMs = 10_000,
-  opts: DispatcherOptions = {},
+  opts: DispatcherOptions,
 ): DispatcherHandle {
   return startDispatcherLoop(root, { primary: adapter, roSinks: [], intervalMs, opts });
 }
@@ -4354,7 +4348,7 @@ export function startChannelDispatcher(
   root: string,
   channelSet: ChannelSet,
   intervalMs = 10_000,
-  opts: DispatcherOptions & { roSinks?: EscalationAdapter[] } = {},
+  opts: DispatcherOptions & { roSinks?: EscalationAdapter[] },
 ): DispatcherHandle {
   return startDispatcherLoop(root, {
     primary: channelSet.primary,
@@ -4399,7 +4393,7 @@ async function dispatchInboxTask(
   root: string,
   task: InboxTask,
   onTask: ((task: InboxTask) => void | Promise<void>) | undefined,
-  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot: PinnedProjectRoot; isOwned?: () => boolean; runtimeAccess?: RuntimeAccess },
+  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot: PinnedProjectRoot; isOwned?: () => boolean; runtimeAccess?: RuntimeAccess; proofAuthority: CtoRuntimeProofAuthority },
 ): Promise<InboxTaskAdmissionOutcome> {
   const admitted = await handleInboxTask(root, task, onTask, opts);
   if (admitted !== null) return "accepted";
@@ -4467,6 +4461,8 @@ export interface DispatcherOptions {
   session_id?: string;
   /** Registry-issued live activation capability; required to claim a dispatcher lease. */
   liveGuard?: DispatcherActivationLiveGuard;
+  /** Opaque root/workflow_tools proof authority; required for all durable proofs. */
+  proofAuthority: CtoRuntimeProofAuthority;
   /** Optional stale-snapshot consistency check; never authorizes a claim without liveGuard. */
   activation?: RegistryContextSnapshot;
 }
@@ -4757,25 +4753,29 @@ function parseBridgeLease(raw: unknown): BridgeLeaseRecord | null {
   return { ...record, session_id: value.session_id, root_identity: value.root_identity, root_dev: value.root_dev as number, root_ino: value.root_ino as number };
 }
 
-function readBridgeLease(root: string, pinnedRoot?: PinnedProjectRoot): { record: BridgeLeaseRecord | null; read: { dev: number; ino: number; bytes: Uint8Array } } | null {
+interface BridgeLeaseReadResult {
+  status: LeaseReadStatus;
+  record: BridgeLeaseRecord | null;
+  read?: LeaseReadBytes;
+}
+
+function readBridgeLease(root: string, pinnedRoot?: PinnedProjectRoot, proofAuthority?: CtoRuntimeProofAuthority): BridgeLeaseReadResult | null {
   if (pinnedRoot && !pinnedRoot.isStable()) return null;
   const queue = openControlQueue(root, false, pinnedRoot);
-  if (!queue) return null;
+  if (!queue) return { status: "missing", record: null };
   try {
-    const read = queue.read("bridge.lock");
+    let read: LeaseReadBytes;
+    try { read = queue.read("bridge.lock"); }
+    catch { return { status: "missing", record: null }; }
     try {
       const raw = JSON.parse(decodeUtf8(read.bytes)) as unknown;
       const record = parseBridgeLease(raw);
-      if (record && (!pinnedRoot || !bridgeLeaseProofMatches(pinnedRoot, record))) return { record: null, read };
-      if (!record && !malformedLeaseOwnerIsDead(raw)) return null;
-      return { record, read };
+      if (!record || !proofAuthority || !bridgeLeaseProofMatches(proofAuthority, record)) return { status: "invalid", record: null, read };
+      return { status: "valid", record, read };
     } catch {
-      // Invalid UTF-8/JSON cannot be attributed to a dead owner and is never
-      // reclaimed.
-      return null;
+      // Malformed/unauthenticated bytes are a split-brain fence, never a dead owner.
+      return { status: "invalid", record: null, read };
     }
-  } catch {
-    return null;
   } finally {
     queue.close();
   }
@@ -4786,7 +4786,7 @@ function bridgeLeaseAlive(record: BridgeLeaseRecord): boolean {
 }
 
 /** Remove process-local bridge leases that no longer own a live exact root/lock. */
-function sweepBridgeLeases(): void {
+function sweepBridgeLeases(proofAuthority?: CtoRuntimeProofAuthority): void {
   for (const [root, owned] of bridgeLeases) {
     const pin = PinnedProjectRoot.open(root);
     if (!pin || !pin.isStable()) {
@@ -4799,7 +4799,9 @@ function sweepBridgeLeases(): void {
         bridgeLeases.delete(root);
         continue;
       }
-      const current = readBridgeLease(root, pin)?.record;
+      const currentRead = readBridgeLease(root, pin, proofAuthority);
+      if (currentRead?.status === "invalid") continue;
+      const current = currentRead?.record;
       const currentMatchesRoot = Boolean(current && bridgeRecordMatchesPinnedRoot(root, pin, current));
       const expiredOrDead = !current || !bridgeLeaseAlive(current);
       const displaced = Boolean(current && (current.token !== owned.token || current.epoch !== owned.epoch || current.session_id !== owned.session_id));
@@ -4824,12 +4826,12 @@ function sweepBridgeLeases(): void {
 }
 
 /** True when a live tg-bridge owns the bot for this project. */
-export function isBridgeAlive(root: string, pinnedRoot?: PinnedProjectRoot): boolean {
-  sweepBridgeLeases();
+export function isBridgeAlive(root: string, pinnedRoot?: PinnedProjectRoot, proofAuthority?: CtoRuntimeProofAuthority): boolean {
+  sweepBridgeLeases(proofAuthority);
   const pin = pinnedRoot ?? PinnedProjectRoot.open(root);
   if (!pin || !pin.isStable()) { if (!pinnedRoot) pin?.close(); return false; }
   try {
-    const current = readBridgeLease(root, pin);
+    const current = readBridgeLease(root, pin, proofAuthority);
     return Boolean(current?.record && bridgeRecordMatchesPinnedRoot(root, pin, current.record) && bridgeLeaseAlive(current.record));
   } finally {
     if (!pinnedRoot) pin.close();
@@ -4851,18 +4853,18 @@ function bridgeLeaseHandle(record: BridgeLeaseRecord): BridgeLeaseHandle {
 const bridgeLeaseNotOwned = (): BridgeLeaseHandle => ({ owned: false });
 
 /** Revalidate one lease token against the pinned root and lock bytes. */
-export function isBridgeLeaseOwned(root: string, handle: BridgeLeaseHandle, pinnedRoot?: PinnedProjectRoot): boolean {
-  sweepBridgeLeases();
+export function isBridgeLeaseOwned(root: string, handle: BridgeLeaseHandle, pinnedRoot?: PinnedProjectRoot, proofAuthority?: CtoRuntimeProofAuthority): boolean {
+  sweepBridgeLeases(proofAuthority);
   if (!handle.owned || typeof handle.token !== "string" || !Number.isSafeInteger(handle.epoch)) return false;
   const pin = pinnedRoot ?? PinnedProjectRoot.open(root);
   if (!pin || !pin.isStable()) { if (!pinnedRoot) pin?.close(); return false; }
   try {
-    const current = readBridgeLease(root, pin);
+    const current = readBridgeLease(root, pin, proofAuthority);
     return Boolean(current?.record
       && bridgeRecordMatchesPinnedRoot(root, pin, current.record)
       && current.record.token === handle.token
       && current.record.epoch === handle.epoch
-      && bridgeLeaseProofMatches(pin, current.record)
+      && Boolean(proofAuthority && bridgeLeaseProofMatches(proofAuthority, current.record))
       && (!handle.session_id || current.record.session_id === handle.session_id)
       && bridgeLeaseAlive(current.record)
       && pin.isStable());
@@ -4874,8 +4876,8 @@ export function isBridgeLeaseOwned(root: string, handle: BridgeLeaseHandle, pinn
 /** Refresh only the lock token installed by this bridge and keep its root
  * identity pinned. A lost/replaced lock returns false so callers stop polling
  * before another consumer can be created. */
-export function refreshBridgeLock(root: string, handle: BridgeLeaseHandle, pinnedRoot?: PinnedProjectRoot): boolean {
-  sweepBridgeLeases();
+export function refreshBridgeLock(root: string, handle: BridgeLeaseHandle, pinnedRoot?: PinnedProjectRoot, proofAuthority?: CtoRuntimeProofAuthority): boolean {
+  sweepBridgeLeases(proofAuthority);
   if (!handle.owned || typeof handle.token !== "string" || !Number.isSafeInteger(handle.epoch)) return false;
   const pin = pinnedRoot ?? PinnedProjectRoot.open(root);
   if (!pin || !pin.isStable()) { if (!pinnedRoot) pin?.close(); return false; }
@@ -4884,15 +4886,15 @@ export function refreshBridgeLock(root: string, handle: BridgeLeaseHandle, pinne
   try {
     const current = queue.read("bridge.lock");
     const record = parseBridgeLease(JSON.parse(decodeUtf8(current.bytes)));
-    if (!record || !bridgeLeaseProofMatches(pin, record) || !bridgeRecordMatchesPinnedRoot(root, pin, record)
+    if (!record || !Boolean(proofAuthority && bridgeLeaseProofMatches(proofAuthority, record)) || !bridgeRecordMatchesPinnedRoot(root, pin, record)
       || record.token !== handle.token || record.epoch !== handle.epoch
       || (handle.session_id !== undefined && record.session_id !== handle.session_id)
       || !pin.isStable()) return false;
     const { proof: _proof, ...withoutProof } = record;
-    const refreshed = signBridgeLease(pin, { ...withoutProof, heartbeatAt: new Date().toISOString() });
+    const refreshed = proofAuthority ? signBridgeLease(proofAuthority, { ...withoutProof, heartbeatAt: new Date().toISOString() }) : null;
     if (!refreshed) return false;
     queue.replaceIfMatches("bridge.lock", queueExpected(current), JSON.stringify(refreshed, null, 2));
-    return pin.isStable() && isBridgeLeaseOwned(root, handle, pin);
+    return pin.isStable() && isBridgeLeaseOwned(root, handle, pin, proofAuthority);
   } catch {
     return false;
   } finally {
@@ -4902,8 +4904,8 @@ export function refreshBridgeLock(root: string, handle: BridgeLeaseHandle, pinne
 }
 
 /** Write a fresh bridge lease and secret using exact-token CAS reclaim. */
-export function writeBridgeLock(root: string, pinnedRoot?: PinnedProjectRoot): BridgeLeaseHandle {
-  sweepBridgeLeases();
+export function writeBridgeLock(root: string, pinnedRoot?: PinnedProjectRoot, proofAuthority?: CtoRuntimeProofAuthority): BridgeLeaseHandle {
+  sweepBridgeLeases(proofAuthority);
   const pin = pinnedRoot ?? PinnedProjectRoot.open(root);
   if (!pin || !pin.isStable()) { if (!pinnedRoot) pin?.close(); return bridgeLeaseNotOwned(); }
   const identity = { lexicalRoot: pin.lexical_root, canonicalRoot: pin.canonical_root, rootDev: pin.dev, rootIno: pin.ino };
@@ -4945,13 +4947,13 @@ export function writeBridgeLock(root: string, pinnedRoot?: PinnedProjectRoot): B
     outbox_run_id: null,
     outbox_cursor: null,
   };
-  const first = signBridgeLease(pin, firstUnsigned);
+  const first = proofAuthority ? signBridgeLease(proofAuthority, firstUnsigned) : null;
   if (!first) { queue.close(); if (!pinnedRoot) pin.close(); return bridgeLeaseNotOwned(); }
   const secretRecord = (epoch: number): BridgeSecretRecord => ({ schema: 1, root_identity: identity.canonicalRoot, root_dev: identity.rootDev, root_ino: identity.rootIno, token, epoch, session_id: sessionId, secret });
   const install = (record: BridgeLeaseRecord): BridgeLeaseHandle => {
     if (!bridgeRootMatchesPinnedRoot(root, pin, identity) || !writeBridgeSecret(root, secretRecord(record.epoch), pin) || !bridgeRootMatchesPinnedRoot(root, pin, identity)) return bridgeLeaseNotOwned();
     bridgeLeases.set(root, { root, ...identity, token, epoch: record.epoch, session_id: sessionId, secret });
-    const current = readBridgeLease(root, pin);
+    const current = readBridgeLease(root, pin, proofAuthority);
     if (!current?.record || !bridgeRecordMatchesPinnedRoot(root, pin, current.record) || current.record.token !== token || current.record.epoch !== record.epoch || !pin.isStable()) {
       bridgeLeases.delete(root);
       return bridgeLeaseNotOwned();
@@ -4975,8 +4977,9 @@ export function writeBridgeLock(root: string, pinnedRoot?: PinnedProjectRoot): B
     } catch (error) {
       if (!(error instanceof BoundedQueueError && error.code === "exists")) return bridgeLeaseNotOwned();
     }
-    const current = readBridgeLease(root, pin);
-    if (!current || (current.record && !bridgeRecordMatchesPinnedRoot(root, pin, current.record))) return bridgeLeaseNotOwned();
+    const current = readBridgeLease(root, pin, proofAuthority);
+    if (!current || current.status === "invalid" || (current.record && !bridgeRecordMatchesPinnedRoot(root, pin, current.record))) return bridgeLeaseNotOwned();
+    if (current.status === "valid" && !current.read) return bridgeLeaseNotOwned();
     if (current.record && bridgeLeaseAlive(current.record)) {
       const known = bridgeLeases.get(root);
       if (known && known.token === current.record.token && known.epoch === current.record.epoch) return bridgeLeaseHandle(current.record);
@@ -4984,9 +4987,9 @@ export function writeBridgeLock(root: string, pinnedRoot?: PinnedProjectRoot): B
     }
     const epoch = current.record ? current.record.epoch + 1 : 1;
     const { proof: _proof, ...firstWithoutProof } = first;
-    const next = signBridgeLease(pin, { ...firstWithoutProof, epoch });
+    const next = proofAuthority ? signBridgeLease(proofAuthority, { ...firstWithoutProof, epoch }) : null;
     if (!next) return bridgeLeaseNotOwned();
-    queue.removeIfMatches("bridge.lock", queueExpected(current.read));
+    queue.removeIfMatches("bridge.lock", queueExpected(current.read!));
     queue.writeExclusive("bridge.lock", JSON.stringify(next, null, 2));
     const result = install(next);
     if (result.owned) return result;
@@ -5006,8 +5009,8 @@ export function writeBridgeLock(root: string, pinnedRoot?: PinnedProjectRoot): B
 }
 
 /** Remove only the exact bridge lease written by this process. */
-export function clearBridgeLock(root: string, suppliedHandle?: BridgeLeaseHandle, pinnedRoot?: PinnedProjectRoot): void {
-  sweepBridgeLeases();
+export function clearBridgeLock(root: string, suppliedHandle?: BridgeLeaseHandle, pinnedRoot?: PinnedProjectRoot, proofAuthority?: CtoRuntimeProofAuthority): void {
+  sweepBridgeLeases(proofAuthority);
   const owned = bridgeLeases.get(root);
   if (suppliedHandle && !suppliedHandle.owned) return;
   const suppliedMatchesOwned = owned !== undefined
@@ -5021,8 +5024,8 @@ export function clearBridgeLock(root: string, suppliedHandle?: BridgeLeaseHandle
   try {
     const expectedToken = suppliedHandle?.token ?? owned?.token;
     const expectedEpoch = suppliedHandle?.epoch ?? owned?.epoch;
-    const current = readBridgeLease(root, pin);
-    if (!current?.record || !bridgeLeaseProofMatches(pin, current.record) || (owned && !bridgeRootMatchesPinnedRoot(root, pin, owned)) || !bridgeRecordMatchesPinnedRoot(root, pin, current.record)) return;
+    const current = readBridgeLease(root, pin, proofAuthority);
+    if (!current?.record || !current.read || !Boolean(proofAuthority && bridgeLeaseProofMatches(proofAuthority, current.record)) || (owned && !bridgeRootMatchesPinnedRoot(root, pin, owned)) || !bridgeRecordMatchesPinnedRoot(root, pin, current.record)) return;
     if (typeof expectedToken !== "string" || !Number.isSafeInteger(expectedEpoch) || current.record.token !== expectedToken || current.record.epoch !== expectedEpoch) return;
     const queue = openControlQueue(root, false, pin);
     if (!queue) return;
@@ -5137,112 +5140,13 @@ function canonicalAuthJson(value: unknown): string {
   return JSON.stringify(canonicalize(value));
 }
 
-const INBOX_AUTH_KEY_SCHEMA = 1;
-interface InboxAuthKeyRecord {
-  schema: 1;
-  root_identity: string;
-  root_dev: number;
-  root_ino: number;
-  secret: string;
-}
+const INBOX_AUTH_PROOF_DOMAIN = "cto-inbox-auth-v1" as const;
 
-/**
- * Auth keys are immutable-root scoped and expensive to validate through the
- * protected home descriptor. Keep a small process-local LRU of records that
- * already passed the 0700/0600 anchored checks. The key deliberately excludes
- * lexical paths: canonical root + device/inode is the only reusable identity.
- * A PinnedProjectRoot stability check remains mandatory at every lookup.
- */
-const INBOX_AUTH_CACHE_LIMIT = 64;
-const inboxAuthSecretCache = new Map<string, InboxAuthKeyRecord>();
-
-function inboxAuthCacheKey(pinnedRoot: PinnedProjectRoot): string | null {
-  if (!pinnedRoot.isStable()) return null;
-  return `${pinnedRoot.canonical_root}\0${pinnedRoot.dev}\0${pinnedRoot.ino}`;
-}
-
-function cachedInboxAuthKey(pinnedRoot: PinnedProjectRoot): InboxAuthKeyRecord | null {
-  const key = inboxAuthCacheKey(pinnedRoot);
-  if (!key) return null;
-  const cached = inboxAuthSecretCache.get(key);
-  if (!cached || !inboxAuthKeyMatches(pinnedRoot, cached)) return null;
-  // Map insertion order is the bounded LRU order.
-  inboxAuthSecretCache.delete(key);
-  inboxAuthSecretCache.set(key, cached);
-  return cached;
-}
-
-function cacheInboxAuthKey(pinnedRoot: PinnedProjectRoot, record: InboxAuthKeyRecord): void {
-  const key = inboxAuthCacheKey(pinnedRoot);
-  if (!key || !inboxAuthKeyMatches(pinnedRoot, record)) return;
-  inboxAuthSecretCache.delete(key);
-  inboxAuthSecretCache.set(key, record);
-  while (inboxAuthSecretCache.size > INBOX_AUTH_CACHE_LIMIT) {
-    const oldest = inboxAuthSecretCache.keys().next().value as string | undefined;
-    if (oldest === undefined) break;
-    inboxAuthSecretCache.delete(oldest);
-  }
-}
-
-function inboxAuthKeyFile(root: string, pinnedRoot: PinnedProjectRoot): string | null {
-  if (!pinnedRoot.isStable()) return null;
-  const identity = `${pinnedRoot.canonical_root}\0${pinnedRoot.dev}\0${pinnedRoot.ino}`;
-  const digest = createHash("sha256").update(identity, "utf8").digest("hex");
-  return join(homedir(), ".omp", "runtime-secrets", digest + ".inbox-auth.json");
-}
-
-function parseInboxAuthKey(value: unknown): InboxAuthKeyRecord | null {
-  if (!exactObjectKeys(value, ["root_dev", "root_identity", "root_ino", "schema", "secret"])) return null;
-  const record = value as Record<string, unknown>;
-  if (record.schema !== INBOX_AUTH_KEY_SCHEMA
-    || typeof record.root_identity !== "string"
-    || record.root_identity.length === 0
-    || record.root_identity.length > RUNTIME_SECRET_ROOT_IDENTITY_MAX_CHARS
-    || !Number.isSafeInteger(record.root_dev) || (record.root_dev as number) < 0
-    || !Number.isSafeInteger(record.root_ino) || (record.root_ino as number) < 0
-    || typeof record.secret !== "string" || record.secret.length < 32
-    || record.secret.length > RUNTIME_SECRET_VALUE_MAX_CHARS) return null;
-  return { schema: 1, root_identity: record.root_identity, root_dev: record.root_dev as number, root_ino: record.root_ino as number, secret: record.secret };
-}
-
-function inboxAuthKeyMatches(pinnedRoot: PinnedProjectRoot, record: InboxAuthKeyRecord): boolean {
-  return pinnedRoot.isStable()
-    && record.root_identity === pinnedRoot.canonical_root
-    && record.root_dev === pinnedRoot.dev
-    && record.root_ino === pinnedRoot.ino;
-}
-
-function readOrCreateInboxAuthSecret(root: string, pinnedRoot: PinnedProjectRoot, lease: BridgeLeaseRecord): string | null {
-  if (!pinnedRoot.isStable() || !bridgeRecordMatchesPinnedRoot(root, pinnedRoot, lease)) return null;
-  const cached = cachedInboxAuthKey(pinnedRoot);
-  if (cached && bridgeRecordMatchesPinnedRoot(root, pinnedRoot, lease)) return cached.secret;
-  const secret = readOrCreateRootRuntimeSecret(pinnedRoot);
-  if (!secret || !pinnedRoot.isStable() || !bridgeRecordMatchesPinnedRoot(root, pinnedRoot, lease)) return null;
-  cacheInboxAuthKey(pinnedRoot, { schema: 1, root_identity: pinnedRoot.canonical_root, root_dev: pinnedRoot.dev, root_ino: pinnedRoot.ino, secret });
-  return secret;
-}
-
-/** Durable envelopes remain verifiable after the bridge lease is cleared. */
-function readInboxAuthSecret(root: string, pinnedRoot: PinnedProjectRoot): string | null {
-  if (!pinnedRoot.isStable()) return null;
-  const cached = cachedInboxAuthKey(pinnedRoot);
-  if (cached) return cached.secret;
-  const secret = readOrCreateRootRuntimeSecret(pinnedRoot);
-  if (!secret || !pinnedRoot.isStable()) return null;
-  cacheInboxAuthKey(pinnedRoot, { schema: 1, root_identity: pinnedRoot.canonical_root, root_dev: pinnedRoot.dev, root_ino: pinnedRoot.ino, secret });
-  return secret;
-}
-
-/** Shared protected key for Telegram mapping proofs; never read from workspace files. */
-export function readTelegramMappingProofSecret(root: string, pinnedRoot: PinnedProjectRoot): string | null {
-  if (!pinnedRoot.isStable()) return null;
-  const lease = readBridgeLease(root, pinnedRoot)?.record;
-  const master = lease ? readOrCreateInboxAuthSecret(root, pinnedRoot, lease) : readInboxAuthSecret(root, pinnedRoot);
-  return master ? deriveRuntimeSecretKey(master, "telegram-mapping-v1") : null;
-}
-
-function authMac(secret: string, payload: Omit<AuthenticatedInboxEnvelope, "auth"> & { auth: { session_id: string; nonce: string; mode: "durable" } | { session_id: string; nonce: string } }): string {
-  return createHmac("sha256", secret).update(canonicalAuthJson(payload), "utf8").digest("hex");
+function authMac(
+  authority: CtoRuntimeProofAuthority,
+  payload: Omit<AuthenticatedInboxEnvelope, "auth"> & { auth: { session_id: string; nonce: string; mode: "durable" } | { session_id: string; nonce: string } },
+): string | null {
+  return signCtoRuntimeProof(authority, INBOX_AUTH_PROOF_DOMAIN, canonicalAuthJson(payload));
 }
 
 /** Create an authenticated bridge drop; the secret never leaves the lock file. */
@@ -5250,12 +5154,15 @@ export function createAuthenticatedInboxEnvelope(
   root: string,
   kind: "task" | "answer",
   input: { id: string; text: string; at: string; by?: string; run_id: string },
-  suppliedPin?: PinnedProjectRoot,
+  suppliedPin: PinnedProjectRoot | undefined,
+  proofAuthority: CtoRuntimeProofAuthority,
 ): AuthenticatedInboxEnvelope {
+  if (!isCtoRuntimeProofAuthority(proofAuthority)) throw new Error("bridge proof authority is unavailable");
+  assertCtoRuntimeProofAuthorityLive(proofAuthority);
   const pin = suppliedPin ?? PinnedProjectRoot.open(root);
   if (!pin || !pin.isStable()) { if (!suppliedPin) pin?.close(); throw new Error("bridge authentication lease unavailable"); }
   try {
-    const current = readBridgeLease(root, pin);
+    const current = readBridgeLease(root, pin, proofAuthority);
     const owned = bridgeLeases.get(root);
     if (!current?.record || !owned
       || owned.token !== current.record.token
@@ -5264,11 +5171,12 @@ export function createAuthenticatedInboxEnvelope(
       || !bridgeRootMatchesPinnedRoot(root, pin, owned)
       || !bridgeRecordMatchesPinnedRoot(root, pin, current.record)
       || !bridgeLeaseAlive(current.record)) throw new Error("bridge authentication lease unavailable");
-    const secret = readOrCreateInboxAuthSecret(root, pin, current.record);
-    if (!secret || !bridgeRootMatchesPinnedRoot(root, pin, owned) || !bridgeRecordMatchesPinnedRoot(root, pin, current.record)) throw new Error("bridge authentication lease unavailable");
+    if (!bridgeRootMatchesPinnedRoot(root, pin, owned) || !bridgeRecordMatchesPinnedRoot(root, pin, current.record)) throw new Error("bridge authentication lease unavailable");
     const body = { schema: 2 as const, kind, id: input.id, text: input.text, at: input.at, by: input.by ?? "telegram-bridge", run_id: input.run_id };
     const auth = { session_id: current.record.session_id, nonce: randomBytes(24).toString("base64url"), mode: "durable" as const };
-    return { ...body, auth: { ...auth, mac: authMac(secret, { ...body, auth: { session_id: auth.session_id, nonce: auth.nonce, mode: auth.mode } }) } };
+    const mac = authMac(proofAuthority, { ...body, auth: { session_id: auth.session_id, nonce: auth.nonce, mode: auth.mode } });
+    if (!mac) throw new Error("bridge proof authority is unavailable");
+    return { ...body, auth: { ...auth, mac } };
   } finally {
     if (!suppliedPin) pin.close();
   }
@@ -5381,10 +5289,10 @@ function normalizePolledAnswer(value: unknown): Pick<EscalationAnswer, "id" | "r
 /** Verify the exact bridge auth lease that signed a just-created envelope
  * is still current. Session id alone is not enough: token and epoch fence a
  * same-session replacement on the same inode. */
-export function isBridgeAuthenticationLeaseCurrent(root: string, pinnedRoot: PinnedProjectRoot, sessionId: string): boolean {
+export function isBridgeAuthenticationLeaseCurrent(root: string, pinnedRoot: PinnedProjectRoot, sessionId: string, proofAuthority: CtoRuntimeProofAuthority): boolean {
   if (!pinnedRoot.isStable() || typeof sessionId !== "string" || sessionId.length === 0) return false;
   const owned = bridgeLeases.get(root);
-  const current = readBridgeLease(root, pinnedRoot);
+  const current = readBridgeLease(root, pinnedRoot, proofAuthority);
   return Boolean(owned && current?.record
     && owned.token === current.record.token
     && owned.epoch === current.record.epoch
@@ -5407,34 +5315,20 @@ export function verifyAuthenticatedInboxEnvelope(
   root: string,
   raw: unknown,
   kind: "task" | "answer",
-  pinnedRoot?: PinnedProjectRoot,
-  maxTextLength = MAX_INBOX_TEXT_LENGTH,
-  allowEmpty = false,
+  pinnedRoot: PinnedProjectRoot | undefined,
+  maxTextLength: number,
+  allowEmpty: boolean,
+  proofAuthority: CtoRuntimeProofAuthority,
 ): AuthenticatedInboxEnvelope | null {
+  if (!isCtoRuntimeProofAuthority(proofAuthority)) return null;
+  try { assertCtoRuntimeProofAuthorityLive(proofAuthority); } catch { return null; }
   if (!raw || typeof raw !== "object" || !pinnedRoot?.isStable()) return null;
   const value = raw as Partial<AuthenticatedInboxEnvelope>;
   if (value.schema !== 2 || value.kind !== kind || typeof value.id !== "string" || value.id.length === 0 || !isAuthenticatedInboxText(value.text, maxTextLength, allowEmpty) || typeof value.at !== "string" || typeof value.by !== "string" || typeof value.run_id !== "string" || !safeRunId(value.run_id)) return null;
   const auth = value.auth;
-  if (!auth || typeof auth !== "object" || typeof auth.session_id !== "string" || typeof auth.nonce !== "string" || auth.nonce.length < 16 || typeof auth.mac !== "string" || !/^[0-9a-f]{64}$/i.test(auth.mac) || (auth.mode !== undefined && auth.mode !== "durable")) return null;
+  if (!auth || typeof auth !== "object" || typeof auth.session_id !== "string" || typeof auth.nonce !== "string" || auth.nonce.length < 16 || typeof auth.mac !== "string" || !/^[0-9a-f]{64}$/i.test(auth.mac) || auth.mode !== "durable") return null;
   const body = { schema: 2 as const, kind, id: value.id, text: value.text, at: value.at, by: value.by, run_id: value.run_id };
-  let expected: string | null = null;
-  let current: { record: BridgeLeaseRecord | null } | null = null;
-  if (auth.mode === "durable") {
-    const secret = readInboxAuthSecret(root, pinnedRoot);
-    if (!secret) return null;
-    expected = authMac(secret, { ...body, auth: { session_id: auth.session_id, nonce: auth.nonce, mode: "durable" } });
-  } else {
-    // Legacy session-HMAC envelopes are accepted only while their original
-    // live lease is still present; callers may then CAS-upgrade them.
-    current = readBridgeLease(root, pinnedRoot);
-    if (!current?.record || !bridgeRecordMatchesPinnedRoot(root, pinnedRoot, current.record) || !bridgeLeaseAlive(current.record) || auth.session_id !== current.record.session_id) return null;
-    const secret = readBridgeSecret(root, current.record, pinnedRoot);
-    if (!secret) return null;
-    expected = authMac(secret, { ...body, auth: { session_id: auth.session_id, nonce: auth.nonce } });
-  }
-  const expectedBytes = Buffer.from(expected, "hex");
-  const actualBytes = Buffer.from(auth.mac, "hex");
-  if (expectedBytes.length !== actualBytes.length || !timingSafeEqual(expectedBytes, actualBytes)) return null;
+  if (!verifyCtoRuntimeProof(proofAuthority, INBOX_AUTH_PROOF_DOMAIN, canonicalAuthJson({ ...body, auth: { session_id: auth.session_id, nonce: auth.nonce, mode: "durable" } }), auth.mac)) return null;
   if (!pinnedRoot.isStable()) return null;
   return { schema: 2, kind, id: value.id, text: value.text, at: value.at, by: value.by, run_id: value.run_id, auth: { session_id: auth.session_id, nonce: auth.nonce, mac: auth.mac, ...(auth.mode === "durable" ? { mode: "durable" as const } : {}) } };
 }
@@ -5879,12 +5773,10 @@ interface WakeEffectReservation {
   alreadyDelivered: boolean;
 }
 
-function wakeEffectProof(pinnedRoot: PinnedProjectRoot, record: Omit<WakeEffectRecord, "proof">): string | null {
-  const master = readOrCreateRootRuntimeSecret(pinnedRoot);
-  if (!master) return null;
-  const key = deriveRuntimeSecretKey(master, "cto-wake-effect-v1");
-  if (!key) return null;
-  return createHmac("sha256", key).update(canonicalAuthJson({
+const WAKE_EFFECT_PROOF_DOMAIN = "cto-wake-effect-v1" as const;
+
+function wakeEffectProof(authority: CtoRuntimeProofAuthority, record: Omit<WakeEffectRecord, "proof">): string | null {
+  return signCtoRuntimeProof(authority, WAKE_EFFECT_PROOF_DOMAIN, canonicalAuthJson({
     schema: record.schema,
     status: record.status,
     identity: record.identity,
@@ -5892,24 +5784,30 @@ function wakeEffectProof(pinnedRoot: PinnedProjectRoot, record: Omit<WakeEffectR
     attempts: record.attempts,
     retryable: record.retryable === true,
     answer: record.answer ?? null,
-  }), "utf8").digest("hex");
+  }));
 }
 
-function authenticatedWakeEffect(pinnedRoot: PinnedProjectRoot, record: Partial<WakeEffectRecord>): record is WakeEffectRecord {
-  if (typeof record.run_id !== "string" || typeof record.proof !== "string") return false;
-  const state = readCtoStatePinned(record.run_id, pinnedRoot);
-  if (!state || !hasValidCtoRuntimeStateProofPinned(pinnedRoot, state)) return false;
-  const expected = wakeEffectProof(pinnedRoot, record as Omit<WakeEffectRecord, "proof">);
-  if (!expected) return false;
-  try {
-    const actual = Buffer.from(record.proof, "hex");
-    const wanted = Buffer.from(expected, "hex");
-    return actual.length === wanted.length && timingSafeEqual(actual, wanted);
-  } catch { return false; }
+function authenticatedWakeEffect(
+  authority: CtoRuntimeProofAuthority,
+  runtimeAccess: RuntimeAccess | undefined,
+  record: Partial<WakeEffectRecord>,
+): record is WakeEffectRecord {
+  if (typeof record.run_id !== "string" || typeof record.proof !== "string" || !runtimeAccess) return false;
+  const state = runtimeAccess.readState(record.run_id);
+  if (!state || state.id !== record.run_id || !runtimeAccess.hasValidStateProof(record.run_id)) return false;
+  return verifyCtoRuntimeProof(authority, WAKE_EFFECT_PROOF_DOMAIN, canonicalAuthJson({
+    schema: record.schema,
+    status: record.status,
+    identity: record.identity,
+    run_id: record.run_id,
+    attempts: record.attempts,
+    retryable: record.retryable === true,
+    answer: record.answer ?? null,
+  }), record.proof);
 }
 
-function withWakeEffectProof(pinnedRoot: PinnedProjectRoot, record: Omit<WakeEffectRecord, "proof">): WakeEffectRecord {
-  const proof = wakeEffectProof(pinnedRoot, record);
+function withWakeEffectProof(authority: CtoRuntimeProofAuthority, record: Omit<WakeEffectRecord, "proof">): WakeEffectRecord {
+  const proof = wakeEffectProof(authority, record);
   if (!proof) throw new WakeEffectAmbiguousError(record.identity);
   return { ...record, proof };
 }
@@ -5918,8 +5816,10 @@ function reserveWakeEffect(
   root: string,
   runId: string,
   taskId: string,
-  suppliedPin?: PinnedProjectRoot,
-  answer?: Pick<EscalationAnswer, "id" | "run_id" | "answer">,
+  suppliedPin: PinnedProjectRoot | undefined,
+  answer: Pick<EscalationAnswer, "id" | "run_id" | "answer"> | undefined,
+  proofAuthority: CtoRuntimeProofAuthority,
+  runtimeAccess: RuntimeAccess,
 ): WakeEffectReservation {
   const pinnedRoot = suppliedPin ?? PinnedProjectRoot.open(root);
   if (!pinnedRoot) throw new WakeEffectAmbiguousError(taskId);
@@ -5930,15 +5830,15 @@ function reserveWakeEffect(
   }
   const fileName = sha256Hex(runId + "/" + taskId) + ".json";
   try {
-    const state = readCtoStatePinned(runId, pinnedRoot);
-    if (!state || !hasValidCtoRuntimeStateProofPinned(pinnedRoot, state)) throw new WakeEffectAmbiguousError(taskId);
+    const state = runtimeAccess.readState(runId);
+    if (!state || state.id !== runId || !runtimeAccess.hasValidStateProof(runId)) throw new WakeEffectAmbiguousError(taskId);
     if (!queue.exists(fileName)) {
-      const record = withWakeEffectProof(pinnedRoot, { schema: 1, status: "prepared", identity: taskId, run_id: runId, attempts: 1, ...(answer ? { answer } : {}) });
+      const record = withWakeEffectProof(proofAuthority, { schema: 1, status: "prepared", identity: taskId, run_id: runId, attempts: 1, ...(answer ? { answer } : {}) });
       queue.writeExclusive(fileName, JSON.stringify(record, null, 2));
       return { claim: { fileName }, alreadyDelivered: false };
     }
     const current = queue.readJson<WakeEffectRecord>(fileName);
-    if (!authenticatedWakeEffect(pinnedRoot, current)) throw new WakeEffectAmbiguousError(taskId);
+    if (!authenticatedWakeEffect(proofAuthority, runtimeAccess, current)) throw new WakeEffectAmbiguousError(taskId);
     if (current.status === "delivered" && current.identity === taskId && current.run_id === runId) return { alreadyDelivered: true };
     if (current.status !== "prepared" || current.identity !== taskId || current.run_id !== runId || !Number.isInteger(current.attempts) || current.attempts < 1) throw new WakeEffectAmbiguousError(taskId);
     if (current.retryable === true && answer && current.answer?.id === answer.id && current.answer.answer === answer.answer) return { claim: { fileName }, alreadyDelivered: false };
@@ -5986,7 +5886,7 @@ function removeInboxTaskFile(root: string, runId: string, task: InboxTask, suppl
   }
 }
 
-function markWakeEffectDelivered(root: string, runId: string, claim: WakeEffectClaim, taskId: string, suppliedPin?: PinnedProjectRoot): void {
+function markWakeEffectDelivered(root: string, runId: string, claim: WakeEffectClaim, taskId: string, suppliedPin: PinnedProjectRoot | undefined, proofAuthority: CtoRuntimeProofAuthority, runtimeAccess: RuntimeAccess): void {
   const pinnedRoot = suppliedPin ?? PinnedProjectRoot.open(root);
   if (!pinnedRoot) throw new WakeEffectAmbiguousError(taskId);
   const queue = openBoundedQueue(pinnedRoot.canonical_root, join(".work-state", "cto", runId, "wake-effects"), { createDirectory: false, pinnedRoot });
@@ -5996,13 +5896,13 @@ function markWakeEffectDelivered(root: string, runId: string, claim: WakeEffectC
   }
   try {
     const current = queue.readJson<WakeEffectRecord>(claim.fileName);
-    if (!authenticatedWakeEffect(pinnedRoot, current)) throw new WakeEffectAmbiguousError(taskId);
+    if (!authenticatedWakeEffect(proofAuthority, runtimeAccess, current)) throw new WakeEffectAmbiguousError(taskId);
     if (current.status === "delivered") return;
     if (current.status !== "prepared" || current.identity !== taskId || current.run_id !== runId) {
       throw new WakeEffectAmbiguousError(taskId);
     }
     const { proof: _proof, ...withoutProof } = current;
-    const next = withWakeEffectProof(pinnedRoot, { ...withoutProof, status: "delivered" });
+    const next = withWakeEffectProof(proofAuthority, { ...withoutProof, status: "delivered" });
     queue.replaceIfMatches(claim.fileName, queueExpected(queue.read(claim.fileName)), JSON.stringify(next, null, 2));
   } catch (error) {
     if (error instanceof WakeEffectAmbiguousError) throw error;
@@ -6018,7 +5918,9 @@ function markWakeEffectRetryable(
   runId: string,
   claim: WakeEffectClaim,
   answer: Pick<EscalationAnswer, "id" | "run_id" | "answer">,
-  suppliedPin?: PinnedProjectRoot,
+  suppliedPin: PinnedProjectRoot | undefined,
+  proofAuthority: CtoRuntimeProofAuthority,
+  runtimeAccess: RuntimeAccess,
 ): void {
   if (answer.run_id !== runId) throw new WakeEffectAmbiguousError(answer.id);
   const pinnedRoot = suppliedPin ?? PinnedProjectRoot.open(root);
@@ -6030,13 +5932,13 @@ function markWakeEffectRetryable(
   }
   try {
     const current = queue.readJson<WakeEffectRecord>(claim.fileName);
-    if (!authenticatedWakeEffect(pinnedRoot, current)) throw new WakeEffectAmbiguousError(answer.id);
+    if (!authenticatedWakeEffect(proofAuthority, runtimeAccess, current)) throw new WakeEffectAmbiguousError(answer.id);
     if (current.status === "delivered") return;
     if (current.status !== "prepared" || current.identity !== answer.id || current.run_id !== runId) {
       throw new WakeEffectAmbiguousError(answer.id);
     }
     const { proof: _proof, ...withoutProof } = current;
-    const next = withWakeEffectProof(pinnedRoot, { ...withoutProof, retryable: true, answer });
+    const next = withWakeEffectProof(proofAuthority, { ...withoutProof, retryable: true, answer });
     queue.replaceIfMatches(claim.fileName, queueExpected(queue.read(claim.fileName)), JSON.stringify(next, null, 2));
   } catch (error) {
     if (error instanceof WakeEffectAmbiguousError) throw error;
@@ -6097,8 +5999,8 @@ function acknowledgeInboxWake(root: string, runId: string, task: InboxTask, hash
 export function handleInboxTask(
   root: string,
   task: InboxTask,
-  onTask?: (t: InboxTask) => void | Promise<void>,
-  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; isOwned?: () => boolean; runtimeAccess?: RuntimeAccess } = {},
+  onTask: ((t: InboxTask) => void | Promise<void>) | undefined,
+  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; isOwned?: () => boolean; runtimeAccess?: RuntimeAccess; proofAuthority: CtoRuntimeProofAuthority },
 ): string | null | Promise<string | null> {
   const suppliedPin = opts.pinnedRoot;
   const pinnedRoot = suppliedPin ?? PinnedProjectRoot.open(root);
@@ -6109,6 +6011,9 @@ export function handleInboxTask(
   const isPromiseLike = (value: unknown): value is PromiseLike<unknown> => Boolean(value && (typeof value === "object" || typeof value === "function") && typeof (value as { then?: unknown }).then === "function");
   try {
     if (!pinnedRoot.isStable() || (opts.isOwned && !opts.isOwned())) return null;
+    if (opts.idempotentWake) {
+      try { assertCtoRuntimeProofAuthorityLive(opts.proofAuthority); } catch { return null; }
+    }
     const normalizedTask = normalizeInboundTask(task, ACTIVE_QUEUE_OPTIONS.maxEntryBytes, true);
     if (!normalizedTask) return null;
     task = normalizedTask;
@@ -6129,12 +6034,7 @@ export function handleInboxTask(
     const admission = opts.runtimeAccess.withRunTransaction(runId, (transaction) => admitInboxTaskUnderLock(root, runId, task, hash, claim, transaction, pinnedRoot));
     if (!admission) return null;
     if (admission.deferred) return admission.path;
-    const reservation = opts.idempotentWake ? reserveWakeEffect(root, runId, task.id, pinnedRoot) : undefined;
-    if (reservation?.alreadyDelivered) {
-      acknowledgeInboxWake(root, runId, task, hash, pinnedRoot, opts.runtimeAccess);
-      return admission.path;
-    }
-    const wakeEffect = reservation?.claim;
+    let wakeEffect: WakeEffectClaim | undefined;
     const rollbackWake = (error: unknown): never => {
       if (wakeEffect) releaseWakeEffect(root, runId, wakeEffect, pinnedRoot);
       try {
@@ -6155,17 +6055,28 @@ export function handleInboxTask(
       }
       throw error;
     };
+    let reservation: WakeEffectReservation | undefined;
+    try {
+      reservation = opts.idempotentWake ? reserveWakeEffect(root, runId, task.id, pinnedRoot, undefined, opts.proofAuthority, opts.runtimeAccess!) : undefined;
+    } catch (error) {
+      rollbackWake(error);
+    }
+    if (reservation?.alreadyDelivered) {
+      acknowledgeInboxWake(root, runId, task, hash, pinnedRoot, opts.runtimeAccess);
+      return admission.path;
+    }
+    wakeEffect = reservation?.claim;
     const acknowledgeWake = (): string => {
       try {
         if (!pinnedRoot.isStable() || (opts.isOwned && !opts.isOwned())) throw new Error("messenger dispatcher lease lost before task acknowledgement");
-        if (wakeEffect) markWakeEffectDelivered(root, runId, wakeEffect, task.id, pinnedRoot);
+        if (wakeEffect) markWakeEffectDelivered(root, runId, wakeEffect, task.id, pinnedRoot, opts.proofAuthority, opts.runtimeAccess!);
         acknowledgeInboxWake(root, runId, task, hash, pinnedRoot, opts.runtimeAccess);
       } catch (error) {
         if (isDispatcherActivationFailure(error)) throw error;
         throw new Error(`inbox task ${task.id} wake acknowledgement failed: ${error instanceof Error ? error.message : String(error)}`);
       }
       try {
-        const channelSet = createChannelSet(root, undefined, pinnedRoot, opts.runtimeAccess);
+        const channelSet = createChannelSet(root, undefined, pinnedRoot, opts.runtimeAccess, opts.proofAuthority);
         if (channelSet.profile.direction === "rw" && channelSet.primary !== null) {
           const excerpt = task.text.trim().slice(0, 200);
           queueCtoDelivery(root, runId, {
@@ -6289,7 +6200,7 @@ async function deliverAnswerWake(
   root: string,
   answer: Pick<EscalationAnswer, "id" | "run_id" | "answer">,
   onAnswer: ((answer: Pick<EscalationAnswer, "id" | "run_id" | "answer">) => void | Promise<void>) | undefined,
-  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; activeRunId?: string; activeStateRevision?: number; isOwned?: () => boolean; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess },
+  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; activeRunId?: string; activeStateRevision?: number; isOwned?: () => boolean; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess; proofAuthority: CtoRuntimeProofAuthority },
 ): Promise<AnswerWakeOutcome> {
   const runId = answer.run_id;
   if (!safeRunId(runId)) return "stale";
@@ -6318,7 +6229,7 @@ async function deliverAnswerWake(
   // a same-path root replacement cannot make a copied lock look live.
   if (opts.isOwned && !opts.isOwned()) return "retryable";
   const reservation = opts.idempotentWake
-    ? reserveWakeEffect(root, runId, answer.id, opts.pinnedRoot, answer)
+    ? reserveWakeEffect(root, runId, answer.id, opts.pinnedRoot, answer, opts.proofAuthority, opts.runtimeAccess!)
     : undefined;
   if (reservation?.alreadyDelivered) return "delivered";
   const claim = reservation?.claim;
@@ -6327,7 +6238,7 @@ async function deliverAnswerWake(
     // ownership changed; leave a claimed idempotent effect retryable for the
     // next owner instead of acknowledging a wake on a replaced root.
     if (opts.isOwned && !opts.isOwned()) {
-      if (claim) markWakeEffectRetryable(root, runId, claim, answer, opts.pinnedRoot);
+      if (claim) markWakeEffectRetryable(root, runId, claim, answer, opts.pinnedRoot, opts.proofAuthority, opts.runtimeAccess!);
       return "retryable";
     }
     await boundedAdapterCall(
@@ -6336,28 +6247,28 @@ async function deliverAnswerWake(
       opts.lifecycle?.trackUnderlyingCallback,
     );
     if (opts.isOwned && !opts.isOwned()) {
-      if (claim) markWakeEffectRetryable(root, runId, claim, answer, opts.pinnedRoot);
+      if (claim) markWakeEffectRetryable(root, runId, claim, answer, opts.pinnedRoot, opts.proofAuthority, opts.runtimeAccess!);
       return "retryable";
     }
   } catch (error) {
     if (isDispatcherActivationFailure(error)) throw error;
     if (claim) {
       try {
-        markWakeEffectRetryable(root, runId, claim, answer, opts.pinnedRoot);
+        markWakeEffectRetryable(root, runId, claim, answer, opts.pinnedRoot, opts.proofAuthority, opts.runtimeAccess!);
       } catch {
         // Keep the prepared effect when the retry marker cannot be published.
       }
     }
     throw error;
   }
-  if (claim) markWakeEffectDelivered(root, runId, claim, answer.id, opts.pinnedRoot);
+  if (claim) markWakeEffectDelivered(root, runId, claim, answer.id, opts.pinnedRoot, opts.proofAuthority, opts.runtimeAccess!);
   return "delivered";
 }
 
 async function replayPendingAnswerWakes(
   root: string,
   onAnswer: ((answer: Pick<EscalationAnswer, "id" | "run_id" | "answer">) => void | Promise<void>) | undefined,
-  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; isOwned?: () => boolean; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess },
+  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; isOwned?: () => boolean; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess; proofAuthority: CtoRuntimeProofAuthority },
 ): Promise<void> {
   if (!opts.idempotentWake) return;
   const pinnedRoot = opts.pinnedRoot ?? PinnedProjectRoot.open(root);
@@ -6406,9 +6317,9 @@ async function replayPendingAnswerWakes(
 export async function pollInbox(
   root: string,
   adapter: EscalationAdapter | null,
-  onTask?: (t: InboxTask) => void,
-  onAnswer?: (a: Pick<EscalationAnswer, "id" | "run_id" | "answer">) => void | Promise<void>,
-  opts: { isOwned?: () => boolean; idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; now?: RetryClock; pinnedRoot?: PinnedProjectRoot; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess; retryCursorStore?: Map<string, string | null> } = {},
+  onTask: ((t: InboxTask) => void) | undefined,
+  onAnswer: ((a: Pick<EscalationAnswer, "id" | "run_id" | "answer">) => void | Promise<void>) | undefined,
+  opts: { isOwned?: () => boolean; idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; now?: RetryClock; pinnedRoot?: PinnedProjectRoot; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess; retryCursorStore?: Map<string, string | null>; proofAuthority: CtoRuntimeProofAuthority },
 ): Promise<void> {
   const suppliedPollPin = opts.pinnedRoot;
   const pollPin = suppliedPollPin ?? PinnedProjectRoot.open(root);
@@ -6552,20 +6463,20 @@ export async function pollInbox(
               } else {
                 const task: InboxTask = { id: verifiedRetry.source.id, text: verifiedRetry.source.text, at: verifiedRetry.source.at, by: verifiedRetry.source.by, runId: verifiedRetry.source.run_id };
                 assertPollLive();
-                const outcome = await dispatchInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess });
+                const outcome = await dispatchInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, proofAuthority: opts.proofAuthority });
                 assertPollLive();
                 if (outcome === "retryable") throw new InboxTaskRetryableError();
                 if (outcome === "rejected") { discardPollEntry(dropQueue, name, observed?.expectation, rejectedDirectory); continue; }
               }
             } else {
               const isAnswer = Boolean(raw && typeof raw === "object" && (raw as { kind?: unknown }).kind === "answer");
-              envelope = verifyAuthenticatedInboxEnvelope(root, raw, isAnswer ? "answer" : "task", pollPin);
+              envelope = verifyAuthenticatedInboxEnvelope(root, raw, isAnswer ? "answer" : "task", pollPin, ACTIVE_QUEUE_OPTIONS.maxEntryBytes, false, opts.proofAuthority);
               // Keep the public verifier strict while allowing a bounded,
               // authenticated oversized task to reach handleInboxTask. That
               // path records the durable rejection reason instead of silently
               // discarding a validly signed producer envelope.
               if (!envelope && !isAnswer) {
-                envelope = verifyAuthenticatedInboxEnvelope(root, raw, "task", pollPin, ACTIVE_QUEUE_OPTIONS.maxEntryBytes, true);
+                envelope = verifyAuthenticatedInboxEnvelope(root, raw, "task", pollPin, ACTIVE_QUEUE_OPTIONS.maxEntryBytes, true, opts.proofAuthority);
               }
               if (!envelope) {
                 discardPollEntry(dropQueue, name, observed?.expectation, rejectedDirectory);
@@ -6606,7 +6517,7 @@ export async function pollInbox(
                 if (envelope.text.trim().length === 0 || envelope.text.length > MAX_INBOX_TEXT_LENGTH) {
                   try {
                     assertPollLive();
-                    await handleInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess });
+                    await handleInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, proofAuthority: opts.proofAuthority });
                     assertPollLive();
                   } catch (error) {
                     if (error instanceof InboxTaskRetryableError || !pollPin.isStable() || (opts.isOwned && !opts.isOwned())) throw error instanceof InboxTaskRetryableError ? error : new InboxTaskRetryableError();
@@ -6616,7 +6527,7 @@ export async function pollInbox(
                   continue;
                 }
                 assertPollLive();
-                const outcome = await dispatchInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess });
+                const outcome = await dispatchInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, proofAuthority: opts.proofAuthority });
                 assertPollLive();
                 if (outcome === "retryable") throw new InboxTaskRetryableError();
                 if (outcome === "rejected") { discardPollEntry(dropQueue, name, observed?.expectation, rejectedDirectory); continue; }
@@ -6659,7 +6570,7 @@ export async function pollInbox(
   //    fake-RW mock, consumer transports) has no getUpdates consumer and is
   //    polled REGARDLESS of the lock, so a live tg bridge never suppresses a
   //    configured RW channel's inbound delivery.
-  const bridgeOwnsPoll = adapter !== null && adapter.kind === "telegram" && isBridgeAlive(root, pollPin ?? undefined);
+  const bridgeOwnsPoll = adapter !== null && adapter.kind === "telegram" && isBridgeAlive(root, pollPin ?? undefined, opts.proofAuthority);
   if (adapter && !bridgeOwnsPoll && isPollOnceCapable(adapter)) {
     const adapterPin = pollPin;
     if (!adapterPin) return;

@@ -16,7 +16,7 @@
  * `fetchImpl` is injectable for tests; defaults to global fetch.
  */
 
-import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { TextDecoder } from "node:util";
 import { join } from "node:path";
 import {
@@ -38,7 +38,12 @@ import {
   type PlainTextSendOutcome,
 } from "@andvl1/omp-workflows-core";
 import type { AdapterOperationContext } from "./registry.js";
-import type { CtoRuntimeAccessFacade } from "@andvl1/omp-workflows-core/cto-runtime";
+import {
+  assertCtoRuntimeProofAuthorityLive,
+  isCtoRuntimeProofAuthority,
+  type CtoRuntimeAccessFacade,
+  type CtoRuntimeProofAuthority,
+} from "@andvl1/omp-workflows-core/cto-runtime";
 
 import {
   BoundedQueueError,
@@ -46,7 +51,10 @@ import {
   openBoundedQueue,
   type BoundedQueue,
 } from "@andvl1/omp-workflows-core/queue";
-import { readOrCreateProtectedTelegramMappingSecret } from "./mapping-secret.js";
+import {
+  signTelegramMappingProof,
+  verifyTelegramMappingProof,
+} from "./mapping-secret.js";
 
 function decodeTelegramUtf8(bytes: Uint8Array): string {
   return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -128,8 +136,8 @@ export interface TelegramAdapterOptions {
   allowedSenderIds?: Array<string | number>;
   /** Authenticated main-session runtime used for run-delivery authority. */
   runtimeAccess?: CtoRuntimeAccessFacade;
-  /** Protected cross-process key shared by the sender and Telegram bridge. */
-  mappingProofSecret?: string;
+  /** Opaque root/workflow_tools authority for Telegram mapping proofs. */
+  proofAuthority: CtoRuntimeProofAuthority;
   /** Called after one bounded update is durably handled and before offset advancement. */
   onUpdateCommitted?: TelegramUpdateCommitHook;
   /** Initial Telegram update offset restored from a route-bound checkpoint. */
@@ -288,7 +296,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   private readonly allowedChatIds: string[];
   private readonly allowedSenderIds: string[];
   private readonly runtimeAccess?: CtoRuntimeAccessFacade;
-  private readonly mappingProofSecret?: string;
+  private readonly proofAuthority: CtoRuntimeProofAuthority;
   private onUpdateCommitted?: TelegramUpdateCommitHook;
   private onPlainMessage: TelegramAdapterOptions["onPlainMessage"];
   private onAnswer?: (answer: EscalationAnswer, pinnedRoot?: PinnedProjectRoot) => void | Promise<void>;
@@ -304,18 +312,11 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     this.chatId = options.chatId;
     this.cwd = options.cwd;
     this.runtimeAccess = options.runtimeAccess;
-    if (options.mappingProofSecret !== undefined) {
-      if (typeof options.mappingProofSecret !== "string" || options.mappingProofSecret.length < 32 || options.mappingProofSecret.length > 512) {
-        throw new Error("telegram: mapping proof secret is invalid");
-      }
-      this.mappingProofSecret = options.mappingProofSecret;
-    } else {
-      const pin = PinnedProjectRoot.open(this.cwd);
-      if (pin) {
-        try { this.mappingProofSecret = readOrCreateProtectedTelegramMappingSecret(pin) ?? undefined; }
-        finally { pin.close(); }
-      }
+    if (!isCtoRuntimeProofAuthority(options.proofAuthority)) {
+      throw new Error("telegram: mapping proof authority is unavailable");
     }
+    assertCtoRuntimeProofAuthorityLive(options.proofAuthority);
+    this.proofAuthority = options.proofAuthority;
     this.onUpdateCommitted = options.onUpdateCommitted;
     if (options.initialOffset !== undefined) {
       if (!Number.isSafeInteger(options.initialOffset) || options.initialOffset < 0) throw new Error("telegram: initial offset is invalid");
@@ -565,6 +566,14 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   }
 
 
+  private assertProofAuthorityLive(): void {
+    try {
+      assertCtoRuntimeProofAuthorityLive(this.proofAuthority);
+    } catch (error) {
+      throw new TelegramActivationRevokedError("telegram mapping proof authority is no longer live", { cause: error });
+    }
+  }
+
   private assertLive(pinnedRoot: PinnedProjectRoot, lifecycle?: AdapterOperationContext): void {
     try {
       lifecycle?.assertLive?.();
@@ -641,7 +650,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   async send(esc: Escalation, suppliedPin?: PinnedProjectRoot, lifecycle?: AdapterOperationContext): Promise<EscalationReceipt> {
     const validation = validateTelegramEscalation(esc, this.mappingMaxEntryBytes, this.chatId);
     if (validation) return invalidTelegramEscalationReceipt(validation);
-    if (!this.mappingProofSecret) return { sent: false, channelRef: "tg:mapping-proof-unavailable" };
+    this.assertProofAuthorityLive();
     const pinnedRoot = suppliedPin ?? PinnedProjectRoot.open(this.cwd);
     if (!pinnedRoot) return { sent: false, channelRef: "tg:send-root-unavailable" };
     const ownsPin = suppliedPin === undefined;
@@ -673,7 +682,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   async sendWithIdempotency(esc: Escalation, idempotencyKey: string, suppliedPin?: PinnedProjectRoot, lifecycle?: AdapterOperationContext): Promise<EscalationReceipt> {
     const validation = validateTelegramEscalation(esc, this.mappingMaxEntryBytes, this.chatId);
     if (validation) return invalidTelegramEscalationReceipt(validation);
-    if (!this.mappingProofSecret) return { sent: false, channelRef: "tg:mapping-proof-unavailable" };
+    this.assertProofAuthorityLive();
     const pinnedRoot = suppliedPin ?? PinnedProjectRoot.open(this.cwd);
     if (!pinnedRoot) return { sent: false, channelRef: "tg:send-root-unavailable" };
     const ownsPin = suppliedPin === undefined;
@@ -1357,7 +1366,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     assertLive();
     this.ensureChatMappingMigrated(runId, this.chatId, pinnedRoot);
     assertLive();
-    if (!this.mappingProofSecret) throw new Error("telegram: mapping proof secret is unavailable");
+    this.assertProofAuthorityLive();
     const queue = this.openMappingQueue(runId, this.chatId, true, pinnedRoot);
     assertLive();
     if (!queue) throw new Error(`telegram: mapping queue for run "${runId}" is unavailable or unsafe`);
@@ -1377,7 +1386,9 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
         receipt: mappingReceipt,
       },
     };
-    const mapping: TelegramMappingRecord = { ...unsigned, proof: telegramMappingProof(unsigned, this.mappingProofSecret) };
+    const proof = telegramMappingProof(unsigned, this.proofAuthority);
+    if (!proof) throw new TelegramActivationRevokedError("telegram mapping proof authority is unavailable");
+    const mapping: TelegramMappingRecord = { ...unsigned, proof };
     const line = `${JSON.stringify(mapping)}\n`;
     if (Buffer.byteLength(line, "utf8") > this.mappingMaxEntryBytes) {
       queue.close();
@@ -1400,7 +1411,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
         const existingByEsc = snapshot.records.find((entry) => entry.escId === escId);
         if (existingByEsc) {
           if (existingByEsc.messageId !== messageId || existingByEsc.chatId !== this.chatId
-            || !telegramMappingProofMatches(existingByEsc, pinnedRoot, unsigned.route!, this.mappingProofSecret)
+            || !telegramMappingProofMatches(existingByEsc, pinnedRoot, unsigned.route!, this.proofAuthority)
             || existingByEsc.delivery?.payload_digest !== payloadDigest) {
             throw new Error(`telegram: mapping for "${escId}" conflicts with message ${String(messageId)} or its proof`);
           }
@@ -1507,7 +1518,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       if (!pinnedRoot.isStable()) return null;
       const snapshot = readTelegramMapSnapshot(queue, runId, this.chatId);
       const mapping = snapshot.records.find((entry) => entry.escId === escId);
-      return mapping && telegramMappingProofMatches(mapping, pinnedRoot, this.mappingRouteBinding(), this.mappingProofSecret) ? mapping.messageId : null;
+      return mapping && telegramMappingProofMatches(mapping, pinnedRoot, this.mappingRouteBinding(), this.proofAuthority) ? mapping.messageId : null;
     } catch {
       return null;
     } finally {
@@ -1631,7 +1642,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
           const route = this.mappingRouteBinding();
           for (const mapping of snapshot.records) {
             if (!isSafeEscalationId(mapping.escId) || telegramMessageKey(mapping.chatId, mapping.messageId) !== messageKey) continue;
-            if (!telegramMappingProofMatches(mapping, pinnedRoot, route, this.mappingProofSecret)) {
+            if (!telegramMappingProofMatches(mapping, pinnedRoot, route, this.proofAuthority)) {
               untrustedMessageEscIds.add(mapping.escId);
               continue;
             }
@@ -1705,7 +1716,8 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   }
 
   private recoverPendingTelegramMapping(marker: TelegramCorrelationMarker, messageId: number, chatId: string, pinnedRoot: PinnedProjectRoot): TelegramAnswerTarget | null {
-    if (!this.mappingProofSecret || !this.runtimeAccess || !isSafeEscalationId(marker.escId) || !Number.isSafeInteger(messageId) || messageId <= 0) return null;
+    if (!this.runtimeAccess || !isSafeEscalationId(marker.escId) || !Number.isSafeInteger(messageId) || messageId <= 0) return null;
+    try { this.assertProofAuthorityLive(); } catch { return null; }
     const runId = marker.escId.split("/")[0];
     if (!runId || !isSafeCtoRunId(runId)) return null;
     try {
@@ -1768,7 +1780,9 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
           receipt: mappingReceipt,
         },
       };
-      const mapping: TelegramMappingRecord = { ...unsigned, proof: telegramMappingProof(unsigned, this.mappingProofSecret) };
+      const proof = telegramMappingProof(unsigned, this.proofAuthority);
+      if (!proof) return null;
+      const mapping: TelegramMappingRecord = { ...unsigned, proof };
       const queue = this.openMappingQueue(runId, chatId, false, pinnedRoot);
       if (!queue) {
         this.recordMappingPinned(marker.escId, messageId, escalation, mappingReceipt, pinnedRoot);
@@ -2050,8 +2064,6 @@ const TG_MAP_LOCK_LEASE_MS = 10_000;
 const TG_MAP_LEGACY_RE = /^tg-map(?:\.(\d{6}))?\.jsonl$/;
 const TG_MAP_GENERATION_RE = /^tg-map\.g(\d{8})\.(\d{6})\.jsonl$/;
 
-const TELEGRAM_MAP_PROOF_CONTEXT = "omp-telegram-mapping-v1\u0000";
-
 interface TelegramMappingReceipt {
   readonly sent: true;
   readonly channelRef: string;
@@ -2091,19 +2103,16 @@ function telegramMappingProofPayload(record: TelegramMappingRecord): string {
     delivery: record.delivery,
   });
 }
-function telegramMappingProof(record: TelegramMappingRecord, secret: string): string {
-  return createHmac("sha256", secret).update(TELEGRAM_MAP_PROOF_CONTEXT, "utf8").update(telegramMappingProofPayload(record), "utf8").digest("hex");
+function telegramMappingProof(record: TelegramMappingRecord, authority: CtoRuntimeProofAuthority): string | null {
+  return signTelegramMappingProof(authority, telegramMappingProofPayload(record));
 }
-function telegramMappingProofMatches(record: TelegramMappingRecord, pinnedRoot: PinnedProjectRoot, route: TelegramMappingRoute, secret?: string): boolean {
+function telegramMappingProofMatches(record: TelegramMappingRecord, pinnedRoot: PinnedProjectRoot, route: TelegramMappingRoute, authority: CtoRuntimeProofAuthority): boolean {
   if (!record.root || record.root.canonical_path !== pinnedRoot.canonical_root || record.root.dev !== pinnedRoot.dev || record.root.ino !== pinnedRoot.ino
     || !record.route || record.route.projection_sha256 !== route.projection_sha256 || record.route.channel !== route.channel || record.route.target !== route.target
     || !record.delivery || record.delivery.receipt.sent !== true || record.delivery.receipt.channelRef !== `tg:${record.messageId}`
     || record.delivery.delivery_digest !== telegramDeliveryDigest(record.delivery.payload_digest, record.delivery.receipt)
     || typeof record.proof !== "string" || !/^[0-9a-f]{64}$/u.test(record.proof)) return false;
-  if (!secret) return false;
-  const expected = Buffer.from(telegramMappingProof(record, secret), "hex");
-  const actual = Buffer.from(record.proof, "hex");
-  return expected.length === actual.length && timingSafeEqual(expected, actual);
+  return verifyTelegramMappingProof(authority, telegramMappingProofPayload(record), record.proof);
 }
 function telegramDeliveryDigest(payloadDigest: string, receipt: TelegramMappingReceipt): string {
   return createHash("sha256").update(JSON.stringify({ payload_digest: payloadDigest, receipt }), "utf8").digest("hex");

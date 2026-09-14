@@ -24,7 +24,7 @@
  */
 
 import { PinnedProjectRoot, EscalationConfigError, resolveChannelProfile } from "@andvl1/omp-workflows-core";
-import type { CtoRuntimeAccessFacade } from "@andvl1/omp-workflows-core/cto-runtime";
+import type { CtoRuntimeAccessFacade, CtoRuntimeProofAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
 import { isBidirectionalChannel } from "./adapters/registry.js";
 
 export type ChannelMode = "telegram" | "http" | null;
@@ -72,6 +72,7 @@ export { isBidirectionalChannel } from "./adapters/registry.js";
  * to the LLM, which then writes the question to the outbox instead.
  */
 export type CtoRuntimeAccessProvider = (cwd: string) => CtoRuntimeAccessFacade | undefined;
+export type CtoRuntimeProofAuthorityProvider = (cwd: string, ctx: unknown) => CtoRuntimeProofAuthority | undefined;
 export type CtoSessionCwdResolver = (ctx: unknown) => string | undefined;
 
 type AskRedirectResult = { block: boolean; reason: string } | undefined;
@@ -114,6 +115,7 @@ function isAuthorityUnavailable(value: unknown): boolean {
 export function createAskRedirectGate(
   resolveCwd: CtoSessionCwdResolver,
   resolveRuntimeAccess: CtoRuntimeAccessProvider,
+  resolveProofAuthority: CtoRuntimeProofAuthorityProvider,
 ): (event: { toolName?: string }, ctx: unknown) => AskRedirectResult {
   return (event, ctx) => {
     if (event?.toolName !== "ask") return undefined;
@@ -145,6 +147,9 @@ export function createAskRedirectGate(
         return blockedAsk();
       }
       if (!runtimeAccess) return blockedAsk();
+      let proofAuthority: CtoRuntimeProofAuthority | undefined;
+      try { proofAuthority = resolveProofAuthority(authoritativeCwd, ctx); } catch { return blockedAsk(ASK_AUTHORITY_UNAVAILABLE_REASON); }
+      if (!proofAuthority) return blockedAsk(ASK_AUTHORITY_UNAVAILABLE_REASON);
       runtimeAccess.assertLive();
       runtimeAccess.assertProjectRoot(canonicalRoot);
       if (!pinnedRoot.isStable()) return blockedAsk();
@@ -163,7 +168,7 @@ export function createAskRedirectGate(
       runtimeAccess.assertProjectRoot(canonicalRoot);
       if (!pinnedRoot.isStable()) return blockedAsk();
       if (!active) return undefined;
-      if (!isBidirectionalChannel(canonicalRoot, undefined, pinnedRoot, runtimeAccess)) return undefined;
+      if (!isBidirectionalChannel(canonicalRoot, undefined, pinnedRoot, runtimeAccess, proofAuthority)) return undefined;
       runtimeAccess.assertLive();
       runtimeAccess.assertProjectRoot(canonicalRoot);
       if (!pinnedRoot.isStable()) return blockedAsk();

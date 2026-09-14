@@ -1,10 +1,21 @@
-import { deriveRuntimeSecretKey, readOrCreateRootRuntimeSecret } from "@andvl1/omp-workflows-core/cto-runtime";
-import type { PinnedProjectRoot } from "@andvl1/omp-workflows-core";
+import {
+  signCtoRuntimeProof,
+  verifyCtoRuntimeProof,
+  type CtoRuntimeProofAuthority,
+} from "@andvl1/omp-workflows-core/cto-runtime";
 
-const TELEGRAM_MAPPING_SECRET_DOMAIN = "telegram-mapping-v1";
+export const TELEGRAM_MAPPING_PROOF_DOMAIN = "telegram-mapping-v1" as const;
 
-/** Root-scoped protected key shared by sender and bridge processes. */
-export function readOrCreateProtectedTelegramMappingSecret(root: PinnedProjectRoot): string | null {
-  const master = readOrCreateRootRuntimeSecret(root);
-  return master ? deriveRuntimeSecretKey(master, TELEGRAM_MAPPING_SECRET_DOMAIN) : null;
+/** Sign one canonical Telegram mapping payload without exposing root key bytes. */
+export function signTelegramMappingProof(authority: CtoRuntimeProofAuthority, canonicalPayload: string): string | null {
+  return signCtoRuntimeProof(authority, TELEGRAM_MAPPING_PROOF_DOMAIN, canonicalPayload);
+}
+
+/** Verify one canonical Telegram mapping payload against the live authority. */
+export function verifyTelegramMappingProof(
+  authority: CtoRuntimeProofAuthority,
+  canonicalPayload: string,
+  proof: string,
+): boolean {
+  return verifyCtoRuntimeProof(authority, TELEGRAM_MAPPING_PROOF_DOMAIN, canonicalPayload, proof);
 }
