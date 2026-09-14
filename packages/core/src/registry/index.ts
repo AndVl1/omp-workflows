@@ -1,9 +1,13 @@
 /**
- * Authenticated bundle-registration seam.
+ * Marker-bound registry ownership seam.
  *
- * Deliberately excludes raw owner claims, mutable registry cells, raw context-close
- * hooks, and marker/context minting internals. Bundles may only open an
- * activation and complete a token-bound transaction through these operations.
+ * Activation is an explicit workspace opt-in: the declared marker set must be
+ * present and remain live while the owner claim is used. This boundary is not
+ * cryptographic authentication of a package or bundle; same-process loaded
+ * JavaScript is trusted. It deliberately excludes raw owner claims, mutable
+ * registry cells, raw context-close hooks, and marker/context minting internals.
+ * Bundles may only open an activation and complete a token-bound transaction
+ * through these operations.
  */
 import {
   closeRegistryRegistrationContext,

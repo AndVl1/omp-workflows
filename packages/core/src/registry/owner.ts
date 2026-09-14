@@ -16,10 +16,10 @@ const registryTokenBrand = Symbol("omp.registry.token");
 const registryPrincipalBrand = Symbol("omp.registry.principal");
 const releaseTokenBrand = Symbol("omp.registry.release");
 export interface RegistryRegistrationContext { readonly [registryContextBrand]: true; }
-/** Detached, non-authorizing evidence for one marker-authenticated owner context. */
+/** Detached, non-authorizing evidence for one marker-bound owner context. */
 export interface RegistryContextSnapshot { readonly canonical_root: string; readonly root_dev: number; readonly root_ino: number; readonly owner_fingerprint: string; readonly principal_fingerprint: string; readonly claim_generation: number; readonly marker_generation: number; readonly marker_digest: string; }
 export interface RegistryRegistrationToken { readonly [registryTokenBrand]: true; }
-/** Stable opaque, non-authorizing identity for one live marker-authenticated activation/claim lifecycle. */
+/** Stable opaque, non-authorizing identity for one live marker-bound activation/claim lifecycle. */
 export interface RegistryRegistrationPrincipal { readonly [registryPrincipalBrand]: true; }
 export interface WorkflowOwnerReleaseToken { readonly [releaseTokenBrand]: true; }
 export type WorkflowOwnerSource = WorkflowOwnerIdentity | ((projectRoot: string) => WorkflowOwnerIdentity);
