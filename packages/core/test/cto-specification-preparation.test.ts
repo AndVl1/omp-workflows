@@ -1337,15 +1337,14 @@ describe("CTO specification preparation decisions", () => {
     }
   });
 
-  test("rejects replayed, cross-run, and stale-phase proofs", async () => {
+  test("idempotently replays exact proofs while rejecting cross-run and stale-phase proofs", async () => {
     const root = freshProject();
     try {
       const replayed = await issueCanonicalDecision(root, "feature-replay", "specify", "approve_continue", "answer-replay");
-      recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [replayed] });
-      assert.throws(
-        () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [replayed] }),
-        /CTO_SPEC_PROOF_REPLAYED|already recorded|already consumed/,
-      );
+      const firstReplay = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [replayed] });
+      const secondReplay = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [replayed] });
+      assert.deepEqual(secondReplay.decisions, firstReplay.decisions);
+      assert.equal(readCtoSpecificationDecisions(root, CTO_RUN_ID).length, 1, "exact replay must not append a second ledger entry");
 
       const crossRun = await issueCanonicalDecision(root, "feature-cross-run", "specify", "approve_continue", "answer-cross-run");
       assert.throws(
@@ -1363,7 +1362,7 @@ describe("CTO specification preparation decisions", () => {
           cto_run_id: CTO_RUN_ID,
           decisions: [{ ...stale, phase: "plan", checkpoint_ref: "checkpoint.plan.v1" }],
         }),
-        /CTO_SPEC_PROOF_INVALID|stage identity|binding is stale|checkpoint.*phase/,
+        /CTO_SPEC_PROOF_INVALID|CTO_SPEC_PROOF_REPLAYED|stage identity|binding is stale|checkpoint.*phase|already consumed/,
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
