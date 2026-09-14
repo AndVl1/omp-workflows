@@ -18,10 +18,12 @@ import { test } from "node:test";
 import { TEST_SESSION_MANAGER } from "./fixtures/registrar-host.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash, type Profile } from "../src/engine/profile.js";
+import { issueCurrentTrustedMappingProof, type TrustedMappingProof } from "../src/engine/durable.js";
 import { openTestRegistry, registerTestProfiles, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import { checkpointPolicyHash, issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, registerTrustedCheckpointHostBridge } from "../src/engine/checkpoints.js";
 import { createCapability, beginCapability, authorizeDispatch, completeDispatch, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
@@ -29,7 +31,8 @@ import { resolveStageDispatchSlots, selectRoster } from "../src/engine/stage.js"
 import { durableNamespacedArtifactId } from "../src/engine/fan-in.js";
 import { resolveConfig } from "../src/engine/config.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
-import { buildAgentMapping, writeAgentMapping, type AgentMappingState } from "../src/engine/agent-mapping.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
+import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { buildDispatchMarker, parseDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
 import { updateStateAtomically, writeState, resolveState, setStateTransactionTestHooks } from "../src/engine/state.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
@@ -39,6 +42,25 @@ const TEST_CHECKPOINT_BRIDGE = Object.freeze({});
 registerTrustedCheckpointHostBridge(TEST_CHECKPOINT_BRIDGE);
 
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
+
+function currentMappingProof(root: string): TrustedMappingProof {
+  const proof = issueCurrentTrustedMappingProof(root);
+  assert.ok(proof, "the fixture must publish an engine-issued mapping proof");
+  if (!proof) throw new Error("the fixture must publish an engine-issued mapping proof");
+  return proof;
+}
+
+function beginWithCurrentProof(root: string, selection?: Parameters<typeof beginCapability>[1]): ReturnType<typeof beginCapability> {
+  return beginCapability(root, selection, { trustedMappingProof: currentMappingProof(root) });
+}
+
+function authorizeWithCurrentProof(root: string, input: Parameters<typeof authorizeDispatch>[1]): ReturnType<typeof authorizeDispatch> {
+  return authorizeDispatch(root, input, { trustedMappingProof: currentMappingProof(root) });
+}
+
+function advanceWithCurrentProof(root: string, input: Parameters<typeof advanceCursor>[1]): ReturnType<typeof advanceCursor> {
+  return advanceCursor(root, input, { trustedMappingProof: currentMappingProof(root) });
+}
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
@@ -250,7 +272,7 @@ test("br-eu6: full-feature exploration issues a valid consilium capability; mark
     }, { featureSlug: "repeat" });
 
     publishMapping(root);
-    const begun = beginCapability(root, THREE_SLOT_SELECTION);
+    const begun = beginWithCurrentProof(root, THREE_SLOT_SELECTION);
     assert.equal(begun.ok, true, "consilium capability with repeated roles must not be rejected");
     if (!begun.ok || !begun.handoff) return;
     const handoff = begun.handoff;
@@ -347,7 +369,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
     });
     assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
 
-    const advanced = advanceCursor(root, {
+    const advanced = advanceWithCurrentProof(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/repeat", branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
@@ -365,7 +387,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
     assert.equal(advanced.state.dispatch_capability?.issued_for.stage_cursor, "discovery");
     assert.equal(advanced.state.stages.find((s) => s.id === "exploration")?.status, "pending", "the roster-policy stage stays semantically unselected");
     assert.equal(advanced.state.roster_selection, undefined, "no default roster is frozen before begin");
-    const staleDispatch = authorizeDispatch(root, {
+    const staleDispatch = authorizeWithCurrentProof(root, {
       token: issued.dispatch_token,
       capability_id: issued.capability_id,
       run_key: "feat/repeat", branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
@@ -374,7 +396,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
     });
     assert.equal(staleDispatch.ok, false, "dispatch before workflow_begin fails closed");
 
-    const begun = beginCapability(root);
+    const begun = beginWithCurrentProof(root);
     assert.equal(begun.ok, true, begun.ok ? "default begin accepted" : begun.error);
     if (!begun.ok || !begun.handoff) return;
     assert.equal(begun.handoff.kind, "consilium");
@@ -393,8 +415,8 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       stage_cursor: begun.handoff.stage_cursor,
       cursor_epoch: begun.handoff.cursor_epoch,
     };
-    const a1 = authorizeDispatch(root, { ...auth, role: "analyst", agent: "analyst" });
-    const tr = authorizeDispatch(root, { ...auth, role: "tech-researcher", agent: "tech-researcher" });
+    const a1 = authorizeWithCurrentProof(root, { ...auth, role: "analyst", agent: "analyst" });
+    const tr = authorizeWithCurrentProof(root, { ...auth, role: "tech-researcher", agent: "tech-researcher" });
     assert.equal(a1.ok, true);
     assert.equal(tr.ok, true);
     if (!a1.ok || !tr.ok || !a1.record || !tr.record) return;
@@ -417,7 +439,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
     const researcherCompletion = complete(tr.record, "tech-researcher", "tech-researcher", ["exploration", "dod"]);
     assert.equal(researcherCompletion.ok, true, researcherCompletion.ok ? "tech-researcher completed" : researcherCompletion.error);
 
-    const advanced2 = advanceCursor(root, { ...auth, token: begun.handoff.advance_token, evidence: "exploration completed" });
+    const advanced2 = advanceWithCurrentProof(root, { ...auth, token: begun.handoff.advance_token, evidence: "exploration completed" });
     if (!advanced2.ok) return;
     assert.equal(advanced2.state.stage_cursor, "clarify");
     // Deterministic synthesis wrote the shared artifacts for downstream consumers.
@@ -475,6 +497,7 @@ test("br-eu6: non-spec run_key auth completes, checkpoints, and advances without
     };
     const authorized = authorizeDispatch(root, auth);
     assert.equal(authorized.ok, true);
+    if (!authorized.ok || !authorized.record) return;
     assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed", artifact_ids: ["implementation"] }).ok, true);
 
     // lightweight implementation declares a checkpoint; record it durably
@@ -502,7 +525,8 @@ test("br-eu6: non-spec run_key auth completes, checkpoints, and advances without
     });
     assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
 
-    const advanced = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "implementation completed" });
+    publishMappingForRoles(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "code-reviewer" }, ["developer-kotlin", "code-reviewer"]);
+    const advanced = advanceWithCurrentProof(root, { ...auth, token: issued.advance_token, evidence: "implementation completed" });
     assert.equal(advanced.ok, true);
     if (!advanced.ok) return;
     assert.equal(advanced.state.stage_cursor, "code_review");
@@ -594,7 +618,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     };
     const oldRecords: Array<{ role: string; agent: string; id: string }> = [];
     for (const item of oldArtifacts) {
-      const authorized = authorizeDispatch(root, { ...oldAuth, role: item.role, agent: item.agent });
+      const authorized = authorizeWithCurrentProof(root, { ...oldAuth, role: item.role, agent: item.agent });
       assert.equal(authorized.ok, true);
       if (!authorized.ok || !authorized.record) return;
       const completed = completeDispatch(root, {
@@ -613,16 +637,17 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     const staleState = JSON.parse(readFileSync(join(root, ".work-state", "features", "reopen", "state.json"), "utf8")) as TeamState;
     staleState.stages = profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "discovery" ? "done" as const : "pending" as const }));
     staleState.dispatch_capability = { ...staleState.dispatch_capability!, status: "complete" };
+    const downstreamPath = join(artifactsDir, "architecture-architect-2.json");
+    const downstreamBytes = Buffer.from("downstream");
     staleState.slot_artifacts = {
       ...staleState.slot_artifacts,
       discovery: { slots: { prior: { discovery: { path: upstreamPath, sha256: "0".repeat(64), size_bytes: 0 } } } },
-      architecture: { slots: { "architect#2": { architecture: { path: join(artifactsDir, "architecture-architect-2.json"), sha256: "1".repeat(64), size_bytes: 0 } } } },
+      architecture: { slots: { "architect#2": { architecture: { path: join(artifactsDir, "architecture-architect-2.json"), sha256: createHash("sha256").update(downstreamBytes).digest("hex"), size_bytes: downstreamBytes.byteLength } } } },
     };
     const oldExplorationSlots = staleState.slot_artifacts.exploration?.slots["analyst#1"];
     if (!oldExplorationSlots) return;
     oldExplorationSlots.outside = { path: outsidePath, sha256: "2".repeat(64), size_bytes: 0 };
-    const downstreamPath = join(artifactsDir, "architecture-architect-2.json");
-    writeFileSync(downstreamPath, "downstream");
+    writeFileSync(downstreamPath, downstreamBytes);
     writeState(root, staleState, { featureSlug: "reopen" });
 
     const staleStatePath = join(root, ".work-state", "features", "reopen", "state.json");
@@ -645,7 +670,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
         writeFileSync(staleStatePath, JSON.stringify(concurrent) + "\n", "utf8");
       },
     }, root);
-    const rejectedReopen = beginCapability(root, THREE_SLOT_SELECTION);
+    const rejectedReopen = beginWithCurrentProof(root, THREE_SLOT_SELECTION);
     setStateTransactionTestHooks(null, root);
     assert.equal(rejectedReopen.ok, false, "reopen must reject a concurrent state CAS drift");
     assert.equal(injectedStateDrift, true, "reopen CAS drift hook must run");
@@ -654,7 +679,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     }
     writeFileSync(staleStatePath, staleStateBytes);
 
-    const begun = beginCapability(root, THREE_SLOT_SELECTION);
+    const begun = beginWithCurrentProof(root, THREE_SLOT_SELECTION);
     assert.equal(begun.ok, true);
     if (!begun.ok || !begun.handoff) return;
     assert.deepEqual(begun.state.artifacts, initialState.artifacts, "upstream state.artifacts survives the reopen");
@@ -694,7 +719,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     };
     writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "reopen stale bindings", branch }));
     const first = oldArtifacts[0]!;
-    const firstAuth = authorizeDispatch(root, { ...freshAuth, role: first.role, agent: first.agent });
+    const firstAuth = authorizeWithCurrentProof(root, { ...freshAuth, role: first.role, agent: first.agent });
     assert.equal(firstAuth.ok, true);
     if (!firstAuth.ok || !firstAuth.record) return;
     const missingOldFile = completeDispatch(root, {
@@ -713,7 +738,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     writeFileSync(join(artifactsDir, "exploration.json"), JSON.stringify({ files_to_read: [{ path: "fresh.ts" }], summary: "fresh exploration" }));
     writeFileSync(join(artifactsDir, "dod.json"), JSON.stringify({ items: [{ criterion: "fresh", verify_method: "focused regression", status: "pending" }] }));
     const freshRecords = [{ role: first.role, agent: first.agent, id: firstAuth.record.id }, ...oldArtifacts.slice(1).map((item) => {
-      const authorized = authorizeDispatch(root, { ...freshAuth, role: item.role, agent: item.agent });
+      const authorized = authorizeWithCurrentProof(root, { ...freshAuth, role: item.role, agent: item.agent });
       assert.equal(authorized.ok, true);
       if (!authorized.ok || !authorized.record) throw new Error("fresh dispatch authorization failed");
       return { role: item.role, agent: item.agent, id: authorized.record.id };
@@ -730,7 +755,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       });
       assert.equal(completed.ok, true);
     }
-    const advanced = advanceCursor(root, { ...freshAuth, token: fresh.advance_token, evidence: "fresh exploration completed" });
+    const advanced = advanceWithCurrentProof(root, { ...freshAuth, token: fresh.advance_token, evidence: "fresh exploration completed" });
     assert.equal(advanced.ok, true, advanced.ok ? "fresh downstream artifacts complete after stale bindings are cleared" : advanced.error);
     if (advanced.ok) assert.equal(advanced.state.stage_cursor, "clarify");
   } finally {
@@ -745,8 +770,8 @@ const ARCHITECT_PAIR_SELECTION = {
   ],
 };
 
-/** Persist a hostile but fully hash-consistent mapping pair (config + runtime file). */
-function publishHostileMapping(root: string, roles: Record<string, string>, availableAgents: string[]): void {
+/** Persist an engine-authenticated config-bound mapping pair (config + runtime file). */
+function publishMappingForRoles(root: string, roles: Record<string, string>, availableAgents: string[]): void {
   mkdirSync(join(root, ".omp"), { recursive: true });
   writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles }) + "\n");
   const config = resolveConfig(root);
@@ -766,11 +791,6 @@ function publishHostileMapping(root: string, roles: Record<string, string>, avai
     config_provenance: config.config_provenance,
   });
   writeAgentMapping(root, mapping);
-}
-
-/** Fresh in-memory discovery result: the trusted handoff shape. */
-function freshMapping(roles: Record<string, string>, availableAgents: string[]): AgentMappingState {
-  return buildAgentMapping({ roles, availableAgents, extraRoles: [], genericFallbackRoles: Object.keys(roles) });
 }
 
 test("wave-004: advance into architecture stays semantically unselected; workflow_begin selects multiple architects", () => {
@@ -833,7 +853,7 @@ test("wave-004: advance into architecture stays semantically unselected; workflo
     });
     assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
 
-    const advanced = advanceCursor(root, {
+    const advanced = advanceWithCurrentProof(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/arch", branch: "feat/arch", workflow: "full-feature", profile_hash: persistedProfileHash,
@@ -848,7 +868,7 @@ test("wave-004: advance into architecture stays semantically unselected; workflo
     assert.equal(advanced.state.stages.find((s) => s.id === "architecture")?.status, "pending", "architecture is not armed by advance");
     assert.equal(advanced.state.roster_selection, undefined, "no default architect roster is frozen before begin");
 
-    const begun = beginCapability(root, ARCHITECT_PAIR_SELECTION);
+    const begun = beginWithCurrentProof(root, ARCHITECT_PAIR_SELECTION);
     assert.equal(begun.ok, true, begun.ok ? "multi-architect begin accepted" : begun.error);
     if (!begun.ok || !begun.handoff) return;
     assert.equal(begun.handoff.kind, "consilium");
@@ -867,8 +887,8 @@ test("wave-004: advance into architecture stays semantically unselected; workflo
       stage_cursor: begun.handoff.stage_cursor,
       cursor_epoch: begun.handoff.cursor_epoch,
     };
-    const slot1 = authorizeDispatch(root, { ...auth, role: "architect#1", agent: "architect" });
-    const slot2 = authorizeDispatch(root, { ...auth, role: "architect#2", agent: "architect" });
+    const slot1 = authorizeWithCurrentProof(root, { ...auth, role: "architect#1", agent: "architect" });
+    const slot2 = authorizeWithCurrentProof(root, { ...auth, role: "architect#2", agent: "architect" });
     assert.equal(slot1.ok, true, slot1.ok ? "architect#1 executable" : slot1.error);
     assert.equal(slot2.ok, true, slot2.ok ? "architect#2 executable" : slot2.error);
   } finally {
@@ -907,7 +927,7 @@ function writeArchitectureFixture(root: string, branch: string, slug: string): v
   }, { featureSlug: slug });
 }
 
-test("wave-004: trusted mapping handoff wins over a tampered persisted mapping; malformed handoff fails closed; fallback stays compatible", () => {
+test("wave-004: raw mapping handoffs fail closed; engine-issued proofs control roster resolution", () => {
   const control = mkdtempSync(join(tmpdir(), "wave004-hostile-control-"));
   const trusted = mkdtempSync(join(tmpdir(), "wave004-hostile-trusted-"));
   try {
@@ -915,34 +935,36 @@ test("wave-004: trusted mapping handoff wins over a tampered persisted mapping; 
     writeArchitectureFixture(trusted, "feat/hostile-trusted", "hostile-trusted");
     const hostileRoles = { ...poolRoles, architect: "omp-attacker" };
     const hostilePool = [...Object.values(poolRoles), "omp-attacker"];
-    publishHostileMapping(control, hostileRoles, hostilePool);
-    publishHostileMapping(trusted, hostileRoles, hostilePool);
+    publishMappingForRoles(control, hostileRoles, hostilePool);
+    publishMappingForRoles(trusted, hostileRoles, hostilePool);
 
     const controlBegun = beginCapability(control, ARCHITECT_PAIR_SELECTION);
-    assert.equal(controlBegun.ok, true, controlBegun.ok ? "fallback begin accepted" : controlBegun.error);
-    if (controlBegun.ok && controlBegun.handoff) {
-      assert.deepEqual(controlBegun.handoff.expected_roster.map((entry) => entry.agent), ["omp-attacker", "omp-attacker"], "without a handoff the persisted workspace mapping still resolves the roster");
-    }
+    assert.equal(controlBegun.ok, false, "a roster capability without an opaque proof fails closed");
+    if (!controlBegun.ok) assert.match(controlBegun.error, /requires an engine-issued trusted agent mapping proof/);
 
-    const trustedBegun = beginCapability(trusted, ARCHITECT_PAIR_SELECTION, { trustedMapping: freshMapping({ ...poolRoles }, Object.values(poolRoles)) });
-    assert.equal(trustedBegun.ok, true, trustedBegun.ok ? "trusted begin accepted" : trustedBegun.error);
-    if (!trustedBegun.ok || !trustedBegun.handoff) return;
-    assert.deepEqual(trustedBegun.handoff.expected_roster, [
-      { role: "architect#1", agent: "architect" },
-      { role: "architect#2", agent: "architect" },
-    ], "the trusted in-memory mapping wins over the tampered persisted file");
+    // A structurally valid, safe-looking object is still not an engine-issued
+    // proof and cannot override the hostile persisted mapping.
+    const trustedBegun = beginCapability(trusted, ARCHITECT_PAIR_SELECTION, { trustedMappingProof: {
+      schema: 1,
+      available_agents: Object.values(poolRoles),
+      resolved_roles: { ...poolRoles },
+      diagnostics: {},
+      unresolved_roles: [],
+    } as unknown as TrustedMappingProof });
+    assert.equal(trustedBegun.ok, false, "a raw safe-looking handoff fails closed");
+    if (!trustedBegun.ok) assert.match(trustedBegun.error, /trusted agent mapping proof is unknown or stale|not an engine-issued opaque proof/);
 
-    const malformed = beginCapability(trusted, ARCHITECT_PAIR_SELECTION, { trustedMapping: { schema: 99 } as unknown as AgentMappingState });
+    const malformed = beginCapability(trusted, ARCHITECT_PAIR_SELECTION, { trustedMappingProof: { schema: 99 } as unknown as TrustedMappingProof });
     assert.equal(malformed.ok, false, "a malformed trusted handoff fails closed");
     if (malformed.ok) return;
-    assert.match(malformed.error, /trusted agent mapping handoff is malformed/);
+    assert.match(malformed.error, /trusted agent mapping proof is unknown or stale|not an engine-issued opaque proof/);
     assert.doesNotMatch(malformed.error, /regenerate the agent mapping/, "a malformed handoff never falls back to the persisted file");
-    const nullHandoff = beginCapability(trusted, ARCHITECT_PAIR_SELECTION, { trustedMapping: null as unknown as AgentMappingState });
+    const nullHandoff = beginCapability(trusted, ARCHITECT_PAIR_SELECTION, { trustedMappingProof: null as unknown as TrustedMappingProof });
     assert.equal(nullHandoff.ok, false, "a runtime-null handoff fails closed instead of selecting the persisted mapping");
-    if (!nullHandoff.ok) assert.match(nullHandoff.error, /trusted agent mapping handoff is malformed/);
-    const junkHandoff = beginCapability(trusted, ARCHITECT_PAIR_SELECTION, { trustedMapping: "workspace-file" as unknown as AgentMappingState });
+    if (!nullHandoff.ok) assert.match(nullHandoff.error, /trusted agent mapping proof is not an engine-issued opaque proof/);
+    const junkHandoff = beginCapability(trusted, ARCHITECT_PAIR_SELECTION, { trustedMappingProof: "workspace-file" as unknown as TrustedMappingProof });
     assert.equal(junkHandoff.ok, false, "a non-object handoff fails closed instead of selecting the persisted mapping");
-    if (!junkHandoff.ok) assert.match(junkHandoff.error, /trusted agent mapping handoff is malformed/);
+    if (!junkHandoff.ok) assert.match(junkHandoff.error, /trusted agent mapping proof is not an engine-issued opaque proof/);
   } finally {
     rmSync(control, { recursive: true, force: true });
     rmSync(trusted, { recursive: true, force: true });
@@ -979,7 +1001,7 @@ test("wave-004: non-roster advance arming consumes the trusted mapping override"
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
     }, { featureSlug: "trusted-advance" });
-    publishHostileMapping(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "omp-attacker" }, ["developer-kotlin", "omp-attacker"]);
+    publishMappingForRoles(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "code-reviewer" }, ["developer-kotlin", "code-reviewer"]);
     const artifactsDir = join(root, ".work-state", "features", "trusted-advance", "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
     writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ files_touched: ["src/index.ts"] }));
@@ -991,7 +1013,7 @@ test("wave-004: non-roster advance arming consumes the trusted mapping override"
       stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch,
       role: "${scope.dev_agent}", agent: "developer-kotlin",
     };
-    const authorized = authorizeDispatch(root, auth);
+    const authorized = authorizeWithCurrentProof(root, auth);
     assert.equal(authorized.ok, true);
     if (!authorized.ok || !authorized.record) return;
     assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed", artifact_ids: ["implementation"] }).ok, true);
@@ -1016,13 +1038,14 @@ test("wave-004: non-roster advance arming consumes the trusted mapping override"
     });
     assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint recorded" : checkpoint.error);
 
-    const malformedAdvance = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "stage completed" }, { trustedMapping: { schema: 99 } as unknown as AgentMappingState });
+    const malformedAdvance = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "stage completed" }, { trustedMappingProof: { schema: 99 } as unknown as TrustedMappingProof });
     assert.equal(malformedAdvance.ok, false, "a malformed trusted handoff fails the advance closed");
-    if (!malformedAdvance.ok) assert.match(malformedAdvance.error, /trusted agent mapping handoff is malformed/);
-    const nullAdvance = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "stage completed" }, { trustedMapping: null as unknown as AgentMappingState });
+    if (!malformedAdvance.ok) assert.match(malformedAdvance.error, /trusted agent mapping proof is unknown or stale|not an engine-issued opaque proof/);
+    const nullAdvance = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "stage completed" }, { trustedMappingProof: null as unknown as TrustedMappingProof });
     assert.equal(nullAdvance.ok, false, "a runtime-null advance handoff fails closed instead of selecting the persisted mapping");
-    if (!nullAdvance.ok) assert.match(nullAdvance.error, /trusted agent mapping handoff is malformed/);
-    const advanced = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "stage completed" }, { trustedMapping: freshMapping({ "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "code-reviewer" }, ["developer-kotlin", "code-reviewer"]) });
+    if (!nullAdvance.ok) assert.match(nullAdvance.error, /trusted agent mapping proof is not an engine-issued opaque proof/);
+    publishMappingForRoles(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "code-reviewer" }, ["developer-kotlin", "code-reviewer"]);
+    const advanced = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "stage completed" }, { trustedMappingProof: currentMappingProof(root) });
     assert.equal(advanced.ok, true, advanced.ok ? "trusted advance ok" : advanced.error);
     if (!advanced.ok) return;
     assert.equal(advanced.state.stage_cursor, "code_review");
@@ -1083,12 +1106,12 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
       cursor_epoch: "fixture-epoch-0",
       updated_at: new Date().toISOString(),
     }, { featureSlug: "loop-roster" });
-    publishMapping(root);
+    publishMappingForRoles(root, { architect: "architect", reviewer: "reviewer" }, ["architect", "reviewer"]);
     const artifactsDir = join(root, ".work-state", "features", "loop-roster", "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
     writeFileSync(join(artifactsDir, "design.json"), JSON.stringify({ chosen: "option-1" }));
 
-    const begun = beginCapability(root, { occurrences: [{ role: "architect", reason: "option one" }] });
+    const begun = beginWithCurrentProof(root, { occurrences: [{ role: "architect", reason: "option one" }] });
     assert.equal(begun.ok, true, begun.ok ? "first-iteration begin accepted" : begun.error);
     if (!begun.ok || !begun.handoff) return;
     const designAuth = {
@@ -1101,12 +1124,12 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
       stage_cursor: begun.handoff.stage_cursor,
       cursor_epoch: begun.handoff.cursor_epoch,
     };
-    const designDispatch = authorizeDispatch(root, { ...designAuth, role: "architect", agent: "architect" });
+    const designDispatch = authorizeWithCurrentProof(root, { ...designAuth, role: "architect", agent: "architect" });
     assert.equal(designDispatch.ok, true);
     if (!designDispatch.ok || !designDispatch.record) return;
     assert.equal(completeDispatch(root, { ...designAuth, role: "architect", agent: "architect", dispatch_id: designDispatch.record.id, outcome: "succeeded", evidence: "design done", artifact_ids: ["design"] }).ok, true);
 
-    const armed = advanceCursor(root, { ...designAuth, token: begun.handoff.advance_token, evidence: "design completed" });
+    const armed = advanceWithCurrentProof(root, { ...designAuth, token: begun.handoff.advance_token, evidence: "design completed" });
     assert.equal(armed.ok, true, armed.ok ? "design-to-review advance ok" : armed.error);
     if (!armed.ok || !armed.handoff) return;
     const reviewAuth = {
@@ -1124,12 +1147,12 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
       findings: [{ title: "flagged edge case", severity: "MEDIUM", confidence: 90, zone: "backend-kotlin" }],
       iterations: 1,
     }));
-    const reviewDispatch = authorizeDispatch(root, { ...reviewAuth, role: "reviewer", agent: "reviewer" });
+    const reviewDispatch = authorizeWithCurrentProof(root, { ...reviewAuth, role: "reviewer", agent: "reviewer" });
     assert.equal(reviewDispatch.ok, true);
     if (!reviewDispatch.ok || !reviewDispatch.record) return;
     assert.equal(completeDispatch(root, { ...reviewAuth, role: "reviewer", agent: "reviewer", dispatch_id: reviewDispatch.record.id, outcome: "succeeded", evidence: "review FAIL", artifact_ids: ["review"] }).ok, true);
 
-    const reentered = advanceCursor(root, { ...reviewAuth, token: armed.handoff.advance_token, evidence: "review FAIL" });
+    const reentered = advanceWithCurrentProof(root, { ...reviewAuth, token: armed.handoff.advance_token, evidence: "review FAIL" });
     assert.equal(reentered.ok, true, reentered.ok ? "loop re-entry ok" : reentered.error);
     if (!reentered.ok) return;
     assert.equal(reentered.state.stage_cursor, "design", "cursor re-enters the roster-policy target");
@@ -1140,12 +1163,12 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
     assert.equal(reentered.state.loop_state?.reentries, 1, "iteration history is recorded");
     assert.notEqual(reentered.state.roster_selections?.["design"]?.capability_epoch, reentered.state.cursor_epoch, "no roster is frozen for the fresh loop epoch");
 
-    const rebegun = beginCapability(root, { occurrences: [{ role: "architect", facet: "second-pass" }] });
+    const rebegun = beginWithCurrentProof(root, { occurrences: [{ role: "architect", facet: "second-pass" }] });
     assert.equal(rebegun.ok, true, rebegun.ok ? "explicit begin reselects the loop target" : rebegun.error);
     if (!rebegun.ok || !rebegun.handoff) return;
     assert.equal(rebegun.state.cursor_epoch, reentered.state.cursor_epoch, "begin binds to the fresh loop epoch");
     assert.deepEqual(rebegun.handoff.expected_roster, [{ role: "architect", agent: "architect" }]);
-    const slot = authorizeDispatch(root, {
+    const slot = authorizeWithCurrentProof(root, {
       token: rebegun.handoff.dispatch_token,
       capability_id: rebegun.handoff.capability_id,
       run_key: rebegun.handoff.run_key,
@@ -1181,11 +1204,10 @@ test("wave-004: a malicious outer-valid trusted handoff fails closed before any 
       diagnostics: {},
       unresolved_roles: [],
     };
-    const ghostBegin = beginCapability(root, ARCHITECT_PAIR_SELECTION, { trustedMapping: ghostAgent as unknown as AgentMappingState });
+    const ghostBegin = beginCapability(root, ARCHITECT_PAIR_SELECTION, { trustedMappingProof: ghostAgent as unknown as TrustedMappingProof });
     assert.equal(ghostBegin.ok, false, "a resolved agent outside available_agents fails the begin closed");
     if (!ghostBegin.ok) {
-      assert.match(ghostBegin.error, /trusted agent mapping handoff is malformed/);
-      assert.match(ghostBegin.error, /resolved_roles\.architect names agent 'omp-ghost' outside available_agents/);
+      assert.match(ghostBegin.error, /trusted agent mapping proof is unknown or stale|not an engine-issued opaque proof/);
       assert.doesNotMatch(ghostBegin.error, /regenerate the agent mapping/, "the hostile persisted file is never offered as a fallback");
     }
     // A role that is unresolved and resolved at once breaks the invariant.
@@ -1196,9 +1218,9 @@ test("wave-004: a malicious outer-valid trusted handoff fails closed before any 
       diagnostics: {},
       unresolved_roles: ["architect"],
     };
-    const disjointBegin = beginCapability(root, ARCHITECT_PAIR_SELECTION, { trustedMapping: disjoint as unknown as AgentMappingState });
+    const disjointBegin = beginCapability(root, ARCHITECT_PAIR_SELECTION, { trustedMappingProof: disjoint as unknown as TrustedMappingProof });
     assert.equal(disjointBegin.ok, false);
-    if (!disjointBegin.ok) assert.match(disjointBegin.error, /unresolved_roles names 'architect' which resolved_roles also resolves/);
+    if (!disjointBegin.ok) assert.match(disjointBegin.error, /trusted agent mapping proof is unknown or stale|not an engine-issued opaque proof/);
     // A resolved role carrying an 'unavailable' diagnostic contradicts itself.
     const conflicted = {
       ...base,
@@ -1207,9 +1229,9 @@ test("wave-004: a malicious outer-valid trusted handoff fails closed before any 
       diagnostics: { architect: { requested: "architect", candidates: ["architect"], status: "unavailable" } },
       unresolved_roles: [],
     };
-    const conflictedBegin = beginCapability(root, ARCHITECT_PAIR_SELECTION, { trustedMapping: conflicted as unknown as AgentMappingState });
+    const conflictedBegin = beginCapability(root, ARCHITECT_PAIR_SELECTION, { trustedMappingProof: conflicted as unknown as TrustedMappingProof });
     assert.equal(conflictedBegin.ok, false);
-    if (!conflictedBegin.ok) assert.match(conflictedBegin.error, /trusted agent mapping handoff is malformed|resolved role 'architect' carries an 'unavailable' diagnostic/);
+    if (!conflictedBegin.ok) assert.match(conflictedBegin.error, /trusted agent mapping proof is unknown or stale|not an engine-issued opaque proof/);
     // Every rejection left the persisted workflow state untouched.
     const untouched = resolveState(root);
     assert.equal(untouched.state?.stage_cursor, "architecture");
@@ -1250,7 +1272,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
     }, { featureSlug: "missing-next-role" });
-    publishHostileMapping(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "omp-attacker" }, ["developer-kotlin", "omp-attacker"]);
+    publishMappingForRoles(root, { "${scope.dev_agent}": "developer-kotlin" }, ["developer-kotlin"]);
     const artifactsDir = join(root, ".work-state", "features", "missing-next-role", "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
     writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ files_touched: ["src/index.ts"] }));
@@ -1262,7 +1284,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
       stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch,
       role: "${scope.dev_agent}", agent: "developer-kotlin",
     };
-    const authorized = authorizeDispatch(root, auth);
+    const authorized = authorizeWithCurrentProof(root, auth);
     assert.equal(authorized.ok, true);
     if (!authorized.ok || !authorized.record) return;
     assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed", artifact_ids: ["implementation"] }).ok, true);
@@ -1290,7 +1312,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
     // The handoff omits the code_review role entirely: the next stage's slot
     // must fail closed instead of falling back to config or the role name.
     const missing = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "stage completed" }, {
-      trustedMapping: freshMapping({ "${scope.dev_agent}": "developer-kotlin" }, ["developer-kotlin"]),
+      trustedMappingProof: currentMappingProof(root),
     });
     assert.equal(missing.ok, false, "a next role missing from the handoff fails the advance closed");
     if (!missing.ok) {
@@ -1351,20 +1373,20 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
     }, { featureSlug: "loop-missing-role" });
-    publishMapping(root);
+    publishMappingForRoles(root, { checker: "checker" }, ["checker"]);
     const artifactsDir = join(root, ".work-state", "features", "loop-missing-role", "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
     writeFileSync(join(artifactsDir, "build.json"), JSON.stringify({ ready: true }));
     writeFileSync(join(artifactsDir, "check.json"), JSON.stringify({ verdict: "needs_changes", findings: [] }));
 
     // Begin with a handoff that omits the stage's role fails closed…
-    const strictBegin = beginCapability(root, undefined, { trustedMapping: freshMapping({ checker: "checker" }, ["checker"]) });
+    const strictBegin = beginCapability(root, undefined, { trustedMappingProof: currentMappingProof(root) });
     assert.equal(strictBegin.ok, false, "a begin role missing from the handoff fails closed");
     if (!strictBegin.ok) {
       assert.match(strictBegin.error, /workflow stage 'build' dispatch roster unresolved/);
       assert.match(strictBegin.error, /'builder' is missing or unavailable in the trusted agent mapping handoff/);
     }
-    // …while the same begin without a handoff keeps the persisted fallback.
+    // …while the same non-roster begin without a handoff keeps its legacy role fallback.
     const fallbackBegin = beginCapability(root);
     assert.equal(fallbackBegin.ok, true, fallbackBegin.ok ? "no-handoff fallback begin accepted" : fallbackBegin.error);
     if (!fallbackBegin.ok || !fallbackBegin.handoff) return;
@@ -1379,14 +1401,14 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
       stage_cursor: fallbackBegin.handoff.stage_cursor,
       cursor_epoch: fallbackBegin.handoff.cursor_epoch,
     };
-    const buildDispatch = authorizeDispatch(root, { ...buildAuth, role: "builder", agent: "builder" });
+    const buildDispatch = authorizeWithCurrentProof(root, { ...buildAuth, role: "builder", agent: "builder" });
     assert.equal(buildDispatch.ok, true);
     if (!buildDispatch.ok || !buildDispatch.record) return;
     assert.equal(completeDispatch(root, { ...buildAuth, role: "builder", agent: "builder", dispatch_id: buildDispatch.record.id, outcome: "succeeded", evidence: "build done", artifact_ids: ["build"] }).ok, true);
 
     // The advance into check consumes the trusted mapping for the next role.
-    const fullMapping = freshMapping({ builder: "builder", checker: "checker" }, ["builder", "checker"]);
-    const armed = advanceCursor(root, { ...buildAuth, token: fallbackBegin.handoff.advance_token, evidence: "build completed" }, { trustedMapping: fullMapping });
+    publishMappingForRoles(root, { builder: "builder", checker: "checker" }, ["builder", "checker"]);
+    const armed = advanceCursor(root, { ...buildAuth, token: fallbackBegin.handoff.advance_token, evidence: "build completed" }, { trustedMappingProof: currentMappingProof(root) });
     assert.equal(armed.ok, true, armed.ok ? "trusted advance into check ok" : armed.error);
     if (!armed.ok || !armed.handoff) return;
     assert.deepEqual(armed.handoff.expected_roster, [{ role: "checker", agent: "checker" }]);
@@ -1400,15 +1422,16 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
       stage_cursor: armed.handoff.stage_cursor,
       cursor_epoch: armed.handoff.cursor_epoch,
     };
-    const checkDispatch = authorizeDispatch(root, { ...checkAuth, role: "checker", agent: "checker" });
+    const checkDispatch = authorizeWithCurrentProof(root, { ...checkAuth, role: "checker", agent: "checker" });
     assert.equal(checkDispatch.ok, true);
     if (!checkDispatch.ok || !checkDispatch.record) return;
     assert.equal(completeDispatch(root, { ...checkAuth, role: "checker", agent: "checker", dispatch_id: checkDispatch.record.id, outcome: "succeeded", evidence: "check FAIL", artifact_ids: ["check"] }).ok, true);
 
     // Loop re-entry with a handoff missing the loop target's role fails
     // closed — the cursor, epoch and loop history stay untouched.
+    publishMappingForRoles(root, { checker: "checker" }, ["checker"]);
     const missingLoop = advanceCursor(root, { ...checkAuth, token: armed.handoff.advance_token, evidence: "check FAIL" }, {
-      trustedMapping: freshMapping({ checker: "checker" }, ["checker"]),
+      trustedMappingProof: currentMappingProof(root),
     });
     assert.equal(missingLoop.ok, false, "a loop target role missing from the handoff fails the re-entry closed");
     if (!missingLoop.ok) {
@@ -1421,7 +1444,8 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
     assert.equal(untouched.state?.loop_state, undefined, "a failed re-entry never records loop history");
 
     // The complete handoff re-enters and arms the loop target from it.
-    const reentered = advanceCursor(root, { ...checkAuth, token: armed.handoff.advance_token, evidence: "check FAIL" }, { trustedMapping: fullMapping });
+    publishMappingForRoles(root, { builder: "builder", checker: "checker" }, ["builder", "checker"]);
+    const reentered = advanceCursor(root, { ...checkAuth, token: armed.handoff.advance_token, evidence: "check FAIL" }, { trustedMappingProof: currentMappingProof(root) });
     assert.equal(reentered.ok, true, reentered.ok ? "trusted loop re-entry ok" : reentered.error);
     if (!reentered.ok || !reentered.handoff) return;
     assert.equal(reentered.state.stage_cursor, "build");
@@ -1509,7 +1533,7 @@ test("wave-004: deferred roster advance masks the prior stage selection until be
     });
     assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
 
-    const advanced = advanceCursor(root, {
+    const advanced = advanceWithCurrentProof(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: "feat/deferred-mask", branch: "feat/deferred-mask", workflow: "full-feature", profile_hash: persistedProfileHash,
@@ -1535,7 +1559,7 @@ test("wave-004: deferred roster advance masks the prior stage selection until be
     assert.equal(beforeBegin.stage.provenance.control_plane.roster_selection, "none");
 
     // workflow_begin refreezes a selection; the contract now exposes it.
-    const begun = beginCapability(root, ARCHITECT_PAIR_SELECTION, { trustedMapping: freshMapping({ ...poolRoles }, Object.values(poolRoles)) });
+    const begun = beginWithCurrentProof(root, ARCHITECT_PAIR_SELECTION);
     assert.equal(begun.ok, true, begun.ok ? "begin refreezes the architecture roster" : begun.error);
     if (!begun.ok || !begun.handoff) return;
     const afterBegin = resolveWorkflowContract(root);
