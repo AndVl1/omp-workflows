@@ -1662,9 +1662,19 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
         || hostContextRootIssue(ctx, current.root, current.rootDev, current.rootIno) !== null) return;
       clearNativeTaskSelectors();
       clearHostContextIdentity(originalPi as unknown as object);
-      // Fetch and delete before invoking opaque cleanup so no reentrant host
-      // callback can observe this generation as still active.
-      teamActivationCells.delete(originalPi as unknown as object);
+      // Replace the live cell with a recoverable tombstone before invoking
+      // opaque cleanup. Keeping the authenticated root/principal lets the
+      // next bindSession rebind through recordTeamLifecycle instead of
+      // silently dropping its cleanup ownership.
+      teamActivationCells.set(originalPi as unknown as object, {
+        ...current,
+        state: "failed",
+        recoverableSession: true,
+        liveGuard: undefined,
+        cleanup: undefined,
+        sessionManager: undefined,
+        sessionId: undefined,
+      });
       current.cleanup?.();
     });
   }

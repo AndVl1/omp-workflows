@@ -1843,6 +1843,10 @@ test("completion persists only exact passing conformance", () => {
     if (completed.ok) assert.equal(completed.value.status, "completed");
     const exactReplay = completeExecutionClaim(root, handoff.feature_id, completionInput);
     assert.ok(exactReplay.ok, exactReplay.ok ? "exact completion replay" : exactReplay.error);
+    const completionStatePath = join(root, ".work-state", "features", handoff.feature_id, "state.json");
+    const completionClaimJournalPath = join(featureArtifactsDir(root, handoff.feature_id), "execution_claim", "next");
+    const beforeAlternateState = readFileSync(completionStatePath);
+    const beforeAlternateClaims = readdirSync(completionClaimJournalPath).sort();
     const alternateArtifact = { ...conformance, evaluated_at: "2026-09-14T00:00:01.000Z" };
     const alternateArtifactReplay = completeExecutionClaim(root, handoff.feature_id, { ...completionInput, conformance: alternateArtifact });
     assert.equal(alternateArtifactReplay.ok, false, "an alternate valid artifact envelope must not replay the canonical completion");
@@ -1858,6 +1862,8 @@ test("completion persists only exact passing conformance", () => {
     assert.equal(alternateHandoffReplay.ok, false, "an alternate handoff identity must not replay the canonical completion");
     const alternateClaimReplay = completeExecutionClaim(root, handoff.feature_id, { ...completionInput, claim_id: "claim-alternate" });
     assert.equal(alternateClaimReplay.ok, false, "an alternate claim identity must not replay the canonical completion");
+    assert.deepEqual(readFileSync(completionStatePath), beforeAlternateState, "alternate replay attempts must not mutate the completed workspace");
+    assert.deepEqual(readdirSync(completionClaimJournalPath).sort(), beforeAlternateClaims, "alternate replay attempts must not append claim journal receipts");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 test("invalid UTF-8 acquired_at in the claim root fails closed without acquisition mutation", () => {

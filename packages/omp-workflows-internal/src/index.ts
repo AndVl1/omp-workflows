@@ -176,7 +176,6 @@ function resolvePinnedActivation(pi: ExtensionAPI, cwd: string, sessionId?: stri
 					: "accepted workspace root or marker identity changed",
 			};
 		}
-		if (!prior.sessionId && sessionId) prior.sessionId = sessionId;
 		return { ok: true, activation: prior };
 	}
 
@@ -406,6 +405,8 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string, sessionId?
 		try {
 			commitRegistryRegistration(transaction.token);
 			closeWorkflowActivation(activation);
+			const pinned = pinnedActivations.get(pi as object);
+			if (pinned && sessionId) pinned.sessionId = sessionId;
 			return { ok: true };
 		} catch (error) {
 			rollbackClaims();
@@ -464,6 +465,7 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string, sessionId?
 		pinned.retainedLease = activation;
 		pinned.gateInstallation = gateInstallation;
 	}
+	if (pinned && sessionId) pinned.sessionId = sessionId;
 	return { ok: true };
 }
 

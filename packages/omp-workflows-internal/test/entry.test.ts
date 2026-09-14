@@ -180,6 +180,22 @@ test("session shutdown releases the retained generation and stale shutdown canno
 	}
 });
 
+test("same-root generation rebind updates retained shutdown ownership", () => {
+	const root = markedRoot();
+	try {
+		const host = makePi();
+		ompWorkflowsInternal(host.pi as never);
+		assert.equal(ensureEngineActivation(host.pi as never, root, "internal-rebind-A").ok, true);
+		assert.equal(ensureEngineActivation(host.pi as never, root, "internal-rebind-B").ok, true);
+		host.fireSessionShutdown({ cwd: root }, { sessionId: "internal-rebind-A" });
+		assert.equal(isRegisteredWorkflow("omp-feature"), true, "stale A shutdown must preserve rebound B");
+		host.fireSessionShutdown({ cwd: root }, { sessionId: "internal-rebind-B" });
+		assert.equal(isRegisteredWorkflow("omp-feature"), false, "exact B shutdown must close rebound activation");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("foreign claim on one capability blocks the whole bundle before any registration", () => {
 	const root = markedRoot();
 	const conflicts = openForeignActivation(root, ["workflow_registration"]);

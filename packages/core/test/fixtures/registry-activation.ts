@@ -3,13 +3,12 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { registerWorkflowProfiles } from "../../src/engine/profile.js";
-import { registerConstitutionTools, registerCtoTools, registerTeamWorkflow, registerWorkflowTools } from "../../src/index.js";
 import { registerConstitutionProvider } from "../../src/specification/constitution-provider.js";
 import { registerDocumentRenderer, registerFormatRecognizer, registerSpecificationRenderer } from "../../src/specification/registry.js";
 import { registerArtifactRenderer, type ArtifactRenderer, type ArtifactRenderLayer } from "../../src/visualize/renderer-registry.js";
 import { openCtoRuntimeAccess, registerCtoRuntimeAccessProvider, type CtoRuntimeAccessFacade } from "../../src/cto/runtime-access.js";
 import { closeWorkflowActivation as closeDistWorkflowActivation, openWorkflowActivation as openDistWorkflowActivation, type WorkflowOwnerIdentity as DistWorkflowOwnerIdentity } from "../../src/registry/index.js";
-import type { WorkflowProfile } from "../../src/engine/types.js";
+import type { Profile } from "../../src/engine/types.js";
 import type { ConstitutionProvider } from "../../src/specification/constitution-provider.js";
 import type { DocumentRenderer } from "../../src/engine/types.js";
 import type { FormatRecognizer, SpecificationRenderer } from "../../src/specification/registry.js";
@@ -28,6 +27,7 @@ import {
   type RegistryRegistrationContext,
 } from "../../src/registry/owner.js";
 
+type WorkflowProfile = Profile;
 const MARKER_CONTENT = "omp-core-test-registry-marker-v1";
 
 // Mounted host hooks resolve an existing run through the authenticated runtime
@@ -87,7 +87,12 @@ export function openTestCtoRuntime(
   root: string,
   sessionId = "main-session",
   ownerId = "core-cto-runtime-test",
-): { readonly access: CtoRuntimeAccessFacade; readonly close: () => void } {
+): {
+  readonly access: CtoRuntimeAccessFacade;
+  readonly registryContext: ReturnType<typeof openDistWorkflowActivation> extends { ok: true; registry_context: infer T } ? T : never;
+  readonly owner: DistWorkflowOwnerIdentity;
+  readonly close: () => void;
+} {
   const marker = writeTestRegistryMarker(root);
   const owner: DistWorkflowOwnerIdentity = {
     owner_id: ownerId,
@@ -234,84 +239,6 @@ export function withTestRegistry<T>(
     return result;
   } catch (error) {
     try { registration.finish(false); } catch { /* preserve the original test failure */ }
-    throw error;
-  }
-}
-
-export function registerTestWorkflowTools(
-  root: string,
-  pi: Parameters<typeof registerWorkflowTools>[0],
-  options: Omit<NonNullable<Parameters<typeof registerWorkflowTools>[1]>, "cwd" | "owner" | "registrationToken"> = {},
-  ownerId = "core-test-workflow-tools",
-): void {
-  writeTestRegistryMarker(root);
-  const registration = openTestRegistry(root, ["workflow_tools"], ownerId);
-  try {
-    registerWorkflowTools(pi, { ...options, cwd: root, owner: () => registration.owner, registrationToken: registration.token });
-    registration.retain(true);
-  } catch (error) {
-    try { registration.finish(false); } catch { /* preserve original */ }
-    throw error;
-  }
-}
-
-export function registerTestCtoTools(
-  root: string,
-  pi: Parameters<typeof registerCtoTools>[0],
-  options: Omit<NonNullable<Parameters<typeof registerCtoTools>[1]>, "cwd" | "registrationToken"> = {},
-  ownerId = "core-test-workflow-tools",
-): void {
-  writeTestRegistryMarker(root);
-  const registration = openTestRegistry(root, ["workflow_tools"], ownerId, ["workflow_tools"]);
-  try {
-    registerCtoTools(pi, {
-      ...options,
-      cwd: options.resolveCwd === undefined ? root : undefined,
-      owner: options.owner ?? (() => registration.owner),
-      registrationToken: registration.token,
-    });
-    registration.retain(true);
-  } catch (error) {
-    try { registration.finish(false); } catch { /* preserve original */ }
-    throw error;
-  }
-}
-
-export function registerTestConstitutionGate(root: string, ownerId = "core-test-constitution-gate"): void {
-  registerTestTeamWorkflow(root, { setLabel() {}, on() {} } as never, { observability: false }, ownerId);
-}
-
-export function registerTestTeamWorkflow(
-  root: string,
-  pi: Parameters<typeof registerTeamWorkflow>[0],
-  options: Omit<NonNullable<Parameters<typeof registerTeamWorkflow>[1]>, "cwd" | "owner" | "registrationToken" | "deferConstitutionGate"> = {},
-  ownerId = "core-test-team-workflow",
-): void {
-  writeTestRegistryMarker(root);
-  const registration = openTestRegistry(root, ["workflow_profiles", "constitution_gate", "runtime_config"], ownerId, ["workflow_registration", "config_writer"]);
-  try {
-    const installGate = registerTeamWorkflow(pi, { ...options, cwd: root, owner: () => registration.owner, registrationToken: registration.token });
-    if (installGate) installGate();
-    registration.retain(true);
-  } catch (error) {
-    try { registration.finish(false); } catch { /* preserve original */ }
-    throw error;
-  }
-}
-
-export function registerTestConstitutionTools(
-  root: string,
-  pi: Parameters<typeof registerConstitutionTools>[0],
-  options: Omit<NonNullable<Parameters<typeof registerConstitutionTools>[1]>, "cwd" | "owner" | "registrationToken"> = {},
-  ownerId = "core-test-constitution-tools",
-): void {
-  writeTestRegistryMarker(root);
-  const registration = openTestRegistry(root, ["workflow_tools"], ownerId);
-  try {
-    registerConstitutionTools(pi, { ...options, cwd: root, owner: () => registration.owner, registrationToken: registration.token });
-    registration.retain(true);
-  } catch (error) {
-    try { registration.finish(false); } catch { /* preserve original */ }
     throw error;
   }
 }
