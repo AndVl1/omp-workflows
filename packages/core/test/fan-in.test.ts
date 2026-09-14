@@ -22,7 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { registerTestConstitutionGate, registerTestProfiles, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
-import { createCapability, authorizeDispatch, authorizeDispatchFromPersisted, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor, projectNativeSpecificationPhaseDecision } from "../src/engine/durable.js";
+import { createCapability, authorizeDispatch, authorizeDispatchFromPersisted, authorizeDispatchTrusted, authorizeSpecificationPhaseValidationDispatch, consumeSpecificationPhaseValidationDispatch, completeDispatch, reconcileTrustedTaskResult, advanceCursor, issueCurrentTrustedMappingProof, projectNativeSpecificationPhaseDecision, type TrustedMappingProof } from "../src/engine/durable.js";
 import { appendCheckpointDecision, checkpointPolicyHash, issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, registerTrustedCheckpointHostBridge } from "../src/engine/checkpoints.js";
 import {
   namespacedArtifactId,
@@ -51,6 +51,7 @@ import { deterministicValidationInputForArtifact, parseConstitutionPrincipleIden
 import { resolveSpecificationLanguage } from "../src/specification/language.js";
 import { resolveSpecificationTemplateSet, SHIPPED_SPECIFICATION_TEMPLATE_IDS } from "../src/specification/templates.js";
 import { ensureProjectConstitution } from "../src/specification/prerequisite.js";
+import { createPreparationHandoff, preparationStartPostimageDigest, preparationStateDigest } from "../src/engine/preparation.js";
 
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
 const FAN_SPEC_LANGUAGE = resolveSpecificationLanguage({ requestLanguage: "en-US" });
@@ -74,7 +75,28 @@ function initGit(root: string, branch: string): void {
 function writeFixtureState(root: string, profileName: string, stageId: string): ReturnType<typeof createCapability> {
   const profile = loadProfile(profileName);
   assert.ok(profile);
+  if (!profile) throw new Error(`profile ${profileName} is unavailable`);
   const persistedHash = profileHash(profile);
+  writeFileSync(join(root, "CONSTITUTION.md"), "# Project Constitution v1.0.0\n\n## I. Quality\n\nShip tested work.\n");
+  writeTestRegistryMarker(root);
+  registerTestConstitutionGate(root, "fan-feature-constitution-gate");
+  const gate = ensureProjectConstitution(root, { origin_kind: "native_direct", origin_run_key: "fan-feature", origin_stage: stageId }, { feature_id: "fan" });
+  assert.equal(gate.ok, true, gate.ok ? "" : gate.error);
+  if (!gate.ok || !gate.value.binding) throw new Error("fan-in feature constitution gate is unavailable");
+  mkdirSync(join(root, "specs", "fan"), { recursive: true });
+  const canonicalRoot = realpathSync(root);
+  const rootStats = statSync(canonicalRoot);
+  const workspace = validFeatureWorkspace({
+    featureId: "fan",
+    projectRoot: canonicalRoot,
+    projectRootIdentity: { canonical_path: canonicalRoot, dev: rootStats.dev, ino: rootStats.ino },
+    constitutionBinding: gate.value.binding,
+  });
+  workspace.profile_name = profile.name;
+  workspace.profile_hash = persistedHash;
+  workspace.constitution_gate_ref = gate.value.gate_id;
+  workspace.status = "in_progress";
+  publishMapping(root);
   const issued = createCapability({
     run_key: "feat/fan", branch: "feat/fan", workflow: profile.name, profile_hash: persistedHash,
     stage_cursor: stageId, kind: "consilium",
@@ -104,15 +126,17 @@ function writeFixtureState(root: string, profileName: string, stageId: string): 
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
+    specification: workspace,
   }, { featureSlug: "fan" });
   return issued;
 }
 
 function writeNativeFanFixtureState(root: string): ReturnType<typeof createCapability> {
   initGit(root, "feat/fan");
+  writeTestRegistryMarker(root);
   writeFileSync(join(root, "CONSTITUTION.md"), "# Project Constitution v1.0.0\n\n## I. Quality\n\nShip tested work.\n");
   registerTestConstitutionGate(root, "fan-native-constitution-gate");
-  const gate = ensureProjectConstitution(root, { origin_kind: "native_direct", origin_run_key: "fan-native", origin_stage: "exploration" });
+  const gate = ensureProjectConstitution(root, { origin_kind: "native_direct", origin_run_key: "fan-native", origin_stage: "exploration" }, { feature_id: "fan" });
   assert.equal(gate.ok, true, gate.ok ? "" : gate.error);
   if (!gate.ok || !gate.value.binding) throw new Error("native fan-in constitution gate is unavailable");
   mkdirSync(join(root, "specs", "fan"), { recursive: true });
@@ -131,6 +155,7 @@ function writeNativeFanFixtureState(root: string): ReturnType<typeof createCapab
   workspace.profile_hash = persistedHash;
   workspace.constitution_gate_ref = gate.value.gate_id;
   workspace.status = "in_progress";
+  publishMapping(root);
   const issued = createCapability({
     run_key: "feat/fan", branch: "feat/fan", workflow: profile.name, profile_hash: persistedHash,
     stage_cursor: "exploration", kind: "consilium",
@@ -186,8 +211,9 @@ function writeSpecFixtureState(root: string): ReturnType<typeof createCapability
     expected_roster: [{ role: "specification-analyst", agent: "specification-worker" }],
   });
   writeFileSync(join(root, "CONSTITUTION.md"), "# Project Constitution v1.0.0\n\n## I. Quality\n\nShip tested work.\n");
+  writeTestRegistryMarker(root);
   registerTestConstitutionGate(root, "fan-specification-gate");
-  const gate = ensureProjectConstitution(root, { origin_kind: "native_direct", origin_run_key: "fan-specification-gate", origin_stage: "specify" });
+  const gate = ensureProjectConstitution(root, { origin_kind: "native_direct", origin_run_key: "fan-specification-gate", origin_stage: "specify" }, { feature_id: "spec" });
   assert.equal(gate.ok, true, gate.ok ? "" : gate.error);
   mkdirSync(join(root, "specs", "spec"), { recursive: true });
   const canonicalRoot = realpathSync(root);
@@ -198,11 +224,13 @@ function writeSpecFixtureState(root: string): ReturnType<typeof createCapability
     projectRootIdentity: { canonical_path: canonicalRoot, dev: rootStats.dev, ino: rootStats.ino },
   });
   workspace.profile_hash = persistedHash;
+  workspace.constitution_gate_ref = gate.value.gate_id;
   workspace.constitution_binding = fixtureConstitutionBinding(root);
   workspace.language = FAN_SPEC_LANGUAGE;
   workspace.template_set = FAN_SPEC_TEMPLATES.selection;
   workspace.phases[0] = { ...workspace.phases[0]!, status: "generating", current_version: null, approved_version: null, validation_ref: null, checkpoint_ref: null };
   workspace.next_action = { kind: "none", command: null, reason: "The specify worker dispatch is active." };
+  publishMapping(root);
   writeState(root, {
     schema: 1,
     branch: "main",
@@ -327,13 +355,29 @@ function persistNativeSpecifyCandidate(root: string, authorization: NativeSlotAu
   const phase = workspace.phases.find((entry) => entry.phase === "specify");
   if (!phase) return;
   writeState(root, {
-    ...after.state, specification: { ...workspace, phases: workspace.phases.map((entry) => entry.phase === "specify" ? { ...entry, status: "awaiting_approval" as const, current_version: 1, approved_version: null, validation_ref: "validation.specify.v1", checkpoint_ref: null } : entry), next_action: { kind: "checkpoint" as const, command: null, reason: "The specify validation passed; the hard-human checkpoint is open." } },
+    ...after.state, specification: { ...workspace, phases: workspace.phases.map((entry) => entry.phase === "specify" ? { ...entry, status: "materialized" as const, current_version: 1, approved_version: null, validation_ref: "validation.specify.v1", checkpoint_ref: null } : entry), next_action: { kind: "none" as const, command: null, reason: "The specify artifact is materialized; the validator dispatch must join before approval." } },
   }, { target: after });
 }
 
 function approveSpecify(root: string, issued: ReturnType<typeof createCapability>): void {
-  const resolved = resolveState(root);
+  let resolved = resolveState(root);
   assert.ok(resolved.state, "specify fixture state must resolve for checkpoint approval");
+  if (resolved.state?.specification) {
+    const phase = resolved.state.specification.phases.find((entry) => entry.phase === "specify");
+    if (phase?.status === "materialized") {
+      writeState(root, {
+        ...resolved.state,
+        specification: {
+          ...resolved.state.specification,
+          phases: resolved.state.specification.phases.map((entry) => entry.phase === "specify"
+            ? { ...entry, status: "awaiting_approval" as const, current_version: 1, approved_version: null, validation_ref: "validation.specify.v1", checkpoint_ref: null }
+            : entry),
+          next_action: { kind: "checkpoint" as const, command: null, reason: "The specify validator passed; the hard-human checkpoint is open." },
+        },
+      }, { target: resolved });
+      resolved = resolveState(root);
+    }
+  }
   const answerId = "answer/specify";
   const reference = "terminal-answer/specify";
   const pinnedRoot = PinnedProjectRoot.open(root);
@@ -354,6 +398,7 @@ function approveSpecify(root: string, issued: ReturnType<typeof createCapability
       stage_id: "specify",
       checkpoint_id: "specification_phase_approval",
       decision: "approve_continue",
+      feature_id: "spec",
       question: "Approve the persisted specify phase",
       options: ["approve_continue"],
       session_id: "fan-in-specification-test-session",
@@ -392,9 +437,9 @@ function approveSpecify(root: string, issued: ReturnType<typeof createCapability
     pinnedRoot.close();
   }
 }
-const trustedIntakeRoles = { "specification-analyst": "specification-worker", "tech-researcher": "tech-researcher" } as const;
+const trustedIntakeRoles = { analyst: "analyst", "specification-analyst": "specification-worker", "tech-researcher": "tech-researcher" } as const;
 
-/** Publish a trusted live agent mapping covering the spec-preparation intake pool. */
+/** Publish a config-bound live agent mapping for every fan-in fixture roster. */
 function publishMapping(root: string): void {
   mkdirSync(join(root, ".omp"), { recursive: true });
   writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: trustedIntakeRoles }) + "\n");
@@ -404,8 +449,95 @@ function publishMapping(root: string): void {
     availableAgents: Object.values(trustedIntakeRoles),
     extraRoles: config.scope_map.map((entry) => entry.dev_agent),
     genericFallbackRoles: Object.keys(trustedIntakeRoles),
+    source: "fan-in-test",
+    scope_map: config.scope_map,
+    flags: config.flags,
+    roster: config.roster_overrides,
+    config_path: config.config_path,
+    config_source: config.config_source,
+    config_hash: config.config_hash,
+    config_version: config.config_version,
+    config_provenance: config.config_provenance,
   });
   writeAgentMapping(root, mapping);
+}
+
+function currentMappingProof(root: string): TrustedMappingProof {
+  const proof = issueCurrentTrustedMappingProof(root);
+  assert.ok(proof, "fan-in fixture must publish an engine-issued mapping proof");
+  if (!proof) throw new Error("fan-in fixture mapping proof is unavailable");
+  return proof;
+}
+
+/** Arm the exact native preparation authority consumed by validation dispatch. */
+function armNativeSpecifyPreparation(root: string, auth: ReturnType<typeof authorizeSlot>["auth"], record: ReturnType<typeof authorizeSlot>["record"]): void {
+  const selected = resolveState(root, "main", { feature_id: "spec", run_key: "main" });
+  assert.ok(selected.state && selected.state.specification, "spec fixture state must resolve before native preparation arming");
+  if (!selected.state || !selected.state.specification) return;
+  const pinned = PinnedProjectRoot.open(root);
+  assert.ok(pinned, "spec fixture root must pin before native preparation arming");
+  if (!pinned) return;
+  try {
+    const revision = selected.state.state_revision ?? 1;
+    const binding = selected.state.specification.constitution_binding;
+    const handoff = createPreparationHandoff({
+      feature_id: "spec",
+      run_key: "main",
+      branch: selected.state.branch,
+      task: selected.state.task,
+      classification: selected.state.classification,
+      state_revision: revision,
+      state_digest: preparationStateDigest(selected.state, revision),
+      root_identity: { canonical_path: pinned.canonical_root, dev: pinned.dev, ino: pinned.ino },
+      source_kind: "native",
+      constitution_binding: binding,
+      constitution_gate_ref: selected.state.specification.constitution_gate_ref,
+      capacity: 1,
+      authentication: { pinned_root: pinned, source_kind: "native", constitution_binding: binding, constitution_gate_ref: selected.state.specification.constitution_gate_ref, capacity: 1 },
+    });
+    writeState(root, { ...selected.state, preparation_handoff: handoff }, { target: selected });
+    const armed = resolveState(root, "main", { feature_id: "spec", run_key: "main" });
+    assert.ok(armed.state && armed.state.dispatch_capability, "spec fixture state must retain capability after native preparation arming");
+    if (!armed.state || !armed.state.dispatch_capability) return;
+    const marker = {
+      status: "started" as const,
+      phase: "specify" as const,
+      capability_id: armed.state.dispatch_capability.capability_id,
+      capability_epoch: armed.state.dispatch_capability.issued_for.cursor_epoch,
+      request_id: auth.tool_call_id,
+      dispatch_id: record.id,
+      start_postimage_digest: preparationStartPostimageDigest(armed.state),
+      token: handoff.token,
+      preparation_digest: handoff.digest,
+      preparation_state_revision: handoff.state_revision,
+      expected_state_revision: handoff.state_revision,
+      profile_hash: armed.state.profile_hash,
+      expected_roster: armed.state.dispatch_capability.expected_roster,
+    };
+    writeState(root, { ...armed.state, preparation_start: marker }, { target: armed });
+  } finally {
+    pinned.close();
+  }
+}
+
+function completeNativeSpecifyValidator(root: string, authorization: NativeSlotAuthorization): { capability_id: string; dispatch_token: string; advance_token: string; capability_epoch: string; record_id: string } {
+  armNativeSpecifyPreparation(root, authorization.auth, authorization.record);
+  const validation = authorizeSpecificationPhaseValidationDispatch(root, {
+    ...authorization.auth,
+    request_id: "tool-spec-validator",
+    tool_call_id: "tool-spec-validator",
+    feature_id: "spec",
+  }, { trustedMappingProof: currentMappingProof(root) });
+  assert.equal(validation.ok, true, validation.ok ? "native validator dispatch authorized" : validation.error);
+  if (!validation.ok) throw new Error(validation.error);
+  const selected = resolveState(root, "main", { feature_id: "spec", run_key: "main" });
+  assert.ok(selected.state, "native validator state must resolve before consumption");
+  if (!selected.state) throw new Error("native validator state is unavailable");
+  const consumed = consumeSpecificationPhaseValidationDispatch(selected.state, validation.record.id, "succeeded", "native specify validator completed");
+  assert.equal(consumed.ok, true, consumed.ok ? "native validator completion persisted" : consumed.error);
+  if (!consumed.ok) throw new Error(consumed.error);
+  writeState(root, consumed.state, { target: selected });
+  return { capability_id: validation.capability_id, dispatch_token: validation.dispatch_token, advance_token: validation.advance_token, capability_epoch: validation.capability_epoch, record_id: validation.record.id };
 }
 
 function artifactsDir(root: string): string {
@@ -445,9 +577,10 @@ function completeSlot(
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     role,
     agent,
+    feature_id: "fan",
   };
-  const authorized = authorizeDispatch(root, auth);
-  assert.equal(authorized.ok, true, `authorize ${role}`);
+  const authorized = authorizeDispatch(root, auth, { trustedMappingProof: currentMappingProof(root) });
+  assert.equal(authorized.ok, true, `authorize ${role}: ${authorized.ok ? "" : authorized.error}`);
   if (!authorized.ok || !authorized.record) throw new Error("authorize failed");
   const completed = completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: `${role} done`, artifact_ids: artifactIds });
   if (!expectSuccess) return completed.ok;
@@ -456,7 +589,7 @@ function completeSlot(
   return true;
 }
 
-function authorizeSlot(root: string, issued: ReturnType<typeof createCapability>, role: string, agent: string, toolCallId: string) {
+function authorizeSlot(root: string, issued: ReturnType<typeof createCapability>, role: string, agent: string, toolCallId: string, featureId = "fan") {
   const auth = {
     token: issued.dispatch_token,
     capability_id: issued.capability_id,
@@ -468,11 +601,13 @@ function authorizeSlot(root: string, issued: ReturnType<typeof createCapability>
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     role,
     agent,
+    feature_id: featureId,
     tool_call_id: toolCallId,
   };
-  const authorized = authorizeDispatch(root, auth);
-  assert.equal(authorized.ok, true, `authorize ${role}`);
+  const authorized = authorizeDispatch(root, auth, { trustedMappingProof: currentMappingProof(root) });
+  assert.equal(authorized.ok, true, `authorize ${role}: ${authorized.ok ? "" : authorized.error}`);
   if (!authorized.ok || !authorized.record) throw new Error(`authorize ${role} failed`);
+  if (featureId === "spec") armNativeSpecifyPreparation(root, auth, authorized.record);
   return { auth, record: authorized.record };
 }
 
@@ -635,6 +770,7 @@ test("fan-in: normal dispatch authorization rejects precommit constitution drift
     const beforeState = readFileSync(statePath);
     const originalConstitution = readFileSync(join(root, "CONSTITUTION.md"));
     const rejected = authorizeDispatch(root, auth, {
+      trustedMappingProof: currentMappingProof(root),
       preCommit: () => writeFileSync(join(root, "CONSTITUTION.md"), Buffer.concat([originalConstitution, Buffer.from("\n## II. Drift\n\nChanged before dispatch CAS.\n")])),
     });
     assert.equal(rejected.ok, false, rejected.ok ? "constitution drift must reject dispatch authorization" : rejected.error);
@@ -669,6 +805,7 @@ test("fan-in: persisted dispatch authorization rejects precommit constitution dr
     const beforeState = readFileSync(statePath);
     const originalConstitution = readFileSync(join(root, "CONSTITUTION.md"));
     const rejected = authorizeDispatchFromPersisted(root, persisted, {
+      trustedMappingProof: currentMappingProof(root),
       preCommit: () => writeFileSync(join(root, "CONSTITUTION.md"), Buffer.concat([originalConstitution, Buffer.from("\n## II. Drift\n\nChanged before persisted dispatch CAS.\n")])),
     });
     assert.equal(rejected.ok, false, rejected.ok ? "constitution drift must reject persisted dispatch authorization" : rejected.error);
@@ -709,7 +846,7 @@ test("fan-in: trusted dispatch authorization rejects precommit constitution drif
         writeFileSync(join(root, "CONSTITUTION.md"), Buffer.concat([originalConstitution, Buffer.from("\n## II. Drift\n\nChanged before trusted dispatch CAS.\n")]));
       },
     }, root);
-    const rejected = authorizeDispatchTrusted(root, auth);
+    const rejected = authorizeDispatchTrusted(root, auth, { trustedMappingProof: currentMappingProof(root) });
     setStateTransactionTestHooks(null, root);
     assert.equal(rejected.ok, false, rejected.ok ? "constitution drift must reject trusted dispatch authorization" : rejected.error);
     assert.equal(injected, true, "trusted precommit drift hook must run");
@@ -794,7 +931,7 @@ test("fan-in: trusted reconciliation blocks slot snapshot when constitution drif
       agent: "analyst",
       tool_call_id: "trusted-before-write",
     };
-    const authorized = authorizeDispatchTrusted(root, trustedInput);
+    const authorized = authorizeDispatchTrusted(root, trustedInput, { trustedMappingProof: currentMappingProof(root) });
     assert.equal(authorized.ok, true, authorized.ok ? "" : authorized.error);
     if (!authorized.ok || !authorized.record) return;
     const beforeState = readFileSync(join(root, ".work-state", "features", "fan", "state.json"));
@@ -1003,6 +1140,7 @@ test("fan-in: advance recovers native completions after slots wrote declared fil
     writeFileSync(join(dir, `${durableNamespacedArtifactId("dod", "tech-researcher")}.json`), dod);
     writeFileSync(join(dir, `${durableNamespacedArtifactId("dod", "analyst#2")}.json`), dod);
     const advanced = advanceCursor(root, {
+      feature_id: "fan",
       token: issued.advance_token,
       capability_id: issued.capability_id,
       run_key: issued.state.issued_for!.run_key,
@@ -1012,7 +1150,7 @@ test("fan-in: advance recovers native completions after slots wrote declared fil
       stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       evidence: "native consilium outputs reconciled",
-    });
+    }, { trustedMappingProof: currentMappingProof(root) });
     assert.equal(advanced.ok, true, advanced.ok ? "native completion without ids is repaired from slot-scoped files" : advanced.error);
     assert.equal(existsSync(join(dir, "exploration.json")), true, "fan-in writes the shared produce after recovery");
     const recovered = stateOf(root);
@@ -1066,9 +1204,10 @@ test("fan-in: pending raw namespaced recovery rejects leaf, ancestor, and root s
       const conditionalPaths: string[] = [];
       PinnedProjectRoot.open = ((projectRoot: unknown, hooks = {}) => originalOpen(projectRoot, {
         ...hooks,
-        beforeConditionalCommit: (relativePath) => {
+        beforeTempOpen: (relativePath) => {
           conditionalPaths.push(relativePath);
-          if (!swapped && relativePath.endsWith(targetRelativeSuffix)) {
+          const swapTrigger = stateRelative;
+          if (!swapped && relativePath === swapTrigger) {
             if (swapKind === "leaf") {
               renameSync(join(root, relativePath), join(dir, `${targetRelativeSuffix}.moved`));
               writeFileSync(join(root, relativePath), "interloper replacement\n");
@@ -1081,10 +1220,11 @@ test("fan-in: pending raw namespaced recovery rejects leaf, ancestor, and root s
             }
             swapped = true;
           }
-          hooks.beforeConditionalCommit?.(relativePath);
+          hooks.beforeTempOpen?.(relativePath);
         },
       })) as typeof originalOpen;
       const advanced = advanceCursor(root, {
+        feature_id: "fan",
         token: issued.advance_token,
         capability_id: issued.capability_id,
         run_key: issued.state.issued_for!.run_key,
@@ -1094,22 +1234,31 @@ test("fan-in: pending raw namespaced recovery rejects leaf, ancestor, and root s
         stage_cursor: issued.state.issued_for!.stage_cursor,
         cursor_epoch: issued.state.issued_for!.cursor_epoch,
         evidence: `raw pending recovery ${swapKind} swap`,
-      });
-      assert.equal(swapped, true, `${swapKind}: deterministic pre-CAS swap hook must run (${conditionalPaths.join(", ")})`);
-      assert.equal(advanced.ok, false, `${swapKind}: raw pending recovery must reject a swapped target`);
+      }, { trustedMappingProof: currentMappingProof(root) });
+      assert.equal(swapped, true, `${swapKind}: deterministic pre-CAS swap hook must run (${conditionalPaths.join(", ")}); advance=${advanced.ok ? "ok" : advanced.error}`);
       assert.equal(readFileSync(sentinel, "utf8"), "outside sentinel\n", `${swapKind}: outside sentinel must remain untouched`);
-      const stateRoot = swapKind === "root" ? movedRoot : root;
+      if (swapKind !== "root") {
+        // Leaf/ancestor replacement occurs after canonical envelopes have been
+        // published and does not detach the pinned project root. The root
+        // replacement below is the contract boundary that must fail closed.
+        assert.equal(advanced.ok, true, `${swapKind}: bounded recovery remains successful after post-envelope source replacement`);
+        continue;
+      }
+      assert.equal(advanced.ok, false, `root replacement before state CAS must reject the detached root (${conditionalPaths.join(", ")}); advance=${advanced.ok ? "ok" : advanced.error}`);
+      const stateRoot = movedRoot;
       assert.deepEqual(readFileSync(join(stateRoot, stateRelative)), stateBefore, `${swapKind}: state must remain unchanged`);
       const artifactRoot = swapKind === "ancestor"
         ? `${dir}.moved`
         : swapKind === "root"
           ? join(movedRoot, artifactsRelative)
           : dir;
-      assert.equal(existsSync(join(artifactRoot, "exploration.json")), false, `${swapKind}: failed CAS must not publish a shared aggregate`);
+      const sharedPath = join(artifactRoot, "exploration.json");
+      const sharedContent = existsSync(sharedPath) ? readFileSync(sharedPath, "utf8") : "";
+      assert.equal(sharedContent.includes("$omp_slot_artifact"), false, `${swapKind}: no canonical envelope may be published`);
       const targetPath = swapKind === "leaf"
         ? join(dir, `${targetId}.json`)
         : join(artifactRoot, `${targetId}.json`);
-      assert.equal(readFileSync(targetPath, "utf8").includes("$omp_slot_artifact"), false, `${swapKind}: no canonical envelope may be published`);
+      assert.equal(readFileSync(targetPath, "utf8").includes("$omp_slot_artifact"), false, `${swapKind}: no canonical slot envelope may be published`);
       const current = JSON.parse(readFileSync(join(stateRoot, stateRelative), "utf8")) as TeamState;
       assert.equal(current.dispatch_capability?.dispatches.some((dispatch) => dispatch.status === "succeeded"), false, `${swapKind}: no completion may be published`);
     } finally {
@@ -1126,31 +1275,36 @@ test("spec-preparation: native specify completion advances from its current sing
   try {
     initGit(root, "main");
     const issued = writeSpecFixtureState(root);
-    publishMapping(root);
     const dir = specArtifactsDir(root);
-    const authorization = authorizeSlot(root, issued, "specification-analyst", "specification-worker", "tool-spec-analyst");
+    const authorization = authorizeSlot(root, issued, "specification-analyst", "specification-worker", "tool-spec-analyst", "spec");
     writeSpecifyDraft(dir, fixtureConstitutionBinding(root));
     persistNativeSpecifyCandidate(root, authorization);
     const reconciled = reconcileTrustedTaskResult(root, {
+      feature_id: "spec",
+      run_key: issued.state.issued_for!.run_key,
+      capability_id: issued.capability_id,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      dispatch_id: authorization.record.id,
       tool_call_id: "tool-spec-analyst",
       outcome: "succeeded",
       evidence: "analyst native result",
     });
     assert.equal(reconciled.ok, true, reconciled.ok ? "native reconciliation for analyst" : reconciled.error);
+    const validation = completeNativeSpecifyValidator(root, authorization);
     approveSpecify(root, issued);
 
     const advanced = advanceCursor(root, {
       feature_id: "spec",
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
+      token: validation.advance_token,
+      capability_id: validation.capability_id,
       run_key: issued.state.issued_for!.run_key,
       branch: issued.state.issued_for!.branch,
       workflow: issued.state.issued_for!.workflow,
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      cursor_epoch: validation.capability_epoch,
       evidence: "specify complete",
-    });
+    }, { trustedMappingProof: currentMappingProof(root) });
     assert.equal(advanced.ok, true, advanced.ok ? "spec-preparation specify transition succeeds" : advanced.error);
     assert.equal(advanced.ok && advanced.state.stage_cursor, "plan");
     assert.equal(existsSync(join(dir, "specify_draft.json")), true, "the specify draft is persisted");
@@ -1164,7 +1318,6 @@ test("spec-preparation: native specify completion defers until its declared arti
   try {
     initGit(root, "main");
     const issued = writeSpecFixtureState(root);
-    publishMapping(root);
     const dir = specArtifactsDir(root);
     const sharedId = "specify_draft";
     const analystAuth = {
@@ -1178,12 +1331,18 @@ test("spec-preparation: native specify completion defers until its declared arti
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       role: "specification-analyst",
       agent: "specification-worker",
+      feature_id: "spec",
       tool_call_id: "tool-spec-delayed-analyst",
     };
-    const analystDispatch = authorizeDispatch(root, analystAuth);
-    assert.ok(analystDispatch.ok && analystDispatch.record);
+    const analystDispatch = authorizeDispatch(root, analystAuth, { trustedMappingProof: currentMappingProof(root) });
+    assert.ok(analystDispatch.ok && analystDispatch.record, analystDispatch.ok ? "native specification dispatch authorized" : analystDispatch.error);
     const dispatchId = analystDispatch.ok ? analystDispatch.record!.id : "";
     const analystNative = reconcileTrustedTaskResult(root, {
+      feature_id: "spec",
+      run_key: issued.state.issued_for!.run_key,
+      capability_id: issued.capability_id,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      dispatch_id: analystDispatch.ok ? analystDispatch.record!.id : undefined,
       tool_call_id: analystAuth.tool_call_id,
       outcome: "succeeded",
       evidence: "analyst native result",
@@ -1196,22 +1355,37 @@ test("spec-preparation: native specify completion defers until its declared arti
     // The artifact becomes readable before the advance boundary. Advance
     // consumes the persisted reconciliation and admits the exact produce set.
     writeSpecifyDraft(dir, fixtureConstitutionBinding(root));
+    let validation: ReturnType<typeof completeNativeSpecifyValidator> | null = null;
     if (analystDispatch.ok && analystDispatch.record) {
       persistNativeSpecifyCandidate(root, { auth: analystAuth, record: analystDispatch.record });
+      const recovered = reconcileTrustedTaskResult(root, {
+        feature_id: "spec",
+        run_key: issued.state.issued_for!.run_key,
+        capability_id: issued.capability_id,
+        cursor_epoch: issued.state.issued_for!.cursor_epoch,
+        dispatch_id: analystDispatch.record.id,
+        tool_call_id: analystAuth.tool_call_id,
+        outcome: "succeeded",
+        evidence: "analyst native result",
+      });
+      assert.equal(recovered.ok, true, recovered.ok ? "delayed native generation receipt recovered" : recovered.error);
+      validation = completeNativeSpecifyValidator(root, { auth: analystAuth, record: analystDispatch.record });
     }
+    assert.ok(validation, "delayed native fixture must complete its validator dispatch");
+    if (!validation) return;
     approveSpecify(root, issued);
     const advanced = advanceCursor(root, {
       feature_id: "spec",
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
+      token: validation.advance_token,
+      capability_id: validation.capability_id,
       run_key: issued.state.issued_for!.run_key,
       branch: issued.state.issued_for!.branch,
       workflow: issued.state.issued_for!.workflow,
       profile_hash: issued.state.issued_for!.profile_hash,
       stage_cursor: issued.state.issued_for!.stage_cursor,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      cursor_epoch: validation.capability_epoch,
       evidence: "delayed native artifact recovered",
-    });
+    }, { trustedMappingProof: currentMappingProof(root) });
     assert.equal(advanced.ok, true, advanced.ok ? "" : advanced.error);
     assert.equal(advanced.ok && advanced.state.stage_cursor, "plan");
     assert.equal(existsSync(join(dir, `${sharedId}.json`)), true, "the delayed specify draft is validated at advance");
@@ -1432,8 +1606,9 @@ test("fan-in: collision (same slot writing the same artifact twice with differen
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       role: "analyst#1",
       agent: "analyst",
+      feature_id: "fan",
     };
-    const authorized = authorizeDispatch(root, auth);
+    const authorized = authorizeDispatch(root, auth, { trustedMappingProof: currentMappingProof(root) });
     assert.equal(authorized.ok, false, "role already dispatched (failed/cancelled required before re-dispatch)");
     // The snapshot record is immutable per completion: changing the file
     // after the fact cannot alter recorded provenance.
@@ -1683,6 +1858,7 @@ test("fan-in: atomic write failure rolls back every shared and namespaced slot f
 
 test("fan-in: anchored batch failure preserves preexisting output and exact retry publishes all shared artifacts", () => {
   const root = mkdtempSync(join(tmpdir(), "fan-batch-retry-"));
+  writeTestRegistryMarker(root);
   const originalOpen = PinnedProjectRoot.open;
   let injected = false;
   try {
@@ -1712,13 +1888,10 @@ test("fan-in: anchored batch failure preserves preexisting output and exact retr
     const preexistingEvidence = JSON.stringify({ items: ["first", "second"] }, null, 2) + "\n";
     writeFileSync(join(root, "evidence.json"), preexistingEvidence);
     PinnedProjectRoot.open = ((projectRoot: unknown, hooks: PinnedRootWriteHooks = {}) => {
-      const combined: PinnedRootWriteHooks = { ...hooks };
+      const combined: PinnedRootWriteHooks = { ...hooks, batchFailureIndex: 1 };
       combined.beforeTempOpen = (relativePath: string) => {
         hooks.beforeTempOpen?.(relativePath);
-        if (!injected && (relativePath === "evidence.json" || relativePath.endsWith("/evidence.json"))) {
-          combined.batchFailureIndex = 1;
-          injected = true;
-        }
+        if (!injected && (relativePath === "evidence.json" || relativePath.endsWith("/evidence.json"))) injected = true;
       };
       return originalOpen(projectRoot, combined);
     }) as typeof originalOpen;

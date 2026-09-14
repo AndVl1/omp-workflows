@@ -5455,6 +5455,7 @@ export class PinnedProjectRoot {
     try {
       for (const [index, entry] of entries.entries()) {
         this.hooks.beforeTempOpen?.(entry.path);
+        this.assertStable();
         this.hooks.beforeRename?.(entry.path);
         if (batchManifest) {
           const currentPreimage = this.captureWritePreimage(entry.path);

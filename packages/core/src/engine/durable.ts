@@ -5863,6 +5863,7 @@ function recoverSynchronousArtifactIds(
   cap: ActiveCapability,
   stage: StageDef,
   canonicalPhaseArtifactReady = false,
+  registerRollback?: DeferredCleanup,
 ): { ok: true; state: TeamState } | { ok: false; error: string } {
   const artifactsDirRelative = artifactsRelativeFor(pinnedRoot, target);
   if (artifactsDirRelative === null) return { ok: false, error: "workflow artifact directory is unavailable or outside the pinned project root" };
@@ -5914,7 +5915,7 @@ function recoverSynchronousArtifactIds(
         completed_by: "synchronous_tool_result",
         terminal_signal: reconciliation.terminal_signal,
         ...(reconciliation.provider_id ? { provider_id: reconciliation.provider_id } : {}),
-      }, beforeArtifactWrite);
+      }, beforeArtifactWrite, registerRollback);
       if (!result.ok) return { ok: false, error: result.error };
       recovered = result.state;
       continue;
@@ -5960,7 +5961,7 @@ function recoverSynchronousArtifactIds(
       evidence: `${completion.evidence}\r\nRecovered declared artifact ids at workflow advance.`,
       artifact_ids: artifactIds,
       completed_by: "synchronous_tool_result",
-    }, beforeArtifactWrite);
+    }, beforeArtifactWrite, registerRollback);
     if (!result.ok) return { ok: false, error: result.error };
     recovered = result.state;
   }
@@ -6698,7 +6699,7 @@ function advanceCursorMutation(
   if (artifactsDirRelative === null) return { ok: false, error: "artifact directory is outside the pinned project root", state: rawState };
   const canonicalArtifactReady = canonicalPhaseArtifactReady(rawState, target, pinnedRoot, currentStage);
   const migratedArtifactReady = canonicalArtifactReady && rawState.specification?.source_kind === "legacy";
-  const recovered = recoverSynchronousArtifactIds(cwd, rawState, target, pinnedRoot, cap, currentStage, canonicalArtifactReady);
+  const recovered = recoverSynchronousArtifactIds(cwd, rawState, target, pinnedRoot, cap, currentStage, canonicalArtifactReady, registerRollback);
   if (!recovered.ok) return { ok: false, error: recovered.error, state: rawState };
   let state = recovered.state;
 
