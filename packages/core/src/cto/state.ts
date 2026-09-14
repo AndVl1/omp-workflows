@@ -2025,6 +2025,8 @@ function recoverCtoRunDeliveryJournalsForRefreshPinned(pinnedRoot: PinnedProject
       if (!journalRead) return true;
       const state = readCtoStatePinned(runId, pinnedRoot);
       if (!state) {
+        if (journalRead.journal.schema_version === 1) return false;
+        if (!journalAuthenticatesPinned(pinnedRoot, journalRead.journal)) return false;
         const stateInfo = pinnedRoot.pathEntryInfo(join(".work-state", "cto", runId, "state.json"));
         if (stateInfo !== null) return false;
         pinnedRoot.removeFileIfMatches(ctoRunDeliveryJournalRelativePath(runId), journalRead.observed);
@@ -3572,6 +3574,8 @@ function recoverCtoRunDeliveryIndexLocked(
     if (!journalRead) continue;
     const state = readCtoStatePinned(runId, pinnedRoot);
     if (!state) {
+      if (journalRead.journal.schema_version === 1) throw new Error(`legacy CTO journal '${runId}' has no exactly proved state`);
+      if (!journalAuthenticatesPinned(pinnedRoot, journalRead.journal)) throw new Error(`CTO publication journal is not authenticated for '${runId}'`);
       // Only an actually absent state path is the pre-state publication gap.
       // A present malformed/symlinked state is recovery evidence and must not
       // be deleted or hidden by index repair.
@@ -3581,6 +3585,8 @@ function recoverCtoRunDeliveryIndexLocked(
       continue;
     }
     if (state.id !== runId || !isSafeCtoRunId(state.id)) throw new Error(`CTO state identity mismatch for journal '${runId}'`);
+    if (journalRead.journal.schema_version === 2 && !journalAuthenticatesPinned(pinnedRoot, journalRead.journal)) throw new Error(`CTO publication journal is not authenticated for '${runId}'`);
+    if (journalRead.journal.schema_version === 1 && !legacyJournalExactStateProofPinned(pinnedRoot, state, journalRead.journal)) throw new Error(`legacy CTO journal is not exactly proved for '${runId}'`);
     const revision = Number.isSafeInteger(state.state_revision) && (state.state_revision as number) >= 0
       ? state.state_revision as number
       : 0;
