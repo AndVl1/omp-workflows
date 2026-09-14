@@ -80,6 +80,7 @@ import { BoundedQueueError, openBoundedQueue, type BoundedQueue, type BoundedQue
 import {
   assertCtoRuntimeAccessFacadeLive,
   assertCtoRuntimeProofAuthorityLive,
+  assertCtoRuntimeProofAuthorityBound,
   isCtoRuntimeAccessFacade,
   isCtoRuntimeProofAuthority,
   signCtoRuntimeProof,
@@ -605,8 +606,8 @@ export function queueCtoDelivery(root: string, runId: string, delivery: CtoDeliv
 }
 
 /** Adapter factory for a transport kind (built-in or consumer-registered). */
-export type EscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined) => EscalationAdapter | null;
-type BuiltinEscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: CtoRuntimeBridgeRouteAccess, assertRoutingLive?: () => void) => EscalationAdapter | null;
+export type EscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess) => EscalationAdapter | null;
+type BuiltinEscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: CtoRuntimeBridgeRouteAccess, assertRoutingLive?: () => void, assertActivationLive?: () => void) => EscalationAdapter | null;
 
 /**
  * Capabilities are registered alongside a consumer transport because channel
@@ -676,7 +677,29 @@ function guardedAdapterOperation<T>(assertLive: () => void, operation: () => T):
   return result;
 }
 
-function wrapCustomAdapterMethods(adapter: EscalationAdapter, assertLive: () => void): void {
+function guardedAsyncAdapterOperation<T>(assertLive: () => void, operation: () => T): Promise<T> {
+  let result: T;
+  try {
+    assertLive();
+    result = operation();
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  if (result && typeof (result as { then?: unknown }).then === "function") {
+    return Promise.resolve(result as unknown as PromiseLike<unknown>).then(
+      (value) => { assertLive(); return value; },
+      (error) => { assertLive(); throw error; },
+    ) as Promise<T>;
+  }
+  try {
+    assertLive();
+    return Promise.resolve(result);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+function wrapAdapterMethods(adapter: EscalationAdapter, assertLive: () => void): void {
   const target = adapter as unknown as Record<string, unknown>;
   for (const name of ["send", "sendWithIdempotency", "cancel", "pollOnce", "sendPlainText", "setPlainMessageHandler", "setAnswerHandler"] as const) {
     const original = target[name];
@@ -690,7 +713,11 @@ function wrapCustomAdapterMethods(adapter: EscalationAdapter, assertLive: () => 
           () => Reflect.apply(handler, undefined, callbackArgs),
         );
       }
-      return guardedAdapterOperation(assertLive, () => Reflect.apply(original, adapter, forwarded));
+      const operation = () => Reflect.apply(original, adapter, forwarded);
+      if (name === "send" || name === "sendWithIdempotency" || name === "cancel" || name === "pollOnce" || name === "sendPlainText") {
+        return guardedAsyncAdapterOperation(assertLive, operation);
+      }
+      return guardedAdapterOperation(assertLive, operation);
     };
   }
 }
@@ -708,7 +735,7 @@ function markAdapterRegistrationLive(adapter: EscalationAdapter, registration: A
     existing.assertLive();
     return;
   }
-  wrapCustomAdapterMethods(adapter, assertLive);
+  wrapAdapterMethods(adapter, assertLive);
   Object.defineProperty(adapter, ADAPTER_REGISTRATION_LIVE_GUARD, {
     configurable: true,
     enumerable: false,
@@ -819,7 +846,13 @@ function capabilitiesEqual(
 
 const builtinAdapterFactories = new Map<string, AdapterRegistration>([
   ["http", {
-    factory: (config) => (config.http?.url ? new HttpEscalationAdapter({ url: config.http.url, headers: config.http.headers }) : null),
+    // HTTP is send-capable, so it may only be constructed on the resident
+    // runtime path. The bridge-only authority is intentionally Telegram-only.
+    factory: () => null,
+    proofFactory: (config, _cwd, pinnedRoot, runtimeAccess, _proofAuthority, _bridgeRoute, _assertRoutingLive, assertActivationLive) =>
+      runtimeAccess && pinnedRoot && config.http?.url
+        ? new HttpEscalationAdapter({ url: config.http.url, headers: config.http.headers, assertLive: assertActivationLive })
+        : null,
     capabilities: frozenCapabilities({ canReceiveInbound: false, canSend: true, canSendWithIdempotency: true }),
     builtin: true,
   }],
@@ -900,6 +933,59 @@ function assertRuntimeScope(runtimeAccess: RuntimeAccess, scope: AdapterResoluti
     throw new EscalationConfigError("changed", String(error instanceof Error ? error.message : error));
   }
   if (!scope.pinnedRoot.isStable()) throw new EscalationConfigError("changed", "escalation channel root changed during resolution");
+}
+
+/**
+ * A resident adapter must be built under the exact project activation that
+ * owns its transport. The standalone Telegram bridge is the one exception:
+ * it has a narrow authenticated bridge route rather than the full runtime
+ * facade, and that authority is accepted only for the Telegram built-in.
+ */
+function assertAdapterConstructionAuthorities(
+  kind: string,
+  runtimeAccess: RuntimeAccess | undefined,
+  proofAuthority: CtoRuntimeProofAuthority,
+  bridgeRoute: CtoRuntimeBridgeRouteAccess | undefined,
+  scope: AdapterResolutionScope,
+): void {
+  const bridgeOnly = runtimeAccess === undefined;
+  if (bridgeOnly && (kind !== "telegram" || !bridgeRoute)) {
+    throw new Error("adapter construction requires an authenticated runtime access facade");
+  }
+  assertCtoRuntimeProofAuthorityBound(proofAuthority, scope.pinnedRoot);
+  if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
+  if (bridgeRoute) {
+    bridgeRoute.assertLive();
+    bridgeRoute.assertProjectRoot(scope.root.canonical_root);
+  }
+  if (!scope.pinnedRoot.isStable()) throw new EscalationConfigError("changed", "escalation channel root changed during construction");
+}
+
+function assertAdapterEffectAuthoritiesLive(
+  expectedRoot: AdapterRootIdentity,
+  runtimeAccess: RuntimeAccess | undefined,
+  proofAuthority: CtoRuntimeProofAuthority,
+  bridgeRoute: CtoRuntimeBridgeRouteAccess | undefined,
+): void {
+  let pin: PinnedProjectRoot | null = null;
+  try {
+    pin = PinnedProjectRoot.open(expectedRoot.canonical_root);
+    if (!pin || !pin.isStable() || pin.dev !== expectedRoot.root_dev || pin.ino !== expectedRoot.root_ino) {
+      throw new Error("adapter activation project root changed");
+    }
+    assertCtoRuntimeProofAuthorityBound(proofAuthority, pin);
+    if (runtimeAccess) {
+      assertCtoRuntimeAccessFacadeLive(runtimeAccess, expectedRoot.canonical_root);
+      runtimeAccess.assertLive();
+      runtimeAccess.assertProjectRoot(expectedRoot.canonical_root);
+    }
+    if (bridgeRoute) {
+      bridgeRoute.assertLive();
+      bridgeRoute.assertProjectRoot(expectedRoot.canonical_root);
+    }
+  } finally {
+    pin?.close();
+  }
 }
 
 function registrationForKind(kind: string, scope?: AdapterResolutionScope): AdapterRegistration | undefined {
@@ -1008,24 +1094,25 @@ function invokeAdapterFactory(
   if (!registration.builtin && !liveCustomRegistration(registration, scope.root)) return null;
   let adapter: EscalationAdapter | null;
   try {
-    if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
-    if (bridgeRoute) bridgeRoute.assertProjectRoot(scope.root.canonical_root);
-    if (!scope.pinnedRoot.isStable()) return null;
+    assertAdapterConstructionAuthorities(config.adapter, runtimeAccess, proofAuthority, bridgeRoute, scope);
     const routingSnapshot = initialRoutingSnapshot ?? (config.adapter === "telegram" ? (bridgeRoute ?? runtimeAccess)?.resolveEscalationChannelSnapshot() : undefined);
     const assertRoutingLive = config.adapter === "telegram"
       ? createTelegramRoutingGuard(config, scope.root, runtimeAccess, bridgeRoute, routingSnapshot)
       : undefined;
+    const assertActivationLive = () => assertAdapterEffectAuthoritiesLive(scope.root, runtimeAccess, proofAuthority, bridgeRoute);
     if (config.adapter === "telegram" && !assertRoutingLive) throw new EscalationConfigError("changed", "telegram routing guard could not be authenticated");
-    adapter = registration.proofFactory
-      ? registration.proofFactory(config, cwd, scope.pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute, assertRoutingLive)
-      : registration.factory(config, cwd, scope.pinnedRoot, runtimeAccess);
+    if (registration.proofFactory) {
+      adapter = registration.proofFactory(config, cwd, scope.pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute, assertRoutingLive, assertActivationLive);
+    } else {
+      if (!runtimeAccess) return null;
+      adapter = registration.factory(config, cwd, scope.pinnedRoot, runtimeAccess);
+    }
     // This is the final construction fence for the adapter itself. A factory
     // that rotates escalation.json synchronously cannot return an old-token
     // Telegram adapter paired with a new guard (or with no guard).
     assertRoutingLive?.();
     if (assertRoutingLive) routingGuards?.push(assertRoutingLive);
-    if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
-    if (bridgeRoute) bridgeRoute.assertProjectRoot(scope.root.canonical_root);
+    assertAdapterConstructionAuthorities(config.adapter, runtimeAccess, proofAuthority, bridgeRoute, scope);
   } catch (error) {
     if (error instanceof EscalationConfigError && error.code === "changed") throw error;
     return null;
@@ -1034,7 +1121,15 @@ function invokeAdapterFactory(
   // against factories that mutate marker/root state themselves and ensures a
   // revoked custom registration never escapes as a usable adapter.
   if (!registration.builtin && !liveCustomRegistration(registration, scope.root)) return null;
-  if (adapter && !registration.builtin) markAdapterRegistrationLive(adapter, registration, scope.root);
+  if (adapter) {
+    // HTTP performs its own pre/post transport fence so an in-flight response
+    // cannot be admitted after revocation. Other adapters use the registry
+    // wrapper, which applies the same fence to every effectful method.
+    if (adapter.kind !== "http") {
+      wrapAdapterMethods(adapter, () => assertAdapterEffectAuthoritiesLive(scope.root, runtimeAccess, proofAuthority, bridgeRoute));
+    }
+    if (!registration.builtin) markAdapterRegistrationLive(adapter, registration, scope.root);
+  }
   return adapter;
 }
 
@@ -1199,6 +1294,8 @@ export function loadEscalationConfig(cwd: string, options: { pinnedRoot?: Pinned
 }
 
 /** Build the configured adapter; null when the config is unusable. */
+export function createEscalationAdapter(config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: CtoRuntimeBridgeRouteAccess): EscalationAdapter | null;
+export function createEscalationAdapter(config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute: CtoRuntimeBridgeRouteAccess): EscalationAdapter | null;
 export function createEscalationAdapter(config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: CtoRuntimeBridgeRouteAccess): EscalationAdapter | null {
   if (!config || typeof config.adapter !== "string") return null;
   const scope = openAdapterResolutionScope(cwd, pinnedRoot);
@@ -4977,28 +5074,55 @@ function parseBridgeLease(raw: unknown): BridgeLeaseRecord | null {
   return { ...record, session_id: value.session_id, root_identity: value.root_identity, root_dev: value.root_dev as number, root_ino: value.root_ino as number };
 }
 
+type BridgeLeaseReadStatus = "live" | "absent" | "invalid_or_unknown";
 interface BridgeLeaseReadResult {
-  status: LeaseReadStatus;
+  status: BridgeLeaseReadStatus;
   record: BridgeLeaseRecord | null;
   read?: LeaseReadBytes;
 }
 
-function readBridgeLease(root: string, pinnedRoot?: PinnedProjectRoot, proofAuthority?: CtoRuntimeProofAuthority): BridgeLeaseReadResult | null {
-  if (pinnedRoot && !pinnedRoot.isStable()) return null;
+function bridgeLockPathState(pinnedRoot: PinnedProjectRoot): "present" | "absent" | "unknown" {
+  try {
+    return pinnedRoot.pathEntryExists(join(".omp", "bridge.lock")) ? "present" : "absent";
+  } catch {
+    return "unknown";
+  }
+}
+
+function readBridgeLease(root: string, pinnedRoot?: PinnedProjectRoot, proofAuthority?: CtoRuntimeProofAuthority): BridgeLeaseReadResult {
+  // A missing/unstable pin cannot prove canonical absence. Treat it as an
+  // unknown bridge owner so resident Telegram polling fails closed.
+  if (!pinnedRoot || !pinnedRoot.isStable()) return { status: "invalid_or_unknown", record: null };
   const queue = openControlQueue(root, false, pinnedRoot);
-  if (!queue) return { status: "missing", record: null };
+  if (!queue) {
+    const state = bridgeLockPathState(pinnedRoot);
+    return { status: state === "absent" ? "absent" : "invalid_or_unknown", record: null };
+  }
   try {
     let read: LeaseReadBytes;
     try { read = queue.read("bridge.lock"); }
-    catch { return { status: "missing", record: null }; }
+    catch {
+      const state = bridgeLockPathState(pinnedRoot);
+      return { status: state === "absent" ? "absent" : "invalid_or_unknown", record: null };
+    }
     try {
       const raw = JSON.parse(decodeUtf8(read.bytes)) as unknown;
       const record = parseBridgeLease(raw);
-      if (!record || !proofAuthority || !bridgeLeaseProofMatches(proofAuthority, record)) return { status: "invalid", record: null, read };
-      return { status: "valid", record, read };
+      // Verify the exact bytes did not change during this read. A changing
+      // lock is an ownership handoff, not permission to start another poller.
+      const reread = queue.read("bridge.lock");
+      if (reread.dev !== read.dev || reread.ino !== read.ino || queueExpected(reread).sha256 !== queueExpected(read).sha256) {
+        return { status: "invalid_or_unknown", record: null, read };
+      }
+      if (!record || !proofAuthority || !bridgeLeaseProofMatches(proofAuthority, record)
+        || !bridgeRecordMatchesPinnedRoot(root, pinnedRoot, record) || !pinnedRoot.isStable()) {
+        return { status: "invalid_or_unknown", record: null, read };
+      }
+      return { status: bridgeLeaseAlive(record) ? "live" : "absent", record, read };
     } catch {
-      // Malformed/unauthenticated bytes are a split-brain fence, never a dead owner.
-      return { status: "invalid", record: null, read };
+      // Malformed/unauthenticated/changing bytes are a split-brain fence,
+      // never a dead owner and never canonical absence.
+      return { status: "invalid_or_unknown", record: null, read };
     }
   } finally {
     queue.close();
@@ -5024,7 +5148,7 @@ function sweepBridgeLeases(proofAuthority?: CtoRuntimeProofAuthority): void {
         continue;
       }
       const currentRead = readBridgeLease(root, pin, proofAuthority);
-      if (currentRead?.status === "invalid") continue;
+      if (currentRead?.status === "invalid_or_unknown") continue;
       const current = currentRead?.record;
       const currentMatchesRoot = Boolean(current && bridgeRecordMatchesPinnedRoot(root, pin, current));
       const expiredOrDead = !current || !bridgeLeaseAlive(current);
@@ -5202,8 +5326,8 @@ export function writeBridgeLock(root: string, pinnedRoot?: PinnedProjectRoot, pr
       if (!(error instanceof BoundedQueueError && error.code === "exists")) return bridgeLeaseNotOwned();
     }
     const current = readBridgeLease(root, pin, proofAuthority);
-    if (!current || current.status === "invalid" || (current.record && !bridgeRecordMatchesPinnedRoot(root, pin, current.record))) return bridgeLeaseNotOwned();
-    if (current.status === "valid" && !current.read) return bridgeLeaseNotOwned();
+    if (!current || current.status === "invalid_or_unknown") return bridgeLeaseNotOwned();
+    if (current.status === "live" && !current.read) return bridgeLeaseNotOwned();
     if (current.record && bridgeLeaseAlive(current.record)) {
       const known = bridgeLeases.get(root);
       if (known && known.token === current.record.token && known.epoch === current.record.epoch) return bridgeLeaseHandle(current.record);
@@ -6801,8 +6925,15 @@ export async function pollInbox(
   //    fake-RW mock, consumer transports) has no getUpdates consumer and is
   //    polled REGARDLESS of the lock, so a live tg bridge never suppresses a
   //    configured RW channel's inbound delivery.
-  const bridgeOwnsPoll = adapter !== null && adapter.kind === "telegram" && isBridgeAlive(root, pollPin ?? undefined, opts.proofAuthority);
-  if (adapter && !bridgeOwnsPoll && isPollOnceCapable(adapter)) {
+  const bridgeLeaseStatus: BridgeLeaseReadStatus = adapter?.kind === "telegram"
+    ? readBridgeLease(root, pollPin ?? undefined, opts.proofAuthority).status
+    : "absent";
+  const bridgeOwnsPoll = adapter?.kind === "telegram" && bridgeLeaseStatus === "live";
+  // Telegram resident polling is permitted only after a canonical absence or
+  // a validated dead/expired lease. Invalid, foreign, unreadable, unstable,
+  // or changing bridge.lock bytes remain a split-brain fence.
+  const bridgePollPermitted = adapter?.kind !== "telegram" || bridgeLeaseStatus === "absent";
+  if (adapter && bridgePollPermitted && !bridgeOwnsPoll && isPollOnceCapable(adapter)) {
     const adapterPin = pollPin;
     if (!adapterPin) return;
     try {

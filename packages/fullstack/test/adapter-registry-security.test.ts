@@ -1,9 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beginRegistryRegistration, commitRegistryRegistration, recordRegistryUndo, rollbackRegistryRegistration } from "@andvl1/omp-workflows-core/registry";
+import { PinnedProjectRoot } from "@andvl1/omp-workflows-core";
+import { openCtoRuntimeBridgeRouteAccess } from "@andvl1/omp-workflows-core/cto-runtime";
 import { fullstackTestOwner } from "./mock-registration.js";
 import { openFullstackRuntimeTest } from "./runtime-access-fixture.js";
 import {
@@ -102,12 +104,118 @@ test("registry: built-in http/telegram kinds cannot be replaced or receive secre
     assert.throws(() => register(root, "http", attacker, { ...capabilities, canReceiveInbound: true }), /reserved|built-in|owner_conflict/i);
     assert.throws(() => register(root, "telegram", attacker, { ...capabilities, canReceiveInbound: false }), /reserved|built-in|owner_conflict/i);
 
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "telegram-secret", chatId: "chat-secret" } }));
     const http = createAdapter(root, { adapter: "http", http: { url: "https://secret.invalid/http-token" } });
     const telegram = createAdapter(root, { adapter: "telegram", telegram: { token: "telegram-secret", chatId: "chat-secret" } });
     assert.equal(http?.kind, "http", "reserved http remains the built-in adapter");
     assert.equal(telegram?.kind, "telegram", "reserved telegram remains the built-in adapter");
     assert.equal(attackerCalls, 0, "reserved-kind rejection occurs before attacker factory invocation");
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("registry: HTTP construction requires matching live runtime and proof authorities", async () => {
+  const root = mkdtempSync(join(tmpdir(), "adapter-authority-http-"));
+  const foreignRoot = mkdtempSync(join(tmpdir(), "adapter-authority-http-foreign-"));
+  const realFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  (globalThis as { fetch: typeof fetch }).fetch = (async () => {
+    fetchCalls += 1;
+    return new Response("ok", { status: 200 });
+  }) as typeof fetch;
+  const config = { adapter: "http", http: { url: "https://example.invalid/hook" } };
+  try {
+    assert.equal(createEscalationAdapter(config, root, undefined, undefined, undefined), null, "missing authorities reject before HTTP construction");
+    assert.equal(fetchCalls, 0, "missing authorities never invoke fetch");
+
+    const stale = openFullstackRuntimeTest(root, "registry-security-http-stale", fullstackTestOwner(root), true, false);
+    stale.close();
+    assert.equal(createEscalationAdapter(config, root, undefined, stale.access, stale.proofAuthority), null, "stale authorities reject before HTTP construction");
+    assert.equal(fetchCalls, 0, "stale authorities never invoke fetch");
+
+    const resident = runtimeFor(root);
+    let customCalls = 0;
+    const customKind = "authority-custom";
+    register(root, customKind, () => {
+      customCalls += 1;
+      return { kind: customKind, send: async () => ({ sent: true }), sendWithIdempotency: async () => ({ sent: true }), cancel: async () => undefined };
+    }, capabilities);
+    assert.equal(createEscalationAdapter({ adapter: customKind }, root, undefined, undefined, undefined), null, "missing authorities reject before custom construction");
+    assert.equal(customCalls, 0, "missing authorities never invoke a custom factory");
+    const foreign = runtimeFor(foreignRoot);
+    assert.equal(createEscalationAdapter(config, root, undefined, foreign.access, foreign.proofAuthority), null, "cross-root authorities reject before HTTP construction");
+    assert.equal(fetchCalls, 0, "cross-root authorities never invoke fetch");
+
+    const adapter = createEscalationAdapter(config, root, undefined, resident.access, resident.proofAuthority);
+    assert.ok(adapter, "matching live authorities construct HTTP");
+    assert.equal((await adapter.send({ id: "run/ask", level: "question", title: "title", body: "body", at: new Date().toISOString(), by: "test", run_id: "run" } as never)).sent, true, "activated HTTP sends");
+    assert.equal(fetchCalls, 1, "activated HTTP invokes fetch once");
+
+    resident.close();
+    await assert.rejects(() => adapter.send({} as never), /authority|activation|runtime|root/i, "revoked authority rejects before the next HTTP effect");
+    assert.equal(fetchCalls, 1, "revoked-before-call HTTP never invokes fetch");
+  } finally {
+    (globalThis as { fetch: typeof fetch }).fetch = realFetch;
+    const resident = runtimeFixtures.get(root);
+    const foreign = runtimeFixtures.get(foreignRoot);
+    resident?.close();
+    foreign?.close();
+    runtimeFixtures.delete(root);
+    runtimeFixtures.delete(foreignRoot);
+    rmSync(root, { recursive: true, force: true });
+    rmSync(foreignRoot, { recursive: true, force: true });
+  }
+});
+
+test("registry: HTTP response after revocation is not admitted", async () => {
+  const root = mkdtempSync(join(tmpdir(), "adapter-authority-http-await-"));
+  const runtime = openFullstackRuntimeTest(root, "registry-security-http-await", fullstackTestOwner(root), true, false);
+  runtimeFixtures.set(root, runtime);
+  const realFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  let release: ((response: Response) => void) | undefined;
+  (globalThis as { fetch: typeof fetch }).fetch = (async () => {
+    fetchCalls += 1;
+    return await new Promise<Response>((resolve) => { release = resolve; });
+  }) as typeof fetch;
+  try {
+    const adapter = createEscalationAdapter({ adapter: "http", http: { url: "https://example.invalid/hook" } }, root, undefined, runtime.access, runtime.proofAuthority);
+    assert.ok(adapter);
+    const pending = adapter.send({} as never);
+    runtime.close();
+    release!(new Response("ok", { status: 200 }));
+    await assert.rejects(() => pending, /authority|activation|runtime|root/i, "a revoked in-flight response is not admitted");
+    assert.equal(fetchCalls, 1, "the in-flight request may have started exactly once");
+  } finally {
+    (globalThis as { fetch: typeof fetch }).fetch = realFetch;
+    runtimeFixtures.delete(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("registry: bridge-only authority constructs Telegram but not HTTP", () => {
+  const root = mkdtempSync(join(tmpdir(), "adapter-authority-bridge-"));
+  const runtime = openFullstackRuntimeTest(root, "registry-security-bridge", fullstackTestOwner(root), true, false);
+  runtimeFixtures.set(root, runtime);
+  const pin = PinnedProjectRoot.open(root);
+  assert.ok(pin);
+  const config = { adapter: "telegram", telegram: { token: "bridge-token", chatId: "bridge-chat" } };
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify(config));
+    const bridgeRoute = openCtoRuntimeBridgeRouteAccess(runtime.activation.registry_context, pin!);
+    assert.ok(bridgeRoute, "bridge route authority opens for the activated root");
+    const telegram = createEscalationAdapter(config, root, pin, undefined, runtime.proofAuthority, bridgeRoute!);
+    assert.ok(telegram, "bridge-only authority is accepted for Telegram");
+    assert.equal(createEscalationAdapter({ adapter: "http", http: { url: "https://example.invalid/hook" } }, root, pin, undefined, runtime.proofAuthority, bridgeRoute!), null, "bridge-only authority is rejected for HTTP");
+    bridgeRoute!.close();
+  } finally {
+    pin!.close();
+    runtime.close();
+    runtimeFixtures.delete(root);
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -208,10 +316,10 @@ test("registry: idempotent activations retain independent custom adapter leases 
       const closeFirst = firstClose === "a" ? first : second;
       const stillLive = firstClose === "a" ? second : first;
       closeFirst.close();
-      assert.equal(createEscalationAdapter({ adapter: kind, custom: { token: "shared" } }, root, undefined, stillLive.access)?.kind, kind, "the remaining activation lease keeps the cell usable");
+      assert.equal(createEscalationAdapter({ adapter: kind, custom: { token: "shared" } }, root, undefined, stillLive.access, stillLive.proofAuthority)?.kind, kind, "the remaining activation lease keeps the cell usable");
       stillLive.close();
       third = openFullstackRuntimeTest(root, "registry-security-cross-activation-check", fullstackTestOwner(root), true, false);
-      assert.equal(createEscalationAdapter({ adapter: kind, custom: { token: "closed" } }, root, undefined, third.access), null, "the cell is removed after both activation leases close");
+      assert.equal(createEscalationAdapter({ adapter: kind, custom: { token: "closed" } }, root, undefined, third.access, third.proofAuthority), null, "the cell is removed after both activation leases close");
       third.close();
       runtimeFixtures.delete(root);
     } finally {
@@ -243,7 +351,7 @@ test("registry: constructed custom adapter methods fail closed after lease close
       pollOnce: async () => { polls += 1; return []; },
     });
     registerWithRuntime(owner!, root, kind, factory, { ...capabilities, canReceiveInbound: true });
-    const old = createEscalationAdapter({ adapter: kind }, root, undefined, runtime.access);
+    const old = createEscalationAdapter({ adapter: kind }, root, undefined, runtime.access, runtime.proofAuthority);
     assert.ok(old);
     await old.send({} as Parameters<typeof old.send>[0]);
     await old.pollOnce?.();
@@ -251,16 +359,16 @@ test("registry: constructed custom adapter methods fail closed after lease close
     assert.equal(polls, 1);
 
     owner.close();
-    assert.throws(() => old.send({} as Parameters<typeof old.send>[0]), /custom adapter registration is no longer live/);
-    assert.throws(() => old.pollOnce!(), /custom adapter registration is no longer live/);
+    await assert.rejects(() => old.send({} as Parameters<typeof old.send>[0]), /custom adapter registration is no longer live/);
+    await assert.rejects(() => old.pollOnce!(), /custom adapter registration is no longer live/);
     assert.equal(sends, 1, "revoked direct send never reaches the old transport");
     assert.equal(polls, 1, "revoked direct poll never reaches the old transport");
 
     replacement = openFullstackRuntimeTest(root, "registry-security-custom-replacement", fullstackTestOwner(root), true, false);
     registerWithRuntime(replacement, root, kind, factory, { ...capabilities, canReceiveInbound: true });
-    const fresh = createEscalationAdapter({ adapter: kind }, root, undefined, runtime.access);
+    const fresh = createEscalationAdapter({ adapter: kind }, root, undefined, runtime.access, runtime.proofAuthority);
     assert.ok(fresh);
-    assert.throws(() => old.send({} as Parameters<typeof old.send>[0]), /custom adapter registration is no longer live/);
+    await assert.rejects(() => old.send({} as Parameters<typeof old.send>[0]), /custom adapter registration is no longer live/);
     await fresh.send({} as Parameters<typeof fresh.send>[0]);
     assert.equal(sends, 2, "the replacement registration constructs a usable fresh adapter");
   } finally {

@@ -343,7 +343,7 @@ test("F: legacy single-adapter config unchanged — mock rw preserved, no fan-ou
     const config = { adapter: "mock", mock: { persisted: true, dir: "legacy" } };
     withConfig(root, config);
     const runtime = runtimeFor(root);
-    const adapter = createEscalationAdapter(loadEscalationConfig(root, { kind: "mock", runtimeAccess: runtime })!, root, undefined, runtime);
+    const adapter = createEscalationAdapter(loadEscalationConfig(root, { kind: "mock", runtimeAccess: runtime })!, root, undefined, runtime, runtimeFixtureFor(root).proofAuthority);
     assert.ok(adapter instanceof MockEscalationAdapter, "legacy config builds the mock adapter");
     const tasks: InboxTask[] = [];
     // Legacy single-adapter dispatcher (the adapter-direct path): the mock's

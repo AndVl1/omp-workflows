@@ -240,6 +240,10 @@ test("messenger security: invalid UTF-8 locks and inbox entries fail closed", as
     writeFileSync(bridgeLockPath(bridgeRoot), invalid);
     writeBridgeLock(bridgeRoot);
     assert.equal(isBridgeAlive(bridgeRoot), false);
+    let polls = 0;
+    const telegram = { kind: "telegram", pollOnce: async () => { polls += 1; return []; } } as never;
+    await pollInbox(bridgeRoot, telegram);
+    assert.equal(polls, 0, "malformed bridge.lock suppresses resident Telegram polling");
     assert.deepEqual(readFileSync(bridgeLockPath(bridgeRoot)), invalid);
   } finally { rmSync(bridgeRoot, { recursive: true, force: true }); }
   const dispatcherRoot = mkdtempSync(join(tmpdir(), "cto-invalid-utf8-dispatcher-"));
@@ -340,6 +344,24 @@ test("messenger security: bridge lock omits secret and forged root lock cannot a
     await pollInbox(forged, null, (task) => tasks.push(task));
     assert.equal(tasks.length, 0);
   } finally { rmSync(owner, { recursive: true, force: true }); rmSync(forged, { recursive: true, force: true }); }
+});
+
+test("messenger security: foreign bridge lock suppresses resident Telegram polling", async () => {
+  const owner = mkdtempSync(join(tmpdir(), "cto-foreign-bridge-owner-"));
+  const resident = mkdtempSync(join(tmpdir(), "cto-foreign-bridge-resident-"));
+  try {
+    writeBridgeLock(owner);
+    mkdirSync(join(resident, ".omp"), { recursive: true });
+    writeFileSync(bridgeLockPath(resident), readFileSync(bridgeLockPath(owner)));
+    let polls = 0;
+    const telegram = { kind: "telegram", pollOnce: async () => { polls += 1; return []; } } as never;
+    await pollInbox(resident, telegram);
+    assert.equal(polls, 0, "a foreign valid bridge lock remains an unknown owner");
+  } finally {
+    clearBridgeLock(owner);
+    rmSync(owner, { recursive: true, force: true });
+    rmSync(resident, { recursive: true, force: true });
+  }
 });
 
 test("messenger security: answer wake idempotency suppresses delivered replay and blocks prepared ambiguity", async () => {
