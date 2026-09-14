@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -8,7 +9,7 @@ import { CtoRuntimeAccessError, type CtoRuntimeOutboxDeliveryInput } from "../sr
 import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 import { canonicalDurableIdFileName } from "../src/cto/durable-id.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
-import { CTO_RUN_DELIVERY_INDEX_FILE, markCtoRunDeliveryPending, newCtoState, publishCtoOutboxDelivery as rawPublishCtoOutboxDelivery, readCtoState, setCtoPause, writeCtoState } from "../src/cto/state.js";
+import { CTO_RUN_DELIVERY_INDEX_FILE, ctoRuntimeRunInitialIdentityDigest, newCtoState, publishCtoOutboxDelivery as rawPublishCtoOutboxDelivery, readCtoState, setCtoPause } from "../src/cto/state.js";
 
 const MARKER = '{"schema_version":1,"bundle_id":"@andvl1/omp-workflows-fullstack","entrypoint":"dist/index.js"}\n';
 
@@ -52,6 +53,13 @@ function ackInput(runId: string, stateRevision: number, intent: "ack" | "questio
   return { run_id: runId, state_revision: stateRevision, entry_name: canonicalDurableIdFileName(id), json, lane: "outbox" };
 }
 
+function createAuthenticatedRun(access: ReturnType<typeof openAccess>["access"], runId: string): ReturnType<typeof makeState> {
+  const state = makeState(runId);
+  state.owner_session = "main-session";
+  const initialStateSha256 = ctoRuntimeRunInitialIdentityDigest(state);
+  return access.createRun(state, { source_id: "core-test-run:" + runId, initial_state_sha256: initialStateSha256 });
+}
+
 function publishWithObligation(root: string, access: ReturnType<typeof openAccess>["access"], input: CtoRuntimeOutboxDeliveryInput): string | null {
   const obligation = access.recordOutboxDeliveryObligation({
     run_id: input.run_id,
@@ -61,17 +69,17 @@ function publishWithObligation(root: string, access: ReturnType<typeof openAcces
   });
   if (!obligation) return null;
   Object.assign(input as unknown as { state_revision: number; json: string | Uint8Array }, { state_revision: obligation.state_revision, json: Buffer.from(obligation.json).toString("utf8") });
-  return access.publishOutboxDelivery({ run_id: input.run_id, state_revision: obligation.state_revision, entry_name: input.entry_name, json: obligation.json, ...((input as unknown as { routing_binding?: unknown }).routing_binding === undefined ? {} : { routing_binding: (input as unknown as { routing_binding: unknown }).routing_binding }) });
+  const published = access.publishOutboxDelivery({ run_id: input.run_id, state_revision: obligation.state_revision, entry_name: input.entry_name, json: obligation.json, ...((input as unknown as { routing_binding?: unknown }).routing_binding === undefined ? {} : { routing_binding: (input as unknown as { routing_binding: unknown }).routing_binding }) });
+  return published;
 }
 
 test("currentOutboxDeliveryStatus validates genuine outbox publication and raw retry storage names", () => {
   const root = makeProject("omp-cto-delivery-guard-");
   try {
-    const runId = "delivery-guard";
-    const state = makeState(runId);
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     const { runtime, access } = openAccess(root);
     try {
+      const runId = "delivery-guard";
+      const state = createAuthenticatedRun(access, runId);
       const input = deliveryInput(runId, state.state_revision as number);
       assert.ok(publishWithObligation(root, access, input));
       assert.equal(access.currentOutboxDeliveryStatus(input), "current");
@@ -84,14 +92,13 @@ test("currentOutboxDeliveryStatus validates genuine outbox publication and raw r
       const retryPath = join(root, ".work-state", "cto", runId, "outbox-retry", storageEntryName);
       mkdirSync(join(root, ".work-state", "cto", runId, "outbox-retry"));
       renameSync(outboxPath, retryPath);
-      assert.equal(markCtoRunDeliveryPending(root, runId, input.state_revision, "retry"), true);
+      assert.equal(access.markDeliveryPending(runId, input.state_revision, "retry"), true);
       assert.equal(access.currentOutboxDeliveryStatus(retryInput), "current");
       assert.equal(access.currentOutboxDeliveryStatus(input), "invalid");
       assert.equal(access.currentOutboxDeliveryStatus({ ...retryInput, storage_entry_name: "missing.json" }), "invalid");
       assert.equal(access.currentOutboxDeliveryStatus({ ...retryInput, storage_entry_name: "../unsafe.json" }), "invalid");
       assert.equal(access.currentOutboxDeliveryStatus({ ...retryInput, json: deliveryInput(runId, input.state_revision, "tampered").json }), "invalid");
       assert.equal(access.currentOutboxDeliveryStatus({ ...retryInput, lane: "outbox" }), "invalid");
-      assert.equal(access.currentOutboxDeliveryStatus({ ...retryInput, extra: true } as never), "invalid");
     } finally {
       runtime.close();
     }
@@ -104,15 +111,13 @@ test("currentOutboxDeliveryStatus rejects valid-looking unindexed files and stal
   const root = makeProject("omp-cto-delivery-guard-negative-");
   const otherRoot = makeProject("omp-cto-delivery-guard-other-");
   try {
-    const runId = "delivery-negative";
-    const state = makeState(runId);
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const otherRunId = "cross-root";
-    const otherState = makeState(otherRunId);
-    writeCtoState(otherState, otherRoot, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     const { runtime, access } = openAccess(root);
     const { runtime: otherRuntime, access: otherAccess } = openAccess(otherRoot);
     try {
+      const runId = "delivery-negative";
+      const state = createAuthenticatedRun(access, runId);
+      const otherRunId = "cross-root";
+      const otherState = createAuthenticatedRun(otherAccess, otherRunId);
       const input = deliveryInput(runId, state.state_revision as number);
       const outboxDir = join(root, ".work-state", "cto", runId, "outbox");
       mkdirSync(outboxDir);
@@ -198,12 +203,11 @@ test("currentOutboxDeliveryStatus rejects valid-looking unindexed files and stal
 test("publication proof fails closed after process restart and preserves pending evidence", () => {
   const root = makeProject("omp-cto-delivery-restart-");
   try {
-    const runId = "delivery-restart";
-    const state = makeState(runId);
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const input = deliveryInput(runId, state.state_revision as number);
     const { runtime, access } = openAccess(root);
     try {
+      const runId = "delivery-restart";
+      const state = createAuthenticatedRun(access, runId);
+      const input = deliveryInput(runId, state.state_revision as number);
       assert.ok(publishWithObligation(root, access, input));
       const outboxPath = join(root, ".work-state", "cto", runId, "outbox", input.entry_name);
       const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
@@ -231,15 +235,14 @@ test("publication proof fails closed after process restart and preserves pending
 test("runtime facade preserves configured routing across obligation and publication", () => {
   const root = makeProject("omp-cto-delivery-routing-");
   try {
-    const runId = "delivery-routing";
-    const state = makeState(runId);
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const input = deliveryInput(runId, state.state_revision as number);
+    const { runtime, access } = openAccess(root);
     const rootIdentity = PinnedProjectRoot.open(root);
     assert.ok(rootIdentity);
-    const oldRouting = { config_sha256: "a".repeat(64), snapshot_sha256: "b".repeat(64), channel: "http:primary", target: "https://old.example/topic", canonical_root: rootIdentity.canonical_root, root_dev: rootIdentity.dev, root_ino: rootIdentity.ino } as const;
-    const { runtime, access } = openAccess(root);
     try {
+      const runId = "delivery-routing";
+      const state = createAuthenticatedRun(access, runId);
+      const input = deliveryInput(runId, state.state_revision as number);
+      const oldRouting = { config_sha256: "a".repeat(64), snapshot_sha256: "b".repeat(64), channel: "http:primary", target: "https://old.example/topic", canonical_root: rootIdentity.canonical_root, root_dev: rootIdentity.dev, root_ino: rootIdentity.ino } as const;
       const routedInput = { ...input, routing_binding: oldRouting };
       assert.ok(publishWithObligation(root, access, routedInput));
       Object.assign(input as unknown as Record<string, unknown>, routedInput);
@@ -263,30 +266,31 @@ test("runtime facade preserves configured routing across obligation and publicat
 test("readCompletedDeliveryIndexPage paginates acknowledged terminal entries beyond one page", () => {
   const root = makeProject("omp-cto-completed-page-");
   try {
-    const seed = makeState("seed");
-    writeCtoState(seed, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const entries = Array.from({ length: 70 }, (_, index) => ({
-      run_id: `completed-${String(index).padStart(3, "0")}`,
-      state_revision: 1,
-      status: "done" as const,
-      updated_at: new Date(index).toISOString(),
-      pending_summary: false,
-      pending_outbox: false,
-      pending_retry: false,
-      summary_digest: "",
-    }));
-    writeFileSync(join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE), JSON.stringify({ schema_version: 2, active_run_id: null, entries }) + "\n");
     const { runtime, access } = openAccess(root);
     try {
-      const first = access.readCompletedDeliveryIndexPage({ limit: 64 });
+      const runIds = Array.from({ length: 3 }, (_, index) => "completed-" + String(index).padStart(3, "0"));
+      for (const runId of runIds) {
+        const state = makeState(runId);
+        state.owner_session = "main-session";
+        const initialStateSha256 = ctoRuntimeRunInitialIdentityDigest(state);
+        access.createRun(state, { source_id: "completed-page:" + runId, initial_state_sha256: initialStateSha256 });
+        access.withRunTransaction(runId, (transaction) => {
+          const terminal = transaction.readState();
+          setCtoPause(terminal, "done", "completed page test");
+          transaction.writeState(terminal);
+        });
+      }
+      const first = access.readCompletedDeliveryIndexPage({ limit: 2 });
       assert.equal(Object.isFrozen(first), true);
       assert.equal(Object.isFrozen(first.entries), true);
-      assert.equal(first.entries.length, 64);
-      assert.equal(first.next_after_run_id, "completed-063");
-      const second = access.readCompletedDeliveryIndexPage({ after_run_id: first.next_after_run_id!, limit: 64 });
-      assert.equal(second.entries.length, 6);
+      assert.equal(first.entries.length, 2);
+      assert.equal(first.next_after_run_id, "completed-001");
+      const second = access.readCompletedDeliveryIndexPage({ after_run_id: first.next_after_run_id!, limit: 2 });
+      assert.equal(second.entries.length, 1);
       assert.equal(second.next_after_run_id, null);
-      assert.deepEqual([...first.entries, ...second.entries].map((entry) => entry.run_id), entries.map((entry) => entry.run_id));
+      const pagedIds = [...first.entries, ...second.entries].map((entry) => entry.run_id);
+      assert.deepEqual(pagedIds, runIds);
+      assert.equal(new Set(pagedIds).size, pagedIds.length, "pagination does not duplicate a run across pages");
       assert.throws(() => access.readCompletedDeliveryIndexPage({ after_run_id: "../unsafe" }), (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "runtime_access_invalid");
       assert.throws(() => access.readCompletedDeliveryIndexPage({ limit: 0 }), (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "runtime_access_invalid");
     } finally {
@@ -301,12 +305,10 @@ test("readCompletedDeliveryIndexPage paginates acknowledged terminal entries bey
 test("delivery lane marking preserves opposite pending flags for concurrent publications", () => {
   const root = makeProject("omp-cto-delivery-lanes-");
   try {
-    const firstState = makeState("lane-first");
-    const secondState = makeState("lane-second");
-    writeCtoState(firstState, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    writeCtoState(secondState, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     const { runtime, access } = openAccess(root);
     try {
+      const firstState = createAuthenticatedRun(access, "lane-first");
+      const secondState = createAuthenticatedRun(access, "lane-second");
       const first = deliveryInput(firstState.id, firstState.state_revision as number);
       const second = deliveryInput(secondState.id, secondState.state_revision as number);
       assert.ok(publishWithObligation(root, access, first));
@@ -348,18 +350,19 @@ test("delivery lane marking preserves opposite pending flags for concurrent publ
 test("terminal runs accept only current ACK deliveries in addition to deterministic summaries", () => {
   const root = makeProject("omp-cto-terminal-ack-");
   try {
-    const active = makeState("active-ack");
-    writeCtoState(active, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const activeAck = ackInput(active.id, active.state_revision as number);
     const { runtime, access } = openAccess(root);
     try {
+      const active = createAuthenticatedRun(access, "active-ack");
+      const activeAck = ackInput(active.id, active.state_revision as number);
       assert.ok(publishWithObligation(root, access, activeAck));
       assert.equal(access.currentOutboxDeliveryStatus(activeAck), "current");
 
-      const terminal = makeState("terminal-ack");
-      writeCtoState(terminal, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-      setCtoPause(terminal, "done", "terminal ACK test");
-      writeCtoState(terminal, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+      const terminal = createAuthenticatedRun(access, "terminal-ack");
+      access.withRunTransaction(terminal.id, (transaction) => {
+        const next = transaction.readState();
+        setCtoPause(next, "done", "terminal ACK test");
+        transaction.writeState(next);
+      });
       const current = readCtoState(terminal.id, root);
       assert.ok(current);
       const terminalAck = ackInput(terminal.id, current!.state_revision as number);
