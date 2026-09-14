@@ -3424,20 +3424,48 @@ export function readCtoRunDeliveryCompletedIndexPage(root: string, options: { af
   }
 }
 
+type CtoRunDeliveryExactPreimage = Readonly<{ dev: number; ino: number; size: number; sha256: string; bytes: Uint8Array }>;
 interface CtoRunDeliveryIndexTransitionAuth {
-  readonly allowAuthenticatedStaleProof: boolean;
+  readonly index: CtoRunDeliveryExactPreimage | null;
+  readonly proof: CtoRunDeliveryExactPreimage | null;
+  readonly origin: CtoRunDeliveryExactPreimage | null;
 }
-function captureCtoRunDeliveryIndexTransitionAuthPinned(pinnedRoot: PinnedProjectRoot): CtoRunDeliveryIndexTransitionAuth {
+function captureCtoRunDeliveryIndexTransitionAuthPinned(pinnedRoot: PinnedProjectRoot, runId: string): CtoRunDeliveryIndexTransitionAuth {
   const current = readCtoRunDeliveryIndexSnapshotPinned(pinnedRoot);
   const proof = readCtoRunDeliveryIndexProofDetailedPinned(pinnedRoot);
   if (proof.status === "invalid") throw new PinnedRootError("recovery_required", "CTO delivery index proof is present but invalid");
   if (proof.status === "present" && current.valid && !indexProofAuthenticatesPinned(pinnedRoot, current)) {
     throw new PinnedRootError("recovery_required", "CTO delivery index proof does not authenticate the current index");
   }
-  return { allowAuthenticatedStaleProof: proof.status === "present" && current.valid };
+  const readExact = (relative: string, maxBytes: number): CtoRunDeliveryExactPreimage | null => {
+    try {
+      const read = pinnedRoot.readFile(relative, { maxBytes });
+      return { dev: read.dev, ino: read.ino, size: read.bytes.byteLength, sha256: createHash("sha256").update(read.bytes).digest("hex"), bytes: new Uint8Array(read.bytes) };
+    } catch { return null; }
+  };
+  return {
+    index: readExact(ctoRunDeliveryIndexRelativePath(), MAX_CTO_RUN_DELIVERY_INDEX_BYTES),
+    proof: readExact(join(".work-state", "cto", CTO_RUN_DELIVERY_INDEX_PROOF_FILE), 16 * 1024),
+    origin: readExact(ctoRuntimeOriginRelativePath(runId), 16 * 1024),
+  };
+}
+function exactPreimageStillMatches(pinnedRoot: PinnedProjectRoot, relative: string, expected: CtoRunDeliveryExactPreimage | null, maxBytes: number): boolean {
+  const current = (() => { try { return pinnedRoot.readFile(relative, { maxBytes }); } catch { return null; } })();
+  if (!expected) return current === null;
+  return current !== null && current.dev === expected.dev && current.ino === expected.ino && current.bytes.byteLength === expected.size
+    && createHash("sha256").update(current.bytes).digest("hex") === expected.sha256
+    && Buffer.from(current.bytes).equals(Buffer.from(expected.bytes));
+}
+function transitionPreimageStillMatches(pinnedRoot: PinnedProjectRoot, runId: string, auth: CtoRunDeliveryIndexTransitionAuth): boolean {
+  return exactPreimageStillMatches(pinnedRoot, ctoRunDeliveryIndexRelativePath(), auth.index, MAX_CTO_RUN_DELIVERY_INDEX_BYTES)
+    && exactPreimageStillMatches(pinnedRoot, join(".work-state", "cto", CTO_RUN_DELIVERY_INDEX_PROOF_FILE), auth.proof, 16 * 1024)
+    && exactPreimageStillMatches(pinnedRoot, ctoRuntimeOriginRelativePath(runId), auth.origin, 16 * 1024);
+}function transitionIndexProofStillMatches(pinnedRoot: PinnedProjectRoot, auth: CtoRunDeliveryIndexTransitionAuth): boolean {
+  return exactPreimageStillMatches(pinnedRoot, ctoRunDeliveryIndexRelativePath(), auth.index, MAX_CTO_RUN_DELIVERY_INDEX_BYTES)
+    && exactPreimageStillMatches(pinnedRoot, join(".work-state", "cto", CTO_RUN_DELIVERY_INDEX_PROOF_FILE), auth.proof, 16 * 1024);
 }
 
-function updateCtoRunDeliveryIndexLocked(state: CtoState, pinnedRoot: PinnedProjectRoot, transitionAuth: CtoRunDeliveryIndexTransitionAuth = { allowAuthenticatedStaleProof: false }): void {
+function updateCtoRunDeliveryIndexLocked(state: CtoState, pinnedRoot: PinnedProjectRoot, transitionAuth: CtoRunDeliveryIndexTransitionAuth = { index: null, proof: null, origin: null }): void {
   let current = readCtoRunDeliveryIndexSnapshotPinned(pinnedRoot);
   if (!current.valid) {
     const rebuilt = rebuildCtoRunDeliveryIndexPinned(pinnedRoot);
@@ -3457,7 +3485,7 @@ function updateCtoRunDeliveryIndexLocked(state: CtoState, pinnedRoot: PinnedProj
   const preimage = writeCtoRunDeliveryIndexPreimagePinned(pinnedRoot, state.id, current);
   try {
     persistCtoRunDeliveryIndexPinned(pinnedRoot, next, current.observed, {
-      allowAuthenticatedStaleProof: transitionAuth.allowAuthenticatedStaleProof || (preimage !== null && indexPreimageAuthenticatesCurrentPinned(pinnedRoot, state.id, current)),
+      allowAuthenticatedStaleProof: transitionIndexProofStillMatches(pinnedRoot, transitionAuth),
     });
     clearCtoRunDeliveryIndexPreimagePinned(pinnedRoot, state.id, preimage);
   }
@@ -3468,7 +3496,7 @@ function updateCtoRunDeliveryIndexLocked(state: CtoState, pinnedRoot: PinnedProj
   }
 }
 
-function updateCtoRunDeliveryIndex(state: CtoState, root: string, providedRoot?: PinnedProjectRoot, transitionAuth: CtoRunDeliveryIndexTransitionAuth = { allowAuthenticatedStaleProof: false }): void {
+function updateCtoRunDeliveryIndex(state: CtoState, root: string, providedRoot?: PinnedProjectRoot, transitionAuth: CtoRunDeliveryIndexTransitionAuth = { index: null, proof: null, origin: null }): void {
   const pinnedRoot = providedRoot ?? PinnedProjectRoot.open(root);
   if (!pinnedRoot) throw new Error("run-delivery index requires a pinnable project root");
   try {
@@ -4997,7 +5025,7 @@ export interface CtoStateWritePreCommitContext {
 }
 
 /** Write one candidate while the canonical per-run state lock is held. */
-export function writeCtoStateLocked(state: CtoState, root: string, options: { pinnedRoot?: PinnedProjectRoot; preCommit?: (context: CtoStateWritePreCommitContext) => void } = {}): string {
+export function writeCtoStateLocked(state: CtoState, root: string, options: { pinnedRoot?: PinnedProjectRoot; preCommit?: (context: CtoStateWritePreCommitContext) => void; originTransition?: { ownerSession: string } } = {}): string {
   assertCurrentExecutionLiveness();
   if (!isSafeCtoRunId(state?.id)) throw new Error("unsafe CTO run id");
   const pinnedRoot = options.pinnedRoot;
@@ -5048,8 +5076,19 @@ export function writeCtoStateLocked(state: CtoState, root: string, options: { pi
     // Capture proof authentication against the pre-CAS state/index image. A
     // standby-to-owned transition changes proof ownership only after state CAS;
     // the captured authenticated preimage authorizes that one journaled update.
-    const transitionAuth = captureCtoRunDeliveryIndexTransitionAuthPinned(pinnedRoot);
+    const transitionAuth = captureCtoRunDeliveryIndexTransitionAuthPinned(pinnedRoot, state.id);
     const priorOrigin = readCtoRuntimeRunOriginHandoffPinned(pinnedRoot, state.id);
+    const candidateInitialDigest = ctoRuntimeRunInitialIdentityDigest(state);
+    const identityChanged = priorOrigin !== null && priorOrigin.identity_sha256 !== candidateInitialDigest;
+    const authorizedPromotion = identityChanged
+      && priorOrigin?.standby === true
+      && priorOrigin.owner_session === null
+      && state.standby !== true
+      && typeof state.owner_session === "string"
+      && options.originTransition?.ownerSession === state.owner_session;
+    if (identityChanged && !authorizedPromotion) {
+      throw new PinnedRootError('recovery_required', 'CTO run origin identity transition is not authorized');
+    }
     // The index lock spans journal publication, state.json, and index. This
     // prevents a reader from observing the short interval where the journal
     // exists but state.json has not committed yet and admitting a duplicate.
@@ -5064,6 +5103,9 @@ export function writeCtoStateLocked(state: CtoState, root: string, options: { pi
       current: current?.state ?? null,
       candidate: candidate as unknown as CtoState,
     });
+    if (!transitionPreimageStillMatches(pinnedRoot, state.id, transitionAuth)) {
+      throw new PinnedRootError('changed', 'CTO delivery transition preimage changed before state CAS');
+    }
     try {
       if (current === null) pinnedRoot.writeExclusive(relativePath, serialized);
       else pinnedRoot.writeAtomic(relativePath, serialized);
@@ -5083,14 +5125,19 @@ export function writeCtoStateLocked(state: CtoState, root: string, options: { pi
     if (!writeCtoRuntimeStateProof(pinnedRoot, state) || !hasValidCtoRuntimeStateProofPinned(pinnedRoot, state)) {
       throw new PinnedRootError('recovery_required', 'CTO state proof publication failed; journal retained for recovery');
     }
-    if (priorOrigin && priorOrigin.identity_sha256 !== ctoRuntimeRunInitialIdentityDigest(state)
-      && !refreshCtoRuntimeRunOriginPinned(pinnedRoot, state, state.owner_session ?? "", priorOrigin.source_id, ctoRuntimeRunInitialIdentityDigest(state))) {
+    if (authorizedPromotion
+      && priorOrigin
+      && !refreshCtoRuntimeRunOriginPinned(pinnedRoot, state, options.originTransition!.ownerSession, priorOrigin.source_id, priorOrigin.initial_state_sha256)) {
       throw new PinnedRootError('recovery_required', 'CTO run origin transition failed; journal retained for recovery');
     }
     // Keep the index transition inside the per-run write lock so an older
     // active snapshot cannot be applied after a newer terminal transition.
     // Keeping this here also covers trusted callers that use the locked writer
     // directly for multi-artifact transactions.
+    if (!exactPreimageStillMatches(pinnedRoot, ctoRunDeliveryIndexRelativePath(), transitionAuth.index, MAX_CTO_RUN_DELIVERY_INDEX_BYTES)
+      || !exactPreimageStillMatches(pinnedRoot, join(".work-state", "cto", CTO_RUN_DELIVERY_INDEX_PROOF_FILE), transitionAuth.proof, 16 * 1024)) {
+      throw new PinnedRootError('changed', 'CTO delivery index preimage changed after state CAS');
+    }
     updateCtoRunDeliveryIndex(state, root, pinnedRoot, transitionAuth);
     // Clearing the journal is deliberately last. If this process dies while
     // clearing it, replay is idempotent and re-publishes the same exact entry.

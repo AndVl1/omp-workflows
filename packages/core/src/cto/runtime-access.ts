@@ -24,6 +24,7 @@ import {
   readCtoRunDeliveryIndexPage,
   readCtoRunDeliveryCompletedIndexPage,
   readCtoStatePinned,
+  readCtoRuntimeRunOriginHandoffPinned,
   currentOutboxDeliveryStatusPinned,
   recordCtoOutboxDeliveryObligation,
   readCtoOutboxDeliveryObligationsPinned,
@@ -1088,8 +1089,14 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
             if (typeof then === "function") throw runtimeError("cto_runtime_transaction_async_unsupported", "CTO run transactions must complete synchronously");
             if (dirty) {
               requireTransactionActive(cell, activity);
+              const initialOrigin = readCtoRuntimeRunOriginHandoffPinned(cell.root, runId);
+              const originTransition = initialOrigin?.standby === true && initialOrigin.owner_session === null
+                && state.standby !== true && state.owner_session === cell.sessionId
+                ? { ownerSession: cell.sessionId }
+                : undefined;
               writeCtoStateLocked(state, cell.root.canonical_root, {
                 pinnedRoot: cell.root,
+                ...(originTransition ? { originTransition } : {}),
                 preCommit: ({ pinnedRoot }) => {
                   requireTransactionActive(cell, activity);
                   if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "CTO project root changed before transaction commit");
@@ -1268,20 +1275,30 @@ function openBridgeRouteFromCell(
       const runId = `standby-${Date.now()}-${randomUUID().slice(0, 8)}`;
       const runDirectory = join(".work-state", "cto", runId);
       const inboxDirectory = join(runDirectory, "inbox");
-      root.ensureDirectories([runDirectory, inboxDirectory]);
-      const now = new Date().toISOString();
-      const state = newCtoState({ id: runId, task: "standby — awaiting inbox tasks", branch: "", autonomous: true, plan: { id: runId, task: "standby — awaiting inbox tasks", teams: [], created_at: now }, standby: true });
-      state.pause = { kind: "none", reason: "standby" };
-      const sourceId = `standby:${runId}`;
-      const initialDigest = ctoRuntimeRunInitialIdentityDigest(state);
-      if (!mintCtoRuntimeRunOrigin(root, state, "cto-bridge", sourceId, initialDigest)) throw runtimeError("runtime_access_invalid", "standby run origin proof could not be committed");
-      writeCtoStateLocked(state, root.canonical_root, { pinnedRoot: root, preCommit: () => assertLive() });
-      if (!writeCtoRuntimeStateProof(root, state) || !hasValidCtoRuntimeStateProofPinned(root, state)
-        || !refreshCtoRunDeliveryIndexAuthorityPinned(root, bridgeDeliveryCapability, "cto-bridge")) throw runtimeError("runtime_access_invalid", "standby delivery authority could not be committed");
-      assertLive();
-      const finalState = readCtoStatePinned(runId, root);
-      if (!finalState || finalState.id !== runId || !hasValidCtoRuntimeStateProofPinned(root, finalState)) throw runtimeError("runtime_access_invalid", "standby state changed during publication");
-      return runId;
+      try {
+        root.ensureDirectories([runDirectory, inboxDirectory]);
+        const now = new Date().toISOString();
+        const state = newCtoState({ id: runId, task: "standby — awaiting inbox tasks", branch: "", autonomous: true, plan: { id: runId, task: "standby — awaiting inbox tasks", teams: [], created_at: now }, standby: true });
+        state.pause = { kind: "none", reason: "standby" };
+        const sourceId = `standby:${runId}`;
+        const initialDigest = ctoRuntimeRunInitialIdentityDigest(state);
+        if (!mintCtoRuntimeRunOrigin(root, state, "cto-bridge", sourceId, initialDigest)) throw runtimeError("runtime_access_invalid", "standby run origin proof could not be committed");
+        writeCtoStateLocked(state, root.canonical_root, { pinnedRoot: root, preCommit: () => assertLive() });
+        if (!writeCtoRuntimeStateProof(root, state) || !hasValidCtoRuntimeStateProofPinned(root, state)
+          || !refreshCtoRunDeliveryIndexAuthorityPinned(root, bridgeDeliveryCapability, "cto-bridge")) throw runtimeError("runtime_access_invalid", "standby delivery authority could not be committed");
+        assertLive();
+        const finalState = readCtoStatePinned(runId, root);
+        if (!finalState || finalState.id !== runId || !hasValidCtoRuntimeStateProofPinned(root, finalState)) throw runtimeError("runtime_access_invalid", "standby state changed during publication");
+        return runId;
+      } catch (error) {
+        for (const path of [join(runDirectory, "state.json"), join(runDirectory, ".runtime-state-proof.json"), join(runDirectory, ".runtime-origin-proof.json")]) {
+          try { root.removeEntry(path); } catch { /* rollback is best-effort */ }
+        }
+        try { root.removeEntry(inboxDirectory); } catch { /* rollback is best-effort */ }
+        try { root.removeEntry(runDirectory); } catch { /* rollback is best-effort */ }
+        try { if (root.isStable()) refreshCtoRunDeliveryIndexAuthorityPinned(root, bridgeDeliveryCapability, cto-bridge); } catch { /* index recovery remains fail-closed */ }
+        throw error;
+      }
     }, { pinnedRoot: root });
   };
   const resolveCompletedStatus = (): Readonly<{ runId: string; summary: Readonly<Record<string, unknown>> }> | null => {
@@ -1292,20 +1309,20 @@ function openBridgeRouteFromCell(
     if (!candidates.ok) return null;
     const verified: Array<{ runId: string; summary: Readonly<Record<string, unknown>>; at: number; revision: number }> = [];
     for (const entry of candidates.entries) {
-      if (entry.status !== done && entry.status !== failed) continue;
+      if (entry.status !== "done" && entry.status !== "failed") continue;
       const at = Date.parse(entry.updated_at);
       if (!Number.isFinite(at) || at > Date.now()) continue;
       const state = readCtoStatePinned(entry.run_id, root) as Readonly<Record<string, unknown>> | null;
       if (!state || state.id !== entry.run_id || state.state_revision !== entry.state_revision || state.updated_at !== entry.updated_at
         || !hasValidCtoRuntimeStateProofPinned(root, state as unknown as CtoState)) continue;
       const pause = state.pause;
-      if (!pause || typeof pause !== object || Array.isArray(pause) || (pause as Record<string, unknown>).kind !== entry.status) continue;
+      if (!pause || typeof pause !== "object" || Array.isArray(pause) || (pause as Record<string, unknown>).kind !== entry.status) continue;
       const rawWaves = state.wave_history;
       const waves = Array.isArray(rawWaves) ? rawWaves.slice(0, 4096).map((wave) => {
-        if (!wave || typeof wave !== object || Array.isArray(wave)) return null;
+        if (!wave || typeof wave !== "object" || Array.isArray(wave)) return null;
         const item = wave as Record<string, unknown>;
-        if (typeof item.id !== string || typeof item.status !== string || typeof item.started_at !== string) return null;
-        return Object.freeze({ id: item.id, status: item.status, started_at: item.started_at, ...(typeof item.finished_at === string ? { finished_at: item.finished_at } : {}), ...(typeof item.outcome === string ? { outcome: item.outcome } : {}) });
+        if (typeof item.id !== "string" || typeof item.status !== "string" || typeof item.started_at !== "string") return null;
+        return Object.freeze({ id: item.id, status: item.status, started_at: item.started_at, ...(typeof item.finished_at === "string" ? { finished_at: item.finished_at } : {}), ...(typeof item.outcome === "string" ? { outcome: item.outcome } : {}) });
       }) : [];
       if (waves.some((wave) => wave === null)) continue;
       verified.push({ runId: entry.run_id, at, revision: entry.state_revision, summary: Object.freeze({ status: entry.status, updated_at: entry.updated_at, waves: Object.freeze(waves) }) });
