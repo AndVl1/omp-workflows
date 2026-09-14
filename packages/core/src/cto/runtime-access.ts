@@ -224,7 +224,9 @@ function runtimeCellForFacade(value: unknown): RuntimeCell | null {
 
 /**
  * Build a null-prototype, core-branded facade that adds a host identity guard
- * without inheriting or consulting any caller-controlled properties.
+ * without inheriting or consulting any caller-controlled properties. Public API
+ * capabilities are same-process loaded-JS trust boundaries, not cryptographic
+ * identities for an untrusted runtime.
  */
 export function createCtoRuntimeAccessGuardedView(
   genuine: CtoRuntimeAccessFacade,
@@ -278,7 +280,7 @@ export function assertCtoRuntimeAccessFacadeLive(
   expectedSessionId?: string,
 ): asserts value is CtoRuntimeAccessFacade {
   const cell = runtimeCellForFacade(value);
-  if (!cell) throw new CtoRuntimeAccessError("runtime_access_invalid", "CTO runtime access is not an authenticated facade");
+  if (!cell) throw new CtoRuntimeAccessError("runtime_access_invalid", "CTO runtime access is not a marker-bound runtime facade");
   requireLive(cell);
   if (expectedRoot !== undefined && cell.root.canonical_root !== expectedRoot) {
     throw new CtoRuntimeAccessError("runtime_access_invalid", "CTO runtime access project root does not match");
@@ -617,7 +619,7 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
             || supplied.dev !== cell.root.dev
             || supplied.ino !== cell.root.ino
             || !supplied.isStable()
-          ) throw runtimeError("runtime_access_invalid", "project root does not match the authenticated facade root");
+          ) throw runtimeError("runtime_access_invalid", "project root does not match the marker-bound facade root");
           requireLive(cell);
         } finally {
           supplied.close();
@@ -1126,7 +1128,7 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
 }
 
 /**
- * Open one owner-authenticated, main-session-bound CTO capability. The owner
+ * Open one marker-bound, main-session-bound CTO capability. The owner
  * context is the only authorization input; raw claims, marker strings, cwd,
  * and lock handles are intentionally not accepted.
  */

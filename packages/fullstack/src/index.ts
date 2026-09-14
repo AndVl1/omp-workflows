@@ -46,6 +46,7 @@ import {
   type ModelRoleEntry,
   type RoleConfig,
   type ScopeRuntimeClassTable,
+  type TeamSessionBindingController,
  } from "@andvl1/omp-workflows-core";
 import {
   beginRegistryRegistration,
@@ -60,8 +61,8 @@ import {
   type WorkflowActivationResult,
   type WorkflowOwnerIdentity,
 } from "@andvl1/omp-workflows-core/registry";
-import { openCtoRuntimeAccess, registerCtoRuntimeAccessProvider } from "@andvl1/omp-workflows-core/cto-runtime";
-import type { CtoRuntimeAccessFacade } from "@andvl1/omp-workflows-core/cto-runtime";
+import { createCtoRuntimeAccessGuardedView, ctoRuntimeSessionAuthorityForContext, openCtoRuntimeAccess, openCtoRuntimeProofAuthority, registerCtoRuntimeAccessProvider, revokeCtoRuntimeProofAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
+import type { CtoRuntimeAccessFacade, CtoRuntimeAccessSession, CtoRuntimeProofAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
 import { registerWorkflowCommands } from "./workflow-commands.js";
 import { defaultFullstackModelRoles, registerModelRolesCommand } from "./model-roles.js";
 export { defaultFullstackModelRoles } from "./model-roles.js";
@@ -726,18 +727,7 @@ function withDispatcherIdentityGuard(
   runtimeAccess: CtoRuntimeAccessFacade,
   assertIdentityLive: () => void,
 ): CtoRuntimeAccessFacade {
-  // The core facade intentionally defines methods as non-configurable own
-  // properties. A Proxy cannot replace `assertLive` without violating the
-  // proxy invariants; an inheriting facade keeps every core method intact
-  // while providing an own identity-fenced assertLive method.
-  const guarded = Object.create(runtimeAccess) as CtoRuntimeAccessFacade;
-  Object.defineProperty(guarded, "assertLive", {
-    configurable: true,
-    enumerable: false,
-    writable: false,
-    value: assertIdentityLive,
-  });
-  return guarded;
+  return createCtoRuntimeAccessGuardedView(runtimeAccess, assertIdentityLive);
 }
 
 const MAX_PENDING_CTO_WAKES = 128;
@@ -1150,6 +1140,9 @@ interface FullstackActivationLease {
 type FullstackActivationLiveGuard = ReturnType<typeof createRegistryRegistrationLiveGuard>;
 interface FullstackActivation {
   readonly context: RegistryRegistrationContext;
+  readonly runtimeAuthority: CtoRuntimeAccessSession;
+  readonly sessionBindingController: TeamSessionBindingController;
+  readonly proofAuthority: CtoRuntimeProofAuthority;
   readonly liveGuard: FullstackActivationLiveGuard;
   readonly leases: readonly FullstackActivationLease[];
 }
@@ -1169,6 +1162,7 @@ const fullstackLectureMounts = new WeakMap<object, LectureMountState>();
 interface RuntimeAccessSlot {
   readonly sessionId: string;
   readonly lexicalRoot: string;
+  readonly authority: CtoRuntimeAccessSession;
   readonly access: CtoRuntimeAccessFacade;
 }
 const fullstackRuntimeAccesses = new WeakMap<object, Map<string, RuntimeAccessSlot>>();
@@ -1206,7 +1200,10 @@ function evictAllRuntimeAccessSlots(pi: ExtensionAPI): void {
   fullstackRuntimeAccesses.delete(pi as object);
 }
 
-function evictFullstackRoot(pi: ExtensionAPI, root: string): void {
+function evictFullstackRoot(pi: ExtensionAPI, root: string, expected?: FullstackActivation): void {
+  const activationRecords = fullstackActivationRecords.get(pi as object);
+  const record = activationRecords?.get(root);
+  if (expected && record !== expected) return;
   // Revoke runtime access first so in-flight callbacks fail immediately, then
   // stop every dispatcher bound to this canonical root. Stop completion may
   // race a newer generation; its finalizer removes only the exact slot object.
@@ -1227,9 +1224,8 @@ function evictFullstackRoot(pi: ExtensionAPI, root: string): void {
       if (dispatcherStopsByRootIdentity.get(identity) === slot) dispatcherStopsByRootIdentity.delete(identity);
     });
   }
-  const activationRecords = fullstackActivationRecords.get(pi as object);
-  const record = activationRecords?.get(root);
   if (record) {
+    revokeCtoRuntimeProofAuthority(record.proofAuthority);
     for (const lease of record.leases) {
       try { closeWorkflowActivation(lease.activation); } catch { /* teardown is best-effort; context fencing still applies */ }
     }
@@ -1271,20 +1267,38 @@ function runtimeAccessForSession(pi: ExtensionAPI, cwd: string, sessionId: strin
         // path. Revoke only this stale capability, then reopen from that fresh
         // context without recursively mounting host tools or gates.
         evictRuntimeAccessSlot(pi, root, existing);
+        const afterEviction = fullstackRuntimeAccesses.get(pi as object)?.get(root);
+        if (afterEviction && afterEviction !== existing) {
+          // A replacement generation won the slot while this stale capability
+          // was being fenced. Never close or overwrite that newer capability.
+          return afterEviction.sessionId === sessionId ? afterEviction.access : null;
+        }
         const refreshedContext = fullstackActivationContexts.get(pi as object)?.get(root);
         if (!refreshedContext) {
           evictFullstackRoot(pi, root);
           console.warn("[omp-workflows-fullstack]", JSON.stringify({ code: "activation_revoked", error: String(error instanceof Error ? error.message : error) }));
           return null;
         }
-        const reopened = openCtoRuntimeAccess(refreshedContext, { sessionId, main: true }, root);
+        const refreshedAuthority = ctoRuntimeSessionAuthorityForContext(refreshedContext);
+        if (!refreshedAuthority) {
+          evictFullstackRoot(pi, root);
+          return null;
+        }
+        const reopened = openCtoRuntimeAccess(refreshedContext, refreshedAuthority, root);
         if (!reopened.ok) {
           evictFullstackRoot(pi, root);
           console.warn("[omp-workflows-fullstack]", JSON.stringify({ code: reopened.code, error: reopened.error }));
           return null;
         }
-        const reopenedSlot: RuntimeAccessSlot = { sessionId, lexicalRoot: pinnedRoot.lexical_root, access: reopened.access };
+        const reopenedSlot: RuntimeAccessSlot = { sessionId, lexicalRoot: pinnedRoot.lexical_root, authority: refreshedAuthority, access: reopened.access };
         const reopenedAccesses = fullstackRuntimeAccesses.get(pi as object) ?? new Map<string, RuntimeAccessSlot>();
+        const replacement = reopenedAccesses.get(root);
+        if (replacement) {
+          // Do not replace a slot installed after the stale slot was evicted;
+          // the candidate facade is unreferenced and can be closed directly.
+          closeRuntimeAccessSlot(root, reopenedSlot);
+          return replacement.sessionId === sessionId ? replacement.access : null;
+        }
         reopenedAccesses.set(root, reopenedSlot);
         fullstackRuntimeAccesses.set(pi as object, reopenedAccesses);
         runtimeAccessByRoot.set(root, reopened.access);
@@ -1293,22 +1307,37 @@ function runtimeAccessForSession(pi: ExtensionAPI, cwd: string, sessionId: strin
       }
     }
     if (existing) {
-      closeRuntimeAccessSlot(root, existing);
-      accesses.delete(root);
+      evictRuntimeAccessSlot(pi, root, existing);
+      const replacement = fullstackRuntimeAccesses.get(pi as object)?.get(root);
+      if (replacement) {
+        // A newer session owns this root. A stale caller must not evict or
+        // overwrite it; only the matching generation may continue.
+        return replacement.sessionId === sessionId ? replacement.access : null;
+      }
     }
     const context = fullstackActivationContexts.get(pi as object)?.get(root);
     if (!context) {
       evictRuntimeAccessSlot(pi, root);
       return null;
     }
-    const opened = openCtoRuntimeAccess(context, { sessionId, main: true }, root);
+    const authority = ctoRuntimeSessionAuthorityForContext(context);
+    if (!authority) {
+      evictFullstackRoot(pi, root);
+      return null;
+    }
+    const opened = openCtoRuntimeAccess(context, authority, root);
     if (!opened.ok) {
       evictRuntimeAccessSlot(pi, root);
       if (opened.code === "activation_revoked") evictFullstackRoot(pi, root);
       console.warn("[omp-workflows-fullstack]", JSON.stringify({ code: opened.code, error: opened.error }));
       return null;
     }
-    const slot: RuntimeAccessSlot = { sessionId, lexicalRoot: pinnedRoot.lexical_root, access: opened.access };
+    const slot: RuntimeAccessSlot = { sessionId, lexicalRoot: pinnedRoot.lexical_root, authority, access: opened.access };
+    const replacement = fullstackRuntimeAccesses.get(pi as object)?.get(root);
+    if (replacement) {
+      closeRuntimeAccessSlot(root, slot);
+      return replacement.sessionId === sessionId ? replacement.access : null;
+    }
     accesses.set(root, slot);
     fullstackRuntimeAccesses.set(pi as object, accesses);
     runtimeAccessByRoot.set(root, opened.access);
@@ -1414,7 +1443,7 @@ function ensureFullstackLiveRoot(
   try {
     if (!pinnedRoot.isStable()) return null;
     const canonicalCwd = pinnedRoot.canonical_root;
-    if (!ensureFullstackActivation(pi, canonicalCwd)) return null;
+    if (!ensureFullstackActivation(pi, canonicalCwd, ctx)) return null;
     if (!pinnedRoot.isStable()) return null;
     return canonicalCwd;
   } finally {
@@ -1442,7 +1471,7 @@ function ensureLectureLiveActivation(
   try {
     if (!pinnedRoot.isStable()) return null;
     const canonicalCwd = pinnedRoot.canonical_root;
-    if (canonicalCwd !== liveCwd || !ensureFullstackActivation(pi, canonicalCwd)) return null;
+    if (canonicalCwd !== liveCwd || !ensureFullstackActivation(pi, canonicalCwd, ctx)) return null;
     const runtimeAccess = runtimeAccessForSession(pi, canonicalCwd, sessionId);
     if (!runtimeAccess) return null;
     try {
@@ -1457,7 +1486,8 @@ function ensureLectureLiveActivation(
 }
 
 /** Mount the fullstack engine only after one root-authenticated transaction. */
-function ensureFullstackActivation(pi: ExtensionAPI, cwd: string): boolean {
+function ensureFullstackActivation(pi: ExtensionAPI, cwd: string, initialSessionContext?: unknown): boolean {
+  registerFullstackRuntimeAccessProvider(pi);
   const pinnedRoot = openSessionRoot(cwd);
   if (!pinnedRoot) return false;
   const root = pinnedRoot.canonical_root;
@@ -1471,6 +1501,12 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string): boolean {
     if (!currentActivations?.has(root) || !currentContexts?.has(root) || !currentRecord) break;
     try {
       currentRecord.liveGuard();
+      if (initialSessionContext !== undefined) {
+        currentRecord.sessionBindingController.bind(initialSessionContext);
+        if (!currentRecord.sessionBindingController.isLive(initialSessionContext)) throw new Error("session binding controller rejected the current host context");
+      }
+      const currentAuthority = ctoRuntimeSessionAuthorityForContext(currentRecord.context);
+      if (!currentAuthority || currentAuthority !== currentRecord.runtimeAuthority) throw new Error("runtime session authority is stale");
     } catch (error) {
       evictFullstackRoot(pi, root);
       if (freshRetryAvailable) {
@@ -1547,6 +1583,8 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string): boolean {
   }
   let gateKey: string | undefined;
   let gateInstalled = false;
+  let sessionBindingController: TeamSessionBindingController | undefined;
+  let proofAuthority: CtoRuntimeProofAuthority | undefined;
   try {
     registerNativeSpecificationAssets(transaction.token);
     const installConstitutionGate = registerTeamWorkflow(pi, {
@@ -1560,8 +1598,19 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string): boolean {
       owner: fullstackOwnerForCwd,
       cwd: root,
       registrationToken: transaction.token,
+      ...(initialSessionContext !== undefined ? { initialSessionContext } : {}),
+      onSessionBindingController: (controller) => { sessionBindingController = controller; },
       deferConstitutionGate: true,
     });
+    if (!sessionBindingController) throw new Error("activation_context_missing: team session binding controller is unavailable");
+    if (initialSessionContext !== undefined) {
+      sessionBindingController.bind(initialSessionContext);
+      if (!sessionBindingController.isLive(initialSessionContext)) throw new Error("activation_context_missing: team session binding controller rejected the host context");
+    }
+    const runtimeAuthority = ctoRuntimeSessionAuthorityForContext(activation.registry_context);
+    if (!runtimeAuthority) throw new Error("activation_context_missing: fullstack runtime session authority is unavailable");
+    proofAuthority = openCtoRuntimeProofAuthority(activation.registry_context, pinnedRoot) ?? undefined;
+    if (!proofAuthority) throw new Error("activation_context_missing: fullstack runtime proof authority is unavailable");
     registerWorkflowTools(pi, transaction.token);
     if (pi.zod) {
       const priorLectureMount = fullstackLectureMounts.get(pi as object);
@@ -1599,6 +1648,9 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string): boolean {
     const activationRecords = fullstackActivationRecords.get(pi as object) ?? new Map<string, FullstackActivation>();
     activationRecords.set(root, {
       context: activation.registry_context,
+      runtimeAuthority,
+      sessionBindingController,
+      proofAuthority,
       liveGuard: retainedLiveGuard,
       leases: [{ activation }],
     });
@@ -1608,6 +1660,7 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string): boolean {
   } catch (error) {
     try { rollbackRegistryRegistration(transaction.token); } catch { /* preserve the registration failure */ }
     if (gateInstalled && gateKey) fullstackGateInstallations.delete(gateKey);
+    if (proofAuthority) revokeCtoRuntimeProofAuthority(proofAuthority);
     try { closeWorkflowActivation(activation); } catch { /* activation teardown is best-effort */ }
     console.warn("[omp-workflows-fullstack]", JSON.stringify({ code: "registration_failed", error: String(error instanceof Error ? error.message : error) }));
     return false;
@@ -1626,7 +1679,7 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
   registerWorkflowCommands(pi, { owner: fullstackOwnerForCwd, resolveCwd: resolveSessionCwd });
   pi.on("session_start", (_event: unknown, ctx: unknown) => {
     const cwd = resolveSessionCwd(ctx);
-    if (cwd) ensureFullstackActivation(pi, cwd);
+    if (cwd) ensureFullstackActivation(pi, cwd, ctx);
   });
   // Register the model-role command during extension load, before OMP snapshots
   // slash suggestions or discovers project-local assets.
@@ -1725,7 +1778,7 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     // rename(A, B) moves A's lock into B, so a live old lease would otherwise
     // make the new dispatcher appear to be an owner conflict.
     await awaitPendingDispatcherStops(pi);
-    if (!ensureFullstackActivation(pi, cwd)) return;
+    if (!ensureFullstackActivation(pi, cwd, ctx)) return;
     // Discovery may run only after a valid activation, and publication
     // revalidates that same root/owner immediately before writing.
     void refreshFullstackAgentMappings(cwd, undefined, () => ensureFullstackActivation(pi, cwd)).catch(() => undefined);
@@ -1857,6 +1910,7 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
       const dispatcher = startChannelDispatcher(pinnedRoot.lexical_root, channelSet, 10_000, {
         pinnedRoot,
         runtimeAccess: guardedRuntimeAccess,
+        proofAuthority: activationRecord.proofAuthority,
         session_id: sessionId,
         liveGuard: activationLiveGuard,
         // Wake the CTO session on an inbound task: idle starts a turn,
@@ -2239,15 +2293,17 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async (_event: unknown, ctx: unknown) => {
     if (!isMainSessionContext(ctx)) return;
-    try {
-      const identity = dispatcherContextIdentity(ctx);
-      if (!identity) return;
-      const ownership = ownershipForContext(pi, ctx, identity);
-      if (!ownership) return;
-      await stopDispatcherOwnership(pi, ownership);
-    } finally {
-      evictAllRuntimeAccessSlots(pi);
-      unregisterFullstackRuntimeAccessProvider(pi);
+    const identity = dispatcherContextIdentity(ctx);
+    if (!identity) return;
+    const ownership = ownershipForContext(pi, ctx, identity);
+    // An unrecognized or stale context must not evict a newer same-root
+    // activation. Only the exact remembered dispatcher ownership may clean up.
+    if (!ownership) return;
+    await stopDispatcherOwnership(pi, ownership);
+    const expectedRecord = fullstackActivationRecords.get(pi as object)?.get(identity.cwd);
+    if (expectedRecord && fullstackActivationRecords.get(pi as object)?.get(identity.cwd) === expectedRecord) {
+      evictFullstackRoot(pi, identity.cwd, expectedRecord);
+      if ((fullstackRuntimeAccesses.get(pi as object)?.size ?? 0) === 0) unregisterFullstackRuntimeAccessProvider(pi);
     }
   });
 }

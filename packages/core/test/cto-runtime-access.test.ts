@@ -230,11 +230,12 @@ test("core guarded views reject inherited overrides and close after identity los
       if (!identityLive) throw new Error("dispatcher identity is stale");
     });
     assert.equal(isCtoRuntimeAccessFacade(guarded), true);
+    assert.deepEqual(Object.getOwnPropertyNames(guarded).sort(), Object.getOwnPropertyNames(opened.access).sort());
     assert.doesNotThrow(() => guarded.assertLive());
     const inherited = Object.create(opened.access) as CtoRuntimeAccessFacade;
     Object.defineProperty(inherited, "assertLive", { value: () => undefined });
     assert.equal(isCtoRuntimeAccessFacade(inherited), false);
-    assert.throws(() => assertCtoRuntimeAccessFacadeLive(inherited), /authenticated facade/);
+    assert.throws(() => assertCtoRuntimeAccessFacadeLive(inherited), /marker-bound runtime facade/);
     identityLive = false;
     assert.throws(() => guarded.findActiveRun(), /identity is stale/);
     assert.doesNotThrow(() => guarded.close());

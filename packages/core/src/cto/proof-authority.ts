@@ -10,6 +10,7 @@ export type CtoRuntimeProofDomain =
   | "bridge-lease-v1"
   | "cto-dispatcher-lease-v1"
   | "telegram-mapping-v1"
+  | "cto-inbox-auth-v1"
   | "cto-wake-effect-v1";
 
 export const MAX_CTO_RUNTIME_PROOF_PAYLOAD_BYTES = 256 * 1024;
@@ -19,6 +20,7 @@ const DOMAIN_VALUES: ReadonlySet<string> = new Set([
   "bridge-lease-v1",
   "cto-dispatcher-lease-v1",
   "telegram-mapping-v1",
+  "cto-inbox-auth-v1",
   "cto-wake-effect-v1",
 ]);
 
@@ -29,7 +31,7 @@ type AuthorityCell = {
   revoked: boolean;
 };
 
-/** Opaque authority; callers cannot read or derive the root secret. */
+/** Opaque same-process authority; callers cannot read or derive the root secret. This is a marker-bound loaded-JS capability, not a cryptographic identity boundary. */
 export type CtoRuntimeProofAuthority = {
   readonly [CTO_RUNTIME_PROOF_AUTHORITY_BRAND]: true;
 };
