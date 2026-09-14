@@ -35,6 +35,7 @@ import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { MAX_WORKFLOW_COMMAND_ARGUMENT_BYTES } from "../src/commands/register.js";
 import { setArtifactContractPolicy, setConstitutionContinuationGate, setFanInPolicy } from "../src/engine/durable.js";
 import { withExecutionLiveness } from "../src/execution-liveness.js";
+import { ctoRuntimeSessionAuthorityForContext, openCtoRuntimeAccess } from "../src/cto/runtime-access.js";
 
 type CommandHandler = (args: string, ctx: unknown) => Promise<void>;
 type SessionStartHandler = (event: unknown, ctx: unknown) => void;
@@ -519,6 +520,67 @@ test("team registration leaves global gate untouched across failed owners and re
     rmSync(root, { recursive: true, force: true });
     rmSync(validRoot, { recursive: true, force: true });
     rmSync(partialRoot, { recursive: true, force: true });
+  }
+});
+
+test("supplied-token initial runtime authority rolls back before retry", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-runtime-rollback-owner-"));
+  try {
+    const markerInfo = marker(root);
+    const activated = openWorkflowActivation(
+      root,
+      ["workflow_registration", "workflow_tools", "config_writer"],
+      activationOwner("runtime-rollback-owner", root, markerInfo.path, markerInfo.sha256),
+    );
+    assert.equal(activated.ok, true);
+    if (!activated.ok) return;
+    const transaction = beginOwnerRegistry(activated.registry_context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
+    assert.equal(transaction.ok, true);
+    if (!transaction.ok) return;
+    const manager = {
+      getCwd: () => root,
+      getSessionId: () => "rollback-session",
+      getSessionFile: () => join(root, "rollback-session.jsonl"),
+    };
+    const makePi = () => ({ setLabel() {}, on() {} });
+    registerTeamWorkflow(makePi() as never, {
+      cwd: root,
+      owner: () => activated.claim.owner,
+      registrationToken: transaction.token,
+      initialSessionContext: { sessionManager: manager },
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    const authority = ctoRuntimeSessionAuthorityForContext(activated.registry_context);
+    assert.ok(authority, "initialSessionContext attaches an authority before outer commit");
+    if (!authority) return;
+    const opened = openCtoRuntimeAccess(activated.registry_context, authority, root);
+    assert.equal(opened.ok, true);
+    if (!opened.ok) return;
+
+    // Simulate a downstream fullstack mount failure after core returned but
+    // before the supplied registration transaction committed.
+    rollbackOwnerRegistry(transaction.token);
+    assert.equal(ctoRuntimeSessionAuthorityForContext(activated.registry_context), null, "outer rollback revokes the initial authority");
+    assert.throws(() => opened.access.assertLive(), /activation_revoked|runtime access/i, "rollback closes every attached facade");
+    assert.ok(workflowOwnerFor(root, "workflow_registration"), "the caller's pre-existing owner lease remains intact");
+
+    const retry = beginOwnerRegistry(activated.registry_context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
+    assert.equal(retry.ok, true, "same authenticated context can retry after rollback");
+    if (!retry.ok) return;
+    registerTeamWorkflow(makePi() as never, {
+      cwd: root,
+      owner: () => activated.claim.owner,
+      registrationToken: retry.token,
+      initialSessionContext: { sessionManager: manager },
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    assert.ok(ctoRuntimeSessionAuthorityForContext(activated.registry_context), "retry attaches a fresh authority");
+    rollbackOwnerRegistry(retry.token);
+    closeWorkflowActivation(activated);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
