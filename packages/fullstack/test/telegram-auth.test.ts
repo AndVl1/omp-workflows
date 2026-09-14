@@ -640,11 +640,12 @@ test("auth: factory Telegram adapter revokes polling after config rotation", asy
   }
 });
 
-test("auth: registry rejects Telegram construction when routing rotates during snapshot capture", () => {
+test("auth: registry rejects Telegram construction when routing rotates during factory access", () => {
   const root = mkdtempSync(join(tmpdir(), "tg-auth-construction-race-"));
   const configPath = join(root, ".omp", "escalation.json");
   const realFetch = globalThis.fetch;
   let fetchCalls = 0;
+  let tokenReads = 0;
   try {
     mkdirSync(join(root, ".omp"), { recursive: true });
     const oldConfig = { adapter: "telegram", telegram: { token: "old-token", chatId: CONFIGURED_CHAT } };
@@ -655,25 +656,20 @@ test("auth: registry rejects Telegram construction when routing rotates during s
       return okResponse([]);
     }) as typeof fetch;
     const fixture = runtimeFixtureFor(root);
-    let firstSnapshot = true;
-    const runtimeAccess = new Proxy(fixture.access, {
-      get(target, property) {
-        if (property === "resolveEscalationChannelSnapshot") {
-          return () => {
-            const snapshot = target.resolveEscalationChannelSnapshot();
-            if (firstSnapshot) {
-              firstSnapshot = false;
-              writeFileSync(configPath, JSON.stringify(newConfig));
-            }
-            return snapshot;
-          };
-        }
-        const value = Reflect.get(target, property, target);
-        return typeof value === "function" ? value.bind(target) : value;
+    const config = {
+      adapter: "telegram",
+      telegram: {
+        chatId: CONFIGURED_CHAT,
+        get token(): string {
+          tokenReads += 1;
+          if (tokenReads === 2) writeFileSync(configPath, JSON.stringify(newConfig));
+          return "old-token";
+        },
       },
-    });
-    const adapter = createEscalationAdapterRaw(oldConfig, root, undefined, runtimeAccess, fixture.proofAuthority);
-    assert.equal(adapter, null, "construction must fail closed when config rotates between snapshot and factory guard");
+    } as Parameters<typeof createEscalationAdapterRaw>[0];
+    const adapter = createEscalationAdapterRaw(config, root, undefined, fixture.access, fixture.proofAuthority);
+    assert.equal(adapter, null, "construction must fail closed when routing rotates during factory access");
+    assert.ok(tokenReads >= 2, "factory must read the supplied credential after guard capture");
     assert.equal(fetchCalls, 0, "a rejected construction must not expose an adapter that can fetch with old credentials");
   } finally {
     (globalThis as { fetch: typeof fetch }).fetch = realFetch;
@@ -687,7 +683,7 @@ test("auth: registry rejects malformed Telegram allowlists", () => {
     const malformedConfigs: unknown[] = [
       { adapter: "telegram", telegram: { token: "t", chatId: CONFIGURED_CHAT, allowedSenderIds: [true] } },
       { adapter: "telegram", telegram: { token: "t", chatId: CONFIGURED_CHAT, allowedSenderIds: ["42", "42"] } },
-      { adapter: "telegram", telegram: { token: "t", chatId: CONFIGURED_CHAT, allowedChatIds: ["\u0000"] } },
+      { adapter: "telegram", telegram: { token: "t", chatId: CONFIGURED_CHAT, allowedChatIds: ["7", "7"] } },
     ];
     mkdirSync(join(root, ".omp"), { recursive: true });
     for (const raw of malformedConfigs) {
