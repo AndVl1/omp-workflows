@@ -202,6 +202,16 @@ function telegramCorrelationMarker(esc: Escalation): string {
   return marker;
 }
 
+function isSyntacticallyValidTelegramCallbackData(value: unknown): value is string {
+  if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > MAX_TELEGRAM_CALLBACK_DATA_UTF8_BYTES) return false;
+  if (TELEGRAM_CALLBACK_TOKEN_RE.test(value)) return true;
+  const separator = value.indexOf("::");
+  if (separator <= 0 || separator !== value.lastIndexOf("::")) return false;
+  const escId = value.slice(0, separator);
+  const optionId = value.slice(separator + 2);
+  return isSafeEscalationId(escId) && isSafeEscalationOptionId(optionId);
+}
+
 function parseTelegramCorrelationMarker(text: unknown): TelegramCorrelationMarker | null {
   if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > TELEGRAM_CORRELATION_MARKER_MAX_BYTES) return null;
   const match = TELEGRAM_CORRELATION_MARKER_RE.exec(text.trim());
@@ -1118,7 +1128,8 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     const at = new Date().toISOString();
     const callbackQuery = update.callback_query;
     const callbackData = callbackQuery?.data;
-    if (callbackQuery && callbackData && callbackQuery.message) {
+    if (callbackQuery?.message) {
+      if (!isSyntacticallyValidTelegramCallbackData(callbackData)) return null;
       const sourceChatId = callbackQuery.message.chat?.id;
       if (sourceChatId === undefined) return null;
       const sourceChat = String(sourceChatId);

@@ -291,6 +291,8 @@ test("auth: plain handler rejection leaves update unconfirmed for retry", async 
 test("auth: reply-to-escalation answers are gated by chat", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-auth-5-"));
   try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "t", chatId: CONFIGURED_CHAT } }));
     withIndexedRun(root, "run-sec1");
     const mapDir = join(root, ".work-state", "cto", "run-sec1");
     mkdirSync(mapDir, { recursive: true });
@@ -719,6 +721,9 @@ test("sec001: malformed callback escIds are dropped (no file outside the run ans
 test("sec001: poisoned tg-map.jsonl escId on the reply path fails closed without writes", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-sec001-11-"));
   try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "t", chatId: CONFIGURED_CHAT } }));
+    withIndexedRun(root, "run-sec1");
     const mapDir = join(root, ".work-state", "cto", "run-sec1");
     mkdirSync(mapDir, { recursive: true });
     writeFileSync(join(mapDir, "tg-map.jsonl"), [
@@ -734,8 +739,8 @@ test("sec001: poisoned tg-map.jsonl escId on the reply path fails closed without
         { update_id: 2, message: { message_id: 13, text: "evil", reply_to_message: { message_id: 100 }, chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } } },
       ]),
     });
-    const answers = await adapter.pollOnce();
-    assert.deepEqual(answers, [], "a corrupted mapping snapshot is rejected before any answer write");
+    await assert.rejects(adapter.pollOnce(), (error: unknown) => error instanceof TelegramMappingRecoveryRequiredError
+      && error.code === "telegram_mapping_recovery_required" && error.messageId === 101, "poisoned mapping requires retryable recovery");
     assert.equal(existsSync(answerPath(root, "run-sec1/esc-2")), false, "valid records in a poisoned shard are not trusted");
     assert.equal(existsSync(answerPath(root, "run-sec1/../../poison")), false, "poisoned mapping cannot escape the run answers dir");
     assert.equal(existsSync(join(root, ".work-state", "answers")), false, "no ../.. escape on the reply path");
