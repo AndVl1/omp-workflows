@@ -150,11 +150,13 @@ test("repeated unique marker activations release lifecycle identities without hi
 
 test("constitution gate cache rejects the 256th root without partial registration", () => {
   const fixture = resolve(new URL("./fixtures/registry-activation.ts", import.meta.url).pathname);
+  const hostToolFixture = resolve(new URL("./fixtures/host-tool-activation.ts", import.meta.url).pathname);
   const source = `
     import { mkdtempSync, rmSync } from "node:fs";
     import { join } from "node:path";
     import { tmpdir } from "node:os";
-    import { closeRetainedTestRegistrations, openTestRegistry, registerTestTeamWorkflow, writeTestRegistryMarker } from ${JSON.stringify(fixture)};
+    import { closeRetainedTestRegistrations, openTestRegistry, writeTestRegistryMarker } from ${JSON.stringify(fixture)};
+    import { registerTestTeamWorkflow } from ${JSON.stringify(hostToolFixture)};
     import { setConstitutionContinuationGate } from ${JSON.stringify(resolve(new URL("../src/engine/durable.ts", import.meta.url).pathname))};
     import { workflowOwnerFor } from ${JSON.stringify(resolve(new URL("../src/registry/owner.ts", import.meta.url).pathname))};
     const roots = [];

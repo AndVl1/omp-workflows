@@ -66,7 +66,8 @@ import {
 } from "./commands/cto.js";
 import { isSafeCtoExecutionId, isSafeCtoRunId, readCtoStatePinned } from "./cto/state.js";
 import { parseCtoSliceMarker } from "./cto/slice-gate.js";
-import { resolveCtoRuntimeAccessForRoot } from "./cto/runtime-access.js";
+import { openCtoRuntimeAccess, type CtoRuntimeAccessFacade } from "./cto/runtime-access.js";
+import { issueCtoRuntimeSessionAuthority, revokeCtoRuntimeSessionAuthority, type CtoRuntimeSessionAuthority } from "./cto/session-authority.js";
 import { readCurrentExecutionClaim } from "./specification/claims.js";
 import {
   persistDoWorkSpecificationConformance,
@@ -155,6 +156,7 @@ import {
   recordRegistryCommit,
   recordRegistryUndo,
   registryRegistrationPrincipal,
+  registryRegistrationContextForToken,
   registryRegistrationProjectRoot,
   releaseWorkflowOwners,
   requireRegistryRegistration,
@@ -167,6 +169,7 @@ import {
   type WorkflowCapability,
   type WorkflowOwnerIdentity,
   type WorkflowOwnerSource,
+  type RegistryRegistrationContext,
 } from "./registry/owner.js";
 
 export type {
@@ -255,15 +258,23 @@ type RegistrarActivationClaim = {
 };
 type TeamActivationCell = RegistrarCell & {
   readonly principal?: RegistryRegistrationPrincipal;
+  readonly principalFingerprint?: string;
   readonly liveGuard?: () => void;
   readonly cleanup?: () => void;
+  readonly registryContext?: RegistryRegistrationContext;
+  readonly runtimeAuthority?: CtoRuntimeSessionAuthority;
+  readonly runtimeAccess?: CtoRuntimeAccessFacade;
   readonly root?: string;
   readonly rootDev?: number;
   readonly rootIno?: number;
   readonly sessionManager?: object;
   readonly sessionId?: string;
+  readonly sessionFile?: string;
+  readonly sessionBasename?: string;
+  readonly sessionGeneration?: string | number;
   readonly retiredSessionIds?: readonly string[];
   readonly retiredSessionManagers?: readonly object[];
+  readonly retiredSessions?: readonly HostSessionIdentity[];
 };
 type HostContextIdentity = {
   readonly sessionManager: object;
@@ -278,8 +289,12 @@ const hostContextBindings = new WeakMap<object, HostContextIdentity>();
 type TeamSessionBinding = {
   readonly root: string;
   readonly principal: RegistryRegistrationPrincipal;
+  readonly principalFingerprint: string;
   readonly liveGuard: () => void;
   readonly cleanup?: () => void;
+  readonly registryContext?: RegistryRegistrationContext;
+  readonly runtimeAuthority?: CtoRuntimeSessionAuthority;
+  readonly runtimeAccess?: CtoRuntimeAccessFacade;
   readonly rootDev: number;
   readonly rootIno: number;
   readonly session?: HostSessionIdentity;
@@ -362,6 +377,7 @@ function reserveTeamActivation(
   pending: boolean,
   root?: PinnedProjectRoot,
   principal?: RegistryRegistrationPrincipal,
+  principalFingerprint?: string,
   liveGuard?: () => void,
 ): TeamActivationReservation {
   const existing = teamActivationCells.get(pi);
@@ -371,19 +387,24 @@ function reserveTeamActivation(
         && existing.root === root.canonical_root
         && existing.rootDev === root.dev
         && existing.rootIno === root.ino;
-      if (sameRoot && existing.recoverableSession === true && principal && liveGuard && existing.principal === principal) {
-        return { cell: existing, mode: "fresh", rebinding: { root: root.canonical_root, rootDev: root.dev, rootIno: root.ino, principal, liveGuard } };
+      if (sameRoot && existing.recoverableSession === true && principal && principalFingerprint && liveGuard
+        && existing.principalFingerprint === principalFingerprint) {
+        // The host hooks are still mounted on this extension object. Reuse the
+        // existing lifecycle cell rather than installing a second hook set; the
+        // authenticated transaction is rebound by recordTeamLifecycle below.
+        return { cell: existing, mode: "duplicate", rebinding: { root: root.canonical_root, rootDev: root.dev, rootIno: root.ino, principal, principalFingerprint, liveGuard } };
       }
       throw new Error(`registration_failed: team activation is terminally failed${existing.failure ? `: ${existing.failure}` : ""}`);
     }
     if (existing.state === "mounting") throw new Error("registry_transaction_invalid: team activation is already mounting");
     if (existing.state === "active") {
-      if (existing.principal !== undefined && principal !== undefined && existing.principal !== principal) {
+      if (existing.principalFingerprint !== undefined && principalFingerprint !== undefined
+        && existing.principalFingerprint !== principalFingerprint) {
         throw new Error("owner_conflict: team activation is already active for a different authenticated owner");
       }
       if (root && principal && existing.root !== undefined && existing.rootDev !== undefined && existing.rootIno !== undefined) {
         const sameIdentity = existing.root === root.canonical_root && existing.rootDev === root.dev && existing.rootIno === root.ino;
-        if (!sameIdentity && liveGuard) return { cell: existing, mode: "rebind", rebinding: { root: root.canonical_root, rootDev: root.dev, rootIno: root.ino, principal, liveGuard } };
+        if (!sameIdentity && liveGuard && principalFingerprint) return { cell: existing, mode: "rebind", rebinding: { root: root.canonical_root, rootDev: root.dev, rootIno: root.ino, principal, principalFingerprint, liveGuard } };
         return { cell: existing, mode: "duplicate" };
       }
       return { cell: existing, mode: "duplicate" };
@@ -419,15 +440,22 @@ function markTeamFailed(pi: object, error: unknown, recoverableSession = false):
   }
 }
 
+function closeTeamBindingResources(binding: TeamSessionBinding): void {
+  if (binding.runtimeAccess) binding.runtimeAccess.close();
+  if (binding.runtimeAuthority) revokeCtoRuntimeSessionAuthority(binding.runtimeAuthority);
+  binding.cleanup?.();
+}
+
 function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, binding?: TeamSessionBinding): void {
   const prior = teamActivationCells.get(pi);
   const rebinding = binding !== undefined
     && (prior?.state === "active" || prior?.state === "failed")
     && prior.root !== undefined
-    && prior.principal === binding.principal;
+    && prior.principalFingerprint === binding.principalFingerprint;
   if (rebinding) {
     const next = binding;
     recordRegistryUndo(token, () => {
+      closeTeamBindingResources(next);
       const current = teamActivationCells.get(pi);
       if (current?.state === "active" && current.root === next.root && current.rootDev === next.rootDev && current.rootIno === next.rootIno) {
         markTeamFailed(pi, "registration rebind transaction rolled back");
@@ -436,13 +464,20 @@ function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, bindi
     recordRegistryCommit(token, "constitution_gate", () => {
       const current = teamActivationCells.get(pi);
       if (!current || current !== prior) return;
+      const priorSession = teamCellSession(current);
       const retired = [...(current.retiredSessionIds ?? [])];
-      if (current.sessionId && next.session && current.sessionId !== next.session.sessionId) retired.push(current.sessionId);
+      if (priorSession && next.session && priorSession.sessionId !== next.session.sessionId) retired.push(priorSession.sessionId);
       const retiredManagers = [...(current.retiredSessionManagers ?? [])];
-      if (current.sessionManager && next.session && current.sessionManager !== next.session.sessionManager) retiredManagers.push(current.sessionManager);
+      if (priorSession && next.session && priorSession.sessionManager !== next.session.sessionManager) retiredManagers.push(priorSession.sessionManager);
+      const priorRetiredSessions = [...(current.retiredSessions ?? [])];
+      if (priorSession && next.session && !sameHostSession(priorSession, next.session)) priorRetiredSessions.push(priorSession);
       const uniqueRetired = [...new Set(retired)].slice(-8);
       const uniqueRetiredManagers = [...new Set(retiredManagers)].slice(-8);
+      const uniqueRetiredSessions = priorRetiredSessions.slice(-8);
       const priorCleanup = current.cleanup;
+      const lifecycleCleanup = next.cleanup || next.runtimeAuthority || next.runtimeAccess
+        ? () => closeTeamBindingResources(next)
+        : undefined;
       teamActivationCells.set(pi, {
         ...current,
         state: "active",
@@ -450,17 +485,31 @@ function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, bindi
         rootDev: next.rootDev,
         rootIno: next.rootIno,
         principal: next.principal,
+        principalFingerprint: next.principalFingerprint,
         liveGuard: next.liveGuard,
-        ...(next.cleanup ? { cleanup: next.cleanup } : {}),
-        ...(next.session ? { sessionManager: next.session.sessionManager, sessionId: next.session.sessionId } : {}),
+        ...(lifecycleCleanup ? { cleanup: lifecycleCleanup } : {}),
+        ...(next.registryContext ? { registryContext: next.registryContext } : {}),
+        ...(next.runtimeAuthority ? { runtimeAuthority: next.runtimeAuthority } : {}),
+        ...(next.runtimeAccess ? { runtimeAccess: next.runtimeAccess } : {}),
+        ...(next.session ? {
+          sessionManager: next.session.sessionManager,
+          sessionId: next.session.sessionId,
+          ...(next.session.sessionFile !== undefined ? { sessionFile: next.session.sessionFile } : {}),
+          ...(next.session.sessionBasename !== undefined ? { sessionBasename: next.session.sessionBasename } : {}),
+          ...(next.session.generation !== undefined ? { sessionGeneration: next.session.generation } : {}),
+        } : {}),
         ...(uniqueRetired.length > 0 ? { retiredSessionIds: uniqueRetired } : {}),
         ...(uniqueRetiredManagers.length > 0 ? { retiredSessionManagers: uniqueRetiredManagers } : {}),
+        ...(uniqueRetiredSessions.length > 0 ? { retiredSessions: uniqueRetiredSessions } : {}),
       });
       if (priorCleanup && priorCleanup !== next.cleanup) pendingTeamActivationCleanups.set(pi, priorCleanup);
     });
     return;
   }
-  recordRegistryUndo(token, () => markTeamFailed(pi, "registration transaction rolled back"));
+  recordRegistryUndo(token, () => {
+    if (binding) closeTeamBindingResources(binding);
+    markTeamFailed(pi, "registration transaction rolled back");
+  });
   recordRegistryCommit(token, "constitution_gate", () => {
     if (!binding) {
       markTeamActive(pi);
@@ -468,6 +517,9 @@ function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, bindi
     }
     const current = teamActivationCells.get(pi);
     if (!current || current.state === "failed") return;
+    const lifecycleCleanup = binding.cleanup || binding.runtimeAuthority || binding.runtimeAccess
+      ? () => closeTeamBindingResources(binding)
+      : undefined;
     teamActivationCells.set(pi, {
       ...current,
       state: "active",
@@ -475,9 +527,19 @@ function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, bindi
       rootDev: binding.rootDev,
       rootIno: binding.rootIno,
       principal: binding.principal,
+      principalFingerprint: binding.principalFingerprint,
       liveGuard: binding.liveGuard,
-      ...(binding.cleanup ? { cleanup: binding.cleanup } : {}),
-      ...(binding.session ? { sessionManager: binding.session.sessionManager, sessionId: binding.session.sessionId } : {}),
+      ...(lifecycleCleanup ? { cleanup: lifecycleCleanup } : {}),
+      ...(binding.registryContext ? { registryContext: binding.registryContext } : {}),
+      ...(binding.runtimeAuthority ? { runtimeAuthority: binding.runtimeAuthority } : {}),
+      ...(binding.runtimeAccess ? { runtimeAccess: binding.runtimeAccess } : {}),
+      ...(binding.session ? {
+        sessionManager: binding.session.sessionManager,
+        sessionId: binding.session.sessionId,
+        ...(binding.session.sessionFile !== undefined ? { sessionFile: binding.session.sessionFile } : {}),
+        ...(binding.session.sessionBasename !== undefined ? { sessionBasename: binding.session.sessionBasename } : {}),
+        ...(binding.session.generation !== undefined ? { sessionGeneration: binding.session.generation } : {}),
+      } : {}),
     });
   });
 }
@@ -657,7 +719,7 @@ function guardedRegistrarHostApi(
           const state = registrations.get(pi as unknown as object);
           if (state?.state === "active" || (allowPendingSessionStart && event === "session_start" && (state?.state === "pending" || state?.state === "mounting" || (state?.state === "failed" && "recoverableSession" in state && state.recoverableSession === true)))) {
             const guard = () => {
-              if (event === "session_start") return;
+              if (event === "session_start" || event === "session_shutdown") return;
               try {
                 const denied = liveOwnerGuard?.(args[1]);
                 if (denied) throw new ExecutionLivenessViolation(denied.reason);
@@ -724,6 +786,8 @@ export interface RegisterOptions {
   rebindSessions?: boolean;
   /** Internal host session identity captured by the first dynamic activation. */
   initialSession?: HostSessionIdentity;
+  /** Actual host lifecycle context for synchronous static session binding. */
+  initialSessionContext?: unknown;
 }
 
 export type CommandId = "do-work" | "team" | "cto" | "init-team" | "interview" | "omp-model-roles";
@@ -1222,7 +1286,10 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       throw new Error("owner_conflict: registration token owner does not match the team workflow owner source");
     }
     assertOwner(tokenRoot, ["workflow_registration", "config_writer"], owner);
-    const installed = registerTeamWorkflowInternal(pi, { ...opts, owner }, { registryToken: suppliedToken });
+    const installed = registerTeamWorkflowInternal(pi, { ...opts, owner }, {
+      registryToken: suppliedToken,
+      registryContext: registryRegistrationContextForToken(suppliedToken),
+    });
     if (opts.deferConstitutionGate && installed) {
       return () => {
         try {
@@ -1251,7 +1318,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       }
       if (!cwd) return;
       const owner = activationOwnerAt(cwd, opts.owner!);
-      const activation = openOwnerActivation(cwd, ["workflow_registration", "config_writer"], owner);
+      const activation = openOwnerActivation(cwd, ["workflow_registration", "workflow_tools", "config_writer"], owner);
       if (!activation) throw new Error("owner_invalid: dynamic team activation owner is unavailable");
       let activationCleaned = false;
       const cleanupActivation = (): void => {
@@ -1260,7 +1327,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         closeRegistryRegistrationContext(activation.registry_context);
         releaseWorkflowOwners(activation.release_token, activation.leased_capabilities);
       };
-      const transaction = beginRegistryRegistration(activation.registry_context, cwd, ["workflow_profiles", "constitution_gate", "runtime_config"]);
+      const transaction = beginRegistryRegistration(activation.registry_context, cwd, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
       if (!transaction.ok) {
         closeRegistryRegistrationContext(activation.registry_context);
         releaseWorkflowOwners(activation.release_token, activation.leased_capabilities);
@@ -1268,7 +1335,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       }
       try {
         attempted = true;
-        const installed = registerTeamWorkflowInternal(pi, { ...opts, owner: opts.owner, rebindSessions: true, ...(hostSessionIdentity(ctx) ? { initialSession: hostSessionIdentity(ctx)! } : {}) }, { registryToken: transaction.token, cleanup: cleanupActivation });
+        const installed = registerTeamWorkflowInternal(pi, { ...opts, owner: opts.owner, rebindSessions: true, ...(hostSessionIdentity(ctx) ? { initialSession: hostSessionIdentity(ctx)! } : {}) }, { registryToken: transaction.token, registryContext: activation.registry_context, cleanup: cleanupActivation });
         installed?.();
         commitRegistryRegistration(transaction.token);
         drainTeamActivationCleanup(pi as unknown as object);
@@ -1298,7 +1365,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     throw new Error(`${transaction.code}: ${transaction.error}`);
   }
   try {
-    const result = registerTeamWorkflowInternal(pi, { ...opts, owner }, { registryToken: transaction.token, cleanup: cleanupActivation });
+    const result = registerTeamWorkflowInternal(pi, { ...opts, owner }, { registryToken: transaction.token, registryContext: activation.registry_context, cleanup: cleanupActivation });
     if (!opts.deferConstitutionGate || !result) {
       commitRegistryRegistration(transaction.token);
       drainTeamActivationCleanup(pi as unknown as object);
@@ -1324,16 +1391,20 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 
 function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, activation?: {
   registryToken: RegistryRegistrationToken;
+  registryContext?: RegistryRegistrationContext;
   cleanup?: () => void;
 }): (() => void) | undefined {
   const teamRoot = activation?.registryToken
     ? PinnedProjectRoot.open(registryRegistrationProjectRoot(activation.registryToken, "constitution_gate")) ?? undefined
     : undefined;
   if (activation?.registryToken && !teamRoot) throw new Error("owner_conflict: team activation root could not be pinned");
-  const teamBinding = teamRoot && activation?.registryToken
-    ? { root: teamRoot.canonical_root, rootDev: teamRoot.dev, rootIno: teamRoot.ino, principal: registryRegistrationPrincipal(activation.registryToken, "constitution_gate"), liveGuard: createRegistryRegistrationLiveGuard(activation.registryToken, "constitution_gate"), ...(activation.cleanup ? { cleanup: activation.cleanup } : {}) }
+  const teamPrincipal = activation?.registryContext && teamRoot
+    ? requireRegistryContext(activation.registryContext, teamRoot.canonical_root, "workflow_registration").principal_fingerprint
     : undefined;
-  const teamReservation = reserveTeamActivation(pi as unknown as object, activation?.registryToken === undefined, teamRoot, teamBinding?.principal, teamBinding?.liveGuard);
+  const teamBinding = teamRoot && activation?.registryToken && teamPrincipal
+    ? { root: teamRoot.canonical_root, rootDev: teamRoot.dev, rootIno: teamRoot.ino, principal: registryRegistrationPrincipal(activation.registryToken, "constitution_gate"), principalFingerprint: teamPrincipal, liveGuard: createRegistryRegistrationLiveGuard(activation.registryToken, "constitution_gate"), ...(activation.registryContext ? { registryContext: activation.registryContext } : {}), ...(activation.cleanup ? { cleanup: activation.cleanup } : {}) }
+    : undefined;
+  const teamReservation = reserveTeamActivation(pi as unknown as object, activation?.registryToken === undefined, teamRoot, teamBinding?.principal, teamBinding?.principalFingerprint, teamBinding?.liveGuard);
   let hostMountStarted = false;
   teamRoot?.close();
   const originalPi = pi;
@@ -1549,9 +1620,8 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
       (before?.state === "active" || before?.state === "failed")
       && incomingSession
       && (
-        (before.state === "failed" && before.sessionManager === incomingSession.sessionManager && before.sessionId === incomingSession.sessionId)
-        || before.retiredSessionManagers?.includes(incomingSession.sessionManager)
-        || (before.sessionManager === incomingSession.sessionManager && before.retiredSessionIds?.includes(incomingSession.sessionId))
+        (before.state === "active" && teamCellSession(before) !== null && sameHostSession(teamCellSession(before)!, incomingSession))
+        || before.retiredSessions?.some((retired) => sameHostSession(retired, incomingSession)) === true
       )
     ) return;
     let activationOpened = false;
@@ -1564,16 +1634,26 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
     try {
       const cwd = resolveHookCwd(ctx);
       if (!cwd) return;
-      const sessionClaim = openOwnerActivation(cwd, ["workflow_registration", "config_writer"], opts.owner);
+      const sessionClaim = openOwnerActivation(cwd, ["workflow_registration", "workflow_tools", "config_writer"], opts.owner);
       activationOpened = sessionClaim !== undefined;
       if (!sessionClaim) {
         writeRuntimeConfig(opts, cwd);
         return;
       }
       let sessionActivationCleaned = false;
+      let sessionAuthority: CtoRuntimeSessionAuthority | undefined;
+      let sessionRuntimeAccess: CtoRuntimeAccessFacade | undefined;
       sessionCleanup = (): void => {
         if (sessionActivationCleaned) return;
         sessionActivationCleaned = true;
+        if (sessionRuntimeAccess) {
+          sessionRuntimeAccess.close();
+          sessionRuntimeAccess = undefined;
+        }
+        if (sessionAuthority) {
+          revokeCtoRuntimeSessionAuthority(sessionAuthority);
+          sessionAuthority = undefined;
+        }
         clearNativeTaskSelectors();
         clearHostContextIdentity(originalTeam);
         closeRegistryRegistrationContext(sessionClaim.registry_context);
@@ -1597,8 +1677,8 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
         rootIno: pinnedSessionRoot.ino,
       };
       const families = opts.workflowProfiles?.length
-        ? ["workflow_profiles", "constitution_gate", "runtime_config"] as const
-        : ["constitution_gate", "runtime_config"] as const;
+        ? ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"] as const
+        : ["workflow_tools", "constitution_gate", "runtime_config"] as const;
       const cleanupSessionActivation = sessionCleanup;
       if (!cleanupSessionActivation) throw new Error("activation_context_missing: session activation cleanup is unavailable");
       const transaction = beginRegistryRegistration(sessionClaim.registry_context, cwd, families);
@@ -1618,7 +1698,36 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
         }
         installConstitutionGateForRoot(transaction.token);
         writeRuntimeConfig({ ...opts, registrationToken: transaction.token }, cwd);
-        recordTeamLifecycle(originalTeam, transaction.token, { ...bindingRoot, principal: registryRegistrationPrincipal(transaction.token, "constitution_gate"), liveGuard: createRegistryRegistrationLiveGuard(transaction.token, "constitution_gate"), cleanup: cleanupSessionActivation, ...(incomingSession ? { session: incomingSession } : {}) });
+        const sessionLiveGuard = createRegistryRegistrationLiveGuard(transaction.token, "constitution_gate");
+        if (incomingSession) {
+          sessionAuthority = issueCtoRuntimeSessionAuthority(
+            sessionClaim.registry_context,
+            { canonical_root: bindingRoot.root, dev: bindingRoot.rootDev, ino: bindingRoot.rootIno },
+            {
+              sessionManager: incomingSession.sessionManager,
+              sessionId: incomingSession.sessionId,
+              ...(incomingSession.sessionFile !== undefined ? { sessionFile: incomingSession.sessionFile } : {}),
+              ...(incomingSession.sessionBasename !== undefined ? { sessionBasename: incomingSession.sessionBasename } : {}),
+              ...(incomingSession.generation !== undefined ? { generation: incomingSession.generation } : {}),
+            },
+            sessionLiveGuard,
+          );
+          const openedRuntime = openCtoRuntimeAccess(sessionClaim.registry_context, sessionAuthority, bindingRoot.root);
+          if (!openedRuntime.ok) throw new Error(`${openedRuntime.code}: ${openedRuntime.error}`);
+          sessionRuntimeAccess = openedRuntime.access;
+        }
+        const sessionPrincipalFingerprint = requireRegistryContext(sessionClaim.registry_context, bindingRoot.root, "workflow_registration").principal_fingerprint;
+      recordTeamLifecycle(originalTeam, transaction.token, {
+        ...bindingRoot,
+        principal: registryRegistrationPrincipal(transaction.token, "constitution_gate"),
+        principalFingerprint: sessionPrincipalFingerprint,
+        liveGuard: sessionLiveGuard,
+        cleanup: cleanupSessionActivation,
+        registryContext: sessionClaim.registry_context,
+        ...(sessionAuthority ? { runtimeAuthority: sessionAuthority } : {}),
+        ...(sessionRuntimeAccess ? { runtimeAccess: sessionRuntimeAccess } : {}),
+        ...(incomingSession ? { session: incomingSession } : {}),
+      });
         commitRegistryRegistration(transaction.token);
         drainTeamActivationCleanup(originalTeam);
       } catch (error) {
@@ -1655,9 +1764,9 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
       // for later exact session generations on this host object.
       const current = teamActivationCells.get(originalPi as unknown as object);
       const incoming = hostSessionIdentity(ctx);
-      if (!current || !incoming || !current.sessionManager || current.sessionId === undefined
-        || current.sessionManager !== incoming.sessionManager
-        || current.sessionId !== incoming.sessionId
+      const currentSession = current ? teamCellSession(current) : null;
+      if (!current || !incoming || !currentSession
+        || !sameHostSession(currentSession, incoming)
         || current.root === undefined || current.rootDev === undefined || current.rootIno === undefined
         || hostContextRootIssue(ctx, current.root, current.rootDev, current.rootIno) !== null) return;
       clearNativeTaskSelectors();
@@ -1666,14 +1775,21 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
       // opaque cleanup. Keeping the authenticated root/principal lets the
       // next bindSession rebind through recordTeamLifecycle instead of
       // silently dropping its cleanup ownership.
+      const retiredSessions = [...(current.retiredSessions ?? []), currentSession].slice(-8);
       teamActivationCells.set(originalPi as unknown as object, {
         ...current,
         state: "failed",
         recoverableSession: true,
         liveGuard: undefined,
         cleanup: undefined,
+        registryContext: undefined,
+        runtimeAuthority: undefined,
         sessionManager: undefined,
         sessionId: undefined,
+        sessionFile: undefined,
+        sessionBasename: undefined,
+        sessionGeneration: undefined,
+        retiredSessions,
       });
       current.cleanup?.();
     });
@@ -1749,7 +1865,7 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
             : "recovery_required: CTO task selector registry is at capacity; terminal or stale selectors must be reconciled before issuing another host capability" });
         }
         if (!result) {
-        const mountedRuntime = mountedCtoRuntime(ctx, cwd, marker.runId);
+        const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, cwd, marker.runId);
         if (!mountedRuntime) {
           run({ block: true, reason: "recovery_required: authenticated CTO RuntimeAccess is unavailable for the exact task marker run" });
         } else {
@@ -1904,7 +2020,7 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
           evidence,
           terminal_signal: event.isError ? "contract_failure" : "native_tool_result",
         }, { pinnedRoot: root });
-        const mountedRuntime = mountedCtoRuntime(ctx, cwd, ctoSelector.cto_run_id);
+        const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, cwd, ctoSelector.cto_run_id);
         if (!mountedRuntime) {
           console.warn("recovery_required: CTO task receipt was signed but live runtime reconciliation is unavailable");
         } else {
@@ -1968,10 +2084,42 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
   if (!opts.deferConstitutionGate) installConstitutionGate?.();
   if (activation?.registryToken) {
     const current = teamActivationCells.get(originalPi as unknown as object);
+    const initialSession = opts.initialSessionContext !== undefined
+      ? hostSessionIdentity(opts.initialSessionContext)
+      : opts.initialSession;
+    const initialRuntimeAuthority = activation.registryContext && teamBinding && initialSession
+      ? issueCtoRuntimeSessionAuthority(
+        activation.registryContext,
+        { canonical_root: teamBinding.root, dev: teamBinding.rootDev, ino: teamBinding.rootIno },
+        {
+          sessionManager: initialSession.sessionManager,
+          sessionId: initialSession.sessionId,
+          ...(initialSession.sessionFile !== undefined ? { sessionFile: initialSession.sessionFile } : {}),
+          ...(initialSession.sessionBasename !== undefined ? { sessionBasename: initialSession.sessionBasename } : {}),
+          ...(initialSession.generation !== undefined ? { generation: initialSession.generation } : {}),
+        },
+        teamBinding.liveGuard,
+      )
+      : undefined;
+    const initialRuntimeAccess = initialRuntimeAuthority && activation.registryContext && teamBinding
+      ? (() => {
+        const opened = openCtoRuntimeAccess(activation.registryContext, initialRuntimeAuthority, teamBinding.root);
+        if (!opened.ok) {
+          revokeCtoRuntimeSessionAuthority(initialRuntimeAuthority);
+          throw new Error(`${opened.code}: ${opened.error}`);
+        }
+        return opened.access;
+      })()
+      : undefined;
     const initialBinding = teamBinding
-      ? { ...teamBinding, ...(opts.initialSession ? { session: opts.initialSession } : {}) }
-      : (current?.root !== undefined && current.rootDev !== undefined && current.rootIno !== undefined && current.principal !== undefined && current.liveGuard !== undefined
-        ? { root: current.root, rootDev: current.rootDev, rootIno: current.rootIno, principal: current.principal, liveGuard: current.liveGuard, ...(opts.initialSession ? { session: opts.initialSession } : {}) }
+      ? {
+        ...teamBinding,
+        ...(initialRuntimeAuthority ? { runtimeAuthority: initialRuntimeAuthority } : {}),
+        ...(initialRuntimeAccess ? { runtimeAccess: initialRuntimeAccess } : {}),
+        ...(initialSession ? { session: initialSession } : {}),
+      }
+      : (current?.root !== undefined && current.rootDev !== undefined && current.rootIno !== undefined && current.principal !== undefined && current.principalFingerprint !== undefined && current.liveGuard !== undefined
+        ? { root: current.root, rootDev: current.rootDev, rootIno: current.rootIno, principal: current.principal, principalFingerprint: current.principalFingerprint, liveGuard: current.liveGuard, ...(initialSession ? { session: initialSession } : {}) }
         : undefined);
     recordTeamLifecycle(originalPi as unknown as object, activation.registryToken, initialBinding);
   }
@@ -1995,6 +2143,9 @@ interface HostAskSurface {
 type HostSessionIdentity = {
   sessionManager: object;
   sessionId: string;
+  sessionFile?: string;
+  sessionBasename?: string;
+  generation?: string | number;
 };
 
 type HostSessionProfile = HostSessionIdentity & {
@@ -2020,8 +2171,15 @@ function hostSessionIdentity(ctx: unknown): HostSessionIdentity | null {
   if (!manager || typeof manager !== "object" || !("getSessionId" in manager) || typeof manager.getSessionId !== "function") return null;
   try {
     const sessionId = manager.getSessionId();
+    const generation = hostSessionGeneration(ctx);
+    const transcript = resolveSessionTranscript(ctx);
     return typeof sessionId === "string" && sessionId.length > 0
-      ? { sessionManager: manager, sessionId }
+      ? {
+        sessionManager: manager,
+        sessionId,
+        ...(transcript ? { sessionFile: transcript.sessionFile, sessionBasename: transcript.sessionBasename } : {}),
+        ...(generation !== undefined ? { generation } : {}),
+      }
       : null;
   } catch {
     return null;
@@ -2029,11 +2187,26 @@ function hostSessionIdentity(ctx: unknown): HostSessionIdentity | null {
 }
 
 function sameHostSession(left: HostSessionIdentity, right: HostSessionIdentity): boolean {
-  return left.sessionManager === right.sessionManager && left.sessionId === right.sessionId;
+  return left.sessionManager === right.sessionManager
+    && left.sessionId === right.sessionId
+    && left.sessionFile === right.sessionFile
+    && left.sessionBasename === right.sessionBasename
+    && left.generation === right.generation;
+}
+
+function teamCellSession(cell: TeamActivationCell): HostSessionIdentity | null {
+  if (!cell.sessionManager || cell.sessionId === undefined) return null;
+  return {
+    sessionManager: cell.sessionManager,
+    sessionId: cell.sessionId,
+    ...(cell.sessionFile !== undefined ? { sessionFile: cell.sessionFile } : {}),
+    ...(cell.sessionBasename !== undefined ? { sessionBasename: cell.sessionBasename } : {}),
+    ...(cell.sessionGeneration !== undefined ? { generation: cell.sessionGeneration } : {}),
+  };
 }
 
 type MountedCtoRuntime = {
-  readonly runtimeAccess: NonNullable<ReturnType<typeof resolveCtoRuntimeAccessForRoot>>;
+  readonly runtimeAccess: CtoRuntimeAccessFacade;
   readonly sessionId: string;
 };
 
@@ -2124,17 +2297,20 @@ function ctoCompletionStateProjection(value: unknown): CtoCompletionStateProject
   };
 }
 
-/** Resolve CTO authority from the live host session manager and exact root. */
-function mountedCtoRuntimeForCreate(ctx: unknown, cwd: string): MountedCtoRuntime | null {
+/** Resolve CTO authority from the current authenticated team activation cell. */
+function mountedCtoRuntimeForCreate(pi: object, ctx: unknown, cwd: string): MountedCtoRuntime | null {
   const identity = hostSessionIdentity(ctx);
-  if (!identity || identity.sessionId.trim().length === 0) return null;
-  const runtimeAccess = resolveCtoRuntimeAccessForRoot(cwd, identity.sessionId);
-  return runtimeAccess ? { runtimeAccess, sessionId: identity.sessionId } : null;
+  const current = teamActivationCells.get(pi);
+  const currentSession = current ? teamCellSession(current) : null;
+  if (!identity || identity.sessionId.trim().length === 0 || !current?.registryContext || !current.runtimeAuthority
+    || !currentSession || !sameHostSession(currentSession, identity)) return null;
+  const opened = openCtoRuntimeAccess(current.registryContext, current.runtimeAuthority, cwd);
+  return opened.ok ? { runtimeAccess: opened.access, sessionId: identity.sessionId } : null;
 }
 
 /** Resolve existing run authority and prove its authenticated state binding. */
-function mountedCtoRuntime(ctx: unknown, cwd: string, ctoRunId: string): MountedCtoRuntime | null {
-  const mounted = mountedCtoRuntimeForCreate(ctx, cwd);
+function mountedCtoRuntime(pi: object, ctx: unknown, cwd: string, ctoRunId: string): MountedCtoRuntime | null {
+  const mounted = mountedCtoRuntimeForCreate(pi, ctx, cwd);
   if (!mounted || typeof ctoRunId !== "string" || ctoRunId.trim().length === 0) return null;
   try {
     // Existing-run mutations reject retired session slots and stale roots.
@@ -4183,7 +4359,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       try {
         const isCto = "owner_kind" in input && input.owner_kind === "cto";
         const mountedRuntime = isCto
-          ? mountedCtoRuntime(ctx, cwd, (input as CtoSpecificationCompletionEnvelope).owner_run_key)
+          ? mountedCtoRuntime(originalPi as unknown as object, ctx, cwd, (input as CtoSpecificationCompletionEnvelope).owner_run_key)
           : null;
         if (isCto && !mountedRuntime) {
           return toolResult({ ok: false, code: "WORKFLOW_COMPLETE_SPECIFICATION_EXECUTION_RECOVERY_REQUIRED", error: "recovery_required: authenticated host session manager/runtime access is required for CTO completion" });
@@ -5248,7 +5424,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
       const checked = context(ctx);
       if ("content" in checked) return checked;
       try {
-        const mountedRuntime = mountedCtoRuntimeForCreate(ctx, checked.cwd);
+        const mountedRuntime = mountedCtoRuntimeForCreate(originalPi as unknown as object, ctx, checked.cwd);
         if (!mountedRuntime) {
           return toolResult({ status: "blocked", prepared: false, dispatched: false, findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO execution preparation"] });
         }
@@ -5326,7 +5502,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
       if ("content" in checked) return checked;
       try {
         const preflightInput = params as { cto_run_id: string; selections: readonly CtoSpecificationExecutionSelection[] };
-        const mountedRuntime = mountedCtoRuntime(ctx, checked.cwd, preflightInput.cto_run_id);
+        const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, checked.cwd, preflightInput.cto_run_id);
         if (!mountedRuntime) return toolResult({ status: "blocked", dispatched: false, findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO preflight"] });
         const result = await preflightCtoSpecificationExecution(checked.cwd, preflightInput, {
           runtimeAccess: mountedRuntime.runtimeAccess,
@@ -5397,7 +5573,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
       const checked = context(ctx);
       if ("content" in checked) return checked;
       const input = params as CtoSpecificationMappingAskInput;
-      const mountedRuntime = mountedCtoRuntime(ctx, checked.cwd, input.cto_run_id);
+      const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, checked.cwd, input.cto_run_id);
       if (!mountedRuntime) return toolResult({ status: "blocked", code: "CTO_CHECKPOINT_ASK_UNAVAILABLE", dispatched: false, findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO mapping Ask"], required_next_tool: { name: "cto_checkpoint_ask_selected", arguments: input }, next_action: "Retry cto_checkpoint_ask_selected from the authenticated interactive main session." });
       const prepared = prepareCtoSpecificationMappingAsk(checked.cwd, input, {
         runtimeAccess: mountedRuntime.runtimeAccess,
@@ -5464,7 +5640,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
         assertCurrentExecutionLiveness();
         const hostIdentity = hostSessionIdentity(ctx);
         if (!hostIdentity || !sameHostSession(hostIdentityBefore, hostIdentity)) return toolResult({ status: "blocked", code: "CTO_CHECKPOINT_ASK_REJECTED", dispatched: false, findings: ["trusted host session changed while the checkpoint Ask was open; no human answer was minted"], required_next_tool: { name: "cto_checkpoint_ask_selected", arguments: input }, next_action: "Retry cto_checkpoint_ask_selected from the interactive main session." });
-        if (!mountedCtoRuntime(ctx, checked.cwd, input.cto_run_id)) return toolResult({ status: "blocked", code: "CTO_CHECKPOINT_ASK_REJECTED", dispatched: false, findings: ["recovery_required: CTO runtime access changed while the mapping Ask was open; no human answer was minted"], required_next_tool: { name: "cto_checkpoint_ask_selected", arguments: input }, next_action: "Retry cto_checkpoint_ask_selected from the authenticated interactive main session." });
+        if (!mountedCtoRuntime(originalPi as unknown as object, ctx, checked.cwd, input.cto_run_id)) return toolResult({ status: "blocked", code: "CTO_CHECKPOINT_ASK_REJECTED", dispatched: false, findings: ["recovery_required: CTO runtime access changed while the mapping Ask was open; no human answer was minted"], required_next_tool: { name: "cto_checkpoint_ask_selected", arguments: input }, next_action: "Retry cto_checkpoint_ask_selected from the authenticated interactive main session." });
         result = recordCtoSpecificationMappingAsk(checked.cwd, {
           ...input,
           decision: selected.selected as "approve_continue" | "request_changes" | "approve_stop",
@@ -5526,7 +5702,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
       const checked = context(ctx);
       if ("content" in checked) return checked;
       const resumeInput = params as CtoSpecificationMappingResumeInput;
-      const mountedRuntime = mountedCtoRuntime(ctx, checked.cwd, resumeInput.cto_run_id);
+      const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, checked.cwd, resumeInput.cto_run_id);
       if (!mountedRuntime) return toolResult({ status: "blocked", dispatched: false, findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO mapping resume"] });
       const result = resumeCtoSpecificationMapping(checked.cwd, resumeInput, {
         runtimeAccess: mountedRuntime.runtimeAccess,
@@ -5566,7 +5742,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
       if ("content" in checked) return checked;
       try {
         const confirmInput = params as CtoSpecificationMappingConfirmationInput;
-        const mountedRuntime = mountedCtoRuntime(ctx, checked.cwd, confirmInput.cto_run_id);
+        const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, checked.cwd, confirmInput.cto_run_id);
         if (!mountedRuntime) return toolResult({ status: "blocked", dispatched: false, findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO mapping confirmation"] });
         const result = await confirmCtoSpecificationMapping(checked.cwd, confirmInput, {
           runtimeAccess: mountedRuntime.runtimeAccess,
@@ -5626,7 +5802,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
       const checked = context(ctx);
       if ("content" in checked) return checked;
       try {
-        const mountedRuntime = mountedCtoRuntime(ctx, checked.cwd, (params as { cto_run_id: string }).cto_run_id);
+        const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, checked.cwd, (params as { cto_run_id: string }).cto_run_id);
         if (!mountedRuntime) {
           return toolResult({ status: "blocked", dispatched: false, findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO dispatch"] });
         }
@@ -5697,7 +5873,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
           mapping_hash: string;
           wave_id: string;
         };
-        const mountedRuntime = mountedCtoRuntime(ctx, checked.cwd, selectors.cto_run_id);
+        const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, checked.cwd, selectors.cto_run_id);
         if (!mountedRuntime) return toolResult({ status: "blocked", replayed: false, features: [], passing_feature_ids: [], blocked_feature_ids: [], findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO conformance"] });
         const authenticatedState = mountedRuntime.runtimeAccess.readState(selectors.cto_run_id);
         const authenticatedWaveHistory = isRecord(authenticatedState) && Array.isArray(authenticatedState.wave_history)
@@ -5861,7 +6037,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
       const checked = context(ctx);
       if ("content" in checked) return checked;
       try {
-        const mountedRuntime = mountedCtoRuntime(ctx, checked.cwd, (params as { cto_run_id: string }).cto_run_id);
+        const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, checked.cwd, (params as { cto_run_id: string }).cto_run_id);
         if (!mountedRuntime) {
           return toolResult({ status: "blocked", closed: false, replayed: false, findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO wave close"] });
         }
@@ -5892,7 +6068,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
       if ("content" in checked) return checked;
       try {
         const input = params as CtoSpecificationPreparationInput;
-        const mountedRuntime = mountedCtoRuntimeForCreate(ctx, checked.cwd);
+        const mountedRuntime = mountedCtoRuntimeForCreate(originalPi as unknown as object, ctx, checked.cwd);
         if (!mountedRuntime) return toolResult({ status: "blocked", prepared: false, dispatched: false, findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO preparation"] });
         const { runtimeAccess, sessionId } = mountedRuntime;
         return toolResult(prepareCtoSpecificationPreparation(checked.cwd, {
@@ -5916,7 +6092,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
       const checked = context(ctx);
       if ("content" in checked) return checked;
       const reviewInput = params as { cto_run_id: string };
-      const mountedRuntime = mountedCtoRuntime(ctx, checked.cwd, reviewInput.cto_run_id);
+      const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, checked.cwd, reviewInput.cto_run_id);
       if (!mountedRuntime) return toolResult({ status: "blocked", dispatched: false, findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO specification review"] });
       return toolResult(reviewCtoSpecificationPreparation(checked.cwd, reviewInput, { runtimeAccess: mountedRuntime.runtimeAccess, sessionId: mountedRuntime.sessionId }));
     },
@@ -5933,7 +6109,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
       const checked = context(ctx);
       if ("content" in checked) return checked;
       const decideInput = params as { cto_run_id: string; decisions: unknown };
-      const mountedRuntime = mountedCtoRuntime(ctx, checked.cwd, decideInput.cto_run_id);
+      const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, checked.cwd, decideInput.cto_run_id);
       if (!mountedRuntime) return toolResult({ status: "blocked", prepared: false, dispatched: false, findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO specification decision"] });
       return toolResult(decideCtoSpecificationPreparation(checked.cwd, decideInput, { runtimeAccess: mountedRuntime.runtimeAccess, sessionId: mountedRuntime.sessionId }));
     },
@@ -5946,7 +6122,7 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
     async execute(_id, params, _signal, _update, ctx) {
       const checked = context(ctx);
       if ("content" in checked) return checked;
-      const mountedRuntime = mountedCtoRuntime(ctx, checked.cwd, (params as { cto_run_id: string }).cto_run_id);
+      const mountedRuntime = mountedCtoRuntime(originalPi as unknown as object, ctx, checked.cwd, (params as { cto_run_id: string }).cto_run_id);
       if (!mountedRuntime) return toolResult({ status: "blocked", prepared: false, dispatched: false, findings: ["recovery_required: authenticated host session manager/runtime access is required for authoritative CTO specification advance"] });
       return toolResult(advanceCtoSpecificationPreparationTool(
         checked.cwd,

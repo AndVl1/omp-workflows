@@ -5,7 +5,7 @@ import {
   type RegistryContextSnapshot,
   type RegistryRegistrationContext,
 } from "../registry/owner.js";
-import { findActiveCtoRun } from "../commands/cto.js";
+import { CtoAuthorityUnavailableError, findActiveCtoRun } from "../commands/cto.js";
 import {
   acknowledgeCtoRunDelivery,
   markCtoRunDeliveryPending,
@@ -16,6 +16,7 @@ import {
   hasValidCtoRuntimeStateProofPinned,
   writeCtoRuntimeStateProof,
   refreshCtoRunDeliveryIndexAuthorityPinned,
+  readCtoRunDeliveryIndexAuthorityPinned,
   newCtoState,
   publishCtoOutboxDelivery,
   readCtoRunDeliveryActiveCandidatesPinned,
@@ -55,7 +56,10 @@ import { PinnedProjectRoot } from "../specification/pinned-root.js";
 import type { CtoState, WaveRecord, ScheduledDigest } from "./types.js";
 import {
   authenticateCtoRuntimeSessionAuthority,
+  attachCtoRuntimeSessionAuthority,
+  isCtoRuntimeSessionAuthority,
   ctoRuntimeSessionAuthorityForContext,
+  detachCtoRuntimeSessionAuthority,
   revokeCtoRuntimeSessionAuthority,
   type CtoRuntimeSessionAuthority,
 } from "./session-authority.js";
@@ -176,6 +180,7 @@ type RuntimeCell = {
   access?: object;
   deliveryCapability?: object;
   authority: CtoRuntimeSessionAuthority;
+  authorityLease?: () => void;
 };
 
 const runtimeCells = new WeakMap<object, RuntimeCell>();
@@ -199,15 +204,8 @@ export function isCtoRuntimeDeliveryCapability(value: unknown): boolean {
 }
 
 function runtimeCellForFacade(value: unknown): RuntimeCell | null {
-  let current = typeof value === "object" && value !== null ? value : null;
-  const seen = new Set<object>();
-  while (current && !seen.has(current)) {
-    seen.add(current);
-    const cell = runtimeCells.get(current);
-    if (cell) return cell;
-    try { current = Object.getPrototypeOf(current) as object | null; } catch { return null; }
-  }
-  return null;
+  if (!value || typeof value !== "object") return null;
+  return runtimeCells.get(value) ?? null;
 }
 
 /** Validates a genuine runtime facade or guarded derived wrapper. */
@@ -384,7 +382,7 @@ function revoke(cell: RuntimeCell): void {
     return;
   }
   cell.revoked = true;
-  revokeCtoRuntimeSessionAuthority(cell.authority);
+  if (cell.authorityLease) detachCtoRuntimeSessionAuthority(cell.authority, cell.authorityLease);
   for (const stop of cell.schedulers) {
     try { stop(); } catch { /* scheduler teardown is best effort */ }
   }
@@ -488,10 +486,29 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
       enumerable: false,
       value: (): CtoRuntimeActiveRunProjection | null => {
         requireLive(cell);
-        const found = findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root });
-        if (!found) return null;
-        const state = detachedProjection(found.state) as unknown as Readonly<Record<string, unknown>>;
-        return { runId: found.runId, state };
+        try {
+          const authority = readCtoRunDeliveryIndexAuthorityPinned(cell.root);
+          const proofPath = join(".work-state", "cto", ".active-run-index.proof.json");
+          if (!authority.authenticated && cell.root.pathEntryInfo(proofPath) !== null) {
+            throw runtimeError("runtime_access_invalid", "canonical CTO delivery authority is unavailable");
+          }
+          if (!authority.authenticated && !refreshCtoRunDeliveryIndexAuthorityPinned(cell.root, cell.deliveryCapability, cell.sessionId)) {
+            throw runtimeError("runtime_access_invalid", "canonical CTO delivery authority is unavailable");
+          }
+          const found = findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root });
+          if (!found) return null;
+          if (!refreshCtoRunDeliveryIndexAuthorityPinned(cell.root, cell.deliveryCapability, cell.sessionId)) {
+            throw runtimeError("runtime_access_invalid", "canonical CTO delivery authority changed during active-run read");
+          }
+          const state = detachedProjection(found.state) as unknown as Readonly<Record<string, unknown>>;
+          return { runId: found.runId, state };
+        } catch (error) {
+          if (error instanceof CtoRuntimeAccessError) throw error;
+          if (error instanceof CtoAuthorityUnavailableError || (error instanceof Error && /delivery index|proof|state read|authority/i.test(error.message))) {
+            throw runtimeError("runtime_access_invalid", "canonical CTO delivery authority is unavailable");
+          }
+          throw error;
+        }
       },
     },
     readState: {
@@ -600,7 +617,15 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
       enumerable: false,
       value: (): string => {
         requireLive(cell);
-        const active = findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root });
+        let active: ReturnType<typeof findActiveCtoRun>;
+        try {
+          active = findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root });
+        } catch (error) {
+          if (error instanceof CtoAuthorityUnavailableError || (error instanceof Error && /delivery index|proof|state read|authority/i.test(error.message))) {
+            throw runtimeError("runtime_access_invalid", "canonical CTO delivery authority is unavailable");
+          }
+          throw error;
+        }
         if (active) return active.runId;
         try {
           return withCtoRegistryLock(
@@ -706,14 +731,21 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
       enumerable: false,
       value: (options: { after_run_id?: string; startAfter?: string; limit?: number } = {}): Readonly<CtoRunDeliveryIndexPage> => {
         requireLive(cell);
-        if (!ownRecord(options)) throw runtimeError("runtime_access_invalid", "delivery index options must be a plain object");
+        if (!ownRecord(options) || Object.keys(options).some((key) => key !== "after_run_id" && key !== "startAfter" && key !== "limit")) {
+          throw runtimeError("runtime_access_invalid", "delivery index options are invalid");
+        }
+        if (options.after_run_id !== undefined && options.startAfter !== undefined) {
+          throw runtimeError("runtime_access_invalid", "delivery cursors are mutually exclusive");
+        }
         const copy: { after_run_id?: string; startAfter?: string; limit?: number } = {};
         if (options.after_run_id !== undefined) {
           if (typeof options.after_run_id !== "string") throw runtimeError("runtime_access_invalid", "delivery cursor is invalid");
+          requireSafeRunId(options.after_run_id);
           copy.after_run_id = options.after_run_id;
         }
         if (options.startAfter !== undefined) {
           if (typeof options.startAfter !== "string") throw runtimeError("runtime_access_invalid", "delivery cursor is invalid");
+          requireSafeRunId(options.startAfter);
           copy.startAfter = options.startAfter;
         }
         if (options.limit !== undefined) {
@@ -952,7 +984,8 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
       value: (runId: string, intervalMs: number, onWave: () => void): () => void => {
         requireLive(cell);
         requireSafeRunId(runId);
-        if (!Number.isSafeInteger(intervalMs) || intervalMs < MIN_RUNTIME_ACCESS_INTERVAL_MS || intervalMs > MAX_RUNTIME_ACCESS_INTERVAL_MS || typeof onWave !== "function") throw runtimeError("runtime_access_invalid", "scheduler arguments are invalid");
+        if (!Number.isSafeInteger(intervalMs) || intervalMs < MIN_RUNTIME_ACCESS_INTERVAL_MS || intervalMs > MAX_RUNTIME_ACCESS_INTERVAL_MS) throw runtimeError("runtime_access_invalid", "scheduler interval must be an integer between configured bounds");
+        if (typeof onWave !== "function") throw runtimeError("runtime_access_invalid", "scheduler callback is invalid");
         if (cell.schedulers.size >= MAX_RUNTIME_ACCESS_SCHEDULERS) throw runtimeError("runtime_access_invalid", "runtime scheduler capacity is exhausted");
         const state = readCtoStatePinned(runId, cell.root);
         if (!state) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
@@ -1028,7 +1061,7 @@ export function openCtoRuntimeAccess(
   session: CtoRuntimeAccessSession,
   projectRoot: string,
 ): CtoRuntimeAccessOpenResult {
-  if (!session || typeof session !== "object") {
+  if (!isCtoRuntimeSessionAuthority(session)) {
     return openFailure("runtime_access_invalid", "an opaque main-session authority is required");
   }
   if (typeof projectRoot !== "string" || projectRoot.trim().length === 0) return openFailure("runtime_access_invalid", "project root is required");
@@ -1068,6 +1101,14 @@ export function openCtoRuntimeAccess(
   };
   const access = makeFacade(cell);
   cell.access = access as object;
+  const authorityLease = (): void => {
+    if (!cell.revoked) revoke(cell);
+  };
+  if (!attachCtoRuntimeSessionAuthority(session, authorityLease)) {
+    root.close();
+    return openFailure("runtime_access_invalid", "runtime session facade capacity is exhausted");
+  }
+  cell.authorityLease = authorityLease;
   const deliveryCapability = Object.freeze({});
   cell.deliveryCapability = deliveryCapability;
   deliveryCapabilities.set(deliveryCapability, cell);

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
   openWorkflowActivation,
+  requireRegistryContext,
   releaseWorkflowOwners,
   type WorkflowOwnerIdentity,
 } from "../src/registry/owner.js";
@@ -18,6 +19,7 @@ import {
   openCtoRuntimeAccess,
   registerCtoRuntimeAccessProvider,
 } from "../src/cto/runtime-access.js";
+import { issueCtoRuntimeSessionAuthority } from "../src/cto/session-authority.js";
 import { ctoRuntimeRunInitialIdentityDigest, mintCtoRuntimeRunOrigin, newCtoState, readCtoState, writeCtoRuntimeStateProof, writeCtoState } from "../src/cto/state.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import type { TeamPlan } from "../src/cto/types.js";
@@ -85,10 +87,24 @@ function stateFor(root: string, runId = "run-one"): void {
 
 function openAccess(root: string, sessionId = "main-session") {
   const activation = activationFor(root);
-  const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId, main: true }, root);
-  assert.equal(opened.ok, true);
-  if (!opened.ok) throw new Error(opened.error);
-  return { activation, access: opened.access };
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  assert.ok(pinnedRoot);
+  if (!pinnedRoot) throw new Error("test root could not be pinned");
+  try {
+    const sessionManager = Object.freeze({});
+    const authority = issueCtoRuntimeSessionAuthority(
+      activation.registry_context,
+      { canonical_root: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino },
+      { sessionManager, sessionId },
+      () => { requireRegistryContext(activation.registry_context, pinnedRoot!.canonical_root, "workflow_tools"); },
+    );
+    const opened = openCtoRuntimeAccess(activation.registry_context, authority, root);
+    assert.equal(opened.ok, true);
+    if (!opened.ok) throw new Error(opened.error);
+    return { activation, access: opened.access, authority };
+  } finally {
+    pinnedRoot.close();
+  }
 }
 
 function assertRevoked(action: () => unknown): void {
@@ -307,16 +323,16 @@ test("raw, forged, wrong-root, non-main, and empty sessions never open access", 
     const activation = activationFor(root);
     const rawClaim = openCtoRuntimeAccess(activation.claim as never, { sessionId: "main-session", main: true }, root);
     assert.equal(rawClaim.ok, false);
-    assert.equal(rawClaim.code, "owner_conflict");
+    assert.equal(rawClaim.code, "runtime_access_invalid");
     const spread = openCtoRuntimeAccess({ ...activation.registry_context }, { sessionId: "main-session", main: true }, root);
     assert.equal(spread.ok, false);
-    assert.equal(spread.code, "owner_conflict");
+    assert.equal(spread.code, "runtime_access_invalid");
     const parsed = openCtoRuntimeAccess(JSON.parse(JSON.stringify(activation.registry_context)), { sessionId: "main-session", main: true }, root);
     assert.equal(parsed.ok, false);
-    assert.equal(parsed.code, "owner_conflict");
+    assert.equal(parsed.code, "runtime_access_invalid");
     const wrongRoot = openCtoRuntimeAccess(activation.registry_context, { sessionId: "main-session", main: true }, otherRoot);
     assert.equal(wrongRoot.ok, false);
-    assert.equal(wrongRoot.code, "owner_conflict");
+    assert.equal(wrongRoot.code, "runtime_access_invalid");
     assert.equal(openCtoRuntimeAccess(activation.registry_context, { sessionId: "", main: true }, root).code, "runtime_access_invalid");
     assert.equal(openCtoRuntimeAccess(activation.registry_context, { sessionId: "bad\u0000session", main: true }, root).code, "runtime_access_invalid");
     assert.equal(openCtoRuntimeAccess(activation.registry_context, { sessionId: "x".repeat(513), main: true }, root).code, "runtime_access_invalid");

@@ -30,6 +30,7 @@ export {
   createRegistryRegistrationLiveGuard,
   openWorkflowActivation,
   recordRegistryUndo,
+  registryRegistrationContextForToken,
   registryRegistrationPrincipal,
   registryRegistrationProjectRoot,
   releaseWorkflowOwner,

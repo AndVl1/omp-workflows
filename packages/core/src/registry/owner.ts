@@ -919,6 +919,14 @@ export function registryRegistrationPrincipal(token: RegistryRegistrationToken, 
   requireRegistryRegistration(token, family);
   return tokenCell(token).principal;
 }
+/** Return the exact opaque context carried by a live token after family auth. */
+export function registryRegistrationContextForToken(token: RegistryRegistrationToken, requiredFamily?: RegistryFamily): RegistryRegistrationContext {
+  const cell = tokenCell(token);
+  if (requiredFamily !== undefined && !cell.families.has(requiredFamily)) {
+    throw failure("registry_transaction_invalid", `registration transaction is not authorized for '${requiredFamily}'`);
+  }
+  return cell.context;
+}
 export function registryRegistrationProjectRoot(token: RegistryRegistrationToken, family: RegistryFamily): string {
   requireRegistryRegistration(token, family);
   return tokenCell(token).root.canonical;

@@ -8,6 +8,7 @@ import { registerConstitutionProvider } from "../../src/specification/constituti
 import { registerDocumentRenderer, registerFormatRecognizer, registerSpecificationRenderer } from "../../src/specification/registry.js";
 import { registerArtifactRenderer, type ArtifactRenderer, type ArtifactRenderLayer } from "../../src/visualize/renderer-registry.js";
 import { openCtoRuntimeAccess, registerCtoRuntimeAccessProvider, type CtoRuntimeAccessFacade } from "../../src/cto/runtime-access.js";
+import { issueCtoRuntimeSessionAuthority } from "../../src/cto/session-authority.js";
 import { closeWorkflowActivation as closeDistWorkflowActivation, openWorkflowActivation as openDistWorkflowActivation, type WorkflowOwnerIdentity as DistWorkflowOwnerIdentity } from "../../src/registry/index.js";
 import type { Profile } from "../../src/engine/types.js";
 import type { ConstitutionProvider } from "../../src/specification/constitution-provider.js";
@@ -20,6 +21,7 @@ import {
   openWorkflowActivation,
   releaseWorkflowOwners,
   rollbackRegistryRegistration,
+  requireRegistryContext,
   type RegistryFamily,
   type WorkflowCapability,
   type RegistryRegistrationToken,
@@ -108,12 +110,20 @@ export function openTestCtoRuntime(
   };
   const activated = openDistWorkflowActivation(root, ["workflow_registration", "workflow_tools"], owner);
   if (!activated.ok) throw new Error(`${activated.code}: ${activated.error}`);
-  const opened = openCtoRuntimeAccess(activated.registry_context, { sessionId, main: true }, root);
+  const runtimeRoot = realpathSync(root);
+  const runtimeIdentity = statSync(runtimeRoot);
+  const sessionManager = Object.freeze({});
+  const authority = issueCtoRuntimeSessionAuthority(
+    activated.registry_context,
+    { canonical_root: runtimeRoot, dev: runtimeIdentity.dev, ino: runtimeIdentity.ino },
+    { sessionManager, sessionId },
+    () => { requireRegistryContext(activated.registry_context, runtimeRoot, "workflow_tools"); },
+  );
+  const opened = openCtoRuntimeAccess(activated.registry_context, authority, root);
   if (!opened.ok) {
     closeDistWorkflowActivation(activated);
     throw new Error(`${opened.code}: ${opened.error}`);
   }
-  const runtimeRoot = realpathSync(root);
   const runtimeKey = `${runtimeRoot}\0${sessionId}`;
   testRuntimeAccesses.set(runtimeKey, opened.access);
   let closed = false;

@@ -33,10 +33,15 @@ export type CtoRuntimeSessionAuthorityCell = {
   readonly sessionBasename?: string;
   readonly generation?: string | number;
   readonly liveGuard: () => void;
+  readonly attached: Set<() => void>;
   revoked: boolean;
 };
 
 const authorityCells = new WeakMap<object, CtoRuntimeSessionAuthorityCell>();
+const MAX_SESSION_ID_BYTES = 512;
+const MAX_SESSION_FILE_BYTES = 4096;
+const MAX_SESSION_BASENAME_BYTES = 512;
+export const MAX_CTO_RUNTIME_SESSION_ATTACHMENTS = 8;
 const contextAuthorities = new WeakMap<object, CtoRuntimeSessionAuthority>();
 
 function authorityObject(): CtoRuntimeSessionAuthority {
@@ -52,9 +57,16 @@ function validRoot(root: CtoRuntimeSessionAuthorityRoot): boolean {
     && root.ino >= 0;
 }
 
+function safeText(value: unknown, maxBytes: number): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= maxBytes
+    && !/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
+}
+
 function validGeneration(value: unknown): value is string | number | undefined {
   return value === undefined
-    || (typeof value === "string" && value.length > 0)
+    || (safeText(value, MAX_SESSION_ID_BYTES))
     || (typeof value === "number" && Number.isSafeInteger(value));
 }
 
@@ -71,7 +83,10 @@ export function issueCtoRuntimeSessionAuthority(
   if (!context || typeof context !== "object") throw new TypeError("runtime session authority context is invalid");
   if (!validRoot(root)) throw new TypeError("runtime session authority root is invalid");
   if (!session || typeof session !== "object" || !session.sessionManager || typeof session.sessionManager !== "object"
-    || typeof session.sessionId !== "string" || session.sessionId.length === 0 || !validGeneration(session.generation)) {
+    || !safeText(session.sessionId, MAX_SESSION_ID_BYTES)
+    || (session.sessionFile !== undefined && !safeText(session.sessionFile, MAX_SESSION_FILE_BYTES))
+    || (session.sessionBasename !== undefined && !safeText(session.sessionBasename, MAX_SESSION_BASENAME_BYTES))
+    || !validGeneration(session.generation)) {
     throw new TypeError("runtime session authority identity is invalid");
   }
   if (typeof liveGuard !== "function") throw new TypeError("runtime session authority live guard is invalid");
@@ -88,11 +103,17 @@ export function issueCtoRuntimeSessionAuthority(
     ...(session.sessionBasename !== undefined ? { sessionBasename: session.sessionBasename } : {}),
     ...(session.generation !== undefined ? { generation: session.generation } : {}),
     liveGuard,
+    attached: new Set<() => void>(),
     revoked: false,
   };
   authorityCells.set(authority as object, cell);
   contextAuthorities.set(context, authority);
   return authority;
+}
+
+/** Runtime-only brand check; no caller claims are inspected or accepted. */
+export function isCtoRuntimeSessionAuthority(value: unknown): value is CtoRuntimeSessionAuthority {
+  return Boolean(value && typeof value === "object" && authorityCells.has(value as object));
 }
 
 /** Revoke one lifecycle capability; stale copies fail closed immediately. */
@@ -101,6 +122,34 @@ export function revokeCtoRuntimeSessionAuthority(authority: CtoRuntimeSessionAut
   if (!cell || cell.revoked) return;
   cell.revoked = true;
   if (contextAuthorities.get(cell.context) === authority) contextAuthorities.delete(cell.context);
+  const attached = [...cell.attached];
+  cell.attached.clear();
+  for (const close of attached) {
+    try { close(); } catch { /* stale facade teardown is best effort */ }
+  }
+}
+
+
+/** Attach one runtime facade lease to its lifecycle authority. */
+export function attachCtoRuntimeSessionAuthority(
+  authority: CtoRuntimeSessionAuthority,
+  close: () => void,
+): boolean {
+  if (!authority || typeof authority !== "object" || typeof close !== "function") return false;
+  const cell = authorityCells.get(authority as object);
+  if (!cell || cell.revoked || cell.attached.size >= MAX_CTO_RUNTIME_SESSION_ATTACHMENTS) return false;
+  try { cell.liveGuard(); } catch { revokeCtoRuntimeSessionAuthority(authority); return false; }
+  cell.attached.add(close);
+  return true;
+}
+
+/** Remove one runtime facade lease after explicit close. */
+export function detachCtoRuntimeSessionAuthority(
+  authority: CtoRuntimeSessionAuthority,
+  close: () => void,
+): void {
+  if (!authority || typeof authority !== "object" || typeof close !== "function") return;
+  authorityCells.get(authority as object)?.attached.delete(close);
 }
 
 /**
