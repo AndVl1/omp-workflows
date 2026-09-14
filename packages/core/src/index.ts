@@ -901,6 +901,7 @@ function resolveCwdFromContext(ctx: unknown): string | undefined {
   }
   return typeof value.cwd === "string" && value.cwd.length > 0 ? value.cwd : undefined;
 }
+const MAX_SESSION_ID_BYTES = 512;
 const MAX_SESSION_FILE_BYTES = 4096;
 const MAX_SESSION_BASENAME_BYTES = 512;
 
@@ -1898,44 +1899,29 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
   }
   if (!skipTeamMount && activation?.cleanup && typeof (originalPi as unknown as { on?: unknown }).on === "function") {
     hostMountStarted = true;
-    pi.on("session_shutdown", (_event: unknown, ctx: unknown) => {
-      // A host may deliver a stale shutdown callback after a session rebind.
-      // Validate the event against the current session/root before consuming
-      // the live cell; stale or incomplete events must leave the current
-      // generation untouched and retryable. The mounted handler is reusable
-      // for later exact session generations on this host object.
-      const current = teamActivationCells.get(originalPi as unknown as object);
-      const incoming = hostSessionIdentity(ctx);
-      const currentSession = current ? teamCellSession(current) : null;
-      if (!current || !incoming || !currentSession
-        || !sameHostSession(currentSession, incoming)
-        || current.root === undefined || current.rootDev === undefined || current.rootIno === undefined
-        || hostContextRootIssue(ctx, current.root, current.rootDev, current.rootIno) !== null) return;
-      clearNativeTaskSelectors();
-      clearHostContextIdentity(originalPi as unknown as object);
-      revokeSessionBindingController();
-      // Replace the live cell with a recoverable tombstone before invoking
-      // opaque cleanup. Keeping the authenticated root/principal lets the
-      // next bindSession rebind through recordTeamLifecycle instead of
-      // silently dropping its cleanup ownership.
-      const retiredSessions = [...(current.retiredSessions ?? []), currentSession].slice(-8);
-      teamActivationCells.set(originalPi as unknown as object, {
-        ...current,
-        state: "failed",
-        recoverableSession: true,
-        liveGuard: undefined,
-        cleanup: undefined,
-        registryContext: undefined,
-        runtimeAuthority: undefined,
-        runtimeAccess: undefined,
-        sessionManager: undefined,
-        sessionId: undefined,
-        sessionFile: undefined,
-        sessionBasename: undefined,
-        sessionGeneration: undefined,
-        retiredSessions,
-      });
-      current.cleanup?.();
+    pi.on("session_shutdown", (event: unknown, ctx: unknown) => {
+      // A host may deliver a delayed shutdown event after the same manager has
+      // rebound to a newer session generation. Parse the event's immutable
+      // identity fields before reading mutable host context, then release only
+      // the exact binding currently owned by this host identity.
+      const eventIdentity = sessionShutdownEventIdentity(event);
+      if (!eventIdentity) return;
+      const currentBinding = sessionBindingController.current(ctx);
+      if (!currentBinding) return;
+      const currentHost = hostSessionIdentity(ctx);
+      if (!currentHost
+        || !sameHostSession(currentHost, {
+          sessionManager: currentBinding.sessionManager,
+          sessionId: currentBinding.sessionId,
+          ...(currentBinding.sessionFile !== undefined ? { sessionFile: currentBinding.sessionFile } : {}),
+          ...(currentBinding.sessionBasename !== undefined ? { sessionBasename: currentBinding.sessionBasename } : {}),
+          ...(currentBinding.generation !== undefined ? { generation: currentBinding.generation } : {}),
+        })
+        || (eventIdentity.hasSessionId && eventIdentity.sessionId !== currentBinding.sessionId)
+        || (eventIdentity.hasSessionFile && eventIdentity.sessionFile !== currentBinding.sessionFile)
+        || (eventIdentity.hasGeneration && eventIdentity.generation !== currentBinding.generation)
+        || hostContextRootIssue(ctx, currentBinding.canonicalRoot, currentBinding.rootDev, currentBinding.rootIno) !== null) return;
+      releaseExactBinding(currentBinding);
     });
   }
   if (!skipTeamMount && (!opts.cwd || opts.rebindSessions) && (opts.owner || hasRuntimeConfigOverrides(opts)) && typeof pi.on === "function") {
@@ -2345,6 +2331,60 @@ function sameHostSession(left: HostSessionIdentity, right: HostSessionIdentity):
     && left.sessionFile === right.sessionFile
     && left.sessionBasename === right.sessionBasename
     && left.generation === right.generation;
+}
+
+type SessionShutdownEventIdentity = {
+  readonly sessionId?: string;
+  readonly sessionFile?: string;
+  readonly generation?: string | number;
+  readonly hasSessionId: boolean;
+  readonly hasSessionFile: boolean;
+  readonly hasGeneration: boolean;
+};
+
+function validShutdownEventText(value: unknown, maxBytes: number): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= maxBytes
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+
+function validShutdownEventSessionFile(value: unknown): value is string {
+  if (!validShutdownEventText(value, MAX_SESSION_FILE_BYTES)) return false;
+  const segments = value.split(/[\\/]/u);
+  return !segments.some((segment) => segment === "." || segment === "..");
+}
+
+function validShutdownEventGeneration(value: unknown): value is string | number {
+  return (typeof value === "number" && Number.isSafeInteger(value))
+    || validShutdownEventText(value, MAX_SESSION_FILE_BYTES);
+}
+
+/** Parse only immutable data properties supplied by the host shutdown event. */
+function sessionShutdownEventIdentity(event: unknown): SessionShutdownEventIdentity | null {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return null;
+  const source = event as object;
+  const read = (key: "sessionId" | "sessionFile" | "generation"): { present: boolean; value?: unknown } | null => {
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (!descriptor) return { present: false };
+    if (!Object.hasOwn(descriptor, "value")) return null;
+    return { present: true, value: descriptor.value };
+  };
+  const sessionId = read("sessionId");
+  const sessionFile = read("sessionFile");
+  const generation = read("generation");
+  if (!sessionId || !sessionFile || !generation) return null;
+  if (sessionId.present && !validShutdownEventText(sessionId.value, MAX_SESSION_ID_BYTES)) return null;
+  if (sessionFile.present && !validShutdownEventSessionFile(sessionFile.value)) return null;
+  if (generation.present && !validShutdownEventGeneration(generation.value)) return null;
+  return Object.freeze({
+    ...(sessionId.present ? { sessionId: sessionId.value as string } : {}),
+    ...(sessionFile.present ? { sessionFile: sessionFile.value as string } : {}),
+    ...(generation.present ? { generation: generation.value as string | number } : {}),
+    hasSessionId: sessionId.present,
+    hasSessionFile: sessionFile.present,
+    hasGeneration: generation.present,
+  });
 }
 
 function teamCellSession(cell: TeamActivationCell): HostSessionIdentity | null {

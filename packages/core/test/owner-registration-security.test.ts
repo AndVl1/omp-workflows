@@ -761,6 +761,69 @@ test("dynamic team activation ignores worker session starts and keeps one main b
   }
 });
 
+test("delayed shutdown event cannot revoke a rebound team session", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-delayed-shutdown-generation-"));
+  const sessionStarts: SessionStartHandler[] = [];
+  const sessionShutdowns: SessionStartHandler[] = [];
+  const pi = {
+    setLabel() {},
+    on(name: string, handler: SessionStartHandler) {
+      if (name === "session_start") sessionStarts.push(handler);
+      if (name === "session_shutdown") sessionShutdowns.push(handler);
+    },
+  };
+  let cleaned = false;
+  try {
+    const markerInfo = marker(root);
+    const ownerSource = activationOwner("delayed-shutdown-generation", root, markerInfo.path, markerInfo.sha256);
+    registerTeamWorkflow(pi as never, {
+      owner: () => ownerSource,
+      resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd,
+      observability: false,
+    });
+    assert.equal(sessionStarts.length, 1);
+    let sessionId = "main-generation-1";
+    let sessionFile = join(root, "main-generation-1.jsonl");
+    let generation: string | number = "generation-1";
+    const sessionManager = {
+      getCwd: () => root,
+      getSessionId: () => sessionId,
+      getSessionFile: () => sessionFile,
+      getSessionGeneration: () => generation,
+    };
+    const context = { cwd: root, hasUI: true, sessionManager };
+    for (const handler of [...sessionStarts]) handler({}, context);
+    assert.ok(workflowOwnerFor(root, "workflow_registration"), "initial session binds the owner");
+    assert.equal(sessionShutdowns.length, 1);
+
+    const staleShutdown = Object.freeze({ sessionId, sessionFile, generation });
+    sessionId = "main-generation-2";
+    sessionFile = join(root, "main-generation-2.jsonl");
+    generation = "generation-2";
+    for (const handler of [...sessionStarts]) handler({}, context);
+    assert.ok(workflowOwnerFor(root, "workflow_registration"), "same manager rebinds the newer session generation");
+
+    for (const handler of [...sessionShutdowns]) handler(staleShutdown, context);
+    assert.ok(workflowOwnerFor(root, "workflow_registration"), "delayed old-generation shutdown leaves the new binding live");
+    for (const malformed of [Object.freeze({ sessionId: null }), Object.freeze({ generation: { value: "generation-2" } })]) {
+      for (const handler of [...sessionShutdowns]) handler(malformed, context);
+    }
+    assert.ok(workflowOwnerFor(root, "workflow_registration"), "malformed shutdown event leaves the new binding live");
+
+    const currentShutdown = Object.freeze({ sessionId, sessionFile, generation });
+    for (const handler of [...sessionShutdowns]) handler(currentShutdown, context);
+    cleaned = true;
+    assert.equal(workflowOwnerFor(root, "workflow_registration"), undefined, "exact current-generation shutdown releases the binding");
+  } finally {
+    if (!cleaned) {
+      for (const handler of [...sessionShutdowns]) {
+        try { handler({ sessionId: "main-generation-2", sessionFile: join(root, "main-generation-2.jsonl"), generation: "generation-2" }, { cwd: root, hasUI: true, sessionManager: { getCwd: () => root, getSessionId: () => "main-generation-2", getSessionFile: () => join(root, "main-generation-2.jsonl"), getSessionGeneration: () => "generation-2" } }); } catch { /* preserve test failure */ }
+      }
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("workflow command lifecycle ignores worker-first start and shutdown around the main mount", () => {
   const root = mkdtempSync(join(tmpdir(), "omp-command-worker-first-"));
   const markerInfo = marker(root);
