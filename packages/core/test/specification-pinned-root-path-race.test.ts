@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import { join, basename, dirname } from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import childProcess, { execFileSync, spawn } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { PinnedProjectRoot, PinnedRootError, processStartIdentity } from "../src/specification/pinned-root.js";
@@ -1626,6 +1627,27 @@ test("Darwin process identity ignores PATH shadow binaries", () => {
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;
     fs.rmSync(fake, { recursive: true, force: true });
+  }
+});
+
+test("Darwin self process identity survives a transient probe outage without relaxing foreign fencing", () => {
+  if (process.platform !== "darwin") return;
+  const first = processStartIdentity(process.pid);
+  assert.match(first ?? "", /^darwin:/u);
+  const originalSpawnSync = childProcess.spawnSync;
+  let foreignProbeCount = 0;
+  childProcess.spawnSync = (() => {
+    foreignProbeCount += 1;
+    throw new Error("simulated process identity probe outage");
+  }) as typeof originalSpawnSync;
+  syncBuiltinESMExports();
+  try {
+    assert.equal(processStartIdentity(process.pid), first, "trusted self identity remains usable during a transient probe outage");
+    assert.equal(processStartIdentity(process.pid + 1), null, "foreign identity remains fail-closed when its probe is unavailable");
+    assert.equal(foreignProbeCount, 1, "foreign PID probes are not served from the self cache");
+  } finally {
+    childProcess.spawnSync = originalSpawnSync;
+    syncBuiltinESMExports();
   }
 });
 

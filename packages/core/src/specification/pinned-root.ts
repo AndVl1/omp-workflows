@@ -33,8 +33,14 @@ import { MAX_PINNED_ROOT_READ_BYTES } from "./limits.js";
 import { assertCurrentExecutionLiveness, ExecutionLivenessViolation, withoutCurrentExecutionLiveness } from "../execution-liveness.js";
 
 /** Return the operating-system process-start identity used to detect PID reuse. */
+let selfProcessStartIdentity: string | undefined;
 export function processStartIdentity(pid = process.pid): string | null {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  // The current process cannot be replaced while this module is running, so a
+  // successful self identity remains safe to reuse if the OS probe is later
+  // transiently unavailable. Foreign PIDs are always probed afresh for reuse
+  // fencing.
+  if (pid === process.pid && selfProcessStartIdentity !== undefined) return selfProcessStartIdentity;
   if (process.platform === "linux") {
     try {
       const line = readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -42,7 +48,9 @@ export function processStartIdentity(pid = process.pid): string | null {
       if (closing < 0) return null;
       const fields = line.slice(closing + 2).trim().split(/\s+/u);
       // The suffix starts at field 3 (state); starttime is field 22.
-      return fields.length > 19 && fields[19] ? `linux:${fields[19]}` : null;
+      const identity = fields.length > 19 && fields[19] ? `linux:${fields[19]}` : null;
+      if (pid === process.pid && identity !== null) selfProcessStartIdentity = identity;
+      return identity;
     } catch {
       return null;
     }
@@ -56,8 +64,10 @@ export function processStartIdentity(pid = process.pid): string | null {
         maxBuffer: 4096,
         env: { LC_ALL: "C", LANG: "C", TZ: "UTC" },
       });
-      const identity = typeof result.stdout === "string" ? result.stdout.trim() : "";
-      return result.status === 0 && identity.length > 0 ? `darwin:${identity}` : null;
+      const output = typeof result.stdout === "string" ? result.stdout.trim() : "";
+      const identity = result.status === 0 && output.length > 0 ? `darwin:${output}` : null;
+      if (pid === process.pid && identity !== null) selfProcessStartIdentity = identity;
+      return identity;
     } catch {
       return null;
     }
@@ -907,10 +917,19 @@ def read_lock_observed(parent, name):
     return data, info, owner if isinstance(owner, dict) else {}
 
 
+_SELF_PID = os.getpid()
+_SELF_START_IDENTITY = None
+
 def process_start_identity(pid):
     """Return an identity that changes whenever pid is recycled."""
+    global _SELF_START_IDENTITY
     if not isinstance(pid, int) or pid <= 0:
         return None
+    # The helper process itself cannot be replaced while this interpreter is
+    # serving requests. Cache only its first successful identity; foreign PIDs
+    # must always be probed afresh for PID-reuse fencing.
+    if pid == _SELF_PID and _SELF_START_IDENTITY is not None:
+        return _SELF_START_IDENTITY
     if sys.platform == "linux":
         try:
             with open("/proc/" + str(pid) + "/stat", "rb") as stream:
@@ -922,7 +941,10 @@ def process_start_identity(pid):
             # The suffix starts at field 3 (state); starttime is field 22.
             if len(fields) <= 19:
                 return None
-            return "linux:" + fields[19]
+            identity = "linux:" + fields[19]
+            if pid == _SELF_PID:
+                _SELF_START_IDENTITY = identity
+            return identity
         except (FileNotFoundError, PermissionError, OSError, UnicodeError):
             return None
     if sys.platform == "darwin":
@@ -941,7 +963,10 @@ def process_start_identity(pid):
             if fields[0].startswith("Z"):
                 return "darwin:zombie"
             identity = fields[1].strip() if len(fields) > 1 else ""
-            return "darwin:" + identity if identity else None
+            identity = "darwin:" + identity if identity else None
+            if pid == _SELF_PID and identity is not None:
+                _SELF_START_IDENTITY = identity
+            return identity
         except (OSError, subprocess.SubprocessError):
             return None
     return None
