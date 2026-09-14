@@ -7,11 +7,12 @@ import { test } from 'node:test';
 import { dispatcherLockPath, inboxDir, startDispatcher } from '../../fullstack/src/adapters/registry.js';
 import { fullstackOwnerForCwd } from '../../fullstack/src/index.js';
 import { writeFullstackActivationMarker } from '../../fullstack/src/activation-marker.js';
-import { openCtoRuntimeAccess } from '@andvl1/omp-workflows-core/cto-runtime';
-import { newCtoState, readCtoRunDeliveryIndexPage, readCtoState, setTeamStatus, writeCtoState } from '../../core/src/cto/state.js';
+import { readCtoRunDeliveryIndexPage, readCtoState, setTeamStatus, writeCtoState } from '../../core/src/cto/state.js';
 import { finishWave } from '../../core/src/cto/waves.js';
 import { beginRegistryRegistration, closeWorkflowActivation, commitRegistryRegistration, createRegistryRegistrationLiveGuard, openWorkflowActivation, rollbackRegistryRegistration } from '@andvl1/omp-workflows-core/registry';
 import { WsDriver, waitFor } from '../src/driver.js';
+import { openE2eCtoRuntime } from './fixtures/cto-runtime.js';
+import type { CtoRuntimeAccessFacade } from '@andvl1/omp-workflows-core/cto-runtime';
 import { startTestSession, type TestSession } from '../src/server.js';
 
 interface InboxTask {
@@ -169,19 +170,22 @@ done
   chmodSync(path, 0o755);
 }
 
-function writeActiveRun(root: string): void {
-  const runDir = join(root, '.work-state', 'cto', 'run-active');
-  mkdirSync(join(runDir, 'inbox'), { recursive: true });
+function writeActiveRunConfig(root: string): void {
   mkdirSync(join(root, '.omp'), { recursive: true });
   writeFileSync(join(root, '.omp', 'escalation.json'), JSON.stringify({ channels: [{ id: 'control', adapter: 'mock', direction: 'read-write', primary: true, mock: { persisted: true, dir: '.omp/fake-rw-control' } }] }));
-  const now = new Date().toISOString();
-  const state = newCtoState({
-    id: 'run-active',
-    task: 'finish the current product wave',
-    branch: 'main',
-    autonomous: true,
-    plan: {
-      id: 'run-active',
+}
+
+function seedActiveRun(runtimeAccess: CtoRuntimeAccessFacade, sessionId: string): string {
+  const runId = runtimeAccess.ensureStandbyRun();
+  runtimeAccess.withRunTransaction(runId, transaction => {
+    const now = new Date().toISOString();
+    const state = transaction.readState();
+    state.task = 'finish the current product wave';
+    state.branch = 'main';
+    state.owner_session = sessionId;
+    state.autonomous = true;
+    state.plan = {
+      id: runId,
       task: 'finish the current product wave',
       created_at: now,
       teams: ['team-a', 'team-b', 'team-c'].map(team => ({
@@ -192,34 +196,35 @@ function writeActiveRun(root: string): void {
         worktree: 'same_branch',
         depends_on: [],
       })),
-    },
-  });
-  for (const team of ['team-a', 'team-b', 'team-c']) setTeamStatus(state, team, 'in_progress');
-  state.active_wave_id = 'wave-1';
-  state.wave_history = [{
-    id: 'wave-1',
-    source: 'mock',
-    source_id: 'mock-wave-1',
-    task: 'finish the current product wave',
-    slice_ids: ['team-a', 'team-b', 'team-c'],
-    status: 'active',
-    started_at: now,
-  }];
-  // Seed the active run through the canonical writer so the delivery index and
-  // revision/CAS metadata are present before the resident dispatcher starts.
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+    };
+    delete state.standby;
+    state.teams = ['team-a', 'team-b', 'team-c'].map(team => ({ id: team, slice_id: 'slice-' + team, status: 'pending', escalations: {} }));
+    for (const team of ['team-a', 'team-b', 'team-c']) setTeamStatus(state, team, 'in_progress');
+    state.active_wave_id = 'wave-1';
+    state.wave_history = [{
+      id: 'wave-1',
+      source: 'mock',
+      source_id: 'mock-wave-1',
+      task: 'finish the current product wave',
+      slice_ids: ['team-a', 'team-b', 'team-c'],
+      status: 'active',
+      started_at: now,
+    }];
+    transaction.writeState(state);
+  });;
+  return runId;
 }
 
-function markCanonicalWaveDone(root: string): void {
-  const state = readCtoState('run-active', root);
+function markCanonicalWaveDone(root: string, runId: string): void {
+  const state = readCtoState(runId, root);
   assert.ok(state, 'active run state remains readable while completing wave 1');
   const wave = state.wave_history?.find(candidate => candidate.id === state.active_wave_id);
   assert.ok(wave, 'canonical active wave is present before completion');
   finishWave(state, { id: wave.id, status: 'done' }, root);
 }
 
-function durableInboxIds(root: string): string[] {
-  const state = readCtoState('run-active', root);
+function durableInboxIds(root: string, runId: string): string[] {
+  const state = readCtoState(runId, root);
   if (!state) return [];
   return Object.values(state.inbox_quarantine ?? {})
     .filter(record => record.status === 'admitted' && record.wake_status === 'delivered')
@@ -227,8 +232,8 @@ function durableInboxIds(root: string): string[] {
     .sort();
 }
 
-function durableWakeIds(root: string): string[] {
-  const wakeDir = join(root, '.work-state', 'cto', 'run-active', 'wake-effects');
+function durableWakeIds(root: string, runId: string): string[] {
+  const wakeDir = join(root, '.work-state', 'cto', runId, 'wake-effects');
   if (!existsSync(wakeDir)) return [];
   return readdirSync(wakeDir)
     .filter(name => name.endsWith('.json'))
@@ -243,7 +248,7 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
   // GIVEN: a real E2E PTY/WS session, an active CTO run with several teams,
   // and a deterministic Telegram-shaped inbound transport.
   const scratch = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-cto-inbox-'));
-  writeActiveRun(scratch);
+  writeActiveRunConfig(scratch);
   const mockOmp = join(scratch, 'mock-omp.sh');
   writeMockOmp(mockOmp);
 
@@ -271,13 +276,12 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
     }
     const sessionId = `cto-inbox-mock-${process.pid}`;
     const activationLiveGuard = activationSnapshotGuard;
-    const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId, main: true }, scratch);
-    if (!opened.ok) {
-      closeWorkflowActivation(activation);
-      throw new Error(`${opened.code}: ${opened.error}`);
-    }
+    const runtime = openE2eCtoRuntime(activation.registry_context, scratch, sessionId, activationSnapshotGuard);
+    const runId = seedActiveRun(runtime.access, runtime.sessionId);
+    assert.equal(runtime.access.findActiveRun()?.runId, runId, 'runtime authority sees the seeded active run');
+    assert.equal(runtime.access.hasValidStateProof(runId), true, 'runtime authority validates the seeded active run proof');
     closeRuntimeAccess = () => {
-      opened.access.close();
+      runtime.close();
       closeWorkflowActivation(activation);
     };
 
@@ -316,9 +320,11 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
         resident?.acceptInboxTask(task);
         adapter.acknowledge(task.id);
       },
-      runtimeAccess: opened.access,
+      pinnedRoot: runtime.pinnedRoot,
+      runtimeAccess: runtime.access,
       session_id: sessionId,
       liveGuard: activationLiveGuard,
+      proofAuthority: runtime.proofAuthority,
     });
     await waitFor(() => existsSync(dispatcherLockPath(scratch)), { label: 'resident dispatcher lease', timeoutMs: 3000 });
     const lease = JSON.parse(readFileSync(dispatcherLockPath(scratch), 'utf8')) as { pid?: number; token?: string; epoch?: number };
@@ -326,52 +332,52 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
     assert.equal(typeof lease.token, 'string');
     assert.equal(typeof lease.epoch, 'number');
     const indexed = readCtoRunDeliveryIndexPage(scratch);
-    assert.equal(indexed.active_run_id, 'run-active', 'active run is present in the canonical index');
-    assert.equal(indexed.entries.some(entry => entry.run_id === 'run-active'), false, 'idle active run has no pending delivery page');
+    assert.equal(indexed.active_run_id, runId, 'active run is present in the canonical index');
+    assert.equal(indexed.entries.some(entry => entry.run_id === runId), false, 'idle active run has no pending delivery page');
 
     // WHEN: two new tasks arrive while canonical wave 1 is active.
     adapter.push('tg:inbox-1', 'add the export endpoint');
     adapter.push('tg:inbox-2', 'update the mobile copy');
     await waitFor(() => {
-      const state = readCtoState('run-active', scratch);
+      const state = readCtoState(runId, scratch);
       return state?.active_wave_id === 'wave-1' && state.wave_history?.some(wave => wave.id === 'wave-1' && wave.status === 'active') === true;
     }, { label: 'canonical wave 1 active before inbox admission', timeoutMs: PTY_SETTLE_TIMEOUT_MS });
-    await waitFor(() => readdirSync(inboxDir('run-active', scratch)).filter(name => name.endsWith('.json')).length === 2, {
+    await waitFor(() => readdirSync(inboxDir(runId, scratch)).filter(name => name.endsWith('.json')).length === 2, {
       label: 'both inbox tasks durably queued for next waves', timeoutMs: PTY_SETTLE_TIMEOUT_MS,
     });
     assert.equal(resident.received.length, 0);
-    assert.deepEqual(durableWakeIds(scratch), []);
+    assert.deepEqual(durableWakeIds(scratch, runId), []);
 
     // Complete wave 1. Exactly one queued task starts wave 2; the second
     // remains durable until that active wave completes.
-    markCanonicalWaveDone(scratch);
+    markCanonicalWaveDone(scratch, runId);
     await resident.finishWaveAndStartNext();
     await resident.flush();
     await waitFor(() => resident.received.length === 1, { label: 'first deferred wake in wave 2', timeoutMs: PTY_SETTLE_TIMEOUT_MS });
-    await waitFor(() => durableWakeIds(scratch).join(',') === 'tg:inbox-1', { label: 'first wake delivered exactly once', timeoutMs: PTY_SETTLE_TIMEOUT_MS });
-    const wave2 = readCtoState('run-active', scratch);
+    await waitFor(() => durableWakeIds(scratch, runId).join(',') === 'tg:inbox-1', { label: 'first wake delivered exactly once', timeoutMs: PTY_SETTLE_TIMEOUT_MS });
+    const wave2 = readCtoState(runId, scratch);
     assert.ok(wave2?.active_wave_id, 'canonical wave 2 is active');
 
     // Complete wave 2. The remaining task starts wave 3 exactly once.
-    markCanonicalWaveDone(scratch);
+    markCanonicalWaveDone(scratch, runId);
     await resident.finishWaveAndStartNext();
     await resident.flush();
     await waitFor(() => resident.received.length === 2, { label: 'second deferred wake in wave 3', timeoutMs: PTY_SETTLE_TIMEOUT_MS });
-    await waitFor(() => durableWakeIds(scratch).join(',') === [...INBOX_IDS].sort().join(','), { label: 'both wakes delivered exactly once', timeoutMs: PTY_SETTLE_TIMEOUT_MS });
+    await waitFor(() => durableWakeIds(scratch, runId).join(',') === [...INBOX_IDS].sort().join(','), { label: 'both wakes delivered exactly once', timeoutMs: PTY_SETTLE_TIMEOUT_MS });
     await waitFor(async () => {
       const screen = await driver!.readScreen();
       return screen.includes('MOCK_INBOX_ACCEPTED:[CTO-INBOX] tg:inbox-1') && screen.includes('MOCK_INBOX_ACCEPTED:[CTO-INBOX] tg:inbox-2');
     }, { label: 'resident accepts both queued tasks', timeoutMs: PTY_SETTLE_TIMEOUT_MS });
-    const state = readCtoState('run-active', scratch);
+    const state = readCtoState(runId, scratch);
     assert.ok(state?.active_wave_id, 'canonical wave 3 is active');
     assert.deepEqual(resident.received.map(task => task.text), ['add the export endpoint', 'update the mobile copy']);
     assert.deepEqual(resident.events, ['wave-1-started', 'wave-1-finished', 'wave-2-started', 'inbox:tg:inbox-1', 'wave-2-finished', 'wave-3-started', 'inbox:tg:inbox-2']);
-    assert.deepEqual(durableInboxIds(scratch), [...INBOX_IDS].sort(), 'canonical state records both task IDs exactly once');
-    assert.deepEqual(durableWakeIds(scratch), [...INBOX_IDS].sort(), 'no pending wake effects remain');
-    const inboxFiles = readdirSync(inboxDir('run-active', scratch)).filter(name => name.endsWith('.json')).sort();
+    assert.deepEqual(durableInboxIds(scratch, runId), [...INBOX_IDS].sort(), 'canonical state records both task IDs exactly once');
+    assert.deepEqual(durableWakeIds(scratch, runId), [...INBOX_IDS].sort(), 'no pending wake effects remain');
+    const inboxFiles = readdirSync(inboxDir(runId, scratch)).filter(name => name.endsWith('.json')).sort();
     assert.equal(inboxFiles.length, 2, 'both durable inbox files remain exactly once');
     assert.deepEqual(
-      inboxFiles.map(name => JSON.parse(readFileSync(join(inboxDir('run-active', scratch), name), 'utf8')).id).sort(),
+      inboxFiles.map(name => JSON.parse(readFileSync(join(inboxDir(runId, scratch), name), 'utf8')).id).sort(),
       [...INBOX_IDS].sort(),
     );
   } finally {

@@ -46,8 +46,9 @@ import { fullstackOwnerForCwd } from '../../../fullstack/src/index.js';
 import { findActiveCtoRun } from '../../../core/src/commands/cto.js';
 import { readCtoState, writeCtoState } from '../../../core/src/cto/state.js';
 import { finishWave } from '../../../core/src/cto/waves.js';
+import { openE2eCtoRuntime } from './cto-runtime.js';
 import { resolveWorkflow } from '../../../core/src/engine/profile.js';
-import { openCtoRuntimeAccess, type CtoRuntimeAccessFacade } from '@andvl1/omp-workflows-core/cto-runtime';
+import type { CtoRuntimeAccessFacade } from '@andvl1/omp-workflows-core/cto-runtime';
 import {
   beginRegistryRegistration,
   closeWorkflowActivation,
@@ -128,20 +129,11 @@ try {
   throw error;
 }
 
-const openedRuntime = openCtoRuntimeAccess(
-  registrationActivation.registry_context,
-  { sessionId: `cto-process-dispatcher-${process.pid}`, main: true },
-  root,
-);
-if (!openedRuntime.ok) {
-  closeWorkflowActivation(registrationActivation);
-  throw new Error(`${openedRuntime.code}: ${openedRuntime.error}`);
-}
-const runtimeAccess: CtoRuntimeAccessFacade = openedRuntime.access;
 const sessionId = `cto-process-dispatcher-${process.pid}`;
+const runtime = openE2eCtoRuntime(registrationActivation.registry_context, root, sessionId, activationSnapshotGuard);
+const runtimeAccess: CtoRuntimeAccessFacade = runtime.access;
 const activationLiveGuard = activationSnapshotGuard;
-const channelSet = createChannelSet(root, undefined, undefined, runtimeAccess);
-
+const channelSet = createChannelSet(root, undefined, runtime.pinnedRoot, runtime.access, runtime.proofAuthority);
 // ── Wave executor (deterministic resident simulation, no LLM) ──────────────
 
 const SLICE_WORKER = fileURLToPath(new URL('./slice-worker.ts', import.meta.url));
@@ -328,7 +320,7 @@ if (channelSet.profile.direction === 'rw') {
   if (active) queueOnlineAck(active.runId);
 }
 
-const stop = startChannelDispatcher(root, channelSet, intervalMs, { onTask, onAnswer, runtimeAccess, session_id: sessionId, liveGuard: activationLiveGuard });
+const stop = startChannelDispatcher(root, channelSet, intervalMs, { pinnedRoot: runtime.pinnedRoot, onTask, onAnswer, runtimeAccess, session_id: sessionId, liveGuard: activationLiveGuard, proofAuthority: runtime.proofAuthority, activation: runtime.activationSnapshot });
 
 // Fail-closed lease verification: after start, the lock file must name OUR
 // pid. When a LIVE foreign lease exists the claim returns null and the loop
@@ -343,7 +335,7 @@ try {
 }
 if (!leaseHeld) {
   record({ t: 'lease-busy', at: new Date().toISOString() });
-  runtimeAccess.close();
+  runtime.close();
   closeWorkflowActivation(registrationActivation);
   process.exit(3);
 }
@@ -383,7 +375,7 @@ async function shutdown(): Promise<void> {
   } catch {
     // best-effort release; the heartbeat TTL handles crashed owners
   } finally {
-    runtimeAccess.close();
+    runtime.close();
     closeWorkflowActivation(registrationActivation);
   }
   process.exitCode = 0;

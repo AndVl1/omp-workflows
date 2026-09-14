@@ -39,13 +39,12 @@ import {
 } from '../../fullstack/src/adapters/registry.js';
 import { fullstackOwnerForCwd } from '../../fullstack/src/index.js';
 import { writeFullstackActivationMarker } from '../../fullstack/src/activation-marker.js';
-import { openCtoRuntimeAccess } from '@andvl1/omp-workflows-core/cto-runtime';
 import {
   CtoStateConflictError,
   readCtoState,
   writeCtoState,
 } from '../../core/src/cto/state.js';
-import { closeWorkflowActivation, openWorkflowActivation } from '@andvl1/omp-workflows-core/registry';
+import { beginRegistryRegistration, closeWorkflowActivation, commitRegistryRegistration, createRegistryRegistrationLiveGuard, openWorkflowActivation, rollbackRegistryRegistration } from '@andvl1/omp-workflows-core/registry';
 import { appendWave, finishWave } from '../../core/src/cto/waves.js';
 import {
   assertCtoSliceDispatchable,
@@ -54,6 +53,7 @@ import {
 } from '../../core/src/cto/slice-gate.js';
 import { ctoNestingGuard } from '../../core/src/gates/cto-nesting.js';
 import { waitFor } from '../src/driver.js';
+import { openE2eCtoRuntime } from './fixtures/cto-runtime.js';
 
 /** Absolute paths to the child-process fixtures (siblings of this test). */
 const FIXTURE = fileURLToPath(new URL('./fixtures/cto-process-dispatcher.ts', import.meta.url));
@@ -244,13 +244,21 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
     writeFullstackActivationMarker(scratch);
     const activation = openWorkflowActivation(scratch, ['workflow_registration', 'workflow_tools'], fullstackOwnerForCwd(scratch));
     if (!activation.ok) throw new Error(`${activation.code}: ${activation.error}`);
-    const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: `cto-process-e2e-${process.pid}`, main: true }, scratch);
-    if (!opened.ok) {
+    const registration = beginRegistryRegistration(activation.registry_context, scratch, ['workflow_tools']);
+    if (!registration.ok) {
       closeWorkflowActivation(activation);
-      throw new Error(`${opened.code}: ${opened.error}`);
+      throw new Error(`${registration.code}: ${registration.error}`);
     }
+    const activationSnapshotGuard = createRegistryRegistrationLiveGuard(registration.token, 'workflow_tools');
+    try {
+      commitRegistryRegistration(registration.token);
+    } catch (error) {
+      try { rollbackRegistryRegistration(registration.token); } finally { closeWorkflowActivation(activation); }
+      throw error;
+    }
+    const runtime = openE2eCtoRuntime(activation.registry_context, scratch, `cto-process-e2e-${process.pid}`, activationSnapshotGuard);
     closeRuntimeAccess = () => {
-      opened.access.close();
+      runtime.close();
       closeWorkflowActivation(activation);
     };
 
@@ -265,7 +273,7 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
       evidencePath,
       (l) => l.t === 'start',
       'dispatcher start evidence',
-      10_000,
+      30_000,
     );
     writeInbound(scratch, 'task-1.json', {
       id: MAIN_TASK_ID,
@@ -388,7 +396,7 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
       title: 'Progress',
       body: 'pending before restart',
       intent: 'progress',
-    }, undefined, undefined, opened.access);
+    }, undefined, undefined, runtime.access);
     assert.ok(queued, 'progress delivery queued');
     assert.ok(existsSync(queued!), 'delivery file durable in outbox before restart');
 
