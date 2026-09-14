@@ -982,7 +982,15 @@ test("adapters: no-lifecycle adapter send is bounded by the fixed operation time
       cancel: async () => undefined,
     } as unknown as EscalationAdapter;
     assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "timeout fixture has authenticated routing");
-    withIndexedRun(root, runId);
+    const state = newCtoState({
+      id: runId,
+      task: "adapter timeout",
+      branch: "main",
+      autonomous: true,
+      owner_session: runtime.sessionId,
+      plan: { id: runId, task: "adapter timeout", teams: [], created_at: new Date().toISOString() },
+    });
+    assert.ok(runtime.access.createRun(state, { source_id: "adapters:" + runId, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
     const published = queueCtoDeliveryRaw(root, runId, sampleEscalation({ id: runId + "/team-a/timeout/1" }), undefined, undefined, runtime.access);
     assert.ok(published, "canonical timeout delivery publication succeeds");
     const started = Date.now();
