@@ -1343,6 +1343,32 @@ test("adapters: drainOutbox quarantines unsafe explicit idempotency keys", async
   }
 });
 
+test("adapters: standalone poll closes its owned pin on activation failure", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-poll-owned-pin-activation-"));
+  const runtime = runtimeFor(root);
+  const originalClose = RuntimePinnedProjectRoot.prototype.close;
+  let closes = 0;
+  RuntimePinnedProjectRoot.prototype.close = function(this: RuntimePinnedProjectRoot): void {
+    closes += 1;
+    originalClose.call(this);
+  };
+  try {
+    const lifecycle = {
+      signal: new AbortController().signal,
+      deadline: Date.now() + 5_000,
+      assertLive: () => { throw Object.assign(new Error("activation revoked"), { code: "activation_revoked" }); },
+    };
+    await assert.rejects(
+      () => pollInboxRaw(root, null, undefined, undefined, { proofAuthority: runtime.proofAuthority, runtimeAccess: runtime.access, lifecycle } as PollOptions),
+      (error: unknown) => (error as { code?: unknown }).code === "activation_revoked",
+    );
+    assert.equal(closes, 1, "standalone poll closes its owned pinned root after activation failure");
+  } finally {
+    RuntimePinnedProjectRoot.prototype.close = originalClose;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("adapters: pollInbox skips malformed adapter answers and wakes a later valid multiline answer", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-poll-answer-validation-"));
   try {

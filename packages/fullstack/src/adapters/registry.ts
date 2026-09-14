@@ -6470,10 +6470,9 @@ export async function pollInbox(
   const suppliedPollPin = opts.pinnedRoot;
   const pollPin = suppliedPollPin ?? PinnedProjectRoot.open(root);
   const ownsPollPin = suppliedPollPin === undefined;
-  if (!pollPin || !pollPin.isStable()) {
-    if (ownsPollPin) pollPin?.close();
-    return;
-  }
+  if (!pollPin) return;
+  try {
+    if (!pollPin.isStable()) return;
   const assertPollLive = (): void => {
     try {
       opts.lifecycle?.assertLive?.();
@@ -6721,10 +6720,7 @@ export async function pollInbox(
     const adapterPin = pollPin;
     if (!adapterPin) return;
     try {
-      if (opts.isOwned && !opts.isOwned()) {
-        if (ownsPollPin) pollPin?.close();
-        return;
-      }
+      if (opts.isOwned && !opts.isOwned()) return;
       const polled = await boundedAdapterCall(
         () => {
           opts.lifecycle?.assertLive?.();
@@ -6763,7 +6759,9 @@ export async function pollInbox(
       // network hiccup / 409 with a bridge — next tick retries
     }
   }
-  if (ownsPollPin) pollPin?.close();
+  } finally {
+    if (ownsPollPin) pollPin.close();
+  }
 }
 
 /**
