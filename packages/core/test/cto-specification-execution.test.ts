@@ -1317,18 +1317,22 @@ test("mounted CTO checkpoint Ask records a trusted proof and returns an exact co
     assert.ok(selected);
     const registered: MountedCtoTool[] = [];
     const sessionStarts: Array<(event: unknown, ctx: unknown) => unknown> = [];
-    const sessionManager = { getSessionId: () => "cto-main-session", getCwd: () => root };
+    const sessionManager = TEST_SESSION_MANAGER;
+    TEST_SESSION_MANAGER.cwd = root;
     const pi = {
       zod: { z: zod },
+      setLabel: (_label: string) => undefined,
       on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
         if (event === "session_start") sessionStarts.push(handler);
       },
       registerTool: (tool: unknown) => registered.push(tool as MountedCtoTool),
     };
-    registerTestCtoTools(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd });
+    registerTestTeamWorkflow(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
+    registerTestCtoTools(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
     const tools = new Map(registered.map((tool) => [tool.name, tool]));
     let askInvoked = false;
-    sessionStarts[0]?.({}, {
+    for (const sessionStart of sessionStarts) sessionStart({}, {
+      cwd: root,
       mode: "tui",
       hasUI: true,
       sessionManager,
@@ -1545,18 +1549,22 @@ test("mounted CTO mapping Ask binds request_changes and approve_stop without con
       const frozen = mapping(await preflight(root, [selection(featureId, runKey)]));
       const registered: MountedCtoTool[] = [];
       const sessionStarts: Array<(event: unknown, ctx: unknown) => unknown> = [];
-      const sessionManager = { getSessionId: () => "cto-main-session", getCwd: () => root };
+      const sessionManager = TEST_SESSION_MANAGER;
+      TEST_SESSION_MANAGER.cwd = root;
       const pi = {
         zod: { z: zod },
+        setLabel: (_label: string) => undefined,
         on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
           if (event === "session_start") sessionStarts.push(handler);
         },
         registerTool: (tool: unknown) => registered.push(tool as MountedCtoTool),
       };
-      registerTestCtoTools(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd });
+      registerTestTeamWorkflow(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
+      registerTestCtoTools(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
       const tools = new Map(registered.map((tool) => [tool.name, tool]));
       let nextDecision = decision;
-      sessionStarts[0]?.({}, {
+      for (const sessionStart of sessionStarts) sessionStart({}, {
+        cwd: root,
         mode: "tui",
         hasUI: true,
         sessionManager,
