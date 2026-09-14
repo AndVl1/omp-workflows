@@ -52,6 +52,7 @@ import { appendWave, appendWaveUnderLock, finishWave } from "../src/cto/waves.js
 import { withCtoRunLock } from "../src/cto/transaction-lock.js";
 import type { CtoTerminalSummaryEnvelope } from "../src/cto/state.js";
 import type { CompletionEnvelope, WorkIdentity } from "../src/engine/types.js";
+import type { WaveRecord } from "../src/cto/types.js";
 import { PinnedProjectRoot, PinnedRootError, processStartIdentity } from "../src/specification/pinned-root.js";
 import { canonicalDurableIdFileName, legacyDurableIdFileName } from "../src/cto/durable-id.js";
 import { findActiveCtoRun } from "../src/commands/cto.js";
@@ -1921,6 +1922,17 @@ test("active-run index serializes concurrent run-lock writers and removes one fi
 
     const finished = readCtoState("index-run-a", root);
     assert.ok(finished);
+    const completedWave = {
+      id: "index-wave-a",
+      source: "test",
+      source_id: "index-source-a",
+      task: "index terminal summary",
+      slice_ids: [],
+      status: "done" as const,
+      started_at: "2026-01-01T00:00:00.000Z",
+      finished_at: "2026-01-01T00:00:01.000Z",
+    } satisfies WaveRecord;
+    finished!.wave_history = [completedWave];
     setCtoPause(finished!, "done", "finished");
     persistState(finished!, root);
     const afterFinish = JSON.parse(readFileSync(indexPath, "utf8")) as { entries: Array<{ run_id: string; status: string; pending_summary: boolean }> };
@@ -1928,7 +1940,31 @@ test("active-run index serializes concurrent run-lock writers and removes one fi
     assert.equal(afterFinish.entries.find((entry) => entry.run_id === "index-run-a")?.pending_summary, true);
     const pending = readCtoRunDeliveryIndexPage(root);
     assert.deepEqual(pending.entries.map((entry) => entry.run_id), ["index-run-a"], "page exposes only the pending terminal delivery");
-    assert.equal(acknowledgeCtoRunDelivery(root, "index-run-a", finished!.state_revision as number, { drained: true }), true);
+
+    const terminal = readCtoState("index-run-a", root);
+    assert.ok(terminal);
+    if (!terminal) throw new Error("terminal active-index state is missing");
+    const terminalWave = terminal.wave_history?.[0];
+    assert.ok(terminalWave);
+    if (!terminalWave) throw new Error("terminal active-index wave is missing");
+    const summary = buildCtoTerminalSummaryEnvelope(terminal, terminalWave);
+    const entryName = canonicalDurableIdFileName(summary.id);
+    const published = publishCtoOutboxDelivery(root, {
+      run_id: terminal.id,
+      state_revision: terminal.state_revision as number,
+      entry_name: entryName,
+      json: JSON.stringify(summary),
+    });
+    assert.ok(published, "terminal summary publication creates canonical delivery evidence");
+    if (!published) throw new Error("terminal active-index summary publication failed");
+    const sentPath = join(root, ".work-state", "cto", terminal.id, "outbox", "sent", entryName);
+    mkdirSync(dirname(sentPath), { recursive: true });
+    renameSync(published, sentPath);
+    assert.equal(removeCtoOutboxDeliveryObligation(root, terminal.id, entryName, summary.id), true, "transport success clears the state-owned obligation");
+    const drained = readCtoState(terminal.id, root);
+    assert.ok(drained);
+    if (!drained) throw new Error("drained active-index state is missing");
+    assert.equal(acknowledgeCtoRunDelivery(root, terminal.id, drained.state_revision as number, { drained: true }), true);
     const afterAck = JSON.parse(readFileSync(indexPath, "utf8")) as { entries: Array<{ run_id: string; status: string; pending_summary: boolean; pending_outbox: boolean }> };
     assert.deepEqual(afterAck.entries.map((entry) => entry.run_id), ["index-run-a", "index-run-b"], "acknowledgement retains the recent terminal run alongside the active run");
     assert.equal(afterAck.entries.find((entry) => entry.run_id === "index-run-a")?.pending_summary, false);
