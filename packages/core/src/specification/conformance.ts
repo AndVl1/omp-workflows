@@ -5168,6 +5168,10 @@ export function persistCtoSpecificationConformance(
     return result;
   }
   try {
+    const preflightState = readCtoStatePinned(authority.cto_run_id, pinnedRoot);
+    if (!preflightState || preflightState.id !== authority.cto_run_id || (preflightState.standby !== true && preflightState.owner_session !== options.sessionId)) {
+      return finish(blockedCtoConformanceResult(input, "CTO conformance runtime session does not own the canonical run."));
+    }
     return finish(options.runtimeAccess.withRunTransaction(
       authority.cto_run_id,
       (transaction) => {
@@ -5218,9 +5222,12 @@ export function persistCtoSpecificationConformance(
             findings: profileGateFindings.slice(0, 128),
           };
         }
+        const state = transaction.readState();
+        if (!state || state.id !== authority.cto_run_id || (state.standby !== true && state.owner_session !== options.sessionId)) {
+          return blockedCtoConformanceResult(input, "CTO conformance runtime session does not own the canonical run.");
+        }
         const replay = readTerminalCtoConformanceReplay(normalizedInput, authority, pinnedRoot, transaction);
         if (replay) return replay;
-        const state = readCtoStatePinned(authority.cto_run_id, pinnedRoot);
         const execution = isRecord(input.mapping) && isRecord(input.mapping.execution) ? input.mapping.execution : null;
         if (hasCompletedCtoWorkspacePostimages(normalizedInput, pinnedRoot, state)) {
           return blockedCtoConformanceResult(input, "terminal CTO conformance postimages no longer match the immutable producer binding.");

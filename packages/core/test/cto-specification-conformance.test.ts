@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
@@ -51,6 +51,20 @@ import { canonicalJson, digestOf, validateImplementationHandoff } from "../src/s
 import type { ExecutionClaim, ImplementationHandoff, QualityGateResult } from "../src/specification/types.js";
 import type { CtoState } from "../src/cto/types.js";
 import type { CompletionArtifactRef } from "../src/engine/types.js";
+
+function snapshotWorkStateBytes(root: string): Map<string, Buffer> {
+  const snapshot = new Map<string, Buffer>();
+  const visit = (relativePath: string): void => {
+    const absolutePath = join(root, relativePath);
+    for (const entry of readdirSync(absolutePath, { withFileTypes: true })) {
+      const child = join(relativePath, entry.name);
+      if (entry.isDirectory()) visit(child);
+      else if (entry.isFile()) snapshot.set(child, readFileSync(join(root, child)));
+    }
+  };
+  if (existsSync(join(root, ".work-state"))) visit(".work-state");
+  return snapshot;
+}
 
 function handoff(featureId: string): ImplementationHandoff {
   const value = structuredClone(validImplementationHandoff({ featureId })) as unknown as ImplementationHandoff;
@@ -963,15 +977,16 @@ test("direct CTO persistence gates pending, failed, wrong-run, and stale termina
         transaction.writeState(next);
       });
     };
-    const invoke = (binding = prepared.binding) => {
+    const invokeWith = (runtimeAccess: typeof runtime.access, sessionId: string, binding = prepared.binding) => {
       const { mappingRecordPath: _mappingRecordPath, ...input } = prepared;
       return persistCtoSpecificationConformance({
         ...input,
         project_root: root,
         binding,
-      } as never, { runtimeAccess: runtime.access, sessionId: "conformance-persist-session" });
+      } as never, { runtimeAccess, sessionId });
     };
-    return { feature, mapping, root, prepared, runtime, updateTeam, invoke };
+    const invoke = (binding = prepared.binding) => invokeWith(runtime.access, "conformance-persist-session", binding);
+    return { feature, mapping, root, prepared, runtime, updateTeam, invoke, invokeWith };
   };
 
   const pending = makeFixture();
@@ -1017,6 +1032,24 @@ test("direct CTO persistence gates pending, failed, wrong-run, and stale termina
   } finally {
     foreign.runtime.close();
     rmSync(foreign.root, { recursive: true, force: true });
+  }
+
+  const foreignSession = makeFixture();
+  try {
+    const foreignRuntime = openTestCtoRuntime(foreignSession.root, "conformance-foreign-session", "conformance-persist-terminal");
+    try {
+      const before = snapshotWorkStateBytes(foreignSession.root);
+      const result = foreignSession.invokeWith(foreignRuntime.access, "conformance-foreign-session");
+      assert.equal(result.status, "blocked");
+      assert.equal(result.persisted, false);
+      assert.match(result.findings.join("; "), /session does not own|owner session/i);
+      assert.deepEqual([...snapshotWorkStateBytes(foreignSession.root)], [...before], "foreign session rejection must leave all workspace, claim, conformance, and CTO state bytes unchanged");
+    } finally {
+      foreignRuntime.close();
+    }
+  } finally {
+    foreignSession.runtime.close();
+    rmSync(foreignSession.root, { recursive: true, force: true });
   }
 
   const forgedCallerClaim = makeFixture();
