@@ -36,6 +36,7 @@ import {
   type CtoCurrentOutboxDeliveryInput,
   type CtoCurrentOutboxDeliveryStatus,
   type CtoRunDeliveryCandidatesRead,
+  type CtoRunDeliveryIndexEntry,
   type CtoRunDeliveryIndexPage,
   writeCtoState,
   writeCtoStateLocked,
@@ -187,7 +188,14 @@ export interface CtoRuntimeBridgeRouteAccess {
   assertLive(): void;
   resolveTelegramRoute(): CtoRuntimeBridgeRouteCandidate | null;
   resolveTelegramChannelProfile(): Readonly<Record<string, unknown>> | null;
+  resolveEscalationChannelSnapshot(): Readonly<CtoRuntimeEscalationChannelSnapshot>;
   resolveCompletedStatus(): Readonly<{ runId: string; summary: Readonly<Record<string, unknown>> }> | null;
+  readActiveDeliveryCandidates(): Readonly<CtoRunDeliveryCandidatesRead>;
+  readCompletedDeliveryIndexPage(options?: { after_run_id?: string; limit?: number }): Readonly<CtoRunDeliveryIndexPage>;
+  hasValidStateProof(runId: string): boolean;
+  readState(runId: string): Readonly<Record<string, unknown>> | null;
+  readOutboxDeliveryObligations(runId?: string): readonly CtoOutboxDeliveryObligationRead[];
+  currentOutboxDeliveryStatus(input: CtoCurrentOutboxDeliveryInput): CtoCurrentOutboxDeliveryStatus;
   ensureStandbyRun(): string;
   readStatus(runId: string): Readonly<Record<string, unknown>> | null;
   close(): void;
@@ -1213,8 +1221,10 @@ function openBridgeRouteFromCell(
     const normalized = normalizeChannelConfigResult(loaded.config, {
       telegram: { canReceiveInbound: true, canSend: true, canSendWithIdempotency: true },
     });
-    if (normalized.status !== "valid" || normalized.profiles.length !== 1) return null;
-    const profile = normalized.profiles[0];
+    if (normalized.status !== "valid") return null;
+    const candidates = normalized.profiles.filter((candidate) => bridgeRouteProfileKey(candidate as unknown as Readonly<Record<string, unknown>>) !== null);
+    if (candidates.length !== 1) return null;
+    const profile = candidates[0];
     if (!profile || !bridgeRouteProfileKey(profile as unknown as Readonly<Record<string, unknown>>)) return null;
     return Object.freeze({ ...profile });
   };
@@ -1252,14 +1262,23 @@ function openBridgeRouteFromCell(
   };
   const bridgeDeliveryCapability = Object.freeze({});
   bridgeDeliveryCapabilities.add(bridgeDeliveryCapability);
+  const validStandbyEntry = (entry: CtoRunDeliveryIndexEntry, profile: Readonly<Record<string, unknown>>): boolean => {
+    if (entry.status !== "standby" || !Number.isSafeInteger(entry.state_revision) || entry.state_revision < 0 || typeof entry.updated_at !== "string") return false;
+    const state = readCtoStatePinned(entry.run_id, root) as (CtoState & { channel_profile?: unknown }) | null;
+    if (!state || state.id !== entry.run_id || state.standby !== true || state.state_revision !== entry.state_revision || state.updated_at !== entry.updated_at
+      || !hasValidCtoRuntimeStateProofPinned(root, state)) return false;
+    const stateProfile = state.channel_profile;
+    return !!stateProfile && typeof stateProfile === "object" && !Array.isArray(stateProfile)
+      && bridgeRouteProfileKey(stateProfile as unknown as Readonly<Record<string, unknown>>) === bridgeRouteProfileKey(profile);
+  };
   const ensureStandbyRun = (): string => {
     assertLive();
+    const profile = routeProfile();
+    if (!profile) throw runtimeError("runtime_access_invalid", "authenticated Telegram route is unavailable");
     const existing = readCtoRunDeliveryActiveCandidatesPinned(root);
     if (existing.ok) {
       for (const entry of existing.entries) {
-        if (entry.status !== "standby") continue;
-        const state = readCtoStatePinned(entry.run_id, root);
-        if (state && state.id === entry.run_id && state.standby === true && hasValidCtoRuntimeStateProofPinned(root, state)) return entry.run_id;
+        if (validStandbyEntry(entry, profile)) return entry.run_id;
       }
     }
     return withCtoRegistryLock(root.canonical_root, () => {
@@ -1267,9 +1286,7 @@ function openBridgeRouteFromCell(
       const rebound = readCtoRunDeliveryActiveCandidatesPinned(root);
       if (rebound.ok) {
         for (const entry of rebound.entries) {
-          if (entry.status !== "standby") continue;
-          const state = readCtoStatePinned(entry.run_id, root);
-          if (state && state.id === entry.run_id && state.standby === true && hasValidCtoRuntimeStateProofPinned(root, state)) return entry.run_id;
+          if (validStandbyEntry(entry, profile)) return entry.run_id;
         }
       }
       const runId = `standby-${Date.now()}-${randomUUID().slice(0, 8)}`;
@@ -1280,6 +1297,7 @@ function openBridgeRouteFromCell(
         const now = new Date().toISOString();
         const state = newCtoState({ id: runId, task: "standby — awaiting inbox tasks", branch: "", autonomous: true, plan: { id: runId, task: "standby — awaiting inbox tasks", teams: [], created_at: now }, standby: true });
         state.pause = { kind: "none", reason: "standby" };
+        state.channel_profile = profile as unknown as CtoState["channel_profile"];
         const sourceId = `standby:${runId}`;
         const initialDigest = ctoRuntimeRunInitialIdentityDigest(state);
         if (!mintCtoRuntimeRunOrigin(root, state, "cto-bridge", sourceId, initialDigest)) throw runtimeError("runtime_access_invalid", "standby run origin proof could not be committed");
@@ -1296,10 +1314,25 @@ function openBridgeRouteFromCell(
         }
         try { root.removeEntry(inboxDirectory); } catch { /* rollback is best-effort */ }
         try { root.removeEntry(runDirectory); } catch { /* rollback is best-effort */ }
-        try { if (root.isStable()) refreshCtoRunDeliveryIndexAuthorityPinned(root, bridgeDeliveryCapability, cto-bridge); } catch { /* index recovery remains fail-closed */ }
+        try { if (root.isStable()) refreshCtoRunDeliveryIndexAuthorityPinned(root, bridgeDeliveryCapability, "cto-bridge"); } catch { /* index recovery remains fail-closed */ }
         throw error;
       }
     }, { pinnedRoot: root });
+  };
+  const resolveEscalationChannelSnapshot = (): Readonly<CtoRuntimeEscalationChannelSnapshot> => {
+    assertLive();
+    const loaded = loadEscalationConfigRaw(root.canonical_root, { pinnedRoot: root });
+    if (loaded.status === "absent") return Object.freeze({ status: "absent" });
+    if (loaded.status === "invalid") return Object.freeze({ status: "invalid", code: loaded.code, reason: loaded.reason });
+    const profile = routeProfile();
+    if (!profile) return Object.freeze({ status: "invalid", code: "invalid_primary_direction", reason: "authenticated Telegram primary profile is unavailable" });
+    const configSha = typeof loaded.config_sha256 === "string" ? loaded.config_sha256 : createHash("sha256").update(JSON.stringify(loaded.config), "utf8").digest("hex");
+    return Object.freeze({
+      status: "valid",
+      config_sha256: configSha,
+      kinds: Object.freeze(["telegram"]),
+      projections: Object.freeze({ telegram: Object.freeze([profile]) }),
+    });
   };
   const resolveCompletedStatus = (): Readonly<{ runId: string; summary: Readonly<Record<string, unknown>> }> | null => {
     const profile = routeProfile();
@@ -1337,7 +1370,35 @@ function openBridgeRouteFromCell(
     assertLive,
     resolveTelegramRoute: route,
     resolveTelegramChannelProfile: routeProfile,
+    resolveEscalationChannelSnapshot,
     resolveCompletedStatus,
+    readActiveDeliveryCandidates: (): Readonly<CtoRunDeliveryCandidatesRead> => {
+      assertLive();
+      return readCtoRunDeliveryActiveCandidatesPinned(root);
+    },
+    readCompletedDeliveryIndexPage: (options: { after_run_id?: string; limit?: number } = {}): Readonly<CtoRunDeliveryIndexPage> => {
+      assertLive();
+      return readCtoRunDeliveryCompletedIndexPage(root.canonical_root, options, root);
+    },
+    hasValidStateProof: (runId: string): boolean => {
+      assertLive();
+      if (typeof runId !== "string") return false;
+      const state = readCtoStatePinned(runId, root);
+      return state !== null && hasValidCtoRuntimeStateProofPinned(root, state);
+    },
+    readState: (runId: string): Readonly<Record<string, unknown>> | null => {
+      assertLive();
+      if (typeof runId !== "string") return null;
+      return readCtoStatePinned(runId, root) as Readonly<Record<string, unknown>> | null;
+    },
+    readOutboxDeliveryObligations: (runId?: string): readonly CtoOutboxDeliveryObligationRead[] => {
+      assertLive();
+      return runId === undefined ? Object.freeze([]) : readCtoOutboxDeliveryObligationsPinned(root.canonical_root, runId, root);
+    },
+    currentOutboxDeliveryStatus: (input: CtoCurrentOutboxDeliveryInput): CtoCurrentOutboxDeliveryStatus => {
+      assertLive();
+      return currentOutboxDeliveryStatusPinned(input, root, bridgeDeliveryCapability);
+    },
     ensureStandbyRun,
     readStatus: (runId: string): Readonly<Record<string, unknown>> | null => {
       assertLive();

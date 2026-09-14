@@ -30,13 +30,19 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
 import { isSafeEscalationId, isSafeCtoRunId, isSafeCtoInboundText, PinnedProjectRoot } from "@andvl1/omp-workflows-core";
-import type { CtoRuntimeAccessFacade, CtoRuntimeProofAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
+import type { CtoRuntimeAccessFacade, CtoRuntimeBridgeRouteAccess, CtoRuntimeProofAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
 import { openBoundedQueue, type BoundedQueue } from "@andvl1/omp-workflows-core/queue";
 import { createAuthenticatedInboxEnvelope, ensureStandbyRun, inboxMessageFileName, isBridgeAlive, isBridgeAuthenticationLeaseCurrent, MAX_INBOX_TEXT_LENGTH, verifyAuthenticatedInboxEnvelope, writeBridgeLock } from "./adapters/registry.js";
 import { readBoundedResponseText } from "./lecture-acquisition/provider-errors.js";
 
 function decodeTelegramUtf8(bytes: Uint8Array): string {
   return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+export type BridgeRouteRuntime = Pick<CtoRuntimeBridgeRouteAccess, "assertLive" | "resolveTelegramRoute" | "resolveTelegramChannelProfile" | "resolveCompletedStatus" | "ensureStandbyRun" | "readStatus">;
+
+function isBridgeRouteRuntime(value: unknown): value is BridgeRouteRuntime {
+  return !!value && typeof value === "object" && typeof (value as { resolveTelegramRoute?: unknown }).resolveTelegramRoute === "function";
 }
 
 export interface BridgeIncoming {
@@ -80,11 +86,12 @@ function withBridgeRoot<T>(cwd: string, suppliedPin: PinnedProjectRoot | undefin
 }
 
 /** File an authenticated message in the local drop (wx-idempotent). */
-export function writeTaskDrop(cwd: string, msg: BridgeIncoming, runId: string | undefined, suppliedPin: PinnedProjectRoot | undefined, runtimeAccess: CtoRuntimeAccessFacade | undefined, proofAuthority: CtoRuntimeProofAuthority): string | null {
+export function writeTaskDrop(cwd: string, msg: BridgeIncoming, runId: string | undefined, suppliedPin: PinnedProjectRoot | undefined, runtimeAccess: CtoRuntimeAccessFacade | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: BridgeRouteRuntime): string | null {
   if (!isSafeCtoInboundText(msg.text, MAX_INBOX_TEXT_LENGTH) || (runId !== undefined && !isSafeCtoRunId(runId))) return null;
   return withBridgeRoot(cwd, suppliedPin, (pinnedRoot) => {
     ensureBridgeSession(cwd, pinnedRoot, proofAuthority)
-    const resolved = runId ?? runtimeAccess?.findActiveRun()?.runId ?? (runtimeAccess ? ensureStandbyRun(cwd, pinnedRoot, runtimeAccess) : null);
+    const resolved = runId ?? (bridgeRoute?.resolveTelegramRoute()?.runId) ?? runtimeAccess?.findActiveRun()?.runId
+      ?? (bridgeRoute ? bridgeRoute.ensureStandbyRun() : runtimeAccess ? ensureStandbyRun(cwd, pinnedRoot, runtimeAccess) : null);
     if (!resolved) return null;
     const envelope = createAuthenticatedInboxEnvelope(cwd, "task", { id: msg.id, text: msg.text, at: msg.at, by: msg.by ?? "telegram-bridge", run_id: resolved }, pinnedRoot, proofAuthority);
     if (!pinnedRoot.isStable()) throw new Error("telegram bridge project root changed before task drop");
@@ -171,8 +178,12 @@ function writeInboxTaskFile(queue: BoundedQueue, fileName: string, envelope: unk
  * read: it has no engine-owned byte commitment and therefore cannot influence
  * a Telegram reply.
  */
-export function findCompletedSummary(cwd: string, suppliedPin?: PinnedProjectRoot, runtimeAccess?: CtoRuntimeAccessFacade): { runId: string; summary: Record<string, unknown> } | null {
+export function findCompletedSummary(cwd: string, suppliedPin?: PinnedProjectRoot, runtimeAccess?: CtoRuntimeAccessFacade, bridgeRoute?: BridgeRouteRuntime): { runId: string; summary: Record<string, unknown> } | null {
   return withBridgeRoot(cwd, suppliedPin, (pinnedRoot) => {
+    if (bridgeRoute) {
+      const completed = bridgeRoute.resolveCompletedStatus();
+      return completed ? { runId: completed.runId, summary: { ...completed.summary } } : null;
+    }
     if (!runtimeAccess) return null;
     try {
       runtimeAccess.assertLive();
@@ -337,29 +348,29 @@ export function buildStatusReply(runId: string, summary: Record<string, unknown>
 }
 
 /** Classify an incoming plain message and file it; returns the reply (if any). */
-export function classifyIncoming(cwd: string, msg: BridgeIncoming, suppliedPin: PinnedProjectRoot | undefined, runtimeAccess: CtoRuntimeAccessFacade | undefined, proofAuthority: CtoRuntimeProofAuthority): BridgeResult {
+export function classifyIncoming(cwd: string, msg: BridgeIncoming, suppliedPin: PinnedProjectRoot | undefined, runtimeAccess: CtoRuntimeAccessFacade | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: CtoRuntimeBridgeRouteAccess): BridgeResult {
   return withBridgeRoot(cwd, suppliedPin, (pinnedRoot) => {
-    if (!runtimeAccess) throw new BridgeRetryableError("telegram bridge runtime access is unavailable");
-    const active = runtimeAccess.findActiveRun();
+    const active = bridgeRoute?.resolveTelegramRoute() ?? runtimeAccess?.findActiveRun() ?? null;
+    if (!active && !bridgeRoute && !runtimeAccess) throw new BridgeRetryableError("telegram bridge route runtime is unavailable");
     if (active) {
       return {
         action: "active-task",
-        filedPath: writeTaskDrop(cwd, msg, active.runId, pinnedRoot, runtimeAccess, proofAuthority),
+        filedPath: writeTaskDrop(cwd, msg, active.runId, pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute),
         runId: active.runId,
         chatId: msg.chatId,
       };
     }
-    const completed = findCompletedSummary(cwd, pinnedRoot, runtimeAccess);
+    const completed = bridgeRoute ? findCompletedSummary(cwd, pinnedRoot, runtimeAccess, bridgeRoute) : runtimeAccess ? findCompletedSummary(cwd, pinnedRoot, runtimeAccess) : null;
     if (completed) {
       return {
         action: "completed-status",
         reply: buildStatusReply(completed.runId, completed.summary),
-        filedPath: writeStandbyTask(cwd, msg, undefined, pinnedRoot, runtimeAccess, proofAuthority),
+        filedPath: writeStandbyTask(cwd, msg, bridgeRoute?.ensureStandbyRun(), pinnedRoot, runtimeAccess, proofAuthority),
         runId: completed.runId,
         chatId: msg.chatId,
       };
     }
-    const runId = ensureStandbyRun(cwd, pinnedRoot, runtimeAccess);
+    const runId = bridgeRoute?.ensureStandbyRun() ?? ensureStandbyRun(cwd, pinnedRoot, runtimeAccess);
     return {
       action: "standby-task",
       reply:
@@ -480,6 +491,7 @@ export function writeAnswerMarker(
   suppliedPin: PinnedProjectRoot | undefined,
   runtimeAccess: CtoRuntimeAccessFacade | undefined,
   proofAuthority: CtoRuntimeProofAuthority,
+  bridgeRoute?: BridgeRouteRuntime,
 ): string | null {
   const id = answer?.id;
   const runId = answer?.run_id;
@@ -491,9 +503,9 @@ export function writeAnswerMarker(
   if (!isSafeEscalationId(id) || !isSafeCtoRunId(runId) || !isSafeAnswerMarkerText(text) || !isSafeAnswerMarkerMetadata(by) || !isSafeBridgeTimestamp(at)) return null;
   return withBridgeRoot(cwd, suppliedPin, (pinnedRoot) => {
     if (!pinnedRoot.isStable()) throw new BridgeRetryableError("telegram bridge root changed before marker lookup");
-    const active = runtimeAccess?.findActiveRun();
+    const active = bridgeRoute?.resolveTelegramRoute() ?? runtimeAccess?.findActiveRun() ?? null;
     if (!pinnedRoot.isStable()) throw new BridgeRetryableError("telegram bridge root changed during marker authority lookup");
-    if (!runtimeAccess || !active || active.runId !== runId) return null;
+    if ((!runtimeAccess && !bridgeRoute) || !active || active.runId !== runId) return null;
     ensureBridgeSession(cwd, pinnedRoot, proofAuthority)
     if (!pinnedRoot.isStable()) throw new BridgeRetryableError("telegram bridge root changed before marker write");
     const envelope = createAuthenticatedInboxEnvelope(cwd, "answer", { id, text, at, by, run_id: runId }, pinnedRoot, proofAuthority);

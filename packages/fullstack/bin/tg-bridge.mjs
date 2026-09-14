@@ -22,10 +22,9 @@ import { TextDecoder } from "node:util";
 import { join } from "node:path";
 import { PinnedProjectRoot, normalizeChannelConfigResult } from "@andvl1/omp-workflows-core";
 import { openWorkflowActivation, closeWorkflowActivation } from "@andvl1/omp-workflows-core/registry";
-import { openCtoRuntimeAccess } from "@andvl1/omp-workflows-core/cto-runtime";
+import { openCtoRuntimeBridgeRouteAccess, openCtoRuntimeProofAuthority, revokeCtoRuntimeProofAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
 import { fullstackOwnerForCwd } from "../dist/index.js";
 import {
-  loadEscalationConfig,
   createEscalationAdapter,
   writeBridgeLock,
   isBridgeLeaseOwned,
@@ -65,18 +64,16 @@ if (!activation.ok) {
 }
 
 const sessionId = `tg-bridge:${process.pid}`;
-const runtimeResult = openCtoRuntimeAccess(
-  activation.registry_context,
-  { main: true, sessionId },
-  projectRoot,
-);
-if (!runtimeResult.ok) {
+const bridgeRoute = openCtoRuntimeBridgeRouteAccess(activation.registry_context, bridgePin);
+const proofAuthority = openCtoRuntimeProofAuthority(activation.registry_context, bridgePin);
+if (!bridgeRoute || !proofAuthority) {
+  bridgeRoute?.close();
+  revokeCtoRuntimeProofAuthority(proofAuthority);
   closeWorkflowActivation(activation);
   bridgePin.close();
-  console.error(`tg-bridge: CTO runtime activation unavailable (${runtimeResult.code})`);
+  console.error(`tg-bridge: CTO bridge route unavailable (${projectRoot})`);
   process.exit(1);
 }
-let runtimeAccess = runtimeResult.access;
 let bridgeLease;
 let bridgeHeartbeat;
 let stopped = false;
@@ -128,11 +125,51 @@ function readPinnedConfig() {
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     const parsed = JSON.parse(text);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("configuration document is not an object");
-    return { bytes, descriptor: configDescriptor(read) };
+    return { bytes, descriptor: configDescriptor(read), config: parsed };
   } catch (error) {
     if (error instanceof BridgeConfigRevokedError) throw error;
     throw new BridgeConfigRevokedError("escalation configuration is unavailable or malformed");
   }
+}
+
+function telegramProfileKey(profile) {
+  if (!profile || profile.adapter !== "telegram" || profile.transport !== "telegram" || profile.direction !== "rw" || profile.primary !== true) return null;
+  return JSON.stringify({
+    adapter: profile.adapter,
+    transport: profile.transport,
+    direction: profile.direction,
+    primary: true,
+    id: profile.id ?? null,
+    ackTarget: profile.ackTarget ?? null,
+    subscriptions: Array.isArray(profile.subscriptions) ? profile.subscriptions : null,
+  });
+}
+
+function selectTelegramAdapterConfig(raw, authenticatedProjection) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new BridgeConfigRevokedError("Telegram configuration is not an object");
+  const normalized = normalizeChannelConfigResult(raw, { telegram: { canReceiveInbound: true, canSend: true, canSendWithIdempotency: true } });
+  if (normalized.status !== "valid") throw new BridgeConfigRevokedError("Telegram channel configuration is invalid");
+  const matches = normalized.profiles.filter((profile) => telegramProfileKey(profile) !== null);
+  if (matches.length !== 1 || telegramProfileKey(matches[0]) !== telegramProfileKey(authenticatedProjection)) {
+    throw new BridgeConfigRevokedError("authenticated Telegram primary profile does not match pinned configuration");
+  }
+  const profile = matches[0];
+  const channels = Array.isArray(raw.channels) ? raw.channels : [];
+  const entry = channels.length > 0
+    ? channels.find((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate)
+      && candidate.adapter === "telegram"
+      && (typeof candidate.id === "string" ? candidate.id.trim() : "") === (profile.id ?? "")
+      && candidate.primary === true)
+    : undefined;
+  if (channels.length > 0 && !entry) throw new BridgeConfigRevokedError("authenticated Telegram channel entry is unavailable");
+  const fallback = raw.telegram && typeof raw.telegram === "object" && !Array.isArray(raw.telegram) ? raw.telegram : {};
+  const selected = entry && entry.telegram && typeof entry.telegram === "object" && !Array.isArray(entry.telegram) ? entry.telegram : (entry ?? {});
+  const telegram = { ...fallback, ...selected };
+  if (typeof telegram.token !== "string" || telegram.token.length === 0
+    || typeof telegram.chatId !== "string" || telegram.chatId.length === 0) {
+    throw new BridgeConfigRevokedError("authenticated Telegram token/chatId is unavailable");
+  }
+  return Object.freeze({ adapter: "telegram", bidirectional: true, telegram: Object.freeze(telegram) });
 }
 
 function projectionDigest(projection) {
@@ -148,19 +185,11 @@ function projectionDigest(projection) {
 
 function captureConfigSnapshot() {
   const first = readPinnedConfig();
-  let projections;
-  let config;
-  try {
-    projections = runtimeAccess.resolveEscalationChannelConfigs("telegram");
-    config = loadEscalationConfig(projectRoot, { kind: "telegram", pinnedRoot: bridgePin, runtimeAccess });
-  } catch (error) {
-    throw new BridgeConfigRevokedError("Telegram channel projection is unavailable");
-  }
-  if (!config || !Array.isArray(projections) || projections.length !== 1 || !projections[0]) return null;
-  const selectedProjectionDigest = projectionDigest(projections[0]);
-  if (projectionDigest(config) !== selectedProjectionDigest) {
-    throw new BridgeConfigRevokedError("Telegram channel projection changed during startup");
-  }
+  const config = first.config;
+  const projection = bridgeRoute.resolveTelegramChannelProfile();
+  if (!config || !projection) return null;
+  const adapterConfig = selectTelegramAdapterConfig(config, projection);
+  const selectedProjectionDigest = projectionDigest(projection);
   const second = readPinnedConfig();
   if (!sameConfigDescriptor(first.descriptor, second.descriptor) || !first.bytes.equals(second.bytes)) {
     throw new BridgeConfigRevokedError("escalation configuration changed during startup");
@@ -170,6 +199,7 @@ function captureConfigSnapshot() {
     descriptor: first.descriptor,
     projectionDigest: selectedProjectionDigest,
     config,
+    adapterConfig,
   });
 }
 
@@ -178,16 +208,11 @@ function assertPinnedConfig(snapshot) {
   if (!sameConfigDescriptor(snapshot.descriptor, current.descriptor) || !snapshot.bytes.equals(current.bytes)) {
     throw new BridgeConfigRevokedError();
   }
-  let projections;
-  try {
-    projections = runtimeAccess.resolveEscalationChannelConfigs("telegram");
-  } catch (error) {
-    throw new BridgeConfigRevokedError("Telegram channel projection is unavailable");
-  }
-  if (!Array.isArray(projections) || projections.length !== 1 || !projections[0]
-    || projectionDigest(projections[0]) !== snapshot.projectionDigest) {
+  const projection = bridgeRoute.resolveTelegramChannelProfile();
+  if (!projection || projectionDigest(projection) !== snapshot.projectionDigest) {
     throw new BridgeConfigRevokedError("Telegram channel projection changed after startup");
   }
+  selectTelegramAdapterConfig(current.config, projection);
 }
 
 class BridgeRouteUnavailableError extends Error {
@@ -216,9 +241,11 @@ function expectedTelegramRoute(config) {
   const normalized = normalizeChannelConfigResult(config, {
     telegram: { canReceiveInbound: true, canSend: true, canSendWithIdempotency: true },
   });
-  if (normalized.status !== "valid" || normalized.profiles.length !== 1) return null;
-  const profile = normalized.profiles[0];
-  if (profile.adapter !== "telegram" || profile.transport !== "telegram" || profile.direction !== "rw" || profile.primary !== true) return null;
+  if (normalized.status !== "valid") return null;
+  const matches = normalized.profiles.filter((profile) => profile.adapter === "telegram"
+    && profile.transport === "telegram" && profile.direction === "rw" && profile.primary === true);
+  if (matches.length !== 1) return null;
+  const profile = matches[0];
   const key = routeProfileKey(profile);
   return key ? { key, profile } : null;
 }
@@ -226,45 +253,21 @@ function expectedTelegramRoute(config) {
 function resolveRouteSession(config) {
   const expected = expectedTelegramRoute(config);
   if (!expected) throw new BridgeRouteUnavailableError("the pinned Telegram configuration has no unique read-write primary route");
-  let candidates;
-  try {
-    candidates = runtimeAccess.readActiveDeliveryCandidates();
-  } catch (error) {
-    throw new BridgeRouteUnavailableError("active run index is unavailable");
+  bridgeRoute.assertLive();
+  const selected = bridgeRoute.resolveTelegramRoute();
+  if (!selected) return { sessionId, runId: null, standby: true };
+  if (routeProfileKey(selected.channelProfile) !== expected.key) {
+    throw new BridgeRouteUnavailableError("authenticated Telegram route changed during selection");
   }
-  if (!candidates || candidates.ok !== true) {
-    if (candidates?.code === "missing") return { sessionId, runId: null, standby: true };
-    throw new BridgeRouteUnavailableError("active run index is unavailable or corrupt");
-  }
-  const activeEntries = candidates.entries.filter((entry) => entry && entry.status === "active");
-  if (activeEntries.length === 0) return { sessionId, runId: null, standby: true };
-  const matches = [];
-  for (const entry of activeEntries) {
-    if (typeof entry.run_id !== "string") continue;
-    let state;
-    try {
-      state = runtimeAccess.readState(entry.run_id);
-    } catch {
-      state = null;
-    }
-    if (!state || typeof state.owner_session !== "string" || state.owner_session.length === 0) continue;
-    if (routeProfileKey(state.channel_profile) === expected.key) {
-      matches.push({ runId: entry.run_id, ownerSession: state.owner_session });
-    }
-  }
-  if (matches.length !== 1) {
-    throw new BridgeRouteUnavailableError(matches.length === 0
-      ? "no active run is authenticated for the pinned Telegram route"
-      : "multiple active runs are authenticated for the pinned Telegram route");
-  }
-  return { sessionId: matches[0].ownerSession, runId: matches[0].runId, standby: false };
+  bridgeRoute.assertLive();
+  return { sessionId: selected.ownerSession, runId: selected.runId, standby: false };
 }
 
 function checkpointBinding(snapshot) {
   const expected = expectedTelegramRoute(snapshot.config);
   if (!expected) throw new BridgeConfigRevokedError("Telegram channel route is unavailable");
-  const token = snapshot.config.telegram.token;
-  const target = String(snapshot.config.telegram.chatId);
+  const token = snapshot.adapterConfig.telegram.token;
+  const target = String(snapshot.adapterConfig.telegram.chatId);
   const botDigest = createHash("sha256").update(token, "utf8").digest("hex");
   const profileDigest = createHash("sha256").update(expected.key, "utf8").digest("hex");
   return Object.freeze({
@@ -308,7 +311,7 @@ function readTelegramCheckpoint(snapshot) {
       || record.canonical_root !== projectRoot
       || record.projection_sha256 !== snapshot.projectionDigest
       || record.channel !== "telegram"
-      || record.target !== String(snapshot.config.telegram.chatId)
+      || record.target !== String(snapshot.adapterConfig.telegram.chatId)
       || !/^[0-9a-f]{64}$/u.test(record.bot_sha256)
       || !/^[0-9a-f]{64}$/u.test(record.route_profile_sha256)
       || !Number.isSafeInteger(record.high_water_update_id)
@@ -361,15 +364,17 @@ function revoke(reason, exitCode = 1) {
   try {
     // Cleanup may run after marker revocation; only remove a lock that is
     // still stable and authenticated as this exact process's lease.
-    if (bridgeLease?.owned && bridgePin.isStable() && isBridgeLeaseOwned(leaseRoot, bridgeLease, bridgePin)) {
-      clearBridgeLock(leaseRoot, bridgeLease, bridgePin);
+    if (bridgeLease?.owned && bridgePin.isStable() && isBridgeLeaseOwned(leaseRoot, bridgeLease, bridgePin, proofAuthority)) {
+      clearBridgeLock(leaseRoot, bridgeLease, bridgePin, proofAuthority);
     }
   } catch (error) {
     console.error("tg-bridge: lease cleanup failed", error instanceof Error ? error.message : error);
   }
   if (cleaned) return;
   cleaned = true;
-  try { runtimeAccess.close(); } catch { /* cleanup is idempotent */ }
+  try { bridgeRoute.close(); } catch { /* cleanup is idempotent */ }
+  try { revokeCtoRuntimeProofAuthority(proofAuthority); } catch { /* cleanup is idempotent */ }
+
   try { closeWorkflowActivation(activation); } catch { /* cleanup is idempotent */ }
   try { bridgePin.close(); } catch { /* cleanup is idempotent */ }
   process.exit(exitCode);
@@ -377,15 +382,15 @@ function revoke(reason, exitCode = 1) {
 
 function assertLive(candidatePin = bridgePin) {
   if (stopped || revoking) throw new Error("telegram bridge activation is revoked");
-  runtimeAccess.assertLive();
-  runtimeAccess.assertProjectRoot(projectRoot);
+  bridgeRoute.assertLive();
+  bridgeRoute.assertLive();
   if (candidatePin.canonical_root !== projectRoot || !candidatePin.isStable() || !bridgePin.isStable()) {
     throw new Error("telegram bridge project root changed");
   }
   // Re-check after the root and runtime assertions: marker/root replacement
   // between checks must fail before any side effect.
-  runtimeAccess.assertLive();
-  runtimeAccess.assertProjectRoot(projectRoot);
+  bridgeRoute.assertLive();
+  bridgeRoute.assertLive();
   if (!candidatePin.isStable() || !bridgePin.isStable()) throw new Error("telegram bridge project root changed");
 }
 
@@ -405,7 +410,8 @@ if (!configSnapshot) {
   revoke(`no telegram escalation config at ${join(projectRoot, ESCALATION_CONFIG_PATH)}`, 1);
 }
 const config = configSnapshot.config;
-if (config.status === "invalid" || config.adapter !== "telegram" || !config.telegram?.token || !config.telegram.chatId) {
+const adapterConfig = configSnapshot.adapterConfig;
+if (!adapterConfig) {
   revoke(`no telegram escalation config at ${join(projectRoot, ESCALATION_CONFIG_PATH)}`, 1);
 }
 
@@ -413,13 +419,13 @@ let telegramCheckpoint = readTelegramCheckpoint(configSnapshot);
 try {
   assertLive();
   assertPinnedConfig(configSnapshot);
-  bridgeLease = writeBridgeLock(leaseRoot, bridgePin);
+  bridgeLease = writeBridgeLock(leaseRoot, bridgePin, proofAuthority);
   assertLive();
   assertPinnedConfig(configSnapshot);
 } catch (error) {
   failClosed(error);
 }
-if (!bridgeLease?.owned || typeof bridgeLease.token !== "string" || !isBridgeLeaseOwned(leaseRoot, bridgeLease, bridgePin)) {
+if (!bridgeLease?.owned || typeof bridgeLease.token !== "string" || !isBridgeLeaseOwned(leaseRoot, bridgeLease, bridgePin, proofAuthority)) {
   revoke(`another bridge owns the Telegram consumer (${projectRoot})`, 1);
 }
 
@@ -427,7 +433,7 @@ let adapter;
 try {
   assertLive();
   assertPinnedConfig(configSnapshot);
-  adapter = createEscalationAdapter(config, projectRoot, bridgePin, runtimeAccess);
+  adapter = createEscalationAdapter(adapterConfig, projectRoot, bridgePin, undefined, proofAuthority, bridgeRoute);
   assertLive();
   assertPinnedConfig(configSnapshot);
   if (!adapter || typeof adapter.setUpdateCommitHook !== "function") throw new Error("telegram adapter does not support durable update commits");
@@ -446,7 +452,7 @@ try {
 }
 if (!adapter) revoke(`telegram adapter construction failed (${projectRoot})`, 1);
 
-const { chatId } = config.telegram;
+const { chatId } = adapterConfig.telegram;
 const pendingPlainAcks = [];
 
 function crashForTest(seam) {
@@ -466,21 +472,7 @@ function openInboundRuntimeAccess() {
   assertLive();
   assertPinnedConfig(configSnapshot);
   const route = resolveRouteSession(config);
-  if (route.standby) {
-    const standbyAccess = Object.create(runtimeAccess);
-    Object.defineProperty(standbyAccess, "findActiveRun", { value: () => null });
-    return { access: standbyAccess, owned: false, standby: true, runId: null };
-  }
-  const rebound = openCtoRuntimeAccess(activation.registry_context, { main: true, sessionId: route.sessionId }, projectRoot);
-  if (!rebound.ok) throw new BridgeRouteUnavailableError(`route owner runtime access unavailable (${rebound.code})`);
-  rebound.access.assertLive();
-  rebound.access.assertProjectRoot(projectRoot);
-  const active = rebound.access.findActiveRun();
-  if (!active || active.runId !== route.runId) {
-    rebound.access.close();
-    throw new BridgeRouteUnavailableError("selected owner run changed before inbound processing");
-  }
-  return { access: rebound.access, owned: true, standby: false, runId: route.runId };
+  return { access: undefined, routeAccess: bridgeRoute, owned: false, standby: route.standby, runId: route.runId };
 }
 
 function closeInboundRuntimeAccess(binding) {
@@ -494,7 +486,7 @@ adapter.setPlainMessageHandler(async (msg, suppliedPin) => {
   try {
     crashForTest("before-core");
     inboundRuntime = openInboundRuntimeAccess();
-    const result = classifyIncoming(leaseRoot, msg, callbackPin, inboundRuntime.access);
+    const result = classifyIncoming(leaseRoot, msg, callbackPin, inboundRuntime.access, proofAuthority, inboundRuntime.routeAccess);
     assertLive(callbackPin);
     assertPinnedConfig(configSnapshot);
     crashForTest("after-core");
@@ -527,7 +519,7 @@ if (typeof adapter.setAnswerHandler === "function") {
       inboundRuntime = openInboundRuntimeAccess();
       assertLive(callbackPin);
       assertPinnedConfig(configSnapshot);
-      const marker = writeAnswerMarker(leaseRoot, answer, callbackPin, inboundRuntime.access);
+      const marker = writeAnswerMarker(leaseRoot, answer, callbackPin, inboundRuntime.access, proofAuthority, inboundRuntime.routeAccess);
       assertLive(callbackPin);
       assertPinnedConfig(configSnapshot);
       console.log(`tg-bridge: answer ${answer.id} -> answers/ + marker ${marker ?? "(dup)"}`);
@@ -537,7 +529,7 @@ if (typeof adapter.setAnswerHandler === "function") {
   });
 }
 
-const intervalMs = config.telegram.pollIntervalMs ?? 5_000;
+const intervalMs = adapterConfig.telegram.pollIntervalMs ?? 5_000;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function flushPlainAcks() {
@@ -570,7 +562,7 @@ async function pollLoop() {
     try {
       assertLive();
       assertPinnedConfig(configSnapshot);
-      if (!isBridgeLeaseOwned(leaseRoot, bridgeLease, bridgePin) || !refreshBridgeLock(leaseRoot, bridgeLease, bridgePin)) {
+      if (!isBridgeLeaseOwned(leaseRoot, bridgeLease, bridgePin, proofAuthority) || !refreshBridgeLock(leaseRoot, bridgeLease, bridgePin, proofAuthority)) {
         throw new Error("telegram bridge lease lost before getUpdates");
       }
       assertLive();
@@ -609,7 +601,7 @@ bridgeHeartbeat = setInterval(() => {
   try {
     assertLive();
     assertPinnedConfig(configSnapshot);
-    if (!isBridgeLeaseOwned(leaseRoot, bridgeLease, bridgePin) || !refreshBridgeLock(leaseRoot, bridgeLease, bridgePin)) {
+    if (!isBridgeLeaseOwned(leaseRoot, bridgeLease, bridgePin, proofAuthority) || !refreshBridgeLock(leaseRoot, bridgeLease, bridgePin, proofAuthority)) {
       throw new Error("telegram bridge lease lost during heartbeat");
     }
     assertLive();

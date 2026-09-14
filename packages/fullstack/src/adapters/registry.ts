@@ -84,6 +84,7 @@ import {
   isCtoRuntimeProofAuthority,
   signCtoRuntimeProof,
   verifyCtoRuntimeProof,
+  type CtoRuntimeBridgeRouteAccess,
   type CtoRuntimeProofAuthority,
 } from "@andvl1/omp-workflows-core/cto-runtime";
 import type { CtoRunDeliveryIndexEntry, CtoRuntimeAccessFacade, CtoRuntimeOutboxDeliveryInput, CtoRunTransactionFacade } from "@andvl1/omp-workflows-core/cto-runtime";
@@ -97,7 +98,7 @@ import {
   type RegistryRegistrationToken,
 } from "@andvl1/omp-workflows-core/registry";
 import { HttpEscalationAdapter } from "./http.js";
-import { TelegramEscalationAdapter } from "./telegram.js";
+import { TelegramEscalationAdapter, type TelegramRuntimeAccess } from "./telegram.js";
 
 type RuntimeAccess = CtoRuntimeAccessFacade;
 
@@ -605,7 +606,7 @@ export function queueCtoDelivery(root: string, runId: string, delivery: CtoDeliv
 
 /** Adapter factory for a transport kind (built-in or consumer-registered). */
 export type EscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined) => EscalationAdapter | null;
-type BuiltinEscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority) => EscalationAdapter | null;
+type BuiltinEscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: CtoRuntimeBridgeRouteAccess) => EscalationAdapter | null;
 
 /**
  * Capabilities are registered alongside a consumer transport because channel
@@ -752,7 +753,7 @@ const builtinAdapterFactories = new Map<string, AdapterRegistration>([
     "telegram",
     {
       factory: () => null,
-      proofFactory: (config, cwd, _pinnedRoot, runtimeAccess, proofAuthority) =>
+      proofFactory: (config, cwd, _pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute) =>
         config.telegram?.token && config.telegram.chatId
           ? new TelegramEscalationAdapter({
               token: config.telegram.token,
@@ -763,7 +764,7 @@ const builtinAdapterFactories = new Map<string, AdapterRegistration>([
               allowedSenderIds: config.telegram.allowedSenderIds,
               legacyMappingMigration: config.telegram.legacyMappingMigration,
               proofAuthority,
-              runtimeAccess,
+              runtimeAccess: (bridgeRoute ?? runtimeAccess) as TelegramRuntimeAccess | undefined,
             })
           : null,
       capabilities: frozenCapabilities({ canReceiveInbound: true, canSend: true, canSendWithIdempotency: true }),
@@ -843,6 +844,7 @@ function invokeAdapterFactory(
   runtimeAccess: RuntimeAccess | undefined,
   scope: AdapterResolutionScope,
   proofAuthority: CtoRuntimeProofAuthority,
+  bridgeRoute?: CtoRuntimeBridgeRouteAccess,
 ): EscalationAdapter | null {
   if (!registration.builtin && !liveCustomRegistration(registration, scope.root)) return null;
   let adapter: EscalationAdapter | null;
@@ -850,7 +852,7 @@ function invokeAdapterFactory(
     if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
     if (!scope.pinnedRoot.isStable()) return null;
     adapter = registration.proofFactory
-      ? registration.proofFactory(config, cwd, scope.pinnedRoot, runtimeAccess, proofAuthority)
+      ? registration.proofFactory(config, cwd, scope.pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute)
       : registration.factory(config, cwd, scope.pinnedRoot, runtimeAccess);
     if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
   } catch (error) {
@@ -1025,16 +1027,20 @@ export function loadEscalationConfig(cwd: string, options: { pinnedRoot?: Pinned
 }
 
 /** Build the configured adapter; null when the config is unusable. */
-export function createEscalationAdapter(config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority): EscalationAdapter | null {
+export function createEscalationAdapter(config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: CtoRuntimeBridgeRouteAccess): EscalationAdapter | null {
   if (!config || typeof config.adapter !== "string") return null;
   const scope = openAdapterResolutionScope(cwd, pinnedRoot);
   if (!scope) return null;
   try {
+    if (bridgeRoute) {
+      bridgeRoute.assertLive();
+      if (!scope.pinnedRoot.isStable()) return null;
+    }
     const registration = registrationForKind(config.adapter, scope);
     const adapter = registration
-      ? invokeAdapterFactory(registration, config, scope.root.canonical_root, scope.pinnedRoot, runtimeAccess, scope, proofAuthority)
+      ? invokeAdapterFactory(registration, config, scope.root.canonical_root, scope.pinnedRoot, runtimeAccess, scope, proofAuthority, bridgeRoute)
       : null;
-    if (adapter && runtimeAccess && !bindEscalationAdapterRouting(adapter, runtimeAccess, scope.pinnedRoot)) return null;
+    if (adapter && runtimeAccess && !bridgeRoute && !bindEscalationAdapterRouting(adapter, runtimeAccess, scope.pinnedRoot)) return null;
     return adapter;
   } finally {
     closeAdapterResolutionScope(scope);
