@@ -76,6 +76,9 @@ const capabilities: EscalationAdapterCapabilities = {
   canSendWithIdempotency: true,
 };
 
+// Mirrors the core owner callback bound; kept private there by design.
+const MAX_REGISTRY_CALLBACKS = 256;
+
 function adapterFactory(kind: string, onCreate: () => void): EscalationAdapterFactory {
   return () => {
     onCreate();
@@ -212,10 +215,13 @@ test("registry: callback-cap rejection leaves no partially inserted custom adapt
     const runtime = runtimeFor(root);
     const registration = beginRegistryRegistration(runtime.activation.registry_context, root, ["escalation_adapters"]);
     if (!registration.ok) throw new Error(registration.code + ": " + registration.error);
-    for (let index = 0; index < 1_024; index += 1) recordRegistryUndo(registration.token, () => undefined);
+    // Fill 255 slots, then let the first registration consume the exact
+    // 256th slot. The next registration callback must fail at the bound.
+    for (let index = 0; index < MAX_REGISTRY_CALLBACKS - 1; index += 1) recordRegistryUndo(registration.token, () => undefined);
     const kind = "security-undo-cap";
+    registerEscalationAdapter(registration.token, kind, adapterFactory(kind, () => undefined), capabilities);
     assert.throws(
-      () => registerEscalationAdapter(registration.token, kind, adapterFactory(kind, () => undefined), capabilities),
+      () => registerEscalationAdapter(registration.token, `${kind}-overflow`, adapterFactory(`${kind}-overflow`, () => undefined), capabilities),
       /callbacks are bounded/i,
     );
     rollbackRegistryRegistration(registration.token);
