@@ -657,6 +657,13 @@ function completeCtoSpecificationExecutionForTest(root: string, input: Json): Re
     sessionId: DEFAULT_TEST_SESSION_ID,
   });
 }
+function cleanupMountedConformanceTest(root: string): void {
+  closeTestRuntime(root, DEFAULT_TEST_SESSION_ID);
+  executionContexts.delete(root);
+  projectFeatures.delete(root);
+  rmSync(root, { recursive: true, force: true });
+}
+
 function completeMountedCtoExecutionTeams(root: string, options: { concurrent?: boolean; featureIds?: readonly string[] } = {}): void {
   const state = readCtoState(RUN_ID, root);
   assert.ok(state, "completion fixture CTO state must be readable before host worker completion");
@@ -1683,6 +1690,8 @@ function mountedConformanceFixture(
   changedIntentFor: string | readonly string[] | null = null,
   noEvidenceFor: string | null = null,
 ): Json {
+  // Conformance evidence is meaningful only after every mapped CTO team has a terminal runtime postimage.
+  completeMountedCtoExecutionTeams(root);
   const handoffs: Json[] = [];
   const claims: Json[] = [];
   const evidence: Json[] = [];
@@ -2538,9 +2547,7 @@ test("mounted CTO conformance producer persists a multi-feature matrix and repla
     assert.equal(forgedCompletion.status, "blocked");
     assert.equal(forgedCompletion.closed, false);
   } finally {
-    executionContexts.delete(root);
-    projectFeatures.delete(root);
-    rmSync(root, { recursive: true, force: true });
+    cleanupMountedConformanceTest(root);
   }
 });
 
@@ -2585,9 +2592,7 @@ test("mounted CTO conformance blocks an extra runtime row before matrix persiste
     assert.equal(readFileSync(statePath, "utf8"), stateBefore, "invalid runtime multiset must not mutate feature state");
     assert.equal(resolveState(root, undefined, { feature_id: featureId, run_key: `run-${featureId}-1` }).state?.specification?.implementation_conformance_ref, null);
   } finally {
-    executionContexts.delete(root);
-    projectFeatures.delete(root);
-    rmSync(root, { recursive: true, force: true });
+    cleanupMountedConformanceTest(root);
   }
 });
 
@@ -2618,9 +2623,7 @@ test("mounted CTO conformance rejects an unused runtime artifact for intent-conf
     assert.equal(readFileSync(statePath, "utf8"), stateBefore, "unused runtime artifact must not mutate feature state");
     assert.equal(existsSync(join(artifactsDir, "implementation_conformance")), false);
   } finally {
-    executionContexts.delete(root);
-    projectFeatures.delete(root);
-    rmSync(root, { recursive: true, force: true });
+    cleanupMountedConformanceTest(root);
   }
 });
 
@@ -2661,9 +2664,7 @@ test("mounted CTO conformance rejects nonempty persisted quality references befo
     assert.equal(readFileSync(statePath, "utf8"), stateBefore, "invalid quality envelope must not mutate feature state");
     assert.equal(existsSync(join(root, ".work-state", "features", featureId, "artifacts", "implementation_conformance")), false);
   } finally {
-    executionContexts.delete(root);
-    projectFeatures.delete(root);
-    rmSync(root, { recursive: true, force: true });
+    cleanupMountedConformanceTest(root);
   }
 });
 
@@ -2699,9 +2700,7 @@ test("mounted CTO conformance rejects prose review verdicts before matrix persis
     assert.equal(readFileSync(statePath, "utf8"), stateBefore, "invalid review verdict must not mutate feature state");
     assert.equal(existsSync(join(artifactsDir, "implementation_conformance")), false);
   } finally {
-    executionContexts.delete(root);
-    projectFeatures.delete(root);
-    rmSync(root, { recursive: true, force: true });
+    cleanupMountedConformanceTest(root);
   }
 });
 
@@ -2737,9 +2736,7 @@ test("mounted CTO conformance rejects raw evidence identifiers before matrix per
     assert.equal(readFileSync(statePath, "utf8"), stateBefore, "raw evidence identifier must not mutate feature state");
     assert.equal(existsSync(join(artifactsDir, "implementation_conformance")), false);
   } finally {
-    executionContexts.delete(root);
-    projectFeatures.delete(root);
-    rmSync(root, { recursive: true, force: true });
+    cleanupMountedConformanceTest(root);
   }
 });
 
@@ -2750,12 +2747,20 @@ test("mounted CTO finalizer admits a quality-to-runtime-to-conformance evidence 
     writeParallelFeatures(root, [featureId]);
     const frozen = mapping(await preflight(root, [selection(featureId)]));
     assert.equal((await confirmTrusted(root, frozen)).status, "confirmed");
-    const dispatched = await dispatchCtoSpecificationMapping(root, {
+    let dispatched = await dispatchCtoSpecificationMapping(root, {
       cto_run_id: RUN_ID,
       mapping_id: String(frozen.mapping_id),
       expected_mapping_hash: String(frozen.mapping_hash),
     }, preparationRuntimeOptions(root)) as unknown as Result;
     assert.equal(dispatched.status, "dispatched", detail(dispatched));
+    if (!dispatched.conformance_binding) {
+      completeMountedCtoExecutionTeams(root);
+      dispatched = await dispatchCtoSpecificationMapping(root, {
+        cto_run_id: RUN_ID,
+        mapping_id: String(frozen.mapping_id),
+        expected_mapping_hash: String(frozen.mapping_hash),
+      }, preparationRuntimeOptions(root)) as unknown as Result;
+    }
     assert.ok(dispatched.mapping && dispatched.conformance_binding, detail(dispatched));
     mountedConformanceFixture(root, dispatched.mapping!, dispatched.conformance_binding!, [featureId]);
     rewriteMountedConformanceThreeLevel(root, featureId);
@@ -2769,9 +2774,7 @@ test("mounted CTO finalizer admits a quality-to-runtime-to-conformance evidence 
     assert.equal(completed.ok, true, detail(completed));
     assert.equal((completed.workspace as Json).status, "completed");
   } finally {
-    executionContexts.delete(root);
-    projectFeatures.delete(root);
-    rmSync(root, { recursive: true, force: true });
+    cleanupMountedConformanceTest(root);
   }
 });
 test("mounted CTO conformance rejects an invalid evidence envelope before any matrix or state mutation", async () => {
@@ -2818,9 +2821,7 @@ test("mounted CTO conformance rejects an invalid evidence envelope before any ma
       assert.equal(existsSync(join(root, ".work-state", "features", featureId, "artifacts", "implementation_conformance")), false);
     }
   } finally {
-    executionContexts.delete(root);
-    projectFeatures.delete(root);
-    rmSync(root, { recursive: true, force: true });
+    cleanupMountedConformanceTest(root);
   }
 });
 test("CTO conformance retries valid-schema wrong-binding evidence without replaying a blocked matrix", async () => {
@@ -2871,9 +2872,7 @@ test("CTO conformance retries valid-schema wrong-binding evidence without replay
     assert.equal(closed.status, "closed", detail(closed));
     assert.equal(closed.outcome, "pass", detail(closed));
   } finally {
-    executionContexts.delete(root);
-    projectFeatures.delete(root);
-    rmSync(root, { recursive: true, force: true });
+    cleanupMountedConformanceTest(root);
   }
 });
 test("mounted CTO conformance producer reports per-feature failure without fabricating a passing matrix", async () => {
@@ -2909,9 +2908,7 @@ test("mounted CTO conformance producer reports per-feature failure without fabri
       assert.equal(existsSync(join(root, ".work-state", "features", featureId, "artifacts", "implementation_conformance")), false);
     }
   } finally {
-    executionContexts.delete(root);
-    projectFeatures.delete(root);
-    rmSync(root, { recursive: true, force: true });
+    cleanupMountedConformanceTest(root);
   }
 });
 test("mounted CTO mixed pass and blocked matrices close with an explicit blocked aggregate and replay idempotently", async () => {
