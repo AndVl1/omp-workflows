@@ -4380,6 +4380,15 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
       }
       if (stopped || !isOwned()) return;
       assertDispatcherActivationLive(opts.runtimeAccess, tickPin, opts.liveGuard, lease.activation);
+      // Filesystem-backed delivery may consume the original tick budget before
+      // the inbound adapter is reached. Keep the same cancellation/liveness
+      // fence, but give polling its own bounded operation window.
+      const pollLifecycle: AdapterOperationContext = {
+        signal: lifecycle.signal,
+        deadline: Date.now() + DISPATCHER_TICK_DEADLINE_MS,
+        trackUnderlyingCallback: lifecycle.trackUnderlyingCallback,
+        assertLive: lifecycle.assertLive,
+      };
       await pollInbox(context.root, primary, (task) => wakeTask(task, context.pinnedRoot), (answer) => wakeAnswer(answer, context.pinnedRoot), {
         isOwned,
         idempotentWake: true,
@@ -4387,7 +4396,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
         pinnedRoot: context.pinnedRoot,
         runtimeAccess: opts.runtimeAccess,
         proofAuthority: opts.proofAuthority,
-        lifecycle,
+        lifecycle: pollLifecycle,
         retryCursorStore,
       });
     } finally {

@@ -942,7 +942,7 @@ test("dispatcher lifecycle: stop aborts a never-resolving custom poll and fences
     },
   };
   try {
-    const stop = startDispatcher(root, adapter, 10_000, { runtimeAccess: runtime.access, session_id: runtime.sessionId, liveGuard: runtime.liveGuard, onTask: () => { callbacks += 1; } });
+    const stop = startDispatcher(root, adapter, 10_000, { runtimeAccess: runtime.access, session_id: runtime.sessionId, liveGuard: runtime.liveGuard, proofAuthority: runtime.proofAuthority, onTask: () => { callbacks += 1; } });
     await Promise.race([
       pollReady,
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("custom poll did not start")), 5_000)),
@@ -989,6 +989,7 @@ test("dispatcher lifecycle: timed-out answer callback retains lease until settle
   try {
     stop = startDispatcher(root, adapter, 10_000, {
       runtimeAccess: runtime.access,
+      proofAuthority: runtime.proofAuthority,
       session_id: runtime.sessionId,
       liveGuard: runtime.liveGuard,
       onAnswer: async () => {
@@ -1010,7 +1011,7 @@ test("dispatcher lifecycle: timed-out answer callback retains lease until settle
     assert.equal(stopped, false, "stop waits for the timed-out callback");
     assert.equal(existsSync(dispatcherLockPath(root)), true, "the lease remains held during callback teardown");
 
-    const contender = startDispatcher(root, adapter, 10_000, { runtimeAccess: runtime.access, session_id: runtime.sessionId, liveGuard: runtime.liveGuard });
+    const contender = startDispatcher(root, adapter, 10_000, { runtimeAccess: runtime.access, session_id: runtime.sessionId, liveGuard: runtime.liveGuard, proofAuthority: runtime.proofAuthority });
     assert.equal(contender.claimed, false, "a second dispatcher cannot reacquire during teardown");
     await contender();
 
@@ -1019,7 +1020,7 @@ test("dispatcher lifecycle: timed-out answer callback retains lease until settle
     assert.equal(callbackStarts, 1, "the callback is not started again after stop begins");
     assert.equal(existsSync(dispatcherLockPath(root)), false, "stop releases the lease after callback settlement");
 
-    const reacquired = startDispatcher(root, adapter, 10_000, { runtimeAccess: runtime.access, session_id: runtime.sessionId, liveGuard: runtime.liveGuard });
+    const reacquired = startDispatcher(root, adapter, 10_000, { runtimeAccess: runtime.access, session_id: runtime.sessionId, liveGuard: runtime.liveGuard, proofAuthority: runtime.proofAuthority });
     assert.equal(reacquired.claimed, true, "the lease is available after teardown completes");
     await reacquired();
   } finally {
@@ -1043,18 +1044,19 @@ test("dispatcher lifecycle: mandatory session and activation identity reject for
   };
   const start = (options: Parameters<typeof startDispatcher>[3]) => startDispatcher(root, adapter, 10_000, options);
   try {
-    const missing = start({ runtimeAccess: runtime.access });
+    const missing = start({ runtimeAccess: runtime.access, proofAuthority: runtime.proofAuthority });
     assert.equal(missing.claimed, false, "missing session/activation identity cannot claim");
     await missing();
     assert.equal(polls, 0, "missing identity never polls");
 
-    const forgedSession = start({ runtimeAccess: runtime.access, session_id: "forged-dispatcher-session", liveGuard: runtime.liveGuard });
+    const forgedSession = start({ runtimeAccess: runtime.access, proofAuthority: runtime.proofAuthority, session_id: "forged-dispatcher-session", liveGuard: runtime.liveGuard });
     assert.equal(forgedSession.claimed, false, "forged session identity cannot claim");
     await forgedSession();
     assert.equal(polls, 0, "forged session never polls");
 
     const staleGeneration = start({
       runtimeAccess: runtime.access,
+      proofAuthority: runtime.proofAuthority,
       session_id: runtime.sessionId,
       liveGuard: runtime.liveGuard,
       activation: { ...runtime.activationSnapshot, claim_generation: runtime.activationSnapshot.claim_generation + 1 },
@@ -1065,6 +1067,7 @@ test("dispatcher lifecycle: mandatory session and activation identity reject for
 
     const staleDigest = start({
       runtimeAccess: runtime.access,
+      proofAuthority: runtime.proofAuthority,
       session_id: runtime.sessionId,
       liveGuard: runtime.liveGuard,
       activation: { ...runtime.activationSnapshot, marker_digest: "0".repeat(64) },
@@ -1114,6 +1117,7 @@ test("dispatcher lifecycle: stale claim cleanup cannot remove a replacement leas
     const contender = startDispatcher(root, adapter, 10_000, {
       pinnedRoot: pin,
       runtimeAccess: runtime.access,
+      proofAuthority: runtime.proofAuthority,
       session_id: runtime.sessionId,
       liveGuard: runtime.liveGuard,
     });
@@ -1154,6 +1158,7 @@ test("dispatcher lifecycle: post-claim liveness failure preserves supplied pin",
   const options = {
     pinnedRoot: pin,
     runtimeAccess: runtime.access,
+    proofAuthority: runtime.proofAuthority,
     session_id: runtime.sessionId,
     liveGuard,
   };
@@ -1186,12 +1191,12 @@ test("dispatcher lifecycle: failed claim is explicit and preserves caller-owned 
   let owner: ReturnType<typeof startDispatcher> | undefined;
   let callerPin: PinnedProjectRoot | null = null;
   try {
-    owner = startDispatcher(root, adapter, 10_000, { runtimeAccess: runtime.access, session_id: runtime.sessionId, liveGuard: runtime.liveGuard });
+    owner = startDispatcher(root, adapter, 10_000, { runtimeAccess: runtime.access, session_id: runtime.sessionId, liveGuard: runtime.liveGuard, proofAuthority: runtime.proofAuthority });
     assert.equal(owner.claimed, true);
     callerPin = PinnedProjectRoot.open(root);
     assert.ok(callerPin);
 
-    const contender = startDispatcher(root, adapter, 10_000, { pinnedRoot: callerPin, runtimeAccess: runtime.access, session_id: runtime.sessionId, liveGuard: runtime.liveGuard });
+    const contender = startDispatcher(root, adapter, 10_000, { pinnedRoot: callerPin, runtimeAccess: runtime.access, session_id: runtime.sessionId, liveGuard: runtime.liveGuard, proofAuthority: runtime.proofAuthority });
     assert.equal(contender.claimed, false, "claim failure is visible to the caller");
     assert.equal(callerPin.isStable(), true, "failed claim does not close the caller-owned pin");
     await contender();
