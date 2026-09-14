@@ -48,7 +48,7 @@ export type {
 } from "./state.js";
 import { appendWave } from "./waves.js";
 import { withCtoRegistryLock, withCtoRunLock, type CtoRunLockHandle } from "./transaction-lock.js";
-import { loadEscalationConfigRaw, type EscalationConfigInvalidCode, type EscalationConfigLoadResult, type NormalizedEscalationConfig } from "./channels.js";
+import { loadEscalationConfigRaw, normalizeChannelConfigResult, type EscalationConfigInvalidCode, type EscalationConfigLoadResult, type NormalizedEscalationConfig } from "./channels.js";
 import { assessRunHealth } from "./health.js";
 import { checkBudget } from "./budget.js";
 import { recallDecisions } from "./decisions.js";
@@ -61,7 +61,6 @@ import {
   isCtoRuntimeSessionAuthority,
   ctoRuntimeSessionAuthorityForContext,
   detachCtoRuntimeSessionAuthority,
-  revokeCtoRuntimeSessionAuthority,
   type CtoRuntimeSessionAuthority,
 } from "./session-authority.js";
 export { ctoRuntimeSessionAuthorityForContext };
@@ -173,6 +172,26 @@ export interface CtoRuntimeAccessFacade {
   assertLive(): void;
 }
 
+export type CtoRuntimeBridgeRouteCandidate = Readonly<{
+  runId: string;
+  ownerSession: string;
+  stateRevision: number;
+  updatedAt: string;
+  status: "active";
+  channelProfile: Readonly<Record<string, unknown>>;
+}>;
+
+/** Narrow bridge capability: route selection/status only, never generic state mutation. */
+export interface CtoRuntimeBridgeRouteAccess {
+  assertLive(): void;
+  resolveTelegramRoute(): CtoRuntimeBridgeRouteCandidate | null;
+  resolveTelegramChannelProfile(): Readonly<Record<string, unknown>> | null;
+  resolveCompletedStatus(): Readonly<{ runId: string; summary: Readonly<Record<string, unknown>> }> | null;
+  ensureStandbyRun(): string;
+  readStatus(runId: string): Readonly<Record<string, unknown>> | null;
+  close(): void;
+}
+
 export type CtoRuntimeAccessProvider = (canonicalRoot: string, sessionId: string) => CtoRuntimeAccessFacade | null;
 
 export type CtoRuntimeAccessOpenResult =
@@ -199,6 +218,7 @@ type RuntimeCell = {
 const runtimeCells = new WeakMap<object, RuntimeCell>();
 const guardedRuntimeCells = new WeakMap<object, RuntimeCell>();
 const deliveryCapabilities = new WeakMap<object, RuntimeCell>();
+const bridgeDeliveryCapabilities = new WeakSet<object>();
 export const MAX_RUNTIME_ACCESS_SCHEDULERS = 8;
 export const MIN_RUNTIME_ACCESS_INTERVAL_MS = 10;
 export const MAX_RUNTIME_ACCESS_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -214,7 +234,7 @@ export function isSafeCtoRuntimeSessionId(value: unknown): value is string {
 
 /** Internal verifier used by state.ts; delivery capability is never public. */
 export function isCtoRuntimeDeliveryCapability(value: unknown): boolean {
-  return typeof value === "object" && value !== null && deliveryCapabilities.has(value);
+  return typeof value === "object" && value !== null && (deliveryCapabilities.has(value) || bridgeDeliveryCapabilities.has(value));
 }
 
 function runtimeCellForFacade(value: unknown): RuntimeCell | null {
@@ -363,6 +383,17 @@ function cloneValue(value: unknown, redact: boolean, seen = new WeakMap<object, 
   const object = value as object;
   const prior = seen.get(object);
   if (prior !== undefined) return prior;
+  if (ArrayBuffer.isView(value)) {
+    const result = new Uint8Array(value.byteLength);
+    result.set(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+    seen.set(object, result);
+    return result;
+  }
+  if (value instanceof ArrayBuffer) {
+    const result = value.slice(0);
+    seen.set(object, result);
+    return result;
+  }
   if (Array.isArray(value)) {
     const result: unknown[] = [];
     seen.set(object, result);
@@ -695,7 +726,8 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
         requireLive(cell);
         let active: ReturnType<typeof findActiveCtoRun>;
         try {
-          active = findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root });
+          const indexPath = join(".work-state", "cto", "active-run-index.json");
+          active = cell.root.pathEntryInfo(indexPath) ? findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root }) : null;
         } catch (error) {
           if (error instanceof CtoAuthorityUnavailableError || (error instanceof Error && /delivery index|proof|state read|authority/i.test(error.message))) {
             throw runtimeError("runtime_access_invalid", "canonical CTO delivery authority is unavailable");
@@ -708,7 +740,8 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
             cell.root.canonical_root,
             () => {
               requireLive(cell);
-              const current = findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root });
+              const indexPath = join(".work-state", "cto", "active-run-index.json");
+              const current = cell.root.pathEntryInfo(indexPath) ? findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root }) : null;
               if (current) return current.runId;
 
               const runId = `standby-${Date.now()}-${randomUUID().slice(0, 8)}`;
@@ -743,10 +776,24 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
                   standby: true,
                 });
                 state.pause = { kind: "none", reason: "standby" };
-                writeCtoState(state, cell.root.canonical_root, { pinnedRoot: cell.root, preCommit: ({ pinnedRoot }) => {
-                  requireLive(cell);
-                  if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "standby project root changed before state commit");
-                } });
+                const sourceId = `standby:${runId}`;
+                const initialStateSha256 = ctoRuntimeRunInitialIdentityDigest(state);
+                if (!mintCtoRuntimeRunOrigin(cell.root, state, cell.sessionId, sourceId, initialStateSha256)) {
+                  throw runtimeError("runtime_access_invalid", "standby run origin proof could not be committed");
+                }
+                writeCtoStateLocked(state, cell.root.canonical_root, {
+                  pinnedRoot: cell.root,
+                  preCommit: ({ pinnedRoot }) => {
+                    requireLive(cell);
+                    if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "standby project root changed before state commit");
+                  },
+                });
+                if (!writeCtoRuntimeStateProof(cell.root, state) || !hasValidCtoRuntimeStateProofPinned(cell.root, state)) {
+                  throw runtimeError("runtime_access_invalid", "standby run state proof could not be committed");
+                }
+                if (!refreshCtoRunDeliveryIndexAuthorityPinned(cell.root, cell.deliveryCapability, cell.sessionId)) {
+                  throw runtimeError("runtime_access_invalid", "standby delivery index proof could not be committed");
+                }
                 if (!cell.root.isStable()) throw new Error("standby project root changed after state/index publication");
                 const finalRun = cell.root.pathEntryInfo(runDirectory);
                 const finalInbox = cell.root.pathEntryInfo(inboxDirectory);
@@ -757,7 +804,8 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
                 return runId;
               } catch (error) {
                 if ((error as NodeJS.ErrnoException)?.code === "EEXIST") {
-                  const winner = findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root });
+                  const indexPath = join(".work-state", "cto", "active-run-index.json");
+                  const winner = cell.root.pathEntryInfo(indexPath) ? findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root }) : null;
                   if (winner) {
                     completed = true;
                     return winner.runId;
@@ -1047,6 +1095,9 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
                   if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "CTO project root changed before transaction commit");
                 },
               });
+              if (!refreshCtoRunDeliveryIndexAuthorityPinned(cell.root, cell.deliveryCapability, cell.sessionId)) {
+                throw runtimeError("runtime_access_invalid", "CTO delivery index proof failed after transaction commit");
+              }
             }
             return result;
           } finally {
@@ -1125,6 +1176,178 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
     },
   });
   return Object.freeze(methods);
+}
+
+function bridgeRouteProfileKey(profile: Readonly<Record<string, unknown>> | undefined): string | null {
+  if (!profile || profile.adapter !== "telegram" || profile.transport !== "telegram" || profile.direction !== "rw" || profile.primary !== true) return null;
+  return JSON.stringify({
+    adapter: profile.adapter,
+    transport: profile.transport,
+    direction: profile.direction,
+    primary: true,
+    id: profile.id ?? null,
+    ackTarget: profile.ackTarget ?? null,
+    subscriptions: Array.isArray(profile.subscriptions) ? profile.subscriptions : null,
+  });
+}
+
+function openBridgeRouteFromCell(
+  registryContext: RegistryRegistrationContext,
+  root: PinnedProjectRoot,
+): CtoRuntimeBridgeRouteAccess {
+  const assertLive = (): void => {
+    if (!root.isStable()) throw runtimeError("activation_revoked", "bridge route project root changed");
+    requireRegistryContext(registryContext, root.canonical_root, "workflow_tools");
+  };
+  const routeProfile = (): Readonly<Record<string, unknown>> | null => {
+    assertLive();
+    const loaded = loadEscalationConfigRaw(root.canonical_root, { pinnedRoot: root });
+    if (loaded.status !== "valid") return null;
+    const normalized = normalizeChannelConfigResult(loaded.config, {
+      telegram: { canReceiveInbound: true, canSend: true, canSendWithIdempotency: true },
+    });
+    if (normalized.status !== "valid" || normalized.profiles.length !== 1) return null;
+    const profile = normalized.profiles[0];
+    if (!profile || !bridgeRouteProfileKey(profile as unknown as Readonly<Record<string, unknown>>)) return null;
+    return Object.freeze({ ...profile });
+  };
+  const route = (): CtoRuntimeBridgeRouteCandidate | null => {
+    const profile = routeProfile();
+    if (!profile) return null;
+    const profileKey = bridgeRouteProfileKey(profile);
+    if (!profileKey) return null;
+    const candidates = readCtoRunDeliveryActiveCandidatesPinned(root);
+    if (!candidates.ok) return null;
+    const matches: CtoRuntimeBridgeRouteCandidate[] = [];
+    for (const entry of candidates.entries) {
+      if (entry.status !== "active" || !Number.isSafeInteger(entry.state_revision) || entry.state_revision < 0) continue;
+      const state = readCtoStatePinned(entry.run_id, root) as Readonly<Record<string, unknown>> | null;
+      if (!state || state.id !== entry.run_id || state.state_revision !== entry.state_revision || state.updated_at !== entry.updated_at
+        || typeof state.owner_session !== "string" || state.owner_session.length === 0 || state.standby === true
+        || !hasValidCtoRuntimeStateProofPinned(root, state as unknown as CtoState)) continue;
+      const stateProfile = state.channel_profile;
+      if (!stateProfile || typeof stateProfile !== "object" || Array.isArray(stateProfile)) continue;
+      if (bridgeRouteProfileKey(stateProfile as Readonly<Record<string, unknown>>) !== profileKey) continue;
+      matches.push(Object.freeze({ runId: entry.run_id, ownerSession: state.owner_session, stateRevision: entry.state_revision, updatedAt: entry.updated_at, status: "active", channelProfile: profile }));
+    }
+    if (matches.length !== 1) return null;
+    const selected = matches[0];
+    if (!selected) return null;
+    assertLive();
+    const second = readCtoRunDeliveryActiveCandidatesPinned(root);
+    if (!second.ok) return null;
+    const rebound = second.entries.find((entry) => entry.run_id === selected.runId);
+    if (!rebound || rebound.status !== "active" || rebound.state_revision !== selected.stateRevision || rebound.updated_at !== selected.updatedAt) return null;
+    const reboundState = readCtoStatePinned(selected.runId, root) as Readonly<Record<string, unknown>> | null;
+    if (!reboundState || reboundState.id !== selected.runId || reboundState.state_revision !== selected.stateRevision || reboundState.updated_at !== selected.updatedAt
+      || reboundState.owner_session !== selected.ownerSession || !hasValidCtoRuntimeStateProofPinned(root, reboundState as unknown as CtoState)) return null;
+    return selected;
+  };
+  const bridgeDeliveryCapability = Object.freeze({});
+  bridgeDeliveryCapabilities.add(bridgeDeliveryCapability);
+  const ensureStandbyRun = (): string => {
+    assertLive();
+    const existing = readCtoRunDeliveryActiveCandidatesPinned(root);
+    if (existing.ok) {
+      for (const entry of existing.entries) {
+        if (entry.status !== "standby") continue;
+        const state = readCtoStatePinned(entry.run_id, root);
+        if (state && state.id === entry.run_id && state.standby === true && hasValidCtoRuntimeStateProofPinned(root, state)) return entry.run_id;
+      }
+    }
+    return withCtoRegistryLock(root.canonical_root, () => {
+      assertLive();
+      const rebound = readCtoRunDeliveryActiveCandidatesPinned(root);
+      if (rebound.ok) {
+        for (const entry of rebound.entries) {
+          if (entry.status !== "standby") continue;
+          const state = readCtoStatePinned(entry.run_id, root);
+          if (state && state.id === entry.run_id && state.standby === true && hasValidCtoRuntimeStateProofPinned(root, state)) return entry.run_id;
+        }
+      }
+      const runId = `standby-${Date.now()}-${randomUUID().slice(0, 8)}`;
+      const runDirectory = join(".work-state", "cto", runId);
+      const inboxDirectory = join(runDirectory, "inbox");
+      root.ensureDirectories([runDirectory, inboxDirectory]);
+      const now = new Date().toISOString();
+      const state = newCtoState({ id: runId, task: "standby — awaiting inbox tasks", branch: "", autonomous: true, plan: { id: runId, task: "standby — awaiting inbox tasks", teams: [], created_at: now }, standby: true });
+      state.pause = { kind: "none", reason: "standby" };
+      const sourceId = `standby:${runId}`;
+      const initialDigest = ctoRuntimeRunInitialIdentityDigest(state);
+      if (!mintCtoRuntimeRunOrigin(root, state, "cto-bridge", sourceId, initialDigest)) throw runtimeError("runtime_access_invalid", "standby run origin proof could not be committed");
+      writeCtoStateLocked(state, root.canonical_root, { pinnedRoot: root, preCommit: () => assertLive() });
+      if (!writeCtoRuntimeStateProof(root, state) || !hasValidCtoRuntimeStateProofPinned(root, state)
+        || !refreshCtoRunDeliveryIndexAuthorityPinned(root, bridgeDeliveryCapability, "cto-bridge")) throw runtimeError("runtime_access_invalid", "standby delivery authority could not be committed");
+      assertLive();
+      const finalState = readCtoStatePinned(runId, root);
+      if (!finalState || finalState.id !== runId || !hasValidCtoRuntimeStateProofPinned(root, finalState)) throw runtimeError("runtime_access_invalid", "standby state changed during publication");
+      return runId;
+    }, { pinnedRoot: root });
+  };
+  const resolveCompletedStatus = (): Readonly<{ runId: string; summary: Readonly<Record<string, unknown>> }> | null => {
+    const profile = routeProfile();
+    if (!profile) return null;
+    assertLive();
+    const candidates = readCtoRunDeliveryCompletedCandidatesPinned(root);
+    if (!candidates.ok) return null;
+    const verified: Array<{ runId: string; summary: Readonly<Record<string, unknown>>; at: number; revision: number }> = [];
+    for (const entry of candidates.entries) {
+      if (entry.status !== done && entry.status !== failed) continue;
+      const at = Date.parse(entry.updated_at);
+      if (!Number.isFinite(at) || at > Date.now()) continue;
+      const state = readCtoStatePinned(entry.run_id, root) as Readonly<Record<string, unknown>> | null;
+      if (!state || state.id !== entry.run_id || state.state_revision !== entry.state_revision || state.updated_at !== entry.updated_at
+        || !hasValidCtoRuntimeStateProofPinned(root, state as unknown as CtoState)) continue;
+      const pause = state.pause;
+      if (!pause || typeof pause !== object || Array.isArray(pause) || (pause as Record<string, unknown>).kind !== entry.status) continue;
+      const rawWaves = state.wave_history;
+      const waves = Array.isArray(rawWaves) ? rawWaves.slice(0, 4096).map((wave) => {
+        if (!wave || typeof wave !== object || Array.isArray(wave)) return null;
+        const item = wave as Record<string, unknown>;
+        if (typeof item.id !== string || typeof item.status !== string || typeof item.started_at !== string) return null;
+        return Object.freeze({ id: item.id, status: item.status, started_at: item.started_at, ...(typeof item.finished_at === string ? { finished_at: item.finished_at } : {}), ...(typeof item.outcome === string ? { outcome: item.outcome } : {}) });
+      }) : [];
+      if (waves.some((wave) => wave === null)) continue;
+      verified.push({ runId: entry.run_id, at, revision: entry.state_revision, summary: Object.freeze({ status: entry.status, updated_at: entry.updated_at, waves: Object.freeze(waves) }) });
+    }
+    verified.sort((left, right) => right.at - left.at || right.revision - left.revision || left.runId.localeCompare(right.runId));
+    const selected = verified[0];
+    if (!selected) return null;
+    assertLive();
+    return Object.freeze({ runId: selected.runId, summary: selected.summary });
+  };
+  return Object.freeze({
+    assertLive,
+    resolveTelegramRoute: route,
+    resolveTelegramChannelProfile: routeProfile,
+    resolveCompletedStatus,
+    ensureStandbyRun,
+    readStatus: (runId: string): Readonly<Record<string, unknown>> | null => {
+      assertLive();
+      if (typeof runId !== "string" || !/^[A-Za-z0-9._-]+$/u.test(runId)) return null;
+      const state = readCtoStatePinned(runId, root);
+      if (!state || !hasValidCtoRuntimeStateProofPinned(root, state)) return null;
+      return Object.freeze({ id: state.id, state_revision: state.state_revision, updated_at: state.updated_at, owner_session: state.owner_session, standby: state.standby === true, channel_profile: state.channel_profile });
+    },
+    close: (): void => { root.close(); },
+  });
+}
+
+/** Open a narrow Telegram bridge route capability from an active registry owner. */
+export function openCtoRuntimeBridgeRouteAccess(
+  registryContext: RegistryRegistrationContext,
+  pinnedRoot: PinnedProjectRoot,
+): CtoRuntimeBridgeRouteAccess | null {
+  if (!pinnedRoot || !pinnedRoot.isStable()) return null;
+  let snapshot: RegistryContextSnapshot;
+  try { snapshot = requireRegistryContext(registryContext, pinnedRoot.canonical_root, "workflow_tools"); } catch { return null; }
+  if (snapshot.canonical_root !== pinnedRoot.canonical_root || snapshot.root_dev !== pinnedRoot.dev || snapshot.root_ino !== pinnedRoot.ino) return null;
+  const ownedRoot = PinnedProjectRoot.open(snapshot.canonical_root);
+  if (!ownedRoot || ownedRoot.canonical_root !== snapshot.canonical_root || ownedRoot.dev !== pinnedRoot.dev || ownedRoot.ino !== pinnedRoot.ino || !ownedRoot.isStable()) {
+    ownedRoot?.close();
+    return null;
+  }
+  return openBridgeRouteFromCell(registryContext, ownedRoot);
 }
 
 /**
