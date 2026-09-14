@@ -756,9 +756,25 @@ function guardedRegistrarHostApi(
   return wrapped;
 }
 
+/** Exact current runtime binding retained by an authenticated bundle. */
+export interface TeamSessionRuntimeBinding {
+  readonly registryContext: RegistryRegistrationContext;
+  readonly runtimeAuthority: CtoRuntimeSessionAuthority;
+  readonly runtimeAccess: CtoRuntimeAccessFacade;
+  readonly canonicalRoot: string;
+  readonly rootDev: number;
+  readonly rootIno: number;
+  readonly sessionManager: object;
+  readonly sessionId: string;
+  readonly sessionFile?: string;
+  readonly sessionBasename?: string;
+  readonly generation?: string | number;
+}
+
 /** Opaque host-session rebinding capability retained by an authenticated bundle. */
 export interface TeamSessionBindingController {
-  bind(ctx: unknown): void;
+  bind(ctx: unknown): TeamSessionRuntimeBinding | null;
+  current(ctx: unknown): TeamSessionRuntimeBinding | null;
   isLive(ctx: unknown): boolean;
 }
 
@@ -1772,27 +1788,18 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
   };
   revokeSessionBindingController = revokeController;
   const sessionBindingController: TeamSessionBindingController = Object.freeze({
-    bind: (ctx: unknown): void => {
-      if (sessionBindingControllerRevoked) return;
+    bind: (ctx: unknown): TeamSessionRuntimeBinding | null => {
+      if (sessionBindingControllerRevoked) return null;
       const current = teamActivationCells.get(originalPi as unknown as object);
-      if (!current || (current.state !== "active" && current.state !== "failed")) return;
+      if (!current || (current.state !== "active" && current.state !== "failed")) return null;
       bindSession(ctx);
+      return currentTeamSessionRuntimeBinding(originalPi as unknown as object, ctx);
     },
-    isLive: (ctx: unknown): boolean => {
-      if (sessionBindingControllerRevoked) return false;
-      const current = teamActivationCells.get(originalPi as unknown as object);
-      const identity = hostSessionIdentity(ctx);
-      const currentSession = current ? teamCellSession(current) : null;
-      if (!current || current.state !== "active" || !identity || !currentSession || !sameHostSession(currentSession, identity)
-        || current.root === undefined || current.rootDev === undefined || current.rootIno === undefined
-        || hostContextRootIssue(ctx, current.root, current.rootDev, current.rootIno) !== null) return false;
-      try {
-        current.liveGuard?.();
-        return true;
-      } catch {
-        return false;
-      }
+    current: (ctx: unknown): TeamSessionRuntimeBinding | null => {
+      if (sessionBindingControllerRevoked) return null;
+      return currentTeamSessionRuntimeBinding(originalPi as unknown as object, ctx);
     },
+    isLive: (ctx: unknown): boolean => currentTeamSessionRuntimeBinding(originalPi as unknown as object, ctx) !== null,
   });
   teamSessionBindingControllerRevokers.set(originalPi as unknown as object, revokeController);
 
@@ -2254,6 +2261,36 @@ function teamCellSession(cell: TeamActivationCell): HostSessionIdentity | null {
     ...(cell.sessionBasename !== undefined ? { sessionBasename: cell.sessionBasename } : {}),
     ...(cell.sessionGeneration !== undefined ? { generation: cell.sessionGeneration } : {}),
   };
+}
+
+function currentTeamSessionRuntimeBinding(pi: object, ctx: unknown): TeamSessionRuntimeBinding | null {
+  const current = teamActivationCells.get(pi);
+  const identity = hostSessionIdentity(ctx);
+  const currentSession = current ? teamCellSession(current) : null;
+  if (!current || current.state !== "active" || !identity || !currentSession || !sameHostSession(currentSession, identity)
+    || !current.registryContext || !current.runtimeAuthority || !current.runtimeAccess
+    || current.root === undefined || current.rootDev === undefined || current.rootIno === undefined
+    || hostContextRootIssue(ctx, current.root, current.rootDev, current.rootIno) !== null) return null;
+  try {
+    current.liveGuard?.();
+    current.runtimeAccess.assertProjectRoot(current.root);
+    current.runtimeAccess.assertLive();
+    return Object.freeze({
+      registryContext: current.registryContext,
+      runtimeAuthority: current.runtimeAuthority,
+      runtimeAccess: current.runtimeAccess,
+      canonicalRoot: current.root,
+      rootDev: current.rootDev,
+      rootIno: current.rootIno,
+      sessionManager: identity.sessionManager,
+      sessionId: identity.sessionId,
+      ...(identity.sessionFile !== undefined ? { sessionFile: identity.sessionFile } : {}),
+      ...(identity.sessionBasename !== undefined ? { sessionBasename: identity.sessionBasename } : {}),
+      ...(identity.generation !== undefined ? { generation: identity.generation } : {}),
+    });
+  } catch {
+    return null;
+  }
 }
 
 type MountedCtoRuntime = {
