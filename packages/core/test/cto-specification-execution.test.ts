@@ -739,7 +739,7 @@ function publicWorkflowTool(name: string, root: string = mkdtempSync(join(tmpdir
     registerTool: (tool: unknown) => registered.push(tool as RegisteredWorkflowTool),
   };
   registerTestWorkflowTools(root, pi as never, { resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
-  registerTestTeamWorkflow(root, pi as never, { resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
+  if (name !== "workflow_prepare") registerTestTeamWorkflow(root, pi as never, { resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
   const tool = registered.find((candidate) => candidate.name === name);
   assert.ok(tool, `${name} tool is registered`);
   return tool!;
@@ -762,7 +762,7 @@ type MountedCtoTool = {
   execute: (...args: unknown[]) => Promise<{ details: unknown }>;
 };
 
-function publicCtoTools(rootOrOptions: string | Parameters<typeof registerCtoTools>[1] = mkdtempSync(join(tmpdir(), "cto-public-tools-")), maybeOptions: Parameters<typeof registerCtoTools>[1] = {}): Map<string, MountedCtoTool> {
+function publicCtoTools(rootOrOptions: string | Parameters<typeof registerCtoTools>[1] = mkdtempSync(join(tmpdir(), "cto-public-tools-")), maybeOptions: Parameters<typeof registerCtoTools>[1] = {}, registerTeamWorkflow = true): Map<string, MountedCtoTool> {
   const root = typeof rootOrOptions === "string" ? rootOrOptions : mkdtempSync(join(tmpdir(), "cto-public-tools-"));
   const options = typeof rootOrOptions === "string" ? maybeOptions : rootOrOptions;
   const registered: MountedCtoTool[] = [];
@@ -772,7 +772,7 @@ function publicCtoTools(rootOrOptions: string | Parameters<typeof registerCtoToo
     setLabel: (_label: string) => undefined,
     registerTool: (tool: unknown) => registered.push(tool as MountedCtoTool),
   };
-  registerTestTeamWorkflow(root, pi as never, { resolveCwd: options.resolveCwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
+  if (registerTeamWorkflow) registerTestTeamWorkflow(root, pi as never, { resolveCwd: options.resolveCwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
   registerTestCtoTools(root, pi as never, options, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
   return new Map(registered.map((tool) => [tool.name, tool]));
 }
@@ -855,12 +855,14 @@ function mountedToolPayloads(): Record<string, Json> {
   };
 }
 function writeMountedPreparationFixture(root: string, featureId: string, runKey: string, runId: string): Json {
-  writeFeature(root, featureId, runKey);
+  const prepared = writeFeature(root, featureId, runKey);
+  const firstTask = (prepared.handoff.tasks as Json[])[0];
+  const affectedScope = Array.isArray(firstTask?.affected_scope) ? firstTask.affected_scope : [];
   mkdirSync(join(root, ".omp"), { recursive: true });
   writeFileSync(join(root, ".omp", "teams.json"), JSON.stringify([{
     id: "team-standard",
     name: "Standard",
-    scope: ["src"],
+    scope: affectedScope,
     profile: "standard",
     lead: "developer",
     roster: ["developer"],
@@ -3502,22 +3504,8 @@ test("mounted cto_prepare is idempotent and blocks a changed payload", async () 
   const featureId = "mounted-prepare-feature";
   const runKey = `run-${featureId}-1`;
   try {
-    writeFeature(root, featureId, runKey);
-    mkdirSync(join(root, ".omp"), { recursive: true });
-    writeFileSync(join(root, ".omp", "teams.json"), JSON.stringify([{
-      id: "team-standard",
-      name: "Standard",
-      scope: ["src"],
-      profile: "standard",
-      lead: "developer",
-      roster: ["developer"],
-    }]), "utf8");
+    const payload = writeMountedPreparationFixture(root, featureId, runKey, "CTO-MOUNTED-PREPARE-RUN");
     const tool = publicCtoTools(root, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd }).get("cto_prepare")!;
-    const payload = mountedToolPayloads().cto_prepare;
-    payload.cto_run_id = "CTO-MOUNTED-PREPARE-RUN";
-    payload.wave_id = "WAVE-MOUNTED-PREPARE-1";
-    payload.source_id = "SOURCE-MOUNTED-PREPARE-1";
-    payload.selections = [{ feature_id: featureId, run_key: runKey }];
     const first = mountedDetails(await tool.execute("prepare-1", payload, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
     assert.equal(first.status, "ready", JSON.stringify(first));
     const second = mountedDetails(await tool.execute("prepare-2", payload, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
@@ -3591,7 +3579,7 @@ test("mounted cto_prepare fails closed when anchor identities exceed the feature
 });
 test("cto_prepare enforces selector and aggregate bounds before mutation", () => {
   const root = makeProject();
-  const tools = publicCtoTools(root, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd });
+  const tools = publicCtoTools(root, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd }, false);
   const tool = tools.get("cto_prepare")!;
   const base = structuredClone(mountedToolPayloads().cto_prepare) as Json;
   const parse = (value: Json): boolean => tool.parameters.safeParse(value).success;
@@ -3861,7 +3849,8 @@ test("cto_prepare preserves canonical team identities through four-way mixed dis
     assert.ok(forgedWave);
     forgedWave.source_id = String(forgedWave.source_id) + "-forged";
     writeFileSync(ctoStatePath, JSON.stringify(forgedWaveState) + String.fromCharCode(10), "utf8");
-    const forgedAsk = prepareCtoSpecificationMappingAsk(root, { ...askArgs, feature_id: "identity-pass", run_key: runKeys["identity-pass"], stage_id: String(askArgs.stage_id) } as never);
+    const prepareMappingAsk = (input: unknown) => prepareCtoSpecificationMappingAsk(root, input as never, preparationRuntimeOptions(root));
+    const forgedAsk = prepareMappingAsk({ ...askArgs, feature_id: "identity-pass", run_key: runKeys["identity-pass"], stage_id: String(askArgs.stage_id) } as never);
     assert.equal(forgedAsk.status, "blocked", JSON.stringify(forgedAsk));
     assert.equal(readFileSync(askMappingPath, "utf8"), askMappingBeforeWaveTamper, "forged wave Ask must not persist mapping proof");
     assert.equal(readFileSync(anchorStatePath, "utf8"), anchorStateBeforeWaveTamper, "forged wave Ask must not mutate trusted-answer state");
@@ -3872,12 +3861,13 @@ test("cto_prepare preserves canonical team identities through four-way mixed dis
       feature_id: "identity-blocked",
       run_key: runKeys["identity-blocked"],
     };
-    const nonAnchorPrepared = prepareCtoSpecificationMappingAsk(root, nonAnchorAsk as never);
+    const nonAnchorPrepared = prepareMappingAsk(nonAnchorAsk as never);
     assert.equal(nonAnchorPrepared.status, "blocked", JSON.stringify(nonAnchorPrepared));
     assert.match(JSON.stringify(nonAnchorPrepared), /first exact frozen selection/u);
     const nonAnchorMappingPath = join(root, ".work-state", "cto", RUN_ID, "specification-mappings", String(askArgs.mapping_id) + ".json");
     const mappingBeforeNonAnchorAsk = readFileSync(nonAnchorMappingPath, "utf8");
-    const nonAnchorAnswered = recordCtoSpecificationMappingAsk(root, { ...nonAnchorAsk, decision: "approve_continue" } as never);
+    const recordMappingAsk = (input: unknown) => recordCtoSpecificationMappingAsk(root, input as never, { ...preparationRuntimeOptions(root), trusted_host: { bridge: {}, question: "", options: [], session_id: DEFAULT_TEST_SESSION_ID } });
+    const nonAnchorAnswered = recordMappingAsk({ ...nonAnchorAsk, decision: "approve_continue" } as never);
     assert.equal(nonAnchorAnswered.status, "blocked", JSON.stringify(nonAnchorAnswered));
     assert.match(JSON.stringify(nonAnchorAnswered), /first exact frozen selection/u);
     assert.equal(readFileSync(nonAnchorMappingPath, "utf8"), mappingBeforeNonAnchorAsk, "non-anchor Ask must not persist pending proof or mutate mapping");
@@ -3893,22 +3883,22 @@ test("cto_prepare preserves canonical team identities through four-way mixed dis
       mapping_hash: String(askArgs.mapping_hash),
     });
     assert.equal(malformedRun.status, "blocked", JSON.stringify(malformedRun));
-    const malformedHash = prepareCtoSpecificationMappingAsk(root, {
+    const malformedHash = prepareMappingAsk({
       ...askArgs,
       mapping_hash: "not-a-sha256",
     } as never);
     assert.equal(malformedHash.status, "blocked", JSON.stringify(malformedHash));
-    const multilineRun = prepareCtoSpecificationMappingAsk(root, {
+    const multilineRun = prepareMappingAsk({
       ...askArgs,
       run_key: `${String(askArgs.run_key)}\nforged`,
     } as never);
     assert.equal(multilineRun.status, "blocked", JSON.stringify(multilineRun));
-    const multilineStage = prepareCtoSpecificationMappingAsk(root, {
+    const multilineStage = prepareMappingAsk({
       ...askArgs,
       stage_id: `${String(askArgs.stage_id)}\nforged`,
     } as never);
     assert.equal(multilineStage.status, "blocked", JSON.stringify(multilineStage));
-    const staleHash = prepareCtoSpecificationMappingAsk(root, {
+    const staleHash = prepareMappingAsk({
       ...askArgs,
       mapping_hash: "0".repeat(64),
     } as never);
@@ -3919,7 +3909,7 @@ test("cto_prepare preserves canonical team identities through four-way mixed dis
     const mutatedRecord = JSON.parse(mappingBeforeMutation) as Json;
     (mutatedRecord.mapping as Json).mapping_hash = "0".repeat(64);
     writeFileSync(mappingPath, `${JSON.stringify(mutatedRecord)}\n`, "utf8");
-    const mutatedMapping = prepareCtoSpecificationMappingAsk(root, askArgs as never);
+    const mutatedMapping = prepareMappingAsk(askArgs as never);
     assert.equal(mutatedMapping.status, "blocked", JSON.stringify(mutatedMapping));
     writeFileSync(mappingPath, mappingBeforeMutation, "utf8");
 
@@ -3936,12 +3926,22 @@ test("cto_prepare preserves canonical team identities through four-way mixed dis
       answer_id: answered.trusted_answer_ref,
     });
     assert.equal(confirmed.status, "confirmed", detail(confirmed));
-    const dispatched = await dispatchCtoSpecificationMapping(root, {
+    let dispatched = await dispatchCtoSpecificationMapping(root, {
       cto_run_id: RUN_ID,
       mapping_id: String(frozen.mapping_id),
       expected_mapping_hash: String(frozen.mapping_hash),
     }, preparationRuntimeOptions(root)) as unknown as Result;
     assert.equal(dispatched.status, "dispatched", detail(dispatched));
+    if (!dispatched.conformance_binding) {
+      completeMountedCtoExecutionTeams(root);
+      dispatched = await dispatchCtoSpecificationMapping(root, {
+        cto_run_id: RUN_ID,
+        mapping_id: String(frozen.mapping_id),
+        expected_mapping_hash: String(frozen.mapping_hash),
+      }, preparationRuntimeOptions(root)) as unknown as Result;
+      assert.equal(dispatched.status, "dispatched", detail(dispatched));
+    }
+    assert.ok(dispatched.conformance_binding, detail(dispatched));
     const dispatchedState = readCtoState(RUN_ID, root);
     assert.ok(dispatchedState);
     for (const featureId of eligibleFeatureIds) {
@@ -3974,8 +3974,8 @@ test("cto_prepare preserves canonical team identities through four-way mixed dis
       ...conformancePayload,
       project_root: root,
     } as never, {
-      runtimeAccess: testRuntimeAccess(root, TEST_SESSION_ID),
-      sessionId: TEST_SESSION_ID,
+      runtimeAccess: testRuntimeAccess(root, DEFAULT_TEST_SESSION_ID),
+      sessionId: DEFAULT_TEST_SESSION_ID,
     }) as unknown as Result;
     assert.equal(conformance.status, "blocked", detail(conformance));
     assert.deepEqual(conformance.passing_feature_ids, ["identity-pass"], detail(conformance));
