@@ -4927,8 +4927,8 @@ export function writeBridgeLock(root: string, pinnedRoot?: PinnedProjectRoot, pr
       canonical_root: pin.canonical_root,
       root_dev: pin.dev,
       root_ino: pin.ino,
-      owner_fingerprint: "bridge",
-      principal_fingerprint: "bridge",
+      owner_fingerprint: createHash("sha256").update("bridge", "utf8").digest("hex"),
+      principal_fingerprint: createHash("sha256").update("bridge", "utf8").digest("hex"),
       claim_generation: 0,
       marker_generation: 0,
       marker_digest: createHash("sha256").update("bridge", "utf8").digest("hex"),
@@ -5818,6 +5818,7 @@ function reserveWakeEffect(
   taskId: string,
   suppliedPin: PinnedProjectRoot | undefined,
   answer: Pick<EscalationAnswer, "id" | "run_id" | "answer"> | undefined,
+  wakeEvidence: ((identity: string) => boolean | undefined) | undefined,
   proofAuthority: CtoRuntimeProofAuthority,
   runtimeAccess: RuntimeAccess,
 ): WakeEffectReservation {
@@ -5842,7 +5843,10 @@ function reserveWakeEffect(
     if (current.status === "delivered" && current.identity === taskId && current.run_id === runId) return { alreadyDelivered: true };
     if (current.status !== "prepared" || current.identity !== taskId || current.run_id !== runId || !Number.isInteger(current.attempts) || current.attempts < 1) throw new WakeEffectAmbiguousError(taskId);
     if (current.retryable === true && answer && current.answer?.id === answer.id && current.answer.answer === answer.answer) return { claim: { fileName }, alreadyDelivered: false };
-    return { claim: { fileName }, alreadyDelivered: false };
+    const evidence = wakeEvidence?.(taskId);
+    if (evidence === true) return { claim: { fileName }, alreadyDelivered: true };
+    if (evidence === false) return { claim: { fileName }, alreadyDelivered: false };
+    throw new WakeEffectAmbiguousError(taskId);
   } catch (error) {
     if (error instanceof WakeEffectAmbiguousError) throw error;
     throw new WakeEffectAmbiguousError(taskId);
@@ -6057,11 +6061,12 @@ export function handleInboxTask(
     };
     let reservation: WakeEffectReservation | undefined;
     try {
-      reservation = opts.idempotentWake ? reserveWakeEffect(root, runId, task.id, pinnedRoot, undefined, opts.proofAuthority, opts.runtimeAccess!) : undefined;
+      reservation = opts.idempotentWake ? reserveWakeEffect(root, runId, task.id, pinnedRoot, undefined, opts.wakeEvidence, opts.proofAuthority, opts.runtimeAccess!) : undefined;
     } catch (error) {
       rollbackWake(error);
     }
     if (reservation?.alreadyDelivered) {
+      if (reservation.claim) markWakeEffectDelivered(root, runId, reservation.claim, task.id, pinnedRoot, opts.proofAuthority, opts.runtimeAccess!);
       acknowledgeInboxWake(root, runId, task, hash, pinnedRoot, opts.runtimeAccess);
       return admission.path;
     }
@@ -6229,9 +6234,12 @@ async function deliverAnswerWake(
   // a same-path root replacement cannot make a copied lock look live.
   if (opts.isOwned && !opts.isOwned()) return "retryable";
   const reservation = opts.idempotentWake
-    ? reserveWakeEffect(root, runId, answer.id, opts.pinnedRoot, answer, opts.proofAuthority, opts.runtimeAccess!)
+    ? reserveWakeEffect(root, runId, answer.id, opts.pinnedRoot, answer, opts.wakeEvidence, opts.proofAuthority, opts.runtimeAccess!)
     : undefined;
-  if (reservation?.alreadyDelivered) return "delivered";
+  if (reservation?.alreadyDelivered) {
+    if (reservation.claim) markWakeEffectDelivered(root, runId, reservation.claim, answer.id, opts.pinnedRoot, opts.proofAuthority, opts.runtimeAccess!);
+    return "delivered";
+  }
   const claim = reservation?.claim;
   try {
     // Reservation itself can race with lease loss. Never invoke user code after
