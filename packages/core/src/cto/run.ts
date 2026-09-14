@@ -1434,12 +1434,12 @@ export function advanceCtoSpecificationPreparation(
     }
     if (!pinnedRoot.isStable()) throw new CtoSpecificationPreparationError("CTO_REVIEW_ROOT_CHANGED", "pinned project root changed before CTO preparation finalization");
     assertRuntimeLive();
+    const projectedState = options.runtimeAccess.readState(ctoRunId) as unknown as CtoState | null;
+    assertRuntimeLive();
+    assertPreparationOwnerSession(projectedState, ctoRunId, options.sessionId);
     recoverReviewPacketTransaction(root, ctoRunId, pinnedRoot);
     assertRuntimeLive();
     try {
-      const projectedState = options.runtimeAccess.readState(ctoRunId) as unknown as CtoState | null;
-      assertRuntimeLive();
-      assertPreparationOwnerSession(projectedState, ctoRunId, options.sessionId);
       ensurePreparationConstitutionBeforeRunLock(root, pinnedRoot, projectedState, assertRuntimeLive);
       assertRuntimeLive();
       return options.runtimeAccess.withRunTransaction(ctoRunId, (transaction) => {
