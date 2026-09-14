@@ -647,6 +647,80 @@ interface AdapterRegistration {
  * token binds the registration to the canonical owner claim/root and is
  * intentionally not reconstructible from public identity fields.
  */
+const ADAPTER_REGISTRATION_LIVE_GUARD = Symbol("omp-cto-adapter-registration-live-guard");
+
+type AdapterRegistrationLiveBinding = {
+  readonly registration: AdapterRegistration;
+  readonly assertLive: () => void;
+};
+type AdapterRegistrationLiveMarker = {
+  readonly [ADAPTER_REGISTRATION_LIVE_GUARD]: AdapterRegistrationLiveBinding;
+};
+
+function guardedAdapterOperation<T>(assertLive: () => void, operation: () => T): T {
+  assertLive();
+  let result: T;
+  try {
+    result = operation();
+  } catch (error) {
+    assertLive();
+    throw error;
+  }
+  if (result && typeof (result as { then?: unknown }).then === "function") {
+    return Promise.resolve(result as unknown as PromiseLike<unknown>).then(
+      (value) => { assertLive(); return value; },
+      (error) => { assertLive(); throw error; },
+    ) as T;
+  }
+  assertLive();
+  return result;
+}
+
+function wrapCustomAdapterMethods(adapter: EscalationAdapter, assertLive: () => void): void {
+  const target = adapter as unknown as Record<string, unknown>;
+  for (const name of ["send", "sendWithIdempotency", "cancel", "pollOnce", "sendPlainText", "setPlainMessageHandler", "setAnswerHandler"] as const) {
+    const original = target[name];
+    if (typeof original !== "function") continue;
+    target[name] = (...args: unknown[]): unknown => {
+      const forwarded = [...args];
+      if ((name === "setPlainMessageHandler" || name === "setAnswerHandler") && typeof forwarded[0] === "function") {
+        const handler = forwarded[0] as (...callbackArgs: unknown[]) => unknown;
+        forwarded[0] = (...callbackArgs: unknown[]): unknown => guardedAdapterOperation(
+          assertLive,
+          () => Reflect.apply(handler, undefined, callbackArgs),
+        );
+      }
+      return guardedAdapterOperation(assertLive, () => Reflect.apply(original, adapter, forwarded));
+    };
+  }
+}
+
+function markAdapterRegistrationLive(adapter: EscalationAdapter, registration: AdapterRegistration, expectedRoot: AdapterRootIdentity): void {
+  if (registration.builtin) return;
+  const assertLive = (): void => {
+    if (!liveCustomRegistration(registration, expectedRoot)) {
+      throw new DispatcherActivationRevokedError("custom adapter registration is no longer live");
+    }
+  };
+  const existing = (adapter as unknown as Partial<AdapterRegistrationLiveMarker>)[ADAPTER_REGISTRATION_LIVE_GUARD];
+  if (existing) {
+    if (existing.registration !== registration) throw new DispatcherActivationRevokedError("adapter object was reused by a different registration");
+    existing.assertLive();
+    return;
+  }
+  wrapCustomAdapterMethods(adapter, assertLive);
+  Object.defineProperty(adapter, ADAPTER_REGISTRATION_LIVE_GUARD, {
+    configurable: true,
+    enumerable: false,
+    value: Object.freeze({ registration, assertLive }),
+  });
+}
+
+function assertAdapterRegistrationLive(adapter: EscalationAdapter | null | undefined): void {
+  if (!adapter) return;
+  (adapter as unknown as Partial<AdapterRegistrationLiveMarker>)[ADAPTER_REGISTRATION_LIVE_GUARD]?.assertLive();
+}
+
 const BUILTIN_ADAPTER_KINDS = new Set(["http", "telegram"]);
 export const MAX_CUSTOM_ADAPTER_KIND_BYTES = 128;
 export const MAX_CUSTOM_ADAPTER_KINDS_PER_ROOT = 64;
@@ -960,6 +1034,7 @@ function invokeAdapterFactory(
   // against factories that mutate marker/root state themselves and ensures a
   // revoked custom registration never escapes as a usable adapter.
   if (!registration.builtin && !liveCustomRegistration(registration, scope.root)) return null;
+  if (adapter && !registration.builtin) markAdapterRegistrationLive(adapter, registration, scope.root);
   return adapter;
 }
 
@@ -2332,6 +2407,7 @@ async function sendWithRetry(
       const receipt = await boundedAdapterCall(
         () => {
           opts.lifecycle?.assertLive?.();
+          assertAdapterRegistrationLive(adapter);
           assertCurrentPublication();
           return typeof opts.idempotencyKey === "string" && typeof idempotent.sendWithIdempotency === "function"
             ? idempotent.sendWithIdempotency(esc, opts.idempotencyKey, opts.pinnedRoot, opts.lifecycle)
@@ -2340,6 +2416,7 @@ async function sendWithRetry(
         opts.lifecycle,
         opts.lifecycle?.trackUnderlyingCallback,
       );
+      assertAdapterRegistrationLive(adapter);
       opts.lifecycle?.assertLive?.();
       if ((opts.pinnedRoot && !opts.pinnedRoot.isStable()) || (opts.isOwned && !opts.isOwned())) return { receipt: { sent: false }, ownershipLost: true };
       if (receipt.sent) {
@@ -4237,16 +4314,20 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
   const wakeTask = async (task: InboxTask, pinnedRoot: PinnedProjectRoot = dispatcherRoot): Promise<void> => {
     if (stopped) throw new Error("messenger dispatcher is stopped");
     assertDispatcherActivationLive(opts.runtimeAccess, pinnedRoot, opts.liveGuard, lease.activation);
+    assertAdapterRegistrationLive(primary);
     if (!ownsDispatcherLeasePinned(lease, pinnedRoot, opts.proofAuthority)) throw new Error("messenger dispatcher lease lost before task wake");
     await onTask?.(task);
+    assertAdapterRegistrationLive(primary);
     assertDispatcherActivationLive(opts.runtimeAccess, pinnedRoot, opts.liveGuard, lease.activation);
     if (stopped || !ownsDispatcherLeasePinned(lease, pinnedRoot, opts.proofAuthority)) throw new Error("messenger dispatcher lease lost during task wake");
   };
   const wakeAnswer = async (answer: Pick<EscalationAnswer, "id" | "run_id" | "answer">, pinnedRoot: PinnedProjectRoot = dispatcherRoot): Promise<void> => {
     if (stopped) throw new Error("messenger dispatcher is stopped");
     assertDispatcherActivationLive(opts.runtimeAccess, pinnedRoot, opts.liveGuard, lease.activation);
+    assertAdapterRegistrationLive(primary);
     if (!ownsDispatcherLeasePinned(lease, pinnedRoot, opts.proofAuthority)) throw new Error("messenger dispatcher lease lost before answer wake");
     await onAnswer?.(answer);
+    assertAdapterRegistrationLive(primary);
     assertDispatcherActivationLive(opts.runtimeAccess, pinnedRoot, opts.liveGuard, lease.activation);
     if (stopped || !ownsDispatcherLeasePinned(lease, pinnedRoot, opts.proofAuthority)) throw new Error("messenger dispatcher lease lost during answer wake");
   };
@@ -4254,6 +4335,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
     if (stopped) return Promise.resolve();
     try {
       assertDispatcherActivationLive(opts.runtimeAccess, dispatcherRoot, opts.liveGuard, lease.activation);
+      assertAdapterRegistrationLive(primary);
     } catch (error) {
       if (isDispatcherActivationFailure(error)) void requestStop?.();
       return Promise.resolve();
@@ -4261,6 +4343,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
     if (!ownsDispatcherLeasePinned(lease, dispatcherRoot, opts.proofAuthority)) return Promise.resolve();
     const operation = (async (): Promise<void> => {
       assertDispatcherActivationLive(opts.runtimeAccess, dispatcherRoot, opts.liveGuard, lease.activation);
+      assertAdapterRegistrationLive(primary);
       const task = normalizeInboundTask(_message);
       if (!task || stopped || !ownsDispatcherLeasePinned(lease, dispatcherRoot, opts.proofAuthority)) return;
       // Adapters may supply a transport-local pin, but admission is always
@@ -4279,6 +4362,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
           return ownsDispatcherLeasePinned(lease, callbackPin, opts.proofAuthority);
         },
       });
+      assertAdapterRegistrationLive(primary);
       if (outcome === "retryable") throw new InboxTaskRetryableError();
     })();
     const tracked = trackCallback(operation);
@@ -4296,7 +4380,9 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
   let inboundInstalled = false;
   try {
     if (inboundCapable && typeof inboundCapable.setPlainMessageHandler === "function") {
+      assertAdapterRegistrationLive(primary);
       inboundCapable.setPlainMessageHandler(inboxHandler);
+      assertAdapterRegistrationLive(primary);
       inboundInstalled = true;
     }
   } catch (error) {
@@ -6724,11 +6810,13 @@ export async function pollInbox(
       const polled = await boundedAdapterCall(
         () => {
           opts.lifecycle?.assertLive?.();
+          assertAdapterRegistrationLive(adapter);
           return adapter.pollOnce(adapterPin, opts.lifecycle);
         },
         opts.lifecycle,
         opts.lifecycle?.trackUnderlyingCallback,
       );
+      assertAdapterRegistrationLive(adapter);
       const answers = detachPolledAnswerBatch(polled);
       if (!answers) throw new Error("polled answer batch contains an accessor, sparse entry, proxy trap, or unsupported value");
       let batchBytes = 0;
@@ -6744,7 +6832,9 @@ export async function pollInbox(
         const answer = normalizePolledAnswer(rawAnswer);
         const answerKey = answer ? `${answer.run_id}\u0000${answer.id}` : null;
         if (!answer || (answerKey !== null && seen.has(answerKey))) continue;
+        assertAdapterRegistrationLive(adapter);
         const wakeOutcome = await deliverAnswerWake(root, answer, onAnswer, { ...opts, pinnedRoot: adapterPin });
+        assertAdapterRegistrationLive(adapter);
         if (wakeOutcome !== "retryable" && answerKey !== null) {
           seen.add(answerKey);
           while (seen.size > MAX_SEEN_ANSWERS_PER_ROOT) {

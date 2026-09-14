@@ -225,6 +225,51 @@ test("registry: idempotent activations retain independent custom adapter leases 
 });
 
 
+test("registry: constructed custom adapter methods fail closed after lease close and replacement", async () => {
+  const root = mkdtempSync(join(tmpdir(), "adapter-constructed-revoked-"));
+  let owner: FullstackRuntime | undefined;
+  let replacement: FullstackRuntime | undefined;
+  try {
+    const runtime = runtimeFor(root);
+    owner = openFullstackRuntimeTest(root, "registry-security-custom-owner", fullstackTestOwner(root), true, false);
+    const kind = "security-constructed-revoked";
+    let sends = 0;
+    let polls = 0;
+    const factory = (): ReturnType<EscalationAdapterFactory> => ({
+      kind,
+      send: async () => { sends += 1; return { sent: true }; },
+      sendWithIdempotency: async () => { sends += 1; return { sent: true }; },
+      cancel: async () => undefined,
+      pollOnce: async () => { polls += 1; return []; },
+    });
+    registerWithRuntime(owner!, root, kind, factory, { ...capabilities, canReceiveInbound: true });
+    const old = createEscalationAdapter({ adapter: kind }, root, undefined, runtime.access);
+    assert.ok(old);
+    await old.send({} as Parameters<typeof old.send>[0]);
+    await old.pollOnce?.();
+    assert.equal(sends, 1);
+    assert.equal(polls, 1);
+
+    owner.close();
+    assert.throws(() => old.send({} as Parameters<typeof old.send>[0]), /custom adapter registration is no longer live/);
+    assert.throws(() => old.pollOnce!(), /custom adapter registration is no longer live/);
+    assert.equal(sends, 1, "revoked direct send never reaches the old transport");
+    assert.equal(polls, 1, "revoked direct poll never reaches the old transport");
+
+    replacement = openFullstackRuntimeTest(root, "registry-security-custom-replacement", fullstackTestOwner(root), true, false);
+    registerWithRuntime(replacement, root, kind, factory, { ...capabilities, canReceiveInbound: true });
+    const fresh = createEscalationAdapter({ adapter: kind }, root, undefined, runtime.access);
+    assert.ok(fresh);
+    assert.throws(() => old.send({} as Parameters<typeof old.send>[0]), /custom adapter registration is no longer live/);
+    await fresh.send({} as Parameters<typeof fresh.send>[0]);
+    assert.equal(sends, 2, "the replacement registration constructs a usable fresh adapter");
+  } finally {
+    replacement?.close();
+    owner?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("registry: callback-cap rejection leaves no partially inserted custom adapter lease", () => {
   const root = mkdtempSync(join(tmpdir(), "adapter-undo-cap-"));
   try {

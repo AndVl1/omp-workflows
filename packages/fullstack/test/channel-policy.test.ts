@@ -37,11 +37,12 @@ import {
   type CtoDelivery,
 } from "../src/adapters/registry.js";
 import { MockEscalationAdapter } from "../src/adapters/mock.js";
-import { beginRegistryRegistration, commitRegistryRegistration, rollbackRegistryRegistration } from "@andvl1/omp-workflows-core/registry";
+import { beginRegistryRegistration, closeWorkflowActivation, commitRegistryRegistration, openWorkflowActivation, rollbackRegistryRegistration } from "@andvl1/omp-workflows-core/registry";
 
 import { createAskRedirectGate } from "../src/messenger-channel.js";
 import { openFullstackRuntimeTest } from "./runtime-access-fixture.js";
-import { resolveSessionCwd } from "../src/index.js";
+import { fullstackOwnerForCwd, resolveSessionCwd } from "../src/index.js";
+import { writeFullstackActivationMarker } from "../src/activation-marker.js";
 import { bindAuthenticatedAdapterRouting } from "./routing-fixture.js";
 
 type FullstackRuntime = ReturnType<typeof openFullstackRuntimeTest>;
@@ -356,6 +357,84 @@ test("policy: registered custom RW capabilities build the primary and poll inbou
       await stop();
     }
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("policy: constructed custom dispatcher is fenced after lease close and replacement", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pol-custom-revoked-dispatcher-"));
+  let owner: Extract<ReturnType<typeof openWorkflowActivation>, { ok: true }> | undefined;
+  let replacement: Extract<ReturnType<typeof openWorkflowActivation>, { ok: true }> | undefined;
+  let stop: Awaited<ReturnType<typeof startChannelDispatcher>> | undefined;
+  try {
+    writeFullstackActivationMarker(root);
+    const openedOwner = openWorkflowActivation(root, ["workflow_registration"], fullstackOwnerForCwd(root));
+    if (!openedOwner.ok) throw new Error(openedOwner.code + ": " + openedOwner.error);
+    owner = openedOwner;
+    const runtime = runtimeFor(root);
+    const kind = "custom-revoked-dispatcher";
+    let polls = 0;
+    let sends = 0;
+    let wakes = 0;
+    let inbound: ((message: unknown) => void | Promise<void>) | undefined;
+    let resolveFirstPoll!: () => void;
+    const firstPoll = new Promise<void>((resolve) => { resolveFirstPoll = resolve; });
+    const registration = beginRegistryRegistration(owner!.registry_context, root, ["escalation_adapters"]);
+    if (!registration.ok) throw new Error(registration.code + ": " + registration.error);
+    try {
+      registerEscalationAdapterRaw(registration.token, kind, () => ({
+        kind,
+        send: async () => { sends += 1; return { sent: true }; },
+        sendWithIdempotency: async () => { sends += 1; return { sent: true }; },
+        cancel: async () => undefined,
+        pollOnce: async () => { polls += 1; resolveFirstPoll(); return []; },
+        setPlainMessageHandler: (handler) => { inbound = handler; },
+      }), { canReceiveInbound: true, canSend: true, canSendWithIdempotency: true });
+      commitRegistryRegistration(registration.token);
+    } catch (error) {
+      try { rollbackRegistryRegistration(registration.token); } catch { /* preserve registration failure */ }
+      throw error;
+    }
+    withConfig(root, { channels: [{ id: "control", adapter: kind, direction: "read-write", primary: true }] });
+    const set = createChannelSet(root);
+    assert.ok(set.primary);
+    stop = startChannelDispatcher(root, set, 10_000, { onTask: () => { wakes += 1; } });
+    await firstPoll;
+    assert.equal(polls, 1, "the constructed adapter polls while its registration lease is live");
+    assert.ok(inbound);
+    closeWorkflowActivation(owner!);
+    owner = undefined;
+    assert.throws(() => inbound!({ id: "revoked-task", text: "ignored", at: new Date().toISOString() }), /custom adapter registration is no longer live/);
+    assert.equal(wakes, 0, "a revoked custom callback cannot wake the CTO");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(sends, 0, "revoked dispatcher never sends through the stale adapter");
+
+    const openedReplacement = openWorkflowActivation(root, ["workflow_registration"], fullstackOwnerForCwd(root));
+    if (!openedReplacement.ok) throw new Error(openedReplacement.code + ": " + openedReplacement.error);
+    replacement = openedReplacement;
+    const replacementRegistration = beginRegistryRegistration(replacement!.registry_context, root, ["escalation_adapters"]);
+    if (!replacementRegistration.ok) throw new Error(replacementRegistration.code + ": " + replacementRegistration.error);
+    try {
+      registerEscalationAdapterRaw(replacementRegistration.token, kind, () => ({
+        kind,
+        send: async () => ({ sent: true }),
+        sendWithIdempotency: async () => ({ sent: true }),
+        cancel: async () => undefined,
+        pollOnce: async () => [],
+        setPlainMessageHandler: () => undefined,
+      }), { canReceiveInbound: true, canSend: true, canSendWithIdempotency: true });
+      commitRegistryRegistration(replacementRegistration.token);
+    } catch (error) {
+      try { rollbackRegistryRegistration(replacementRegistration.token); } catch { /* preserve replacement registration failure */ }
+      throw error;
+    }
+    const fresh = createChannelSet(root);
+    assert.equal(fresh.primary?.kind, kind, "replacement registration constructs a fresh primary");
+    await fresh.primary!.send({} as Parameters<NonNullable<typeof fresh.primary>["send"]>[0]);
+  } finally {
+    await stop?.();
+    if (replacement) closeWorkflowActivation(replacement);
+    if (owner) closeWorkflowActivation(owner);
     rmSync(root, { recursive: true, force: true });
   }
 });
