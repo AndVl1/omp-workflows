@@ -50,9 +50,9 @@ test("close remains local and does not mask marker revocation", () => {
     const runtime = openTestCtoRuntime(root, "main", "cto-runtime-lifecycle-revocation-test");
     runtime.access.close();
     runtime.access.close();
-    unlinkSync(join(root, ".omp-test-registry-marker"));
     const authority = ctoRuntimeSessionAuthorityForContext(runtime.registryContext);
     assert.ok(authority);
+    unlinkSync(join(root, ".omp-test-registry-marker"));
     const fresh = authority === null
       ? { ok: false as const, code: "runtime_access_invalid" as const }
       : openCtoRuntimeAccess(runtime.registryContext, authority, root);

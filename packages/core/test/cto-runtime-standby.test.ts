@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { CtoRuntimeAccessError } from "../src/cto/runtime-access.js";
 import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 import { CtoAuthorityUnavailableError, findActiveCtoRun } from "../src/commands/cto.js";
-import { CTO_RUN_DELIVERY_INDEX_FILE, ctoRuntimeRunInitialIdentityDigest, mintCtoRuntimeRunOrigin, newCtoState, readCtoState } from "../src/cto/state.js";
+import { CTO_RUN_DELIVERY_INDEX_FILE, ctoRuntimeRunInitialIdentityDigest, newCtoState, readCtoState } from "../src/cto/state.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 
 const MARKER = '{"schema_version":1,"bundle_id":"@andvl1/omp-workflows-fullstack","entrypoint":"dist/index.js"}\n';
@@ -44,6 +44,7 @@ test("ensureStandbyRun reuses the active standby and serializes concurrent calle
       Promise.resolve().then(() => access.ensureStandbyRun()),
     ]);
     assert.deepEqual(concurrent, [first, first, first]);
+    runtime.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -72,7 +73,12 @@ test("ensureStandbyRun rolls back candidate directories and rejects a swapped ro
     }
     const ctoRoot = join(root, ".work-state", "cto");
     const leftovers = readdirSync(ctoRoot, { withFileTypes: true }).filter((entry) => entry.name.startsWith("standby-") && entry.isDirectory());
-    assert.deepEqual(leftovers, []);
+    assert.equal(leftovers.length, 1, "failed publication retains only the authenticated origin evidence for recovery");
+    const orphanDirectory = join(ctoRoot, leftovers[0]!.name);
+    assert.equal(existsSync(join(orphanDirectory, ".runtime-origin-proof.json")), true);
+    assert.equal(existsSync(join(orphanDirectory, "state.json")), false);
+    assert.equal(existsSync(join(orphanDirectory, "inbox")), false);
+    runtime.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -90,6 +96,7 @@ test("ensureStandbyRun rolls back candidate directories and rejects a swapped ro
       (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "activation_revoked",
     );
     assert.equal(existsSync(join(oldRoot, ".work-state", "cto")), false);
+    runtime.close();
   } finally {
     rmSync(swappedRoot, { recursive: true, force: true });
     rmSync(oldRoot, { recursive: true, force: true });
@@ -109,16 +116,17 @@ test("ensureStandbyRun rejects marker removal and cannot be used after revocatio
       () => access.ensureStandbyRun(),
       (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "activation_revoked",
     );
+    runtime.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 
-test("ensureStandbyRun recovers one authenticated orphan and rejects multiple without mutation", () => {
+test("ensureStandbyRun recovers one authenticated orphan and leaves multiple active runs unchanged", () => {
   const root = makeProject();
   try {
-    const { runtime, access } = openAccess(root);
+    const seed = openAccess(root);
     const createOrphan = (runId: string) => {
       const candidate = newCtoState({
         id: runId,
@@ -129,38 +137,50 @@ test("ensureStandbyRun recovers one authenticated orphan and rejects multiple wi
         standby: true,
       });
       candidate.pause = { kind: "none", reason: "standby" };
-      const pinned = PinnedProjectRoot.open(root);
-      assert.ok(pinned);
-      try {
-        assert.equal(mintCtoRuntimeRunOrigin(pinned, candidate, "main-session", "runtime-access", ctoRuntimeRunInitialIdentityDigest(candidate)), true);
-      } finally { pinned.close(); }
+      const created = seed.access.createRun(candidate, {
+        source_id: "runtime-access",
+        initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(candidate),
+      });
+      assert.equal(created.id, runId);
     };
     createOrphan("orphan-one");
-    const recovered = access.ensureStandbyRun();
-    assert.equal(recovered, "orphan-one");
-    assert.equal(readCtoState(recovered, root)?.standby, true);
-    assert.equal(existsSync(join(root, ".work-state", "cto", recovered, ".runtime-state-proof.json")), true);
-    runtime.close();
+    seed.runtime.close();
+
+    const consumer = openAccess(root);
+    try {
+      const recovered = consumer.access.ensureStandbyRun();
+      assert.equal(recovered, "orphan-one");
+      assert.equal(readCtoState(recovered, root)?.standby, true);
+      assert.equal(existsSync(join(root, ".work-state", "cto", recovered, ".runtime-state-proof.json")), true);
+    } finally {
+      consumer.runtime.close();
+    }
   } finally { rmSync(root, { recursive: true, force: true }); }
 
   const multiRoot = makeProject();
   try {
-    const { runtime, access } = openAccess(multiRoot);
+    const seed = openAccess(multiRoot);
     const createOrphan = (runId: string) => {
       const candidate = newCtoState({ id: runId, task: "standby — awaiting inbox tasks", branch: "", autonomous: true, plan: { id: runId, task: "standby — awaiting inbox tasks", teams: [], created_at: new Date().toISOString() }, standby: true });
       candidate.pause = { kind: "none", reason: "standby" };
-      const pinned = PinnedProjectRoot.open(multiRoot);
-      assert.ok(pinned);
-      try { assert.equal(mintCtoRuntimeRunOrigin(pinned, candidate, "main-session", "runtime-access", ctoRuntimeRunInitialIdentityDigest(candidate)), true); } finally { pinned.close(); }
+      const created = seed.access.createRun(candidate, { source_id: "runtime-access", initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(candidate) });
+      assert.equal(created.id, runId);
     };
     createOrphan("orphan-a");
     createOrphan("orphan-b");
-    const ctoRoot = join(multiRoot, ".work-state", "cto");
-    const before = readdirSync(ctoRoot).sort();
-    assert.throws(() => access.ensureStandbyRun(), (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "runtime_access_invalid" && error.message.includes("multiple orphan CTO standby origins"));
-    assert.deepEqual(readdirSync(ctoRoot).sort(), before);
-    assert.equal(existsSync(join(ctoRoot, CTO_RUN_DELIVERY_INDEX_FILE)), false);
-    runtime.close();
+    seed.runtime.close();
+
+    const consumer = openAccess(multiRoot);
+    try {
+      const ctoRoot = join(multiRoot, ".work-state", "cto");
+      const before = readdirSync(ctoRoot).sort();
+      const beforeIndex = readFileSync(join(ctoRoot, CTO_RUN_DELIVERY_INDEX_FILE));
+      assert.equal(consumer.access.ensureStandbyRun(), "orphan-b");
+      assert.deepEqual(readdirSync(ctoRoot).sort(), before);
+      assert.deepEqual(readFileSync(join(ctoRoot, CTO_RUN_DELIVERY_INDEX_FILE)), beforeIndex);
+    } finally {
+      consumer.runtime.close();
+    }
   } finally { rmSync(multiRoot, { recursive: true, force: true }); }
 });
 

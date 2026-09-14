@@ -21,7 +21,6 @@ import {
   classifyCtoIntent,
 } from "@andvl1/omp-workflows-core";
 import { MAX_CTO_SPECIFICATION_AGGREGATE_BYTES, MAX_CTO_SPECIFICATION_REQUESTS } from "../src/cto/types.js";
-import { parseEnvelope as parseCtoEnvelopeSource, parseCtoSpecificationExecutionSelections as parseCtoSpecificationExecutionSelectionsSource } from "../src/commands/cto.js";
 
 const TEAMS_JSON = [
   {
@@ -147,12 +146,12 @@ test("cto-cmd: issue metadata rejects zero, unsafe, and repeated identifiers bef
   const root = mkdtempSync(join(tmpdir(), "cto-core-issue-bounds-"));
   try {
     for (const args of ["Fix issue=#0", "Fix issue=#000000000000000", "Fix issue=#1234567890123456", "Fix issue=#9007199254740992", "Fix issue=#1 issue=#2"]) {
-      const parsed = parseCtoEnvelopeSource(args, root);
+      const parsed = parseCtoEnvelope(args, root);
       assert.equal(parsed.issue, null, `${args}: invalid issue must not become metadata`);
       assert.equal(parsed.specificationSelectionError?.code, "CTO_SPEC_ARGUMENT_INVALID", `${args}: invalid issue must surface a parser error`);
       assert.match(parsed.specificationSelectionError?.message ?? "", /issue metadata/u);
     }
-    const safe = parseCtoEnvelopeSource("Fix issue=#999999999999999", root);
+    const safe = parseCtoEnvelope("Fix issue=#999999999999999", root);
     assert.equal(safe.issue, 999999999999999);
     assert.equal(safe.specificationSelectionError, undefined);
     const prompt = ctoCommand({ args: "Fix issue=#0", cwd: root, ui: { notify: () => {} } });
@@ -197,23 +196,23 @@ test("cto-cmd: malformed and duplicate specification selector pairs are rejected
 });
 test("cto-cmd: selector parser bounds argv size, selector count, token work, and run-key safety", () => {
   const exact = Array.from({ length: MAX_CTO_SPECIFICATION_REQUESTS }, (_, index) => `--spec feature-${index} --run-key run-${index}`).join(" ");
-  const accepted = parseCtoSpecificationExecutionSelectionsSource(exact);
+  const accepted = parseCtoSpecificationExecutionSelections(exact);
   assert.equal(accepted.error, undefined);
   assert.equal(accepted.selections.length, MAX_CTO_SPECIFICATION_REQUESTS);
 
-  const overLimit = parseCtoSpecificationExecutionSelectionsSource(`${exact} --spec feature-over --run-key run-over`);
+  const overLimit = parseCtoSpecificationExecutionSelections(`${exact} --spec feature-over --run-key run-over`);
   assert.equal(overLimit.error?.code, "CTO_SPEC_ARGUMENT_INVALID");
   assert.match(overLimit.error?.message ?? "", /at most|64/u);
 
-  const unsafeRun = parseCtoSpecificationExecutionSelectionsSource("--spec feature-one --run-key ../escape");
+  const unsafeRun = parseCtoSpecificationExecutionSelections("--spec feature-one --run-key ../escape");
   assert.equal(unsafeRun.error?.code, "CTO_SPEC_ARGUMENT_INVALID");
   assert.match(unsafeRun.error?.message ?? "", /safe bounded run key/u);
 
-  const oversizedArgv = parseCtoSpecificationExecutionSelectionsSource("x".repeat(MAX_CTO_SPECIFICATION_AGGREGATE_BYTES + 1));
+  const oversizedArgv = parseCtoSpecificationExecutionSelections("x".repeat(MAX_CTO_SPECIFICATION_AGGREGATE_BYTES + 1));
   assert.equal(oversizedArgv.error?.code, "CTO_SPEC_ARGUMENT_INVALID");
   assert.match(oversizedArgv.error?.message ?? "", /bytes/u);
 
-  const tooManyTokens = parseCtoSpecificationExecutionSelectionsSource(Array.from({ length: 10_000 }, () => "task").join(" "));
+  const tooManyTokens = parseCtoSpecificationExecutionSelections(Array.from({ length: 10_000 }, () => "task").join(" "));
   assert.equal(tooManyTokens.error?.code, "CTO_SPEC_ARGUMENT_INVALID");
   assert.match(tooManyTokens.error?.message ?? "", /tokens/u);
 });
@@ -253,11 +252,16 @@ test("cto-cmd: intent gate makes preparation, execution, and ambiguous routes mu
     assert.match(preparationPrompt, /Never concatenate, recompute, move, or substitute a marker/u, "preparation prompt forbids model marker construction");
     assert.doesNotMatch(preparationPrompt, /slice=specification-preparation/u, "preparation prompt does not emit a non-authoritative literal slice marker");
     assert.match(preparationPrompt, /Mode: PREPARATION/u);
+    assert.match(
+      preparationPrompt,
+      /For each scheduled feature, revalidate its exact constitution binding with `ensure_project_constitution`/u,
+      "scheduled feature constitution revalidation stays on the preparation route",
+    );
     assert.ok(
       preparationPrompt.includes(
-        "`ensure_project_constitution` exactly with {\"feature_id\":\"<exact returned feature_id>\",\"run_key\":\"<exact returned feature_id run_key>\",\"origin_kind\":\"cto_preparation\",\"origin_run_key\":\"<exact returned feature_id run_key>\",\"origin_stage\":\"cto\"}",
+        'constitution_impact_assess` exactly with {"feature_id":"<exact returned feature_id>","run_key":"<exact returned feature_id run_key>"}',
       ),
-      "scheduled feature constitution revalidation must bind selector and origin_run_key to the same exact feature run",
+      "scheduled feature impact assessment binds the exact returned feature and run",
     );
     assert.match(
       preparationPrompt,
