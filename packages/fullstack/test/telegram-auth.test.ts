@@ -52,24 +52,30 @@ function answerPath(root: string, escId: string): string {
   return join(root, ".work-state", "cto", runId, "answers", fileName);
 }
 function withIndexedRun(root: string, runId: string): void {
-  const runtime = runtimeFor(root);
+  const fixture = runtimeFixtureFor(root);
+  const runtime = fixture.access;
   const state = newCtoState({
     id: runId,
     task: "telegram auth",
     branch: "main",
     autonomous: true,
-    owner_session: runtime.sessionId,
+    owner_session: fixture.sessionId,
     plan: { id: runId, task: "telegram auth", teams: [], created_at: new Date().toISOString() },
   });
   assert.ok(runtime.createRun(state, { source_id: `telegram-auth:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
   assert.equal(runtime.markDeliveryPending(runId, state.state_revision, "outbox"), true);
 }
 function migrateLegacy(adapter: TelegramEscalationAdapter, root: string, runId: string, chatId: string): void {
+  mkdirSync(join(root, ".omp"), { recursive: true });
+  writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "fixture-token", chatId } }));
   const pin = PinnedProjectRoot.open(root);
   assert.ok(pin, "migration fixture root is pinnable");
   try { adapter.migrateLegacyMappings(runId, chatId, pin); } finally { pin.close(); }
 }
 function withIndexedMapping(root: string, runId: string, escId: string, messageId: number, chatId = CONFIGURED_CHAT): void {
+  mkdirSync(join(root, ".omp"), { recursive: true });
+  const configPath = join(root, ".omp", "escalation.json");
+  if (!existsSync(configPath)) writeFileSync(configPath, JSON.stringify({ adapter: "telegram", telegram: { token: "fixture-token", chatId, allowedChatIds: [chatId, "999"] } }));
   if (!existsSync(join(root, ".work-state", "cto", runId, "state.json"))) withIndexedRun(root, runId);
   const adapter = telegramAdapter({ token: "fixture-token", chatId, cwd: root });
   const recordMapping = (adapter as unknown as {
@@ -379,6 +385,8 @@ test("mapping proof: separate sender and poller instances share the opaque autho
   const runId = "run-shared-map";
   const escId = `${runId}/team/check/1`;
   try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "fixture-token", chatId: CONFIGURED_CHAT } }));
     withIndexedRun(root, runId);
     let outbound: Record<string, unknown> | null = null;
     const sender = telegramAdapter({
@@ -924,6 +932,8 @@ test("mapping lookup: identical message IDs remain partitioned by Telegram chat"
   const root = mkdtempSync(join(tmpdir(), "tg-map-chat-partition-"));
   const runId = "run-chat-partition";
   try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "fixture-token", chatId: CONFIGURED_CHAT, allowedChatIds: [CONFIGURED_CHAT, "999"] } }));
     withIndexedMapping(root, runId, `${runId}/primary`, 88, CONFIGURED_CHAT);
     withIndexedMapping(root, runId, `${runId}/readonly`, 88, "999");
     const adapter = telegramAdapter({

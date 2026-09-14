@@ -99,6 +99,11 @@ export interface TelegramPlainMessage {
 
 export type TelegramUpdateCommitHook = (updateId: number, pinnedRoot?: PinnedProjectRoot) => void | Promise<void>;
 
+export type TelegramRuntimeAccess = Pick<CtoRuntimeAccessFacade,
+  "assertLive" | "resolveEscalationChannelSnapshot" | "readActiveDeliveryCandidates"
+  | "readCompletedDeliveryIndexPage" | "hasValidStateProof" | "readState"
+  | "readOutboxDeliveryObligations" | "currentOutboxDeliveryStatus">;
+
 export interface TelegramAdapterOptions {
   token: string;
   chatId: string;
@@ -134,8 +139,8 @@ export interface TelegramAdapterOptions {
    * rule still applies.
    */
   allowedSenderIds?: Array<string | number>;
-  /** Authenticated main-session runtime used for run-delivery authority. */
-  runtimeAccess?: CtoRuntimeAccessFacade;
+  /** Authenticated readonly runtime used for Telegram mapping authority. */
+  runtimeAccess?: TelegramRuntimeAccess;
   /** Opaque root/workflow_tools authority for Telegram mapping proofs. */
   proofAuthority: CtoRuntimeProofAuthority;
   /** Called after one bounded update is durably handled and before offset advancement. */
@@ -295,7 +300,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   private readonly legacyMappingMigration?: { tenant: string; chatId: string };
   private readonly allowedChatIds: string[];
   private readonly allowedSenderIds: string[];
-  private readonly runtimeAccess?: CtoRuntimeAccessFacade;
+  private readonly runtimeAccess?: TelegramRuntimeAccess;
   private readonly proofAuthority: CtoRuntimeProofAuthority;
   private onUpdateCommitted?: TelegramUpdateCommitHook;
   private onPlainMessage: TelegramAdapterOptions["onPlainMessage"];
@@ -1289,8 +1294,11 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     const targetConfigured = projections.some((projection) => {
       const direct = projection.chatId;
       const nested = projection.telegram;
-      const nestedChat = nested && typeof nested === "object" && !Array.isArray(nested) ? (nested as Record<string, unknown>).chatId : undefined;
-      return (typeof direct === "string" && direct === chatId) || (typeof nestedChat === "string" && nestedChat === chatId);
+      const nestedRecord = nested && typeof nested === "object" && !Array.isArray(nested) ? nested as Record<string, unknown> : null;
+      const nestedChat = nestedRecord?.chatId;
+      const allowed = nestedRecord?.allowedChatIds;
+      const allowlisted = Array.isArray(allowed) && allowed.some((value) => typeof value === "string" && value === chatId);
+      return (typeof direct === "string" && direct === chatId) || (typeof nestedChat === "string" && nestedChat === chatId) || allowlisted;
     });
     if (!targetConfigured) throw new TelegramActivationRevokedError("telegram channel target is not bound to the authenticated projection");
     return { projection_sha256: snapshot.config_sha256, channel: "telegram", target: chatId };
@@ -1679,7 +1687,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
           const snapshot = readTelegramMapSnapshot(queue, entry.run_id, chatId, budget);
           this.runtimeAccess!.assertLive();
           if (!pinnedRoot.isStable()) return false;
-          const route = this.mappingRouteBinding();
+          const route = this.mappingRouteBinding(chatId);
           for (const mapping of snapshot.records) {
             if (!isSafeEscalationId(mapping.escId) || telegramMessageKey(mapping.chatId, mapping.messageId) !== messageKey) continue;
             if (!telegramMappingProofMatches(mapping, pinnedRoot, route, this.proofAuthority)) {
@@ -1814,7 +1822,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
         messageId,
         chatId,
         root: { canonical_path: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino },
-        route: this.mappingRouteBinding(),
+        route: this.mappingRouteBinding(chatId),
         delivery: {
           payload_digest: payloadDigest,
           delivery_digest: telegramDeliveryDigest(payloadDigest, mappingReceipt),
