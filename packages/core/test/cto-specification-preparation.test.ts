@@ -30,7 +30,7 @@ import { deriveCtoSpecificationPreparationTeams } from "../src/commands/cto.js";
 import type { TeamDef } from "../src/cto/types.js";
 import { canonicalJson, digestOf, sha256Hex, validateNativePhase, type NativePhaseValidationInput } from "../src/specification/validation.js";
 import { canonicalHandoffDigest } from "../src/specification/handoff.js";
-import { resolveState, updateStateAtomically, writeState } from "../src/engine/state.js";
+import { resolveState, setStateTransactionTestHooks, updateStateAtomically, writeState } from "../src/engine/state.js";
 import {
   readCtoSpecificationDecisions,
   recordCtoSpecificationDecisions,
@@ -784,6 +784,33 @@ async function issueCanonicalDecision(
   return decision(featureId, phase, value, trustedProof.answer_id, trustedProof);
 }
 
+function armCanonicalPreparationCheckpoint(root: string, featureId: string, phase: Phase): { state: TeamState; input: Record<string, unknown> } {
+  const issued = armFeaturePhase(root, featureId, phase);
+  const workspace = resolveFeatureWorkspace(root, { feature_id: featureId, run_key: featureId + "-run" });
+  assert.equal(workspace.ok, true, workspace.ok ? "" : workspace.error);
+  const selected = resolveState(root, undefined, { feature_id: featureId, run_key: featureId + "-run" });
+  assert.ok(selected.state && selected.statePath, "selected Ask fixture must resolve exact feature/run state");
+  if (!selected.state) throw new Error("selected Ask fixture state unavailable");
+  return {
+    state: selected.state,
+    input: {
+      feature_id: featureId,
+      advance_token: issued.advance_token,
+      capability_id: issued.capability_id,
+      run_key: selected.state.run_key!,
+      branch: selected.state.branch,
+      workflow: SHIPPED_PREPARATION_PROFILE.name,
+      profile_hash: selected.state.profile_hash!,
+      stage_cursor: phase,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      checkpoint: SPECIFICATION_CHECKPOINT,
+      checkpoint_id: SPECIFICATION_CHECKPOINT,
+      checkpoint_kind: "specification_phase_approval",
+      loop_iteration: 1,
+    },
+  };
+}
+
 /** Issue the same canonical answer and typed decision that generic workflow tools persist. */
 async function issueGenericPhaseDecision(
   root: string,
@@ -1491,211 +1518,147 @@ describe("CTO specification preparation decisions", () => {
     const root = freshProject();
     const featureId = "feature-state-conflict";
     try {
-      const pending = await issueCanonicalDecision(root, featureId, "specify", "approve_continue", "answer-state-conflict");
+      const armed = armCanonicalPreparationCheckpoint(root, featureId, "specify");
       let mutated = false;
-      setCtoSpecificationDecisionFailureInjector((point) => {
-        if (point !== "before_feature_state_write" || mutated) return;
-        mutated = true;
-        const updated = updateStateAtomically<null>(
-          root,
-          (snapshot) => snapshot.state
-            ? { op: "commit", state: { ...snapshot.state, task: "newer canonical state" }, value: null }
-            : { op: "fail", code: "state_missing", error: "state disappeared during conflict setup" },
-          { selector: { feature_id: featureId, run_key: `${featureId}-run` } },
-        );
-        assert.equal(updated.ok, true, "the deterministic conflict must mutate canonical state");
-      });
-      assert.throws(
-        () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [pending] }),
-        /CTO_SPEC_DECISION_ABORTED|CTO_SPEC_STATE_CONFLICT|CTO_SPEC_DECISION_COMMIT_FAILED/,
-      );
-      setCtoSpecificationDecisionFailureInjector(null);
+      setStateTransactionTestHooks({
+        beforeCas: ({ sourcePath }) => {
+          if (mutated) return;
+          mutated = true;
+          const state = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+          state.updated_at = new Date().toISOString();
+          const temporary = sourcePath + ".foreign";
+          writeFileSync(temporary, JSON.stringify(state, null, 2) + "\n", "utf8");
+          renameSync(temporary, sourcePath);
+        },
+      }, root);
+      const rejected = await mountedPreparationCheckpointAsk(root, armed.input, "approve_continue");
+      setStateTransactionTestHooks(null, root);
+      assert.equal(rejected.ok, false, "the selected Ask must reject a state CAS race");
+      assert.match(String(rejected.error), /state moved|state transaction|checkpoint_failed|checkpoint_invalid/);
 
       const selected = resolveState(root, undefined, { feature_id: featureId, run_key: `${featureId}-run` });
-      assert.equal(selected.state?.task, "newer canonical state", "the newer canonical state must survive the rejected commit");
-      const answer = selected.state?.trusted_checkpoint_answers?.find((candidate) => candidate.answer_id === pending.trusted_answer_ref);
-      assert.ok(answer && !answer.consumed_at, "a failed state CAS must not consume the trusted proof");
-      assert.deepEqual(readCtoSpecificationDecisions(root, CTO_RUN_ID), [], "an aborted staged decision must not be readable");
-
-      const transactionsDir = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decision-transactions", "history");
-      const transactionFiles = readdirSync(transactionsDir).filter((entry) => entry.endsWith(".json"));
-      assert.equal(transactionFiles.length, 1, "the terminal WAL must be retained in history for audit");
-      const transaction = JSON.parse(readFileSync(join(transactionsDir, transactionFiles[0]!), "utf8")) as Record<string, unknown>;
-      assert.equal(transaction.status, "aborted");
-      assert.equal(transaction.abort_reason, "state_conflict");
-      assert.equal(typeof transaction.aborted_at, "string");
-      const before = transaction.decision_before as Record<string, unknown>;
-      assert.equal(before.disposition, "absent");
-      assert.equal(before.content, null);
-
-      const fresh = await recordCanonicalDecision(root, featureId, "specify", "approve_continue", "answer-state-conflict-fresh");
-      assert.equal(fresh.decisions.length, 1, "a fresh authoritative answer must proceed after abort recovery");
-      assert.equal(fresh.decisions[0]?.trusted_answer_ref, fresh.decisions[0]?.trusted_proof.answer_id);
+      assert.notEqual(selected.state?.updated_at, armed.state.updated_at, "the newer canonical state must survive the rejected Ask");
+      const fresh = await issueCanonicalDecision(root, featureId, "specify", "approve_continue", "answer-state-conflict-fresh");
+      const recorded = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [fresh] });
+      assert.equal(recorded.decisions.length, 1, "a fresh authoritative answer must proceed after the rejected Ask");
     } finally {
-      setCtoSpecificationDecisionFailureInjector(null);
+      setStateTransactionTestHooks(null, root);
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("compensates an earlier feature after a later CAS conflict without losing unrelated state", async () => {
+  test("selected Ask preserves an earlier feature after a later CAS conflict without losing unrelated state", async () => {
     const root = freshProject();
     const firstFeature = "feature-batch-conflict-a";
     const secondFeature = "feature-batch-conflict-b";
     try {
       const first = await issueCanonicalDecision(root, firstFeature, "specify", "approve_continue", "answer-batch-conflict-a");
-      const second = await issueCanonicalDecision(root, secondFeature, "specify", "request_changes", "answer-batch-conflict-b");
-      const seeded = updateStateAtomically<null>(
-        root,
-        (snapshot) => snapshot.state
-          ? { op: "commit", state: { ...snapshot.state, task: "unrelated concurrent update" }, value: null }
-          : { op: "fail", code: "state_missing", error: "earlier feature disappeared" },
-        { selector: { feature_id: firstFeature, run_key: `${firstFeature}-run` } },
-      );
-      assert.equal(seeded.ok, true, "the unrelated source field must be established before staging");
-      let stateWrites = 0;
-      setCtoSpecificationDecisionFailureInjector((point) => {
-        if (point !== "before_feature_state_write") return;
-        stateWrites += 1;
-        if (stateWrites !== 2) return;
-        const conflict = updateStateAtomically<null>(
-          root,
-          (snapshot) => snapshot.state
-            ? { op: "commit", state: { ...snapshot.state, task: "later feature conflict" }, value: null }
-            : { op: "fail", code: "state_missing", error: "later feature disappeared" },
-          { selector: { feature_id: secondFeature, run_key: `${secondFeature}-run` } },
-        );
-        assert.equal(conflict.ok, true, "the deterministic race must move the later feature before its CAS");
-      });
+      const firstRecorded = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [first] });
+      assert.equal(firstRecorded.decisions.length, 1);
 
-      assert.throws(
-        () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [first, second] }),
-        /CTO_SPEC_DECISION_ABORTED|CTO_SPEC_STATE_CONFLICT|CTO_SPEC_DECISION_COMMIT_FAILED/,
-      );
-      setCtoSpecificationDecisionFailureInjector(null);
+      const second = armCanonicalPreparationCheckpoint(root, secondFeature, "specify");
+      let mutated = false;
+      setStateTransactionTestHooks({
+        beforeCas: ({ sourcePath }) => {
+          if (mutated) return;
+          mutated = true;
+          const state = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+          state.updated_at = new Date().toISOString();
+          const temporary = sourcePath + ".foreign";
+          writeFileSync(temporary, JSON.stringify(state, null, 2) + "\n", "utf8");
+          renameSync(temporary, sourcePath);
+        },
+      }, root);
+      const rejected = await mountedPreparationCheckpointAsk(root, second.input, "request_changes", `Review feedback for ${secondFeature}/specify.`);
+      setStateTransactionTestHooks(null, root);
+      assert.equal(rejected.ok, false, "the later selected Ask must reject its state CAS race");
+      assert.match(String(rejected.error), /state moved|state transaction|checkpoint_failed|checkpoint_invalid/);
 
       const firstState = resolveState(root, undefined, { feature_id: firstFeature, run_key: `${firstFeature}-run` });
+      assert.equal(firstState.state?.specification?.phases.find((phase) => phase.phase === "specify")?.status, "approved", "the earlier feature must remain approved");
       const secondState = resolveState(root, undefined, { feature_id: secondFeature, run_key: `${secondFeature}-run` });
-      assert.equal(firstState.state?.task, "unrelated concurrent update", "compensation must preserve unrelated changes");
-      for (const [selected, entry] of [[firstState, first], [secondState, second] ] as const) {
-        const answer = selected.state?.trusted_checkpoint_answers?.find((candidate) => candidate.answer_id === entry.trusted_answer_ref);
-        assert.ok(answer && !answer.consumed_at, `${entry.feature_id} proof must be unconsumed after exact owned compensation`);
-      }
-      assert.deepEqual(readCtoSpecificationDecisions(root, CTO_RUN_ID), [], "aborted batch decisions must not be exposed");
+      assert.notEqual(secondState.state?.updated_at, second.state.updated_at, "the unrelated newer state must survive the rejected Ask");
 
-      const freshFirst = await issueCanonicalDecision(root, firstFeature, "specify", "approve_continue", "answer-batch-conflict-a-fresh");
       const freshSecond = await issueCanonicalDecision(root, secondFeature, "specify", "request_changes", "answer-batch-conflict-b-fresh");
-      const retry = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [freshFirst, freshSecond] });
-      assert.deepEqual(
-        retry.decisions.map(({ feature_id }) => feature_id),
-        [firstFeature, secondFeature],
-      );
-      assert.ok(retry.decisions.every(({ trusted_answer_ref, trusted_proof }) => trusted_answer_ref === trusted_proof.answer_id));
+      const retry = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [freshSecond] });
+      assert.deepEqual(retry.decisions.map(({ feature_id }) => feature_id), [firstFeature, secondFeature]);
     } finally {
-      setCtoSpecificationDecisionFailureInjector(null);
+      setStateTransactionTestHooks(null, root);
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("decision rollback preserves a same-byte replacement inode", async () => {
+  test("selected Ask rejects a replaced state inode without overwriting the replacement", async () => {
     const root = freshProject();
     const featureId = "feature-decision-same-byte-replacement";
-    const decisionPath = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decisions.json");
     try {
-      const pending = await issueCanonicalDecision(root, featureId, "specify", "approve_continue", "answer-decision-same-byte-replacement");
+      const armed = armCanonicalPreparationCheckpoint(root, featureId, "specify");
       let replaced = false;
       let replacementInode: number | null = null;
-      setCtoSpecificationDecisionFailureInjector((point) => {
-        if (point === "after_decisions_write" && !replaced) {
+      let replacementBytes: Buffer | null = null;
+      setStateTransactionTestHooks({
+        beforeCas: ({ sourcePath }) => {
+          if (replaced) return;
           replaced = true;
-          const bytes = readFileSync(decisionPath);
-          const temporary = decisionPath + ".foreign";
-          writeFileSync(temporary, bytes);
-          renameSync(temporary, decisionPath);
-          replacementInode = statSync(decisionPath).ino;
-        }
-        if (point === "before_feature_state_write" && replaced) {
-          const updated = updateStateAtomically<null>(
-            root,
-            (snapshot) => snapshot.state
-              ? { op: "commit", state: { ...snapshot.state, task: "foreign state winner" }, value: null }
-              : { op: "fail", code: "state_missing", error: "state disappeared" },
-            { selector: { feature_id: featureId, run_key: `${featureId}-run` } },
-          );
-          assert.equal(updated.ok, true);
-        }
-      });
-      assert.throws(
-        () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [pending] }),
-        /CTO_SPEC_DECISION_ABORTED|CTO_SPEC_DECISION_COMMIT_FAILED/,
-      );
-      setCtoSpecificationDecisionFailureInjector(null);
-      assert.equal(statSync(decisionPath).ino, replacementInode, "the replacement inode must remain authoritative");
-      assert.deepEqual(readCtoSpecificationDecisions(root, CTO_RUN_ID), [pending], "the same-byte concurrent winner remains the readable artifact");
-      const historyDir = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decision-transactions", "history");
-      const historyEntries = readdirSync(historyDir).filter((entry) => entry.endsWith(".json"));
-      assert.equal(historyEntries.length, 1);
-      const terminal = JSON.parse(readFileSync(join(historyDir, historyEntries[0]!), "utf8")) as Record<string, unknown>;
-      assert.equal(terminal.status, "aborted");
-      assert.equal(terminal.terminal_disposition, "preserved");
-      const selected = resolveState(root, undefined, { feature_id: featureId, run_key: `${featureId}-run` });
-      assert.equal(selected.state?.task, "foreign state winner");
+          const state = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+          state.updated_at = new Date().toISOString();
+          const temporary = sourcePath + ".foreign";
+          writeFileSync(temporary, JSON.stringify(state, null, 2) + "\n", "utf8");
+          renameSync(temporary, sourcePath);
+          replacementInode = statSync(sourcePath).ino;
+          replacementBytes = readFileSync(sourcePath);
+        },
+      }, root);
+      const rejected = await mountedPreparationCheckpointAsk(root, armed.input, "approve_continue");
+      setStateTransactionTestHooks(null, root);
+      assert.equal(rejected.ok, false, "the selected Ask must reject a replaced state inode");
+      assert.match(String(rejected.error), /state moved|state transaction|checkpoint_failed|checkpoint_invalid/);
+      assert.equal(statSync(join(root, ".work-state", "features", featureId, "state.json")).ino, replacementInode, "the replacement inode must remain authoritative");
+      assert.deepEqual(readFileSync(join(root, ".work-state", "features", featureId, "state.json")), replacementBytes, "the replacement bytes must remain untouched");
+      assert.deepEqual(readCtoSpecificationDecisions(root, CTO_RUN_ID), [], "a rejected selected Ask must not publish a CTO decision WAL");
     } finally {
-      setCtoSpecificationDecisionFailureInjector(null);
+      setStateTransactionTestHooks(null, root);
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("state rollback preserves a same-byte replacement inode and retains the WAL", async () => {
+  test("selected Ask preserves an earlier state after a later replacement race", async () => {
     const root = freshProject();
     const firstFeature = "feature-state-same-byte-replacement-a";
     const secondFeature = "feature-state-same-byte-replacement-b";
     try {
       const first = await issueCanonicalDecision(root, firstFeature, "specify", "approve_continue", "answer-state-same-byte-replacement-a");
-      const second = await issueCanonicalDecision(root, secondFeature, "specify", "request_changes", "answer-state-same-byte-replacement-b");
-      let firstPublished = false;
+      const firstStateBefore = resolveState(root, undefined, { feature_id: firstFeature, run_key: `${firstFeature}-run` });
+      assert.equal(firstStateBefore.state?.specification?.phases.find((phase) => phase.phase === "specify")?.status, "approved");
+      const second = armCanonicalPreparationCheckpoint(root, secondFeature, "specify");
+      let replaced = false;
       let replacementInode: number | null = null;
       let replacementBytes: Buffer | null = null;
-      let secondWrite = false;
-      setCtoSpecificationDecisionFailureInjector((point) => {
-        if (point === "after_feature_state_write" && !firstPublished) {
-          firstPublished = true;
-          const statePath = join(root, ".work-state", "features", firstFeature, "state.json");
-          const temporary = statePath + ".foreign";
-          writeFileSync(temporary, readFileSync(statePath));
-          renameSync(temporary, statePath);
-          replacementInode = statSync(statePath).ino;
-          replacementBytes = readFileSync(statePath);
-        }
-        if (point === "before_feature_state_write") {
-          if (!firstPublished || secondWrite) return;
-          secondWrite = true;
-          const updated = updateStateAtomically<null>(
-            root,
-            (snapshot) => snapshot.state
-              ? { op: "commit", state: { ...snapshot.state, task: "later state winner" }, value: null }
-              : { op: "fail", code: "state_missing", error: "state disappeared" },
-            { selector: { feature_id: secondFeature, run_key: `${secondFeature}-run` } },
-          );
-          assert.equal(updated.ok, true);
-        }
-      });
-      const firstPath = join(root, ".work-state", "features", firstFeature, "state.json");
-      assert.throws(
-        () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [first, second] }),
-        /CTO_SPEC_DECISION_QUARANTINED|CTO_SPEC_DECISION_COMMIT_FAILED/,
-      );
-      setCtoSpecificationDecisionFailureInjector(null);
-      assert.equal(statSync(firstPath).ino, replacementInode, "the concurrent state inode must remain");
-      assert.deepEqual(readFileSync(firstPath), replacementBytes, "the concurrent state bytes must remain");
-      const pendingDir = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decision-transactions");
-      const historyDir = join(pendingDir, "history");
-      const historyEntries = readdirSync(historyDir).filter((entry) => entry.endsWith(".json"));
-      assert.equal(historyEntries.length, 1, "descriptor mismatch must move the WAL to durable history");
-      const terminal = JSON.parse(readFileSync(join(historyDir, historyEntries[0]!), "utf8")) as Record<string, unknown>;
-      assert.equal(terminal.status, "quarantined");
-      assert.deepEqual(readCtoSpecificationDecisions(root, CTO_RUN_ID), [], "quarantined decisions remain unpublished");
+      setStateTransactionTestHooks({
+        beforeCas: ({ sourcePath }) => {
+          if (replaced) return;
+          replaced = true;
+          const state = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+          state.updated_at = new Date().toISOString();
+          const temporary = sourcePath + ".foreign";
+          writeFileSync(temporary, JSON.stringify(state, null, 2) + "\n", "utf8");
+          renameSync(temporary, sourcePath);
+          replacementInode = statSync(sourcePath).ino;
+          replacementBytes = readFileSync(sourcePath);
+        },
+      }, root);
+      const rejected = await mountedPreparationCheckpointAsk(root, second.input, "request_changes", `Review feedback for ${secondFeature}/specify.`);
+      setStateTransactionTestHooks(null, root);
+      assert.equal(rejected.ok, false, "the later selected Ask must reject its replacement race");
+      assert.match(String(rejected.error), /state moved|state transaction|checkpoint_failed|checkpoint_invalid/);
+      const firstStateAfter = resolveState(root, undefined, { feature_id: firstFeature, run_key: `${firstFeature}-run` });
+      assert.equal(firstStateAfter.state?.specification?.phases.find((phase) => phase.phase === "specify")?.status, "approved", "the earlier feature must remain approved");
+      const secondPath = join(root, ".work-state", "features", secondFeature, "state.json");
+      assert.equal(statSync(secondPath).ino, replacementInode, "the later replacement inode must remain authoritative");
+      assert.deepEqual(readFileSync(secondPath), replacementBytes, "the later replacement bytes must remain untouched");
+      assert.equal(first.trusted_answer_ref, first.trusted_proof.answer_id);
     } finally {
-      setCtoSpecificationDecisionFailureInjector(null);
+      setStateTransactionTestHooks(null, root);
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -2070,104 +2033,68 @@ describe("CTO specification preparation decisions", () => {
     }
   });
 
-  test("recovers an abort idempotently across every abort write boundary", async () => {
-    const abortFailurePoints = [
-      "before_abort",
-      "after_abort_prepare",
-      "before_abort_artifact_restore",
-      "after_abort_artifact_restore",
-      "after_abort",
-    ] as const;
-    for (const failurePoint of abortFailurePoints) {
-      const root = freshProject();
-      const featureId = `feature-abort-${failurePoint}`;
-      try {
-        const pending = await issueCanonicalDecision(root, featureId, "specify", "approve_continue", `answer-abort-${failurePoint}`);
-        let mutated = false;
-        let injected = false;
-        setCtoSpecificationDecisionFailureInjector((point) => {
-          if (point === "before_feature_state_write" && !mutated) {
-            mutated = true;
-            const updated = updateStateAtomically<null>(
-              root,
-              (snapshot) => snapshot.state
-                ? { op: "commit", state: { ...snapshot.state, task: `newer state ${failurePoint}` }, value: null }
-                : { op: "fail", code: "state_missing", error: "state disappeared during abort setup" },
-              { selector: { feature_id: featureId, run_key: `${featureId}-run` } },
-            );
-            assert.equal(updated.ok, true);
-          }
-          if (!injected && point === failurePoint) {
-            injected = true;
-            throw new Error(`injected ${point}`);
-          }
-        });
-        assert.throws(
-          () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [pending] }),
-          /injected|CTO_SPEC_DECISION_COMMIT_FAILED/,
-        );
-        setCtoSpecificationDecisionFailureInjector(null);
+  test("recovers a selected Ask after a state transaction abort", async () => {
+    const root = freshProject();
+    const featureId = "feature-abort-selected-ask";
+    try {
+      const armed = armCanonicalPreparationCheckpoint(root, featureId, "specify");
+      let mutated = false;
+      setStateTransactionTestHooks({
+        beforeCas: ({ sourcePath }) => {
+          if (mutated) return;
+          mutated = true;
+          const state = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+          state.updated_at = new Date().toISOString();
+          const temporary = sourcePath + ".foreign";
+          writeFileSync(temporary, JSON.stringify(state, null, 2) + "\n", "utf8");
+          renameSync(temporary, sourcePath);
+        },
+      }, root);
+      const rejected = await mountedPreparationCheckpointAsk(root, armed.input, "approve_continue");
+      setStateTransactionTestHooks(null, root);
+      assert.equal(rejected.ok, false, "the selected Ask must reject its aborted state transaction");
+      assert.match(String(rejected.error), /state moved|state transaction|checkpoint_failed|checkpoint_invalid/);
+      assert.deepEqual(readCtoSpecificationDecisions(root, CTO_RUN_ID), [], "an aborted selected Ask must not publish CTO decisions");
 
-        // A later operation is the recovery boundary. It must finish an
-        // interrupted abort, ignore a terminal WAL, and remain idempotent.
-        const recovered = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [] });
-        assert.deepEqual(recovered.decisions, [], `${failurePoint} recovery must not expose staged decisions`);
-        assert.deepEqual(readCtoSpecificationDecisions(root, CTO_RUN_ID), []);
-        const selected = resolveState(root, undefined, { feature_id: featureId, run_key: `${featureId}-run` });
-        const answer = selected.state?.trusted_checkpoint_answers?.find((candidate) => candidate.answer_id === pending.trusted_answer_ref);
-        assert.ok(answer && !answer.consumed_at, `${failurePoint} abort must preserve the unconsumed proof`);
-        const transactionDir = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decision-transactions", "history");
-        const transactionFiles = readdirSync(transactionDir).filter((entry) => entry.endsWith(".json"));
-        assert.equal(transactionFiles.length, 1, `${failurePoint} terminal WAL must remain in history for audit`);
-        const transaction = JSON.parse(readFileSync(join(transactionDir, transactionFiles[0]!), "utf8")) as Record<string, unknown>;
-        assert.equal(transaction.status, "aborted", `${failurePoint} must converge to terminal abort`);
-        assert.equal(transaction.abort_reason, "state_conflict");
-      } finally {
-        setCtoSpecificationDecisionFailureInjector(null);
-        rmSync(root, { recursive: true, force: true });
-      }
+      const fresh = await issueCanonicalDecision(root, featureId, "specify", "approve_continue", "answer-abort-selected-fresh");
+      const recorded = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [fresh] });
+      assert.equal(recorded.decisions.length, 1, "a fresh selected Ask must recover after the aborted transaction");
+    } finally {
+      setStateTransactionTestHooks(null, root);
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("decision rollback rejects a replaced root without touching replacement", async () => {
+  test("selected Ask rejects a replaced root without touching the replacement", async () => {
     const root = freshProject();
     const movedRoot = root + ".opened";
     const replacement = freshProject();
+    const replacementEntries = readdirSync(replacement);
     const featureId = "feature-abort-root-replaced";
     let swapped = false;
     try {
-      const pending = await issueCanonicalDecision(root, featureId, "specify", "approve_continue", "answer-abort-root-replaced");
-      let mutated = false;
-      setCtoSpecificationDecisionFailureInjector((point) => {
-        if (point === "before_feature_state_write" && !mutated) {
-          mutated = true;
-          const updated = updateStateAtomically<null>(
-            root,
-            (snapshot) => snapshot.state
-              ? { op: "commit", state: { ...snapshot.state, task: "unrelated concurrent update" }, value: null }
-              : { op: "fail", code: "state_missing", error: "state disappeared during abort setup" },
-            { selector: { feature_id: featureId, run_key: featureId + "-run" } },
-          );
-          assert.equal(updated.ok, true);
-        }
-        if (point === "before_abort_artifact_restore" && !swapped) {
+      const armed = armCanonicalPreparationCheckpoint(root, featureId, "specify");
+      setStateTransactionTestHooks({
+        beforeCas: () => {
+          if (swapped) return;
           swapped = true;
           renameSync(root, movedRoot);
           symlinkSync(replacement, root, "dir");
-        }
-      });
-      assert.throws(
-        () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [pending] }),
-        /CTO_SPEC_DECISION_COMMIT_FAILED|CTO_SPEC_PATH_INVALID|pinned project root changed/,
-      );
-      assert.deepEqual(readdirSync(replacement), [], "replacement root remains untouched");
+        },
+      }, root);
+      const rejected = await mountedPreparationCheckpointAsk(root, armed.input, "approve_continue");
+      setStateTransactionTestHooks(null, root);
+      assert.equal(rejected.ok, false, "the selected Ask must reject a replaced root");
+      assert.match(String(rejected.error), /root|pinned|checkpoint_failed|checkpoint_invalid/);
+      assert.deepEqual(readdirSync(replacement), replacementEntries, "the replacement root must remain untouched");
       unlinkSync(root);
       renameSync(movedRoot, root);
       swapped = false;
       const selected = resolveState(root, undefined, { feature_id: featureId, run_key: featureId + "-run" });
-      assert.equal(selected.state?.task, "unrelated concurrent update", "original state remains unchanged by rollback swap");
+      assert.ok(selected.state, "the original root must remain readable after restoration");
+      assert.deepEqual(readCtoSpecificationDecisions(root, CTO_RUN_ID), [], "a replaced-root Ask must not publish a CTO decision");
     } finally {
-      setCtoSpecificationDecisionFailureInjector(null);
+      setStateTransactionTestHooks(null, root);
       if (swapped) {
         unlinkSync(root);
         renameSync(movedRoot, root);
@@ -2178,40 +2105,27 @@ describe("CTO specification preparation decisions", () => {
     }
   });
 
-  test("rechecks the exact constitution source before every decision commit boundary", async () => {
-    const boundaries = [
-      "before_prepare",
-      "after_prepare",
-      "before_decisions_write",
-      "before_feature_state_write",
-      "after_feature_state_write",
-    ] as const;
-    for (const boundary of boundaries) {
-      const root = freshProject();
-      try {
-        const pending = await issueCanonicalDecision(
-          root,
-          `feature-constitution-drift-${boundary}`,
-          "specify",
-          "approve_continue",
-          `answer-constitution-drift-${boundary}`,
-        );
-        let changed = false;
-        setCtoSpecificationDecisionFailureInjector((point) => {
-          if (!changed && point === boundary) {
-            changed = true;
-            writeFileSync(join(root, "CONSTITUTION.md"), `${PREPARATION_CONSTITUTION}\nDrifted after selection.\n`, "utf8");
-          }
-        });
-        assert.throws(
-          () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [pending] }),
-          /CTO_SPEC_CONSTITUTION_STALE|CTO_SPEC_DECISION_COMMIT_FAILED/,
-          `${boundary} must reject constitution source drift`,
-        );
-      } finally {
-        setCtoSpecificationDecisionFailureInjector(null);
-        rmSync(root, { recursive: true, force: true });
-      }
+  test("rechecks the exact constitution source before selected Ask publication", async () => {
+    const root = freshProject();
+    const featureId = "feature-constitution-drift-selected";
+    try {
+      const armed = armCanonicalPreparationCheckpoint(root, featureId, "specify");
+      let changed = false;
+      setStateTransactionTestHooks({
+        beforeCas: () => {
+          if (changed) return;
+          changed = true;
+          writeFileSync(join(root, "CONSTITUTION.md"), `${PREPARATION_CONSTITUTION}\nDrifted after selection.\n`, "utf8");
+        },
+      }, root);
+      const rejected = await mountedPreparationCheckpointAsk(root, armed.input, "approve_continue");
+      setStateTransactionTestHooks(null, root);
+      assert.equal(rejected.ok, false, "selected Ask must reject constitution drift before publication");
+      assert.match(String(rejected.error), /constitution|stale|checkpoint_failed|checkpoint_invalid/);
+      assert.deepEqual(readCtoSpecificationDecisions(root, CTO_RUN_ID), [], "constitution drift must not publish a CTO decision");
+    } finally {
+      setStateTransactionTestHooks(null, root);
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
