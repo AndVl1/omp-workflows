@@ -33,6 +33,7 @@ import { PinnedProjectRoot as RuntimePinnedProjectRoot } from "../../core/dist/s
 import { beginRegistryRegistration, commitRegistryRegistration, rollbackRegistryRegistration } from "@andvl1/omp-workflows-core/registry";
 import { signCtoRuntimeProof } from "@andvl1/omp-workflows-core/cto-runtime";
 import { openFullstackRuntimeTest } from "./runtime-access-fixture.js";
+import { bindAuthenticatedAdapterRouting } from "./routing-fixture.js";
 
 type FullstackRuntime = ReturnType<typeof openFullstackRuntimeTest>;
 const runtimeFixtures = new Map<string, FullstackRuntime>();
@@ -42,6 +43,17 @@ function runtimeFor(root: string): FullstackRuntime {
   const runtime = openFullstackRuntimeTest(root, "adapters-" + runtimeFixtures.size);
   runtimeFixtures.set(root, runtime);
   return runtime;
+}
+function writeTelegramTestConfig(root: string, token: string, chatId: string): void {
+  mkdirSync(join(root, ".omp"), { recursive: true });
+  writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token, chatId } }));
+}
+function authenticatedTelegramAdapter(root: string, token: string, chatId: string, fetchImpl: typeof fetch): TelegramEscalationAdapter {
+  writeTelegramTestConfig(root, token, chatId);
+  const runtime = runtimeFor(root);
+  const adapter = new TelegramEscalationAdapter({ token, chatId, cwd: root, proofAuthority: runtime.proofAuthority, runtimeAccess: runtime.access, fetchImpl });
+  assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "telegram test adapter has authenticated routing");
+  return adapter;
 }
 function resetRuntimeFor(root: string): void {
   const existing = runtimeFixtures.get(root);
@@ -453,7 +465,7 @@ test("adapters: Telegram idempotent send replays delivered receipt and refuses p
       }
       return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = authenticatedTelegramAdapter(root, "token", "42", fetchImpl);
     const esc = sampleEscalation({ id: "tg-run/idempotent" });
     const first = await adapter.sendWithIdempotency(esc, "tg-delivery-1");
     const replay = await adapter.sendWithIdempotency(esc, "tg-delivery-1");
@@ -594,7 +606,7 @@ test("adapters: Telegram definitive unsent idempotency failure is retryable and 
       await retryGate;
       return new Response(JSON.stringify({ ok: true, result: { message_id: sends } }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = authenticatedTelegramAdapter(root, "token", "42", fetchImpl);
     const esc = sampleEscalation({ id: "tg-run/retryable" });
     const key = "tg-delivery-retryable";
 
@@ -642,7 +654,7 @@ test("adapters: Telegram accepted send journals remote receipt before mapping an
       }
       return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = authenticatedTelegramAdapter(root, "token", "42", fetchImpl);
     const esc = sampleEscalation({ id: "tg-run/unmapped" });
     const key = "tg-delivery-unmapped";
     type Mapping = (escId: string, messageId: number, value: Escalation) => void;
@@ -699,7 +711,7 @@ test("adapters: Telegram delivered_unmapped crash replay repairs mapping without
       sends += 1;
       throw new Error("transport must not be called for a journaled remote receipt");
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = authenticatedTelegramAdapter(root, "token", "42", fetchImpl);
     const esc = sampleEscalation({ id: "tg-run/crash-replay" });
     const key = "tg-delivery-crash-replay";
     const effects = join(root, ".work-state", "cto", "tg-run", "delivery-effects");
@@ -801,7 +813,7 @@ test("adapters: Telegram API response reader bounds streamed and malformed bodie
     const fetchImpl = (async () => telegramStreamResponse(
       [bytes.subarray(0, split), bytes.subarray(split)],
     )) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: validRoot, proofAuthority: runtimeFor(validRoot).proofAuthority, fetchImpl });
+    const adapter = authenticatedTelegramAdapter(validRoot, "t", "100", fetchImpl);
     const receipt = await adapter.send(sampleEscalation({ id: "tg-api-streamed" }));
     assert.deepEqual(receipt, { sent: true, channelRef: "tg:321" });
   } finally {
@@ -817,7 +829,7 @@ test("adapters: Telegram API response reader bounds streamed and malformed bodie
       Buffer.from('"}', "utf8"),
     ];
     const fetchImpl = (async () => telegramStreamResponse(chunks, 200, () => { cancelled = true; })) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: oversizedRoot, proofAuthority: runtimeFor(oversizedRoot).proofAuthority, fetchImpl });
+    const adapter = authenticatedTelegramAdapter(oversizedRoot, "t", "100", fetchImpl);
     const receipt = await adapter.send(sampleEscalation({ id: "tg-api-oversized" }));
     assert.equal(receipt.sent, false);
     assert.equal(cancelled, true, "oversized response reader is cancelled");
@@ -840,7 +852,7 @@ test("adapters: Telegram API response reader bounds streamed and malformed bodie
     const root = mkdtempSync(join(tmpdir(), `tg-api-malformed-${index}-`));
     try {
       const fetchImpl = (async () => telegramStreamResponse([body])) as typeof fetch;
-      const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+      const adapter = authenticatedTelegramAdapter(root, "t", "100", fetchImpl);
       const receipt = await adapter.send(sampleEscalation({ id: `tg-api-malformed-${index}` }));
       assert.equal(receipt.sent, false);
       const partition = telegramPartitionDir(root, `tg-api-malformed-${index}`, "100");
@@ -877,6 +889,7 @@ test("adapters: drain rejects oversized caller batches before any scan or send",
 
 test("adapters: canonical answer replay is rejected after bounded seen-answer eviction", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-seen-answer-eviction-"));
+  writeTelegramTestConfig(root, "token", "42");
   const runId = resolveInboxRunId(root);
   try {
     const answers = Array.from({ length: MAX_SEEN_ANSWERS_PER_ROOT + 1 }, (_, index) => ({
@@ -893,6 +906,8 @@ test("adapters: canonical answer replay is rejected after bounded seen-answer ev
       cancel: async () => undefined,
       pollOnce: async () => pollCount++ === 0 ? answers : [answers[0]],
     } as unknown as EscalationAdapter;
+    const runtime = runtimeFor(root);
+    assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "answer replay fixture has authenticated routing");
     await pollInbox(root, adapter, undefined, () => { callbacks += 1; }, { idempotentWake: true });
     assert.equal(callbacks, answers.length, "the first canonical batch reaches each answer callback once");
     await pollInbox(root, adapter, undefined, () => { callbacks += 1; }, { idempotentWake: true });
@@ -950,6 +965,7 @@ test("adapters: poll rejects an oversized whole answer batch without partial wak
 
 test("adapters: no-lifecycle adapter send is bounded by the fixed operation timeout", { timeout: 10_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-adapter-timeout-"));
+  writeTelegramTestConfig(root, "token", "42");
   try {
     const runId = "adapter-timeout";
     withIndexedRun(root, runId);
@@ -960,6 +976,8 @@ test("adapters: no-lifecycle adapter send is bounded by the fixed operation time
       sendWithIdempotency: async () => new Promise<never>(() => undefined),
       cancel: async () => undefined,
     } as unknown as EscalationAdapter;
+    const runtime = runtimeFor(root);
+    assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "timeout fixture has authenticated routing");
     const started = Date.now();
     const results = await drainOutbox(root, adapter, 1);
     const elapsed = Date.now() - started;
