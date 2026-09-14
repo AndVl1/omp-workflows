@@ -671,7 +671,6 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       },
     }, root);
     const rejectedReopen = beginWithCurrentProof(root, THREE_SLOT_SELECTION);
-    setStateTransactionTestHooks(null, root);
     assert.equal(rejectedReopen.ok, false, "reopen must reject a concurrent state CAS drift");
     assert.equal(injectedStateDrift, true, "reopen CAS drift hook must run");
     for (const [path, bytes] of staleArtifactPreimages) {
@@ -759,6 +758,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     assert.equal(advanced.ok, true, advanced.ok ? "fresh downstream artifacts complete after stale bindings are cleared" : advanced.error);
     if (advanced.ok) assert.equal(advanced.state.stage_cursor, "clarify");
   } finally {
+    setStateTransactionTestHooks(null, root);
     rmSync(root, { recursive: true, force: true });
   }
 });
