@@ -626,6 +626,19 @@ test("session binding release only closes the exact current generation", () => {
       deferConstitutionGate: true,
       observability: false,
     });
+    assert.ok(controller, "the controller is published while the outer transaction is mounting");
+    if (!controller) return;
+    const pendingBind = controller.bind(contextA);
+    const pendingCurrent = controller.current(contextA);
+    assert.ok(pendingBind, "the exact pending initial context exposes its attached snapshot");
+    assert.ok(pendingCurrent, "current exposes the exact pending initial snapshot");
+    if (!pendingBind || !pendingCurrent) return;
+    assert.equal(pendingBind.runtimeAuthority, pendingCurrent.runtimeAuthority, "pending bind/current share authority");
+    assert.equal(pendingBind.runtimeAccess, pendingCurrent.runtimeAccess, "pending bind/current share runtime facade");
+    assert.equal(controller.bind(contextB), null, "an unseen generation cannot bind before the outer transaction commits");
+    assert.equal(controller.bind({ cwd: root, sessionManager: { getCwd: () => root } }), null, "a malformed manager cannot bind before the outer transaction commits");
+    assert.equal(controller.bind({ cwd: root, sessionManager: { getCwd: () => root, getSessionId: () => "release-a" } }), null, "a foreign manager cannot bind before the outer transaction commits");
+    assert.equal(controller.current(contextA)?.runtimeAccess, pendingCurrent.runtimeAccess, "rejected pending binds leave the exact facade unchanged");
     installed?.();
     seed.retain(true);
     seedToken = undefined;
@@ -650,6 +663,7 @@ test("session binding release only closes the exact current generation", () => {
     const bindingB = controller.bind(contextB);
     assert.ok(bindingB, "rebind publishes the replacement generation");
     if (!bindingB) return;
+    assert.equal(controller.current(contextA), null, "the retired A generation is not current after B rebind");
 
     assert.equal(controller.release(bindingA), false, "a stale generation cannot release the replacement");
     assert.equal(controller.isLive(contextB), true, "stale release leaves replacement live");
@@ -689,6 +703,60 @@ test("session binding release only closes the exact current generation", () => {
     if (retryToken) { try { rollbackOwnerRegistry(retryToken); } catch { /* preserve test failure */ } }
     if (seedToken) { try { rollbackOwnerRegistry(seedToken); } catch { /* preserve test failure */ } }
     closeRetainedTestRegistrations(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dynamic team activation ignores worker session starts and keeps one main binding", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-dynamic-worker-session-"));
+  const sessionStarts: SessionStartHandler[] = [];
+  const sessionShutdowns: SessionStartHandler[] = [];
+  const pi = {
+    setLabel() {},
+    on(name: string, handler: SessionStartHandler) {
+      if (name === "session_start") sessionStarts.push(handler);
+      if (name === "session_shutdown") sessionShutdowns.push(handler);
+    },
+  };
+  let cleaned = false;
+  try {
+    const markerInfo = marker(root);
+    const ownerSource = activationOwner("dynamic-worker-session", root, markerInfo.path, markerInfo.sha256);
+    registerTeamWorkflow(pi as never, {
+      owner: () => ownerSource,
+      resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd,
+      observability: false,
+    });
+    assert.equal(sessionStarts.length, 1, "dynamic registration installs one callback before activation");
+    const manager = (id: string) => ({
+      getCwd: () => root,
+      getSessionId: () => id,
+      getSessionFile: () => join(root, `${id}.jsonl`),
+      getSessionGeneration: () => `generation-${id}`,
+    });
+    const workerContext = { cwd: root, hasUI: false, sessionManager: manager("worker") };
+    const mainContext = { cwd: root, hasUI: true, sessionManager: manager("main") };
+    const dispatch = (ctx: unknown): void => {
+      for (const handler of [...sessionStarts]) handler({}, ctx);
+    };
+
+    dispatch(workerContext);
+    assert.equal(workflowOwnerFor(root, "workflow_registration"), undefined, "worker session start claims no dynamic owner");
+    dispatch(mainContext);
+    assert.ok(workflowOwnerFor(root, "workflow_registration"), "main session start claims the owner once");
+    const handlerCount = sessionStarts.length;
+    dispatch(workerContext);
+    assert.equal(sessionStarts.length, handlerCount, "worker session cannot add a second lifecycle handler");
+    assert.ok(workflowOwnerFor(root, "workflow_registration"), "later worker start cannot rebind or revoke the main activation");
+    for (const handler of [...sessionShutdowns]) handler({}, mainContext);
+    cleaned = true;
+    assert.equal(workflowOwnerFor(root, "workflow_registration"), undefined, "exact main shutdown releases the dynamic owner");
+  } finally {
+    if (!cleaned) {
+      for (const handler of [...sessionShutdowns]) {
+        try { handler({}, { cwd: root, hasUI: true, sessionManager: { getCwd: () => root, getSessionId: () => "main" } }); } catch { /* preserve test failure */ }
+      }
+    }
     rmSync(root, { recursive: true, force: true });
   }
 });
