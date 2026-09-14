@@ -1592,7 +1592,11 @@ function sessionDescriptor(sessionPath: string): { readonly dev: number; readonl
 
 /** Discover immediate, real session scratches under a suite root. */
 function discoverSuiteChildren(suiteRoot: string): SuiteDiscovery | null {
-  const rootSession = existingPath(join(suiteRoot, '.work-state', 'ux-e2e', 'session.json'));
+  const rootSessionInfo = existingPath(join(suiteRoot, '.work-state', 'ux-e2e', 'session.json'));
+  const rootSession = rootSessionInfo !== null
+    && rootSessionInfo.isFile
+    && !rootSessionInfo.isSymbolicLink
+    && readSessionMeta(suiteRoot).schema_version === 2;
   const root = pinDirectory(suiteRoot);
   if (root === null) return null;
   let retainRoot = false;
@@ -1605,7 +1609,10 @@ function discoverSuiteChildren(suiteRoot: string): SuiteDiscovery | null {
       for (;;) {
         const entry = handle.readSync();
         if (entry === null) break;
-        if (entry.isSymbolicLink()) throw new Error('ux-e2e: suite child ' + entry.name + ' must not be a symlink');
+        if (entry.isSymbolicLink()) {
+          if (rootSession) continue;
+          throw new Error('ux-e2e: suite child ' + entry.name + ' must not be a symlink');
+        }
         if (entry.isDirectory()) {
           if (names.length >= MAX_SUITE_DIRECTORY_ENTRIES) throw new Error('ux-e2e: suite has too many immediate directory entries');
           names.push(entry.name);
@@ -1637,7 +1644,7 @@ function discoverSuiteChildren(suiteRoot: string): SuiteDiscovery | null {
       children.push({ name, scratchDir: resolve(child), childDev: childInfo.dev, childIno: childInfo.ino, sessionDev: descriptor.dev, sessionIno: descriptor.ino, sessionDigest: descriptor.digest });
     }
     if (!pinnedDirectoryIsStable(root)) throw new Error('ux-e2e: suite root changed during child enumeration');
-    if (rootSession !== null && children.length > 0) throw new Error('ux-e2e: ambiguous suite root and child session ownership');
+    if (rootSession && children.length > 0) throw new Error('ux-e2e: ambiguous suite root and child session ownership');
     if (children.length === 0) return null;
     retainRoot = true;
     return { root, children };

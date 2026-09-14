@@ -913,7 +913,7 @@ test('report suite: real root replacement fails pinned identity revalidation', (
   let replaced = false;
   setEvidenceCopyTestHooks({
     beforeSourceOpen(path) {
-      if (!replaced && path.includes(`${join(suite, 'session-a')}${sep}`)) {
+      if (!replaced && path.endsWith(`${sep}session-a${sep}.work-state${sep}ux-e2e${sep}transcript.jsonl`)) {
         replaced = true;
         renameSync(suite, moved);
         renameSync(replacement, suite);
@@ -921,7 +921,7 @@ test('report suite: real root replacement fails pinned identity revalidation', (
     },
   });
   try {
-    assert.throws(() => generateReport(suite, BASE_INPUT, { mdDir, copyEvidence: true }), /suite (root changed|child membership changed)/u);
+    assert.throws(() => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }), /suite (root changed|child membership changed)/u);
   } finally {
     setEvidenceCopyTestHooks(null);
     rmSync(suite, { recursive: true, force: true });
@@ -942,9 +942,13 @@ test('report suite: aggregate evidence budget rejects oversized children before 
     const session = readSessionRecord(child);
     const scenario = session.scenario as Record<string, unknown>;
     const workspace = scenario.workspace as Record<string, unknown>;
-    workspace.evidence = ['large-evidence.bin'];
+    const documents = Array.from({ length: 9 }, (_, index) => `large-evidence-${String(index)}.bin`);
+    const perFileBytes = 7.5 * 1024 * 1024;
+    assert.ok(perFileBytes < MAX_PINNED_READ_BYTES);
+    assert.ok(documents.length * perFileBytes > 64 * 1024 * 1024);
+    workspace.documents = documents;
     writeSessionRecord(child, session);
-    writeSizedFile(join(child, 'large-evidence.bin'), 40 * 1024 * 1024);
+    for (const document of documents) writeFileSync(join(child, document), Buffer.alloc(perFileBytes, 0x61));
   }
   try {
     assert.throws(() => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }), /aggregate byte limit/u);
