@@ -2592,42 +2592,43 @@ function mountedCtoRuntime(pi: object, ctx: unknown, cwd: string, ctoRunId: stri
   }
   return mounted;
 }
+
 function ctoCompletionTerminalReadiness(
   mounted: MountedCtoRuntime,
   input: CtoSpecificationCompletionEnvelope,
 ): string | null {
-  let rawState: ReturnType<MountedCtoRuntime["runtimeAccess"]["readState"]>;
   try {
-    rawState = mounted.runtimeAccess.readState(input.owner_run_key);
+    return mounted.runtimeAccess.withRunTransaction(input.owner_run_key, (transaction) => {
+      const rawState = transaction.readState();
+      const state = ctoCompletionStateProjection(rawState);
+      if (!state || state.id !== input.owner_run_key) return "recovery_required: authenticated CTO state is unavailable for completion";
+      const wave = state.wave_history?.find((candidate) => candidate.id === input.wave_id);
+      if (!wave || wave.source !== "specification-execution" || (wave.status !== "active" && wave.status !== "done")) {
+        return "CTO completion is not ready: the exact specification-execution wave is not active or terminal";
+      }
+      if (wave.status === "active" && state.active_wave_id !== input.wave_id) return "CTO completion is not ready: the exact wave is not the active canonical wave";
+      if (wave.status === "done" && state.active_wave_id !== undefined) return "CTO completion is not ready: canonical state routes an active wave while the requested wave is terminal";
+      const waveTeams = state.teams.filter((team) => typeof team.slice_id === "string" && wave.slice_ids.includes(team.slice_id));
+      if (waveTeams.length !== wave.slice_ids.length) return "CTO completion is not ready: authenticated state does not contain every mapped execution team";
+      const featureTeams = waveTeams.filter((team) => team.feature_id === input.feature_id && team.run_key === input.run_key);
+      if (featureTeams.length === 0) return "CTO completion is not ready: no mapped execution team matches the exact feature/run selector";
+      for (const team of waveTeams) {
+        if (team.status !== "done" && team.status !== "failed") return `CTO completion is not ready: execution team '${team.id}' is not terminal`;
+        if (team.pending !== undefined) return `CTO completion is not ready: execution team '${team.id}' still has pending work`;
+        if (!team.work_identity || !team.completion_envelope || team.completion_envelope.outcome === "pending" || team.completion_envelope.terminal_signal === null) {
+          return `CTO completion is not ready: execution team '${team.id}' lacks terminal completion evidence`;
+        }
+        if (JSON.stringify(team.completion_envelope.identity) !== JSON.stringify(team.work_identity)
+          || !validateTypedControlPlane({ work_identity: team.work_identity, completion_envelope: team.completion_envelope }).ok) {
+          return `CTO completion is not ready: execution team '${team.id}' terminal completion evidence is stale or invalid`;
+        }
+      }
+      return null;
+    });
   } catch (error) {
     return `recovery_required: authenticated CTO state reread failed: ${error instanceof Error ? error.message : String(error)}`;
   }
-  const state = ctoCompletionStateProjection(rawState);
-  if (!state || state.id !== input.owner_run_key) return "recovery_required: authenticated CTO state is unavailable for completion";
-  const wave = state.wave_history?.find((candidate) => candidate.id === input.wave_id);
-  if (!wave || wave.source !== "specification-execution" || (wave.status !== "active" && wave.status !== "done")) {
-    return "CTO completion is not ready: the exact specification-execution wave is not active or terminal";
-  }
-  if (wave.status === "active" && state.active_wave_id !== input.wave_id) return "CTO completion is not ready: the exact wave is not the active canonical wave";
-  if (wave.status === "done" && state.active_wave_id !== undefined) return "CTO completion is not ready: canonical state routes an active wave while the requested wave is terminal";
-  const waveTeams = state.teams.filter((team) => typeof team.slice_id === "string" && wave.slice_ids.includes(team.slice_id));
-  if (waveTeams.length !== wave.slice_ids.length) return "CTO completion is not ready: authenticated state does not contain every mapped execution team";
-  const featureTeams = waveTeams.filter((team) => team.feature_id === input.feature_id && team.run_key === input.run_key);
-  if (featureTeams.length === 0) return "CTO completion is not ready: no mapped execution team matches the exact feature/run selector";
-  for (const team of waveTeams) {
-    if (team.status !== "done" && team.status !== "failed") return `CTO completion is not ready: execution team '${team.id}' is not terminal`;
-    if (team.pending !== undefined) return `CTO completion is not ready: execution team '${team.id}' still has pending work`;
-    if (!team.work_identity || !team.completion_envelope || team.completion_envelope.outcome === "pending" || team.completion_envelope.terminal_signal === null) {
-      return `CTO completion is not ready: execution team '${team.id}' lacks terminal completion evidence`;
-    }
-    if (JSON.stringify(team.completion_envelope.identity) !== JSON.stringify(team.work_identity)
-      || !validateTypedControlPlane({ work_identity: team.work_identity, completion_envelope: team.completion_envelope }).ok) {
-      return `CTO completion is not ready: execution team '${team.id}' terminal completion evidence is stale or invalid`;
-    }
-  }
-  return null;
 }
-
 function hostAskContext(
   ctx: unknown,
   trustedInteractiveProfile: (ctx: unknown) => HostSessionProfile | null,

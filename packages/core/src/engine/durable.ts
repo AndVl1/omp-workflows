@@ -3916,6 +3916,13 @@ export function completeSpecificationExecution(
       if (runtimeState.id !== input.owner_run_key) {
         return { ok: false, code: "SPEC_STATE_INVALID", error: "SPEC_STATE_INVALID: CTO runtime transaction selected a different run" } as SpecificationExecutionCompletionResult;
       }
+      const runtimeWorkIdentity = runtimeState.work_identity;
+      if (runtimeState.standby === true
+        || runtimeState.owner_session !== options.sessionId
+        || !runtimeWorkIdentity
+        || runtimeWorkIdentity.session_id !== options.sessionId) {
+        return { ok: false, code: "SPEC_STATE_INVALID", error: "SPEC_STATE_INVALID: CTO execution completion session does not own the canonical runtime state" } as SpecificationExecutionCompletionResult;
+      }
       options.runtimeAccess!.assertLive();
       const completed = completeSpecificationExecutionUnlocked(cwd, input, pinnedRoot);
       options.runtimeAccess!.assertLive();

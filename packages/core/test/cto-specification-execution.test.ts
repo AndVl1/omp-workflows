@@ -125,11 +125,11 @@ type TestRuntimeFixture = { access: CtoRuntimeAccessFacade };
 const testRuntimeFixtures = new Map<string, TestRuntimeFixture & { close: () => void }>();
 const DEFAULT_TEST_SESSION_ID = "registrar-test-session";
 
-function testRuntimeAccess(root: string, sessionId: string) {
+function testRuntimeAccess(root: string, sessionId: string, ownerId = `core-test-runtime-${digestOf({ root, sessionId }).slice(0, 16)}`) {
   const key = `${root}\0${sessionId}`;
   const existing = testRuntimeFixtures.get(key);
   if (existing) return existing.access;
-  const opened = openTestCtoRuntime(root, sessionId, `core-test-runtime-${digestOf({ root, sessionId }).slice(0, 16)}`);
+  const opened = openTestCtoRuntime(root, sessionId, ownerId);
   const fixture = { access: opened.access, close: opened.close } as TestRuntimeFixture & { close: () => void };
   testRuntimeFixtures.set(key, fixture as TestRuntimeFixture);
   return fixture.access;
@@ -727,9 +727,11 @@ function publicWorkflowTool(name: string, root: string = mkdtempSync(join(tmpdir
   const pi = {
     zod: { z: zod },
     on: testOnForRoot(root),
+    setLabel: (_label: string) => undefined,
     registerTool: (tool: unknown) => registered.push(tool as RegisteredWorkflowTool),
   };
   registerTestWorkflowTools(root, pi as never, { resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
+  registerTestTeamWorkflow(root, pi as never, { resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
   const tool = registered.find((candidate) => candidate.name === name);
   assert.ok(tool, `${name} tool is registered`);
   return tool!;
@@ -759,8 +761,10 @@ function publicCtoTools(rootOrOptions: string | Parameters<typeof registerCtoToo
   const pi = {
     zod: { z: zod },
     on: testOnForRoot(root),
+    setLabel: (_label: string) => undefined,
     registerTool: (tool: unknown) => registered.push(tool as MountedCtoTool),
   };
+  registerTestTeamWorkflow(root, pi as never, { resolveCwd: options.resolveCwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
   registerTestCtoTools(root, pi as never, options, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
   return new Map(registered.map((tool) => [tool.name, tool]));
 }
@@ -775,11 +779,11 @@ function mountedTaskHooks(root: string, sessionId: string = DEFAULT_TEST_SESSION
   const hooks = new Map<string, MountedTaskHook>();
   const pi = {
     zod: { z: zod },
-    on: (event: string, handler: MountedTaskHook) => { hooks.set(event, handler); },
-    registerTool: (_tool: unknown) => undefined,
+    on: (event: string, handler: MountedTaskHook) => { hooks.set(event, handler); if (event === "session_start") handler({}, TEST_CONTEXT(root)); },
     setLabel: (_label: string) => undefined,
+    registerTool: (_tool: unknown) => undefined,
   };
-  registerTestTeamWorkflow(root, pi as never, { observability: false, resolveCwd: (ctx) => (ctx as { cwd?: string }).cwd }, `core-test-runtime-${digestOf({ root, sessionId }).slice(0, 16)}`);
+  registerTestTeamWorkflow(root, pi as never, { observability: false, rebindSessions: true, resolveCwd: (ctx) => (ctx as { cwd?: string }).cwd }, `core-test-runtime-${digestOf({ root, sessionId }).slice(0, 16)}`);
   const toolCall = hooks.get("tool_call");
   const toolResult = hooks.get("tool_result");
   assert.ok(toolCall && toolResult, "workflow host task hooks must be mounted");
@@ -2281,6 +2285,39 @@ test("mounted CTO conformance producer persists a multi-feature matrix and repla
     assert.equal(replay.replayed, true);
     assert.deepEqual(replay.passing_feature_ids, featureIds);
     assert.deepEqual((replay.features as Json[]).map((feature) => feature.conformance_id), firstFeatures.map((feature) => feature.conformance_id));
+    const publicRuntimeState = testRuntimeAccess(root, DEFAULT_TEST_SESSION_ID).readState(RUN_ID);
+    const publicRuntimeTeam = (publicRuntimeState?.teams as Json[] | undefined)?.[0];
+    assert.ok(publicRuntimeTeam, "public runtime projection must expose the terminal execution team");
+    const publicRuntimeEnvelope = publicRuntimeTeam?.completion_envelope as Json | undefined;
+    assert.ok(publicRuntimeEnvelope, "public runtime projection must expose the completion envelope shape");
+    assert.equal(Object.hasOwn(publicRuntimeEnvelope ?? {}, "completed_by"), false, "public runtime projection must redact completion author metadata");
+    const foreignFeatureId = featureIds[0]!;
+    const foreignEnvelope = producedCompletionEnvelope(root, dispatched.mapping!, String(dispatched.mapping_digest), foreignFeatureId);
+    const featureDirectory = join(root, ".work-state", "features", foreignFeatureId);
+    const foreignCtoStatePath = join(root, ".work-state", "cto", RUN_ID, "state.json");
+    const snapshotTree = (directory: string): Array<[string, string]> => {
+      const rows: Array<[string, string]> = [];
+      for (const name of readdirSync(directory).sort()) {
+        const child = join(directory, name);
+        if (statSync(child).isDirectory()) rows.push(...snapshotTree(child));
+        else rows.push([child, readFileSync(child, "utf8")]);
+      }
+      return rows;
+    };
+    const beforeForeignFeature = snapshotTree(featureDirectory);
+    const beforeForeignCtoState = readFileSync(foreignCtoStatePath, "utf8");
+    const foreignRuntime = testRuntimeAccess(root, "foreign-completion-session", `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
+    try {
+      const foreign = completeSpecificationExecution(root, foreignEnvelope as never, {
+        runtimeAccess: foreignRuntime,
+        sessionId: "foreign-completion-session",
+      });
+      assert.equal(foreign.ok, false, "a foreign live session must not complete another session's execution");
+      assert.deepEqual(snapshotTree(featureDirectory), beforeForeignFeature, "foreign completion must not mutate feature or claim bytes");
+      assert.equal(readFileSync(foreignCtoStatePath, "utf8"), beforeForeignCtoState, "foreign completion must not mutate canonical CTO state bytes");
+    } finally {
+      closeTestRuntime(root, "foreign-completion-session");
+    }
     const finalizer = publicWorkflowTool("workflow_complete_specification_execution", root);
     for (const featureId of featureIds) {
       const envelope = producedCompletionEnvelope(root, dispatched.mapping!, String(dispatched.mapping_digest), featureId);
@@ -2340,39 +2377,27 @@ test("mounted CTO conformance producer persists a multi-feature matrix and repla
     };
     assert.equal(closeTool.parameters.safeParse(closePayload).success, true);
     const mappingId = String((dispatched.mapping as Json).mapping_id ?? "");
-    assert.ok(isSafeCtoExecutionId(mappingId), "close TOCTOU fixture requires a safe canonical mapping id");
+    assert.ok(isSafeCtoExecutionId(mappingId), "close mapping fixture requires a safe canonical mapping id");
     const mappingRecordPath = `.work-state/cto/${RUN_ID}/specification-mappings/${mappingId}.json`;
     const mappingPath = join(root, mappingRecordPath);
-    assert.equal(existsSync(mappingPath), true, "close TOCTOU fixture requires the canonical mapping record to exist");
+    assert.equal(existsSync(mappingPath), true, "close mapping fixture requires the canonical mapping record to exist");
     const mappingBytes = readFileSync(mappingPath);
     const mappingRecord = JSON.parse(mappingBytes.toString("utf8")) as Json;
     const persistedMapping = mappingRecord.mapping as Json | undefined;
-    assert.equal(persistedMapping?.mapping_id, mappingId, "close TOCTOU fixture must read the exact selected mapping id");
-    assert.equal(persistedMapping?.mapping_hash, String((dispatched.mapping as Json).mapping_hash), "close TOCTOU fixture must read the exact selected mapping hash");
+    assert.equal(persistedMapping?.mapping_id, mappingId, "close mapping fixture must read the exact selected mapping id");
+    assert.equal(persistedMapping?.mapping_hash, String((dispatched.mapping as Json).mapping_hash), "close mapping fixture must read the exact selected mapping hash");
     const closeStatePath = join(root, ".work-state", "cto", RUN_ID, "state.json");
-    const stateBeforeTerminalizerRace = readFileSync(closeStatePath, "utf8");
-    const baseRuntime = testRuntimeAccess(root, DEFAULT_TEST_SESSION_ID);
-    const racingRuntime = Object.create(baseRuntime) as CtoRuntimeAccessFacade;
-    let closeTransactions = 0;
-    Object.defineProperty(racingRuntime, "withRunTransaction", {
-      value: (runId: string, callback: Parameters<CtoRuntimeAccessFacade["withRunTransaction"]>[1]) => {
-        closeTransactions += 1;
-        // close() calls reconciliation first, then the dependency terminalizer.
-        // Mutate only before the terminalizer's locked callback reads the record.
-        if (closeTransactions === 2) writeFileSync(mappingPath, Buffer.from("{}\n", "utf8"));
-        return baseRuntime.withRunTransaction(runId, callback);
-      },
-    });
-    let terminalizerRace: Awaited<ReturnType<typeof closeCtoSpecificationExecutionWave>>;
+    const stateBeforeInvalidMapping = readFileSync(closeStatePath, "utf8");
+    writeFileSync(mappingPath, Buffer.from("{}\n", "utf8"));
+    let invalidMappingClose: Awaited<ReturnType<typeof closeCtoSpecificationExecutionWave>>;
     try {
-      terminalizerRace = await closeCtoSpecificationExecutionWave(root, closePayload, { runtimeAccess: racingRuntime, sessionId: DEFAULT_TEST_SESSION_ID });
+      invalidMappingClose = await closeCtoSpecificationExecutionWave(root, closePayload, { runtimeAccess: testRuntimeAccess(root, DEFAULT_TEST_SESSION_ID), sessionId: DEFAULT_TEST_SESSION_ID });
     } finally {
       writeFileSync(mappingPath, mappingBytes);
     }
-    assert.equal(closeTransactions >= 2, true, "close must use separate authenticated reconciliation and terminalizer transactions");
-    assert.equal(terminalizerRace!.status, "blocked", JSON.stringify(terminalizerRace));
-    assert.match(JSON.stringify(terminalizerRace!.findings), /mapping|immutable|unreadable|record/i);
-    assert.equal(readFileSync(closeStatePath, "utf8"), stateBeforeTerminalizerRace, "mapping TOCTOU must not mutate the CTO state");
+    assert.equal(invalidMappingClose.status, "blocked", JSON.stringify(invalidMappingClose));
+    assert.match(JSON.stringify(invalidMappingClose.findings), /mapping|immutable|unreadable|record/i);
+    assert.equal(readFileSync(closeStatePath, "utf8"), stateBeforeInvalidMapping, "invalid mapping must not mutate the CTO state");
     const closed = mountedDetails(await closeTool.execute("close", closePayload, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
     assert.equal(closed.status, "closed", detail(closed));
     assert.equal(closed.closed, true);
@@ -2396,20 +2421,20 @@ test("mounted CTO conformance producer persists a multi-feature matrix and repla
     const receiptPath = join(root, receiptRelativePath);
     const receiptBytes = readFileSync(receiptPath);
     const ctoStatePath = join(root, ".work-state", "cto", RUN_ID, "state.json");
-    const terminalStateBeforeReceiptCorruption = readFileSync(ctoStatePath, "utf8");
+    const terminalStateBeforeReceiptCorruption = readFileSync(foreignCtoStatePath, "utf8");
     unlinkSync(receiptPath);
     const missingReceipt = await closeCtoSpecificationExecutionWave(root, closePayload, { runtimeAccess: testRuntimeAccess(root, DEFAULT_TEST_SESSION_ID), sessionId: DEFAULT_TEST_SESSION_ID });
     assert.equal(missingReceipt.status, "blocked", JSON.stringify(missingReceipt));
     assert.match(JSON.stringify(missingReceipt.findings), /receipt|recovery/i);
-    assert.equal(readFileSync(ctoStatePath, "utf8"), terminalStateBeforeReceiptCorruption);
+    assert.equal(readFileSync(foreignCtoStatePath, "utf8"), terminalStateBeforeReceiptCorruption);
     writeFileSync(receiptPath, receiptBytes);
     writeFileSync(receiptPath, Buffer.concat([receiptBytes, Buffer.from("tampered", "utf8")]));
     const tamperedReceipt = await closeCtoSpecificationExecutionWave(root, closePayload, { runtimeAccess: testRuntimeAccess(root, DEFAULT_TEST_SESSION_ID), sessionId: DEFAULT_TEST_SESSION_ID });
     assert.equal(tamperedReceipt.status, "blocked", JSON.stringify(tamperedReceipt));
     assert.match(JSON.stringify(tamperedReceipt.findings), /receipt|canonical|invalid|digest/i);
-    assert.equal(readFileSync(ctoStatePath, "utf8"), terminalStateBeforeReceiptCorruption);
+    assert.equal(readFileSync(foreignCtoStatePath, "utf8"), terminalStateBeforeReceiptCorruption);
     writeFileSync(receiptPath, receiptBytes);
-    const terminalStateBeforeForeignClose = readFileSync(ctoStatePath, "utf8");
+    const terminalStateBeforeForeignClose = readFileSync(foreignCtoStatePath, "utf8");
     const foreignClose = await closeCtoSpecificationExecutionWave(root, closePayload, {
       // Keep the authenticated facade bound to the owner session while forging
       // only the caller session selector; opening another fixture would race
@@ -2419,10 +2444,10 @@ test("mounted CTO conformance producer persists a multi-feature matrix and repla
     });
     assert.equal(foreignClose.status, "blocked", JSON.stringify(foreignClose));
     assert.match(JSON.stringify(foreignClose.findings), /session|owner/i);
-    assert.equal(readFileSync(ctoStatePath, "utf8"), terminalStateBeforeForeignClose, "foreign terminal replay must not mutate canonical state");
-    const terminalStateBeforeReplay = readFileSync(ctoStatePath, "utf8");
+    assert.equal(readFileSync(foreignCtoStatePath, "utf8"), terminalStateBeforeForeignClose, "foreign terminal replay must not mutate canonical state");
+    const terminalStateBeforeReplay = readFileSync(foreignCtoStatePath, "utf8");
     const replayClose = mountedDetails(await closeTool.execute("close-replay", closePayload, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
-    assert.equal(readFileSync(ctoStatePath, "utf8"), terminalStateBeforeReplay, "same-owner terminal replay must be byte-idempotent");
+    assert.equal(readFileSync(foreignCtoStatePath, "utf8"), terminalStateBeforeReplay, "same-owner terminal replay must be byte-idempotent");
     const beforeTerminalReplayState = new Map(featureIds.map((featureId) => [
       featureId,
       readFileSync(join(root, ".work-state", "features", featureId, "state.json"), "utf8"),
@@ -2445,7 +2470,7 @@ test("mounted CTO conformance producer persists a multi-feature matrix and repla
     }
     assert.equal(replayClose.status, "closed", detail(replayClose));
     assert.equal(replayClose.replayed, true);
-    const terminalStateBeforeConformanceTamper = readFileSync(ctoStatePath, "utf8");
+    const terminalStateBeforeConformanceTamper = readFileSync(foreignCtoStatePath, "utf8");
     const tamperedDoneState = readCtoState(RUN_ID, root);
     assert.ok(tamperedDoneState, "terminal conformance tamper fixture requires canonical state");
     if (!tamperedDoneState) throw new Error("terminal conformance tamper state is unavailable");
@@ -2459,22 +2484,22 @@ test("mounted CTO conformance producer persists a multi-feature matrix and repla
       work_identity: { ...tamperedTeam.work_identity, task_id: `${tamperedTeam.work_identity.task_id}-tampered` },
     };
     writeCtoState(tamperedDoneState, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const tamperedDoneStateBytes = readFileSync(ctoStatePath, "utf8");
+    const tamperedDoneStateBytes = readFileSync(foreignCtoStatePath, "utf8");
     const tamperedDone = mountedDetails(await tool.execute("terminal-done-projection-tamper", payload, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
     assert.equal(tamperedDone.status, "blocked", detail(tamperedDone));
     assert.match(JSON.stringify(tamperedDone.findings), /terminal|identity|mapping|stale|receipt/i);
-    assert.equal(readFileSync(ctoStatePath, "utf8"), tamperedDoneStateBytes, "tampered terminal projection must not mutate CTO state");
+    assert.equal(readFileSync(foreignCtoStatePath, "utf8"), tamperedDoneStateBytes, "tampered terminal projection must not mutate CTO state");
     const restoredDoneState = readCtoState(RUN_ID, root);
     assert.ok(restoredDoneState, "terminal conformance tamper fixture requires state restoration");
     if (!restoredDoneState) throw new Error("terminal conformance tamper restoration state is unavailable");
     const originalTerminalState = JSON.parse(terminalStateBeforeConformanceTamper) as CtoState;
     writeCtoState({ ...restoredDoneState, teams: structuredClone(originalTerminalState.teams) }, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const terminalStateBeforeReceiptTamper = readFileSync(ctoStatePath, "utf8");
+    const terminalStateBeforeReceiptTamper = readFileSync(foreignCtoStatePath, "utf8");
     writeFileSync(receiptPath, Buffer.concat([receiptBytes, Buffer.from("tampered-terminal-receipt", "utf8")]));
     const tamperedReceiptReplay = mountedDetails(await tool.execute("terminal-receipt-tamper", payload, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
     assert.equal(tamperedReceiptReplay.status, "blocked", detail(tamperedReceiptReplay));
     assert.match(JSON.stringify(tamperedReceiptReplay.findings), /receipt|canonical|invalid|digest|terminal/i);
-    assert.equal(readFileSync(ctoStatePath, "utf8"), terminalStateBeforeReceiptTamper, "tampered terminal receipt must not mutate CTO state");
+    assert.equal(readFileSync(foreignCtoStatePath, "utf8"), terminalStateBeforeReceiptTamper, "tampered terminal receipt must not mutate CTO state");
     writeFileSync(receiptPath, receiptBytes);
     const terminalStateForRepair = readCtoState(RUN_ID, root);
     assert.ok(terminalStateForRepair, "terminal projection repair requires canonical state");
@@ -5139,6 +5164,147 @@ test("dispatch is blocked until exact mapping hash and trusted confirmation exis
     assert.notEqual(after.dispatched, false, detail(after));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+test("CTO specification mutators reject a foreign owner before durable writes", async () => {
+  const root = makeProject();
+  const foreignSession = "foreign-cto-owner-session";
+  const featureId = "foreign-owner-feature";
+  const runKey = "run-" + featureId + "-1";
+  const featureStatePath = join(root, ".work-state", "features", featureId, "state.json");
+  const ctoStatePath = join(root, ".work-state", "cto", RUN_ID, "state.json");
+  const mappingDirectory = join(root, ".work-state", "cto", RUN_ID, "specification-mappings");
+  const transactionDirectory = join(root, ".work-state", "cto", RUN_ID, "specification-mapping-transactions");
+  const ownerId = "core-test-runtime-" + digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16);
+  let foreignRuntime: ReturnType<typeof openTestCtoRuntime> | undefined;
+  const snapshotDirectory = (directory: string): Array<[string, string]> | null => {
+    if (!existsSync(directory)) return null;
+    return readdirSync(directory).sort().map((name) => [name, readFileSync(join(directory, name), "utf8")]);
+  };
+  const snapshotDurable = (mappingPath?: string) => ({
+    feature: readFileSync(featureStatePath, "utf8"),
+    cto: readFileSync(ctoStatePath, "utf8"),
+    mapping: mappingPath && existsSync(mappingPath) ? readFileSync(mappingPath, "utf8") : null,
+    mappings: snapshotDirectory(mappingDirectory),
+    transactions: snapshotDirectory(transactionDirectory),
+  });
+  try {
+    writeFeature(root, featureId, runKey);
+    ensureExecutionContext(root);
+    // Keep both live facades under the same workflow owner principal. The
+    // session identity is intentionally different; ownership is enforced by
+    // the canonical CtoState owner_session, not by registry activation.
+    foreignRuntime = openTestCtoRuntime(root, foreignSession, ownerId);
+    const foreignOptions = {
+      runtimeAccess: foreignRuntime.access,
+      sessionId: foreignSession,
+    };
+
+    const intactCtoState = readFileSync(ctoStatePath, "utf8");
+    const beforeForeignPreflight = snapshotDurable();
+    const foreignPreflight = await preflightCtoSpecificationExecution(root, {
+      cto_run_id: RUN_ID,
+      selections: [selection(featureId, runKey)],
+    } as never, foreignOptions) as unknown as Result;
+    assert.equal(foreignPreflight.status, "blocked", detail(foreignPreflight));
+    assert.deepEqual(snapshotDurable(), beforeForeignPreflight, "foreign preflight must not mutate feature, mapping, checkpoint, or transaction bytes");
+
+    const forgedCtoState = JSON.parse(intactCtoState) as Json;
+    forgedCtoState.work_identity = { ...(forgedCtoState.work_identity as Json), session_id: foreignSession };
+    writeFileSync(ctoStatePath, JSON.stringify(forgedCtoState) + String.fromCharCode(10), "utf8");
+    const beforeIdentityTamper = snapshotDurable();
+    const identityTamperedPreflight = await preflightCtoSpecificationExecutionForTest(root, {
+      cto_run_id: RUN_ID,
+      selections: [selection(featureId, runKey)],
+    });
+    assert.equal(identityTamperedPreflight.status, "blocked", detail(identityTamperedPreflight));
+    assert.deepEqual(snapshotDurable(), beforeIdentityTamper, "top-level identity mismatch must block before durable writes");
+    writeFileSync(ctoStatePath, intactCtoState, "utf8");
+
+    const ownerPreflight = await preflight(root, [selection(featureId, runKey)]);
+    assert.equal(ownerPreflight.status, "ready", detail(ownerPreflight));
+    const frozen = mapping(ownerPreflight);
+    const askArgs = {
+      cto_run_id: RUN_ID,
+      mapping_id: frozen.mapping_id,
+      mapping_hash: frozen.mapping_hash,
+      mapping_version: frozen.mapping_version,
+      feature_id: featureId,
+      run_key: runKey,
+      stage_id: "execution",
+    } as Json;
+    const mappingPath = join(mappingDirectory, String(frozen.mapping_id) + ".json");
+
+    const beforeForeignPrepare = snapshotDurable(mappingPath);
+    const foreignPrepare = prepareCtoSpecificationMappingAsk(root, askArgs as never, foreignOptions);
+    assert.equal(foreignPrepare.status, "blocked", JSON.stringify(foreignPrepare));
+    assert.deepEqual(snapshotDurable(mappingPath), beforeForeignPrepare, "foreign mapping preparation must not mutate durable bytes");
+    const ownerPrepare = prepareCtoSpecificationMappingAsk(root, askArgs as never, preparationRuntimeOptions(root));
+    assert.equal(ownerPrepare.status, "ready", JSON.stringify(ownerPrepare));
+    alignCtoExecutionCapability(root, { feature_id: featureId, run_key: runKey });
+
+    const recordInput = { ...askArgs, decision: "request_changes" as const, feedback: "Review the mapping." };
+    const foreignRecordOptions = {
+      ...foreignOptions,
+      trusted_host: { bridge: {}, question: "foreign", options: ["request_changes"], session_id: foreignSession },
+    } as Parameters<typeof recordCtoSpecificationMappingAsk>[2];
+    const beforeForeignRecord = snapshotDurable(mappingPath);
+    const foreignRecord = recordCtoSpecificationMappingAsk(root, recordInput as never, foreignRecordOptions);
+    assert.equal(foreignRecord.status, "blocked", JSON.stringify(foreignRecord));
+    assert.deepEqual(snapshotDurable(mappingPath), beforeForeignRecord, "foreign mapping Ask recording must not mutate durable bytes");
+
+    const ownerAsk = await mountedCtoHostAsk(root, askArgs, "request_changes", "Review the mapping.");
+    assert.equal(ownerAsk.status, "answered", detail(ownerAsk));
+    const resumeInput = {
+      cto_run_id: RUN_ID,
+      mapping_id: frozen.mapping_id,
+      mapping_hash: frozen.mapping_hash,
+      mapping_version: frozen.mapping_version,
+    };
+    const beforeForeignResume = snapshotDurable(mappingPath);
+    const foreignResume = resumeCtoSpecificationMapping(root, resumeInput as never, foreignOptions) as unknown as Result;
+    assert.equal(foreignResume.status, "blocked", detail(foreignResume));
+    assert.deepEqual(snapshotDurable(mappingPath), beforeForeignResume, "foreign mapping resume must not mutate durable bytes");
+    const ownerResume = resumeCtoSpecificationMapping(root, resumeInput as never, preparationRuntimeOptions(root));
+    assert.equal(ownerResume.status, "resumed", detail(ownerResume));
+
+    const resumedAskArgs = {
+      cto_run_id: ownerResume.cto_run_id,
+      mapping_id: ownerResume.mapping_id,
+      mapping_hash: ownerResume.mapping_hash,
+      mapping_version: ownerResume.mapping_version,
+      feature_id: ownerResume.feature_id,
+      run_key: ownerResume.run_key,
+      stage_id: ownerResume.stage_id,
+    } as Json;
+    const ownerContinuationAsk = await mountedCtoHostAsk(root, resumedAskArgs, "approve_continue");
+    assert.equal(ownerContinuationAsk.status, "answered", detail(ownerContinuationAsk));
+    const confirmationInput = {
+      cto_run_id: RUN_ID,
+      mapping_id: frozen.mapping_id,
+      mapping_hash: frozen.mapping_hash,
+      answer_id: ownerContinuationAsk.trusted_answer_ref,
+    };
+    const beforeForeignConfirm = snapshotDurable(mappingPath);
+    const foreignConfirm = await confirmCtoSpecificationMapping(root, confirmationInput as never, foreignOptions) as unknown as Result;
+    assert.equal(foreignConfirm.status, "blocked", detail(foreignConfirm));
+    assert.deepEqual(snapshotDurable(mappingPath), beforeForeignConfirm, "foreign confirmation must not mutate durable bytes");
+    const ownerConfirm = await confirmCtoSpecificationMappingForTest(root, confirmationInput);
+    assert.equal(ownerConfirm.status, "confirmed", detail(ownerConfirm));
+    const beforeForeignDispatch = snapshotDurable(mappingPath);
+    const foreignDispatch = await dispatchCtoSpecificationMapping(root, {
+      cto_run_id: RUN_ID,
+      mapping_id: frozen.mapping_id,
+      expected_mapping_hash: frozen.mapping_hash,
+    }, foreignOptions);
+    assert.equal(foreignDispatch.status, "blocked", detail(foreignDispatch as unknown as Result));
+    assert.deepEqual(snapshotDurable(mappingPath), beforeForeignDispatch, "foreign dispatch/replay admission must not mutate durable bytes");
+  } finally {
+    foreignRuntime?.close();
+    executionContexts.delete(root);
+    projectFeatures.delete(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("multi-feature confirmation is anchored to first selection and ignores non-anchor answers", async () => {
   const root = makeProject();
   const firstFeature = "anchor-first";
