@@ -20,6 +20,7 @@ import {
   readCtoRunDeliveryIndexAuthorityPinned,
   newCtoState,
   publishCtoOutboxDelivery,
+  normalizeCtoOutboxDeliveryRoutingBinding,
   readCtoRunDeliveryActiveCandidatesPinned,
   readCtoRunDeliveryCompletedCandidatesPinned,
   readCtoRunDeliveryIndexPage,
@@ -32,6 +33,7 @@ import {
   removeCtoOutboxDeliveryObligation,
   type AppendWaveOptions,
   type CtoOutboxDeliveryPublishInput,
+  type CtoOutboxDeliveryRoutingBinding,
   type CtoOutboxDeliveryObligationInput,
   type CtoOutboxDeliveryObligationRead,
   type CtoCurrentOutboxDeliveryInput,
@@ -942,12 +944,19 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
           ? input.json
           : input.json instanceof Uint8Array ? new Uint8Array(input.json) : null;
         if (json === null) throw runtimeError("runtime_access_invalid", "outbox delivery JSON is invalid");
+        const routingBinding = input.routing_binding === undefined
+          ? undefined
+          : normalizeCtoOutboxDeliveryRoutingBinding(input.routing_binding);
+        if (input.routing_binding !== undefined && routingBinding === null) {
+          throw runtimeError("runtime_access_invalid", "outbox delivery routing binding is invalid");
+        }
         const copy: CtoOutboxDeliveryPublishInput = {
           run_id: runId,
           state_revision: input.state_revision,
           entry_name: input.entry_name,
           ...(input.legacy_entry_name === undefined ? {} : { legacy_entry_name: input.legacy_entry_name }),
           json,
+          ...(routingBinding === undefined ? {} : { routing_binding: routingBinding as CtoOutboxDeliveryRoutingBinding }),
         };
         return publishCtoOutboxDelivery(cell.root.canonical_root, copy, cell.root, cell.deliveryCapability);
       },

@@ -228,7 +228,7 @@ test("publication proof fails closed after process restart and preserves pending
   }
 });
 
-test("routing configuration replacement blocks a published delivery", () => {
+test("runtime facade preserves configured routing across obligation and publication", () => {
   const root = makeProject("omp-cto-delivery-routing-");
   try {
     const runId = "delivery-routing";
@@ -247,6 +247,10 @@ test("routing configuration replacement blocks a published delivery", () => {
       const replacementRouting = { ...oldRouting, config_sha256: "c".repeat(64), snapshot_sha256: "d".repeat(64), target: "https://replacement.example/topic" } as const;
       assert.equal(access.currentOutboxDeliveryStatus({ ...input, routing_binding: replacementRouting }), "unavailable", "a changed routing snapshot cannot authorize the old publication");
       assert.equal(access.currentOutboxDeliveryStatus({ ...input, routing_binding: oldRouting }), "current", "the original receipt remains usable until a trusted republish");
+      assert.throws(
+        () => access.publishOutboxDelivery({ ...routedInput, routing_binding: { ...oldRouting, config_sha256: "invalid" } } as never),
+        (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "runtime_access_invalid",
+      );
     } finally {
       runtime.close();
       rootIdentity.close();
