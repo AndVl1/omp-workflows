@@ -19,12 +19,38 @@ import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { registerWorkflowTools } from "../src/index.js";
 import { ensureProjectConstitution } from "../src/specification/prerequisite.js";
 import { createFeatureWorkspace } from "../src/specification/workspace.js";
-import { resolveState, writeState } from "../src/engine/state.js";
-import type { AgentMappingState } from "../src/engine/agent-mapping.js";
+import { resolveState, updateStateAtomically, writeState } from "../src/engine/state.js";
+import { buildAgentMapping, writeAgentMapping, type AgentMappingState } from "../src/engine/agent-mapping.js";
+import { resolveConfig } from "../src/engine/config.js";
 import type { CapabilityHandoff } from "../src/engine/durable.js";
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
+}
+
+function publishMapping(root: string): AgentMappingState {
+  mkdirSync(join(root, ".omp"), { recursive: true });
+  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({
+    roles: { "specification-analyst": "specification-worker", "specification-architect": "specification-architect" },
+  }) + "\n");
+  const config = resolveConfig(root);
+  const mapping = buildAgentMapping({
+    roles: config.roles,
+    availableAgents: ["specification-worker", "specification-architect"],
+    extraRoles: config.scope_map.map((entry) => entry.dev_agent),
+    genericFallbackRoles: Object.keys(config.roles),
+    source: "workflow-tools-integration-test",
+    scope_map: config.scope_map,
+    flags: config.flags,
+    roster: config.roster_overrides,
+    config_path: config.config_path,
+    config_source: config.config_source,
+    config_hash: config.config_hash,
+    config_version: config.config_version,
+    config_provenance: config.config_provenance,
+  });
+  writeAgentMapping(root, mapping);
+  return mapping;
 }
 
 test("wave-004: workflow tools invoke beforeBegin per transition with the exact current cwd; hook rejection fails advance closed", async () => {
@@ -323,17 +349,22 @@ test("specification control tools bind explicit selectors despite a stale active
     assert.equal(instructions.details.workflow, "spec-preparation");
     assert.equal(instructions.details.state.stageCursor, profile.stages[0]?.id);
     assert.match(instructions.details.provenance.statePath, /features\/selector-a\/state\.json$/);
+    assert.equal(instructions.details.required_next_tool.name, "workflow_start_native_specification_phase");
+    assert.deepEqual(instructions.details.required_next_tool.arguments, prepareA.details.required_next_tool.arguments, "instructions expose the exact engine-issued preparation handoff");
 
+    const stateBeforeBegin = readFileSync(selectorAPath, "utf8");
     const begun = await tool("workflow_begin").execute("id", {
       ...selectorA,
       selection: { occurrences: [{ role: "specification-analyst" }] },
     }, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER });
-    assert.equal(begun.details.ok, true, begun.details.error ?? "explicit A begin accepted");
-    assert.equal(begun.details.handoff.run_key, "run-selector-a");
+    assert.equal(begun.details.ok, false);
+    assert.equal(begun.details.code, "WORKFLOW_BEGIN_REJECTED");
+    assert.equal(begun.details.error, "native specification capability requires the engine-issued authenticated preparation source");
+    assert.equal(readFileSync(selectorAPath, "utf8"), stateBeforeBegin, "selector-only native begin is rejected without mutating state");
 
     const selectedA = resolveState(root, undefined, selectorA);
     const selectedB = resolveState(root, undefined, { feature_id: "selector-b", run_key: "run-selector-b" });
-    assert.equal(selectedA.state?.dispatch_capability?.status, "ready");
+    assert.equal(selectedA.state?.dispatch_capability, undefined);
     assert.equal(selectedB.state?.dispatch_capability, undefined, "the active-pointer workspace was not mutated");
 
     const implicitStatus = await tool("workflow_status").execute("id", {}, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER });
