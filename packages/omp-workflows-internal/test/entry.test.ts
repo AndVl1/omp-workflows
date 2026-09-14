@@ -78,9 +78,9 @@ function plainRoot(): string {
 }
 
 function replaceAllMarkers(root: string): void {
-	rmSync(join(root, "package.json"));
-	rmSync(join(root, "packages", "core"), { recursive: true });
-	rmSync(join(root, "packages", "fullstack"), { recursive: true });
+	rmSync(join(root, "package.json"), { force: true });
+	rmSync(join(root, "packages", "core"), { recursive: true, force: true });
+	rmSync(join(root, "packages", "fullstack"), { recursive: true, force: true });
 	writeFileSync(join(root, "package.json"), "{}\n");
 	mkdirSync(join(root, "packages", "core"), { recursive: true });
 	mkdirSync(join(root, "packages", "fullstack"), { recursive: true });
@@ -145,6 +145,7 @@ test("with all markers present the bundle claims every capability under frozen i
 	assert.deepEqual(host.labels, [OMP_INTERNAL_BUNDLE_ID]);
 	assert.equal(isRegisteredWorkflow("omp-feature"), true, "bundle profile registered");
 	assert.equal(isRegisteredWorkflow("omp-validate"), true, "bundle profile registered");
+	host.fireSessionShutdown({ cwd: root });
 });
 
 test("re-activation is idempotent per host instance", () => {
@@ -154,6 +155,7 @@ test("re-activation is idempotent per host instance", () => {
 	host.fireSessionStart({ cwd: root });
 	host.fireSessionStart({ cwd: root });
 	assert.deepEqual(host.labels, [OMP_INTERNAL_BUNDLE_ID], "label set exactly once");
+	host.fireSessionShutdown({ cwd: root });
 });
 
 
@@ -174,6 +176,8 @@ test("session shutdown releases the retained generation and stale shutdown canno
 		assert.equal(isRegisteredWorkflow("omp-feature"), true, "missing shutdown identity must preserve the replacement generation");
 		host.fireSessionShutdown({ cwd: root }, { sessionId: 42 });
 		assert.equal(isRegisteredWorkflow("omp-feature"), true, "malformed shutdown identity must preserve the replacement generation");
+		host.fireSessionShutdown({ cwd: root, sessionId: "internal-session-B" }, { sessionId: 42 });
+		assert.equal(isRegisteredWorkflow("omp-feature"), true, "malformed event identity must not fall back to mutable context identity");
 		host.fireSessionShutdown({ cwd: root }, { sessionId: "internal-session-A" });
 		assert.equal(isRegisteredWorkflow("omp-feature"), true, "stale shutdown must not evict the replacement generation");
 		host.fireSessionShutdown({ cwd: root }, { sessionId: "internal-session-B" });
@@ -232,9 +236,10 @@ test("an already-activated bundle rejects a later foreign claim (reverse order)"
 	ompWorkflowsInternal(host.pi as never);
 	host.fireSessionStart({ cwd: root });
 
-	const attempted = openForeignActivation(root, ["workflow_tools"]);
+	const attempted = openForeignActivation(root, ["workflow_registration", "workflow_tools"]);
 	assert.equal(attempted.ok, false);
 	if (!attempted.ok) assert.equal(attempted.code, "owner_conflict");
+	host.fireSessionShutdown({ cwd: root });
 });
 
 test("`omp-workflow-team validate` is strictly read-only", async () => {
@@ -289,6 +294,7 @@ test("session manager getter failure is authoritative over stale context cwd", (
 test("a throw mid-registration yields a typed degradation, never a silent ok", () => {
 	const root = markedRoot();
 	const failing = makePi();
+	ompWorkflowsInternal(failing.pi as never);
 	// registerTeamWorkflow calls pi.setLabel first — inject the failure there.
 	failing.pi.setLabel = () => {
 		throw new Error("host registration exploded");
@@ -303,6 +309,7 @@ test("a throw mid-registration yields a typed degradation, never a silent ok", (
 	const second = ensureEngineActivation(failing.pi as never, root);
 	assert.equal(second.ok, false);
 	if (!second.ok) assert.equal(second.code, "registration_failed");
+	failing.fireSessionShutdown({ cwd: root });
 });
 
 test("runtime config failure rolls back only this activation's new claims", () => {
@@ -312,6 +319,7 @@ test("runtime config failure rolls back only this activation's new claims", () =
 	rmSync(join(root, ".omp"), { recursive: true, force: true });
 	writeFileSync(join(root, ".omp"), "not a directory\n");
 	const host = makePi();
+	ompWorkflowsInternal(host.pi as never);
 	const first = ensureEngineActivation(host.pi as never, root);
 	assert.equal(first.ok, false);
 	if (!first.ok) assert.equal(first.code, "registration_failed");
@@ -322,11 +330,13 @@ test("runtime config failure rolls back only this activation's new claims", () =
 	mkdirSync(join(root, ".omp"), { recursive: true });
 	const second = ensureEngineActivation(host.pi as never, root);
 	assert.equal(second.ok, true);
+	host.fireSessionShutdown({ cwd: root });
 });
 
 test("registration recovers on a later attempt once the host stops throwing", () => {
 	const root = markedRoot();
 	const flaky = makePi();
+	ompWorkflowsInternal(flaky.pi as never);
 	let failures = 1;
 	flaky.pi.setLabel = (label: string) => {
 		if (failures > 0) {
@@ -341,6 +351,7 @@ test("registration recovers on a later attempt once the host stops throwing", ()
 	const second = ensureEngineActivation(flaky.pi as never, root);
 	assert.equal(second.ok, true);
 	assert.deepEqual(flaky.labels, [OMP_INTERNAL_BUNDLE_ID]);
+	flaky.fireSessionShutdown({ cwd: root });
 });
 
 test("registration rollback uses original-root token across replacement and preserves foreign claims", () => {
@@ -384,8 +395,11 @@ test("registration rollback uses original-root token across replacement and pres
 	rmSync(aliasParent, { force: true });
 	symlinkSync(parentOne, aliasParent, "dir");
 	renameSync(movedRoot, originalRoot);
-	const retry = ensureEngineActivation(makePi().pi as never, cwd);
+	const retryHost = makePi();
+	ompWorkflowsInternal(retryHost.pi as never);
+	const retry = ensureEngineActivation(retryHost.pi as never, cwd);
 	assert.equal(retry.ok, true, "the original activation claims were released by token");
+	retryHost.fireSessionShutdown({ cwd });
 	releaseWorkflowOwners(foreign.release_token, foreign.leased_capabilities);
 
 	rmSync(aliasParent, { force: true });
@@ -405,6 +419,7 @@ test("initial marked activation writes config and permits a normal later session
 	const second = ensureEngineActivation(host.pi as never, root);
 	assert.equal(second.ok, true);
 	assert.equal(readFileSync(configPath, "utf8"), before, "normal subsequent activation is idempotent");
+	host.fireSessionShutdown({ cwd: root });
 });
 
 test("marker deletion and symlink substitution reject retained activation before writes", () => {
@@ -435,6 +450,8 @@ test("marker deletion and symlink substitution reject retained activation before
 	if (!linked.ok) assert.equal(linked.code, "activation_markers_missing");
 	assert.equal(statSync(symlinkConfig).mtimeMs, symlinkConfigStat.mtimeMs, "symlink substitution must block config writes");
 	assert.equal(existsSync(join(symlinkRoot, ".work-state")), false, "revoked activation must not create state");
+	host.fireSessionShutdown({ cwd: root });
+	symlinkHost.fireSessionShutdown({ cwd: symlinkRoot });
 });
 
 test("complete marker replacement blocks retained owner/config writes", () => {
@@ -451,6 +468,7 @@ test("complete marker replacement blocks retained owner/config writes", () => {
 	if (!replaced.ok) assert.equal(replaced.code, "activation_identity_changed");
 	assert.equal(readFileSync(configPath, "utf8"), before, "marker replacement must not rewrite config");
 	assert.equal(existsSync(join(root, ".work-state")), false, "marker replacement must not create state");
+	host.fireSessionShutdown({ cwd: root });
 });
 
 test("tracked marker replacement revokes retained activation", () => {
@@ -467,6 +485,7 @@ test("tracked marker replacement revokes retained activation", () => {
 	assert.equal(replaced.ok, false, "tracked marker identity replacement must revoke activation");
 	if (!replaced.ok) assert.equal(replaced.code, "activation_identity_changed");
 	assert.equal(readFileSync(configPath, "utf8"), before, "tracked marker replacement must not rewrite config");
+	host.fireSessionShutdown({ cwd: root });
 });
 
 test("root replacement blocks retained command ownership before replacement-root writes", () => {
@@ -488,4 +507,5 @@ test("root replacement blocks retained command ownership before replacement-root
 	assert.equal(existsSync(join(root, ".omp")), false, "replacement root must not receive config");
 	assert.equal(existsSync(join(root, ".work-state")), false, "replacement root must not receive state");
 	assert.equal(existsSync(join(oldRoot, ".omp", "team.config.json")), true, "original root remains intact");
+	host.fireSessionShutdown({ cwd: root });
 });

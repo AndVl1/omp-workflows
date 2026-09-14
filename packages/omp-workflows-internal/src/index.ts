@@ -255,15 +255,18 @@ function sessionIdentityFromContext(event: unknown, ctx: unknown): string | unde
 		if (!source || typeof source !== "object") continue;
 		try {
 			let identityFieldPresent = false;
+			let identity: string | undefined;
 			for (const key of ["sessionId", "session_id"] as const) {
 				if (!(key in (source as object))) continue;
 				identityFieldPresent = true;
 				const value = (source as Record<string, unknown>)[key];
-				if (typeof value === "string" && value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/u.test(value)) return value;
+				if (typeof value !== "string" || value.length === 0 || value.length > 256 || /[\u0000-\u001f\u007f]/u.test(value)) return undefined;
+				if (identity !== undefined && identity !== value) return undefined;
+				identity = value;
 			}
-			// An explicitly present but malformed identity is authoritative and
-			// must not fall through to mutable context state.
-			if (identityFieldPresent) return undefined;
+			// An explicitly present but malformed or conflicting identity is
+			// authoritative and must not fall through to mutable context state.
+			if (identityFieldPresent) return identity;
 		} catch {
 			return undefined;
 		}
