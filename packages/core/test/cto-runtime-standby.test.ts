@@ -1,21 +1,15 @@
 import { strict as assert } from "node:assert";
-import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, mkdirSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import {
-  openWorkflowActivation,
-  releaseWorkflowOwners,
-  type WorkflowOwnerIdentity,
-} from "../src/registry/owner.js";
-import { CtoRuntimeAccessError, openCtoRuntimeAccess } from "../src/cto/runtime-access.js";
+import { CtoRuntimeAccessError } from "../src/cto/runtime-access.js";
+import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 import { CtoAuthorityUnavailableError, findActiveCtoRun } from "../src/commands/cto.js";
 import { CTO_RUN_DELIVERY_INDEX_FILE, ctoRuntimeRunInitialIdentityDigest, mintCtoRuntimeRunOrigin, newCtoState, readCtoState } from "../src/cto/state.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 
 const MARKER = '{"schema_version":1,"bundle_id":"@andvl1/omp-workflows-fullstack","entrypoint":"dist/index.js"}\n';
-const MARKER_SHA256 = createHash("sha256").update(MARKER, "utf8").digest("hex");
 
 function makeProject(): string {
   const root = mkdtempSync(join(tmpdir(), "omp-cto-standby-"));
@@ -24,39 +18,15 @@ function makeProject(): string {
   return root;
 }
 
-function ownerFor(root: string): WorkflowOwnerIdentity {
-  return {
-    owner_id: "fullstack-standby-test",
-    bundle_id: "@andvl1/omp-workflows-fullstack",
-    owner_kind: "fullstack",
-    activation_marker: "fullstack-standby-test-v1",
-    host_range: ">=17.0.0",
-    activation: {
-      marker_id: "fullstack-standby-test-v1",
-      required: [{ path: ".omp/fullstack.activation.json", kind: "file", sha256: MARKER_SHA256 }],
-    },
-    provenance: {
-      package: "@andvl1/omp-workflows-fullstack",
-      entrypoint: "dist/index.js",
-      cwd: root,
-    },
-  };
-}
-
 function openAccess(root: string) {
-  const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], ownerFor(root));
-  assert.equal(activation.ok, true);
-  if (!activation.ok) throw new Error(activation.error);
-  const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "main-session", main: true }, root);
-  assert.equal(opened.ok, true);
-  if (!opened.ok) throw new Error(opened.error);
-  return { activation, access: opened.access };
+  const runtime = openTestCtoRuntime(root, "main-session", "cto-runtime-standby-test");
+  return { runtime, access: runtime.access };
 }
 
 test("ensureStandbyRun reuses the active standby and serializes concurrent callers", async () => {
   const root = makeProject();
   try {
-    const { activation, access } = openAccess(root);
+    const { runtime, access } = openAccess(root);
     const first = access.ensureStandbyRun();
     assert.match(first, /^standby-[0-9]+-[0-9a-f]{8}$/u);
     const second = access.ensureStandbyRun();
@@ -74,7 +44,6 @@ test("ensureStandbyRun reuses the active standby and serializes concurrent calle
       Promise.resolve().then(() => access.ensureStandbyRun()),
     ]);
     assert.deepEqual(concurrent, [first, first, first]);
-    releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -83,7 +52,7 @@ test("ensureStandbyRun reuses the active standby and serializes concurrent calle
 test("ensureStandbyRun rolls back candidate directories and rejects a swapped root", () => {
   const root = makeProject();
   try {
-    const { activation, access } = openAccess(root);
+    const { runtime, access } = openAccess(root);
     const prototype = PinnedProjectRoot.prototype as unknown as {
       writeExclusive: (relativeFile: string, content: unknown) => void;
     };
@@ -104,7 +73,6 @@ test("ensureStandbyRun rolls back candidate directories and rejects a swapped ro
     const ctoRoot = join(root, ".work-state", "cto");
     const leftovers = readdirSync(ctoRoot, { withFileTypes: true }).filter((entry) => entry.name.startsWith("standby-") && entry.isDirectory());
     assert.deepEqual(leftovers, []);
-    releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -112,7 +80,7 @@ test("ensureStandbyRun rolls back candidate directories and rejects a swapped ro
   const swappedRoot = makeProject();
   const oldRoot = `${swappedRoot}.old`;
   try {
-    const { activation, access } = openAccess(swappedRoot);
+    const { runtime, access } = openAccess(swappedRoot);
     renameSync(swappedRoot, oldRoot);
     mkdirSync(swappedRoot);
     mkdirSync(join(swappedRoot, ".omp"));
@@ -122,7 +90,6 @@ test("ensureStandbyRun rolls back candidate directories and rejects a swapped ro
       (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "activation_revoked",
     );
     assert.equal(existsSync(join(oldRoot, ".work-state", "cto")), false);
-    releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
   } finally {
     rmSync(swappedRoot, { recursive: true, force: true });
     rmSync(oldRoot, { recursive: true, force: true });
@@ -132,8 +99,8 @@ test("ensureStandbyRun rolls back candidate directories and rejects a swapped ro
 test("ensureStandbyRun rejects marker removal and cannot be used after revocation", () => {
   const root = makeProject();
   try {
-    const { activation, access } = openAccess(root);
-    unlinkSync(join(root, ".omp", "fullstack.activation.json"));
+    const { runtime, access } = openAccess(root);
+    unlinkSync(join(root, ".omp-test-registry-marker"));
     assert.throws(
       () => access.ensureStandbyRun(),
       (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "activation_revoked",
@@ -142,7 +109,6 @@ test("ensureStandbyRun rejects marker removal and cannot be used after revocatio
       () => access.ensureStandbyRun(),
       (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "activation_revoked",
     );
-    releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -152,7 +118,7 @@ test("ensureStandbyRun rejects marker removal and cannot be used after revocatio
 test("ensureStandbyRun recovers one authenticated orphan and rejects multiple without mutation", () => {
   const root = makeProject();
   try {
-    const { activation, access } = openAccess(root);
+    const { runtime, access } = openAccess(root);
     const createOrphan = (runId: string) => {
       const candidate = newCtoState({
         id: runId,
@@ -174,13 +140,12 @@ test("ensureStandbyRun recovers one authenticated orphan and rejects multiple wi
     assert.equal(recovered, "orphan-one");
     assert.equal(readCtoState(recovered, root)?.standby, true);
     assert.equal(existsSync(join(root, ".work-state", "cto", recovered, ".runtime-state-proof.json")), true);
-    access.close();
-    releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
+    runtime.close();
   } finally { rmSync(root, { recursive: true, force: true }); }
 
   const multiRoot = makeProject();
   try {
-    const { activation, access } = openAccess(multiRoot);
+    const { runtime, access } = openAccess(multiRoot);
     const createOrphan = (runId: string) => {
       const candidate = newCtoState({ id: runId, task: "standby — awaiting inbox tasks", branch: "", autonomous: true, plan: { id: runId, task: "standby — awaiting inbox tasks", teams: [], created_at: new Date().toISOString() }, standby: true });
       candidate.pause = { kind: "none", reason: "standby" };
@@ -195,8 +160,7 @@ test("ensureStandbyRun recovers one authenticated orphan and rejects multiple wi
     assert.throws(() => access.ensureStandbyRun(), (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "runtime_access_invalid" && error.message.includes("multiple orphan CTO standby origins"));
     assert.deepEqual(readdirSync(ctoRoot).sort(), before);
     assert.equal(existsSync(join(ctoRoot, CTO_RUN_DELIVERY_INDEX_FILE)), false);
-    access.close();
-    releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
+    runtime.close();
   } finally { rmSync(multiRoot, { recursive: true, force: true }); }
 });
 
@@ -211,7 +175,7 @@ test("ensureStandbyRun fails closed when active discovery is temporarily unavail
       owner_session: "main-session",
       plan: { id: "existing-active", task: "existing active run", teams: [], created_at: "" },
     });
-    const { activation, access } = openAccess(root);
+    const { runtime, access } = openAccess(root);
     access.createRun(active, { source_id: "runtime-standby-test", initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(active) });
     const ctoRoot = join(root, ".work-state", "cto");
     const indexPath = join(ctoRoot, CTO_RUN_DELIVERY_INDEX_FILE);
@@ -235,9 +199,8 @@ test("ensureStandbyRun fails closed when active discovery is temporarily unavail
       assert.equal(access.ensureStandbyRun(), active.id, "a valid active run is reused after authority recovery");
     } finally {
       prototype.readFile = originalReadFile;
-      access.close();
-      releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
-    }
+      runtime.close();
+      }
     assert.equal(blocked, 2);
     assert.deepEqual(readdirSync(ctoRoot).sort(), beforeDirs, "authority outage must not create a standby directory or rewrite its authenticated index");
     assert.deepEqual(readFileSync(indexPath), beforeIndex, "authority outage must not rewrite the delivery index");

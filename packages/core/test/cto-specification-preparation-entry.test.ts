@@ -18,24 +18,12 @@ import { sha256Hex } from "../src/specification/validation.js";
 import type { ParsedCtoEnvelope } from "../src/commands/cto.js";
 import { buildPreparationCtoPrompt } from "../src/commands/cto.js";
 import { MAX_CTO_SPECIFICATION_AGGREGATE_BYTES, MAX_CTO_SPECIFICATION_REQUESTS, MAX_CTO_SPECIFICATION_TEXT_BYTES } from "../src/cto/types.js";
-import { closeRegistryRegistrationContext, openWorkflowActivation, releaseWorkflowOwners, type WorkflowOwnerIdentity } from "../src/registry/owner.js";
-import { openCtoRuntimeAccess, type CtoRuntimeAccessFacade } from "../src/cto/runtime-access.js";
+import { type CtoRuntimeAccessFacade } from "../src/cto/runtime-access.js";
+import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 
 const CONSTITUTION = "# Project Constitution\n\nVersion: 1.0.0\n\n## Quality\n\nEvery change ships with behavioral tests.\n";
 const FULLSTACK_MARKER = "{\"schema_version\":1,\"bundle_id\":\"@andvl1/omp-workflows-fullstack\",\"entrypoint\":\"dist/index.js\"}\n";
 const FULLSTACK_MARKER_SHA256 = createHash("sha256").update(FULLSTACK_MARKER, "utf8").digest("hex");
-
-function ownerFor(root: string): WorkflowOwnerIdentity {
-  return {
-    owner_id: "fullstack-preparation-entry-test",
-    bundle_id: "@andvl1/omp-workflows-fullstack",
-    owner_kind: "fullstack",
-    activation_marker: "fullstack-preparation-entry-test-v1",
-    host_range: ">=17.0.0",
-    activation: { marker_id: "fullstack-preparation-entry-test-v1", required: [{ path: ".omp/fullstack.activation.json", kind: "file", sha256: FULLSTACK_MARKER_SHA256 }] },
-    provenance: { package: "@andvl1/omp-workflows-fullstack", entrypoint: "dist/index.js", cwd: root },
-  };
-}
 
 function project(): string {
   const root = mkdtempSync(join(tmpdir(), "cto-preparation-entry-"));
@@ -48,28 +36,8 @@ function project(): string {
 type PreparationRuntimeOptions = { runtimeAccess: CtoRuntimeAccessFacade; sessionId: string; cleanup: () => void };
 
 function preparationRuntimeOptions(root: string): PreparationRuntimeOptions {
-  const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], ownerFor(root));
-  assert.equal(activation.ok, true);
-  if (!activation.ok) throw new Error(activation.error);
-  const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "preparation-entry-test", main: true }, root);
-  assert.equal(opened.ok, true);
-  if (!opened.ok) {
-    closeRegistryRegistrationContext(activation.registry_context);
-    releaseWorkflowOwners(activation.release_token, activation.leased_capabilities);
-    throw new Error(opened.error);
-  }
-  let cleaned = false;
-  return {
-    runtimeAccess: opened.access,
-    sessionId: "preparation-entry-test",
-    cleanup: () => {
-      if (cleaned) return;
-      cleaned = true;
-      opened.access.close();
-      closeRegistryRegistrationContext(activation.registry_context);
-      releaseWorkflowOwners(activation.release_token, activation.leased_capabilities);
-    },
-  };
+  const runtime = openTestCtoRuntime(root, "preparation-entry-test", "cto-preparation-entry-runtime");
+  return { runtimeAccess: runtime.access, sessionId: "preparation-entry-test", cleanup: runtime.close };
 }
 
 function prepareCtoSpecificationPreparationWithRuntime(root: string, preparationInput: Record<string, unknown>): ReturnType<typeof prepareCtoSpecificationPreparationRaw> {
@@ -105,8 +73,10 @@ function crashDuringBootstrap(root: string, preparationInput: Record<string, unk
   const runtimeAccessModuleUrl = new URL("../src/cto/runtime-access.ts", import.meta.url).href;
   const script = `import { prepareCtoSpecificationPreparation } from ${JSON.stringify(preparationModuleUrl)};
 import { setCtoSpecificationPreparationFailureInjector } from ${JSON.stringify(runModuleUrl)};
-import { openWorkflowActivation } from ${JSON.stringify(ownerModuleUrl)};
+import { openWorkflowActivation, requireRegistryContext } from ${JSON.stringify(ownerModuleUrl)};
+import { issueCtoRuntimeSessionAuthority } from ${JSON.stringify(new URL("../src/cto/session-authority.ts", import.meta.url).href)};
 import { openCtoRuntimeAccess } from ${JSON.stringify(runtimeAccessModuleUrl)};
+import { realpathSync, statSync } from "node:fs";
 setCtoSpecificationPreparationFailureInjector((point) => { if (point === process.env.BOOTSTRAP_FAILURE_POINT) process.exit(73); });
 const root = process.env.BOOTSTRAP_ROOT;
 if (!root) throw new Error("BOOTSTRAP_ROOT is required");
@@ -121,9 +91,19 @@ const owner = {
 };
 const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], owner);
 if (!activation.ok) throw new Error(activation.error);
-const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "preparation-entry-child", main: true }, root);
+const sessionId = "preparation-entry-child";
+const runtimeRoot = realpathSync(root);
+const runtimeIdentity = statSync(runtimeRoot);
+const sessionManager = Object.freeze({ cwd: root, getSessionId: () => sessionId, getCwd: () => root });
+const authority = issueCtoRuntimeSessionAuthority(
+  activation.registry_context,
+  { canonical_root: runtimeRoot, dev: runtimeIdentity.dev, ino: runtimeIdentity.ino },
+  { sessionManager, sessionId },
+  () => { requireRegistryContext(activation.registry_context, runtimeRoot, "workflow_tools"); },
+);
+const opened = openCtoRuntimeAccess(activation.registry_context, authority, root);
 if (!opened.ok) throw new Error(opened.error);
-prepareCtoSpecificationPreparation(process.env.BOOTSTRAP_ROOT, JSON.parse(process.env.BOOTSTRAP_INPUT), { runtimeAccess: opened.access, sessionId: "preparation-entry-child" });
+prepareCtoSpecificationPreparation(process.env.BOOTSTRAP_ROOT, JSON.parse(process.env.BOOTSTRAP_INPUT), { runtimeAccess: opened.access, sessionId });
 process.exit(92);`;
   const child = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
     cwd: process.cwd(),
@@ -149,19 +129,14 @@ describe("engine-owned CTO specification preparation entry", () => {
   });
   test("rejects blank runtime session identity before preparation mutation", () => {
     const root = project();
-    const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], ownerFor(root));
-    assert.equal(activation.ok, true);
-    if (!activation.ok) throw new Error(activation.error);
+    const runtime = openTestCtoRuntime(root, "preparation-entry-test", "cto-preparation-entry-blank-session");
     try {
-      const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "preparation-entry-test", main: true }, root);
-      assert.equal(opened.ok, true);
-      if (!opened.ok) throw new Error(opened.error);
-      const result = prepareCtoSpecificationPreparationRaw(root, input() as never, { runtimeAccess: opened.access, sessionId: "   " });
+      const result = prepareCtoSpecificationPreparationRaw(root, input() as never, { runtimeAccess: runtime.access, sessionId: "   " });
       assert.equal(result.status, "blocked", JSON.stringify(result));
       if (result.status === "blocked") assert.match(result.findings.join("\n"), /session id is required/u);
       assert.equal(existsSync(join(root, ".work-state")), false);
     } finally {
-      releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
+      runtime.close();
       rmSync(root, { recursive: true, force: true });
     }
   });

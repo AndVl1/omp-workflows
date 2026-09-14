@@ -25,8 +25,7 @@ import {
   recordTrustedCheckpointAnswer,
 } from "../src/engine/checkpoints.js";
 import { createCapability } from "../src/engine/durable.js";
-import { openWorkflowActivation, releaseWorkflowOwners, type WorkflowOwnerIdentity } from "../src/registry/owner.js";
-import { openCtoRuntimeAccess } from "../src/cto/runtime-access.js";
+import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { deriveCtoSpecificationPreparationTeams } from "../src/commands/cto.js";
 import type { TeamDef } from "../src/cto/types.js";
@@ -171,33 +170,8 @@ const recordDecisions = recordCtoSpecificationDecisions as unknown as (
 ) => DecisionsResult;
 
 function openPreparationRuntime(root: string) {
-  const owner: WorkflowOwnerIdentity = {
-    owner_id: "cto-spec-preparation-runtime-test",
-    bundle_id: "@andvl1/omp-workflows-fullstack",
-    owner_kind: "fullstack",
-    activation_marker: "cto-spec-preparation-runtime-test-v1",
-    host_range: ">=17.0.0",
-    activation: {
-      marker_id: "cto-spec-preparation-runtime-test-v1",
-      required: [{ path: ".omp/fullstack.activation.json", kind: "file", sha256: RUNTIME_ACTIVATION_MARKER_SHA256 }],
-    },
-    provenance: {
-      package: "@andvl1/omp-workflows-fullstack",
-      entrypoint: "dist/index.js",
-      cwd: root,
-    },
-  };
-  const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], owner);
-  if (!activation.ok) throw new Error(activation.error);
-  const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "cto-spec-preparation-runtime-test-session", main: true }, root);
-  if (!opened.ok) {
-    releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
-    throw new Error(opened.error);
-  }
-  return {
-    access: opened.access,
-    release: () => releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]),
-  };
+  const runtime = openTestCtoRuntime(root, "cto-spec-preparation-runtime-test-session", "cto-spec-preparation-runtime-test");
+  return { access: runtime.access, release: runtime.close };
 }
 
 function advance(projectRoot: string, input: { cto_run_id: string }): AdvanceResult {
@@ -212,8 +186,11 @@ function advance(projectRoot: string, input: { cto_run_id: string }): AdvanceRes
 function childRuntimeBootstrap(): string {
   const ownerModuleUrl = new URL("../src/registry/owner.ts", import.meta.url).href;
   const runtimeModuleUrl = new URL("../src/cto/runtime-access.ts", import.meta.url).href;
-  return `import { openWorkflowActivation, releaseWorkflowOwners } from ${JSON.stringify(ownerModuleUrl)};
+  const sessionAuthorityModuleUrl = new URL("../src/cto/session-authority.ts", import.meta.url).href;
+  return `import { openWorkflowActivation, releaseWorkflowOwners, requireRegistryContext } from ${JSON.stringify(ownerModuleUrl)};
+import { issueCtoRuntimeSessionAuthority } from ${JSON.stringify(sessionAuthorityModuleUrl)};
 import { openCtoRuntimeAccess } from ${JSON.stringify(runtimeModuleUrl)};
+import { realpathSync, statSync } from "node:fs";
 const root = process.env.REVIEW_PACKET_CRASH_ROOT;
 if (!root) throw new Error("review packet crash root is missing");
 const markerSha256 = ${JSON.stringify(RUNTIME_ACTIVATION_MARKER_SHA256)};
@@ -228,7 +205,17 @@ const owner = {
 };
 const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], owner);
 if (!activation.ok) throw new Error(activation.error);
-const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "cto-spec-preparation-runtime-test-child-session", main: true }, root);
+const sessionId = "cto-spec-preparation-runtime-test-child-session";
+const runtimeRoot = realpathSync(root);
+const runtimeIdentity = statSync(runtimeRoot);
+const sessionManager = Object.freeze({ cwd: root, getSessionId: () => sessionId, getCwd: () => root });
+const authority = issueCtoRuntimeSessionAuthority(
+  activation.registry_context,
+  { canonical_root: runtimeRoot, dev: runtimeIdentity.dev, ino: runtimeIdentity.ino },
+  { sessionManager, sessionId },
+  () => { requireRegistryContext(activation.registry_context, runtimeRoot, "workflow_tools"); },
+);
+const opened = openCtoRuntimeAccess(activation.registry_context, authority, root);
 if (!opened.ok) {
   releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
   throw new Error(opened.error);

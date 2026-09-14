@@ -1,22 +1,16 @@
 import { strict as assert } from "node:assert";
-import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import {
-  openWorkflowActivation,
-  releaseWorkflowOwners,
-  type WorkflowOwnerIdentity,
-} from "../src/registry/owner.js";
-import { CtoRuntimeAccessError, openCtoRuntimeAccess, type CtoRuntimeOutboxDeliveryInput } from "../src/cto/runtime-access.js";
+import { CtoRuntimeAccessError, type CtoRuntimeOutboxDeliveryInput } from "../src/cto/runtime-access.js";
+import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 import { canonicalDurableIdFileName } from "../src/cto/durable-id.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { CTO_RUN_DELIVERY_INDEX_FILE, markCtoRunDeliveryPending, newCtoState, publishCtoOutboxDelivery as rawPublishCtoOutboxDelivery, readCtoState, setCtoPause, writeCtoState } from "../src/cto/state.js";
 
 const MARKER = '{"schema_version":1,"bundle_id":"@andvl1/omp-workflows-fullstack","entrypoint":"dist/index.js"}\n';
-const MARKER_SHA256 = createHash("sha256").update(MARKER, "utf8").digest("hex");
 
 function makeProject(prefix: string): string {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -25,31 +19,9 @@ function makeProject(prefix: string): string {
   return root;
 }
 
-function ownerFor(root: string): WorkflowOwnerIdentity {
-  return {
-    owner_id: "fullstack-delivery-guard-test",
-    bundle_id: "@andvl1/omp-workflows-fullstack",
-    owner_kind: "fullstack",
-    activation_marker: "fullstack-delivery-guard-test-v1",
-    host_range: ">=17.0.0",
-    activation: {
-      marker_id: "fullstack-delivery-guard-test-v1",
-      required: [{ path: ".omp/fullstack.activation.json", kind: "file", sha256: MARKER_SHA256 }],
-    },
-    provenance: {
-      package: "@andvl1/omp-workflows-fullstack",
-      entrypoint: "dist/index.js",
-      cwd: root,
-    },
-  };
-}
-
 function openAccess(root: string) {
-  const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], ownerFor(root));
-  if (activation.ok !== true) throw new Error(activation.error);
-  const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "main-session", main: true }, root);
-  if (opened.ok !== true) throw new Error(opened.error);
-  return { activation, access: opened.access };
+  const runtime = openTestCtoRuntime(root, "main-session", "cto-runtime-delivery-guard-test");
+  return { runtime, access: runtime.access };
 }
 
 function makeState(runId: string) {
@@ -98,7 +70,7 @@ test("currentOutboxDeliveryStatus validates genuine outbox publication and raw r
     const runId = "delivery-guard";
     const state = makeState(runId);
     writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const { activation, access } = openAccess(root);
+    const { runtime, access } = openAccess(root);
     try {
       const input = deliveryInput(runId, state.state_revision as number);
       assert.ok(publishWithObligation(root, access, input));
@@ -121,8 +93,7 @@ test("currentOutboxDeliveryStatus validates genuine outbox publication and raw r
       assert.equal(access.currentOutboxDeliveryStatus({ ...retryInput, lane: "outbox" }), "invalid");
       assert.equal(access.currentOutboxDeliveryStatus({ ...retryInput, extra: true } as never), "invalid");
     } finally {
-      access.close();
-      releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
+      runtime.close();
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -139,8 +110,8 @@ test("currentOutboxDeliveryStatus rejects valid-looking unindexed files and stal
     const otherRunId = "cross-root";
     const otherState = makeState(otherRunId);
     writeCtoState(otherState, otherRoot, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const { activation, access } = openAccess(root);
-    const { activation: otherActivation, access: otherAccess } = openAccess(otherRoot);
+    const { runtime, access } = openAccess(root);
+    const { runtime: otherRuntime, access: otherAccess } = openAccess(otherRoot);
     try {
       const input = deliveryInput(runId, state.state_revision as number);
       const outboxDir = join(root, ".work-state", "cto", runId, "outbox");
@@ -215,10 +186,8 @@ test("currentOutboxDeliveryStatus rejects valid-looking unindexed files and stal
       }
       assert.equal(access.currentOutboxDeliveryStatus(input), "current");
     } finally {
-      access.close();
-      otherAccess.close();
-      releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
-      releaseWorkflowOwners(otherActivation.release_token, ["workflow_registration", "workflow_tools"]);
+      runtime.close();
+      otherRuntime.close();
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -233,11 +202,11 @@ test("publication proof fails closed after process restart and preserves pending
     const state = makeState(runId);
     writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     const input = deliveryInput(runId, state.state_revision as number);
-    const { activation, access } = openAccess(root);
+    const { runtime, access } = openAccess(root);
     try {
       assert.ok(publishWithObligation(root, access, input));
-    const outboxPath = join(root, ".work-state", "cto", runId, "outbox", input.entry_name);
-    const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
+      const outboxPath = join(root, ".work-state", "cto", runId, "outbox", input.entry_name);
+      const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
     const stateUrl = new URL("../src/cto/state.ts", import.meta.url).href;
     const pinnedRootUrl = new URL("../src/specification/pinned-root.ts", import.meta.url).href;
     const script = `import { currentOutboxDeliveryStatusPinned } from ${JSON.stringify(stateUrl)}; import { PinnedProjectRoot } from ${JSON.stringify(pinnedRootUrl)}; const root = PinnedProjectRoot.open(${JSON.stringify(root)}); if (!root) process.exit(3); const result = currentOutboxDeliveryStatusPinned(${JSON.stringify(input)}, root); root.close(); process.stdout.write(result);`;
@@ -252,8 +221,7 @@ test("publication proof fails closed after process restart and preserves pending
     assert.equal(recovery.status, 0, recovery.stderr);
     assert.equal(recovery.stdout.trim(), "null:recovery_required", "a fresh process cannot re-sign the prior process-scoped proof");
       } finally {
-        access.close();
-        releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
+        runtime.close();
       }
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -270,7 +238,7 @@ test("routing configuration replacement blocks a published delivery", () => {
     const rootIdentity = PinnedProjectRoot.open(root);
     assert.ok(rootIdentity);
     const oldRouting = { config_sha256: "a".repeat(64), snapshot_sha256: "b".repeat(64), channel: "http:primary", target: "https://old.example/topic", canonical_root: rootIdentity.canonical_root, root_dev: rootIdentity.dev, root_ino: rootIdentity.ino } as const;
-    const { activation, access } = openAccess(root);
+    const { runtime, access } = openAccess(root);
     try {
       const routedInput = { ...input, routing_binding: oldRouting };
       assert.ok(publishWithObligation(root, access, routedInput));
@@ -280,8 +248,7 @@ test("routing configuration replacement blocks a published delivery", () => {
       assert.equal(access.currentOutboxDeliveryStatus({ ...input, routing_binding: replacementRouting }), "unavailable", "a changed routing snapshot cannot authorize the old publication");
       assert.equal(access.currentOutboxDeliveryStatus({ ...input, routing_binding: oldRouting }), "current", "the original receipt remains usable until a trusted republish");
     } finally {
-      access.close();
-      releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
+      runtime.close();
       rootIdentity.close();
     }
   } finally {
@@ -305,7 +272,7 @@ test("readCompletedDeliveryIndexPage paginates acknowledged terminal entries bey
       summary_digest: "",
     }));
     writeFileSync(join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE), JSON.stringify({ schema_version: 2, active_run_id: null, entries }) + "\n");
-    const { activation, access } = openAccess(root);
+    const { runtime, access } = openAccess(root);
     try {
       const first = access.readCompletedDeliveryIndexPage({ limit: 64 });
       assert.equal(Object.isFrozen(first), true);
@@ -319,8 +286,7 @@ test("readCompletedDeliveryIndexPage paginates acknowledged terminal entries bey
       assert.throws(() => access.readCompletedDeliveryIndexPage({ after_run_id: "../unsafe" }), (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "runtime_access_invalid");
       assert.throws(() => access.readCompletedDeliveryIndexPage({ limit: 0 }), (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "runtime_access_invalid");
     } finally {
-      access.close();
-      releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
+      runtime.close();
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -335,7 +301,7 @@ test("delivery lane marking preserves opposite pending flags for concurrent publ
     const secondState = makeState("lane-second");
     writeCtoState(firstState, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     writeCtoState(secondState, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const { activation, access } = openAccess(root);
+    const { runtime, access } = openAccess(root);
     try {
       const first = deliveryInput(firstState.id, firstState.state_revision as number);
       const second = deliveryInput(secondState.id, secondState.state_revision as number);
@@ -367,8 +333,7 @@ test("delivery lane marking preserves opposite pending flags for concurrent publ
       assert.equal(access.acknowledgeDelivery(secondState.id, secondDrained!.state_revision), true);
       assert.deepEqual(access.readDeliveryIndexPage().entries, []);
     } finally {
-      access.close();
-      releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
+      runtime.close();
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -382,7 +347,7 @@ test("terminal runs accept only current ACK deliveries in addition to determinis
     const active = makeState("active-ack");
     writeCtoState(active, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     const activeAck = ackInput(active.id, active.state_revision as number);
-    const { activation, access } = openAccess(root);
+    const { runtime, access } = openAccess(root);
     try {
       assert.ok(publishWithObligation(root, access, activeAck));
       assert.equal(access.currentOutboxDeliveryStatus(activeAck), "current");
@@ -401,8 +366,7 @@ test("terminal runs accept only current ACK deliveries in addition to determinis
       assert.equal(rawPublishCtoOutboxDelivery(root, ackInput(terminal.id, current!.state_revision as number, "progress")), null);
       assert.equal(rawPublishCtoOutboxDelivery(root, ackInput(terminal.id, current!.state_revision as number, "ack", "wrong-target")), null);
     } finally {
-      access.close();
-      releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
+      runtime.close();
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
