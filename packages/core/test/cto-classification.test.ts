@@ -11,7 +11,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { runCto, type TeamDef } from "@andvl1/omp-workflows-core";
+import { runCto } from "../src/cto/run.js";
+import type { TeamDef } from "../src/cto/types.js";
 import { findActiveCtoRun } from "../src/commands/cto.js";
 import { newCtoState, readCtoState, resolveCtoAutonomous, writeCtoState } from "../src/cto/state.js";
 import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
@@ -155,27 +156,18 @@ test("cto-class: newCtoState with a partial runtime classification (boolean auto
   assert.equal(resolveCtoAutonomous(state), false);
 });
 
-
 test("cto-class: standby is engine-created — no classification, top-level autonomous:true, documented", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-class-standby-"));
+  const runtime = openTestCtoRuntime(root, "standby-session", "cto-class-standby-test");
   try {
-    const now = new Date().toISOString();
-    const standby = newCtoState({
-      id: "standby-1",
-      task: "standby — awaiting inbox tasks",
-      branch: "",
-      autonomous: true,
-      standby: true,
-      plan: { id: "standby-1", task: "standby — awaiting inbox tasks", teams: [], created_at: now },
-    });
-    writeCtoState(standby, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-
-    const active = findActiveCtoRun(root);
-    assert.equal(active?.runId, "standby-1", "standby run is active");
+    const runId = runtime.access.ensureStandbyRun();
+    const active = findActiveCtoRun(root, { sessionId: "standby-session" });
+    assert.equal(active?.runId, runId, "standby run is active");
     assert.equal(active?.state.classification, undefined, "standby has no user task — nothing to classify");
     assert.equal(active?.state.autonomous, true, "engine-created standby marker preserved");
     assert.equal(resolveCtoAutonomous(active!.state), true, "top-level fallback applies without a classification");
   } finally {
+    runtime.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -11,14 +11,49 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { runCto, type TeamDef } from "@andvl1/omp-workflows-core";
+import { runCto } from "../src/cto/run.js";
+import type { TeamDef } from "../src/cto/types.js";
 import { findActiveCtoRun } from "../src/commands/cto.js";
-import { isCtoRunTerminal, newCtoState, readCtoState, setIntegration, setTeamStatus, writeCtoState } from "../src/cto/state.js";
+import { isCtoRunTerminal, newCtoState, readCtoState, setIntegration, setTeamStatus, writeCtoRuntimeStateProof, writeCtoState } from "../src/cto/state.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
+function seedOwnedState(root: string, state: ReturnType<typeof newCtoState>, runtimeAccess: Parameters<typeof runCto>[0]["runtimeAccess"]): void {
+  state.owner_session = "main-session";
+  state.work_identity ??= {
+    run_id: state.id,
+    wave_id: "cto-run",
+    slice_id: "cto-run",
+    session_id: "main-session",
+    workflow: "standard",
+    stage_id: "cto",
+    stage_cursor: "cto",
+    capability_id: "cto-test",
+    capability_epoch: "test",
+    slot_id: state.id,
+    task_id: state.id,
+    dispatch_id: state.id,
+    attempt: 1,
+    worker_id: "cto-test",
+  };
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  assert.ok(pinnedRoot, "ownership fixture root must be pinnable");
+  if (!pinnedRoot) throw new Error("ownership fixture root cannot be pinned");
+  try {
+    writeCtoState(state, root, { pinnedRoot, preCommit: ({ pinnedRoot: stableRoot }) => stableRoot.assertStable() });
+    assert.equal(writeCtoRuntimeStateProof(pinnedRoot, state), true, "ownership fixture state proof must be refreshed");
+  } finally {
+    pinnedRoot.close();
+  }
+  runtimeAccess.findActiveRun();
+}
 
 function persistState(state: ReturnType<typeof newCtoState>, runtimeAccess: Parameters<typeof runCto>[0]["runtimeAccess"]): void {
   runtimeAccess.withRunTransaction(state.id, (transaction) => {
-    transaction.writeState(state);
+    const next = transaction.readState();
+    next.teams = structuredClone(state.teams);
+    next.integration = structuredClone(state.integration);
+    next.pause = structuredClone(state.pause);
+    transaction.writeState(next);
   });
 }
 
@@ -58,27 +93,18 @@ test("cto-owner: same-session task runs amend, foreign sessions get a fresh cont
     rmSync(root, { recursive: true, force: true });
   }
 });
-
 test("cto-owner: standby runs remain adoptable across sessions", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-owner-standby-"));
+  const runtime = openTestCtoRuntime(root, "sess-A", "cto-owner-standby-test");
   try {
-    const now = new Date().toISOString();
-    const standby = newCtoState({
-      id: "standby-1",
-      task: "standby — awaiting inbox tasks",
-      branch: "",
-      autonomous: true,
-      standby: true,
-      plan: { id: "standby-1", task: "standby — awaiting inbox tasks", teams: [], created_at: now },
-    });
-    writeCtoState(standby, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-
+    const runId = runtime.access.ensureStandbyRun();
     for (const sessionId of ["sess-A", "sess-B", undefined]) {
       const active = findActiveCtoRun(root, sessionId ? { sessionId } : {});
-      assert.equal(active?.runId, "standby-1", `standby adoptable for session ${String(sessionId)}`);
+      assert.equal(active?.runId, runId, `standby adoptable for session ${String(sessionId)}`);
       assert.equal(active?.state.standby, true, "standby marker preserved");
     }
   } finally {
+    runtime.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -98,6 +124,7 @@ test("cto-owner: all teams done plus integration done is terminal without pause 
       runtimeAccess: runtime.access,
     });
     assert.ok(res);
+    seedOwnedState(root, res.state, runtime.access);
     assert.equal(isCtoRunTerminal(res.state), false, "fresh run is not terminal");
 
     // One team still in_progress + integration done -> NOT terminal yet.
