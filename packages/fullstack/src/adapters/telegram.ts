@@ -146,6 +146,8 @@ export interface TelegramAdapterOptions {
   allowedSenderIds?: Array<string | number>;
   /** Authenticated readonly runtime used for Telegram mapping authority. */
   runtimeAccess?: TelegramRuntimeAccess;
+  /** Factory-captured config/profile/root fence; absent only for direct test seams. */
+  assertRoutingLive?: () => void;
   /** Opaque root/workflow_tools authority for Telegram mapping proofs. */
   proofAuthority: CtoRuntimeProofAuthority;
   /** Called after one bounded update is durably handled and before offset advancement. */
@@ -307,6 +309,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   private readonly allowedChatIds: string[];
   private readonly allowedSenderIds: string[];
   private readonly runtimeAccess?: TelegramRuntimeAccess;
+  private readonly assertRoutingLive?: () => void;
   private readonly proofAuthority: CtoRuntimeProofAuthority;
   private onUpdateCommitted?: TelegramUpdateCommitHook;
   private onPlainMessage: TelegramAdapterOptions["onPlainMessage"];
@@ -323,6 +326,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     this.chatId = options.chatId;
     this.cwd = options.cwd;
     this.runtimeAccess = options.runtimeAccess;
+    this.assertRoutingLive = options.assertRoutingLive;
     if (!isCtoRuntimeProofAuthority(options.proofAuthority)) {
       throw new Error("telegram: mapping proof authority is unavailable");
     }
@@ -620,6 +624,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     try {
       lifecycle?.assertLive?.();
       this.runtimeAccess?.assertLive();
+      this.assertRoutingLive?.();
     } catch (error) {
       if (isTelegramActivationFailure(error)) throw error;
       throw new TelegramActivationRevokedError("telegram activation is no longer live", { cause: error });
@@ -629,6 +634,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
 
   private async api(method: string, payload: Record<string, unknown>, lifecycle?: AdapterOperationContext): Promise<unknown> {
     lifecycle?.assertLive?.();
+    this.assertRoutingLive?.();
     let response: Response;
     try {
       response = await this.fetchImpl(`https://api.telegram.org/bot${this.token}/${method}`, {
@@ -642,6 +648,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       throw new TelegramApiError(`telegram ${method} -> transport failure`, false, error);
     }
     lifecycle?.assertLive?.();
+    this.assertRoutingLive?.();
     if (!response.ok) {
       // Telegram may have accepted a request before returning a 5xx or
       // rate-limit response. Only deterministic client rejections are safe to

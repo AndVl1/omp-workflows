@@ -605,6 +605,34 @@ test("auth: registry passes allowedSenderIds through to the telegram adapter", a
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("auth: factory Telegram adapter revokes polling after config rotation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-auth-rotation-"));
+  const configPath = join(root, ".omp", "escalation.json");
+  const realFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({ adapter: "telegram", telegram: { token: "old-token", chatId: CONFIGURED_CHAT } }));
+    (globalThis as { fetch: typeof fetch }).fetch = (async (url: unknown) => {
+      fetchCalls += 1;
+      assert.match(String(url), /botold-token\/getUpdates/u);
+      return okResponse([]);
+    }) as typeof fetch;
+    const adapter = createEscalationAdapter({ adapter: "telegram", telegram: { token: "old-token", chatId: CONFIGURED_CHAT } }, root);
+    assert.ok(adapter, "factory creates the resident Telegram adapter");
+    const telegram = adapter as TelegramEscalationAdapter;
+    await telegram.pollOnce();
+    assert.equal(fetchCalls, 1, "unchanged authenticated config remains live");
+
+    writeFileSync(configPath, JSON.stringify({ adapter: "telegram", telegram: { token: "new-token", chatId: "67890" } }));
+    await assert.rejects(telegram.pollOnce(), /activation|routing|changed|live/i, "rotated config revokes the old adapter before its next fetch");
+    assert.equal(fetchCalls, 1, "rotated config must not fetch with the old token");
+  } finally {
+    (globalThis as { fetch: typeof fetch }).fetch = realFetch;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("auth: registry rejects malformed Telegram allowlists", () => {
   const root = mkdtempSync(join(tmpdir(), "tg-auth-9b-"));
   try {

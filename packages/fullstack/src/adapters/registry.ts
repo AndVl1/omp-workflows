@@ -606,7 +606,7 @@ export function queueCtoDelivery(root: string, runId: string, delivery: CtoDeliv
 
 /** Adapter factory for a transport kind (built-in or consumer-registered). */
 export type EscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined) => EscalationAdapter | null;
-type BuiltinEscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: CtoRuntimeBridgeRouteAccess) => EscalationAdapter | null;
+type BuiltinEscalationAdapterFactory = (config: EscalationConfig, cwd: string, pinnedRoot: PinnedProjectRoot | undefined, runtimeAccess: RuntimeAccess | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: CtoRuntimeBridgeRouteAccess, assertRoutingLive?: () => void) => EscalationAdapter | null;
 
 /**
  * Capabilities are registered alongside a consumer transport because channel
@@ -753,7 +753,7 @@ const builtinAdapterFactories = new Map<string, AdapterRegistration>([
     "telegram",
     {
       factory: () => null,
-      proofFactory: (config, cwd, _pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute) =>
+      proofFactory: (config, cwd, _pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute, assertRoutingLive) =>
         config.telegram?.token && config.telegram.chatId
           ? new TelegramEscalationAdapter({
               token: config.telegram.token,
@@ -765,6 +765,7 @@ const builtinAdapterFactories = new Map<string, AdapterRegistration>([
               legacyMappingMigration: config.telegram.legacyMappingMigration,
               proofAuthority,
               runtimeAccess: (bridgeRoute ?? runtimeAccess) as TelegramRuntimeAccess | undefined,
+              assertRoutingLive,
             })
           : null,
       capabilities: frozenCapabilities({ canReceiveInbound: true, canSend: true, canSendWithIdempotency: true }),
@@ -836,6 +837,82 @@ function registrationForKind(kind: string, scope?: AdapterResolutionScope): Adap
   return candidate ? liveCustomRegistration(candidate, scope.root) : undefined;
 }
 
+function telegramRoutingRevoked(message: string): Error & { code: "activation_revoked" } {
+  const error = new Error(message) as Error & { code: "activation_revoked" };
+  error.code = "activation_revoked";
+  return error;
+}
+
+function createTelegramRoutingGuard(
+  config: EscalationConfig,
+  root: AdapterRootIdentity,
+  runtimeAccess: RuntimeAccess | undefined,
+  bridgeRoute: CtoRuntimeBridgeRouteAccess | undefined,
+): (() => void) | undefined {
+  const source = bridgeRoute ?? runtimeAccess;
+  if (!source) return undefined;
+  let snapshot: ReturnType<RuntimeAccess["resolveEscalationChannelSnapshot"]>;
+  let projection: Readonly<Record<string, unknown>> | null;
+  try {
+    snapshot = source.resolveEscalationChannelSnapshot();
+    if (snapshot.status !== "valid") return undefined;
+    if (bridgeRoute) {
+      projection = bridgeRoute.resolveTelegramChannelProfile();
+    } else {
+      const candidates = snapshot.projections.telegram;
+      const configuredId = typeof config.id === "string" ? config.id.trim() : "";
+      const matching = Array.isArray(candidates)
+        ? candidates.filter((candidate) => candidate.adapter === "telegram"
+          && (configuredId.length === 0 ? candidate.id === undefined : candidate.id === configuredId)
+          && (config.primary !== true || candidate.primary === true))
+        : [];
+      projection = matching.length === 1 ? matching[0]! : null;
+    }
+  } catch {
+    return undefined;
+  }
+  if (!projection || typeof snapshot.config_sha256 !== "string") return undefined;
+  const expectedProjectionSha = createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex");
+  return (): void => {
+    let currentRoot: PinnedProjectRoot | null = null;
+    try {
+      currentRoot = PinnedProjectRoot.open(root.canonical_root);
+      if (!currentRoot || !currentRoot.isStable() || currentRoot.dev !== root.root_dev || currentRoot.ino !== root.root_ino) {
+        throw telegramRoutingRevoked("telegram routing project root changed");
+      }
+      if (bridgeRoute) {
+        bridgeRoute.assertLive();
+        bridgeRoute.assertProjectRoot(root.canonical_root);
+      } else if (runtimeAccess) {
+        runtimeAccess.assertLive();
+        runtimeAccess.assertProjectRoot(root.canonical_root);
+      }
+      const currentSnapshot = source.resolveEscalationChannelSnapshot();
+      if (currentSnapshot.status !== "valid" || currentSnapshot.config_sha256 !== snapshot.config_sha256) {
+        throw telegramRoutingRevoked("telegram routing configuration changed");
+      }
+      const currentProjection = bridgeRoute
+        ? bridgeRoute.resolveTelegramChannelProfile()
+        : (() => {
+          const candidates = currentSnapshot.projections.telegram;
+          const configuredId = typeof config.id === "string" ? config.id.trim() : "";
+          const matching = Array.isArray(candidates)
+            ? candidates.filter((candidate) => candidate.adapter === "telegram"
+              && (configuredId.length === 0 ? candidate.id === undefined : candidate.id === configuredId)
+              && (config.primary !== true || candidate.primary === true))
+            : [];
+          return matching.length === 1 ? matching[0]! : null;
+        })();
+      if (!currentProjection
+        || createHash("sha256").update(JSON.stringify(currentProjection), "utf8").digest("hex") !== expectedProjectionSha) {
+        throw telegramRoutingRevoked("telegram routing projection changed");
+      }
+    } finally {
+      currentRoot?.close();
+    }
+  };
+}
+
 function invokeAdapterFactory(
   registration: AdapterRegistration,
   config: EscalationConfig,
@@ -852,8 +929,11 @@ function invokeAdapterFactory(
     if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
     if (bridgeRoute) bridgeRoute.assertProjectRoot(scope.root.canonical_root);
     if (!scope.pinnedRoot.isStable()) return null;
+    const assertRoutingLive = config.adapter === "telegram"
+      ? createTelegramRoutingGuard(config, scope.root, runtimeAccess, bridgeRoute)
+      : undefined;
     adapter = registration.proofFactory
-      ? registration.proofFactory(config, cwd, scope.pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute)
+      ? registration.proofFactory(config, cwd, scope.pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute, assertRoutingLive)
       : registration.factory(config, cwd, scope.pinnedRoot, runtimeAccess);
     if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
     if (bridgeRoute) bridgeRoute.assertProjectRoot(scope.root.canonical_root);
