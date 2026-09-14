@@ -1814,7 +1814,6 @@ function commitTransaction(
     return "aborted";
   }
 
-  const txPath = transactionPath(root, transaction, pinnedRoot);
   let cleanupJournal: TransactionJournalRead = options.journal ?? { raw: serializeTransaction(transaction) };
   const currentDigest = currentCanonicalDigest(root, transaction.decision_path, pinnedRoot);
   if (currentDigest !== transaction.decision_digest) {
@@ -1910,8 +1909,42 @@ function commitTransaction(
   }
 
   injectDecisionFailure("after_commit", transaction.transaction_id);
+  cleanupPendingTransaction(root, transaction, pinnedRoot, cleanupJournal);
+  return "committed";
+}
+
+function fullyCommittedExactPostimage(
+  root: string,
+  transaction: SpecificationDecisionTransaction,
+  pinnedRoot?: PinnedProjectRoot,
+): boolean {
+  if (!pinnedRoot || transaction.status !== "pending" || transaction.staged_states.length === 0 || transaction.staged_states.some((staged) => staged.applied !== true)) return false;
+  if (!pinnedRoot.isStable()) return false;
+  if (currentCanonicalDigest(root, transaction.decision_path, pinnedRoot) !== transaction.decision_digest) return false;
+  if (transaction.decision_digest !== transaction.base_decisions_digest
+    && (!transaction.decision_receipt || !pinnedReceiptOwnsCurrent(pinnedRoot, transaction.decision_receipt))) return false;
+  for (const staged of transaction.staged_states) {
+    if (!stagedReceiptsOwnCurrent(pinnedRoot, staged)) return false;
+    try {
+      const raw = readCanonicalFile(root, staged.target.statePath, pinnedRoot, MAX_PERSISTED_STATE_BYTES);
+      const state = JSON.parse(raw) as unknown;
+      if (stateDigest(state) !== staged.target_digest) return false;
+    } catch {
+      return false;
+    }
+  }
+  return pinnedRoot.isStable();
+}
+
+function cleanupPendingTransaction(
+  root: string,
+  transaction: SpecificationDecisionTransaction,
+  pinnedRoot: PinnedProjectRoot | undefined,
+  journal: TransactionJournalRead,
+): void {
+  const txPath = transactionPath(root, transaction, pinnedRoot);
   try {
-    if (!removeCanonicalFileIfMatches(root, txPath, sha256Hex(cleanupJournal.raw), pinnedRoot, DECISION_TRANSACTION_MAX_FILE_BYTES, cleanupJournal.descriptor)) {
+    if (!removeCanonicalFileIfMatches(root, txPath, sha256Hex(journal.raw), pinnedRoot, DECISION_TRANSACTION_MAX_FILE_BYTES, journal.descriptor)) {
       throw new Error("transaction cleanup target changed before exact removal");
     }
   } catch (error) {
@@ -1919,7 +1952,6 @@ function commitTransaction(
       throw new Error(`CTO_SPEC_TRANSACTION_CLEANUP_FAILED: ${String(error)}`);
     }
   }
-  return "committed";
 }
 
 function recoverPendingTransactions(
@@ -1929,6 +1961,11 @@ function recoverPendingTransactions(
 ): SpecificationDecisionTransaction[] {
   const completed: SpecificationDecisionTransaction[] = [];
   for (const { transaction, journal } of readPendingTransactions(root, ctoRunId, pinnedRoot)) {
+    if (fullyCommittedExactPostimage(root, transaction, pinnedRoot)) {
+      cleanupPendingTransaction(root, transaction, pinnedRoot, journal);
+      completed.push(transaction);
+      continue;
+    }
     const guard = pinnedRoot
       ? () => assertCtoDecisionSourcesCurrent(root, transaction, pinnedRoot)
       : undefined;

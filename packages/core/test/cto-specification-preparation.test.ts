@@ -1547,6 +1547,57 @@ describe("CTO specification preparation decisions", () => {
     }
   });
 
+  test("cleans a fully published decision WAL after constitution drift without rewriting postimages", async () => {
+    const root = freshProject();
+    const featureId = "feature-recovery-complete-drift";
+    try {
+      const pending = await issueCanonicalDecision(root, featureId, "specify", "approve_continue", "answer-recovery-complete-drift");
+      let staged = false;
+      setCtoSpecificationDecisionFailureInjector((point) => {
+        if (point !== "after_prepare" || staged) return;
+        staged = true;
+        deriveStagedDecisionWal(root, pending);
+        throw new Error("leave staged decision WAL");
+      });
+      assert.throws(
+        () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [pending] }),
+        /leave staged decision WAL/,
+      );
+      setCtoSpecificationDecisionFailureInjector(null);
+
+      let interrupted = false;
+      setCtoSpecificationDecisionFailureInjector((point) => {
+        if (point !== "after_commit" || interrupted) return;
+        interrupted = true;
+        throw new Error("leave fully published decision WAL");
+      });
+      assert.throws(
+        () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [pending] }),
+        /leave fully published decision WAL/,
+      );
+      setCtoSpecificationDecisionFailureInjector(null);
+
+      const statePath = join(root, ".work-state", "features", featureId, "state.json");
+      const decisionPath = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decisions.json");
+      const stateAfterCommit = readFileSync(statePath);
+      const decisionsAfterCommit = readFileSync(decisionPath);
+      const constitutionPath = join(root, "CONSTITUTION.md");
+      const driftedConstitution = PREPARATION_CONSTITUTION.replace("Ship tested work.", "Ship drifted work.");
+      writeFileSync(constitutionPath, driftedConstitution, "utf8");
+
+      const retry = recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [pending] });
+      assert.deepEqual(retry.decisions.map(({ trusted_answer_ref }) => trusted_answer_ref), [pending.trusted_answer_ref]);
+      assert.deepEqual(readFileSync(statePath), stateAfterCommit, "fully committed recovery must not rewrite the state postimage");
+      assert.deepEqual(readFileSync(decisionPath), decisionsAfterCommit, "fully committed recovery must not rewrite the decision postimage");
+      assert.equal(readFileSync(constitutionPath, "utf8"), driftedConstitution, "constitution drift must remain observable");
+      const transactionDir = join(root, ".work-state", "cto", CTO_RUN_ID, "specification-decision-transactions");
+      assert.equal(readdirSync(transactionDir).filter((entry) => entry.endsWith(".json")).length, 0, "fully committed recovery must clean the exact WAL");
+    } finally {
+      setCtoSpecificationDecisionFailureInjector(null);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("recovers an interrupted multi-feature selection without cross-feature consumption", async () => {
     const root = freshProject();
     const firstFeature = "feature-batch-a";
@@ -2377,6 +2428,38 @@ describe("CTO specification preparation terminal boundary", () => {
     }
   });
 
+  test("replays a post-commit packet WAL after constitution drift", async () => {
+    const root = freshProject();
+    try {
+      await recordCanonicalDecision(root, "feature-post-commit-drift", "tasks", "approve_continue", "answer-post-commit-drift");
+      await setupResidentPreparation(root);
+      setCtoSpecificationPreparationFailureInjector((point) => {
+        if (point === "after_cto_state_write") throw new Error("injected after_cto_state_write");
+      });
+      assert.throws(() => advance(root, { cto_run_id: CTO_RUN_ID }), /injected after_cto_state_write/);
+      setCtoSpecificationPreparationFailureInjector(null);
+      const packetPath = join(realpathSync(root), ".work-state", "cto", CTO_RUN_ID, "specification-review-packet.md");
+      const transactionPath = join(realpathSync(root), ".work-state", "cto", CTO_RUN_ID, "review-packet.transaction.json");
+      assert.ok(existsSync(packetPath), "post-commit crash must leave the packet postimage");
+      assert.ok(existsSync(transactionPath), "post-commit crash must leave the cleanup WAL");
+      const committed = readCtoState(CTO_RUN_ID, root);
+      assert.equal(committed?.active_wave_id, undefined, "post-commit crash must already have a terminal state");
+      assert.equal(committed?.pending?.status, "succeeded", "post-commit crash must retain the committed terminal state");
+      writeFileSync(join(root, "CONSTITUTION.md"), `${PREPARATION_CONSTITUTION}\nDrifted after terminal packet commit.\n`, "utf8");
+      const replay = advance(root, { cto_run_id: CTO_RUN_ID });
+      assert.equal(replay.hard_stop, true);
+      assert.equal(replay.execution_started, false);
+      assert.equal(replay.review_packet_ref, packetPath);
+      assert.equal(existsSync(packetPath), true, "constitution drift must not delete terminal evidence");
+      assert.equal(existsSync(transactionPath), false, "terminal replay must remove only its cleanup WAL");
+      const terminal = readCtoState(CTO_RUN_ID, root);
+      assert.equal(terminal?.active_wave_id, undefined);
+      assert.equal(terminal?.pending?.status, "succeeded");
+    } finally {
+      setCtoSpecificationPreparationFailureInjector(null);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   test("review packet crash child replays only its WAL-owned postimage", async () => {
     const root = freshProject();
     try {

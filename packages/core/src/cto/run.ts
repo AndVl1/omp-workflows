@@ -28,6 +28,7 @@ import {
   ctoStateDir,
   ctoPreparationTeamId,
   isSafeCtoRunId,
+  readCtoStatePinned,
   isValidCtoBranchText,
   isValidCtoTaskText,
   newCtoState,
@@ -493,26 +494,38 @@ function persistReviewPacketTransaction(
   root: string,
   transaction: ReviewPacketPublicationTransaction,
   pinnedRoot: PinnedProjectRoot,
-): void {
+): PinnedRootWriteDescriptor {
   const path = reviewPacketTransactionPath(root, transaction.cto_run_id);
   const relativePath = pinnedRoot.relativePath(path);
   if (!relativePath) throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_PATH_INVALID", "review packet transaction path is outside the pinned project root");
-  pinnedRoot.writeAtomic(relativePath, reviewPacketTransactionContent(transaction));
+  const receipt = pinnedRoot.writeAtomicWithReceipt(relativePath, reviewPacketTransactionContent(transaction));
+  return receipt.descriptor;
 }
 function removeReviewPacketTransaction(
   root: string,
   ctoRunId: string,
   pinnedRoot: PinnedProjectRoot,
+  expected?: PinnedRootWriteDescriptor,
 ): void {
   const path = reviewPacketTransactionPath(root, ctoRunId);
   const relativePath = pinnedRoot.relativePath(path);
   if (!relativePath) throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_PATH_INVALID", "review packet transaction path is outside the pinned project root");
   try {
     const current = pinnedRoot.readFile(relativePath, { maxBytes: MAX_REVIEW_PACKET_TRANSACTION_BYTES });
-    pinnedRoot.removeFileIfMatches(relativePath, {
+    const descriptor = expected ?? {
+      path: pinnedRoot.anchorPath(relativePath),
+      relative_path: relativePath,
       dev: current.dev,
       ino: current.ino,
+      size: current.bytes.byteLength,
       sha256: createHash("sha256").update(Buffer.from(current.bytes)).digest("hex"),
+    };
+    if (descriptor.path !== pinnedRoot.anchorPath(relativePath) || descriptor.relative_path !== relativePath) return;
+    pinnedRoot.removeFileIfMatches(relativePath, {
+      dev: descriptor.dev,
+      ino: descriptor.ino,
+      size: descriptor.size,
+      sha256: descriptor.sha256,
     });
   } catch (error) {
     if (!(error instanceof PinnedRootError && error.code === "not_found")) throw error;
@@ -626,6 +639,27 @@ function recoverReviewPacketTransaction(
   const before = currentContent === transaction.before_content && currentDigest === transaction.before_digest;
   const after = currentContent === transaction.after_content && currentDigest === transaction.after_digest;
   if (!before && !after) throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_COLLISION", "review packet transaction target differs from both its registered preimage and postimage");
+  // State publication is owned by the outer authenticated runtime transaction.
+  // Once the canonical terminal postimage is durable, packet recovery is only
+  // exact WAL cleanup: a later constitution change must never roll back the
+  // evidence referenced by the completed state.
+  const terminalState = readCtoStatePinned(ctoRunId, pinnedRoot);
+  const terminalPacketPath = join(pinnedRoot.lexical_root, transaction.path);
+  const terminalEvidence = terminalState !== null
+    && finalizedPreparationState(terminalState)
+    && terminalState.completion_envelope?.evidence_ref === terminalPacketPath;
+  if (terminalEvidence) {
+    if (!after || !current || !transaction.postimage_descriptor
+      || current.dev !== transaction.postimage_descriptor.dev
+      || current.ino !== transaction.postimage_descriptor.ino
+      || current.bytes.byteLength !== transaction.postimage_descriptor.size
+      || transaction.postimage_descriptor.path !== pinnedRoot.anchorPath(transaction.path)
+      || transaction.postimage_descriptor.relative_path !== transaction.path) {
+      throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_CONFLICT", "terminal CTO state references a packet postimage that is missing or no longer owned by its WAL");
+    }
+    removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+    return;
+  }
   if (before) {
     removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
     return;
@@ -1078,7 +1112,9 @@ function advanceCtoSpecificationPreparationUnlocked(
       );
     }
   }
-  assertPreparationWorkspacesReady(root, state, packet.value, pinnedRoot);
+  if (!finalizedPreparationState(state)) {
+    assertPreparationWorkspacesReady(root, state, packet.value, pinnedRoot);
+  }
   const features = featureStatuses(decisions, (state as CtoState & { preparation_features?: Array<{ feature_id: string; run_key: string }> }).preparation_features);
 
   const wave = activeWave(state);
@@ -1444,8 +1480,10 @@ export function advanceCtoSpecificationPreparation(
     recoverReviewPacketTransaction(root, ctoRunId, pinnedRoot);
     assertRuntimeLive();
     try {
-      ensurePreparationConstitutionBeforeRunLock(root, pinnedRoot, projectedState, assertRuntimeLive);
-      assertRuntimeLive();
+      if (!projectedState || !finalizedPreparationState(projectedState)) {
+        ensurePreparationConstitutionBeforeRunLock(root, pinnedRoot, projectedState, assertRuntimeLive);
+        assertRuntimeLive();
+      }
       let packetTransactionCommitted = false;
       const result = options.runtimeAccess.withRunTransaction(ctoRunId, (transaction) => {
         assertRuntimeLive();
@@ -1462,6 +1500,7 @@ export function advanceCtoSpecificationPreparation(
           () => { packetTransactionCommitted = true; },
         );
       });
+      injectPreparationFailure("after_cto_state_write");
       if (packetTransactionCommitted) {
         assertRuntimeLive();
         removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
