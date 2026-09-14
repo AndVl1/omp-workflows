@@ -228,24 +228,23 @@ function withIndexedRun(root: string, runId: string): void {
   const sourceId = `adapters:${runId}`;
   const initialStateSha256 = ctoRuntimeRunInitialIdentityDigest(state);
   assert.ok(runtime.access.createRun(state, { source_id: sourceId, initial_state_sha256: initialStateSha256 }));
+}
+
+function withPendingIndexedRun(root: string, runId: string): void {
+  withIndexedRun(root, runId);
+  const runtime = runtimeFor(root);
+  const state = runtime.access.readState(runId);
+  assert.ok(state, "canonical CTO state exists for pending fixture");
   assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
 }
 
 function publishTestDelivery(root: string, runId: string, delivery: Record<string, unknown>): string {
   const runtime = runtimeFor(root);
-  const state = runtime.access.readState(runId);
-  assert.ok(state, "canonical CTO state exists");
   const id = delivery.id;
   assert.equal(typeof id, "string", "test delivery has a canonical id");
-  const envelope = { ...delivery, idempotency_key: id };
-  const entryName = canonicalDurableIdFileName(id as string);
-  const published = runtime.access.publishOutboxDelivery({
-    run_id: runId,
-    state_revision: state.state_revision as number,
-    entry_name: entryName,
-    json: JSON.stringify(envelope),
-  });
-  assert.ok(published, "canonical publication succeeds");
+  const envelope = { ...delivery, idempotency_key: id } as Parameters<typeof queueCtoDeliveryRaw>[2];
+  const published = queueCtoDeliveryRaw(root, runId, envelope, undefined, undefined, runtime.access);
+  assert.ok(published, "canonical obligation and publication succeed");
   return published as string;
 }
 function publishTestTerminalSummary(root: string, runId: string): string {
@@ -991,7 +990,7 @@ test("adapters: no-lifecycle adapter send is bounded by the fixed operation time
       plan: { id: runId, task: "adapter timeout", teams: [], created_at: new Date().toISOString() },
     });
     assert.ok(runtime.access.createRun(state, { source_id: "adapters:" + runId, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
-    const published = queueCtoDeliveryRaw(root, runId, { ...sampleEscalation({ id: runId + "/team-a/timeout/1" }), intent: "question" }, undefined, undefined, runtime.access);
+    const published = publishTestDelivery(root, runId, { ...sampleEscalation({ id: runId + "/team-a/timeout/1" }), intent: "question" });
     assert.ok(published, "canonical timeout delivery publication succeeds");
     const started = Date.now();
     const results = await drainOutbox(root, adapter, 1);
@@ -1108,7 +1107,7 @@ test("adapters: malformed unbound outbox keeps pending run until authoritative r
   let stop: ReturnType<typeof startDispatcher> | undefined;
   try {
     const runId = "run-malformed-unbound";
-    withIndexedRun(root, runId);
+    withPendingIndexedRun(root, runId);
     const outbox = outboxDir(runId, root);
     mkdirSync(outbox, { recursive: true });
     const initialPublished = join(outbox, "initial.json");
@@ -1315,7 +1314,7 @@ test("adapters: drainOutbox quarantines unsafe explicit idempotency keys", async
   const invalidKeys: unknown[] = ["", "   ", "\u001b[31mred", "line\nbreak", "bidi\u202e", "x".repeat(256)];
   const root = mkdtempSync(join(tmpdir(), "cto-dispatch-key-"));
   try {
-    withIndexedRun(root, "run-keys");
+    withPendingIndexedRun(root, "run-keys");
     const outbox = outboxDir("run-keys", root);
     mkdirSync(outbox, { recursive: true });
     for (const [index, key] of invalidKeys.entries()) {
