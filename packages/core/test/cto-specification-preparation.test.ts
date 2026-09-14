@@ -2552,6 +2552,7 @@ describe("CTO specification preparation terminal boundary", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
   test("packet rollback preserves a same-content concurrent replacement and fails closed", async () => {
     const root = freshProject();
     try {

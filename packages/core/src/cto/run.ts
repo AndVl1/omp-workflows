@@ -1507,7 +1507,10 @@ export function advanceCtoSpecificationPreparation(
           state,
           (next) => { assertRuntimeLive(); transaction.writeState(next); assertRuntimeLive(); },
           assertRuntimeLive,
-          (descriptor) => { packetTransactionCommitted = true; committedPacketTransactionDescriptor = descriptor; },
+          (descriptor) => {
+            packetTransactionCommitted = true;
+            committedPacketTransactionDescriptor = descriptor;
+          },
         );
       });
       injectPreparationFailure("after_cto_state_write");
