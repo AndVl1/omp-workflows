@@ -37,6 +37,7 @@ export function openFullstackRuntimeTest(
   sessionId = "fullstack-runtime-test-session",
   owner: WorkflowOwnerIdentity = fullstackOwnerForCwd(root),
   writeMarker = true,
+  registerMock = true,
 ): FullstackRuntimeTestFixture {
   if (writeMarker) writeFullstackActivationMarker(root);
   const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], owner);
@@ -52,7 +53,7 @@ export function openFullstackRuntimeTest(
   }
   const activationSnapshotGuard = createRegistryRegistrationLiveGuard(transaction.token, "workflow_tools");
   try {
-    registerMockAdapterForTesting(transaction.token);
+    if (registerMock) registerMockAdapterForTesting(transaction.token);
     commitRegistryRegistration(transaction.token);
   } catch (error) {
     try { rollbackRegistryRegistration(transaction.token); } catch { /* preserve registration failure */ }

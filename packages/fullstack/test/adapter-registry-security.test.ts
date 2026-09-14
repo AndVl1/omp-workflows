@@ -164,11 +164,27 @@ test("registry: stale custom owner is swept and an overlong kind or per-root cap
 
     const overlong = "a".repeat(MAX_CUSTOM_ADAPTER_KIND_BYTES + 1);
     assert.throws(() => register(root, overlong, adapterFactory(overlong, () => undefined), capabilities), /kind|invalid/i);
-    for (let index = 0; index < MAX_CUSTOM_ADAPTER_KINDS_PER_ROOT - 1; index += 1) {
-      const kind = `security-custom-cap-${index}`;
-      register(root, kind, adapterFactory(kind, () => undefined), capabilities);
+
+    // Use an isolated root for the per-root capacity boundary. The stale-kind
+    // lifecycle above intentionally occupies one custom slot on `root`.
+    const capRoot = mkdtempSync(join(tmpdir(), "adapter-bounds-cap-"));
+    let capRuntime: FullstackRuntime | undefined;
+    try {
+      capRuntime = openFullstackRuntimeTest(capRoot, "registry-security-cap", fullstackTestOwner(capRoot), true, false);
+      runtimeFixtures.set(capRoot, capRuntime);
+      for (let index = 0; index < MAX_CUSTOM_ADAPTER_KINDS_PER_ROOT; index += 1) {
+        const kind = `security-custom-cap-${index}`;
+        registerWithRuntime(capRuntime, capRoot, kind, adapterFactory(kind, () => undefined), capabilities);
+      }
+      assert.throws(
+        () => registerWithRuntime(capRuntime!, capRoot, "security-custom-cap-overflow", adapterFactory("security-custom-cap-overflow", () => undefined), capabilities),
+        /capacity|invalid/i,
+      );
+    } finally {
+      capRuntime?.close();
+      runtimeFixtures.delete(capRoot);
+      rmSync(capRoot, { recursive: true, force: true });
     }
-    assert.throws(() => register(root, "security-custom-cap-overflow", adapterFactory("security-custom-cap-overflow", () => undefined), capabilities), /capacity|invalid/i);
     replacement.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -184,7 +200,7 @@ test("registry: idempotent activations retain independent custom adapter leases 
     let third: FullstackRuntime | undefined;
     try {
       first = runtimeFor(root);
-      second = openFullstackRuntimeTest(root, "registry-security-cross-activation", fullstackTestOwner(root));
+      second = openFullstackRuntimeTest(root, "registry-security-cross-activation", fullstackTestOwner(root), true, false);
       const kind = `security-cross-activation-${firstClose}`;
       const factory = adapterFactory(kind, () => undefined);
       registerWithRuntime(first, root, kind, factory, capabilities);
@@ -194,7 +210,7 @@ test("registry: idempotent activations retain independent custom adapter leases 
       closeFirst.close();
       assert.equal(createEscalationAdapter({ adapter: kind, custom: { token: "shared" } }, root, undefined, stillLive.access)?.kind, kind, "the remaining activation lease keeps the cell usable");
       stillLive.close();
-      third = openFullstackRuntimeTest(root, "registry-security-cross-activation-check", fullstackTestOwner(root));
+      third = openFullstackRuntimeTest(root, "registry-security-cross-activation-check", fullstackTestOwner(root), true, false);
       assert.equal(createEscalationAdapter({ adapter: kind, custom: { token: "closed" } }, root, undefined, third.access), null, "the cell is removed after both activation leases close");
       third.close();
       runtimeFixtures.delete(root);
