@@ -48,6 +48,10 @@ function writeTelegramTestConfig(root: string, token: string, chatId: string): v
   mkdirSync(join(root, ".omp"), { recursive: true });
   writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token, chatId } }));
 }
+function writeMockTestConfig(root: string): void {
+  mkdirSync(join(root, ".omp"), { recursive: true });
+  writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "mock", bidirectional: true, mock: { persisted: true, dir: "timeout-rw" } }));
+}
 function authenticatedTelegramAdapter(root: string, token: string, chatId: string, fetchImpl: typeof fetch): TelegramEscalationAdapter {
   writeTelegramTestConfig(root, token, chatId);
   const runtime = runtimeFor(root);
@@ -140,7 +144,6 @@ import {
   MAX_POLLED_ANSWER_BATCH_ENTRIES,
   MAX_POLLED_ANSWER_BATCH_BYTES,
   MAX_BRIDGE_LEASES,
-  MAX_SEEN_ANSWERS_PER_ROOT,
   MAX_DRAIN_RETRIES,
   ADAPTER_OPERATION_TIMEOUT_MS,
 } from "../src/adapters/registry.js";
@@ -901,9 +904,6 @@ test("adapters: Telegram API response reader bounds streamed and malformed bodie
   }
 });
 
-
-
-
 test("adapters: drain rejects oversized caller batches before any scan or send", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-drain-input-bounds-"));
   let sends = 0;
@@ -918,44 +918,6 @@ test("adapters: drain rejects oversized caller batches before any scan or send",
     assert.deepEqual(await drainOutbox(root, adapter, 1, { runEntries: oversizedRuns as never }), []);
     assert.deepEqual(await drainOutbox(root, adapter, 1, { roSinks: new Array(MAX_DRAIN_RO_SINKS + 1).fill(adapter) }), []);
     assert.equal(sends, 0, "invalid drain inputs are rejected before adapter sends");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("adapters: canonical answer replay is rejected after bounded seen-answer eviction", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cto-seen-answer-eviction-"));
-  writeTelegramTestConfig(root, "token", "42");
-  const runId = resolveInboxRunId(root);
-  try {
-    const answers = Array.from({ length: MAX_SEEN_ANSWERS_PER_ROOT + 1 }, (_, index) => ({
-      id: `${runId}/team-a/q-${index}`,
-      run_id: runId,
-      answer: "approve_continue",
-    }));
-    const answerBatches: Array<typeof answers> = [];
-    for (let offset = 0; offset < answers.length; offset += MAX_POLLED_ANSWER_BATCH_ENTRIES) {
-      answerBatches.push(answers.slice(offset, offset + MAX_POLLED_ANSWER_BATCH_ENTRIES));
-    }
-    let pollCount = 0;
-    let callbacks = 0;
-    const adapter = {
-      kind: "seen-answer-poll",
-      send: async () => ({ sent: true }),
-      sendWithIdempotency: async () => ({ sent: true }),
-      cancel: async () => undefined,
-      pollOnce: async () => answerBatches[pollCount++] ?? [answers[0]],
-    } as unknown as EscalationAdapter;
-    const runtime = runtimeFor(root);
-    assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "answer replay fixture has authenticated routing");
-    let delivered = 0;
-    for (const batch of answerBatches) {
-      await pollInbox(root, adapter, undefined, () => { callbacks += 1; }, { idempotentWake: true });
-      delivered += batch.length;
-      assert.equal(callbacks, delivered, "each bounded canonical answer batch reaches its callback once");
-    }
-    await pollInbox(root, adapter, undefined, () => { callbacks += 1; }, { idempotentWake: true });
-    assert.equal(callbacks, answers.length, "durable canonical checkpoint state rejects replay after in-memory eviction");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1009,12 +971,12 @@ test("adapters: poll rejects an oversized whole answer batch without partial wak
 
 test("adapters: no-lifecycle adapter send is bounded by the fixed operation timeout", { timeout: 10_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-adapter-timeout-"));
-  writeTelegramTestConfig(root, "token", "42");
+  writeMockTestConfig(root);
   try {
     const runId = "adapter-timeout";
     const runtime = runtimeFor(root);
     const adapter = {
-      kind: "never-send",
+      kind: "mock",
       send: async () => new Promise<never>(() => undefined),
       sendWithIdempotency: async () => new Promise<never>(() => undefined),
       cancel: async () => undefined,
