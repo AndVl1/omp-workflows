@@ -9,15 +9,11 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-import {
-  runCto,
-  ctoCommand,
-  buildAmendPrompt,
-  type TeamDef,
-} from "@andvl1/omp-workflows-core";
-import { findActiveCtoRun } from "../src/commands/cto.js";
-import { isCtoRunTerminal, markAmended, newCtoState, readCtoState, setCtoPause, setIntegration, setTeamStatus } from "../src/cto/state.js";
+import { runCto } from "../src/cto/run.js";
+import { CtoAuthorityUnavailableError, ctoCommand, buildAmendPrompt, findActiveCtoRun } from "../src/commands/cto.js";
+import type { TeamDef } from "../src/cto/types.js";
+import { ctoRuntimeRunInitialIdentityDigest, isCtoRunTerminal, markAmended, newCtoState, readCtoState, writeCtoRuntimeStateProof, writeCtoState, setCtoPause, setIntegration, setTeamStatus } from "../src/cto/state.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 import type { CtoRuntimeAccessFacade } from "../src/cto/runtime-access.js";
 
@@ -41,10 +37,45 @@ function startRun(root: string, runtimeAccess: CtoRuntimeAccessFacade) {
     runtimeAccess,
   });
   assert.equal(res.ok, true);
+  if (res.ok) seedOwnedState(root, res.state, runtimeAccess);
   return res.ok ? res : null;
 }
 
-function persistState(state: ReturnType<typeof newCtoState>, runtimeAccess: CtoRuntimeAccessFacade): void {
+function ownedIdentity(state: ReturnType<typeof newCtoState>): void {
+  state.owner_session = "main-session";
+  state.work_identity ??= {
+    run_id: state.id,
+    wave_id: "cto-run",
+    slice_id: "cto-run",
+    session_id: "main-session",
+    workflow: "standard",
+    stage_id: "cto",
+    stage_cursor: "cto",
+    capability_id: "cto-test",
+    capability_epoch: "test",
+    slot_id: state.id,
+    task_id: state.id,
+    dispatch_id: state.id,
+    attempt: 1,
+    worker_id: "cto-test",
+  };
+}
+
+function seedOwnedState(root: string, state: ReturnType<typeof newCtoState>, runtimeAccess: CtoRuntimeAccessFacade): void {
+  ownedIdentity(state);
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  assert.ok(pinnedRoot);
+  try {
+    writeCtoState(state, root, { pinnedRoot, preCommit: ({ pinnedRoot: stableRoot }) => stableRoot.assertStable() });
+    assert.equal(writeCtoRuntimeStateProof(pinnedRoot, state), true);
+  } finally {
+    pinnedRoot.close();
+  }
+  runtimeAccess.findActiveRun();
+}
+
+function persistState(root: string, state: ReturnType<typeof newCtoState>, runtimeAccess: CtoRuntimeAccessFacade): void {
+  seedOwnedState(root, state, runtimeAccess);
   runtimeAccess.withRunTransaction(state.id, (transaction) => {
     transaction.writeState(state);
   });
@@ -151,7 +182,7 @@ test("cto-amend: findActiveCtoRun finds an active run and ignores finished ones"
     assert.equal(done.ok, true);
     if (done.ok) {
       setCtoPause(done.state, "done", "finished");
-      persistState(done.state, runtime.access);
+      persistState(root, done.state, runtime.access);
     }
 
     const active = findActiveCtoRun(root);
@@ -163,7 +194,7 @@ test("cto-amend: findActiveCtoRun finds an active run and ignores finished ones"
 
     // Marking the active run done -> nothing active left.
     setCtoPause(active!.state, "done", "finished");
-    persistState(active!.state, runtime.access);
+    persistState(root, active!.state, runtime.access);
     assert.equal(findActiveCtoRun(root), null);
   } finally {
     runtime.close();
@@ -171,7 +202,7 @@ test("cto-amend: findActiveCtoRun finds an active run and ignores finished ones"
   }
 });
 
-test("cto-amend: canonical state outranks forged valid delivery-index fields", () => {
+test("cto-amend: forged delivery-index fields fail closed without mutating canonical state", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-amend-authority-"));
   const runtime = openTestCtoRuntime(root);
   try {
@@ -179,11 +210,13 @@ test("cto-amend: canonical state outranks forged valid delivery-index fields", (
     assert.ok(active);
     if (!active) return;
     const indexPath = join(root, ".work-state", "cto", "active-run-index.json");
+    const statePath = join(root, ".work-state", "cto", active.plan.id, "state.json");
     const original = JSON.parse(readFileSync(indexPath, "utf8")) as {
       schema_version: number;
       active_run_id: string | null;
       entries: Array<Record<string, unknown>>;
     };
+    const canonicalStateBytes = readFileSync(statePath);
     const entry = original.entries.find((candidate) => candidate.run_id === active.plan.id);
     assert.ok(entry);
     if (!entry) return;
@@ -215,12 +248,19 @@ test("cto-amend: canonical state outranks forged valid delivery-index fields", (
         active_run_id: mutation.active_run_id,
         entries: original.entries.map((candidate) => candidate.run_id === active.plan.id ? mutation.entry : candidate),
       }) + "\n");
-      const discovered = findActiveCtoRun(root);
-      assert.equal(discovered?.runId, active.plan.id, `${mutation.label} forged fields must not outrank canonical state`);
-      assert.deepEqual(discovered?.state, readCtoState(active.plan.id, root), `${mutation.label} discovery must return canonical state`);
-      const repaired = JSON.parse(readFileSync(indexPath, "utf8")) as typeof original;
-      assert.equal(repaired.active_run_id, active.plan.id, `${mutation.label} recovery must restore the canonical active pointer`);
-      assert.deepEqual(repaired.entries.find((candidate) => candidate.run_id === active.plan.id), original.entries.find((candidate) => candidate.run_id === active.plan.id), `${mutation.label} recovery must restore the canonical delivery entry`);
+      assert.throws(
+        () => findActiveCtoRun(root),
+        (error: unknown) => error instanceof CtoAuthorityUnavailableError && error.code === "CTO_AUTHORITY_UNAVAILABLE",
+        `${mutation.label} forged fields must fail closed when index proof no longer authenticates`,
+      );
+      const notifications: string[] = [];
+      assert.throws(
+        () => ctoCommand({ args: "follow-up", cwd: root, ui: { notify: (message: string) => notifications.push(message) } }),
+        (error: unknown) => error instanceof CtoAuthorityUnavailableError && error.code === "CTO_AUTHORITY_UNAVAILABLE",
+        `${mutation.label} must not route a fresh or amend command through a forged index`,
+      );
+      assert.deepEqual(readFileSync(statePath), canonicalStateBytes, `${mutation.label} must not rewrite canonical state`);
+      assert.deepEqual(notifications, [], `${mutation.label} must not emit fresh/amend routing notifications`);
     }
   } finally {
     runtime.close();
@@ -246,21 +286,24 @@ test("cto-amend: indexed active run survives more than 1025 junk directories", (
 });
 test("cto-amend: uppercase active run ids remain discoverable and do not create a second run", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-amend-uppercase-"));
+  const runtime = openTestCtoRuntime(root);
   try {
     const state = newCtoState({
       id: "CTO-1",
       task: "Uppercase resident run",
       branch: "main",
       autonomous: false,
+      owner_session: "main-session",
       plan: { id: "CTO-1", task: "Uppercase resident run", teams: [], created_at: "2026-08-31T12:00:00.000Z" },
     });
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+    runtime.access.createRun(state, { source_id: "cto-uppercase-test", initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) });
     const discovered = findActiveCtoRun(root);
     assert.equal(discovered?.runId, "CTO-1");
     const amend = ctoCommand({ args: "follow-up", cwd: root, ui: { notify: () => undefined } });
     assert.match(amend, /\/cto AMEND/);
     assert.equal(findActiveCtoRun(root)?.runId, "CTO-1");
   } finally {
+    runtime.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -292,7 +335,7 @@ test("cto-amend: ctoCommand routes to AMEND while a run is active, fresh otherwi
     const active = findActiveCtoRun(root);
     assert.ok(active);
     setCtoPause(active.state, "done", "done");
-    persistState(active.state, runtime.access);
+    persistState(root, active.state, runtime.access);
     const freshAgain = ctoCommand(ctx("execute ready handoff --spec feature-c --run-key run-c"));
     assert.ok(freshAgain.includes("/cto workflow"));
     assert.ok(!freshAgain.includes("AMEND"));
@@ -309,7 +352,7 @@ test("cto-amend: markAmended stamps amended_at and persists", () => {
     const res = startRun(root, runtime.access);
     assert.ok(res);
     markAmended(res.state);
-    persistState(res.state, runtime.access);
+    persistState(root, res.state, runtime.access);
     const reloaded = readCtoState(res.plan.id, root);
     assert.ok(reloaded?.amended_at, "amended_at stamped after markAmended");
   } finally {

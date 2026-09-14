@@ -11,7 +11,8 @@ import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { runCto, type TeamDef, type Escalation, type CtoState, type TeamLease, type DecisionMemoryEntry } from "@andvl1/omp-workflows-core";
+import { runCto } from "../src/cto/run.js";
+import type { TeamDef, Escalation, CtoState, TeamLease, DecisionMemoryEntry } from "../src/cto/types.js";
 import { PinnedRootError } from "../src/specification/pinned-root.js";
 import { MAX_TEAMS } from "../src/cto/types.js";
 import { buildTeamPlan, validateDecompositionDepth } from "../src/cto/plan.js";
@@ -449,7 +450,8 @@ test("cto-core: readCtoState normalizes legacy bytes in memory without rewriting
     const runId = "legacy-run-2026-08-01";
     const statePath = join(root, ".work-state", "cto", runId, "state.json");
     mkdirSync(dirname(statePath), { recursive: true });
-    const legacyBytes = Buffer.from(JSON.stringify(schema1Fixture(), null, 2), "utf8");
+    const legacyReadFixture = { ...schema1Fixture(), state_revision: 0, wave_history: [] };
+    const legacyBytes = Buffer.from(JSON.stringify(legacyReadFixture, null, 2), "utf8");
     writeFileSync(statePath, legacyBytes);
 
     const reloaded = readCtoState(runId, root);
@@ -469,6 +471,7 @@ test("cto-core: readCtoState normalizes partial schema-2 bytes without rewriting
     const runId = "standby-1234";
     const partial = {
       schema: 2,
+      state_revision: 1,
       id: runId,
       task: "standby — awaiting inbox tasks",
       branch: "",
@@ -478,6 +481,7 @@ test("cto-core: readCtoState normalizes partial schema-2 bytes without rewriting
       integration: { status: "pending" },
       pause: { kind: "none", reason: "standby" },
       updated_at: "2026-08-07T00:00:00.000Z",
+      wave_history: [],
     };
     const statePath = join(root, ".work-state", "cto", runId, "state.json");
     mkdirSync(dirname(statePath), { recursive: true });
