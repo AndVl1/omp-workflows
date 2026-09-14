@@ -375,7 +375,10 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
    * lookups so an old shard can never be silently attributed to a new run.
    */
   migrateLegacyMappings(tenant: string, chatId: string, pinnedRoot?: PinnedProjectRoot): void {
-    if (pinnedRoot && !pinnedRoot.isStable()) throw new Error("telegram: project root changed before mapping migration");
+    if (!pinnedRoot) throw new Error("telegram: mapping migration requires a pinned project root");
+    this.assertProofAuthorityLive();
+    this.assertLive(pinnedRoot);
+    if (!pinnedRoot.isStable()) throw new Error("telegram: project root changed before mapping migration");
     if (!isSafeRunId(tenant) || typeof chatId !== "string" || chatId.length === 0 || chatId.length > 512 || /[\u0000-\u001f\u007f]/u.test(chatId)) {
       throw new Error("telegram: legacy mapping migration identity is invalid");
     }
@@ -433,6 +436,33 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
         }
       }
       const snapshot = readTelegramMapSnapshot(source, tenant, chatId, budget, true);
+      const migrationRoute = this.mappingRouteBinding(chatId);
+      const migratedRecords = snapshot.records.map((entry) => {
+        this.assertProofAuthorityLive();
+        if (entry.root || entry.route || entry.delivery || entry.proof) {
+          if (!telegramMappingProofMatches(entry, pinnedRoot, migrationRoute, this.proofAuthority)) {
+            throw new Error("telegram: legacy mapping contains an invalid bound proof");
+          }
+          return entry;
+        }
+        const receipt: TelegramMappingReceipt = { sent: true, channelRef: `tg:${entry.messageId}` };
+        const unsigned: TelegramMappingRecord = {
+          escId: entry.escId,
+          messageId: entry.messageId,
+          chatId,
+          root: { canonical_path: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino },
+          route: migrationRoute,
+          delivery: {
+            payload_digest: legacyTelegramMappingPayloadDigest(tenant, chatId, entry.escId, entry.messageId),
+            delivery_digest: telegramDeliveryDigest(legacyTelegramMappingPayloadDigest(tenant, chatId, entry.escId, entry.messageId), receipt),
+            receipt,
+          },
+        };
+        const proof = telegramMappingProof(unsigned, this.proofAuthority);
+        if (!proof) throw new TelegramActivationRevokedError("telegram mapping proof authority is unavailable");
+        return { ...unsigned, proof };
+      });
+      const migratedSnapshot: TelegramMapSnapshot = { ...snapshot, records: migratedRecords };
       const callbacks = readTelegramCallbackBindings(source, tenant, chatId, this.mappingMaxEntryBytes, true);
       if (snapshot.records.some((entry) => entry.escId.split("/")[0] !== tenant)
         || (callbacks?.bindings.some((entry) => entry.escId.split("/")[0] !== tenant) ?? false)) {
@@ -471,7 +501,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       const byMessageKey = new Map<string, string>();
       for (const entry of mergedRecords) addTelegramMapping(mergedRecords, byEscId, byMessageKey, entry);
       const destinationLength = mergedRecords.length;
-      for (const entry of snapshot.records) addTelegramMapping(mergedRecords, byEscId, byMessageKey, entry);
+      for (const entry of migratedSnapshot.records) addTelegramMapping(mergedRecords, byEscId, byMessageKey, entry);
       const nextShardIndex = writeCanonicalTelegramMappingRecords(
         destination,
         mergedRecords.slice(destinationLength),
@@ -575,6 +605,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   }
 
   private assertLive(pinnedRoot: PinnedProjectRoot, lifecycle?: AdapterOperationContext): void {
+    this.assertProofAuthorityLive();
     try {
       lifecycle?.assertLive?.();
       this.runtimeAccess?.assertLive();
@@ -1241,20 +1272,28 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       this.migrateLegacyMappings(runId, chatId, pinnedRoot);
     }
   }
-  private mappingRouteBinding(): TelegramMappingRoute {
-    let snapshot: unknown = { status: "runtime-unavailable" };
+  private mappingRouteBinding(chatId = this.chatId): TelegramMappingRoute {
+    this.assertProofAuthorityLive();
+    const runtimeAccess = this.runtimeAccess;
+    if (!runtimeAccess) throw new TelegramActivationRevokedError("telegram runtime authority is unavailable");
+    let snapshot: ReturnType<CtoRuntimeAccessFacade["resolveEscalationChannelSnapshot"]>;
     try {
-      snapshot = this.runtimeAccess?.resolveEscalationChannelSnapshot() ?? { status: "runtime-unavailable" };
-    } catch {
-      snapshot = { status: "runtime-error" };
+      runtimeAccess.assertLive();
+      snapshot = runtimeAccess.resolveEscalationChannelSnapshot();
+    } catch (error) {
+      throw new TelegramActivationRevokedError("telegram channel projection is unavailable", { cause: error });
     }
-    let projection_sha256: string;
-    try {
-      projection_sha256 = createHash("sha256").update(JSON.stringify(snapshot), "utf8").digest("hex");
-    } catch {
-      projection_sha256 = createHash("sha256").update("runtime-projection-unavailable", "utf8").digest("hex");
-    }
-    return { projection_sha256, channel: "telegram", target: this.chatId };
+    if (snapshot.status !== "valid") throw new TelegramActivationRevokedError("telegram channel projection is not valid");
+    const projections = snapshot.projections.telegram;
+    if (!Array.isArray(projections) || projections.length === 0) throw new TelegramActivationRevokedError("telegram channel projection is absent");
+    const targetConfigured = projections.some((projection) => {
+      const direct = projection.chatId;
+      const nested = projection.telegram;
+      const nestedChat = nested && typeof nested === "object" && !Array.isArray(nested) ? (nested as Record<string, unknown>).chatId : undefined;
+      return (typeof direct === "string" && direct === chatId) || (typeof nestedChat === "string" && nestedChat === chatId);
+    });
+    if (!targetConfigured) throw new TelegramActivationRevokedError("telegram channel target is not bound to the authenticated projection");
+    return { projection_sha256: snapshot.config_sha256, channel: "telegram", target: chatId };
   }
   private prepareCallbackMappings(esc: Escalation, pinnedRoot: PinnedProjectRoot, lifecycle?: AdapterOperationContext): void {
     if (!esc.options || esc.options.length === 0) return;
@@ -1598,6 +1637,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
           || typeof entry.pending_summary !== "boolean" || typeof entry.pending_outbox !== "boolean" || typeof entry.pending_retry !== "boolean"
           || typeof entry.summary_digest !== "string"
           || seenRuns.has(entry.run_id)) return false;
+        if (!this.runtimeAccess!.hasValidStateProof(entry.run_id)) return false;
         const state = this.runtimeAccess!.readState(entry.run_id);
         this.runtimeAccess!.assertLive();
         if (!pinnedRoot.isStable()) return false;
@@ -1722,6 +1762,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     if (!runId || !isSafeCtoRunId(runId)) return null;
     try {
       this.runtimeAccess.assertLive();
+      if (!this.runtimeAccess.hasValidStateProof(runId)) return null;
       const state = this.runtimeAccess.readState(runId);
       this.runtimeAccess.assertLive();
       if (!state || !pinnedRoot.isStable()) return null;
@@ -2116,6 +2157,12 @@ function telegramMappingProofMatches(record: TelegramMappingRecord, pinnedRoot: 
 }
 function telegramDeliveryDigest(payloadDigest: string, receipt: TelegramMappingReceipt): string {
   return createHash("sha256").update(JSON.stringify({ payload_digest: payloadDigest, receipt }), "utf8").digest("hex");
+}
+function legacyTelegramMappingPayloadDigest(tenant: string, chatId: string, escId: string, messageId: number): string {
+  return createHash("sha256")
+    .update("telegram-legacy-mapping-v1\u0000", "utf8")
+    .update(JSON.stringify({ tenant, chatId, escId, messageId }), "utf8")
+    .digest("hex");
 }
 function legacyTelegramMappingLine(record: TelegramMappingRecord): string {
   return JSON.stringify({ escId: record.escId, messageId: record.messageId, chatId: record.chatId });
