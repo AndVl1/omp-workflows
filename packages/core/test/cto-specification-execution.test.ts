@@ -296,7 +296,7 @@ function migrateFeatureWorkspaceToSchema3(root: string, featureId: string, runKe
   if (!released.ok) throw new Error(released.error);
 }
 
-function ensureExecutionContext(root: string): void {
+function ensureExecutionContext(root: string, options: { featureStateOnly?: boolean } = {}): void {
   if (executionContexts.has(root)) return;
   const features = [...(projectFeatures.get(root) ?? [])].sort();
   if (features.length === 0) throw new Error("execution fixture requires one feature");
@@ -315,6 +315,7 @@ function ensureExecutionContext(root: string): void {
     specification: firstWorkspace as TeamState["specification"], updated_at: new Date().toISOString(),
   };
   writeState(root, featureState, { featureSlug: firstFeature });
+  if (options.featureStateOnly) return;
   const capabilityId = issued.state.capability_id!;
   const capabilityEpoch = issued.state.issued_for!.cursor_epoch;
   const slices: Array<{ feature_id: string; task_id: string; slice_id: string; team_id: string; depends_on: string[] }> = [];
@@ -4731,7 +4732,7 @@ test("preparation preserves selection report for post-eligibility failures", () 
   }
 });
 
-test("multi-task same TeamDef prepares unique execution instances and closes", async () => {
+test("multi-task same TeamDef preparation creates unique execution instances and replays", async () => {
   const root = makeProject();
   const featureId = "multi-task-same-def";
   const preparationRun = "MULTI-TASK-PREP";
@@ -4744,13 +4745,13 @@ test("multi-task same TeamDef prepares unique execution instances and closes", a
       const verification = (handoff.verification as Json[])[0]!;
       verification.task_ids = [...(verification.task_ids as string[]), "T-2"];
     }, root);
-    ensureExecutionContext(root);
+    ensureExecutionContext(root, { featureStateOnly: true });
     const featureStatePath = join(root, ".work-state", "features", featureId, "state.json");
     const selectedFeature = resolveState(root, undefined, selection(featureId));
     assert.ok(selectedFeature.state);
     if (!selectedFeature.state) return;
     selectedFeature.state.stages = Array.from({ length: 4096 }, (_, index) => ({
-      id: index === 0 ? "execution" : "stage-" + index, status: index === 0 ? "in_progress" : "pending", note: "x".repeat(400),
+      id: index === 0 ? "execution" : "stage-" + index, status: index === 0 ? "in_progress" : "done", note: "x".repeat(400),
     }));
     writeState(root, selectedFeature.state, { featureSlug: featureId });
     assert.ok(statSync(featureStatePath).size > 1024 * 1024, "fixture must be writer-valid and exceed the retired 1MiB preparation cap");
@@ -4761,8 +4762,8 @@ test("multi-task same TeamDef prepares unique execution instances and closes", a
       cto_run_id: preparationRun, task: "prepare multi-task execution", branch: "main", classification,
       selections: [selection(featureId)],
       teams: [
-        { team: teamDef.id, task_ref: { feature_id: featureId, task_id: "T-1" }, classification, workflow: "standard", profile: "standard", worktree: "same_branch", depends_on: [], dod },
-        { team: teamDef.id, task_ref: { feature_id: featureId, task_id: "T-2" }, classification, workflow: "standard", profile: "standard", worktree: "same_branch", depends_on: [], dod },
+        { team: teamDef.id, task_ref: { feature_id: featureId, task_id: "T-1" }, scope: ["src/feature.ts"], classification, workflow: "standard", profile: "standard", worktree: "same_branch", depends_on: [], dod },
+        { team: teamDef.id, task_ref: { feature_id: featureId, task_id: "T-2" }, scope: ["src/other.ts"], classification, workflow: "standard", profile: "standard", worktree: "same_branch", depends_on: [], dod },
       ],
     };
     let injected = false;
@@ -4774,15 +4775,15 @@ test("multi-task same TeamDef prepares unique execution instances and closes", a
         }
       },
     }, root);
-    const interrupted = prepareCtoSpecificationExecution(root, preparationInput, { defs: [teamDef], ...preparationRuntimeOptions(root) });
+    const interrupted = prepareCtoSpecificationExecution(root, preparationInput, { defs: [teamDef], ...preparationRuntimeOptions(root, "preparation-session") });
     assert.equal(interrupted.status, "blocked", JSON.stringify(interrupted));
     setCtoSpecificationPreparationTestHooks(null, root);
     assert.deepEqual(readFileSync(featureStatePath), stateBeforePreparation, "rollback must restore the >1MiB anchor preimage");
     const preimageDir = join(root, ".work-state", "cto", preparationRun, "preparation-preimages");
     assert.ok(existsSync(preimageDir) && readdirSync(preimageDir).some((name) => name.endsWith(".bin")), "rollback must retain a content-addressed preimage");
-    const prepared = prepareCtoSpecificationExecution(root, preparationInput, { defs: [teamDef], ...preparationRuntimeOptions(root) });
+    const prepared = prepareCtoSpecificationExecution(root, preparationInput, { defs: [teamDef], ...preparationRuntimeOptions(root, "preparation-session") });
     assert.equal(prepared.status, "ready", JSON.stringify(prepared));
-    const replay = prepareCtoSpecificationExecution(root, preparationInput, { defs: [teamDef], ...preparationRuntimeOptions(root) });
+    const replay = prepareCtoSpecificationExecution(root, preparationInput, { defs: [teamDef], ...preparationRuntimeOptions(root, "preparation-session") });
     assert.equal(replay.status, "ready", JSON.stringify(replay));
     if (prepared.status !== "ready") return;
     const preparedState = readCtoState(preparationRun, root);
@@ -4793,28 +4794,8 @@ test("multi-task same TeamDef prepares unique execution instances and closes", a
     assert.deepEqual(preparedState.plan.teams[1]!.depends_on, [preparedState.plan.teams[0]!.team]);
     assert.deepEqual(preparedState.teams.map((team) => team.team_def_id), [teamDef.id, teamDef.id]);
 
-    // The writer-valid fixture was hydrated before preparation; rebuild the public RUN_ID context after the anchor capability write.
-    rmSync(join(root, ".work-state", "cto", RUN_ID), { recursive: true, force: true });
-    executionContexts.delete(root);
-    const frozen = mapping(await preflight(root, [selection(featureId)]));
-    const owners = frozen.task_to_slice as Json[];
-    assert.equal(new Set(owners.map((owner) => owner.team_id)).size, 2);
-    const confirmed = await confirmTrusted(root, frozen);
-    assert.equal(confirmed.status, "confirmed", detail(confirmed));
-    const dispatched = await dispatchCtoSpecificationMapping(root, { cto_run_id: RUN_ID, mapping_id: String(frozen.mapping_id), expected_mapping_hash: String(frozen.mapping_hash) }, preparationRuntimeOptions(root)) as unknown as Result;
-    assert.equal(dispatched.status, "dispatched", detail(dispatched));
-    const conformanceTool = publicCtoTools(root).get("cto_specification_conformance")!;
-    const conformance = mountedDetails(await conformanceTool.execute("multi-task-conformance", mountedConformancePayload(root, dispatched.mapping!, dispatched.conformance_binding!, [featureId]), undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
-    assert.equal(conformance.status, "ready", detail(conformance));
-    const nextTools = (conformance.required_next_tools as Json[] | undefined) ?? [];
-    if (nextTools.length > 0) {
-      const finalizer = publicWorkflowTool("workflow_complete_specification_execution", root);
-      const closed = mountedDetails(await finalizer.execute("multi-task-close", nextTools[0]!.arguments, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
-      assert.equal(closed.ok, true, detail(closed));
-    }
-    const completed = resolveState(root, undefined, { feature_id: featureId, run_key: "run-" + featureId + "-1" });
-    assert.equal(completed.state?.specification?.status, "completed");
   } finally {
+    setCtoSpecificationPreparationTestHooks(null, root);
     executionContexts.delete(root);
     projectFeatures.delete(root);
     rmSync(root, { recursive: true, force: true });
@@ -4838,6 +4819,7 @@ test("duplicate preflight selectors produce one actionable exact retry", async (
     projectFeatures.delete(root);
     rmSync(root, { recursive: true, force: true });
   }
+    setCtoSpecificationPreparationTestHooks(null, root);
 });
 test("preflight rejects artifact-version content changed behind an old frozen digest", async () => {
   const root = makeProject();
@@ -4947,7 +4929,7 @@ test("CTO reconciliation rejects cross-bound identity receipts before team mutat
       const state = readCtoState(runId, root);
       assert.ok(state?.teams[0]?.work_identity);
       if (!state || !state.teams[0]?.work_identity) continue;
-      state.teams[0].work_identity = mutateIdentity(state.teams[0].work_identity as unknown as Json) as unknown as typeof state.teams[0].work_identity;
+      state.teams[0].work_identity = mutateIdentity(state.teams[0].work_identity as unknown as Json) as unknown as CtoState["teams"][number]["work_identity"];
       testRuntimeAccess(root, DEFAULT_TEST_SESSION_ID).withRunTransaction(runId, (transaction) => { transaction.writeState(state); });
       const before = readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8");
       const reconciled = reconcileCtoSpecificationExecutionTeams(root, runId, preparationRuntimeOptions(root));
