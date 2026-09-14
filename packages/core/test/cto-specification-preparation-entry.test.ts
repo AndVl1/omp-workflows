@@ -91,7 +91,7 @@ const owner = {
 };
 const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], owner);
 if (!activation.ok) throw new Error(activation.error);
-const sessionId = "preparation-entry-child";
+const sessionId = "preparation-entry-test";
 const runtimeRoot = realpathSync(root);
 const runtimeIdentity = statSync(runtimeRoot);
 const sessionManager = Object.freeze({ cwd: root, getSessionId: () => sessionId, getCwd: () => root });
