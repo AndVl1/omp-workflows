@@ -1644,8 +1644,9 @@ function rosterSelectionInputError(selection: unknown): string | null {
  * mapping, then frozen on the issued capability.
  *
  * `options.trustedMappingProof` carries an opaque engine-issued proof for a
- * canonical host-discovered mapping. A raw or stale mapping cannot authorize
- * role availability; callers without a proof keep the persisted fallback.
+ * canonical host-discovered mapping. A raw, stale, or absent proof cannot
+ * authorize roster role availability; roster capabilities fail closed until
+ * the host publishes a fresh engine-issued proof.
  */
 export function beginCapability(cwd: string, requested?: RosterBeginSelection, options?: TrustedMappingOptions): TransitionResult {
   const selectionError = rosterSelectionInputError(requested);
