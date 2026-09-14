@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
-import { registerTestTeamWorkflow } from "./fixtures/registry-activation.js";
+import { registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
 import { TEST_CONTEXT } from "./fixtures/registrar-host.js";
 import type { RoleConfig } from "../src/engine/types.js";
 import { orchestratorWriteGate } from "../src/gates/orchestrator-write.js";

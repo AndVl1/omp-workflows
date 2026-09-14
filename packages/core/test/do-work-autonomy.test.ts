@@ -21,7 +21,7 @@ import { appendCheckpointDecision, checkpointPolicyHash, issueTrustedCheckpointA
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
-import { registerTestTeamWorkflow } from "./fixtures/registry-activation.js";
+import { registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
 import { resolveState, setStateTransactionTestHooks, writeState } from "../src/engine/state.js";
 import { createFeatureWorkspace } from "../src/specification/workspace.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";

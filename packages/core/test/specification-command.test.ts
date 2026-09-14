@@ -12,7 +12,8 @@ import { parseImportReview, parseSpecificationCommand, parseSpecificationImportC
 import { createCompatibilitySupplement } from "../src/specification/import.js";
 import { validateArtifactStructure } from "../src/engine/artifacts.js";
 import { setCanonicalHandoffReadTestHooks } from "../src/specification/canonical-reader.js";
-import { registerTestConstitutionGate, registerTestFormatRecognizer, registerTestWorkflowTools, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { registerTestConstitutionGate, registerTestFormatRecognizer, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { registerTestWorkflowTools } from "./fixtures/host-tool-activation.js";
 import { normalizePersistedState, resolveState, setStateTransactionTestHooks, updateStateAtomically, writeState } from "../src/engine/state.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { loadProfile, profileHash } from "../src/engine/profile.js";

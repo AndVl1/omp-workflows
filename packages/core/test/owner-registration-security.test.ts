@@ -12,7 +12,8 @@ import {
   registerTeamWorkflow,
   type WorkflowOwnerIdentity,
 } from "../src/index.js";
-import { closeRetainedTestRegistrations, openTestRegistry, registerTestTeamWorkflow, registerTestCtoTools, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { closeRetainedTestRegistrations, openTestRegistry, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { registerTestCtoTools, registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
 import {
   releaseWorkflowOwners,
   workflowOwnerFor,
@@ -939,6 +940,42 @@ test("owner-aware command registration is idempotent across repeated session_sta
     ]);
     assert.equal(harness.registerCalls, 7);
     assert.equal(workflowOwnerFor(root, "workflow_registration")?.owner.owner_id, "bundle-one");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("command shutdown requires manager, file, and generation identity beyond a reused session id", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-command-shutdown-identity-"));
+  try {
+    const markerInfo = marker(root);
+    const managerA = {
+      getCwd: () => root,
+      getSessionId: () => "reused-session-id",
+      getSessionFile: () => join(root, "session-a.jsonl"),
+      getSessionGeneration: () => 1,
+    };
+    const managerB = {
+      getCwd: () => root,
+      getSessionId: () => "reused-session-id",
+      getSessionFile: () => join(root, "session-b.jsonl"),
+      getSessionGeneration: () => 2,
+    };
+    const harness = commandHarness();
+    registerWorkflowCommands(harness.pi as never, {
+      owner: () => activationOwner("bundle-shutdown-identity", root, markerInfo.path, markerInfo.sha256),
+      resolveCwd: () => root,
+    });
+    const contextA = { cwd: root, sessionManager: managerA };
+    const contextB = { cwd: root, sessionManager: managerB };
+    harness.sessionStarts[0]?.({}, contextA);
+    const handler = harness.commands.get("do-work")?.handler;
+    assert.ok(handler);
+    harness.sessionShutdowns[0]?.({}, contextB);
+    await handler!("still-live", contextA);
+    assert.equal(harness.prompts.length, 1, "same-id stale shutdown must preserve the A activation");
+    harness.sessionShutdowns[0]?.({}, contextA);
+    await assert.rejects(handler!("closed", contextA), /activation_identity_changed|registration context/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

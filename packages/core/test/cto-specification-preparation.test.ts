@@ -13,7 +13,7 @@ import { test, describe } from "node:test";
 import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
 import { TEST_CONTEXT, TEST_SESSION_MANAGER } from "./fixtures/registrar-host.js";
-import { registerTestWorkflowTools } from "./fixtures/registry-activation.js";
+import { registerTestWorkflowTools } from "./fixtures/host-tool-activation.js";
 import { z as zod } from "zod";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

@@ -28,7 +28,7 @@ import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { validFeatureWorkspace } from "./fixtures/specification-fixtures.js";
 import { resolveState, updateStateAtomically } from "../src/engine/state.js";
-import { registerTestWorkflowTools } from "./fixtures/registry-activation.js";
+import { registerTestWorkflowTools } from "./fixtures/host-tool-activation.js";
 import { completeDispatch, resolveNativePhaseCheckpointSubject } from "../src/engine/durable.js";
 import { z as zod } from "zod";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";

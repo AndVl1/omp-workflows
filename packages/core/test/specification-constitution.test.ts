@@ -53,7 +53,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256, bindFeatureWorkspaceToRoot, validConstitutionBinding, validFeatureWorkspace } from "./fixtures/specification-fixtures.js";
 import { evaluateConstitutionUsability } from "../src/gates/constitution.js";
-import { registerTestConstitutionProvider, registerTestConstitutionTools, registerTestWorkflowTools, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { registerTestConstitutionProvider, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { registerTestWorkflowTools, registerTestConstitutionTools } from "./fixtures/host-tool-activation.js";
 import {
   resolveConstitutionProvider,
 } from "../src/specification/constitution-provider.js";

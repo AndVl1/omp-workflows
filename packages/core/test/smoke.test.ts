@@ -25,7 +25,8 @@ import {
   reopenFromFeedback,
   type WorkflowOwnerIdentity,
 } from "@andvl1/omp-workflows-core";
-import { registerTestProfiles, registerTestTeamWorkflow, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { registerTestProfiles, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
 import { loadAllProfiles as loadSourceProfiles, selectProfile as selectSourceProfile } from "../src/engine/profile.js";
 import { classificationToolGate } from "../src/gates/classification.js";
 import { createTaskCaller, runStage, type TaskToolLike } from "../src/engine/stage.js";

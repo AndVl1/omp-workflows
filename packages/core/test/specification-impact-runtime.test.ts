@@ -11,7 +11,7 @@ import {
   validFeatureWorkspace,
   validImplementationHandoff,
 } from "./fixtures/specification-fixtures.js";
-import { registerTestConstitutionTools } from "./fixtures/registry-activation.js";
+import { registerTestConstitutionTools } from "./fixtures/host-tool-activation.js";
 import {
   parseConstitutionPrincipleIdentities,
   renderCanonicalPhaseDocument,

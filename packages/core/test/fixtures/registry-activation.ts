@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { registerWorkflowProfiles } from "../../src/engine/profile.js";
+import { setConstitutionContinuationGate } from "../../src/engine/durable.js";
 import { registerConstitutionProvider } from "../../src/specification/constitution-provider.js";
 import { registerDocumentRenderer, registerFormatRecognizer, registerSpecificationRenderer } from "../../src/specification/registry.js";
 import { registerArtifactRenderer, type ArtifactRenderer, type ArtifactRenderLayer } from "../../src/visualize/renderer-registry.js";
@@ -25,9 +26,11 @@ import {
   type WorkflowOwnerIdentity,
   type WorkflowOwnerReleaseToken,
   type RegistryRegistrationContext,
+  type WorkflowActivationResult,
 } from "../../src/registry/owner.js";
 
 type WorkflowProfile = Profile;
+type OpenedWorkflowActivation = Extract<WorkflowActivationResult, { readonly ok: true }>;
 const MARKER_CONTENT = "omp-core-test-registry-marker-v1";
 
 // Mounted host hooks resolve an existing run through the authenticated runtime
@@ -89,7 +92,7 @@ export function openTestCtoRuntime(
   ownerId = "core-cto-runtime-test",
 ): {
   readonly access: CtoRuntimeAccessFacade;
-  readonly registryContext: ReturnType<typeof openDistWorkflowActivation> extends { ok: true; registry_context: infer T } ? T : never;
+  readonly registryContext: OpenedWorkflowActivation["registry_context"];
   readonly owner: DistWorkflowOwnerIdentity;
   readonly close: () => void;
 } {
@@ -224,6 +227,17 @@ export function registerTestSpecificationRenderer(root: string, renderer: Specif
 export function registerTestArtifactRenderer(root: string, layer: ArtifactRenderLayer, artifactId: string, renderer: ArtifactRenderer, ownerId = "core-test-visual"): void {
   const registration = openTestRegistry(root, ["visual_renderers"], ownerId);
   try { registerArtifactRenderer(registration.token, layer, artifactId, renderer); registration.retain(true); } catch (error) { try { registration.finish(false); } catch { /* preserve original */ } throw error; }
+}
+
+export function registerTestConstitutionGate(root: string, ownerId = "core-test-constitution-gate"): void {
+  const registration = openTestRegistry(root, ["constitution_gate"], ownerId);
+  try {
+    setConstitutionContinuationGate(registration.token, () => null);
+    registration.retain(true);
+  } catch (error) {
+    try { registration.finish(false); } catch { /* preserve original */ }
+    throw error;
+  }
 }
 
 export function withTestRegistry<T>(

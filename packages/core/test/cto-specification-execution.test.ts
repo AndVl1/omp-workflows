@@ -21,7 +21,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as publicCore from "../src/index.js";
-import { openTestCtoRuntime, registerTestCtoTools, registerTestTeamWorkflow, registerTestWorkflowTools } from "./fixtures/registry-activation.js";
+import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
+import { registerTestWorkflowTools, registerTestCtoTools, registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
 import { resolveCtoRuntimeAccessForRoot, type CtoRuntimeAccessFacade } from "../src/cto/runtime-access.js";
 import {
   closeCtoSpecificationExecutionWave as closeCtoSpecificationExecutionWaveImpl,

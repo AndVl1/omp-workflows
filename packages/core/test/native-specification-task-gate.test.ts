@@ -19,7 +19,9 @@ import {
 } from "../src/gates/native-specification.js";
 import { TEST_CONTEXT, TEST_SESSION_MANAGER } from "./fixtures/registrar-host.js";
 import { registerTeamWorkflow } from "../src/index.js";
-import { openTestRegistry, registerTestTeamWorkflow, registerTestWorkflowTools, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { openTestRegistry, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { registerTestWorkflowTools, registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
+import { workflowOwnerFor } from "../src/registry/owner.js";
 import { specificationPhaseSchemaForConstitution } from "../src/engine/artifact-contract.js";
 import { PinnedProjectRoot, type PinnedRootWriteHooks } from "../src/specification/pinned-root.js";
 import { readPinnedConstitutionPrincipleIdentities } from "../src/specification/constitution-identities.js";
@@ -2224,29 +2226,35 @@ test("team shutdown ignores stale session generations and closes each exact rebi
     const contextB = { cwd: f.root, sessionManager: manager("shutdown-b") };
     const contextC = { cwd: f.root, sessionManager: manager("shutdown-c") };
     initialSessionStart({}, contextA);
+    assert.ok(workflowOwnerFor(f.root, "workflow_registration"), "initial A binds an owner claim");
     const sessionStart = handlers.get("session_start");
     const sessionShutdown = handlers.get("session_shutdown");
     assert.ok(sessionStart && sessionShutdown);
     if (!sessionStart || !sessionShutdown) return;
     sessionStart({}, contextB);
+    assert.ok(workflowOwnerFor(f.root, "workflow_registration"), "replacement B binds an owner claim");
 
     // The initial handler must not tear down the replacement B activation.
     sessionShutdown({}, contextA);
+    assert.ok(workflowOwnerFor(f.root, "workflow_registration"), "stale A shutdown preserves B owner claim");
     const call = { type: "tool_call", toolCallId: "shutdown-call-b", toolName: "task", input: envelope(f.item) };
     assert.equal(handlers.get("tool_call")?.(call, contextB), undefined, "stale A shutdown leaves B active");
 
     // The exact B shutdown closes B immediately and remains idempotent.
     sessionShutdown({}, contextB);
+    assert.equal(workflowOwnerFor(f.root, "workflow_registration"), undefined, "exact B shutdown releases its owner claim immediately");
     sessionShutdown({}, contextB);
 
     // The mounted handler is reusable for a later exact generation. A stale
     // B event cannot close C, while the exact C event can close it.
     sessionStart({}, contextC);
+    assert.ok(workflowOwnerFor(f.root, "workflow_registration"), "C rebind restores a live owner claim");
     const callC = { ...call, toolCallId: "shutdown-call-c" };
     assert.equal(handlers.get("tool_call")?.(callC, contextC), undefined, "C activation is live after B shutdown");
     sessionShutdown({}, contextB);
     assert.equal(handlers.get("tool_call")?.({ ...callC, toolCallId: "shutdown-call-c-after-stale" }, contextC), undefined, "stale B shutdown leaves C active");
     sessionShutdown({}, contextC);
+    assert.equal(workflowOwnerFor(f.root, "workflow_registration"), undefined, "exact C shutdown releases its owner claim immediately");
     sessionShutdown({}, contextC);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
