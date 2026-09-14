@@ -46,13 +46,15 @@ import {
   setTeamStatus,
   withCtoStateWriteLock,
   buildCtoTerminalSummaryEnvelope,
+  ctoRunDeliverySummaryDigest,
   writeCtoStateLocked,
+  writeCtoRuntimeStateProof,
 } from "../src/cto/state.js";
 import { appendWave, appendWaveUnderLock, finishWave } from "../src/cto/waves.js";
 import { withCtoRunLock } from "../src/cto/transaction-lock.js";
 import type { CtoTerminalSummaryEnvelope } from "../src/cto/state.js";
 import type { CompletionEnvelope, WorkIdentity } from "../src/engine/types.js";
-import type { WaveRecord } from "../src/cto/types.js";
+import type { CtoState, WaveRecord } from "../src/cto/types.js";
 import { PinnedProjectRoot, PinnedRootError, processStartIdentity } from "../src/specification/pinned-root.js";
 import { canonicalDurableIdFileName, legacyDurableIdFileName } from "../src/cto/durable-id.js";
 import { findActiveCtoRun } from "../src/commands/cto.js";
@@ -183,6 +185,37 @@ function publishCtoOutboxDelivery(root: string, input: { run_id: string; state_r
       ...(input.routing_binding === undefined ? {} : { routing_binding: input.routing_binding as never }),
     });
   } finally { trusted.release(); }
+}
+
+function seedAuthenticatedBackingStates(states: readonly CtoState[], root: string): CtoState[] {
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  assert.ok(pinnedRoot);
+  if (!pinnedRoot) throw new Error("retention fixture root could not be pinned");
+  const seeded: CtoState[] = [];
+  try {
+    for (const state of states) {
+      const ownerSession = state.standby === true ? "core-state-revision-test" : state.owner_session ?? "core-state-revision-test";
+      if (state.standby !== true) state.owner_session = ownerSession;
+      if (state.work_identity) state.work_identity = { ...state.work_identity, run_id: state.id, session_id: ownerSession };
+      // State proofs intentionally bind positive revisions; revision one is
+      // the authenticated postimage of this test-only seed write.
+      state.state_revision = 1;
+      const statePath = join(".work-state", "cto", state.id, "state.json");
+      pinnedRoot.ensureDirectories([dirname(statePath)]);
+      pinnedRoot.writeExclusive(statePath, `${JSON.stringify(state, null, 2)}\n`);
+      if (!mintCtoRuntimeRunOrigin(pinnedRoot, state, ownerSession, "state-revision-test", ctoRuntimeRunInitialIdentityDigest(state))) {
+        throw new Error(`retention fixture origin publication failed for ${state.id}`);
+      }
+      if (!writeCtoRuntimeStateProof(pinnedRoot, state)) throw new Error(`retention fixture state proof publication failed for ${state.id}`);
+      const verified = readCtoState(state.id, root);
+      assert.ok(verified);
+      if (!verified) throw new Error(`retention fixture state ${state.id} is unreadable after authenticated seed`);
+      seeded.push(verified);
+    }
+    return seeded;
+  } finally {
+    pinnedRoot.close();
+  }
 }
 
 test("CTO state reads are detached and mutators do not write without a trusted transaction", () => {
@@ -1987,54 +2020,43 @@ test("active-run index serializes concurrent run-lock writers and removes one fi
 test("run-delivery acknowledgement compacts old terminal entries without dropping active runs", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-run-delivery-retention-"));
   try {
-    const finished = fixture("retention-current");
-    persistState(finished, root);
-    setCtoPause(finished, "done", "finished");
-    persistState(finished, root);
-    const persisted = readCtoState(finished.id, root);
+    const oldStates = seedAuthenticatedBackingStates(Array.from({ length: 65 }, (_, index) => {
+      const state = fixture(`retention-old-${String(index).padStart(2, "0")}`);
+      setCtoPause(state, "done", "historical");
+      return state;
+    }), root);
+    const persisted = seedAuthenticatedBackingStates([(() => {
+      const state = fixture("retention-current");
+      setCtoPause(state, "done", "finished");
+      return state;
+    })()], root)[0];
     assert.ok(persisted);
-    if (!persisted) throw new Error("retention fixture state is missing");
+    if (!persisted) throw new Error("retention current fixture state is missing");
+    const active = seedAuthenticatedBackingStates([fixture("retention-active")], root)[0];
+    assert.ok(active);
+    if (!active) throw new Error("retention active fixture state is missing");
+
+    const discovered = readCtoRunDeliveryIndexPage(root);
+    assert.equal(discovered.active_run_id, active.id, "canonical discovery identifies the authenticated active run");
     const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
-    const current = JSON.parse(readFileSync(indexPath, "utf8")) as { entries: Array<Record<string, unknown>> };
-    const currentEntry = current.entries.find((entry) => entry.run_id === finished.id);
-    assert.ok(currentEntry);
-    if (!currentEntry) throw new Error("retention fixture index entry is missing");
-    // Historical index entries must have canonical state backing; recovery
-    // intentionally drops names that exist only in a forged index image.
-    for (let index = 0; index < 65; index += 1) {
-      const old = fixture(`retention-old-${String(index).padStart(2, "0")}`);
-      persistState(old, root);
-      setCtoPause(old, "done", "historical");
-      persistState(old, root);
+    const discoveredIndex = JSON.parse(readFileSync(indexPath, "utf8")) as { entries: Array<{ run_id: string; status: string }> };
+    assert.equal(discoveredIndex.entries.length, 67, "canonical discovery includes every authenticated backing state");
+    assert.equal(discoveredIndex.entries.filter((entry) => entry.status === "done").length, 66);
+
+    const trusted = trustedAccess(root);
+    try {
+      const currentBeforeAck = readCtoState(persisted.id, root);
+      assert.ok(currentBeforeAck);
+      if (!currentBeforeAck) throw new Error("retention current state disappeared before acknowledgement");
+      assert.equal(trusted.access.acknowledgeDelivery(currentBeforeAck.id, currentBeforeAck.state_revision as number, { drained: true }), true, "current terminal must acknowledge after canonical discovery");
+    } finally {
+      trusted.release();
     }
-    const active = fixture("retention-active");
-    persistState(active, root);
-    const oldTerminalEntries = Array.from({ length: 65 }, (_, index) => ({
-      run_id: `retention-old-${String(index).padStart(2, "0")}`,
-      state_revision: 1,
-      status: "done",
-      updated_at: new Date(0).toISOString(),
-      pending_summary: false,
-      pending_outbox: false,
-      summary_digest: "",
-    }));
-    const activeEntry = {
-      run_id: "retention-active",
-      state_revision: 1,
-      status: "active",
-      updated_at: new Date(0).toISOString(),
-      pending_summary: false,
-      pending_outbox: false,
-      summary_digest: "",
-    };
-    const entries = [...oldTerminalEntries, currentEntry, activeEntry].sort((left, right) => String(left.run_id).localeCompare(String(right.run_id)));
-    writeFileSync(indexPath, `${JSON.stringify({ schema_version: 2, active_run_id: activeEntry.run_id, entries })}\n`);
-    rmSync(join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_PROOF_FILE), { force: true });
-    assert.equal(acknowledgeCtoRunDelivery(root, finished.id, persisted.state_revision as number, { drained: true }), true);
+
     const compacted = JSON.parse(readFileSync(indexPath, "utf8")) as { entries: Array<{ run_id: string; status: string; pending_summary: boolean }> };
-    assert.equal(compacted.entries.some((entry) => entry.run_id === activeEntry.run_id), true);
-    assert.equal(compacted.entries.some((entry) => entry.run_id === finished.id && entry.pending_summary === false), true);
-    assert.equal(compacted.entries.filter((entry) => entry.status === "done").length, 64);
+    assert.equal(compacted.entries.some((entry) => entry.run_id === active.id), true, "active run survives terminal compaction");
+    assert.equal(compacted.entries.some((entry) => entry.run_id === persisted.id && entry.pending_summary === false), true, "newest terminal remains acknowledged");
+    assert.equal(compacted.entries.filter((entry) => entry.status === "done").length, 64, "terminal history is bounded to 64 acknowledged entries");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
