@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import initTeamFactory from "../commands/init-team/index.js";
@@ -35,6 +35,37 @@ test("init-team: skips an existing config and explains the re-seed behaviour", a
 		assert.match(readFileSync(configPath, "utf8"), /my-rust-agent/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("init-team: rejects a symlinked .omp directory without touching the outside target", async () => {
+	const { root, run } = project();
+	const outside = mkdtempSync(join(tmpdir(), "init-team-outside-omp-"));
+	const outsideConfig = join(outside, "team.config.json");
+	try {
+		writeFileSync(outsideConfig, "outside sentinel\n");
+		rmSync(join(root, ".omp"), { recursive: true, force: true });
+		symlinkSync(outside, join(root, ".omp"), "dir");
+		await assert.rejects(run(["--force"]), /\.omp must be a real directory/);
+		assert.equal(readFileSync(outsideConfig, "utf8"), "outside sentinel\n");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+		rmSync(outside, { recursive: true, force: true });
+	}
+});
+
+test("init-team: rejects a symlinked config target without touching the outside target", async () => {
+	const { root, configPath, run } = project();
+	const outside = mkdtempSync(join(tmpdir(), "init-team-outside-config-"));
+	const outsideSentinel = join(outside, "sentinel.txt");
+	try {
+		writeFileSync(outsideSentinel, "outside sentinel\n");
+		symlinkSync(outsideSentinel, configPath, "file");
+		await assert.rejects(run(["--force"]), /team\.config\.json must be a regular file/);
+		assert.equal(readFileSync(outsideSentinel, "utf8"), "outside sentinel\n");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+		rmSync(outside, { recursive: true, force: true });
 	}
 });
 
