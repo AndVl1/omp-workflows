@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { PinnedProjectRoot } from "../../core/src/specification/pinned-root.js";
 import { EscalationConfigError, type Escalation } from "@andvl1/omp-workflows-core";
 import { canonicalDurableIdFileName, safeLegacyDurableIdFileName } from "../../core/src/cto/durable-id.js";
-import { buildCtoTerminalSummaryEnvelope, markCtoRunDeliveryPending, newCtoState, readCtoState, setCtoPause, writeCtoState } from "../../core/src/cto/state.js";
+import { buildCtoTerminalSummaryEnvelope, ctoRuntimeRunInitialIdentityDigest, newCtoState, readCtoState, setCtoPause, writeCtoState } from "../../core/src/cto/state.js";
 import {
   createChannelSet as createChannelSetRaw,
   startChannelDispatcher as startChannelDispatcherRaw,
@@ -80,31 +80,32 @@ type HandleOptions = NonNullable<Parameters<typeof handleInboxTaskRaw>[3]>;
 function createChannelSet(root: string, capabilities?: ChannelCapabilities, pinnedRoot?: ChannelPinnedRoot) {
   const pin = pinnedRoot ?? PinnedProjectRoot.open(root);
   try {
-    return createChannelSetRaw(root, capabilities, pin, runtimeFor(root).access);
+    return createChannelSetRaw(root, capabilities, pin, runtimeFor(root).access, runtimeFor(root).proofAuthority);
   } finally {
     if (!pinnedRoot) pin.close();
   }
 }
-function startChannelDispatcher(root: string, set: Parameters<typeof startChannelDispatcherRaw>[1], intervalMs = 10_000, options: DispatcherOptions = {}) {
+function startChannelDispatcher(root: string, set: Parameters<typeof startChannelDispatcherRaw>[1], intervalMs = 10_000, options: Partial<DispatcherOptions> = {}) {
   const runtimeAccess = options.runtimeAccess ?? runtimeFor(root).access;
   const pinnedRoot = options.pinnedRoot ?? PinnedProjectRoot.open(root);
   try {
     if (set.primary) assert.equal(bindAuthenticatedAdapterRouting(root, set.primary, runtimeAccess, pinnedRoot), true, "channel-policy primary has authenticated routing");
     for (const sink of options.roSinks ?? set.roSinks) assert.equal(bindAuthenticatedAdapterRouting(root, sink, runtimeAccess, pinnedRoot), true, "channel-policy RO sink has authenticated routing");
     const runtime = runtimeFor(root);
-    return startChannelDispatcherRaw(root, set, intervalMs, { ...options, pinnedRoot, runtimeAccess, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard });
+    return startChannelDispatcherRaw(root, set, intervalMs, { ...options, proofAuthority: runtime.proofAuthority, pinnedRoot, runtimeAccess, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard } as DispatcherOptions);
   } catch (error) {
     if (!options.pinnedRoot) pinnedRoot.close();
     throw error;
   }
 }
-async function drainOutbox(root: string, adapter: Parameters<typeof drainOutboxRaw>[1], maxRetries = 3, options: DrainOptions = {}) {
-  const runtimeAccess = options.runtimeAccess ?? runtimeFor(root).access;
+async function drainOutbox(root: string, adapter: Parameters<typeof drainOutboxRaw>[1], maxRetries = 3, options: Partial<DrainOptions> = {}) {
+  const runtime = runtimeFor(root);
+  const runtimeAccess = options.runtimeAccess ?? runtime.access;
   const pinnedRoot = options.pinnedRoot ?? PinnedProjectRoot.open(root);
   try {
     if (adapter) assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtimeAccess, pinnedRoot), true, "channel-policy adapter has authenticated routing");
     for (const sink of options.roSinks ?? []) assert.equal(bindAuthenticatedAdapterRouting(root, sink, runtimeAccess, pinnedRoot), true, "channel-policy RO sink has authenticated routing");
-    return await drainOutboxRaw(root, adapter, maxRetries, { ...retryDrainContext(root), ...options, pinnedRoot, runtimeAccess });
+    return await drainOutboxRaw(root, adapter, maxRetries, { ...retryDrainContext(root), ...options, proofAuthority: runtime.proofAuthority, pinnedRoot, runtimeAccess } as DrainOptions);
   } finally {
     if (!options.pinnedRoot) pinnedRoot.close();
   }
@@ -113,10 +114,11 @@ function queueCtoDelivery(root: string, runId: string, delivery: Parameters<type
   return queueCtoDeliveryRaw(root, runId, delivery, pinnedRoot, isOwned, runtimeAccess ?? runtimeFor(root).access);
 }
 function isBidirectionalChannel(root: string, capabilities?: Parameters<typeof isBidirectionalChannelRaw>[1], pinnedRoot?: Parameters<typeof isBidirectionalChannelRaw>[2]) {
-  return isBidirectionalChannelRaw(root, capabilities, pinnedRoot, runtimeFor(root).access);
+  return isBidirectionalChannelRaw(root, capabilities, pinnedRoot, runtimeFor(root).access, runtimeFor(root).proofAuthority);
 }
-function handleInboxTask(root: string, task: Parameters<typeof handleInboxTaskRaw>[1], onTask?: Parameters<typeof handleInboxTaskRaw>[2], options: HandleOptions = {}) {
-  return handleInboxTaskRaw(root, task, onTask, { ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access });
+function handleInboxTask(root: string, task: Parameters<typeof handleInboxTaskRaw>[1], onTask: Parameters<typeof handleInboxTaskRaw>[2] = undefined, options: Partial<HandleOptions> = {}) {
+  const runtime = runtimeFor(root);
+  return handleInboxTaskRaw(root, task, onTask, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access } as HandleOptions);
 }
 function resolveInboxRunId(root: string, pinnedRoot?: Parameters<typeof resolveInboxRunIdRaw>[1], runtimeAccess?: Parameters<typeof resolveInboxRunIdRaw>[2]) {
   return resolveInboxRunIdRaw(root, pinnedRoot, runtimeAccess ?? runtimeFor(root).access);
@@ -127,7 +129,7 @@ function loadEscalationConfig(root: string, options: LoadOptions = {}) {
 function createEscalationAdapter(config: Parameters<typeof createEscalationAdapterRaw>[0], root: string, pinnedRoot?: Parameters<typeof createEscalationAdapterRaw>[2], runtimeAccess?: Parameters<typeof createEscalationAdapterRaw>[3]) {
   const pin = pinnedRoot ?? PinnedProjectRoot.open(root);
   try {
-    return createEscalationAdapterRaw(config, root, pin, runtimeAccess ?? runtimeFor(root).access);
+    return createEscalationAdapterRaw(config, root, pin, runtimeAccess ?? runtimeFor(root).access, runtimeFor(root).proofAuthority);
   } finally {
     if (!pinnedRoot) pin.close();
   }
@@ -163,8 +165,9 @@ function withIndexedRun(root: string, runId: string, ackTarget?: string): void {
     plan: { id: runId, task: "channel routing", teams: [], created_at: new Date().toISOString() },
   });
   if (ackTarget) state.channel_profile = { ackTarget };
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-  assert.equal(markCtoRunDeliveryPending(root, runId, undefined, "outbox"), true);
+  const runtime = runtimeFor(root);
+  assert.ok(runtime.access.createRun(state, { source_id: `channel-policy:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+  assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
 }
 
 function queueTerminalSummary(root: string, runId: string): string {
@@ -1522,7 +1525,7 @@ test("wave: wake rollback retry re-admits the SAME wave (no duplicate)", () => {
 test("ask gate: blocks only with a validated RW primary AND an active run", () => {
   const root = mkdtempSync(join(tmpdir(), "ask-cap-"));
   try {
-    const gate = createAskRedirectGate(resolveSessionCwd, (cwd) => runtimeFor(cwd).access);
+    const gate = createAskRedirectGate(resolveSessionCwd, (cwd) => runtimeFor(cwd).access, (cwd) => runtimeFor(cwd).proofAuthority);
 
     // no config -> ask passes
     assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "no config -> pass");
@@ -1549,7 +1552,7 @@ test("ask gate: blocks only with a validated RW primary AND an active run", () =
 test("ask gate: explicit validated RW primary blocks; invalid declared-rw kind blocks configuration", () => {
   const root = mkdtempSync(join(tmpdir(), "ask-explicit-"));
   try {
-    const gate = createAskRedirectGate(resolveSessionCwd, (cwd) => runtimeFor(cwd).access);
+    const gate = createAskRedirectGate(resolveSessionCwd, (cwd) => runtimeFor(cwd).access, (cwd) => runtimeFor(cwd).proofAuthority);
 
     // explicit validated RW primary (mock: inbound+outbound) + active run -> blocked
     withConfig(root, { channels: [{ id: "control", adapter: "mock", direction: "read-write", primary: true }] });

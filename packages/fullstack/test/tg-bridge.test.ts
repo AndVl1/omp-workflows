@@ -7,8 +7,19 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { writeFullstackActivationMarker, FULLSTACK_ACTIVATION_MARKER_PATH } from "../src/activation-marker.js";
-import { newCtoState, writeCtoState, markCtoRunDeliveryPending } from "../../core/src/cto/state.js";
+import { ctoRuntimeRunInitialIdentityDigest, newCtoState } from "../../core/src/cto/state.js";
 import { TelegramEscalationAdapter } from "../src/adapters/telegram.js";
+import { openFullstackRuntimeTest, type FullstackRuntimeTestFixture } from "./runtime-access-fixture.js";
+
+const runtimeFixtures = new Map<string, FullstackRuntimeTestFixture>();
+function runtimeFor(root: string): FullstackRuntimeTestFixture {
+  const existing = runtimeFixtures.get(root);
+  if (existing) return existing;
+  const fixture = openFullstackRuntimeTest(root, "tg-bridge-test-" + String(runtimeFixtures.size));
+  runtimeFixtures.set(root, fixture);
+  return fixture;
+}
+test.after(() => { for (const fixture of runtimeFixtures.values()) fixture.close(); runtimeFixtures.clear(); });
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bridge = resolve(here, "../bin/tg-bridge.mjs");
@@ -40,8 +51,9 @@ function writeOwnerRoute(root: string, runId: string, ownerSession: string, chat
     plan: { id: runId, task: `active route ${chatId}`, teams: [], created_at: new Date().toISOString() },
   });
   state.channel_profile = { direction: "rw", transport: "telegram", adapter: "telegram", ackTarget: chatId, primary: true };
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-  assert.equal(markCtoRunDeliveryPending(root, runId, undefined, "outbox"), true);
+  const runtime = runtimeFor(root);
+  assert.ok(runtime.access.createRun(state, { source_id: `tg-bridge:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+  assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
 }
 
 function inboxFileCount(root: string): number {

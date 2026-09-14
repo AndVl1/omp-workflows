@@ -646,7 +646,7 @@ test("fake-rw: registry factory builds the persisted adapter from config.mock", 
   try {
     withConfig(root, { adapter: "mock", mock: { persisted: true, dir: "my-rw" } });
     const config = loadEscalationConfig(root, { kind: "mock", runtimeAccess: scope.runtime.access, pinnedRoot: scope.pinnedRoot });
-    const adapter = createEscalationAdapter(config!, root, scope.pinnedRoot, scope.runtime.access);
+    const adapter = createEscalationAdapter(config!, root, scope.pinnedRoot, scope.runtime.access, scope.runtime.proofAuthority);
     assert.ok(adapter instanceof MockEscalationAdapter);
     await (adapter as MockEscalationAdapter).injectTask("hello");
     assert.ok(existsSync(join(root, "my-rw", "inbound")), "persisted dir resolved under cwd");
@@ -662,7 +662,7 @@ test("fake-rw: default persisted dir is .omp/fake-rw", async () => {
   try {
     withConfig(root, { adapter: "mock", mock: { persisted: true } });
     const config = loadEscalationConfig(root, { kind: "mock", runtimeAccess: scope.runtime.access, pinnedRoot: scope.pinnedRoot });
-    const adapter = createEscalationAdapter(config!, root, scope.pinnedRoot, scope.runtime.access);
+    const adapter = createEscalationAdapter(config!, root, scope.pinnedRoot, scope.runtime.access, scope.runtime.proofAuthority);
     assert.ok(adapter instanceof MockEscalationAdapter);
     await (adapter as MockEscalationAdapter).injectTask("hello");
     assert.ok(existsSync(join(root, ".omp", "fake-rw", "inbound")), "default dir is .omp/fake-rw");

@@ -20,13 +20,14 @@ import { createEscalationAdapter as createEscalationAdapterRaw } from "../src/ad
 import { openFullstackRuntimeTest, type FullstackRuntimeTestFixture } from "./runtime-access-fixture.js";
 
 const runtimeFixtures = new Map<string, FullstackRuntimeTestFixture>();
-function runtimeFor(root: string) {
+function runtimeFixtureFor(root: string): FullstackRuntimeTestFixture {
   const existing = runtimeFixtures.get(root);
-  if (existing) return existing.access;
+  if (existing) return existing;
   const fixture = openFullstackRuntimeTest(root, "telegram-auth-test");
   runtimeFixtures.set(root, fixture);
-  return fixture.access;
+  return fixture;
 }
+function runtimeFor(root: string) { return runtimeFixtureFor(root).access; }
 test.afterEach(() => {
   for (const fixture of runtimeFixtures.values()) fixture.close();
   runtimeFixtures.clear();
@@ -34,13 +35,15 @@ test.afterEach(() => {
 
 function createEscalationAdapter(...args: Parameters<typeof createEscalationAdapterRaw>): ReturnType<typeof createEscalationAdapterRaw> {
   const [config, root, pinnedRoot] = args;
-  return createEscalationAdapterRaw(config, root, pinnedRoot, runtimeFor(root));
+  const fixture = runtimeFixtureFor(root);
+  return createEscalationAdapterRaw(config, root, pinnedRoot, fixture.access, fixture.proofAuthority);
 }
 function telegramAdapter(options: ConstructorParameters<typeof TelegramEscalationAdapter>[0]): TelegramEscalationAdapter {
-  return new TelegramEscalationAdapter({ ...options, mappingProofSecret: options.mappingProofSecret ?? TEST_MAPPING_PROOF_SECRET, runtimeAccess: options.runtimeAccess ?? runtimeFor(options.cwd) });
+  const fixture = runtimeFixtureFor(options.cwd);
+  return new TelegramEscalationAdapter({ ...options, runtimeAccess: options.runtimeAccess ?? fixture.access, proofAuthority: fixture.proofAuthority });
 }
-import { canonicalDurableIdFileName, type Escalation, type EscalationAnswer, type EscalationReceipt } from "@andvl1/omp-workflows-core";
-import { markCtoRunDeliveryPending, newCtoState, writeCtoState } from "../../core/src/cto/state.js";
+import { canonicalDurableIdFileName, PinnedProjectRoot, type Escalation, type EscalationAnswer, type EscalationReceipt } from "@andvl1/omp-workflows-core";
+import { ctoRuntimeRunInitialIdentityDigest, newCtoState } from "../../core/src/cto/state.js";
 
 /** Absolute path of the answer file the adapter writes for an escId. */
 function answerPath(root: string, escId: string): string {
@@ -49,16 +52,22 @@ function answerPath(root: string, escId: string): string {
   return join(root, ".work-state", "cto", runId, "answers", fileName);
 }
 function withIndexedRun(root: string, runId: string): void {
-  runtimeFor(root);
+  const runtime = runtimeFor(root);
   const state = newCtoState({
     id: runId,
     task: "telegram auth",
     branch: "main",
     autonomous: true,
+    owner_session: runtime.sessionId,
     plan: { id: runId, task: "telegram auth", teams: [], created_at: new Date().toISOString() },
   });
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-  assert.equal(markCtoRunDeliveryPending(root, runId, undefined, "outbox"), true);
+  assert.ok(runtime.createRun(state, { source_id: `telegram-auth:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+  assert.equal(runtime.markDeliveryPending(runId, state.state_revision, "outbox"), true);
+}
+function migrateLegacy(adapter: TelegramEscalationAdapter, root: string, runId: string, chatId: string): void {
+  const pin = PinnedProjectRoot.open(root);
+  assert.ok(pin, "migration fixture root is pinnable");
+  try { adapter.migrateLegacyMappings(runId, chatId, pin); } finally { pin.close(); }
 }
 function withIndexedMapping(root: string, runId: string, escId: string, messageId: number, chatId = CONFIGURED_CHAT): void {
   if (!existsSync(join(root, ".work-state", "cto", runId, "state.json"))) withIndexedRun(root, runId);
@@ -108,7 +117,6 @@ function mockFetch(updates: unknown[] | (() => unknown[]), onGetUpdates?: (offse
 }
 
 const CONFIGURED_CHAT = "12345";
-const TEST_MAPPING_PROOF_SECRET = "fixture-telegram-map-secret-012345678901234567890123456789";
 
 // 1. Unauthorized callback dropped, offset still advances, authorized
 //    follow-up in the same round is processed.
@@ -366,44 +374,17 @@ test("auth: stale or foreign replies require recovery instead of waking the plai
   }
 });
 
-test("mapping proof: separate sender and poller instances share the protected key, while a mismatched key retries", async () => {
+test("mapping proof: separate sender and poller instances share the opaque authority", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-auth-shared-map-key-"));
   const runId = "run-shared-map";
   const escId = `${runId}/team/check/1`;
-  const sharedSecret = "A".repeat(64);
-  const fakeState = {
-    id: runId,
-    state_revision: 0,
-    updated_at: "2026-01-01T00:00:00.000Z",
-    pause: { kind: "none" },
-    standby: false,
-    teams: [],
-  };
-  const candidate = {
-    run_id: runId,
-    state_revision: 0,
-    status: "active",
-    updated_at: fakeState.updated_at,
-    pending_summary: false,
-    pending_outbox: false,
-    pending_retry: false,
-    summary_digest: "none",
-  };
-  const runtime = {
-    assertLive: () => undefined,
-    readState: (id: string) => id === runId ? fakeState : null,
-    readActiveDeliveryCandidates: () => ({ ok: true, active_run_id: runId, entries: [candidate] }),
-    readCompletedDeliveryIndexPage: () => ({ entries: [], next_after_run_id: null, active_run_id: null }),
-    resolveEscalationChannelSnapshot: () => ({ status: "absent" }),
-  } as unknown as ConstructorParameters<typeof TelegramEscalationAdapter>[0]["runtimeAccess"];
   try {
+    withIndexedRun(root, runId);
     let outbound: Record<string, unknown> | null = null;
     const sender = telegramAdapter({
       token: "sender-token",
       chatId: CONFIGURED_CHAT,
       cwd: root,
-      mappingProofSecret: sharedSecret,
-      runtimeAccess: runtime,
       fetchImpl: (async (_url: unknown, init?: RequestInit) => {
         outbound = JSON.parse(String(init?.body)) as Record<string, unknown>;
         return okResponse({ message_id: 77 });
@@ -427,26 +408,12 @@ test("mapping proof: separate sender and poller instances share the protected ke
       token: "poller-token",
       chatId: CONFIGURED_CHAT,
       cwd: root,
-      mappingProofSecret: sharedSecret,
-      runtimeAccess: runtime,
       fetchImpl: mockFetch(reply("approved")),
     });
     const answers = await accepted.pollOnce();
     assert.equal(answers[0]?.id, escId, "shared key authorizes the persisted mapping in a separate adapter instance");
     assert.equal(answers[0]?.answer, "approved");
 
-    const offsets: number[] = [];
-    const mismatched = telegramAdapter({
-      token: "poller-token",
-      chatId: CONFIGURED_CHAT,
-      cwd: root,
-      mappingProofSecret: "B".repeat(64),
-      runtimeAccess: runtime,
-      fetchImpl: mockFetch(reply("forged"), (offset) => offsets.push(offset)),
-    });
-    await assert.rejects(mismatched.pollOnce(), (error: unknown) => error instanceof TelegramMappingRecoveryRequiredError
-      && error.code === "telegram_mapping_recovery_required");
-    assert.deepEqual(offsets, [0], "a poller without the sender's protected key cannot commit the update");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -808,7 +775,7 @@ test("mapping migration: metadata-free legacy source is scoped and retryable aft
       legacyMappingMigration: { tenant: runId, chatId: CONFIGURED_CHAT },
       fetchImpl: mockFetch([]),
     });
-    adapter.migrateLegacyMappings(runId, CONFIGURED_CHAT);
+    migrateLegacy(adapter, root, runId, CONFIGURED_CHAT);
     const partition = createHash("sha256")
       .update("telegram-chat-mapping\u0000", "utf8")
       .update(CONFIGURED_CHAT, "utf8")
@@ -822,7 +789,7 @@ test("mapping migration: metadata-free legacy source is scoped and retryable aft
     // source-file removal. Marker recovery must verify it against its
     // manifest and remove it without rewriting destination state.
     writeFileSync(join(legacyDir, "tg-map.jsonl"), legacyLine);
-    adapter.migrateLegacyMappings(runId, CONFIGURED_CHAT);
+    migrateLegacy(adapter, root, runId, CONFIGURED_CHAT);
     assert.equal(existsSync(join(legacyDir, "tg-map.jsonl")), false);
     const internals = adapter as unknown as { escIdOfMessage(messageId: number, chatId: string): string | null };
     assert.equal(internals.escIdOfMessage(73, CONFIGURED_CHAT), escId);
@@ -848,7 +815,7 @@ test("mapping lock: expired legacy chat lock is reclaimed by another chat", () =
       fetchImpl: mockFetch([]),
     });
 
-    adapter.migrateLegacyMappings(runId, "chat-b");
+    migrateLegacy(adapter, root, runId, "chat-b");
 
     assert.equal(existsSync(join(legacyDir, "tg-map.jsonl")), false, "reclaimed source lock permits migration");
     assert.equal(existsSync(lockPath), false, "reclaimed lock is released after migration");
@@ -880,7 +847,7 @@ test("mapping lock: live legacy chat lock blocks a different chat", () => {
     });
 
     assert.throws(
-      () => adapter.migrateLegacyMappings(runId, "chat-b"),
+      () => migrateLegacy(adapter, root, runId, "chat-b"),
       /tenant\/chat identity conflicts/,
     );
     assert.equal(existsSync(join(legacyDir, "tg-map.jsonl")), true, "live foreign lock preserves source");
@@ -933,7 +900,7 @@ test("mapping lock: stale owner release cannot remove a newer chat lease", () =>
       return queue;
     };
 
-    adapter.migrateLegacyMappings(runId, "chat-a");
+    migrateLegacy(adapter, root, runId, "chat-a");
 
     assert.equal(injected, true, "test installs a newer lease before stale release");
     const lock = JSON.parse(readFileSync(join(legacyDir, "tg-map.lock.json"), "utf8")) as {
@@ -993,7 +960,7 @@ test("mapping migration: foreign run rows fail closed before partition publicati
       legacyMappingMigration: { tenant: runId, chatId: CONFIGURED_CHAT },
       fetchImpl: mockFetch([]),
     });
-    assert.throws(() => adapter.migrateLegacyMappings(runId, CONFIGURED_CHAT), /foreign escalation/);
+    assert.throws(() => migrateLegacy(adapter, root, runId, CONFIGURED_CHAT), /foreign escalation/);
     assert.equal(existsSync(join(legacyDir, "tg-map.jsonl")), true);
     const partition = createHash("sha256")
       .update("telegram-chat-mapping\u0000", "utf8")

@@ -40,13 +40,15 @@ function retryDrainContext(root: string) {
   }
   return context;
 }
-function runtimeFor(root: string) {
+function runtimeFixtureFor(root: string) {
   const existing = runtimeFixtures.get(root);
-  if (existing) return existing.access;
+  if (existing) return existing;
   const fixture = openFullstackRuntimeTest(root, "retry-lane-test");
   runtimeFixtures.set(root, fixture);
-  return fixture.access;
+  return fixture;
 }
+function runtimeFor(root: string) { return runtimeFixtureFor(root).access; }
+function proofFor(root: string) { return runtimeFixtureFor(root).proofAuthority; }
 test.afterEach(() => {
   for (const fixture of runtimeFixtures.values()) fixture.close();
   runtimeFixtures.clear();
@@ -63,14 +65,14 @@ async function drainOutbox(...args: Parameters<typeof drainOutboxRaw>): ReturnTy
   const pinnedRoot = options?.pinnedRoot ?? PinnedProjectRoot.open(root);
   try {
     if (adapter) assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtimeAccess, pinnedRoot), true, "retry test adapter has authenticated routing");
-    return await drainOutboxRaw(root, adapter, maxRetries, { ...retryDrainContext(root), ...options, pinnedRoot, runtimeAccess });
+    return await drainOutboxRaw(root, adapter, maxRetries, { ...retryDrainContext(root), ...options, proofAuthority: proofFor(root), pinnedRoot, runtimeAccess });
   } finally {
     if (!options?.pinnedRoot) pinnedRoot.close();
   }
 }
 function pollInbox(...args: Parameters<typeof pollInboxRaw>): ReturnType<typeof pollInboxRaw> {
   const [root, adapter, onTask, onAnswer, options] = args;
-  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, runtimeAccess: runtimeFor(root) });
+  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, proofAuthority: proofFor(root), runtimeAccess: runtimeFor(root) });
 }
 function startDispatcher(...args: Parameters<typeof startDispatcherRaw>): ReturnType<typeof startDispatcherRaw> {
   const [root, adapter, intervalMs, options] = args;
@@ -80,7 +82,7 @@ function startDispatcher(...args: Parameters<typeof startDispatcherRaw>): Return
     if (adapter) assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtimeAccess, pinnedRoot), true, "retry dispatcher adapter has authenticated routing");
     const fixture = runtimeFixtures.get(root) ?? openFullstackRuntimeTest(root, "retry-lane-test");
     runtimeFixtures.set(root, fixture);
-    return startDispatcherRaw(root, adapter, intervalMs, { ...options, pinnedRoot, runtimeAccess, session_id: options?.session_id ?? fixture.sessionId, liveGuard: options?.liveGuard ?? fixture.liveGuard });
+    return startDispatcherRaw(root, adapter, intervalMs, { ...options, proofAuthority: fixture.proofAuthority, pinnedRoot, runtimeAccess, session_id: options?.session_id ?? fixture.sessionId, liveGuard: options?.liveGuard ?? fixture.liveGuard });
   } catch (error) {
     if (!options?.pinnedRoot) pinnedRoot.close();
     throw error;
@@ -195,7 +197,7 @@ test("routing config replacement blocks redirect until trusted republish", { tim
       id: `${runId}/question`, level: "question", title: "route guard", body: "route guard", intent: "ack", target: "chat-expected",
       at: new Date().toISOString(), by: "routing-test", run_id: runId, idempotency_key: `${runId}/question`,
     };
-    const oldSet = createChannelSet(root, undefined, undefined, runtimeFor(root));
+    const oldSet = createChannelSet(root, undefined, undefined, runtimeFor(root), proofFor(root));
     assert.ok(oldSet.primary, "old endpoint adapter is constructed");
     assert.ok(queueCtoDelivery(root, runId, delivery, undefined, undefined, runtimeFor(root)));
     writeRoutingConfig("456:new-token", "https://new-audit.example/topic");
@@ -204,7 +206,7 @@ test("routing config replacement blocks redirect until trusted republish", { tim
     assert.equal(calls.length, 0, "stale config sends zero requests");
     assert.equal(existsSync(join(root, ".work-state", "cto", runId, "outbox", canonicalDurableIdFileName(delivery.id))), true);
     assert.equal(queueCtoDelivery(root, runId, delivery, undefined, undefined, runtimeFor(root)), null, "trusted republish is idempotent while rebinding the new routing receipt");
-    const newSet = createChannelSet(root, undefined, undefined, runtimeFor(root));
+    const newSet = createChannelSet(root, undefined, undefined, runtimeFor(root), proofFor(root));
     assert.ok(newSet.primary, "new endpoint adapter is constructed after explicit rebind");
     const delivered = await drainOutbox(root, newSet.primary, 1);
     assert.equal(delivered.some((entry) => entry.sent), true, "the exact republish under the replacement config may send once");
@@ -725,7 +727,7 @@ test("retry lane direct API without persistent context defers without resetting"
     const adapter: EscalationAdapter = { kind: "retry-context-required", send: async () => ({ sent: false }), cancel: async () => undefined };
     const access = runtimeFor(root);
     assert.equal(bindAuthenticatedAdapterRouting(root, adapter, access), true);
-    const options = { runtimeAccess: access, now: () => 1_000_000 };
+    const options = { runtimeAccess: access, proofAuthority: proofFor(root), now: () => 1_000_000 };
     const first = await drainOutboxRaw(root, adapter, 1, options);
     assert.equal(first[0]?.sent, false);
     const retryDirectory = join(root, ".work-state", "cto", runId, "outbox-retry");
@@ -825,8 +827,8 @@ test("retry lane fair rotation preserves one delivery attempt across restart", {
 
 /** Rotate the bridge lease while retaining durable-authenticated ingress. */
 function rotateBridgeForDurableRetry(root: string): void {
-  clearBridgeLock(root);
-  const bridge = writeBridgeLock(root);
+  clearBridgeLock(root, undefined, undefined, proofFor(root));
+  const bridge = writeBridgeLock(root, undefined, proofFor(root));
   assert.equal(bridge.owned, true, "retry fixture bridge rotation succeeds");
 }
 
@@ -1005,7 +1007,7 @@ test("retry lane accepts spaces and unicode without starving later work", async 
 test("inbox retry persistence preserves a replacement after source CAS", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-inbox-retry-cas-race-"));
   try {
-    const bridge = writeBridgeLock(root);
+    const bridge = writeBridgeLock(root, undefined, proofFor(root));
     assert.equal(bridge.owned, true);
     const runId = resolveInboxRunId(root);
     const active = join(root, ".omp", "inbox");
@@ -1042,7 +1044,7 @@ test("inbox retry persistence preserves a replacement after source CAS", async (
     assert.equal(jsonCount(active), 1, "the replaced active source remains durable");
     assert.equal(jsonCount(join(root, ".omp", "inbox-retry")), 0, "no retry move occurs for a replaced post-CAS source");
   } finally {
-    clearBridgeLock(root);
+    clearBridgeLock(root, undefined, undefined, proofFor(root));
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1050,7 +1052,7 @@ test("inbox retry persistence preserves a replacement after source CAS", async (
 test("inbox retry promotion preserves a concurrent replacement after its receipt is classified", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-inbox-retry-receipt-race-"));
   try {
-    const bridge = writeBridgeLock(root);
+    const bridge = writeBridgeLock(root, undefined, proofFor(root));
     assert.equal(bridge.owned, true);
     const runId = resolveInboxRunId(root);
     const active = join(root, ".omp", "inbox");
@@ -1094,7 +1096,7 @@ test("inbox retry promotion preserves a concurrent replacement after its receipt
     assert.equal(jsonCount(retryDirectory), 1, "the concurrent replacement remains in the retry lane");
     assert.equal(jsonCount(join(root, ".omp", "inbox")), 0, "the replacement is not blindly promoted into active ingress");
   } finally {
-    clearBridgeLock(root);
+    clearBridgeLock(root, undefined, undefined, proofFor(root));
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1102,11 +1104,11 @@ test("inbox retry promotion preserves a concurrent replacement after its receipt
 test("signed inbox retries survive lease expiry and forged wrappers are discarded", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-inbox-retry-auth-"));
   try {
-    writeBridgeLock(root);
+    writeBridgeLock(root, undefined, proofFor(root));
     const runId = resolveInboxRunId(root);
     const active = join(root, ".omp", "inbox");
     mkdirSync(active, { recursive: true });
-    const envelope = createAuthenticatedInboxEnvelope(root, "answer", { id: `${runId}/lease-recovery`, text: "retry", at: new Date().toISOString(), by: "bridge", run_id: runId });
+    const envelope = createAuthenticatedInboxEnvelope(root, "answer", { id: `${runId}/lease-recovery`, text: "retry", at: new Date().toISOString(), by: "bridge", run_id: runId }, undefined, proofFor(root));
     writeFileSync(join(active, "lease-recovery.json"), JSON.stringify(envelope));
     let attempts = 0;
     const wake = (answer: { id: string; answer: string }): void => {
@@ -1134,7 +1136,7 @@ test("signed inbox retries survive lease expiry and forged wrappers are discarde
     assert.equal(existsSync(forgedPath), false, "project-forged wrapper is discarded before wake");
     assert.equal(jsonEntries(join(active, "processed")).length, 1, "recovered answer is archived exactly once");
   } finally {
-    clearBridgeLock(root);
+    clearBridgeLock(root, undefined, undefined, proofFor(root));
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1145,7 +1147,7 @@ test("retry lane rotates a legacy path-only secret before accepting new retries"
   let previousLegacy: string | null = null;
   try {
     const runId = resolveInboxRunId(root);
-    writeBridgeLock(root);
+    writeBridgeLock(root, undefined, proofFor(root));
     const canonical = realpathSync(root);
     legacyPath = join(homedir(), ".omp", "runtime-secrets", createHash("sha256").update(canonical, "utf8").digest("hex") + ".inbox-retry.json");
     previousLegacy = existsSync(legacyPath) ? readFileSync(legacyPath, "utf8") : null;
@@ -1153,7 +1155,7 @@ test("retry lane rotates a legacy path-only secret before accepting new retries"
     const legacySecret = "L".repeat(43);
     writeFileSync(legacyPath, JSON.stringify({ schema: 1, root_identity: canonical, domain: "omp-inbox-retry-v1", secret: legacySecret }));
 
-    const source = createAuthenticatedInboxEnvelope(root, "answer", { id: `${runId}/legacy`, text: "legacy", at: new Date().toISOString(), by: "bridge", run_id: runId });
+    const source = createAuthenticatedInboxEnvelope(root, "answer", { id: `${runId}/legacy`, text: "legacy", at: new Date().toISOString(), by: "bridge", run_id: runId }, undefined, proofFor(root));
     const sourceDigest = createHash("sha256").update(canonicalJson(source), "utf8").digest("hex");
     const body = { schema: 1 as const, kind: "inbox-retry" as const, attempt: 1, due_at: 0, original_name: "legacy-answer.json", source, source_digest: sourceDigest, auth_evidence: source.auth };
     const mac = createHmac("sha256", legacySecret).update("omp-inbox-retry-v1\0", "utf8").update(canonical, "utf8").update("\0", "utf8").update(sourceDigest, "utf8").update("\0", "utf8").update(canonicalJson(body), "utf8").digest("hex");
@@ -1165,7 +1167,7 @@ test("retry lane rotates a legacy path-only secret before accepting new retries"
     await pollInbox(root, null, undefined, undefined, { now: () => Date.now() + 60_000 });
     assert.equal(jsonCount(retryDirectory), 0, "legacy wrapper is not accepted with a path-only secret");
 
-    const fresh = createAuthenticatedInboxEnvelope(root, "task", { id: `${runId}/fresh`, text: "fresh", at: new Date().toISOString(), by: "bridge", run_id: runId });
+    const fresh = createAuthenticatedInboxEnvelope(root, "task", { id: `${runId}/fresh`, text: "fresh", at: new Date().toISOString(), by: "bridge", run_id: runId }, undefined, proofFor(root));
     mkdirSync(join(root, ".omp", "inbox"), { recursive: true });
     writeFileSync(join(root, ".omp", "inbox", "fresh.json"), JSON.stringify(fresh));
     const now = Date.now();
@@ -1176,7 +1178,7 @@ test("retry lane rotates a legacy path-only secret before accepting new retries"
     await pollInbox(root, null, () => { callbacks += 1; }, undefined, { now: () => now + 60_000 });
     assert.equal(callbacks, 2, "new identity-bound retry verifies and delivers");
   } finally {
-    clearBridgeLock(root);
+    clearBridgeLock(root, undefined, undefined, proofFor(root));
     if (legacyPath) {
       if (previousLegacy !== null) writeFileSync(legacyPath, previousLegacy);
       else rmSync(legacyPath, { force: true });
@@ -1192,7 +1194,7 @@ test("retry lane rejects a copied same-lexical-root retry wrapper", async () => 
   const replacement = mkdtempSync(join(tmpdir(), "cto-inbox-retry-root-new-"));
   try {
     const runId = resolveInboxRunId(root);
-    writeBridgeLock(root);
+    writeBridgeLock(root, undefined, proofFor(root));
     const envelope = createAuthenticatedInboxEnvelope(root, "task", {
       id: `${runId}/replacement-retry`,
       text: "retry me",
@@ -1228,7 +1230,7 @@ test("retry lane rejects a copied same-lexical-root retry wrapper", async () => 
     assert.equal(readFileSync(bridgeLockPath(root), "utf8"), lockBefore, "copied bridge lock remains untouched");
     assert.equal(readFileSync(statePath, "utf8"), stateBefore, "copied state remains untouched");
     assert.equal(readFileSync(indexPath, "utf8"), indexBefore, "copied active-run index remains untouched");
-    clearBridgeLock(root);
+    clearBridgeLock(root, undefined, undefined, proofFor(root));
     assert.equal(readFileSync(bridgeLockPath(root), "utf8"), lockBefore, "clear cannot remove a lease from the displaced inode");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1240,7 +1242,7 @@ test("retry lane rejects a copied same-lexical-root retry wrapper", async () => 
 test("retry lane keeps 64 failed inbox wakes from starving a later answer", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-inbox-retry-lane-"));
   try {
-    const bridge = writeBridgeLock(root);
+    const bridge = writeBridgeLock(root, undefined, proofFor(root));
     assert.equal(bridge.owned, true, "retry fixture owns the bridge lease");
     const runId = resolveInboxRunId(root);
     const active = join(root, ".omp", "inbox");
@@ -1251,13 +1253,13 @@ test("retry lane keeps 64 failed inbox wakes from starving a later answer", asyn
       // instead of bypassing the production auth creator in this 65-entry
       // starvation fixture.
       if (index % 8 === 0) {
-        assert.equal(refreshBridgeLock(root, bridge), true, "retry fixture bridge lease remains current");
+        assert.equal(refreshBridgeLock(root, bridge, undefined, proofFor(root)), true, "retry fixture bridge lease remains current");
       }
-      const envelope = createAuthenticatedInboxEnvelope(root, "answer", { id: `${runId}/retry/${index}`, text: "retry", at: new Date().toISOString(), by: "bridge", run_id: runId });
+      const envelope = createAuthenticatedInboxEnvelope(root, "answer", { id: `${runId}/retry/${index}`, text: "retry", at: new Date().toISOString(), by: "bridge", run_id: runId }, undefined, proofFor(root));
       writeFileSync(join(active, `000-retry-${String(index).padStart(3, "0")}.json`), JSON.stringify(envelope));
     }
-    assert.equal(refreshBridgeLock(root, bridge), true, "retry fixture bridge lease remains current for later answer");
-    const later = createAuthenticatedInboxEnvelope(root, "answer", { id: `${runId}/later`, text: "later", at: new Date().toISOString(), by: "bridge", run_id: runId });
+    assert.equal(refreshBridgeLock(root, bridge, undefined, proofFor(root)), true, "retry fixture bridge lease remains current for later answer");
+    const later = createAuthenticatedInboxEnvelope(root, "answer", { id: `${runId}/later`, text: "later", at: new Date().toISOString(), by: "bridge", run_id: runId }, undefined, proofFor(root));
     writeFileSync(join(active, "zzz-later.json"), JSON.stringify(later));
     let laterCalls = 0;
     const attempts = new Map<string, number>();
@@ -1296,7 +1298,7 @@ test("retry lane keeps 64 failed inbox wakes from starving a later answer", asyn
     assert.equal([...attempts.keys()].filter((id) => id.includes("/retry/")).length, 64, "all retryable wakes remain accounted for");
     assert.equal(jsonEntries(join(active, "processed")).length, 65, "later and every retryable answer are processed exactly once");
   } finally {
-    clearBridgeLock(root);
+    clearBridgeLock(root, undefined, undefined, proofFor(root));
     rmSync(root, { recursive: true, force: true });
   }
 });

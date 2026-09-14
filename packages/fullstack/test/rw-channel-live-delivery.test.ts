@@ -30,7 +30,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { markCtoRunDeliveryPending, newCtoState, readCtoState, writeCtoState } from "../../core/src/cto/state.js";
+import { ctoRuntimeRunInitialIdentityDigest, newCtoState, readCtoState } from "../../core/src/cto/state.js";
 
 import { openFullstackRuntimeTest, type FullstackRuntimeTestFixture } from "./runtime-access-fixture.js";
 
@@ -127,7 +127,7 @@ function startLiveDispatcher(
 ): { stop: () => void; channelSet: ChannelSet; tasks: InboxTask[]; answers: Array<{ id: string; answer: string }> } {
   const expected = opts.direction ?? "rw";
   withConfig(root, config);
-  const channelSet = createChannelSet(root, undefined, undefined, runtimeFor(root));
+  const channelSet = createChannelSet(root, undefined, undefined, runtimeFor(root), runtimeFixtureFor(root).proofAuthority);
   assert.equal(channelSet.profile.direction, expected, `resolved channel profile direction is ${expected}`);
   if (expected === "rw") {
     assert.ok(channelSet.primary, "rw primary is built");
@@ -140,6 +140,7 @@ function startLiveDispatcher(
   const runtime = runtimeFixtureFor(root);
   const stop = startChannelDispatcher(root, channelSet, 50, {
     runtimeAccess: runtime.access,
+    proofAuthority: runtime.proofAuthority,
     session_id: runtime.sessionId,
     liveGuard: runtime.liveGuard,
     onTask: (t) => tasks.push(t),
@@ -158,7 +159,7 @@ test("A: persisted mock RW channel delivers inbound despite a live tg-bridge loc
     // A live bridge (alive pid) owns the bot BEFORE the dispatcher starts —
     // resident-session repro: telegram bridge running, persisted RW channel
     // configured alongside.
-    writeBridgeLock(root);
+    writeBridgeLock(root, undefined, runtimeFixtureFor(root).proofAuthority);
     const dir = "rw";
     const { stop, tasks } = startLiveDispatcher(root, RW_CHANNEL(dir));
     try {
@@ -279,8 +280,9 @@ test("D: answer follow-up delivered via the same RW channel, exactly once", asyn
       autonomous: true,
       plan: { id: runId, task: "live answer follow-up", teams: [], created_at: new Date().toISOString() },
     });
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    assert.equal(markCtoRunDeliveryPending(root, runId, undefined, "outbox"), true, "canonical active run index is established");
+    const runtime = runtimeFixtureFor(root);
+    assert.ok(runtime.access.createRun(state, { source_id: `rw-channel-live:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+    assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true, "canonical active run index is established");
     assert.equal(readCtoState(runId, root)?.id, runId, "canonical run state is readable before answer polling");
     const { stop, answers } = startLiveDispatcher(root, RW_CHANNEL(dir));
     try {

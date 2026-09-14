@@ -20,6 +20,16 @@ function openMockRuntime(root: string, sessionId: string) {
   return openFullstackRuntimeTest(root, sessionId);
 }
 
+function testSessionManager(root: string, sessionId: string): Record<string, unknown> {
+  const sessionFile = join(root, ".omp", `session-${sessionId}.json`);
+  return {
+    getCwd: () => root,
+    getSessionId: () => sessionId,
+    getSessionFile: () => sessionFile,
+    getSessionGeneration: () => `test-generation:${sessionId}`,
+  };
+}
+
 test("dispatcher lifecycle: task subagent contexts do not own the messenger", () => {
   assert.equal(isMainSessionContext({ hasUI: false }), false);
   assert.equal(isMainSessionContext({ hasUI: true }), true);
@@ -135,7 +145,7 @@ test("dispatcher lifecycle: absent activation marker never starts the dispatcher
     await sessionStart({ type: "session_start" }, {
       cwd: root,
       hasUI: true,
-      sessionManager: { getCwd: () => root, getSessionId: () => "no-marker" },
+      sessionManager: testSessionManager(root, "no-marker"),
     });
     assert.equal(existsSync(lock), false, "missing fullstack marker must block dispatcher start");
   } finally {
@@ -446,7 +456,7 @@ test("dispatcher lifecycle: model-role research requires a one-time session-boun
     // A fresh command-issued token is bound to the original manager/root.
     await command.handler("recommendations", context);
     const movedEnvelope = prompts[1]!;
-    const movedManager = { getCwd: () => root, getSessionId: () => "other-session" };
+    const movedManager = testSessionManager(root, "other-session");
     const movedContext = { ...context, sessionManager: movedManager };
     assert.equal(await beforeAgentStart({ type: "before_agent_start", prompt: movedEnvelope, systemPrompt: [] }, movedContext), undefined);
     assert.equal(await beforeAgentStart({ type: "before_agent_start", prompt: movedEnvelope, systemPrompt: [] }, context), undefined, "cross-session attempt consumes the token and cannot replay it");
@@ -454,7 +464,7 @@ test("dispatcher lifecycle: model-role research requires a one-time session-boun
     // A fresh token is also bound to the canonical root observed at issue time.
     await command.handler("recommendations", context);
     const rootBoundEnvelope = prompts[2]!;
-    const movingManager = { getCwd: () => "/tmp", getSessionId: () => "research-auth-session" };
+    const movingManager = testSessionManager("/tmp", "research-auth-session");
     const movedRootContext = { ...context, sessionManager: movingManager };
     assert.equal(await beforeAgentStart({ type: "before_agent_start", prompt: rootBoundEnvelope, systemPrompt: [] }, movedRootContext), undefined, "moved root cannot authorize the old envelope");
     assert.equal(await beforeAgentStart({ type: "before_agent_start", prompt: rootBoundEnvelope, systemPrompt: [] }, context), undefined, "moved-root attempt consumes the token");
@@ -491,7 +501,7 @@ test("dispatcher lifecycle: supported host registers model roles without project
     assert.ok(commands.has("omp-model-roles"), "supported hosts receive /omp-model-roles through registerCommand");
     const sessionStart = handlers.get("session_start");
     assert.ok(sessionStart, "session_start handler registered");
-    const sessionContext = { cwd: root, hasUI: true, sessionManager: { getCwd: () => root, getSessionId: () => "supported-host-session" } };
+    const sessionContext = { cwd: root, hasUI: true, sessionManager: testSessionManager(root, "supported-host-session") };
     await sessionStart(
       { type: "session_start", sessionId: "supported-host-session" },
       sessionContext,
@@ -502,7 +512,7 @@ test("dispatcher lifecycle: supported host registers model roles without project
     await modelRoles.handler("validate", {
       cwd: root,
       hasUI: true,
-      sessionManager: { getCwd: () => root, getSessionId: () => "supported-host-session" },
+      sessionManager: testSessionManager(root, "supported-host-session"),
       models: { list: () => [], resolve: () => undefined },
       ui: { notify: () => undefined },
     });
@@ -547,22 +557,22 @@ test("dispatcher lifecycle: stale shutdown cannot stop a newer cwd owner", async
     const contextAStart = {
       sessionId: "raw-a-start",
       hasUI: true,
-      sessionManager: { getCwd: () => root, getSessionId: () => "session-a" },
+      sessionManager: testSessionManager(root, "session-a"),
     };
     const contextBStart = {
       session_id: "raw-b-start",
       hasUI: true,
-      sessionManager: { getCwd: () => root, getSessionId: () => "session-b" },
+      sessionManager: testSessionManager(root, "session-b"),
     };
     const contextAShutdown = {
       sessionId: "raw-a-shutdown",
       hasUI: true,
-      sessionManager: { getCwd: () => root, getSessionId: () => "session-a" },
+      sessionManager: testSessionManager(root, "session-a"),
     };
     const contextBShutdown = {
       session_id: "raw-b-shutdown",
       hasUI: true,
-      sessionManager: { getCwd: () => root, getSessionId: () => "session-b" },
+      sessionManager: testSessionManager(root, "session-b"),
     };
     await sessionStart({ type: "session_start" }, contextAStart);
     assert.ok(existsSync(lock), "A owns the dispatcher after session_start");
@@ -614,11 +624,11 @@ test("dispatcher lifecycle: same-session restart owns the newest generation", as
     assert.ok(sessionShutdown, "session_shutdown handler registered");
     const firstContext = {
       hasUI: true,
-      sessionManager: { getCwd: () => root, getSessionId: () => "session-same" },
+      sessionManager: testSessionManager(root, "session-same"),
     };
     const restartedContext = {
       hasUI: true,
-      sessionManager: { getCwd: () => root, getSessionId: () => "session-same" },
+      sessionManager: testSessionManager(root, "session-same"),
     };
 
     await sessionStart({ type: "session_start" }, firstContext);
@@ -679,7 +689,7 @@ test("dispatcher lifecycle: session switch revokes old root before rebinding the
     assert.equal(existsSync(dispatcherLockPath(rootA)), true, "branch transition keeps the current manager identity");
     await switched({ type: "session_switch", reason: "resume" }, {
       hasUI: false,
-      sessionManager: { getCwd: () => rootB, getSessionId: () => "subagent-switch" },
+      sessionManager: testSessionManager(rootB, "subagent-switch"),
     });
     assert.equal(existsSync(dispatcherLockPath(rootA)), true, "subagent transition cannot revoke the interactive owner");
     assert.equal(existsSync(dispatcherLockPath(rootB)), false, "subagent transition cannot start a dispatcher");
@@ -787,7 +797,7 @@ test("dispatcher lifecycle: shutdown without a valid session identity is a no-op
     assert.ok(sessionShutdown, "session_shutdown handler registered");
     const ownerContext = {
       hasUI: true,
-      sessionManager: { getCwd: () => root, getSessionId: () => "session-owner" },
+      sessionManager: testSessionManager(root, "session-owner"),
     };
     const invalidShutdownContext = { cwd: root, hasUI: true };
     await sessionStart({ type: "session_start" }, ownerContext);
@@ -832,8 +842,8 @@ test("dispatcher lifecycle: real and symlink-alias cwd share one immutable root 
     const sessionShutdown = handlers.get("session_shutdown");
     assert.ok(sessionStart);
     assert.ok(sessionShutdown);
-    const contextA = { hasUI: true, sessionManager: { getCwd: () => realRoot, getSessionId: () => "alias-a" } };
-    const contextB = { hasUI: true, sessionManager: { getCwd: () => aliasRoot, getSessionId: () => "alias-b" } };
+    const contextA = { hasUI: true, sessionManager: testSessionManager(realRoot, "alias-a") };
+    const contextB = { hasUI: true, sessionManager: testSessionManager(aliasRoot, "alias-b") };
 
     await sessionStart({ type: "session_start" }, contextA);
     assert.ok(existsSync(lock), "real path starts the dispatcher");
@@ -884,7 +894,7 @@ test("dispatcher lifecycle: same lexical path replacement isolates old shutdown"
         getSessionId: () => "replace-a",
       },
     };
-    const contextB = { hasUI: true, sessionManager: { getCwd: () => root, getSessionId: () => "replace-b" } };
+    const contextB = { hasUI: true, sessionManager: testSessionManager(root, "replace-b") };
 
     await sessionStart({ type: "session_start" }, contextA);
     assert.ok(existsSync(lock), "old root starts the dispatcher");

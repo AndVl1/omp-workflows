@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { channelMode, clearChannelCache, createAskRedirectGate } from "../src/messenger-channel.js";
 import { resolveSessionCwd } from "../src/index.js";
 import { openFullstackRuntimeTest } from "./runtime-access-fixture.js";
+import { ctoRuntimeRunInitialIdentityDigest, newCtoState } from "../../core/src/cto/state.js";
 
 function withChannel(root: string, adapter: "telegram" | "http" | null): void {
   clearChannelCache();
@@ -19,7 +20,19 @@ function withChannel(root: string, adapter: "telegram" | "http" | null): void {
 }
 
 function withActiveRun(runtime: ReturnType<typeof openFullstackRuntimeTest>): void {
-  runtime.access.ensureStandbyRun();
+  const now = new Date().toISOString();
+  const runId = "messenger-active-run";
+  const state = newCtoState({
+    id: runId,
+    task: "messenger active run",
+    branch: "main",
+    autonomous: true,
+    plan: { id: runId, task: "messenger active run", teams: [], created_at: now },
+    standby: true,
+  });
+  state.pause = { kind: "none", reason: "standby" };
+  assert.ok(runtime.access.createRun(state, { source_id: `messenger:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+  assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
 }
 
 test("messenger: channelMode reads .omp/escalation.json", () => {
@@ -67,7 +80,7 @@ test("messenger: ask gate blocks only when telegram + active CTO run", () => {
   const root = mkdtempSync(join(tmpdir(), "ask-gate-"));
   const runtime = openFullstackRuntimeTest(root, "ask-gate");
   try {
-    const gate = createAskRedirectGate(resolveSessionCwd, (cwd) => cwd === root ? runtime.access : undefined);
+    const gate = createAskRedirectGate(resolveSessionCwd, (cwd) => cwd === root ? runtime.access : undefined, (cwd) => cwd === root ? runtime.proofAuthority : undefined);
 
     // no channel -> ask passes
     assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "no channel -> pass");
@@ -108,7 +121,7 @@ test("messenger: ask gate blocks active CTO when the index proof is corrupt or m
           throw Object.assign(new Error(`active-run index ${mode} proof is unavailable`), { code: "CTO_AUTHORITY_UNAVAILABLE" });
         },
       } as unknown as ReturnType<typeof runtime.access>;
-      const gate = createAskRedirectGate(resolveSessionCwd, () => unavailableRuntime);
+      const gate = createAskRedirectGate(resolveSessionCwd, () => unavailableRuntime, () => runtime.proofAuthority);
       const blocked = gate({ toolName: "ask" }, { cwd: root });
       assert.equal(blocked?.block, true, `${mode} index proof blocks ask instead of falling back to interactive mode`);
       assert.match(blocked?.reason ?? "", /authority is unavailable/u, `${mode} proof failure is identified as an authority outage`);
@@ -131,7 +144,7 @@ test("messenger: ask gate blocks forged, missing, and mismatched session roots",
     const gate = createAskRedirectGate(resolveSessionCwd, (cwd) => {
       requested.push(cwd);
       return cwd === rootA ? runtime.access : undefined;
-    });
+    }, (cwd) => cwd === rootA ? runtime.proofAuthority : undefined);
 
     const forged = gate({ toolName: "ask" }, {
       cwd: rootB,
@@ -144,7 +157,7 @@ test("messenger: ask gate blocks forged, missing, and mismatched session roots",
     assert.equal(missing?.block, true, "missing authoritative resolver result blocks ask");
     const malformed = gate({ toolName: "ask" }, { cwd: rootA, sessionManager: {} });
     assert.equal(malformed?.block, true, "malformed session manager blocks ask");
-    const throwing = createAskRedirectGate(() => { throw new Error("manager unavailable"); }, () => runtime.access);
+    const throwing = createAskRedirectGate(() => { throw new Error("manager unavailable"); }, () => runtime.access, () => runtime.proofAuthority);
     assert.equal(throwing({ toolName: "ask" }, { cwd: rootA })?.block, true, "throwing resolver blocks ask");
 
     const mismatchedFacade = new Proxy(runtime.access, {
@@ -153,7 +166,7 @@ test("messenger: ask gate blocks forged, missing, and mismatched session roots",
         return Reflect.get(target, property, receiver);
       },
     });
-    const mismatch = createAskRedirectGate(resolveSessionCwd, () => mismatchedFacade);
+    const mismatch = createAskRedirectGate(resolveSessionCwd, () => mismatchedFacade, () => runtime.proofAuthority);
     assert.equal(mismatch({ toolName: "ask" }, { cwd: rootA })?.block, true, "mismatched runtime facade blocks ask");
   } finally {
     runtime.close();

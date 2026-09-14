@@ -25,12 +25,13 @@ import {
   type EscalationAdapter,
 } from "@andvl1/omp-workflows-core";
 import { BoundedQueue, DEFAULT_QUEUE_MAX_ENTRY_BYTES } from "@andvl1/omp-workflows-core/queue";
-import { setCtoPause, buildCtoTerminalSummaryEnvelope, newCtoState, readCtoState, readCtoRunDeliveryCandidatesPinned, markCtoRunDeliveryPending, setCtoRunDeliveryTestHooks, writeCtoState } from "../../core/src/cto/state.js";
+import { setCtoPause, buildCtoTerminalSummaryEnvelope, ctoRuntimeRunInitialIdentityDigest, newCtoState, readCtoState, readCtoRunDeliveryCandidatesPinned, setCtoRunDeliveryTestHooks, writeCtoState } from "../../core/src/cto/state.js";
 import { canonicalDurableIdFileName } from "../../core/src/cto/durable-id.js";
 import { finishWave } from "../../core/src/cto/waves.js";
 import { PinnedProjectRoot } from "../../core/src/specification/pinned-root.js";
 import { PinnedProjectRoot as RuntimePinnedProjectRoot } from "../../core/dist/specification/pinned-root.js";
 import { beginRegistryRegistration, commitRegistryRegistration, rollbackRegistryRegistration } from "@andvl1/omp-workflows-core/registry";
+import { signCtoRuntimeProof } from "@andvl1/omp-workflows-core/cto-runtime";
 import { openFullstackRuntimeTest } from "./runtime-access-fixture.js";
 
 type FullstackRuntime = ReturnType<typeof openFullstackRuntimeTest>;
@@ -58,21 +59,25 @@ type DrainOptions = NonNullable<Parameters<typeof drainOutboxRaw>[3]>;
 type HandleOptions = NonNullable<Parameters<typeof handleInboxTaskRaw>[3]>;
 type LoadOptions = NonNullable<Parameters<typeof loadEscalationConfigRaw>[1]>;
 function createChannelSet(root: string, capabilities?: Parameters<typeof createChannelSetRaw>[1], pinnedRoot?: Parameters<typeof createChannelSetRaw>[2]) {
-  return createChannelSetRaw(root, capabilities, pinnedRoot, runtimeFor(root).access);
+  const runtime = runtimeFor(root);
+  return createChannelSetRaw(root, capabilities, pinnedRoot, runtime.access, runtime.proofAuthority);
 }
 
-function startDispatcher(root: string, adapter: Parameters<typeof startDispatcherRaw>[1], intervalMs = 10_000, options: DispatcherOptions = {}) {
+function startDispatcher(root: string, adapter: Parameters<typeof startDispatcherRaw>[1], intervalMs = 10_000, options: Partial<DispatcherOptions> = {}) {
   const runtime = runtimeFor(root);
-  return startDispatcherRaw(root, adapter, intervalMs, { ...options, runtimeAccess: options.runtimeAccess ?? runtime.access, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard });
+  return startDispatcherRaw(root, adapter, intervalMs, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard } as DispatcherOptions);
 }
-function pollInbox(root: string, adapter: Parameters<typeof pollInboxRaw>[1], onTask?: Parameters<typeof pollInboxRaw>[2], onAnswer?: Parameters<typeof pollInboxRaw>[3], options: PollOptions = {}) {
-  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access });
+function pollInbox(root: string, adapter: Parameters<typeof pollInboxRaw>[1], onTask?: Parameters<typeof pollInboxRaw>[2], onAnswer?: Parameters<typeof pollInboxRaw>[3], options: Partial<PollOptions> = {}) {
+  const runtime = runtimeFor(root);
+  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access } as PollOptions);
 }
-function drainOutbox(root: string, adapter: Parameters<typeof drainOutboxRaw>[1], maxRetries = 3, options: DrainOptions = {}) {
-  return drainOutboxRaw(root, adapter, maxRetries, { ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access });
+function drainOutbox(root: string, adapter: Parameters<typeof drainOutboxRaw>[1], maxRetries = 3, options: Partial<DrainOptions> = {}) {
+  const runtime = runtimeFor(root);
+  return drainOutboxRaw(root, adapter, maxRetries, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access } as DrainOptions);
 }
-function handleInboxTask(root: string, task: Parameters<typeof handleInboxTaskRaw>[1], onTask?: Parameters<typeof handleInboxTaskRaw>[2], options: HandleOptions = {}) {
-  return handleInboxTaskRaw(root, task, onTask, { ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access });
+function handleInboxTask(root: string, task: Parameters<typeof handleInboxTaskRaw>[1], onTask: Parameters<typeof handleInboxTaskRaw>[2] = undefined, options: Partial<HandleOptions> = {}) {
+  const runtime = runtimeFor(root);
+  return handleInboxTaskRaw(root, task, onTask, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access } as HandleOptions);
 }
 function resolveInboxRunId(root: string, pinnedRoot?: Parameters<typeof resolveInboxRunIdRaw>[1], runtimeAccess?: Parameters<typeof resolveInboxRunIdRaw>[2]) {
   return resolveInboxRunIdRaw(root, pinnedRoot, runtimeAccess ?? runtimeFor(root).access);
@@ -81,13 +86,15 @@ function ensureStandbyRun(root: string, pinnedRoot?: Parameters<typeof ensureSta
   return ensureStandbyRunRaw(root, pinnedRoot, runtimeAccess ?? runtimeFor(root).access);
 }
 function isBidirectionalChannel(root: string, capabilities?: Parameters<typeof isBidirectionalChannelRaw>[1], pinnedRoot?: Parameters<typeof isBidirectionalChannelRaw>[2]) {
-  return isBidirectionalChannelRaw(root, capabilities, pinnedRoot, runtimeFor(root).access);
+  const runtime = runtimeFor(root);
+  return isBidirectionalChannelRaw(root, capabilities, pinnedRoot, runtime.access, runtime.proofAuthority);
 }
 function loadEscalationConfig(root: string, options: LoadOptions = {}) {
   return loadEscalationConfigRaw(root, { ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access });
 }
 function createEscalationAdapter(config: Parameters<typeof createEscalationAdapterRaw>[0], root: string, pinnedRoot?: Parameters<typeof createEscalationAdapterRaw>[2], runtimeAccess?: Parameters<typeof createEscalationAdapterRaw>[3]) {
-  return createEscalationAdapterRaw(config, root, pinnedRoot, runtimeAccess ?? runtimeFor(root).access);
+  const runtime = runtimeFor(root);
+  return createEscalationAdapterRaw(config, root, pinnedRoot, runtimeAccess ?? runtime.access, runtime.proofAuthority);
 }
 
 import { HttpEscalationAdapter } from "../src/adapters/http.js";
@@ -163,8 +170,8 @@ function inboxIdentityHash(id: string, text: string, by = "local"): string {
 function writeSignedDrop(root: string, runId: string, id: string, text: string, kind: "task" | "answer" = "task", fileName?: string): void {
   const drop = join(root, ".omp", "inbox");
   mkdirSync(drop, { recursive: true });
-  writeBridgeLock(root);
-  const envelope = createAuthenticatedInboxEnvelope(root, kind, { id, text, at: new Date().toISOString(), by: "test-bridge", run_id: runId });
+  writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
+  const envelope = createAuthenticatedInboxEnvelope(root, kind, { id, text, at: new Date().toISOString(), by: "test-bridge", run_id: runId }, undefined, runtimeFor(root).proofAuthority);
   writeFileSync(join(drop, fileName ?? (id.replace(/[^a-zA-Z0-9._-]/g, "-") + ".json")), JSON.stringify(envelope));
 }
 function telegramStreamResponse(
@@ -199,8 +206,8 @@ function withIndexedRun(root: string, runId: string): void {
     autonomous: true,
     plan: { id: runId, task: "adapter delivery", teams: [], created_at: new Date().toISOString() },
   });
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-  assert.equal(markCtoRunDeliveryPending(root, runId, undefined, "outbox"), true);
+  assert.ok(runtimeFor(root).access.createRun(state, { source_id: `adapters:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+  assert.equal(runtimeFor(root).access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
 }
 
 function publishTestDelivery(root: string, runId: string, delivery: Record<string, unknown>): string {
@@ -442,7 +449,7 @@ test("adapters: Telegram idempotent send replays delivered receipt and refuses p
       }
       return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const esc = sampleEscalation({ id: "tg-run/idempotent" });
     const first = await adapter.sendWithIdempotency(esc, "tg-delivery-1");
     const replay = await adapter.sendWithIdempotency(esc, "tg-delivery-1");
@@ -475,7 +482,7 @@ test("adapters: Telegram idempotency key ingress is UTF-8 bounded before marker 
       sends += 1;
       return new Response(JSON.stringify({ ok: true, result: { message_id: sends } }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const key = "🙂".repeat(Math.floor(MAX_TELEGRAM_IDEMPOTENCY_KEY_UTF8_BYTES / 4) + 1);
     assert.ok(Buffer.byteLength(key, "utf8") > MAX_TELEGRAM_IDEMPOTENCY_KEY_UTF8_BYTES);
     const receipt = await adapter.sendWithIdempotency(sampleEscalation({ id: "tg-run/oversized-key" }), key);
@@ -497,7 +504,7 @@ test("adapters: Telegram invalid UTF-8 metadata prevents cancellation delete", a
     mkdirSync(mapDir, { recursive: true });
     const invalid = Buffer.from([0x7b, 0x22, 0x74, 0x65, 0x6e, 0x61, 0x6e, 0x74, 0x22, 0x3a, 0xff, 0x7d]);
     writeFileSync(metadataPath, invalid);
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     await adapter.cancel(`${runId}/escalation`);
     assert.equal(deletes, 0, "invalid metadata must not authorize a Telegram delete");
     assert.deepEqual(readFileSync(metadataPath), invalid, "invalid metadata bytes are not rewritten");
@@ -519,7 +526,7 @@ test("adapters: Telegram cancellation pin rejects copied same-path mapping", asy
       if (String(url).endsWith("/deleteMessage")) deletes += 1;
       return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     pin = PinnedProjectRoot.open(root);
     assert.ok(pin);
     renameSync(root, displaced);
@@ -543,7 +550,7 @@ test("adapters: Telegram invalid UTF-8 delivery effect prevents send and commit"
       if (String(url).endsWith("/sendMessage")) sends += 1;
       return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const esc = sampleEscalation({ id: "tg-invalid-delivery-effect/escalation" });
     const key = "tg-invalid-delivery-effect-key";
     const effects = join(root, ".work-state", "cto", "tg-invalid-delivery-effect", "delivery-effects");
@@ -583,7 +590,7 @@ test("adapters: Telegram definitive unsent idempotency failure is retryable and 
       await retryGate;
       return new Response(JSON.stringify({ ok: true, result: { message_id: sends } }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const esc = sampleEscalation({ id: "tg-run/retryable" });
     const key = "tg-delivery-retryable";
 
@@ -631,7 +638,7 @@ test("adapters: Telegram accepted send journals remote receipt before mapping an
       }
       return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const esc = sampleEscalation({ id: "tg-run/unmapped" });
     const key = "tg-delivery-unmapped";
     type Mapping = (escId: string, messageId: number, value: Escalation) => void;
@@ -688,7 +695,7 @@ test("adapters: Telegram delivered_unmapped crash replay repairs mapping without
       sends += 1;
       throw new Error("transport must not be called for a journaled remote receipt");
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const esc = sampleEscalation({ id: "tg-run/crash-replay" });
     const key = "tg-delivery-crash-replay";
     const effects = join(root, ".work-state", "cto", "tg-run", "delivery-effects");
@@ -733,7 +740,7 @@ test("adapters: Telegram unknown transport outcome keeps prepared ambiguity", as
       }
       return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const esc = sampleEscalation({ id: "tg-run/unknown" });
     const key = "tg-delivery-unknown";
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -758,7 +765,7 @@ test("adapters: Telegram 5xx send outcome stays ambiguous and never resends", as
       }
       return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const esc = sampleEscalation({ id: "tg-run/5xx" });
     const key = "tg-delivery-5xx";
 
@@ -790,7 +797,7 @@ test("adapters: Telegram API response reader bounds streamed and malformed bodie
     const fetchImpl = (async () => telegramStreamResponse(
       [bytes.subarray(0, split), bytes.subarray(split)],
     )) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: validRoot, fetchImpl });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: validRoot, proofAuthority: runtimeFor(validRoot).proofAuthority, fetchImpl });
     const receipt = await adapter.send(sampleEscalation({ id: "tg-api-streamed" }));
     assert.deepEqual(receipt, { sent: true, channelRef: "tg:321" });
   } finally {
@@ -806,7 +813,7 @@ test("adapters: Telegram API response reader bounds streamed and malformed bodie
       Buffer.from('"}', "utf8"),
     ];
     const fetchImpl = (async () => telegramStreamResponse(chunks, 200, () => { cancelled = true; })) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: oversizedRoot, fetchImpl });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: oversizedRoot, proofAuthority: runtimeFor(oversizedRoot).proofAuthority, fetchImpl });
     const receipt = await adapter.send(sampleEscalation({ id: "tg-api-oversized" }));
     assert.equal(receipt.sent, false);
     assert.equal(cancelled, true, "oversized response reader is cancelled");
@@ -829,7 +836,7 @@ test("adapters: Telegram API response reader bounds streamed and malformed bodie
     const root = mkdtempSync(join(tmpdir(), `tg-api-malformed-${index}-`));
     try {
       const fetchImpl = (async () => telegramStreamResponse([body])) as typeof fetch;
-      const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+      const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
       const receipt = await adapter.send(sampleEscalation({ id: `tg-api-malformed-${index}` }));
       assert.equal(receipt.sent, false);
       const partition = telegramPartitionDir(root, `tg-api-malformed-${index}`, "100");
@@ -1330,21 +1337,21 @@ test("adapters: pollInbox rejects malformed and foreign local answer markers wit
     withIndexedRun(root, "run-1");
     const drop = join(root, ".omp", "inbox");
     mkdirSync(drop, { recursive: true });
-    writeBridgeLock(root);
+    writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
     const malformed = createAuthenticatedInboxEnvelope(root, "answer", {
       id: "run-1//malformed",
       text: "do not wake",
       at: new Date().toISOString(),
       by: "test-bridge",
       run_id: "run-1",
-    });
+    }, undefined, runtimeFor(root).proofAuthority);
     const foreign = createAuthenticatedInboxEnvelope(root, "answer", {
       id: "run-foreign/team-a/q1",
       text: "foreign answer",
       at: new Date().toISOString(),
       by: "test-bridge",
       run_id: "run-foreign",
-    });
+    }, undefined, runtimeFor(root).proofAuthority);
     writeFileSync(join(drop, "malformed.json"), JSON.stringify(malformed));
     writeFileSync(join(drop, "foreign.json"), JSON.stringify(foreign));
     const received: unknown[] = [];
@@ -1418,7 +1425,7 @@ test("adapters: telegram sendMessage + pollOnce writes answer files", async () =
     }) as typeof fetch;
 
     withIndexedRun(root, "run-1");
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const receipt = await adapter.send(sampleEscalation());
     assert.equal(receipt.sent, true);
     assert.equal((sentPayload as { chat_id?: string })?.chat_id, "100");
@@ -1471,7 +1478,7 @@ test("adapters: Telegram emits opaque callbacks and resolves durable token bindi
       throw new Error(`unexpected method: ${method}`);
     }) as typeof fetch;
     withIndexedRun(root, runId);
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const receipt = await adapter.send(sampleEscalation({
       id: escId,
       options: [{ id: "approve", label: "Approve", apply: "now" }],
@@ -1508,7 +1515,7 @@ test("adapters: Telegram rejects unsafe and over-limit escalation transport data
       sends += 1;
       return new Response(JSON.stringify({ ok: true, result: { message_id: sends } }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const invalid = [
       sampleEscalation({ id: "run//team" }),
       sampleEscalation({ options: [{ id: "approve::later", label: "Approve", apply: "now" }] }),
@@ -1577,7 +1584,7 @@ test("adapters: Telegram pollOnce skips malformed updates, preserves monotonic o
     const adapter = new TelegramEscalationAdapter({
       token: "t",
       chatId: "100",
-      cwd: root,
+      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
       runtimeAccess: runtimeFor(root).access,
       fetchImpl,
       onPlainMessage: (msg) => { texts.push(msg.text); },
@@ -1622,7 +1629,7 @@ test("adapters: Telegram pollOnce rejects oversized responses without starving a
     const adapter = new TelegramEscalationAdapter({
       token: "t",
       chatId: "100",
-      cwd: root,
+      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
       runtimeAccess: runtimeFor(root).access,
       fetchImpl,
       onPlainMessage: (msg) => { texts.push(msg.text); },
@@ -1671,7 +1678,7 @@ test("adapters: telegram callback_query maps to an option answer", async () => {
     }) as typeof fetch;
     withIndexedRun(root, "run-1");
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     await adapter.send(sampleEscalation());
     const answers = await adapter.pollOnce();
     assert.equal(answers.length, 1);
@@ -1708,7 +1715,7 @@ test("adapters: Telegram answer filenames preserve same-run IDs across sanitizer
       throw new Error(`unexpected method: ${method}`);
     }) as typeof fetch;
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     await adapter.send(sampleEscalation({ id: firstId }));
     await adapter.send(sampleEscalation({ id: secondId }));
     const [first, second] = await Promise.all([adapter.pollOnce(), adapter.pollOnce()]);
@@ -1781,7 +1788,7 @@ test("adapters: Telegram uses canonical indexed runs and ignores unindexed maps"
     const adapter = new TelegramEscalationAdapter({
       token: "t",
       chatId: "100",
-      cwd: root,
+      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
       runtimeAccess: runtimeFor(root).access,
       legacyMappingMigration: { tenant: "run-69", chatId: "100" },
       fetchImpl: (async (url: unknown) => {
@@ -1834,7 +1841,7 @@ test("adapters: Telegram reverse lookup reaches an older run beyond newer pendin
     } finally {
       pin.close();
     }
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, runtimeAccess: runtimeFor(root).access, fetchImpl: (async () => new Response(JSON.stringify({ ok: true, result: [] }))) as typeof fetch });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, runtimeAccess: runtimeFor(root).access, fetchImpl: (async () => new Response(JSON.stringify({ ok: true, result: [] }))) as typeof fetch });
     const internals = adapter as unknown as {
       answerTargetOfMessage(messageId: number, chatId: string): { runId: string; escId: string } | null;
       escIdOfMessage(messageId: number, chatId: string): string | null;
@@ -1884,7 +1891,7 @@ test("adapters: Telegram mapping shards rotate, compact, validate identity, and 
     const adapter = new TelegramEscalationAdapter({
       token: "t",
       chatId: "100",
-      cwd: root,
+      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
       runtimeAccess: runtimeFor(root).access,
       mappingMaxEntryBytes: 180,
     });
@@ -1905,7 +1912,7 @@ test("adapters: Telegram mapping shards rotate, compact, validate identity, and 
     const restarted = new TelegramEscalationAdapter({
       token: "t",
       chatId: "100",
-      cwd: root,
+      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
       runtimeAccess: runtimeFor(root).access,
       mappingMaxEntryBytes: 180,
     }) as unknown as {
@@ -1920,7 +1927,7 @@ test("adapters: Telegram mapping shards rotate, compact, validate identity, and 
     const wrongChat = new TelegramEscalationAdapter({
       token: "t",
       chatId: "other-chat",
-      cwd: root,
+      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
       runtimeAccess: runtimeFor(root).access,
       mappingMaxEntryBytes: 180,
     }) as unknown as {
@@ -1941,7 +1948,7 @@ test("adapters: Telegram mapping corruption and conflicting remaps fail closed",
       { escId: "map-run/team/check/1", messageId: 7 },
       { escId: "map-run/team/check/2", messageId: 7 },
     ]);
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, runtimeAccess: runtimeFor(root).access }) as unknown as {
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, runtimeAccess: runtimeFor(root).access }) as unknown as {
       messageIdOf: (escId: string) => number | null;
       escIdOfMessage: (messageId: number) => string | null;
     };
@@ -1974,7 +1981,7 @@ test("adapters: Telegram mapping recovery discards incomplete compaction and com
     }));
     writeFileSync(join(runDir, "tg-map.g00000001.000000.jsonl"), JSON.stringify({ escId: "recover-run/team/check/1", messageId: 41, chatId: "100" }) + "\n");
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, runtimeAccess: runtimeFor(root).access }) as unknown as {
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, runtimeAccess: runtimeFor(root).access }) as unknown as {
       messageIdOf: (escId: string) => number | null;
       escIdOfMessage: (messageId: number, chatId?: string) => string | null;
     };
@@ -2035,7 +2042,7 @@ test("adapters: Telegram concurrent mapping appends converge through CAS", { tim
     const restarted = new TelegramEscalationAdapter({
       token: "t",
       chatId: "100",
-      cwd: root,
+      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
       runtimeAccess: runtimeFor(root).access,
       mappingMaxEntryBytes: 180,
     }) as unknown as { messageIdOf: (escId: string) => number | null };
@@ -2077,7 +2084,7 @@ test("adapters: Telegram answer conflicts reject without overwriting or waking",
     }) as typeof fetch;
     withIndexedRun(root, "run-1");
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     await adapter.send(sampleEscalation({ id: escId }));
     const first = await adapter.pollOnce();
     assert.equal(first.length, 1);
@@ -2141,7 +2148,7 @@ test("adapters: telegram plain message routes to the inbox handler (not an answe
     const adapter = new TelegramEscalationAdapter({
       token: "t",
       chatId: "100",
-      cwd: root,
+      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
       runtimeAccess: runtimeFor(root).access,
       fetchImpl,
       onPlainMessage: (msg) => inboxMessages.push(msg),
@@ -2182,7 +2189,7 @@ test("adapters: telegram concurrent pollOnce calls share one getUpdates round", 
     }) as typeof fetch;
     withIndexedRun(root, "run-1");
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     await adapter.send(sampleEscalation());
 
     // Both calls are in flight together; the second must reuse the first's
@@ -2228,7 +2235,7 @@ test("adapters: telegram pollOnce keeps the offset on answer persistence failure
     }) as typeof fetch;
     withIndexedRun(root, "run-1");
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     await adapter.send(sampleEscalation());
 
     // Sabotage answer persistence: the answers dir path is occupied by a
@@ -3194,8 +3201,8 @@ test("adapters: terminal run drains exact current authenticated ACK once", async
     const state = readCtoState(runId, root);
     assert.ok(state);
     setCtoPause(state, "done", "terminal ACK regression");
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    assert.equal(markCtoRunDeliveryPending(root, runId, state.state_revision, "outbox"), true);
+    assert.ok(runtimeFor(root).access.createRun(state, { source_id: `adapters:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+    assert.equal(runtimeFor(root).access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
     const published = publishTestDelivery(root, runId, {
       ...sampleEscalation({ id: `${runId}/ack/current` }),
       intent: "ack",
@@ -3231,7 +3238,7 @@ test("adapters: terminal run rejects stale ACK and non-ACK intents", async () =>
     setCtoPause(state, "done", "terminal ACK rejection regression");
     writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     const revision = state.state_revision;
-    assert.equal(markCtoRunDeliveryPending(root, runId, revision, "outbox"), true);
+    assert.equal(runtimeFor(root).access.markDeliveryPending(runId, revision, "outbox"), true);
     const outbox = outboxDir(runId, root);
     mkdirSync(outbox, { recursive: true });
     const staleId = `${runId}/ack/stale`;
@@ -3296,8 +3303,8 @@ test("adapters: direct discovery leaves terminal queue untouched with a corrupt 
     const state = readCtoState(runId, root);
     assert.ok(state);
     setCtoPause(state, "done", "corrupt index direct-discovery regression");
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    assert.equal(markCtoRunDeliveryPending(root, runId, state.state_revision, "outbox"), true);
+    assert.ok(runtimeFor(root).access.createRun(state, { source_id: `adapters:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+    assert.equal(runtimeFor(root).access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
     const directDelivery = {
       ...sampleEscalation({ id: `${runId}/ack/current` }),
       intent: "ack",
@@ -3372,7 +3379,7 @@ test("adapters: missing index preserves canonical direct bytes until publication
     assert.equal(sends, 0, "missing pending authority never reaches the adapter");
     await stop();
     stop = undefined as unknown as ReturnType<typeof startDispatcher>;
-    assert.equal(markCtoRunDeliveryPending(root, runId, revision, "outbox"), true, "publication authority is restored explicitly");
+    assert.equal(runtimeFor(root).access.markDeliveryPending(runId, revision, "outbox"), true, "publication authority is restored explicitly");
     unlinkSync(entryPath);
     const recoveredPath = publishTestDelivery(root, runId, {
       ...sampleEscalation({ id }),
@@ -3635,8 +3642,8 @@ test("adapters: active-run switch leaves terminal ACK for canonical indexed drai
     const oldState = readCtoState(oldRunId, root);
     assert.ok(oldState);
     setCtoPause(oldState, "done", "active-run switch direct-discovery regression");
-    writeCtoState(oldState, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    assert.equal(markCtoRunDeliveryPending(root, oldRunId, oldState.state_revision, "outbox"), true);
+    assert.ok(runtimeFor(root).access.createRun(oldState, { source_id: `adapters:${oldRunId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(oldState) }));
+    assert.equal(runtimeFor(root).access.markDeliveryPending(oldRunId, oldState.state_revision, "outbox"), true);
     const published = publishTestDelivery(root, oldRunId, {
       ...sampleEscalation({ id: `${oldRunId}/ack/current` }),
       intent: "ack",
@@ -3853,21 +3860,21 @@ test("adapters: cached answer authority fences a newer active run mid-poll", asy
   try {
     withIndexedRun(root, "run-1");
     mkdirSync(active, { recursive: true });
-    writeBridgeLock(root);
+    writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
     const first = createAuthenticatedInboxEnvelope(root, "answer", {
       id: firstId,
       text: "first",
       at: new Date().toISOString(),
       by: "bridge",
       run_id: "run-1",
-    });
+    }, undefined, runtimeFor(root).proofAuthority);
     const second = createAuthenticatedInboxEnvelope(root, "answer", {
       id: secondId,
       text: "second",
       at: new Date().toISOString(),
       by: "bridge",
       run_id: "run-1",
-    });
+    }, undefined, runtimeFor(root).proofAuthority);
     writeFileSync(join(active, "001-first.json"), JSON.stringify(first));
     writeFileSync(join(active, "002-second.json"), JSON.stringify(second));
     const wakes: string[] = [];
@@ -3885,7 +3892,7 @@ test("adapters: cached answer authority fences a newer active run mid-poll", asy
     assert.deepEqual(wakes, [firstId], "the first answer wakes before the active pointer changes");
     assert.equal(existsSync(join(active, "002-second.json")), false, "the old-run answer is fenced and removed from active ingress");
   } finally {
-    clearBridgeLock(root);
+    clearBridgeLock(root, undefined, undefined, runtimeFor(root).proofAuthority);
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -3912,41 +3919,74 @@ test("adapters: answer wake routes by explicit run_id instead of id prefix", asy
 test("adapters: bridge lock — alive while pid lives, stale after exit", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-lock-"));
   try {
-    assert.equal(isBridgeAlive(root), false, "no lock -> not alive");
+    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false, "no lock -> not alive");
     // lock with a dead pid -> stale, treated as not alive
     mkdirSync(join(root, ".omp"), { recursive: true });
     writeFileSync(bridgeLockPath(root), JSON.stringify({ pid: 99999999 }));
-    assert.equal(isBridgeAlive(root), false, "stale lock (dead pid) ignored");
+    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false, "stale lock (dead pid) ignored");
     // lock with OUR live pid -> alive
-    writeBridgeLock(root);
-    assert.equal(isBridgeAlive(root), true, "live lock -> bridge owns the bot");
-    clearBridgeLock(root);
-    assert.equal(isBridgeAlive(root), false, "cleared on shutdown");
+    writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
+    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), true, "live lock -> bridge owns the bot");
+    clearBridgeLock(root, undefined, undefined, runtimeFor(root).proofAuthority);
+    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false, "cleared on shutdown");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
+function signDeadBridgeLease(root: string): ReturnType<typeof writeBridgeLock> {
+  const runtime = runtimeFor(root);
+  const handle = writeBridgeLock(root, undefined, runtime.proofAuthority);
+  assert.equal(handle.owned, true, "fixture installs a valid bridge lease before aging it");
+  const record = JSON.parse(readFileSync(bridgeLockPath(root), "utf8")) as Record<string, any>;
+  clearBridgeLock(root, handle, undefined, runtime.proofAuthority);
+  record.pid = 99999999;
+  record.start_identity = "linux:99999999";
+  record.heartbeatAt = new Date(0).toISOString();
+  const unsigned = { ...record };
+  delete unsigned.proof;
+  const proofPayload = JSON.stringify({
+    schema: unsigned.schema,
+    activation: unsigned.activation,
+    config: { lease_ttl_ms: 30_000, clock_skew_ms: 5_000 },
+    owner: { pid: unsigned.pid, start_identity: unsigned.start_identity },
+    acquired_at: unsigned.startedAt,
+    expires_at: new Date(Date.parse(unsigned.heartbeatAt) + 30_000).toISOString(),
+    pid: unsigned.pid,
+    start_identity: unsigned.start_identity,
+    root_identity: unsigned.root_identity,
+    root_dev: unsigned.root_dev,
+    root_ino: unsigned.root_ino,
+    token: unsigned.token,
+    session_id: unsigned.session_id ?? null,
+    generation: unsigned.epoch,
+    startedAt: unsigned.startedAt,
+    heartbeatAt: unsigned.heartbeatAt,
+    run_cursor: unsigned.run_cursor ?? null,
+    outbox_run_id: unsigned.outbox_run_id ?? null,
+    outbox_cursor: unsigned.outbox_cursor ?? null,
+  });
+  unsigned.proof = signCtoRuntimeProof(runtime.proofAuthority, "bridge-lease-v1", proofPayload);
+  assert.equal(typeof unsigned.proof, "string");
+  writeFileSync(bridgeLockPath(root), JSON.stringify(unsigned, null, 2));
+  return handle;
+}
+
 test("adapters: expired bridge lease sweeps its exact secret and stale handles cannot fence a new token", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-bridge-expiry-"));
   let first!: ReturnType<typeof writeBridgeLock>;
   try {
-    first = writeBridgeLock(root);
-    assert.equal(first.owned, true);
-    const secretPath = join(homedir(), ".omp", "runtime-secrets", createHash("sha256").update(realpathSync(root), "utf8").digest("hex") + ".json");
-    assert.equal(existsSync(secretPath), true, "owned bridge writes a private runtime secret");
-    writeFileSync(bridgeLockPath(root), JSON.stringify({ pid: 99999999 }));
-    assert.equal(isBridgeAlive(root), false, "dead lease is no longer alive");
-    assert.equal(existsSync(secretPath), false, "dead lease secret is removed by the exact-root sweep");
+    first = signDeadBridgeLease(root);
+    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false, "signed dead lease is no longer alive");
 
-    const replacement = writeBridgeLock(root);
+    const replacement = writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
     assert.equal(replacement.owned, true, "a new token can claim the dead lease");
-    clearBridgeLock(root, first);
-    assert.equal(isBridgeAlive(root), true, "stale token cannot clear the replacement lease");
-    clearBridgeLock(root, replacement);
-    assert.equal(isBridgeAlive(root), false);
+    clearBridgeLock(root, first, undefined, runtimeFor(root).proofAuthority);
+    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), true, "stale token cannot clear the replacement lease");
+    clearBridgeLock(root, replacement, undefined, runtimeFor(root).proofAuthority);
+    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false);
   } finally {
-    if (first?.owned) clearBridgeLock(root, first);
+    if (first?.owned) clearBridgeLock(root, first, undefined, runtimeFor(root).proofAuthority);
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -3959,18 +3999,18 @@ test("adapters: bridge teardown leaves old secret fenced when lexical root becom
   let handle!: ReturnType<typeof writeBridgeLock>;
   try {
     mkdirSync(root, { recursive: true });
-    handle = writeBridgeLock(root);
+    handle = writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
     assert.equal(handle.owned, true);
     const oldSecret = join(homedir(), ".omp", "runtime-secrets", createHash("sha256").update(realpathSync(root), "utf8").digest("hex") + ".json");
     assert.equal(existsSync(oldSecret), true);
     renameSync(root, displaced);
     symlinkSync(foreign, root);
-    assert.equal(isBridgeAlive(root), false, "foreign symlink never inherits the old lease");
+    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false, "foreign symlink never inherits the old lease");
     assert.equal(existsSync(oldSecret), true, "old-root secret is left fenced when exact identity cannot be reopened");
     unlinkSync(root);
     renameSync(displaced, root);
   } finally {
-    if (handle?.owned) clearBridgeLock(root, handle);
+    if (handle?.owned) clearBridgeLock(root, handle, undefined, runtimeFor(root).proofAuthority);
     rmSync(root, { recursive: true, force: true });
     rmSync(displaced, { recursive: true, force: true });
     rmSync(foreign, { recursive: true, force: true });
@@ -3982,11 +4022,11 @@ test("adapters: bridge lease cache refuses a sixty-fifth live root", () => {
   const roots = Array.from({ length: MAX_BRIDGE_LEASES + 1 }, (_, index) => mkdtempSync(join(tmpdir(), `cto-bridge-cap-${index}-`)));
   const handles: Array<{ root: string; handle: ReturnType<typeof writeBridgeLock> }> = [];
   try {
-    for (const candidate of roots) handles.push({ root: candidate, handle: writeBridgeLock(candidate) });
+    for (const candidate of roots) handles.push({ root: candidate, handle: writeBridgeLock(candidate, undefined, runtimeFor(candidate).proofAuthority) });
     assert.equal(handles.filter(({ handle }) => handle.owned).length, MAX_BRIDGE_LEASES, "live bridge lease cache stays bounded");
     assert.equal(handles.at(-1)?.handle.owned, false, "the over-cap root is rejected before lock ownership");
   } finally {
-    for (const { root, handle } of handles) if (handle.owned) clearBridgeLock(root, handle);
+    for (const { root, handle } of handles) if (handle.owned) clearBridgeLock(root, handle, undefined, runtimeFor(root).proofAuthority);
     for (const candidate of roots) rmSync(candidate, { recursive: true, force: true });
   }
 });
@@ -3997,27 +4037,24 @@ test("adapters: live malformed bridge lock is not reclaimed", () => {
     mkdirSync(join(root, ".omp"), { recursive: true });
     const malformed = JSON.stringify({ pid: process.pid });
     writeFileSync(bridgeLockPath(root), malformed);
-    writeBridgeLock(root);
+    writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
     assert.equal(readFileSync(bridgeLockPath(root), "utf8"), malformed, "live malformed owner is not overwritten");
-    assert.equal(isBridgeAlive(root), false, "malformed owner is never treated as a live bridge");
+    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false, "malformed owner is never treated as a live bridge");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("adapters: dead old-schema bridge lock is atomically upgraded", () => {
+test("adapters: dead invalid-schema bridge lock is retained", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-lock-malformed-dead-"));
   try {
     mkdirSync(join(root, ".omp"), { recursive: true });
-    writeFileSync(bridgeLockPath(root), JSON.stringify({ pid: 99999999 }));
-    writeBridgeLock(root);
-    const upgraded = JSON.parse(readFileSync(bridgeLockPath(root), "utf8")) as Record<string, unknown>;
-    assert.equal(upgraded.pid, process.pid, "dead legacy owner is replaced by this process");
-    assert.equal(typeof upgraded.root_identity, "string", "upgraded lock binds canonical root");
-    assert.equal(typeof upgraded.root_dev, "number", "upgraded lock binds root device");
-    assert.equal(typeof upgraded.root_ino, "number", "upgraded lock binds root inode");
-    assert.equal(isBridgeAlive(root), true);
-    clearBridgeLock(root);
+    const legacy = JSON.stringify({ pid: 99999999 });
+    writeFileSync(bridgeLockPath(root), legacy);
+    const attempt = writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
+    assert.equal(attempt.owned, false, "invalid legacy lease cannot be reclaimed");
+    assert.equal(readFileSync(bridgeLockPath(root), "utf8"), legacy, "invalid legacy lease remains byte-identical");
+    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -4038,10 +4075,10 @@ test("adapters: pollInbox skips telegram polling while the bridge is alive", asy
     await pollInbox(root, stub, undefined, undefined);
     assert.equal(polls, 1, "no bridge -> session polls telegram");
 
-    writeBridgeLock(root);
+    writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
     await pollInbox(root, stub, undefined, undefined);
     assert.equal(polls, 1, "bridge alive -> session must NOT poll telegram");
-    clearBridgeLock(root);
+    clearBridgeLock(root, undefined, undefined, runtimeFor(root).proofAuthority);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -4056,7 +4093,7 @@ test("adapters: pollInbox — persisted mock RW adapter polls through a live tg-
     adapter.setPlainMessageHandler((m) => tasks.push({ id: m.id, text: m.text }));
 
     // Live-lock resident repro: the tg-bridge lock is up BEFORE the first poll.
-    writeBridgeLock(root);
+    writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
 
     // Second-process path: a SEPARATE writer drops the inbound file; this
     // adapter instance only ever sees it via pollOnce() (no injection-time
@@ -4078,7 +4115,7 @@ test("adapters: pollInbox — persisted mock RW adapter polls through a live tg-
     await pollInbox(root, adapter, undefined, undefined);
     assert.equal(tasks.length, 1, "inbound task delivered exactly once");
   } finally {
-    clearBridgeLock(root);
+    clearBridgeLock(root, undefined, undefined, runtimeFor(root).proofAuthority);
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -4202,7 +4239,7 @@ test("adapters: telegram sendPlainText posts plain text without markup", async (
       throw new Error(`unexpected method: ${method}`);
     }) as typeof fetch;
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "c", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "c", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     const result = await adapter.sendPlainText("c", "status reply");
     assert.equal(result.sent, true);
     assert.equal(payload?.chat_id, "c");
@@ -4523,7 +4560,7 @@ test("adapters: active Telegram answer cannot wake after same-lexical root repla
         }],
       }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
     let finishPoll: (() => void) | undefined;
     const pollDone = new Promise<void>((resolve) => { finishPoll = resolve; });
     const originalPollOnce = adapter.pollOnce.bind(adapter);
@@ -4857,7 +4894,7 @@ test("adapters: Telegram update commit hook runs after durable callback and befo
     const adapter = new TelegramEscalationAdapter({
       token: "t",
       chatId: "100",
-      cwd: root,
+      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
       fetchImpl,
       onPlainMessage: () => { events.push("durable-callback"); },
       onUpdateCommitted: async () => {

@@ -34,7 +34,7 @@ import * as registry from "../src/adapters/registry.js";
 import { MockEscalationAdapter } from "../src/adapters/mock.js";
 import { openFullstackRuntimeTest, type FullstackRuntimeTestFixture } from "./runtime-access-fixture.js";
 import { canonicalDurableIdFileName } from "../../core/src/cto/durable-id.js";
-import { markCtoRunDeliveryPending, newCtoState, writeCtoState } from "../../core/src/cto/state.js";
+import { ctoRuntimeRunInitialIdentityDigest, newCtoState } from "../../core/src/cto/state.js";
 
 type FullstackRuntime = FullstackRuntimeTestFixture;
 const runtimeFixtures = new Map<string, FullstackRuntime>();
@@ -69,16 +69,16 @@ type HandleOptions = NonNullable<Parameters<typeof registry.handleInboxTask>[3]>
 type RunOptions = NonNullable<Parameters<typeof registry.produceWaveDeliveries>[1]>;
 
 function createChannelSet(root: string, capabilities?: ChannelCapabilities, pinnedRoot?: ChannelPinnedRoot) {
-  return registry.createChannelSet(root, capabilities, pinnedRoot, runtimeFor(root).access);
+  return registry.createChannelSet(root, capabilities, pinnedRoot, runtimeFor(root).access, runtimeFor(root).proofAuthority);
 }
 function drainOutbox(root: string, adapter: Parameters<typeof registry.drainOutbox>[1], maxRetries = 3, options: DrainOptions = {}) {
-  return registry.drainOutbox(root, adapter, maxRetries, { ...retryDrainContext(root), ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access });
+  return registry.drainOutbox(root, adapter, maxRetries, { ...retryDrainContext(root), ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access, proofAuthority: runtimeFor(root).proofAuthority });
 }
 function queueCtoDelivery(root: string, runId: string, delivery: Parameters<typeof registry.queueCtoDelivery>[2], pinnedRoot?: DeliveryPinnedRoot, isOwned?: DeliveryOwner, runtimeAccess?: Parameters<typeof registry.queueCtoDelivery>[5]) {
   return registry.queueCtoDelivery(root, runId, delivery, pinnedRoot, isOwned, runtimeAccess ?? runtimeFor(root).access);
 }
 function handleInboxTask(root: string, task: Parameters<typeof registry.handleInboxTask>[1], onTask?: Parameters<typeof registry.handleInboxTask>[2], options: HandleOptions = {}) {
-  return registry.handleInboxTask(root, task, onTask, { ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access });
+  return registry.handleInboxTask(root, task, onTask, { ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access, proofAuthority: runtimeFor(root).proofAuthority });
 }
 function resolveInboxRunId(root: string, pinnedRoot?: Parameters<typeof registry.resolveInboxRunId>[1], runtimeAccess?: Parameters<typeof registry.resolveInboxRunId>[2]) {
   return registry.resolveInboxRunId(root, pinnedRoot, runtimeAccess ?? runtimeFor(root).access);
@@ -159,9 +159,10 @@ function withRunState(
   if (opts.ackTarget) {
     state.channel_profile = { direction: "rw", transport: "telegram", adapter: "telegram", primary: true, ackTarget: opts.ackTarget };
   }
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+  const runtime = runtimeFor(root);
+  assert.ok(runtime.access.createRun(state, { source_id: `outbound-producer:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
   if (opts.waves.some((wave) => (wave.status === "done" || wave.status === "failed") && wave.finished_at)) {
-    assert.equal(markCtoRunDeliveryPending(root, runId, undefined, "summary"), true, "completed wave summary obligation is indexed");
+    assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "summary"), true, "completed wave summary obligation is indexed");
   }
 }
 
@@ -515,7 +516,7 @@ test("outbound: malformed wave_history state fails closed with no summary or out
     withRunState(root, runId, {
       waves: [{ id: "wave-bad", source_id: "t-bad", task: "Valid before corruption", status: "done", started_at: now, finished_at: now }],
     });
-    assert.equal(markCtoRunDeliveryPending(root, runId, undefined, "summary"), true, "valid run is indexed with a pending summary obligation");
+    assert.equal(runtimeFor(root).access.markDeliveryPending(runId, runtimeFor(root).access.readState(runId)?.state_revision, "summary"), true, "valid run is indexed with a pending summary obligation");
     const state = JSON.parse(readFileSync(join(runDir, "state.json"), "utf8")) as Record<string, unknown>;
     state.wave_history = [
       null, // corrupt entry: malformed records must not be summarized
@@ -553,7 +554,7 @@ test("outbound: non-array wave_history state publishes nothing for itself and do
     const corruptRunId = "run-corrupt-container";
     const corruptDir = join(root, ".work-state", "cto", corruptRunId);
     withRunState(root, corruptRunId, { waves: [] });
-    assert.equal(markCtoRunDeliveryPending(root, corruptRunId, undefined, "summary"), true, "corrupt run retains an indexed pending obligation");
+    assert.equal(runtimeFor(root).access.markDeliveryPending(corruptRunId, runtimeFor(root).access.readState(corruptRunId)?.state_revision, "summary"), true, "corrupt run retains an indexed pending obligation");
     // The typed withRunState helper CANNOT express an agent-written
     // non-array wave_history; preserve the canonical revision/index identity
     // and corrupt only that persisted field.

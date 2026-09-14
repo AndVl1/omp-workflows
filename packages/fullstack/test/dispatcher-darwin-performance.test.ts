@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { PinnedProjectRoot } from "../../core/src/specification/pinned-root.js";
-import { markCtoRunDeliveryPending, newCtoState, writeCtoState } from "../../core/src/cto/state.js";
+import { ctoRuntimeRunInitialIdentityDigest, newCtoState } from "../../core/src/cto/state.js";
 import { openFullstackRuntimeTest } from "./runtime-access-fixture.js";
 import { createChannelSet, startChannelDispatcher } from "../src/adapters/registry.js";
 
@@ -24,8 +24,8 @@ test("Darwin dispatcher keeps the event loop responsive with two deferred tasks"
     const plan = { id: runId, task: "active", teams: [], created_at: now };
     const state = newCtoState({ id: runId, task: "active", branch: "", autonomous: false, plan });
     mkdirSync(join(root, ".omp"), { recursive: true });
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    assert.equal(markCtoRunDeliveryPending(root, runId, undefined, "outbox"), true);
+    assert.ok(runtime.access.createRun(state, { source_id: `darwin-performance:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+    assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
     writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({
       channels: [{ id: "mock", adapter: "mock", direction: "read-write", primary: true, mock: { persisted: true, dir: "rw" } }],
     }));
@@ -34,7 +34,7 @@ test("Darwin dispatcher keeps the event loop responsive with two deferred tasks"
       writeFileSync(join(root, "rw", "inbound", `${id}.json`), JSON.stringify({ id, text: `deferred ${id}`, at: now, by: "darwin-probe" }));
     }
 
-    const channelSet = createChannelSet(root, undefined, undefined, runtime.access);
+    const channelSet = createChannelSet(root, undefined, undefined, runtime.access, runtime.proofAuthority);
     const delays: number[] = [];
     let callbackCount = 0;
     let resolveReceipt: (() => void) | undefined;
@@ -48,6 +48,7 @@ test("Darwin dispatcher keeps the event loop responsive with two deferred tasks"
     const started = performance.now();
     const stop = startChannelDispatcher(root, channelSet, 10_000, {
       runtimeAccess: runtime.access,
+      proofAuthority: runtime.proofAuthority,
       session_id: runtime.sessionId,
       liveGuard: runtime.liveGuard,
       onTask: () => {

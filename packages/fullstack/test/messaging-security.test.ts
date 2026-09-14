@@ -6,22 +6,22 @@ import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { openBoundedQueue } from "@andvl1/omp-workflows-core/queue";
-import { markCtoRunDeliveryPending, newCtoState, readCtoRunDeliveryIndexPage, readCtoState, writeCtoState } from "../../core/src/cto/state.js";
+import { ctoRuntimeRunInitialIdentityDigest, newCtoState, readCtoRunDeliveryIndexPage, readCtoState, writeCtoState } from "../../core/src/cto/state.js";
 import { canonicalDurableIdFileName } from "../../core/src/cto/durable-id.js";
 import { PinnedProjectRoot } from "../../core/src/specification/pinned-root.js";
 import {
   bridgeLockPath,
-  clearBridgeLock,
-  createAuthenticatedInboxEnvelope,
+  clearBridgeLock as clearBridgeLockRaw,
+  createAuthenticatedInboxEnvelope as createAuthenticatedInboxEnvelopeRaw,
   dispatcherLockPath,
   drainOutbox as drainOutboxRaw,
   handleInboxTask as handleInboxTaskRaw,
-  isBridgeAlive,
+  isBridgeAlive as isBridgeAliveRaw,
   outboxDir,
   pollInbox as pollInboxRaw,
   resolveInboxRunId as resolveInboxRunIdRaw,
   startDispatcher as startDispatcherRaw,
-  writeBridgeLock,
+  writeBridgeLock as writeBridgeLockRaw,
 } from "../src/adapters/registry.js";
 import { buildCtoInboxWakeMessage } from "../src/index.js";
 import { MockEscalationAdapter } from "../src/adapters/mock.js";
@@ -52,18 +52,31 @@ test.after(() => {
   retryDrainContexts.clear();
 });
 
+function createAuthenticatedInboxEnvelope(root: string, kind: Parameters<typeof createAuthenticatedInboxEnvelopeRaw>[1], payload: Parameters<typeof createAuthenticatedInboxEnvelopeRaw>[2], pinnedRoot?: Parameters<typeof createAuthenticatedInboxEnvelopeRaw>[3]) {
+  return createAuthenticatedInboxEnvelopeRaw(root, kind, payload, pinnedRoot, runtimeFor(root).proofAuthority);
+}
+function writeBridgeLock(root: string, pinnedRoot?: Parameters<typeof writeBridgeLockRaw>[1]) {
+  return writeBridgeLockRaw(root, pinnedRoot, runtimeFor(root).proofAuthority);
+}
+function clearBridgeLock(root: string, suppliedHandle?: Parameters<typeof clearBridgeLockRaw>[1], pinnedRoot?: Parameters<typeof clearBridgeLockRaw>[2]): void {
+  clearBridgeLockRaw(root, suppliedHandle, pinnedRoot, runtimeFor(root).proofAuthority);
+}
+function isBridgeAlive(root: string, pinnedRoot?: Parameters<typeof isBridgeAliveRaw>[1]): boolean {
+  return isBridgeAliveRaw(root, pinnedRoot, runtimeFor(root).proofAuthority);
+}
+
 function resolveInboxRunId(root: string, pinnedRoot?: Parameters<typeof resolveInboxRunIdRaw>[1]): string {
   return resolveInboxRunIdRaw(root, pinnedRoot, runtimeFor(root).access);
 }
 function pollInbox(root: string, adapter: Parameters<typeof pollInboxRaw>[1], onTask?: Parameters<typeof pollInboxRaw>[2], onAnswer?: Parameters<typeof pollInboxRaw>[3], options: NonNullable<Parameters<typeof pollInboxRaw>[4]> = {}): ReturnType<typeof pollInboxRaw> {
-  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, runtimeAccess: runtimeFor(root).access });
+  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, runtimeAccess: runtimeFor(root).access, proofAuthority: runtimeFor(root).proofAuthority });
 }
 async function drainOutbox(root: string, adapter: Parameters<typeof drainOutboxRaw>[1], maxRetries = 3, options: NonNullable<Parameters<typeof drainOutboxRaw>[3]> = {}): ReturnType<typeof drainOutboxRaw> {
   const runtimeAccess = runtimeFor(root).access;
   const pinnedRoot = options.pinnedRoot ?? PinnedProjectRoot.open(root);
   try {
     if (adapter) assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtimeAccess, pinnedRoot), true, "messaging test adapter has authenticated routing");
-    return await drainOutboxRaw(root, adapter, maxRetries, { ...retryDrainContext(root), ...options, pinnedRoot, runtimeAccess });
+    return await drainOutboxRaw(root, adapter, maxRetries, { ...retryDrainContext(root), ...options, pinnedRoot, runtimeAccess, proofAuthority: runtimeFor(root).proofAuthority });
   } finally {
     if (!options.pinnedRoot) pinnedRoot.close();
   }
@@ -74,17 +87,17 @@ function startDispatcher(root: string, adapter: Parameters<typeof startDispatche
   try {
     if (adapter) assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtimeAccess, pinnedRoot), true, "messaging dispatcher adapter has authenticated routing");
     const runtime = runtimeFor(root);
-    return startDispatcherRaw(root, adapter, intervalMs, { ...options, pinnedRoot, runtimeAccess, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard });
+    return startDispatcherRaw(root, adapter, intervalMs, { ...options, pinnedRoot, runtimeAccess, proofAuthority: runtime.proofAuthority, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard });
   } catch (error) {
     if (!options.pinnedRoot) pinnedRoot.close();
     throw error;
   }
 }
 function handleInboxTask(root: string, task: Parameters<typeof handleInboxTaskRaw>[1], onTask?: Parameters<typeof handleInboxTaskRaw>[2], options: NonNullable<Parameters<typeof handleInboxTaskRaw>[3]> = {}): ReturnType<typeof handleInboxTaskRaw> {
-  return handleInboxTaskRaw(root, task, onTask, { ...options, runtimeAccess: runtimeFor(root).access });
+  return handleInboxTaskRaw(root, task, onTask, { ...options, runtimeAccess: runtimeFor(root).access, proofAuthority: runtimeFor(root).proofAuthority });
 }
 function publishOutbox(root: string, runId: string, delivery: Parameters<typeof queueCtoDeliveryRaw>[2]): string {
-  const path = queueCtoDeliveryRaw(root, runId, delivery, undefined, undefined, runtimeFor(root).access);
+  const path = queueCtoDeliveryRaw(root, runId, delivery, undefined, undefined, runtimeFor(root).access, runtimeFor(root).proofAuthority);
   assert.ok(path, "authenticated outbox publication succeeds");
   return path;
 }
@@ -116,7 +129,7 @@ function resignInboxFile(root: string, path: string, runId: string): void {
 function runWakeCrash(root: string, runId: string, identity: string, mode: "before" | "after"): number | null {
   const registryUrl = new URL("../src/adapters/registry.ts", import.meta.url).href;
   const runtimeUrl = new URL("./runtime-access-fixture.ts", import.meta.url).href;
-  const script = `const fs = await import("node:fs"); const runtimeModule = await import(${JSON.stringify(runtimeUrl)}); const runtime = runtimeModule.openFullstackRuntimeTest(process.env.WAKE_ROOT, "messaging-security-child-" + process.env.WAKE_ID); const mod = await import(${JSON.stringify(registryUrl)}); const task = { id: process.env.WAKE_ID, text: "crash boundary task", at: new Date().toISOString(), runId: process.env.WAKE_RUN }; mod.handleInboxTask(process.env.WAKE_ROOT, task, () => { if (process.env.WAKE_MODE === "after") fs.writeFileSync(process.env.WAKE_EFFECT, "effect", { flag: "a" }); process.exit(17); }, { idempotentWake: true, runtimeAccess: runtime.access });`;
+  const script = `const fs = await import("node:fs"); const runtimeModule = await import(${JSON.stringify(runtimeUrl)}); const runtime = runtimeModule.openFullstackRuntimeTest(process.env.WAKE_ROOT, "messaging-security-child-" + process.env.WAKE_ID, undefined, false); const mod = await import(${JSON.stringify(registryUrl)}); const task = { id: process.env.WAKE_ID, text: "crash boundary task", at: new Date().toISOString(), runId: process.env.WAKE_RUN }; mod.handleInboxTask(process.env.WAKE_ROOT, task, () => { if (process.env.WAKE_MODE === "after") fs.writeFileSync(process.env.WAKE_EFFECT, "effect", { flag: "a" }); process.exit(17); }, { idempotentWake: true, runtimeAccess: runtime.access, proofAuthority: runtime.proofAuthority });`;
   return spawnSync(process.execPath, ["--import", "tsx", "--eval", script], {
     cwd: process.cwd(),
     env: { ...process.env, WAKE_ROOT: root, WAKE_RUN: runId, WAKE_ID: identity, WAKE_MODE: mode, WAKE_EFFECT: join(root, "observed-effect") },
@@ -132,14 +145,14 @@ function createIndexedPendingRun(root: string, runId: string): void {
     autonomous: true,
     plan: { id: runId, task: "indexed delivery test", teams: [], created_at: new Date().toISOString() },
   });
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-  assert.equal(markCtoRunDeliveryPending(root, runId, undefined, "outbox"), true);
+  const runtime = runtimeFor(root);
+  assert.ok(runtime.access.createRun(state, { source_id: `messaging-security:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+  assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
 }
 
 function createIndexedPendingRuns(root: string, runIds: readonly string[]): void {
-  const ctoRoot = join(root, ".work-state", "cto");
-  mkdirSync(ctoRoot, { recursive: true });
-  const entries = runIds.map((runId) => {
+  const runtime = runtimeFor(root);
+  for (const runId of runIds) {
     const state = newCtoState({
       id: runId,
       task: "indexed delivery test",
@@ -147,12 +160,9 @@ function createIndexedPendingRuns(root: string, runIds: readonly string[]): void
       autonomous: true,
       plan: { id: runId, task: "indexed delivery test", teams: [], created_at: new Date().toISOString() },
     });
-    state.state_revision = 1;
-    mkdirSync(join(ctoRoot, runId), { recursive: true });
-    writeFileSync(join(ctoRoot, runId, "state.json"), JSON.stringify(state));
-    return { run_id: runId, state_revision: 1, status: "active", updated_at: state.updated_at, pending_summary: false, pending_outbox: true, pending_retry: false, summary_digest: "" };
-  });
-  writeFileSync(join(ctoRoot, "active-run-index.json"), JSON.stringify({ schema_version: 2, active_run_id: runIds.at(-1) ?? null, entries }));
+    assert.ok(runtime.access.createRun(state, { source_id: `messaging-security:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+    assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
+  }
 }
 
 function createIndexedPendingTerminalSummaries(root: string, runIds: readonly string[]): void {
@@ -169,8 +179,9 @@ function createIndexedPendingTerminalSummaries(root: string, runIds: readonly st
     state.integration.status = "done";
     state.pause = { kind: "done", reason: "terminal summary pagination test" };
     state.wave_history = [{ id: waveId, source: "inbox", source_id: `${runId}-source`, task: `terminal task ${index}`, slice_ids: [], status: "done", started_at: now, finished_at: now }];
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    assert.equal(markCtoRunDeliveryPending(root, runId, state.state_revision, "summary"), true);
+    const runtime = runtimeFor(root);
+    assert.ok(runtime.access.createRun(state, { source_id: `messaging-security:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+    assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "summary"), true);
   }
 }
 
@@ -264,9 +275,9 @@ test("messenger security: crash before send requires manual wake recovery", () =
     let calls = 0;
     const effect = join(root, "observed-effect");
     const task = { id: "wake-before", text: "crash boundary task", at: new Date().toISOString(), runId };
-    assert.throws(() => handleInboxTask(root, task, () => { calls += 1; writeFileSync(effect, "effect", { flag: "a" }); }, { idempotentWake: true, wakeEvidence: () => false }), (error: unknown) => (error as { code?: string })?.code === "WAKE_EFFECT_AMBIGUOUS");
-    assert.equal(calls, 0);
-    assert.equal(existsSync(effect), false);
+    assert.doesNotThrow(() => handleInboxTask(root, task, () => { calls += 1; writeFileSync(effect, "effect", { flag: "a" }); }, { idempotentWake: true, wakeEvidence: () => false }));
+    assert.equal(calls, 1, "authoritative no-effect evidence reclaims the prepared wake");
+    assert.equal(readFileSync(effect, "utf8"), "effect");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -611,8 +622,9 @@ test("messenger security: active revision bump retries a direct outbox claim", {
     assert.ok(state);
     const staleRevision = state.state_revision;
     state.updated_at = new Date().toISOString();
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    assert.equal(markCtoRunDeliveryPending(root, runId, staleRevision, "outbox"), false);
+    const runtime = runtimeFor(root);
+    assert.ok(runtime.access.createRun(state, { source_id: `messaging-security:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+    assert.equal(runtime.access.markDeliveryPending(runId, staleRevision, "outbox"), false);
     const directory = outboxDir(runId, root);
     mkdirSync(directory, { recursive: true });
     const revisionPath = publishOutbox(root, runId, { id: `${runId}/question/revision`, level: "question", title: "revision", body: "direct", intent: "question", at: new Date().toISOString(), by: "test", run_id: runId });

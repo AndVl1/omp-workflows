@@ -49,7 +49,7 @@ function register(
 }
 
 function createAdapter(root: string, config: Parameters<typeof createEscalationAdapter>[0]): ReturnType<typeof createEscalationAdapter> {
-  return createEscalationAdapter(config, root, undefined, runtimeFor(root).access);
+  return createEscalationAdapter(config, root, undefined, runtimeFor(root).access, runtimeFor(root).proofAuthority);
 }
 
 function registerWithRuntime(
