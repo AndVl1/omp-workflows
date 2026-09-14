@@ -16,7 +16,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, existsSync, rmSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TelegramEscalationAdapter, TelegramMappingRecoveryRequiredError } from "../src/adapters/telegram.js";
-import { createEscalationAdapter as createEscalationAdapterRaw } from "../src/adapters/registry.js";
+import { createEscalationAdapter as createEscalationAdapterRaw, createChannelSet as createChannelSetRaw } from "../src/adapters/registry.js";
 import { openFullstackRuntimeTest, type FullstackRuntimeTestFixture } from "./runtime-access-fixture.js";
 
 const runtimeFixtures = new Map<string, FullstackRuntimeTestFixture>();
@@ -673,6 +673,29 @@ test("auth: registry rejects Telegram construction when routing rotates during f
     assert.equal(fetchCalls, 0, "a rejected construction must not expose an adapter that can fetch with old credentials");
   } finally {
     (globalThis as { fetch: typeof fetch }).fetch = realFetch;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("auth: explicit Telegram channel IDs normalize whitespace consistently", () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-auth-channel-id-whitespace-"));
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    const config = {
+      channels: [{
+        id: " primary ",
+        adapter: "telegram",
+        direction: "read-write",
+        primary: true,
+        telegram: { token: "t", chatId: CONFIGURED_CHAT },
+      }],
+    };
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify(config));
+    const fixture = runtimeFixtureFor(root);
+    const set = createChannelSetRaw(root, undefined, undefined, fixture.access, fixture.proofAuthority);
+    assert.ok(set.primary, "whitespace-padded explicit Telegram ID still constructs its guarded primary");
+    assert.equal(set.profile.id, "primary", "normalized profile identity is used for selection");
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });

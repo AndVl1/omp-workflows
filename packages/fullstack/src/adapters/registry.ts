@@ -861,7 +861,9 @@ function telegramProjectionForSnapshot(
   const configuredId = typeof config.id === "string" ? config.id.trim() : "";
   const matching = Array.isArray(candidates)
     ? candidates.filter((candidate) => candidate.adapter === "telegram"
-      && (configuredId.length === 0 ? candidate.id === undefined : candidate.id === configuredId)
+      && (configuredId.length === 0
+        ? candidate.id === undefined
+        : (typeof candidate.id === "string" && candidate.id.trim() === configuredId))
       && (config.primary !== true || candidate.primary === true))
     : [];
   return matching.length === 1 ? matching[0]! : null;
