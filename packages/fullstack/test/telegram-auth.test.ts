@@ -454,10 +454,12 @@ test("auth: allowedSenderIds restricts senders inside the allowed chat", async (
 test("auth: allowedChatIds extends the allowlist; configured chatId stays allowed", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-auth-7-"));
   try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "fixture-token", chatId: CONFIGURED_CHAT, allowedChatIds: [999] } }));
     withIndexedMapping(root, "run-sec1", "run-sec1/esc-2", 31, "999");
     withIndexedMapping(root, "run-sec1", "run-sec1/esc-3", 32, CONFIGURED_CHAT);
     const adapter = telegramAdapter({
-      token: "t", chatId: CONFIGURED_CHAT, cwd: root, allowedChatIds: ["999"],
+      token: "t", chatId: CONFIGURED_CHAT, cwd: root, allowedChatIds: [999],
       fetchImpl: mockFetch([
         { update_id: 1, callback_query: { id: "cq1", from: { id: 111 }, message: { message_id: 30, chat: { id: 555 } }, data: "run-sec1/esc-1::no" } },
         { update_id: 2, callback_query: { id: "cq2", from: { id: 111 }, message: { message_id: 31, chat: { id: 999 } }, data: "run-sec1/esc-2::yes" } },

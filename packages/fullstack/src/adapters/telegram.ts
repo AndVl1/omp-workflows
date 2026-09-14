@@ -102,7 +102,9 @@ export type TelegramUpdateCommitHook = (updateId: number, pinnedRoot?: PinnedPro
 export type TelegramRuntimeAccess = Pick<CtoRuntimeAccessFacade,
   "assertLive" | "resolveEscalationChannelSnapshot" | "readActiveDeliveryCandidates"
   | "readCompletedDeliveryIndexPage" | "hasValidStateProof" | "readState"
-  | "readOutboxDeliveryObligations" | "currentOutboxDeliveryStatus">;
+  | "readOutboxDeliveryObligations" | "currentOutboxDeliveryStatus"> & {
+  readonly readStatus?: (runId: string) => Readonly<Record<string, unknown>> | null;
+};
 
 export interface TelegramAdapterOptions {
   token: string;
@@ -174,6 +176,7 @@ interface TgUpdate {
 interface TelegramAnswerTarget {
   readonly runId: string;
   readonly escId: string;
+  readonly status: "active" | "standby" | "done" | "failed";
 }
 
 interface TelegramCorrelationMarker {
@@ -1059,9 +1062,11 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
           this.assertLive(pinnedRoot, lifecycle);
           const persisted = this.writeAnswer(answer, pinnedRoot, lifecycle);
           this.assertLive(pinnedRoot, lifecycle);
-          await this.onAnswer?.(persisted, pinnedRoot);
-          this.assertLive(pinnedRoot, lifecycle);
-          answers.push(persisted);
+          if (persisted) {
+            await this.onAnswer?.(persisted, pinnedRoot);
+            this.assertLive(pinnedRoot, lifecycle);
+            answers.push(persisted);
+          }
         }
         this.assertLive(pinnedRoot, lifecycle);
         await this.onUpdateCommitted?.(update.update_id, pinnedRoot);
@@ -1108,6 +1113,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       if (sourceChatId === undefined) return null;
       const sourceChat = String(sourceChatId);
       const target = this.answerTargetOfMessage(callbackQuery.message.message_id, sourceChat, pinnedRoot);
+      if (target?.status === "done" || target?.status === "failed") return null;
       if (target && TELEGRAM_CALLBACK_TOKEN_RE.test(callbackData)) {
         const optionId = this.optionIdOfCallback(target.escId, callbackData, sourceChat, pinnedRoot);
         if (optionId) return { id: target.escId, run_id: target.runId, answer: optionId, at, by: "telegram:callback" };
@@ -1137,6 +1143,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       const replyTo = message.reply_to_message;
       const marker = parseTelegramCorrelationMarker(replyTo.text);
       const target = this.answerTargetOfMessage(replyTo.message_id, String(sourceChatId), pinnedRoot, marker ?? undefined);
+      if (target?.status === "done" || target?.status === "failed") return null;
       if (target && isSafeCtoInboundText(message.text)) {
         return { id: target.escId, run_id: target.runId, answer: message.text, at, by: "telegram:reply" };
       }
@@ -1167,12 +1174,19 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     return null;
   }
 
-  private writeAnswer(answer: EscalationAnswer, pinnedRoot: PinnedProjectRoot, lifecycle?: AdapterOperationContext): EscalationAnswer {
+  private writeAnswer(answer: EscalationAnswer, pinnedRoot: PinnedProjectRoot, lifecycle?: AdapterOperationContext): EscalationAnswer | null {
     const runId = answer.run_id;
     if (!isSafeRunId(runId) || !isSafeEscalationId(answer.id) || answer.id.split("/")[0] !== runId) {
       throw new Error(`telegram: writeAnswer rejected unsafe answer identity "${String(answer.id)}"`);
     }
     this.assertLive(pinnedRoot, lifecycle);
+    const status = this.runtimeAccess?.readStatus?.(runId);
+    if (status) {
+      const terminal = status.status === "done" || status.status === "failed";
+      if (terminal) return null;
+    } else if (this.runtimeAccess?.readStatus) {
+      throw new TelegramMappingRecoveryRequiredError(0, `telegram answer target  requires mapping recovery`);
+    }
     let queue;
     try {
       queue = openBoundedQueue(pinnedRoot.canonical_root, join(".work-state", "cto", runId, "answers"), { pinnedRoot });
@@ -1298,7 +1312,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       const nestedRecord = nested && typeof nested === "object" && !Array.isArray(nested) ? nested as Record<string, unknown> : null;
       const nestedChat = nestedRecord?.chatId;
       const allowed = nestedRecord?.allowedChatIds;
-      const allowlisted = Array.isArray(allowed) && allowed.some((value) => typeof value === "string" && value === chatId);
+      const allowlisted = Array.isArray(allowed) && allowed.some((value) => (typeof value === "string" && value === chatId) || (typeof value === "number" && Number.isSafeInteger(value) && String(value) === chatId));
       return (typeof direct === "string" && direct === chatId) || (typeof nestedChat === "string" && nestedChat === chatId) || allowlisted;
     });
     if (!targetConfigured) throw new TelegramActivationRevokedError("telegram channel target is not bound to the authenticated projection");
@@ -1695,7 +1709,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
               untrustedMessageEscIds.add(mapping.escId);
               continue;
             }
-            const target = { runId: entry.run_id, escId: mapping.escId };
+            const target = { runId: entry.run_id, escId: mapping.escId, status: entry.status as TelegramAnswerTarget["status"] };
             if (found !== null && (found.runId !== target.runId || found.escId !== target.escId)) ambiguous = true;
             else found = target;
           }
@@ -1836,7 +1850,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       const queue = this.openMappingQueue(runId, chatId, false, pinnedRoot);
       if (!queue) {
         this.recordMappingPinned(marker.escId, messageId, escalation, mappingReceipt, pinnedRoot);
-        return { runId, escId: marker.escId };
+        return { runId, escId: marker.escId, status: "active" };
       }
       let lock: TelegramMapLock | null = null;
       try {
@@ -1851,7 +1865,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
         maybeCompactTelegramMap(queue, runId, chatId, { ...snapshot, records }, this.mappingMaxEntryBytes, lock, true);
         this.runtimeAccess.assertLive();
         if (!pinnedRoot.isStable()) return null;
-        return { runId, escId: marker.escId };
+        return { runId, escId: marker.escId, status: "active" };
       } finally {
         if (lock) releaseTelegramMapLock(queue, lock);
         queue.close();

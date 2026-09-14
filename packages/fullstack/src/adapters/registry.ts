@@ -2203,12 +2203,10 @@ async function sendWithRetry(
     opts.lifecycle?.assertLive?.();
     const assertCurrentPublication = (): void => {
       if (!opts.runtimeAccess || !opts.delivery) return;
-      const status = currentDeliveryStatus(opts.runtimeAccess, {
-        ...opts.delivery,
-        routing_binding: opts.delivery.routing_binding ?? routingBindingForBytes(opts.runtimeAccess, typeof opts.delivery.json === "string" ? Buffer.from(opts.delivery.json, "utf8") : opts.delivery.json, opts.pinnedRoot) ?? undefined,
-      }, opts.pinnedRoot);
+      const routingBinding = opts.delivery.routing_binding ?? routingBindingForBytes(opts.runtimeAccess, typeof opts.delivery.json === "string" ? Buffer.from(opts.delivery.json, "utf8") : opts.delivery.json, opts.pinnedRoot) ?? undefined;
+      const status = currentDeliveryStatus(opts.runtimeAccess, { ...opts.delivery, routing_binding: routingBinding }, opts.pinnedRoot);
       if (status === "unavailable") throw new DeliveryAuthorityUnavailableError();
-      if (status !== "current") throw new UnauthorizedDeliveryError();
+      if (status !== "current" || !routingBinding || !adapterMatchesRoutingBinding(adapter, routingBinding)) throw new UnauthorizedDeliveryError();
     };
     try {
       assertCurrentPublication();

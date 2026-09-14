@@ -526,7 +526,11 @@ export function writeAnswerMarker(
     if (!pinnedRoot.isStable()) throw new BridgeRetryableError("telegram bridge root changed during marker authority lookup");
     if (!runtimeAccess && !bridgeRoute) return null;
     if (!active || active.runId !== runId) {
-      if (bridgeRoute) throw new BridgeRetryableError("telegram active route changed before answer marker");
+      if (bridgeRoute) {
+        const terminal = bridgeRoute.readStatus(runId);
+        if (terminal?.status === "done" || terminal?.status === "failed") return null;
+        throw new BridgeRetryableError("telegram active route changed before answer marker");
+      }
       return null;
     }
     const candidate = bridgeRoute?.resolveTelegramRoute() ?? null;

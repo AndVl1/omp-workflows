@@ -1222,27 +1222,49 @@ function bridgeRouteProjectionKey(profile: Readonly<Record<string, unknown>> | u
   return JSON.stringify({ normalized, chatId: profile?.chatId ?? null, allowedChatIds: safeArray(profile?.allowedChatIds), allowedSenderIds: safeArray(profile?.allowedSenderIds), nestedChatId: nestedRecord?.chatId ?? null, nestedAllowedChatIds: safeArray(nestedRecord?.allowedChatIds), nestedAllowedSenderIds: safeArray(nestedRecord?.allowedSenderIds) });
 }
 
-function sanitizeTelegramRouteProjection(profile: Readonly<Record<string, unknown>>, raw: Record<string, unknown>): Readonly<Record<string, unknown>> {
-  const safe = (value: unknown): unknown => typeof value === "string" || (typeof value === "number" && Number.isFinite(value)) ? value : undefined;
-  const safeArray = (value: unknown): readonly unknown[] | undefined => Array.isArray(value) ? Object.freeze(value.map(safe).filter((item): item is string | number => item !== undefined)) : undefined;
+function sanitizeTelegramRouteProjection(profile: Readonly<Record<string, unknown>>, raw: Record<string, unknown>): Readonly<Record<string, unknown>> | null {
+  const safeIdentity = (value: unknown): string | number | undefined => {
+    if (typeof value === "string") return value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/u.test(value) ? value : undefined;
+    return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
+  };
+  const normalizeAllowlist = (value: unknown): readonly string[] | undefined | null => {
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value) || value.length > 256) return null;
+    const seen = new Set<string>();
+    const normalized: string[] = [];
+    for (const item of value) {
+      const safe = safeIdentity(item);
+      if (safe === undefined) return null;
+      const id = String(safe);
+      if (seen.has(id)) return null;
+      seen.add(id);
+      normalized.push(id);
+    }
+    return Object.freeze(normalized);
+  };
   const nested = raw.telegram;
   const nestedRecord = nested && typeof nested === "object" && !Array.isArray(nested) ? nested as Record<string, unknown> : undefined;
   const result: Record<string, unknown> = { ...profile };
   for (const key of ["chatId", "ackTarget"] as const) {
-    const value = safe(raw[key]);
+    const value = safeIdentity(raw[key]);
     if (value !== undefined) result[key] = value;
   }
   for (const key of ["allowedChatIds", "allowedSenderIds"] as const) {
-    const value = safeArray(raw[key]);
+    const value = normalizeAllowlist(raw[key]);
+    if (value === null) return null;
     if (value !== undefined) result[key] = value;
   }
   if (nestedRecord) {
     const selected: Record<string, unknown> = {};
     for (const key of ["chatId", "allowedChatIds", "allowedSenderIds"] as const) {
-      const value = safe(key === "chatId" ? nestedRecord[key] : nestedRecord[key]);
-      const array = key === "chatId" ? undefined : safeArray(nestedRecord[key]);
-      if (value !== undefined) selected[key] = value;
-      else if (array !== undefined) selected[key] = array;
+      if (key === "chatId") {
+        const value = safeIdentity(nestedRecord[key]);
+        if (value !== undefined) selected[key] = value;
+      } else {
+        const value = normalizeAllowlist(nestedRecord[key]);
+        if (value === null) return null;
+        if (value !== undefined) selected[key] = value;
+      }
     }
     if (Object.keys(selected).length > 0) result.telegram = Object.freeze(selected);
   }
@@ -1497,7 +1519,9 @@ function openBridgeRouteFromCell(
       if (typeof runId !== "string" || !/^[A-Za-z0-9._-]+$/u.test(runId)) return null;
       const state = readCtoStatePinned(runId, root);
       if (!state || !hasValidCtoRuntimeStateProofPinned(root, state)) return null;
-      return Object.freeze({ id: state.id, state_revision: state.state_revision, updated_at: state.updated_at, owner_session: state.owner_session, standby: state.standby === true, channel_profile: state.channel_profile });
+      const pauseKind = state.pause && typeof state.pause === "object" && !Array.isArray(state.pause) ? (state.pause as { kind?: unknown }).kind : undefined;
+      const status = pauseKind === "done" ? "done" : pauseKind === "failed" ? "failed" : state.standby === true ? "standby" : "active";
+      return Object.freeze({ id: state.id, state_revision: state.state_revision, updated_at: state.updated_at, owner_session: state.owner_session, standby: state.standby === true, status, channel_profile: state.channel_profile });
     },
     close: (): void => { root.close(); },
   });
