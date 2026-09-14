@@ -3740,6 +3740,23 @@ function leaseWrite(queue: BoundedQueue, name: string, record: DispatcherLeaseRe
   queue.writeExclusive(name, JSON.stringify(record, null, 2));
 }
 
+/** Remove a dispatcher lease only when the exact token/generation still owns the bytes we read. */
+function removeDispatcherLeaseIfOwned(queue: BoundedQueue, pinnedRoot: PinnedProjectRoot, token: string, epoch: number): void {
+  try {
+    const observed = queue.read("cto-dispatcher.lock");
+    const record = parseLease(JSON.parse(decodeUtf8(observed.bytes)));
+    if (!record
+      || record.token !== token
+      || record.epoch !== epoch
+      || !dispatcherLeaseProofMatches(pinnedRoot, record)
+      || !dispatcherRecordMatchesPinnedRoot(pinnedRoot.lexical_root, pinnedRoot, record)
+      || !pinnedRoot.isStable()) return;
+    queue.removeIfMatches("cto-dispatcher.lock", queueExpected(observed));
+  } catch {
+    // A displaced/replaced lock is never removed by a stale claimant.
+  }
+}
+
 function claimDispatcher(root: string, providedRoot?: PinnedProjectRoot, runtimeAccess?: RuntimeAccess, sessionId?: string, liveGuard?: DispatcherActivationLiveGuard, expectedActivation?: RegistryContextSnapshot): { lease: DispatcherLease; pinnedRoot: PinnedProjectRoot } | null {
   const pinnedRoot = providedRoot ?? PinnedProjectRoot.open(root);
   const ownsPin = providedRoot === undefined;
@@ -3810,19 +3827,13 @@ function claimDispatcher(root: string, providedRoot?: PinnedProjectRoot, runtime
       wroteFirst = true;
       assertDispatcherActivationLive(runtimeAccess, pinnedRoot, liveGuard, activation);
       if (!dispatcherRootMatchesPinnedRoot(root, pinnedRoot, identity) || !dispatcherRecordMatchesPinnedRoot(root, pinnedRoot, first)) {
-        try { queue.removeIfMatches("cto-dispatcher.lock", queueExpected(queue.read("cto-dispatcher.lock"))); } catch { /* displaced root remains isolated */ }
+        removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, first.epoch);
         return null;
       }
       retained = true;
       return { lease: lease(first), pinnedRoot };
     } catch (error) {
-      if (wroteFirst) {
-        try {
-          const observed = queue.read("cto-dispatcher.lock");
-          const record = parseLease(JSON.parse(decodeUtf8(observed.bytes)));
-          if (record?.token === token) queue.removeIfMatches("cto-dispatcher.lock", queueExpected(observed));
-        } catch { /* displaced root remains isolated */ }
-      }
+      if (wroteFirst) removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, first.epoch);
       if (!(error instanceof BoundedQueueError && error.code === "exists")) return null;
     }
     const current = readDispatcherLeaseAny(root, pinnedRoot);
@@ -3846,15 +3857,11 @@ function claimDispatcher(root: string, providedRoot?: PinnedProjectRoot, runtime
     try {
       assertDispatcherActivationLive(runtimeAccess, pinnedRoot, liveGuard, activation);
     } catch (error) {
-      try {
-        const observed = queue.read("cto-dispatcher.lock");
-        const record = parseLease(JSON.parse(decodeUtf8(observed.bytes)));
-        if (record?.token === token) queue.removeIfMatches("cto-dispatcher.lock", queueExpected(observed));
-      } catch { /* displaced root remains isolated */ }
+      removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, next.epoch);
       throw error;
     }
     if (!dispatcherRootMatchesPinnedRoot(root, pinnedRoot, identity) || !dispatcherRecordMatchesPinnedRoot(root, pinnedRoot, next)) {
-      try { queue.removeIfMatches("cto-dispatcher.lock", queueExpected(queue.read("cto-dispatcher.lock"))); } catch { /* displaced root remains isolated */ }
+      removeDispatcherLeaseIfOwned(queue, pinnedRoot, token, next.epoch);
       return null;
     }
     retained = true;
@@ -4058,11 +4065,12 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
   const claimed = claimDispatcher(root, opts.pinnedRoot, opts.runtimeAccess, opts.session_id, opts.liveGuard, opts.activation);
   if (!claimed) return dispatcherHandle(false, async () => undefined);
   const { lease, pinnedRoot: dispatcherRoot } = claimed;
+  const ownsDispatcherRoot = opts.pinnedRoot === undefined;
   try {
     assertDispatcherActivationLive(opts.runtimeAccess, dispatcherRoot, opts.liveGuard, lease.activation);
   } catch {
     releaseDispatcherLease(lease, dispatcherRoot);
-    void dispatcherRoot.closeAsync().catch(() => undefined);
+    if (ownsDispatcherRoot) void dispatcherRoot.closeAsync().catch(() => undefined);
     return dispatcherHandle(false, async () => undefined);
   }
   let requestStop: (() => Promise<void>) | undefined;
@@ -5944,7 +5952,8 @@ function reserveWakeEffect(
   }
 }
 
-function removeInboxTaskFile(root: string, runId: string, taskId: string, suppliedPin?: PinnedProjectRoot): void {
+function removeInboxTaskFile(root: string, runId: string, task: InboxTask, suppliedPin?: PinnedProjectRoot): void {
+  const taskId = task.id;
   const pinnedRoot = suppliedPin ?? PinnedProjectRoot.open(root);
   if (!pinnedRoot) return;
   const queue = openBoundedQueue(pinnedRoot.canonical_root, join(".work-state", "cto", runId, "inbox"), { pinnedRoot });
@@ -5957,9 +5966,16 @@ function removeInboxTaskFile(root: string, runId: string, taskId: string, suppli
     for (const fileName of candidates) {
       if (!queue.exists(fileName)) continue;
       try {
-        const current = queue.readJson<Partial<InboxTask>>(fileName);
-        if (current.id !== taskId) continue;
-        queue.removeIfMatches(fileName, queueExpected(queue.read(fileName)));
+        // Capture one bounded read and its exact expectation. Never reread by
+        // pathname before removal: a same-id replacement must survive rollback.
+        const observed = queue.read(fileName);
+        const parsed = JSON.parse(decodeUtf8(observed.bytes)) as unknown;
+        const current = normalizeInboundTask(parsed, ACTIVE_QUEUE_OPTIONS.maxEntryBytes, true);
+        if (!current
+          || current.id !== taskId
+          || current.runId !== runId
+          || inboxTaskIdentityHash(current) !== inboxTaskIdentityHash({ ...task, runId })) continue;
+        queue.removeIfMatches(fileName, observed.expectation);
       } catch {
         // Rollback is best-effort; a later admission can safely inspect it.
       }
@@ -6132,7 +6148,7 @@ export function handleInboxTask(
             delete (record as InboxWakeRecord).wake_claim;
             transaction.writeState(current);
           }
-          if (!wakeWasDelivered) removeInboxTaskFile(root, runId, task.id, pinnedRoot);
+          if (!wakeWasDelivered) removeInboxTaskFile(root, runId, task, pinnedRoot);
         });
       } catch {
         // The wake failure is primary; preserve durable evidence for recovery.

@@ -24,7 +24,7 @@ import {
   type Escalation,
   type EscalationAdapter,
 } from "@andvl1/omp-workflows-core";
-import { DEFAULT_QUEUE_MAX_ENTRY_BYTES } from "@andvl1/omp-workflows-core/queue";
+import { BoundedQueue, DEFAULT_QUEUE_MAX_ENTRY_BYTES } from "@andvl1/omp-workflows-core/queue";
 import { setCtoPause, buildCtoTerminalSummaryEnvelope, newCtoState, readCtoState, readCtoRunDeliveryCandidatesPinned, markCtoRunDeliveryPending, setCtoRunDeliveryTestHooks, writeCtoState } from "../../core/src/cto/state.js";
 import { canonicalDurableIdFileName } from "../../core/src/cto/durable-id.js";
 import { finishWave } from "../../core/src/cto/waves.js";
@@ -4734,6 +4734,44 @@ test("cto-safety: quarantine record becomes admitted and wake-delivered after fi
     assert.equal(record?.status, "admitted", "status flips to admitted once the file is durable");
     assert.equal(record?.wake_status, "delivered", "successful wake is acknowledged durably");
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-safety: wake rollback preserves a same-id replacement between read and remove", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-q-wake-replacement-race-"));
+  let armed = false;
+  let replaced = false;
+  const originalRead = BoundedQueue.prototype.read;
+  BoundedQueue.prototype.read = function(name: string) {
+    const observed = originalRead.call(this, name);
+    if (armed && !replaced && this.relativeDirectory.endsWith("/inbox") && name === inboxMessageFileName("t-race")) {
+      replaced = true;
+      this.writeAtomic(name, JSON.stringify({
+        id: "t-race",
+        text: "replacement body",
+        at: new Date().toISOString(),
+        runId,
+      }));
+    }
+    return observed;
+  };
+  try {
+    const runId = resolveInboxRunId(root);
+    const task = { id: "t-race", text: "original body", at: new Date().toISOString(), runId };
+    assert.throws(
+      () => handleInboxTask(root, task, () => {
+        armed = true;
+        throw new Error("wake failed");
+      }),
+      /wake failed/,
+    );
+    assert.equal(replaced, true, "replacement was injected after the rollback read");
+    const inboxPath = join(inboxDir(runId, root), inboxMessageFileName(task.id));
+    assert.equal(existsSync(inboxPath), true, "the concurrent replacement remains durable");
+    assert.equal((JSON.parse(readFileSync(inboxPath, "utf8")) as { text?: string }).text, "replacement body");
+  } finally {
+    BoundedQueue.prototype.read = originalRead;
     rmSync(root, { recursive: true, force: true });
   }
 });

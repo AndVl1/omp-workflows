@@ -1071,6 +1071,101 @@ test("dispatcher lifecycle: mandatory session and activation identity reject for
   }
 });
 
+test("dispatcher lifecycle: stale claim cleanup cannot remove a replacement lease", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-dispatcher-stale-cleanup-"));
+  const runtime = openFullstackRuntimeTest(root, "dispatcher-stale-cleanup-session");
+  const adapter = {
+    kind: "stale-cleanup",
+    send: async () => ({ sent: false }),
+    sendWithIdempotency: async () => ({ sent: false }),
+    cancel: async () => undefined,
+    pollOnce: async () => [],
+  };
+  let armed = false;
+  let replaced = false;
+  const pin = PinnedProjectRoot.open(root, {
+    beforeRename(relativePath) {
+      if (relativePath === "cto-dispatcher.lock") armed = true;
+    },
+  });
+  assert.ok(pin);
+  const mutablePin = pin as PinnedProjectRoot & { isStable: () => boolean; ino: number };
+  const originalIsStable = pin.isStable.bind(pin);
+  mutablePin.isStable = () => {
+    const stable = originalIsStable();
+    if (stable && armed && !replaced && existsSync(dispatcherLockPath(root))) {
+      const current = JSON.parse(readFileSync(dispatcherLockPath(root), "utf8")) as Record<string, unknown>;
+      writeFileSync(dispatcherLockPath(root), JSON.stringify({ ...current, token: "replacement-lease" }));
+      // Make the claimant's post-write identity check fail without invalidating
+      // the descriptor itself; the stale cleanup then observes the replacement.
+      mutablePin.ino += 1;
+      replaced = true;
+    }
+    return stable;
+  };
+  try {
+    const contender = startDispatcher(root, adapter, 10_000, {
+      pinnedRoot: pin,
+      runtimeAccess: runtime.access,
+      session_id: runtime.sessionId,
+      liveGuard: runtime.liveGuard,
+    });
+    assert.equal(contender.claimed, false, "the injected identity mismatch rejects the stale claim");
+    assert.equal(replaced, true, "the replacement lease was installed before cleanup");
+    assert.equal(existsSync(dispatcherLockPath(root)), true, "the replacement lease remains durable");
+    assert.equal((JSON.parse(readFileSync(dispatcherLockPath(root), "utf8")) as { token?: string }).token, "replacement-lease");
+    await contender();
+  } finally {
+    await pin.closeAsync();
+    runtime.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dispatcher lifecycle: post-claim liveness failure preserves supplied pin", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-dispatcher-post-claim-pin-"));
+  const runtime = openFullstackRuntimeTest(root, "dispatcher-post-claim-pin-session");
+  const pin = PinnedProjectRoot.open(root);
+  assert.ok(pin);
+  let guardCalls = 0;
+  let failPostClaim = true;
+  const liveGuard: typeof runtime.liveGuard = () => {
+    guardCalls += 1;
+    if (failPostClaim && guardCalls === 4) {
+      failPostClaim = false;
+      throw new Error("injected post-claim liveness failure");
+    }
+    return runtime.liveGuard();
+  };
+  const adapter = {
+    kind: "post-claim-pin",
+    send: async () => ({ sent: false }),
+    sendWithIdempotency: async () => ({ sent: false }),
+    cancel: async () => undefined,
+    pollOnce: async () => [],
+  };
+  const options = {
+    pinnedRoot: pin,
+    runtimeAccess: runtime.access,
+    session_id: runtime.sessionId,
+    liveGuard,
+  };
+  try {
+    const failed = startDispatcher(root, adapter, 10_000, options);
+    assert.equal(failed.claimed, false, "the injected post-claim liveness failure rejects startup");
+    assert.ok(guardCalls >= 4, "the failure was injected after the claim path");
+    assert.equal(pin.isStable(), true, "startup failure does not close a caller-owned pin");
+
+    const recovered = startDispatcher(root, adapter, 10_000, options);
+    assert.equal(recovered.claimed, true, "the caller-owned pin remains usable for a later claim");
+    await recovered();
+  } finally {
+    await pin.closeAsync();
+    runtime.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("dispatcher lifecycle: failed claim is explicit and preserves caller-owned pin", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-dispatcher-claim-failure-"));
   const runtime = openFullstackRuntimeTest(root, "dispatcher-claim-failure-session");
