@@ -67,7 +67,7 @@ import {
 import { isSafeCtoExecutionId, isSafeCtoRunId, readCtoStatePinned } from "./cto/state.js";
 import { parseCtoSliceMarker } from "./cto/slice-gate.js";
 import { openCtoRuntimeAccess, type CtoRuntimeAccessFacade } from "./cto/runtime-access.js";
-import { issueCtoRuntimeSessionAuthority, revokeCtoRuntimeSessionAuthority, type CtoRuntimeSessionAuthority } from "./cto/session-authority.js";
+import { ctoRuntimeSessionAuthorityForContext, issueCtoRuntimeSessionAuthority, revokeCtoRuntimeSessionAuthority, type CtoRuntimeSessionAuthority } from "./cto/session-authority.js";
 import { readCurrentExecutionClaim } from "./specification/claims.js";
 import {
   persistDoWorkSpecificationConformance,
@@ -2269,6 +2269,7 @@ function currentTeamSessionRuntimeBinding(pi: object, ctx: unknown): TeamSession
   const currentSession = current ? teamCellSession(current) : null;
   if (!current || current.state !== "active" || !identity || !currentSession || !sameHostSession(currentSession, identity)
     || !current.registryContext || !current.runtimeAuthority || !current.runtimeAccess
+    || ctoRuntimeSessionAuthorityForContext(current.registryContext) !== current.runtimeAuthority
     || current.root === undefined || current.rootDev === undefined || current.rootIno === undefined
     || hostContextRootIssue(ctx, current.root, current.rootDev, current.rootIno) !== null) return null;
   try {
