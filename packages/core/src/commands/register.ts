@@ -332,6 +332,11 @@ function bindCommandContextIdentity(slot: CommandActivationSlot, cwd: string, ct
   return identity && slot.sessionManager === undefined ? { ...slot, ...identity } : slot;
 }
 
+function isExplicitWorkerSession(ctx: unknown): boolean {
+  if (!ctx || typeof ctx !== "object") return false;
+  try { return (ctx as { hasUI?: unknown }).hasUI === false; } catch { return false; }
+}
+
 function closeCommandOwnerActivation(pi: ExtensionAPI, event: unknown, ctx: unknown): void {
   const state = commandOwnerStates.get(pi as object);
   if (!state) return;
@@ -366,6 +371,7 @@ function installCommandOwnerShutdown(pi: ExtensionAPI): void {
   state.shutdownRegistered = true;
   try {
     pi.on("session_shutdown", (event: unknown, ctx: unknown) => {
+      if (isExplicitWorkerSession(ctx)) return;
       closeCommandOwnerActivation(pi, event, ctx);
     });
   } catch (error) {
@@ -786,6 +792,10 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 
   try {
     pi.on("session_start", (_event: unknown, ctx: unknown) => {
+      // Worker/subagent sessions load the extension too, but must never race
+      // the interactive main session for command ownership or mount state.
+      // Older hosts omit hasUI and remain compatible as main sessions.
+      if (isExplicitWorkerSession(ctx)) return;
       const cwd = resolveEffectiveCwd(ctx as ExtensionCommandContext);
       if (!cwd) return;
       registerCommands(cwd, ctx, "session");

@@ -761,6 +761,58 @@ test("dynamic team activation ignores worker session starts and keeps one main b
   }
 });
 
+test("workflow command lifecycle ignores worker-first start and shutdown around the main mount", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-command-worker-first-"));
+  const markerInfo = marker(root);
+  const harness = commandHarness();
+  let cleaned = false;
+  try {
+    registerWorkflowCommands(harness.pi as never, {
+      owner: () => activationOwner("command-worker-first", root, markerInfo.path, markerInfo.sha256),
+      resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd,
+    });
+    assert.equal(harness.sessionStarts.length, 1, "dynamic command registration installs one session-start callback");
+    const sessionManager = {
+      getCwd: () => root,
+      getSessionId: () => "main-session",
+      getSessionFile: () => join(root, "main-session.jsonl"),
+      getSessionGeneration: () => "generation-main",
+    };
+    const workerContext = { cwd: root, hasUI: false, sessionManager };
+    const mainContext = { cwd: root, hasUI: true, sessionManager };
+    const dispatchStart = (ctx: unknown): void => {
+      for (const handler of [...harness.sessionStarts]) handler({}, ctx);
+    };
+    const dispatchShutdown = (ctx: unknown): void => {
+      for (const handler of [...harness.sessionShutdowns]) handler({}, ctx);
+    };
+
+    dispatchStart(workerContext);
+    assert.equal(workflowOwnerFor(root, "workflow_registration"), undefined, "worker-first start claims no owner");
+    assert.equal(harness.commands.size, 0, "worker-first start mounts no commands");
+    assert.equal(harness.sessionShutdowns.length, 0, "worker-first start installs no shutdown owner");
+
+    dispatchStart(mainContext);
+    const mountedCount = harness.commands.size;
+    assert.ok(mountedCount > 0, "main start mounts the workflow commands");
+    assert.ok(workflowOwnerFor(root, "workflow_registration"), "main start claims the workflow owner");
+    assert.equal(harness.sessionShutdowns.length, 1, "main mount installs one shutdown owner");
+
+    dispatchStart(workerContext);
+    assert.equal(harness.commands.size, mountedCount, "later worker start does not remount commands");
+    dispatchShutdown(workerContext);
+    assert.ok(workflowOwnerFor(root, "workflow_registration"), "worker shutdown cannot dispose the main mount");
+    assert.equal(harness.commands.size, mountedCount, "worker shutdown leaves main commands live");
+
+    dispatchShutdown(mainContext);
+    cleaned = true;
+    assert.equal(workflowOwnerFor(root, "workflow_registration"), undefined, "exact main shutdown releases the command owner");
+  } finally {
+    if (!cleaned) dispatchShutdown({ cwd: root, hasUI: true, sessionManager: { getCwd: () => root, getSessionId: () => "main-session", getSessionFile: () => join(root, "main-session.jsonl"), getSessionGeneration: () => "generation-main" } });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("CTO registrar rejects reentrant mounting and honors explicit cwd", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-cto-owner-"));
   try {
