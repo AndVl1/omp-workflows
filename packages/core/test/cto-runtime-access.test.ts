@@ -12,6 +12,10 @@ import {
 } from "../src/registry/owner.js";
 import {
   CtoRuntimeAccessError,
+  assertCtoRuntimeAccessFacadeLive,
+  createCtoRuntimeAccessGuardedView,
+  isCtoRuntimeAccessFacade,
+  type CtoRuntimeAccessFacade,
   MAX_RUNTIME_ACCESS_INTERVAL_MS,
   MAX_RUNTIME_ACCESS_PROVIDERS,
   MAX_RUNTIME_ACCESS_SCHEDULERS,
@@ -20,6 +24,7 @@ import {
   registerCtoRuntimeAccessProvider,
 } from "../src/cto/runtime-access.js";
 import { issueCtoRuntimeSessionAuthority, revokeCtoRuntimeSessionAuthority } from "../src/cto/session-authority.js";
+import { openCtoRuntimeProofAuthority, revokeCtoRuntimeProofAuthority, signCtoRuntimeProof, verifyCtoRuntimeProof } from "../src/cto/proof-authority.js";
 import { ctoRuntimeRunInitialIdentityDigest, mintCtoRuntimeRunOrigin, newCtoState, readCtoState, writeCtoRuntimeStateProof, writeCtoState } from "../src/cto/state.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import type { TeamPlan } from "../src/cto/types.js";
@@ -111,6 +116,34 @@ function assertRevoked(action: () => unknown): void {
   assert.throws(action, (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "activation_revoked");
 }
 
+test("opaque proof authority binds allowed domains to the live registry claim", () => {
+  const root = makeProject();
+  try {
+    const activation = activationFor(root);
+    const pinned = PinnedProjectRoot.open(root);
+    assert.ok(pinned);
+    if (!pinned) throw new Error("test root could not be pinned");
+    try {
+      const authority = openCtoRuntimeProofAuthority(activation.registry_context, pinned);
+      assert.ok(authority);
+      if (!authority) return;
+      const payload = JSON.stringify({ schema: 1, identity: "test" });
+      const proof = signCtoRuntimeProof(authority, "telegram-mapping-v1", payload);
+      assert.match(proof ?? "", /^[0-9a-f]{64}$/u);
+      assert.equal(verifyCtoRuntimeProof(authority, "telegram-mapping-v1", payload, proof!), true);
+      assert.equal(verifyCtoRuntimeProof(authority, "telegram-mapping-v1", payload + "x", proof!), false);
+      assert.equal(signCtoRuntimeProof(authority, "not-allowed" as never, payload), null);
+      revokeCtoRuntimeProofAuthority(authority);
+      assert.equal(verifyCtoRuntimeProof(authority, "telegram-mapping-v1", payload, proof!), false);
+    } finally {
+      pinned.close();
+      releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runtime scheduler rejects unsafe intervals, caps live timers, and reuses stopped slots", () => {
   const root = makeProject();
   try {
@@ -183,6 +216,30 @@ test("shared session authority isolates facade close and revokes attached peers"
       pinnedRoot.close();
       releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("core guarded views reject inherited overrides and close after identity loss", () => {
+  const root = makeProject();
+  try {
+    const opened = openAccess(root);
+    let identityLive = true;
+    const guarded = createCtoRuntimeAccessGuardedView(opened.access, () => {
+      if (!identityLive) throw new Error("dispatcher identity is stale");
+    });
+    assert.equal(isCtoRuntimeAccessFacade(guarded), true);
+    assert.doesNotThrow(() => guarded.assertLive());
+    const inherited = Object.create(opened.access) as CtoRuntimeAccessFacade;
+    Object.defineProperty(inherited, "assertLive", { value: () => undefined });
+    assert.equal(isCtoRuntimeAccessFacade(inherited), false);
+    assert.throws(() => assertCtoRuntimeAccessFacadeLive(inherited), /authenticated facade/);
+    identityLive = false;
+    assert.throws(() => guarded.findActiveRun(), /identity is stale/);
+    assert.doesNotThrow(() => guarded.close());
+    assert.doesNotThrow(() => guarded.close());
+    releaseWorkflowOwners(opened.activation.release_token, ["workflow_registration", "workflow_tools"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -26,6 +26,7 @@
  */
 
 import { TextDecoder } from "node:util";
+import { createHash } from "node:crypto";
 import { PinnedProjectRoot, PinnedRootError } from "../specification/pinned-root.js";
 import type { ChannelDirection, ChannelProfile } from "./types.js";
 
@@ -58,7 +59,7 @@ export interface NormalizedEscalationConfig extends Record<string, unknown> {
 export type EscalationConfigInvalidCode = "malformed" | "invalid_shape" | "duplicate_id" | "duplicate_primary" | "invalid_primary_direction";
 export type EscalationConfigLoadResult =
   | { status: "absent" }
-  | { status: "valid"; config: NormalizedEscalationConfig }
+  | { status: "valid"; config: NormalizedEscalationConfig; config_sha256?: string }
   | { status: "invalid"; code: EscalationConfigInvalidCode; reason: string };
 export type ChannelNormalizationResult =
   | { status: "absent" }
@@ -249,7 +250,10 @@ export function loadEscalationConfigRaw(cwd: string, options: LoadEscalationConf
   try {
     try {
       const read = root.readFile(".omp/escalation.json", { maxBytes: MAX_ESCALATION_CONFIG_BYTES });
-      return parseEscalationConfigRaw(read.bytes);
+      const parsed = parseEscalationConfigRaw(read.bytes);
+      return parsed.status === "valid"
+        ? { ...parsed, config_sha256: createHash("sha256").update(read.bytes).digest("hex") }
+        : parsed;
     } catch (error) {
       if (error instanceof PinnedRootError && error.code === "not_found") return { status: "absent" };
       if (error instanceof PinnedRootError && error.code === "not_regular") throw new EscalationConfigError("not_regular", "escalation.json must be a regular file", { cause: error });

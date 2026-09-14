@@ -10,6 +10,8 @@ import {
   type WorkflowOwnerIdentity,
 } from "../src/registry/owner.js";
 import { CtoRuntimeAccessError, openCtoRuntimeAccess } from "../src/cto/runtime-access.js";
+import { issueCtoRuntimeSessionAuthority } from "../src/cto/session-authority.js";
+import { requireRegistryContext } from "../src/registry/owner.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 
 const MARKER = '{"schema_version":1,"bundle_id":"@andvl1/omp-workflows-fullstack","entrypoint":"dist/index.js"}\n';
@@ -44,8 +46,18 @@ function ownerFor(root: string): WorkflowOwnerIdentity {
 function openAccess(root: string) {
   const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], ownerFor(root));
   if (activation.ok !== true) throw new Error(activation.error);
-  const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "main-session", main: true }, root);
-  if (opened.ok !== true) throw new Error(opened.error);
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  if (!pinnedRoot) throw new Error("test root could not be pinned");
+  const sessionManager = Object.freeze({});
+  const authority = issueCtoRuntimeSessionAuthority(
+    activation.registry_context,
+    { canonical_root: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino },
+    { sessionManager, sessionId: "main-session" },
+    () => { requireRegistryContext(activation.registry_context, pinnedRoot!.canonical_root, "workflow_tools"); },
+  );
+  pinnedRoot.close();
+  const opened = openCtoRuntimeAccess(activation.registry_context, authority, root);
+  if (opened.ok !== true) { pinnedRoot.close(); throw new Error(opened.error); }
   return { activation, access: opened.access };
 }
 

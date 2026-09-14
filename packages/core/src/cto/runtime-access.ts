@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
   requireRegistryContext,
@@ -40,6 +40,7 @@ import {
   writeCtoStateLocked,
 } from "./state.js";
 export type {
+  CtoCurrentOutboxDeliveryInput as CtoRuntimeOutboxDeliveryInput,
   CtoRunDeliveryCandidatesRead,
   CtoRunDeliveryIndexEntry,
   CtoRunDeliveryIndexPage,
@@ -64,6 +65,16 @@ import {
   type CtoRuntimeSessionAuthority,
 } from "./session-authority.js";
 export { ctoRuntimeSessionAuthorityForContext };
+export {
+  assertCtoRuntimeProofAuthorityLive,
+  isCtoRuntimeProofAuthority,
+  openCtoRuntimeProofAuthority,
+  revokeCtoRuntimeProofAuthority,
+  signCtoRuntimeProof,
+  verifyCtoRuntimeProof,
+  MAX_CTO_RUNTIME_PROOF_PAYLOAD_BYTES,
+} from "./proof-authority.js";
+export type { CtoRuntimeProofAuthority, CtoRuntimeProofDomain } from "./proof-authority.js";
 
 const RUNTIME_CONTEXT_BRAND = Symbol("omp.cto.runtime-access-context");
 const SENSITIVE_PROJECTION_KEY = /(?:^|_)(?:answer|body|user|by|raw|token)(?:_|$)/iu;
@@ -127,6 +138,7 @@ export type CtoRuntimeEscalationChannelSnapshot =
   | { readonly status: "invalid"; readonly code: EscalationConfigInvalidCode; readonly reason: string }
   | {
     readonly status: "valid";
+    readonly config_sha256: string;
     readonly kinds: readonly string[];
     readonly projections: Readonly<Record<string, CtoRuntimeEscalationChannelProjection>>;
   };
@@ -134,6 +146,7 @@ export type CtoRuntimeEscalationChannelSnapshot =
 export interface CtoRuntimeAccessFacade {
   findActiveRun(): CtoRuntimeActiveRunProjection | null;
   readState(runId: string): Readonly<Record<string, unknown>> | null;
+  hasValidStateProof(runId: string): boolean;
   stateDirectory(runId: string): string;
   assertProjectRoot(projectRoot: string): void;
   ensureStandbyRun(): string;
@@ -184,6 +197,7 @@ type RuntimeCell = {
 };
 
 const runtimeCells = new WeakMap<object, RuntimeCell>();
+const guardedRuntimeCells = new WeakMap<object, RuntimeCell>();
 const deliveryCapabilities = new WeakMap<object, RuntimeCell>();
 export const MAX_RUNTIME_ACCESS_SCHEDULERS = 8;
 export const MIN_RUNTIME_ACCESS_INTERVAL_MS = 10;
@@ -205,7 +219,56 @@ export function isCtoRuntimeDeliveryCapability(value: unknown): boolean {
 
 function runtimeCellForFacade(value: unknown): RuntimeCell | null {
   if (!value || typeof value !== "object") return null;
-  return runtimeCells.get(value) ?? null;
+  return runtimeCells.get(value) ?? guardedRuntimeCells.get(value) ?? null;
+}
+
+/**
+ * Build a null-prototype, core-branded facade that adds a host identity guard
+ * without inheriting or consulting any caller-controlled properties.
+ */
+export function createCtoRuntimeAccessGuardedView(
+  genuine: CtoRuntimeAccessFacade,
+  assertIdentityLive: () => void,
+): CtoRuntimeAccessFacade {
+  const cell = genuine && typeof genuine === "object" ? runtimeCells.get(genuine) : undefined;
+  if (!cell || typeof assertIdentityLive !== "function") {
+    throw new CtoRuntimeAccessError("runtime_access_invalid", "a genuine CTO runtime facade and identity guard are required");
+  }
+  requireLive(cell);
+  assertIdentityLive();
+  const guarded = Object.create(null) as CtoRuntimeAccessFacade;
+  const methodNames = [
+    "findActiveRun", "readState", "hasValidStateProof", "stateDirectory", "assertProjectRoot", "ensureStandbyRun",
+    "registerRunOrigin", "createRun", "readActiveDeliveryCandidates", "readCompletedDeliveryCandidates",
+    "readDeliveryIndexPage", "readCompletedDeliveryIndexPage", "markDeliveryPending", "publishOutboxDelivery",
+    "recordOutboxDeliveryObligation", "readOutboxDeliveryObligations", "removeOutboxDeliveryObligation",
+    "acknowledgeDelivery", "currentOutboxDeliveryStatus", "listEscalationChannelKinds",
+    "resolveEscalationChannelSnapshot", "resolveEscalationChannelConfigs", "buildDigest", "withRunTransaction",
+    "startScheduler", "close", "assertLive",
+  ] as const satisfies readonly (keyof CtoRuntimeAccessFacade)[];
+  const invoke = (name: keyof CtoRuntimeAccessFacade): ((...args: unknown[]) => unknown) => {
+    return (...args: unknown[]): unknown => {
+      const method = genuine[name];
+      if (typeof method !== "function") throw new CtoRuntimeAccessError("runtime_access_invalid", `runtime facade method '${String(name)}' is unavailable`);
+      if (name === "close") return Reflect.apply(method as (...values: unknown[]) => unknown, genuine, args);
+      assertIdentityLive();
+      const result = Reflect.apply(method as (...values: unknown[]) => unknown, genuine, args);
+      if (result && typeof result === "object" && typeof (result as { then?: unknown }).then === "function") {
+        return (result as Promise<unknown>).then(
+          (value) => { assertIdentityLive(); return value; },
+          (error) => { assertIdentityLive(); throw error; },
+        );
+      }
+      assertIdentityLive();
+      return result;
+    };
+  };
+  for (const name of methodNames) {
+    Object.defineProperty(guarded, name, { enumerable: false, configurable: false, writable: false, value: invoke(name) });
+  }
+  Object.freeze(guarded);
+  guardedRuntimeCells.set(guarded as object, cell);
+  return guarded;
 }
 
 /** Validates a genuine runtime facade or guarded derived wrapper. */
@@ -468,7 +531,9 @@ function channelSnapshot(root: PinnedProjectRoot): Readonly<CtoRuntimeEscalation
   const kinds = channelKindNamesFromConfig(loaded.config);
   const projections: Record<string, CtoRuntimeEscalationChannelProjection> = Object.create(null) as Record<string, CtoRuntimeEscalationChannelProjection>;
   for (const kind of kinds) projections[kind] = channelConfigsForNormalizedConfig(loaded.config, kind);
-  return Object.freeze({ status: "valid", kinds, projections: Object.freeze(projections) });
+  const config_sha256 = loaded.config_sha256
+    ?? createHash("sha256").update(JSON.stringify(loaded.config), "utf8").digest("hex");
+  return Object.freeze({ status: "valid", config_sha256, kinds, projections: Object.freeze(projections) });
 }
 
 function channelConfigsForKind(root: PinnedProjectRoot, kind: string): readonly Readonly<Record<string, unknown>>[] {
@@ -520,6 +585,15 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
         if (state === null) return null;
         const projection = detachedProjection(state) as unknown as Readonly<Record<string, unknown>>;
         return projection;
+      },
+    },
+    hasValidStateProof: {
+      enumerable: false,
+      value: (runId: string): boolean => {
+        requireLive(cell);
+        requireSafeRunId(runId);
+        const state = readCtoStatePinned(runId, cell.root);
+        return state !== null && hasValidCtoRuntimeStateProofPinned(cell.root, state);
       },
     },
     stateDirectory: {
