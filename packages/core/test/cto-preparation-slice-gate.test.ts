@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -12,7 +12,8 @@ import {
 import { assertCtoSliceDispatchable as assertCtoSliceDispatchablePinned } from "../src/cto/slice-gate.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { readCtoState } from "../src/cto/state.js";
-import { openWorkflowActivation, releaseWorkflowOwners, type WorkflowOwnerIdentity } from "../src/registry/owner.js";
+import { openWorkflowActivation, releaseWorkflowOwners, requireRegistryContext, type WorkflowOwnerIdentity } from "../src/registry/owner.js";
+import { issueCtoRuntimeSessionAuthority } from "../src/cto/session-authority.js";
 import { openCtoRuntimeAccess } from "../src/cto/runtime-access.js";
 
 function assertCtoSliceDispatchable(state: Parameters<typeof assertCtoSliceDispatchablePinned>[0], opts: { sliceId: string; root: string; markerRunId?: string }) {
@@ -44,7 +45,15 @@ function prepareWithRuntime(root: string, input: Parameters<typeof prepareCtoSpe
   assert.equal(activation.ok, true);
   if (!activation.ok) throw new Error(activation.error);
   try {
-    const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "preparation-slice-test", main: true }, root);
+    const runtimeRoot = realpathSync(root);
+    const runtimeIdentity = statSync(runtimeRoot);
+    const authority = issueCtoRuntimeSessionAuthority(
+      activation.registry_context,
+      { canonical_root: runtimeRoot, dev: runtimeIdentity.dev, ino: runtimeIdentity.ino },
+      { sessionManager: Object.freeze({}), sessionId: "preparation-slice-test" },
+      () => { requireRegistryContext(activation.registry_context, runtimeRoot, "workflow_tools"); },
+    );
+    const opened = openCtoRuntimeAccess(activation.registry_context, authority, root);
     assert.equal(opened.ok, true);
     if (!opened.ok) throw new Error(opened.error);
     return prepareCtoSpecificationPreparationRaw(root, input, { runtimeAccess: opened.access, sessionId: "preparation-slice-test" });

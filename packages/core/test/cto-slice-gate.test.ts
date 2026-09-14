@@ -8,7 +8,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -29,7 +29,8 @@ import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { applyAppendWaveTransition, applyFinishWaveTransition } from "../src/cto/state.js";
 import { canonicalCtoDoDDigest } from "../src/cto/dod.js";
 import { writeState } from "../src/engine/state.js";
-import { openWorkflowActivation, releaseWorkflowOwners, type WorkflowOwnerIdentity } from "../src/registry/owner.js";
+import { openWorkflowActivation, releaseWorkflowOwners, requireRegistryContext, type WorkflowOwnerIdentity } from "../src/registry/owner.js";
+import { issueCtoRuntimeSessionAuthority } from "../src/cto/session-authority.js";
 import { openCtoRuntimeAccess } from "../src/cto/runtime-access.js";
 
 function replaceState(target: CtoState, next: CtoState): CtoState {
@@ -124,7 +125,15 @@ function validRun(runId = "run-1", sliceId = "slice-1", teamId = "lead-a"): RunF
   if (!persisted || !writeCtoRuntimeStateProof(runtimeRoot, persisted)) throw new Error("slice-gate fixture runtime proof could not be written");
   const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], ownerFor(root));
   if (!activation.ok) throw new Error(activation.error);
-  const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "slice-gate-test-session", main: true }, root);
+  const canonicalRoot = realpathSync(root);
+  const rootIdentity = statSync(canonicalRoot);
+  const authority = issueCtoRuntimeSessionAuthority(
+    activation.registry_context,
+    { canonical_root: canonicalRoot, dev: rootIdentity.dev, ino: rootIdentity.ino },
+    { sessionManager: Object.freeze({}), sessionId: "slice-gate-test-session" },
+    () => { requireRegistryContext(activation.registry_context, canonicalRoot, "workflow_tools"); },
+  );
+  const opened = openCtoRuntimeAccess(activation.registry_context, authority, root);
   if (!opened.ok) {
     releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
     throw new Error(opened.error);

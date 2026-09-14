@@ -654,9 +654,13 @@ function persistPreparationTransaction(
     if (current.state_revision !== state.state_revision) {
       throw new Error(`CTO preparation state changed during transaction (expected ${String(state.state_revision)}, got ${String(current.state_revision)})`);
     }
-    next = postimage;
     preCommit?.();
     tx.writeState(postimage);
+    // Capture the transaction-owned object, not the caller's preimage.
+    // The authenticated writer advances this exact staged object after the
+    // callback returns, so the returned image carries the committed revision
+    // into the next logical preparation step without a second write.
+    next = tx.readState();
   });
   if (!next) throw new Error("CTO preparation transaction did not produce a persisted state image");
   return next;
