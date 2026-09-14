@@ -64,6 +64,7 @@ export type {
 export { generateReport, DEFECT_FLOORS, UX_DIMENSIONS, AGENT_DIMENSIONS, DEFECT_SEVERITIES } from './report.js';
 export type {
   UxE2eReport,
+  ReportChildSession,
   ReportInput,
   ReportSessionMeta,
   ReportSelectors,

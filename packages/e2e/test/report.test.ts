@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { test } from 'node:test';
 
 import {
@@ -758,4 +758,53 @@ test('report: final directory identity is rechecked after the helper walk', () =
   assert.equal(swapped, true);
   assert.equal(readFileSync(join(attackerDir, 'attacker-sentinel'), 'utf8'), 'helper sentinel');
   assert.equal(existsSync(join(attackerDir, 'transcript.jsonl')), false);
+});
+
+test('report suite: deterministic child sessions aggregate and copy evidence per child', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-readable-spec-workflow-'));
+  const first = makeSessionDir();
+  const second = makeSessionDir();
+  renameSync(first, join(suite, 'session-a'));
+  renameSync(second, join(suite, 'session-b'));
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-suite-md-'));
+  try {
+    const result = generateReport(suite, BASE_INPUT, { mdDir, copyEvidence: true });
+    const report = JSON.parse(readFileSync(result.jsonPath, 'utf8')) as UxE2eReport;
+    const children = report.session.child_sessions ?? [];
+    assert.deepEqual(children.map(child => basename(child.scratch_dir)), ['session-a', 'session-b']);
+    assert.equal(children.length, 2);
+    assert.match(children[0]!.evidence[0] ?? '', /evidence\/session-a\//u);
+    assert.match(children[1]!.evidence[0] ?? '', /evidence\/session-b\//u);
+    assert.equal(new Set(report.evidence).size, report.evidence.length);
+    assert.match(readFileSync(result.mdPath, 'utf8'), /## Child sessions/u);
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+test('report suite: symlink and malformed children are rejected instead of omitted', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-readable-spec-workflow-'));
+  const target = makeSessionDir();
+  symlinkSync(target, join(suite, 'session-link'), 'dir');
+  assert.throws(() => generateReport(suite, BASE_INPUT), /must not be a symlink/u);
+  unlinkSync(join(suite, 'session-link'));
+  rmSync(target, { recursive: true, force: true });
+  mkdirSync(join(suite, 'malformed', '.work-state', 'ux-e2e'), { recursive: true });
+  assert.throws(() => generateReport(suite, BASE_INPUT), /malformed suite child malformed/u);
+  rmSync(suite, { recursive: true, force: true });
+});
+
+test('report suite: PASS requires readiness for every child before root output', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-readable-spec-workflow-'));
+  const ready = makeSessionDir();
+  const incomplete = makeSessionDir({ completeEvidence: false });
+  renameSync(ready, join(suite, 'ready'));
+  renameSync(incomplete, join(suite, 'incomplete'));
+  try {
+    assert.throws(() => generateReport(suite, BASE_INPUT), /PASS requires/u);
+    assert.equal(existsSync(join(suite, '.work-state', 'ux-e2e', 'report.json')), false);
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+  }
 });

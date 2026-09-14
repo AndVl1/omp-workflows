@@ -210,6 +210,23 @@ export interface ReportScenarioReference {
   readonly transcript?: ScenarioTranscriptExpectations;
 }
 
+export interface ReportChildSession {
+  readonly slug: string;
+  readonly scratch_dir: string;
+  readonly status: 'starting' | 'running' | 'shutdown_failed' | 'stopped' | null;
+  readonly scenario: ReportScenarioReference | null;
+  readonly transcript: string;
+  readonly session_jsonl: string;
+  readonly events_jsonl: string;
+  readonly omp_log: string;
+  readonly evidence: string[];
+  readonly verdict: Verdict;
+  readonly overall: Overall;
+  readonly selectors?: ReportSelectors;
+  readonly workspace?: ReportWorkspaceEvidence;
+  readonly next_action?: ReportNextAction;
+}
+
 export interface ReportSessionMeta {
   readonly slug: string;
   readonly scratch_dir: string;
@@ -230,6 +247,7 @@ export interface ReportSessionMeta {
   readonly selectors?: ReportSelectors;
   readonly workspace?: ReportWorkspaceEvidence;
   readonly next_action?: ReportNextAction;
+  readonly child_sessions?: ReportChildSession[];
 }
 
 export interface UxE2eReport {
@@ -1141,6 +1159,24 @@ function renderMarkdown(report: UxE2eReport): string {
     const action = report.session.next_action;
     lines.push(`- next action: \`${sanitizeMarkdownInline(action.kind)}\`${action.command !== null ? ` — \`${sanitizeMarkdownInline(action.command)}\`` : ''}${action.reason !== null ? ` — ${sanitizeMarkdownInline(action.reason)}` : ''}`);
   }
+  if (report.session.child_sessions !== undefined) {
+    lines.push('## Child sessions');
+    lines.push('');
+    for (const child of report.session.child_sessions) {
+      lines.push('### ' + sanitizeMarkdownInline(child.slug));
+      lines.push('');
+      lines.push('- status: `' + sanitizeMarkdownInline(child.status ?? 'unknown') + '`');
+      lines.push('- verdict: `' + sanitizeMarkdownInline(child.verdict) + '`');
+      lines.push('- scratch dir: `' + sanitizeMarkdownInline(child.scratch_dir) + '`');
+      lines.push('- transcript: `' + sanitizeMarkdownInline(child.transcript) + '`');
+      if (child.scenario !== null) lines.push('- scenario: `' + sanitizeMarkdownInline(child.scenario.id) + '`');
+      if (child.evidence.length > 0) {
+        lines.push('- evidence:');
+        for (const evidence of child.evidence) lines.push('  - `' + sanitizeMarkdownInline(evidence) + '`');
+      }
+      lines.push('');
+    }
+  }
   if (report.session.task_prompt !== null) {
     lines.push('');
     lines.push('### Task prompt');
@@ -1267,11 +1303,20 @@ function todayStamp(): string {
  * @param sessionDir Scratch project directory (the `<scratch>` in the
  *                   contract — session.json lives under its `.work-state`).
  */
-export function generateReport(
+interface InternalGenerateReportOptions extends GenerateReportOptions {
+  readonly writeOutputs?: boolean;
+  readonly evidenceTargetDir?: string;
+}
+
+interface InternalGenerateReportResult extends GenerateReportResult {
+  readonly report: UxE2eReport;
+}
+
+function generateSingleReport(
   sessionDir: string,
   input: ReportInput,
-  opts: GenerateReportOptions = {},
-): GenerateReportResult {
+  opts: InternalGenerateReportOptions = {},
+): InternalGenerateReportResult {
   const scratchDir = resolve(sessionDir);
   const warnings: string[] = [];
   const rawSession = readSessionMeta(scratchDir);
@@ -1368,14 +1413,14 @@ export function generateReport(
   const sessionShutdownError = rawShutdownError(rawSession);
 
   const mdDir = resolve(opts.mdDir ?? join(process.cwd(), 'vibe-report'));
-  const reportDestination = pinOrCreateDirectory(mdDir);
-  if (reportDestination === null) {
+  const reportDestination = opts.writeOutputs === false ? null : pinOrCreateDirectory(mdDir);
+  if (opts.writeOutputs !== false && reportDestination === null) {
     throw new Error('ux-e2e: report destination root must be a stable non-symlink directory');
   }
   try {
     let evidence = collectEvidence(candidates);
     if (opts.copyEvidence === true) {
-      evidence = copyEvidence(evidence, join(mdDir, 'evidence', slug), scratchDir);
+      evidence = copyEvidence(evidence, opts.evidenceTargetDir ?? join(mdDir, 'evidence', slug), scratchDir);
     }
     const report = sanitizeOutput({
       type: 'ux-e2e',
@@ -1413,6 +1458,9 @@ export function generateReport(
     }, '') as UxE2eReport;
 
     const jsonPath = join(stateDir, 'report.json');
+    if (opts.writeOutputs === false) {
+      return { jsonPath, mdPath: '', warnings, report };
+    }
     const stateDestination = pinOrCreateDirectory(stateDir);
     if (stateDestination === null) {
       throw new Error('ux-e2e: session report directory must be a stable non-symlink directory');
@@ -1431,15 +1479,203 @@ export function generateReport(
 
     const mdFilename = `${slug}-ux-e2e-${todayStamp()}.md`;
     const mdPath = join(mdDir, mdFilename);
+    if (reportDestination === null) throw new Error('ux-e2e: report destination root is unavailable');
     if (!writePinnedFile(reportDestination, mdFilename, Buffer.from(renderMarkdown(report)))) {
       throw new Error('ux-e2e: failed to write markdown inside the report destination');
     }
-    return { jsonPath, mdPath, warnings };
+    return { jsonPath, mdPath, warnings, report };
   } finally {
     try {
-      closeSync(reportDestination.fd);
+      if (reportDestination !== null) closeSync(reportDestination.fd);
     } catch {
       /* Ignore cleanup failures. */
     }
   }
+}
+
+
+const MAX_SUITE_CHILDREN = 64;
+
+interface SuiteChild {
+  readonly name: string;
+  readonly scratchDir: string;
+}
+
+function existingPath(path: string): { readonly isDirectory: boolean; readonly isSymbolicLink: boolean; readonly isFile: boolean } | null {
+  try {
+    const info = lstatSync(path);
+    return { isDirectory: info.isDirectory(), isSymbolicLink: info.isSymbolicLink(), isFile: info.isFile() };
+  } catch {
+    return null;
+  }
+}
+
+/** Discover immediate, real session scratches under a suite root. */
+function discoverSuiteChildren(suiteRoot: string): SuiteChild[] | null {
+  const rootSession = existingPath(join(suiteRoot, '.work-state', 'ux-e2e', 'session.json'));
+  if (rootSession !== null) return null;
+  const root = pinDirectory(suiteRoot);
+  if (root === null) return null;
+  const children: SuiteChild[] = [];
+  try {
+    if (!pinnedDirectoryIsStable(root)) throw new Error('ux-e2e: suite root changed during child enumeration');
+    const names: string[] = [];
+    const handle = opendirSync(root.lexicalPath);
+    try {
+      for (;;) {
+        const entry = handle.readSync();
+        if (entry === null) break;
+        if (entry.isSymbolicLink()) throw new Error('ux-e2e: suite child ' + entry.name + ' must not be a symlink');
+        if (entry.isDirectory()) names.push(entry.name);
+      }
+    } finally {
+      try { handle.closeSync(); } catch { /* best effort */ }
+    }
+    names.sort();
+    for (const name of names) {
+      if (children.length >= MAX_SUITE_CHILDREN) throw new Error('ux-e2e: suite has more than ' + String(MAX_SUITE_CHILDREN) + ' child sessions');
+      if (!safeFilenameSegment(name)) throw new Error('ux-e2e: suite child name is unsafe: ' + name);
+      const child = join(suiteRoot, name);
+      const childState = join(child, '.work-state', 'ux-e2e');
+      const stateInfo = existingPath(childState);
+      if (stateInfo === null) continue;
+      if (stateInfo.isSymbolicLink || !stateInfo.isDirectory) throw new Error('ux-e2e: malformed suite child ' + name + ' state directory');
+      const sessionPath = join(childState, 'session.json');
+      const sessionInfo = existingPath(sessionPath);
+      if (sessionInfo === null || sessionInfo.isSymbolicLink || !sessionInfo.isFile) {
+        throw new Error('ux-e2e: malformed suite child ' + name + ' session metadata');
+      }
+      const raw = readSessionMeta(child);
+      if (raw.schema_version !== 2) throw new Error('ux-e2e: malformed suite child ' + name + ' session metadata');
+      children.push({ name, scratchDir: resolve(child) });
+    }
+    if (!pinnedDirectoryIsStable(root)) throw new Error('ux-e2e: suite root changed during child enumeration');
+    return children.length === 0 ? null : children;
+  } finally {
+    closePinnedDirectory(root);
+  }
+}
+
+function childSessionEntry(report: UxE2eReport, evidence: readonly string[]): ReportChildSession {
+  return {
+    slug: report.session.slug,
+    scratch_dir: report.session.scratch_dir,
+    status: report.session.status,
+    scenario: report.session.scenario,
+    transcript: report.session.transcript,
+    session_jsonl: report.session.session_jsonl,
+    events_jsonl: report.session.events_jsonl,
+    omp_log: report.session.omp_log,
+    evidence: [...evidence],
+    verdict: report.verdict,
+    overall: report.overall,
+    ...(report.session.selectors !== undefined ? { selectors: report.session.selectors } : {}),
+    ...(report.session.workspace !== undefined ? { workspace: report.session.workspace } : {}),
+    ...(report.session.next_action !== undefined ? { next_action: report.session.next_action } : {}),
+  };
+}
+
+function writeSuiteReport(
+  suiteRoot: string,
+  mdDir: string,
+  report: UxE2eReport,
+  warnings: readonly string[],
+): GenerateReportResult {
+  const reportRoot = pinOrCreateDirectory(mdDir);
+  if (reportRoot === null) throw new Error('ux-e2e: report destination root must be a stable non-symlink directory');
+  try {
+    const stateDir = join(suiteRoot, '.work-state', 'ux-e2e');
+    const stateRoot = pinOrCreateDirectory(stateDir);
+    if (stateRoot === null) throw new Error('ux-e2e: suite report directory must be a stable non-symlink directory');
+    try {
+      const jsonPath = join(stateDir, 'report.json');
+      if (!writePinnedFile(stateRoot, 'report.json', Buffer.from(JSON.stringify(report, null, 2) + '\n'))) {
+        throw new Error('ux-e2e: failed to write suite report.json');
+      }
+      const mdFilename = report.session.slug + '-ux-e2e-' + todayStamp() + '.md';
+      const mdPath = join(mdDir, mdFilename);
+      if (!writePinnedFile(reportRoot, mdFilename, Buffer.from(renderMarkdown(report)))) {
+        throw new Error('ux-e2e: failed to write suite markdown report');
+      }
+      return { jsonPath, mdPath, warnings: [...warnings] };
+    } finally {
+      closeSync(stateRoot.fd);
+    }
+  } finally {
+    closeSync(reportRoot.fd);
+  }
+}
+
+function generateSuiteReport(
+  suiteRoot: string,
+  children: readonly SuiteChild[],
+  input: ReportInput,
+  opts: GenerateReportOptions,
+): GenerateReportResult {
+  const childReports: Array<{ readonly child: SuiteChild; readonly result: InternalGenerateReportResult }> = [];
+  const warnings: string[] = [];
+  for (const child of children) {
+    const result = generateSingleReport(child.scratchDir, input, { ...opts, copyEvidence: false, writeOutputs: false });
+    childReports.push({ child, result });
+    warnings.push(...result.warnings.map(warning => child.name + ': ' + warning));
+  }
+  const mdDir = resolve(opts.mdDir ?? join(process.cwd(), 'vibe-report'));
+  const childEntries: ReportChildSession[] = [];
+  const aggregateEvidence: string[] = [];
+  for (const { child, result } of childReports) {
+    const childEvidence = opts.copyEvidence === true
+      ? copyEvidence(result.report.evidence, join(mdDir, 'evidence', child.name), child.scratchDir)
+      : [...result.report.evidence];
+    childEntries.push(childSessionEntry(result.report, childEvidence));
+    aggregateEvidence.push(...childEvidence);
+  }
+  const first = childReports[0]?.result.report;
+  if (first === undefined) throw new Error('ux-e2e: suite has no child sessions');
+  const rootSlug = basename(resolve(suiteRoot)).replace(/^omp-ux-e2e-/u, '') || 'ux-e2e-suite';
+  if (!safeFilenameSegment(rootSlug)) throw new Error('ux-e2e: suite root slug must be a bounded safe filename segment');
+  const report = sanitizeOutput({
+    type: 'ux-e2e',
+    schema_version: 1,
+    verdict: input.verdict,
+    mode: 'ui',
+    regressions: [...(input.regressions ?? [])],
+    session: {
+      slug: rootSlug,
+      scratch_dir: resolve(suiteRoot),
+      omp_version: 'suite',
+      profile: 'suite',
+      tty: { cols: 0, rows: 0, term: 'unknown' },
+      status: null,
+      started_at: null,
+      stopped_at: null,
+      finished_at: null,
+      shutdown_error: null,
+      task_prompt: null,
+      scenario: null,
+      transcript: '',
+      session_jsonl: '',
+      events_jsonl: '',
+      omp_log: '',
+      child_sessions: childEntries,
+    },
+    steps: first.steps,
+    defects: first.defects,
+    agent_quality: first.agent_quality,
+    overall: first.overall,
+    evidence: aggregateEvidence,
+    generated_at: new Date().toISOString(),
+  }, '') as UxE2eReport;
+  return writeSuiteReport(suiteRoot, mdDir, report, warnings);
+}
+
+export function generateReport(
+  sessionDir: string,
+  input: ReportInput,
+  opts: GenerateReportOptions = {},
+): GenerateReportResult {
+  const suiteRoot = resolve(sessionDir);
+  const children = discoverSuiteChildren(suiteRoot);
+  return children === null
+    ? (() => { const result = generateSingleReport(suiteRoot, input, opts); return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings }; })()
+    : generateSuiteReport(suiteRoot, children, input, opts);
 }
