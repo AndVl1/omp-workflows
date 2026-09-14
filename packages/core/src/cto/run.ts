@@ -505,27 +505,24 @@ function removeReviewPacketTransaction(
   root: string,
   ctoRunId: string,
   pinnedRoot: PinnedProjectRoot,
-  expected?: PinnedRootWriteDescriptor,
+  expected: PinnedRootWriteDescriptor,
 ): void {
   const path = reviewPacketTransactionPath(root, ctoRunId);
   const relativePath = pinnedRoot.relativePath(path);
   if (!relativePath) throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_PATH_INVALID", "review packet transaction path is outside the pinned project root");
   try {
     const current = pinnedRoot.readFile(relativePath, { maxBytes: MAX_REVIEW_PACKET_TRANSACTION_BYTES });
-    const descriptor = expected ?? {
-      path: pinnedRoot.anchorPath(relativePath),
-      relative_path: relativePath,
-      dev: current.dev,
-      ino: current.ino,
-      size: current.bytes.byteLength,
-      sha256: createHash("sha256").update(Buffer.from(current.bytes)).digest("hex"),
-    };
-    if (descriptor.path !== pinnedRoot.anchorPath(relativePath) || descriptor.relative_path !== relativePath) return;
+    const currentDigest = createHash("sha256").update(Buffer.from(current.bytes)).digest("hex");
+    if (expected.path !== pinnedRoot.anchorPath(relativePath)
+      || expected.relative_path !== relativePath
+      || expected.dev !== current.dev
+      || expected.ino !== current.ino
+      || expected.size !== current.bytes.byteLength
+      || expected.sha256 !== currentDigest) return;
     pinnedRoot.removeFileIfMatches(relativePath, {
-      dev: descriptor.dev,
-      ino: descriptor.ino,
-      size: descriptor.size,
-      sha256: descriptor.sha256,
+      dev: expected.dev,
+      ino: expected.ino,
+      sha256: expected.sha256,
     });
   } catch (error) {
     if (!(error instanceof PinnedRootError && error.code === "not_found")) throw error;
@@ -633,6 +630,14 @@ function recoverReviewPacketTransaction(
       throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_INVALID", "review packet transaction write descriptor is invalid");
     }
   }
+  const walDescriptor: PinnedRootWriteDescriptor = {
+    path: pinnedRoot.anchorPath(relativePath),
+    relative_path: relativePath,
+    dev: read.dev,
+    ino: read.ino,
+    size: read.bytes.byteLength,
+    sha256: createHash("sha256").update(Buffer.from(read.bytes)).digest("hex"),
+  };
   const current = reviewPacketImage(pinnedRoot, { cto_run_id: ctoRunId } as ReviewPacket);
   const currentContent = current?.bytes.toString("utf8") ?? null;
   const currentDigest = createHash("sha256").update(currentContent ?? "").digest("hex");
@@ -657,17 +662,17 @@ function recoverReviewPacketTransaction(
       || transaction.postimage_descriptor.relative_path !== transaction.path) {
       throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_CONFLICT", "terminal CTO state references a packet postimage that is missing or no longer owned by its WAL");
     }
-    removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+    removeReviewPacketTransaction(root, ctoRunId, pinnedRoot, walDescriptor);
     return;
   }
   if (before) {
-    removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+    removeReviewPacketTransaction(root, ctoRunId, pinnedRoot, walDescriptor);
     return;
   }
   const constitutionError = reviewPacketConstitutionError(transaction as ReviewPacketPublicationTransaction, pinnedRoot);
   if (constitutionError) {
     if (!restoreReviewPacketPreimage(transaction as ReviewPacketPublicationTransaction, pinnedRoot)) throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_CONFLICT", "stale review packet postimage could not be restored without clobbering a concurrent replacement");
-    removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+    removeReviewPacketTransaction(root, ctoRunId, pinnedRoot, walDescriptor);
     throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_CONSTITUTION_CONFLICT", constitutionError);
   }
   if (!transaction.postimage_descriptor
@@ -677,7 +682,7 @@ function recoverReviewPacketTransaction(
     || current.bytes.byteLength !== transaction.postimage_descriptor.size) {
     throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_CONFLICT", "review packet postimage ownership descriptor is unavailable or no longer matches the persisted packet");
   }
-  removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+  removeReviewPacketTransaction(root, ctoRunId, pinnedRoot, walDescriptor);
 }
 
 function reviewPacketRelativePath(packet: ReviewPacket): string {
@@ -1228,6 +1233,7 @@ function advanceCtoSpecificationPreparationUnlocked(
   assertPreparationConstitutionFresh(root, state, pinnedRoot);
   const packetBefore = reviewPacketImage(pinnedRoot, packet.value);
   const packetExpected = packetBefore?.bytes ?? renderExpectedReplayBytes(packet.value);
+  let packetTransactionDescriptor: PinnedRootWriteDescriptor | undefined;
   let packetTransaction: ReviewPacketPublicationTransaction | null = null;
   if (packetBefore === null) {
     packetTransaction = {
@@ -1242,7 +1248,7 @@ function advanceCtoSpecificationPreparationUnlocked(
       constitution_bindings: captureReviewPacketConstitutionBindings(root, state, pinnedRoot),
     };
     assertRuntimeLive();
-    persistReviewPacketTransaction(root, packetTransaction, pinnedRoot);
+    packetTransactionDescriptor = persistReviewPacketTransaction(root, packetTransaction, pinnedRoot);
     assertRuntimeLive();
   }
   let packetPath: string;
@@ -1256,7 +1262,7 @@ function advanceCtoSpecificationPreparationUnlocked(
     }
     packetTransaction.postimage_descriptor = receipt.descriptor;
     assertRuntimeLive();
-    persistReviewPacketTransaction(root, packetTransaction, pinnedRoot);
+    packetTransactionDescriptor = persistReviewPacketTransaction(root, packetTransaction, pinnedRoot);
     assertRuntimeLive();
     injectPreparationFailure("before_packet_publish");
   };
@@ -1269,14 +1275,14 @@ function advanceCtoSpecificationPreparationUnlocked(
       // A concurrent writer won between preflight and publication. We verified
       // its exact canonical bytes but did not publish or own its inode.
       assertRuntimeLive();
-      removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+      removeReviewPacketTransaction(root, ctoRunId, pinnedRoot, packetTransactionDescriptor);
       assertRuntimeLive();
       packetTransaction = null;
     }
   } catch (error) {
     if (packetTransaction && packetPrePublishForeign) {
       assertRuntimeLive();
-      removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+      removeReviewPacketTransaction(root, ctoRunId, pinnedRoot, packetTransactionDescriptor);
       assertRuntimeLive();
       packetTransaction = null;
     }
@@ -1284,7 +1290,7 @@ function advanceCtoSpecificationPreparationUnlocked(
     if (packetTransaction) assertRuntimeLive();
     if (packetTransaction && rollbackCreatedReviewPacket(pinnedRoot, packet.value, packetBefore, packetExpected, packetTransaction?.postimage_descriptor)) {
       assertRuntimeLive();
-      removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+      removeReviewPacketTransaction(root, ctoRunId, pinnedRoot, packetTransactionDescriptor);
       assertRuntimeLive();
     }
     throw error;
@@ -1337,7 +1343,7 @@ function advanceCtoSpecificationPreparationUnlocked(
       assertRuntimeLive();
       if (rolledBack) {
         assertRuntimeLive();
-        removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+        removeReviewPacketTransaction(root, ctoRunId, pinnedRoot, packetTransactionDescriptor);
         assertRuntimeLive();
       }
     }
@@ -1503,7 +1509,7 @@ export function advanceCtoSpecificationPreparation(
       injectPreparationFailure("after_cto_state_write");
       if (packetTransactionCommitted) {
         assertRuntimeLive();
-        removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+        removeReviewPacketTransaction(root, ctoRunId, pinnedRoot, packetTransactionDescriptor);
         assertRuntimeLive();
       }
       return result;

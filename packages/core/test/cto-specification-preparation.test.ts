@@ -2505,6 +2505,53 @@ describe("CTO specification preparation terminal boundary", () => {
     }
   });
 
+  test("preserves a same-content replacement WAL at packet error cleanup", async () => {
+    const root = freshProject();
+    const featureId = "feature-packet-wal-replacement-error";
+    try {
+      await recordCanonicalDecision(root, featureId, "tasks", "approve_continue", "answer-packet-wal-replacement-error");
+      await setupResidentPreparation(root);
+      const canonicalRoot = realpathSync(root);
+      const runDir = join(canonicalRoot, ".work-state", "cto", CTO_RUN_ID);
+      const packetPath = join(runDir, "specification-review-packet.md");
+      const transactionPath = join(runDir, "review-packet.transaction.json");
+      let walBefore: Buffer | null = null;
+      let originalIno: number | null = null;
+      let replacementIno: number | null = null;
+      let replaced = false;
+      setCtoSpecificationPreparationFailureInjector((point) => {
+        if (point !== "before_state_write" || replaced) return;
+        replaced = true;
+        const walBytes = readFileSync(transactionPath);
+        walBefore = walBytes;
+        originalIno = statSync(transactionPath).ino;
+        const moved = `${transactionPath}.foreign`;
+        renameSync(transactionPath, moved);
+        writeFileSync(transactionPath, walBytes);
+        rmSync(moved, { force: true });
+        replacementIno = statSync(transactionPath).ino;
+        writeFileSync(join(root, "CONSTITUTION.md"), `${PREPARATION_CONSTITUTION}\nDrifted before packet state commit.\n`, "utf8");
+      });
+      assert.throws(
+        () => advance(root, { cto_run_id: CTO_RUN_ID }),
+        /constitution|state finalization|CTO_STATE_CONFLICT/i,
+      );
+      setCtoSpecificationPreparationFailureInjector(null);
+      assert.equal(replaced, true, "the error seam must replace the packet WAL");
+      assert.ok(walBefore, "the packet WAL must be captured before replacement");
+      assert.ok(originalIno !== null && replacementIno !== null, "the packet WAL replacement must be observed");
+      assert.notEqual(replacementIno, originalIno, "the replacement WAL must have a distinct inode");
+      assert.equal(existsSync(packetPath), false, "failed packet publication must roll back its owned packet");
+      assert.deepEqual(readFileSync(transactionPath), walBefore, "same-content replacement WAL bytes must remain untouched");
+      assert.equal(statSync(transactionPath).ino, replacementIno, "same-content replacement WAL inode must remain untouched");
+      const state = readCtoState(CTO_RUN_ID, root);
+      assert.equal(state?.active_wave_id, "wave-cto-preparation", "failed packet publication must not close the active wave");
+      assert.equal(state?.pending?.status, undefined, "failed packet publication must not publish terminal state");
+    } finally {
+      setCtoSpecificationPreparationFailureInjector(null);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   test("packet rollback preserves a same-content concurrent replacement and fails closed", async () => {
     const root = freshProject();
     try {
