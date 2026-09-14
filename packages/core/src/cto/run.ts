@@ -1003,6 +1003,7 @@ function advanceCtoSpecificationPreparationUnlocked(
   state: CtoState,
   commitState: (next: CtoState) => void,
   assertRuntimeLive: () => void,
+  markPacketTransactionCommitted: () => void,
 ): AdvanceCtoSpecificationPreparationResult {
   assertRuntimeLive();
   recoverReviewPacketTransaction(root, ctoRunId, pinnedRoot);
@@ -1323,7 +1324,10 @@ function advanceCtoSpecificationPreparationUnlocked(
   injectPreparationFailure("after_state_write");
   if (packetTransaction) {
     assertRuntimeLive();
-    removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+    // The runtime transaction callback has only staged the CTO state here;
+    // its outer commit still owns the state/index CAS. Defer WAL removal until
+    // that commit returns successfully so any failure retains recovery proof.
+    markPacketTransactionCommitted();
     assertRuntimeLive();
   }
 
@@ -1442,7 +1446,8 @@ export function advanceCtoSpecificationPreparation(
     try {
       ensurePreparationConstitutionBeforeRunLock(root, pinnedRoot, projectedState, assertRuntimeLive);
       assertRuntimeLive();
-      return options.runtimeAccess.withRunTransaction(ctoRunId, (transaction) => {
+      let packetTransactionCommitted = false;
+      const result = options.runtimeAccess.withRunTransaction(ctoRunId, (transaction) => {
         assertRuntimeLive();
         const state = transaction.readState();
         assertPreparationOwnerSession(state, ctoRunId, options.sessionId);
@@ -1454,8 +1459,15 @@ export function advanceCtoSpecificationPreparation(
           state,
           (next) => { assertRuntimeLive(); transaction.writeState(next); assertRuntimeLive(); },
           assertRuntimeLive,
+          () => { packetTransactionCommitted = true; },
         );
       });
+      if (packetTransactionCommitted) {
+        assertRuntimeLive();
+        removeReviewPacketTransaction(root, ctoRunId, pinnedRoot);
+        assertRuntimeLive();
+      }
+      return result;
     } catch (error) {
       if (error instanceof CtoSpecificationPreparationError && error.code === "CTO_REVIEW_ROOT_CHANGED") throw error;
       const message = error instanceof Error ? error.message : String(error);

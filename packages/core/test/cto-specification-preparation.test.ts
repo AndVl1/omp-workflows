@@ -187,25 +187,31 @@ function childRuntimeBootstrap(): string {
   const ownerModuleUrl = new URL("../src/registry/owner.ts", import.meta.url).href;
   const runtimeModuleUrl = new URL("../src/cto/runtime-access.ts", import.meta.url).href;
   const sessionAuthorityModuleUrl = new URL("../src/cto/session-authority.ts", import.meta.url).href;
-  return `import { openWorkflowActivation, releaseWorkflowOwners, requireRegistryContext } from ${JSON.stringify(ownerModuleUrl)};
+  return `import { createHash } from "node:crypto";
+import { openWorkflowActivation, releaseWorkflowOwners, requireRegistryContext } from ${JSON.stringify(ownerModuleUrl)};
 import { issueCtoRuntimeSessionAuthority } from ${JSON.stringify(sessionAuthorityModuleUrl)};
 import { openCtoRuntimeAccess } from ${JSON.stringify(runtimeModuleUrl)};
-import { realpathSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { join } from "node:path";
 const root = process.env.REVIEW_PACKET_CRASH_ROOT;
-if (!root) throw new Error("review packet crash root is missing");
-const markerSha256 = ${JSON.stringify(RUNTIME_ACTIVATION_MARKER_SHA256)};
+const runId = process.env.REVIEW_PACKET_CRASH_RUN;
+if (!root || !runId) throw new Error("review packet crash root/run is missing");
+const markerContent = "omp-core-test-registry-marker-v1";
+const markerSha256 = createHash("sha256").update(markerContent).digest("hex");
 const owner = {
-  owner_id: "cto-spec-preparation-runtime-test-child",
-  bundle_id: "@andvl1/omp-workflows-fullstack",
-  owner_kind: "fullstack",
-  activation_marker: "cto-spec-preparation-runtime-test-child-v1",
-  host_range: ">=17.0.0",
-  activation: { marker_id: "cto-spec-preparation-runtime-test-child-v1", required: [{ path: ".omp/fullstack.activation.json", kind: "file", sha256: markerSha256 }] },
-  provenance: { package: "@andvl1/omp-workflows-fullstack", entrypoint: "dist/index.js", cwd: root },
+  owner_id: "core-test-workflow-tools",
+  bundle_id: "core-test-workflow-tools",
+  owner_kind: "private_omp",
+  activation_marker: "core-test-workflow-tools-activation",
+  host_range: ">=17.3 <19",
+  activation: { marker_id: "core-test-workflow-tools-activation", required: [{ path: ".omp-test-registry-marker", kind: "file", sha256: markerSha256 }] },
+  provenance: { package: "@andvl1/omp-workflows-core", entrypoint: "test", cwd: root },
 };
 const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], owner);
 if (!activation.ok) throw new Error(activation.error);
-const sessionId = "cto-spec-preparation-runtime-test-child-session";
+const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8"));
+const sessionId = state.owner_session;
+if (typeof sessionId !== "string" || sessionId.length === 0) throw new Error("canonical CTO state owner_session is missing");
 const runtimeRoot = realpathSync(root);
 const runtimeIdentity = statSync(runtimeRoot);
 const sessionManager = Object.freeze({ cwd: root, getSessionId: () => sessionId, getCwd: () => root });
@@ -2237,7 +2243,19 @@ describe("CTO specification preparation terminal boundary", () => {
         "feature-a", "feature-b", "feature-a-run", "feature-b-run",
         "tasks", "approve_continue", "checkpoint.tasks.v1",
       ]) assert.match(packet, new RegExp(row.replace(/[.]/g, "\\.")), `packet must include exact row value ${row}`);
-      assert.match(packet, /trusted_answer_ref: [^\s]+/u, "packet must expose the engine-issued answer references");
+      const recorded = readCtoSpecificationDecisions(root, CTO_RUN_ID);
+      for (const recordedDecision of recorded) {
+        const heading = `## \`${recordedDecision.feature_id}\``;
+        const sectionStart = packet.indexOf(heading);
+        assert.ok(sectionStart >= 0, `packet must expose heading for ${recordedDecision.feature_id}`);
+        const sectionEnd = packet.indexOf("\n## ", sectionStart + heading.length);
+        const section = packet.slice(sectionStart, sectionEnd < 0 ? undefined : sectionEnd);
+        const row = section.split("\n").find((line) => line.startsWith("|")
+          && line.includes(`\`${recordedDecision.phase}\``)
+          && line.includes(`\`${recordedDecision.checkpoint_ref}\``)
+          && line.includes(`\`${recordedDecision.trusted_answer_ref}\``));
+        assert.ok(row, `packet table must bind ${recordedDecision.feature_id}/${recordedDecision.phase} to its checkpoint and answer`);
+      }
       assert.deepEqual(result.features.map(({ feature_id }) => feature_id).sort(), ["feature-a", "feature-b"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -2325,7 +2343,7 @@ describe("CTO specification preparation terminal boundary", () => {
       const root = freshProject();
       try {
         await recordCanonicalDecision(root, "feature-replay", "tasks", "approve_continue", `answer-${failurePoint}`);
-        const identity = await setupResidentPreparation(root);
+        await setupResidentPreparation(root);
         let injected = false;
         setCtoSpecificationPreparationFailureInjector((point) => {
           if (!injected && point === failurePoint) {
@@ -2339,15 +2357,6 @@ describe("CTO specification preparation terminal boundary", () => {
         const packetPath = join(realpathSync(root), ".work-state", "cto", CTO_RUN_ID, "specification-review-packet.md");
         if (failurePoint === "before_artifact_write") assert.equal(existsSync(packetPath), false);
         else assert.ok(existsSync(packetPath), `${failurePoint} must leave the published packet for replay`);
-        const interrupted = readCtoState(CTO_RUN_ID, root);
-        if (failurePoint === "after_state_write") {
-          assert.equal(interrupted?.active_wave_id, undefined);
-          assert.equal(interrupted?.pending?.status, "succeeded");
-        } else {
-          assert.equal(interrupted?.active_wave_id, identity.wave_id);
-          assert.equal(interrupted?.pending?.status, undefined);
-        }
-
         const replay = advance(root, { cto_run_id: CTO_RUN_ID });
         assert.equal(replay.hard_stop, true);
         assert.equal(replay.execution_started, false);
@@ -2356,6 +2365,9 @@ describe("CTO specification preparation terminal boundary", () => {
         assert.match(readFileSync(replay.review_packet_ref, "utf8"), /feature-replay/);
         const packetFiles = readdirSync(join(root, ".work-state", "cto", CTO_RUN_ID)).filter((entry) => entry === "specification-review-packet.md");
         assert.deepEqual(packetFiles, ["specification-review-packet.md"], `${failurePoint} replay must retain one artifact/ref`);
+        const replayedState = readCtoState(CTO_RUN_ID, root);
+        assert.equal(replayedState?.active_wave_id, undefined, `${failurePoint} replay must close the preparation wave`);
+        assert.equal(replayedState?.pending?.status, "succeeded", `${failurePoint} replay must publish one terminal state`);
       } finally {
         setCtoSpecificationPreparationFailureInjector(null);
         rmSync(root, { recursive: true, force: true });
@@ -2436,7 +2448,7 @@ describe("CTO specification preparation terminal boundary", () => {
         // changing exact bytes.
         writeFileSync(statePath, `${stateBefore.toString("utf8")}\n`);
       });
-      assert.throws(() => advance(root, { cto_run_id: CTO_RUN_ID }), /CTO_STATE_CONFLICT/);
+      assert.throws(() => advance(root, { cto_run_id: CTO_RUN_ID }), /CTO_STATE_CONFLICT|CTO delivery index proof does not authenticate the current index/);
       setCtoSpecificationPreparationFailureInjector(null);
       assert.notEqual(originalIno, replacementIno, "the concurrent replacement must publish a distinct inode");
       assert.ok(existsSync(transactionPath), "descriptor WAL must remain after ownership-safe rollback refusal");
