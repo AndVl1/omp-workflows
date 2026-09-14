@@ -991,7 +991,7 @@ test("adapters: no-lifecycle adapter send is bounded by the fixed operation time
       plan: { id: runId, task: "adapter timeout", teams: [], created_at: new Date().toISOString() },
     });
     assert.ok(runtime.access.createRun(state, { source_id: "adapters:" + runId, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
-    const published = queueCtoDeliveryRaw(root, runId, sampleEscalation({ id: runId + "/team-a/timeout/1" }), undefined, undefined, runtime.access);
+    const published = queueCtoDeliveryRaw(root, runId, { ...sampleEscalation({ id: runId + "/team-a/timeout/1" }), intent: "question" }, undefined, undefined, runtime.access);
     assert.ok(published, "canonical timeout delivery publication succeeds");
     const started = Date.now();
     const results = await drainOutbox(root, adapter, 1);
