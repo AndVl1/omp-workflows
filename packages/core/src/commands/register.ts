@@ -263,6 +263,15 @@ function commandContextIdentity(ctx: unknown): CommandContextIdentity | null {
   };
 }
 
+function commandSessionIdentityChanged(slot: CommandActivationSlot, identity: CommandContextIdentity | null, sessionId: string | undefined): boolean {
+  if (!identity) return slot.sessionManager !== undefined || slot.sessionId !== sessionId;
+  return slot.sessionManager !== identity.sessionManager
+    || slot.sessionId !== identity.sessionId
+    || slot.sessionFile !== identity.sessionFile
+    || slot.sessionBasename !== identity.sessionBasename
+    || slot.sessionGeneration !== identity.sessionGeneration;
+}
+
 function commandRootIdentity(cwd: string): { root: string; rootDev: number; rootIno: number } {
   let canonicalCwd: string;
   try { canonicalCwd = realpathSync(cwd); } catch { throw new Error("activation_identity_changed: command project root could not be pinned"); }
@@ -326,9 +335,23 @@ function bindCommandContextIdentity(slot: CommandActivationSlot, cwd: string, ct
 function closeCommandOwnerActivation(pi: ExtensionAPI, event: unknown, ctx: unknown): void {
   const state = commandOwnerStates.get(pi as object);
   if (!state) return;
-  const currentSessionId = commandSessionId(ctx, event);
-  const activeSessionId = state.slot?.sessionId ?? state.sessionId;
-  if (activeSessionId && currentSessionId && activeSessionId !== currentSessionId) return;
+  const slot = state.slot;
+  if (slot?.sessionManager !== undefined) {
+    // A session id alone is not a lifecycle identity: hosts may reuse it
+    // across manager instances, transcript files, or generations. Require
+    // every bound field from the retained slot before disposing its lease.
+    const identity = commandContextIdentity(ctx);
+    if (!identity
+      || identity.sessionManager !== slot.sessionManager
+      || identity.sessionId !== slot.sessionId
+      || identity.sessionFile !== slot.sessionFile
+      || identity.sessionBasename !== slot.sessionBasename
+      || identity.sessionGeneration !== slot.sessionGeneration) return;
+  } else {
+    const currentSessionId = commandSessionId(ctx, event);
+    const activeSessionId = slot?.sessionId ?? state.sessionId;
+    if (activeSessionId && currentSessionId && activeSessionId !== currentSessionId) return;
+  }
   disposeCommandOwnerActivation(pi);
   if (state.mount !== "failed") state.revoked = false;
   state.disposed = true;
@@ -535,11 +558,21 @@ function claimCommandOwner(
 ): ExecutionLivenessGuard | undefined {
   if (!options.owner) return undefined;
   const state = commandOwnerState(pi);
+  const sessionId = commandSessionId(ctx);
+  const candidateIdentity = phase === "session" ? commandContextIdentity(ctx) : null;
+  const existing = state.slot;
+  if (phase === "session" && existing?.sessionManager !== undefined && (!candidateIdentity
+    || (existing.sessionId !== undefined && candidateIdentity.sessionId === undefined)
+    || (existing.sessionFile !== undefined && candidateIdentity.sessionFile === undefined)
+    || (existing.sessionBasename !== undefined && candidateIdentity.sessionBasename === undefined)
+    || (existing.sessionGeneration !== undefined && candidateIdentity.sessionGeneration === undefined))) {
+    // Never downgrade an authenticated manager-bound slot to an unbound or
+    // partial identity. Leave the current lease and callbacks untouched.
+    throw new Error("activation_context_missing: complete session identity is required to rebind workflow commands");
+  }
   if (phase === "session" || phase === "initial") state.disposed = false;
   if (state.disposed) throw new Error("activation_identity_changed: registration session is closed");
-  const sessionId = commandSessionId(ctx);
-  const existing = state.slot;
-  const sessionChanged = phase === "session" && !!existing?.sessionId && !!sessionId && existing.sessionId !== sessionId;
+  const sessionChanged = phase === "session" && existing !== undefined && commandSessionIdentityChanged(existing, candidateIdentity, sessionId);
   const revokedSessionChanged = phase === "session" && !existing && !!state.sessionId && !!sessionId && state.sessionId !== sessionId;
   if (state.revoked && !sessionChanged && !revokedSessionChanged) {
     throw new Error("activation_identity_changed: registration activation was revoked");

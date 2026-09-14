@@ -966,16 +966,24 @@ test("command shutdown requires manager, file, and generation identity beyond a 
       owner: () => activationOwner("bundle-shutdown-identity", root, markerInfo.path, markerInfo.sha256),
       resolveCwd: () => root,
     });
-    const contextA = { cwd: root, sessionManager: managerA };
-    const contextB = { cwd: root, sessionManager: managerB };
+    const contextA = { cwd: root, sessionManager: managerA, ui: { notify() {} } };
+    const contextB = { cwd: root, sessionManager: managerB, ui: { notify() {} } };
     harness.sessionStarts[0]?.({}, contextA);
     const handler = harness.commands.get("do-work")?.handler;
     assert.ok(handler);
-    harness.sessionShutdowns[0]?.({}, contextB);
-    await handler!("still-live", contextA);
-    assert.equal(harness.prompts.length, 1, "same-id stale shutdown must preserve the A activation");
+    assert.throws(
+      () => harness.sessionStarts[0]?.({}, { cwd: root, ui: { notify() {} } }),
+      /activation_context_missing|activation_context_invalid/,
+      "manager-bound activation must reject a missing-manager rebind without mutation",
+    );
+    await handler!("still-live-before-rebind", contextA);
+    assert.equal(harness.prompts.length, 1, "missing-manager rejection must preserve the A activation");
+    assert.doesNotThrow(() => harness.sessionStarts[0]?.({}, contextB), "same-id manager/generation change must rebind");
     harness.sessionShutdowns[0]?.({}, contextA);
-    await assert.rejects(handler!("closed", contextA), /activation_identity_changed|registration context/);
+    await handler!("still-live", contextB);
+    assert.equal(harness.prompts.length, 2, "stale A shutdown must preserve the rebound B activation");
+    harness.sessionShutdowns[0]?.({}, contextB);
+    await assert.rejects(handler!("closed", contextB), /activation_identity_changed|registration context/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
