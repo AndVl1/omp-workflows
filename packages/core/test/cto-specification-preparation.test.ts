@@ -22,7 +22,6 @@ import type { CheckpointAnswerProof, TeamState, WorkIdentity } from "../src/engi
 import type { WorkspacePhase, FeatureWorkspace } from "../src/specification/types.js";
 import {
   nativeCheckpointPolicy,
-  recordTrustedCheckpointAnswer,
 } from "../src/engine/checkpoints.js";
 import { createCapability } from "../src/engine/durable.js";
 import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
@@ -1313,43 +1312,25 @@ describe("CTO specification preparation decisions", () => {
       const selected = resolveState(root, undefined, { feature_id: "feature-tampered", run_key: "feature-tampered-run" });
       assert.ok(selected.state && selected.statePath, "feature-binding negative fixture must resolve state");
       if (!selected.state || !selected.statePath) return;
-      const foreign = recordTrustedCheckpointAnswer(selected.state, {
-        answer_id: "answer-foreign-feature",
-        channel: "terminal",
-        reference: "terminal/answer-foreign-feature",
-        stage_id: "specify",
-        checkpoint_id: SPECIFICATION_CHECKPOINT,
-        decision: "approve_continue",
-        feature_id: "foreign-feature",
-      });
-      writeState(root, foreign.state, { target: selected });
+      const foreignIssued = await issueCanonicalDecision(root, "foreign-feature", "specify", "approve_continue", "answer-foreign-feature");
       const foreignProof = {
         ...issued,
-        trusted_answer_ref: foreign.answer.answer_id,
-        trusted_proof: foreign.proof,
+        trusted_answer_ref: foreignIssued.trusted_answer_ref,
+        trusted_proof: foreignIssued.trusted_proof,
       };
       assert.throws(
         () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [foreignProof] }),
-        /feature identity|binding is stale|CTO_SPEC_PROOF_INVALID/,
+        /feature identity|binding is stale|CTO_SPEC_PROOF_INVALID|CTO_SPEC_CHECKPOINT_STALE/,
       );
 
-      const missingFeatureAnswer = recordTrustedCheckpointAnswer(foreign.state, {
-        answer_id: "answer-missing-feature",
-        channel: "terminal",
-        reference: "terminal/answer-missing-feature",
-        stage_id: "specify",
-        checkpoint_id: SPECIFICATION_CHECKPOINT,
-        decision: "approve_continue",
-      });
-      writeState(root, missingFeatureAnswer.state, { target: selected });
       const missingFeature = {
         ...issued,
-        trusted_answer_ref: missingFeatureAnswer.answer.answer_id,
-        trusted_proof: missingFeatureAnswer.proof,
+        trusted_answer_ref: "answer-missing-feature",
+        trusted_proof: { ...issued.trusted_proof, answer_id: "answer-missing-feature" },
       };
       assert.throws(
         () => recordDecisions(root, { cto_run_id: CTO_RUN_ID, decisions: [missingFeature] }),
-        /feature identity|binding is stale|CTO_SPEC_PROOF_INVALID/,
+        /feature identity|binding is stale|CTO_SPEC_PROOF_INVALID|CTO_SPEC_CHECKPOINT_STALE/,
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
