@@ -706,6 +706,41 @@ test("promotion rejects missing index or proof preimages before state CAS", () =
   }
 });
 
+test("ordinary schema2 journal repairs state-proof crash without origin transition", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-v2-ordinary-crash-"));
+  const runId = "v2-ordinary-crash";
+  try {
+    const initial = fixture(runId);
+    persistState(initial, root);
+    const candidate = readCtoState(runId, root);
+    assert.ok(candidate);
+    candidate!.integration.note = "ordinary crash postimage";
+    const originalReplace = PinnedProjectRoot.prototype.replaceFileIfMatches;
+    let injected = false;
+    PinnedProjectRoot.prototype.replaceFileIfMatches = function(relativePath, expected, content) {
+      if (!injected && relativePath.endsWith(".runtime-state-proof.json")) {
+        injected = true;
+        throw new PinnedRootError("changed", "injected ordinary proof crash");
+      }
+      return originalReplace.call(this, relativePath, expected, content);
+    };
+    try {
+      assert.throws(() => writeCtoState(candidate!, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() }), (error: unknown) => error instanceof PinnedRootError && error.code === "recovery_required");
+    } finally {
+      PinnedProjectRoot.prototype.replaceFileIfMatches = originalReplace;
+    }
+    assert.equal(injected, true);
+    const journalPath = join(root, ".work-state", "cto", ".active-run-index-journal", `${runId}.json`);
+    assert.equal((JSON.parse(readFileSync(journalPath, "utf8")) as { schema_version: number }).schema_version, 2);
+    readCtoRunDeliveryIndexPage(root);
+    assert.equal(existsSync(journalPath), false);
+    assert.equal(readCtoState(runId, root)?.integration.note, "ordinary crash postimage");
+    assert.equal(existsSync(join(root, ".work-state", "cto", runId, ".runtime-state-proof.json")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("legacy v1 publication journal only replays an exact already-proved state", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-legacy-journal-proof-"));
   const runId = "legacy-journal-proof";

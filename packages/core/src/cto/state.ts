@@ -1987,7 +1987,8 @@ function journalAllowsPriorStateProofPinned(
   state: CtoState,
   journal: CtoRunDeliveryPublicationJournal,
 ): boolean {
-  if (!journalTransitionAuthenticatesPinned(pinnedRoot, journal) || journal.schema_version !== 2) return false;
+  if (journal.schema_version !== 2 || !journalAuthenticatesPinned(pinnedRoot, journal)
+    || (journal.origin_transition && !journalTransitionAuthenticatesPinned(pinnedRoot, journal))) return false;
   try {
     const prior = readCtoRuntimeStateProofRecordPinned(pinnedRoot, state.id);
     return !!prior
@@ -2052,7 +2053,7 @@ function recoverCtoRunDeliveryJournalsForRefreshPinned(pinnedRoot: PinnedProject
       const nextEntry = ctoRunDeliveryEntry(state, known, pinnedRoot, { reconcileQueueEvidence: true });
       const entries = boundedRunDeliveryEntries([...current.index.entries.filter((entry) => entry.run_id !== runId), nextEntry]);
       const next = { schema_version: 2 as const, active_run_id: latestActiveRunId(entries), entries };
-      if (journalRead.journal.schema_version === 2 && !journalIndexPreimagesStillMatchPinned(pinnedRoot, journalRead.journal)) return false;
+      if (journalRead.journal.origin_transition && !journalIndexPreimagesStillMatchPinned(pinnedRoot, journalRead.journal)) return false;
       const currentProofAuthenticated = indexProofAuthenticatesPinned(pinnedRoot, current);
       const priorProofAuthenticated = !currentProofAuthenticated && (
         (journalRead.journal.schema_version === 2 && journalTransitionAuthenticatesPinned(pinnedRoot, journalRead.journal)
@@ -3616,7 +3617,7 @@ function recoverCtoRunDeliveryIndexLocked(
         nextEntry,
       ]);
       const next = { schema_version: 2 as const, active_run_id: latestActiveRunId(entries), entries };
-      if (journalRead.journal.schema_version === 2 && !journalIndexPreimagesStillMatchPinned(pinnedRoot, journalRead.journal)) throw new Error(`CTO transition preimage changed during recovery for '${runId}'`);
+      if (journalRead.journal.origin_transition && !journalIndexPreimagesStillMatchPinned(pinnedRoot, journalRead.journal)) throw new Error(`CTO transition preimage changed during recovery for '${runId}'`);
       persistCtoRunDeliveryIndexPinned(pinnedRoot, next, current.observed, journalRead.journal.schema_version === 2 ? {
         allowAuthenticatedStaleProof: true,
         transitionJournal: journalRead.journal,
