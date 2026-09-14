@@ -1293,6 +1293,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     if (!Array.isArray(projections) || projections.length === 0) throw new TelegramActivationRevokedError("telegram channel projection is absent");
     const targetConfigured = projections.some((projection) => {
       const direct = projection.chatId;
+      const ackTarget = projection.ackTarget;
       const nested = projection.telegram;
       const nestedRecord = nested && typeof nested === "object" && !Array.isArray(nested) ? nested as Record<string, unknown> : null;
       const nestedChat = nestedRecord?.chatId;

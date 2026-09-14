@@ -16,6 +16,7 @@ import {
   hasValidCtoRuntimeStateProofPinned,
   writeCtoRuntimeStateProof,
   refreshCtoRunDeliveryIndexAuthorityPinned,
+  withCtoRunDeliveryReadTransactionPinned,
   readCtoRunDeliveryIndexAuthorityPinned,
   newCtoState,
   publishCtoOutboxDelivery,
@@ -179,14 +180,19 @@ export type CtoRuntimeBridgeRouteCandidate = Readonly<{
   ownerSession: string;
   stateRevision: number;
   updatedAt: string;
-  status: "active";
+  status: "active" | "standby";
+  profileKey: string;
   channelProfile: Readonly<Record<string, unknown>>;
 }>;
+export type CtoRuntimeBridgeDeliveryWriteCandidate = Readonly<Pick<CtoRuntimeBridgeRouteCandidate, "runId" | "stateRevision" | "updatedAt" | "status" | "profileKey">>;
 
 /** Narrow bridge capability: route selection/status only, never generic state mutation. */
 export interface CtoRuntimeBridgeRouteAccess {
   assertLive(): void;
+  assertProjectRoot(projectRoot: string): void;
+  withAuthenticatedDeliveryWrite<T>(candidate: CtoRuntimeBridgeDeliveryWriteCandidate, callback: () => T): T;
   resolveTelegramRoute(): CtoRuntimeBridgeRouteCandidate | null;
+  resolveStandbyRoute(): CtoRuntimeBridgeRouteCandidate | null;
   resolveTelegramChannelProfile(): Readonly<Record<string, unknown>> | null;
   resolveEscalationChannelSnapshot(): Readonly<CtoRuntimeEscalationChannelSnapshot>;
   resolveCompletedStatus(): Readonly<{ runId: string; summary: Readonly<Record<string, unknown>> }> | null;
@@ -1206,6 +1212,43 @@ function bridgeRouteProfileKey(profile: Readonly<Record<string, unknown>> | unde
   });
 }
 
+function bridgeRouteProjectionKey(profile: Readonly<Record<string, unknown>> | undefined): string | null {
+  const normalized = bridgeRouteProfileKey(profile);
+  if (!normalized) return null;
+  const safeArray = (value: unknown): readonly (string | number)[] | null => Array.isArray(value)
+    && value.every((item) => (typeof item === "string" || typeof item === "number") && Number.isFinite(item)) ? Object.freeze(value.slice() as (string | number)[]) : null;
+  const nested = profile?.telegram;
+  const nestedRecord = nested && typeof nested === "object" && !Array.isArray(nested) ? nested as Record<string, unknown> : undefined;
+  return JSON.stringify({ normalized, chatId: profile?.chatId ?? null, allowedChatIds: safeArray(profile?.allowedChatIds), allowedSenderIds: safeArray(profile?.allowedSenderIds), nestedChatId: nestedRecord?.chatId ?? null, nestedAllowedChatIds: safeArray(nestedRecord?.allowedChatIds), nestedAllowedSenderIds: safeArray(nestedRecord?.allowedSenderIds) });
+}
+
+function sanitizeTelegramRouteProjection(profile: Readonly<Record<string, unknown>>, raw: Record<string, unknown>): Readonly<Record<string, unknown>> {
+  const safe = (value: unknown): unknown => typeof value === "string" || (typeof value === "number" && Number.isFinite(value)) ? value : undefined;
+  const safeArray = (value: unknown): readonly unknown[] | undefined => Array.isArray(value) ? Object.freeze(value.map(safe).filter((item): item is string | number => item !== undefined)) : undefined;
+  const nested = raw.telegram;
+  const nestedRecord = nested && typeof nested === "object" && !Array.isArray(nested) ? nested as Record<string, unknown> : undefined;
+  const result: Record<string, unknown> = { ...profile };
+  for (const key of ["chatId", "ackTarget"] as const) {
+    const value = safe(raw[key]);
+    if (value !== undefined) result[key] = value;
+  }
+  for (const key of ["allowedChatIds", "allowedSenderIds"] as const) {
+    const value = safeArray(raw[key]);
+    if (value !== undefined) result[key] = value;
+  }
+  if (nestedRecord) {
+    const selected: Record<string, unknown> = {};
+    for (const key of ["chatId", "allowedChatIds", "allowedSenderIds"] as const) {
+      const value = safe(key === "chatId" ? nestedRecord[key] : nestedRecord[key]);
+      const array = key === "chatId" ? undefined : safeArray(nestedRecord[key]);
+      if (value !== undefined) selected[key] = value;
+      else if (array !== undefined) selected[key] = array;
+    }
+    if (Object.keys(selected).length > 0) result.telegram = Object.freeze(selected);
+  }
+  return Object.freeze(result);
+}
+
 function openBridgeRouteFromCell(
   registryContext: RegistryRegistrationContext,
   root: PinnedProjectRoot,
@@ -1226,7 +1269,12 @@ function openBridgeRouteFromCell(
     if (candidates.length !== 1) return null;
     const profile = candidates[0];
     if (!profile || !bridgeRouteProfileKey(profile as unknown as Readonly<Record<string, unknown>>)) return null;
-    return Object.freeze({ ...profile });
+    const channels = loaded.config.channels;
+    const rawEntry = Array.isArray(channels) ? channels.find((entry) => entry && typeof entry === "object" && !Array.isArray(entry)
+      && (entry as Record<string, unknown>).adapter === "telegram"
+      && ((typeof (entry as Record<string, unknown>).id === "string" ? ((entry as Record<string, unknown>).id as string).trim() : "") === (profile.id ?? ""))
+      && (entry as Record<string, unknown>).primary === true) as Record<string, unknown> | undefined : loaded.config;
+    return sanitizeTelegramRouteProjection(profile as unknown as Readonly<Record<string, unknown>>, rawEntry ?? {});
   };
   const route = (): CtoRuntimeBridgeRouteCandidate | null => {
     const profile = routeProfile();
@@ -1245,7 +1293,7 @@ function openBridgeRouteFromCell(
       const stateProfile = state.channel_profile;
       if (!stateProfile || typeof stateProfile !== "object" || Array.isArray(stateProfile)) continue;
       if (bridgeRouteProfileKey(stateProfile as Readonly<Record<string, unknown>>) !== profileKey) continue;
-      matches.push(Object.freeze({ runId: entry.run_id, ownerSession: state.owner_session, stateRevision: entry.state_revision, updatedAt: entry.updated_at, status: "active", channelProfile: profile }));
+      matches.push(Object.freeze({ runId: entry.run_id, ownerSession: state.owner_session, stateRevision: entry.state_revision, updatedAt: entry.updated_at, status: "active", profileKey: bridgeRouteProjectionKey(profile)!, channelProfile: profile }));
     }
     if (matches.length !== 1) return null;
     const selected = matches[0];
@@ -1271,23 +1319,56 @@ function openBridgeRouteFromCell(
     return !!stateProfile && typeof stateProfile === "object" && !Array.isArray(stateProfile)
       && bridgeRouteProfileKey(stateProfile as unknown as Readonly<Record<string, unknown>>) === bridgeRouteProfileKey(profile);
   };
+  const resolveStandbyRoute = (): CtoRuntimeBridgeRouteCandidate | null => {
+    const profile = routeProfile();
+    if (!profile) return null;
+    const candidates = readCtoRunDeliveryActiveCandidatesPinned(root);
+    if (!candidates.ok) return null;
+    const matches = candidates.entries.filter((entry) => validStandbyEntry(entry, profile));
+    if (matches.length !== 1) return null;
+    const entry = matches[0];
+    if (!entry) return null;
+    return Object.freeze({ runId: entry.run_id, ownerSession: "", stateRevision: entry.state_revision, updatedAt: entry.updated_at, status: "standby", profileKey: bridgeRouteProjectionKey(profile)!, channelProfile: profile });
+  };
+  const withAuthenticatedDeliveryWrite = <T>(candidate: CtoRuntimeBridgeDeliveryWriteCandidate, callback: () => T): T => {
+    assertLive();
+    if (!candidate || typeof candidate.runId !== "string" || !/^[A-Za-z0-9._-]+$/u.test(candidate.runId)
+      || !Number.isSafeInteger(candidate.stateRevision) || candidate.stateRevision < 0 || typeof candidate.updatedAt !== "string"
+      || (candidate.status !== "active" && candidate.status !== "standby") || typeof candidate.profileKey !== "string" || typeof callback !== "function") {
+      throw runtimeError("runtime_access_invalid", "bridge delivery write target is invalid");
+    }
+    const validate = (): boolean => {
+      const current = candidate.status === "active" ? route() : resolveStandbyRoute();
+      return current !== null && current.runId === candidate.runId && current.stateRevision === candidate.stateRevision
+        && current.updatedAt === candidate.updatedAt && current.status === candidate.status && current.profileKey === candidate.profileKey;
+    };
+    return withCtoRunDeliveryReadTransactionPinned(root, () => {
+      assertLive();
+      if (!validate()) throw runtimeError("activation_revoked", "authenticated Telegram route changed before delivery write");
+      const result = callback();
+      assertLive();
+      if (!validate()) throw runtimeError("activation_revoked", "authenticated Telegram route changed after delivery write");
+      return result;
+    });
+  };
+
   const ensureStandbyRun = (): string => {
     assertLive();
     const profile = routeProfile();
     if (!profile) throw runtimeError("runtime_access_invalid", "authenticated Telegram route is unavailable");
     const existing = readCtoRunDeliveryActiveCandidatesPinned(root);
     if (existing.ok) {
-      for (const entry of existing.entries) {
-        if (validStandbyEntry(entry, profile)) return entry.run_id;
-      }
+      const matches = existing.entries.filter((entry) => validStandbyEntry(entry, profile));
+      if (matches.length > 1) throw runtimeError("runtime_access_invalid", "multiple authenticated standby Telegram routes are ambiguous");
+      if (matches.length === 1) return matches[0]!.run_id;
     }
     return withCtoRegistryLock(root.canonical_root, () => {
       assertLive();
       const rebound = readCtoRunDeliveryActiveCandidatesPinned(root);
       if (rebound.ok) {
-        for (const entry of rebound.entries) {
-          if (validStandbyEntry(entry, profile)) return entry.run_id;
-        }
+        const matches = rebound.entries.filter((entry) => validStandbyEntry(entry, profile));
+        if (matches.length > 1) throw runtimeError("runtime_access_invalid", "multiple authenticated standby Telegram routes are ambiguous");
+        if (matches.length === 1) return matches[0]!.run_id;
       }
       const runId = `standby-${Date.now()}-${randomUUID().slice(0, 8)}`;
       const runDirectory = join(".work-state", "cto", runId);
@@ -1368,7 +1449,18 @@ function openBridgeRouteFromCell(
   };
   return Object.freeze({
     assertLive,
+    assertProjectRoot: (projectRoot: string): void => {
+      assertLive();
+      if (typeof projectRoot !== "string" || projectRoot !== root.canonical_root) throw runtimeError("runtime_access_invalid", "bridge route project root does not match its authenticated pin");
+      const candidate = PinnedProjectRoot.open(projectRoot);
+      if (!candidate) throw runtimeError("activation_revoked", "bridge route project root is unavailable");
+      try {
+        if (!candidate.isStable() || candidate.dev !== root.dev || candidate.ino !== root.ino) throw runtimeError("activation_revoked", "bridge route project root identity changed");
+      } finally { candidate.close(); }
+    },
     resolveTelegramRoute: route,
+    resolveStandbyRoute,
+    withAuthenticatedDeliveryWrite,
     resolveTelegramChannelProfile: routeProfile,
     resolveEscalationChannelSnapshot,
     resolveCompletedStatus,

@@ -164,7 +164,7 @@ function selectTelegramAdapterConfig(raw, authenticatedProjection) {
   if (channels.length > 0 && !entry) throw new BridgeConfigRevokedError("authenticated Telegram channel entry is unavailable");
   const fallback = raw.telegram && typeof raw.telegram === "object" && !Array.isArray(raw.telegram) ? raw.telegram : {};
   const selected = entry && entry.telegram && typeof entry.telegram === "object" && !Array.isArray(entry.telegram) ? entry.telegram : (entry ?? {});
-  const telegram = { ...fallback, ...selected };
+  const telegram = channels.length > 0 ? { ...selected } : { ...fallback };
   if (typeof telegram.token !== "string" || telegram.token.length === 0
     || typeof telegram.chatId !== "string" || telegram.chatId.length === 0) {
     throw new BridgeConfigRevokedError("authenticated Telegram token/chatId is unavailable");

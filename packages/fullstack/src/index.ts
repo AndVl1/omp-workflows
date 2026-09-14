@@ -607,8 +607,10 @@ const dispatcherStopsByRootIdentity = new Map<string, DispatcherSlot>();
 const dispatcherOwnershipByPi = new WeakMap<object, Map<string, DispatcherOwnership>>();
 const dispatcherCurrentOwnershipByPi = new WeakMap<object, DispatcherOwnership>();
 const dispatcherGenerationByManagerByPi = new WeakMap<object, WeakMap<object, number>>();
-const dispatcherRetiredManagersByPi = new WeakMap<object, WeakSet<object>>();
+const dispatcherRetiredManagersByPi = new WeakMap<object, WeakMap<object, Set<string>>>();
 const dispatcherPendingManagerByPi = new WeakMap<object, object>();
+const dispatcherPendingManagerIdentityByPi = new WeakMap<object, DispatcherContextIdentity>();
+const MAX_RETIRED_HOST_GENERATIONS = 32;
 let nextDispatcherGeneration = 0;
 
 function rememberDispatcherManagerGeneration(pi: ExtensionAPI, ctx: unknown, generation: number): void {
@@ -629,6 +631,7 @@ function dispatcherRootIdentity(pinnedRoot: PinnedProjectRoot): string {
 }
 
 interface DispatcherContextIdentity extends DispatcherOwnership {
+  readonly sessionManager: object;
 	readonly lexicalRoot: string;
 	readonly cwd: string;
 }
@@ -644,7 +647,7 @@ function sessionGenerationFromManager(manager: Record<string, unknown>): string 
   if (typeof manager.getSessionGeneration !== "function") return undefined;
   try {
     const value = manager.getSessionGeneration();
-    return typeof value === "string" || typeof value === "number" ? value : undefined;
+    return validHostGeneration(value) ? value : undefined;
   } catch {
     return undefined;
   }
@@ -673,10 +676,12 @@ function dispatcherContextIdentity(ctx: unknown): DispatcherContextIdentity | nu
 			if (!pinnedRoot.isStable()) return null;
 			return {
 				owner,
+				sessionManager: manager,
 				rootIdentity: dispatcherRootIdentity(pinnedRoot),
 				lexicalRoot: pinnedRoot.lexical_root,
 				cwd: pinnedRoot.canonical_root,
 				sessionFile: sessionFileFromManager(manager),
+				sessionGeneration: sessionGenerationFromManager(manager),
 				generation: 0,
 			};
 		} finally {
@@ -691,13 +696,41 @@ function dispatcherOwnershipKey(ownership: Pick<DispatcherOwnership, "owner" | "
 	return JSON.stringify([ownership.owner, ownership.rootIdentity, ownership.cwd, ownership.generation, ownership.sessionFile ?? null, ownership.sessionGeneration ?? null]);
 }
 
-function retireDispatcherManager(pi: ExtensionAPI, manager: object): void {
-  const retired = dispatcherRetiredManagersByPi.get(pi as object) ?? new WeakSet<object>();
-  retired.add(manager);
+function validHostGeneration(value: unknown): value is string | number {
+  return (typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 512)
+    || (typeof value === "number" && Number.isSafeInteger(value));
+}
+
+function managerIdentityKey(identity: Pick<DispatcherOwnership, "owner" | "rootIdentity" | "cwd" | "sessionFile" | "sessionGeneration">): string {
+  return JSON.stringify([identity.owner, identity.rootIdentity, identity.cwd, identity.sessionFile ?? null, identity.sessionGeneration ?? null]);
+}
+
+function retireDispatcherManager(pi: ExtensionAPI, identity: Pick<DispatcherOwnership, "sessionManager" | "owner" | "rootIdentity" | "cwd" | "sessionFile" | "sessionGeneration">): void {
+  const manager = identity.sessionManager;
+  if (!manager) return;
+  const retired = dispatcherRetiredManagersByPi.get(pi as object) ?? new WeakMap<object, Set<string>>();
+  const identities = retired.get(manager) ?? new Set<string>();
+  identities.delete(managerIdentityKey(identity));
+  identities.add(managerIdentityKey(identity));
+  while (identities.size > MAX_RETIRED_HOST_GENERATIONS) {
+    const oldest = identities.values().next().value;
+    if (typeof oldest !== "string") break;
+    identities.delete(oldest);
+  }
+  retired.set(manager, identities);
   dispatcherRetiredManagersByPi.set(pi as object, retired);
 }
 
+function isRetiredDispatcherManager(pi: ExtensionAPI, identity: Pick<DispatcherOwnership, "sessionManager" | "owner" | "rootIdentity" | "cwd" | "sessionFile" | "sessionGeneration">): boolean {
+  return identity.sessionManager ? dispatcherRetiredManagersByPi.get(pi as object)?.get(identity.sessionManager)?.has(managerIdentityKey(identity)) === true : false;
+}
+
 function rememberDispatcherOwnership(pi: ExtensionAPI, ownership: DispatcherOwnership): void {
+  const previous = dispatcherCurrentOwnershipByPi.get(pi as object);
+  if (previous?.sessionManager && (previous.sessionManager !== ownership.sessionManager
+      || (previous.sessionGeneration ?? null) !== (ownership.sessionGeneration ?? null)
+      || previous.owner !== ownership.owner || previous.rootIdentity !== ownership.rootIdentity || previous.cwd !== ownership.cwd
+      || (previous.sessionFile ?? null) !== (ownership.sessionFile ?? null))) retireDispatcherManager(pi, previous);
 	const entries = dispatcherOwnershipByPi.get(pi as object) ?? new Map<string, DispatcherOwnership>();
 	entries.set(dispatcherOwnershipKey(ownership), ownership);
 	// Keep ownership memory bounded while retaining every currently active root.
@@ -1186,6 +1219,14 @@ const fullstackActivationRecords = new WeakMap<object, Map<string, FullstackActi
  * the previous root before retaining a new activation, even when both roots
  * happen to use the same extension API object. */
 const fullstackActiveRootByPi = new WeakMap<object, string>();
+interface FullstackLifecycleAdmission {
+  readonly sessionManager: object;
+  readonly owner: string;
+  readonly rootIdentity: string;
+  readonly cwd: string;
+  readonly sessionGeneration?: string | number;
+}
+const fullstackLifecycleAdmissionByPi = new WeakMap<object, FullstackLifecycleAdmission>();
 /** Dispatcher stops started by root migration must settle before the next
  * main-session start claims a moved/replaced project path. */
 const pendingDispatcherStopsByPi = new WeakMap<object, Set<Promise<void>>>();
@@ -1568,7 +1609,17 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string, initialSession
   if (!pinnedRoot) return false;
   const root = pinnedRoot.canonical_root;
   const activeRoot = fullstackActiveRootByPi.get(pi as object);
-  if (activeRoot && activeRoot !== root) evictFullstackRoot(pi, activeRoot);
+  if (activeRoot && activeRoot !== root) {
+    const admission = fullstackLifecycleAdmissionByPi.get(pi as object);
+    const identity = initialSessionContext === undefined ? undefined : dispatcherContextIdentity(initialSessionContext);
+    if (!admission || !identity || identity.sessionManager !== admission.sessionManager || identity.owner !== admission.owner
+      || identity.rootIdentity !== admission.rootIdentity || identity.cwd !== admission.cwd
+      || (identity.sessionGeneration ?? null) !== (admission.sessionGeneration ?? null)) {
+      pinnedRoot.close();
+      return false;
+    }
+    evictFullstackRoot(pi, activeRoot);
+  }
   let freshRetryAvailable = true;
   while (true) {
     const currentActivations = fullstackActivations.get(pi as object);
@@ -1919,24 +1970,37 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     const contextIdentity = dispatcherContextIdentity(ctx);
     const cwd = resolveSessionCwd(ctx);
     if (!contextIdentity || !cwd) return;
+    const eventRecord = event && typeof event === "object" ? event as { sessionId?: unknown; session_id?: unknown; generation?: unknown; sessionGeneration?: unknown; session_generation?: unknown } : undefined;
+    const eventSessionId = eventRecord?.sessionId ?? eventRecord?.session_id;
+    const eventGeneration = eventRecord?.generation ?? eventRecord?.sessionGeneration ?? eventRecord?.session_generation;
+    // Validate immutable event claims before touching epoch/retirement state.
+    if (eventSessionId !== undefined && (typeof eventSessionId !== "string" || eventSessionId !== contextIdentity.owner)) return;
+    if (eventGeneration !== undefined && (!validHostGeneration(eventGeneration)
+      || (contextIdentity.sessionGeneration !== undefined && eventGeneration !== contextIdentity.sessionGeneration))) return;
+    fullstackLifecycleAdmissionByPi.set(pi as object, Object.freeze({
+      sessionManager: contextIdentity.sessionManager,
+      owner: contextIdentity.owner,
+      rootIdentity: contextIdentity.rootIdentity,
+      cwd: contextIdentity.cwd,
+      ...(contextIdentity.sessionGeneration === undefined ? {} : { sessionGeneration: contextIdentity.sessionGeneration }),
+    }));
     const ui = extractUiFromContext(ctx);
     const piObject = pi as object;
     const lifecycleEpoch = (sessionLifecycleEpochByPi.get(piObject) ?? 0) + 1;
     sessionLifecycleEpochByPi.set(piObject, lifecycleEpoch);
-    const eventSessionId = event && typeof event === "object"
-      ? ((event as { sessionId?: unknown; session_id?: unknown }).sessionId ?? (event as { session_id?: unknown }).session_id)
-      : undefined;
-    const eventGeneration = event && typeof event === "object"
-      ? ((event as { generation?: unknown; sessionGeneration?: unknown; session_generation?: unknown }).generation
-        ?? (event as { sessionGeneration?: unknown }).sessionGeneration
-        ?? (event as { session_generation?: unknown }).session_generation)
-      : undefined;
     const sessionManager = authoritativeSessionManager(ctx);
-    const retiredManagers = dispatcherRetiredManagersByPi.get(piObject);
-    if (sessionManager && retiredManagers?.has(sessionManager)) return;
+    const lifecycleIdentity: DispatcherContextIdentity = contextIdentity;
+    if (sessionManager && isRetiredDispatcherManager(pi, lifecycleIdentity)) return;
     const pendingManager = dispatcherPendingManagerByPi.get(piObject);
-    if (sessionManager && pendingManager && pendingManager !== sessionManager) retireDispatcherManager(pi, pendingManager);
-    if (sessionManager) dispatcherPendingManagerByPi.set(piObject, sessionManager);
+    const pendingIdentity = dispatcherPendingManagerIdentityByPi.get(piObject);
+    if (sessionManager && pendingManager && pendingIdentity && (pendingManager !== sessionManager
+      || managerIdentityKey(pendingIdentity) !== managerIdentityKey(lifecycleIdentity))) {
+      retireDispatcherManager(pi, pendingIdentity);
+    }
+    if (sessionManager) {
+      dispatcherPendingManagerByPi.set(piObject, sessionManager);
+      dispatcherPendingManagerIdentityByPi.set(piObject, lifecycleIdentity);
+    }
     const currentOwnership = dispatcherCurrentOwnershipByPi.get(piObject);
     if (eventGeneration !== undefined && (typeof eventGeneration !== "string" && typeof eventGeneration !== "number"
       || (contextIdentity.sessionGeneration !== undefined && eventGeneration !== contextIdentity.sessionGeneration))) return;
@@ -1951,7 +2015,6 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
         && (eventSessionId === undefined || eventSessionId === contextIdentity.owner)
         && (eventGeneration === undefined || currentGeneration === undefined || eventGeneration === currentGeneration);
     };
-    if (currentOwnership && eventSessionId !== undefined && eventSessionId !== contextIdentity.owner) return;
     // Main-session-only dispatcher ownership. Task subagents never reach this
     // point and therefore cannot revoke or advance the lifecycle generation.
     // The session manager identity is canonical for lifecycle hooks. Keep
@@ -2409,10 +2472,14 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
       && rebound.rootIdentity === target.rootIdentity
       && rebound.cwd === target.cwd
       && (rebound.sessionFile ?? null) === (target.sessionFile ?? null)
+      && (rebound.sessionGeneration ?? null) === (target.sessionGeneration ?? null)
+      && rebound.sessionManager === target.sessionManager
       && (!previous || rebound.generation !== previous.generation)) return;
     await revokeCurrentDispatcher(pi, target);
     const current = dispatcherCurrentOwnershipByPi.get(pi as object);
-    if (current && previous && current.generation === previous.generation && current.rootIdentity === previous.rootIdentity && current.owner === previous.owner && current.cwd === previous.cwd && (current.sessionFile ?? null) === (previous.sessionFile ?? null)) return;
+    if (current && previous && current.generation === previous.generation && current.rootIdentity === previous.rootIdentity && current.owner === previous.owner && current.cwd === previous.cwd && (current.sessionFile ?? null) === (previous.sessionFile ?? null)
+      && (current.sessionGeneration ?? null) === (previous.sessionGeneration ?? null)
+      && current.sessionManager === previous.sessionManager) return;
     await sessionLifecycleHandler({ type: "session_start" }, ctx);
   };
   // The host emits these completion events instead of session_start after a

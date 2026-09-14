@@ -30,7 +30,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
 import { isSafeEscalationId, isSafeCtoRunId, isSafeCtoInboundText, PinnedProjectRoot } from "@andvl1/omp-workflows-core";
-import type { CtoRuntimeAccessFacade, CtoRuntimeBridgeRouteAccess, CtoRuntimeProofAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
+import type { CtoRuntimeAccessFacade, CtoRuntimeBridgeDeliveryWriteCandidate, CtoRuntimeBridgeRouteAccess, CtoRuntimeProofAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
 import { openBoundedQueue, type BoundedQueue } from "@andvl1/omp-workflows-core/queue";
 import { createAuthenticatedInboxEnvelope, ensureStandbyRun, inboxMessageFileName, isBridgeAlive, isBridgeAuthenticationLeaseCurrent, MAX_INBOX_TEXT_LENGTH, verifyAuthenticatedInboxEnvelope, writeBridgeLock } from "./adapters/registry.js";
 import { readBoundedResponseText } from "./lecture-acquisition/provider-errors.js";
@@ -39,7 +39,7 @@ function decodeTelegramUtf8(bytes: Uint8Array): string {
   return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
-export type BridgeRouteRuntime = Pick<CtoRuntimeBridgeRouteAccess, "assertLive" | "resolveTelegramRoute" | "resolveTelegramChannelProfile" | "resolveCompletedStatus" | "ensureStandbyRun" | "readStatus">;
+export type BridgeRouteRuntime = Pick<CtoRuntimeBridgeRouteAccess, "assertLive" | "withAuthenticatedDeliveryWrite" | "resolveTelegramRoute" | "resolveStandbyRoute" | "resolveTelegramChannelProfile" | "resolveCompletedStatus" | "ensureStandbyRun" | "readStatus">;
 
 function isBridgeRouteRuntime(value: unknown): value is BridgeRouteRuntime {
   return !!value && typeof value === "object" && typeof (value as { resolveTelegramRoute?: unknown }).resolveTelegramRoute === "function";
@@ -86,48 +86,63 @@ function withBridgeRoot<T>(cwd: string, suppliedPin: PinnedProjectRoot | undefin
 }
 
 /** File an authenticated message in the local drop (wx-idempotent). */
-export function writeTaskDrop(cwd: string, msg: BridgeIncoming, runId: string | undefined, suppliedPin: PinnedProjectRoot | undefined, runtimeAccess: CtoRuntimeAccessFacade | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: BridgeRouteRuntime): string | null {
+export function writeTaskDrop(cwd: string, msg: BridgeIncoming, runId: string | undefined, suppliedPin: PinnedProjectRoot | undefined, runtimeAccess: CtoRuntimeAccessFacade | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: BridgeRouteRuntime, routeCandidate?: CtoRuntimeBridgeDeliveryWriteCandidate): string | null {
   if (!isSafeCtoInboundText(msg.text, MAX_INBOX_TEXT_LENGTH) || (runId !== undefined && !isSafeCtoRunId(runId))) return null;
   return withBridgeRoot(cwd, suppliedPin, (pinnedRoot) => {
-    ensureBridgeSession(cwd, pinnedRoot, proofAuthority)
-    const resolved = runId ?? (bridgeRoute?.resolveTelegramRoute()?.runId) ?? runtimeAccess?.findActiveRun()?.runId
+    ensureBridgeSession(cwd, pinnedRoot, proofAuthority);
+    const candidate = routeCandidate ?? bridgeRoute?.resolveTelegramRoute() ?? null;
+    const resolved = runId ?? candidate?.runId ?? runtimeAccess?.findActiveRun()?.runId
       ?? (bridgeRoute ? bridgeRoute.ensureStandbyRun() : runtimeAccess ? ensureStandbyRun(cwd, pinnedRoot, runtimeAccess) : null);
     if (!resolved) return null;
-    const envelope = createAuthenticatedInboxEnvelope(cwd, "task", { id: msg.id, text: msg.text, at: msg.at, by: msg.by ?? "telegram-bridge", run_id: resolved }, pinnedRoot, proofAuthority);
-    if (!pinnedRoot.isStable()) throw new Error("telegram bridge project root changed before task drop");
-    const queue = openBoundedQueue(pinnedRoot.canonical_root, join(".omp", "inbox"), { pinnedRoot });
-    if (!queue) throw new Error("telegram bridge local inbox is unavailable or unsafe");
-    try {
-      const filed = writeInboxTaskFile(queue, inboxMessageFileName(msg.id), envelope, pinnedRoot, cwd, proofAuthority);
-      if (!pinnedRoot.isStable() || !isBridgeAuthenticationLeaseCurrent(cwd, pinnedRoot, envelope.auth.session_id, proofAuthority)) throw new BridgeRetryableError("telegram bridge auth lease changed after task drop");
-      return filed;
-    } finally {
-      queue.close();
+    if (bridgeRoute) {
+      if (!candidate || candidate.status !== "active") throw new BridgeRetryableError("telegram active route disappeared before task write");
+      if (candidate.runId !== resolved) throw new BridgeRetryableError("telegram active route changed before task write");
     }
+    const write = (): string | null => {
+      const envelope = createAuthenticatedInboxEnvelope(cwd, "task", { id: msg.id, text: msg.text, at: msg.at, by: msg.by ?? "telegram-bridge", run_id: resolved }, pinnedRoot, proofAuthority);
+      if (!pinnedRoot.isStable()) throw new Error("telegram bridge project root changed before task drop");
+      const queue = openBoundedQueue(pinnedRoot.canonical_root, join(".omp", "inbox"), { pinnedRoot });
+      if (!queue) throw new Error("telegram bridge local inbox is unavailable or unsafe");
+      try {
+        const filed = writeInboxTaskFile(queue, inboxMessageFileName(msg.id), envelope, pinnedRoot, cwd, proofAuthority);
+        if (!pinnedRoot.isStable() || !isBridgeAuthenticationLeaseCurrent(cwd, pinnedRoot, envelope.auth.session_id, proofAuthority)) throw new BridgeRetryableError("telegram bridge auth lease changed after task drop");
+        return filed;
+      } finally { queue.close(); }
+    };
+    return bridgeRoute && candidate
+      ? bridgeRoute.withAuthenticatedDeliveryWrite(candidate, write)
+      : write();
   });
 }
 
 /** File an authenticated message under a standby run inbox (wx-idempotent). */
-export function writeStandbyTask(cwd: string, msg: BridgeIncoming, runId: string | undefined, suppliedPin: PinnedProjectRoot | undefined, runtimeAccess: CtoRuntimeAccessFacade | undefined, proofAuthority: CtoRuntimeProofAuthority): string | null {
+export function writeStandbyTask(cwd: string, msg: BridgeIncoming, runId: string | undefined, suppliedPin: PinnedProjectRoot | undefined, runtimeAccess: CtoRuntimeAccessFacade | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: BridgeRouteRuntime, routeCandidate?: CtoRuntimeBridgeDeliveryWriteCandidate): string | null {
   if (!isSafeCtoInboundText(msg.text, MAX_INBOX_TEXT_LENGTH) || (runId !== undefined && !isSafeCtoRunId(runId))) return null;
   return withBridgeRoot(cwd, suppliedPin, (pinnedRoot) => {
-    ensureBridgeSession(cwd, pinnedRoot, proofAuthority)
-    const resolved = runId ?? (runtimeAccess ? ensureStandbyRun(cwd, pinnedRoot, runtimeAccess) : null);
+    ensureBridgeSession(cwd, pinnedRoot, proofAuthority);
+    const candidate = routeCandidate ?? bridgeRoute?.resolveStandbyRoute() ?? null;
+    const resolved = runId ?? candidate?.runId ?? (runtimeAccess ? ensureStandbyRun(cwd, pinnedRoot, runtimeAccess) : null);
     if (!resolved) return null;
-    const envelope = createAuthenticatedInboxEnvelope(cwd, "task", { id: msg.id, text: msg.text, at: msg.at, by: msg.by ?? "telegram-bridge", run_id: resolved }, pinnedRoot, proofAuthority);
-    if (!pinnedRoot.isStable()) throw new Error("telegram bridge project root changed before standby task drop");
-    const queue = openBoundedQueue(pinnedRoot.canonical_root, join(".work-state", "cto", resolved, "inbox"), { pinnedRoot });
-    if (!queue) throw new Error("telegram bridge standby inbox is unavailable or unsafe");
-    try {
-      const filed = writeInboxTaskFile(queue, inboxMessageFileName(msg.id), envelope, pinnedRoot, cwd, proofAuthority);
-      if (!pinnedRoot.isStable() || !isBridgeAuthenticationLeaseCurrent(cwd, pinnedRoot, envelope.auth.session_id, proofAuthority)) throw new BridgeRetryableError("telegram bridge auth lease changed after standby task drop");
-      return filed;
-    } finally {
-      queue.close();
+    if (bridgeRoute) {
+      if (!candidate || candidate.status !== "standby") throw new BridgeRetryableError("telegram standby route disappeared before task write");
+      if (candidate.runId !== resolved) throw new BridgeRetryableError("telegram standby route changed before task write");
     }
+    const write = (): string | null => {
+      const envelope = createAuthenticatedInboxEnvelope(cwd, "task", { id: msg.id, text: msg.text, at: msg.at, by: msg.by ?? "telegram-bridge", run_id: resolved }, pinnedRoot, proofAuthority);
+      if (!pinnedRoot.isStable()) throw new Error("telegram bridge project root changed before standby task drop");
+      const queue = openBoundedQueue(pinnedRoot.canonical_root, join(".work-state", "cto", resolved, "inbox"), { pinnedRoot });
+      if (!queue) throw new Error("telegram bridge standby inbox is unavailable or unsafe");
+      try {
+        const filed = writeInboxTaskFile(queue, inboxMessageFileName(msg.id), envelope, pinnedRoot, cwd, proofAuthority);
+        if (!pinnedRoot.isStable() || !isBridgeAuthenticationLeaseCurrent(cwd, pinnedRoot, envelope.auth.session_id, proofAuthority)) throw new BridgeRetryableError("telegram bridge auth lease changed after standby task drop");
+        return filed;
+      } finally { queue.close(); }
+    };
+    return bridgeRoute && candidate
+      ? bridgeRoute.withAuthenticatedDeliveryWrite(candidate, write)
+      : write();
   });
 }
-
 
 function writeInboxTaskFile(queue: BoundedQueue, fileName: string, envelope: unknown, pinnedRoot: PinnedProjectRoot, cwd: string, proofAuthority: CtoRuntimeProofAuthority): string | null {
   const serialized = JSON.stringify(envelope, null, 2);
@@ -350,34 +365,38 @@ export function buildStatusReply(runId: string, summary: Record<string, unknown>
 /** Classify an incoming plain message and file it; returns the reply (if any). */
 export function classifyIncoming(cwd: string, msg: BridgeIncoming, suppliedPin: PinnedProjectRoot | undefined, runtimeAccess: CtoRuntimeAccessFacade | undefined, proofAuthority: CtoRuntimeProofAuthority, bridgeRoute?: CtoRuntimeBridgeRouteAccess): BridgeResult {
   return withBridgeRoot(cwd, suppliedPin, (pinnedRoot) => {
-    const active = bridgeRoute?.resolveTelegramRoute() ?? runtimeAccess?.findActiveRun() ?? null;
+    const activeCandidate = bridgeRoute?.resolveTelegramRoute() ?? null;
+    const active = bridgeRoute ? activeCandidate : runtimeAccess?.findActiveRun() ?? null;
     if (!active && !bridgeRoute && !runtimeAccess) throw new BridgeRetryableError("telegram bridge route runtime is unavailable");
     if (active) {
+      const selectedActiveCandidate = bridgeRoute ? activeCandidate ?? undefined : undefined;
       return {
         action: "active-task",
-        filedPath: writeTaskDrop(cwd, msg, active.runId, pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute),
+        filedPath: writeTaskDrop(cwd, msg, active.runId, pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute, selectedActiveCandidate),
         runId: active.runId,
         chatId: msg.chatId,
       };
     }
     const completed = bridgeRoute ? findCompletedSummary(cwd, pinnedRoot, runtimeAccess, bridgeRoute) : runtimeAccess ? findCompletedSummary(cwd, pinnedRoot, runtimeAccess) : null;
+    const standbyCandidate = bridgeRoute?.resolveStandbyRoute() ?? null;
     if (completed) {
+      const standbyRunId = standbyCandidate?.runId ?? bridgeRoute?.ensureStandbyRun();
       return {
         action: "completed-status",
         reply: buildStatusReply(completed.runId, completed.summary),
-        filedPath: writeStandbyTask(cwd, msg, bridgeRoute?.ensureStandbyRun(), pinnedRoot, runtimeAccess, proofAuthority),
+        filedPath: writeStandbyTask(cwd, msg, standbyRunId, pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute, standbyCandidate ?? undefined),
         runId: completed.runId,
         chatId: msg.chatId,
       };
     }
-    const runId = bridgeRoute?.ensureStandbyRun() ?? ensureStandbyRun(cwd, pinnedRoot, runtimeAccess);
+    const runId = standbyCandidate?.runId ?? bridgeRoute?.ensureStandbyRun() ?? ensureStandbyRun(cwd, pinnedRoot, runtimeAccess);
     return {
       action: "standby-task",
       reply:
         "CTO is not active right now and no completed run is available to report. " +
         `Your message was saved as a task in standby run \`${runId}\` and will be picked up ` +
         "when a CTO session starts (/cto).",
-      filedPath: writeStandbyTask(cwd, msg, runId, pinnedRoot, runtimeAccess, proofAuthority),
+      filedPath: writeStandbyTask(cwd, msg, runId, pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute, standbyCandidate ?? undefined),
       runId,
       chatId: msg.chatId,
     };
@@ -505,8 +524,15 @@ export function writeAnswerMarker(
     if (!pinnedRoot.isStable()) throw new BridgeRetryableError("telegram bridge root changed before marker lookup");
     const active = bridgeRoute?.resolveTelegramRoute() ?? runtimeAccess?.findActiveRun() ?? null;
     if (!pinnedRoot.isStable()) throw new BridgeRetryableError("telegram bridge root changed during marker authority lookup");
-    if ((!runtimeAccess && !bridgeRoute) || !active || active.runId !== runId) return null;
-    ensureBridgeSession(cwd, pinnedRoot, proofAuthority)
+    if (!runtimeAccess && !bridgeRoute) return null;
+    if (!active || active.runId !== runId) {
+      if (bridgeRoute) throw new BridgeRetryableError("telegram active route changed before answer marker");
+      return null;
+    }
+    const candidate = bridgeRoute?.resolveTelegramRoute() ?? null;
+    if (bridgeRoute && (!candidate || candidate.status !== "active" || candidate.runId !== runId)) throw new BridgeRetryableError("telegram active route changed before answer marker");
+    ensureBridgeSession(cwd, pinnedRoot, proofAuthority);
+    const write = (): string | null => {
     if (!pinnedRoot.isStable()) throw new BridgeRetryableError("telegram bridge root changed before marker write");
     const envelope = createAuthenticatedInboxEnvelope(cwd, "answer", { id, text, at, by, run_id: runId }, pinnedRoot, proofAuthority);
     if (!pinnedRoot.isStable()) throw new BridgeRetryableError("telegram bridge root changed before marker queue");
@@ -544,5 +570,9 @@ export function writeAnswerMarker(
     } finally {
       queue.close();
     }
+    };
+    return bridgeRoute && candidate
+      ? bridgeRoute.withAuthenticatedDeliveryWrite(candidate, write)
+      : write();
   });
 }

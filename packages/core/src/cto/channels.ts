@@ -295,7 +295,11 @@ function legacyChatId(config: Record<string, unknown>): string | undefined {
 /** ackTarget passthrough for explicit entries: `ackTarget` or telegram `chatId`. */
 function entryAckTarget(entry: Record<string, unknown>): string | undefined {
   if (typeof entry.ackTarget === "string") return entry.ackTarget;
-  if (entry.adapter === "telegram" && typeof entry.chatId === "string") return entry.chatId;
+  if (entry.adapter === "telegram") {
+    const nested = entry.telegram;
+    if (nested && typeof nested === "object" && !Array.isArray(nested) && typeof (nested as Record<string, unknown>).chatId === "string") return (nested as Record<string, unknown>).chatId as string;
+    if (typeof entry.chatId === "string") return entry.chatId;
+  }
   return undefined;
 }
 

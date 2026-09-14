@@ -850,11 +850,13 @@ function invokeAdapterFactory(
   let adapter: EscalationAdapter | null;
   try {
     if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
+    if (bridgeRoute) bridgeRoute.assertProjectRoot(scope.root.canonical_root);
     if (!scope.pinnedRoot.isStable()) return null;
     adapter = registration.proofFactory
       ? registration.proofFactory(config, cwd, scope.pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute)
       : registration.factory(config, cwd, scope.pinnedRoot, runtimeAccess);
     if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
+    if (bridgeRoute) bridgeRoute.assertProjectRoot(scope.root.canonical_root);
   } catch (error) {
     if (error instanceof EscalationConfigError && error.code === "changed") throw error;
     return null;
@@ -1034,6 +1036,7 @@ export function createEscalationAdapter(config: EscalationConfig, cwd: string, p
   try {
     if (bridgeRoute) {
       bridgeRoute.assertLive();
+      bridgeRoute.assertProjectRoot(scope.root.canonical_root);
       if (!scope.pinnedRoot.isStable()) return null;
     }
     const registration = registrationForKind(config.adapter, scope);

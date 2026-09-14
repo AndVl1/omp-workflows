@@ -185,10 +185,7 @@ test("dispatcher lifecycle: deferred provider hook hydrates only the current use
     at: new Date().toISOString(),
     by: "adversarial-test",
   }));
-  const manager = {
-    getCwd: () => root,
-    getSessionId: () => "opaque-provider-boundary",
-  };
+  const manager = testSessionManager(root, "opaque-provider-boundary");
   const context = { cwd: root, hasUI: true, sessionManager: manager };
   let sessionShutdown: ((event: unknown, ctx: unknown) => unknown) | undefined;
   try {
@@ -247,7 +244,7 @@ test("dispatcher lifecycle: stale provider wake stays opaque and task replays un
     at: new Date().toISOString(),
     by: "adversarial-test",
   }));
-  const manager = { getCwd: () => root, getSessionId: () => "stale-provider-wake" };
+  const manager = testSessionManager(root, "stale-provider-wake");
   const context = { cwd: root, hasUI: true, sessionManager: manager };
   let sessionShutdown: ((event: unknown, ctx: unknown) => unknown) | undefined;
   try {
@@ -330,7 +327,7 @@ test("dispatcher lifecycle: stale answer wake stays opaque and leaves its effect
     at: new Date().toISOString(),
     by: "adversarial-test",
   }));
-  const manager = { getCwd: () => root, getSessionId: () => "stale-answer-wake" };
+  const manager = testSessionManager(root, "stale-answer-wake");
   const context = { cwd: root, hasUI: true, sessionManager: manager };
   let sessionShutdown: ((event: unknown, ctx: unknown) => unknown) | undefined;
   try {
@@ -397,7 +394,7 @@ test("dispatcher lifecycle: model-role research requires a one-time session-boun
     get: () => undefined,
   };
   const root = mkdtempSync(join(tmpdir(), "omp-research-auth-"));
-  const manager = { getCwd: () => root, getSessionId: () => "research-auth-session" };
+  const manager = testSessionManager(root, "research-auth-session");
   const runtime = openMockRuntime(root, "research-auth-session");
   const context = {
     cwd: root,
