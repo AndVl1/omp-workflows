@@ -119,6 +119,9 @@ function persistState(state: CtoState, root: string): void {
   try {
     const ownerSession = state.standby === true ? "core-state-revision-test" : state.owner_session ?? "core-state-revision-test";
     if (state.standby !== true) state.owner_session = ownerSession;
+    if (state.work_identity) {
+      state.work_identity = { ...state.work_identity, run_id: state.id, session_id: ownerSession };
+    }
     const originPath = join(".work-state", "cto", state.id, ".runtime-origin-proof.json");
     if (!existsSync(join(root, originPath))
       && !mintCtoRuntimeRunOrigin(pinnedRoot, state, ownerSession, "state-revision-test", ctoRuntimeRunInitialIdentityDigest(state))) {
@@ -131,7 +134,7 @@ function persistState(state: CtoState, root: string): void {
 }
 
 function fixture(id: string): CtoState {
-  return newCtoState({
+  const state = newCtoState({
     id,
     task: "state revision test",
     branch: "test",
@@ -139,6 +142,23 @@ function fixture(id: string): CtoState {
     owner_session: "core-state-revision-test",
     plan: { id, task: "state revision test", teams: [], created_at: "" },
   });
+  state.work_identity = {
+    run_id: id,
+    wave_id: "wave-state-revision",
+    slice_id: "slice-state-revision",
+    session_id: "core-state-revision-test",
+    workflow: "standard",
+    stage_id: "state-revision",
+    stage_cursor: "state-revision",
+    capability_id: "capability-state-revision",
+    capability_epoch: "epoch-state-revision",
+    slot_id: "state-revision",
+    task_id: "task-state-revision",
+    dispatch_id: "dispatch-state-revision",
+    attempt: 1,
+    worker_id: "worker-state-revision",
+  };
+  return state;
 }
 
 function publishCtoOutboxDelivery(root: string, input: { run_id: string; state_revision: number; entry_name: string; json: string | Uint8Array; legacy_entry_name?: string; routing_binding?: unknown }): string | null {
@@ -324,7 +344,10 @@ test("publication journal clear preserves a concurrent replacement", () => {
       return receipt;
     };
     try {
-      state!.standby = true;
+      // Use an ordinary state revision so publication reaches exact journal
+      // cleanup; the replacement is installed between the journal write and
+      // receipt-bound remove, exercising the concurrent-replacement fence.
+      state!.integration.note = "journal replacement";
       assert.throws(
         () => writeCtoState(state!, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() }),
         (error: unknown) => error instanceof PinnedRootError && error.code === "recovery_required",
@@ -441,6 +464,22 @@ async function crashWriterAtBoundary(root: string, runId: string, target: string
         plan: { id: runId, task: "crash-boundary candidate", teams: [], created_at: "" },
         owner_session: "core-state-revision-test",
       });
+      state.work_identity = {
+        run_id: runId,
+        wave_id: "wave-crash-boundary",
+        slice_id: "slice-crash-boundary",
+        session_id: "core-state-revision-test",
+        workflow: "standard",
+        stage_id: "state-revision",
+        stage_cursor: "state-revision",
+        capability_id: "capability-crash-boundary",
+        capability_epoch: "epoch-crash-boundary",
+        slot_id: "crash-boundary",
+        task_id: "task-crash-boundary",
+        dispatch_id: "dispatch-crash-boundary",
+        attempt: 1,
+        worker_id: "worker-crash-boundary",
+      };
       if (!mintCtoRuntimeRunOrigin(pinned, state, "core-state-revision-test", "crash-boundary", ctoRuntimeRunInitialIdentityDigest(state))) throw new Error("crash-boundary origin publication failed");
       writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable(), pinnedRoot: pinned });
     `],
@@ -570,6 +609,7 @@ function promoteStandbyForJournalCrash(root: string, runId: string, failPath: "s
   assert.ok(candidate);
   candidate!.standby = false;
   candidate!.owner_session = "promoted-session";
+  candidate!.work_identity = { ...candidate!.work_identity!, session_id: "promoted-session" };
   const statePath = join(root, ".work-state", "cto", runId, "state.json");
   const originPath = join(root, ".work-state", "cto", runId, ".runtime-origin-proof.json");
   const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
@@ -1831,6 +1871,22 @@ test("active-run index serializes concurrent run-lock writers and removes one fi
       writeFileSync(join(root, runId + ".ready"), "ready");
       while (!existsSync(join(root, "go"))) await new Promise((resolve) => setTimeout(resolve, 5));
       const state = newCtoState({ id: runId, task: runId, branch: "main", autonomous: false, owner_session: "core-state-revision-test", plan: { id: runId, task: runId, teams: [], created_at: "" } });
+      state.work_identity = {
+        run_id: runId,
+        wave_id: "wave-active-index",
+        slice_id: "slice-active-index",
+        session_id: "core-state-revision-test",
+        workflow: "standard",
+        stage_id: "state-revision",
+        stage_cursor: "state-revision",
+        capability_id: "capability-active-index",
+        capability_epoch: "epoch-active-index",
+        slot_id: "active-index",
+        task_id: "task-active-index",
+        dispatch_id: "dispatch-active-index",
+        attempt: 1,
+        worker_id: "worker-active-index",
+      };
       const pinned = PinnedProjectRoot.open(root);
       if (!pinned) throw new Error("active-index worker root could not be pinned");
       if (!mintCtoRuntimeRunOrigin(pinned, state, "core-state-revision-test", "state-revision-test", ctoRuntimeRunInitialIdentityDigest(state))) throw new Error("active-index worker origin publication failed");
