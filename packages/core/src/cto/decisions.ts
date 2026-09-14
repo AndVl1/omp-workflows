@@ -737,6 +737,16 @@ interface CanonicalRead {
   raw: string;
   descriptor?: ExactReadDescriptor;
 }
+/** Exact bytes and descriptor observed for a transaction journal entry. */
+interface TransactionJournalRead {
+  raw: string;
+  descriptor?: ExactReadDescriptor;
+}
+/** Parsed transaction paired with the exact journal bytes read from disk. */
+interface PendingTransactionRead {
+  transaction: SpecificationDecisionTransaction;
+  journal: TransactionJournalRead;
+}
 
 function readCanonicalFileWithDescriptor(
   root: string,
@@ -1452,7 +1462,7 @@ function stagedStatePreflightError(stagedStates: unknown): string | null {
   return null;
 }
 
-function readPendingTransactions(root: string, ctoRunId: string, pinnedRoot?: PinnedProjectRoot): SpecificationDecisionTransaction[] {
+function readPendingTransactions(root: string, ctoRunId: string, pinnedRoot?: PinnedProjectRoot): PendingTransactionRead[] {
   const directory = transactionDirectory(root, ctoRunId, pinnedRoot);
   const rawTransactions: Array<{ transactionId: string; path: string; raw: string; descriptor?: ExactReadDescriptor }> = [];
   let totalBytes = 0;
@@ -1516,14 +1526,14 @@ function readPendingTransactions(root: string, ctoRunId: string, pinnedRoot?: Pi
     }
   }
   const parsed = rawTransactions.map(({ transactionId, path, raw }) => parseTransaction(root, raw, path, ctoRunId, transactionId, pinnedRoot));
-  const pending: SpecificationDecisionTransaction[] = [];
+  const pending: PendingTransactionRead[] = [];
   for (let index = 0; index < parsed.length; index += 1) {
     const transaction = parsed[index]!;
     const source = rawTransactions[index]!;
     if (terminalTransaction(transaction.status)) {
       moveTerminalTransaction(root, transaction, source.raw, pinnedRoot, source.descriptor);
     } else {
-      pending.push(transaction);
+      pending.push({ transaction, journal: { raw: source.raw, descriptor: source.descriptor } });
     }
   }
   if (pending.length > DECISION_TRANSACTION_MAX_FILES) {
@@ -1546,7 +1556,7 @@ function persistTransaction(
   transaction: SpecificationDecisionTransaction,
   pinnedRoot?: PinnedProjectRoot,
   options: { beforeWrite?: () => void } = {},
-): void {
+): TransactionJournalRead {
   const content = serializeTransaction(transaction);
   const txPath = transactionPath(root, transaction, pinnedRoot);
   let publishedDescriptor: ExactReadDescriptor | undefined;
@@ -1575,6 +1585,7 @@ function persistTransaction(
     // as well makes the pending WAL transition durable across a crash.
     fsyncDirectory(root, transactionDirectory(root, transaction.cto_run_id));
   }
+  return { raw: content, descriptor: publishedDescriptor };
 }
 
 function writeDecisionArtifactPinned(
@@ -1633,6 +1644,7 @@ function removeCanonicalFileIfMatches(
   expectedDigest: string,
   pinnedRoot?: PinnedProjectRoot,
   maxBytes = DECISION_TRANSACTION_MAX_BYTES,
+  expectedDescriptor?: ExactReadDescriptor,
 ): boolean {
   const anchor = pinnedRoot ?? PinnedProjectRoot.open(root);
   if (!anchor) throw new Error("CTO_SPEC_PATH_INVALID: project root cannot be pinned for exact cleanup");
@@ -1649,6 +1661,14 @@ function removeCanonicalFileIfMatches(
       throw error;
     }
     const actualDigest = sha256Hex(decodeCanonicalUtf8(observed.bytes, candidate));
+    const observedSize = observed.size ?? observed.bytes.byteLength;
+    if (expectedDescriptor
+      && (observed.path !== expectedDescriptor.path
+        || expectedDescriptor.relative_path !== relativePath
+        || observed.dev !== expectedDescriptor.dev
+        || observed.ino !== expectedDescriptor.ino
+        || observedSize !== expectedDescriptor.size
+        || actualDigest !== expectedDescriptor.sha256)) return false;
     if (actualDigest !== expectedDigest) return false;
     try {
       anchor.removeFileIfMatches(relativePath, { dev: observed.dev, ino: observed.ino, sha256: actualDigest });
@@ -1783,7 +1803,7 @@ function commitTransaction(
   root: string,
   transaction: SpecificationDecisionTransaction,
   pinnedRoot?: PinnedProjectRoot,
-  options: { beforeDecisionWrite?: () => void } = {},
+  options: { beforeDecisionWrite?: () => void; journal?: TransactionJournalRead } = {},
 ): "committed" | "aborted" {
   if (transaction.status === "aborted") return "aborted";
   if (transaction.status === "quarantined") {
@@ -1795,6 +1815,7 @@ function commitTransaction(
   }
 
   const txPath = transactionPath(root, transaction, pinnedRoot);
+  let cleanupJournal: TransactionJournalRead = options.journal ?? { raw: serializeTransaction(transaction) };
   const currentDigest = currentCanonicalDigest(root, transaction.decision_path, pinnedRoot);
   if (currentDigest !== transaction.decision_digest) {
     if (currentDigest !== transaction.base_decisions_digest) {
@@ -1811,7 +1832,7 @@ function commitTransaction(
         options.beforeDecisionWrite,
         (receipt) => {
           transaction.decision_receipt = durableWriteReceipt(receipt);
-          persistTransaction(root, transaction, pinnedRoot, { beforeWrite: options.beforeDecisionWrite });
+          cleanupJournal = persistTransaction(root, transaction, pinnedRoot, { beforeWrite: options.beforeDecisionWrite });
           injectDecisionFailure("before_decision_publish", transaction.transaction_id);
         },
       );
@@ -1862,7 +1883,7 @@ function commitTransaction(
             const durable = receipts.map(durableWriteReceipt);
             staged.receipts = durable;
             staged.receipt_chain = [...(staged.receipt_chain ?? []), durable];
-            persistTransaction(root, transaction, pinnedRoot, { beforeWrite: options.beforeDecisionWrite });
+            cleanupJournal = persistTransaction(root, transaction, pinnedRoot, { beforeWrite: options.beforeDecisionWrite });
             injectDecisionFailure("before_feature_state_publish", transaction.transaction_id);
           },
         } : {}),
@@ -1885,12 +1906,12 @@ function commitTransaction(
     // The exact receipt was already persisted in beforePublish. Rechecking
     // source identity here would mistake a concurrent replacement of the
     // just-published inode for a stale preimage and strand the WAL pending.
-    persistTransaction(root, transaction, pinnedRoot);
+    cleanupJournal = persistTransaction(root, transaction, pinnedRoot);
   }
 
   injectDecisionFailure("after_commit", transaction.transaction_id);
   try {
-    if (!removeCanonicalFileIfMatches(root, txPath, sha256Hex(JSON.stringify(transaction, null, 2) + "\n"), pinnedRoot, DECISION_TRANSACTION_MAX_FILE_BYTES)) {
+    if (!removeCanonicalFileIfMatches(root, txPath, sha256Hex(cleanupJournal.raw), pinnedRoot, DECISION_TRANSACTION_MAX_FILE_BYTES, cleanupJournal.descriptor)) {
       throw new Error("transaction cleanup target changed before exact removal");
     }
   } catch (error) {
@@ -1907,11 +1928,11 @@ function recoverPendingTransactions(
   pinnedRoot?: PinnedProjectRoot,
 ): SpecificationDecisionTransaction[] {
   const completed: SpecificationDecisionTransaction[] = [];
-  for (const transaction of readPendingTransactions(root, ctoRunId, pinnedRoot)) {
+  for (const { transaction, journal } of readPendingTransactions(root, ctoRunId, pinnedRoot)) {
     const guard = pinnedRoot
       ? () => assertCtoDecisionSourcesCurrent(root, transaction, pinnedRoot)
       : undefined;
-    if (commitTransaction(root, transaction, pinnedRoot, { beforeDecisionWrite: guard }) === "committed") completed.push(transaction);
+    if (commitTransaction(root, transaction, pinnedRoot, { beforeDecisionWrite: guard, journal }) === "committed") completed.push(transaction);
   }
   return completed;
 }
@@ -2433,11 +2454,11 @@ function recordCtoSpecificationDecisionsUnlocked(
   } else {
     assertContainedPath(root, txPath, { allowMissing: true, regularFile: true });
   }
-  persistTransaction(root, transaction, pinnedRoot, { beforeWrite: assertDecisionSourcesCurrent });
+  const preparedJournal = persistTransaction(root, transaction, pinnedRoot, { beforeWrite: assertDecisionSourcesCurrent });
   injectDecisionFailure("after_prepare", transaction.transaction_id);
 
   try {
-    const outcome = commitTransaction(root, transaction, pinnedRoot, { beforeDecisionWrite: assertDecisionSourcesCurrent });
+    const outcome = commitTransaction(root, transaction, pinnedRoot, { beforeDecisionWrite: assertDecisionSourcesCurrent, journal: preparedJournal });
     if (outcome === "aborted") {
       throw new Error(`CTO_SPEC_DECISION_ABORTED: transaction aborted (${transaction.abort_reason ?? "unknown"})`);
     }

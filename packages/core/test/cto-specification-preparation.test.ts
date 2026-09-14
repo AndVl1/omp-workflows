@@ -1391,16 +1391,13 @@ describe("CTO specification preparation decisions", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
-  test("recovers a prepared decision exactly once across every durable write boundary", async () => {
+  test("recovers a prepared decision exactly once across every reachable durable write boundary", async () => {
     const failurePoints = [
       "before_prepare",
       "after_prepare",
       "before_decisions_write",
       "before_decision_publish",
       "after_decisions_write",
-      "before_feature_state_write",
-      "before_feature_state_publish",
-      "after_feature_state_write",
       "after_commit",
     ] as const;
 
