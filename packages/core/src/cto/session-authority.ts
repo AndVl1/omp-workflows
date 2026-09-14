@@ -19,6 +19,8 @@ export type CtoRuntimeSessionAuthorityRoot = {
 export type CtoRuntimeSessionAuthoritySession = {
   readonly sessionManager: object;
   readonly sessionId: string;
+  readonly sessionFile?: string;
+  readonly sessionBasename?: string;
   readonly generation?: string | number;
 };
 
@@ -27,6 +29,8 @@ export type CtoRuntimeSessionAuthorityCell = {
   readonly root: CtoRuntimeSessionAuthorityRoot;
   readonly sessionManager: object;
   readonly sessionId: string;
+  readonly sessionFile?: string;
+  readonly sessionBasename?: string;
   readonly generation?: string | number;
   readonly liveGuard: () => void;
   revoked: boolean;
@@ -80,6 +84,8 @@ export function issueCtoRuntimeSessionAuthority(
     root: Object.freeze({ ...root }),
     sessionManager: session.sessionManager,
     sessionId: session.sessionId,
+    ...(session.sessionFile !== undefined ? { sessionFile: session.sessionFile } : {}),
+    ...(session.sessionBasename !== undefined ? { sessionBasename: session.sessionBasename } : {}),
     ...(session.generation !== undefined ? { generation: session.generation } : {}),
     liveGuard,
     revoked: false,

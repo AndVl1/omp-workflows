@@ -44,7 +44,7 @@ export type {
   CtoRunDeliveryIndexPage,
   CtoRunDeliveryStatus,
 } from "./state.js";
-import { appendWaveUnderLock } from "./waves.js";
+import { appendWave } from "./waves.js";
 import { withCtoRegistryLock, withCtoRunLock, type CtoRunLockHandle } from "./transaction-lock.js";
 import { loadEscalationConfigRaw, type EscalationConfigInvalidCode, type EscalationConfigLoadResult, type NormalizedEscalationConfig } from "./channels.js";
 import { assessRunHealth } from "./health.js";
@@ -168,6 +168,8 @@ type RuntimeCell = {
   root: PinnedProjectRoot;
   sessionId: string;
   sessionManager: object;
+  sessionFile?: string;
+  sessionBasename?: string;
   sessionGeneration?: string | number;
   schedulers: Set<() => void>;
   revoked: boolean;
@@ -334,7 +336,9 @@ function requireLive(cell: RuntimeCell): void {
     dev: cell.snapshot.root_dev,
     ino: cell.snapshot.root_ino,
   });
-  if (!authority || authority.sessionId !== cell.sessionId || authority.sessionManager !== cell.sessionManager || authority.generation !== cell.sessionGeneration) {
+  if (!authority || authority.sessionId !== cell.sessionId || authority.sessionManager !== cell.sessionManager
+    || authority.sessionFile !== cell.sessionFile || authority.sessionBasename !== cell.sessionBasename
+    || authority.generation !== cell.sessionGeneration) {
     revoke(cell);
     throw runtimeError("activation_revoked", "CTO runtime session authority has been revoked or rebound");
   }
@@ -869,8 +873,10 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
         if (typeof callback !== "function") throw runtimeError("runtime_access_invalid", "run transaction callback is invalid");
         return withCtoRunLock(cell.root.canonical_root, runId, (handle: CtoRunLockHandle) => {
           requireLive(cell);
-          let state = readCtoStatePinned(runId, cell.root);
-          if (!state) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+          const initial = readCtoStatePinned(runId, cell.root);
+          if (!initial) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
+          let state = structuredClone(initial) as CtoState;
+          let dirty = false;
           const activity = { active: true };
           const transaction: CtoRunTransactionFacade = Object.create(null) as CtoRunTransactionFacade;
           Object.defineProperties(transaction, {
@@ -878,7 +884,7 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
               enumerable: false,
               value: (): CtoState => {
                 requireTransactionActive(cell, activity);
-                return state!;
+                return state;
               },
             },
             writeState: {
@@ -886,15 +892,9 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
               value: (next: CtoState): string => {
                 requireTransactionActive(cell, activity);
                 if (!next || typeof next !== "object" || next.id !== runId) throw runtimeError("runtime_access_invalid", "run transaction state identity does not match the bound run");
-                const path = writeCtoStateLocked(next, cell.root.canonical_root, {
-                  pinnedRoot: cell.root,
-                  preCommit: ({ pinnedRoot }) => {
-                    requireTransactionActive(cell, activity);
-                    if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "CTO project root changed before state commit");
-                  },
-                });
-                state = next;
-                return path;
+                state = structuredClone(next) as CtoState;
+                dirty = true;
+                return join(cell.root.canonical_root, ".work-state", "cto", runId, "state.json");
               },
             },
             appendWave: {
@@ -902,13 +902,12 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
               value: (options: AppendWaveOptions): CtoState => {
                 requireTransactionActive(cell, activity);
                 if (!ownRecord(options)) throw runtimeError("runtime_access_invalid", "wave options must be a plain object");
-                const next = appendWaveUnderLock(state!, options, handle);
+                const next = appendWave(state, options);
                 if (next !== state) {
-                  requireTransactionActive(cell, activity);
-                  writeCtoStateLocked(next, cell.root.canonical_root, { pinnedRoot: cell.root });
                   state = next;
+                  dirty = true;
                 }
-                return state!;
+                return state;
               },
             },
             findWaveBySourceId: {
@@ -916,7 +915,7 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
               value: (sourceId: string): WaveRecord | null => {
                 requireTransactionActive(cell, activity);
                 requireSafeRunId(sourceId);
-                const matches = (state!.wave_history ?? []).filter((wave) => wave.source_id === sourceId);
+                const matches = (state.wave_history ?? []).filter((wave) => wave.source_id === sourceId);
                 return matches.length === 1 ? matches[0]! : null;
               },
             },
@@ -926,14 +925,20 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
             const result = callback(transaction);
             let then: unknown;
             try {
-              if (result !== null && (typeof result === "object" || typeof result === "function")) {
-                then = (result as { then?: unknown }).then;
-              }
+              if (result !== null && (typeof result === "object" || typeof result === "function")) then = (result as { then?: unknown }).then;
             } catch {
               throw runtimeError("runtime_access_invalid", "run transaction result thenable inspection failed");
             }
-            if (typeof then === "function") {
-              throw runtimeError("cto_runtime_transaction_async_unsupported", "CTO run transactions must complete synchronously");
+            if (typeof then === "function") throw runtimeError("cto_runtime_transaction_async_unsupported", "CTO run transactions must complete synchronously");
+            if (dirty) {
+              requireTransactionActive(cell, activity);
+              writeCtoStateLocked(state, cell.root.canonical_root, {
+                pinnedRoot: cell.root,
+                preCommit: ({ pinnedRoot }) => {
+                  requireTransactionActive(cell, activity);
+                  if (!pinnedRoot.isStable()) throw runtimeError("activation_revoked", "CTO project root changed before transaction commit");
+                },
+              });
             }
             return result;
           } finally {
@@ -947,7 +952,8 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
       value: (runId: string, intervalMs: number, onWave: () => void): () => void => {
         requireLive(cell);
         requireSafeRunId(runId);
-        if (!Number.isFinite(intervalMs) || intervalMs <= 0 || typeof onWave !== "function") throw runtimeError("runtime_access_invalid", "scheduler arguments are invalid");
+        if (!Number.isSafeInteger(intervalMs) || intervalMs < MIN_RUNTIME_ACCESS_INTERVAL_MS || intervalMs > MAX_RUNTIME_ACCESS_INTERVAL_MS || typeof onWave !== "function") throw runtimeError("runtime_access_invalid", "scheduler arguments are invalid");
+        if (cell.schedulers.size >= MAX_RUNTIME_ACCESS_SCHEDULERS) throw runtimeError("runtime_access_invalid", "runtime scheduler capacity is exhausted");
         const state = readCtoStatePinned(runId, cell.root);
         if (!state) throw runtimeError("runtime_access_invalid", `CTO run '${runId}' is unavailable`);
         let stopped = false;
@@ -1053,6 +1059,8 @@ export function openCtoRuntimeAccess(
     root,
     sessionId: authority.sessionId,
     sessionManager: authority.sessionManager,
+    ...(authority.sessionFile !== undefined ? { sessionFile: authority.sessionFile } : {}),
+    ...(authority.sessionBasename !== undefined ? { sessionBasename: authority.sessionBasename } : {}),
     ...(authority.generation !== undefined ? { sessionGeneration: authority.generation } : {}),
     schedulers: new Set(),
     revoked: false,
