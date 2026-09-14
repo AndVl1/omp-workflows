@@ -5,6 +5,7 @@ import {
   fstatSync,
   fsyncSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   openSync,
   readSync,
@@ -647,7 +648,13 @@ export async function withPinnedExclusiveLockAsync<T>(
 
 
 /** Atomic single-link replacement using the same destination primitive as reports. */
-export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buffer): boolean {
+export interface PinnedWriteOptions {
+  /** Publish only when the destination is absent; never replace a concurrent leaf. */
+  readonly replaceExisting?: boolean;
+}
+
+export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buffer, options: PinnedWriteOptions = {}): boolean {
+  const replaceExisting = options.replaceExisting !== false;
   if (!safeName(name) || bytes.length > MAX_PINNED_WRITE_BYTES) return false;
   if (!pinnedDirectoryIsStable(root)) return false;
   const destination = join(root.lexicalPath, name);
@@ -665,7 +672,12 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
       if (!pinnedDirectoryIsStable(root)) return false;
       testHooks?.beforeTargetRename?.(destination);
       if (!pinnedDirectoryIsStable(root)) return false;
-      if (runDarwinHelper(root, 'publish', { final: name, temporary }) === null) return false;
+      if (replaceExisting) {
+        if (runDarwinHelper(root, 'publish', { final: name, temporary }) === null) return false;
+      } else {
+        linkSync(join(root.lexicalPath, temporary), destination);
+        unlinkSync(join(root.lexicalPath, temporary));
+      }
       temporary = null;
       published = true;
       return pinnedDirectoryIsStable(root);
@@ -696,7 +708,12 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
     if (!pinnedDirectoryIsStable(root)) return false;
     testHooks?.beforeTargetRename?.(destination);
     if (!pinnedDirectoryIsStable(root)) return false;
-    renameSync(temporary, join(descriptorRoot, name));
+    if (replaceExisting) {
+      renameSync(temporary, join(descriptorRoot, name));
+    } else {
+      linkSync(temporary, join(descriptorRoot, name));
+      unlinkSync(temporary);
+    }
     temporary = null;
     published = true;
     fsyncSync(root.fd);

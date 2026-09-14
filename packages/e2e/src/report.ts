@@ -443,6 +443,8 @@ const MAX_EVIDENCE_FILES = 4096;
 const MAX_EVIDENCE_FILE_BYTES = MAX_PINNED_READ_BYTES;
 /** Maximum bytes copied across all evidence files. */
 const MAX_EVIDENCE_BYTES = 64 * 1024 * 1024;
+/** Maximum bytes aggregated across all child sessions in one suite report. */
+const MAX_SUITE_EVIDENCE_BYTES = MAX_EVIDENCE_BYTES;
 
 function boundedFileSize(path: string): number | null {
   const absolute = resolve(path);
@@ -473,6 +475,10 @@ function boundedReadableFile(path: string): boolean {
 /* Evidence collection                                                 */
 /* ------------------------------------------------------------------ */
 
+function isCredentialBearingEvidence(scratchDir: string, path: string): boolean {
+  return projectRelative(scratchDir, resolve(path)) === '.work-state/ux-e2e/session.json';
+}
+
 function evidenceCandidates(
   scratchDir: string,
   screenshots: readonly string[],
@@ -482,7 +488,7 @@ function evidenceCandidates(
   const stateDir = join(scratchDir, '.work-state', 'ux-e2e');
   const candidates: string[] = [];
   const addCandidate = (value: string): void => {
-    if (candidates.length < MAX_EVIDENCE_FILES && value.length > 0) candidates.push(value);
+    if (candidates.length < MAX_EVIDENCE_FILES && value.length > 0 && !isCredentialBearingEvidence(scratchDir, value)) candidates.push(value);
   };
   addCandidate(join(stateDir, 'transcript.jsonl'));
   // session.json contains bearer/control/startup credentials. Its terminal
@@ -504,7 +510,7 @@ export interface EvidenceCopyTestHooks extends FsSafetyTestHooks {}
 export function setEvidenceCopyTestHooks(hooks: EvidenceCopyTestHooks | null): void {
   setFsSafetyTestHooks(hooks);
 }
-function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir: string): string[] {
+function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir: string, maxBytes = MAX_EVIDENCE_BYTES): string[] {
   const sourceRoot = pinDirectory(scratchDir);
   const targetRoot = pinOrCreateDirectory(targetDir);
   if (sourceRoot === null || targetRoot === null) {
@@ -516,11 +522,12 @@ function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir
     const copied: string[] = [];
     let totalBytes = 0;
     for (const source of evidence) {
-      if (copied.length >= MAX_EVIDENCE_FILES || totalBytes >= MAX_EVIDENCE_BYTES) break;
+      if (copied.length >= MAX_EVIDENCE_FILES || totalBytes >= maxBytes) break;
+      if (isCredentialBearingEvidence(scratchDir, source)) continue;
       const bytes = readPinnedEvidence(sourceRoot, source);
       if (bytes === null
         || bytes.length > MAX_EVIDENCE_FILE_BYTES
-        || bytes.length > MAX_EVIDENCE_BYTES - totalBytes) continue;
+        || bytes.length > maxBytes - totalBytes) continue;
       totalBytes += bytes.length;
       const relativeSource = projectRelative(scratchDir, resolve(source));
       const sourceParts = relativeSource === null ? ['external'] : relativeSource.split('/');
@@ -543,7 +550,7 @@ function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir
           copied.push(join(destinationDir, filename));
           continue;
         }
-        if (!writePinnedFile(destinationRoot, filename, bytes)) continue;
+        if (!writePinnedFile(destinationRoot, filename, bytes, { replaceExisting: false })) continue;
         copied.push(join(destinationDir, filename));
       } finally {
         closePinnedDirectory(destinationRoot);
@@ -960,25 +967,67 @@ function readTty(raw: unknown): { cols: number; rows: number; term: string } {
   return { cols, rows, term };
 }
 /** Runtime-narrowed scenario reference from session.json (null when absent). */
+function scenarioPath(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value.length <= 2048 && sanitizeForJson(value) === value ? value : undefined;
+}
+
+function scenarioPathList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length > 4096) return undefined;
+  const paths = value.map(scenarioPath).filter((path): path is string => path !== undefined);
+  return paths.length === value.length ? paths : undefined;
+}
+
+function readScenarioWorkspace(raw: unknown): ScenarioWorkspacePaths | undefined {
+  const record = asRecord(raw);
+  if (record === null) return undefined;
+  const result: ScenarioWorkspacePaths = {
+    ...(scenarioPath(record.path) !== undefined ? { path: scenarioPath(record.path) } : {}),
+    ...(scenarioPath(record.state_path) !== undefined ? { state_path: scenarioPath(record.state_path) } : {}),
+    ...(scenarioPathList(record.documents) !== undefined ? { documents: scenarioPathList(record.documents) } : {}),
+    ...(scenarioPathList(record.validation) !== undefined ? { validation: scenarioPathList(record.validation) } : {}),
+    ...(scenarioPathList(record.history) !== undefined ? { history: scenarioPathList(record.history) } : {}),
+    ...(scenarioPathList(record.handoff) !== undefined ? { handoff: scenarioPathList(record.handoff) } : {}),
+    ...(scenarioPathList(record.checkpoints) !== undefined ? { checkpoints: scenarioPathList(record.checkpoints) } : {}),
+    ...(scenarioPathList(record.evidence) !== undefined ? { evidence: scenarioPathList(record.evidence) } : {}),
+  };
+  return Object.keys(result).length === 0 ? undefined : result;
+}
+
+function readScenarioTranscript(raw: unknown): ScenarioTranscriptExpectations | undefined {
+  const record = asRecord(raw);
+  if (record === null) return undefined;
+  const result: ScenarioTranscriptExpectations = {
+    ...(scenarioPathList(record.checkpoints) !== undefined ? { checkpoints: scenarioPathList(record.checkpoints) } : {}),
+    ...(scenarioPathList(record.workers) !== undefined ? { workers: scenarioPathList(record.workers) } : {}),
+    ...(scenarioPathList(record.validation) !== undefined ? { validation: scenarioPathList(record.validation) } : {}),
+    ...(scenarioPathList(record.history) !== undefined ? { history: scenarioPathList(record.history) } : {}),
+    ...(scenarioPathList(record.handoff) !== undefined ? { handoff: scenarioPathList(record.handoff) } : {}),
+    ...(scenarioPathList(record.interruption) !== undefined ? { interruption: scenarioPathList(record.interruption) } : {}),
+    ...(scenarioPathList(record.resume) !== undefined ? { resume: scenarioPathList(record.resume) } : {}),
+    ...(scenarioPathList(record.next_actions) !== undefined ? { next_actions: scenarioPathList(record.next_actions) } : {}),
+  };
+  return Object.keys(result).length === 0 ? undefined : result;
+}
+
 function readScenarioRef(raw: unknown): ReportScenarioReference | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const record = raw as Record<string, unknown>;
-  const id = typeof record['id'] === 'string' ? record['id'] : 'unknown';
-  const title = typeof record['title'] === 'string' ? record['title'] : undefined;
-  const selectorsRecord = asRecord(record['selectors']);
+  const id = scenarioPath(record.id) ?? 'unknown';
+  const title = scenarioPath(record.title);
+  const selectorsRecord = asRecord(record.selectors);
   const featureId = nonEmptyString(selectorsRecord?.['feature_id']);
   const runKey = nonEmptyString(selectorsRecord?.['run_key']);
   const selectors = featureId !== null && runKey !== null
     ? { feature_id: featureId, run_key: runKey }
     : undefined;
-  const workspace = asRecord(record['workspace']) as ScenarioWorkspacePaths | null;
-  const transcript = asRecord(record['transcript']) as ScenarioTranscriptExpectations | null;
+  const workspace = readScenarioWorkspace(record.workspace);
+  const transcript = readScenarioTranscript(record.transcript);
   return {
     id,
     ...(title !== undefined ? { title } : {}),
     ...(selectors !== undefined ? { selectors } : {}),
-    ...(workspace !== null ? { workspace } : {}),
-    ...(transcript !== null ? { transcript } : {}),
+    ...(workspace !== undefined ? { workspace } : {}),
+    ...(transcript !== undefined ? { transcript } : {}),
   };
 }
 interface DeclaredScenarioEvidence {
@@ -1025,6 +1074,10 @@ function declaredScenarioEvidencePaths(
       continue;
     }
     const absolute = resolve(scratchDir, value);
+    if (isCredentialBearingEvidence(scratchDir, absolute)) {
+      missing += 1;
+      continue;
+    }
     if (projectRelative(scratchDir, absolute) === null || !boundedReadableFile(absolute)) {
       missing += 1;
       continue;
@@ -1075,7 +1128,7 @@ function assertPassReadiness(
   }
   const missingScreenshots = screenshots.filter(path => {
     const absolute = resolve(path);
-    if (projectRelative(scratchDir, absolute) === null || hasSymlinkAncestor(scratchDir, absolute)) return true;
+    if (isCredentialBearingEvidence(scratchDir, absolute) || projectRelative(scratchDir, absolute) === null || hasSymlinkAncestor(scratchDir, absolute)) return true;
     try {
       const info = lstatSync(absolute);
       if (info.isSymbolicLink() || !info.isFile()) return true;
@@ -1495,27 +1548,54 @@ function generateSingleReport(
 
 
 const MAX_SUITE_CHILDREN = 64;
+const MAX_SUITE_DIRECTORY_ENTRIES = 1024;
 
 interface SuiteChild {
   readonly name: string;
   readonly scratchDir: string;
+  readonly childDev: number;
+  readonly childIno: number;
+  readonly sessionDev: number;
+  readonly sessionIno: number;
+  readonly sessionDigest: string;
 }
 
-function existingPath(path: string): { readonly isDirectory: boolean; readonly isSymbolicLink: boolean; readonly isFile: boolean } | null {
+interface SuiteDiscovery {
+  readonly root: PinnedDirectory;
+  readonly children: SuiteChild[];
+}
+
+function existingPath(path: string): { readonly isDirectory: boolean; readonly isSymbolicLink: boolean; readonly isFile: boolean; readonly dev: number; readonly ino: number } | null {
   try {
     const info = lstatSync(path);
-    return { isDirectory: info.isDirectory(), isSymbolicLink: info.isSymbolicLink(), isFile: info.isFile() };
+    return { isDirectory: info.isDirectory(), isSymbolicLink: info.isSymbolicLink(), isFile: info.isFile(), dev: info.dev, ino: info.ino };
   } catch {
     return null;
   }
 }
 
+function sessionDescriptor(sessionPath: string): { readonly dev: number; readonly ino: number; readonly digest: string } | null {
+  const parent = pinDirectory(dirname(sessionPath));
+  if (parent === null) return null;
+  try {
+    const bytes = readPinnedFileFull(parent, basename(sessionPath), 1024 * 1024);
+    if (bytes === null) return null;
+    const info = lstatSync(sessionPath);
+    if (info.isSymbolicLink() || !info.isFile() || !pinnedDirectoryIsStable(parent)) return null;
+    return { dev: info.dev, ino: info.ino, digest: createHash('sha256').update(bytes).digest('hex') };
+  } catch {
+    return null;
+  } finally {
+    closePinnedDirectory(parent);
+  }
+}
+
 /** Discover immediate, real session scratches under a suite root. */
-function discoverSuiteChildren(suiteRoot: string): SuiteChild[] | null {
+function discoverSuiteChildren(suiteRoot: string): SuiteDiscovery | null {
   const rootSession = existingPath(join(suiteRoot, '.work-state', 'ux-e2e', 'session.json'));
-  if (rootSession !== null) return null;
   const root = pinDirectory(suiteRoot);
   if (root === null) return null;
+  let retainRoot = false;
   const children: SuiteChild[] = [];
   try {
     if (!pinnedDirectoryIsStable(root)) throw new Error('ux-e2e: suite root changed during child enumeration');
@@ -1526,34 +1606,58 @@ function discoverSuiteChildren(suiteRoot: string): SuiteChild[] | null {
         const entry = handle.readSync();
         if (entry === null) break;
         if (entry.isSymbolicLink()) throw new Error('ux-e2e: suite child ' + entry.name + ' must not be a symlink');
-        if (entry.isDirectory()) names.push(entry.name);
+        if (entry.isDirectory()) {
+          if (names.length >= MAX_SUITE_DIRECTORY_ENTRIES) throw new Error('ux-e2e: suite has too many immediate directory entries');
+          names.push(entry.name);
+        }
       }
     } finally {
       try { handle.closeSync(); } catch { /* best effort */ }
     }
     names.sort();
     for (const name of names) {
-      if (children.length >= MAX_SUITE_CHILDREN) throw new Error('ux-e2e: suite has more than ' + String(MAX_SUITE_CHILDREN) + ' child sessions');
-      if (!safeFilenameSegment(name)) throw new Error('ux-e2e: suite child name is unsafe: ' + name);
       const child = join(suiteRoot, name);
       const childState = join(child, '.work-state', 'ux-e2e');
       const stateInfo = existingPath(childState);
+      // Ordinary real directories (for example .git or report output) do not
+      // claim session ownership and are intentionally ignored.
       if (stateInfo === null) continue;
       if (stateInfo.isSymbolicLink || !stateInfo.isDirectory) throw new Error('ux-e2e: malformed suite child ' + name + ' state directory');
+      if (!safeFilenameSegment(name)) throw new Error('ux-e2e: suite child name is unsafe: ' + name);
+      if (children.length >= MAX_SUITE_CHILDREN) throw new Error('ux-e2e: suite has more than ' + String(MAX_SUITE_CHILDREN) + ' child sessions');
       const sessionPath = join(childState, 'session.json');
       const sessionInfo = existingPath(sessionPath);
       if (sessionInfo === null || sessionInfo.isSymbolicLink || !sessionInfo.isFile) {
         throw new Error('ux-e2e: malformed suite child ' + name + ' session metadata');
       }
-      const raw = readSessionMeta(child);
-      if (raw.schema_version !== 2) throw new Error('ux-e2e: malformed suite child ' + name + ' session metadata');
-      children.push({ name, scratchDir: resolve(child) });
+      const descriptor = sessionDescriptor(sessionPath);
+      if (descriptor === null || readSessionMeta(child).schema_version !== 2) throw new Error('ux-e2e: malformed suite child ' + name + ' session metadata');
+      const childInfo = existingPath(child);
+      if (childInfo === null || childInfo.isSymbolicLink || !childInfo.isDirectory) throw new Error('ux-e2e: malformed suite child ' + name + ' directory');
+      children.push({ name, scratchDir: resolve(child), childDev: childInfo.dev, childIno: childInfo.ino, sessionDev: descriptor.dev, sessionIno: descriptor.ino, sessionDigest: descriptor.digest });
     }
     if (!pinnedDirectoryIsStable(root)) throw new Error('ux-e2e: suite root changed during child enumeration');
-    return children.length === 0 ? null : children;
+    if (rootSession !== null && children.length > 0) throw new Error('ux-e2e: ambiguous suite root and child session ownership');
+    if (children.length === 0) return null;
+    retainRoot = true;
+    return { root, children };
   } finally {
-    closePinnedDirectory(root);
+    if (!retainRoot) closePinnedDirectory(root);
   }
+}
+
+function sameSuiteChildren(left: readonly SuiteChild[], right: readonly SuiteChild[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((child, index) => {
+    const other = right[index];
+    return other !== undefined
+      && child.name === other.name
+      && child.childDev === other.childDev
+      && child.childIno === other.childIno
+      && child.sessionDev === other.sessionDev
+      && child.sessionIno === other.sessionIno
+      && child.sessionDigest === other.sessionDigest;
+  });
 }
 
 function childSessionEntry(report: UxE2eReport, evidence: readonly string[]): ReportChildSession {
@@ -1577,10 +1681,12 @@ function childSessionEntry(report: UxE2eReport, evidence: readonly string[]): Re
 
 function writeSuiteReport(
   suiteRoot: string,
+  suiteRootHandle: PinnedDirectory,
   mdDir: string,
   report: UxE2eReport,
   warnings: readonly string[],
 ): GenerateReportResult {
+  if (!pinnedDirectoryIsStable(suiteRootHandle)) throw new Error('ux-e2e: suite root changed before report output');
   const reportRoot = pinOrCreateDirectory(mdDir);
   if (reportRoot === null) throw new Error('ux-e2e: report destination root must be a stable non-symlink directory');
   try {
@@ -1588,15 +1694,18 @@ function writeSuiteReport(
     const stateRoot = pinOrCreateDirectory(stateDir);
     if (stateRoot === null) throw new Error('ux-e2e: suite report directory must be a stable non-symlink directory');
     try {
+      if (!pinnedDirectoryIsStable(suiteRootHandle)) throw new Error('ux-e2e: suite root changed before report output');
       const jsonPath = join(stateDir, 'report.json');
       if (!writePinnedFile(stateRoot, 'report.json', Buffer.from(JSON.stringify(report, null, 2) + '\n'))) {
         throw new Error('ux-e2e: failed to write suite report.json');
       }
+      if (!pinnedDirectoryIsStable(suiteRootHandle)) throw new Error('ux-e2e: suite root changed after report JSON output');
       const mdFilename = report.session.slug + '-ux-e2e-' + todayStamp() + '.md';
       const mdPath = join(mdDir, mdFilename);
       if (!writePinnedFile(reportRoot, mdFilename, Buffer.from(renderMarkdown(report)))) {
         throw new Error('ux-e2e: failed to write suite markdown report');
       }
+      if (!pinnedDirectoryIsStable(suiteRootHandle)) throw new Error('ux-e2e: suite root changed after report output');
       return { jsonPath, mdPath, warnings: [...warnings] };
     } finally {
       closeSync(stateRoot.fd);
@@ -1608,10 +1717,11 @@ function writeSuiteReport(
 
 function generateSuiteReport(
   suiteRoot: string,
-  children: readonly SuiteChild[],
+  discovery: SuiteDiscovery,
   input: ReportInput,
   opts: GenerateReportOptions,
 ): GenerateReportResult {
+  const children = discovery.children;
   const childReports: Array<{ readonly child: SuiteChild; readonly result: InternalGenerateReportResult }> = [];
   const warnings: string[] = [];
   for (const child of children) {
@@ -1622,10 +1732,21 @@ function generateSuiteReport(
   const mdDir = resolve(opts.mdDir ?? join(process.cwd(), 'vibe-report'));
   const childEntries: ReportChildSession[] = [];
   const aggregateEvidence: string[] = [];
+  let aggregateEvidenceBytes = 0;
   for (const { child, result } of childReports) {
+    let childEvidenceBytes = 0;
+    for (const evidencePath of result.report.evidence) {
+      const size = boundedFileSize(evidencePath);
+      if (size === null) continue;
+      if (size > MAX_SUITE_EVIDENCE_BYTES - aggregateEvidenceBytes - childEvidenceBytes) {
+        throw new Error('ux-e2e: suite evidence exceeds the aggregate byte limit');
+      }
+      childEvidenceBytes += size;
+    }
     const childEvidence = opts.copyEvidence === true
-      ? copyEvidence(result.report.evidence, join(mdDir, 'evidence', child.name), child.scratchDir)
+      ? copyEvidence(result.report.evidence, join(mdDir, 'evidence', child.name), child.scratchDir, MAX_SUITE_EVIDENCE_BYTES - aggregateEvidenceBytes)
       : [...result.report.evidence];
+    aggregateEvidenceBytes += childEvidenceBytes;
     childEntries.push(childSessionEntry(result.report, childEvidence));
     aggregateEvidence.push(...childEvidence);
   }
@@ -1633,6 +1754,15 @@ function generateSuiteReport(
   if (first === undefined) throw new Error('ux-e2e: suite has no child sessions');
   const rootSlug = basename(resolve(suiteRoot)).replace(/^omp-ux-e2e-/u, '') || 'ux-e2e-suite';
   if (!safeFilenameSegment(rootSlug)) throw new Error('ux-e2e: suite root slug must be a bounded safe filename segment');
+  const currentDiscovery = discoverSuiteChildren(suiteRoot);
+  if (currentDiscovery === null) throw new Error('ux-e2e: suite child membership changed before report output');
+  try {
+    if (!pinnedDirectoryIsStable(discovery.root) || !sameSuiteChildren(discovery.children, currentDiscovery.children)) {
+      throw new Error('ux-e2e: suite child membership changed before report output');
+    }
+  } finally {
+    closePinnedDirectory(currentDiscovery.root);
+  }
   const report = sanitizeOutput({
     type: 'ux-e2e',
     schema_version: 1,
@@ -1665,7 +1795,7 @@ function generateSuiteReport(
     evidence: aggregateEvidence,
     generated_at: new Date().toISOString(),
   }, '') as UxE2eReport;
-  return writeSuiteReport(suiteRoot, mdDir, report, warnings);
+  return writeSuiteReport(suiteRoot, discovery.root, mdDir, report, warnings);
 }
 
 export function generateReport(
@@ -1674,8 +1804,14 @@ export function generateReport(
   opts: GenerateReportOptions = {},
 ): GenerateReportResult {
   const suiteRoot = resolve(sessionDir);
-  const children = discoverSuiteChildren(suiteRoot);
-  return children === null
-    ? (() => { const result = generateSingleReport(suiteRoot, input, opts); return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings }; })()
-    : generateSuiteReport(suiteRoot, children, input, opts);
+  const discovery = discoverSuiteChildren(suiteRoot);
+  if (discovery === null) {
+    const result = generateSingleReport(suiteRoot, input, opts);
+    return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings };
+  }
+  try {
+    return generateSuiteReport(suiteRoot, discovery, input, opts);
+  } finally {
+    closePinnedDirectory(discovery.root);
+  }
 }
