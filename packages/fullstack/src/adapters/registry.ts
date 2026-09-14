@@ -843,35 +843,48 @@ function telegramRoutingRevoked(message: string): Error & { code: "activation_re
   return error;
 }
 
+const TELEGRAM_PROJECTION_SHARED_KEYS = new Set(["adapter", "id", "name", "mode", "direction", "primary", "subscriptions", "fields", "ackTarget", "chatId", "bidirectional"]);
+function telegramConfigProjection(config: EscalationConfig): Readonly<Record<string, unknown>> {
+  const projection: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (TELEGRAM_PROJECTION_SHARED_KEYS.has(key) || key === "telegram") projection[key] = value;
+  }
+  return projection;
+}
+
+function telegramProjectionForSnapshot(
+  config: EscalationConfig,
+  snapshot: ReturnType<RuntimeAccess["resolveEscalationChannelSnapshot"]>,
+): Readonly<Record<string, unknown>> | null {
+  if (snapshot.status !== "valid") return null;
+  const candidates = snapshot.projections.telegram;
+  const configuredId = typeof config.id === "string" ? config.id.trim() : "";
+  const matching = Array.isArray(candidates)
+    ? candidates.filter((candidate) => candidate.adapter === "telegram"
+      && (configuredId.length === 0 ? candidate.id === undefined : candidate.id === configuredId)
+      && (config.primary !== true || candidate.primary === true))
+    : [];
+  return matching.length === 1 ? matching[0]! : null;
+}
+
 function createTelegramRoutingGuard(
   config: EscalationConfig,
   root: AdapterRootIdentity,
   runtimeAccess: RuntimeAccess | undefined,
   bridgeRoute: CtoRuntimeBridgeRouteAccess | undefined,
+  initialSnapshot: ReturnType<RuntimeAccess["resolveEscalationChannelSnapshot"]> | undefined,
 ): (() => void) | undefined {
   const source = bridgeRoute ?? runtimeAccess;
-  if (!source) return undefined;
-  let snapshot: ReturnType<RuntimeAccess["resolveEscalationChannelSnapshot"]>;
-  let projection: Readonly<Record<string, unknown>> | null;
-  try {
-    snapshot = source.resolveEscalationChannelSnapshot();
-    if (snapshot.status !== "valid") return undefined;
-    if (bridgeRoute) {
-      projection = bridgeRoute.resolveTelegramChannelProfile();
-    } else {
-      const candidates = snapshot.projections.telegram;
-      const configuredId = typeof config.id === "string" ? config.id.trim() : "";
-      const matching = Array.isArray(candidates)
-        ? candidates.filter((candidate) => candidate.adapter === "telegram"
-          && (configuredId.length === 0 ? candidate.id === undefined : candidate.id === configuredId)
-          && (config.primary !== true || candidate.primary === true))
-        : [];
-      projection = matching.length === 1 ? matching[0]! : null;
-    }
-  } catch {
-    return undefined;
-  }
+  if (!source || !initialSnapshot || initialSnapshot.status !== "valid") return undefined;
+  const snapshot = initialSnapshot;
+  const projection = bridgeRoute
+    ? bridgeRoute.resolveTelegramChannelProfile()
+    : telegramProjectionForSnapshot(config, snapshot);
   if (!projection || typeof snapshot.config_sha256 !== "string") return undefined;
+  if (!bridgeRoute && canonicalAuthJson(telegramConfigProjection(config)) !== canonicalAuthJson(projection)) return undefined;
+  // Capture the exact initial projection digest. The factory may synchronously
+  // rotate escalation.json; no later source read is allowed to redefine the
+  // adapter's construction-time route.
   const expectedProjectionSha = createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex");
   return (): void => {
     let currentRoot: PinnedProjectRoot | null = null;
@@ -893,16 +906,7 @@ function createTelegramRoutingGuard(
       }
       const currentProjection = bridgeRoute
         ? bridgeRoute.resolveTelegramChannelProfile()
-        : (() => {
-          const candidates = currentSnapshot.projections.telegram;
-          const configuredId = typeof config.id === "string" ? config.id.trim() : "";
-          const matching = Array.isArray(candidates)
-            ? candidates.filter((candidate) => candidate.adapter === "telegram"
-              && (configuredId.length === 0 ? candidate.id === undefined : candidate.id === configuredId)
-              && (config.primary !== true || candidate.primary === true))
-            : [];
-          return matching.length === 1 ? matching[0]! : null;
-        })();
+        : telegramProjectionForSnapshot(config, currentSnapshot);
       if (!currentProjection
         || createHash("sha256").update(JSON.stringify(currentProjection), "utf8").digest("hex") !== expectedProjectionSha) {
         throw telegramRoutingRevoked("telegram routing projection changed");
@@ -922,6 +926,8 @@ function invokeAdapterFactory(
   scope: AdapterResolutionScope,
   proofAuthority: CtoRuntimeProofAuthority,
   bridgeRoute?: CtoRuntimeBridgeRouteAccess,
+  initialRoutingSnapshot?: ReturnType<RuntimeAccess["resolveEscalationChannelSnapshot"]>,
+  routingGuards?: Array<() => void>,
 ): EscalationAdapter | null {
   if (!registration.builtin && !liveCustomRegistration(registration, scope.root)) return null;
   let adapter: EscalationAdapter | null;
@@ -929,12 +935,19 @@ function invokeAdapterFactory(
     if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
     if (bridgeRoute) bridgeRoute.assertProjectRoot(scope.root.canonical_root);
     if (!scope.pinnedRoot.isStable()) return null;
+    const routingSnapshot = initialRoutingSnapshot ?? (config.adapter === "telegram" ? (bridgeRoute ?? runtimeAccess)?.resolveEscalationChannelSnapshot() : undefined);
     const assertRoutingLive = config.adapter === "telegram"
-      ? createTelegramRoutingGuard(config, scope.root, runtimeAccess, bridgeRoute)
+      ? createTelegramRoutingGuard(config, scope.root, runtimeAccess, bridgeRoute, routingSnapshot)
       : undefined;
+    if (config.adapter === "telegram" && !assertRoutingLive) throw new EscalationConfigError("changed", "telegram routing guard could not be authenticated");
     adapter = registration.proofFactory
       ? registration.proofFactory(config, cwd, scope.pinnedRoot, runtimeAccess, proofAuthority, bridgeRoute, assertRoutingLive)
       : registration.factory(config, cwd, scope.pinnedRoot, runtimeAccess);
+    // This is the final construction fence for the adapter itself. A factory
+    // that rotates escalation.json synchronously cannot return an old-token
+    // Telegram adapter paired with a new guard (or with no guard).
+    assertRoutingLive?.();
+    if (assertRoutingLive) routingGuards?.push(assertRoutingLive);
     if (runtimeAccess) assertRuntimeScope(runtimeAccess, scope);
     if (bridgeRoute) bridgeRoute.assertProjectRoot(scope.root.canonical_root);
   } catch (error) {
@@ -1377,6 +1390,7 @@ export function createChannelSet(cwd: string, capabilities: Record<string, Chann
       `configured channel "${kind}" has no registered adapter factory`,
     );
   }
+  const telegramRoutingGuards: Array<() => void> = [];
   const build = (profile: ChannelProfile): { adapter: EscalationAdapter | null; capabilityMismatch: boolean } => {
     const kind = profile.adapter ?? profile.transport;
     if (!kind) return { adapter: null, capabilityMismatch: false };
@@ -1385,7 +1399,18 @@ export function createChannelSet(cwd: string, capabilities: Record<string, Chann
     const entry = entryFor(profile);
     if (!entry) return { adapter: null, capabilityMismatch: false };
     try {
-      const adapter = invokeAdapterFactory(registration, entry as EscalationConfig, scope.root.canonical_root, scope.pinnedRoot, runtimeAccess, scope, proofAuthority);
+      const adapter = invokeAdapterFactory(
+        registration,
+        entry as EscalationConfig,
+        scope.root.canonical_root,
+        scope.pinnedRoot,
+        runtimeAccess,
+        scope,
+        proofAuthority,
+        undefined,
+        resolvedRoutingSnapshot,
+        telegramRoutingGuards,
+      );
       if (!adapter) return { adapter: null, capabilityMismatch: false };
       if (!registration.capabilities) return { adapter, capabilityMismatch: false };
       const usable = typeof adapter.send === "function" && typeof adapter.cancel === "function";
@@ -1399,6 +1424,16 @@ export function createChannelSet(cwd: string, capabilities: Record<string, Chann
     }
   };
   const builds = profiles.map(build);
+  // Revalidate every Telegram adapter after all factories have completed: a
+  // later factory is allowed to rotate config, but the set must not return a
+  // Telegram primary built from a stale token/chat projection.
+  for (const guard of telegramRoutingGuards) {
+    try {
+      guard();
+    } catch (error) {
+      throw new EscalationConfigError("changed", String(error instanceof Error ? error.message : error));
+    }
+  }
   const unusableAnnotated = profiles.find((profile, index) => {
     const kind = profile.adapter ?? profile.transport;
     const registration = kind ? registrationForKind(kind, scope) : undefined;
