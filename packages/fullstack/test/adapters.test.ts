@@ -3531,6 +3531,47 @@ test("adapters: transport authority outage inside sendWithRetry preserves public
   }
 });
 
+test("adapters: route rotation after send starts rejects the old receipt", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-send-route-rotation-race-"));
+  try {
+    const runId = "run-send-route-rotation-race";
+    writeTelegramTestConfig(root, "token-route-a", "chat-route-a");
+    withPendingIndexedRun(root, runId);
+    const published = publishTestDelivery(root, runId, {
+      ...sampleEscalation({ id: `${runId}/question/current` }),
+      intent: "question",
+      run_id: runId,
+    });
+    let releaseSend!: () => void;
+    let notifyStarted!: () => void;
+    const started = new Promise<void>((resolve) => { notifyStarted = resolve; });
+    const sendGate = new Promise<void>((resolve) => { releaseSend = resolve; });
+    const runtime = runtimeFor(root);
+    const adapter: EscalationAdapter = {
+      kind: "route-rotation-race",
+      send: async () => {
+        notifyStarted();
+        await sendGate;
+        return { sent: true };
+      },
+      cancel: async () => undefined,
+    };
+    assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true);
+    const draining = drainOutbox(root, adapter, 1);
+    await started;
+    writeTelegramTestConfig(root, "token-route-b", "chat-route-b");
+    releaseSend();
+    const result = await draining;
+    assert.equal(result.length, 1);
+    assert.equal(result[0]?.sent, false, "a receipt from the pre-rotation route is not accepted");
+    assert.match(result[0]?.error ?? "", /authority is unavailable|not the current authenticated publication/u);
+    assert.equal(existsSync(join(root, ".work-state", "cto", runId, "outbox", "sent", basename(published))), false, "the stale receipt is not archived as sent");
+    assert.equal(existsSync(published), true, "the publication remains durable for authoritative recovery");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("adapters: move retry authority outage before mark preserves source lane", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-move-authority-pre-mark-"));
   try {

@@ -2320,10 +2320,12 @@ async function sendWithRetry(
     opts.lifecycle?.assertLive?.();
     const assertCurrentPublication = (): void => {
       if (!opts.runtimeAccess || !opts.delivery) return;
-      const routingBinding = opts.delivery.routing_binding ?? routingBindingForBytes(opts.runtimeAccess, typeof opts.delivery.json === "string" ? Buffer.from(opts.delivery.json, "utf8") : opts.delivery.json, opts.pinnedRoot) ?? undefined;
+      const deliveryBytes = typeof opts.delivery.json === "string" ? Buffer.from(opts.delivery.json, "utf8") : opts.delivery.json;
+      const routingBinding = routingBindingForBytes(opts.runtimeAccess, deliveryBytes, opts.pinnedRoot);
+      if (!routingBinding) throw new UnauthorizedDeliveryError();
       const status = currentDeliveryStatus(opts.runtimeAccess, { ...opts.delivery, routing_binding: routingBinding }, opts.pinnedRoot);
       if (status === "unavailable") throw new DeliveryAuthorityUnavailableError();
-      if (status !== "current" || !routingBinding || !adapterMatchesRoutingBinding(adapter, routingBinding)) throw new UnauthorizedDeliveryError();
+      if (status !== "current" || !adapterMatchesRoutingBinding(adapter, routingBinding)) throw new UnauthorizedDeliveryError();
     };
     try {
       assertCurrentPublication();
@@ -2340,7 +2342,10 @@ async function sendWithRetry(
       );
       opts.lifecycle?.assertLive?.();
       if ((opts.pinnedRoot && !opts.pinnedRoot.isStable()) || (opts.isOwned && !opts.isOwned())) return { receipt: { sent: false }, ownershipLost: true };
-      if (receipt.sent) return { receipt };
+      if (receipt.sent) {
+        assertCurrentPublication();
+        return { receipt };
+      }
     } catch (error) {
       if (isDispatcherActivationFailure(error)) throw error;
       if (error instanceof DeliveryAuthorityUnavailableError) return { receipt: { sent: false }, unavailable: true, error: error.message };
