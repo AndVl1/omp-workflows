@@ -961,7 +961,15 @@ test("direct CTO persistence gates pending, failed, wrong-run, and stale termina
     try {
       const state = readCtoStatePinned("cto-wave-1", runtimeRoot);
       if (!state) throw new Error("fixture CTO state unavailable for runtime proof");
-      state.owner_session = "conformance-persist-session";
+      const sessionId = "conformance-persist-session";
+      state.owner_session = sessionId;
+      const firstTeam = state.teams[0];
+      if (!firstTeam?.work_identity) throw new Error("fixture CTO team identity unavailable for runtime proof");
+      const sourceIdentity = { ...firstTeam.work_identity, session_id: sessionId };
+      firstTeam.work_identity = sourceIdentity;
+      if (firstTeam.completion_envelope) firstTeam.completion_envelope = { ...firstTeam.completion_envelope, identity: sourceIdentity };
+      state.work_identity = sourceIdentity;
+      state.wave_history = (state.wave_history ?? []).map((wave) => ({ ...wave, work_identity: sourceIdentity }));
       writeCtoState(state, root, { preCommit: ({ pinnedRoot: commitRoot }) => commitRoot.assertStable() });
       const initialDigest = ctoRuntimeRunInitialIdentityDigest(state);
       if (!mintCtoRuntimeRunOrigin(runtimeRoot, state, "conformance-persist-session", "source-1", initialDigest)
@@ -970,6 +978,7 @@ test("direct CTO persistence gates pending, failed, wrong-run, and stale termina
     } finally {
       runtimeRoot.close();
     }
+    prepared.binding = bindingFor(mapping, root, "cto-wave-1", prepared.claims as unknown as CtoActiveClaimSummary[]);
     const updateTeam = (update: (team: CtoState["teams"][number]) => void) => {
       runtime.access.withRunTransaction("cto-wave-1", (transaction) => {
         const next = transaction.readState();
