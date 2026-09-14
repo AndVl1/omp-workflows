@@ -262,6 +262,44 @@ export function pinOrCreateDirectory(directory: string): PinnedDirectory | null 
   }
 }
 
+/** Pin a descendant using the retained parent descriptor, never a re-resolved lexical root. */
+export function pinChildDirectory(root: PinnedDirectory, components: readonly string[]): PinnedDirectory | null {
+  if (components.length === 0 || components.some(component => !safeName(component))) return null;
+  if (!pinnedDirectoryIsStable(root)) return null;
+  const descriptorRoot = descriptorPathFor(root.fd);
+  if (descriptorRoot === null) return null;
+  const relativePath = components.join(sep);
+  const lexicalPath = join(root.lexicalPath, ...components);
+  const descriptorPath = join(descriptorRoot, ...components);
+  testHooks?.beforeDirectoryOpen?.(lexicalPath);
+  let fd: number | null = null;
+  let pinned = false;
+  try {
+    if (process.platform === 'darwin') {
+      if (runDarwinHelper(root, 'ensure_directory', { path: relativePath }) === null) return null;
+    }
+    try {
+      fd = openSync(descriptorPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    } catch (error) {
+      if (errnoCode(error) !== 'ENOENT' || process.platform === 'darwin') return null;
+      mkdirSync(descriptorPath, { mode: 0o700, recursive: true });
+      fd = openSync(descriptorPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    }
+    const descriptorStat = fstatSync(fd);
+    const pathStat = lstatSync(lexicalPath);
+    if (!descriptorStat.isDirectory() || pathStat.isSymbolicLink() || !pathStat.isDirectory()
+      || !sameIdentity(pathStat, descriptorStat) || !pinnedDirectoryIsStable(root)) return null;
+    const physicalPath = realpathSync(lexicalPath);
+    pinned = true;
+    return { lexicalPath, physicalPath, fd, identity: { dev: descriptorStat.dev, ino: descriptorStat.ino } };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null && !pinned) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+  }
+}
 function childPath(root: PinnedDirectory, name: string): string | null {
   if (!safeName(name)) return null;
   const descriptorRoot = process.platform === 'darwin' ? null : descriptorPathFor(root.fd);
@@ -439,6 +477,34 @@ export function unlinkPinnedFile(root: PinnedDirectory, name: string): boolean {
   }
 }
 
+export function unlinkPinnedFileIfExact(root: PinnedDirectory, name: string, expected: Buffer): boolean {
+  if (!safeName(name) || expected.length > MAX_PINNED_WRITE_BYTES) return false;
+  const digest = createHash('sha256').update(expected).digest('hex');
+  if (process.platform === 'darwin') {
+    return runDarwinHelper(root, 'unlink_if_exact', { name, size: expected.length, sha256: digest })?.removed === true;
+  }
+  const file = openPinnedFile(root, name, fsConstants.O_RDONLY);
+  if (file === null || file.size !== expected.length) {
+    if (file !== null) closePinnedFile(file);
+    return false;
+  }
+  try {
+    const bytes = Buffer.allocUnsafe(file.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = readSync(file.fd, bytes, offset, bytes.length - offset, offset);
+      if (count <= 0) return false;
+      offset += count;
+    }
+    const after = fstatSync(file.fd);
+    if (!sameIdentity(after, file.identity) || after.size !== file.size || !pinnedDirectoryIsStable(root) || !bytes.equals(expected)) return false;
+  } catch {
+    return false;
+  } finally {
+    closePinnedFile(file);
+  }
+  return unlinkPinnedFile(root, name);
+}
 export function processStartIdentity(pid: number): string | null {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   const override = testHooks?.processStartIdentity?.(pid);
@@ -675,8 +741,7 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
       if (replaceExisting) {
         if (runDarwinHelper(root, 'publish', { final: name, temporary }) === null) return false;
       } else {
-        linkSync(join(root.lexicalPath, temporary), destination);
-        unlinkSync(join(root.lexicalPath, temporary));
+        if (runDarwinHelper(root, 'publish_noreplace', { final: name, temporary }) === null) return false;
       }
       temporary = null;
       published = true;
@@ -1082,6 +1147,45 @@ def publish(final, temporary):
     os.replace(temporary, final, src_dir_fd=3, dst_dir_fd=3)
     os.fsync(3)
 
+def publish_noreplace(final, temporary):
+    final, temporary = safe_name(final), safe_name(temporary)
+    info = os.stat(temporary, dir_fd=3, follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: fail("temporary is unsafe")
+    linked = False
+    try:
+        os.link(temporary, final, src_dir_fd=3, dst_dir_fd=3, follow_symlinks=False)
+        linked = True
+        os.unlink(temporary, dir_fd=3)
+    except Exception:
+        if linked:
+            try:
+                current = os.stat(final, dir_fd=3, follow_symlinks=False)
+                if current.st_dev == info.st_dev and current.st_ino == info.st_ino and current.st_nlink == 2:
+                    os.unlink(final, dir_fd=3)
+            except Exception:
+                pass
+        raise
+    os.fsync(3)
+
+def unlink_if_exact(name, size, digest):
+    name = safe_name(name)
+    if not isinstance(size, int) or size < 0 or size > MAX_WRITE or not isinstance(digest, str) or len(digest) != 64: fail("exact unlink bounds are invalid")
+    fd, info = open_regular(name, os.O_RDONLY)
+    try:
+        if info.st_size != size: return {"removed": False}
+        data = b""
+        while len(data) < size:
+            chunk = os.read(fd, size - len(data))
+            if not chunk: fail("short read")
+            data += chunk
+        after = os.fstat(fd)
+        if after.st_dev != info.st_dev or after.st_ino != info.st_ino or after.st_size != info.st_size or hashlib.sha256(data).hexdigest() != digest: return {"removed": False}
+        os.unlink(name, dir_fd=3)
+        os.fsync(3)
+        return {"removed": True}
+    finally:
+        os.close(fd)
+
 def cleanup(temporary):
     try: os.unlink(safe_name(temporary), dir_fd=3)
     except FileNotFoundError: pass
@@ -1102,6 +1206,8 @@ try:
     elif op == "lock_release":
         lock_release(payload.get("name"), payload.get("dev"), payload.get("ino"), payload.get("digest")); result = {"ok": True}
     elif op == "publish": publish(payload.get("final"), payload.get("temporary")); result = {"ok": True}
+    elif op == "publish_noreplace": publish_noreplace(payload.get("final"), payload.get("temporary")); result = {"ok": True}
+    elif op == "unlink_if_exact": result = unlink_if_exact(payload.get("name"), payload.get("size"), payload.get("sha256"))
     elif op == "cleanup": cleanup(payload.get("temporary")); result = {"ok": True}
     else: fail("unsupported operation")
     sys.stdout.write(json.dumps(result, separators=(",", ":")))

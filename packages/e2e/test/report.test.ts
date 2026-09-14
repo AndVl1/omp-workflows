@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join, sep } from 'node:path';
+import { basename, dirname, join, sep } from 'node:path';
 import { test } from 'node:test';
 
 import {
@@ -821,6 +821,15 @@ test('report suite: symlink and malformed children are rejected instead of omitt
   rmSync(suite, { recursive: true, force: true });
 });
 
+test('report suite: caps all immediate entries, including non-directories', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-readable-spec-workflow-entry-cap-'));
+  try {
+    for (let index = 0; index <= 1024; index += 1) writeFileSync(join(suite, `entry-${String(index)}.txt`), '');
+    assert.throws(() => generateReport(suite, BASE_INPUT), /too many immediate directory entries/u);
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+  }
+});
 test('report suite: PASS requires readiness for every child before root output', () => {
   const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-readable-spec-workflow-'));
   const ready = makeSessionDir();
@@ -980,5 +989,199 @@ test('report: no-replace evidence publication preserves a concurrent destination
   } finally {
     setEvidenceCopyTestHooks(null);
     rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+test('report: no-replace publication stays on the pinned directory across a lexical root swap', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-noreplace-root-race-'));
+  const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-report-noreplace-outside-'));
+  const moved = `${mdDir}.moved`;
+  const outsideEvidenceDir = join(outside, 'evidence', 'my-feature');
+  mkdirSync(outsideEvidenceDir, { recursive: true });
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeTargetRename(destination) {
+      if (swapped || !destination.includes(`${sep}evidence${sep}my-feature${sep}`)) return;
+      const destinationDir = dirname(destination);
+      const temporaryName = readdirSync(destinationDir).find(name => name.startsWith('.') && name.endsWith('.tmp'));
+      if (temporaryName === undefined) return;
+      renameSync(join(destinationDir, temporaryName), join(outsideEvidenceDir, temporaryName));
+      renameSync(mdDir, moved);
+      symlinkSync(outside, mdDir);
+      swapped = true;
+    },
+  });
+  try {
+    assert.throws(() => generateReport(dir, BASE_INPUT, { mdDir, copyEvidence: true }), /report destination root|failed to write markdown/u);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (swapped) {
+      unlinkSync(mdDir);
+      renameSync(moved, mdDir);
+    }
+  }
+  assert.equal(swapped, true);
+  assert.equal(readdirSync(outsideEvidenceDir).some(name => !name.endsWith('.tmp')), false, 'lexical root swap must not publish the temporary outside the pinned directory');
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(mdDir, { recursive: true, force: true });
+  rmSync(outside, { recursive: true, force: true });
+});
+
+
+test('report selectors: bounded feature and run selectors accept limits and reject over-limit values', () => {
+  const accepted = makeSessionDir();
+  const acceptedSession = readSessionRecord(accepted);
+  const acceptedScenario = acceptedSession.scenario as Record<string, unknown>;
+  acceptedScenario.selectors = { feature_id: 'f'.repeat(128), run_key: 'r'.repeat(4096) };
+  delete acceptedSession.selectors;
+  writeSessionRecord(accepted, acceptedSession);
+  const acceptedResult = generateReport(accepted, { ...BASE_INPUT, verdict: 'FAIL' });
+  assert.ok(existsSync(acceptedResult.jsonPath));
+
+  const featureTooLong = makeSessionDir();
+  const featureSession = readSessionRecord(featureTooLong);
+  (featureSession.scenario as Record<string, unknown>).selectors = { feature_id: 'f'.repeat(129), run_key: 'run-1' };
+  writeSessionRecord(featureTooLong, featureSession);
+  assertSelectorFailure(featureTooLong, 'partial');
+
+  const runTooLong = makeSessionDir();
+  const runSession = readSessionRecord(runTooLong);
+  (runSession.scenario as Record<string, unknown>).selectors = { feature_id: 'feature-a', run_key: 'r'.repeat(4097) };
+  writeSessionRecord(runTooLong, runSession);
+  assertSelectorFailure(runTooLong, 'partial');
+});
+
+test('report scenario declarations: malformed known evidence lists fail PASS and sanitize non-PASS output', () => {
+  const dir = makeSessionDir();
+  const session = readSessionRecord(dir);
+  const scenario = session.scenario as Record<string, unknown>;
+  const workspace = scenario.workspace as Record<string, unknown>;
+  workspace.evidence = [123];
+  writeSessionRecord(dir, session);
+  assert.throws(() => generateReport(dir, BASE_INPUT), /all declared scenario evidence/u);
+
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-malformed-declaration-'));
+  try {
+    const result = generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir });
+    const report = JSON.parse(readFileSync(result.jsonPath, 'utf8')) as UxE2eReport;
+    assert.ok(result.warnings.some(warning => warning.includes('workspace.evidence')));
+    assert.equal(JSON.stringify(report).includes('123'), false, 'malformed raw declaration is not reflected in report output');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+test('report suite: child identity change between JSON and markdown publish rolls back exact outputs', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-readable-spec-workflow-publish-race-'));
+  const first = makeSessionDir();
+  const second = makeSessionDir();
+  renameSync(first, join(suite, 'session-a'));
+  renameSync(second, join(suite, 'session-b'));
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-suite-publish-race-md-'));
+  const sessionPath = join(suite, 'session-a', '.work-state', 'ux-e2e', 'session.json');
+  const movedSession = `${sessionPath}.moved`;
+  let mutated = false;
+  setEvidenceCopyTestHooks({
+    beforeTargetOpen(destination) {
+      if (mutated || !destination.startsWith(mdDir + sep) || !destination.endsWith('.md')) return;
+      mutated = true;
+      const mutatedSession = { ...readSessionRecord(join(suite, 'session-a')), profile: 'mutated' };
+      renameSync(sessionPath, movedSession);
+      writeFileSync(sessionPath, JSON.stringify(mutatedSession) + '\n');
+    },
+  });
+  try {
+    assert.throws(() => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }), /membership changed/u);
+    assert.equal(existsSync(join(suite, '.work-state', 'ux-e2e', 'report.json')), false);
+    assert.deepEqual(readdirSync(mdDir), []);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (existsSync(sessionPath)) unlinkSync(sessionPath);
+    if (existsSync(movedSession)) renameSync(movedSession, sessionPath);
+    rmSync(suite, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+test('report: single-session root replacement is rejected before publishing outside the retained root', () => {
+  const dir = makeSessionDir();
+  const replacement = mkdtempSync(join(tmpdir(), 'ux-e2e-single-root-replacement-'));
+  const moved = `${dir}.moved`;
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-single-root-race-md-'));
+  let replaced = false;
+  setEvidenceCopyTestHooks({
+    beforeTargetOpen(destination) {
+      if (replaced || !destination.endsWith(`${sep}report.json`)) return;
+      replaced = true;
+      renameSync(dir, moved);
+      renameSync(replacement, dir);
+    },
+  });
+  try {
+    assert.throws(() => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }), /session root changed|failed to write report/u);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (replaced) {
+      rmSync(dir, { recursive: true, force: true });
+      renameSync(moved, dir);
+    } else {
+      rmSync(replacement, { recursive: true, force: true });
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+test('report: nested evidence pin refuses a target root swapped between parent and child pin', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-inter-pin-md-'));
+  const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-inter-pin-outside-'));
+  const targetRoot = join(mdDir, 'evidence', 'my-feature', 'ux-e2e');
+  const movedTarget = `${targetRoot}.moved`;
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeDirectoryOpen(path) {
+      if (swapped || !path.startsWith(targetRoot + sep)) return;
+      swapped = true;
+      renameSync(targetRoot, movedTarget);
+      symlinkSync(outside, targetRoot, 'dir');
+    },
+  });
+  try {
+    const result = generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true });
+    const report = JSON.parse(readFileSync(result.jsonPath, 'utf8')) as UxE2eReport;
+    assert.equal(swapped, true);
+    assert.equal(report.evidence.some(path => path.includes(`${sep}evidence${sep}`)), false);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (existsSync(targetRoot)) unlinkSync(targetRoot);
+    if (existsSync(movedTarget)) renameSync(movedTarget, targetRoot);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('report suite: total evidence file cap rejects many short files before root publication', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-readable-spec-workflow-file-cap-'));
+  const first = makeSessionDir();
+  const second = makeSessionDir();
+  renameSync(first, join(suite, 'session-a'));
+  renameSync(second, join(suite, 'session-b'));
+  const documents = Array.from({ length: 2050 }, (_, index) => `short-evidence-${String(index)}.txt`);
+  for (const childName of ['session-a', 'session-b']) {
+    const child = join(suite, childName);
+    const session = readSessionRecord(child);
+    ((session.scenario as Record<string, unknown>).workspace as Record<string, unknown>).documents = documents;
+    writeSessionRecord(child, session);
+    for (const document of documents) writeFileSync(join(child, document), 'x');
+  }
+  try {
+    assert.throws(() => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }), /too many evidence files/u);
+    assert.equal(existsSync(join(suite, '.work-state', 'ux-e2e', 'report.json')), false);
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
   }
 });
