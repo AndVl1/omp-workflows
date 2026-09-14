@@ -1,0 +1,6 @@
+{
+  "branch": "feature/checkout",
+  "workflow": "spec-preparation",
+  "status": "in_progress",
+  "active_feature": "checkout"
+}
