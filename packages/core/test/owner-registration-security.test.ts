@@ -989,6 +989,26 @@ test("command shutdown requires manager, file, and generation identity beyond a 
   }
 });
 
+test("legacy command shutdown requires its active session id", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-command-legacy-shutdown-"));
+  try {
+    const markerInfo = marker(root);
+    const harness = commandHarness();
+    registerWorkflowCommands(harness.pi as never, {
+      owner: () => activationOwner("bundle-legacy-shutdown", root, markerInfo.path, markerInfo.sha256),
+      resolveCwd: () => root,
+    });
+    harness.sessionStarts[0]?.({}, { cwd: root, sessionId: "legacy-session" });
+    assert.equal(workflowOwnerFor(root, "workflow_registration")?.owner.owner_id, "bundle-legacy-shutdown");
+    harness.sessionShutdowns[0]?.({}, { cwd: root });
+    assert.equal(workflowOwnerFor(root, "workflow_registration")?.owner.owner_id, "bundle-legacy-shutdown", "malformed shutdown must preserve a session-bound legacy slot");
+    harness.sessionShutdowns[0]?.({}, { cwd: root, sessionId: "legacy-session" });
+    assert.equal(workflowOwnerFor(root, "workflow_registration"), undefined, "matching legacy shutdown must close the slot");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("session rebind preserves a separately held activation generation", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-command-shared-session-"));
   try {

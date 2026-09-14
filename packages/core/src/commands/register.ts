@@ -350,7 +350,10 @@ function closeCommandOwnerActivation(pi: ExtensionAPI, event: unknown, ctx: unkn
   } else {
     const currentSessionId = commandSessionId(ctx, event);
     const activeSessionId = slot?.sessionId ?? state.sessionId;
-    if (activeSessionId && currentSessionId && activeSessionId !== currentSessionId) return;
+    // A legacy/unbound slot that still carries a session id must not be
+    // closed by an absent or malformed shutdown identity. Only an actually
+    // sessionless legacy slot may be disposed by this extension teardown.
+    if (activeSessionId && (!currentSessionId || activeSessionId !== currentSessionId)) return;
   }
   disposeCommandOwnerActivation(pi);
   if (state.mount !== "failed") state.revoked = false;
