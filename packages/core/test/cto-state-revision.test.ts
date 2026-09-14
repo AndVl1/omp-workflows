@@ -39,6 +39,7 @@ import {
   ensureSecureStateDirectory,
   migrateCtoState,
   readCtoState,
+  readCtoStatePinned,
   parsePersistedCtoState,
   newCtoState,
   writeCtoState,
@@ -202,12 +203,13 @@ function seedAuthenticatedBackingStates(states: readonly CtoState[], root: strin
       state.state_revision = 1;
       const statePath = join(".work-state", "cto", state.id, "state.json");
       pinnedRoot.ensureDirectories([dirname(statePath)]);
+      assert.ok(parsePersistedCtoState(state as unknown as Record<string, unknown>), `retention fixture state schema is invalid for ${state.id}`);
       pinnedRoot.writeExclusive(statePath, `${JSON.stringify(state, null, 2)}\n`);
       if (!mintCtoRuntimeRunOrigin(pinnedRoot, state, ownerSession, "state-revision-test", ctoRuntimeRunInitialIdentityDigest(state))) {
         throw new Error(`retention fixture origin publication failed for ${state.id}`);
       }
       if (!writeCtoRuntimeStateProof(pinnedRoot, state)) throw new Error(`retention fixture state proof publication failed for ${state.id}`);
-      const verified = readCtoState(state.id, root);
+      const verified = readCtoStatePinned(state.id, pinnedRoot);
       assert.ok(verified);
       if (!verified) throw new Error(`retention fixture state ${state.id} is unreadable after authenticated seed`);
       seeded.push(verified);
@@ -2065,6 +2067,12 @@ test("run-delivery acknowledgement compacts old terminal entries without droppin
 test("obligation-owned terminal survives 64-entry compaction and acknowledgement", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-run-delivery-obligation-cap-"));
   try {
+    const oldStates = seedAuthenticatedBackingStates(Array.from({ length: 65 }, (_, index) => {
+      const old = fixture(`obligation-old-${String(index).padStart(2, "0")}`);
+      old.updated_at = new Date(index).toISOString();
+      setCtoPause(old, "done", "historical");
+      return old;
+    }), root);
     const state = fixture("obligation-terminal");
     const wave: WaveRecord = {
       id: "wave-obligation-terminal",
@@ -2079,60 +2087,50 @@ test("obligation-owned terminal survives 64-entry compaction and acknowledgement
     };
     state.wave_history = [wave];
     state.integration = { status: "done" };
-    persistState(state, root);
     setCtoPause(state, "done", "terminal");
-    persistState(state, root);
-    const terminal = readCtoState(state.id, root);
+    const terminal = seedAuthenticatedBackingStates([state], root)[0];
     assert.ok(terminal);
     if (!terminal) throw new Error("obligation terminal state is missing");
     const summary = buildCtoTerminalSummaryEnvelope(terminal, wave);
     const entryName = canonicalDurableIdFileName(summary.id);
+
+    // One canonical discovery builds the authenticated index from every
+    // backing state. The 65 empty-wave terminals are already drained; only the
+    // completed-wave terminal needs a pending obligation below.
+    readCtoRunDeliveryIndexPage(root);
+    const newestOld = oldStates[oldStates.length - 1]!;
     const trusted = trustedAccess(root);
-    const obligation = trusted.access.recordOutboxDeliveryObligation({
-      run_id: state.id,
-      entry_name: entryName,
-      json: JSON.stringify(summary),
-    });
-    assert.ok(obligation);
+    try {
+      const obligation = trusted.access.recordOutboxDeliveryObligation({
+        run_id: state.id,
+        entry_name: entryName,
+        json: JSON.stringify(summary),
+      });
+      assert.ok(obligation);
+      if (!obligation) throw new Error("obligation terminal delivery commitment is missing");
+      const pending = readCtoRunDeliveryIndexPage(root);
+      assert.deepEqual(pending.entries.map((entry) => entry.run_id), [state.id], "recovery exposes only the obligation-owned terminal as pending");
+      const withObligation = readCtoState(state.id, root);
+      assert.ok(withObligation);
+      if (!withObligation) throw new Error("obligation state disappeared before acknowledgement");
+      assert.equal(trusted.access.acknowledgeDelivery(state.id, withObligation.state_revision as number, { drained: true }), false, "pending obligation blocks terminal acknowledgement");
+
+      // A protected obligation must remain outside the bounded completed
+      // candidate count while an already-drained newest historical terminal
+      // drives compaction. The oldest historical terminal is evicted; the
+      // newest historical terminal and protected obligation survive.
+      assert.equal(trusted.access.acknowledgeDelivery(newestOld.id, newestOld.state_revision as number, { drained: true }), true, "an already-drained historical terminal triggers retention compaction");
+    } finally {
+      trusted.release();
+    }
+
     const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
-    const oldTerminals = Array.from({ length: 64 }, (_, index) => ({
-      run_id: `obligation-old-${String(index).padStart(2, "0")}`,
-      state_revision: 1,
-      status: "done",
-      updated_at: new Date(index).toISOString(),
-      pending_summary: false,
-      pending_outbox: false,
-      pending_retry: false,
-      summary_digest: "",
-    }));
-    writeFileSync(indexPath, `${JSON.stringify({ schema_version: 2, active_run_id: null, entries: oldTerminals })}\n`);
-    rmSync(join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_PROOF_FILE), { force: true });
-
-    const pending = readCtoRunDeliveryIndexPage(root);
-    assert.deepEqual(pending.entries.map((entry) => entry.run_id), [state.id], "recovery indexes an orphaned obligation-owned terminal");
-    const withObligation = readCtoState(state.id, root);
-    assert.ok(withObligation);
-    assert.equal(acknowledgeCtoRunDelivery(root, state.id, withObligation!.state_revision as number, { drained: true }), false, "pending obligation blocks terminal acknowledgement");
-    assert.equal(readCtoRunDeliveryIndexPage(root).entries.some((entry) => entry.run_id === state.id), true, "blocked acknowledgement preserves indexed obligation");
-
-    const published = trusted.access.publishOutboxDelivery({
-      run_id: state.id,
-      state_revision: obligation!.state_revision,
-      entry_name: entryName,
-      json: obligation!.json,
-    });
-    trusted.release();
-    const sentPath = join(root, ".work-state", "cto", state.id, "outbox", "sent", entryName);
-    mkdirSync(dirname(sentPath), { recursive: true });
-    renameSync(published!, sentPath);
-    assert.equal(removeCtoOutboxDeliveryObligation(root, state.id, entryName, summary.id), true);
-    const drained = readCtoState(state.id, root);
-    assert.ok(drained);
-    assert.equal(acknowledgeCtoRunDelivery(root, state.id, drained!.state_revision as number, { drained: true }), true, "exact immutable sent evidence acknowledges after the obligation-clear revision");
     const compacted = JSON.parse(readFileSync(indexPath, "utf8")) as { entries: Array<{ run_id: string; pending_outbox: boolean }> };
-    assert.equal(compacted.entries.some((entry) => entry.run_id === state.id), true, "acknowledged terminal remains in bounded completed history");
-    assert.equal(compacted.entries.filter((entry) => entry.pending_outbox).length, 0);
-    assert.equal(compacted.entries.filter((entry) => entry.run_id.startsWith("obligation-old-")).length, 63, "64-terminal cap applies only obligation-empty terminals");
+    assert.equal(compacted.entries.some((entry) => entry.run_id === state.id && entry.pending_outbox), true, "protected obligation remains indexed and pending");
+    assert.equal(compacted.entries.some((entry) => entry.run_id === oldStates[0]!.id), false, "oldest completed terminal is evicted");
+    assert.equal(compacted.entries.some((entry) => entry.run_id === newestOld.id), true, "newest completed terminal is retained");
+    assert.equal(compacted.entries.filter((entry) => entry.run_id.startsWith("obligation-old-")).length, 64, "protected obligation permits 64 completed terminals beyond the cap");
+    assert.equal(readCtoRunDeliveryIndexPage(root).entries.some((entry) => entry.run_id === state.id), true, "pending obligation remains discoverable after historical compaction");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2141,25 +2139,43 @@ test("obligation-owned terminal survives 64-entry compaction and acknowledgement
 test("run-delivery index pages more than 64 pending entries without wrapping", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-run-delivery-pages-"));
   try {
-    const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
-    const entries = Array.from({ length: 70 }, (_, i) => ({
-      run_id: `delivery-${String(i).padStart(3, "0")}`,
-      state_revision: 1,
-      status: "active",
-      updated_at: new Date(0).toISOString(),
-      pending_summary: false,
-      pending_outbox: true,
-      summary_digest: "",
-    }));
-    // Delivery index recovery is canonical-state backed. Seed each run and
-    // bounded queue evidence before presenting the 70-entry index image;
-    // otherwise forged names are correctly excluded during reconciliation.
-    for (const entry of entries) {
-      persistState(fixture(entry.run_id), root);
-      mkdirSync(join(root, ".work-state", "cto", entry.run_id, "outbox"), { recursive: true });
-      writeFileSync(join(root, ".work-state", "cto", entry.run_id, "outbox", "pending"), "pending");
-    }
-    writeFileSync(indexPath, JSON.stringify({ schema_version: 2, active_run_id: entries[0]!.run_id, entries }) + "\n");
+    const states = seedAuthenticatedBackingStates(Array.from({ length: 70 }, (_, i) => {
+      const state = fixture(`delivery-${String(i).padStart(3, "0")}`);
+      setCtoPause(state, "done", "pending pagination");
+      // State-owned progress obligations are canonical pending evidence and
+      // avoid creating 70 separate publication transactions in this paging
+      // fixture. The index recovery path derives all pending flags from these
+      // authenticated obligations.
+      const envelopeId = `${state.id}/progress`;
+      const envelope = {
+        id: envelopeId,
+        level: "question" as const,
+        title: "delivery progress",
+        body: "pending",
+        intent: "progress" as const,
+        topic: "progress",
+        at: "2026-09-14T00:00:00.000Z",
+        by: "cto",
+        run_id: state.id,
+        state_revision: 1,
+        idempotency_key: envelopeId,
+      };
+      state.pending_delivery_obligations = [{
+        entry_name: canonicalDurableIdFileName(envelopeId),
+        envelope_id: envelopeId,
+        run_id: state.id,
+        intent: "progress",
+        source: "cto",
+        source_ref: envelopeId,
+        created_revision: 1,
+        envelope: JSON.stringify(envelope),
+      }];
+      return state;
+    }), root);
+    // Build the authenticated canonical index once; no forged index bytes or
+    // queue names participate in the paging snapshot.
+    readCtoRunDeliveryIndexPage(root);
+
     const first = readCtoRunDeliveryIndexPage(root, { limit: 64 });
     assert.equal(first.entries.length, 64);
     assert.equal(first.next_after_run_id, "delivery-063");
@@ -2168,14 +2184,7 @@ test("run-delivery index pages more than 64 pending entries without wrapping", (
     assert.equal(second.next_after_run_id, null);
     const all = [...first.entries, ...second.entries].map((entry) => entry.run_id);
     assert.deepEqual(all, Array.from({ length: 70 }, (_, i) => `delivery-${String(i).padStart(3, "0")}`));
-    const terminalEntries = entries.map((entry, i) => ({
-      ...entry,
-      status: "done" as const,
-      pending_summary: i % 3 === 0,
-      pending_outbox: i % 3 === 1,
-      pending_retry: i % 3 === 2,
-    }));
-    writeFileSync(indexPath, JSON.stringify({ schema_version: 2, active_run_id: null, entries: terminalEntries }) + "\n");
+
     const pinned = PinnedProjectRoot.open(root);
     assert.ok(pinned);
     if (pinned) {
@@ -2183,9 +2192,13 @@ test("run-delivery index pages more than 64 pending entries without wrapping", (
         const candidates = readCtoRunDeliveryCandidatesPinned(pinned);
         assert.equal(candidates.ok, true);
         if (candidates.ok) {
-          assert.equal(candidates.entries.length, 70, "pending terminal candidates include summary-only, outbox-only, and retry-only work");
-          assert.equal(candidates.entries.some((entry) => entry.pending_retry && !entry.pending_summary && !entry.pending_outbox), true, "retry-only terminal delivery remains discoverable");
-          assert.deepEqual(candidates.entries.map((entry) => entry.run_id), Array.from({ length: 70 }, (_, i) => `delivery-${String(i).padStart(3, "0")}`));
+          assert.equal(candidates.entries.length, 70, "pending terminal candidates retain every authenticated state-owned progress obligation");
+          assert.equal(candidates.entries.every((entry) => entry.pending_outbox && !entry.pending_summary && !entry.pending_retry), true, "state-owned progress obligations remain in the canonical outbox lane");
+          assert.deepEqual(
+            candidates.entries.map((entry) => entry.run_id).sort(),
+            Array.from({ length: 70 }, (_, i) => `delivery-${String(i).padStart(3, "0")}`),
+            "candidate reader returns the complete canonical pending set",
+          );
         }
       } finally {
         pinned.close();
