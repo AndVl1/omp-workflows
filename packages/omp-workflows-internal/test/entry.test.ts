@@ -170,6 +170,10 @@ test("session shutdown releases the retained generation and stale shutdown canno
 		replaceAllMarkers(root);
 		const second = ensureEngineActivation(host.pi as never, root, "internal-session-B");
 		assert.equal(second.ok, true, "same host must activate a fresh generation after shutdown");
+		host.fireSessionShutdown({ cwd: root }, {});
+		assert.equal(isRegisteredWorkflow("omp-feature"), true, "missing shutdown identity must preserve the replacement generation");
+		host.fireSessionShutdown({ cwd: root }, { sessionId: 42 });
+		assert.equal(isRegisteredWorkflow("omp-feature"), true, "malformed shutdown identity must preserve the replacement generation");
 		host.fireSessionShutdown({ cwd: root }, { sessionId: "internal-session-A" });
 		assert.equal(isRegisteredWorkflow("omp-feature"), true, "stale shutdown must not evict the replacement generation");
 		host.fireSessionShutdown({ cwd: root }, { sessionId: "internal-session-B" });

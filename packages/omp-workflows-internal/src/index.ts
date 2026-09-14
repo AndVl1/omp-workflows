@@ -254,10 +254,16 @@ function sessionIdentityFromContext(event: unknown, ctx: unknown): string | unde
 	for (const source of [event, ctx]) {
 		if (!source || typeof source !== "object") continue;
 		try {
+			let identityFieldPresent = false;
 			for (const key of ["sessionId", "session_id"] as const) {
+				if (!(key in (source as object))) continue;
+				identityFieldPresent = true;
 				const value = (source as Record<string, unknown>)[key];
 				if (typeof value === "string" && value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/u.test(value)) return value;
 			}
+			// An explicitly present but malformed identity is authoritative and
+			// must not fall through to mutable context state.
+			if (identityFieldPresent) return undefined;
 		} catch {
 			return undefined;
 		}
@@ -588,7 +594,7 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 			// session must never evict a replacement activation. Teardown is
 			// token-based: marker/root validation is deliberately not required, so
 			// deleting a workspace cannot leak its retained owner lease.
-			if (activation.sessionId && generation && generation !== activation.sessionId) return;
+			if (activation.sessionId && (!generation || generation !== activation.sessionId)) return;
 			revokePinnedActivation(activation);
 			pinnedActivations.delete(pi as object);
 			activatedEngines.delete(pi as object);
