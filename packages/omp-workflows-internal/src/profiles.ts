@@ -2,9 +2,11 @@
  * Bundle-owned workflow profile assets.
  *
  * Profiles live in workflows/*.json and are registered into the core
- * interpreter via `registerTeamWorkflow({ workflowProfiles })`. Loaded from
- * disk relative to this module (one directory below the package root in both
- * src/ and dist/ layouts) so no static JSON import is needed. Structural
+ * interpreter through `registerTeamWorkflow({ workflowProfiles, owner, resolveCwd,
+ * registrationToken })`. The bundle coordinator authenticates a project-local
+ * physical marker and opens the registry transaction before registration. Loaded
+ * from disk relative to this module (one directory below the package root in
+ * both src/ and dist/ layouts) so no static JSON import is needed. Structural
  * validation is local because the core control-plane validator is not part of
  * the public core surface; registration remains fail-closed either way.
  */

@@ -1,0 +1,72 @@
+{
+  "run": "validation-release",
+  "source_edits": false,
+  "package_validation": {
+    "root_build": {
+      "command": "npm run build",
+      "status": "pass",
+      "evidence": "01-root-build.log"
+    },
+    "root_typecheck": {
+      "command": "npm run typecheck",
+      "status": "pass",
+      "evidence": "02-root-typecheck.log"
+    },
+    "core_tests": {
+      "command": "npm run test:core",
+      "status": "pass",
+      "tests": 1241,
+      "passed": 1241,
+      "failed": 0,
+      "evidence": "03-test-core.log"
+    },
+    "fullstack_tests": {
+      "command": "npm run test:fullstack",
+      "status": "pass",
+      "tests": 412,
+      "passed": 412,
+      "failed": 0,
+      "evidence": "04-test-fullstack.log"
+    },
+    "internal_tests": {
+      "command": "npm run test -w @andvl1/omp-workflows-internal",
+      "status": "pass",
+      "tests": 74,
+      "passed": 74,
+      "failed": 0,
+      "evidence": "05-test-internal.log"
+    }
+  },
+  "runtime_validation": {
+    "T061": {
+      "command": "OMP_UX_E2E_SEMANTIC_TIMEOUT_MS=800000 OMP_UX_E2E_PRESERVE_ON_FAILURE=1 node --test --import tsx --test-name-pattern='complete generic bundle' test/spec-import.test.ts",
+      "status": "fail",
+      "tests": 1,
+      "passed": 0,
+      "failed": 1,
+      "duration_ms": 803988.738459,
+      "failure": "waitFor timed out after 800000ms (complete bundle compatibility intake semantic readiness)",
+      "selected_checkpoint_tool": "workflow_checkpoint_ask_selected",
+      "selected_checkpoint_result": "WORKFLOW_CHECKPOINT_ASK_REJECTED",
+      "selected_checkpoint_error": "import source root is outside the pinned project root",
+      "evidence": [
+        "06-t061-generic-complete.log",
+        "t061-failure/transcript.jsonl",
+        "t061-failure/state.json",
+        "t061-failure/events.jsonl",
+        "t061-failure/artifacts/import_snapshot.json",
+        "t061-failure/artifacts/compatibility_report.json"
+      ]
+    },
+    "T094": {
+      "command": "node --test --import tsx --test-name-pattern 'T094 runtime' test/spec-cto-execution.test.ts",
+      "status": "held",
+      "reason": "Parent instructed hold until external-source selected ask fix freezes",
+      "evidence": null
+    }
+  },
+  "scratch_cleanup": {
+    "T061_scratch": "stopped through npm run e2e -- stop; harness reported session pid 19050 is not running",
+    "T094_scratch": "not applicable; run held"
+  }
+}

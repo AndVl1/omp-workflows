@@ -48,13 +48,12 @@ Only the selected findings are handed to the fix agents below.
    - These are review findings from Phase 6
    - Follow existing codebase patterns
    - Make minimal changes to fix each issue
-
    Requirements:
    - Fix ONLY the specified issues
    - Do NOT refactor unrelated code
-   - Run ./gradlew build after fixes
-   - Commit each fix with clear message
-   - Report all files modified"
+   - Report all files modified
+   - If checks are run, report them as `worker_attested` observations only; they are not workflow proof.
+   - Do not claim workflow tests passed from the fix report; independent `qa_tests` owns the workflow QA gate.
 
    # For FRONTEND issues, launch frontend-developer agent:
    Agent (frontend-developer):
@@ -68,13 +67,12 @@ Only the selected findings are handed to the fix agents below.
    - These are review findings from Phase 6
    - Follow React/TypeScript conventions
    - Make minimal changes to fix each issue
-
    Requirements:
    - Fix ONLY the specified issues
    - Do NOT refactor unrelated code
-   - Run npm run build after fixes
-   - Commit each fix with clear message
-   - Report all files modified"
+   - Report all files modified
+   - If checks are run, report them as `worker_attested` observations only; they are not workflow proof.
+   - Do not claim workflow tests passed from the fix report; independent `qa_tests` owns the workflow QA gate.
 
    # For MOBILE issues, launch developer-mobile agent:
    Agent (developer-mobile):
@@ -88,13 +86,12 @@ Only the selected findings are handed to the fix agents below.
    - These are review findings from Phase 6
    - Follow compose-arch patterns strictly
    - Make minimal changes to fix each issue
-
    Requirements:
    - Fix ONLY the specified issues
    - Do NOT refactor unrelated code
-   - Run ./gradlew assemble after fixes
-   - Commit each fix with clear message
-   - Report all files modified"
+   - Report all files modified
+   - If checks are run, report them as `worker_attested` observations only; they are not workflow proof.
+   - Do not claim workflow tests passed from the fix report; independent `qa_tests` owns the workflow QA gate.
 
    # For DEVOPS issues, launch devops agent:
    Agent (devops):
@@ -115,10 +112,9 @@ Only the selected findings are handed to the fix agents below.
 
 3. **Wait for all fix agents to complete**
 
-4. **Verify fixes**:
-   - Run builds for affected layers
-   - Run tests if applicable
-
+4. **Record the worker result**:
+   - Preserve changed-file and check observations as worker attestation only.
+   - The independent `qa_tests` stage determines whether the workflow's tests pass.
 5. **Optional: Quick re-review**
    - For CRITICAL fixes, consider launching `qa` agent for spot-check
    - Only if user explicitly requested verification
@@ -131,17 +127,17 @@ Backend (developer agent):
 - Fixed: [issue 1]
 - Fixed: [issue 2]
 - Files: [list]
-- Build: PASS
+- Worker checks (attested, if any): [reported checks/results]
 
 Frontend (frontend-developer agent):
 - Fixed: [issue 1]
 - Files: [list]
-- Build: PASS
+- Worker checks (attested, if any): [reported checks/results]
 
 Mobile (developer-mobile agent):
 - Fixed: [issue 1]
 - Files: [list]
-- Build: PASS
+- Worker checks (attested, if any): [reported checks/results]
 
 All issues addressed. Proceeding to manual QA (has_ui) or automated tests.
 ```

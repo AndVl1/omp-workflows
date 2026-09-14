@@ -1,9 +1,9 @@
 /**
  * Shared expression semantics (gate / skip_if / until):
  *   - every shipped profile expression parses (load-time coverage),
- *   - the previously-broken shipped expressions now evaluate correctly:
- *     full-feature `qa_tests` PASS/CONDITIONAL gate, `review_fixes` artifact
- *     debug-cycle `until` (verdict == PASS),
+ *   - the independent `qa_reported_pass` gate reads only canonical
+ *     `qa_tests.build_status`, while `review_fixes` artifact skip_if and
+ *     debug-cycle `until` continue to use their declared artifact fields,
  *   - unsupported syntax fails closed with diagnostics (never silent false),
  *   - OR evaluation is three-valued: a satisfied fallback term keeps the
  *     expression passing when the artifact it references is missing.
@@ -11,7 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadAllProfiles, loadProfile } from "../src/engine/profile.js";
@@ -49,61 +49,53 @@ test("predicate: every shipped gate/skip_if/until/conditional expression parses"
   }
 });
 
-test("predicate: full-feature qa_tests gate accepts PASS/CONDITIONAL, rejects FAIL, and preserves skipped fallback", () => {
-  const root = mkdtempSync(join(tmpdir(), "pred-or-"));
+test("predicate: qa_reported_pass consumes only the canonical qa_tests artifact", () => {
+  const root = mkdtempSync(join(tmpdir(), "pred-qa-report-"));
   try {
     const artifactsDir = join(root, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
-    const stage = { id: "qa_tests", title: "QA", type: "single" as const, role: "qa", produces: "qa_tests", consumes: ["manual_qa"] };
-    const gate = "manual_qa.verdict != FAIL || !scope.has_runtime";
+    const stateValue = state();
+    const qaGate = (name: string) => {
+      if (name !== "qa_reported_pass") return undefined;
+      let report: Record<string, unknown>;
+      try {
+        report = JSON.parse(readFileSync(join(artifactsDir, "qa_tests.json"), "utf8")) as Record<string, unknown>;
+      } catch {
+        return "canonical qa_tests artifact is missing or malformed";
+      }
+      return report.build_status === "pass"
+        ? null
+        : "qa_reported_pass requires qa_tests.build_status=pass";
+    };
 
-    for (const profileName of ["full-feature", "standard"]) {
+    for (const profileName of ["full-feature", "standard", "lightweight", "bug-fix", "debug-cycle", "emergency"]) {
       const profile = loadProfile(profileName);
       assert.ok(profile);
       const qaTests = profile.stages.find((candidate) => candidate.id === "qa_tests");
-      assert.equal(qaTests?.gate, gate, `${profileName} qa_tests gate must preserve conditional runtime semantics`);
+      assert.equal(qaTests?.gate, "qa_reported_pass", `${profileName} must use the independent QA gate`);
+      assert.ok(profile.stages.find((candidate) => candidate.id === "summary")?.consumes?.includes("qa_tests"), `${profileName} summary must consume qa_tests`);
     }
 
-    // Verdict path: manual_qa PASS.
-    writeFileSync(join(artifactsDir, "manual_qa.json"), JSON.stringify({ verdict: "PASS", evidence: ["ran"] }));
+    writeFileSync(join(artifactsDir, "manual_qa.json"), JSON.stringify({ verdict: "PASS", evidence: ["worker report only"] }));
+    writeFileSync(join(artifactsDir, "debug.json"), JSON.stringify({ verdict: "PASS", iterations: 1 }));
+    writeFileSync(join(artifactsDir, "qa_tests.json"), JSON.stringify({ tests_added: ["regression"], build_status: "pass" }));
     assert.deepEqual(
-      evaluatePredicate(gate, { flags: RUNTIME_FLAGS, artifactsDir, state: state(), stage }),
+      evaluatePredicate("qa_reported_pass", { flags: RUNTIME_FLAGS, artifactsDir, state: stateValue, namedGate: qaGate }),
       { ok: true, value: true },
     );
 
-    // Conditional path: deterministic/runtime evidence exists, but a required
-    // live criterion is unavailable behind an explicit blocker.
-    writeFileSync(join(artifactsDir, "manual_qa.json"), JSON.stringify({
-      verdict: "CONDITIONAL",
-      evidence: ["deterministic checks passed"],
-      blocked_prerequisites: ["live provider credential unavailable"],
-    }));
-    assert.deepEqual(
-      evaluatePredicate(gate, { flags: RUNTIME_FLAGS, artifactsDir, state: state(), stage }),
-      { ok: true, value: true },
-      "CONDITIONAL is accepted for runtime-backed deterministic QA",
-    );
+    for (const status of ["fail", "n/a"] as const) {
+      writeFileSync(join(artifactsDir, "qa_tests.json"), JSON.stringify({ tests_added: ["regression"], build_status: status }));
+      assert.deepEqual(
+        evaluatePredicate("qa_reported_pass", { flags: RUNTIME_FLAGS, artifactsDir, state: stateValue, namedGate: qaGate }),
+        { ok: true, value: false },
+        `${status} QA report must block`,
+      );
+    }
 
-    // Fallback path: manual_qa skipped (artifact absent) and no runtime scope.
-    rmSync(join(artifactsDir, "manual_qa.json"));
-    assert.deepEqual(
-      evaluatePredicate(gate, { flags: FLAGS, artifactsDir, state: state(), stage }),
-      { ok: true, value: true },
-      "OR fallback term keeps the expression passing when the artifact is missing",
-    );
-
-    // Blocking path: manual_qa FAIL and runtime present.
-    writeFileSync(join(artifactsDir, "manual_qa.json"), JSON.stringify({ verdict: "FAIL", evidence: ["broke"] }));
-    assert.deepEqual(
-      evaluatePredicate(gate, { flags: RUNTIME_FLAGS, artifactsDir, state: state(), stage }),
-      { ok: true, value: false },
-    );
-
-    // Missing artifact with no satisfied fallback fails closed (diagnostic).
-    rmSync(join(artifactsDir, "manual_qa.json"));
-    const blocked = evaluatePredicate(gate, { flags: RUNTIME_FLAGS, artifactsDir, state: state(), stage });
-    assert.equal(blocked.ok, false);
-    if (!blocked.ok) assert.match(blocked.error, /manual_qa/);
+    rmSync(join(artifactsDir, "qa_tests.json"));
+    const missing = evaluatePredicate("qa_reported_pass", { flags: RUNTIME_FLAGS, artifactsDir, state: stateValue, namedGate: qaGate });
+    assert.deepEqual(missing, { ok: true, value: false }, "missing QA report must block");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -152,28 +144,6 @@ test("predicate: debug-cycle loop until (verdict == PASS) resolves the implicit 
       evaluatePredicate(verify!.loop!.until, { flags: FLAGS, artifactsDir, state: state(), stage: verify! }),
       { ok: true, value: true },
       "PASS verdict exits the loop",
-    );
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("predicate: qa_tests verdict gate falls back to a consumed artifact when the produced one has no verdict", () => {
-  const root = mkdtempSync(join(tmpdir(), "pred-consumed-"));
-  try {
-    const artifactsDir = join(root, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    const profile = loadProfile("debug-cycle");
-    assert.ok(profile);
-    const qaTests = profile.stages.find((stage) => stage.id === "qa_tests");
-    assert.ok(qaTests);
-    // qa_tests.json has no verdict field; debug.json (consumed) does.
-    writeFileSync(join(artifactsDir, "qa_tests.json"), JSON.stringify({ tests_added: ["t"], build_status: "pass" }));
-    writeFileSync(join(artifactsDir, "debug.json"), JSON.stringify({ verdict: "PASS", iterations: 1 }));
-    assert.deepEqual(
-      evaluatePredicate(qaTests!.gate!, { flags: FLAGS, artifactsDir, state: state(), stage: qaTests! }),
-      { ok: true, value: true },
-      "implicit verdict resolution considers consumed artifacts",
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -244,4 +214,46 @@ test("predicate: value comparisons support arrays, strings, numbers, booleans, n
   }
   const count = parseExpression("debug.iterations == 3");
   assert.equal(count.ok, true);
+});
+test("predicate: deepEqual is iterative, bounded, and prototype-safe", () => {
+  let boundedLeft: unknown = "leaf";
+  let boundedRight: unknown = "leaf";
+  for (let depth = 0; depth < 64; depth += 1) {
+    boundedLeft = { next: boundedLeft };
+    boundedRight = { next: boundedRight };
+  }
+  assert.equal(deepEqual(boundedLeft, boundedRight), true, "values at the shared depth bound remain comparable");
+  boundedLeft = { next: boundedLeft };
+  boundedRight = { next: boundedRight };
+  assert.equal(deepEqual(boundedLeft, boundedRight), false, "values past the depth bound fail closed");
+
+  const inherited = Object.create({ prototypeOnly: true }) as Record<string, unknown>;
+  inherited.value = 1;
+  assert.equal(deepEqual(inherited, { value: 1 }), false, "different prototypes are never treated as equal");
+
+  const leftCycle: Record<string, unknown> = {};
+  const rightCycle: Record<string, unknown> = {};
+  leftCycle.self = leftCycle;
+  rightCycle.self = rightCycle;
+  assert.equal(deepEqual(leftCycle, rightCycle), true, "isomorphic cycles terminate without recursion");
+
+  const largeLeft = Array.from({ length: 12_000 }, (_, index) => index);
+  const largeRight = Array.from({ length: 12_000 }, (_, index) => index);
+  largeRight[11_999] = -1;
+  assert.equal(deepEqual(largeLeft, largeRight), false, "large unequal values terminate with a false result");
+});
+test("predicate: over-budget artifact values fail closed before comparison", () => {
+  const root = mkdtempSync(join(tmpdir(), "pred-structure-"));
+  try {
+    const artifactsDir = join(root, "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    let deep: unknown = { iterations: 1 };
+    for (let depth = 0; depth < 65; depth += 1) deep = { next: deep };
+    writeFileSync(join(artifactsDir, "debug.json"), JSON.stringify(deep));
+    const result = evaluatePredicate("debug.iterations == 1", { flags: FLAGS, artifactsDir, state: state() });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.match(result.error, /cannot be evaluated safely: artifact structure limit exceeded/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

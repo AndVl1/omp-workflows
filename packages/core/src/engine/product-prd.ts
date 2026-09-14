@@ -39,12 +39,16 @@ import {
   mkdirSync,
   readFileSync,
   realpathSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { renderMarkdownDocumentHtml } from "../report/markdown.js";
+import {
+  MAX_ARTIFACT_BYTES,
+  createArtifactStructureBudget,
+  readPinnedArtifactSnapshot,
+  validateArtifactStructure,
+} from "./artifacts.js";
+import { PinnedProjectRoot, PinnedRootError, type PinnedRootWriteReceipt } from "../specification/pinned-root.js";
 
 /** Typed artifact id produced by the PRD document stage. */
 export const PRODUCT_PRD_ARTIFACT_ID = "product_prd";
@@ -60,6 +64,12 @@ export const PRD_SOURCE_ARTIFACT_IDS = [
 
 /** Renderer identity recorded in the manifest; bump on any template change. */
 export const PRODUCT_PRD_RENDERER = "product-prd-renderer@2";
+
+/** Maximum UTF-8 bytes accepted by the pinned PRD document/HTML reader. */
+export const MAX_PRD_VALIDATION_FILE_BYTES = 4 * 1024 * 1024;
+
+/** Maximum UTF-8 bytes accepted by the pinned artifact reader. */
+export const MAX_PRD_ARTIFACT_BYTES = MAX_ARTIFACT_BYTES;
 
 /** Default document location inside the state dir. */
 const DEFAULT_DOCUMENT_PATH = "documents/product-prd.md";
@@ -89,11 +99,27 @@ export interface ProductPrdManifest {
   content: string;
 }
 
+export interface ProductPrdPinnedWriteOptions {
+  /** Borrowed descriptor-anchored project root for the enclosing transaction. */
+  pinnedRoot: PinnedProjectRoot;
+  /** Descriptor-safe project-relative directory owning the document. */
+  stateDirRelative: string;
+  /** Descriptor-safe project-relative directory receiving the typed artifact. */
+  artifactsDirRelative: string;
+  /** Safe relative path of the markdown document inside stateDirRelative. */
+  path?: string;
+  /** The five source artifacts keyed by artifact id. */
+  sourceArtifacts: Record<string, unknown>;
+  /** Register exact rollback for each output as soon as the batch publishes. */
+  registerRollback?: (cleanup: () => void) => void;
+}
 export interface ProductPrdWriteOptions {
-  /** State root the document path is resolved within (e.g. `.work-state`). */
-  stateDir: string;
-  /** Directory receiving the typed `product_prd` artifact. */
-  artifactsDir: string;
+  /** Project root to pin for this standalone operation. */
+  projectRoot: string;
+  /** Descriptor-safe project-relative directory owning the document. */
+  stateDirRelative: string;
+  /** Descriptor-safe project-relative directory receiving the typed artifact. */
+  artifactsDirRelative: string;
   /** Safe relative path of the markdown document; defaults to `documents/product-prd.md`. */
   path?: string;
   /** The five source artifacts keyed by artifact id. */
@@ -462,126 +488,145 @@ function derivedHtmlPath(documentPath: string): string {
 
 // ── atomic persistence ─────────────────────────────────────────────────────
 
-let tempCounter = 0;
-
-/** Temp path (same dir, dot-prefixed) staged next to the final target. */
-function tempPathFor(target: string): string {
-  return join(dirname(target), `.${basename(target)}.tmp-${process.pid}-${(tempCounter += 1)}`);
-}
-
-/**
- * The artifacts dir must be a real directory inside the real state root —
- * never a symlink (which could point outside the state dir entirely) and
- * never a regular file.
- */
-function safeArtifactsDir(stateDir: string, artifactsDir: string): { ok: true } | { ok: false; error: string } {
-  if (existsSync(artifactsDir)) {
-    const info = lstatSync(artifactsDir);
-    if (info.isSymbolicLink()) return { ok: false, error: `unsafe artifacts dir: '${artifactsDir}' is a symlink` };
-    if (!info.isDirectory()) return { ok: false, error: `unsafe artifacts dir: '${artifactsDir}' is not a directory` };
-    const realRoot = realpathSync(stateDir);
-    const realArtifacts = realpathSync(artifactsDir);
-    const rel = relative(realRoot, realArtifacts);
-    if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-      return { ok: false, error: `unsafe artifacts dir: '${artifactsDir}' resolves outside the state dir` };
-    }
-    return { ok: true };
+/** Validate a project-relative path without consulting the lexical filesystem. */
+function safePinnedRelativePath(value: string, label: string, allowEmpty = false): { ok: true } | { ok: false; error: string } {
+  if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
+    return { ok: false, error: `unsafe ${label}: path is empty` };
   }
-  const lexical = relative(stateDir, artifactsDir);
-  if (lexical === "" || lexical === ".." || lexical.startsWith(`..${sep}`) || isAbsolute(lexical)) {
-    return { ok: false, error: `unsafe artifacts dir: '${artifactsDir}' lies outside the state dir` };
+  if (allowEmpty && value.length === 0) return { ok: true };
+  if (value.includes("\\") || value.includes("\0") || isAbsolute(value)) {
+    return { ok: false, error: `unsafe ${label}: path must be relative and contain no backslash or NUL` };
   }
-  // Absent target: no existing ancestor between the state root and the
-  // artifacts dir may be a symlink — otherwise the (recursive) create would
-  // silently materialize the dir outside the state root through the link.
-  let current = stateDir;
-  for (const segment of lexical.split(sep).filter((part) => part !== "" && part !== ".")) {
-    current = join(current, segment);
-    if (current === artifactsDir) break;
-    if (existsSync(current) && lstatSync(current).isSymbolicLink()) {
-      return { ok: false, error: `unsafe artifacts dir: '${segment}' on the path to '${artifactsDir}' is a symlink` };
-    }
+  const segments = value.split("/");
+  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+    return { ok: false, error: `unsafe ${label}: path contains an empty, '.' or '..' segment` };
   }
-
   return { ok: true };
 }
 
-interface FileSnapshot {
-  exists: boolean;
-  bytes: Buffer | null;
+function pinnedOutputPath(base: string, child: string, label: string): string {
+  const value = base.length === 0 ? child : `${base}/${child}`;
+  const safe = safePinnedRelativePath(value, label);
+  if (!safe.ok) throw new PinnedRootError("path_unauthorized", safe.error);
+  return value;
+}
+/** Return the exact three relative outputs produced by the PRD writer. */
+export function productPrdOutputRelativePaths(
+  stateDirRelative: string,
+  artifactsDirRelative: string,
+  relativePath = DEFAULT_DOCUMENT_PATH,
+): readonly string[] {
+  return [
+    pinnedOutputPath(stateDirRelative, relativePath, "document path"),
+    pinnedOutputPath(stateDirRelative, derivedHtmlPath(relativePath), "HTML document path"),
+    pinnedOutputPath(artifactsDirRelative, `${PRODUCT_PRD_ARTIFACT_ID}.json`, "artifact path"),
+  ];
 }
 
-function validateArtifactTarget(path: string): { ok: true } | { ok: false; error: string } {
-  if (!existsSync(path)) return { ok: true };
-  const info = lstatSync(path);
-  if (info.isSymbolicLink()) return { ok: false, error: `product PRD persistence failed: unsafe artifact target: '${path}' is a symlink` };
-  if (!info.isFile()) return { ok: false, error: `product PRD persistence failed: unsafe artifact target: '${path}' is not a regular file` };
-  return { ok: true };
+function canonicalOutputPath(path: string): string {
+  return path
+    .split("/")
+    .map((segment) => segment.normalize("NFC").toLowerCase())
+    .join("/");
 }
 
-function captureSnapshot(path: string): FileSnapshot {
-  return existsSync(path) ? { exists: true, bytes: readFileSync(path) } : { exists: false, bytes: null };
+function outputPathsConflict(left: string, right: string): boolean {
+  const canonicalLeft = canonicalOutputPath(left);
+  const canonicalRight = canonicalOutputPath(right);
+  return canonicalLeft === canonicalRight
+    || canonicalLeft.startsWith(canonicalRight + "/")
+    || canonicalRight.startsWith(canonicalLeft + "/");
 }
 
-function restoreSnapshot(path: string, snapshot: FileSnapshot): void {
-  if (!snapshot.exists || snapshot.bytes === null) {
-    rmSync(path, { force: true });
-    return;
-  }
-  const restoreTemp = tempPathFor(path);
-  try {
-    writeFileSync(restoreTemp, snapshot.bytes);
-    renameSync(restoreTemp, path);
-  } finally {
-    rmSync(restoreTemp, { force: true });
-  }
+function pinnedParentPath(path: string): string {
+  const parent = dirname(path).split(sep).join("/");
+  return parent === "." ? "" : parent;
 }
 
 /**
- * Render and atomically persist the product PRD: the markdown document at
- * `join(stateDir, path)`, its derived sibling HTML viewer, and the typed
- * `product_prd` artifact with the exact manifest fields. All validation and
- * rendering happens before the first commit rename; failures restore every
- * previous target and clean temporary files.
+ * Render and atomically persist the product PRD through a borrowed pinned
+ * root. Every source is supplied by the enclosing transaction and every
+ * output is addressed by a descriptor-relative path; no lexical path is
+ * re-authorized or reopened here.
  */
-export function writeProductPrdDocument(options: ProductPrdWriteOptions): ProductPrdWriteResult {
-  const sourceArtifacts: Record<string, unknown> = {};
+export function writeProductPrdDocumentPinned(options: ProductPrdPinnedWriteOptions): ProductPrdWriteResult {
   const provided = options.sourceArtifacts ?? {};
+  const sourceArtifacts: Record<string, unknown> = {};
+  const sourceBudget = createArtifactStructureBudget();
   for (const id of PRD_SOURCE_ARTIFACT_IDS) {
     const value = provided[id];
     if (value === undefined || value === null) {
       return { ok: false, error: `cannot render product PRD: source artifact '${id}' is missing` };
     }
+    const structure = validateArtifactStructure(value, sourceBudget);
+    if (!structure.ok) {
+      return { ok: false, error: `cannot render product PRD: source artifact '${id}' is not safely renderable: ${structure.error}` };
+    }
     sourceArtifacts[id] = value;
   }
-
   const relativePath = options.path ?? DEFAULT_DOCUMENT_PATH;
-  const safe = safeDocumentPath(options.stateDir, relativePath);
-  if (!safe.ok) return { ok: false, error: safe.error };
+  const documentSafe = safePinnedRelativePath(relativePath, "document path");
+  if (!documentSafe.ok) return { ok: false, error: documentSafe.error };
   const htmlRelativePath = derivedHtmlPath(relativePath);
-  const safeHtml = safeDocumentPath(options.stateDir, htmlRelativePath);
-  if (!safeHtml.ok) return { ok: false, error: safeHtml.error };
-  if (safe.absolute === safeHtml.absolute) {
-    return { ok: false, error: `unsafe document path: Markdown and HTML targets collide at '${safe.absolute}'` };
+  const htmlSafe = safePinnedRelativePath(htmlRelativePath, "HTML document path");
+  if (!htmlSafe.ok) return { ok: false, error: htmlSafe.error };
+  let documentPath: string;
+  let htmlPath: string;
+  let artifactPath: string;
+  try {
+    documentPath = pinnedOutputPath(options.stateDirRelative, relativePath, "document path");
+    htmlPath = pinnedOutputPath(options.stateDirRelative, htmlRelativePath, "HTML document path");
+    artifactPath = pinnedOutputPath(options.artifactsDirRelative, `${PRODUCT_PRD_ARTIFACT_ID}.json`, "artifact path");
+    if (documentPath === htmlPath) return { ok: false, error: `unsafe document path: Markdown and HTML targets collide at '${relativePath}'` };
+    const outputPaths = [
+      ["document", documentPath],
+      ["HTML", htmlPath],
+      ["artifact", artifactPath],
+    ] as const;
+    for (let index = 0; index < outputPaths.length; index += 1) {
+      const [leftLabel, leftPath] = outputPaths[index]!;
+      for (let other = index + 1; other < outputPaths.length; other += 1) {
+        const [rightLabel, rightPath] = outputPaths[other]!;
+        if (outputPathsConflict(leftPath, rightPath)) {
+          return { ok: false, error: `unsafe product PRD output paths: ${leftLabel} '${leftPath}' conflicts with ${rightLabel} '${rightPath}'` };
+        }
+      }
+    }
+    const stateSafe = safePinnedRelativePath(options.stateDirRelative, "state directory", true);
+    if (!stateSafe.ok) return { ok: false, error: stateSafe.error };
+    const artifactsSafe = safePinnedRelativePath(options.artifactsDirRelative, "artifacts directory", true);
+    if (!artifactsSafe.ok) return { ok: false, error: artifactsSafe.error };
+    if (!options.pinnedRoot.isStable()) return { ok: false, error: "pinned project root changed before product PRD render" };
+    for (const target of [documentPath, htmlPath, artifactPath]) {
+      const entry = options.pinnedRoot.pathEntryInfo(target);
+      if (entry && entry.kind !== "file") return { ok: false, error: `product PRD target '${target}' is not a regular file` };
+    }
+  } catch (error) {
+    return { ok: false, error: `product PRD persistence path is unsafe: ${String(error)}` };
   }
-  const artifactsDirSafe = safeArtifactsDir(options.stateDir, options.artifactsDir);
-  if (!artifactsDirSafe.ok) return { ok: false, error: artifactsDirSafe.error };
-  const artifactPath = join(options.artifactsDir, `${PRODUCT_PRD_ARTIFACT_ID}.json`);
-  const artifactTargetSafe = validateArtifactTarget(artifactPath);
-  if (!artifactTargetSafe.ok) return { ok: false, error: artifactTargetSafe.error };
 
-  let documentTemp: string | null = null;
-  let htmlTemp: string | null = null;
-  let artifactTemp: string | null = null;
-  let snapshots: Array<[string, FileSnapshot]> | null = null;
   try {
     const markdown = renderProductPrdDocument(sourceArtifacts);
+    const markdownBytes = Buffer.from(markdown, "utf8");
+    if (markdownBytes.byteLength > MAX_PRD_VALIDATION_FILE_BYTES) {
+      return {
+        ok: false,
+        error: `product PRD persistence failed: Markdown output is ${markdownBytes.byteLength} UTF-8 bytes, exceeding the readable limit of ${MAX_PRD_VALIDATION_FILE_BYTES} bytes`,
+      };
+    }
     const html = renderMarkdownDocumentHtml(markdown, {
       title: "Product PRD",
       lang: "en",
       toc: true,
       navigation: true,
     });
+    const htmlBytes = Buffer.from(html, "utf8");
+    if (htmlBytes.byteLength > MAX_PRD_VALIDATION_FILE_BYTES) {
+      return {
+        ok: false,
+        error: `product PRD persistence failed: HTML output is ${htmlBytes.byteLength} UTF-8 bytes, exceeding the readable limit of ${MAX_PRD_VALIDATION_FILE_BYTES} bytes`,
+      };
+    }
     const source_hash = sourceHash(sourceArtifacts);
     const content_hash = sha256(markdown);
     const manifest: ProductPrdManifest = {
@@ -594,56 +639,80 @@ export function writeProductPrdDocument(options: ProductPrdWriteOptions): Produc
       content_hash,
       content: markdown,
     };
-    snapshots = [
-      [safe.absolute, captureSnapshot(safe.absolute)],
-      [safeHtml.absolute, captureSnapshot(safeHtml.absolute)],
-      [artifactPath, captureSnapshot(artifactPath)],
-    ];
-
-    mkdirSync(dirname(safe.absolute), { recursive: true });
-    mkdirSync(dirname(safeHtml.absolute), { recursive: true });
-    mkdirSync(options.artifactsDir, { recursive: true });
-
-    // Stage all three outputs before committing any rename.
-    documentTemp = tempPathFor(safe.absolute);
-    writeFileSync(documentTemp, markdown, "utf8");
-    htmlTemp = tempPathFor(safeHtml.absolute);
-    writeFileSync(htmlTemp, html, "utf8");
-    artifactTemp = tempPathFor(artifactPath);
-    writeFileSync(artifactTemp, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-
-    renameSync(documentTemp, safe.absolute);
-    documentTemp = null;
-    renameSync(htmlTemp, safeHtml.absolute);
-    htmlTemp = null;
-    renameSync(artifactTemp, artifactPath);
-    artifactTemp = null;
-    return {
-      ok: true,
-      documentPath: safe.absolute,
-      htmlDocumentPath: safeHtml.absolute,
-      artifactPath,
-      source_hash,
-      content_hash,
-    };
-  } catch (error) {
-    if (documentTemp !== null) rmSync(documentTemp, { force: true });
-    if (htmlTemp !== null) rmSync(htmlTemp, { force: true });
-    if (artifactTemp !== null) rmSync(artifactTemp, { force: true });
-    const rollbackErrors: string[] = [];
-    if (snapshots !== null) {
-      for (const [target, snapshot] of snapshots) {
-        try {
-          restoreSnapshot(target, snapshot);
-        } catch (rollbackError) {
-          rollbackErrors.push(`${target}: ${String(rollbackError)}`);
-        }
-      }
+    const manifestStructure = validateArtifactStructure(manifest);
+    if (!manifestStructure.ok) {
+      return {
+        ok: false,
+        error: `product PRD persistence failed: manifest is not readable by the pinned artifact validator: ${manifestStructure.error}`,
+      };
     }
-    return {
-      ok: false,
-      error: `product PRD persistence failed: ${String(error)}${rollbackErrors.length ? `; rollback: ${rollbackErrors.join("; ")}` : ""}`,
+    const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    if (manifestBytes.byteLength > MAX_PRD_ARTIFACT_BYTES) {
+      return {
+        ok: false,
+        error: `product PRD persistence failed: manifest is ${manifestBytes.byteLength} UTF-8 bytes, exceeding the readable limit of ${MAX_PRD_ARTIFACT_BYTES} bytes`,
+      };
+    }
+    const outputEntries = [
+      { path: documentPath, content: markdownBytes },
+      { path: htmlPath, content: htmlBytes },
+      { path: artifactPath, content: manifestBytes },
+    ];
+    // The batch writer returns exact receipts for every publication. Keep them
+    // before callbacks or result capture so a later failure can roll back only
+    // this attempt.
+    const receipts: PinnedRootWriteReceipt[] = [];
+    const rollback = (): void => {
+      for (const receipt of receipts.slice().reverse()) receipt.rollback();
     };
+    try {
+      const directories = [...new Set([
+        options.stateDirRelative,
+        options.artifactsDirRelative,
+        pinnedParentPath(documentPath),
+        pinnedParentPath(htmlPath),
+        pinnedParentPath(artifactPath),
+      ].filter((path) => path.length > 0))];
+      options.pinnedRoot.ensureDirectories(directories);
+      if (!options.pinnedRoot.isStable()) throw new PinnedRootError("changed", "pinned project root changed before product PRD commit");
+      const published = options.pinnedRoot.writeAtomicFilesWithReceipts(outputEntries, {
+        beforePublish: (prepared) => {
+          for (const receipt of prepared) options.registerRollback?.(() => { receipt.rollback(); });
+        },
+      });
+      receipts.push(...published);
+      if (!options.pinnedRoot.isStable()) throw new PinnedRootError("changed", "pinned project root changed after product PRD commit");
+      return {
+        ok: true,
+        documentPath: join(options.pinnedRoot.lexical_root, documentPath),
+        htmlDocumentPath: join(options.pinnedRoot.lexical_root, htmlPath),
+        artifactPath: join(options.pinnedRoot.lexical_root, artifactPath),
+        source_hash,
+        content_hash,
+      };
+    } catch (error) {
+      rollback();
+      throw error;
+    }
+  } catch (error) {
+    return { ok: false, error: `product PRD persistence failed: ${String(error)}` };
+  }
+}
+
+/** Standalone writer: pin the project root once, then use only relative paths. */
+export function writeProductPrdDocument(options: ProductPrdWriteOptions): ProductPrdWriteResult {
+  const pinnedRoot = PinnedProjectRoot.open(options.projectRoot);
+  if (!pinnedRoot) return { ok: false, error: `product PRD persistence failed: project root ${options.projectRoot} could not be pinned` };
+  try {
+    return writeProductPrdDocumentPinned({
+      pinnedRoot,
+      stateDirRelative: options.stateDirRelative,
+      artifactsDirRelative: options.artifactsDirRelative,
+      path: options.path,
+      sourceArtifacts: options.sourceArtifacts,
+    });
+  } finally {
+    pinnedRoot.close();
   }
 }
 
@@ -655,7 +724,41 @@ export function writeProductPrdDocument(options: ProductPrdWriteOptions): Produc
  * non-symlink, hash match) and stale-source detection by re-hashing the
  * current five source artifacts against the recorded `source_hash`.
  */
-export function validateProductPrdDocument(options: { stateDir: string; artifactsDir: string }): ProductPrdValidation {
+export interface ProductPrdPinnedValidationOptions {
+  pinnedRoot: PinnedProjectRoot;
+  stateDirRelative: string;
+  artifactsDirRelative: string;
+}
+
+export function validateProductPrdDocument(
+  options: { stateDir: string; artifactsDir: string; pinnedRoot?: PinnedProjectRoot; stateDirRelative?: string; artifactsDirRelative?: string },
+): ProductPrdValidation {
+  if (options.pinnedRoot) {
+    if (options.stateDirRelative === undefined || options.artifactsDirRelative === undefined) {
+      return { ok: false, issues: ["product_prd validation failed: pinned relative directories are missing"] };
+    }
+    return validateProductPrdDocumentPinned({
+      pinnedRoot: options.pinnedRoot,
+      stateDirRelative: options.stateDirRelative,
+      artifactsDirRelative: options.artifactsDirRelative,
+    });
+  }
+  const projectRoot = resolve(options.stateDir);
+  const pinnedRoot = PinnedProjectRoot.open(projectRoot);
+  if (!pinnedRoot) return { ok: false, issues: [`product_prd validation failed: project root ${projectRoot} could not be pinned`] };
+  try {
+    const stateDirRelative = pinnedRoot.relativePath(options.stateDir)
+      ?? (resolve(options.stateDir) === pinnedRoot.lexical_root ? "" : null);
+    const artifactsDirRelative = pinnedRoot.relativePath(options.artifactsDir);
+    if (stateDirRelative === null || artifactsDirRelative === null) {
+      return { ok: false, issues: ["product_prd validation failed: directories are outside the pinned project root"] };
+    }
+    return validateProductPrdDocumentPinned({ pinnedRoot, stateDirRelative, artifactsDirRelative });
+  } finally {
+    pinnedRoot.close();
+  }
+}
+function validateProductPrdDocumentPath(options: { stateDir: string; artifactsDir: string }): ProductPrdValidation {
   const issues: string[] = [];
   const artifactPath = join(options.artifactsDir, `${PRODUCT_PRD_ARTIFACT_ID}.json`);
   if (!existsSync(artifactPath)) {
@@ -724,8 +827,8 @@ export function validateProductPrdDocument(options: { stateDir: string; artifact
       }
     }
   }
-
   const current: Record<string, unknown> = {};
+
   const unreadable: string[] = [];
   const symlinked: string[] = [];
   for (const id of PRD_SOURCE_ARTIFACT_IDS) {
@@ -755,5 +858,78 @@ export function validateProductPrdDocument(options: { stateDir: string; artifact
     );
   }
 
+  return { ok: issues.length === 0, issues };
+}
+
+type PinnedTextRead = { ok: true; text: string } | { ok: false; reason: string };
+
+function readPinnedText(pinnedRoot: PinnedProjectRoot, path: string): PinnedTextRead {
+  try {
+    const entry = pinnedRoot.readFile(path, { maxBytes: MAX_PRD_VALIDATION_FILE_BYTES });
+    return { ok: true, text: new TextDecoder("utf-8", { fatal: true }).decode(entry.bytes) };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function validateProductPrdDocumentPinned(options: ProductPrdPinnedValidationOptions): ProductPrdValidation {
+  const { pinnedRoot, stateDirRelative, artifactsDirRelative } = options;
+  const issues: string[] = [];
+  if (!pinnedRoot.isStable()) return { ok: false, issues: ["product_prd validation failed: pinned project root changed before validation"] };
+  let manifest: Record<string, unknown> | null = null;
+  try {
+    const snapshot = readPinnedArtifactSnapshot(pinnedRoot, artifactsDirRelative, PRODUCT_PRD_ARTIFACT_ID);
+    if (snapshot.value && typeof snapshot.value === "object" && !Array.isArray(snapshot.value)) manifest = snapshot.value as Record<string, unknown>;
+    else issues.push("product_prd manifest must be a JSON object");
+  } catch (error) {
+    if (error instanceof PinnedRootError && error.code === "not_found") return { ok: false, issues: ["product_prd artifact is missing"] };
+    return { ok: false, issues: [`product_prd manifest could not be read safely: ${error instanceof Error ? error.message : String(error)}`] };
+  }
+  if (!manifest) return { ok: false, issues };
+  const present = Object.keys(manifest).sort();
+  const expected = [...PRD_MANIFEST_FIELDS].sort();
+  if (present.length !== expected.length || present.some((key, index) => key !== expected[index])) issues.push(`manifest field set mismatch: expected exactly [${expected.join(", ")}] but found [${present.join(", ")}]`);
+  if (manifest.type !== PRODUCT_PRD_ARTIFACT_ID) issues.push(`manifest type must be '${PRODUCT_PRD_ARTIFACT_ID}'`);
+  if (manifest.format !== "markdown") issues.push("manifest format must be 'markdown'");
+  if (typeof manifest.renderer !== "string" || manifest.renderer.length === 0) issues.push("manifest renderer must be a non-empty string");
+  const sourceList = Array.isArray(manifest.source_artifacts) ? manifest.source_artifacts : null;
+  if (sourceList === null || sourceList.length !== PRD_SOURCE_ARTIFACT_IDS.length || sourceList.some((id, index) => id !== PRD_SOURCE_ARTIFACT_IDS[index])) issues.push(`manifest source_artifacts must be exactly [${PRD_SOURCE_ARTIFACT_IDS.join(", ")}] in order`);
+  const content = typeof manifest.content === "string" ? manifest.content : null;
+  const contentHash = typeof manifest.content_hash === "string" ? manifest.content_hash : null;
+  const sourceHashValue = typeof manifest.source_hash === "string" ? manifest.source_hash : null;
+  if (content === null) issues.push("manifest content must be a string");
+  if (contentHash === null) issues.push("manifest content_hash must be a string");
+  if (sourceHashValue === null) issues.push("manifest source_hash must be a string");
+  if (content !== null && contentHash !== null && sha256(content) !== contentHash) issues.push("manifest content does not match its own content_hash (hash mismatch)");
+  const manifestPath = typeof manifest.path === "string" ? manifest.path : null;
+  if (manifestPath === null) {
+    issues.push("manifest path must be a string");
+  } else {
+    try {
+      const document = readPinnedText(pinnedRoot, pinnedOutputPath(stateDirRelative, manifestPath, "document path"));
+      const html = readPinnedText(pinnedRoot, pinnedOutputPath(stateDirRelative, derivedHtmlPath(manifestPath), "HTML document path"));
+      if (!document.ok) issues.push(`document file could not be read safely: ${document.reason}`);
+      if (!html.ok) issues.push(`HTML document could not be read safely: ${html.reason}`);
+      if (document.ok && contentHash !== null && sha256(document.text) !== contentHash) issues.push("document content on disk no longer matches content_hash (stale or modified content)");
+      if (document.ok && content !== null && document.text !== content) issues.push("document content on disk differs from the manifest content");
+    } catch (error) {
+      issues.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  const current: Record<string, unknown> = {};
+  const unreadable: string[] = [];
+  const symlinked: string[] = [];
+  for (const id of PRD_SOURCE_ARTIFACT_IDS) {
+    try {
+      current[id] = readPinnedArtifactSnapshot(pinnedRoot, artifactsDirRelative, id).value;
+    } catch (error) {
+      if (error instanceof PinnedRootError && /symlink/i.test(error.message)) symlinked.push(id);
+      else unreadable.push(id);
+    }
+  }
+  if (symlinked.length > 0) issues.push(`stale source: source artifact(s) ${symlinked.join(", ")} are symlinks — sources must be regular files`);
+  if (unreadable.length > 0) issues.push(`stale source: cannot safely re-read source artifact(s) ${unreadable.join(", ")}`);
+  else if (symlinked.length === 0 && sourceHashValue !== null && sourceHash(current) !== sourceHashValue) issues.push(`stale source: the rendered PRD no longer matches the current source artifacts (${PRD_SOURCE_ARTIFACT_IDS.join(", ")}) — source_hash mismatch`);
+  if (!pinnedRoot.isStable()) issues.push("product_prd validation failed: pinned project root changed during validation");
   return { ok: issues.length === 0, issues };
 }

@@ -1,0 +1,353 @@
+{
+  "schema": 1,
+  "branch": "main",
+  "classification": {
+    "type": "SPEC",
+    "complexity": "MEDIUM",
+    "confidence": "HIGH",
+    "autonomous": false,
+    "workflow": "spec-import"
+  },
+  "task": "Read-only external specification compatibility validation",
+  "workflow_override": true,
+  "issue": null,
+  "stage_cursor": "handoff",
+  "stages": [
+    {
+      "id": "import",
+      "status": "done"
+    },
+    {
+      "id": "constitution",
+      "status": "done"
+    },
+    {
+      "id": "compatibility",
+      "status": "done"
+    },
+    {
+      "id": "compatibility_approval",
+      "status": "done"
+    },
+    {
+      "id": "handoff",
+      "status": "done"
+    }
+  ],
+  "artifacts": {},
+  "pause": {
+    "kind": "done",
+    "reason": ""
+  },
+  "updated_at": "2026-09-02T23:47:20.395Z",
+  "policy": {
+    "strict_orchestrator": true
+  },
+  "scope": {
+    "has_security": false,
+    "has_infra": false,
+    "scope": [],
+    "has_ui": false,
+    "has_runtime": false,
+    "dev_agent": null
+  },
+  "profile_hash": "ca87a46494ca8a93743f7bf3904352a98a8a277421d55af12600c7bfbacba8ad",
+  "run_key": "import-f555db5b-1a97-4a8f-b26a-cbbb9283de2d",
+  "specification": {
+    "schema_version": 2,
+    "feature_id": "imported-payment-retry",
+    "display_name": "imported/payment-retry",
+    "source_kind": "external",
+    "project_root": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-9TuB0s/omp-spec-e2e-complete",
+    "project_root_identity": {
+      "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-9TuB0s/omp-spec-e2e-complete",
+      "dev": 16777234,
+      "ino": 95031200
+    },
+    "workspace_path": "specs/imported-payment-retry",
+    "state_path": ".work-state/features/imported-payment-retry/state.json",
+    "profile_name": "spec-import",
+    "profile_hash": "ca87a46494ca8a93743f7bf3904352a98a8a277421d55af12600c7bfbacba8ad",
+    "constitution_gate_ref": "constitution-gate-3006d825",
+    "constitution_binding": {
+      "provider_id": "native",
+      "path": "CONSTITUTION.md",
+      "version": "0.0.0",
+      "content_sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      "semantic_hash": "35ce12b619924ee68ab11046b5ac497392f2615526e791d52482d5c5257714af",
+      "validation_ref": "constitution.validation.8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      "bound_at": "2026-09-02T23:46:10.983Z"
+    },
+    "language": {
+      "language": "en-US",
+      "source": "project_default",
+      "selection_hash": "587f63b2864bc26fbb1f627c015449cc5b395f78d35e7384876c51cd32f675bd"
+    },
+    "template_set": {
+      "template_set_id": "specification-default",
+      "source": "shipped_default",
+      "content_hash": "5b01f9d8c07f93b2a94f0a4d79fb0d314633a5b5d5cc81ce036f7143a48e0868",
+      "required_markers": []
+    },
+    "phases": [
+      {
+        "phase": "specify",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "plan",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "tasks",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      }
+    ],
+    "status": "implementation_ready",
+    "next_action": {
+      "kind": "command",
+      "command": "/do-work --spec imported-payment-retry",
+      "reason": "Imported compatibility approval finalized the engine-owned implementation handoff."
+    },
+    "handoff_ref": "imported-payment-retry.handoff.v1",
+    "execution_claim_ref": null,
+    "implementation_conformance_ref": null,
+    "import_ref": "import.44693b662ff3a2f615a91c6d5f30aa0c3079fa8409786416344df08f5bd53f58",
+    "migration_receipt_ref": null
+  },
+  "state_revision": 10,
+  "completion_intent": {
+    "mode": "handoff_only",
+    "acceptance": "quality_gates_and_artifacts",
+    "source": "workflow_policy",
+    "rationale": "Import ends at one approved shared implementation handoff."
+  },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": [
+      "custom"
+    ],
+    "rules": {
+      "import_compatibility_approval": {
+        "kind": "custom",
+        "default": "required_human",
+        "allowed_decisions": [
+          "approve_continue",
+          "request_changes",
+          "approve_stop"
+        ],
+        "phase": "before_advance",
+        "rationale": "Explicit approval binds exact source and constitution hashes plus feature/run selectors."
+      }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Constitution prerequisite precedes compatibility and no native phases are replayed."
+  },
+  "work_identity": {
+    "run_id": "import-f555db5b-1a97-4a8f-b26a-cbbb9283de2d",
+    "wave_id": "legacy-wave-0530a02bf713f394ea3a2c5d",
+    "slice_id": "legacy-slice-compatibility_approval",
+    "session_id": "legacy-session-0530a02bf713f394ea3a2c5d",
+    "workflow": "spec-import",
+    "stage_id": "compatibility_approval",
+    "stage_cursor": "compatibility_approval",
+    "capability_id": "legacy-capability-0530a02bf713f394ea3a2c5d",
+    "capability_epoch": "legacy-epoch-0530a02bf713f394ea3a2c5d",
+    "slot_id": "orchestrator",
+    "task_id": "legacy-task-0530a02bf713f394ea3a2c5d",
+    "dispatch_id": "legacy-dispatch-0530a02bf713f394ea3a2c5d",
+    "attempt": 1,
+    "worker_id": "engine"
+  },
+  "migration": {
+    "id": "migration-8b9809290d985c311764937f",
+    "from_schema": 1,
+    "to_schema": 2,
+    "source_profile_hash": "ca87a46494ca8a93743f7bf3904352a98a8a277421d55af12600c7bfbacba8ad",
+    "target_profile_hash": "ca87a46494ca8a93743f7bf3904352a98a8a277421d55af12600c7bfbacba8ad",
+    "source_policy_hash": null,
+    "target_policy_hash": "b5e6fb19582e03efe0d8b782be1d53eeeb0167371e38224ab1188f2e65d472f5",
+    "legacy_inputs": [
+      "classification.autonomous"
+    ],
+    "warnings": [
+      "completion_intent projected from typed profile or conservative migration default",
+      "checkpoint_policy projected from typed profile or conservative human-required migration policy"
+    ],
+    "status": "complete",
+    "migrated_at": "2026-09-02T23:46:14.281Z"
+  },
+  "control_plane_provenance": {
+    "completion_intent": "state",
+    "checkpoint_policy": "state",
+    "roster_policy": "legacy",
+    "roster_selection": "none",
+    "work_identity": "migration",
+    "pending": "none",
+    "child_join": "none",
+    "completion_envelope": "none",
+    "legacy_inputs": [
+      "classification.autonomous"
+    ],
+    "warnings": [],
+    "status": "migrated"
+  },
+  "cursor_epoch": "c4d0739f-3a86-45a7-be27-d0a543b683f8",
+  "dispatch_capability": {
+    "capability_id": "6c43f484-03a2-44bd-aa03-8388b7f2ccf4",
+    "dispatch_token_hash": "e0213da159202bd5c931c5d0680d2524768a3d6369138b27ee4f6e368e416cc1",
+    "advance_token_hash": "05f97956e42319027949244f13b7464893d7c44ce4735033e65ef2a981f06109",
+    "issued_for": {
+      "run_key": "import-f555db5b-1a97-4a8f-b26a-cbbb9283de2d",
+      "branch": "main",
+      "workflow": "spec-import",
+      "profile_hash": "ca87a46494ca8a93743f7bf3904352a98a8a277421d55af12600c7bfbacba8ad",
+      "stage_cursor": "handoff",
+      "cursor_epoch": "c4d0739f-3a86-45a7-be27-d0a543b683f8"
+    },
+    "kind": "none",
+    "expected_roles": [],
+    "expected_count": 0,
+    "expected_roster": [],
+    "status": "complete",
+    "dispatches": []
+  },
+  "observability": {
+    "eventsPath": "observability/events.jsonl",
+    "lastEventId": "evt-mtkqvr1e-2",
+    "rollupThroughId": "evt-mtkqvr1e-2",
+    "rollup": {
+      "agentInvocations": 0,
+      "agents": {},
+      "tools": {},
+      "toolErrors": {},
+      "subagents": {},
+      "skills": {},
+      "totalToolCalls": 0,
+      "totalToolErrors": 0,
+      "durationMs": 15,
+      "firstEventAt": "2026-09-02T23:46:12.755Z",
+      "lastEventAt": "2026-09-02T23:46:12.770Z",
+      "pendingEvents": 0,
+      "pendingReasons": {},
+      "terminalSignals": {},
+      "artifactSummaries": 0,
+      "artifactWrites": 2
+    }
+  },
+  "trusted_checkpoint_answers": [
+    {
+      "answer_id": "checkpoint-answer-00a2ff98-eee6-40ff-8b01-6a9b3f1b3e01",
+      "nonce": "b14dd0ed6c44ab29f24fa4bc6798b03ee6687b64523600a3ecb53ea806b2fb7c",
+      "channel": "terminal",
+      "reference": "terminal:workflow_checkpoint_ask_selected:checkpoint-answer-00a2ff98-eee6-40ff-8b01-6a9b3f1b3e01",
+      "run_id": "import-f555db5b-1a97-4a8f-b26a-cbbb9283de2d",
+      "stage_id": "compatibility_approval",
+      "checkpoint_id": "import_compatibility_approval",
+      "work_identity_hash": "bb590cd3dbfaa2dbaac92808288b03a93954c233a189b05125e545d6ba21e188",
+      "capability_id": "c4c476d1-b7e2-4287-8387-b0919bb06374",
+      "capability_epoch": "562ac466-f00e-42d2-8dd8-c24df850dbf6",
+      "policy_hash": "b5e6fb19582e03efe0d8b782be1d53eeeb0167371e38224ab1188f2e65d472f5",
+      "feature_id": "imported-payment-retry",
+      "loop_iteration": 1,
+      "subject_binding": "a79d462309766aac5106ecec753fc19ac259fbc418e350859d2547f978956d32",
+      "subject_revision": 6,
+      "decision": "approve_continue",
+      "binding": "f5c1c03eacf74b55f10998ea70a4585857831479e6394c8bcbed6fefe53832ce",
+      "issued_at": "2026-09-02T23:46:44.668Z",
+      "consumed_at": "2026-09-02T23:46:58.891Z"
+    }
+  ],
+  "typed_checkpoint_decisions": [
+    {
+      "run_id": "import-f555db5b-1a97-4a8f-b26a-cbbb9283de2d",
+      "stage_id": "compatibility_approval",
+      "checkpoint_id": "import_compatibility_approval",
+      "checkpoint_kind": "custom",
+      "decision": "approve_continue",
+      "authorization": "human",
+      "actor": {
+        "kind": "user",
+        "ref": "terminal:workflow_checkpoint_ask_selected:checkpoint-answer-00a2ff98-eee6-40ff-8b01-6a9b3f1b3e01",
+        "proof": {
+          "answer_id": "checkpoint-answer-00a2ff98-eee6-40ff-8b01-6a9b3f1b3e01",
+          "nonce": "b14dd0ed6c44ab29f24fa4bc6798b03ee6687b64523600a3ecb53ea806b2fb7c",
+          "channel": "terminal",
+          "reference": "terminal:workflow_checkpoint_ask_selected:checkpoint-answer-00a2ff98-eee6-40ff-8b01-6a9b3f1b3e01",
+          "binding": "f5c1c03eacf74b55f10998ea70a4585857831479e6394c8bcbed6fefe53832ce"
+        }
+      },
+      "capability_id": "c4c476d1-b7e2-4287-8387-b0919bb06374",
+      "capability_epoch": "562ac466-f00e-42d2-8dd8-c24df850dbf6",
+      "policy_hash": "b5e6fb19582e03efe0d8b782be1d53eeeb0167371e38224ab1188f2e65d472f5",
+      "feature_id": "imported-payment-retry",
+      "loop_iteration": 1,
+      "subject_binding": "a79d462309766aac5106ecec753fc19ac259fbc418e350859d2547f978956d32",
+      "rationale": "Approved exact imported compatibility mapping, source and normalized hashes, constitution binding, and compatibility report for handoff.",
+      "decided_at": "2026-09-02T23:46:58.890Z"
+    }
+  ],
+  "checkpoint_decisions": [
+    {
+      "stage_id": "compatibility_approval",
+      "checkpoint": "import_compatibility_approval",
+      "mode": "interactive",
+      "decision": "approve_continue",
+      "actor": "user:terminal:workflow_checkpoint_ask_selected:checkpoint-answer-00a2ff98-eee6-40ff-8b01-6a9b3f1b3e01",
+      "rationale": "Approved exact imported compatibility mapping, source and normalized hashes, constitution binding, and compatibility report for handoff.",
+      "decided_at": "2026-09-02T23:46:58.890Z",
+      "run_id": "import-f555db5b-1a97-4a8f-b26a-cbbb9283de2d",
+      "checkpoint_id": "import_compatibility_approval",
+      "checkpoint_kind": "custom",
+      "authorization": "human",
+      "actor_provenance": {
+        "kind": "user",
+        "ref": "terminal:workflow_checkpoint_ask_selected:checkpoint-answer-00a2ff98-eee6-40ff-8b01-6a9b3f1b3e01",
+        "proof": {
+          "answer_id": "checkpoint-answer-00a2ff98-eee6-40ff-8b01-6a9b3f1b3e01",
+          "nonce": "b14dd0ed6c44ab29f24fa4bc6798b03ee6687b64523600a3ecb53ea806b2fb7c",
+          "channel": "terminal",
+          "reference": "terminal:workflow_checkpoint_ask_selected:checkpoint-answer-00a2ff98-eee6-40ff-8b01-6a9b3f1b3e01",
+          "binding": "f5c1c03eacf74b55f10998ea70a4585857831479e6394c8bcbed6fefe53832ce"
+        }
+      },
+      "capability_id": "c4c476d1-b7e2-4287-8387-b0919bb06374",
+      "capability_epoch": "562ac466-f00e-42d2-8dd8-c24df850dbf6",
+      "policy_hash": "b5e6fb19582e03efe0d8b782be1d53eeeb0167371e38224ab1188f2e65d472f5",
+      "feature_id": "imported-payment-retry",
+      "loop_iteration": 1,
+      "subject_binding": "a79d462309766aac5106ecec753fc19ac259fbc418e350859d2547f978956d32"
+    }
+  ],
+  "join_summary": {
+    "stage_id": "compatibility_approval",
+    "cursor_epoch": "562ac466-f00e-42d2-8dd8-c24df850dbf6",
+    "dispatch_ids": [],
+    "roles": [],
+    "evidence": "Human approved the exact imported compatibility mapping and hash bindings at import_compatibility_approval.",
+    "joined_at": "2026-09-02T23:47:07.915Z"
+  }
+}

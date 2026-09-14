@@ -1,0 +1,297 @@
+{
+  "id": "spec-do-work-adaptive",
+  "title": "Specification-backed do-work: adaptive preparation depth with durable nested resume",
+  "description": "Drives `/do-work` without an existing workspace across the declared preparation depths: a clear low-risk quick request stays lightweight with a recorded rationale, a medium ambiguous request requires focused clarification before bounded preparation, a complex request enters the full nested specification workflow under one explicit feature/run identity, and a security-sensitive request routes full against the same identity. The nested run pauses after an approved phase, resumes from durable state in one explicit invocation without replaying approved work, and a duplicate invocation fails closed without a second run.",
+  "params": {
+    "feature_id": "readable-do-work-adaptive",
+    "run_key": "readable-do-work-adaptive-run-001",
+    "quick_request": "Correct the deploy script usage banner that prints the wrong flag name",
+    "medium_request": "Improve the release notes generation; the scope and output format are not settled yet",
+    "medium_clarification": "Target only the changelog generator output, keep the existing format, and change no other consumers.",
+    "complex_request": "Add a cross-cutting retry and idempotency layer for the job scheduler with durable state migration",
+    "security_request": "Harden the same job scheduler retry layer against replay and privilege-escalation risks before its specification is approved"
+  },
+  "selectors": {
+    "feature_id": "readable-do-work-adaptive",
+    "run_key": "readable-do-work-adaptive-run-001"
+  },
+  "workspace": {
+    "path": "specs/{{feature_id}}",
+    "state_path": ".work-state/features/{{feature_id}}/state.json",
+    "documents": [
+      "specs/{{feature_id}}/status.md",
+      "specs/{{feature_id}}/spec.md",
+      "specs/{{feature_id}}/plan.md",
+      "specs/{{feature_id}}/tasks.md"
+    ],
+    "validation": [
+      "specs/{{feature_id}}/validation/specify.md",
+      "specs/{{feature_id}}/validation/plan.md",
+      "specs/{{feature_id}}/validation/tasks.md",
+      "specs/{{feature_id}}/validation/constitution-impact.md"
+    ],
+    "history": [
+      "specs/{{feature_id}}/history/specify",
+      "specs/{{feature_id}}/history/plan",
+      "specs/{{feature_id}}/history/tasks"
+    ],
+    "handoff": [
+      "specs/{{feature_id}}/handoff.md"
+    ],
+    "checkpoints": [
+      ".work-state/features/{{feature_id}}/state.json",
+      ".work-state/ux-e2e/transcript.jsonl",
+      ".work-state/ux-e2e/ask-state.jsonl"
+    ],
+    "evidence": [
+      ".work-state/features/{{feature_id}}/artifacts",
+      "exactly one workspace under specs and .work-state/features"
+    ]
+  },
+  "transcript": {
+    "checkpoints": [
+      "approve_continue",
+      "approve_stop",
+      "trusted human proof",
+      "one decision per approved phase",
+      "no duplicate approval"
+    ],
+    "workers": [
+      "Specify worker dispatch",
+      "Plan worker dispatch",
+      "Tasks worker dispatch",
+      "no repeated Specify dispatch after resume",
+      "no duplicate worker dispatch",
+      "no main-authored approval",
+      "no detached reviewer approval"
+    ],
+    "validation": [
+      "validation/specify.md",
+      "validation/plan.md",
+      "validation/tasks.md",
+      "validation/constitution-impact.md"
+    ],
+    "history": [
+      "history/specify",
+      "history/plan",
+      "history/tasks",
+      "no duplicate history entry"
+    ],
+    "handoff": [
+      "handoff.md",
+      "handoff_digest",
+      "status ready",
+      "open_decisions",
+      "execution_choices"
+    ],
+    "interruption": [
+      "nested run paused",
+      "Specify approved",
+      "Plan not_started",
+      "durable state unchanged while idle"
+    ],
+    "resume": [
+      "resumed from durable state",
+      "same nested identity",
+      "one explicit invocation",
+      "no repeated Specify dispatch",
+      "no repeated Specify approval"
+    ],
+    "next_actions": [
+      "/do-work --spec {{feature_id}}",
+      "recorded preparation depth rationale",
+      "focused clarification before bounded preparation",
+      "recoverable duplicate-run diagnostic"
+    ]
+  },
+  "task": "Exercise adaptive `/do-work` preparation depth as seven deterministic journeys over one explicit nested identity. Use only the canonical workspace `specs/{{feature_id}}`, durable state `.work-state/features/{{feature_id}}/state.json`, and the existing native classification, constitution prerequisite, phase profiles, and typed artifacts. Select the exact explicit `feature_id={{feature_id}}` and `run_key={{run_key}}` for every status, command, dispatch, checkpoint, resume, and evidence lookup; reject any branch-, cwd-, `.active-feature`-, inferred-, or alternate-run selection. The nested full path MUST use the same documents, validation, checkpoints, language behavior, and durable resume rules as a directly invoked specification workflow: no private abbreviated specification, no main-session authorship of phase content, and no skipped validation because the entry point is `/do-work`. Every depth decision must record a readable rationale naming the observed complexity, confidence, and risk.\n\nJourney 1 - quick stays lightweight. Submit `/do-work` with this request verbatim while no feature workspace exists: `{{quick_request}}`. Confirm the classification records preparation depth quick with a rationale stating why the full specification workflow was unnecessary, and that the run created no feature workspace, dispatched no specification phase, opened no constitution prerequisite, and exposed no checkpoint.\n\nJourney 2 - medium requires bounded preparation. Submit `/do-work` with this request verbatim, again with no feature workspace: `{{medium_request}}`. Confirm the classification records preparation depth medium with its rationale, that focused clarification is required before implementation, answer the `[ask_user]` clarification with this text verbatim: `{{medium_clarification}}`, and that implementation does not begin before the bounded preparation completes. Confirm the medium path opened no constitution prerequisite and dispatched no full three-phase specification profile.\n\nJourney 3 - complex enters the full nested workflow. Submit `/do-work` with this request verbatim: `{{complex_request}}`. Confirm the classification records preparation depth full with its rationale, that the nested specification workflow starts under exactly the one identity `feature_id={{feature_id}}` with `run_key={{run_key}}`, and that exactly one workspace appears under `specs` and `.work-state/features`. The shared native constitution prerequisite runs first; approve it at its `[ask_user]` checkpoint, then confirm the nested Specify phase dispatches with the same documents, validation, and checkpoint contract as a direct invocation.\n\nJourney 4 - duplicate invocation fails closed. While that nested run is still active, submit the same `/do-work` request verbatim again: `{{complex_request}}`. Confirm the duplicate is rejected with a recoverable diagnostic naming the active nested run, that exactly one active run remains for the identity, and that no second workspace, capability, dispatch, artifact, or approval was created. The active run must continue untouched.\n\nJourney 5 - security-sensitive routes full against the same identity. Submit this request verbatim for the same explicit `feature_id={{feature_id}}` and `run_key={{run_key}}`: `{{security_request}}`. Confirm the classification records preparation depth full with a security-sensitive rationale, and that the request resolves against the one existing nested run - no second nested run, no alternate identity, and no additional workspace.\n\nJourney 6 - pause after an approved phase. At the nested Specify `[ask_user]` checkpoint choose `approve_continue` and wait until the decision is committed with trusted human proof bound to the exact current Specify version. Then stop the process only after durable state and readable projections are written. Confirm the durable state reports the nested run paused with Specify approved and Plan not_started, that idle time changed no state, and that no phase, dispatch, approval, or history entry was duplicated.\n\nJourney 7 - resume without replay. On a fresh process, resume with exactly one explicit `/do-work` invocation selecting `feature_id={{feature_id}}` and `run_key={{run_key}}`. Confirm the nested run resumes from durable state with the same nested identity: Specify is not replayed - no repeated Specify dispatch, approval, version, or history entry. At the resulting Plan `[ask_user]` checkpoint choose `approve_continue`; at the resulting Tasks `[ask_user]` checkpoint choose `approve_stop`. Confirm zero repeated approved phases, `specs/{{feature_id}}/handoff.md` materialized with a 64-hex content-addressed `handoff_digest`, durable state `implementation_ready` with `status ready`, empty `open_decisions`, and `next_action` naming exactly `/do-work --spec {{feature_id}}`. The nested run ends at preparation: do not begin implementation in this scenario.\n\nEnd with a compact evidence summary listing `feature_id={{feature_id}}`, `run_key={{run_key}}`, the recorded depth rationale for the quick, medium, complex-full, and security-sensitive-full decisions, the one nested identity, the final `handoff_digest`, the exact next action, and the artifact paths under `specs/{{feature_id}}` and `.work-state/features/{{feature_id}}`.",
+  "stages": [
+    {
+      "id": "quick-lightweight",
+      "name": "Quick low-risk request stays lightweight with a recorded rationale",
+      "expect": [
+        "{{quick_request}}",
+        "preparation depth quick",
+        "why the full specification workflow was unnecessary",
+        "no feature workspace",
+        "no specification phase dispatch",
+        "no constitution prerequisite",
+        "no checkpoint"
+      ]
+    },
+    {
+      "id": "medium-bounded",
+      "name": "Medium ambiguous request requires focused clarification before bounded preparation",
+      "expect": [
+        "{{medium_request}}",
+        "preparation depth medium",
+        "focused clarification",
+        "no implementation before bounded preparation",
+        "no constitution prerequisite",
+        "no full three-phase dispatch",
+        "[ask_user]"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]larification",
+          "answer": "{{medium_clarification}}",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "complex-full-nested",
+      "name": "Complex request enters the full nested specification workflow",
+      "expect": [
+        "{{complex_request}}",
+        "preparation depth full",
+        "nested specification workflow",
+        "feature_id={{feature_id}}",
+        "run_key={{run_key}}",
+        "exactly one workspace",
+        "same documents, validation, and checkpoints",
+        "CONSTITUTION.md",
+        "[ask_user]",
+        "approve_continue"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]onstitution",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "duplicate-invocation",
+      "name": "Duplicate invocation fails closed against the one active nested run",
+      "expect": [
+        "{{complex_request}}",
+        "duplicate rejected",
+        "recoverable diagnostic",
+        "one active nested run",
+        "no second workspace",
+        "no duplicate capability",
+        "no duplicate dispatch",
+        "no duplicate approval",
+        "active run untouched"
+      ]
+    },
+    {
+      "id": "security-sensitive-full",
+      "name": "Security-sensitive request routes full against the same nested identity",
+      "expect": [
+        "{{security_request}}",
+        "preparation depth full",
+        "security-sensitive rationale",
+        "feature_id={{feature_id}}",
+        "run_key={{run_key}}",
+        "one existing nested run",
+        "no second nested run",
+        "no alternate identity",
+        "no additional workspace"
+      ]
+    },
+    {
+      "id": "specify-checkpoint",
+      "name": "Nested Specify checkpoint approves continue like a direct workflow",
+      "expect": [
+        "Specify",
+        "specs/{{feature_id}}/spec.md",
+        "validation/specify.md",
+        "feature_id={{feature_id}}",
+        "run_key={{run_key}}",
+        "trusted human proof",
+        "[ask_user]",
+        "approve_continue"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Ss]pecify",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "paused-durable",
+      "name": "Nested run pauses after the approved phase with durable state",
+      "expect": [
+        "approve_continue committed",
+        "Specify approved",
+        "Plan not_started",
+        "nested run paused",
+        "durable state unchanged while idle",
+        "no duplicate phase version",
+        "no duplicate approval"
+      ]
+    },
+    {
+      "id": "resumed-exact",
+      "name": "One explicit invocation resumes the nested run from durable state",
+      "expect": [
+        "feature_id={{feature_id}}",
+        "run_key={{run_key}}",
+        "resumed from durable state",
+        "same nested identity",
+        "no repeated Specify dispatch",
+        "no repeated Specify approval",
+        "Plan",
+        "[ask_user]",
+        "approve_continue"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Pp]lan",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "tasks-ready-handoff",
+      "name": "Tasks approval freezes the ready handoff without starting implementation",
+      "expect": [
+        "Tasks",
+        "specs/{{feature_id}}/tasks.md",
+        "handoff.md",
+        "handoff_digest",
+        "implementation_ready",
+        "status ready",
+        "next_action",
+        "/do-work --spec {{feature_id}}",
+        "zero repeated approved phases",
+        "one nested identity",
+        "approve_stop",
+        "[ask_user]"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Tt]asks",
+          "answer": "3",
+          "count": 1
+        }
+      ]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 600000,
+    "checkpointPollMs": 500
+  },
+  "screenshots": {
+    "on": ["stage_start", "stage_end", "ask_user", "error"]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

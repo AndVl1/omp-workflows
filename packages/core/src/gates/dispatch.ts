@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { resolveState, resolveActiveBranch } from "../engine/state.js";
+import { ctoSliceTaskGate, isActiveCtoExecutionTask } from "../cto/slice-gate.js";
 import { loadProfile, profileHash } from "../engine/profile.js";
+import { isSafeFeatureId } from "../specification/validation.js";
 
 import type { StageDef } from "../engine/types.js";
 export const DISPATCH_MARKER_PREFIX = "<!-- omp-dispatch";
-const MARKER_RE = /<!--\s*omp-dispatch\s+run=([^\s]+)\s+stage=([^\s]+)\s+kind=(single|consilium)\s+cursor=([^\s]+)\s+roles=([^\s]+)(?:\s+role=([^\s]+))?(?:\s+capability=([^\s]+))?(?:\s+slot=([^\s]+))?(?:\s+task=([^\s]+))?\s*-->/;
+const MARKER_RE = /<!--\s*omp-dispatch\s+run=([^\s]+)\s+stage=([^\s]+)\s+kind=(single|consilium)\s+cursor=([^\s]+)\s+roles=([^\s]+)(?:\s+role=([^\s]+))?(?:\s+capability=([^\s]+))?(?:\s+slot=([^\s]+))?(?:\s+task=([^\s]+))?(?:\s+feature_id=([^\s]+))?\s*-->/;
 
 export type DispatchMarker = {
   run: string;
@@ -16,11 +18,56 @@ export type DispatchMarker = {
   capability_id?: string;
   slot_id?: string;
   task_id?: string;
+  /** Explicit feature workspace binding for native specification dispatches. */
+  feature_id?: string;
 };
+
+/** Opaque engine-issued binding echoed by one native worker generation. */
+export interface NativeGenerationBinding {
+  input_ref: string;
+  input_digest: string;
+}
+
+/** Derive a stable generation identity without admitting caller-supplied authority. */
+export function nativeGenerationBinding(input: {
+  feature_id: string;
+  run_key: string;
+  phase: string;
+  version: number;
+  request_id: string;
+  dispatch_id: string;
+  capability_id: string;
+  capability_epoch: string;
+  run_id: string;
+  workflow: string;
+  task_id: string;
+  worker_id: string;
+}): NativeGenerationBinding {
+  const input_ref = `spec-native:${input.feature_id}:${input.run_key}:${input.phase}:${input.dispatch_id}`;
+  const input_digest = createHash("sha256")
+    .update(JSON.stringify([
+      input_ref,
+      input.version,
+      input.request_id,
+      input.capability_id,
+      input.capability_epoch,
+      input.run_id,
+      input.workflow,
+      input.task_id,
+      input.worker_id,
+    ]))
+    .digest("hex");
+  return { input_ref, input_digest };
+}
 
 /** Stable task identity used by the marker and durable authorization layers. */
 export function dispatchTaskId(capabilityId: string, runKey: string, branch: string, workflow: string, stage: string, role: string): string {
   return `task-${createHash("sha256").update(`${capabilityId}|${runKey}|${branch}|${workflow}|${stage}|${role}`).digest("hex").slice(0, 32)}`;
+}
+
+/** Bounded generic-task label for native specification workers. */
+export function nativeWorkerName(phase: string, dispatchId: string): string {
+  return `spec-${phase}-${dispatchId}`;
 }
 
 export function buildDispatchMarker(
@@ -32,20 +79,24 @@ export function buildDispatchMarker(
   capabilityId?: string,
   slotId?: string,
   taskId?: string,
+  featureId?: string,
 ): string {
   const roles = rolesOverride ?? (stage.type === "single" ? [stage.role ?? ""] : stage.roles ?? []);
   const rolePart = role ? ` role=${role}` : "";
   const capabilityPart = capabilityId ? ` capability=${capabilityId}` : "";
   const slotPart = slotId ? ` slot=${slotId}` : "";
   const taskPart = taskId ? ` task=${taskId}` : "";
-  return `${DISPATCH_MARKER_PREFIX} run=${run} stage=${stage.id} kind=${stage.type} cursor=${cursor} roles=${roles.length > 0 ? roles.join(",") : "-"}${rolePart}${capabilityPart}${slotPart}${taskPart} -->`;
+  if (featureId !== undefined && !isSafeFeatureId(featureId)) throw new Error("feature_id must be a safe feature id");
+  const featurePart = featureId === undefined ? "" : ` feature_id=${featureId}`;
+  return `${DISPATCH_MARKER_PREFIX} run=${run} stage=${stage.id} kind=${stage.type} cursor=${cursor} roles=${roles.length > 0 ? roles.join(",") : "-"}${rolePart}${capabilityPart}${slotPart}${taskPart}${featurePart} -->`;
 }
 
 export function parseDispatchMarker(text: string): DispatchMarker | null {
   const match = text.match(MARKER_RE);
   if (!match) return null;
-  const [run, stage, kind, cursor, rolesText, role, capability_id, slot_id, task_id] = match.slice(1);
+  const [run, stage, kind, cursor, rolesText, role, capability_id, slot_id, task_id, feature_id] = match.slice(1);
   if (!run || !stage || !kind || !cursor || !rolesText) return null;
+  if (feature_id !== undefined && !isSafeFeatureId(feature_id)) return null;
   const roles = rolesText === "-" ? [] : rolesText.split(",");
   if (roles.some((entry) => !entry)) return null;
   return {
@@ -58,11 +109,15 @@ export function parseDispatchMarker(text: string): DispatchMarker | null {
     ...(capability_id ? { capability_id } : {}),
     ...(slot_id ? { slot_id } : {}),
     ...(task_id ? { task_id } : {}),
+    ...(feature_id ? { feature_id } : {}),
   };
 }
 
 export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx: { cwd: string }): { block: true; reason: string } | undefined {
   if (event.toolName !== "task") return;
+  const ctoGate = ctoSliceTaskGate(event, ctx);
+  if (ctoGate?.block) return ctoGate;
+  if (isActiveCtoExecutionTask(event, ctx)) return;
   const currentBranch = resolveActiveBranch(ctx.cwd);
   const resolved = resolveState(ctx.cwd, currentBranch);
   if (resolved.invalid) return { block: true, reason: "dispatch gate: workflow state path is invalid" };
@@ -171,6 +226,7 @@ export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx:
       || marker.stage !== issued.stage_cursor
       || marker.cursor !== issued.cursor_epoch
       || marker.kind !== capability.kind
+      || (marker.feature_id !== undefined && marker.feature_id !== state.specification?.feature_id)
       || JSON.stringify([...marker.roles].sort()) !== JSON.stringify(expectedRoster.map((entry) => entry.role).sort())
     ) {
       return { block: true, reason: "dispatch gate: task marker does not match persisted opaque capability" };
@@ -193,6 +249,8 @@ export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx:
 }
 
 export interface DispatchAuthorizationRequest {
+  /** Explicit feature selector for native concurrent phase dispatches. */
+  feature_id?: string;
   capability_id: string;
   run_key: string;
   branch: string;
@@ -217,12 +275,15 @@ export interface DispatchAuthorizationRequest {
 export function trustedDispatchRequests(
   event: { toolName?: string; toolCallId?: string; input?: unknown },
   ctx: { cwd: string },
+  options: { skipGate?: boolean; selector?: { feature_id: string; run_key: string } } = {},
 ): { ok: true; requests: DispatchAuthorizationRequest[] } | { ok: false; reason: string } {
   if (event.toolName !== "task") return { ok: false, reason: "dispatch gate: non-task call" };
-  const resolved = resolveState(ctx.cwd, resolveActiveBranch(ctx.cwd));
+  const resolved = options.selector
+    ? resolveState(ctx.cwd, resolveActiveBranch(ctx.cwd), options.selector)
+    : resolveState(ctx.cwd, resolveActiveBranch(ctx.cwd));
   const state = resolved.state;
   if (!state || state.policy?.strict_orchestrator !== true) return { ok: true, requests: [] };
-  const blocked = dispatchGate(event, ctx);
+  const blocked = options.skipGate ? undefined : dispatchGate(event, ctx);
   if (blocked) return { ok: false, reason: blocked.reason };
   const toolCallId = event.toolCallId;
   if (!toolCallId) return { ok: false, reason: "dispatch gate: task call identity is missing" };
@@ -244,6 +305,7 @@ export function trustedDispatchRequests(
     const slotId = marker.slot_id ?? marker.role ?? (typeof item.role === "string" ? item.role : "");
     if (!slotId) return { ok: false, reason: "dispatch gate: task slot identity is missing" };
     requests.push({
+      ...(options.selector ? { feature_id: options.selector.feature_id } : {}),
       capability_id: capabilityId,
       run_key: issued.run_key,
       branch: issued.branch,

@@ -28,4 +28,12 @@ test("privateOmpOwnerForCwd builds provenance from the resolved cwd", () => {
 	assert.equal(owner.provenance.entrypoint, "dist/index.js");
 	assert.equal(owner.provenance.cwd, root);
 	assert.equal(owner.provenance.config_path, join(root, ".omp", "team.config.json"));
+	assert.deepEqual(owner.activation, {
+		marker_id: OMP_INTERNAL_ACTIVATION_MARKER,
+		required: [
+			{ path: "package.json", kind: "file" },
+			{ path: "packages/core", kind: "directory" },
+			{ path: "packages/fullstack", kind: "directory" },
+		],
+	});
 });

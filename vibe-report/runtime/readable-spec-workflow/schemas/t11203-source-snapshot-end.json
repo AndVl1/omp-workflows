@@ -1,0 +1,2099 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-09-11T17:51:25.191Z",
+  "digest": "9fe974c9034f05be5d23316bf1bbd50c015443d0a442aeee9e3cfa0dded301a5",
+  "file_count": 417,
+  "missing_file_count": 2,
+  "scope": [
+    "tracked packages/** source/test/schema/runtime inputs",
+    "tracked specs/001-redesign-spec-workflow/contracts/**",
+    "tracked root package manifests and tsconfig files"
+  ],
+  "files": [
+    {
+      "path": "package-lock.json",
+      "present": true,
+      "sha256": "c5475f9acfc2e5f11ce46c7af7356f897e96ef5dda5aaa462c25fbcefe59e1a8"
+    },
+    {
+      "path": "package.json",
+      "present": true,
+      "sha256": "5b5ab1d3e1ed8236df53f97829ea9ae493e993cfe452622e391b48bea8eda328"
+    },
+    {
+      "path": "packages/core/README.md",
+      "present": true,
+      "sha256": "bb61cbe880787fb1aa1a9c8181b236d50fa91ec75259a717e9bdb45e8df39470"
+    },
+    {
+      "path": "packages/core/package.json",
+      "present": true,
+      "sha256": "556d0b20671d82242268878783b517263d38c19899a6824181096d392208cf21"
+    },
+    {
+      "path": "packages/core/skills/custom-agent-bundle/SKILL.md",
+      "present": true,
+      "sha256": "fc7f32a77197ab9cdabbb17c7a6034c459aa29c18c78f5d93524338e44feb05d"
+    },
+    {
+      "path": "packages/core/skills/custom-escalation-adapter/SKILL.md",
+      "present": true,
+      "sha256": "78a2f5dd3218f8fab4ec64d5c983680417c5155976f5870e09c7188b3b9af6d3"
+    },
+    {
+      "path": "packages/core/src/commands/classification-contract.ts",
+      "present": true,
+      "sha256": "249e3f1c28abaae3d19ad60516c6f66fdfecd61dfb68a71f7949f1d98e8dee7f"
+    },
+    {
+      "path": "packages/core/src/commands/cto.ts",
+      "present": true,
+      "sha256": "d8a1d23aacb587b6e03dfd84c60f763b43e15113efeba31410a711fcbc6f258f"
+    },
+    {
+      "path": "packages/core/src/commands/do-work.ts",
+      "present": true,
+      "sha256": "5256a7632b4ad74657716440e64041ca50564334b54f96d455e169bb11ba3ad1"
+    },
+    {
+      "path": "packages/core/src/commands/envelope.ts",
+      "present": true,
+      "sha256": "8a2833bbfea6c42e1b9fae8fbfcdfe0219fb165f178b946f7fcc6a59b749d89b"
+    },
+    {
+      "path": "packages/core/src/commands/register.ts",
+      "present": true,
+      "sha256": "aafec0e95a16a90ad8f2dc67ec5a0a886e7970e5aa98e158f9b3b38b8a4454cf"
+    },
+    {
+      "path": "packages/core/src/commands/team.ts",
+      "present": true,
+      "sha256": "baa879723a6bf8ca75c1056579e04a91d2e561ae9ff2fd6d6040c2c7665295e9"
+    },
+    {
+      "path": "packages/core/src/commands/types.ts",
+      "present": true,
+      "sha256": "c886a2e0be5f6659ad1cbfa2536813cc7d33d34f5f737f6271887145cd6269aa"
+    },
+    {
+      "path": "packages/core/src/cto/budget.ts",
+      "present": true,
+      "sha256": "c962b43f631f91654dad6bde5f35555bbe5b7cb64d887f2c572eeb99dc43c9d5"
+    },
+    {
+      "path": "packages/core/src/cto/channels.ts",
+      "present": true,
+      "sha256": "f89ccb5778d837a28d0b9a54b7cd8ef9b1e3de56f238dbbe9dcfc73dfca5420a"
+    },
+    {
+      "path": "packages/core/src/cto/decisions.ts",
+      "present": true,
+      "sha256": "2b0334c91e92451ea4891bfb7707aed8c9d1e9a048624f0dfda9efea096adb06"
+    },
+    {
+      "path": "packages/core/src/cto/dissent.ts",
+      "present": true,
+      "sha256": "b2b36ffade15f45e4955d17d66edbec8e4dc30ae017eb97d9a75e53e89e67afd"
+    },
+    {
+      "path": "packages/core/src/cto/escalation.ts",
+      "present": true,
+      "sha256": "722818de7c304eb3194d084cdb1c235b3f91274586962faa6e3bdf5488b6370b"
+    },
+    {
+      "path": "packages/core/src/cto/gates.ts",
+      "present": true,
+      "sha256": "93c3ec8d27966f89c62d8b408735e693bc0c80fe0b4490a620782bc9b3e30448"
+    },
+    {
+      "path": "packages/core/src/cto/health.ts",
+      "present": true,
+      "sha256": "22dc18bc3e6c4657843df6021d9cbbb3afc91564fdfb9547834b0fff8edf655e"
+    },
+    {
+      "path": "packages/core/src/cto/leases.ts",
+      "present": true,
+      "sha256": "85439d883c9f229ec8ef70daa856f95e89f55bcaf5bb63e47b61872e81d7a8bd"
+    },
+    {
+      "path": "packages/core/src/cto/plan.ts",
+      "present": true,
+      "sha256": "aaebd64563a93e1cbeb17e1ae5c1345ef1a5e836a0118d664e5636c3f0022565"
+    },
+    {
+      "path": "packages/core/src/cto/redaction.ts",
+      "present": true,
+      "sha256": "74576401ee7f9e7551f4f1eec3c88bda8a7559b1828f0ec8b5f2cc70822f1cc0"
+    },
+    {
+      "path": "packages/core/src/cto/refinement.ts",
+      "present": true,
+      "sha256": "e624a7f45293cd97032c6798c2d535284a8e324ac463f521e592501df9231369"
+    },
+    {
+      "path": "packages/core/src/cto/run.ts",
+      "present": true,
+      "sha256": "4348bc1ae6ce8695333a576658d40e6c2e4ecde75f822e8bb12d661b1633d3ee"
+    },
+    {
+      "path": "packages/core/src/cto/scheduler.ts",
+      "present": true,
+      "sha256": "970e093a300afb969cdf91034b628f895d64536d20b6b68178ac30be01335e29"
+    },
+    {
+      "path": "packages/core/src/cto/slice-gate.ts",
+      "present": true,
+      "sha256": "b78dd14c4ba3993faa50459241c4ea91b36c8ec6cb334cf5ce4e696725e1d742"
+    },
+    {
+      "path": "packages/core/src/cto/state.ts",
+      "present": true,
+      "sha256": "be164662af8fd44e8dc3f36dccea68da9129d74f9706b3e7b8f8156df7df5759"
+    },
+    {
+      "path": "packages/core/src/cto/types.ts",
+      "present": true,
+      "sha256": "081262468f50db8d0a8877c3ffa1b788b02c283e701b340597f7c6ff8acb623f"
+    },
+    {
+      "path": "packages/core/src/engine/agent-mapping.ts",
+      "present": true,
+      "sha256": "b27fbb81335a8b5579b4efa4d48a756c29465ffc7cc107922a1f3442ff88b3ad"
+    },
+    {
+      "path": "packages/core/src/engine/artifact-contract.ts",
+      "present": true,
+      "sha256": "8f0f701e36f2539d19bb9f8a79452aa555e6de331daf7628d0f6143a04252c97"
+    },
+    {
+      "path": "packages/core/src/engine/artifacts.ts",
+      "present": true,
+      "sha256": "69cfd6ed559fbc37bd952ce91cd2521c7d59204be379f16d2b8bd0055fa84dae"
+    },
+    {
+      "path": "packages/core/src/engine/checkpoints.ts",
+      "present": true,
+      "sha256": "1127c148b7eb848fa31422a232f6268cc6d00e499260de72572bfa6cc38cc0a5"
+    },
+    {
+      "path": "packages/core/src/engine/classify.ts",
+      "present": true,
+      "sha256": "c58f505c04bc8c60e6b7f8f9ae56129c137430012cd4ce1cb41a74b488b432ac"
+    },
+    {
+      "path": "packages/core/src/engine/config.ts",
+      "present": true,
+      "sha256": "1a9781969bee1c8165583a3b993a806429e508e55918fddb2eb26b459c14037b"
+    },
+    {
+      "path": "packages/core/src/engine/dod.ts",
+      "present": true,
+      "sha256": "89e1c5d73355e9bf944395cb1a4346cb5b57637da5cb9b3ef468f68676cf5d72"
+    },
+    {
+      "path": "packages/core/src/engine/durable.ts",
+      "present": true,
+      "sha256": "6dcd790f7c6e813e6ed0ab3b5589adc72084b13fe96ba132aa68db14e9557b49"
+    },
+    {
+      "path": "packages/core/src/engine/fan-in.ts",
+      "present": true,
+      "sha256": "7d896d83bc18dbd4e648823b18a5135f1483e4557491cd143a4e4edfbdad96dd"
+    },
+    {
+      "path": "packages/core/src/engine/loops.ts",
+      "present": true,
+      "sha256": "5972c5b6bf4723f2149764dc2da043e398cabd1fce4f7112209ee0916acc7192"
+    },
+    {
+      "path": "packages/core/src/engine/minimatch.ts",
+      "present": true,
+      "sha256": "7c95a0b5fb6ae53ceaba6693a37e5abe8c196a3d9952b0c342ad9bf4d050c799"
+    },
+    {
+      "path": "packages/core/src/engine/predicate.ts",
+      "present": true,
+      "sha256": "6b1a7c3f02b6aa171759fe9aa92c716b127e8000aaeee66139a12f250fe007a0"
+    },
+    {
+      "path": "packages/core/src/engine/product-prd.ts",
+      "present": true,
+      "sha256": "f322d687dd0ae41689092c2019e2e2e7b8c7f75e4cb6e0a68afdebf12ba1a02f"
+    },
+    {
+      "path": "packages/core/src/engine/profile.ts",
+      "present": true,
+      "sha256": "f352cc9c3e0a72e2aaffad79e797fe44897b84894f56a4279d994f203931d3e7"
+    },
+    {
+      "path": "packages/core/src/engine/run.ts",
+      "present": true,
+      "sha256": "40807d0a5f6006c7f6d9b01bc55ab277ec807253637db7c6277feecf2fc9e352"
+    },
+    {
+      "path": "packages/core/src/engine/scope.ts",
+      "present": true,
+      "sha256": "1f26b7dcd1ecc5089c01e4a88839c65993940dbadc97b381c7191a7a14784f06"
+    },
+    {
+      "path": "packages/core/src/engine/stage.ts",
+      "present": true,
+      "sha256": "e5e70ef71249fbd111a21c22c0e8ecf60bf0f37cfc4cf29869ae29e385bd94f8"
+    },
+    {
+      "path": "packages/core/src/engine/state.ts",
+      "present": true,
+      "sha256": "056040795bb72b48b6fa65fadb5006758d0493b65dde4ce26a898733500f2d5b"
+    },
+    {
+      "path": "packages/core/src/engine/types.ts",
+      "present": true,
+      "sha256": "88c36cf484b15da08e7775d62022916156943bd25a9c506651181c0e749ea307"
+    },
+    {
+      "path": "packages/core/src/engine/workflow-contract.ts",
+      "present": true,
+      "sha256": "a5ffeb855517b4a2e0a3f7756cb1b41c3e051f13d60d6ee78521b65466246952"
+    },
+    {
+      "path": "packages/core/src/gates/classification.ts",
+      "present": true,
+      "sha256": "6247fd33f8a1af604fdc77221229e2896d135546f8bea8f07b27f86cc0d79057"
+    },
+    {
+      "path": "packages/core/src/gates/cto-nesting.ts",
+      "present": true,
+      "sha256": "a790f26ab78d5a4566e164af0190300c87470f17b464e8abc4ddf5069ef8f51d"
+    },
+    {
+      "path": "packages/core/src/gates/dispatch.ts",
+      "present": true,
+      "sha256": "9bf26a7ef4f8cf8362fcf62384ce555b9184d1a41a5e07f3739b104a45689a49"
+    },
+    {
+      "path": "packages/core/src/gates/dod-backstop.ts",
+      "present": true,
+      "sha256": "9d30e29f79fe9089db9b7da2620cdeb37136196b9bd37171c1ed67156b5d804a"
+    },
+    {
+      "path": "packages/core/src/gates/monotonic.ts",
+      "present": true,
+      "sha256": "c131cc064c3719a6efc7b568f5493a68cb9c22812633babf7cf1b4ffd9cb88ce"
+    },
+    {
+      "path": "packages/core/src/gates/orchestrator-write.ts",
+      "present": true,
+      "sha256": "1efeb47e8f17411abd01d0b58b15a125847ef71815134bb53cb95ba363f8282c"
+    },
+    {
+      "path": "packages/core/src/gates/outbox.ts",
+      "present": true,
+      "sha256": "3528899db4846637bfae8556c2c2115f85672342f9b8b51d314194262fafe205"
+    },
+    {
+      "path": "packages/core/src/gates/safety.ts",
+      "present": true,
+      "sha256": "93b63902028f3a443c5870b79ebc99d51cbd76d4da0578c4490555d575d5b2b1"
+    },
+    {
+      "path": "packages/core/src/gates/validation.ts",
+      "present": false,
+      "sha256": null
+    },
+    {
+      "path": "packages/core/src/index.ts",
+      "present": true,
+      "sha256": "b0dafbcedca2fa2445e30eafa15dedb35fb2281cafae1f1ca78890fa85dad3d0"
+    },
+    {
+      "path": "packages/core/src/lecture/acquisition.ts",
+      "present": true,
+      "sha256": "2be84d219f8f7cac6ec4c8bf40ebde4ea2e37e937bff93de1d0e8266ad7b631b"
+    },
+    {
+      "path": "packages/core/src/model-roles.ts",
+      "present": true,
+      "sha256": "75652a62319063fd49089a48e71b90b1744b6923fe49e2a17a18ed6e1400e45c"
+    },
+    {
+      "path": "packages/core/src/observability/events.ts",
+      "present": true,
+      "sha256": "b8390bd037972e477b64c3c055496be4bed45092761f5d6cbb4123afdd037c22"
+    },
+    {
+      "path": "packages/core/src/observability/hooks.ts",
+      "present": true,
+      "sha256": "efa7461f499716c66707ca95f43ffb71fe0a13ebc18010b8d03b4055815c3037"
+    },
+    {
+      "path": "packages/core/src/observability/index.ts",
+      "present": true,
+      "sha256": "c2a946325118722934faf90c9937303a8159adc5947b5f13ff08b73982b421fe"
+    },
+    {
+      "path": "packages/core/src/observability/recorder.ts",
+      "present": true,
+      "sha256": "0c8ce4e72b2eeb39a94dcef75cc7113125bc51d679455faf9ebf1dcd0ab512e3"
+    },
+    {
+      "path": "packages/core/src/observability/skills.ts",
+      "present": true,
+      "sha256": "7e6c88ca58868d9413ce55a20ae7cdbb3d0ebe721f53b5bc33c12b624341c728"
+    },
+    {
+      "path": "packages/core/src/report/assemble.ts",
+      "present": true,
+      "sha256": "bbe1a5a152bb834be460087b03ee79587b8e5f44dc3fad9d260fdd646aa2b2cb"
+    },
+    {
+      "path": "packages/core/src/report/html-shell.ts",
+      "present": true,
+      "sha256": "895bb046182b8157604603b57b1c4eb37fde998ef74bcc23aa61b05f9538d5d7"
+    },
+    {
+      "path": "packages/core/src/report/html.ts",
+      "present": true,
+      "sha256": "693772fd7b3bc8a35a2054c256b1b52e9fbf3150c0668345e3c98116cdb64242"
+    },
+    {
+      "path": "packages/core/src/report/index.ts",
+      "present": true,
+      "sha256": "3ee5710c9e4bdb006a3923c84e521dc9e4d3a2fa43cac5f8b42816dd99869733"
+    },
+    {
+      "path": "packages/core/src/report/markdown.ts",
+      "present": true,
+      "sha256": "f189ae3007a9ecfe877e05ff5863acb92626ff2008fcf6864bb02bdd5900aa2c"
+    },
+    {
+      "path": "packages/core/src/report/redact.ts",
+      "present": true,
+      "sha256": "5271ebc776b1e6272dd8717cf27b627e5ecdf5c91c6ce12d596d330a8e45b57e"
+    },
+    {
+      "path": "packages/core/src/report/session-source.ts",
+      "present": true,
+      "sha256": "37bf0fc066209ec2b947b02290f65684fd42bc5aa50f648bb0c84dacee4413e8"
+    },
+    {
+      "path": "packages/core/src/report/types.ts",
+      "present": true,
+      "sha256": "3267894591418b3920b29afbfbb89f85161e2ba3e82e225876a95d8d1342c06e"
+    },
+    {
+      "path": "packages/core/src/runtime-config.ts",
+      "present": true,
+      "sha256": "c4edbbe3adf766430ee46b0220dad0a3eb1a462c973b1abc3eef63971e226d2b"
+    },
+    {
+      "path": "packages/core/src/visualize/html.ts",
+      "present": true,
+      "sha256": "4832d0b7f5c225484aef529ecdbecb07bda9dc9c559c55c39c3b77a6f4793030"
+    },
+    {
+      "path": "packages/core/src/visualize/index.ts",
+      "present": true,
+      "sha256": "f5e685e630b32646a856c7fa8aa38e9436bc74cfecb7f3d69b6afda39b38f580"
+    },
+    {
+      "path": "packages/core/src/visualize/manifest.ts",
+      "present": true,
+      "sha256": "7d9a8ac3ab4234e1f0594db44d35b6a7d5657eea7a9e5fd40171af9846271967"
+    },
+    {
+      "path": "packages/core/src/visualize/markdown.ts",
+      "present": true,
+      "sha256": "45b9cb2ddc6202c53a3f48caaf1d72129f871d6fcdfdc4e7f71a2e195c03fe67"
+    },
+    {
+      "path": "packages/core/src/visualize/render-config.ts",
+      "present": true,
+      "sha256": "6ad257377e11975293cc14a087465ccf40c7ce966c7ff1b4cdeda995c17325c3"
+    },
+    {
+      "path": "packages/core/src/visualize/render-json.ts",
+      "present": true,
+      "sha256": "68aa7cb0471f176d8c72535e07f448cd54c1e35699aa8058a0057786063a00d6"
+    },
+    {
+      "path": "packages/core/src/visualize/render-spec.ts",
+      "present": true,
+      "sha256": "bc3b6a668d296888070544278771978e975268b204a550980774424fe4815ff7"
+    },
+    {
+      "path": "packages/core/src/visualize/renderer-registry.ts",
+      "present": true,
+      "sha256": "680235abf2a8bd3d2ca2b8a0876890dfd79cfcb0e101a8379e08525ca9038758"
+    },
+    {
+      "path": "packages/core/src/visualize/snapshot.ts",
+      "present": true,
+      "sha256": "18aa1a58a1a8f29b75f96a0ec68b8701e5c52ffc00367813187e086e65aeb7a0"
+    },
+    {
+      "path": "packages/core/src/visualize/types.ts",
+      "present": true,
+      "sha256": "f8342d95f1342a8482808f752aed64cba30833df416fe692be71b617252efc44"
+    },
+    {
+      "path": "packages/core/src/visualize/writer.ts",
+      "present": true,
+      "sha256": "2a728224957b7d073266578ba268f82128782908ab03e87dc05602cbe4bf66e2"
+    },
+    {
+      "path": "packages/core/test/agent-mapping-dispatch.test.ts",
+      "present": true,
+      "sha256": "6f4f3f094e62fc1d6c596f9fe4400b424678779ac60b299ae5c2a42b63e294de"
+    },
+    {
+      "path": "packages/core/test/agent-mapping.test.ts",
+      "present": true,
+      "sha256": "c4b9631d887d866b5e847b5478314b86cd70454032fea98e5edf7d340c5f8c7b"
+    },
+    {
+      "path": "packages/core/test/artifact-contract.test.ts",
+      "present": true,
+      "sha256": "ec9b847c541c0fd84864e6d4f1a248f717a939e929aacfe2481d94ce3c75a42d"
+    },
+    {
+      "path": "packages/core/test/channels.test.ts",
+      "present": true,
+      "sha256": "90a51311895bb4b491a0c90b972392d146db5a7a2aef5f2511dc8079fc80c5b4"
+    },
+    {
+      "path": "packages/core/test/command-presentation.test.ts",
+      "present": true,
+      "sha256": "eea9f7670041d1dcf49defd017afb3565476a9e8c2bcaa110e98599b0c21e211"
+    },
+    {
+      "path": "packages/core/test/core-default-path.test.ts",
+      "present": true,
+      "sha256": "6083916addd6715b2413031cf79ce9f4c25d81cb0274dd7f95029ca7e449ff23"
+    },
+    {
+      "path": "packages/core/test/cto-amend.test.ts",
+      "present": true,
+      "sha256": "e46a5da775e4c21d0c0c9267de8c1149a3d6f72337ebc1778403205156350eb3"
+    },
+    {
+      "path": "packages/core/test/cto-classification.test.ts",
+      "present": true,
+      "sha256": "8c4ee0fa5b8e2cf7770840ada31181a7a67f3bd9da950f76bb38a3bbcb9c57e6"
+    },
+    {
+      "path": "packages/core/test/cto-command.test.ts",
+      "present": true,
+      "sha256": "f3b61f0fb1d6bfd1ce1514cf8a98e1133c439628555eebad8b9d53b2f34cb1e6"
+    },
+    {
+      "path": "packages/core/test/cto-control-plane.test.ts",
+      "present": true,
+      "sha256": "f7104ae9ac87cb8acdad6f6173bca41c83f06e80a68121471862ef0fe90d1ca3"
+    },
+    {
+      "path": "packages/core/test/cto-engine.test.ts",
+      "present": true,
+      "sha256": "787ca95bd8df6f78c5c513bb4f1dac2775ed9b9a62653a9b14498d7bb02a5dc7"
+    },
+    {
+      "path": "packages/core/test/cto-nesting.test.ts",
+      "present": true,
+      "sha256": "35507679454c9c975fd7e4431c849f0a6f86d7ee1185bef1258140b1ebc996ea"
+    },
+    {
+      "path": "packages/core/test/cto-ownership.test.ts",
+      "present": true,
+      "sha256": "b1d5a73364cd6de57dc18f4ec4f2fa250cf73533ec598aa18fb1f94c21f9ec66"
+    },
+    {
+      "path": "packages/core/test/cto-resident.test.ts",
+      "present": true,
+      "sha256": "e88b3fb57513b4096da060cc9d1ff86300e678a401ca49586a5dc9d8c8a1ce53"
+    },
+    {
+      "path": "packages/core/test/cto-slice-gate.test.ts",
+      "present": true,
+      "sha256": "6334b328b7097b2b3bbefb74bc94e94c04df2d5da1de12f7c13b345274557b44"
+    },
+    {
+      "path": "packages/core/test/cto.test.ts",
+      "present": true,
+      "sha256": "a032d0d91bd43c8e5e55655b7fca7015b614674c9f728cfbc0c1daf34d395640"
+    },
+    {
+      "path": "packages/core/test/do-work-autonomy.test.ts",
+      "present": true,
+      "sha256": "9c6db1a9a2f7c09d8438ef79a42632623cc43b071fc95e1d8182729c5980ce63"
+    },
+    {
+      "path": "packages/core/test/documents.test.ts",
+      "present": true,
+      "sha256": "a3d87c549368138ebd21e9ce2fc56ca9e39a3cfebc6d445ab6c88ce3b0a13f14"
+    },
+    {
+      "path": "packages/core/test/dod-path.test.ts",
+      "present": true,
+      "sha256": "c6d323cb933503ad48966fd6f606e847fc78638a1ed0e00d31ce72f6b74f7a8e"
+    },
+    {
+      "path": "packages/core/test/durable-document.test.ts",
+      "present": true,
+      "sha256": "e03aba35119455a87d3a20f5c2fb528a01632aacd95775e0f2ecf4c3d0a477ba"
+    },
+    {
+      "path": "packages/core/test/durable-repeated-role.test.ts",
+      "present": true,
+      "sha256": "feca9e67eb45f98ac3f9c0a40ffae3a0f1e6f96111f15df951bdd7089bd4270e"
+    },
+    {
+      "path": "packages/core/test/durable-skip.test.ts",
+      "present": true,
+      "sha256": "3542f5283f2c6e818ab876f3035ea9f60e579766d65fca696a5c0229fc06e4c5"
+    },
+    {
+      "path": "packages/core/test/envelope.test.ts",
+      "present": true,
+      "sha256": "b2a9e5c30211958977c2e102a2d5ee679b4eff0b648205268048bf4e5b55da46"
+    },
+    {
+      "path": "packages/core/test/fan-in.test.ts",
+      "present": true,
+      "sha256": "22f1630536735382f31e681fbaac5a1f76af6695b1185fc67a74ee48a4e8bff4"
+    },
+    {
+      "path": "packages/core/test/fixtures/specification-fixtures.ts",
+      "present": true,
+      "sha256": "a993dfdccfd088a9940058f81f6e8a80b2dca00810d6dcb6f7f79777ddc862dc"
+    },
+    {
+      "path": "packages/core/test/fixtures/visualize-fixtures.ts",
+      "present": true,
+      "sha256": "316d74d8380d1a4d45701657cf6be68647ef9e4e62b8ab4111370d6145cd14b6"
+    },
+    {
+      "path": "packages/core/test/gate-resolution.test.ts",
+      "present": true,
+      "sha256": "6e138adcfa2f619eec58b27661a5e6f75c14bd7028cdb0ef3744e41cb8568461"
+    },
+    {
+      "path": "packages/core/test/lecture-research.test.ts",
+      "present": true,
+      "sha256": "e3d2e07f9691f852048ddcc818f4642cdd537e9a4f433aaabb1bc2607ff925ce"
+    },
+    {
+      "path": "packages/core/test/mapping-provenance.test.ts",
+      "present": true,
+      "sha256": "81cb5ae8899dafdc5407df8687dcc226289ff79dcb36c2d4e6d7e36092717a1c"
+    },
+    {
+      "path": "packages/core/test/markdown-html.test.ts",
+      "present": true,
+      "sha256": "35cc1d9362fd5a07fe141846249997f72f070197996c36b4ffbeaa91bf7489c4"
+    },
+    {
+      "path": "packages/core/test/model-roles.test.ts",
+      "present": true,
+      "sha256": "baf573ed4f605494382dc47ab6ce8fd23337b67f9cb0bd93997442f82e90dbfd"
+    },
+    {
+      "path": "packages/core/test/observability/integration.test.ts",
+      "present": true,
+      "sha256": "adc0b9489d600b84817a7fed37b3a2dd793d557d2d167e916f08878d115e19ea"
+    },
+    {
+      "path": "packages/core/test/observability/recorder.test.ts",
+      "present": true,
+      "sha256": "6ac24789e536122d623529eecc2982c495943c0aaa6c475507742c073db61ec4"
+    },
+    {
+      "path": "packages/core/test/observability/skills.test.ts",
+      "present": true,
+      "sha256": "2ec78b67b5e9451ecadace6a8bfe55357238b18e8f5416da96085fa2dcda35cb"
+    },
+    {
+      "path": "packages/core/test/outbox-gate.test.ts",
+      "present": true,
+      "sha256": "24ee3fe935817d68cebbf1caf4d28c45043ff8b64f25fd470b08b12ba88f820a"
+    },
+    {
+      "path": "packages/core/test/owner-registration-security.test.ts",
+      "present": true,
+      "sha256": "03061906d1e5ef8aaa6e8c05df710b51d14fe2c6d7f39b975a9ca24e784d50b1"
+    },
+    {
+      "path": "packages/core/test/predicate.test.ts",
+      "present": true,
+      "sha256": "450a5fb813d26dbe71204e87684a2eceda6fff170fcb6c6f99eb601e384a2b6e"
+    },
+    {
+      "path": "packages/core/test/product-discovery.test.ts",
+      "present": true,
+      "sha256": "bb84e3c9320c0e211803c986b14f9b9b751b01de558fe7c453a8712ec5cf0b2c"
+    },
+    {
+      "path": "packages/core/test/redaction.test.ts",
+      "present": true,
+      "sha256": "49877b07c7e8cbbc085e3440cc2ca09505568d319b8202e06c380e52fc66968b"
+    },
+    {
+      "path": "packages/core/test/report-cto.test.ts",
+      "present": true,
+      "sha256": "40b727f23a6aa0d59b14906fdef5203e16f944213c4b5b53a8ce10b8253bcb13"
+    },
+    {
+      "path": "packages/core/test/report-do-work.test.ts",
+      "present": true,
+      "sha256": "a1e6c008136c436666092feb203499f7981fc076ce8fc4b1c8207fcd327af923"
+    },
+    {
+      "path": "packages/core/test/report-html.test.ts",
+      "present": true,
+      "sha256": "a8cf27db2e270bf9543d6ffc5e479442121751953a6e1b86c377cf88750342c1"
+    },
+    {
+      "path": "packages/core/test/report-session-source.test.ts",
+      "present": true,
+      "sha256": "5ff1f94216a4410a46f36479a807220581e0eb9346f5c40e2f5ac40e3648a2e9"
+    },
+    {
+      "path": "packages/core/test/report-writer.test.ts",
+      "present": true,
+      "sha256": "6984bda19a8a79d03015a556ac2d3a8536b0deb2403cae92aaa7f862ac2a7d27"
+    },
+    {
+      "path": "packages/core/test/roster-begin-selection.test.ts",
+      "present": true,
+      "sha256": "2b71947e3a29b70101460168f1d3c5cc3c45d912c19f3d829c6c7bdba5d7d1ab"
+    },
+    {
+      "path": "packages/core/test/run-continuation.test.ts",
+      "present": true,
+      "sha256": "ef7fe0da6060c706687ef2b735fdc3e37ff8ecaaf8cc10833d3f4aed67669c6c"
+    },
+    {
+      "path": "packages/core/test/runtime-config.test.ts",
+      "present": true,
+      "sha256": "cd058f2d835c5e548fe6ac9fd0c907ea8fa1ffea9fa3b6854d28fc96ede53851"
+    },
+    {
+      "path": "packages/core/test/scope-runtime-class.test.ts",
+      "present": true,
+      "sha256": "0ff9528ce0ef392b871f4d54b04e7b406345545e5eab67a5169eeff47a44def8"
+    },
+    {
+      "path": "packages/core/test/smoke.test.ts",
+      "present": true,
+      "sha256": "e5f035ee2e5947c1e15be1b3f823d0905ad43e8413027fa5e74141865cccb543"
+    },
+    {
+      "path": "packages/core/test/task-caller.test.ts",
+      "present": true,
+      "sha256": "306625f4b0c8e3e12bd8a8fb06df9af2a6238d17bad7c061814d99bb95c63d99"
+    },
+    {
+      "path": "packages/core/test/validation-gate.test.ts",
+      "present": false,
+      "sha256": null
+    },
+    {
+      "path": "packages/core/test/visualize-contract.test.ts",
+      "present": true,
+      "sha256": "da6779b324693eec7ac684a580a64f2902810c0cac17cfc97c2f4d459e74624e"
+    },
+    {
+      "path": "packages/core/test/visualize-html.test.ts",
+      "present": true,
+      "sha256": "876be3180c10a2967600a52eeddc88b2fe5d9e2909c82946fc464a86a4541a0d"
+    },
+    {
+      "path": "packages/core/test/visualize-links.test.ts",
+      "present": true,
+      "sha256": "266cb8ee7f8d5ef72b1f35d83a41a7aea438e35ebf51cd312224593e2cf24225"
+    },
+    {
+      "path": "packages/core/test/visualize-markdown.test.ts",
+      "present": true,
+      "sha256": "a48568c7747e87e7efdce810cb2067b9937b7982fa99d6a4fcddb59d9c786693"
+    },
+    {
+      "path": "packages/core/test/visualize-renderers.test.ts",
+      "present": true,
+      "sha256": "758a6f461ce9a09e4d05990139a574516b4d065097df3092eccd9676df0c4131"
+    },
+    {
+      "path": "packages/core/test/visualize-security.test.ts",
+      "present": true,
+      "sha256": "afbff4c5ef6f1ae9ab1f8d9a3ab35597948c6d4f4395e6d7347bb3eeff145765"
+    },
+    {
+      "path": "packages/core/test/visualize-snapshot.test.ts",
+      "present": true,
+      "sha256": "bd08e730d086078453ca3ac858fb4e850bc14971efa01b511a04498b8c1674a1"
+    },
+    {
+      "path": "packages/core/test/visualize-writer.test.ts",
+      "present": true,
+      "sha256": "80ec76762e1f859985fbf02293299b8830c5537c0dceb559a52e80e1c43b18c2"
+    },
+    {
+      "path": "packages/core/test/workflow-contract-typed.test.ts",
+      "present": true,
+      "sha256": "b517c5c9215d16a5dd7c297de002195a52295f401806360c85222fcc8f1250cf"
+    },
+    {
+      "path": "packages/core/test/workflow-engine-scopes.test.ts",
+      "present": true,
+      "sha256": "54930f23687ed09c57c4fe148e561a1c10494a4b9db7efab9fa7489bd88cb9cc"
+    },
+    {
+      "path": "packages/core/test/write-scope.test.ts",
+      "present": true,
+      "sha256": "9280386049f13251ec58706ef9ec6492aa7adc33857d225e691cb0888c947b31"
+    },
+    {
+      "path": "packages/core/tsconfig.json",
+      "present": true,
+      "sha256": "9d50aea48a5c3c0daf595d565931fd0f7c58ee651a30e514989bd9bf8527df03"
+    },
+    {
+      "path": "packages/core/workflows/README.md",
+      "present": true,
+      "sha256": "5e9426f167add347a500fd31eb562181f39f21941a60a91cdacb4110d66cdf0d"
+    },
+    {
+      "path": "packages/core/workflows/_schema.json",
+      "present": true,
+      "sha256": "265be02808e79caeb8f121af71864ded20a8d2705c005722ed28d6fdf5cce3e0"
+    },
+    {
+      "path": "packages/core/workflows/artifacts-schema.json",
+      "present": true,
+      "sha256": "ebebe602642aa8b95bfaee8ece751f2e681928291ed59cbf97f269a6fc8360a6"
+    },
+    {
+      "path": "packages/core/workflows/bug-fix.json",
+      "present": true,
+      "sha256": "6f394e7efe37576370887edca9484804b404f73f310ea5f93c83a2a6c1589817"
+    },
+    {
+      "path": "packages/core/workflows/cto.json",
+      "present": true,
+      "sha256": "b2ccde5d72cd6610350a53d02526d7069e078eac72e110884372c44e2f9e2260"
+    },
+    {
+      "path": "packages/core/workflows/debug-cycle.json",
+      "present": true,
+      "sha256": "8a96db6aceda517677025c5ccaa7dcbc93e327356858640d13423d2f1aac4f27"
+    },
+    {
+      "path": "packages/core/workflows/emergency.json",
+      "present": true,
+      "sha256": "347d78539cab255e5ef38105e9fa59327b43975af58fad5de29b8b5dea6f4b65"
+    },
+    {
+      "path": "packages/core/workflows/feature-regression.json",
+      "present": true,
+      "sha256": "7b43638f16d834338ae839d8bb98a8799ba1d1f3be4fc0fab0251a152ff27eeb"
+    },
+    {
+      "path": "packages/core/workflows/full-feature.json",
+      "present": true,
+      "sha256": "cda74e2c40e27b60d219e6d5282dd837c63b1ed742616b8abb21ed949600df8e"
+    },
+    {
+      "path": "packages/core/workflows/lecture-research.json",
+      "present": true,
+      "sha256": "2fe12f75e998a831bd2647ac07d44bf164063c0ed3d15a2157be1f8375d13054"
+    },
+    {
+      "path": "packages/core/workflows/lightweight.json",
+      "present": true,
+      "sha256": "18776b5a358b6bf9faae6771dcc2b1e98ef8108465069ecd18c90aa09e1a91bd"
+    },
+    {
+      "path": "packages/core/workflows/product-discovery.json",
+      "present": true,
+      "sha256": "6f32a7e2508874826dc00952797fc36f7df9fddce8b9b4c02956ccdd51d3abf5"
+    },
+    {
+      "path": "packages/core/workflows/research.json",
+      "present": true,
+      "sha256": "4422eaf7a7ce03c84e00982a18fcd4270e1a78c8a71982a5b5ceb21b7175cfd1"
+    },
+    {
+      "path": "packages/core/workflows/review.json",
+      "present": true,
+      "sha256": "8705943edb6515b6a7824eac9f52ac985a2172468b32bfd321053ac16b8c323b"
+    },
+    {
+      "path": "packages/core/workflows/spec-preparation.json",
+      "present": true,
+      "sha256": "87bf398c913e1106c7294b1044004624210c330692ada77e1ae07eff713b98dc"
+    },
+    {
+      "path": "packages/core/workflows/stages/architecture.md",
+      "present": true,
+      "sha256": "3d807dd9e86eaca9cefc5ab8d3a7fb7a4a2e6b7ab51326f514d9dae374916d94"
+    },
+    {
+      "path": "packages/core/workflows/stages/clarify.md",
+      "present": true,
+      "sha256": "1f04a1c4d2f5849959637119d1353dfa051bb50dbacad377764374a182be654c"
+    },
+    {
+      "path": "packages/core/workflows/stages/code_review.md",
+      "present": true,
+      "sha256": "cf92682175909c00422eb39bf6e3a17aa6b3756847cbcafe1325b535eaabe59c"
+    },
+    {
+      "path": "packages/core/workflows/stages/diagnose.md",
+      "present": true,
+      "sha256": "b1ecc4765d59c38497a14d2f5312682811c8e92fbe70d177585830b30790fe68"
+    },
+    {
+      "path": "packages/core/workflows/stages/discovery.md",
+      "present": true,
+      "sha256": "649510f4d9a6e3114215f16f8e89e48b8fa0abf4b17f8906898d36e8e65e9368"
+    },
+    {
+      "path": "packages/core/workflows/stages/exploration.md",
+      "present": true,
+      "sha256": "2f8abb0f4abedadaac408a5c7ea0b6244a07656e05fce779bf67e2bef3adf357"
+    },
+    {
+      "path": "packages/core/workflows/stages/feature_spec.md",
+      "present": true,
+      "sha256": "3acb77c2771b3b21d084a0ff0034f6a3c12f61a9550e4c8e7f2a0f4d1575bebb"
+    },
+    {
+      "path": "packages/core/workflows/stages/implementation.md",
+      "present": true,
+      "sha256": "163a59800c86d34db1d8b96f6a08c346028c10536186d09df0234eff9cbe13a3"
+    },
+    {
+      "path": "packages/core/workflows/stages/manual_qa.md",
+      "present": true,
+      "sha256": "b5924ca664fe0e577298531d3938f91fc4be4c1cda2c1e0e9c8105ec32b3b75f"
+    },
+    {
+      "path": "packages/core/workflows/stages/qa_tests.md",
+      "present": true,
+      "sha256": "f31cebacaeb48e689599b3f5da27a75c7a78700c09a315a93bc176d46a1c1cc3"
+    },
+    {
+      "path": "packages/core/workflows/stages/review.md",
+      "present": true,
+      "sha256": "bd22136d6ce3bd17cd519eed1ad3aff882cdd1a50c748b61564fe37b9dc0ce73"
+    },
+    {
+      "path": "packages/core/workflows/stages/review_fixes.md",
+      "present": true,
+      "sha256": "7b192bcfcf4f351015121197528797c1c5cbd48849f7d502019bbce66e5246d9"
+    },
+    {
+      "path": "packages/core/workflows/stages/summary.md",
+      "present": true,
+      "sha256": "9edb11fbbb539d90e6b08ddd6ed60203e39c984a8cc67f5379f4d50f1926ff10"
+    },
+    {
+      "path": "packages/core/workflows/stages/verify.md",
+      "present": true,
+      "sha256": "af7939a169ef2edde726ea0cf112f0321cb815b21fefa5ed519d92ae1e8fa27d"
+    },
+    {
+      "path": "packages/core/workflows/standard.json",
+      "present": true,
+      "sha256": "2edabe62981e9c0e17c73df4b633c8adad431a49f22810a2ec10dc1597d073a5"
+    },
+    {
+      "path": "packages/core/workflows/team.config.example.json",
+      "present": true,
+      "sha256": "3c9978cfaa6190b4e29b8fe39342e12bc2495472dbc2e5313d788236cf5b55d1"
+    },
+    {
+      "path": "packages/core/workflows/team.config.schema.json",
+      "present": true,
+      "sha256": "2f26bc6473df37787321281f9fef8c4b9934377b3297f7b48d1e560180e0df53"
+    },
+    {
+      "path": "packages/core/workflows/teams.example.json",
+      "present": true,
+      "sha256": "48c856154621b17233cb144da4e45883d0619ad6cc5f1d7c209fc0ca8dfcc2e9"
+    },
+    {
+      "path": "packages/e2e/CHANGELOG.md",
+      "present": true,
+      "sha256": "91f4b2e4bacec63156ae82ce21bdc2f6c93ca51d344e438ca82b413ecb2fb34b"
+    },
+    {
+      "path": "packages/e2e/README.md",
+      "present": true,
+      "sha256": "7d72ffc2ac813b49d60ef44dceab542001a24a62753be5afe6d7845734da2b45"
+    },
+    {
+      "path": "packages/e2e/_ask_command.mjs",
+      "present": true,
+      "sha256": "8aee087947f3ff076c351d5df39c49b41fb1da6ccc4eb53b1c7cca6fee234989"
+    },
+    {
+      "path": "packages/e2e/_ask_ro.mjs",
+      "present": true,
+      "sha256": "9953c5b954d26940daa73a1be9f11756f6d1dd7dda73518f6722e586169043d6"
+    },
+    {
+      "path": "packages/e2e/_drive.mjs",
+      "present": true,
+      "sha256": "483aad1dd828ec71aeaa705e40ebf403df9dfc04d94628ed1f0dff7bf16778c0"
+    },
+    {
+      "path": "packages/e2e/_drive_cr.mjs",
+      "present": true,
+      "sha256": "df86e0bac66b2484ef9cdb9b4983a7dffc1271757ca5bab3c9a00921ea70b9ae"
+    },
+    {
+      "path": "packages/e2e/_send_enter.mjs",
+      "present": true,
+      "sha256": "a02a9d8ceea49e74c589f1043d80f5345235a3bebe28cd84f2dff388452280ee"
+    },
+    {
+      "path": "packages/e2e/assets/page.js",
+      "present": true,
+      "sha256": "fd323b541aa78fe55a2f7699511707ffcd4d622912d3747f6cf895f5fb2c755b"
+    },
+    {
+      "path": "packages/e2e/assets/terminal.html",
+      "present": true,
+      "sha256": "7120e67bd71069f10ddd2205eb8cf5030918e98802ff14625056c0bd383a0755"
+    },
+    {
+      "path": "packages/e2e/package.json",
+      "present": true,
+      "sha256": "c2fb36be16c2d52958ca3d2a45204229427cbd13b9d04c9d7163b2e864358ed8"
+    },
+    {
+      "path": "packages/e2e/scenarios/full-feature-task.md",
+      "present": true,
+      "sha256": "1b430c43f5e2c2f298d23a51416cb134169f5a5dd362ddae10a9a525cb04ed9f"
+    },
+    {
+      "path": "packages/e2e/scenarios/full-feature.json",
+      "present": true,
+      "sha256": "4e78efb26d411b139c9e724e0c45076e53d4f14e0ecef827e8efa021113f91fa"
+    },
+    {
+      "path": "packages/e2e/scenarios/model-roles-task.md",
+      "present": true,
+      "sha256": "eb6c7ae765fc1772de1ba5bdb405b44748fe4a9bf4b12877809d87b7d1b1dd04"
+    },
+    {
+      "path": "packages/e2e/scenarios/model-roles.json",
+      "present": true,
+      "sha256": "d385373c4f1bc205f07968d599525ce457dadc97c2e5f8c2db8dc874f4964e35"
+    },
+    {
+      "path": "packages/e2e/scenarios/recommendations-task.md",
+      "present": true,
+      "sha256": "b2742a1ef252f210e211df2368f3fa4998a077da812d0b5272865cb3c9f8912c"
+    },
+    {
+      "path": "packages/e2e/scenarios/recommendations.json",
+      "present": true,
+      "sha256": "7710e0f3c903123bd70e7a39b27a9376a2a600cbf59a0b5b1195c01276fc8562"
+    },
+    {
+      "path": "packages/e2e/src/cli.ts",
+      "present": true,
+      "sha256": "1876ef4b81fde3f1cf9049b05c34a00803120b143cc4b06ba8d8f08c8c7b4444"
+    },
+    {
+      "path": "packages/e2e/src/driver.ts",
+      "present": true,
+      "sha256": "b81ad800496bd3862015646d09fd4f2df583256da9be25d15be85c21e5edd694"
+    },
+    {
+      "path": "packages/e2e/src/index.ts",
+      "present": true,
+      "sha256": "31ac81cc507e354ec4a5cfdfa42cf6bf79f9ec88f4421b444d59ab5bcd70e2b8"
+    },
+    {
+      "path": "packages/e2e/src/report.ts",
+      "present": true,
+      "sha256": "122bd8b33712599c779aee9707e677a6cfab97ebea990d43e49a979411f1d54f"
+    },
+    {
+      "path": "packages/e2e/src/scenario.ts",
+      "present": true,
+      "sha256": "c96327eb9eeed3baf0a6d25c207fd4a3a84136b9c4b7eb20a18446e8d8146663"
+    },
+    {
+      "path": "packages/e2e/src/server.ts",
+      "present": true,
+      "sha256": "fe9ac19910bde7a611c54b03773944a3ca3405a7dc78c7ce1510fd134a4a1393"
+    },
+    {
+      "path": "packages/e2e/src/util.ts",
+      "present": true,
+      "sha256": "e63c9048ed718e68f2761cc6b9f6a213b067c6e8e1d25ff3750f1e14d29e8b74"
+    },
+    {
+      "path": "packages/e2e/test/cli.test.ts",
+      "present": true,
+      "sha256": "01efd2287d920b9beb808d3d8d8a479a1f55c19e955c6574072fea0fc26e3509"
+    },
+    {
+      "path": "packages/e2e/test/cto-inbox-mock.test.ts",
+      "present": true,
+      "sha256": "cc98a3fe796d6c7339e77e3b6bef4c93766009cc63c3d424ad8b54d60b73d0a4"
+    },
+    {
+      "path": "packages/e2e/test/cto-process-e2e.test.ts",
+      "present": true,
+      "sha256": "8fcecab36f8186637b725c549a0efc5092351b4c4e861d56fd297a08a3834ebf"
+    },
+    {
+      "path": "packages/e2e/test/detach.test.ts",
+      "present": true,
+      "sha256": "02fadd54e9a647757384197a43ab481093a786c689d29c86406396393db2a3eb"
+    },
+    {
+      "path": "packages/e2e/test/driver.test.ts",
+      "present": true,
+      "sha256": "55e7ab3a704475568da53269375d73289e79df507ac2fc838f78c1f5cc22d67c"
+    },
+    {
+      "path": "packages/e2e/test/fixtures/cto-process-dispatcher.ts",
+      "present": true,
+      "sha256": "14272602446f892fe963947a4abee816ca3c268fcf76462e7844a6a3127dd047"
+    },
+    {
+      "path": "packages/e2e/test/fixtures/slice-worker.ts",
+      "present": true,
+      "sha256": "1304f025ba73ed0659e92ced9e9f108aa8c58fc9d5c5a1a2316767ad17f76367"
+    },
+    {
+      "path": "packages/e2e/test/qa-regression.test.ts",
+      "present": true,
+      "sha256": "f5a09875630f32b8c0d39ef7043e96f4c67ceeed54847769d21c46202958bbee"
+    },
+    {
+      "path": "packages/e2e/test/report.test.ts",
+      "present": true,
+      "sha256": "3b054ae15fa607797a3aa1cc9af5ca0cdb52dd6b38404386009ae526b644ea04"
+    },
+    {
+      "path": "packages/e2e/test/scenario.test.ts",
+      "present": true,
+      "sha256": "15a07152ea4e5ac824a6a6bbeb961c83067909874bead5791aa281b482f336fb"
+    },
+    {
+      "path": "packages/e2e/test/server.test.ts",
+      "present": true,
+      "sha256": "3916a444cba0d4ff22106f87f7e22fa22c3a637d65ff1dd0a19d789b9c0e0c9a"
+    },
+    {
+      "path": "packages/e2e/test/web-enter.test.ts",
+      "present": true,
+      "sha256": "96f8ee58c9e4e83fa68b1e6c705bcd07b1db484d20c394136ec9a55e6b37e47c"
+    },
+    {
+      "path": "packages/e2e/tsconfig.json",
+      "present": true,
+      "sha256": "9d50aea48a5c3c0daf595d565931fd0f7c58ee651a30e514989bd9bf8527df03"
+    },
+    {
+      "path": "packages/fullstack/README.md",
+      "present": true,
+      "sha256": "1bc5bfd974073e065a0b41385e1b4233de2b37011bd2819abd82ca3c414126f3"
+    },
+    {
+      "path": "packages/fullstack/agents/analyst.md",
+      "present": true,
+      "sha256": "271ae27193a81d60c27ade2ab3dbf4fa7d1ca31580601155a4689ccbd0c51b1f"
+    },
+    {
+      "path": "packages/fullstack/agents/architect.md",
+      "present": true,
+      "sha256": "574737301510e242bb206091b08003af8fb303a33bb6ad232ea3ce3342f08ed0"
+    },
+    {
+      "path": "packages/fullstack/agents/code-reviewer.md",
+      "present": true,
+      "sha256": "156663398c86d539424aef16a77dd33237d43e7988b8f2a1ff50bd74df8ee051"
+    },
+    {
+      "path": "packages/fullstack/agents/cto.md",
+      "present": true,
+      "sha256": "d0cc1c3d2d8e12894ce64e3ff28202be57a7f64bb139ff1c59e85b167cb0cd59"
+    },
+    {
+      "path": "packages/fullstack/agents/developer-go.md",
+      "present": true,
+      "sha256": "5f99af9076e73e867a24ac95a9067759bf8ea7d0aab9e0edb39bf8663ab8a36d"
+    },
+    {
+      "path": "packages/fullstack/agents/developer-kotlin.md",
+      "present": true,
+      "sha256": "ac646c1ae8e96d19643689d12a70795579dba9cf6faffc365b95ad80d9e6f6cb"
+    },
+    {
+      "path": "packages/fullstack/agents/developer-mobile.md",
+      "present": true,
+      "sha256": "e91925899a0ae1ae6864cf8d052b50dd97680eafdcfc4274b985720caa8b5589"
+    },
+    {
+      "path": "packages/fullstack/agents/devops.md",
+      "present": true,
+      "sha256": "015634a6a619f5ab7668ae56b6bedf56925651e48e07845a0307817cd11690ba"
+    },
+    {
+      "path": "packages/fullstack/agents/diagnostics.md",
+      "present": true,
+      "sha256": "7f138aa6298588464f39b105edfbcc9ceb690d98a920086da5579a28316e15d5"
+    },
+    {
+      "path": "packages/fullstack/agents/discovery.md",
+      "present": true,
+      "sha256": "7d1b6a92032b7cea49099c1b103f690828860f49736dfb57389d9ad33da08eea"
+    },
+    {
+      "path": "packages/fullstack/agents/frontend-developer.md",
+      "present": true,
+      "sha256": "fb5ac6ceca951617c83051e64f877294dedc505e64a24964625478828a6f94e1"
+    },
+    {
+      "path": "packages/fullstack/agents/init-mobile.md",
+      "present": true,
+      "sha256": "e9b9673e8c58e0611acdeeb5cf0870015deb825a8bf474bcf32a889fb61c809a"
+    },
+    {
+      "path": "packages/fullstack/agents/manual-qa.md",
+      "present": true,
+      "sha256": "e006781d563d587e79c12c40d9c2fab61fbef5883483ef0b3e1b5ab098cbb12a"
+    },
+    {
+      "path": "packages/fullstack/agents/product-analyst.md",
+      "present": true,
+      "sha256": "0d1110902eaa3e6561afc8e54419c5caba985967d074c71fb436b11b43107eef"
+    },
+    {
+      "path": "packages/fullstack/agents/product-critic.md",
+      "present": true,
+      "sha256": "11d6e78fdd8c29b1617a7bda7f1b43750de768ee7d9190d6e1301113655b0f33"
+    },
+    {
+      "path": "packages/fullstack/agents/product-researcher.md",
+      "present": true,
+      "sha256": "9e679e3a070bec8de5850aca88c51315161e808525ec3cfdd6e6e2d9016360b7"
+    },
+    {
+      "path": "packages/fullstack/agents/product-strategist.md",
+      "present": true,
+      "sha256": "5cd70a0b3a97707ac7d861c9e28a76cf59a008045f4d537bcdc3caaaaeefe7f8"
+    },
+    {
+      "path": "packages/fullstack/agents/qa.md",
+      "present": true,
+      "sha256": "d4f2f8ef83b400d002756e0255d713f7b9ac449d485dd6f449de800fa14e46da"
+    },
+    {
+      "path": "packages/fullstack/agents/security-tester.md",
+      "present": true,
+      "sha256": "ccf41171cc13bded95c15a442868ff1a83114dd40f72b6b49119e4ebfeab5b3a"
+    },
+    {
+      "path": "packages/fullstack/agents/team-lead.md",
+      "present": true,
+      "sha256": "7aa71c97813e31a6ea92a38cd448a8ab25c55abd9d32edf73424832cbb7be537"
+    },
+    {
+      "path": "packages/fullstack/agents/tech-researcher.md",
+      "present": true,
+      "sha256": "51efb89da7f16604d8807830e2d07a168b23c294aa0a5aa85e7cd24f39cbbb84"
+    },
+    {
+      "path": "packages/fullstack/bin/tg-bridge.mjs",
+      "present": true,
+      "sha256": "cc32b79dfd6962d4d18d33c35e2683439683a5bec1b0754a916b8d24d7e71539"
+    },
+    {
+      "path": "packages/fullstack/commands/init-team/index.ts",
+      "present": true,
+      "sha256": "5ad0b7f80ced901b693950f3a30965b752cad3749370c91e4d2e53893fd0393f"
+    },
+    {
+      "path": "packages/fullstack/commands/interview/index.ts",
+      "present": true,
+      "sha256": "44f40f52c3d0d607ef3cbed42ae5c8b0d6207f0df6aaaa9125136ab80cdd29ed"
+    },
+    {
+      "path": "packages/fullstack/commands/omp-model-roles/index.ts",
+      "present": true,
+      "sha256": "dde9ac8c07a2d5c0ac73a968dd7acc24320ef29f0204419bcc1976e6392d409b"
+    },
+    {
+      "path": "packages/fullstack/commands/session-report/index.ts",
+      "present": true,
+      "sha256": "4db1c4668810f7ea4c60fab1f7db006f240039a73b9bba546c28b058ac95359c"
+    },
+    {
+      "path": "packages/fullstack/commands/workflow-view/index.ts",
+      "present": true,
+      "sha256": "77e062a0ba9387065221bb25d2e5496523991b1040890c2d615db95eb14b40f4"
+    },
+    {
+      "path": "packages/fullstack/evals/lecture-eval-fixtures.json",
+      "present": true,
+      "sha256": "67098575293f7a45b7607ae49d3996bd39c5710d74b4943e660c8ce29a8bb18a"
+    },
+    {
+      "path": "packages/fullstack/package.json",
+      "present": true,
+      "sha256": "369b7f500a6d876288bc5b8e1c33f85c89e6e138e8f889ffb8989be3390b51a5"
+    },
+    {
+      "path": "packages/fullstack/scripts/copy-commands.mjs",
+      "present": true,
+      "sha256": "ecd2eecfb8ba3cb66115266df057a6d9bdc3656b5e674c95fa534db59b7429b7"
+    },
+    {
+      "path": "packages/fullstack/scripts/yt-dlp-owned-audio.mjs",
+      "present": true,
+      "sha256": "aa2a9edc5bab2c7a7db4646dbfe56cb654070ffa87d16d92ba7b5da7a2095c2e"
+    },
+    {
+      "path": "packages/fullstack/skills/api-design/SKILL.md",
+      "present": true,
+      "sha256": "9adab8c584cc7a60033c54c2afc5e0e857027ad3d517fcf5cf6daba08867a200"
+    },
+    {
+      "path": "packages/fullstack/skills/chrome-testing/SKILL.md",
+      "present": true,
+      "sha256": "b6f2898d2c0084cde0b22ead2c417c7921d79928f1f40d70d3f5b11006fd191a"
+    },
+    {
+      "path": "packages/fullstack/skills/compose-arch/SKILL.md",
+      "present": true,
+      "sha256": "d04c239bb903367183fe349d302a63d57201687259b7668aa1ca29ac9f5b0d0e"
+    },
+    {
+      "path": "packages/fullstack/skills/compose-arch/evals/evals.json",
+      "present": true,
+      "sha256": "86326d77bacf65d332454a0d2c90907302ca1d03f68524141711e9aef06b89ce"
+    },
+    {
+      "path": "packages/fullstack/skills/compose/SKILL.md",
+      "present": true,
+      "sha256": "f624411ad2a39036bb8c1d33788f0c94a68006ec4051946e3bfab8a0d78d8308"
+    },
+    {
+      "path": "packages/fullstack/skills/custom-agent-bundle/SKILL.md",
+      "present": true,
+      "sha256": "b5c43b7ef7caee01c0aab610ef5f6846fcd94265d39d6041c6f882c8c75b94f9"
+    },
+    {
+      "path": "packages/fullstack/skills/custom-escalation-adapter/SKILL.md",
+      "present": true,
+      "sha256": "78a2f5dd3218f8fab4ec64d5c983680417c5155976f5870e09c7188b3b9af6d3"
+    },
+    {
+      "path": "packages/fullstack/skills/decompose/SKILL.md",
+      "present": true,
+      "sha256": "66f62842396d72e68c0e181e9b45476e8d8096e66b88b2bbe4a1abeef02d2268"
+    },
+    {
+      "path": "packages/fullstack/skills/decompose/evals/evals.json",
+      "present": true,
+      "sha256": "f943c1221f42cf13fd7e341c81f49a6e8dca6199115ed54086b71e9185634579"
+    },
+    {
+      "path": "packages/fullstack/skills/go-concurrency/SKILL.md",
+      "present": true,
+      "sha256": "542fbeb6bb8c83c8d09ee34a9d5ec1cd122cf5fd091041d16e60c4a8f0402080"
+    },
+    {
+      "path": "packages/fullstack/skills/go-microservices/SKILL.md",
+      "present": true,
+      "sha256": "0441183f5596c03b23037037e597b3ce00cdf14cccf3b69a4d7ba775bc64277d"
+    },
+    {
+      "path": "packages/fullstack/skills/go-patterns/SKILL.md",
+      "present": true,
+      "sha256": "70373fef5e5c5915f4df7c5fb39dfb65b259f84f14d26e0dd61e0043446c865f"
+    },
+    {
+      "path": "packages/fullstack/skills/jooq-patterns/SKILL.md",
+      "present": true,
+      "sha256": "7a07b306dea24380fbd4ee0fb1cf202cbf61d2e3ae132170e7dcac9cc971813c"
+    },
+    {
+      "path": "packages/fullstack/skills/kmp-feature-slice/SKILL.md",
+      "present": true,
+      "sha256": "6a276cc8420bccbb4caeba9bca65bb3b6c8641b1559987e806554306e9c8dac7"
+    },
+    {
+      "path": "packages/fullstack/skills/kmp-feature-slice/evals/evals.json",
+      "present": true,
+      "sha256": "f14dc4979dd6c88efd2b6619b6ec48dfb2e6129f166c763ae3b5cb94780835b6"
+    },
+    {
+      "path": "packages/fullstack/skills/kmp-feature-slice/references/compose-ui-templates.md",
+      "present": true,
+      "sha256": "f1b0a0293273d6e32fbc7c24c8293ade87907c0664e7986eb43b5d40d608ffd2"
+    },
+    {
+      "path": "packages/fullstack/skills/kmp-feature-slice/references/error-patterns.md",
+      "present": true,
+      "sha256": "90673bfa5ef01b1a48a5201d937af75091c1454465e4c73ba43d14d540918e68"
+    },
+    {
+      "path": "packages/fullstack/skills/kmp-feature-slice/references/kotlin-web-templates.md",
+      "present": true,
+      "sha256": "20d05cbeacc2ea9c1d2214634143afc0e84481801e07b3b9dfa30c3cf2df583e"
+    },
+    {
+      "path": "packages/fullstack/skills/kmp/SKILL.md",
+      "present": true,
+      "sha256": "b5a8251935902bffaecf28da98ac3dd46ba2ccb829c8b58d3a0066aa19ee4a7e"
+    },
+    {
+      "path": "packages/fullstack/skills/koog/SKILL.md",
+      "present": true,
+      "sha256": "43ff2df32eb947aaa4df524376ebfa7cf3f855dbf0a7e7d4611a8e9f37583082"
+    },
+    {
+      "path": "packages/fullstack/skills/koog/references/built-in-tools.md",
+      "present": true,
+      "sha256": "7889bb213aa6dea864c10ef2b31189168544ed59487c5a3dd61a1fd95c0788c2"
+    },
+    {
+      "path": "packages/fullstack/skills/koog/references/event-handler.md",
+      "present": true,
+      "sha256": "d70eb02798c9962100ae8e2d0edb300ef3eb8981248ad4f946e010ab68c08a10"
+    },
+    {
+      "path": "packages/fullstack/skills/koog/references/memory.md",
+      "present": true,
+      "sha256": "38df59d53cc27e9b3e03c2c5d0faa79cca26211f1657e40700916ed8d9782a23"
+    },
+    {
+      "path": "packages/fullstack/skills/koog/references/providers.md",
+      "present": true,
+      "sha256": "a543e53a1647dc710de302a1a22e78a50a7761eb7497bd4254c2ccaa9f18fa71"
+    },
+    {
+      "path": "packages/fullstack/skills/koog/references/strategies.md",
+      "present": true,
+      "sha256": "02e42f30e6a6fba7f0542814d434b300f98b1ec64fbf8d4c380be148d520ceab"
+    },
+    {
+      "path": "packages/fullstack/skills/koog/references/structured-output.md",
+      "present": true,
+      "sha256": "e1738f7481e98271af145e835a37221bd33903c28947c7e3af9c479ec048f2ce"
+    },
+    {
+      "path": "packages/fullstack/skills/koog/references/tracing-persistence.md",
+      "present": true,
+      "sha256": "c4007fb671426b1a8d24af8ef91466e8b746d6879d8545d34f7e1cc6aca94437"
+    },
+    {
+      "path": "packages/fullstack/skills/kotlin-spring-boot/SKILL.md",
+      "present": true,
+      "sha256": "cb72ed887c86bb06fb8c964ab0747554c080a33024776c0b868751003fe4cbac"
+    },
+    {
+      "path": "packages/fullstack/skills/kotlin-spring-boot/evals/evals.json",
+      "present": true,
+      "sha256": "196b83f417ec4c00e3a95a29c1c6daab3d274276b6cd99add0fc6f0376f6df2c"
+    },
+    {
+      "path": "packages/fullstack/skills/kotlin-spring-patterns/SKILL.md",
+      "present": true,
+      "sha256": "7cea80c44a4b25c2aa8165db74ade9b4984e0b6c252760e051aeeaacc4d8b3da"
+    },
+    {
+      "path": "packages/fullstack/skills/kotlin-spring-patterns/evals/evals.json",
+      "present": true,
+      "sha256": "6a3fcc185c78dd2908a3c7e3ba91589032ab3fd8468ffae5d6baeff7e3ffb940"
+    },
+    {
+      "path": "packages/fullstack/skills/kotlin-web/SKILL.md",
+      "present": true,
+      "sha256": "b9d4b78ca3c5551b598e4b60b7ebe4cdcde59a6a0fc59344a303f6b7061db3b3"
+    },
+    {
+      "path": "packages/fullstack/skills/kotlin-web/evals/evals.json",
+      "present": true,
+      "sha256": "d65cc5ac345cf2479e0cb9aa1e339eb6686cfdcd8f75b830eb48c3afb695780d"
+    },
+    {
+      "path": "packages/fullstack/skills/kotlin-web/references/compose-wasm.md",
+      "present": true,
+      "sha256": "9a9758dd3e59bed21f99cbf5b29c1c3be4942a20d15c66b8d9414fbac2d2f30c"
+    },
+    {
+      "path": "packages/fullstack/skills/kotlin-web/references/kotlin-js-react.md",
+      "present": true,
+      "sha256": "2440e02cdc6be736b0ec6b544a5029667eae0d57e56d75ce5e0dde7c36289863"
+    },
+    {
+      "path": "packages/fullstack/skills/kotlin-web/references/kotlin-js-vue.md",
+      "present": true,
+      "sha256": "d125991d057a2588b9db12b918d701fdd8e56b3986e6e3a8222c4853782f01fa"
+    },
+    {
+      "path": "packages/fullstack/skills/ktgbotapi-patterns/SKILL.md",
+      "present": true,
+      "sha256": "5ebcdd59054d618ace419f4aa5168a340d02d3f0958a6d3b5b470095bc364147"
+    },
+    {
+      "path": "packages/fullstack/skills/ktgbotapi-patterns/evals/evals.json",
+      "present": true,
+      "sha256": "8fae4dbfd70c97b36fc33b1439b3178385410c48f12268819d9d7c66d2eb54e3"
+    },
+    {
+      "path": "packages/fullstack/skills/ktgbotapi/SKILL.md",
+      "present": true,
+      "sha256": "8ea023c35b684b6028cf7fb0c93513d5ee3f2f7d8b46378d4b5cf5919f549d3c"
+    },
+    {
+      "path": "packages/fullstack/skills/ktgbotapi/evals/evals.json",
+      "present": true,
+      "sha256": "db221c5e475efee55b9bdbbc3ca09bd0981b4c3ff078a0345cca9978fc9cc438"
+    },
+    {
+      "path": "packages/fullstack/skills/ktor-client/SKILL.md",
+      "present": true,
+      "sha256": "1a0638325b941657085115095c3802a87f0f6dffd77deb8aa6bc11e2baa44c8d"
+    },
+    {
+      "path": "packages/fullstack/skills/ktor-client/evals/evals.json",
+      "present": true,
+      "sha256": "e15b1a111303542927ca28bcacd24815867101c05676b65560495f02ea3997a1"
+    },
+    {
+      "path": "packages/fullstack/skills/metro-di-mobile/SKILL.md",
+      "present": true,
+      "sha256": "83a43a99df9d21b14250d4aec5a17dbeee2ce43a79f3f18173f214d59ed4f168"
+    },
+    {
+      "path": "packages/fullstack/skills/metro-di-mobile/evals/evals.json",
+      "present": true,
+      "sha256": "a14a2a65641d68322488a1696ebd69211b9c9195245738dcab68efca0963c5c3"
+    },
+    {
+      "path": "packages/fullstack/skills/mobile-testing/SKILL.md",
+      "present": true,
+      "sha256": "a3d55407fa8c520f115a5bd344a3c3c0d9762070ca636d61e853ae7f937ac885"
+    },
+    {
+      "path": "packages/fullstack/skills/opentelemetry/SKILL.md",
+      "present": true,
+      "sha256": "241c77078d827eb748be6450248462fbd7ce9e11274bb07944164ef864e5996f"
+    },
+    {
+      "path": "packages/fullstack/skills/publish-gist-report/SKILL.md",
+      "present": true,
+      "sha256": "ae7667e3f286cd4d52ce5730f9303ddc62b16df98da2dcd4dd650c4a9bce8490"
+    },
+    {
+      "path": "packages/fullstack/skills/react-vite/SKILL.md",
+      "present": true,
+      "sha256": "1b668af48f0415d6a82cb0a3ca824f947fbb9614233592f6003996d0d7e6c2e6"
+    },
+    {
+      "path": "packages/fullstack/skills/systematic-planning/SKILL.md",
+      "present": true,
+      "sha256": "5240648688f88e8fddbca96ef4136e8c2414aae9140e73d15cca570dbc980d3a"
+    },
+    {
+      "path": "packages/fullstack/skills/telegram-mini-apps/SKILL.md",
+      "present": true,
+      "sha256": "d5eb925c1afdd28aabd6186959fd3caa242c16098442cca3f46f645144bb229d"
+    },
+    {
+      "path": "packages/fullstack/skills/workmanager/SKILL.md",
+      "present": true,
+      "sha256": "749aa4f3de2f3853ee1dd591c5d33ede29de5e51293f1a3b16f791e54b0f24ba"
+    },
+    {
+      "path": "packages/fullstack/skills/workmanager/references/chaining.md",
+      "present": true,
+      "sha256": "d1f0cab63459c75114a15b5925243140f822bd6a42085f05933d26509d3be8cc"
+    },
+    {
+      "path": "packages/fullstack/skills/workmanager/references/constraints.md",
+      "present": true,
+      "sha256": "2b33bfe383703cc135eecee129765540f4012552b655a3ead728d009b8c74848"
+    },
+    {
+      "path": "packages/fullstack/skills/workmanager/references/testing.md",
+      "present": true,
+      "sha256": "f94e7c277efb1c1032b816599802c284e580b1d8946527637f38c0964117f7e6"
+    },
+    {
+      "path": "packages/fullstack/skills/workmanager/references/troubleshooting.md",
+      "present": true,
+      "sha256": "6d89c6e8e2a13b4db28d2a7e67c43991011f53dcf08e2811ebdd26187b06303d"
+    },
+    {
+      "path": "packages/fullstack/src/adapters/http.ts",
+      "present": true,
+      "sha256": "b7e5614f63ccc06b21b419f96a1e5b54d723eb2da48844c6591ba04533e56e00"
+    },
+    {
+      "path": "packages/fullstack/src/adapters/mock.ts",
+      "present": true,
+      "sha256": "52a23ab9f50bb692efdf23328238eff1fc720f80ab47db7b516354e847301c2c"
+    },
+    {
+      "path": "packages/fullstack/src/adapters/registry.ts",
+      "present": true,
+      "sha256": "c763d210f4baa5b4d9ef4525dfbdb4e44946fce6b4bf24d601b9f12e23679b23"
+    },
+    {
+      "path": "packages/fullstack/src/adapters/telegram.ts",
+      "present": true,
+      "sha256": "74fbda3b79b64b164c016b08a9cfced96c0cdd0137d21991fe690bea021a625d"
+    },
+    {
+      "path": "packages/fullstack/src/agent-mapping.ts",
+      "present": true,
+      "sha256": "3fdf0dcea596f6d8aa6fdec9817e839b6439a4c10a83fd196bc56c84f90949a8"
+    },
+    {
+      "path": "packages/fullstack/src/before-agent-start-marker.ts",
+      "present": true,
+      "sha256": "41eddc91ee48d88423e5639f8093b82876ad996280f305d49b669cbccb68f4ec"
+    },
+    {
+      "path": "packages/fullstack/src/copy-commands.ts",
+      "present": true,
+      "sha256": "bf40ba8f99478ba985c6f95768607c3b1b0d050891262ca5ab0504443b8ae163"
+    },
+    {
+      "path": "packages/fullstack/src/cto-mode-reminder.ts",
+      "present": true,
+      "sha256": "709940f7f16274f706984f4edfbe46f953ba7b44f2660d6499162eaec26706b1"
+    },
+    {
+      "path": "packages/fullstack/src/cto-scheduler-daemon.ts",
+      "present": true,
+      "sha256": "786308fd77ca9b0f5054e7641d4377055a4a81a32e0b9673fca96187d894f94a"
+    },
+    {
+      "path": "packages/fullstack/src/index.ts",
+      "present": true,
+      "sha256": "1a39e0b57a00dcfeaf9b8e9344a292f39ec729f9e98e402a57a5011cc9fa2115"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/asr-hosted.ts",
+      "present": true,
+      "sha256": "8946279ce99c6291fb7c5f9d2b065710bf95b8f936cb58f017cb82e238aed35c"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/asr-local-whisper.ts",
+      "present": true,
+      "sha256": "005b9b9dacfba3ba2c0447d6003003435420b93ad181b31094c4f7a875f8f6be"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/asr-openrouter.ts",
+      "present": true,
+      "sha256": "35f17e1cfa7044f21b28b85453352d27a23d92c8fc9bc21119d8ab3f35f4ca40"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/asr.ts",
+      "present": true,
+      "sha256": "b1fe05360fff73246cfe64b7538cb6f4395bf664ab341e531534f6aa6bfb13ea"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/audio-preprocess.ts",
+      "present": true,
+      "sha256": "814b5b4d0ba094033f58be4ddcf39079af7309d76e6b6eac2708ec739da2676b"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/child-lifecycle.ts",
+      "present": true,
+      "sha256": "160e42a970ce486bdab454bf83cabba6fb07b69c92dc2e48aa3d8c31f02658f7"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/config.ts",
+      "present": true,
+      "sha256": "f5bade8a9fb3cf21eaca95d6aedc78b16c3d09eaf13374a583ee9c1c8f13e0f9"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/endpoint-policy.ts",
+      "present": true,
+      "sha256": "91defdf5be4a05b1d04704002e725738c7a5cf994851c46ccbeaffbe21fee494"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/eval.ts",
+      "present": true,
+      "sha256": "8c7112091252667d04b20bf8af6e79b46a3598dd5473d0e63ccb838df9199859"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/gemini.ts",
+      "present": true,
+      "sha256": "ca39dd19b66e4f9f714c2537e8485b732035490724a9a05b61ed87003dd976f2"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/local-text.ts",
+      "present": true,
+      "sha256": "808a7dfb971c9f80e585901870fb728cd0b3afd2ca990790b244623494fc9757"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/media.ts",
+      "present": true,
+      "sha256": "d03b6e9448061e05cb9908894cbc573d1355a641dee0731070d0927b7de9626c"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/omp-runtime.ts",
+      "present": true,
+      "sha256": "22b1d9f0214a9ab476bd0f5a1e5055902c0812f7589cba9f6a04e626d4f15227"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/pipeline.ts",
+      "present": true,
+      "sha256": "ca2e7ef09aed359748352601e81960c837e2509ca2b864c535f33a6b4ad7e72c"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/provider-errors.ts",
+      "present": true,
+      "sha256": "e9d974c4b866235b3fc2f179e247b11fbee6fa88fa70198d90dad17c30abeb22"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/readable-lifecycle.ts",
+      "present": true,
+      "sha256": "2b19f1d0df6517677e8be0fa15b1363291668a97d3b88eb9369e133d5a7e6f2f"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/service.ts",
+      "present": true,
+      "sha256": "49afb017555a78e9199a81e975d29638883b5b59b6212aae262e05a4f02a728d"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/text-analysis.ts",
+      "present": true,
+      "sha256": "291db9205758def526d9ee676f8ab8268fce4032f9236a464763a9565abfea10"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/wav.ts",
+      "present": true,
+      "sha256": "d6e75ccd8f3b308d1beca7e351833867975482eee8d5961e7decefb67742c441"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/writable-file-owner.ts",
+      "present": true,
+      "sha256": "4d6de9563ed5f3ea5e78c5c37d365301567d77d904f4f9e4a0a399f01a0edf62"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/youtube-playlist.ts",
+      "present": true,
+      "sha256": "12d91dc3ef575b957f12ea8428ffce84e2b9ae560871536ab988a2f817be0cb5"
+    },
+    {
+      "path": "packages/fullstack/src/lecture-acquisition/youtube-url.ts",
+      "present": true,
+      "sha256": "166c783e6502c2501afe9eab54b066f55ae35c688fade3ddb75f2629eee4e1a2"
+    },
+    {
+      "path": "packages/fullstack/src/messenger-channel.ts",
+      "present": true,
+      "sha256": "32350bd093e4f13761008befc1d5fe6a7d84c86fc862df5ecb8cb4feb7ec826a"
+    },
+    {
+      "path": "packages/fullstack/src/subagent-tree.ts",
+      "present": true,
+      "sha256": "e1cfef470277be4c2dd2b49540150a47e0d9fda8a9bb632cb71fd43fbe43cb8c"
+    },
+    {
+      "path": "packages/fullstack/src/telegram-bridge.ts",
+      "present": true,
+      "sha256": "4eb77a9ed9684e691898f74e1266182075b1a91990f7d72a421e4f0a5b9fe4b1"
+    },
+    {
+      "path": "packages/fullstack/src/tools/lecture-acquire.ts",
+      "present": true,
+      "sha256": "9697c0b417f4c0504ec3ef81da9478e33fe6e62a78019fb78dcd57aad93eb85f"
+    },
+    {
+      "path": "packages/fullstack/src/workflow-commands.ts",
+      "present": true,
+      "sha256": "65f4fe45818ad618cfb45dd16e5ff489efeadcb1a4817b30fca915d6714996fa"
+    },
+    {
+      "path": "packages/fullstack/src/workflow-contract.ts",
+      "present": true,
+      "sha256": "a0cb10c798ec95032799310be7c4e668f0dbb042a3d12597f1567b9c1dfb4071"
+    },
+    {
+      "path": "packages/fullstack/test/adapters.test.ts",
+      "present": true,
+      "sha256": "44676f866d482769de9d99360f3327ed196b91e247120e44f93a8bea0d523066"
+    },
+    {
+      "path": "packages/fullstack/test/agent-mapping.test.ts",
+      "present": true,
+      "sha256": "c6f6a97cc557444fcaca27459229bc8c34e20f38f586d0a7bb339b762f511d0f"
+    },
+    {
+      "path": "packages/fullstack/test/before-agent-start-marker.test.ts",
+      "present": true,
+      "sha256": "2c684f4a4593ebe3426dbb3bd982f9e311ec7aeda402066f70fa7ea4d0815ca3"
+    },
+    {
+      "path": "packages/fullstack/test/channel-policy.test.ts",
+      "present": true,
+      "sha256": "81793329dca1965f617525a7a8e6de64db8d58e4e2eba50c2b9d3c3955dcabe8"
+    },
+    {
+      "path": "packages/fullstack/test/copy-commands.test.ts",
+      "present": true,
+      "sha256": "c19a24f8f153ae89f262e11c57fa822f80a8a36edd95cfa02acca91153ff995e"
+    },
+    {
+      "path": "packages/fullstack/test/copy-prune.test.ts",
+      "present": true,
+      "sha256": "56b9295d2ecfab1e1225fd419ec926953dcf8f306a057c27836acc86ab1f22bc"
+    },
+    {
+      "path": "packages/fullstack/test/cto-mode-reminder.test.ts",
+      "present": true,
+      "sha256": "253ac77f926ee755bc3db1f9897012867be7697a30965932698c5f0dcdba95c9"
+    },
+    {
+      "path": "packages/fullstack/test/cto-scheduler-daemon.test.ts",
+      "present": true,
+      "sha256": "4e091fddedfe78efb21587309ae8ade5f0a910a9ce90b44c8befbeca21b9ef5a"
+    },
+    {
+      "path": "packages/fullstack/test/dispatcher-lifecycle.test.ts",
+      "present": true,
+      "sha256": "e4a725a893d8fdb62566580e709e906d4b5717f324a0a3a231bfab5995fe78e4"
+    },
+    {
+      "path": "packages/fullstack/test/fake-rw.test.ts",
+      "present": true,
+      "sha256": "e0ee1dd8124230dc1118cb3b2e938dd171f9ad8b7e765e4989382d1d707694b3"
+    },
+    {
+      "path": "packages/fullstack/test/init-team.test.ts",
+      "present": true,
+      "sha256": "8bff48d3f458140366dcdea7974b9aa46d03bb00e7964ff0bf400150f2a772e6"
+    },
+    {
+      "path": "packages/fullstack/test/integration-regression.test.ts",
+      "present": true,
+      "sha256": "b677e7f128ee645fd09dd5cce43d52097c85a95b0f8f8abb2a0909a01f8b037a"
+    },
+    {
+      "path": "packages/fullstack/test/lecture-acquisition.test.ts",
+      "present": true,
+      "sha256": "83f7a45f51ceacd8379a403234e48a831c5faa96041efbf9703ac9b2ff81b873"
+    },
+    {
+      "path": "packages/fullstack/test/lecture-endpoint-policy.test.ts",
+      "present": true,
+      "sha256": "96e8b281a4983c16ad0c4e10f0320bc1324b35adc24da8a73db30c142b843c85"
+    },
+    {
+      "path": "packages/fullstack/test/lecture-eval.test.ts",
+      "present": true,
+      "sha256": "52d6cfa7cd3343da16086fc85ddba9d56001ce21fe33ba2b3d07c51e64a46233"
+    },
+    {
+      "path": "packages/fullstack/test/lecture-local-whisper.test.ts",
+      "present": true,
+      "sha256": "185b4c613621451c550f66d287ee369147c09c8fdd86e938fe9a3e21a8c3e2e5"
+    },
+    {
+      "path": "packages/fullstack/test/lecture-media.test.ts",
+      "present": true,
+      "sha256": "cde991e27f6c1bc92face93c9246474d3802a72e400038709cf53be84d56546e"
+    },
+    {
+      "path": "packages/fullstack/test/lecture-openrouter-asr.test.ts",
+      "present": true,
+      "sha256": "7b9891ff74111bcd52971d0f8d8d1bcd1f388732378ec1987c2cdf615196ec58"
+    },
+    {
+      "path": "packages/fullstack/test/lecture-pipeline.test.ts",
+      "present": true,
+      "sha256": "baedb4fae72eb4c241484a1c3e9e98c3519a8fc27864a604b1e403d118049e17"
+    },
+    {
+      "path": "packages/fullstack/test/lecture-provider-adapters.test.ts",
+      "present": true,
+      "sha256": "36d9da60c75d5b2ba35b095b7dacceb39beb2e89ce174aa942e9f657508636bb"
+    },
+    {
+      "path": "packages/fullstack/test/lecture-wav-parser.test.ts",
+      "present": true,
+      "sha256": "80d85073ef17a754d5913dcd7699701880da8ea6dc95de10208484081aacb846"
+    },
+    {
+      "path": "packages/fullstack/test/messenger-channel.test.ts",
+      "present": true,
+      "sha256": "518cf570bba1157a485c92538fe17f554033bc675dbd9427ac71b2eeb1270a6b"
+    },
+    {
+      "path": "packages/fullstack/test/omp-model-roles.test.ts",
+      "present": true,
+      "sha256": "087a62463088229869c952855d6fcf5678eab520ea47993563cffca3e07d7500"
+    },
+    {
+      "path": "packages/fullstack/test/outbound-producer.test.ts",
+      "present": true,
+      "sha256": "3d2cdc38b73ad62e7c8a13c2e36b700bc6767948b823c0c03fb7dc3f5a6efb57"
+    },
+    {
+      "path": "packages/fullstack/test/package-contract.test.ts",
+      "present": true,
+      "sha256": "1c0fe4373f27cfd97bc1e5edf1846eb33d60ed0e94fa70dfaaba8319cc0eb1c0"
+    },
+    {
+      "path": "packages/fullstack/test/runtime-config-trace.test.ts",
+      "present": true,
+      "sha256": "c323600286e84f9423d96cc35828dcf214b713c54bb8499c76e39172e1be27d6"
+    },
+    {
+      "path": "packages/fullstack/test/rw-channel-live-delivery.test.ts",
+      "present": true,
+      "sha256": "8bd02a971749a042cd91fd276ef0486b8c7a6722f6278d3a024a4dfd80f48d09"
+    },
+    {
+      "path": "packages/fullstack/test/session-report-command.test.ts",
+      "present": true,
+      "sha256": "bb02974b4b8cc6997873752f325b88aa992d1c34787a43dc16ee7bbc8dda0196"
+    },
+    {
+      "path": "packages/fullstack/test/subagent-tree.test.ts",
+      "present": true,
+      "sha256": "4b5afd89a0348fefb427900d29fdf79b31083674ffb94ef27daca5009a076e39"
+    },
+    {
+      "path": "packages/fullstack/test/telegram-auth.test.ts",
+      "present": true,
+      "sha256": "1d86695e704784ebd6d2dc26b16ac4a3c031f375dc58df2a5b76fa885a1db91e"
+    },
+    {
+      "path": "packages/fullstack/test/telegram-bridge.test.ts",
+      "present": true,
+      "sha256": "ea1b08ec45d6ca3bcbfcd2bb6cdc396dd9be28889b587007883be300b92d7d14"
+    },
+    {
+      "path": "packages/fullstack/test/workflow-commands.test.ts",
+      "present": true,
+      "sha256": "d6c7bdb80ac0b9c50d32f7dbff17b1a372c039f7235b615f9bdc2976a31ca252"
+    },
+    {
+      "path": "packages/fullstack/test/workflow-tools.test.ts",
+      "present": true,
+      "sha256": "b9cc92814fa73d6652a2f2a3fe5a6d069b88d168ed82294b657c7cbb644212df"
+    },
+    {
+      "path": "packages/fullstack/test/workflow-view-command.test.ts",
+      "present": true,
+      "sha256": "445659f78a48d88b1f9c332ab7146d63532dd0a6e436cc7d1c2215ad6b24c0f7"
+    },
+    {
+      "path": "packages/fullstack/tsconfig.commands.json",
+      "present": true,
+      "sha256": "87a4ea541466984a741da4001bf53c203ffdc45e6788f735cbdcf10d849f6e9b"
+    },
+    {
+      "path": "packages/fullstack/tsconfig.json",
+      "present": true,
+      "sha256": "b20acc349daa2c000fff112cf07e60e38f37878d94aadd8661cd0388f6df4ffc"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-analyst.md",
+      "present": true,
+      "sha256": "3e15d707f11b80e0ee89bf3932ad3c29c82761c20cb3a1349b508b464bf9c23a"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-architect.md",
+      "present": true,
+      "sha256": "5eda2bafa87094b3aba389f17ce4b90989c4702ba47c164b0f156a787459d42d"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-code-reviewer.md",
+      "present": true,
+      "sha256": "2ed1c97615838444b84817222fd8464b975026f011e4e8ef4446e3e7c5d8ea13"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-devops.md",
+      "present": true,
+      "sha256": "f4190681b3036bcdbac1f1f38ddd46c66d5caef0b249044a14288dbbcf69bf8c"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-diagnostics.md",
+      "present": true,
+      "sha256": "c519a9f639b40fd0dcf070b5b78bf631801b5871d3535322c7180e78c8be0761"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-engine-specialist.md",
+      "present": true,
+      "sha256": "667f4b25beb2201713647ef634b011e2fcb35482df122414a67a2206fecfc8a7"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-host-integration-specialist.md",
+      "present": true,
+      "sha256": "94a683f843cb202c8ff3496d448752930d736104c139f55c1a8485d2e3d477cb"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-manual-qa.md",
+      "present": true,
+      "sha256": "0cb8bbdf4718c52a6cc254ca202147c7c5e9c6b2a5a96109727258c72ff0cc87"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-package-release-specialist.md",
+      "present": true,
+      "sha256": "1f2b3ebb7b0ecff70abd980b8c8cd07fd760f5590d541c6a9166714dcd3bd037"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-plugin-developer.md",
+      "present": true,
+      "sha256": "f511f511793edf94c036abe8e229ee9d3eb3eec5eca8ff0060b8e3caa6a2476d"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-qa.md",
+      "present": true,
+      "sha256": "3a2163f638d39d3e07621bc6bada75e6ddb0807a420d238136d57765759f80e6"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-security-tester.md",
+      "present": true,
+      "sha256": "ecc31ec65167f725c6f0d4c6fef7f6bc27e824bb849076898b0bb50cc137c3e5"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-team-lead.md",
+      "present": true,
+      "sha256": "b9e16853dbd792051c4d415df1620d39b7b0aefbdb15461a407d674f797c2642"
+    },
+    {
+      "path": "packages/omp-workflows-internal/agents/omp-tech-researcher.md",
+      "present": true,
+      "sha256": "c17b38a59de571ec9b4fd7e67c6335c2791c3d9fce8bdbc59398e34ce226b585"
+    },
+    {
+      "path": "packages/omp-workflows-internal/package.json",
+      "present": true,
+      "sha256": "5fd3b9c5c1f112fa54420a763db2e9a88ef7eef1035dda0887f85a6aef8fc13f"
+    },
+    {
+      "path": "packages/omp-workflows-internal/src/activation.ts",
+      "present": true,
+      "sha256": "7ba8dd6275d2a6164ef7f91761d307c37898d91b178e5628421357ffced27159"
+    },
+    {
+      "path": "packages/omp-workflows-internal/src/identity.ts",
+      "present": true,
+      "sha256": "b8e8d2d0b590cc8d5ad7ae67ad39b8172c1d2888ba2c41ea1cd1e3991ee3b16a"
+    },
+    {
+      "path": "packages/omp-workflows-internal/src/index.ts",
+      "present": true,
+      "sha256": "2a47cd1f63982483050d28bd43d66eb2aa1b11bd59a745a1b46df18e7a5dc67a"
+    },
+    {
+      "path": "packages/omp-workflows-internal/src/pool.ts",
+      "present": true,
+      "sha256": "7476db5500b5e62780535620e379235459ed3dd96ddc9108e94a42e2a6a8a8c3"
+    },
+    {
+      "path": "packages/omp-workflows-internal/src/profiles.ts",
+      "present": true,
+      "sha256": "d42ab070ea1bfccb766a009074872dcc8d3075766d112cf762b557c25d9b40b4"
+    },
+    {
+      "path": "packages/omp-workflows-internal/test/activation.test.ts",
+      "present": true,
+      "sha256": "9ceff0d1c87a66d213810923f00a85a7c04e63995ce6c501a27db65e45233861"
+    },
+    {
+      "path": "packages/omp-workflows-internal/test/agent-mapping.test.ts",
+      "present": true,
+      "sha256": "97b4965da3a647de1a36e6ddd7193c34264ee26222f12244435543f3bb1be67c"
+    },
+    {
+      "path": "packages/omp-workflows-internal/test/assets.test.ts",
+      "present": true,
+      "sha256": "591af695b9ef3c53aaf40de72e6c9de347869d1135b4201fe1bd97549993b60a"
+    },
+    {
+      "path": "packages/omp-workflows-internal/test/entry.test.ts",
+      "present": true,
+      "sha256": "fc9b79337e4751a2ef0f061a1b51ff68e6c6f5a5073c4b1205cd754d030ca35e"
+    },
+    {
+      "path": "packages/omp-workflows-internal/test/identity.test.ts",
+      "present": true,
+      "sha256": "f86a2b24782cfa8f5f5d892d294978130b07573d097dc241147d252f5f5acba3"
+    },
+    {
+      "path": "packages/omp-workflows-internal/test/namespace-activation.test.ts",
+      "present": true,
+      "sha256": "4c2becd9b4430a314343509865df7e335671dce678f6054b195b427b18374e15"
+    },
+    {
+      "path": "packages/omp-workflows-internal/test/qa-command-discovery.test.ts",
+      "present": true,
+      "sha256": "4d9b21cbde3fba9b9f7a6d0f528ac4f362dd90d4f9847288ac52a078569382e3"
+    },
+    {
+      "path": "packages/omp-workflows-internal/test/qa-owner-and-gate.test.ts",
+      "present": true,
+      "sha256": "2ed5bd037d3f013475064d297533d2a2820d91d2834f2fae9c16cd7732e7beef"
+    },
+    {
+      "path": "packages/omp-workflows-internal/test/qa-package-metadata.test.ts",
+      "present": true,
+      "sha256": "0dde415c3e67604f57f713e58e9e04e91f682d99e39954a5a5bd3464192ee847"
+    },
+    {
+      "path": "packages/omp-workflows-internal/test/qa-pool-contract.test.ts",
+      "present": true,
+      "sha256": "e6c1d6cbd7dba5e0cd9596008069f438591e8f1a8aec318c1ee086178365d26d"
+    },
+    {
+      "path": "packages/omp-workflows-internal/tsconfig.json",
+      "present": true,
+      "sha256": "411871b43e12c5947dc058956f1d3961655e854f19a1bb7b77e993ee5224dfbd"
+    },
+    {
+      "path": "packages/omp-workflows-internal/workflows/omp-feature.json",
+      "present": true,
+      "sha256": "20dda28fae322c72548e3a4166e8aa020b162d4c466ad9b18003533638a9e237"
+    },
+    {
+      "path": "packages/omp-workflows-internal/workflows/omp-validate.json",
+      "present": true,
+      "sha256": "5e0cd2d88f4db05f65c4c66d8438f50176f6b47665a9e524f836ad548623388a"
+    },
+    {
+      "path": "specs/001-redesign-spec-workflow/contracts/command-contract.md",
+      "present": true,
+      "sha256": "6f97fd418afd258b410e0014ee2aeb30c3093b40ce43ad4a88a823444dfe7df6"
+    },
+    {
+      "path": "specs/001-redesign-spec-workflow/contracts/feature-workspace.schema.json",
+      "present": true,
+      "sha256": "52de32ebf91085a7f533bec6b6cd57150d93f61dab731bcfdd432f3223cf2a1f"
+    },
+    {
+      "path": "specs/001-redesign-spec-workflow/contracts/implementation-conformance.schema.json",
+      "present": true,
+      "sha256": "3a76510356faf788c955fb3c13543a3589056726ce7319afe97dd32c5136b9e1"
+    },
+    {
+      "path": "specs/001-redesign-spec-workflow/contracts/implementation-handoff.schema.json",
+      "present": true,
+      "sha256": "f8f9a57f73e6383109e7009cd3860825826dd58104396551534f703d097360ac"
+    },
+    {
+      "path": "tsconfig.json",
+      "present": true,
+      "sha256": "0e0808e3718c3d035050a39ec42cc1fa72386f4770a5dc67fa9547be3e31e012"
+    }
+  ]
+}

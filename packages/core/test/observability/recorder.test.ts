@@ -8,7 +8,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -63,7 +63,7 @@ function completionEnvelope(
           path: "artifacts/result.json",
           sha256: "a".repeat(64),
           schema_status: "met",
-          dod_status: "met",
+          quality_gate_status: "met",
         }],
     evidence_ref: outcome === "pending" ? null : "evidence/dispatch-1",
     conflict_ref: null,
@@ -183,6 +183,48 @@ test("recorder: readAll skips corrupt lines instead of throwing", async () => {
     assert.equal(all.length, 2, "skips the corrupt line, returns the 2 valid ones");
   } finally {
     cleanup();
+  }
+});
+
+test("recorder: compaction keeps deterministic recent records within byte and count caps", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    const r = new EventRecorder({
+      cwd,
+      branch: "main",
+      maxEventBytes: 256,
+      nextId: makeIdGen(),
+      maxLogBytes: 512,
+      maxAggregateBytes: 512,
+      maxRecords: 2,
+    });
+    await r.append({ kind: "agent_start", ts: ts(0) });
+    await r.append({ kind: "agent_start", ts: ts(1) });
+    await r.append({ kind: "agent_start", ts: ts(2) });
+    assert.deepEqual(r.readAll().map((event) => event.id), ["e-2", "e-3"]);
+    assert.ok(readFileSync(r.path).byteLength <= 512);
+  } finally {
+    cleanup();
+  }
+});
+
+test("recorder: invalid UTF-8 and a leaf symlink are fatal without outside writes", async () => {
+  const { cwd, cleanup } = withTempDir();
+  const outside = mkdtempSync(join(tmpdir(), "omp-obs-outside-"));
+  const sentinel = join(outside, "sentinel");
+  try {
+    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-hostile" });
+    writeFileSync(sentinel, "untouched\n", "utf8");
+    writeFileSync(r.path, Buffer.from([0xff, 0xfe]));
+    assert.throws(() => r.readAll(), /UTF-8/);
+    writeFileSync(r.path, "{}", "utf8");
+    unlinkSync(r.path);
+    symlinkSync(sentinel, r.path);
+    await assert.rejects(r.append({ kind: "agent_start", ts: ts(0) }), /symbolic link|unsafe|path/i);
+    assert.equal(readFileSync(sentinel, "utf8"), "untouched\n");
+  } finally {
+    cleanup();
+    rmSync(outside, { recursive: true, force: true });
   }
 });
 

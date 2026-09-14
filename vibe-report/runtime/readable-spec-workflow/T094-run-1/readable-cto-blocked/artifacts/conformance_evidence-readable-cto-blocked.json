@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "artifact_id": "conformance_evidence-readable-cto-blocked",
+  "entries": [
+    {
+      "evidence_id": "readable-cto-blocked-implementation-fr-1",
+      "kind": "implementation",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-3f02fb822c43095d7a271d42e0dd0695",
+      "intent_message": "The generic approved handoff states only that the tool completes the requested outcome and supplies no invocation or output contract. The referenced specs/feature-one/spec.md and in-scope src/blocked/** are absent, so no honest FR-1 behavior can be implemented without inventing the contract.",
+      "recorded_at": "2026-09-05T00:00:00.000Z"
+    },
+    {
+      "evidence_id": "readable-cto-blocked-implementation-ac-1",
+      "kind": "implementation",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-3f02fb822c43095d7a271d42e0dd0695",
+      "intent_message": "The generic approved handoff states only that the tool completes the requested outcome and supplies no invocation or output contract. The referenced specs/feature-one/spec.md and in-scope src/blocked/** are absent, so no honest AC-1 behavior can be implemented without inventing the contract.",
+      "recorded_at": "2026-09-05T00:00:00.000Z"
+    },
+    {
+      "evidence_id": "readable-cto-blocked-intent-conflict-fr-1",
+      "kind": "intent_conflict",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-3f02fb822c43095d7a271d42e0dd0695",
+      "intent_message": "The generic approved handoff gives no honest behavior to implement beyond the statement that the tool completes the requested outcome: specs/feature-one/spec.md is absent and the in-scope src/blocked/** path is absent. Implementing FR-1 would require inventing an unstated behavior contract.",
+      "recorded_at": "2026-09-05T00:00:00.000Z"
+    },
+    {
+      "evidence_id": "readable-cto-blocked-intent-conflict-ac-1",
+      "kind": "intent_conflict",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-3f02fb822c43095d7a271d42e0dd0695",
+      "intent_message": "The generic approved handoff gives no honest behavior to implement beyond the statement that the tool completes the requested outcome: specs/feature-one/spec.md is absent and the in-scope src/blocked/** path is absent. Implementing AC-1 would require inventing an unstated behavior contract.",
+      "recorded_at": "2026-09-05T00:00:00.000Z"
+    }
+  ]
+}

@@ -41,10 +41,10 @@
    Requirements:
    - Follow existing codebase conventions
    - Commit incrementally (small, logical commits)
-   - Each commit should compile and tests should pass
    - Use conventional commit messages (feat:, fix:, etc.)
-   - Run build after implementation
    - Report all files created/modified
+   - Optionally report `worker_attested: true` with checks you personally ran; this is informational only and is not workflow proof.
+   - Do not claim workflow tests passed from the implementation report; independent `qa_tests` owns the workflow QA gate.
    ```
 
 4. **For FRONTEND implementation**, launch **frontend-developer agent**:
@@ -63,8 +63,9 @@
    - Use @telegram-apps/ui components
    - Handle loading, error, empty states
    - Use proper TypeScript types (no 'any')
-   - Run npm run build to verify
    - Report all files created/modified
+   - Optionally report `worker_attested: true` with checks you personally ran; this is informational only and is not workflow proof.
+   - Do not claim workflow tests passed from the implementation report; independent `qa_tests` owns the workflow QA gate.
    ```
 
 5. **For MOBILE implementation**, launch **developer-mobile agent**:
@@ -84,8 +85,9 @@
    - Use Metro DI for dependency injection
    - Handle loading, error, empty states
    - Use Value<T> for component state (not StateFlow)
-   - Run ./gradlew assemble to verify
    - Report all files created/modified
+   - Optionally report `worker_attested: true` with checks you personally ran; this is informational only and is not workflow proof.
+   - Do not claim workflow tests passed from the implementation report; independent `qa_tests` owns the workflow QA gate.
    ```
 
 6. **For FULL-STACK (web) features**, launch BOTH agents IN PARALLEL:
@@ -115,11 +117,10 @@
 
    **Integration contract**: Same as web - both work from Architect's API design
 
-8. Review implementation (backend, frontend, and/or mobile)
-9. Run builds to verify
-10. Ensure all changes are committed with meaningful messages
+8. Report the implementation artifact and any worker attestation; do not treat implementation text as validation.
+9. Ensure all changes are committed with meaningful messages
 
-**Output**: Working implementation with all files listed
+**Output**: Working implementation with all files listed; any worker attestation is informational only.
 
 **Checkpoint**: Proceed to Phase 6
 

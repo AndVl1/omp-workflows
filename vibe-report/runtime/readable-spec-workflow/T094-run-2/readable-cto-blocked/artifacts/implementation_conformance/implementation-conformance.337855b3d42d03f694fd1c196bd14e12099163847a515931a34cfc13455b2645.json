@@ -1,0 +1,210 @@
+{
+  "schema_version": "1.0",
+  "feature_id": "readable-cto-blocked",
+  "handoff_id": "readable-cto-blocked.handoff.v1",
+  "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+  "execution_claim_id": "claim-aa8b086101bbe9ed628795ff7319d1bb",
+  "execution_owner": "cto",
+  "execution_run_id": "readable-cto-exec-wave-001",
+  "profile_hash": "4410dbc9f79aa780862e28b53905cccc9f963c375c2c5f0c6d170f03b2f135b5",
+  "entries": [
+    {
+      "entry_id": "closure.e0f2ee737b4ccc990dd6d3743bb9b316120f8ff4253efac771bd5c31d6cd6e04",
+      "subject_kind": "requirement",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "observable_behavior": true,
+      "implementation_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-blocked-implementation",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-implementation.json",
+          "sha256": "aefe344902949ce763d9db868fba8e7d5e7b5ea6d8662c0dbe34136139966ddf",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "review_verdict": "fail",
+      "review_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-blocked-qa",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-qa.json",
+          "sha256": "851d4ce0135b45d69e9598351f3c94663461a270fd5705d81ad0fcbba8124f85",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "test_evidence": [
+        {
+          "evidence_ref": {
+            "artifact_id": "readable-cto-blocked-runtime-record",
+            "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-runtime-record.json",
+            "sha256": "449719669c9044f1c330b66e008e35d222289c9b2a68e19cda6ed83fe1c15233",
+            "schema_status": "met",
+            "quality_gate_status": "met"
+          },
+          "test_kind": "runtime",
+          "status": "fail",
+          "executed_at": "2026-09-04T23:55:41.257483000Z"
+        }
+      ],
+      "status": "changed_intent",
+      "findings": [
+        {
+          "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+          "subject_id": "FR-1",
+          "message": "Review failed for 'FR-1'; repeat review after remediation.",
+          "evidence_refs": [
+            "readable-cto-blocked-qa"
+          ]
+        },
+        {
+          "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+          "subject_id": "FR-1",
+          "message": "Executed tests failed for 'FR-1'.",
+          "evidence_refs": [
+            "readable-cto-blocked-runtime-record"
+          ]
+        },
+        {
+          "code": "SPEC_IMPLEMENTATION_INTENT_CHANGED",
+          "subject_id": "FR-1",
+          "message": "The approved handoff lacks a deterministic observable oracle for FR-1: it defines no concrete runtime command, input, output, exit status, or success condition. No focused runtime command was executable honestly; the result is blocked rather than fabricated as passing.",
+          "evidence_refs": [
+            "readable-cto-blocked-qa"
+          ]
+        }
+      ]
+    },
+    {
+      "entry_id": "closure.831814cf042323f928495e987bf94e915e65a6932810188f18991272cd4a2974",
+      "subject_kind": "acceptance_scenario",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "observable_behavior": true,
+      "implementation_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-blocked-implementation",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-implementation.json",
+          "sha256": "aefe344902949ce763d9db868fba8e7d5e7b5ea6d8662c0dbe34136139966ddf",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "review_verdict": "fail",
+      "review_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-blocked-qa",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-qa.json",
+          "sha256": "851d4ce0135b45d69e9598351f3c94663461a270fd5705d81ad0fcbba8124f85",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "test_evidence": [
+        {
+          "evidence_ref": {
+            "artifact_id": "readable-cto-blocked-runtime-record",
+            "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-runtime-record.json",
+            "sha256": "449719669c9044f1c330b66e008e35d222289c9b2a68e19cda6ed83fe1c15233",
+            "schema_status": "met",
+            "quality_gate_status": "met"
+          },
+          "test_kind": "runtime",
+          "status": "fail",
+          "executed_at": "2026-09-04T23:55:41.257483000Z"
+        }
+      ],
+      "status": "changed_intent",
+      "findings": [
+        {
+          "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+          "subject_id": "AC-1",
+          "message": "Review failed for 'AC-1'; repeat review after remediation.",
+          "evidence_refs": [
+            "readable-cto-blocked-qa"
+          ]
+        },
+        {
+          "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+          "subject_id": "AC-1",
+          "message": "Executed tests failed for 'AC-1'.",
+          "evidence_refs": [
+            "readable-cto-blocked-runtime-record"
+          ]
+        },
+        {
+          "code": "SPEC_IMPLEMENTATION_INTENT_CHANGED",
+          "subject_id": "AC-1",
+          "message": "The approved handoff lacks a deterministic observable oracle for AC-1: it specifies no concrete input, output, exit status, runtime command, or acceptance behavior, and src/blocked/** is absent. No focused runtime command was executable honestly; the result is blocked rather than fabricated as passing.",
+          "evidence_refs": [
+            "readable-cto-blocked-qa"
+          ]
+        }
+      ]
+    }
+  ],
+  "quality_gate_results": [
+    {
+      "gate_id": "cto-handoff-constitution-binding.readable-cto-blocked.handoff.v1",
+      "source": "project_constitution",
+      "status": "pass",
+      "evidence_refs": [],
+      "findings": []
+    }
+  ],
+  "overall_status": "changed_intent",
+  "blocking_findings": [
+    {
+      "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+      "subject_id": "FR-1",
+      "message": "Review failed for 'FR-1'; repeat review after remediation.",
+      "evidence_refs": [
+        "readable-cto-blocked-qa"
+      ]
+    },
+    {
+      "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+      "subject_id": "FR-1",
+      "message": "Executed tests failed for 'FR-1'.",
+      "evidence_refs": [
+        "readable-cto-blocked-runtime-record"
+      ]
+    },
+    {
+      "code": "SPEC_IMPLEMENTATION_INTENT_CHANGED",
+      "subject_id": "FR-1",
+      "message": "The approved handoff lacks a deterministic observable oracle for FR-1: it defines no concrete runtime command, input, output, exit status, or success condition. No focused runtime command was executable honestly; the result is blocked rather than fabricated as passing.",
+      "evidence_refs": [
+        "readable-cto-blocked-qa"
+      ]
+    },
+    {
+      "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+      "subject_id": "AC-1",
+      "message": "Review failed for 'AC-1'; repeat review after remediation.",
+      "evidence_refs": [
+        "readable-cto-blocked-qa"
+      ]
+    },
+    {
+      "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+      "subject_id": "AC-1",
+      "message": "Executed tests failed for 'AC-1'.",
+      "evidence_refs": [
+        "readable-cto-blocked-runtime-record"
+      ]
+    },
+    {
+      "code": "SPEC_IMPLEMENTATION_INTENT_CHANGED",
+      "subject_id": "AC-1",
+      "message": "The approved handoff lacks a deterministic observable oracle for AC-1: it specifies no concrete input, output, exit status, runtime command, or acceptance behavior, and src/blocked/** is absent. No focused runtime command was executable honestly; the result is blocked rather than fabricated as passing.",
+      "evidence_refs": [
+        "readable-cto-blocked-qa"
+      ]
+    }
+  ],
+  "next_action": "revise_specification",
+  "conformance_id": "implementation-conformance.337855b3d42d03f694fd1c196bd14e12099163847a515931a34cfc13455b2645",
+  "matrix_digest": "337855b3d42d03f694fd1c196bd14e12099163847a515931a34cfc13455b2645",
+  "evaluated_at": "2026-09-05T00:08:01.205Z"
+}

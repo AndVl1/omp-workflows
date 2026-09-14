@@ -1,0 +1,21 @@
+{
+  "label": "specification-command",
+  "command": "node --test --import tsx --test-concurrency=1 test/specification-command.test.ts",
+  "cwd": "packages/core",
+  "started_at_utc": "2026-09-11T20:02:36.246Z",
+  "ended_at_utc": "2026-09-11T20:03:44.714Z",
+  "duration_ms": 68466,
+  "exit_code": 1,
+  "sha256": "3d62006cc1086cf179067470aa01fd54f356dd6299eba8bec100b5ea9a0d66aa",
+  "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/focused-specification-command.clean.log",
+  "counts": {
+    "log_bytes": 6217,
+    "log_lines": 77,
+    "tests": 50,
+    "passed": 49,
+    "failed": 1,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0
+  }
+}

@@ -8,7 +8,11 @@ Default fullstack bundle for `@andvl1/omp-workflows-core`. Ships 16 specialized 
 npm install @andvl1/omp-workflows-fullstack @andvl1/omp-workflows-core
 ```
 
-The extension registers `/do-work`, `/team`, and `/cto` directly during plugin loading, so they appear in slash autocomplete and execute from the installed package without a project-local copy. The copy command remains available for disk-discovery runtimes and explicit bootstrap:
+The extension registers `/do-work`, `/team`, `/cto`, and
+`/omp-model-roles` directly during plugin loading, so they appear in slash
+autocomplete and execute from the installed package without a project-local
+copy. The copy command remains available only for explicitly requested legacy
+disk-discovery compatibility and install-time bootstrap:
 
 ```bash
 npm run --prefix node_modules/@andvl1/omp-workflows-fullstack copy-commands
@@ -16,22 +20,119 @@ npm run --prefix node_modules/@andvl1/omp-workflows-fullstack copy-commands
 npx omp-workflows-copy-commands
 ```
 
-On `omp plugin install`, `session_start` performs a SHA-256-aware compatibility sync into `.omp/commands/`. It updates files that still match the previous shipped hash and preserves user edits. The manifest is `.omp/commands/.omp-shipped.json` (schema 2).
+`session_start` does not copy or load project-local compatibility command
+assets. This avoids resolving the fullstack core peer from an arbitrary
+consumer worktree; the hardened copier remains an explicit manual
+compatibility/bootstrap path and records `.omp/commands/.omp-shipped.json`
+(schema 2).
+
+The explicit installer is also the cooperative fullstack opt-in: after a
+successful copy it writes `.omp/fullstack.activation.json` with the canonical
+bundle marker. Run it against the intended project root before loading the
+extension when that project is being enabled; it never installs globally, and
+ordinary dependency installation, extension loading, or `session_start` does
+not create or repair that file. A pre-existing differing, malformed, symlinked,
+or wrong-kind marker is preserved and fails closed. The marker is a
+project-local routing signal, not a cryptographic signature or
+package-authenticity proof.
+
+## Custom escalation adapters
+
+Consumers implement channels per project through the narrow public subpath;
+the dispatcher, queue, bridge, and raw registry helpers remain runtime
+internals. A custom adapter extension owns its own project-local physical
+marker and activation owner; it does not borrow fullstack runtime authority:
+
+```ts
+import {
+  beginRegistryRegistration,
+  closeWorkflowActivation,
+  commitRegistryRegistration,
+  openWorkflowActivation,
+  rollbackRegistryRegistration,
+  type WorkflowOwnerIdentity,
+} from "@andvl1/omp-workflows-core/registry";
+import {
+  registerEscalationAdapter,
+  type EscalationAdapterCapabilities,
+  type EscalationAdapterFactory,
+} from "@andvl1/omp-workflows-fullstack/adapters";
+
+// customOwnerForProjectRoot requires this extension's exact physical marker,
+// for example .omp/my-channel.activation.json. Its marker is cooperative
+// project intent, not cryptographic proof of package authorship.
+const owner: WorkflowOwnerIdentity = customOwnerForProjectRoot(projectRoot);
+const activation = openWorkflowActivation(projectRoot, ["workflow_registration"], owner);
+if (!activation.ok) throw new Error("activation failed");
+const transaction = beginRegistryRegistration(activation.registry_context, projectRoot, ["escalation_adapters"]);
+if (!transaction.ok) {
+  closeWorkflowActivation(activation);
+  throw new Error("registration transaction failed");
+}
+try {
+  const factory: EscalationAdapterFactory = (config, cwd, pinnedRoot) => createMyChannel(config, cwd, pinnedRoot);
+  const capabilities: EscalationAdapterCapabilities = { canReceiveInbound: true, canSend: true, canSendWithIdempotency: true };
+  registerEscalationAdapter(transaction.token, "my-channel", factory, capabilities);
+  commitRegistryRegistration(transaction.token);
+} catch (error) {
+  try { rollbackRegistryRegistration(transaction.token); } catch { /* preserve original */ }
+  closeWorkflowActivation(activation);
+  throw error;
+}
+// Retain this activation in plugin-local state keyed by extension + canonical
+// root. The adapter registry keeps a token-derived live guard after commit.
+// On matching session_shutdown, delete the slot and call closeWorkflowActivation.
+```
+
+`registerEscalationAdapter` accepts only the opaque token borrowed from the
+core transaction. Do not construct a token, use an owner id/marker string, or
+retain the token after commit/rollback. `closeWorkflowActivation` is not called
+after a successful commit; it closes the retained activation on the matching
+session/root shutdown. Do not create a process-global owner map or claim. The
+custom owner, marker, and canonical project root must match exactly. Because the
+host exposes no source identity, an in-process extension could copy a descriptor
+or read the marker, so docs must not claim cryptographic authorship.
+
+The adapter factory receives validated project configuration, the project cwd,
+and a pinned root. Implement core's `EscalationAdapter` (`kind`, `send`,
+`cancel`, plus any declared inbound/idempotency methods). Inbound answers are
+persisted as canonical files below `.work-state/cto/<runId>/answers/` through
+the stable pinned root; they are not returned through the adapter API. `send`
+receives already sanitized data and returns `{ sent: false }` on transport
+failure so the dispatcher can retry.
 
 ## What it does
 
-`@andvl1/omp-workflows-fullstack` composes three separate core seams with one
-fullstack owner identity:
+`/omp-workflows-fullstack` composes three separate core seams with one fullstack owner identity. The mount is activation-bound and project-local; no ownership is inferred from package loading:
 
-1. `registerTeamWorkflow(...)` — gates, observability, and seed-if-absent
-   runtime configuration;
-2. `createWorkflowToolAdapter(...).register(pi)` — the `workflow_*` tools and
-   live agent-mapping handoff;
-3. `registerWorkflowCommands(pi)` — `/do-work`, `/team`, and `/cto`.
+```ts
+// owner includes the exact physical project marker and canonical-root provenance.
+const owner = fullstackOwnerForCwd(projectRoot);
+const resolveCwd = resolveSessionCwd;
 
-Calling `registerTeamWorkflow` alone does **not** publish the slash commands or
-the workflow tool adapter. A custom bundle must wire all three layers; see
-[`../../docs/adding-agents.md`](../../docs/adding-agents.md#4-регистрация-workflow).
+// Commands receive the same owner/resolver and are safe to publish eagerly.
+registerWorkflowCommands(pi, { resolveCwd, owner });
+
+const activation = openWorkflowActivation(projectRoot, ["workflow_registration", "workflow_tools", "config_writer"], owner);
+if (!activation.ok) throw new Error("activation marker/root validation failed");
+const transaction = beginRegistryRegistration(activation.registry_context, projectRoot, ["workflow_profiles", "constitution_gate", "runtime_config", "workflow_tools"]);
+if (!transaction.ok) {
+  closeWorkflowActivation(activation);
+  throw new Error("workflow registration transaction failed");
+}
+try {
+  registerTeamWorkflow(pi, { label: "omp-workflows-fullstack", roles: fullstackPreset.roles, scopeMap: fullstackPreset.scopeMap, flags: fullstackPreset.flags, resolveCwd, owner, cwd: projectRoot, registrationToken: transaction.token });
+  createWorkflowToolAdapter({ resolveCwd, owner, registrationToken: transaction.token }).register(pi);
+  commitRegistryRegistration(transaction.token);
+  // Retain activation in extension/session state; close it only on matching shutdown.
+} catch (error) {
+  try { rollbackRegistryRegistration(transaction.token); } catch { /* preserve original */ }
+  closeWorkflowActivation(activation);
+  throw error;
+}
+```
+
+A successful activation remains open because the registered runtime may retain a token-derived live guard. On the exact session/root shutdown, remove the activation from plugin-local state and call `closeWorkflowActivation`; do not create a process-global owner map. Failed begin/register/commit paths roll back and close immediately. A custom bundle must wire all three layers; see [`../../docs/adding-agents.md`](../../docs/adding-agents.md#4-регистрация-workflow).
 
 The command handlers resolve and authorize the session cwd, generate a prompt,
 and pass it to `pi.sendUserMessage(...)`. They do not spawn subagents directly.
@@ -59,6 +160,50 @@ discover custom-TS files from disk; same-name project files are not an override
 API.
 
 The `agents/` and `skills/` directories are picked up by OMP's discovery automatically.
+
+## Readable specification workflow
+
+Fullstack wires the core's native, readable specification workflow at version **0.27.0**. During extension assembly it registers the shipped document renderers, validates the shipped constitution-first template set, registers the native constitution provider, and primes the shipped format recognizers. This setup is idempotent and additive; it does not create a second state machine or command path.
+
+### Commands and authority boundaries
+
+The direct commands are available from the installed extension, in addition to `/do-work`, `/team`, and `/cto`:
+
+```text
+/specify [--feature <feature-id>] <request>
+/spec-plan --feature <feature-id>
+/spec-tasks --feature <feature-id>
+/spec-import <path> [--framework <id|generic>] [--feature <feature-id>]
+```
+
+For example:
+
+```text
+/specify --feature account-recovery Add account recovery with email verification
+/spec-plan --feature account-recovery
+/spec-tasks --feature account-recovery
+/do-work --spec account-recovery Implement task T-1 from the approved handoff
+```
+
+Specify → Plan → Tasks is a constitution-first sequence. Each phase produces a typed immutable artifact and pauses for a trusted human decision: `approve_continue`, `request_changes`, or `approve_stop`. Approval advances or stops specification preparation only; it never dispatches implementation. `/do-work` adaptively chooses quick, bounded Specify, or full specification preparation, then uses an exclusive handoff claim and conformance evidence before execution. `/cto <task>` is the resident main-session CTO; `/cto` enters standby, and `task(agent=cto)` is never used.
+
+Readable phase projections are under `specs/<feature-id>/`; authoritative state is `.work-state/features/<feature-id>/state.json`, with versioned artifacts below the feature's `artifacts/` directory. A safe explicit feature id and durable run key are the identity; branch names and `.active-feature` never select or replace a workspace. The retired `dod_and_artifacts/CompletionDodStatus/dod_status` path and old JSON-only specification flow are not supported.
+
+### Registration seams and generic fallback
+
+Fullstack primes these format recognizers in deterministic order: `speckit`, `openspec`, `bmad`, `superpowers`, `xpowers`, then `generic`. A named framework is selected only when its recognizer claims the bounded local sources. The final `generic` recognizer maps readable requirements/specification, plan/design, and tasks documents without framework markers. It is the fallback for `--framework generic`; competing claims or competing generic document sets fail closed and require an explicit selector.
+
+The constitution/provider boundary is also explicit. The native provider contributes the shipped bootstrap template; a consumer may register a provider with `registerConstitutionProvider(...)` to discover an existing safe project-local policy. Provider resolution is explicit override → one discovered provider → native default. A provider is discovery-only: it reads bounded regular files and does not install, invoke, or shell out to a framework CLI. Likewise, recognizers and `/spec-import` inspect one authorized local path read-only, capture a snapshot/hash, and perform no network access, external command execution, or source writes. Custom bundles can add recognizers with `registerFormatRecognizer(...)`; they must preserve fail-closed ambiguity and path-boundary checks.
+
+Template and language selections are persisted with each phase: language precedence is feature override → project default → request language; template precedence is feature override → project default → shipped default. An invalid higher-precedence template does not fall through. Changing either selection stales affected approvals and requires revalidation. Legacy JSON migration is one-way and read-only, requires explicit safe identity plus a compatible Specify/Plan/Tasks state and constitution binding, and writes a migration receipt; incompatible input returns `SPEC_MIGRATION_BLOCKED` with diagnostics instead of guessing.
+
+### CTO multi-feature preparation and execution
+
+CTO preparation may schedule independent features concurrently, but keeps one writer per feature/phase and records queue reasons: `capacity`, `depth`, `ownership`, `active_phase`, `same_feature_serialized`, and `nested_cto`. Nested CTO requests queue behind the resident CTO. Decisions are independent per feature and phase; `request_changes` reopens that phase, while `approve_stop` stops that feature at its boundary. After Tasks approval, CTO emits the review packet and takes a final hard stop: preparation never starts implementation.
+
+A separate execution step preflights explicit feature/run selectors and freezes exact handoff digests into one mapping. Dispatch requires trusted human confirmation of the exact mapping id and hash; approval is not execution authority. Safe slicing gives each task one owner, records dependencies and serializes shared contracts, while only independent slices run in parallel. Conformance is evaluated per feature and handoff: passing features release their claims; blocked features retain claims and receive feature-local remediation. Evidence cannot be borrowed across handoffs.
+
+The most useful recovery signals are actionable: `SPEC_ARGUMENT_INVALID` or `SPEC_SELECTOR_AMBIGUOUS` means correct the command grammar; `SPEC_SELECTOR_REQUIRED` or `SPEC_PATH_UNAUTHORIZED` means provide a safe explicit selector/local path; `SPEC_CONSTITUTION_SOURCE_AMBIGUOUS` or `SPEC_STATE_INVALID` means resolve the competing or malformed source and rerun; `SPEC_TEMPLATE_*` or `SPEC_LANGUAGE_UNRESOLVED` means fix presentation configuration and revalidate; `SPEC_HANDOFF_INCOMPLETE` or `SPEC_HANDOFF_STALE` means follow the returned direct phase command; and `SPEC_EXECUTION_CLAIMED` means wait for the current owner rather than taking over. Durable state, hashes, trusted proofs, claims, and mapping bindings remain authoritative.
 
 ## URL-first lecture research
 
@@ -111,7 +256,7 @@ A `.omp/lecture-research.json` with a top-level `"pipeline"` block selects `tran
 ```
 The native ASR branch posts to the model-specific, validated `https://openrouter.ai/api/v1/audio/transcriptions` route with the exact `{ model, input_audio: { data: <raw-base64>, format: "wav" } }` shape and consumes the direct `{ text, usage? }` response. Analysis remains on the existing `https://openrouter.ai/api/v1/chat/completions` transport. The model is pinned exactly to `nvidia/nemotron-3.5-asr-streaming-multilingual-0.6b`; the model-specific endpoints API is the source of truth for live QA, and generic catalog omission is not a product error. Keys are resolved from the configured environment-variable name immediately before use and are never written to errors or artifacts.
 
-Prepared normalized PCM WAV leases that fit the conservative encoded envelope retain the exact one-fetch fast path. Larger leases are read once as RIFF/WAVE PCM s16le mono 16-kHz data and sent as bounded sequential chunks (`concurrency=1`) with zero overlap, no retries, and no temporary chunk files. Every chunk body is checked as UTF-8 JSON against `maxRequestBytes` (default 32 MiB, hard cap 64 MiB); each synthesized WAV has a canonical 44-byte header. A chunk error, cancellation, malformed/truncated input, request/cost/response/transcript bound, or final global validation failure discards the complete single-source transcript and produces no partial evidence. `maxChunksPerSource` remains the independent analysis-chunk limit and also caps ASR requests only when OpenRouter chunk mode is selected; it is not silently conflated with transcript segment counts.
+Prepared normalized PCM WAV leases that fit the conservative encoded envelope retain the exact one-fetch fast path. Larger leases are read once as RIFF/WAVE PCM s16le mono 16-kHz data and sent as bounded sequential chunks (`concurrency=1`) with zero overlap, no retries, and no temporary chunk files. Every chunk body is checked as UTF-8 JSON against `maxRequestBytes` (default 32 MiB, hard cap 64 MiB); each synthesized WAV has a canonical 44-byte header. A chunk error, cancellation, malformed/truncated input, request/cost/response/transcript bound, or final global validation failure discards the complete single-source transcript and produces no partial evidence. `maxChunksPerSource` remains the independent analysis-chunk limit and also caps ASR requests only when chunk mode is selected; neither limit is silently reused as a transcript-segment count.
 
 `chunkDurationSeconds` defaults to 45 and accepts integers 1..60. `chunkTimeoutMs` defaults to 60000 and accepts integers 1..120000. The existing `maxAudioBytes` lease cap remains a total-source bound; the default 64 MiB must be raised explicitly (never above the 256 MiB hard cap) for long normalized WAVs. Global estimated timestamps are frame-derived and disclosed as `timestampMode: "estimated"` for the direct text response; the native STT contract does not assume provider timecodes. The supplied 1:09:42 target is 4,182 seconds, so `ceil(4182 / 45) = 93` sequential requests, below the default 128-request cap; its normalized mono 16-kHz PCM lease is roughly 134 MiB, so it requires an explicit audio lease cap increase while still holding only one request-safe chunk in memory.
 
@@ -143,7 +288,13 @@ Provider comparisons use the dependency-light API at `@andvl1/omp-workflows-full
 | `/omp-model-roles` | Validate model-role configuration or delegate recommendations. |
 | `/session-report [do-work|cto] [id=<id>] [--full]` | Generate a self-contained offline HTML snapshot of one workflow session. |
 
-The three workflow entry points are registered directly; `/init-team`, `/interview`, `/omp-model-roles`, and `/session-report` remain custom-TS modules copied into project-local `.omp/commands/`. Most commands return prompts and do not dispatch subagents directly. `/session-report` is deterministic: it reads persisted state/artifacts, renders HTML, and writes only under `.work-state`.
+The workflow entry points and `/omp-model-roles` are registered directly by
+the extension. `/init-team`, `/interview`, and `/session-report` remain
+available through the explicit legacy copier when a disk-discovery runtime is
+required; `session_start` never materializes project-local command files on
+supported OMP hosts. Most commands return prompts and do not dispatch
+subagents directly. `/session-report` is deterministic: it reads persisted
+state/artifacts, renders HTML, and writes only under `.work-state`.
 
 ## Model roles
 
@@ -151,7 +302,7 @@ Each agent class has a first-choice role followed by a standard fallback in fron
 
 | Роль | Агенты | Фоллбэк | Пример конфига |
 | --- | --- | --- | --- |
-| `architect` | `architect` | `@slow` | `architect: anthropic/claude-opus-4-6` |
+| `architect` | `architect` | `@slow` | `architect: anthropic/claude-opus-4-6:high` |
 | `reviewer` | `code-reviewer` | `@slow` | `reviewer: openai/gpt-5.4` |
 | `security` | `security-tester` | `@slow` | `security: anthropic/claude-sonnet-4-6` |
 | `researcher` | `tech-researcher`, `discovery` | `@smol` | `researcher: google/gemini-2.5-flash` |
@@ -162,8 +313,7 @@ Each agent class has a first-choice role followed by a standard fallback in fron
 | `developer-mobile` | `developer-mobile`, `init-mobile` | `@task` | `developer-mobile: anthropic/claude-sonnet-4-6` |
 | `devops` | `devops` | `@task` | `devops: openai/gpt-5.3-codex` |
 | `diagnostics` | `diagnostics` | `@task` | `diagnostics: anthropic/claude-sonnet-4-6` |
-| `qa` | `qa` | `@task` | `qa: openai/gpt-5-mini` |
-| `manual-qa` | `manual-qa` | `@task` | `manual-qa: anthropic/claude-sonnet-4-6` |
+| `manual-qa` | `manual-qa` | `@task` | `manual-qa: openai/gpt-5-mini` |
 
 ## Конфигурация моделей ролей
 

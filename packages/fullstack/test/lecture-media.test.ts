@@ -1,4 +1,4 @@
-import { createReadStream } from "node:fs";
+import { createReadStream, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { test } from "node:test";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable } from "node:stream";
@@ -762,6 +762,46 @@ test("TERM-immune authorized command escalates once to SIGKILL and settles withi
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     process.removeListener("warning", onWarning);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("existing-input streams from one owned no-follow descriptor", { concurrency: false }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-media-fd-"));
+  const input = join(directory, "owned-audio.fixture");
+  let descriptor: number | undefined;
+  const readStreamFactory = ((path: string, options?: Parameters<typeof createReadStream>[1]) => {
+    descriptor = typeof options?.fd === "number" ? options.fd : undefined;
+    return createReadStream(path, options);
+  }) as typeof createReadStream;
+  try {
+    await writeFile(input, new Uint8Array([1, 2, 3, 4]));
+    const audio = await new AuthorizedAudioAcquirer({ provider: "existing-input", inputPath: input, maxBytes: 32, timeoutMs: 1_000, tempDirectory: directory, readStreamFactory }).acquire(source, request, new AbortController().signal);
+    assert.equal(typeof descriptor, "number");
+    await audio.dispose();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("existing-input rejects symlink and path replacement without reading the replacement", { concurrency: false }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-media-identity-"));
+  const target = join(directory, "owned-audio.target");
+  const symlink = join(directory, "owned-audio.link");
+  try {
+    await writeFile(target, new Uint8Array([1, 2, 3, 4]));
+    symlinkSync(target, symlink);
+    const noFollow = new AuthorizedAudioAcquirer({ provider: "existing-input", inputPath: symlink, maxBytes: 32, timeoutMs: 1_000, tempDirectory: directory });
+    await assert.rejects(() => noFollow.acquire(source, request, new AbortController().signal), (error: unknown) => error instanceof AcquisitionProviderError && error.code === "MEDIA_NOT_ACCESSIBLE");
+
+    const readStreamFactory = ((path: string, options?: Parameters<typeof createReadStream>[1]) => {
+      renameSync(path, `${path}.original`);
+      writeFileSync(path, new Uint8Array([8, 8, 8, 8]));
+      return createReadStream(path, options);
+    }) as typeof createReadStream;
+    const swapped = new AuthorizedAudioAcquirer({ provider: "existing-input", inputPath: target, maxBytes: 32, timeoutMs: 1_000, tempDirectory: directory, readStreamFactory });
+    await assert.rejects(() => swapped.acquire(source, request, new AbortController().signal), (error: unknown) => error instanceof AcquisitionProviderError && error.code === "MEDIA_NOT_ACCESSIBLE");
+  } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });

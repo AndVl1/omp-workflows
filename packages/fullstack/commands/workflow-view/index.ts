@@ -47,7 +47,7 @@ import {
   isSafePathKey,
   listSessions,
   preflightLinks,
-  publishVisualize,
+  publishVisualizePinned,
   renderHubHtml,
   renderHubMarkdown,
   renderSessionHtml,
@@ -60,6 +60,7 @@ import {
   type VisualizationSession,
   type VisualizationSnapshot,
 } from "@andvl1/omp-workflows-core";
+import { PinnedProjectRoot } from "@andvl1/omp-workflows-core";
 
 /** Selector kinds understood by the command (frozen grammar). */
 export type WorkflowViewKind = "do-work" | "cto" | "legacy";
@@ -154,10 +155,18 @@ function matchesKind(kind: WorkflowViewKind, entry: SessionSourceEntry): boolean
   if (kind === "legacy") return entry.kind === "do-work" && entry.isLegacy;
   return entry.kind === "do-work";
 }
+/** Discoverable sessions as bounded, single-line safe labels (E-2). */
+function displaySessionId(id: string): string {
+  if (isSafePathKey(id)) return id;
+  const escaped = JSON.stringify(id)
+    .replace(/[\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu, (value) =>
+      `\\u${value.codePointAt(0)!.toString(16).padStart(4, "0")}`,
+    );
+  return escaped.length <= 160 ? escaped : `${escaped.slice(0, 159)}…`;
+}
 
-/** Discoverable sessions as safe `kind/id` labels (E-2 error listing). */
 function discoverableLabels(entries: readonly SessionSourceEntry[]): string {
-  return entries.map((e) => `${displayKindOf(e)}/${e.id}`).join(", ");
+  return entries.map((e) => `${displayKindOf(e)}/${displaySessionId(e.id)}`).join(", ");
 }
 
 interface Selection {
@@ -176,24 +185,41 @@ interface Selection {
 export function selectWorkflowSessions(entries: SessionSourceEntry[], selector: WorkflowViewSelector): Selection {
   const applyKind = (list: SessionSourceEntry[]): SessionSourceEntry[] =>
     selector.kind === undefined ? list : list.filter((e) => matchesKind(selector.kind!, e));
-
-  if (selector.all !== undefined) {
-    return { entries: applyKind(entries), scope: "all" };
-  }
   if (selector.id !== undefined) {
+    const shownId = displaySessionId(selector.id);
+    // `legacy` is a reserved selector for the legacy root. It must never
+    // alias a feature with the same literal slug, even when the root is
+    // absent or a kind filter excludes the root.
+    if (selector.id === "legacy") {
+      const root = entries.find((e) =>
+        e.id === "legacy"
+        && e.kind === "do-work"
+        && e.isLegacy
+        && (selector.kind === undefined || matchesKind(selector.kind, e)),
+      );
+      if (root !== undefined) return { entries: [root], scope: "selected" };
+      const kindPart = selector.kind === undefined ? "" : ` (kind ${selector.kind})`;
+      const listed = entries.length > 0 ? `; discoverable sessions: ${discoverableLabels(entries)}` : "";
+      return {
+        entries: [],
+        scope: "selected",
+        error: `session not found: ${shownId}${kindPart}${listed}`,
+      };
+    }
     const matches = entries.filter((e) => e.id === selector.id && (selector.kind === undefined || matchesKind(selector.kind, e)));
     if (matches.length === 0) {
       const kindPart = selector.kind === undefined ? "" : ` (kind ${selector.kind})`;
       const listed = entries.length > 0 ? `; discoverable sessions: ${discoverableLabels(entries)}` : "";
-      return { entries: [], scope: "selected", error: `session not found: ${selector.id}${kindPart}${listed}` };
-    }
-    // id=legacy is reserved for the legacy root (report selector parity);
-    // the degraded feature literally named "legacy" never shadows it.
-    if (selector.id === "legacy") {
-      const root = matches.find((e) => e.kind === "do-work" && e.isLegacy);
-      if (root !== undefined) return { entries: [root], scope: "selected" };
+      return { entries: [], scope: "selected", error: `session not found: ${shownId}${kindPart}${listed}` };
     }
     return { entries: matches.slice(0, 1), scope: "selected" };
+  }
+  if (selector.all) {
+    const matches = applyKind(entries);
+    if (matches.length === 0 && selector.kind !== undefined) {
+      return { entries: [], scope: "all", error: `no ${selector.kind} session found under .work-state` };
+    }
+    return { entries: matches, scope: "all" };
   }
   if (selector.kind !== undefined) {
     const matches = applyKind(entries);
@@ -243,82 +269,84 @@ const factory = (api: CustomCommandAPI): CustomCommand => ({
 
     const parsed = parseWorkflowViewArgs(args);
     if (parsed.error) return `ERROR: ${parsed.error}\n\n${USAGE}`;
-
-    const discovered = listSessions(cwd);
-    const selection = selectWorkflowSessions(discovered, parsed.selector);
-    if (selection.error) return `ERROR: ${selection.error}\n\n${USAGE}`;
-    if (selection.entries.length === 0) {
-      return "ERROR: no workflow sessions found under .work-state (nothing to visualize)\n\n" + USAGE;
-    }
-
-    const generatedAt = new Date().toISOString();
+    const pin = PinnedProjectRoot.open(cwd);
+    if (!pin) return "ERROR: project root cannot be pinned for workflow view.\n\n" + USAGE;
+    let discovered: SessionSourceEntry[];
+    let selection: Selection;
     let sessions: VisualizationSession[];
+    const generatedAt = new Date().toISOString();
     try {
-      sessions = buildSessionSnapshots(cwd, selection.entries, generatedAt, { generatedAt, full: parsed.options.full });
+      discovered = listSessions(cwd, pin);
+      selection = selectWorkflowSessions(discovered, parsed.selector);
+      if (selection.error) return `ERROR: ${selection.error}\n\n${USAGE}`;
+      if (selection.entries.length === 0) {
+        return "ERROR: no workflow sessions found under .work-state (nothing to visualize)\n\n" + USAGE;
+      }
+      sessions = buildSessionSnapshots(cwd, selection.entries, generatedAt, { generatedAt, full: parsed.options.full, pinnedRoot: pin });
+      if (sessions.length === 0) {
+        return "ERROR: no workflow sessions found under .work-state (nothing to visualize)\n\n" + USAGE;
+      }
+
+      // F2: in selected/latest scope the hub metadata must report the TOTAL
+      // discovered count (not the number of selected entries) so the bundle is
+      // honestly partial; generatedSessions stays the selected count. --all
+      // generates every discovered session in scope, so discovered == generated
+      // there and selection.entries.length remains the correct value.
+      const manifest = buildManifest(sessions, selection.scope, {
+        generatedAt,
+        discoveredSessions: selection.scope === "all" ? selection.entries.length : discovered.length,
+      });
+      const snapshot: VisualizationSnapshot = {
+        schema: 1,
+        scope: selection.scope,
+        generatedAt,
+        renderer: DEFAULT_RENDERER_IDENTITY,
+        sessions,
+        manifest,
+        warnings: [],
+      };
+
+      const hubMarkdown = renderHubMarkdown(snapshot);
+      const hubHtml = renderHubHtml(snapshot);
+      const files: VisualizeBundleFile[] = [
+        { relPath: VISUALIZE_OUTPUT_FILES.hubMarkdown, content: hubMarkdown },
+        { relPath: VISUALIZE_OUTPUT_FILES.hubHtml, content: hubHtml },
+        { relPath: VISUALIZE_OUTPUT_FILES.manifest, content: `${JSON.stringify(manifest, null, 2)}\n` },
+      ];
+      const htmlPages: Record<string, string> = { [VISUALIZE_OUTPUT_FILES.hubHtml]: hubHtml };
+      for (const session of sessions) {
+        const mdPath = sessionPagePath(session.identity.kind, session.identity.pathKey, "md");
+        const htmlPath = sessionPagePath(session.identity.kind, session.identity.pathKey, "html");
+        const md = renderSessionMarkdown(session, { full: parsed.options.full });
+        const html = renderSessionHtml(session, { scope: selection.scope });
+        files.push({ relPath: mdPath, content: md }, { relPath: htmlPath, content: html });
+        htmlPages[htmlPath] = html;
+      }
+
+      // Fresh-output link gate: zero dead internal links before any write.
+      const preflight = preflightLinks(htmlPages);
+      if (preflight.deadLinks.length > 0) {
+        return `ERROR: workflow view link preflight failed (${preflight.deadLinks.length} dead link(s)); nothing written.`;
+      }
+
+      let result: VisualizePublishResult;
+      try {
+        result = publishVisualizePinned(cwd, files, pin);
+      } catch (err) {
+        const message = err instanceof VisualizePublishError ? err.message : "publish failed";
+        return `ERROR: could not write workflow view: ${message}`;
+      }
+
+      ctx.ui?.notify?.(
+        `workflow-view: ${selection.scope === "all" ? "all" : "selected/latest"} — ${sessions.length} session(s) → ${VISUALIZE_OUTPUT_ROOT}`,
+        "info",
+      );
+      return formatWorkflowViewStatus(snapshot, result);
     } catch {
-      // Snapshot building degrades per session by contract; an unexpected
-      // whole-build throw is surfaced as a category-only error (never raw).
       return "ERROR: could not build the workflow view: unexpected build failure\n\n" + USAGE;
+    } finally {
+      pin.close();
     }
-    if (sessions.length === 0) {
-      return "ERROR: no workflow sessions found under .work-state (nothing to visualize)\n\n" + USAGE;
-    }
-
-    // F2: in selected/latest scope the hub metadata must report the TOTAL
-    // discovered count (not the number of selected entries) so the bundle is
-    // honestly partial; generatedSessions stays the selected count. --all
-    // generates every discovered session in scope, so discovered == generated
-    // there and selection.entries.length remains the correct value.
-    const manifest = buildManifest(sessions, selection.scope, {
-      generatedAt,
-      discoveredSessions: selection.scope === "all" ? selection.entries.length : discovered.length,
-    });
-    const snapshot: VisualizationSnapshot = {
-      schema: 1,
-      scope: selection.scope,
-      generatedAt,
-      renderer: DEFAULT_RENDERER_IDENTITY,
-      sessions,
-      manifest,
-      warnings: [],
-    };
-
-    const hubMarkdown = renderHubMarkdown(snapshot);
-    const hubHtml = renderHubHtml(snapshot);
-    const files: VisualizeBundleFile[] = [
-      { relPath: VISUALIZE_OUTPUT_FILES.hubMarkdown, content: hubMarkdown },
-      { relPath: VISUALIZE_OUTPUT_FILES.hubHtml, content: hubHtml },
-      { relPath: VISUALIZE_OUTPUT_FILES.manifest, content: `${JSON.stringify(manifest, null, 2)}\n` },
-    ];
-    const htmlPages: Record<string, string> = { [VISUALIZE_OUTPUT_FILES.hubHtml]: hubHtml };
-    for (const session of sessions) {
-      const mdPath = sessionPagePath(session.identity.kind, session.identity.pathKey, "md");
-      const htmlPath = sessionPagePath(session.identity.kind, session.identity.pathKey, "html");
-      const md = renderSessionMarkdown(session, { full: parsed.options.full });
-      const html = renderSessionHtml(session, { scope: selection.scope });
-      files.push({ relPath: mdPath, content: md }, { relPath: htmlPath, content: html });
-      htmlPages[htmlPath] = html;
-    }
-
-    // Fresh-output link gate: zero dead internal links before any write.
-    const preflight = preflightLinks(htmlPages);
-    if (preflight.deadLinks.length > 0) {
-      return `ERROR: workflow view link preflight failed (${preflight.deadLinks.length} dead link(s)); nothing written.`;
-    }
-
-    let result: VisualizePublishResult;
-    try {
-      result = publishVisualize(cwd, files);
-    } catch (err) {
-      const message = err instanceof VisualizePublishError ? err.message : "publish failed";
-      return `ERROR: could not write workflow view: ${message}`;
-    }
-
-    ctx.ui?.notify?.(
-      `workflow-view: ${selection.scope === "all" ? "all" : "selected/latest"} — ${sessions.length} session(s) → ${VISUALIZE_OUTPUT_ROOT}`,
-      "info",
-    );
-    return formatWorkflowViewStatus(snapshot, result);
   },
 });
 

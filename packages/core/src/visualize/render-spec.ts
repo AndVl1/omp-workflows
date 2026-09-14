@@ -497,14 +497,14 @@ function renderStructured(artifact: VisualizationArtifact, options: RenderOption
  * match / bounded generic fallback.
  */
 export const renderSpecArtifact: ArtifactRenderer = (artifact, options: RenderOptions, _warnings: string[]): RenderNode[] => {
-  const presentation = SPEC_PRESENTATIONS[artifact.id];
+  const presentation = Object.hasOwn(SPEC_PRESENTATIONS, artifact.id) ? SPEC_PRESENTATIONS[artifact.id] : undefined;
   if (presentation === undefined) return [];
   return renderStructured(artifact, options, presentation);
 };
 
 /** Structured schema renderer for the 22 typed schema ids. */
 export const renderTypedArtifact: ArtifactRenderer = (artifact, options: RenderOptions, _warnings: string[]): RenderNode[] => {
-  const presentation = TYPED_PRESENTATIONS[artifact.id];
+  const presentation = Object.hasOwn(TYPED_PRESENTATIONS, artifact.id) ? TYPED_PRESENTATIONS[artifact.id] : undefined;
   if (presentation === undefined) return renderStructured(artifact, options, { title: humanize(artifact.id), sections: [] });
   return renderStructured(artifact, options, presentation);
 };

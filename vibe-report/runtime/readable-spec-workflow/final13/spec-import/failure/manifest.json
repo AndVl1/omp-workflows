@@ -1,0 +1,50 @@
+{
+  "feature": "spec-import",
+  "suite": "packages/e2e/test/spec-import.test.ts",
+  "command": "OMP_UX_E2E_SEMANTIC_TIMEOUT_MS=900000 OMP_UX_E2E_PRESERVE_ON_FAILURE=1 node --test --test-concurrency=1 --import tsx test/spec-import.test.ts",
+  "cwd": "packages/e2e",
+  "build_commands": [
+    "npm run build:core",
+    "npm run build:fullstack",
+    "npm run build -w @andvl1/omp-workflows-e2e"
+  ],
+  "build_status": "PASS",
+  "runtime_log": "vibe-report/runtime/readable-spec-workflow/final13/spec-import/spec-import-runtime.log",
+  "preserved_runtime_log": "vibe-report/runtime/readable-spec-workflow/final13/spec-import/failure/spec-import-runtime.log",
+  "duration_ms": 701506.467334,
+  "duration_real": "11m41.568s",
+  "exit_code": 1,
+  "tests": 19,
+  "passed": 18,
+  "failed": 1,
+  "cancelled": 0,
+  "skipped": 0,
+  "failed_test": "T061 runtime: an incomplete bundle classifies supplement-required with an actionable supplement next action",
+  "assertion": {
+    "file": "packages/e2e/test/spec-import.test.ts",
+    "line": 1392,
+    "message": "incomplete import persists only the immutable snapshot and compatibility report",
+    "actual": [
+      "compatibility_report.json",
+      "execution_claim",
+      "import_snapshot.json"
+    ],
+    "expected": [
+      "compatibility_report.json",
+      "import_snapshot.json"
+    ]
+  },
+  "scratch_parent": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw",
+  "scratch_root": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw/omp-spec-e2e-incomplete",
+  "preserved_state": "vibe-report/runtime/readable-spec-workflow/final13/spec-import/failure/state.json",
+  "preserved_artifacts": "vibe-report/runtime/readable-spec-workflow/final13/spec-import/failure/artifacts/",
+  "artifact_listing": "vibe-report/runtime/readable-spec-workflow/final13/spec-import/failure/artifact-listing.json",
+  "preserved_transcript": "vibe-report/runtime/readable-spec-workflow/final13/spec-import/failure/transcript.jsonl",
+  "preserved_scratch_metadata": "vibe-report/runtime/readable-spec-workflow/final13/spec-import/failure/scratch-parent.json",
+  "stop_log": "vibe-report/runtime/readable-spec-workflow/final13/spec-import/failure/stop.log",
+  "stop_command": "npm run e2e -- stop /var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw",
+  "stop_result": "ux-e2e stop: no session.json found — nothing to stop (session was already closed by test cleanup)",
+  "no_live_scratch_process_check": "pgrep -lf 'omp-spec-import-incomplete|omp-spec-e2e-incomplete|spec-import.test.ts' → no output (exit 1, no matching process)",
+  "capture_note": "The runtime log was tee'd from packages/e2e to the repo-relative final13 path. The failing test preserved its exact scratch parent; state, artifacts including the unexpected empty execution_claim/next directory, transcript, scratch metadata, and the full runtime log were copied before harness stop. No source or checklist files were modified.",
+  "verdict": "FAIL"
+}

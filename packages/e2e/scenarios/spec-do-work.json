@@ -1,0 +1,302 @@
+{
+  "id": "spec-do-work",
+  "title": "Specification-backed do-work execution",
+  "description": "Consumes a frozen native implementation handoff through the exact /do-work --spec selection: one exclusive claim without Specify/Plan/Tasks rediscovery, a blocked closure that retains the claim, fail-closed changed-intent routing, same-owner repair and re-evaluation, and pass-only completion bound to the conformance matrix and its readable projection.",
+  "params": {
+    "feature_id": "readable-do-work",
+    "run_key": "readable-do-work-run-001",
+    "request": "Add a deterministic project-local workflow profile override with explicit ownership",
+    "execution_task": "implement the approved handoff tasks for the workflow profile override, leaving exactly one frozen verification obligation without evidence on this first pass",
+    "intent_feedback": "Rework the shipped override so its activation behavior deliberately differs from the approved specification; keep everything else as is.",
+    "repair_feedback": "Withdraw the out-of-scope rework, restore the approved override behavior exactly, and produce the missing verification evidence for the frozen obligation left without evidence."
+  },
+  "selectors": {
+    "feature_id": "readable-do-work",
+    "run_key": "readable-do-work-run-001"
+  },
+  "workspace": {
+    "path": "specs/{{feature_id}}",
+    "state_path": ".work-state/features/{{feature_id}}/state.json",
+    "documents": [
+      "specs/{{feature_id}}/status.md",
+      "specs/{{feature_id}}/spec.md",
+      "specs/{{feature_id}}/plan.md",
+      "specs/{{feature_id}}/tasks.md"
+    ],
+    "validation": [
+      "specs/{{feature_id}}/validation/specify.md",
+      "specs/{{feature_id}}/validation/plan.md",
+      "specs/{{feature_id}}/validation/tasks.md",
+      "specs/{{feature_id}}/validation/implementation-conformance.md"
+    ],
+    "history": [
+      "specs/{{feature_id}}/history/specify",
+      "specs/{{feature_id}}/history/plan",
+      "specs/{{feature_id}}/history/tasks"
+    ],
+    "handoff": [
+      "specs/{{feature_id}}/handoff.md"
+    ],
+    "checkpoints": [
+      ".work-state/features/{{feature_id}}/state.json",
+      ".work-state/ux-e2e/transcript.jsonl",
+      ".work-state/ux-e2e/ask-state.jsonl"
+    ],
+    "evidence": [
+      ".work-state/features/{{feature_id}}/artifacts"
+    ]
+  },
+  "transcript": {
+    "checkpoints": [
+      "approve_continue",
+      "approve_stop",
+      "trusted human proof"
+    ],
+    "workers": [
+      "Specify worker dispatch",
+      "Plan worker dispatch",
+      "Tasks worker dispatch",
+      "no Specify redispatch",
+      "no Plan redispatch",
+      "no Tasks redispatch",
+      "no discovery stage",
+      "no clarify ask"
+    ],
+    "validation": [
+      "validation/implementation-conformance.md",
+      "overall_status blocked",
+      "changed_intent",
+      "overall_status pass",
+      "one closure row per frozen subject",
+      "no waived conformance row",
+      "no executor-added conformance row",
+      "blocking finding"
+    ],
+    "history": [
+      "history/specify",
+      "history/plan",
+      "history/tasks",
+      "no new history entry during execution"
+    ],
+    "handoff": [
+      "handoff.md",
+      "handoff_digest",
+      "status ready",
+      "open_decisions",
+      "execution_choices",
+      "handoff digest unchanged"
+    ],
+    "interruption": [
+      "completion_blocked",
+      "claim retained",
+      "never complete_feature",
+      "non-passing closure row"
+    ],
+    "resume": [
+      "same claimed run",
+      "same owner_run_id",
+      "no released claim",
+      "no second active claim",
+      "re-evaluated on the claimed handoff digest"
+    ],
+    "next_actions": [
+      "/do-work --spec {{feature_id}}",
+      "repair",
+      "revise_specification",
+      "complete_feature"
+    ]
+  },
+  "task": "Consume a frozen native implementation handoff through `/do-work --spec` as one deterministic exclusive-owner journey. Use only the canonical workspace `specs/{{feature_id}}`, durable state `.work-state/features/{{feature_id}}/state.json`, and the existing native phase commands and typed artifacts. Select the exact explicit `feature_id={{feature_id}}` and `run_key={{run_key}}` for every status, command, dispatch, claim, conformance, and evidence lookup; reject any branch-, cwd-, `.active-feature`-, inferred-, or alternate-run selection. The plugin-native constitution prerequisite gates the flow; obtain the required human approval when it asks.\n\nFreeze the handoff. Start with `/specify --feature {{feature_id}} {{request}}` and choose `approve_continue` at its checkpoint, then `/spec-plan --feature {{feature_id}}` with `approve_continue`, then `/spec-tasks --feature {{feature_id}}` with `approve_stop`. Confirm durable state reports `implementation_ready` with Specify, Plan, and Tasks approved, `handoff_ref` set, and `next_action` naming exactly `/do-work --spec {{feature_id}}`. Confirm the typed ImplementationHandoff artifact carries `status ready`, empty `open_decisions`, `execution_choices` including `do-work`, and a 64-hex content-addressed `handoff_digest`, and that `specs/{{feature_id}}/handoff.md` is materialized containing that exact digest. No implementation evidence may exist yet: no ExecutionClaim artifact and no conformance matrix.\n\nClaim it once. Submit exactly `/do-work --spec {{feature_id}} {{execution_task}}`. Confirm exactly one active ExecutionClaim artifact exists for that handoff digest under `.work-state/features/{{feature_id}}/artifacts` with `owner_kind do_work`, no released claims, `execution_claim_ref` bound in durable state, and workspace status in `claimed`, `executing`, or `completion_validating` - never completed at claim time. Confirm `run_key` and every Specify, Plan, and Tasks current and approved version are unchanged, no second workspace appears under `.work-state/features`, and the transcript reports no Specify redispatch, no Plan redispatch, no Tasks redispatch, no discovery stage, and no clarify ask after the submission.\n\nAccept the blocked closure. This first pass intentionally leaves exactly one frozen verification obligation without evidence, so confirm the first conformance evaluation reports `overall_status blocked` with `completion_blocked` in durable state, `specs/{{feature_id}}/validation/implementation-conformance.md` materialized, one closure row per frozen subject using `requirement:` and `acceptance_scenario:` ids derived from the frozen handoff, at least one non-passing closure row or blocking finding, no waived conformance row and no executor-added conformance row, `next_action` naming a repair path and never complete_feature while blocked, and the owning claim retained - never released. Append-only history gains no new history entry during execution.\n\nRoute the changed intent fail-closed. While the claim is active, submit this rework directive verbatim into the same claimed run: `{{intent_feedback}}`. Confirm the re-evaluation reports `changed_intent` with `next_action` = `revise_specification`, the workspace is not completed, the claim retained, and the transcript states the frozen handoff stays the only closure arbiter - the change belongs to a Specify revision, not to do-work scope, and no executor override adds, removes, or reinterprets a frozen row.\n\nRepair under the same owner. Then submit this repair directive verbatim into the same claimed run: `{{repair_feedback}}`. Confirm the repair continues the same claimed run with the same owner_run_id - no released claim and no second active claim - the handoff digest unchanged and phase versions unchanged, and the matrix re-evaluated on the claimed handoff digest.\n\nComplete pass-only. Confirm the re-evaluated matrix reports `overall_status pass` with every closure row passes and zero blocking findings, `next_action` = `complete_feature`, durable state `completed` with `implementation_conformance_ref` bound to the exact `conformance_id`, `specs/{{feature_id}}/validation/implementation-conformance.md` updated pass-only, the claim completed rather than released, exactly one workspace under `.work-state/features`, and the full journey having produced no Specify redispatch, no Plan redispatch, and no Tasks redispatch.\n\nEnd with a compact evidence summary listing `feature_id={{feature_id}}`, `run_key={{run_key}}`, `handoff_id`, the final `handoff_digest`, `claim_id` with `owner_kind do_work` and its owner run, `conformance_id` with `matrix_digest`, the final workspace status, and the artifact paths under `specs/{{feature_id}}` and `.work-state/features/{{feature_id}}/artifacts`.",
+  "stages": [
+    {
+      "id": "constitution",
+      "name": "Native constitution prerequisite and approval",
+      "expect": [
+        "CONSTITUTION.md",
+        "constitution",
+        "[ask_user]",
+        "approve_continue"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]onstitution",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "specify",
+      "name": "Specify phase toward the frozen handoff",
+      "expect": [
+        "Specify",
+        "specs/{{feature_id}}/spec.md",
+        "validation/specify.md",
+        "feature_id={{feature_id}}",
+        "run_key={{run_key}}",
+        "[ask_user]",
+        "/spec-plan --feature {{feature_id}}"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Ss]pecify",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "plan",
+      "name": "Plan phase toward the frozen handoff",
+      "expect": [
+        "Plan",
+        "specs/{{feature_id}}/plan.md",
+        "validation/plan.md",
+        "run_key={{run_key}}",
+        "[ask_user]",
+        "/spec-tasks --feature {{feature_id}}"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Pp]lan",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "tasks",
+      "name": "Tasks phase and handoff freeze",
+      "expect": [
+        "Tasks",
+        "specs/{{feature_id}}/tasks.md",
+        "validation/tasks.md",
+        "handoff.md",
+        "run_key={{run_key}}",
+        "approve_stop",
+        "[ask_user]"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Tt]asks",
+          "answer": "3",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "ready-handoff",
+      "name": "Ready handoff frozen with its exact digest",
+      "expect": [
+        "implementation_ready",
+        "specs/{{feature_id}}/handoff.md",
+        "handoff_digest",
+        "status ready",
+        "open_decisions",
+        "execution_choices",
+        "/do-work --spec {{feature_id}}",
+        "no ExecutionClaim",
+        "no conformance matrix"
+      ]
+    },
+    {
+      "id": "exclusive-claim",
+      "name": "One exclusive claimed owner without rediscovery",
+      "expect": [
+        "/do-work --spec {{feature_id}}",
+        "exactly one active ExecutionClaim",
+        "owner_kind do_work",
+        "execution_claim_ref",
+        "never completed at claim time",
+        "no second workspace",
+        "no Specify redispatch",
+        "no Plan redispatch",
+        "no Tasks redispatch",
+        "no discovery stage",
+        "no clarify ask"
+      ]
+    },
+    {
+      "id": "blocked-closure",
+      "name": "First evaluation closes blocked with the claim retained",
+      "expect": [
+        "implementation-conformance.md",
+        "overall_status blocked",
+        "completion_blocked",
+        "one closure row per frozen subject",
+        "requirement:",
+        "acceptance_scenario:",
+        "non-passing closure row",
+        "no waived conformance row",
+        "no executor-added conformance row",
+        "never complete_feature",
+        "claim retained"
+      ]
+    },
+    {
+      "id": "changed-intent",
+      "name": "Rework outside the frozen handoff routes changed intent",
+      "expect": [
+        "{{intent_feedback}}",
+        "changed_intent",
+        "revise_specification",
+        "not completed",
+        "claim retained",
+        "only closure arbiter",
+        "no executor override"
+      ]
+    },
+    {
+      "id": "repair-re-evaluation",
+      "name": "Same owner repairs on the claimed handoff digest",
+      "expect": [
+        "{{repair_feedback}}",
+        "same claimed run",
+        "same owner_run_id",
+        "no released claim",
+        "no second active claim",
+        "handoff digest unchanged",
+        "phase versions unchanged",
+        "re-evaluated on the claimed handoff digest"
+      ]
+    },
+    {
+      "id": "pass-only-completion",
+      "name": "Pass-only matrix completes the workspace",
+      "expect": [
+        "overall_status pass",
+        "every closure row passes",
+        "zero blocking findings",
+        "complete_feature",
+        "implementation_conformance_ref",
+        "conformance_id",
+        "pass-only",
+        "claim completed",
+        "exactly one workspace",
+        "no Specify redispatch",
+        "no Plan redispatch",
+        "no Tasks redispatch"
+      ]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 600000,
+    "checkpointPollMs": 500
+  },
+  "screenshots": {
+    "on": ["stage_start", "stage_end", "ask_user", "error"]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

@@ -1,0 +1,37 @@
+id: 2026-09-01T10-57-00-testing
+parent: null
+agent: testing
+timestamp: "2026-09-01T10:57:00Z"
+status: blocked
+context:
+  task: "Migrate specification constitution decision workspace fixtures to shipped canonical profiles"
+  phase: validation-release
+output:
+  summary: "Inspected the stale constitution fixture and derived the canonical profile-backed patch. Workspace writes are blocked in this worker's mounted editor; parent was sent the exact implementation plan."
+  tests_added:
+    unit: 0
+    integration: 0
+    property: 0
+  coverage:
+    before: "unknown"
+    after: "unknown"
+    target: "existing seven constitution behavior/security tests"
+  test_results:
+    total: 0
+    passed: 0
+    failed: 0
+    skipped: 0
+  test_files:
+    - path: packages/core/test/specification-constitution.test.ts
+      tests: ["existing constitution bootstrap, proof, revision, import-resume, and nested-boundary tests"]
+  gaps:
+    - "Parent must apply the helper-only patch because direct workspace writes return EPERM."
+next:
+  agent: null
+  task: "Apply the sent patch in packages/core/test/specification-constitution.test.ts, then run the assigned focused suite in the parent validation wave."
+  priority: high
+  acceptance_criteria:
+    - "No intake_repo_map or spec-preparation synthetic profile/capability remains in constitution decision workspace builders."
+    - "Native fixture bindings use shipped spec-preparation specify stage and exact profile hash."
+    - "External fixture bindings use shipped spec-import compatibility stage while approval resume target remains compatibility_validation."
+    - "Bootstrap policy is projected from the shipped constitution profile with its custom hard-human rule."

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "artifact_id": "readable-cto-passing-runtime-record",
+  "entries": [
+    {
+      "evidence_id": "readable-cto-passing-runtime-record-v-1-runtime",
+      "kind": "implementation",
+      "subject_id": "V-1-runtime",
+      "requirement_id": "FR-1",
+      "handoff_digest": "7644909b7d17135edef84221f57709f0cff3d853e11fa51500c0ee2aa02c9ab7",
+      "execution_claim_id": "claim-e85e8cb13fb5a1971007585ad94ec13f",
+      "recorded_at": "2026-09-04T23:54:26Z"
+    }
+  ]
+}

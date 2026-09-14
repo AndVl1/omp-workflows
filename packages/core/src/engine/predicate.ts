@@ -25,7 +25,9 @@
  */
 
 import type { ScopeFlags } from "./scope.js";
-import { readArtifact } from "./artifacts.js";
+import { readPinnedArtifactSnapshot, validateArtifactStructure, ARTIFACT_STRUCTURE_LIMITS } from "./artifacts.js";
+import { PinnedRootError } from "../specification/pinned-root.js";
+import type { PinnedProjectRoot } from "../specification/pinned-root.js";
 import type { Profile, StageDef, TeamState } from "./types.js";
 
 export type PredicateTerm =
@@ -106,7 +108,8 @@ function parsePredicateValue(text: string): unknown {
   if (/^-?\d+(\.\d+)?$/.test(text)) return Number(text);
   if (text.startsWith("[")) {
     try {
-      return JSON.parse(text) as unknown;
+      const value = JSON.parse(text) as unknown;
+      return validateArtifactStructure(value).ok ? value : undefined;
     } catch {
       return undefined;
     }
@@ -120,6 +123,13 @@ export interface PredicateContext {
   state: TeamState;
   /** Current stage — drives implicit artifact resolution (produced, then consumed). */
   stage?: StageDef;
+  /**
+   * Borrowed root pin for durable evaluation. When supplied, compare
+   * operands MUST use the paired descriptor-relative directory; no lexical
+   * path fallback is permitted.
+   */
+  pinnedRoot?: PinnedProjectRoot;
+  artifactsDirRelative?: string;
   /**
    * Named-gate resolver. Return `null` when the gate holds, a reason string
    * when it fails, or `undefined` when the name is unknown (unsupported).
@@ -189,24 +199,55 @@ function evaluateTerm(term: PredicateTerm, ctx: PredicateContext, source: string
   if (term.negated) value = !value;
   return { ok: true, value };
 }
+type CompareArtifactRead =
+  | { ok: true; value: unknown }
+  | { ok: false; kind: "missing" | "unsafe"; reason: string };
+
+function readPredicateArtifact(ctx: PredicateContext, id: string): CompareArtifactRead {
+  if (ctx.pinnedRoot) {
+    if (ctx.artifactsDirRelative === undefined) {
+      return { ok: false, kind: "unsafe", reason: "pinned artifact directory is missing" };
+    }
+    try {
+      const snapshot = readPinnedArtifactSnapshot(ctx.pinnedRoot, ctx.artifactsDirRelative, id);
+      return { ok: true, value: snapshot.value };
+    } catch (error) {
+      if (error instanceof PinnedRootError && error.code === "not_found") {
+        return { ok: false, kind: "missing", reason: "artifact is missing" };
+      }
+      return { ok: false, kind: "unsafe", reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  return { ok: false, kind: "unsafe", reason: "artifact read requires a pinned project root" };
+}
 
 function resolveCompareOperand(
   term: Extract<PredicateTerm, { kind: "compare" }>,
   ctx: PredicateContext,
 ): { ok: true; artifact: unknown; id: string } | { ok: false; error: string } {
   if (term.artifact) {
-    const value = readArtifact(ctx.artifactsDir, term.artifact);
-    if (value === null) {
-      return { ok: false, error: `artifact '${term.artifact}' referenced by expression is missing` };
+    const snapshot = readPredicateArtifact(ctx, term.artifact);
+    if (!snapshot.ok) {
+      return {
+        ok: false,
+        error: snapshot.kind === "missing"
+          ? `artifact '${term.artifact}' referenced by expression is missing`
+          : `artifact '${term.artifact}' cannot be evaluated safely: ${snapshot.reason}`,
+      };
     }
-    return { ok: true, artifact: value, id: term.artifact };
+    return { ok: true, artifact: snapshot.value, id: term.artifact };
   }
   const candidates = [
     ...(ctx.stage ? producesOf(ctx.stage) : []),
     ...(ctx.stage?.consumes ?? []),
   ];
   for (const id of candidates) {
-    const value = readArtifact(ctx.artifactsDir, id);
+    const snapshot = readPredicateArtifact(ctx, id);
+    if (!snapshot.ok) {
+      if (snapshot.kind === "missing") continue;
+      return { ok: false, error: `artifact '${id}' cannot be evaluated safely: ${snapshot.reason}` };
+    }
+    const value = snapshot.value;
     if (value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, term.field)) {
       return { ok: true, artifact: value, id };
     }
@@ -218,19 +259,86 @@ function producesOf(stage: StageDef): string[] {
   return Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
 }
 
+
 export function deepEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (Array.isArray(a) && Array.isArray(b)) {
-    if (a.length !== b.length) return false;
-    return a.every((item, index) => deepEqual(item, b[index]));
+  const stack: Array<{ left: unknown; right: unknown; depth: number }> = [{ left: a, right: b, depth: 0 }];
+  const leftToRight = new WeakMap<object, object>();
+  const rightToLeft = new WeakMap<object, object>();
+  let work = 0;
+  try {
+    while (stack.length > 0) {
+      const pair = stack.pop()!;
+      if (pair.depth > ARTIFACT_STRUCTURE_LIMITS.maxDepth) return false;
+      work += 1;
+      if (work > ARTIFACT_STRUCTURE_LIMITS.maxWork) return false;
+      if (pair.left === pair.right || (typeof pair.left === "number" && typeof pair.right === "number" && Number.isNaN(pair.left) && Number.isNaN(pair.right))) continue;
+      if (pair.left === null || pair.right === null || typeof pair.left !== "object" || typeof pair.right !== "object") return false;
+      const left = pair.left as object;
+      const right = pair.right as object;
+      const leftArray = Array.isArray(left);
+      const leftPrototype = Object.getPrototypeOf(left);
+      const rightPrototype = Object.getPrototypeOf(right);
+      if (leftArray
+        ? leftPrototype !== Array.prototype || rightPrototype !== Array.prototype
+        : (leftPrototype !== Object.prototype && leftPrototype !== null)
+          || (rightPrototype !== Object.prototype && rightPrototype !== null)) return false;
+      const mappedRight = leftToRight.get(left);
+      if (mappedRight !== undefined) {
+        if (mappedRight !== right) return false;
+        continue;
+      }
+      const mappedLeft = rightToLeft.get(right);
+      if (mappedLeft !== undefined) {
+        if (mappedLeft !== left) return false;
+        continue;
+      }
+      leftToRight.set(left, right);
+      rightToLeft.set(right, left);
+      if (leftArray) {
+        const leftValue = left as unknown[];
+        const rightValue = right as unknown[];
+        const leftKeys = Object.keys(leftValue);
+        const rightKeys = Object.keys(rightValue);
+        if (leftValue.length !== rightValue.length
+          || leftKeys.length !== leftValue.length
+          || rightKeys.length !== rightValue.length
+          || leftKeys.some((key) => !/^(?:0|[1-9]\d*)$/u.test(key) || Number(key) >= leftValue.length)
+          || rightKeys.some((key) => !/^(?:0|[1-9]\d*)$/u.test(key) || Number(key) >= rightValue.length)
+          || Object.getOwnPropertySymbols(leftValue).some((symbol) => Object.prototype.propertyIsEnumerable.call(leftValue, symbol))
+          || Object.getOwnPropertySymbols(rightValue).some((symbol) => Object.prototype.propertyIsEnumerable.call(rightValue, symbol))) return false;
+        work += leftValue.length;
+        if (work > ARTIFACT_STRUCTURE_LIMITS.maxWork || leftValue.length > ARTIFACT_STRUCTURE_LIMITS.maxArrayItems) return false;
+        for (let index = leftValue.length - 1; index >= 0; index -= 1) {
+          const leftDescriptor = Object.getOwnPropertyDescriptor(leftValue, String(index));
+          const rightDescriptor = Object.getOwnPropertyDescriptor(rightValue, String(index));
+          if (!leftDescriptor || !rightDescriptor || !("value" in leftDescriptor) || !("value" in rightDescriptor)) return false;
+          stack.push({ left: leftDescriptor.value, right: rightDescriptor.value, depth: pair.depth + 1 });
+        }
+        continue;
+      }
+      const leftKeys = Object.keys(left);
+      const rightKeys = Object.keys(right);
+      if (Object.getOwnPropertySymbols(left).some((symbol) => Object.prototype.propertyIsEnumerable.call(left, symbol))
+        || Object.getOwnPropertySymbols(right).some((symbol) => Object.prototype.propertyIsEnumerable.call(right, symbol))) return false;
+      work += leftKeys.length + rightKeys.length;
+      if (work > ARTIFACT_STRUCTURE_LIMITS.maxWork
+        || leftKeys.length > ARTIFACT_STRUCTURE_LIMITS.maxKeys
+        || rightKeys.length > ARTIFACT_STRUCTURE_LIMITS.maxKeys
+        || leftKeys.length !== rightKeys.length) return false;
+      const rightKeySet = new Set(rightKeys);
+      for (let index = leftKeys.length - 1; index >= 0; index -= 1) {
+        const key = leftKeys[index]!;
+        if (!rightKeySet.has(key)) return false;
+        const leftDescriptor = Object.getOwnPropertyDescriptor(left, key);
+        const rightDescriptor = Object.getOwnPropertyDescriptor(right, key);
+        if (!leftDescriptor || !rightDescriptor || !("value" in leftDescriptor) || !("value" in rightDescriptor)) return false;
+        stack.push({ left: leftDescriptor.value, right: rightDescriptor.value, depth: pair.depth + 1 });
+      }
+    }
+    return true;
+  } catch {
+    return false;
   }
-  if (a && b && typeof a === "object" && typeof b === "object" && !Array.isArray(a) && !Array.isArray(b)) {
-    const aKeys = Object.keys(a).sort();
-    const bKeys = Object.keys(b).sort();
-    if (aKeys.length !== bKeys.length) return false;
-    return aKeys.every((key) => deepEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key]));
-  }
-  return false;
 }
 
 /**

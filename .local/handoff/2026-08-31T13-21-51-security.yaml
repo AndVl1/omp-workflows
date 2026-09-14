@@ -1,0 +1,48 @@
+id: 2026-08-31T13-21-51-security
+parent: null
+agent: security
+timestamp: "2026-08-31T13:21:51Z"
+status: completed
+
+context:
+  task: "Archive complete previous document sets and make shipped renderer reset reversible"
+  phase: "foundation-contracts"
+
+output:
+  summary: "Materialization now derives immutable history identity from the previous manifest, archives removed documents, removes retired current projections, and preflights archive/current collisions. Renderer lifecycle now has one public reset that clears both registries and invalidates shipped registration state."
+  vulnerabilities:
+    critical: 0
+    high: 0
+    medium: 0
+    low: 0
+  cargo_deny:
+    status: skipped
+    advisories: 0
+    license_issues: 0
+  dependencies:
+    outdated: 0
+    unmaintained: 0
+    actions: []
+  unsafe_blocks:
+    total: 0
+    reviewed: 0
+    approved: 0
+    needs_refactor: 0
+  issues: []
+  files_modified:
+    - packages/core/src/specification/materialize.ts
+    - packages/core/src/specification/registry.ts
+    - packages/core/src/index.ts
+    - packages/core/test/specification-artifact-contract.test.ts
+  verification:
+    status: skipped
+    reason: "Assignment explicitly requires no validation; CTO reruns project validation after all concurrent slices land."
+
+next:
+  agent: null
+  task: "CTO reruns aggregate validation"
+  priority: high
+  acceptance_criteria:
+    - "Removed current documents are archived under deterministic previous-version identities and removed from current projection"
+    - "Archive and unowned current collisions reject before mutation"
+    - "Reset followed by shipped registration restores both renderers and preserves custom registration behavior"

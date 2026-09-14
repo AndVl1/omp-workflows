@@ -1,0 +1,120 @@
+{
+  "report_id": "compatibility.ab497218eee434bd2be9b9e9884e9f76a5c4aa88718ae9150a4a02c9d59580bd",
+  "snapshot_ref": "import.4d52c7caa73d20c870c5590e1be4f647fc1bf8e1e35b229f848e8ee3af023110",
+  "constitution_binding": {
+    "provider_id": "native",
+    "path": "CONSTITUTION.md",
+    "version": "0.0.0",
+    "content_sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+    "semantic_hash": "35ce12b619924ee68ab11046b5ac497392f2615526e791d52482d5c5257714af",
+    "validation_ref": "constitution.validation.8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+    "bound_at": "2026-09-03T07:01:17.787Z"
+  },
+  "status": "supplement_required",
+  "mapping": [
+    {
+      "source_ref": "imported/payment-retry-incomplete/requirements.md",
+      "contract_subject": "requirement",
+      "subject_id": "FR-101"
+    },
+    {
+      "source_ref": "imported/payment-retry-incomplete/requirements.md",
+      "contract_subject": "requirement",
+      "subject_id": "FR-102"
+    },
+    {
+      "source_ref": "imported/payment-retry-incomplete/requirements.md",
+      "contract_subject": "requirement",
+      "subject_id": "FR-103"
+    },
+    {
+      "source_ref": "imported/payment-retry-incomplete/requirements.md",
+      "contract_subject": "verification",
+      "subject_id": "FR-101"
+    },
+    {
+      "source_ref": "imported/payment-retry-incomplete/requirements.md",
+      "contract_subject": "verification",
+      "subject_id": "FR-102"
+    },
+    {
+      "source_ref": "imported/payment-retry-incomplete/requirements.md",
+      "contract_subject": "verification",
+      "subject_id": "FR-103"
+    }
+  ],
+  "blocking_findings": [
+    {
+      "code": "SPEC_IMPORT_TASK_GRAPH_COVERAGE_MISSING",
+      "subject_id": "FR-101",
+      "message": "requirement FR-101 has no executable task",
+      "evidence_refs": [
+        "imported/payment-retry-incomplete/requirements.md"
+      ]
+    },
+    {
+      "code": "SPEC_IMPORT_DECISION_COVERAGE_MISSING",
+      "subject_id": "FR-101",
+      "message": "requirement FR-101 has no linked decision",
+      "evidence_refs": [
+        "imported/payment-retry-incomplete/requirements.md"
+      ]
+    },
+    {
+      "code": "SPEC_IMPORT_TASK_GRAPH_COVERAGE_MISSING",
+      "subject_id": "FR-102",
+      "message": "requirement FR-102 has no executable task",
+      "evidence_refs": [
+        "imported/payment-retry-incomplete/requirements.md"
+      ]
+    },
+    {
+      "code": "SPEC_IMPORT_DECISION_COVERAGE_MISSING",
+      "subject_id": "FR-102",
+      "message": "requirement FR-102 has no linked decision",
+      "evidence_refs": [
+        "imported/payment-retry-incomplete/requirements.md"
+      ]
+    },
+    {
+      "code": "SPEC_IMPORT_TASK_GRAPH_COVERAGE_MISSING",
+      "subject_id": "FR-103",
+      "message": "requirement FR-103 has no executable task",
+      "evidence_refs": [
+        "imported/payment-retry-incomplete/requirements.md"
+      ]
+    },
+    {
+      "code": "SPEC_IMPORT_DECISION_COVERAGE_MISSING",
+      "subject_id": "FR-103",
+      "message": "requirement FR-103 has no linked decision",
+      "evidence_refs": [
+        "imported/payment-retry-incomplete/requirements.md"
+      ]
+    },
+    {
+      "code": "SPEC_IMPORT_DECISIONS_MISSING",
+      "subject_id": null,
+      "message": "no decisions document was recognized",
+      "evidence_refs": [
+        "imported/payment-retry-incomplete/CONSTITUTION.md",
+        "imported/payment-retry-incomplete/plan.md",
+        "imported/payment-retry-incomplete/requirements.md"
+      ]
+    },
+    {
+      "code": "SPEC_IMPORT_TASK_GRAPH_MISSING",
+      "subject_id": null,
+      "message": "no executable task graph was recognized",
+      "evidence_refs": [
+        "imported/payment-retry-incomplete/CONSTITUTION.md",
+        "imported/payment-retry-incomplete/plan.md",
+        "imported/payment-retry-incomplete/requirements.md"
+      ]
+    }
+  ],
+  "warnings": [],
+  "ignored_content": [],
+  "supplement_ref": null,
+  "evaluated_at": "2026-09-03T07:01:06.647Z"
+}

@@ -1,0 +1,39 @@
+id: 2026-09-01T07-18-31-debug
+parent: null
+agent: debug
+timestamp: "2026-09-01T07:18:31Z"
+status: completed
+
+context:
+  task: "Fix canonical fixture creation in cto-specification-preparation.test.ts"
+  phase: "validation-release"
+
+output:
+  summary: "Canonical preparation fixtures now resolve and persist the exact feature TeamState before trusted answer issuance."
+  error_type: runtime
+  root_cause:
+    file: packages/core/test/cto-specification-preparation.test.ts
+    line: 196
+    issue: "The fixture expected a nonexistent ResolvedState.target and wrote the first state by derived feature slug before an explicit feature/run target existed; it also used a synthetic profile hash."
+    explanation: "resolveState returns the ResolvedState itself as the write target. Seeding the canonical minimal specification envelope first gives the explicit resolver an authoritative feature state path. Trusted checkpoint bindings must use the shipped spec-preparation profile hash and declared stage metadata."
+  reproduction:
+    steps:
+      - "Create a fresh temporary project."
+      - "Issue a canonical preparation decision for a feature/phase."
+      - "Observe fixture resolution fail because selected.target is undefined or because the synthetic profile binding is not canonical."
+    minimal_case: "armFeaturePhase previously asserted selected.target and passed selected.target to writeState, although resolveState returns state/statePath/stateDir directly."
+  solution:
+    before: "Resolve before creating a feature envelope; use synthetic PROFILE_HASH and selected.target."
+    after: "Seed {schema: 1, run_key, specification}, resolveState with explicit feature/run selector, use selected as ResolvedState target, derive profile hash and stage metadata from loadProfile(\"spec-preparation\"), and writeState with {target: selected}."
+  regression_test: "Existing cto-specification-preparation.test.ts positive trusted-decision, mixed-outcome, ledger-history, terminal-boundary, symlink, traversal, tamper, replay, cross-run, and stale-phase cases exercise the corrected fixture while preserving negative boundaries."
+  related_issues:
+    - "ResolvedState does not expose a target property; wrappers that return found/target must not be conflated with resolveState."
+
+next:
+  agent: null
+  task: "Parent should run the planned project-wide validation once sibling slices land."
+  priority: high
+  acceptance_criteria:
+    - "Only packages/core/test/cto-specification-preparation.test.ts is changed by this slice."
+    - "No source resolver weakening or security validation bypass is introduced."
+    - "Canonical fixtures bind to shipped profile/stage/checkpoint metadata and exact persisted feature state."

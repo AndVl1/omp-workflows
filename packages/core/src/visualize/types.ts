@@ -138,9 +138,27 @@ export function fragmentForSession(pathKey: PathKey): string {
 }
 
 export function fragmentForArtifact(pathKey: PathKey, artifactId: string): string {
-  // encodeURIComponent is deterministic in Node and keeps the fragment free of
-  // Markdown/HTML/URL-breaking characters while staying collision-free.
-  return `viz-${pathKey}-${encodeURIComponent(artifactId)}`;
+  // encodeURIComponent throws on lone UTF-16 surrogates. Normalize only
+  // malformed code units so hostile model identities remain renderable while
+  // valid Unicode pairs retain their existing fragment encoding.
+  let safeId = "";
+  for (let index = 0; index < artifactId.length; index += 1) {
+    const code = artifactId.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = artifactId.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        safeId += artifactId.slice(index, index + 2);
+        index += 1;
+      } else {
+        safeId += "\uFFFD";
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      safeId += "\uFFFD";
+    } else {
+      safeId += artifactId[index];
+    }
+  }
+  return `viz-${pathKey}-${encodeURIComponent(safeId)}`;
 }
 
 // ── Deterministic ordering (implementation_contract.ordering) ────────────────

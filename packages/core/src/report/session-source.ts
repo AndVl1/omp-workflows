@@ -8,18 +8,15 @@
  *   do-work feature  → .work-state/features/<slug>/state.json
  *   do-work legacy   → .work-state/team-state.json            (+ artifacts/)
  *   cto JSON         → .work-state/cto/<runId>/state.json
- *   cto markdown     → .work-state/cto/<runId>/{team-plan,decisions,cto_discovery}.md
- *                      (agent-written runs with no state.json)
+ *   cto markdown     → never a discoverable execution/report source
  *   cto team         → .work-state/artifacts/<teamId>/  + each team's dod_path
  *
  * Two APIs with deliberately different guarantees:
  *
  * - `resolveDoWorkSource` / `resolveCtoSource` — exact-selector resolution
  *   used by the report. They preserve buildSessionReport semantics verbatim:
- *   a corrupt exact-id `state.json` throws (as it does today), a CTO run
- *   with a corrupt `state.json` is invisible (no markdown fallback), and
- *   terminal markdown runs are invisible because `markdownCtoState` returns
- *   null for them. A selector must be a single non-traversal path segment:
+ *   a corrupt exact-id `state.json` throws (as it does today), and a CTO run
+ *   without a valid canonical `state.json` is invisible. A selector must be a single non-traversal path segment:
  *   traversal-shaped ids (`../x`, `a/b`, `..`) are rejected (they can never
  *   name a real directory entry, so nothing discoverable is hidden), while
  *   previously valid exotic names (unicode, spaces) resolve verbatim —
@@ -45,14 +42,317 @@
  * entry. A removed target is never remapped to another session.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { resolveState } from "../engine/state.js";
+import { PinnedProjectRoot, PinnedRootError } from "../specification/pinned-root.js";
+import { MAX_PERSISTED_STATE_BYTES } from "../engine/state.js";
 import type { TeamState } from "../engine/types.js";
-import { readCtoState } from "../cto/state.js";
+import { isBoundedLineInert, isSafeWorkflowIdentifier, MAX_ADVANCE_FIELD_BYTES } from "../engine/durable.js";
+import { MAX_CTO_STATE_READ_BYTES, isSafeCtoRunId, parsePersistedCtoState } from "../cto/state.js";
+import { MAX_CTO_SPECIFICATION_TEXT_BYTES } from "../cto/types.js";
 import type { CtoState } from "../cto/types.js";
-import { markdownCtoState } from "../commands/cto.js";
+
+const MAX_POINTER_BYTES = 4096;
+const MAX_TEAM_STATE_COLLECTION_BYTES = 256 * 1024;
+const MAX_TEAM_STATE_COLLECTION_ITEMS = 256;
+const MAX_TEAM_STATE_JSON_DEPTH = 8;
+const MAX_TEAM_STATE_JSON_NODES = 4096;
+const MAX_TEAM_STATE_JSON_KEYS = 256;
+const MAX_TEAM_STATE_JSON_TOTAL_KEYS = 4096;
+const MAX_SESSION_SOURCES = 4096;
+
+interface TeamStateGraphFrame {
+  value: unknown;
+  depth: number;
+  exit?: boolean;
+}
+
+interface TeamStateGraphBudget {
+  bytes: number;
+  items: number;
+  nodes: number;
+  keys: number;
+}
+
+const STAGE_STATUSES: Record<string, true> = {
+  pending: true,
+  in_progress: true,
+  done: true,
+  skipped: true,
+  failed: true,
+};
+const TASK_TYPES: Record<string, true> = {
+  FEATURE: true,
+  REFACTOR: true,
+  OPS: true,
+  BUG_FIX: true,
+  SPEC: true,
+  REGRESS: true,
+  INVESTIGATION: true,
+  LECTURE_RESEARCH: true,
+  REVIEW: true,
+  HOTFIX: true,
+  PRODUCT_DISCOVERY: true,
+};
+const COMPLEXITIES: Record<string, true> = { QUICK: true, MEDIUM: true, COMPLEX: true, CRITICAL: true };
+const CONFIDENCES: Record<string, true> = { HIGH: true, MEDIUM: true, LOW: true };
+const PAUSE_KINDS: Record<string, true> = {
+  none: true,
+  background_wait: true,
+  user_checkpoint: true,
+  needs_human: true,
+  failed: true,
+  done: true,
+};
+const BOUNDED_ID_FIELDS: Record<string, true> = {
+  id: true,
+  run_id: true,
+  run_key: true,
+  session_id: true,
+  wave_id: true,
+  slice_id: true,
+  feature_id: true,
+  stage_id: true,
+  stage_cursor: true,
+  capability_id: true,
+  capability_epoch: true,
+  slot_id: true,
+  task_id: true,
+  dispatch_id: true,
+  worker_id: true,
+  artifact_id: true,
+  phase: true,
+  profile_hash: true,
+  config_hash: true,
+};
+
+
+function ownsPin(cwd: string, supplied?: PinnedProjectRoot): { pin: PinnedProjectRoot; owned: boolean } | null {
+  const pin = supplied ?? PinnedProjectRoot.open(cwd);
+  if (!pin) return null;
+  return { pin, owned: supplied === undefined };
+}
+
+function sourcePath(cwd: string, relativePath: string): string {
+  return resolve(cwd, relativePath);
+}
+
+function readUtf8(pin: PinnedProjectRoot, relativePath: string, maxBytes: number): string {
+  if (!pin.isStable()) throw new PinnedRootError("changed", "pinned project root changed before report read");
+  const read = pin.readFile(relativePath, { maxBytes });
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
+  } catch (error) {
+    throw new Error(`invalid UTF-8 in ${relativePath}: ${String(error)}`);
+  }
+  if (!pin.isStable()) throw new PinnedRootError("changed", "pinned project root changed after report read");
+  return text;
+}
+
+function invalidTeamState(): never {
+  throw new Error("state.json has an invalid TeamState shape");
+}
+
+function boundedText(value: unknown, maxBytes: number, allowEmpty = false): value is string {
+  if (typeof value !== "string") return false;
+  if (value.length === 0) return allowEmpty;
+  return isBoundedLineInert(value, maxBytes);
+}
+function boundedId(value: unknown): value is string {
+  return typeof value === "string" && isSafeWorkflowIdentifier(value, MAX_ADVANCE_FIELD_BYTES);
+}
+
+function validateTeamStateValues(value: unknown, budget: TeamStateGraphBudget): void {
+  const active = new WeakSet<object>();
+  const stack: TeamStateGraphFrame[] = [{ value, depth: 0 }];
+  const accountString = (text: string): void => {
+    const bytes = Buffer.byteLength(text, "utf8");
+    if (bytes > MAX_CTO_SPECIFICATION_TEXT_BYTES) invalidTeamState();
+    budget.bytes += bytes;
+    if (budget.bytes > MAX_TEAM_STATE_COLLECTION_BYTES) invalidTeamState();
+  };
+
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    if (frame.exit) {
+      if (frame.value !== null && typeof frame.value === "object") active.delete(frame.value);
+      continue;
+    }
+    if (++budget.nodes > MAX_TEAM_STATE_JSON_NODES || frame.depth > MAX_TEAM_STATE_JSON_DEPTH) invalidTeamState();
+    if (typeof frame.value === "string") {
+      if (!boundedText(frame.value, MAX_CTO_SPECIFICATION_TEXT_BYTES, true)) invalidTeamState();
+      accountString(frame.value);
+      continue;
+    }
+    const node = frame.value;
+    if (node === null || typeof node === "boolean") continue;
+    if (typeof node === "number") {
+      if (!Number.isFinite(node)) invalidTeamState();
+      continue;
+    }
+    if (typeof node !== "object") invalidTeamState();
+    if (active.has(node)) invalidTeamState();
+    active.add(node);
+    stack.push({ value: node, depth: frame.depth, exit: true });
+
+    const prototype = Object.getPrototypeOf(node);
+    if (Object.getOwnPropertySymbols(node).length > 0) invalidTeamState();
+    if (Array.isArray(node)) {
+      if (prototype !== Array.prototype || node.length > MAX_TEAM_STATE_COLLECTION_ITEMS) invalidTeamState();
+      const keys = Object.keys(node);
+      const propertyNames = Object.getOwnPropertyNames(node);
+      if (
+        propertyNames.length !== keys.length + 1
+        || keys.length !== node.length
+        || keys.some((key) => !/^(?:0|[1-9]\d*)$/u.test(key) || Number(key) >= node.length)
+      ) invalidTeamState();
+      budget.items += node.length;
+      if (budget.items > MAX_TEAM_STATE_COLLECTION_ITEMS) invalidTeamState();
+      for (let index = node.length - 1; index >= 0; index -= 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(node, String(index));
+        if (!descriptor || !("value" in descriptor)) invalidTeamState();
+        stack.push({ value: descriptor.value, depth: frame.depth + 1 });
+      }
+      continue;
+    }
+    if (prototype !== Object.prototype && prototype !== null) invalidTeamState();
+    const record = node as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (Object.getOwnPropertyNames(record).length !== keys.length) invalidTeamState();
+    if (keys.length > MAX_TEAM_STATE_JSON_KEYS) invalidTeamState();
+    budget.keys += keys.length;
+    if (budget.keys > MAX_TEAM_STATE_JSON_TOTAL_KEYS) invalidTeamState();
+    for (let index = keys.length - 1; index >= 0; index -= 1) {
+      const key = keys[index]!;
+      if (!boundedText(key, 256)) invalidTeamState();
+      accountString(key);
+      if (BOUNDED_ID_FIELDS[key] === true) {
+        const entry = record[key];
+        if (entry !== null && entry !== undefined && !boundedId(entry)) invalidTeamState();
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(record, key);
+      if (!descriptor || !("value" in descriptor)) invalidTeamState();
+      stack.push({ value: descriptor.value, depth: frame.depth + 1 });
+    }
+  }
+}
+
+function parseTeamState(text: string): TeamState {
+  const parsed: unknown = JSON.parse(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) invalidTeamState();
+  const value = parsed as Record<string, unknown>;
+  const classification = value.classification;
+  const classificationRecord = classification && typeof classification === "object" && !Array.isArray(classification)
+    ? classification as Record<string, unknown>
+    : null;
+  const pause = value.pause;
+  const pauseRecord = pause && typeof pause === "object" && !Array.isArray(pause)
+    ? pause as Record<string, unknown>
+    : null;
+  const issue = value.issue;
+  const issueRecord = issue && typeof issue === "object" && !Array.isArray(issue)
+    ? issue as Record<string, unknown>
+    : null;
+  if (
+    value.schema !== 1
+    || !boundedText(value.branch, MAX_ADVANCE_FIELD_BYTES)
+    || !boundedText(value.task, MAX_CTO_SPECIFICATION_TEXT_BYTES)
+    || !classificationRecord
+    || TASK_TYPES[String(classificationRecord.type)] !== true
+    || COMPLEXITIES[String(classificationRecord.complexity)] !== true
+    || CONFIDENCES[String(classificationRecord.confidence)] !== true
+    || !boundedId(classificationRecord.workflow)
+    || typeof classificationRecord.autonomous !== "boolean"
+    || typeof value.workflow_override !== "boolean"
+    || (issue !== null && !issueRecord)
+    || (issueRecord !== null && (!Number.isSafeInteger(issueRecord.number) || (issueRecord.url !== undefined && !boundedText(issueRecord.url, MAX_ADVANCE_FIELD_BYTES))))
+    || !boundedId(value.stage_cursor)
+    || !Array.isArray(value.stages)
+    || value.stages.length > MAX_TEAM_STATE_COLLECTION_ITEMS
+    || !value.artifacts || typeof value.artifacts !== "object" || Array.isArray(value.artifacts)
+    || !pauseRecord
+    || PAUSE_KINDS[String(pauseRecord.kind)] !== true
+    || !boundedText(pauseRecord.reason, MAX_CTO_SPECIFICATION_TEXT_BYTES, true)
+    || !boundedText(value.updated_at, MAX_ADVANCE_FIELD_BYTES)
+  ) invalidTeamState();
+  for (const stage of value.stages) {
+    if (!stage || typeof stage !== "object" || Array.isArray(stage)) invalidTeamState();
+    const record = stage as Record<string, unknown>;
+    if (!boundedId(record.id) || typeof record.status !== "string" || STAGE_STATUSES[record.status] !== true) invalidTeamState();
+  }
+  for (const [artifactId, artifactPath] of Object.entries(value.artifacts)) {
+    if (!boundedText(artifactId, MAX_ADVANCE_FIELD_BYTES) || !boundedText(artifactPath, MAX_ADVANCE_FIELD_BYTES)) invalidTeamState();
+  }
+  validateTeamStateValues(value, { bytes: 0, items: 0, nodes: 0, keys: 0 });
+  return value as unknown as TeamState;
+}
+
+function parseCtoState(text: string): CtoState | null {
+  const parsed: unknown = JSON.parse(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  return parsePersistedCtoState(parsed as Record<string, unknown>);
+}
+
+function pathKind(pin: PinnedProjectRoot, relativePath: string): "file" | "directory" | "symlink" | "other" | null {
+  return pin.pathEntryInfo(relativePath)?.kind ?? null;
+}
+
+function isRegularState(pin: PinnedProjectRoot, relativePath: string): boolean {
+  return pathKind(pin, relativePath) === "file";
+}
+
+function isSafeDirectory(pin: PinnedProjectRoot, relativePath: string): boolean {
+  const kind = pathKind(pin, relativePath);
+  return kind === null || kind === "directory";
+}
+
+function stateFeatureIdentity(state: TeamState, slug: string): boolean {
+  const candidate = (state as TeamState & { feature_id?: unknown }).feature_id
+    ?? (state.work_identity as { feature_id?: unknown } | undefined)?.feature_id;
+  return candidate === undefined || candidate === slug;
+}
+
+function sourceFromTeamState(
+  cwd: string,
+  pin: PinnedProjectRoot,
+  id: string,
+  state: TeamState,
+  stateRelative: string,
+  stateDirRelative: string,
+  artifactsRelative: string,
+  isLegacy: boolean,
+): ResolvedDoWork {
+  if (!isLegacy && !stateFeatureIdentity(state, id)) throw new Error("state feature identity does not match directory name");
+  if (!isSafeDirectory(pin, artifactsRelative)) throw new PinnedRootError("path_unauthorized", "artifacts directory must not be a symlink");
+  return {
+    kind: "do-work",
+    id,
+    state,
+    statePath: sourcePath(cwd, stateRelative),
+    stateDir: sourcePath(cwd, stateDirRelative),
+    artifactsDir: sourcePath(cwd, artifactsRelative),
+    isLegacy,
+    status: "ok",
+    updatedAt: state.updated_at,
+  };
+}
+
+function resolveFeaturePinned(cwd: string, pin: PinnedProjectRoot, slug: string): ResolvedDoWork | null {
+  const featureRelative = join(WORK_STATE_DIR, FEATURES_DIR, slug);
+  if (pathKind(pin, featureRelative) !== "directory") return null;
+  const stateRelative = join(featureRelative, "state.json");
+  if (!isRegularState(pin, stateRelative)) return null;
+  const state = parseTeamState(readUtf8(pin, stateRelative, MAX_PERSISTED_STATE_BYTES));
+  return sourceFromTeamState(cwd, pin, slug, state, stateRelative, featureRelative, join(featureRelative, "artifacts"), false);
+}
+
+function resolveLegacyPinned(cwd: string, pin: PinnedProjectRoot): ResolvedDoWork | null {
+  const stateRelative = join(WORK_STATE_DIR, LEGACY_STATE);
+  if (!isRegularState(pin, stateRelative)) return null;
+  const state = parseTeamState(readUtf8(pin, stateRelative, MAX_PERSISTED_STATE_BYTES));
+  return sourceFromTeamState(cwd, pin, "legacy", state, stateRelative, WORK_STATE_DIR, join(WORK_STATE_DIR, "artifacts"), true);
+}
 
 export const WORK_STATE_DIR = ".work-state";
 export const LEGACY_STATE = "team-state.json";
@@ -73,25 +373,6 @@ export const EXCLUDED_SOURCE_NAMES: Record<string, true> = {
   "vibe-report": true, // human E2E/report documentation at the workspace root
   "events.jsonl": true, // observability event stream
 };
-
-/**
- * Files that count as markdown run-state evidence (mirror of the
- * active-evidence list in commands/cto.ts — the report path always calls
- * `markdownCtoState`; this list only labels the terminal projection).
- */
-export const CTO_MD_EVIDENCE: readonly string[] = ["team-plan.md", "decisions.md", "cto_discovery.md"];
-
-/**
- * Files that mark an agent-written markdown run FINISHED (mirror of
- * FINISH_MARKERS in commands/cto.ts). A run without state.json stays active
- * until one of these markers appears.
- */
-export const CTO_MD_FINISH_MARKERS: readonly string[] = [
-  "summary.md",
-  "summary.json",
-  "integration_review.md",
-  "integration_review.json",
-];
 
 // ── Source model ────────────────────────────────────────────────────────────
 
@@ -152,20 +433,12 @@ export interface CtoSessionSource {
   /** Safe relative id: the run directory name. */
   id: string;
   state: CtoState | null;
-  /** Canonical state path; null for markdown-state runs. */
-  statePath: string | null;
+  /** Canonical state path. */
+  statePath: string;
   runDir: string;
-  format: "json" | "markdown";
+  format: "json";
   status: SessionSourceStatus;
   error?: string;
-  /**
-   * Visualization-only projection: an agent-written markdown run that a
-   * summary/integration-review marker has finished. `markdownCtoState`
-   * returns null for it (report semantics: such runs are invisible to the
-   * report), but the projection keeps it discoverable as degraded so a
-   * removed target never resolves to another session.
-   */
-  terminalMarkdown?: boolean;
   updatedAt: string | null;
 }
 
@@ -204,25 +477,27 @@ export function ctoTeamArtifactsDir(cwd: string, teamId: string): string {
  * stream (events.jsonl) and the inbound answers/ tree. Sorted
  * lexicographically — never filesystem enumeration order.
  */
-export function ctoRunLocalFiles(runDir: string): string[] {
-  let names: string[];
+export function ctoRunLocalFiles(runDir: string, suppliedPin?: PinnedProjectRoot): string[] {
+  const rootCandidate = resolve(runDir, "..", "..", "..");
+  const opened = ownsPin(rootCandidate, suppliedPin);
+  if (!opened) return [];
+  const { pin, owned } = opened;
   try {
-    names = readdirSync(runDir);
+    const relativeRunDir = pin.relativePath(runDir);
+    if (!relativeRunDir || !pin.isStable()) return [];
+    const names = pin.listDirectory(relativeRunDir, { maxEntries: 4096, maxNameBytes: 512 * 1024 });
+    const out: string[] = [];
+    for (const name of names) {
+      if (EXCLUDED_SOURCE_NAMES[name] || name === "state.json" || name === "answers") continue;
+      if (!name.endsWith(".md") && !name.endsWith(".json")) continue;
+      if (pathKind(pin, join(relativeRunDir, name)) === "file") out.push(name);
+    }
+    return out.sort();
   } catch {
     return [];
+  } finally {
+    if (owned) pin.close();
   }
-  const out: string[] = [];
-  for (const name of names) {
-    if (EXCLUDED_SOURCE_NAMES[name]) continue;
-    if (name === "state.json" || name === "answers") continue;
-    if (!name.endsWith(".md") && !name.endsWith(".json")) continue;
-    try {
-      if (statSync(join(runDir, name)).isFile()) out.push(name);
-    } catch {
-      // missing/racy — skip
-    }
-  }
-  return out.sort();
 }
 
 // ── Exact-selector resolution (report semantics, verbatim) ──────────────────
@@ -240,142 +515,146 @@ export function ctoRunLocalFiles(runDir: string): string[] {
  * Returns null when the session does not exist — callers turn that into the
  * same "not found" error the report throws today.
  */
-export function resolveDoWorkSource(cwd: string, id?: string): ResolvedDoWork | null {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  if (id && id !== "legacy") {
-    if (!isSinglePathSegment(id)) return null; // traversal-shaped selector can never address a real feature
-    const featureDir = join(wsDir, FEATURES_DIR, id);
-    const statePath = join(featureDir, "state.json");
-    if (!existsSync(statePath)) return null;
-    // Throws on corrupt state — exact-id report parity (buildSessionReport
-    // surfaces the JSON.parse error unchanged).
-    const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-    return {
-      kind: "do-work",
-      id,
-      state,
-      statePath,
-      stateDir: featureDir,
-      artifactsDir: join(featureDir, "artifacts"),
-      isLegacy: false,
-      status: "ok",
-      updatedAt: state.updated_at,
-    };
-  }
-  if (id === "legacy") {
-    const statePath = join(wsDir, LEGACY_STATE);
-    if (!existsSync(statePath)) return null;
-    const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-    return {
-      kind: "do-work",
-      id: "legacy",
-      state,
-      statePath,
-      stateDir: wsDir,
-      artifactsDir: join(wsDir, "artifacts"),
-      isLegacy: true,
-      status: "ok",
-      updatedAt: state.updated_at,
-    };
-  }
-  const resolved = resolveState(cwd);
-  if (resolved.state && resolved.statePath) {
-    const slug = resolved.isLegacy ? "legacy" : basename(resolved.stateDir ?? "");
-    return {
-      kind: "do-work",
-      id: slug,
-      state: resolved.state,
-      statePath: resolved.statePath,
-      stateDir: resolved.stateDir ?? wsDir,
-      artifactsDir: resolved.artifactsDir ?? join(wsDir, "artifacts"),
-      isLegacy: resolved.isLegacy,
-      isStale: resolved.isStale,
-      status: "ok",
-      updatedAt: resolved.state.updated_at,
-    };
-  }
-  // "Latest" fallback: no active-feature pointer and no legacy state — scan
-  // per-feature states and pick the newest by updated_at. Corrupt states are
-  // skipped (same as the report's scan).
-  const featuresDir = join(wsDir, FEATURES_DIR);
-  if (!existsSync(featuresDir)) return null;
-  let best: ResolvedDoWork | null = null;
+export function resolveDoWorkSource(cwd: string, id?: string, suppliedPin?: PinnedProjectRoot): ResolvedDoWork | null {
+  const opened = ownsPin(cwd, suppliedPin);
+  if (!opened) return null;
+  const { pin, owned } = opened;
   try {
-    for (const slug of readdirSync(featuresDir)) {
-      const entry = readFeatureSource(wsDir, slug);
-      if (!entry || !entry.state) continue;
-      if (!best || entry.state.updated_at > best.state.updated_at) {
-        best = { ...entry, state: entry.state, status: "ok" };
+    if (!pin.isStable()) return null;
+    if (id && id !== "legacy") {
+      if (!isSinglePathSegment(id)) return null;
+      try {
+        return resolveFeaturePinned(cwd, pin, id);
+      } catch (error) {
+        if (error instanceof PinnedRootError
+          && (error.code === "not_found" || error.code === "path_unauthorized" || error.code === "not_regular" || error.code === "changed")) return null;
+        throw error;
       }
     }
-  } catch {
-    // unreadable features dir — no do-work session available
+    if (id === "legacy") {
+      try {
+        return resolveLegacyPinned(cwd, pin);
+      } catch (error) {
+        if (error instanceof PinnedRootError
+          && (error.code === "not_found" || error.code === "path_unauthorized" || error.code === "not_regular" || error.code === "changed")) return null;
+        throw error;
+      }
+    }
+
+    const activeRelative = join(WORK_STATE_DIR, ".active-feature");
+    const activeKind = pathKind(pin, activeRelative);
+    if (activeKind !== null) {
+      if (activeKind !== "file") return null;
+      const active = readUtf8(pin, activeRelative, MAX_POINTER_BYTES).trim();
+      if (!isSinglePathSegment(active)) return null;
+      try {
+        const selected = resolveFeaturePinned(cwd, pin, active);
+        if (selected) return selected;
+      } catch (error) {
+        if (!(error instanceof PinnedRootError
+          && (error.code === "not_found" || error.code === "path_unauthorized" || error.code === "not_regular" || error.code === "changed"))) throw error;
+      }
+    }
+
+    try {
+      const legacy = resolveLegacyPinned(cwd, pin);
+      if (legacy) return legacy;
+    } catch (error) {
+      if (!(error instanceof PinnedRootError
+        && (error.code === "not_found" || error.code === "path_unauthorized" || error.code === "not_regular" || error.code === "changed"))) throw error;
+    }
+
+    const featuresRelative = join(WORK_STATE_DIR, FEATURES_DIR);
+    if (pathKind(pin, featuresRelative) !== "directory") return null;
+    let names: string[];
+    try {
+      names = pin.listDirectory(featuresRelative, { maxEntries: 4096, maxNameBytes: 512 * 1024 }).sort();
+    } catch {
+      return null;
+    }
+    let best: ResolvedDoWork | null = null;
+    for (const slug of names) {
+      if (!isSinglePathSegment(slug)) continue;
+      try {
+        const entry = resolveFeaturePinned(cwd, pin, slug);
+        if (entry && (best === null || (entry.updatedAt ?? "") > (best.updatedAt ?? ""))) best = entry;
+      } catch (error) {
+        if (error instanceof PinnedRootError
+          && (error.code === "not_found" || error.code === "path_unauthorized" || error.code === "not_regular" || error.code === "changed")) continue;
+        // The latest selector skips malformed peers, preserving report parity.
+      }
+    }
+    return best;
+  } finally {
+    if (owned) pin.close();
   }
-  return best;
 }
 
 /**
- * Resolve one CTO run by exact selector, preserving report semantics:
- * `state.json` first (JSON format); when absent, the agent-written markdown
- * fallback via `markdownCtoState` (ACTIVE runs only — a terminal markdown
- * run returns null here and stays invisible to the report; see
- * `listCtoSources` for the visualization-only terminal projection). No id →
+ * Resolve one CTO run by exact selector from canonical `state.json`; a
+ * markdown-only run is inactive and never becomes report authority. No id →
  * the newest run by updated_at. A corrupt `state.json` makes the run
  * invisible (no markdown fallback), matching the report. Run ids must be
  * single non-traversal path segments: traversal-shaped selectors are
  * rejected, while previously valid exotic ids (unicode, spaces) resolve
  * verbatim when the state is readable.
  */
-export function resolveCtoSource(cwd: string, id?: string): ResolvedCto | null {
-  const runsDir = join(cwd, WORK_STATE_DIR, CTO_DIR);
-  if (!existsSync(runsDir)) return null;
+export function resolveCtoSource(cwd: string, id?: string, suppliedPin?: PinnedProjectRoot): ResolvedCto | null {
+  const opened = ownsPin(cwd, suppliedPin);
+  if (!opened) return null;
+  const { pin, owned } = opened;
+  const runsRelative = join(WORK_STATE_DIR, CTO_DIR);
   const readRun = (runId: string): ResolvedCto | null => {
-    const runDir = join(runsDir, runId);
-    if (!existsSync(runDir)) return null;
-    const statePath = join(runDir, "state.json");
-    if (existsSync(statePath)) {
-      const state = readCtoState(runId, cwd);
-      if (!state) return null; // corrupt state.json — invisible to the report (unchanged)
-      return {
-        kind: "cto",
-        id: runId,
-        state,
-        statePath,
-        runDir,
-        format: "json",
-        status: "ok",
-        updatedAt: state.updated_at,
-      };
-    }
-    const mdState = markdownCtoState(runId, runDir);
-    if (!mdState) return null;
+    const runRelative = join(runsRelative, runId);
+    if (pathKind(pin, runRelative) !== "directory") return null;
+    const stateRelative = join(runRelative, "state.json");
+    if (!isRegularState(pin, stateRelative)) return null;
+    const state = parseCtoState(readUtf8(pin, stateRelative, MAX_CTO_STATE_READ_BYTES));
+    if (!state || state.id !== runId) return null;
     return {
       kind: "cto",
       id: runId,
-      state: mdState,
-      statePath: null,
-      runDir,
-      format: "markdown",
+      state,
+      statePath: sourcePath(cwd, stateRelative),
+      runDir: sourcePath(cwd, runRelative),
+      format: "json",
       status: "ok",
-      updatedAt: mdState.updated_at,
+      updatedAt: state.updated_at,
     };
   };
-  if (id) {
-    if (!isSinglePathSegment(id)) return null; // traversal-shaped selector can never name a real run
-    return readRun(id);
-  }
-  let best: ResolvedCto | null = null;
   try {
-    for (const runId of readdirSync(runsDir)) {
-      if (!isSinglePathSegment(runId)) continue; // defensive — readdir entries are single segments
-      const run = readRun(runId);
-      if (!run) continue;
-      if (!best || run.state.updated_at > best.state.updated_at) best = run;
+    if (!pin.isStable()) return null;
+    if (id) {
+      if (!isSafeCtoRunId(id)) return null;
+      try {
+        return readRun(id);
+      } catch (error) {
+        if (error instanceof PinnedRootError
+          && (error.code === "not_found" || error.code === "path_unauthorized" || error.code === "not_regular" || error.code === "changed")) return null;
+        return null;
+      }
     }
-  } catch {
-    // unreadable runs dir — no CTO session available
+    if (pathKind(pin, runsRelative) !== "directory") return null;
+    let names: string[];
+    try {
+      names = pin.listDirectory(runsRelative, { maxEntries: 4096, maxNameBytes: 512 * 1024 }).sort();
+    } catch {
+      return null;
+    }
+    let best: ResolvedCto | null = null;
+    for (const runId of names) {
+      if (!isSafeCtoRunId(runId)) continue;
+      try {
+        const run = readRun(runId);
+        if (run && (best === null || (run.updatedAt ?? "") > (best.updatedAt ?? ""))) best = run;
+      } catch {
+        // Enumeration is fail-closed for malformed or racing peers.
+      }
+    }
+    return best;
+  } finally {
+    if (owned) pin.close();
   }
-  return best;
 }
 
 // ── Safe enumeration (visualize projection) ─────────────────────────────────
@@ -386,24 +665,67 @@ export function resolveCtoSource(cwd: string, id?: string): ResolvedCto | null {
  * `error` entry here — enumeration never throws; the report's exact-id probe
  * keeps throwing instead (see resolveDoWorkSource).
  */
-function readFeatureSource(wsDir: string, slug: string): DoWorkSessionSource | null {
-  if (!isSinglePathSegment(slug)) return null; // defensive — readdir entries are single segments
-  const featureDir = join(wsDir, FEATURES_DIR, slug);
-  const statePath = join(featureDir, "state.json");
-  if (!existsSync(statePath)) return null;
+function readFeatureSource(cwd: string, pin: PinnedProjectRoot, slug: string): DoWorkSessionSource | null {
+  if (!isSinglePathSegment(slug)) return null;
+  const featureRelative = join(WORK_STATE_DIR, FEATURES_DIR, slug);
+  if (pathKind(pin, featureRelative) !== "directory") return null;
+  const stateRelative = join(featureRelative, "state.json");
+  const statePath = sourcePath(cwd, stateRelative);
+  const featureDir = sourcePath(cwd, featureRelative);
+  const artifactsRelative = join(featureRelative, "artifacts");
   const base = {
     kind: "do-work" as const,
     id: slug,
     statePath,
     stateDir: featureDir,
-    artifactsDir: join(featureDir, "artifacts"),
+    artifactsDir: sourcePath(cwd, artifactsRelative),
     isLegacy: false,
   };
+  const stateKind = pathKind(pin, stateRelative);
+  if (stateKind === null) return null;
+  if (stateKind !== "file") {
+    return { ...base, state: null, status: "error", error: "state.json is not a regular file", updatedAt: null };
+  }
   try {
-    const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-    return { ...base, state, status: "ok" as const, updatedAt: state.updated_at };
+    const state = parseTeamState(readUtf8(pin, stateRelative, MAX_PERSISTED_STATE_BYTES));
+    if (!stateFeatureIdentity(state, slug)) {
+      return { ...base, state: null, status: "error", error: "state feature identity does not match directory name", updatedAt: null };
+    }
+    const artifactsKind = pathKind(pin, artifactsRelative);
+    if (artifactsKind !== null && artifactsKind !== "directory") {
+      return { ...base, state, status: "degraded", error: "artifacts directory is not a regular directory", updatedAt: state.updated_at };
+    }
+    return { ...base, state, status: "ok", updatedAt: state.updated_at };
   } catch {
-    return { ...base, state: null, status: "error" as const, error: "unreadable state.json", updatedAt: null };
+    return { ...base, state: null, status: "error", error: "unreadable state.json", updatedAt: null };
+  }
+}
+
+function listLegacySource(cwd: string, pin: PinnedProjectRoot): DoWorkSessionSource | null {
+  const stateRelative = join(WORK_STATE_DIR, LEGACY_STATE);
+  const statePath = sourcePath(cwd, stateRelative);
+  const stateDir = sourcePath(cwd, WORK_STATE_DIR);
+  const artifactsRelative = join(WORK_STATE_DIR, "artifacts");
+  const base = {
+    kind: "do-work" as const,
+    id: "legacy",
+    statePath,
+    stateDir,
+    artifactsDir: sourcePath(cwd, artifactsRelative),
+    isLegacy: true,
+  };
+  const stateKind = pathKind(pin, stateRelative);
+  if (stateKind === null) return null;
+  if (stateKind !== "file") return { ...base, state: null, status: "error", error: "unreadable team-state.json", updatedAt: null };
+  try {
+    const state = parseTeamState(readUtf8(pin, stateRelative, MAX_PERSISTED_STATE_BYTES));
+    const artifactsKind = pathKind(pin, artifactsRelative);
+    if (artifactsKind !== null && artifactsKind !== "directory") {
+      return { ...base, state, status: "degraded", error: "artifacts directory is not a regular directory", updatedAt: state.updated_at };
+    }
+    return { ...base, state, status: "ok", updatedAt: state.updated_at };
+  } catch {
+    return { ...base, state: null, status: "error", error: "unreadable team-state.json", updatedAt: null };
   }
 }
 
@@ -416,168 +738,160 @@ function readFeatureSource(wsDir: string, slug: string): DoWorkSessionSource | n
  * id. Ordering: updated_at desc, then id — never filesystem enumeration
  * order.
  */
-export function listDoWorkSources(cwd: string): DoWorkSessionSource[] {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  const out: DoWorkSessionSource[] = [];
-  const legacyPath = join(wsDir, LEGACY_STATE);
-  if (existsSync(legacyPath)) {
-    try {
-      const state = JSON.parse(readFileSync(legacyPath, "utf8")) as TeamState;
-      out.push({
-        kind: "do-work",
-        id: "legacy",
-        state,
-        statePath: legacyPath,
-        stateDir: wsDir,
-        artifactsDir: join(wsDir, "artifacts"),
-        isLegacy: true,
-        status: "ok",
-        updatedAt: state.updated_at,
-      });
-    } catch {
-      out.push({
-        kind: "do-work",
-        id: "legacy",
-        state: null,
-        statePath: legacyPath,
-        stateDir: wsDir,
-        artifactsDir: join(wsDir, "artifacts"),
-        isLegacy: true,
-        status: "error",
-        error: "unreadable team-state.json",
-        updatedAt: null,
-      });
-    }
-  }
-  const featuresDir = join(wsDir, FEATURES_DIR);
-  if (existsSync(featuresDir)) {
-    let names: string[];
-    try {
-      names = readdirSync(featuresDir);
-    } catch {
-      names = [];
-    }
-    for (const slug of names) {
-      const entry = readFeatureSource(wsDir, slug);
-      if (!entry) continue;
-      if (entry.id === "legacy") {
-        out.push({
-          ...entry,
-          status: "degraded",
-          error: "id 'legacy' is reserved for the legacy root state — feature reachable only by category",
-        });
-        continue;
+export function listDoWorkSources(cwd: string, suppliedPin?: PinnedProjectRoot): DoWorkSessionSource[] {
+  const opened = ownsPin(cwd, suppliedPin);
+  if (!opened) return [];
+  const { pin, owned } = opened;
+  try {
+    if (!pin.isStable()) return [];
+    const out: DoWorkSessionSource[] = [];
+    const legacy = listLegacySource(cwd, pin);
+    if (legacy) out.push(legacy);
+    const featuresRelative = join(WORK_STATE_DIR, FEATURES_DIR);
+    if (pathKind(pin, featuresRelative) === "directory") {
+      let names: string[] = [];
+      try {
+        names = pin.listDirectory(featuresRelative, { maxEntries: 4096, maxNameBytes: 512 * 1024 });
+      } catch {
+        names = [];
       }
-      out.push(entry);
+      for (const slug of names.sort()) {
+        const entry = readFeatureSource(cwd, pin, slug);
+        if (!entry) continue;
+        if (entry.id === "legacy") {
+          out.push({
+            ...entry,
+            status: "degraded",
+            error: "id 'legacy' is reserved for the legacy root state — feature reachable only by category",
+          });
+        } else {
+          out.push(entry);
+        }
+      }
     }
+    return sortSources(out);
+  } catch {
+    return [];
+  } finally {
+    if (owned) pin.close();
   }
-  return sortSources(out);
 }
 
 /**
  * Enumerate every CTO run deterministically. JSON runs are `ok`; a corrupt
  * `state.json` is an `error` entry (category-only — the report path skips
- * it); agent-written markdown runs are `ok` while active and become a
- * degraded `terminalMarkdown` projection once a summary/integration-review
- * marker finishes them. Ordering: updated_at desc, then id — never
- * filesystem enumeration order.
+ * it). Markdown-only directories are not sessions. Ordering: updated_at desc,
+ * then id — never filesystem enumeration order.
  */
-export function listCtoSources(cwd: string): CtoSessionSource[] {
-  const runsDir = join(cwd, WORK_STATE_DIR, CTO_DIR);
-  if (!existsSync(runsDir)) return [];
-  let names: string[];
+export function listCtoSources(cwd: string, suppliedPin?: PinnedProjectRoot): CtoSessionSource[] {
+  const opened = ownsPin(cwd, suppliedPin);
+  if (!opened) return [];
+  const { pin, owned } = opened;
   try {
-    names = readdirSync(runsDir);
-  } catch {
-    return []; // unreadable runs dir — no CTO sessions
-  }
-  const out: CtoSessionSource[] = [];
-  for (const runId of names) {
-    if (!isSinglePathSegment(runId)) continue; // defensive — readdir entries are single segments; exotic names are kept verbatim, never aliased
-    const runDir = join(runsDir, runId);
-    let isDir = false;
+    if (!pin.isStable()) return [];
+    const runsRelative = join(WORK_STATE_DIR, CTO_DIR);
+    if (pathKind(pin, runsRelative) !== "directory") return [];
+    let names: string[];
     try {
-      isDir = statSync(runDir).isDirectory();
+      names = pin.listDirectory(runsRelative, { maxEntries: 4096, maxNameBytes: 512 * 1024 });
     } catch {
-      continue;
+      return [];
     }
-    if (!isDir) continue; // a stray file under cto/ is not a run
-    const statePath = join(runDir, "state.json");
-    if (existsSync(statePath)) {
-      let state: CtoState | null = null;
+    const out: CtoSessionSource[] = [];
+    for (const runId of names.sort()) {
+      if (!isSinglePathSegment(runId)) continue;
+      const runRelative = join(runsRelative, runId);
+      if (pathKind(pin, runRelative) !== "directory") continue;
+      const stateRelative = join(runRelative, "state.json");
+      const statePath = sourcePath(cwd, stateRelative);
+      const runDir = sourcePath(cwd, runRelative);
+      if (!isSafeCtoRunId(runId)) {
+        if (pathKind(pin, stateRelative) !== null) {
+          out.push({ kind: "cto", id: runId, state: null, statePath, runDir, format: "json", status: "error", error: "unsafe run id", updatedAt: null });
+        }
+        continue;
+      }
+      if (pathKind(pin, stateRelative) === null) continue;
+      const base = { kind: "cto" as const, id: runId, statePath, runDir, format: "json" as const };
       try {
-        state = readCtoState(runId, cwd);
+        if (!isRegularState(pin, stateRelative)) {
+          out.push({ ...base, state: null, status: "error", error: "unreadable state.json", updatedAt: null });
+          continue;
+        }
+        const state = parseCtoState(readUtf8(pin, stateRelative, MAX_CTO_STATE_READ_BYTES));
+        if (!state || state.id !== runId) {
+          out.push({ ...base, state: null, status: "error", error: "state identity does not match run directory", updatedAt: null });
+          continue;
+        }
+        out.push({ ...base, state, status: "ok", updatedAt: state.updated_at });
       } catch {
-        state = null;
+        out.push({ ...base, state: null, status: "error", error: "unreadable state.json", updatedAt: null });
       }
-      if (state) {
-        out.push({
-          kind: "cto",
-          id: runId,
-          state,
-          statePath,
-          runDir,
-          format: "json",
-          status: "ok",
-          updatedAt: state.updated_at,
-        });
-      } else {
-        out.push({
-          kind: "cto",
-          id: runId,
-          state: null,
-          statePath,
-          runDir,
-          format: "json",
-          status: "error",
-          error: "unreadable state.json",
-          updatedAt: null,
-        });
-      }
-      continue;
     }
-    const mdState = markdownCtoState(runId, runDir);
-    if (mdState) {
-      out.push({
-        kind: "cto",
-        id: runId,
-        state: mdState,
-        statePath: null,
-        runDir,
-        format: "markdown",
-        status: "ok",
-        updatedAt: mdState.updated_at,
-      });
-      continue;
-    }
-    if (isTerminalMarkdownRun(runDir)) {
-      out.push({
-        kind: "cto",
-        id: runId,
-        state: null,
-        statePath: null,
-        runDir,
-        format: "markdown",
-        status: "degraded",
-        terminalMarkdown: true,
-        error: "terminal markdown run (summary/integration-review marker present) — projection only",
-        updatedAt: newestRunLocalMtime(runDir),
-      });
-    }
-    // No state at all (no state.json, no markdown evidence) — not a session.
+    return sortSources(out);
+  } catch {
+    return [];
+  } finally {
+    if (owned) pin.close();
   }
-  return sortSources(out);
 }
 
 /**
  * Every discoverable session (do-work + cto) in the total deterministic
- * order — the visualize entry point for the "all sessions" scope.
+ * order — the visualize entry point for the "all sessions" scope. The
+ * returned cross-category view is capped at MAX_SESSION_SOURCES.
  */
-export function listSessions(cwd: string): SessionSourceEntry[] {
-  return sortSources([...listDoWorkSources(cwd), ...listCtoSources(cwd)]);
+export function listSessions(cwd: string, suppliedPin?: PinnedProjectRoot): SessionSourceEntry[] {
+  const opened = ownsPin(cwd, suppliedPin);
+  if (!opened) return [];
+  const { pin, owned } = opened;
+  try {
+    if (!pin.isStable()) return [];
+    // Both category readers return the same total order. Merge only the
+    // bounded prefix so a project with many valid sessions never retains or
+    // sorts an unbounded cross-category array.
+    return mergeSortedSources(
+      listDoWorkSources(cwd, pin),
+      listCtoSources(cwd, pin),
+      MAX_SESSION_SOURCES,
+    );
+  } finally {
+    if (owned) pin.close();
+  }
 }
 
 // ── Deterministic ordering ──────────────────────────────────────────────────
+
+function compareSources(a: SessionSourceEntry, b: SessionSourceEntry): number {
+  const at = a.updatedAt ?? "";
+  const bt = b.updatedAt ?? "";
+  if (at !== bt) return at < bt ? 1 : -1;
+  if (a.kind !== b.kind) return a.kind < b.kind ? -1 : 1;
+  if (a.id !== b.id) return a.id < b.id ? -1 : 1;
+  return 0;
+}
+
+function mergeSortedSources(
+  left: readonly SessionSourceEntry[],
+  right: readonly SessionSourceEntry[],
+  limit: number,
+): SessionSourceEntry[] {
+  const merged: SessionSourceEntry[] = [];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (merged.length < limit && (leftIndex < left.length || rightIndex < right.length)) {
+    const leftEntry = left[leftIndex];
+    const rightEntry = right[rightIndex];
+    if (rightEntry === undefined || (leftEntry !== undefined && compareSources(leftEntry, rightEntry) <= 0)) {
+      merged.push(leftEntry!);
+      leftIndex += 1;
+    } else {
+      merged.push(rightEntry);
+      rightIndex += 1;
+    }
+  }
+  return merged;
+}
 
 /**
  * Total deterministic order: updated_at descending (entries without a
@@ -585,50 +899,7 @@ export function listSessions(cwd: string): SessionSourceEntry[] {
  * enumeration order.
  */
 function sortSources<T extends SessionSourceEntry>(entries: T[]): T[] {
-  return [...entries].sort((a, b) => {
-    const at = a.updatedAt ?? "";
-    const bt = b.updatedAt ?? "";
-    if (at !== bt) return at < bt ? 1 : -1;
-    if (a.kind !== b.kind) return a.kind < b.kind ? -1 : 1;
-    if (a.id !== b.id) return a.id < b.id ? -1 : 1;
-    return 0;
-  });
+  return [...entries].sort(compareSources);
 }
 
-/**
- * True when an agent-written markdown run was finished by a
- * summary/integration-review marker (i.e. `markdownCtoState` returns null
- * for the finish-marker reason, not the missing-evidence reason).
- */
-function isTerminalMarkdownRun(runDir: string): boolean {
-  let names: string[];
-  try {
-    names = readdirSync(runDir);
-  } catch {
-    return false;
-  }
-  return (
-    names.some((n) => CTO_MD_EVIDENCE.includes(n)) &&
-    names.some((n) => CTO_MD_FINISH_MARKERS.includes(n))
-  );
-}
 
-/** Newest mtime across run-local .md/.json files (mirrors markdownCtoState's updated_at). */
-function newestRunLocalMtime(runDir: string): string | null {
-  let newest = 0;
-  let names: string[];
-  try {
-    names = readdirSync(runDir);
-  } catch {
-    return null;
-  }
-  for (const name of names) {
-    if (!name.endsWith(".md") && !name.endsWith(".json")) continue;
-    try {
-      newest = Math.max(newest, statSync(join(runDir, name)).mtimeMs);
-    } catch {
-      // missing/racy — skip
-    }
-  }
-  return newest > 0 ? new Date(newest).toISOString() : null;
-}

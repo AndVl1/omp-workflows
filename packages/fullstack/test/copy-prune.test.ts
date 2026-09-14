@@ -7,7 +7,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { once } from "node:events";
+import { spawn } from "node:child_process";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -130,3 +132,146 @@ test("fullstack: obsolete workflow adapters are absent from the package tree", (
 		assert.ok(LEGACY_REMOVED_COMMANDS.includes(name as never), `${name} must remain in upgrade cleanup`);
 	}
 });
+
+test("fullstack security: prune leaves a stale command symlink and outside sentinel untouched", () => {
+	const dir = freshProjectDir();
+	const outside = freshProjectDir();
+	try {
+		const target = join(dir, ".omp", "commands");
+		const outsideSentinel = join(outside, "sentinel.txt");
+		writeFileSync(outsideSentinel, "outside prune sentinel\n", "utf8");
+		mkdirSync(target, { recursive: true });
+		symlinkSync(outside, join(target, "team-next"), "dir");
+
+		assert.deepEqual(pruneStaleCommands(target, []), []);
+		assert.equal(readFileSync(outsideSentinel, "utf8"), "outside prune sentinel\n");
+		assert.deepEqual(readdirSync(outside), ["sentinel.txt"]);
+		assert.equal(lstatSync(join(target, "team-next")).isSymbolicLink(), true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		rmSync(outside, { recursive: true, force: true });
+	}
+});
+
+test("fullstack security: prune removes child links without traversing outside", () => {
+	const dir = freshProjectDir();
+	const outside = freshProjectDir();
+	try {
+		const target = join(dir, ".omp", "commands");
+		const stale = join(target, "team-next");
+		const outsideSentinel = join(outside, "sentinel.txt");
+		writeFileSync(outsideSentinel, "outside child sentinel\n", "utf8");
+		mkdirSync(stale, { recursive: true });
+		symlinkSync(outsideSentinel, join(stale, "outside-link"));
+
+		assert.deepEqual(pruneStaleCommands(target, []), ["team-next"]);
+		assert.equal(readFileSync(outsideSentinel, "utf8"), "outside child sentinel\n");
+		assert.deepEqual(readdirSync(outside), ["sentinel.txt"]);
+		assert.equal(existsSync(stale), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		rmSync(outside, { recursive: true, force: true });
+	}
+});
+
+test("fullstack security: prune survives a concurrent stale-command parent swap", async () => {
+	const dir = freshProjectDir();
+	const outside = freshProjectDir();
+	const target = join(dir, ".omp", "commands");
+	const stale = join(target, "team-next");
+	const backup = join(target, "team-next-backup");
+	const outsideSentinel = join(outside, "sentinel.txt");
+	try {
+		writeCommand(target, "team-next", COMMAND_BODY);
+		writeFileSync(outsideSentinel, "outside race sentinel\n", "utf8");
+		const racer = spawn(
+			process.execPath,
+			[
+				"-e",
+				`const fs=require("node:fs"); const target=process.argv[1]; const backup=process.argv[2]; const outside=process.argv[3]; const end=Date.now()+2000; while(Date.now()<end){ try{fs.renameSync(target,backup)}catch{} try{fs.symlinkSync(outside,target,"dir")}catch{} try{fs.unlinkSync(target)}catch{} try{fs.renameSync(backup,target)}catch{} } try{fs.unlinkSync(target)}catch{} try{fs.renameSync(backup,target)}catch{}`,
+				stale,
+				backup,
+				outside,
+			],
+			{ stdio: "ignore" },
+		);
+		try {
+			pruneStaleCommands(target, []);
+			assert.equal(readFileSync(outsideSentinel, "utf8"), "outside race sentinel\n");
+			assert.deepEqual(readdirSync(outside), ["sentinel.txt"]);
+		} finally {
+			if (racer.exitCode === null) {
+				racer.kill();
+				await once(racer, "exit");
+			}
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		rmSync(outside, { recursive: true, force: true });
+	}
+});
+
+test("fullstack security: bounded target scan rejects many entries without partial prune", () => {
+	const dir = freshProjectDir();
+	try {
+		const target = join(dir, ".omp", "commands");
+		writeCommand(target, "team-next", COMMAND_BODY);
+		for (let index = 0; index < 4100; index++) {
+			mkdirSync(join(target, `unrelated-${index}-${"x".repeat(238)}`));
+		}
+		const before = readdirSync(target).sort();
+
+		assert.deepEqual(pruneStaleCommands(target, []), []);
+		assert.equal(existsSync(join(target, "team-next")), true, "stale command must remain when scan budget is exceeded");
+		assert.deepEqual(readdirSync(target).sort(), before, "bounded scan must fail before deleting any entry");
+		assert.equal(existsSync(join(target, SHIPPED_MANIFEST_FILE)), false, "manifest must not be rewritten after a failed scan");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+
+test("fullstack security: bounded stale-tree scan rejects many children without partial prune", () => {
+	const dir = freshProjectDir();
+	try {
+		const target = join(dir, ".omp", "commands");
+		const stale = join(target, "team-next");
+		mkdirSync(stale, { recursive: true });
+		for (let index = 0; index < 4100; index++) {
+			writeFileSync(join(stale, `child-${index}.ts`), "stale\n", "utf8");
+		}
+		const before = readdirSync(stale).sort();
+
+		assert.deepEqual(pruneStaleCommands(target, []), []);
+		assert.equal(existsSync(stale), true, "stale command must remain when child scan exceeds its budget");
+		assert.deepEqual(readdirSync(stale).sort(), before, "child validation must finish before any deletion");
+		assert.equal(existsSync(join(target, SHIPPED_MANIFEST_FILE)), false, "manifest must not be rewritten after a failed child scan");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+for (const [operationName, operation] of [
+	["session sync", ensureCommandsForSession],
+	["force install copy", copyCommandsForInstall],
+] as const) {
+	test(`fullstack security: ${operationName} rejects a hostile target scan before mutation`, () => {
+		const dir = freshProjectDir();
+		try {
+			const target = join(dir, ".omp", "commands");
+			writeCommand(target, "team-next", COMMAND_BODY);
+			for (let index = 0; index < 4100; index++) {
+				mkdirSync(join(target, `unrelated-${index}-${"x".repeat(238)}`));
+			}
+			const before = readdirSync(target).sort();
+
+			const result = operation(dir);
+			assert.ok(result.errors.length > 0, "hostile target scan should fail closed");
+			assert.equal(existsSync(join(target, "team-next")), true, "stale command must remain");
+			assert.deepEqual(readdirSync(target).sort(), before, "target scan must happen before copying or pruning");
+			assert.equal(existsSync(join(target, SHIPPED_MANIFEST_FILE)), false, "manifest must remain untouched");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+}

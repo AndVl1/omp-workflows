@@ -1,0 +1,33 @@
+{
+  "label": "t11203-core-test",
+  "command": "npm run test:core",
+  "argv": ["npm", "run", "test:core"],
+  "started_at_utc": "2026-09-11T09:47:02.971Z",
+  "ended_at_utc": "2026-09-11T10:24:18.391Z",
+  "duration_ms": 2235331,
+  "exit_code": 1,
+  "signal": null,
+  "spawn_error": null,
+  "source_snapshot_digest": "eb7f31fc98f7779935c244a7c9b41b822848354ed9908525461da974b6c0eed3",
+  "source_snapshot_path": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/t11203-source-snapshot-start.json",
+  "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/t11203-core-test.log",
+  "sha256": "9ac5208df7386009780ea8ad6949eb5747d0933d1808cc3c590570e0ee734c02",
+  "counts": {
+    "log_bytes": 192926,
+    "log_lines": 2143,
+    "tests": 1762,
+    "passed": 1748,
+    "failed": 14,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0
+  },
+  "status": "failed_and_stale",
+  "failure_excerpt": [
+    "specification-constitution.test.ts: request_changes re-dispatches the same draft stage with feedback and a new version — checkpoint_unverified: request_changes trusted answer requires exact bounded feedback",
+    "specification-constitution.test.ts: constitution Ask uses a trusted RPC session UI for UI-less tool contexts and drops it on session switch — CONSTITUTION_CHECKPOINT_ASK_UNAVAILABLE",
+    "specification-impact-runtime.test.ts: mounted constitution impact flow commits no-impact retention and replays atomically — assertion false !== true",
+    "specification-impact-runtime.test.ts: constitution impact Ask paths — CONSTITUTION_IMPACT_ASK_UNAVAILABLE",
+    "workflow-engine-scopes.test.ts: mounted checkpoint request_changes re-arms the current stage, then revised approval advances — checkpoint_unverified"
+  ]
+}

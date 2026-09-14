@@ -1,0 +1,210 @@
+{
+  "schema_version": "1.0",
+  "feature_id": "readable-cto-blocked",
+  "handoff_id": "readable-cto-blocked.handoff.v1",
+  "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+  "execution_claim_id": "claim-3f02fb822c43095d7a271d42e0dd0695",
+  "execution_owner": "cto",
+  "execution_run_id": "readable-cto-exec-wave-01a06e95",
+  "profile_hash": "4410dbc9f79aa780862e28b53905cccc9f963c375c2c5f0c6d170f03b2f135b5",
+  "entries": [
+    {
+      "entry_id": "closure.e0f2ee737b4ccc990dd6d3743bb9b316120f8ff4253efac771bd5c31d6cd6e04",
+      "subject_kind": "requirement",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "observable_behavior": true,
+      "implementation_evidence_refs": [
+        {
+          "artifact_id": "conformance_evidence-readable-cto-blocked",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/conformance_evidence-readable-cto-blocked.json",
+          "sha256": "527a68d1df886d7eb9221b928e28274d6f64305bfcb9ac466fad28344c52ac03",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "review_verdict": "fail",
+      "review_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-blocked-qa-blocked-support.v1",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-qa-blocked-support.v1.json",
+          "sha256": "a6e57fad28c77691ffb4d22af0279b2052fa3d8d34a11b9f98c0c6f7d5498621",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "test_evidence": [
+        {
+          "evidence_ref": {
+            "artifact_id": "readable-cto-blocked-qa-blocked-support.v1",
+            "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-qa-blocked-support.v1.json",
+            "sha256": "a6e57fad28c77691ffb4d22af0279b2052fa3d8d34a11b9f98c0c6f7d5498621",
+            "schema_status": "met",
+            "quality_gate_status": "met"
+          },
+          "test_kind": "runtime",
+          "status": "fail",
+          "executed_at": "2026-09-05T00:00:00.000Z"
+        }
+      ],
+      "status": "changed_intent",
+      "findings": [
+        {
+          "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+          "subject_id": "FR-1",
+          "message": "Review failed for 'FR-1'; repeat review after remediation.",
+          "evidence_refs": [
+            "readable-cto-blocked-qa-blocked-support.v1"
+          ]
+        },
+        {
+          "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+          "subject_id": "FR-1",
+          "message": "Executed tests failed for 'FR-1'.",
+          "evidence_refs": [
+            "readable-cto-blocked-qa-blocked-support.v1"
+          ]
+        },
+        {
+          "code": "SPEC_IMPLEMENTATION_INTENT_CHANGED",
+          "subject_id": "FR-1",
+          "message": "The generic approved handoff gives no honest behavior to implement beyond the statement that the tool completes the requested outcome: specs/feature-one/spec.md is absent and the in-scope src/blocked/** path is absent. Implementing FR-1 would require inventing an unstated behavior contract.",
+          "evidence_refs": [
+            "conformance_evidence-readable-cto-blocked"
+          ]
+        }
+      ]
+    },
+    {
+      "entry_id": "closure.831814cf042323f928495e987bf94e915e65a6932810188f18991272cd4a2974",
+      "subject_kind": "acceptance_scenario",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "observable_behavior": true,
+      "implementation_evidence_refs": [
+        {
+          "artifact_id": "conformance_evidence-readable-cto-blocked",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/conformance_evidence-readable-cto-blocked.json",
+          "sha256": "527a68d1df886d7eb9221b928e28274d6f64305bfcb9ac466fad28344c52ac03",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "review_verdict": "fail",
+      "review_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-blocked-qa-blocked-support.v1",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-qa-blocked-support.v1.json",
+          "sha256": "a6e57fad28c77691ffb4d22af0279b2052fa3d8d34a11b9f98c0c6f7d5498621",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "test_evidence": [
+        {
+          "evidence_ref": {
+            "artifact_id": "readable-cto-blocked-qa-blocked-support.v1",
+            "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-qa-blocked-support.v1.json",
+            "sha256": "a6e57fad28c77691ffb4d22af0279b2052fa3d8d34a11b9f98c0c6f7d5498621",
+            "schema_status": "met",
+            "quality_gate_status": "met"
+          },
+          "test_kind": "runtime",
+          "status": "fail",
+          "executed_at": "2026-09-05T00:00:00.000Z"
+        }
+      ],
+      "status": "changed_intent",
+      "findings": [
+        {
+          "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+          "subject_id": "AC-1",
+          "message": "Review failed for 'AC-1'; repeat review after remediation.",
+          "evidence_refs": [
+            "readable-cto-blocked-qa-blocked-support.v1"
+          ]
+        },
+        {
+          "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+          "subject_id": "AC-1",
+          "message": "Executed tests failed for 'AC-1'.",
+          "evidence_refs": [
+            "readable-cto-blocked-qa-blocked-support.v1"
+          ]
+        },
+        {
+          "code": "SPEC_IMPLEMENTATION_INTENT_CHANGED",
+          "subject_id": "AC-1",
+          "message": "The generic approved handoff gives no honest behavior to implement beyond the statement that the tool completes the requested outcome: specs/feature-one/spec.md is absent and the in-scope src/blocked/** path is absent. Implementing AC-1 would require inventing an unstated behavior contract.",
+          "evidence_refs": [
+            "conformance_evidence-readable-cto-blocked"
+          ]
+        }
+      ]
+    }
+  ],
+  "quality_gate_results": [
+    {
+      "gate_id": "cto-handoff-constitution-binding.readable-cto-blocked.handoff.v1",
+      "source": "project_constitution",
+      "status": "pass",
+      "evidence_refs": [],
+      "findings": []
+    }
+  ],
+  "overall_status": "changed_intent",
+  "blocking_findings": [
+    {
+      "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+      "subject_id": "FR-1",
+      "message": "Review failed for 'FR-1'; repeat review after remediation.",
+      "evidence_refs": [
+        "readable-cto-blocked-qa-blocked-support.v1"
+      ]
+    },
+    {
+      "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+      "subject_id": "FR-1",
+      "message": "Executed tests failed for 'FR-1'.",
+      "evidence_refs": [
+        "readable-cto-blocked-qa-blocked-support.v1"
+      ]
+    },
+    {
+      "code": "SPEC_IMPLEMENTATION_INTENT_CHANGED",
+      "subject_id": "FR-1",
+      "message": "The generic approved handoff gives no honest behavior to implement beyond the statement that the tool completes the requested outcome: specs/feature-one/spec.md is absent and the in-scope src/blocked/** path is absent. Implementing FR-1 would require inventing an unstated behavior contract.",
+      "evidence_refs": [
+        "conformance_evidence-readable-cto-blocked"
+      ]
+    },
+    {
+      "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+      "subject_id": "AC-1",
+      "message": "Review failed for 'AC-1'; repeat review after remediation.",
+      "evidence_refs": [
+        "readable-cto-blocked-qa-blocked-support.v1"
+      ]
+    },
+    {
+      "code": "SPEC_IMPLEMENTATION_CONFORMANCE_FAILED",
+      "subject_id": "AC-1",
+      "message": "Executed tests failed for 'AC-1'.",
+      "evidence_refs": [
+        "readable-cto-blocked-qa-blocked-support.v1"
+      ]
+    },
+    {
+      "code": "SPEC_IMPLEMENTATION_INTENT_CHANGED",
+      "subject_id": "AC-1",
+      "message": "The generic approved handoff gives no honest behavior to implement beyond the statement that the tool completes the requested outcome: specs/feature-one/spec.md is absent and the in-scope src/blocked/** path is absent. Implementing AC-1 would require inventing an unstated behavior contract.",
+      "evidence_refs": [
+        "conformance_evidence-readable-cto-blocked"
+      ]
+    }
+  ],
+  "next_action": "revise_specification",
+  "conformance_id": "implementation-conformance.74fda283ebb97175c16f4acf8b43ef8bb6f65331a93fcbc238a6f27e55affbda",
+  "matrix_digest": "74fda283ebb97175c16f4acf8b43ef8bb6f65331a93fcbc238a6f27e55affbda",
+  "evaluated_at": "2026-09-04T23:26:52.133Z"
+}

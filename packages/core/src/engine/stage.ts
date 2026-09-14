@@ -12,25 +12,35 @@
  * The orchestrator hands every `task` call its `consumes` artifact content;
  * the agent gathers its own context outside this layer.
  *
- * v0.7.0: stages that ship code (currently `implementation` and
- * `review_fixes`) go through the `validationGate` after the subagent
- * returns. A subagent that claims `ready: true` without `validation_run:
- * true` + non-empty `validation_evidence` is rejected with a precise
- * reason so the orchestrator re-spawns the developer instead of editing
- * the artifact. See `gates/validation.ts` for the full contract.
+ * Stage execution persists artifacts through a descriptor-pinned project
+ * root held for the full run. Returned payloads are validated and written
+ * only while the captured stage authority (run/cursor/capability/work
+ * identity) remains current.
  */
 
 import { buildDispatchMarker, dispatchTaskId } from "../gates/dispatch.js";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { dirname } from "node:path";
-import { persistReturnedArtifacts, readArtifact, writeArtifact } from "./artifacts.js";
+import { dirname, resolve } from "node:path";
+import {
+  ARTIFACT_STRUCTURE_LIMITS,
+  MAX_ARTIFACT_BYTES,
+  MAX_ARTIFACT_AGGREGATE_BYTES,
+  parseArtifactJson,
+  readArtifactPinned,
+  validateArtifactStructure,
+  writeArtifactPinned,
+  rollbackArtifactAtomicWrite,
+  type ArtifactAtomicWriteRollbackToken,
+} from "./artifacts.js";
+import { PinnedProjectRoot, type PinnedRootWriteReceipt } from "../specification/pinned-root.js";
+import { readPinnedCurrentConstitution } from "../specification/constitution-identities.js";
 import { resolveConfig } from "./config.js";
 import { type ScopeFlags } from "./scope.js";
 import { evaluatePredicate } from "./predicate.js";
-import { namespacedArtifactId, sanitizeSlot } from "./fan-in.js";
-import { PRD_SOURCE_ARTIFACT_IDS, validateProductPrdDocument, writeProductPrdDocument } from "./product-prd.js";
-import { checkArtifact as validationCheckArtifact, validationGate } from "../gates/validation.js";
+import { DEFAULT_ARTIFACT_CONTRACT_POLICY, validateConsumedArtifacts } from "./artifact-contract.js";
+import { createSlotArtifactEnvelope, durableNamespacedArtifactId, legacyNamespacedArtifactId, slotArtifactEnvelopeBytes } from "./fan-in.js";
+import { PRD_SOURCE_ARTIFACT_IDS, writeProductPrdDocumentPinned } from "./product-prd.js";
 import type {
   DispatchSlot,
   Profile,
@@ -39,7 +49,10 @@ import type {
   RosterSelectionEntry,
   StageDef,
   TeamState,
+  WorkIdentity,
 } from "./types.js";
+/** Durable completion evidence and provider result text share this UTF-8 cap. */
+export const MAX_TASK_RESULT_OUTPUT_BYTES = 8 * 1024;
 
 
 /**
@@ -55,6 +68,16 @@ export class DevAgentUnavailableError extends Error {
     );
     this.name = "DevAgentUnavailableError";
   }
+}
+
+export interface StageArtifactAuthority {
+  featureId?: string;
+  runKey: string;
+  stageId: string;
+  stageCursor: string;
+  capabilityId?: string;
+  capabilityEpoch?: string;
+  workIdentity?: WorkIdentity;
 }
 
 export interface StageContext {
@@ -78,10 +101,21 @@ export interface StageContext {
   }) => Promise<OrchestratorResult | void> | OrchestratorResult | void;
   onStageStart?: (stageId: string) => void;
   onStageComplete?: (stageId: string, status: StageOutcome["status"]) => void;
+  /**
+   * Borrowed by a caller that already pins the project root. When absent,
+   * runStage opens exactly one pin and closes it after the stage settles.
+   */
+  pinnedRoot?: PinnedProjectRoot;
+  /** Descriptor-relative artifact directory paired with `pinnedRoot`. */
+  artifactsDirRelative?: string;
+  /** Feature identity is optional for legacy, non-feature runs. */
+  featureId?: string;
+  /** Captured after stage start and never replaced across an async dispatch. */
+  stageAuthority?: StageArtifactAuthority;
   /** Present when strict durable execution is armed. */
   durable?: {
-    authorize: (role: string, agent: string) => { ok: true; dispatchId: string } | { ok: false; error: string };
-    complete: (dispatchId: string, output: string, outcome: "succeeded" | "failed", artifactIds?: string[]) => { ok: true } | { ok: false; error: string };
+    authorize: (role: string, agent: string) => { ok: true; dispatchId: string; state: TeamState } | { ok: false; error: string; state?: TeamState };
+    complete: (dispatchId: string, output: string, outcome: "succeeded" | "failed", artifactIds?: string[], providerId?: string) => { ok: true } | { ok: false; error: string };
     pending?: (dispatchId: string, reason?: "provider_running" | "awaiting_result" | "transport_reconnect", providerRef?: string) => { ok: true } | { ok: false; error: string };
     advance: (evidence: string) => { ok: true; handoff?: { capability_id: string; dispatch_token: string; advance_token: string; cursor_epoch: string } } | { ok: false; error: string };
   };
@@ -179,6 +213,30 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function taskResultFailure(id: string, error: string): TaskResult {
+  return { id, output: "", artifacts: {}, exitCode: 1, error };
+}
+
+function boundedProviderText(value: unknown, label: string): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof value !== "string") return { ok: false, error: `${label} must be a string` };
+  if (Buffer.byteLength(value, "utf8") > MAX_TASK_RESULT_OUTPUT_BYTES) {
+    return { ok: false, error: `${label} exceeds the ${MAX_TASK_RESULT_OUTPUT_BYTES}-byte UTF-8 limit` };
+  }
+  return { ok: true, value };
+}
+
+function boundedProviderSerialization(value: unknown, label: string): { ok: true; value: string } | { ok: false; error: string } {
+  const structure = validateArtifactStructure(value);
+  if (!structure.ok) return { ok: false, error: `${label} rejected: ${structure.error}` };
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value) ?? "";
+  } catch {
+    return { ok: false, error: `${label} is not JSON-serializable` };
+  }
+  return boundedProviderText(serialized, label);
+}
+
 function contentText(value: unknown): string {
   if (!isObject(value) || !Array.isArray(value.content)) return "";
   return value.content
@@ -239,8 +297,16 @@ function extractPayload(raw: unknown, newId: () => string): TaskResult {
   const value = isObject(raw) && "output" in raw && !("id" in raw || "exitCode" in raw || "artifacts" in raw || "error" in raw || "slot_id" in raw || "task_id" in raw)
     ? raw.output
     : raw;
+  const structure = validateArtifactStructure(value);
+  if (!structure.ok) return taskResultFailure(newId(), `task result payload rejected: ${structure.error}`);
   if (isObject(value)) {
     const r = readSingleSpawn(value);
+    const output = r.output !== undefined
+      ? boundedProviderText(r.output, "task output")
+      : boundedProviderSerialization(value, "task payload");
+    if (!output.ok) return taskResultFailure(r.id ?? newId(), output.error);
+    const error = r.error === undefined ? { ok: true as const, value: undefined } : boundedProviderText(r.error, "task error");
+    if (!error.ok) return taskResultFailure(r.id ?? newId(), error.error);
     return {
       id: r.id ?? newId(),
       ...(r.slot_id ? { slot_id: r.slot_id } : {}),
@@ -248,29 +314,36 @@ function extractPayload(raw: unknown, newId: () => string): TaskResult {
       ...(r.dispatch_id ? { dispatch_id: r.dispatch_id } : {}),
       ...(r.capability_id ? { capability_id: r.capability_id } : {}),
       ...(r.capability_epoch ? { capability_epoch: r.capability_epoch } : {}),
-      output: r.output ?? JSON.stringify(value),
+      output: output.value,
       artifacts: r.artifacts ?? {},
       exitCode: r.exitCode ?? 0,
-      error: r.error,
+      error: error.value,
     };
   }
-  return {
-    id: newId(),
-    output: typeof value === "string" ? value : "",
-    artifacts: {},
-    exitCode: 0,
-  };
+  if (typeof value === "string") {
+    const output = boundedProviderText(value, "task output");
+    if (!output.ok) return taskResultFailure(newId(), output.error);
+    return { id: newId(), output: output.value, artifacts: {}, exitCode: 0 };
+  }
+  return { id: newId(), output: "", artifacts: {}, exitCode: 0 };
 }
 
 function extractResult(raw: unknown, newId: () => string): TaskResult {
+  const structure = validateArtifactStructure(raw);
+  if (!structure.ok) return taskResultFailure(newId(), `task result payload rejected: ${structure.error}`);
   const rows = taskResultRows(raw);
   const result = extractPayload(rows[0] ?? raw, newId);
   if (taskIsPending(raw)) {
+    if (result.error) return result;
     return { ...result, pending: true, exitCode: 1, error: "task remains asynchronous" };
   }
   if (rows.length === 0 && result.output === "") {
     const text = contentText(raw);
-    if (text) return { ...result, output: text };
+    if (text) {
+      const bounded = boundedProviderText(text, "task content");
+      if (!bounded.ok) return taskResultFailure(result.id, bounded.error);
+      return { ...result, output: bounded.value };
+    }
   }
   return result;
 }
@@ -332,26 +405,18 @@ export function createTaskCaller(tool: TaskToolLike): TaskCaller {
 				}),
 			};
 			const result = await tool.execute(newId(), params);
-			const results = taskResultRows(result);
-			if (results.length > 0) {
-				const normalized = results.map((r) => extractPayload(r, newId));
-				return stampPositionalBatchIdentity(args.tasks, normalized);
-			}
 			if (taskIsPending(result)) return [];
-			return [];
+			return stampPositionalBatchIdentity(args.tasks, taskResultRows(result).map((entry) => extractPayload(entry, newId)));
 		},
 	};
 }
-
 /**
- * Compute a stable wire name for a single subagent (used as default `name:`
- * when the caller doesn't supply one). Mirrors OMP's `oneLineLabel` rules so
- * the rendered spawn roster is readable.
+ * Compute the stable wire name used for a single subagent when the caller
+ * does not provide one.
  */
-export function spawnLabel(role: string, stageId: string, cwd: string): string {
-	return `${stageId}-${role}`;
+export function spawnLabel(role: string, stageId: string, _cwd: string): string {
+  return `${stageId}-${role}`;
 }
-
 
 export interface StageOutcome {
   stageId: string;
@@ -361,19 +426,220 @@ export interface StageOutcome {
   loopIteration?: number;
 }
 
+function readStageArtifact<T = unknown>(ctx: StageContext, id: string): T | null {
+  if (!ctx.pinnedRoot || ctx.artifactsDirRelative === undefined) return null;
+  return readArtifactPinned<T>(ctx.pinnedRoot, ctx.artifactsDirRelative, id);
+}
+
+function captureStageAuthority(stage: StageDef, ctx: StageContext): StageArtifactAuthority {
+  const capability = ctx.state.dispatch_capability;
+  return {
+    ...(ctx.featureId !== undefined ? { featureId: ctx.featureId } : {}),
+    runKey: ctx.state.run_key ?? ctx.state.branch,
+    stageId: stage.id,
+    stageCursor: ctx.state.stage_cursor ?? stage.id,
+    ...(capability?.capability_id !== undefined ? { capabilityId: capability.capability_id } : {}),
+    ...(ctx.state.cursor_epoch !== undefined ? { capabilityEpoch: ctx.state.cursor_epoch } : {}),
+    ...(ctx.state.work_identity ? { workIdentity: { ...ctx.state.work_identity } } : {}),
+  };
+}
+
+function sameWorkIdentity(left: WorkIdentity, right: WorkIdentity): boolean {
+  return left.run_id === right.run_id
+    && left.wave_id === right.wave_id
+    && left.slice_id === right.slice_id
+    && left.session_id === right.session_id
+    && left.workflow === right.workflow
+    && left.stage_id === right.stage_id
+    && left.stage_cursor === right.stage_cursor
+    && left.capability_id === right.capability_id
+    && left.capability_epoch === right.capability_epoch
+    && left.slot_id === right.slot_id
+    && left.task_id === right.task_id
+    && left.dispatch_id === right.dispatch_id
+    && left.attempt === right.attempt
+    && left.worker_id === right.worker_id;
+}
+
+function stageAuthorityError(stage: StageDef, ctx: StageContext): string | null {
+  const expected = ctx.stageAuthority;
+  if (!expected) return null;
+  const currentRunKey = ctx.state.run_key ?? ctx.state.branch;
+  if (expected.stageId !== stage.id) return `stage authority is stale for '${stage.id}'`;
+  if (expected.runKey !== currentRunKey) return `stage authority run changed from '${expected.runKey}'`;
+  if (expected.stageCursor !== (ctx.state.stage_cursor ?? stage.id)) return `stage authority cursor changed for '${stage.id}'`;
+  if (expected.capabilityId !== undefined && expected.capabilityId !== ctx.state.dispatch_capability?.capability_id) {
+    return `stage authority capability changed for '${stage.id}'`;
+  }
+  if (expected.capabilityEpoch !== undefined && expected.capabilityEpoch !== ctx.state.cursor_epoch) {
+    return `stage authority epoch changed for '${stage.id}'`;
+  }
+  if (expected.workIdentity && (!ctx.state.work_identity || !sameWorkIdentity(expected.workIdentity, ctx.state.work_identity))) {
+    return `stage authority work identity changed for '${stage.id}'`;
+  }
+  return null;
+}
+
+function strictStageConstitutionWriteGuard(ctx: StageContext): () => void {
+  const workspace = ctx.state.specification;
+  if (!workspace?.constitution_binding || !ctx.pinnedRoot) return () => undefined;
+  return () => {
+    const current = readPinnedCurrentConstitution(ctx.pinnedRoot!.canonical_root, ctx.pinnedRoot!, workspace.constitution_binding!);
+    if (!current.ok) throw new Error(`artifact write rejected: ${current.error}`);
+    if (!ctx.pinnedRoot!.isStable()) throw new Error("artifact write rejected: pinned project root changed during constitution check");
+  };
+}
+
+function assertStageWriteAuthority(ctx: StageContext, stage: StageDef, result?: TaskResult, dispatchId?: string): void {
+  const authorityError = stageAuthorityError(stage, ctx);
+  if (authorityError) throw new Error(`artifact write rejected: ${authorityError}`);
+  if (!ctx.pinnedRoot || ctx.artifactsDirRelative === undefined) {
+    throw new Error("artifact write rejected: project root is not pinned");
+  }
+  if (!ctx.pinnedRoot.isStable()) {
+    throw new Error("artifact write rejected: pinned project root changed");
+  }
+  if (!result) return;
+  const expected = ctx.stageAuthority;
+  if (expected?.capabilityId && result.capability_id && result.capability_id !== expected.capabilityId) {
+    throw new Error(`artifact write rejected: result capability '${result.capability_id}' is stale`);
+  }
+  if (expected?.capabilityEpoch && result.capability_epoch && result.capability_epoch !== expected.capabilityEpoch) {
+    throw new Error(`artifact write rejected: result capability epoch '${result.capability_epoch}' is stale`);
+  }
+  if (dispatchId && result.dispatch_id && result.dispatch_id !== dispatchId) {
+    throw new Error(`artifact write rejected: result dispatch '${result.dispatch_id}' is stale`);
+  }
+}
+
+interface PreparedStageArtifact {
+  id: string;
+  value: unknown;
+}
+interface PreparedConsiliumSlotArtifact extends PreparedStageArtifact {
+  slotEnvelopeBytes: Buffer;
+}
+
+
+function artifactIdsMatch(actual: readonly string[], expected: readonly string[]): boolean {
+  if (new Set(actual).size !== actual.length || new Set(expected).size !== expected.length) return false;
+  const sortedActual = [...actual].sort();
+  const sortedExpected = [...expected].sort();
+  return sortedActual.length === sortedExpected.length && sortedActual.every((id, index) => id === sortedExpected[index]);
+}
+
+function prepareStageArtifacts(
+  artifacts: Record<string, unknown>,
+  expectedIds?: readonly string[],
+): PreparedStageArtifact[] {
+  const entries = Object.entries(artifacts);
+  if (entries.length > ARTIFACT_STRUCTURE_LIMITS.maxKeys) {
+    throw new Error(`artifact map key count exceeds ${ARTIFACT_STRUCTURE_LIMITS.maxKeys}`);
+  }
+  if (expectedIds && !artifactIdsMatch(entries.map(([id]) => id), expectedIds)) {
+    throw new Error("completion artifact ids must exactly match current stage.produces");
+  }
+  let aggregateBytes = 0;
+  for (const [id, raw] of entries) {
+    if (typeof raw !== "string") continue;
+    const bytes = Buffer.byteLength(raw, "utf8");
+    if (bytes > MAX_ARTIFACT_BYTES) {
+      throw new Error(`artifact "${id}" exceeds the ${MAX_ARTIFACT_BYTES}-byte payload limit`);
+    }
+    aggregateBytes += bytes;
+    if (aggregateBytes > MAX_ARTIFACT_AGGREGATE_BYTES) {
+      throw new Error(`artifact aggregate exceeds the ${MAX_ARTIFACT_AGGREGATE_BYTES}-byte payload limit`);
+    }
+  }
+  return entries.map(([id, raw]) => {
+    let value: unknown = raw;
+    if (typeof raw === "string") {
+      const parsed = parseArtifactJson(raw);
+      if (!parsed.ok) {
+        throw new Error(parsed.kind === "structure-limit"
+          ? `artifact "${id}" ${parsed.reason}`
+          : `artifact "${id}" is not valid JSON`);
+      }
+      value = parsed.value;
+    } else {
+      const structure = validateArtifactStructure(value);
+      if (!structure.ok) throw new Error(`artifact "${id}" ${structure.error}`);
+    }
+    return { id, value };
+  });
+}
+
+interface PersistedArtifactBatch {
+  ids: string[];
+  rollback: () => void;
+}
+
+function persistPreparedArtifacts(
+  ctx: StageContext,
+  stage: StageDef,
+  prepared: readonly PreparedStageArtifact[],
+  result?: TaskResult,
+  dispatchId?: string,
+): PersistedArtifactBatch {
+  const rollbackTokens: ArtifactAtomicWriteRollbackToken[] = [];
+  const rollback = (): void => {
+    for (const token of rollbackTokens.slice().reverse()) rollbackArtifactAtomicWrite(ctx.pinnedRoot!, token);
+  };
+  try {
+    assertStageWriteAuthority(ctx, stage, result, dispatchId);
+    for (const { id, value } of prepared) {
+      assertStageWriteAuthority(ctx, stage, result, dispatchId);
+      writeArtifactPinned(ctx.pinnedRoot!, ctx.artifactsDirRelative!, id, value, {
+        beforeWrite: strictStageConstitutionWriteGuard(ctx),
+        onWritten: (token) => { rollbackTokens.push(token); },
+      });
+    }
+    return { ids: prepared.map(({ id }) => id), rollback };
+  } catch (error) {
+    rollback();
+    throw error;
+  }
+}
+
+function persistPinnedArtifacts(
+  ctx: StageContext,
+  stage: StageDef,
+  artifacts: Record<string, unknown>,
+  expectedIds: readonly string[],
+  result?: TaskResult,
+  dispatchId?: string,
+): PersistedArtifactBatch {
+  return persistPreparedArtifacts(ctx, stage, prepareStageArtifacts(artifacts, expectedIds), result, dispatchId);
+}
+
 export async function runStage(
   stage: StageDef,
   ctx: StageContext,
 ): Promise<StageOutcome> {
+  const borrowedPin = ctx.pinnedRoot;
+  const pinnedRoot = borrowedPin ?? PinnedProjectRoot.open(ctx.cwd);
+  if (!pinnedRoot) {
+    return { stageId: stage.id, status: "failed", note: "stage artifact root could not be pinned", artifacts: [] };
+  }
+  const artifactsDirRelative = ctx.artifactsDirRelative ?? pinnedRoot.relativePath(ctx.artifactsDir);
+  if (artifactsDirRelative === null || artifactsDirRelative === undefined) {
+    if (!borrowedPin) pinnedRoot.close();
+    return { stageId: stage.id, status: "failed", note: "stage artifact directory is outside the pinned project root", artifacts: [] };
+  }
+  const previousPin = ctx.pinnedRoot;
+  const previousArtifactsDirRelative = ctx.artifactsDirRelative;
+  const previousAuthority = ctx.stageAuthority;
+  ctx.pinnedRoot = pinnedRoot;
+  ctx.artifactsDirRelative = artifactsDirRelative;
+  try {
   if (stage.skip_if) {
-    // Fail closed: an expression we cannot evaluate (unsupported syntax or a
-    // missing referenced artifact) blocks the stage instead of silently
-    // skipping or silently running.
     const skip = evaluatePredicate(stage.skip_if, {
       flags: ctx.flags,
       artifactsDir: ctx.artifactsDir,
       state: ctx.state,
       stage,
+      pinnedRoot: ctx.pinnedRoot,
+      artifactsDirRelative: ctx.artifactsDirRelative,
     });
     if (!skip.ok) {
       return { stageId: stage.id, status: "failed", note: `skip_if evaluation failed: ${skip.error}`, artifacts: [] };
@@ -383,11 +649,10 @@ export async function runStage(
       return { stageId: stage.id, status: "skipped", note: "skipped by skip_if", artifacts: [] };
     }
   }
-
-  const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
-  try {
+    const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
     ctx.log(`stage ${stage.id}: ${stage.title}`);
     ctx.onStageStart?.(stage.id);
+    ctx.stageAuthority = captureStageAuthority(stage, ctx);
     switch (stage.type) {
       case "orchestrator":
         return await runOrchestrator(stage, ctx, produces);
@@ -407,9 +672,15 @@ export async function runStage(
   } catch (error) {
     if (error instanceof DevAgentUnavailableError) {
       ctx.log(`stage ${stage.id}: failed — ${error.message}`);
+      const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
       return { stageId: stage.id, status: "failed", note: error.message, artifacts: produces };
     }
     throw error;
+  } finally {
+    ctx.pinnedRoot = previousPin;
+    ctx.artifactsDirRelative = previousArtifactsDirRelative;
+    ctx.stageAuthority = previousAuthority;
+    if (!borrowedPin) pinnedRoot.close();
   }
 }
 
@@ -424,8 +695,12 @@ async function runOrchestrator(stage: StageDef, ctx: StageContext, produces: str
         artifactsDir: ctx.artifactsDir,
         state: ctx.state,
       });
-      if (result?.artifacts) persistReturnedArtifacts(ctx.artifactsDir, result.artifacts);
-      return validateProduced(stage, ctx, produces, result?.output?.trim() || "orchestrator stage completed");
+      const output = boundedProviderText(result?.output ?? "", "orchestrator output");
+      if (!output.ok) throw new Error(output.error);
+      if (produces.length > 0 || result?.artifacts !== undefined) {
+        persistPinnedArtifacts(ctx, stage, result?.artifacts ?? {}, produces);
+      }
+      return validateProduced(stage, ctx, produces, output.value.trim() || "orchestrator stage completed");
     } catch (error) {
       return { stageId: stage.id, status: "failed", note: `orchestrator stage failed: ${String(error)}`, artifacts: produces };
     }
@@ -441,13 +716,21 @@ async function runOrchestrator(stage: StageDef, ctx: StageContext, produces: str
   return validateProduced(stage, ctx, [], "orchestrator stage (inline)");
 }
 
-function persistTaskArtifacts(ctx: StageContext, result: TaskResult): { ids: string[]; error?: string } {
+function persistTaskArtifacts(
+  stage: StageDef,
+  ctx: StageContext,
+  result: TaskResult,
+  produces: readonly string[],
+  dispatchId?: string,
+): PersistedArtifactBatch & { error?: string } {
   try {
-    return { ids: persistReturnedArtifacts(ctx.artifactsDir, result.artifacts ?? {}) };
+    const prepared = prepareStageArtifacts(result.artifacts ?? {}, produces);
+    return persistPreparedArtifacts(ctx, stage, prepared, result, dispatchId);
   } catch (error) {
-    return { ids: [], error: String(error) };
+    return { ids: [], rollback: () => undefined, error: String(error) };
   }
 }
+
 function failAuthorizedDispatches(
   ctx: StageContext,
   authorized: Array<{ ok: true; dispatchId: string } | { ok: false; error: string }>,
@@ -461,8 +744,26 @@ function failAuthorizedDispatches(
   }
 }
 
+function taskResultTextError(result: TaskResult): string | null {
+  if (typeof result.output !== "string") return "task output must be a string";
+  if (Buffer.byteLength(result.output, "utf8") > MAX_TASK_RESULT_OUTPUT_BYTES) {
+    return `task output exceeds the ${MAX_TASK_RESULT_OUTPUT_BYTES}-byte UTF-8 limit`;
+  }
+  if (result.error !== undefined && typeof result.error !== "string") return "task error must be a string";
+  if (result.error !== undefined && Buffer.byteLength(result.error, "utf8") > MAX_TASK_RESULT_OUTPUT_BYTES) {
+    return `task error exceeds the ${MAX_TASK_RESULT_OUTPUT_BYTES}-byte UTF-8 limit`;
+  }
+  return null;
+}
+
 function taskEvidence(result: TaskResult, outcome: "succeeded" | "failed"): string {
-  return result.output.trim() || result.error?.trim() || (outcome === "failed" ? "task failed" : "task completed");
+  const textError = taskResultTextError(result);
+  if (textError) throw new Error(textError);
+  const candidate = result.output.trim() || result.error?.trim() || (outcome === "failed" ? "task failed" : "task completed");
+  if (Buffer.byteLength(candidate, "utf8") > MAX_TASK_RESULT_OUTPUT_BYTES) {
+    throw new Error(`task evidence exceeds the ${MAX_TASK_RESULT_OUTPUT_BYTES}-byte UTF-8 limit`);
+  }
+  return candidate;
 }
 
 async function runSingle(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
@@ -472,6 +773,10 @@ async function runSingle(stage: StageDef, ctx: StageContext, produces: string[])
   const task = buildStagePrompt(stage, ctx, slot.slot);
   ctx.log(`  single: ${agent} (slot=${slot.slot}, role=${slot.role})`);
   const authorized = ctx.durable?.authorize(slot.slot, agent);
+  if (authorized?.ok) {
+    ctx.state = authorized.state;
+    ctx.stageAuthority = captureStageAuthority(stage, ctx);
+  }
   if (authorized && !authorized.ok) return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${authorized.error}`, artifacts: produces };
   let result: TaskResult;
   try {
@@ -480,6 +785,11 @@ async function runSingle(stage: StageDef, ctx: StageContext, produces: string[])
     if (authorized?.ok) failAuthorizedDispatches(ctx, [authorized], `task call failed: ${String(error)}`);
     return { stageId: stage.id, status: "failed", note: `${agent} task call failed: ${String(error)}`, artifacts: produces };
   }
+  const textError = taskResultTextError(result);
+  if (textError) {
+    if (authorized?.ok) failAuthorizedDispatches(ctx, [authorized], textError);
+    return { stageId: stage.id, status: "failed", note: textError, artifacts: produces };
+  }
   if (result.pending) {
     if (authorized?.ok && ctx.durable?.pending) {
       const pending = ctx.durable.pending(authorized.dispatchId, "provider_running", result.id);
@@ -487,11 +797,14 @@ async function runSingle(stage: StageDef, ctx: StageContext, produces: string[])
     }
     return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} remains active`, artifacts: produces };
   }
-  const persisted = persistTaskArtifacts(ctx, result);
+  const persisted = persistTaskArtifacts(stage, ctx, result, produces, authorized?.ok ? authorized.dispatchId : undefined);
   const outcome = result.exitCode === 0 && !persisted.error ? "succeeded" : "failed";
   if (authorized) {
     const completed = ctx.durable!.complete(authorized.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids);
-    if (!completed.ok) return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
+    if (!completed.ok) {
+      persisted.rollback();
+      return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
+    }
   }
   if (persisted.error) return { stageId: stage.id, status: "failed", note: persisted.error, artifacts: produces };
   if (result.exitCode !== 0) return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} returned exit ${result.exitCode}`, artifacts: produces };
@@ -517,29 +830,44 @@ async function runProductPrdRender(stage: StageDef, ctx: StageContext, produces:
   if (contract.renderer !== "product-prd") {
     return { stageId: stage.id, status: "failed", note: `unsupported document renderer: ${String(contract.renderer)}`, artifacts: produces };
   }
+  const sourceIds = [...new Set([...(stage.consumes ?? []), ...PRD_SOURCE_ARTIFACT_IDS])];
   const sourceArtifacts: Record<string, unknown> = {};
+  const sourceValidation = validateConsumedArtifacts(
+    { ...stage, consumes: sourceIds },
+    ctx.artifactsDir,
+    ctx.state,
+    null,
+    DEFAULT_ARTIFACT_CONTRACT_POLICY,
+    ctx.pinnedRoot && ctx.artifactsDirRelative !== undefined
+      ? { pinnedRoot: ctx.pinnedRoot, artifactsDirRelative: ctx.artifactsDirRelative, capture: sourceArtifacts }
+      : undefined,
+  );
+  if (!sourceValidation.ok) {
+    return { stageId: stage.id, status: "failed", note: `product_prd source validation failed: ${sourceValidation.error}`, artifacts: produces };
+  }
   for (const id of PRD_SOURCE_ARTIFACT_IDS) {
-    const artifact = readArtifact(ctx.artifactsDir, id);
-    if (artifact === null) {
+    if (!Object.prototype.hasOwnProperty.call(sourceArtifacts, id)) {
       return { stageId: stage.id, status: "failed", note: `product_prd render: source artifact '${id}.json' not found`, artifacts: produces };
     }
-    sourceArtifacts[id] = artifact;
   }
-  const written = writeProductPrdDocument({
-    stateDir: dirname(ctx.artifactsDir),
-    artifactsDir: ctx.artifactsDir,
+  const pinnedRoot = ctx.pinnedRoot;
+  const stateDirectory = dirname(ctx.artifactsDir);
+  const stateDirRelative = pinnedRoot?.relativePath(stateDirectory)
+    ?? (resolve(stateDirectory) === pinnedRoot?.lexical_root ? "" : null);
+  const artifactsDirRelative = ctx.artifactsDirRelative;
+  if (!pinnedRoot || stateDirRelative === null || stateDirRelative === undefined || artifactsDirRelative === undefined) {
+    return { stageId: stage.id, status: "failed", note: "product_prd render failed: project root is not pinned", artifacts: produces };
+  }
+  strictStageConstitutionWriteGuard(ctx)();
+  const written = writeProductPrdDocumentPinned({
+    pinnedRoot,
+    stateDirRelative,
+    artifactsDirRelative,
     path: contract.path,
     sourceArtifacts,
   });
   if (!written.ok) {
     return { stageId: stage.id, status: "failed", note: `product_prd render failed: ${written.error}`, artifacts: produces };
-  }
-  // Fail closed on the freshly persisted pair: re-verify the exact manifest
-  // shape, hash agreement, on-disk document bytes and source staleness
-  // BEFORE the produced-artifact validation can mark the stage done.
-  const pair = validateProductPrdDocument({ stateDir: dirname(ctx.artifactsDir), artifactsDir: ctx.artifactsDir });
-  if (!pair.ok) {
-    return { stageId: stage.id, status: "failed", note: `product_prd pair validation failed: ${pair.issues.join("; ")}`, artifacts: produces };
   }
   ctx.log(`  product_prd: deterministic render -> ${written.documentPath}`);
   return validateProduced(stage, ctx, produces, `deterministic product PRD rendered to ${written.documentPath}`);
@@ -572,7 +900,16 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
   const multiSlot = roster.length > 1;
   ctx.log(`  consilium: ${roster.map((slot) => slot.slot).join(", ")}${multiSlot ? " (slot-scoped artifacts)" : ""}`);
   const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: ctx.agent(slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot) }));
-  const authorized = ctx.durable ? roster.map((slot, i) => ctx.durable!.authorize(slot.slot, tasks[i]!.agent)) : [];
+  const authorized = ctx.durable
+    ? roster.map((slot, index) => {
+      const result = ctx.durable!.authorize(slot.slot, tasks[index]!.agent);
+      if (result.ok) {
+        ctx.state = result.state;
+        ctx.stageAuthority = captureStageAuthority(stage, ctx);
+      }
+      return result;
+    })
+    : [];
   const denied = authorized.find((a) => !a.ok);
   if (denied && !denied.ok) {
     failAuthorizedDispatches(ctx, authorized, `dispatch authorization failed: ${denied.error}`);
@@ -594,7 +931,18 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
     failAuthorizedDispatches(ctx, authorized, paired.error);
     return { stageId: stage.id, status: "failed", note: paired.error, artifacts: produces };
   }
+  const preparedSlots: Array<{
+    slot: string;
+    result: TaskResult;
+    auth: { ok: true; dispatchId: string; state: TeamState };
+    prepared: PreparedConsiliumSlotArtifact[];
+  }> = [];
   for (const { slot, result } of paired.paired) {
+    const textError = taskResultTextError(result);
+    if (textError) {
+      failAuthorizedDispatches(ctx, authorized, textError);
+      return { stageId: stage.id, status: "failed", note: textError, artifacts: produces };
+    }
     const auth = authorized[roster.findIndex((candidate) => candidate.slot === slot.slot)];
     if (result.pending) {
       if (auth?.ok && ctx.durable?.pending) {
@@ -603,65 +951,139 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
       }
       continue;
     }
-    if (auth?.ok) {
-      const persisted = multiSlot
-        ? persistConsiliumSlotArtifacts(ctx, slot.slot, result, produces)
-        : persistTaskArtifacts(ctx, result);
-      const outcome = result.exitCode === 0 && !persisted.error ? "succeeded" : "failed";
-      const completed = ctx.durable!.complete(auth.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids);
-      if (!completed.ok) {
-        failAuthorizedDispatches(ctx, authorized.slice(roster.findIndex((candidate) => candidate.slot === slot.slot) + 1), `dispatch completion failed: ${completed.error}`);
-        return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
+    if (!auth?.ok) continue;
+    if (multiSlot) {
+      const prepared = prepareConsiliumSlotArtifacts(ctx, slot.slot, result, produces);
+      if ("error" in prepared) {
+        failAuthorizedDispatches(ctx, authorized, prepared.error);
+        return { stageId: stage.id, status: "failed", note: prepared.error, artifacts: produces };
       }
-      if (persisted.error) {
-        failAuthorizedDispatches(ctx, authorized.slice(roster.findIndex((candidate) => candidate.slot === slot.slot) + 1), persisted.error);
-        return { stageId: stage.id, status: "failed", note: persisted.error, artifacts: produces };
-      }
+      preparedSlots.push({ slot: slot.slot, result, auth, prepared: prepared.value });
     }
   }
   const failed = paired.paired.filter(({ result }) => result.exitCode !== 0 || result.pending);
+  if (failed.length > 0) {
+    if (failed.some(({ result }) => result.pending)) {
+      failAuthorizedDispatches(ctx, authorized, `${failed.length}/${tasks.length} failed or pending`);
+      return { stageId: stage.id, status: "failed", note: `${failed.length}/${tasks.length} failed or pending`, artifacts: produces };
+    }
+  }
+  for (const { slot, result, auth, prepared } of preparedSlots) {
+    const persisted = persistConsiliumSlotArtifacts(stage, ctx, slot, result, produces, auth.dispatchId, prepared);
+    const outcome = result.exitCode === 0 && !persisted.error ? "succeeded" : "failed";
+    if (persisted.error) {
+      failAuthorizedDispatches(ctx, authorized, persisted.error);
+      return { stageId: stage.id, status: "failed", note: persisted.error, artifacts: produces };
+    }
+    const completed = ctx.durable!.complete(auth.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids, result.id);
+    if (!completed.ok) {
+      persisted.rollback();
+      failAuthorizedDispatches(ctx, authorized.slice(roster.findIndex((candidate) => candidate.slot === slot) + 1), `dispatch completion failed: ${completed.error}`);
+      return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
+    }
+  }
+  if (!multiSlot) {
+    for (const { slot, result } of paired.paired) {
+      const auth = authorized[roster.findIndex((candidate) => candidate.slot === slot.slot)];
+      if (!auth?.ok || result.pending) continue;
+      const persisted = persistTaskArtifacts(stage, ctx, result, produces, auth.dispatchId);
+      const outcome = result.exitCode === 0 && !persisted.error ? "succeeded" : "failed";
+      if (persisted.error) {
+        failAuthorizedDispatches(ctx, authorized, persisted.error);
+        return { stageId: stage.id, status: "failed", note: persisted.error, artifacts: produces };
+      }
+      const completed = ctx.durable!.complete(auth.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids, result.id);
+      if (!completed.ok) {
+        persisted.rollback();
+        return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
+      }
+    }
+  }
   if (failed.length > 0) return { stageId: stage.id, status: "failed", note: `${failed.length}/${tasks.length} failed or pending`, artifacts: produces };
   return validateProduced(stage, ctx, produces, `${tasks.length} agents in parallel`, multiSlot ? roster : undefined);
 }
 
 /**
- * Persist a consilium slot's returned artifacts and guarantee the
- * slot-scoped namespaced files (`<id>-<slot>.json`) exist for every declared
- * produce. When the slot returned the shared id, a namespaced copy is made
- * from its own just-written content, so later slots can never clobber this
- * slot's provenance. The namespaced ids are declared on the durable
- * completion so advance-time synthesis can read them deterministically.
+ * Prepare and validate every artifact in one consilium slot before any slot
+ * writes begin. Existing namespaced content is accepted only byte-for-byte
+ * equivalent to the requested provider envelope.
  */
-function persistConsiliumSlotArtifacts(
+function prepareConsiliumSlotArtifacts(
   ctx: StageContext,
   slot: string,
   result: TaskResult,
-  produces: string[],
-): { ids: string[]; error?: string } {
-  const persisted = persistTaskArtifacts(ctx, result);
-  if (persisted.error) return persisted;
-  const ids = [...persisted.ids];
-  for (const produce of produces) {
-    const namespaced = namespacedArtifactId(produce, slot);
-    if (ids.includes(namespaced)) continue;
-    // Only snapshot a produce this slot EXPLICITLY returned under the shared
-    // id: at this moment the shared file is the slot's own just-written
-    // content. A slot that returned no artifact for a produce must never
-    // inherit another slot's (or a prior iteration's) shared file as its
-    // namespaced provenance — that would count a free-rider slot as a
-    // contributor and record incorrect fan-in provenance.
-    if (!ids.includes(produce)) continue;
-    const shared = readArtifact(ctx.artifactsDir, produce);
-    if (shared !== null) {
-      try {
-        writeArtifact(ctx.artifactsDir, namespaced, shared);
-      } catch (error) {
-        return { ids, error: String(error) };
+  produces: readonly string[],
+): { value: PreparedConsiliumSlotArtifact[] } | { error: string } {
+  try {
+    const prepared = prepareStageArtifacts(result.artifacts ?? {}, produces);
+    if (prepared.length * 2 > 8) return { error: "consilium slot artifact batch exceeds the atomic file bound" };
+    const withEnvelopes: PreparedConsiliumSlotArtifact[] = [];
+    for (const artifact of prepared) {
+      const { id, value } = artifact;
+      const envelope = createSlotArtifactEnvelope(id, slot, result.id, value);
+      const envelopeStructure = validateArtifactStructure(envelope);
+      if (!envelopeStructure.ok) return { error: `artifact "${id}" ${envelopeStructure.error}` };
+      const envelopeBytes = Buffer.from(slotArtifactEnvelopeBytes(id, slot, result.id, value), "utf8");
+      if (envelopeBytes.byteLength > MAX_ARTIFACT_BYTES) {
+        return { error: `artifact "${id}" slot envelope exceeds the ${MAX_ARTIFACT_BYTES}-byte payload limit` };
       }
-      ids.push(namespaced);
+      const existing = readStageArtifact(ctx, durableNamespacedArtifactId(id, slot));
+      if (existing !== null && JSON.stringify(existing) !== JSON.stringify(envelope)) {
+        return { error: `slot artifact '${id}' collided with a different slot/provider payload` };
+      }
+      withEnvelopes.push({ ...artifact, slotEnvelopeBytes: envelopeBytes });
     }
+    return { value: withEnvelopes };
+  } catch (error) {
+    return { error: String(error) };
   }
-  return { ids };
+}
+
+/**
+ * Persist a consilium slot's already-validated artifacts and create a
+ * provenance envelope at the canonical slot path. Completion receives only
+ * logical ids; durable completion records the same envelope through an
+ * exclusive write.
+ */
+function persistConsiliumSlotArtifacts(
+  stage: StageDef,
+  ctx: StageContext,
+  slot: string,
+  result: TaskResult,
+  produces: readonly string[],
+  dispatchId?: string,
+  prepared?: PreparedConsiliumSlotArtifact[],
+): { ids: string[]; rollback: () => void; error?: string } {
+  let receipts: PinnedRootWriteReceipt[] = [];
+  const rollback = (): void => {
+    for (const receipt of receipts.slice().reverse()) receipt.rollback();
+  };
+  try {
+    const values = prepared ?? (() => {
+      const checked = prepareConsiliumSlotArtifacts(ctx, slot, result, produces);
+      if ("error" in checked) throw new Error(checked.error);
+      return checked.value;
+    })();
+    const entries: Array<{ path: string; content: string | Buffer }> = [];
+    const ids: string[] = [];
+    for (const { id, value, slotEnvelopeBytes } of values) {
+      const sharedPath = ctx.artifactsDirRelative!.length > 0 ? `${ctx.artifactsDirRelative}/${id}.json` : `${id}.json`;
+      const namespaced = durableNamespacedArtifactId(id, slot);
+      const namespacedPath = ctx.artifactsDirRelative!.length > 0 ? `${ctx.artifactsDirRelative}/${namespaced}.json` : `${namespaced}.json`;
+      entries.push({ path: sharedPath, content: JSON.stringify(value, null, 2) + "\n" });
+      entries.push({ path: namespacedPath, content: slotEnvelopeBytes });
+      ids.push(id);
+    }
+    assertStageWriteAuthority(ctx, stage, result, dispatchId);
+    ctx.pinnedRoot!.ensureDirectory(ctx.artifactsDirRelative!);
+    assertStageWriteAuthority(ctx, stage, result, dispatchId);
+    strictStageConstitutionWriteGuard(ctx)();
+    receipts = [...ctx.pinnedRoot!.writeAtomicFilesWithReceipts(entries)];
+    return { ids, rollback };
+  } catch (error) {
+    rollback();
+    return { ids: [], rollback: () => undefined, error: String(error) };
+  }
 }
 
 async function runBash(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
@@ -679,17 +1101,6 @@ async function runBash(stage: StageDef, ctx: StageContext, produces: string[]): 
   }
 }
 
-/**
- * Inspect produced artifacts for the stage and run the validation gate
- * when the stage is in the validation-required list. Returns `done` when
- * the gate passes or when the stage is not in the list; `failed` with the
- * gate's reason otherwise.
- *
- * The gate is what prevents the failure mode from session 019fbd62:
- * a subagent that returns `ready: true, validation_run: false` is
- * rejected with a clear, actionable reason that the orchestrator can
- * read and re-spawn with.
- */
 function validateProduced(
   stage: StageDef,
   ctx: StageContext,
@@ -703,7 +1114,7 @@ function validateProduced(
   // Every declared output is required. Validation-specific checks below add
   // stronger semantic requirements for code-bearing artifacts.
   for (const id of produces) {
-    if (!readArtifact(ctx.artifactsDir, id)) {
+    if (!readStageArtifact(ctx, id)) {
       return {
         stageId: stage.id,
         status: "failed",
@@ -712,21 +1123,6 @@ function validateProduced(
       };
     }
   }
-
-  const validatedIds = new Set(["implementation", "review_fixes"]);
-  const gated = produces.filter((p) => validatedIds.has(p));
-  if (gated.length === 0) {
-    return { stageId: stage.id, status: "done", note: successNote, artifacts: produces };
-  }
-  for (const id of gated) {
-    const data = readArtifact(ctx.artifactsDir, id);
-    const result = validationCheckArtifact(id, data as Record<string, unknown>);
-    if (!result.ok) {
-      ctx.log(`  validation: REJECTED for ${id} — ${result.reason}`);
-      return { stageId: stage.id, status: "failed", note: result.reason, artifacts: produces };
-    }
-  }
-  ctx.log(`  validation: PASSED for ${stage.id}`);
   return { stageId: stage.id, status: "done", note: successNote, artifacts: produces };
 }
 
@@ -751,12 +1147,15 @@ function validateProducedMultiSlot(
   }
   const contributing = new Set<string>();
   for (const id of produces) {
-    const contributors = slots.filter((slot) => readArtifact(ctx.artifactsDir, namespacedArtifactId(id, slot.slot)) !== null);
+    const contributors = slots.filter((slot) =>
+      readStageArtifact(ctx, durableNamespacedArtifactId(id, slot.slot)) !== null
+      || readStageArtifact(ctx, legacyNamespacedArtifactId(id, slot.slot)) !== null,
+    );
     if (contributors.length === 0) {
       return {
         stageId: stage.id,
         status: "failed",
-        note: `produced artifact "${id}" has no per-slot results (<id>-<slot>.json) at ${ctx.artifactsDir} — every consilium slot must write its slot-scoped artifact for each declared produce.`,
+        note: `produced artifact "${id}" has no per-slot results (canonical slot artifact) at ${ctx.artifactsDir} — every consilium slot must write its slot-scoped artifact for each declared produce.`,
         artifacts: produces,
       };
     }
@@ -778,7 +1177,7 @@ function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string, slot
   const consumes = stage.consumes ?? [];
   const reads = consumes
     .map((id) => {
-      const data = readArtifact(ctx.artifactsDir, id);
+      const data = readStageArtifact(ctx, id);
       return data ? `### ${id}\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\`` : null;
     })
     .filter((x): x is string => x !== null);
@@ -786,11 +1185,11 @@ function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string, slot
   const readsBlock = reads.length > 0 ? `\n\n## Reads from prior stages\n${reads.join("\n\n")}` : "";
   const rawProduces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
   const produces = slotScoped
-    ? rawProduces.map((id) => `${id}-${sanitizeSlot(role)}.json`).join(", ")
+    ? rawProduces.map((id) => `${durableNamespacedArtifactId(id, role)}.json`).join(", ")
     : rawProduces.join(", ") || "(none)";
   const roleHint = isOrchestratorRole(role)
-    ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
-    : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
+    ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact."
+    : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, run the project's required validation and include the actual evidence in the artifact.";
   const capability = ctx.state.dispatch_capability;
   const markerCapabilityId = capability?.capability_id;
   const markerTaskId = markerCapabilityId
@@ -1313,5 +1712,3 @@ export async function walkProfile(
   return outcomes;
 }
 
-// Re-export so consumers can read the validation gate cheaply.
-export { validationGate };

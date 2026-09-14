@@ -14,10 +14,10 @@
  *      `od -An -c` with `stty raw` to disable the kernel ICRNL
  *      translation).
  *
- * The chromium integration test SKIPS when playwright or chromium
- * cannot be loaded — it is environment-dependent (needs
- * `playwright install chromium`) and must never fail CI without a
- * browser installed. The unit contracts (1, 2) always run.
+ * The chromium integration test requires the installed Playwright browser and
+ * fails closed when the dependency or browser executable is unavailable; it
+ * must never silently skip the real click path. The unit contracts (1, 2)
+ * always run.
  */
 
 import assert from 'node:assert/strict';
@@ -114,30 +114,21 @@ function readInputFrames(transcriptText: string): string[] {
   return frames;
 }
 
-/** Spawn a fake-PTY idle session and return its handle + the script
- * path. Returns `null` (and skips the caller) when node-pty cannot
- * spawn — callers use `t.skip()` via the returned tuple. */
+/** Spawn a fake-PTY idle session and return its handle + the script path. */
 async function spawnIdleSession(t: import('node:test').TestContext): Promise<{
   session: Awaited<ReturnType<typeof startTestSession>>;
   scriptPath: string;
-} | null> {
+}> {
   const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-enter-'));
   mkdirSync(join(dir, '.work-state', 'ux-e2e'), { recursive: true });
   const scriptPath = join(dir, 'fake-idle.sh');
   writeFileSync(scriptPath, FAKE_IDLE_SCRIPT, { mode: 0o755 });
   chmodSync(scriptPath, 0o755);
-
-  let session;
-  try {
-    session = await startTestSession({ cwd: dir, ompBinary: scriptPath, token: 'sekret', idleMs: 10_000 });
-  } catch (err) {
-    t.skip(`node-pty unavailable: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
+  const session = await startTestSession({ cwd: dir, ompBinary: scriptPath, token: 'sekret', idleMs: 10_000 });
   t.after(() => session.close());
   if (session.pty.mode !== 'pty') {
-    t.skip('node-pty could not spawn the idle script');
-    return null;
+    await session.close();
+    throw new Error('node-pty could not spawn the idle script');
   }
   return { session, scriptPath };
 }
@@ -148,7 +139,6 @@ async function spawnIdleSession(t: import('node:test').TestContext): Promise<{
 
 test('WsDriver: pressEnter sends a single {t:"i",d:"\\r"} frame', async t => {
   const spawned = await spawnIdleSession(t);
-  if (spawned === null) return;
   const { session } = spawned;
 
   const driver = new WsDriver({ url: session.url, transcriptPath: session.transcriptPath });
@@ -166,7 +156,6 @@ test('WsDriver: pressEnter sends a single {t:"i",d:"\\r"} frame', async t => {
 
 test('WsDriver: submit() appends "\\n" while pressEnter() sends "\\r" — different bytes', async t => {
   const spawned = await spawnIdleSession(t);
-  if (spawned === null) return;
   const { session } = spawned;
 
   const driver = new WsDriver({ url: session.url, transcriptPath: session.transcriptPath });
@@ -235,41 +224,24 @@ test('web surface: page.js fallback sends {t:"i",d:"\\r"} after a bounded timeou
 /* ------------------------------------------------------------------ */
 
 test('web surface (chromium): pressing the Enter button delivers CR to the PTY', async t => {
-  // Lazy import of playwright — mirrors the optional-dep pattern in
-  // `createPlaywrightDriver`. The static import would fail in test
-  // environments where playwright is not installed.
-  let pw: typeof import('playwright');
-  try {
-    pw = (await import('playwright')) as typeof import('playwright');
-  } catch {
-    t.skip('playwright is not installed');
-    return;
-  }
-
+  const pw = (await import('playwright')) as typeof import('playwright');
   const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-enter-'));
   mkdirSync(join(dir, '.work-state', 'ux-e2e'), { recursive: true });
   const scriptPath = join(dir, 'fake-enter.sh');
   writeFileSync(scriptPath, FAKE_ENTER_SCRIPT, { mode: 0o755 });
   chmodSync(scriptPath, 0o755);
-
-  let session;
-  try {
-    session = await startTestSession({
-      cwd: dir,
-      ompBinary: scriptPath,
-      token: 'sekret',
-      idleMs: 10_000,
-      cols: 120,
-      rows: 30,
-    });
-  } catch (err) {
-    t.skip(`node-pty unavailable: ${err instanceof Error ? err.message : String(err)}`);
-    return;
-  }
+  const session = await startTestSession({
+    cwd: dir,
+    ompBinary: scriptPath,
+    token: 'sekret',
+    idleMs: 10_000,
+    cols: 120,
+    rows: 30,
+  });
   t.after(() => session.close());
   if (session.pty.mode !== 'pty') {
-    t.skip('node-pty could not spawn the fake enter command');
-    return;
+    await session.close();
+    throw new Error('node-pty could not spawn the fake enter command');
   }
 
   // The page-side helpers are installed by page.js — wait until
@@ -341,10 +313,6 @@ test('web surface (chromium): pressing the Enter button delivers CR to the PTY',
 
     await ctx.close();
   } catch (err) {
-    if (err instanceof Error && /Executable doesn't exist|browserType\.launch/i.test(err.message)) {
-      t.skip(`chromium not installed: ${err.message}`);
-      return;
-    }
     throw err;
   } finally {
     if (browser !== undefined) {

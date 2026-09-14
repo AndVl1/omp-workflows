@@ -61,6 +61,38 @@ test("transcribe-analyze pipeline disposes media and prepared leases after succe
   assert.deepEqual((result.raw as { segments: unknown[] }).segments.length, 1);
 });
 
+test("pipeline rejects ASR output above maxTranscriptSegments before analysis", async () => {
+  const boundedRequest = { ...request, limits: { ...request.limits, maxTranscriptSegments: 2 } };
+  const segments = (count: number) => Array.from({ length: count }, (_, index) => ({
+    segmentId: `s${index}`,
+    text: "x",
+    startSeconds: index,
+    endSeconds: index + 1,
+  }));
+  let exactAnalysisCalls = 0;
+  const exact = new TranscribeAnalyzeEvidenceProvider({
+    media: { async acquire() { return { format: "fixture", sizeBytes: 1, async open() { return (async function* () { yield new Uint8Array(); })(); }, async dispose() {} }; } },
+    preprocess: { async prepare() { return lease(); } },
+    asr: { id: "fixture-asr", async transcribe() { return { provider: "fixture-asr", segments: segments(2) }; } },
+    analysis: { async analyze(input) { exactAnalysisCalls += 1; return { provider: "fixture-analysis", evidence: [{ quote: input.transcript[0]!.text, startSeconds: 0, endSeconds: 1, kind: "transcript_excerpt" as const }] }; } },
+  });
+  await exact.acquire(source, boundedRequest, new AbortController().signal);
+  assert.equal(exactAnalysisCalls, 1, "the exact configured segment count reaches analysis");
+
+  let oversizedAnalysisCalls = 0;
+  const oversized = new TranscribeAnalyzeEvidenceProvider({
+    media: { async acquire() { return { format: "fixture", sizeBytes: 1, async open() { return (async function* () { yield new Uint8Array(); })(); }, async dispose() {} }; } },
+    preprocess: { async prepare() { return lease(); } },
+    asr: { id: "fixture-asr", async transcribe() { return { provider: "fixture-asr", segments: segments(3) }; } },
+    analysis: { async analyze() { oversizedAnalysisCalls += 1; return { provider: "fixture-analysis", evidence: [] }; } },
+  });
+  await assert.rejects(
+    () => oversized.acquire(source, boundedRequest, new AbortController().signal),
+    (error: unknown) => error instanceof AcquisitionProviderError && error.code === "LIMIT_EXCEEDED",
+  );
+  assert.equal(oversizedAnalysisCalls, 0, "analysis is never called for oversized ASR output");
+});
+
 test("empty text-analysis chunks are skipped while later chunks still produce grounded evidence", async () => {
   let analysisCalls = 0;
   const media = { format: "fixture", sizeBytes: 1, async open() { return (async function* () { yield new Uint8Array(); })(); }, async dispose() {} };

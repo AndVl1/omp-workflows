@@ -1,0 +1,21 @@
+id: 2026-09-01T00-00-00-testing
+parent: null
+agent: testing
+timestamp: "2026-09-01T00:00:00Z"
+status: blocked
+context:
+  task: "Migrate fullstack workflow_begin fixture to shipped spec-preparation specify stage"
+output:
+  blocker: "Workspace write access unavailable through available write mechanisms (EPERM); no file edit applied."
+  required_changes:
+    - "Rename writeConsiliumBeginFixture to writeSpecificationBeginFixture"
+    - "Use stage_cursor/stage specify and specification marker task"
+    - "Assert compact shipped profile hash, single analyst roster, exact one marker and marker capability/slot/task fields"
+    - "Assert slot_artifacts { analyst: [specify_draft] }"
+next:
+  agent: null
+  task: "Apply the described edit in packages/fullstack/test/workflow-tools.test.ts"
+  priority: high
+  acceptance_criteria:
+    - "Fixture begins against shipped spec-preparation profile"
+    - "Exactly one analyst dispatch marker and current declared artifact are asserted"

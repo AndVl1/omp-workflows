@@ -27,16 +27,20 @@ import {
   resolveClassification,
   validateProducedArtifact,
 } from "@andvl1/omp-workflows-core";
-import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
+import { loadProfile, profileHash } from "../src/engine/profile.js";
+import { registerTestProfiles, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import { createCapability, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
-import { checkpointPolicyHash, recordTrustedCheckpointAnswer, unresolvedCheckpointError } from "../src/engine/checkpoints.js";
+import { checkpointPolicyHash, issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, registerTrustedCheckpointHostBridge, unresolvedCheckpointError } from "../src/engine/checkpoints.js";
 import { writeState } from "../src/engine/state.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 
 const COMPLEXITIES = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] as const;
 
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
+const TEST_CHECKPOINT_BRIDGE = Object.freeze({});
+registerTrustedCheckpointHostBridge(TEST_CHECKPOINT_BRIDGE);
 
 /** Single orchestrator stage exercising the product_approval_recorded gate. */
 const APPROVAL_PROFILE: Profile = {
@@ -56,6 +60,34 @@ const APPROVAL_PROFILE: Profile = {
   ],
 };
 
+const CHECKPOINT_PERSISTENCE_PROFILE: Profile = {
+  name: "checkpoint-persistence-regression",
+  title: "Checkpoint persistence regression",
+  description: "checkpoint advance persistence and replay regression",
+  match: { type: ["PRODUCT_DISCOVERY"] },
+  checkpoint_policy: {
+    default: "required_human",
+    scope: "decision",
+    hard_human: [],
+    rules: {
+      clarification: {
+        kind: "clarification",
+        default: "required_human",
+        allowed_decisions: ["proceed"],
+        phase: "before_advance",
+        rationale: "Clarification requires an explicit answer.",
+      },
+    },
+    source: "profile",
+    policy_version: 1,
+    rationale: "Checkpoint persistence regression policy.",
+  },
+  stages: [
+    { id: "product_approval", title: "Clarification", type: "orchestrator", checkpoint: "clarification" },
+    { id: "after_clarification", title: "After clarification", type: "orchestrator" },
+  ],
+};
+
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
 }
@@ -66,6 +98,40 @@ function classification(workflow: string, autonomous: boolean): TeamState["class
 
 function readState(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "features", "product-approval", "state.json"), "utf8")) as TeamState;
+}
+
+function stateRevision(state: TeamState): number {
+  const revision = (state as TeamState & { state_revision?: unknown }).state_revision;
+  return typeof revision === "number" ? revision : 0;
+}
+
+function recordInteractiveAnswer(root: string, state: TeamState, input: { answer_id: string; channel: "terminal" | "escalation"; reference: string; stage_id: string; checkpoint_id: string; decision: string }) {
+  assert.ok(state.profile_hash, "checkpoint fixture state must have a profile hash");
+  if (!state.profile_hash) throw new Error("checkpoint fixture profile hash is unavailable");
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  assert.ok(pinnedRoot, "checkpoint fixture root must pin");
+  if (!pinnedRoot) throw new Error("checkpoint fixture root is unavailable");
+  try {
+    const rootIdentity = { canonical_root: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino };
+    const capability = issueTrustedCheckpointAnswerCapability(TEST_CHECKPOINT_BRIDGE, {
+      root: rootIdentity,
+      state,
+      answer_id: input.answer_id,
+      channel: input.channel,
+      reference: input.reference,
+      stage_id: input.stage_id,
+      checkpoint_id: input.checkpoint_id,
+      decision: input.decision,
+      question: "Authorize the product-discovery fixture checkpoint",
+      options: [input.decision],
+      session_id: "product-discovery-test-session",
+      actor_ref: input.reference,
+      profile_hash: state.profile_hash,
+    });
+    return recordTrustedCheckpointAnswer(state, input, { capability, root: rootIdentity });
+  } finally {
+    pinnedRoot.close();
+  }
 }
 
 function advanceAuth(issued: ReturnType<typeof createCapability>) {
@@ -410,11 +476,94 @@ test("product-discovery: artifact contracts accept valid documents and reject in
   );
 });
 
+test("durable checkpoint advance persists unresolved and invalid-proof pauses idempotently", () => {
+  const root = mkdtempSync(join(tmpdir(), "pd-checkpoint-pause-"));
+  try {
+    initGit(root, "feat/checkpoint-pause");
+    writeTestRegistryMarker(root);
+    registerTestProfiles(root, [CHECKPOINT_PERSISTENCE_PROFILE]);
+    const profile = loadProfile(CHECKPOINT_PERSISTENCE_PROFILE.name);
+    assert.ok(profile?.checkpoint_policy);
+    if (!profile?.checkpoint_policy) return;
+    const { issued } = setupApprovalStage(root, "feat/checkpoint-pause", profile);
+    const initial = readState(root);
+    writeState(root, { ...initial, checkpoint_policy: profile.checkpoint_policy }, { featureSlug: "product-approval" });
+    const advanceInput = { ...advanceAuth(issued), evidence: "checkpoint pause persistence regression" };
+
+    const unresolved = advanceCursor(root, advanceInput);
+    assert.equal(unresolved.ok, false, "an unresolved checkpoint must block advance");
+    if (unresolved.ok) return;
+    assert.match(unresolved.error, /checkpoint_unresolved \[user_checkpoint\]/);
+    const unresolvedReason = "checkpoint 'clarification' for stage 'product_approval' is unresolved: explicit human consent is required before advancing";
+    const paused = readState(root);
+    assert.deepEqual(paused.pause, { kind: "user_checkpoint", reason: unresolvedReason }, "the unresolved checkpoint pause must survive a new state read");
+    const unresolvedRevision = stateRevision(paused);
+
+    const unresolvedReplay = advanceCursor(root, advanceInput);
+    assert.equal(unresolvedReplay.ok, false, "replaying unresolved advance must remain blocked");
+    if (!unresolvedReplay.ok) assert.equal(unresolvedReplay.error, unresolved.error);
+    assert.equal(stateRevision(readState(root)), unresolvedRevision, "identical unresolved replay must not create a duplicate revision");
+
+    const trusted = recordInteractiveAnswer(root, readState(root), {
+      answer_id: "product-owner/clarification/1",
+      channel: "escalation",
+      reference: "answer/clarification/1",
+      stage_id: "product_approval",
+      checkpoint_id: "clarification",
+      decision: "proceed",
+    });
+    writeState(root, trusted.state, { featureSlug: "product-approval" });
+    const decision = recordCheckpointDecision(root, {
+      ...advanceAuth(issued),
+      checkpoint: "clarification",
+      checkpoint_kind: "clarification",
+      decision: "proceed",
+      authorization: "human",
+      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
+      rationale: "The clarification is resolved by the product owner.",
+    });
+    assert.equal(decision.ok, true, decision.ok ? "" : decision.error);
+    if (!decision.ok) return;
+    const validDecisionState = readState(root);
+    const invalidPolicyHash = "f".repeat(64);
+    writeState(root, {
+      ...validDecisionState,
+      typed_checkpoint_decisions: validDecisionState.typed_checkpoint_decisions?.map((candidate) => ({ ...candidate, policy_hash: invalidPolicyHash })),
+      checkpoint_decisions: validDecisionState.checkpoint_decisions?.map((candidate) => ({ ...candidate, policy_hash: invalidPolicyHash })),
+    }, { featureSlug: "product-approval" });
+
+    const invalid = advanceCursor(root, advanceInput);
+    assert.equal(invalid.ok, false, "an invalid checkpoint proof must block advance");
+    if (invalid.ok) return;
+    assert.match(invalid.error, /checkpoint_unverified \[needs_human\]/);
+    const invalidReason = "checkpoint decision policy_hash does not match the active policy";
+    const invalidPaused = readState(root);
+    assert.deepEqual(invalidPaused.pause, { kind: "needs_human", reason: invalidReason }, "the invalid-proof pause must survive a new state read");
+    const invalidRevision = stateRevision(invalidPaused);
+
+    const invalidReplay = advanceCursor(root, advanceInput);
+    assert.equal(invalidReplay.ok, false, "replaying invalid proof must remain blocked");
+    if (!invalidReplay.ok) assert.equal(invalidReplay.error, invalid.error);
+    assert.equal(stateRevision(readState(root)), invalidRevision, "identical invalid-proof replay must not create a duplicate revision");
+
+    writeState(root, { ...validDecisionState, pause: { kind: "needs_human", reason: invalidReason } }, { featureSlug: "product-approval" });
+    const advanced = advanceCursor(root, advanceInput);
+    assert.equal(advanced.ok, true, advanced.ok ? "" : advanced.error);
+    if (!advanced.ok) return;
+    assert.deepEqual(advanced.state.pause, { kind: "none", reason: "" }, "a successful checkpoint decision must clear the prior pause");
+    assert.deepEqual(readState(root).pause, { kind: "none", reason: "" }, "the cleared pause must survive a new state read");
+    assert.equal(readState(root).stage_cursor, "after_clarification");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("product-discovery: product_approval_recorded gate requires an interactive human decision to advance", () => {
   const root = mkdtempSync(join(tmpdir(), "pd-approval-"));
   try {
     initGit(root, "feat/product-approval");
-    registerWorkflowProfiles([APPROVAL_PROFILE]);
+    writeTestRegistryMarker(root);
+    registerTestProfiles(root, [APPROVAL_PROFILE]);
     const profile = loadProfile("product-approval-regression");
     assert.ok(profile);
     const { issued, artifactsDir } = setupApprovalStage(root, "feat/product-approval", profile);
@@ -447,7 +596,7 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
     //    adapter binds policy hash and capability epoch from the active state.
     const beforeInteractive = readState(root);
     const expectedPolicyHash = checkpointPolicyHash(beforeInteractive.checkpoint_policy!);
-    const trusted = recordTrustedCheckpointAnswer(beforeInteractive, {
+    const trusted = recordInteractiveAnswer(root, beforeInteractive, {
       answer_id: "product-owner/product_approval/1",
       channel: "escalation",
       reference: "escalation-answer/product-owner/product_approval/1",

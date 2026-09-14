@@ -1,0 +1,56 @@
+id: 2026-08-31T11-20-50-security
+parent: null
+agent: security
+timestamp: "2026-08-31T11:20:50Z"
+status: completed
+
+context:
+  task: "Fix constitution draft workspace identity failures without weakening selected-workspace or checkpoint-proof guarantees."
+  phase: "foundation-contracts"
+
+output:
+  summary: "Canonicalized constitution test workspace/proof identity and made first validated draft binding durable before checkpoint creation."
+  vulnerabilities:
+    critical: 0
+    high: 0
+    medium: 0
+    low: 0
+  cargo_deny:
+    status: not_run
+    advisories: null
+    license_issues: null
+    note: "Dependency auditing was outside this slice and validation was explicitly reserved for the CTO."
+  dependencies:
+    outdated: null
+    unmaintained: null
+    actions: []
+    note: "No dependency changes or dependency audit."
+  unsafe_blocks:
+    total: 0
+    reviewed: 0
+    approved: 0
+    needs_refactor: 0
+  issues:
+    - severity: high
+      location: "packages/core/test/specification-constitution.test.ts"
+      issue: "Fixture explicit selection returned null because the canonical specs/<feature> workspace did not exist; its trusted answer also used a stage different from the blocked origin."
+      fix: "Materialize canonical selected workspaces and bind capability/state/answer to the exact origin stage, run, and feature."
+    - severity: high
+      location: "packages/core/src/specification/prerequisite.ts"
+      issue: "First workspace adoption was persisted only together with checkpoint state, rather than before checkpoint creation."
+      fix: "After draft validation and exact explicit selection, persist the first immutable feature binding before creating the draft/checkpoint."
+  files_changed:
+    - packages/core/src/specification/prerequisite.ts
+    - packages/core/test/specification-constitution.test.ts
+    - .work-state/artifacts/sdd-foundation/constitution-identity.json
+  validation:
+    status: skipped
+    reason: "Assignment explicitly required no validation run; CTO reruns after concurrent slices land."
+
+next:
+  agent: null
+  task: "CTO runs the consolidated validation after all foundation slices land."
+  priority: high
+  acceptance_criteria:
+    - "All five constitution flows reach the exact hard-human checkpoint."
+    - "Cross-feature and cross-run draft adoption remains blocked."

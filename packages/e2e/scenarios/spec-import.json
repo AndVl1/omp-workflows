@@ -1,0 +1,322 @@
+{
+  "id": "spec-import",
+  "title": "Read-only external specification import",
+  "description": "Imports every recognized external specification framework through explicit selectors: Spec Kit, OpenSpec, BMAD, Superpowers, XPowers, and generic complete bundles each pass the constitution gate, reach exactly one compatibility checkpoint, and freeze the shared imported handoff, while incomplete, ambiguous, and hostile bundles fail closed with supplement, explicit-selection, and blocked-unsafe outcomes; replay, approval, and dispatch leave the external source byte-for-byte unchanged.",
+  "params": {
+    "feature_id": "payment-retry",
+    "feature_speckit": "payment-retry-speckit",
+    "feature_openspec": "payment-retry-openspec",
+    "feature_bmad": "payment-retry-bmad",
+    "feature_superpowers": "payment-retry-superpowers",
+    "feature_xpowers": "payment-retry-xpowers",
+    "bundle_generic": "imported/payment-retry",
+    "bundle_speckit": "imported/payment-retry-speckit",
+    "bundle_openspec": "imported/payment-retry-openspec",
+    "bundle_bmad": "imported/payment-retry-bmad",
+    "bundle_superpowers": "imported/payment-retry-superpowers",
+    "bundle_xpowers": "imported/payment-retry-xpowers",
+    "bundle_incomplete": "imported/payment-retry-incomplete",
+    "bundle_ambiguous": "imported/payment-retry-ambiguous",
+    "bundle_hostile": "imported/payment-retry-hostile"
+  },
+  "workspace": {
+    "path": "specs/{{feature_id}}",
+    "state_path": ".work-state/features/{{feature_id}}/state.json",
+    "handoff": [
+      "specs/{{feature_id}}/handoff.md"
+    ],
+    "checkpoints": [
+      ".work-state/features/{{feature_id}}/state.json",
+      ".work-state/ux-e2e/transcript.jsonl",
+      ".work-state/ux-e2e/ask-state.jsonl"
+    ],
+    "evidence": [
+      ".work-state/features/{{feature_id}}/artifacts"
+    ]
+  },
+  "transcript": {
+    "checkpoints": [
+      "import_compatibility_approval",
+      "approve_continue",
+      "exactly one compatibility checkpoint",
+      "no Specify checkpoint",
+      "no Plan checkpoint",
+      "no Tasks checkpoint"
+    ],
+    "workers": [
+      "no worker dispatch",
+      "blocked before delegation"
+    ],
+    "validation": [
+      "constitution prerequisite",
+      "constitution binding",
+      "compatibility report",
+      "supplement_required",
+      "blocking finding"
+    ],
+    "history": [
+      "no native phase history entries",
+      "external source byte-for-byte unchanged"
+    ],
+    "handoff": [
+      "handoff.md",
+      "handoff_digest",
+      "import_ref",
+      "source_kind external",
+      "status ready",
+      "/do-work --spec {{feature_id}}",
+      "handoff digest unchanged"
+    ],
+    "interruption": [
+      "supplement_required",
+      "blocked_ambiguous",
+      "blocked_unsafe",
+      "fail closed",
+      "secrets redacted",
+      "no compatibility checkpoint",
+      "no handoff"
+    ],
+    "resume": [
+      "established snapshot",
+      "no duplicate workspace",
+      "no duplicate handoff",
+      "no fresh compatibility decision",
+      "replay unchanged"
+    ],
+    "next_actions": [
+      "workflow_checkpoint_ask_selected",
+      "--supplement",
+      "--review",
+      "--framework generic",
+      "/do-work --spec {{feature_id}}"
+    ]
+  },
+  "task": "Run the complete read-only external specification import journey in the authorized scratch repository, where every external bundle below is already materialized as byte-exact local files. The external source is untrusted local input: never write, move, rename, or delete anything under the external bundle paths; through intake, replay, approval, and dispatch the recognized source must remain byte-for-byte unchanged, and secret-like attachment content must never be read into readable output.\n\nUse explicit selection for every import: name the exact bundle path, pass the explicit `--framework` flag wherever the journey specifies one, and never infer identity from `.active-feature`, a branch name, or the current directory. Each imported workspace takes the final path segment of its explicit bundle path as the immutable feature id ({{feature_id}} for the primary import). The plugin-native constitution prerequisite gates every import: the project constitution must be resolved and validated before any compatibility classification.\n\nExecute these journeys in order:\n\n1. Constitution gate and generic complete import: `/spec-import {{bundle_generic}} --framework generic`. Verify the constitution prerequisite precedes compatibility, the readable report classifies the bundle ready under the generic mapping with the selected source artifacts and provenance bound to the constitution, and exactly one compatibility checkpoint appears with no native Specify/Plan/Tasks checkpoints. The ready report proposes `/spec-import {{bundle_generic}} --approve`; approve the checkpoint through its approve option so the approval binds the exact source and constitution hashes plus feature/run selectors, freezing exactly one imported handoff whose next action is `/do-work --spec {{feature_id}}`.\n2. Spec Kit named recognition: `/spec-import {{bundle_speckit}}` with no framework flag. Verify the recognizer names the detected Spec Kit mapping, the ready report and exactly one compatibility checkpoint appear, and approval freezes one shared handoff whose next action is `/do-work --spec {{feature_speckit}}`.\n3. OpenSpec: `/spec-import {{bundle_openspec}} --framework openspec`. Verify the ready report names the openspec mapping with its proposal, tasks, and design artifacts, exactly one compatibility checkpoint appears, and approval freezes the shared handoff for `/do-work --spec {{feature_openspec}}`.\n4. BMAD: `/spec-import {{bundle_bmad}} --framework bmad`. Verify the ready report names the bmad mapping with its PRD, architecture, and story artifacts, exactly one compatibility checkpoint appears, and approval freezes the shared handoff for `/do-work --spec {{feature_bmad}}`.\n5. Superpowers: `/spec-import {{bundle_superpowers}} --framework superpowers`. Verify the ready report names the superpowers mapping with its brief, design, and tasks artifacts, exactly one compatibility checkpoint appears, and approval freezes the shared handoff for `/do-work --spec {{feature_superpowers}}`.\n6. XPowers: `/spec-import {{bundle_xpowers}} --framework xpowers`. Verify the ready report names the xpowers mapping with its approved requirements, canonical tasks, and decisions artifacts, exactly one compatibility checkpoint appears, and approval freezes the shared handoff for `/do-work --spec {{feature_xpowers}}`.\n7. Supplement: `/spec-import {{bundle_incomplete}} --framework generic`. Verify a supplement_required classification that names the missing executable task graph as an actionable blocking finding, presents no compatibility checkpoint, starts no implementation, freezes no handoff, and routes the durable next action to the local supplement (`--supplement`).\n8. Ambiguity: `/spec-import {{bundle_ambiguous}} --framework generic`. Verify the intake reports the ambiguity with both candidate sets (docs-a and docs-b), requires an explicit user selection, never auto-selects a snapshot, presents no compatibility checkpoint, and routes the fail-closed next action to `--review`.\n9. Hostile: run `/spec-import {{bundle_hostile}} --framework generic` twice. Verify both intakes fail closed as blocked/unsafe with the escaping symlink/traversal and oversize/secret-like findings surfaced, no secret-like content appears in readable output, no compatibility checkpoint is ever presented, and the replay is deterministic.\n10. Idempotent replay: rerun `/spec-import {{bundle_generic}} --framework generic` with the source unchanged. Verify it returns the established snapshot, compatibility result, and approval state with no duplicate workspace, no duplicate handoff, and no fresh compatibility decision.\n11. Dispatch: run `/do-work --spec {{feature_id}} implement the approved imported handoff`. Verify exactly one active claim is acquired for the frozen handoff digest owned by the do-work run, the handoff digest is unchanged, and the external source is still byte-for-byte unchanged.\n\nStop after the dispatch claim with the source-immutability verdict reported.",
+  "stages": [
+    {
+      "id": "constitution-gate-generic-complete",
+      "name": "Constitution gate then generic complete import approval",
+      "expect": [
+        "/spec-import {{bundle_generic}} --framework generic",
+        "constitution",
+        "compatibility",
+        "ready",
+        "generic",
+        "requirements.md",
+        "workflow_checkpoint_ask_selected",
+        "[ask_user]",
+        "approve_continue",
+        "implementation_ready",
+        "handoff",
+        "import_ref",
+        "/do-work --spec {{feature_id}}",
+        "immutability"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]ompatibility",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "speckit-named-recognition",
+      "name": "Spec Kit named recognition without a framework flag",
+      "expect": [
+        "/spec-import {{bundle_speckit}}",
+        "speckit|[Ss]pec [Kk]it",
+        "compatibility",
+        "ready",
+        "tasks.md",
+        "workflow_checkpoint_ask_selected",
+        "[ask_user]",
+        "implementation_ready",
+        "/do-work --spec {{feature_speckit}}"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]ompatibility",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "openspec-import",
+      "name": "OpenSpec import through the explicit framework selector",
+      "expect": [
+        "/spec-import {{bundle_openspec}} --framework openspec",
+        "openspec|OpenSpec",
+        "compatibility",
+        "ready",
+        "proposal.md",
+        "workflow_checkpoint_ask_selected",
+        "[ask_user]",
+        "implementation_ready",
+        "/do-work --spec {{feature_openspec}}"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]ompatibility",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "bmad-import",
+      "name": "BMAD import through the explicit framework selector",
+      "expect": [
+        "/spec-import {{bundle_bmad}} --framework bmad",
+        "bmad|BMAD",
+        "compatibility",
+        "ready",
+        "story-1.1-payment-retry.md",
+        "workflow_checkpoint_ask_selected",
+        "[ask_user]",
+        "implementation_ready",
+        "/do-work --spec {{feature_bmad}}"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]ompatibility",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "superpowers-import",
+      "name": "Superpowers import through the explicit framework selector",
+      "expect": [
+        "/spec-import {{bundle_superpowers}} --framework superpowers",
+        "superpowers|Superpowers",
+        "compatibility",
+        "ready",
+        "brief.md",
+        "workflow_checkpoint_ask_selected",
+        "[ask_user]",
+        "implementation_ready",
+        "/do-work --spec {{feature_superpowers}}"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]ompatibility",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "xpowers-import",
+      "name": "XPowers import through the explicit framework selector",
+      "expect": [
+        "/spec-import {{bundle_xpowers}} --framework xpowers",
+        "xpowers|XPowers",
+        "compatibility",
+        "ready",
+        "requirements.md",
+        "workflow_checkpoint_ask_selected",
+        "[ask_user]",
+        "implementation_ready",
+        "/do-work --spec {{feature_xpowers}}"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]ompatibility",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "supplement-required",
+      "name": "Incomplete bundle classifies supplement-required",
+      "expect": [
+        "/spec-import {{bundle_incomplete}} --framework generic",
+        "supplement",
+        "task",
+        "finding|gap|block|missing",
+        "--supplement",
+        "no compatibility checkpoint",
+        "no handoff",
+        "immutability"
+      ]
+    },
+    {
+      "id": "ambiguous-selection",
+      "name": "Ambiguous bundle requires explicit selection and fails closed",
+      "expect": [
+        "/spec-import {{bundle_ambiguous}} --framework generic",
+        "ambiguous",
+        "docs-a",
+        "docs-b",
+        "select|choice|selection",
+        "--review",
+        "no compatibility checkpoint",
+        "no handoff",
+        "immutability"
+      ]
+    },
+    {
+      "id": "hostile-blocked",
+      "name": "Hostile bundle blocks before delegation and survives replay",
+      "expect": [
+        "/spec-import {{bundle_hostile}} --framework generic",
+        "block|unsafe|reject",
+        "symlink|traversal|escape",
+        "oversiz|secret|redact|credential",
+        "no compatibility checkpoint",
+        "no handoff",
+        "immutability"
+      ]
+    },
+    {
+      "id": "idempotent-replay",
+      "name": "Unchanged-source replay returns the established import state",
+      "expect": [
+        "/spec-import {{bundle_generic}} --framework generic",
+        "ready|established|unchanged|snapshot",
+        "no duplicate workspace",
+        "no duplicate handoff",
+        "no fresh compatibility decision",
+        "implementation_ready",
+        "immutability"
+      ]
+    },
+    {
+      "id": "dispatch-handoff",
+      "name": "Dispatch claims the frozen imported handoff digest",
+      "expect": [
+        "/do-work --spec {{feature_id}}",
+        "execution_claim_ref",
+        "exactly one active ExecutionClaim",
+        "owner_kind do_work",
+        "handoff.md",
+        "handoff digest unchanged",
+        "immutability"
+      ]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 600000,
+    "checkpointPollMs": 500
+  },
+  "screenshots": {
+    "on": ["stage_start", "stage_end", "ask_user", "error"]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

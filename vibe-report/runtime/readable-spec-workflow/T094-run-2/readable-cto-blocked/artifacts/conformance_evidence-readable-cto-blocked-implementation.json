@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "artifact_id": "conformance_evidence-readable-cto-blocked-implementation",
+  "entries": [
+    {
+      "evidence_id": "readable-cto-blocked-implementation-fr-1",
+      "kind": "implementation",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-aa8b086101bbe9ed628795ff7319d1bb",
+      "intent_message": "Inspected the frozen handoff, approved artifacts, and owned source scope. FR-1 only states that the tool completes the requested outcome and defines no concrete observable behavior; src/blocked/** remains unchanged.",
+      "recorded_at": "2026-09-04T23:52:23.285Z"
+    },
+    {
+      "evidence_id": "readable-cto-blocked-implementation-ac-1",
+      "kind": "implementation",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-aa8b086101bbe9ed628795ff7319d1bb",
+      "intent_message": "AC-1 has no concrete input, output, exit status, or other deterministic oracle beyond the generic requested-outcome wording; no implementation or test was invented.",
+      "recorded_at": "2026-09-04T23:52:23.285Z"
+    }
+  ]
+}

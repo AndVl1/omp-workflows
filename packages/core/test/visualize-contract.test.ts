@@ -378,23 +378,19 @@ test("visualize contract: deterministic total ordering (never filesystem order)"
   const golden = buildExpectedSpecPreparationSession();
   const goldenOrder = golden.artifacts.map((a) => a.id);
   const goldenDeclared = [
-    "spec_intake_repo_map",
-    "spec_requirements_edge_cases",
-    "spec_options_decisions",
-    "spec_architecture_tasks",
-    "spec_completeness",
+    "specify_draft",
+    "plan_draft",
+    "task_graph",
     "spec-preparation",
     "spec_handoff",
   ];
   assert.deepEqual([...goldenOrder].sort((a, b) => compareArtifactIds(a, b, goldenDeclared)), goldenOrder);
   assert.deepEqual(goldenOrder, [
-    "spec_intake_repo_map",
-    "spec_intake_repo_map-analyst",
-    "spec_intake_repo_map-tech-researcher",
-    "spec_requirements_edge_cases",
-    "spec_options_decisions",
-    "spec_architecture_tasks",
-    "spec_completeness",
+    "specify_draft",
+    "specify_draft-analyst",
+    "specify_draft-tech-researcher",
+    "plan_draft",
+    "task_graph",
     "spec-preparation",
     "spec_handoff",
   ]);
@@ -504,7 +500,7 @@ test("visualize contract: link targets use stable identity and explicit states",
   // missing/unreadable/degraded targets remain explicit reachable states
   const golden = buildExpectedSpecPreparationSession();
   const missing = golden.artifacts.find((a) => a.status === "missing");
-  assert.equal(missing?.id, "spec_completeness");
+  assert.equal(missing?.id, "task_graph");
   const unreadableCase = buildFixtureInventory().cases.find((c) => c.id === "corrupt-unreadable-empty");
   assert.equal(unreadableCase?.input.expected.artifactStatuses.corrupt, "unreadable");
 

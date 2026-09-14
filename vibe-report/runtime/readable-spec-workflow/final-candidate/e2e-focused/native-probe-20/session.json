@@ -1,0 +1,117 @@
+{
+  "schema_version": 2,
+  "session_id": "ZSDM3IeRwYxmgRl_I4-VoXKj1xgF1T7vxHuZN_366pw",
+  "control_nonce": "nGMMihcNWjWEsr5xax9M-YLPkpvRXArl3dsXkPh73YA",
+  "server_pid": 41908,
+  "server_start_identity": "0LLRgtC-0YDQvdC40LosICA4INGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMTg6MDc6MTY",
+  "server_start_nonce": "8v3_SR3ZJMgg51Jo-rzLK06nK6-VtPx4p2gKNpZadFM",
+  "slug": "omp-spec-e2e-readable-native-probe-20",
+  "url": "http://127.0.0.1:62803/?token=UmNEfOKM9l1pc0-1YHyRjFE1e-_09KIIlnRqdka6aHs",
+  "browser_url": "http://127.0.0.1:62803/?code=8qvZiJraexnz5QvrS08hfuthFRDKczDcdPG6OCFJWss",
+  "browser_bootstrap_consumed": false,
+  "browser_code_expires_at": "2026-09-08T15:08:18.277Z",
+  "token": "UmNEfOKM9l1pc0-1YHyRjFE1e-_09KIIlnRqdka6aHs",
+  "wsPath": "/ws",
+  "omp_version": "omp/18.0.6",
+  "pid": 42193,
+  "pgid": 42193,
+  "probe_pid": null,
+  "probe_pgid": null,
+  "probe_start_identity": null,
+  "pty_start_identity": "0LLRgtC-0YDQvdC40LosICA4INGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMTg6MDc6MTk",
+  "spawn_error": null,
+  "started_at": "2026-09-08T15:07:18.280Z",
+  "status": "running",
+  "phase": "running",
+  "shutdown_error": null,
+  "pty_exit_observed": false,
+  "shutdown_completed_at": null,
+  "stopped_at": null,
+  "finished_at": null,
+  "profile": null,
+  "tty": {
+    "cols": 120,
+    "rows": 40,
+    "term": "xterm-256color"
+  },
+  "task_prompt": "Start a native readable specification for the request below. Use the explicit feature_id `readable-native-probe-20` for every phase and preserve the engine-generated explicit run_key for every state/tool operation; never infer identity from .active-feature, a branch name, or the current directory.\n\nRequest: Add a deterministic project-local workflow profile override with explicit ownership\n\nThe repository intentionally has no Spec Kit or other external specification framework. Use the plugin-native constitution prerequisite, obtain the required human approval, and then run the explicit Constitution -> Specify -> Plan -> Tasks flow. The terminal commands are `/specify --feature readable-native-probe-20 <request>`, `/spec-plan --feature readable-native-probe-20`, and `/spec-tasks --feature readable-native-probe-20`; carry the same feature_id and run_key through each command and underlying tool call. Keep every phase content attributable to its declared worker dispatch. Stop after the final Tasks approval with the readable handoff ready for `/do-work --spec readable-native-probe-20`.",
+  "scenario": {
+    "id": "spec-workflow",
+    "title": "Native readable specification: constitution -> Specify -> Plan -> Tasks"
+  },
+  "surface": "text",
+  "host_config": {
+    "path": "/Users/a.vladislavov/.omp/agent/config.yml",
+    "warning": null
+  },
+  "omp_log_binding": null,
+  "user_config": {
+    "path": null,
+    "default_path": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-20/omp-spec-e2e-readable-native-probe-20/.omp/ux-e2e-overlay.user.json"
+  },
+  "extension_isolation": {
+    "ambient_discovery_disabled": true,
+    "explicit_roots": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-20/omp-spec-e2e-readable-native-probe-20/node_modules/@andvl1/omp-workflows-fullstack",
+    "home": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-20/omp-spec-e2e-readable-native-probe-20/.work-state/ux-e2e/omp-home",
+    "agent_dir": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-20/omp-spec-e2e-readable-native-probe-20/.work-state/ux-e2e/omp-home/.omp/agent"
+  },
+  "runtime_plugins": {
+    "schema_version": 1,
+    "extension_package": {
+      "name": "@andvl1/omp-workflows-fullstack",
+      "version": "0.27.0",
+      "package_path": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-20/omp-spec-e2e-readable-native-probe-20/node_modules/@andvl1/omp-workflows-fullstack",
+      "realpath": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/fullstack",
+      "entrypoint": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/fullstack/dist/index.js"
+    },
+    "core_package": {
+      "name": "@andvl1/omp-workflows-core",
+      "version": "0.27.0",
+      "package_path": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-20/omp-spec-e2e-readable-native-probe-20/node_modules/@andvl1/omp-workflows-core",
+      "realpath": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/core",
+      "entrypoint": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/core/dist/index.js"
+    },
+    "configured_extensions": [
+      "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-20/omp-spec-e2e-readable-native-probe-20/node_modules/@andvl1/omp-workflows-fullstack"
+    ],
+    "tool_names": [
+      "constitution_checkpoint_ask_selected",
+      "constitution_impact_apply",
+      "constitution_impact_ask_selected",
+      "constitution_impact_assess",
+      "cto_checkpoint_ask_selected",
+      "cto_close_specification_execution_wave",
+      "cto_confirm",
+      "cto_dispatch",
+      "cto_mapping_resume",
+      "cto_preflight",
+      "cto_prepare",
+      "cto_specification_advance",
+      "cto_specification_conformance",
+      "cto_specification_decide",
+      "cto_specification_prepare",
+      "cto_specification_review",
+      "decide_constitution_checkpoint",
+      "do_work_claim",
+      "ensure_project_constitution",
+      "lecture_acquire",
+      "present_constitution_draft",
+      "workflow_advance",
+      "workflow_begin",
+      "workflow_begin_phase_validation",
+      "workflow_checkpoint",
+      "workflow_checkpoint_ask_selected",
+      "workflow_complete",
+      "workflow_complete_specification_execution",
+      "workflow_dispatch_specification_phase",
+      "workflow_finalize_import_handoff",
+      "workflow_instructions",
+      "workflow_persist_specification_phase",
+      "workflow_prepare",
+      "workflow_specification_conformance",
+      "workflow_status",
+      "workflow_validate_phase"
+    ],
+    "duplicate_tool_names": []
+  }
+}

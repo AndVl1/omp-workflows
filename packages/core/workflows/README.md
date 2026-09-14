@@ -200,6 +200,16 @@ The prose phase descriptions in `commands/team.md` remain as a **STAGE REFERENCE
 the detailed prompt templates and review criteria live there. Profiles drive *which* stages
 run and *in what order*; the reference supplies the *how* for each stage type.
 
+### Profile-hash migration
+
+The independent QA cutover changes every coding profile's content: `qa_tests` now runs as
+an explicit stage and uses the canonical `qa_reported_pass` gate. Because profile hashes
+are content-addressed, persisted in-progress workspaces and capabilities created from
+an older profile hash are intentionally stale and fail closed. Reinitialize the workflow
+from the current profile through the normal `/team` or `/do-work` entry point; never edit
+`profile_hash` or capability bindings by hand and never treat an old worker report as a
+replacement for the new `qa_tests` artifact.
+
 ## Definition of Done (acceptance gate)
 
 Profiles with an implementation phase produce a `dod` artifact early (exploration / discovery /

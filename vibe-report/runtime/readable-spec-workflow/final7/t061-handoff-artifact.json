@@ -1,0 +1,232 @@
+{
+  "feature_id": "imported-payment-retry",
+  "source_kind": "external",
+  "content_provenance": {
+    "source_kind": "external",
+    "content_role": "untrusted_inert_data",
+    "embedded_instruction_policy": "inert_data_only",
+    "source_refs": [
+      "imported/payment-retry/CONSTITUTION.md",
+      "imported/payment-retry/decisions.md",
+      "imported/payment-retry/plan.md",
+      "imported/payment-retry/requirements.md",
+      "imported/payment-retry/tasks.md"
+    ]
+  },
+  "artifact_versions": [
+    {
+      "artifact_id": "import.8893097d805bd337eee3504e8dcf026199663e2524c03ec1fc9a5e93d1afafbb",
+      "kind": "import_snapshot",
+      "version": 1,
+      "sha256": "8741a468b5a854d7d5643fc9ead3741f9b2a1891ac550888fdeeab95e3f32c8b"
+    }
+  ],
+  "scope": {
+    "in_scope": [
+      "automatic retry of timed-out card charges, idempotency keys, dead-letter"
+    ],
+    "out_of_scope": [
+      "alternative payment providers, subscription billing, refunds."
+    ],
+    "constraints": [
+      "recording after the final attempt."
+    ]
+  },
+  "requirements": [
+    {
+      "requirement_id": "FR-101",
+      "statement": "The system MUST retry a timed-out card charge up to 3 times with exponential backoff (1s, 2s, 4s) before giving up.",
+      "acceptance_ids": [
+        "A-101",
+        "A-102",
+        "A-103"
+      ],
+      "source_refs": [
+        "imported/payment-retry/requirements.md"
+      ]
+    },
+    {
+      "requirement_id": "FR-102",
+      "statement": "Every retried charge MUST reuse the same provider idempotency key as the first attempt.",
+      "acceptance_ids": [
+        "A-101",
+        "A-102",
+        "A-103"
+      ],
+      "source_refs": [
+        "imported/payment-retry/requirements.md"
+      ]
+    },
+    {
+      "requirement_id": "FR-103",
+      "statement": "After the final failed attempt the system MUST write a dead-letter record with the order id, attempt count, and provider error code.",
+      "acceptance_ids": [
+        "A-101",
+        "A-102",
+        "A-103"
+      ],
+      "source_refs": [
+        "imported/payment-retry/requirements.md"
+      ]
+    }
+  ],
+  "decisions": [
+    {
+      "decision_id": "D-101",
+      "decision": ". Deterministic in-process backoff",
+      "rationale": "Fixed 1s/2s/4s schedule; no scheduler service. Traces to FR-101.",
+      "requirement_ids": [
+        "FR-101"
+      ]
+    },
+    {
+      "decision_id": "D-102",
+      "decision": ". Reuse the orders idempotency column",
+      "rationale": "The existing column stores the provider idempotency key. Traces to FR-102.",
+      "requirement_ids": [
+        "FR-102"
+      ]
+    },
+    {
+      "decision_id": "D-103",
+      "decision": ". Persist final retry exhaustion in the dead-letter audit",
+      "rationale": "Reuse the existing dead-letter/audit failure persistence when retries are finally exhausted, including the order id, attempt count, and provider error code. Traces to FR-103.",
+      "requirement_ids": [
+        "FR-103"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "task_id": "T-101",
+      "title": ". Implement RetryPolicy schedule",
+      "requirement_ids": [
+        "FR-101"
+      ],
+      "depends_on": [],
+      "expected_outcome": "retries use the fixed 1s/2s/4s schedule and stop after the",
+      "affected_scope": [
+        "`src/payments/retry-policy.ts`."
+      ],
+      "completion_evidence": [
+        "unit test covering attempt boundaries."
+      ],
+      "parallel_safe": true
+    },
+    {
+      "task_id": "T-102",
+      "title": ". Reuse idempotency keys across attempts",
+      "requirement_ids": [
+        "FR-102"
+      ],
+      "depends_on": [
+        "T-101"
+      ],
+      "expected_outcome": "every attempt of one charge sends the identical provider",
+      "affected_scope": [
+        "`src/payments/charge-client.ts`."
+      ],
+      "completion_evidence": [
+        "runtime scenario A-101."
+      ],
+      "parallel_safe": false
+    },
+    {
+      "task_id": "T-103",
+      "title": ". Write dead-letter records after final failure",
+      "requirement_ids": [
+        "FR-103"
+      ],
+      "depends_on": [
+        "T-102"
+      ],
+      "expected_outcome": "a dead-letter record with order id, attempt count, and",
+      "affected_scope": [
+        "`src/payments/dead-letter.ts`."
+      ],
+      "completion_evidence": [
+        "runtime scenario A-102."
+      ],
+      "parallel_safe": false
+    }
+  ],
+  "verification": [
+    {
+      "verification_id": "verification:FR-101",
+      "requirement_ids": [
+        "FR-101"
+      ],
+      "acceptance_ids": [
+        "A-101",
+        "A-102",
+        "A-103"
+      ],
+      "task_ids": [
+        "T-101"
+      ],
+      "observable_behavior": true,
+      "expected_evidence": "evidence for FR-101"
+    },
+    {
+      "verification_id": "verification:FR-102",
+      "requirement_ids": [
+        "FR-102"
+      ],
+      "acceptance_ids": [
+        "A-101",
+        "A-102",
+        "A-103"
+      ],
+      "task_ids": [
+        "T-102"
+      ],
+      "observable_behavior": true,
+      "expected_evidence": "evidence for FR-102"
+    },
+    {
+      "verification_id": "verification:FR-103",
+      "requirement_ids": [
+        "FR-103"
+      ],
+      "acceptance_ids": [
+        "A-101",
+        "A-102",
+        "A-103"
+      ],
+      "task_ids": [
+        "T-103"
+      ],
+      "observable_behavior": true,
+      "expected_evidence": "evidence for FR-103"
+    }
+  ],
+  "validation_refs": [
+    "compatibility.3077b6555e948cc6e6249e6e50554d66abc19586382e91067abea8eac2abb215"
+  ],
+  "approval_refs": [
+    "terminal:workflow_checkpoint_ask_selected:checkpoint-answer-772774b4-195d-4989-ab9a-241434f86169"
+  ],
+  "language": "en-US",
+  "constitution_binding": {
+    "provider_id": "native",
+    "path": "CONSTITUTION.md",
+    "version": "0.0.0",
+    "content_sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+    "semantic_hash": "35ce12b619924ee68ab11046b5ac497392f2615526e791d52482d5c5257714af",
+    "validation_ref": "constitution.validation.8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+    "bound_at": "2026-09-02T22:57:29.984Z"
+  },
+  "constitution_impact_ref": null,
+  "risks": [],
+  "open_decisions": [],
+  "execution_choices": [
+    "do-work",
+    "cto"
+  ],
+  "import_snapshot_ref": "import.8893097d805bd337eee3504e8dcf026199663e2524c03ec1fc9a5e93d1afafbb",
+  "compatibility_supplement_ref": null,
+  "schema_version": 1,
+  "handoff_id": "imported-payment-retry.handoff.v1",
+  "handoff_digest": "2f60fb2ae2c5b5c867dc7658b46b8a3b0c46f9306264b37767105a308ccf588c",
+  "status": "ready"
+}

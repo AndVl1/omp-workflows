@@ -10,18 +10,34 @@
 import { createHash, randomBytes } from "node:crypto";
 import { migrationCheckpointPolicy, validateTypedControlPlane } from "./workflow-contract.js";
 import type {
+  CheckpointActor,
   CheckpointAnswerChannel,
   CheckpointAnswerProof,
   CheckpointDecision,
   CheckpointPolicy,
   CheckpointRule,
+  NativeCheckpointRuleKind,
   StageDef,
   TeamState,
   TrustedCheckpointAnswer,
   TypedCheckpointDecision,
 } from "./types.js";
 
+export const CONSTITUTION_APPROVAL_DECISIONS = ["approve_continue", "request_changes"] as const;
+export const SPECIFICATION_PHASE_APPROVAL_DECISIONS = [
+  "approve_continue",
+  "request_changes",
+  "approve_stop",
+] as const;
+
+const NATIVE_CHECKPOINT_DECISIONS: Record<NativeCheckpointRuleKind, readonly string[]> = {
+  constitution_approval: CONSTITUTION_APPROVAL_DECISIONS,
+  specification_phase_approval: SPECIFICATION_PHASE_APPROVAL_DECISIONS,
+};
+
 const HARD_HUMAN_FLOOR: Record<string, true> = {
+  constitution_approval: true,
+  specification_phase_approval: true,
   product_approval: true,
   security: true,
   destructive_side_effect: true,
@@ -33,6 +49,281 @@ const HARD_HUMAN_FLOOR: Record<string, true> = {
 type StageCheckpointRef = Pick<StageDef, "id" | "checkpoint" | "checkpoint_policy">;
 function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+const isBoundedCheckpointFeedback = (value: string): boolean => Buffer.byteLength(value, "utf8") <= 8192 && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
+
+const CHECKPOINT_CONTROL_OR_FORMAT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const CHECKPOINT_ID = /^[A-Za-z0-9._-]+$/u;
+const CHECKPOINT_TEXT_BYTES = 4096;
+const CHECKPOINT_RATIONALE_BYTES = 8192;
+const isSafeCheckpointReference = (value: string): boolean =>
+  !value.split(/[\\/]/u).some((segment) => segment === "" || segment === "." || segment === "..");
+
+/** Filesystem identity bound to a host Ask capability. */
+export interface TrustedCheckpointRootIdentity {
+  canonical_root: string;
+  dev: number;
+  ino: number;
+}
+
+/**
+ * Opaque runtime-only authority minted after the trusted host Ask returns.
+ * The object has no bearer fields; the module-private WeakMap below is the
+ * only source of its provenance.
+ */
+export type TrustedCheckpointAnswerCapability = object & { readonly __trusted_checkpoint_answer_capability?: never };
+
+export interface TrustedCheckpointAnswerIssuanceInput {
+  root: TrustedCheckpointRootIdentity;
+  state: TeamState;
+  answer_id: string;
+  channel: CheckpointAnswerChannel;
+  reference: string;
+  stage_id: string;
+  checkpoint_id: string;
+  decision: string;
+  feedback?: string;
+  feature_id?: string;
+  loop_iteration?: number;
+  subject_binding?: string;
+  subject_revision?: number;
+  /** Exact canonical host question and ordered policy options. */
+  question: string;
+  options: readonly string[];
+  /** Current host session identity and answer actor reference. */
+  session_id: string;
+  actor_ref: string;
+  /** Immutable workflow profile identity rendered by the selected Ask. */
+  profile_hash?: string;
+}
+
+export interface TrustedCheckpointAnswerRecordOptions {
+  capability: TrustedCheckpointAnswerCapability;
+  root: TrustedCheckpointRootIdentity;
+}
+
+type TrustedCheckpointAnswerAuthority = {
+  capability: TrustedCheckpointAnswerCapability;
+  root: TrustedCheckpointRootIdentity;
+  answer_id: string;
+  channel: CheckpointAnswerChannel;
+  reference: string;
+  stage_id: string;
+  checkpoint_id: string;
+  decision: string;
+  feedback?: string;
+  feature_id?: string;
+  loop_iteration?: number;
+  subject_binding?: string;
+  subject_revision?: number;
+  run_id: string;
+  capability_id: string;
+  capability_epoch: string;
+  policy_hash: string;
+  profile_hash?: string;
+  work_identity_hash: string;
+  question: string;
+  options: readonly string[];
+  session_id: string;
+  actor_ref: string;
+  authority_receipt: string;
+  nonce: string;
+  /** Monotonic process-local issue time; never trusted from host input. */
+  issued_at_ms: number;
+};
+
+let trustedCheckpointHostBridge: object | null = null;
+const trustedCheckpointAnswerAuthorities = new Map<string, TrustedCheckpointAnswerAuthority>();
+const trustedCheckpointAnswerCapabilities = new WeakMap<object, TrustedCheckpointAnswerAuthority>();
+const TRUSTED_CHECKPOINT_AUTHORITIES_MAX = 1024;
+const TRUSTED_CHECKPOINT_AUTHORITY_TTL_MS = 30 * 60 * 1000;
+
+function retireTrustedCheckpointAnswerAuthority(answerId: string): void {
+  const authority = trustedCheckpointAnswerAuthorities.get(answerId);
+  if (!authority) return;
+  trustedCheckpointAnswerAuthorities.delete(answerId);
+  trustedCheckpointAnswerCapabilities.delete(authority.capability);
+}
+
+/**
+ * Remove authorities that are no longer usable. A durable consumed marker is
+ * authoritative when a state snapshot is available; an unconsumed answer is
+ * retained until its bounded TTL so a pending commit/retry is not silently
+ * invalidated by a sweep.
+ */
+function sweepTrustedCheckpointAnswerAuthorities(state?: TeamState, retireConsumed = false): void {
+  const now = Date.now();
+  const consumed = retireConsumed
+    ? new Set((state?.trusted_checkpoint_answers ?? [])
+      .filter((answer) => answer.consumed_at !== undefined)
+      .map((answer) => answer.answer_id))
+    : undefined;
+  for (const [answerId, authority] of trustedCheckpointAnswerAuthorities) {
+    if (consumed?.has(answerId) || now - authority.issued_at_ms >= TRUSTED_CHECKPOINT_AUTHORITY_TTL_MS) {
+      retireTrustedCheckpointAnswerAuthority(answerId);
+    }
+  }
+}
+
+/** Delete one authority after its durable transition is known to have committed. */
+export function retireTrustedCheckpointAnswer(answerId: string): void {
+  if (!nonEmpty(answerId)) return;
+  retireTrustedCheckpointAnswerAuthority(answerId);
+}
+
+/** Internal one-time bridge installed by the mounted workflow host. */
+export function registerTrustedCheckpointHostBridge(bridge: object): void {
+  if (trustedCheckpointHostBridge === null) {
+    trustedCheckpointHostBridge = bridge;
+    return;
+  }
+  if (trustedCheckpointHostBridge !== bridge) throw new Error("checkpoint_unverified: trusted host bridge is already bound");
+}
+
+function authorityForCapability(value: unknown): TrustedCheckpointAnswerAuthority | null {
+  if (!value || typeof value !== "object") return null;
+  const authority = trustedCheckpointAnswerCapabilities.get(value) ?? null;
+  if (!authority || trustedCheckpointAnswerAuthorities.get(authority.answer_id) !== authority) return null;
+  return authority;
+}
+
+function sameRootIdentity(left: TrustedCheckpointRootIdentity, right: TrustedCheckpointRootIdentity): boolean {
+  return left.canonical_root === right.canonical_root && left.dev === right.dev && left.ino === right.ino;
+}
+
+function authorityInputError(
+  state: TeamState,
+  input: TrustedCheckpointAnswerInput,
+  authority: TrustedCheckpointAnswerAuthority,
+  root: TrustedCheckpointRootIdentity,
+): string | null {
+  const binding = capabilityBinding(state);
+  const policy = state.checkpoint_policy;
+  const expectedRun = expectedRunId(state);
+  const policyHash = policy ? checkpointPolicyHash(policy) : null;
+  const profileHash = state.profile_hash;
+  if (!sameRootIdentity(authority.root, root)) return "checkpoint_unverified: trusted host answer root identity is stale or mismatched";
+  if (!binding || !policy || !policyHash) return "checkpoint_unverified: checkpoint capability or policy binding is unavailable";
+  if (authority.answer_id !== input.answer_id || authority.channel !== input.channel || authority.reference !== input.reference
+    || authority.stage_id !== input.stage_id || authority.checkpoint_id !== input.checkpoint_id || authority.decision !== input.decision
+    || authority.feedback !== input.feedback || authority.feature_id !== input.feature_id || authority.loop_iteration !== input.loop_iteration
+    || authority.subject_binding !== input.subject_binding || authority.subject_revision !== input.subject_revision
+    || authority.run_id !== expectedRun || authority.capability_id !== binding.id || authority.capability_epoch !== binding.epoch
+    || authority.policy_hash !== policyHash || !authority.profile_hash || authority.profile_hash !== profileHash
+    || authority.work_identity_hash !== checkpointWorkIdentityHash(state, input.stage_id)) {
+    return "checkpoint_unverified: trusted host answer capability is stale or mismatched";
+  }
+  return null;
+}
+
+/**
+ * Mint one opaque authority only for the mounted host Ask path.  Callers must
+ * retain the returned object in memory and pass it to record/commit; copying
+ * any durable answer fields cannot recreate this capability.
+ */
+export function issueTrustedCheckpointAnswerCapability(
+  bridge: object,
+  input: TrustedCheckpointAnswerIssuanceInput,
+): TrustedCheckpointAnswerCapability {
+  // A canonical consumed marker permits a later host Ask to reuse an answer id
+  // only after the prior authority has been retired; pending records remain
+  // protected by the duplicate-id check.
+  sweepTrustedCheckpointAnswerAuthorities(input?.state, true);
+  if (trustedCheckpointHostBridge === null || bridge !== trustedCheckpointHostBridge) {
+    throw new Error("checkpoint_unverified: trusted host Ask bridge is unavailable");
+  }
+  if (trustedCheckpointAnswerAuthorities.size >= TRUSTED_CHECKPOINT_AUTHORITIES_MAX) {
+    throw new Error("checkpoint_recovery_required: trusted host answer authority registry is at capacity; complete or recover a pending answer before asking again");
+  }
+  if (trustedCheckpointAnswerAuthorities.has(input.answer_id)) {
+    throw new Error("checkpoint_unverified: trusted host answer capability has already been issued");
+  }
+  if (!nonEmpty(input.root.canonical_root)
+    || !Number.isSafeInteger(input.root.dev) || !Number.isSafeInteger(input.root.ino)
+    || !nonEmpty(input.answer_id) || !nonEmpty(input.reference) || !nonEmpty(input.stage_id)
+    || !nonEmpty(input.checkpoint_id) || !nonEmpty(input.decision) || !nonEmpty(input.question)
+    || !nonEmpty(input.session_id) || !nonEmpty(input.actor_ref) || !nonEmpty(input.profile_hash)
+    || !Array.isArray(input.options) || input.options.length === 0
+    || input.options.some((option) => !nonEmpty(option))) {
+    throw new Error("checkpoint_unverified: trusted host answer capability context is incomplete");
+  }
+  const binding = capabilityBinding(input.state);
+  const policy = input.state.checkpoint_policy;
+  if (!binding || !policy) throw new Error("checkpoint_unverified: checkpoint capability or policy binding is unavailable");
+  const rule = policy.rules[input.checkpoint_id];
+  if (!rule || !rule.allowed_decisions.includes(input.decision)) throw new Error("checkpoint_unverified: decision is not allowed by the active checkpoint policy");
+  const authority: TrustedCheckpointAnswerAuthority = {
+    capability: Object.freeze(Object.create(null)) as TrustedCheckpointAnswerCapability,
+    root: { canonical_root: input.root.canonical_root, dev: input.root.dev, ino: input.root.ino },
+    answer_id: input.answer_id,
+    channel: input.channel,
+    reference: input.reference,
+    stage_id: input.stage_id,
+    checkpoint_id: input.checkpoint_id,
+    decision: input.decision,
+    ...(input.feedback !== undefined ? { feedback: input.feedback } : {}),
+    ...(input.feature_id !== undefined ? { feature_id: input.feature_id } : {}),
+    ...(input.loop_iteration !== undefined ? { loop_iteration: input.loop_iteration } : {}),
+    ...(input.subject_binding !== undefined ? { subject_binding: input.subject_binding } : {}),
+    ...(input.subject_revision !== undefined ? { subject_revision: input.subject_revision } : {}),
+    run_id: expectedRunId(input.state),
+    capability_id: binding.id,
+    capability_epoch: binding.epoch,
+    policy_hash: checkpointPolicyHash(policy),
+    profile_hash: input.profile_hash,
+    work_identity_hash: checkpointWorkIdentityHash(input.state, input.stage_id),
+    question: input.question,
+    options: Object.freeze([...input.options]),
+    session_id: input.session_id,
+    actor_ref: input.actor_ref,
+    authority_receipt: randomBytes(32).toString("hex"),
+    nonce: randomBytes(32).toString("hex"),
+    issued_at_ms: Date.now(),
+  };
+  trustedCheckpointAnswerAuthorities.set(input.answer_id, authority);
+  trustedCheckpointAnswerCapabilities.set(authority.capability, authority);
+  return authority.capability;
+}
+
+function checkpointInputError(decision: CheckpointDecision | TypedCheckpointDecision): string | null {
+  const value = decision as unknown as Record<string, unknown>;
+  const textFields = [
+    "stage_id", "checkpoint", "checkpoint_id", "decision", "rationale", "run_id",
+    "capability_id", "capability_epoch", "policy_hash", "feature_id", "subject_binding",
+    "artifact_id", "validation_ref", "artifact_digest", "validation_digest", "decided_at",
+  ];
+  let aggregate = 0;
+  for (const field of textFields) {
+    const item = value[field];
+    if (item === undefined) continue;
+    if (typeof item !== "string" || Buffer.byteLength(item, "utf8") > (field === "rationale" ? CHECKPOINT_RATIONALE_BYTES : CHECKPOINT_TEXT_BYTES) || CHECKPOINT_CONTROL_OR_FORMAT.test(item)) {
+      return `checkpoint decision ${field} is not bounded line-inert text`;
+    }
+    aggregate += Buffer.byteLength(item, "utf8");
+  }
+  for (const field of ["stage_id", "checkpoint", "checkpoint_id", "capability_id", "capability_epoch", "feature_id", "artifact_id"] as const) {
+    const item = value[field];
+    if (item !== undefined && (typeof item !== "string" || !CHECKPOINT_ID.test(item) || item === "." || item === "..")) return `checkpoint decision ${field} is not a safe identifier`;
+  }
+  const actor = value.actor_provenance ?? value.actor;
+  if (actor && typeof actor === "object" && !Array.isArray(actor)) {
+    const actorValue = actor as Record<string, unknown>;
+    const item = actorValue.ref;
+    if (item !== undefined && (typeof item !== "string" || Buffer.byteLength(item, "utf8") > CHECKPOINT_TEXT_BYTES || CHECKPOINT_CONTROL_OR_FORMAT.test(item) || !isSafeCheckpointReference(item))) return "checkpoint actor ref is not bounded or safe";
+    if (typeof item === "string") aggregate += Buffer.byteLength(item, "utf8");
+    const proof = actorValue.proof;
+    if (proof && typeof proof === "object" && !Array.isArray(proof)) {
+      for (const field of ["answer_id", "nonce", "reference", "binding"] as const) {
+        const proofItem = (proof as Record<string, unknown>)[field];
+        if (proofItem !== undefined && (typeof proofItem !== "string" || Buffer.byteLength(proofItem, "utf8") > CHECKPOINT_TEXT_BYTES || CHECKPOINT_CONTROL_OR_FORMAT.test(proofItem) || !isSafeCheckpointReference(proofItem))) return `checkpoint proof ${field} is not bounded or safe`;
+        if (typeof proofItem === "string") aggregate += Buffer.byteLength(proofItem, "utf8");
+      }
+      const feedback = (proof as Record<string, unknown>).feedback;
+      if (feedback !== undefined && (typeof feedback !== "string" || !feedback.trim() || Buffer.byteLength(feedback, "utf8") > CHECKPOINT_RATIONALE_BYTES || CHECKPOINT_CONTROL_OR_FORMAT.test(feedback))) return "checkpoint proof feedback is not bounded non-empty line-inert text";
+      if (typeof feedback === "string") aggregate += Buffer.byteLength(feedback, "utf8");
+    }
+  }
+  return aggregate > 16 * 1024 ? "checkpoint decision text aggregate exceeds the maximum byte budget" : null;
 }
 
 
@@ -79,6 +370,19 @@ function canonicalize(value: unknown): unknown {
   }
   return value;
 }
+function checkpointSubjectIdentity(decision: Pick<TypedCheckpointDecision, "feature_id" | "loop_iteration" | "subject_binding" | "artifact_id" | "artifact_version" | "artifact_digest" | "validation_ref" | "validation_digest">): string {
+  return JSON.stringify(canonicalize({
+    feature_id: decision.feature_id ?? null,
+    loop_iteration: decision.loop_iteration ?? null,
+    subject_binding: decision.subject_binding ?? null,
+    artifact_id: decision.artifact_id ?? null,
+    artifact_version: decision.artifact_version ?? null,
+    artifact_digest: decision.artifact_digest ?? null,
+    validation_ref: decision.validation_ref ?? null,
+    validation_digest: decision.validation_digest ?? null,
+  }));
+}
+
 
 /** SHA-256 over canonical policy JSON; persisted migration uses the same rule. */
 export function checkpointPolicyHash(policy: CheckpointPolicy): string {
@@ -94,6 +398,12 @@ export interface TrustedCheckpointAnswerInput {
   stage_id: string;
   checkpoint_id: string;
   decision: string;
+  /** Trusted current-user feedback required by selected request_changes callers. */
+  feedback?: string;
+  feature_id?: string;
+  loop_iteration?: number;
+  subject_binding?: string;
+  subject_revision?: number;
   issued_at?: string;
 }
 
@@ -135,20 +445,29 @@ function answerProof(answer: TrustedCheckpointAnswer): CheckpointAnswerProof {
     channel: answer.channel,
     reference: answer.reference,
     binding: answer.binding,
+    ...(answer.feedback !== undefined ? { feedback: answer.feedback } : {}),
   };
 }
 
 /**
  * Record an answer at the trusted terminal/escalation ingest boundary.
  *
- * The public checkpoint tool receives only the returned proof.  It cannot
- * choose the nonce or binding, and re-ingesting an answer id is idempotent
- * only when every durable context field is identical.
+ * The host Ask must first issue an opaque runtime capability. The public
+ * checkpoint tool receives only the returned proof; it cannot choose the
+ * nonce, receipt, or binding, and re-ingesting an answer id is idempotent only
+ * when every durable context field and authenticated receipt are identical.
  */
 export function recordTrustedCheckpointAnswer(
   state: TeamState,
   input: TrustedCheckpointAnswerInput,
+  options: TrustedCheckpointAnswerRecordOptions,
 ): { state: TeamState; answer: TrustedCheckpointAnswer; proof: CheckpointAnswerProof } {
+  sweepTrustedCheckpointAnswerAuthorities(state);
+  const authority = authorityForCapability(options?.capability);
+  if (!authority) throw new Error("checkpoint_recovery_required: trusted host answer authority capability is unavailable; repeat the host Ask");
+  if (!options?.root) throw new Error("checkpoint_recovery_required: trusted host answer root binding is unavailable; repeat the host Ask");
+  const authorityError = authorityInputError(state, input, authority, options.root);
+  if (authorityError) throw new Error(authorityError);
   if (
     !nonEmpty(input.answer_id)
     || !nonEmpty(input.reference)
@@ -159,6 +478,17 @@ export function recordTrustedCheckpointAnswer(
   ) {
     throw new Error("checkpoint_unverified: trusted answer identity is incomplete");
   }
+  const bounded = (value: unknown, max = 4096): value is string => typeof value === "string" && value.length > 0 && value.length <= max && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
+  if (!bounded(input.answer_id) || !bounded(input.reference) || !bounded(input.stage_id) || !bounded(input.checkpoint_id) || !bounded(input.decision, 256)) throw new Error("checkpoint_unverified: trusted answer fields exceed bounds");
+  if (input.feature_id !== undefined && (!/^[a-z0-9][a-z0-9._-]{0,127}$/u.test(input.feature_id))) throw new Error("checkpoint_unverified: trusted answer feature_id is invalid");
+  if (input.loop_iteration !== undefined && (!Number.isSafeInteger(input.loop_iteration) || input.loop_iteration < 1 || input.loop_iteration > 1000000)) throw new Error("checkpoint_unverified: trusted answer loop_iteration is invalid");
+  if (input.subject_binding !== undefined && !/^[a-f0-9]{64}$/u.test(input.subject_binding)) throw new Error("checkpoint_unverified: trusted answer subject binding is invalid");
+  if (input.subject_revision !== undefined && (!Number.isSafeInteger(input.subject_revision) || input.subject_revision < 0)) throw new Error("checkpoint_unverified: trusted answer subject revision is invalid");
+  if (input.decision === "request_changes") {
+    if (input.feedback === undefined || typeof input.feedback !== "string" || !input.feedback || input.feedback !== input.feedback.trim() || !isBoundedCheckpointFeedback(input.feedback)) throw new Error("checkpoint_unverified: request_changes trusted answer requires exact bounded feedback");
+  } else if (input.feedback !== undefined) {
+    throw new Error("checkpoint_unverified: feedback is only valid for request_changes");
+  }
   if (input.reference.trim().toLowerCase().startsWith("user:")) {
     throw new Error("checkpoint_unverified: user provenance references are not durable answer identities");
   }
@@ -166,14 +496,26 @@ export function recordTrustedCheckpointAnswer(
   if (!binding) throw new Error("checkpoint_unverified: checkpoint capability binding is unavailable");
   const policy = state.checkpoint_policy;
   if (!policy) throw new Error("checkpoint_unverified: checkpoint policy is unavailable");
+  const policyIssues = policyValidationIssues(policy);
+  if (policyIssues.length > 0) {
+    throw new Error("checkpoint_unverified: checkpoint policy is invalid: " + policyIssues.join("; "));
+  }
+  const rule = policy.rules[input.checkpoint_id];
+  if (!rule || !rule.allowed_decisions.includes(input.decision)) {
+    throw new Error("checkpoint_unverified: decision is not allowed by the active checkpoint policy");
+  }
   const policyHash = checkpointPolicyHash(policy);
   const runId = expectedRunId(state);
   const workIdentityHash = checkpointWorkIdentityHash(state, input.stage_id);
   const existing = (state.trusted_checkpoint_answers ?? []).find((candidate) => candidate.answer_id === input.answer_id);
+  const sameOptionalContext = (left: unknown, right: unknown): boolean =>
+    (left === undefined) === (right === undefined) && left === right;
   if (existing) {
     const expected = checkpointAnswerBinding(existing);
     if (
       existing.binding !== expected
+      || existing.authority_receipt !== authority.authority_receipt
+      || existing.nonce !== authority.nonce
       || existing.channel !== input.channel
       || existing.reference !== input.reference
       || existing.run_id !== runId
@@ -184,6 +526,11 @@ export function recordTrustedCheckpointAnswer(
       || existing.capability_epoch !== binding.epoch
       || existing.policy_hash !== policyHash
       || existing.decision !== input.decision
+      || !sameOptionalContext(existing.feature_id, input.feature_id)
+      || !sameOptionalContext(existing.loop_iteration, input.loop_iteration)
+      || !sameOptionalContext(existing.subject_binding, input.subject_binding)
+      || !sameOptionalContext(existing.subject_revision, input.subject_revision)
+      || !sameOptionalContext(existing.feedback, input.feedback)
     ) {
       throw new Error("checkpoint_unverified: trusted answer replay conflicts with the active context");
     }
@@ -191,7 +538,7 @@ export function recordTrustedCheckpointAnswer(
   }
   const answer: TrustedCheckpointAnswer = {
     answer_id: input.answer_id,
-    nonce: randomBytes(32).toString("hex"),
+    nonce: authority.nonce,
     channel: input.channel,
     reference: input.reference,
     run_id: runId,
@@ -201,8 +548,14 @@ export function recordTrustedCheckpointAnswer(
     capability_id: binding.id,
     capability_epoch: binding.epoch,
     policy_hash: policyHash,
+    ...(input.feature_id !== undefined ? { feature_id: input.feature_id } : {}),
+    ...(input.loop_iteration !== undefined ? { loop_iteration: input.loop_iteration } : {}),
+    ...(input.subject_binding !== undefined ? { subject_binding: input.subject_binding } : {}),
+    ...(input.subject_revision !== undefined ? { subject_revision: input.subject_revision } : {}),
     decision: input.decision,
+    ...(input.feedback !== undefined ? { feedback: input.feedback } : {}),
     binding: "",
+    authority_receipt: authority.authority_receipt,
     issued_at: input.issued_at ?? new Date().toISOString(),
   };
   answer.binding = checkpointAnswerBinding(answer);
@@ -213,14 +566,56 @@ export function recordTrustedCheckpointAnswer(
   return { state: next, answer, proof: answerProof(answer) };
 }
 
+function nativeCheckpointKind(value: string): NativeCheckpointRuleKind | null {
+  return Object.prototype.hasOwnProperty.call(NATIVE_CHECKPOINT_DECISIONS, value)
+    ? value as NativeCheckpointRuleKind
+    : null;
+}
+
+function exactDecisionSet(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length && expected.every((decision) => actual.includes(decision));
+}
+
+function policyForTypedControlPlane(policy: CheckpointPolicy): CheckpointPolicy {
+  const hardHuman = policy.hard_human.map((kind) => nativeCheckpointKind(kind) ? "product_approval" as const : kind);
+  return {
+    ...policy,
+    hard_human: [...new Set(hardHuman)],
+    rules: Object.fromEntries(Object.entries(policy.rules).map(([id, rule]) => [
+      id,
+      nativeCheckpointKind(rule.kind) ? { ...rule, kind: "product_approval" as const } : rule,
+    ])),
+  };
+}
+
 function policyValidationIssues(policy: CheckpointPolicy): string[] {
-  const result = validateTypedControlPlane({ checkpoint_policy: policy });
-  if (result.ok) return [];
-  // Migration policies intentionally leave decisions empty: that represents
-  // unresolved legacy consent and never authorizes a decision.
-  return result.issues
+  const result = validateTypedControlPlane({ checkpoint_policy: policyForTypedControlPlane(policy) });
+  const issues = result.ok ? [] : result.issues
     .filter((issue) => !(policy.source === "migration" && issue.path.endsWith(".allowed_decisions") && issue.message.includes("must not be empty")))
-    .map((issue) => `${issue.path} ${issue.message}`);
+    .map((issue) => issue.path + " " + issue.message);
+
+  for (const [checkpointId, rule] of Object.entries(policy.rules)) {
+    const kind = nativeCheckpointKind(rule.kind) ?? nativeCheckpointKind(checkpointId);
+    if (!kind) continue;
+    if (nativeCheckpointKind(rule.kind) && checkpointId !== kind) {
+      issues.push("checkpoint_policy.rules." + checkpointId + ".kind must match checkpoint id '" + kind + "'");
+      continue;
+    }
+    const expected = NATIVE_CHECKPOINT_DECISIONS[kind];
+    if (!exactDecisionSet(rule.allowed_decisions, expected)) {
+      issues.push("checkpoint_policy.rules." + checkpointId + ".allowed_decisions must be exactly " + expected.join(" | "));
+    }
+    if (policy.default !== "required_human" || rule.default !== "required_human") {
+      issues.push("checkpoint_policy.rules." + checkpointId + " must be required_human at policy and rule level");
+    }
+    if (rule.phase !== "before_advance") {
+      issues.push("checkpoint_policy.rules." + checkpointId + ".phase must be before_advance");
+    }
+    if (!isFloorRule(policy, rule, checkpointId)) {
+      issues.push("checkpoint_policy.rules." + checkpointId + " must be hard-human");
+    }
+  }
+  return issues;
 }
 
 /**
@@ -251,19 +646,44 @@ function applyLegacyMigrationPolicy(state: TeamState, policy: CheckpointPolicy, 
  * A declared legacy checkpoint gets a conservative migration policy; absence
  * of a checkpoint is not an approval requirement and does not imply consent.
  */
+export function nativeCheckpointPolicy(kind: NativeCheckpointRuleKind): CheckpointPolicy {
+  return {
+    default: "required_human",
+    scope: "decision",
+    hard_human: [kind],
+    rules: {
+      [kind]: {
+        kind,
+        default: "required_human",
+        allowed_decisions: [...NATIVE_CHECKPOINT_DECISIONS[kind]],
+        phase: "before_advance",
+        rationale: kind === "constitution_approval"
+          ? "Constitution bootstrap decisions require a trusted human answer."
+          : "Specification phase decisions require a trusted human answer.",
+      },
+    },
+    source: "profile",
+    policy_version: 1,
+    rationale: "Native specification checkpoints are hard-human and decision-bound.",
+  };
+}
+
 export function resolveCheckpointPolicy(
   stage: StageCheckpointRef,
   state: TeamState,
 ): CheckpointPolicy | null {
   if (!stage.checkpoint) return null;
+  const nativeKind = nativeCheckpointKind(stage.checkpoint);
   const policy = state.checkpoint_policy
     ?? stage.checkpoint_policy
-    ?? migrationCheckpointPolicy(stage.checkpoint);
+    ?? (nativeKind ? nativeCheckpointPolicy(nativeKind) : migrationCheckpointPolicy(stage.checkpoint));
   return applyLegacyMigrationPolicy(state, policy, stage.checkpoint);
 }
 
-function isFloorRule(policy: CheckpointPolicy, rule: CheckpointRule): boolean {
-  return HARD_HUMAN_FLOOR[rule.kind] === true || policy.hard_human.includes(rule.kind);
+function isFloorRule(policy: CheckpointPolicy, rule: CheckpointRule, checkpointId?: string): boolean {
+  return (checkpointId !== undefined && nativeCheckpointKind(checkpointId) !== null)
+    || HARD_HUMAN_FLOOR[rule.kind] === true
+    || policy.hard_human.includes(rule.kind);
 }
 
 function expectedRunId(state: TeamState): string {
@@ -277,39 +697,197 @@ function capabilityBinding(state: TeamState): { id: string; epoch: string } | nu
   return nonEmpty(id) && nonEmpty(epoch) ? { id, epoch } : null;
 }
 
-function trustedHumanAnswerError(
+export interface TrustedCheckpointAnswerContext {
+  actor: CheckpointActor;
+  run_id: string;
+  stage_id: string;
+  checkpoint_id: string;
+  decision: string;
+  capability_id?: string;
+  capability_epoch?: string;
+  policy_hash?: string;
+  /** Explicit specification identity; omitted for non-specification checkpoints. */
+  feature_id?: string;
+  loop_iteration?: number;
+  subject_binding?: string;
+  /** Exact state/artifact revision captured when the trusted answer was minted. */
+  subject_revision?: number;
+  /** Historical idempotent replay validates the immutable record, not the moved cursor. */
+  bind_active_context?: boolean;
+  /** Require a checkpoint-specific hard-human rule (constitution/bootstrap use). */
+  require_hard_human?: boolean;
+  /** Exact decision rationale bound to a request_changes trusted answer. */
+  feedback?: string;
+  /** Root identity captured by the trusted host Ask, when available. */
+  root_identity?: TrustedCheckpointRootIdentity;
+  /** Host session identity captured by the trusted host Ask, when available. */
+  session_id?: string;
+}
+
+/**
+ * Canonical verification for an engine-issued human answer. Callers outside
+ * the normal typed checkpoint transition (for example the project
+ * constitution prerequisite) must use this verifier rather than interpreting
+ * proof strings themselves.
+ */
+export function trustedCheckpointAnswerError(
   state: TeamState,
-  candidate: TypedCheckpointDecision,
-  stage: StageCheckpointRef,
+  context: TrustedCheckpointAnswerContext,
 ): string | null {
-  if (candidate.actor.kind !== "user") return "human checkpoint authorization requires a user actor";
-  const proof = candidate.actor.proof;
+  sweepTrustedCheckpointAnswerAuthorities(state);
+  if (context.actor.kind !== "user") return "human checkpoint authorization requires a user actor";
+  const proof = context.actor.proof;
   if (!proof) return "human checkpoint authorization requires a durable terminal/escalation answer proof";
-  if (!nonEmpty(candidate.actor.ref) || proof.reference !== candidate.actor.ref) {
+  if (!nonEmpty(context.actor.ref) || proof.reference !== context.actor.ref) {
     return "human checkpoint authorization answer reference does not match actor provenance";
+  }
+  if (context.feature_id !== undefined && state.specification && state.specification.feature_id !== context.feature_id) {
+    return "human checkpoint authorization feature identity does not match the selected workspace";
+  }
+  if (expectedRunId(state) !== context.run_id) {
+    return "human checkpoint authorization run identity does not match the selected workspace";
   }
   const answer = (state.trusted_checkpoint_answers ?? []).find((record) => record.answer_id === proof.answer_id);
   if (!answer) return "human checkpoint authorization answer identity is not present in the durable answer ledger";
+  const authority = trustedCheckpointAnswerAuthorities.get(answer.answer_id);
+  if (!authority) {
+    if (!answer.consumed_at) return "human checkpoint authorization recovery_required: trusted host answer authority is unavailable after process restart; repeat the host Ask";
+    // A consumed answer is already durable and cannot authorize a new
+    // transition. Permit only the exact immutable replay from its canonical
+    // ledger record after the one-time runtime authority has been retired.
+    if (answer.reference !== context.actor.ref || answer.run_id !== context.run_id
+      || answer.stage_id !== context.stage_id || answer.checkpoint_id !== context.checkpoint_id
+      || answer.decision !== context.decision || answer.nonce !== proof.nonce
+      || answer.answer_id !== proof.answer_id || answer.channel !== proof.channel
+      || answer.reference !== proof.reference || answer.feedback !== proof.feedback
+      || answer.binding !== proof.binding || answer.binding !== checkpointAnswerBinding(answer)
+      || (context.capability_id !== undefined && answer.capability_id !== context.capability_id)
+      || (context.capability_epoch !== undefined && answer.capability_epoch !== context.capability_epoch)
+      || (context.policy_hash !== undefined && answer.policy_hash !== context.policy_hash)
+      || (context.feature_id !== undefined && answer.feature_id !== context.feature_id)
+      || (context.loop_iteration !== undefined && answer.loop_iteration !== context.loop_iteration)
+      || (context.subject_binding !== undefined && answer.subject_binding !== context.subject_binding)
+      || (context.subject_revision !== undefined && answer.subject_revision !== context.subject_revision)
+      || (context.decision === "request_changes" && answer.feedback !== context.feedback)
+      || (context.decision !== "request_changes" && answer.feedback !== undefined)) {
+      return "human checkpoint authorization answer authority is stale or mismatched";
+    }
+    return null;
+  }
+  if (context.root_identity && !sameRootIdentity(context.root_identity, authority.root)) {
+    return "human checkpoint authorization answer root identity does not match the trusted host Ask";
+  }
+  if (context.session_id !== undefined && context.session_id !== authority.session_id) {
+    return "human checkpoint authorization answer host session does not match the trusted host Ask";
+  }
+  if (authority.actor_ref !== context.actor.ref || authority.run_id !== context.run_id || authority.stage_id !== context.stage_id
+    || authority.checkpoint_id !== context.checkpoint_id || authority.decision !== context.decision
+    || (context.feature_id !== undefined && authority.feature_id !== context.feature_id)
+    || (context.loop_iteration !== undefined && authority.loop_iteration !== context.loop_iteration)
+    || (context.subject_binding !== undefined && authority.subject_binding !== context.subject_binding)
+    || (context.subject_revision !== undefined && authority.subject_revision !== context.subject_revision)
+    || (context.feedback !== undefined && authority.feedback !== context.feedback)
+    || authority.nonce !== answer.nonce
+    || authority.authority_receipt !== answer.authority_receipt) {
+    return "human checkpoint authorization answer authority is stale or mismatched";
+  }
   if (
     answer.answer_id !== proof.answer_id
     || answer.nonce !== proof.nonce
     || answer.channel !== proof.channel
     || answer.reference !== proof.reference
-    || answer.run_id !== candidate.run_id
-    || answer.stage_id !== stage.id
-    || answer.checkpoint_id !== candidate.checkpoint_id
-    || answer.capability_id !== candidate.capability_id
-    || answer.capability_epoch !== candidate.capability_epoch
-    || answer.policy_hash !== candidate.policy_hash
-    || answer.decision !== candidate.decision
-    || answer.work_identity_hash !== checkpointWorkIdentityHash(state, stage.id)
+    || answer.feedback !== proof.feedback
+    || (context.decision === "request_changes" && answer.feedback !== context.feedback)
+    || (context.decision !== "request_changes" && answer.feedback !== undefined)
+    || answer.run_id !== context.run_id
+    || answer.stage_id !== context.stage_id
+    || answer.checkpoint_id !== context.checkpoint_id
+    || answer.decision !== context.decision
+    || (context.capability_id !== undefined && answer.capability_id !== context.capability_id)
+    || (context.capability_epoch !== undefined && answer.capability_epoch !== context.capability_epoch)
+    || (context.policy_hash !== undefined && answer.policy_hash !== context.policy_hash)
+    || (context.feature_id !== undefined && answer.feature_id !== context.feature_id)
+    || (context.loop_iteration !== undefined && answer.loop_iteration !== context.loop_iteration)
+    || (context.subject_binding !== undefined && answer.subject_binding !== context.subject_binding)
+    || (context.subject_revision !== undefined && answer.subject_revision !== context.subject_revision)
   ) {
     return "human checkpoint authorization answer binding is stale or mismatched";
   }
   if (answer.binding !== checkpointAnswerBinding(answer) || proof.binding !== answer.binding) {
     return "human checkpoint authorization answer binding digest is invalid";
   }
+  if (context.bind_active_context !== false) {
+    const binding = capabilityBinding(state);
+    const capabilityStage = state.dispatch_capability?.issued_for?.stage_cursor;
+    const policy = state.checkpoint_policy;
+    if (!binding || !policy) return "human checkpoint authorization active context is unavailable";
+    const mappingExecutionCheckpoint = context.checkpoint_id.startsWith("cto-specification-mapping-");
+    const stageMatches = state.stage_cursor === context.stage_id
+      || (mappingExecutionCheckpoint && capabilityStage === context.stage_id);
+    if (!stageMatches || capabilityStage !== context.stage_id) {
+      return "human checkpoint authorization stage identity does not match the active capability";
+    }
+    if (context.require_hard_human) {
+      const rule = policy.rules[context.checkpoint_id];
+      if (!rule || !isFloorRule(policy, rule, context.checkpoint_id)
+        || policy.default !== "required_human" || rule.default !== "required_human"
+        || !rule.allowed_decisions.includes(context.decision)) {
+        return "human checkpoint authorization is not bound to a hard-human checkpoint policy";
+      }
+    }
+    if (
+      answer.capability_id !== binding.id
+      || answer.capability_epoch !== binding.epoch
+      || answer.policy_hash !== checkpointPolicyHash(policy)
+      || answer.work_identity_hash !== checkpointWorkIdentityHash(state, context.stage_id)
+    ) {
+      return "human checkpoint authorization answer binding is stale or mismatched";
+    }
+  }
+  if (answer.consumed_at) retireTrustedCheckpointAnswerAuthority(answer.answer_id);
   return null;
+}
+
+function markTrustedAnswerConsumed(state: TeamState, answerId: string): TeamState {
+  if (!state.trusted_checkpoint_answers) return state;
+  const index = state.trusted_checkpoint_answers.findIndex((answer) => answer.answer_id === answerId);
+  if (index < 0 || state.trusted_checkpoint_answers[index]?.consumed_at) return state;
+  const answers = [...state.trusted_checkpoint_answers];
+  answers[index] = { ...answers[index]!, consumed_at: new Date().toISOString() };
+  return { ...state, trusted_checkpoint_answers: answers };
+}
+
+/** Validate and idempotently consume one immutable trusted answer record. */
+export function consumeTrustedCheckpointAnswer(
+  state: TeamState,
+  context: TrustedCheckpointAnswerContext,
+): TeamState {
+  const error = trustedCheckpointAnswerError(state, context);
+  if (error) throw new Error("checkpoint_unverified: " + error);
+  return markTrustedAnswerConsumed(state, context.actor.proof!.answer_id);
+}
+
+function trustedHumanAnswerError(
+  state: TeamState,
+  candidate: TypedCheckpointDecision,
+  stage: StageCheckpointRef,
+  bindActiveContext: boolean,
+): string | null {
+  return trustedCheckpointAnswerError(state, {
+    actor: candidate.actor,
+    run_id: candidate.run_id,
+    stage_id: stage.id,
+    checkpoint_id: candidate.checkpoint_id,
+    decision: candidate.decision,
+    capability_id: candidate.capability_id,
+    capability_epoch: candidate.capability_epoch,
+    policy_hash: candidate.policy_hash,
+    feature_id: candidate.feature_id,
+    loop_iteration: candidate.loop_iteration,
+    subject_binding: candidate.subject_binding,
+    bind_active_context: bindActiveContext,
+    feedback: candidate.decision === "request_changes" ? candidate.rationale : undefined,
+  });
 }
 
 function fail(
@@ -373,6 +951,14 @@ function typedInput(
     capability_id: old.capability_id ?? capabilityBinding(state)!.id,
     capability_epoch: old.capability_epoch ?? capabilityBinding(state)!.epoch,
     policy_hash: old.policy_hash ?? checkpointPolicyHash(policy),
+    feature_id: old.feature_id,
+    loop_iteration: old.loop_iteration,
+    subject_binding: old.subject_binding,
+    artifact_id: old.artifact_id,
+    artifact_version: old.artifact_version,
+    artifact_digest: old.artifact_digest,
+    validation_ref: old.validation_ref,
+    validation_digest: old.validation_digest,
     rationale: old.rationale,
     decided_at: old.decided_at,
   };
@@ -388,6 +974,8 @@ export function validateCheckpointDecision(
   decision: CheckpointDecision | TypedCheckpointDecision,
   options: CheckpointValidationOptions = {},
 ): CheckpointValidationResult {
+  const inputError = checkpointInputError(decision);
+  if (inputError) return fail("policy_invalid", inputError);
   const stageId = options.stage?.id ?? decision.stage_id;
   const checkpointId = options.stage?.checkpoint
     ?? ("checkpoint_id" in decision ? decision.checkpoint_id : decision.checkpoint);
@@ -420,7 +1008,11 @@ export function validateCheckpointDecision(
   const prepared = typedInput(state, decision, policy, rule);
   if ("ok" in prepared) return prepared;
   const candidate = prepared.candidate;
-  const typedValidation = validateTypedControlPlane({ typed_checkpoint_decisions: [candidate] });
+  const typedValidation = validateTypedControlPlane({
+    typed_checkpoint_decisions: [nativeCheckpointKind(candidate.checkpoint_kind)
+      ? { ...candidate, checkpoint_kind: "product_approval" }
+      : candidate],
+  });
   if (!typedValidation.ok) {
     return fail(
       "policy_invalid",
@@ -456,12 +1048,12 @@ export function validateCheckpointDecision(
     return fail("checkpoint_unverified", "checkpoint decision capability binding is missing");
   }
 
-  const floor = isFloorRule(policy, rule);
+  const floor = isFloorRule(policy, rule, checkpointId);
   if (floor && (rule.default === "autonomous_allowed" || policy.default === "autonomous_allowed")) {
     return fail("policy_invalid", `hard-human checkpoint '${checkpointId}' cannot permit autonomous authorization`, "needs_human");
   }
   if (candidate.authorization === "human") {
-    const provenanceError = trustedHumanAnswerError(state, candidate, stage);
+    const provenanceError = trustedHumanAnswerError(state, candidate, stage, bindCapability);
     if (provenanceError) {
       return fail("checkpoint_unverified", provenanceError, "needs_human");
     }
@@ -494,10 +1086,19 @@ export function validateCheckpointDecision(
   return { ok: true, decision: candidate };
 }
 
-/** Validate the current stage's decision, including the resumable missing-answer state. */
-export function validateCheckpointForAdvance(
+/**
+ * Select the newest valid decision for a stage.
+ *
+ * Typed decisions and their schema-1 mirrors are both present in migrated
+ * state. Validation runs newest-first by durable decision timestamp, while
+ * stale decisions (for example, a superseded capability epoch) are skipped.
+ * Two different valid decisions at the same timestamp are ambiguous and fail
+ * closed; equivalent typed/mirror pairs are harmless duplicates.
+ */
+export function selectLatestValidCheckpointDecision(
   stage: StageCheckpointRef,
   state: TeamState,
+  options: Pick<CheckpointValidationOptions, "bindCapability"> = {},
 ): CheckpointValidationResult {
   if (!stage.checkpoint) return { ok: true, decision: undefined as never };
   const policy = resolveCheckpointPolicy(stage, state);
@@ -512,19 +1113,65 @@ export function validateCheckpointForAdvance(
   if (candidates.length === 0) {
     const rule = policy.rules[stage.checkpoint];
     if (!rule) return fail("policy_invalid", `checkpoint policy has no rule for '${stage.checkpoint}'`, "needs_human");
-    const floor = isFloorRule(policy, rule);
+    const floor = isFloorRule(policy, rule, stage.checkpoint);
     return fail(
       "checkpoint_unresolved",
       `checkpoint '${stage.checkpoint}' for stage '${stage.id}' is unresolved: explicit human consent is required before advancing`,
       floor ? "needs_human" : "user_checkpoint",
     );
   }
-  for (const candidate of candidates) {
-    const result = validateCheckpointDecision(state, candidate, { stage, policy });
-    if (result.ok) return result;
-    return result;
+
+  const valid: Array<{ decision: TypedCheckpointDecision; index: number }> = [];
+  let latestFailure: CheckpointValidationFailure | undefined;
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const result = validateCheckpointDecision(state, candidates[index]!, {
+      stage,
+      policy,
+      bindCapability: options.bindCapability,
+    });
+    if (result.ok) valid.push({ decision: result.decision, index });
+    else if (!latestFailure) latestFailure = result;
   }
-  return fail("checkpoint_unresolved", `checkpoint '${stage.checkpoint}' for stage '${stage.id}' is unresolved`, "user_checkpoint");
+  if (valid.length === 0) {
+    return latestFailure ?? fail("checkpoint_unresolved", `checkpoint '${stage.checkpoint}' for stage '${stage.id}' is unresolved`, "user_checkpoint");
+  }
+
+  const timestamp = valid.reduce((latest, candidate) =>
+    candidate.decision.decided_at > latest ? candidate.decision.decided_at : latest, valid[0]!.decision.decided_at);
+  const newest = valid.filter((candidate) => candidate.decision.decided_at === timestamp);
+  const decisions = new Set(newest.map((candidate) => candidate.decision.decision));
+  if (decisions.size > 1) {
+    return fail(
+      "checkpoint_unverified",
+      `checkpoint '${stage.checkpoint}' for stage '${stage.id}' has conflicting valid decisions at '${timestamp}'`,
+      "needs_human",
+    );
+  }
+  newest.sort((left, right) => right.index - left.index);
+  return { ok: true, decision: newest[0]!.decision };
+}
+/**
+ * Resolve the only state transition effects a validated checkpoint decision
+ * may have. Callers must branch on this result rather than treating every
+ * approved decision as permission to continue.
+ */
+export type CheckpointDecisionEffect = "continue" | "stop" | "revise";
+
+export function checkpointDecisionEffect(
+  decision: Pick<TypedCheckpointDecision, "decision">,
+): CheckpointDecisionEffect {
+  if (decision.decision === "approve_continue" || decision.decision === "proceed") return "continue";
+  if (decision.decision === "approve_stop") return "stop";
+  return "revise";
+}
+
+
+/** Validate the current stage's decision, including the resumable missing-answer state. */
+export function validateCheckpointForAdvance(
+  stage: StageCheckpointRef,
+  state: TeamState,
+): CheckpointValidationResult {
+  return selectLatestValidCheckpointDecision(stage, state, { bindCapability: true });
 }
 
 function toLegacyDecision(decision: TypedCheckpointDecision): CheckpointDecision {
@@ -544,6 +1191,14 @@ function toLegacyDecision(decision: TypedCheckpointDecision): CheckpointDecision
     capability_id: decision.capability_id,
     capability_epoch: decision.capability_epoch,
     policy_hash: decision.policy_hash,
+    feature_id: decision.feature_id,
+    loop_iteration: decision.loop_iteration,
+    subject_binding: decision.subject_binding,
+    artifact_id: decision.artifact_id,
+    artifact_version: decision.artifact_version,
+    artifact_digest: decision.artifact_digest,
+    validation_ref: decision.validation_ref,
+    validation_digest: decision.validation_digest,
   };
 }
 
@@ -554,17 +1209,8 @@ export function findCheckpointDecision(
 ): CheckpointDecision | null {
   const stage: StageCheckpointRef = { id: stageId, checkpoint };
   const currentStage = state.dispatch_capability?.issued_for?.stage_cursor === stageId;
-  for (const decision of state.typed_checkpoint_decisions ?? []) {
-    if (decision.stage_id !== stageId || decision.checkpoint_id !== checkpoint) continue;
-    const result = validateCheckpointDecision(state, decision, { stage, bindCapability: currentStage });
-    if (result.ok) return toLegacyDecision(result.decision);
-  }
-  for (const decision of state.checkpoint_decisions ?? []) {
-    if (decision.stage_id !== stageId || decision.checkpoint !== checkpoint) continue;
-    const result = validateCheckpointDecision(state, decision, { stage, bindCapability: currentStage });
-    if (result.ok) return decision;
-  }
-  return null;
+  const selected = selectLatestValidCheckpointDecision(stage, state, { bindCapability: currentStage });
+  return selected.ok ? toLegacyDecision(selected.decision) : null;
 }
 
 export function hasCheckpointDecision(state: TeamState, stageId: string, checkpoint: string): boolean {
@@ -572,13 +1218,8 @@ export function hasCheckpointDecision(state: TeamState, stageId: string, checkpo
 }
 
 function consumeTrustedAnswer(state: TeamState, decision: TypedCheckpointDecision): TeamState {
-  const proof = decision.actor.proof;
-  if (!proof || !state.trusted_checkpoint_answers) return state;
-  const index = state.trusted_checkpoint_answers.findIndex((answer) => answer.answer_id === proof.answer_id);
-  if (index < 0 || state.trusted_checkpoint_answers[index]?.consumed_at) return state;
-  const answers = [...state.trusted_checkpoint_answers];
-  answers[index] = { ...answers[index]!, consumed_at: new Date().toISOString() };
-  return { ...state, trusted_checkpoint_answers: answers };
+  const answerId = decision.actor.proof?.answer_id;
+  return answerId ? markTrustedAnswerConsumed(state, answerId) : state;
 }
 
 /**
@@ -604,12 +1245,18 @@ export function appendCheckpointDecision(
   }
   const typed = result.decision;
   const existingTyped = state.typed_checkpoint_decisions ?? [];
-  const existingForCheckpoint = existingTyped.find(
-    (candidate) => candidate.stage_id === typed.stage_id && candidate.checkpoint_id === typed.checkpoint_id,
-  );
-  if (existingForCheckpoint) {
-    if (JSON.stringify(canonicalize(existingForCheckpoint)) !== JSON.stringify(canonicalize(typed))) {
-      throw new Error("migration_conflict: conflicting checkpoint decision already exists");
+  const sameCapability = (candidate: TypedCheckpointDecision): boolean =>
+    candidate.run_id === typed.run_id
+      && candidate.stage_id === typed.stage_id
+      && candidate.checkpoint_id === typed.checkpoint_id
+      && candidate.capability_id === typed.capability_id
+      && candidate.capability_epoch === typed.capability_epoch;
+  const subjectIdentity = checkpointSubjectIdentity(typed);
+  const sameSubject = existingTyped.filter((candidate) => sameCapability(candidate) && checkpointSubjectIdentity(candidate) === subjectIdentity);
+  const existingForSubject = sameSubject.at(-1);
+  if (existingForSubject) {
+    if (JSON.stringify(canonicalize(existingForSubject)) !== JSON.stringify(canonicalize(typed))) {
+      throw new Error("migration_conflict: conflicting checkpoint decision already exists for the current subject");
     }
     return consumeTrustedAnswer(state, typed);
   }

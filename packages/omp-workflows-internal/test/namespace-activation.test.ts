@@ -6,10 +6,10 @@ import { test } from "node:test";
 
 import {
 	isRegisteredWorkflow,
-	resetWorkflowOwners,
-	workflowOwnerFor,
 	type WorkflowCapability,
+	type WorkflowOwnerIdentity,
 } from "@andvl1/omp-workflows-core";
+import { openWorkflowActivation, releaseWorkflowOwners } from "@andvl1/omp-workflows-core/registry";
 
 import ompWorkflowsInternal, {
 	resolveGatedCommandCwd,
@@ -17,7 +17,6 @@ import ompWorkflowsInternal, {
 import {
 	OMP_INTERNAL_ACTIVATION_MARKER,
 	OMP_INTERNAL_BUNDLE_ID,
-	OMP_INTERNAL_OWNER_KIND,
 	privateOmpOwnerForMarkedWorkspace,
 } from "../src/identity.js";
 
@@ -102,58 +101,97 @@ function commandContext(cwd: string): unknown {
 	};
 }
 
-const ALL_CAPABILITIES: WorkflowCapability[] = ["workflow_registration", "workflow_tools", "config_writer"];
+const CAPABILITIES: readonly WorkflowCapability[] = ["workflow_registration", "workflow_tools", "config_writer"];
 
-function assertUnclaimed(cwd: string, capability: WorkflowCapability): void {
-	assert.equal(workflowOwnerFor(cwd, capability), undefined, `${capability} must be unclaimed`);
+const FOREIGN_IDENTITY: WorkflowOwnerIdentity = {
+	owner_id: "foreign-bundle",
+	bundle_id: "foreign-bundle",
+	owner_kind: "fullstack",
+	activation_marker: "omp-fullstack",
+	host_range: ">=17.3 <19",
+	activation: {
+		marker_id: "omp-fullstack",
+		required: [
+			{ path: "package.json", kind: "file" },
+			{ path: "packages/core", kind: "directory" },
+			{ path: "packages/fullstack", kind: "directory" },
+		],
+	},
+	provenance: { package: "foreign-bundle", entrypoint: "dist/index.js", cwd: "" },
+};
+
+function openForeignActivation(root: string, capabilities: readonly WorkflowCapability[]) {
+	return openWorkflowActivation(root, capabilities, {
+		...FOREIGN_IDENTITY,
+		provenance: { ...FOREIGN_IDENTITY.provenance, cwd: root, config_path: join(root, ".omp", "team.config.json") },
+	});
 }
 
 // ── Missing-marker contract ──────────────────────────────────────────────────
 
-test("descriptors publish eagerly outside a marked workspace, but session_start claims zero owners", () => {
-	resetWorkflowOwners();
+const NAMESPACED_COMMANDS = [
+	"omp-cto",
+	"omp-do-work",
+	"omp-spec-import",
+	"omp-spec-plan",
+	"omp-spec-tasks",
+	"omp-specify",
+	"omp-team",
+	"omp-workflow-team",
+];
+
+test("only the diagnostic command publishes before a marked session mounts the omp namespace", () => {
+	const root = markedRoot();
+	const host = makePi();
+	ompWorkflowsInternal(host.pi as never);
+
+	// registerWorkflowCommands is a lifecycle mount: before the session root is
+	// authenticated, only the private diagnostic command is discoverable.
+	assert.deepEqual([...host.commands.keys()], ["omp-workflow-team"]);
+
+	host.fireSessionStart({ cwd: root });
+	assert.deepEqual([...host.commands.keys()].sort(), NAMESPACED_COMMANDS);
+	assert.deepEqual(host.labels, [OMP_INTERNAL_BUNDLE_ID]);
+	assert.equal(host.errors.length, 0, "marked workspace mounts without gated refusals");
+});
+
+test("an unmarked session leaves only the diagnostic command and claims zero owners", () => {
 	const root = plainRoot();
 	const host = makePi();
 	ompWorkflowsInternal(host.pi as never);
 
-	// Eager publication happened at extension load, before any session event.
-	assert.deepEqual(
-		[...host.commands.keys()].sort(),
-		["omp-cto", "omp-do-work", "omp-team", "omp-workflow-team"],
-	);
-
 	host.fireSessionStart({ cwd: root });
 
-	for (const capability of ALL_CAPABILITIES) assertUnclaimed(root, capability);
+	assert.deepEqual([...host.commands.keys()], ["omp-workflow-team"]);
 	assert.deepEqual(host.labels, [], "no engine label outside the marked workspace");
 	assert.deepEqual(host.tools, [], "no tool registrations outside the marked workspace");
 	assert.equal(isRegisteredWorkflow("omp-feature") && false, false, "no bundle profile registered");
 	assert.equal(host.errors.length, 0, "gated resolution claims zero owners and never throws outside the marked workspace");
 });
 
-test("namespaced command handlers fail closed with workflow-cwd-unavailable outside a marked workspace", async () => {
-	const root = plainRoot();
+test("namespaced command handlers fail closed when invoked from an unmarked workspace", async () => {
+	const marked = markedRoot();
 	const host = makePi();
 	ompWorkflowsInternal(host.pi as never);
+	host.fireSessionStart({ cwd: marked });
 
-	for (const name of ["omp-do-work", "omp-team", "omp-cto"]) {
+	const plain = plainRoot();
+	for (const name of ["omp-do-work", "omp-team", "omp-cto", "omp-specify", "omp-spec-plan", "omp-spec-tasks", "omp-spec-import"]) {
 		const command = host.commands.get(name);
-		assert.ok(command, `${name} descriptor must exist`);
+		assert.ok(command, `${name} descriptor must exist after marked-session mount`);
 		await assert.rejects(
-			command.handler("some task", commandContext(root)),
+			command.handler("some task", commandContext(plain)),
 			/workflow cwd unavailable/,
 			`${name} must refuse outside the marked workspace`,
 		);
 	}
 
 	assert.deepEqual(host.sent, [], "no workflow prompt may leave the gate");
-	for (const capability of ALL_CAPABILITIES) assertUnclaimed(root, capability);
 });
 
 // ── Marked-workspace inventory/claim contract ────────────────────────────────
 
 test("in a marked workspace workflow_registration is claimed first, then all three under one owner", () => {
-	resetWorkflowOwners();
 	const root = markedRoot();
 	const host = makePi();
 	ompWorkflowsInternal(host.pi as never);
@@ -162,29 +200,37 @@ test("in a marked workspace workflow_registration is claimed first, then all thr
 	assert.ok(handlers.length >= 2, "core claim handler + engine activation handler expected");
 
 	// Step 1: core's namespaced-command session_start handler claims the
-	// registration capability first.
+	// registration capability first. A foreign activation must observe the
+	// conflict while the remaining capabilities are still available.
 	handlers[0]?.({}, { cwd: root });
-	const first = workflowOwnerFor(root, "workflow_registration");
-	assert.ok(first, "workflow_registration must be claimed by the command layer first");
-	assert.equal(first?.owner.owner_id, OMP_INTERNAL_BUNDLE_ID);
-	assertUnclaimed(root, "workflow_tools");
-	assertUnclaimed(root, "config_writer");
+	const registrationProbe = openForeignActivation(root, ["workflow_registration"]);
+	assert.equal(registrationProbe.ok, false);
+	if (!registrationProbe.ok) assert.equal(registrationProbe.code, "owner_conflict");
+	for (const capability of ["workflow_tools", "config_writer"] as const) {
+		const probe = openForeignActivation(root, [capability]);
+		assert.equal(probe.ok, true, `${capability} remains available before engine activation`);
+		if (probe.ok) releaseWorkflowOwners(probe.release_token, probe.leased_capabilities);
+	}
 
 	// Step 2: the engine activation handler idempotently claims all three.
 	for (const handler of handlers.slice(1)) handler({}, { cwd: root });
-	for (const capability of ALL_CAPABILITIES) {
-		const claim = workflowOwnerFor(root, capability);
-		assert.ok(claim, `${capability} must be claimed`);
-		assert.equal(claim?.owner.owner_id, OMP_INTERNAL_BUNDLE_ID, "single owner across capabilities");
-		assert.equal(claim?.owner.owner_kind, OMP_INTERNAL_OWNER_KIND);
+	for (const capability of CAPABILITIES) {
+		const probe = openForeignActivation(root, [capability]);
+		assert.equal(probe.ok, false, `${capability} must be claimed after engine activation`);
+		if (!probe.ok) assert.equal(probe.code, "owner_conflict");
 	}
 	assert.equal(isRegisteredWorkflow("omp-feature"), true);
 	assert.equal(isRegisteredWorkflow("omp-validate"), true);
 	assert.deepEqual(host.labels, [OMP_INTERNAL_BUNDLE_ID]);
+
+	const freshRoot = markedRoot();
+	const fresh = openWorkflowActivation(freshRoot, CAPABILITIES, privateOmpOwnerForMarkedWorkspace(freshRoot));
+	assert.equal(fresh.ok, true, "a fresh isolated marked root accepts activation");
+	if (fresh.ok) releaseWorkflowOwners(fresh.release_token, fresh.leased_capabilities);
 });
 
+
 test("repeated session_start in a marked workspace stays idempotent under the single owner", () => {
-	resetWorkflowOwners();
 	const root = markedRoot();
 	const host = makePi();
 	ompWorkflowsInternal(host.pi as never);
@@ -193,10 +239,6 @@ test("repeated session_start in a marked workspace stays idempotent under the si
 	host.fireSessionStart({ cwd: root });
 
 	assert.deepEqual(host.labels, [OMP_INTERNAL_BUNDLE_ID], "label set exactly once");
-	const fingerprints = new Set(
-		ALL_CAPABILITIES.map((capability) => workflowOwnerFor(root, capability)?.fingerprint ?? ""),
-	);
-	assert.equal(fingerprints.size, 1, "all three claims share one owner fingerprint");
 	assert.equal(host.errors.length, 0, "marked workspace produces no gated refusals");
 });
 
@@ -226,5 +268,4 @@ test("privateOmpOwnerForMarkedWorkspace issues the frozen identity only inside t
 	assert.equal(owner.activation_marker, OMP_INTERNAL_ACTIVATION_MARKER);
 
 	assert.throws(() => privateOmpOwnerForMarkedWorkspace(plain), /activation_markers_missing/);
-	assertUnclaimed(plain, "workflow_registration");
 });

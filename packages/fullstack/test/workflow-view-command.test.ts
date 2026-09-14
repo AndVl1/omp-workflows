@@ -44,6 +44,7 @@ import {
   listSessions,
   sessionPagePath,
 } from "@andvl1/omp-workflows-core";
+import { newCtoState, writeCtoState } from "../../core/src/cto/state.js";
 import type { VisualizationManifest, VisualizationSnapshot } from "@andvl1/omp-workflows-core";
 
 function makeProject(): { root: string; notifyCalls: string[] } {
@@ -136,8 +137,6 @@ function writeLegacyFixture(root: string, overrides: Record<string, unknown> = {
 }
 
 const CTO_STATE = {
-  schema: 2,
-  id: "run-1",
   task: "Decompose the payments migration",
   branch: "feat/payments",
   autonomous: false,
@@ -154,9 +153,30 @@ const CTO_STATE = {
   updated_at: "2026-08-10T11:00:00.000Z",
 };
 
-/** CTO run fixture (JSON state; dod declared but absent). */
+/** CTO run fixture written through the canonical schema-2 writer. */
 function writeCtoFixture(root: string, runId: string, updatedAt = CTO_STATE.updated_at): void {
-  writeJson(join(root, `.work-state/cto/${runId}/state.json`), { ...CTO_STATE, id: runId, updated_at: updatedAt });
+  const state = newCtoState({
+    id: runId,
+    task: CTO_STATE.task,
+    branch: CTO_STATE.branch,
+    autonomous: CTO_STATE.autonomous,
+    plan: {
+      id: runId,
+      task: CTO_STATE.task,
+      teams: CTO_STATE.plan.teams,
+      created_at: updatedAt,
+    },
+  });
+  state.teams = CTO_STATE.teams.map((team) => ({ ...team }));
+  state.integration = { ...CTO_STATE.integration };
+  state.pause = { ...CTO_STATE.pause };
+  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+  // The canonical writer owns updated_at and the active-run index. For
+  // deterministic ordering fixtures, retain the requested source timestamp
+  // while preserving every schema-2 field emitted by the writer.
+  if (state.updated_at !== updatedAt) {
+    writeJson(join(root, `.work-state/cto/${runId}/state.json`), { ...state, updated_at: updatedAt });
+  }
 }
 
 /** Bug-fix fixture: compact depth policy — bodies hidden unless --full. */
@@ -280,6 +300,30 @@ test("command: selects latest, latest-within-kind, exact id, and all", () => {
   assert.equal(allDoWork.scope, "all");
   assert.equal(allDoWork.entries.length, 3);
   rmSync(root, { recursive: true, force: true });
+});
+
+test("command: legacy id is reserved and never aliases a feature slug", () => {
+  const rootAbsent = makeProject().root;
+  writeFeatureFixture(rootAbsent, "legacy");
+  writeFeatureFixture(rootAbsent, "normal");
+  const withoutRoot = selectWorkflowSessions(listSessions(rootAbsent), { id: "legacy" });
+  assert.equal(withoutRoot.entries.length, 0);
+  assert.ok(withoutRoot.error?.includes("session not found: legacy"));
+  const normal = selectWorkflowSessions(listSessions(rootAbsent), { id: "normal" });
+  assert.deepEqual(normal.entries.map((entry) => entry.id), ["normal"]);
+  rmSync(rootAbsent, { recursive: true, force: true });
+
+  const rootPresent = makeProject().root;
+  writeLegacyFixture(rootPresent);
+  writeFeatureFixture(rootPresent, "legacy");
+  const withCollision = selectWorkflowSessions(listSessions(rootPresent), { id: "legacy" });
+  assert.deepEqual(withCollision.entries.map((entry) => [entry.id, entry.isLegacy]), [["legacy", true]]);
+  const rootScoped = selectWorkflowSessions(listSessions(rootPresent), { kind: "do-work", id: "legacy" });
+  assert.deepEqual(rootScoped.entries.map((entry) => [entry.id, entry.isLegacy]), [["legacy", true]]);
+  const featureScoped = selectWorkflowSessions(listSessions(rootPresent), { kind: "cto", id: "legacy" });
+  assert.equal(featureScoped.entries.length, 0);
+  assert.ok(featureScoped.error?.includes("session not found: legacy (kind cto)"));
+  rmSync(rootPresent, { recursive: true, force: true });
 });
 
 test("command: unknown id lists discoverable sessions; empty workspace errors", () => {

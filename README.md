@@ -39,12 +39,18 @@ npm install @andvl1/omp-workflows-fullstack
 
 The fullstack extension registers `/do-work`, `/team`, and `/cto` directly while OMP loads the plugin. Registered extension commands are available to slash autocomplete and execute before project-local custom-TS files, so a stale `.omp/commands/` copy or an unresolved peer dependency cannot hide or replace the current plugin implementation.
 
-Project-local `.omp/commands/` copies remain a compatibility path for runtimes that only discover custom-TS commands from disk:
+Project-local `.omp/commands/` copies remain an explicit compatibility path for runtimes that only discover custom-TS commands from disk:
 
-- **`npm install`** — `postinstall` runs `scripts/copy-commands.mjs` and force-copies the shipped files.
-- **`omp plugin install`** — npm's `postinstall` does not fire because the package lives in `~/.omp/plugins/`. The extension's `session_start` hook runs a SHA-256-aware sync into `<project>/.omp/commands/`; files unchanged since the previous shipped hash are updated, while user-edited files are preserved.
+- **`npm install`** — installs package files only; it does not copy commands or create activation markers. Run the explicit copy/bootstrap command below when disk discovery is required.
+- **`omp plugin install`** — the package lives in `~/.omp/plugins/`; run the same explicit copy command below from the project when disk-discovery compatibility is required.
 
-The sync writes `.omp/commands/.omp-shipped.json` (schema 2) with per-file hashes. The authoritative registered commands are loaded on the next OMP session after a plugin update; the compatibility copies are refreshed at session start.
+### Fullstack activation marker — explicit project-local opt-in
+
+Before loading the extension, run `npx omp-workflows-copy-commands` (or `npm run --prefix node_modules/@andvl1/omp-workflows-fullstack copy-commands`). The explicit installer writes the exact marker at `.omp/fullstack.activation.json` only after a successful copy. It is project-local and does not install anything globally; ordinary extension loading and `session_start` never create or repair it. Existing differing, malformed, symlinked, or wrong-kind marker entries are preserved and fail closed.
+
+The marker is a cooperative routing/ownership signal, not a cryptographic signature or proof of package authenticity. OMP still resolves and loads the configured extension package; the marker only records explicit project consent for this bundle.
+
+The sync writes `.omp/commands/.omp-shipped.json` (schema 2) with per-file hashes. The authoritative registered commands are loaded on the next OMP session after a plugin update; compatibility copies are refreshed only by the explicit installer or other explicitly invoked legacy sync.
 
 > **Использование одновременно с Claude Code-плагинами.** Этот пакет и слаг `claude-plugin` (legacy Claude Code-плагин) ставят пересекающийся набор агентов и скиллов. Если вы ставили `claude-plugin` через `claude plugin install`, в omp он подгружается через discovery-provider `claude-plugins` (то же, что `ast-index@ast-index-marketplace`, `figma@claude-plugins-official`, и т. д.). Чтобы не дублировать агентов — отключите provider в `~/.omp/agent/config.yml` одним из способов ниже.
 
@@ -203,7 +209,7 @@ Consumer choices:
 - Change agents without changing commands through `.omp/team.config.json`
   (`roles`, `scope_map`, `flags`, `roster_overrides`).
 - Add a non-conflicting surface with
-  `registerWorkflowCommands(pi, { commandPrefix: "rust", ... })`, producing
+  `registerWorkflowCommands(pi, { commandPrefix: "rust", resolveCwd: resolveSessionCwd, owner: ownerForCwd })`, producing
   `/rust-do-work`, `/rust-team`, and `/rust-cto`.
 - Fully replace the default bundle by loading only the custom extension and
   wiring all three core seams: `registerTeamWorkflow`,
@@ -401,10 +407,12 @@ provider probe, run the agent and read its `Degraded Notices` block.
 
 
 For a custom bundle, do not treat `registerTeamWorkflow` as the complete
-extension entry point: it wires gates/config/observability, but not the
-`workflow_*` tools or slash commands. Compose all three seams under one owner
-identity as shown in
-[`docs/adding-agents.md`](docs/adding-agents.md#4-регистрация-workflow).
+extension entry point: it wires gates/config/observability only when passed the
+marker-bound `owner`, session-aware `resolveCwd`, and authenticated
+`registrationToken`. Compose all three seams under that same owner identity:
+`registerTeamWorkflow`, `createWorkflowToolAdapter(...).register(pi)`, and
+`registerWorkflowCommands`. The explicit project-local marker bootstrap and
+transaction lifecycle are shown in [`docs/adding-agents.md`](docs/adding-agents.md#4-регистрация-workflow).
 
 ## Observability (v0.7.0+)
 
@@ -440,37 +448,25 @@ This is the source of truth for:
 - **Tool-level failure rates** — useful for catching a subagent that emits
   broken code (compile errors surface as `tool_result.isError`).
 
-Disable per-bundle via `registerTeamWorkflow(pi, { observability: false })`.
+Disable per-bundle via `registerTeamWorkflow(pi, { observability: false, resolveCwd: resolveSessionCwd, owner: ownerForCwd, registrationToken: transaction.token })`; `ownerForCwd` must carry the project-local physical activation marker and `transaction.token` must come from the authenticated registry transaction described in [`docs/adding-agents.md`](docs/adding-agents.md#4-регистрация-workflow).
 Pre-observability features yield an absent `TeamState.observability` field
 (no migration needed).
 
-## Subagent validation contract (v0.8.0+)
+## Independent QA contract (v0.8.0+)
 
-Stages that produce a code-bearing artifact (`implementation`,
-`review_fixes`) go through a machine-checked validation gate after the
-subagent returns. The handoff is blocked unless the artifact contains:
+Implementation and review-fix reports are worker attestations only. They may
+describe changed files and checks observed by the worker, but neither report is
+workflow proof. Every coding profile reaches the independent `qa_tests` stage
+before `summary`.
 
-- `ready: "true"`
-- `validation_run: "true"` (the string, not the boolean)
-- `validation_evidence`: the verbatim stdout/stderr of the project's
-  build + test commands — not a summary, not "ok", the actual output.
+The canonical `.work-state/artifacts/qa_tests.json` artifact is the sole input
+to the `qa_reported_pass` gate. It must report `build_status: "pass"`; missing,
+malformed, `fail`, and `n/a` reports block completion. The QA worker chooses
+project-specific commands from the repository; project-neutral profiles do not
+guess package-manager or build commands.
 
-A subagent that returns `ready: true` without these is **rejected** with
-a precise reason. The stage is marked `failed` and the orchestrator must
-re-spawn the developer with the gate's reason as the new task. The
-orchestrator is forbidden from patching the artifact by hand, from
-editing source code, or from re-running the subagent's build to "double
-check".
-
-Why: in production we observed subagents returning
-`ready: true, validation_run: "false", validation_note: "Per assignment,
-orchestrator owns validation"`. The "per assignment" was an LLM
-hallucination — the assignment said no such thing. There is no
-escape hatch in the engine. The gate is the source of truth.
-
-Profiles that re-use the `implementation` or `review_fixes` produce keys
-for non-code stages must either rename the produces key or include the
-validation fields; otherwise the stage will be marked `failed`.
+These rules preserve the dispatch/completion/artifact integrity bindings while
+ensuring implementation text cannot promote a self-attestation into proof.
 
 ## Orchestrator discipline
 
@@ -480,14 +476,12 @@ The orchestrator (the main agent driving the workflow) is a
 - It does not edit source code. If a subagent's output is wrong, the
   orchestrator re-spawns the same agent with a sharper task. It does
   not patch the subagent's artifact.
-- It does not second-guess build/test output by re-running it. The
-  subagent owns the validation evidence; the orchestrator either trusts
-  it or re-spawns.
+- It does not treat implementation, review-fix, or manual-QA reports as proof.
+  Only the canonical `qa_tests` artifact can satisfy `qa_reported_pass`.
 - It does not skip stages to "save time". The profile order is the
-  contract.
-- On a validation-gate failure, the orchestrator's only job is to call
-  the same agent again with the gate's reason (the stage outcome's
-  `note` field) as the new task, copied verbatim.
+  contract, including independent QA before summary.
+- A non-pass QA report blocks the workflow; the orchestrator must not rewrite
+  the QA artifact or promote a worker attestation.
 
 These rules are documented in the `/do-work` command prompt and injected
 into the stage prompt for every executor via `buildStagePrompt`.

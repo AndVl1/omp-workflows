@@ -35,3 +35,26 @@ function containsCtoAgent(input: unknown): boolean {
     return typeof agent === "string" && CTO_AGENT_NAMES[agent.trim().toLowerCase()] === true;
   });
 }
+
+// ── Preparation scheduling reuse (T103) ─────────────────────────────────────
+
+/**
+ * True when a preparation scheduling attempt names a run other than the
+ * resident CTO run. Pure identity check — scheduling callers queue such
+ * attempts (`nested_cto`) instead of executing them.
+ */
+export function isNonResidentCtoRun(ctoRunId: string, residentCtoRunId: string): boolean {
+  return ctoRunId !== residentCtoRunId;
+}
+
+/**
+ * Deterministic queue reason for a non-resident/nested scheduling attempt.
+ * Built on the canonical nesting-guard message so the run has exactly one
+ * nesting policy text.
+ */
+export function nonResidentCtoRunReason(attemptedRunId: string, residentRunId: string): string {
+  return (
+    `run '${attemptedRunId}' is not the resident CTO run '${residentRunId}': nested or non-resident ` +
+    `CTO attempts are queued, never executed. ${NESTED_CTO_BLOCK_REASON}`
+  );
+}

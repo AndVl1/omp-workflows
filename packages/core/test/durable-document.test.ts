@@ -16,13 +16,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
+import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { createCapability, advanceCursor, type IssuedCapability } from "../src/engine/durable.js";
-import { writeState } from "../src/engine/state.js";
+import { setStateTransactionTestHooks, writeState } from "../src/engine/state.js";
 import { validateProductPrdDocument } from "../src/engine/product-prd.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 
@@ -87,9 +88,8 @@ function setupDocumentStage(preArtifacts: Record<string, unknown>): {
 } {
   const profile = loadProfile("product-discovery") as Profile;
   assert.ok(profile, "shipped product-discovery profile is available");
-  registerWorkflowProfiles([profile]);
-  const branch = "feat/product-discovery-workflow";
   const root = mkdtempSync(join(tmpdir(), "prd-durable-"));
+  const branch = "feat/product-discovery-workflow";
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
   const persistedHash = profileHash(profile);
   const currentStageId = "product_prd_document";
@@ -167,6 +167,79 @@ test("durable document advance: the engine renders doc + product_prd before the 
   }
 });
 
+
+test("durable document render rejects a project-root replacement before writing the replacement", () => {
+  const { issued, root } = setupDocumentStage(fiveSources());
+  const outside = mkdtempSync(join(tmpdir(), "prd-durable-root-swap-outside-"));
+  const moved = root + ".opened";
+  const originalOpen = PinnedProjectRoot.open;
+  let swapped = false;
+  try {
+    PinnedProjectRoot.open = (projectRoot, hooks = {}) => originalOpen(projectRoot, {
+      ...hooks,
+      beforeTempOpen: (relativePath) => {
+        hooks.beforeTempOpen?.(relativePath);
+        if (swapped || !relativePath.endsWith("documents/product-prd.md")) return;
+        swapped = true;
+        renameSync(root, moved);
+        symlinkSync(outside, root, "dir");
+      },
+    });
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "root swap render attempt" });
+    assert.equal(advanced.ok, false, "a project-root replacement must block durable document advance");
+    assert.equal(swapped, true, "the renderer write seam must execute");
+    assert.deepEqual(readdirSync(outside), [], "the replacement root must remain untouched");
+    assert.equal(existsSync(join(outside, "documents")), false, "no renderer output may escape to the replacement root");
+    assert.equal(existsSync(join(outside, ".work-state")), false, "state must not be committed to the replacement root");
+  } finally {
+    PinnedProjectRoot.open = originalOpen;
+    if (swapped) {
+      rmSync(root, { recursive: true, force: true });
+      renameSync(moved, root);
+    }
+    rmSync(root, { recursive: true, force: true });
+    rmSync(moved, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("durable document render rolls back exact outputs when the enclosing state CAS loses", () => {
+  const { issued, root, featureDir } = setupDocumentStage(fiveSources());
+  const documentPath = join(featureDir, "documents", "product-prd.md");
+  const htmlPath = join(featureDir, "documents", "product-prd.html");
+  const manifestPath = join(featureDir, "artifacts", "product_prd.json");
+  const statePath = join(featureDir, "state.json");
+  const oldDocument = "preexisting markdown\n";
+  const oldHtml = "preexisting html\n";
+  const oldManifest = "preexisting manifest\n";
+  let injected = false;
+  try {
+    mkdirSync(join(featureDir, "documents"), { recursive: true });
+    writeFileSync(documentPath, oldDocument, "utf8");
+    writeFileSync(htmlPath, oldHtml, "utf8");
+    writeFileSync(manifestPath, oldManifest, "utf8");
+    setStateTransactionTestHooks({
+      beforeCas: () => {
+        if (injected) return;
+        injected = true;
+        const current = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+        current.task = "concurrent state winner";
+        current.state_revision = Number(current.state_revision ?? 0) + 1;
+        writeFileSync(statePath, `${JSON.stringify(current, null, 2)}\n`, "utf8");
+      },
+    }, root);
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "render before CAS drift" });
+    assert.equal(advanced.ok, false, advanced.ok ? "state CAS drift must reject the document advance" : advanced.error);
+    assert.equal(injected, true, "the deterministic state CAS seam must run");
+    assert.equal(readFileSync(documentPath, "utf8"), oldDocument, "CAS abort restores the exact Markdown preimage");
+    assert.equal(readFileSync(htmlPath, "utf8"), oldHtml, "CAS abort restores the exact HTML preimage");
+    assert.equal(readFileSync(manifestPath, "utf8"), oldManifest, "CAS abort restores the exact manifest preimage");
+  } finally {
+    setStateTransactionTestHooks(null, root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("durable document advance: a missing source fails closed — nothing rendered, nothing transitioned", () => {
   const sources = fiveSources();
   delete sources.product_evidence;
@@ -181,6 +254,23 @@ test("durable document advance: a missing source fails closed — nothing render
     assert.equal(state.stage_cursor, "product_prd_document", "cursor did not move");
     assert.ok(!existsSync(join(artifactsDir, "product_prd.json")), "no artifact was written");
     assert.ok(!existsSync(join(featureDir, "documents")), "no document was rendered");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("durable document advance validates malformed present sources before any render side effect", () => {
+  const sources = fiveSources();
+  sources.product_evidence = { malformed: true };
+  const { issued, root, featureDir, artifactsDir } = setupDocumentStage(sources);
+  try {
+    const before = readState(root);
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "attempted malformed document render" });
+    assert.equal(advanced.ok, false, "a malformed present source must block the advance");
+    if (!advanced.ok) assert.match(advanced.error, /product_evidence|contract|invalid/i);
+    assert.equal(readState(root).stage_cursor, before.stage_cursor, "cursor remains at the document stage");
+    assert.equal(readState(root).stages.find((stage) => stage.id === "product_prd_document")?.status, "in_progress");
+    assert.equal(existsSync(join(artifactsDir, "product_prd.json")), false, "malformed source must not write the typed artifact");
+    assert.equal(existsSync(join(featureDir, "documents")), false, "malformed source must not render documents");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

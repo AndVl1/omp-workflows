@@ -1,0 +1,28 @@
+id: 2026-09-01T09-05-00-developer
+parent: null
+agent: developer
+timestamp: "2026-09-01T09:05:00Z"
+status: completed
+context:
+  task: "T109: add readable specification workflow documentation to core and fullstack READMEs"
+  phase: "validation-release"
+output:
+  summary: "Added concise public documentation for direct specification phases, constitution gates, native workspaces, external intake seams, adaptive do-work execution, language/template precedence, migration, CTO preparation/execution, errors, and ownership invariants."
+  files_changed:
+    - path: packages/core/README.md
+      action: modified
+      changes: "Added the readable specification workflow guide while preserving existing install, API, profile, build, and license sections."
+    - path: packages/fullstack/README.md
+      action: modified
+      changes: "Added fullstack wiring, registration seams, generic recognizer fallback, no-external-CLI boundary, phase/CTO authority, and recovery documentation while preserving existing sections."
+  types_implemented: []
+  dependencies_added: []
+  todos: []
+next:
+  agent: null
+  task: "No follow-up required."
+  priority: low
+  acceptance_criteria:
+    - "Commands and examples use the current direct phase and /do-work syntax."
+    - "Approval is explicitly distinct from implementation execution authority."
+    - "Fullstack registration/provider/recognizer behavior and generic fallback are documented without claiming external CLI execution."

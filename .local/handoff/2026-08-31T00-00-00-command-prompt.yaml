@@ -1,0 +1,23 @@
+id: 2026-08-31T00-00-00-command-prompt
+parent: null
+agent: developer
+timestamp: "2026-08-31T00:00:00Z"
+status: completed
+context:
+  task: "Fix native specification command bootstrap and plan-to-tasks prompt failures from artifact 226"
+output:
+  summary: "Removed the phase-only approval decision from constitution bootstrap output and made phase prompts render the exact explicit current command selector while retaining feature/run bindings."
+  files_changed:
+    - path: packages/core/src/commands/specification.ts
+      action: modified
+      changes: "Bootstrap now exposes only approve_continue/request_changes; phase prompt now emits Next command: /<phase-command> --feature <feature-id>."
+  types_implemented: []
+  dependencies_added: []
+  todos: []
+next:
+  agent: null
+  task: ""
+  priority: low
+  acceptance_criteria:
+    - "Constitution bootstrap output does not contain approve_stop."
+    - "Plan-approved tasks entry renders /spec-tasks --feature <id> and preserves run_key."

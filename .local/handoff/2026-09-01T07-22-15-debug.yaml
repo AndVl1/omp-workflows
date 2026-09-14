@@ -1,0 +1,35 @@
+id: 2026-09-01T07-22-15-debug
+parent: null
+agent: debug
+timestamp: "2026-09-01T07:22:15Z"
+status: completed
+context:
+  task: "Fix specification command and migration focused test fixtures after readable marker cleanup"
+  phase: validation-release
+output:
+  summary: "Repaired focused fixtures to use shipped profile/presentation bindings and corrected canonical migration projection path."
+  error_type: runtime
+  root_cause:
+    file: packages/core/test/specification-command.test.ts
+    line: 1
+    issue: "Synthetic seeded phase records retained the default workspace presentation and arbitrary profile digest; command presentation reconciliation consequently staled approval/checkpoint records before assertions."
+    explanation: "Seeds now load spec-preparation and profileHash(profile), then bind request_language en-US and the resolved shipped specification template-set selection before deriving next_action."
+  reproduction:
+    steps:
+      - "Seed an approved or awaiting-approval phase with the old fixture helper."
+      - "Invoke a direct specification command with a usable constitution."
+      - "Observe presentation reconciliation staling synthetic records, hiding expected checkpoint/route output."
+    minimal_case: "Old seeds used sha256(\"spec-preparation\") and workspace default language/template hashes instead of current shipped bindings."
+  solution:
+    before: "Command seeds persisted arbitrary profile hash and default presentation selections. Migration assertion opened specs/<feature>/specify.md."
+    after: "Seeds use shipped profileHash and resolved shipped language/template selections; migration assertion opens specs/<feature>/spec.md, plan.md, tasks.md, and migration.md."
+  regression_test: "packages/core/test/specification-command.test.ts (16 tests) and packages/core/test/specification-migration.test.ts (6 tests); parent will run focused/project validation."
+  related_issues:
+    - "Do not reintroduce omp-cto-slice markers or relax checkpoint/identity assertions."
+next:
+  agent: null
+  task: "Parent validates focused behavior and project-wide checks."
+  priority: high
+  acceptance_criteria:
+    - "Required feature/run identity, exact next commands, three phase decisions, and import compatibility checkpoint remain asserted."
+    - "Migration tests use canonical materialized specs/<feature>/spec.md path and preserve source provenance/marker absence."

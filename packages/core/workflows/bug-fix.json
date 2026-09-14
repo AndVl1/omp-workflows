@@ -4,7 +4,7 @@
   "description": "BUG_FIX with an obvious fix. Diagnostics → fix → review. For bugs needing iterative verification, the interpreter promotes to the debug-cycle profile (autonomous mode always uses debug-cycle).",
   "completion_intent": {
     "mode": "complete_outcome",
-    "acceptance": "dod_and_artifacts",
+    "acceptance": "quality_gates_and_artifacts",
     "source": "workflow_policy",
     "rationale": "Bug-fix workflows complete a verified fix with durable diagnosis, review, and DoD artifacts."
   },
@@ -68,10 +68,19 @@
       "produces": "manual_qa"
     },
     {
+      "id": "qa_tests",
+      "title": "Automated Tests",
+      "type": "single",
+      "role": "qa",
+      "consumes": ["manual_qa", "implementation", "diagnosis", "review"],
+      "gate": "qa_reported_pass",
+      "produces": "qa_tests"
+    },
+    {
       "id": "summary",
       "title": "Summary",
       "type": "orchestrator",
-      "consumes": ["implementation", "diagnosis", "review", "manual_qa", "dod"],
+      "consumes": ["implementation", "diagnosis", "review", "manual_qa", "qa_tests", "dod"],
       "gate": "dod_complete",
       "produces": "summary"
     }

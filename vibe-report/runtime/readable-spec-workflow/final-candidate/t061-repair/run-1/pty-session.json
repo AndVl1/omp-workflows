@@ -1,0 +1,115 @@
+{
+  "schema_version": 2,
+  "session_id": "8OTWY-1TsouQ2J_ukQKOIq0YX34RAZtqQjOwDBQmYJM",
+  "control_nonce": "qyfrb6cKoRZ32gXUsX-bITFHGUH3GhvgN4axua_L2Kw",
+  "server_pid": 32282,
+  "server_start_identity": "0LLRgtC-0YDQvdC40LosICA4INGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMDI6Mzk6MjA",
+  "server_start_nonce": "YTFLIP35Z6vjLmSkFg4BfcI74TRQcGUo71-ICkjtV7U",
+  "slug": "omp-spec-e2e-complete",
+  "url": "http://127.0.0.1:60101/?token=L3c3r6AJLPhT0FA851zZ8COHsYcrNQb3zt5xoJthnWE",
+  "browser_url": "http://127.0.0.1:60101/?code=pq7Sqp6pafWl_n3mE4ORDMyL6GcH8b_PvGf6QvgDRZM",
+  "browser_bootstrap_consumed": false,
+  "browser_code_expires_at": "2026-09-07T23:40:21.861Z",
+  "token": "L3c3r6AJLPhT0FA851zZ8COHsYcrNQb3zt5xoJthnWE",
+  "wsPath": "/ws",
+  "omp_version": "omp/18.1.11",
+  "pid": 32381,
+  "pty_start_identity": "0LLRgtC-0YDQvdC40LosICA4INGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMDI6Mzk6MjI",
+  "spawn_error": null,
+  "started_at": "2026-09-07T23:39:21.864Z",
+  "status": "stopped",
+  "shutdown_error": null,
+  "pty_exit_observed": true,
+  "shutdown_completed_at": "2026-09-07T23:43:20.221Z",
+  "stopped_at": "2026-09-07T23:43:20.221Z",
+  "finished_at": "2026-09-07T23:43:20.221Z",
+  "profile": null,
+  "tty": {
+    "cols": 100,
+    "rows": 30,
+    "term": "xterm-256color"
+  },
+  "task_prompt": "Exercise the read-only external specification import contract.",
+  "scenario": {
+    "id": "spec-import",
+    "title": "Read-only external specification import"
+  },
+  "surface": "text",
+  "host_config": {
+    "path": "/Users/a.vladislavov/.omp/agent/config.yml",
+    "warning": null
+  },
+  "omp_log_binding": null,
+  "user_config": {
+    "path": null,
+    "default_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-OyYKFN/omp-spec-e2e-complete/.omp/ux-e2e-overlay.user.json"
+  },
+  "runtime_plugins": {
+    "schema_version": 1,
+    "extension_package": {
+      "name": "@andvl1/omp-workflows-fullstack",
+      "version": "0.27.0",
+      "package_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-OyYKFN/omp-spec-e2e-complete/node_modules/@andvl1/omp-workflows-fullstack",
+      "realpath": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/fullstack",
+      "entrypoint": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/fullstack/dist/index.js"
+    },
+    "core_package": {
+      "name": "@andvl1/omp-workflows-core",
+      "version": "0.27.0",
+      "package_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-OyYKFN/omp-spec-e2e-complete/node_modules/@andvl1/omp-workflows-core",
+      "realpath": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/core",
+      "entrypoint": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/core/dist/index.js"
+    },
+    "configured_extensions": [
+      "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-OyYKFN/omp-spec-e2e-complete/node_modules/@andvl1/omp-workflows-fullstack"
+    ],
+    "tool_names": [
+      "constitution_checkpoint_ask_selected",
+      "constitution_impact_apply",
+      "constitution_impact_ask_selected",
+      "constitution_impact_assess",
+      "cto_checkpoint_ask_selected",
+      "cto_close_specification_execution_wave",
+      "cto_confirm",
+      "cto_dispatch",
+      "cto_mapping_resume",
+      "cto_preflight",
+      "cto_prepare",
+      "cto_specification_advance",
+      "cto_specification_conformance",
+      "cto_specification_decide",
+      "cto_specification_prepare",
+      "cto_specification_review",
+      "decide_constitution_checkpoint",
+      "do_work_claim",
+      "ensure_project_constitution",
+      "lecture_acquire",
+      "present_constitution_draft",
+      "workflow_advance",
+      "workflow_begin",
+      "workflow_begin_phase_validation",
+      "workflow_checkpoint",
+      "workflow_checkpoint_ask_selected",
+      "workflow_complete",
+      "workflow_complete_specification_execution",
+      "workflow_dispatch_specification_phase",
+      "workflow_finalize_import_handoff",
+      "workflow_instructions",
+      "workflow_persist_specification_phase",
+      "workflow_prepare",
+      "workflow_specification_conformance",
+      "workflow_status",
+      "workflow_validate_phase"
+    ],
+    "duplicate_tool_names": []
+  },
+  "omp_log_snapshot": {
+    "relative_path": "omp-log.e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.log",
+    "size": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_dev": 16777234,
+    "source_ino": 101210951,
+    "generation": "YTFLIP35Z6vjLmSkFg4BfcI74TRQcGUo71-ICkjtV7U",
+    "process_start": "0LLRgtC-0YDQvdC40LosICA4INGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMDI6Mzk6MjI"
+  }
+}

@@ -1,0 +1,40 @@
+id: 2026-09-01T07-23-59-testing
+parent: null
+agent: testing
+timestamp: "2026-09-01T07:23:59Z"
+status: completed
+
+context:
+  task: "Fix focused contract-drift tests for current readable specification workflow"
+  phase: "validation-release"
+
+output:
+  summary: "Updated only the three assigned test files to current shipped profile and fail-closed contracts."
+  tests_added:
+    unit: 0
+    integration: 0
+    property: 0
+  coverage:
+    before: "not measured"
+    after: "not measured"
+    target: "existing focused contracts preserved"
+  test_results:
+    total: 0
+    passed: 0
+    failed: 0
+    skipped: 0
+  test_files:
+    - path: packages/core/test/fan-in.test.ts
+      tests: ["spec-preparation current specify fixture", "delayed specify artifact binding"]
+    - path: packages/core/test/durable-repeated-role.test.ts
+      tests: ["specification control tools bind explicit selectors despite a stale active pointer"]
+    - path: packages/core/test/cto-resident.test.ts
+      tests: ["CTO state rejects a symlinked run directory without writing outside"]
+  gaps:
+    - "Project-wide validation is owned by the parent agent."
+
+next:
+  agent: null
+  task: ""
+  priority: low
+  acceptance_criteria: []

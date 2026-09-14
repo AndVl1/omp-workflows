@@ -1,0 +1,125 @@
+{
+  "schema": 1,
+  "run_key": "import-41fd175a-4294-449d-af09-cd89920342a6",
+  "specification": {
+    "schema_version": 3,
+    "feature_id": "imported-payment-retry-incomplete",
+    "display_name": "imported/payment-retry-incomplete",
+    "source_kind": "external",
+    "project_root": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw/omp-spec-e2e-incomplete",
+    "project_root_identity": {
+      "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw/omp-spec-e2e-incomplete",
+      "dev": 16777234,
+      "ino": 95184373
+    },
+    "path_binding": {
+      "specs": {
+        "relative_path": "specs/imported-payment-retry-incomplete",
+        "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw/omp-spec-e2e-incomplete/specs/imported-payment-retry-incomplete",
+        "dev": 16777234,
+        "ino": 95184744
+      },
+      "feature_state": {
+        "relative_path": ".work-state/features/imported-payment-retry-incomplete",
+        "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw/omp-spec-e2e-incomplete/.work-state/features/imported-payment-retry-incomplete",
+        "dev": 16777234,
+        "ino": 95184745
+      },
+      "artifacts": {
+        "relative_path": ".work-state/features/imported-payment-retry-incomplete/artifacts",
+        "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw/omp-spec-e2e-incomplete/.work-state/features/imported-payment-retry-incomplete/artifacts",
+        "dev": 16777234,
+        "ino": 95184746
+      },
+      "execution_claim": {
+        "relative_path": ".work-state/features/imported-payment-retry-incomplete/artifacts/execution_claim",
+        "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw/omp-spec-e2e-incomplete/.work-state/features/imported-payment-retry-incomplete/artifacts/execution_claim",
+        "dev": 16777234,
+        "ino": 95184747
+      },
+      "execution_claim_next": {
+        "relative_path": ".work-state/features/imported-payment-retry-incomplete/artifacts/execution_claim/next",
+        "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw/omp-spec-e2e-incomplete/.work-state/features/imported-payment-retry-incomplete/artifacts/execution_claim/next",
+        "dev": 16777234,
+        "ino": 95184748
+      }
+    },
+    "workspace_path": "specs/imported-payment-retry-incomplete",
+    "state_path": ".work-state/features/imported-payment-retry-incomplete/state.json",
+    "profile_name": "spec-import",
+    "profile_hash": "ca87a46494ca8a93743f7bf3904352a98a8a277421d55af12600c7bfbacba8ad",
+    "constitution_gate_ref": "constitution-gate-ea39e6e4",
+    "constitution_binding": {
+      "provider_id": "native",
+      "path": "CONSTITUTION.md",
+      "version": "0.0.0",
+      "content_sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      "semantic_hash": "35ce12b619924ee68ab11046b5ac497392f2615526e791d52482d5c5257714af",
+      "validation_ref": "constitution.validation.8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      "bound_at": "2026-09-03T07:01:17.787Z"
+    },
+    "language": {
+      "language": "en-US",
+      "source": "project_default",
+      "selection_hash": "587f63b2864bc26fbb1f627c015449cc5b395f78d35e7384876c51cd32f675bd"
+    },
+    "template_set": {
+      "template_set_id": "specification-default",
+      "source": "shipped_default",
+      "content_hash": "5b01f9d8c07f93b2a94f0a4d79fb0d314633a5b5d5cc81ce036f7143a48e0868",
+      "required_markers": []
+    },
+    "phases": [
+      {
+        "phase": "specify",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "plan",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "tasks",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      }
+    ],
+    "status": "blocked",
+    "next_action": {
+      "kind": "remediation",
+      "command": null,
+      "reason": "Compatibility validation requires a minimal local supplement; record it separately and rerun /spec-import with --supplement."
+    },
+    "handoff_ref": null,
+    "execution_claim_prepare_ref": null,
+    "execution_claim_ref": null,
+    "implementation_conformance_ref": null,
+    "import_ref": "import.4d52c7caa73d20c870c5590e1be4f647fc1bf8e1e35b229f848e8ee3af023110",
+    "migration_receipt_ref": null
+  },
+  "state_revision": 5,
+  "pause": {
+    "kind": "needs_human",
+    "reason": "Compatibility validation requires a minimal local supplement; record it separately and rerun /spec-import with --supplement."
+  }
+}

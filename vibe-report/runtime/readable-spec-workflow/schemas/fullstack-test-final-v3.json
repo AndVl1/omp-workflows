@@ -1,0 +1,11 @@
+{
+  "command": "npm run test:fullstack",
+  "cwd": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration",
+  "started_at_utc": "2026-09-12T04:46:25.799Z",
+  "ended_at_utc": "2026-09-12T04:49:25.115Z",
+  "idle_timeout_ms": 180000,
+  "timed_out_for_silence": false,
+  "exit_code": 0,
+  "signal": null,
+  "log": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/vibe-report/runtime/readable-spec-workflow/schemas/fullstack-test-final-v3.log"
+}

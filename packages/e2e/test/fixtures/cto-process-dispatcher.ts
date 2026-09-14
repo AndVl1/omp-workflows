@@ -40,10 +40,22 @@ import {
   startChannelDispatcher,
   type InboxTask,
 } from '../../../fullstack/src/adapters/registry.js';
-import { MockEscalationAdapter } from '../../../fullstack/src/adapters/mock.js';
+import { MockEscalationAdapter, registerMockAdapterForTesting } from '../../../fullstack/src/adapters/mock.js';
+import { writeFullstackActivationMarker } from '../../../fullstack/src/activation-marker.js';
+import { fullstackOwnerForCwd } from '../../../fullstack/src/index.js';
 import { findActiveCtoRun } from '../../../core/src/commands/cto.js';
-import { finishWave, readCtoState, writeCtoState } from '../../../core/src/cto/state.js';
+import { readCtoState, writeCtoState } from '../../../core/src/cto/state.js';
+import { finishWave } from '../../../core/src/cto/waves.js';
 import { resolveWorkflow } from '../../../core/src/engine/profile.js';
+import { openCtoRuntimeAccess, type CtoRuntimeAccessFacade } from '@andvl1/omp-workflows-core/cto-runtime';
+import {
+  beginRegistryRegistration,
+  closeWorkflowActivation,
+  commitRegistryRegistration,
+  createRegistryRegistrationLiveGuard,
+  openWorkflowActivation,
+  rollbackRegistryRegistration,
+} from '@andvl1/omp-workflows-core/registry';
 
 /** Identity on EVERY git command (the scratch repo has no user config). */
 const GIT_IDENTITY = ['-c', 'user.name=Process E2E', '-c', 'user.email=process-e2e@example.invalid'];
@@ -82,7 +94,7 @@ function git(cwd: string, args: string[]): string {
 
 // ── Channel set ────────────────────────────────────────────────────────────
 //
-// The registry registers the "mock" transport at import. createChannelSet
+// The E2E fixture explicitly injects the "mock" transport below. createChannelSet
 // matches channel entries BY ADAPTER KIND (channels.find(c => c.adapter ===
 // kind)), so two channels with adapter "mock" would BOTH build from the
 // FIRST entry — the RO audit sink would share the control dir and RO-only
@@ -90,23 +102,52 @@ function git(cwd: string, args: string[]): string {
 // production wires a second channel (e.g. telegram RW + http RO): register
 // "mock-ro" through the exported consumer seam and build the persisted mock
 // the same way the built-in factory does.
-registerEscalationAdapter('mock-ro', (config, cwd) => {
-  const mock = config.mock as { persisted?: boolean; dir?: string } | undefined;
-  if (mock?.persisted === true) {
-    return new MockEscalationAdapter({ persisted: { dir: resolve(cwd, mock.dir ?? '.omp/fake-rw') } });
+writeFullstackActivationMarker(root);
+const registrationActivation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], fullstackOwnerForCwd(root));
+if (!registrationActivation.ok) throw new Error(`${registrationActivation.code}: ${registrationActivation.error}`);
+const registrationTransaction = beginRegistryRegistration(registrationActivation.registry_context, root, ["escalation_adapters", "workflow_tools"]);
+if (!registrationTransaction.ok) {
+  closeWorkflowActivation(registrationActivation);
+  throw new Error(`${registrationTransaction.code}: ${registrationTransaction.error}`);
+}
+const activationSnapshotGuard = createRegistryRegistrationLiveGuard(registrationTransaction.token, "workflow_tools");
+try {
+  registerMockAdapterForTesting(registrationTransaction.token);
+  registerEscalationAdapter(registrationTransaction.token, "mock-ro", (config, cwd) => {
+    const mock = config["mock-ro"] as { persisted?: boolean; dir?: string } | undefined;
+    if (mock?.persisted === true) {
+      return new MockEscalationAdapter({ persisted: { dir: resolve(cwd, mock.dir ?? ".omp/fake-rw"), root: cwd } });
+    }
+    return new MockEscalationAdapter();
+  }, { canReceiveInbound: true, canSend: true, canSendWithIdempotency: true });
+  commitRegistryRegistration(registrationTransaction.token);
+} catch (error) {
+  try { rollbackRegistryRegistration(registrationTransaction.token); } finally {
+    closeWorkflowActivation(registrationActivation);
   }
-  return new MockEscalationAdapter();
-});
+  throw error;
+}
 
-const channelSet = createChannelSet(root);
-record({ t: 'start', at: new Date().toISOString() });
+const openedRuntime = openCtoRuntimeAccess(
+  registrationActivation.registry_context,
+  { sessionId: `cto-process-dispatcher-${process.pid}`, main: true },
+  root,
+);
+if (!openedRuntime.ok) {
+  closeWorkflowActivation(registrationActivation);
+  throw new Error(`${openedRuntime.code}: ${openedRuntime.error}`);
+}
+const runtimeAccess: CtoRuntimeAccessFacade = openedRuntime.access;
+const sessionId = `cto-process-dispatcher-${process.pid}`;
+const activationLiveGuard = activationSnapshotGuard;
+const channelSet = createChannelSet(root, undefined, undefined, runtimeAccess);
 
 // ── Wave executor (deterministic resident simulation, no LLM) ──────────────
 
 const SLICE_WORKER = fileURLToPath(new URL('./slice-worker.ts', import.meta.url));
 
-/** Pids of in-flight slice workers — reaped on shutdown (insurance only). */
-const workerPids = new Set<number>();
+/** In-flight slice workers — awaited and reaped on shutdown. */
+const workers = new Set<ChildProcess>();
 
 /** Spawn one slice-worker child; resolves when it exits 0, rejects otherwise. */
 function spawnSliceWorker(worktree: string, slice: string): Promise<void> {
@@ -116,14 +157,14 @@ function spawnSliceWorker(worktree: string, slice: string): Promise<void> {
       ['--import', 'tsx', SLICE_WORKER, '--worktree', worktree, '--slice', slice, '--evidence', evidencePath],
       { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] },
     );
-    if (worker.pid) workerPids.add(worker.pid);
+    workers.add(worker);
     let out = '';
     let err = '';
     worker.stdout?.on('data', (d: Buffer) => (out += String(d)));
     worker.stderr?.on('data', (d: Buffer) => (err += String(d)));
     worker.on('error', reject);
     worker.on('close', (code) => {
-      workerPids.delete(worker.pid);
+      workers.delete(worker);
       if (code === 0) resolveP();
       else reject(new Error(`slice-worker ${slice} exited ${code}: ${err || out}`));
     });
@@ -134,17 +175,6 @@ async function executeWave(task: InboxTask): Promise<void> {
   const runId = task.runId ?? '';
   const waveId = task.waveId ?? '';
   record({ t: 'wave-start', runId, waveId, taskId: task.id });
-
-  // Online ACK queued right after admission — the dispatcher's NEXT tick
-  // drains it to the primary RW channel (RO sinks never receive
-  // non-summary intents).
-  queueCtoDelivery(root, runId, {
-    id: `${runId}/system/ack/${Date.now()}`,
-    level: 'question',
-    title: 'CTO online',
-    body: 'resident standby',
-    intent: 'ack',
-  });
 
   // Per-slice state + DoD BEFORE any worker spawn (architecture-3/7 proof):
   // the run's CtoState must carry full per-slice classification, the
@@ -188,7 +218,7 @@ async function executeWave(task: InboxTask): Promise<void> {
       teamsChanged = true;
     }
   }
-  if (teamsChanged) writeCtoState(state, root);
+  if (teamsChanged) writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
 
   for (const slice of SLICES) {
     const dodDir = join(root, '.work-state', 'artifacts', slice);
@@ -198,7 +228,14 @@ async function executeWave(task: InboxTask): Promise<void> {
       dodPath,
       `${JSON.stringify(
         {
-          items: [{ id: `${slice}-1`, criterion: `${slice} acceptance criteria`, status: 'pending' }],
+          items: [{
+            id: `${slice}-1`,
+            source: 'cto-process-e2e',
+            criterion: `${slice} acceptance criteria`,
+            verify_method: 'automated process E2E',
+            status: 'pending',
+            evidence: '',
+          }],
           type_requirements_met: false,
           updated_at: new Date().toISOString(),
         },
@@ -237,6 +274,7 @@ async function executeWave(task: InboxTask): Promise<void> {
   // summary delivery is drained by the next tick to the primary + RO sinks.
   const finalState = readCtoState(runId, root);
   if (finalState) finishWave(finalState, { id: waveId, status: 'done' }, root);
+  if (channelSet.profile.direction === 'rw') queueOnlineAck(runId);
   queueCtoDelivery(root, runId, {
     id: `${runId}/system/summary/${Date.now()}`,
     level: 'question',
@@ -244,7 +282,7 @@ async function executeWave(task: InboxTask): Promise<void> {
     body: JSON.stringify({ waveId, slices }),
     intent: 'summary',
     topic: 'summary',
-  });
+  }, undefined, undefined, runtimeAccess);
 }
 
 // ── Dispatcher wiring ──────────────────────────────────────────────────────
@@ -270,21 +308,27 @@ const onAnswer = (answer: { id: string; answer: string }): void => {
 
 // Replicate the production session_start resident wiring: when the resolved
 // profile is RW AND an active CTO run exists, queue the online-ACK delivery
-// (drained by the dispatcher's immediate first tick).
+// (drained by the dispatcher's immediate first tick). A brand-new resident
+// has no active run until its first inbox task is admitted, so the same ACK is
+// queued from onTask below for that first run.
+let onlineAckQueued = false;
+const queueOnlineAck = (runId: string): void => {
+  if (onlineAckQueued) return;
+  const published = queueCtoDelivery(root, runId, {
+    id: `${runId}/system/ack/${Date.now()}`,
+    level: 'question',
+    title: 'CTO online',
+    body: 'resident standby',
+    intent: 'ack',
+  }, undefined, undefined, runtimeAccess);
+  if (published !== null) onlineAckQueued = true;
+};
 if (channelSet.profile.direction === 'rw') {
   const active = findActiveCtoRun(root);
-  if (active) {
-    queueCtoDelivery(root, active.runId, {
-      id: `${active.runId}/system/ack/${Date.now()}`,
-      level: 'question',
-      title: 'CTO online',
-      body: 'resident standby',
-      intent: 'ack',
-    });
-  }
+  if (active) queueOnlineAck(active.runId);
 }
 
-const stop = startChannelDispatcher(root, channelSet, intervalMs, { onTask, onAnswer });
+const stop = startChannelDispatcher(root, channelSet, intervalMs, { onTask, onAnswer, runtimeAccess, session_id: sessionId, liveGuard: activationLiveGuard });
 
 // Fail-closed lease verification: after start, the lock file must name OUR
 // pid. When a LIVE foreign lease exists the claim returns null and the loop
@@ -299,27 +343,51 @@ try {
 }
 if (!leaseHeld) {
   record({ t: 'lease-busy', at: new Date().toISOString() });
+  runtimeAccess.close();
+  closeWorkflowActivation(registrationActivation);
   process.exit(3);
 }
 
-// SIGTERM/SIGINT: release the lease via the stop function and exit 0.
+// SIGTERM/SIGINT: stop every spawned worker, await their close events,
+// then release the dispatcher lease and exit. A direct process.exit before
+// awaiting children lets node-isolation workers survive the fixture.
 let stopping = false;
-const shutdown = (): void => {
-  if (stopping) return;
-  stopping = true;
-  for (const pid of workerPids) {
+async function stopWorker(worker: ChildProcess): Promise<void> {
+  const exited = new Promise<void>((resolveExit) => worker.once('close', () => resolveExit()));
+  if (worker.exitCode === null && worker.signalCode === null) {
     try {
-      process.kill(pid, 'SIGTERM');
+      worker.kill('SIGTERM');
     } catch {
-      // worker already gone
+      // worker may have exited between the state check and signal.
     }
   }
+  let timer: NodeJS.Timeout | undefined;
+  const graceful = new Promise<boolean>((resolveGraceful) => {
+    timer = setTimeout(() => resolveGraceful(false), 45_000);
+    void exited.then(() => {
+      if (timer !== undefined) clearTimeout(timer);
+      resolveGraceful(true);
+    });
+  });
+  if (!await graceful) {
+    throw new Error('slice worker did not exit gracefully within 45000ms after SIGTERM');
+  }
+}
+async function shutdown(): Promise<void> {
+  if (stopping) return;
+  stopping = true;
+  const dispatcherStopped = stop();
+  await Promise.all([...workers].map((worker) => stopWorker(worker)));
   try {
-    stop();
+    await dispatcherStopped;
   } catch {
     // best-effort release; the heartbeat TTL handles crashed owners
+  } finally {
+    runtimeAccess.close();
+    closeWorkflowActivation(registrationActivation);
   }
-  process.exit(0);
-};
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+  process.exitCode = 0;
+}
+process.on('SIGTERM', () => { void shutdown(); });
+process.on('SIGINT', () => { void shutdown(); });
+record({ t: 'start', pid: process.pid, at: new Date().toISOString() });

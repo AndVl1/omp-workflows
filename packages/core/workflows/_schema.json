@@ -108,7 +108,7 @@
           "description": "For document stages: the executable document contract. The engine itself renders the document — no agent dispatch, no model.",
           "properties": {
             "format": { "enum": ["markdown"], "description": "Output format (only markdown is shipped)." },
-            "renderer": { "enum": ["product-prd"], "description": "Renderer selector resolved by the engine to the shipped product-prd renderer; the manifest records the exact renderer id+version." },
+            "renderer": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$", "description": "Registered renderer selector, resolved fail-closed at render time through the one engine renderer registry (specification/registry.ts; specification/materialize.ts pre-registers the shipped product-prd renderer). The manifest records the exact renderer id+version." },
             "path": { "type": "string", "description": "Safe relative path of the rendered document inside the state dir (e.g. 'documents/product-prd.md')." }
           }
         },
@@ -135,7 +135,7 @@
         },
         "gate": {
           "type": "string",
-          "description": "Precondition that must hold before the interpreter may mark this stage done (e.g. 'branch_created', 'verdict != reject', 'root_cause_documented', 'dod_complete', 'tests_passed'). Review stages use 'verdict != reject' — keyed on the review artifact's normalized verdict (see artifacts-schema review.verdict), not a subjective confidence number."
+          "description": "Precondition that must hold before the interpreter may mark this stage done (e.g. 'branch_created', 'verdict != reject', 'root_cause_documented', 'dod_complete', 'qa_reported_pass'). Review stages use 'verdict != reject' — keyed on the review artifact's normalized verdict (see artifacts-schema review.verdict), not a subjective confidence number."
         },
         "conditional": {
           "type": "array",
@@ -173,7 +173,7 @@
       "required": ["mode", "acceptance", "source", "rationale"],
       "properties": {
         "mode": { "enum": ["complete_outcome", "handoff_only"] },
-        "acceptance": { "enum": ["dod_and_artifacts", "explicit_human_acceptance"] },
+        "acceptance": { "enum": ["quality_gates_and_artifacts", "explicit_human_acceptance"] },
         "source": { "enum": ["user", "workflow_policy", "migration"] },
         "rationale": { "type": "string", "minLength": 1 }
       }
@@ -185,16 +185,54 @@
       "properties": {
         "kind": {
           "enum": [
+            "constitution_approval", "specification_phase_approval",
             "product_approval", "clarification", "architecture_choice", "implementation_approval",
             "review_fix", "regression_plan", "integration_acceptance", "security",
             "destructive_side_effect", "production", "bundle_activation", "migration_cutover", "custom"
           ]
         },
         "default": { "enum": ["required_human", "autonomous_allowed"] },
-        "allowed_decisions": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "allowed_decisions": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
         "phase": { "enum": ["before_dispatch", "before_advance"] },
         "rationale": { "type": "string", "minLength": 1 }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "constitution_approval" } }, "required": ["kind"] },
+          "then": {
+            "properties": {
+              "default": { "const": "required_human" },
+              "phase": { "const": "before_advance" },
+              "allowed_decisions": {
+                "minItems": 2, "maxItems": 2, "uniqueItems": true,
+                "items": { "enum": ["approve_continue", "request_changes"] },
+                "allOf": [
+                  { "contains": { "const": "approve_continue" } },
+                  { "contains": { "const": "request_changes" } }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "specification_phase_approval" } }, "required": ["kind"] },
+          "then": {
+            "properties": {
+              "default": { "const": "required_human" },
+              "phase": { "const": "before_advance" },
+              "allowed_decisions": {
+                "minItems": 3, "maxItems": 3, "uniqueItems": true,
+                "items": { "enum": ["approve_continue", "request_changes", "approve_stop"] },
+                "allOf": [
+                  { "contains": { "const": "approve_continue" } },
+                  { "contains": { "const": "request_changes" } },
+                  { "contains": { "const": "approve_stop" } }
+                ]
+              }
+            }
+          }
+        }
+      ]
     },
     "checkpointPolicy": {
       "type": "object",
@@ -206,7 +244,7 @@
         "hard_human": {
           "type": "array",
           "items": {
-            "enum": ["product_approval", "security", "destructive_side_effect", "production", "bundle_activation", "migration_cutover", "custom"]
+            "enum": ["constitution_approval", "specification_phase_approval", "product_approval", "security", "destructive_side_effect", "production", "bundle_activation", "migration_cutover", "custom"]
           }
         },
         "rules": {
@@ -234,7 +272,8 @@
             "nonce": { "type": "string", "minLength": 1 },
             "channel": { "enum": ["terminal", "escalation"] },
             "reference": { "type": "string", "minLength": 1 },
-            "binding": { "type": "string", "minLength": 1 }
+            "binding": { "type": "string", "minLength": 1 },
+            "feedback": { "type": "string", "minLength": 1, "maxLength": 8192 }
           }
         }
       }
@@ -458,13 +497,13 @@
     "completionArtifactRef": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["artifact_id", "path", "sha256", "schema_status", "dod_status"],
+      "required": ["artifact_id", "path", "sha256", "schema_status", "quality_gate_status"],
       "properties": {
         "artifact_id": { "type": "string", "minLength": 1 },
         "path": { "type": "string", "pattern": "^(?![/\\\\])(?!.*\\.\\.)(?!.*\\\\).+" },
         "sha256": { "type": "string", "minLength": 1 },
         "schema_status": { "enum": ["met", "failed"] },
-        "dod_status": { "enum": ["met", "pending", "failed"] }
+        "quality_gate_status": { "enum": ["met", "pending", "failed"] }
       }
     },
     "completionEnvelope": {

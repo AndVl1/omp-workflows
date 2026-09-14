@@ -393,6 +393,12 @@ export interface ImplementationHandoffRecord {
   handoff_digest: string;
   feature_id: string;
   source_kind: "native" | "external" | "legacy";
+  content_provenance?: {
+    source_kind: "external";
+    content_role: "untrusted_inert_data";
+    embedded_instruction_policy: "inert_data_only";
+    source_refs: string[];
+  };
   artifact_versions: HandoffArtifactVersionRecord[];
   scope: { in_scope: string[]; out_of_scope: string[]; constraints: string[] };
   requirements: HandoffRequirementRecord[];
@@ -410,6 +416,15 @@ export interface ImplementationHandoffRecord {
   status: "candidate" | "ready" | "stale";
   import_snapshot_ref: string | null;
   compatibility_supplement_ref: string | null;
+  import_framework?: string;
+  import_mapping_id?: string;
+  import_mapping_version?: string;
+  import_selected_paths?: string[];
+  import_ignored_candidates?: Array<{ path: string; reason: string }>;
+  import_intake_paths?: string[];
+  import_document_language?: string;
+  import_document_language_source?: "explicit" | "metadata" | "unknown";
+  import_source_revision?: string | null;
 }
 
 export interface ValidHandoffOptions {
@@ -492,6 +507,15 @@ export function validImplementationHandoff(options: ValidHandoffOptions = {}): I
     status: options.status ?? "ready",
     import_snapshot_ref: null,
     compatibility_supplement_ref: null,
+    import_framework: "generic",
+    import_mapping_id: "generic-requirements-plan-tasks",
+    import_mapping_version: "1",
+    import_selected_paths: ["requirements.md"],
+    import_ignored_candidates: [],
+    import_intake_paths: ["external-source"],
+    import_document_language: "und",
+    import_document_language_source: "unknown",
+    import_source_revision: null,
   };
   const { handoff_id: _id, handoff_digest: _digest, schema_version: _schema, status: _status, ...content } = handoff;
   handoff.handoff_digest = canonicalDigestOf(content);
@@ -755,10 +779,10 @@ export function validImplementationConformance(
     },
   ];
   const entries = [requirementEntry, acceptanceEntry];
-  return {
+  const result: ImplementationConformanceRecord = {
     schema_version: "1.0",
-    conformance_id: `${featureId}.conformance.v1`,
-    matrix_digest: digestOf({ featureId, handoffDigest, entries }),
+    conformance_id: "",
+    matrix_digest: "",
     feature_id: featureId,
     handoff_id: handoff.handoff_id,
     handoff_digest: handoffDigest,
@@ -775,6 +799,23 @@ export function validImplementationConformance(
       ? "complete_feature"
       : "repair_implementation",
   };
+  result.matrix_digest = canonicalDigestOf({
+    schema_version: result.schema_version,
+    feature_id: result.feature_id,
+    handoff_id: result.handoff_id,
+    handoff_digest: result.handoff_digest,
+    execution_claim_id: result.execution_claim_id,
+    execution_owner: result.execution_owner,
+    execution_run_id: result.execution_run_id,
+    profile_hash: result.profile_hash,
+    entries: result.entries,
+    quality_gate_results: result.quality_gate_results,
+    overall_status: result.overall_status,
+    blocking_findings: result.blocking_findings,
+    next_action: result.next_action,
+  });
+  result.conformance_id = `implementation-conformance.${result.matrix_digest}`;
+  return result;
 }
 
 export const INVALID_CONFORMANCE_RESULT_CASES: Readonly<Record<string, unknown>> = {

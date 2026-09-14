@@ -1,6 +1,6 @@
 {
   "name": "@andvl1/omp-workflows-core",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "description": "Workflow engine + gates + custom-TS command helpers + runtime observability for omp. No agents — bundles ship those. Ships the custom-agent-bundle skill (installable via `omp plugin install @andvl1/omp-workflows-core`).",
   "type": "module",
   "license": "MIT",
@@ -12,9 +12,21 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./queue": {
+      "types": "./dist/specification/queue.d.ts",
+      "import": "./dist/specification/queue.js"
+    },
     "./visualize": {
       "types": "./dist/visualize/index.d.ts",
       "import": "./dist/visualize/index.js"
+    },
+    "./registry": {
+      "types": "./dist/registry/index.d.ts",
+      "import": "./dist/registry/index.js"
+    },
+    "./cto-runtime": {
+      "types": "./dist/cto/runtime-access.d.ts",
+      "import": "./dist/cto/runtime-access.js"
     },
     "./workflows": "./workflows/",
     "./workflows/*": "./workflows/*"
@@ -29,13 +41,14 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "find test -name '*.test.ts' -type f | xargs node --test --import tsx"
+    "test": "find test -name '*.test.ts' -type f | xargs node --test --import tsx --test-concurrency=1"
   },
   "peerDependencies": {
     "@oh-my-pi/pi-coding-agent": "*"
   },
   "dependencies": {
-    "marked": "^18.0.7"
+    "marked": "^18.0.7",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "typescript": "^5.6.0",

@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "feature": "legacy-payment-retry",
+  "branch": "feat/legacy-payment-retry",
+  "created_at": "2025-11-14T09:30:00.000Z",
+  "generator": "spec-preparation (JSON-only legacy export; inert fixture data)",
+  "completed": true,
+  "specification": {
+    "problem": "Transient provider timeouts lose checkout sales because the first attempt is never retried.",
+    "requirements": [
+      {
+        "id": "FR-101",
+        "text": "Retry a timed-out card charge up to 3 times with exponential backoff."
+      },
+      {
+        "id": "FR-102",
+        "text": "Every retried charge reuses the provider idempotency key of the first attempt."
+      },
+      {
+        "id": "FR-103",
+        "text": "After the final failed attempt, write a dead-letter record."
+      }
+    ],
+    "acceptance": [
+      {
+        "id": "A-101",
+        "requirement": "FR-101",
+        "text": "Exactly one additional provider call within 2 seconds using the same idempotency key."
+      },
+      {
+        "id": "A-102",
+        "requirement": "FR-103",
+        "text": "A dead-letter record exists after the third timeout and no further calls are made."
+      }
+    ]
+  },
+  "plan": {
+    "decisions": [
+      {
+        "id": "D-101",
+        "text": "Fixed in-process backoff schedule (1s/2s/4s)."
+      },
+      {
+        "id": "D-102",
+        "text": "Reuse the orders idempotency column."
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "T-101",
+      "title": "Implement RetryPolicy schedule",
+      "requirement_ids": [
+        "FR-101"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "T-102",
+      "title": "Reuse idempotency keys across attempts",
+      "requirement_ids": [
+        "FR-102"
+      ],
+      "depends_on": [
+        "T-101"
+      ]
+    },
+    {
+      "id": "T-103",
+      "title": "Write dead-letter records after final failure",
+      "requirement_ids": [
+        "FR-103"
+      ],
+      "depends_on": [
+        "T-102"
+      ]
+    }
+  ],
+  "artifacts": {
+    "specification": "spec-preparation/specification.json",
+    "plan": "spec-preparation/plan.json",
+    "tasks": "spec-preparation/tasks.json"
+  }
+}

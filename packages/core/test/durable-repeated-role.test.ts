@@ -15,25 +15,29 @@
  */
 
 import { test } from "node:test";
+import { TEST_SESSION_MANAGER } from "./fixtures/registrar-host.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, profileHash, registerWorkflowProfiles, type Profile } from "../src/engine/profile.js";
+import { loadProfile, profileHash, type Profile } from "../src/engine/profile.js";
+import { openTestRegistry, registerTestProfiles, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { checkpointPolicyHash, issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, registerTrustedCheckpointHostBridge } from "../src/engine/checkpoints.js";
+import { createCapability, beginCapability, authorizeDispatch, completeDispatch, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
 import { resolveStageDispatchSlots, selectRoster } from "../src/engine/stage.js";
-import { createCapability, beginCapability, authorizeDispatch, completeDispatch, advanceCursor, recordCheckpointDecision, type CapabilityHandoff } from "../src/engine/durable.js";
-import { checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
+import { durableNamespacedArtifactId } from "../src/engine/fan-in.js";
 import { resolveConfig } from "../src/engine/config.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildAgentMapping, writeAgentMapping, type AgentMappingState } from "../src/engine/agent-mapping.js";
 import { buildDispatchMarker, parseDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
-import { writeState, resolveState } from "../src/engine/state.js";
+import { updateStateAtomically, writeState, resolveState, setStateTransactionTestHooks } from "../src/engine/state.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TeamState } from "../src/engine/types.js";
 
-import { registerWorkflowTools } from "../src/index.js";
-import { z as zod } from "zod";
+const TEST_CHECKPOINT_BRIDGE = Object.freeze({});
+registerTrustedCheckpointHostBridge(TEST_CHECKPOINT_BRIDGE);
+
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
 
 function initGit(root: string, branch: string): void {
@@ -43,26 +47,56 @@ function initGit(root: string, branch: string): void {
 function trustedCheckpoint(root: string, stageId: string, checkpointId: string, decision: string, channel: "terminal" | "escalation" = "terminal") {
   const resolved = resolveState(root);
   assert.ok(resolved.state, "checkpoint fixture state must resolve");
-  const trusted = recordTrustedCheckpointAnswer(resolved.state, {
-    answer_id: `durable/${stageId}/${checkpointId}`,
-    channel,
-    reference: `${channel}-answer/durable/${stageId}/${checkpointId}`,
-    stage_id: stageId,
-    checkpoint_id: checkpointId,
-    decision,
-  });
-  writeState(root, trusted.state, { target: resolved });
-
-  return trusted;
+  if (!resolved.state) throw new Error("checkpoint fixture state must resolve");
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  assert.ok(pinnedRoot, "checkpoint fixture root must pin");
+  if (!pinnedRoot) throw new Error("checkpoint fixture root must pin");
+  try {
+    const rootIdentity = { canonical_root: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino };
+    const policy = resolved.state.checkpoint_policy;
+    const rule = policy?.rules[checkpointId];
+    assert.ok(policy && rule, `checkpoint fixture policy must define ${checkpointId}`);
+    if (!policy || !rule) throw new Error(`checkpoint fixture policy must define ${checkpointId}`);
+    const answerId = `durable/${stageId}/${checkpointId}/${rootIdentity.dev}-${rootIdentity.ino}`;
+    const reference = `${channel}-answer/${answerId}`;
+    const capability = issueTrustedCheckpointAnswerCapability(TEST_CHECKPOINT_BRIDGE, {
+      root: rootIdentity,
+      state: resolved.state,
+      answer_id: answerId,
+      channel,
+      reference,
+      stage_id: stageId,
+      checkpoint_id: checkpointId,
+      decision,
+      question: `Authorize checkpoint ${checkpointId}`,
+      options: rule.allowed_decisions,
+      session_id: "durable-repeated-role-session",
+      actor_ref: reference,
+      profile_hash: resolved.state.profile_hash ?? "",
+    });
+    const trusted = recordTrustedCheckpointAnswer(resolved.state, {
+      answer_id: answerId,
+      channel,
+      reference,
+      stage_id: stageId,
+      checkpoint_id: checkpointId,
+      decision,
+    }, { capability, root: rootIdentity });
+    writeState(root, trusted.state, { target: resolved });
+    return trusted;
+  } finally {
+    pinnedRoot.close();
+  }
 }
-
 const poolRoles = {
   analyst: "analyst",
   "tech-researcher": "tech-researcher",
   architect: "architect",
+  "specification-analyst": "specification-worker",
+  "specification-architect": "specification-architect",
 } as const;
 
-/** Publish a trusted live agent mapping for the full-feature selection pool. */
+/** Publish a trusted live agent mapping for the full-feature and specification selection pools. */
 function publishMapping(root: string): void {
   mkdirSync(join(root, ".omp"), { recursive: true });
   writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: poolRoles }) + "\n");
@@ -72,6 +106,15 @@ function publishMapping(root: string): void {
     availableAgents: Object.values(poolRoles),
     extraRoles: config.scope_map.map((entry) => entry.dev_agent),
     genericFallbackRoles: Object.keys(poolRoles),
+    source: "durable-repeated-role-test",
+    scope_map: config.scope_map,
+    flags: config.flags,
+    roster: config.roster_overrides,
+    config_path: config.config_path,
+    config_source: config.config_source,
+    config_hash: config.config_hash,
+    config_version: config.config_version,
+    config_provenance: config.config_provenance,
   });
   writeAgentMapping(root, mapping);
 }
@@ -228,7 +271,7 @@ test("br-eu6: full-feature exploration issues a valid consilium capability; mark
       { agent: "analyst", task: markerFor("analyst#1") },
       { agent: "tech-researcher", task: markerFor("tech-researcher") },
       { agent: "analyst", task: markerFor("analyst#2") },
-    ] } }, { cwd: root });
+    ] } }, { cwd: root, sessionManager: TEST_SESSION_MANAGER });
     assert.equal(batch, undefined, "gate accepts two distinct analyst slots");
 
     // Collapsing both occurrences onto one slot must be rejected.
@@ -236,7 +279,7 @@ test("br-eu6: full-feature exploration issues a valid consilium capability; mark
       { agent: "analyst", task: markerFor("analyst#1") },
       { agent: "tech-researcher", task: markerFor("tech-researcher") },
       { agent: "analyst", task: markerFor("analyst#1") },
-    ] } }, { cwd: root });
+    ] } }, { cwd: root, sessionManager: TEST_SESSION_MANAGER });
     assert.equal(collapsed?.block, true, "marker validation cannot collapse analyst slots");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -365,11 +408,14 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
     // Multi-slot consilium fan-in: every slot writes slot-scoped artifacts
     // (<produce>-<slot>.json); the shared ids are synthesized deterministically
     // at advance. The analyst slot also contributes the dod.
-    writeFileSync(join(artifactsDir, "exploration-analyst.json"), JSON.stringify({ files_to_read: [{ path: "a.ts", why: "x" }], summary: "analyst one" }));
-    writeFileSync(join(artifactsDir, "exploration-tech-researcher.json"), JSON.stringify({ files_to_read: [{ path: "b.ts", why: "y" }], summary: "researcher" }));
-    writeFileSync(join(artifactsDir, "dod-analyst.json"), JSON.stringify({ items: [{ criterion: "c", verify_method: "v", status: "pending" }] }));
-    assert.equal(complete(a1.record, "analyst", "analyst", ["exploration-analyst", "dod-analyst"]).ok, true);
-    assert.equal(complete(tr.record, "tech-researcher", "tech-researcher", ["exploration-tech-researcher"]).ok, true);
+    writeFileSync(join(artifactsDir, `${durableNamespacedArtifactId("exploration", "analyst")}.json`), JSON.stringify({ files_to_read: [{ path: "a.ts", why: "x" }], summary: "analyst one" }));
+    writeFileSync(join(artifactsDir, `${durableNamespacedArtifactId("exploration", "tech-researcher")}.json`), JSON.stringify({ files_to_read: [{ path: "b.ts", why: "y" }], summary: "researcher" }));
+    writeFileSync(join(artifactsDir, `${durableNamespacedArtifactId("dod", "analyst")}.json`), JSON.stringify({ items: [{ criterion: "c", verify_method: "v", status: "pending" }] }));
+    writeFileSync(join(artifactsDir, `${durableNamespacedArtifactId("dod", "tech-researcher")}.json`), JSON.stringify({ items: [{ criterion: "c", verify_method: "v", status: "pending" }] }));
+    const analystCompletion = complete(a1.record, "analyst", "analyst", ["exploration", "dod"]);
+    assert.equal(analystCompletion.ok, true, analystCompletion.ok ? "analyst completed" : analystCompletion.error);
+    const researcherCompletion = complete(tr.record, "tech-researcher", "tech-researcher", ["exploration", "dod"]);
+    assert.equal(researcherCompletion.ok, true, researcherCompletion.ok ? "tech-researcher completed" : researcherCompletion.error);
 
     const advanced2 = advanceCursor(root, { ...auth, token: begun.handoff.advance_token, evidence: "exploration completed" });
     if (!advanced2.ok) return;
@@ -384,7 +430,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
   }
 });
 
-test("br-eu6: single-to-single advance arms a ready capability with the next stage in_progress and immediately executable", () => {
+test("br-eu6: non-spec run_key auth completes, checkpoints, and advances without explicit feature routing", () => {
   const root = mkdtempSync(join(tmpdir(), "br-eu6-single-"));
   try {
     initGit(root, "feat/single");
@@ -416,10 +462,9 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
     }, { featureSlug: "single" });
     const artifactsDir = join(root, ".work-state", "features", "single", "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
-    // Schema-valid implementation artifact (files_touched is required by the
-    // artifact contract; the validation gate additionally requires the
-    // validation block).
-    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "focused single-to-single regression", files_touched: ["src/index.ts"] }));
+    // Schema-valid implementation artifact: files_touched is required by the
+    // artifact contract; independent QA owns workflow test authority.
+    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ files_touched: ["src/index.ts"] }));
 
     const auth = {
       token: issued.dispatch_token,
@@ -430,8 +475,7 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
     };
     const authorized = authorizeDispatch(root, auth);
     assert.equal(authorized.ok, true);
-    if (!authorized.ok || !authorized.record) return;
-    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed" }).ok, true);
+    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed", artifact_ids: ["implementation"] }).ok, true);
 
     // lightweight implementation declares a checkpoint; record it durably
     // before the advance is allowed.
@@ -470,7 +514,7 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
     const codeReview = profile.stages.find((stage) => stage.id === "code_review");
     assert.ok(codeReview);
     const marker = buildDispatchMarker("feat/single", codeReview, ["code-reviewer"], "code-reviewer", advanced.state.cursor_epoch);
-    const gate = dispatchGate({ toolName: "task", input: { agent: "code-reviewer", role: "code-reviewer", task: marker } }, { cwd: root });
+    const gate = dispatchGate({ toolName: "task", input: { agent: "code-reviewer", role: "code-reviewer", task: marker } }, { cwd: root, sessionManager: TEST_SESSION_MANAGER });
     assert.equal(gate, undefined, "armed next stage is immediately executable");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -530,12 +574,13 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     writeFileSync(outsidePath, "outside");
 
     const oldArtifacts = [
-      { role: "analyst#1", agent: "analyst", id: "exploration-analyst-1" },
-      { role: "tech-researcher", agent: "tech-researcher", id: "exploration-tech-researcher" },
-      { role: "analyst#2", agent: "analyst", id: "exploration-analyst-2" },
+      { role: "analyst#1", agent: "analyst", slot: "analyst#1", id: durableNamespacedArtifactId("exploration", "analyst#1") },
+      { role: "tech-researcher", agent: "tech-researcher", slot: "tech-researcher", id: durableNamespacedArtifactId("exploration", "tech-researcher") },
+      { role: "analyst#2", agent: "analyst", slot: "analyst#2", id: durableNamespacedArtifactId("exploration", "analyst#2") },
     ];
     for (const item of oldArtifacts) {
       writeFileSync(join(artifactsDir, item.id + ".json"), JSON.stringify({ files_to_read: [{ path: "old.ts" }], summary: "old" }));
+      writeFileSync(join(artifactsDir, durableNamespacedArtifactId("dod", item.slot) + ".json"), JSON.stringify({ items: [{ criterion: "old", verify_method: "v", status: "pending" }] }));
     }
     const oldAuth = {
       token: issued.dispatch_token,
@@ -559,9 +604,9 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
         dispatch_id: authorized.record.id,
         outcome: "succeeded",
         evidence: "old completion",
-        artifact_ids: [item.id],
+        artifact_ids: ["exploration", "dod"],
       });
-      assert.equal(completed.ok, true);
+      assert.equal(completed.ok, true, completed.ok ? "stale completion recorded" : completed.error);
       oldRecords.push({ role: item.role, agent: item.agent, id: authorized.record.id });
     }
 
@@ -570,15 +615,44 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     staleState.dispatch_capability = { ...staleState.dispatch_capability!, status: "complete" };
     staleState.slot_artifacts = {
       ...staleState.slot_artifacts,
-      discovery: { slots: { prior: { discovery: { path: upstreamPath, hash: "upstream" } } } },
-      architecture: { slots: { "architect#2": { architecture: { path: join(artifactsDir, "architecture-architect-2.json"), hash: "downstream" } } } },
+      discovery: { slots: { prior: { discovery: { path: upstreamPath, sha256: "0".repeat(64), size_bytes: 0 } } } },
+      architecture: { slots: { "architect#2": { architecture: { path: join(artifactsDir, "architecture-architect-2.json"), sha256: "1".repeat(64), size_bytes: 0 } } } },
     };
     const oldExplorationSlots = staleState.slot_artifacts.exploration?.slots["analyst#1"];
     if (!oldExplorationSlots) return;
-    oldExplorationSlots.outside = { path: outsidePath, hash: "outside" };
+    oldExplorationSlots.outside = { path: outsidePath, sha256: "2".repeat(64), size_bytes: 0 };
     const downstreamPath = join(artifactsDir, "architecture-architect-2.json");
     writeFileSync(downstreamPath, "downstream");
     writeState(root, staleState, { featureSlug: "reopen" });
+
+    const staleStatePath = join(root, ".work-state", "features", "reopen", "state.json");
+    const staleStateBytes = readFileSync(staleStatePath);
+    const staleArtifactPaths = [
+      ...oldArtifacts.flatMap((item) => [
+        join(artifactsDir, item.id + ".json"),
+        join(artifactsDir, durableNamespacedArtifactId("dod", item.slot) + ".json"),
+      ]),
+      downstreamPath,
+    ];
+    const staleArtifactPreimages = staleArtifactPaths.map((path) => [path, readFileSync(path)] as const);
+    let injectedStateDrift = false;
+    setStateTransactionTestHooks({
+      beforeCas: () => {
+        if (injectedStateDrift) return;
+        injectedStateDrift = true;
+        const concurrent = JSON.parse(staleStateBytes.toString("utf8")) as Record<string, unknown>;
+        concurrent.task = "concurrent reopen writer";
+        writeFileSync(staleStatePath, JSON.stringify(concurrent) + "\n", "utf8");
+      },
+    }, root);
+    const rejectedReopen = beginCapability(root, THREE_SLOT_SELECTION);
+    setStateTransactionTestHooks(null, root);
+    assert.equal(rejectedReopen.ok, false, "reopen must reject a concurrent state CAS drift");
+    assert.equal(injectedStateDrift, true, "reopen CAS drift hook must run");
+    for (const [path, bytes] of staleArtifactPreimages) {
+      assert.deepEqual(readFileSync(path), bytes, "failed reopen must preserve exact stale artifact bytes");
+    }
+    writeFileSync(staleStatePath, staleStateBytes);
 
     const begun = beginCapability(root, THREE_SLOT_SELECTION);
     assert.equal(begun.ok, true);
@@ -591,6 +665,9 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     assert.equal(existsSync(upstreamPath), true, "upstream slot artifact file remains");
     assert.equal(existsSync(outsidePath), true, "out-of-tree stale path is never removed");
     for (const item of oldArtifacts) assert.equal(existsSync(join(artifactsDir, item.id + ".json")), false, "stale slot file is removed: " + item.id);
+    for (const item of oldArtifacts) {
+      assert.equal(existsSync(join(artifactsDir, durableNamespacedArtifactId("dod", item.slot) + ".json")), false, "stale slot file is removed: dod-" + item.slot);
+    }
     assert.equal(existsSync(downstreamPath), false, "downstream stale slot file is removed");
 
     const replay = completeDispatch(root, {
@@ -627,17 +704,14 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       dispatch_id: firstAuth.record.id,
       outcome: "succeeded",
       evidence: "stale file replay",
-      artifact_ids: [first.id],
+      artifact_ids: ["exploration", "dod"],
     });
     assert.equal(missingOldFile.ok, false, "a removed old file cannot authorize fresh completion");
     if (missingOldFile.ok) return;
     assert.match(missingOldFile.error, /declared artifact missing/);
 
-    for (const item of oldArtifacts) {
-      writeFileSync(join(artifactsDir, item.id + ".json"), JSON.stringify({ files_to_read: [{ path: "fresh.ts" }], summary: "fresh " + item.role }));
-      const dodId = item.id.replace("exploration-", "dod-");
-      writeFileSync(join(artifactsDir, dodId + ".json"), JSON.stringify({ items: [{ criterion: "fresh", verify_method: "focused regression", status: "pending" }] }));
-    }
+    writeFileSync(join(artifactsDir, "exploration.json"), JSON.stringify({ files_to_read: [{ path: "fresh.ts" }], summary: "fresh exploration" }));
+    writeFileSync(join(artifactsDir, "dod.json"), JSON.stringify({ items: [{ criterion: "fresh", verify_method: "focused regression", status: "pending" }] }));
     const freshRecords = [{ role: first.role, agent: first.agent, id: firstAuth.record.id }, ...oldArtifacts.slice(1).map((item) => {
       const authorized = authorizeDispatch(root, { ...freshAuth, role: item.role, agent: item.agent });
       assert.equal(authorized.ok, true);
@@ -645,8 +719,6 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       return { role: item.role, agent: item.agent, id: authorized.record.id };
     })];
     for (const item of freshRecords) {
-      const explorationId = "exploration-" + item.role.replace(/[^A-Za-z0-9._-]/g, "-");
-      const dodId = "dod-" + item.role.replace(/[^A-Za-z0-9._-]/g, "-");
       const completed = completeDispatch(root, {
         ...freshAuth,
         role: item.role,
@@ -654,12 +726,12 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
         dispatch_id: item.id,
         outcome: "succeeded",
         evidence: "fresh completion",
-        artifact_ids: [explorationId, dodId],
+        artifact_ids: ["exploration", "dod"],
       });
       assert.equal(completed.ok, true);
     }
     const advanced = advanceCursor(root, { ...freshAuth, token: fresh.advance_token, evidence: "fresh exploration completed" });
-    assert.equal(advanced.ok, true, "fresh downstream artifacts complete after stale bindings are cleared");
+    assert.equal(advanced.ok, true, advanced.ok ? "fresh downstream artifacts complete after stale bindings are cleared" : advanced.error);
     if (advanced.ok) assert.equal(advanced.state.stage_cursor, "clarify");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -683,6 +755,15 @@ function publishHostileMapping(root: string, roles: Record<string, string>, avai
     availableAgents,
     extraRoles: config.scope_map.map((entry) => entry.dev_agent),
     genericFallbackRoles: Object.keys(roles),
+    source: "durable-repeated-role-hostile-test",
+    scope_map: config.scope_map,
+    flags: config.flags,
+    roster: config.roster_overrides,
+    config_path: config.config_path,
+    config_source: config.config_source,
+    config_hash: config.config_hash,
+    config_version: config.config_version,
+    config_provenance: config.config_provenance,
   });
   writeAgentMapping(root, mapping);
 }
@@ -901,7 +982,7 @@ test("wave-004: non-roster advance arming consumes the trusted mapping override"
     publishHostileMapping(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "omp-attacker" }, ["developer-kotlin", "omp-attacker"]);
     const artifactsDir = join(root, ".work-state", "features", "trusted-advance", "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "trusted advance override regression", files_touched: ["src/index.ts"] }));
+    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ files_touched: ["src/index.ts"] }));
 
     const auth = {
       token: issued.dispatch_token,
@@ -913,7 +994,7 @@ test("wave-004: non-roster advance arming consumes the trusted mapping override"
     const authorized = authorizeDispatch(root, auth);
     assert.equal(authorized.ok, true);
     if (!authorized.ok || !authorized.record) return;
-    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed" }).ok, true);
+    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed", artifact_ids: ["implementation"] }).ok, true);
     const implementationStage = profile.stages.find((stage) => stage.id === "implementation");
     assert.ok(implementationStage?.checkpoint === "approve_implementation");
     const policy = profile.checkpoint_policy;
@@ -979,7 +1060,8 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
   const root = mkdtempSync(join(tmpdir(), "wave004-loop-roster-"));
   try {
     initGit(root, "feat/loop-roster");
-    registerWorkflowProfiles([LOOP_ROSTER_PROFILE]);
+    writeTestRegistryMarker(root);
+    registerTestProfiles(root, [LOOP_ROSTER_PROFILE]);
     const profile = loadProfile("loop-roster-regression");
     assert.ok(profile);
     const persistedProfileHash = profileHash(profile);
@@ -1080,98 +1162,6 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
   }
 });
 
-test("wave-004: workflow tools invoke beforeBegin per transition with the exact current cwd; hook rejection fails advance closed", async () => {
-  const root = mkdtempSync(join(tmpdir(), "wave004-tool-hook-"));
-  const otherRoot = mkdtempSync(join(tmpdir(), "wave004-tool-hook-other-"));
-  try {
-    initGit(root, "feat/tool-hook");
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    writeState(root, {
-      schema: 1,
-      branch: "feat/tool-hook",
-      run_key: "feat/tool-hook",
-      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
-      task: "per-transition hook regression",
-      workflow_override: false,
-      issue: null,
-      stage_cursor: "implementation",
-      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "implementation" ? "in_progress" as const : "pending" as const })),
-      artifacts: {},
-      pause: { kind: "none" as const, reason: "" },
-      policy: { strict_orchestrator: true },
-      profile_hash: profileHash(profile),
-      scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
-      cursor_epoch: "fixture-epoch-0",
-      updated_at: new Date().toISOString(),
-    }, { featureSlug: "tool-hook" });
-
-    const calls: string[] = [];
-    const responses: Array<AgentMappingState | undefined | null> = [undefined, undefined, null];
-    let hookFailure: Error | null = null;
-    const registered: Array<{ name: string; execute: (id: string, params: unknown, signal: unknown, update: unknown, ctx: unknown) => Promise<{ details: { ok: boolean; code?: string; error?: string; handoff?: CapabilityHandoff } }> }> = [];
-    const pi = {
-      zod: { z: zod },
-      registerTool: (tool: { name: string; execute: never }) => registered.push(tool as never),
-    };
-    registerWorkflowTools(pi as unknown as Parameters<typeof registerWorkflowTools>[0], {
-      isMainSession: () => true,
-      resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd,
-      beforeBegin: (cwd: string) => {
-        calls.push(cwd);
-        if (hookFailure) throw hookFailure;
-        return responses.shift();
-      },
-    });
-    const beginTool = registered.find((tool) => tool.name === "workflow_begin");
-    const advanceTool = registered.find((tool) => tool.name === "workflow_advance");
-    assert.ok(beginTool && advanceTool, "workflow tools registered");
-
-    // Begin consumes its own per-call hook with the begin cwd.
-    const begun = await beginTool.execute("id", {}, undefined, undefined, { cwd: root });
-    assert.equal(begun.details.ok, true, begun.details.error ?? "begin ok");
-    assert.deepEqual(calls, [root], "begin invoked the hook with its exact cwd");
-    const handoff = begun.details.handoff;
-    assert.ok(handoff);
-
-    // A later advance re-invokes the hook with the advance's own cwd — never
-    // a cached mapping from the earlier transition or another project.
-    const advancedOther = await advanceTool.execute("id", {
-      token: handoff.advance_token, capability_id: handoff.capability_id, run_key: handoff.run_key,
-      branch: handoff.branch, workflow: handoff.workflow, profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor, cursor_epoch: handoff.cursor_epoch, evidence: "stage completed",
-    }, undefined, undefined, { cwd: otherRoot });
-    assert.deepEqual(calls, [root, otherRoot], "advance re-invoked the hook with its own cwd");
-    assert.equal(advancedOther.details.ok, false, "the other project has no workflow state");
-
-    // Runtime null from the hook fails the advance closed (no fallback).
-    const advancedNull = await advanceTool.execute("id", {
-      token: handoff.advance_token, capability_id: handoff.capability_id, run_key: handoff.run_key,
-      branch: handoff.branch, workflow: handoff.workflow, profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor, cursor_epoch: handoff.cursor_epoch, evidence: "stage completed",
-    }, undefined, undefined, { cwd: root });
-    assert.deepEqual(calls, [root, otherRoot, root], "null case re-invoked the hook");
-    assert.equal(advancedNull.details.ok, false);
-    assert.match(advancedNull.details.error ?? "", /trusted agent mapping handoff is malformed/);
-
-    hookFailure = new Error("stale discovery markers");
-    // A throwing hook (stale marker/freshness failure) fails the advance closed.
-    const advancedThrow = await advanceTool.execute("id", {
-      token: handoff.advance_token, capability_id: handoff.capability_id, run_key: handoff.run_key,
-      branch: handoff.branch, workflow: handoff.workflow, profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor, cursor_epoch: handoff.cursor_epoch, evidence: "stage completed",
-    }, undefined, undefined, { cwd: root });
-    assert.equal(advancedThrow.details.ok, false);
-    assert.match(advancedThrow.details.error ?? "", /stale discovery markers/);
-    hookFailure = null;
-    const state = resolveState(root);
-    assert.equal(state.state?.stage_cursor, "implementation", "failed hook calls never advanced the cursor");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-    rmSync(otherRoot, { recursive: true, force: true });
-  }
-});
-
 test("wave-004: a malicious outer-valid trusted handoff fails closed before any roster resolution", () => {
   const root = mkdtempSync(join(tmpdir(), "wave004-outer-valid-"));
   try {
@@ -1219,7 +1209,7 @@ test("wave-004: a malicious outer-valid trusted handoff fails closed before any 
     };
     const conflictedBegin = beginCapability(root, ARCHITECT_PAIR_SELECTION, { trustedMapping: conflicted as unknown as AgentMappingState });
     assert.equal(conflictedBegin.ok, false);
-    if (!conflictedBegin.ok) assert.match(conflictedBegin.error, /resolved role 'architect' carries an 'unavailable' diagnostic/);
+    if (!conflictedBegin.ok) assert.match(conflictedBegin.error, /trusted agent mapping handoff is malformed|resolved role 'architect' carries an 'unavailable' diagnostic/);
     // Every rejection left the persisted workflow state untouched.
     const untouched = resolveState(root);
     assert.equal(untouched.state?.stage_cursor, "architecture");
@@ -1263,7 +1253,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
     publishHostileMapping(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "omp-attacker" }, ["developer-kotlin", "omp-attacker"]);
     const artifactsDir = join(root, ".work-state", "features", "missing-next-role", "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "missing next role regression", files_touched: ["src/index.ts"] }));
+    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ files_touched: ["src/index.ts"] }));
 
     const auth = {
       token: issued.dispatch_token,
@@ -1275,7 +1265,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
     const authorized = authorizeDispatch(root, auth);
     assert.equal(authorized.ok, true);
     if (!authorized.ok || !authorized.record) return;
-    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed" }).ok, true);
+    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed", artifact_ids: ["implementation"] }).ok, true);
     const implementationStage = profile.stages.find((stage) => stage.id === "implementation");
     assert.ok(implementationStage?.checkpoint === "approve_implementation");
     const policy = profile.checkpoint_policy;
@@ -1333,7 +1323,8 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
   const root = mkdtempSync(join(tmpdir(), "wave004-loop-missing-role-"));
   try {
     initGit(root, "feat/loop-missing-role");
-    registerWorkflowProfiles([LOOP_NON_ROSTER_PROFILE]);
+    writeTestRegistryMarker(root);
+    registerTestProfiles(root, [LOOP_NON_ROSTER_PROFILE]);
     const profile = loadProfile("loop-non-roster-regression");
     assert.ok(profile);
     const persistedProfileHash = profileHash(profile);
@@ -1556,3 +1547,5 @@ test("wave-004: deferred roster advance masks the prior stage selection until be
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+

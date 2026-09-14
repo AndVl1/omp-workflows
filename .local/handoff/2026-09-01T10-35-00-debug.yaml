@@ -1,0 +1,39 @@
+id: 2026-09-01T10-35-00-debug
+parent: null
+agent: debug
+timestamp: "2026-09-01T10:35:00Z"
+status: completed
+
+context:
+  task: "Canonicalize the positive buildTeamPlan fixture without changing production validation or rejection cases."
+  phase: "validation-release"
+
+output:
+  summary: "Restored the accidentally truncated test file byte-for-byte from HEAD, then updated only the positive decomposition fixture to satisfy fail-closed plan validation."
+  error_type: compilation
+  root_cause:
+    file: packages/core/test/cto-engine.test.ts
+    line: 104
+    issue: "The positive fixture used an unsafe slice string (web client) and omitted explicit scope/profile fields on the frontend entry."
+    explanation: "Current buildTeamPlan validation requires safe slug slices and validates all provided/derived arrays and strings."
+  reproduction:
+    steps:
+      - "Call buildTeamPlan with the former frontend slice web client."
+      - "Observe rejection because the slice is not a safe slug."
+  solution:
+    before: "Frontend entry omitted scope/profile and used slice: web client."
+    after: "Both entries provide canonical scope/profile/worktree/dependency fields; frontend uses slice: web-client."
+  regression_test: "The existing positive buildTeamPlan test now exercises valid arrays, profiles, worktree strategies, safe slices, and dependencies while preserving two-team/dependency semantics."
+  verification:
+    baseline: "HEAD fixture: 67134 bytes, SHA-256 74726fa066de3a9681556470e67bc6dc022e2946175f61685ee36b6f34afb838, 92 test() calls, 4 describe() calls."
+    updated: "Updated fixture: 67220 bytes, SHA-256 348c73c764b61358cca5dcd0605fcbd7a63996af926ece33c8709f6a8c45559f, 92 test() calls, 4 describe() calls."
+    diff_scope: "git diff contains only the two positive fixture lines in cto-engine.test.ts."
+    tests: "Not run per assignment instruction (No commands)."
+
+next:
+  agent: null
+  task: "Main runs the focused/full suite once the validation-release wave is complete."
+  priority: high
+  acceptance_criteria:
+    - "Positive fixture remains canonical and buildTeamPlan accepts it."
+    - "Negative rejection tests and production validation remain unchanged."

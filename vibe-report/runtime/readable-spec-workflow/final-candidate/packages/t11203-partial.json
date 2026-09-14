@@ -1,0 +1,88 @@
+{
+  "evidence": "t11203-partial",
+  "status": "stale_and_incomplete",
+  "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/t11203-partial.log",
+  "sha256": "b43019143d28e2be925f1459350f5f910c2b2f3ecc7d68b7bfba42b48df16163",
+  "counts": {
+    "log_bytes": 195106,
+    "log_lines": 2207,
+    "commands_captured": 3,
+    "commands_not_run": 3
+  },
+  "source_snapshot_start": {
+    "path": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/t11203-source-snapshot-start.json",
+    "digest": "eb7f31fc98f7779935c244a7c9b41b822848354ed9908525461da974b6c0eed3"
+  },
+  "source_snapshot_end": {
+    "path": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/t11203-source-snapshot-end.json",
+    "digest": "543919f7c7a3e4034a2bb60f960b2ad9df9a71013a0dc0bf3b3a75995e138dc8"
+  },
+  "changed_tracked_inputs": [
+    "packages/core/src/commands/cto.ts",
+    "packages/core/src/cto/decisions.ts",
+    "packages/core/src/engine/checkpoints.ts",
+    "packages/core/src/engine/durable.ts",
+    "packages/core/src/engine/state.ts",
+    "packages/core/src/engine/workflow-contract.ts",
+    "packages/core/src/index.ts",
+    "packages/e2e/src/driver.ts"
+  ],
+  "captured_commands": [
+    {
+      "command": "npm run build",
+      "exit_code": 0,
+      "duration_ms": 6953,
+      "sha256": "cbcef300445698106e0b1262f2201f87b49f3e835513124cb64b04fa503128ef",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/t11203-root-build.log",
+      "counts": {
+        "log_bytes": 265,
+        "log_lines": 20,
+        "tests": 0,
+        "passed": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      }
+    },
+    {
+      "command": "npm run typecheck",
+      "exit_code": 0,
+      "duration_ms": 6277,
+      "sha256": "9dbba6b20da9f855e25bc99b19cf8fa3126949959cdf20e7d5e7acd16d47ebbc",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/t11203-root-typecheck.log",
+      "counts": {
+        "log_bytes": 367,
+        "log_lines": 20,
+        "tests": 0,
+        "passed": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      }
+    },
+    {
+      "command": "npm run test:core",
+      "exit_code": 1,
+      "duration_ms": 2235331,
+      "sha256": "9ac5208df7386009780ea8ad6949eb5747d0933d1808cc3c590570e0ee734c02",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/t11203-core-test.log",
+      "counts": {
+        "log_bytes": 192926,
+        "log_lines": 2143,
+        "tests": 1762,
+        "passed": 1748,
+        "failed": 14,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      }
+    }
+  ],
+  "omitted_commands": [
+    "npm run test:fullstack",
+    "npm run test -w @andvl1/omp-workflows-internal",
+    "node --import tsx /tmp/omp-ux-schema-export-check.mjs"
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "validation": "readable-spec-workflow-final-candidate",
+  "scope": "settled-root",
+  "generated_at_utc": "2026-09-10T07:10:12Z",
+  "commands": [
+    {
+      "command": "npm run build",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/settled-root-build.log",
+      "started_at_utc": "2026-09-10T07:07:26Z",
+      "ended_at_utc": "2026-09-10T07:08:24Z",
+      "exit_code": 0,
+      "sha256": "d92f9b3a236279defe191591efca47594b4c2fbc376a92c3e84a80f206adf323"
+    },
+    {
+      "command": "npm run typecheck",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/settled-root-typecheck.log",
+      "started_at_utc": "2026-09-10T07:08:58Z",
+      "ended_at_utc": "2026-09-10T07:09:39Z",
+      "exit_code": 0,
+      "sha256": "7259c6c46b1181b17bb84d417eea140a5e38298412da6cc2b38351e4b64624e9"
+    }
+  ]
+}

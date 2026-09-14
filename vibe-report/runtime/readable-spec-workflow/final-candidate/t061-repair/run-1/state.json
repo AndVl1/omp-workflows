@@ -1,0 +1,283 @@
+{
+  "schema": 1,
+  "branch": "main",
+  "classification": {
+    "type": "SPEC",
+    "complexity": "MEDIUM",
+    "confidence": "HIGH",
+    "autonomous": false,
+    "workflow": "spec-import"
+  },
+  "task": "Read-only external specification compatibility validation",
+  "workflow_override": true,
+  "issue": null,
+  "stage_cursor": "compatibility_approval",
+  "stages": [
+    {
+      "id": "import",
+      "status": "done"
+    },
+    {
+      "id": "constitution",
+      "status": "done"
+    },
+    {
+      "id": "compatibility",
+      "status": "done"
+    },
+    {
+      "id": "compatibility_approval",
+      "status": "in_progress"
+    },
+    {
+      "id": "handoff",
+      "status": "pending"
+    }
+  ],
+  "artifacts": {},
+  "pause": {
+    "kind": "none",
+    "reason": ""
+  },
+  "updated_at": "2026-09-07T23:40:19.541Z",
+  "policy": {
+    "strict_orchestrator": true
+  },
+  "scope": {
+    "has_security": false,
+    "has_infra": false,
+    "scope": [],
+    "has_ui": false,
+    "has_runtime": false,
+    "dev_agent": null
+  },
+  "profile_hash": "ca87a46494ca8a93743f7bf3904352a98a8a277421d55af12600c7bfbacba8ad",
+  "run_key": "import-7e10cfba-dbac-46b9-892b-28904111bce0",
+  "specification": {
+    "schema_version": 3,
+    "feature_id": "imported-payment-retry",
+    "display_name": "imported/payment-retry",
+    "source_kind": "external",
+    "project_root": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-OyYKFN/omp-spec-e2e-complete",
+    "project_root_identity": {
+      "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-OyYKFN/omp-spec-e2e-complete",
+      "dev": 16777234,
+      "ino": 101210757
+    },
+    "path_binding": {
+      "specs": {
+        "relative_path": "specs/imported-payment-retry",
+        "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-OyYKFN/omp-spec-e2e-complete/specs/imported-payment-retry",
+        "dev": 16777234,
+        "ino": 101210995
+      },
+      "feature_state": {
+        "relative_path": ".work-state/features/imported-payment-retry",
+        "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-OyYKFN/omp-spec-e2e-complete/.work-state/features/imported-payment-retry",
+        "dev": 16777234,
+        "ino": 101210996
+      },
+      "artifacts": {
+        "relative_path": ".work-state/features/imported-payment-retry/artifacts",
+        "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-OyYKFN/omp-spec-e2e-complete/.work-state/features/imported-payment-retry/artifacts",
+        "dev": 16777234,
+        "ino": 101210997
+      },
+      "execution_claim": null,
+      "execution_claim_next": null
+    },
+    "workspace_path": "specs/imported-payment-retry",
+    "state_path": ".work-state/features/imported-payment-retry/state.json",
+    "profile_name": "spec-import",
+    "profile_hash": "ca87a46494ca8a93743f7bf3904352a98a8a277421d55af12600c7bfbacba8ad",
+    "constitution_gate_ref": "constitution-gate-023d0798",
+    "constitution_binding": {
+      "provider_id": "native",
+      "path": "CONSTITUTION.md",
+      "version": "0.0.0",
+      "content_sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      "semantic_hash": "35ce12b619924ee68ab11046b5ac497392f2615526e791d52482d5c5257714af",
+      "validation_ref": "constitution.validation.8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      "bound_at": "2026-09-07T23:39:26.571Z"
+    },
+    "language": {
+      "language": "en-US",
+      "source": "project_default",
+      "selection_hash": "587f63b2864bc26fbb1f627c015449cc5b395f78d35e7384876c51cd32f675bd"
+    },
+    "template_set": {
+      "template_set_id": "specification-default",
+      "source": "shipped_default",
+      "content_hash": "5b01f9d8c07f93b2a94f0a4d79fb0d314633a5b5d5cc81ce036f7143a48e0868",
+      "required_markers": []
+    },
+    "phases": [
+      {
+        "phase": "specify",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "plan",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "tasks",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      }
+    ],
+    "status": "in_progress",
+    "next_action": {
+      "kind": "checkpoint",
+      "command": null,
+      "reason": "Compatibility validation passed; the sole hard-human imported compatibility checkpoint is open."
+    },
+    "handoff_ref": null,
+    "execution_claim_prepare_ref": null,
+    "execution_claim_ref": null,
+    "implementation_conformance_ref": null,
+    "import_ref": "import.9347be8efa341f6529aa9c90d19472810cff24e855ab32e6d4dc8c3853bdc7e6",
+    "migration_receipt_ref": null
+  },
+  "state_revision": 7,
+  "completion_intent": {
+    "mode": "handoff_only",
+    "acceptance": "quality_gates_and_artifacts",
+    "source": "workflow_policy",
+    "rationale": "Import ends at one approved shared implementation handoff."
+  },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": [
+      "custom"
+    ],
+    "rules": {
+      "import_compatibility_approval": {
+        "kind": "custom",
+        "default": "required_human",
+        "allowed_decisions": [
+          "approve_continue",
+          "request_changes",
+          "approve_stop"
+        ],
+        "phase": "before_advance",
+        "rationale": "Explicit approval binds exact source and constitution hashes plus feature/run selectors."
+      }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Constitution prerequisite precedes compatibility and no native phases are replayed."
+  },
+  "work_identity": {
+    "run_id": "import-7e10cfba-dbac-46b9-892b-28904111bce0",
+    "wave_id": "legacy-wave-8fecf2f6c675d7873cb149a4",
+    "slice_id": "legacy-slice-compatibility_approval",
+    "session_id": "legacy-session-8fecf2f6c675d7873cb149a4",
+    "workflow": "spec-import",
+    "stage_id": "compatibility_approval",
+    "stage_cursor": "compatibility_approval",
+    "capability_id": "legacy-capability-8fecf2f6c675d7873cb149a4",
+    "capability_epoch": "legacy-epoch-8fecf2f6c675d7873cb149a4",
+    "slot_id": "orchestrator",
+    "task_id": "legacy-task-8fecf2f6c675d7873cb149a4",
+    "dispatch_id": "legacy-dispatch-8fecf2f6c675d7873cb149a4",
+    "attempt": 1,
+    "worker_id": "engine"
+  },
+  "migration": {
+    "id": "migration-99eade3a946f61f4b12102e7",
+    "from_schema": 1,
+    "to_schema": 2,
+    "source_profile_hash": "ca87a46494ca8a93743f7bf3904352a98a8a277421d55af12600c7bfbacba8ad",
+    "target_profile_hash": "ca87a46494ca8a93743f7bf3904352a98a8a277421d55af12600c7bfbacba8ad",
+    "source_policy_hash": null,
+    "target_policy_hash": "b5e6fb19582e03efe0d8b782be1d53eeeb0167371e38224ab1188f2e65d472f5",
+    "legacy_inputs": [
+      "classification.autonomous"
+    ],
+    "warnings": [
+      "completion_intent projected from typed profile or conservative migration default",
+      "checkpoint_policy projected from typed profile or conservative human-required migration policy"
+    ],
+    "status": "complete",
+    "migrated_at": "2026-09-07T23:39:26.841Z"
+  },
+  "control_plane_provenance": {
+    "completion_intent": "state",
+    "checkpoint_policy": "state",
+    "roster_policy": "legacy",
+    "roster_selection": "none",
+    "work_identity": "migration",
+    "pending": "none",
+    "child_join": "none",
+    "completion_envelope": "none",
+    "legacy_inputs": [
+      "classification.autonomous"
+    ],
+    "warnings": [],
+    "status": "migrated"
+  },
+  "cursor_epoch": "f16011c0-12ef-4fda-a12b-6b342c7ccba2",
+  "dispatch_capability": {
+    "capability_id": "fa308072-f5ec-4bb2-83d2-e91ebfcad5df",
+    "dispatch_token_hash": "5794c6516ddfc9bc4c494e0a47e30a7b56a3190665abb1ad3ca96902f120ddd1",
+    "advance_token_hash": "a0924425441404a093891b55ebf6a435cefba415f6550958176d0368c37cf488",
+    "issued_for": {
+      "run_key": "import-7e10cfba-dbac-46b9-892b-28904111bce0",
+      "branch": "main",
+      "workflow": "spec-import",
+      "profile_hash": "ca87a46494ca8a93743f7bf3904352a98a8a277421d55af12600c7bfbacba8ad",
+      "stage_cursor": "compatibility_approval",
+      "cursor_epoch": "f16011c0-12ef-4fda-a12b-6b342c7ccba2"
+    },
+    "kind": "none",
+    "expected_roles": [],
+    "expected_count": 0,
+    "expected_roster": [],
+    "status": "ready",
+    "dispatches": []
+  },
+  "trusted_checkpoint_answers": [
+    {
+      "answer_id": "checkpoint-answer-79d44b6f-4b51-4c8e-a14e-9dd659ac9f22",
+      "nonce": "cb884d57b82917dda9127c6e4d660fd14a03e02b8aab39fb90517f8e337c4e0f",
+      "channel": "terminal",
+      "reference": "terminal:workflow_checkpoint_ask_selected:checkpoint-answer-79d44b6f-4b51-4c8e-a14e-9dd659ac9f22",
+      "run_id": "import-7e10cfba-dbac-46b9-892b-28904111bce0",
+      "stage_id": "compatibility_approval",
+      "checkpoint_id": "import_compatibility_approval",
+      "work_identity_hash": "18c3c2d5ad59ea3a846a515e3a08e634175c0ac4f5ba6a4091c32b54c1e824b6",
+      "capability_id": "fa308072-f5ec-4bb2-83d2-e91ebfcad5df",
+      "capability_epoch": "f16011c0-12ef-4fda-a12b-6b342c7ccba2",
+      "policy_hash": "b5e6fb19582e03efe0d8b782be1d53eeeb0167371e38224ab1188f2e65d472f5",
+      "feature_id": "imported-payment-retry",
+      "loop_iteration": 1,
+      "subject_binding": "598d6c209eb3145374410989a530900aeed48402b8263d97d2eb3ca61ead182c",
+      "subject_revision": 6,
+      "decision": "approve_continue",
+      "binding": "dc4f34ba1a7db9f18a43ee278ff8f5ce1a53cbf9fc7a1a6803912fc593f223aa",
+      "issued_at": "2026-09-07T23:40:19.530Z"
+    }
+  ]
+}

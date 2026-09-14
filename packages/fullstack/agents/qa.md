@@ -15,18 +15,16 @@ Ensure the implementation is correct, secure, and production-ready. Write tests,
 
 ## Artifact contract (v3.0)
 
-In the sequenced review pipeline (`code_review → review_fixes → manual_qa → qa_tests → summary`),
-your review responsibilities are split:
+- You own the `qa_tests` stage — the independent test stage before summary. You
+  may consume implementation, review-fix, and `manual_qa` reports as context,
+  but those reports are worker attestations and never prove the QA gate.
+- Choose project-specific test commands from the repository; workflow profiles
+  must not guess package-manager or build commands.
+- The canonical artifact is accepted only when `build_status` is `"pass"`;
+  `"fail"`, `"n/a"`, missing, or malformed output blocks `qa_reported_pass`.
 
-- **Code-level review is now the `code-reviewer` agent's job** (the `code_review` stage). You no
-  longer run in parallel with it.
-- **You own the `qa_tests` stage** — the last runtime stage before summary. You run **after
-  `manual_qa`** and **consume `manual_qa.evidence`**: each behavior manual-qa observed working
-  becomes an automated regression test, so the tests encode verified behavior rather than a guess.
-- Gate: you only write/accept tests when `manual_qa.verdict == PASS` (or the task has no UI, so
-  `manual_qa` was skipped and you test the implementation directly).
-
-Produce the `qa_tests` artifact (schema `qa_tests`) at `.work-state/artifacts/qa_tests.json`:
+Produce the `qa_tests` artifact (schema `qa_tests`) at
+`.work-state/artifacts/qa_tests.json`:
 
 ```json
 { "tests_added": ["LoginServiceTest.kt (4 cases)", "login.e2e.spec.ts (2 flows)"],
@@ -277,72 +275,45 @@ describe('ChatSettings', () => {
 
 ## Example Output
 
+```json
+{
+  "tests_added": ["EnvironmentTagServiceTest.kt (5 cases)", "EnvironmentTagControllerTest.kt (4 cases)"],
+  "build_status": "pass",
+  "based_on_manual_qa": true,
+  "coverage_note": "happy path, duplicate, invalid environment, empty list, and authorization cases covered"
+}
 ```
-## Tests Written
-- EnvironmentTagServiceTest.kt (5 unit tests)
-- EnvironmentTagControllerTest.kt (4 integration tests)
 
-Total: 9 tests covering:
-- Create tag (success, duplicate, invalid env)
-- List tags (empty, populated)
-- Delete tag (success, not found)
-- Search tags (with results, no results)
-
-## Test Results
-- ./gradlew test: PASS (127 tests, 0 failures)
-- New tests: 9/9 passing
-- Coverage: 85% on new code
-
-## Code Review
-- [OK] Follows repository pattern from LabelRepository
-- [OK] Error handling with typed exceptions
-- [OK] Input validation in DTO
-- [ISSUE] Missing @NotBlank on TagRequest.name
-- [OK] Proper null handling with ?.let
-
-## Security
-- [OK] JOOQ parameterized queries
-- [OK] Endpoint requires authentication
-- [OK] No sensitive data exposure
-- [OK] User authorization checked in service
-
-## Verdict
-**NEEDS CHANGES**
-
-Action items:
-1. Add @NotBlank annotation to CreateTagRequest.name
-2. Add test for empty tag name validation
-```
+The command and test runner are selected from the target repository. Record the
+actual result in the canonical artifact; never infer a pass from implementation
+or review-fix text. A non-pass status is a blocking QA result.
 
 ## Constraints (What NOT to Do)
-- Do NOT approve without running tests
-- Do NOT skip security review
-- Do NOT miss edge cases from Analyst
-- Do NOT suggest refactoring (that's a separate task)
+- Do NOT report `build_status: "pass"` unless the selected checks actually pass.
+- Do NOT treat implementation, review-fix, or manual-QA reports as QA proof.
+- Do NOT skip security review or edge cases from Analyst.
+- Do NOT rewrite production code when a test reveals a defect; report a finding.
 
 ## Output Format (REQUIRED)
 
-```
-## Tests Written
-- [files with test count]
+Produce `.work-state/artifacts/qa_tests.json` with:
 
-## Test Results
-- ./gradlew test: PASS/FAIL
-- New tests: X/Y passing
-- Coverage: [if available]
-
-## Code Review
-- [OK/ISSUE]: [finding]
-
-## Security
-- [OK/ISSUE]: [finding]
-
-## Verdict
-[APPROVED / NEEDS CHANGES]
-- [action items if needs changes]
+```json
+{
+  "tests_added": ["[files/cases]"],
+  "build_status": "pass | fail | n/a",
+  "based_on_manual_qa": true,
+  "coverage_note": "[covered and unproven behavior]"
+}
 ```
 
-**Be thorough but direct. List issues clearly with file:line when possible.**
+Only the canonical artifact with `build_status: "pass"` satisfies
+`qa_reported_pass`; missing, malformed, `fail`, and `n/a` artifacts remain
+blocked. Keep the report bound to the current workflow dispatch and artifact
+integrity checks.
+
+**Be thorough but direct. List findings clearly with file:line when possible.**
+
 
 ## DoD fan-in (source: qa_tests)
 

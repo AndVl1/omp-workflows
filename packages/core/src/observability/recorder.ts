@@ -8,21 +8,22 @@
  * so the recorder is re-entrant and stateless between calls.
  *
  * Storage strategy:
- *   - events.jsonl: line-delimited JSON, one event per line, append-only
+ *   - events.jsonl: bounded, descriptor-anchored JSONL with deterministic
+ *     suffix compaction at record and aggregate-byte limits
  *   - rollup: in-memory only here; persisted via TeamState.observability
  *     by the engine's `writeState`. The recorder is the producer, the engine
  *     is the persister.
  *
- * Concurrency: appendFileSync is atomic for small writes (< PIPE_BUF on
- * POSIX). For multi-event hook bursts, we serialize via a single async
- * queue (no parallel writes). The recorder API is async to make the queue
- * contract explicit at the call site. Tests use `await recorder.flush()` to
- * drain the queue without real timers.
+ * Concurrency: every append takes a bounded, fenced lock under the pinned
+ * feature directory, reads a bounded snapshot, then commits a complete
+ * compacted JSONL image atomically. This avoids interleaving and leaves either
+ * the old image or the new image after a crash.
  */
 
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { PinnedProjectRoot, PinnedRootError, processStartIdentity } from "../specification/pinned-root.js";
+import { withoutCurrentExecutionLiveness } from "../execution-liveness.js";
+import { isAbsolute, join } from "node:path";
 import {
   emptyRollup,
   type EventKind,
@@ -42,11 +43,24 @@ import type {
 
 const OBSERVABILITY_DIR = "observability";
 const EVENTS_FILENAME = "events.jsonl";
+const OBSERVABILITY_PATH = ".work-state/features";
+export const OBSERVABILITY_MAX_EVENT_BYTES = 64 * 1024;
+export const OBSERVABILITY_MAX_LOG_BYTES = 2 * 1024 * 1024;
+export const OBSERVABILITY_MAX_RECORDS = 5000;
+export const OBSERVABILITY_MAX_AGGREGATE_BYTES = 2 * 1024 * 1024;
+export const OBSERVABILITY_MAX_READ_BYTES = 8 * 1024 * 1024;
+const MAX_POINTER_BYTES = 64 * 1024;
+const MAX_LOCK_BYTES = 64 * 1024;
+const LOCK_ATTEMPTS = 128;
+const LOCK_RETRY_MS = 5;
+const MAX_JSON_DEPTH = 32;
+const SELF_START_IDENTITY = processStartIdentity();
+const MAX_EVENT_BYTES = OBSERVABILITY_MAX_EVENT_BYTES;
+const MAX_LOG_BYTES = OBSERVABILITY_MAX_LOG_BYTES;
+const MAX_RECORDS = OBSERVABILITY_MAX_RECORDS;
+const MAX_AGGREGATE_BYTES = OBSERVABILITY_MAX_AGGREGATE_BYTES;
+const MAX_PINNED_READ_BYTES = OBSERVABILITY_MAX_READ_BYTES;
 
-function isWithinTree(root: string, candidate: string): boolean {
-  const rel = relative(root, candidate);
-  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
-}
 
 function isSafeFeatureSlug(value: string): boolean {
   return value.length > 0 && /^[A-Za-z0-9._-]+$/.test(value);
@@ -119,15 +133,18 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-function relativeSafePath(root: string, value: unknown): string | undefined {
+function relativeSafePath(root: PinnedProjectRoot, value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const raw = value.replace(/\\/g, "/").trim();
   if (!raw || /[\u0000-\u001f\u007f]/.test(raw) || /^[A-Za-z]:\//.test(raw)) return undefined;
-  const candidate = resolve(root, raw);
-  if (!isWithinTree(resolve(root), candidate)) return undefined;
-  const rel = relative(resolve(root), candidate);
-  if (!rel || rel === "." || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
-  return normalize(rel).split(sep).join("/");
+  try {
+    const candidate = isAbsolute(raw) ? raw : root.anchorPath(raw);
+    const relativePath = root.relativePath(candidate);
+    if (!relativePath || relativePath === "." || relativePath === "..") return undefined;
+    return relativePath.split(/[\\/]/u).join("/");
+  } catch {
+    return undefined;
+  }
 }
 
 function identityFrom(value: unknown): WorkIdentity | undefined {
@@ -195,7 +212,7 @@ function dispatchIdentityKey(event: Pick<ObservabilityEvent, "work_identity">): 
   return identity ? `${workTupleKey(identity) ?? ""}\u001f${identity.dispatch_id}` : undefined;
 }
 
-function sanitizeArtifactSummary(root: string, value: unknown): ObservabilityArtifactSummary | undefined {
+function sanitizeArtifactSummary(root: PinnedProjectRoot, value: unknown): ObservabilityArtifactSummary | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
   const artifactId = safeIdentifier(record.artifact_id ?? record.artifactId);
@@ -210,11 +227,11 @@ function sanitizeArtifactSummary(root: string, value: unknown): ObservabilityArt
   };
   if (Number.isSafeInteger(bytes) && Number(bytes) >= 0) summary.bytes = Number(bytes);
   if (record.schema_status === "met" || record.schema_status === "failed") summary.schema_status = record.schema_status;
-  if (record.dod_status === "met" || record.dod_status === "pending" || record.dod_status === "failed") summary.dod_status = record.dod_status;
+  if (record.quality_gate_status === "met" || record.quality_gate_status === "pending" || record.quality_gate_status === "failed") summary.quality_gate_status = record.quality_gate_status;
   return summary;
 }
 
-function sanitizeCompletionEnvelope(root: string, value: unknown): CompletionEnvelope | undefined {
+function sanitizeCompletionEnvelope(root: PinnedProjectRoot, value: unknown): CompletionEnvelope | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
   const identity = identityFrom(record.identity);
@@ -233,7 +250,7 @@ function sanitizeCompletionEnvelope(root: string, value: unknown): CompletionEnv
       path: summary.path,
       sha256: summary.sha256,
       schema_status: summary.schema_status ?? "failed",
-      dod_status: summary.dod_status ?? "failed",
+      quality_gate_status: summary.quality_gate_status ?? "failed",
     });
   }
   const completedBy = record.completed_by;
@@ -259,7 +276,7 @@ function sanitizeCompletionEnvelope(root: string, value: unknown): CompletionEnv
   };
 }
 
-function sanitizeEvent(root: string, event: unknown): Omit<ObservabilityEvent, "id" | "branch"> {
+function sanitizeEvent(root: PinnedProjectRoot, event: unknown): Omit<ObservabilityEvent, "id" | "branch"> {
   const source = asRecord(event);
   if (!source) throw new Error("observability event must be an object");
   const kind = source.kind;
@@ -332,7 +349,7 @@ function sanitizeEvent(root: string, event: unknown): Omit<ObservabilityEvent, "
         path: ref.path,
         sha256: ref.sha256,
         schema_status: ref.schema_status,
-        dod_status: ref.dod_status,
+        quality_gate_status: ref.quality_gate_status,
       })).slice(0, MAX_ARTIFACTS);
     }
   }
@@ -423,6 +440,168 @@ function canonicalize(value: unknown): unknown {
   }
   return value;
 }
+function decodeUtf8(bytes: Uint8Array, what: string): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (error) {
+    throw new PinnedRootError("invalid", `${what} is not valid UTF-8: ${String(error)}`);
+  }
+}
+
+export interface BoundedObservabilityParseOptions {
+  maxBytes?: number;
+  maxRecords?: number;
+  maxEventBytes?: number;
+  maxAggregateBytes?: number;
+  maxWork?: number;
+}
+function jsonDepthWithin(value: unknown, maxDepth: number): boolean {
+  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (!current.value || typeof current.value !== "object") continue;
+    const depth = current.depth + 1;
+    if (depth > maxDepth) return false;
+    for (const nested of Object.values(current.value as Record<string, unknown>)) {
+      pending.push({ value: nested, depth });
+    }
+  }
+  return true;
+}
+
+export function parseBoundedObservabilityEvents(
+  bytes: Uint8Array,
+  options: BoundedObservabilityParseOptions = {},
+): ObservabilityEvent[] {
+  const maxBytes = options.maxBytes ?? MAX_PINNED_READ_BYTES;
+  const maxRecords = options.maxRecords ?? MAX_RECORDS;
+  const maxEventBytes = options.maxEventBytes ?? MAX_EVENT_BYTES;
+  const maxAggregateBytes = options.maxAggregateBytes ?? MAX_AGGREGATE_BYTES;
+  const maxWork = options.maxWork ?? maxBytes * 4;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_PINNED_READ_BYTES
+    || !Number.isSafeInteger(maxRecords) || maxRecords <= 0 || maxRecords > MAX_RECORDS
+    || !Number.isSafeInteger(maxEventBytes) || maxEventBytes <= 0 || maxEventBytes > MAX_PINNED_READ_BYTES
+    || !Number.isSafeInteger(maxAggregateBytes) || maxAggregateBytes <= 0 || maxAggregateBytes > MAX_PINNED_READ_BYTES
+    || !Number.isSafeInteger(maxWork) || maxWork <= 0 || maxWork > MAX_PINNED_READ_BYTES * 4) {
+    throw new PinnedRootError("invalid", "bounded observability parser limits are invalid");
+  }
+  if (bytes.byteLength > maxBytes) throw new PinnedRootError("limit", "observability event log exceeds its bounded read limit");
+  const text = decodeUtf8(bytes, "observability event log");
+  const ring: Array<{ event: ObservabilityEvent; bytes: number } | undefined> = new Array(maxRecords);
+  let count = 0;
+  let start = 0;
+  let retainedBytes = 0;
+  let work = 0;
+  let offset = 0;
+  while (offset < text.length) {
+    const end = text.indexOf("\n", offset);
+    const lineEnd = end < 0 ? text.length : end;
+    const line = text.slice(offset, lineEnd);
+    offset = end < 0 ? text.length : end + 1;
+    const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+    work += lineBytes;
+    if (work > maxWork) throw new PinnedRootError("limit", "observability event log exceeded its bounded parse-work limit");
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (lineBytes > maxEventBytes) throw new PinnedRootError("limit", "observability event exceeds the bounded event-byte limit");
+    if (lineBytes > maxAggregateBytes) throw new PinnedRootError("limit", "observability event cannot fit the bounded aggregate-byte limit");
+    try {
+      const value: unknown = JSON.parse(trimmed);
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      if (!jsonDepthWithin(value, MAX_JSON_DEPTH)) throw new PinnedRootError("limit", "observability event JSON depth exceeds its bounded limit");
+      const record = { event: value as ObservabilityEvent, bytes: lineBytes };
+      if (count < maxRecords) {
+        ring[(start + count) % maxRecords] = record;
+        count += 1;
+      } else {
+        const replaced = ring[start];
+        if (replaced) retainedBytes -= replaced.bytes;
+        ring[start] = record;
+        start = (start + 1) % maxRecords;
+      }
+      retainedBytes += lineBytes;
+      while (retainedBytes > maxAggregateBytes && count > 0) {
+        const removed = ring[start];
+        if (!removed) break;
+        ring[start] = undefined;
+        start = (start + 1) % maxRecords;
+        count -= 1;
+        retainedBytes -= removed.bytes;
+      }
+    } catch (error) {
+      if (error instanceof PinnedRootError) throw error;
+      // Preserve compatibility with older logs: malformed JSON records are
+      // ignored, while invalid UTF-8 and unsafe storage remain fatal.
+    }
+  }
+  const events: ObservabilityEvent[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const record = ring[(start + index) % maxRecords];
+    if (record) events.push(record.event);
+  }
+  return events;
+}
+
+function serializedEvent(event: ObservabilityEvent, maxEventBytes: number): Buffer {
+  let text: string;
+  try {
+    text = JSON.stringify(event);
+  } catch (error) {
+    throw new PinnedRootError("invalid", `observability event is not serializable: ${String(error)}`);
+  }
+  if (typeof text !== "string") throw new PinnedRootError("invalid", "observability event is not serializable");
+  const bytes = Buffer.from(`${text}\n`, "utf8");
+  if (bytes.byteLength > maxEventBytes) throw new PinnedRootError("limit", "observability event exceeds the bounded event-byte limit");
+  return bytes;
+}
+
+function validateBound(value: number | undefined, fallback: number, max: number, label: string): number {
+  const result = value ?? fallback;
+  if (!Number.isSafeInteger(result) || result <= 0 || result > max) {
+    throw new PinnedRootError("invalid", `${label} bound is invalid`);
+  }
+  return result;
+}
+
+function ownerIsStale(owner: unknown): boolean {
+  if (!owner || typeof owner !== "object" || Array.isArray(owner)) return false;
+  const value = owner as { pid?: unknown; start_identity?: unknown };
+  if (!Number.isSafeInteger(value.pid) || (value.pid as number) <= 0 || typeof value.start_identity !== "string" || value.start_identity.length === 0) return false;
+  try {
+    process.kill(value.pid as number, 0);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ESRCH";
+  }
+  const currentIdentity = processStartIdentity(value.pid as number);
+  return currentIdentity !== null && currentIdentity !== value.start_identity;
+}
+
+
+function compactRecent(
+  events: ReadonlyArray<ObservabilityEvent>,
+  maxRecords: number,
+  maxBytes: number,
+  maxAggregateBytes: number,
+  maxEventBytes: number,
+): ObservabilityEvent[] {
+  const byteBudget = Math.min(maxBytes, maxAggregateBytes);
+  const retained: ObservabilityEvent[] = [];
+  let totalBytes = 0;
+  for (let index = events.length - 1; index >= 0 && retained.length < maxRecords; index -= 1) {
+    const event = events[index]!;
+    const bytes = serializedEvent(event, maxEventBytes);
+    if (totalBytes + bytes.byteLength > byteBudget) {
+      if (retained.length === 0) throw new PinnedRootError("limit", "observability event cannot fit the bounded log-byte limit");
+      break;
+    }
+    retained.push(event);
+    totalBytes += bytes.byteLength;
+  }
+  retained.reverse();
+  return retained;
+}
+
 
 function replayKey(event: ObservabilityEvent): string | undefined {
   if (!event.idempotency_key && !isPendingClaim(event) && !isTerminalClaim(event) && !event.retry_of) return undefined;
@@ -439,6 +618,16 @@ export interface RecorderOptions {
   branch: string;
   /** Feature slug (under `.work-state/features/<slug>/`). */
   featureSlug?: string;
+  /** Borrow an already pinned root; ownership remains with the caller. */
+  pinnedRoot?: PinnedProjectRoot;
+  /** Maximum encoded bytes for one event including its JSONL newline. */
+  maxEventBytes?: number;
+  /** Maximum encoded bytes retained in events.jsonl. */
+  maxLogBytes?: number;
+  /** Maximum number of retained records. */
+  maxRecords?: number;
+  /** Maximum aggregate encoded bytes retained by compaction. */
+  maxAggregateBytes?: number;
   /**
    * Optional id generator. Default: monotonic counter + Date.now base.
    * Tests inject a deterministic generator to keep ids stable.
@@ -449,27 +638,56 @@ export interface RecorderOptions {
 let staticCounter = 0;
 
 export class EventRecorder {
-  private readonly cwd: string;
   private readonly branch: string;
   private readonly featureSlug: string;
   private readonly nextId: () => string;
+  private readonly pinnedRoot: PinnedProjectRoot;
+  private readonly ownsPinnedRoot: boolean;
+  private readonly eventsRelativePath: string;
+  private readonly lockRelativePath: string;
   private readonly eventsPath: string;
+  private readonly maxEventBytes: number;
+  private readonly maxLogBytes: number;
+  private readonly maxRecords: number;
+  private readonly maxAggregateBytes: number;
   private queue: Promise<void> = Promise.resolve();
 
   constructor(opts: RecorderOptions) {
-    this.cwd = opts.cwd;
     this.branch = opts.branch;
     this.featureSlug = opts.featureSlug ?? "default";
+    if (!isSafeFeatureSlug(this.featureSlug)) throw new PinnedRootError("invalid", "unsafe observability feature slug");
+    this.maxEventBytes = validateBound(opts.maxEventBytes, MAX_EVENT_BYTES, MAX_PINNED_READ_BYTES, "event-byte");
+    this.maxLogBytes = validateBound(opts.maxLogBytes, MAX_LOG_BYTES, MAX_PINNED_READ_BYTES, "log-byte");
+    this.maxRecords = validateBound(opts.maxRecords, MAX_RECORDS, MAX_RECORDS, "record-count");
+    this.maxAggregateBytes = validateBound(opts.maxAggregateBytes, MAX_AGGREGATE_BYTES, MAX_PINNED_READ_BYTES, "aggregate-byte");
     this.nextId =
       opts.nextId ??
       ((): string => {
         const n = staticCounter++;
         return `evt-${Date.now().toString(36)}-${n.toString(36)}`;
       });
-    this.eventsPath = this.resolveEventsPath();
+    const suppliedRoot = opts.pinnedRoot;
+    const openedRoot = suppliedRoot ?? PinnedProjectRoot.open(opts.cwd);
+    if (!openedRoot) throw new PinnedRootError("unsupported", "project root could not be pinned for observability");
+    this.pinnedRoot = openedRoot;
+    this.ownsPinnedRoot = suppliedRoot === undefined;
+    this.eventsRelativePath = join(OBSERVABILITY_PATH, this.featureSlug, OBSERVABILITY_DIR, EVENTS_FILENAME);
+    this.lockRelativePath = join(OBSERVABILITY_PATH, this.featureSlug, OBSERVABILITY_DIR, `.${EVENTS_FILENAME}.lock`);
+    try {
+      this.pinnedRoot.ensureDirectory(join(OBSERVABILITY_PATH, this.featureSlug, OBSERVABILITY_DIR));
+      this.eventsPath = this.pinnedRoot.anchorPath(this.eventsRelativePath);
+    } catch (error) {
+      if (this.ownsPinnedRoot) this.pinnedRoot.close();
+      throw error;
+    }
   }
 
-  /** Absolute path of the events.jsonl file. */
+  /** Close an owned root. Borrowed roots remain owned by the caller. */
+  close(): void {
+    if (this.ownsPinnedRoot) this.pinnedRoot.close();
+  }
+
+  /** Absolute descriptor anchor for compatibility with existing readers/tests. */
   get path(): string {
     return this.eventsPath;
   }
@@ -484,12 +702,13 @@ export class EventRecorder {
 
   /** Append a single event. Invalid lifecycle evidence rejects this promise. */
   append(event: Omit<ObservabilityEvent, "id" | "branch">): Promise<ObservabilityEvent> {
-    const normalized = sanitizeEvent(this.cwd, event);
+    const normalized = sanitizeEvent(this.pinnedRoot, event);
     const fullEvent: ObservabilityEvent = {
       ...normalized,
       id: this.nextId(),
       branch: safeIdentifier(this.branch) ?? "(unknown)",
     };
+    serializedEvent(fullEvent, this.maxEventBytes);
     const operation = this.queue.then(() => this.writeOne(fullEvent));
     this.queue = operation.then(
       () => undefined,
@@ -498,25 +717,26 @@ export class EventRecorder {
     return operation;
   }
 
-  /** Read the full event log (small files expected; bounded by session length). */
+  /** Read the bounded event log through the pinned root. */
   readAll(): ObservabilityEvent[] {
-    if (!existsSync(this.eventsPath)) return [];
-    const text = readFileSync(this.eventsPath, "utf8");
-    const out: ObservabilityEvent[] = [];
-    for (const line of text.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        out.push(JSON.parse(trimmed) as ObservabilityEvent);
-      } catch {
-        // best-effort: skip corrupt lines rather than throw
-      }
-    }
-    return out;
+    if (!this.pinnedRoot.isStable()) throw new PinnedRootError("changed", "pinned project root changed before observability read");
+    const info = this.pinnedRoot.pathEntryInfo(this.eventsRelativePath);
+    if (info === null) return [];
+    if (info.kind === "symlink") throw new PinnedRootError("path_unauthorized", "observability event log must not be a symbolic link");
+    if (info.kind !== "file") throw new PinnedRootError("not_regular", "observability event log must be a regular file");
+    const read = this.pinnedRoot.readFile(this.eventsRelativePath, { maxBytes: MAX_PINNED_READ_BYTES });
+    if (!this.pinnedRoot.isStable()) throw new PinnedRootError("changed", "pinned project root changed after observability read");
+    const events = parseBoundedObservabilityEvents(read.bytes, {
+      maxBytes: MAX_PINNED_READ_BYTES,
+      maxRecords: this.maxRecords,
+      maxEventBytes: this.maxEventBytes,
+      maxAggregateBytes: Math.min(this.maxLogBytes, this.maxAggregateBytes),
+    });
+    return compactRecent(events, this.maxRecords, this.maxLogBytes, this.maxAggregateBytes, this.maxEventBytes);
   }
 
   /**
-   * Build the rollup by reading the full event log. Used on first append
+   * Build the rollup by reading the bounded event log. Used on first append
    * if no prior rollup is supplied.
    */
   buildRollup(): ObservabilityRollup {
@@ -539,80 +759,108 @@ export class EventRecorder {
     };
   }
 
-  private resolveEventsPath(): string {
-    if (!isSafeFeatureSlug(this.featureSlug)) throw new Error("unsafe observability feature slug");
-    const projectRoot = realpathSync(resolve(this.cwd));
-    const wsDir = resolve(this.cwd, ".work-state");
-    mkdirSync(wsDir, { recursive: true });
-    const realWorkState = realpathSync(wsDir);
-    if (!isWithinTree(projectRoot, realWorkState)) throw new Error("observability path escapes project root");
-    const featuresDir = join(wsDir, "features");
-    mkdirSync(featuresDir, { recursive: true });
-    const realFeatures = realpathSync(featuresDir);
-    if (!isWithinTree(realWorkState, realFeatures)) throw new Error("observability features path escapes .work-state");
-    const featureDir = join(featuresDir, this.featureSlug);
-    if (existsSync(featureDir) && !isWithinTree(realFeatures, realpathSync(featureDir))) {
-      throw new Error("observability feature path escapes .work-state/features");
-    }
-    mkdirSync(featureDir, { recursive: true });
-    const realFeature = realpathSync(featureDir);
-    if (!isWithinTree(realFeatures, realFeature)) throw new Error("observability feature path escapes .work-state/features");
-    const obsDir = join(featureDir, OBSERVABILITY_DIR);
-    if (existsSync(obsDir) && !isWithinTree(realFeature, realpathSync(obsDir))) {
-      throw new Error("observability directory escapes feature path");
-    }
-    mkdirSync(obsDir, { recursive: true });
-    const realObs = realpathSync(obsDir);
-    if (!isWithinTree(realFeature, realObs)) throw new Error("observability directory escapes feature path");
-    const eventsPath = join(realObs, EVENTS_FILENAME);
-    if (existsSync(eventsPath) && !isWithinTree(realObs, realpathSync(eventsPath))) {
-      throw new Error("observability event log escapes feature path");
-    }
-    return eventsPath;
-  }
-
-  private assertEventsPathSafe(): void {
-    const projectRoot = realpathSync(resolve(this.cwd));
-    const realWorkState = realpathSync(resolve(this.cwd, ".work-state"));
-    const realFeatures = realpathSync(join(realWorkState, "features"));
-    const realFeature = realpathSync(join(realFeatures, this.featureSlug));
-    const realObs = realpathSync(dirname(this.eventsPath));
-    if (!isWithinTree(projectRoot, realWorkState) || !isWithinTree(realWorkState, realFeatures) || !isWithinTree(realFeatures, realFeature) || !isWithinTree(realFeature, realObs)) {
-      throw new Error("observability event path escapes project state");
-    }
-    if (existsSync(this.eventsPath) && !isWithinTree(realObs, realpathSync(this.eventsPath))) {
-      throw new Error("observability event log escapes feature path");
-    }
-  }
-
   private relativePath(): string {
     return join(OBSERVABILITY_DIR, EVENTS_FILENAME);
   }
 
-  private async writeOne(event: ObservabilityEvent): Promise<ObservabilityEvent> {
-    this.assertEventsPathSafe();
-    mkdirSync(dirname(this.eventsPath), { recursive: true });
-    const existing = this.readAll();
-    const candidateReplayKey = replayKey(event);
-    if (candidateReplayKey) {
-      const replay = existing.find((candidate) => replayKey(candidate) === candidateReplayKey);
-      if (replay) return replay;
+  private async reclaimStaleLock(): Promise<void> {
+    let observed;
+    try {
+      observed = this.pinnedRoot.readFile(this.lockRelativePath, { maxBytes: MAX_LOCK_BYTES });
+    } catch (error) {
+      if (error instanceof PinnedRootError && error.code === "not_found") return;
+      return;
     }
+    let owner: unknown;
+    try {
+      owner = JSON.parse(decodeUtf8(observed.bytes, "observability lock"));
+    } catch {
+      return;
+    }
+    if (!ownerIsStale(owner)) return;
+    try {
+      withoutCurrentExecutionLiveness(() => this.pinnedRoot.removeFileIfMatches(this.lockRelativePath, {
+        dev: observed.dev,
+        ino: observed.ino,
+        sha256: createHash("sha256").update(observed.bytes).digest("hex"),
+      }));
+    } catch {
+      // A replacement lock or root change wins; the next bounded attempt will
+      // observe the current state again.
+    }
+  }
+  private async acquireLock(): Promise<{ token: string }> {
+    const token = randomUUID();
+    const owner = JSON.stringify({
+      schema_version: 1,
+      token,
+      pid: process.pid,
+      start_identity: SELF_START_IDENTITY,
+      operation: "observability_append",
+    });
+    for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
+      if (this.pinnedRoot.tryAcquireExclusiveLock(
+        `${this.lockRelativePath}.${randomUUID()}.candidate`,
+        this.lockRelativePath,
+        `${owner}\n`,
+      )) return { token };
+      await this.reclaimStaleLock();
+      if (attempt + 1 < LOCK_ATTEMPTS) await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, LOCK_RETRY_MS));
+    }
+    throw new PinnedRootError("write_failed", "observability event log lock could not be acquired within the bounded retry budget");
+  }
+
+  private serializeLog(events: ReadonlyArray<ObservabilityEvent>): Buffer {
+    const encoded = events.map((event) => serializedEvent(event, this.maxEventBytes));
+    const total = encoded.reduce((sum, bytes) => sum + bytes.byteLength, 0);
+    const budget = Math.min(this.maxLogBytes, this.maxAggregateBytes);
+    if (total > budget) throw new PinnedRootError("limit", "observability event log exceeds its bounded byte budget");
+    return Buffer.concat(encoded, total);
+  }
+
+  private async writeOne(event: ObservabilityEvent): Promise<ObservabilityEvent> {
     const evidenceError = envelopeError(event);
     if (evidenceError) throw new Error(evidenceError);
-    const retryError = retryLinkError(existing, event);
-    if (retryError) throw new Error(retryError);
-    const dispatchKey = dispatchIdentityKey(event);
-    if (dispatchKey && (isPendingClaim(event) || isTerminalClaim(event))) {
-      const conflicting = existing.find((candidate) =>
-        dispatchIdentityKey(candidate) === dispatchKey
-        && (isPendingClaim(candidate) || isTerminalClaim(candidate))
-        && replayKey(candidate) !== candidateReplayKey,
-      );
-      if (conflicting) throw new Error("conflicting observability replay for dispatch identity");
+    const lock = await this.acquireLock();
+    let primaryError: unknown = null;
+    try {
+      if (!this.pinnedRoot.isStable()) throw new PinnedRootError("changed", "pinned project root changed before observability append");
+      const existing = this.readAll();
+      const candidateReplayKey = replayKey(event);
+      if (candidateReplayKey) {
+        const replay = existing.find((candidate) => replayKey(candidate) === candidateReplayKey);
+        if (replay) return replay;
+      }
+      const retryError = retryLinkError(existing, event);
+      if (retryError) throw new Error(retryError);
+      const dispatchKey = dispatchIdentityKey(event);
+      if (dispatchKey && (isPendingClaim(event) || isTerminalClaim(event))) {
+        const conflicting = existing.find((candidate) =>
+          dispatchIdentityKey(candidate) === dispatchKey
+          && (isPendingClaim(candidate) || isTerminalClaim(candidate))
+          && replayKey(candidate) !== candidateReplayKey,
+        );
+        if (conflicting) throw new Error("conflicting observability replay for dispatch identity");
+      }
+      const retained = compactRecent([...existing, event], this.maxRecords, this.maxLogBytes, this.maxAggregateBytes, this.maxEventBytes);
+      const encoded = this.serializeLog(retained);
+      this.pinnedRoot.writeAtomic(this.eventsRelativePath, encoded);
+      const committed = this.pinnedRoot.readFile(this.eventsRelativePath, { maxBytes: MAX_PINNED_READ_BYTES });
+      if (Buffer.compare(Buffer.from(committed.bytes), encoded) !== 0) {
+        throw new PinnedRootError("changed", "observability event log changed during append");
+      }
+      if (!this.pinnedRoot.isStable()) throw new PinnedRootError("changed", "pinned project root changed after observability append");
+      return event;
+    } catch (error) {
+      primaryError = error;
+      throw error;
+    } finally {
+      try {
+        withoutCurrentExecutionLiveness(() => this.pinnedRoot.releaseExclusiveLock(this.lockRelativePath, lock.token));
+      } catch (error) {
+        if (primaryError === null) throw error;
+      }
     }
-    appendFileSync(this.eventsPath, JSON.stringify(event) + "\n", "utf8");
-    return event;
   }
 }
 
@@ -694,51 +942,62 @@ export function readObservabilityPointer(
   cwd: string,
   featureSlug: string,
 ): ObservabilityPointer | null {
-  const eventsPath = resolve(
-    cwd,
-    ".work-state",
-    "features",
-    featureSlug,
-    OBSERVABILITY_DIR,
-    EVENTS_FILENAME,
-  );
-  if (!existsSync(eventsPath)) return null;
-  const text = readFileSync(eventsPath, "utf8");
-  const events: ObservabilityEvent[] = [];
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      events.push(JSON.parse(trimmed) as ObservabilityEvent);
-    } catch {
-      // skip
-    }
+  if (!isSafeFeatureSlug(featureSlug)) throw new PinnedRootError("invalid", "unsafe observability feature slug");
+  const pinnedRoot = PinnedProjectRoot.open(cwd);
+  if (!pinnedRoot) throw new PinnedRootError("unsupported", "project root could not be pinned for observability pointer read");
+  const eventsPath = join(OBSERVABILITY_PATH, featureSlug, OBSERVABILITY_DIR, EVENTS_FILENAME);
+  try {
+    if (!pinnedRoot.isStable()) throw new PinnedRootError("changed", "pinned project root changed before observability pointer read");
+    const info = pinnedRoot.pathEntryInfo(eventsPath);
+    if (info === null) return null;
+    if (info.kind === "symlink") throw new PinnedRootError("path_unauthorized", "observability event log must not be a symbolic link");
+    if (info.kind !== "file") throw new PinnedRootError("not_regular", "observability event log must be a regular file");
+    const read = pinnedRoot.readFile(eventsPath, { maxBytes: MAX_PINNED_READ_BYTES });
+    if (!pinnedRoot.isStable()) throw new PinnedRootError("changed", "pinned project root changed after observability pointer read");
+    const events = compactRecent(
+      parseBoundedObservabilityEvents(read.bytes, {
+        maxBytes: MAX_PINNED_READ_BYTES,
+        maxRecords: MAX_RECORDS,
+        maxEventBytes: MAX_EVENT_BYTES,
+        maxAggregateBytes: Math.min(MAX_LOG_BYTES, MAX_AGGREGATE_BYTES),
+      }),
+      MAX_RECORDS,
+      MAX_LOG_BYTES,
+      MAX_AGGREGATE_BYTES,
+      MAX_EVENT_BYTES,
+    );
+    const last = events[events.length - 1];
+    return {
+      eventsPath: join(OBSERVABILITY_DIR, EVENTS_FILENAME),
+      lastEventId: last?.id ?? "",
+      rollupThroughId: last?.id ?? "",
+      rollup: rollupFromEvents(events),
+    };
+  } finally {
+    pinnedRoot.close();
   }
-  const last = events[events.length - 1];
-  return {
-    eventsPath: join(OBSERVABILITY_DIR, EVENTS_FILENAME),
-    lastEventId: last?.id ?? "",
-    rollupThroughId: last?.id ?? "",
-    rollup: rollupFromEvents(events),
-  };
 }
 
-/** Write the pointer inside the feature's `state.json` (called by `writeState`). */
+/** Write the pointer inside the feature's observability directory. */
 export function writePointerSync(
   cwd: string,
   featureSlug: string,
   pointer: ObservabilityPointer,
 ): void {
-  // Mirror the events path into a small JSON file alongside the event log so
-  // the engine can rebuild the pointer without re-reading state.json. The
-  // canonical store is `TeamState.observability`; this file is the cache.
-  const obsDir = resolve(
-    cwd,
-    ".work-state",
-    "features",
-    featureSlug,
-    OBSERVABILITY_DIR,
-  );
-  mkdirSync(obsDir, { recursive: true });
-  writeFileSync(join(obsDir, "pointer.json"), JSON.stringify(pointer, null, 2) + "\n", "utf8");
+  if (!isSafeFeatureSlug(featureSlug)) throw new PinnedRootError("invalid", "unsafe observability feature slug");
+  const pinnedRoot = PinnedProjectRoot.open(cwd);
+  if (!pinnedRoot) throw new PinnedRootError("unsupported", "project root could not be pinned for observability pointer write");
+  const obsDir = join(OBSERVABILITY_PATH, featureSlug, OBSERVABILITY_DIR);
+  const pointerPath = join(obsDir, "pointer.json");
+  try {
+    pinnedRoot.ensureDirectory(obsDir);
+    const text = JSON.stringify(pointer, null, 2);
+    const bytes = Buffer.from(`${text}\n`, "utf8");
+    if (bytes.byteLength > MAX_POINTER_BYTES) throw new PinnedRootError("limit", "observability pointer exceeds its bounded byte limit");
+    if (!pinnedRoot.isStable()) throw new PinnedRootError("changed", "pinned project root changed before observability pointer write");
+    pinnedRoot.writeAtomic(pointerPath, bytes);
+    if (!pinnedRoot.isStable()) throw new PinnedRootError("changed", "pinned project root changed after observability pointer write");
+  } finally {
+    pinnedRoot.close();
+  }
 }

@@ -1,0 +1,35 @@
+{
+  "schema": 2,
+  "transaction_id": "acquire-50e36c5398f64d6bd3867d9f5d9d54be27c881036fa7da57",
+  "operation": "active",
+  "previous_digest": null,
+  "claim": {
+    "claim_id": "claim-3f02fb822c43095d7a271d42e0dd0695",
+    "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+    "owner_kind": "cto",
+    "owner_run_id": "readable-cto-exec-wave-01a06e95",
+    "status": "active",
+    "acquired_at": "2026-09-04T22:48:36.525Z",
+    "updated_at": "2026-09-04T22:48:36.525Z",
+    "release_reason": null,
+    "admission_binding": {
+      "mapping_record_path": ".work-state/cto/readable-cto-exec-wave-01a06e95/specification-mappings/cto-mapping-f8023ff30906da86a7ae7ebd56bcac7a.json",
+      "mapping_record_digest": "d8551279a3a7713b2b29c04fd653a0d8cdeb59264bd2839d9cbf47ebf229bc72",
+      "mapping_id": "cto-mapping-f8023ff30906da86a7ae7ebd56bcac7a",
+      "mapping_hash": "f8023ff30906da86a7ae7ebd56bcac7a5a0faf4e318e759ba456e8f57f7f4f68",
+      "mapping_version": 1,
+      "confirmation_state_revision": 9,
+      "feature_state_revision": 5,
+      "confirmation_state_digest": "bc564dec9935d73a608e88330e611f4dccf5fd356b35e03acbbda262c355bb1c",
+      "confirmation_authorization_digest": "5c1e3e7d87a38f938d9b0a071b6a4a162d666b14730d8e7dafb9a96e131c2a10",
+      "confirmation_ledger_digest": "ffb9a76ce764fa2f3b1bd2e2529521a1ad7e69d159a8efc186f10c4c4002263f",
+      "checkpoint_ref": "cto-specification-mapping-48368112c64339b1ec4437b307d3c34ab6bb4de2109f00f0a2b6802f450590db",
+      "trusted_answer_ref": "cto-answer-d8d033ff-7246-4d04-b573-83afc21363db",
+      "stage_id": "execution",
+      "policy_hash": "5ca11b26cc6252741d4f201c103db5db1c80384d85ddaa4d919de5e6ea9750e8",
+      "wave_id": "wave-49ed902456dbd2d8e347deee52e0cf57",
+      "capability_id": "d29d69eb-dcf2-4e57-894a-134df71ec2db",
+      "capability_epoch": "11020e76-91fe-449d-9232-b3e905d72643"
+    }
+  }
+}

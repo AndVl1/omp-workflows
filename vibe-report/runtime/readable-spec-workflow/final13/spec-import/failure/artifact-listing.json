@@ -1,0 +1,47 @@
+{
+  "scratch_parent": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw",
+  "scratch_root": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw/omp-spec-e2e-incomplete",
+  "artifact_directory": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-incomplete-KT2Syw/omp-spec-e2e-incomplete/.work-state/features/imported-payment-retry-incomplete/artifacts",
+  "entries": [
+    {
+      "path": "compatibility_report.json",
+      "type": "file",
+      "bytes": 4011
+    },
+    {
+      "path": "execution_claim",
+      "type": "directory",
+      "entries": ["next/"]
+    },
+    {
+      "path": "execution_claim/next",
+      "type": "directory",
+      "entries": []
+    },
+    {
+      "path": "import_snapshot.json",
+      "type": "file",
+      "bytes": 1477
+    }
+  ],
+  "observed_artifact_entries": [
+    "compatibility_report.json",
+    "execution_claim",
+    "import_snapshot.json"
+  ],
+  "expected_artifact_entries": [
+    "compatibility_report.json",
+    "import_snapshot.json"
+  ],
+  "unexpected_entries": ["execution_claim"],
+  "state": {
+    "path": ".work-state/features/imported-payment-retry-incomplete/state.json",
+    "bytes": 5455,
+    "preserved_as": "failure/state.json"
+  },
+  "transcript": {
+    "path": ".work-state/ux-e2e/transcript.jsonl",
+    "bytes": 3609300,
+    "preserved_as": "failure/transcript.jsonl"
+  }
+}

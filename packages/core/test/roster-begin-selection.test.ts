@@ -19,11 +19,11 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
-import { beginCapability, type RosterBeginSelection } from "../src/engine/durable.js";
+import { beginCapability, issueCurrentTrustedMappingProof, issueTrustedMappingProof, type RosterBeginSelection, type TrustedMappingProof } from "../src/engine/durable.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { writeState, resolveState } from "../src/engine/state.js";
 import { resolveConfig } from "../src/engine/config.js";
-import { buildAgentMapping, validateAgentMappingState, writeAgentMapping, type AgentMappingState } from "../src/engine/agent-mapping.js";
+import { buildAgentMapping, validateAgentMappingState, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TeamState } from "../src/engine/types.js";
 
@@ -48,8 +48,22 @@ function publishMapping(root: string): void {
     availableAgents: Object.values(poolRoles),
     extraRoles: config.scope_map.map((entry) => entry.dev_agent),
     genericFallbackRoles: Object.keys(poolRoles),
+    source: "roster-begin-selection-test",
+    scope_map: config.scope_map,
+    flags: config.flags,
+    roster: config.roster_overrides,
+    config_path: config.config_path,
+    config_source: config.config_source,
+    config_hash: config.config_hash,
+    config_version: config.config_version,
+    config_provenance: config.config_provenance,
   });
   writeAgentMapping(root, mapping);
+}
+
+function beginWithCurrentProof(root: string, selection?: RosterBeginSelection): ReturnType<typeof beginCapability> {
+  const trustedMappingProof = issueCurrentTrustedMappingProof(root);
+  return beginCapability(root, selection, trustedMappingProof === undefined ? undefined : { trustedMappingProof });
 }
 
 function writeFreshState(root: string): void {
@@ -110,7 +124,7 @@ test("begin freezes a semantic selection with live-mapped agents; identical re-i
         { role: "tech-researcher", reason: "prior art" },
       ],
     };
-    const begun = beginCapability(root, selection);
+    const begun = beginWithCurrentProof(root, selection);
     assert.equal(begun.ok, true, begun.ok ? "begin accepted" : begun.error);
     if (!begun.ok) return;
     assert.deepEqual(begun.handoff?.expected_roster, [
@@ -122,7 +136,7 @@ test("begin freezes a semantic selection with live-mapped agents; identical re-i
     assert.equal(frozen?.selected.length, 2);
     assert.equal(frozen?.selected[0]?.agent, "analyst");
 
-    const again = beginCapability(root, selection);
+    const again = beginWithCurrentProof(root, selection);
     assert.equal(again.ok, true, again.ok ? "identical re-issue is idempotent" : again.error);
     const refrozen = frozenSelection(root);
     assert.equal(refrozen?.snapshot_id, frozen?.snapshot_id, "identical selection keeps the frozen snapshot");
@@ -138,26 +152,26 @@ test("a changed selection for an active capability is rejected with the frozen s
     initGit(root);
     writeFreshState(root);
     publishMapping(root);
-    const begun = beginCapability(root, { occurrences: [{ role: "analyst" }, { role: "tech-researcher" }] });
+    const begun = beginWithCurrentProof(root, { occurrences: [{ role: "analyst" }, { role: "tech-researcher" }] });
     assert.equal(begun.ok, true);
     const frozen = frozenSelection(root);
     assert.ok(frozen);
 
     // A genuinely different composition is rejected and names the frozen snapshot.
-    const reordered = beginCapability(root, { occurrences: [{ role: "tech-researcher" }, { role: "analyst" }] });
+    const reordered = beginWithCurrentProof(root, { occurrences: [{ role: "tech-researcher" }, { role: "analyst" }] });
     assert.equal(reordered.ok, false, "a reordered selection is a changed selection");
     if (reordered.ok) return;
     assert.match(reordered.error, /frozen/);
     assert.match(reordered.error, new RegExp(frozen.snapshot_id));
 
-    const refaceted = beginCapability(root, { occurrences: [{ role: "analyst", facet: "second-probe" }, { role: "tech-researcher" }] });
+    const refaceted = beginWithCurrentProof(root, { occurrences: [{ role: "analyst", facet: "second-probe" }, { role: "tech-researcher" }] });
     assert.equal(refaceted.ok, false, "a changed facet composition is a changed selection");
     if (refaceted.ok) return;
     assert.match(refaceted.error, /frozen/);
 
     // Engine-appended slots are engine-owned: a strict prefix of the frozen
     // composition stays idempotent.
-    const shrunk = beginCapability(root, { occurrences: [{ role: "analyst" }] });
+    const shrunk = beginWithCurrentProof(root, { occurrences: [{ role: "analyst" }] });
     assert.equal(shrunk.ok, true, "a prefix of the frozen composition is the identical selection");
     const kept = frozenSelection(root);
     assert.equal(kept?.snapshot_id, frozen.snapshot_id);
@@ -173,7 +187,7 @@ test("concrete agent ids are never accepted as selection input", () => {
     writeFreshState(root);
     publishMapping(root);
     const tainted = { occurrences: [{ role: "analyst", agent: "someone-else" }] } as unknown as RosterBeginSelection;
-    const rejected = beginCapability(root, tainted);
+    const rejected = beginWithCurrentProof(root, tainted);
     assert.equal(rejected.ok, false, "agent ids are not caller authority");
     if (rejected.ok) return;
     assert.match(rejected.error, /semantic/);
@@ -190,12 +204,12 @@ test("selection validation: unmapped role, role outside the allowed pool, and mu
     writeFreshState(root);
     publishMapping(root);
 
-    const unmapped = beginCapability(root, { occurrences: [{ role: "qa" }] });
+    const unmapped = beginWithCurrentProof(root, { occurrences: [{ role: "qa" }] });
     assert.equal(unmapped.ok, false);
     if (unmapped.ok) return;
     assert.match(unmapped.error, /no live registered agent mapping: 'qa'/);
 
-    const outside = beginCapability(root, { occurrences: [{ role: "architect" }] });
+    const outside = beginWithCurrentProof(root, { occurrences: [{ role: "architect" }] });
     assert.equal(outside.ok, false, "architect is registered but outside the exploration pool");
     if (outside.ok) return;
     assert.match(outside.error, /outside allowed_roles/);
@@ -203,7 +217,7 @@ test("selection validation: unmapped role, role outside the allowed pool, and mu
     // wave-004 widened exploration multiplicity to three per role, so the
     // fail-closed bound now needs a fourth analyst (it exceeds both the
     // per-role maximum and the overall max_workers bound).
-    const tooMany = beginCapability(root, { occurrences: [{ role: "analyst" }, { role: "analyst" }, { role: "analyst" }, { role: "analyst" }] });
+    const tooMany = beginWithCurrentProof(root, { occurrences: [{ role: "analyst" }, { role: "analyst" }, { role: "analyst" }, { role: "analyst" }] });
     assert.equal(tooMany.ok, false);
     if (tooMany.ok) return;
     assert.match(tooMany.error, /exceeds multiplicity maximum/);
@@ -220,10 +234,10 @@ test("a stage with no trusted live agent mapping fails closed; the no-selection 
     const blocked = beginCapability(root, { occurrences: [{ role: "analyst" }] });
     assert.equal(blocked.ok, false, "no begin without a trusted live mapping");
     if (blocked.ok) return;
-    assert.match(blocked.error, /live registered agent mapping/);
+    assert.match(blocked.error, /live registered agent mapping|engine-issued trusted agent mapping proof/);
 
     publishMapping(root);
-    const begun = beginCapability(root);
+    const begun = beginWithCurrentProof(root);
     assert.equal(begun.ok, true, begun.ok ? "default selection works" : begun.error);
     if (!begun.ok || !begun.handoff) return;
     assert.deepEqual(begun.handoff.expected_roster, [
@@ -241,7 +255,7 @@ test("the contract exposes a frozen selection only for the current stage and cur
     initGit(root);
     writeFreshState(root);
     publishMapping(root);
-    const begun = beginCapability(root, { occurrences: [{ role: "analyst" }, { role: "tech-researcher" }] });
+    const begun = beginWithCurrentProof(root, { occurrences: [{ role: "analyst" }, { role: "tech-researcher" }] });
     assert.equal(begun.ok, true, begun.ok ? "begin accepted" : begun.error);
     if (!begun.ok) return;
     const frozen = frozenSelection(root);
@@ -353,20 +367,19 @@ test("validateAgentMappingState is the one trusted boundary: invariant violation
     initGit(root);
     writeFreshState(root);
     publishMapping(root);
-    const ghostBegin = beginCapability(root, { occurrences: [{ role: "analyst" }] }, {
-      trustedMapping: {
-        ...base,
-        available_agents: ["analyst"],
-        resolved_roles: { analyst: "omp-ghost" },
-        diagnostics: {},
-        unresolved_roles: [],
-      } as unknown as AgentMappingState,
-    });
-    assert.equal(ghostBegin.ok, false, "the ghost handoff fails the begin closed");
-    if (!ghostBegin.ok) {
-      assert.match(ghostBegin.error, /trusted agent mapping handoff is malformed/);
-      assert.match(ghostBegin.error, /outside available_agents/);
-    }
+    const forgedProof = {
+      __trusted_mapping_proof: true,
+      available_agents: ["analyst"],
+      resolved_roles: { analyst: "omp-ghost" },
+    } as unknown as TrustedMappingProof;
+    const ghostBegin = beginCapability(root, { occurrences: [{ role: "analyst" }] }, { trustedMappingProof: forgedProof });
+    assert.equal(ghostBegin.ok, false, "the ghost proof fails the begin closed");
+    if (!ghostBegin.ok) assert.match(ghostBegin.error, /proof is unknown or stale/);
+    assert.throws(
+      () => issueTrustedMappingProof(root, { ...base, available_agents: ["analyst"], resolved_roles: { analyst: "omp-ghost" }, diagnostics: {}, unresolved_roles: [] }),
+      /trusted agent mapping handoff is malformed|canonical config-bound publication/,
+      "a forged mapping cannot mint a proof",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -378,7 +391,7 @@ test("a legacy state without a top-level cursor epoch masks any selection, whate
     initGit(root);
     writeFreshState(root);
     publishMapping(root);
-    const begun = beginCapability(root, { occurrences: [{ role: "analyst" }, { role: "tech-researcher" }] });
+    const begun = beginWithCurrentProof(root, { occurrences: [{ role: "analyst" }, { role: "tech-researcher" }] });
     assert.equal(begun.ok, true, begun.ok ? "begin accepted" : begun.error);
     if (!begun.ok || !begun.handoff) return;
     const capEpoch = begun.handoff.cursor_epoch;
@@ -432,6 +445,22 @@ test("a legacy state without a top-level cursor epoch masks any selection, whate
     assert.equal(modern.stage.roster_selection?.capability_epoch, capEpoch, "the authoritative epoch binding exposes the selection");
     assert.equal(modern.stage.dispatch.selection_id, modern.stage.roster_selection?.snapshot_id);
     assert.equal(modern.stage.dispatch.permitted, true, "a live epoch binding satisfies selectionReady");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("malformed roster selection input fails closed instead of throwing", () => {
+  const root = mkdtempSync(join(tmpdir(), "roster-seam-malformed-"));
+  try {
+    initGit(root);
+    writeFreshState(root);
+    publishMapping(root);
+    const malformed = beginWithCurrentProof(root, { occurrences: null } as never);
+    assert.equal(malformed.ok, false);
+    assert.match(malformed.ok ? "" : malformed.error, /roster selection rejected/u);
+    const malformedOccurrence = beginWithCurrentProof(root, { occurrences: [null] } as never);
+    assert.equal(malformedOccurrence.ok, false);
+    assert.match(malformedOccurrence.ok ? "" : malformedOccurrence.error, /roster selection rejected/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

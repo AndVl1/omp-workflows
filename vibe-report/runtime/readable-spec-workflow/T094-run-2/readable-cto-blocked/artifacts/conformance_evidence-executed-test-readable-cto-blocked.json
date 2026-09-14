@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "artifact_id": "conformance_evidence-executed-test-readable-cto-blocked",
+  "entries": [
+    {
+      "evidence_id": "readable-cto-blocked-runtime-record-fr-1",
+      "kind": "intent_conflict",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-aa8b086101bbe9ed628795ff7319d1bb",
+      "intent_message": "Focused verification was not executed because the approved FR-1 contract provides no deterministic runtime command, input, output, exit status, or success oracle. The implementation is blocked rather than falsely marked passing.",
+      "recorded_at": "2026-09-04T23:52:23.285Z"
+    },
+    {
+      "evidence_id": "readable-cto-blocked-runtime-record-ac-1",
+      "kind": "intent_conflict",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-aa8b086101bbe9ed628795ff7319d1bb",
+      "intent_message": "AC-1 cannot be exercised honestly: no concrete observable acceptance behavior is specified, and src/blocked/** does not exist. No test result or fabricated pass is reported.",
+      "recorded_at": "2026-09-04T23:52:23.285Z"
+    }
+  ]
+}

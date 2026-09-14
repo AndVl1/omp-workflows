@@ -1,0 +1,191 @@
+{
+  "id": "spec-cto-execution",
+  "title": "CTO specification execution: mixed handoffs, one confirmed wave, isolated evidence",
+  "description": "Runs one resident CTO execution wave over four prebuilt typed workspaces. Pass the immutable full selector array to cto_prepare in selector-only form; the engine derives canonical task/DoD/TeamDef candidates, presents the mapping for human confirmation, then emits an eligible-only preflight descriptor after that confirmation. Report stale and claimed exclusions verbatim; they remain selected for readiness audit and are never claimed, while the passing and blocked features are the only admitted pair for dispatch.",
+  "params": {
+    "feature_passing": "readable-cto-passing",
+    "feature_id": "readable-cto-passing",
+    "run_key": "readable-cto-passing-run-001",
+    "feature_blocked": "readable-cto-blocked",
+    "run_key_blocked": "readable-cto-blocked-run-001",
+    "feature_stale": "readable-cto-stale",
+    "run_key_stale": "readable-cto-stale-run-001",
+    "feature_claimed": "readable-cto-claimed",
+    "run_key_claimed": "readable-cto-claimed-run-001",
+    "execution_request": "Execute readable-cto-passing and readable-cto-blocked through one confirmed CTO wave: complete every task of readable-cto-passing with real evidence, and for readable-cto-blocked implement everything while leaving exactly one frozen verification obligation without evidence on this first pass"
+  },
+  "selectors": {
+    "feature_id": "readable-cto-passing",
+    "run_key": "readable-cto-passing-run-001"
+  },
+  "workspace": {
+    "path": "specs/{{feature_passing}}",
+    "state_path": ".work-state/features/{{feature_passing}}/state.json",
+    "documents": [
+      "specs/{{feature_passing}}/status.md",
+      "specs/{{feature_passing}}/spec.md",
+      "specs/{{feature_passing}}/plan.md",
+      "specs/{{feature_passing}}/tasks.md"
+    ],
+    "validation": [
+      "specs/{{feature_passing}}/validation/specify.md",
+      "specs/{{feature_passing}}/validation/plan.md",
+      "specs/{{feature_passing}}/validation/tasks.md",
+      "specs/{{feature_passing}}/validation/implementation-conformance.md"
+    ],
+    "history": [
+      "specs/{{feature_passing}}/history/specify",
+      "specs/{{feature_passing}}/history/plan",
+      "specs/{{feature_passing}}/history/tasks"
+    ],
+    "handoff": [
+      "specs/{{feature_passing}}/handoff.md"
+    ],
+    "checkpoints": [
+      ".work-state/features/{{feature_passing}}/state.json",
+      ".work-state/ux-e2e/transcript.jsonl",
+      ".work-state/ux-e2e/ask-state.jsonl"
+    ],
+    "evidence": [
+      ".work-state/features/{{feature_passing}}/artifacts",
+      ".work-state/features/{{feature_blocked}}/artifacts",
+      ".work-state/features/{{feature_stale}}/artifacts",
+      ".work-state/features/{{feature_claimed}}/artifacts",
+      "specs/{{feature_blocked}}/handoff.md",
+      "{{bundle_blocked}}"
+    ]
+  },
+  "transcript": {
+    "checkpoints": [
+      "approve_continue",
+      "mapping confirmation",
+      "confirmation recorded",
+      "checkpoint_ref"
+    ],
+    "workers": [
+      "CTO team dispatch",
+      "independent slices in parallel",
+      "shared-file pair serialized",
+      "no worker before confirmation",
+      "no nested CTO"
+    ],
+    "validation": [
+      "validation/implementation-conformance.md",
+      "overall_status pass",
+      "overall_status blocked",
+      "one closure row per frozen subject",
+      "blocking finding",
+      "readiness stale",
+      "SPEC_EXECUTION_CLAIMED",
+      "cross-feature evidence rejected"
+    ],
+    "history": [
+      "no approval rewritten",
+      "handoff digest unchanged"
+    ],
+    "handoff": [
+      "handoff.md",
+      "handoff_digest",
+      "status ready",
+      "execution_choices"
+    ],
+    "interruption": [
+      "completion_blocked",
+      "claim retained",
+      "never complete_feature",
+      "non-passing closure row"
+    ],
+    "resume": [
+      "same claimed run",
+      "no released claim",
+      "no second active claim",
+      "revalidate"
+    ],
+    "next_actions": [
+      "revalidate",
+      "repair",
+      "complete_feature"
+    ]
+  },
+  "task": "Coordinate one resident CTO execution wave over four prebuilt typed feature workspaces in the authorized scratch repository. The harness seeds current approved handoffs through production APIs, invalidates one workspace through production revision propagation, and acquires one do-work claim through the canonical claim CAS. Do not run native Specify, Plan, Tasks, import, or do-work commands. Select these exact feature/run pairs as one immutable full selector array: {{feature_passing}}/{{run_key}}, {{feature_blocked}}/{{run_key_blocked}}, {{feature_stale}}/{{run_key_stale}}, and {{feature_claimed}}/{{run_key_claimed}}. Call cto_prepare first in selector-only form with that full array. The engine derives canonical task, DoD, and TeamDef candidates from the frozen handoffs and presents the exact mapping choices for the human mapping confirmation; after that confirmation, the engine emits the eligible-only cto_preflight descriptor. Keep stale and claimed selectors in the immutable request for readiness exclusion, report every excluded finding verbatim, and never claim either excluded selector. Execute the engine-issued eligible-only preflight descriptor, then call cto_confirm followed by cto_dispatch. Dispatch only the two admitted passing and blocked slices with isolated claims and conformance evidence. The first explicit CTO request is held while the production constitution gate is approved once; a fresh session then submits the exact same CTO request once.",
+  "stages": [
+    {
+      "id": "constitution",
+      "name": "Single production constitution gate approval",
+      "expect": [
+        "CONSTITUTION.md",
+        "constitution",
+        "approve_continue"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]onstitution",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "mapping",
+      "name": "One explicit mapping confirmation",
+      "expect": [
+        "mapping confirmation",
+        "checkpoint_ref",
+        "handoff_digest"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Mm]apping|[Cc]onfirm",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "preflight",
+      "name": "Eligible-only CTO preflight after mapping confirmation",
+      "expect": [
+        "implementation_ready",
+        "readiness stale",
+        "SPEC_EXECUTION_CLAIMED",
+        "no worker before confirmation"
+      ]
+    },
+    {
+      "id": "wave",
+      "name": "Isolated CTO execution wave",
+      "expect": [
+        "CTO claim",
+        "overall_status pass",
+        "overall_status blocked",
+        "cross-feature evidence rejected",
+        "completion_blocked"
+      ]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 600000,
+    "checkpointPollMs": 500
+  },
+  "screenshots": {
+    "on": [
+      "stage_start",
+      "stage_end",
+      "ask_user",
+      "error"
+    ]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

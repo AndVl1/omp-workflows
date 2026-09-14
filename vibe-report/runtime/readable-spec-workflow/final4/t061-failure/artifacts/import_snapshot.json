@@ -1,0 +1,48 @@
+{
+  "snapshot_id": "import.ceca4b644bd37cb4a9ccbb2167e63222ee4580b228416aa1b9b8c97632dfb490",
+  "source_root": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-vRLAQJ/omp-spec-e2e-complete",
+  "source_root_identity": {
+    "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-vRLAQJ/omp-spec-e2e-complete",
+    "dev": 16777234,
+    "ino": 94921289,
+    "mode": 16832
+  },
+  "recognition_ref": "recognition.8af78f791602fc6b7a7a27500aac663af284f7f010e884bf30dfcb0bd6b14e76",
+  "files": [
+    {
+      "path": "imported/payment-retry/CONSTITUTION.md",
+      "sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      "size_bytes": 905,
+      "media_type": "text/markdown"
+    },
+    {
+      "path": "imported/payment-retry/decisions.md",
+      "sha256": "fe19467a6f9983c064e5363925606b8b27830fca04a31c8b7ae3713eb65fd9ee",
+      "size_bytes": 516,
+      "media_type": "text/markdown"
+    },
+    {
+      "path": "imported/payment-retry/plan.md",
+      "sha256": "87e61a5f9bda56851b366fc1c8668b47ea85800782bba893c695a088ac2db606",
+      "size_bytes": 2029,
+      "media_type": "text/markdown"
+    },
+    {
+      "path": "imported/payment-retry/requirements.md",
+      "sha256": "a26e5e2a0235d4d71397bcf92efb7a3515b041259a69530b4f7dffa4ea6e9200",
+      "size_bytes": 1763,
+      "media_type": "text/markdown"
+    },
+    {
+      "path": "imported/payment-retry/tasks.md",
+      "sha256": "b86a5f4d62d6bea037c2219bd2f9a28cbac150996a64fe4e89d962a5f007159e",
+      "size_bytes": 951,
+      "media_type": "text/markdown"
+    }
+  ],
+  "source_revision": null,
+  "document_language": null,
+  "redactions": [],
+  "normalized_content_ref": "normalized.e13cf73da1754109c66b23b82b7e22f06de30873e7f60ee54ed28c01f1a0573f",
+  "created_at": "2026-09-02T19:46:49.644Z"
+}

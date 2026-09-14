@@ -13,9 +13,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
-  exactRenderers,
   htmlText,
   mdText,
   parseBoundedJson,
@@ -46,6 +48,8 @@ import {
   type RenderOptions,
   type VisualizationArtifact,
 } from "../src/visualize/types.js";
+import { registerTestArtifactRenderer, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+
 import {
   CRLF_SAMPLE,
   DEEP_JSON_SAMPLE,
@@ -163,6 +167,21 @@ test("parseBoundedJson enforces depth 8, collections 200, scalar 8192 and report
   assert.deepEqual(arrayRoot.value, [1, 2, 3]);
 });
 
+test("parseBoundedJson preserves prototype-shaped keys without changing the clone prototype", () => {
+  const parsed = parseBoundedJson(
+    '{"__proto__":{"constructor":{"toString":"nested"}},"constructor":"own-constructor","toString":"own-toString","normal":{"__proto__":"nested-proto"}}',
+  );
+  assert.equal(parsed.ok, true);
+  const value = parsed.value as Record<string, unknown>;
+  assert.equal(Object.getPrototypeOf(value), null);
+  assert.equal(Object.hasOwn(value, "__proto__"), true);
+  assert.equal(Object.hasOwn(value, "constructor"), true);
+  assert.equal(Object.hasOwn(value, "toString"), true);
+  const nested = value.__proto__ as Record<string, unknown>;
+  assert.equal(Object.hasOwn(nested, "constructor"), true);
+  assert.equal(Object.hasOwn((value.normal as Record<string, unknown>), "__proto__"), true);
+});
+
 // ── Safe text primitives ─────────────────────────────────────────────────────
 
 test("mdText escapes Markdown markup and preserves Unicode/CRLF as data", () => {
@@ -209,7 +228,7 @@ const TYPED_PAYLOADS: Record<string, unknown> = {
   team_plan: { teams: [{ team: "core", slice: "renderers", profile: "standard", worktree: "same_branch" }], max_teams: 2 },
   team_artifacts: { teams: [{ team: "core", status: "done", summary: "all green" }] },
   integration_review: { verdict: "approve", findings: [], merged_branches: ["feat/x"], note: "ok" },
-  lecture_intake: { task: "Research playlist", sources: [{ id: "l1", kind: "transcript", location: "file.md", provenance: "provided" }] },
+  lecture_intake: { schemaVersion: 1, task: "Research playlist", sources: [{ id: "l1", kind: "transcript", location: "file.md", provenance: "provided" }] },
   lecture_mapping: { coverage: "3/4 mapped", lectures: [{ id: "l1-u1", title: "Intro", source_id: "l1", evidence: "quote" }], gaps: [] },
   lecture_candidates: { candidates: [{ id: "c1", topic: "X", evidence_sources: [{ source_id: "l1", evidence: "quote" }], conflicts: [] }], deduped_count: 1 },
   lecture_repo_fit: { findings: [{ title: "matches", category: "repo_fit", evidence: "symbol" }], verdict: "fit" },
@@ -502,31 +521,53 @@ test("objectTable caps columns at 8 and reports omitted ones", () => {
 
 test("an exact-layer renderer failure degrades to generic and increments a warning", () => {
   const id = "boom-exact";
-  exactRenderers[id] = () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-renderer-test-"));
+  writeTestRegistryMarker(root);
+  registerTestArtifactRenderer(root, "exact", id, () => {
     throw new Error("kaboom");
-  };
+  });
   try {
     const warnings: string[] = [];
     const result = renderArtifact(artifact(id, { note: "x" }), options(), warnings);
     assert.equal(result.layer, "generic-fallback");
     assert.equal(kvOf(result.nodes, "note"), "x", "generic fallback rendered the payload");
     assert.equal(warnings.length, 1);
+
     assert.ok(warnings[0]?.includes(`renderer exact failed for artifact "${id}"`), warnings[0]);
     assert.ok(warnings[0]?.includes("kaboom"));
   } finally {
-    delete exactRenderers[id];
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("renderer registry treats prototype-shaped artifact ids as ordinary generic ids", () => {
+  for (const id of ["constructor", "toString", "__proto__", "normal"]) {
+    const warnings: string[] = [];
+    assert.doesNotThrow(() => {
+      const result = renderArtifactWithTables(
+        artifact(id, { artifact_id: id, artifact_type: "constructor", nested: { __proto__: id } }),
+        { exact: {}, spec: {}, typed: {} },
+        options(),
+        warnings,
+      );
+      assert.equal(result.layer, "generic-fallback");
+      assert.ok(allText(result.nodes).includes(id));
+    });
+    assert.deepEqual(warnings, []);
   }
 });
 
 test("an exact-layer renderer outranks the spec-family layer when registered", () => {
   const id = "spec_handoff";
-  exactRenderers[id] = () => [{ kind: "paragraph", text: "exact view" }];
+  const root = mkdtempSync(join(tmpdir(), "omp-renderer-test-"));
+  writeTestRegistryMarker(root);
+  registerTestArtifactRenderer(root, "exact", id, () => [{ kind: "paragraph", text: "exact view" }]);
   try {
     const result = renderArtifact(artifact(id, SPEC_PAYLOADS.spec_handoff));
     assert.equal(result.layer, "exact");
     assert.equal(paragraphs(result.nodes)[0]?.text, "exact view");
   } finally {
-    delete exactRenderers[id];
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

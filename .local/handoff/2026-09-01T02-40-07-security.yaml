@@ -1,0 +1,38 @@
+id: 2026-09-01T02-40-07-security
+parent: null
+agent: security
+timestamp: "2026-09-01T02:40:07.208Z"
+status: completed
+context:
+  task: "T084-T085 and adaptive integration"
+output:
+  summary: "Integrated presentation staleness/materialization and adaptive canonical state validation/preservation."
+  vulnerabilities:
+    critical: 0
+    high: 0
+    medium: 0
+    low: 0
+  cargo_deny:
+    status: fail
+    advisories: 0
+    license_issues: 0
+  dependencies:
+    outdated: 0
+    unmaintained: 0
+    actions: []
+  unsafe_blocks:
+    total: 0
+    reviewed: 0
+    approved: 0
+    needs_refactor: 0
+  issues:
+    - severity: low
+      location: "validation"
+      issue: "cargo-deny and tests were not run by assignment constraint"
+      fix: "Main agent runs combined validation"
+next:
+  agent: null
+  task: "Main agent combined validation"
+  priority: high
+  acceptance_criteria:
+    - "Run authoritative T074/T080 and project integration validation"

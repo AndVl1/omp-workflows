@@ -1,0 +1,125 @@
+{
+  "id": "spec-workflow",
+  "title": "Native readable specification: constitution -> Specify -> Plan -> Tasks",
+  "description": "Runs the framework-neutral native flow in a repository with no Spec Kit or other specification framework, then verifies readable projections, explicit identity, attribution, validation, history, and the exact handoff action.",
+  "params": {
+    "feature_id": "readable-native",
+    "request": "Add a deterministic project-local workflow profile override with explicit ownership"
+  },
+  "task": "Start a native readable specification for the request below. Use the explicit feature_id `{{feature_id}}` for every phase and preserve the engine-generated explicit run_key for every state/tool operation; never infer identity from .active-feature, a branch name, or the current directory.\n\nRequest: {{request}}\n\nThe repository intentionally has no Spec Kit or other external specification framework. Use the plugin-native constitution prerequisite, obtain the required human approval, and then run the explicit Constitution -> Specify -> Plan -> Tasks flow. The terminal commands are `/specify --feature {{feature_id}} <request>`, `/spec-plan --feature {{feature_id}}`, and `/spec-tasks --feature {{feature_id}}`; carry the same feature_id and run_key through each command and underlying tool call. Keep every phase content attributable to its declared worker dispatch. Stop after the final Tasks approval with the readable handoff ready for `/do-work --spec {{feature_id}}`.",
+  "stages": [
+    {
+      "id": "constitution",
+      "name": "Native constitution prerequisite and approval",
+      "expect": [
+        "no Spec Kit",
+        "CONSTITUTION.md",
+        "constitution",
+        "[ask_user]",
+        "approve_continue",
+        "request_changes",
+        "/specify --feature {{feature_id}}"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]onstitution",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "specify",
+      "name": "Specify phase",
+      "expect": [
+        "Specify",
+        "specs/{{feature_id}}/spec.md",
+        "validation/specify.md",
+        "feature_id",
+        "run_key",
+        "[ask_user]",
+        "/spec-plan --feature {{feature_id}}"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Ss]pecify",
+          "answer": "3",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "plan",
+      "name": "Plan phase",
+      "expect": [
+        "Plan",
+        "specs/{{feature_id}}/plan.md",
+        "validation/plan.md",
+        "feature_id",
+        "run_key",
+        "[ask_user]",
+        "/spec-tasks --feature {{feature_id}}"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Pp]lan",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "tasks",
+      "name": "Tasks phase and handoff approval",
+      "expect": [
+        "Tasks",
+        "specs/{{feature_id}}/tasks.md",
+        "validation/tasks.md",
+        "handoff.md",
+        "feature_id",
+        "run_key",
+        "[ask_user]"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Tt]asks",
+          "answer": "3",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "readable-evidence",
+      "name": "Readable workspace, history, and exact next action",
+      "expect": [
+        "status.md",
+        "Approvals",
+        "Next Action",
+        "history",
+        "handoff.md",
+        "/do-work --spec {{feature_id}}",
+        "implementation_ready"
+      ]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 600000,
+    "checkpointPollMs": 500
+  },
+  "screenshots": {
+    "on": ["stage_start", "stage_end", "ask_user", "error"]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

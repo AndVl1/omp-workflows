@@ -1,12 +1,12 @@
 /**
  * Session-report assembly: CTO (CtoState schema 2) normalization — derived
  * workflow stages, team statuses (parked/failed/done), depends_on edges,
- * integration/health, per-team artifacts, and the markdown fallback reader.
+ * integration/health, per-team artifacts, and canonical state.json authority.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -45,6 +45,18 @@ function writeRun(cwd: string, state: CtoState): void {
   const dir = join(cwd, ".work-state", "cto", state.id);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "state.json"), JSON.stringify(state, null, 2));
+}
+
+function writeCtoSessionTelemetry(
+  cwd: string,
+  sessionId: string,
+  pointer: Record<string, unknown>,
+  events: readonly Record<string, unknown>[],
+): void {
+  const dir = join(cwd, ".work-state", "features", sessionId, "observability");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "pointer.json"), JSON.stringify(pointer));
+  writeFileSync(join(dir, "events.jsonl"), events.map((event) => JSON.stringify(event)).join("\n") + "\n");
 }
 
 function tmpWorkspace(): string {
@@ -129,34 +141,6 @@ test("cto: team artifacts under .work-state/artifacts/<team>/ are navigable resu
   }
 });
 
-test("cto: markdown fallback reader produces a report for agent-written runs", () => {
-  const cwd = tmpWorkspace();
-  try {
-    const runDir = join(cwd, ".work-state", "cto", "md-run");
-    mkdirSync(runDir, { recursive: true });
-    writeFileSync(join(runDir, "cto_discovery.md"), "# CTO Discovery\nsummary of scope\n");
-    writeFileSync(
-      join(runDir, "team-plan.md"),
-      [
-        "# Team Plan",
-        "- team: alpha — API slice",
-        "- team: beta — UI slice",
-      ].join("\n"),
-    );
-
-    const report = buildSessionReport(cwd, { kind: "cto", id: "md-run" });
-
-    assert.equal(report.source.format, "markdown");
-    assert.equal(report.source.statePath, null);
-    assert.equal(report.meta.task, "CTO Discovery");
-    const alpha = report.teams?.find((t) => t.id === "alpha");
-    assert.equal(alpha?.status, "in_progress");
-    assert.equal(report.stages.find((s) => s.id === "team:alpha")?.status, "in_progress");
-    assert.ok(report.warnings.length >= 0);
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
 
 test("cto: auto-detect picks the CTO run when it is newer than the do-work state", () => {
   const cwd = tmpWorkspace();
@@ -204,11 +188,9 @@ test("cto: explicit unknown run id throws a clear error", () => {
 test("cto: absent observability → null rollup, CTO-specific warning, chronology still state-sourced", () => {
   const cwd = tmpWorkspace();
   try {
-    // A bare CTO run in a workspace with no feature-scoped observability
-    // pointer: readObservabilityPointer(cwd, "default") finds no events.jsonl,
-    // so ctoTelemetry degrades. manual_qa ui-12: the CTO report shows "No
-    // telemetry recorded" plus the CTO-specific absence warning, and the
-    // chronology falls back to state-sourced entries (no event stream).
+    // A bare CTO run has no owner-session observability pointer, so the
+    // report must remain explicitly empty rather than borrowing "default" or
+    // another feature's stream.
     writeRun(cwd, makeCtoState());
 
     const report = buildSessionReport(cwd, { kind: "cto" });
@@ -230,6 +212,79 @@ test("cto: absent observability → null rollup, CTO-specific warning, chronolog
 });
 
 // ── Standby stage derivation ────────────────────────────────────────────────
+
+test("cto: telemetry binds to exact owner session and cto run, filtering mixed events", () => {
+  const cwd = tmpWorkspace();
+  try {
+    const state = makeCtoState({ owner_session: "session-a" });
+    writeRun(cwd, state);
+    writeCtoSessionTelemetry(
+      cwd,
+      "session-a",
+      {
+        session_id: "session-a",
+        cto_run_id: "run-1",
+        pointer: {
+          eventsPath: "observability/events.jsonl",
+          lastEventId: "4",
+          rollupThroughId: "4",
+          rollup: {},
+        },
+      },
+      [
+        { id: "1", kind: "stage_transition", ts: "2026-08-08T09:01:00.000Z", runId: "run-1", sessionId: "session-a", stageId: "teams" },
+        { id: "2", kind: "stage_transition", ts: "2026-08-08T09:02:00.000Z", runId: "run-2", sessionId: "session-a", stageId: "teams" },
+        { id: "3", kind: "stage_transition", ts: "2026-08-08T09:03:00.000Z", runId: "run-1", sessionId: "session-b", stageId: "teams" },
+        { id: "4", kind: "stage_transition", ts: "2026-08-08T09:04:00.000Z", runId: "default", sessionId: "session-a", stageId: "teams" },
+      ],
+    );
+
+    const report = buildSessionReport(cwd, { kind: "cto", id: "run-1" });
+    assert.equal(report.telemetry.eventCounts?.stage_transition, 1);
+    assert.equal(report.telemetry.rollup?.stageTransitions, 1);
+    assert.equal(report.telemetry.eventsPath, ".work-state/features/session-a/observability/events.jsonl");
+    assert.ok(report.chronology.some((entry) => entry.source === "event" && entry.at === "2026-08-08T09:01:00.000Z"));
+    assert.ok(!report.chronology.some((entry) => entry.source === "event" && entry.at !== "2026-08-08T09:01:00.000Z"));
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("cto: wrong/default pointer identities and symlink event logs never become telemetry", () => {
+  const cwd = tmpWorkspace();
+  try {
+    writeRun(cwd, makeCtoState({ owner_session: "session-a" }));
+    const dir = join(cwd, ".work-state", "features", "session-a", "observability");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(cwd, "outside-events.jsonl"), JSON.stringify({ id: "1", kind: "stage_transition", ts: "2026-08-08T09:01:00.000Z", runId: "run-1" }));
+    symlinkSync(join(cwd, "outside-events.jsonl"), join(dir, "events.jsonl"));
+    writeFileSync(
+      join(dir, "pointer.json"),
+      JSON.stringify({
+        session_id: "session-a",
+        cto_run_id: "default",
+        pointer: { eventsPath: "observability/events.jsonl", lastEventId: "1", rollupThroughId: "1", rollup: {} },
+      }),
+    );
+    const wrongIdentity = buildSessionReport(cwd, { kind: "cto", id: "run-1" });
+    assert.equal(wrongIdentity.telemetry.rollup, null);
+    assert.ok(wrongIdentity.warnings.some((warning) => warning.includes("malformed") || warning.includes("another run/session")));
+
+    writeFileSync(
+      join(dir, "pointer.json"),
+      JSON.stringify({
+        session_id: "session-a",
+        cto_run_id: "run-1",
+        pointer: { eventsPath: "observability/events.jsonl", lastEventId: "1", rollupThroughId: "1", rollup: {} },
+      }),
+    );
+    const symlinkedEvents = buildSessionReport(cwd, { kind: "cto", id: "run-1" });
+    assert.equal(symlinkedEvents.telemetry.rollup, null);
+    assert.ok(symlinkedEvents.warnings.some((warning) => warning.includes("event log")));
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 // ── Stage provenance (agents / inputs / outputs) ────────────────────────────
 

@@ -1,0 +1,340 @@
+{
+  "id": "spec-migration",
+  "title": "Legacy migration and interrupted resume: receipts, preservation, fresh approval, exactly-once",
+  "description": "Migrates a compatible JSON-only legacy specification run through the fail-closed migration boundary — missing current constitution binding blocks first, the plugin-native constitution prerequisite resolves it, and the retry materializes provenance-bound unapproved records that require new validation plus fresh human approval — while malformed, branch-derived, and replay attempts fail closed or return established records with the original bytes untouched, and an interrupted new-format run resumes its first unapproved phase exactly once with no duplicate run, capability, dispatch, version, or approval.",
+  "params": {
+    "legacy_feature_id": "legacy-payment-retry",
+    "legacy_branch": "feat/legacy-payment-retry",
+    "legacy_state_path": ".work-state/specification/legacy-payment-retry/legacy-run.json",
+    "malformed_state_path": ".work-state/specification/legacy-malformed/legacy-run.json",
+    "branch_derived_state_path": ".work-state/specification/legacy-branch-only/legacy-run.json",
+    "resume_feature_id": "migration-resume",
+    "resume_request": "Add a deterministic retry ledger with an explicit idempotency boundary"
+  },
+  "workspace": {
+    "path": "specs/{{legacy_feature_id}}",
+    "state_path": ".work-state/features/{{legacy_feature_id}}/state.json",
+    "documents": [
+      "specs/{{legacy_feature_id}}/status.md",
+      "specs/{{legacy_feature_id}}/spec.md",
+      "specs/{{legacy_feature_id}}/plan.md",
+      "specs/{{legacy_feature_id}}/tasks.md"
+    ],
+    "validation": [
+      "specs/{{legacy_feature_id}}/validation/specify.md",
+      "specs/{{legacy_feature_id}}/validation/plan.md",
+      "specs/{{legacy_feature_id}}/validation/tasks.md",
+      "specs/{{legacy_feature_id}}/validation/constitution-impact.md"
+    ],
+    "history": [
+      "specs/{{legacy_feature_id}}/history/specify",
+      "specs/{{legacy_feature_id}}/history/plan",
+      "specs/{{legacy_feature_id}}/history/tasks"
+    ],
+    "handoff": [
+      "specs/{{legacy_feature_id}}/handoff.md"
+    ],
+    "checkpoints": [
+      ".work-state/features/{{legacy_feature_id}}/state.json",
+      ".work-state/features/{{resume_feature_id}}/state.json",
+      ".work-state/ux-e2e/transcript.jsonl",
+      ".work-state/ux-e2e/ask-state.jsonl"
+    ],
+    "evidence": [
+      ".work-state/features/{{legacy_feature_id}}/artifacts",
+      ".work-state/features/{{legacy_feature_id}}/artifacts/migration",
+      "{{legacy_state_path}}",
+      "{{malformed_state_path}}",
+      "{{branch_derived_state_path}}",
+      ".active-feature",
+      "specs/{{resume_feature_id}}"
+    ]
+  },
+  "transcript": {
+    "checkpoints": [
+      "no checkpoint for a blocked migration",
+      "constitution bootstrap is one two-decision checkpoint",
+      "exactly one Specify checkpoint after migration",
+      "exactly one Plan checkpoint on resume",
+      "trusted human answer proof with exact version and epoch binding",
+      "failed validation never opens a checkpoint"
+    ],
+    "workers": [
+      "migration dispatches no implementation workers",
+      "blocked migrations dispatch no workers",
+      "phase content is worker-authored, never main-session authored",
+      "resume dispatches no duplicate Specify worker"
+    ],
+    "validation": [
+      "migrated records require new validation",
+      "legacy completed status carries no validation or approval",
+      "validation findings name blocking locations and remediation",
+      "blocked migration runs no validation"
+    ],
+    "history": [
+      "append-only migrated history",
+      "legacy source bytes unchanged through every journey",
+      "replay rewrites no history entry"
+    ],
+    "handoff": [
+      "no handoff from an unapproved migration",
+      "handoff requires fresh Specify, Plan, and Tasks approvals",
+      "handoff digest binds exact approved versions"
+    ],
+    "interruption": [
+      "interrupted only after durable approval",
+      "durable state written before interruption",
+      "resume starts at the first unapproved phase"
+    ],
+    "resume": [
+      "established receipt returned on replay",
+      "no duplicate workspace",
+      "no duplicate migration receipt",
+      "no duplicate run or capability",
+      "no duplicated approved artifact or trusted answer",
+      "no fresh migration decision on replay"
+    ],
+    "next_actions": [
+      "resolve the constitution prerequisite",
+      "/specify --feature {{legacy_feature_id}}",
+      "/spec-plan --feature {{resume_feature_id}}",
+      "/spec-tasks --feature {{resume_feature_id}}",
+      "first unapproved phase",
+      "exact remediation for every blocked migration"
+    ]
+  },
+  "task": "Run the complete legacy-migration and interrupted-resume journey in the authorized scratch repository, where every legacy fixture below is already materialized as byte-exact local files: {{legacy_state_path}} (compatible JSON-only spec-preparation run for feature {{legacy_feature_id}}, branch {{legacy_branch}}, marked completed by the legacy generator), {{malformed_state_path}} (malformed/incompatible legacy record), {{branch_derived_state_path}} (branch-derived legacy record carrying only branch and .active-feature identity), and a legacy `.active-feature` selector at the repository root. The legacy files are migration inputs, not live workspaces: never edit, rewrite, move, or delete them; record each file's SHA-256 before and after every journey and prove byte-for-byte preservation in the final evidence. The repository starts with no usable project constitution.\n\nIdentity rules: every state-changing call carries an explicit feature_id and run_key; branch names, `.active-feature`, and the current directory are legacy migration inputs only, consumed exclusively by the migration boundary and recorded as provenance — never infer new-work identity from them.\n\nExecute these journeys in order:\n\n1. Missing binding blocks first: open the legacy run through the explicit selection `/specify --feature {{legacy_feature_id}}`; when an explicit selection resolves to legacy-only state, the fail-closed migration boundary runs (use the canonical remediation command the report names if the boundary surfaces through it, and never fabricate a workspace by hand). Because no current constitution binding exists yet, migration must block: the blocked migration receipt names the missing current constitution binding as the exact diagnostic, no workspace or durable state is created, no checkpoint or approval capability appears, and the legacy source bytes are unchanged. The durable next action routes to the plugin-native constitution prerequisite.\n2. Resolve the binding: run the plugin-native constitution prerequisite for that exact blocked origin. Generate the native constitution and approve it through its one two-decision checkpoint with approve_continue so the current version and fingerprint bind to the migration origin, which then resumes exactly once without re-creating the draft or re-running the originating command.\n3. Compatible migration: with the binding established, the same explicit open now migrates the legacy run exactly once. Verify the migration receipt records the migrated outcome, the source digest of the exact legacy bytes, provenance for every consumed legacy selector (branch {{legacy_branch}}, `.active-feature`, legacy workflow and completion status), the explicit feature_id {{legacy_feature_id}} with the run_key bound in the receipt, and that the workspace materializes at `specs/{{legacy_feature_id}}` with durable state at `.work-state/features/{{legacy_feature_id}}/state.json` and source_kind legacy. Verify every phase record is unapproved (approved_version null, no checkpoint proof), the first unapproved phase is Specify, and the legacy completed flag produced no validation, approval, or handoff.\n4. New validation and fresh approval: resume `/specify --feature {{legacy_feature_id}}` so the migrated Specify record passes new validation bound to the current constitution fingerprint and presents its human checkpoint. Approve with approve_stop. Verify the trusted human proof binds the exact Specify version and epoch, the approval is new (nothing inherited from the legacy run), Plan and Tasks remain not_started, the approved Specify projection archives under `history/specify`, and no handoff exists.\n5. Idempotent replay: repeat the same open. Verify it returns the established record — the same receipt id, source digest, and constitution binding with an unchanged outcome; no duplicate workspace, migration receipt, capability, run, approval, or history entry; and the legacy source still byte-for-byte unchanged.\n6. Malformed fails closed: open {{malformed_state_path}} through the same explicit-selection boundary. Verify a blocked migration receipt with typed diagnostics (code, path, message) naming the exact incompatible fields of the unknown schema/workflow shape, no workspace, durable state, checkpoint, approval, or worker dispatch, and unchanged source bytes.\n7. Branch-derived is never inferred: open {{branch_derived_state_path}}. Verify migration rejects it rather than inferring identity: the blocked receipt states that branch names and `.active-feature` are not feature identity, no workspace is created, and the original bytes are unchanged.\n8. Interrupted new-format run: start `/specify --feature {{resume_feature_id}} {{resume_request}}` as a fresh native run, approve its Specify checkpoint with approve_stop, and verify the approval is durably committed. Treat that commit as the interruption point: stop the current OMP process only after durable state and readable projections are written.\n9. Exact resume: on a fresh process, re-select the exact feature and run with `/spec-plan --feature {{resume_feature_id}}`. Verify it resumes at the first unapproved phase (Plan) without replaying Specify: the approved Specify version, its trusted proof, and its history entry are unchanged; no duplicate capability, run, dispatch, phase version, or approval is created; and the Plan checkpoint presents exactly once. Approve with approve_stop and verify exactly one Plan approval, an intact trusted answer ledger, and the deterministic next action `/spec-tasks --feature {{resume_feature_id}}`.\n\nNever dispatch implementation work, never mark the migrated or resumed workspace implementation-ready, and never author phase content in the main session. End with a compact evidence summary: every migration receipt id and outcome, every legacy source SHA-256 with its before/after preservation verdict, phase approval counts for both workspaces, and the exact next action per workspace.",
+  "stages": [
+    {
+      "id": "missing-binding-blocked",
+      "name": "Migration without a current constitution binding blocks closed",
+      "expect": [
+        "legacy",
+        "migration",
+        "blocked",
+        "receipt",
+        "constitution binding",
+        "missing",
+        "diagnostics",
+        "byte-for-byte unchanged",
+        "no checkpoint",
+        "no approval capability",
+        "constitution prerequisite"
+      ]
+    },
+    {
+      "id": "constitution-bootstrap",
+      "name": "Constitution prerequisite binds the blocked migration origin",
+      "expect": [
+        "constitution",
+        "CONSTITUTION.md",
+        "native",
+        "fingerprint",
+        "binding",
+        "exact origin",
+        "resume",
+        "[ask_user]",
+        "approve_continue",
+        "request_changes"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]onstitution",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "compatible-migration",
+      "name": "Compatible legacy run migrates exactly once with provenance",
+      "expect": [
+        "migrated",
+        "receipt",
+        "source digest",
+        "provenance",
+        "feat/legacy-payment-retry",
+        ".active-feature",
+        "source_kind legacy",
+        "specs/{{legacy_feature_id}}",
+        ".work-state/features/{{legacy_feature_id}}/state.json",
+        "unapproved",
+        "approved_version null",
+        "first unapproved phase",
+        "Specify",
+        "no inferred approval",
+        "byte-for-byte unchanged"
+      ]
+    },
+    {
+      "id": "fresh-validation-approval",
+      "name": "Migrated records require new validation and fresh human approval",
+      "expect": [
+        "/specify --feature {{legacy_feature_id}}",
+        "validation/specify.md",
+        "new validation",
+        "constitution fingerprint",
+        "[ask_user]",
+        "approve_stop",
+        "trusted human proof",
+        "legacy completed status",
+        "no inherited approval",
+        "Plan not_started",
+        "Tasks not_started",
+        "history/specify",
+        "no handoff"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Ss]pecify",
+          "answer": "3",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "idempotent-replay",
+      "name": "Replay returns the established migration without duplicates",
+      "expect": [
+        "current",
+        "unchanged outcome",
+        "same receipt id",
+        "same source digest",
+        "no duplicate workspace",
+        "no duplicate migration receipt",
+        "no duplicate capability",
+        "no duplicate run",
+        "no duplicate approval",
+        "no fresh migration decision",
+        "byte-for-byte unchanged"
+      ]
+    },
+    {
+      "id": "malformed-blocked",
+      "name": "Malformed and incompatible legacy state fails closed",
+      "expect": [
+        "{{malformed_state_path}}",
+        "blocked",
+        "receipt",
+        "diagnostics",
+        "code",
+        "path",
+        "message",
+        "incompatible",
+        "no workspace",
+        "no checkpoint",
+        "no worker dispatch",
+        "byte-for-byte unchanged"
+      ]
+    },
+    {
+      "id": "branch-derived-blocked",
+      "name": "Branch-derived identity is never inferred",
+      "expect": [
+        "{{branch_derived_state_path}}",
+        "branch",
+        ".active-feature",
+        "not feature identity",
+        "blocked",
+        "receipt",
+        "diagnostics",
+        "no workspace",
+        "original preserved",
+        "byte-for-byte unchanged"
+      ]
+    },
+    {
+      "id": "interrupted-approve-stop",
+      "name": "New-format run approves Specify and stops durably",
+      "expect": [
+        "/specify --feature {{resume_feature_id}}",
+        "{{resume_request}}",
+        "Specify",
+        "validation/specify.md",
+        "[ask_user]",
+        "approve_stop",
+        "durable",
+        "approved version"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Ss]pecify",
+          "answer": "3",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "durable-interruption",
+      "name": "Interruption happens only after the approval is durable",
+      "expect": [
+        "approve_stop committed",
+        "process interrupted after approval",
+        "trusted human proof",
+        "durable state",
+        "no duplicate"
+      ]
+    },
+    {
+      "id": "exact-resume",
+      "name": "Fresh process resumes the first unapproved phase exactly once",
+      "expect": [
+        "/spec-plan --feature {{resume_feature_id}}",
+        "first unapproved phase",
+        "Plan",
+        "approved Specify unchanged",
+        "no repeated Specify dispatch",
+        "no duplicate capability",
+        "no duplicate run",
+        "no duplicate phase version",
+        "[ask_user]"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Pp]lan",
+          "answer": "3",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "resume-evidence",
+      "name": "Resume evidence is complete and the next action deterministic",
+      "expect": [
+        "one Plan approval",
+        "no duplicate dispatch",
+        "no duplicate approval",
+        "trusted answer ledger",
+        "deterministic next action",
+        "/spec-tasks --feature {{resume_feature_id}}",
+        "status.md",
+        "no handoff before Tasks approval"
+      ]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 600000,
+    "checkpointPollMs": 500
+  },
+  "screenshots": {
+    "on": [
+      "stage_start",
+      "stage_end",
+      "ask_user",
+      "error"
+    ]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

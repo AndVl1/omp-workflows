@@ -6,7 +6,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -80,22 +81,27 @@ test("non-ask tools pass even when bidirectional", () => {
   }
 });
 
-test("malformed escalation.json passes, never throws", () => {
+test("malformed escalation.json is blocked fail-closed with a typed configuration reason", () => {
   const cwd = mkdtempSync(join(tmpdir(), "outbox-gate-"));
   try {
     mkdirSync(join(cwd, ".omp"), { recursive: true });
     writeFileSync(join(cwd, ".omp", "escalation.json"), "{ not json !!");
-    assert.equal(outboxEnforcementGate(ask, { cwd }), undefined);
+    const result = outboxEnforcementGate(ask, { cwd });
+    assert.ok(result, "malformed present config must not fall through to interactive ask");
+    assert.equal(result.block, true);
+    assert.match(result.reason, /configuration is blocked/);
   } finally {
     cleanup(cwd);
   }
 });
 
-test("missing cwd path passes, never throws", () => {
-  const cwd = join(tmpdir(), "outbox-gate-does-not-exist-" + Date.now());
-  assert.equal(outboxEnforcementGate(ask, { cwd }), undefined);
-});
 
+test("missing cwd path blocks fail-closed without leaking a path", () => {
+  const cwd = join(tmpdir(), "outbox-gate-does-not-exist-" + Date.now());
+  const result = outboxEnforcementGate(ask, { cwd });
+  assert.equal(result?.block, true);
+  assert.match(result?.reason ?? "", /configuration is blocked/);
+});
 // ── Explicit channels[] (architecture-4): hasBidirectionalChannel now
 // resolves through the shared normalizer (cto/channels.ts), so a
 // capability-validated RW primary blocks ask and a declared-rw incapable
@@ -120,5 +126,59 @@ test("ask passes for an explicit declared-rw incapable kind (http downgrades to 
     assert.equal(outboxEnforcementGate(ask, { cwd }), undefined, "http has no inbound -> ro -> ask passes");
   } finally {
     cleanup(cwd);
+  }
+});
+
+test("ask is blocked with a typed configuration reason for an invalid marked RW primary", () => {
+  const cwd = makeCwd({
+    channels: [{ id: "broken", adapter: "http", direction: "read-write", primary: true }],
+  });
+  try {
+    const result = outboxEnforcementGate(ask, { cwd });
+    assert.ok(result, "invalid marked primary must not fall through to interactive ask");
+    assert.equal(result.block, true);
+    assert.match(result.reason, /configuration is blocked/);
+  } finally {
+    cleanup(cwd);
+  }
+});
+
+test("ask blocks unsafe escalation config files without exposing filesystem details", () => {
+  const symlinkRoot = makeCwd();
+  const outside = mkdtempSync(join(tmpdir(), "outbox-config-outside-"));
+  try {
+    mkdirSync(join(symlinkRoot, ".omp"), { recursive: true });
+    writeFileSync(join(outside, "config.json"), JSON.stringify({ adapter: "telegram" }));
+    symlinkSync(join(outside, "config.json"), join(symlinkRoot, ".omp", "escalation.json"));
+    const result = outboxEnforcementGate(ask, { cwd: symlinkRoot });
+    assert.equal(result?.block, true);
+    assert.match(result?.reason ?? "", /configuration is blocked/);
+    assert.doesNotMatch(result?.reason ?? "", /outbox-config-outside/);
+  } finally {
+    cleanup(symlinkRoot);
+    cleanup(outside);
+  }
+
+  const fifoRoot = makeCwd();
+  try {
+    mkdirSync(join(fifoRoot, ".omp"), { recursive: true });
+    const fifo = join(fifoRoot, ".omp", "escalation.json");
+    assert.equal(spawnSync("mkfifo", [fifo]).status, 0);
+    const result = outboxEnforcementGate(ask, { cwd: fifoRoot });
+    assert.equal(result?.block, true);
+    assert.match(result?.reason ?? "", /configuration is blocked/);
+  } finally {
+    cleanup(fifoRoot);
+  }
+
+  const largeRoot = makeCwd();
+  try {
+    mkdirSync(join(largeRoot, ".omp"), { recursive: true });
+    writeFileSync(join(largeRoot, ".omp", "escalation.json"), "x".repeat(256 * 1024 + 1));
+    const result = outboxEnforcementGate(ask, { cwd: largeRoot });
+    assert.equal(result?.block, true);
+    assert.match(result?.reason ?? "", /configuration is blocked/);
+  } finally {
+    cleanup(largeRoot);
   }
 });

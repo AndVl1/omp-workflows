@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { run } from "../src/engine/run.js";
-import { registerWorkflowProfiles } from "../src/engine/profile.js";
-import { writeState } from "../src/engine/state.js";
+import { registerTestProfiles, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { setStateTransactionTestHooks, writeState } from "../src/engine/state.js";
 import type { Profile, TaskType, TeamState } from "../src/engine/types.js";
 import type { TaskCaller, TaskResult } from "../src/engine/stage.js";
 
@@ -24,7 +24,6 @@ const profile: Profile = {
   ],
 };
 
-registerWorkflowProfiles([profile]);
 
 function taskResult(id: string): TaskResult {
   return { id, output: "ok", artifacts: {}, exitCode: 0 };
@@ -55,6 +54,8 @@ function fixtureState(branch: string, statuses: TeamState["stages"][number]["sta
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
+  writeTestRegistryMarker(root);
+  registerTestProfiles(root, [profile]);
 }
 
 function options(root: string, branch: string, taskTool: TaskCaller, continuation?: { feedback: string; stageId: string }) {
@@ -163,7 +164,7 @@ test("run continuation keeps explicit custom feature state and artifacts layout"
       async batch(args) { prompts.push(...args.tasks.map((task) => task.task)); return args.tasks.map(() => taskResult("batch")); },
     };
     const result = await run(options(root, branch, taskTool, { feedback: "custom feedback", stageId: "reopened" }));
-    assert.equal(result.statePath, join(customDir, "state.json"));
+    assert.equal(result.statePath, realpathSync(join(customDir, "state.json")));
     assert.ok(prompts.some((prompt) => prompt.includes('"source": "custom"')));
     const state = JSON.parse(readFileSync(result.statePath!, "utf8")) as TeamState;
     assert.equal(state.pause.kind, "done");
@@ -189,11 +190,220 @@ test("run continuation keeps legacy state and artifacts layout", async () => {
       async batch(args) { prompts.push(...args.tasks.map((task) => task.task)); return args.tasks.map(() => taskResult("batch")); },
     };
     const result = await run(options(root, branch, taskTool, { feedback: "legacy feedback", stageId: "reopened" }));
-    assert.equal(result.statePath, join(legacyDir, "team-state.json"));
+    assert.equal(result.statePath, realpathSync(join(legacyDir, "team-state.json")));
     assert.ok(prompts.some((prompt) => prompt.includes('"source": "legacy"')));
     assert.equal(existsSync(join(root, ".work-state", "features", "feature-x", "state.json")), false);
     assert.equal(existsSync(join(legacyDir, "team-state.json")), true);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle start rereads and preserves a concurrent generic state mutation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-run-state-race-"));
+  const branch = "feature/state-race";
+  const featureId = "state-race";
+  const runKey = "run-state-race";
+  try {
+    initGit(root, branch);
+    const seeded = fixtureState(branch, ["done", "done", "done"]);
+    seeded.run_key = runKey;
+    writeState(root, seeded, { featureSlug: featureId });
+    let transactionCount = 0;
+    setStateTransactionTestHooks({
+      afterTargetResolution: ({ statePath }) => {
+        if (++transactionCount !== 2) return;
+        const current = JSON.parse(readFileSync(statePath, "utf8")) as TeamState & { state_revision?: number };
+        current.task = "concurrent-task-mutation";
+        current.state_revision = (current.state_revision ?? 0) + 1;
+        writeFileSync(statePath, JSON.stringify(current, null, 2) + "\n", "utf8");
+      },
+    }, root);
+    const taskTool: TaskCaller = {
+      async call() { return taskResult("race-call"); },
+      async batch(args) { return args.tasks.map((_, index) => taskResult(`race-batch-${index}`)); },
+    };
+    const result = await run({
+      task: "Race lifecycle with generic state mutation",
+      cwd: root,
+      branch,
+      autonomous: false,
+      classification: {
+        type: "FEATURE",
+        complexity: "QUICK",
+        confidence: "HIGH",
+        autonomous: false,
+        workflow: PROFILE_NAME,
+      },
+      taskTool,
+      continuation: { feedback: "reopen raced stage", stageId: "reopened" },
+      feature_id: featureId,
+      run_key: runKey,
+    }, root);
+    const state = JSON.parse(readFileSync(result.statePath!, "utf8")) as TeamState & { state_revision?: number };
+    assert.match(state.task, /concurrent-task-mutation/u);
+    assert.equal(state.dispatch_capability?.status, "complete");
+    assert.ok((state.state_revision ?? 0) >= 4, "prepare and lifecycle commits must advance revision monotonically");
+    assert.equal(transactionCount >= 2, true, "the second transaction is the lifecycle start barrier");
+  } finally {
+    setStateTransactionTestHooks(null, root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("generic restart reuses ready and dispatched capabilities without duplicate provider dispatch", async () => {
+  for (const mode of ["ready", "dispatched"] as const) {
+    const root = mkdtempSync(join(tmpdir(), `omp-run-restart-${mode}-`));
+    const branch = `feature/restart-${mode}`;
+    let firstAttempt = true;
+    let statePath = "";
+    const observed: Array<{ capabilityId: string; dispatchId?: string }> = [];
+    let calls = 0;
+    const callStages: string[] = [];
+    const taskTool: TaskCaller = {
+      async call({ task }) {
+        callStages.push(task.match(/## Stage: ([^ ]+)/)?.[1] ?? "unknown");
+        calls += 1;
+        if (!firstAttempt) {
+          const persisted = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+          observed.push({
+            capabilityId: persisted.dispatch_capability?.capability_id ?? "",
+            dispatchId: persisted.dispatch_capability?.dispatches?.[0]?.id,
+          });
+        }
+        if (firstAttempt) {
+          firstAttempt = false;
+          return { id: "pending", output: "", error: "provider remains active", exitCode: 0, pending: true };
+        }
+        return taskResult(`restart-${calls}`);
+      },
+      async batch(args) {
+        return args.tasks.map((_, index) => taskResult(`restart-batch-${index}`));
+      },
+    };
+    try {
+      initGit(root, branch);
+      const first = await run({
+        task: "restart capability",
+        cwd: root,
+        branch,
+        autonomous: false,
+        classification: {
+          type: "FEATURE",
+          complexity: "QUICK",
+          confidence: "HIGH",
+          autonomous: false,
+          workflow: PROFILE_NAME,
+        },
+        taskTool,
+      });
+      statePath = first.statePath;
+      const interrupted = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+      const capability = interrupted.dispatch_capability;
+      assert.ok(capability?.capability_id && capability.issued_for?.stage_cursor === "upstream");
+      assert.equal(capability?.status, "dispatched");
+      const originalCapabilityId = capability?.capability_id;
+      const originalDispatchId = capability?.dispatches?.[0]?.id;
+      if (mode === "ready" && capability) {
+        writeState(root, {
+          ...interrupted,
+          dispatch_capability: { ...capability, status: "ready", dispatches: [] },
+        }, { featureSlug: branch.replace(/\//g, "-") });
+      }
+      await run({
+        task: "restart capability replay",
+        cwd: root,
+        branch,
+        autonomous: true,
+        classification: {
+          type: "BUG_FIX",
+          complexity: "COMPLEX",
+          confidence: "LOW",
+          autonomous: true,
+          workflow: "debug-cycle",
+        },
+        taskTool,
+        continuation: { feedback: "resume the interrupted stage", stageId: "upstream" },
+      });
+      assert.equal(calls, 4, `${mode}: one interrupted call, one resumed upstream call, reopened continuation, and downstream call`);
+      assert.equal(observed[0]?.capabilityId, originalCapabilityId, `${mode}: capability identity is preserved across restart`);
+      if (mode === "dispatched") assert.equal(observed[0]?.dispatchId, originalDispatchId, "dispatched restart must reuse the authorized dispatch");
+      const finalState = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+      assert.equal(finalState.pause.kind, "done");
+      assert.equal(finalState.dispatch_capability?.status, "complete");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("generic restart rejects profile and configuration mutation instead of reminting", async () => {
+  for (const mutation of ["profile", "config"] as const) {
+    const root = mkdtempSync(join(tmpdir(), `omp-run-restart-mutated-${mutation}-`));
+    const branch = `feature/restart-mutated-${mutation}`;
+    let firstAttempt = true;
+    let calls = 0;
+    let statePath = "";
+    const taskTool: TaskCaller = {
+      async call() {
+        calls += 1;
+        if (firstAttempt) {
+          firstAttempt = false;
+          return { id: "pending", output: "", error: "provider remains active", exitCode: 0, pending: true };
+        }
+        return taskResult("unexpected");
+      },
+      async batch() { return []; },
+    };
+    try {
+      initGit(root, branch);
+      const first = await run({
+        task: "restart mutation",
+        cwd: root,
+        branch,
+        autonomous: false,
+        classification: {
+          type: "FEATURE",
+          complexity: "QUICK",
+          confidence: "HIGH",
+          autonomous: false,
+          workflow: PROFILE_NAME,
+        },
+        taskTool,
+      });
+      statePath = first.statePath;
+      const interrupted = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+      assert.equal(interrupted.dispatch_capability?.status, "dispatched");
+      if (mutation === "profile") {
+        const tampered = { ...interrupted, profile_hash: "mutated-continuation-profile-hash" };
+        writeFileSync(statePath, JSON.stringify(tampered, null, 2) + "\n", "utf8");
+      } else {
+        mkdirSync(join(root, ".omp"), { recursive: true });
+        writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: { worker: "mutated-worker" } }) + "\n");
+      }
+      await assert.rejects(
+        run({
+          task: "restart mutation replay",
+          cwd: root,
+          branch,
+          autonomous: true,
+          classification: {
+            type: "BUG_FIX",
+            complexity: "COMPLEX",
+            confidence: "LOW",
+            autonomous: true,
+            workflow: "debug-cycle",
+          },
+          taskTool,
+          continuation: { feedback: "resume mutated stage", stageId: "upstream" },
+        }),
+        /persisted durable stage|state_invalid|stale/u,
+      );
+      assert.equal(calls, 1, `${mutation}: mutation must reject before provider dispatch`);
+      const after = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+      assert.equal(after.dispatch_capability?.capability_id, interrupted.dispatch_capability?.capability_id);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });

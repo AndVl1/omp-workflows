@@ -1,0 +1,28 @@
+{
+  "slug": "omp-spec-e2e-complete",
+  "url": "http://127.0.0.1:60770/?token=KPg-iPiF3OGVMbMo1jXfPVcnnAVr5oC8lizyogTElLk",
+  "token": "KPg-iPiF3OGVMbMo1jXfPVcnnAVr5oC8lizyogTElLk",
+  "wsPath": "/ws",
+  "pid": 52253,
+  "started_at": "2026-09-02T23:46:04.529Z",
+  "omp_version": "omp/18.0.11",
+  "tty": {
+    "cols": 100,
+    "rows": 30,
+    "term": "xterm-256color"
+  },
+  "task_prompt": "Exercise the read-only external specification import contract.",
+  "scenario": {
+    "id": "spec-import",
+    "title": "Read-only external specification import"
+  },
+  "surface": "text",
+  "host_config": {
+    "path": "/Users/a.vladislavov/.omp/agent/config.yml",
+    "warning": null
+  },
+  "user_config": {
+    "path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-9TuB0s/omp-spec-e2e-complete/.omp/ux-e2e-overlay.user.json",
+    "default_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-9TuB0s/omp-spec-e2e-complete/.omp/ux-e2e-overlay.user.json"
+  }
+}

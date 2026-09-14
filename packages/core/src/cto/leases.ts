@@ -14,7 +14,6 @@
 
 import { randomUUID } from "node:crypto";
 import type { CtoState, TeamLease } from "./types.js";
-import { writeCtoState } from "./state.js";
 
 /**
  * Lease liveness. `ttl_ms === 0` → alive iff the holder PID is alive
@@ -45,48 +44,53 @@ export function isLeaseAlive(lease: TeamLease, now: number = Date.now()): boolea
  * Acquire the fence for one team. If a live lease already exists for
  * `teamId` → `{ state, conflict }` with NO mutation (no duplicate
  * completion). If the existing lease is dead → force-reclaimed with a new
- * token and returned as the fresh lease. Persists via `writeCtoState`
- * when `root` is provided.
+ * token and returned as the fresh lease. The transition performs no persistence;
+ * callers commit through a trusted runtime transaction.
  */
 export function acquireLease(
   state: CtoState,
   teamId: string,
   pid: number,
   ttlMs: number = 0,
-  root: string | null = null,
 ): { state: CtoState; lease: TeamLease } | { state: CtoState; conflict: string } {
-  const existing = state.leases?.[teamId];
-  if (existing && isLeaseAlive(existing)) {
-    return {
-      state,
-      conflict: `team "${teamId}" already has a live lease (pid ${existing.pid}) — duplicate spawn blocked`,
+  let lease: TeamLease | undefined;
+  let conflict: string | undefined;
+  const apply = (current: CtoState): boolean => {
+    const existing = current.leases?.[teamId];
+    if (existing && isLeaseAlive(existing)) {
+      conflict = `team "${teamId}" already has a live lease (pid ${existing.pid}) — duplicate spawn blocked`;
+      return false;
+    }
+    const now = new Date().toISOString();
+    lease = {
+      token: randomUUID(),
+      acquired_at: now,
+      heartbeat_at: now,
+      ttl_ms: ttlMs,
+      pid,
+      team_id: teamId,
     };
-  }
-  const now = new Date().toISOString();
-  const lease: TeamLease = {
-    token: randomUUID(),
-    acquired_at: now,
-    heartbeat_at: now,
-    ttl_ms: ttlMs,
-    pid,
-    team_id: teamId,
+    if (!current.leases) current.leases = {};
+    current.leases[teamId] = lease;
+    return true;
   };
-  if (!state.leases) state.leases = {};
-  state.leases[teamId] = lease;
-  if (root) writeCtoState(state, root);
-  return { state, lease };
+  apply(state);
+  if (conflict) return { state, conflict };
+  return { state, lease: lease! };
 }
 
 /**
  * Refresh `heartbeat_at` — only when `token` matches the current lease.
  * Stale/wrong token → no-op, state unchanged (and no write).
  */
-export function heartbeatLease(state: CtoState, teamId: string, token: string, root: string | null = null): CtoState {
-  const lease = state.leases?.[teamId];
-  if (lease && lease.token === token) {
+export function heartbeatLease(state: CtoState, teamId: string, token: string): CtoState {
+  const apply = (current: CtoState): boolean => {
+    const lease = current.leases?.[teamId];
+    if (!lease || lease.token !== token) return false;
     lease.heartbeat_at = new Date().toISOString();
-    if (root) writeCtoState(state, root);
-  }
+    return true;
+  };
+  apply(state);
   return state;
 }
 
@@ -94,34 +98,38 @@ export function heartbeatLease(state: CtoState, teamId: string, token: string, r
  * Remove the lease for `teamId` — only when `token` matches. Wrong token
  * → no-op, state unchanged.
  */
-export function releaseLease(state: CtoState, teamId: string, token: string, root: string | null = null): CtoState {
-  const lease = state.leases?.[teamId];
-  if (lease && lease.token === token) {
-    delete state.leases![teamId];
-    if (root) writeCtoState(state, root);
-  }
+export function releaseLease(state: CtoState, teamId: string, token: string): CtoState {
+  const apply = (current: CtoState): boolean => {
+    const lease = current.leases?.[teamId];
+    if (!lease || lease.token !== token) return false;
+    delete current.leases![teamId];
+    return true;
+  };
+  apply(state);
   return state;
 }
 
 /**
  * Remove every dead lease (TTL expired and/or PID gone); returns the
- * reclaimed teamIds. Persists when `root` is provided AND at least one
- * lease was reclaimed (no write on a no-op).
+ * reclaimed teamIds. The transition performs no persistence.
  */
 export function reclaimDeadLeases(
   state: CtoState,
   now: number = Date.now(),
-  root: string | null = null,
 ): { state: CtoState; reclaimed: string[] } {
-  const reclaimed: string[] = [];
-  const leases = state.leases;
-  if (!leases) return { state, reclaimed };
-  for (const [teamId, lease] of Object.entries(leases)) {
-    if (!isLeaseAlive(lease, now)) {
-      delete leases[teamId];
-      reclaimed.push(teamId);
+  let reclaimed: string[] = [];
+  const apply = (current: CtoState): boolean => {
+    reclaimed = [];
+    const leases = current.leases;
+    if (!leases) return false;
+    for (const [teamId, lease] of Object.entries(leases)) {
+      if (!isLeaseAlive(lease, now)) {
+        delete leases[teamId];
+        reclaimed.push(teamId);
+      }
     }
-  }
-  if (root && reclaimed.length > 0) writeCtoState(state, root);
+    return reclaimed.length > 0;
+  };
+  apply(state);
   return { state, reclaimed };
 }

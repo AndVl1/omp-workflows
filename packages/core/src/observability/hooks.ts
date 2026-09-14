@@ -13,9 +13,8 @@
  * the engine's notion of the "active feature".
  */
 
-import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { execSync } from "node:child_process";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { PinnedProjectRoot, PinnedRootError } from "../specification/pinned-root.js";
 import { EventRecorder } from "./recorder.js";
 import { extractSkills } from "./skills.js";
 import type {
@@ -34,6 +33,7 @@ import type {
 
 const ACTIVE_FEATURE = ".active-feature";
 const WORK_STATE_DIR = ".work-state";
+const ACTIVE_FEATURE_MAX_BYTES = 4096;
 
 /** Narrow the OMP extension context to the few fields we read. */
 function ctxCwd(ctx: unknown): string | undefined {
@@ -59,17 +59,22 @@ function currentBranch(cwd: string): string {
  * Resolve the active feature slug. Falls back to "default" so the recorder
  * always has a place to write.
  */
-function activeFeatureSlug(cwd: string): string {
-  const workState = resolve(cwd, WORK_STATE_DIR);
-  const active = resolve(workState, ACTIVE_FEATURE);
-  if (!existsSync(active)) return "default";
+function activeFeatureSlug(pinnedRoot: PinnedProjectRoot): string {
   try {
-    const realRoot = realpathSync(workState);
-    const realPointer = realpathSync(active);
-    const rel = relative(realRoot, realPointer);
-    if (rel !== ACTIVE_FEATURE && (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel))) return "default";
-    const slug = readFileSync(active, "utf8").trim();
-    return /^[A-Za-z0-9._-]+$/.test(slug) ? slug : "default";
+    // Native runs publish the selector under .work-state. Legacy runs keep the
+    // canonical selector at the project root; consult it only when the native
+    // pointer is absent so a compatible migration never creates features/default.
+    const candidates = [`${WORK_STATE_DIR}/${ACTIVE_FEATURE}`, ACTIVE_FEATURE];
+    for (const relativePath of candidates) {
+      const info = pinnedRoot.pathEntryInfo(relativePath);
+      if (info === null) continue;
+      if (info.kind !== "file") return "default";
+      const bytes = pinnedRoot.readFile(relativePath, { maxBytes: ACTIVE_FEATURE_MAX_BYTES }).bytes;
+      const slug = new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim();
+      if (!pinnedRoot.isStable()) return "default";
+      return /^[A-Za-z0-9._-]+$/.test(slug) ? slug : "default";
+    }
+    return "default";
   } catch {
     return "default";
   }
@@ -80,11 +85,19 @@ const recorderCache = new Map<string, EventRecorder>();
 function getRecorder(cwd: string): EventRecorder {
   const cached = recorderCache.get(cwd);
   if (cached) return cached;
-  const branch = currentBranch(cwd);
-  const featureSlug = activeFeatureSlug(cwd);
-  const rec = new EventRecorder({ cwd, branch, featureSlug });
-  recorderCache.set(cwd, rec);
-  return rec;
+  const pinnedRoot = PinnedProjectRoot.open(cwd);
+  if (!pinnedRoot) throw new PinnedRootError("unsupported", "project root could not be pinned for observability");
+  let retained = false;
+  try {
+    const branch = currentBranch(cwd);
+    const featureSlug = activeFeatureSlug(pinnedRoot);
+    const rec = new EventRecorder({ cwd, branch, featureSlug, pinnedRoot });
+    recorderCache.set(cwd, rec);
+    retained = true;
+    return rec;
+  } finally {
+    if (!retained) pinnedRoot.close();
+  }
 }
 
 /**

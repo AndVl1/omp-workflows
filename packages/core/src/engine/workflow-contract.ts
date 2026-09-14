@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { loadProfile, profileHash as sharedProfileHash, resolveWorkflowProfilePath } from "./profile.js";
 import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope } from "./scope.js";
-import { resolveActiveBranch, resolveState } from "./state.js";
+import { resolveActiveBranch, resolveActiveStatePinned, resolveStatePinned } from "./state.js";
+import { isSafeFeatureId } from "../specification/validation.js";
+import type { FeatureStateSelector, ResolvedState } from "./state.js";
 import { resolveStageDispatchSlots } from "./stage.js";
-import { sanitizeSlot } from "./fan-in.js";
-import { artifactSchemaFor, type JsonSchemaDef } from "./artifact-contract.js";
+import { durableNamespacedArtifactId } from "./fan-in.js";
+import { selectLatestValidCheckpointDecision } from "./checkpoints.js";
+import { artifactSchemaFor, specificationPhaseSchemaForConstitution, validateProducedArtifact, type JsonSchemaDef } from "./artifact-contract.js";
+import { parseArtifactJson } from "./artifacts.js";
 import type {
   CheckpointPolicy,
   CheckpointRule,
@@ -29,6 +32,9 @@ import type {
   WorkflowContractStatus,
   WorkflowName,
 } from "./types.js";
+import { PinnedProjectRoot } from "../specification/pinned-root.js";
+import { readPinnedConstitutionPrincipleIdentities } from "../specification/constitution-identities.js";
+import type { FeatureWorkspace } from "../specification/types.js";
 
 export interface TypedContractIssue {
   path: string;
@@ -110,17 +116,19 @@ function validateCompletionIntent(value: unknown, path: string, issues: TypedCon
   }
   unknownKeys(value, ["mode", "acceptance", "source", "rationale"], path, issues);
   requireEnum(value, "mode", ["complete_outcome", "handoff_only"], path, issues);
-  requireEnum(value, "acceptance", ["dod_and_artifacts", "explicit_human_acceptance"], path, issues);
+  requireEnum(value, "acceptance", ["quality_gates_and_artifacts", "explicit_human_acceptance"], path, issues);
   requireEnum(value, "source", ["user", "workflow_policy", "migration"], path, issues);
   requireString(value, "rationale", path, issues);
 }
 
 const CHECKPOINT_KINDS: readonly string[] = [
+  "constitution_approval", "specification_phase_approval",
   "product_approval", "clarification", "architecture_choice", "implementation_approval",
   "review_fix", "regression_plan", "integration_acceptance", "security",
   "destructive_side_effect", "production", "bundle_activation", "migration_cutover", "custom",
 ];
 const HARD_HUMAN_KINDS: readonly string[] = [
+  "constitution_approval", "specification_phase_approval",
   "product_approval", "security", "destructive_side_effect", "production",
   "bundle_activation", "migration_cutover", "custom",
 ];
@@ -250,7 +258,7 @@ function validateRosterPolicy(value: unknown, path: string, issues: TypedContrac
   }
 }
 
-function validateWorkIdentity(value: unknown, path: string, issues: TypedContractIssue[]): void {
+export function validateWorkIdentity(value: unknown, path: string, issues: TypedContractIssue[]): void {
   if (!isRecord(value)) {
     addIssue(issues, path, "must be an object");
     return;
@@ -326,7 +334,7 @@ function validatePendingState(value: unknown, path: string, issues: TypedContrac
     addIssue(issues, path, "must be an object");
     return;
   }
-  unknownKeys(value, ["identity", "status", "pending_reason", "provider_ref", "lease", "terminal_signal", "retry_of", "updated_at"], path, issues);
+  unknownKeys(value, ["identity", "status", "pending_reason", "provider_ref", "reconciliation", "lease", "terminal_signal", "retry_of", "updated_at"], path, issues);
   validateWorkIdentity(value.identity, `${path}.identity`, issues);
   requireEnum(value, "status", ["authorized", "running", "pending", "succeeded", "failed", "cancelled"], path, issues);
   if (value.pending_reason !== undefined && (typeof value.pending_reason !== "string" || !["provider_running", "awaiting_result", "transport_reconnect"].includes(value.pending_reason))) {
@@ -347,6 +355,43 @@ function validatePendingState(value: unknown, path: string, issues: TypedContrac
   requireString(value, "updated_at", path, issues);
   if (value.status === "pending" && value.terminal_signal !== undefined && value.terminal_signal !== null) {
     addIssue(issues, `${path}.terminal_signal`, "pending work cannot claim a terminal signal");
+  }
+  if (value.reconciliation !== undefined) {
+    const reconciliationPath = `${path}.reconciliation`;
+    if (!isRecord(value.reconciliation)) {
+      addIssue(issues, reconciliationPath, "must be an object");
+    } else {
+      const reconciliation = value.reconciliation;
+      unknownKeys(
+        reconciliation,
+        ["identity", "result_digest", "outcome", "evidence", "artifact_ids", "terminal_signal", "provider_id", "updated_at"],
+        reconciliationPath,
+        issues,
+      );
+      validateWorkIdentity(reconciliation.identity, `${reconciliationPath}.identity`, issues);
+      if (typeof reconciliation.result_digest !== "string" || !/^[a-f0-9]{64}$/u.test(reconciliation.result_digest)) addIssue(issues, `${reconciliationPath}.result_digest`, "must be a lowercase SHA-256 digest");
+      requireEnum(reconciliation, "outcome", ["succeeded", "failed", "cancelled"], reconciliationPath, issues);
+      if (typeof reconciliation.evidence !== "string"
+        || !nonEmptyString(reconciliation.evidence)
+        || Buffer.byteLength(reconciliation.evidence, "utf8") > 8192
+        || /[\u0000-\u001f\u007f\r\n]/u.test(reconciliation.evidence)) addIssue(issues, `${reconciliationPath}.evidence`, "must be bounded non-empty line-inert text");
+      const artifactIds = stringArray(reconciliation.artifact_ids, `${reconciliationPath}.artifact_ids`, issues);
+      if (artifactIds && artifactIds.length > 64) addIssue(issues, `${reconciliationPath}.artifact_ids`, "must contain at most 64 identifiers");
+      if (artifactIds) artifactIds.forEach((id, index) => {
+        if (!/^[A-Za-z0-9._-]+$/u.test(id) || id === "." || id === "..") addIssue(issues, `${reconciliationPath}.artifact_ids[${index}]`, "must be a safe identifier");
+      });
+      if (isRecord(value.identity) && isRecord(reconciliation.identity) && hash(value.identity) !== hash(reconciliation.identity)) {
+        addIssue(issues, `${reconciliationPath}.identity`, `must match ${path}.identity`);
+      }
+      if (typeof reconciliation.updated_at !== "string"
+        || !nonEmptyString(reconciliation.updated_at)
+        || Buffer.byteLength(reconciliation.updated_at, "utf8") > 256
+        || /[\u0000-\u001f\u007f\r\n]/u.test(reconciliation.updated_at)) addIssue(issues, `${reconciliationPath}.updated_at`, "must be bounded line-inert text");
+      if (isRecord(value.identity) && isRecord(reconciliation.identity) && JSON.stringify(value.identity) !== JSON.stringify(reconciliation.identity)) {
+        addIssue(issues, `${reconciliationPath}.identity`, `must match ${path}.identity`);
+      }
+      if (value.status !== "pending") addIssue(issues, reconciliationPath, `is only valid while ${path}.status is pending`);
+    }
   }
 }
 
@@ -389,12 +434,13 @@ function validateCompletionEnvelope(value: unknown, path: string, issues: TypedC
         addIssue(issues, entryPath, "must be an object");
         return;
       }
-      unknownKeys(entry, ["artifact_id", "path", "sha256", "schema_status", "dod_status"], entryPath, issues);
+      unknownKeys(entry, ["artifact_id", "path", "sha256", "size_bytes", "schema_status", "quality_gate_status"], entryPath, issues);
       requireString(entry, "artifact_id", entryPath, issues);
       if (!safeRelativePath(entry.path)) addIssue(issues, `${entryPath}.path`, "must be a safe relative path");
       requireString(entry, "sha256", entryPath, issues);
+      if (entry.size_bytes !== undefined && (typeof entry.size_bytes !== "number" || !Number.isSafeInteger(entry.size_bytes) || entry.size_bytes < 0)) addIssue(issues, `${entryPath}.size_bytes`, "must be a non-negative safe integer");
       requireEnum(entry, "schema_status", ["met", "failed"], entryPath, issues);
-      requireEnum(entry, "dod_status", ["met", "pending", "failed"], entryPath, issues);
+      requireEnum(entry, "quality_gate_status", ["met", "pending", "failed"], entryPath, issues);
     });
   }
   if (!hasOwn(value, "evidence_ref") || (value.evidence_ref !== null && !nonEmptyString(value.evidence_ref))) addIssue(issues, `${path}.evidence_ref`, "must be a non-empty string or null");
@@ -414,9 +460,10 @@ function validateCheckpointAnswerProof(value: unknown, path: string, issues: Typ
     addIssue(issues, path, "must be an object");
     return;
   }
-  unknownKeys(value, ["answer_id", "nonce", "channel", "reference", "binding"], path, issues);
+  unknownKeys(value, ["answer_id", "nonce", "channel", "reference", "binding", "feedback"], path, issues);
   for (const key of ["answer_id", "nonce", "reference", "binding"]) requireString(value, key, path, issues);
   requireEnum(value, "channel", ["terminal", "escalation"], path, issues);
+  if (value.feedback !== undefined && (typeof value.feedback !== "string" || value.feedback.length === 0 || value.feedback !== value.feedback.trim() || Buffer.byteLength(value.feedback, "utf8") > 8192 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value.feedback))) addIssue(issues, `${path}.feedback`, "must be bounded non-empty single-line text");
 }
 function validateTrustedCheckpointAnswer(value: unknown, path: string, issues: TypedContractIssue[]): void {
   if (!isRecord(value)) {
@@ -426,7 +473,7 @@ function validateTrustedCheckpointAnswer(value: unknown, path: string, issues: T
   unknownKeys(value, [
     "answer_id", "nonce", "channel", "reference", "run_id", "stage_id", "checkpoint_id",
     "work_identity_hash", "capability_id", "capability_epoch", "policy_hash", "decision",
-    "binding", "issued_at", "consumed_at",
+    "binding", "authority_receipt", "issued_at", "consumed_at", "feature_id", "loop_iteration", "subject_binding", "subject_revision", "feedback",
   ], path, issues);
   for (const key of [
     "answer_id", "nonce", "reference", "run_id", "stage_id", "checkpoint_id",
@@ -434,7 +481,23 @@ function validateTrustedCheckpointAnswer(value: unknown, path: string, issues: T
     "decision", "binding", "issued_at",
   ]) requireString(value, key, path, issues);
   requireEnum(value, "channel", ["terminal", "escalation"], path, issues);
+  if (value.authority_receipt !== undefined) requireString(value, "authority_receipt", path, issues);
   if (value.consumed_at !== undefined) requireString(value, "consumed_at", path, issues);
+  if (value.feedback !== undefined && (typeof value.feedback !== "string" || value.feedback.length === 0 || value.feedback !== value.feedback.trim() || Buffer.byteLength(value.feedback, "utf8") > 8192 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value.feedback))) addIssue(issues, `${path}.feedback`, "must be bounded non-empty single-line text");
+  if (value.feature_id !== undefined && !isSafeFeatureId(value.feature_id)) {
+    addIssue(issues, `${path}.feature_id`, "must be a safe feature id");
+  }
+  const loopIteration = value.loop_iteration;
+  if (loopIteration !== undefined && (typeof loopIteration !== "number" || !Number.isSafeInteger(loopIteration) || loopIteration < 1 || loopIteration > 1_000_000)) {
+    addIssue(issues, `${path}.loop_iteration`, "must be a safe integer between 1 and 1000000");
+  }
+  if (value.subject_binding !== undefined && (typeof value.subject_binding !== "string" || !/^[a-f0-9]{64}$/u.test(value.subject_binding))) {
+    addIssue(issues, `${path}.subject_binding`, "must be a lowercase SHA-256 digest");
+  }
+  const subjectRevision = value.subject_revision;
+  if (subjectRevision !== undefined && (typeof subjectRevision !== "number" || !Number.isSafeInteger(subjectRevision) || subjectRevision < 0)) {
+    addIssue(issues, `${path}.subject_revision`, "must be a non-negative safe integer");
+  }
 }
 
 function validateCheckpointDecision(value: unknown, path: string, issues: TypedContractIssue[]): void {
@@ -446,6 +509,8 @@ function validateCheckpointDecision(value: unknown, path: string, issues: TypedC
     "stage_id", "checkpoint", "mode", "decision", "actor", "rationale", "decided_at",
     "run_id", "checkpoint_id", "checkpoint_kind", "authorization", "actor_provenance",
     "capability_id", "capability_epoch", "policy_hash", "work_identity",
+    "feature_id", "loop_iteration", "subject_binding",
+    "artifact_id", "artifact_version", "artifact_digest", "validation_ref", "validation_digest",
   ], path, issues);
   for (const key of ["stage_id", "checkpoint", "decision", "actor", "rationale", "decided_at"]) requireString(value, key, path, issues);
   requireEnum(value, "mode", ["interactive", "autonomous"], path, issues);
@@ -459,12 +524,22 @@ function validateCheckpointDecision(value: unknown, path: string, issues: TypedC
       requireString(value.actor_provenance, "ref", `${path}.actor_provenance`, issues);
       if (value.actor_provenance.proof !== undefined) {
         validateCheckpointAnswerProof(value.actor_provenance.proof, `${path}.actor_provenance.proof`, issues);
+        const proof = value.actor_provenance.proof as Record<string, unknown>;
+        if (value.decision === "request_changes" && proof.feedback !== value.rationale) addIssue(issues, `${path}.rationale`, "must equal trusted proof feedback byte-for-byte for request_changes");
+        if (value.decision !== "request_changes" && proof.feedback !== undefined) addIssue(issues, `${path}.actor_provenance.proof.feedback`, "feedback is only valid for request_changes");
       }
     }
   }
   for (const key of ["run_id", "checkpoint_id", "capability_id", "capability_epoch", "policy_hash"]) {
     if (value[key] !== undefined && !nonEmptyString(value[key])) addIssue(issues, `${path}.${key}`, "must be a non-empty string");
   }
+  if (value.feature_id !== undefined && !isSafeFeatureId(value.feature_id)) addIssue(issues, `${path}.feature_id`, "must be a canonical safe feature id");
+  if (value.loop_iteration !== undefined && (!Number.isSafeInteger(value.loop_iteration) || (value.loop_iteration as number) < 1 || (value.loop_iteration as number) > 1000000)) addIssue(issues, `${path}.loop_iteration`, "must be a bounded positive integer");
+  if (value.subject_binding !== undefined && (typeof value.subject_binding !== "string" || !/^[a-f0-9]{64}$/u.test(value.subject_binding))) addIssue(issues, `${path}.subject_binding`, "must be a lowercase SHA-256 digest");
+  if (value.artifact_id !== undefined && (typeof value.artifact_id !== "string" || !/^(specify|plan|tasks)\.v[1-9][0-9]*$/u.test(value.artifact_id))) addIssue(issues, `${path}.artifact_id`, "must be an exact native phase artifact id");
+  if (value.artifact_version !== undefined && (!Number.isSafeInteger(value.artifact_version) || (value.artifact_version as number) < 1)) addIssue(issues, `${path}.artifact_version`, "must be a positive safe integer");
+  if (value.validation_ref !== undefined && (typeof value.validation_ref !== "string" || !/^validation\.(specify|plan|tasks)\.v[1-9][0-9]*$/u.test(value.validation_ref))) addIssue(issues, `${path}.validation_ref`, "must be an exact phase validation reference");
+  if (value.validation_digest !== undefined && (typeof value.validation_digest !== "string" || !/^[a-f0-9]{64}$/u.test(value.validation_digest))) addIssue(issues, `${path}.validation_digest`, "must be a lowercase SHA-256 digest");
   if (value.work_identity !== undefined) validateWorkIdentity(value.work_identity, `${path}.work_identity`, issues);
   if (value.authorization === "policy_auto" && value.mode === "interactive") addIssue(issues, `${path}.authorization`, "policy_auto cannot use interactive mode");
   if (value.authorization === "human" && value.mode === "autonomous") addIssue(issues, `${path}.authorization`, "human authorization cannot use autonomous mode");
@@ -477,12 +552,22 @@ function validateTypedCheckpointDecision(value: unknown, path: string, issues: T
   unknownKeys(value, [
     "run_id", "stage_id", "checkpoint_id", "checkpoint_kind", "decision", "authorization",
     "actor", "capability_id", "capability_epoch", "policy_hash", "rationale", "decided_at",
+    "feature_id", "loop_iteration", "subject_binding",
+    "artifact_id", "artifact_version", "artifact_digest", "validation_ref", "validation_digest",
   ], path, issues);
   for (const key of ["run_id", "stage_id", "checkpoint_id", "decision", "capability_id", "capability_epoch", "policy_hash", "rationale", "decided_at"]) {
     requireString(value, key, path, issues);
   }
   requireEnum(value, "checkpoint_kind", CHECKPOINT_KINDS, path, issues);
   requireEnum(value, "authorization", ["human", "policy_auto"], path, issues);
+  if (value.feature_id !== undefined && !isSafeFeatureId(value.feature_id)) addIssue(issues, `${path}.feature_id`, "must be a canonical safe feature id");
+  if (value.loop_iteration !== undefined && (!Number.isSafeInteger(value.loop_iteration) || (value.loop_iteration as number) < 1 || (value.loop_iteration as number) > 1000000)) addIssue(issues, `${path}.loop_iteration`, "must be a bounded positive integer");
+  if (value.subject_binding !== undefined && (typeof value.subject_binding !== "string" || !/^[a-f0-9]{64}$/u.test(value.subject_binding))) addIssue(issues, `${path}.subject_binding`, "must be a lowercase SHA-256 digest");
+  if (value.artifact_id !== undefined && (typeof value.artifact_id !== "string" || !/^(specify|plan|tasks)\.v[1-9][0-9]*$/u.test(value.artifact_id))) addIssue(issues, `${path}.artifact_id`, "must be an exact native phase artifact id");
+  if (value.artifact_version !== undefined && (!Number.isSafeInteger(value.artifact_version) || (value.artifact_version as number) < 1)) addIssue(issues, `${path}.artifact_version`, "must be a positive safe integer");
+  if (value.artifact_digest !== undefined && (typeof value.artifact_digest !== "string" || !/^[a-f0-9]{64}$/u.test(value.artifact_digest))) addIssue(issues, `${path}.artifact_digest`, "must be a lowercase SHA-256 digest");
+  if (value.validation_digest !== undefined && (typeof value.validation_digest !== "string" || !/^[a-f0-9]{64}$/u.test(value.validation_digest))) addIssue(issues, `${path}.validation_digest`, "must be a lowercase SHA-256 digest");
+  if (value.validation_ref !== undefined && (typeof value.validation_ref !== "string" || !/^validation\.(specify|plan|tasks)\.v[1-9][0-9]*$/u.test(value.validation_ref))) addIssue(issues, `${path}.validation_ref`, "must be an exact phase validation reference");
   if (!isRecord(value.actor)) addIssue(issues, `${path}.actor`, "must be an object");
   else {
     unknownKeys(value.actor, ["kind", "ref", "proof"], `${path}.actor`, issues);
@@ -585,7 +670,7 @@ export function checkpointPolicyLegacyConflict(policy: CheckpointPolicy | undefi
 export function migrationCompletionIntent(): CompletionIntent {
   return {
     mode: "complete_outcome",
-    acceptance: "dod_and_artifacts",
+    acceptance: "quality_gates_and_artifacts",
     source: "migration",
     rationale: "Legacy workflow runs requested a completed outcome; this default grants no checkpoint permission.",
   };
@@ -629,6 +714,17 @@ export function migrationCheckpointPolicy(checkpoint: string): CheckpointPolicy 
   };
 }
 
+export interface TerminalConformanceAuthorityProjection {
+  /** Current durable claim identity loaded by the contract caller. */
+  claim_id: string | null;
+  owner_kind: "do_work" | "cto" | null;
+  owner_run_id: string | null;
+  status: "active" | "completed" | "released" | "blocked" | null;
+  handoff_digest: string | null;
+  /** Current evidence identity, normally the exact conformance artifact id. */
+  evidence_identity: string | null;
+}
+
 export interface WorkflowContractOptions {
   /** Require a persisted, branch-current run. Defaults to true. */
   requireState?: boolean;
@@ -636,6 +732,14 @@ export interface WorkflowContractOptions {
   branch?: string;
   stageId?: string;
   maxInstructions?: number;
+  /** Explicit specification run selection; bypasses .active-feature entirely. */
+  selector?: FeatureStateSelector;
+  /**
+   * Current claim/evidence authority loaded by the caller. The terminal
+   * conformance gate never reloads claim state through this module because the
+   * durable claim reader depends on checkpoint policy in this module.
+   */
+  terminal_authority?: TerminalConformanceAuthorityProjection | null;
 }
 
 export interface WorkflowStageContract {
@@ -694,7 +798,7 @@ function slotArtifactsFor(stage: StageDef, slots: Array<{ role: string; agent: s
   const multiSlot = stage.type === "consilium" && slots.length > 1;
   return Object.fromEntries(slots.map(({ role }) => [
     role,
-    multiSlot ? produces.map(id => `${id}-${sanitizeSlot(role)}`) : produces,
+    multiSlot ? produces.map(id => durableNamespacedArtifactId(id, role)) : produces,
   ]));
 }
 
@@ -716,6 +820,8 @@ export interface WorkflowContract {
   child_join: ChildJoin | null;
   completion_envelope: CompletionEnvelope | null;
   status: WorkflowContractStatus;
+  /** T054 terminal conformance guard verdict for specification execution workspaces. */
+  terminal_conformance: TerminalConformanceGateStatus;
   state: {
     path: string | null;
     /** Exact directory where the current run's declared artifacts must be written. */
@@ -763,7 +869,8 @@ export class WorkflowContractError extends Error {
     | "STAGE_MISSING"
     | "PROFILE_MISMATCH"
     | "POLICY_INVALID"
-    | "MIGRATION_CONFLICT";
+    | "MIGRATION_CONFLICT"
+    | "SPEC_MIGRATION_REQUIRED";
   constructor(code: WorkflowContractError["code"], message: string) {
     super(message);
     this.name = "WorkflowContractError";
@@ -805,6 +912,107 @@ function workflowStatus(
   return { stage: stageStatus, lifecycle, pause, reason };
 }
 
+// ── T054 implementation-conformance terminal gate (typed contract view) ──────
+
+/** Specification execution statuses whose terminal completion is conformance-guarded. */
+const SPEC_GUARDED_WORKSPACE_STATUSES: Record<string, true> = {
+  claimed: true,
+  executing: true,
+  completion_validating: true,
+  completion_blocked: true,
+  completed: true,
+};
+
+/** Typed terminal-guard verdict surfaced on every resolved workflow contract. */
+export interface TerminalConformanceGateStatus {
+  /** True when the carried workspace is a specification execution under the terminal guard. */
+  required: boolean;
+  /** True when the guard does not apply or the current passing chain is present. */
+  satisfied: boolean;
+  /** Stable fail-closed reason (`SPEC_IMPLEMENTATION_*`) when unsatisfied; null otherwise. */
+  reason: string | null;
+}
+const TERMINAL_GATE_NOT_REQUIRED: TerminalConformanceGateStatus = { required: false, satisfied: true, reason: null };
+
+
+function specificationConformanceArtifact(
+  pinnedRoot: PinnedProjectRoot,
+  artifactsDirRelative: string,
+  ref: string,
+): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  try {
+    const relativePath = `${artifactsDirRelative}/implementation_conformance/${ref}.json`;
+    const entry = pinnedRoot.readFile(relativePath, { maxBytes: 8 * 1024 * 1024 });
+    if (!pinnedRoot.isStable()) return { ok: false, error: "project root changed while reading implementation conformance artifact" };
+    const parsed = parseArtifactJson(Buffer.from(entry.bytes));
+    if (!parsed.ok) return { ok: false, error: `implementation conformance '${ref}' is not valid bounded JSON: ${parsed.reason}` };
+    if (!parsed.value || typeof parsed.value !== "object" || Array.isArray(parsed.value)) {
+      return { ok: false, error: `implementation conformance '${ref}' is not a JSON object` };
+    }
+    return { ok: true, value: parsed.value as Record<string, unknown> };
+  } catch (error) {
+    return { ok: false, error: `implementation conformance '${ref}' is unreadable: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+/**
+ * Narrow lifecycle view of the T054 terminal guard: a specification execution
+ * workspace without a current passing conformance reference/result can never
+ * resolve to a terminal-complete lifecycle, no matter what generic gates,
+ * feature DoD records, or human acknowledgements claim. The durable engine
+ * boundary enforces the full frozen-handoff/claim/conformance chain; this
+ * check keeps the typed contract from advertising completion without it.
+ */
+function terminalConformanceGate(
+  state: TeamState | null,
+  artifactsDir: string | null,
+  pinnedRoot: PinnedProjectRoot,
+  terminalAuthority: TerminalConformanceAuthorityProjection | null | undefined,
+): TerminalConformanceGateStatus {
+  const workspace: FeatureWorkspace | undefined = state?.specification;
+  if (!workspace || !SPEC_GUARDED_WORKSPACE_STATUSES[workspace.status]) return TERMINAL_GATE_NOT_REQUIRED;
+  const fail = (reason: string): TerminalConformanceGateStatus => ({ required: true, satisfied: false, reason });
+  if (!artifactsDir) return fail("SPEC_IMPLEMENTATION_CONFORMANCE_FAILED: specification execution requires the feature artifact tree");
+  const artifactsDirRelative = pinnedRoot.relativePath(artifactsDir);
+  if (artifactsDirRelative === null) return fail("SPEC_IMPLEMENTATION_CONFORMANCE_FAILED: feature artifact tree is outside the pinned project root");
+  if (!workspace.implementation_conformance_ref) {
+    return fail("SPEC_IMPLEMENTATION_CONFORMANCE_FAILED: specification execution has no implementation conformance reference");
+  }
+  if (typeof workspace.implementation_conformance_ref !== "string" || !/^[A-Za-z0-9._-]+$/u.test(workspace.implementation_conformance_ref)) {
+    return fail("SPEC_IMPLEMENTATION_CONFORMANCE_FAILED: implementation conformance reference is not a safe artifact identifier");
+  }
+  const record = specificationConformanceArtifact(pinnedRoot, artifactsDirRelative, workspace.implementation_conformance_ref);
+  if (!record.ok) return fail(`SPEC_IMPLEMENTATION_CONFORMANCE_FAILED: ${record.error}`);
+  if (record.value.overall_status === "changed_intent") {
+    return fail("SPEC_IMPLEMENTATION_INTENT_CHANGED: implementation conformance reports changed intent; revise the earliest affected specification phase");
+  }
+  const validation = validateProducedArtifact("implementation_conformance", record.value);
+  if (!validation.ok) {
+    return fail(`SPEC_IMPLEMENTATION_CONFORMANCE_FAILED: implementation conformance is invalid: ${validation.issues.map((issue) => `${issue.field}: ${issue.message}`).join("; ")}`);
+  }
+  const mismatch = (detail: string): string =>
+    `SPEC_IMPLEMENTATION_CONFORMANCE_FAILED: implementation conformance does not bind the active workspace (${detail})`;
+  if (!terminalAuthority) {
+    return fail("SPEC_IMPLEMENTATION_CONFORMANCE_FAILED: current claim/evidence authority projection is unavailable");
+  }
+  if (terminalAuthority.claim_id !== workspace.execution_claim_ref
+    || terminalAuthority.owner_kind !== record.value.execution_owner
+    || terminalAuthority.owner_run_id !== record.value.execution_run_id
+    || terminalAuthority.handoff_digest !== record.value.handoff_digest
+    || terminalAuthority.evidence_identity !== record.value.conformance_id
+    || (terminalAuthority.status !== "active" && terminalAuthority.status !== "completed")) {
+    return fail(mismatch("current claim owner/status, handoff, or evidence identity"));
+  }
+  if (record.value.feature_id !== workspace.feature_id) return fail(mismatch("feature_id"));
+  if (record.value.handoff_id !== workspace.handoff_ref) return fail(mismatch("handoff_id"));
+  if (record.value.execution_claim_id !== workspace.execution_claim_ref) return fail(mismatch("execution_claim_id"));
+  if (record.value.profile_hash !== workspace.profile_hash) return fail(mismatch("profile_hash"));
+  if (record.value.overall_status !== "pass") {
+    return fail(`SPEC_IMPLEMENTATION_CONFORMANCE_FAILED: implementation conformance is '${String(record.value.overall_status)}'; terminal completion requires a current pass`);
+  }
+  return { required: true, satisfied: true, reason: null };
+}
+
 function controlPlaneProvenance(
   intent: ControlPlaneFieldSource,
   checkpointPolicy: ControlPlaneFieldSource,
@@ -843,7 +1051,17 @@ function validationMessage(label: string, result: TypedContractValidationResult)
 /** Resolve the persisted run, profile and current stage into one bounded, typed contract. */
 export function resolveWorkflowContract(cwd: string, options: WorkflowContractOptions = {}): WorkflowContract {
   const expectedBranch = options.branch ?? resolveActiveBranch(cwd);
-  const resolved = resolveState(cwd, expectedBranch);
+  const pinnedRoot = PinnedProjectRoot.open(cwd);
+  if (!pinnedRoot) throw new WorkflowContractError("STATE_INVALID", "workflow project root is unavailable or unsafe");
+  try {
+    // An explicit stateless lookup is a profile-only contract. Never inspect
+    // or expose an active persisted state when the caller opts out of state;
+    // this keeps state paths/artifact roots from leaking into stateless tools.
+    const resolved: ResolvedState = options.requireState === false
+      ? { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false }
+      : options.selector
+        ? resolveStatePinned(cwd, pinnedRoot, options.selector)
+        : resolveActiveStatePinned(cwd, pinnedRoot, expectedBranch);
   if (resolved.invalid) throw new WorkflowContractError("STATE_INVALID", "workflow state is malformed or unsafe");
   const state = resolved.state as TeamState | null;
   if (options.requireState !== false && (!state || !resolved.statePath)) {
@@ -853,6 +1071,12 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     throw new WorkflowContractError("STATE_STALE", `workflow state branch '${state.branch}' is stale (current '${expectedBranch ?? "unknown"}')`);
   }
   if (state) {
+    if (!state.classification || typeof state.classification !== "object") {
+      throw new WorkflowContractError(
+        "SPEC_MIGRATION_REQUIRED",
+        "persisted workflow state has no typed classification; explicit specification migration is required",
+      );
+    }
     const stateValidation = validateTypedControlPlane(state);
     if (!stateValidation.ok) throw new WorkflowContractError("POLICY_INVALID", validationMessage("persisted typed contract", stateValidation));
     const classificationValidation = validateTypedControlPlane(state.classification);
@@ -893,7 +1117,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     ?? profile.stages.map(item => ({ id: item.id, status: "pending" }));
   const capability = state?.dispatch_capability;
   if (capability) {
-    const capabilityValidation = validateTypedControlPlane(capability);
+    const capabilityValidation = validateTypedControlPlane({ dispatch_capability: capability });
     if (!capabilityValidation.ok) throw new WorkflowContractError("POLICY_INVALID", validationMessage("dispatch capability typed contract", capabilityValidation));
   }
 
@@ -921,17 +1145,11 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   const checkpoint_rule = stage.checkpoint
     ? checkpoint_policy?.rules[stage.checkpoint] ?? null
     : null;
-  const typedCheckpointDecision = stage.checkpoint
-    ? state?.typed_checkpoint_decisions?.find((decision) =>
-      decision.stage_id === stage.id && decision.checkpoint_id === stage.checkpoint,
-    ) ?? null
+  const checkpointSelection = stage.checkpoint && state
+    ? selectLatestValidCheckpointDecision({ id: stage.id, checkpoint: stage.checkpoint }, state)
     : null;
-  const checkpoint_decision: CheckpointDecision | TypedCheckpointDecision | null = typedCheckpointDecision
-    ?? (stage.checkpoint
-      ? state?.checkpoint_decisions?.find((decision) =>
-        decision.stage_id === stage.id && decision.checkpoint === stage.checkpoint,
-      ) ?? null
-      : null);
+  const typedCheckpointDecision = checkpointSelection?.ok ? checkpointSelection.decision : null;
+  const checkpoint_decision: CheckpointDecision | TypedCheckpointDecision | null = typedCheckpointDecision;
   if (stage.checkpoint && !checkpoint_rule) {
     throw new WorkflowContractError("POLICY_INVALID", `checkpoint policy has no rule for '${stage.checkpoint}'`);
   }
@@ -974,8 +1192,13 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   }
   const child_join = state?.child_join ?? null;
   const completion_envelope = state?.completion_envelope ?? null;
-  if (pending && completion_envelope && (pending.status === "pending") !== (completion_envelope.outcome === "pending")) {
-    throw new WorkflowContractError("MIGRATION_CONFLICT", "pending lifecycle and completion_envelope outcomes conflict");
+  if (pending && completion_envelope) {
+    const expectedOutcome = pending.status === "authorized" || pending.status === "running" || pending.status === "pending"
+      ? "pending"
+      : pending.status;
+    if (completion_envelope.outcome !== expectedOutcome) {
+      throw new WorkflowContractError("MIGRATION_CONFLICT", "pending lifecycle and completion_envelope outcomes conflict");
+    }
   }
   const selectionRequired = roster_policy !== null;
   const selectionReady = !selectionRequired || roster_selection !== null;
@@ -987,7 +1210,14 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   const selectedRoleAgents = roster_selection?.selected.map((entry) => ({ role: entry.slot_id, agent: entry.agent })) ?? [];
   const configuredRoleAgents = slots.map(slot => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
   const roleAgents = configuredRoleAgents.length > 0 ? configuredRoleAgents : selectedRoleAgents;
-  const status = workflowStatus(state, stage.id, pending);
+  const terminal_gate = terminalConformanceGate(state, resolved.artifactsDir, pinnedRoot, options.terminal_authority);
+  const unguardedStatus = workflowStatus(state, stage.id, pending);
+  // A specification execution workspace without its current passing
+  // conformance chain is never terminal-complete: the lifecycle is reported
+  // blocked with the stable guard reason instead.
+  const status: WorkflowContractStatus = terminal_gate.reason && unguardedStatus.lifecycle === "complete"
+    ? { ...unguardedStatus, lifecycle: "blocked", reason: terminal_gate.reason }
+    : unguardedStatus;
   const legacyInputs = [
     state?.classification?.autonomous !== undefined ? "classification.autonomous" : null,
     state?.autonomous !== undefined ? "TeamState.autonomous" : null,
@@ -1009,11 +1239,20 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     roster_selection ? (stateSelection ? "state" : "typed") : "none",
     work_identity ? (stateIdentity ? "state" : "typed") : "none",
     pending ? (state?.pending ? "state" : "typed") : "none",
-    child_join ? "state" : "none",
+    child_join ? (state?.child_join ? "state" : "typed") : "none",
     completion_envelope ? "state" : "none",
     legacyInputs,
     warnings,
   );
+  const stageArtifactSchemas = artifactSchemasFor(stage);
+  const nativePhaseStage = workflow === "spec-preparation" && (stage.id === "specify" || stage.id === "plan" || stage.id === "tasks");
+  if (nativePhaseStage && state?.specification?.constitution_binding) {
+    const identities = readPinnedConstitutionPrincipleIdentities(pinnedRoot, state.specification.constitution_binding);
+    if (!identities.ok) throw new WorkflowContractError("STATE_STALE", identities.error);
+    const schema = specificationPhaseSchemaForConstitution(identities.value, state.specification.constitution_binding, stage.id as "specify" | "plan" | "tasks");
+    if (!schema) throw new WorkflowContractError("POLICY_INVALID", "native specification phase schema cannot bind the approved constitution");
+    stageArtifactSchemas.specification_phase_model = schema;
+  }
   const stageContract: WorkflowStageContract = {
     id: stage.id,
     title: stage.title,
@@ -1024,7 +1263,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     parallel: stage.parallel ?? stage.type === "consilium",
     consumes: stage.consumes ?? [],
     produces: typeof stage.produces === "string" ? [stage.produces] : stage.produces ?? [],
-    artifact_schemas: artifactSchemasFor(stage),
+    artifact_schemas: stageArtifactSchemas,
     checkpoint_decision,
     slot_artifacts: slotArtifactsFor(stage, roleAgents),
     checkpoint: stage.checkpoint ?? null,
@@ -1054,10 +1293,8 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     instructions: instructions(stage, options.maxInstructions ?? 4000),
     provenance: { source: "workflow", profilePath: path, profileHash: pHash, stageHash: hash(stage), control_plane },
   };
-  const stateRaw = resolved.statePath ? readFileSync(resolved.statePath, "utf8") : null;
-  const stateHash = stateRaw
-    ? hash(JSON.parse(stateRaw))
-    : hash({ source: "stateless", workflow, stage: stage.id, profileHash: pHash });
+  const stateHash = resolved.raw_hash
+    ?? hash({ source: "stateless", workflow, stage: stage.id, profileHash: pHash });
   return {
     workflow,
     profile: { title: profile.title, description: profile.description, path, hash: pHash, source: "workflow" },
@@ -1071,6 +1308,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     child_join,
     completion_envelope,
     status,
+    terminal_conformance: terminal_gate,
     state: {
       path: resolved.statePath,
       artifactsDir: resolved.artifactsDir,
@@ -1101,6 +1339,9 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     stage: stageContract,
     provenance: { statePath: resolved.statePath, profilePath: path, profileHash: pHash, stateHash, control_plane },
   };
+  } finally {
+    pinnedRoot.close();
+  }
 }
 
 export function resolveStageInstructions(cwd: string, options: WorkflowContractOptions = {}): WorkflowStageContract {

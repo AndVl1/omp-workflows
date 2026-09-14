@@ -1,0 +1,24 @@
+{
+  "schema": 2,
+  "feature_id": "readable-cto-passing",
+  "project_root_identity": {
+    "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-z6TScn/omp-spec-e2e-cto-exec-wave",
+    "dev": 16777234,
+    "ino": 95982592
+  },
+  "workspace_path_binding_digest": "54dfecbc03e8021eed6256a652a41509345944f37559a21f5a2be8e47371fe50",
+  "claim_directory_identity": {
+    "relative_path": ".work-state/features/readable-cto-passing/artifacts/execution_claim",
+    "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-z6TScn/omp-spec-e2e-cto-exec-wave/.work-state/features/readable-cto-passing/artifacts/execution_claim",
+    "dev": 16777234,
+    "ino": 95983475
+  },
+  "next_directory_identity": {
+    "relative_path": ".work-state/features/readable-cto-passing/artifacts/execution_claim/next",
+    "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-z6TScn/omp-spec-e2e-cto-exec-wave/.work-state/features/readable-cto-passing/artifacts/execution_claim/next",
+    "dev": 16777234,
+    "ino": 95983480
+  },
+  "journal_format": "legacy-chain-v1+wal-v2",
+  "legacy_tail_digest": null
+}

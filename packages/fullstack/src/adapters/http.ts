@@ -9,7 +9,8 @@
  * `fetchImpl` is injectable for tests; defaults to global fetch.
  */
 
-import type { Escalation, EscalationAdapter, EscalationReceipt } from "@andvl1/omp-workflows-core";
+import type { Escalation, EscalationAdapter, EscalationReceipt, PinnedProjectRoot } from "@andvl1/omp-workflows-core";
+import type { AdapterOperationContext } from "./registry.js";
 
 export interface HttpAdapterOptions {
   url: string;
@@ -32,17 +33,38 @@ export class HttpEscalationAdapter implements EscalationAdapter {
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
-  async send(esc: Escalation): Promise<EscalationReceipt> {
+  async send(_esc: Escalation, _pinnedRoot?: PinnedProjectRoot, lifecycle?: AdapterOperationContext): Promise<EscalationReceipt> {
     try {
       const response = await this.fetchImpl(this.url, {
         method: this.method,
         headers: this.headers,
-        body: JSON.stringify(esc),
+        body: JSON.stringify(_esc),
+        ...(lifecycle ? { signal: lifecycle.signal } : {}),
       });
       if (!response.ok) return { sent: false, channelRef: `http:${response.status}` };
       return { sent: true, channelRef: `http:${response.status}` };
     } catch (error) {
-      return { sent: false, channelRef: error instanceof Error ? error.message : String(error) };
+      return { sent: false, channelRef: "http:send-failed" };
+    }
+  }
+
+  /** Send with a stable idempotency key and require matching receiver acknowledgement. */
+  async sendWithIdempotency(_esc: Escalation, idempotencyKey: string, _pinnedRoot?: PinnedProjectRoot, lifecycle?: AdapterOperationContext): Promise<EscalationReceipt> {
+    const key = typeof idempotencyKey === "string" ? idempotencyKey.trim() : "";
+    if (!key) return { sent: false, channelRef: "http:idempotency-key-required" };
+    try {
+      const response = await this.fetchImpl(this.url, {
+        method: this.method,
+        headers: { ...this.headers, "idempotency-key": key },
+        body: JSON.stringify(_esc),
+        ...(lifecycle ? { signal: lifecycle.signal } : {}),
+      });
+      if (!response.ok) return { sent: false, channelRef: `http:${response.status}` };
+      const acknowledged = typeof response.headers?.get === "function" && (response.headers.get("idempotency-key") === key || response.headers.get("x-idempotency-key") === key);
+      if (!acknowledged) return { sent: false, channelRef: "http:idempotency-unacknowledged" };
+      return { sent: true, channelRef: `http:${response.status}` };
+    } catch {
+      return { sent: false, channelRef: "http:idempotency-unknown" };
     }
   }
 

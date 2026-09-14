@@ -3,28 +3,24 @@
  *
  * Defends the observable boundaries and invariants of buildSessionSnapshot:
  * statuses produced/missing/pending/skipped/unreadable, deterministic
- * ordering (declared produces order → consilium slots → extras), stage
+ * ordering (declared produces order → native slots → extras), stage
  * progress with attached slots, provenance/staleness (AC-11), the SLICE-0/
  * BG-1 source digest (mtime-free, cross-workspace and touch-invariant),
- * mid-consilium pending shared artifact, zero-artifact sessions, legacy/CTO
+ * native mid-tasks pending shared artifact, zero-artifact sessions, legacy/CTO
  * layouts, corrupt peers without abort, and strict read-only (no canonical
  * mutation). Fixed generated_at for determinism.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildSessionSnapshot, buildSessionSnapshots } from "../src/visualize/snapshot.js";
-import { renderHubMarkdown } from "../src/visualize/markdown.js";
-import { renderHubHtml } from "../src/visualize/html.js";
-import { buildManifest } from "../src/visualize/manifest.js";
+import { buildSessionSnapshot } from "../src/visualize/snapshot.js";
 import { resolveRenderConfig } from "../src/visualize/render-config.js";
-import { DEFAULT_RENDERER_IDENTITY, LEGACY_ROOT_PATH_KEY, LEGACY_SESSION_ID, sessionPagePath, type VisualizationSnapshot } from "../src/visualize/types.js";
+import { LEGACY_ROOT_PATH_KEY, LEGACY_SESSION_ID } from "../src/visualize/types.js";
 import {
-  listCtoSources,
   listDoWorkSources,
   resolveCtoSource,
   resolveDoWorkSource,
@@ -37,7 +33,6 @@ import {
   digestFor,
   featureSession,
   ctoStateJson,
-  markdownCtoFiles,
   artifact,
   hostileSpecBody,
   DEEP_JSON_SAMPLE,
@@ -64,29 +59,15 @@ function stateRelPath(input: CanonicalSessionInput): string {
 }
 
 /** Write the canonical input onto disk (state + declared/discovered files). */
-function materialize(cwd: string, input: CanonicalSessionInput, extraFiles: Record<string, string> = {}): void {
-  if (input.kind === "cto") {
-    const runDir = join(cwd, ".work-state", "cto", input.id);
-    if (input.state.format === "markdown") {
-      // Agent-written markdown runs: write the evidence + finish-marker files.
-      for (const [name, content] of Object.entries(extraFiles)) write(join(runDir, name), content);
-    } else {
-      write(join(runDir, "state.json"), input.state.content);
-    }
-  } else {
-    write(join(cwd, stateRelPath(input)), input.state.content);
-  }
+function materialize(cwd: string, input: CanonicalSessionInput): void {
+  write(join(cwd, stateRelPath(input)), input.state.content);
   for (const f of input.artifacts) write(join(cwd, f.relPath), f.content);
 }
 
-/** The discovered entry for an input (exact selector; terminal md via list). */
+/** The discovered entry for an input via its canonical state file. */
+
 function entryOf(cwd: string, input: CanonicalSessionInput): SessionSourceEntry {
   if (input.kind === "cto") {
-    if (input.state.format === "markdown" && input.state.content.includes("# Summary")) {
-      const entry = listCtoSources(cwd).find((e) => e.id === input.id);
-      if (!entry) throw new Error(`terminal markdown run not discovered: ${input.id}`);
-      return entry;
-    }
     const resolved = resolveCtoSource(cwd, input.id);
     if (!resolved) throw new Error(`cto run not resolved: ${input.id}`);
     return resolved;
@@ -137,41 +118,36 @@ test("snapshot: spec-preparation session matches the frozen golden model (BG-1 d
     assert.deepEqual(
       session.artifacts.map((a) => a.id),
       [
-        "spec_intake_repo_map",
-        "spec_intake_repo_map-analyst",
-        "spec_intake_repo_map-tech-researcher",
-        "spec_requirements_edge_cases",
-        "spec_options_decisions",
-        "spec_architecture_tasks",
-        "spec_completeness",
+        "specify_draft",
+        "specify_draft-analyst",
+        "specify_draft-tech-researcher",
+        "plan_draft",
+        "task_graph",
         "spec-preparation",
         "spec_handoff",
       ],
     );
     const statuses = Object.fromEntries(session.artifacts.map((a) => [a.id, a.status]));
     assert.deepEqual(statuses, {
-      spec_intake_repo_map: "produced",
-      "spec_intake_repo_map-analyst": "produced",
-      "spec_intake_repo_map-tech-researcher": "produced",
-      spec_requirements_edge_cases: "produced",
-      spec_options_decisions: "produced",
-      spec_architecture_tasks: "produced",
-      spec_completeness: "missing",
+      specify_draft: "produced",
+      "specify_draft-analyst": "produced",
+      "specify_draft-tech-researcher": "produced",
+      plan_draft: "produced",
+      task_graph: "missing",
       "spec-preparation": "produced",
       spec_handoff: "produced",
     });
     assert.deepEqual(session.warnings, [
-      "declared artifact spec_completeness is missing",
+      "declared artifact task_graph is missing",
       "artifact spec_handoff is larger than the read window: head preview (original bytes > window)",
     ]);
 
-    // Stage progress with attached slot artifactIds (deterministic titles).
+    // Native stage progress with attached slot artifactIds. The specify, plan,
+    // and tasks stages omit titles; generic handoff retains the "Handoff" title.
     assert.deepEqual(session.stages, [
-      { stageId: "intake_repo_map", title: "Repository intake map", status: "done", artifactIds: ["spec_intake_repo_map", "spec_intake_repo_map-analyst", "spec_intake_repo_map-tech-researcher"] },
-      { stageId: "requirements_edge_cases", title: "Requirements and edge cases", status: "done", artifactIds: ["spec_requirements_edge_cases"] },
-      { stageId: "options_decision_log", title: "Options and decision log", status: "done", artifactIds: ["spec_options_decisions"] },
-      { stageId: "architecture_task_slices", title: "Architecture and task slices", status: "done", artifactIds: ["spec_architecture_tasks"] },
-      { stageId: "completeness_gate", title: "Completeness gate", status: "in_progress", artifactIds: ["spec_completeness"] },
+      { stageId: "specify", status: "done", artifactIds: ["specify_draft", "specify_draft-analyst", "specify_draft-tech-researcher"] },
+      { stageId: "plan", status: "done", artifactIds: ["plan_draft"] },
+      { stageId: "tasks", status: "in_progress", artifactIds: ["task_graph"] },
       { stageId: "handoff", title: "Handoff", status: "in_progress", artifactIds: ["spec-preparation", "spec_handoff"] },
     ]);
 
@@ -184,10 +160,10 @@ test("snapshot: spec-preparation session matches the frozen golden model (BG-1 d
     assert.equal(session.provenance.generatedAt, FIXED_GENERATED_AT);
 
     // Slot ownership and slotFor identity.
-    const slot = session.artifacts.find((a) => a.id === "spec_intake_repo_map-tech-researcher");
+    const slot = session.artifacts.find((a) => a.id === "specify_draft-tech-researcher");
     assert.ok(slot);
-    assert.equal(slot.owner, "intake_repo_map");
-    assert.equal(slot.slotFor, "spec_intake_repo_map");
+    assert.equal(slot.owner, "specify");
+    assert.equal(slot.slotFor, "specify_draft");
     assert.equal(slot.status, "produced");
 
     // Detailed policy → embedded redacted body; in-window parse gives keys/summary.
@@ -200,7 +176,7 @@ test("snapshot: spec-preparation session matches the frozen golden model (BG-1 d
     assert.equal(prep.source?.readBytes, prep.bytes, "in-window file fully read");
 
     // Missing artifact carries no source.
-    const missing = session.artifacts.find((a) => a.id === "spec_completeness");
+    const missing = session.artifacts.find((a) => a.id === "task_graph");
     assert.equal(missing?.source, undefined);
     assert.equal(missing?.bytes, undefined);
   } finally {
@@ -411,39 +387,49 @@ test("snapshot: bug-fix compact hides bodies by default; --full embeds them with
   }
 });
 
-// ── 5. Mid-consilium: pending shared base + produced slots ──────────────────
+// ── 5. Native mid-tasks: pending shared base + produced slots ────────────────
 
-test("snapshot: mid-consilium yields produced slots plus pending shared artifact", () => {
+test("snapshot: native mid-tasks yields produced slots plus pending shared artifact", () => {
   const cwd = tmpWorkspace();
   try {
     const input = featureSession({
-      id: "consilium",
-      pathKey: "consilium",
-      task: "Run a consilium stage mid-flight.",
+      id: "tasks",
+      pathKey: "tasks",
+      task: "Run the native tasks stage mid-flight.",
       workflow: "spec-preparation",
       updatedAt: "2026-08-19T04:00:00.000Z",
-      stages: [{ id: "architecture_task_slices", status: "in_progress" }],
-      declared: { spec_architecture_tasks: ".work-state/features/consilium/artifacts/spec_architecture_tasks.json" },
+      stages: [{ id: "tasks", status: "in_progress" }],
+      declared: { task_graph: ".work-state/features/tasks/artifacts/task_graph.json" },
       files: [
-        artifact("spec_architecture_tasks-architect", ".work-state/features/consilium/artifacts/spec_architecture_tasks-architect.json", slotJson("spec_architecture_tasks", "architect")),
-        artifact("spec_architecture_tasks-tech-researcher", ".work-state/features/consilium/artifacts/spec_architecture_tasks-tech-researcher.json", slotJson("spec_architecture_tasks", "tech-researcher")),
+        artifact("task_graph-architect", ".work-state/features/tasks/artifacts/task_graph-architect.json", slotJson("task_graph", "architect")),
+        artifact("task_graph-tech-researcher", ".work-state/features/tasks/artifacts/task_graph-tech-researcher.json", slotJson("task_graph", "tech-researcher")),
       ],
-      expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
+      expected: {
+        status: "complete",
+        staleness: "fresh",
+        artifactStatuses: {
+          task_graph: "pending",
+          "task_graph-architect": "produced",
+          "task_graph-tech-researcher": "produced",
+        },
+        warnings: ["shared artifact task_graph is pending: producer in_progress, slots present"],
+      },
     });
     materialize(cwd, input);
     const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
 
     assert.deepEqual(session.artifacts.map((a) => a.id), [
-      "spec_architecture_tasks",
-      "spec_architecture_tasks-architect",
-      "spec_architecture_tasks-tech-researcher",
+      "task_graph",
+      "task_graph-architect",
+      "task_graph-tech-researcher",
     ]);
     const byId = Object.fromEntries(session.artifacts.map((a) => [a.id, a]));
-    assert.equal(byId["spec_architecture_tasks"]?.status, "pending");
-    assert.equal(byId["spec_architecture_tasks-architect"]?.status, "produced");
-    assert.equal(byId["spec_architecture_tasks-tech-researcher"]?.status, "produced");
-    assert.equal(byId["spec_architecture_tasks-architect"]?.slotFor, "spec_architecture_tasks");
-    assert.deepEqual(session.warnings, ["shared artifact spec_architecture_tasks is pending: producer in_progress, slots present"]);
+    assert.equal(byId["task_graph"]?.status, "pending");
+    assert.equal(byId["task_graph-architect"]?.status, "produced");
+    assert.equal(byId["task_graph-tech-researcher"]?.status, "produced");
+    assert.equal(byId["task_graph-architect"]?.slotFor, "task_graph");
+    assert.equal(byId["task_graph-tech-researcher"]?.slotFor, "task_graph");
+    assert.deepEqual(session.warnings, ["shared artifact task_graph is pending: producer in_progress, slots present"]);
 
     // The shared base contributes absent (present:false) to the digest.
     const digest = digestFor(input);
@@ -620,75 +606,7 @@ test("snapshot: CTO JSON run resolves run-local, team compatibility and dod_path
   }
 });
 
-// ── 9. CTO markdown state: active complete / terminal degraded ──────────────
-
-test("snapshot: active markdown CTO is complete with unknown staleness; terminal is degraded with reason", () => {
-  const cwd = tmpWorkspace();
-  try {
-    const activeFiles = markdownCtoFiles({
-      task: "Coordinate a markdown-only CTO run.",
-      classificationLine: 'classification: { "type": "FEATURE", "complexity": "COMPLEX", "confidence": "MEDIUM", "autonomous": true }',
-    }).files;
-    const activeInput: CanonicalSessionInput = {
-      kind: "cto",
-      id: "cto-markdown-live",
-      pathKey: "cto-markdown-live",
-      state: {
-        format: "markdown",
-        content: activeFiles["team-plan.md"] ?? "",
-        updatedAt: undefined,
-      },
-      workflow: "cto",
-      declaredArtifacts: {},
-      artifacts: [],
-      excludedPaths: [],
-      expected: { status: "complete", staleness: "unknown", artifactStatuses: {} },
-    };
-    materialize(cwd, activeInput, activeFiles);
-    const active = buildSessionSnapshot(cwd, entryOf(cwd, activeInput), FIXED_GENERATED_AT);
-    assert.equal(active.status, "complete");
-    assert.equal(active.identity.sourceFormat, "markdown");
-    assert.equal(active.identity.task, "Coordinate a markdown-only CTO run.", "task from the markdown state heading");
-    assert.equal(active.provenance.staleness, "unknown", "markdown state carries no updated_at (mtime excluded)");
-    assert.equal(active.provenance.sourceUpdatedAt, undefined);
-    assert.deepEqual(active.artifacts, []);
-    assert.equal(active.source.label, ".work-state/cto/cto-markdown-live");
-    assert.equal(active.provenance.sourceDigest.full, digestFor(activeInput).full, "canonical state text = team-plan.md");
-
-    const terminalFiles = markdownCtoFiles({
-      task: "A finished markdown CTO run.",
-      classificationLine: 'classification: { "type": "FEATURE", "complexity": "COMPLEX", "confidence": "MEDIUM", "autonomous": false }',
-      withFinishMarker: true,
-    }).files;
-    const terminalInput: CanonicalSessionInput = {
-      kind: "cto",
-      id: "cto-markdown-done",
-      pathKey: "cto-markdown-done",
-      state: {
-        format: "markdown",
-        content: terminalFiles["summary.md"] ?? "",
-        updatedAt: undefined,
-      },
-      workflow: "cto",
-      declaredArtifacts: {},
-      artifacts: [],
-      excludedPaths: [],
-      expected: { status: "degraded", staleness: "unknown", artifactStatuses: {}, degradedReasons: ["terminal markdown CTO state: visualization-only projection"] },
-    };
-    materialize(cwd, terminalInput, terminalFiles);
-    const terminal = buildSessionSnapshot(cwd, entryOf(cwd, terminalInput), FIXED_GENERATED_AT);
-    assert.equal(terminal.status, "degraded");
-    assert.equal(terminal.identity.degraded, true);
-    assert.equal(terminal.identity.task, "A finished markdown CTO run.", "task derives from the finish-marker state");
-    assert.deepEqual(terminal.degradedReasons, ["terminal markdown CTO state: visualization-only projection"]);
-    assert.equal(terminal.provenance.staleness, "unknown");
-    assert.equal(terminal.provenance.sourceDigest.full, digestFor(terminalInput).full, "canonical state text = summary.md");
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-// ── 10. Unsafe ids/paths: skipped/missing with exact warnings ───────────────
+// ── 9. Unsafe ids/paths: skipped/missing with exact warnings ───────────────
 
 test("snapshot: unsafe ids are skipped, unsafe declared paths are excluded, safe ones resolve", () => {
   const cwd = tmpWorkspace();
@@ -920,122 +838,4 @@ test("snapshot: undeclared extras sort lexicographically; unlisted workflows get
   }
 });
 
-// ── 16. F3: mixed JSON feature + markdown CTO — mtime-free total order ───────
 
-test("snapshot: F3 — markdown-CTO run-local mtime never reorders; snapshot, manifest and both hubs agree on the content-derived order", () => {
-  const cwd = tmpWorkspace();
-  try {
-    const classification = 'classification: { "type": "FEATURE", "complexity": "COMPLEX", "confidence": "MEDIUM", "autonomous": true }';
-    // JSON feature with a content timestamp (state.updated_at).
-    const feature = featureSession({
-      id: "alpha",
-      pathKey: "alpha",
-      task: "Alpha JSON feature.",
-      workflow: "standard",
-      updatedAt: "2026-08-19T10:00:00.000Z",
-      stages: [{ id: "discovery", status: "done" }],
-      declared: {},
-      expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
-    });
-    // Markdown-state CTO runs (one active, two terminal): discovery labels
-    // them with run-local mtimes — internal metadata that must never order.
-    const ctoInput = (id: string, task: string, withFinishMarker: boolean): CanonicalSessionInput => {
-      const files = markdownCtoFiles({ task, classificationLine: classification, withFinishMarker }).files;
-      return {
-        kind: "cto",
-        id,
-        pathKey: id,
-        state: {
-          format: "markdown",
-          content: files[withFinishMarker ? "summary.md" : "team-plan.md"] ?? "",
-          updatedAt: undefined,
-        },
-        workflow: "cto",
-        declaredArtifacts: {},
-        artifacts: [],
-        excludedPaths: [],
-        expected: { status: withFinishMarker ? "degraded" : "complete", staleness: "unknown", artifactStatuses: {} },
-      };
-    };
-    const live = ctoInput("cto-live", "Live markdown CTO run.", false);
-    const doneA = ctoInput("cto-a", "Finished markdown CTO run A.", true);
-    const doneB = ctoInput("cto-b", "Finished markdown CTO run B.", true);
-
-    materialize(cwd, feature);
-    materialize(cwd, live, markdownCtoFiles({ task: "Live markdown CTO run.", classificationLine: classification }).files);
-    materialize(cwd, doneA, markdownCtoFiles({ task: "Finished markdown CTO run A.", classificationLine: classification, withFinishMarker: true }).files);
-    materialize(cwd, doneB, markdownCtoFiles({ task: "Finished markdown CTO run B.", classificationLine: classification, withFinishMarker: true }).files);
-
-    const entries = [resolveDoWorkSource(cwd, "alpha"), ...listCtoSources(cwd)];
-    assert.equal(entries.length, 4, "feature + three markdown CTO runs discovered");
-    const sessions = buildSessionSnapshots(cwd, entries, FIXED_GENERATED_AT);
-    assert.deepEqual(
-      sessions.map((s) => `${s.identity.kind}/${s.identity.id}`),
-      ["feature/alpha", "cto/cto-a", "cto/cto-b", "cto/cto-live"],
-      "content-timestamp feature first; markdown CTOs (no content timestamp) sort last, then kind, then id",
-    );
-
-    // The total order is stable regardless of caller input order.
-    const scrambled = buildSessionSnapshots(cwd, [...entries].reverse(), FIXED_GENERATED_AT);
-    assert.deepEqual(scrambled.map((s) => s.identity.id), sessions.map((s) => s.identity.id));
-
-    // All output surfaces agree on the same deterministic order.
-    const manifest = buildManifest(sessions, "all", { generatedAt: FIXED_GENERATED_AT });
-    assert.deepEqual(manifest.sessions.map((e) => e.id), sessions.map((s) => s.identity.id), "manifest order === snapshot order");
-    const snapshot: VisualizationSnapshot = {
-      schema: 1,
-      scope: "all",
-      generatedAt: FIXED_GENERATED_AT,
-      renderer: DEFAULT_RENDERER_IDENTITY,
-      sessions,
-      manifest,
-      warnings: [],
-    };
-    const expectedMd = sessions.map((s) => sessionPagePath(s.identity.kind, s.identity.pathKey, "md"));
-    const expectedHtml = sessions.map((s) => sessionPagePath(s.identity.kind, s.identity.pathKey, "html"));
-    const mdOrder = [...renderHubMarkdown(snapshot).matchAll(/\(([^)]+\.md)#/g)].map((m) => m[1]);
-    const htmlOrder = [...renderHubHtml(snapshot).matchAll(/href="([^"]+\.html)#/g)].map((m) => m[1]);
-    assert.deepEqual(mdOrder, expectedMd, "markdown hub lists sessions in the same order");
-    assert.deepEqual(htmlOrder, expectedHtml, "html hub lists sessions in the same order");
-
-    // Touch invariance: bump every run-local mtime with distinct future
-    // values. Discovery MUST observe the new mtimes (so this test fails
-    // before the F3 fix) — the ordering boundary must not use them.
-    const futureByRun: Record<string, Date> = {
-      "cto-live": new Date("2030-01-01T00:00:00.000Z"),
-      "cto-a": new Date("2030-02-01T00:00:00.000Z"),
-      "cto-b": new Date("2030-03-01T00:00:00.000Z"),
-    };
-    for (const [runId, future] of Object.entries(futureByRun)) {
-      const runDir = join(cwd, ".work-state", "cto", runId);
-      for (const name of readdirSync(runDir)) {
-        const p = join(runDir, name);
-        if (statSync(p).isFile()) utimesSync(p, future, future);
-      }
-    }
-    const touched = listCtoSources(cwd);
-    for (const [runId, future] of Object.entries(futureByRun)) {
-      const entry = touched.find((e) => e.id === runId);
-      assert.ok(entry, `touched run still discovered: ${runId}`);
-      assert.equal(entry.updatedAt, future.toISOString(), `discovery observes the new run-local mtime for ${runId}`);
-    }
-
-    const sessionsAfter = buildSessionSnapshots(cwd, [resolveDoWorkSource(cwd, "alpha"), ...touched], FIXED_GENERATED_AT);
-    assert.deepEqual(sessionsAfter, sessions, "mtime-only change reorders nothing and changes no model or digest");
-    const manifestAfter = buildManifest(sessionsAfter, "all", { generatedAt: FIXED_GENERATED_AT });
-    assert.deepEqual(manifestAfter, manifest, "manifest unchanged by mtime-only change");
-    const snapshotAfter: VisualizationSnapshot = { ...snapshot, sessions: sessionsAfter, manifest: manifestAfter };
-    assert.deepEqual(
-      [...renderHubMarkdown(snapshotAfter).matchAll(/\(([^)]+\.md)#/g)].map((m) => m[1]),
-      expectedMd,
-      "markdown hub order unchanged",
-    );
-    assert.deepEqual(
-      [...renderHubHtml(snapshotAfter).matchAll(/href="([^"]+\.html)#/g)].map((m) => m[1]),
-      expectedHtml,
-      "html hub order unchanged",
-    );
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});

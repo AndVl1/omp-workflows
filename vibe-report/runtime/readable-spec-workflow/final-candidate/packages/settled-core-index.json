@@ -1,0 +1,83 @@
+{
+  "validation": "readable-spec-workflow-final-candidate",
+  "scope": "settled-core",
+  "generated_at_utc": "2026-09-10T07:16:54Z",
+  "commands": [
+    {
+      "package": "@andvl1/omp-workflows-core@0.27.0",
+      "command": "npm run test",
+      "working_directory": "packages/core",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/settled-core-test.log",
+      "started_at_utc": "2026-09-10T07:07:33Z",
+      "ended_at_utc": "2026-09-10T07:14:20Z",
+      "exit_code": 1,
+      "status": "failed",
+      "sha256": "3b715eb7bd04c98a28085e7119664b6239e7731be20276566f1c396134bac186",
+      "counts": {
+        "log_lines": 1973,
+        "log_bytes": 180625,
+        "tests": 1631,
+        "passed": 1626,
+        "failed": 5,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      },
+      "failures": [
+        "test/cto-state-revision.test.ts: CTO state writer keeps near-limit canonical bytes readable and rejects over-limit before journal",
+        "test/durable-repeated-role.test.ts: specification control tools bind explicit selectors despite a stale active pointer",
+        "test/fan-in.test.ts: fan-in: near-cap UTF-8 slot envelope remains readable at durable completion",
+        "test/report-writer.test.ts: writeReport: accepts a multibyte HTML document immediately below the UTF-8 cap",
+        "test/specification-phase-durability.test.ts: mounted native checkpoint requires strict validation and invalidates stale ask subjects"
+      ],
+      "payload_sha256": "6061be73a1263d65b07996a64e392b73455c4e67992ffa319c805768bb22fbbe"
+    },
+    {
+      "package": "@andvl1/omp-workflows-core@0.27.0",
+      "command": "npm run typecheck",
+      "working_directory": "packages/core",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/settled-core-typecheck.log",
+      "started_at_utc": "2026-09-10T07:16:06Z",
+      "ended_at_utc": "2026-09-10T07:16:09Z",
+      "exit_code": 0,
+      "status": "passed",
+      "sha256": "0a4139128853bbd01719551fa7865335357fb361f303c56a58593bf032b8956d",
+      "counts": {
+        "log_lines": 17,
+        "log_bytes": 450,
+        "diagnostics": 0,
+        "errors": 0
+      },
+      "payload_sha256": "693942573274380eed3c999db84990e06bef2182dff80b93fb6acd9a2783b27c"
+    },
+    {
+      "package": "@andvl1/omp-workflows-core@0.27.0",
+      "command": "npm run build",
+      "working_directory": "packages/core",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/settled-core-build.log",
+      "started_at_utc": "2026-09-10T07:16:50Z",
+      "ended_at_utc": "2026-09-10T07:16:54Z",
+      "exit_code": 0,
+      "status": "passed",
+      "sha256": "37b71fda6c090fad18dd6262fede9902e2e0d66a69057dafd766cfa4e7190dc1",
+      "counts": {
+        "log_lines": 17,
+        "log_bytes": 442,
+        "diagnostics": 0,
+        "errors": 0,
+        "emitted": "complete"
+      },
+      "payload_sha256": "0d76244505eb751ac0aef05e3c90fd1fdbbe1cbc2a9f1b60bcaf5f0f2ecc95e7"
+    }
+  ],
+  "summary": {
+    "commands": 3,
+    "passed": 2,
+    "failed": 1,
+    "test_cases": 1631,
+    "test_passed": 1626,
+    "test_failed": 5,
+    "typecheck_passed": 1,
+    "build_passed": 1
+  }
+}

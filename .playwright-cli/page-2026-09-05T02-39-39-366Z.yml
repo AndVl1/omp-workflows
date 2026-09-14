@@ -1,0 +1,7 @@
+- generic [active] [ref=f1e1]:
+  - generic [ref=f1e5]:
+    - generic:
+      - textbox "Terminal input"
+  - generic [ref=f1e53]:
+    - generic [ref=f1e54]: connecting…
+    - button "⏎ Enter" [ref=f1e57] [cursor=pointer]

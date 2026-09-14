@@ -242,8 +242,17 @@ const MARKDOWN_SCRIPT = `<script>
 })();
 </script>`;
 
-const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+const CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}]/u;
+const CONTROL_CHARACTERS_GLOBAL = /[\p{Cc}\p{Cf}]/gu;
 const SCHEME = /^([a-z][a-z\d+.-]*):/i;
+const MAX_RENDERED_TEXT_BYTES = 64 * 1024;
+const MAX_HEADING_ID_BYTES = 256;
+
+function cleanRenderedText(value: unknown, maxBytes = MAX_RENDERED_TEXT_BYTES): string {
+  const text = String(value ?? "").replace(CONTROL_CHARACTERS_GLOBAL, " ");
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  return Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
+}
 
 /**
  * Permit navigation-only links without allowing a script-capable or malformed
@@ -251,11 +260,26 @@ const SCHEME = /^([a-z][a-z\d+.-]*):/i;
  * network targets; ordinary relative paths, fragments, http(s), and mailto
  * remain useful in a file:// viewer.
  */
-function safeHref(value: unknown): string | undefined {
+function hasNetworkPathPrefix(value: string): boolean {
+  return value.replace(/\\/gu, "/").startsWith("//");
+}
+
+function hasRawNetworkPathPrefix(raw: unknown): boolean {
+  return typeof raw === "string" && /\]\(\s*<?[\\/]{2}/u.test(raw);
+}
+
+function safeHref(value: unknown, raw?: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const href = value.trim();
-  if (href.length === 0 || CONTROL_CHARACTERS.test(href) || /\s/.test(href) || href.includes("\\")) return undefined;
-  if (href.startsWith("//")) return undefined;
+  if (
+    href.length === 0
+    || Buffer.byteLength(href, "utf8") > MAX_RENDERED_TEXT_BYTES
+    || CONTROL_CHARACTERS.test(href)
+    || /\s/.test(href)
+    || href.includes("\\")
+    || hasNetworkPathPrefix(href)
+    || hasRawNetworkPathPrefix(raw)
+  ) return undefined;
   const scheme = SCHEME.exec(href)?.[1]?.toLowerCase();
   if (scheme !== undefined && scheme !== "http" && scheme !== "https" && scheme !== "mailto") return undefined;
   if (href.startsWith(":")) return undefined;
@@ -274,15 +298,17 @@ function safeHref(value: unknown): string | undefined {
   }
   return href;
 }
-
 function headingSlug(label: string): string {
-  const normalized = label.normalize("NFKC").toLowerCase();
+  const normalized = cleanRenderedText(label, MAX_RENDERED_TEXT_BYTES).normalize("NFKC").toLowerCase();
   const slug = Array.from(normalized)
     .map((character) => (/^\p{L}|^\p{N}/u.test(character) ? character : "-"))
     .join("")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
-  return slug || "section";
+  if (!slug) return "section";
+  return Buffer.byteLength(slug, "utf8") <= MAX_HEADING_ID_BYTES
+    ? slug
+    : Buffer.from(slug, "utf8").subarray(0, MAX_HEADING_ID_BYTES).toString("utf8").replace(/-+$/u, "") || "section";
 }
 
 function renderTocNodes(nodes: TocNode[]): string {
@@ -340,7 +366,7 @@ export function renderMarkdownDocumentHtml(markdown: string, options: MarkdownDo
   marked.walkTokens(tokens, (token: Token) => {
     if (token.type !== "heading" || !("depth" in token) || !("tokens" in token)) return;
     const headingToken = token as Tokens.Heading;
-    const label = textParser.parseInline(headingToken.tokens, textRenderer);
+    const label = cleanRenderedText(textParser.parseInline(headingToken.tokens, textRenderer));
     const base = headingSlug(label);
     let suffix = nextSuffix.get(base) ?? 1;
     let id = suffix === 1 ? base : `${base}-${suffix}`;
@@ -366,7 +392,7 @@ export function renderMarkdownDocumentHtml(markdown: string, options: MarkdownDo
   const renderer = new marked.Renderer();
   renderer.heading = function (token) {
     const heading = headingByToken.get(token);
-    const id = heading?.id ?? headingSlug(token.text);
+    const id = heading?.id ?? headingSlug(cleanRenderedText(token.text));
     const label = this.parser.parseInline(token.tokens);
     const navigation = options.navigation !== false && token.depth === 2 && navigationByToken.has(token)
       ? renderNavigation(navigationByToken.get(token)!)
@@ -374,37 +400,39 @@ export function renderMarkdownDocumentHtml(markdown: string, options: MarkdownDo
     return `<h${token.depth} id="${escapeHtml(id)}" class="markdown-heading"><a class="heading-anchor" href="#${escapeHtml(id)}">${label}</a></h${token.depth}>${navigation}\n`;
   };
   renderer.html = function (token) {
-    return escapeHtml(token.text);
+    return escapeHtml(cleanRenderedText(token.text));
   };
   renderer.text = function (token) {
     if ("tokens" in token && token.tokens) return this.parser.parseInline(token.tokens);
-    return escapeHtml(token.text);
+    return escapeHtml(cleanRenderedText(token.text));
   };
   renderer.code = function (token) {
-    const language = token.lang ? ` class="language-${escapeHtml(token.lang)}"` : "";
-    return `<pre><code${language}>${escapeHtml(token.text)}</code></pre>\n`;
+    const language = token.lang ? ` class="language-${escapeHtml(cleanRenderedText(token.lang, 256))}"` : "";
+    return `<pre><code${language}>${escapeHtml(cleanRenderedText(token.text))}</code></pre>\n`;
   };
   renderer.codespan = function (token) {
-    return `<code>${escapeHtml(token.text)}</code>`;
+    return `<code>${escapeHtml(cleanRenderedText(token.text))}</code>`;
   };
   renderer.link = function (token) {
     const label = this.parser.parseInline(token.tokens);
-    const href = safeHref(token.href);
+    const href = safeHref(token.href, token.raw);
     if (href === undefined) return label;
-    const title = token.title ? ` title="${escapeHtml(token.title)}"` : "";
+    const title = token.title ? ` title="${escapeHtml(cleanRenderedText(token.title))}"` : "";
     return `<a href="${escapeHtml(href)}"${title}>${label}</a>`;
   };
   renderer.image = function (token) {
     const imageTokens = token.tokens;
-    const alt = imageTokens !== undefined ? this.parser.parseInline(imageTokens, this.parser.textRenderer) : token.text;
-    return `<span class="markdown-image-alt">[Image: ${escapeHtml(alt)}]</span>`;
+    const alt = imageTokens !== undefined
+      ? this.parser.parseInline(imageTokens, this.parser.textRenderer)
+      : cleanRenderedText(token.text);
+    return `<span class="markdown-image-alt">[Image: ${escapeHtml(cleanRenderedText(alt))}]</span>`;
   };
   renderer.checkbox = function (token) {
     return `<input type="checkbox" disabled${token.checked ? " checked" : ""}> `;
   };
   renderer.tablecell = function (token) {
     const tag = token.header ? "th" : "td";
-    const align = token.align ? ` align="${escapeHtml(token.align)}"` : "";
+    const align = token.align ? ` align="${escapeHtml(cleanRenderedText(token.align, 32))}"` : "";
     return `<${tag}${align}>${this.parser.parseInline(token.tokens)}</${tag}>\n`;
   };
 
@@ -412,10 +440,9 @@ export function renderMarkdownDocumentHtml(markdown: string, options: MarkdownDo
   const body = `<main class="markdown-document"><div class="markdown-container">${
     options.toc === false ? "" : buildToc(headings)
   }<article class="markdown-body">${rendered.trim().length > 0 ? rendered : '<p class="markdown-empty" role="status">This Markdown document is empty.</p>'}</article></div></main>`;
-
   return renderOfflineHtml({
-    title: options.title ?? "Markdown document",
-    lang: options.lang ?? "en",
+    title: cleanRenderedText(options.title ?? "Markdown document"),
+    lang: cleanRenderedText(options.lang ?? "en", 256),
     css: MARKDOWN_CSS,
     body,
     script: MARKDOWN_SCRIPT,

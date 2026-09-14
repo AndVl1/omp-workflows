@@ -20,15 +20,18 @@ npm run build -w @andvl1/omp-workflows-e2e
 node packages/e2e/dist/cli.js bootstrap my-feature feat/my-feature \
   --monorepo . --workdir /tmp
 
-# 3. Start a session (prints a localhost URL with a session-scoped token)
+# 3. Start a session (prints a one-shot browser bootstrap URL)
 node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-my-feature \
   --scenario packages/e2e/scenarios/full-feature.json
 
-# 4. Open the URL in a browser (web surface), or drive it over WS (text surface)
+# 4. Open the bootstrap URL in a browser (it exchanges ?code= for an
+#    HttpOnly cookie; reloads use that cookie and no URL credential)
 #    Ask-state helpers:
 node packages/e2e/dist/cli.js ask /tmp/omp-ux-e2e-my-feature --list
 node packages/e2e/dist/cli.js ask /tmp/omp-ux-e2e-my-feature "1"
-#    Arbitrary command input (uses `\n`; for real PTY submit prefer `pressEnter()` / `\r` — see [Enter semantics](#enter-semantics-r-vs-n)):
+#    OMP 18 native Ask cards with multiple D-* questions require explicit answers:
+node packages/e2e/dist/cli.js ask /tmp/omp-ux-e2e-my-feature --answers '{"d101":"Approve","d102":"1"}'
+#    Arbitrary command input (sends text followed by real PTY Enter `\r`; see [Enter semantics](#enter-semantics-r-vs-n)):
 node packages/e2e/dist/cli.js input /tmp/omp-ux-e2e-my-feature "/do-work implement it"
 
 # 5. Inspect the session, then emit the report
@@ -44,37 +47,48 @@ Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
 | Command | Purpose |
 |---|---|
 | `bootstrap <slug> <branch>` | Create `<workdir>/omp-ux-e2e-<slug>` (default `/tmp`), `git init`, wire the plugin via `npm link` (NOT `file:` — the unpublished peer would fail with ETARGET), write `.omp/ux-e2e-overlay.json`, copy `.omp/team.config.json`, materialize custom-TS commands. `--force` re-creates. |
-| `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a **detached child that survives the parent** — the child writes its stdout/stderr directly into `<scratch>/.work-state/ux-e2e/detach.log` via an inherited file descriptor (no pipe between parent and child, so the child cannot crash with EPIPE when the parent exits). The parent tails the last 8 KiB on the 15 s startup timeout so failures are not swallowed. `--scenario`, `--task`, `--surface web\|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. Honours the optional user-supplied overlay at `<scratch>/.omp/ux-e2e-overlay.user.json` (see [User-supplied overlay](#user-supplied-overlay)). |
-| `stop <scratch-dir>` | SIGTERM → SIGKILL the recorded process tree (see session.json `pid`). |
+| `start <scratch-dir>` | `startTestSession()` + print a one-shot browser bootstrap URL (`?code=...`), never the long-lived session bearer. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a **detached child that survives the parent** — the child writes its stdout/stderr directly into `<scratch>/.work-state/ux-e2e/detach.log` via an inherited file descriptor (no pipe between parent and child, so the child cannot crash with EPIPE when the parent exits). The parent waits up to 60 s for matching `server_pid` + startup nonce and tails the last 8 KiB on timeout so failures are not swallowed. `--scenario`, `--task`, `--surface web\|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. Honours the optional user-supplied overla… |
+| `stop <scratch-dir>` | Authenticated `POST /control/stop` using the exact v2 session metadata (`session_id`, `control_nonce`, bearer token, and server identity). The server owns shutdown: it asks the PTY to close gracefully and waits for its original exit; the CLI never kills a PID from `session.json`. |
 | `transcript <scratch-dir>` | Render transcript.jsonl as text; `--tail N`, `--follow`. |
-| `input <scratch-dir> <text>` | Unconditionally sends `<text>\n` in ONE `{t:'i'}` frame, without requiring a pending `[ask_user]` prompt. **Prefer `pressEnter()` (`\r`) for real omp submit** — `submit()` (`\n`) is a legacy text-mode helper; see [Enter semantics](#enter-semantics-r-vs-n). |
+| `ask <scratch-dir> [<answer>]` | List or answer a pending legacy `[ask_user]` prompt or OMP 18 native Ask card. Native cards expose structured `D-*` question IDs; a multi-question card fails closed for positional `<answer>` and requires `--answers '{"d101":"Approve","d102":"1"}'`. |
+| `input <scratch-dir> <text>` | Unconditionally sends `<text>` followed by real PTY Enter (`\r`) in separate `{t:'i'}` frames, without requiring a pending `[ask_user]` prompt. `WsDriver.submit()` remains a legacy LF helper; prefer `pressEnter()` for real omp submit — see [Enter semantics](#enter-semantics-r-vs-n). |
 | `report <scratch-dir>` | `generateReport()` → `<scratch>/.work-state/ux-e2e/report.json` + `<mdDir>/<slug>-ux-e2e-<date>.md` (default `./vibe-report`). `--steps` supplies structured ratings; `--copy-evidence` mirrors evidence files. |
 
 ## Session hygiene & safe stopping
 
-Stop sessions **only** through `ux-e2e stop <scratch>` (or the equivalent
-`npm run e2e -- stop <scratch>`). The command reads the session PID from
-`<scratch>/.work-state/ux-e2e/session.json`, verifies that the live process
-belongs to that scratch session, then sends SIGTERM and (after the grace
-period) SIGKILL to its process tree. If the PID is stale or belongs to another
-process, stopping is refused rather than risking an unrelated session.
+Every running session publishes exact `schema_version: 2` metadata in
+`<scratch>/.work-state/ux-e2e/session.json`. Stop sessions **only** through
+`ux-e2e stop <scratch>` (or `npm run e2e -- stop <scratch>`). The CLI reads and
+validates that metadata, then sends an authenticated `POST /control/stop`
+bound to the session ID, control nonce, bearer token, and server identity.
+
+The server owns the PTY lifecycle: it requests a graceful close and waits for
+the original PTY to report exit before closing its listener and retained state
+directory. A stop response of `202` means the request was accepted; shutdown
+failure is retained and reported by the server. The CLI never sends a signal
+to a PID read from `session.json`, and no process-tree or arbitrary-PID kill
+fallback exists.
+
+Ask reservations are short-lived records bound to the exact session nonce,
+answering process PID/start identity, and lease expiry. Input is committed only
+after revalidation and observed terminal output/lifecycle evidence; an inbound
+transcript frame alone is not success evidence.
 
 **Never** use `pkill`, `killall`, or `kill` by a process name or pattern (for
-example `omp` or `bun`). Those commands can terminate omp sessions belonging
-to other terminals or users. `start --force` already resolves a live session
-for the requested scratch directory; manual process cleanup is not needed.
-
-When the recorded PID is no longer running, `ux-e2e stop` reports that state
-and leaves the rest of the host untouched.
+example `omp` or `bun`). Those commands can terminate sessions belonging to
+other terminals or users. `start --force` handles a live session for the
+requested scratch directory through the authenticated lifecycle.
 
 ## Architecture
 
 - **`src/server.ts`** — `startTestSession()`: loopback-only HTTP+WS server,
-  session-scoped 256-bit token (constant-time compare), Origin (if present) /
-  Host checks, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, strict
-  CSP, per-connection rate limit, idle timer, SIGTERM → SIGKILL process-tree
-  kill, 64 KiB max frame. Closing a WS only detaches that client; the PTY stays
-  alive for reconnect until `session.close()`, idle timeout, or PTY exit. Vendored static routes
+  exact `schema_version: 2` session metadata, session-scoped 256-bit token
+  (constant-time compare), Origin (if present) / Host checks,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, strict CSP,
+  per-connection rate limit, idle timer, authenticated server-owned graceful
+  PTY shutdown, and a 64 KiB max frame. Closing a WS only detaches that client;
+  the PTY stays alive for reconnect until server shutdown, idle timeout, or PTY
+  exit. Vendored static routes
   (`terminal.html`, `page.js`, `xterm.js`, `xterm.css`, `addon-fit.js`; query
   strings are stripped by `pathnameOf`, so cache-busters like `?cb=1` resolve
   to the same file). Spawns omp with up to three `--config` overlays in
@@ -101,13 +115,13 @@ and leaves the rest of the host untouched.
   prompt never contains a literal `{{...}}`. Merge precedence: caller
   `params` > `def.params` > `BUILTIN_DEFAULTS`.
 - **`src/report.ts`** — `generateReport()`: ux-e2e JSON + manual_qa-compatible
-  markdown. Defect floors: CRITICAL→1, HIGH→2, MEDIUM→3, LOW→4; ratings are
-  clamped and warnings are emitted.
 - **`src/cli.ts`** — thin `node:util parseArgs` dispatch over the seven
-  subcommands. `--detach` spawns the child with an inherited file descriptor
-  for stdout/stderr pointing at `detach.log` (no parent-side pipe — the
-  child outlives the parent without an EPIPE crash) and tails the log on
-  the 15 s startup timeout.
+  subcommands. `--detach` pins the state directory, opens `detach.log`
+  descriptor-relatively with no-follow/non-blocking regular-file checks, and
+  gives the descriptor to the child (no parent-side pipe). It forwards the
+  exact `--force`, `--max-time` seconds, and `--idle-ms` values plus a unique
+  startup nonce; readiness accepts only matching `server_pid` + nonce metadata,
+  then tails the bounded log on startup timeout.
 
 ## User-supplied overlay
 
@@ -179,8 +193,7 @@ line"; `\n` is just a line break and does **not** submit.
 - `WsDriver.submit(text)` (legacy) — appends `'\n'`. Retained for
   backward compatibility with surfaces that normalised LF → CR; prefer
   `pressEnter()` for real PTY sessions.
-
-Upgrade path: `/ws?token=<session-scoped-token>`. The token remains valid for
+The programmatic upgrade path is `/ws?token=<session-scoped-token>`; browser pages use the one-shot `/?code=<bootstrap-code>` exchange and then reconnect with the HttpOnly cookie. The token remains valid only while that exact v2 session is active; the loopback `Host`/`Origin` checks and authenticated session identity are enforced on every upgrade. The server owns PTY shutdown: callers use authenticated `POST /stop`, never a PID fallback, and startup/stop completion is accepted only after the exact session's lifecycle evidence is observed.
 
 ## Report schema
 
@@ -205,31 +218,36 @@ Upgrade path: `/ws?token=<session-scoped-token>`. The token remains valid for
 
 ## Agent-browser recipe (web surface)
 
-1. `ux-e2e start <scratch> --detach` → prints the URL (session survives).
-2. Open the URL in a browser (the token is in the URL; never share it).
+1. `ux-e2e start <scratch> --detach` → prints the one-shot browser bootstrap URL.
+2. Open it in a browser; the server exchanges `?code=...` for an HttpOnly
+   cookie and the page removes the code before reconnects or reloads. Never
+   share the bootstrap URL.
 3. Drive the terminal as a human: type `/do-work <task>`. The toolbar at
    the bottom of the page has an **⏎ Enter** button (`window.__pressEnter()`)
    that emits a real Enter keypress — use it whenever the TUI is waiting
    for input and you would press Enter at a real keyboard.
-4. On every `[ask_user]` block, either type the answer in the terminal or run
-   `ux-e2e ask <scratch> --list` / `ux-e2e ask <scratch> "<answer>"`.
+4. On every legacy `[ask_user]` prompt or OMP 18 native Ask card, either type
+   the answer in the terminal, run `ux-e2e ask <scratch> --list`, or answer via
+   `ux-e2e ask <scratch> "<answer>"`. For native cards with multiple `D-*`
+   questions, use `--answers '{"d101":"Approve","d102":"1"}'`; a single
+   positional answer is rejected rather than applied to every question.
 5. At each stage: screenshot, rate the 6 UX dimensions, log defects to a
    `steps.json`.
 6. `ux-e2e report <scratch> --steps steps.json --copy-evidence`.
 
 ## Known limitations
 
-- `[ask_user]` detection is a regex heuristic over the transcript (numbered
-  option lines after an `[ask_user]` title); calibration may be needed on the
-  first real run. Answers typed *inside* the terminal (not via `ask`) are not
-  recorded in ask-state.jsonl and are treated as "the transcript moved on".
-- Single session at a time per scratch dir (session.json live-pid guard).
+- Ask detection supports legacy `[ask_user]` blocks and OMP 18 native cards
+  (`Ask N questions`, `D-*` tabs, option labels/descriptions, and Submit).
+  Multi-question native cards fail closed unless every question ID is supplied
+- Exact `schema_version: 2` session metadata is required; a live process ID
+  alone is never sufficient for lifecycle control.
 - `--detach` runs the session in a detached child whose stdout/stderr are
-  captured to `<scratch>/.work-state/ux-e2e/detach.log` via an inherited
-  file descriptor (no pipe between parent and child — the child
-  **outlives the parent** and is only stopped via `ux-e2e stop <scratch>` or
-  `--max-time` expiry). The parent surfaces the log tail on the 15 s
-  startup timeout.
+  captured to `<scratch>/.work-state/ux-e2e/detach.log` via a pinned inherited
+  descriptor (no pipe between parent and child). The child **outlives the
+  parent** and is stopped only through the authenticated server control POST or
+  its `--max-time` expiry; the CLI does not kill a recorded PID. The parent
+  surfaces the bounded log tail on startup timeout.
 - The xterm stylesheet is served from `@xterm/xterm/css/xterm.css` (the package
   does not ship `lib/xterm.css`).
 - The host `~/.omp/agent/config.yml` is auto-inherited as the first
@@ -244,9 +262,8 @@ Upgrade path: `/ws?token=<session-scoped-token>`. The token remains valid for
   `session.json` under `user_config`. See
   [User-supplied overlay](#user-supplied-overlay).
     - **Batch via `ux-e2e input <scratch> "<command>"`** for arbitrary commands
-      — sends the command plus a trailing LF (`\n`). For real PTY submit
-      (omp editor maps `\r` → submit) use `pressEnter()` instead; see
-      [Enter semantics](#enter-semantics-r-vs-n).
+      — sends the command followed by real PTY Enter (`\r`). The command and
+      submit are separate input frames; see [Enter semantics](#enter-semantics-r-vs-n).
 - **Single-PTY lifecycle** — the session holds ONE PTY for the whole run. A WS
   disconnect (browser reload, sleep/resume, network blip, or a rate-limit
   close) only detaches that client; reconnect with the session-scoped token
@@ -263,7 +280,7 @@ Upgrade path: `/ws?token=<session-scoped-token>`. The token remains valid for
     - **Batch via `ux-e2e ask <scratch> "<answer>"`** for pending asks — sends
       the answer in a single `{t:'i'}` frame and writes to `ask-state.jsonl`.
     - **Batch via `ux-e2e input <scratch> "<command>"`** for arbitrary commands
-      — sends the command plus a trailing LF (`\n`). For real PTY submit use `pressEnter()` (`\r`); see [Enter semantics](#enter-semantics-r-vs-n).
+      — sends the command followed by real PTY Enter (`\r`); see [Enter semantics](#enter-semantics-r-vs-n).
     - **Throttle typing** — use `delay ≥ 150 ms` per character on
       `page.keyboard.type(...)` (200 ms was observed safe in a live run).
     - **Send whole prompts in one frame** rather than per-char keystrokes.

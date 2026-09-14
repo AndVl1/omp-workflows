@@ -1,0 +1,338 @@
+{
+  "id": "spec-cto-preparation",
+  "title": "CTO preparation: independent features, same-feature facets, mixed decisions, blocked slices, queue limits, final hard stop",
+  "description": "Coordinates specification preparation through one resident CTO run over three specifications: independent features prepared in parallel with distinct workspaces, same-feature facets serialized behind one phase writer in a single workspace, batched mixed decisions (approve-and-continue and request-changes) where only eligible specifications advance, a deterministically blocked facet slice that retains durable state for targeted resume, an overflow request queued with visible capacity, depth, ownership, and active-phase reasons, and the final hard stop returning implementation-ready handoffs without starting any execution wave.",
+  "params": {
+    "feature_alpha": "prep-atlas",
+    "feature_beta": "prep-borealis",
+    "feature_facets": "prep-meridian",
+    "request_alpha": "Add a deterministic request deduplication ledger with explicit ownership",
+    "request_beta": "Add a deterministic configuration snapshot exporter with explicit ownership",
+    "request_facets": "Add a deterministic feature-flag audit trail spanning facet-a and facet-b in one workspace",
+    "beta_revision_feedback": "Rework the Specify draft so the snapshot exporter defines its snapshot boundary and exclusion rules explicitly; keep the same feature identity and run_key.",
+    "overflow_request": "Add a deterministic CLI usage counter with explicit ownership"
+  },
+  "workspace": {
+    "documents": [
+      "specs/{{feature_alpha}}/status.md",
+      "specs/{{feature_alpha}}/spec.md",
+      "specs/{{feature_alpha}}/plan.md",
+      "specs/{{feature_alpha}}/tasks.md",
+      "specs/{{feature_beta}}/status.md",
+      "specs/{{feature_beta}}/spec.md",
+      "specs/{{feature_beta}}/plan.md",
+      "specs/{{feature_beta}}/tasks.md",
+      "specs/{{feature_facets}}/status.md",
+      "specs/{{feature_facets}}/spec.md",
+      "specs/{{feature_facets}}/plan.md",
+      "specs/{{feature_facets}}/tasks.md"
+    ],
+    "validation": [
+      "specs/{{feature_alpha}}/validation/specify.md",
+      "specs/{{feature_alpha}}/validation/plan.md",
+      "specs/{{feature_alpha}}/validation/tasks.md",
+      "specs/{{feature_beta}}/validation/specify.md",
+      "specs/{{feature_beta}}/validation/plan.md",
+      "specs/{{feature_beta}}/validation/tasks.md",
+      "specs/{{feature_facets}}/validation/specify.md",
+      "specs/{{feature_facets}}/validation/plan.md",
+      "specs/{{feature_facets}}/validation/tasks.md"
+    ],
+    "history": [
+      "specs/{{feature_alpha}}/history/specify",
+      "specs/{{feature_alpha}}/history/plan",
+      "specs/{{feature_alpha}}/history/tasks",
+      "specs/{{feature_beta}}/history/specify",
+      "specs/{{feature_beta}}/history/plan",
+      "specs/{{feature_beta}}/history/tasks",
+      "specs/{{feature_facets}}/history/specify",
+      "specs/{{feature_facets}}/history/plan",
+      "specs/{{feature_facets}}/history/tasks"
+    ],
+    "handoff": [
+      "specs/{{feature_alpha}}/handoff.md",
+      "specs/{{feature_beta}}/handoff.md",
+      "specs/{{feature_facets}}/handoff.md"
+    ],
+    "checkpoints": [
+      ".work-state/features/{{feature_alpha}}/state.json",
+      ".work-state/features/{{feature_beta}}/state.json",
+      ".work-state/features/{{feature_facets}}/state.json",
+      ".work-state/ux-e2e/transcript.jsonl",
+      ".work-state/ux-e2e/ask-state.jsonl"
+    ],
+    "evidence": [
+      ".work-state/features/{{feature_alpha}}/artifacts",
+      ".work-state/features/{{feature_beta}}/artifacts",
+      ".work-state/features/{{feature_facets}}/artifacts"
+    ]
+  },
+  "transcript": {
+    "checkpoints": [
+      "approve_continue",
+      "request_changes",
+      "approve_stop",
+      "trusted human proof",
+      "one decision per specification and phase",
+      "no CTO or team-lead self-approval"
+    ],
+    "workers": [
+      "Specify worker dispatch",
+      "Plan worker dispatch",
+      "Tasks worker dispatch",
+      "parallel only independent preparation",
+      "one phase writer",
+      "no parallel writes to the same phase",
+      "no nested CTO dispatch",
+      "no second CTO run"
+    ],
+    "validation": [
+      "same templates",
+      "same validation rules",
+      "revision remains on the affected phase",
+      "re-enter validation",
+      "no autonomous approval path"
+    ],
+    "history": [
+      "history/specify",
+      "history/plan",
+      "history/tasks",
+      "append-only history per workspace",
+      "approved phases untouched by revision"
+    ],
+    "handoff": [
+      "implementation_ready",
+      "handoff_id",
+      "handoff_digest",
+      "standard implementation-ready handoff",
+      "no execution wave started",
+      "no implementation evidence"
+    ],
+    "interruption": [
+      "facet-b blocked",
+      "no fabricated evidence",
+      "durable state retained",
+      "targeted resume",
+      "completed specifications remain reviewable"
+    ],
+    "resume": [
+      "only eligible specifications advance",
+      "targeted resume of the blocked facet",
+      "same feature identity",
+      "same run_key",
+      "revised Specify re-enters validation"
+    ],
+    "next_actions": [
+      "separate explicit execution wave",
+      "queued",
+      "team cap",
+      "decomposition depth",
+      "ownership",
+      "active phase",
+      "no nested CTO"
+    ]
+  },
+  "task": "Coordinate specification preparation through one resident CTO run as one deterministic multi-feature journey. Create exactly one resident CTO run for this task; never spawn, nest, or delegate to a second CTO, and never create a separate specification system. Prepare exactly three specifications through the standard constitution prerequisite and the standard Specify -> Plan -> Tasks flow, reusing the existing native templates, selected language, validation rules, traceability, and durable state for every feature workspace; never invent a CTO-specific specification format or an autonomous approval path. Preserve each engine-generated explicit run_key and select the exact explicit feature ids {{feature_alpha}}, {{feature_beta}}, and {{feature_facets}} for every workspace, dispatch, decision, and evidence lookup; never infer identity from .active-feature, a branch name, or the current directory.\n\nDispatch independent preparation. {{feature_alpha}} ({{request_alpha}}) and {{feature_beta}} ({{request_beta}}) are independent features: give each a distinct canonical workspace `specs/{{feature_alpha}}` and `specs/{{feature_beta}}` and prepare them in parallel, because only independent preparation may run concurrently. {{feature_facets}} ({{request_facets}}) is one broad feature with facet-a and facet-b: keep all three facets in the single workspace `specs/{{feature_facets}}` with coordinated contributors serialized behind one phase writer - no parallel writes to the same feature phase and no facet spun into a second workspace. Confirm the transcript shows parallel dispatch only across the independent features and strictly serialized facet phases inside the shared workspace.\n\nPresent readable checkpoints. At every phase checkpoint present one readable CTO review packet per specification and phase, and record a separate explicit trusted human decision for every specification and phase; neither the CTO, nor a team lead, nor any worker may approve on the user's behalf, and no decision may be recorded without its trusted human proof. Batch the three Specify checkpoints into one review packet and answer it with mixed decisions: approve and continue {{feature_alpha}} (approve_continue), request changes on {{feature_beta}} (request_changes), and approve and continue {{feature_facets}} (approve_continue).\n\nResume mixed decisions correctly. After the mixed Specify answers, only eligible specifications advance: {{feature_alpha}} and {{feature_facets}} proceed to Plan while {{feature_beta}} stays on its affected Specify phase. Submit this revision feedback verbatim into {{feature_beta}}'s Specify revision: `{{beta_revision_feedback}}`. Confirm the revision remains on the Specify phase, re-enters validation, produces a new validated Specify version without touching any already-approved phase, and only then re-presents its checkpoint; approve and continue the revised Specify (approve_continue) so {{feature_beta}} joins Plan. No feature may advance past a phase the user has not approved.\n\nBlock one slice deterministically. Facet-b of {{feature_facets}} intentionally blocks before its Plan artifact completes: the facet dispatch finds no usable facet-b baseline and stops without fabricated evidence. Confirm the blocked slice retains durable state under `.work-state/features/{{feature_facets}}` (state, checkpoint ledger, and the blocking reason) sufficient for targeted resume, that {{feature_alpha}} and {{feature_beta}} Plans continue unaffected, that every completed specification remains reviewable, and that the transcript names the blocked facet-b instead of silently dropping it. Supply the missing facet-b baseline and resume only the blocked facet so it completes its Plan through the same single workspace phase writer.\n\nEnforce the single resident run and queue limits. While the resident run is active, submit a fourth preparation request: `{{overflow_request}}`. The resident run has already reached its team cap and its decomposition-depth cap for additional preparation slices: nothing new may be folded into execution depth at this point. Queue the overflow request with a visible reason naming capacity (team cap), decomposition depth, ownership, and the currently active phase, and confirm the transcript reports the queued reason, exactly one resident CTO run exists, and no nested CTO is ever created.\n\nFinal hard stop. Take the final Tasks approvals (approve_stop at the Tasks checkpoint for each of the three specifications, after the resumed facet-b completes Plan and Tasks for {{feature_facets}}). Confirm each feature ends implementation_ready with a standard implementation-ready handoff carrying a handoff_id and a 64-hex content-addressed handoff_digest bound to its approved tasks, that status.md shows Approvals and the Next Action naming a separate explicit CTO execution wave, and that no implementation evidence, claim, or dispatch exists for any feature. The resident CTO returns the three handoffs and waits: preparation completion is never execution intent, and execution starts only after a separate explicit CTO execution request or wave.\n\nEnd with a compact evidence summary listing the three feature ids with their run_keys, the recorded decision per specification and phase (approve_continue, request_changes, revise-and-approve, approve_stop), the blocked-slice durable resume evidence path under `.work-state/features/{{feature_facets}}`, the queued overflow request with its visible capacity, depth, ownership, and active-phase reason, and the three implementation-ready handoffs with handoff_id and handoff_digest - plus the explicit statement that no execution wave was started and no nested CTO was created.",
+  "stages": [
+    {
+      "id": "resident-run",
+      "name": "Single resident CTO run opens three standard preparation tracks",
+      "expect": [
+        "one resident CTO run",
+        "no nested CTO",
+        "specs/{{feature_alpha}}",
+        "specs/{{feature_beta}}",
+        "specs/{{feature_facets}}",
+        "run_key",
+        "Specify",
+        "Plan",
+        "Tasks"
+      ]
+    },
+    {
+      "id": "constitution",
+      "name": "Plugin-native constitution prerequisite gates preparation",
+      "expect": [
+        "CONSTITUTION.md",
+        "constitution",
+        "plugin-native",
+        "[ask_user]",
+        "approve_continue"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]onstitution",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "independent-facets",
+      "name": "Independent features parallel; same-feature facets serialized in one workspace",
+      "expect": [
+        "parallel only independent preparation",
+        "distinct workspace",
+        "specs/{{feature_alpha}}",
+        "specs/{{feature_beta}}",
+        "one workspace",
+        "specs/{{feature_facets}}",
+        "one phase writer",
+        "no parallel writes to the same phase",
+        "same templates",
+        "same validation rules",
+        "durable state"
+      ]
+    },
+    {
+      "id": "specify-mixed-review",
+      "name": "Batched Specify review packet with mixed trusted decisions",
+      "expect": [
+        "review packet",
+        "[ask_user]",
+        "approve_continue",
+        "request_changes",
+        "every specification and phase",
+        "trusted human proof",
+        "no approval authority"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Aa]tlas",
+          "answer": "1",
+          "count": 1
+        },
+        {
+          "titlePattern": "[Bb]orealis",
+          "answer": "2",
+          "count": 1
+        },
+        {
+          "titlePattern": "[Mm]eridian",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "mixed-resume",
+      "name": "Only eligible specifications advance; revised Specify re-enters validation",
+      "expect": [
+        "only eligible specifications advance",
+        "{{feature_beta}}",
+        "Specify",
+        "affected phase",
+        "re-enter validation",
+        "approved phases untouched",
+        "[ask_user]",
+        "approve_continue"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Ff]eedback|[Rr]evision",
+          "answer": "{{beta_revision_feedback}}",
+          "count": 1
+        },
+        {
+          "titlePattern": "[Bb]orealis",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "blocked-slice",
+      "name": "Facet-b blocks with durable targeted-resume state; others stay reviewable",
+      "expect": [
+        "facet-b",
+        "blocked",
+        "no fabricated evidence",
+        "durable state",
+        "targeted resume",
+        "reviewable",
+        "{{feature_alpha}}",
+        "{{feature_beta}}",
+        "[ask_user]"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Rr]esume|[Bb]lock",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "queue-limits",
+      "name": "Overflow request queued with visible capacity, depth, ownership, and active-phase reasons",
+      "expect": [
+        "{{overflow_request}}",
+        "queued",
+        "visible reason",
+        "team cap",
+        "decomposition depth",
+        "capacity",
+        "ownership",
+        "active phase",
+        "one resident CTO run",
+        "no nested CTO"
+      ]
+    },
+    {
+      "id": "final-hard-stop",
+      "name": "Final Tasks approvals return implementation-ready handoffs; execution needs a separate wave",
+      "expect": [
+        "Tasks",
+        "[ask_user]",
+        "approve_stop",
+        "implementation_ready",
+        "handoff_id",
+        "handoff_digest",
+        "waits",
+        "separate explicit execution wave",
+        "no implementation"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Tt]asks",
+          "answer": "3",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "id": "preparation-evidence",
+      "name": "Readable evidence: statuses, approvals, next actions, and no execution intent",
+      "expect": [
+        "status.md",
+        "Approvals",
+        "Next Action",
+        "history",
+        "implementation_ready",
+        "separate explicit execution wave",
+        "no execution wave started",
+        "no nested CTO"
+      ]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 900000,
+    "checkpointPollMs": 500
+  },
+  "screenshots": {
+    "on": ["stage_start", "stage_end", "ask_user", "error"]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

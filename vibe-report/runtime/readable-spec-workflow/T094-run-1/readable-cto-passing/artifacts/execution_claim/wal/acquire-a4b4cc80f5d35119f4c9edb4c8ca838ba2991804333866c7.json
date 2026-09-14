@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "operation": "acquire_prepared",
+  "transaction_id": "acquire-a4b4cc80f5d35119f4c9edb4c8ca838ba2991804333866c7",
+  "claim": {
+    "claim_id": "claim-b6630cc0c3b4564702f310e9bc8993e8",
+    "handoff_digest": "7644909b7d17135edef84221f57709f0cff3d853e11fa51500c0ee2aa02c9ab7",
+    "owner_kind": "cto",
+    "owner_run_id": "readable-cto-exec-wave-01a06e95",
+    "status": "active",
+    "acquired_at": "2026-09-04T22:48:25.882Z",
+    "updated_at": "2026-09-04T22:48:25.882Z",
+    "release_reason": null,
+    "admission_binding": {
+      "mapping_record_path": ".work-state/cto/readable-cto-exec-wave-01a06e95/specification-mappings/cto-mapping-f8023ff30906da86a7ae7ebd56bcac7a.json",
+      "mapping_record_digest": "d8551279a3a7713b2b29c04fd653a0d8cdeb59264bd2839d9cbf47ebf229bc72",
+      "mapping_id": "cto-mapping-f8023ff30906da86a7ae7ebd56bcac7a",
+      "mapping_hash": "f8023ff30906da86a7ae7ebd56bcac7a5a0faf4e318e759ba456e8f57f7f4f68",
+      "mapping_version": 1,
+      "confirmation_state_revision": 6,
+      "feature_state_revision": 9,
+      "confirmation_state_digest": "627d20eeb7e3168af91a06a35394e1bb0511d8aa0429a210d2243b69f4bff19d",
+      "confirmation_authorization_digest": "5c1e3e7d87a38f938d9b0a071b6a4a162d666b14730d8e7dafb9a96e131c2a10",
+      "confirmation_ledger_digest": "ffb9a76ce764fa2f3b1bd2e2529521a1ad7e69d159a8efc186f10c4c4002263f",
+      "checkpoint_ref": "cto-specification-mapping-48368112c64339b1ec4437b307d3c34ab6bb4de2109f00f0a2b6802f450590db",
+      "trusted_answer_ref": "cto-answer-d8d033ff-7246-4d04-b573-83afc21363db",
+      "stage_id": "execution",
+      "policy_hash": "5ca11b26cc6252741d4f201c103db5db1c80384d85ddaa4d919de5e6ea9750e8",
+      "wave_id": "wave-49ed902456dbd2d8e347deee52e0cf57",
+      "capability_id": "d29d69eb-dcf2-4e57-894a-134df71ec2db",
+      "capability_epoch": "11020e76-91fe-449d-9232-b3e905d72643"
+    }
+  },
+  "feature_id": "readable-cto-passing",
+  "run_key": "readable-cto-passing-run-001",
+  "handoff_ref": "readable-cto-passing.handoff.v1",
+  "expected_workspace_digest": "1b70aaeb0ffd7774da93a63a1a3710575b0cdb8a4ff8cc5e6a9f2eded9a99fad",
+  "previous_digest": null,
+  "workspace_path_binding_digest": "9e1a8a9595acd2f8c01014d5f48a846e497966e3f5a80f6d33a21ed3d29a7b53",
+  "project_root_identity": {
+    "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-2uMB3v/omp-spec-e2e-cto-exec-wave",
+    "dev": 16777234,
+    "ino": 95977674
+  },
+  "path_binding": {
+    "specs": {
+      "relative_path": "specs/readable-cto-passing",
+      "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-2uMB3v/omp-spec-e2e-cto-exec-wave/specs/readable-cto-passing",
+      "dev": 16777234,
+      "ino": 95977751
+    },
+    "feature_state": {
+      "relative_path": ".work-state/features/readable-cto-passing",
+      "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-2uMB3v/omp-spec-e2e-cto-exec-wave/.work-state/features/readable-cto-passing",
+      "dev": 16777234,
+      "ino": 95977754
+    },
+    "artifacts": {
+      "relative_path": ".work-state/features/readable-cto-passing/artifacts",
+      "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-2uMB3v/omp-spec-e2e-cto-exec-wave/.work-state/features/readable-cto-passing/artifacts",
+      "dev": 16777234,
+      "ino": 95977755
+    },
+    "execution_claim": {
+      "relative_path": ".work-state/features/readable-cto-passing/artifacts/execution_claim",
+      "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-2uMB3v/omp-spec-e2e-cto-exec-wave/.work-state/features/readable-cto-passing/artifacts/execution_claim",
+      "dev": 16777234,
+      "ino": 95978881
+    },
+    "execution_claim_next": {
+      "relative_path": ".work-state/features/readable-cto-passing/artifacts/execution_claim/next",
+      "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-2uMB3v/omp-spec-e2e-cto-exec-wave/.work-state/features/readable-cto-passing/artifacts/execution_claim/next",
+      "dev": 16777234,
+      "ino": 95978886
+    }
+  },
+  "created_at": "2026-09-04T22:48:25.882Z"
+}

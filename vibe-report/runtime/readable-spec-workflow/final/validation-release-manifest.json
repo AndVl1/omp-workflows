@@ -1,0 +1,22 @@
+{
+  "runs": [
+    {"command":"npm run build","cwd":".","exit":0,"duration_seconds":5,"totals":{"log_lines":20},"log":"root-build.log"},
+    {"command":"npm run typecheck","cwd":".","exit":0,"duration_seconds":5,"totals":{"log_lines":20},"log":"root-typecheck.log"},
+    {"command":"npm run test:core","cwd":".","exit":1,"duration_seconds":428,"totals":{"tests":1220,"passed":1219,"failed":1,"skipped":0,"log_lines":1336},"log":"test-core.log","first_failure":"packages/core/test/lecture-research.test.ts:571 fresh CTO prompt exposes the lecture-research profile"},
+    {"command":"npm run test:fullstack","cwd":".","exit":1,"duration_seconds":234,"totals":{"tests":411,"passed":410,"failed":1,"skipped":0,"log_lines":454},"log":"test-fullstack.log","first_failure":"packages/fullstack/test/workflow-commands.test.ts:146 prompts[0] does not include /cto workflow"},
+    {"command":"npm run test -w @andvl1/omp-workflows-internal","cwd":".","exit":0,"duration_seconds":1,"totals":{"tests":74,"passed":74,"failed":0,"skipped":0,"log_lines":96},"log":"test-internal.log"},
+    {"command":"OMP_UX_E2E_SEMANTIC_TIMEOUT_MS=600000 OMP_UX_E2E_PRESERVE_ON_FAILURE=1 node --test --import tsx --test-name-pattern=complete generic bundle test/spec-import.test.ts","cwd":"packages/e2e","exit":1,"duration_seconds":604,"totals":{"tests":1,"passed":0,"failed":1,"skipped":0,"log_lines":21},"log":"t061-generic-complete-exact.log","first_failure":"test/spec-import.test.ts:599 waitFor timed out after 600000ms (complete bundle compatibility intake semantic readiness)"},
+    {"command":"node --test --import tsx --test-name-pattern=T094 runtime test/spec-cto-execution.test.ts","cwd":"packages/e2e","exit":0,"duration_seconds":44,"totals":{"tests":1,"passed":1,"failed":0,"skipped":0,"log_lines":9},"log":"t094-run1.log"},
+    {"command":"node --test --import tsx --test-name-pattern=T094 runtime test/spec-cto-execution.test.ts","cwd":"packages/e2e","exit":0,"duration_seconds":44,"totals":{"tests":1,"passed":1,"failed":0,"skipped":0,"log_lines":9},"log":"t094-run2.log"}
+  ],
+  "focused_preparation": "not_run: parent stopped pending routing/P3 fix",
+  "full_e2e": "not_run: focused preparation not passed",
+  "source_assertion_failures": [
+    "packages/core/test/lecture-research.test.ts:571",
+    "packages/fullstack/test/workflow-commands.test.ts:146",
+    "packages/e2e/test/spec-import.test.ts:599"
+  ],
+  "preserved_t061_scratch": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-eQvQ0z",
+  "t061_last_tool": "workflow_checkpoint_ask rejected WORKFLOW_CHECKPOINT_ASK_REJECTED; workflow_checkpoint and workflow_advance were not called",
+  "notes": "No production, tests, or checklist files edited. T061 scratch was stopped via npm run e2e -- stop. Existing OMP sessions belonging to other sessions were not stopped."
+}

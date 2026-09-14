@@ -48,7 +48,7 @@ export interface ObservabilityArtifactSummary {
   sha256: string;
   bytes?: number;
   schema_status?: CompletionArtifactRef["schema_status"];
-  dod_status?: CompletionArtifactRef["dod_status"];
+  quality_gate_status?: CompletionArtifactRef["quality_gate_status"];
 }
 
 export type ObservabilityStatus = PendingState["status"] | CompletionOutcome;

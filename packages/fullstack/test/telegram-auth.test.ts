@@ -11,23 +11,85 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, existsSync, rmSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TelegramEscalationAdapter } from "../src/adapters/telegram.js";
-import { createEscalationAdapter } from "../src/adapters/registry.js";
-import type { Escalation, EscalationAnswer } from "@andvl1/omp-workflows-core";
+import { TelegramEscalationAdapter, TelegramMappingRecoveryRequiredError } from "../src/adapters/telegram.js";
+import { createEscalationAdapter as createEscalationAdapterRaw } from "../src/adapters/registry.js";
+import { openFullstackRuntimeTest, type FullstackRuntimeTestFixture } from "./runtime-access-fixture.js";
+
+const runtimeFixtures = new Map<string, FullstackRuntimeTestFixture>();
+function runtimeFor(root: string) {
+  const existing = runtimeFixtures.get(root);
+  if (existing) return existing.access;
+  const fixture = openFullstackRuntimeTest(root, "telegram-auth-test");
+  runtimeFixtures.set(root, fixture);
+  return fixture.access;
+}
+test.afterEach(() => {
+  for (const fixture of runtimeFixtures.values()) fixture.close();
+  runtimeFixtures.clear();
+});
+
+function createEscalationAdapter(...args: Parameters<typeof createEscalationAdapterRaw>): ReturnType<typeof createEscalationAdapterRaw> {
+  const [config, root, pinnedRoot] = args;
+  return createEscalationAdapterRaw(config, root, pinnedRoot, runtimeFor(root));
+}
+function telegramAdapter(options: ConstructorParameters<typeof TelegramEscalationAdapter>[0]): TelegramEscalationAdapter {
+  return new TelegramEscalationAdapter({ ...options, mappingProofSecret: options.mappingProofSecret ?? TEST_MAPPING_PROOF_SECRET, runtimeAccess: options.runtimeAccess ?? runtimeFor(options.cwd) });
+}
+import { canonicalDurableIdFileName, type Escalation, type EscalationAnswer, type EscalationReceipt } from "@andvl1/omp-workflows-core";
+import { markCtoRunDeliveryPending, newCtoState, writeCtoState } from "../../core/src/cto/state.js";
 
 /** Absolute path of the answer file the adapter writes for an escId. */
 function answerPath(root: string, escId: string): string {
   const runId = escId.split("/")[0] ?? escId;
-  const fileName = escId.replace(/[^a-zA-Z0-9-_]/g, "-");
-  return join(root, ".work-state", "cto", runId, "answers", `${fileName}.json`);
+  const fileName = canonicalDurableIdFileName(escId);
+  return join(root, ".work-state", "cto", runId, "answers", fileName);
+}
+function withIndexedRun(root: string, runId: string): void {
+  runtimeFor(root);
+  const state = newCtoState({
+    id: runId,
+    task: "telegram auth",
+    branch: "main",
+    autonomous: true,
+    plan: { id: runId, task: "telegram auth", teams: [], created_at: new Date().toISOString() },
+  });
+  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+  assert.equal(markCtoRunDeliveryPending(root, runId, undefined, "outbox"), true);
+}
+function withIndexedMapping(root: string, runId: string, escId: string, messageId: number, chatId = CONFIGURED_CHAT): void {
+  if (!existsSync(join(root, ".work-state", "cto", runId, "state.json"))) withIndexedRun(root, runId);
+  const adapter = telegramAdapter({ token: "fixture-token", chatId, cwd: root });
+  const recordMapping = (adapter as unknown as {
+    recordMapping(escId: string, messageId: number, esc: Escalation, receipt: EscalationReceipt): void;
+  }).recordMapping;
+  recordMapping.call(adapter, escId, messageId, {
+    id: escId,
+    level: "question",
+    title: "Fixture escalation",
+    body: "Fixture body",
+  }, { sent: true, channelRef: `tg:${messageId}` });
+}
+function mappingShardPath(root: string, runId: string, chatId: string): string {
+  const partition = createHash("sha256").update("telegram-chat-mapping\u0000", "utf8").update(chatId, "utf8").digest("hex");
+  const directory = join(root, ".work-state", "cto", runId, "telegram-callbacks", partition);
+  const shard = readdirSync(directory).find((name) => name.startsWith("tg-map") && name.endsWith(".jsonl"));
+  assert.ok(shard, "mapping shard exists");
+  return join(directory, shard);
+}
+function writeLegacyMappingLock(root: string, tenant: string, chatId: string, owner: string, expiresAt: number): string {
+  const path = join(root, ".work-state", "cto", tenant, "tg-map.lock.json");
+  mkdirSync(join(root, ".work-state", "cto", tenant), { recursive: true });
+  writeFileSync(path, JSON.stringify({ schema: 1, tenant, chatId, owner, expiresAt }));
+  return path;
 }
 
-/** Response-shaped object the adapter's api() accepts (checks ok + json()). */
+/** Real streamed Response used by the adapter's bounded API reader. */
 function okResponse(result: unknown): Response {
-  return { ok: true, status: 200, json: async () => ({ ok: true, result }) } as unknown as Response;
+  return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
 }
 
 /**
@@ -46,6 +108,7 @@ function mockFetch(updates: unknown[] | (() => unknown[]), onGetUpdates?: (offse
 }
 
 const CONFIGURED_CHAT = "12345";
+const TEST_MAPPING_PROOF_SECRET = "fixture-telegram-map-secret-012345678901234567890123456789";
 
 // 1. Unauthorized callback dropped, offset still advances, authorized
 //    follow-up in the same round is processed.
@@ -53,6 +116,7 @@ test("auth: unauthorized callback is dropped (no file, no handler) and the offse
   const root = mkdtempSync(join(tmpdir(), "tg-auth-1-"));
   const calls: string[] = [];
   try {
+    withIndexedMapping(root, "run-sec1", "run-sec1/esc-1", 11);
     let round = 0;
     const rounds = () => (round++ === 0 ? [
       {
@@ -65,7 +129,7 @@ test("auth: unauthorized callback is dropped (no file, no handler) and the offse
       },
     ] : []);
     const offsets: number[] = [];
-    const adapter = new TelegramEscalationAdapter({
+    const adapter = telegramAdapter({
       token: "t",
       chatId: CONFIGURED_CHAT,
       cwd: root,
@@ -92,13 +156,14 @@ test("auth: unauthorized callback is dropped (no file, no handler) and the offse
 test("auth: callback answer from the configured chatId writes the answer file exactly as before", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-auth-2-"));
   try {
+    withIndexedMapping(root, "run-sec1", "run-sec1/esc-1", 20);
     const updates = [
       {
         update_id: 5,
         callback_query: { id: "cq1", from: { id: 111 }, message: { message_id: 20, chat: { id: Number(CONFIGURED_CHAT) } }, data: "run-sec1/esc-1::yes" },
       },
     ];
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: CONFIGURED_CHAT, cwd: root, fetchImpl: mockFetch(updates) });
+    const adapter = telegramAdapter({ token: "t", chatId: CONFIGURED_CHAT, cwd: root, fetchImpl: mockFetch(updates) });
     const answers = await adapter.pollOnce();
     assert.equal(answers.length, 1);
     const file = answerPath(root, "run-sec1/esc-1");
@@ -121,7 +186,7 @@ test("auth: plain task from an unauthorized chat does not call onPlainMessage", 
     const updates = [
       { update_id: 7, message: { message_id: 1, text: "run the deploy", chat: { id: 999 }, from: { id: 111 } } },
     ];
-    const adapter = new TelegramEscalationAdapter({
+    const adapter = telegramAdapter({
       token: "t", chatId: CONFIGURED_CHAT, cwd: root, fetchImpl: mockFetch(updates),
       onPlainMessage: (m) => calls.push(m.text),
     });
@@ -141,16 +206,67 @@ test("auth: plain task from the configured chat calls onPlainMessage with { id, 
     const updates = [
       { update_id: 8, message: { message_id: 3, text: "run the deploy", chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } } },
     ];
-    const adapter = new TelegramEscalationAdapter({
+    const adapter = telegramAdapter({
       token: "t", chatId: CONFIGURED_CHAT, cwd: root, fetchImpl: mockFetch(updates),
       onPlainMessage: (m) => calls.push(m),
     });
     await adapter.pollOnce();
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].id, "tg:3");
+    assert.match(calls[0].id, /^tg-[0-9a-f]{64}$/u, "plain task id is a chat-scoped canonical token");
     assert.equal(calls[0].text, "run the deploy");
     assert.equal(typeof calls[0].at, "string");
     assert.ok(!Number.isNaN(Date.parse(calls[0].at)), "at is an ISO timestamp");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("auth: plain task context preserves source chat and separates chat-scoped message IDs", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-auth-chat-context-"));
+  const calls: Array<{ id: string; text: string; chatId: string; userId?: string; messageId: number }> = [];
+  try {
+    const updates = [
+      { update_id: 80, message: { message_id: 7, text: "from primary", chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } } },
+      { update_id: 81, message: { message_id: 7, text: "from allowed", chat: { id: 67890 }, from: { id: 222 } } },
+    ];
+    const adapter = telegramAdapter({
+      token: "t",
+      chatId: CONFIGURED_CHAT,
+      allowedChatIds: ["67890"],
+      cwd: root,
+      fetchImpl: mockFetch(updates),
+      onPlainMessage: (m) => calls.push(m),
+    });
+    await adapter.pollOnce();
+    assert.equal(calls.length, 2);
+    assert.notEqual(calls[0].id, calls[1].id, "same Telegram message_id in different chats has distinct task identity");
+    assert.deepEqual(
+      calls.map(({ chatId, userId, messageId }) => ({ chatId, userId, messageId })),
+      [
+        { chatId: CONFIGURED_CHAT, userId: "111", messageId: 7 },
+        { chatId: "67890", userId: "222", messageId: 7 },
+      ],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("auth: plain handler rejection leaves update unconfirmed for retry", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-auth-retry-"));
+  const offsets: number[] = [];
+  let rounds = 0;
+  let fail = true;
+  try {
+    const update = { update_id: 19, message: { message_id: 4, text: "wake", chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } } };
+    const adapter = telegramAdapter({
+      token: "t", chatId: CONFIGURED_CHAT, cwd: root,
+      fetchImpl: mockFetch(() => (rounds++ < 2 ? [update] : []), (offset) => offsets.push(offset)),
+      onPlainMessage: async () => { if (fail) { fail = false; throw new Error("wake admission failed"); } },
+    });
+    await assert.rejects(adapter.pollOnce(), /wake admission failed/);
+    await adapter.pollOnce();
+    assert.deepEqual(offsets, [0, 0], "failed plain admission must not advance Telegram offset");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -161,11 +277,12 @@ test("auth: plain task from the configured chat calls onPlainMessage with { id, 
 test("auth: reply-to-escalation answers are gated by chat", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-auth-5-"));
   try {
+    withIndexedRun(root, "run-sec1");
     const mapDir = join(root, ".work-state", "cto", "run-sec1");
     mkdirSync(mapDir, { recursive: true });
     writeFileSync(join(mapDir, "tg-map.jsonl"), `${JSON.stringify({ escId: "run-sec1/esc-1", messageId: 100 })}\n`);
 
-    const unauthorized = new TelegramEscalationAdapter({
+    const unauthorized = telegramAdapter({
       token: "t", chatId: CONFIGURED_CHAT, cwd: root,
       fetchImpl: mockFetch([
         { update_id: 1, message: { message_id: 11, text: "no", reply_to_message: { message_id: 100 }, chat: { id: 999 }, from: { id: 111 } } },
@@ -174,8 +291,9 @@ test("auth: reply-to-escalation answers are gated by chat", async () => {
     await unauthorized.pollOnce();
     assert.equal(existsSync(answerPath(root, "run-sec1/esc-1")), false, "unauthorized chat reply produces no answer file");
 
-    const authorized = new TelegramEscalationAdapter({
+    const authorized = telegramAdapter({
       token: "t", chatId: CONFIGURED_CHAT, cwd: root,
+      legacyMappingMigration: { tenant: "run-sec1", chatId: CONFIGURED_CHAT },
       fetchImpl: mockFetch([
         { update_id: 1, message: { message_id: 11, text: "yes, approved", reply_to_message: { message_id: 100 }, chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } } },
       ]),
@@ -189,6 +307,150 @@ test("auth: reply-to-escalation answers are gated by chat", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+// A reply-shaped message with no routable target is not a plain CTO task.
+// It surfaces retryable recovery and keeps the Telegram offset unconfirmed.
+test("auth: stale or foreign replies require recovery instead of waking the plain handler", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-auth-reply-target-"));
+  const calls: Array<{ id: string; text: string; at: string }> = [];
+  try {
+    withIndexedRun(root, "run-sec2");
+    const foreignPartition = createHash("sha256")
+      .update("telegram-chat-mapping\u0000", "utf8")
+      .update("999", "utf8")
+      .digest("hex");
+    const foreignMapDir = join(root, ".work-state", "cto", "run-sec2", "telegram-callbacks", foreignPartition);
+    mkdirSync(foreignMapDir, { recursive: true });
+    writeFileSync(join(foreignMapDir, "tg-map.meta.json"), JSON.stringify({ schema: 2, tenant: "run-sec2", chatId: "999" }));
+    appendFileSync(join(foreignMapDir, "tg-map.jsonl"), `${JSON.stringify({ escId: "run-sec2/esc-foreign", messageId: 100, chatId: "999" })}\n`);
+    const updates = [
+      {
+        update_id: 20,
+        message: {
+          message_id: 20,
+          text: "stale reply",
+          reply_to_message: { message_id: 999 },
+          chat: { id: Number(CONFIGURED_CHAT) },
+          from: { id: 111 },
+        },
+      },
+      {
+        update_id: 21,
+        message: {
+          message_id: 21,
+          text: "foreign reply",
+          reply_to_message: { message_id: 100 },
+          chat: { id: Number(CONFIGURED_CHAT) },
+          from: { id: 111 },
+        },
+      },
+      {
+        update_id: 22,
+        message: { message_id: 22, text: "true plain task", chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } },
+      },
+    ];
+    const offsets: number[] = [];
+    const adapter = telegramAdapter({
+      token: "t",
+      chatId: CONFIGURED_CHAT,
+      cwd: root,
+      fetchImpl: mockFetch(updates, (offset) => offsets.push(offset)),
+      onPlainMessage: (m) => calls.push(m),
+    });
+    await assert.rejects(adapter.pollOnce(), (error: unknown) => error instanceof TelegramMappingRecoveryRequiredError
+      && error.code === "telegram_mapping_recovery_required" && error.messageId === 999);
+    assert.deepEqual(offsets, [0], "recovery leaves the Telegram update offset unconfirmed");
+    assert.equal(existsSync(answerPath(root, "run-sec2/esc-foreign")), false, "foreign reply produces no answer file");
+    assert.equal(calls.length, 0, "unresolved reply never wakes the plain handler");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("mapping proof: separate sender and poller instances share the protected key, while a mismatched key retries", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-auth-shared-map-key-"));
+  const runId = "run-shared-map";
+  const escId = `${runId}/team/check/1`;
+  const sharedSecret = "A".repeat(64);
+  const fakeState = {
+    id: runId,
+    state_revision: 0,
+    updated_at: "2026-01-01T00:00:00.000Z",
+    pause: { kind: "none" },
+    standby: false,
+    teams: [],
+  };
+  const candidate = {
+    run_id: runId,
+    state_revision: 0,
+    status: "active",
+    updated_at: fakeState.updated_at,
+    pending_summary: false,
+    pending_outbox: false,
+    pending_retry: false,
+    summary_digest: "none",
+  };
+  const runtime = {
+    assertLive: () => undefined,
+    readState: (id: string) => id === runId ? fakeState : null,
+    readActiveDeliveryCandidates: () => ({ ok: true, active_run_id: runId, entries: [candidate] }),
+    readCompletedDeliveryIndexPage: () => ({ entries: [], next_after_run_id: null, active_run_id: null }),
+    resolveEscalationChannelSnapshot: () => ({ status: "absent" }),
+  } as unknown as ConstructorParameters<typeof TelegramEscalationAdapter>[0]["runtimeAccess"];
+  try {
+    let outbound: Record<string, unknown> | null = null;
+    const sender = telegramAdapter({
+      token: "sender-token",
+      chatId: CONFIGURED_CHAT,
+      cwd: root,
+      mappingProofSecret: sharedSecret,
+      runtimeAccess: runtime,
+      fetchImpl: (async (_url: unknown, init?: RequestInit) => {
+        outbound = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return okResponse({ message_id: 77 });
+      }) as typeof fetch,
+    });
+    const escalation = { id: escId, level: "question" as const, title: "Shared", body: "Key" };
+    assert.equal((await sender.send(escalation)).sent, true);
+    assert.ok(typeof outbound?.text === "string" && outbound.text.includes("omp-escalation-ref"), "outbound text carries canonical marker");
+
+    const reply = (text: string) => [{
+      update_id: 1,
+      message: {
+        message_id: 78,
+        text,
+        reply_to_message: { message_id: 77, text: String(outbound?.text) },
+        chat: { id: Number(CONFIGURED_CHAT) },
+        from: { id: 111 },
+      },
+    }];
+    const accepted = telegramAdapter({
+      token: "poller-token",
+      chatId: CONFIGURED_CHAT,
+      cwd: root,
+      mappingProofSecret: sharedSecret,
+      runtimeAccess: runtime,
+      fetchImpl: mockFetch(reply("approved")),
+    });
+    const answers = await accepted.pollOnce();
+    assert.equal(answers[0]?.id, escId, "shared key authorizes the persisted mapping in a separate adapter instance");
+    assert.equal(answers[0]?.answer, "approved");
+
+    const offsets: number[] = [];
+    const mismatched = telegramAdapter({
+      token: "poller-token",
+      chatId: CONFIGURED_CHAT,
+      cwd: root,
+      mappingProofSecret: "B".repeat(64),
+      runtimeAccess: runtime,
+      fetchImpl: mockFetch(reply("forged"), (offset) => offsets.push(offset)),
+    });
+    await assert.rejects(mismatched.pollOnce(), (error: unknown) => error instanceof TelegramMappingRecoveryRequiredError
+      && error.code === "telegram_mapping_recovery_required");
+    assert.deepEqual(offsets, [0], "a poller without the sender's protected key cannot commit the update");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 // 6. allowedSenderIds: non-listed sender rejected, listed sender accepted
 //    inside the allowed chat.
@@ -196,7 +458,7 @@ test("auth: allowedSenderIds restricts senders inside the allowed chat", async (
   const root = mkdtempSync(join(tmpdir(), "tg-auth-6-"));
   const calls: Array<{ id: string; text: string; at: string }> = [];
   try {
-    const adapter = new TelegramEscalationAdapter({
+    const adapter = telegramAdapter({
       token: "t", chatId: CONFIGURED_CHAT, cwd: root, allowedSenderIds: ["42"],
       fetchImpl: mockFetch([
         { update_id: 1, message: { message_id: 1, text: "hi", chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 7 } } },
@@ -206,7 +468,7 @@ test("auth: allowedSenderIds restricts senders inside the allowed chat", async (
     });
     await adapter.pollOnce();
     assert.equal(calls.length, 1, "only the listed sender's message is accepted");
-    assert.equal(calls[0].id, "tg:2");
+    assert.match(calls[0].id, /^tg-[0-9a-f]{64}$/u);
     assert.equal(calls[0].text, "hi");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -217,7 +479,9 @@ test("auth: allowedSenderIds restricts senders inside the allowed chat", async (
 test("auth: allowedChatIds extends the allowlist; configured chatId stays allowed", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-auth-7-"));
   try {
-    const adapter = new TelegramEscalationAdapter({
+    withIndexedMapping(root, "run-sec1", "run-sec1/esc-2", 31, "999");
+    withIndexedMapping(root, "run-sec1", "run-sec1/esc-3", 32, CONFIGURED_CHAT);
+    const adapter = telegramAdapter({
       token: "t", chatId: CONFIGURED_CHAT, cwd: root, allowedChatIds: ["999"],
       fetchImpl: mockFetch([
         { update_id: 1, callback_query: { id: "cq1", from: { id: 111 }, message: { message_id: 30, chat: { id: 555 } }, data: "run-sec1/esc-1::no" } },
@@ -242,7 +506,7 @@ test("auth: fail closed on missing chat.id / missing sender with allowedSenderId
   const root = mkdtempSync(join(tmpdir(), "tg-auth-8-"));
   const calls: Array<{ id: string; text: string; at: string }> = [];
   try {
-    const adapter = new TelegramEscalationAdapter({
+    const adapter = telegramAdapter({
       token: "t", chatId: CONFIGURED_CHAT, cwd: root, allowedSenderIds: ["42"],
       fetchImpl: mockFetch([
         // message with text + from but NO chat.id -> rejected
@@ -259,7 +523,7 @@ test("auth: fail closed on missing chat.id / missing sender with allowedSenderId
     const answers = await adapter.pollOnce();
     assert.equal(answers.length, 0, "no answer written for provenance-less updates");
     assert.equal(calls.length, 1, "only the fully-shaped control message wakes the handler");
-    assert.equal(calls[0].id, "tg:4");
+    assert.match(calls[0].id, /^tg-[0-9a-f]{64}$/u);
     assert.equal(existsSync(answerPath(root, "run-sec1/esc-1")), false, "no answer file from the chat-less callback");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -291,9 +555,25 @@ test("auth: registry passes allowedSenderIds through to the telegram adapter", a
     tg.setPlainMessageHandler((m) => calls.push(m));
     await tg.pollOnce();
     assert.equal(calls.length, 1, "sender 7 rejected, sender 42 accepted through the registry seam");
-    assert.equal(calls[0].id, "tg:2");
+    assert.match(calls[0].id, /^tg-[0-9a-f]{64}$/u);
   } finally {
     (globalThis as { fetch: typeof fetch }).fetch = realFetch;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("auth: registry rejects malformed Telegram allowlists", () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-auth-9b-"));
+  try {
+    const malformedConfigs: unknown[] = [
+      { adapter: "telegram", telegram: { token: "t", chatId: CONFIGURED_CHAT, allowedSenderIds: [true] } },
+      { adapter: "telegram", telegram: { token: "t", chatId: CONFIGURED_CHAT, allowedSenderIds: ["42", "42"] } },
+      { adapter: "telegram", telegram: { token: "t", chatId: CONFIGURED_CHAT, allowedChatIds: ["\u0000"] } },
+    ];
+    for (const raw of malformedConfigs) {
+      const config = raw as Parameters<typeof createEscalationAdapter>[0];
+      assert.equal(createEscalationAdapter(config, root), null, "malformed allowlist fails closed");
+    }
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -306,6 +586,7 @@ test("auth: registry passes allowedSenderIds through to the telegram adapter", a
 test("sec001: malformed callback escIds are dropped (no file outside the run answers dir), offset advances, valid callback still writes", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-sec001-10-"));
   try {
+    withIndexedMapping(root, "run-sec1", "run-sec1/esc-1", 20);
     const malformed = ["../../::yes", "..\\..::yes", "C:\\evil::yes", "/abs/path::yes", "a//b::yes", "...::yes"];
     const updates = [
       ...malformed.map((data, i) => ({
@@ -330,7 +611,7 @@ test("sec001: malformed callback escIds are dropped (no file outside the run ans
     let round = 0;
     const rounds = () => (round++ === 0 ? updates : []);
     const offsets: number[] = [];
-    const adapter = new TelegramEscalationAdapter({
+    const adapter = telegramAdapter({
       token: "t", chatId: CONFIGURED_CHAT, cwd: root,
       fetchImpl: mockFetch(rounds, (offset) => offsets.push(offset)),
     });
@@ -361,11 +642,9 @@ test("sec001: malformed callback escIds are dropped (no file outside the run ans
 });
 
 // 11. SEC-001: a poisoned tg-map.jsonl escId on the reply path cannot write
-//     outside the cto root (fail-closed throw at the write boundary); a valid
-//     map entry in the same test still writes, mapping preserved. Fails on the
-//     original code: the poisoned reply wrote <root>/.work-state/answers/ and
-//     pollOnce resolved instead of rejecting.
-test("sec001: poisoned tg-map.jsonl escId on the reply path cannot write outside the cto root; valid map entry still writes", async () => {
+// outside the cto root. The complete mapping snapshot fails closed, so even a
+// valid entry in the same corrupted shard is not trusted.
+test("sec001: poisoned tg-map.jsonl escId on the reply path fails closed without writes", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-sec001-11-"));
   try {
     const mapDir = join(root, ".work-state", "cto", "run-sec1");
@@ -375,26 +654,21 @@ test("sec001: poisoned tg-map.jsonl escId on the reply path cannot write outside
       JSON.stringify({ escId: "run-sec1/esc-2", messageId: 101 }),
       "",
     ].join("\n"));
-    const adapter = new TelegramEscalationAdapter({
+    const adapter = telegramAdapter({
       token: "t", chatId: CONFIGURED_CHAT, cwd: root,
+      legacyMappingMigration: { tenant: "run-sec1", chatId: CONFIGURED_CHAT },
       fetchImpl: mockFetch([
-        // valid entry first — written before the poisoned one throws
         { update_id: 1, message: { message_id: 12, text: "approved", reply_to_message: { message_id: 101 }, chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } } },
         { update_id: 2, message: { message_id: 13, text: "evil", reply_to_message: { message_id: 100 }, chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } } },
       ]),
     });
-    await assert.rejects(
-      () => adapter.pollOnce(),
-      /writeAnswer rejected unsafe runId/,
-      "poisoned map escId fails closed at the write boundary",
-    );
-    // Valid map entry still wrote with the reply text, mapping preserved:
-    const saved = JSON.parse(readFileSync(answerPath(root, "run-sec1/esc-2"), "utf8")) as { id: string; answer: string; by: string };
-    assert.equal(saved.id, "run-sec1/esc-2");
-    assert.equal(saved.answer, "approved");
-    assert.equal(saved.by, "telegram:reply");
-    // No write outside the cto root:
+    const answers = await adapter.pollOnce();
+    assert.deepEqual(answers, [], "a corrupted mapping snapshot is rejected before any answer write");
+    assert.equal(existsSync(answerPath(root, "run-sec1/esc-2")), false, "valid records in a poisoned shard are not trusted");
+    assert.equal(existsSync(answerPath(root, "run-sec1/../../poison")), false, "poisoned mapping cannot escape the run answers dir");
     assert.equal(existsSync(join(root, ".work-state", "answers")), false, "no ../.. escape on the reply path");
+    assert.equal(existsSync(join(root, ".work-state", "cto", "answers")), false, "no empty-runId write on the reply path");
+    assert.equal(existsSync(join(root, ".work-state", "cto", "run-sec1", "answers")), false, "no answer is written from a corrupted mapping");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -406,14 +680,14 @@ test("sec001: poisoned tg-map.jsonl escId on the reply path cannot write outside
 test("sec001: writeAnswer rejects traversal ids and creates nothing", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-sec001-12-"));
   try {
-    const adapter = new TelegramEscalationAdapter({
+    const adapter = telegramAdapter({
       token: "t", chatId: CONFIGURED_CHAT, cwd: root, fetchImpl: mockFetch([]),
     });
     const writer = adapter as unknown as { writeAnswer(a: EscalationAnswer): EscalationAnswer };
     for (const id of ["../..", "..\\..", "C:\\x", "..", "/abs"]) {
       assert.throws(
-        () => writer.writeAnswer({ id, answer: "x", at: new Date().toISOString(), by: "test" }),
-        /writeAnswer rejected unsafe runId/,
+        () => writer.writeAnswer({ id, run_id: "run-sec1", answer: "x", at: new Date().toISOString(), by: "test" }),
+        /writeAnswer rejected unsafe answer id/,
         `writeAnswer must reject id ${JSON.stringify(id)}`,
       );
     }
@@ -431,7 +705,7 @@ test("sec001: writeAnswer rejects traversal ids and creates nothing", async () =
 test("sec002: send failure channelRef never leaks the bot token (fetch rejection)", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-sec002-13-"));
   try {
-    const adapter = new TelegramEscalationAdapter({
+    const adapter = telegramAdapter({
       token: "123456:SUPERSECRETTOKEN",
       chatId: CONFIGURED_CHAT,
       cwd: root,
@@ -455,7 +729,7 @@ test("sec002: send failure channelRef never leaks the bot token (fetch rejection
 test("sec002: non-ok response yields a token-free http-status failure ref", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-sec002-14-"));
   try {
-    const adapter = new TelegramEscalationAdapter({
+    const adapter = telegramAdapter({
       token: "123456:SUPERSECRETTOKEN",
       chatId: CONFIGURED_CHAT,
       cwd: root,
@@ -477,7 +751,7 @@ test("sec002: non-ok response yields a token-free http-status failure ref", asyn
 test("sec002: sendPlainText rejection channelRef is token-free", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-sec002-15-"));
   try {
-    const adapter = new TelegramEscalationAdapter({
+    const adapter = telegramAdapter({
       token: "123456:SUPERSECRETTOKEN",
       chatId: CONFIGURED_CHAT,
       cwd: root,
@@ -489,6 +763,243 @@ test("sec002: sendPlainText rejection channelRef is token-free", async () => {
     assert.equal(receipt.sent, false);
     assert.equal(receipt.channelRef, "tg:sendMessage:failed", "safe marker replaces the raw fetch error");
     assert.ok(!(receipt.channelRef ?? "").includes("SUPERSECRETTOKEN"), "bot token must not appear in channelRef");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sec002: API error codes classify HTTP-200 Telegram failures", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-sec002-api-code-"));
+  try {
+    let mode: "forbidden" | "rate-limit" = "forbidden";
+    const adapter = telegramAdapter({
+      token: "t",
+      chatId: CONFIGURED_CHAT,
+      cwd: root,
+      fetchImpl: (async () => new Response(JSON.stringify(mode === "forbidden" ? { ok: false, error_code: 403, description: "blocked" } : { ok: false, error_code: 429, parameters: { retry_after: 2 } }), { status: 200 })) as typeof fetch,
+    });
+    const permanent = await adapter.sendPlainText(CONFIGURED_CHAT, "blocked");
+    assert.deepEqual(permanent, { sent: false, status: "permanent", channelRef: "tg:sendMessage:api-403", httpStatus: 403, reason: "Telegram rejected the reply (HTTP 403)" });
+    mode = "rate-limit";
+    const retryable = await adapter.sendPlainText(CONFIGURED_CHAT, "retry");
+    assert.equal(retryable.sent, false);
+    assert.equal(retryable.status, "retryable");
+    assert.equal(retryable.channelRef, "tg:sendMessage:api-429");
+    assert.equal(retryable.httpStatus, 429);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("mapping migration: metadata-free legacy source is scoped and retryable after partial cleanup", () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-map-migration-"));
+  const runId = "run-migration";
+  const escId = `${runId}/esc-1`;
+  const legacyDir = join(root, ".work-state", "cto", runId);
+  try {
+    withIndexedRun(root, runId);
+    mkdirSync(legacyDir, { recursive: true });
+    const legacyLine = `${JSON.stringify({ escId, messageId: 73 })}\n`;
+    writeFileSync(join(legacyDir, "tg-map.jsonl"), legacyLine);
+    const adapter = telegramAdapter({
+      token: "t",
+      chatId: CONFIGURED_CHAT,
+      cwd: root,
+      legacyMappingMigration: { tenant: runId, chatId: CONFIGURED_CHAT },
+      fetchImpl: mockFetch([]),
+    });
+    adapter.migrateLegacyMappings(runId, CONFIGURED_CHAT);
+    const partition = createHash("sha256")
+      .update("telegram-chat-mapping\u0000", "utf8")
+      .update(CONFIGURED_CHAT, "utf8")
+      .digest("hex");
+    const partitionDir = join(legacyDir, "telegram-callbacks", partition);
+    const markerPath = join(partitionDir, "tg-map.migration.json");
+    assert.equal(existsSync(markerPath), true);
+    assert.equal(existsSync(join(legacyDir, "tg-map.jsonl")), false);
+
+    // Reintroduce an exact source file to model a crash after the first
+    // source-file removal. Marker recovery must verify it against its
+    // manifest and remove it without rewriting destination state.
+    writeFileSync(join(legacyDir, "tg-map.jsonl"), legacyLine);
+    adapter.migrateLegacyMappings(runId, CONFIGURED_CHAT);
+    assert.equal(existsSync(join(legacyDir, "tg-map.jsonl")), false);
+    const internals = adapter as unknown as { escIdOfMessage(messageId: number, chatId: string): string | null };
+    assert.equal(internals.escIdOfMessage(73, CONFIGURED_CHAT), escId);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("mapping lock: expired legacy chat lock is reclaimed by another chat", () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-map-lock-expired-"));
+  const runId = "run-lock-expired";
+  const legacyDir = join(root, ".work-state", "cto", runId);
+  const escId = `${runId}/esc-1`;
+  try {
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(join(legacyDir, "tg-map.jsonl"), `${JSON.stringify({ escId, messageId: 73 })}\n`);
+    const lockPath = writeLegacyMappingLock(root, runId, "chat-a", "owner-a", Date.now() - 1);
+    const adapter = telegramAdapter({
+      token: "t",
+      chatId: "chat-b",
+      cwd: root,
+      legacyMappingMigration: { tenant: runId, chatId: "chat-b" },
+      fetchImpl: mockFetch([]),
+    });
+
+    adapter.migrateLegacyMappings(runId, "chat-b");
+
+    assert.equal(existsSync(join(legacyDir, "tg-map.jsonl")), false, "reclaimed source lock permits migration");
+    assert.equal(existsSync(lockPath), false, "reclaimed lock is released after migration");
+    const partition = createHash("sha256")
+      .update("telegram-chat-mapping\u0000", "utf8")
+      .update("chat-b", "utf8")
+      .digest("hex");
+    assert.equal(existsSync(join(legacyDir, "telegram-callbacks", partition, "tg-map.meta.json")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("mapping lock: live legacy chat lock blocks a different chat", () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-map-lock-live-"));
+  const runId = "run-lock-live";
+  const legacyDir = join(root, ".work-state", "cto", runId);
+  const escId = `${runId}/esc-1`;
+  try {
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(join(legacyDir, "tg-map.jsonl"), `${JSON.stringify({ escId, messageId: 73 })}\n`);
+    const lockPath = writeLegacyMappingLock(root, runId, "chat-a", "owner-a", Date.now() + 60_000);
+    const adapter = telegramAdapter({
+      token: "t",
+      chatId: "chat-b",
+      cwd: root,
+      legacyMappingMigration: { tenant: runId, chatId: "chat-b" },
+      fetchImpl: mockFetch([]),
+    });
+
+    assert.throws(
+      () => adapter.migrateLegacyMappings(runId, "chat-b"),
+      /tenant\/chat identity conflicts/,
+    );
+    assert.equal(existsSync(join(legacyDir, "tg-map.jsonl")), true, "live foreign lock preserves source");
+    assert.deepEqual(JSON.parse(readFileSync(lockPath, "utf8")), {
+      schema: 1,
+      tenant: runId,
+      chatId: "chat-a",
+      owner: "owner-a",
+      expiresAt: JSON.parse(readFileSync(lockPath, "utf8")).expiresAt,
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("mapping lock: stale owner release cannot remove a newer chat lease", () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-map-lock-fenced-release-"));
+  const runId = "run-lock-fenced";
+  const legacyDir = join(root, ".work-state", "cto", runId);
+  const escId = `${runId}/esc-1`;
+  try {
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(join(legacyDir, "tg-map.jsonl"), `${JSON.stringify({ escId, messageId: 73 })}\n`);
+    const adapter = telegramAdapter({
+      token: "t",
+      chatId: "chat-a",
+      cwd: root,
+      legacyMappingMigration: { tenant: runId, chatId: "chat-a" },
+      fetchImpl: mockFetch([]),
+    });
+    const internals = adapter as unknown as {
+      openUnpartitionedMappingQueue: (tenant: string, createDirectory?: boolean) => unknown;
+    };
+    const openSource = internals.openUnpartitionedMappingQueue.bind(adapter);
+    let injected = false;
+    internals.openUnpartitionedMappingQueue = (tenant, createDirectory = false) => {
+      const queue = openSource(tenant, createDirectory);
+      if (!queue || injected) return queue;
+      const queueLike = queue as {
+        removeIfMatches: (name: string, expected: unknown) => void;
+      };
+      const removeSourceFile = queueLike.removeIfMatches.bind(queueLike);
+      queueLike.removeIfMatches = (name, expected) => {
+        removeSourceFile(name, expected);
+        if (name === "tg-map.jsonl" && !injected) {
+          injected = true;
+          writeLegacyMappingLock(root, runId, "chat-b", "owner-b", Date.now() + 60_000);
+        }
+      };
+      return queue;
+    };
+
+    adapter.migrateLegacyMappings(runId, "chat-a");
+
+    assert.equal(injected, true, "test installs a newer lease before stale release");
+    const lock = JSON.parse(readFileSync(join(legacyDir, "tg-map.lock.json"), "utf8")) as {
+      schema?: number;
+      tenant?: string;
+      chatId?: string;
+      owner?: string;
+      expiresAt?: number;
+    };
+    assert.equal(lock.schema, 1);
+    assert.equal(lock.tenant, runId);
+    assert.equal(lock.chatId, "chat-b");
+    assert.equal(lock.owner, "owner-b");
+    assert.ok(typeof lock.expiresAt === "number" && lock.expiresAt > Date.now());
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("mapping lookup: identical message IDs remain partitioned by Telegram chat", () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-map-chat-partition-"));
+  const runId = "run-chat-partition";
+  try {
+    withIndexedMapping(root, runId, `${runId}/primary`, 88, CONFIGURED_CHAT);
+    withIndexedMapping(root, runId, `${runId}/readonly`, 88, "999");
+    const adapter = telegramAdapter({
+      token: "t",
+      chatId: CONFIGURED_CHAT,
+      allowedChatIds: ["999"],
+      cwd: root,
+      fetchImpl: mockFetch([]),
+    });
+    const internals = adapter as unknown as { escIdOfMessage(messageId: number, chatId: string): string | null };
+    assert.equal(internals.escIdOfMessage(88, CONFIGURED_CHAT), `${runId}/primary`);
+    assert.equal(internals.escIdOfMessage(88, "999"), `${runId}/readonly`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("mapping migration: foreign run rows fail closed before partition publication", () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-map-migration-foreign-"));
+  const runId = "run-migration-foreign";
+  const legacyDir = join(root, ".work-state", "cto", runId);
+  try {
+    withIndexedRun(root, runId);
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(join(legacyDir, "tg-map.jsonl"), [
+      JSON.stringify({ escId: `${runId}/esc-1`, messageId: 73 }),
+      JSON.stringify({ escId: "other-run/esc-foreign", messageId: 74 }),
+      "",
+    ].join("\n"));
+    const adapter = telegramAdapter({
+      token: "t",
+      chatId: CONFIGURED_CHAT,
+      cwd: root,
+      legacyMappingMigration: { tenant: runId, chatId: CONFIGURED_CHAT },
+      fetchImpl: mockFetch([]),
+    });
+    assert.throws(() => adapter.migrateLegacyMappings(runId, CONFIGURED_CHAT), /foreign escalation/);
+    assert.equal(existsSync(join(legacyDir, "tg-map.jsonl")), true);
+    const partition = createHash("sha256")
+      .update("telegram-chat-mapping\u0000", "utf8")
+      .update(CONFIGURED_CHAT, "utf8")
+      .digest("hex");
+    assert.equal(existsSync(join(legacyDir, "telegram-callbacks", partition, "tg-map.meta.json")), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

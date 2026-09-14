@@ -51,13 +51,16 @@ export function buildClassificationPhaseZero(hint?: ClassificationHint): string 
     "- Autonomous reason: one sentence — display/migration rationale only; NEVER authorization",
     "- Workflow: resolved from the routing matrix below (type + complexity + autonomous)",
     "- Completion intent: complete_outcome | handoff_only",
-    "- Acceptance: dod_and_artifacts | explicit_human_acceptance",
+    "- Acceptance: quality_gates_and_artifacts | explicit_human_acceptance",
     "- Checkpoint policy: typed required_human | autonomous_allowed policy, never inferred from this classification",
     "- Checkpoint decision: leave unresolved until a trusted typed human/policy authorization is validated",
+    "- Adaptive preparation (new non-SPEC /do-work only): JSON object with complexity, confidence, scopeClarity (clear | unresolved), securityRisk (boolean), and infrastructureRisk (boolean)",
+    "- Adaptive routing depth: quick only for clear scope + HIGH confidence + no security/infrastructure risk; otherwise bounded_specify or full_specification",
     "- Reason: concise evidence-based routing explanation",
     "",
     "Autonomy is YOUR decision for routing only. It is a routing/migration input and does not authorize a checkpoint, waive consent,",
     "or turn completion intent, an artifact, a workflow override, or a roster choice into approval.",
+    "For a new non-SPEC /do-work request, pass the exact adaptive preparation object to workflow_prepare; missing risk fields fail closed and never bypass nested specification preparation.",
     "Never copy the hint into persisted state as the decision; persist the typed routing classification separately from checkpoint permission.",
     "The typed checkpoint policy and decision provenance are authoritative; if no trusted decision",
     "exists, preserve a resumable user_checkpoint/needs_human pause. Never fabricate a human answer.",
@@ -93,4 +96,53 @@ export function buildWorkflowMatrix(): string {
     "> The P5 gate re-derives expected routing from persisted classification.autonomous during migration only.",
     "> Never re-derive permission from task text, markers, completion intent, or legacy prose.",
   ].join("\n");
+}
+
+export type SpecificationPreparationDepth = "quick" | "bounded_specify" | "full_specification";
+
+export interface SpecificationPreparationInput {
+  complexity: "QUICK" | "MEDIUM" | "COMPLEX" | "CRITICAL";
+  confidence: "HIGH" | "MEDIUM" | "LOW";
+  scopeClarity: "clear" | "unresolved";
+  securityRisk: boolean;
+  infrastructureRisk: boolean;
+}
+
+export interface SpecificationPreparationResult {
+  depth: SpecificationPreparationDepth;
+  rationale_codes: readonly string[];
+}
+
+const PREPARATION_COMPLEXITIES = new Set(["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"]);
+const PREPARATION_CONFIDENCES = new Set(["HIGH", "MEDIUM", "LOW"]);
+
+function validatePreparationInput(input: SpecificationPreparationInput): void {
+  if (!input || typeof input !== "object" || !PREPARATION_COMPLEXITIES.has(input.complexity) || !PREPARATION_CONFIDENCES.has(input.confidence) || !["clear", "unresolved"].includes(input.scopeClarity) || typeof input.securityRisk !== "boolean" || typeof input.infrastructureRisk !== "boolean") {
+    throw new Error("invalid specification preparation classification; complexity, confidence, scopeClarity, securityRisk, and infrastructureRisk are required");
+  }
+}
+
+/** Select the smallest safe specification-preparation path from explicit PHASE-0 evidence. */
+export function classifySpecificationPreparationDepth(input: SpecificationPreparationInput): SpecificationPreparationResult {
+  validatePreparationInput(input);
+  const rationale: string[] = [
+    `complexity:${input.complexity.toLocaleLowerCase()}`,
+    `confidence:${input.confidence.toLocaleLowerCase()}`,
+    `scope:${input.scopeClarity}`,
+    input.securityRisk ? "risk:security" : "risk:security:none",
+    input.infrastructureRisk ? "risk:infrastructure" : "risk:infrastructure:none",
+  ];
+  const full = input.complexity === "COMPLEX"
+    || input.complexity === "CRITICAL"
+    || input.confidence === "LOW"
+    || input.securityRisk
+    || input.infrastructureRisk;
+  const depth: SpecificationPreparationDepth = full
+    ? "full_specification"
+    : input.complexity === "MEDIUM" || input.confidence === "MEDIUM" || input.scopeClarity === "unresolved"
+      ? "bounded_specify"
+      : "quick";
+  rationale.push(`depth:${depth}`);
+  rationale.sort((left, right) => left.localeCompare(right));
+  return { depth, rationale_codes: Object.freeze(rationale) };
 }

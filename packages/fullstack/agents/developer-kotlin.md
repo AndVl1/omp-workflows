@@ -219,20 +219,15 @@ write concrete `evidence` (build/test output). Reference items by `id`, bump `up
 only **append** a new item (with `source` + unique `id`) if you introduced a criterion nobody
 else captured. Never renumber existing items. See `commands/team.md` § Multi-source fan-in.
 
-## Validation contract (machine-checked, v0.7.0+)
+## Worker attestation (non-authoritative)
 
-The engine inspects your produced artifact (`implementation.json` /
-`review_fixes.json`) before handing it to the next stage. A `ready: true`
-without `validation_run: true` + non-empty `validation_evidence` is
-**rejected** — the stage is marked failed and the orchestrator re-spawns
-you. The engine is the source of truth, not this document.
+The implementation artifact records your changed files and may include
+`worker_attested: true` plus checks you personally ran. This is an informational
+self-report only: it is not workflow proof and must never be described as an
+independent validation result. The separate `qa_tests` stage owns the
+`qa_reported_pass` gate and must produce the canonical QA artifact.
 
-Required fields in the artifact JSON:
-
-- `ready`: "true" only if the build actually passes.
-- `validation_run`: the string `"true"`. Anything else (including `"false"`) is rejected.
-- `validation_evidence`: the verbatim stdout/stderr of the build + lint + test commands. Not a summary. Not "ok". The actual output.
-
-There is no "orchestrator owns validation" escape hatch. That contract does
-not exist in the engine. If you cannot run validation (e.g. failing
-upstream), mark the stage `failed` instead of `ready: true`.
+If checks are unavailable or fail, report that fact without claiming readiness.
+Do not invent evidence or rely on an implementation/review-fix report to satisfy
+the QA gate. Project-specific command selection belongs to the trusted QA worker
+for the independent test stage.

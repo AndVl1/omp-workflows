@@ -59,16 +59,17 @@
   `pressEnter()` (driver) and the **⏎ Enter** button (web surface).
   `WsDriver.submit()` still appends `'\n'` for backward compatibility
   but is explicitly marked legacy.
-- WebSocket tokens are now scoped to the live session, so clients can reconnect
+- WebSocket tokens are now scoped to the live session, so clients can reconnect.
 - Closing or losing a WebSocket now detaches only that client instead of killing
   the PTY. `session.close()`, idle timeout, and PTY exit retain their lifecycle
-  behavior, including process-tree cleanup and exit notification.
+  behavior; shutdown is accepted only after the original PTY reports exit.
 - Added `ux-e2e input <scratch-dir> <text>` for arbitrary terminal commands. It
-  sends `<text>\n` as one input frame without waiting for `[ask_user]`; `\n` is
-  Enter in the omp TUI, while `\r` is literal input.
-- Hardened `ux-e2e stop` against stale or foreign `session.json` PIDs: a live
-  process must have a command line containing the requested scratch path before
-  its process tree is terminated; mismatches are refused with an error.
+  sends the text and a real PTY Enter (`\r`) in separate input frames without
+  waiting for `[ask_user]`; the legacy `WsDriver.submit()` LF helper remains
+  available for older text surfaces.
+- Hardened `ux-e2e stop` against stale or foreign `session.json` metadata:
+  shutdown uses only the authenticated server control endpoint and never kills
+  an arbitrary PID from metadata.
 - Added README guidance in **Session hygiene & safe stopping**: use only
   `ux-e2e stop <scratch>`, never broad `pkill`/`killall`/name-pattern kills,
   and rely on `start --force` for live-session replacement.

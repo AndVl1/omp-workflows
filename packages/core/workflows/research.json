@@ -4,7 +4,7 @@
   "description": "INVESTIGATION. Deep parallel exploration, no implementation. Returns findings.",
   "completion_intent": {
     "mode": "handoff_only",
-    "acceptance": "dod_and_artifacts",
+    "acceptance": "quality_gates_and_artifacts",
     "source": "workflow_policy",
     "rationale": "Research workflows hand off evidence-backed findings without implementation."
   },

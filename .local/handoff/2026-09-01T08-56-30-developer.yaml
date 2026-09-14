@@ -1,0 +1,25 @@
+id: 2026-09-01T08-56-30-developer
+parent: null
+agent: developer
+timestamp: "2026-09-01T08:56:30Z"
+status: completed
+context:
+  task: "T110: document the 0.27.0 readable specification workflow cutover in CHANGELOG.md"
+  phase: "validation-release"
+output:
+  summary: "Added the 0.27.0 changelog entry for the readable specification workflow, durable migration/resume, clean completion-contract cutover, consumer migration, CTO/adaptive execution, and hard-stop invariants."
+  files_changed:
+    - path: CHANGELOG.md
+      action: modified
+      changes: "Prepended a dated 0.27.0 entry; no other release entries or files changed by this task."
+  types_implemented: []
+  dependencies_added: []
+  todos: []
+next:
+  agent: null
+  task: "No follow-up required."
+  priority: low
+  acceptance_criteria:
+    - "0.27.0 entry appears before 0.26.0 and matches existing changelog style."
+    - "Breaking consumer migration actions and clean removal of JSON-only/legacy completion paths are explicit."
+    - "No compatibility shim is claimed or introduced."

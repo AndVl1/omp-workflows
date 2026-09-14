@@ -6,11 +6,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { startCtoSchedulerDaemon } from "../src/cto-scheduler-daemon.js";
+import { openFullstackRuntimeTest } from "./runtime-access-fixture.js";
+import { newCtoState, writeCtoState } from "../../core/src/cto/state.js";
 
 /** Wall-clock delay; see the real-timer exception note in the first test. */
 function delay(ms: number): Promise<void> {
@@ -45,12 +47,22 @@ function deferred<T>(): {
 // verify the timer fires and that stop() clears it.
 test("cto-scheduler-daemon: start + stop round-trip fires onWave and stops", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-daemon-"));
+  let runtime: ReturnType<typeof openFullstackRuntimeTest> | undefined;
   try {
+    runtime = openFullstackRuntimeTest(root, "scheduler-session");
+    writeCtoState(newCtoState({
+      id: "daemon-run-1",
+      task: "scheduler test",
+      branch: "main",
+      autonomous: false,
+      plan: { id: "daemon-run-1", task: "scheduler test", teams: [], created_at: new Date().toISOString() },
+    }), root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     let waves = 0;
     const { stop } = startCtoSchedulerDaemon({
       runId: "daemon-run-1",
       root,
       intervalMs: 30,
+      runtimeAccess: runtime!.access,
       onWave: () => {
         waves += 1;
       },
@@ -65,26 +77,31 @@ test("cto-scheduler-daemon: start + stop round-trip fires onWave and stops", asy
     await delay(150);
     assert.equal(waves, afterStop, "no waves after stop()");
   } finally {
+    runtime?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("cto-scheduler-daemon: interval <= 0 returns a no-op stop and writes nothing", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-daemon-off-"));
+  const runtimeAccess = {
+    startScheduler(): never {
+      throw new Error("disabled scheduler must not access runtime");
+    },
+  } as unknown as Parameters<typeof startCtoSchedulerDaemon>[0]["runtimeAccess"];
   try {
     const { stop } = startCtoSchedulerDaemon({
       runId: "daemon-off-1",
       root,
       intervalMs: 0,
+      runtimeAccess,
       onWave: () => {
         throw new Error("must never fire");
       },
     });
     stop();
     stop(); // idempotent
-    assert.throws(() =>
-      readFileSync(join(root, ".work-state", "cto", "daemon-off-1", "state.json"), "utf8"),
-    );
+    assert.equal(existsSync(join(root, ".work-state")), false, "disabled scheduler does not write state");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

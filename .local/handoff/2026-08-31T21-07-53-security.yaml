@@ -1,0 +1,37 @@
+id: 2026-08-31T21-07-53-security
+parent: null
+agent: security
+timestamp: "2026-08-31T21:07:53Z"
+status: completed
+
+context:
+  task: "Canonicalize the native specification phase checkpoint and bind the T029 durable advance fixture to trusted human proof."
+  phase: "native-workflow"
+
+output:
+  summary: "Replaced the three custom native phase approvals with one canonical hard-human specification_phase_approval rule and updated T029 to ingest, bind, append, consume, and persist explicit trusted approve_continue consent before advancing."
+  security_properties:
+    hard_human_floor_preserved: true
+    trusted_answer_channel: terminal
+    fake_user_reference_prefixes: false
+    capability_binding: current
+    policy_hash_binding: exact_active_policy
+    trusted_answer_consumed_before_advance: true
+  files_modified:
+    - packages/core/workflows/spec-preparation.json
+    - packages/core/test/specification-native-flow.test.ts
+  validation:
+    status: not_run
+    reason: "Assignment explicitly required no validation; CTO reruns shared validation."
+  dependency_audit:
+    status: not_run
+  unsafe_review:
+    status: not_applicable
+
+next:
+  agent: null
+  task: "CTO should run shared validation after concurrent native-workflow slices land."
+  priority: high
+  acceptance_criteria:
+    - "All native specification stages reference specification_phase_approval."
+    - "T029 advances only after a consumed trusted approve_continue answer bound to the active capability and exact policy hash."

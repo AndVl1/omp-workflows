@@ -6,10 +6,11 @@
  * at each stage, which [ask_user] prompts to answer, timing, screenshot
  * triggers, and the rating dimensions. New test surfaces = new scenario
  * files, zero code.
+ *
  */
 
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, basename, sep } from 'node:path';
+import { closePinnedDirectory, pinDirectory, readPinnedFileFull } from './fs-safety.js';
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -51,6 +52,50 @@ export interface ScenarioRatings {
 
 export type ScenarioTask = string | { readonly file: string };
 
+/** Explicit identity used by a native run and every evidence lookup. */
+export interface ScenarioSelectors {
+  readonly feature_id: string;
+  readonly run_key: string;
+}
+
+/**
+ * Canonical generated workspace locations. Paths are project-relative and
+ * may contain templates (for example `specs/{{feature_id}}/spec.md`).
+ */
+export interface ScenarioWorkspacePaths {
+  readonly path?: string;
+  readonly state_path?: string;
+  /** Readable phase/status documents generated below `specs/<feature-id>/`. */
+  readonly documents?: string[];
+  /** Phase and constitution-impact validation projections. */
+  readonly validation?: string[];
+  /** Archived readable revisions. */
+  readonly history?: string[];
+  /** Frozen implementation handoff projections. */
+  readonly handoff?: string[];
+  /** Durable checkpoint/answer ledgers used across interruption and resume. */
+  readonly checkpoints?: string[];
+  /** Additional scenario-specific evidence paths. */
+  readonly evidence?: string[];
+}
+
+/**
+ * Transcript assertions that are not tied to one terminal frame. Keeping
+ * these declarations in the scenario makes checkpoint, worker, validation,
+ * history, handoff, interruption, resume, and next-action evidence durable
+ * without introducing another runner.
+ */
+export interface ScenarioTranscriptExpectations {
+  readonly checkpoints?: string[];
+  readonly workers?: string[];
+  readonly validation?: string[];
+  readonly history?: string[];
+  readonly handoff?: string[];
+  readonly interruption?: string[];
+  readonly resume?: string[];
+  readonly next_actions?: string[];
+}
+
 export interface ScenarioDefinition {
   readonly id: string;
   readonly title: string;
@@ -59,11 +104,18 @@ export interface ScenarioDefinition {
   readonly task: string;
   /** Declared params with defaults — merged into the expansion context. */
   readonly params: Record<string, string>;
+  /** Explicit feature/run selectors, when the scenario declares them. */
+  readonly selectors?: ScenarioSelectors;
+  /** Generated feature workspace paths and extra evidence paths. */
+  readonly workspace?: ScenarioWorkspacePaths;
+  /** Durable transcript markers expected by the scenario. */
+  readonly transcript?: ScenarioTranscriptExpectations;
   readonly stages: ScenarioStage[];
   readonly timing: ScenarioTiming;
   readonly screenshots: { readonly on: ScreenshotTrigger[] };
   readonly ratings: ScenarioRatings;
 }
+
 
 /* ------------------------------------------------------------------ */
 /* Validation                                                          */
@@ -82,8 +134,34 @@ function requireString(value: unknown, field: string, problem: string): asserts 
   if (typeof value !== 'string' || value.length === 0) throw new ScenarioValidationError(field, problem);
 }
 
+const MAX_NODE_TIMER_MS = 2_147_483_647;
+
+function requireTimerMs(value: unknown, field: string): asserts value is number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)
+    || value <= 0 || value > MAX_NODE_TIMER_MS) {
+    throw new ScenarioValidationError(field, `expected a positive safe integer <= ${String(MAX_NODE_TIMER_MS)}`);
+  }
+}
+
 function requireNumber(value: unknown, field: string, problem: string): asserts value is number {
   if (typeof value !== 'number' || !Number.isFinite(value)) throw new ScenarioValidationError(field, problem);
+}
+function optionalString(value: unknown, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  requireString(value, field, 'expected a non-empty string');
+  return value;
+}
+
+function stringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || item.length === 0)) {
+    throw new ScenarioValidationError(field, 'expected an array of non-empty strings');
+  }
+  return value as string[];
+}
+
+function optionalStringArray(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  return stringArray(value, field);
 }
 
 function validateScenario(raw: unknown): {
@@ -155,9 +233,9 @@ function validateScenario(raw: unknown): {
     throw new ScenarioValidationError('timing', 'expected an object');
   }
   const timing = r.timing as Record<string, unknown>;
-  requireNumber(timing.startupTimeoutMs, 'timing.startupTimeoutMs', 'expected a number');
-  requireNumber(timing.stageTimeoutMs, 'timing.stageTimeoutMs', 'expected a number');
-  requireNumber(timing.checkpointPollMs, 'timing.checkpointPollMs', 'expected a number');
+  requireTimerMs(timing.startupTimeoutMs, 'timing.startupTimeoutMs');
+  requireTimerMs(timing.stageTimeoutMs, 'timing.stageTimeoutMs');
+  requireTimerMs(timing.checkpointPollMs, 'timing.checkpointPollMs');
 
   if (typeof r.screenshots !== 'object' || r.screenshots === null) {
     throw new ScenarioValidationError('screenshots', 'expected an object');
@@ -199,6 +277,86 @@ function validateScenario(raw: unknown): {
     params = r.params as Record<string, string>;
   }
 
+  let selectors: ScenarioSelectors | undefined;
+  const selectorValue = r.selectors;
+  if (selectorValue !== undefined) {
+    if (typeof selectorValue !== 'object' || selectorValue === null) {
+      throw new ScenarioValidationError('selectors', 'expected an object');
+    }
+    const s = selectorValue as Record<string, unknown>;
+    const featureId = optionalString(s.feature_id ?? s.featureId, 'selectors.feature_id');
+    const runKey = optionalString(s.run_key ?? s.runKey, 'selectors.run_key');
+    if (featureId === undefined || runKey === undefined) {
+      throw new ScenarioValidationError('selectors', 'feature_id and run_key are both required');
+    }
+    selectors = { feature_id: featureId, run_key: runKey };
+  } else if (r.feature_id !== undefined || r.run_key !== undefined) {
+    const featureId = optionalString(r.feature_id, 'feature_id');
+    const runKey = optionalString(r.run_key, 'run_key');
+    if (featureId === undefined || runKey === undefined) {
+      throw new ScenarioValidationError('selectors', 'feature_id and run_key are both required');
+    }
+    selectors = { feature_id: featureId, run_key: runKey };
+  }
+
+  let workspace: ScenarioWorkspacePaths | undefined;
+  const workspaceValue = r.workspace ?? r.workspace_paths;
+  if (workspaceValue !== undefined) {
+    if (typeof workspaceValue !== 'object' || workspaceValue === null) {
+      throw new ScenarioValidationError('workspace', 'expected an object');
+    }
+    const w = workspaceValue as Record<string, unknown>;
+    workspace = {
+      ...(optionalString(w.path ?? w.workspace_path, 'workspace.path') !== undefined
+        ? { path: optionalString(w.path ?? w.workspace_path, 'workspace.path') }
+        : {}),
+      ...(optionalString(w.state_path, 'workspace.state_path') !== undefined
+        ? { state_path: optionalString(w.state_path, 'workspace.state_path') }
+        : {}),
+      ...(w.documents !== undefined ? { documents: stringArray(w.documents, 'workspace.documents') } : {}),
+      ...(w.validation !== undefined ? { validation: stringArray(w.validation, 'workspace.validation') } : {}),
+      ...(w.history !== undefined ? { history: stringArray(w.history, 'workspace.history') } : {}),
+      ...(w.handoff !== undefined ? { handoff: stringArray(w.handoff, 'workspace.handoff') } : {}),
+      ...(w.checkpoints !== undefined ? { checkpoints: stringArray(w.checkpoints, 'workspace.checkpoints') } : {}),
+      ...(w.evidence !== undefined ? { evidence: stringArray(w.evidence, 'workspace.evidence') } : {}),
+    };
+  }
+
+  let transcript: ScenarioTranscriptExpectations | undefined;
+  const transcriptValue = r.transcript ?? r.transcript_expectations;
+  if (transcriptValue !== undefined) {
+    if (typeof transcriptValue !== 'object' || transcriptValue === null) {
+      throw new ScenarioValidationError('transcript', 'expected an object');
+    }
+    const t = transcriptValue as Record<string, unknown>;
+    transcript = {
+      ...(optionalStringArray(t.checkpoints, 'transcript.checkpoints') !== undefined
+        ? { checkpoints: optionalStringArray(t.checkpoints, 'transcript.checkpoints') }
+        : {}),
+      ...(optionalStringArray(t.workers, 'transcript.workers') !== undefined
+        ? { workers: optionalStringArray(t.workers, 'transcript.workers') }
+        : {}),
+      ...(optionalStringArray(t.validation, 'transcript.validation') !== undefined
+        ? { validation: optionalStringArray(t.validation, 'transcript.validation') }
+        : {}),
+      ...(optionalStringArray(t.history, 'transcript.history') !== undefined
+        ? { history: optionalStringArray(t.history, 'transcript.history') }
+        : {}),
+      ...(optionalStringArray(t.handoff, 'transcript.handoff') !== undefined
+        ? { handoff: optionalStringArray(t.handoff, 'transcript.handoff') }
+        : {}),
+      ...(optionalStringArray(t.interruption, 'transcript.interruption') !== undefined
+        ? { interruption: optionalStringArray(t.interruption, 'transcript.interruption') }
+        : {}),
+      ...(optionalStringArray(t.resume, 'transcript.resume') !== undefined
+        ? { resume: optionalStringArray(t.resume, 'transcript.resume') }
+        : {}),
+      ...(optionalStringArray(t.next_actions ?? t.nextActions, 'transcript.next_actions') !== undefined
+        ? { next_actions: optionalStringArray(t.next_actions ?? t.nextActions, 'transcript.next_actions') }
+        : {}),
+    };
+  }
+
   return {
     def: {
       id: r.id as string,
@@ -206,6 +364,9 @@ function validateScenario(raw: unknown): {
       ...(r.description !== undefined ? { description: r.description as string } : {}),
       task: taskValue,
       params,
+      ...(selectors !== undefined ? { selectors } : {}),
+      ...(workspace !== undefined ? { workspace } : {}),
+      ...(transcript !== undefined ? { transcript } : {}),
       stages,
       timing: {
         startupTimeoutMs: timing.startupTimeoutMs as number,
@@ -268,6 +429,81 @@ function expandStage(stage: ScenarioStage, ctx: Readonly<Record<string, string>>
       : {}),
   };
 }
+function expandWorkspace(
+  workspace: ScenarioWorkspacePaths | undefined,
+  ctx: Readonly<Record<string, string>>,
+  featureId: string | undefined,
+): ScenarioWorkspacePaths | undefined {
+  const generated =
+    workspace === undefined && featureId !== undefined
+      ? {
+          path: `specs/${featureId}`,
+          state_path: `.work-state/features/${featureId}/state.json`,
+          documents: [
+            `specs/${featureId}/status.md`,
+            `specs/${featureId}/spec.md`,
+            `specs/${featureId}/plan.md`,
+            `specs/${featureId}/tasks.md`,
+          ],
+          validation: [
+            `specs/${featureId}/validation/specify.md`,
+            `specs/${featureId}/validation/plan.md`,
+            `specs/${featureId}/validation/tasks.md`,
+          ],
+          history: [`specs/${featureId}/history`],
+          handoff: [`specs/${featureId}/handoff.md`],
+          checkpoints: [
+            `.work-state/features/${featureId}/state.json`,
+            `.work-state/ux-e2e/transcript.jsonl`,
+            `.work-state/ux-e2e/ask-state.jsonl`,
+          ],
+        }
+      : workspace;
+  if (generated === undefined) return undefined;
+  return {
+    ...(generated.path !== undefined ? { path: expandValue(generated.path, ctx) } : {}),
+    ...(generated.state_path !== undefined ? { state_path: expandValue(generated.state_path, ctx) } : {}),
+    ...(generated.documents !== undefined ? { documents: generated.documents.map(value => expandValue(value, ctx)) } : {}),
+    ...(generated.validation !== undefined ? { validation: generated.validation.map(value => expandValue(value, ctx)) } : {}),
+    ...(generated.history !== undefined ? { history: generated.history.map(value => expandValue(value, ctx)) } : {}),
+    ...(generated.handoff !== undefined ? { handoff: generated.handoff.map(value => expandValue(value, ctx)) } : {}),
+    ...(generated.checkpoints !== undefined ? { checkpoints: generated.checkpoints.map(value => expandValue(value, ctx)) } : {}),
+    ...(generated.evidence !== undefined ? { evidence: generated.evidence.map(value => expandValue(value, ctx)) } : {}),
+  };
+}
+
+function expandTranscript(
+  transcript: ScenarioTranscriptExpectations | undefined,
+  ctx: Readonly<Record<string, string>>,
+): ScenarioTranscriptExpectations | undefined {
+  if (transcript === undefined) return undefined;
+  const expand = (values: string[] | undefined): string[] | undefined =>
+    values === undefined ? undefined : values.map(value => expandValue(value, ctx));
+  return {
+    ...(expand(transcript.checkpoints) !== undefined ? { checkpoints: expand(transcript.checkpoints) } : {}),
+    ...(expand(transcript.workers) !== undefined ? { workers: expand(transcript.workers) } : {}),
+    ...(expand(transcript.validation) !== undefined ? { validation: expand(transcript.validation) } : {}),
+    ...(expand(transcript.history) !== undefined ? { history: expand(transcript.history) } : {}),
+    ...(expand(transcript.handoff) !== undefined ? { handoff: expand(transcript.handoff) } : {}),
+    ...(expand(transcript.interruption) !== undefined ? { interruption: expand(transcript.interruption) } : {}),
+    ...(expand(transcript.resume) !== undefined ? { resume: expand(transcript.resume) } : {}),
+    ...(expand(transcript.next_actions) !== undefined ? { next_actions: expand(transcript.next_actions) } : {}),
+  };
+}
+
+
+function readBoundedScenarioFile(path: string, maxBytes: number): string {
+  const absolute = resolve(path);
+  const root = pinDirectory(dirname(absolute));
+  if (root === null) throw new Error(`cannot open stable scenario parent: ${absolute}`);
+  try {
+    const bytes = readPinnedFileFull(root, basename(absolute), maxBytes);
+    if (bytes === null) throw new Error(`cannot read bounded regular scenario file: ${absolute}`);
+    return bytes.toString('utf8');
+  } finally {
+    closePinnedDirectory(root);
+  }
+}
 
 /**
  * Load, validate, and expand a scenario file.
@@ -281,30 +517,56 @@ function expandStage(stage: ScenarioStage, ctx: Readonly<Record<string, string>>
 export function loadScenario(path: string, params: Record<string, string> = {}): ScenarioDefinition {
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(path, 'utf8'));
+    raw = JSON.parse(readBoundedScenarioFile(path, 1024 * 1024));
   } catch (err) {
     throw new ScenarioValidationError('file', `cannot read/parse ${path}: ${err instanceof Error ? err.message : String(err)}`);
   }
   const { def } = validateScenario(raw);
 
+  // Selectors are part of the expansion context, so every generated path and
+  // marker is bound to the same explicit feature/run pair.
+  const ctx: Record<string, string> = {
+    ...BUILTIN_DEFAULTS,
+    ...def.params,
+    ...(def.selectors !== undefined
+      ? { feature_id: def.selectors.feature_id, run_key: def.selectors.run_key }
+      : {}),
+    ...params,
+  };
+  const featureId = ctx.feature_id;
+  const runKey = ctx.run_key;
+  const selectors =
+    featureId !== undefined && runKey !== undefined
+      ? { feature_id: featureId, run_key: runKey }
+      : undefined;
+
   let taskText: string;
   if (typeof def.task === 'string') {
     taskText = def.task;
   } else {
-    const taskPath = resolve(dirname(path), def.task.file);
-    if (!existsSync(taskPath)) {
-      throw new ScenarioValidationError('task.file', `referenced task file does not exist: ${taskPath}`);
+    const taskPath = resolve(dirname(path), expandValue(def.task.file, ctx));
+    const scenarioDir = dirname(resolve(path));
+    if (taskPath !== scenarioDir && !taskPath.startsWith(`${scenarioDir}${sep}`)) {
+      throw new ScenarioValidationError('task.file', 'referenced task must remain contained by the scenario directory');
     }
-    taskText = readFileSync(taskPath, 'utf8');
+    try {
+      taskText = readBoundedScenarioFile(taskPath, 8 * 1024 * 1024);
+    } catch (err) {
+      throw new ScenarioValidationError('task.file', `cannot read referenced task file ${taskPath}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
-  const ctx: Record<string, string> = { ...BUILTIN_DEFAULTS, ...def.params, ...params };
   return {
     id: def.id,
     title: expandValue(def.title, ctx),
     ...(def.description !== undefined ? { description: expandValue(def.description, ctx) } : {}),
     task: expandValue(taskText, ctx),
     params: def.params,
+    ...(selectors !== undefined ? { selectors } : {}),
+    ...(def.workspace !== undefined || featureId !== undefined
+      ? { workspace: expandWorkspace(def.workspace, ctx, featureId) }
+      : {}),
+    ...(def.transcript !== undefined ? { transcript: expandTranscript(def.transcript, ctx) } : {}),
     stages: def.stages.map(s => expandStage(s, ctx)),
     timing: def.timing,
     screenshots: def.screenshots,

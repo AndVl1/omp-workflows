@@ -1,0 +1,78 @@
+{
+  "marker": "<!-- omp-cto-slice run=01a0549b-cf6a-72f5-a45a-820b5eac89d2 slice=validation-release -->",
+  "row": "T112.30",
+  "verdict": "FAIL",
+  "environment": {
+    "scratch": "/tmp/omp-ux-e2e-readable-spec-workflow/s08-resume",
+    "scenario": "packages/e2e/scenarios/spec-migration.json",
+    "harness": "real OMP PTY via npm run e2e --",
+    "omp_version": "omp/18.0.6"
+  },
+  "commands": [
+    "npm run e2e -- bootstrap s08-resume feat/readable-s08-resume --monorepo . --workdir /tmp/omp-ux-e2e-readable-spec-workflow --force",
+    "cp -R packages/e2e/fixtures/specification/generic/legacy/. /tmp/omp-ux-e2e-readable-spec-workflow/s08-resume/",
+    "mkdir -p /tmp/omp-ux-e2e-readable-spec-workflow/s08-resume/.work-state/specification/legacy-payment-retry",
+    "mv /tmp/omp-ux-e2e-readable-spec-workflow/s08-resume/legacy-run.json /tmp/omp-ux-e2e-readable-spec-workflow/s08-resume/.work-state/specification/legacy-payment-retry/legacy-run.json",
+    "shasum -a 256 .active-feature CONSTITUTION.md .work-state/specification/legacy-payment-retry/legacy-run.json",
+    "npm run e2e -- start /tmp/omp-ux-e2e-readable-spec-workflow/s08-resume --scenario packages/e2e/scenarios/spec-migration.json --surface text --detach --max-time 600 --idle-ms 900000",
+    "npm run e2e -- input /tmp/omp-ux-e2e-readable-spec-workflow/s08-resume /specify --feature legacy-payment-retry",
+    "npm run e2e -- transcript /tmp/omp-ux-e2e-readable-spec-workflow/s08-resume --tail 80"
+  ],
+  "observed_migration": {
+    "receipt_id": "migration-9a9f6aaad6cf857bce1cd0a3",
+    "status": "complete",
+    "outcome": "migrated",
+    "feature_id": "legacy-payment-retry",
+    "run_key": "legacy-2881b3516c05d9d0a6da4238",
+    "source_path": ".work-state/specification/legacy-payment-retry/legacy-run.json",
+    "source_sha256": "2881b3516c05d9d0a6da423831c81da32cd139906cdd3a3859141672a1eff631",
+    "constitution_binding": {
+      "version": "0.0.0",
+      "fingerprint": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc"
+    },
+    "legacy_inputs": ["branch=feat/legacy-payment-retry"],
+    "diagnostics": []
+  },
+  "observed_readable_documents": [
+    "specs/legacy-payment-retry/spec.md",
+    "specs/legacy-payment-retry/plan.md",
+    "specs/legacy-payment-retry/tasks.md",
+    "specs/legacy-payment-retry/migration.md"
+  ],
+  "observed_state_before_validation_failure": {
+    "source_kind": "legacy",
+    "phases": {
+      "specify": {"status": "revision_required", "current_version": 1, "approved_version": null, "checkpoint_ref": null},
+      "plan": {"status": "materialized", "current_version": 1, "approved_version": null, "checkpoint_ref": null},
+      "tasks": {"status": "materialized", "current_version": 1, "approved_version": null, "checkpoint_ref": null}
+    },
+    "validation_ref": ".work-state/features/legacy-payment-retry/artifacts/validation.specify.v1.attempt.35fc359a6ff191b2259bb5af35780e791974c68e55a390a4b8d11f454ab498d6",
+    "failure": {
+      "code": "WORKFLOW_VALIDATE_PHASE_REJECTED",
+      "message": "phase source_artifact.semantic_model is required"
+    },
+    "next_action": "/specify --feature legacy-payment-retry",
+    "handoff_ref": null,
+    "execution_claim_ref": null
+  },
+  "source_hashes": {
+    "before": {
+      ".active-feature": "a5497577b013ce5d0b56102401318e204a69fc7611266fbf3f074e7f1c900fc2",
+      "CONSTITUTION.md": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      ".work-state/specification/legacy-payment-retry/legacy-run.json": "2881b3516c05d9d0a6da423831c81da32cd139906cdd3a3859141672a1eff631"
+    },
+    "after": {
+      ".active-feature": "a5497577b013ce5d0b56102401318e204a69fc7611266fbf3f074e7f1c900fc2",
+      "CONSTITUTION.md": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      ".work-state/specification/legacy-payment-retry/legacy-run.json": "2881b3516c05d9d0a6da423831c81da32cd139906cdd3a3859141672a1eff631"
+    },
+    "preserved": true
+  },
+  "evidence_transcript": "vibe-report/runtime/readable-spec-workflow/s08/frozen-candidate-migration-transcript.txt",
+  "gaps": [
+    "No pending human checkpoint was presented because validation failed before awaiting_approval.",
+    "Receipt legacy_inputs contains branch provenance only; consumed .active-feature, legacy workflow, and completion status are not represented.",
+    "No specs/legacy-payment-retry/status.md projection was present.",
+    "Transcript reports workflow_begin returned no request_id although the next validation tool requires request_id."
+  ]
+}

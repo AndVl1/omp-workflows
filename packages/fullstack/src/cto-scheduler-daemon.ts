@@ -9,16 +9,12 @@
  * credentials, nothing wired into package.json bin — same as
  * telegram-bridge.ts).
  *
- * For this epic it is a STUB that tests can drive directly:
- * `startCtoSchedulerDaemon` constructs a minimal `CtoState` (via the core
- * state helpers — existing run state when present, else a fresh empty run)
- * and delegates to `startWaveScheduler`. `main()` parses argv
- * (`<runId> <root> <intervalMs>`) and starts the scheduler with graceful
- * SIGINT/SIGTERM shutdown.
+ * The daemon requires a marker-authenticated main-session runtime facade;
+ * it never reads or mutates CTO state through raw root helpers.
  */
 
 import { fileURLToPath } from "node:url";
-import { newCtoState, readCtoState, startWaveScheduler, type TeamPlan } from "@andvl1/omp-workflows-core";
+import type { CtoRuntimeAccessFacade } from "@andvl1/omp-workflows-core/cto-runtime";
 
 export interface CtoSchedulerDaemonOpts {
   /** CTO run id (`.work-state/cto/<runId>/`). */
@@ -29,21 +25,20 @@ export interface CtoSchedulerDaemonOpts {
   intervalMs: number;
   /** Invoked on each due wave (defaults to a no-op). */
   onWave?: () => void;
+  /** Authenticated main-session CTO capability. */
+  runtimeAccess: CtoRuntimeAccessFacade;
 }
 
 /**
- * Start the scheduler daemon. Constructs a minimal `CtoState` — the
- * existing run state when one is readable on disk, otherwise a fresh empty
- * run — then delegates to `startWaveScheduler`, which persists
- * `scheduler.wave_interval_ms` on start and `last_wave_at`/`next_wave_at`
- * on each wave. Returns `{ stop() }`; `stop` is idempotent.
+ * Start the scheduler through the authenticated runtime facade. Returns
+ * `{ stop() }`; `stop` is idempotent.
  */
 export function startCtoSchedulerDaemon(opts: CtoSchedulerDaemonOpts): { stop(): void } {
-  const plan: TeamPlan = { id: opts.runId, task: "", teams: [], created_at: new Date().toISOString() };
-  const state =
-    readCtoState(opts.runId, opts.root) ??
-    newCtoState({ id: opts.runId, task: "", branch: "", autonomous: false, plan });
-  const stop = startWaveScheduler(state, opts.root, opts.intervalMs, opts.onWave ?? (() => {}));
+  // A finite non-positive interval is an explicit disabled mode. Return
+  // before touching the runtime facade so disabling a daemon cannot require
+  // state, credentials, or an otherwise-live session.
+  if (Number.isFinite(opts.intervalMs) && opts.intervalMs <= 0) return { stop: () => undefined };
+  const stop = opts.runtimeAccess.startScheduler(opts.runId, opts.intervalMs, opts.onWave ?? (() => {}));
   return { stop };
 }
 
@@ -60,14 +55,11 @@ export function main(): void {
     return;
   }
   const intervalMs = Number(intervalMsArg ?? 60_000);
-  const { stop } = startCtoSchedulerDaemon({ runId, root, intervalMs });
-  console.error(`[cto-scheduler-daemon] started run=${runId} root=${root} intervalMs=${intervalMs}`);
-  const shutdown = (): void => {
-    stop();
-    process.exit(0);
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  // A standalone process has no marker-authenticated owner context. It must
+  // be launched by an already-authorized main session, never with raw root
+  // state access or a fabricated facade.
+  console.error(`[cto-scheduler-daemon] runtime access required for run=${runId} root=${root} intervalMs=${intervalMs}`);
+  process.exitCode = 1;
 }
 
 // Direct-run guard (ESM equivalent of `import.meta.main`): the first argv

@@ -1,0 +1,47 @@
+{
+  "slice": "validation-release",
+  "run": "01a0549b-cf6a-72f5-a45a-820b5eac89d2",
+  "captured_at": "2026-09-03",
+  "source_frozen": true,
+  "t061": {
+    "command": "OMP_UX_E2E_SEMANTIC_TIMEOUT_MS=900000 OMP_UX_E2E_PRESERVE_ON_FAILURE=1 node --test --import tsx --test-name-pattern 'T061 runtime: a complete generic bundle reaches exactly one compatibility checkpoint and the shared imported handoff' test/spec-import.test.ts",
+    "cwd": "packages/e2e",
+    "status": "FAIL",
+    "exit": 1,
+    "failure": "waitFor timed out after 900000ms (imported feature workspace created); featureWorkspaceIds observed imported-payment-retry plus empty default telemetry directory",
+    "scratch_parent": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-thfkK4",
+    "scratch_root": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-thfkK4/omp-spec-e2e-complete",
+    "evidence": {
+      "test_log": "t061-exact.log",
+      "stop_log": "t061-stop.log",
+      "root_stop_log": "t061-stop-root.log",
+      "scratch": "t061-scratch/",
+      "agent_trace": "t061-agent.jsonl",
+      "transcript": "t061-transcript.jsonl",
+      "state": "t061-state.json",
+      "handoff": "t061-handoff.md",
+      "handoff_artifact": "t061-handoff-artifact.json",
+      "default_events": "t061-default-events.jsonl",
+      "imported_events": "t061-imported-events.jsonl"
+    },
+    "observed": {
+      "workflow_prepare": "one model invocation, exact feature_id imported-payment-retry, toolResult ok=true transition=prepare",
+      "selected_ask": "approve_continue accepted through real PTY",
+      "workflow_checkpoint": "accepted",
+      "workflow_advance": "accepted",
+      "workflow_finalize_import_handoff": "accepted",
+      "state": "implementation_ready with next_action /do-work --spec imported-payment-retry and nested handoff_ref imported-payment-retry.handoff.v1",
+      "source_unchanged": true,
+      "default_side_effect": "default/ contains observability/events.jsonl only; no state.json or artifacts; session_start precedes model workflow_prepare"
+    },
+    "pid": {
+      "omp_pid": 46175,
+      "absent_after_stop": true
+    }
+  },
+  "t094": {
+    "status": "HELD",
+    "reason": "Parent instruction: wait for workspace helper fix; premature run was canceled",
+    "run1_log": "t094-run1.log"
+  }
+}

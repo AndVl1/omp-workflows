@@ -1,11 +1,108 @@
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { TextDecoder } from "node:util";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { PinnedProjectRoot, type PinnedRootWriteReceipt } from "../specification/pinned-root.js";
 
 export const AGENT_MAPPING_SCHEMA = 1 as const;
 export const DEFAULT_GENERIC_AGENT = "task";
+export const AGENT_MAPPING_MAX_BYTES = 256 * 1024;
+const MAPPING_MAX_DEPTH = 8;
+const MAPPING_MAX_NODES = 4096;
+const MAPPING_MAX_KEYS = 256;
+const MAPPING_MAX_ARRAY = 256;
+const MAPPING_MAX_STRING_BYTES = 8 * 1024;
+
+export type AgentMappingWriteErrorCode = "invalid" | "limit";
+
+/** Typed fail-closed error raised before a mapping file can be replaced. */
+export class AgentMappingWriteError extends Error {
+  readonly code: AgentMappingWriteErrorCode;
+  readonly byteLength?: number;
+  readonly maxBytes = AGENT_MAPPING_MAX_BYTES;
+
+  constructor(code: AgentMappingWriteErrorCode, message: string, byteLength?: number) {
+    super(message);
+    this.name = "AgentMappingWriteError";
+    this.code = code;
+    this.byteLength = byteLength;
+  }
+}
+
+function boundedMappingJson(value: unknown, depth = 0, budget = { nodes: 0, bytes: 0 }, seen = new Set<object>()): boolean {
+  if (++budget.nodes > MAPPING_MAX_NODES || depth > MAPPING_MAX_DEPTH) return false;
+  if (value === null || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "string") {
+    budget.bytes += Buffer.byteLength(value, "utf8");
+    return budget.bytes <= AGENT_MAPPING_MAX_BYTES
+      && Buffer.byteLength(value, "utf8") <= MAPPING_MAX_STRING_BYTES
+      && !/[\u0000-\u001f\u007f]/u.test(value);
+  }
+  if (!value || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.length <= MAPPING_MAX_ARRAY
+        && value.every((item) => boundedMappingJson(item, depth + 1, budget, seen));
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    const entries = Object.entries(value);
+    return entries.length <= MAPPING_MAX_KEYS
+      && entries.every(([key, item]) => {
+        budget.bytes += Buffer.byteLength(key, "utf8");
+        return Buffer.byteLength(key, "utf8") <= MAPPING_MAX_STRING_BYTES
+          && !/[\u0000-\u001f\u007f]/u.test(key)
+          && budget.bytes <= AGENT_MAPPING_MAX_BYTES
+          && boundedMappingJson(item, depth + 1, budget, seen);
+      });
+  } finally {
+    seen.delete(value);
+  }
+}
+function readPinnedUtf8(root: PinnedProjectRoot, relativePath: string): string | null {
+  try {
+    if (!root.pathEntryExists(relativePath)) return null;
+    return new TextDecoder("utf-8", { fatal: true }).decode(root.readFile(relativePath, { maxBytes: AGENT_MAPPING_MAX_BYTES }).bytes);
+  } catch {
+    return null;
+  }
+}
 const MAX_NAME_LENGTH = 128;
+
+function setMappingOwn<T>(target: Record<string, T>, key: string, value: T): void {
+  Object.defineProperty(target, key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
 const MAPPING_FILE = join(".work-state", "runtime", "agent-mapping.json");
+
+export type AgentMappingPublicationReceipt = {
+  readonly canonical_root: string;
+  readonly root_dev: number;
+  readonly root_ino: number;
+  readonly relative_path: string;
+  readonly dev: number;
+  readonly ino: number;
+  readonly size: number;
+  readonly sha256: string;
+};
+
+// A persisted JSON parse is intentionally not enough to mint authorization.
+// Only the exact mapping object returned by the engine's publication writer
+// gets a receipt, and proof issuance verifies that receipt against a pinned
+// read before accepting the host handoff.
+const mappingPublicationReceipts = new WeakMap<object, AgentMappingPublicationReceipt>();
+const latestPublishedMappings = new Map<string, AgentMappingState>();
+const MAX_LATEST_PUBLISHED_MAPPINGS = 256;
+
+function publicationRootKey(root: PinnedProjectRoot): string {
+  return `${root.canonical_root}\u0000${root.dev}:${root.ino}`;
+}
 
 export type AgentMappingStatus = "preferred" | "fallback" | "unavailable";
 
@@ -249,8 +346,8 @@ export function buildAgentMapping(options: AgentMappingOptions): AgentMappingSta
       : resolved === requested
         ? "preferred"
         : "fallback";
-    diagnostics[key] = { requested, candidates, ...(resolved ? { resolved } : {}), status };
-    if (resolved) resolved_roles[key] = resolved;
+    setMappingOwn(diagnostics, key, { requested, candidates, ...(resolved ? { resolved } : {}), status });
+    if (resolved) setMappingOwn(resolved_roles, key, resolved);
     else unresolved_roles.push(key);
   }
 
@@ -262,21 +359,24 @@ export function buildAgentMapping(options: AgentMappingOptions): AgentMappingSta
     available_agents,
     resolved_roles,
     diagnostics,
-    unresolved_roles,
     ...(provenance.source !== undefined ? { source: provenance.source } : {}),
     ...(provenance.config_path !== undefined ? { config_path: provenance.config_path } : {}),
     ...(provenance.config_hash !== undefined ? { config_hash: provenance.config_hash } : {}),
     ...(provenance.config_version !== undefined ? { config_version: provenance.config_version } : {}),
     provider_discovery_hash: hashValue([...available_agents].sort((left, right) => left.localeCompare(right))),
+    unresolved_roles: unresolved_roles.sort((left, right) => left.localeCompare(right)),
     provenance,
   };
 }
 
 function isDiagnostic(value: unknown): value is AgentMappingDiagnostic {
-  if (!value || typeof value !== "object") return false;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const diagnostic = value as Partial<AgentMappingDiagnostic>;
+  const keys = Object.keys(value);
+  if (keys.some((key) => !["requested", "candidates", "resolved", "status"].includes(key))) return false;
   return typeof diagnostic.requested === "string"
     && Array.isArray(diagnostic.candidates)
+    && diagnostic.candidates.length <= MAPPING_MAX_ARRAY
     && diagnostic.candidates.every(candidate => Boolean(normalizedName(candidate)))
     && (diagnostic.status === "preferred" || diagnostic.status === "fallback" || diagnostic.status === "unavailable")
     && (diagnostic.resolved === undefined || Boolean(normalizedName(diagnostic.resolved)));
@@ -288,74 +388,235 @@ export type AgentMappingStateValidation =
 
 /**
  * The one complete runtime validator for an `AgentMappingState`. Beyond the
- * outer structural shape it enforces the semantic invariants a malicious
- * caller could otherwise forge: every resolved role names a non-empty agent
- * that is present in `available_agents`, diagnostics are well-formed with
- * resolved agents inside the live inventory, and `unresolved_roles` stays
- * disjoint from `resolved_roles` with matching diagnostic status. Trusted
- * in-memory handoffs and the persisted mapping boundaries (read and write)
- * share this single gate, so nothing can look valid from the outside while
- * resolving roles to agents that were never discovered.
+ * outer structural shape it enforces the semantic closure a malicious caller
+ * could otherwise forge: every diagnostic role is exactly resolved or
+ * unresolved, resolved agents are in the discovered inventory and equal the
+ * first eligible candidate, and requested/resolved/status fields agree.
+ * Trusted in-memory handoffs and persisted mapping boundaries share this
+ * single gate, so nothing can look valid from the outside while redirecting a
+ * role to an agent or candidate that the mapping does not authorize.
  */
 export function validateAgentMappingState(value: unknown): AgentMappingStateValidation {
   if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, error: "mapping is not an object" };
+  if (!boundedMappingJson(value)) return { ok: false, error: "mapping exceeds bounded JSON limits" };
   const mapping = value as Partial<AgentMappingState>;
+  const allowedKeys = new Set(["schema", "generated_at", "preferences_hash", "available_agents", "resolved_roles", "diagnostics", "unresolved_roles", "source", "config_path", "config_hash", "config_version", "provider_discovery_hash", "provenance"]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return { ok: false, error: "mapping contains unknown keys" };
   if (mapping.schema !== AGENT_MAPPING_SCHEMA) return { ok: false, error: `schema must be ${AGENT_MAPPING_SCHEMA}` };
   if (typeof mapping.generated_at !== "string" || !mapping.generated_at) return { ok: false, error: "generated_at must be a non-empty string" };
   if (typeof mapping.preferences_hash !== "string" || !mapping.preferences_hash) return { ok: false, error: "preferences_hash must be a non-empty string" };
-  if (!Array.isArray(mapping.available_agents) || !mapping.available_agents.every((agent) => Boolean(normalizedName(agent)))) {
-    return { ok: false, error: "available_agents must be an array of non-empty agent names" };
+  if (!Array.isArray(mapping.available_agents)
+    || mapping.available_agents.length > MAPPING_MAX_ARRAY
+    || !mapping.available_agents.every((agent) => normalizedName(agent) === agent)) {
+    return { ok: false, error: "available_agents must be a bounded array of normalized non-empty agent names" };
   }
   const available = new Set(mapping.available_agents);
   if (available.size !== mapping.available_agents.length) return { ok: false, error: "available_agents must not contain duplicates" };
   const resolvedRoles = mapping.resolved_roles;
-  if (!resolvedRoles || typeof resolvedRoles !== "object" || Array.isArray(resolvedRoles)) return { ok: false, error: "resolved_roles must be an object" };
+  if (!resolvedRoles || typeof resolvedRoles !== "object" || Array.isArray(resolvedRoles)
+    || Object.keys(resolvedRoles).length > MAPPING_MAX_KEYS) return { ok: false, error: "resolved_roles must be a bounded object" };
   for (const [role, agent] of Object.entries(resolvedRoles)) {
-    if (!normalizedName(role)) return { ok: false, error: `resolved_roles.${role} is not a non-empty role name` };
-    if (!normalizedName(agent)) return { ok: false, error: `resolved_roles.${role} is not a non-empty agent name` };
+    if (normalizedName(role) !== role) return { ok: false, error: `resolved_roles.${role} is not a normalized role name` };
+    if (normalizedName(agent) !== agent) return { ok: false, error: `resolved_roles.${role} is not a normalized agent name` };
     if (!available.has(agent)) return { ok: false, error: `resolved_roles.${role} names agent '${agent}' outside available_agents` };
   }
-  if (!mapping.diagnostics || typeof mapping.diagnostics !== "object" || Array.isArray(mapping.diagnostics)) return { ok: false, error: "diagnostics must be an object" };
+  if (!mapping.diagnostics || typeof mapping.diagnostics !== "object" || Array.isArray(mapping.diagnostics)
+    || Object.keys(mapping.diagnostics).length > MAPPING_MAX_KEYS) return { ok: false, error: "diagnostics must be a bounded object" };
+  const diagnosticRoles = Object.keys(mapping.diagnostics);
   for (const [role, diagnostic] of Object.entries(mapping.diagnostics)) {
-    if (!normalizedName(role) || !isDiagnostic(diagnostic)) return { ok: false, error: `diagnostics.${role} is not a well-formed diagnostic` };
-    if (diagnostic.resolved !== undefined && !available.has(diagnostic.resolved)) return { ok: false, error: `diagnostics.${role} resolves outside available_agents` };
+    if (normalizedName(role) !== role || !isDiagnostic(diagnostic)) return { ok: false, error: `diagnostics.${role} is not a well-formed diagnostic` };
+    if (normalizedName(diagnostic.requested) !== diagnostic.requested) return { ok: false, error: `diagnostics.${role}.requested is not a normalized role name` };
+    const candidates = diagnostic.candidates;
+    if (candidates.some((candidate) => normalizedName(candidate) !== candidate)) return { ok: false, error: `diagnostics.${role}.candidates contain an unnormalized agent name` };
+    if (new Set(candidates).size !== candidates.length) return { ok: false, error: `diagnostics.${role}.candidates must not contain duplicates` };
+    if (diagnostic.resolved !== undefined) {
+      if (normalizedName(diagnostic.resolved) !== diagnostic.resolved) return { ok: false, error: `diagnostics.${role}.resolved is not a normalized agent name` };
+      if (!available.has(diagnostic.resolved)) return { ok: false, error: `diagnostics.${role} resolves outside available_agents` };
+    }
   }
-  if (!Array.isArray(mapping.unresolved_roles) || !mapping.unresolved_roles.every((role) => Boolean(normalizedName(role)))) {
-    return { ok: false, error: "unresolved_roles must be an array of non-empty role names" };
+  if (!Array.isArray(mapping.unresolved_roles)
+    || mapping.unresolved_roles.length > MAPPING_MAX_ARRAY
+    || !mapping.unresolved_roles.every((role) => normalizedName(role) === role)) {
+    return { ok: false, error: "unresolved_roles must be a bounded array of normalized role names" };
   }
+  if (new Set(mapping.unresolved_roles).size !== mapping.unresolved_roles.length) return { ok: false, error: "unresolved_roles must not contain duplicates" };
+
+  const unresolved = new Set(mapping.unresolved_roles);
+  const resolvedRoleNames = Object.keys(resolvedRoles);
   for (const role of mapping.unresolved_roles) {
-    if (role in resolvedRoles) return { ok: false, error: `unresolved_roles names '${role}' which resolved_roles also resolves` };
-    const diagnostic: AgentMappingDiagnostic | undefined = mapping.diagnostics[role];
-    if (diagnostic && diagnostic.status !== "unavailable") return { ok: false, error: `unresolved role '${role}' carries a '${diagnostic.status}' diagnostic` };
+    if (Object.hasOwn(resolvedRoles, role)) return { ok: false, error: `unresolved_roles names '${role}' which resolved_roles also resolves` };
   }
-  for (const role of Object.keys(resolvedRoles)) {
-    if (mapping.diagnostics[role]?.status === "unavailable") return { ok: false, error: `resolved role '${role}' carries an 'unavailable' diagnostic` };
+  const allRoles = new Set([...diagnosticRoles, ...resolvedRoleNames, ...mapping.unresolved_roles]);
+  if (allRoles.size !== diagnosticRoles.length
+    || diagnosticRoles.some((role) => !allRoles.has(role))
+    || resolvedRoleNames.some((role) => !allRoles.has(role))) {
+    return { ok: false, error: "diagnostics, resolved_roles, and unresolved_roles must describe the same role closure" };
   }
-  if (mapping.source !== undefined && !normalizedName(mapping.source)) return { ok: false, error: "source must be a non-empty name when present" };
+  for (const role of allRoles) {
+    const diagnostic = mapping.diagnostics[role];
+    const resolved = Object.hasOwn(resolvedRoles, role) ? resolvedRoles[role] : undefined;
+    const isResolved = resolved !== undefined;
+    const isUnresolved = unresolved.has(role);
+    if (isResolved === isUnresolved) return { ok: false, error: `role '${role}' must be exactly resolved or unresolved` };
+    if (diagnostic === undefined) return { ok: false, error: `role '${role}' is missing a diagnostic` };
+    if (diagnostic.resolved !== resolved) return { ok: false, error: `diagnostics.${role}.resolved does not match resolved_roles` };
+    const firstEligible = diagnostic.candidates.find((candidate) => available.has(candidate));
+    if (isResolved) {
+      if (firstEligible !== resolved) return { ok: false, error: `resolved_roles.${role} is not the first eligible diagnostic candidate` };
+      const expectedStatus = resolved === diagnostic.requested ? "preferred" : "fallback";
+      if (diagnostic.status !== expectedStatus) return { ok: false, error: `diagnostics.${role} status must be '${expectedStatus}' for its resolved agent` };
+    } else {
+      if (diagnostic.status !== "unavailable") return { ok: false, error: `unresolved role '${role}' carries a '${diagnostic.status}' diagnostic` };
+      if (firstEligible !== undefined) return { ok: false, error: `unresolved role '${role}' has an eligible diagnostic candidate` };
+    }
+  }
+  if (mapping.source !== undefined && normalizedName(mapping.source) !== mapping.source) return { ok: false, error: "source must be a normalized non-empty name when present" };
   if (mapping.config_path !== undefined && mapping.config_path !== null && typeof mapping.config_path !== "string") return { ok: false, error: "config_path must be a string or null" };
   if (mapping.config_hash !== undefined && typeof mapping.config_hash !== "string") return { ok: false, error: "config_hash must be a string when present" };
   if (mapping.config_version !== undefined && mapping.config_version !== null
     && typeof mapping.config_version !== "string" && typeof mapping.config_version !== "number") return { ok: false, error: "config_version must be a string, number or null" };
   if (mapping.provider_discovery_hash !== undefined && typeof mapping.provider_discovery_hash !== "string") return { ok: false, error: "provider_discovery_hash must be a string when present" };
+  if (mapping.provider_discovery_hash !== undefined
+    && mapping.provider_discovery_hash !== hashValue([...mapping.available_agents].sort((left, right) => left.localeCompare(right)))) {
+    return { ok: false, error: "provider_discovery_hash does not match available_agents" };
+  }
   if (mapping.provenance !== undefined && (!mapping.provenance || typeof mapping.provenance !== "object" || Array.isArray(mapping.provenance))) return { ok: false, error: "provenance must be an object when present" };
   return { ok: true, mapping: mapping as AgentMappingState };
 }
 
-function configFingerprint(cwd: string): { path: string | null; hash: string | null } {
-  const candidates = [join(cwd, ".omp", "team.config.json"), join(cwd, ".claude", "team.config.json")];
-  for (const path of candidates) {
-    if (!existsSync(path)) continue;
-    try {
-      if (lstatSync(path).isSymbolicLink()) return { path, hash: null };
-      return {
-        path,
-        hash: hashText(readFileSync(path, "utf8")),
-      };
-    } catch {
-      return { path, hash: null };
-    }
+function serializeAgentMapping(mapping: AgentMappingState): Buffer {
+  const validated = validateAgentMappingState(mapping);
+  if (!validated.ok) {
+    throw new AgentMappingWriteError("invalid", `refusing to persist malformed agent mapping: ${validated.error}`);
   }
-  return { path: null, hash: null };
+  const content = `${canonicalString(validated.mapping)}\n`;
+  const bytes = Buffer.from(content, "utf8");
+  if (bytes.byteLength > AGENT_MAPPING_MAX_BYTES) {
+    throw new AgentMappingWriteError(
+      "limit",
+      `agent mapping is ${bytes.byteLength} UTF-8 bytes; maximum is ${AGENT_MAPPING_MAX_BYTES}`,
+      bytes.byteLength,
+    );
+  }
+  return bytes;
+}
+
+function publicationReceiptMatches(root: PinnedProjectRoot, receipt: AgentMappingPublicationReceipt): boolean {
+  if (!root.isStable()
+    || root.canonical_root !== receipt.canonical_root
+    || root.dev !== receipt.root_dev
+    || root.ino !== receipt.root_ino
+    || receipt.relative_path !== MAPPING_FILE) return false;
+  try {
+    const observed = root.readFile(receipt.relative_path, { maxBytes: AGENT_MAPPING_MAX_BYTES });
+    return observed.dev === receipt.dev
+      && observed.ino === receipt.ino
+      && observed.size === receipt.size
+      && hashText(Buffer.from(observed.bytes).toString("utf8")) === receipt.sha256;
+  } catch {
+    return false;
+  }
+}
+
+function mappingSemanticProjection(mapping: AgentMappingState): unknown {
+  const { generated_at: _generatedAt, ...semantic } = mapping;
+  return semantic;
+}
+
+function sameMappingSemantics(left: AgentMappingState, right: AgentMappingState): boolean {
+  return canonicalString(mappingSemanticProjection(left)) === canonicalString(mappingSemanticProjection(right));
+}
+
+function persistedFallbackPreferences(provenance: MappingPreferencesProvenance): {
+  fallbackChains?: Record<string, readonly string[]>;
+  genericFallback?: string | null;
+  genericFallbackRoles?: readonly string[];
+} | undefined {
+  const result: {
+    fallbackChains?: Record<string, readonly string[]>;
+    genericFallback?: string | null;
+    genericFallbackRoles?: readonly string[];
+  } = {};
+  const rawChains = provenance.fallback_chains;
+  if (rawChains !== undefined) {
+    if (!rawChains || typeof rawChains !== "object" || Array.isArray(rawChains)) return undefined;
+    const chains: Record<string, readonly string[]> = {};
+    for (const [role, rawCandidates] of Object.entries(rawChains)) {
+      if (normalizedName(role) !== role || !Array.isArray(rawCandidates)
+        || rawCandidates.some((candidate) => normalizedName(candidate) !== candidate)) return undefined;
+      setMappingOwn(chains, role, [...rawCandidates]);
+    }
+    result.fallbackChains = chains;
+  }
+  if (provenance.generic_fallback !== undefined) {
+    if (provenance.generic_fallback !== null && normalizedName(provenance.generic_fallback) !== provenance.generic_fallback) return undefined;
+    result.genericFallback = provenance.generic_fallback;
+  }
+  if (provenance.generic_fallback_roles !== undefined) {
+    if (!Array.isArray(provenance.generic_fallback_roles)
+      || provenance.generic_fallback_roles.some((role) => normalizedName(role) !== role)) return undefined;
+    result.genericFallbackRoles = [...provenance.generic_fallback_roles];
+  }
+  return result;
+}
+
+function recomputeExpectedMapping(
+  parsed: AgentMappingState,
+  expected: AgentMappingExpectation,
+): AgentMappingState | undefined {
+  if (!parsed.provenance || typeof parsed.provenance !== "object" || Array.isArray(parsed.provenance)) return undefined;
+  const provenance = parsed.provenance;
+  const providerDiscovery = provenance.provider_discovery;
+  if (!Array.isArray(providerDiscovery)
+    || providerDiscovery.some((agent) => normalizedName(agent) !== agent)
+    || providerDiscovery.length !== parsed.available_agents.length
+    || providerDiscovery.some((agent, index) => agent !== parsed.available_agents[index])) return undefined;
+  const fallback = persistedFallbackPreferences(provenance);
+  if (!fallback) return undefined;
+  const options: AgentMappingOptions = {
+    roles: expected.roles!,
+    availableAgents: parsed.available_agents,
+    extraRoles: expected.extraRoles ?? [],
+    scope_map: expected.scope_map,
+    flags: expected.flags,
+    roster: expected.roster,
+    config_path: expected.config_path,
+    config_source: expected.config_source,
+    config_hash: expected.config_hash,
+    config_version: expected.config_version,
+    config_provenance: expected.config_provenance,
+    ...(parsed.source !== undefined ? { source: parsed.source } : {}),
+    ...(fallback.fallbackChains !== undefined ? { fallbackChains: fallback.fallbackChains } : {}),
+    ...(fallback.genericFallback !== undefined ? { genericFallback: fallback.genericFallback } : {}),
+    ...(fallback.genericFallbackRoles !== undefined ? { genericFallbackRoles: fallback.genericFallbackRoles } : {}),
+  };
+  return buildAgentMapping(options);
+}
+
+function configFingerprint(cwd: string, borrowedRoot?: PinnedProjectRoot): { path: string | null; hash: string | null } {
+  const root = borrowedRoot ?? PinnedProjectRoot.open(cwd);
+  if (!root) return { path: null, hash: null };
+  const ownsRoot = borrowedRoot === undefined;
+  const candidates = [
+    { relative: ".omp/team.config.json", sourcePath: join(root.canonical_root, ".omp", "team.config.json") },
+    { relative: ".claude/team.config.json", sourcePath: join(root.canonical_root, ".claude", "team.config.json") },
+  ];
+  try {
+    for (const candidate of candidates) {
+      let exists = false;
+      try {
+        exists = root.pathEntryExists(candidate.relative);
+      } catch {
+        return { path: candidate.sourcePath, hash: null };
+      }
+      if (!exists) continue;
+      const raw = readPinnedUtf8(root, candidate.relative);
+      return { path: candidate.sourcePath, hash: raw === null ? null : hashText(raw) };
+    }
+    return { path: null, hash: null };
+  } finally {
+    if (ownsRoot) root.close();
+  }
 }
 
 function assertSafeMappingRoot(cwd: string): string {
@@ -383,34 +644,39 @@ export function agentMappingPath(cwd: string): string {
   assertSafeMappingPath(root, path);
   return path;
 }
-
-export function readAgentMapping(cwd: string, expected?: AgentMappingExpectation): AgentMappingState | undefined {
+export function readAgentMapping(cwd: string, expected?: AgentMappingExpectation, borrowedRoot?: PinnedProjectRoot): AgentMappingState | undefined {
   let path: string;
   let root: string;
   try {
-    root = assertSafeMappingRoot(cwd);
-    path = agentMappingPath(root);
+    if (borrowedRoot) {
+      root = borrowedRoot.canonical_root;
+      path = resolve(root, MAPPING_FILE);
+    } else {
+      root = assertSafeMappingRoot(cwd);
+      path = agentMappingPath(root);
+    }
   } catch {
     return undefined;
   }
-  if (!existsSync(path)) return undefined;
+  const pinnedRoot = borrowedRoot ?? PinnedProjectRoot.open(root);
+  if (!pinnedRoot) return undefined;
+  const ownsRoot = borrowedRoot === undefined;
   try {
-    if (lstatSync(path).isSymbolicLink() || !lstatSync(path).isFile()) return undefined;
-    const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!pinnedRoot.pathEntryExists(MAPPING_FILE)) return undefined;
+    const rawText = readPinnedUtf8(pinnedRoot, MAPPING_FILE);
+    if (rawText === null) return undefined;
+    const raw: unknown = JSON.parse(rawText);
     const validated = validateAgentMappingState(raw);
     if (!validated.ok) return undefined;
     const parsed = validated.mapping;
-    const fingerprint = configFingerprint(root);
+    const fingerprint = configFingerprint(root, pinnedRoot);
     if (parsed.config_path !== undefined && parsed.config_path !== fingerprint.path) return undefined;
     if (parsed.config_hash && fingerprint.hash && parsed.config_hash !== fingerprint.hash) return undefined;
     if (parsed.provider_discovery_hash && parsed.provider_discovery_hash !== hashValue([...parsed.available_agents].sort((left, right) => left.localeCompare(right)))) return undefined;
     if (expected?.preferences_hash && parsed.preferences_hash !== expected.preferences_hash) return undefined;
     if (expected?.roles) {
-      const expectedHash = mappingPreferencesHash(expected.roles, expected.extraRoles ?? [], {
-        ...expected,
-        provider_discovery: expected.provider_discovery ?? expected.availableAgents ?? parsed.available_agents,
-      });
-      if (parsed.preferences_hash !== expectedHash) return undefined;
+      const recomputed = recomputeExpectedMapping(parsed, expected);
+      if (!recomputed || !sameMappingSemantics(parsed, recomputed)) return undefined;
     }
     if (expected?.availableAgents && uniqueNames(expected.availableAgents).sort().join("\u0000") !== [...parsed.available_agents].sort().join("\u0000")) return undefined;
     if (expected?.source !== undefined && (parsed.source ?? parsed.provenance?.source) !== expected.source) return undefined;
@@ -421,18 +687,65 @@ export function readAgentMapping(cwd: string, expected?: AgentMappingExpectation
     return parsed;
   } catch {
     return undefined;
+  } finally {
+    if (ownsRoot) pinnedRoot.close();
   }
 }
 
+/** Return the current engine-published map for a pinned root, never a parsed disk fallback. */
+export function latestPublishedAgentMapping(borrowedRoot: PinnedProjectRoot): AgentMappingState | null {
+  const mapping = latestPublishedMappings.get(publicationRootKey(borrowedRoot));
+  const receipt = mapping ? mappingPublicationReceipts.get(mapping as object) : undefined;
+  if (!mapping || !receipt || !publicationReceiptMatches(borrowedRoot, receipt)) return null;
+  return mapping;
+}
+
+/** Capture the exact anchored publication receipt for this engine-written map. */
+export function agentMappingPublicationReceipt(mapping: AgentMappingState, borrowedRoot: PinnedProjectRoot): AgentMappingPublicationReceipt | null {
+  const receipt = mappingPublicationReceipts.get(mapping as object);
+  if (!receipt || !publicationReceiptMatches(borrowedRoot, receipt)) return null;
+  return { ...receipt };
+}
+
+/** Verify an anchored mapping publication receipt against a pinned read. */
+export function verifyAgentMappingPublicationReceipt(
+  borrowedRoot: PinnedProjectRoot,
+  receipt: AgentMappingPublicationReceipt,
+): boolean {
+  return publicationReceiptMatches(borrowedRoot, receipt);
+}
+
 /** Persist the generated map outside project configuration and atomically. */
-export function writeAgentMapping(cwd: string, mapping: AgentMappingState): string {
-  const root = assertSafeMappingRoot(cwd);
-  const path = agentMappingPath(root);
-  if (!validateAgentMappingState(mapping).ok) throw new Error("refusing to persist malformed agent mapping");
-  const directory = dirname(path);
-  mkdirSync(directory, { recursive: true });
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(mapping, null, 2)}\n`, "utf8");
-  renameSync(temporary, path);
-  return path;
+export function writeAgentMapping(cwd: string, mapping: AgentMappingState, borrowedRoot?: PinnedProjectRoot): string {
+  const content = serializeAgentMapping(mapping);
+  const root = borrowedRoot?.canonical_root ?? assertSafeMappingRoot(cwd);
+  const path = borrowedRoot ? resolve(root, MAPPING_FILE) : agentMappingPath(root);
+  const pinnedRoot = borrowedRoot ?? PinnedProjectRoot.open(root);
+  if (!pinnedRoot) throw new Error("agent mapping root could not be opened and pinned safely");
+  const ownsRoot = borrowedRoot === undefined;
+  try {
+    if (!pinnedRoot.isStable()) throw new Error("agent mapping root changed before publication");
+    const receipt: PinnedRootWriteReceipt = pinnedRoot.writeAtomicWithReceipt(MAPPING_FILE, content);
+    mappingPublicationReceipts.set(mapping as object, {
+      canonical_root: pinnedRoot.canonical_root,
+      root_dev: pinnedRoot.dev,
+      root_ino: pinnedRoot.ino,
+      relative_path: receipt.relative_path,
+      dev: receipt.descriptor.dev,
+      ino: receipt.descriptor.ino,
+      size: receipt.descriptor.size,
+      sha256: receipt.descriptor.sha256,
+    });
+    const key = publicationRootKey(pinnedRoot);
+    latestPublishedMappings.delete(key);
+    latestPublishedMappings.set(key, mapping);
+    while (latestPublishedMappings.size > MAX_LATEST_PUBLISHED_MAPPINGS) {
+      const oldest = latestPublishedMappings.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      latestPublishedMappings.delete(oldest);
+    }
+    return path;
+  } finally {
+    if (ownsRoot) pinnedRoot.close();
+  }
 }

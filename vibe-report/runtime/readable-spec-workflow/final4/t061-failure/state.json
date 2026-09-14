@@ -1,0 +1,261 @@
+{
+  "schema": 1,
+  "branch": "main",
+  "classification": {
+    "type": "SPEC",
+    "complexity": "MEDIUM",
+    "confidence": "HIGH",
+    "autonomous": false,
+    "workflow": "spec-import"
+  },
+  "task": "Read-only external specification compatibility validation",
+  "workflow_override": true,
+  "issue": null,
+  "stage_cursor": "compatibility_approval",
+  "stages": [
+    {
+      "id": "import",
+      "status": "done"
+    },
+    {
+      "id": "constitution",
+      "status": "done"
+    },
+    {
+      "id": "compatibility",
+      "status": "done"
+    },
+    {
+      "id": "compatibility_approval",
+      "status": "in_progress"
+    },
+    {
+      "id": "handoff",
+      "status": "pending"
+    }
+  ],
+  "artifacts": {},
+  "pause": {
+    "kind": "none",
+    "reason": ""
+  },
+  "updated_at": "2026-09-02T19:47:33.384Z",
+  "policy": {
+    "strict_orchestrator": true
+  },
+  "scope": {
+    "has_security": false,
+    "has_infra": false,
+    "scope": [],
+    "has_ui": false,
+    "has_runtime": false,
+    "dev_agent": null
+  },
+  "profile_hash": "e6de792059dc5595edebf9e142ce26803532a854e6b157bfda9f84dc86bf9f07",
+  "run_key": "import-59eea86a-3e18-4902-815e-172b749faf9a",
+  "specification": {
+    "schema_version": 2,
+    "feature_id": "imported-payment-retry",
+    "display_name": "imported/payment-retry",
+    "source_kind": "external",
+    "project_root": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-vRLAQJ/omp-spec-e2e-complete",
+    "project_root_identity": {
+      "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-vRLAQJ/omp-spec-e2e-complete",
+      "dev": 16777234,
+      "ino": 94921289
+    },
+    "workspace_path": "specs/imported-payment-retry",
+    "state_path": ".work-state/features/imported-payment-retry/state.json",
+    "profile_name": "spec-import",
+    "profile_hash": "e6de792059dc5595edebf9e142ce26803532a854e6b157bfda9f84dc86bf9f07",
+    "constitution_gate_ref": "constitution-gate-d58d442f",
+    "constitution_binding": {
+      "provider_id": "native",
+      "path": "CONSTITUTION.md",
+      "version": "0.0.0",
+      "content_sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      "semantic_hash": "35ce12b619924ee68ab11046b5ac497392f2615526e791d52482d5c5257714af",
+      "validation_ref": "constitution.validation.8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      "bound_at": "2026-09-02T19:46:57.084Z"
+    },
+    "language": {
+      "language": "en-US",
+      "source": "project_default",
+      "selection_hash": "587f63b2864bc26fbb1f627c015449cc5b395f78d35e7384876c51cd32f675bd"
+    },
+    "template_set": {
+      "template_set_id": "specification-default",
+      "source": "shipped_default",
+      "content_hash": "5b01f9d8c07f93b2a94f0a4d79fb0d314633a5b5d5cc81ce036f7143a48e0868",
+      "required_markers": []
+    },
+    "phases": [
+      {
+        "phase": "specify",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "plan",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "tasks",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      }
+    ],
+    "status": "in_progress",
+    "next_action": {
+      "kind": "checkpoint",
+      "command": null,
+      "reason": "Compatibility validation passed; the sole hard-human imported compatibility checkpoint is open."
+    },
+    "handoff_ref": null,
+    "execution_claim_ref": null,
+    "implementation_conformance_ref": null,
+    "import_ref": "import.ceca4b644bd37cb4a9ccbb2167e63222ee4580b228416aa1b9b8c97632dfb490",
+    "migration_receipt_ref": null
+  },
+  "state_revision": 6,
+  "completion_intent": {
+    "mode": "handoff_only",
+    "acceptance": "quality_gates_and_artifacts",
+    "source": "workflow_policy",
+    "rationale": "Import ends at one approved shared implementation handoff."
+  },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": [
+      "custom"
+    ],
+    "rules": {
+      "import_compatibility_approval": {
+        "kind": "custom",
+        "default": "required_human",
+        "allowed_decisions": [
+          "approve_continue",
+          "request_changes",
+          "approve_stop"
+        ],
+        "phase": "before_advance",
+        "rationale": "Explicit approval binds exact source and constitution hashes plus feature/run selectors."
+      }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Constitution prerequisite precedes compatibility and no native phases are replayed."
+  },
+  "work_identity": {
+    "run_id": "import-59eea86a-3e18-4902-815e-172b749faf9a",
+    "wave_id": "legacy-wave-074df82c79d9c677371adc0c",
+    "slice_id": "legacy-slice-compatibility_approval",
+    "session_id": "legacy-session-074df82c79d9c677371adc0c",
+    "workflow": "spec-import",
+    "stage_id": "compatibility_approval",
+    "stage_cursor": "compatibility_approval",
+    "capability_id": "legacy-capability-074df82c79d9c677371adc0c",
+    "capability_epoch": "legacy-epoch-074df82c79d9c677371adc0c",
+    "slot_id": "orchestrator",
+    "task_id": "legacy-task-074df82c79d9c677371adc0c",
+    "dispatch_id": "legacy-dispatch-074df82c79d9c677371adc0c",
+    "attempt": 1,
+    "worker_id": "engine"
+  },
+  "migration": {
+    "id": "migration-3185b324d87e1444fff978fe",
+    "from_schema": 1,
+    "to_schema": 2,
+    "source_profile_hash": "e6de792059dc5595edebf9e142ce26803532a854e6b157bfda9f84dc86bf9f07",
+    "target_profile_hash": "e6de792059dc5595edebf9e142ce26803532a854e6b157bfda9f84dc86bf9f07",
+    "source_policy_hash": null,
+    "target_policy_hash": "b5e6fb19582e03efe0d8b782be1d53eeeb0167371e38224ab1188f2e65d472f5",
+    "legacy_inputs": [
+      "classification.autonomous"
+    ],
+    "warnings": [
+      "completion_intent projected from typed profile or conservative migration default",
+      "checkpoint_policy projected from typed profile or conservative human-required migration policy"
+    ],
+    "status": "complete",
+    "migrated_at": "2026-09-02T19:47:00.456Z"
+  },
+  "control_plane_provenance": {
+    "completion_intent": "state",
+    "checkpoint_policy": "state",
+    "roster_policy": "legacy",
+    "roster_selection": "none",
+    "work_identity": "migration",
+    "pending": "none",
+    "child_join": "none",
+    "completion_envelope": "none",
+    "legacy_inputs": [
+      "classification.autonomous"
+    ],
+    "warnings": [],
+    "status": "migrated"
+  },
+  "cursor_epoch": "3342ed2f-cf1a-4ff0-810b-433c3b27311c",
+  "dispatch_capability": {
+    "capability_id": "04585085-b4b9-4180-b9d4-bfaa3904fc03",
+    "dispatch_token_hash": "8900efe988ac12af60065ae3875d582ceb443a28fb8a69c8212efaa6c502810c",
+    "advance_token_hash": "62ae7e8601310faacc8e416b9486e447a8fc84385aca528a732bc29611c31557",
+    "issued_for": {
+      "run_key": "import-59eea86a-3e18-4902-815e-172b749faf9a",
+      "branch": "main",
+      "workflow": "spec-import",
+      "profile_hash": "e6de792059dc5595edebf9e142ce26803532a854e6b157bfda9f84dc86bf9f07",
+      "stage_cursor": "compatibility_approval",
+      "cursor_epoch": "3342ed2f-cf1a-4ff0-810b-433c3b27311c"
+    },
+    "kind": "none",
+    "expected_roles": [],
+    "expected_count": 0,
+    "expected_roster": [],
+    "status": "ready",
+    "dispatches": []
+  },
+  "observability": {
+    "eventsPath": "observability/events.jsonl",
+    "lastEventId": "evt-mtkic3j8-2",
+    "rollupThroughId": "evt-mtkic3j8-2",
+    "rollup": {
+      "agentInvocations": 0,
+      "agents": {},
+      "tools": {},
+      "toolErrors": {},
+      "subagents": {},
+      "skills": {},
+      "totalToolCalls": 0,
+      "totalToolErrors": 0,
+      "durationMs": 17,
+      "firstEventAt": "2026-09-02T19:46:58.899Z",
+      "lastEventAt": "2026-09-02T19:46:58.916Z",
+      "pendingEvents": 0,
+      "pendingReasons": {},
+      "terminalSignals": {},
+      "artifactSummaries": 0,
+      "artifactWrites": 2
+    }
+  }
+}

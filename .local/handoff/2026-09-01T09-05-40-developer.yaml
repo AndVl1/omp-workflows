@@ -1,0 +1,34 @@
+id: 2026-09-01T09-05-40-developer
+parent: null
+agent: developer
+timestamp: "2026-09-01T09:05:40Z"
+status: completed
+context:
+  task: "Remove CTO transport markers from readable specification materialization and migration documents"
+  phase: "validation-release"
+output:
+  summary: "Removed hard-coded CTO slice marker lines from all requested readable projection renderers and legacy migrated phase documents; added deterministic marker-free projection coverage."
+  files_changed:
+    - path: packages/core/src/specification/materialize.ts
+      action: modified
+      changes: "Removed marker constant and marker lines from handoff, compatibility, conformance, and migration receipt renderers."
+    - path: packages/core/src/specification/migration.ts
+      action: modified
+      changes: "Removed marker from migrated readable phase document output; preserved the orchestration source comment."
+    - path: packages/core/test/specification-materialization.test.ts
+      action: created
+      changes: "Covers all four readable projections for marker absence, provenance/digest retention, and deterministic replay."
+    - path: packages/core/test/specification-migration.test.ts
+      action: modified
+      changes: "Asserts migrated specify/plan/tasks/migration Markdown is marker-free and retains source digest provenance."
+  types_implemented: []
+  dependencies_added: []
+  todos: []
+next:
+  agent: null
+  task: "Parent integrates this slice and runs project-wide validation."
+  priority: high
+  acceptance_criteria:
+    - "Readable domain projections contain no omp-cto-slice transport marker."
+    - "Trusted source orchestration comment remains intact."
+    - "Focused marker regression test passes."

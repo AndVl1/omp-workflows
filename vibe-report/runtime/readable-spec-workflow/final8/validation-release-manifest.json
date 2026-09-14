@@ -1,0 +1,44 @@
+{
+  "slice": "validation-release",
+  "run": "01a0549b-cf6a-72f5-a45a-820b5eac89d2",
+  "captured_at": "2026-09-03",
+  "close_fix": {
+    "source": "packages/core/src/specification/import.ts",
+    "focused_tests": "packages/core/test/specification-import.test.ts",
+    "node_focused_status": "PASS",
+    "node_focused_tests": 18,
+    "bun_directory_smoke": "PASS",
+    "typecheck": "PASS"
+  },
+  "t061": {
+    "command": "OMP_UX_E2E_SEMANTIC_TIMEOUT_MS=300000 OMP_UX_E2E_PRESERVE_ON_FAILURE=1 node --test --import tsx --test-name-pattern='complete generic bundle' test/spec-import.test.ts",
+    "cwd": "packages/e2e",
+    "status": "FAIL_AFTER_IMPORT_AND_FINALIZER",
+    "failure": "packages/e2e/test/spec-import.test.ts:885: assertion approval freezes exactly one imported handoff; expected 1, actual 0",
+    "close_error_absent": true,
+    "import_stage": "done",
+    "constitution_stage": "done",
+    "compatibility_stage": "done",
+    "compatibility_approval_stage": "done",
+    "handoff_stage": "done",
+    "nested_handoff_artifact": ".work-state/features/imported-payment-retry/artifacts/implementation_handoff/imported-payment-retry.handoff.v1.json",
+    "scratch_parent": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-9TuB0s",
+    "scratch_root": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-9TuB0s/omp-spec-e2e-complete",
+    "session_pid": 52253,
+    "session_pid_absent_after_stop": true
+  },
+  "evidence": {
+    "exact_log": "t061-exact.log",
+    "stop_log": "t061-stop-root.log",
+    "state": "t061-state.json",
+    "handoff_artifact": "t061-handoff-artifact.json",
+    "transcript": "t061-transcript.jsonl",
+    "session": "t061-session.json"
+  },
+  "sha256": {
+    "t061-state.json": "9fd13a7a970b8dad745de9d432f3085a50fb706c6936f30ebe0e178fa263a80b",
+    "t061-handoff-artifact.json": "1e26f8afd5b97bfe7ba2fd5367b3d4aba16fc4616fd71e219cf2c3257ca54c51",
+    "t061-transcript.jsonl": "798b7958f347890c78c91c6e54248cb584f26347f999330f5cf8e3bc32fb0e7b",
+    "t061-session.json": "c5db6795c2d7229eb0e1bc659910205863f974ae900434db2fe640a44dbc615c"
+  }
+}

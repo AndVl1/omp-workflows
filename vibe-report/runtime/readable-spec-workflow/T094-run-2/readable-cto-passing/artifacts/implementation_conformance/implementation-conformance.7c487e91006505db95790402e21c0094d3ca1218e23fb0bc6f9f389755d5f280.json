@@ -1,0 +1,111 @@
+{
+  "schema_version": "1.0",
+  "feature_id": "readable-cto-passing",
+  "handoff_id": "readable-cto-passing.handoff.v1",
+  "handoff_digest": "7644909b7d17135edef84221f57709f0cff3d853e11fa51500c0ee2aa02c9ab7",
+  "execution_claim_id": "claim-e85e8cb13fb5a1971007585ad94ec13f",
+  "execution_owner": "cto",
+  "execution_run_id": "readable-cto-exec-wave-001",
+  "profile_hash": "4410dbc9f79aa780862e28b53905cccc9f963c375c2c5f0c6d170f03b2f135b5",
+  "entries": [
+    {
+      "entry_id": "closure.e0f2ee737b4ccc990dd6d3743bb9b316120f8ff4253efac771bd5c31d6cd6e04",
+      "subject_kind": "requirement",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "observable_behavior": true,
+      "implementation_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-passing-implementation",
+          "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-implementation.json",
+          "sha256": "2db3484819d8536cd2ebcec15f5ba755dd2e2b790d3402269d0481369e1f09f6",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "review_verdict": "pass",
+      "review_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-passing-qa",
+          "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-qa.json",
+          "sha256": "d8716eff1f3a1bf3a2653e285c01797c0513e9bff1a64a26d52c9d08366eafd8",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "test_evidence": [
+        {
+          "evidence_ref": {
+            "artifact_id": "readable-cto-passing-runtime-record",
+            "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-runtime-record.json",
+            "sha256": "29072b32c93fb8eb7479858b047465ff514858ee07d99c7fc4fac47102163a8c",
+            "schema_status": "met",
+            "quality_gate_status": "met"
+          },
+          "test_kind": "runtime",
+          "status": "pass",
+          "executed_at": "2026-09-04T23:54:26Z"
+        }
+      ],
+      "status": "pass",
+      "findings": []
+    },
+    {
+      "entry_id": "closure.831814cf042323f928495e987bf94e915e65a6932810188f18991272cd4a2974",
+      "subject_kind": "acceptance_scenario",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "observable_behavior": true,
+      "implementation_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-passing-implementation",
+          "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-implementation.json",
+          "sha256": "2db3484819d8536cd2ebcec15f5ba755dd2e2b790d3402269d0481369e1f09f6",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "review_verdict": "pass",
+      "review_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-passing-qa",
+          "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-qa.json",
+          "sha256": "d8716eff1f3a1bf3a2653e285c01797c0513e9bff1a64a26d52c9d08366eafd8",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "test_evidence": [
+        {
+          "evidence_ref": {
+            "artifact_id": "readable-cto-passing-runtime-record",
+            "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-runtime-record.json",
+            "sha256": "29072b32c93fb8eb7479858b047465ff514858ee07d99c7fc4fac47102163a8c",
+            "schema_status": "met",
+            "quality_gate_status": "met"
+          },
+          "test_kind": "runtime",
+          "status": "pass",
+          "executed_at": "2026-09-04T23:54:26Z"
+        }
+      ],
+      "status": "pass",
+      "findings": []
+    }
+  ],
+  "quality_gate_results": [
+    {
+      "gate_id": "cto-handoff-constitution-binding.readable-cto-passing.handoff.v1",
+      "source": "project_constitution",
+      "status": "pass",
+      "evidence_refs": [],
+      "findings": []
+    }
+  ],
+  "overall_status": "pass",
+  "blocking_findings": [],
+  "next_action": "complete_feature",
+  "conformance_id": "implementation-conformance.7c487e91006505db95790402e21c0094d3ca1218e23fb0bc6f9f389755d5f280",
+  "matrix_digest": "7c487e91006505db95790402e21c0094d3ca1218e23fb0bc6f9f389755d5f280",
+  "evaluated_at": "2026-09-05T00:07:59.652Z"
+}

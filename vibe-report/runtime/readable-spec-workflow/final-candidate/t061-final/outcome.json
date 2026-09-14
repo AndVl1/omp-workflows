@@ -1,0 +1,34 @@
+{
+  "scenario": "T061 runtime: a complete generic bundle reaches exactly one compatibility checkpoint and the shared imported handoff",
+  "command": "OMP_UX_E2E_PRESERVE_ON_FAILURE=1 OMP_UX_E2E_SEMANTIC_TIMEOUT_MS=180000 node --test --import tsx --test-name-pattern=\"T061 runtime: a complete generic bundle reaches exactly one compatibility checkpoint and the shared imported handoff\" packages/e2e/test/spec-import.test.ts",
+  "cwd": ".",
+  "status": "PASS",
+  "tests": {
+    "selected": 1,
+    "passed": 1,
+    "failed": 0,
+    "cancelled": 0,
+    "skipped": 0
+  },
+  "runtime": {
+    "pty": true,
+    "mock": false,
+    "duration_seconds": 189.985,
+    "stop": "test finally closeSession; scratch cleanup completed"
+  },
+  "contract": {
+    "explicit_terminal_approval": true,
+    "compatibility_checkpoints": 1,
+    "native_phase_checkpoints": 0,
+    "workspace_status": "implementation_ready",
+    "handoffs": 1,
+    "handoff_provenance": "native constitution binding plus immutable import snapshot/report",
+    "source_unchanged": true
+  },
+  "evidence": {
+    "raw_test_log": "t061-real-pty.log",
+    "scratch": "removed by cleanupScratchOnCompletion after PASS",
+    "provenance": "ambient isolation and loaded-plugin provenance covered by focused harness tests; final runtime was real PTY, not mock",
+    "child_leak": false
+  }
+}

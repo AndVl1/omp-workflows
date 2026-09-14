@@ -7,15 +7,12 @@
  * default (unlimited), and spend accounting uses the chars/4 heuristic (C1)
  * until a real token-meter `BudgetRecorder` is wired in; dollars stay 0.
  *
- * Persistence mirrors the sibling modules (`decisions.ts`, `leases.ts`,
- * `state.ts` transitions): mutations operate on the passed in-memory
- * `CtoState` and are written to disk via `writeCtoState` ONLY when a `root`
- * is provided (runId derived from `state.id`). With `root` null the function
- * is a pure in-memory transition and returns the mutated state.
+ * Mutations operate on the passed in-memory `CtoState`; persistence belongs to
+ * the caller's trusted runtime transaction.
  */
 
-import type { BudgetPolicy, BudgetState, BudgetStatus, CtoState } from "./types.js";
-import { writeCtoState } from "./state.js";
+import type { BudgetState, BudgetStatus, CtoState } from "./types.js";
+import { isSafeCtoRunId, isSafeBudgetDollar, isSafeBudgetInteger, persistedBudgetValid } from "./state.js";
 import type { ObservabilityEvent } from "../observability/events.js";
 
 /**
@@ -77,30 +74,35 @@ export function checkBudget(state: CtoState, now: number = Date.now()): { status
  * Add spend to the run's accounting: totals (`tokens_estimated`,
  * `dollars_estimated`) and the `per_team[teamId]` entry (created on first
  * spend for the team, `ms` untouched — elapsed is tracked by the health
- * slice, br-zps.7). Persists when `root` is given, in-memory otherwise.
+ * slice, br-zps.7). The transition performs no persistence.
  */
-export function recordSpend(state: CtoState, teamId: string, tokens: number, dollars: number, root: string | null = null): CtoState {
-  if (!state.budget) state.budget = defaultBudgetState();
-  const accounting = state.budget.accounting;
-  accounting.tokens_estimated += tokens;
-  accounting.dollars_estimated += dollars;
-  const entry = accounting.per_team[teamId] ?? { tokens: 0, dollars: 0, ms: 0 };
-  entry.tokens += tokens;
-  entry.dollars += dollars;
-  accounting.per_team[teamId] = entry;
-  if (root) writeCtoState(state, root);
-  return state;
-}
-
-/**
- * Shallow-merge a partial policy over the existing one, preserving unset
- * fields (lead decision, architecture §4.2). Persists when `root` is given,
- * in-memory otherwise.
- */
-export function setBudgetPolicy(state: CtoState, policy: Partial<BudgetPolicy>, root: string | null = null): CtoState {
-  if (!state.budget) state.budget = defaultBudgetState();
-  state.budget.policy = { ...state.budget.policy, ...policy };
-  if (root) writeCtoState(state, root);
+export function recordSpend(state: CtoState, teamId: string, tokens: number, dollars: number): CtoState {
+  if (!isSafeCtoRunId(teamId)) throw new Error("recordSpend: invalid team id");
+  if (!isSafeBudgetInteger(tokens) || !isSafeBudgetDollar(dollars)) throw new Error("recordSpend: spend values are invalid");
+  const apply = (current: CtoState): void => {
+    const budget = current.budget ?? defaultBudgetState();
+    if (!persistedBudgetValid(budget)) throw new Error("recordSpend: current budget is invalid");
+    const existing = budget.accounting.per_team[teamId] ?? { tokens: 0, dollars: 0, ms: 0 };
+    const nextBudget: BudgetState = {
+      ...budget,
+      accounting: {
+        ...budget.accounting,
+        tokens_estimated: budget.accounting.tokens_estimated + tokens,
+        dollars_estimated: budget.accounting.dollars_estimated + dollars,
+        per_team: {
+          ...budget.accounting.per_team,
+          [teamId]: {
+            tokens: existing.tokens + tokens,
+            dollars: existing.dollars + dollars,
+            ms: existing.ms,
+          },
+        },
+      },
+    };
+    if (!persistedBudgetValid(nextBudget)) throw new Error("recordSpend: spend exceeds persisted budget bounds");
+    current.budget = nextBudget;
+  };
+  apply(state);
   return state;
 }
 

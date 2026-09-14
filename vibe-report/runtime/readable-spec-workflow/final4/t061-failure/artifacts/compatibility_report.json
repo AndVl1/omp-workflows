@@ -1,0 +1,81 @@
+{
+  "report_id": "compatibility.bf51e219336c71fb11a1d5032a0db82f1b29f6efe25bcc0ed7d400dbc9bbff4d",
+  "snapshot_ref": "import.ceca4b644bd37cb4a9ccbb2167e63222ee4580b228416aa1b9b8c97632dfb490",
+  "constitution_binding": {
+    "provider_id": "native",
+    "path": "CONSTITUTION.md",
+    "version": "0.0.0",
+    "content_sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+    "semantic_hash": "35ce12b619924ee68ab11046b5ac497392f2615526e791d52482d5c5257714af",
+    "validation_ref": "constitution.validation.8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+    "bound_at": "2026-09-02T19:46:57.084Z"
+  },
+  "status": "ready",
+  "mapping": [
+    {
+      "source_ref": "imported/payment-retry/decisions.md",
+      "contract_subject": "decision",
+      "subject_id": "D-101"
+    },
+    {
+      "source_ref": "imported/payment-retry/decisions.md",
+      "contract_subject": "decision",
+      "subject_id": "D-102"
+    },
+    {
+      "source_ref": "imported/payment-retry/decisions.md",
+      "contract_subject": "decision",
+      "subject_id": "D-103"
+    },
+    {
+      "source_ref": "imported/payment-retry/requirements.md",
+      "contract_subject": "requirement",
+      "subject_id": "FR-101"
+    },
+    {
+      "source_ref": "imported/payment-retry/requirements.md",
+      "contract_subject": "requirement",
+      "subject_id": "FR-102"
+    },
+    {
+      "source_ref": "imported/payment-retry/requirements.md",
+      "contract_subject": "requirement",
+      "subject_id": "FR-103"
+    },
+    {
+      "source_ref": "imported/payment-retry/requirements.md",
+      "contract_subject": "verification",
+      "subject_id": "FR-101"
+    },
+    {
+      "source_ref": "imported/payment-retry/requirements.md",
+      "contract_subject": "verification",
+      "subject_id": "FR-102"
+    },
+    {
+      "source_ref": "imported/payment-retry/requirements.md",
+      "contract_subject": "verification",
+      "subject_id": "FR-103"
+    },
+    {
+      "source_ref": "imported/payment-retry/tasks.md",
+      "contract_subject": "task",
+      "subject_id": "T-101"
+    },
+    {
+      "source_ref": "imported/payment-retry/tasks.md",
+      "contract_subject": "task",
+      "subject_id": "T-102"
+    },
+    {
+      "source_ref": "imported/payment-retry/tasks.md",
+      "contract_subject": "task",
+      "subject_id": "T-103"
+    }
+  ],
+  "blocking_findings": [],
+  "warnings": [],
+  "ignored_content": [],
+  "supplement_ref": null,
+  "evaluated_at": "2026-09-02T19:46:49.644Z"
+}

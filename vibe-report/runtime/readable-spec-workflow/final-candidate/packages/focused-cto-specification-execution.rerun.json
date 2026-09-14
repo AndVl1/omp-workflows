@@ -1,0 +1,21 @@
+{
+  "label": "focused-cto-specification-execution-rerun",
+  "command": "node --test --import tsx --test-concurrency=1 test/cto-specification-execution.test.ts",
+  "cwd": "packages/core",
+  "started_at_utc": "2026-09-11T19:15:51.912Z",
+  "ended_at_utc": "2026-09-11T19:20:24.001Z",
+  "duration_ms": 272082,
+  "exit_code": 1,
+  "sha256": "f781792095b54eb1b2c6ff56e5e7d74d74efabc4f4ae22be500a1b087c000619",
+  "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/focused-cto-specification-execution.rerun.log",
+  "counts": {
+    "log_bytes": 47695,
+    "log_lines": 883,
+    "tests": 102,
+    "passed": 60,
+    "failed": 42,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0
+  }
+}

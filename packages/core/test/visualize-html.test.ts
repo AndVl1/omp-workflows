@@ -176,7 +176,7 @@ test("html: hub with no sessions renders an explicit empty state", () => {
 
 // ── Session page: structure, anchors, sections ───────────────────────────────
 
-test("html: session page has overview, TOC, stable anchors and all semantic sections", () => {
+test("html: session page has overview, TOC, stable anchors, standard sections and Tasks", () => {
   const session = buildExpectedSpecPreparationSession();
   const html = renderSessionHtml(session, { scope: "all" });
   assert.equal(renderSessionHtml(session, { scope: "all" }), html, "identical inputs must produce byte-identical session HTML");
@@ -194,10 +194,10 @@ test("html: session page has overview, TOC, stable anchors and all semantic sect
   }
   assert.equal(ids.size, collectIdsAndHrefs(html).ids.length, "no duplicate ids in the session page");
 
-  // Semantic sections: requirements, decisions, architecture, tasks.
+  // Standard sections plus the Tasks section; obsolete requirements, decisions and architecture are not emitted.
   assert.ok(ids.has("overview") && ids.has("stages") && ids.has("status-details"));
-  assert.ok(ids.has("requirements") && ids.has("decisions") && ids.has("architecture") && ids.has("tasks"));
-
+  assert.ok(ids.has("tasks"));
+  assert.ok(!ids.has("requirements") && !ids.has("decisions") && !ids.has("architecture"));
   // Overview content: task, workflow, stage progress, provenance.
   assert.ok(html.includes("Visualize workflow specs"));
   assert.ok(html.includes("spec-preparation"));
@@ -208,7 +208,7 @@ test("html: session page has overview, TOC, stable anchors and all semantic sect
 
   // TOC links exactly the emitted sections; all resolve in-page.
   const toc = tocHrefs(html);
-  assert.ok(toc.length >= 7, "TOC lists overview, stages, sections and status details");
+  assert.ok(toc.length >= 5, "TOC lists overview, stages, tasks, artifacts and status details");
   for (const href of toc) {
     assert.ok(href.startsWith("#"), "TOC navigation is static fragment navigation");
     assert.ok(ids.has(href.slice(1)), `TOC target ${href} exists`);

@@ -1,0 +1,111 @@
+{
+  "schema_version": "1.0",
+  "feature_id": "readable-cto-passing",
+  "handoff_id": "readable-cto-passing.handoff.v1",
+  "handoff_digest": "7644909b7d17135edef84221f57709f0cff3d853e11fa51500c0ee2aa02c9ab7",
+  "execution_claim_id": "claim-b6630cc0c3b4564702f310e9bc8993e8",
+  "execution_owner": "cto",
+  "execution_run_id": "readable-cto-exec-wave-01a06e95",
+  "profile_hash": "4410dbc9f79aa780862e28b53905cccc9f963c375c2c5f0c6d170f03b2f135b5",
+  "entries": [
+    {
+      "entry_id": "closure.e0f2ee737b4ccc990dd6d3743bb9b316120f8ff4253efac771bd5c31d6cd6e04",
+      "subject_kind": "requirement",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "observable_behavior": true,
+      "implementation_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-passing-implementation-conformance.v1",
+          "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-implementation-conformance.v1.json",
+          "sha256": "152a159ad6d0d093a79ea304c4a406aefe71310ce5e898f64ff2479d51915383",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "review_verdict": "pass",
+      "review_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-passing-qa-runtime-support.v1",
+          "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-qa-runtime-support.v1.json",
+          "sha256": "5711f18921538942fe87f01c939124afda6efad89bb4c460ec0c808f327006ef",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "test_evidence": [
+        {
+          "evidence_ref": {
+            "artifact_id": "readable-cto-passing-qa-runtime-support.v1",
+            "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-qa-runtime-support.v1.json",
+            "sha256": "5711f18921538942fe87f01c939124afda6efad89bb4c460ec0c808f327006ef",
+            "schema_status": "met",
+            "quality_gate_status": "met"
+          },
+          "test_kind": "runtime",
+          "status": "pass",
+          "executed_at": "2026-09-05T00:00:00.000Z"
+        }
+      ],
+      "status": "pass",
+      "findings": []
+    },
+    {
+      "entry_id": "closure.831814cf042323f928495e987bf94e915e65a6932810188f18991272cd4a2974",
+      "subject_kind": "acceptance_scenario",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "observable_behavior": true,
+      "implementation_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-passing-implementation-conformance.v1",
+          "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-implementation-conformance.v1.json",
+          "sha256": "152a159ad6d0d093a79ea304c4a406aefe71310ce5e898f64ff2479d51915383",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "review_verdict": "pass",
+      "review_evidence_refs": [
+        {
+          "artifact_id": "readable-cto-passing-qa-runtime-support.v1",
+          "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-qa-runtime-support.v1.json",
+          "sha256": "5711f18921538942fe87f01c939124afda6efad89bb4c460ec0c808f327006ef",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        }
+      ],
+      "test_evidence": [
+        {
+          "evidence_ref": {
+            "artifact_id": "readable-cto-passing-qa-runtime-support.v1",
+            "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-qa-runtime-support.v1.json",
+            "sha256": "5711f18921538942fe87f01c939124afda6efad89bb4c460ec0c808f327006ef",
+            "schema_status": "met",
+            "quality_gate_status": "met"
+          },
+          "test_kind": "runtime",
+          "status": "pass",
+          "executed_at": "2026-09-05T00:00:00.000Z"
+        }
+      ],
+      "status": "pass",
+      "findings": []
+    }
+  ],
+  "quality_gate_results": [
+    {
+      "gate_id": "cto-handoff-constitution-binding.readable-cto-passing.handoff.v1",
+      "source": "project_constitution",
+      "status": "pass",
+      "evidence_refs": [],
+      "findings": []
+    }
+  ],
+  "overall_status": "pass",
+  "blocking_findings": [],
+  "next_action": "complete_feature",
+  "conformance_id": "implementation-conformance.697f58b0cbcf38f110b4809f41c8e39f7d60fb2d84a74b7b85e9f3120bcafe4a",
+  "matrix_digest": "697f58b0cbcf38f110b4809f41c8e39f7d60fb2d84a74b7b85e9f3120bcafe4a",
+  "evaluated_at": "2026-09-04T23:26:50.561Z"
+}

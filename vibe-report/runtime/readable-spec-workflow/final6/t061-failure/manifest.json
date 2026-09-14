@@ -1,0 +1,62 @@
+{
+  "test": "T061 runtime: a complete generic bundle reaches exactly one compatibility checkpoint and the shared imported handoff",
+  "command": "OMP_UX_E2E_SEMANTIC_TIMEOUT_MS=900000 OMP_UX_E2E_PRESERVE_ON_FAILURE=1 node --test --import tsx --test-name-pattern='complete generic bundle' test/spec-import.test.ts",
+  "result": "FAIL",
+  "duration_seconds": 903.91,
+  "failure": "waitFor timed out after 900000ms (complete bundle compatibility intake semantic readiness)",
+  "scratch_parent": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-RlYhl1",
+  "scratch_root": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-complete-RlYhl1/omp-spec-e2e-complete",
+  "final_stage_cursor": "compatibility_approval",
+  "stage_status": {
+    "import": "done",
+    "constitution": "done",
+    "compatibility": "done",
+    "compatibility_approval": "in_progress",
+    "handoff": "pending"
+  },
+  "workspace_status": "in_progress",
+  "handoff_ref": null,
+  "implementation_ready": false,
+  "selected_ask": {
+    "feature_id": "imported-payment-retry",
+    "run_key": "import-a64504be-b4de-4acc-bc2c-c1664b429c68",
+    "snapshot_id": "import.65ee6ffa4e925d6c6a4f1f442e4d54892cf0a2a7f53dd82f8285719839542218",
+    "source_sha256": "8741a468b5a854d7d5643fc9ead3741f9b2a1891ac550888fdeeab95e3f32c8b",
+    "normalized_hash": "c6b0bb333da1f72c597d15b7c5a3a08872eea8406a5878c590ffc7ea4c59cefa",
+    "constitution_content_sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+    "compatibility_report_id": "compatibility.ed03e50b8d113178c6c73603289e27c5141652f74e41861b90c1fef6699025d9",
+    "capability_id": "63cb29f1-87c9-40da-a4a6-742ddc790fe3",
+    "advance_token": "e3e8ae76-dcf1-443b-a05b-4b03f31bf8ff",
+    "loop_iteration": 1
+  },
+  "selected_ask_result": {
+    "ok": false,
+    "code": "WORKFLOW_CHECKPOINT_ASK_REJECTED",
+    "error": "selected checkpoint identity fields must be bounded line-inert strings"
+  },
+  "successful_calls": {
+    "workflow_checkpoint_ask_selected": false,
+    "workflow_checkpoint": false,
+    "workflow_advance": false,
+    "workflow_finalize_import_handoff": false
+  },
+  "source_unchanged": true,
+  "source_hash_evidence": "source-after-sha256.txt matches import_snapshot.json files[]",
+  "handoff_markdown": false,
+  "model_final_text": null,
+  "session": {
+    "pid": 39102,
+    "stop_command_result": "ux-e2e stop: session pid 39102 is not running",
+    "ps_confirmed_absent": true
+  },
+  "evidence": {
+    "transcript": "transcript.jsonl",
+    "agent_session": "agent.jsonl",
+    "state": "state.json",
+    "events": "events.jsonl",
+    "selected_ask_payload": "selected-ask-payload.txt",
+    "selected_ask_result": "selected-ask-result.txt",
+    "source_hashes": "source-after-sha256.txt",
+    "stop_log": "../t061-stop.log"
+  }
+}

@@ -1,0 +1,117 @@
+{
+  "validation": "readable-spec-workflow-final-candidate",
+  "scope": "settled-fullstack-and-internal-packages",
+  "generated_at_utc": "2026-09-10T07:13:26Z",
+  "commands": [
+    {
+      "package": "@andvl1/omp-workflows-fullstack@0.27.0",
+      "command": "npm run test -w @andvl1/omp-workflows-fullstack",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/settled-fullstack-test.log",
+      "started_at_utc": "2026-09-10T07:07:36Z",
+      "ended_at_utc": "2026-09-10T07:10:33Z",
+      "exit_code": 1,
+      "status": "failed",
+      "sha256": "3d390fb5148ae83fd9b9f04a467bb941e09c7adcd9b9cb931a4e16d7b06124e1",
+      "counts": {
+        "log_lines": 683,
+        "log_bytes": 61672,
+        "tests": 621,
+        "passed": 619,
+        "failed": 2,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      },
+      "failures": [
+        "test/native-start-mapping.test.ts: fullstack native start waits for the fresh mapping and binds the mapped worker",
+        "test/workflow-tools.test.ts: fullstack: workflow_begin exposes role-bound dispatch markers"
+      ]
+    },
+    {
+      "package": "@andvl1/omp-workflows-fullstack@0.27.0",
+      "command": "npm run typecheck -w @andvl1/omp-workflows-fullstack",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/settled-fullstack-typecheck.log",
+      "started_at_utc": "2026-09-10T07:11:07Z",
+      "ended_at_utc": "2026-09-10T07:11:10Z",
+      "exit_code": 0,
+      "status": "passed",
+      "sha256": "9c21ebd2afde0b6ef3dfee88eb4ca6724b6947001e75f3970edb9f327d841154",
+      "counts": {
+        "log_lines": 9,
+        "log_bytes": 253
+      }
+    },
+    {
+      "package": "@andvl1/omp-workflows-fullstack@0.27.0",
+      "command": "npm run build -w @andvl1/omp-workflows-fullstack",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/settled-fullstack-build.log",
+      "started_at_utc": "2026-09-10T07:11:37Z",
+      "ended_at_utc": "2026-09-10T07:11:39Z",
+      "exit_code": 0,
+      "status": "passed",
+      "sha256": "e304e953bdf35d53fb1aa9e9e829337457fdb13c8f3824d27ecb91d635bb828d",
+      "counts": {
+        "log_lines": 9,
+        "log_bytes": 194
+      }
+    },
+    {
+      "package": "@andvl1/omp-workflows-internal@0.0.0",
+      "command": "npm run test -w @andvl1/omp-workflows-internal",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/settled-internal-test.log",
+      "started_at_utc": "2026-09-10T07:09:02Z",
+      "ended_at_utc": "2026-09-10T07:09:13Z",
+      "exit_code": 0,
+      "status": "passed",
+      "sha256": "c8f8bbc8695a406069cd8c462b3cdb408bf703e7eea5dd3a2415d1d4a42792e1",
+      "counts": {
+        "log_lines": 106,
+        "log_bytes": 9889,
+        "tests": 80,
+        "passed": 80,
+        "failed": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      }
+    },
+    {
+      "package": "@andvl1/omp-workflows-internal@0.0.0",
+      "command": "npm run typecheck -w @andvl1/omp-workflows-internal",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/settled-internal-typecheck.log",
+      "started_at_utc": "2026-09-10T07:11:26Z",
+      "ended_at_utc": "2026-09-10T07:11:27Z",
+      "exit_code": 0,
+      "status": "passed",
+      "sha256": "ff8f14318f20e327f0c283f46869ccd7e4299e0cc6c0efc78a664bab87f6ea16",
+      "counts": {
+        "log_lines": 9,
+        "log_bytes": 208
+      }
+    },
+    {
+      "package": "@andvl1/omp-workflows-internal@0.0.0",
+      "command": "npm run build -w @andvl1/omp-workflows-internal",
+      "log": "vibe-report/runtime/readable-spec-workflow/final-candidate/packages/settled-internal-build.log",
+      "started_at_utc": "2026-09-10T07:11:49Z",
+      "ended_at_utc": "2026-09-10T07:11:50Z",
+      "exit_code": 0,
+      "status": "passed",
+      "sha256": "e27e52fced321aa7a9b55ca1ca11f65818c92d977eab82b32c64db5d8d9913c6",
+      "counts": {
+        "log_lines": 9,
+        "log_bytes": 191
+      }
+    }
+  ],
+  "summary": {
+    "commands": 6,
+    "passed": 5,
+    "failed": 1,
+    "test_cases": 701,
+    "test_passed": 699,
+    "test_failed": 2,
+    "typecheck_passed": 2,
+    "build_passed": 2
+  }
+}

@@ -10,19 +10,16 @@
 
 ### PHASE 6.8: AUTOMATED TESTS — encode observed behavior as regression tests
 
-**Why sequenced (v3.0):** tests are written **after** manual QA so they encode what was actually
-observed working (`manual_qa.evidence`), not a guess made against unverified code. A
-`CONDITIONAL` manual-qa verdict allows deterministic regression tests to proceed, but does not
-prove the live acceptance criteria that an explicit capability, credential, or configuration
-blocker made unobservable. This is the last runtime stage before summary.
+**Why sequenced:** tests run in an independent QA stage after implementation and any review fixes. QA may consume implementation, review, and manual-QA reports as context, but those worker attestations never prove the test gate.
 
-**Gate** (`manual_qa.verdict != FAIL || !scope.has_runtime`): write/accept tests when manual QA
-passed or is `CONDITIONAL` with runtime evidence. If there is no runtime (`!scope.has_runtime`),
-manual_qa is skipped and the fallback remains valid. A `FAIL` verdict while runtime exists, or a
-missing/unknown manual_qa verdict while runtime exists, never passes this gate.
+**Gate** (`qa_reported_pass`): the canonical `qa_tests` artifact must report
+`build_status: "pass"`. A missing artifact, `fail`, or `n/a` status blocks the
+workflow; there is no runtime or manual-QA fallback.
 
-**Input**: `manual_qa` (evidence + verdict + any `blocked_prerequisites`) when present, plus
-`implementation` / `architecture`.
+**Input**: implementation/review-fix reports and `manual_qa` when present. These
+reports are informational worker attestations only. The QA worker chooses the
+project-specific test commands from the repository and records the result in
+the canonical artifact; the profile must not guess a package-manager command.
 
 **Actions**:
 

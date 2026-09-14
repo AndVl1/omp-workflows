@@ -1,0 +1,41 @@
+id: 2026-08-31T09-48-39-security
+parent: null
+agent: security
+timestamp: "2026-08-31T09:48:39.069Z"
+status: completed
+
+context:
+  task: "Repair artifact-contract materialization behavior failures from artifact://89."
+  phase: "foundation-contracts"
+
+output:
+  summary: "Restored secure materialization into missing in-project directories with deepest-existing-ancestor projection, post-mkdir realpath containment, explicit symlink rejection, and the canonical conformance fixture import."
+  vulnerabilities:
+    status: "not_assessed; this was a bounded behavioral remediation, not a vulnerability audit"
+  cargo_deny:
+    status: not_run
+    note: "Dependency auditing was outside this slice and validation commands were prohibited."
+  dependencies:
+    status: unchanged
+    actions: []
+  unsafe_blocks:
+    total: 0
+    reviewed: 0
+    approved: 0
+    needs_refactor: 0
+  issues: []
+  files:
+    - packages/core/src/specification/materialize.ts
+    - packages/core/test/specification-artifact-contract.test.ts
+    - .work-state/artifacts/sdd-foundation/materialize-behavior-remediation.json
+  validation:
+    run: false
+    note: "No validation commands were run by explicit slice contract; edited sections were read back."
+
+next:
+  agent: null
+  task: "CTO-owned combined validation after the parallel foundation workers settle."
+  priority: high
+  acceptance_criteria:
+    - "Artifact-contract focused suite passes in combined validation."
+    - "Normal missing-directory materialization succeeds and symlink escapes remain fail-closed."

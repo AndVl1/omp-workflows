@@ -27,21 +27,25 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { PinnedProjectRoot, PinnedRootError } from "../specification/pinned-root.js";
 
-import { readDoDFileSafe, type DodSafeFileRead, resolveDodPath } from "../engine/dod.js";
+import { isSafeStateSegment } from "../engine/state.js";
 import { loadProfile } from "../engine/profile.js";
 import { resolveConfig, resolveAgentForRole } from "../engine/config.js";
 import type { Profile, RoleConfig, StageDef, StageStatus, TeamState } from "../engine/types.js";
+import { resolveDodPath, type DodSafeFileRead } from "../engine/dod.js";
 import { assessRunHealth } from "../cto/health.js";
 import { loadTeamDefs } from "../cto/plan.js";
 import type { CtoState, RunHealth, TeamDef, TeamRunStatus } from "../cto/types.js";
-import { readObservabilityPointer } from "../observability/recorder.js";
+import { rollupFromEvents } from "../observability/recorder.js";
 import type { ObservabilityEvent, ObservabilityPointer } from "../observability/events.js";
-import { redactReportBody } from "./redact.js";
+import { MAX_ARTIFACT_AGGREGATE_BYTES } from "../engine/artifacts.js";
+import { redactReportBody, truncateUtf8 } from "./redact.js";
 import {
   resolveCtoSource,
   resolveDoWorkSource,
   TEAM_ARTIFACTS_DIR,
+  FEATURES_DIR,
   WORK_STATE_DIR,
 } from "./session-source.js";
 import type {
@@ -65,9 +69,62 @@ import type {
 // Session-source layout constants and resolution live in session-source.ts
 // (single source of truth for feature/legacy/CTO discovery — architecture-2).
 const DEFAULT_MAX_ARTIFACT_BYTES = 16 * 1024;
+export const MIN_REPORT_ARTIFACT_BYTES = 1;
+export const MAX_REPORT_ARTIFACT_BYTES = 8 * 1024 * 1024;
 const MAX_EVENT_BYTES = 2 * 1024 * 1024;
 const MAX_EVENT_LINES = 5000;
+const MAX_PINNED_ARTIFACT_BYTES = MAX_REPORT_ARTIFACT_BYTES;
+const MAX_PINNED_EVENT_BYTES = 8 * 1024 * 1024;
 const SUMMARY_CAP_FACTOR = 4;
+
+const REPORT_HTML_SHELL_BUDGET_BYTES = 4 * 1024 * 1024;
+const REPORT_HTML_ESCAPED_COPY_FACTOR = 7;
+
+/**
+ * Hard UTF-8 ceiling for a persisted report document.
+ *
+ * Canonical artifact writers bound one artifact set to
+ * `MAX_ARTIFACT_AGGREGATE_BYTES` (8 MiB).  The renderer can represent
+ * sanitized artifact content twice (the escaped `<pre>` and the JSON data
+ * island), with a conservative sevenfold UTF-8/escaping allowance.  A 4 MiB
+ * allowance covers the fixed shell and bounded graph / metadata, yielding a
+ * 60 MiB canonical-input budget.  The cap is rounded up to the pinned
+ * writer's 64 MiB atomic-write ceiling; documents beyond it fail before any
+ * filesystem mutation rather than being silently truncated.
+ */
+export const MAX_REPORT_HTML_BYTES = Math.max(
+  64 * 1024 * 1024,
+  REPORT_HTML_SHELL_BUDGET_BYTES + MAX_ARTIFACT_AGGREGATE_BYTES * REPORT_HTML_ESCAPED_COPY_FACTOR,
+);
+
+/** Stable fail-closed error raised before a report target is touched. */
+export class ReportHtmlLimitError extends Error {
+  readonly code = "REPORT_HTML_TOO_LARGE" as const;
+  readonly byteLength: number;
+  readonly maxBytes = MAX_REPORT_HTML_BYTES;
+
+  constructor(byteLength: number) {
+    super(
+      `writeReport: report HTML exceeds ${MAX_REPORT_HTML_BYTES} UTF-8 bytes (actual ${byteLength}); code=REPORT_HTML_TOO_LARGE`,
+    );
+    this.name = "ReportHtmlLimitError";
+    this.byteLength = byteLength;
+  }
+}
+
+function assertReportHtmlWithinLimit(html: string): void {
+  const byteLength = Buffer.byteLength(html, "utf8");
+  if (byteLength > MAX_REPORT_HTML_BYTES) throw new ReportHtmlLimitError(byteLength);
+}
+function pinnedRegularRelative(pin: PinnedProjectRoot, filePath: string): string | null {
+  const relativePath = pin.relativePath(filePath);
+  if (!relativePath) return null;
+  try {
+    return pin.pathEntryInfo(relativePath)?.kind === "file" ? relativePath : null;
+  } catch {
+    return null;
+  }
+}
 
 // ── Session selection ───────────────────────────────────────────────────────
 
@@ -90,28 +147,24 @@ interface CtoResolved {
 }
 
 /** Resolve a do-work TeamState; null when not found (id probe or empty work-state). */
-function resolveDoWork(cwd: string, id?: string): DoWorkResolved | null {
-  // Delegated: deterministic feature/legacy/latest discovery with the exact
-  // report selectors lives in session-source.ts (architecture-2).
-  return resolveDoWorkSource(cwd, id);
+function resolveDoWork(cwd: string, id: string | undefined, pin: PinnedProjectRoot): DoWorkResolved | null {
+  return resolveDoWorkSource(cwd, id, pin);
 }
 
 /** Resolve a CTO run; null when not found (id probe or no runs). */
-function resolveCto(cwd: string, id?: string): CtoResolved | null {
-  // Delegated: deterministic JSON-first/markdown-fallback discovery with the
-  // exact report selectors lives in session-source.ts (architecture-2).
-  return resolveCtoSource(cwd, id);
+function resolveCto(cwd: string, id: string | undefined, pin: PinnedProjectRoot): CtoResolved | null {
+  return resolveCtoSource(cwd, id, pin);
 }
 
 /** Auto-detect: the newest of the best do-work state and best CTO run. */
-function guessKind(cwd: string, id?: string): SessionKind {
+function guessKind(cwd: string, id: string | undefined, pin: PinnedProjectRoot): SessionKind {
   if (id) {
-    if (resolveDoWork(cwd, id)) return "do-work";
-    if (resolveCto(cwd, id)) return "cto";
+    if (resolveDoWork(cwd, id, pin)) return "do-work";
+    if (resolveCto(cwd, id, pin)) return "cto";
     throw new Error(`no do-work or cto session found for id "${id}" under ${resolve(cwd, WORK_STATE_DIR)}`);
   }
-  const dw = resolveDoWork(cwd);
-  const cto = resolveCto(cwd);
+  const dw = resolveDoWork(cwd, undefined, pin);
+  const cto = resolveCto(cwd, undefined, pin);
   if (dw && cto) return cto.state.updated_at > dw.state.updated_at ? "cto" : "do-work";
   if (dw) return "do-work";
   if (cto) return "cto";
@@ -120,26 +173,54 @@ function guessKind(cwd: string, id?: string): SessionKind {
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
+function validateReportOptions(options: BuildSessionReportOptions): void {
+  const value = options.maxArtifactBytes;
+  if (value === undefined) return;
+  if (!Number.isSafeInteger(value) || value < MIN_REPORT_ARTIFACT_BYTES || value > MAX_REPORT_ARTIFACT_BYTES) {
+    throw new TypeError(
+      `maxArtifactBytes must be an integer between ${MIN_REPORT_ARTIFACT_BYTES} and ${MAX_REPORT_ARTIFACT_BYTES}`,
+    );
+  }
+}
+
+export function buildSessionReportPinned(
+  cwd: string,
+  selector: SessionSelector = {},
+  options: BuildSessionReportOptions = {},
+  pin: PinnedProjectRoot,
+): SessionReport {
+  if (resolve(cwd) !== pin.lexical_root) throw new Error("project root pin does not match report cwd");
+  validateReportOptions(options);
+  const kind = selector.kind ?? guessKind(cwd, selector.id, pin);
+  if (kind === "cto") {
+    const run = resolveCto(cwd, selector.id, pin);
+    if (!run) {
+      const id = selector.id ?? "latest";
+      throw new Error(`cto session "${id}" not found (no state.json and no markdown fallback)`);
+    }
+    return assembleCto(cwd, run, options, pin);
+  }
+  const dw = resolveDoWork(cwd, selector.id, pin);
+  if (!dw) {
+    const id = selector.id ?? "latest";
+    throw new Error(`do-work session "${id}" not found (no per-feature or legacy state.json)`);
+  }
+  return assembleDoWork(cwd, dw, options, pin);
+}
+
 export function buildSessionReport(
   cwd: string,
   selector: SessionSelector = {},
   options: BuildSessionReportOptions = {},
 ): SessionReport {
-  const kind = selector.kind ?? guessKind(cwd, selector.id);
-  if (kind === "cto") {
-    const run = resolveCto(cwd, selector.id);
-    if (!run) {
-      const id = selector.id ?? "latest";
-      throw new Error(`cto session "${id}" not found (no state.json and no markdown fallback)`);
-    }
-    return assembleCto(cwd, run, options);
+  validateReportOptions(options);
+  const pin = PinnedProjectRoot.open(cwd);
+  if (!pin) throw new Error("project root cannot be pinned for report read");
+  try {
+    return buildSessionReportPinned(cwd, selector, options, pin);
+  } finally {
+    pin.close();
   }
-  const dw = resolveDoWork(cwd, selector.id);
-  if (!dw) {
-    const id = selector.id ?? "latest";
-    throw new Error(`do-work session "${id}" not found (no per-feature or legacy state.json)`);
-  }
-  return assembleDoWork(cwd, dw, options);
 }
 
 // ── Stage provenance (agents / inputs / outputs) ────────────────────────────
@@ -283,8 +364,7 @@ function teamLeadAgents(teamId: string, teamDefs: Map<string, TeamDef>): StageAg
 }
 
 // ── do-work assembly ────────────────────────────────────────────────────────
-
-function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionReportOptions): SessionReport {
+function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionReportOptions, pin: PinnedProjectRoot): SessionReport {
   const warnings: string[] = [];
   const state = r.state;
   const profile = loadProfile(state.classification.workflow);
@@ -292,7 +372,7 @@ function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionRep
   if (profile) for (const s of profile.stages) stageDefs.set(s.id, s);
   const config = resolveConfig(cwd);
 
-  const { telemetry, events } = doWorkTelemetry(cwd, r, warnings);
+  const { telemetry, events } = doWorkTelemetry(cwd, r, warnings, pin);
   const stageEventTimes = latestTransitionTimes(events, (e) => e.stageId);
   const artifactEventTimes = latestTransitionTimes(events, (e) => e.artifactId);
 
@@ -308,7 +388,7 @@ function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionRep
   const pushArtifact = (input: ArtifactInput) => {
     if (builtIds.has(input.id)) return;
     builtIds.add(input.id);
-    const art = buildArtifact(input, options, warnings);
+    const art = buildArtifact(input, options, warnings, pin);
     artifacts.push(art);
     if (art.mtime) artifactMtimes.set(input.id, art.mtime);
   };
@@ -320,22 +400,20 @@ function assembleDoWork(cwd: string, r: DoWorkResolved, options: BuildSessionRep
       id: artifactId,
       owner: ownerStage,
       filePath,
-      status: !filePath || !existsSync(filePath) ? (stageStatus === "skipped" ? "skipped" : "missing") : "produced",
+      status: !filePath || pinnedRegularRelative(pin, filePath) === null ? (stageStatus === "skipped" ? "skipped" : "missing") : "produced",
     });
   }
   // Undeclared artifacts agents wrote directly (honest extras).
-  if (existsSync(r.artifactsDir)) {
+  const artifactsRelative = pin.relativePath(r.artifactsDir);
+  if (artifactsRelative && pin.pathEntryInfo(artifactsRelative)?.kind === "directory") {
     try {
-      for (const file of readdirSync(r.artifactsDir)) {
+      for (const file of pin.listDirectory(artifactsRelative, { maxEntries: 4096, maxNameBytes: 512 * 1024 })) {
         if (!file.endsWith(".json")) continue;
         const artifactId = file.replace(/\.json$/, "");
         if (declaredProduces.has(artifactId)) continue;
-        pushArtifact({
-          id: artifactId,
-          owner: "extra",
-          filePath: join(r.artifactsDir, file),
-          status: "produced",
-        });
+        const filePath = join(r.artifactsDir, file);
+        if (pinnedRegularRelative(pin, filePath) === null) continue;
+        pushArtifact({ id: artifactId, owner: "extra", filePath, status: "produced" });
       }
     } catch {
       warnings.push(`artifacts dir unreadable: ${r.artifactsDir}`);
@@ -455,7 +533,7 @@ function doWorkEdges(state: TeamState, profile: Profile | null): SessionEdge[] {
 
 // ── CTO assembly ────────────────────────────────────────────────────────────
 
-function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOptions): SessionReport {
+function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOptions, pin: PinnedProjectRoot): SessionReport {
   const warnings: string[] = [];
   const state = r.state;
   const profile = loadProfile("cto");
@@ -464,7 +542,7 @@ function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOpt
   const config = resolveConfig(cwd);
   const teamDefs = new Map(loadTeamDefs(cwd).map((d) => [d.id, d]));
 
-  const { telemetry, events } = ctoTelemetry(cwd, r, warnings);
+  const { telemetry, events } = ctoTelemetry(cwd, r, warnings, pin);
   const teamIds = new Set(state.teams.map((t) => t.id));
   const relevant = events.filter(
     (e) => e.runId === r.id || (e.runId === undefined && teamIds.has(e.stageId ?? "")),
@@ -524,7 +602,7 @@ function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOpt
 
   const edges = ctoEdges(state, profile);
 
-  const { artifacts, artifactMtimes } = ctoArtifacts(cwd, state, options, warnings);
+  const { artifacts, artifactMtimes } = ctoArtifacts(cwd, state, options, warnings, pin);
 
   const meta: ReportMeta = {
     title: taskTitle(state.task, null),
@@ -651,6 +729,7 @@ function ctoArtifacts(
   state: CtoState,
   options: BuildSessionReportOptions,
   warnings: string[],
+  pin: PinnedProjectRoot,
 ): { artifacts: ReportArtifact[]; artifactMtimes: Map<string, string> } {
   const artifacts: ReportArtifact[] = [];
   const artifactMtimes = new Map<string, string>();
@@ -664,31 +743,32 @@ function ctoArtifacts(
     const canonical = resolveDodPath(cwd, team.dod_path, team.id);
     if (!canonical.ok) {
       warnings.push(`team ${team.id} dod_path unusable: ${canonical.reason}`);
-      seen.add(`${team.id}/dod`); // fail closed: no generic pathname fallback
+      seen.add(`${team.id}/dod`);
     } else {
-      const read = readDoDFileSafe(cwd, canonical.file);
-      if (!read.ok) {
-        if (read.kind !== "missing") {
-          warnings.push(`artifact dod (${team.id}) unreadable: ${read.reason}`);
-          artifacts.push({ id: "dod", path: canonical.file, owner: team.id, status: "produced", summary: "unreadable artifact" });
+      const canonicalRelative = pinnedRegularRelative(pin, canonical.file);
+      if (!canonicalRelative) {
+        if (pin.relativePath(canonical.file) !== null && pin.pathEntryInfo(pin.relativePath(canonical.file)!)?.kind !== undefined) {
+          warnings.push(`artifact dod (${team.id}) unreadable: path is not a regular in-project file`);
         }
       } else {
-        const art = buildArtifactFromRead({ id: "dod", owner: team.id, filePath: canonical.file, status: "produced" }, read, options, warnings);
+        const art = buildArtifact({ id: "dod", owner: team.id, filePath: canonical.file, status: "produced" }, options, warnings, pin);
         artifacts.push(art);
         if (art.mtime) artifactMtimes.set("dod", art.mtime);
       }
       seen.add(`${team.id}/dod`);
     }
-    if (existsSync(dir)) {
+    const relativeDir = pin.relativePath(dir);
+    if (relativeDir && pin.pathEntryInfo(relativeDir)?.kind === "directory") {
       try {
-        for (const file of readdirSync(dir)) {
+        for (const file of pin.listDirectory(relativeDir, { maxEntries: 4096, maxNameBytes: 512 * 1024 })) {
           if (!file.endsWith(".json")) continue;
           const artifactId = file.replace(/\.json$/, "");
           const key = `${team.id}/${artifactId}`;
           if (seen.has(key)) continue;
           seen.add(key);
           const filePath = join(dir, file);
-          const art = buildArtifact({ id: artifactId, owner: team.id, filePath, status: "produced" }, options, warnings);
+          if (pinnedRegularRelative(pin, filePath) === null) continue;
+          const art = buildArtifact({ id: artifactId, owner: team.id, filePath, status: "produced" }, options, warnings, pin);
           artifacts.push(art);
           if (art.mtime) artifactMtimes.set(artifactId, art.mtime);
         }
@@ -725,6 +805,7 @@ function buildArtifact(
   input: ArtifactInput,
   options: BuildSessionReportOptions,
   warnings: string[],
+  pin: PinnedProjectRoot,
 ): ReportArtifact {
   const maxBytes = options.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES;
   const base: ReportArtifact = {
@@ -733,34 +814,36 @@ function buildArtifact(
     owner: input.owner,
     status: input.status,
   };
-  if (!input.filePath || !existsSync(input.filePath)) {
+  if (!input.filePath) {
     base.summary = input.status === "skipped" ? "skipped — artifact not produced" : "not produced";
     return base;
   }
-  let size = 0;
+  const relativePath = pinnedRegularRelative(pin, input.filePath);
+  if (!relativePath) {
+    base.summary = input.status === "skipped" ? "skipped — artifact not produced" : "not produced";
+    return base;
+  }
   try {
-    size = statSync(input.filePath).size;
+    const read = pin.readFile(relativePath, { maxBytes: MAX_PINNED_ARTIFACT_BYTES });
+    const raw = new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
+    const summaryCap = Math.max(maxBytes * SUMMARY_CAP_FACTOR, 64 * 1024);
+    return finishArtifact(
+      base,
+      input,
+      truncateUtf8(raw, summaryCap),
+      read.bytes.byteLength,
+      pin.pathEntryInfo(relativePath)?.mtimeMs ?? null,
+      maxBytes,
+      options,
+      warnings,
+    );
   } catch {
     warnings.push(`artifact ${input.id} (${input.owner}) unreadable`);
     base.summary = "unreadable artifact";
     return base;
   }
-  let mtimeMs: number | null = null;
-  try {
-    mtimeMs = statSync(input.filePath).mtimeMs;
-  } catch {
-    // mtime best-effort
-  }
-  const summaryCap = Math.max(maxBytes * SUMMARY_CAP_FACTOR, 64 * 1024);
-  const raw = readBounded(input.filePath, summaryCap);
-  if (raw === null) {
-    warnings.push(`artifact ${input.id} (${input.owner}) unreadable`);
-    base.summary = "unreadable artifact";
-    return base;
-  }
-  return finishArtifact(base, input, raw, size, mtimeMs, maxBytes, options, warnings);
-}
 
+}
 /**
  * Assemble the report artifact from a SAFE fd-bound DoD read result: content,
  * size and mtime come from the safe read — the resolved pathname is never
@@ -777,7 +860,7 @@ function buildArtifactFromRead(
   const summaryCap = Math.max(maxBytes * SUMMARY_CAP_FACTOR, 64 * 1024);
   const base: ReportArtifact = { id: input.id, path: input.filePath ?? input.id, owner: input.owner, status: input.status };
   const raw =
-    read.raw.length > summaryCap ? Buffer.from(read.raw, "utf8").subarray(0, summaryCap).toString("utf8") : read.raw;
+    truncateUtf8(read.raw, summaryCap);
   return finishArtifact(base, input, raw, read.bytes, read.mtimeMs, maxBytes, options, warnings);
 }
 
@@ -872,32 +955,120 @@ function doWorkTelemetry(
   cwd: string,
   r: DoWorkResolved,
   warnings: string[],
+  pin: PinnedProjectRoot,
 ): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
   const slug = r.isLegacy ? (deriveFeatureSlug(r.state.branch) ?? "default") : r.id;
-  const pointer = r.state.observability ?? readObservabilityPointer(cwd, slug);
+  let pointer = r.state.observability as ObservabilityPointer | undefined;
+  if (!pointer) {
+    const relativePath = join(WORK_STATE_DIR, FEATURES_DIR, slug, "observability", "events.jsonl");
+    if (pin.pathEntryInfo(relativePath)?.kind === "file") {
+      pointer = { eventsPath: "observability/events.jsonl", lastEventId: "", rollupThroughId: "", rollup: rollupFromEvents([]) };
+    }
+  }
   if (!pointer) {
     warnings.push("no telemetry available for this session");
     return { telemetry: { rollup: null }, events: [] };
   }
-  return buildTelemetry(cwd, slug, pointer, warnings);
+  return buildTelemetry(cwd, slug, pointer, warnings, pin);
+
+}
+const CTO_TELEMETRY_POINTER = "pointer.json";
+const CTO_TELEMETRY_EVENTS = "events.jsonl";
+const CTO_TELEMETRY_MAX_POINTER_BYTES = 64 * 1024;
+
+function ctoTelemetryEmpty(warnings: string[], reason: string): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
+  warnings.push(reason);
+  return { telemetry: { rollup: null }, events: [] };
+}
+
+function ctoIdentityField(record: Record<string, unknown>, names: readonly string[]): string | undefined {
+  for (const name of names) {
+    const value = record[name];
+    if (value !== undefined) return typeof value === "string" ? value : undefined;
+  }
+  return undefined;
+}
+
+function parseCtoTelemetryPointer(
+  bytes: Uint8Array,
+  runId: string,
+  sessionId: string,
+): { pointer: ObservabilityPointer; eventsPath: string } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const envelope = parsed as Record<string, unknown>;
+  const nested = envelope.pointer;
+  const pointer = nested && typeof nested === "object" && !Array.isArray(nested)
+    ? nested as Record<string, unknown>
+    : envelope;
+  const pointerRunId = ctoIdentityField(envelope, ["cto_run_id", "run_id", "runId"])
+    ?? ctoIdentityField(pointer, ["cto_run_id", "run_id", "runId"]);
+  const pointerSessionId = ctoIdentityField(envelope, ["session_id", "sessionId"])
+    ?? ctoIdentityField(pointer, ["session_id", "sessionId"]);
+  if ((pointerRunId !== undefined && pointerRunId !== runId)
+    || (pointerSessionId !== undefined && pointerSessionId !== sessionId)) return null;
+  const rawEventsPath = pointer.eventsPath ?? pointer.events_path;
+  if (rawEventsPath !== "observability/events.jsonl"
+    || typeof pointer.lastEventId !== "string"
+    || typeof pointer.rollupThroughId !== "string"
+    || !pointer.rollup || typeof pointer.rollup !== "object" || Array.isArray(pointer.rollup)) return null;
+  return {
+    pointer: pointer as unknown as ObservabilityPointer,
+    eventsPath: rawEventsPath,
+  };
 }
 
 function ctoTelemetry(
   cwd: string,
   r: CtoResolved,
   warnings: string[],
+  pin: PinnedProjectRoot,
 ): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
-  // CTO runs have no observability pointer of their own; the recorder is
-  // feature-scoped and falls back to "default" for CTO sessions. This is
-  // coarse session-level telemetry — flagged in the report.
-  const pointer = readObservabilityPointer(cwd, "default");
-  if (!pointer) {
-    warnings.push("no telemetry available for this CTO run (session-level events only)");
-    return { telemetry: { rollup: null }, events: [] };
+  const sessionId = r.state.owner_session;
+  if (typeof sessionId !== "string" || !isSafeStateSegment(sessionId) || Buffer.byteLength(sessionId, "utf8") > 128) {
+    return ctoTelemetryEmpty(warnings, "no telemetry available for this CTO run (owner session identity is missing or invalid)");
   }
-  const result = buildTelemetry(cwd, "default", pointer, warnings);
-  warnings.push("CTO telemetry is session-level (no per-run event stream); chronology falls back to state");
-  return result;
+  const sessionRoot = join(WORK_STATE_DIR, FEATURES_DIR, sessionId, "observability");
+  const pointerPath = join(sessionRoot, CTO_TELEMETRY_POINTER);
+  let pointerBytes: Uint8Array;
+  try {
+    if (!pin.isStable() || pin.pathEntryInfo(pointerPath)?.kind !== "file") {
+      return ctoTelemetryEmpty(warnings, "no telemetry available for this CTO run (session pointer is missing)");
+    }
+    pointerBytes = pin.readFile(pointerPath, { maxBytes: CTO_TELEMETRY_MAX_POINTER_BYTES }).bytes;
+    if (!pin.isStable()) throw new PinnedRootError("changed", "pinned project root changed after CTO telemetry pointer read");
+  } catch {
+    return ctoTelemetryEmpty(warnings, "CTO telemetry pointer is unreadable or changed");
+  }
+  const parsed = parseCtoTelemetryPointer(pointerBytes, r.id, sessionId);
+  if (!parsed) return ctoTelemetryEmpty(warnings, "CTO telemetry pointer is malformed or belongs to another run/session");
+  const eventsPath = join(sessionRoot, CTO_TELEMETRY_EVENTS);
+  let allEvents: ObservabilityEvent[];
+  try {
+    allEvents = readEventsBounded(pin, eventsPath, warnings);
+    if (!pin.isStable()) throw new PinnedRootError("changed", "pinned project root changed after CTO telemetry read");
+  } catch {
+    return ctoTelemetryEmpty(warnings, "CTO telemetry event log is unreadable or changed");
+  }
+  const events = allEvents.filter((event) =>
+    event.runId === r.id && (event.sessionId === undefined || event.sessionId === sessionId),
+  );
+  const eventCounts: Record<string, number> = {};
+  for (const event of events) eventCounts[event.kind] = (eventCounts[event.kind] ?? 0) + 1;
+  return {
+    telemetry: {
+      eventsPath,
+      lastEventId: parsed.pointer.lastEventId,
+      rollup: events.length > 0 ? rollupFromEvents(events) : null,
+      eventCounts,
+    },
+    events,
+  };
 }
 
 function buildTelemetry(
@@ -905,40 +1076,46 @@ function buildTelemetry(
   slug: string,
   pointer: ObservabilityPointer,
   warnings: string[],
+  pin: PinnedProjectRoot,
 ): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
   const eventsPath = resolve(cwd, WORK_STATE_DIR, "features", slug, pointer.eventsPath);
-  const events = readEventsBounded(eventsPath, warnings);
+  const relativePath = pin.relativePath(eventsPath);
+  const events = relativePath ? readEventsBounded(pin, relativePath, warnings) : [];
+  if (!relativePath) warnings.push("event log path is outside the pinned project root");
   const eventCounts: Record<string, number> = {};
   for (const e of events) eventCounts[e.kind] = (eventCounts[e.kind] ?? 0) + 1;
   return {
     telemetry: {
       eventsPath: pointer.eventsPath,
       lastEventId: pointer.lastEventId,
-      rollup: pointer.rollup,
+      rollup: pointer.rollup ?? rollupFromEvents(events),
       eventCounts,
     },
     events,
   };
-}
 
-function readEventsBounded(eventsPath: string, warnings: string[]): ObservabilityEvent[] {
-  if (!existsSync(eventsPath)) {
-    warnings.push("event log missing — chronology falls back to artifact mtime/state timestamps");
-    return [];
-  }
+}
+function readEventsBounded(pin: PinnedProjectRoot, relativePath: string, warnings: string[]): ObservabilityEvent[] {
   let text: string;
   let startsMidLine = false;
   try {
-    const size = statSync(eventsPath).size;
-    if (size > MAX_EVENT_BYTES) {
-      // Chronology/event counts need the MOST RECENT events, so read the
-      // final window (tail), not the head.
-      const tail = readBoundedTail(eventsPath, MAX_EVENT_BYTES);
-      text = tail?.text ?? "";
-      startsMidLine = tail?.startsMidLine ?? false;
+    const info = pin.pathEntryInfo(relativePath);
+    if (!info) {
+      warnings.push("event log missing — chronology falls back to artifact mtime/state timestamps");
+      return [];
+    }
+    if (info.kind !== "file") throw new PinnedRootError("not_regular", "event log is not a regular file");
+    const read = pin.readFile(relativePath, { maxBytes: MAX_PINNED_EVENT_BYTES });
+    const bytes = Buffer.from(read.bytes);
+    if (bytes.byteLength > MAX_EVENT_BYTES) {
+      const offset = bytes.byteLength - MAX_EVENT_BYTES;
+      const windowStart = offset > 0 ? offset - 1 : 0;
+      const prefix = bytes.subarray(windowStart, offset);
+      startsMidLine = offset > 0 && prefix[0] !== 0x0a;
+      text = bytes.subarray(offset).toString("utf8");
       warnings.push(`event log exceeds the telemetry cap — only the final ${MAX_EVENT_BYTES} bytes (tail) were read`);
     } else {
-      text = readFileSync(eventsPath, "utf8");
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     }
   } catch {
     warnings.push("event log unreadable — chronology falls back to artifact mtime/state timestamps");
@@ -947,8 +1124,6 @@ function readEventsBounded(eventsPath: string, warnings: string[]): Observabilit
   const out: ObservabilityEvent[] = [];
   let corrupt = 0;
   for (const line of text.split("\n")) {
-    // A tail window can begin mid-line: the first fragment is a partial
-    // JSONL line — an artifact of the byte cap, not corruption. Drop it.
     if (startsMidLine) {
       startsMidLine = false;
       continue;
@@ -957,11 +1132,8 @@ function readEventsBounded(eventsPath: string, warnings: string[]): Observabilit
     if (!trimmed) continue;
     try {
       const parsed = JSON.parse(trimmed) as ObservabilityEvent;
-      if (parsed && typeof parsed === "object" && typeof parsed.ts === "string" && typeof parsed.kind === "string") {
-        out.push(parsed);
-      } else {
-        corrupt += 1;
-      }
+      if (parsed && typeof parsed === "object" && typeof parsed.ts === "string" && typeof parsed.kind === "string") out.push(parsed);
+      else corrupt += 1;
     } catch {
       corrupt += 1;
     }
@@ -1001,20 +1173,70 @@ function sortedChronology(entries: ChronologyEvent[]): ChronologyEvent[] {
 // ── Report writer (containment + 0600) ──────────────────────────────────────
 
 /**
- * Write the report HTML under `.work-state`. Rejects any target outside
- * `.work-state` (lexically AND through symlinked parents), creates parent
- * dirs, and applies mode 0600. Returns the absolute target path.
+ * Write the report HTML under `.work-state` through a borrowed pinned root.
+ * The caller owns the pin and must keep it open for the whole render/write
+ * transaction.  Parent directories and the leaf are opened without following
+ * links; the final file is staged, fsynced and atomically published as 0600.
  */
-export function writeReport(cwd: string, targetPath: string, html: string): string {
+export function writeReportPinned(
+  cwd: string,
+  targetPath: string,
+  html: string,
+  pin: PinnedProjectRoot,
+): string {
+  // Check the exact bytes before any directory creation or atomic-write setup.
+  assertReportHtmlWithinLimit(html);
   const wsRoot = resolve(cwd, WORK_STATE_DIR);
   const target = resolve(cwd, targetPath);
-  if (!isUnderWorkState(wsRoot, target)) {
+  if (resolve(cwd) !== pin.lexical_root || !isUnderWorkState(wsRoot, target)) {
     throw new Error(`writeReport: target must be under ${wsRoot} (got ${targetPath})`);
   }
-  mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, html, { encoding: "utf8", mode: 0o600 });
-  chmodSync(target, 0o600);
+  const workspaceReal = realish(wsRoot);
+  const targetParent = dirname(target);
+  const targetParentReal = realish(targetParent);
+  const parentRelative = pin.relativePath(targetParentReal);
+  const targetPhysical = join(targetParentReal, basename(target));
+  const targetRelative = pin.relativePath(targetPhysical);
+  if (parentRelative === null || targetRelative === null) {
+    throw new Error(`writeReport: target must be under ${wsRoot} (got ${targetPath})`);
+  }
+  const ensureStable = (): void => {
+    if (
+      !pin.isStable()
+      || realish(wsRoot) !== workspaceReal
+      || realish(targetParent) !== targetParentReal
+    ) {
+      throw new Error("writeReport: project boundary changed during write");
+    }
+  };
+  try {
+    ensureStable();
+    pin.ensureDirectory(parentRelative);
+    ensureStable();
+    pin.writeAtomic(targetRelative, html);
+    ensureStable();
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("writeReport:")) throw error;
+    throw new Error("writeReport: report could not be written safely");
+  }
   return target;
+}
+
+/**
+ * Standalone report writer.  A caller that already owns a report/session pin
+ * must use {@link writeReportPinned} instead so render and publication share
+ * one lifetime.
+ */
+export function writeReport(cwd: string, targetPath: string, html: string): string {
+  // Keep the standalone path fail-closed even before opening a project pin.
+  assertReportHtmlWithinLimit(html);
+  const pin = PinnedProjectRoot.open(cwd);
+  if (!pin) throw new Error("writeReport: project root cannot be pinned");
+  try {
+    return writeReportPinned(cwd, targetPath, html, pin);
+  } finally {
+    pin.close();
+  }
 }
 
 function isUnderWorkState(wsRoot: string, target: string): boolean {

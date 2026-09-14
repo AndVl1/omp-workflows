@@ -1,0 +1,37 @@
+{
+  "feature_id": "readable-native-final",
+  "request": "Add a deterministic project-local workflow profile override with explicit ownership",
+  "runtime": "real npm run e2e PTY",
+  "status": "fail_existing_sla",
+  "constitution": {
+    "selector": ["approve_continue", "request_changes", "Other (type your own)"],
+    "answer": "approve_continue",
+    "approved": true
+  },
+  "post_approval": {
+    "workflow_prepare": "executed",
+    "workflow_begin": "executed",
+    "workflow_instructions": "executed",
+    "workflow_dispatch_specification_phase": "executed",
+    "state_phase": "specify",
+    "state_phase_status": "generating",
+    "phase_checkpoint": "not_reached"
+  },
+  "failure": {
+    "kind": "existing_stage_sla",
+    "detail": "The native phase worker/model remained in repository/schema inspection after dispatch; the PTY harness detached session ended with scenario stage timed out: constitution. No timeout was increased.",
+    "provider_outage_evidence": "none; provider was active and emitted tool calls, but did not produce a persisted phase artifact before the existing 600000ms stage SLA."
+  },
+  "source_fixes_under_probe": [
+    "packages/core/src/index.ts: workflow_prepare and workflow_begin return structured required_next_tool chaining",
+    "packages/core/src/commands/specification.ts: same-turn transition and bounded worker payload guidance",
+    "packages/e2e/src/cli.ts: pending Ask delivery does not wait for startup-only Welcome TUI",
+    "packages/e2e/src/driver.ts: pending Ask replay scans the bounded 8MiB transcript horizon"
+  ],
+  "evidence": {
+    "transcript": "transcript.jsonl",
+    "session": "session.json",
+    "state": "state.json",
+    "detach_log": "detach.log"
+  }
+}

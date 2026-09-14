@@ -1,0 +1,128 @@
+{
+  "schema_version": 2,
+  "session_id": "KjnEKSClJ50mx5PHt4elzOj9To4DhfEA6i54O4S58js",
+  "control_nonce": "vn3xDbvWLObywYxQyYkCsmE2k0_CdaZCsTtCw6szKWg",
+  "server_pid": 83092,
+  "server_start_identity": "0L_Rj9GC0L3QuNGG0LAsIDExINGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMDk6MzM6MTA",
+  "server_start_nonce": "s1eZLt6pMmmJEtItqvPXMcy4By128HP_OwSegn9bp7Y",
+  "slug": "omp-spec-e2e-cto-preparation",
+  "url": "http://127.0.0.1:54596/?token=MxxS91FCkzl_qc5bTtH27Xu0VP9yIc9nX8LHGhvIZqk",
+  "browser_url": "http://127.0.0.1:54596/?code=kNKXrYW8Bt3Ic4n-GtaTIf30l5vAUPbo5E-eOzd9lOE",
+  "browser_bootstrap_consumed": false,
+  "browser_code_expires_at": "2026-09-11T06:34:16.564Z",
+  "token": "MxxS91FCkzl_qc5bTtH27Xu0VP9yIc9nX8LHGhvIZqk",
+  "wsPath": "/ws",
+  "omp_version": "omp/18.1.11",
+  "pid": 83346,
+  "pgid": 83346,
+  "probe_pid": null,
+  "probe_pgid": null,
+  "probe_start_identity": null,
+  "pty_start_identity": "0L_Rj9GC0L3QuNGG0LAsIDExINGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMDk6MzM6MTc",
+  "spawn_error": null,
+  "started_at": "2026-09-11T06:33:16.567Z",
+  "status": "stopped",
+  "phase": "stopped",
+  "shutdown_error": null,
+  "pty_exit_observed": true,
+  "shutdown_completed_at": "2026-09-11T06:43:47.602Z",
+  "stopped_at": "2026-09-11T06:43:47.602Z",
+  "finished_at": "2026-09-11T06:43:47.602Z",
+  "profile": null,
+  "tty": {
+    "cols": 120,
+    "rows": 40,
+    "term": "xterm-256color"
+  },
+  "task_prompt": "Coordinate specification preparation through one resident CTO run as one deterministic multi-feature journey. Create exactly one resident CTO run for this task; never spawn, nest, or delegate to a second CTO, and never create a separate specification system. Prepare exactly three specifications through the standard constitution prerequisite and the standard Specify -> Plan -> Tasks flow, reusing the existing native templates, selected language, validation rules, traceability, and durable state for every feature workspace; never invent a CTO-specific specification format or an autonomous approval path. Preserve each engine-generated explicit run_key and select the exact explicit feature ids prep-atlas, prep-borealis, and prep-meridian for every workspace, dispatch, decision, and evidence lookup; never infer identity from .active-feature, a branch name, or the current directory.\n\nDispatch independent preparation. prep-atlas (Add a deterministic request deduplication ledger with explicit ownership) and prep-borealis (Add a deterministic configuration snapshot exporter with explicit ownership) are independent features: give each a distinct canonical workspace `specs/prep-atlas` and `specs/prep-borealis` and prepare them in parallel, because only independent preparation may run concurrently. prep-meridian (Add a deterministic feature-flag audit trail spanning facet-a and facet-b in one workspace) is one broad feature with facet-a and facet-b: keep all three facets in the single workspace `specs/prep-meridian` with coordinated contributors serialized behind one phase writer - no parallel writes to the same feature phase and no facet spun into a second workspace. Confirm the transcript shows parallel dispatch only across the independent features and strictly serialized facet phases inside the shared workspace.\n\nPresent readable checkpoints. At every phase checkpoint present one readable CTO review packet per specification and phase, and record a separate explicit trusted human decision for every specification and phase; neither the CTO, nor a team lead, nor any worker may approve on the user's behalf, and no decision may be recorded without its trusted human proof. Batch the three Specify checkpoints into one review packet and answer it with mixed decisions: approve and continue prep-atlas (approve_continue), request changes on prep-borealis (request_changes), and approve and continue prep-meridian (approve_continue).\n\nResume mixed decisions correctly. After the mixed Specify answers, only eligible specifications advance: prep-atlas and prep-meridian proceed to Plan while prep-borealis stays on its affected Specify phase. Submit this revision feedback verbatim into prep-borealis's Specify revision: `Rework the Specify draft so the snapshot exporter defines its snapshot boundary and exclusion rules explicitly; keep the same feature identity and run_key.`. Confirm the revision remains on the Specify phase, re-enters validation, produces a new validated Specify version without touching any already-approved phase, and only then re-presents its checkpoint; approve and continue the revised Specify (approve_continue) so prep-borealis joins Plan. No feature may advance past a phase the user has not approved.\n\nBlock one slice deterministically. Facet-b of prep-meridian intentionally blocks before its Plan artifact completes: the facet dispatch finds no usable facet-b baseline and stops without fabricated evidence. Confirm the blocked slice retains durable state under `.work-state/features/prep-meridian` (state, checkpoint ledger, and the blocking reason) sufficient for targeted resume, that prep-atlas and prep-borealis Plans continue unaffected, that every completed specification remains reviewable, and that the transcript names the blocked facet-b instead of silently dropping it. Supply the missing facet-b baseline and resume only the blocked facet so it completes its Plan through the same single workspace phase writer.\n\nEnforce the single resident run and queue limits. While the resident run is active, submit a fourth preparation request: `Add a deterministic CLI usage counter with explicit ownership`. The resident run has already reached its team cap and its decomposition-depth cap for additional preparation slices: nothing new may be folded into execution depth at this point. Queue the overflow request with a visible reason naming capacity (team cap), decomposition depth, ownership, and the currently active phase, and confirm the transcript reports the queued reason, exactly one resident CTO run exists, and no nested CTO is ever created.\n\nFinal hard stop. Take the final Tasks approvals (approve_stop at the Tasks checkpoint for each of the three specifications, after the resumed facet-b completes Plan and Tasks for prep-meridian). Confirm each feature ends implementation_ready with a standard implementation-ready handoff carrying a handoff_id and a 64-hex content-addressed handoff_digest bound to its approved tasks, that status.md shows Approvals and the Next Action naming a separate explicit CTO execution wave, and that no implementation evidence, claim, or dispatch exists for any feature. The resident CTO returns the three handoffs and waits: preparation completion is never execution intent, and execution starts only after a separate explicit CTO execution request or wave.\n\nEnd with a compact evidence summary listing the three feature ids with their run_keys, the recorded decision per specification and phase (approve_continue, request_changes, revise-and-approve, approve_stop), the blocked-slice durable resume evidence path under `.work-state/features/prep-meridian`, the queued overflow request with its visible capacity, depth, ownership, and active-phase reason, and the three implementation-ready handoffs with handoff_id and handoff_digest - plus the explicit statement that no execution wave was started and no nested CTO was created.",
+  "scenario": {
+    "id": "spec-cto-preparation",
+    "title": "CTO preparation: independent features, same-feature facets, mixed decisions, blocked slices, queue limits, final hard stop"
+  },
+  "surface": "text",
+  "host_config": {
+    "path": "/Users/a.vladislavov/.omp/agent/config.yml",
+    "warning": null
+  },
+  "omp_log_binding": null,
+  "user_config": {
+    "path": null,
+    "default_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-preparation-e2e-L9hOhc/omp-spec-e2e-cto-preparation/.omp/ux-e2e-overlay.user.json"
+  },
+  "extension_isolation": {
+    "ambient_discovery_disabled": true,
+    "explicit_roots": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-preparation-e2e-L9hOhc/omp-spec-e2e-cto-preparation/node_modules/@andvl1/omp-workflows-fullstack",
+    "home": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-preparation-e2e-L9hOhc/omp-spec-e2e-cto-preparation/.work-state/ux-e2e/omp-home",
+    "agent_dir": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-preparation-e2e-L9hOhc/omp-spec-e2e-cto-preparation/.work-state/ux-e2e/omp-home/.omp/agent"
+  },
+  "runtime_plugins": {
+    "schema_version": 1,
+    "extension_package": {
+      "name": "@andvl1/omp-workflows-fullstack",
+      "version": "0.27.0",
+      "package_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-preparation-e2e-L9hOhc/omp-spec-e2e-cto-preparation/node_modules/@andvl1/omp-workflows-fullstack",
+      "realpath": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/fullstack",
+      "entrypoint": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/fullstack/dist/index.js"
+    },
+    "core_package": {
+      "name": "@andvl1/omp-workflows-core",
+      "version": "0.27.0",
+      "package_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-preparation-e2e-L9hOhc/omp-spec-e2e-cto-preparation/node_modules/@andvl1/omp-workflows-core",
+      "realpath": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/core",
+      "entrypoint": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/core/dist/index.js"
+    },
+    "configured_extensions": [
+      "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-preparation-e2e-L9hOhc/omp-spec-e2e-cto-preparation/node_modules/@andvl1/omp-workflows-fullstack"
+    ],
+    "tool_names": [
+      "constitution_checkpoint_ask_selected",
+      "constitution_impact_apply",
+      "constitution_impact_ask_selected",
+      "constitution_impact_assess",
+      "cto_checkpoint_ask_selected",
+      "cto_close_specification_execution_wave",
+      "cto_confirm",
+      "cto_dispatch",
+      "cto_mapping_resume",
+      "cto_preflight",
+      "cto_prepare",
+      "cto_specification_advance",
+      "cto_specification_conformance",
+      "cto_specification_decide",
+      "cto_specification_prepare",
+      "cto_specification_review",
+      "decide_constitution_checkpoint",
+      "do_work_claim",
+      "ensure_project_constitution",
+      "lecture_acquire",
+      "present_constitution_draft",
+      "workflow_advance",
+      "workflow_begin",
+      "workflow_begin_phase_validation",
+      "workflow_checkpoint",
+      "workflow_checkpoint_ask_selected",
+      "workflow_complete",
+      "workflow_complete_specification_execution",
+      "workflow_dispatch_specification_phase",
+      "workflow_finalize_import_handoff",
+      "workflow_finalize_native_specification_phase",
+      "workflow_instructions",
+      "workflow_persist_specification_phase",
+      "workflow_prepare",
+      "workflow_specification_conformance",
+      "workflow_start_native_specification_phase",
+      "workflow_status",
+      "workflow_validate_phase"
+    ],
+    "duplicate_tool_names": []
+  },
+  "omp_log_snapshot": {
+    "relative_path": "omp-log.ee610771698d9dd9fae990ffdfce692de1e33f7b711da95a2e6a07d9f785b1d3.log",
+    "size": 58493,
+    "sha256": "ee610771698d9dd9fae990ffdfce692de1e33f7b711da95a2e6a07d9f785b1d3",
+    "source_dev": 16777234,
+    "source_ino": 109442001,
+    "generation": "s1eZLt6pMmmJEtItqvPXMcy4By128HP_OwSegn9bp7Y",
+    "process_start": "0L_Rj9GC0L3QuNGG0LAsIDExINGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMDk6MzM6MTc"
+  }
+}

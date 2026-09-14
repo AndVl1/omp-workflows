@@ -54,6 +54,15 @@ function publishMapping(root: string, availableAgents: string[]): void {
     availableAgents,
     extraRoles: config.scope_map.map(entry => entry.dev_agent),
     genericFallbackRoles: Object.keys(genericRoles).filter(role => role !== "security-tester"),
+    source: "agent-mapping-dispatch-test",
+    scope_map: config.scope_map,
+    flags: config.flags,
+    roster: config.roster_overrides,
+    config_path: config.config_path,
+    config_source: config.config_source,
+    config_hash: config.config_hash,
+    config_version: config.config_version,
+    config_provenance: config.config_provenance,
   });
   writeAgentMapping(root, mapping);
 }

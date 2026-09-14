@@ -1,0 +1,42 @@
+{
+  "snapshot_id": "import.103b3f5b1980c0e61999f5344d0371f8a9ff48d06911eec7055cd0ae689f2b1a",
+  "source_root": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-immutability-WXWXvD/omp-spec-e2e-immutability",
+  "source_root_identity": {
+    "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-immutability-WXWXvD/omp-spec-e2e-immutability",
+    "dev": 16777234,
+    "ino": 95111292,
+    "mode": 16832
+  },
+  "recognition_ref": "recognition.089cbd956758029b3268213c0d171c8331b8d5815058674e93e2f12cc1483ad8",
+  "files": [
+    {
+      "path": "imported/payment-retry-speckit/.specify/memory/constitution.md",
+      "sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+      "size_bytes": 905,
+      "media_type": "text/markdown"
+    },
+    {
+      "path": "imported/payment-retry-speckit/specs/101-payment-retry/plan.md",
+      "sha256": "7d4bff409ee9cb1087e8e23b464c80191a5807a4afcb0dcff8c178b005c27998",
+      "size_bytes": 1705,
+      "media_type": "text/markdown"
+    },
+    {
+      "path": "imported/payment-retry-speckit/specs/101-payment-retry/spec.md",
+      "sha256": "d78cabdd8ea7f4351288380ee1c420691ec818d21ae98ab2cf3e9555999de998",
+      "size_bytes": 1758,
+      "media_type": "text/markdown"
+    },
+    {
+      "path": "imported/payment-retry-speckit/specs/101-payment-retry/tasks.md",
+      "sha256": "b86a5f4d62d6bea037c2219bd2f9a28cbac150996a64fe4e89d962a5f007159e",
+      "size_bytes": 951,
+      "media_type": "text/markdown"
+    }
+  ],
+  "source_revision": null,
+  "document_language": null,
+  "redactions": [],
+  "normalized_content_ref": "normalized.a51cc0a6c3e536e709d818105876d69f4496ffad14259759e6fa192d72ed9745",
+  "created_at": "2026-09-03T04:14:57.399Z"
+}

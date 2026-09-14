@@ -24,6 +24,7 @@ that workers follow exactly.
 3. Specify contracts: exported names, types, ownership of files, cross-slice interfaces.
 4. Give per-worker implementation steps specific enough to follow blindly, including validation steps.
 
+
 ## Constraints
 
 Single-writer packages; no Rust/Kotlin/Go/frontend/mobile writers exist downstream.

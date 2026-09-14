@@ -258,7 +258,7 @@ test("links: manifest counts honor explicit discovered/generated/pages/dead-link
   assert.equal(manifest.counts.deadLinks, 2);
   assert.equal(manifest.counts.staleSessions, 0);
   assert.equal(manifest.counts.degradedSessions, 1);
-  assert.equal(manifest.counts.artifactTotal, 16);
+  assert.equal(manifest.counts.artifactTotal, 14);
 });
 
 // ── Pruning metadata ─────────────────────────────────────────────────────────

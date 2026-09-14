@@ -113,17 +113,29 @@ const CTO_STATE = {
   branch: "feat/payments",
   autonomous: false,
   plan: {
+    id: "run-1",
+    task: "Decompose the payments migration",
     teams: [
-      { team: "backend", scope: ["**/*.kt"], slice: "API", profile: "full-feature", worktree: "same_branch", depends_on: [] },
-      { team: "web", scope: ["**/*.tsx"], slice: "Frontend", profile: "standard", worktree: "same_branch", depends_on: ["backend"] },
+      { team: "backend", team_def_id: "backend", scope: ["**/*.kt"], slice: "API", profile: "full-feature", worktree: "same_branch", depends_on: [] },
+      { team: "web", team_def_id: "web", scope: ["**/*.tsx"], slice: "Frontend", profile: "standard", worktree: "same_branch", depends_on: ["backend"] },
     ],
+    created_at: "2026-08-08T11:00:00.000Z",
   },
   teams: [
     { id: "backend", status: "done", escalations: {}, dod_path: ".work-state/cto/run-1/teams/backend/dod.json" },
-    { id: "web", status: "parked", escalations: { "esc-1": { id: "esc-1" } } },
+    { id: "web", status: "parked", escalations: { "esc-1": { status: "pending" } } },
   ],
   integration: { status: "in_progress", note: "waiting for web" },
   pause: { kind: "background_wait", reason: "escalation pending" },
+  state_revision: 0,
+  budget: {
+    policy: { token_limit: null, dollar_limit: null, time_limit_ms: null },
+    accounting: { tokens_estimated: 0, dollars_estimated: 0, elapsed_ms: 0, per_team: {} },
+  },
+  leases: {},
+  decisions: [],
+  inbox_quarantine: {},
+  wave_history: [],
   updated_at: "2026-08-08T11:00:00.000Z",
 };
 

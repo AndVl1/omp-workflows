@@ -32,17 +32,116 @@ import {
   lstatSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
-  writeFileSync,
   type Stats,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { DoD, DoDItem } from "./types.js";
+import { isSafeCanonicalToken } from "../specification/validation.js";
+import type { PinnedProjectRoot } from "../specification/pinned-root.js";
 
 /** Canonical DoD file name inside an artifacts directory. */
 export const DOD_FILENAME = "dod.json";
 
 const MAX_DOD_PATH_LENGTH = 512;
+/** Maximum bytes accepted from one canonical DoD artifact. */
+export const MAX_DOD_BYTES = 1024 * 1024;
+const MAX_DOD_ITEMS = 64;
+const MAX_DOD_STRING_BYTES = 16 * 1024;
+const MAX_DOD_ID_BYTES = 128;
+const MAX_DOD_AGGREGATE_BYTES = MAX_DOD_BYTES;
+const MAX_DOD_DEPTH = 32;
+
+const DOD_ITEM_ID_RE = /^[A-Za-z0-9._-]+$/u;
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function boundedDodText(value: unknown, nonEmpty = false): value is string {
+  return typeof value === "string"
+    && (!nonEmpty || value.trim().length > 0)
+    && Buffer.byteLength(value, "utf8") <= MAX_DOD_STRING_BYTES;
+}
+
+function boundedDodCanonicalId(value: unknown): value is string {
+  return isSafeCanonicalToken(value) && Buffer.byteLength(value, "utf8") <= MAX_DOD_ID_BYTES;
+}
+
+export function isValidDodSource(value: unknown): value is string {
+  return typeof value === "string"
+    && value.trim().length > 0
+    && Buffer.byteLength(value, "utf8") <= MAX_DOD_STRING_BYTES
+    && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value);
+}
+
+function boundedDodItemId(value: unknown): value is string {
+  return typeof value === "string"
+    && DOD_ITEM_ID_RE.test(value)
+    && Buffer.byteLength(value, "utf8") <= MAX_DOD_ID_BYTES;
+}
+
+/**
+ * Validate the exact typed DoD shape accepted by both persistence and reads.
+ * The writer calls this before serialization, so every emitted artifact
+ * satisfies the same field, count, and UTF-8 bounds enforced by the reader.
+ */
+function validateDoDValue(value: unknown): string | null {
+  if (!plainRecord(value)) return "is not a valid typed DoD object";
+  const keys = Object.keys(value);
+  if (keys.some((key) => !["items", "type_requirements_met", "updated_at", "contributions"].includes(key))) {
+    return "has unsupported typed DoD fields";
+  }
+  if (!Array.isArray(value.items)) return "has invalid typed DoD items";
+  if (value.items.length > MAX_DOD_ITEMS) return `has too many typed DoD items (maximum ${MAX_DOD_ITEMS})`;
+  if (typeof value.type_requirements_met !== "boolean") return "has invalid typed DoD requirements status";
+  if (!boundedDodText(value.updated_at, true)) return "has invalid typed DoD timestamp";
+
+  const ids = new Set<string>();
+  for (const [index, rawItem] of value.items.entries()) {
+    if (!plainRecord(rawItem)) return `has an invalid typed DoD item at index ${index}`;
+    const itemKeys = Object.keys(rawItem);
+    if (itemKeys.some((key) => !["id", "source", "criterion", "verify_method", "status", "evidence"].includes(key))) {
+      return `has an invalid typed DoD item at index ${index}`;
+    }
+    if (!boundedDodItemId(rawItem.id)
+      || ids.has(rawItem.id)
+      || !isValidDodSource(rawItem.source)
+      || !boundedDodText(rawItem.criterion, true)
+      || !boundedDodText(rawItem.verify_method, true)
+      || (rawItem.status !== "pending" && rawItem.status !== "met")
+      || !boundedDodText(rawItem.evidence)) {
+      return `has an invalid typed DoD item at index ${index}`;
+    }
+    ids.add(rawItem.id);
+  }
+
+  if (value.contributions === undefined) return null;
+  if (!plainRecord(value.contributions)) return "has invalid typed DoD contributions";
+  const contributionKeys = Object.keys(value.contributions);
+  if (contributionKeys.length > MAX_DOD_ITEMS) return `has too many typed DoD contributions (maximum ${MAX_DOD_ITEMS})`;
+  for (const stageId of contributionKeys) {
+    if (!boundedDodCanonicalId(stageId)) return "has an invalid typed DoD contribution id";
+    const contribution = value.contributions[stageId];
+    if (!plainRecord(contribution)) return "has an invalid typed DoD contribution";
+    const contributionFields = Object.keys(contribution);
+    if (contributionFields.some((key) => !["added", "closed", "by"].includes(key))
+      || !Array.isArray(contribution.added)
+      || !Array.isArray(contribution.closed)
+      || contribution.added.length > MAX_DOD_ITEMS
+      || contribution.closed.length > MAX_DOD_ITEMS
+      || !boundedDodCanonicalId(contribution.by)
+      || contribution.added.some((id) => !boundedDodItemId(id))
+      || contribution.closed.some((id) => !boundedDodItemId(id))) {
+      return "has an invalid typed DoD contribution";
+    }
+  }
+  return null;
+}
 
 export type DodPathResolution = { ok: true; file: string } | { ok: false; reason: string };
 
@@ -170,6 +269,7 @@ export type DodSafeReadFailure =
   | "not-regular"
   | "changed"
   | "unsafe"
+  | "limit"
   | "unreadable";
 
 /**
@@ -235,10 +335,11 @@ function readContainmentRejection(rootPath: string, file: string): string | null
 /**
  * THE safe DoD read: opens the resolved file with O_NOFOLLOW|O_NONBLOCK (the
  * non-blocking flag keeps a FIFO posing as dod.json from hanging the open),
- * fstats the fd and requires a regular file, binds the fd to the pathname via a dev/ino
- * match, revalidates root containment through realpaths, then reads the text
- * from that SAME fd — a pathname swapped in after validation cannot change
- * what is parsed. Never throws; failure reasons never echo untrusted values.
+ * fstats the fd and requires a regular file, applies the bounded byte limit,
+ * binds the fd to the pathname via a dev/ino match, revalidates root
+ * containment through realpaths, then reads and fatally decodes UTF-8 from
+ * that SAME fd — a pathname swapped in after validation cannot change what is
+ * parsed. Never throws; failure reasons never echo untrusted values.
  */
 export function readDoDFileSafe(root: string, file: string): DodSafeFileRead {
   const rootPath = resolve(root);
@@ -259,6 +360,9 @@ export function readDoDFileSafe(root: string, file: string): DodSafeFileRead {
       return { ok: false, kind: "unreadable", reason: `${file} is unreadable: fstat failed` };
     }
     if (!st.isFile()) return { ok: false, kind: "not-regular", reason: `${file} is not a regular file` };
+    if (!Number.isSafeInteger(st.size) || st.size < 0 || st.size > MAX_DOD_BYTES) {
+      return { ok: false, kind: "limit", reason: `${file} exceeds the bounded DoD read limit of ${MAX_DOD_BYTES} bytes` };
+    }
     // fd-vs-path inode bind: the opened inode must still be the node the path
     // names at validation time; the read below uses the bound fd, so later
     // pathname swaps cannot change what is parsed.
@@ -273,14 +377,44 @@ export function readDoDFileSafe(root: string, file: string): DodSafeFileRead {
     }
     const rejection = readContainmentRejection(rootPath, file);
     if (rejection !== null) return { ok: false, kind: "unsafe", reason: `${file} ${rejection}` };
-    let raw: string;
+
+    // Allocate only the observed bounded size plus one byte. The extra byte
+    // detects an append without ever allocating based on an unbounded size.
+    let bytes: Buffer;
+    let offset = 0;
     try {
-      raw = readFileSync(fd, "utf8"); // read the SAME opened fd — never the pathname
+      bytes = Buffer.allocUnsafe(Math.min(MAX_DOD_BYTES + 1, st.size + 1));
+      while (offset < bytes.length) {
+        const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
+        if (count === 0) break;
+        offset += count;
+      }
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code ?? "unknown error";
       return { ok: false, kind: "unreadable", reason: `${file} is unreadable: ${code}` };
     }
-    return { ok: true, raw, bytes: st.size, mtimeMs: st.mtimeMs };
+    let after: Stats;
+    try {
+      after = fstatSync(fd);
+    } catch {
+      return { ok: false, kind: "unreadable", reason: `${file} is unreadable: fstat failed after read` };
+    }
+    if (after.size > MAX_DOD_BYTES || offset > MAX_DOD_BYTES) {
+      return { ok: false, kind: "limit", reason: `${file} exceeds the bounded DoD read limit of ${MAX_DOD_BYTES} bytes` };
+    }
+    if (!Number.isSafeInteger(after.size) || after.size < 0
+      || offset !== after.size
+      || after.dev !== st.dev || after.ino !== st.ino
+      || after.size !== st.size || after.mtimeMs !== st.mtimeMs || after.ctimeMs !== st.ctimeMs) {
+      return { ok: false, kind: "changed", reason: `${file} changed while being read (refusing to read)` };
+    }
+    let raw: string;
+    try {
+      raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, offset));
+    } catch {
+      return { ok: false, kind: "unreadable", reason: `${file} is not valid UTF-8` };
+    }
+    return { ok: true, raw, bytes: after.size, mtimeMs: after.mtimeMs };
   } finally {
     try {
       closeSync(fd);
@@ -303,34 +437,97 @@ export type DodReadOptions = { root?: string };
 export function readDoDFile(file: string, opts?: DodReadOptions): DodReadResult {
   const safe = readDoDFileSafe(opts?.root ?? dirname(file), file);
   if (!safe.ok) return { ok: false, reason: safe.reason };
+  return parseDoDText(file, safe.raw);
+}
+
+/** Read one DoD artifact through an already-pinned project root. */
+export function readDoDFilePinned(pinnedRoot: PinnedProjectRoot, relativeFile: string): DodReadResult {
   try {
-    return { ok: true, dod: JSON.parse(safe.raw) as DoD };
+    const read = pinnedRoot.readFile(relativeFile, { maxBytes: MAX_DOD_BYTES });
+    const raw = new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
+    return parseDoDText(relativeFile, raw);
   } catch (error) {
-    return { ok: false, reason: `${file} is not valid JSON: ${(error as Error).message}` };
+    return { ok: false, reason: `${relativeFile} is unreadable: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
-/** Directory-form convenience read (stage-local flows keyed by artifactsDir). */
-export function readDoD(artifactsDir: string): DoD | null {
-  const read = readDoDFile(join(artifactsDir, DOD_FILENAME));
+function parseDoDText(file: string, raw: string): DodReadResult {
+  if (Buffer.byteLength(raw, "utf8") > MAX_DOD_AGGREGATE_BYTES) {
+    return { ok: false, reason: `${file} exceeds the bounded DoD aggregate limit` };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch (error) {
+    return { ok: false, reason: `${file} is not valid JSON: ${(error as Error).message}` };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+    || Object.getPrototypeOf(parsed) !== Object.prototype) {
+    return { ok: false, reason: `${file} is not a valid typed DoD object` };
+  }
+  const candidate = parsed as Record<string, unknown>;
+  const keys = Object.keys(candidate);
+  if (keys.some((key) => !["items", "type_requirements_met", "updated_at", "contributions"].includes(key))) {
+    return { ok: false, reason: `${file} has unsupported typed DoD fields` };
+  }
+  if (!Array.isArray(candidate.items)) return { ok: false, reason: `${file} has invalid typed DoD items` };
+  if (candidate.items.length > MAX_DOD_ITEMS) return { ok: false, reason: `${file} has too many typed DoD items` };
+  if (typeof candidate.type_requirements_met !== "boolean") return { ok: false, reason: `${file} has invalid typed DoD requirements status` };
+  if (typeof candidate.updated_at !== "string" || candidate.updated_at.trim().length === 0 || Buffer.byteLength(candidate.updated_at, "utf8") > MAX_DOD_STRING_BYTES) return { ok: false, reason: `${file} has invalid typed DoD timestamp` };
+  if (candidate.contributions !== undefined && (!candidate.contributions || typeof candidate.contributions !== "object" || Array.isArray(candidate.contributions))) {
+    return { ok: false, reason: `${file} has invalid typed DoD contributions` };
+  }
+  const stack: Array<{ value: unknown; depth: number }> = [{ value: parsed, depth: 0 }];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (current.depth > MAX_DOD_DEPTH) return { ok: false, reason: `${file} exceeds the bounded DoD nesting limit` };
+    if (typeof current.value === "string") {
+      if (Buffer.byteLength(current.value, "utf8") > MAX_DOD_STRING_BYTES) return { ok: false, reason: `${file} contains an oversized typed DoD string` };
+      continue;
+    }
+    if (!current.value || typeof current.value !== "object") continue;
+    if (Object.getPrototypeOf(current.value) !== Object.prototype && !Array.isArray(current.value)) return { ok: false, reason: `${file} contains an unsafe typed DoD object` };
+    if (Array.isArray(current.value)) {
+      if (current.value.length > MAX_DOD_ITEMS) return { ok: false, reason: `${file} contains an oversized typed DoD array` };
+      for (const item of current.value) stack.push({ value: item, depth: current.depth + 1 });
+    } else {
+      for (const value of Object.values(current.value)) stack.push({ value, depth: current.depth + 1 });
+    }
+  }
+  const validationError = validateDoDValue(parsed);
+  if (validationError !== null) return { ok: false, reason: `${file} ${validationError}` };
+  return { ok: true, dod: parsed as unknown as DoD };
+}
+
+function writeDoDPinned(pinnedRoot: PinnedProjectRoot, artifactsDirRelative: string, dod: DoD): void {
+  const stamped: DoD = { ...dod, updated_at: new Date().toISOString() };
+  const validationError = validateDoDValue(stamped);
+  if (validationError !== null) throw new Error(`invalid DoD: ${validationError}`);
+  const serialized = JSON.stringify(stamped, null, 2) + "\n";
+  const bytes = Buffer.byteLength(serialized, "utf8");
+  if (bytes > MAX_DOD_BYTES) throw new Error(`DoD artifact exceeds the bounded ${MAX_DOD_BYTES}-byte limit`);
+  const relativeFile = artifactsDirRelative.length > 0 ? `${artifactsDirRelative}/${DOD_FILENAME}` : DOD_FILENAME;
+  pinnedRoot.writeAtomic(relativeFile, serialized);
+}
+/** Read the default DoD artifact through the caller's already-pinned root. */
+export function readDoDPinned(
+  pinnedRoot: PinnedProjectRoot,
+  artifactsDirRelative: string,
+): DoD | null {
+  const relativeFile = artifactsDirRelative.length > 0 ? `${artifactsDirRelative}/${DOD_FILENAME}` : DOD_FILENAME;
+  const read = readDoDFilePinned(pinnedRoot, relativeFile);
   return read.ok ? read.dod : null;
 }
 
-export function writeDoD(artifactsDir: string, dod: DoD): string {
-  const path = join(artifactsDir, DOD_FILENAME);
-  const stamped: DoD = { ...dod, updated_at: new Date().toISOString() };
-  writeFileSync(path, JSON.stringify(stamped, null, 2) + "\n", "utf8");
-  return path;
-}
-
-export function appendDoDItem(
-  artifactsDir: string,
+export function appendDoDItemPinned(
+  pinnedRoot: PinnedProjectRoot,
+  artifactsDirRelative: string,
   stageId: string,
   criterion: string,
   verifyMethod: string,
   agent: string,
 ): DoD {
-  const existing = readDoD(artifactsDir) ?? emptyDoD();
+  const existing = readDoDPinned(pinnedRoot, artifactsDirRelative) ?? emptyDoD();
   const n = existing.items.filter((it) => it.source === stageId).length + 1;
   const item: DoDItem = {
     id: `${stageId}-${n}`,
@@ -343,33 +540,28 @@ export function appendDoDItem(
   const items = [...existing.items, item];
   const contributions = mergeContribution(existing.contributions, stageId, { added: [item.id], closed: [], by: agent });
   const next: DoD = { ...existing, items, contributions };
-  writeDoD(artifactsDir, next);
+  writeDoDPinned(pinnedRoot, artifactsDirRelative, next);
   return next;
 }
 
-export function closeDoDItem(
-  artifactsDir: string,
+export function closeDoDItemPinned(
+  pinnedRoot: PinnedProjectRoot,
+  artifactsDirRelative: string,
   itemId: string,
   evidence: string,
   agent: string,
 ): { ok: true; dod: DoD } | { ok: false; reason: string } {
-  if (!evidence || !evidence.trim()) {
-    return { ok: false, reason: "evidence is required to close a DoD item" };
-  }
-  const existing = readDoD(artifactsDir);
+  if (!evidence || !evidence.trim()) return { ok: false, reason: "evidence is required to close a DoD item" };
+  const existing = readDoDPinned(pinnedRoot, artifactsDirRelative);
   if (!existing) return { ok: false, reason: "dod.json missing" };
-  const items = existing.items.map((it) =>
-    it.id === itemId ? { ...it, status: "met" as const, evidence: evidence.trim() } : it,
-  );
   const item = existing.items.find((it) => it.id === itemId);
   if (!item) return { ok: false, reason: `DoD item ${itemId} not found` };
-  const stageId = item.source;
-  const contributions = mergeContribution(existing.contributions, stageId, { added: [], closed: [itemId], by: agent });
+  const items = existing.items.map((it) => it.id === itemId ? { ...it, status: "met" as const, evidence: evidence.trim() } : it);
+  const contributions = mergeContribution(existing.contributions, item.source, { added: [], closed: [itemId], by: agent });
   const next: DoD = { ...existing, items, contributions };
-  writeDoD(artifactsDir, next);
+  writeDoDPinned(pinnedRoot, artifactsDirRelative, next);
   return { ok: true, dod: next };
 }
-
 export function isDoDComplete(dod: DoD | null): { ok: true } | { ok: false; pending: DoDItem[] } {
   if (!dod) return { ok: false, pending: [] };
   const pending = dod.items.filter((it) => it.status !== "met" || !it.evidence);
@@ -402,17 +594,19 @@ function mergeContribution(
  * For BUG_FIX: gate BEFORE first code edit. The root_cause must be a non-empty
  * string in the diagnosis artifact and explain WHY the fix closes the cause.
  */
-export function isRootCauseDocumented(
-  artifactsDir: string,
+/** Evaluate root-cause evidence from the pinned artifact bytes only. */
+export function isRootCauseDocumentedPinned(
+  pinnedRoot: PinnedProjectRoot,
+  artifactsDirRelative: string,
 ): { ok: true; diagnosis: { root_cause: string; explanation: string } } | { ok: false; reason: string } {
-  const path = join(artifactsDir, "diagnosis.json");
-  if (!existsSync(path)) return { ok: false, reason: "diagnosis.json missing" };
-  const diagnosis = JSON.parse(readFileSync(path, "utf8")) as { root_cause?: string; explanation?: string };
-  if (!diagnosis.root_cause || !diagnosis.root_cause.trim()) {
-    return { ok: false, reason: "diagnosis.root_cause is empty" };
+  const relativeFile = artifactsDirRelative.length > 0 ? `${artifactsDirRelative}/diagnosis.json` : "diagnosis.json";
+  try {
+    const read = pinnedRoot.readFile(relativeFile, { maxBytes: 1024 * 1024 });
+    const diagnosis = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(read.bytes)) as { root_cause?: string; explanation?: string };
+    if (!diagnosis.root_cause || !diagnosis.root_cause.trim()) return { ok: false, reason: "diagnosis.root_cause is empty" };
+    if (!diagnosis.explanation || !diagnosis.explanation.trim()) return { ok: false, reason: "diagnosis.explanation is empty (why does this fix close the root cause?)" };
+    return { ok: true, diagnosis: { root_cause: diagnosis.root_cause, explanation: diagnosis.explanation } };
+  } catch {
+    return { ok: false, reason: "diagnosis.json is missing or unreadable" };
   }
-  if (!diagnosis.explanation || !diagnosis.explanation.trim()) {
-    return { ok: false, reason: "diagnosis.explanation is empty (why does this fix close the root cause?)" };
-  }
-  return { ok: true, diagnosis: { root_cause: diagnosis.root_cause, explanation: diagnosis.explanation } };
 }

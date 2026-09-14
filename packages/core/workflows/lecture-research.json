@@ -8,7 +8,7 @@
       "id": "intake",
       "title": "URL-First Intake",
       "type": "orchestrator",
-      "prompt": "URL-first intake: extract exactly ONE public YouTube video or playlist URL from the task and the non-empty natural-language research prompt. Record the URL as the sole source prerequisite with kind video|playlist, stable id, location, and provenance 'user-provided URL; acquisition pending'. Do NOT ask the user for a transcript, captions, recording, notes, or media file; acquisition is automatic in the next stage. Do not summarize, filter, judge, fetch, or start implementation, repo edits, or task creation — intake is research-only.",
+      "prompt": "URL-first intake: emit the exact lecture_intake schema with schemaVersion 1. Extract exactly ONE public YouTube video or playlist URL from the task and the non-empty natural-language research prompt. Record the URL as the sole source prerequisite with kind video|playlist, stable id, location, and provenance 'user-provided URL; acquisition pending'. Do NOT ask the user for a transcript, captions, recording, notes, or media file; acquisition is automatic in the next stage. Do not summarize, filter, judge, fetch, or start implementation, repo edits, or task creation — intake is research-only.",
       "produces": "lecture_intake"
     },
     {

@@ -1,6 +1,6 @@
-import { readFile } from "node:fs/promises";
-import type { AcquisitionLimits } from "@andvl1/omp-workflows-core";
-import { DEFAULT_ACQUISITION_LIMITS, HARD_ACQUISITION_LIMITS, normalizeAcquisitionLimits } from "@andvl1/omp-workflows-core";
+import type { AcquisitionLimits, PinnedProjectRoot } from "@andvl1/omp-workflows-core";
+import { DEFAULT_ACQUISITION_LIMITS, HARD_ACQUISITION_LIMITS, normalizeAcquisitionLimits, PinnedProjectRoot as PinnedProjectRootRuntime, PinnedRootError } from "@andvl1/omp-workflows-core";
+import { resolve } from "node:path";
 import { validateEndpoint, type EndpointTrust } from "./endpoint-policy.js";
 import {
   OPENROUTER_NATIVE_ASR_DEFAULT_MAX_REQUEST_BYTES,
@@ -73,13 +73,17 @@ export const defaultLectureResearchConfig: LectureResearchConfig = Object.freeze
   gemini: Object.freeze({ provider: "gemini", model: "gemini-2.5-flash", endpoint: "https://generativelanguage.googleapis.com", apiKeyEnv: "GEMINI_API_KEY" }),
 });
 
+export type LectureResearchConfigErrorCode = "invalid" | "root_unavailable" | "not_found" | "not_regular" | "limit" | "invalid_utf8" | "changed" | "unsafe";
+
 export class LectureResearchConfigError extends Error {
-  constructor(message = "Invalid lecture research configuration") {
+  readonly code: LectureResearchConfigErrorCode;
+
+  constructor(message = "Invalid lecture research configuration", code: LectureResearchConfigErrorCode = "invalid") {
     super(message);
     this.name = "LectureResearchConfigError";
+    this.code = code;
   }
 }
-
 function boundedString(value: unknown, name: string, max: number): string {
   if (typeof value !== "string" || value.length === 0 || value.length > max || /[\r\n\u0000-\u001f\u007f]/.test(value)) {
     throw new LectureResearchConfigError(`Invalid ${name}`);
@@ -258,13 +262,63 @@ function parsePipeline(value: unknown, limits: AcquisitionLimits): LecturePipeli
   }
   return result;
 }
+export const MAX_LECTURE_RESEARCH_CONFIG_BYTES = 256 * 1024;
 
-export async function loadLectureResearchConfig(cwd: string, _env: Record<string, string | undefined> = process.env): Promise<LectureResearchConfig> {
+export interface LoadLectureResearchConfigOptions {
+  /** Borrow a caller-owned project pin so the config read shares its identity. */
+  pinnedRoot?: PinnedProjectRoot;
+}
+
+function readLectureResearchConfigText(cwd: string, options: LoadLectureResearchConfigOptions): string | null {
+  const supplied = options.pinnedRoot;
+  const pinned = supplied ?? PinnedProjectRootRuntime.open(cwd);
+  if (!pinned) throw new LectureResearchConfigError("Project root cannot be pinned for lecture research configuration", "root_unavailable");
+  try {
+    const resolvedCwd = resolve(cwd);
+    if (resolvedCwd !== pinned.lexical_root && resolvedCwd !== pinned.canonical_root) {
+      throw new LectureResearchConfigError("Lecture research configuration root does not match the pinned project", "changed");
+    }
+    if (!pinned.isStable()) throw new LectureResearchConfigError("Pinned project root changed before lecture research configuration read", "changed");
+    const entry = pinned.pathEntryInfo(".omp/lecture-research.json");
+    if (entry && entry.kind !== "file") throw new LectureResearchConfigError("lecture-research.json must be a regular file", "not_regular");
+    let read: { bytes: Uint8Array };
+    try {
+      read = pinned.readFile(".omp/lecture-research.json", { maxBytes: MAX_LECTURE_RESEARCH_CONFIG_BYTES });
+    } catch (error) {
+      if (error instanceof PinnedRootError && error.code === "not_found") return null;
+      if (error instanceof PinnedRootError && error.code === "not_regular") {
+        throw new LectureResearchConfigError("lecture-research.json must be a regular file", "not_regular");
+      }
+      if (error instanceof PinnedRootError && (error.code === "limit" || /bounded read limit|exceeds the bounded read limit/u.test(error.message))) {
+        throw new LectureResearchConfigError("lecture-research.json exceeds the 256 KiB limit", "limit");
+      }
+      if (error instanceof PinnedRootError && error.code === "changed") {
+        throw new LectureResearchConfigError("lecture-research.json changed during the bounded read", "changed");
+      }
+      throw new LectureResearchConfigError("lecture-research.json could not be read safely", "unsafe");
+    }
+    if (!pinned.isStable()) throw new LectureResearchConfigError("Pinned project root changed after lecture research configuration read", "changed");
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
+    } catch {
+      throw new LectureResearchConfigError("lecture-research.json is not valid UTF-8", "invalid_utf8");
+    }
+  } finally {
+    if (!supplied) pinned.close();
+  }
+}
+
+export async function loadLectureResearchConfig(
+  cwd: string,
+  _env: Record<string, string | undefined> = process.env,
+  options: LoadLectureResearchConfigOptions = {},
+): Promise<LectureResearchConfig> {
+  const text = readLectureResearchConfigText(cwd, options);
+  if (text === null) return defaultLectureResearchConfig;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(await readFile(`${cwd}/.omp/lecture-research.json`, "utf8"));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultLectureResearchConfig;
+    parsed = JSON.parse(text) as unknown;
+  } catch {
     throw new LectureResearchConfigError("Invalid lecture research configuration file");
   }
   const root = objectValue(parsed, "configuration");

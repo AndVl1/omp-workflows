@@ -11,47 +11,25 @@ import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { runCto, type TeamDef, type Escalation, type CtoState, type TeamLease, type DecisionMemoryEntry } from "@andvl1/omp-workflows-core";
+import { PinnedRootError } from "../src/specification/pinned-root.js";
+import { MAX_TEAMS } from "../src/cto/types.js";
+import { buildTeamPlan, validateDecompositionDepth } from "../src/cto/plan.js";
+import { ctoRunId } from "../src/cto/run.js";
 import {
-  MAX_TEAMS,
-  buildTeamPlan,
-  validateDecompositionDepth,
-  runCto,
-  ctoRunId,
-  newCtoState,
-  writeCtoState,
-  readCtoState,
-  migrateCtoState,
-  canonicalizeState,
-  setTeamStatus,
-  setEscalation,
-  expireEscalations,
-  pendingEscalations,
-  activeTeams,
-  setIntegration,
-  setCtoPause,
-  integrationDoD,
-  ctoBackstop,
-  sanitizeEscalation,
-  appendDoDItem,
-  closeDoDItem,
-  acquireLease,
-  heartbeatLease,
-  releaseLease,
-  isLeaseAlive,
-  reclaimDeadLeases,
-  recordDecision,
-  recallDecisions,
-  decisionsToMarkdown,
-  type TeamDef,
-  type Escalation,
-  type CtoState,
-  type TeamLease,
-  type DecisionMemoryEntry,
-  refineTask,
-  validateRefinement,
-  evaluateDissent,
-  dissentGate,
-} from "@andvl1/omp-workflows-core";
+  newCtoState, writeCtoState, readCtoState, migrateCtoState, setTeamStatus, setEscalation,
+  expireEscalations, pendingEscalations, activeTeams, setIntegration, setCtoPause,
+} from "../src/cto/state.js";
+import { integrationDoD, ctoBackstop } from "../src/cto/gates.js";
+import { sanitizeEscalation } from "../src/cto/escalation.js";
+import { appendDoDItemPinned, closeDoDItemPinned } from "../src/engine/dod.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
+import { acquireLease, heartbeatLease, releaseLease, isLeaseAlive, reclaimDeadLeases } from "../src/cto/leases.js";
+import { recordDecision, recallDecisions, decisionsToMarkdown } from "../src/cto/decisions.js";
+import { refineTask, validateRefinement } from "../src/cto/refinement.js";
+import { evaluateDissent } from "../src/cto/dissent.js";
+import { dissentGate } from "../src/cto/gates.js";
+import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 
 function sampleDefs(): Record<string, TeamDef> {
   return {
@@ -82,6 +60,10 @@ function sampleDefs(): Record<string, TeamDef> {
   };
 }
 
+function persistState(state: CtoState, root: string): void {
+  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+}
+
 function sampleEscalation(overrides: Partial<Escalation> = {}): Escalation {
   return {
     id: "run-1/kotlin-backend/clarify/1",
@@ -100,8 +82,8 @@ test("cto-engine: buildTeamPlan accepts a valid decomposition", () => {
       id: "auth-2026-08-04",
       task: "Add OAuth",
       teams: [
-        { team: "kotlin-backend", scope: ["backend-kotlin"], slice: "server", profile: "lightweight" },
-        { team: "frontend", slice: "web client", worktree: "separate_worktree", depends_on: ["kotlin-backend"] },
+        { team: "kotlin-backend", scope: ["backend-kotlin"], slice: "server", profile: "lightweight", worktree: "same_branch", depends_on: [] },
+        { team: "frontend", scope: ["frontend"], slice: "web-client", profile: "lightweight", worktree: "separate_worktree", depends_on: ["kotlin-backend"] },
       ],
     },
     sampleDefs(),
@@ -112,6 +94,14 @@ test("cto-engine: buildTeamPlan accepts a valid decomposition", () => {
     assert.equal(res.plan.teams[1]?.worktree, "separate_worktree");
     assert.deepEqual(res.plan.teams[1]?.depends_on, ["kotlin-backend"]);
   }
+});
+test("cto-engine: buildTeamPlan accepts uppercase CTO run identities", () => {
+  const result = buildTeamPlan({
+    id: "CTO-RUN-1",
+    task: "uppercase run",
+    teams: [{ team: "kotlin-backend", scope: ["backend-kotlin"], slice: "server", profile: "lightweight", worktree: "same_branch", depends_on: [] }],
+  }, sampleDefs());
+  assert.equal(result.ok, true, result.ok ? "" : result.reason);
 });
 
 test("cto-engine: buildTeamPlan rejects over-cap and empty plans", () => {
@@ -189,14 +179,20 @@ test("cto-engine: validateDecompositionDepth enforces the depth cap", () => {
 
 test("cto-engine: runCto persists state and returns the plan", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-run-"));
+  const runtime = openTestCtoRuntime(root);
+  const pinned = PinnedProjectRoot.open(root);
+  assert.ok(pinned);
+  if (!pinned) { runtime.close(); rmSync(root, { recursive: true, force: true }); return; }
   try {
     const res = runCto({
       task: "Add OAuth",
       cwd: root,
       branch: "feat/auth",
       autonomous: false,
+      sessionId: "main-session",
       teams: [{ team: "kotlin-backend", slice: "server" }, { team: "frontend", slice: "web" }],
       defs: sampleDefs(),
+      runtimeAccess: runtime.access,
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;
@@ -207,6 +203,7 @@ test("cto-engine: runCto persists state and returns the plan", () => {
     assert.ok(reloaded);
     assert.equal(reloaded?.task, "Add OAuth");
   } finally {
+    runtime.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -220,25 +217,30 @@ test("cto-engine: ctoRunId produces a unique slug per task", () => {
 
 test("cto-engine: state transitions persist and are readable", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-state-"));
+  const runtime = openTestCtoRuntime(root);
   try {
     const res = runCto({
       task: "t",
       cwd: root,
       branch: "main",
       autonomous: false,
+      sessionId: "main-session",
       teams: [{ team: "frontend", slice: "s" }],
       defs: sampleDefs(),
+      runtimeAccess: runtime.access,
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;
 
-    setTeamStatus(res.state, "frontend", "parked", root);
-    setEscalation(res.state, "frontend", "esc-1", { status: "pending", sent_at: new Date().toISOString(), timeout_ms: 1000 }, root);
+    setTeamStatus(res.state, "frontend", "parked");
+    setEscalation(res.state, "frontend", "esc-1", { status: "pending", sent_at: new Date().toISOString(), timeout_ms: 1000 });
+    persistState(res.state, root);
     const reloaded = readCtoState(res.plan.id, root);
     assert.equal(reloaded?.teams[0]?.status, "parked");
     assert.equal(reloaded?.teams[0]?.escalations["esc-1"]?.status, "pending");
     assert.deepEqual(activeTeams(reloaded!), ["frontend"]);
   } finally {
+    runtime.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -277,58 +279,77 @@ test("cto-engine: pendingEscalations lists only pending across teams", () => {
 
 test("cto-engine: integrationDoD requires every team done with a complete DoD", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-dod-"));
+  const runtime = openTestCtoRuntime(root);
+  const pinned = PinnedProjectRoot.open(root);
+  assert.ok(pinned);
+  if (!pinned) { runtime.close(); rmSync(root, { recursive: true, force: true }); return; }
   try {
     const res = runCto({
       task: "t",
       cwd: root,
       branch: "main",
       autonomous: false,
+      sessionId: "main-session",
       teams: [{ team: "frontend", slice: "s" }],
       defs: sampleDefs(),
+      runtimeAccess: runtime.access,
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;
 
     // Not done yet -> blocked.
-    assert.equal(integrationDoD(res.state, root).ok, false);
+    assert.equal(integrationDoD(res.state, pinned).ok, false);
 
-    setTeamStatus(res.state, "frontend", "done", root);
+    setTeamStatus(res.state, "frontend", "done");
     // Done but no dod_path -> blocked.
-    assert.equal(integrationDoD(res.state, root).ok, false);
+    assert.equal(integrationDoD(res.state, pinned).ok, false);
 
     // Give the team a complete DoD.
     const artifacts = join(root, ".work-state", "artifacts", "frontend");
     mkdirSync(artifacts, { recursive: true });
+    const artifactsRelative = pinned.relativePath(artifacts);
+    assert.ok(artifactsRelative !== null);
+    if (artifactsRelative === null) { pinned.close(); return; }
     res.state.teams[0]!.dod_path = join(".work-state", "artifacts", "frontend");
-    const dod = appendDoDItem(artifacts, "implementation", "feature works", "run the app", "developer-kotlin");
+    const dod = appendDoDItemPinned(pinned, artifactsRelative, "implementation", "feature works", "run the app", "developer-kotlin");
     const itemId = dod.items[0]?.id;
     assert.ok(itemId);
-    closeDoDItem(artifacts, itemId, "smoke test passed", "developer-kotlin");
-    assert.equal(integrationDoD(res.state, root).ok, true);
+    closeDoDItemPinned(pinned, artifactsRelative, itemId, "smoke test passed", "developer-kotlin");
+    assert.equal(integrationDoD(res.state, pinned).ok, true);
   } finally {
+    pinned.close();
+    runtime.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("cto-engine: ctoBackstop blocks a done-claim with incomplete team DoD", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-backstop-"));
+  const runtime = openTestCtoRuntime(root);
+  const pinned = PinnedProjectRoot.open(root);
+  assert.ok(pinned);
+  if (!pinned) { runtime.close(); rmSync(root, { recursive: true, force: true }); return; }
   try {
     const res = runCto({
       task: "t",
       cwd: root,
       branch: "main",
       autonomous: false,
+      sessionId: "main-session",
       teams: [{ team: "frontend", slice: "s" }],
       defs: sampleDefs(),
+      runtimeAccess: runtime.access,
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;
-    setTeamStatus(res.state, "frontend", "done", root);
-    setCtoPause(res.state, "done", "claiming done", root);
-    const gate = ctoBackstop(res.state, root);
+    setTeamStatus(res.state, "frontend", "done");
+    setCtoPause(res.state, "done", "claiming done");
+    const gate = ctoBackstop(res.state, pinned);
     assert.equal(gate.decision, "block");
     if (gate.decision === "block") assert.match(gate.reason, /CTO DoD/);
   } finally {
+    pinned.close();
+    runtime.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -422,48 +443,30 @@ test("cto-core: migrateCtoState treats missing schema as v1 and default-fills pa
   assert.deepEqual(completed.inbox_quarantine, {}, "missing inbox_quarantine default-filled");
 });
 
-test("cto-core: readCtoState applies migration to legacy state files", () => {
-  const root = mkdtempSync(join(tmpdir(), "cto-legacy-"));
+test("cto-core: readCtoState normalizes legacy bytes in memory without rewriting", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-legacy-read-"));
   try {
-    writeCtoState(schema1Fixture() as unknown as CtoState, root);
-    const reloaded = readCtoState("legacy-run-2026-08-01", root);
+    const runId = "legacy-run-2026-08-01";
+    const statePath = join(root, ".work-state", "cto", runId, "state.json");
+    mkdirSync(dirname(statePath), { recursive: true });
+    const legacyBytes = Buffer.from(JSON.stringify(schema1Fixture(), null, 2), "utf8");
+    writeFileSync(statePath, legacyBytes);
+
+    const reloaded = readCtoState(runId, root);
     assert.ok(reloaded);
     assert.equal(reloaded?.schema, 2);
     assert.deepEqual(reloaded?.budget?.policy, { token_limit: null, dollar_limit: null, time_limit_ms: null });
     assert.deepEqual(reloaded?.leases, {});
+    assert.deepEqual(readFileSync(statePath), legacyBytes, "legacy normalization is read-only");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("cto-core: canonicalizeState migrates a legacy file once and is idempotent", () => {
-  const root = mkdtempSync(join(tmpdir(), "cto-canon-"));
-  try {
-    const runId = "legacy-run-2026-08-01";
-    writeCtoState(schema1Fixture() as unknown as CtoState, root);
-    const path = join(root, ".work-state", "cto", runId, "state.json");
-
-    const first = canonicalizeState(runId, root);
-    assert.equal(first.schema, 2);
-    assert.deepEqual(first.budget?.policy, { token_limit: null, dollar_limit: null, time_limit_ms: null });
-    assert.deepEqual(first.leases, {});
-    const afterFirst = readFileSync(path, "utf8");
-
-    const second = canonicalizeState(runId, root);
-    assert.equal(second.schema, 2);
-    const afterSecond = readFileSync(path, "utf8");
-    assert.equal(afterSecond, afterFirst);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("cto-core: canonicalizeState rewrites a partial schema-2 file once and is idempotent", () => {
-  const root = mkdtempSync(join(tmpdir(), "cto-canon-s2-"));
+test("cto-core: readCtoState normalizes partial schema-2 bytes without rewriting", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-partial-read-"));
   try {
     const runId = "standby-1234";
-    // Direct standby-writer shape (registry.ensureStandbyRun): schema 2 but
-    // no canonical schema-2 fields — a partial canonical state.
     const partial = {
       schema: 2,
       id: runId,
@@ -476,47 +479,38 @@ test("cto-core: canonicalizeState rewrites a partial schema-2 file once and is i
       pause: { kind: "none", reason: "standby" },
       updated_at: "2026-08-07T00:00:00.000Z",
     };
-    const dir = join(root, ".work-state", "cto", runId);
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, "state.json");
-    writeFileSync(path, JSON.stringify(partial, null, 2));
+    const statePath = join(root, ".work-state", "cto", runId, "state.json");
+    mkdirSync(dirname(statePath), { recursive: true });
+    const partialBytes = Buffer.from(JSON.stringify(partial, null, 2), "utf8");
+    writeFileSync(statePath, partialBytes);
 
-    const first = canonicalizeState(runId, root);
-    assert.equal(first.schema, 2);
-    assert.deepEqual(first.budget?.policy, { token_limit: null, dollar_limit: null, time_limit_ms: null });
-    assert.deepEqual(first.leases, {});
-    assert.deepEqual(first.decisions, []);
-    assert.deepEqual(first.inbox_quarantine, {});
-    const afterFirst = readFileSync(path, "utf8");
-    assert.ok(afterFirst.includes('"leases": {}'), "canonical fields persisted to disk");
-
-    const second = canonicalizeState(runId, root);
-    assert.equal(second.schema, 2);
-    const afterSecond = readFileSync(path, "utf8");
-    assert.equal(afterSecond, afterFirst, "no rewrite once the state is canonical");
+    const projected = readCtoState(runId, root);
+    assert.ok(projected);
+    assert.deepEqual(projected?.budget?.policy, { token_limit: null, dollar_limit: null, time_limit_ms: null });
+    assert.deepEqual(projected?.leases, {});
+    assert.deepEqual(projected?.decisions, []);
+    assert.deepEqual(projected?.inbox_quarantine, {});
+    assert.deepEqual(readFileSync(statePath), partialBytes, "partial legacy normalization is read-only");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("cto-core: canonicalizeState leaves a complete schema-2 state untouched", () => {
-  const root = mkdtempSync(join(tmpdir(), "cto-canon-complete-"));
+test("cto-core: writeCtoState rejects a missing preCommit before mutation", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-write-guard-"));
   try {
     const state = newCtoState({
-      id: "complete-run",
+      id: "missing-precommit",
       task: "t",
       branch: "b",
       autonomous: false,
-      plan: { id: "complete-run", task: "t", teams: [], created_at: "2026-08-07T00:00:00.000Z" },
+      plan: { id: "missing-precommit", task: "t", teams: [], created_at: "2026-08-07T00:00:00.000Z" },
     });
-    writeCtoState(state, root);
-    const path = join(root, ".work-state", "cto", "complete-run", "state.json");
-    const before = readFileSync(path, "utf8");
-
-    const canonical = canonicalizeState("complete-run", root);
-    assert.equal(canonical.schema, 2);
-    const after = readFileSync(path, "utf8");
-    assert.equal(after, before, "complete canonical state is not rewritten (updated_at not re-stamped)");
+    assert.throws(
+      () => (writeCtoState as unknown as (value: CtoState, cwd: string) => string)(state, root),
+      /requires a preCommit callback/u,
+    );
+    assert.equal(existsSync(join(root, ".work-state", "cto", "missing-precommit", "state.json")), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -543,7 +537,7 @@ test("cto-core: writeCtoState round-trips schema 2 with stable defaults", () => 
     assert.equal(state.health, undefined);
     assert.equal(state.scheduler, undefined);
 
-    const path = writeCtoState(state, root);
+    const path = writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     assert.ok(path.endsWith(join(".work-state", "cto", "rt-run", "state.json")));
 
     const reloaded = readCtoState("rt-run", root);
@@ -559,29 +553,43 @@ test("cto-core: writeCtoState round-trips schema 2 with stable defaults", () => 
     rmSync(root, { recursive: true, force: true });
   }
 });
-test("cto-core: readCtoState never observes partial state during concurrent writes", async () => {
+test("cto-core: concurrent reads fail closed on an in-flight replacement and never observe partial state", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-atomic-"));
   const initial = newCtoState({ id: "atomic-run", task: "t", branch: "b", autonomous: false,
     plan: { id: "atomic-run", task: "t", teams: [], created_at: "" } });
-  initial.plan.task = "x".repeat(256 * 1024);
-  writeCtoState(initial, root);
+  initial.plan.task = "x".repeat(64 * 1024);
+  writeCtoState(initial, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
   const writer = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
-    import { writeCtoState, newCtoState } from './src/cto/state.ts';
+    import { readCtoState, writeCtoState } from './src/cto/state.ts';
     const root = process.env.CTO_ROOT;
     if (!root) throw new Error('missing CTO_ROOT');
-    const state = newCtoState({ id: 'atomic-run', task: 't', branch: 'b', autonomous: false,
-      plan: { id: 'atomic-run', task: 't', teams: [], created_at: '' } });
-    state.plan.task = 'x'.repeat(256 * 1024);
-    for (let i = 0; i < 200; i++) writeCtoState(state, root);
+    for (let i = 0; i < 4; i++) {
+      const state = readCtoState('atomic-run', root);
+      if (!state) throw new Error('atomic-run state disappeared');
+      state.plan.task = 'x'.repeat(64 * 1024);
+      writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+    }
   `], { cwd: resolve(dirname(fileURLToPath(import.meta.url)), ".."), env: { ...process.env, CTO_ROOT: root }, stdio: ["ignore", "ignore", "pipe"] });
   let writerError = "";
   writer.stderr?.on("data", (chunk: Buffer) => { writerError += String(chunk); });
   try {
-    for (let i = 0; i < 20_000; i++) {
-      const observed = readCtoState("atomic-run", root);
+    // Keep the synchronous read burst bounded: the child writer gets an
+    // event-loop turn after this loop, while every completed read still has
+    // to be canonical or an explicitly typed fail-closed race.
+    for (let i = 0; i < 20; i++) {
+      let observed: CtoState | null;
+      try {
+        observed = readCtoState("atomic-run", root);
+      } catch (error) {
+        // Descriptor-anchored reads fail closed if an atomic replacement is
+        // detected between snapshot and verification. The typed race result
+        // is part of the security contract; it must not be treated as data.
+        assert.ok(error instanceof PinnedRootError);
+        assert.equal(error.code, "changed");
+        continue;
+      }
       assert.ok(observed, `readCtoState returned null at iteration ${i}`);
-      assert.equal(observed?.plan.task.length, 256 * 1024);
-      if (writer.exitCode !== null) break;
+      assert.equal(observed?.plan.task.length, 64 * 1024);
     }
     const status = await new Promise<number>((resolve) => writer.once("exit", (code) => resolve(code ?? 1)));
     assert.equal(status, 0, writerError);
@@ -710,25 +718,29 @@ test("cto-core: acquireLease force-reclaims a dead lease with a new token", () =
   assert.equal(state.leases?.["frontend"], second.lease);
 });
 
-test("cto-core: lease root persistence round-trips through writeCtoState", () => {
+test("cto-core: lease transitions require explicit trusted persistence", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-lease-"));
   try {
     const state = leaseFixture("lease-persist-run");
-    const res = acquireLease(state, "frontend", process.pid, 30_000, root);
+    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+    const res = acquireLease(state, "frontend", process.pid, 30_000);
     assert.ok("lease" in res);
     if (!("lease" in res)) return;
 
+    persistState(state, root);
     let reloaded = readCtoState("lease-persist-run", root);
     assert.ok(reloaded);
     assert.deepEqual(reloaded?.leases?.["frontend"], res.lease);
 
-    heartbeatLease(state, "frontend", res.lease.token, root);
+    heartbeatLease(state, "frontend", res.lease.token);
+    persistState(state, root);
     const heartbeatAt = state.leases!["frontend"]!.heartbeat_at;
     reloaded = readCtoState("lease-persist-run", root);
     assert.ok(reloaded);
     assert.equal(reloaded?.leases?.["frontend"]?.heartbeat_at, heartbeatAt);
 
-    releaseLease(state, "frontend", res.lease.token, root);
+    releaseLease(state, "frontend", res.lease.token);
+    persistState(state, root);
     reloaded = readCtoState("lease-persist-run", root);
     assert.ok(reloaded);
     assert.equal(reloaded?.leases?.["frontend"], undefined);
@@ -847,15 +859,16 @@ test("cto-core: decisionsToMarkdown is a deterministic projection containing dec
   assert.equal(decisionsToMarkdown(state), md); // deterministic: same input → same output
 });
 
-test("cto-core: recordDecision root persistence round-trips through writeCtoState", () => {
+test("cto-core: recordDecision requires explicit trusted persistence", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-decision-"));
   try {
     const state = decisionFixture("decision-persist-run");
+    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     recordDecision(
       state,
       { decision: "Persist decisions", why: "Durable audit trail", tags: ["durable"], by: "cto" },
-      root,
     );
+    persistState(state, root);
 
     const reloaded = readCtoState("decision-persist-run", root);
     assert.ok(reloaded);
@@ -874,37 +887,21 @@ test("cto-core: recordDecision root persistence round-trips through writeCtoStat
 });
 
 // ── cto-operations (br-zps.2, br-zps.7, br-zps.8) tests ─────────────────────
-import {
-  defaultBudgetState,
-  checkBudget,
-  recordSpend,
-  setBudgetPolicy,
-  CHAR_HEURISTIC_RECORDER,
-  type BudgetRecorder,
-  assessRunHealth,
-  healthToMarkdown,
-  shouldRunWave,
-  buildDigest,
-  startWaveScheduler,
-  type TeamPlan,
-} from "@andvl1/omp-workflows-core";
+import type { TeamPlan } from "@andvl1/omp-workflows-core";
+import { defaultBudgetState, checkBudget, recordSpend, CHAR_HEURISTIC_RECORDER, type BudgetRecorder } from "../src/cto/budget.js";
+import { assessRunHealth, healthToMarkdown } from "../src/cto/health.js";
+import { shouldRunWave, buildDigest, startWaveScheduler } from "../src/cto/scheduler.js";
 
 describe("cto-operations budget", () => {
   function sampleState(overrides: Partial<CtoState> = {}): CtoState {
-    return {
-      schema: 2,
+    const state = newCtoState({
       id: "run-budget-test",
       task: "budget slice",
       branch: "feat/br-zps-cto-control-plane",
       autonomous: true,
       plan: { id: "run-budget-test", task: "budget slice", teams: [], created_at: new Date().toISOString() },
-      teams: [],
-      integration: { status: "pending" },
-      pause: { kind: "none", reason: "" },
-      updated_at: new Date().toISOString(),
-      budget: defaultBudgetState(),
-      ...overrides,
-    };
+    });
+    return { ...state, ...overrides };
   }
 
   test("defaultBudgetState: all limits null, all accounting zero (D3)", () => {
@@ -936,12 +933,13 @@ describe("cto-operations budget", () => {
     });
   });
 
-  test("recordSpend persists to disk when root is given", () => {
+  test("recordSpend requires explicit trusted persistence", () => {
     const root = mkdtempSync(join(tmpdir(), "cto-budget-"));
     try {
       const state = sampleState();
-      writeCtoState(state, root);
-      recordSpend(state, "backend", 300, 6, root);
+      writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+      recordSpend(state, "backend", 300, 6);
+      persistState(state, root);
       const onDisk = readCtoState("run-budget-test", root);
       assert.ok(onDisk);
       assert.equal(onDisk.budget!.accounting.tokens_estimated, 300);
@@ -959,24 +957,34 @@ describe("cto-operations budget", () => {
     assert.deepEqual(state.budget!.policy, defaultBudgetState().policy);
   });
 
-  test("setBudgetPolicy partial merge preserves unset fields", () => {
-    const state = sampleState();
-    setBudgetPolicy(state, { token_limit: 1000, time_limit_ms: 60_000 });
-    assert.equal(state.budget!.policy.token_limit, 1000);
-    assert.equal(state.budget!.policy.time_limit_ms, 60_000);
-    assert.equal(state.budget!.policy.dollar_limit, null); // untouched
-  });
-
-  test("setBudgetPolicy persists to disk when root is given", () => {
+  test("canonical initial budget policy persists and exceeded budget blocks", () => {
     const root = mkdtempSync(join(tmpdir(), "cto-budget-"));
     try {
-      const state = sampleState();
-      writeCtoState(state, root);
-      setBudgetPolicy(state, { token_limit: 500 }, root);
-      const onDisk = readCtoState("run-budget-test", root);
-      assert.ok(onDisk);
-      assert.equal(onDisk.budget!.policy.token_limit, 500);
-      assert.equal(onDisk.budget!.policy.dollar_limit, null);
+      const state = sampleState({
+        budget: {
+          policy: { token_limit: 500, dollar_limit: null, time_limit_ms: null },
+          accounting: {
+            tokens_estimated: 500,
+            dollars_estimated: 0,
+            elapsed_ms: 0,
+            per_team: { "budget-team": { tokens: 500, dollars: 0, ms: 0 } },
+          },
+        },
+      });
+      writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+      const persisted = readCtoState("run-budget-test", root);
+      assert.ok(persisted);
+
+      const budget = checkBudget(persisted!);
+      assert.equal(budget.status, "exceeded");
+      assert.match(budget.detail ?? "", /tokens 500 >= limit 500/);
+
+      const gate = dissentGate(persisted!, "budget-team", { stakes: "low", reversible: true });
+      assert.equal(gate.ok, false);
+      if (!gate.ok) {
+        assert.match(gate.reason, /budget exceeded/);
+        assert.match(gate.reason, /budget-team/);
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1213,54 +1221,40 @@ describe("cto-operations health+scheduler", () => {
     assert.equal(shouldRunWave({ ...sampleState(), scheduler: { ...scheduler, last_wave_at: "not-a-date" } }, now), true);
   });
 
-  test("scheduler: buildDigest shape and disk-truth preference", () => {
-    const root = mkdtempSync(join(tmpdir(), "cto-digest-"));
-    try {
-      // Disk truth: 2 decisions, 3 open escalations, exceeded budget.
-      const disk = withBudget(sampleState(), {
-        policy: { token_limit: 1000, dollar_limit: null, time_limit_ms: null },
-        accounting: { tokens_estimated: 5000, dollars_estimated: 0, elapsed_ms: 20, per_team: {} },
-      });
-      disk.decisions = [
-        { id: "d1", at: "2026-08-07T10:00:00.000Z", decision: "keep mock adapter", why: "no network in tests", tags: ["adapter"], by: "cto" },
-        { id: "d2", at: "2026-08-07T11:00:00.000Z", decision: "unlimited budget default", why: "D3", tags: ["budget"], by: "cto" },
-      ];
-      disk.teams[0].escalations = { "e1": { status: "pending" }, "e2": { status: "undelivered" } };
-      disk.teams[1].escalations = { "e3": { status: "pending" } };
-      writeCtoState(disk, root);
+  test("scheduler: buildDigest shape from the supplied state", () => {
+    const state = withBudget(sampleState(), {
+      policy: { token_limit: 1000, dollar_limit: null, time_limit_ms: null },
+      accounting: { tokens_estimated: 0, dollars_estimated: 0, elapsed_ms: 0, per_team: {} },
+    });
+    recordSpend(state, "team-a", 5000, 0);
+    state.decisions = [
+      { id: "d1", at: "2026-08-07T10:00:00.000Z", decision: "keep mock adapter", why: "no network in tests", tags: ["adapter"], by: "cto" },
+      { id: "d2", at: "2026-08-07T11:00:00.000Z", decision: "unlimited budget default", why: "D3", tags: ["budget"], by: "cto" },
+    ];
+    state.teams[0].escalations = { "e1": { status: "pending" }, "e2": { status: "undelivered" } };
+    state.teams[1].escalations = { "e3": { status: "pending" } };
 
-      // In-memory state is stale: no decisions, no escalations, unlimited budget.
-      const stale = withBudget(sampleState());
-      const digest = buildDigest(stale, root);
-
-      assert.equal(digest.run_id, "run-health-1");
-      assert.ok(!Number.isNaN(Date.parse(digest.at)));
-      assert.equal(digest.health.run_id, "run-health-1");
-      assert.equal(digest.health.budget_status, "exceeded");
-      assert.equal(digest.health.healthy, false);
-      assert.equal(digest.health.pending_escalations, 3);
-      assert.equal(digest.open_escalations, 3);
-      assert.equal(digest.budget_status, "exceeded");
-      assert.equal(digest.recent_decisions.length, 2);
-      assert.equal(digest.recent_decisions[0].id, "d2"); // newest-first
-      assert.equal(digest.recent_decisions[0].by, "cto");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+    const digest = buildDigest(state);
+    assert.equal(digest.run_id, "run-health-1");
+    assert.ok(!Number.isNaN(Date.parse(digest.at)));
+    assert.equal(digest.health.run_id, "run-health-1");
+    assert.equal(digest.health.budget_status, "exceeded");
+    assert.equal(digest.health.healthy, false);
+    assert.equal(digest.health.pending_escalations, 3);
+    assert.equal(digest.open_escalations, 3);
+    assert.equal(digest.budget_status, "exceeded");
+    assert.equal(digest.recent_decisions.length, 2);
+    assert.equal(digest.recent_decisions[0].id, "d2");
+    assert.equal(digest.recent_decisions[0].by, "cto");
   });
 
-  test("scheduler: buildDigest falls back to passed state when no file on disk", () => {
-    const root = mkdtempSync(join(tmpdir(), "cto-digest-empty-"));
-    try {
-      const state = withBudget(sampleState());
-      const digest = buildDigest(state, root);
-      assert.equal(digest.run_id, "run-health-1");
-      assert.equal(digest.health.healthy, true);
-      assert.equal(digest.open_escalations, 0);
-      assert.deepEqual(digest.recent_decisions, []);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+  test("scheduler: buildDigest handles a supplied state without disk access", () => {
+    const state = withBudget(sampleState());
+    const digest = buildDigest(state);
+    assert.equal(digest.run_id, "run-health-1");
+    assert.equal(digest.health.healthy, true);
+    assert.equal(digest.open_escalations, 0);
+    assert.deepEqual(digest.recent_decisions, []);
   });
 
   /** Wall-clock delay; see the real-timer exception note below. */
@@ -1296,42 +1290,80 @@ describe("cto-operations health+scheduler", () => {
   // (30ms interval vs 200ms observation) are the only honest way to verify the
   // timer fires and that stop() actually clears it.
   test("scheduler: startWaveScheduler fires onWave on interval and stops cleanly", async () => {
-    const root = mkdtempSync(join(tmpdir(), "cto-wave-"));
+    let waves = 0;
+    let current = withBudget(sampleState());
+    const adapter = {
+      read: () => current,
+      update: (mutator: (state: CtoState) => CtoState): CtoState => {
+        current = mutator(current);
+        return current;
+      },
+    };
+    const stop = startWaveScheduler(current, adapter, 30, () => {
+      waves += 1;
+    });
     try {
-      let waves = 0;
-      const state = withBudget(sampleState());
-      const stop = startWaveScheduler(state, root, 30, () => {
-        waves += 1;
-      });
-      try {
-        await delay(200);
-        assert.ok(waves >= 1, `onWave should fire at least once (got ${waves})`);
-      } finally {
-        stop();
-      }
-      const afterStop = waves;
-      await delay(150);
-      assert.equal(waves, afterStop, "no waves after stop()");
-      // scheduler fields persisted on disk
-      const fromDisk = JSON.parse(readFileSync(join(root, ".work-state", "cto", "run-health-1", "state.json"), "utf8")) as {
-        scheduler: { wave_interval_ms: number; last_wave_at?: string; next_wave_at?: string };
-      };
-      assert.equal(fromDisk.scheduler.wave_interval_ms, 30);
-      assert.ok(fromDisk.scheduler.last_wave_at);
-      assert.ok(fromDisk.scheduler.next_wave_at);
+      await delay(200);
+      assert.ok(waves >= 1, `onWave should fire at least once (got ${waves})`);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      stop();
     }
+    const afterStop = waves;
+    await delay(150);
+    assert.equal(waves, afterStop, "no waves after stop()");
+    assert.equal(current.scheduler?.wave_interval_ms, 30);
+    assert.ok(current.scheduler?.last_wave_at);
+    assert.ok(current.scheduler?.next_wave_at);
+  });
+
+  test("scheduler: metadata updates cannot alter wave or team authority", () => {
+    let current = withBudget(sampleState());
+    current.active_wave_id = "wave-authority";
+    current.wave_history = [{
+      id: "wave-authority",
+      source: "test",
+      source_id: "authority-source",
+      task: "authority task",
+      slice_ids: [],
+      status: "active",
+      started_at: "2026-08-01T00:00:00.000Z",
+    }];
+    const beforeTeams = structuredClone(current.teams);
+    const adapter = {
+      read: () => current,
+      update: (mutator: (state: CtoState) => CtoState): CtoState => {
+        current = mutator(current);
+        return current;
+      },
+    };
+    const stop = startWaveScheduler(current, adapter, 60_000, () => undefined);
+    stop();
+    assert.equal(current.active_wave_id, "wave-authority");
+    assert.deepEqual(current.wave_history, [{
+      id: "wave-authority",
+      source: "test",
+      source_id: "authority-source",
+      task: "authority task",
+      slice_ids: [],
+      status: "active",
+      started_at: "2026-08-01T00:00:00.000Z",
+    }]);
+    assert.deepEqual(current.teams, beforeTeams);
+    assert.equal(current.scheduler?.wave_interval_ms, 60_000);
   });
 
   test("scheduler: startWaveScheduler with interval <= 0 returns a no-op stop", () => {
     const state = withBudget(sampleState());
-    const stop = startWaveScheduler(state, tmpdir(), 0, () => {
+    const adapter = {
+      read: () => state,
+      update: (mutator: (current: CtoState) => CtoState): CtoState => mutator(state),
+    };
+    const stop = startWaveScheduler(state, adapter, 0, () => {
       throw new Error("must never fire");
     });
     assert.equal(typeof stop, "function");
-    stop(); // must not throw
-    stop(); // idempotent
+    stop();
+    stop();
   });
 });
 

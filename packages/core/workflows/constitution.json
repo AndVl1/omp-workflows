@@ -1,0 +1,84 @@
+{
+  "$schema": "./_schema.json",
+  "name": "constitution",
+  "title": "Constitution Bootstrap",
+  "description": "Plugin-native, zero-dependency constitution bootstrap: one declared draft worker, deterministic engine-owned materialization/validation, and one hard-human two-decision checkpoint. Invoked as a blocking child workflow by the shared ensure_project_constitution prerequisite; never selected by classification.",
+  "completion_intent": {
+    "mode": "handoff_only",
+    "acceptance": "quality_gates_and_artifacts",
+    "source": "workflow_policy",
+    "rationale": "The bootstrap completes only when the engine's deterministic usability validation passes and the required typed artifacts (constitution_draft and constitution_gate_record) exist; the approved, fingerprinted binding then hands back to the exact blocked origin through the declared hard-human two-decision checkpoint, which no agent, lead, policy default, or dispatch completion can substitute for."
+  },
+  "match": { "type": ["SPEC"], "complexity": ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": ["custom"],
+    "rules": {
+      "constitution_approval": {
+        "kind": "custom",
+        "default": "required_human",
+        "allowed_decisions": ["approve_continue", "request_changes"],
+        "phase": "before_advance",
+        "rationale": "Bootstrap approval is a hard-human decision on trusted proof with typed actor provenance: approve_continue fingerprints the validated draft and resumes the exact blocked origin once; request_changes reopens the same draft identity with non-empty feedback. approve_stop deliberately does not exist because the originating flow stays blocked until a current constitution is approved."
+      }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "The constitution is the governing policy every later validation and approval binds to, so its bootstrap is hard-human and separate from the three-decision phase checkpoint policy; a failed validation never opens the checkpoint and a phase approval never satisfies constitution approval."
+  },
+  "stages": [
+    {
+      "id": "constitution_draft",
+      "title": "Constitution draft worker",
+      "type": "single",
+      "role": "analyst",
+      "roster_policy": {
+        "allowed_roles": ["analyst"],
+        "required_roles": ["analyst"],
+        "required_facets": [],
+        "min_workers": 1,
+        "max_workers": 1,
+        "multiplicity": { "analyst": { "min": 1, "max": 1 } },
+        "prefer_distinct_agents": true,
+        "selection_mode": "pre_dispatch_minimum_valid",
+        "triggers": { "complexity": [], "confidence": [], "scope_flags": [], "evidence": [] },
+        "budget": { "token_limit": null, "dollar_limit": null }
+      },
+      "prompt": "Act as the declared constitution draft worker. Derive the project's governing policy from repository evidence and the requesting origin's context only: no external framework, CLI, package manager, network service, or Spec Kit installation is consulted, and none is required. Return exactly one typed `constitution_draft` artifact with its closed schema fields and no extras: schema_version 1, gate_id, feature_id, run_key, version (the immutable draft revision; versions are never overwritten), document (the full draft text), document_sha256, worker attribution (role, agent, dispatch_id), and constitution_binding. Inside `document`, render every mandatory marker of the resolved template as a normalized semantic section: a principles section of numbered principle subsections (### I., II., ...), each principle stating the rule and its own Rationale; a rationale section recording the governing intent, scope, conflict resolution, and amendment rule; and a validation section defining the deterministic compliance checks later work must pass — plus a `Version:` label, explicit assumptions and unresolved items, and source/provenance references authored as document prose. Every template placeholder must be resolved: unresolved markers fail deterministic validation. You author typed content only — never write the human-readable provider file or any project file, and never approve or validate your own draft.",
+      "produces": "constitution_draft"
+    },
+    {
+      "id": "constitution_revise",
+      "title": "Constitution revision worker",
+      "type": "single",
+      "role": "analyst",
+      "roster_policy": {
+        "allowed_roles": ["analyst"],
+        "required_roles": ["analyst"],
+        "required_facets": [],
+        "min_workers": 1,
+        "max_workers": 1,
+        "multiplicity": { "analyst": { "min": 1, "max": 1 } },
+        "prefer_distinct_agents": true,
+        "selection_mode": "pre_dispatch_minimum_valid",
+        "triggers": { "complexity": [], "confidence": [], "scope_flags": [], "evidence": [] },
+        "budget": { "token_limit": null, "dollar_limit": null }
+      },
+      "skip_if": "constitution_draft.feedback == null",
+      "prompt": "Act as the declared constitution revision worker. Apply the exact non-empty request_changes feedback recorded against the open bootstrap checkpoint to the same draft identity: resolve every addressed finding, keep unaffected principle subsections inside `document` byte-stable so the semantic diff stays reviewable, and return a new typed `constitution_draft` candidate under the same closed schema — a new immutable version, refreshed document_sha256, unchanged gate/feature/run identity, and current worker attribution. The document keeps every mandatory template marker resolved, the `Version:` label, and current assumptions and provenance prose. No external framework or tooling dependency is introduced. You author typed content only — never write the provider file or any project file, and never approve, validate, or decide the checkpoint yourself.",
+      "consumes": ["constitution_draft"],
+      "produces": "constitution_draft"
+    },
+    {
+      "id": "constitution_validate",
+      "title": "Deterministic materialization and validation",
+      "type": "orchestrator",
+      "prompt": "Engine-owned deterministic materialization and validation; the coordinator passes typed results to engine tools and authors no semantic content. Resolve the selected template through the template seam, then pass the exact typed draft document to the engine bootstrap entry so the engine alone runs authoritative deterministic usability validation, versions the draft, persists durable state under the constitution state directory, and materializes the resolved provider path through safe atomic writes. Validation must reach a terminal result before any checkpoint is presented: a failed validation never opens a checkpoint and routes the actionable findings back to constitution_revise as explicit feedback. On pass, present the hard-human bootstrap checkpoint with exactly the decisions approve_continue and request_changes — approve_stop does not exist for bootstrap; a decision requires trusted human proof with typed actor provenance, and request_changes requires non-empty feedback. Replays are idempotent: re-presenting the open draft returns the established record, a changed document becomes a new immutable draft version, and no second checkpoint path or state machine is ever created.",
+      "consumes": ["constitution_draft"],
+      "gate": "constitution_validation == pass",
+      "checkpoint": "constitution_approval",
+      "produces": "constitution_gate_record"
+    }
+  ]
+}

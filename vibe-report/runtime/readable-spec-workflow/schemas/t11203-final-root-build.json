@@ -1,0 +1,29 @@
+{
+  "label": "t11203-final-root-build",
+  "command": "npm run build",
+  "argv": [
+    "npm",
+    "run",
+    "build"
+  ],
+  "started_at_utc": "2026-09-11T18:07:24.370Z",
+  "ended_at_utc": "2026-09-11T18:07:31.226Z",
+  "duration_ms": 6855,
+  "exit_code": 0,
+  "signal": null,
+  "spawn_error": null,
+  "source_snapshot_digest": "ca1300adb9f9e04bb79716d9355cda8c2a2b1bd5eadc919171aec4efbe8b2006",
+  "source_snapshot_path": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-final-source-snapshot-start.json",
+  "log": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-final-root-build.log",
+  "sha256": "cbcef300445698106e0b1262f2201f87b49f3e835513124cb64b04fa503128ef",
+  "counts": {
+    "log_bytes": 265,
+    "log_lines": 20,
+    "tests": null,
+    "passed": null,
+    "failed": null,
+    "cancelled": null,
+    "skipped": null,
+    "todo": null
+  }
+}

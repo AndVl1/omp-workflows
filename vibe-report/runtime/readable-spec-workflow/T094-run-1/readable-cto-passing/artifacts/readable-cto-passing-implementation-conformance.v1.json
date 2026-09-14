@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "artifact_id": "readable-cto-passing-implementation-conformance.v1",
+  "entries": [
+    {
+      "evidence_id": "readable-cto-passing-implementation-fr-1",
+      "kind": "implementation",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "7644909b7d17135edef84221f57709f0cff3d853e11fa51500c0ee2aa02c9ab7",
+      "execution_claim_id": "claim-b6630cc0c3b4564702f310e9bc8993e8",
+      "intent_message": "Implemented the deterministic passing CLI outcome in src/passing/index.js; the recorded runtime result for node src/passing/index.js with no arguments is exit 0 with the exact required JSON output followed by one newline and no extra stdout.",
+      "recorded_at": "2026-09-05T00:00:00.000Z"
+    },
+    {
+      "evidence_id": "readable-cto-passing-implementation-ac-1",
+      "kind": "implementation",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "7644909b7d17135edef84221f57709f0cff3d853e11fa51500c0ee2aa02c9ab7",
+      "execution_claim_id": "claim-b6630cc0c3b4564702f310e9bc8993e8",
+      "intent_message": "Implemented the runnable project-root outcome for AC-1; the recorded runtime result for node src/passing/index.js with no arguments is exit 0 with exactly {\"status\":\"completed\",\"outcome\":\"requested outcome completed\"} followed by one newline and no extra stdout.",
+      "recorded_at": "2026-09-05T00:00:00.000Z"
+    }
+  ]
+}

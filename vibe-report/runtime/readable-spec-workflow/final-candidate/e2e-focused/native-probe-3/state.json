@@ -1,0 +1,103 @@
+{
+  "schema": 1,
+  "run_key": "spec-b99744a0-cb23-451a-816e-2121e6eecadf",
+  "specification": {
+    "schema_version": 3,
+    "feature_id": "readable-native-probe-3",
+    "display_name": "Add a deterministic project-local workflow profile override with explicit ownership",
+    "source_kind": "native",
+    "project_root": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-3/omp-spec-e2e-readable-native-probe-3",
+    "project_root_identity": {
+      "canonical_path": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-3/omp-spec-e2e-readable-native-probe-3",
+      "dev": 16777234,
+      "ino": 102890240
+    },
+    "path_binding": {
+      "specs": {
+        "relative_path": "specs/readable-native-probe-3",
+        "canonical_path": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-3/omp-spec-e2e-readable-native-probe-3/specs/readable-native-probe-3",
+        "dev": 16777234,
+        "ino": 102890545
+      },
+      "feature_state": {
+        "relative_path": ".work-state/features/readable-native-probe-3",
+        "canonical_path": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-3/omp-spec-e2e-readable-native-probe-3/.work-state/features/readable-native-probe-3",
+        "dev": 16777234,
+        "ino": 102890546
+      },
+      "artifacts": {
+        "relative_path": ".work-state/features/readable-native-probe-3/artifacts",
+        "canonical_path": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-3/omp-spec-e2e-readable-native-probe-3/.work-state/features/readable-native-probe-3/artifacts",
+        "dev": 16777234,
+        "ino": 102890547
+      },
+      "execution_claim": null,
+      "execution_claim_next": null
+    },
+    "workspace_path": "specs/readable-native-probe-3",
+    "state_path": ".work-state/features/readable-native-probe-3/state.json",
+    "profile_name": "spec-preparation",
+    "profile_hash": "4410dbc9f79aa780862e28b53905cccc9f963c375c2c5f0c6d170f03b2f135b5",
+    "constitution_gate_ref": null,
+    "constitution_binding": null,
+    "language": {
+      "language": "en-US",
+      "source": "project_default",
+      "selection_hash": "587f63b2864bc26fbb1f627c015449cc5b395f78d35e7384876c51cd32f675bd"
+    },
+    "template_set": {
+      "template_set_id": "specification-default",
+      "source": "shipped_default",
+      "content_hash": "5b01f9d8c07f93b2a94f0a4d79fb0d314633a5b5d5cc81ce036f7143a48e0868",
+      "required_markers": []
+    },
+    "phases": [
+      {
+        "phase": "specify",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "plan",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "tasks",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      }
+    ],
+    "status": "created",
+    "next_action": {
+      "kind": "remediation",
+      "command": "ensure_project_constitution",
+      "reason": "The project constitution prerequisite is unresolved; resolve or approve it before phase work."
+    },
+    "handoff_ref": null,
+    "execution_claim_prepare_ref": null,
+    "execution_claim_ref": null,
+    "implementation_conformance_ref": null,
+    "import_ref": null,
+    "migration_receipt_ref": null
+  },
+  "state_revision": 1
+}

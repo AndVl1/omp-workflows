@@ -4,9 +4,8 @@
  * Defends the safety properties of buildSessionSnapshot:
  *   - redaction at EVERY verbosity (default and --full), redaction before
  *     caps, visible size/read-window markers (AC-3);
- *   - hard byte caps and bounded head reads;
- *   - unsafe ids → skipped; unsafe/symlink-escape/boundary/excluded paths →
- *     rejected and never read;
+ *   - unsafe ids → skipped; unsafe/symlinked/non-regular/boundary/excluded
+ *     paths → rejected and never read;
  *   - excluded inputs (events.jsonl, vibe-report, .work-state/visualize)
  *     are never discovered;
  *   - empty vs fully-redacted vs oversized classification;
@@ -212,7 +211,7 @@ test("security: unsafe ids are skipped and never read; absolute and escaping dec
   }
 });
 
-test("security: a symlinked artifact escaping the workspace is rejected and never read", () => {
+test("security: a symlinked artifact entry is rejected and never read", () => {
   const cwd = tmpWorkspace();
   const outside = tmpWorkspace();
   try {

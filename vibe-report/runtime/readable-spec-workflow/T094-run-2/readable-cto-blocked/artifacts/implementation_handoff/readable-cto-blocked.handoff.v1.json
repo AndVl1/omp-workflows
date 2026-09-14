@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "handoff_id": "readable-cto-blocked.handoff.v1",
+  "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+  "feature_id": "readable-cto-blocked",
+  "source_kind": "native",
+  "artifact_versions": [
+    {
+      "artifact_id": "specify.v1",
+      "kind": "specify",
+      "version": 1,
+      "sha256": "509b0d7adf50ef70fc17e6d8bd720fdb55132173f88891a4760e688fba786b36"
+    },
+    {
+      "artifact_id": "plan.v1",
+      "kind": "plan",
+      "version": 1,
+      "sha256": "e2322e7f94ca96a07f038ff0729660a2846ad8f87d7c83fa5fe8e095df254d28"
+    },
+    {
+      "artifact_id": "tasks.v1",
+      "kind": "tasks",
+      "version": 1,
+      "sha256": "ae4d05d6c7c1c8c652c5fc991a12d98664ab2ffe7d0c62f1ada642c1e29d1791"
+    }
+  ],
+  "scope": {
+    "in_scope": [
+      "src/blocked/**"
+    ],
+    "out_of_scope": [
+      "unrelated refactors"
+    ],
+    "constraints": [
+      "same-branch serialized ownership"
+    ]
+  },
+  "requirements": [
+    {
+      "requirement_id": "FR-1",
+      "statement": "The tool completes the requested outcome.",
+      "acceptance_ids": [
+        "AC-1"
+      ],
+      "source_refs": [
+        "specs/feature-one/spec.md#requirements"
+      ]
+    }
+  ],
+  "decisions": [
+    {
+      "decision_id": "D-1",
+      "decision": "Use the existing durable engine for state.",
+      "rationale": "One engine; no second state machine.",
+      "requirement_ids": [
+        "FR-1"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "task_id": "T-1",
+      "title": "Implement the outcome and produce typed conformance evidence",
+      "requirement_ids": [
+        "FR-1"
+      ],
+      "depends_on": [],
+      "expected_outcome": "The requested outcome is observable, and the lead passes the typed evidence contract verbatim to implementation and QA evidence workers.",
+      "affected_scope": [
+        "src/blocked/**"
+      ],
+      "completion_evidence": [
+        "focused test run proving the outcome",
+        "Persist the canonical conformance_evidence envelope at .work-state/features/<feature_id>/artifacts/<artifact_id>.json and reference that exact feature-local path; do not use a team-level .work-state/artifacts mirror.",
+        "Canonical conformance_evidence envelope has exactly schema_version, artifact_id, and entries; do not add top-level provenance.",
+        "The CTO conformance call wraps every submitted evidence entry with an artifact: CompletionArtifactRef, and every executed_test entry has test.evidence_ref: CompletionArtifactRef.",
+        "Pass this evidence contract verbatim from the lead to both implementation and QA evidence workers."
+      ],
+      "parallel_safe": false
+    }
+  ],
+  "verification": [
+    {
+      "verification_id": "V-1",
+      "requirement_ids": [
+        "FR-1"
+      ],
+      "acceptance_ids": [
+        "AC-1"
+      ],
+      "task_ids": [
+        "T-1"
+      ],
+      "observable_behavior": true,
+      "expected_evidence": "The lead passes the exact conformance_evidence envelope schema guidance to implementation and QA evidence workers; the CTO conformance call wraps every entry with CompletionArtifactRef and every executed_test has test.evidence_ref: CompletionArtifactRef."
+    }
+  ],
+  "validation_refs": [
+    "validation.specify.v1",
+    "validation.plan.v1",
+    "validation.tasks.v1"
+  ],
+  "approval_refs": [
+    "checkpoint.specify.v1",
+    "checkpoint.plan.v1",
+    "checkpoint.tasks.v1"
+  ],
+  "language": "en-US",
+  "constitution_binding": {
+    "provider_id": "native",
+    "path": "CONSTITUTION.md",
+    "version": "1.0.0",
+    "content_sha256": "cdcb2e42d8a081ea54a4d76e9301691beff67fead73d7fefd3766eaad62ffb12",
+    "semantic_hash": "c1bc1e90b30b8fc005de456aae9dc20d9044036a78841063103f23e49514599c",
+    "validation_ref": "constitution.validation.cdcb2e42d8a081ea54a4d76e9301691beff67fead73d7fefd3766eaad62ffb12",
+    "bound_at": "2026-08-31T12:00:00.000Z"
+  },
+  "constitution_impact_ref": null,
+  "risks": [],
+  "open_decisions": [],
+  "execution_choices": [
+    "do-work",
+    "cto"
+  ],
+  "status": "ready",
+  "import_snapshot_ref": null,
+  "compatibility_supplement_ref": null
+}

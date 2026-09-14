@@ -30,7 +30,25 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readCtoState } from "@andvl1/omp-workflows-core";
+import { markCtoRunDeliveryPending, newCtoState, readCtoState, writeCtoState } from "../../core/src/cto/state.js";
+
+import { openFullstackRuntimeTest, type FullstackRuntimeTestFixture } from "./runtime-access-fixture.js";
+
+const runtimeFixtures = new Map<string, FullstackRuntimeTestFixture>();
+function runtimeFixtureFor(root: string): FullstackRuntimeTestFixture {
+  const existing = runtimeFixtures.get(root);
+  if (existing) return existing;
+  const fixture = openFullstackRuntimeTest(root, "rw-channel-live-test");
+  runtimeFixtures.set(root, fixture);
+  return fixture;
+}
+function runtimeFor(root: string) {
+  return runtimeFixtureFor(root).access;
+}
+test.afterEach(() => {
+  for (const fixture of runtimeFixtures.values()) fixture.close();
+  runtimeFixtures.clear();
+});
 import {
   createChannelSet,
   createEscalationAdapter,
@@ -109,7 +127,7 @@ function startLiveDispatcher(
 ): { stop: () => void; channelSet: ChannelSet; tasks: InboxTask[]; answers: Array<{ id: string; answer: string }> } {
   const expected = opts.direction ?? "rw";
   withConfig(root, config);
-  const channelSet = createChannelSet(root);
+  const channelSet = createChannelSet(root, undefined, undefined, runtimeFor(root));
   assert.equal(channelSet.profile.direction, expected, `resolved channel profile direction is ${expected}`);
   if (expected === "rw") {
     assert.ok(channelSet.primary, "rw primary is built");
@@ -119,7 +137,11 @@ function startLiveDispatcher(
   }
   const tasks: InboxTask[] = [];
   const answers: Array<{ id: string; answer: string }> = [];
+  const runtime = runtimeFixtureFor(root);
   const stop = startChannelDispatcher(root, channelSet, 50, {
+    runtimeAccess: runtime.access,
+    session_id: runtime.sessionId,
+    liveGuard: runtime.liveGuard,
     onTask: (t) => tasks.push(t),
     onAnswer: (a) => answers.push(a),
   });
@@ -153,14 +175,15 @@ test("A: persisted mock RW channel delivers inbound despite a live tg-bridge loc
       );
       assert.equal(tasks[0]?.text, "live resident task via persisted RW channel");
       // Durable inbox file under the resolved run.
-      const runId = readdirSync(join(root, ".work-state", "cto"))[0]!;
+      const runId = tasks[0]?.runId;
+      assert.ok(runId, "task callback carries the canonical run id");
       assert.ok(existsSync(join(root, ".work-state", "cto", runId, "inbox", "t1.json")), "task filed durably in the run inbox");
       // Transport file consumed to processed/.
       assert.ok(existsSync(join(root, dir, "inbound", "processed", "task-1.json")), "transport file moved to inbound/processed");
       // One admitted wave in run state.
       const state = readCtoState(runId, root);
       assert.equal(state?.wave_history?.length, 1, "one wave admitted in run state");
-      assert.equal(state?.wave_history?.[0]?.source_id, "t1", "wave keyed on the transport task id");
+      assert.equal(state?.wave_history?.[0]?.source_id, `inbox-${sha256Hex(JSON.stringify({ id: "t1", transport: "second-process" }))}`, "wave keyed on canonical transport and task identity");
     } finally {
       stop();
     }
@@ -197,11 +220,13 @@ test("B: inbound delivered exactly once; duplicate normalized text never re-deli
       assert.ok(existsSync(join(root, dir, "inbound", "processed", "task-1.json")), "task-1 consumed to processed/");
       assert.ok(existsSync(join(root, dir, "inbound", "processed", "task-2.json")), "task-2 consumed to processed/");
       // Admitted-dedup quarantine record + one wave in run state.
-      const runId = readdirSync(join(root, ".work-state", "cto"))[0]!;
+      const runId = tasks[0]?.runId;
+      assert.ok(runId, "task callback carries the canonical run id");
       const state = readCtoState(runId, root);
-      assert.equal(state?.inbox_quarantine?.[sha256Hex(text)]?.status, "admitted", "quarantine status is admitted");
+      const quarantineHash = sha256Hex(JSON.stringify({ id: "t1", text, transport: "second-process" }));
+      assert.equal(state?.inbox_quarantine?.[quarantineHash]?.status, "admitted", "quarantine status is admitted");
       assert.equal(state?.wave_history?.length, 1, "exactly one wave admitted");
-      assert.equal(state?.wave_history?.[0]?.source_id, "t1", "wave keyed on the first transport id");
+      assert.equal(state?.wave_history?.[0]?.source_id, `inbox-${sha256Hex(JSON.stringify({ id: "t1", transport: "second-process" }))}`, "wave keyed on canonical transport and task identity");
     } finally {
       stop();
     }
@@ -246,10 +271,22 @@ test("D: answer follow-up delivered via the same RW channel, exactly once", asyn
   const root = mkdtempSync(join(tmpdir(), "rw-live-answer-"));
   try {
     const dir = "rw";
+    const runId = "run-x";
+    const state = newCtoState({
+      id: runId,
+      task: "live answer follow-up",
+      branch: "main",
+      autonomous: true,
+      plan: { id: runId, task: "live answer follow-up", teams: [], created_at: new Date().toISOString() },
+    });
+    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+    assert.equal(markCtoRunDeliveryPending(root, runId, undefined, "outbox"), true, "canonical active run index is established");
+    assert.equal(readCtoState(runId, root)?.id, runId, "canonical run state is readable before answer polling");
     const { stop, answers } = startLiveDispatcher(root, RW_CHANNEL(dir));
     try {
       dropFile(join(root, dir, "answers"), "ans-1.json", {
-        id: "run-x/team-a/q1",
+        id: `${runId}/team-a/q1`,
+        run_id: runId,
         answer: "yes",
         at: new Date().toISOString(),
         by: "user-1",
@@ -303,13 +340,15 @@ test("F: legacy single-adapter config unchanged — mock rw preserved, no fan-ou
     // NO channels[]: the pre-channel-set single-adapter shape.
     const config = { adapter: "mock", mock: { persisted: true, dir: "legacy" } };
     withConfig(root, config);
-    const adapter = createEscalationAdapter(loadEscalationConfig(root)!, root);
+    const runtime = runtimeFor(root);
+    const adapter = createEscalationAdapter(loadEscalationConfig(root, { kind: "mock", runtimeAccess: runtime })!, root, undefined, runtime);
     assert.ok(adapter instanceof MockEscalationAdapter, "legacy config builds the mock adapter");
     const tasks: InboxTask[] = [];
     // Legacy single-adapter dispatcher (the adapter-direct path): the mock's
     // rw inbound surface is wired and polled as before — unchanged by the
     // channel-set world.
-    const stop = startDispatcher(root, adapter, 50, { onTask: (t) => tasks.push(t) });
+    const fixture = runtimeFixtureFor(root);
+    const stop = startDispatcher(root, adapter, 50, { runtimeAccess: fixture.access, session_id: fixture.sessionId, liveGuard: fixture.liveGuard, onTask: (t) => tasks.push(t) });
     try {
       dropFile(join(root, "legacy", "inbound"), "task-1.json", {
         id: "t1",

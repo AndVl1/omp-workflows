@@ -1,0 +1,27 @@
+id: 2026-09-01T00-00-00-developer
+parent: null
+agent: developer
+timestamp: "2026-09-01T00:00:00Z"
+status: completed
+context:
+  task: "Remove fixed development-run CTO routing authority from public specification command responses"
+  phase: "validation-release"
+output:
+  files:
+    - packages/core/src/commands/specification.ts
+    - packages/core/src/index.ts
+    - packages/core/test/specification-command.test.ts
+  changes:
+    - "Removed SPECIFICATION_SLICE_MARKER declaration/export and every response insertion, including source headers."
+    - "Added feature_id to import compatibility response identity header."
+    - "Added focused assertions for no omp-cto-slice marker, feature/run identity, next actions, checkpoints, and worker instructions."
+  verification:
+    marker_scan: "specification.ts and index.ts contain zero fixed marker references"
+    focused_test: "blocked before test execution because dependency bun is unavailable from @oh-my-pi/pi-utils"
+next:
+  agent: null
+  task: "No follow-up required"
+  priority: low
+  acceptance_criteria:
+    - "Public direct/native/import specification outputs contain no fixed omp-cto-slice marker."
+    - "Dynamic trusted CTO slice-gate transport remains untouched."

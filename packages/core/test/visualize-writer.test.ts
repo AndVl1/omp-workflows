@@ -21,9 +21,10 @@
  *     canonical state bytes;
  *   - concurrency: deterministic hook-driven simulations of racing writers
  *     prove the rollback guard — an older writer whose swap fails against a
- *     newer complete target discards staging/backup with a swap-rollback
- *     warning and never restores the older tree; an ENOENT-style capture
- *     (no previous bundle) proceeds; a strictly newer backup is restored;
+ *     complete target discards staging/backup with a swap-rollback warning and
+ *     never restores the older tree; an ENOENT-style capture (no previous
+ *     bundle) proceeds; an invalid concurrent target is preserved with a
+ *     typed rollback failure;
  *   - canonical-byte identity and result hygiene: the result carries only
  *     relative paths/counters/warnings — never content, secrets or absolute
  *     paths.
@@ -39,19 +40,39 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 
-import { publishVisualize, VisualizePublishError, type VisualizePublishResult } from "../src/visualize/writer.js";
+import {
+  publishVisualize,
+  publishVisualizePinned,
+  VisualizePublishError,
+  type VisualizePublishResult,
+} from "../src/visualize/writer.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { VISUALIZE_OUTPUT_FILES, VISUALIZE_OUTPUT_ROOT, sessionPagePath } from "../src/visualize/types.js";
 
 function tmpWorkspace(): string {
   return mkdtempSync(join(tmpdir(), "viz-writer-"));
+}
+
+function displaceForRace(path: string, recreate: () => void): string {
+  const displaced = `${path}.displaced`;
+  renameSync(path, displaced);
+  recreate();
+  return displaced;
+}
+
+function restoreDisplaced(path: string, displaced: string): void {
+  rmSync(path, { recursive: true, force: true });
+  renameSync(displaced, path);
 }
 
 const T0 = "2026-08-19T09:00:00.000Z";
@@ -387,31 +408,133 @@ test("writer: with no previous bundle, a swap failure against a live complete ta
   }
 });
 
-test("writer: rollback restores the previous bundle when it is strictly newer than the live target", () => {
+test("writer: a future-clock complete target always wins over the captured backup", () => {
   const cwd = tmpWorkspace();
   try {
     publishVisualize(cwd, bundle(T1, [{ kind: "feature", pathKey: "alpha" }]));
     const v0 = bundle(T0, [{ kind: "feature", pathKey: "alpha" }]);
-    // The racing writer lands an OLDER bundle at the target while v0 is mid-swap.
-    const older = bundle("2026-08-19T08:30:00.000Z", [{ kind: "feature", pathKey: "stale" }]);
+    // The racing writer lands a complete target with a future timestamp while
+    // v0 is mid-swap. Recovery must trust the current valid target, not compare
+    // timestamps or recursively remove it.
+    const future = bundle("2099-12-31T23:59:59.000Z", [{ kind: "feature", pathKey: "future" }]);
+    const result = publishVisualize(cwd, v0, {
+      hooks: { onCaptured: () => publishVisualize(cwd, future) },
+    });
+    assert.equal(result.status, "superseded");
+    assert.ok(result.warnings.some((w) => w.includes("swap-rollback")));
+    for (const f of future) assert.equal(readTarget(cwd, f.relPath), f.content);
+    assert.equal(readTarget(cwd, VISUALIZE_OUTPUT_FILES.manifest), manifest("2099-12-31T23:59:59.000Z"));
+    assert.equal(existsSync(join(cwd, VISUALIZE_OUTPUT_ROOT, "sessions", "feature", "alpha.md")), false);
+    assert.deepEqual(leftoverDirs(cwd), []);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("writer: an invalid concurrent target is preserved and backup remains recoverable", () => {
+  const cwd = tmpWorkspace();
+  try {
+    publishVisualize(cwd, bundle(T1, [{ kind: "feature", pathKey: "alpha" }]));
+    const v0 = bundle(T0, [{ kind: "feature", pathKey: "alpha" }]);
     assertErrorCode(
       () =>
         publishVisualize(cwd, v0, {
-          hooks: { onCaptured: () => publishVisualize(cwd, older) },
+          hooks: {
+            onCaptured: () => {
+              mkdirSync(join(cwd, VISUALIZE_OUTPUT_ROOT), { recursive: true });
+              writeFileSync(join(cwd, VISUALIZE_OUTPUT_ROOT, VISUALIZE_OUTPUT_FILES.manifest), "{}", { mode: 0o600 });
+            },
+          },
         }),
-      "swap-failed",
+      "recovery_required",
     );
-    // The backup (T1) is strictly newer than the racing tree: it is restored.
-    for (const f of bundle(T1, [{ kind: "feature", pathKey: "alpha" }])) {
-      assert.equal(readTarget(cwd, f.relPath), f.content);
+    assert.equal(readFileSync(join(cwd, VISUALIZE_OUTPUT_ROOT, VISUALIZE_OUTPUT_FILES.manifest), "utf8"), "{}");
+    const leftovers = leftoverDirs(cwd);
+    assert.equal(leftovers.length, 2, "captured backup and staging remain as recovery artifacts");
+    assert.equal(leftovers.filter((name) => name.startsWith(".visualize-backup-")).length, 1);
+    assert.equal(leftovers.filter((name) => name.startsWith(".visualize-staging-")).length, 1);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("writer: malformed, nonregular, missing, and hash-raced winners require recovery without scratch cleanup", () => {
+  type InvalidCase = { name: string; mutate: (target: string, outside: string) => void };
+  const cases: InvalidCase[] = [
+    {
+      name: "manifest schema",
+      mutate: (target) => writeFileSync(join(target, VISUALIZE_OUTPUT_FILES.manifest), JSON.stringify({ generatedAt: "x" }), { mode: 0o600 }),
+    },
+    {
+      name: "missing required file",
+      mutate: (target) => writeFileSync(join(target, VISUALIZE_OUTPUT_FILES.manifest), manifest(T2), { mode: 0o600 }),
+    },
+    {
+      name: "nonregular required file",
+      mutate: (target) => {
+        writeFileSync(join(target, VISUALIZE_OUTPUT_FILES.manifest), manifest(T2), { mode: 0o600 });
+        rmSync(join(target, VISUALIZE_OUTPUT_FILES.hubMarkdown), { force: true });
+        mkdirSync(join(target, VISUALIZE_OUTPUT_FILES.hubMarkdown));
+      },
+    },
+    {
+      name: "symlink required file",
+      mutate: (target, outside) => {
+        writeFileSync(join(target, VISUALIZE_OUTPUT_FILES.manifest), manifest(T2), { mode: 0o600 });
+        rmSync(join(target, VISUALIZE_OUTPUT_FILES.hubMarkdown), { force: true });
+        symlinkSync(outside, join(target, VISUALIZE_OUTPUT_FILES.hubMarkdown), "file");
+      },
+    },
+  ];
+  for (const current of cases) {
+    const cwd = tmpWorkspace();
+    const outside = mkdtempSync(join(tmpdir(), `viz-recovery-${current.name.replaceAll(" ", "-")}-`));
+    try {
+      publishVisualize(cwd, bundle(T1, [{ kind: "feature", pathKey: "old" }]));
+      assertErrorCode(
+        () => publishVisualize(cwd, bundle(T0, [{ kind: "feature", pathKey: "old" }]), {
+          hooks: {
+            onCaptured: () => {
+              mkdirSync(join(cwd, VISUALIZE_OUTPUT_ROOT), { recursive: true });
+              current.mutate(join(cwd, VISUALIZE_OUTPUT_ROOT), outside);
+            },
+          },
+        }),
+        "recovery_required",
+      );
+      const leftovers = leftoverDirs(cwd);
+      assert.equal(leftovers.filter((name) => name.startsWith(".visualize-backup-")).length, 1, current.name);
+      assert.equal(leftovers.filter((name) => name.startsWith(".visualize-staging-")).length, 1, current.name);
+      assert.deepEqual(readdirSync(outside), [], `${current.name}: foreign target remains untouched`);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
     }
-    assert.equal(readTarget(cwd, VISUALIZE_OUTPUT_FILES.manifest), manifest(T1));
-    assert.equal(
-      existsSync(join(cwd, VISUALIZE_OUTPUT_ROOT, "sessions", "feature", "stale.md")),
-      false,
-      "older racing tree replaced",
+  }
+
+  const cwd = tmpWorkspace();
+  try {
+    publishVisualize(cwd, bundle(T1, [{ kind: "feature", pathKey: "old" }]));
+    let mutated = false;
+    assertErrorCode(
+      () => publishVisualize(cwd, bundle(T0, [{ kind: "feature", pathKey: "old" }]), {
+        hooks: {
+          onCaptured: () => publishVisualize(cwd, bundle(T2, [{ kind: "feature", pathKey: "new" }])),
+          onAfterRecoveryFileRead: (target, relativePath) => {
+            if (relativePath === VISUALIZE_OUTPUT_FILES.hubMarkdown && !mutated) {
+              mutated = true;
+              writeFileSync(join(target, relativePath), "# attacker", "utf8");
+            }
+          },
+        },
+      }),
+      "recovery_required",
     );
-    assert.deepEqual(leftoverDirs(cwd), []);
+    assert.equal(mutated, true, "hash barrier was exercised");
+    const leftovers = leftoverDirs(cwd);
+    assert.equal(leftovers.filter((name) => name.startsWith(".visualize-backup-")).length, 1);
+    assert.equal(leftovers.filter((name) => name.startsWith(".visualize-staging-")).length, 1);
+    assert.equal(readTarget(cwd, VISUALIZE_OUTPUT_FILES.manifest), manifest(T2), "valid winner remains live");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -478,6 +601,36 @@ test("writer: republish prunes old derived pages, preserves non-derived entries 
 });
 
 // ── 6. Boundary / symlink rejection and tolerance ────────────────────────────
+
+test("writer: nested v2 replacement during prune stays live and quarantines the old backup", () => {
+  const cwd = tmpWorkspace();
+  try {
+    publishVisualize(cwd, bundle(T0, [{ kind: "feature", pathKey: "old" }]));
+    const v1 = bundle(T1, [{ kind: "feature", pathKey: "new" }, { kind: "legacy", pathKey: "nested" }]);
+    const v2 = bundle(T2, [{ kind: "feature", pathKey: "new" }, { kind: "cto", pathKey: "newer" }]);
+    let raced = false;
+    assert.throws(
+      () => publishVisualize(cwd, v1, {
+        hooks: {
+          onBeforePrune: () => {
+            if (raced) return;
+            raced = true;
+            publishVisualize(cwd, v2);
+          },
+        },
+      }),
+      (error: unknown) => error instanceof VisualizePublishError && error.code === "swap-failed",
+    );
+    assert.equal(raced, true, "the nested prune race must execute");
+    for (const file of v2) assert.equal(readTarget(cwd, file.relPath), file.content, `newer nested bundle remains at ${file.relPath}`);
+    const backups = leftoverDirs(cwd).filter((name) => name.startsWith(".visualize-backup-"));
+    assert.equal(backups.length, 1, "the older captured tree remains quarantined");
+    assert.equal(readFileSync(join(cwd, ".work-state", backups[0]!, VISUALIZE_OUTPUT_FILES.manifest), "utf8"), manifest(T0));
+    assert.deepEqual(leftoverDirs(cwd).filter((name) => name.startsWith(".visualize-staging-")), []);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test("writer: rejects symlinked targets and non-directory destinations without touching them", () => {
   const cwd = tmpWorkspace();
@@ -586,6 +739,216 @@ test("writer: repeated publishes always leave exactly one complete bundle and no
     assert.equal(existsSync(join(cwd, VISUALIZE_OUTPUT_ROOT, "sessions", "feature", "alpha.md")), false);
     assert.equal(existsSync(join(cwd, VISUALIZE_OUTPUT_ROOT, "sessions", "cto", "final.md")), true);
   } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("writer: pinned publication fails closed for root and ancestor swaps at every irreversible boundary", () => {
+  const files = bundle(T1, [{ kind: "feature", pathKey: "alpha" }]);
+  const phases = ["after-snapshots", "mkdir", "temp-write", "rename", "tree-rename"] as const;
+  for (const phase of phases) {
+    const container = tmpWorkspace();
+    const cwd = phase === "after-snapshots" ? container : join(container, "project");
+    if (phase !== "after-snapshots") mkdirSync(cwd);
+    const displacedPath = phase === "mkdir" ? container : cwd;
+    let displaced: string | null = null;
+    let replacement: string | null = null;
+    const swap = (): void => {
+      if (displaced !== null) return;
+      displaced = `${displacedPath}.displaced`;
+      if (displacedPath === container) {
+        renameSync(container, displaced);
+        mkdirSync(container);
+        replacement = cwd;
+        if (replacement !== container) mkdirSync(cwd);
+      } else {
+        renameSync(cwd, displaced);
+        mkdirSync(cwd);
+        replacement = cwd;
+      }
+    };
+    let triggered = false;
+    const pin = phase === "after-snapshots"
+      ? null
+      : PinnedProjectRoot.open(cwd, {
+        beforeDirectoryCreate: (relativePath) => {
+          if (phase === "mkdir" && relativePath.includes(".visualize-staging-") && !triggered) {
+            triggered = true;
+            swap();
+          }
+        },
+        beforeTempOpen: () => {
+          if (phase === "temp-write" && !triggered) {
+            triggered = true;
+            swap();
+          }
+        },
+        beforeRename: () => {
+          if (phase === "rename" && !triggered) {
+            triggered = true;
+            swap();
+          }
+        },
+      });
+    try {
+      let error: unknown;
+      try {
+        if (phase === "after-snapshots") {
+          publishVisualize(cwd, files, { hooks: { onStagingCreated: () => swap() } });
+        } else {
+          const options = phase === "tree-rename"
+            ? { hooks: { onBeforeSwap: () => { triggered = true; swap(); } } }
+            : {};
+          publishVisualizePinned(cwd, files, pin, options);
+        }
+      } catch (caught) {
+        error = caught;
+      }
+      assert.ok(error instanceof VisualizePublishError, `${phase} must fail closed`);
+      assert.ok(triggered || phase === "after-snapshots", `${phase} race seam was exercised`);
+      assert.ok(replacement !== null);
+      assert.deepEqual(readdirSync(replacement!), [], `${phase} replacement stayed untouched`);
+      assert.equal(existsSync(join(replacement!, VISUALIZE_OUTPUT_ROOT)), false, `${phase} no mixed target`);
+    } finally {
+      pin?.close();
+      if (displaced !== null) {
+        restoreDisplaced(displacedPath, displaced);
+      }
+      rmSync(container, { recursive: true, force: true });
+    }
+  }
+});
+
+test("writer: output-directory and staged-leaf symlink swaps never escape or publish mixed output", () => {
+  const files = bundle(T1, [{ kind: "feature", pathKey: "alpha" }]);
+
+  const outputRoot = tmpWorkspace();
+  const outputOutside = mkdtempSync(join(tmpdir(), "viz-output-outside-"));
+  try {
+    const outputTarget = join(outputRoot, VISUALIZE_OUTPUT_ROOT);
+    assert.throws(
+      () =>
+        publishVisualize(outputRoot, files, {
+          hooks: {
+            onBeforeSwap: () => {
+              symlinkSync(outputOutside, outputTarget, "dir");
+            },
+          },
+        }),
+      (error: unknown) => error instanceof VisualizePublishError && error.code === "swap-failed",
+    );
+    assert.equal(lstatSync(outputTarget).isSymbolicLink(), true);
+    assert.deepEqual(readdirSync(outputOutside), [], "output-dir replacement stayed untouched");
+    assert.equal(existsSync(join(outputOutside, "index.md")), false);
+  } finally {
+    rmSync(outputRoot, { recursive: true, force: true });
+    rmSync(outputOutside, { recursive: true, force: true });
+  }
+
+  const leafRoot = tmpWorkspace();
+  const leafOutside = mkdtempSync(join(tmpdir(), "viz-leaf-outside-"));
+  try {
+    assert.throws(
+      () =>
+        publishVisualize(leafRoot, files, {
+          hooks: {
+            onBeforeSwap: (staging) => {
+              const leaf = join(staging, "index.md");
+              unlinkSync(leaf);
+              symlinkSync(leafOutside, leaf, "file");
+            },
+          },
+        }),
+      (error: unknown) => error instanceof VisualizePublishError && error.code === "swap-failed",
+    );
+    assert.equal(existsSync(join(leafRoot, VISUALIZE_OUTPUT_ROOT)), false, "leaf swap did not publish target");
+    assert.deepEqual(readdirSync(leafOutside), [], "staged-leaf replacement stayed untouched");
+  } finally {
+    rmSync(leafRoot, { recursive: true, force: true });
+    rmSync(leafOutside, { recursive: true, force: true });
+  }
+});
+
+test("writer: root replacement during prune is rejected without writing into the replacement", () => {
+  const cwd = tmpWorkspace();
+  const displaced = `${cwd}.displaced`;
+  let swapped = false;
+  try {
+    publishVisualize(cwd, bundle(T0, [{ kind: "feature", pathKey: "old" }]));
+    assert.throws(
+      () =>
+        publishVisualize(cwd, bundle(T1, [{ kind: "feature", pathKey: "new" }]), {
+          hooks: {
+            onBeforePrune: () => {
+              if (swapped) return;
+              swapped = true;
+              renameSync(cwd, displaced);
+              mkdirSync(cwd);
+            },
+          },
+        }),
+      (error: unknown) => error instanceof VisualizePublishError && error.code === "boundary-escape",
+    );
+    assert.equal(swapped, true);
+    assert.deepEqual(readdirSync(cwd), [], "prune replacement stayed untouched");
+    assert.equal(existsSync(join(cwd, VISUALIZE_OUTPUT_ROOT)), false, "prune replacement has no mixed target");
+  } finally {
+    if (swapped) restoreDisplaced(cwd, displaced);
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("writer: prune rejects output-directory and leaf symlink swaps without clobbering the replacement", () => {
+  const cases = ["output-directory", "leaf"] as const;
+  for (const kind of cases) {
+    const cwd = tmpWorkspace();
+    const outside = mkdtempSync(join(tmpdir(), `viz-prune-${kind}-outside-`));
+    try {
+      publishVisualize(cwd, bundle(T0, [{ kind: "feature", pathKey: "old" }]));
+      const target = join(cwd, VISUALIZE_OUTPUT_ROOT);
+      assert.throws(
+        () =>
+          publishVisualize(cwd, bundle(T1, [{ kind: "feature", pathKey: "new" }]), {
+            hooks: {
+              onBeforePrune: () => {
+                if (kind === "output-directory") {
+                  rmSync(target, { recursive: true, force: true });
+                  symlinkSync(outside, target, "dir");
+                } else {
+                  const leaf = join(target, "index.md");
+                  unlinkSync(leaf);
+                  symlinkSync(outside, leaf, "file");
+                }
+              },
+            },
+          }),
+        (error: unknown) => error instanceof VisualizePublishError && error.code === "swap-failed",
+      );
+      if (kind === "output-directory") {
+        assert.equal(lstatSync(target).isSymbolicLink(), true, "the replacement output directory remains in place");
+      } else {
+        assert.equal(lstatSync(join(target, "index.md")).isSymbolicLink(), true, "the replacement leaf remains in place");
+      }
+      assert.deepEqual(readdirSync(outside), [], `${kind} replacement stayed untouched`);
+      assert.ok(leftoverDirs(cwd).some((name) => name.startsWith(".visualize-backup-")), `${kind} stale backup remains quarantined`);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  }
+});
+
+test("writer: borrowed pinned publisher leaves the caller-owned root open", () => {
+  const cwd = tmpWorkspace();
+  const pin = PinnedProjectRoot.open(cwd);
+  assert.ok(pin);
+  try {
+    const result = publishVisualizePinned(cwd, bundle(T1, [{ kind: "feature", pathKey: "alpha" }]), pin);
+    assert.equal(result.status, "published");
+    assert.equal(pin.isStable(), true, "borrowed pin remains open after publication");
+    assert.equal(pin.pathEntryInfo(".work-state/visualize/index.md")?.kind, "file");
+  } finally {
+    pin.close();
     rmSync(cwd, { recursive: true, force: true });
   }
 });

@@ -2,20 +2,109 @@
   "$schema": "./_schema.json",
   "name": "spec-preparation",
   "title": "Implementation-ready specification preparation",
-  "description": "Platform-neutral workflow for SPEC requests. Produces a traceable implementation-ready specification and does not modify application code.",
+  "description": "Native constitution-first workflow for SPEC requests. A blocking constitution prerequisite gates the ordered Specify → Plan → Tasks progression: each phase is authored by one dispatched worker into a typed draft artifact and advances only through its hard-human before_advance checkpoint exposing exactly approve_continue, request_changes, and approve_stop; the terminal handoff assembles the traceable implementation-ready specification and does not modify application code.",
   "completion_intent": {
     "mode": "handoff_only",
-    "acceptance": "dod_and_artifacts",
+    "acceptance": "quality_gates_and_artifacts",
     "source": "workflow_policy",
-    "rationale": "Specification preparation hands off a traceable implementation-ready specification without modifying application code."
+    "rationale": "Specification preparation hands off a traceable implementation-ready specification assembled from validated typed drafts; every phase artifact must exist and pass its checkpoint, and no application code is modified."
+  },
+  "constitution_prerequisite": {
+    "required": true,
+    "bootstrap_profile": "constitution",
+    "bootstrap_decisions": ["approve_continue", "request_changes"]
   },
   "match": { "type": ["SPEC"], "complexity": ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": ["specification_phase_approval"],
+    "rules": {
+      "specification_phase_approval": {
+        "kind": "specification_phase_approval",
+        "default": "required_human",
+        "allowed_decisions": ["approve_continue", "request_changes", "approve_stop"],
+        "phase": "before_advance",
+        "rationale": "Every native specification phase requires an explicit trusted human decision on its validated typed artifact: approve_continue arms the next phase, request_changes reopens the current phase with recorded feedback, and approve_stop ends the run at the phase boundary."
+      }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Specify, plan, and tasks all advance through the canonical hard-human specification_phase_approval checkpoint with the exact three phase decisions; the constitution bootstrap approval is declared separately by the prerequisite and never satisfies a phase approval."
+  },
   "stages": [
-    { "id": "intake_repo_map", "title": "Intake and repository map", "type": "consilium", "roles": ["analyst", "tech-researcher"], "roster_policy": { "allowed_roles": ["analyst", "tech-researcher"], "required_roles": ["analyst", "tech-researcher"], "required_facets": [], "min_workers": 2, "max_workers": 3, "multiplicity": { "analyst": { "min": 1, "max": 2 }, "tech-researcher": { "min": 1, "max": 2 } }, "prefer_distinct_agents": true, "selection_mode": "pre_dispatch_minimum_valid", "triggers": { "complexity": ["COMPLEX", "CRITICAL"], "confidence": ["LOW"], "scope_flags": ["has_security", "has_infra"], "evidence": ["conflicting", "uncovered_facet"] }, "budget": { "token_limit": null, "dollar_limit": null } }, "parallel": true, "prompt": "Normalize the request, inspect repository structure and conventions, identify affected modules/symbols/configuration, and gather authoritative local or external evidence. If a product_spec artifact is present, use it as approved product context (what and why) — never re-litigate the approved direction. Its absence is expected for standalone SPEC requests and must not block this workflow. Separate verified facts, assumptions, and open questions; do not edit code or specification files.", "consumes": ["product_spec"], "produces": "spec_intake_repo_map" },
-    { "id": "requirements_edge_cases", "title": "Requirements and edge cases", "type": "single", "role": "analyst", "roster_policy": { "allowed_roles": ["analyst"], "required_roles": ["analyst"], "required_facets": [], "min_workers": 1, "max_workers": 1, "multiplicity": { "analyst": { "min": 1, "max": 1 } }, "prefer_distinct_agents": true, "selection_mode": "pre_dispatch_minimum_valid", "triggers": { "complexity": [], "confidence": [], "scope_flags": [], "evidence": [] }, "budget": { "token_limit": null, "dollar_limit": null } }, "prompt": "Convert the intake into testable functional requirements, non-goals, acceptance criteria, invariants, error behavior, lifecycle/state transitions, security/privacy constraints, compatibility constraints, and edge cases. Trace every requirement to evidence or mark it as a decision needed.", "consumes": ["spec_intake_repo_map"], "produces": "spec_requirements_edge_cases" },
-    { "id": "options_decision_log", "title": "Options and decision log", "type": "single", "role": "architect", "roster_policy": { "allowed_roles": ["architect"], "required_roles": ["architect"], "required_facets": [], "min_workers": 1, "max_workers": 1, "multiplicity": { "architect": { "min": 1, "max": 1 } }, "prefer_distinct_agents": true, "selection_mode": "pre_dispatch_minimum_valid", "triggers": { "complexity": [], "confidence": [], "scope_flags": [], "evidence": [] }, "budget": { "token_limit": null, "dollar_limit": null } }, "prompt": "Compare materially different implementation options against repository conventions, complexity, risk, migration cost, operability, testability, and reversibility. Recommend one conservative option and record rejected alternatives, rationale, assumptions, and unresolved decisions.", "consumes": ["spec_requirements_edge_cases"], "produces": "spec_options_decisions" },
-    { "id": "architecture_task_slices", "title": "Architecture and task slices", "type": "consilium", "roles": ["architect", "tech-researcher"], "roster_policy": { "allowed_roles": ["architect", "tech-researcher"], "required_roles": ["architect", "tech-researcher"], "required_facets": [], "min_workers": 2, "max_workers": 3, "multiplicity": { "architect": { "min": 1, "max": 2 }, "tech-researcher": { "min": 1, "max": 2 } }, "prefer_distinct_agents": true, "selection_mode": "pre_dispatch_minimum_valid", "triggers": { "complexity": ["COMPLEX", "CRITICAL"], "confidence": ["LOW"], "scope_flags": ["has_security", "has_infra"], "evidence": ["conflicting", "uncovered_facet"] }, "budget": { "token_limit": null, "dollar_limit": null } }, "parallel": true, "prompt": "Produce implementation-ready architecture and independently challenge it. Define boundaries, data/control flow, interfaces/contracts, ownership, dependencies, migration order, observability, test strategy, and bite-sized task slices with files/symbols and acceptance evidence. Do not implement.", "consumes": ["spec_requirements_edge_cases", "spec_options_decisions"], "produces": "spec_architecture_tasks" },
-    { "id": "completeness_gate", "title": "Completeness gate", "type": "single", "role": "analyst", "roster_policy": { "allowed_roles": ["analyst"], "required_roles": ["analyst"], "required_facets": [], "min_workers": 1, "max_workers": 1, "multiplicity": { "analyst": { "min": 1, "max": 1 } }, "prefer_distinct_agents": true, "selection_mode": "pre_dispatch_minimum_valid", "triggers": { "complexity": [], "confidence": [], "scope_flags": [], "evidence": [] }, "budget": { "token_limit": null, "dollar_limit": null } }, "prompt": "Audit the specification for requirement-to-design-to-task-to-test traceability, internal contradictions, missing failure paths, unsafe assumptions, unclear terminology, scope creep, and unresolved decisions. Return blocking gaps with exact remediation; pass only when another engineer can implement without rediscovery.", "consumes": ["spec_intake_repo_map", "spec_requirements_edge_cases", "spec_options_decisions", "spec_architecture_tasks"], "produces": "spec_completeness" },
-    { "id": "handoff", "title": "Specification handoff", "type": "orchestrator", "prompt": "Assemble the final specification handoff from the validated artifacts. Preserve provenance and confidence, distinguish verified facts from inference, list implementation slices and verification commands, and state explicitly that no application or specification files were changed by this workflow.", "consumes": ["spec_completeness"], "produces": ["spec-preparation", "spec_handoff"] }
+    {
+      "id": "specify",
+      "title": "Specify authoring",
+      "type": "single",
+      "role": "specification-analyst",
+      "roster_policy": {
+        "allowed_roles": ["specification-analyst"],
+        "required_roles": ["specification-analyst"],
+        "required_facets": [],
+        "min_workers": 1,
+        "max_workers": 1,
+        "multiplicity": { "specification-analyst": { "min": 1, "max": 1 } },
+        "prefer_distinct_agents": true,
+        "selection_mode": "pre_dispatch_minimum_valid",
+        "triggers": { "complexity": [], "confidence": [], "scope_flags": [], "evidence": [] },
+        "budget": { "token_limit": null, "dollar_limit": null }
+      },
+      "checkpoint": "specification_phase_approval",
+      "prompt": "Act as the declared specify worker. Read only the requester task, the approved constitution document plus its exact binding, and limited targeted implementation paths needed to ground the request; do not search tests, schemas, examples, or unrelated files for output guidance, never write files, and never call workflow tools. Return exactly one strict JSON worker_result object with no extra keys: sections, requirements, decisions, tasks, verification, contradictions, constitution_principles. The sections object must contain exactly these non-empty keys: problem, scope, non_goals, actors, journeys, requirements, edge_cases, assumptions, dependencies, success_criteria. Use exact row keys with no extras: requirements={requirement_id,statement,acceptance_ids,source_refs,testable,untestable_reason}; decisions={decision_id,decision,rationale,requirement_ids}; tasks={id,title,requirement_ids,acceptance_ids,decision_ids,verification_ids,depends_on,expected_outcome,affected_scope,completion_evidence,parallel_safe}; verification={verification_id,requirement_ids,acceptance_ids,task_ids,observable_behavior,expected_evidence}; contradictions={contradiction_id,subject_ids,status,assessment,evidence}; constitution_principles={principle_id,applicability,status,evidence}. Use unique IDs, non-empty required strings/arrays, only declared-row links, untestable_reason=null for testable requirements, and one principle row for every approved constitution identity. Include at least REQ-1/AC-1, DEC-1 linked to REQ-1, TASK-1 linked to REQ-1/AC-1/DEC-1/VER-1, and VER-1 linked to REQ-1/AC-1/TASK-1 unless the request genuinely supplies a larger set. Do not author schema_version, feature_id, run_key, phase, version, worker, constitution_binding, or upstream_versions: the engine derives and binds those fields from the trusted handoff. Yield exactly once with the worker_result; if the engine rejects persistence, report exactly one untouched worker failure and stop; never retry or reconstruct a replacement model.",
+      "produces": "specify_draft"
+    },
+    {
+      "id": "plan",
+      "title": "Plan authoring",
+      "type": "single",
+      "role": "specification-architect",
+      "roster_policy": {
+        "allowed_roles": ["specification-architect"],
+        "required_roles": ["specification-architect"],
+        "required_facets": [],
+        "min_workers": 1,
+        "max_workers": 1,
+        "multiplicity": { "specification-architect": { "min": 1, "max": 1 } },
+        "prefer_distinct_agents": true,
+        "selection_mode": "pre_dispatch_minimum_valid",
+        "triggers": { "complexity": [], "confidence": [], "scope_flags": [], "evidence": [] },
+        "budget": { "token_limit": null, "dollar_limit": null }
+      },
+      "checkpoint": "specification_phase_approval",
+      "prompt": "Act as the declared plan worker. Consume the approved specify_draft and design the implementation approach against bounded repository conventions, complexity, risk, migration cost, operability, testability, and reversibility: the chosen approach with materially different rejected alternatives and why each was rejected, component and module boundaries, data and interface contracts, and the verification strategy. Read only the requester task, approved constitution and exact binding, approved immutable Specify artifact, and limited targeted implementation paths; do not search tests, schemas, examples, or unrelated files for output guidance, never write files, and never call workflow tools. Return exactly one strict JSON worker_result object with no extra keys: sections, requirements, decisions, tasks, verification, contradictions, constitution_principles. The sections object must contain exactly these non-empty keys: repository_grounding, decisions, alternatives, contracts, data_flow, control_flow, migration, security, operations, verification_strategy, constitution_recheck. Use exact row keys with no extras: requirements={requirement_id,statement,acceptance_ids,source_refs,testable,untestable_reason}; decisions={decision_id,decision,rationale,requirement_ids}; tasks={id,title,requirement_ids,acceptance_ids,decision_ids,verification_ids,depends_on,expected_outcome,affected_scope,completion_evidence,parallel_safe}; verification={verification_id,requirement_ids,acceptance_ids,task_ids,observable_behavior,expected_evidence}; contradictions={contradiction_id,subject_ids,status,assessment,evidence}; constitution_principles={principle_id,applicability,status,evidence}. Preserve Specify requirements, contradictions, and principle identities exactly, use unique IDs and only declared-row links, and include at least REQ-1/AC-1, DEC-1, TASK-1, and VER-1 unless the request genuinely supplies a larger set. Do not author schema_version, feature_id, run_key, phase, version, worker, constitution_binding, or upstream_versions: the engine derives and binds those fields from the trusted handoff. Yield exactly once with the worker_result; if the engine rejects persistence, report exactly one untouched worker failure and stop; never retry or reconstruct a replacement model.",
+      "consumes": ["specify_draft"],
+      "produces": "plan_draft"
+    },
+    {
+      "id": "tasks",
+      "title": "Task graph authoring",
+      "type": "single",
+      "role": "specification-architect",
+      "roster_policy": {
+        "allowed_roles": ["specification-architect"],
+        "required_roles": ["specification-architect"],
+        "required_facets": [],
+        "min_workers": 1,
+        "max_workers": 1,
+        "multiplicity": { "specification-architect": { "min": 1, "max": 1 } },
+        "prefer_distinct_agents": true,
+        "selection_mode": "pre_dispatch_minimum_valid",
+        "triggers": { "complexity": [], "confidence": [], "scope_flags": [], "evidence": [] },
+        "budget": { "token_limit": null, "dollar_limit": null }
+      },
+      "checkpoint": "specification_phase_approval",
+      "prompt": "Act as the declared tasks worker. Consume the approved plan_draft and decompose the implementation into ordered, independently verifiable task slices. For each task declare its goal, the files or modules it touches, its dependencies on earlier tasks, the verification command or check that proves it complete, and the plan item and specify requirements it serves; prefer the fewest tasks that cover the whole plan with no gaps or overlaps. Read only the requester task, approved constitution and exact binding, approved immutable Specify and Plan artifacts, and limited targeted implementation paths; do not search tests, schemas, examples, or unrelated files for output guidance, never write files, and never call workflow tools. Return exactly one strict JSON worker_result object with no extra keys: sections, requirements, decisions, tasks, verification, contradictions, constitution_principles. The sections object must contain exactly these non-empty keys: task_graph, dependencies, expected_outcomes. Use exact row keys with no extras: requirements={requirement_id,statement,acceptance_ids,source_refs,testable,untestable_reason}; decisions={decision_id,decision,rationale,requirement_ids}; tasks={id,title,requirement_ids,acceptance_ids,decision_ids,verification_ids,depends_on,expected_outcome,affected_scope,completion_evidence,parallel_safe}; verification={verification_id,requirement_ids,acceptance_ids,task_ids,observable_behavior,expected_evidence}; contradictions={contradiction_id,subject_ids,status,assessment,evidence}; constitution_principles={principle_id,applicability,status,evidence}. Preserve Specify requirements and contradictions, Plan decisions, and principle identities exactly, use unique IDs and only declared-row links, and include at least REQ-1/AC-1, DEC-1, TASK-1, and VER-1 unless the request genuinely supplies a larger set. Do not author schema_version, feature_id, run_key, phase, version, worker, constitution_binding, or upstream_versions: the engine derives and binds those fields from the trusted handoff. Yield exactly once with the worker_result; if the engine rejects persistence, report exactly one untouched worker failure and stop; never retry or reconstruct a replacement model.",
+      "consumes": ["plan_draft"],
+      "produces": "task_graph"
+    },
+    {
+      "id": "handoff",
+      "title": "Specification handoff",
+      "type": "orchestrator",
+      "prompt": "Assemble the final specification handoff from the validated typed drafts (specify_draft, plan_draft, task_graph). Preserve provenance and worker attribution, distinguish verified facts from inference, list the implementation task slices with their verification commands, bind the summary to the approved constitution, and state explicitly that no application or specification files were changed by this workflow.",
+      "consumes": ["specify_draft", "plan_draft", "task_graph"],
+      "produces": ["spec-preparation", "spec_handoff"]
+    }
   ]
 }

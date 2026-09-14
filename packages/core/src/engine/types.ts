@@ -7,6 +7,9 @@
 
 import type { AgentMappingState } from "./agent-mapping.js";
 import type { ObservabilityPointer } from "../observability/events.js";
+import type { ConstitutionOriginKind, FeatureWorkspace } from "../specification/types.js";
+import type { PinnedProjectRoot } from "../specification/pinned-root.js";
+import type { NativePreparationStartMarker, WorkflowPreparationHandoff } from "./preparation.js";
 
 export type TaskType = "FEATURE" | "REFACTOR" | "OPS" | "BUG_FIX" | "SPEC" | "REGRESS" | "INVESTIGATION" | "LECTURE_RESEARCH" | "REVIEW" | "HOTFIX" | "PRODUCT_DISCOVERY";
 export type Complexity = "QUICK" | "MEDIUM" | "COMPLEX" | "CRITICAL";
@@ -39,7 +42,7 @@ export type PauseKind =
   | "failed"
   | "done";
 export type CompletionIntentMode = "complete_outcome" | "handoff_only";
-export type CompletionAcceptance = "dod_and_artifacts" | "explicit_human_acceptance";
+export type CompletionAcceptance = "quality_gates_and_artifacts" | "explicit_human_acceptance";
 export type CompletionIntentSource = "user" | "workflow_policy" | "migration";
 
 /**
@@ -56,7 +59,11 @@ export interface CompletionIntent {
 export type CheckpointPolicyDefault = "required_human" | "autonomous_allowed";
 export type CheckpointPolicyScope = "decision";
 export type CheckpointPolicyPhase = "before_dispatch" | "before_advance";
+export type NativeCheckpointRuleKind = "constitution_approval" | "specification_phase_approval";
+export type ConstitutionApprovalDecision = "approve_continue" | "request_changes";
+export type SpecificationPhaseApprovalDecision = ConstitutionApprovalDecision | "approve_stop";
 export type CheckpointRuleKind =
+  | NativeCheckpointRuleKind
   | "product_approval"
   | "clarification"
   | "architecture_choice"
@@ -105,6 +112,8 @@ export interface CheckpointAnswerProof {
   channel: CheckpointAnswerChannel;
   reference: string;
   binding: string;
+  /** Exact trusted user feedback when decision=request_changes. */
+  feedback?: string;
 }
 
 /**
@@ -124,8 +133,16 @@ export interface TrustedCheckpointAnswer {
   capability_id: string;
   capability_epoch: string;
   policy_hash: string;
+  feature_id?: string;
+  loop_iteration?: number;
+  subject_binding?: string;
+  subject_revision?: number;
   decision: string;
+  /** Exact trusted user feedback when decision=request_changes. */
+  feedback?: string;
   binding: string;
+  /** Runtime-authenticated effect receipt; presence alone never grants authority. */
+  authority_receipt?: string;
   issued_at: string;
   consumed_at?: string;
 }
@@ -253,11 +270,23 @@ export interface PendingLease {
  * Pending is a durable lifecycle state, not a failure or a replacement
  * signal. Terminal transitions retain the same work identity.
  */
+export interface PendingReconciliation {
+  identity: WorkIdentity;
+  result_digest: string;
+  outcome: Exclude<CompletionOutcome, "pending">;
+  evidence: string;
+  artifact_ids: string[];
+  terminal_signal: CompletionTerminalSignal;
+  provider_id?: string;
+  updated_at: string;
+}
+
 export interface PendingState {
   identity: WorkIdentity;
   status: "authorized" | "running" | "pending" | "succeeded" | "failed" | "cancelled";
   pending_reason?: PendingReason;
   provider_ref?: string;
+  reconciliation?: PendingReconciliation;
   lease?: PendingLease;
   terminal_signal?: string | null;
   retry_of?: string | null;
@@ -280,14 +309,15 @@ export interface ChildJoin {
 export type CompletionOutcome = "pending" | "succeeded" | "failed" | "cancelled";
 export type CompletionTerminalSignal = "workflow_complete" | "native_tool_result" | "provider_terminal" | "contract_failure";
 export type CompletionSchemaStatus = "met" | "failed";
-export type CompletionDodStatus = "met" | "pending" | "failed";
+export type CompletionQualityGateStatus = "met" | "pending" | "failed";
 
 export interface CompletionArtifactRef {
   artifact_id: string;
   path: string;
   sha256: string;
+  size_bytes?: number;
   schema_status: CompletionSchemaStatus;
-  dod_status: CompletionDodStatus;
+  quality_gate_status: CompletionQualityGateStatus;
 }
 
 /**
@@ -369,6 +399,53 @@ export interface ProfileMatch {
   complexity?: Complexity[];
 }
 
+/**
+ * Registered deterministic Markdown document renderer (one registry, one
+ * materialization path). Renderers are pure functions of their declared
+ * source artifacts: identical inputs render byte-identical Markdown with no
+ * wall-clock or randomness. Registration happens exactly once through
+ * specification/materialize.ts; the durable engine resolves stage document
+ * contracts fail-closed through the registry.
+ */
+export interface DocumentRenderInput {
+  /** Borrowed transaction root; all renderer I/O must use this descriptor. */
+  pinnedRoot: PinnedProjectRoot;
+  /** Descriptor-safe project-relative state directory. */
+  stateDirRelative: string;
+  /** Descriptor-safe project-relative artifacts directory. */
+  artifactsDirRelative: string;
+  /** Safe relative path of the document inside the state dir. */
+  path: string;
+  /** Stage-consumed source artifacts keyed by artifact id. */
+  sourceArtifacts: Record<string, unknown>;
+  /** Register exact rollback for each output as soon as the renderer publishes it. */
+  registerRollback?: (cleanup: () => void) => void;
+}
+
+export type DocumentRenderResult =
+  | {
+      ok: true;
+      /** Absolute path of the rendered Markdown document. */
+      documentPath: string;
+      /** SHA-256 of the exact rendered bytes. */
+      content_sha256: string;
+      /** Key-order-independent hash of the contributing sources. */
+      source_hash: string | null;
+      /** Typed artifact id recording the render manifest, when persisted. */
+      artifactPath: string | null;
+    }
+  | { ok: false; error: string };
+
+export interface DocumentRenderer {
+  /** Stable registry id used by stage document contracts (e.g. "product-prd"). */
+  id: string;
+  /** Output format; only "markdown" is shipped. */
+  format: "markdown";
+  /** Source artifact ids the renderer requires; all must exist before render. */
+  requiredSourceArtifacts: readonly string[];
+  render(input: DocumentRenderInput): DocumentRenderResult;
+}
+
 export interface StageDef {
   id: string;
   title: string;
@@ -414,13 +491,15 @@ export interface StageDef {
   command?: string;
   /**
    * For document stages: the executable document contract. The engine —
-   * not an agent — renders the declared document (see engine/product-prd.ts
-   * for the shipped product-prd renderer).
+   * not an agent — renders the declared document through the registered
+   * deterministic Markdown renderer registry (see
+   * specification/materialize.ts; the shipped product-prd renderer is
+   * pre-registered there).
    */
   document?: {
     /** Output format; only "markdown" is shipped. */
     format: string;
-    /** Renderer selector; only "product-prd" is shipped. */
+    /** Registered renderer selector, resolved fail-closed at render time. */
     renderer: string;
     /** Safe relative path of the document inside the state dir. */
     path: string;
@@ -449,6 +528,8 @@ export interface StageDef {
 }
 
 export interface Profile {
+  /** Optional JSON Schema URI/path metadata retained from shipped assets. */
+  readonly "$schema"?: string;
   name: WorkflowName;
   title: string;
   description: string;
@@ -476,6 +557,10 @@ export interface DispatchCompletion {
 
 export interface DispatchRecord {
   id: string;
+  /** Distinguishes phase validation authority from generation workers. */
+  purpose?: "generation" | "validation";
+  /** Immutable phase version bound to a validation dispatch. */
+  phase_version?: number;
   role: string;
   agent: string;
   tool_call_id?: string;
@@ -533,6 +618,8 @@ export interface DispatchCapabilityState {
   run?: string;
   workflow?: WorkflowName;
   profile_hash?: string;
+  /** Exact stage control-plane digest bound when the engine arms a capability. */
+  policy_hash?: string;
   stage?: string;
   roles?: string[];
   capability_id?: string;
@@ -583,6 +670,14 @@ export interface CheckpointDecision {
   capability_id?: string;
   capability_epoch?: string;
   policy_hash?: string;
+  feature_id?: string;
+  loop_iteration?: number;
+  artifact_id?: string;
+  artifact_version?: number;
+  artifact_digest?: string;
+  validation_ref?: string;
+  validation_digest?: string;
+  subject_binding?: string;
   work_identity?: WorkIdentity;
 }
 
@@ -601,15 +696,40 @@ export interface TypedCheckpointDecision {
   capability_id: string;
   capability_epoch: string;
   policy_hash: string;
+  feature_id?: string;
+  loop_iteration?: number;
+  subject_binding?: string;
+  /** Exact phase artifact bound by a specification checkpoint decision. */
+  artifact_id?: string;
+  /** Immutable phase artifact version bound by the decision. */
+  artifact_version?: number;
+  /** SHA-256 digest of the exact canonical phase artifact bound by the decision. */
+  artifact_digest?: string;
+  /** Exact validation artifact reference bound by a specification checkpoint decision. */
+  validation_ref?: string;
+  /** Digest of the exact validation artifact bound by the decision. */
+  validation_digest?: string;
   rationale: string;
   decided_at: string;
 }
 /** Durable provenance of one slot's artifact contribution to a consilium stage. */
 export interface SlotArtifactRecord {
-  /** Absolute path of the namespaced per-slot snapshot (`<id>-<slot>.json`). */
+  /** Absolute path of the canonical per-slot snapshot. */
   path: string;
-  /** SHA-256 of the normalized artifact JSON captured at completion. */
-  hash: string;
+  /** SHA-256 of the exact persisted envelope bytes captured at completion. */
+  sha256: string;
+  /** Exact persisted byte length captured at completion. */
+  size_bytes: number;
+  /** Logical artifact identity carried by the persisted envelope. */
+  artifact_id?: string;
+  /** Exact dispatch slot identity carried by the persisted envelope. */
+  slot_id?: string;
+  /** Provider/result identity carried by the persisted envelope. */
+  provider_id?: string;
+  /** SHA-256 of the logical value before its provenance envelope. */
+  value_sha256?: string;
+  /** SHA-256 of the envelope identity tuple. */
+  identity_sha256?: string;
 }
 
 /**
@@ -693,8 +813,17 @@ export interface LoopState {
   ended_at?: string;
 }
 
+export interface AdaptivePreparationState {
+  depth: "quick" | "bounded_specify" | "full_specification";
+  rationale_codes: readonly string[];
+  feature_id: string;
+  run_key: string;
+  request_digest: string;
+}
+
 export interface TeamState {
   schema: 1;
+  state_revision?: number;
   branch: string;
   classification: Classification;
   task: string;
@@ -724,6 +853,8 @@ export interface TeamState {
     dev_agent: string | null;
   };
   profile_hash?: string;
+  /** Raw project team configuration digest captured when the run was prepared. */
+  config_hash?: string;
   cursor_epoch?: string;
   run_key?: string;
   dispatch_capability?: DispatchCapabilityState;
@@ -753,7 +884,52 @@ export interface TeamState {
   /** Per-slot consilium artifact provenance + synthesis evidence (additive). */
   slot_artifacts?: Record<string, StageSlotRecords>;
   observability?: ObservabilityPointer;
+  /**
+   * Embedded canonical specification aggregate (additive). The record is
+   * the FeatureWorkspace contract; its transitions remain the engine's
+   * capability/checkpoint records. Malformed values fail closed at load.
+   */
+  specification?: FeatureWorkspace;
+  /** Persisted adaptive specification-preparation classification, if used. */
+  adaptive_preparation?: AdaptivePreparationState;
+  /** Opaque postimage authority returned by workflow_prepare. */
+  preparation_handoff?: WorkflowPreparationHandoff;
+  /* Durable postimage receipt proving native phase start. */
+  preparation_start?: NativePreparationStartMarker;
 }
+
+// ── Constitution prerequisite vocabulary (T020) ─────────────────────────────
+
+/**
+ * Exact origin descriptor consumed by the shared constitution
+ * prerequisite. The descriptor names the one origin that stays blocked
+ * behind a constitution bootstrap and is echoed verbatim in the resume
+ * target after approval.
+ */
+export interface ConstitutionOriginDescriptor {
+  origin_kind: ConstitutionOriginKind;
+  /** Explicit run binding of the blocked origin; never inferred. */
+  origin_run_key: string;
+  /** Stage or command the origin resumes once the constitution is approved. */
+  origin_stage: string;
+}
+
+/** Where an approved bootstrap resumes its exact origin, once. */
+export type ConstitutionResumeTarget = "specify" | "compatibility_validation" | (string & {});
+
+export interface ConstitutionResume {
+  origin_kind: ConstitutionOriginKind;
+  origin_run_key: string;
+  resume_target: ConstitutionResumeTarget;
+}
+
+/**
+ * Injectable bootstrap continuation gate (T020): returns a blocking reason
+ * while a constitution bootstrap is pending for the origin, or null when
+ * the durable cursor may continue. The specification integration registers
+ * the real gate; unset keeps engine behavior unchanged.
+ */
+export type ConstitutionContinuationGate = (input: { state: TeamState; stage: StageDef }) => string | null;
 
 export interface RoleConfig {
   /** role -> agent name (passed verbatim to `task` tool) */

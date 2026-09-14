@@ -1,41 +1,44 @@
 /**
  * Model-first CTO classification persistence (review follow-up): new CTO task
  * runs persist the structured model classification, `classification.autonomous`
- * is the AUTHORITY (the legacy top-level field never overrides it), standby
- * stays the documented engine-created exception with no user task, and
- * markdown state restores the classification from the persisted line.
+ * is the AUTHORITY (the legacy top-level field never overrides it), and
+ * standby stays the documented engine-created exception with no user task.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import {
-  runCto,
-  findActiveCtoRun,
-  newCtoState,
-  readCtoState,
-  writeCtoState,
-  resolveCtoAutonomous,
-  type TeamDef,
-} from "@andvl1/omp-workflows-core";
+import { runCto, type TeamDef } from "@andvl1/omp-workflows-core";
+import { findActiveCtoRun } from "../src/commands/cto.js";
+import { newCtoState, readCtoState, resolveCtoAutonomous, writeCtoState } from "../src/cto/state.js";
+import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 
 function sampleDefs(): Record<string, TeamDef> {
   return {
-    backend: { id: "backend", name: "Backend", scope: ["backend-kotlin"], profile: "lightweight", lead: "team-lead", roster: ["backend-kotlin"] },
+    backend: {
+      id: "backend",
+      name: "Backend",
+      scope: ["backend-kotlin"],
+      profile: "lightweight",
+      lead: "team-lead",
+      roster: ["backend-kotlin"],
+    },
   };
 }
 
 test("cto-class: runCto persists the model classification; classification.autonomous is the authority", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-class-"));
+  const runtime = openTestCtoRuntime(root);
   try {
     const res = runCto({
       task: "Fix login bug",
       cwd: root,
       branch: "fix/login",
       autonomous: false, // legacy flag must NOT win over the classification
+      sessionId: "main-session",
       classification: {
         type: "BUG_FIX",
         complexity: "QUICK",
@@ -43,8 +46,16 @@ test("cto-class: runCto persists the model classification; classification.autono
         autonomous: true,
         autonomous_reason: "task explicitly waives approval",
       },
-      teams: [{ team: "backend", slice: "fix 500" }],
+      teams: [{
+        team: "backend",
+        scope: ["backend-kotlin"],
+        slice: "fix-500",
+        profile: "lightweight",
+        worktree: "same_branch",
+        depends_on: [],
+      }],
       defs: sampleDefs(),
+      runtimeAccess: runtime.access,
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;
@@ -62,20 +73,24 @@ test("cto-class: runCto persists the model classification; classification.autono
     assert.equal(reloaded?.classification?.autonomous, true, "classification persisted and readable");
     assert.equal(resolveCtoAutonomous(reloaded!), true);
   } finally {
+    runtime.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("cto-class: runCto without classification keeps the legacy top-level flag (no silent classification)", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-class-legacy-"));
+  const runtime = openTestCtoRuntime(root);
   try {
     const res = runCto({
       task: "Legacy task",
       cwd: root,
       branch: "main",
       autonomous: false,
+      sessionId: "main-session",
       teams: [{ team: "backend", slice: "s" }],
       defs: sampleDefs(),
+      runtimeAccess: runtime.access,
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;
@@ -83,6 +98,7 @@ test("cto-class: runCto without classification keeps the legacy top-level flag (
     assert.equal(res.state.autonomous, false, "caller flag stored verbatim — never defaulted");
     assert.equal(resolveCtoAutonomous(res.state), false, "top-level flag is the fallback authority");
   } finally {
+    runtime.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -139,81 +155,6 @@ test("cto-class: newCtoState with a partial runtime classification (boolean auto
   assert.equal(resolveCtoAutonomous(state), false);
 });
 
-test("cto-class: markdown state restores the structured classification; classification.autonomous wins over the legacy line", () => {
-  const root = mkdtempSync(join(tmpdir(), "cto-class-md-"));
-  try {
-    const runId = "md-class-run";
-    const runDir = join(root, ".work-state", "cto", runId);
-    mkdirSync(runDir, { recursive: true });
-    writeFileSync(
-      join(runDir, "cto_discovery.md"),
-      [
-        "# Fix login bug",
-        "",
-        "autonomous: true",
-        'classification: { "type": "BUG_FIX", "complexity": "QUICK", "confidence": "HIGH", "autonomous": false, "autonomous_reason": "user wants review" }',
-        "",
-        "Discovered scope.",
-      ].join("\n"),
-    );
-    writeFileSync(join(runDir, "team-plan.md"), "# Team Plan\n- team: backend\n");
-
-    const active = findActiveCtoRun(root);
-    assert.ok(active, "markdown run with a classification is active");
-    assert.equal(active?.state.classification?.type, "BUG_FIX");
-    assert.equal(active?.state.classification?.autonomous, false);
-    assert.equal(active?.state.autonomous, false, "top-level mirrors the classification — the legacy true line must NOT win");
-    assert.equal(resolveCtoAutonomous(active!.state), false, "classification.autonomous is the authority");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("cto-class: markdown state without a classification line falls back to the legacy top-level line", () => {
-  const root = mkdtempSync(join(tmpdir(), "cto-class-mdlegacy-"));
-  try {
-    const runId = "md-legacy-run";
-    const runDir = join(root, ".work-state", "cto", runId);
-    mkdirSync(runDir, { recursive: true });
-    writeFileSync(join(runDir, "cto_discovery.md"), "# Legacy run\nautonomous: true\n");
-    writeFileSync(join(runDir, "team-plan.md"), "# Team Plan\n- team: backend\n");
-
-    const active = findActiveCtoRun(root);
-    assert.ok(active, "legacy markdown run detected");
-    assert.equal(active?.state.classification, undefined, "no classification without a classification line");
-    assert.equal(active?.state.autonomous, true, "legacy top-level line is the fallback");
-    assert.equal(resolveCtoAutonomous(active!.state), true);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("cto-class: malformed classification line is ignored — legacy fallback, never a half-stored classification", () => {
-  const root = mkdtempSync(join(tmpdir(), "cto-class-malformed-"));
-  try {
-    const runId = "md-malformed-run";
-    const runDir = join(root, ".work-state", "cto", runId);
-    mkdirSync(runDir, { recursive: true });
-    writeFileSync(
-      join(runDir, "cto_discovery.md"),
-      [
-        "# Task",
-        "autonomous: false",
-        'classification: { "type": "BUG_FIX", "autonomous": "true" }', // incomplete + non-boolean
-        "",
-      ].join("\n"),
-    );
-    writeFileSync(join(runDir, "team-plan.md"), "# Team Plan\n- team: backend\n");
-
-    const active = findActiveCtoRun(root);
-    assert.ok(active, "run stays active on the legacy fallback");
-    assert.equal(active?.state.classification, undefined, "malformed classification is not stored");
-    assert.equal(active?.state.autonomous, false, "legacy line is the fallback authority");
-    assert.equal(resolveCtoAutonomous(active!.state), false);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 test("cto-class: standby is engine-created — no classification, top-level autonomous:true, documented", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-class-standby-"));
@@ -227,7 +168,7 @@ test("cto-class: standby is engine-created — no classification, top-level auto
       standby: true,
       plan: { id: "standby-1", task: "standby — awaiting inbox tasks", teams: [], created_at: now },
     });
-    writeCtoState(standby, root);
+    writeCtoState(standby, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
 
     const active = findActiveCtoRun(root);
     assert.equal(active?.runId, "standby-1", "standby run is active");

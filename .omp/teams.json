@@ -1,16 +1,66 @@
 [
   {
-    "id": "workflow-platform",
-    "name": "Workflow Platform",
-    "scope": "Plugin command publication, project override materialization, command discovery tests, and related monorepo packaging under packages/core, packages/fullstack, packages/omp-workflows-internal, packages/e2e, and .omp/commands",
+    "id": "sdd-foundation",
+    "name": "SDD Foundation",
+    "scope": ["dev"],
+    "profile": "full-feature",
+    "lead": "team-lead",
+    "roster": ["developer", "plugin-developer", "qa", "code-reviewer"]
+  },
+  {
+    "id": "sdd-runtime-fixtures",
+    "name": "SDD Runtime Fixtures",
+    "scope": ["dev"],
+    "profile": "full-feature",
+    "lead": "team-lead",
+    "roster": ["developer", "qa"]
+  },
+  {
+    "id": "sdd-native",
+    "name": "Native Specification Workflow",
+    "scope": ["dev"],
+    "profile": "full-feature",
+    "lead": "team-lead",
+    "roster": ["developer", "plugin-developer", "qa", "code-reviewer"]
+  },
+  {
+    "id": "sdd-execution",
+    "name": "Specification Execution",
+    "scope": ["dev"],
+    "profile": "full-feature",
+    "lead": "team-lead",
+    "roster": ["developer", "qa", "code-reviewer"]
+  },
+  {
+    "id": "sdd-interoperability",
+    "name": "Specification Interoperability",
+    "scope": ["dev"],
+    "profile": "full-feature",
+    "lead": "team-lead",
+    "roster": ["developer", "plugin-developer", "qa", "security-tester", "code-reviewer"]
+  },
+  {
+    "id": "sdd-evolution",
+    "name": "Specification Evolution",
+    "scope": ["dev"],
+    "profile": "full-feature",
+    "lead": "team-lead",
+    "roster": ["developer", "qa", "code-reviewer"]
+  },
+  {
+    "id": "sdd-cto-integration",
+    "name": "CTO Specification Integration",
+    "scope": ["dev"],
+    "profile": "full-feature",
+    "lead": "team-lead",
+    "roster": ["developer", "qa", "manual-qa", "code-reviewer"]
+  },
+  {
+    "id": "sdd-validation-release",
+    "name": "SDD Validation and Release",
+    "scope": ["dev"],
     "profile": "feature-regression",
     "lead": "team-lead",
-    "roster": [
-      "diagnostics",
-      "developer",
-      "plugin-developer",
-      "qa",
-      "code-reviewer"
-    ]
+    "roster": ["qa", "manual-qa", "developer", "code-reviewer"]
   }
 ]

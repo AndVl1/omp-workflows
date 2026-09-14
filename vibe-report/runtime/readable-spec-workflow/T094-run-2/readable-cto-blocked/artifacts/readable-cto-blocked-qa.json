@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "artifact_id": "readable-cto-blocked-qa",
+  "entries": [
+    {
+      "evidence_id": "readable-cto-blocked-qa-fr-1-review",
+      "kind": "review",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-aa8b086101bbe9ed628795ff7319d1bb",
+      "review_verdict": "fail",
+      "recorded_at": "2026-09-04T23:55:41.257483000Z"
+    },
+    {
+      "evidence_id": "readable-cto-blocked-qa-fr-1-executed-test",
+      "kind": "executed_test",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-aa8b086101bbe9ed628795ff7319d1bb",
+      "test": {
+        "evidence_ref": {
+          "artifact_id": "readable-cto-blocked-runtime-record",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-runtime-record.json",
+          "sha256": "449719669c9044f1c330b66e008e35d222289c9b2a68e19cda6ed83fe1c15233",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        },
+        "test_kind": "runtime",
+        "status": "fail",
+        "executed_at": "2026-09-04T23:55:41.257483000Z"
+      },
+      "recorded_at": "2026-09-04T23:55:41.257483000Z"
+    },
+    {
+      "evidence_id": "readable-cto-blocked-qa-fr-1-intent-conflict",
+      "kind": "intent_conflict",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-aa8b086101bbe9ed628795ff7319d1bb",
+      "intent_message": "The approved handoff lacks a deterministic observable oracle for FR-1: it defines no concrete runtime command, input, output, exit status, or success condition. No focused runtime command was executable honestly; the result is blocked rather than fabricated as passing.",
+      "recorded_at": "2026-09-04T23:55:41.257483000Z"
+    },
+    {
+      "evidence_id": "readable-cto-blocked-qa-ac-1-review",
+      "kind": "review",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-aa8b086101bbe9ed628795ff7319d1bb",
+      "review_verdict": "fail",
+      "recorded_at": "2026-09-04T23:55:41.257483000Z"
+    },
+    {
+      "evidence_id": "readable-cto-blocked-qa-ac-1-executed-test",
+      "kind": "executed_test",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-aa8b086101bbe9ed628795ff7319d1bb",
+      "test": {
+        "evidence_ref": {
+          "artifact_id": "readable-cto-blocked-runtime-record",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/readable-cto-blocked-runtime-record.json",
+          "sha256": "449719669c9044f1c330b66e008e35d222289c9b2a68e19cda6ed83fe1c15233",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        },
+        "test_kind": "runtime",
+        "status": "fail",
+        "executed_at": "2026-09-04T23:55:41.257483000Z"
+      },
+      "recorded_at": "2026-09-04T23:55:41.257483000Z"
+    },
+    {
+      "evidence_id": "readable-cto-blocked-qa-ac-1-intent-conflict",
+      "kind": "intent_conflict",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-aa8b086101bbe9ed628795ff7319d1bb",
+      "intent_message": "The approved handoff lacks a deterministic observable oracle for AC-1: it specifies no concrete input, output, exit status, runtime command, or acceptance behavior, and src/blocked/** is absent. No focused runtime command was executable honestly; the result is blocked rather than fabricated as passing.",
+      "recorded_at": "2026-09-04T23:55:41.257483000Z"
+    }
+  ]
+}

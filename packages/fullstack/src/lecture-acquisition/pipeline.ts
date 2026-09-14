@@ -91,9 +91,19 @@ export class TranscribeAnalyzeEvidenceProvider implements LectureEvidenceProvide
       try {
         prepared = await this.options.preprocess.prepare(media, limits, signal);
         const transcriptResult = await this.options.asr.transcribe(prepared, source, request, signal);
+        const maxTranscriptSegments = limits.maxTranscriptSegments;
+        if (!Array.isArray(transcriptResult.segments) || !Number.isSafeInteger(maxTranscriptSegments) || maxTranscriptSegments < 1) {
+          throw new AcquisitionProviderError("LIMIT_EXCEEDED", "ASR transcript segment bound is invalid", { provider: this.id, retryable: false });
+        }
+        if (transcriptResult.segments.length > maxTranscriptSegments) {
+          throw new AcquisitionProviderError("LIMIT_EXCEEDED", "ASR transcript exceeds the configured segment limit", { provider: this.id, retryable: false });
+        }
         const transcript = normalizeTimestampedTranscriptSegments(transcriptResult.segments, limits.maxTranscriptCharacters).map((segment) =>
           transcriptResult.timestampMode ? { ...segment, timestampSource: transcriptResult.timestampMode } : segment,
         );
+        if (transcript.length > maxTranscriptSegments) {
+          throw new AcquisitionProviderError("LIMIT_EXCEEDED", "ASR transcript exceeds the configured segment limit", { provider: this.id, retryable: false });
+        }
         const estimatedTimestamps = transcriptResult.timestampMode === "estimated";
         const chunks = chunkTimestampedTranscript(source.sourceId, transcript, limits);
         const evidence: EvidenceSegment[] = [];

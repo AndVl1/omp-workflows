@@ -1,0 +1,24 @@
+id: 2026-08-31T18-00-00-developer
+parent: null
+agent: developer
+timestamp: "2026-08-31T18:00:00Z"
+status: completed
+
+context:
+  task: "Fix constitution profile typed-control-plane error from artifact 226."
+  phase: "native-workflow"
+
+output:
+  modified:
+    - packages/core/workflows/constitution.json
+  change: "Added the required roster_policy.triggers object to constitution_draft, with empty complexity, confidence, scope_flags, and evidence arrays."
+  structural_review: "constitution_revise roster policy matches the same schema; constitution_validate is an orchestrator and correctly has no roster policy; template unchanged."
+  validation: "Skipped per assignment; parent/CTO reruns project validation."
+
+next:
+  agent: null
+  task: ""
+  priority: low
+  acceptance_criteria:
+    - "loadProfile('constitution') can load with typed roster policy validation."
+    - "Zero-dependency two-decision bootstrap semantics remain unchanged."

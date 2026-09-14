@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import modelRolesFactory, {
 	BUILTIN_ROLES,
 	MAX_RESEARCH_PROMPT_BYTES,
-} from "../commands/omp-model-roles/index.js";
+} from "../src/model-roles.js";
 import { fullstackPreset } from "../src/index.js";
 import {
 	type InventoryModel,
@@ -384,7 +384,7 @@ test("execute remains exit-safe when UI notify throws", async () => {
 });
 
 test("command source contains no mutation APIs", () => {
-	const source = readFileSync(join(packageRoot, "commands", "omp-model-roles", "index.ts"), "utf8");
+	const source = readFileSync(join(packageRoot, "src", "model-roles.ts"), "utf8");
 	assert.doesNotMatch(source, /setModelRole|setProjectModelRole|writeFile|appendFile|mkdir|rmSync|api\.exec/);
 });
 

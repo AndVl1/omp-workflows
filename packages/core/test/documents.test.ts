@@ -14,7 +14,7 @@
  *     Throws (fail closed) when one of the five sources is missing. The
  *     markdown never embeds a timestamp.
  *
- *   writeProductPrdDocument({ stateDir, artifactsDir, path?, sourceArtifacts })
+ *   writeProductPrdDocument({ projectRoot, stateDirRelative, artifactsDirRelative, path?, sourceArtifacts })
  *     -> { ok: true; documentPath: string; artifactPath: string;
  *          source_hash: string; content_hash: string }
  *      | { ok: false; error: string }
@@ -62,15 +62,18 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { loadAllProfiles } from "../src/engine/profile.js";
 import { artifactSchemaFor, requiredFieldsOf, validateProducedArtifact } from "../src/engine/artifact-contract.js";
 import {
+  MAX_PRD_VALIDATION_FILE_BYTES,
   PRODUCT_PRD_RENDERER,
   renderProductPrdDocument,
   validateProductPrdDocument,
   writeProductPrdDocument,
+  writeProductPrdDocumentPinned,
 } from "../src/engine/product-prd.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { renderMarkdownDocumentHtml } from "../src/report/markdown.js";
 import { runStage, type StageContext } from "../src/engine/stage.js";
 import type { StageDef } from "../src/engine/types.js";
@@ -154,7 +157,7 @@ function seededRun(): { stateDir: string; artifactsDir: string } {
 function writePrd(stateDir: string, artifactsDir: string, path?: string) {
   const sources: Record<string, unknown> = {};
   for (const id of SOURCE_ARTIFACT_IDS) sources[id] = JSON.parse(readFileSync(join(artifactsDir, `${id}.json`), "utf8"));
-  return writeProductPrdDocument({ stateDir, artifactsDir, path, sourceArtifacts: sources });
+  return writeProductPrdDocument({ projectRoot: stateDir, stateDirRelative: "", artifactsDirRelative: relative(stateDir, artifactsDir).split(sep).join("/"), path, sourceArtifacts: sources });
 }
 
 /** First Markdown heading matching `include` (and not any `exclude`). */
@@ -448,6 +451,80 @@ test("product-prd: writeProductPrdDocument persists document + typed artifact wi
   }
 });
 
+test("product-prd: multibyte output near the pinned artifact string bound remains readable", () => {
+  const run = seededRun();
+  try {
+    const sources = validSources();
+    const spec = sources.product_spec as Record<string, unknown>;
+    spec.value_proposition = "🙂".repeat(125_000);
+    writeFileSync(join(run.artifactsDir, "product_spec.json"), JSON.stringify(spec, null, 2));
+
+    const written = writePrd(run.stateDir, run.artifactsDir, "docs/product-prd.md");
+    assert.ok(written.ok, written.ok ? "" : written.error);
+    if (!written.ok) return;
+
+    const markdownBytes = readFileSync(written.documentPath).byteLength;
+    assert.ok(markdownBytes > 900 * 1024, `Markdown should be near the 1 MiB manifest-string bound, got ${markdownBytes}`);
+    assert.ok(markdownBytes < 1 * 1024 * 1024, `Markdown must stay readable by the artifact schema, got ${markdownBytes}`);
+
+    const pinned = PinnedProjectRoot.open(run.stateDir);
+    assert.ok(pinned, "the near-bound fixture root must be pinnable");
+    if (!pinned) return;
+    try {
+      const validation = validateProductPrdDocument({
+        stateDir: run.stateDir,
+        artifactsDir: run.artifactsDir,
+        pinnedRoot: pinned,
+        stateDirRelative: "",
+        artifactsDirRelative: "artifacts",
+      });
+      assert.deepEqual(validation, { ok: true, issues: [] }, "the pinned reader must accept the near-bound UTF-8 outputs");
+    } finally {
+      pinned.close();
+    }
+  } finally {
+    rmSync(run.stateDir, { recursive: true, force: true });
+  }
+});
+
+test("product-prd: multibyte Markdown cap+1 rejects before output mutation or overwrite", () => {
+  const run = seededRun();
+  try {
+    const baseline = writePrd(run.stateDir, run.artifactsDir, "docs/product-prd.md");
+    assert.ok(baseline.ok, baseline.ok ? "" : baseline.error);
+    if (!baseline.ok) return;
+    const targets = [baseline.documentPath, baseline.htmlDocumentPath, baseline.artifactPath];
+    const beforeBytes = targets.map((path) => readFileSync(path));
+    const beforeStateEntries = readdirSync(run.stateDir).sort();
+    const beforeArtifactEntries = readdirSync(run.artifactsDir).sort();
+
+    const oversizedSources = validSources();
+    (oversizedSources.product_spec as Record<string, unknown>).target_users = Array.from(
+      { length: 16_384 },
+      () => "🙂".repeat(32),
+    );
+    const renderedBytes = Buffer.byteLength(renderProductPrdDocument(oversizedSources), "utf8");
+    assert.ok(renderedBytes > MAX_PRD_VALIDATION_FILE_BYTES, `fixture must exceed the ${MAX_PRD_VALIDATION_FILE_BYTES}-byte Markdown cap, got ${renderedBytes}`);
+
+    const result = writeProductPrdDocument({
+      projectRoot: run.stateDir,
+      stateDirRelative: "",
+      artifactsDirRelative: "artifacts",
+      path: "docs/product-prd.md",
+      sourceArtifacts: oversizedSources,
+    });
+    assert.equal(result.ok, false, "an over-cap Markdown render must be rejected");
+    if (!result.ok) assert.match(result.error, /Markdown output.*UTF-8 bytes.*readable limit/i);
+    assert.deepEqual(readdirSync(run.stateDir).sort(), beforeStateEntries, "the rejected render must not create output directories or temp files");
+    assert.deepEqual(readdirSync(run.artifactsDir).sort(), beforeArtifactEntries, "the rejected render must not mutate the artifact directory");
+    for (const [index, path] of targets.entries()) {
+      assert.deepEqual(readFileSync(path), beforeBytes[index], `${path} must remain byte-identical after rejection`);
+    }
+  } finally {
+    rmSync(run.stateDir, { recursive: true, force: true });
+  }
+});
+
 test("product-prd: a default document path is used when none is given and stays inside the state dir", () => {
   const run = seededRun();
   try {
@@ -482,6 +559,56 @@ test("product-prd: writeProductPrdDocument rejects traversal and absolute paths 
   } finally {
     rmSync(run.stateDir, { recursive: true, force: true });
     rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("product-prd: rejects output destinations that collide by exact, case, Unicode, or ancestor aliases before mutation", () => {
+  const cases = [
+    { path: "artifacts/product_prd.json", artifactsDirRelative: "artifacts", label: "exact artifact target" },
+    { path: "ARTIFACTS/PRODUCT_PRD.JSON", artifactsDirRelative: "artifacts", label: "case-folded artifact target" },
+    { path: "artifacts", artifactsDirRelative: "artifacts", label: "document ancestor of artifact target" },
+  ] as const;
+  for (const candidate of cases) {
+    const run = seededRun();
+    try {
+      const beforeState = readdirSync(run.stateDir).sort();
+      const beforeArtifacts = readdirSync(run.artifactsDir).sort();
+      const result = writeProductPrdDocument({
+        projectRoot: run.stateDir,
+        stateDirRelative: "",
+        artifactsDirRelative: candidate.artifactsDirRelative,
+        path: candidate.path,
+        sourceArtifacts: validSources(),
+      });
+      assert.equal(result.ok, false, candidate.label);
+      if (!result.ok) assert.match(result.error, /unsafe|conflict|collid/i);
+      assert.deepEqual(readdirSync(run.stateDir).sort(), beforeState, `${candidate.label} must create no state entries`);
+      assert.deepEqual(readdirSync(run.artifactsDir).sort(), beforeArtifacts, `${candidate.label} must create no artifact entries`);
+    } finally {
+      rmSync(run.stateDir, { recursive: true, force: true });
+    }
+  }
+
+  const stateDir = mkdtempSync(join(tmpdir(), "omp-prd-unicode-"));
+  const decomposedArtifacts = join(stateDir, "e\u0301");
+  mkdirSync(decomposedArtifacts);
+  for (const [id, value] of Object.entries(validSources())) {
+    writeFileSync(join(decomposedArtifacts, `${id}.json`), JSON.stringify(value, null, 2));
+  }
+  try {
+    const beforeState = readdirSync(stateDir).sort();
+    const result = writeProductPrdDocument({
+      projectRoot: stateDir,
+      stateDirRelative: "",
+      artifactsDirRelative: "e\u0301",
+      path: "\u00e9/product_prd.json",
+      sourceArtifacts: validSources(),
+    });
+    assert.equal(result.ok, false, "NFC-equivalent Unicode artifact target must be rejected");
+    if (!result.ok) assert.match(result.error, /unsafe|conflict|collid/i);
+    assert.deepEqual(readdirSync(stateDir).sort(), beforeState, "Unicode alias rejection must create no entries");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
   }
 });
 
@@ -727,7 +854,7 @@ const PRD_DOCUMENT_STAGE: StageDef = {
 function stageContext(artifactsDir: string): { ctx: StageContext; taskCalls: () => number } {
   let calls = 0;
   const ctx: StageContext = {
-    cwd: artifactsDir,
+    cwd: dirname(artifactsDir),
     state: {
       schema: 1,
       branch: "feat/product-discovery-workflow",
@@ -805,6 +932,24 @@ test("product-prd: runStage fails closed when a source artifact is missing", asy
   }
 });
 
+test("product-prd: legacy runStage rejects a malformed-present source before writing outputs", async () => {
+  const { root, artifactsDir } = seededArtifactsRun();
+  try {
+    // The file is present and valid JSON, but it violates the strict
+    // product_evidence artifact contract. Legacy walkProfile must reject it
+    // before the renderer's transactional commit.
+    writeFileSync(join(artifactsDir, "product_evidence.json"), JSON.stringify({}));
+    const { ctx } = stageContext(artifactsDir);
+    const outcome = await runStage(PRD_DOCUMENT_STAGE, ctx);
+    assert.equal(outcome.status, "failed");
+    assert.match(outcome.note ?? "", /product_evidence|source validation|contract violation/);
+    assert.equal(existsSync(join(artifactsDir, "product_prd.json")), false, "invalid source must not create the typed output");
+    assert.equal(existsSync(join(root, "documents")), false, "invalid source must not create the document directory");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("product-prd: tampering with the rendered document breaks validation", async () => {
   const { root, artifactsDir } = seededArtifactsRun();
   try {
@@ -831,8 +976,9 @@ test("product-prd: writeProductPrdDocument rejects an artifacts dir symlinked ou
     mkdirSync(join(outside, "artifacts"));
     symlinkSync(join(outside, "artifacts"), join(stateRoot, "artifacts"));
     const written = writeProductPrdDocument({
-      stateDir: stateRoot,
-      artifactsDir: join(stateRoot, "artifacts"),
+      projectRoot: stateRoot,
+      stateDirRelative: "",
+      artifactsDirRelative: "artifacts",
       path: "documents/product-prd.md",
       sourceArtifacts: validSources(),
     });
@@ -892,7 +1038,7 @@ test("product-prd: a failed manifest persistence leaves the previous document+ma
     sources[id] = JSON.parse(readFileSync(join(run.artifactsDir, `${id}.json`), "utf8"));
   }
   const write = () =>
-    writeProductPrdDocument({ stateDir: run.stateDir, artifactsDir: run.artifactsDir, path: "documents/product-prd.md", sourceArtifacts: sources });
+    writeProductPrdDocument({ projectRoot: run.stateDir, stateDirRelative: "", artifactsDirRelative: "artifacts", path: "documents/product-prd.md", sourceArtifacts: sources });
   try {
     assert.ok(write().ok);
     assert.deepEqual(validateProductPrdDocument(run), { ok: true, issues: [] });
@@ -918,14 +1064,14 @@ test("product-prd: a failed manifest persistence leaves the previous document+ma
 });
 
 
-test("product-prd: a mid-commit manifest rename failure rolls the document back and cleans temps", () => {
+test("product-prd: a non-file manifest target is rejected without mutating the prior pair", () => {
   const run = seededRun();
   const write = () => {
     const sources: Record<string, unknown> = {};
     for (const id of SOURCE_ARTIFACT_IDS) {
       sources[id] = JSON.parse(readFileSync(join(run.artifactsDir, `${id}.json`), "utf8"));
     }
-    return writeProductPrdDocument({ stateDir: run.stateDir, artifactsDir: run.artifactsDir, path: "documents/product-prd.md", sourceArtifacts: sources });
+    return writeProductPrdDocument({ projectRoot: run.stateDir, stateDirRelative: "", artifactsDirRelative: "artifacts", path: "documents/product-prd.md", sourceArtifacts: sources });
   };
   try {
     const first = write();
@@ -933,12 +1079,9 @@ test("product-prd: a mid-commit manifest rename failure rolls the document back 
     const documentPath = join(run.stateDir, "documents", "product-prd.md");
     const firstDocument = readFileSync(documentPath, "utf8");
 
-    // Change a source so the second render diverges, then break the manifest
-    // commit: a directory at the manifest target makes the rename fail AFTER
-    // the document rename already committed (the injection itself removes
-    // the old artifact file, so pair-validity here is the document rollback
-    // plus no-new-manifest; clean preflight failures keep the whole pair,
-    // covered by the artifactsDir-as-file test above).
+    // Change a source so the second render diverges, then make the manifest
+    // target a directory. The pinned writer rejects the non-file target
+    // before any document or artifact bytes are changed.
     const specPath = join(run.artifactsDir, "product_spec.json");
     const spec = JSON.parse(readFileSync(specPath, "utf8")) as Record<string, unknown>;
     spec.open_decisions = ["changed for the second render"];
@@ -949,8 +1092,8 @@ test("product-prd: a mid-commit manifest rename failure rolls the document back 
 
     const second = write();
     assert.equal(second.ok, false, "the mid-commit write must fail");
-    if (!second.ok) assert.match(second.error, /persistence failed|rollback/i);
-    assert.equal(readFileSync(documentPath, "utf8"), firstDocument, "the previous document content is restored byte-for-byte");
+    if (!second.ok) assert.match(second.error, /regular file|directory|unsafe/i);
+    assert.equal(readFileSync(documentPath, "utf8"), firstDocument, "the previous document content remains byte-for-byte unchanged");
     assert.ok(existsSync(manifestPath), "no new manifest was committed over the broken target");
     assert.equal(
       readdirSync(join(run.stateDir, "documents")).filter((name) => name.includes(".tmp-")).length,
@@ -967,6 +1110,135 @@ test("product-prd: a mid-commit manifest rename failure rolls the document back 
   }
 });
 
+test("product-prd: every multi-target commit failure restores the exact document, HTML and manifest set", () => {
+  for (const failureIndex of [0, 1, 2]) {
+    const root = mkdtempSync(join(tmpdir(), `omp-prd-batch-rollback-${failureIndex}-`));
+    const documentPath = join(root, "documents", "product-prd.md");
+    const htmlPath = join(root, "documents", "product-prd.html");
+    const manifestPath = join(root, "artifacts", "product_prd.json");
+    try {
+      mkdirSync(dirname(documentPath), { recursive: true });
+      mkdirSync(dirname(manifestPath), { recursive: true });
+      writeFileSync(documentPath, `old markdown ${failureIndex}\n`, "utf8");
+      writeFileSync(htmlPath, `old html ${failureIndex}\n`, "utf8");
+      writeFileSync(manifestPath, `old manifest ${failureIndex}\n`, "utf8");
+
+      const pinnedRoot = PinnedProjectRoot.open(root, { batchFailureIndex: failureIndex });
+      assert.ok(pinnedRoot);
+      try {
+        const result = writeProductPrdDocumentPinned({
+          pinnedRoot,
+          stateDirRelative: "",
+          artifactsDirRelative: "artifacts",
+          path: "documents/product-prd.md",
+          sourceArtifacts: validSources(),
+        });
+        assert.equal(result.ok, false, `failure ${failureIndex} must reject the product PRD transaction`);
+      } finally {
+        pinnedRoot.close();
+      }
+
+      assert.equal(readFileSync(documentPath, "utf8"), `old markdown ${failureIndex}\n`);
+      assert.equal(readFileSync(htmlPath, "utf8"), `old html ${failureIndex}\n`);
+      assert.equal(readFileSync(manifestPath, "utf8"), `old manifest ${failureIndex}\n`);
+      assert.deepEqual(
+        readdirSync(join(root, "documents")).filter((name) => name.includes(".tmp-")),
+        [],
+        `failure ${failureIndex} must clean document temporaries`,
+      );
+      assert.deepEqual(
+        readdirSync(join(root, "artifacts")).filter((name) => name.includes(".tmp-")),
+        [],
+        `failure ${failureIndex} must clean manifest temporaries`,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("product-prd: rollback registrar failure restores every published output", () => {
+  const run = seededRun();
+  const pinnedRoot = PinnedProjectRoot.open(run.stateDir);
+  assert.ok(pinnedRoot, "product rollback fixture root must be pinnable");
+  if (!pinnedRoot) return;
+  const documentPath = join(run.stateDir, "documents", "product-prd.md");
+  const htmlPath = join(run.stateDir, "documents", "product-prd.html");
+  const manifestPath = join(run.artifactsDir, "product_prd.json");
+  try {
+    mkdirSync(dirname(documentPath), { recursive: true });
+    const oldDocument = "old markdown\n";
+    const oldHtml = "old html\n";
+    const oldManifest = "old manifest\n";
+    writeFileSync(documentPath, oldDocument, "utf8");
+    writeFileSync(htmlPath, oldHtml, "utf8");
+    writeFileSync(manifestPath, oldManifest, "utf8");
+    let registrations = 0;
+    const result = writeProductPrdDocumentPinned({
+      pinnedRoot,
+      stateDirRelative: "",
+      artifactsDirRelative: "artifacts",
+      path: "documents/product-prd.md",
+      sourceArtifacts: validSources(),
+      registerRollback: () => {
+        registrations += 1;
+        if (registrations === 2) throw new Error("rollback registrar failure");
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(registrations, 2, "the registrar must fail on the second published descriptor");
+    assert.equal(readFileSync(documentPath, "utf8"), oldDocument);
+    assert.equal(readFileSync(htmlPath, "utf8"), oldHtml);
+    assert.equal(readFileSync(manifestPath, "utf8"), oldManifest);
+  } finally {
+    pinnedRoot.close();
+    rmSync(run.stateDir, { recursive: true, force: true });
+  }
+});
+
+test("product-prd: batch rollback preserves a same-content replacement between write and capture", () => {
+  const run = seededRun();
+  const pinnedRoot = PinnedProjectRoot.open(run.stateDir);
+  assert.ok(pinnedRoot, "product descriptor race fixture root must be pinnable");
+  if (!pinnedRoot) return;
+  const originalBatch = PinnedProjectRoot.prototype.writeAtomicFilesWithReceipts;
+  let replaced = false;
+  const cleanups: Array<() => void> = [];
+  try {
+    PinnedProjectRoot.prototype.writeAtomicFilesWithReceipts = function (entries, options) {
+      const receipts = originalBatch.call(this, entries, options);
+      if (!replaced) {
+        replaced = true;
+        const first = entries[0]!;
+        const replacement = join(run.stateDir, "documents", "replacement.tmp");
+        mkdirSync(dirname(replacement), { recursive: true });
+        writeFileSync(replacement, first.content);
+        renameSync(replacement, join(run.stateDir, first.path));
+      }
+      return receipts;
+    };
+    const result = writeProductPrdDocumentPinned({
+      pinnedRoot,
+      stateDirRelative: "",
+      artifactsDirRelative: "artifacts",
+      path: "documents/product-prd.md",
+      sourceArtifacts: validSources(),
+      registerRollback: (cleanup) => cleanups.push(cleanup),
+    });
+    assert.equal(result.ok, true, result.ok ? "" : result.error);
+    assert.equal(replaced, true, "the replacement seam must execute after the descriptor-producing batch");
+    assert.equal(cleanups.length, 3, "each published output must register its own rollback");
+    for (const cleanup of cleanups) cleanup();
+    assert.equal(existsSync(join(run.stateDir, "documents", "product-prd.md")), true, "rollback must preserve the concurrent replacement");
+    assert.equal(existsSync(join(run.stateDir, "documents", "product-prd.html")), false, "rollback removes the owned HTML output");
+    assert.equal(existsSync(join(run.artifactsDir, "product_prd.json")), false, "rollback removes the owned manifest output");
+  } finally {
+    PinnedProjectRoot.prototype.writeAtomicFilesWithReceipts = originalBatch;
+    pinnedRoot.close();
+    rmSync(run.stateDir, { recursive: true, force: true });
+  }
+});
+
 test("product-prd: an absent artifacts dir behind a symlinked ancestor is rejected without outside writes", () => {
   const stateRoot = mkdtempSync(join(tmpdir(), "omp-prd-state-"));
   const outside = mkdtempSync(join(tmpdir(), "omp-prd-outside-"));
@@ -974,8 +1246,9 @@ test("product-prd: an absent artifacts dir behind a symlinked ancestor is reject
     mkdirSync(join(outside, "target"));
     symlinkSync(join(outside, "target"), join(stateRoot, "link"));
     const written = writeProductPrdDocument({
-      stateDir: stateRoot,
-      artifactsDir: join(stateRoot, "link", "artifacts"),
+      projectRoot: stateRoot,
+      stateDirRelative: "",
+      artifactsDirRelative: "link/artifacts",
       path: "documents/product-prd.md",
       sourceArtifacts: validSources(),
     });

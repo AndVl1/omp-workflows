@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "gate_id": "constitution-gate-8cb7f6fb",
+  "project_root": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-preparation-e2e-1nK8rV/omp-spec-e2e-cto-preparation",
+  "feature_id": "prep-atlas",
+  "origin": {
+    "origin_kind": "cto_preparation",
+    "origin_run_key": "01a08c8c-212b-72f4-9c84-81ec6ac90e19",
+    "origin_stage": "cto"
+  },
+  "gate": {
+    "gate_id": "constitution-gate-8cb7f6fb",
+    "origin_kind": "cto_preparation",
+    "origin_run_key": "01a08c8c-212b-72f4-9c84-81ec6ac90e19",
+    "origin_stage": "cto",
+    "status": "usable",
+    "usability_result": "usable",
+    "provider": {
+      "provider_id": "native",
+      "source": "native_default",
+      "path": "CONSTITUTION.md",
+      "template_ref": "workflows/templates/specification/constitution.md",
+      "template_hash": "11a1521cab73dec50b27e0716c85aed369290106282b3ba25c0309289a849425",
+      "selection_hash": "9a0734e1e8d2feb496c83af4526a00e62e1a6e09eeae67b1e36e41e0d471b428",
+      "selected_at": "2026-09-10T18:20:06.045Z"
+    },
+    "constitution_workflow_ref": null,
+    "checkpoint_ref": null,
+    "binding": {
+      "provider_id": "native",
+      "path": "CONSTITUTION.md",
+      "version": "0.0.0",
+      "content_sha256": "f8ca5b08c245c0fba6ad20eebbd88cb1df860296b509f999cd50ebb69c88e6ee",
+      "semantic_hash": "9298efe0721c9d752f7af97b211120bcf82a96c29e292d9fab8a22dd72d69e8e",
+      "validation_ref": "constitution.validation.f8ca5b08c245c0fba6ad20eebbd88cb1df860296b509f999cd50ebb69c88e6ee",
+      "bound_at": "2026-09-10T18:20:56.190Z"
+    },
+    "resume_marker": "constitution-gate-8cb7f6fb.resume.v1"
+  },
+  "drafts": [
+    {
+      "version": 1,
+      "document": "# Project Constitution\n\n## 1. Correctness and Explicit Contracts\nAll specifications and implementation handoffs must define observable behavior, inputs, outputs, failure modes, and invariants. Rationale: explicit contracts prevent ambiguity and make verification repeatable.\n\n## 2. Maintainable Simplicity\nPrefer the smallest coherent design that follows existing project conventions; avoid duplicate abstractions, speculative extensibility, and compatibility shims without a stated requirement. Rationale: simple, conventional systems remain understandable and safe to change.\n\n## 3. Evidence-Based Quality\nEvery material behavior change must have proportionate verification evidence, with tests reserved for durable contracts and realistic regressions. Rationale: executable evidence catches defects while keeping the test suite purposeful.\n\n## 4. Security and Data Integrity\nSpecifications must identify trust boundaries, sensitive data, authorization requirements, transactional invariants, and safe failure behavior wherever applicable. Rationale: security and integrity must be designed in rather than recovered after implementation.\n\n## 5. Clean Ownership and Traceability\nEach feature, facet, artifact, checkpoint, and handoff must have one explicit owner and durable provenance; shared facets remain within one feature workspace. Rationale: unambiguous ownership prevents divergent state and preserves an auditable decision trail.\n\n## 6. Human Authorization at Declared Gates\nRequired checkpoints may advance only from a trusted typed user decision; workflow classification, autonomy hints, artifacts, or inferred intent never substitute for approval. Rationale: explicit authorization preserves user control over consequential transitions.\n\n## 7. Preparation and Execution Separation\nSpecification preparation ends with approved implementation-ready handoffs and must not dispatch implementation work unless a separate execution request is made. Rationale: separating design approval from execution prevents accidental scope escalation.",
+      "document_sha256": "f8ca5b08c245c0fba6ad20eebbd88cb1df860296b509f999cd50ebb69c88e6ee",
+      "validation_ref": "constitution.validation.f8ca5b08c245c0fba6ad20eebbd88cb1df860296b509f999cd50ebb69c88e6ee",
+      "presented_at": "2026-09-10T18:20:19.770Z"
+    }
+  ],
+  "decisions": [
+    {
+      "checkpoint_id": "constitution-gate-8cb7f6fb.checkpoint.v1",
+      "decision": "approve_continue",
+      "feedback": null,
+      "authorization": "human",
+      "actor_provenance": {
+        "kind": "user",
+        "ref": "terminal:constitution_checkpoint_ask_selected:constitution-answer-4bce9e62-4b31-4c2b-9331-26027b0f6857",
+        "proof": {
+          "answer_id": "constitution-answer-4bce9e62-4b31-4c2b-9331-26027b0f6857",
+          "nonce": "6b12ee8a-0da8-460f-bd3c-5f9f6ad68444",
+          "channel": "terminal",
+          "reference": "terminal:constitution_checkpoint_ask_selected:constitution-answer-4bce9e62-4b31-4c2b-9331-26027b0f6857",
+          "binding": "b905df7ec49c80e35b2617a64b3949c28eb5fce6c17c6487941a0ef4bac8c846"
+        }
+      },
+      "at": "2026-09-10T18:20:56.190Z"
+    }
+  ],
+  "last_decision": {
+    "checkpoint_id": "constitution-gate-8cb7f6fb.checkpoint.v1",
+    "decision": "approve_continue",
+    "feedback": null
+  },
+  "last_feedback": null,
+  "resume": {
+    "origin_kind": "cto_preparation",
+    "origin_run_key": "01a08c8c-212b-72f4-9c84-81ec6ac90e19",
+    "resume_target": "specify"
+  },
+  "resume_marker_consumed": true,
+  "trusted_answers": [
+    {
+      "answer_id": "constitution-answer-4bce9e62-4b31-4c2b-9331-26027b0f6857",
+      "nonce": "6b12ee8a-0da8-460f-bd3c-5f9f6ad68444",
+      "channel": "terminal",
+      "reference": "terminal:constitution_checkpoint_ask_selected:constitution-answer-4bce9e62-4b31-4c2b-9331-26027b0f6857",
+      "run_id": "01a08c8c-212b-72f4-9c84-81ec6ac90e19",
+      "stage_id": "cto",
+      "checkpoint_id": "constitution-gate-8cb7f6fb.checkpoint.v1",
+      "work_identity_hash": "7b7c3aae52f3c513a593961c45c1a8bd8edc3d11f3292367098480217c1aafec",
+      "capability_id": "constitution:constitution-gate-8cb7f6fb",
+      "capability_epoch": "draft:1",
+      "policy_hash": "ff6baa7adfb49dad975e03dc38f02a56ab14708d901bfe60d94751e0e71daf14",
+      "feature_id": "prep-atlas",
+      "subject_binding": "f8ca5b08c245c0fba6ad20eebbd88cb1df860296b509f999cd50ebb69c88e6ee",
+      "subject_revision": 1,
+      "decision": "approve_continue",
+      "binding": "b905df7ec49c80e35b2617a64b3949c28eb5fce6c17c6487941a0ef4bac8c846",
+      "issued_at": "2026-09-10T18:20:47.502Z",
+      "gate_id": "constitution-gate-8cb7f6fb",
+      "draft_sha256": "f8ca5b08c245c0fba6ad20eebbd88cb1df860296b509f999cd50ebb69c88e6ee",
+      "consumed_at": "2026-09-10T18:20:56.118Z"
+    }
+  ]
+}

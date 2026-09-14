@@ -1,35 +1,61 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readdirSync, renameSync, symlinkSync, unlinkSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PinnedProjectRoot } from "@andvl1/omp-workflows-core";
+import { newCtoState, writeCtoState, type CtoState } from "../../core/src/cto/state.js";
+import { openFullstackRuntimeTest, type FullstackRuntimeTestFixture } from "./runtime-access-fixture.js";
 import {
-  classifyIncoming,
+  classifyIncoming as classifyIncomingRaw,
   buildStatusReply,
-  findCompletedSummary,
+  findCompletedSummary as findCompletedSummaryRaw,
   sendTelegramText,
-  writeTaskDrop,
+  writeTaskDrop as writeTaskDropRaw,
+  writeAnswerMarker as writeAnswerMarkerRaw,
+  BridgeRetryableError,
 } from "../src/telegram-bridge.js";
+import { inboxMessageFileName } from "../src/adapters/registry.js";
+
+const runtimeFixtures = new Map<string, FullstackRuntimeTestFixture>();
+function runtimeFor(root: string) {
+  const existing = runtimeFixtures.get(root);
+  if (existing) return existing.access;
+  const fixture = openFullstackRuntimeTest(root, "telegram-bridge-test");
+  runtimeFixtures.set(root, fixture);
+  return fixture.access;
+}
+test.afterEach(() => {
+  for (const fixture of runtimeFixtures.values()) fixture.close();
+  runtimeFixtures.clear();
+});
+
+function classifyIncoming(...args: Parameters<typeof classifyIncomingRaw>): ReturnType<typeof classifyIncomingRaw> {
+  const [cwd, message, suppliedPin] = args;
+  return classifyIncomingRaw(cwd, message, suppliedPin, runtimeFor(cwd));
+}
+function findCompletedSummary(...args: Parameters<typeof findCompletedSummaryRaw>): ReturnType<typeof findCompletedSummaryRaw> {
+  const [cwd, suppliedPin] = args;
+  return findCompletedSummaryRaw(cwd, suppliedPin, runtimeFor(cwd));
+}
+function writeTaskDrop(...args: Parameters<typeof writeTaskDropRaw>): ReturnType<typeof writeTaskDropRaw> {
+  const [cwd, message, runId, suppliedPin] = args;
+  return writeTaskDropRaw(cwd, message, runId, suppliedPin, runtimeFor(cwd));
+}
+function writeAnswerMarker(...args: Parameters<typeof writeAnswerMarkerRaw>): ReturnType<typeof writeAnswerMarkerRaw> {
+  const [cwd, answer, suppliedPin] = args;
+  return writeAnswerMarkerRaw(cwd, answer, suppliedPin, runtimeFor(cwd));
+}
 
 function activeRun(root: string): void {
-  const runDir = join(root, ".work-state", "cto", "run-one");
-  mkdirSync(runDir, { recursive: true });
-  const now = new Date().toISOString();
-  writeFileSync(
-    join(runDir, "state.json"),
-    JSON.stringify({
-      schema: 1,
-      id: "run-one",
-      task: "Active task",
-      branch: "main",
-      autonomous: true,
-      plan: { id: "run-one", task: "Active task", teams: [], created_at: now },
-      teams: [],
-      integration: { status: "pending" },
-      pause: { kind: "none", reason: "" },
-      updated_at: now,
-    }),
-  );
+  const state = newCtoState({
+    id: "run-one",
+    task: "Active task",
+    branch: "main",
+    autonomous: true,
+    plan: { id: "run-one", task: "Active task", teams: [], created_at: new Date().toISOString() },
+  });
+  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
 }
 
 function finishedRun(root: string): void {
@@ -62,6 +88,20 @@ function finishedRun(root: string): void {
       updated_at: now,
     }),
   );
+  writeCtoState(JSON.parse(readFileSync(join(runDir, "state.json"), "utf8")), root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+}
+
+function finishedRunWithWave(root: string): void {
+  finishedRun(root);
+  const statePath = join(root, ".work-state", "cto", "run-done", "state.json");
+  const state = JSON.parse(readFileSync(statePath, "utf8")) as CtoState;
+  const now = new Date().toISOString();
+  state.updated_at = now;
+  state.wave_history = [{
+    id: "wave-one", source: "run-done", source_id: "wave-source", task: "canonical task", slice_ids: [],
+    status: "done", outcome: "pass", started_at: now, finished_at: now,
+  }];
+  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
 }
 
 const MSG = { id: "tg:11", text: "Какой статус?", at: new Date().toISOString(), by: "telegram" };
@@ -80,6 +120,133 @@ test("bridge: active run -> task filed in the local drop, no reply", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("bridge: pinned active task drop rejects root, ancestor, and symlink replacement", () => {
+  for (const replacementKind of ["root", "ancestor", "symlink"] as const) {
+    const container = mkdtempSync(join(tmpdir(), `bridge-pinned-${replacementKind}-`));
+    const parent = replacementKind === "ancestor" ? join(container, "parent") : null;
+    const root = parent ? join(parent, "project") : container;
+    if (parent) mkdirSync(root, { recursive: true });
+    activeRun(root);
+    const displaced = `${root}.opened`;
+    const displacedParent = parent ? `${parent}.opened` : null;
+    const outside = replacementKind === "symlink" ? mkdtempSync(join(tmpdir(), "bridge-pinned-outside-")) : null;
+    let swapped = false;
+    const pin = PinnedProjectRoot.open(root, {
+      beforeRename: (relativePath) => {
+        if (swapped || relativePath.endsWith("/bridge.lock")) return;
+        swapped = true;
+        if (replacementKind === "ancestor" && parent && displacedParent) {
+          renameSync(parent, displacedParent);
+          mkdirSync(root, { recursive: true });
+        } else {
+          renameSync(root, displaced);
+          if (replacementKind === "symlink" && outside) symlinkSync(outside, root);
+          else mkdirSync(root);
+        }
+      },
+    });
+    try {
+      assert.ok(pin);
+      assert.throws(
+        () => writeTaskDrop(root, { ...MSG, id: `tg-pinned-${replacementKind}` }, undefined, pin),
+        /changed|unsafe|unavailable|failed|not found/i,
+      );
+      assert.equal(existsSync(join(root, ".omp")), false);
+      if (outside) assert.equal(existsSync(join(outside, ".omp")), false);
+    } finally {
+      pin?.close();
+      if (replacementKind === "symlink" && swapped) {
+        unlinkSync(root);
+        renameSync(displaced, root);
+      } else if (replacementKind === "ancestor" && swapped && displacedParent && parent) {
+        rmSync(parent, { recursive: true, force: true });
+        renameSync(displacedParent, parent);
+      } else if (swapped) {
+        rmSync(root, { recursive: true, force: true });
+        renameSync(displaced, root);
+      }
+      rmSync(parent ?? root, { recursive: true, force: true });
+      rmSync(container, { recursive: true, force: true });
+      if (outside) rmSync(outside, { recursive: true, force: true });
+    }
+  }
+});
+
+
+
+test("bridge: pinned answer marker rejects root, ancestor, and symlink replacement", () => {
+  for (const replacementKind of ["root", "ancestor", "symlink"] as const) {
+    const container = mkdtempSync(join(tmpdir(), `bridge-answer-${replacementKind}-`));
+    const parent = replacementKind === "ancestor" ? join(container, "parent") : null;
+    const root = parent ? join(parent, "project") : container;
+    if (parent) mkdirSync(root, { recursive: true });
+    activeRun(root);
+    const displaced = `${root}.opened`;
+    const displacedParent = parent ? `${parent}.opened` : null;
+    const outside = replacementKind === "symlink" ? mkdtempSync(join(tmpdir(), "bridge-answer-outside-")) : null;
+    let swapped = false;
+    const swapAfterLease = (relativePath: string): void => {
+      if (swapped || relativePath.endsWith("/bridge.lock")) return;
+      swapped = true;
+      if (replacementKind === "ancestor" && parent && displacedParent) {
+        renameSync(parent, displacedParent);
+        mkdirSync(root, { recursive: true });
+      } else {
+        renameSync(root, displaced);
+        if (replacementKind === "symlink" && outside) symlinkSync(outside, root);
+        else mkdirSync(root);
+      }
+    };
+    const pin = PinnedProjectRoot.open(root, { beforeTempOpen: swapAfterLease, beforeRename: swapAfterLease });
+    try {
+      assert.ok(pin);
+      assert.throws(
+        () => writeAnswerMarker(root, { id: "run-one/escalation-0", run_id: "run-one", answer: "seed" }, pin),
+        BridgeRetryableError,
+      );
+      assert.equal(swapped, true, "answer seam must reject the supplied unstable pin");
+      assert.throws(
+        () => writeAnswerMarker(root, { id: "run-one/escalation-1", run_id: "run-one", answer: "answer" }, pin),
+        BridgeRetryableError,
+      );
+    } finally {
+      pin?.close();
+      if (replacementKind === "symlink" && swapped) {
+        unlinkSync(root);
+        renameSync(displaced, root);
+      } else if (replacementKind === "ancestor" && swapped && displacedParent && parent) {
+        rmSync(parent, { recursive: true, force: true });
+        renameSync(displacedParent, parent);
+      } else if (swapped) {
+        rmSync(root, { recursive: true, force: true });
+        renameSync(displaced, root);
+      }
+      rmSync(parent ?? root, { recursive: true, force: true });
+      rmSync(container, { recursive: true, force: true });
+      if (outside) rmSync(outside, { recursive: true, force: true });
+    }
+  }
+});
+test("bridge: answer marker requires an active run and canonical bounded identity", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-answer-validation-"));
+  try {
+    activeRun(root);
+    assert.equal(writeAnswerMarker(root, { id: "run-one//malformed", run_id: "run-one", answer: "no" }), null);
+    assert.equal(writeAnswerMarker(root, { id: "run-other/team-a/q1", run_id: "run-other", answer: "foreign" }), null);
+    assert.equal(writeAnswerMarker(root, { id: "run-one/team-a/q1", run_id: "run-one", answer: "ok", by: "x".repeat(257) }), null);
+    assert.equal(existsSync(join(root, ".omp", "inbox")), false, "rejected markers do not create the local drop");
+    const path = writeAnswerMarker(root, { id: "run-one/team-a/q1", run_id: "run-one", answer: "approved", by: "telegram:reply" });
+    assert.ok(path);
+    const marker = JSON.parse(readFileSync(path!, "utf8")) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(marker).sort(), ["at", "auth", "by", "id", "kind", "run_id", "schema", "text"]);
+    assert.equal(marker.id, "run-one/team-a/q1");
+    assert.equal(marker.run_id, "run-one");
+    assert.equal(marker.text, "approved");
+    assert.equal(marker.by, "telegram:reply");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("bridge: finished run -> status reply + standby task filed", () => {
   const root = mkdtempSync(join(tmpdir(), "bridge-done-"));
@@ -88,14 +255,43 @@ test("bridge: finished run -> status reply + standby task filed", () => {
     const result = classifyIncoming(root, MSG);
     assert.equal(result.action, "completed-status");
     assert.ok(result.reply!.includes("run-done"), "reply names the run");
-    assert.ok(result.reply!.includes("APPROVE"), "reply carries the verdict");
-    assert.ok(result.reply!.includes("#348"), "reply carries per-item status");
+    assert.ok(result.reply!.includes("status: done"), "reply carries canonical run status");
+    assert.equal(result.reply!.includes("APPROVE"), false, "summary verdict is not authoritative");
+    assert.equal(result.reply!.includes("#348"), false, "summary details are not authoritative");
     assert.ok(result.filedPath, "message still filed (user may have meant a task)");
     assert.equal(result.runId, "run-done");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("bridge: completed status replies target each originating chat", async () => {
+  const roots = [mkdtempSync(join(tmpdir(), "bridge-chat-one-")), mkdtempSync(join(tmpdir(), "bridge-chat-two-"))];
+  const payloads: Array<{ chat_id?: string; text?: string }> = [];
+  try {
+    const messages = [
+      { ...MSG, id: "tg-chat-one", chatId: "12345", messageId: 77 },
+      { ...MSG, id: "tg-chat-two", chatId: "67890", messageId: 77 },
+    ];
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { chat_id?: string; text?: string };
+      payloads.push(body);
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
+    }) as typeof fetch;
+    for (const [index, root] of roots.entries()) {
+      finishedRun(root);
+      const result = classifyIncoming(root, messages[index]!);
+      assert.equal(result.action, "completed-status");
+      assert.equal(result.chatId, messages[index]!.chatId);
+      assert.ok(result.reply?.includes("status: done"));
+      assert.ok(result.filedPath, "plain task remains filed alongside the status response");
+      assert.equal(await sendTelegramText("token", result.chatId!, result.reply!, fetchImpl), true);
+    }
+    assert.deepEqual(payloads.map((payload) => payload.chat_id), ["12345", "67890"], "responses never cross chats");
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});
+
 
 test("bridge: nothing -> standby run + saved reply", () => {
   const root = mkdtempSync(join(tmpdir(), "bridge-empty-"));
@@ -118,7 +314,141 @@ test("bridge: buildStatusReply + findCompletedSummary agree", () => {
     const found = findCompletedSummary(root);
     assert.equal(found?.runId, "run-done");
     const reply = buildStatusReply(found!.runId, found!.summary);
-    assert.ok(reply.includes("#355") && reply.includes("r2 fixes pushed"));
+    assert.ok(reply.includes("status: done"));
+    assert.equal(reply.includes("#355"), false);
+    assert.equal(reply.includes("r2 fixes pushed"), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge: forged summary verdict and future timestamp have zero influence", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-forged-summary-"));
+  try {
+    finishedRun(root);
+    const summaryPath = join(root, ".work-state", "cto", "run-done", "summary.json");
+    const forged = JSON.stringify({ verdict: "REJECT", updated_at: "2999-01-01T00:00:00.000Z", first_sweep: { forged: { action: "must not appear" } } });
+    writeFileSync(summaryPath, forged);
+    const found = findCompletedSummary(root);
+    assert.equal(found?.runId, "run-done");
+    const reply = buildStatusReply(found!.runId, found!.summary);
+    assert.match(reply, /status: done/);
+    assert.equal(reply.includes("REJECT"), false);
+    assert.equal(reply.includes("must not appear"), false);
+    assert.equal(readFileSync(summaryPath, "utf8"), forged, "forged summary remains untouched");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge: copied cross-run summary has zero influence", () => {
+  const roots = [mkdtempSync(join(tmpdir(), "bridge-summary-source-")), mkdtempSync(join(tmpdir(), "bridge-summary-target-"))];
+  try {
+    finishedRun(roots[0]!);
+    finishedRun(roots[1]!);
+    const sourceSummary = readFileSync(join(roots[0]!, ".work-state", "cto", "run-done", "summary.json"));
+    const targetSummary = join(roots[1]!, ".work-state", "cto", "run-done", "summary.json");
+    writeFileSync(targetSummary, sourceSummary);
+    const found = findCompletedSummary(roots[1]!);
+    assert.equal(found?.runId, "run-done");
+    const reply = buildStatusReply(found!.runId, found!.summary);
+    assert.match(reply, /status: done/);
+    assert.equal(reply.includes("#348"), false);
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge: canonical state status works without summary.json", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-no-summary-"));
+  try {
+    finishedRun(root);
+    unlinkSync(join(root, ".work-state", "cto", "run-done", "summary.json"));
+    const found = findCompletedSummary(root);
+    assert.equal(found?.runId, "run-done");
+    assert.match(buildStatusReply(found!.runId, found!.summary), /status: done/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge: status reply uses authenticated wave outcome and timestamps", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-wave-status-"));
+  try {
+    finishedRunWithWave(root);
+    const found = findCompletedSummary(root);
+    assert.equal(found?.runId, "run-done");
+    const reply = buildStatusReply(found!.runId, found!.summary);
+    assert.match(reply, /Status per wave:/);
+    assert.match(reply, /wave-one: done/);
+    assert.match(reply, /outcome: pass/);
+    assert.match(reply, /2026|20/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge: canonical status reply is bounded, Unicode-safe, and does not mutate state", () => {
+  for (const count of [4096, 4097]) {
+    const waves: Array<Record<string, unknown>> = [];
+    for (let index = 0; index < count; index += 1) {
+      waves.push({ id: `wave-${index}`, status: "done", started_at: "2026-01-01T00:00:00.000Z", finished_at: "2026-01-01T00:00:01.000Z", outcome: "pass" });
+    }
+    const summary = { status: "done", updated_at: "2026-01-01T00:00:01.000Z", waves };
+    const before = JSON.stringify(summary);
+    const reply = buildStatusReply("run-😀", summary);
+    if (count === 4097) assert.match(reply, /status unavailable: malformed summary/);
+    assert.ok(Array.from(reply).length <= 4096);
+    assert.equal(reply.includes("\u0000"), false);
+    assert.equal(JSON.stringify(summary), before);
+  }
+});
+
+
+test("bridge: zero-byte predictable task collision is retryable", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-zero-byte-collision-"));
+  try {
+    const message = { ...MSG, id: "tg-zero-byte" };
+    const path = join(root, ".omp", "inbox", inboxMessageFileName(message.id));
+    activeRun(root);
+    mkdirSync(join(root, ".omp", "inbox"), { recursive: true });
+    writeFileSync(path, Buffer.alloc(0));
+    assert.throws(() => writeTaskDrop(root, message, "run-one"), BridgeRetryableError);
+    assert.equal(readFileSync(path).byteLength, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge: authenticated task collision binds exact text and run", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-collision-binding-"));
+  try {
+    const message = { ...MSG, id: "tg-binding" };
+    activeRun(root);
+    const first = writeTaskDrop(root, message, "run-one");
+    assert.ok(first);
+    const forged = JSON.parse(readFileSync(first!, "utf8")) as Record<string, unknown>;
+    forged.text = "different text";
+    writeFileSync(first!, JSON.stringify(forged));
+    assert.throws(() => writeTaskDrop(root, message, "run-one"), BridgeRetryableError);
+
+    const foreignMessage = { ...MSG, id: "tg-foreign-route" };
+    const foreignPath = writeTaskDrop(root, foreignMessage, "run-two");
+    assert.ok(foreignPath);
+    assert.throws(() => writeTaskDrop(root, foreignMessage, "run-one"), BridgeRetryableError);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge: exact genuine task redelivery remains idempotent", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-genuine-redelivery-"));
+  try {
+    const message = { ...MSG, id: "tg-genuine-redelivery" };
+    activeRun(root);
+    assert.ok(writeTaskDrop(root, message, "run-one"));
+    assert.equal(writeTaskDrop(root, message, "run-one"), null);
+    assert.equal(readdirSync(join(root, ".omp", "inbox")).filter((name) => name.endsWith(".json")).length, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -146,9 +476,8 @@ test("bridge: persistence failures propagate instead of looking like duplicate d
     const drop = join(root, ".omp", "inbox");
     mkdirSync(drop, { recursive: true });
     // A directory at the deterministic task path proves the write was not
-    // durable; treating any existing path as a duplicate would lose the update.
-    mkdirSync(join(drop, "tg-11.json"));
-    assert.throws(() => writeTaskDrop(root, MSG), /EEXIST|EISDIR|directory|is a directory/i);
+    mkdirSync(join(drop, inboxMessageFileName(MSG.id)));
+    assert.throws(() => writeTaskDrop(root, MSG), /EEXIST|EISDIR|directory|is a directory|already exists/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -170,4 +499,10 @@ test("bridge: sendTelegramText posts to the bot API and reports ok", async () =>
   assert.equal(payload?.chat_id, "c");
   assert.equal(payload?.text, "hello");
   assert.equal("reply_markup" in (payload ?? {}), false, "plain text, no reply markup");
+});
+test("bridge: sendTelegramText rejects oversized or malformed response bodies", async () => {
+  const oversized = await sendTelegramText("t", "c", "hello", (async () => new Response("x".repeat(70_000), { status: 200 })) as typeof fetch);
+  assert.equal(oversized, false);
+  const malformed = await sendTelegramText("t", "c", "hello", (async () => new Response(JSON.stringify({ ok: "yes" }), { status: 200 })) as typeof fetch);
+  assert.equal(malformed, false);
 });

@@ -32,24 +32,14 @@ export function isAcquisitionProviderError(value: unknown): value is Acquisition
 export async function readBoundedResponseText(response: Response, maxBytes: number, provider: string): Promise<string> {
   const body = response.body;
   if (!body) {
-    let text: string;
-    try {
-      text = await response.text();
-    } catch {
-      throw new AcquisitionProviderError("NETWORK_ERROR", "provider response could not be read", {
-        provider,
-        retryable: true,
-        status: response.status,
-      });
-    }
-    if (new TextEncoder().encode(text).byteLength > maxBytes) {
-      throw new AcquisitionProviderError("LIMIT_EXCEEDED", "provider response exceeded the configured byte limit", {
-        provider,
-        retryable: false,
-        status: response.status,
-      });
-    }
-    return text;
+    const contentLength = response.headers.get("content-length")?.trim();
+    const noBodyStatus = (response.status >= 100 && response.status < 200) || response.status === 204 || response.status === 304;
+    if (noBodyStatus || contentLength === "0") return "";
+    throw new AcquisitionProviderError("NETWORK_ERROR", "provider response body was unavailable", {
+      provider,
+      retryable: true,
+      status: response.status,
+    });
   }
 
   let reader: ReadableStreamDefaultReader<Uint8Array>;

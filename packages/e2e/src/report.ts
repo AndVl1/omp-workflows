@@ -6,23 +6,68 @@
  * and warns on every clamp, so the score can never outrun the defects.
  */
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
-
+import { createHash } from 'node:crypto';
+import {
+  closeSync,
+  constants as fsConstants,
+  lstatSync,
+  opendirSync,
+  realpathSync,
+  type Dir,
+} from 'node:fs';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
+import type {
+  ScenarioSelectors,
+  ScenarioWorkspacePaths,
+  ScenarioTranscriptExpectations,
+} from './scenario.js';
+import {
+  closePinnedDirectory,
+  closePinnedFile,
+  MAX_PINNED_READ_BYTES,
+  openPinnedFile,
+  pinDirectory,
+  pinOrCreateDirectory,
+  pinnedDirectoryIsStable,
+  readPinnedEvidence,
+  readPinnedFile,
+  readPinnedFileFull,
+  setFsSafetyTestHooks,
+  writePinnedFile,
+  type FsSafetyTestHooks,
+  type PinnedDirectory,
+} from './fs-safety.js';
 
 /**
- * Strip ANSI escapes and lone C0 control chars from a value destined for
- * the report. Keeps \t \n \r at the byte level (they're harmless in JSON)
- * but drops the ESC (0x1b) sequence and embedded BEL/BS/VT/FF that
- * downstream renderers can mishandle. Mirrors `sanitizeForJson` in
- * server.ts — duplicated here so report.ts remains import-free.
+ * Strip terminal controls before any value reaches human-readable report
+ * output. Evidence files remain raw and are referenced, never rendered.
  */
 function sanitizeForJson(value: string): string {
   // eslint-disable-next-line no-control-regex
-  return value
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/gu, '')
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/gu, '');
+  return value.replace(
+    /(?:\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|(?:P|X|\^|_)[^\u001b]*(?:\u001b\\)|\[[0-?]*[ -/]*[@-~]|[ -/]*[@-~])|\u009d[^\u0007]*(?:\u0007|\u001b\\)|[\u0090\u0098\u009e\u009f][^\u001b]*(?:\u001b\\)|\u009b[0-?]*[ -/]*[@-~]|[\u0080-\u009c]|[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f])/gu,
+    '',
+  ).replace(/\r\n?/gu, '\n').replace(/\t/gu, '  ');
+}
+
+function sanitizeMarkdownInline(value: string): string {
+  return sanitizeForJson(value)
+    .replace(/\\/gu, '\\\\')
+    .replace(/`/gu, '\\`')
+    .replace(/([*_{}\[\]<>|#])/gu, '\\$1');
+}
+
+function sanitizeMarkdownBlock(value: string): string {
+  return sanitizeMarkdownInline(value);
+}
+
+function sanitizeOutput(value: unknown, key = ''): unknown {
+  if (typeof value === 'string') return key === 'evidence' ? value : sanitizeForJson(value);
+  if (Array.isArray(value)) return value.map(item => sanitizeOutput(item, key));
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(Object.entries(value).map(([name, child]) => [name, sanitizeOutput(child, name)]));
+  }
+  return value;
 }
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -110,20 +155,81 @@ export interface Overall {
   readonly recommendation: Recommendation;
 }
 
+export interface ReportWorkerAttribution {
+  readonly phase: string | null;
+  readonly dispatch_id: string;
+  readonly role: string | null;
+  readonly agent: string | null;
+  /** Project-relative immutable record containing the attribution. */
+  readonly evidence: string;
+}
+
+export interface ReportRuntimeMarker {
+  readonly kind: 'interruption' | 'resume';
+  readonly value: string;
+  readonly evidence: string;
+}
+
+export interface ReportWorkspaceEvidence {
+  /** Project-relative `specs/<feature-id>` location. */
+  readonly path: string;
+  /** Project-relative feature state location. */
+  readonly state_path: string;
+  /** Existing readable phase documents and status projections. */
+  readonly documents: string[];
+  /** Existing validation, revision-history, handoff, and immutable records. */
+  readonly validation: string[];
+  readonly history: string[];
+  readonly handoff: string[];
+  readonly artifacts: string[];
+  /** Durable checkpoint records and real PTY answer/transcript ledgers. */
+  readonly checkpoints: string[];
+  readonly checkpoint_transcripts: string[];
+  /** Worker provenance retained by immutable phase versions. */
+  readonly worker_attribution: ReportWorkerAttribution[];
+  /** Durable pause/cursor evidence used to prove interruption and exact resume. */
+  readonly interruption_resume: ReportRuntimeMarker[];
+}
+
+export interface ReportNextAction {
+  readonly kind: string;
+  readonly command: string | null;
+  readonly reason: string | null;
+}
+
+export interface ReportSelectors {
+  readonly feature_id: string | null;
+  readonly run_key: string | null;
+}
+
+export interface ReportScenarioReference {
+  readonly id: string;
+  readonly title?: string;
+  readonly selectors?: ScenarioSelectors;
+  readonly workspace?: ScenarioWorkspacePaths;
+  readonly transcript?: ScenarioTranscriptExpectations;
+}
+
 export interface ReportSessionMeta {
   readonly slug: string;
   readonly scratch_dir: string;
   readonly omp_version: string;
   readonly profile: string;
   readonly tty: { readonly cols: number; readonly rows: number; readonly term: string };
+  readonly status: 'starting' | 'running' | 'shutdown_failed' | 'stopped' | null;
   readonly started_at: string | null;
+  readonly stopped_at: string | null;
   readonly finished_at: string | null;
+  readonly shutdown_error: string | null;
   readonly task_prompt: string | null;
-  readonly scenario: { readonly id: string; readonly title?: string } | null;
+  readonly scenario: ReportScenarioReference | null;
   readonly transcript: string;
   readonly session_jsonl: string;
   readonly events_jsonl: string;
   readonly omp_log: string;
+  readonly selectors?: ReportSelectors;
+  readonly workspace?: ReportWorkspaceEvidence;
+  readonly next_action?: ReportNextAction;
 }
 
 export interface UxE2eReport {
@@ -163,54 +269,121 @@ export interface GenerateReportResult {
   readonly warnings: string[];
 }
 
+
+export type ReportSelectorResolutionFailure = 'invalid' | 'partial' | 'conflicting' | 'unresolved';
+
+/** Raised when report attribution cannot be bound to one feature/run pair. */
+export class ReportSelectorResolutionError extends Error {
+  readonly code = 'ux-e2e-report-selector-resolution-failed';
+  readonly reason: ReportSelectorResolutionFailure;
+
+  constructor(reason: ReportSelectorResolutionFailure, detail: string) {
+    super('ux-e2e: report selector resolution failed (' + reason + '): ' + detail);
+    this.name = 'ReportSelectorResolutionError';
+    this.reason = reason;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Session metadata                                                    */
 /* ------------------------------------------------------------------ */
-
 interface RawSessionJson {
+  readonly schema_version?: unknown;
   readonly slug?: unknown;
   readonly url?: unknown;
   readonly token?: unknown;
   readonly wsPath?: unknown;
   readonly pid?: unknown;
+  readonly pty_start_identity?: unknown;
+  readonly server_start_nonce?: unknown;
   readonly started_at?: unknown;
+  readonly stopped_at?: unknown;
+  readonly finished_at?: unknown;
+  readonly status?: unknown;
+  readonly pty_exit_observed?: unknown;
+  readonly shutdown_completed_at?: unknown;
+  readonly shutdown_error?: unknown;
   readonly omp_version?: unknown;
   readonly profile?: unknown;
   readonly tty?: unknown;
   readonly task_prompt?: unknown;
   readonly scenario?: unknown;
+  readonly feature_id?: unknown;
+  readonly run_key?: unknown;
+  readonly selectors?: unknown;
+  readonly workspace?: unknown;
+  readonly next_action?: unknown;
+  readonly omp_log_binding?: unknown;
+  readonly omp_log_snapshot?: unknown;
 }
-
+interface RawOmpLogSnapshot {
+  readonly relative_path?: unknown;
+  readonly size?: unknown;
+  readonly sha256?: unknown;
+}
+function validSnapshotName(value: unknown): value is string {
+  return typeof value === 'string' && /^omp-log\.[0-9a-f]{64}\.log$/u.test(value);
+}
 function readSessionMeta(scratchDir: string): RawSessionJson {
   const p = join(scratchDir, '.work-state', 'ux-e2e', 'session.json');
-  if (!existsSync(p)) return {};
+  const root = pinDirectory(dirname(p));
+  if (root === null) return {};
   try {
-    return JSON.parse(readFileSync(p, 'utf8')) as RawSessionJson;
+    const bytes = readPinnedFileFull(root, basename(p), 1024 * 1024);
+    if (bytes === null) return {};
+    const value = JSON.parse(bytes.toString('utf8')) as RawSessionJson;
+    return value.schema_version === 2 ? value : {};
   } catch {
     return {};
+  } finally {
+    closePinnedDirectory(root);
   }
 }
+type ReportSessionStatus = 'starting' | 'running' | 'shutdown_failed' | 'stopped';
 
-/** Newest file matching `~/.omp/logs/omp.*.log`, or null. */
-function newestOmpLog(): string | null {
-  const dir = join(homedir(), '.omp', 'logs');
-  if (!existsSync(dir)) return null;
-  let best: string | null = null;
-  let bestMtime = 0;
-  for (const entry of readdirSync(dir)) {
-    if (!entry.startsWith('omp.') || !entry.endsWith('.log')) continue;
-    const p = join(dir, entry);
-    try {
-      const mtime = statSync(p).mtimeMs;
-      if (mtime > bestMtime) {
-        best = p;
-        bestMtime = mtime;
-      }
-    } catch {
-      /* skip unreadable entries */
-    }
+function rawLifecycleTimestamp(raw: RawSessionJson, key: 'stopped_at' | 'finished_at' | 'shutdown_completed_at'): string | null {
+  const value = raw[key];
+  if (typeof value !== 'string' || value.length === 0 || value.length > 64 || Number.isNaN(Date.parse(value))) return null;
+  return value;
+}
+
+function rawSessionStatus(raw: RawSessionJson): ReportSessionStatus | null {
+  const value = raw.status;
+  return value === 'starting' || value === 'running' || value === 'shutdown_failed' || value === 'stopped' ? value : null;
+}
+
+function rawShutdownError(raw: RawSessionJson): string | null {
+  if (raw.shutdown_error === undefined || raw.shutdown_error === null) return null;
+  return typeof raw.shutdown_error === 'string' && raw.shutdown_error.length <= 1024
+    ? sanitizeForJson(raw.shutdown_error)
+    : 'invalid shutdown metadata';
+}
+function ompLogForSession(scratchDir: string, raw: RawSessionJson): string | null {
+  const snapshot = raw.omp_log_snapshot;
+  if (typeof snapshot !== 'object' || snapshot === null || Array.isArray(snapshot)) return null;
+  const candidate = snapshot as RawOmpLogSnapshot;
+  if (!validSnapshotName(candidate.relative_path)
+    || typeof candidate.size !== 'number'
+    || !Number.isSafeInteger(candidate.size)
+    || candidate.size < 0
+    || candidate.size > MAX_PINNED_READ_BYTES
+    || typeof candidate.sha256 !== 'string'
+    || !/^[0-9a-f]{64}$/u.test(candidate.sha256)) return null;
+  const stateDir = join(scratchDir, '.work-state', 'ux-e2e');
+  const root = pinDirectory(stateDir);
+  if (root === null) return null;
+  try {
+    const info = lstatSync(join(stateDir, candidate.relative_path));
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size !== candidate.size) return null;
+    const bytes = readPinnedFileFull(root, candidate.relative_path, MAX_PINNED_READ_BYTES);
+    if (bytes === null || bytes.length !== candidate.size
+      || createHash('sha256').update(bytes).digest('hex') !== candidate.sha256) return null;
+    return join(stateDir, candidate.relative_path);
+  } catch {
+    return null;
+  } finally {
+    closePinnedDirectory(root);
   }
-  return best;
 }
 
 /* ------------------------------------------------------------------ */
@@ -220,16 +393,17 @@ function newestOmpLog(): string | null {
 /** Effective rating for a dimension given the step's worst defect floor. */
 function clampRating(rating: number | undefined, floor: number, warnings: string[], where: string): number | undefined {
   if (rating === undefined) return undefined;
+  const safeWhere = sanitizeForJson(where).slice(0, 256);
   if (rating < 1) {
-    warnings.push(`${where}: rating ${rating} clamped up to 1`);
+    warnings.push(`${safeWhere}: rating ${rating} clamped up to 1`);
     return 1;
   }
   if (rating > 5) {
-    warnings.push(`${where}: rating ${rating} clamped down to 5`);
+    warnings.push(`${safeWhere}: rating ${rating} clamped down to 5`);
     return 5;
   }
   if (rating > floor) {
-    warnings.push(`${where}: rating ${rating} clamped down to defect floor ${floor}`);
+    warnings.push(`${safeWhere}: rating ${rating} clamped down to defect floor ${floor}`);
     return floor;
   }
   return rating;
@@ -240,49 +414,521 @@ function floorForStep(defects: readonly UxDefect[], stepId: string): number {
   for (const d of defects) {
     if (d.step !== stepId) continue;
     const f = DEFECT_FLOORS[d.severity] ?? 5;
+
     if (f < floor) floor = f;
   }
   return floor;
+}
+
+const MAX_EVIDENCE_FILES = 4096;
+/** Maximum bytes accepted for one evidence file by the pinned reader. */
+const MAX_EVIDENCE_FILE_BYTES = MAX_PINNED_READ_BYTES;
+/** Maximum bytes copied across all evidence files. */
+const MAX_EVIDENCE_BYTES = 64 * 1024 * 1024;
+
+function boundedFileSize(path: string): number | null {
+  const absolute = resolve(path);
+  const root = pinDirectory(dirname(absolute));
+  if (root === null) return null;
+  const file = openPinnedFile(root, basename(absolute), fsConstants.O_RDONLY);
+  if (file === null) {
+    closePinnedDirectory(root);
+    return null;
+  }
+  try {
+    return Number.isSafeInteger(file.size)
+      && file.size >= 0
+      && file.size <= MAX_EVIDENCE_FILE_BYTES
+      ? file.size
+      : null;
+  } finally {
+    closePinnedFile(file);
+    closePinnedDirectory(root);
+  }
+}
+
+function boundedReadableFile(path: string): boolean {
+  return boundedFileSize(path) !== null;
 }
 
 /* ------------------------------------------------------------------ */
 /* Evidence collection                                                 */
 /* ------------------------------------------------------------------ */
 
-function collectEvidence(
+function evidenceCandidates(
   scratchDir: string,
   screenshots: readonly string[],
+  workspaceEvidence: readonly string[] = [],
+  ompLog: string | null = null,
 ): string[] {
   const stateDir = join(scratchDir, '.work-state', 'ux-e2e');
-  const candidates: string[] = [
-    join(stateDir, 'transcript.jsonl'),
-    join(stateDir, 'session.json'),
-    join(stateDir, 'session.jsonl'),
-    join(stateDir, 'events.jsonl'),
-    ...screenshots,
-  ];
-  const ompLog = newestOmpLog();
-  if (ompLog !== null) candidates.push(ompLog);
-  const evidence: string[] = [];
-  for (const p of candidates) {
-    if (p.length > 0 && existsSync(p)) evidence.push(resolve(p));
-  }
-  return [...new Set(evidence)];
+  const candidates: string[] = [];
+  const addCandidate = (value: string): void => {
+    if (candidates.length < MAX_EVIDENCE_FILES && value.length > 0) candidates.push(value);
+  };
+  addCandidate(join(stateDir, 'transcript.jsonl'));
+  // session.json contains bearer/control/startup credentials. Its terminal
+  // lifecycle projection is retained in report.session; never publish raw
+  // metadata through evidence paths or copyEvidence.
+  addCandidate(join(stateDir, 'session.jsonl'));
+  addCandidate(join(stateDir, 'events.jsonl'));
+  for (const screenshot of screenshots) addCandidate(screenshot);
+  for (const path of workspaceEvidence) addCandidate(path);
+  if (ompLog !== null) addCandidate(ompLog);
+  return [...new Set(candidates.map(path => resolve(path)))].slice(0, MAX_EVIDENCE_FILES);
 }
 
-function copyEvidence(evidence: readonly string[], targetDir: string): string[] {
-  mkdirSync(targetDir, { recursive: true });
-  const copied: string[] = [];
-  for (const src of evidence) {
+function collectEvidence(candidates: readonly string[]): string[] {
+  return candidates.filter(path => boundedReadableFile(path));
+}
+export interface EvidenceCopyTestHooks extends FsSafetyTestHooks {}
+
+export function setEvidenceCopyTestHooks(hooks: EvidenceCopyTestHooks | null): void {
+  setFsSafetyTestHooks(hooks);
+}
+function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir: string): string[] {
+  const sourceRoot = pinDirectory(scratchDir);
+  const targetRoot = pinOrCreateDirectory(targetDir);
+  if (sourceRoot === null || targetRoot === null) {
+    if (sourceRoot !== null) closePinnedDirectory(sourceRoot);
+    if (targetRoot !== null) closePinnedDirectory(targetRoot);
+    return [];
+  }
+  try {
+    const copied: string[] = [];
+    let totalBytes = 0;
+    for (const source of evidence) {
+      if (copied.length >= MAX_EVIDENCE_FILES || totalBytes >= MAX_EVIDENCE_BYTES) break;
+      const bytes = readPinnedEvidence(sourceRoot, source);
+      if (bytes === null
+        || bytes.length > MAX_EVIDENCE_FILE_BYTES
+        || bytes.length > MAX_EVIDENCE_BYTES - totalBytes) continue;
+      totalBytes += bytes.length;
+      const relativeSource = projectRelative(scratchDir, resolve(source));
+      const sourceParts = relativeSource === null ? ['external'] : relativeSource.split('/');
+      const sourceName = sourceParts.pop() ?? 'evidence';
+      const directories = sourceParts.filter(safeFilenameSegment);
+      const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+      const baseName = safeFilenameSegment(sourceName) ? sourceName.slice(0, 100) : 'evidence';
+      const filename = `${baseName}.${digest}`;
+      const destinationDir = directories.length === 0
+        ? targetRoot.lexicalPath
+        : join(targetRoot.lexicalPath, ...directories);
+      const destinationRoot = pinOrCreateDirectory(destinationDir);
+      if (destinationRoot === null) continue;
+      try {
+        const existing = readPinnedFile(destinationRoot, filename, MAX_PINNED_READ_BYTES, 0);
+        if (existing !== null) {
+          if (!existing.equals(bytes)) {
+            throw new Error(`ux-e2e: evidence destination collision: ${join(destinationDir, filename)}`);
+          }
+          copied.push(join(destinationDir, filename));
+          continue;
+        }
+        if (!writePinnedFile(destinationRoot, filename, bytes)) continue;
+        copied.push(join(destinationDir, filename));
+      } finally {
+        closePinnedDirectory(destinationRoot);
+      }
+    }
+    return copied;
+  } finally {
+    closePinnedDirectory(sourceRoot);
+    closePinnedDirectory(targetRoot);
+  }
+}
+type JsonRecord = Record<string, unknown>;
+
+interface ResolvedFeatureState {
+  readonly feature_id: string;
+  readonly run_key: string;
+  readonly state_path: string;
+  readonly state: JsonRecord;
+}
+
+interface CollectedWorkspaceEvidence {
+  readonly report: ReportWorkspaceEvidence;
+  readonly absolute_paths: string[];
+}
+
+function asRecord(value: unknown): JsonRecord | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as JsonRecord
+    : null;
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function safeFilenameSegment(value: string): boolean {
+  return value.length > 0
+    && value.length <= 128
+    && /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/u.test(value);
+}
+
+function safeFeatureId(value: string): boolean {
+  return safeFilenameSegment(value);
+}
+
+function readJsonRecord(path: string): JsonRecord | null {
+  const absolute = resolve(path);
+  const root = pinDirectory(dirname(absolute));
+  if (root === null) return null;
+  try {
+    const bytes = readPinnedFileFull(root, basename(absolute), 8 * 1024 * 1024);
+    return bytes === null ? null : asRecord(JSON.parse(bytes.toString('utf8')));
+  } catch {
+    return null;
+  } finally {
+    closePinnedDirectory(root);
+  }
+}
+
+function isWithin(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..');
+}
+
+function boundedFiles(root: string): string[] {
+  const rootHandle = pinDirectory(root);
+  if (rootHandle === null) return [];
+  const realRoot = rootHandle.physicalPath;
+  const files: string[] = [];
+  let totalBytes = 0;
+  let nodes = 0;
+  let directories = 0;
+  const maxFiles = 2048;
+  const maxNodes = 8192;
+  const maxDirectories = 2048;
+  const maxDepth = 12;
+  const maxAggregateBytes = 32 * 1024 * 1024;
+  const visit = (directory: string, depth: number): void => {
+    if (
+      depth > maxDepth
+      || files.length >= maxFiles
+      || nodes >= maxNodes
+      || directories >= maxDirectories
+      || totalBytes >= maxAggregateBytes
+    ) return;
+    directories += 1;
+    let handle: Dir | null = null;
     try {
-      const dst = join(targetDir, basename(src));
-      copyFileSync(src, dst);
-      copied.push(dst);
+      handle = opendirSync(directory);
+      for (;;) {
+        if (files.length >= maxFiles || nodes >= maxNodes || totalBytes >= maxAggregateBytes) return;
+        const entry = handle.readSync();
+        if (entry === null) return;
+        nodes += 1;
+        if (entry.isSymbolicLink()) continue;
+        const candidate = join(directory, entry.name);
+        try {
+          const info = lstatSync(candidate);
+          if (info.isSymbolicLink()) continue;
+          const real = realpathSync(candidate);
+          if (!isWithin(realRoot, real)) continue;
+          if (info.isDirectory()) visit(candidate, depth + 1);
+          else if (info.isFile() && info.size <= maxAggregateBytes - totalBytes) {
+            files.push(resolve(candidate));
+            totalBytes += info.size;
+          }
+        } catch {
+          /* Skip evidence that changed or became unreadable during collection. */
+        }
+      }
     } catch {
-      copied.push(src); // keep the original reference when copy fails
+      return;
+    } finally {
+      try { handle?.closeSync(); } catch { /* best effort */ }
+    }
+  };
+  try {
+    visit(root, 0);
+    return files.sort();
+  } finally {
+    closePinnedDirectory(rootHandle);
+  }
+}
+
+function projectRelative(scratchDir: string, path: string): string | null {
+  const rel = relative(scratchDir, path);
+  if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`)) return null;
+  return rel.split(sep).join('/');
+}
+
+interface SelectorPair {
+  readonly feature_id: string;
+  readonly run_key: string;
+}
+
+interface SelectorSource {
+  readonly name: string;
+  readonly present: boolean;
+  readonly pair: SelectorPair | null;
+  readonly invalid: boolean;
+}
+
+interface DeclaredSelectorResolution {
+  readonly selectors: ReportSelectors;
+  readonly pair: SelectorPair | null;
+}
+
+function hasOwn(record: JsonRecord, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function selectorSourceFromRecord(name: string, value: unknown, present: boolean): SelectorSource {
+  if (!present) return { name, present: false, pair: null, invalid: false };
+  const record = asRecord(value);
+  if (record === null) return { name, present: true, pair: null, invalid: true };
+  const hasFeature = hasOwn(record, 'feature_id');
+  const hasRun = hasOwn(record, 'run_key');
+  const featureId = nonEmptyString(record.feature_id);
+  const runKey = nonEmptyString(record.run_key);
+  if (!hasFeature || !hasRun || featureId === null || runKey === null) {
+    return { name, present: true, pair: null, invalid: true };
+  }
+  return { name, present: true, pair: { feature_id: featureId, run_key: runKey }, invalid: false };
+}
+
+function selectorSourceFromTopLevel(raw: RawSessionJson): SelectorSource {
+  const record = raw as unknown as JsonRecord;
+  const present = hasOwn(record, 'feature_id') || hasOwn(record, 'run_key');
+  if (!present) return { name: 'session top-level', present: false, pair: null, invalid: false };
+  const featureId = nonEmptyString(raw.feature_id);
+  const runKey = nonEmptyString(raw.run_key);
+  if (featureId === null || runKey === null) {
+    return { name: 'session top-level', present: true, pair: null, invalid: true };
+  }
+  return { name: 'session top-level', present: true, pair: { feature_id: featureId, run_key: runKey }, invalid: false };
+}
+
+function declaredSelectorResolution(raw: RawSessionJson): DeclaredSelectorResolution {
+  const rawRecord = raw as unknown as JsonRecord;
+  const scenario = asRecord(raw.scenario);
+  const sources = [
+    selectorSourceFromRecord('session.selectors', raw.selectors, hasOwn(rawRecord, 'selectors')),
+    selectorSourceFromRecord('scenario.selectors', scenario?.selectors, scenario !== null && hasOwn(scenario, 'selectors')),
+    selectorSourceFromTopLevel(raw),
+  ];
+  const present = sources.filter(source => source.present);
+  const invalid = present.find(source => source.invalid);
+  if (invalid !== undefined) {
+    throw new ReportSelectorResolutionError('partial', `${invalid.name} must declare feature_id and run_key as one complete pair`);
+  }
+  const pairs = present.flatMap(source => source.pair === null ? [] : [source.pair]);
+  const first = pairs[0];
+  if (first === undefined) {
+    return { selectors: { feature_id: null, run_key: null }, pair: null };
+  }
+  if (pairs.some(pair => pair.feature_id !== first.feature_id || pair.run_key !== first.run_key)) {
+    throw new ReportSelectorResolutionError('conflicting', 'declared selector sources do not identify one exact feature_id/run_key pair');
+  }
+  return { selectors: first, pair: first };
+}
+
+function stateSelectorPair(state: JsonRecord, featureId: string, statePath: string): SelectorPair | null {
+  const specificationValue = state.specification;
+  const specification = specificationValue === undefined
+    ? null
+    : asRecord(specificationValue);
+  if (specificationValue !== undefined && specification === null) {
+    throw new ReportSelectorResolutionError('unresolved', `state ${statePath} has an invalid specification object`);
+  }
+  const featureValues: Array<string | null> = [];
+  const runValues: Array<string | null> = [];
+  if (hasOwn(state, 'feature_id')) featureValues.push(nonEmptyString(state.feature_id));
+  if (specification !== null && hasOwn(specification, 'feature_id')) featureValues.push(nonEmptyString(specification.feature_id));
+  if (hasOwn(state, 'run_key')) runValues.push(nonEmptyString(state.run_key));
+  if (specification !== null && hasOwn(specification, 'run_key')) runValues.push(nonEmptyString(specification.run_key));
+  const featurePresent = featureValues.length > 0;
+  const runPresent = runValues.length > 0;
+  if (!featurePresent && !runPresent) return null;
+  if (!featurePresent || !runPresent || featureValues.some(value => value === null) || runValues.some(value => value === null)) {
+    throw new ReportSelectorResolutionError('unresolved', `state ${statePath} does not contain one complete feature_id/run_key pair`);
+  }
+  const uniqueFeatures = new Set(featureValues);
+  const uniqueRuns = new Set(runValues);
+  if (uniqueFeatures.size !== 1 || uniqueRuns.size !== 1) {
+    throw new ReportSelectorResolutionError('conflicting', `state ${statePath} contains conflicting selector values`);
+  }
+  const resolvedFeature = featureValues[0];
+  const resolvedRun = runValues[0];
+  if (resolvedFeature === undefined || resolvedRun === undefined || resolvedFeature === null || resolvedRun === null) {
+    throw new ReportSelectorResolutionError('unresolved', `state ${statePath} could not resolve selectors`);
+  }
+  if (resolvedFeature !== featureId) {
+    throw new ReportSelectorResolutionError('conflicting', `state ${statePath} is stored under ${featureId} but declares ${resolvedFeature}`);
+  }
+  return { feature_id: resolvedFeature, run_key: resolvedRun };
+}
+
+function sameSelectorPair(left: SelectorPair, right: SelectorPair): boolean {
+  return left.feature_id === right.feature_id && left.run_key === right.run_key;
+}
+
+function resolveFeatureState(scratchDir: string, raw: RawSessionJson): ResolvedFeatureState | null {
+  const declared = declaredSelectorResolution(raw);
+  const stateRoot = join(scratchDir, '.work-state', 'features');
+  const stateFiles = new Set(boundedFiles(stateRoot).map(path => resolve(path)));
+  const featureIds: string[] = [];
+  if (declared.pair !== null) {
+    if (!safeFeatureId(declared.pair.feature_id)) {
+      throw new ReportSelectorResolutionError('invalid', `feature_id ${declared.pair.feature_id} is not a safe feature selector`);
+    }
+    featureIds.push(declared.pair.feature_id);
+  } else {
+    const discovered = new Set<string>();
+    for (const path of stateFiles) {
+      const first = relative(stateRoot, path).split(sep)[0];
+      if (first !== undefined && safeFeatureId(first)) discovered.add(first);
+    }
+    featureIds.push(...discovered);
+  }
+
+  const candidates: ResolvedFeatureState[] = [];
+  for (const featureId of featureIds) {
+    const statePath = resolve(join(stateRoot, featureId, 'state.json'));
+    const state = readJsonRecord(statePath);
+    if (state === null) {
+      if (stateFiles.has(statePath)) {
+        throw new ReportSelectorResolutionError('unresolved', `state ${statePath} is unreadable or malformed`);
+      }
+      continue;
+    }
+    const statePair = stateSelectorPair(state, featureId, statePath);
+    if (statePair === null) continue;
+    if (declared.pair !== null && !sameSelectorPair(declared.pair, statePair)) {
+      throw new ReportSelectorResolutionError('conflicting', `declared selectors do not match authoritative state ${statePath}`);
+    }
+    candidates.push({ feature_id: statePair.feature_id, run_key: statePair.run_key, state_path: statePath, state });
+  }
+  if (candidates.length === 1) return candidates[0] ?? null;
+  if (declared.pair === null && featureIds.length > 0) {
+    throw new ReportSelectorResolutionError('unresolved', 'feature state files did not resolve to one exact selector pair');
+  }
+  return null;
+}
+
+function collectWorkerAttribution(
+  value: unknown,
+  evidence: string,
+  output: ReportWorkerAttribution[],
+  seen: Set<string>,
+  depth = 0,
+): void {
+  if (depth > 32 || output.length >= 2048) return;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (output.length >= 2048) return;
+      collectWorkerAttribution(item, evidence, output, seen, depth + 1);
+    }
+    return;
+  }
+  const record = asRecord(value);
+  if (record === null) return;
+  const dispatchId = nonEmptyString(record.dispatch_id);
+  if (dispatchId !== null) {
+    const identity = asRecord(record.work_identity);
+    const phase = nonEmptyString(record.phase);
+    const role = nonEmptyString(identity?.role) ?? nonEmptyString(record.role);
+    const agent = nonEmptyString(identity?.agent) ?? nonEmptyString(record.agent);
+    const key = `${dispatchId}\u0000${evidence}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      output.push({ phase, dispatch_id: dispatchId, role, agent, evidence });
     }
   }
-  return copied;
+  for (const child of Object.values(record)) {
+    if (output.length >= 2048) return;
+    collectWorkerAttribution(child, evidence, output, seen, depth + 1);
+  }
+}
+
+function collectWorkspaceEvidence(scratchDir: string, resolvedState: ResolvedFeatureState): CollectedWorkspaceEvidence {
+  const featureId = resolvedState.feature_id;
+  const workspaceRoot = join(scratchDir, 'specs', featureId);
+  const featureStateRoot = join(scratchDir, '.work-state', 'features', featureId);
+  const readable = boundedFiles(workspaceRoot);
+  const stateFiles = boundedFiles(featureStateRoot);
+  const rel = (paths: readonly string[]): string[] => paths
+    .map(path => projectRelative(scratchDir, path))
+    .filter((path): path is string => path !== null)
+    .sort();
+
+  const documents = rel(readable.filter(path => {
+    const local = relative(workspaceRoot, path).split(sep);
+    return local.length === 1 && path.endsWith('.md') && local[0] !== 'handoff.md';
+  }));
+  const validation = rel(readable.filter(path => relative(workspaceRoot, path).split(sep)[0] === 'validation'));
+  const history = rel(readable.filter(path => relative(workspaceRoot, path).split(sep)[0] === 'history'));
+  const handoff = rel(readable.filter(path => basename(path) === 'handoff.md'));
+  const artifacts = rel(stateFiles.filter(path => relative(featureStateRoot, path).split(sep)[0] === 'artifacts'));
+  const stateRel = projectRelative(scratchDir, resolvedState.state_path);
+  const checkpoints = rel(stateFiles.filter(path => /checkpoint|decision|answer/iu.test(relative(featureStateRoot, path))));
+  if (stateRel !== null && !checkpoints.includes(stateRel)) checkpoints.unshift(stateRel);
+
+  const uxState = join(scratchDir, '.work-state', 'ux-e2e');
+  const checkpointTranscripts = rel([
+    join(uxState, 'transcript.jsonl'),
+    join(uxState, 'ask-state.jsonl'),
+    join(uxState, 'session.jsonl'),
+  ].filter(path => boundedReadableFile(path)));
+
+  const attribution: ReportWorkerAttribution[] = [];
+  const seenAttribution = new Set<string>();
+  if (stateRel !== null) collectWorkerAttribution(resolvedState.state, stateRel, attribution, seenAttribution);
+  for (const path of stateFiles.filter(candidate => candidate.endsWith('.json'))) {
+    const value = readJsonRecord(path);
+    const evidence = projectRelative(scratchDir, path);
+    if (value !== null && evidence !== null) collectWorkerAttribution(value, evidence, attribution, seenAttribution);
+  }
+  attribution.sort((a, b) => a.evidence.localeCompare(b.evidence) || a.dispatch_id.localeCompare(b.dispatch_id));
+
+  const markers: ReportRuntimeMarker[] = [];
+  const pause = asRecord(resolvedState.state.pause);
+  const pauseKind = nonEmptyString(pause?.kind);
+  const pauseReason = nonEmptyString(pause?.reason);
+  if (stateRel !== null && (pauseKind !== null || pauseReason !== null)) {
+    markers.push({ kind: 'interruption', value: [pauseKind, pauseReason].filter(Boolean).join(': '), evidence: stateRel });
+  }
+  const stageCursor = nonEmptyString(resolvedState.state.stage_cursor);
+  const cursorEpoch = nonEmptyString(resolvedState.state.cursor_epoch)
+    ?? nonEmptyString(asRecord(asRecord(resolvedState.state.dispatch_capability)?.issued_for)?.cursor_epoch);
+  if (stateRel !== null && stageCursor !== null) {
+    markers.push({ kind: 'resume', value: `stage_cursor=${stageCursor}`, evidence: stateRel });
+  }
+  if (stateRel !== null && cursorEpoch !== null) {
+    markers.push({ kind: 'resume', value: `cursor_epoch=${cursorEpoch}`, evidence: stateRel });
+  }
+  const report: ReportWorkspaceEvidence = {
+    path: `specs/${featureId}`,
+    state_path: `.work-state/features/${featureId}/state.json`,
+    documents,
+    validation,
+    history,
+    handoff,
+    artifacts,
+    checkpoints,
+    checkpoint_transcripts: checkpointTranscripts,
+    worker_attribution: attribution,
+    interruption_resume: markers,
+  };
+  return {
+    report,
+    absolute_paths: [...new Set([...readable, ...stateFiles, ...checkpointTranscripts.map(path => join(scratchDir, path))])].sort(),
+  };
+}
+
+function readNextAction(raw: RawSessionJson, resolvedState: ResolvedFeatureState | null): ReportNextAction | undefined {
+  const specification = resolvedState === null ? null : asRecord(resolvedState.state.specification);
+  const candidate = asRecord(specification?.next_action) ?? asRecord(raw.next_action);
+  if (candidate === null) return undefined;
+  const kind = nonEmptyString(candidate.kind);
+  if (kind === null) return undefined;
+  const command = candidate.command === null ? null : nonEmptyString(candidate.command);
+  const reason = candidate.reason === null ? null : nonEmptyString(candidate.reason);
+  return { kind, command, reason };
 }
 
 /** Runtime-narrowed tty metadata from session.json (defaults when absent). */
@@ -295,14 +941,159 @@ function readTty(raw: unknown): { cols: number; rows: number; term: string } {
   const term = 'term' in raw && typeof raw.term === 'string' && raw.term.length > 0 ? raw.term : 'xterm-256color';
   return { cols, rows, term };
 }
-
 /** Runtime-narrowed scenario reference from session.json (null when absent). */
-function readScenarioRef(raw: unknown): { id: string; title?: string } | null {
+function readScenarioRef(raw: unknown): ReportScenarioReference | null {
   if (typeof raw !== 'object' || raw === null) return null;
-  const id = 'id' in raw && typeof raw.id === 'string' ? raw.id : 'unknown';
-  const title = 'title' in raw && typeof raw.title === 'string' ? raw.title : undefined;
-  return title !== undefined ? { id, title } : { id };
+  const record = raw as Record<string, unknown>;
+  const id = typeof record['id'] === 'string' ? record['id'] : 'unknown';
+  const title = typeof record['title'] === 'string' ? record['title'] : undefined;
+  const selectorsRecord = asRecord(record['selectors']);
+  const featureId = nonEmptyString(selectorsRecord?.['feature_id']);
+  const runKey = nonEmptyString(selectorsRecord?.['run_key']);
+  const selectors = featureId !== null && runKey !== null
+    ? { feature_id: featureId, run_key: runKey }
+    : undefined;
+  const workspace = asRecord(record['workspace']) as ScenarioWorkspacePaths | null;
+  const transcript = asRecord(record['transcript']) as ScenarioTranscriptExpectations | null;
+  return {
+    id,
+    ...(title !== undefined ? { title } : {}),
+    ...(selectors !== undefined ? { selectors } : {}),
+    ...(workspace !== null ? { workspace } : {}),
+    ...(transcript !== null ? { transcript } : {}),
+  };
 }
+interface DeclaredScenarioEvidence {
+  readonly observed: string[];
+  readonly missing: number;
+}
+
+function declaredScenarioEvidencePaths(
+  scratchDir: string,
+  scenario: ReportScenarioReference | null,
+): DeclaredScenarioEvidence {
+  if (scenario === null) return { observed: [], missing: 0 };
+  const declared: unknown[] = [];
+  const workspace = scenario.workspace;
+  const transcript = scenario.transcript;
+  if (workspace !== undefined) {
+    declared.push(
+      workspace.state_path,
+      ...(workspace.documents ?? []),
+      ...(workspace.validation ?? []),
+      ...(workspace.history ?? []),
+      ...(workspace.handoff ?? []),
+      ...(workspace.checkpoints ?? []),
+      ...(workspace.evidence ?? []),
+    );
+  }
+  if (transcript !== undefined) {
+    declared.push(
+      ...(transcript.checkpoints ?? []),
+      ...(transcript.workers ?? []),
+      ...(transcript.validation ?? []),
+      ...(transcript.history ?? []),
+      ...(transcript.handoff ?? []),
+      ...(transcript.interruption ?? []),
+      ...(transcript.resume ?? []),
+      ...(transcript.next_actions ?? []),
+    );
+  }
+  const observed: string[] = [];
+  let missing = 0;
+  for (const value of declared) {
+    if (typeof value !== 'string' || value.length === 0 || value.length > 2048) {
+      missing += 1;
+      continue;
+    }
+    const absolute = resolve(scratchDir, value);
+    if (projectRelative(scratchDir, absolute) === null || !boundedReadableFile(absolute)) {
+      missing += 1;
+      continue;
+    }
+    observed.push(absolute);
+  }
+  return { observed: [...new Set(observed)].sort(), missing };
+}
+function hasSymlinkAncestor(scratchDir: string, absolutePath: string): boolean {
+  const projectPath = projectRelative(scratchDir, absolutePath);
+  if (projectPath === null) return false;
+  let current = resolve(scratchDir);
+  for (const segment of projectPath.split('/')) {
+    current = join(current, segment);
+    try {
+      if (lstatSync(current).isSymbolicLink()) return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+function assertPassReadiness(
+  scratchDir: string,
+  rawSession: RawSessionJson,
+  declaredEvidence: DeclaredScenarioEvidence,
+  screenshots: readonly string[],
+  candidates: readonly string[],
+  requiredEvidence: readonly string[],
+): void {
+  const status = rawSessionStatus(rawSession);
+  const stoppedAt = rawLifecycleTimestamp(rawSession, 'stopped_at');
+  const finishedAt = rawLifecycleTimestamp(rawSession, 'finished_at');
+  const shutdownCompletedAt = rawLifecycleTimestamp(rawSession, 'shutdown_completed_at');
+  const shutdownError = rawShutdownError(rawSession);
+  if (status !== 'stopped'
+    || rawSession.pty_exit_observed !== true
+    || stoppedAt === null
+    || finishedAt === null
+    || shutdownCompletedAt === null
+    || stoppedAt !== finishedAt
+    || stoppedAt !== shutdownCompletedAt
+    || shutdownError !== null) {
+    throw new Error('ux-e2e: PASS requires a stopped session with exact shutdown proof and no shutdown error');
+  }
+  if (declaredEvidence.missing > 0) {
+    throw new Error(`ux-e2e: PASS requires all declared scenario evidence (${String(declaredEvidence.missing)} missing)`);
+  }
+  const missingScreenshots = screenshots.filter(path => {
+    const absolute = resolve(path);
+    if (projectRelative(scratchDir, absolute) === null || hasSymlinkAncestor(scratchDir, absolute)) return true;
+    try {
+      const info = lstatSync(absolute);
+      if (info.isSymbolicLink() || !info.isFile()) return true;
+    } catch {
+      return true;
+    }
+    return !boundedReadableFile(absolute);
+  });
+  if (missingScreenshots.length > 0) {
+    throw new Error(`ux-e2e: PASS requires all declared screenshots (${String(missingScreenshots.length)} missing)`);
+  }
+
+  const required = new Set(requiredEvidence.map(path => resolve(path)));
+  const candidateSet = new Set(candidates);
+  if ([...required].some(path => !candidateSet.has(path))) {
+    throw new Error('ux-e2e: PASS requires all declared evidence within the evidence file limit');
+  }
+  let totalBytes = 0;
+  for (const path of candidates) {
+    const size = boundedFileSize(path);
+    if (size === null) {
+      if (required.has(path)) {
+        throw new Error('ux-e2e: PASS requires all mandatory evidence to be bounded and readable');
+      }
+      continue;
+    }
+    if (size > MAX_EVIDENCE_BYTES - totalBytes) {
+      if (required.has(path)) {
+        throw new Error('ux-e2e: PASS requires all declared evidence within the aggregate evidence byte limit');
+      }
+      continue;
+    }
+    totalBytes += size;
+  }
+}
+
 
 /* ------------------------------------------------------------------ */
 /* Markdown                                                            */
@@ -314,44 +1105,99 @@ function formatTty(tty: ReportSessionMeta['tty']): string {
 
 function renderMarkdown(report: UxE2eReport): string {
   const lines: string[] = [];
-  lines.push(`# UX E2E Report — ${report.session.slug}`);
+  lines.push(`# UX E2E Report — ${sanitizeMarkdownInline(report.session.slug)}`);
   lines.push('');
   lines.push(`**Verdict:** ${report.verdict}  `);
   lines.push(`**Overall:** ${report.overall.score.toFixed(1)}/5 — ${report.overall.recommendation}  `);
-  lines.push(`**Generated:** ${report.generated_at}`);
+  lines.push(`**Generated:** ${sanitizeMarkdownInline(report.generated_at)}`);
   lines.push('');
   lines.push('## Session');
   lines.push('');
-  lines.push(`- slug: \`${report.session.slug}\``);
-  lines.push(`- scratch dir: \`${report.session.scratch_dir}\``);
-  lines.push(`- omp version: \`${report.session.omp_version}\``);
-  lines.push(`- profile: \`${report.session.profile}\``);
-  lines.push(`- tty: \`${formatTty(report.session.tty)}\``);
-  lines.push(`- started: \`${report.session.started_at ?? 'n/a'}\``);
-  lines.push(`- finished: \`${report.session.finished_at ?? 'n/a'}\``);
+  lines.push(`- status: \`${sanitizeMarkdownInline(report.session.status ?? 'unknown')}\``);
+  lines.push(`- stopped: \`${sanitizeMarkdownInline(report.session.stopped_at ?? 'n/a')}\``);
+  if (report.session.shutdown_error !== null) {
+    lines.push(`- shutdown error: ${sanitizeMarkdownInline(report.session.shutdown_error)}`);
+  }
+  lines.push(`- slug: \`${sanitizeMarkdownInline(report.session.slug)}\``);
+  lines.push(`- scratch dir: \`${sanitizeMarkdownInline(report.session.scratch_dir)}\``);
+  lines.push(`- omp version: \`${sanitizeMarkdownInline(report.session.omp_version)}\``);
+  lines.push(`- profile: \`${sanitizeMarkdownInline(report.session.profile)}\``);
+  lines.push(`- tty: \`${sanitizeMarkdownInline(formatTty(report.session.tty))}\``);
+  lines.push(`- started: \`${sanitizeMarkdownInline(report.session.started_at ?? 'n/a')}\``);
+  lines.push(`- finished: \`${sanitizeMarkdownInline(report.session.finished_at ?? 'n/a')}\``);
   if (report.session.scenario !== null) {
-    lines.push(`- scenario: \`${report.session.scenario.id}\`${report.session.scenario.title !== undefined ? ` — ${report.session.scenario.title}` : ''}`);
+    lines.push(`- scenario: \`${sanitizeMarkdownInline(report.session.scenario.id)}\`${report.session.scenario.title !== undefined ? ` — ${sanitizeMarkdownInline(report.session.scenario.title)}` : ''}`);
+  }
+  if (report.session.selectors !== undefined) {
+    lines.push(`- feature_id: \`${sanitizeMarkdownInline(report.session.selectors.feature_id ?? 'n/a')}\``);
+    lines.push(`- run_key: \`${sanitizeMarkdownInline(report.session.selectors.run_key ?? 'n/a')}\``);
+  }
+  if (report.session.workspace !== undefined) {
+    const workspace = report.session.workspace;
+    lines.push(`- specification workspace: \`${sanitizeMarkdownInline(workspace.path)}\``);
+    lines.push(`- specification state: \`${sanitizeMarkdownInline(workspace.state_path)}\``);
+  }
+  if (report.session.next_action !== undefined) {
+    const action = report.session.next_action;
+    lines.push(`- next action: \`${sanitizeMarkdownInline(action.kind)}\`${action.command !== null ? ` — \`${sanitizeMarkdownInline(action.command)}\`` : ''}${action.reason !== null ? ` — ${sanitizeMarkdownInline(action.reason)}` : ''}`);
   }
   if (report.session.task_prompt !== null) {
     lines.push('');
     lines.push('### Task prompt');
     lines.push('');
     lines.push('```');
-    lines.push(report.session.task_prompt.slice(0, 2000));
+    lines.push(sanitizeMarkdownBlock(report.session.task_prompt.slice(0, 2000)));
     lines.push('```');
   }
   lines.push('');
+  if (report.session.workspace !== undefined) {
+    const workspace = report.session.workspace;
+    lines.push('## Specification evidence');
+    lines.push('');
+    const groups: ReadonlyArray<readonly [string, readonly string[]]> = [
+      ['Documents', workspace.documents],
+      ['Validation', workspace.validation],
+      ['History', workspace.history],
+      ['Handoff', workspace.handoff],
+      ['Immutable artifacts', workspace.artifacts],
+      ['Checkpoint records', workspace.checkpoints],
+      ['Checkpoint transcripts', workspace.checkpoint_transcripts],
+    ];
+    for (const [label, paths] of groups) {
+      if (paths.length === 0) continue;
+      lines.push(`### ${label}`);
+      lines.push('');
+      for (const path of paths) lines.push(`- \`${sanitizeMarkdownInline(path)}\``);
+      lines.push('');
+    }
+    if (workspace.worker_attribution.length > 0) {
+      lines.push('### Worker attribution');
+      lines.push('');
+      for (const worker of workspace.worker_attribution) {
+        lines.push(`- \`${sanitizeMarkdownInline(worker.phase ?? 'unknown')}\` / \`${sanitizeMarkdownInline(worker.dispatch_id)}\` — role \`${sanitizeMarkdownInline(worker.role ?? 'unknown')}\`, agent \`${sanitizeMarkdownInline(worker.agent ?? 'unknown')}\` (\`${sanitizeMarkdownInline(worker.evidence)}\`)`);
+      }
+      lines.push('');
+    }
+    if (workspace.interruption_resume.length > 0) {
+      lines.push('### Interruption and resume');
+      lines.push('');
+      for (const marker of workspace.interruption_resume) {
+        lines.push(`- ${sanitizeMarkdownInline(marker.kind)}: \`${sanitizeMarkdownInline(marker.value)}\` (\`${sanitizeMarkdownInline(marker.evidence)}\`)`);
+      }
+      lines.push('');
+    }
+  }
   lines.push('## Overall');
   lines.push('');
   lines.push(`**Score:** ${report.overall.score.toFixed(1)}/5  `);
   lines.push(`**Recommendation:** ${report.overall.recommendation}`);
   lines.push('');
-  lines.push(report.overall.summary);
+  lines.push(sanitizeMarkdownBlock(report.overall.summary));
   lines.push('');
   if (report.regressions.length > 0) {
     lines.push('## Regressions');
     lines.push('');
-    for (const r of report.regressions) lines.push(`- ${r}`);
+    for (const r of report.regressions) lines.push(`- ${sanitizeMarkdownBlock(r)}`);
     lines.push('');
   }
   lines.push('## Steps');
@@ -362,7 +1208,7 @@ function renderMarkdown(report: UxE2eReport): string {
     const ratings = UX_DIMENSIONS.filter(d => step.ratings[d] !== undefined)
       .map(d => `${d}: ${String(step.ratings[d])}`)
       .join(', ');
-    lines.push(`| ${step.order} | ${step.name} | ${ratings || 'n/a'} | ${step.defects.join(', ') || '—'} |`);
+    lines.push(`| ${step.order} | ${sanitizeMarkdownInline(step.name)} | ${ratings || 'n/a'} | ${step.defects.map(sanitizeMarkdownInline).join(', ') || '—'} |`);
   }
   lines.push('');
   lines.push('## Defects');
@@ -371,16 +1217,16 @@ function renderMarkdown(report: UxE2eReport): string {
     lines.push('No defects recorded.');
   } else {
     for (const d of report.defects) {
-      lines.push(`### ${d.id} [${d.severity}] ${d.title}`);
+      lines.push(`### ${sanitizeMarkdownInline(d.id)} [${d.severity}] ${sanitizeMarkdownInline(d.title)}`);
       lines.push('');
-      lines.push(`- dimension: \`${d.dimension}\``);
-      lines.push(`- step: \`${d.step}\``);
-      if (d.repro !== undefined) lines.push(`- repro: \`${d.repro}\``);
-      if (d.notes !== undefined) lines.push(`- notes: ${d.notes}`);
+      lines.push(`- dimension: \`${sanitizeMarkdownInline(d.dimension)}\``);
+      lines.push(`- step: \`${sanitizeMarkdownInline(d.step)}\``);
+      if (d.repro !== undefined) lines.push(`- repro: \`${sanitizeMarkdownInline(d.repro)}\``);
+      if (d.notes !== undefined) lines.push(`- notes: ${sanitizeMarkdownBlock(d.notes)}`);
       if (d.evidence.length > 0) {
         lines.push('');
         lines.push('Evidence:');
-        for (const e of d.evidence) lines.push(`  - \`${e}\``);
+        for (const e of d.evidence) lines.push(`  - \`${sanitizeMarkdownInline(e)}\``);
       }
       lines.push('');
     }
@@ -389,7 +1235,7 @@ function renderMarkdown(report: UxE2eReport): string {
   lines.push('');
   lines.push(`**Rating:** ${report.agent_quality.rating}/5  `);
   lines.push('');
-  lines.push(report.agent_quality.rationale);
+  lines.push(sanitizeMarkdownBlock(report.agent_quality.rationale));
   if (report.agent_quality.dimensions !== undefined) {
     lines.push('');
     for (const dim of AGENT_DIMENSIONS) {
@@ -400,7 +1246,7 @@ function renderMarkdown(report: UxE2eReport): string {
   lines.push('');
   lines.push('## Evidence');
   lines.push('');
-  for (const e of report.evidence) lines.push(`- \`${e}\``);
+  for (const e of report.evidence) lines.push(`- \`${sanitizeMarkdownInline(e)}\``);
   lines.push('');
   return lines.join('\n');
 }
@@ -429,10 +1275,11 @@ export function generateReport(
   const scratchDir = resolve(sessionDir);
   const warnings: string[] = [];
   const rawSession = readSessionMeta(scratchDir);
-  const slug =
-    typeof rawSession.slug === 'string' && rawSession.slug.length > 0
-      ? rawSession.slug
-      : basename(scratchDir).replace(/^omp-ux-e2e-/u, '') || 'ux-e2e';
+  const rawSlug = typeof rawSession.slug === 'string' && rawSession.slug.length > 0 ? rawSession.slug : null;
+  const slug = rawSlug ?? (basename(scratchDir).replace(/^omp-ux-e2e-/u, '') || 'ux-e2e');
+  if (!safeFilenameSegment(slug)) {
+    throw new Error('ux-e2e: session slug must be a bounded safe filename segment');
+  }
 
   // Assign stable ids when the caller omitted them.
   const defects: UxDefect[] = input.defects.map((d, i) => ({
@@ -490,49 +1337,109 @@ export function generateReport(
   const eventsJsonl = join(stateDir, 'events.jsonl');
   const sessionJsonl = join(stateDir, 'session.jsonl');
 
+  const declared = declaredSelectorResolution(rawSession);
+  const resolvedState = resolveFeatureState(scratchDir, rawSession);
+  const selectors: ReportSelectors | undefined = resolvedState === null
+    ? (declared.pair === null ? undefined : declared.selectors)
+    : { feature_id: resolvedState.feature_id, run_key: resolvedState.run_key };
+  const scenario = readScenarioRef(rawSession.scenario);
+  const collectedWorkspace = resolvedState === null ? undefined : collectWorkspaceEvidence(scratchDir, resolvedState);
+  // Scenario workspace/transcript values are declarations only. They remain
+  // under session.scenario and become observed evidence only when the bounded
+  // collector independently reads the corresponding files.
+  const workspace = collectedWorkspace?.report;
+  const declaredEvidence = declaredScenarioEvidencePaths(scratchDir, scenario);
+  const observedWorkspacePaths = [...new Set([
+    ...(collectedWorkspace?.absolute_paths ?? []),
+    ...declaredEvidence.observed,
+  ])];
+  const nextAction = readNextAction(rawSession, resolvedState);
+
   const screenshots = clampedSteps.flatMap(s => s.screenshots);
-  let evidence = collectEvidence(scratchDir, screenshots);
-  if (opts.copyEvidence === true) {
-    const mdRoot = resolve(opts.mdDir ?? join(process.cwd(), 'vibe-report'));
-    evidence = copyEvidence(evidence, join(mdRoot, 'evidence', slug));
+  const ompLog = ompLogForSession(scratchDir, rawSession);
+  const candidates = evidenceCandidates(scratchDir, screenshots, observedWorkspacePaths, ompLog);
+  const requiredEvidence = [transcript, ...observedWorkspacePaths, ...screenshots];
+  if (input.verdict === 'PASS') {
+    assertPassReadiness(scratchDir, rawSession, declaredEvidence, screenshots, candidates, requiredEvidence);
   }
-  const report: UxE2eReport = {
-    type: 'ux-e2e',
-    schema_version: 1,
-    verdict: input.verdict,
-    mode: 'ui',
-    regressions: [...(input.regressions ?? [])],
-    session: {
-      slug,
-      scratch_dir: scratchDir,
-      omp_version: typeof rawSession.omp_version === 'string' ? rawSession.omp_version : 'unknown',
-      profile: typeof rawSession.profile === 'string' && rawSession.profile.length > 0 ? rawSession.profile : 'default',
-      tty: readTty(rawSession.tty),
-      started_at: typeof rawSession.started_at === 'string' ? rawSession.started_at : null,
-      finished_at: null,
-      task_prompt: typeof rawSession.task_prompt === 'string' ? sanitizeForJson(rawSession.task_prompt) : null,
-      scenario: readScenarioRef(rawSession.scenario),
-      transcript,
-      session_jsonl: sessionJsonl,
-      events_jsonl: eventsJsonl,
-      omp_log: newestOmpLog() ?? '',
-    },
-    steps: clampedSteps,
-    defects,
-    agent_quality: { ...input.agent_quality, rating: agentRating },
-    overall: { score, summary: input.overall.summary, recommendation },
-    evidence,
-    generated_at: new Date().toISOString(),
-  };
+  const sessionStatus = rawSessionStatus(rawSession);
+  const sessionStoppedAt = rawLifecycleTimestamp(rawSession, 'stopped_at');
+  const sessionFinishedAt = rawLifecycleTimestamp(rawSession, 'finished_at');
+  const sessionShutdownError = rawShutdownError(rawSession);
 
-  const jsonPath = join(stateDir, 'report.json');
-  mkdirSync(stateDir, { recursive: true });
   const mdDir = resolve(opts.mdDir ?? join(process.cwd(), 'vibe-report'));
-  mkdirSync(mdDir, { recursive: true });
-  const mdPath = join(mdDir, `${slug}-ux-e2e-${todayStamp()}.md`);
+  const reportDestination = pinOrCreateDirectory(mdDir);
+  if (reportDestination === null) {
+    throw new Error('ux-e2e: report destination root must be a stable non-symlink directory');
+  }
+  try {
+    let evidence = collectEvidence(candidates);
+    if (opts.copyEvidence === true) {
+      evidence = copyEvidence(evidence, join(mdDir, 'evidence', slug), scratchDir);
+    }
+    const report = sanitizeOutput({
+      type: 'ux-e2e',
+      schema_version: 1,
+      verdict: input.verdict,
+      mode: 'ui',
+      regressions: [...(input.regressions ?? [])],
+      session: {
+        slug,
+        scratch_dir: scratchDir,
+        omp_version: typeof rawSession.omp_version === 'string' ? rawSession.omp_version : 'unknown',
+        profile: typeof rawSession.profile === 'string' && rawSession.profile.length > 0 ? rawSession.profile : 'default',
+        tty: readTty(rawSession.tty),
+        status: sessionStatus,
+        started_at: typeof rawSession.started_at === 'string' ? rawSession.started_at : null,
+        stopped_at: sessionStoppedAt,
+        finished_at: sessionFinishedAt,
+        shutdown_error: sessionShutdownError,
+        task_prompt: typeof rawSession.task_prompt === 'string' ? sanitizeForJson(rawSession.task_prompt) : null,
+        scenario,
+        transcript,
+        session_jsonl: sessionJsonl,
+        events_jsonl: eventsJsonl,
+        omp_log: ompLog ?? '',
+        ...(selectors !== undefined ? { selectors } : {}),
+        ...(workspace !== undefined ? { workspace } : {}),
+        ...(nextAction !== undefined ? { next_action: nextAction } : {}),
+      },
+      steps: clampedSteps,
+      defects,
+      agent_quality: { ...input.agent_quality, rating: agentRating },
+      overall: { score, summary: input.overall.summary, recommendation },
+      evidence,
+      generated_at: new Date().toISOString(),
+    }, '') as UxE2eReport;
 
-  writeFileSync(jsonPath, JSON.stringify(report, null, 2) + '\n');
-  writeFileSync(mdPath, renderMarkdown(report));
+    const jsonPath = join(stateDir, 'report.json');
+    const stateDestination = pinOrCreateDirectory(stateDir);
+    if (stateDestination === null) {
+      throw new Error('ux-e2e: session report directory must be a stable non-symlink directory');
+    }
+    try {
+      if (!writePinnedFile(stateDestination, 'report.json', Buffer.from(JSON.stringify(report, null, 2) + '\n'))) {
+        throw new Error('ux-e2e: failed to write report.json inside the session directory');
+      }
+    } finally {
+      try {
+        closeSync(stateDestination.fd);
+      } catch {
+        /* Ignore cleanup failures. */
+      }
+    }
 
-  return { jsonPath, mdPath, warnings };
+    const mdFilename = `${slug}-ux-e2e-${todayStamp()}.md`;
+    const mdPath = join(mdDir, mdFilename);
+    if (!writePinnedFile(reportDestination, mdFilename, Buffer.from(renderMarkdown(report)))) {
+      throw new Error('ux-e2e: failed to write markdown inside the report destination');
+    }
+    return { jsonPath, mdPath, warnings };
+  } finally {
+    try {
+      closeSync(reportDestination.fd);
+    } catch {
+      /* Ignore cleanup failures. */
+    }
+  }
 }

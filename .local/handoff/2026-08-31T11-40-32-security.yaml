@@ -1,0 +1,51 @@
+id: 2026-08-31T11-40-32-security
+parent: null
+agent: security
+timestamp: "2026-08-31T11:40:32.092Z"
+status: completed
+
+context:
+  task: "Resolve the four constitution trusted-answer proof-binding failures from artifact://122."
+  phase: foundation-contracts
+
+output:
+  summary: "Corrected the test fixture to record against the exact persisted selected TeamState and return the unchanged persisted proof; production verification remains untouched."
+  vulnerabilities:
+    critical: 0
+    high: 0
+    medium: 0
+    low: 0
+  cargo_deny:
+    status: skipped
+    advisories: null
+    license_issues: null
+    reason: "Dependency audit was outside this assignment and validation was explicitly reserved for the CTO."
+  dependencies:
+    outdated: null
+    unmaintained: null
+    actions: []
+  unsafe_blocks:
+    total: 0
+    reviewed: 0
+    approved: 0
+    needs_refactor: 0
+  issues:
+    - severity: high
+      location: packages/core/test/specification-constitution.test.ts
+      issue: "The fixture recorded a trusted answer before writeState added the persisted work identity, making the returned proof stale against the selected ledger."
+      fix: "Resolve the persisted feature/run state, bind the exact checkpoint context, record once, persist recordTrustedCheckpointAnswer.state through that target, and assert the re-read answer/proof is identical."
+  files_changed:
+    - packages/core/test/specification-constitution.test.ts
+    - .work-state/artifacts/sdd-foundation/constitution-proof-final.json
+  verification:
+    method: "Source and persisted-contract inspection only; no validation command run per assignment."
+    commands_run: []
+
+next:
+  agent: null
+  task: "CTO reruns the reserved validation and consumes constitution-proof-final.json."
+  priority: high
+  acceptance_criteria:
+    - "Four positive constitution decisions verify against the persisted answer ledger."
+    - "Fabricated, cross-context, mismatched-decision, wrong-checkpoint, non-user, and revised-checkpoint reuse cases still reject."
+    - "No production proof verifier relaxation."

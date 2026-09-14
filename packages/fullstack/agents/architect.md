@@ -49,6 +49,7 @@ mcp__deepwiki__ask_question repoName="InsanusMokrassar/ktgbotapi" question="FSM 
 | Open-source architecture | DeepWiki |
 | Implementation examples | DeepWiki |
 
+
 ## What You Do
 
 ### 1. Architecture Decision

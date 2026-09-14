@@ -12,12 +12,13 @@
  *   --full          embed sanitized full artifact content (byte-capped)
  *
  * The command is a thin orchestration shell over the core report API:
- * `buildSessionReport` (normalization/redaction) → `renderReportHtml`
- * (pure renderer) → `writeReport` (enforces the .work-state boundary and
- * restrictive permissions). It never dispatches agents and never embeds
- * raw events/transcripts.
+ * `buildSessionReportPinned` (normalization/redaction) →
+ * `renderReportHtml` (pure renderer) → `writeReportPinned` (enforces the
+ * `.work-state` boundary and restrictive permissions).  One pinned project
+ * root is borrowed across all three stages.  It never dispatches agents and
+ * never embeds raw events/transcripts.
  *
- * Output paths (chosen here, enforced by core writeReport):
+ * Output paths (chosen here, enforced by core `writeReportPinned`):
  *   do-work feature → .work-state/features/<slug>/report.html
  *   do-work legacy  → .work-state/report.html
  *   cto run         → .work-state/cto/<runId>/report.html
@@ -25,7 +26,12 @@
 
 import type { CustomCommand, CustomCommandAPI } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/types";
 import type { HookCommandContext } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/types";
-import { buildSessionReport, renderReportHtml, writeReport } from "@andvl1/omp-workflows-core";
+import {
+  buildSessionReportPinned,
+  PinnedProjectRoot,
+  renderReportHtml,
+  writeReportPinned,
+} from "@andvl1/omp-workflows-core";
 import type {
   BuildSessionReportOptions,
   SessionReport,
@@ -112,25 +118,31 @@ const factory = (api: CustomCommandAPI): CustomCommand => ({
     const parsed = parseSessionReportArgs(args);
     if (parsed.error) return `ERROR: ${parsed.error}\n\n${USAGE}`;
 
-    let report: SessionReport;
+    const pin = PinnedProjectRoot.open(cwd);
+    if (!pin) return "ERROR: project root cannot be pinned for session report.\n\n" + USAGE;
     try {
-      report = buildSessionReport(cwd, parsed.selector, parsed.options);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return `ERROR: could not build session report: ${message}\n\n${USAGE}`;
-    }
+      let report: SessionReport;
+      try {
+        report = buildSessionReportPinned(cwd, parsed.selector, parsed.options, pin);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return `ERROR: could not build session report: ${message}\n\n${USAGE}`;
+      }
 
-    const target = sessionReportTargetPath(report);
-    let absolutePath: string;
-    try {
-      absolutePath = writeReport(cwd, target, renderReportHtml(report));
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return `ERROR: could not write report: ${message}`;
-    }
+      const target = sessionReportTargetPath(report);
+      let absolutePath: string;
+      try {
+        absolutePath = writeReportPinned(cwd, target, renderReportHtml(report), pin);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return `ERROR: could not write report: ${message}`;
+      }
 
-    ctx.ui?.notify?.(`session-report: ${report.meta.title} → ${target}`, "info");
-    return formatSessionReportStatus(report, absolutePath);
+      ctx.ui?.notify?.(`session-report: ${report.meta.title} → ${target}`, "info");
+      return formatSessionReportStatus(report, absolutePath);
+    } finally {
+      pin.close();
+    }
   },
 });
 

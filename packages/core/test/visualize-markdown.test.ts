@@ -3,7 +3,7 @@
  *
  * Golden tests over the architecture-1 fixture inventory plus the hand-built
  * golden models: spec-preparation detailed, bug-fix compact, unlisted safe
- * default, legacy/CTO (JSON + markdown-state degraded), slots/mid-consilium,
+ * default, legacy/CTO (JSON + markdown-state degraded), slots/native mid-tasks,
  * missing/pending/skipped/unreadable/empty, hostile content (Unicode, fences,
  * HTML-like, CRLF, deep/large) and hub scope statements (selected partial vs
  * --all complete).
@@ -268,38 +268,34 @@ test("markdown: spec-preparation detailed session page — structure, anchors, s
   // Stage progress with statuses and owned-artifact links.
   assert.ok(md.includes("### Workflow and stage progress"));
   for (const stage of session.stages) {
-    assert.ok(md.includes(`- **${stage.status}** ${mdEscape(stage.stageId)} — ${stage.title ?? stage.stageId}`), `stage ${stage.stageId}`);
+    const expectedStage = `- **${stage.status}** ${mdEscape(stage.stageId)}${stage.title ? ` — ${mdEscape(stage.title)}` : ""}`;
+    assert.ok(md.includes(expectedStage), `stage ${stage.stageId}`);
   }
-  assert.ok(md.includes("  - [spec\\_intake\\_repo\\_map\\-analyst](#viz-visualize-spec_intake_repo_map-analyst)"), "slot linked from its stage (id escaped in the label)");
+  assert.ok(md.includes("  - [specify\\_draft\\-analyst](#viz-visualize-specify_draft-analyst)"), "slot linked from its stage (id escaped in the label)");
 
-  // Semantic sections reachable from the overview with stable anchors.
+  // The native spec-preparation artifact remains reachable from the meaningful
+  // Decisions section; obsolete requirements/architecture/tasks artifacts are
+  // not part of this profile's current fixture.
   assert.ok(md.includes("### Sections"));
-  assert.ok(md.includes("[Requirements](#viz-visualize@requirements)"));
   assert.ok(md.includes("[Decisions and options](#viz-visualize@decisions)"));
-  assert.ok(md.includes("[Architecture](#viz-visualize@architecture)"));
-  assert.ok(md.includes("[Tasks](#viz-visualize@tasks)"));
   assert.ok(md.includes("[Artifacts](#viz-visualize@artifacts)"));
   assert.ok(md.includes("[Status details](#viz-visualize@status-details)"));
-  assert.ok(md.includes('<a id="viz-visualize@requirements"></a>'));
+  assert.ok(md.includes('<a id="viz-visualize@decisions"></a>'));
   assert.ok(md.includes('<a id="viz-visualize@status-details"></a>'));
-  assert.ok(md.includes("## Requirements"));
   assert.ok(md.includes("## Decisions and options"));
-  assert.ok(md.includes("## Architecture"));
-  assert.ok(md.includes("## Tasks"));
+  assert.ok(md.includes("## Artifacts"));
+  assert.ok(md.includes("## Status details"));
+  assert.ok(md.includes("- [spec\\-preparation](#viz-visualize-spec-preparation) — produced"));
 
-  // Semantic section content links into the artifact anchors.
-  assert.ok(md.includes("- [spec\\_requirements\\_edge\\_cases](#viz-visualize-spec_requirements_edge_cases) — produced"));
-  assert.ok(md.includes("- [spec\\_options\\_decisions](#viz-visualize-spec_options_decisions) — produced"));
-
-  // Slot artifacts render with their own anchors (slot suffixes are covered
-  // by the fs-built mid-consilium test, where the model carries slotFor).
-  assert.ok(md.includes("- [spec\\_intake\\_repo\\_map\\-analyst](#viz-visualize-spec_intake_repo_map-analyst) — produced"));
-  assert.ok(md.includes("### spec\\_intake\\_repo\\_map\\-analyst"), "slot artifact heading (escaped, data intact)");
+  // Slot artifacts render with their own anchors (slotFor identity is covered
+  // by the native mid-tasks filesystem test, where the model carries slotFor).
+  assert.ok(md.includes("- [specify\\_draft\\-analyst](#viz-visualize-specify_draft-analyst) — produced"));
+  assert.ok(md.includes("### specify\\_draft\\-analyst"), "slot artifact heading (escaped, data intact)");
 
   // Missing artifact: status-only block, explicit status, no source.
-  assert.ok(md.includes("### spec\\_completeness"), "missing artifact status-only heading");
-  assert.ok(md.includes("- [spec\\_completeness](#viz-visualize-spec_completeness) — missing"));
-  assert.match(md, /spec\\_completeness.*— missing — owner completeness\\_gate/s);
+  assert.ok(md.includes("### task\\_graph"), "missing artifact status-only heading");
+  assert.ok(md.includes("- [task\\_graph](#viz-visualize-task_graph) — missing"));
+  assert.match(md, /task\\_graph.*— missing — owner tasks/s);
 
   // Provenance + stale/regenerate absence (fresh).
   assert.ok(md.includes("### Provenance"));
@@ -314,7 +310,7 @@ test("markdown: spec-preparation detailed session page — structure, anchors, s
   assert.ok(md.includes("## Status details"));
   assert.ok(md.includes("- **Session status:** complete"));
   assert.ok(md.includes("## Warnings"));
-  assert.ok(md.includes("- declared artifact spec\\_completeness is missing"));
+  assert.ok(md.includes("- declared artifact task\\_graph is missing"));
   assert.ok(md.includes("- artifact spec\\_handoff is larger than the read window"), "oversized preview warning");
   assert.ok(md.includes("original bytes"), "warning body present (escaped)");
 
@@ -467,23 +463,23 @@ test("markdown: degraded markdown-state CTO page shows degraded status and reaso
   assert.deepEqual(preflightLinks(snapshot).deadLinks, []);
 });
 
-// ── Golden: slots / mid-consilium / missing / unreadable / empty ─────────────
+// ── Golden: slots / native mid-tasks / missing / unreadable / empty ──────────
 
-test("markdown: mid-consilium slots render with pending shared base", () => {
+test("markdown: native mid-tasks slots render with pending shared base", () => {
   const cwd = tmpWorkspace();
   try {
-    const input = caseInput("slots-mid-consilium");
+    const input = caseInput("slots-mid-tasks");
     materialize(cwd, input);
     const session = sessionOf(cwd, input);
     const md = renderSessionMarkdown(session);
     assertFencesClosed(md);
     assertOnlyAnchorTags(md);
 
-    assert.ok(md.includes("- [spec\\_architecture\\_tasks](#viz-consilium-spec_architecture_tasks) — pending"));
-    assert.ok(md.includes("- [spec\\_architecture\\_tasks\\-architect](#viz-consilium-spec_architecture_tasks-architect) — produced (slot of spec\\_architecture\\_tasks)"));
-    assert.ok(md.includes("- [spec\\_architecture\\_tasks\\-tech\\-researcher](#viz-consilium-spec_architecture_tasks-tech-researcher) — produced (slot of spec\\_architecture\\_tasks)"));
-    assert.ok(md.includes("\\(slot of spec\\_architecture\\_tasks\\)"), "slot artifact heading shows the base");
-    assert.ok(md.includes("shared artifact spec\\_architecture\\_tasks is pending: producer in\\_progress, slots present"));
+    assert.ok(md.includes("- [task\\_graph](#viz-tasks-task_graph) — pending"));
+    assert.ok(md.includes("- [task\\_graph\\-architect](#viz-tasks-task_graph-architect) — produced (slot of task\\_graph)"));
+    assert.ok(md.includes("- [task\\_graph\\-tech\\-researcher](#viz-tasks-task_graph-tech-researcher) — produced (slot of task\\_graph)"));
+    assert.ok(md.includes("\\(slot of task\\_graph\\)"), "slot artifact heading shows the base");
+    assert.ok(md.includes("shared artifact task\\_graph is pending: producer in\\_progress, slots present"));
 
     const snapshot = snapshotFor([session], "all");
     assertPageHrefsResolve(session, md, snapshot);
@@ -579,7 +575,7 @@ test("markdown: hostile identities (artifact ids, stage ids, owners, slot bases)
   const imgId = "<img src=x onerror=alert`1`>";
   const bracketId = "[b]`c`";
   const punctId = "a|b=c#d+e.f-g&j";
-  const slotId = "spec_intake_repo_map-analyst";
+  const slotId = "specify_draft-analyst";
   const ownerHostile = "own<er>`b`[x]";
   const ownerEmphasis = "own*er~x!y";
   const slotBase = "base<b>`s";
@@ -883,7 +879,7 @@ test("markdown: anchors are stable identity-based and disjoint across kinds", ()
   const md = renderSessionMarkdown(session);
   // Artifact anchors never collide with section anchors (@ is outside the
   // encoded-artifact alphabet).
-  assert.ok(md.includes('<a id="viz-visualize@requirements"></a>'));
-  assert.ok(!md.includes('id="viz-visualize@requirements-"'));
+  assert.ok(md.includes('<a id="viz-visualize@decisions"></a>'));
+  assert.ok(!md.includes('id="viz-visualize@decisions-"'));
   assert.doesNotMatch(md, /id="viz-visualize-@/, "no artifact anchor can carry the section separator");
 });

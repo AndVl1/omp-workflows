@@ -18,7 +18,13 @@
  * outbox whenever the channel is configured.
  */
 
-import { resolveChannelProfile } from "../cto/channels.js";
+import { statSync } from "node:fs";
+
+import {
+  EscalationConfigError,
+  resolveChannelProfile,
+  resolveValidatedChannelProfile,
+} from "../cto/channels.js";
 
 interface ToolCallEvent {
   toolName?: string;
@@ -34,6 +40,10 @@ export const OUTBOX_GATE_BLOCK_REASON =
   "Do NOT use ask — write the question as an escalation to `.work-state/cto/<runId>/outbox/<escId>.json` " +
   "(level question/decision, timeoutMs + default); the answer lands in `answers/<escId>.json` and the " +
   "CTO picks it up at the next checkpoint.";
+
+export const OUTBOX_GATE_CONFIG_BLOCK_REASON =
+  "cto-safety outbox gate: escalation channel configuration is blocked. " +
+  "Fix the explicitly marked read-write primary before using ask or the outbox.";
 
 /**
  * True when `.omp/escalation.json` resolves to a validated RW primary
@@ -60,9 +70,22 @@ export function outboxEnforcementGate(
 ): { block: true; reason: string } | undefined {
   try {
     if (event?.toolName !== "ask") return undefined;
-    if (!hasBidirectionalChannel(ctx.cwd)) return undefined;
+    if (!isUsableConfigRoot(ctx.cwd)) return { block: true, reason: OUTBOX_GATE_CONFIG_BLOCK_REASON };
+    const profile = resolveValidatedChannelProfile(ctx.cwd);
+    if (profile.direction !== "rw") return undefined;
     return { block: true, reason: OUTBOX_GATE_BLOCK_REASON };
-  } catch {
+  } catch (error) {
+    if (error instanceof EscalationConfigError) {
+      return { block: true, reason: OUTBOX_GATE_CONFIG_BLOCK_REASON };
+    }
     return undefined;
+  }
+}
+
+function isUsableConfigRoot(cwd: string): boolean {
+  try {
+    return statSync(cwd).isDirectory();
+  } catch {
+    return false;
   }
 }

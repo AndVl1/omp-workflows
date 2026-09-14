@@ -1,0 +1,1 @@
+{"command":"node --test --import tsx --test-name-pattern=T094 runtime test/spec-cto-execution.test.ts","cwd":"packages/e2e","exit":0,"duration_seconds":44,"totals":{"log_lines":9}}

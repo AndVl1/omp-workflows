@@ -1,0 +1,10 @@
+{
+  "scenario": "T061 runtime: a complete generic bundle reaches exactly one compatibility checkpoint and the shared imported handoff",
+  "command": "OMP_UX_E2E_SEMANTIC_TIMEOUT_MS=86400000 OMP_UX_E2E_PRESERVE_ON_FAILURE=1 node --test --import tsx --test-name-pattern=\"T061 runtime: a complete generic bundle reaches exactly one compatibility checkpoint and the shared imported handoff\" test/spec-import.test.ts",
+  "cwd": "packages/e2e",
+  "status": "FAIL",
+  "tests": {"selected": 1, "passed": 0, "failed": 0, "cancelled": 1, "skipped": 0},
+  "runtime": {"omp_version": "omp/18.1.11", "pty": true, "mock": false, "started_at": "2026-09-07T23:06:12.780Z", "stopped_at": "2026-09-07T23:21:28.442Z", "duration_seconds": 915.662, "stop": "npm run e2e -- stop <owned scratch path>"},
+  "failure": {"phase": "compatibility_approval", "state_cursor": "compatibility_approval", "state_status": "in_progress", "handoff_status": "pending", "root_cause": "the real OMP PTY was no longer live before the compatibility approval decision resolved; the validator was then ended after the project stop API reported no live session, and no imported handoff was finalized", "approval": "not completed", "provenance": "captured in compatibility_report.json before stop", "child_leak": false},
+  "evidence": {"raw_pty_transcript": "scratch/.work-state/ux-e2e/transcript.jsonl", "session": "scratch/.work-state/ux-e2e/session.json", "state": "scratch/.work-state/features/imported-payment-retry/state.json", "compatibility_report": "scratch/.work-state/features/imported-payment-retry/artifacts/compatibility_report.json", "import_snapshot": "scratch/.work-state/features/imported-payment-retry/artifacts/import_snapshot.json", "stop_log": "t061-stop.log", "raw_test_log": "not captured: initial tee path was relative to packages/e2e; scratch transcript is preserved"}
+}

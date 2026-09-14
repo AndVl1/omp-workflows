@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  appendWave,
+  applyAppendWaveTransition,
   migrateCtoState,
   newCtoState,
   setCtoControlPlane,
@@ -12,7 +12,7 @@ import {
 } from "../src/cto/state.js";
 import { writeState } from "../src/engine/state.js";
 import type { CtoState, TeamPlan } from "../src/cto/types.js";
-import type { CompletionIntent, WorkIdentity, TeamState } from "../src/engine/types.js";
+import type { CompletionEnvelope, CompletionIntent, WorkIdentity, TeamState } from "../src/engine/types.js";
 
 const identity: WorkIdentity = {
   run_id: "run-control-plane",
@@ -33,7 +33,7 @@ const identity: WorkIdentity = {
 
 const completionIntent: CompletionIntent = {
   mode: "complete_outcome",
-  acceptance: "dod_and_artifacts",
+  acceptance: "quality_gates_and_artifacts",
   source: "workflow_policy",
   rationale: "The workflow records a completed outcome independently from consent.",
 };
@@ -73,7 +73,7 @@ function freshState(): CtoState {
 }
 
 test("cto control-plane: malformed typed fields quarantine with provenance and preserve the value", () => {
-  const malformedCompletionIntent = { mode: "not-a-completion-mode", acceptance: "dod_and_artifacts" };
+  const malformedCompletionIntent = { mode: "not-a-completion-mode", acceptance: "explicit_human_acceptance" };
   const migrated = migrateCtoState({
     ...freshState(),
     completion_intent: malformedCompletionIntent,
@@ -102,6 +102,33 @@ test("cto control-plane: setters validate before merge and preserve state on inv
   assert.equal(JSON.stringify(state.teams), teamBefore, "invalid team patch must not partially mutate any team");
 });
 
+test("cto control-plane: lifecycle projections cannot bind to a stale work identity", () => {
+  const state = freshState();
+  const staleEnvelope: CompletionEnvelope = {
+    schema_version: 1,
+    identity: { ...identity, dispatch_id: "stale-dispatch" },
+    outcome: "succeeded",
+    terminal_signal: "workflow_complete",
+    artifact_refs: [],
+    evidence_ref: null,
+    conflict_ref: null,
+    completed_by: "workflow_complete",
+    emitted_at: "2026-08-25T00:00:00.000Z",
+  };
+  assert.throws(
+    () => setCtoControlPlane(state, { work_identity: identity, completion_envelope: staleEnvelope }),
+    /stale for the current work identity/u,
+  );
+  assert.equal(state.work_identity, undefined);
+  assert.equal(state.completion_envelope, undefined);
+  assert.throws(
+    () => setTeamControlPlane(state, "backend", { work_identity: identity, completion_envelope: staleEnvelope }),
+    /stale for the current work identity/u,
+  );
+  assert.equal(state.teams.find((team) => team.id === "backend")?.work_identity, undefined);
+  assert.equal(state.teams.find((team) => team.id === "backend")?.completion_envelope, undefined);
+});
+
 test("cto control-plane: valid setters merge and undefined metadata patches do not erase existing values", () => {
   const state = freshState();
   state.control_plane_status = { stage: "pending", lifecycle: "pending", pause: "none", reason: "awaiting dispatch" };
@@ -119,7 +146,7 @@ test("cto control-plane: valid setters merge and undefined metadata patches do n
 
 test("cto control-plane: appendWave validates and stamps work identity, then deduplicates source_id", () => {
   const state = freshState();
-  appendWave(state, {
+  const admitted = applyAppendWaveTransition(state, {
     id: "wave-1",
     source: "test",
     source_id: "message-1",
@@ -127,21 +154,35 @@ test("cto control-plane: appendWave validates and stamps work identity, then ded
     work_identity: identity,
     now: "2026-08-25T00:00:01.000Z",
   });
-  assert.deepEqual(state.wave_history?.[0]?.work_identity, identity);
-  const historyAfterFirst = JSON.stringify(state.wave_history);
+  assert.deepEqual(admitted.wave_history?.[0]?.work_identity, identity);
+  const historyAfterFirst = JSON.stringify(admitted.wave_history);
 
-  appendWave(state, {
-    id: "wave-duplicate",
+  const replay = applyAppendWaveTransition(admitted, {
+    id: "wave-1",
     source: "test",
     source_id: "message-1",
-    task: "duplicate task",
-    work_identity: { ...identity, wave_id: "wave-duplicate" },
+    task: "wave task",
+    work_identity: identity,
     now: "2026-08-25T00:00:02.000Z",
   });
-  assert.equal(JSON.stringify(state.wave_history), historyAfterFirst, "duplicate transport source must be idempotent");
+  assert.equal(replay, admitted, "exact duplicate transport source must return the same state object");
+  assert.equal(JSON.stringify(replay.wave_history), historyAfterFirst, "exact duplicate transport source must be idempotent");
+  const changedReplayBefore = JSON.stringify(admitted);
+  assert.throws(
+    () => applyAppendWaveTransition(admitted, {
+      id: "wave-duplicate",
+      source: "test",
+      source_id: "message-1",
+      task: "duplicate task",
+      work_identity: { ...identity, wave_id: "wave-duplicate" },
+      now: "2026-08-25T00:00:02.000Z",
+    }),
+    /replay does not match/,
+  );
+  assert.equal(JSON.stringify(admitted), changedReplayBefore, "changed duplicate replay must not mutate state");
 
   assert.throws(
-    () => appendWave(state, {
+    () => applyAppendWaveTransition(admitted, {
       id: "wave-invalid",
       source: "test",
       source_id: "message-2",

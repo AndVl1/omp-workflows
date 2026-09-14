@@ -1,0 +1,35 @@
+{
+  "session_id": "01a063ce-a29b-74b5-8c6b-f4fc45b6bee8",
+  "selected_ask": {
+    "tool": "write",
+    "path": "xd://workflow_checkpoint_ask_selected",
+    "started_at": "2026-09-02T20:28:51.636Z",
+    "feature_id": "imported-payment-retry",
+    "run_key": "import-89a9e6b4-ccc0-406e-ac78-2631b1d74814",
+    "workflow": "spec-import",
+    "stage_cursor": "compatibility_approval",
+    "checkpoint": "import_compatibility_approval",
+    "checkpoint_id": "import_compatibility_approval",
+    "checkpoint_kind": "custom",
+    "capability_id": "1489b658-2aa3-4306-92ea-e61677a7c2f2",
+    "advance_token": "e4460d0c-b4f0-422d-8c3f-ec81afa742ec",
+    "profile_hash": "e6de792059dc5595edebf9e142ce2607",
+    "branch": "main",
+    "loop_iteration": 1,
+    "snapshot_id": "import.52cae95c6359620288b1b25a26ffa31e025a575140c16c02b498898e108764fa",
+    "source_sha256": "8741a468b5a854d7d5643fc9ead3741f9b2a1891ac550888fdeeab95e3f32c8b",
+    "normalized_hash": "90aaf3e1cf70e310ac08a1f0208062f13ef28fed123751c3aab87a6c701fe2c3",
+    "constitution_content_sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+    "compatibility_report_id": "compatibility.d237bd55cf43cbf06d89a1c35bc2254a658c2a72a1e9aee5326997cdb876f53e",
+    "allowed_decisions": ["approve_continue", "request_changes", "approve_stop"]
+  },
+  "outcome": {
+    "session_exit_reason": "sighup",
+    "session_exit_at": "2026-09-02T20:42:59.903Z",
+    "tool_result": "Aborted: The operation was aborted.",
+    "approval_returned": false,
+    "advance_returned": false,
+    "ready_handoff_returned": false
+  },
+  "source": "omp-agent durable transcript and ux-e2e transcript"
+}

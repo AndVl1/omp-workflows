@@ -1,0 +1,1 @@
+{"command":"OMP_UX_E2E_SEMANTIC_TIMEOUT_MS=600000 OMP_UX_E2E_PRESERVE_ON_FAILURE=1 node --test --import tsx --test-name-pattern=complete generic bundle test/spec-import.test.ts","cwd":"packages/e2e","exit":1,"duration_seconds":604,"totals":{"log_lines":21}}

@@ -1,0 +1,45 @@
+id: 2026-08-31T09-07-25-debug
+parent: null
+agent: debug
+timestamp: "2026-08-31T09:07:25"
+status: blocked
+context:
+  task: "Foundation compile remediation candidate generation for engine state/run/index/durable and specification validation"
+  phase: "001"
+output:
+  modified_files:
+    - .work-state/artifacts/sdd-foundation/compile-remediation.json
+  candidate_files:
+    - packages/core/src/engine/run.ts
+    - packages/core/src/engine/state.ts
+    - packages/core/src/engine/index.ts
+    - packages/core/src/engine/durable.ts
+    - packages/core/src/specification/validation.ts
+  candidate_artifacts:
+    validation: artifact://74
+    state: artifact://75
+    index: artifact://76
+    durable: artifact://77
+    run: "persistent node REPL variable runFull; sha256 32cd27cf322519c350f52690036acc3de2907bc27c7398c239fbfb2a4b1cc421; 20390 bytes"
+  remediation_record: .work-state/artifacts/sdd-foundation/compile-remediation.json
+  changes:
+    - "state: remove duplicate atomicWrite; explicit feature_id/run_key target resolver with path containment and run binding"
+    - "run: import DispatchSlot; validate selectors before state read; preserve workspace specification; feature target and durable selector forwarding"
+    - "index: value z import; selector forwarding; constitution continuation gate registration; nullable record guard; duplicate MigrationReceipt export removal"
+    - "durable: explicit selectors threaded through state lookup and transitions"
+    - "validation: node:crypto createHash import"
+  blocked_actions:
+    - "Tracked source edits fail EPERM through available REPL; parent must use edit-capable worker"
+    - "Only three named probe deletions attempted; REPL deletion failed EPERM"
+  probes:
+    - packages/core/src/specification/.write-probe
+    - packages/core/src/specification/.write-probe:2
+    - packages/core/src/specification/.write-probe:raw
+next:
+  agent: null
+  task: "Apply exact candidate files with edit-capable worker; remove only the three named probes; CTO performs one project validation after both remediation workers settle."
+  priority: high
+  acceptance_criteria:
+    - "Candidates applied without touching frozen workspace.ts, templates.ts, or artifact-contract.ts"
+    - "Only three named worker-created probe files removed"
+    - "No formatter, linter, build, typecheck, or tests run by this worker"

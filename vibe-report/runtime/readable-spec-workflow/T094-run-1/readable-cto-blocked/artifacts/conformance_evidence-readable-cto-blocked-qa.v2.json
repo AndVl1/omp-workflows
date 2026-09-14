@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "artifact_id": "conformance_evidence-readable-cto-blocked-qa.v2",
+  "entries": [
+    {
+      "evidence_id": "readable-cto-blocked-qa-v2-executed-test-fr-1",
+      "kind": "executed_test",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-3f02fb822c43095d7a271d42e0dd0695",
+      "test": {
+        "evidence_ref": {
+          "artifact_id": "conformance_evidence-readable-cto-blocked-qa-support.v2",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/conformance_evidence-readable-cto-blocked-qa-support.v2.json",
+          "sha256": "7abeea9461925d8cf2cda2b3804f8b42ea34f62fb3ff747187b95365ea05eb44",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        },
+        "test_kind": "runtime",
+        "status": "fail",
+        "executed_at": "2026-09-05T00:00:00.000Z"
+      },
+      "intent_message": "No invocation or output contract exists for FR-1: the generic handoff does not specify one, specs/feature-one/spec.md is absent, and src/blocked/** is absent. No command was invented or run; the support artifact records the explicit blocked review finding.",
+      "recorded_at": "2026-09-05T00:00:00.000Z"
+    },
+    {
+      "evidence_id": "readable-cto-blocked-qa-v2-executed-test-ac-1",
+      "kind": "executed_test",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "5abbcdd582d13b1c95aa412c82d6568ba8badcd8dc2d58ae495c20d3f8fa1646",
+      "execution_claim_id": "claim-3f02fb822c43095d7a271d42e0dd0695",
+      "test": {
+        "evidence_ref": {
+          "artifact_id": "conformance_evidence-readable-cto-blocked-qa-support.v2",
+          "path": ".work-state/features/readable-cto-blocked/artifacts/conformance_evidence-readable-cto-blocked-qa-support.v2.json",
+          "sha256": "7abeea9461925d8cf2cda2b3804f8b42ea34f62fb3ff747187b95365ea05eb44",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        },
+        "test_kind": "runtime",
+        "status": "fail",
+        "executed_at": "2026-09-05T00:00:00.000Z"
+      },
+      "intent_message": "No invocation or output contract exists for AC-1: the generic handoff does not specify one, specs/feature-one/spec.md is absent, and src/blocked/** is absent. No command was invented or run; the support artifact records the explicit blocked review finding.",
+      "recorded_at": "2026-09-05T00:00:00.000Z"
+    }
+  ]
+}

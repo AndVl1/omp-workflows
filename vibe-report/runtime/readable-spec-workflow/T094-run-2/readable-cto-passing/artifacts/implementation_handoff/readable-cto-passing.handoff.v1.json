@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "handoff_id": "readable-cto-passing.handoff.v1",
+  "handoff_digest": "7644909b7d17135edef84221f57709f0cff3d853e11fa51500c0ee2aa02c9ab7",
+  "feature_id": "readable-cto-passing",
+  "source_kind": "native",
+  "artifact_versions": [
+    {
+      "artifact_id": "specify.v1",
+      "kind": "specify",
+      "version": 1,
+      "sha256": "7a9d9edd72255e8796f7bde9d00325043b205437f69ed24cb141076ed43da58a"
+    },
+    {
+      "artifact_id": "plan.v1",
+      "kind": "plan",
+      "version": 1,
+      "sha256": "edf9e1067d77cb52249eb28df3673a53dc1168801db934fb6eac8f46de5ab5b7"
+    },
+    {
+      "artifact_id": "tasks.v1",
+      "kind": "tasks",
+      "version": 1,
+      "sha256": "662d3f370b33ec2ad9559ac5357ff6df5e960ea0e231118f03df7e08e6e40c80"
+    }
+  ],
+  "scope": {
+    "in_scope": [
+      "src/passing/**"
+    ],
+    "out_of_scope": [
+      "unrelated refactors"
+    ],
+    "constraints": [
+      "same-branch serialized ownership"
+    ]
+  },
+  "requirements": [
+    {
+      "requirement_id": "FR-1",
+      "statement": "Running node src/passing/index.js with no arguments exits with code 0 and emits exactly {\"status\":\"completed\",\"outcome\":\"requested outcome completed\"} followed by a newline.",
+      "acceptance_ids": [
+        "AC-1"
+      ],
+      "source_refs": [
+        "specs/readable-cto-passing/spec.md#requirements"
+      ]
+    }
+  ],
+  "decisions": [
+    {
+      "decision_id": "D-1",
+      "decision": "Use the existing durable engine for state.",
+      "rationale": "One engine; no second state machine.",
+      "requirement_ids": [
+        "FR-1"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "task_id": "T-1",
+      "title": "Implement the outcome and produce typed conformance evidence",
+      "requirement_ids": [
+        "FR-1"
+      ],
+      "depends_on": [],
+      "expected_outcome": "Running node src/passing/index.js with no arguments exits 0 and emits the exact completed JSON line; the lead passes the typed evidence contract verbatim to implementation and QA evidence workers.",
+      "affected_scope": [
+        "src/passing/**"
+      ],
+      "completion_evidence": [
+        "Run node src/passing/index.js and record exit code 0 plus the exact JSON output.",
+        "focused test run proving the outcome",
+        "Persist the canonical conformance_evidence envelope at .work-state/features/<feature_id>/artifacts/<artifact_id>.json and reference that exact feature-local path; do not use a team-level .work-state/artifacts mirror.",
+        "Canonical conformance_evidence envelope has exactly schema_version, artifact_id, and entries; do not add top-level provenance.",
+        "The CTO conformance call wraps every submitted evidence entry with an artifact: CompletionArtifactRef, and every executed_test entry has test.evidence_ref: CompletionArtifactRef.",
+        "Pass this evidence contract verbatim from the lead to both implementation and QA evidence workers."
+      ],
+      "parallel_safe": false
+    }
+  ],
+  "verification": [
+    {
+      "verification_id": "V-1",
+      "requirement_ids": [
+        "FR-1"
+      ],
+      "acceptance_ids": [
+        "AC-1"
+      ],
+      "task_ids": [
+        "T-1"
+      ],
+      "observable_behavior": true,
+      "expected_evidence": "Run node src/passing/index.js; record exit code 0 and the exact JSON output. The lead passes the exact conformance_evidence envelope schema guidance to implementation and QA evidence workers; the CTO conformance call wraps every entry with CompletionArtifactRef and every executed_test has test.evidence_ref: CompletionArtifactRef."
+    }
+  ],
+  "validation_refs": [
+    "validation.specify.v1",
+    "validation.plan.v1",
+    "validation.tasks.v1"
+  ],
+  "approval_refs": [
+    "checkpoint.specify.v1",
+    "checkpoint.plan.v1",
+    "checkpoint.tasks.v1"
+  ],
+  "language": "en-US",
+  "constitution_binding": {
+    "provider_id": "native",
+    "path": "CONSTITUTION.md",
+    "version": "1.0.0",
+    "content_sha256": "cdcb2e42d8a081ea54a4d76e9301691beff67fead73d7fefd3766eaad62ffb12",
+    "semantic_hash": "c1bc1e90b30b8fc005de456aae9dc20d9044036a78841063103f23e49514599c",
+    "validation_ref": "constitution.validation.cdcb2e42d8a081ea54a4d76e9301691beff67fead73d7fefd3766eaad62ffb12",
+    "bound_at": "2026-08-31T12:00:00.000Z"
+  },
+  "constitution_impact_ref": null,
+  "risks": [],
+  "open_decisions": [],
+  "execution_choices": [
+    "do-work",
+    "cto"
+  ],
+  "status": "ready",
+  "import_snapshot_ref": null,
+  "compatibility_supplement_ref": null
+}

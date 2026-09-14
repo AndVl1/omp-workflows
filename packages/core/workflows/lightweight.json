@@ -4,7 +4,7 @@
   "description": "QUICK features. No parallel exploration or architecture options. Implement + quick review.",
   "completion_intent": {
     "mode": "complete_outcome",
-    "acceptance": "dod_and_artifacts",
+    "acceptance": "quality_gates_and_artifacts",
     "source": "workflow_policy",
     "rationale": "Lightweight workflows complete the bounded quick-task outcome with durable artifacts and DoD evidence."
   },
@@ -64,6 +64,7 @@
       "type": "single",
       "role": "qa",
       "consumes": ["implementation", "review"],
+      "gate": "qa_reported_pass",
       "produces": "qa_tests"
     },
     {

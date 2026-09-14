@@ -1,0 +1,24 @@
+{
+  "schema": 2,
+  "feature_id": "readable-cto-blocked",
+  "project_root_identity": {
+    "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-z6TScn/omp-spec-e2e-cto-exec-wave",
+    "dev": 16777234,
+    "ino": 95982592
+  },
+  "workspace_path_binding_digest": "129343552a87bf14ded7b6f97db51e675b06df04ec0f7d17b384a8fbb8a88a2f",
+  "claim_directory_identity": {
+    "relative_path": ".work-state/features/readable-cto-blocked/artifacts/execution_claim",
+    "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-z6TScn/omp-spec-e2e-cto-exec-wave/.work-state/features/readable-cto-blocked/artifacts/execution_claim",
+    "dev": 16777234,
+    "ino": 95983523
+  },
+  "next_directory_identity": {
+    "relative_path": ".work-state/features/readable-cto-blocked/artifacts/execution_claim/next",
+    "canonical_path": "/private/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-z6TScn/omp-spec-e2e-cto-exec-wave/.work-state/features/readable-cto-blocked/artifacts/execution_claim/next",
+    "dev": 16777234,
+    "ino": 95983528
+  },
+  "journal_format": "legacy-chain-v1+wal-v2",
+  "legacy_tail_digest": null
+}

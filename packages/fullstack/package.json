@@ -1,6 +1,6 @@
 {
   "name": "@andvl1/omp-workflows-fullstack",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "description": "Default team agents and skills for omp-workflows with extension-owned workflow commands and project-local compatibility commands. Pulls @andvl1/omp-workflows-core as peer.",
   "type": "module",
   "license": "MIT",
@@ -11,9 +11,21 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./activation-marker": {
+      "types": "./dist/activation-marker.d.ts",
+      "import": "./dist/activation-marker.js"
+    },
+    "./adapters": {
+      "types": "./dist/adapters/index.d.ts",
+      "import": "./dist/adapters/index.js"
+    },
     "./lecture-acquisition/eval": {
       "types": "./dist/lecture-acquisition/eval.d.ts",
       "import": "./dist/lecture-acquisition/eval.js"
+    },
+    "./model-roles": {
+      "types": "./dist/model-roles.d.ts",
+      "import": "./dist/model-roles.js"
     },
     "./commands": "./commands/",
     "./commands/*": "./commands/*"
@@ -39,16 +51,15 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.commands.json",
     "typecheck:commands": "tsc --noEmit -p tsconfig.commands.json",
-    "test": "node --test --import tsx test/*.test.ts",
+    "test": "node --test --import tsx --import ./test/mock-registration.ts test/*.test.ts",
     "copy-commands": "node scripts/copy-commands.mjs",
-    "postinstall": "node scripts/copy-commands.mjs || true",
     "prepublishOnly": "npm run build && npm run typecheck"
   },
   "bin": {
     "omp-workflows-copy-commands": "scripts/copy-commands.mjs"
   },
   "peerDependencies": {
-    "@andvl1/omp-workflows-core": "^0.26.0",
+    "@andvl1/omp-workflows-core": "^0.27.0",
     "@oh-my-pi/pi-coding-agent": "*"
   },
   "devDependencies": {

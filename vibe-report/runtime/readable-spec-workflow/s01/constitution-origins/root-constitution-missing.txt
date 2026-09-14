@@ -1,0 +1,1 @@
+CONSTITUTION.md was not materialized at scratch root; gate provider.path was CONSTITUTION.md.

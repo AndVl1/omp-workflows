@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { agentMappingPath, resetWorkflowOwners, resolveConfig } from "@andvl1/omp-workflows-core";
 
+import { agentMappingPath, resolveConfig } from "@andvl1/omp-workflows-core";
 import ompWorkflowsInternal from "../src/index.js";
 import {
 	ALLOWED_POOL_AGENTS,
@@ -17,6 +17,7 @@ import {
 	type InternalAgentDiscovery,
 	type InternalDiscoveredAgent,
 } from "../src/pool.js";
+import { captureWorkspaceActivation } from "../src/activation.js";
 import { loadOmpWorkflowProfiles } from "../src/profiles.js";
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -372,11 +373,12 @@ test("begin seam re-checks current markers before joining an in-flight refresh",
 	// The seam must reject on CURRENT markers, not join the in-flight
 	// refresh that started while the workspace was still marked.
 	await assert.rejects(waitForInternalAgentMappings(root), /activation_markers_missing/);
-	// Restore markers so the in-flight refresh (started while marked)
-	// settles cleanly; every later seam call re-checks markers regardless.
+	// Recreating the marker path gives it a new physical identity. The
+	// retained snapshot must reject the in-flight refresh rather than accept
+	// a same-path replacement under the old authority.
 	mkdirSync(join(root, "packages", "fullstack"), { recursive: true });
 	release();
-	assert.ok(await inFlight);
+	await assert.rejects(inFlight, /activation_identity_changed/);
 });
 
 // ── In-flight marker race (W004-MAPPING-FRESHNESS): publish-time re-check ─────
@@ -421,6 +423,47 @@ test("markers lost during in-flight discovery fail the refresh closed and force 
 	};
 	assert.deepEqual(persisted.available_agents, revived.available_agents, "the persisted write-through is the new mapping");
 	assert.equal(resolveConfig(root).agent_mapping?.preferences_hash, revived.preferences_hash, "core accepts only the newly published mapping");
+});
+
+test("retained activation snapshot rejects a same-path root replacement before mapping write", async () => {
+	const root = markedRoot(testRoles());
+	const captured = captureWorkspaceActivation(root);
+	assert.equal(captured.ok, true);
+	if (!captured.ok) return;
+	let release!: () => void;
+	const gated = new Promise<void>((resolveGate) => {
+		release = resolveGate;
+	});
+	const inFlight = refreshInternalAgentMappings(root, captured.snapshot, async () => {
+		await gated;
+		return { agents: [...poolRecords(), ...foreignRecords()] };
+	});
+	const joined = waitForInternalAgentMappings(root, captured.snapshot);
+
+	// Replace the directory at the exact same pathname while discovery is
+	// suspended. The replacement carries valid markers, but a new dev+ino.
+	const original = `${root}-original`;
+	const replacement = markedRoot(testRoles());
+	renameSync(root, original);
+	renameSync(replacement, root);
+	release();
+
+	await assert.rejects(inFlight, /activation_identity_changed/);
+	await assert.rejects(joined, /activation_identity_changed/);
+	assert.equal(existsSync(agentMappingPath(root)), false, "the raced activation never writes into the replacement root");
+	assert.equal(existsSync(agentMappingPath(original)), false, "the old generation has no persisted mapping");
+
+	// A fresh activation snapshot is a distinct cache generation and may now
+	// derive the replacement workspace normally.
+	const replacementCapture = captureWorkspaceActivation(root);
+	assert.equal(replacementCapture.ok, true);
+	if (!replacementCapture.ok) return;
+	const revived = await waitForInternalAgentMappings(root, replacementCapture.snapshot, poolDiscovery());
+	assert.equal(revived.resolved_roles["qa"], "omp-qa");
+	assert.equal(existsSync(agentMappingPath(root)), true, "only the replacement activation may publish its mapping");
+
+	rmSync(original, { recursive: true, force: true });
+	rmSync(root, { recursive: true, force: true });
 });
 
 test("a begin-seam joiner of an in-flight refresh rejects when markers vanish before publish", async () => {
@@ -546,7 +589,6 @@ function makePi() {
 }
 
 test("session_start starts the mapping refresh for a marked session without default discovery", async () => {
-	resetWorkflowOwners();
 	const root = markedRoot(testRoles());
 	let release!: () => void;
 	const gated = new Promise<void>((resolveGate) => {
@@ -573,7 +615,6 @@ test("session_start starts the mapping refresh for a marked session without defa
 });
 
 test("session_start starts nothing for an unmarked session", async () => {
-	resetWorkflowOwners();
 	const root = mkdtempSync(join(tmpdir(), "omp-internal-mapping-plain-"));
 	const host = makePi();
 	ompWorkflowsInternal(host.pi as never);
@@ -586,7 +627,6 @@ test("session_start starts nothing for an unmarked session", async () => {
 });
 
 test("session_start on a clean marked workspace seeds roles before the refresh resolves and first begin succeeds", async () => {
-	resetWorkflowOwners();
 	const root = cleanMarkedRoot();
 	const configPath = join(root, ".omp", "team.config.json");
 	assert.ok(
@@ -652,7 +692,6 @@ test("session_start on a clean marked workspace seeds roles before the refresh r
 });
 
 test("session_start seeding never overwrites an existing custom config", async () => {
-	resetWorkflowOwners();
 	const root = markedRoot({ ...testRoles(), developer: "omp-team-lead" });
 	const configPath = join(root, ".omp", "team.config.json");
 	const before = readFileSync(configPath, "utf8");

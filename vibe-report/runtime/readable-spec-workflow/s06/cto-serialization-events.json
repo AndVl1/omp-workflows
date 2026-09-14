@@ -1,0 +1,14 @@
+{
+  "marker": "<!-- omp-cto-slice run=01a0549b-cf6a-72f5-a45a-820b5eac89d2 slice=validation-release -->",
+  "row": "T112.25",
+  "status": "NOT_RUN",
+  "reason": "T112.24 final-candidate preflight could not reach a constitution Ask prompt; parent source-freeze pause stopped further scenario actions.",
+  "required_evidence": [
+    "independent JSON audit-log/metrics slices parallelize",
+    "dependent loader/schema-validator slices serialize",
+    "shared defaults pair serializes",
+    "no nested CTO",
+    "every result maps original requirement/task id"
+  ],
+  "observed": "No confirmation, CTO dispatch, worker, claim, or canonical wave event was observed before the exact owned session ended."
+}

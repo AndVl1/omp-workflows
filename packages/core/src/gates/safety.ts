@@ -61,7 +61,11 @@ export function safetyGuard(event: ToolCallEvent, ctx: ToolCallContext): { block
   return;
 }
 
-function checkBash(input: Record<string, unknown> | undefined, _ctx: ToolCallContext): { block?: boolean; reason?: string } | void {
+
+const FORCE_PUSH_BRANCH_UNAVAILABLE_REASON =
+  "safety-guard: refusing to force-push because the current branch could not be established.";
+
+function checkBash(input: Record<string, unknown> | undefined, ctx: ToolCallContext): { block?: boolean; reason?: string } | void {
   const cmd = String(input?.command ?? "");
   if (!cmd) return;
   for (const pattern of DESTRUCTIVE_BASH_PATTERNS) {
@@ -69,12 +73,10 @@ function checkBash(input: Record<string, unknown> | undefined, _ctx: ToolCallCon
       return { block: true, reason: `safety-guard: destructive bash pattern blocked (${pattern}). Refusing to execute.` };
     }
   }
-  if (/\bgit\s+push\b/.test(cmd) && /\b(--force|-f)\b/.test(cmd)) {
-    const branch = currentBranchSafe();
-    if (branch && PROTECTED_BRANCHES.has(branch)) {
-      return { block: true, reason: `safety-guard: refusing to force-push to protected branch '${branch}'.` };
-    }
-  }
+  if (!/\bgit\s+push\b/i.test(cmd) || !/(?:^|\s)(?:--force(?:-with-lease)?|-f)(?:=|\s|$)/i.test(cmd)) return;
+  const branch = currentBranchSafe(ctx.cwd);
+  if (branch === null) return { block: true, reason: FORCE_PUSH_BRANCH_UNAVAILABLE_REASON };
+  if (PROTECTED_BRANCHES.has(branch)) return { block: true, reason: `safety-guard: refusing to force-push to protected branch '${branch}'.` };
 }
 
 function checkWrite(input: Record<string, unknown> | undefined, _ctx: ToolCallContext): { block?: boolean; reason?: string } | void {
@@ -87,9 +89,12 @@ function checkWrite(input: Record<string, unknown> | undefined, _ctx: ToolCallCo
   }
 }
 
-function currentBranchSafe(): string | null {
+
+function currentBranchSafe(cwd: string): string | null {
   try {
-    return execSync("git rev-parse --abbrev-ref HEAD", { encoding: "utf8" }).trim();
+    const branch = execSync("git symbolic-ref --short HEAD", { cwd, encoding: "utf8" }).trim();
+    if (!branch || branch === "HEAD") return null;
+    return branch;
   } catch {
     return null;
   }

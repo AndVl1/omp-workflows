@@ -8,6 +8,7 @@ import { parseYouTubeUrl } from "../src/lecture-acquisition/youtube-url.js";
 import { YouTubePlaylistExpander } from "../src/lecture-acquisition/youtube-playlist.js";
 import { GeminiYouTubeProvider } from "../src/lecture-acquisition/gemini.js";
 import { LectureResearchConfigError, loadLectureResearchConfig } from "../src/lecture-acquisition/config.js";
+import { AcquisitionProviderError, readBoundedResponseText } from "../src/lecture-acquisition/provider-errors.js";
 import { createDefaultLectureAcquisitionService } from "../src/lecture-acquisition/service.js";
 const limits: AcquisitionLimits = {
   maxPages: 4,
@@ -75,6 +76,32 @@ test("YouTubePlaylistExpander rejects streamed responses that exceed the byte li
   assert.deepEqual(result.items, []);
   assert.equal(result.truncated, true);
   assert.deepEqual(result.failures, [{ code: "LIMIT_EXCEEDED", provider: "youtube", message: "provider response exceeded the configured byte limit", retryable: false, attempts: 1, severity: "error" }]);
+});
+test("bounded response reader rejects bodyless success without calling fallback text", async () => {
+  const response = new Response(null, { status: 200 });
+  let textCalls = 0;
+  Object.defineProperty(response, "text", {
+    configurable: true,
+    value: () => {
+      textCalls += 1;
+      return Promise.resolve("x".repeat(2_000_000));
+    },
+  });
+  await assert.rejects(
+    () => readBoundedResponseText(response, 128, "fixture"),
+    (error: unknown) => error instanceof AcquisitionProviderError && error.code === "NETWORK_ERROR",
+  );
+  assert.equal(textCalls, 0);
+});
+
+test("bounded response reader accepts only semantically empty bodyless responses", async () => {
+  for (const response of [
+    new Response(null, { status: 204 }),
+    new Response(null, { status: 304 }),
+    new Response(null, { status: 200, headers: { "content-length": "0" } }),
+  ]) {
+    assert.equal(await readBoundedResponseText(response, 128, "fixture"), "");
+  }
 });
 
 test("GeminiYouTubeProvider sends documented request and extracts current and legacy response text", async () => {

@@ -1,0 +1,59 @@
+{
+  "report_id": "compatibility.453629cf55471b4f73f5fad1c1286a8bd7a04aef1049b371ec2becfcf728374a",
+  "snapshot_ref": "import.103b3f5b1980c0e61999f5344d0371f8a9ff48d06911eec7055cd0ae689f2b1a",
+  "constitution_binding": {
+    "provider_id": "native",
+    "path": "CONSTITUTION.md",
+    "version": "0.0.0",
+    "content_sha256": "8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+    "semantic_hash": "35ce12b619924ee68ab11046b5ac497392f2615526e791d52482d5c5257714af",
+    "validation_ref": "constitution.validation.8406d9a2513cb61ab806544d618623515e6d281a3aaa9c15d2b6ffdf419df2fc",
+    "bound_at": "2026-09-03T04:15:13.062Z"
+  },
+  "status": "unsupported",
+  "mapping": [
+    {
+      "source_ref": "imported/payment-retry-speckit/specs/101-payment-retry/tasks.md",
+      "contract_subject": "task",
+      "subject_id": "T-101"
+    },
+    {
+      "source_ref": "imported/payment-retry-speckit/specs/101-payment-retry/tasks.md",
+      "contract_subject": "task",
+      "subject_id": "T-102"
+    },
+    {
+      "source_ref": "imported/payment-retry-speckit/specs/101-payment-retry/tasks.md",
+      "contract_subject": "task",
+      "subject_id": "T-103"
+    }
+  ],
+  "blocking_findings": [
+    {
+      "code": "SPEC_IMPORT_REQUIREMENTS_MISSING",
+      "subject_id": null,
+      "message": "no requirements document was recognized",
+      "evidence_refs": [
+        "imported/payment-retry-speckit/.specify/memory/constitution.md",
+        "imported/payment-retry-speckit/specs/101-payment-retry/plan.md",
+        "imported/payment-retry-speckit/specs/101-payment-retry/spec.md",
+        "imported/payment-retry-speckit/specs/101-payment-retry/tasks.md"
+      ]
+    },
+    {
+      "code": "SPEC_IMPORT_DECISIONS_MISSING",
+      "subject_id": null,
+      "message": "no decisions document was recognized",
+      "evidence_refs": [
+        "imported/payment-retry-speckit/.specify/memory/constitution.md",
+        "imported/payment-retry-speckit/specs/101-payment-retry/plan.md",
+        "imported/payment-retry-speckit/specs/101-payment-retry/spec.md",
+        "imported/payment-retry-speckit/specs/101-payment-retry/tasks.md"
+      ]
+    }
+  ],
+  "warnings": [],
+  "ignored_content": [],
+  "supplement_ref": null,
+  "evaluated_at": "2026-09-03T04:14:57.399Z"
+}

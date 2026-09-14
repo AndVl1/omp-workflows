@@ -36,7 +36,8 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
+import { loadProfile, profileHash } from "../src/engine/profile.js";
+import { registerTestProfiles, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import { createCapability, authorizeDispatch, completeDispatch, advanceCursor, type CapabilityHandoff } from "../src/engine/durable.js";
 import { writeState, checkMonotonic } from "../src/engine/state.js";
 import { buildDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
@@ -63,7 +64,8 @@ function setup(
 ): { issued: ReturnType<typeof createCapability>; root: string } {
   const root = mkdtempSync(join(tmpdir(), `w3-skip-${branch}-`));
   initGit(root, branch);
-  registerWorkflowProfiles([profile]);
+  writeTestRegistryMarker(root);
+  registerTestProfiles(root, [profile]);
   const persistedHash = profileHash(profile);
   const issued = createCapability({
     run_key: branch, branch, workflow: profile.name, profile_hash: persistedHash,
@@ -219,12 +221,12 @@ test("WF-3: consecutive skipped stages are all marked skipped; the native walk t
     // Dispatch and complete qa_tests, then advance to summary.
     const qaAuth = dispatchAuth(advanced1.handoff);
     const authorized = authorizeDispatch(root, { ...qaAuth, role: "qa", agent: "qa" });
-    assert.equal(authorized.ok, true);
+    assert.equal(authorized.ok, true, authorized.ok ? "" : authorized.error);
     if (!authorized.ok || !authorized.record) return;
     const completed = completeDispatch(root, { ...qaAuth, role: "qa", agent: "qa", dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "qa passed", artifact_ids: [] });
-    assert.equal(completed.ok, true);
+    assert.equal(completed.ok, true, completed.ok ? "" : completed.error);
     const advanced2 = advanceCursor(root, { ...qaAuth, token: advanced1.handoff.advance_token, evidence: "qa completed" });
-    assert.equal(advanced2.ok, true);
+    assert.equal(advanced2.ok, true, advanced2.ok ? "" : `${advanced2.error}; completion=${completed.ok ? completed.state?.dispatch_capability?.dispatches.map((item) => `${item.role}:${item.status}`).join(",") : completed.error}`);
     if (!advanced2.ok || !advanced2.handoff) return;
     assert.equal(advanced2.state.stage_cursor, "summary");
     assert.equal(advanced2.state.stages.find((s) => s.id === "qa_tests")?.status, "done");
@@ -361,6 +363,7 @@ test("WF-3: interpreter parity — run() skips the skip_if stage without dispatc
   const branch = "interp-skip";
   try {
     initGit(root, branch);
+    writeTestRegistryMarker(root);
     const interpProfile: Profile = {
       name: "skip-interp",
       title: "Skip interp",
@@ -373,7 +376,7 @@ test("WF-3: interpreter parity — run() skips the skip_if stage without dispatc
         { id: "summary", title: "Summary", type: "orchestrator" },
       ],
     };
-    registerWorkflowProfiles([interpProfile]);
+    registerTestProfiles(root, [interpProfile]);
     // The artifact the skip_if reads must exist when the walk evaluates it.
     const artifactsDir = join(root, ".work-state", "features", branch, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
@@ -386,7 +389,9 @@ test("WF-3: interpreter parity — run() skips the skip_if stage without dispatc
         return {
           id: "x",
           output: "ok",
-          artifacts: agent === "qa" ? { qa_tests: { tests_added: [], build_status: "pass" } } : {},
+          artifacts: agent === "qa"
+            ? { qa_tests: JSON.stringify({ tests_added: [], build_status: "pass" }) }
+            : {},
           exitCode: 0,
         };
       },

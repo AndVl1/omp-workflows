@@ -1,0 +1,47 @@
+id: 2026-09-01T00-57-25-security
+parent: null
+agent: security
+timestamp: "2026-09-01T00:57:25Z"
+status: completed
+
+context:
+  task: "T072 imported specification re-hash, idempotency, staleness, and claim blocking"
+  phase: "06"
+
+output:
+  summary: "Added exact safe-path source and constitution re-hashing before imported approval/dispatch, deterministic unchanged replay, and immutable stale projections for changed source or supplement bindings."
+  vulnerabilities:
+    critical: 0
+    high: 0
+    medium: 0
+    low: 0
+  cargo_deny:
+    status: pass
+    advisories: 0
+    license_issues: 0
+    note: "Not run; assignment explicitly delegated validation to CTO. No dependency changes."
+  dependencies:
+    outdated: 0
+    unmaintained: 0
+    actions: []
+  unsafe_blocks:
+    total: 0
+    reviewed: 0
+    approved: 0
+    needs_refactor: 0
+  issues: []
+  files:
+    - packages/core/src/specification/import.ts
+    - packages/core/src/specification/handoff.ts
+    - .work-state/artifacts/sdd-interoperability/T072.json
+  verification:
+    validation_run: false
+    reason: "No validation per assignment; CTO reruns once sibling slices land."
+
+next:
+  agent: null
+  task: "CTO combined validation for T070-T073"
+  priority: high
+  acceptance_criteria:
+    - "T059 source-change, idempotency, symlink/path, constitution, and supplement contracts pass"
+    - "Changed imported handoffs cannot acquire an execution claim before revalidation and reapproval"

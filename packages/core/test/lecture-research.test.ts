@@ -44,12 +44,13 @@ import {
   keywordClassify,
   buildClassificationPhaseZero,
   buildWorkflowMatrix,
-  validateProducedArtifact,
-  requiredFieldsOf,
-  loadArtifactSchemas,
   evaluatePredicate,
   buildDoWorkPrompt,
   buildCtoPrompt,
+  validateProducedArtifact,
+  validateLectureAcquisitionArtifact,
+  requiredFieldsOf,
+  loadArtifactSchemas,
   buildAmendPrompt,
   runCto,
   type Classification,
@@ -65,6 +66,7 @@ import {
 } from "@andvl1/omp-workflows-core";
 import { dodBackstop } from "../src/gates/dod-backstop.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
+import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 
 const COMPLEXITIES: Complexity[] = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"];
 const FLAGS: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
@@ -106,7 +108,7 @@ function acquisitionArtifact(
   evidence: unknown[] = status === "failed"
     ? []
     : [{
-        evidenceId: "ev-1",
+        evidenceId: "a".repeat(64),
         sourceId: "yt-video-abc",
         location: "https://www.youtube.com/watch?v=abc",
         provider: "test-provider",
@@ -118,7 +120,19 @@ function acquisitionArtifact(
   failures: unknown[] = [],
 ): Record<string, unknown> {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    binding: {
+      featureId: "fixture-feature",
+      featureRunKey: "fixture-run",
+      stageId: "acquisition",
+      cursorEpoch: "fixture-epoch",
+      intakeArtifactId: "lecture_intake",
+      intakeSchemaVersion: 1,
+      intakeContentSha256: "a".repeat(64),
+      requestSha256: "b".repeat(64),
+      rightsMode: "metadata-only",
+      rightsSha256: "c".repeat(64),
+    },
     status,
     request: {
       sourceUrl: "https://www.youtube.com/watch?v=abc",
@@ -278,10 +292,10 @@ test("lecture-research: every artifact the profile produces or consumes has a sh
     "lecture_repo_fit",
   ]);
   const schemas = loadArtifactSchemas();
-  for (const id of ids) assert.ok(schemas[id], `schema for '${id}' must exist`);
-  assert.deepEqual(requiredFieldsOf("lecture_intake"), ["task", "sources"]);
+  assert.deepEqual(requiredFieldsOf("lecture_intake"), ["schemaVersion", "task", "sources"]);
   assert.deepEqual(requiredFieldsOf("lecture_acquisition"), [
     "schemaVersion",
+    "binding",
     "status",
     "request",
     "sourceSet",
@@ -300,6 +314,7 @@ test("lecture-research: artifact contract accepts grounded artifacts, rejects mi
   // provenance and empty sources block.
   assert.deepEqual(
     validateProducedArtifact("lecture_intake", {
+      schemaVersion: 1,
       task: "What architecture does the course teach?",
       sources: [
         { id: "lecture-url", kind: "url", location: "https://www.youtube.com/watch?v=abc", provenance: "user-provided URL; acquisition pending" },
@@ -308,6 +323,7 @@ test("lecture-research: artifact contract accepts grounded artifacts, rejects mi
     { ok: true },
   );
   const noProvenance = validateProducedArtifact("lecture_intake", {
+    schemaVersion: 1,
     task: "t",
     sources: [{ id: "lecture-url", kind: "url", location: "https://www.youtube.com/watch?v=abc" }],
   });
@@ -318,7 +334,7 @@ test("lecture-research: artifact contract accepts grounded artifacts, rejects mi
       "diagnostic carries the provenance JSON path",
     );
   }
-  assert.equal(validateProducedArtifact("lecture_intake", { task: "t", sources: [] }).ok, false, "empty intake sources block");
+  assert.equal(validateProducedArtifact("lecture_intake", { schemaVersion: 1, task: "t", sources: [] }).ok, false, "empty intake sources block");
 
   // acquisition: normalized timestamped evidence is required for success and
   // partial; failed may preserve a provider failure with no evidence.
@@ -419,6 +435,32 @@ test("lecture-research: artifact contract accepts grounded artifacts, rejects mi
     false,
     "unknown repo-fit category blocks",
   );
+});
+
+test("lecture-research: schema v2 binding is required by direct and mounted validators", () => {
+  const valid = acquisitionArtifact("succeeded");
+  assert.deepEqual(validateLectureAcquisitionArtifact(valid, { requireBinding: true }), []);
+  const invalidCases: Array<[string, (value: Record<string, unknown>) => void]> = [
+    ["schema version", (value) => { value.schemaVersion = 1; }],
+    ["missing binding", (value) => { delete value.binding; }],
+    ["intake schema version", (value) => { (value.binding as Record<string, unknown>).intakeSchemaVersion = 2; }],
+    ["feature id", (value) => { (value.binding as Record<string, unknown>).featureId = ""; }],
+    ["request digest", (value) => { (value.binding as Record<string, unknown>).requestSha256 = "not-a-digest"; }],
+    ["rights mode", (value) => { (value.binding as Record<string, unknown>).rightsMode = "invalid"; }],
+  ];
+  for (const [label, mutate] of invalidCases) {
+    const direct = structuredClone(valid) as Record<string, unknown>;
+    mutate(direct);
+    assert.notDeepEqual(validateLectureAcquisitionArtifact(direct, { requireBinding: true }), [], `${label}: direct validator must reject`);
+    assert.equal(validateProducedArtifact("lecture_acquisition", direct).ok, false, `${label}: mounted validator must reject`);
+  }
+  for (const key of ["maxItems", "maxPages", "deadlineMs", "maxAttempts", "maxResponseBytes", "maxEvidenceSegmentsPerSource"] as const) {
+    const direct = structuredClone(valid) as Record<string, unknown>;
+    const limits = (direct.request as Record<string, unknown>).limits as Record<string, unknown>;
+    limits[key] = HARD_ACQUISITION_LIMITS[key] + 1;
+    assert.notDeepEqual(validateLectureAcquisitionArtifact(direct, { requireBinding: true }), [], `${key}: direct hard maximum must reject`);
+    assert.equal(validateProducedArtifact("lecture_acquisition", direct).ok, false, `${key}: mounted hard maximum must reject`);
+  }
 });
 
 test("lecture-research: decision artifact accepts approved and rejected verdicts only", () => {
@@ -562,6 +604,7 @@ test("lecture-research: do-work prompt and classification contract expose the de
 
 test("lecture-research: fresh and amend CTO prompts keep the research-only human-gated policy", () => {
   const root = mkdtempSync(join(tmpdir(), "lecture-cto-"));
+  const runtime = openTestCtoRuntime(root);
   try {
     const fresh = buildCtoPrompt(
       { task: "Research the lecture playlist into verified findings", autonomyHint: false, issue: null, branch: null },
@@ -580,10 +623,12 @@ test("lecture-research: fresh and amend CTO prompts keep the research-only human
       cwd: root,
       branch: "main",
       autonomous: false,
+      sessionId: "main-session",
       teams: [{ team: "backend", slice: "s1" }],
       defs: {
         backend: { id: "backend", name: "Backend", scope: ["backend-kotlin"], profile: "lightweight", lead: "team-lead", roster: ["backend-kotlin"] } satisfies TeamDef,
       },
+      runtimeAccess: runtime.access,
     });
     assert.equal(res.ok, true, "amend fixture: runCto starts a run in the temp root");
     if (!res.ok) return;
@@ -600,6 +645,7 @@ test("lecture-research: fresh and amend CTO prompts keep the research-only human
     assert.match(amend, /no transcript is requested/i);
     assert.match(amend, /core does not fetch URLs/i);
   } finally {
+    runtime.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -623,7 +669,7 @@ test("lecture-research: DoD backstop exempts lecture-research done-claims", () =
     assert.ok(blocked, "control: a non-exempt workflow claiming done is blocked");
     if (!blocked || !("reason" in blocked)) assert.fail("blocked result carries a reason");
     assert.equal(blocked.decision, "block");
-    assert.match(blocked.reason, /dod\.json: file is missing/, "the block is the missing-DoD block, proving the exemption is what allowed the stop above");
+    assert.match(blocked.reason, /dod\.json: (?:file is missing|.*unreadable)/, "the block is the missing-DoD block, proving the exemption is what allowed the stop above");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

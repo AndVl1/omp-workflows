@@ -10,8 +10,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildSessionReport } from "../src/report/assemble.js";
-import { registerWorkflowProfiles } from "../src/engine/profile.js";
+import { buildSessionReport, MAX_REPORT_ARTIFACT_BYTES, MIN_REPORT_ARTIFACT_BYTES } from "../src/report/assemble.js";
+import { truncateUtf8 } from "../src/report/redact.js";
+import { registerTestProfiles, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import { rollupFromEvents, EventRecorder } from "../src/observability/recorder.js";
 import type { ObservabilityEvent } from "../src/observability/events.js";
 import type { SessionReport, StageInfo } from "../src/report/types.js";
@@ -81,6 +82,38 @@ function writeRolesConfig(cwd: string): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "team.config.json"), JSON.stringify({ roles: REPORT_FIXTURE_ROLES }, null, 2));
 }
+
+test("do-work: maxArtifactBytes rejects unsafe values before project reads", () => {
+  const invalid = [0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 1.5, MAX_REPORT_ARTIFACT_BYTES + 1, Number.MAX_SAFE_INTEGER];
+  for (const value of invalid) {
+    assert.throws(
+      () => buildSessionReport("/definitely-not-a-project", {}, { maxArtifactBytes: value }),
+      (error: unknown) => error instanceof TypeError && String((error as Error).message).includes("maxArtifactBytes"),
+    );
+  }
+});
+
+test("do-work: maxArtifactBytes accepts the authoritative boundaries", () => {
+  const cwd = tmpWorkspace();
+  try {
+    writeFeature(cwd, "bounds", makeTeamState());
+    for (const value of [MIN_REPORT_ARTIFACT_BYTES, MAX_REPORT_ARTIFACT_BYTES]) {
+      assert.doesNotThrow(() => buildSessionReport(cwd, { kind: "do-work", id: "bounds" }, { maxArtifactBytes: value }));
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("report UTF-8 truncation never splits multibyte code points", () => {
+  for (const text of ["é", "👋", "e\u0301", "ascii"]) {
+    for (let cap = 0; cap <= Buffer.byteLength(text, "utf8") + 1; cap += 1) {
+      const truncated = truncateUtf8(text, cap);
+      assert.ok(Buffer.byteLength(truncated, "utf8") <= cap);
+      assert.doesNotThrow(() => new TextEncoder().encode(truncated));
+    }
+  }
+});
 
 test("do-work: normalizes per-feature TeamState schema 1 into SessionReport", () => {
   const cwd = tmpWorkspace();
@@ -544,7 +577,7 @@ test("do-work: full-feature stages carry resolved agents, original roles, and de
     const manualQa = report.stages.find((s) => s.id === "manual_qa");
     assert.equal(manualQa?.gate, "manual_qa.verdict != FAIL");
     const qaTests = report.stages.find((s) => s.id === "qa_tests");
-    assert.equal(qaTests?.gate, "manual_qa.verdict != FAIL || !scope.has_runtime");
+    assert.equal(qaTests?.gate, "qa_reported_pass");
 
     // Stages that declare none of the metadata keep every field absent.
     assert.equal(exploration?.description, undefined);
@@ -557,9 +590,11 @@ test("do-work: full-feature stages carry resolved agents, original roles, and de
 });
 
 test("do-work: declared stage description/checkpoint/gate/autonomous flow into profile-backed stages", () => {
+  const cwd = tmpWorkspace();
+  writeTestRegistryMarker(cwd);
   // No shipped profile declares stage-level `description` (schema keeps it
   // optional), so the copy path is proven with a registered fixture profile.
-  registerWorkflowProfiles([
+  registerTestProfiles(cwd, [
     {
       name: "stage-detail",
       title: "Stage Detail Fixture",
@@ -595,8 +630,6 @@ test("do-work: declared stage description/checkpoint/gate/autonomous flow into p
       ],
     },
   ]);
-
-  const cwd = tmpWorkspace();
   try {
     const state = makeTeamState({
       classification: { ...makeTeamState().classification, workflow: "stage-detail" },
@@ -733,7 +766,7 @@ test("do-work: profile-backed stages carry a bounded reconstructed promptPreview
     assert.ok(qa.promptPreview!.includes("agents: qa"), "resolved agent/role present");
     assert.ok(qa.promptPreview!.includes("inputs: manual_qa, implementation, architecture"), "declared inputs");
     assert.ok(qa.promptPreview!.includes("outputs: qa_tests"), "declared outputs");
-    assert.ok(qa.promptPreview!.includes("gate: manual_qa.verdict != FAIL || !scope.has_runtime"), "profile gate metadata");
+    assert.ok(qa.promptPreview!.includes("gate: qa_reported_pass"), "profile gate metadata");
     assert.ok(qa.promptPreview!.length <= 4096, "normal-size preview stays within the strict cap");
 
     // Pool stage: preview makes no agent claim (roster_policy selection is

@@ -1,0 +1,53 @@
+id: 2026-09-01T04-00-00-security
+parent: null
+agent: security
+timestamp: "2026-09-01T04:00:00Z"
+status: completed
+
+context:
+  task: "Close T081/T087 runtime command adapters in packages/core/src/commands/specification.ts."
+  phase: "adaptive-evolution"
+
+output:
+  summary: "Wired bounded presentation configuration and explicit legacy migration/resume adapters into the direct specification commands."
+  vulnerabilities:
+    critical: 0
+    high: 0
+    medium: 0
+    low: 0
+  cargo_deny:
+    status: not_run
+    advisories: 0
+    license_issues: 0
+    note: "Validation was explicitly reserved for the parent CTO."
+  dependencies:
+    outdated: 0
+    unmaintained: 0
+    actions: []
+  unsafe_blocks:
+    total: 0
+    reviewed: 0
+    approved: 0
+    needs_refactor: 0
+  issues: []
+  files:
+    created:
+      - packages/core/src/specification/presentation-config.ts
+    modified:
+      - packages/core/src/commands/specification.ts
+      - .work-state/artifacts/sdd-evolution/T081.json
+      - .work-state/artifacts/sdd-evolution/T087.json
+  behavior:
+    - "Reads only .omp/specification.json and bounded project-relative regular UTF-8 template files without symlink traversal."
+    - "Resolves feature/project/request language and feature/project/shipped templates before phase dispatch, then persists exact presentation bindings."
+    - "Checks only .work-state/specification/<id>/legacy-run.json for an explicit unknown /specify selector after the shared constitution prerequisite."
+    - "Renders blocked migration diagnostics and resumes an immutable migrated phase through validation without a duplicate content dispatch."
+  validation: "Not run by explicit assignment constraint; parent owns combined validation."
+
+next:
+  agent: rust-code-reviewer
+  task: "Include these adapters in the combined CTO validation/review wave."
+  priority: high
+  acceptance_criteria:
+    - "T081/T087 runtime journeys pass."
+    - "No duplicate migrated phase version or legacy source mutation occurs."

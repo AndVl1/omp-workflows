@@ -1,0 +1,24 @@
+{
+  "marker": "<!-- omp-cto-slice run=01a0549b-cf6a-72f5-a45a-820b5eac89d2 slice=validation-release -->",
+  "row": "T112.21",
+  "verdict": "FAIL",
+  "scratch": "/tmp/omp-ux-e2e-readable-spec-workflow/s05-import",
+  "commands": [
+    "npm run e2e -- start /tmp/omp-ux-e2e-readable-spec-workflow/s05-import --surface text --scenario packages/e2e/scenarios/spec-import.json --detach --max-time 3600 --idle-ms 600000",
+    "npm run e2e -- ask /tmp/omp-ux-e2e-readable-spec-workflow/s05-import",
+    "npm run e2e -- input /tmp/omp-ux-e2e-readable-spec-workflow/s05-import /spec-import imported/payment-retry-speckit",
+    "npm run e2e -- ask /tmp/omp-ux-e2e-readable-spec-workflow/s05-import",
+    "npm run e2e -- stop /tmp/omp-ux-e2e-readable-spec-workflow/s05-import"
+  ],
+  "observed": [
+    "Initial ask-list: no pending [ask_user] prompt.",
+    "Spec Kit input delivered: 43 characters followed by Enter.",
+    "Follow-up ask-list: no pending [ask_user] prompt while PTY transcript remained in Reading workspace preparation state; no constitution or compatibility checkpoint was exposed.",
+    "Stop: authenticated server stop completed."
+  ],
+  "gaps": [
+    "No complete adapter import, compatibility approval, per-import artifacts, handoff, or checkpoint evidence could be observed before source-freeze pause.",
+    "The exact PTY transcript is preserved at t112-21-spec-kit-stopped-transcript.jsonl; copied transcript contains no URL token markers."
+  ],
+  "source": "manual_qa"
+}

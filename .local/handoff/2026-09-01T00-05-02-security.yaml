@@ -1,0 +1,39 @@
+id: 2026-09-01T00-05-02-security
+parent: null
+agent: security
+timestamp: "2026-08-31T21:05:02Z"
+status: completed
+
+context:
+  task: "Fix trusted specification checkpoint proof fixtures and preserve hard-human proof binding."
+  phase: "native-workflow"
+
+output:
+  summary: "Corrected the phase checkpoint fixture to pass the engine-issued proof envelope, added a valid constitution_approval cross-checkpoint fixture rule, surfaced positive outcome errors, and corrected replay expectations to assert no redispatch."
+  security_scope:
+    dependency_audit: not_requested
+    unsafe_review: not_requested
+    hard_human_guarantee: preserved
+  issues:
+    - severity: high
+      location: packages/core/test/specification-checkpoints.test.ts
+      issue: "The fixture passed the full durable answer record as actor proof; strict typed proof validation rejects its extra authority-bearing context fields."
+      fix: "Return trusted.proof while persisting trusted.state to the exact selected state target."
+    - severity: medium
+      location: packages/core/test/specification-checkpoints.test.ts
+      issue: "The cross-checkpoint negative case could not create a valid constitution answer because its rule was absent."
+      fix: "Add the exact hard-human constitution_approval rule with approve_continue and request_changes only."
+  files_modified:
+    - packages/core/test/specification-checkpoints.test.ts
+  verification:
+    status: not_run
+    reason: "Assignment explicitly reserved validation for the CTO."
+
+next:
+  agent: null
+  task: "CTO reruns the combined validation after sibling changes land."
+  priority: high
+  acceptance_criteria:
+    - "approve_continue, approve_stop, and request_changes accept exact trusted proofs"
+    - "tampered, missing, cross-checkpoint, and cross-context proofs remain rejected without consumption"
+    - "exact replay consumes once and never redispatches"

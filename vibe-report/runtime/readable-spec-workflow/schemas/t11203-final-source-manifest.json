@@ -1,0 +1,107 @@
+{
+  "validation": "T112.03 fresh final-source diagnostic gate",
+  "status": "failed_build_typecheck_blocked",
+  "generated_at_utc": "2026-09-11T17:52:03.887Z",
+  "source_snapshot": {
+    "start_path": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-source-snapshot-start.json",
+    "start_digest": "9fe974c9034f05be5d23316bf1bbd50c015443d0a442aeee9e3cfa0dded301a5",
+    "end_path": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-source-snapshot-end.json",
+    "end_digest": "9fe974c9034f05be5d23316bf1bbd50c015443d0a442aeee9e3cfa0dded301a5",
+    "unchanged": true,
+    "tracked_file_count": 417,
+    "missing_file_count_at_both_snapshots": 2
+  },
+  "evidence_logs": {
+    "build_typecheck": {
+      "path": "vibe-report/runtime/readable-spec-workflow/schemas/build-typecheck.log",
+      "sha256": "1dd7cefed099e0aa9d2e1032edc681a8a991576d3ac1907450a911c8ed44b0c1",
+      "commands": [
+        {
+          "label": "t11203-root-build",
+          "command": "npm run build",
+          "argv": [
+            "npm",
+            "run",
+            "build"
+          ],
+          "started_at_utc": "2026-09-11T17:50:21.267Z",
+          "ended_at_utc": "2026-09-11T17:50:28.092Z",
+          "duration_ms": 6824,
+          "exit_code": 2,
+          "signal": null,
+          "spawn_error": null,
+          "source_snapshot_digest": "9fe974c9034f05be5d23316bf1bbd50c015443d0a442aeee9e3cfa0dded301a5",
+          "source_snapshot_path": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-source-snapshot-start.json",
+          "log": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-root-build.log",
+          "sha256": "0e1eadbe84629f352e98db731c7f445ea9bebf36ed44b6fb0f140c26cf68423b",
+          "counts": {
+            "log_bytes": 4523,
+            "log_lines": 60,
+            "tests": null,
+            "passed": null,
+            "failed": null,
+            "cancelled": null,
+            "skipped": null,
+            "todo": null
+          }
+        },
+        {
+          "label": "t11203-root-typecheck",
+          "command": "npm run typecheck",
+          "argv": [
+            "npm",
+            "run",
+            "typecheck"
+          ],
+          "started_at_utc": "2026-09-11T17:50:52.386Z",
+          "ended_at_utc": "2026-09-11T17:50:57.065Z",
+          "duration_ms": 4677,
+          "exit_code": 2,
+          "signal": null,
+          "spawn_error": null,
+          "source_snapshot_digest": "9fe974c9034f05be5d23316bf1bbd50c015443d0a442aeee9e3cfa0dded301a5",
+          "source_snapshot_path": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-source-snapshot-start.json",
+          "log": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-root-typecheck.log",
+          "sha256": "58dee534fd6b7ad3090eb0b063acd62c2b7781c8f03b26d4ff75040a5dff0bd7",
+          "counts": {
+            "log_bytes": 4706,
+            "log_lines": 60,
+            "tests": null,
+            "passed": null,
+            "failed": null,
+            "cancelled": null,
+            "skipped": null,
+            "todo": null
+          }
+        }
+      ]
+    },
+    "schema_exports": {
+      "path": "vibe-report/runtime/readable-spec-workflow/schemas/schema-export-tests.log",
+      "sha256": "6ed127b972eb198daae1e2fe688f700de9745ff3d3cb6e473145d9545d0281c7"
+    },
+    "raw_build": {
+      "path": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-root-build.log",
+      "sha256": "0e1eadbe84629f352e98db731c7f445ea9bebf36ed44b6fb0f140c26cf68423b"
+    },
+    "raw_typecheck": {
+      "path": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-root-typecheck.log",
+      "sha256": "58dee534fd6b7ad3090eb0b063acd62c2b7781c8f03b26d4ff75040a5dff0bd7"
+    }
+  },
+  "omitted_due_to_block": [
+    "npm run test:core",
+    "npm run test:fullstack",
+    "npm run test -w @andvl1/omp-workflows-internal",
+    "npm run test -w @andvl1/omp-workflows-e2e",
+    "contract schema comparison",
+    "public export imports"
+  ],
+  "diagnostics": [
+    "packages/core/src/cto/runtime-access.ts:247 TS2345",
+    "packages/core/src/specification/registry.ts:367 TS2322",
+    "packages/core/src/specification/registry.ts:371 TS7006",
+    "packages/fullstack/src/adapters/registry.ts:4225 TS1136",
+    "packages/omp-workflows-internal/src/index.ts:292 TS2322"
+  ]
+}

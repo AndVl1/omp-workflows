@@ -8,7 +8,7 @@
  * `task` agent) — see the refresh section below.
  */
 
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,6 +16,7 @@ import {
 	buildAgentMapping,
 	resolveConfig,
 	writeAgentMapping,
+	PinnedProjectRoot,
 	type AgentMappingState,
 	type Profile,
 	type RoleConfig,
@@ -24,7 +25,11 @@ import {
 
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task";
 
-import { detectWorkspaceMarkers } from "./activation.js";
+import {
+	captureWorkspaceActivation,
+	validateWorkspaceActivation,
+	type WorkspaceActivationSnapshot,
+} from "./activation.js";
 import { OMP_INTERNAL_ACTIVATION_MARKER, OMP_INTERNAL_BUNDLE_ID } from "./identity.js";
 import { loadOmpWorkflowProfiles } from "./profiles.js";
 
@@ -35,6 +40,7 @@ export const ALLOWED_POOL_AGENTS: readonly string[] = [
 	"omp-tech-researcher",
 	"omp-diagnostics",
 	"omp-architect",
+	"omp-specification-worker",
 	"omp-qa",
 	// Pool-only (finding F1): no scope trigger references manual-qa in this
 	// bundle's profiles — nothing under a TS monorepo can set has_ui. It stays
@@ -61,6 +67,8 @@ export const defaultOmpInternalRoles: RoleConfig["roles"] = {
 	"tech-researcher": "omp-tech-researcher",
 	diagnostics: "omp-diagnostics",
 	architect: "omp-architect",
+	"specification-analyst": "omp-specification-worker",
+	"specification-architect": "omp-specification-worker",
 	developer: "omp-engine-specialist",
 	qa: "omp-qa",
 	"manual-qa": "omp-manual-qa",
@@ -175,17 +183,84 @@ const mappingRefreshes = new Map<string, Promise<AgentMappingState>>();
 const freshMappings = new Map<string, AgentMappingState>();
 
 /**
- * Marker re-check for the asynchronous refresh path (W004-MAPPING-FRESHNESS):
- * discovery is an async suspension window in which the workspace can lose its
- * markers. The full marker set must still stand when discovery resolves and
- * again when the mapping is about to be published; anything shorter fails
- * closed. The typed error matches the kickoff gate so every seam rejects
- * identically.
+ * Refreshes retain the activation snapshot captured by the entry seam. The
+ * snapshot key includes the physical root identity, so a replacement at the
+ * same pathname cannot join or invalidate the wrong generation's cache.
  */
-function assertMarkersCurrent(sessionCwd: string): void {
-	if (!detectWorkspaceMarkers(sessionCwd).ok) {
-		throw new Error(`activation_markers_missing: ${OMP_INTERNAL_ACTIVATION_MARKER}`);
+function activationKey(snapshot: WorkspaceActivationSnapshot): string {
+	return `${snapshot.canonicalRoot}\u0000${snapshot.rootDev}:${snapshot.rootIno}`;
+}
+
+function invalidateRootCaches(cwd: string): void {
+	const lexical = resolve(cwd);
+	const canonical = (() => {
+		try { return realpathSync(lexical); } catch { return lexical; }
+	})();
+	const prefix = `${canonical}\u0000`;
+	for (const key of freshMappings.keys()) {
+		if (key.startsWith(prefix)) freshMappings.delete(key);
 	}
+}
+
+function isWorkspaceActivationSnapshot(value: WorkspaceActivationSnapshot | InternalAgentDiscovery | undefined): value is WorkspaceActivationSnapshot {
+	return value !== undefined && value !== null && typeof value === "object" && "canonicalRoot" in value && "rootDev" in value && "rootIno" in value && "markers" in value;
+}
+
+function snapshotError(snapshot: WorkspaceActivationSnapshot, cwd: string): Error | undefined {
+	const checked = validateWorkspaceActivation(snapshot, cwd);
+	if (checked.ok) return undefined;
+	return new Error(`${checked.code}: ${checked.code === "activation_markers_missing" ? OMP_INTERNAL_ACTIVATION_MARKER : "accepted workspace root or marker identity changed"}`);
+}
+
+function openPinnedSnapshot(snapshot: WorkspaceActivationSnapshot): PinnedProjectRoot | undefined {
+	const pinned = PinnedProjectRoot.open(snapshot.canonicalRoot);
+	if (!pinned) return undefined;
+	if (pinned.canonical_root !== snapshot.canonicalRoot
+		|| pinned.dev !== snapshot.rootDev
+		|| pinned.ino !== snapshot.rootIno
+		|| !pinned.isStable()) {
+		pinned.close();
+		return undefined;
+	}
+	return pinned;
+}
+
+function pinnedSnapshotError(
+	snapshot: WorkspaceActivationSnapshot,
+	cwd: string,
+	pinned: PinnedProjectRoot,
+): Error | undefined {
+	const current = snapshotError(snapshot, cwd);
+	if (current) return current;
+	if (!pinned.isStable()
+		|| pinned.canonical_root !== snapshot.canonicalRoot
+		|| pinned.dev !== snapshot.rootDev
+		|| pinned.ino !== snapshot.rootIno) {
+		return new Error("activation_identity_changed: retained project root descriptor changed");
+	}
+	return undefined;
+}
+
+function capturedSnapshot(cwd: string): WorkspaceActivationSnapshot {
+	const result = captureWorkspaceActivation(cwd);
+	if (!result.ok) {
+		throw new Error(`${result.code}: ${result.code === "activation_markers_missing" ? OMP_INTERNAL_ACTIVATION_MARKER : "workspace root or marker identity could not be pinned"}`);
+	}
+	return result.snapshot;
+}
+
+function refreshInputs(
+	cwd: string,
+	snapshotOrDiscover: WorkspaceActivationSnapshot | InternalAgentDiscovery | undefined,
+	discover: InternalAgentDiscovery | undefined,
+): { snapshot: WorkspaceActivationSnapshot; discover: InternalAgentDiscovery } {
+	if (isWorkspaceActivationSnapshot(snapshotOrDiscover)) {
+		return { snapshot: snapshotOrDiscover, discover: discover ?? defaultAgentDiscovery };
+	}
+	if (typeof snapshotOrDiscover === "function") {
+		return { snapshot: capturedSnapshot(cwd), discover: snapshotOrDiscover };
+	}
+	return { snapshot: capturedSnapshot(cwd), discover: discover ?? defaultAgentDiscovery };
 }
 
 async function defaultAgentDiscovery(cwd: string): Promise<{ agents: ReadonlyArray<InternalDiscoveredAgent> }> {
@@ -269,27 +344,63 @@ export function requiredInternalProfileRoles(profiles: readonly Profile[]): stri
  * the core mapping path; on failure the cached mapping is invalidated and
  * the error propagates.
  */
+/**
+ * Discover the live host roster while retaining the activation root snapshot.
+ * The overload without a snapshot is kept for direct callers/tests; the
+ * production activation path always supplies its retained snapshot.
+ */
 export function refreshInternalAgentMappings(
 	cwd: string,
-	discover: InternalAgentDiscovery = defaultAgentDiscovery,
+	snapshot: WorkspaceActivationSnapshot,
+	discover?: InternalAgentDiscovery,
+): Promise<AgentMappingState>;
+export function refreshInternalAgentMappings(
+	cwd: string,
+	discover?: InternalAgentDiscovery,
+): Promise<AgentMappingState>;
+export function refreshInternalAgentMappings(
+	cwd: string,
+	snapshotOrDiscover?: WorkspaceActivationSnapshot | InternalAgentDiscovery,
+	discover?: InternalAgentDiscovery,
 ): Promise<AgentMappingState> {
-	const resolvedCwd = resolve(cwd);
-	const sessionCwd = existsSync(resolvedCwd) ? realpathSync(resolvedCwd) : resolvedCwd;
-	const running = mappingRefreshes.get(sessionCwd);
-	if (running) return running;
-	if (!detectWorkspaceMarkers(sessionCwd).ok) {
-		// Markers removed mid-session: the workspace is no longer ours to
-		// serve — drop any cached runtime mapping with it.
-		freshMappings.delete(sessionCwd);
-		return Promise.reject(new Error(`activation_markers_missing: ${OMP_INTERNAL_ACTIVATION_MARKER}`));
+	let inputs: { snapshot: WorkspaceActivationSnapshot; discover: InternalAgentDiscovery };
+	try {
+		inputs = refreshInputs(cwd, snapshotOrDiscover, discover);
+	} catch (error) {
+		invalidateRootCaches(cwd);
+		return Promise.reject(error);
 	}
-	const refresh = discover(sessionCwd)
+	const { snapshot, discover: discovery } = inputs;
+	const cacheKey = activationKey(snapshot);
+	const initialError = snapshotError(snapshot, cwd);
+	if (initialError) {
+		freshMappings.delete(cacheKey);
+		return Promise.reject(initialError);
+	}
+	const running = mappingRefreshes.get(cacheKey);
+	if (running) return running;
+	const sessionCwd = snapshot.canonicalRoot;
+	const pinnedRoot = openPinnedSnapshot(snapshot);
+	if (!pinnedRoot) {
+		freshMappings.delete(cacheKey);
+		return Promise.reject(new Error("activation_identity_changed: project root could not be pinned"));
+	}
+	let discovered: Promise<{ agents: ReadonlyArray<InternalDiscoveredAgent> }>;
+	try {
+		discovered = discovery(sessionCwd);
+	} catch (error) {
+		discovered = Promise.reject(error);
+	}
+	const refresh = discovered
 		.then(({ agents }) => {
-			// Discovery just resolved after an async suspension: the workspace
-			// may have lost its markers while it was in flight.
-			assertMarkersCurrent(sessionCwd);
+			// Discovery is an async suspension: the retained root and every
+			// accepted marker must still identify this activation generation.
+			const afterDiscoveryError = pinnedSnapshotError(snapshot, cwd, pinnedRoot);
+			if (afterDiscoveryError) throw afterDiscoveryError;
 			const inventory = bundleOwnedInventory(agents);
-			const config = resolveConfig(sessionCwd);
+			const config = resolveConfig(sessionCwd, {}, pinnedRoot);
+			const afterConfigError = pinnedSnapshotError(snapshot, cwd, pinnedRoot);
+			if (afterConfigError) throw afterConfigError;
 			const requiredAgents = [
 				...new Set(
 					requiredInternalProfileRoles(loadOmpWorkflowProfiles()).map(
@@ -317,60 +428,67 @@ export function refreshInternalAgentMappings(
 				config_version: config.config_version,
 				config_provenance: config.config_provenance,
 			});
-			// Publish-time re-check: nothing is written, cached or returned
-			// once activation is gone, however briefly discovery raced it.
-			assertMarkersCurrent(sessionCwd);
-			writeAgentMapping(sessionCwd, mapping);
-			freshMappings.set(sessionCwd, mapping);
+			// This check is immediately adjacent to the writer: no cache or
+			// persisted mapping may be produced for a replacement root.
+			const beforeWriteError = pinnedSnapshotError(snapshot, cwd, pinnedRoot);
+			if (beforeWriteError) throw beforeWriteError;
+			writeAgentMapping(sessionCwd, mapping, pinnedRoot);
+			freshMappings.set(cacheKey, mapping);
 			return mapping;
 		})
 		.catch((error: unknown) => {
-			// A failed discovery invalidates the runtime mapping: the roster was
-			// just re-derived and could not be reproduced, so serving the last
-			// accepted one would authorize begin from a stale roster. The next
-			// begin re-attempts discovery or fails closed — it never falls back
-			// to the persisted mapping file.
-			freshMappings.delete(sessionCwd);
+			// Any failed generation, including root replacement, invalidates the
+			// retained generation's in-memory authority. A new root identity gets
+			// a different key and must perform a fresh discovery.
+			freshMappings.delete(cacheKey);
 			throw error;
 		})
 		.finally(() => {
-			mappingRefreshes.delete(sessionCwd);
+			mappingRefreshes.delete(cacheKey);
+			pinnedRoot.close();
 		});
-	mappingRefreshes.set(sessionCwd, refresh);
+	mappingRefreshes.set(cacheKey, refresh);
 	return refresh;
 }
 
 /**
- * Ensure a fresh, discovery-verified mapping for `workflow_begin` (the
- * workflow tool adapter calls this in `beforeBegin`, before
- * `workflow_begin`, and its resolved value is handed to core as the trusted
- * mapping for this begin). Re-checks the CURRENT workspace markers on every
- * call — before joining an in-flight refresh or serving the cached mapping —
- * so a direct workflow tool call after marker removal retains no authority:
- * the runtime cache is invalidated and the typed
- * `activation_markers_missing` rejection blocks the transition. With markers
- * present it joins an in-flight refresh, otherwise serves the last
- * discovery-verified mapping from memory, otherwise kicks a new refresh —
- * and rejects whenever discovery fails, so begin is blocked fail-closed
- * instead of being authorized from the persisted (possibly stale or
- * tampered) mapping file, which is never read back here. A joiner that
- * passed its own entry check still inherits the fail-closed rejection when
- * markers vanish while the joined refresh is in flight: the refresh
- * re-verifies markers at discovery completion and before publish.
+ * Ensure a fresh, discovery-verified mapping for `workflow_begin`. The
+ * retained activation snapshot is checked before joining or serving a cache,
+ * then the refresh checks it after async discovery and immediately before
+ * writing. A root replacement at the same path therefore cannot inherit the
+ * old mapping generation.
  */
 export function waitForInternalAgentMappings(
 	cwd: string,
-	discover: InternalAgentDiscovery = defaultAgentDiscovery,
+	snapshot: WorkspaceActivationSnapshot,
+	discover?: InternalAgentDiscovery,
+): Promise<AgentMappingState>;
+export function waitForInternalAgentMappings(
+	cwd: string,
+	discover?: InternalAgentDiscovery,
+): Promise<AgentMappingState>;
+export function waitForInternalAgentMappings(
+	cwd: string,
+	snapshotOrDiscover?: WorkspaceActivationSnapshot | InternalAgentDiscovery,
+	discover?: InternalAgentDiscovery,
 ): Promise<AgentMappingState> {
-	const resolvedCwd = resolve(cwd);
-	const sessionCwd = existsSync(resolvedCwd) ? realpathSync(resolvedCwd) : resolvedCwd;
-	if (!detectWorkspaceMarkers(sessionCwd).ok) {
-		freshMappings.delete(sessionCwd);
-		return Promise.reject(new Error(`activation_markers_missing: ${OMP_INTERNAL_ACTIVATION_MARKER}`));
+	let inputs: { snapshot: WorkspaceActivationSnapshot; discover: InternalAgentDiscovery };
+	try {
+		inputs = refreshInputs(cwd, snapshotOrDiscover, discover);
+	} catch (error) {
+		invalidateRootCaches(cwd);
+		return Promise.reject(error);
 	}
-	const running = mappingRefreshes.get(sessionCwd);
+	const { snapshot, discover: discovery } = inputs;
+	const cacheKey = activationKey(snapshot);
+	const initialError = snapshotError(snapshot, cwd);
+	if (initialError) {
+		freshMappings.delete(cacheKey);
+		return Promise.reject(initialError);
+	}
+	const running = mappingRefreshes.get(cacheKey);
 	if (running) return running;
-	const fresh = freshMappings.get(sessionCwd);
+	const fresh = freshMappings.get(cacheKey);
 	if (fresh) return Promise.resolve(fresh);
-	return refreshInternalAgentMappings(sessionCwd, discover);
+	return refreshInternalAgentMappings(cwd, snapshot, discovery);
 }

@@ -19,7 +19,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createTaskCaller, type TaskToolLike } from "../src/engine/stage.js";
+import { createTaskCaller, MAX_TASK_RESULT_OUTPUT_BYTES, type TaskToolLike } from "../src/engine/stage.js";
 
 test("core: createTaskCaller maps to OMP TaskTool.execute signature", async () => {
 	const calls: Array<{ toolCallId: string; params: Record<string, unknown> }> = [];
@@ -160,6 +160,53 @@ test("core: createTaskCaller normalises non-object output to a string", async ()
 	const result = await caller.call({ agent: "developer-kotlin", task: "noop" });
 	assert.equal(result.output, "raw text response");
 	assert.equal(result.exitCode, 0);
+});
+
+test("core: createTaskCaller rejects oversized provider text without preserving artifacts", async () => {
+  const oversized = "x".repeat(MAX_TASK_RESULT_OUTPUT_BYTES + 1);
+  const fakeTool: TaskToolLike = {
+    async execute() {
+      return { output: { id: "oversized", output: oversized, artifacts: { report: "{}" }, exitCode: 0 } };
+    },
+  };
+  const result = await createTaskCaller(fakeTool).call({ agent: "qa", task: "inspect" });
+  assert.equal(result.output, "");
+  assert.equal(result.exitCode, 1);
+  assert.match(result.error ?? "", /task output exceeds/);
+  assert.deepEqual(result.artifacts, {}, "oversized output must not carry artifacts into stage persistence");
+});
+
+test("core: createTaskCaller rejects deeply nested provider payloads before stringify", async () => {
+  let nested: Record<string, unknown> = {};
+  for (let index = 0; index < 80; index += 1) nested = { child: nested };
+  const fakeTool: TaskToolLike = {
+    async execute() {
+      return { output: { id: "deep", output: nested, artifacts: {}, exitCode: 0 } };
+    },
+  };
+  const result = await createTaskCaller(fakeTool).call({ agent: "qa", task: "inspect" });
+  assert.equal(result.output, "");
+  assert.equal(result.exitCode, 1);
+  assert.match(result.error ?? "", /task result payload rejected|task output rejected/);
+  assert.deepEqual(result.artifacts, {});
+});
+
+test("core: rejected oversized output does not become an asynchronous pending result", async () => {
+  const oversized = "x".repeat(MAX_TASK_RESULT_OUTPUT_BYTES + 1);
+  const fakeTool: TaskToolLike = {
+    async execute() {
+      return {
+        details: {
+          async: { state: "running" },
+          results: [{ id: "pending-oversized", output: oversized, artifacts: {}, exitCode: 0 }],
+        },
+      };
+    },
+  };
+  const result = await createTaskCaller(fakeTool).call({ agent: "qa", task: "inspect" });
+  assert.equal(result.pending, undefined);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.error ?? "", /task output exceeds/);
 });
 
 test("core: createTaskCaller reads native TaskTool details results", async () => {

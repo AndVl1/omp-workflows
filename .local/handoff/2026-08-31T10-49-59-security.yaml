@@ -1,0 +1,52 @@
+id: 2026-08-31T10-49-59-security
+parent: null
+agent: security
+timestamp: "2026-08-31T10:49:59Z"
+status: completed
+context:
+  task: "Bind constitution approval/revision to the existing immutable trusted answer ledger and fix adjacent durable selector routing."
+  phase: "wave-001 foundation-contracts"
+output:
+  summary: "Replaced caller-trusted constitution proof strings with canonical engine ledger verification and idempotent consumption; preserved two-decision/exact-resume behavior; fixed non-spec run_key auth routing."
+  vulnerabilities:
+    critical: 0
+    high: 1
+    medium: 0
+    low: 0
+  cargo_deny:
+    status: fail
+    advisories: 0
+    license_issues: 0
+    note: "Not assessed: assignment explicitly prohibited validation commands; status is non-passing rather than a fabricated pass. No dependency changes were made."
+  dependencies:
+    outdated: 0
+    unmaintained: 0
+    actions: []
+  unsafe_blocks:
+    total: 0
+    reviewed: 0
+    approved: 0
+    needs_refactor: 0
+  issues:
+    - severity: high
+      location: packages/core/src/specification/prerequisite.ts
+      issue: "Fabricated non-empty proof strings authorized constitution decisions."
+      fix: "Require typed user provenance and canonical nonce/context/digest lookup in TeamState.trusted_checkpoint_answers, then persist idempotent consumption."
+  files_changed:
+    - packages/core/src/engine/checkpoints.ts
+    - packages/core/src/engine/durable.ts
+    - packages/core/src/specification/prerequisite.ts
+    - packages/core/test/durable-repeated-role.test.ts
+    - packages/core/test/specification-constitution.test.ts
+    - .work-state/artifacts/sdd-foundation/constitution-proof-ledger.json
+  validation:
+    commands_run: []
+    reason: "Assignment explicitly reserves final fan-in validation for the CTO."
+next:
+  agent: rust-code-reviewer
+  task: "Review canonical ledger verification, replay/consumption ordering, and adjacent durable selector routing; CTO runs final fan-in."
+  priority: high
+  acceptance_criteria:
+    - "Only an engine-issued persisted human answer can approve or revise constitution."
+    - "Fabricated, cross-feature/run/checkpoint, mismatched-decision, replayed-cross-context, and non-user proofs fail closed."
+    - "Exact replay remains idempotent and exact resume is preserved."

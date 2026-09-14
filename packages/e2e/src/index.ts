@@ -8,7 +8,6 @@ export {
   mintToken,
   safeEqual,
   buildOmpArgs,
-  killProcessTree,
   pidIsLive,
   assertNoLiveSession,
   readSessionInfo,
@@ -27,20 +26,25 @@ export type {
   RateLimitOptions,
   IdleTimerOptions,
   OmpLaunchConfig,
-  KillProcessTreeOptions,
   SessionInfo,
   ServerMsg,
   AttachResult,
 } from './server.js';
 
-export { WsDriver, TranscriptLog, AskStateTracker, stripAnsi, waitFor, WaitTimeoutError, wsUrlFromPageUrl, createPlaywrightDriver } from './driver.js';
+export { WsDriver, TranscriptLog, AskStateTracker, answerNativeAsk, answerSelectedAsk, answerSelectedAskWithNote, stripAnsi, waitFor, WaitTimeoutError, wsUrlFromPageUrl, createPlaywrightDriver, isOmpTuiReady, waitForOmpTuiReady } from './driver.js';
 export type {
   TerminalDriver,
+  TerminalKey,
   WsDriverOptions,
+  AskOption,
+  AskQuestion,
   AskBlock,
+  SelectedAskBlock,
   AskStateRecord,
+  AskStateTrackerOptions,
+  AnswerReservation,
+  ReservationResult,
   AnswerResult,
-  WaitForOptions,
 } from './driver.js';
 
 export { loadScenario, expandTemplate } from './scenario.js';
@@ -52,6 +56,9 @@ export type {
   ScenarioTask,
   AskExpectation,
   ScreenshotTrigger,
+  ScenarioSelectors,
+  ScenarioWorkspacePaths,
+  ScenarioTranscriptExpectations,
 } from './scenario.js';
 
 export { generateReport, DEFECT_FLOORS, UX_DIMENSIONS, AGENT_DIMENSIONS, DEFECT_SEVERITIES } from './report.js';
@@ -59,6 +66,12 @@ export type {
   UxE2eReport,
   ReportInput,
   ReportSessionMeta,
+  ReportSelectors,
+  ReportScenarioReference,
+  ReportWorkspaceEvidence,
+  ReportWorkerAttribution,
+  ReportRuntimeMarker,
+  ReportNextAction,
   UxStep,
   UxDefect,
   AgentQuality,
@@ -70,6 +83,6 @@ export type {
   Recommendation,
   GenerateReportOptions,
   GenerateReportResult,
-  } from './report.js';
+} from './report.js';
 
 export { deferred, type Deferred } from './util.js';

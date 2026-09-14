@@ -27,8 +27,9 @@
  *   - declared paths must be safe RELATIVE paths inside `.work-state` that
  *     do not escape via `..`/absolute/backslash segments and are not
  *     excluded inputs (events.jsonl, vibe-report, .work-state/visualize);
- *     symlinked files whose realpath leaves the work-state root are
- *     rejected; excluded inputs are never discovered, never read;
+ *     all symlinked/non-regular artifact entries are rejected by no-follow
+ *     metadata (regardless of whether their target is inside or outside);
+ *     excluded inputs are never discovered, never read;
  *   - the snapshot is strictly read-only: canonical state and artifact
  *     files are never written or mutated.
  *
@@ -49,21 +50,20 @@
 import { createHash } from "node:crypto";
 import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { PinnedProjectRoot, PinnedRootError } from "../specification/pinned-root.js";
 
 import { readDoDFileSafe, type DodSafeFileRead, resolveDodPath } from "../engine/dod.js";
 import { loadProfile } from "../engine/profile.js";
 import type { TeamState } from "../engine/types.js";
 import type { CtoState } from "../cto/types.js";
 import {
-  CTO_MD_EVIDENCE,
-  CTO_MD_FINISH_MARKERS,
   EXCLUDED_SOURCE_NAMES,
   WORK_STATE_DIR,
   ctoTeamArtifactsDir,
   isExcludedSourcePath,
   type SessionSourceEntry,
 } from "../report/session-source.js";
-import { redactReportBody } from "../report/redact.js";
+import { redactReportBody, truncateUtf8 } from "../report/redact.js";
 import {
   BOUNDED_DIGEST_LENGTH,
   DEFAULT_RENDERER_IDENTITY,
@@ -97,15 +97,15 @@ import {
 } from "./types.js";
 import { resolveRenderConfig, type RenderConfig } from "./render-config.js";
 
-// ── Options ──────────────────────────────────────────────────────────────────
-
 export interface BuildSessionSnapshotOptions {
-  /** ISO timestamp — the only volatile model field (fixed clock in tests). */
+  /** Fixed timestamp — the only volatile model field (generatedAt, provenance, manifest). */
   generatedAt: string;
   /** --full: bigger bounded body/read caps; never weakens redaction. */
   full?: boolean;
   /** Pre-resolved render config; default: resolveRenderConfig(workflow, full). */
   renderConfig?: RenderConfig;
+  /** Borrow a descriptor pin across discovery, selection, and snapshot reads. */
+  pinnedRoot?: PinnedProjectRoot;
 }
 
 // ── Deterministic stage titles (architecture-1 golden vocabulary) ───────────
@@ -277,62 +277,21 @@ interface StateRead {
 }
 
 /** Deterministic canonical state text for a session entry (one raw read). */
-function readStateContent(cwd: string, entry: SessionSourceEntry): StateRead {
-  if (entry.kind === "do-work") {
-    if (entry.statePath && existsSync(entry.statePath)) {
-      try {
-        return { text: readFileSync(entry.statePath, "utf8"), label: cwdRelativeLabel(cwd, entry.statePath), format: "json" };
-      } catch {
-        // fall through — unreadable state yields an empty canonical text
-      }
-    }
-    return { text: "", label: entry.statePath ? cwdRelativeLabel(cwd, entry.statePath) : ".work-state", format: "json" };
-  }
-  // CTO: state.json first; markdown-state runs use the evidence/finish files.
-  if (entry.statePath && existsSync(entry.statePath)) {
+function readStateContent(cwd: string, entry: SessionSourceEntry, pin: PinnedProjectRoot): StateRead {
+  const relativePath = entry.statePath ? pin.relativePath(entry.statePath) : null;
+  if (relativePath) {
     try {
-      return { text: readFileSync(entry.statePath, "utf8"), label: cwdRelativeLabel(cwd, entry.statePath), format: "json" };
-    } catch {
-      // fall through to the markdown candidates
-    }
-  }
-  const candidates = entry.terminalMarkdown ? [...CTO_MD_FINISH_MARKERS] : [...CTO_MD_EVIDENCE];
-  for (const name of candidates) {
-    const p = join(entry.runDir, name);
-    if (existsSync(p)) {
-      try {
-        return { text: readFileSync(p, "utf8"), label: `.work-state/cto/${entry.id}`, format: "markdown" };
-      } catch {
-        continue;
+      const info = pin.pathEntryInfo(relativePath);
+      if (info?.kind === "file") {
+        const read = pin.readFile(relativePath, { maxBytes: 8 * 1024 * 1024 });
+        const text = new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
+        return { text, label: cwdRelativeLabel(cwd, entry.statePath), format: "json" };
       }
-    }
-  }
-  return { text: "", label: `.work-state/cto/${entry.id}`, format: "markdown" };
-}
-
-/** First `# ` heading of a markdown state text — the run task (like markdownCtoState). */
-function markdownTask(text: string): string {
-  const line = text.split("\n").find((l) => l.startsWith("# "));
-  return line ? line.replace(/^#\s+/, "").trim() : "";
-}
-
-/**
- * Task for a terminal markdown run: derived from the evidence files exactly
- * like markdownCtoState (cto_discovery.md first, then team-plan.md) — the
- * finish-marker state text (summary.md) is the digest source, not the task.
- */
-function terminalMarkdownTask(runDir: string): string {
-  for (const name of ["cto_discovery.md", "team-plan.md"]) {
-    const p = join(runDir, name);
-    if (!existsSync(p)) continue;
-    try {
-      const task = markdownTask(readFileSync(p, "utf8"));
-      if (task !== "") return task;
     } catch {
-      // unreadable — try the next evidence file
+      // A source that changes while the snapshot is built is degraded rather than followed by pathname.
     }
   }
-  return "";
+  return { text: "", label: entry.statePath ? cwdRelativeLabel(cwd, entry.statePath) : entry.kind === "cto" ? `.work-state/cto/${entry.id}` : ".work-state", format: "json" };
 }
 
 // ── Artifact plans ───────────────────────────────────────────────────────────
@@ -360,31 +319,29 @@ interface ArtifactPlan {
  * byte cap) so safe-read artifacts keep identical window semantics.
  */
 function windowOfSafeRead(read: Extract<DodSafeFileRead, { ok: true }>, windowBytes: number): string {
-  return Buffer.from(read.raw, "utf8").subarray(0, Math.min(read.bytes, windowBytes)).toString("utf8");
+  return truncateUtf8(read.raw, windowBytes);
 }
 
 /** Deterministic top-level scan of a directory for JSON artifact files. */
 function scanJsonArtifacts(
   cwd: string,
   dir: string,
+  pin: PinnedProjectRoot,
   onEntry: (id: string, absPath: string) => void,
 ): void {
+  const relativeDir = pin.relativePath(dir);
+  if (!relativeDir || pin.pathEntryInfo(relativeDir)?.kind !== "directory") return;
   let names: string[];
   try {
-    names = readdirSync(dir);
+    names = pin.listDirectory(relativeDir, { maxEntries: 4096, maxNameBytes: 512 * 1024 });
   } catch {
     return;
   }
   names.sort();
   for (const name of names) {
-    if (EXCLUDED_SOURCE_NAMES[name]) continue;
-    if (!name.endsWith(".json")) continue;
+    if (EXCLUDED_SOURCE_NAMES[name] || !name.endsWith(".json")) continue;
     const absPath = join(dir, name);
-    try {
-      if (!statSync(absPath).isFile()) continue;
-    } catch {
-      continue;
-    }
+    if (pin.pathEntryInfo(join(relativeDir, name))?.kind !== "file") continue;
     if (isExcludedSourcePath(cwd, absPath)) continue;
     onEntry(name.slice(0, -".json".length), absPath);
   }
@@ -395,13 +352,13 @@ function planDoWorkArtifacts(
   cwd: string,
   entry: Extract<SessionSourceEntry, { kind: "do-work" }>,
   state: TeamState,
+  pin: PinnedProjectRoot,
 ): { plans: ArtifactPlan[]; declaredOrder: string[] } {
   const workflow = state.classification.workflow;
   const declaredOrder = declaredOrderOf(workflow);
   const producesByStage = producesByStageOf(workflow);
   const declared = new Set(Object.keys(state.artifacts ?? {}));
   const plans = new Map<string, ArtifactPlan>();
-
   for (const [id, ref] of Object.entries(state.artifacts ?? {})) {
     const owner = producesByStage.get(id) ?? "";
     if (!isSafePathKey(id)) {
@@ -409,22 +366,18 @@ function planDoWorkArtifacts(
       continue;
     }
     const resolved = resolveDeclaredPath(cwd, ref);
-    if ("invalid" in resolved) {
-      plans.set(id, { id, declared: true, owner, invalid: resolved.invalid });
+    if ("invalid" in resolved || !pin.relativePath(resolved.absPath)) {
+      plans.set(id, { id, declared: true, owner, invalid: "unsafe-path" });
       continue;
     }
-    plans.set(id, { id, declared: true, owner, absPath: resolved.absPath, label: resolved.label, ...(id === "dod" ? { safeRead: readDoDFileSafe(cwd, resolved.absPath) } : {}) });
+    plans.set(id, { id, declared: true, owner, absPath: resolved.absPath, label: resolved.label });
   }
-
-  // Discovered extras: slot files attach to their declared base, anything
-  // else stays unclaimed. Excluded inputs are never discovered.
-  scanJsonArtifacts(cwd, entry.artifactsDir, (id, absPath) => {
+  scanJsonArtifacts(cwd, entry.artifactsDir, pin, (id, absPath) => {
     if (declared.has(id)) return;
     const base = slotBaseOf(id, declared);
     const owner = base ? (producesByStage.get(base) ?? "") : "";
-    plans.set(id, { id, declared: false, owner, ...(base ? { slotFor: base } : {}), absPath, label: cwdRelativeLabel(cwd, absPath), ...(id === "dod" ? { safeRead: readDoDFileSafe(cwd, absPath) } : {}) });
+    plans.set(id, { id, declared: false, owner, ...(base ? { slotFor: base } : {}), absPath, label: cwdRelativeLabel(cwd, absPath) });
   });
-
   return { plans: [...plans.values()], declaredOrder };
 }
 
@@ -434,71 +387,40 @@ function planCtoArtifacts(
   entry: Extract<SessionSourceEntry, { kind: "cto" }>,
   state: CtoState,
   warnings: string[],
+  pin: PinnedProjectRoot,
 ): { plans: ArtifactPlan[]; declaredOrder: string[] } {
   const declaredOrder = declaredOrderOf("cto");
   const plans = new Map<string, ArtifactPlan>();
   const reserved = new Set<string>();
-  const add = (id: string, owner: string, absPath: string, label: string, safeRead?: DodSafeFileRead): void => {
-    if (reserved.has(id)) return; // fail-closed reservation: no generic fallback
+  const add = (id: string, owner: string, absPath: string, label: string): void => {
+    if (reserved.has(id)) return;
     if (plans.has(id)) {
       warnings.push(`artifact ${id} exists in multiple locations: first resolution wins`);
       return;
     }
-    plans.set(id, { id, declared: true, owner, absPath, label, ...(safeRead ? { safeRead } : {}) });
+    if (!pin.relativePath(absPath) || pin.pathEntryInfo(pin.relativePath(absPath)!)?.kind !== "file") return;
+    plans.set(id, { id, declared: true, owner, absPath, label });
   };
-
-  // 1. Canonical team DoD for EVERY team (explicit dod_path or the unset/
-  //    default team artifacts dir), planned BEFORE all generic scans through
-  //    the fd-bound safe read. Plan ids are globally unique: the first
-  //    canonical claim wins, and an unsafe canonical path RESERVES the dod id
-  //    (fail-closed, excluded from rendering) so scans can never provide a
-  //    fallback.
   for (const team of state.teams ?? []) {
-    // Canonical dod_path resolution (directory containing dod.json OR the
-    // dod.json file itself; default team artifacts dir when unset).
     const resolved = resolveDodPath(cwd, team.dod_path, team.id);
-    if (!resolved.ok) {
-      // Fail closed: warn and RESERVE the dod id so run-local and
-      // compatibility scans can never provide a fallback.
+    if (!resolved.ok || isExcludedSourcePath(cwd, resolved.file)
+      || !pin.relativePath(resolved.file)
+      || pin.pathEntryInfo(pin.relativePath(resolved.file)!)?.kind !== "file") {
       warnings.push(`declared path for dod is not a safe relative path: excluded from rendering`);
       reserved.add("dod");
       continue;
     }
-    if (isExcludedSourcePath(cwd, resolved.file)) {
-      // Canonical exclusion contract (same predicate as declared paths):
-      // generated visualize output, vibe-report documentation and the
-      // observability event stream are never artifact inputs — warn and
-      // reserve against any generic fallback.
-      warnings.push(`declared path for dod is not a safe relative path: excluded from rendering`);
-      reserved.add("dod");
-      continue;
-    }
-    const safe = readDoDFileSafe(cwd, resolved.file);
-    if (!safe.ok && safe.kind === "missing") {
-      // Absent canonical DoD: reserve against generic fallback but keep the
-      // prior no-artifact behavior — no missing plan is added.
-      reserved.add("dod");
-      continue;
-    }
-    reserved.delete("dod"); // a real canonical file outranks an earlier absence
-    add("dod", team.id, resolved.file, cwdRelativeLabel(cwd, resolved.file), safe);
+    reserved.delete("dod");
+    add("dod", team.id, resolved.file, cwdRelativeLabel(cwd, resolved.file));
   }
-
-  // 2. Run-local artifacts: .work-state/cto/<runId>/artifacts/*.json. A
-  //    discovered dod.json is safe-read, never pathname-read.
-  scanJsonArtifacts(cwd, join(entry.runDir, "artifacts"), (id, absPath) => {
-    add(id, "", absPath, cwdRelativeLabel(cwd, absPath), id === "dod" ? readDoDFileSafe(cwd, absPath) : undefined);
+  scanJsonArtifacts(cwd, join(entry.runDir, "artifacts"), pin, (id, absPath) => {
+    add(id, "", absPath, cwdRelativeLabel(cwd, absPath));
   });
-
-  // 3. Team compatibility dirs: .work-state/artifacts/<teamId>/*.json (a
-  //    discovered dod.json — e.g. the default-dir DoD of a team without a
-  //    configured dod_path — is safe-read, never pathname-read).
   for (const team of state.teams ?? []) {
-    scanJsonArtifacts(cwd, ctoTeamArtifactsDir(cwd, team.id), (id, absPath) => {
-      add(id, team.id, absPath, cwdRelativeLabel(cwd, absPath), id === "dod" ? readDoDFileSafe(cwd, absPath) : undefined);
+    scanJsonArtifacts(cwd, ctoTeamArtifactsDir(cwd, team.id), pin, (id, absPath) => {
+      add(id, team.id, absPath, cwdRelativeLabel(cwd, absPath));
     });
   }
-
   return { plans: [...plans.values()], declaredOrder };
 }
 
@@ -575,7 +497,8 @@ function boundedParse(text: string): ParseOutcome {
   let summary: string | undefined;
   if (record.summary !== undefined) {
     const raw = String(record.summary);
-    summary = raw.length > MAX_SCALAR_CHARS ? raw.slice(0, MAX_SCALAR_CHARS) : raw;
+    const redacted = redactReportBody(raw, MAX_SCALAR_CHARS);
+    summary = truncateUtf8(redacted, MAX_SCALAR_CHARS);
   }
   return {
     ok: true,
@@ -608,9 +531,9 @@ function buildBody(text: string, originalBytes: number, windowBytes: number, cap
 }
 
 // ── Artifact model construction ──────────────────────────────────────────────
-
 interface BuildContext {
   cwd: string;
+  pin: PinnedProjectRoot;
   renderConfig: RenderConfig;
   stageStatuses: Map<string, string>;
   warnings: string[];
@@ -636,7 +559,7 @@ function absentStatusOf(
 }
 
 function buildArtifactModel(plans: ArtifactPlan[], declaredOrder: readonly string[], ctx: BuildContext): VisualizationArtifact[] {
-  const { cwd, renderConfig, stageStatuses, warnings, contributions } = ctx;
+  const { cwd, pin, renderConfig, stageStatuses, warnings, contributions } = ctx;
   const windowBytes = renderConfig.options.readWindowBytes;
   const capBytes = renderConfig.options.bodyCapBytes;
   const bodiesEnabled = renderConfig.bodiesEnabled;
@@ -662,7 +585,14 @@ function buildArtifactModel(plans: ArtifactPlan[], declaredOrder: readonly strin
     // Rejected ids are skipped and never read (unsafe id / unsafe path).
     if (plan.invalid === "unsafe-id") {
       warnings.push(`artifact id "${id}" is not a safe path key: skipped`);
-      const size = plan.absPath ? statSizeOf(plan.absPath) : null;
+      let size: number | null = null;
+      try {
+        const relativePath = plan.absPath ? pin.relativePath(plan.absPath) : null;
+        const info = relativePath ? pin.pathEntryInfo(relativePath) : null;
+        size = info?.kind === "file" ? info.size : null;
+      } catch {
+        size = null;
+      }
       contributions.set(id, { id, present: size !== null, sizeBytes: size ?? 0, readBytes: size === null ? 0 : Math.min(size, windowBytes) });
       artifacts.push({ id, owner: plan.owner, status: "skipped", ...slotOf(id) });
       continue;
@@ -677,14 +607,9 @@ function buildArtifactModel(plans: ArtifactPlan[], declaredOrder: readonly strin
     const safeRead = plan.safeRead;
     let size: number | null;
     let text: string | null;
-
     if (safeRead) {
-      // dod_path artifact: read ONCE at plan time via the safe fd-bound read
-      // (O_NOFOLLOW, regular-file check, fd/path inode bind, cwd containment).
-      // Rendering consumes that result and NEVER reopens the pathname.
       if (!safeRead.ok) {
         if (safeRead.kind === "missing") {
-          // Absent — declared rules apply; never unreadable (no path stats).
           const status = absentStatusOf(plan, slotsOfBase, stageStatuses);
           contributions.set(id, { id, present: false, sizeBytes: 0, readBytes: 0 });
           if (status === "pending" && plan.declared && stageStatuses.get(plan.owner) === "in_progress" && slotsOfBase.has(plan.id)) {
@@ -694,7 +619,6 @@ function buildArtifactModel(plans: ArtifactPlan[], declaredOrder: readonly strin
           }
           artifacts.push({ id, owner: plan.owner, status, ...slotOf(id) });
         } else {
-          // Symlink / non-regular / boundary / changed — refused at read time; never parsed.
           warnings.push(`artifact ${id} is not a safe regular file inside the workspace: skipped`);
           contributions.set(id, { id, present: true, sizeBytes: 0, readBytes: 0 });
           artifacts.push({ id, owner: plan.owner, status: "skipped", ...slotOf(id) });
@@ -710,10 +634,9 @@ function buildArtifactModel(plans: ArtifactPlan[], declaredOrder: readonly strin
         artifacts.push({ id, owner: plan.owner, status: "missing", ...slotOf(id) });
         continue;
       }
-
-      size = statSizeOf(absPath);
-      if (size === null) {
-        // Absent (or unstatable) — declared rules apply; never unreadable.
+      const relativePath = pin.relativePath(absPath);
+      const info = relativePath ? pin.pathEntryInfo(relativePath) : null;
+      if (!relativePath || !info) {
         const status = absentStatusOf(plan, slotsOfBase, stageStatuses);
         contributions.set(id, { id, present: false, sizeBytes: 0, readBytes: 0 });
         if (status === "pending" && plan.declared && stageStatuses.get(plan.owner) === "in_progress" && slotsOfBase.has(plan.id)) {
@@ -724,31 +647,30 @@ function buildArtifactModel(plans: ArtifactPlan[], declaredOrder: readonly strin
         artifacts.push({ id, owner: plan.owner, status, ...slotOf(id) });
         continue;
       }
-
-      // Symlink/boundary escape on a resolvable file — rejected, never read.
-      if (escapesViaSymlink(cwd, absPath)) {
+      if (info.kind !== "file") {
         warnings.push(`artifact ${id} escapes the workspace via symlink: skipped`);
-        contributions.set(id, { id, present: true, sizeBytes: size, readBytes: Math.min(size, windowBytes) });
+        contributions.set(id, { id, present: true, sizeBytes: info.size, readBytes: 0 });
         artifacts.push({ id, owner: plan.owner, status: "skipped", ...slotOf(id) });
         continue;
       }
-
-      text = readBoundedHead(absPath, windowBytes);
-      if (text === null) {
-        // Read failure (IO) — unreadable within the window.
+      try {
+        const prefixBytes = Math.min(8 * 1024 * 1024, Math.max(1, windowBytes + 4));
+        const read = pin.readFilePrefix(relativePath, { maxBytes: prefixBytes });
+        size = info.size;
+        const fullText = new TextDecoder("utf-8", { fatal: info.size <= windowBytes }).decode(read.bytes);
+        text = truncateUtf8(fullText, windowBytes);
+      } catch {
         warnings.push(`artifact ${id} is unreadable: read error`);
-        contributions.set(id, { id, present: true, sizeBytes: size, readBytes: 0 });
+        contributions.set(id, { id, present: true, sizeBytes: info.size, readBytes: 0 });
         artifacts.push({ id, owner: plan.owner, status: "unreadable", errorCategory: "read-error", ...slotOf(id) });
         continue;
       }
     }
-
     contributions.set(id, { id, present: true, sizeBytes: size, readBytes: Math.min(size, windowBytes) });
     const preview = size > windowBytes;
     const parsed = boundedParse(text);
     const base: Pick<VisualizationArtifact, "id" | "owner" | "slotFor"> = { id, owner: plan.owner, ...slotOf(id) };
 
-    // An empty file is empty, not corrupt: produced with the [empty] marker.
     if (text === "") {
       artifacts.push({
         ...base,
@@ -846,12 +768,15 @@ function buildStages(
     list.push(a.id);
     byOwner.set(a.owner, list);
   }
-  return (state.stages ?? []).map((s) => ({
-    stageId: s.id,
-    ...(STAGE_TITLES[s.id] ? { title: STAGE_TITLES[s.id] } : {}),
-    status: s.status,
-    artifactIds: (byOwner.get(s.id) ?? []).sort((a, b) => compareArtifactIds(a, b, declaredOrder)),
-  }));
+  return (state.stages ?? []).map((s) => {
+    const title = Object.hasOwn(STAGE_TITLES, s.id) && typeof STAGE_TITLES[s.id] === "string" ? STAGE_TITLES[s.id] : undefined;
+    return {
+      stageId: s.id,
+      ...(title !== undefined ? { title } : {}),
+      status: s.status,
+      artifactIds: (byOwner.get(s.id) ?? []).sort((a, b) => compareArtifactIds(a, b, declaredOrder)),
+    };
+  });
 }
 
 // ── Session construction ─────────────────────────────────────────────────────
@@ -874,16 +799,17 @@ function identityBaseOf(entry: SessionSourceEntry): {
  * Build the immutable normalized session model for one discovered session
  * entry. Never mutates canonical state; never throws for corrupt peers.
  */
-export function buildSessionSnapshot(
+function buildSessionSnapshotPinned(
   cwd: string,
   entry: SessionSourceEntry,
   generatedAt: string,
-  opts?: BuildSessionSnapshotOptions,
+  opts: BuildSessionSnapshotOptions | undefined,
+  pin: PinnedProjectRoot,
 ): VisualizationSession {
   const identityBase = identityBaseOf(entry);
   const warnings: string[] = [];
   const contributions = new Map<string, DigestArtifactContribution>();
-  const stateRead = readStateContent(cwd, entry);
+  const stateRead = readStateContent(cwd, entry, pin);
   const workflow: WorkflowName =
     entry.kind === "cto" ? "cto" : (entry.state?.classification?.workflow ?? "standard");
   const renderConfig = opts?.renderConfig ?? resolveRenderConfig(workflow, opts?.full ?? false);
@@ -908,23 +834,15 @@ export function buildSessionSnapshot(
   };
 
   try {
-    // ── Degraded projection: no usable state (corrupt JSON / terminal md). ──
+    // ── Degraded projection: no usable canonical state. ──
     if (entry.state === null) {
-      const degradedReasons =
-        entry.kind === "cto" && entry.terminalMarkdown === true
-          ? ["terminal markdown CTO state: visualization-only projection"]
-          : entry.kind === "cto"
-            ? ["unreadable state (JSON or markdown); rendering available content"]
-            : [entry.error ?? "unreadable state; rendering available content"];
+      const degradedReasons = [entry.error ?? "unreadable state; rendering available content"];
       return {
         schema: 1,
         identity: {
           ...identityBase,
           title: sessionTitleFor(identityBase.kind, identityBase.id),
-          task:
-            entry.kind === "cto" && entry.terminalMarkdown === true
-              ? terminalMarkdownTask(entry.runDir)
-              : "",
+          task: "",
           workflow,
           sourceFormat: stateRead.format,
           isLegacy: identityBase.kind === "legacy",
@@ -952,10 +870,11 @@ export function buildSessionSnapshot(
     if (entry.kind === "do-work") {
       const state = entry.state as TeamState;
       for (const s of state.stages ?? []) stageStatuses.set(s.id, s.status);
-      const planned = planDoWorkArtifacts(cwd, entry, state);
+      const planned = planDoWorkArtifacts(cwd, entry, state, pin);
       declaredOrder = planned.declaredOrder;
       artifacts = buildArtifactModel(planned.plans, declaredOrder, {
         cwd,
+        pin,
         renderConfig,
         stageStatuses,
         warnings,
@@ -968,10 +887,11 @@ export function buildSessionSnapshot(
       if (artifacts.length === 0) warnings.push("no artifacts yet");
     } else {
       const state = entry.state as CtoState;
-      const planned = planCtoArtifacts(cwd, entry, state, warnings);
+      const planned = planCtoArtifacts(cwd, entry, state, warnings, pin);
       declaredOrder = planned.declaredOrder;
       artifacts = buildArtifactModel(planned.plans, declaredOrder, {
         cwd,
+        pin,
         renderConfig,
         stageStatuses,
         warnings,
@@ -1023,6 +943,21 @@ export function buildSessionSnapshot(
     };
   }
 }
+export function buildSessionSnapshot(
+  cwd: string,
+  entry: SessionSourceEntry,
+  generatedAt: string,
+  opts?: BuildSessionSnapshotOptions,
+): VisualizationSession {
+  const supplied = opts?.pinnedRoot;
+  const pin = supplied ?? PinnedProjectRoot.open(cwd);
+  if (!pin) throw new PinnedRootError("invalid", "project root cannot be pinned for visualization");
+  try {
+    return buildSessionSnapshotPinned(cwd, entry, generatedAt, opts, pin);
+  } finally {
+    if (!supplied) pin.close();
+  }
+}
 
 /**
  * Content-derived session timestamp for the total order (F3). Only
@@ -1036,7 +971,6 @@ export function buildSessionSnapshot(
  * order, both hubs and the manifest always agree.
  */
 function contentUpdatedAtOf(entry: SessionSourceEntry): string | undefined {
-  if (entry.kind === "cto" && entry.format === "markdown") return undefined;
   return entry.updatedAt ?? undefined;
 }
 
@@ -1059,5 +993,12 @@ export function buildSessionSnapshots(
       { updatedAt: contentUpdatedAtOf(b), kind: sessionKindOf(b), id: b.id },
     ),
   );
-  return sorted.map((entry) => buildSessionSnapshot(cwd, entry, generatedAt, opts));
+  const supplied = opts?.pinnedRoot;
+  const pin = supplied ?? PinnedProjectRoot.open(cwd);
+  if (!pin) throw new PinnedRootError("invalid", "project root cannot be pinned for visualization");
+  try {
+    return sorted.map((entry) => buildSessionSnapshotPinned(cwd, entry, generatedAt, opts, pin));
+  } finally {
+    if (!supplied) pin.close();
+  }
 }

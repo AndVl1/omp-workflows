@@ -1,88 +1,169 @@
 ---
 name: custom-escalation-adapter
-description: Add your own escalation channel for CTO sub-orchestration — implement the EscalationAdapter interface (core), wire it per-project via .omp/escalation.json + outbox dispatcher, ingest answers as files. Use when the user wants to connect Telegram/Slack/ntfy/custom push to CTO escalations, asks "escalation adapter", "communication channel for CTO", "куда слать эскалации", or needs to build a consumer-side channel. Full guide: docs/adding-escalation-adapter.md.
+description: Add a project-local Telegram/Slack/ntfy/custom escalation channel through the fullstack adapter seam. Use when the user asks to build or connect a CTO escalation transport, notification channel, or custom adapter.
 ---
 
-# Custom Escalation Adapter — канал связи для CTO эскалаций
+# Custom escalation adapter
 
-Движок коммуникации живёт в `@andvl1/omp-workflows-core` (интерфейс + хелперы);
-**реализация канала — per-project**: каждый потребитель пишет свой адаптер под
-свой мессенджер/пуш и регистрирует его через `.omp/escalation.json`.
-Fullstack поставляет только референсы (HTTP send-only, Telegram send+long-polling).
-Полный гайд с примерами кода: `docs/adding-escalation-adapter.md`.
+## 1. Consumer-owned project activation is explicit
 
-## 1. Жизненный цикл (что уже написано, не пиши заново)
+A custom adapter extension owns a physical project-local marker, for example
+`.omp/my-channel.activation.json`, and the matching `WorkflowOwnerIdentity`
+activation descriptor. An explicit project bootstrap writes the exact marker
+bytes and digest. Loading the extension, registering ordinary commands, and
+installing dependencies never create it. No global or home-directory marker is
+valid.
 
-```
-агент (CTO/лид) ── .work-state/cto/<runId>/outbox/<escId>.json ──► dispatcher
-dispatcher ── sanitizeEscalation (R4) ──► adapter.send(esc) ──► канал
-канал/пользователь ──► .work-state/cto/<runId>/answers/<escId>.json ──► агент (чекпоинт)
-```
+The marker proves persisted cooperative project intent only. A host
+`ExtensionAPI` does not expose source identity, so an in-process extension
+could copy a descriptor or read the marker; never describe it as cryptographic
+package-authorship proof. Core still requires exact owner, marker, and canonical
+root matching. Missing, malformed, extra-key, symlinked, or wrong-digest
+markers fail closed as `activation_markers_missing`.
 
-- **Outbox-диспетчер, санитизация, retry/backoff (3), файловая очередь ответов —
-  уже в fullstack** (`src/adapters/registry.ts`, `session_start`-хук). Не дублируй.
-- Потребитель реализует ТОЛЬКО интерфейс из core:
+## 2. Authenticate registration through core
+
+Use the public core registry subpath and keep the transaction outermost. The
+curated `closeWorkflowActivation` helper closes the opaque context and releases
+only capabilities newly acquired by that exact successful activation. The
+adapter registry retains a token-derived live guard after commit, so successful
+activation must remain open until the matching session/root shuts down.
+
+Keep active activation in plugin-local state keyed by the extension instance
+and exact canonical root; do not create a process-global ownership map. Failed
+begin/register/commit paths roll back and close immediately. On
+`session_shutdown`, verify the same session/root, delete the local slot, and
+then call `closeWorkflowActivation`.
 
 ```ts
-import type { Escalation, EscalationAdapter, EscalationReceipt } from "@andvl1/omp-workflows-core";
+import {
+  beginRegistryRegistration,
+  closeWorkflowActivation,
+  commitRegistryRegistration,
+  openWorkflowActivation,
+  rollbackRegistryRegistration,
+  type WorkflowOwnerIdentity,
+} from "@andvl1/omp-workflows-core/registry";
+import {
+  registerEscalationAdapter,
+  type EscalationAdapterCapabilities,
+  type EscalationAdapterFactory,
+} from "@andvl1/omp-workflows-fullstack/adapters";
 
-export class MyChannelAdapter implements EscalationAdapter {
-  readonly kind = "my-channel";
-  constructor(private readonly webhookUrl: string) {}
-  async send(esc: Escalation): Promise<EscalationReceipt> {
-    try {
-      const res = await fetch(this.webhookUrl, {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify(esc),            // уже санитизировано движком (R4)
-      });
-      return { sent: res.ok, channelRef: `http:${res.status}` };
-    } catch (e) {
-      return { sent: false, channelRef: e instanceof Error ? e.message : String(e) };
-    }
+const ownerForProjectRoot = (projectRoot: string): WorkflowOwnerIdentity =>
+  customOwnerWithMarker(projectRoot); // .omp/my-channel.activation.json + exact digest
+
+type Active = {
+  readonly projectRoot: string;
+  readonly activation: Extract<ReturnType<typeof openWorkflowActivation>, { ok: true }>;
+};
+const activeByExtension = new WeakMap<object, Active>();
+
+function mount(extension: object, projectRoot: string, factory: EscalationAdapterFactory): void {
+  const owner = ownerForProjectRoot(projectRoot);
+  const activation = openWorkflowActivation(projectRoot, ["workflow_registration"], owner);
+  if (!activation.ok) throw new Error(`${activation.code}: ${activation.error}`);
+  const transaction = beginRegistryRegistration(
+    activation.registry_context,
+    projectRoot,
+    ["escalation_adapters"],
+  );
+  if (!transaction.ok) {
+    closeWorkflowActivation(activation);
+    throw new Error(`${transaction.code}: ${transaction.error}`);
   }
-  async cancel(_id: string): Promise<void> { /* best-effort */ }
+  try {
+    const capabilities: EscalationAdapterCapabilities = {
+      canReceiveInbound: true,
+      canSend: true,
+      canSendWithIdempotency: true,
+    };
+    registerEscalationAdapter(transaction.token, "my-channel", factory, capabilities);
+    commitRegistryRegistration(transaction.token);
+  } catch (error) {
+    try { rollbackRegistryRegistration(transaction.token); } catch { /* preserve original */ }
+    closeWorkflowActivation(activation);
+    throw error;
+  }
+  // Keep the activation live for the registry guard; close on exact shutdown.
+  activeByExtension.set(extension, { projectRoot, activation });
+}
+
+function onSessionShutdown(extension: object, projectRoot: string): void {
+  const active = activeByExtension.get(extension);
+  if (!active || active.projectRoot !== projectRoot) return;
+  activeByExtension.delete(extension);
+  closeWorkflowActivation(active.activation);
 }
 ```
 
-## 2. Ответы — только файлами
+The token is opaque and borrowed. Never invent one, persist one, pass an owner
+id instead, or use it after commit/rollback. A registration transaction must
+request only `escalation_adapters`; do not borrow a generic runtime transaction
+facade or unrelated authority. Match the exact session/root before shutdown
+cleanup.
 
-Ответы НЕ возвращаются через adapter. Колбэк/вебхук канала пишет файл
-`.work-state/cto/<runId>/answers/<escId>.json`:
+## 3. Implement the channel
+
+Implement core's `EscalationAdapter` (`kind`, `send`, `cancel`, and any declared
+inbound/idempotency methods). The factory receives validated project
+configuration, cwd, and the pinned root:
 
 ```ts
-import { ensureAnswersDir } from "@andvl1/omp-workflows-core";
-import { writeFileSync, join } from "node:fs";
-
-const dir = ensureAnswersDir(runId, cwd);   // .work-state/cto/<runId>/answers/
-writeFileSync(join(dir, `${escId.replace(/[^\w-]/g, "-")}.json`),
-  JSON.stringify({ id: escId, answer, at: new Date().toISOString(), by: "my-channel" }));
+const factory: EscalationAdapterFactory = (config, cwd, pinnedRoot) => {
+  const settings = config["my-channel"];
+  if (!isValidSettings(settings)) return null;
+  return new MyChannelAdapter(settings, pinnedRoot);
+};
 ```
 
-Файлы переживают рестарты; агент подхватывает ответ на следующем чекпоинте.
+`send` receives R4-sanitized data. Return `{ sent: false, channelRef }` on a
+transport failure instead of throwing; the dispatcher applies bounded retry.
+Do not add secrets or untrusted content to the outgoing body.
 
-## 3. Регистрация (per-project)
+`createEscalationAdapter` is the safe construction path for a configured
+built-in or authenticated consumer registration. It returns `null` for an
+unusable or capability-incompatible configuration.
+
+## 4. Persist inbound answers safely
+
+Answers are files, not return values from the adapter. Validate safe run and
+escalation ids, verify `pinnedRoot.isStable()`, create the project-local
+`.work-state/cto/<runId>/answers/` directory through the pinned root, and use
+exclusive canonical filenames. Never import core raw readers or write through
+an unpinned absolute path. Re-check stability after writing.
+
+## 5. Project configuration and explicit copy
+
+A project may configure a channel in `.omp/escalation.json`:
 
 ```json
-// <project>/.omp/escalation.json
-{ "adapter": "http", "http": { "url": "https://ntfy.sh/my-topic", "headers": {} } }
-// или: { "adapter": "telegram", "telegram": { "token": "...", "chatId": "...", "pollIntervalMs": 5000 } }
+{
+  "adapter": "my-channel",
+  "my-channel": { "endpoint": "https://example.invalid/topic" }
+}
 ```
 
-`session_start` читает конфиг → `createEscalationAdapter` → `startDispatcher`
-(drain outbox каждые 10с + немедленный drain при старте — pending-эскалации
-переживают рестарт). Свой канал: зарегистрируй адаптер в своём extension
-(расширь `createEscalationAdapter` или зови `startDispatcher` сам).
+The project must run an explicit copy/bootstrap command only when disk command
+discovery is required:
 
-## 4. Референсы и тесты
+```bash
+npm run --prefix node_modules/@andvl1/omp-workflows-fullstack copy-commands
+# or
+npx omp-workflows-copy-commands
+```
 
-- Двусторонний канал (send + long-polling → answers + map msgId→escId):
-  `packages/fullstack/src/adapters/telegram.ts`.
-- Односторонний: `packages/fullstack/src/adapters/http.ts`.
-- Тесты (DI `fetchImpl`, retry/backoff, ответы): `packages/fullstack/test/adapters.test.ts`.
+There is no package `postinstall` hook. Normal dependency installation performs
+no project writes, command copy, marker creation, or global installation.
 
-## 5. Правила
+## 6. Checklist
 
-- R4-санитизация в движке: секретные строки вырезаются до `send`; канал контент не добавляет.
-- `send` не бросает: `{ sent: false }` → диспетчер retry с backoff (до 3).
-- `blocker` ждёт без таймаута, команда паркуется (`background_wait`), остальные работают.
-- Эскалации шлют CTO/лид, не воркеры (контракт глубины main(CTO) → лид → воркер).
+- Explicitly bootstrap this extension's project-local physical marker.
+- Call `openWorkflowActivation` and require the exact marker/digest/root.
+- Borrow a token from `beginRegistryRegistration(..., ["escalation_adapters"])`.
+- Register through `@andvl1/omp-workflows-fullstack/adapters` only.
+- Commit or rollback once; retain successful activation until exact shutdown.
+- Close failed transactions immediately and successful activations with
+  `closeWorkflowActivation` only after matching session/root shutdown.
+- Keep dispatcher/queue/bridge/raw registry helpers private.
+- Persist inbound answers only through a stable pinned project root.

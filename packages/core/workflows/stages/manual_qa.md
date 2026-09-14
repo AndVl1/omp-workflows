@@ -69,7 +69,8 @@ when the runtime/deterministic evidence is real and an explicit capability, cred
 configuration blocker makes one or more required criteria unobservable; preserve that blocker
 in `blocked_prerequisites`. A missing or unknown verdict is treated as FAIL (never auto-pass).
 
-**Feeds**: `qa_tests` consumes `manual_qa.evidence`; `summary` consumes the verdict.
+**Feeds**: `qa_tests` may consume `manual_qa.evidence` as context. The independent
+`qa_tests` artifact, not this report's verdict, is required before `summary`.
 
 ---
 

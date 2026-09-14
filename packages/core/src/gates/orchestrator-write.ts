@@ -8,7 +8,7 @@
  * fail closed for strict-state writes.
  */
 import { isAbsolute, relative, resolve, dirname, join, sep } from "node:path";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { resolveState } from "../engine/state.js";
 
 interface ToolCallEvent {
@@ -19,43 +19,51 @@ interface ToolCallContext { cwd: string; hasUI?: boolean; actor?: Actor }
 
 type Actor = "orchestrator" | "worker" | "lead";
 
+// These are generic shell-capable execution surfaces. They are deliberately
+// classified by tool identity, not by parsing command text or interpreter
+// encodings; strict workers have no generic shell authorization path.
+const GENERIC_SHELL_EXECUTION_TOOLS = new Set([
+  "bash", "sh", "zsh", "fish", "shell", "exec", "execute", "run", "run_command", "command", "terminal",
+  "node", "python", "python3", "perl", "ruby", "php",
+]);
+function isGenericShellExecutionTool(toolName: string): boolean {
+  return GENERIC_SHELL_EXECUTION_TOOLS.has(toolName.toLowerCase());
+}
+
 export function orchestratorWriteGate(
   event: ToolCallEvent,
   ctx: ToolCallContext,
 ): { block?: boolean; reason?: string } | void {
   if (!hasStrictOrchestratorState(ctx.cwd)) return;
-  if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
+  if (event.toolName !== "write" && event.toolName !== "edit" && !isGenericShellExecutionTool(event.toolName)) return;
   // The host invokes mounted `xd://` devices through the generic write
   // transport. That transport is not a project filesystem mutation.
-  if (event.toolName !== "bash" && isMountedToolRouteInput(event.input)) return;
+  if ((event.toolName === "write" || event.toolName === "edit") && isMountedToolRouteInput(event.input)) return;
   const actor = trustedActorOf(ctx);
 
-  if (event.toolName === "bash") {
-    const command = commandFromInput(event.input);
-    const targets = bashMutationTargets(command);
-    const canonical = targets.find((path) => isCanonicalStatePath(path, ctx.cwd));
-    if (canonical || looksLikeWorkflowStateMutation(command)) {
-      return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused bash mutation${canonical ? ` '${canonical}'` : ""}` };
-    }
-    const projectTarget = targets.find((path) => isProjectPath(path, ctx.cwd) && !isWorkStatePath(path, ctx.cwd));
-    if (projectTarget && actor !== "worker") {
-      return { block: true, reason: `orchestrator policy: source mutation via bash requires a trusted worker actor; got ${actor ?? "unknown"}` };
-    }
-    if (looksLikeSourceMutation(command) && actor !== "worker") {
-      return { block: true, reason: `orchestrator policy: source mutation via bash requires a trusted worker actor; got ${actor ?? "unknown"}` };
-    }
-    return;
+  if (isGenericShellExecutionTool(event.toolName)) {
+    // Generic shell-capable tools have no descriptor-bound authorization seam.
+    // Strict workers must use scoped host Write/Edit or a trusted validation
+    // owner; never parse shell text to guess whether it is read-only.
+    const shellSurface = event.toolName === "bash" ? "shell-capable Bash execution" : "generic shell execution tool";
+    return { block: true, reason: `orchestrator policy: strict workflows deny ${shellSurface}; got ${actor ?? "unknown"}` };
   }
 
   const paths = pathsFromInput(event.input);
   if (paths.length === 0) {
     return { block: true, reason: `orchestrator policy: ${actor ?? "unknown"} write/edit has no verifiable path` };
   }
+  if (actor === "worker") {
+    const authority = paths.find((path) => isEngineOwnedPath(path, ctx.cwd));
+    if (authority) {
+      return { block: true, reason: `orchestrator policy: engine-owned workflow authority tree; refused '${authority}'` };
+    }
+    return;
+  }
   const canonical = paths.find((path) => isCanonicalStatePath(path, ctx.cwd));
   if (canonical) {
     return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused '${canonical}'` };
   }
-  if (actor === "worker") return;
   if (actor !== "orchestrator" && actor !== "lead") {
     return { block: true, reason: "orchestrator policy: trusted actor identity is required for source writes" };
   }
@@ -76,12 +84,6 @@ function trustedActorOf(ctx: ToolCallContext): Actor | undefined {
 export function actorOf(input: Record<string, unknown> | undefined): Actor | undefined {
   const raw = input?.__omp_actor ?? input?.actor;
   return raw === "orchestrator" || raw === "worker" || raw === "lead" ? raw : undefined;
-}
-
-function commandFromInput(input: ToolCallEvent["input"]): string {
-  if (typeof input === "string") return input;
-  if (!input) return "";
-  return String(input.command ?? "");
 }
 
 function pathsFromInput(input: ToolCallEvent["input"]): string[] {
@@ -110,16 +112,81 @@ function isMountedToolRouteInput(input: ToolCallEvent["input"]): boolean {
   return paths.length > 0 && paths.every((path) => path.trim().toLowerCase().startsWith("xd://"));
 }
 
+
+
+function isEngineOwnedTreePath(path: string, cwd: string, treeName: ".work-state" | ".omp"): boolean {
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+  const treeRoot = resolve(cwd, treeName);
+  const logical = relative(treeRoot, absolute);
+  const logicalInside = logical === "" || (!logical.startsWith(`..${sep}`) && logical !== ".." && !isAbsolute(logical));
+  if (logicalInside) return true;
+  try {
+    const realRoot = realpathSync(treeRoot);
+    let existing = absolute;
+    while (!existsSync(existing)) {
+      const parent = dirname(existing);
+      if (parent === existing) return false;
+      existing = parent;
+    }
+    const realExisting = realpathSync(existing);
+    const realCandidate = resolve(realExisting, relative(existing, absolute));
+    const physical = relative(realRoot, realCandidate);
+    return physical === "" || (!physical.startsWith(`..${sep}`) && physical !== ".." && !isAbsolute(physical));
+  } catch {
+    return false;
+  }
+}
+
+function isWorkStateTreePath(path: string, cwd: string): boolean {
+  return isEngineOwnedTreePath(path, cwd, ".work-state");
+}
+
+function isControlPlaneTreePath(path: string, cwd: string): boolean {
+  return isEngineOwnedTreePath(path, cwd, ".omp");
+}
+
+function isEngineOwnedPath(path: string, cwd: string): boolean {
+  return isWorkStateTreePath(path, cwd) || isControlPlaneTreePath(path, cwd);
+}
 function isWorkStatePath(path: string, cwd: string): boolean {
   const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
   const workState = resolve(cwd, ".work-state");
   const rel = relative(workState, absolute);
   if (rel !== "" && (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel))) return false;
   try {
+    // Orchestrator/lead writes are allowed only below the project's physical
+    // .work-state directory. A lexical path (or a realpath rooted at a
+    // symlink) is not sufficient: accepting a symlinked .work-state would
+    // authorize writes into an external tree.
+    const expectedRoot = resolve(realpathSync(cwd), ".work-state");
+    const rootStat = lstatSync(workState);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return false;
     const realRoot = realpathSync(workState);
-    const realCandidate = existsSync(absolute)
-      ? realpathSync(absolute)
-      : resolve(realpathSync(dirname(absolute)), absolute.slice(dirname(absolute).length + 1));
+    if (realRoot !== expectedRoot) return false;
+
+    // Resolve the nearest existing ancestor without following any symlinked
+    // component. This keeps nested, not-yet-created targets usable while
+    // rejecting both existing and broken symlink escapes.
+    let existing = absolute;
+    while (true) {
+      let stat;
+      try {
+        stat = lstatSync(existing);
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error
+          ? (error as { code?: unknown }).code
+          : undefined;
+        if (code !== "ENOENT" && code !== "ENOTDIR") return false;
+        const parent = dirname(existing);
+        if (parent === existing) return false;
+        existing = parent;
+        continue;
+      }
+      if (stat.isSymbolicLink()) return false;
+      break;
+    }
+    const realExisting = realpathSync(existing);
+    const realCandidate = resolve(realExisting, relative(existing, absolute));
     const realRel = relative(realRoot, realCandidate);
     return realRel === "" || (!realRel.startsWith(`..${sep}`) && realRel !== ".." && !isAbsolute(realRel));
   } catch {
@@ -143,79 +210,6 @@ function isCanonicalStatePath(path: string, cwd: string): boolean {
   }
 }
 
-function looksLikeWorkflowStateMutation(command: string): boolean {
-  const workflowPath =
-    /(?:^|[\s"'`/])(?:\.\/)?\.work-state\/(?:team-state\.json|\.active-feature|features\/[A-Za-z0-9._-]+\/state\.json|cto\/[A-Za-z0-9._-]+\/state\.json)(?=$|[\s"'`;&|),])|(?:^|[\s"'`])(?:\.\/)?(?:team-state\.json|\.active-feature)(?=$|[\s"'`;&|),])/i;
-  if (!workflowPath.test(command) && !hasRelativeWorkflowStateContext(command)) return false;
-  return /(?:>|>>|tee\b|(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|chmod|rsync|patch|ed|sponge)\b|(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|(?:python(?:3)?|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile(?:Sync)?|appendFile(?:Sync)?|write_text|write_bytes|unlink|rename|mkdir|rmdir|remove|replace)\b|(?:python(?:3)?|ruby)\b[^\n]*(?:-c|--eval)[^\n]*open\([^\n)]*,\s*["\'][^"\']*[wax+][^"\']*["\']|git\s+(?:apply|checkout|restore|reset|clean|mv|rm|show|stash)\b)/i.test(command);
-}
-
-function hasRelativeWorkflowStateContext(command: string): boolean {
-  const cd = /(?:^|[;&|]\s*)cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi;
-  const rootRelative = /(?:^|[\s"'`])(?:\.\/)?(?:team-state\.json|\.active-feature|(?:features|cto)\/[A-Za-z0-9._-]+\/state\.json)(?=$|[\s"'`;&|),])/i;
-  const nestedRelative = /(?:^|[\s"'`])(?:\.\/)?state\.json(?=$|[\s"'`;&|),])/i;
-
-  for (const match of command.matchAll(cd)) {
-    const directory = (match[1] ?? match[2] ?? match[3] ?? "").replace(/\/+$/, "");
-    const afterCd = command.slice((match.index ?? 0) + match[0].length);
-    if (/(?:^|\/)\.work-state$/.test(directory) && rootRelative.test(afterCd)) return true;
-    if (/(?:^|\/)\.work-state\/features\/[A-Za-z0-9._-]+$/.test(directory) && nestedRelative.test(afterCd)) return true;
-    if (/(?:^|\/)\.work-state\/cto\/[A-Za-z0-9._-]+$/.test(directory) && nestedRelative.test(afterCd)) return true;
-  }
-  return false;
-}
-function bashMutationTargets(command: string): string[] {
-  const targets: string[] = [];
-  const redirection = /(?:^|[\s;&|])>>?\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/g;
-  for (const match of command.matchAll(redirection)) {
-    const target = match[1] ?? match[2] ?? match[3];
-    if (target) targets.push(target);
-  }
-  const dd = /\bdd\b[^\n]*\bof=(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi;
-  for (const match of command.matchAll(dd)) {
-    const target = match[1] ?? match[2] ?? match[3];
-    if (target) targets.push(target);
-  }
-  const tee = /(?:^|[;&|]\s*)tee(?:\s+-[^\s]+)*\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi;
-  for (const match of command.matchAll(tee)) {
-    const target = match[1] ?? match[2] ?? match[3];
-    if (target) targets.push(target);
-  }
-  return targets;
-}
-
-function isProjectPath(path: string, cwd: string): boolean {
-  const root = resolve(cwd);
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
-  const rel = relative(root, absolute);
-  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
-}
-
-
-const CHECKOUT_PATH_MUTATION = /\bgit\s+checkout\b[^;&|]*(?:--(?:\s|$)|(?:^|\s)(?:\.{1,2}|\/)(?:[\/\s"'`]|$)|(?:^|\s)(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$))/i;
-const CHECKOUT_FORCE_MUTATION = /(?:^|[;&|]\s*)git\s+checkout\b[^;&|]*(?:--force\b|(?:^|\s)-f(?:\s|$|[;&|]))/;
-const CHECKOUT_FORCE_BRANCH_MUTATION = /(?:^|[;&|]\s*)git\s+checkout\b[^;&|]*(?:^|\s)-B(?:\s|$|[;&|])/;
-const SWITCH_DISCARD_MUTATION = /(?:^|[;&|]\s*)git\s+switch\b[^;&|]*--discard-changes\b/i;
-const SWITCH_FORCE_BRANCH_MUTATION = /(?:^|[;&|]\s*)git\s+switch\b[^;&|]*(?:^|\s)-C(?:\s|$|[;&|])/;
-
-/**
- * Detect direct source/worktree mutations that the orchestrator must not perform.
- *
- * Commit/publication and history-integration commands (`git commit`, `git push`,
- * `git fetch`, `git merge`, `git rebase`, `git cherry-pick`, `gh pr create`)
- * reconcile or publish delegated work and are intentionally not matched here.
- * Branch setup is also allowed; only checkout/switch forms that restore or
- * discard worktree contents remain blocked.
- */
-function looksLikeSourceMutation(command: string): boolean {
-  return /(?:\b(?:tee)\b|\b(?:cat|printf|echo)\b[^\n]*(?:>|>>|<<)|(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|rsync|patch|ed|sponge)\b|\b(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\b(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\bgit\s+(?:apply|restore|reset|clean|mv|rm|stash)\b|\bgit\s+show\b[^\n]*(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:python(?:3)?|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile(?:Sync)?|appendFile(?:Sync)?|write_text|write_bytes|unlink|rename|mkdir|rmdir|remove|replace)\b|(?:python(?:3)?|ruby)\b[^\n]*(?:-c|--eval)[^\n]*open\([^\n)]*,\s*["'][^"']*[wax+][^"']*["'])/i.test(command)
-    || CHECKOUT_PATH_MUTATION.test(command)
-    || CHECKOUT_FORCE_MUTATION.test(command)
-    || CHECKOUT_FORCE_BRANCH_MUTATION.test(command)
-    || SWITCH_DISCARD_MUTATION.test(command)
-    || SWITCH_FORCE_BRANCH_MUTATION.test(command);
-}
-
 export function hasStrictOrchestratorState(cwd: string): boolean {
   const resolved = resolveState(cwd);
   if (resolved.invalid) return true;
@@ -224,61 +218,46 @@ export function hasStrictOrchestratorState(cwd: string): boolean {
 
 // ── Bounded write_scope experiment (scope 7) ───────────────────────────────
 //
-// Advisory-only worker path matcher, OFF by default. When enabled it is
-// composed AFTER orchestratorWriteGate and can only ADD blocks (narrow the
-// paths a worker may write); it can never weaken the orchestrator boundary
-// or the canonical-state protection. Shipped defaults keep the single-writer
-// model: no write_scope is configured unless a bundle opts in explicitly.
+// Descriptor-bound worker mutation policy, OFF by default. The declaration
+// remains part of the bundle shape for compatibility, but no generic host
+// write/edit/Bash mutation is authorized until a descriptor-bound execution
+// route exists. Shipped defaults keep the single-writer model.
 
 export interface WorkerWriteScope {
   enabled: boolean;
-  /** Glob patterns a worker may write (relative to the project root). */
+  /** Legacy scope declaration retained for strict shape validation. */
   allow: string[];
-  /** Glob patterns a worker may never write (deny wins over allow). */
+  /** Legacy deny declaration retained for strict shape validation. */
   deny?: string[];
 }
 
-function matchesAnyGlob(path: string, patterns: string[]): boolean {
-  const normalized = path.replace(/\\/g, "/");
-  for (const pattern of patterns) {
-    const candidate = pattern.replace(/\\/g, "/");
-    if (candidate === normalized) return true;
-    if (candidate.endsWith("/**") && normalized.startsWith(candidate.slice(0, -3))) return true;
-    if (candidate.endsWith("/") && normalized.startsWith(candidate)) return true;
-    const base = candidate.replace(/\/\*$/u, "");
-    if (base !== candidate && (normalized === base || normalized.startsWith(`${base}/`))) return true;
-  }
-  return false;
-}
+const DESCRIPTOR_BOUND_MUTATION_UNAVAILABLE = "write_scope: descriptor_bound_mutation_unavailable";
 
 /**
- * Narrowing gate for worker source writes. Composed after
- * orchestratorWriteGate in `registerTeamWorkflow`; it only ever blocks
- * worker writes outside the declared scope. Non-worker actors and disabled
- * scopes are unaffected.
+ * Experimental worker write_scope contract. The host's generic write/edit and
+ * Bash tools execute pathnames after this hook returns; without a
+ * descriptor-bound host route, allowing even an apparently in-scope target
+ * would leave a TOCTOU race. Enabled scopes therefore fail closed for every
+ * mutation. Generic shell execution remains denied even for read-only-looking
+ * commands; no shell-text parser is an authorization mechanism. The flag stays off by default.
  */
 export function workerWriteScopeGate(
   event: ToolCallEvent,
   ctx: ToolCallContext & { writeScope?: WorkerWriteScope },
 ): { block?: boolean; reason?: string } | void {
   const scope = ctx.writeScope;
-  if (!scope?.enabled) return;
-  if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
-  if (event.toolName !== "bash" && isMountedToolRouteInput(event.input)) return;
+  if (scope === undefined || scope === null || scope.enabled === false) return;
+  if (event.toolName !== "write" && event.toolName !== "edit" && !isGenericShellExecutionTool(event.toolName)) return;
+  if ((event.toolName === "write" || event.toolName === "edit") && isMountedToolRouteInput(event.input)) return;
   if (trustedActorOf(ctx) !== "worker") return;
-  const paths = event.toolName === "bash" ? bashMutationTargets(commandFromInput(event.input)) : pathsFromInput(event.input);
-  if (paths.length === 0) return;
-  for (const path of paths) {
-    const absolute = isAbsolute(path) ? resolve(path) : resolve(ctx.cwd, path);
-    const rel = relative(resolve(ctx.cwd), absolute);
-    if (rel.startsWith("..") || isAbsolute(rel)) {
-      return { block: true, reason: `write_scope: worker target '${path}' escapes the project root` };
-    }
-    if (matchesAnyGlob(rel, scope.deny ?? [])) {
-      return { block: true, reason: `write_scope: worker write to '${rel}' is denied by write_scope` };
-    }
-    if (!matchesAnyGlob(rel, scope.allow)) {
-      return { block: true, reason: `write_scope: worker write to '${rel}' is outside the declared write scope` };
-    }
+  if (scope.enabled !== true) return { block: true, reason: "write_scope: malformed scope enablement" };
+  if (!Array.isArray(scope.allow) || scope.allow.some((pattern) => typeof pattern !== "string")
+    || (scope.deny !== undefined && (!Array.isArray(scope.deny) || scope.deny.some((pattern) => typeof pattern !== "string")))) {
+    return { block: true, reason: "write_scope: malformed scope patterns" };
   }
+
+  if (isGenericShellExecutionTool(event.toolName)) {
+    return { block: true, reason: `${DESCRIPTOR_BOUND_MUTATION_UNAVAILABLE}: generic shell execution requires a descriptor-bound host route` };
+  }
+  return { block: true, reason: `${DESCRIPTOR_BOUND_MUTATION_UNAVAILABLE}: generic host ${event.toolName} cannot bind a pinned descriptor` };
 }

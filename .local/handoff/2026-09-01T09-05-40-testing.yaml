@@ -1,0 +1,28 @@
+id: 2026-09-01T09-05-40-testing
+parent: null
+agent: testing
+timestamp: "2026-09-01T09:05:40Z"
+status: completed
+context:
+  task: "T113 additive package smoke coverage for readable specification workflow assets, commands, adapters, and recognizers"
+  phase: "validation-release"
+output:
+  files:
+    - packages/core/test/smoke.test.ts
+    - packages/fullstack/test/package-contract.test.ts
+    - packages/core/src/index.ts
+  changes:
+    - "Assert all direct specification, spec-import, do-work, and cto command registrations and executable usage paths."
+    - "Assert shipped constitution/spec-preparation profiles, workflow JSON schemas, artifact executable schemas, and core adapter exports."
+    - "Assert fullstack Spec Kit, OpenSpec, BMAD, Superpowers, XPowers, and generic recognizers resolve and registration is complete/idempotent."
+    - "Export specImportCommand, parseSpecificationImportCommand, specificationImportUsage, and ParsedSpecificationImportCommand from the core public barrel."
+  verification:
+    - "Confirmed accidental packages/core/test/smoke.test.ts:227 probe file removed."
+    - "Scoped core and fullstack tests attempted; both blocked before test execution by missing package 'bun' imported through @oh-my-pi/pi-utils."
+next:
+  agent: null
+  task: "Main agent performs build and project-wide validation."
+  priority: high
+  acceptance_criteria:
+    - "Refresh core dist so the new spec-import public exports are present in the shipped artifact."
+    - "Run project validation after sibling wave changes land."

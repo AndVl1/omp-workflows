@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "ref": "constitution.validation.d17dbb5bcd23c5c5c7f80a16657889286e9a31b3dbf889662622adb5115e4835",
+  "document_sha256": "d17dbb5bcd23c5c5c7f80a16657889286e9a31b3dbf889662622adb5115e4835",
+  "result": "usable",
+  "validator": "constitution-usability@1",
+  "checked_at": "2026-09-05T02:34:33.700Z"
+}

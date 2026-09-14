@@ -4,7 +4,7 @@
   "description": "COMPLEX features. Parallel exploration, mandatory clarifying questions, parallel architecture options, scoped implementation, parallel review.",
   "completion_intent": {
     "mode": "complete_outcome",
-    "acceptance": "dod_and_artifacts",
+    "acceptance": "quality_gates_and_artifacts",
     "source": "workflow_policy",
     "rationale": "Full-feature workflows complete the requested outcome with durable artifacts and DoD evidence."
   },
@@ -158,7 +158,7 @@
       "type": "single",
       "role": "qa",
       "consumes": ["manual_qa", "implementation", "architecture"],
-      "gate": "manual_qa.verdict != FAIL || !scope.has_runtime",
+      "gate": "qa_reported_pass",
       "produces": "qa_tests"
     },
     {

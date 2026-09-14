@@ -1,0 +1,29 @@
+{
+  "label": "t11203-final-core-test",
+  "command": "npm run test:core",
+  "argv": [
+    "npm",
+    "run",
+    "test:core"
+  ],
+  "started_at_utc": "2026-09-11T18:08:09.914Z",
+  "ended_at_utc": "2026-09-11T18:36:21.655Z",
+  "duration_ms": 1691684,
+  "exit_code": 1,
+  "signal": null,
+  "spawn_error": null,
+  "source_snapshot_digest": "ca1300adb9f9e04bb79716d9355cda8c2a2b1bd5eadc919171aec4efbe8b2006",
+  "source_snapshot_path": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-final-source-snapshot-start.json",
+  "log": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-final-core-test.log",
+  "sha256": "b2ed5e1f42026db3fb3e8eb9ef591ed83aadcf79d9216f1d73a10c61a9f071ae",
+  "counts": {
+    "log_bytes": 247505,
+    "log_lines": 3121,
+    "tests": 1594,
+    "passed": 1516,
+    "failed": 78,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0
+  }
+}

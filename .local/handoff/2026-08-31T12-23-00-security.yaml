@@ -1,0 +1,65 @@
+id: 2026-08-31T12-23-00-security
+parent: null
+agent: security
+timestamp: "2026-08-31T12:23:00"
+status: completed
+
+context:
+  task: "Remediate foundation constitution-impact trust, durable evidence, symlink containment, and artifact://135 follow-up"
+  phase: "foundation-contracts"
+
+output:
+  summary: "Replaced caller-trusted constitution impact assertions with deterministic project-bound durable evidence. Follow-up diagnosed artifact://135 as a stale focused-fixture validation_ref, corrected to the engine's full-SHA evidence identity without weakening production checks."
+  vulnerabilities:
+    critical: 0
+    high: 3
+    medium: 0
+    low: 0
+  cargo_deny:
+    status: not_run
+    advisories: null
+    license_issues: null
+    note: "Dependency surface unchanged and validation remains reserved for CTO."
+  dependencies:
+    outdated: null
+    unmaintained: null
+    actions: []
+  unsafe_blocks:
+    total: 0
+    reviewed: 0
+    approved: 0
+    needs_refactor: 0
+  issues:
+    - severity: high
+      location: packages/core/src/specification/prerequisite.ts
+      issue: "Caller-crafted impact assessment could authorize drift clearance."
+      fix: "Load strict project-local evidence and independently verify binding hashes, project identity, complete inventory, evaluator output, and exact caller/disk equality."
+    - severity: high
+      location: packages/core/src/specification/constitution-impact.ts
+      issue: "Assessment journaling was advisory and omitted a complete durable trust binding."
+      fix: "Require atomic persistence/read-back of stable assessment id/hash, binding hashes, inventory/hash, and per-artifact verdict evidence before returning success."
+    - severity: high
+      location: packages/core/src/specification/constitution-impact.ts
+      issue: "Lexical evidence joins could follow hostile state-directory symlinks."
+      fix: "Preflight and recheck each state ancestor, reject symlinks/non-directories, and enforce canonical realpath containment for reads and writes."
+  follow_up:
+    ground_truth: artifact://135
+    root_cause: "The test's manually reconstructed current binding used constitution.validation.<sha8>; prerequisite now durably binds constitution.validation.<full-sha256>. Exact binding verification therefore correctly rejected the otherwise legitimate assessment as stale."
+    correction: "Use the full document SHA-256 in the focused fixture validation_ref. Production verification remains unchanged."
+  files_changed:
+    - packages/core/src/specification/constitution-impact.ts
+    - packages/core/src/specification/prerequisite.ts
+    - packages/core/test/specification-constitution.test.ts
+    - .work-state/artifacts/sdd-foundation/impact-trust-remediation.json
+  validation:
+    status: skipped
+    reason: "No gate rerun per assignment; artifact://135 accepted as ground truth. Scoped diagnostic only identified the exact binding-field mismatch."
+
+next:
+  agent: rust-code-reviewer
+  task: "Review durable impact evidence trust and full-SHA fixture correction; CTO should rerun gates."
+  priority: high
+  acceptance_criteria:
+    - "Forged, incomplete, stale, affected, and foreign assessments cannot clear constitution drift."
+    - "A deterministic persisted no-impact assessment with the exact full-SHA usability evidence binding can clear matching drift."
+    - "Symlinked impact evidence ancestors cannot create or write outside the project."

@@ -151,6 +151,23 @@ test("integration: writes the jsonl log under .work-state/features/default/obser
   }
 });
 
+test("integration: legacy root active-feature selects the migrated feature without default workspace pollution", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    // Legacy fixtures keep the canonical selector at the project root and do
+    // not have a native .work-state/.active-feature pointer yet.
+    writeFileSync(join(cwd, ".active-feature"), "legacy-feature\n", "utf8");
+    observabilityHooks.onBeforeAgentStart({ systemPrompt: [] }, ctx(cwd));
+    await flushRecorder(cwd);
+
+    const legacyLog = join(cwd, ".work-state", "features", "legacy-feature", "observability", "events.jsonl");
+    assert.ok(existsSync(legacyLog), "legacy root selector routes events to the migrated feature");
+    assert.equal(existsSync(join(cwd, ".work-state", "features", "default")), false, "legacy startup does not materialize the default feature workspace");
+  } finally {
+    cleanup();
+  }
+});
+
 test("integration: writeState without an event log still produces valid state", () => {
   const { cwd, cleanup } = withTempDir();
   try {

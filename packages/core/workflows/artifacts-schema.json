@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "fullstack-team/workflows/artifacts-schema.json",
   "title": "Handoff Artifacts",
-  "description": "Typed handoff contracts between workflow stages. Each stage with a `produces` field writes .work-state/artifacts/<id>.json matching the schema below. Downstream stages declare these ids in `consumes` and read them from disk instead of receiving pasted prose. Artifacts survive context compaction and make the inter-stage contract explicit.",
+  "description": "Typed handoff contracts between workflow stages. Each stage with a `produces` field writes .work-state/artifacts/<id>.json matching the schema below. Downstream stages declare these ids in `consumes` and read them from disk instead of receiving pasted prose. Artifacts survive context compaction and make the inter-stage contract explicit. Native readable specification",
   "definitions": {
     "discovery": {
       "type": "object",
@@ -78,8 +78,87 @@
       "properties": {
         "files_touched": { "type": "array", "items": { "type": "string" } },
         "commits": { "type": "array", "items": { "type": "string" } },
-        "build_status": { "enum": ["pass", "fail", "n/a"] },
+        "build_status": { "enum": ["pass", "fail", "n/a"], "description": "Worker-reported check status only; independent qa_tests is the workflow QA authority." },
+        "worker_attested": { "type": "boolean", "description": "Optional worker self-attestation; never substitutes for the independent qa_tests artifact." },
         "scope": { "type": "array", "items": { "type": "string" }, "description": "Project-defined scope names touched (e.g. backend-kotlin, go, frontend, mobile, devops, rust). Matches scope_map in team.config." }
+      }
+    },
+    "conformance_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Canonical typed evidence envelope. CTO conformance reads only entries persisted in this artifact; caller wrappers may select an entry but cannot author its semantics.",
+      "required": ["schema_version", "artifact_id", "entries"],
+      "properties": {
+        "schema_version": { "enum": [1] },
+        "artifact_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
+        "entries": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["evidence_id", "kind", "subject_id", "requirement_id", "handoff_digest", "execution_claim_id", "recorded_at"],
+            "properties": {
+              "evidence_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
+              "kind": { "enum": ["implementation", "review", "executed_test", "intent_conflict"] },
+              "subject_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
+              "requirement_id": { "type": ["string", "null"], "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
+              "handoff_digest": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" },
+              "execution_claim_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
+              "review_verdict": { "enum": ["pass", "fail"] },
+              "test": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["evidence_ref", "test_kind", "status", "executed_at"],
+                "properties": {
+                  "evidence_ref": { "type": "object", "additionalProperties": false, "required": ["artifact_id", "path", "sha256", "schema_status", "quality_gate_status"], "properties": { "artifact_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" }, "path": { "type": "string", "minLength": 1, "maxLength": 16384 }, "sha256": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" }, "schema_status": { "enum": ["met", "failed"] }, "quality_gate_status": { "enum": ["met", "pending", "failed"] } } },
+                  "test_kind": { "enum": ["unit", "integration", "e2e", "runtime"] },
+                  "status": { "enum": ["pass", "fail"] },
+                  "executed_at": { "type": "string", "minLength": 24, "maxLength": 24, "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" }
+                }
+              },
+              "intent_message": { "type": "string", "maxLength": 16384 },
+              "recorded_at": { "type": "string", "minLength": 24, "maxLength": 24, "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" }
+            }
+          }
+        }
+      }
+    },
+    "quality_gate_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Canonical typed quality-gate envelope. CTO conformance derives gate status from persisted gates, never from caller wrappers.",
+      "required": ["schema_version", "artifact_id", "gates"],
+      "properties": {
+        "schema_version": { "enum": [1] },
+        "artifact_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
+        "gates": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["gate_id", "source", "status", "evidence_refs", "findings", "evaluated_at"],
+            "properties": {
+              "gate_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
+              "source": { "enum": ["project_constitution", "execution_profile"] },
+              "status": { "enum": ["pass", "fail"] },
+              "evidence_refs": {
+                "type": "array",
+                "maxItems": 64,
+                "items": { "type": "object", "additionalProperties": false, "required": ["artifact_id", "path", "sha256", "schema_status", "quality_gate_status"], "properties": { "artifact_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" }, "path": { "type": "string", "minLength": 1, "maxLength": 16384 }, "sha256": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" }, "schema_status": { "enum": ["met", "failed"] }, "quality_gate_status": { "enum": ["met", "pending", "failed"] } } }
+              },
+              "findings": {
+                "type": "array",
+                "maxItems": 128,
+                "items": { "type": "object", "additionalProperties": false, "required": ["code", "subject_id", "message", "evidence_refs"], "properties": { "code": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" }, "subject_id": { "type": ["string", "null"], "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" }, "message": { "type": "string", "minLength": 1, "maxLength": 16384 }, "evidence_refs": { "type": "array", "maxItems": 64, "items": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" } } } }
+              },
+              "evaluated_at": { "type": "string", "minLength": 24, "maxLength": 24, "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" }
+            }
+          }
+        }
       }
     },
     "debug": {
@@ -166,7 +245,7 @@
     },
     "qa_tests": {
       "type": "object",
-      "description": "Automated tests written by the qa agent AFTER manual_qa, encoding the manually-observed behavior (manual_qa.evidence) as durable regression tests. Accepted when manual_qa.verdict is PASS or CONDITIONAL while runtime exists, or when the task has no runtime (!scope.has_runtime) and manual_qa was skipped. CONDITIONAL permits deterministic regression tests to proceed but does not prove blocked live criteria; a FAIL verdict with runtime never passes this gate.",
+      "description": "Independent automated QA report produced after implementation and review-fixes. The workflow gate reads only this canonical artifact's build_status; implementation/review-fix/manual-QA reports are informational worker attestations and never substitute for it.",
       "required": ["tests_added", "build_status"],
       "properties": {
         "tests_added": { "type": "array", "items": { "type": "string" }, "description": "Test files/cases added or updated." },
@@ -444,90 +523,111 @@
     },
     "lecture_acquisition": {
       "type": "object",
-      "description": "Provider-neutral, bounded URL acquisition handoff. The consumer-owned lecture_acquire tool writes this artifact after parsing one video/playlist URL and normalizing provider evidence; core does not fetch URLs. status=failed may have an empty evidence array and cannot advance. status=partial may advance only when evidence contains at least one valid segment, and failures must preserve every unresolved source or provider warning.",
-      "required": ["schemaVersion", "status", "request", "sourceSet", "evidence", "failures", "provider", "startedAt", "completedAt"],
+      "additionalProperties": false,
+      "description": "Provider-neutral, bounded URL acquisition handoff. Persisted artifacts are schema version 2 and must carry an engine-issued feature/run/stage/intake binding.",
+      "required": ["schemaVersion", "binding", "status", "request", "sourceSet", "evidence", "failures", "provider", "startedAt", "completedAt"],
       "properties": {
-        "schemaVersion": { "type": "integer", "enum": [1], "description": "Version of the provider-neutral acquisition artifact." },
-        "status": { "enum": ["succeeded", "partial", "failed"], "description": "succeeded means all bounded sources acquired; partial means valid evidence exists but failures/gaps remain; failed cannot pass the acquisition gate." },
+        "schemaVersion": { "type": "integer", "enum": [2] },
+        "binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["featureId", "featureRunKey", "stageId", "cursorEpoch", "intakeArtifactId", "intakeSchemaVersion", "intakeContentSha256", "requestSha256", "rightsMode", "rightsSha256"],
+          "properties": {
+            "featureId": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "featureRunKey": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "stageId": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "cursorEpoch": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "intakeArtifactId": { "enum": ["lecture_intake"] },
+            "intakeSchemaVersion": { "type": "integer", "enum": [1] },
+            "intakeContentSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+            "requestSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+            "rightsMode": { "enum": ["metadata-only", "owned-audio"] },
+            "rightsSha256": { "type": "string", "minLength": 64, "maxLength": 64 }
+          }
+        },
+        "status": { "enum": ["succeeded", "partial", "failed"] },
         "request": {
           "type": "object",
-          "description": "The one URL plus natural-language prompt extracted at intake. No transcript or media prerequisite is implied.",
+          "additionalProperties": false,
           "required": ["sourceUrl", "sourceKind", "prompt", "limits"],
           "properties": {
-            "sourceUrl": { "type": "string", "description": "The single user-provided public video or playlist URL; provider adapters must revalidate and canonicalize it." },
-            "canonicalUrl": { "type": "string", "description": "Canonical allowlisted video/playlist URL, when parsing succeeded." },
-            "sourceKind": { "enum": ["video", "playlist"], "description": "Parsed URL kind." },
-            "prompt": { "type": "string", "description": "Non-empty natural-language research prompt; do not request a user transcript." },
+            "sourceUrl": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "canonicalUrl": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "sourceKind": { "enum": ["video", "playlist"] },
+            "prompt": { "type": "string", "minLength": 1, "maxLength": 16384 },
             "limits": {
               "type": "object",
-              "description": "Finite bounds. Consumer-supplied limits may tighten configured values but must never exceed hard caps.",
+              "additionalProperties": false,
               "required": ["maxItems", "maxPages", "deadlineMs", "maxAttempts", "maxResponseBytes", "maxEvidenceSegmentsPerSource"],
               "properties": {
-                "maxItems": { "type": "integer", "minimum": 1, "description": "Maximum videos resolved from a request." },
-                "maxPages": { "type": "integer", "minimum": 1, "description": "Maximum playlist pagination pages." },
-                "maxDurationSeconds": { "type": "number", "minimum": 0, "description": "Optional trusted duration bound; never inferred from a URL alone." },
-                "deadlineMs": { "type": "integer", "minimum": 1, "description": "Overall bounded acquisition deadline in milliseconds." },
-                "maxAttempts": { "type": "integer", "minimum": 1, "description": "Maximum attempts per provider call." },
-                "maxResponseBytes": { "type": "integer", "minimum": 1, "description": "Maximum accepted provider response size." },
-                "maxEvidenceSegmentsPerSource": { "type": "integer", "minimum": 1, "description": "Maximum normalized evidence segments retained for one source." },
-                "maxAudioBytes": { "type": "integer", "minimum": 1, "description": "Maximum ephemeral audio bytes." },
-                "maxTranscriptCharacters": { "type": "integer", "minimum": 1, "description": "Maximum transcript characters held in memory." },
-                "maxTranscriptSegments": { "type": "integer", "minimum": 1, "description": "Maximum normalized transcript segments accepted from one ASR response." },
-                "maxChunkCharacters": { "type": "integer", "minimum": 1, "description": "Maximum transcript characters sent in one analysis chunk." },
-                "maxChunksPerSource": { "type": "integer", "minimum": 1, "description": "Maximum analysis chunks per source." },
-                "maxAnalysisOutputBytes": { "type": "integer", "minimum": 1, "description": "Maximum analysis response bytes." },
-                "maxProviderCostCents": { "type": "integer", "minimum": 0, "description": "Optional estimated provider budget." }
+                "maxItems": { "type": "integer", "minimum": 1, "maximum": 10 },
+                "maxPages": { "type": "integer", "minimum": 1, "maximum": 100 },
+                "maxDurationSeconds": { "type": "number", "minimum": 0, "maximum": 86400 },
+                "deadlineMs": { "type": "integer", "minimum": 1, "maximum": 600000 },
+                "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 2 },
+                "maxResponseBytes": { "type": "integer", "minimum": 1, "maximum": 10485760 },
+                "maxEvidenceSegmentsPerSource": { "type": "integer", "minimum": 1, "maximum": 256 },
+                "maxAudioBytes": { "type": "integer", "minimum": 1, "maximum": 268435456 },
+                "maxTranscriptCharacters": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+                "maxTranscriptSegments": { "type": "integer", "minimum": 1, "maximum": 16384 },
+                "maxChunkCharacters": { "type": "integer", "minimum": 1, "maximum": 32000 },
+                "maxChunksPerSource": { "type": "integer", "minimum": 1, "maximum": 512 },
+                "maxAnalysisOutputBytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+                "maxProviderCostCents": { "type": "integer", "minimum": 0, "maximum": 100000 }
               }
             }
           }
         },
         "sourceSet": {
           "type": "object",
-          "description": "The bounded, stable-order source set resolved from the parsed URL. A truncated playlist must remain visibly partial.",
+          "additionalProperties": false,
           "required": ["requested", "items", "truncated", "failures"],
           "properties": {
             "requested": {
               "type": "object",
+              "additionalProperties": false,
               "required": ["kind", "canonicalUrl"],
               "properties": {
                 "kind": { "enum": ["video", "playlist"] },
-                "videoId": { "type": "string" },
-                "playlistId": { "type": "string" },
-                "canonicalUrl": { "type": "string" }
+                "videoId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "playlistId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "canonicalUrl": { "type": "string", "minLength": 1, "maxLength": 2048 }
               }
             },
             "items": {
               "type": "array",
-              "description": "Resolved video sources in deterministic order; duplicate video ids are first-wins.",
+              "maxItems": 10,
               "items": {
                 "type": "object",
+                "additionalProperties": false,
                 "required": ["sourceId", "videoId", "canonicalUrl"],
                 "properties": {
-                  "sourceId": { "type": "string", "description": "Stable source id used by evidence and mapping citations." },
-                  "videoId": { "type": "string" },
-                  "canonicalUrl": { "type": "string" },
-                  "playlistId": { "type": "string" },
-                  "position": { "type": "integer", "minimum": 0 },
-                  "title": { "type": "string" },
-                  "durationSeconds": { "type": "number", "minimum": 0 }
+                  "sourceId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "videoId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "canonicalUrl": { "type": "string", "minLength": 1, "maxLength": 2048 },
+                  "playlistId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "position": { "type": "integer", "minimum": 0, "maximum": 10000 },
+                  "title": { "type": "string", "maxLength": 16384 },
+                  "durationSeconds": { "type": "number", "minimum": 0, "maximum": 86400 }
                 }
               }
             },
-            "truncated": { "type": "boolean", "description": "True when bounds prevented claiming complete playlist coverage." },
-            "totalKnown": { "type": "integer", "minimum": 0, "description": "Optional provider-reported total before bounded truncation." },
+            "truncated": { "type": "boolean" },
+            "totalKnown": { "type": "integer", "minimum": 0, "maximum": 10000 },
             "failures": {
               "type": "array",
-              "description": "Source-resolution failures retained even when some sources succeed.",
+              "maxItems": 100,
               "items": {
                 "type": "object",
+                "additionalProperties": false,
                 "required": ["code", "message", "retryable", "attempts", "severity"],
                 "properties": {
                   "code": { "enum": ["INVALID_URL", "UNSUPPORTED_URL", "VIDEO_NOT_FOUND", "PLAYLIST_NOT_FOUND", "PRIVATE_OR_UNLISTED", "PLAYLIST_TOO_LARGE", "CAPTIONS_UNAVAILABLE", "MEDIA_NOT_ACCESSIBLE", "RIGHTS_REQUIRED", "PROVIDER_AUTH_MISSING", "QUOTA_EXCEEDED", "PROVIDER_TIMEOUT", "NETWORK_ERROR", "TRANSCRIPT_FAILED", "ANALYSIS_FAILED", "INVALID_PROVIDER_RESPONSE", "LIMIT_EXCEEDED", "PARTIAL_SOURCE_SET", "OMP_RUNTIME_UNAVAILABLE"] },
-                  "sourceId": { "type": "string" },
-                  "provider": { "type": "string" },
-                  "message": { "type": "string", "description": "Sanitized diagnostic; never include provider payloads, keys, or headers." },
+                  "sourceId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "provider": { "type": "string", "minLength": 1, "maxLength": 128 },
+                  "message": { "type": "string", "minLength": 1, "maxLength": 4096 },
                   "retryable": { "type": "boolean" },
-                  "attempts": { "type": "integer", "minimum": 0 },
+                  "attempts": { "type": "integer", "minimum": 0, "maximum": 2 },
                   "severity": { "enum": ["warning", "error"] }
                 }
               }
@@ -536,69 +636,72 @@
         },
         "evidence": {
           "type": "array",
-          "description": "Only normalized, bounded evidence segments may reach mapping. Every segment needs finite startSeconds >= 0 and endSeconds strictly greater than startSeconds; core enforces this cross-field invariant.",
+          "maxItems": 2560,
           "items": {
             "type": "object",
+            "additionalProperties": false,
             "required": ["evidenceId", "sourceId", "location", "provider", "kind", "quote", "startSeconds", "endSeconds"],
             "properties": {
-              "evidenceId": { "type": "string", "description": "Deterministic evidence identity." },
-              "sourceId": { "type": "string" },
-              "location": { "type": "string", "description": "Canonical source URL." },
-              "provider": { "type": "string" },
+              "evidenceId": { "type": "string", "minLength": 64, "maxLength": 64 },
+              "sourceId": { "type": "string", "minLength": 1, "maxLength": 256 },
+              "location": { "type": "string", "minLength": 1, "maxLength": 2048 },
+              "provider": { "type": "string", "minLength": 1, "maxLength": 128 },
               "kind": { "enum": ["transcript_excerpt", "audio_observation", "visual_observation"] },
-              "quote": { "type": "string", "description": "Bounded provider excerpt or observation; raw provider output is forbidden." },
-              "startSeconds": { "type": "number", "minimum": 0, "description": "Finite timestamp start in seconds." },
-              "endSeconds": { "type": "number", "minimum": 0, "description": "Finite timestamp end in seconds; must be strictly greater than startSeconds." },
-              "language": { "type": "string" },
+              "quote": { "type": "string", "minLength": 1, "maxLength": 4096 },
+              "startSeconds": { "type": "number", "minimum": 0 },
+              "endSeconds": { "type": "number", "minimum": 0 },
+              "language": { "type": "string", "minLength": 1, "maxLength": 64 },
               "confidence": { "enum": ["low", "medium", "high"] }
             }
           }
         },
         "failures": {
           "type": "array",
-          "description": "All acquisition failures and warnings. Partial results must preserve failures instead of implying complete coverage.",
+          "maxItems": 100,
           "items": {
             "type": "object",
+            "additionalProperties": false,
             "required": ["code", "message", "retryable", "attempts", "severity"],
             "properties": {
               "code": { "enum": ["INVALID_URL", "UNSUPPORTED_URL", "VIDEO_NOT_FOUND", "PLAYLIST_NOT_FOUND", "PRIVATE_OR_UNLISTED", "PLAYLIST_TOO_LARGE", "CAPTIONS_UNAVAILABLE", "MEDIA_NOT_ACCESSIBLE", "RIGHTS_REQUIRED", "PROVIDER_AUTH_MISSING", "QUOTA_EXCEEDED", "PROVIDER_TIMEOUT", "NETWORK_ERROR", "TRANSCRIPT_FAILED", "ANALYSIS_FAILED", "INVALID_PROVIDER_RESPONSE", "LIMIT_EXCEEDED", "PARTIAL_SOURCE_SET", "OMP_RUNTIME_UNAVAILABLE"] },
-              "sourceId": { "type": "string" },
-              "provider": { "type": "string" },
-              "message": { "type": "string", "description": "Sanitized diagnostic; never include provider payloads, keys, or headers." },
+              "sourceId": { "type": "string", "minLength": 1, "maxLength": 256 },
+              "provider": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "message": { "type": "string", "minLength": 1, "maxLength": 4096 },
               "retryable": { "type": "boolean" },
-              "attempts": { "type": "integer", "minimum": 0 },
+              "attempts": { "type": "integer", "minimum": 0, "maximum": 2 },
               "severity": { "enum": ["warning", "error"] }
             }
           }
         },
         "provider": {
           "type": "object",
+          "additionalProperties": false,
           "required": ["id"],
-          "description": "Provider-neutral identity and optional model label. Never store credentials, headers, or raw payloads.",
           "properties": {
-            "id": { "type": "string" },
-            "model": { "type": "string" }
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "model": { "type": "string", "minLength": 1, "maxLength": 256 }
           }
         },
         "pipeline": {
           "type": "object",
-          "description": "Optional stage provider metadata; never contains endpoints, credentials, media, transcripts, or raw provider responses.",
+          "additionalProperties": false,
           "properties": {
-            "media": { "type": "object", "required": ["id", "mode"], "properties": { "id": { "type": "string" }, "mode": { "enum": ["metadata-only", "owned-audio"] } } },
-            "asr": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" }, "model": { "type": "string" }, "timestampMode": { "enum": ["provider", "estimated"], "description": "Timestamp provenance. Estimated intervals are bounded navigation hints, not provider timecodes." } } },
-            "analysis": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" }, "model": { "type": "string" }, "route": { "type": "string" } } },
+            "media": { "type": "object", "additionalProperties": false, "required": ["id", "mode"], "properties": { "id": { "type": "string", "minLength": 1, "maxLength": 128 }, "mode": { "enum": ["metadata-only", "owned-audio"] } } },
+            "asr": { "type": "object", "additionalProperties": false, "required": ["id"], "properties": { "id": { "type": "string", "minLength": 1, "maxLength": 128 }, "model": { "type": "string", "minLength": 1, "maxLength": 256 }, "timestampMode": { "enum": ["provider", "estimated"] } } },
+            "analysis": { "type": "object", "additionalProperties": false, "required": ["id"], "properties": { "id": { "type": "string", "minLength": 1, "maxLength": 128 }, "model": { "type": "string", "minLength": 1, "maxLength": 256 }, "route": { "type": "string", "minLength": 1, "maxLength": 64 } } },
             "fallbackUsed": { "type": "boolean" }
           }
         },
-        "startedAt": { "type": "string", "description": "ISO-8601 acquisition start timestamp." },
-        "completedAt": { "type": "string", "description": "ISO-8601 completion timestamp; must not precede startedAt." }
+        "startedAt": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "completedAt": { "type": "string", "minLength": 1, "maxLength": 128 }
       }
     },
     "lecture_intake": {
       "type": "object",
       "description": "URL-first intake for lecture-research: extract exactly one public video/playlist URL plus the natural-language research prompt. The URL is the only source prerequisite; no user transcript, captions, or media file is requested. Produced by the intake (orchestrator) stage with acquisition-pending provenance.",
-      "required": ["task", "sources"],
+      "required": ["schemaVersion", "task", "sources"],
       "properties": {
+        "schemaVersion": { "type": "integer", "enum": [1] },
         "task": { "type": "string", "description": "The research question/goal the user asked about the lectures/playlist." },
         "sources": {
           "type": "array",
@@ -756,6 +859,3588 @@
         "rationale": { "type": "string", "description": "Why approved/rejected (user words, or the documented autonomous decision)." },
         "approved_candidates": { "type": "array", "items": { "type": "string" }, "description": "Candidate ids accepted for any follow-up." },
         "next_steps": { "type": "array", "items": { "type": "string" }, "description": "Notes for a future, separately-classified slice — never started by this workflow." }
+      }
+    },
+    "feature_workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Canonical FeatureWorkspace aggregate (specification/types.ts). Identity, path bindings, and phase records are additionally enforced by validateFeatureWorkspaceRecord.",
+      "required": ["schema_version", "feature_id", "display_name", "source_kind", "project_root", "project_root_identity", "workspace_path", "state_path", "profile_name", "profile_hash", "constitution_gate_ref", "constitution_binding", "language", "template_set", "phases", "status", "next_action", "handoff_ref", "execution_claim_ref", "implementation_conformance_ref", "import_ref", "migration_receipt_ref"],
+      "properties": {
+        "schema_version": { "type": "integer", "enum": [2], "description": "Canonical aggregate schema version; 2." },
+        "feature_id": { "type": "string", "description": "Immutable, branch-independent safe single path segment." },
+        "display_name": { "type": "string" },
+        "source_kind": { "enum": ["native", "external", "legacy"] },
+        "project_root": { "type": "string", "description": "Absolute, realpath-bounded authorized project root." },
+        "project_root_identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["canonical_path", "dev", "ino"],
+          "properties": {
+            "canonical_path": { "type": "string" },
+            "dev": { "type": "integer", "minimum": 0 },
+            "ino": { "type": "integer", "minimum": 0 }
+          },
+          "description": "Pinned filesystem identity for the authorized project root; path text alone is not authority."
+        },
+        "workspace_path": { "type": "string", "description": "Exactly specs/<feature-id> (project-relative)." },
+        "state_path": { "type": "string", "description": "Exactly .work-state/features/<feature-id>/state.json (project-relative)." },
+        "profile_name": { "type": "string" },
+        "profile_hash": { "type": "string" },
+        "constitution_gate_ref": { "type": ["string", "null"] },
+        "constitution_binding": {
+          "type": ["object", "null"],
+          "required": ["provider_id", "path", "version", "content_sha256", "semantic_hash", "validation_ref", "bound_at"],
+          "properties": {
+            "provider_id": { "type": "string" },
+            "path": { "type": "string" },
+            "version": { "type": "string" },
+            "content_sha256": { "type": "string" },
+            "semantic_hash": { "type": "string" },
+            "validation_ref": { "type": "string" },
+            "bound_at": { "type": "string" }
+          }
+        },
+        "language": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["language", "source", "selection_hash"],
+          "properties": {
+            "language": { "type": "string" },
+            "source": { "enum": ["feature_override", "project_default", "request_language"] },
+            "selection_hash": { "type": "string" }
+          }
+        },
+        "template_set": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["template_set_id", "source", "content_hash", "required_markers"],
+          "properties": {
+            "template_set_id": { "type": "string" },
+            "source": { "enum": ["feature_override", "project_default", "shipped_default"] },
+            "content_hash": { "type": "string" },
+            "required_markers": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "phases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["phase", "status", "current_version", "approved_version", "validation_ref", "checkpoint_ref", "upstream_versions", "stale_reason", "last_feedback"],
+            "properties": {
+              "phase": { "enum": ["specify", "plan", "tasks"] },
+              "status": { "enum": ["not_started", "generating", "materialized", "validating", "awaiting_approval", "revision_required", "approved", "stale", "blocked"] },
+              "current_version": { "type": ["integer", "null"], "minimum": 1 },
+              "approved_version": { "type": ["integer", "null"], "minimum": 1 },
+              "validation_ref": { "type": ["string", "null"] },
+              "checkpoint_ref": { "type": ["string", "null"] },
+              "upstream_versions": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["phase", "version", "hash"],
+                  "properties": {
+                    "phase": { "enum": ["specify", "plan", "tasks"] },
+                    "version": { "type": "integer", "minimum": 1 },
+                    "hash": { "type": "string" }
+                  }
+                }
+              },
+              "stale_reason": { "type": ["string", "null"] },
+              "last_feedback": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "status": { "enum": ["created", "in_progress", "implementation_ready", "claimed", "executing", "completion_validating", "completion_blocked", "completed", "blocked", "stale"] },
+        "next_action": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "command", "reason"],
+          "properties": {
+            "kind": { "enum": ["command", "checkpoint", "remediation", "none"] },
+            "command": { "type": ["string", "null"] },
+            "reason": { "type": "string" }
+          }
+        },
+        "handoff_ref": { "type": ["string", "null"] },
+        "execution_claim_ref": { "type": ["string", "null"] },
+        "implementation_conformance_ref": { "type": ["string", "null"] },
+        "import_ref": { "type": ["string", "null"] },
+        "migration_receipt_ref": { "type": ["string", "null"] }
+      }
+    },
+    "specification_phase_version": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Immutable content/provenance for one phase revision (specification/types.ts PhaseArtifactVersion). Versioned ids are never overwritten; replaced readable projections archive under history/.",
+      "required": ["artifact_id", "phase", "version", "dispatch_id", "work_identity", "source_artifact_hash", "semantic_model", "document_paths", "document_hashes", "semantic_section_hashes", "template_hash", "language_hash", "upstream_versions", "created_at", "constitution_binding"],
+      "properties": {
+        "artifact_id": { "type": "string", "description": "Versioned id such as specify.v2." },
+        "phase": { "enum": ["specify", "plan", "tasks"] },
+        "version": { "type": "integer", "minimum": 1 },
+        "dispatch_id": { "type": "string", "description": "Proves which subagent dispatch produced the content." },
+        "work_identity": { "type": "object" },
+        "source_artifact_hash": { "type": "string", "description": "SHA-256 of canonical typed worker output." },
+        "semantic_model": { "type": "object", "description": "Complete typed immutable semantic model; exact phase shape is enforced by the engine." },
+        "document_paths": { "type": "array", "items": { "type": "string" }, "description": "All paths remain inside the feature workspace." },
+        "document_hashes": { "type": "object", "additionalProperties": { "type": "string" }, "description": "path to SHA-256; detects manual edits or materialization drift." },
+        "semantic_section_hashes": { "type": "object", "additionalProperties": { "type": "string" } },
+        "template_hash": { "type": "string" },
+        "language_hash": { "type": "string" },
+        "upstream_versions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["artifact_id", "version", "hash"],
+            "properties": {
+              "artifact_id": { "type": "string" },
+              "version": { "type": "integer", "minimum": 1 },
+              "hash": { "type": "string" }
+            }
+          }
+        },
+        "created_at": { "type": "string" },
+        "constitution_binding": { "type": "object", "required": ["provider_id", "path", "version", "content_sha256", "semantic_hash", "validation_ref", "bound_at"], "properties": { "provider_id": { "type": "string" }, "path": { "type": "string" }, "version": { "type": "string" }, "content_sha256": { "type": "string" }, "semantic_hash": { "type": "string" }, "validation_ref": { "type": "string" }, "bound_at": { "type": "string" } } }
+      }
+    },
+    "constitution_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Exact constitution policy binding (specification/types.ts ConstitutionBinding); the version label is never trusted without content_sha256.",
+      "required": ["provider_id", "path", "version", "content_sha256", "semantic_hash", "validation_ref", "bound_at"],
+      "properties": {
+        "provider_id": { "type": "string" },
+        "path": { "type": "string", "description": "Project-relative policy path, realpath-bounded to the authorized project." },
+        "version": { "type": "string" },
+        "content_sha256": { "type": "string", "description": "SHA-256 of the exact bytes used for validation or approval." },
+        "semantic_hash": { "type": "string", "description": "SHA-256 of normalized policy sections; impact comparison only." },
+        "validation_ref": { "type": "string" },
+        "bound_at": { "type": "string", "description": "Audit only; excluded from content hashes." }
+      }
+    },
+    "constitution_provider_selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Immutable resolution result for the project policy location (explicit override, one discovered provider, or native default).",
+      "required": ["provider_id", "source", "path", "template_ref", "template_hash", "selection_hash", "selected_at"],
+      "properties": {
+        "provider_id": { "type": "string" },
+        "source": { "enum": ["explicit_override", "discovered_provider", "native_default"] },
+        "path": { "type": "string" },
+        "template_ref": { "type": "string" },
+        "template_hash": { "type": "string" },
+        "selection_hash": { "type": "string", "description": "Binds provider id, path, template, configuration, discovery evidence." },
+        "selected_at": { "type": "string" }
+      }
+    },
+    "constitution_gate_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Durable constitution prerequisite record shared by native preparation and external intake (specification/types.ts ConstitutionGateRecord).",
+      "required": ["gate_id", "origin_kind", "origin_run_key", "origin_stage", "status", "usability_result", "provider", "constitution_workflow_ref", "checkpoint_ref", "binding", "resume_marker"],
+      "properties": {
+        "gate_id": { "type": "string" },
+        "origin_kind": { "enum": ["native_direct", "do_work_nested", "cto_preparation", "external_import"] },
+        "origin_run_key": { "type": "string" },
+        "origin_stage": { "type": "string" },
+        "status": { "enum": ["checking", "usable", "constitution_required", "awaiting_approval", "approved", "blocked"] },
+        "usability_result": { "enum": ["usable", "missing", "empty", "unresolved_template", "structurally_invalid", null] },
+        "provider": { "type": ["object", "null"] },
+        "constitution_workflow_ref": { "type": ["string", "null"] },
+        "checkpoint_ref": { "type": ["string", "null"], "description": "Required only when a generated or corrected constitution is approved." },
+        "binding": { "type": ["object", "null"] },
+        "resume_marker": { "type": ["string", "null"], "description": "Dispatch/idempotency marker consumed exactly once." }
+      }
+    },
+    "constitution_impact_assessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Typed semantic-impact assessment over the bound artifact set (specification/types.ts ConstitutionImpactAssessment).",
+      "required": ["assessment_id", "previous_binding", "current_binding", "evaluator_version", "artifact_results", "status", "assessed_at"],
+      "properties": {
+        "assessment_id": { "type": "string" },
+        "previous_binding": { "type": "object" },
+        "current_binding": { "type": "object" },
+        "evaluator_version": { "type": "string" },
+        "artifact_results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["artifact_id", "verdict", "evidence_refs"],
+            "properties": {
+              "artifact_id": { "type": "string" },
+              "verdict": { "enum": ["affected", "no_impact"] },
+              "evidence_refs": { "type": "array", "items": { "type": "string" }, "description": "Required for affected AND no_impact." }
+            }
+          }
+        },
+        "status": { "enum": ["pass", "blocked"] },
+        "assessed_at": { "type": "string" }
+      }
+    },
+    "specification_validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Machine-readable phase validation bound to one artifact version (specification/types.ts PhaseValidationResult); only pass permits awaiting_approval.",
+      "required": ["validation_id", "phase", "artifact_version", "status", "checks", "blocking_findings", "warnings", "constitution", "traceability_summary", "validator_version", "validated_at"],
+      "properties": {
+        "validation_id": { "type": "string" },
+        "phase": { "enum": ["specify", "plan", "tasks"] },
+        "artifact_version": { "type": "string", "description": "Must match the current artifact to authorize a checkpoint." },
+        "status": { "enum": ["pass", "fail"] },
+        "checks": { "type": "array", "items": { "type": "object" } },
+        "blocking_findings": { "type": "array", "items": { "type": "object" }, "description": "Empty when status is pass." },
+        "warnings": { "type": "array", "items": { "type": "object" } },
+        "constitution": { "type": "object" },
+        "traceability_summary": { "type": ["object", "null"] },
+        "validator_version": { "type": "string" },
+        "validated_at": { "type": "string" }
+      }
+    },
+    "implementation_handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Frozen executor-neutral implementation contract (specification/types.ts ImplementationHandoff); the tasks array is the only canonical implementation task source.",
+      "required": ["schema_version", "handoff_id", "handoff_digest", "feature_id", "source_kind", "artifact_versions", "scope", "requirements", "decisions", "tasks", "verification", "validation_refs", "approval_refs", "language", "constitution_binding", "constitution_impact_ref", "risks", "open_decisions", "execution_choices", "status", "import_snapshot_ref", "compatibility_supplement_ref"],
+      "properties": {
+        "schema_version": { "type": "integer", "enum": [1] },
+        "handoff_id": { "type": "string" },
+        "handoff_digest": { "type": "string", "description": "SHA-256; immutable and content-addressed." },
+        "feature_id": { "type": "string" },
+        "source_kind": { "enum": ["native", "external", "legacy"] },
+        "content_provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_kind", "content_role", "embedded_instruction_policy", "source_refs"],
+          "properties": {
+            "source_kind": { "enum": ["external"] },
+            "content_role": { "enum": ["untrusted_inert_data"] },
+            "embedded_instruction_policy": { "enum": ["inert_data_only"] },
+            "source_refs": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+          },
+          "description": "Imported source provenance; content is data only and cannot authorize execution."
+        },
+        "artifact_versions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["artifact_id", "kind", "version", "sha256"],
+            "properties": {
+              "artifact_id": { "type": "string" },
+              "kind": { "enum": ["specify", "plan", "tasks", "import_snapshot", "supplement"] },
+              "version": { "type": "integer", "minimum": 1 },
+              "sha256": { "type": "string" }
+            }
+          }
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["in_scope", "out_of_scope", "constraints"],
+          "properties": {
+            "in_scope": { "type": "array", "items": { "type": "string" } },
+            "out_of_scope": { "type": "array", "items": { "type": "string" } },
+            "constraints": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["requirement_id", "statement", "acceptance_ids", "source_refs"],
+            "properties": {
+              "requirement_id": { "type": "string" },
+              "statement": { "type": "string" },
+              "acceptance_ids": { "type": "array", "items": { "type": "string" } },
+              "source_refs": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["decision_id", "decision", "rationale", "requirement_ids"],
+            "properties": {
+              "decision_id": { "type": "string" },
+              "decision": { "type": "string" },
+              "rationale": { "type": "string" },
+              "requirement_ids": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["task_id", "title", "requirement_ids", "depends_on", "expected_outcome", "affected_scope", "completion_evidence", "parallel_safe"],
+            "properties": {
+              "task_id": { "type": "string" },
+              "title": { "type": "string" },
+              "requirement_ids": { "type": "array", "items": { "type": "string" } },
+              "depends_on": { "type": "array", "items": { "type": "string" }, "description": "No self-reference, dangling id, or cycle." },
+              "expected_outcome": { "type": "string" },
+              "affected_scope": { "type": "array", "items": { "type": "string" } },
+              "completion_evidence": { "type": "array", "items": { "type": "string" } },
+              "parallel_safe": { "type": "boolean" }
+            }
+          }
+        },
+        "verification": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["verification_id", "requirement_ids", "acceptance_ids", "task_ids", "observable_behavior", "expected_evidence"],
+            "properties": {
+              "verification_id": { "type": "string" },
+              "requirement_ids": { "type": "array", "items": { "type": "string" } },
+              "acceptance_ids": { "type": "array", "items": { "type": "string" } },
+              "task_ids": { "type": "array", "items": { "type": "string" } },
+              "observable_behavior": { "type": "boolean", "description": "Terminal conformance requires executed-test evidence when true." },
+              "expected_evidence": { "type": "string" }
+            }
+          }
+        },
+        "validation_refs": { "type": "array", "items": { "type": "string" } },
+        "approval_refs": { "type": "array", "items": { "type": "string" } },
+        "language": { "type": "string" },
+        "constitution_binding": { "type": "object", "additionalProperties": false, "description": "Exact constitution policy binding (constitution_record); the version label is never trusted without content_sha256.", "required": ["provider_id", "path", "version", "content_sha256", "semantic_hash", "validation_ref", "bound_at"], "properties": { "provider_id": { "type": "string" }, "path": { "type": "string" }, "version": { "type": "string" }, "content_sha256": { "type": "string" }, "semantic_hash": { "type": "string" }, "validation_ref": { "type": "string" }, "bound_at": { "type": "string" } } },
+        "constitution_impact_ref": { "type": ["string", "null"] },
+        "risks": { "type": "array", "items": { "type": "string" } },
+        "open_decisions": { "type": "array", "items": { "type": "string" }, "description": "Open blocking decisions must be empty when ready." },
+        "execution_choices": { "type": "array", "minItems": 1, "items": { "enum": ["do-work", "cto"] } },
+        "status": { "enum": ["candidate", "ready", "stale"] },
+        "import_snapshot_ref": { "type": ["string", "null"] },
+        "compatibility_supplement_ref": { "type": ["string", "null"] },
+        "import_framework": { "type": "string", "description": "Required for external handoffs; omitted for native handoffs." },
+        "import_mapping_id": { "type": "string", "description": "Required for external handoffs; omitted for native handoffs." },
+        "import_mapping_version": { "type": "string", "description": "Required for external handoffs; omitted for native handoffs." },
+        "import_selected_paths": { "type": "array", "items": { "type": "string" }, "description": "Required for external handoffs; exact selected source projection." },
+        "import_ignored_candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "reason"],
+            "properties": {
+              "path": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          },
+          "description": "Required for external handoffs; exact ignored source candidates."
+        },
+        "import_intake_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Required for external handoffs; exact source-intake roots/paths used to discover the snapshot."
+        },
+        "import_document_language": { "type": "string", "description": "Required for external handoffs; exact captured document language." },
+        "import_document_language_source": { "type": "string", "enum": ["explicit", "metadata", "unknown"], "description": "Required for external handoffs; exact language provenance." },
+        "import_source_revision": { "type": ["string", "null"], "description": "Required for external handoffs; exact captured source revision." },
+        "import_limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Exact normalized import ceilings bound to the persisted snapshot; omitted only for legacy artifacts.",
+          "required": ["maxFiles", "maxBytes", "maxFileBytes", "maxTextBytes", "maxBinaryBytes", "maxDirectoryEntries", "maxHeadings", "maxRequirements", "maxTasks", "maxDecisions", "maxDependencies", "maxMappings", "maxFindings", "maxWork"],
+          "properties": {
+            "maxFiles": { "type": "integer", "minimum": 1, "maximum": 512 },
+            "maxBytes": { "type": "integer", "minimum": 1, "maximum": 33554432 },
+            "maxFileBytes": { "type": "integer", "minimum": 1, "maximum": 4194304 },
+            "maxTextBytes": { "type": "integer", "minimum": 1, "maximum": 33554432 },
+            "maxBinaryBytes": { "type": "integer", "minimum": 1, "maximum": 4194304 },
+            "maxDirectoryEntries": { "type": "integer", "minimum": 1, "maximum": 8192 },
+            "maxHeadings": { "type": "integer", "minimum": 1, "maximum": 8192 },
+            "maxRequirements": { "type": "integer", "minimum": 1, "maximum": 2048 },
+            "maxTasks": { "type": "integer", "minimum": 1, "maximum": 4096 },
+            "maxDecisions": { "type": "integer", "minimum": 1, "maximum": 2048 },
+            "maxDependencies": { "type": "integer", "minimum": 1, "maximum": 8192 },
+            "maxMappings": { "type": "integer", "minimum": 1, "maximum": 16384 },
+            "maxFindings": { "type": "integer", "minimum": 1, "maximum": 8192 },
+            "maxWork": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+          }
+        }
+      }
+    },
+    "execution_claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Exclusive ownership of one ready handoff version, keyed by handoff digest (specification/types.ts ExecutionClaim).",
+      "required": ["claim_id", "handoff_digest", "owner_kind", "owner_run_id", "status", "acquired_at", "updated_at", "release_reason"],
+      "properties": {
+        "claim_id": { "type": "string" },
+        "handoff_digest": { "type": "string" },
+        "owner_kind": { "enum": ["do_work", "cto"] },
+        "owner_run_id": { "type": "string" },
+        "status": { "enum": ["active", "completed", "released", "blocked"] },
+        "acquired_at": { "type": "string" },
+        "updated_at": { "type": "string" },
+        "release_reason": { "type": ["string", "null"], "description": "Required for release/block." }
+      }
+    },
+    "import_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Immutable normalization of exact external sources; sources stay read-only (specification/types.ts ImportSnapshot).",
+      "required": ["snapshot_id", "source_root", "source_root_identity", "intake_paths", "recognition_ref", "framework", "mapping_id", "mapping_version", "selected_paths", "ignored_candidates", "files", "source_revision", "document_language", "document_language_source", "redactions", "normalized_content_ref", "created_at"],
+      "properties": {
+        "snapshot_id": { "type": "string" },
+        "source_root": { "type": "string" },
+        "source_root_identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["canonical_path", "dev", "ino", "mode"],
+          "properties": {
+            "canonical_path": { "type": "string" },
+            "dev": { "type": "integer", "minimum": 0 },
+            "ino": { "type": "integer", "minimum": 0 },
+            "mode": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "intake_paths": { "type": "array", "items": { "type": "string" } },
+        "recognition_ref": { "type": "string" },
+        "framework": { "type": "string" },
+        "mapping_id": { "type": "string" },
+        "mapping_version": { "type": "string" },
+        "selected_paths": { "type": "array", "items": { "type": "string" } },
+        "ignored_candidates": { "type": "array", "items": { "type": "object" } },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256", "size_bytes", "media_type"],
+            "properties": {
+              "path": { "type": "string" },
+              "sha256": { "type": "string" },
+              "size_bytes": { "type": "integer", "minimum": 0 },
+              "media_type": { "type": "string" }
+            }
+          }
+        },
+        "source_revision": { "type": ["string", "null"], "description": "Git revision or null; per-file hashes remain authoritative." },
+        "document_language": { "type": "string" },
+        "document_language_source": { "type": "string", "enum": ["explicit", "metadata", "unknown"] },
+        "redactions": { "type": "array", "items": { "type": "object" } },
+        "normalized_content_ref": { "type": "string", "description": "Typed artifact id; content is treated as data, not instructions." },
+        "created_at": { "type": "string" },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Exact normalized import ceilings; omitted only for legacy artifacts.",
+          "required": ["maxFiles", "maxBytes", "maxFileBytes", "maxTextBytes", "maxBinaryBytes", "maxDirectoryEntries", "maxHeadings", "maxRequirements", "maxTasks", "maxDecisions", "maxDependencies", "maxMappings", "maxFindings", "maxWork"],
+          "properties": {
+            "maxFiles": { "type": "integer", "minimum": 1, "maximum": 512 },
+            "maxBytes": { "type": "integer", "minimum": 1, "maximum": 33554432 },
+            "maxFileBytes": { "type": "integer", "minimum": 1, "maximum": 4194304 },
+            "maxTextBytes": { "type": "integer", "minimum": 1, "maximum": 33554432 },
+            "maxDirectoryEntries": { "type": "integer", "minimum": 1, "maximum": 8192 },
+            "maxBinaryBytes": { "type": "integer", "minimum": 1, "maximum": 4194304 },
+            "maxHeadings": { "type": "integer", "minimum": 1, "maximum": 8192 },
+            "maxRequirements": { "type": "integer", "minimum": 1, "maximum": 2048 },
+            "maxTasks": { "type": "integer", "minimum": 1, "maximum": 4096 },
+            "maxDecisions": { "type": "integer", "minimum": 1, "maximum": 2048 },
+            "maxDependencies": { "type": "integer", "minimum": 1, "maximum": 8192 },
+            "maxMappings": { "type": "integer", "minimum": 1, "maximum": 16384 },
+            "maxFindings": { "type": "integer", "minimum": 1, "maximum": 8192 },
+            "maxWork": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+          }
+        }
+      }
+    },
+    "compatibility_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["report_id", "snapshot_ref", "constitution_binding", "status", "document_language", "document_language_source", "framework", "mapping_id", "mapping_version", "selected_paths", "mapping", "blocking_findings", "warnings", "ignored_content", "supplement_ref", "evaluated_at"],
+      "properties": {
+        "report_id": { "type": "string" },
+        "snapshot_ref": { "type": "string" },
+        "constitution_binding": { "type": "object" },
+      "document_language": { "type": "string" },
+      "document_language_source": { "type": "string", "enum": ["explicit", "metadata", "unknown"] },
+        "status": { "enum": ["ready", "supplement_required", "blocked", "unsupported"] },
+        "framework": { "type": "string" },
+        "mapping_id": { "type": "string" },
+        "mapping_version": { "type": "string" },
+        "selected_paths": { "type": "array", "items": { "type": "string" } },
+        "mapping": { "type": "array", "items": { "type": "object" } },
+        "blocking_findings": { "type": "array", "items": { "type": "object" } },
+        "warnings": { "type": "array", "items": { "type": "object" } },
+        "ignored_content": { "type": "array", "items": { "type": "object" } },
+        "supplement_ref": { "type": ["string", "null"] },
+        "evaluated_at": { "type": "string" }
+      }
+    },
+    "compatibility_supplement": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Local, versioned supplement; never alters or impersonates external content (specification/types.ts CompatibilitySupplement).",
+      "required": ["schema_version", "supplement_id", "feature_id", "snapshot_id", "snapshot_ref", "source_sha256", "framework", "mapping_id", "mapping_version", "semantic_rows", "sections", "approved_by_ref", "approved_at", "content_sha256"],
+      "properties": {
+        "schema_version": { "type": "integer", "enum": [1] },
+        "supplement_id": { "type": "string" },
+        "feature_id": { "type": "string" },
+        "snapshot_id": { "type": "string" },
+        "snapshot_ref": { "type": "string" },
+        "source_sha256": { "type": "string" },
+        "framework": { "type": "string" },
+        "mapping_id": { "type": "string" },
+        "mapping_version": { "type": "string" },
+        "semantic_rows": { "type": "array", "items": { "type": "object" } },
+        "sections": { "type": "array", "items": { "type": "object" } },
+        "approved_by_ref": { "type": "string" },
+        "approved_at": { "type": "string" },
+        "content_sha256": { "type": "string" }
+      }
+    },
+    "closure_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One immutable requirement-closure matrix row (specification/types.ts RequirementClosureEntry); the closed row shape enforced for implementation_conformance.entries.",
+      "required": ["entry_id", "subject_kind", "subject_id", "requirement_id", "observable_behavior", "implementation_evidence_refs", "review_verdict", "review_evidence_refs", "test_evidence", "status", "findings"],
+      "properties": {
+        "entry_id": { "type": "string" },
+        "subject_kind": { "enum": ["requirement", "acceptance_scenario"] },
+        "subject_id": { "type": "string" },
+        "requirement_id": { "type": "string", "description": "Self for a requirement row; owning requirement for an acceptance row." },
+        "observable_behavior": { "type": "boolean", "description": "Copied from the frozen verification obligations, never inferred." },
+        "implementation_evidence_refs": { "type": "array", "items": { "type": "object", "additionalProperties": false, "description": "CompletionArtifactRef (engine/types.ts).", "required": ["artifact_id", "path", "sha256", "schema_status", "quality_gate_status"], "properties": { "artifact_id": { "type": "string" }, "path": { "type": "string" }, "sha256": { "type": "string" }, "schema_status": { "enum": ["met", "failed"] }, "quality_gate_status": { "enum": ["met", "pending", "failed"] } } } },
+        "review_verdict": { "enum": ["pass", "fail", "missing"] },
+        "review_evidence_refs": { "type": "array", "items": { "type": "object", "additionalProperties": false, "description": "CompletionArtifactRef (engine/types.ts).", "required": ["artifact_id", "path", "sha256", "schema_status", "quality_gate_status"], "properties": { "artifact_id": { "type": "string" }, "path": { "type": "string" }, "sha256": { "type": "string" }, "schema_status": { "enum": ["met", "failed"] }, "quality_gate_status": { "enum": ["met", "pending", "failed"] } } } },
+        "test_evidence": { "type": "array", "items": { "type": "object", "additionalProperties": false, "description": "ExecutedTestEvidence (specification/types.ts).", "required": ["evidence_ref", "test_kind", "status", "executed_at"], "properties": { "evidence_ref": { "type": "object", "additionalProperties": false, "description": "CompletionArtifactRef (engine/types.ts).", "required": ["artifact_id", "path", "sha256", "schema_status", "quality_gate_status"], "properties": { "artifact_id": { "type": "string" }, "path": { "type": "string" }, "sha256": { "type": "string" }, "schema_status": { "enum": ["met", "failed"] }, "quality_gate_status": { "enum": ["met", "pending", "failed"] } } }, "test_kind": { "enum": ["unit", "integration", "e2e", "runtime"] }, "status": { "enum": ["pass", "fail"] }, "executed_at": { "type": "string" } } } },
+        "status": { "enum": ["pass", "blocked", "changed_intent"] },
+        "findings": { "type": "array", "items": { "type": "object", "additionalProperties": false, "description": "ConformanceFinding (specification/types.ts).", "required": ["code", "subject_id", "message", "evidence_refs"], "properties": { "code": { "type": "string" }, "subject_id": { "type": ["string", "null"] }, "message": { "type": "string" }, "evidence_refs": { "type": "array", "items": { "type": "string" } } } } }
+      }
+    },
+    "implementation_conformance": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The executor-neutral requirement-closure matrix gating terminal feature completion (specification/types.ts ImplementationConformanceResult); executors can submit evidence but never add, remove, reinterpret, or waive rows.",
+      "required": ["schema_version", "conformance_id", "matrix_digest", "feature_id", "handoff_id", "handoff_digest", "execution_claim_id", "execution_owner", "execution_run_id", "profile_hash", "evaluated_at", "entries", "quality_gate_results", "overall_status", "blocking_findings", "next_action"],
+      "properties": {
+        "schema_version": { "type": "string", "enum": ["1.0"] },
+        "conformance_id": { "type": "string" },
+        "matrix_digest": { "type": "string", "description": "SHA-256; immutable, content-addressed, idempotent for the same inputs." },
+        "feature_id": { "type": "string" },
+        "handoff_id": { "type": "string" },
+        "handoff_digest": { "type": "string" },
+        "execution_claim_id": { "type": "string" },
+        "execution_owner": { "enum": ["do_work", "cto"] },
+        "execution_run_id": { "type": "string" },
+        "profile_hash": { "type": "string" },
+        "evaluated_at": { "type": "string" },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["entry_id", "subject_kind", "subject_id", "requirement_id", "observable_behavior", "implementation_evidence_refs", "review_verdict", "review_evidence_refs", "test_evidence", "status", "findings"],
+            "properties": {
+              "entry_id": { "type": "string" },
+              "subject_kind": { "enum": ["requirement", "acceptance_scenario"] },
+              "subject_id": { "type": "string" },
+              "requirement_id": { "type": "string", "description": "Self for a requirement row; owning requirement for an acceptance row." },
+              "observable_behavior": { "type": "boolean", "description": "Copied from the frozen verification obligations, never inferred." },
+              "implementation_evidence_refs": { "type": "array", "items": { "type": "object", "additionalProperties": false, "description": "CompletionArtifactRef (engine/types.ts).", "required": ["artifact_id", "path", "sha256", "schema_status", "quality_gate_status"], "properties": { "artifact_id": { "type": "string" }, "path": { "type": "string" }, "sha256": { "type": "string" }, "schema_status": { "enum": ["met", "failed"] }, "quality_gate_status": { "enum": ["met", "pending", "failed"] } } } },
+              "review_verdict": { "enum": ["pass", "fail", "missing"] },
+              "review_evidence_refs": { "type": "array", "items": { "type": "object", "additionalProperties": false, "description": "CompletionArtifactRef (engine/types.ts).", "required": ["artifact_id", "path", "sha256", "schema_status", "quality_gate_status"], "properties": { "artifact_id": { "type": "string" }, "path": { "type": "string" }, "sha256": { "type": "string" }, "schema_status": { "enum": ["met", "failed"] }, "quality_gate_status": { "enum": ["met", "pending", "failed"] } } } },
+              "test_evidence": { "type": "array", "items": { "type": "object", "additionalProperties": false, "description": "ExecutedTestEvidence (specification/types.ts).", "required": ["evidence_ref", "test_kind", "status", "executed_at"], "properties": { "evidence_ref": { "type": "object", "additionalProperties": false, "description": "CompletionArtifactRef (engine/types.ts).", "required": ["artifact_id", "path", "sha256", "schema_status", "quality_gate_status"], "properties": { "artifact_id": { "type": "string" }, "path": { "type": "string" }, "sha256": { "type": "string" }, "schema_status": { "enum": ["met", "failed"] }, "quality_gate_status": { "enum": ["met", "pending", "failed"] } } }, "test_kind": { "enum": ["unit", "integration", "e2e", "runtime"] }, "status": { "enum": ["pass", "fail"] }, "executed_at": { "type": "string" } } } },
+              "status": { "enum": ["pass", "blocked", "changed_intent"] },
+              "findings": { "type": "array", "items": { "type": "object", "additionalProperties": false, "description": "ConformanceFinding (specification/types.ts).", "required": ["code", "subject_id", "message", "evidence_refs"], "properties": { "code": { "type": "string" }, "subject_id": { "type": ["string", "null"] }, "message": { "type": "string" }, "evidence_refs": { "type": "array", "items": { "type": "string" } } } } }
+            }
+          }
+        },
+        "quality_gate_results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["gate_id", "source", "status", "evidence_refs", "findings"],
+            "properties": {
+              "gate_id": { "type": "string" },
+              "source": { "enum": ["project_constitution", "execution_profile"] },
+              "status": { "enum": ["pass", "fail"] },
+              "evidence_refs": { "type": "array", "items": { "type": "object", "additionalProperties": false, "description": "CompletionArtifactRef (engine/types.ts).", "required": ["artifact_id", "path", "sha256", "schema_status", "quality_gate_status"], "properties": { "artifact_id": { "type": "string" }, "path": { "type": "string" }, "sha256": { "type": "string" }, "schema_status": { "enum": ["met", "failed"] }, "quality_gate_status": { "enum": ["met", "pending", "failed"] } } } },
+              "findings": { "type": "array", "items": { "type": "object", "additionalProperties": false, "description": "ConformanceFinding (specification/types.ts).", "required": ["code", "subject_id", "message", "evidence_refs"], "properties": { "code": { "type": "string" }, "subject_id": { "type": ["string", "null"] }, "message": { "type": "string" }, "evidence_refs": { "type": "array", "items": { "type": "string" } } } } }
+            }
+          }
+        },
+        "overall_status": { "enum": ["pass", "blocked", "changed_intent"] },
+        "blocking_findings": { "type": "array", "items": { "type": "object", "additionalProperties": false, "description": "ConformanceFinding (specification/types.ts).", "required": ["code", "subject_id", "message", "evidence_refs"], "properties": { "code": { "type": "string" }, "subject_id": { "type": ["string", "null"] }, "message": { "type": "string" }, "evidence_refs": { "type": "array", "items": { "type": "string" } } } } },
+        "next_action": { "enum": ["complete_feature", "repair_implementation", "repeat_review", "repeat_tests", "repair_quality_gate", "revise_specification"] }
+      }
+    },
+    "format_recognition": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Advisory format recognition result; recognition never changes gates (specification/types.ts FormatRecognitionResult).",
+      "required": ["framework", "confidence", "selected_paths", "ignored_candidates", "mapping_id", "mapping_version"],
+      "properties": {
+        "framework": { "type": "string" },
+        "confidence": { "enum": ["high", "medium", "low", "ambiguous"] },
+        "selected_paths": { "type": "array", "items": { "type": "string", "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*\\\\)(?!.*\\u0000).+$" }, "description": "Immutable source-root-relative references only; no absolute paths, empty/dot/parent segments, or platform-separator ambiguity." },
+        "ignored_candidates": { "type": "array", "items": { "type": "object", "properties": { "path": { "type": "string", "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*\\\\)(?!.*\\u0000).+$" }, "reason": { "type": "string" } }, "required": ["path", "reason"], "additionalProperties": false } },
+        "mapping_id": { "type": "string" },
+        "mapping_version": { "type": "string" }
+      }
+    },
+    "constitution_draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Typed constitution draft worker output (T027); attributes the authoring dispatch and binds the exact constitution policy the draft was produced against (specification/types.ts ConstitutionGateRecord prerequisites).",
+      "required": ["schema_version", "gate_id", "feature_id", "run_key", "version", "document", "document_sha256", "worker", "constitution_binding"],
+      "properties": {
+        "schema_version": { "type": "integer", "description": "Canonical draft schema version; 1." },
+        "gate_id": { "type": "string", "description": "Stable identifier of the constitution gate record this draft belongs to." },
+        "feature_id": { "type": "string", "description": "Immutable, branch-independent feature identity of the requesting workspace." },
+        "run_key": { "type": "string", "description": "Explicit run key of the dispatching workflow run." },
+        "version": { "type": "integer", "minimum": 1, "description": "Immutable draft revision; draft versions are never overwritten." },
+        "document": { "type": "string", "description": "Full constitution draft document text." },
+        "document_sha256": { "type": "string", "description": "SHA-256 of the exact document bytes." },
+        "worker": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Attribution of the authoring worker dispatch; stable and audit-facing.",
+          "required": ["role", "agent", "dispatch_id"],
+          "properties": {
+            "role": { "type": "string", "description": "Declared profile role of the authoring worker." },
+            "agent": { "type": "string", "description": "Registered agent type that authored the draft." },
+            "dispatch_id": { "type": "string", "description": "Capability-bound dispatch id proving which dispatch produced the content." }
+          }
+        },
+        "constitution_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Exact constitution policy binding (constitution_record); the version label is never trusted without content_sha256.",
+          "required": ["provider_id", "path", "version", "content_sha256", "semantic_hash", "validation_ref", "bound_at"],
+          "properties": {
+            "provider_id": { "type": "string" },
+            "path": { "type": "string" },
+            "version": { "type": "string" },
+            "content_sha256": { "type": "string" },
+            "semantic_hash": { "type": "string" },
+            "validation_ref": { "type": "string" },
+            "bound_at": { "type": "string" }
+          }
+        }
+      }
+    },
+    "specify_draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Complete immutable semantic model for one readable Specify, Plan, or Tasks phase. Every readable projection is rendered from this model byte-for-byte.",
+      "required": [
+        "schema_version",
+        "feature_id",
+        "run_key",
+        "phase",
+        "version",
+        "worker",
+        "constitution_binding",
+        "upstream_versions",
+        "sections",
+        "requirements",
+        "decisions",
+        "tasks",
+        "verification",
+        "contradictions",
+        "constitution_principles"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "feature_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        },
+        "run_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        },
+        "phase": {
+          "enum": [
+            "specify",
+            "plan",
+            "tasks"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "worker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "role",
+            "agent",
+            "dispatch_id"
+          ],
+          "properties": {
+            "role": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "agent": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "dispatch_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "constitution_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "provider_id",
+            "path",
+            "version",
+            "content_sha256",
+            "semantic_hash",
+            "validation_ref",
+            "bound_at"
+          ],
+          "properties": {
+            "provider_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "content_sha256": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "semantic_hash": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "validation_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "bound_at": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "upstream_versions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "artifact_id",
+              "version",
+              "hash"
+            ],
+            "properties": {
+              "artifact_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "version": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "hash": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "sections": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "problem": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "scope": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "non_goals": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "actors": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "journeys": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "requirements": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "edge_cases": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "assumptions": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "dependencies": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "success_criteria": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "repository_grounding": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "decisions": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "alternatives": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "contracts": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "data_flow": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "control_flow": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "migration": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "security": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "operations": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "verification_strategy": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "constitution_recheck": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "task_graph": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "expected_outcomes": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "requirement_id",
+              "statement",
+              "acceptance_ids",
+              "source_refs",
+              "testable",
+              "untestable_reason"
+            ],
+            "properties": {
+              "requirement_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "statement": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "source_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "testable": {
+                "type": "boolean"
+              },
+              "untestable_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "decision_id",
+              "decision",
+              "rationale",
+              "requirement_ids"
+            ],
+            "properties": {
+              "decision_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "decision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "rationale": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "title",
+              "requirement_ids",
+              "acceptance_ids",
+              "decision_ids",
+              "verification_ids",
+              "depends_on",
+              "expected_outcome",
+              "affected_scope",
+              "completion_evidence",
+              "parallel_safe"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "decision_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "verification_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "depends_on": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "expected_outcome": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "affected_scope": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "completion_evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "parallel_safe": {
+                "type": "boolean"
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "verification": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "verification_id",
+              "requirement_ids",
+              "acceptance_ids",
+              "task_ids",
+              "observable_behavior",
+              "expected_evidence"
+            ],
+            "properties": {
+              "verification_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "task_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "observable_behavior": {
+                "type": "boolean"
+              },
+              "expected_evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "contradictions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "contradiction_id",
+              "subject_ids",
+              "status",
+              "assessment",
+              "evidence"
+            ],
+            "properties": {
+              "contradiction_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "subject_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "status": {
+                "enum": [
+                  "resolved",
+                  "accepted",
+                  "unresolved"
+                ]
+              },
+              "assessment": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "constitution_principles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "principle_id",
+              "title",
+              "applicability",
+              "status",
+              "evidence",
+              "binding"
+            ],
+            "properties": {
+              "principle_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "applicability": {
+                "enum": [
+                  "applicable",
+                  "not_applicable"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "pass",
+                  "fail",
+                  "not_applicable"
+                ]
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "binding": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "provider_id",
+                  "path",
+                  "version",
+                  "content_sha256",
+                  "semantic_hash",
+                  "validation_ref",
+                  "bound_at"
+                ],
+                "properties": {
+                  "provider_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "version": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "content_sha256": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "semantic_hash": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "validation_ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "bound_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  }
+                }
+              }
+            }
+          },
+          "maxItems": 4096
+        }
+      }
+    },
+    "plan_draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Complete immutable semantic model for one readable Specify, Plan, or Tasks phase. Every readable projection is rendered from this model byte-for-byte.",
+      "required": [
+        "schema_version",
+        "feature_id",
+        "run_key",
+        "phase",
+        "version",
+        "worker",
+        "constitution_binding",
+        "upstream_versions",
+        "sections",
+        "requirements",
+        "decisions",
+        "tasks",
+        "verification",
+        "contradictions",
+        "constitution_principles"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "feature_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        },
+        "run_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        },
+        "phase": {
+          "enum": [
+            "specify",
+            "plan",
+            "tasks"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "worker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "role",
+            "agent",
+            "dispatch_id"
+          ],
+          "properties": {
+            "role": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "agent": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "dispatch_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "constitution_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "provider_id",
+            "path",
+            "version",
+            "content_sha256",
+            "semantic_hash",
+            "validation_ref",
+            "bound_at"
+          ],
+          "properties": {
+            "provider_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "content_sha256": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "semantic_hash": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "validation_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "bound_at": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "upstream_versions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "artifact_id",
+              "version",
+              "hash"
+            ],
+            "properties": {
+              "artifact_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "version": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "hash": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "sections": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "problem": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "scope": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "non_goals": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "actors": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "journeys": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "requirements": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "edge_cases": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "assumptions": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "dependencies": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "success_criteria": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "repository_grounding": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "decisions": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "alternatives": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "contracts": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "data_flow": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "control_flow": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "migration": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "security": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "operations": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "verification_strategy": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "constitution_recheck": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "task_graph": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "expected_outcomes": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "requirement_id",
+              "statement",
+              "acceptance_ids",
+              "source_refs",
+              "testable",
+              "untestable_reason"
+            ],
+            "properties": {
+              "requirement_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "statement": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "source_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "testable": {
+                "type": "boolean"
+              },
+              "untestable_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "decision_id",
+              "decision",
+              "rationale",
+              "requirement_ids"
+            ],
+            "properties": {
+              "decision_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "decision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "rationale": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "title",
+              "requirement_ids",
+              "acceptance_ids",
+              "decision_ids",
+              "verification_ids",
+              "depends_on",
+              "expected_outcome",
+              "affected_scope",
+              "completion_evidence",
+              "parallel_safe"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "decision_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "verification_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "depends_on": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "expected_outcome": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "affected_scope": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "completion_evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "parallel_safe": {
+                "type": "boolean"
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "verification": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "verification_id",
+              "requirement_ids",
+              "acceptance_ids",
+              "task_ids",
+              "observable_behavior",
+              "expected_evidence"
+            ],
+            "properties": {
+              "verification_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "task_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "observable_behavior": {
+                "type": "boolean"
+              },
+              "expected_evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "contradictions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "contradiction_id",
+              "subject_ids",
+              "status",
+              "assessment",
+              "evidence"
+            ],
+            "properties": {
+              "contradiction_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "subject_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "status": {
+                "enum": [
+                  "resolved",
+                  "accepted",
+                  "unresolved"
+                ]
+              },
+              "assessment": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "constitution_principles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "principle_id",
+              "title",
+              "applicability",
+              "status",
+              "evidence",
+              "binding"
+            ],
+            "properties": {
+              "principle_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "applicability": {
+                "enum": [
+                  "applicable",
+                  "not_applicable"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "pass",
+                  "fail",
+                  "not_applicable"
+                ]
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "binding": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "provider_id",
+                  "path",
+                  "version",
+                  "content_sha256",
+                  "semantic_hash",
+                  "validation_ref",
+                  "bound_at"
+                ],
+                "properties": {
+                  "provider_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "version": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "content_sha256": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "semantic_hash": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "validation_ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "bound_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  }
+                }
+              }
+            }
+          },
+          "maxItems": 4096
+        }
+      }
+    },
+    "task_graph": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Complete immutable semantic model for one readable Specify, Plan, or Tasks phase. Every readable projection is rendered from this model byte-for-byte.",
+      "required": [
+        "schema_version",
+        "feature_id",
+        "run_key",
+        "phase",
+        "version",
+        "worker",
+        "constitution_binding",
+        "upstream_versions",
+        "sections",
+        "requirements",
+        "decisions",
+        "tasks",
+        "verification",
+        "contradictions",
+        "constitution_principles"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "feature_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        },
+        "run_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        },
+        "phase": {
+          "enum": [
+            "specify",
+            "plan",
+            "tasks"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "worker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "role",
+            "agent",
+            "dispatch_id"
+          ],
+          "properties": {
+            "role": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "agent": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "dispatch_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "constitution_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "provider_id",
+            "path",
+            "version",
+            "content_sha256",
+            "semantic_hash",
+            "validation_ref",
+            "bound_at"
+          ],
+          "properties": {
+            "provider_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "content_sha256": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "semantic_hash": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "validation_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "bound_at": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "upstream_versions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "artifact_id",
+              "version",
+              "hash"
+            ],
+            "properties": {
+              "artifact_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "version": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "hash": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "sections": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "problem": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "scope": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "non_goals": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "actors": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "journeys": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "requirements": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "edge_cases": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "assumptions": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "dependencies": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "success_criteria": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "repository_grounding": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "decisions": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "alternatives": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "contracts": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "data_flow": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "control_flow": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "migration": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "security": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "operations": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "verification_strategy": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "constitution_recheck": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "task_graph": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "expected_outcomes": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "requirement_id",
+              "statement",
+              "acceptance_ids",
+              "source_refs",
+              "testable",
+              "untestable_reason"
+            ],
+            "properties": {
+              "requirement_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "statement": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "source_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "testable": {
+                "type": "boolean"
+              },
+              "untestable_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "decision_id",
+              "decision",
+              "rationale",
+              "requirement_ids"
+            ],
+            "properties": {
+              "decision_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "decision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "rationale": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "title",
+              "requirement_ids",
+              "acceptance_ids",
+              "decision_ids",
+              "verification_ids",
+              "depends_on",
+              "expected_outcome",
+              "affected_scope",
+              "completion_evidence",
+              "parallel_safe"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "decision_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "verification_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "depends_on": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "expected_outcome": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "affected_scope": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "completion_evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "parallel_safe": {
+                "type": "boolean"
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "verification": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "verification_id",
+              "requirement_ids",
+              "acceptance_ids",
+              "task_ids",
+              "observable_behavior",
+              "expected_evidence"
+            ],
+            "properties": {
+              "verification_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "task_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "observable_behavior": {
+                "type": "boolean"
+              },
+              "expected_evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "contradictions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "contradiction_id",
+              "subject_ids",
+              "status",
+              "assessment",
+              "evidence"
+            ],
+            "properties": {
+              "contradiction_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "subject_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "status": {
+                "enum": [
+                  "resolved",
+                  "accepted",
+                  "unresolved"
+                ]
+              },
+              "assessment": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "constitution_principles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "principle_id",
+              "title",
+              "applicability",
+              "status",
+              "evidence",
+              "binding"
+            ],
+            "properties": {
+              "principle_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "applicability": {
+                "enum": [
+                  "applicable",
+                  "not_applicable"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "pass",
+                  "fail",
+                  "not_applicable"
+                ]
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "binding": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "provider_id",
+                  "path",
+                  "version",
+                  "content_sha256",
+                  "semantic_hash",
+                  "validation_ref",
+                  "bound_at"
+                ],
+                "properties": {
+                  "provider_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "version": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "content_sha256": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "semantic_hash": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "validation_ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "bound_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  }
+                }
+              }
+            }
+          },
+          "maxItems": 4096
+        }
+      }
+    },
+    "phase_validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Readable and machine-readable phase validation bound to one artifact version (specification/types.ts PhaseValidationResult); only pass permits awaiting_approval, and a checkpoint is impossible before a current passing validation result exists.",
+      "required": ["validation_id", "phase", "artifact_version", "status", "checks", "blocking_findings", "constitution", "validator_version"],
+      "properties": {
+        "validation_id": { "type": "string", "description": "Stable validation identifier; never overwritten." },
+        "phase": { "enum": ["specify", "plan", "tasks"] },
+        "artifact_version": { "type": "string", "description": "Must match the current artifact version to authorize a checkpoint." },
+        "status": { "type": "string", "enum": ["pass", "fail"] },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["check_id", "status", "evidence", "remediation"],
+            "properties": {
+              "check_id": { "type": "string", "description": "Stable check identifier." },
+              "status": { "enum": ["pass", "fail", "warning"] },
+              "evidence": { "type": "string" },
+              "remediation": { "type": ["string", "null"], "description": "Actionable remediation; required when status is not pass." }
+            }
+          }
+        },
+        "blocking_findings": {
+          "type": "array",
+          "description": "Pass/fail invariant: empty when status is pass and non-empty when status is fail.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "severity", "subject_id", "message", "evidence_refs", "remediation"],
+            "properties": {
+              "code": { "type": "string", "description": "Stable finding code." },
+              "severity": { "enum": ["blocking", "warning"] },
+              "subject_id": { "type": ["string", "null"] },
+              "message": { "type": "string" },
+              "evidence_refs": { "type": "array", "items": { "type": "string" } },
+              "remediation": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "constitution": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Per-principle result plus the exact constitution binding used.",
+          "required": ["binding", "principles"],
+          "properties": {
+            "binding": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Exact constitution policy binding (constitution_record).",
+              "required": ["provider_id", "path", "version", "content_sha256", "semantic_hash", "validation_ref", "bound_at"],
+              "properties": {
+                "provider_id": { "type": "string" },
+                "path": { "type": "string" },
+                "version": { "type": "string" },
+                "content_sha256": { "type": "string" },
+                "semantic_hash": { "type": "string" },
+                "validation_ref": { "type": "string" },
+                "bound_at": { "type": "string" }
+              }
+            },
+            "principles": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["principle_id", "status", "evidence"],
+                "properties": {
+                  "principle_id": { "type": "string" },
+                  "status": { "enum": ["pass", "fail", "not_applicable"] },
+                  "evidence": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "validator_version": { "type": "string", "description": "Makes revalidation deterministic and attributable." },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "severity", "subject_id", "message", "evidence_refs", "remediation"],
+            "properties": {
+              "code": { "type": "string", "description": "Stable finding code." },
+              "severity": { "enum": ["blocking", "warning"] },
+              "subject_id": { "type": ["string", "null"] },
+              "message": { "type": "string" },
+              "evidence_refs": { "type": "array", "items": { "type": "string" } },
+              "remediation": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "traceability_summary": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "Required after Plan and Tasks; null is only acceptable before upstream phases exist.",
+          "required": ["requirements_total", "requirements_with_acceptance", "decisions_linked", "tasks_linked", "verification_linked", "missing_ids"],
+          "properties": {
+            "requirements_total": { "type": "integer", "minimum": 0 },
+            "requirements_with_acceptance": { "type": "integer", "minimum": 0 },
+            "decisions_linked": { "type": "integer", "minimum": 0 },
+            "tasks_linked": { "type": "integer", "minimum": 0 },
+            "verification_linked": { "type": "integer", "minimum": 0 },
+            "missing_ids": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "validated_at": { "type": "string", "description": "Audit only." }
+      }
+    },
+    "specification_phase_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Complete immutable semantic model for one readable Specify, Plan, or Tasks phase. Every readable projection is rendered from this model byte-for-byte.",
+      "required": [
+        "schema_version",
+        "feature_id",
+        "run_key",
+        "phase",
+        "version",
+        "worker",
+        "constitution_binding",
+        "upstream_versions",
+        "sections",
+        "requirements",
+        "decisions",
+        "tasks",
+        "verification",
+        "contradictions",
+        "constitution_principles"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "feature_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        },
+        "run_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        },
+        "phase": {
+          "enum": [
+            "specify",
+            "plan",
+            "tasks"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "worker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "role",
+            "agent",
+            "dispatch_id"
+          ],
+          "properties": {
+            "role": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "agent": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "dispatch_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "constitution_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "provider_id",
+            "path",
+            "version",
+            "content_sha256",
+            "semantic_hash",
+            "validation_ref",
+            "bound_at"
+          ],
+          "properties": {
+            "provider_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "content_sha256": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "semantic_hash": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "validation_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "bound_at": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "upstream_versions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "artifact_id",
+              "version",
+              "hash"
+            ],
+            "properties": {
+              "artifact_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "version": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "hash": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "sections": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "problem": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "scope": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "non_goals": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "actors": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "journeys": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "requirements": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "edge_cases": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "assumptions": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "dependencies": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "success_criteria": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "repository_grounding": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "decisions": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "alternatives": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "contracts": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "data_flow": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "control_flow": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "migration": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "security": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "operations": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "verification_strategy": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "constitution_recheck": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "task_graph": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "expected_outcomes": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          }
+        },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "requirement_id",
+              "statement",
+              "acceptance_ids",
+              "source_refs",
+              "testable",
+              "untestable_reason"
+            ],
+            "properties": {
+              "requirement_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "statement": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "source_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "testable": {
+                "type": "boolean"
+              },
+              "untestable_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "decision_id",
+              "decision",
+              "rationale",
+              "requirement_ids"
+            ],
+            "properties": {
+              "decision_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "decision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "rationale": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "title",
+              "requirement_ids",
+              "acceptance_ids",
+              "decision_ids",
+              "verification_ids",
+              "depends_on",
+              "expected_outcome",
+              "affected_scope",
+              "completion_evidence",
+              "parallel_safe"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "decision_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "verification_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "depends_on": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "expected_outcome": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "affected_scope": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "completion_evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "parallel_safe": {
+                "type": "boolean"
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "verification": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "verification_id",
+              "requirement_ids",
+              "acceptance_ids",
+              "task_ids",
+              "observable_behavior",
+              "expected_evidence"
+            ],
+            "properties": {
+              "verification_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "acceptance_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "task_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "observable_behavior": {
+                "type": "boolean"
+              },
+              "expected_evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "contradictions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "contradiction_id",
+              "subject_ids",
+              "status",
+              "assessment",
+              "evidence"
+            ],
+            "properties": {
+              "contradiction_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "subject_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "maxItems": 4096
+              },
+              "status": {
+                "enum": [
+                  "resolved",
+                  "accepted",
+                  "unresolved"
+                ]
+              },
+              "assessment": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              }
+            }
+          },
+          "maxItems": 4096
+        },
+        "constitution_principles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "principle_id",
+              "title",
+              "applicability",
+              "status",
+              "evidence",
+              "binding"
+            ],
+            "properties": {
+              "principle_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "applicability": {
+                "enum": [
+                  "applicable",
+                  "not_applicable"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "pass",
+                  "fail",
+                  "not_applicable"
+                ]
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768
+              },
+              "binding": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "provider_id",
+                  "path",
+                  "version",
+                  "content_sha256",
+                  "semantic_hash",
+                  "validation_ref",
+                  "bound_at"
+                ],
+                "properties": {
+                  "provider_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "version": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "content_sha256": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "semantic_hash": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "validation_ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  },
+                  "bound_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768
+                  }
+                }
+              }
+            }
+          },
+          "maxItems": 4096
+        }
+      }
+    },
+    "specification_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Readable specification-status projection (T027) exposing phase status, approvals, and the typed next action for one feature run; regenerated from the durable FeatureWorkspace aggregate and never independently trusted.",
+      "required": ["schema_version", "feature_id", "run_key", "phases", "status", "next_action"],
+      "properties": {
+        "schema_version": { "type": "integer", "description": "Canonical status projection schema version; 1." },
+        "feature_id": { "type": "string", "description": "Immutable, branch-independent feature identity." },
+        "run_key": { "type": "string", "description": "Explicit run key of the generating workflow run." },
+        "profile_name": { "type": "string" },
+        "profile_hash": { "type": "string" },
+        "source_kind": { "enum": ["native", "external", "legacy"] },
+        "constitution_gate_ref": { "type": ["string", "null"] },
+        "constitution_binding": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "Exact constitution policy binding (constitution_record); null before the prerequisite is bound.",
+          "required": ["provider_id", "path", "version", "content_sha256", "semantic_hash", "validation_ref", "bound_at"],
+          "properties": {
+            "provider_id": { "type": "string" },
+            "path": { "type": "string" },
+            "version": { "type": "string" },
+            "content_sha256": { "type": "string" },
+            "semantic_hash": { "type": "string" },
+            "validation_ref": { "type": "string" },
+            "bound_at": { "type": "string" }
+          }
+        },
+        "phases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["phase", "status", "current_version", "approved_version", "validation_ref", "checkpoint_ref", "upstream_versions", "stale_reason", "last_feedback"],
+            "properties": {
+              "phase": { "enum": ["specify", "plan", "tasks"] },
+              "status": { "enum": ["not_started", "generating", "materialized", "validating", "awaiting_approval", "revision_required", "approved", "stale", "blocked"] },
+              "current_version": { "type": ["integer", "null"], "minimum": 1 },
+              "approved_version": { "type": ["integer", "null"], "minimum": 1 },
+              "validation_ref": { "type": ["string", "null"], "description": "Required before awaiting_approval or approved." },
+              "checkpoint_ref": { "type": ["string", "null"], "description": "Required when approved." },
+              "upstream_versions": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["phase", "version", "hash"],
+                  "properties": {
+                    "phase": { "enum": ["specify", "plan", "tasks"] },
+                    "version": { "type": "integer", "minimum": 1 },
+                    "hash": { "type": "string" }
+                  }
+                }
+              },
+              "stale_reason": { "type": ["string", "null"], "description": "Required when status is stale." },
+              "last_feedback": { "type": ["string", "null"], "description": "Captured only from request_changes." }
+            }
+          }
+        },
+        "status": { "enum": ["created", "in_progress", "implementation_ready", "claimed", "executing", "completion_validating", "completion_blocked", "completed", "blocked", "stale"] },
+        "next_action": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Typed next action using the canonical WorkspaceNextActionKind vocabulary; must identify a valid command, checkpoint, or remediation, or none.",
+          "required": ["kind", "command", "reason"],
+          "properties": {
+            "kind": { "enum": ["command", "checkpoint", "remediation", "none"] },
+            "command": { "type": ["string", "null"], "description": "Exact command, checkpoint id, or remediation entry point; null for checkpoint and none kinds." },
+            "reason": { "type": "string" }
+          }
+        },
+        "handoff_ref": { "type": ["string", "null"] },
+        "execution_claim_ref": { "type": ["string", "null"] },
+        "implementation_conformance_ref": { "type": ["string", "null"] },
+        "updated_at": { "type": "string", "description": "Audit only; the projection is regenerated from the durable aggregate." }
       }
     }
   }

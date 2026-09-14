@@ -1,0 +1,87 @@
+{
+  "task": "T094",
+  "test": "T094 runtime: one confirmed CTO wave executes ready handoffs with per-feature isolation and blocked preflight",
+  "command": "node --test --import tsx --test-name-pattern='T094 runtime' test/spec-cto-execution.test.ts",
+  "cwd": "packages/e2e",
+  "runs": [
+    {
+      "id": "run1",
+      "command": "node --test --import tsx --test-name-pattern='T094 runtime' test/spec-cto-execution.test.ts",
+      "exit": 0,
+      "totals": { "tests": 1, "passed": 1, "failed": 0, "cancelled": 0, "skipped": 0, "todo": 0 },
+      "log": "run1.log",
+      "log_sha256": "e2f0c41e904bce43307d36c09d0ba7f770510a24ec2e7b31fafada2d5cc4a733"
+    },
+    {
+      "id": "run2",
+      "command": "node --test --import tsx --test-name-pattern='T094 runtime' test/spec-cto-execution.test.ts",
+      "exit": 0,
+      "totals": { "tests": 1, "passed": 1, "failed": 0, "cancelled": 0, "skipped": 0, "todo": 0 },
+      "log": "run2.log",
+      "log_sha256": "a1e186fded4956213247c06449b0a0f9259a26b7686997f43aaf92b85109ef93"
+    }
+  ],
+  "normalized_outputs": {
+    "normalization": "Compared semantic identities and outcome counts; omitted random UUIDs (mapping/wave/capability/claim ids), timestamps, tokens, and temporary absolute roots.",
+    "mapping": {
+      "schema_version": 1,
+      "mapping_version": 1,
+      "cto_run_id": "readable-cto-wave-001",
+      "execution_choice": "cto",
+      "status": "confirmed",
+      "feature_ids": ["readable-cto-passing", "readable-cto-blocked"],
+      "selections": [
+        { "feature_id": "readable-cto-passing", "run_key": "readable-cto-passing-run-001" },
+        { "feature_id": "readable-cto-blocked", "run_key": "readable-cto-blocked-run-001" }
+      ],
+      "handoff_bindings": [
+        { "feature_id": "readable-cto-passing", "handoff_id": "readable-cto-passing.handoff.v1", "handoff_digest": "c6c768cadba59af051483fd563c0724d54b94f8a2c64f9a9553926f784046874", "artifact_versions": [1, 1, 1] },
+        { "feature_id": "readable-cto-blocked", "handoff_id": "readable-cto-blocked.handoff.v1", "handoff_digest": "be08d41a6dfa25b120e7f4d9578dfb4dd530ac96dfdde30b26337702c97816ae", "artifact_versions": [1, 1, 1] }
+      ],
+      "task_to_slice": [
+        { "feature_id": "readable-cto-passing", "task_id": "T-1", "team_id": "team-6cc2f4133933ba7c968daf55dfcdc1fe", "slice_id": "slice-2428a7f0a0735178960f7933b4aa6de9", "requirement_ids": ["FR-1"], "verification_ids": ["V-1"] },
+        { "feature_id": "readable-cto-blocked", "task_id": "T-1", "team_id": "team-566158364807105640bc80e741d6d7ba", "slice_id": "slice-8c53cf8f0b2b850ee07b63b06b0c2f55", "requirement_ids": ["FR-1"], "verification_ids": ["V-1"] }
+      ],
+      "parallelization": [
+        { "slice_id": "slice-2428a7f0a0735178960f7933b4aa6de9", "decision": "serial", "worktree": "same_branch" },
+        { "slice_id": "slice-8c53cf8f0b2b850ee07b63b06b0c2f55", "decision": "serial", "worktree": "same_branch" }
+      ]
+    },
+    "claims": {
+      "preflight": { "cto_claims": 0, "confirmed_mappings": 0 },
+      "post_dispatch": {
+        "readable-cto-passing": { "cto_active": 0 },
+        "readable-cto-blocked": { "cto_active": 1 },
+        "readable-cto-stale": { "all_claims": 0 },
+        "readable-cto-claimed": { "do_work_active": 1 }
+      }
+    },
+    "capability": {
+      "workflow": "spec-preparation",
+      "stage_cursor": "execution",
+      "kind": "consilium",
+      "expected_count": 2,
+      "expected_roles": [
+        "slice-2428a7f0a0735178960f7933b4aa6de9",
+        "slice-8c53cf8f0b2b850ee07b63b06b0c2f55"
+      ],
+      "choice": "cto",
+      "volatile_identity_fields_present": true
+    }
+  },
+  "comparison": {
+    "run1_vs_run2_normalized_mapping": "match",
+    "run1_vs_run2_normalized_claims": "match",
+    "run1_vs_run2_normalized_capability": "match",
+    "run1_vs_run2_success_totals": "match (1/1 each)",
+    "result": "PASS"
+  },
+  "scratch_cleanup": {
+    "scratch": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-p3G8Jb",
+    "stop_command": "npm run --silent e2e -- stop /var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-cto-exec-p3G8Jb",
+    "stop_log": "stop.log",
+    "stop_log_sha256": "5dcf70370d48401daad9b84c186125fcee78954db781fa563f75191aff8ab955",
+    "stop_result": "no session.json found — nothing to stop; test cleanup had already removed scratch",
+    "live_process_check": "pgrep -af 'omp-spec-cto-exec|omp-spec-e2e-cto-exec-wave' returned no processes"
+  }
+}

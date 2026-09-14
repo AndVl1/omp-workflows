@@ -8,6 +8,7 @@ import type {
   LectureEvidenceProvider,
   LectureSourceParser,
   LectureTextAnalysisPort,
+  PinnedProjectRoot,
   PlaylistExpander,
   ResolvedVideoSource,
 } from "@andvl1/omp-workflows-core";
@@ -244,15 +245,16 @@ async function createPipelineProvider(
   const asrMetadata = { id: asr.id, ...(asr.model ? { model: asr.model } : {}), ...(config.pipeline.asr.timestampMode ? { timestampMode: config.pipeline.asr.timestampMode } : {}) };
   return new TranscribeAnalyzeEvidenceProvider({ media: audio, preprocess, asr, analysis, fallbackAnalysis: fallback, preflightError, pipelineMetadata: { media: { id: "authorized-audio", mode: "owned-audio" }, asr: asrMetadata, analysis: { id: analysis.id, ...(analysis.model ? { model: analysis.model } : {}) } } });
 }
-
 export interface LectureAcquisitionServiceOverrides {
   fetch?: typeof globalThis.fetch;
   ompRuntime?: unknown;
   ompRuntimeProbe?: OmpRuntimeCapabilityProbe;
+  /** Borrow the lecture_acquire operation pin; the service never closes it. */
+  pinnedRoot?: PinnedProjectRoot;
 }
 
 export async function createDefaultLectureAcquisitionService(cwd: string, env: Record<string, string | undefined> = process.env, overrides: LectureAcquisitionServiceOverrides = {}): Promise<YouTubeLectureAcquisitionService> {
-  const config = await loadLectureResearchConfig(cwd, env);
+  const config = await loadLectureResearchConfig(cwd, env, { pinnedRoot: overrides.pinnedRoot });
   const fetchImpl = overrides.fetch ?? globalThis.fetch;
   const youtubeKey = env[config.youtube.apiKeyEnv];
   const playlistExpander: PlaylistExpander = youtubeKey

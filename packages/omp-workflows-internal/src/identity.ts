@@ -28,6 +28,30 @@ export const OMP_INTERNAL_OWNER_KIND = "private_omp" as const;
 /** Supported host range, mirroring the core/fullstack contract. */
 export const OMP_INTERNAL_HOST_RANGE = ">=17.3 <19";
 
+function ownerForCanonicalRoot(root: string): WorkflowOwnerIdentity {
+	return {
+		owner_id: OMP_INTERNAL_BUNDLE_ID,
+		bundle_id: OMP_INTERNAL_BUNDLE_ID,
+		owner_kind: OMP_INTERNAL_OWNER_KIND,
+		activation_marker: OMP_INTERNAL_ACTIVATION_MARKER,
+		host_range: OMP_INTERNAL_HOST_RANGE,
+		activation: {
+			marker_id: OMP_INTERNAL_ACTIVATION_MARKER,
+			required: [
+				{ path: "package.json", kind: "file" },
+				{ path: "packages/core", kind: "directory" },
+				{ path: "packages/fullstack", kind: "directory" },
+			],
+		},
+		provenance: {
+			package: OMP_INTERNAL_BUNDLE_ID,
+			entrypoint: "dist/index.js",
+			cwd: root,
+			config_path: join(root, ".omp", "team.config.json"),
+		},
+	};
+}
+
 /**
  * Build the workflow owner identity for a session project root.
  *
@@ -36,20 +60,12 @@ export const OMP_INTERNAL_HOST_RANGE = ">=17.3 <19";
  * `<root>/.omp/team.config.json`, which the core claim API validates.
  */
 export function privateOmpOwnerForCwd(cwd: string): WorkflowOwnerIdentity {
-	const root = resolve(cwd);
-	return {
-		owner_id: OMP_INTERNAL_BUNDLE_ID,
-		bundle_id: OMP_INTERNAL_BUNDLE_ID,
-		owner_kind: OMP_INTERNAL_OWNER_KIND,
-		activation_marker: OMP_INTERNAL_ACTIVATION_MARKER,
-		host_range: OMP_INTERNAL_HOST_RANGE,
-		provenance: {
-			package: OMP_INTERNAL_BUNDLE_ID,
-			entrypoint: "dist/index.js",
-			cwd: root,
-			config_path: join(root, ".omp", "team.config.json"),
-		},
-	};
+	return ownerForCanonicalRoot(resolve(cwd));
+}
+
+/** Build an owner from an already pinned canonical root. */
+export function privateOmpOwnerForPinnedRoot(canonicalRoot: string): WorkflowOwnerIdentity {
+	return ownerForCanonicalRoot(canonicalRoot);
 }
 
 /**
@@ -69,5 +85,5 @@ export function privateOmpOwnerForMarkedWorkspace(cwd: string): WorkflowOwnerIde
 	if (!detectWorkspaceMarkers(cwd).ok) {
 		throw new Error(`activation_markers_missing: ${OMP_INTERNAL_ACTIVATION_MARKER}`);
 	}
-	return privateOmpOwnerForCwd(cwd);
+	return privateOmpOwnerForPinnedRoot(resolve(cwd));
 }

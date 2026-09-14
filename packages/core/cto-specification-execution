@@ -1,0 +1,20 @@
+{
+  "command": "node --test --import tsx --test-concurrency=1 undefined",
+  "cwd": "packages/core",
+  "started_at_utc": "2026-09-11T19:25:48.214Z",
+  "ended_at_utc": "2026-09-11T19:25:48.216Z",
+  "duration_ms": 1,
+  "exit_code": null,
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "log": "cto-specification-execution",
+  "counts": {
+    "log_bytes": 0,
+    "log_lines": 0,
+    "tests": null,
+    "passed": null,
+    "failed": null,
+    "cancelled": null,
+    "skipped": null,
+    "todo": null
+  }
+}

@@ -15,10 +15,10 @@
  *   - not claiming done yet (cursor not at summary AND pause.kind != done)
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { resolve, join } from "node:path";
-import { isSafeStateSegment } from "../engine/state.js";
-import { readDoDFileSafe } from "../engine/dod.js";
+import { join } from "node:path";
+import { PinnedProjectRoot } from "../specification/pinned-root.js";
+import { resolveActiveStatePinned } from "../engine/state.js";
+import { readDoDFilePinned } from "../engine/dod.js";
 const WORK_STATE_DIR = ".work-state";
 
 export interface SessionStopEvent {
@@ -50,6 +50,7 @@ interface TeamState {
   pause?: { kind?: string };
   stage_cursor?: string;
   branch?: string;
+  specification?: { status?: unknown; handoff_ref?: unknown };
 }
 
 const NEUTRAL_RUNTIME_STATES: Record<string, true> = {
@@ -157,101 +158,72 @@ export function validateTypedDoD(input: unknown): DoDValidation {
 
 export function dodBackstop(event: SessionStopEvent, ctx: SessionStopContext): { decision: "block"; reason: string } | { continue: true } | void {
   if (event.stop_hook_active) return;
-  const statePath = resolveStatePath(ctx.cwd);
-  if (!statePath) return;
-  let state: TeamState;
+  const pinnedRoot = PinnedProjectRoot.open(ctx.cwd);
+  if (!pinnedRoot) return;
   try {
-    const parsed: unknown = JSON.parse(readFileSync(statePath, "utf8"));
-    if (!isRecord(parsed)) return;
-    state = parsed as TeamState;
-  } catch {
-    return;
+    const resolved = resolveActiveStatePinned(ctx.cwd, pinnedRoot);
+    const state = resolved.state;
+    if (!state || !resolved.stateDir) return;
+    if (pinnedRoot.pathEntryExists(join(WORK_STATE_DIR, ".dod-override"))) return;
+    if (hasNeutralRuntimeState(state)) return;
+
+    const workflow = state.classification?.workflow;
+    if (workflow === "research" || workflow === "review" || workflow === "emergency" || workflow === "lecture-research") return;
+
+    const pause = state.pause?.kind ?? "none";
+    const cursor = state.stage_cursor;
+    const claimingDone = pause === "done" || cursor === "summary";
+    if (!claimingDone) return;
+
+    const pendingDispatches = (state as TeamState & { dispatch_capability?: { dispatches?: Array<{ id: string; status?: string }> } }).dispatch_capability?.dispatches?.filter((d) => d.status === "authorized" || d.status === "running") ?? [];
+    if (pendingDispatches.length > 0) {
+      return {
+        decision: "block",
+        reason: `Durable join incomplete: ${pendingDispatches.length} dispatch(es) still authorized/running (${pendingDispatches.map((d) => d.id).join(", ")}). Reconcile terminal tool_result outcomes before stopping.`,
+      };
+    }
+
+    // spec-import stops at an implementation-ready handoff. It has completed
+    // compatibility approval and frozen the shared handoff, but it has not
+    // started implementation work, so the implementation DoD backstop does
+    // not apply until /do-work --spec claims that handoff.
+    if (workflow === "spec-import"
+      && state.specification?.status === "implementation_ready"
+      && nonEmptyString(state.specification.handoff_ref)) {
+      return { continue: true };
+    }
+
+    const dodAbsolutePath = join(resolved.stateDir, "artifacts", "dod.json");
+    const dodRelativePath = pinnedRoot.relativePath(dodAbsolutePath);
+    if (!dodRelativePath) return;
+    const dodResult = readDoDFilePinned(pinnedRoot, dodRelativePath);
+    if (!dodResult.ok) {
+      const reason = dodResult.reason.includes("missing")
+        ? `DoD: malformed typed artifact at ${dodAbsolutePath}: file is missing (unmet or evidence-less). Write the typed Definition of Done (items with criterion, verify_method, and status).`
+        : `DoD: malformed typed artifact at ${dodAbsolutePath}: ${dodResult.reason}. Each item requires criterion, verify_method, status (pending|met), and optional evidence.`;
+      return { decision: "block", reason };
+    }
+
+    const dod = dodResult.dod;
+    if (dod.items.length === 0) {
+      return {
+        decision: "block",
+        reason: "DoD: empty typed Definition of Done at done-claim. Write at least one criterion before claiming done.",
+      };
+    }
+
+    const pending = dod.items.flatMap((item, index) => {
+      const evidenceMet = typeof item.evidence === "string" && item.evidence.trim().length > 0;
+      return item.status === "met" && evidenceMet ? [] : [item.id ?? `item-${index + 1}`];
+    });
+    if (pending.length > 0) {
+      return {
+        decision: "block",
+        reason: `DoD: ${pending.length} item(s) unmet or evidence-less: ${pending.join(", ")}. Close each typed item with non-empty evidence, or set a typed neutral pause state for an intentional pause. Override: touch .work-state/.dod-override`,
+      };
+    }
+    return { continue: true };
+  } finally {
+    pinnedRoot.close();
   }
-
-  if (existsSync(join(ctx.cwd, WORK_STATE_DIR, ".dod-override"))) return;
-  if (hasNeutralRuntimeState(state)) return;
-
-  const workflow = state.classification?.workflow;
-  if (workflow === "research" || workflow === "review" || workflow === "emergency" || workflow === "lecture-research") return;
-
-  const pause = state.pause?.kind ?? "none";
-  const cursor = state.stage_cursor;
-  const claimingDone = pause === "done" || cursor === "summary";
-  if (!claimingDone) return;
-
-  const pendingDispatches = (state as TeamState & { dispatch_capability?: { dispatches?: Array<{ id: string; status?: string }> } }).dispatch_capability?.dispatches?.filter((d) => d.status === "authorized" || d.status === "running") ?? [];
-  if (pendingDispatches.length > 0) {
-    return {
-      decision: "block",
-      reason: `Durable join incomplete: ${pendingDispatches.length} dispatch(es) still authorized/running (${pendingDispatches.map((d) => d.id).join(", ")}). Reconcile terminal tool_result outcomes before stopping.`,
-    };
-  }
-
-  const dodPath = resolveDoDPath(statePath);
-  // Single safe read (O_NOFOLLOW, regular-file, fd/path bind, cwd containment):
-  // a dod.json swapped for a symlink cannot leak outside the workspace here.
-  const dodResult = readDoD(ctx.cwd, dodPath);
-  if (!dodResult.value) {
-    const reason = dodResult.error
-      ? `DoD: malformed typed artifact at ${dodPath}: ${dodResult.error}. Each item requires criterion, verify_method, status (pending|met), and optional evidence.`
-      : `DoD: malformed typed artifact at ${dodPath}: file is missing (unmet or evidence-less). Write the typed Definition of Done (items with criterion, verify_method, and status).`;
-    return { decision: "block", reason };
-  }
-
-  const dod = dodResult.value;
-  if (dod.items.length === 0) {
-    return {
-      decision: "block",
-      reason: "DoD: empty typed Definition of Done at done-claim. Write at least one criterion before claiming done.",
-    };
-  }
-
-  const pending = dod.items.flatMap((item, index) => {
-    const evidenceMet = typeof item.evidence === "string" && item.evidence.trim().length > 0;
-    return item.status === "met" && evidenceMet ? [] : [item.id ?? `item-${index + 1}`];
-  });
-  if (pending.length > 0) {
-    return {
-      decision: "block",
-      reason: `DoD: ${pending.length} item(s) unmet or evidence-less: ${pending.join(", ")}. Close each typed item with non-empty evidence, or set a typed neutral pause state for an intentional pause. Override: touch .work-state/.dod-override`,
-    };
-  }
-  return { continue: true };
-}
-
-function resolveStatePath(cwd: string): string | null {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  if (!existsSync(wsDir)) return null;
-  const active = join(wsDir, ".active-feature");
-  if (existsSync(active)) {
-    const slug = readFileSync(active, "utf8").trim();
-    if (!isSafeStateSegment(slug)) return null;
-    const path = join(wsDir, "features", slug, "state.json");
-    if (existsSync(path)) return path;
-  }
-  const legacy = join(wsDir, "team-state.json");
-  if (existsSync(legacy)) return legacy;
-  return null;
-}
-
-function resolveDoDPath(statePath: string): string {
-  // artifacts sit next to state.json: <dir>/state.json -> <dir>/artifacts/dod.json
-  const dir = statePath.replace(/team-state\.json$/, "").replace(/state\.json$/, "");
-  return `${dir}artifacts/dod.json`;
-}
-
-function readDoD(cwd: string, path: string): { value: DoD | null; error?: string } {
-  const read = readDoDFileSafe(cwd, path);
-  if (!read.ok) {
-    if (read.kind === "missing") return { value: null };
-    return { value: null, error: read.reason };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(read.raw) as unknown;
-  } catch {
-    return { value: null, error: "invalid JSON" };
-  }
-  const validation = validateTypedDoD(parsed);
-  return validation.ok ? { value: validation.value } : { value: null, error: validation.error };
 }

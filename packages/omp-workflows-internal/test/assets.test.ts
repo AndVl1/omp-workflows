@@ -3,8 +3,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-
-import { ALLOWED_POOL_AGENTS } from "../src/pool.js";
+import { ALLOWED_POOL_AGENTS, defaultOmpInternalRoles } from "../src/pool.js";
 import { loadOmpWorkflowProfiles } from "../src/profiles.js";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -45,6 +44,29 @@ test("agent files declare the full frontmatter and stay concise", () => {
 	}
 });
 
+test("native specification roles use the dedicated worker asset", () => {
+	const worker = readFileSync(join(packageRoot, "agents", "omp-specification-worker.md"), "utf8");
+	assert.match(worker, /^name: omp-specification-worker$/mu);
+	assert.match(worker, /^model: \["@task"\]$/mu);
+	assert.match(worker, /^thinkingLevel: auto$/mu);
+	assert.match(worker, /^tools: read$/mu);
+	assert.match(worker, /exact standalone `NATIVE_WORKER_INPUT` marker/iu);
+	assert.match(worker, /bounded single-pass transformation/iu);
+	assert.doesNotMatch(worker, /low.?effort|exact effort/iu);
+	assert.match(worker, /fill the strict worker_result schema directly from the embedded inputs/iu);
+	assert.match(worker, /do not perform extended analysis or research/iu);
+	assert.doesNotMatch(worker, /semantic_model/iu);
+	assert.match(worker, /preserve engine-owned identity, binding, upstream, version, and title values as context only/iu);
+	assert.match(worker, /do not emit, copy, or invent those(?: or any other)? engine-owned(?: envelope)? fields/iu);
+	assert.match(worker, /exactly seven authored keys: sections, requirements, decisions, tasks, verification, contradictions, and constitution_principles/iu);
+	assert.match(worker, /yield exactly once/iu);
+	assert.equal(defaultOmpInternalRoles["specification-analyst"], "omp-specification-worker");
+	assert.equal(defaultOmpInternalRoles["specification-architect"], "omp-specification-worker");
+	for (const agent of ["omp-analyst", "omp-architect"] as const) {
+		const raw = readFileSync(join(packageRoot, "agents", `${agent}.md`), "utf8");
+		assert.doesNotMatch(raw, /Native Specification Worker Mode/iu, `${agent}: legacy native block must be removed`);
+	}
+});
 test("bundle profiles load, validate and use only the allowed pool roles", () => {
 	const profiles = loadOmpWorkflowProfiles();
 	assert.deepEqual(profiles.map((profile) => profile.name), ["omp-feature", "omp-validate"]);
@@ -54,6 +76,8 @@ test("bundle profiles load, validate and use only the allowed pool roles", () =>
 		"tech-researcher": "",
 		diagnostics: "",
 		architect: "",
+		"specification-analyst": "",
+		"specification-architect": "",
 		developer: "",
 		qa: "",
 		"manual-qa": "",

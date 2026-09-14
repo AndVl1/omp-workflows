@@ -24,8 +24,8 @@
  * producer and consumer are this same bundle.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { TextDecoder } from "node:util";
+import { PinnedProjectRoot } from "@andvl1/omp-workflows-core";
 import type { ExtensionAPI, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 
 /**
@@ -49,7 +49,11 @@ export const SUBAGENT_CARD_TYPE = "omp-subagent-card";
 /** Status values for subagent lifecycle (UI rendering set). */
 type SubagentStatus = "running" | "completed" | "failed" | "aborted";
 
-/** Mirror of AgentProgress — the fields we actually read. */
+/** Maximum UTF-8 bytes retained for any untrusted lifecycle/progress label. */
+export const MAX_SUBAGENT_FIELD_BYTES = 256;
+/** Maximum nodes retained in memory; oldest finished nodes are evicted first. */
+export const MAX_SUBAGENT_NODES = 256;
+
 interface SubagentProgress {
 	id?: string;
 	currentTool?: string;
@@ -122,9 +126,10 @@ const STATUS_GLYPH: Record<SubagentStatus, string> = {
 	aborted: "\u00b7",
 };
 
-/** Format a token count in compact form. */
+/** Format a bounded token count in compact form. */
 function formatTokens(tokens: number): string {
-	return tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : `${tokens}`;
+	const bounded = Number.isFinite(tokens) ? Math.max(0, Math.min(1_000_000_000_000, Math.floor(tokens))) : 0;
+	return bounded >= 1000 ? `${(bounded / 1000).toFixed(1)}k` : `${bounded}`;
 }
 
 /** Format a millisecond duration in human-readable form. */
@@ -136,47 +141,84 @@ function formatDuration(ms: number): string {
 	return `${minutes}m${remainder.toString().padStart(2, "0")}s`;
 }
 
-/** Clamp a string to a max length, appending an ellipsis when truncated. */
-function clampText(text: string, max: number): string {
-	return text.length > max ? `${text.slice(0, max - 3)}...` : text;
-}
-
 /**
- * Defensive narrowing for the lifecycle payload. "started" is normalised
- * to "running" so the downstream union stays aligned with `SubagentStatus`.
+ * Normalize untrusted labels to bounded, line-inert display text. Cc/Cf
+ * includes ANSI escapes, newlines, and bidi controls; replacement glyphs keep
+ * those values visible without allowing terminal state or layout injection.
  */
-function isLifecyclePayload(value: unknown): value is SubagentLifecyclePayload {
-	if (!value || typeof value !== "object") return false;
-	const v = value as Record<string, unknown>;
-	if (typeof v.id !== "string") return false;
-	if (typeof v.agent !== "string") return false;
-	const status = v.status;
-	if (status === "started") {
-		v.status = "running";
-		return true;
+export function normalizeSubagentDisplayText(value: unknown, maxBytes = MAX_SUBAGENT_FIELD_BYTES): string {
+	if (typeof value !== "string" || !Number.isFinite(maxBytes) || maxBytes < 1) return "";
+	const limit = Math.min(MAX_SUBAGENT_FIELD_BYTES, Math.floor(maxBytes));
+	const source = value.normalize("NFKC");
+	let output = "";
+	for (const character of source) {
+		const safe = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(character) ? "\uFFFD" : character;
+		const candidate = output + safe;
+		if (Buffer.byteLength(candidate, "utf8") > limit) {
+			const suffix = "\u2026";
+			if (Buffer.byteLength(output + suffix, "utf8") <= limit) output += suffix;
+			break;
+		}
+		output = candidate;
 	}
-	if (status !== "completed" && status !== "failed" && status !== "aborted") return false;
-	return true;
+	return output;
 }
 
-/** Defensive narrowing for the progress payload. */
-function isProgressPayload(value: unknown): value is SubagentProgressPayload {
-	if (!value || typeof value !== "object") return false;
+function boundedRequiredLabel(value: unknown, maxBytes = MAX_SUBAGENT_FIELD_BYTES): string | null {
+	const normalized = normalizeSubagentDisplayText(value, maxBytes);
+	return normalized.length > 0 ? normalized : null;
+}
+
+/** Defensive narrowing and normalization for lifecycle payloads. */
+function normalizeLifecyclePayload(value: unknown): SubagentLifecyclePayload | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const v = value as Record<string, unknown>;
-	const progress = v.progress;
-	if (!progress || typeof progress !== "object") return false;
+	const id = boundedRequiredLabel(v.id);
+	const agent = boundedRequiredLabel(v.agent);
+	if (!id || !agent) return null;
+	const status = v.status === "started" ? "running" : v.status;
+	if (status !== "running" && status !== "completed" && status !== "failed" && status !== "aborted") return null;
+	const parentToolCallId = boundedRequiredLabel(v.parentToolCallId);
+	const description = boundedRequiredLabel(v.description);
+	return {
+		id,
+		agent,
+		...(parentToolCallId ? { parentToolCallId } : {}),
+		...(description ? { description } : {}),
+		status,
+	};
+}
+
+/** Defensive narrowing and normalization for progress payloads. */
+function normalizeProgressPayload(value: unknown): SubagentProgressPayload | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const progress = (value as Record<string, unknown>).progress;
+	if (!progress || typeof progress !== "object" || Array.isArray(progress)) return null;
 	const p = progress as Record<string, unknown>;
-	return typeof p.id === "string" || typeof p.currentTool === "string";
+	const id = boundedRequiredLabel(p.id);
+	const currentTool = boundedRequiredLabel(p.currentTool);
+	if (!id && !currentTool) return null;
+	const tokens = typeof p.tokens === "number" && Number.isFinite(p.tokens)
+		? Math.max(0, Math.min(1_000_000_000_000, Math.floor(p.tokens)))
+		: undefined;
+	return {
+		progress: {
+			...(id ? { id } : {}),
+			...(currentTool ? { currentTool } : {}),
+			...(tokens !== undefined ? { tokens } : {}),
+		},
+	};
 }
 
 /** Render a one-line summary suitable for the compact HUD above the editor. */
 export function renderSubagentCompactLine(nodes: SubagentNode[]): string[] {
-	const running = nodes.filter((n) => n.status === "running");
+	const running = nodes.filter((n) => n.status === "running").slice(0, MAX_SUBAGENT_NODES);
 	if (running.length === 0) return [];
 
-	const counts: Record<string, number> = {};
+	const counts: Record<string, number> = Object.create(null) as Record<string, number>;
 	for (const node of running) {
-		counts[node.agent] = (counts[node.agent] ?? 0) + 1;
+		const agent = normalizeSubagentDisplayText(node.agent, 128) || "unknown";
+		counts[agent] = (counts[agent] ?? 0) + 1;
 	}
 	const head = `${WIDGET_HEADER}: ${running.length} running`;
 	const agents = Object.entries(counts)
@@ -188,10 +230,9 @@ export function renderSubagentCompactLine(nodes: SubagentNode[]): string[] {
 	return [`${head}${tail}`];
 }
 
-/** Public renderer entry — full tree (expanded mode). */
-export function renderSubagentTree(nodes: SubagentNode[]): string[] {
-	if (nodes.length === 0) return [];
 
+/** Render the full hierarchical tree while preserving bounded output. */
+export function renderSubagentTree(nodes: SubagentNode[]): string[] {
 	const byParent = new Map<string | undefined, SubagentNode[]>();
 	for (const node of nodes) {
 		const key = node.parentToolCallId;
@@ -226,7 +267,7 @@ function appendNode(
 ): void {
 	const branch = prefix + (isLast ? "\u2514\u2500 " : "\u251c\u2500 ");
 	const summary = describeNode(node);
-	lines.push(`${branch}${STATUS_GLYPH[node.status]} ${node.agent}${summary}`);
+	lines.push(`${branch}${STATUS_GLYPH[node.status]} ${normalizeSubagentDisplayText(node.agent, 128)}${summary}`);
 
 	const children = (byParent.get(node.id) ?? []).sort((a, b) => a.startedAtMs - b.startedAtMs);
 	const childPrefix = prefix + (isLast ? "   " : "\u2502  ");
@@ -239,8 +280,8 @@ function appendNode(
 /** Build the per-line summary annotation (tool + tokens + duration). */
 function describeNode(node: SubagentNode): string {
 	const parts: string[] = [];
-	if (node.description) parts.push(`\u00b7 ${clampText(node.description, 60)}`);
-	if (node.progress?.currentTool) parts.push(`\u00b7 ${node.progress.currentTool}`);
+	if (node.description) parts.push(`\u00b7 ${normalizeSubagentDisplayText(node.description, 128)}`);
+	if (node.progress?.currentTool) parts.push(`\u00b7 ${normalizeSubagentDisplayText(node.progress.currentTool, 128)}`);
 	if (node.progress && node.progress.tokens && node.progress.tokens > 0) {
 		parts.push(`\u00b7 ${formatTokens(node.progress.tokens)} tok`);
 	}
@@ -251,33 +292,61 @@ function describeNode(node: SubagentNode): string {
 }
 
 /** Read the persistent view state under `<cwd>/.omp/subagent-tree.json`. */
+const MAX_SUBAGENT_STATE_BYTES = 8 * 1024;
+
+function defaultPersistedState(): SubagentTreePersistedState {
+	return { enabled: true, mode: "compact" };
+}
+
+function parsePersistedState(value: unknown): SubagentTreePersistedState | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const keys = Object.keys(value).sort();
+	if (keys.length !== 2 || keys[0] !== "enabled" || keys[1] !== "mode") return null;
+	const raw = value as Record<string, unknown>;
+	if (typeof raw.enabled !== "boolean" || (raw.mode !== "compact" && raw.mode !== "expanded")) return null;
+	return { enabled: raw.enabled, mode: raw.mode };
+}
+
+/** Read the persistent view state through the pinned project descriptor. */
 export function readPersistedState(cwd: string): SubagentTreePersistedState {
-	const path = statePath(cwd);
-	if (!existsSync(path)) return { enabled: true, mode: "compact" };
+	const fallback = defaultPersistedState();
+	const root = PinnedProjectRoot.open(cwd);
+	if (!root) return fallback;
 	try {
-		const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<SubagentTreePersistedState>;
-		const mode = raw.mode === "expanded" ? "expanded" : "compact";
-		return {
-			enabled: raw.enabled ?? true,
-			mode,
-		};
+		if (!root.isStable()) return fallback;
+		const bytes = root.readFile(".omp/subagent-tree.json", { maxBytes: MAX_SUBAGENT_STATE_BYTES }).bytes;
+		if (!root.isStable()) return fallback;
+		const parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+		if (!root.isStable()) return fallback;
+		return parsePersistedState(parsed) ?? fallback;
 	} catch {
-		return { enabled: true, mode: "compact" };
+		// Missing, malformed, oversized, special-file, symlink, and root-swap
+		// state is non-authoritative; keep the safe default.
+		return fallback;
+	} finally {
+		root.close();
 	}
 }
 
 export function writePersistedState(cwd: string, state: SubagentTreePersistedState): void {
-	const path = statePath(cwd);
+	const root = PinnedProjectRoot.open(cwd);
+	if (!root) return;
 	try {
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, JSON.stringify(state, null, 2));
+		if (!root.isStable()) return;
+		const value: SubagentTreePersistedState = {
+			enabled: state.enabled === true,
+			mode: state.mode === "expanded" ? "expanded" : "compact",
+		};
+		const serialized = JSON.stringify(value);
+		if (Buffer.byteLength(serialized, "utf8") > MAX_SUBAGENT_STATE_BYTES) return;
+		root.ensureDirectory(".omp");
+		root.writeAtomic(".omp/subagent-tree.json", serialized);
+		if (!root.isStable()) return;
 	} catch {
 		// best-effort: persistence failures must never break the agent loop
+	} finally {
+		root.close();
 	}
-}
-
-function statePath(cwd: string): string {
-	return join(cwd, ".omp", "subagent-tree.json");
 }
 
 /** Subagent tree controller — holds per-session state, exposes mutations. */
@@ -300,9 +369,17 @@ export class SubagentTreeController {
 	 * should `appendEntry` an inline card into the transcript.
 	 */
 	applyLifecycle(raw: unknown): { event: "started" | "finished"; data: SubagentCardData } | null {
-		if (!isLifecyclePayload(raw)) return null;
-		const payload = raw;
+		const payload = normalizeLifecyclePayload(raw);
+		if (!payload) return null;
 		if (payload.status === "running") {
+		if (!this.nodes.has(payload.id) && this.nodes.size >= MAX_SUBAGENT_NODES) {
+			const finished = [...this.nodes.values()]
+				.filter((node) => node.status !== "running")
+				.sort((a, b) => (a.finishedAtMs ?? a.startedAtMs) - (b.finishedAtMs ?? b.startedAtMs));
+			const evicted = finished[0];
+			if (!evicted) return null;
+			this.nodes.delete(evicted.id);
+		}
 			const node: SubagentNode = {
 				id: payload.id,
 				parentToolCallId: payload.parentToolCallId,
@@ -350,12 +427,13 @@ export class SubagentTreeController {
 
 	/** Apply a raw progress payload. Returns true if the visible tree changed. */
 	applyProgress(raw: unknown): boolean {
-		if (!isProgressPayload(raw)) return false;
-		const id = raw.progress.id;
+		const payload = normalizeProgressPayload(raw);
+		if (!payload) return false;
+		const id = payload.progress.id;
 		if (typeof id !== "string") return false;
 		const existing = this.nodes.get(id);
 		if (!existing) return false;
-		existing.progress = raw.progress;
+		existing.progress = payload.progress;
 		return true;
 	}
 
@@ -440,19 +518,26 @@ export function renderWidget(ui: ExtensionUIContext, controller: SubagentTreeCon
 
 /** Render a single inline card as a `Component`-like object for the transcript. */
 function renderCardComponent(data: SubagentCardData): ComponentLike {
-	const glyph = STATUS_GLYPH[data.status];
-	const description = data.description ? `  \u00b7 ${clampText(data.description, 50)}` : "";
-	const head = `${glyph} ${data.agent}${description}`;
+	const value = data && typeof data === "object" ? data : {} as SubagentCardData;
+	const status = value.status in STATUS_GLYPH ? value.status : "aborted";
+	const glyph = STATUS_GLYPH[status];
+	const agent = boundedRequiredLabel(value.agent) ?? "unknown";
+	const description = boundedRequiredLabel(value.description, 128);
+	const currentTool = boundedRequiredLabel(value.currentTool, 128);
+	const tokens = typeof value.tokens === "number" && Number.isFinite(value.tokens) ? value.tokens : 0;
+	const startedAtMs = typeof value.startedAtMs === "number" && Number.isFinite(value.startedAtMs) ? value.startedAtMs : 0;
+	const finishedAtMs = typeof value.finishedAtMs === "number" && Number.isFinite(value.finishedAtMs) ? value.finishedAtMs : 0;
+	const head = `${glyph} ${agent}${description ? `  \u00b7 ${description}` : ""}`;
 
 	let detail = "";
-	if (data.status === "running") {
+	if (status === "running") {
 		const parts: string[] = [];
-		if (data.currentTool) parts.push(`tool: ${data.currentTool}`);
-		if (data.tokens && data.tokens > 0) parts.push(`${formatTokens(data.tokens)} tok`);
+		if (currentTool) parts.push(`tool: ${currentTool}`);
+		if (tokens > 0) parts.push(`${formatTokens(tokens)} tok`);
 		detail = parts.length > 0 ? `  \u00b7 ${parts.join(" \u00b7 ")}` : "";
-	} else if (data.finishedAtMs) {
-		const duration = data.finishedAtMs - data.startedAtMs;
-		if (duration > 100) detail = `  \u00b7 ${formatDuration(duration)}`;
+	} else if (finishedAtMs > 0) {
+		const duration = finishedAtMs - startedAtMs;
+		if (duration > 100) detail = `  \u00b7 ${formatDuration(Math.min(duration, 86_400_000))}`;
 	}
 
 	const line = `${head}${detail}`;
@@ -464,8 +549,10 @@ function renderCardComponent(data: SubagentCardData): ComponentLike {
 /** Build the inline-card renderer that decodes `CustomMessage.details`. */
 export function buildCardRenderer(): (message: unknown) => ComponentLike {
 	return (message: unknown) => {
-		const messageLike = message as { details?: SubagentCardData };
-		const data = messageLike.details ?? (message as unknown as SubagentCardData);
+		const messageLike = message && typeof message === "object" ? message as { details?: unknown } : {};
+		const data = messageLike.details && typeof messageLike.details === "object"
+			? messageLike.details as SubagentCardData
+			: message as SubagentCardData;
 		return renderCardComponent(data);
 	};
 }

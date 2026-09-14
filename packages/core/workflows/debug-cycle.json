@@ -4,7 +4,7 @@
   "description": "BUG_FIX requiring verification, or any BUG_FIX in autonomous mode. Iterative loop: diagnose → fix → manual-qa verify; on FAIL loop back to diagnose with new evidence (max 3).",
   "completion_intent": {
     "mode": "complete_outcome",
-    "acceptance": "dod_and_artifacts",
+    "acceptance": "quality_gates_and_artifacts",
     "source": "workflow_policy",
     "rationale": "Debug cycles complete a verified fix with diagnosis, evidence, and DoD artifacts."
   },
@@ -68,7 +68,7 @@
       "type": "single",
       "role": "qa",
       "consumes": ["debug", "implementation", "diagnosis"],
-      "gate": "verdict == PASS",
+      "gate": "qa_reported_pass",
       "produces": "qa_tests"
     },
     {

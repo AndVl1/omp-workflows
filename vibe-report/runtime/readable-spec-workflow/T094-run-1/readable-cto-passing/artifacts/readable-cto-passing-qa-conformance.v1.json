@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "artifact_id": "readable-cto-passing-qa-conformance.v1",
+  "entries": [
+    {
+      "evidence_id": "readable-cto-passing-qa-executed-test-fr-1",
+      "kind": "executed_test",
+      "subject_id": "FR-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "7644909b7d17135edef84221f57709f0cff3d853e11fa51500c0ee2aa02c9ab7",
+      "execution_claim_id": "claim-b6630cc0c3b4564702f310e9bc8993e8",
+      "test": {
+        "evidence_ref": {
+          "artifact_id": "readable-cto-passing-qa-runtime-support.v1",
+          "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-qa-runtime-support.v1.json",
+          "sha256": "5711f18921538942fe87f01c939124afda6efad89bb4c460ec0c808f327006ef",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        },
+        "test_kind": "runtime",
+        "status": "pass",
+        "executed_at": "2026-09-05T00:00:00.000Z"
+      },
+      "intent_message": "Independent QA verification for FR-1 reusing the recorded runtime result: node src/passing/index.js with no arguments exited 0 and emitted exactly the required completed JSON line followed by one newline, with no extra stdout.",
+      "recorded_at": "2026-09-05T00:00:00.000Z"
+    },
+    {
+      "evidence_id": "readable-cto-passing-qa-executed-test-ac-1",
+      "kind": "executed_test",
+      "subject_id": "AC-1",
+      "requirement_id": "FR-1",
+      "handoff_digest": "7644909b7d17135edef84221f57709f0cff3d853e11fa51500c0ee2aa02c9ab7",
+      "execution_claim_id": "claim-b6630cc0c3b4564702f310e9bc8993e8",
+      "test": {
+        "evidence_ref": {
+          "artifact_id": "readable-cto-passing-qa-runtime-support.v1",
+          "path": ".work-state/features/readable-cto-passing/artifacts/readable-cto-passing-qa-runtime-support.v1.json",
+          "sha256": "5711f18921538942fe87f01c939124afda6efad89bb4c460ec0c808f327006ef",
+          "schema_status": "met",
+          "quality_gate_status": "met"
+        },
+        "test_kind": "runtime",
+        "status": "pass",
+        "executed_at": "2026-09-05T00:00:00.000Z"
+      },
+      "intent_message": "Independent QA verification for AC-1 reusing the recorded runtime result: node src/passing/index.js with no arguments exited 0 and emitted exactly {\"status\":\"completed\",\"outcome\":\"requested outcome completed\"} followed by one newline, with no extra stdout.",
+      "recorded_at": "2026-09-05T00:00:00.000Z"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+
+Interrupted while running:
+
+⚠ test/specification-command.test.ts (test/specification-command.test.ts:1:1)
+✖ test/specification-command.test.ts (6275.381875ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 0
+ℹ cancelled 1
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 6278.303625
+
+✖ failing tests:
+
+test at test/specification-command.test.ts:1:1
+✖ test/specification-command.test.ts (6275.381875ms)
+  'Promise resolution is still pending but the event loop has already resolved'

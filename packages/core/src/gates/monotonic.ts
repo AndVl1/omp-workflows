@@ -9,10 +9,8 @@
  * Wired to `before_agent_start`.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { resolve, join } from "node:path";
-import { isSafeStateSegment } from "../engine/state.js";
-const WORK_STATE_DIR = ".work-state";
+import { PinnedProjectRoot } from "../specification/pinned-root.js";
+import { resolveActiveStatePinned } from "../engine/state.js";
 
 interface AgentStartContext {
   cwd: string;
@@ -23,16 +21,22 @@ interface StageEntry {
   status?: "pending" | "in_progress" | "done" | "skipped" | "failed";
 }
 
-export function monotonicGate(_event: unknown, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
-  const statePath = resolveStatePath(ctx.cwd);
-  if (!statePath) return;
-  let state: { stages?: StageEntry[] };
-  try {
-    state = JSON.parse(readFileSync(statePath, "utf8")) as typeof state;
-  } catch {
-    return;
+export function monotonicGate(
+  _event: unknown,
+  ctx: AgentStartContext,
+  borrowedState?: { stages?: StageEntry[] },
+): { block?: boolean; reason?: string } | void {
+  let state: { stages?: StageEntry[] } | null = borrowedState ?? null;
+  if (!state) {
+    const pinnedRoot = PinnedProjectRoot.open(ctx.cwd);
+    if (!pinnedRoot) return;
+    try {
+      state = resolveActiveStatePinned(ctx.cwd, pinnedRoot).state;
+    } finally {
+      pinnedRoot.close();
+    }
   }
-  if (!Array.isArray(state.stages) || state.stages.length === 0) return;
+  if (!state || !Array.isArray(state.stages) || state.stages.length === 0) return;
   const statuses = state.stages.map((s) => s.status ?? "pending");
   const firstPending = statuses.indexOf("pending");
   if (firstPending === -1) return;
@@ -44,20 +48,4 @@ export function monotonicGate(_event: unknown, ctx: AgentStartContext): { block?
       reason: `BLOCK (P4): stage progress is not monotonic — stage ${stageId} is pending while a later stage is done/in_progress. Mark skipped stages 'skipped', not 'pending'.`,
     };
   }
-}
-
-function resolveStatePath(cwd: string): string | null {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  if (!existsSync(wsDir)) return null;
-  const active = join(wsDir, ".active-feature");
-  if (existsSync(active)) {
-    const slug = readFileSync(active, "utf8").trim();
-    if (isSafeStateSegment(slug)) {
-      const path = join(wsDir, "features", slug, "state.json");
-      if (existsSync(path)) return path;
-    }
-  }
-  const legacy = join(wsDir, "team-state.json");
-  if (existsSync(legacy)) return legacy;
-  return null;
 }

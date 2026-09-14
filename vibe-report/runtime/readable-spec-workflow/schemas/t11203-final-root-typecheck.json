@@ -1,0 +1,29 @@
+{
+  "label": "t11203-final-root-typecheck",
+  "command": "npm run typecheck",
+  "argv": [
+    "npm",
+    "run",
+    "typecheck"
+  ],
+  "started_at_utc": "2026-09-11T18:07:47.571Z",
+  "ended_at_utc": "2026-09-11T18:07:53.690Z",
+  "duration_ms": 6118,
+  "exit_code": 0,
+  "signal": null,
+  "spawn_error": null,
+  "source_snapshot_digest": "ca1300adb9f9e04bb79716d9355cda8c2a2b1bd5eadc919171aec4efbe8b2006",
+  "source_snapshot_path": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-final-source-snapshot-start.json",
+  "log": "vibe-report/runtime/readable-spec-workflow/schemas/t11203-final-root-typecheck.log",
+  "sha256": "9dbba6b20da9f855e25bc99b19cf8fa3126949959cdf20e7d5e7acd16d47ebbc",
+  "counts": {
+    "log_bytes": 367,
+    "log_lines": 20,
+    "tests": null,
+    "passed": null,
+    "failed": null,
+    "cancelled": null,
+    "skipped": null,
+    "todo": null
+  }
+}

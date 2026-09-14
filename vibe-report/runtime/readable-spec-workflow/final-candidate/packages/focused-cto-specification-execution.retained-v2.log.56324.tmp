@@ -1,0 +1,38 @@
+✔ mounted cto_prepare closes the registrar guard and handler-owned root pins (907.502625ms)
+✔ mounted cto_prepare rejects root and ancestor replacements after pin opens (199.387834ms)
+✔ mounted cto_prepare rejects a TeamDef leaf replacement between load and preparation (209.291541ms)
+✔ mounted cto_prepare keeps one borrowed pin through a root swap during pinned path read (201.922917ms)
+✔ mounted CTO conformance accepts only immutable selectors (3.773459ms)
+✔ root export surface hides internal preparation sink while mounted selector tool remains available (2.324833ms)
+✔ mounted CTO tools expose strict schemas without state override fields (3.814875ms)
+✔ execution prompt cto_prepare template round-trips through the public parser (208.456333ms)
+✔ execution prepare rejects caller-authored classification before state write (2.440416ms)
+✔ mounted CTO wave and mapping schemas share uppercase SAFE_ID semantics (2.834834ms)
+✔ mounted CTO schemas enforce exact hashes, bounded proofs, and authoritative completion counts (3.215083ms)
+✔ mounted CTO checkpoint Ask records a trusted proof and returns an exact confirmation descriptor (2576.74875ms)
+✔ mounted CTO mapping Ask binds request_changes and approve_stop without confirmation or dispatch (7496.4575ms)
+✔ mounted CTO dispatch blocks a fresh-v3 migration when its state CAS preimage changes (1698.793458ms)
+✔ mounted CTO dispatch lazily initializes fresh-v3 claim paths for the confirmation anchor (2191.504792ms)
+✔ mounted CTO dispatch keeps a non-anchor migration bound to the anchor and replays exactly (3708.667125ms)
+✔ mounted CTO dispatch admits the confirmation anchor with an exact post-prepare snapshot (2204.324ms)
+✔ mounted CTO mapping confirms and dispatches when authoritative teams are reordered (2539.527542ms)
+✔ mounted CTO dispatch compensates a claim after a post-prepare foreign state mutation (2347.397334ms)
+
+Interrupted while running:
+
+⚠ test/cto-specification-execution.test.ts (test/cto-specification-execution.test.ts:1:1)
+✖ test/cto-specification-execution.test.ts (78917.31225ms)
+ℹ tests 20
+ℹ suites 0
+ℹ pass 19
+ℹ fail 0
+ℹ cancelled 1
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 78919.946166
+
+✖ failing tests:
+
+test at test/cto-specification-execution.test.ts:1:1
+✖ test/cto-specification-execution.test.ts (78917.31225ms)
+  'Promise resolution is still pending but the event loop has already resolved'

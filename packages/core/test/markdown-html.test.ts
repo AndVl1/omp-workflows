@@ -73,6 +73,12 @@ test("markdown renderer escapes raw HTML and rejects unsafe links/images", () =>
     "[vbscript](vbscript:msgbox(1))",
     "[file](file:///etc/passwd)",
     "[broken](://not-a-url)",
+    "[network-path](//attacker.example/path)",
+    "[backslash-network](\\\\attacker.example/path)",
+    "[slash-backslash-network](/\\attacker.example/path)",
+    "[backslash-slash-network](\\/attacker.example/path)",
+    "[http](http://example.test/path)",
+    "[root-relative](/docs/readme.md)",
     "[https](https://example.test/path)",
     "[mailto](mailto:team@example.test)",
     "[fragment](#security)",
@@ -89,12 +95,44 @@ test("markdown renderer escapes raw HTML and rejects unsafe links/images", () =>
   assert.ok(!html.includes('href="vbscript:'));
   assert.ok(!html.includes('href="file:'));
   assert.ok(!html.includes('href="://'));
+  assert.ok(!html.includes('attacker.example'), "network-path and slash/backslash links are inert text");
+  assert.ok(html.includes('href="http://example.test/path"'));
+  assert.ok(html.includes('href="/docs/readme.md"'));
   assert.ok(html.includes('href="https://example.test/path"'));
   assert.ok(html.includes('href="mailto:team@example.test"'));
   assert.ok(html.includes('href="#security"'));
   assert.ok(html.includes('href="docs/readme.md"'));
   assert.ok(html.includes("[Image: secret]"));
   assert.ok(!html.includes("<img"));
+});
+
+test("markdown renderer bounds and neutralizes control/format characters in canonical fields", () => {
+  const html = renderMarkdownDocumentHtml(
+    [
+      "# <img src=x onerror=alert(1)> \u202e",
+      "",
+      "## status | details \u200b",
+      "",
+      "| name | status |",
+      "| --- | --- |",
+      "| <img src=x onerror=alert(2)> | `a|b` |",
+      "",
+      "```html",
+      "<img src=x onerror=alert(3)>",
+      "```",
+      "",
+      '[quoted](https://safe.test/path" onmouseover="alert(4))',
+    ].join("\r\n"),
+    { title: 'Report\u0000\u202e', lang: "en\u202e" },
+  );
+
+  assert.ok(html.includes("&lt;img src=x onerror=alert(1)&gt;"));
+  assert.ok(!html.includes("<img"));
+  assert.ok(!html.includes(' onmouseover="'));
+  assert.ok(!html.includes("\u0000"));
+  assert.ok(!html.includes("\u202e"));
+  assert.ok(!html.includes("\u200b"));
+  assert.ok(html.includes('href="https://safe.test/path'));
 });
 
 test("markdown renderer supports explicit empty and disabled-navigation states", () => {

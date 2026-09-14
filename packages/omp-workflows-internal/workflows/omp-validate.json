@@ -4,7 +4,7 @@
   "description": "REVIEW tasks in this monorepo. Parallel findings-only review; no implementation stage.",
   "completion_intent": {
     "mode": "handoff_only",
-    "acceptance": "dod_and_artifacts",
+    "acceptance": "quality_gates_and_artifacts",
     "source": "workflow_policy",
     "rationale": "Validation workflows hand off findings and evidence; they do not implement changes."
   },

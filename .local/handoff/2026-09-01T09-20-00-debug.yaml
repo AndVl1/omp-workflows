@@ -1,0 +1,25 @@
+id: 2026-09-01T09-20-00-debug
+parent: null
+agent: debug
+timestamp: "2026-09-01T09:20:00Z"
+status: completed
+context:
+  task: "Restore real node-pty PTY execution on Darwin arm64 for E2E harness"
+  phase: validation-release
+output:
+  root_cause: "node-pty 1.1.0 Darwin arm64 spawn-helper was mode 0644; node-pty reports posix_spawnp failed from unixTerminal.js:92. pty.node and helper are valid arm64 Mach-O."
+  changes:
+    - "packages/e2e/package.json: postinstall chmod repair for node-pty build/Release, build/Debug, and prebuilds/<platform-arch>; only executable bits are added."
+    - "packages/e2e/src/server.ts: Darwin-only runtime bootstrap with regular-file lstat, package realpath containment, spawn-helper basename validation, mode-preserving executable-bit repair against resolved realpath, and clear failures."
+  verification:
+    - "Focused npm run postinstall -w @andvl1/omp-workflows-e2e exited 0; helper mode verified 755."
+    - "Direct supervised /opt/homebrew/bin/node node-pty spawn('/bin/sh',['-c','printf pty-ok']) emitted out pty-ok and exitCode 0 signal 0."
+    - "Final server.ts SHA-256 3291fbf0113adfbca3b5fb084840ffec1c8516d04a89011b996adfcabd4635db; 47732 bytes."
+    - "Before repair direct probe reproduced exact posix_spawnp failed at unixTerminal.js:92; helper child spawn returned EACCES."
+next:
+  agent: null
+  task: "Parent runs focused package build and remaining workflow validation."
+  priority: high
+  acceptance_criteria:
+    - "Build succeeds with runtime bootstrap imports."
+    - "Direct node-pty PTY probe remains pty-ok / exit 0."

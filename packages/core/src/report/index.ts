@@ -3,16 +3,20 @@
  *
  * build → render → write, all dependency-free:
  * - `buildSessionReport` reads + normalizes TeamState/CtoState into
- *   `SessionReport` (state-first; bounded optional telemetry).
+ *   `SessionReport` (state-first; bounded optional telemetry).  Callers that
+ *   already own a project pin use `buildSessionReportPinned`.
  * - `renderReportHtml` is the pure, self-contained HTML renderer
  *   (implemented in html.ts, exported through this barrel).
  * - `writeReport` persists the HTML under `.work-state` with mode 0600 and
- *   rejects any target outside `.work-state`.
+ *   rejects any target outside `.work-state`; pinned callers use
+ *   `writeReportPinned` to keep the same descriptor through publication.
  */
 
 export {
   buildSessionReport,
+  buildSessionReportPinned,
   writeReport,
+  writeReportPinned,
 } from "./assemble.js";
 export { renderReportHtml } from "./html.js";
 export { renderMarkdownDocumentHtml } from "./markdown.js";

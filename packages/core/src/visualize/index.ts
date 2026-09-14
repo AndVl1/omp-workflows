@@ -88,6 +88,7 @@ export { allGeneratedPages, buildManifest, preflightLinks, resolvePageHref, type
 export {
   VisualizePublishError,
   publishVisualize,
+  publishVisualizePinned,
   type PublishVisualizeOptions,
   type VisualizeBundleFile,
   type VisualizePublishCounters,

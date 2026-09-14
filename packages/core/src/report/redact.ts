@@ -14,6 +14,22 @@ import type { RedactionConfig } from "../cto/types.js";
 export { redactText, DEFAULT_REDACTION_CONFIG } from "../cto/redaction.js";
 export type { RedactionConfig } from "../cto/types.js";
 
+/** Truncate UTF-8 text without splitting a code point or exceeding maxBytes. */
+export function truncateUtf8(text: string, maxBytes: number): string {
+  const cap = Number.isSafeInteger(maxBytes) ? Math.max(0, maxBytes) : 0;
+  if (cap === 0) return "";
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.byteLength <= cap) return text;
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  for (let end = cap; end > Math.max(0, cap - 4); end -= 1) {
+    try {
+      return decoder.decode(bytes.subarray(0, end));
+    } catch {
+      // A UTF-8 sequence can be at most four bytes; trim its partial tail.
+    }
+  }
+  return "";
+}
 /**
  * Whole-line drop for QUOTED JSON keys — the default CTO patterns
  * (`token\s*[:=]`) match prose (`token = x`) but not JSON
@@ -34,9 +50,12 @@ export function redactReportBody(
   maxBytes: number,
   config: RedactionConfig = DEFAULT_REDACTION_CONFIG,
 ): string {
-  return redactText(text, {
-    ...config,
-    secret_line_patterns: [...config.secret_line_patterns, JSON_SECRET_KEY_LINE],
-    max_body: Math.max(0, maxBytes),
-  }).slice(0, Math.max(0, maxBytes));
+  return truncateUtf8(
+    redactText(text, {
+      ...config,
+      secret_line_patterns: [...config.secret_line_patterns, JSON_SECRET_KEY_LINE],
+      max_body: Math.max(0, maxBytes),
+    }),
+    maxBytes,
+  );
 }

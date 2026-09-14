@@ -25,6 +25,8 @@ Transform vague user requests into clear, actionable requirements for the Archit
 - For mobile work, read `skill://kmp` before analysis.
 - Your output goes directly to the **Architect** who will design the solution
 
+
+
 ## What You Do
 
 ### 1. Clarify Requirements

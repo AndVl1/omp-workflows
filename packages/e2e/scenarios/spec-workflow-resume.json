@@ -1,0 +1,273 @@
+{
+  "id": "spec-workflow-resume",
+  "title": "Native readable specification: durable revision, interruption, and exact resume",
+  "description": "Exercises the existing native specification workflow across a rejected revision, an invalid validation result, approve-stop, a real process interruption, exact resume, downstream approval, and targeted upstream staleness. Evidence must come from the one canonical workspace, aggregate, ledger, registry, renderer, and durable state path.",
+  "params": {
+    "feature_id": "readable-resume",
+    "run_key": "readable-resume-run-001",
+    "request": "Add a revision-safe retry boundary with deterministic idempotency and durable resume",
+    "invalid_feedback": "Remove the testable retry acceptance criteria and contradict the idempotency boundary so validation must block without opening a checkpoint.",
+    "repair_feedback": "Restore one unambiguous retry boundary, testable acceptance criteria, and explicit idempotency traceability.",
+    "stale_feedback": "Change the approved retry boundary semantically so dependent Plan, Tasks, approvals, and handoff become stale."
+  },
+  "selectors": {
+    "feature_id": "readable-resume",
+    "run_key": "readable-resume-run-001"
+  },
+  "workspace": {
+    "path": "specs/{{feature_id}}",
+    "state_path": ".work-state/features/{{feature_id}}/state.json",
+    "documents": [
+      "specs/{{feature_id}}/status.md",
+      "specs/{{feature_id}}/spec.md",
+      "specs/{{feature_id}}/plan.md",
+      "specs/{{feature_id}}/tasks.md"
+    ],
+    "validation": [
+      "specs/{{feature_id}}/validation/specify.md",
+      "specs/{{feature_id}}/validation/plan.md",
+      "specs/{{feature_id}}/validation/tasks.md",
+      "specs/{{feature_id}}/validation/constitution-impact.md"
+    ],
+    "history": [
+      "specs/{{feature_id}}/history/specify",
+      "specs/{{feature_id}}/history/plan",
+      "specs/{{feature_id}}/history/tasks"
+    ],
+    "handoff": [
+      "specs/{{feature_id}}/handoff.md"
+    ],
+    "checkpoints": [
+      ".work-state/features/{{feature_id}}/state.json",
+      ".work-state/ux-e2e/transcript.jsonl",
+      ".work-state/ux-e2e/ask-state.jsonl"
+    ],
+    "evidence": [
+      ".work-state/features/{{feature_id}}/artifacts"
+    ]
+  },
+  "transcript": {
+    "checkpoints": [
+      "request_changes",
+      "approve_stop",
+      "approve_continue",
+      "trusted human proof",
+      "no checkpoint for invalid content"
+    ],
+    "workers": [
+      "Specify worker dispatch",
+      "Plan worker dispatch",
+      "Tasks worker dispatch",
+      "no main-authored approval",
+      "no detached reviewer approval"
+    ],
+    "validation": [
+      "validation/specify.md",
+      "blocking locations",
+      "violated criteria",
+      "remediation command",
+      "checkpoint suppressed"
+    ],
+    "history": [
+      "history/specify/v1.md",
+      "append-only",
+      "replaced revision",
+      "stale downstream"
+    ],
+    "handoff": [
+      "handoff.md",
+      "stale"
+    ],
+    "interruption": [
+      "approve_stop committed",
+      "process interrupted after approval",
+      "Plan not_started"
+    ],
+    "resume": [
+      "feature_id={{feature_id}}",
+      "run_key={{run_key}}",
+      "/spec-plan --feature {{feature_id}}",
+      "approved Specify unchanged",
+      "no repeated Specify dispatch",
+      "no duplicate phase version"
+    ],
+    "next_actions": [
+      "/specify --feature {{feature_id}}",
+      "/spec-plan --feature {{feature_id}}",
+      "/spec-tasks --feature {{feature_id}}",
+      "first valid next action"
+    ]
+  },
+  "task": "Exercise the native readable specification workflow as a restart-safe durable journey. Use only the canonical workspace `specs/{{feature_id}}`, durable state `.work-state/features/{{feature_id}}/state.json`, and the existing aggregate, checkpoint ledger, registry, renderer, validation path, and phase commands. Select the exact explicit `feature_id={{feature_id}}` and `run_key={{run_key}}` for every status, begin, dispatch, checkpoint, completion, resume, and evidence lookup; reject any branch-, cwd-, `.active-feature`-, inferred-, or alternate-run selection.\n\nStart with `/specify --feature {{feature_id}} {{request}}`. At its first passing hard-human Specify checkpoint choose `request_changes` and submit this feedback verbatim: `{{invalid_feedback}}`. The resulting worker-authored revision must fail validation, write the blocking locations, violated criteria, and exact remediation command to `validation/specify.md` and `status.md`, and expose no `[ask_user]` checkpoint or approval capability. Use the reported canonical remediation action with `{{repair_feedback}}`; do not patch durable state or let the main session author phase content. When the repaired worker-authored Specify revision passes validation and returns to the same three-decision checkpoint, choose `approve_stop`. Confirm the human proof is durably bound to the exact current version, Plan remains `not_started`, and the first approved Specify projection is archived under `history/specify/` without overwriting any earlier history entry.\n\nTreat that committed approve-stop boundary as the interruption point: stop the current OMP process only after state and readable projections are durable. On a fresh process, re-read the exact feature/run pair and resume with `/spec-plan --feature {{feature_id}}`. Never replay Specify, its capability, approval, dispatch, or version. At the passing Plan checkpoint choose `approve_continue`; at the resulting Tasks checkpoint choose `approve_stop`. Confirm resume created exactly one Plan dispatch/version and one Tasks dispatch/version, retained only the intentional Specify revision dispatches/versions, and did not duplicate any approval or archive entry.\n\nAfter Tasks approval, exercise one canonical worker-authored semantic Specify revision using this feedback verbatim: `{{stale_feedback}}`. Do not create another aggregate or ledger. Confirm append-only history preserves every replaced readable version; the current changed Specify version is not implicitly approved; only semantically dependent Plan, Tasks, their approvals, and `handoff.md` become stale; unrelated evidence remains current; and `status.md` exposes the deterministic first valid remediation/next action for the earliest stale phase using the same explicit feature_id and run_key. Replay the resume/status operation once and prove it returns the established records without another Specify, Plan, or Tasks dispatch, version, approval, or history file.\n\nAt every checkpoint prove the decision ledger contains trusted human answer proof and an exact version/epoch binding. While each checkpoint is idle, verify durable state remains unchanged: no detached reviewer, worker, executor, generic quality gate, or main-session author may approve, waive, advance, or manufacture approval. End with compact paths and counts for phase versions, dispatches, approvals, archived revisions, stale projections, and the exact next action.",
+  "stages": [
+    {
+      "id": "explicit-selection",
+      "name": "Resolve the one exact feature and run",
+      "expect": [
+        "feature_id={{feature_id}}",
+        "run_key={{run_key}}",
+        "specs/{{feature_id}}",
+        ".work-state/features/{{feature_id}}/state.json",
+        "explicit"
+      ]
+    },
+    {
+      "id": "specify-request-changes",
+      "name": "Request a worker-authored Specify revision",
+      "expect": [
+        "Specify",
+        "validation/specify.md",
+        "request_changes",
+        "approve_continue",
+        "approve_stop",
+        "[ask_user]"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Ss]pecify",
+          "answer": "2",
+          "count": 1
+        },
+        {
+          "titlePattern": "[Ff]eedback|[Rr]evision|[Cc]hange",
+          "answer": "{{invalid_feedback}}",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "invalid-checkpoint-suppression",
+      "name": "Invalid revised content blocks without a checkpoint",
+      "expect": [
+        "validation failed",
+        "blocking locations",
+        "violated criteria",
+        "checkpoint suppressed",
+        "/specify --feature {{feature_id}}",
+        "no approval"
+      ]
+    },
+    {
+      "id": "repair-and-approve-stop",
+      "name": "Repair Specify, archive revisions, and approve-stop",
+      "expect": [
+        "{{repair_feedback}}",
+        "Specify",
+        "history/specify",
+        "append-only",
+        "approve_stop",
+        "Plan not_started",
+        "[ask_user]"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Ss]pecify",
+          "answer": "3",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "durable-interruption",
+      "name": "Interrupt only after approve-stop is durable",
+      "expect": [
+        "approve_stop committed",
+        "process interrupted after approval",
+        "approved_version",
+        "Plan not_started",
+        "trusted human proof"
+      ]
+    },
+    {
+      "id": "exact-plan-resume",
+      "name": "Fresh process resumes Plan without replaying Specify",
+      "expect": [
+        "/spec-plan --feature {{feature_id}}",
+        "run_key={{run_key}}",
+        "approved Specify unchanged",
+        "no repeated Specify dispatch",
+        "Plan",
+        "[ask_user]"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Pp]lan",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "tasks-approve-stop",
+      "name": "Advance once to Tasks and stop after approval",
+      "expect": [
+        "/spec-tasks --feature {{feature_id}}",
+        "Tasks",
+        "handoff.md",
+        "approve_stop",
+        "one Plan dispatch",
+        "one Tasks dispatch",
+        "[ask_user]"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Tt]asks",
+          "answer": "3",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "stale-propagation",
+      "name": "Semantic upstream revision stales only dependent projections",
+      "expect": [
+        "{{stale_feedback}}",
+        "history/specify",
+        "append-only",
+        "Plan stale",
+        "Tasks stale",
+        "handoff.md stale",
+        "not implicitly approved"
+      ]
+    },
+    {
+      "id": "idempotent-final-evidence",
+      "name": "Replay is idempotent and next action is deterministic",
+      "expect": [
+        "no duplicate Specify dispatch",
+        "no duplicate Plan dispatch",
+        "no duplicate Tasks dispatch",
+        "no duplicate phase version",
+        "no detached reviewer approval",
+        "no main-authored approval",
+        "first valid next action",
+        "status.md"
+      ]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 600000,
+    "checkpointPollMs": 500
+  },
+  "screenshots": {
+    "on": [
+      "stage_start",
+      "stage_end",
+      "ask_user",
+      "error"
+    ]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

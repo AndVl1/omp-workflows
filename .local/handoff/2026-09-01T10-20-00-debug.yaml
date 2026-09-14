@@ -1,0 +1,35 @@
+id: 2026-09-01T10-20-00-debug
+parent: null
+agent: debug
+timestamp: "2026-09-01T10:20:00Z"
+status: completed
+context:
+  task: "Fix ensureExecutionContext fixture to use real shipped profile/stage/checkpoint while retaining security regressions"
+  phase: "validation-release"
+output:
+  summary: "Canonicalized CTO execution confirmation fixture against the shipped constitution profile and restored all hardened execution regressions."
+  error_type: runtime
+  root_cause:
+    file: packages/core/test/cto-specification-execution.test.ts
+    line: 42
+    issue: "ensureExecutionContext persisted workflow standard with synthetic profile hash and nonexistent cto_mapping_confirmation stage; secure writeState rejected the fixture."
+    explanation: "The confirmation seam requires an exact durable stage/capability/policy context. The command's approve_continue contract is exercised by the shipped constitution profile's constitution_validate / constitution_approval checkpoint."
+  reproduction:
+    steps:
+      - "Create a temporary feature workspace and invoke preflight."
+      - "Observe ensureExecutionContext fail while secure writeState validates the synthetic stage/profile."
+    minimal_case: "createCapability({ workflow: 'standard', profile_hash: digestOf({ profile: 'cto-specification-execution-test' }), stage_cursor: 'cto_mapping_confirmation' })"
+  solution:
+    before: "Synthetic profile digest, standard workflow, nonexistent cto_mapping_confirmation stage, and custom product_approval policy."
+    after: "loadProfile('constitution') + profileHash(profile), constitution_validate stage, constitution_approval checkpoint, exact approve_continue decision, kind:none capability, and canonical policy rule alias for the dynamic mapping checkpoint."
+  regression_test: "Existing cto-specification-execution.test.ts hardened preflight, trusted proof, symlink, claim, wave, identity, and handoff authorization tests remain present; validation is deferred to Main per orchestration constraints."
+  related_issues:
+    - "Do not replace this fixture with a fake stage/profile or weaken trusted proof validation."
+next:
+  agent: null
+  task: "Parent runs the planned project-wide validation once all slices land."
+  priority: high
+  acceptance_criteria:
+    - "Fixture profile hash equals profileHash(loadProfile('constitution'))."
+    - "Fixture uses constitution_validate/constitution_approval and approve_continue from the shipped policy."
+    - "Mapping run/wave/capability binding and all security regressions remain intact."

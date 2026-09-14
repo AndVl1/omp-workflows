@@ -1,0 +1,63 @@
+id: 2026-08-31T09-15-03-security
+parent: null
+agent: security
+timestamp: "2026-08-31T09:15:03.532Z"
+status: completed
+
+context:
+  task: "Repair external-input and path fail-open findings for foundation contracts"
+  phase: "wave-001-remediation"
+
+output:
+  summary: "Constitution reads/seeds and materialization reads/writes now fail closed at canonical path boundaries; semantic drift requires exact evidence; E2E default fixture root is corrected."
+  vulnerabilities:
+    critical: 0
+    high: 5
+    medium: 1
+    low: 0
+  cargo_deny:
+    status: not_run
+    advisories: null
+    license_issues: null
+    note: "Dependency audit was outside this slice and validation commands were prohibited."
+  dependencies:
+    outdated: null
+    unmaintained: null
+    actions: []
+  unsafe_blocks:
+    total: 0
+    reviewed: 0
+    approved: 0
+    needs_refactor: 0
+  issues:
+    - severity: high
+      location: packages/core/src/specification/prerequisite.ts
+      issue: "Missing-parent and existing symlink constitution paths could fail open or fail before safe bootstrap."
+      fix: "Deepest-existing-ancestor containment, post-mkdir containment, canonical-parent writes, and final-target bounded reads."
+    - severity: high
+      location: packages/core/src/specification/prerequisite.ts
+      issue: "Binding drift blocked indiscriminately without consuming semantic impact evidence."
+      fix: "Only exact, evidence-backed no-impact assessments update the binding; affected or invalid evidence remains blocked."
+    - severity: high
+      location: packages/core/src/specification/materialize.ts
+      issue: "Manifest and archive paths were not bound against symlink escapes."
+      fix: "All write targets are checked before and after directory creation and written through canonical parents."
+    - severity: high
+      location: packages/core/src/specification/materialize.ts
+      issue: "Persisted traversal and malformed document rows were silently skipped or read without path validation."
+      fix: "Strict manifest identity/row validation plus per-entry realpath containment; malformed rows reject the whole request."
+    - severity: medium
+      location: packages/e2e/src/specification-fixtures.ts
+      issue: "Default fixture root resolved outside packages/e2e."
+      fix: "Removed the extra parent traversal while preserving explicit override resolution."
+  evidence: ".work-state/artifacts/sdd-foundation/path-security-remediation.json"
+  validation_run: false
+  validation_reason: "Assignment explicitly reserves formatter, linter, build, typecheck, and test execution for CTO after both workers settle."
+
+next:
+  agent: null
+  task: "CTO validates both disjoint worker landings once."
+  priority: high
+  acceptance_criteria:
+    - "Run the designated focused suites and typechecks after both workers settle."
+    - "Confirm no source files outside the two ownership sets changed."

@@ -121,13 +121,28 @@ import {
   registerWorkflowCommands,
   type WorkflowOwnerIdentity,
 } from "@andvl1/omp-workflows-core";
+import {
+  beginRegistryRegistration,
+  closeWorkflowActivation,
+  commitRegistryRegistration,
+  openWorkflowActivation,
+  rollbackRegistryRegistration,
+} from "@andvl1/omp-workflows-core/registry";
 
 const BUNDLE_ID = "@acme/omp-workflows-rust";
+import { RUST_ACTIVATION_MARKER_PATH, RUST_ACTIVATION_MARKER_SHA256 } from "./activation-marker.js";
 
-// Реализация должна брать cwd из session context/sessionManager и никогда не
-// подменять отсутствующее значение на process.cwd().
+// This resolver reads the canonical session manager first and never falls back
+// to process.cwd(); a real bundle should use its host-specific session API.
 const resolveSessionCwd = (ctx: unknown): string | undefined => {
   if (!ctx || typeof ctx !== "object") return undefined;
+  const manager = (ctx as { sessionManager?: unknown }).sessionManager;
+  if (manager && typeof manager === "object" && "getCwd" in manager && typeof manager.getCwd === "function") {
+    try {
+      const value = (manager.getCwd as () => unknown)();
+      return typeof value === "string" && value.length > 0 ? value : undefined;
+    } catch { return undefined; }
+  }
   const value = (ctx as { cwd?: unknown }).cwd;
   return typeof value === "string" && value.length > 0 ? value : undefined;
 };
@@ -138,6 +153,10 @@ const ownerForCwd = (cwd: string): WorkflowOwnerIdentity => ({
   owner_kind: "rust",
   activation_marker: "omp-rust",
   host_range: ">=18 <19",
+  activation: {
+    marker_id: "omp-rust",
+    required: [{ path: RUST_ACTIVATION_MARKER_PATH, kind: "file", sha256: RUST_ACTIVATION_MARKER_SHA256 }],
+  },
   provenance: {
     package: BUNDLE_ID,
     entrypoint: "dist/index.js",
@@ -146,32 +165,66 @@ const ownerForCwd = (cwd: string): WorkflowOwnerIdentity => ({
   },
 });
 
+const registration = {
+  label: BUNDLE_ID,
+  roles: { /* workflow-роль -> имя агента */ },
+  scopeMap: [ /* glob -> scope + dev_agent */ ],
+  flags: { /* флаг -> glob-список */ },
+  designSystem: null,
+  resolveCwd: resolveSessionCwd,
+  owner: ownerForCwd,
+};
+
+function mountProject(pi: ExtensionAPI, projectRoot: string): void {
+  const owner = ownerForCwd(projectRoot);
+  const activation = openWorkflowActivation(
+    projectRoot,
+    ["workflow_registration", "workflow_tools", "config_writer"],
+    owner,
+  );
+  if (!activation.ok) throw new Error("activation marker/root validation failed");
+  const transaction = beginRegistryRegistration(
+    activation.registry_context,
+    projectRoot,
+    ["workflow_profiles", "constitution_gate", "runtime_config", "workflow_tools"],
+  );
+  if (!transaction.ok) {
+    closeWorkflowActivation(activation);
+    throw new Error("workflow registration transaction failed");
+  }
+  try {
+    registerTeamWorkflow(pi, { ...registration, cwd: projectRoot, registrationToken: transaction.token });
+    createWorkflowToolAdapter({
+      resolveCwd: resolveSessionCwd,
+      owner: ownerForCwd,
+      registrationToken: transaction.token,
+    }).register(pi);
+    commitRegistryRegistration(transaction.token);
+    // Retain activation in plugin/session state; close on matching shutdown.
+  } catch (error) {
+    try { rollbackRegistryRegistration(transaction.token); } catch { /* preserve original */ }
+    closeWorkflowActivation(activation);
+    throw error;
+  }
+}
+
 export default function (pi: ExtensionAPI) {
-  const registration = {
-    label: BUNDLE_ID,
-    roles: { /* workflow-роль → имя агента */ },
-    scopeMap: [ /* glob → scope + dev_agent */ ],
-    flags: { /* флаг → glob-список */ },
-    designSystem: null,
-    resolveCwd: resolveSessionCwd,
-    owner: ownerForCwd,
-  };
-
-  registerTeamWorkflow(pi, registration);
-
-  createWorkflowToolAdapter({
-    resolveCwd: resolveSessionCwd,
-    owner: ownerForCwd,
-    // Вернуть свежий AgentMappingState; ошибка должна блокировать begin.
-    beforeBegin: refreshAndReturnLiveAgentMapping,
-  }).register(pi);
-
   registerWorkflowCommands(pi, {
     resolveCwd: resolveSessionCwd,
     owner: ownerForCwd,
   });
+  // In the host session_start handler: mountProject(pi, canonicalProjectRoot).
+  // Keep the successful activation until matching session/root shutdown.
 }
 ```
+
+`RUST_ACTIVATION_MARKER_PATH` is created only by an explicit project-local
+bootstrap/enable command that writes the exact bytes used for
+`RUST_ACTIVATION_MARKER_SHA256`; package installation and extension loading do
+not create it or install anything globally. Keep a successful activation in
+plugin/session state until the matching canonical-root shutdown, then call
+`closeWorkflowActivation`; failed begin/register/commit paths close immediately.
+Do not use raw owner claims, release calls, or a process-global owner map.
 
 Все три вызова используют один owner identity. Core разрешает ровно одного
 владельца на canonical worktree для `workflow_registration`,

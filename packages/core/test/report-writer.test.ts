@@ -6,13 +6,38 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
-import { writeReport } from "../src/report/assemble.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
+import { MAX_REPORT_HTML_BYTES, ReportHtmlLimitError, writeReport, writeReportPinned } from "../src/report/assemble.js";
 import { redactText, redactReportBody, DEFAULT_REDACTION_CONFIG } from "../src/report/redact.js";
 
+
+function replaceDirectory(path: string): string {
+  const displaced = `${path}.displaced`;
+  renameSync(path, displaced);
+  mkdirSync(path);
+  return displaced;
+}
+
+function restoreDirectory(path: string, displaced: string): void {
+  rmSync(path, { recursive: true, force: true });
+  renameSync(displaced, path);
+}
 function tmpWorkspace(): string {
   return mkdtempSync(join(tmpdir(), "report-wr-"));
 }
@@ -73,6 +98,112 @@ test("writeReport: accepts absolute targets inside .work-state", () => {
   }
 });
 
+test("writeReport: accepts a multibyte HTML document immediately below the UTF-8 cap", () => {
+  const cwd = tmpWorkspace();
+  try {
+    const prefix = "<html>";
+    const suffix = "</html>";
+    const fixedBytes = Buffer.byteLength(prefix + suffix, "utf8");
+    const available = MAX_REPORT_HTML_BYTES - fixedBytes;
+    const html = `${prefix}${"界".repeat(Math.floor(available / Buffer.byteLength("界", "utf8")))}${suffix}`;
+    const expectedBytes = Buffer.byteLength(html, "utf8");
+    assert.ok(expectedBytes <= MAX_REPORT_HTML_BYTES);
+    assert.ok(MAX_REPORT_HTML_BYTES - expectedBytes < 3, "multibyte fixture must be immediately below the cap");
+
+    const written = writeReport(cwd, ".work-state/features/near/report.html", html);
+    const stored = readFileSync(written);
+    assert.equal(stored.byteLength, expectedBytes, "the read-back byte count must use UTF-8 bytes");
+    assert.equal(stored.subarray(0, Buffer.byteLength(prefix)).toString("utf8"), prefix);
+    assert.equal(stored.subarray(-Buffer.byteLength(suffix)).toString("utf8"), suffix);
+    assert.equal(stored.subarray(Buffer.byteLength(prefix), Buffer.byteLength(prefix) + 3).toString("utf8"), "界");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("writeAtomic text transport preserves UTF-8 controls and rejects ambiguous payloads", { skip: process.platform !== "darwin" }, () => {
+  const cwd = tmpWorkspace();
+  const target = ".work-state/features/text/report.html";
+  const html = "<!doctype html>" + String.fromCharCode(10) + "界" + String.fromCharCode(9, 0, 13, 10) + "</html>";
+  const pin = PinnedProjectRoot.open(cwd);
+  assert.ok(pin);
+  try {
+    const helper = pin as unknown as { runDescriptorHelper: (operation: string, payload: Record<string, unknown>) => unknown };
+    helper.runDescriptorHelper("write_atomic", { path: target, text: html });
+    const stored = readFileSync(join(cwd, target));
+    assert.deepEqual(stored, Buffer.from(html, "utf8"), "text payload must round-trip exact UTF-8 bytes");
+
+    const ambiguousTarget = ".work-state/features/text/ambiguous.html";
+    assert.throws(
+      () => helper.runDescriptorHelper("write_atomic", { path: ambiguousTarget, text: html, bytes: Buffer.from(html, "utf8").toString("base64") }),
+      /exactly one bytes or text payload/u,
+    );
+    assert.equal(existsSync(join(cwd, ambiguousTarget)), false, "ambiguous payload must fail before creating a target");
+
+    const invalidTarget = ".work-state/features/text/invalid.html";
+    assert.throws(
+      () => helper.runDescriptorHelper("write_atomic", { path: invalidTarget, text: "invalid-" + String.fromCharCode(0xd800) }),
+      /not valid UTF-8/u,
+    );
+    assert.equal(existsSync(join(cwd, invalidTarget)), false, "invalid UTF-8 must fail before creating a target");
+  } finally {
+    pin.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("report writers: cap+1 UTF-8 bytes fail before creating or replacing a target", () => {
+  const oversized = `${"x".repeat(MAX_REPORT_HTML_BYTES - 1)}é`;
+  const expectedBytes = MAX_REPORT_HTML_BYTES + 1;
+  assert.equal(Buffer.byteLength(oversized, "utf8"), expectedBytes);
+
+  const standaloneRoot = tmpWorkspace();
+  try {
+    const target = join(".work-state", "features", "oversized", "report.html");
+    assert.throws(
+      () => writeReport(standaloneRoot, target, oversized),
+      (error: unknown) => {
+        assert.ok(error instanceof ReportHtmlLimitError);
+        assert.equal(error.code, "REPORT_HTML_TOO_LARGE");
+        assert.equal(error.byteLength, expectedBytes);
+        assert.equal(error.maxBytes, MAX_REPORT_HTML_BYTES);
+        return true;
+      },
+    );
+    assert.equal(existsSync(join(standaloneRoot, ".work-state")), false, "oversized standalone reports create no directories");
+  } finally {
+    rmSync(standaloneRoot, { recursive: true, force: true });
+  }
+
+  const pinnedRoot = tmpWorkspace();
+  const target = join(".work-state", "features", "oversized", "report.html");
+  const absoluteTarget = join(pinnedRoot, target);
+  mkdirSync(dirname(absoluteTarget), { recursive: true });
+  writeFileSync(absoluteTarget, "previous report", "utf8");
+  const pin = PinnedProjectRoot.open(pinnedRoot);
+  assert.ok(pin);
+  try {
+    assert.throws(
+      () => writeReportPinned(pinnedRoot, target, oversized, pin),
+      (error: unknown) => {
+        assert.ok(error instanceof ReportHtmlLimitError);
+        assert.equal(error.code, "REPORT_HTML_TOO_LARGE");
+        assert.equal(error.byteLength, expectedBytes);
+        return true;
+      },
+    );
+    assert.equal(readFileSync(absoluteTarget, "utf8"), "previous report", "oversized pinned reports never replace the existing file");
+    assert.deepEqual(
+      readdirSync(dirname(absoluteTarget)).filter((entry) => entry.endsWith(".tmp")),
+      [],
+      "oversized reports do not stage a temporary file",
+    );
+  } finally {
+    pin.close();
+    rmSync(pinnedRoot, { recursive: true, force: true });
+  }
+});
+
 // ── Redaction ───────────────────────────────────────────────────────────────
 
 test("redactText: drops secret lines, keeps context, truncates, never throws", () => {
@@ -115,4 +246,117 @@ test("redactReportBody: drops quoted JSON secret keys the prose pattern misses",
   assert.ok(clean.includes('"notes"'));
   // CTO default semantics unchanged: redactText alone still misses quoted keys.
   assert.ok(redactText(json, DEFAULT_REDACTION_CONFIG).includes("sk-12345"));
+});
+
+test("writeReportPinned: keeps a borrowed root open and writes atomically with private mode", () => {
+  const cwd = tmpWorkspace();
+  const pin = PinnedProjectRoot.open(cwd);
+  assert.ok(pin);
+  try {
+    const target = join(".work-state", "features", "pinned", "report.html");
+    const written = writeReportPinned(cwd, target, "<html>pinned</html>", pin);
+    assert.equal(written, resolve(cwd, target));
+    assert.equal(pin.isStable(), true, "caller-owned pin remains open");
+    assert.equal(statSync(written).mode & 0o777, 0o600);
+    assert.equal(readFileSync(written, "utf8"), "<html>pinned</html>");
+  } finally {
+    pin.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("writeReportPinned: root and ancestor swaps after containment fail before replacement writes", () => {
+  const rootCase = tmpWorkspace();
+  let rootDisplaced: string | null = null;
+  const rootPin = PinnedProjectRoot.open(rootCase, {
+    beforeDirectoryCreate: () => {
+      if (rootDisplaced === null) rootDisplaced = replaceDirectory(rootCase);
+    },
+  });
+  assert.ok(rootPin);
+  try {
+    assert.throws(
+      () => writeReportPinned(rootCase, ".work-state/features/x/report.html", "root", rootPin),
+      /writeReport/,
+    );
+    assert.deepEqual(readdirSync(rootCase), [], "root replacement stayed untouched");
+  } finally {
+    rootPin.close();
+    if (rootDisplaced !== null) restoreDirectory(rootCase, rootDisplaced);
+    rmSync(rootCase, { recursive: true, force: true });
+  }
+
+  const container = tmpWorkspace();
+  const ancestorRoot = join(container, "project");
+  mkdirSync(ancestorRoot);
+  let ancestorDisplaced: string | null = null;
+  const ancestorPin = PinnedProjectRoot.open(ancestorRoot, {
+    beforeDirectoryCreate: () => {
+      if (ancestorDisplaced === null) {
+        ancestorDisplaced = replaceDirectory(container);
+        mkdirSync(ancestorRoot);
+      }
+    },
+  });
+  assert.ok(ancestorPin);
+  try {
+    assert.throws(
+      () => writeReportPinned(ancestorRoot, ".work-state/features/x/report.html", "ancestor", ancestorPin),
+      /writeReport/,
+    );
+    assert.deepEqual(readdirSync(ancestorRoot), [], "ancestor replacement stayed untouched");
+  } finally {
+    ancestorPin.close();
+    if (ancestorDisplaced !== null) restoreDirectory(container, ancestorDisplaced);
+    rmSync(container, { recursive: true, force: true });
+  }
+});
+
+test("writeReportPinned: parent and leaf symlink swaps never write outside the pinned root", () => {
+  const parentRoot = tmpWorkspace();
+  const parentOutside = mkdtempSync(join(tmpdir(), "report-parent-outside-"));
+  const parentPin = PinnedProjectRoot.open(parentRoot, {
+    beforeDirectoryCreate: (relativePath) => {
+      if (relativePath === ".work-state/features/x") {
+        mkdirSync(join(parentRoot, ".work-state"), { recursive: true });
+        symlinkSync(parentOutside, join(parentRoot, ".work-state/features"), "dir");
+      }
+    },
+  });
+  assert.ok(parentPin);
+  try {
+    assert.throws(
+      () => writeReportPinned(parentRoot, ".work-state/features/x/report.html", "parent", parentPin),
+      /writeReport/,
+    );
+    assert.deepEqual(readdirSync(parentOutside), [], "parent replacement stayed untouched");
+  } finally {
+    parentPin.close();
+    rmSync(parentRoot, { recursive: true, force: true });
+    rmSync(parentOutside, { recursive: true, force: true });
+  }
+
+  const leafRoot = tmpWorkspace();
+  const leafOutside = mkdtempSync(join(tmpdir(), "report-leaf-outside-"));
+  const outsideFile = join(leafOutside, "sentinel.html");
+  writeFileSync(outsideFile, "sentinel");
+  const leafTarget = join(leafRoot, ".work-state/features/x/report.html");
+  mkdirSync(dirname(leafTarget), { recursive: true });
+  const leafPin = PinnedProjectRoot.open(leafRoot, {
+    beforeTempOpen: () => {
+      if (!existsSync(leafTarget)) symlinkSync(outsideFile, leafTarget, "file");
+    },
+  });
+  assert.ok(leafPin);
+  try {
+    assert.throws(
+      () => writeReportPinned(leafRoot, ".work-state/features/x/report.html", "leaf", leafPin),
+      /writeReport/,
+    );
+    assert.equal(readFileSync(outsideFile, "utf8"), "sentinel", "leaf replacement stayed untouched");
+  } finally {
+    leafPin.close();
+    rmSync(leafRoot, { recursive: true, force: true });
+    rmSync(leafOutside, { recursive: true, force: true });
+  }
 });

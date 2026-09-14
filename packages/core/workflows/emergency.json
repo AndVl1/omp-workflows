@@ -4,7 +4,7 @@
   "description": "HOTFIX / CRITICAL production impact. Minimal fix, focused sanity check, no refactoring. May run on main.",
   "completion_intent": {
     "mode": "complete_outcome",
-    "acceptance": "dod_and_artifacts",
+    "acceptance": "quality_gates_and_artifacts",
     "source": "workflow_policy",
     "rationale": "Emergency workflows produce a minimal verified fix and focused evidence; no approval is inferred from urgency."
   },
@@ -27,10 +27,20 @@
       "produces": "review"
     },
     {
+      "id": "qa_tests",
+      "title": "Automated Tests",
+      "type": "single",
+      "role": "qa",
+      "consumes": ["implementation", "review"],
+      "gate": "qa_reported_pass",
+      "produces": "qa_tests"
+    },
+    {
       "id": "summary",
       "title": "Summary",
       "type": "orchestrator",
-      "consumes": ["implementation", "review"],
+      "consumes": ["implementation", "review", "qa_tests"],
+      "gate": "qa_reported_pass",
       "produces": "summary"
     }
   ]

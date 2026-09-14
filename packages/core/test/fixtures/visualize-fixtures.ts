@@ -630,10 +630,10 @@ export const REQUIRED_EDGE_GROUPS: readonly string[] = [
 export function buildFixtureInventory(): FixtureInventory {
   const cases: FixtureCase[] = [];
 
-  // 1. feature · spec-preparation · detailed · slots · hostile · missing · oversized
+  // 1. feature · spec-preparation · native stages · slots · hostile · missing · oversized
   cases.push({
     id: "feature-spec-preparation",
-    title: "spec-preparation feature session: 7 spec artifacts + consilium slots, hostile content, one missing, one oversized preview",
+    title: "spec-preparation feature session: native Specify → Plan → Tasks → Handoff stages, slots, hostile content, one missing, one oversized preview",
     groups: ["feature", "spec-family", "slots", "missing", "unicode", "fences", "html-like", "crlf", "large", "produced"],
     input: featureSession({
       id: "visualize",
@@ -643,30 +643,24 @@ export function buildFixtureInventory(): FixtureInventory {
       updatedAt: "2026-08-19T10:00:00.000Z",
       profileHash: "p-visualize-1",
       stages: [
-        { id: "intake_repo_map", status: "done" },
-        { id: "requirements_edge_cases", status: "done" },
-        { id: "options_decision_log", status: "done" },
-        { id: "architecture_task_slices", status: "done" },
-        { id: "completeness_gate", status: "in_progress" },
+        { id: "specify", status: "done" },
+        { id: "plan", status: "done" },
+        { id: "tasks", status: "in_progress" },
         { id: "handoff", status: "in_progress" },
       ],
       declared: {
-        spec_intake_repo_map: ".work-state/features/visualize/artifacts/spec_intake_repo_map.json",
-        spec_requirements_edge_cases: ".work-state/features/visualize/artifacts/spec_requirements_edge_cases.json",
-        spec_options_decisions: ".work-state/features/visualize/artifacts/spec_options_decisions.json",
-        spec_architecture_tasks: ".work-state/features/visualize/artifacts/spec_architecture_tasks.json",
-        spec_completeness: ".work-state/features/visualize/artifacts/spec_completeness.json",
+        specify_draft: ".work-state/features/visualize/artifacts/specify_draft.json",
+        plan_draft: ".work-state/features/visualize/artifacts/plan_draft.json",
+        task_graph: ".work-state/features/visualize/artifacts/task_graph.json",
         "spec-preparation": ".work-state/features/visualize/artifacts/spec-preparation.json",
         spec_handoff: ".work-state/features/visualize/artifacts/spec_handoff.json",
       },
       files: [
-        artifact("spec_intake_repo_map", ".work-state/features/visualize/artifacts/spec_intake_repo_map.json", specArtifactJson("spec_intake_repo_map", { verified_facts: ["22 typed ids", "12 workflow profiles"] })),
-        artifact("spec_intake_repo_map-analyst", ".work-state/features/visualize/artifacts/spec_intake_repo_map-analyst.json", slotArtifactJson("spec_intake_repo_map", "analyst")),
-        artifact("spec_intake_repo_map-tech-researcher", ".work-state/features/visualize/artifacts/spec_intake_repo_map-tech-researcher.json", slotArtifactJson("spec_intake_repo_map", "tech-researcher")),
-        artifact("spec_requirements_edge_cases", ".work-state/features/visualize/artifacts/spec_requirements_edge_cases.json", specArtifactJson("spec_requirements_edge_cases", { edge_cases: ["unsafe ids", "CRLF", "deep JSON"] })),
-        artifact("spec_options_decisions", ".work-state/features/visualize/artifacts/spec_options_decisions.json", specArtifactJson("spec_options_decisions", { options: ["OPT-A", "OPT-B", "OPT-C"] })),
-        artifact("spec_architecture_tasks", ".work-state/features/visualize/artifacts/spec_architecture_tasks.json", specArtifactJson("spec_architecture_tasks", { task_slices: ["architecture-1", "architecture-2"] })),
-        // spec_completeness declared but NOT on disk → missing
+        artifact("specify_draft", ".work-state/features/visualize/artifacts/specify_draft.json", specArtifactJson("specify_draft", { verified_facts: ["22 typed ids", "12 workflow profiles"] })),
+        artifact("specify_draft-analyst", ".work-state/features/visualize/artifacts/specify_draft-analyst.json", slotArtifactJson("specify_draft", "analyst")),
+        artifact("specify_draft-tech-researcher", ".work-state/features/visualize/artifacts/specify_draft-tech-researcher.json", slotArtifactJson("specify_draft", "tech-researcher")),
+        artifact("plan_draft", ".work-state/features/visualize/artifacts/plan_draft.json", specArtifactJson("plan_draft", { options: ["OPT-A", "OPT-B", "OPT-C"] })),
+        // task_graph declared but NOT on disk → missing
         artifact("spec-preparation", ".work-state/features/visualize/artifacts/spec-preparation.json", hostileSpecBody()),
         // 17 KB > default 16 KiB read window → produced with preview at default
         artifact(
@@ -679,18 +673,16 @@ export function buildFixtureInventory(): FixtureInventory {
         status: "complete",
         staleness: "fresh",
         artifactStatuses: {
-          spec_intake_repo_map: "produced",
-          "spec_intake_repo_map-analyst": "produced",
-          "spec_intake_repo_map-tech-researcher": "produced",
-          spec_requirements_edge_cases: "produced",
-          spec_options_decisions: "produced",
-          spec_architecture_tasks: "produced",
-          spec_completeness: "missing",
+          specify_draft: "produced",
+          "specify_draft-analyst": "produced",
+          "specify_draft-tech-researcher": "produced",
+          plan_draft: "produced",
+          task_graph: "missing",
           "spec-preparation": "produced",
           spec_handoff: "produced",
         },
         warnings: [
-          "declared artifact spec_completeness is missing",
+          "declared artifact task_graph is missing",
           "artifact spec_handoff is larger than the read window: head preview (original bytes > window)",
         ],
       },
@@ -1035,34 +1027,34 @@ export function buildFixtureInventory(): FixtureInventory {
     }),
   });
 
-  // 11. slots · mid-consilium: shared base absent while producer is in_progress → base pending
+  // 11. slots · native mid-tasks: shared base absent while producer is in_progress → base pending
   cases.push({
-    id: "slots-mid-consilium",
-    title: "mid-consilium: base artifact absent while its producer is in_progress and slots exist → base pending, slots produced",
+    id: "slots-mid-tasks",
+    title: "mid-tasks: base artifact absent while its producer is in_progress and slots exist → base pending, slots produced",
     groups: ["slots", "pending"],
     input: featureSession({
-      id: "consilium",
-      pathKey: "consilium",
-      task: "Run a consilium stage mid-flight.",
+      id: "tasks",
+      pathKey: "tasks",
+      task: "Run the native tasks stage mid-flight.",
       workflow: "spec-preparation",
       updatedAt: "2026-08-19T04:00:00.000Z",
-      stages: [{ id: "architecture_task_slices", status: "in_progress" }],
+      stages: [{ id: "tasks", status: "in_progress" }],
       declared: {
-        spec_architecture_tasks: ".work-state/features/consilium/artifacts/spec_architecture_tasks.json",
+        task_graph: ".work-state/features/tasks/artifacts/task_graph.json",
       },
       files: [
-        artifact("spec_architecture_tasks-architect", ".work-state/features/consilium/artifacts/spec_architecture_tasks-architect.json", slotArtifactJson("spec_architecture_tasks", "architect")),
-        artifact("spec_architecture_tasks-tech-researcher", ".work-state/features/consilium/artifacts/spec_architecture_tasks-tech-researcher.json", slotArtifactJson("spec_architecture_tasks", "tech-researcher")),
+        artifact("task_graph-architect", ".work-state/features/tasks/artifacts/task_graph-architect.json", slotArtifactJson("task_graph", "architect")),
+        artifact("task_graph-tech-researcher", ".work-state/features/tasks/artifacts/task_graph-tech-researcher.json", slotArtifactJson("task_graph", "tech-researcher")),
       ],
       expected: {
         status: "complete",
         staleness: "fresh",
         artifactStatuses: {
-          spec_architecture_tasks: "pending",
-          "spec_architecture_tasks-architect": "produced",
-          "spec_architecture_tasks-tech-researcher": "produced",
+          task_graph: "pending",
+          "task_graph-architect": "produced",
+          "task_graph-tech-researcher": "produced",
         },
-        warnings: ["shared artifact spec_architecture_tasks is pending: producer in_progress, slots present"],
+        warnings: ["shared artifact task_graph is pending: producer in_progress, slots present"],
       },
     }),
   });
@@ -1383,9 +1375,9 @@ export function buildExpectedSpecPreparationSession(generatedAt: string = FIXED_
     bounds: { maxDepth: 8, maxCollectionItems: 200, maxScalarChars: 8192 },
   };
   const files = new Map(input.artifacts.map((f) => [f.id, f]));
-  const artifactById = (id: string, status: ArtifactStatus, owner: string): VisualizationArtifact => {
+  const artifactById = (id: string, status: ArtifactStatus, owner: string, slotFor?: string): VisualizationArtifact => {
     const file = files.get(id);
-    const base: VisualizationArtifact = { id, owner, status };
+    const base: VisualizationArtifact = { id, owner, status, ...(slotFor ? { slotFor } : {}) };
     if (status === "produced" && file) {
       const bytes = Buffer.byteLength(file.content, "utf8");
       const body = expectedRedactedBody(file.content, { windowBytes: renderOptions.readWindowBytes, capBytes: renderOptions.bodyCapBytes });
@@ -1413,13 +1405,11 @@ export function buildExpectedSpecPreparationSession(generatedAt: string = FIXED_
   };
 
   const artifacts: VisualizationArtifact[] = [
-    artifactById("spec_intake_repo_map", "produced", "intake_repo_map"),
-    artifactById("spec_intake_repo_map-analyst", "produced", "intake_repo_map"),
-    artifactById("spec_intake_repo_map-tech-researcher", "produced", "intake_repo_map"),
-    artifactById("spec_requirements_edge_cases", "produced", "requirements_edge_cases"),
-    artifactById("spec_options_decisions", "produced", "options_decision_log"),
-    artifactById("spec_architecture_tasks", "produced", "architecture_task_slices"),
-    artifactById("spec_completeness", "missing", "completeness_gate"),
+    artifactById("specify_draft", "produced", "specify"),
+    artifactById("specify_draft-analyst", "produced", "specify", "specify_draft"),
+    artifactById("specify_draft-tech-researcher", "produced", "specify", "specify_draft"),
+    artifactById("plan_draft", "produced", "plan"),
+    artifactById("task_graph", "missing", "tasks"),
     artifactById("spec-preparation", "produced", "handoff"),
     artifactById("spec_handoff", "produced", "handoff"),
   ];
@@ -1439,11 +1429,9 @@ export function buildExpectedSpecPreparationSession(generatedAt: string = FIXED_
     },
     status: "complete",
     stages: [
-      { stageId: "intake_repo_map", title: "Repository intake map", status: "done", artifactIds: ["spec_intake_repo_map", "spec_intake_repo_map-analyst", "spec_intake_repo_map-tech-researcher"] },
-      { stageId: "requirements_edge_cases", title: "Requirements and edge cases", status: "done", artifactIds: ["spec_requirements_edge_cases"] },
-      { stageId: "options_decision_log", title: "Options and decision log", status: "done", artifactIds: ["spec_options_decisions"] },
-      { stageId: "architecture_task_slices", title: "Architecture and task slices", status: "done", artifactIds: ["spec_architecture_tasks"] },
-      { stageId: "completeness_gate", title: "Completeness gate", status: "in_progress", artifactIds: ["spec_completeness"] },
+      { stageId: "specify", status: "done", artifactIds: ["specify_draft", "specify_draft-analyst", "specify_draft-tech-researcher"] },
+      { stageId: "plan", status: "done", artifactIds: ["plan_draft"] },
+      { stageId: "tasks", status: "in_progress", artifactIds: ["task_graph"] },
       { stageId: "handoff", title: "Handoff", status: "in_progress", artifactIds: ["spec-preparation", "spec_handoff"] },
     ],
     artifacts,

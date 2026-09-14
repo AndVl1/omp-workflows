@@ -46,16 +46,45 @@ export class MyChannelAdapter implements EscalationAdapter {
 
 ## 2. Ответы — только файлами
 
-Ответы НЕ возвращаются через adapter. Колбэк/вебхук канала пишет файл
-`.work-state/cto/<runId>/answers/<escId>.json`:
+Ответы НЕ возвращаются через adapter. Колбэк/вебхук передаёт ответ
+adapter-у, а сам adapter пишет его в
+`.work-state/cto/<runId>/answers/<escId>.json` через pinned root, полученный
+от dispatcher-а в `pollOnce(pinnedRoot)`. Не импортируй из core raw readers или
+`ensureAnswersDir`: они не являются публичным API.
 
 ```ts
-import { ensureAnswersDir } from "@andvl1/omp-workflows-core";
-import { writeFileSync, join } from "node:fs";
+import {
+  canonicalDurableIdFileName,
+  isSafeCtoRunId,
+  isSafeEscalationId,
+  PinnedProjectRoot,
+} from "@andvl1/omp-workflows-core";
+import { join } from "node:path";
 
-const dir = ensureAnswersDir(runId, cwd);   // .work-state/cto/<runId>/answers/
-writeFileSync(join(dir, `${escId.replace(/[^\w-]/g, "-")}.json`),
-  JSON.stringify({ id: escId, answer, at: new Date().toISOString(), by: "my-channel" }));
+type Answer = { id: string; run_id: string; answer: string; at: string; by: string };
+
+function persistAnswer(pinnedRoot: PinnedProjectRoot, runId: string, answer: Answer): void {
+  if (!isSafeCtoRunId(runId) || answer.run_id !== runId || !isSafeEscalationId(answer.id)) {
+    throw new Error("unsafe answer identity");
+  }
+  if (!pinnedRoot.isStable()) throw new Error("project root changed before answer persistence");
+  const relativeDirectory = join(".work-state", "cto", runId, "answers");
+  pinnedRoot.ensureDirectory(relativeDirectory);
+  pinnedRoot.writeExclusive(
+    join(relativeDirectory, canonicalDurableIdFileName(answer.id)),
+    JSON.stringify(answer),
+  );
+  if (!pinnedRoot.isStable()) throw new Error("project root changed after answer persistence");
+}
+
+// Inside EscalationAdapter.pollOnce(pinnedRoot):
+persistAnswer(pinnedRoot, runId, {
+  id: escId,
+  run_id: runId,
+  answer: text,
+  at: new Date().toISOString(),
+  by: "my-channel",
+});
 ```
 
 Файлы переживают рестарты; агент подхватывает ответ на следующем чекпоинте.

@@ -1,0 +1,512 @@
+{
+  "schema": 1,
+  "branch": "main",
+  "classification": {
+    "type": "SPEC",
+    "complexity": "MEDIUM",
+    "confidence": "HIGH",
+    "autonomous": false,
+    "workflow": "spec-preparation"
+  },
+  "task": "Add a deterministic project-local workflow profile override with explicit ownership",
+  "workflow_override": true,
+  "issue": null,
+  "stage_cursor": "specify",
+  "stages": [
+    {
+      "id": "specify",
+      "status": "in_progress"
+    },
+    {
+      "id": "plan",
+      "status": "pending"
+    },
+    {
+      "id": "tasks",
+      "status": "pending"
+    },
+    {
+      "id": "handoff",
+      "status": "pending"
+    }
+  ],
+  "pause": {
+    "kind": "none",
+    "reason": ""
+  },
+  "artifacts": {},
+  "scope": {
+    "has_security": false,
+    "has_infra": false,
+    "scope": [],
+    "has_ui": false,
+    "has_runtime": false,
+    "dev_agent": null
+  },
+  "policy": {
+    "strict_orchestrator": true
+  },
+  "profile_hash": "5d1deacda0c0e848f4e1b4d60762a16956a73b5b7479535cceff29da3f7ed825",
+  "config_hash": "87d28f4faa2b482198b15002293439aabc8a55b8d14e2814ad320c258e78fb16",
+  "run_key": "spec-e90cc263-f80f-4c1d-8922-de9918bc62e3",
+  "updated_at": "2026-09-08T12:19:50.101Z",
+  "specification": {
+    "schema_version": 3,
+    "feature_id": "readable-native-probe-11",
+    "display_name": "Add a deterministic project-local workflow profile override with explicit ownership",
+    "source_kind": "native",
+    "project_root": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-11/omp-spec-e2e-readable-native-probe-11",
+    "project_root_identity": {
+      "canonical_path": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-11/omp-spec-e2e-readable-native-probe-11",
+      "dev": 16777234,
+      "ino": 102939945
+    },
+    "path_binding": {
+      "specs": {
+        "relative_path": "specs/readable-native-probe-11",
+        "canonical_path": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-11/omp-spec-e2e-readable-native-probe-11/specs/readable-native-probe-11",
+        "dev": 16777234,
+        "ino": 102940235
+      },
+      "feature_state": {
+        "relative_path": ".work-state/features/readable-native-probe-11",
+        "canonical_path": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-11/omp-spec-e2e-readable-native-probe-11/.work-state/features/readable-native-probe-11",
+        "dev": 16777234,
+        "ino": 102940236
+      },
+      "artifacts": {
+        "relative_path": ".work-state/features/readable-native-probe-11/artifacts",
+        "canonical_path": "/private/tmp/omp-ux-e2e-readable-spec-workflow/native-probe-11/omp-spec-e2e-readable-native-probe-11/.work-state/features/readable-native-probe-11/artifacts",
+        "dev": 16777234,
+        "ino": 102940237
+      },
+      "execution_claim": null,
+      "execution_claim_next": null
+    },
+    "workspace_path": "specs/readable-native-probe-11",
+    "state_path": ".work-state/features/readable-native-probe-11/state.json",
+    "profile_name": "spec-preparation",
+    "profile_hash": "5d1deacda0c0e848f4e1b4d60762a16956a73b5b7479535cceff29da3f7ed825",
+    "constitution_gate_ref": "constitution-gate-afdeb021",
+    "constitution_binding": {
+      "provider_id": "native",
+      "path": "CONSTITUTION.md",
+      "version": "1.0.0",
+      "content_sha256": "08018de18abc061a72983470c2584f3356489c340bb6a3a4bdbb2aeea318915a",
+      "semantic_hash": "7867ca8650aed783d176d7e1032bc8a404a329d92183e3f9a5dca67b9a472e55",
+      "validation_ref": "constitution.validation.08018de18abc061a72983470c2584f3356489c340bb6a3a4bdbb2aeea318915a",
+      "bound_at": "2026-09-08T12:14:25.274Z"
+    },
+    "language": {
+      "language": "en-US",
+      "source": "project_default",
+      "selection_hash": "587f63b2864bc26fbb1f627c015449cc5b395f78d35e7384876c51cd32f675bd"
+    },
+    "template_set": {
+      "template_set_id": "specification-default",
+      "source": "shipped_default",
+      "content_hash": "5b01f9d8c07f93b2a94f0a4d79fb0d314633a5b5d5cc81ce036f7143a48e0868",
+      "required_markers": []
+    },
+    "phases": [
+      {
+        "phase": "specify",
+        "status": "generating",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "plan",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      },
+      {
+        "phase": "tasks",
+        "status": "not_started",
+        "current_version": null,
+        "approved_version": null,
+        "validation_ref": null,
+        "checkpoint_ref": null,
+        "upstream_versions": [],
+        "stale_reason": null,
+        "last_feedback": null
+      }
+    ],
+    "status": "in_progress",
+    "next_action": {
+      "kind": "none",
+      "command": null,
+      "reason": "The specify worker dispatch is active."
+    },
+    "handoff_ref": null,
+    "execution_claim_prepare_ref": null,
+    "execution_claim_ref": null,
+    "implementation_conformance_ref": null,
+    "import_ref": null,
+    "migration_receipt_ref": null
+  },
+  "state_revision": 6,
+  "completion_intent": {
+    "mode": "handoff_only",
+    "acceptance": "quality_gates_and_artifacts",
+    "source": "workflow_policy",
+    "rationale": "Specification preparation hands off a traceable implementation-ready specification assembled from validated typed drafts; every phase artifact must exist and pass its checkpoint, and no application code is modified."
+  },
+  "checkpoint_policy": {
+    "default": "required_human",
+    "scope": "decision",
+    "hard_human": [
+      "specification_phase_approval"
+    ],
+    "rules": {
+      "specification_phase_approval": {
+        "kind": "specification_phase_approval",
+        "default": "required_human",
+        "allowed_decisions": [
+          "approve_continue",
+          "request_changes",
+          "approve_stop"
+        ],
+        "phase": "before_advance",
+        "rationale": "Every native specification phase requires an explicit trusted human decision on its validated typed artifact: approve_continue arms the next phase, request_changes reopens the current phase with recorded feedback, and approve_stop ends the run at the phase boundary."
+      }
+    },
+    "source": "profile",
+    "policy_version": 1,
+    "rationale": "Specify, plan, and tasks all advance through the canonical hard-human specification_phase_approval checkpoint with the exact three phase decisions; the constitution bootstrap approval is declared separately by the prerequisite and never satisfies a phase approval."
+  },
+  "roster_policy": {
+    "allowed_roles": [
+      "analyst"
+    ],
+    "required_roles": [
+      "analyst"
+    ],
+    "required_facets": [],
+    "min_workers": 1,
+    "max_workers": 1,
+    "multiplicity": {
+      "analyst": {
+        "min": 1,
+        "max": 1
+      }
+    },
+    "prefer_distinct_agents": true,
+    "selection_mode": "pre_dispatch_minimum_valid",
+    "triggers": {
+      "complexity": [],
+      "confidence": [],
+      "scope_flags": [],
+      "evidence": []
+    },
+    "budget": {
+      "token_limit": null,
+      "dollar_limit": null
+    }
+  },
+  "work_identity": {
+    "run_id": "spec-e90cc263-f80f-4c1d-8922-de9918bc62e3",
+    "wave_id": "legacy-wave-14f2cfcffd20aaa544632c5a",
+    "slice_id": "legacy-slice-specify",
+    "session_id": "legacy-session-14f2cfcffd20aaa544632c5a",
+    "workflow": "spec-preparation",
+    "stage_id": "specify",
+    "stage_cursor": "specify",
+    "capability_id": "483009ba-c93e-448a-adc0-f4de8c2dbff1",
+    "capability_epoch": "300df9cb-2a21-4a1e-82fe-41a2e396c735",
+    "slot_id": "analyst",
+    "task_id": "task-9ad6b8913614dda7d9982a2d1fc6f65d",
+    "dispatch_id": "0e0aaba9-00f5-4772-b5e4-222500043315",
+    "attempt": 1,
+    "worker_id": "analyst"
+  },
+  "migration": {
+    "id": "migration-b725cca9e4cd90f0c19f97bf",
+    "from_schema": 1,
+    "to_schema": 2,
+    "source_profile_hash": "5d1deacda0c0e848f4e1b4d60762a16956a73b5b7479535cceff29da3f7ed825",
+    "target_profile_hash": "5d1deacda0c0e848f4e1b4d60762a16956a73b5b7479535cceff29da3f7ed825",
+    "source_policy_hash": null,
+    "target_policy_hash": "5e490e403acb0690b96579bfb9973743ca0b2a67ab27b0f841320b2a64a7883d",
+    "legacy_inputs": [
+      "classification.autonomous"
+    ],
+    "warnings": [
+      "completion_intent projected from typed profile or conservative migration default",
+      "checkpoint_policy projected from typed profile or conservative human-required migration policy"
+    ],
+    "status": "complete",
+    "migrated_at": "2026-09-08T12:14:34.712Z"
+  },
+  "control_plane_provenance": {
+    "completion_intent": "state",
+    "checkpoint_policy": "state",
+    "roster_policy": "profile",
+    "roster_selection": "state",
+    "work_identity": "migration",
+    "pending": "none",
+    "child_join": "none",
+    "completion_envelope": "state",
+    "legacy_inputs": [
+      "classification.autonomous"
+    ],
+    "warnings": [],
+    "status": "migrated"
+  },
+  "cursor_epoch": "300df9cb-2a21-4a1e-82fe-41a2e396c735",
+  "roster_selection": {
+    "snapshot_id": "selection-628793720e365462c3bc5e4235fbb3de",
+    "run_key": "spec-e90cc263-f80f-4c1d-8922-de9918bc62e3",
+    "wave_id": "legacy-wave-14f2cfcffd20aaa544632c5a",
+    "slice_id": "legacy-slice-specify",
+    "session_id": "legacy-session-14f2cfcffd20aaa544632c5a",
+    "workflow": "spec-preparation",
+    "stage_id": "specify",
+    "profile_hash": "5d1deacda0c0e848f4e1b4d60762a16956a73b5b7479535cceff29da3f7ed825",
+    "policy_hash": "620e2f3aeabb83c9aa5b2b4c70fae2e7b7dc231bae7ba012e09d373e55657626",
+    "scope_hash": "e71bca71642e9f3dd57ebadf6d13a233aacb87ee2df4cc8063d24abdee8a68fd",
+    "mapping_hash": "02530e62ad004119441ceaf3508bb895be9007a1b3e251b8d3d7f67b65277bce",
+    "capability_epoch": "300df9cb-2a21-4a1e-82fe-41a2e396c735",
+    "selected": [
+      {
+        "slot_id": "analyst",
+        "role": "analyst",
+        "occurrence": 1,
+        "facet": null,
+        "agent": "analyst",
+        "reason": "required role coverage"
+      }
+    ],
+    "omitted": [],
+    "triggers": [
+      "selection:minimum_valid_set"
+    ],
+    "stop_reason": "minimum_valid_set",
+    "selected_at": "2026-09-08T12:14:44.412Z",
+    "frozen_at": "2026-09-08T12:14:44.412Z"
+  },
+  "roster_selections": {
+    "specify": {
+      "snapshot_id": "selection-628793720e365462c3bc5e4235fbb3de",
+      "run_key": "spec-e90cc263-f80f-4c1d-8922-de9918bc62e3",
+      "wave_id": "legacy-wave-14f2cfcffd20aaa544632c5a",
+      "slice_id": "legacy-slice-specify",
+      "session_id": "legacy-session-14f2cfcffd20aaa544632c5a",
+      "workflow": "spec-preparation",
+      "stage_id": "specify",
+      "profile_hash": "5d1deacda0c0e848f4e1b4d60762a16956a73b5b7479535cceff29da3f7ed825",
+      "policy_hash": "620e2f3aeabb83c9aa5b2b4c70fae2e7b7dc231bae7ba012e09d373e55657626",
+      "scope_hash": "e71bca71642e9f3dd57ebadf6d13a233aacb87ee2df4cc8063d24abdee8a68fd",
+      "mapping_hash": "02530e62ad004119441ceaf3508bb895be9007a1b3e251b8d3d7f67b65277bce",
+      "capability_epoch": "300df9cb-2a21-4a1e-82fe-41a2e396c735",
+      "selected": [
+        {
+          "slot_id": "analyst",
+          "role": "analyst",
+          "occurrence": 1,
+          "facet": null,
+          "agent": "analyst",
+          "reason": "required role coverage"
+        }
+      ],
+      "omitted": [],
+      "triggers": [
+        "selection:minimum_valid_set"
+      ],
+      "stop_reason": "minimum_valid_set",
+      "selected_at": "2026-09-08T12:14:44.412Z",
+      "frozen_at": "2026-09-08T12:14:44.412Z"
+    }
+  },
+  "dispatch_capability": {
+    "capability_id": "483009ba-c93e-448a-adc0-f4de8c2dbff1",
+    "dispatch_token_hash": "718023ccc2002c9eab03333a6b43761388dca1c55ad70fee19524e26e9c4892d",
+    "advance_token_hash": "78838585ed03175b9861503cc19aca1aad1dc9c09288030c8cae7dd672c942ae",
+    "issued_for": {
+      "run_key": "spec-e90cc263-f80f-4c1d-8922-de9918bc62e3",
+      "branch": "main",
+      "workflow": "spec-preparation",
+      "profile_hash": "5d1deacda0c0e848f4e1b4d60762a16956a73b5b7479535cceff29da3f7ed825",
+      "stage_cursor": "specify",
+      "cursor_epoch": "300df9cb-2a21-4a1e-82fe-41a2e396c735"
+    },
+    "kind": "single",
+    "expected_roles": [
+      "analyst"
+    ],
+    "expected_count": 1,
+    "expected_roster": [
+      {
+        "role": "analyst",
+        "agent": "analyst"
+      }
+    ],
+    "roster_selection": {
+      "snapshot_id": "selection-628793720e365462c3bc5e4235fbb3de",
+      "run_key": "spec-e90cc263-f80f-4c1d-8922-de9918bc62e3",
+      "wave_id": "legacy-wave-14f2cfcffd20aaa544632c5a",
+      "slice_id": "legacy-slice-specify",
+      "session_id": "legacy-session-14f2cfcffd20aaa544632c5a",
+      "workflow": "spec-preparation",
+      "stage_id": "specify",
+      "profile_hash": "5d1deacda0c0e848f4e1b4d60762a16956a73b5b7479535cceff29da3f7ed825",
+      "policy_hash": "620e2f3aeabb83c9aa5b2b4c70fae2e7b7dc231bae7ba012e09d373e55657626",
+      "scope_hash": "e71bca71642e9f3dd57ebadf6d13a233aacb87ee2df4cc8063d24abdee8a68fd",
+      "mapping_hash": "02530e62ad004119441ceaf3508bb895be9007a1b3e251b8d3d7f67b65277bce",
+      "capability_epoch": "300df9cb-2a21-4a1e-82fe-41a2e396c735",
+      "selected": [
+        {
+          "slot_id": "analyst",
+          "role": "analyst",
+          "occurrence": 1,
+          "facet": null,
+          "agent": "analyst",
+          "reason": "required role coverage"
+        }
+      ],
+      "omitted": [],
+      "triggers": [
+        "selection:minimum_valid_set"
+      ],
+      "stop_reason": "minimum_valid_set",
+      "selected_at": "2026-09-08T12:14:44.412Z",
+      "frozen_at": "2026-09-08T12:14:44.412Z"
+    },
+    "status": "dispatched",
+    "dispatches": [
+      {
+        "id": "0e0aaba9-00f5-4772-b5e4-222500043315",
+        "purpose": "generation",
+        "role": "analyst",
+        "agent": "analyst",
+        "tool_call_id": "specify-dispatch-probe-11-v1",
+        "status": "authorized",
+        "attempt": 1,
+        "created_at": "2026-09-08T12:17:02.877Z",
+        "work_identity": {
+          "run_id": "spec-e90cc263-f80f-4c1d-8922-de9918bc62e3",
+          "wave_id": "legacy-wave-14f2cfcffd20aaa544632c5a",
+          "slice_id": "legacy-slice-specify",
+          "session_id": "legacy-session-14f2cfcffd20aaa544632c5a",
+          "workflow": "spec-preparation",
+          "stage_id": "specify",
+          "stage_cursor": "specify",
+          "capability_id": "483009ba-c93e-448a-adc0-f4de8c2dbff1",
+          "capability_epoch": "300df9cb-2a21-4a1e-82fe-41a2e396c735",
+          "slot_id": "analyst",
+          "task_id": "task-9ad6b8913614dda7d9982a2d1fc6f65d",
+          "dispatch_id": "0e0aaba9-00f5-4772-b5e4-222500043315",
+          "attempt": 1,
+          "worker_id": "analyst"
+        },
+        "pending": {
+          "identity": {
+            "run_id": "spec-e90cc263-f80f-4c1d-8922-de9918bc62e3",
+            "wave_id": "legacy-wave-14f2cfcffd20aaa544632c5a",
+            "slice_id": "legacy-slice-specify",
+            "session_id": "legacy-session-14f2cfcffd20aaa544632c5a",
+            "workflow": "spec-preparation",
+            "stage_id": "specify",
+            "stage_cursor": "specify",
+            "capability_id": "483009ba-c93e-448a-adc0-f4de8c2dbff1",
+            "capability_epoch": "300df9cb-2a21-4a1e-82fe-41a2e396c735",
+            "slot_id": "analyst",
+            "task_id": "task-9ad6b8913614dda7d9982a2d1fc6f65d",
+            "dispatch_id": "0e0aaba9-00f5-4772-b5e4-222500043315",
+            "attempt": 1,
+            "worker_id": "analyst"
+          },
+          "status": "authorized",
+          "retry_of": null,
+          "updated_at": "2026-09-08T12:17:02.877Z"
+        },
+        "completion_envelope": {
+          "schema_version": 1,
+          "identity": {
+            "run_id": "spec-e90cc263-f80f-4c1d-8922-de9918bc62e3",
+            "wave_id": "legacy-wave-14f2cfcffd20aaa544632c5a",
+            "slice_id": "legacy-slice-specify",
+            "session_id": "legacy-session-14f2cfcffd20aaa544632c5a",
+            "workflow": "spec-preparation",
+            "stage_id": "specify",
+            "stage_cursor": "specify",
+            "capability_id": "483009ba-c93e-448a-adc0-f4de8c2dbff1",
+            "capability_epoch": "300df9cb-2a21-4a1e-82fe-41a2e396c735",
+            "slot_id": "analyst",
+            "task_id": "task-9ad6b8913614dda7d9982a2d1fc6f65d",
+            "dispatch_id": "0e0aaba9-00f5-4772-b5e4-222500043315",
+            "attempt": 1,
+            "worker_id": "analyst"
+          },
+          "outcome": "pending",
+          "terminal_signal": null,
+          "artifact_refs": [],
+          "evidence_ref": "evidence/0e0aaba9-00f5-4772-b5e4-222500043315",
+          "conflict_ref": null,
+          "completed_by": "engine_task_caller",
+          "emitted_at": "2026-09-08T12:17:02.877Z"
+        }
+      }
+    ],
+    "pending": [
+      {
+        "identity": {
+          "run_id": "spec-e90cc263-f80f-4c1d-8922-de9918bc62e3",
+          "wave_id": "legacy-wave-14f2cfcffd20aaa544632c5a",
+          "slice_id": "legacy-slice-specify",
+          "session_id": "legacy-session-14f2cfcffd20aaa544632c5a",
+          "workflow": "spec-preparation",
+          "stage_id": "specify",
+          "stage_cursor": "specify",
+          "capability_id": "483009ba-c93e-448a-adc0-f4de8c2dbff1",
+          "capability_epoch": "300df9cb-2a21-4a1e-82fe-41a2e396c735",
+          "slot_id": "analyst",
+          "task_id": "task-9ad6b8913614dda7d9982a2d1fc6f65d",
+          "dispatch_id": "0e0aaba9-00f5-4772-b5e4-222500043315",
+          "attempt": 1,
+          "worker_id": "analyst"
+        },
+        "status": "authorized",
+        "retry_of": null,
+        "updated_at": "2026-09-08T12:17:02.877Z"
+      }
+    ]
+  },
+  "completion_envelope": {
+    "schema_version": 1,
+    "identity": {
+      "run_id": "spec-e90cc263-f80f-4c1d-8922-de9918bc62e3",
+      "wave_id": "legacy-wave-14f2cfcffd20aaa544632c5a",
+      "slice_id": "legacy-slice-specify",
+      "session_id": "legacy-session-14f2cfcffd20aaa544632c5a",
+      "workflow": "spec-preparation",
+      "stage_id": "specify",
+      "stage_cursor": "specify",
+      "capability_id": "483009ba-c93e-448a-adc0-f4de8c2dbff1",
+      "capability_epoch": "300df9cb-2a21-4a1e-82fe-41a2e396c735",
+      "slot_id": "analyst",
+      "task_id": "task-9ad6b8913614dda7d9982a2d1fc6f65d",
+      "dispatch_id": "0e0aaba9-00f5-4772-b5e4-222500043315",
+      "attempt": 1,
+      "worker_id": "analyst"
+    },
+    "outcome": "pending",
+    "terminal_signal": null,
+    "artifact_refs": [],
+    "evidence_ref": "evidence/0e0aaba9-00f5-4772-b5e4-222500043315",
+    "conflict_ref": null,
+    "completed_by": "engine_task_caller",
+    "emitted_at": "2026-09-08T12:17:02.877Z"
+  }
+}

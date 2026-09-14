@@ -1,5 +1,5 @@
-import { createReadStream } from "node:fs";
-import { access, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { constants, createReadStream } from "node:fs";
+import { access, lstat, mkdtemp, open, rm, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -93,6 +93,46 @@ class TempAudio implements EphemeralAudio {
   }
 }
 
+async function readBoundedTempHeader(
+  outputPath: string,
+  expectedSize: number,
+  maxBytes: number,
+): Promise<Uint8Array | undefined> {
+  const noFollow = constants.O_NOFOLLOW;
+  if (!Number.isInteger(noFollow)) {
+    throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio output cannot be opened safely", { provider: "authorized-audio", retryable: false });
+  }
+  let headerFile: FileHandle | undefined;
+  try {
+    headerFile = await open(outputPath, constants.O_RDONLY | noFollow);
+    const opened = await headerFile.stat();
+    if (!opened.isFile() || opened.size !== expectedSize || !Number.isSafeInteger(opened.size) || opened.size < 0 || opened.size > maxBytes) {
+      throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio output changed before header inspection", { provider: "authorized-audio", retryable: false });
+    }
+    const openedPath = await lstat(outputPath);
+    if (!openedPath.isFile() || openedPath.dev !== opened.dev || openedPath.ino !== opened.ino) {
+      throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio output changed before header inspection", { provider: "authorized-audio", retryable: false });
+    }
+    if (expectedSize < 44) return undefined;
+    const header = new Uint8Array(Math.min(expectedSize, 128));
+    let offset = 0;
+    while (offset < header.byteLength) {
+      const { bytesRead } = await headerFile.read(header, offset, header.byteLength - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    const final = await headerFile.stat();
+    const finalPath = await lstat(outputPath);
+    if (!final.isFile() || final.dev !== opened.dev || final.ino !== opened.ino || final.size !== expectedSize
+      || !finalPath.isFile() || finalPath.dev !== final.dev || finalPath.ino !== final.ino) {
+      throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio output changed during header inspection", { provider: "authorized-audio", retryable: false });
+    }
+    return offset >= 44 ? header.subarray(0, offset) : undefined;
+  } finally {
+    await headerFile?.close().catch(() => undefined);
+  }
+}
+
 async function writeStreamToTemp(
   source: AsyncIterable<Uint8Array>,
   options: { directory: string; maxBytes: number; signal: AbortSignal },
@@ -117,7 +157,7 @@ async function writeStreamToTemp(
       await writable.write(bytes);
     }
     await writable.finish();
-    const header = total >= 44 ? await readFile(outputPath, { encoding: null }).then((value) => new Uint8Array(value.buffer, value.byteOffset, Math.min(value.byteLength, 128))) : undefined;
+    const header = total >= 44 ? await readBoundedTempHeader(outputPath, total, options.maxBytes) : undefined;
     return { path: outputPath, directory, sizeBytes: total, durationSeconds: header ? parseWavDuration(header) : undefined };
   } catch (error) {
     if (ownedSource) await ownedSource.dispose().catch(() => undefined);
@@ -131,16 +171,57 @@ async function writeStreamToTemp(
 }
 
 async function copyFileToTemp(path: string, options: { directory: string; maxBytes: number; signal: AbortSignal; readStreamFactory?: typeof createReadStream }): Promise<{ path: string; directory: string; sizeBytes: number; durationSeconds?: number }> {
-  let details;
+  const noFollow = constants.O_NOFOLLOW;
+  const nonBlock = constants.O_NONBLOCK;
+  if (!Number.isInteger(noFollow) || !Number.isInteger(nonBlock)) {
+    throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio input cannot be opened safely", { provider: "authorized-audio", retryable: false });
+  }
+  let file: FileHandle;
   try {
-    details = await stat(path);
+    file = await open(path, constants.O_RDONLY | noFollow | nonBlock);
   } catch {
     throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio input is unavailable", { provider: "authorized-audio", retryable: false });
   }
-  if (!details.isFile()) throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio input is unavailable", { provider: "authorized-audio", retryable: false });
-  if (details.size > options.maxBytes) throw new AcquisitionProviderError("LIMIT_EXCEEDED", "Authorized audio exceeds the configured size limit", { provider: "authorized-audio", retryable: false });
-  const streamFactory = options.readStreamFactory ?? createReadStream;
-  return writeStreamToTemp(streamFactory(path, { signal: options.signal }) as AsyncIterable<Uint8Array>, options);
+  let streamFile: FileHandle | undefined;
+  let result: { path: string; directory: string; sizeBytes: number; durationSeconds?: number } | undefined;
+  let reading = false;
+  try {
+    const before = await file.stat();
+    if (!before.isFile()) throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio input is not a regular file", { provider: "authorized-audio", retryable: false });
+    if (!Number.isSafeInteger(before.size) || before.size < 0 || before.size > options.maxBytes) {
+      throw new AcquisitionProviderError("LIMIT_EXCEEDED", "Authorized audio exceeds the configured size limit", { provider: "authorized-audio", retryable: false });
+    }
+    const initialPath = await lstat(path);
+    if (!initialPath.isFile() || initialPath.dev !== before.dev || initialPath.ino !== before.ino) {
+      throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio input changed while opening", { provider: "authorized-audio", retryable: false });
+    }
+    streamFile = await open(path, constants.O_RDONLY | noFollow | nonBlock);
+    const streamIdentity = await streamFile.stat();
+    if (!streamIdentity.isFile() || streamIdentity.dev !== before.dev || streamIdentity.ino !== before.ino) {
+      throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio input changed while opening", { provider: "authorized-audio", retryable: false });
+    }
+    const streamFactory = options.readStreamFactory ?? createReadStream;
+    const stream = streamFactory(path, { fd: streamFile.fd, autoClose: true, signal: options.signal }) as AsyncIterable<Uint8Array>;
+    reading = true;
+    result = await writeStreamToTemp(stream, options);
+    reading = false;
+    const after = await file.stat();
+    const finalPath = await lstat(path);
+    if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs
+      || !finalPath.isFile() || finalPath.dev !== after.dev || finalPath.ino !== after.ino) {
+      throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio input changed during the bounded read", { provider: "authorized-audio", retryable: false });
+    }
+    return result;
+  } catch (error) {
+    if (result) await rm(result.directory, { recursive: true, force: true }).catch(() => undefined);
+    if (error instanceof AcquisitionProviderError) throw error;
+    if (options.signal.aborted) throw new AcquisitionProviderError("PROVIDER_TIMEOUT", "Audio acquisition deadline exceeded", { provider: "authorized-audio", retryable: false });
+    if (reading) throw error;
+    throw new AcquisitionProviderError("MEDIA_NOT_ACCESSIBLE", "Authorized audio input could not be read safely", { provider: "authorized-audio", retryable: false });
+  } finally {
+    await streamFile?.close().catch(() => undefined);
+    await file.close().catch(() => undefined);
+  }
 }
 
 async function waitForChild(child: ChildProcess, signal: AbortSignal, termination: ChildTerminationOwner): Promise<void> {

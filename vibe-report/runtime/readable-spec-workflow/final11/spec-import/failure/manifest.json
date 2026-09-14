@@ -1,0 +1,44 @@
+{
+  "feature": "spec-import",
+  "suite": "packages/e2e/test/spec-import.test.ts",
+  "command": "OMP_UX_E2E_SEMANTIC_TIMEOUT_MS=900000 OMP_UX_E2E_PRESERVE_ON_FAILURE=1 node --test --test-concurrency=1 --import tsx test/spec-import.test.ts",
+  "cwd": "packages/e2e",
+  "build_log": "vibe-report/runtime/readable-spec-workflow/final11/spec-import/build.log",
+  "runtime_log": "vibe-report/runtime/readable-spec-workflow/final11/spec-import/failure/spec-import-runtime.log",
+  "runtime_started_at": "2026-09-03T04:08:36Z",
+  "runtime_finished_at": "2026-09-03T04:15:37Z",
+  "duration_ms": 421399.844333,
+  "duration_real": "7m1.440s",
+  "exit_code": 1,
+  "tests": 19,
+  "passed": 18,
+  "failed": 1,
+  "cancelled": 0,
+  "skipped": 0,
+  "scratch_parent": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-immutability-WXWXvD",
+  "scratch_root": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/omp-spec-import-immutability-WXWXvD/omp-spec-e2e-immutability",
+  "failed_test": "T061 runtime: replay, approval, and dispatch attempts leave the recognized source byte-for-byte unchanged",
+  "assertion": {
+    "file": "packages/e2e/test/spec-import.test.ts",
+    "line": 1553,
+    "message": "the recognized complete bundle presents exactly one compatibility checkpoint",
+    "actual": 0,
+    "expected": 1
+  },
+  "preserved_state": "vibe-report/runtime/readable-spec-workflow/final11/spec-import/failure/state.json",
+  "preserved_compatibility_report": "vibe-report/runtime/readable-spec-workflow/final11/spec-import/failure/compatibility_report.json",
+  "preserved_import_snapshot": "vibe-report/runtime/readable-spec-workflow/final11/spec-import/failure/import_snapshot.json",
+  "preserved_transcript": "vibe-report/runtime/readable-spec-workflow/final11/spec-import/failure/transcript.jsonl",
+  "stop_log": "vibe-report/runtime/readable-spec-workflow/final11/spec-import/failure/stop.log",
+  "stop_result": "npm run e2e -- stop <scratch_parent> → ux-e2e stop: no session.json found — nothing to stop (session was already closed by test cleanup)",
+  "source_fingerprint": {
+    "status": "unsupported",
+    "blocking_codes": [
+      "SPEC_IMPORT_REQUIREMENTS_MISSING",
+      "SPEC_IMPORT_DECISIONS_MISSING"
+    ],
+    "handoff": null
+  },
+  "capture_note": "The first tee target was relative to packages/e2e and did not exist. The complete process output was recovered from the finished job result and recorded in runtime_log; no source or checklist files were modified.",
+  "verdict": "FAIL"
+}

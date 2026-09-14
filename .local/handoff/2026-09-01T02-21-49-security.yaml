@@ -1,0 +1,62 @@
+id: 2026-09-01T02-21-49-security
+parent: null
+agent: security
+timestamp: "2026-09-01T02:21:49Z"
+status: completed
+
+context:
+  task: "Implement T088-T090 legacy specification migration boundary"
+  phase: "09"
+
+output:
+  summary: "Implemented the explicit T086 legacy migration API, secure bounded source reader, immutable unapproved phase materialization, readable migration receipt, idempotent replay, current-run resume, wrapper delegation, public exports, and T088-T090 manifests."
+  assessment_scope: "Implementation only; no dependency or vulnerability audit was requested or run."
+  vulnerabilities:
+    critical: null
+    high: null
+    medium: null
+    low: null
+  cargo_deny:
+    status: not_run
+    advisories: null
+    license_issues: null
+    note: "Dependency audit is outside this TypeScript slice and validation is owned by Main."
+  dependencies:
+    outdated: null
+    unmaintained: null
+    actions: []
+  unsafe_blocks:
+    total: 0
+    reviewed: 0
+    approved: 0
+    needs_refactor: 0
+  security_controls:
+    - "Legacy source path must remain lexically and physically inside the real project root."
+    - "Every source path component is lstat-checked and symlinks are rejected."
+    - "Final source open uses O_RDONLY | O_NOFOLLOW with a 4 MiB bound and before/after fstat identity checks."
+    - "Malformed, ambiguous, incompatible, missing-binding, and replay-mismatch inputs fail closed without writing source bytes."
+    - "Legacy completion cannot create validation, approval, checkpoint, handoff, claim, or conformance authority."
+  files:
+    created:
+      - packages/core/src/specification/migration.ts
+      - .work-state/artifacts/sdd-evolution/T088.json
+      - .work-state/artifacts/sdd-evolution/T089.json
+      - .work-state/artifacts/sdd-evolution/T090.json
+    modified:
+      - packages/core/src/engine/state.ts
+      - packages/core/src/specification/workspace.ts
+      - packages/core/src/specification/materialize.ts
+      - packages/core/src/index.ts
+  validation:
+    performed: false
+    reason: "Assignment explicitly says no validation; Main owns the single combined validation run after concurrent slices land."
+  issues: []
+
+next:
+  agent: rust-code-reviewer
+  task: "Review T088-T090 against T086 and run combined validation only after all concurrent slices land."
+  priority: high
+  acceptance_criteria:
+    - "T086 compatible, incompatible, branch-derived, missing-binding, current resume, and idempotent replay contracts pass."
+    - "T087 runtime materialization and resume assertions pass."
+    - "Blocked sources remain byte-identical and symlink/path/bounds cases fail closed."

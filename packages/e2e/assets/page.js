@@ -1,8 +1,9 @@
 /**
  * ux-e2e terminal page — plain script (no build step).
  *
- * Wire a local xterm instance to the session WebSocket:
- *   - token comes from ?token= (single-use, minted by the server);
+ *   - browser bootstrap code comes from ?code= and is exchanged by the
+ *     server for an HttpOnly session cookie; programmatic clients may use
+ *     the internal ?token= URL;
  *   - outbound: {t:'i',d} keystrokes, {t:'r',cols,rows} resizes;
  *   - inbound:  {t:'o',d} output, {t:'exit',code} process exit,
  *               {t:'err',code,message} session errors, {t:'s',ok} ack.
@@ -33,9 +34,13 @@
 
   var params = new URLSearchParams(window.location.search);
   var token = params.get('token');
-  if (!token) {
-    fatal('missing ?token= — open the URL printed by `ux-e2e start`');
-    return;
+  var bootstrapCode = params.get('code');
+  if (bootstrapCode) {
+    // The server consumes the one-time code on the HTML request and sets an
+    // HttpOnly cookie. Remove it from the visible URL before any navigation
+    // or copy/paste can preserve a replayable credential.
+    window.history.replaceState(null, '', window.location.pathname);
+    token = null;
   }
 
   var term = new Terminal({
@@ -52,58 +57,80 @@
   window.__uxTerm = term;
 
   var proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  var ws = new WebSocket(
-    proto + '//' + window.location.host + '/ws?token=' + encodeURIComponent(token)
-  );
+  var ws = null;
 
-  // Gate the Enter button until the WS is open so a click before auth-ack
-  // never produces a half-press that the PTY rejects.
-  if (enterBtn) enterBtn.disabled = true;
+  function attachSocket(wsPath) {
+    var wsUrl = proto + '//' + window.location.host + wsPath
+      + (token ? '?token=' + encodeURIComponent(token) : '');
+    ws = new WebSocket(wsUrl);
 
-  ws.addEventListener('open', function () {
-    setStatus('connected');
-    if (enterBtn) enterBtn.disabled = false;
-    term.focus();
-  });
+    ws.addEventListener('open', function () {
+      setStatus('connected');
+      if (enterBtn) enterBtn.disabled = false;
+      term.focus();
+    });
 
-  ws.addEventListener('message', function (ev) {
-    var msg;
-    try {
-      msg = JSON.parse(ev.data);
-    } catch (e) {
+    ws.addEventListener('message', function (ev) {
+      var msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch (e) {
+        return;
+      }
+      if (msg.t === 'o') {
+        term.write(msg.d);
+      } else if (msg.t === 'exit') {
+        term.write('\r\n\x1b[33m[process exited code=' + msg.code + ']\x1b[0m\r\n');
+        setStatus('process exited code=' + msg.code);
+        if (enterBtn) enterBtn.disabled = true;
+        ws.close();
+      } else if (msg.t === 'err') {
+        term.write('\r\n\x1b[31m[error ' + msg.code + (msg.message ? ': ' + msg.message : '') + ']\x1b[0m\r\n');
+        setStatus('error ' + msg.code);
+      } else if (msg.t === 's') {
+        // {t:'s', ok:true} — auth ack, nothing to render.
+      }
+    });
+
+    ws.addEventListener('close', function () {
+      term.write('\r\n\x1b[90m[connection closed]\x1b[0m\r\n');
+      setStatus('disconnected');
+      if (enterBtn) enterBtn.disabled = true;
+    });
+
+    ws.addEventListener('error', function () {
+      term.write('\r\n\x1b[31m[connection error]\x1b[0m\r\n');
+      setStatus('connection error');
+    });
+  }
+
+  function connectSocket() {
+    if (token) {
+      attachSocket('/ws');
       return;
     }
-    if (msg.t === 'o') {
-      term.write(msg.d);
-    } else if (msg.t === 'exit') {
-      term.write('\r\n\x1b[33m[process exited code=' + msg.code + ']\x1b[0m\r\n');
-      setStatus('process exited code=' + msg.code);
-      if (enterBtn) enterBtn.disabled = true;
-      ws.close();
-    } else if (msg.t === 'err') {
-      term.write('\r\n\x1b[31m[error ' + msg.code + (msg.message ? ': ' + msg.message : '') + ']\x1b[0m\r\n');
-      setStatus('error ' + msg.code);
-    } else if (msg.t === 's') {
-      // {t:'s', ok:true} — auth ack, nothing to render.
-    }
-  });
-
-  ws.addEventListener('close', function () {
-    term.write('\r\n\x1b[90m[connection closed]\x1b[0m\r\n');
-    setStatus('disconnected');
-    if (enterBtn) enterBtn.disabled = true;
-  });
-
-  ws.addEventListener('error', function () {
-    term.write('\r\n\x1b[31m[connection error]\x1b[0m\r\n');
-    setStatus('connection error');
-  });
+    fetch('/session', { credentials: 'same-origin', cache: 'no-store' })
+      .then(function (response) {
+        if (!response.ok) throw new Error('browser session is not authenticated');
+        return response.json();
+      })
+      .then(function (descriptor) {
+        if (!descriptor || typeof descriptor.ws_path !== 'string' || descriptor.ws_path !== '/ws') {
+          throw new Error('browser session descriptor is invalid');
+        }
+        attachSocket(descriptor.ws_path);
+      })
+      .catch(function (error) {
+        fatal(error instanceof Error ? error.message : 'browser session is not authenticated');
+      });
+  }
 
   term.onData(function (data) {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws !== null && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ t: 'i', d: data }));
     }
   });
+  connectSocket();
 
   function sendResize() {
     try {
@@ -111,7 +138,7 @@
     } catch (e) {
       return;
     }
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws !== null && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ t: 'r', cols: term.cols, rows: term.rows }));
     }
   }
@@ -141,7 +168,7 @@
   // ----------------------------------------------------------------
 
   function pressEnter() {
-    if (ws.readyState !== WebSocket.OPEN) return Promise.resolve(false);
+    if (ws === null || ws.readyState !== WebSocket.OPEN) return Promise.resolve(false);
 
     // Primary: dispatch a real-looking Enter on the xterm textarea.
     // xterm's CoreBrowserTerminal listens on its own textarea, which
@@ -171,7 +198,6 @@
       } catch (e) {
         // dispatchEvent can throw on a detached element; fall through
         // to the timeout-based fallback below.
-        sawCarriageReturn = true; // skip the fallback so we don't double-send
       }
 
       // Wait briefly for xterm to forward the keypress through onData.
@@ -211,7 +237,7 @@
    * NOT append Enter; use `__pressEnter()` for that.
    */
   function typeText(text) {
-    if (ws.readyState !== WebSocket.OPEN) return false;
+    if (ws === null || ws.readyState !== WebSocket.OPEN) return false;
     try {
       ws.send(JSON.stringify({ t: 'i', d: text }));
       return true;

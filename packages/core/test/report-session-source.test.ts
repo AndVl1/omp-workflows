@@ -1,9 +1,9 @@
 /**
  * Session-source discovery (visualize architecture-2): deterministic, safe
- * discovery for feature / legacy / CTO JSON / CTO markdown-state and
- * run-local artifact locations — with report-preserving exact selectors, a
- * visualization-only terminal-markdown projection, excluded inputs, and
- * feature/legacy/path-key collision handling without aliasing.
+ * discovery for feature / legacy / canonical CTO JSON state
+ * and run-local artifact locations — with report-preserving exact selectors,
+ * excluded inputs, and feature/legacy/path-key collision handling without
+ * aliasing.
  *
  * Report parity is asserted against buildSessionReport: the public report
  * behavior must remain unchanged after the assemble.ts delegation.
@@ -11,6 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { MAX_CTO_SPECIFICATION_TEXT_BYTES } from "../src/cto/types.js";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,7 +27,6 @@ import {
   resolveDoWorkSource,
 } from "../src/report/session-source.js";
 import { buildSessionReport } from "../src/report/assemble.js";
-import { markdownCtoState } from "../src/commands/cto.js";
 import type { TeamState } from "../src/engine/types.js";
 import type { CtoState } from "../src/cto/types.js";
 
@@ -115,6 +115,114 @@ test("session-source: exact feature id resolves; unknown and unsafe ids are null
     assert.equal(resolveDoWorkSource(cwd, ".."), null, "parent-segment id → null");
     assert.equal(resolveDoWorkSource(cwd, "."), null, "self-segment id → null");
     assert.equal(resolveDoWorkSource(cwd, "a\\b"), null, "backslash-shaped id never resolves (rejected or absent)");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("session-source: TeamState stage/status fields are strict and bounded", () => {
+  const cwd = tmpWorkspace();
+  try {
+    writeFeature(cwd, "oversized", makeTeamState({ task: "x".repeat(MAX_CTO_SPECIFICATION_TEXT_BYTES + 1) }));
+    assert.throws(
+      () => resolveDoWorkSource(cwd, "oversized"),
+      /state\.json has an invalid TeamState shape/,
+    );
+
+    writeFeature(
+      cwd,
+      "bad-status",
+      makeTeamState({ stages: [{ id: "implementation", status: "parked" as never }] }),
+    );
+    assert.throws(
+      () => resolveDoWorkSource(cwd, "bad-status"),
+      /state\.json has an invalid TeamState shape/,
+    );
+
+    writeFeature(
+      cwd,
+      "bad-details",
+      makeTeamState({
+        stages: [{ id: "implementation", status: "in_progress", details: "x".repeat(16 * 1024 + 1) } as never],
+      }),
+    );
+    assert.throws(
+      () => resolveDoWorkSource(cwd, "bad-details"),
+      /state\.json has an invalid TeamState shape/,
+    );
+
+    const artifacts = Object.fromEntries(
+      Array.from({ length: 80 }, (_, index) => [`artifact-${index}`, "x".repeat(4096)]),
+    );
+    writeFeature(cwd, "aggregate", makeTeamState({ artifacts }));
+    assert.throws(
+      () => resolveDoWorkSource(cwd, "aggregate"),
+      /state\.json has an invalid TeamState shape/,
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("session-source: TeamState graph bounds reject wide, empty-value, and deep states before report/discovery retention", () => {
+  const cwd = tmpWorkspace();
+  try {
+    const base = makeTeamState();
+    const baseKeyCount = Object.keys(base).length;
+    const maxExtras = 256 - baseKeyCount;
+    const maxState = makeTeamState(
+      Object.fromEntries(Array.from({ length: maxExtras }, (_, index) => [`extra-${index}`, ""])) as never,
+    );
+    writeFeature(cwd, "max-keys", maxState);
+    assert.doesNotThrow(() => resolveDoWorkSource(cwd, "max-keys"), "the exact top-level key cap is inclusive");
+
+    const tooManyKeys = makeTeamState(
+      Object.fromEntries(Array.from({ length: maxExtras + 1 }, (_, index) => [`extra-${index}`, ""])) as never,
+    );
+    writeFeature(cwd, "too-many-keys", tooManyKeys);
+    assert.throws(
+      () => resolveDoWorkSource(cwd, "too-many-keys"),
+      /state\.json has an invalid TeamState shape/,
+      "one key over the exact top-level cap is rejected",
+    );
+    assert.throws(
+      () => buildSessionReport(cwd, { kind: "do-work", id: "too-many-keys" }),
+      /do-work session "too-many-keys" not found|invalid TeamState shape/,
+      "an over-wide state never builds a report",
+    );
+    const tooManyEntry = listDoWorkSources(cwd).find((entry) => entry.id === "too-many-keys");
+    assert.equal(tooManyEntry?.status, "error", "an over-wide state is category-only during discovery");
+    assert.equal(tooManyEntry?.state, null);
+
+    const emptyValueFields = Object.fromEntries(
+      Array.from({ length: 512 }, (_, index) => [`empty-${index}`, ""]),
+    );
+    writeFeature(cwd, "many-empty-values", makeTeamState({ extras: emptyValueFields } as never));
+    assert.throws(
+      () => resolveDoWorkSource(cwd, "many-empty-values"),
+      /state\.json has an invalid TeamState shape/,
+      "many empty values still consume the bounded object-key budget",
+    );
+    const emptyValueEntry = listDoWorkSources(cwd).find((entry) => entry.id === "many-empty-values");
+    assert.equal(emptyValueEntry?.status, "error");
+    assert.equal(emptyValueEntry?.state, null);
+
+    let deep: unknown = "leaf";
+    for (let index = 0; index < 32; index += 1) deep = { next: deep };
+    writeFeature(cwd, "deep", makeTeamState({ nested: deep } as never));
+    assert.throws(
+      () => resolveDoWorkSource(cwd, "deep"),
+      /state\.json has an invalid TeamState shape/,
+      "deep JSON is rejected without recursive stack growth",
+    );
+    assert.throws(
+      () => buildSessionReport(cwd, { kind: "do-work", id: "deep" }),
+      /do-work session "deep" not found|invalid TeamState shape/,
+      "deep JSON never builds a report",
+    );
+    const deepEntry = listDoWorkSources(cwd).find((entry) => entry.id === "deep");
+    assert.equal(deepEntry?.status, "error", "deep JSON is category-only during discovery");
+    assert.equal(deepEntry?.state, null);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -276,103 +384,47 @@ test("session-source: cto JSON resolution; corrupt state.json is an error entry 
   }
 });
 
-// ── Markdown-state CTO: active vs terminal ──────────────────────────────────
+// ── Canonical CTO state: markdown-only directories are inactive ─────────────
 
-test("session-source: active markdown run resolves; terminal markdown run is a degraded projection invisible to the report", () => {
+test("session-source: markdown-only CTO runs are inactive, non-discoverable, and require migration", () => {
   const cwd = tmpWorkspace();
   try {
-    // Active agent-written run: no state.json, no finish marker.
-    const activeDir = join(cwd, ".work-state", "cto", "md-run");
-    mkdirSync(activeDir, { recursive: true });
-    writeFileSync(join(activeDir, "cto_discovery.md"), "# CTO Discovery\nsummary of scope\n");
-    writeFileSync(join(activeDir, "team-plan.md"), "# Team Plan\n- team: alpha — API slice\n");
+    for (const [id, files] of [
+      ["active-markdown", { "cto_discovery.md": "# CTO Discovery\n", "team-plan.md": "# Team Plan\n" }],
+      ["terminal-markdown", { "cto_discovery.md": "# CTO Discovery\n", "summary.md": "# Summary\ndone\n" }],
+    ] as const) {
+      const runDir = join(cwd, ".work-state", "cto", id);
+      mkdirSync(runDir, { recursive: true });
+      for (const [name, content] of Object.entries(files)) writeFileSync(join(runDir, name), content);
+      assert.equal(resolveCtoSource(cwd, id), null, `${id} has no canonical state.json`);
+      assert.throws(
+        () => buildSessionReport(cwd, { kind: "cto", id }),
+        new RegExp(`cto session "${id}" not found \\(no state\\.json and no markdown fallback\\)`),
+      );
+    }
 
-    const active = resolveCtoSource(cwd, "md-run");
-    assert.ok(active);
-    assert.equal(active.format, "markdown");
-    assert.equal(active.status, "ok");
-    assert.equal(active.statePath, null, "markdown runs have no canonical state path");
-    assert.equal(active.state?.id, "md-run");
-    assert.equal(markdownCtoState("md-run", activeDir)?.id, "md-run", "markdownCtoState unchanged");
-
-    // Report parity: markdown fallback still produces a report.
-    const report = buildSessionReport(cwd, { kind: "cto", id: "md-run" });
-    assert.equal(report.source.format, "markdown");
-    assert.equal(report.source.statePath, null);
-
-    // Terminal agent-written run: a summary marker finishes it.
-    const termDir = join(cwd, ".work-state", "cto", "term-run");
-    mkdirSync(termDir, { recursive: true });
-    writeFileSync(join(termDir, "cto_discovery.md"), "# CTO Discovery\n");
-    writeFileSync(join(termDir, "summary.md"), "# Summary\ndone\n");
-
-    assert.equal(markdownCtoState("term-run", termDir), null, "markdownCtoState returns null for terminal runs (unchanged)");
-    assert.equal(resolveCtoSource(cwd, "term-run"), null, "terminal run invisible to report resolution");
-    assert.throws(() => buildSessionReport(cwd, { kind: "cto", id: "term-run" }), /cto session "term-run" not found/);
-
-    // Visualization-only projection: discoverable as degraded, never remapped.
-    const term = listCtoSources(cwd).find((e) => e.id === "term-run");
-    assert.ok(term, "terminal run is enumerated for the projection");
-    assert.equal(term.status, "degraded");
-    assert.equal(term.terminalMarkdown, true);
-    assert.equal(term.format, "markdown");
-    assert.equal(term.state, null);
-    assert.ok(term.updatedAt, "terminal projection keeps a deterministic updated_at");
-    assert.match(term.error ?? "", /terminal markdown run/);
+    assert.deepEqual(listCtoSources(cwd), [], "Markdown-only runs are not enumerated as CTO sessions");
+    assert.deepEqual(listSessions(cwd), [], "Markdown-only runs are not discoverable in the all-sessions view");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
 
-test("session-source: latest cto ignores terminal markdown runs entirely (report unchanged)", () => {
+test("session-source: canonical CTO ids stay exact; traversal-shaped selectors are rejected", () => {
   const cwd = tmpWorkspace();
   try {
-    const termDir = join(cwd, ".work-state", "cto", "term-only");
-    mkdirSync(termDir, { recursive: true });
-    writeFileSync(join(termDir, "cto_discovery.md"), "# CTO Discovery\n");
-    writeFileSync(join(termDir, "integration_review.md"), "# Review\n");
-
-    assert.equal(resolveCtoSource(cwd), null, "no active run → null latest");
-    assert.throws(() => buildSessionReport(cwd, { kind: "cto" }), /cto session "latest" not found/);
-    assert.equal(listCtoSources(cwd).length, 1, "projection still lists the terminal run");
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-test("session-source: exotic cto run ids — active markdown runs resolve verbatim; traversal-shaped selectors rejected", () => {
-  const cwd = tmpWorkspace();
-  try {
-    // Agent-written markdown run with a space in its name: previously
-    // resolvable via the markdown fallback (markdownCtoState has no slug
-    // contract); the safe-segment guard made it undiscoverable.
-    const mdRunDir = join(cwd, ".work-state", "cto", "md run with space");
-    mkdirSync(mdRunDir, { recursive: true });
-    writeFileSync(join(mdRunDir, "cto_discovery.md"), "# CTO Discovery\n");
-    writeFileSync(join(mdRunDir, "team-plan.md"), "# Team Plan\n");
-
-    const mdRun = resolveCtoSource(cwd, "md run with space");
-    assert.ok(mdRun);
-    assert.equal(mdRun.id, "md run with space");
-    assert.equal(mdRun.format, "markdown");
-    assert.equal(mdRun.status, "ok");
-
-    // Report parity: /session-report cto id=<exotic run id> still builds.
-    const report = buildSessionReport(cwd, { kind: "cto", id: "md run with space" });
-    assert.equal(report.source.id, "md run with space");
-    assert.equal(report.source.format, "markdown");
-
-    assert.equal(resolveCtoSource(cwd)?.id, "md run with space", "exotic markdown run can win latest");
-    assert.ok(listCtoSources(cwd).some((e) => e.id === "md run with space"));
-    assert.ok(listSessions(cwd).some((s) => s.kind === "cto" && s.id === "md run with space"));
-
-    // A JSON run with an exotic id stays invisible to the report: the
-    // canonical reader (readCtoState) requires ASCII ids by contract, so
-    // neither the exact probe nor the latest scan surfaces it — matching
-    // the pre-delegation report behavior exactly.
+    // Canonical reader rejects ids outside the engine's safe-id contract
+    // rather than aliasing them to another run.
     writeRun(cwd, makeCtoState({ id: "run with space", updated_at: "2026-08-08T11:00:00.000Z" }));
-    assert.equal(resolveCtoSource(cwd, "run with space"), null, "exotic JSON run stays invisible (canonical reader contract)");
-    assert.throws(() => buildSessionReport(cwd, { kind: "cto", id: "run with space" }), /cto session "run with space" not found/);
+    assert.equal(resolveCtoSource(cwd, "run with space"), null, "unsafe canonical id is not resolved");
+    assert.throws(
+      () => buildSessionReport(cwd, { kind: "cto", id: "run with space" }),
+      /cto session "run with space" not found/,
+    );
+    const unsafe = listCtoSources(cwd);
+    assert.equal(unsafe.length, 1);
+    assert.equal(unsafe[0]?.id, "run with space");
+    assert.equal(unsafe[0]?.status, "error", "unreadable unsafe canonical state is category-only");
 
     // Traversal-shaped selectors are rejected outright — never aliased.
     assert.equal(resolveCtoSource(cwd, "../escape"), null);

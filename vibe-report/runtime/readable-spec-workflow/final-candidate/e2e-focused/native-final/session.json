@@ -1,0 +1,152 @@
+{
+  "schema_version": 2,
+  "session_id": "kYHIafQ7y2mwVz_UffKZH1A0taHlk0EtKNBHPrVsDb4",
+  "control_nonce": "ondReq6HlbJFYj_t5_M4zkBnNKJHbbB3ddjXZXH0TPg",
+  "server_pid": 88324,
+  "server_start_identity": "0LLRgtC-0YDQvdC40LosICA4INGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMTQ6MTY6MTQ",
+  "server_start_nonce": "vJ_aDazNN2I73DGn-7MI9ELlAW-vH3UyzDCmS2OmEUA",
+  "slug": "readable-native-final",
+  "url": "http://127.0.0.1:49805/?token=mR1_ObvhwI92RRTg9_y9AFtKlV0XM0qu-k5bOmSdA24",
+  "browser_url": "http://127.0.0.1:49805/?code=ACM4CBRdShHZWZtbX8GVaxZUmudwM-wHJWpAJ_9gZEA",
+  "browser_bootstrap_consumed": false,
+  "browser_code_expires_at": "2026-09-08T11:17:15.391Z",
+  "token": "mR1_ObvhwI92RRTg9_y9AFtKlV0XM0qu-k5bOmSdA24",
+  "wsPath": "/ws",
+  "omp_version": "omp/18.0.6",
+  "pid": 88376,
+  "pgid": 88376,
+  "probe_pid": null,
+  "probe_pgid": null,
+  "probe_start_identity": null,
+  "pty_start_identity": "0LLRgtC-0YDQvdC40LosICA4INGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMTQ6MTY6MTY",
+  "spawn_error": null,
+  "started_at": "2026-09-08T11:16:15.394Z",
+  "status": "stopped",
+  "phase": "stopped",
+  "shutdown_error": null,
+  "pty_exit_observed": true,
+  "shutdown_completed_at": "2026-09-08T11:26:06.326Z",
+  "stopped_at": "2026-09-08T11:26:06.326Z",
+  "finished_at": "2026-09-08T11:26:06.326Z",
+  "profile": null,
+  "tty": {
+    "cols": 100,
+    "rows": 30,
+    "term": "xterm-256color"
+  },
+  "task_prompt": "Start a native readable specification for the request below. Use the explicit feature_id `readable-native` for every phase and preserve the engine-generated explicit run_key for every state/tool operation; never infer identity from .active-feature, a branch name, or the current directory.\n\nRequest: Add a deterministic project-local workflow profile override with explicit ownership\n\nThe repository intentionally has no Spec Kit or other external specification framework. Use the plugin-native constitution prerequisite, obtain the required human approval, and then run the explicit Constitution -> Specify -> Plan -> Tasks flow. The terminal commands are `/specify --feature readable-native <request>`, `/spec-plan --feature readable-native`, and `/spec-tasks --feature readable-native`; carry the same feature_id and run_key through each command and underlying tool call. Keep every phase content attributable to its declared worker dispatch. Stop after the final Tasks approval with the readable handoff ready for `/do-work --spec readable-native`.",
+  "scenario": {
+    "id": "spec-workflow",
+    "title": "Native readable specification: constitution -> Specify -> Plan -> Tasks",
+    "workspace": {
+      "path": "specs/readable-native",
+      "state_path": ".work-state/features/readable-native/state.json",
+      "documents": [
+        "specs/readable-native/status.md",
+        "specs/readable-native/spec.md",
+        "specs/readable-native/plan.md",
+        "specs/readable-native/tasks.md"
+      ],
+      "validation": [
+        "specs/readable-native/validation/specify.md",
+        "specs/readable-native/validation/plan.md",
+        "specs/readable-native/validation/tasks.md"
+      ],
+      "history": [
+        "specs/readable-native/history"
+      ],
+      "handoff": [
+        "specs/readable-native/handoff.md"
+      ],
+      "checkpoints": [
+        ".work-state/features/readable-native/state.json",
+        ".work-state/ux-e2e/transcript.jsonl",
+        ".work-state/ux-e2e/ask-state.jsonl"
+      ]
+    }
+  },
+  "surface": "web",
+  "host_config": {
+    "path": "/Users/a.vladislavov/.omp/agent/config.yml",
+    "warning": null
+  },
+  "omp_log_binding": null,
+  "user_config": {
+    "path": null,
+    "default_path": "/tmp/omp-ux-e2e-readable-native-final/.omp/ux-e2e-overlay.user.json"
+  },
+  "extension_isolation": {
+    "ambient_discovery_disabled": true,
+    "explicit_roots": "/tmp/omp-ux-e2e-readable-native-final/node_modules/@andvl1/omp-workflows-fullstack",
+    "home": "/tmp/omp-ux-e2e-readable-native-final/.work-state/ux-e2e/omp-home",
+    "agent_dir": "/tmp/omp-ux-e2e-readable-native-final/.work-state/ux-e2e/omp-home/.omp/agent"
+  },
+  "runtime_plugins": {
+    "schema_version": 1,
+    "extension_package": {
+      "name": "@andvl1/omp-workflows-fullstack",
+      "version": "0.27.0",
+      "package_path": "/tmp/omp-ux-e2e-readable-native-final/node_modules/@andvl1/omp-workflows-fullstack",
+      "realpath": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/fullstack",
+      "entrypoint": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/fullstack/dist/index.js"
+    },
+    "core_package": {
+      "name": "@andvl1/omp-workflows-core",
+      "version": "0.27.0",
+      "package_path": "/tmp/omp-ux-e2e-readable-native-final/node_modules/@andvl1/omp-workflows-core",
+      "realpath": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/core",
+      "entrypoint": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/core/dist/index.js"
+    },
+    "configured_extensions": [
+      "/tmp/omp-ux-e2e-readable-native-final/node_modules/@andvl1/omp-workflows-fullstack"
+    ],
+    "tool_names": [
+      "constitution_checkpoint_ask_selected",
+      "constitution_impact_apply",
+      "constitution_impact_ask_selected",
+      "constitution_impact_assess",
+      "cto_checkpoint_ask_selected",
+      "cto_close_specification_execution_wave",
+      "cto_confirm",
+      "cto_dispatch",
+      "cto_mapping_resume",
+      "cto_preflight",
+      "cto_prepare",
+      "cto_specification_advance",
+      "cto_specification_conformance",
+      "cto_specification_decide",
+      "cto_specification_prepare",
+      "cto_specification_review",
+      "decide_constitution_checkpoint",
+      "do_work_claim",
+      "ensure_project_constitution",
+      "lecture_acquire",
+      "present_constitution_draft",
+      "workflow_advance",
+      "workflow_begin",
+      "workflow_begin_phase_validation",
+      "workflow_checkpoint",
+      "workflow_checkpoint_ask_selected",
+      "workflow_complete",
+      "workflow_complete_specification_execution",
+      "workflow_dispatch_specification_phase",
+      "workflow_finalize_import_handoff",
+      "workflow_instructions",
+      "workflow_persist_specification_phase",
+      "workflow_prepare",
+      "workflow_specification_conformance",
+      "workflow_status",
+      "workflow_validate_phase"
+    ],
+    "duplicate_tool_names": []
+  },
+  "omp_log_snapshot": {
+    "relative_path": "omp-log.11d03710dcd3ae1d74f17ab027bf08cd1dd737c01a1a1a522935acbfa9d2def6.log",
+    "size": 15969,
+    "sha256": "11d03710dcd3ae1d74f17ab027bf08cd1dd737c01a1a1a522935acbfa9d2def6",
+    "source_dev": 16777234,
+    "source_ino": 102918119,
+    "generation": "vJ_aDazNN2I73DGn-7MI9ELlAW-vH3UyzDCmS2OmEUA",
+    "process_start": "0LLRgtC-0YDQvdC40LosICA4INGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMTQ6MTY6MTY"
+  }
+}

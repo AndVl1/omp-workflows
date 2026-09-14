@@ -1,0 +1,28 @@
+id: 2026-09-01T10-30-00-debug
+parent: null
+agent: debug
+timestamp: "2026-09-01T10:30:00Z"
+status: completed
+
+context:
+  task: "Canonicalize the local CTO classification runCto fixture after stricter TeamDef/plan validation."
+  phase: "validation-release"
+
+output:
+  changed_files:
+    - packages/core/test/cto-classification.test.ts
+  changes:
+    - "Kept the TeamDef fixture fully populated with canonical id, scope, profile, lead, and roster values."
+    - "Changed the target decomposition slice from the invalid spaced value to safe id fix-500."
+    - "Made target plan fields explicit: scope, profile, same_branch worktree, and empty depends_on array."
+    - "Preserved assertions that persisted classification.autonomous overrides the contradictory legacy autonomous flag and survives reload."
+  verification:
+    - "Read back the edited target test fixture; no commands were run per assignment."
+
+next:
+  agent: null
+  task: "Main should run the assigned focused/full validation suite."
+  priority: high
+  acceptance_criteria:
+    - "cto-class runCto persistence test returns ok with canonical plan input."
+    - "Persisted classification.autonomous remains the authority for autonomy."

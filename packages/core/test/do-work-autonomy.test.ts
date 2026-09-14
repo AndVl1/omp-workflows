@@ -10,19 +10,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, renameSync, rmSync, symlinkSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
 import { resolveConfig } from "../src/engine/config.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
-import { appendCheckpointDecision, checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
+import { appendCheckpointDecision, checkpointPolicyHash, issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, registerTrustedCheckpointHostBridge } from "../src/engine/checkpoints.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
-import { registerTeamWorkflow } from "../src/index.js";
-import { resolveState, writeState } from "../src/engine/state.js";
+import { registerTestTeamWorkflow } from "./fixtures/registry-activation.js";
+import { resolveState, setStateTransactionTestHooks, writeState } from "../src/engine/state.js";
+import { createFeatureWorkspace } from "../src/specification/workspace.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
+import { prepareWorkflowState as prepareWorkflowStateSource, resolveClassification as resolveClassificationSource } from "../src/engine/run.js";
 
 import {
   parseWorkEnvelope,
@@ -44,8 +47,9 @@ function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
 }
 
-const trustedIntakeRoles = { analyst: "analyst", "tech-researcher": "tech-researcher" } as const;
-
+const trustedIntakeRoles = { "specification-analyst": "specification-worker", "tech-researcher": "tech-researcher" } as const;
+const TEST_CHECKPOINT_BRIDGE = Object.freeze({});
+registerTrustedCheckpointHostBridge(TEST_CHECKPOINT_BRIDGE);
 /** Publish a trusted live agent mapping covering the spec-preparation intake pool. */
 function publishMapping(root: string): void {
   mkdirSync(join(root, ".omp"), { recursive: true });
@@ -56,6 +60,15 @@ function publishMapping(root: string): void {
     availableAgents: Object.values(trustedIntakeRoles),
     extraRoles: config.scope_map.map((entry) => entry.dev_agent),
     genericFallbackRoles: Object.keys(trustedIntakeRoles),
+    source: "do-work-autonomy-test",
+    scope_map: config.scope_map,
+    flags: config.flags,
+    roster: config.roster_overrides,
+    config_path: config.config_path,
+    config_source: config.config_source,
+    config_hash: config.config_hash,
+    config_version: config.config_version,
+    config_provenance: config.config_provenance,
   });
   writeAgentMapping(root, mapping);
 }
@@ -70,14 +83,40 @@ function recordTypedCheckpoint(root: string, stageId: string, checkpointId: stri
   const rule = policy.rules[checkpointId];
   assert.ok(rule, `checkpoint fixture must define ${checkpointId}`);
   const runId = state.work_identity?.run_id ?? state.run_key ?? state.branch;
-  const trusted = recordTrustedCheckpointAnswer(state, {
-    answer_id: `do-work/${stageId}/${checkpointId}`,
-    channel: "terminal",
-    reference: `terminal-answer/do-work/${stageId}/${checkpointId}`,
-    stage_id: stageId,
-    checkpoint_id: checkpointId,
-    decision: "proceed",
-  });
+  const answerId = `do-work/${stageId}/${checkpointId}`;
+  const reference = `terminal-answer/do-work/${stageId}/${checkpointId}`;
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  assert.ok(pinnedRoot, "checkpoint fixture root must pin");
+  if (!pinnedRoot) return;
+  if (!state.profile_hash) {
+    pinnedRoot.close();
+    return;
+  }
+  try {
+    const rootIdentity = { canonical_root: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino };
+    const capabilityAnswer = issueTrustedCheckpointAnswerCapability(TEST_CHECKPOINT_BRIDGE, {
+      root: rootIdentity,
+      state,
+      answer_id: answerId,
+      channel: "terminal",
+      reference,
+      stage_id: stageId,
+      checkpoint_id: checkpointId,
+      decision: "proceed",
+      question: "Authorize the fixture checkpoint",
+      options: ["proceed"],
+      session_id: "do-work-autonomy-test-session",
+      actor_ref: reference,
+      profile_hash: state.profile_hash,
+    });
+    const trusted = recordTrustedCheckpointAnswer(state, {
+      answer_id: answerId,
+      channel: "terminal",
+      reference,
+      stage_id: stageId,
+      checkpoint_id: checkpointId,
+      decision: "proceed",
+    }, { capability: capabilityAnswer, root: rootIdentity });
   const typed = {
     run_id: runId,
     stage_id: stageId,
@@ -92,7 +131,10 @@ function recordTypedCheckpoint(root: string, stageId: string, checkpointId: stri
     rationale: "explicit typed fixture answer",
     decided_at: new Date().toISOString(),
   };
-  writeState(root, appendCheckpointDecision(trusted.state, typed), { target: resolved });
+    writeState(root, appendCheckpointDecision(trusted.state, typed), { target: resolved });
+  } finally {
+    pinnedRoot.close();
+  }
 }
 test("do-work: matching-branch state prompt is resumable", () => {
   const root = mkdtempSync(join(tmpdir(), "do-work-resume-match-"));
@@ -144,14 +186,99 @@ test("workflow_prepare: stale active-feature state is replaced for the current b
       files: [],
       issue: null,
     });
-    assert.equal(prepared.statePath, join(root, ".work-state", "features", "main", "state.json"));
+    assert.equal(prepared.statePath, realpathSync(join(root, ".work-state", "features", "main", "state.json")));
     assert.equal(resolveState(root, "main").state?.branch, "main");
     assert.equal(readFileSync(join(root, ".work-state", ".active-feature"), "utf8"), "main\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
-test("resolveState: complete legacy classification wins over an incomplete active feature", () => {
+test("workflow_prepare adaptive QUICK uses root legacy state without feature workspace", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-adaptive-quick-"));
+  try {
+    initGit(root, "feat/adaptive");
+    const prepared = prepareWorkflowStateSource({
+      task: "Correct the deploy script usage banner that prints the wrong flag name",
+      cwd: root,
+      branch: "feat/adaptive",
+      autonomous: false,
+      classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false },
+      files: [],
+      issue: null,
+      adaptiveQuick: true,
+    });
+    assert.equal(prepared.statePath, realpathSync(join(root, ".work-state", "team-state.json")));
+    assert.equal(existsSync(join(root, ".work-state", "features")), false);
+    const resolved = resolveState(root, "feat/adaptive");
+    assert.equal(resolved.isLegacy, true);
+    assert.equal(resolved.state?.classification?.complexity, "QUICK");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("workflow_prepare: stale retarget preserves a newer destination created before CAS", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-stale-destination-race-"));
+  try {
+    initGit(root, "main");
+    mkdirSync(join(root, ".work-state", "features", "old"), { recursive: true });
+    writeFileSync(join(root, ".work-state", ".active-feature"), "old\n");
+    writeFileSync(join(root, ".work-state", "features", "old", "state.json"), JSON.stringify({
+      schema: 1,
+      branch: "feat/old",
+      task: "previous fix",
+      classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "bug-fix" },
+      stage_cursor: "discovery",
+      stages: [{ id: "discovery", status: "pending" }],
+      artifacts: {},
+      pause: { kind: "none", reason: "" },
+    }));
+    const destinationPath = join(realpathSync(root), ".work-state", "features", "main", "state.json");
+    const newerBytes = JSON.stringify({
+      schema: 1,
+      state_revision: 8,
+      branch: "main",
+      task: "newer current-branch workflow",
+      classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "standard" },
+      stage_cursor: "discovery",
+      stages: [{ id: "discovery", status: "in_progress" }],
+      artifacts: {},
+      pause: { kind: "none", reason: "" },
+    }, null, 2) + "\n";
+    let injected = false;
+    setStateTransactionTestHooks({
+      beforeCas: ({ destinationPath: resolvedDestination }) => {
+        if (injected) return;
+        injected = true;
+        assert.equal(resolvedDestination, destinationPath);
+        writeFileSync(resolvedDestination, newerBytes);
+      },
+    }, root);
+    try {
+      assert.throws(
+        () => prepareWorkflowStateSource({
+          task: "current branch fix",
+          cwd: root,
+          branch: "main",
+          autonomous: false,
+          classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false },
+          files: [],
+          issue: null,
+        }),
+        /state_conflict: workflow state was created during the transaction/,
+      );
+    } finally {
+      setStateTransactionTestHooks(null, root);
+    }
+    assert.equal(injected, true, "the deterministic race hook must run");
+    assert.equal(readFileSync(destinationPath, "utf8"), newerBytes, "a newer destination must never be overwritten");
+    assert.equal(readFileSync(join(root, ".work-state", ".active-feature"), "utf8"), "old\n", "failed prepare must not publish a new pointer");
+  } finally {
+    setStateTransactionTestHooks(null, root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveState: incomplete active feature blocks legacy root without migration", () => {
   const root = mkdtempSync(join(tmpdir(), "do-work-active-feature-legacy-fallback-"));
   try {
     initGit(root, "main");
@@ -173,23 +300,30 @@ test("resolveState: complete legacy classification wins over an incomplete activ
         workflow: "spec-preparation",
       },
       task: "current task",
-      stage_cursor: "intake_repo_map",
-      stages: [{ id: "intake_repo_map", status: "in_progress" }],
+      stage_cursor: "specify",
+      stages: [{ id: "specify", status: "in_progress" }],
       artifacts: {},
       workflow_override: false,
       issue: null,
       pause: { kind: "none", reason: "" },
       updated_at: new Date().toISOString(),
       policy: { strict_orchestrator: true },
-    });
+    }, root);
 
     const resolved = resolveState(root, "main");
-    assert.equal(resolved.isLegacy, true);
-    assert.equal(resolved.statePath, join(root, ".work-state", "team-state.json"));
-    assert.equal(resolved.state?.classification.workflow, "spec-preparation");
+    assert.equal(resolved.isLegacy, false);
+    assert.equal(resolved.statePath, realpathSync(join(root, ".work-state", "features", "stale", "state.json")));
+    assert.equal(resolved.state?.classification, undefined, "incomplete active feature has no executable classification");
+    const legacyPath = join(root, ".work-state", "team-state.json");
+    const legacyBefore = readFileSync(legacyPath, "utf8");
+    const activeFeaturePath = join(root, ".work-state", "features", "stale", "state.json");
+    const activeFeatureBefore = readFileSync(activeFeaturePath, "utf8");
     publishMapping(root);
     const begun = beginCapability(root);
-    assert.equal(begun.ok, true);
+    assert.equal(begun.ok, false, "legacy state requires explicit migration before capability issuance");
+    assert.equal(begun.state?.dispatch_capability, undefined, "migration-required legacy admission cannot issue a capability");
+    assert.equal(readFileSync(legacyPath, "utf8"), legacyBefore, "fail-closed legacy handling must not rewrite the source state");
+    assert.equal(readFileSync(activeFeaturePath, "utf8"), activeFeatureBefore, "migration-required legacy admission must not mutate the active feature state");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -218,9 +352,9 @@ test("beginCapability: migrates pre-durable top-level workflow state", () => {
     assert.deepEqual(resolved.state?.stages, []);
     publishMapping(root);
     const begun = beginCapability(root);
-    assert.equal(begun.ok, true);
-    assert.equal(begun.state?.stage_cursor, "intake_repo_map");
-    assert.ok(begun.state?.stages.some((stage) => stage.id === "intake_repo_map"));
+    assert.equal(begun.ok, true, begun.ok ? "" : begun.error);
+    assert.equal(begun.state?.stage_cursor, "specify");
+    assert.ok(begun.state?.stages.some((stage) => stage.id === "specify"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -563,6 +697,73 @@ test("engine: resolveClassification FAILS CLOSED on incomplete model output (no 
   );
 });
 
+test("engine: seeded SPEC classification honors the registered workspace profile", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-prepare-spec-seed-"));
+  try {
+    initGit(root, "main");
+    const profile = loadProfile("spec-import");
+    assert.ok(profile, "the shipped spec-import profile must be available");
+    if (!profile) return;
+    const created = createFeatureWorkspace(root, {
+      feature_id: "import-seed",
+      display_name: "Imported seed",
+      run_key: "run-import-seed",
+      profile_name: profile.name,
+      profile_hash: profileHash(profile),
+      source_kind: "external",
+      import_ref: "snapshot-import-seed",
+    });
+    assert.equal(created.ok, true, created.ok ? "import workspace created" : created.error);
+    if (!created.ok) return;
+    const prepared = prepareWorkflowStateSource({
+      task: "Read-only external specification compatibility validation",
+      cwd: root,
+      branch: "main",
+      autonomous: false,
+      classification: {
+        type: "SPEC",
+        complexity: "MEDIUM",
+        confidence: "HIGH",
+        autonomous: false,
+        workflow: "spec-import",
+      },
+      files: [],
+      issue: null,
+      feature_id: "import-seed",
+      run_key: "run-import-seed",
+    });
+    assert.equal(prepared.profile.name, "spec-import");
+    assert.equal(prepared.classification.workflow, "spec-import");
+    assert.equal(prepared.state.specification?.profile_name, "spec-import");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("engine: seeded SPEC workflow rejects arbitrary and unbound overrides", () => {
+  const base = {
+    task: "Read-only external specification compatibility validation",
+    autonomous: false,
+    classification: {
+      type: "SPEC" as const,
+      complexity: "MEDIUM" as const,
+      confidence: "HIGH" as const,
+      autonomous: false,
+      workflow: "spec-import" as const,
+    },
+  };
+  const bound = resolveClassificationSource(base, "spec-import");
+  assert.equal(bound.workflow, "spec-import");
+  assert.throws(
+    () => resolveClassificationSource({ ...base, classification: { ...base.classification, workflow: "full-feature" } }, "spec-import"),
+    /seeded SPEC workspace requires workflow spec-import/,
+  );
+  assert.throws(
+    () => resolveClassificationSource(base),
+    /SPEC must resolve to 'spec-preparation'/,
+  );
+});
+
 test("engine: legacy path (no model classification) uses the caller flag verbatim — never defaulted", () => {
   const resolved = resolveClassification({ task: "fix the login bug", autonomous: true });
   assert.equal(resolved.type, "BUG_FIX", "keyword guess still detects the type on the legacy path");
@@ -584,7 +785,7 @@ test("P5 gate: missing classification blocks; absent state allows (legacy flow)"
   }
 });
 
-test("strict orchestrator policy blocks source and canonical-state writes, allows artifacts", async () => {
+test("strict orchestrator policy blocks source and canonical-state writes and denies generic shell execution for every actor", async () => {
   const root = mkdtempSync(join(tmpdir(), "orchestrator-write-policy-"));
   try {
     mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
@@ -592,10 +793,8 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
     const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
     const source = orchestratorWriteGate({ toolName: "write", input: { actor: "worker", path: "src/app.ts" } }, { cwd: root, hasUI: true });
     assert.equal(source?.block, true);
-    assert.match(source?.reason ?? "", /may write only under \.work-state/);
     const state = orchestratorWriteGate({ toolName: "edit", input: { actor: "worker", path: ".work-state/team-state.json" } }, { cwd: root, hasUI: true });
     assert.equal(state?.block, true);
-    assert.match(state?.reason ?? "", /canonical workflow state/);
     const artifact = orchestratorWriteGate({ toolName: "write", input: { actor: "worker", path: ".work-state/artifacts/report.json" } }, { cwd: root, hasUI: true });
     assert.equal(artifact, undefined);
 
@@ -609,20 +808,33 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
       { cwd: root, hasUI: true },
     );
     assert.equal(mountedDiagnosticTool, undefined, "mounted diagnostics are not project writes");
+
+    for (const toolName of ["read", "glob", "grep"]) {
+      assert.equal(
+        orchestratorWriteGate({ toolName, input: { path: "src/app.ts" } }, { cwd: root, hasUI: true }),
+        undefined,
+        `${toolName} remains an explicit non-shell read-only tool`,
+      );
+    }
+
     const worker = orchestratorWriteGate({ toolName: "write", input: { actor: "orchestrator", path: "src/app.ts" } }, { cwd: root, hasUI: false });
     assert.equal(worker, undefined);
-    const bashEcho = orchestratorWriteGate({ toolName: "bash", input: { command: "echo hacked > src/app.ts" } }, { cwd: root, hasUI: true });
-    assert.equal(bashEcho?.block, true);
-    const bashRemove = orchestratorWriteGate({ toolName: "bash", input: { command: "rm src/app.ts" } }, { cwd: root, hasUI: true });
-    assert.equal(bashRemove?.block, true);
-    const bashRead = orchestratorWriteGate({ toolName: "bash", input: { command: "git diff -- src/app.ts" } }, { cwd: root, hasUI: true });
-    assert.equal(bashRead, undefined);
+    const orchestratorRead = orchestratorWriteGate({ toolName: "bash", input: { command: "git diff -- src/app.ts" } }, { cwd: root, hasUI: true });
+    assert.equal(orchestratorRead?.block, true, "even read-only Bash is denied to the orchestrator");
+    assert.match(orchestratorRead?.reason ?? "", /shell-capable Bash execution/);
+    const spoofedWorker = orchestratorWriteGate(
+      { toolName: "bash", input: { actor: "worker", command: "git diff -- src/app.ts" } },
+      { cwd: root, hasUI: true },
+    );
+    assert.equal(spoofedWorker?.block, true, "event input cannot grant worker authority");
+
+    for (const command of ["echo hacked > src/app.ts", "rm src/app.ts", "git diff -- src/app.ts"]) {
+      const blockedWorker = orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: false });
+      assert.equal(blockedWorker?.block, true, `strict worker Bash must be denied: ${command}`);
+      assert.match(blockedWorker?.reason ?? "", /generic shell execution|shell-capable Bash execution/);
+    }
     const workerCanonicalBash = orchestratorWriteGate({ toolName: "bash", input: { command: "cat > .work-state/team-state.json" } }, { cwd: root, hasUI: false });
     assert.equal(workerCanonicalBash?.block, true);
-    const ctoCanonicalBash = orchestratorWriteGate({ toolName: "bash", input: { command: "awk '{print}' > .work-state/cto/run-1/state.json" } }, { cwd: root, hasUI: true });
-    assert.equal(ctoCanonicalBash?.block, true);
-    const redirectedSource = orchestratorWriteGate({ toolName: "bash", input: { command: "git show HEAD:src/app.ts > \"$(pwd)/src/app.ts\"" } }, { cwd: root, hasUI: true });
-    assert.equal(redirectedSource?.block, true);
     const workerCanonicalInPlace = orchestratorWriteGate({ toolName: "bash", input: { command: "awk -i inplace '{print}' .work-state/team-state.json" } }, { cwd: root, hasUI: false });
     assert.equal(workerCanonicalInPlace?.block, true);
   } finally {
@@ -630,124 +842,184 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
   }
 });
 
-test("strict orchestrator policy permits git publication and PR control-plane commands", async () => {
-  const root = mkdtempSync(join(tmpdir(), "orchestrator-git-policy-"));
+test("strict orchestrator Bash gate blocks the bypass matrix before command parsing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-bash-bypass-matrix-"));
   try {
     mkdirSync(join(root, ".work-state"), { recursive: true });
     writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
     const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
-    const allowed = [
-      'git status --short && git add src/app.ts && git commit -m "fix: publish worker changes" && git fetch origin main && git rebase origin/main && git push origin HEAD && gh pr create --fill',
-      "git checkout main && git pull origin main && git checkout -b feat/example",
-      "git checkout main",
-      "git checkout -b feat/example",
-      "git switch main",
-      "git switch -c feat/example",
-      "git fetch origin main",
-      "git pull --rebase origin main",
-      "git rebase origin/main",
-      "git rebase --continue",
-      "git merge --no-edit feature/worker",
-      "git merge --abort",
-      "git cherry-pick abc123",
-      "git cherry-pick --abort",
-      "git push origin HEAD",
-      "gh pr create --fill",
-    ];
-    for (const command of allowed) {
-      assert.equal(
-        orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true }),
-        undefined,
-        `control-plane command should be allowed: ${command}`,
-      );
-    }
-    const blocked = [
-      "git checkout -- src/app.ts",
-      "git checkout HEAD -- src/app.ts",
-      "git checkout src/app.ts",
-      "git checkout -f main",
-      "git checkout .",
-      "git switch --discard-changes main",
-      "git restore src/app.ts",
+    const commands = [
+      "perl -pi -e 's/old/new/' src/app.ts",
+      "php -r 'file_put_contents(\"src/app.ts\", \"hacked\");'",
+      "awk '{print}' > src/app.ts",
+      "python3 -c 'from pathlib import Path; Path(\"src/app.ts\").write_text(\"hacked\")'",
+      "node -e 'require(\"node:fs\").writeFileSync(\"src/app.ts\", \"hacked\")'",
+      "ruby -e 'File.write(\"src/app.ts\", \"hacked\")'",
+      "echo \"$(cat src/app.ts)\" > src/app.ts",
+      "env -i PATH=\"$PATH\" sh -c 'echo hacked > src/app.ts'",
+      "ln -s ../src/app.ts src/app-link.ts",
       "git reset --hard HEAD",
-      "git clean -fd",
-      "git stash push -m temp",
+      "python3 -c 'import base64; __import__(\"pathlib\").Path(\"src/app.ts\").write_bytes(base64.b64decode(\"aGFja2Vk\"))'",
+      "node -e 'require(\"node:fs\").writeFileSync(Buffer.from(\"c3JjL2FwcC50cw==\", \"base64\").toString(), Buffer.from(\"aGFja2Vk\", \"base64\"))'",
+      "target=src/app.ts; printf hacked > \"$target\"",
+      "npm run mutate",
+      "cat ../../secret.txt",
+      "cat /tmp/secret.txt",
+      "find .. -type f",
+      "PATH=/tmp/shadow:$PATH npm run check",
+      "unknown-command --write src/app.ts",
     ];
-    for (const command of blocked) {
-      assert.equal(
-        orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true })?.block,
-        true,
-        `direct worktree mutation should remain blocked: ${command}`,
+    for (const command of commands) {
+      const blocked = orchestratorWriteGate(
+        { toolName: "bash", input: { command } },
+        { cwd: root, hasUI: true },
       );
+      assert.equal(blocked?.block, true, `strict orchestrator Bash must be denied: ${command}`);
+      assert.match(blocked?.reason ?? "", /shell-capable Bash execution/);
+      const worker = orchestratorWriteGate(
+        { toolName: "bash", input: { command } },
+        { cwd: root, hasUI: false },
+      );
+      assert.equal(worker?.block, true, `strict worker Bash must be denied: ${command}`);
+      assert.match(worker?.reason ?? "", /generic shell execution|shell-capable Bash execution/);
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("strict orchestrator policy parses edit patches and allows read-only artifact validation", async () => {
+
+test("strict workers deny every generic shell execution tool before parsing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-shell-tool-aliases-"));
+  try {
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
+    const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
+    for (const toolName of ["bash", "sh", "zsh", "shell", "exec", "execute", "run", "run_command", "command", "terminal", "node", "python", "python3", "perl", "ruby", "php"]) {
+      const blocked = orchestratorWriteGate({ toolName, input: { command: "cat ../../secret.txt" } }, { cwd: root, hasUI: false });
+      assert.equal(blocked?.block, true, `strict worker must deny ${toolName}`);
+      assert.match(blocked?.reason ?? "", /generic shell execution|shell-capable Bash execution/);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("strict worker Bash blocks cooperative workflow-state mutation forms", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-state-mutation-matrix-"));
+  try {
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
+    const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
+    const blockedCommands = [
+      `python3 -c 'from pathlib import Path; Path(os.path.join(".work-state","team-state.json")).write_text("x")'`,
+      `node -e 'fs.writeFileSync(path.join(".work-state","team-state.json"), "x")'`,
+      `ruby -e 'File.write(File.join(".work-state","team-state.json"), "x")'`,
+      `perl -e 'open(F, ">.work-state/team-state.json")'`,
+      `env -i sh -c 'cd .work-state && touch team-state.json'`,
+      "python3 -c open(.work-state/team-state.json,w)",
+      "echo x > .omp/activation.json",
+      "rm .omp/escalation.json",
+      "python3 -c open(.omp/commands/do.json,w)",
+      `cd ".work-state" && echo x > team-state.json`,
+      "rm -rf .work-state",
+      `rm -rf ".work-state"`,
+      "mv .work-state backup-work-state",
+      "cp -R source .work-state",
+      "truncate -s 0 .work-state/team-state.json",
+      "touch .work-state/team-state.json",
+    ];
+    for (const command of blockedCommands) {
+      const result = orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: false });
+      assert.equal(result?.block, true, `worker Bash must block workflow-state mutation: ${command}`);
+    }
+    const readOnlyCommands = [
+      "cat .work-state/team-state.json",
+      "python3 -c 'import json; json.load(open(os.path.join(\".work-state\",\"team-state.json\")))'",
+      "node -e 'fs.readFileSync(path.join(\".work-state\",\"team-state.json\"))'",
+      "ruby -e 'File.read(File.join(\".work-state\",\"team-state.json\"))'",
+      "perl -e 'open(F, \"<.work-state/team-state.json\")'",
+      "npm test",
+      "node --test test/example.test.ts",
+      "cat ../../secret.txt",
+      "cat /tmp/secret.txt",
+      "find .. -type f",
+      "grep -R secret ..",
+      "PATH=/tmp/shadow:$PATH npm run check",
+    ];
+    for (const command of readOnlyCommands) {
+      const result = orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: false });
+      assert.equal(result?.block, true, `strict worker must block read-only-looking shell: ${command}`);
+      assert.match(result?.reason ?? "", /generic shell execution|shell-capable Bash execution/);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("strict orchestrator policy parses edit patches while denying every Bash command", async () => {
   const root = mkdtempSync(join(tmpdir(), "orchestrator-write-patch-policy-"));
   try {
     mkdirSync(join(root, ".work-state", "features", "visualize", "artifacts"), { recursive: true });
     writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
     const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
-    const sourcePatch = [
-      "[packages/e2e/src/server.ts#064B]",
-      "PUT 1.=1:",
-      "+export const server = true;",
-    ].join("\n");
-    assert.equal(
-      orchestratorWriteGate({ toolName: "edit", input: { input: sourcePatch } }, { cwd: root, hasUI: false }),
-      undefined,
-      "a worker edit patch with a file header is a verifiable source path",
-    );
-    assert.equal(
-      orchestratorWriteGate({ toolName: "edit", input: sourcePatch }, { cwd: root, hasUI: false }),
-      undefined,
-      "a worker edit patch passed as the raw tool input is a verifiable source path",
-    );
-    const canonicalPatch = [
-      "[.work-state/features/visualize/state.json#064B]",
-      "PUT 1.=1:",
-      "+{}",
-    ].join("\n");
-    const blockedCanonicalPatch = orchestratorWriteGate(
-      { toolName: "edit", input: { input: canonicalPatch } },
-      { cwd: root, hasUI: false },
-    );
-    assert.equal(blockedCanonicalPatch?.block, true);
-    assert.match(blockedCanonicalPatch?.reason ?? "", /canonical workflow state/);
-    const blockedHeaderlessPatch = orchestratorWriteGate(
-      { toolName: "edit", input: { input: "PUT 1.=1:\n+not a file patch" } },
-      { cwd: root, hasUI: false },
-    );
+    const sourcePatch = ["[packages/e2e/src/server.ts#064B]", "PUT 1.=1:", "+export const server = true;"].join("\n");
+    assert.equal(orchestratorWriteGate({ toolName: "edit", input: { input: sourcePatch } }, { cwd: root, hasUI: false }), undefined, "a worker edit patch with a file header is a verifiable source path");
+    assert.equal(orchestratorWriteGate({ toolName: "edit", input: sourcePatch }, { cwd: root, hasUI: false }), undefined, "a worker edit patch passed as the raw tool input is a verifiable source path");
+    const authorityPatch = ["[.work-state/features/visualize/state.json#064B]", "PUT 1.=1:", "+{}"].join("\n");
+    const blockedAuthorityPatch = orchestratorWriteGate({ toolName: "edit", input: { input: authorityPatch } }, { cwd: root, hasUI: false });
+    assert.equal(blockedAuthorityPatch?.block, true);
+    const blockedHeaderlessPatch = orchestratorWriteGate({ toolName: "edit", input: { input: "PUT 1.=1:\n+not a file patch" } }, { cwd: root, hasUI: false });
     assert.equal(blockedHeaderlessPatch?.block, true);
     assert.match(blockedHeaderlessPatch?.reason ?? "", /no verifiable path/);
-
-    const pythonReadOnlyValidation =
-      "/usr/bin/python3 -m json.tool .work-state/features/visualize/artifacts/spec_intake_repo_map-analyst.json > /dev/null";
-    const pythonJsonReadOnlyValidation =
-      "python3 -c 'import glob,json; [json.load(open(path)) for path in glob.glob(\".work-state/features/visualize/artifacts/*.json\")]'";
-    const nodeReadOnlyValidation =
-      "node -e 'const fs=require(\"node:fs\"); const value=JSON.parse(fs.readFileSync(\".work-state/features/visualize/artifacts/spec_requirements_edge_cases.json\", \"utf8\")); const valid=[value].every((item) => item !== null);'";
-    const nodeGlobReadOnlyValidation =
-      "node -e 'const fs=require(\"node:fs\"); const values=fs.globSync(\".work-state/features/visualize/artifacts/*.json\").map((path) => JSON.parse(fs.readFileSync(path, \"utf8\")));'";
-    for (const command of [pythonReadOnlyValidation, pythonJsonReadOnlyValidation, nodeReadOnlyValidation, nodeGlobReadOnlyValidation]) {
-      assert.equal(
-        orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true }),
-        undefined,
-        "read-only artifact validation must remain allowed: " + command,
-      );
-    }
-
-    for (const command of [
-      "printf '{}' > .work-state/team-state.json",
-      "printf '{}' | tee .work-state/features/visualize/state.json",
-      "cd .work-state/features/visualize && printf '{}' > state.json",
-    ]) {
+    const readOnlyCommands = [
+      "/usr/bin/python3 -m json.tool .work-state/features/visualize/artifacts/spec.json > /dev/null",
+      "python3 -c 'import glob,json; [json.load(open(path)) for path in glob.glob(\".work-state/features/visualize/artifacts/*.json\")]'",
+      "node -e 'const fs=require(\"node:fs\"); JSON.parse(fs.readFileSync(\".work-state/features/visualize/artifacts/spec.json\", \"utf8\"));'",
+      "node -e 'const fs=require(\"node:fs\"); fs.globSync(\".work-state/features/visualize/artifacts/*.json\");'",
+    ];
+    for (const command of readOnlyCommands) {
       const blocked = orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: true });
-      assert.equal(blocked?.block, true, "canonical workflow write must remain blocked: " + command);
+      assert.equal(blocked?.block, true, "read-only shell validation is still shell execution: " + command);
+      assert.match(blocked?.reason ?? "", /shell-capable Bash execution/);
+      assert.equal(orchestratorWriteGate({ toolName: "bash", input: { command } }, { cwd: root, hasUI: false })?.block, true, "authority references are blocked for workers: " + command);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("strict worker writes cannot mutate any workflow authority subtree or symlink alias", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-authority-tree-"));
+  try {
+    const workState = join(root, ".work-state");
+    const controlPlane = join(root, ".omp");
+    mkdirSync(join(controlPlane, "commands"), { recursive: true });
+    writeFileSync(join(controlPlane, "activation.json"), "{}");
+    writeFileSync(join(controlPlane, "escalation.json"), "{}");
+    for (const directory of ["outbox", "inbox", "answers", "claims", "artifacts"]) mkdirSync(join(workState, directory), { recursive: true });
+    writeFileSync(join(workState, "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
+    symlinkSync(workState, join(root, "work-state-alias"), "dir");
+    symlinkSync(controlPlane, join(root, "omp-alias"), "dir");
+    const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
+    const authorityPaths = [
+      ".work-state/outbox/message.json",
+      ".work-state/inbox/request.json",
+      ".work-state/answers/answer.json",
+      ".work-state/claims/claim.json",
+      ".work-state/artifacts/result.json",
+      "work-state-alias/outbox/message.json",
+      realpathSync(workState) + "/inbox/real-path.json",
+      ".omp/activation.json",
+      ".omp/escalation.json",
+      ".omp/commands/do.json",
+      "omp-alias/commands/alias.json",
+    ];
+    for (const path of authorityPaths) {
+      const result = orchestratorWriteGate({ toolName: "write", input: { path } }, { cwd: root, hasUI: false });
+      assert.equal(result?.block, true);
+    }
+    assert.equal(orchestratorWriteGate({ toolName: "edit", input: { path: "src/application.ts" } }, { cwd: root, hasUI: false }), undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -776,8 +1048,9 @@ test("do-work prompt makes orchestrator non-coding policy explicit", () => {
     const prompt = buildDoWorkPrompt(parseWorkEnvelope("Implement feature", root), root);
     assert.match(prompt, /STRICT ORCHESTRATOR POLICY/);
     assert.match(prompt, /write\/edit application source or project files \| DENY/);
-    assert.match(prompt, /git status.*git fetch.*git merge.*git rebase.*git cherry-pick.*git add.*git commit.*git push.*gh pr create/);
-    assert.match(prompt, /git checkout <branch>.*git checkout -b <branch>.*git switch <branch>.*git switch -c <branch>/);
+    assert.match(prompt, /direct git, shell, interpreter, and process execution \| DENY/);
+    assert.match(prompt, /direct branch switching or any shell-capable execution \| DENY/);
+    assert.match(prompt, /bash stage runs only through a trusted worker execution context/);
     assert.match(prompt, /After every delegated call or parallel batch/);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -791,9 +1064,6 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
     assert.ok(!existsSync(join(root, "packages", "core")), "temp consumer cwd has no packages/core");
     const prompt = buildDoWorkPrompt(parseWorkEnvelope("Fix login bug", root), root);
 
-    // Step 1 must be an explicit tool-only sequence: workflow_prepare first,
-    // then workflow_instructions read BEFORE workflow_begin, a re-read after begin,
-    // and workflow_instructions as the ONLY workflow instruction source.
     assert.ok(
       prompt.includes("workflow_prepare"),
       "prompt must require workflow_prepare before state transitions",
@@ -802,15 +1072,10 @@ test("do-work: prompt is tool-only for workflow content and never instructs file
       prompt.indexOf("workflow_prepare") < prompt.indexOf("workflow_begin"),
       "workflow_prepare must precede workflow_begin in the tool sequence",
     );
-    assert.ok(
-      prompt.indexOf("workflow_instructions") < prompt.indexOf("workflow_begin"),
-      "workflow_instructions must be read before workflow_begin in the tool sequence",
-    );
-    assert.match(
-      prompt,
-      /re-read `workflow_instructions`/,
-      "prompt must require re-reading workflow_instructions after begin",
-    );
+    assert.match(prompt, /If it includes `required_next_tool`, execute that exact descriptor now/);
+    assert.ok(prompt.indexOf("required_next_tool") < prompt.indexOf("workflow_begin"), "required_next_tool branch must be established before generic workflow_begin");
+    assert.match(prompt, /If no `required_next_tool` is returned, and only then, call `workflow_instructions` BEFORE `workflow_begin`/);
+    assert.match(prompt, /native specification.*composite start supersedes `workflow_begin`, `workflow_instructions`, and low-level phase dispatch/i);
     assert.match(prompt, /ONLY supported state initialization\/update path/);
     assert.doesNotMatch(prompt, /Then write `.work-state\/team-state\.json`/);
     assert.ok(
@@ -857,7 +1122,7 @@ test("do-work: resume guidance is exactly eight ordered steps with no-micromanag
     assert.deepEqual(resumeSection.match(/^\d+\. /gm), ["1. ", "2. ", "3. ", "4. ", "5. ", "6. ", "7. ", "8. "]);
     for (const label of [
       "**Prepare**",
-      "**Read instructions and compose selection**",
+      "**Honor preparation continuation or read instructions",
       "**Resolve and validate begin**",
       "**Freeze snapshot/capability**",
       "**Authorize identity**",
@@ -902,22 +1167,82 @@ test("DoD gate: malformed and legacy artifacts fail closed while typed evidence 
     assert.equal(dodBackstop({}, { cwd: root }), undefined, "unsafe active-feature slug must fail closed before reading state");
     rmSync(join(workState, ".active-feature"));
 
-    writeFileSync(dodPath, JSON.stringify({ items: [{ criterion: "criterion", status: "met", evidence: "observed pass" }] }));
+    writeFileSync(dodPath, JSON.stringify({
+      items: [{ id: "manual-1", source: "manual", criterion: "criterion", status: "met", evidence: "observed pass" }],
+      type_requirements_met: true,
+      updated_at: new Date().toISOString(),
+    }));
     const malformed = dodBackstop({}, { cwd: root });
     assert.equal(malformed?.decision, "block");
     assert.match(malformed?.reason ?? "", /malformed typed artifact/);
 
     writeFileSync(dodPath, JSON.stringify({
-      items: [{ criterion: "criterion", verify_method: "run the focused check", status: "pending" }],
+      items: [{ id: "manual-1", source: "manual", criterion: "criterion", verify_method: "run the focused check", status: "pending", evidence: "" }],
+      type_requirements_met: true,
+      updated_at: new Date().toISOString(),
     }));
     const pending = dodBackstop({}, { cwd: root });
     assert.equal(pending?.decision, "block");
     assert.match(pending?.reason ?? "", /unmet or evidence-less/);
 
     writeFileSync(dodPath, JSON.stringify({
-      items: [{ criterion: "criterion", verify_method: "run the focused check", status: "met", evidence: "observed pass" }],
+      items: [{ id: "manual-1", source: "manual", criterion: "criterion", verify_method: "run the focused check", status: "met", evidence: "observed pass" }],
+      type_requirements_met: true,
+      updated_at: new Date().toISOString(),
     }));
     assert.deepEqual(dodBackstop({}, { cwd: root }), { continue: true });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("DoD gate: terminal spec-import handoff stops without implementation DoD", () => {
+  const root = mkdtempSync(join(tmpdir(), "dod-spec-import-handoff-"));
+  try {
+    initGit(root, "main");
+    const profile = loadProfile("spec-import");
+    assert.ok(profile, "spec-import profile must be available");
+    if (!profile) return;
+    const created = createFeatureWorkspace(root, {
+      feature_id: "imported-payment-retry",
+      display_name: "Imported payment retry",
+      run_key: "run-imported-payment-retry",
+      profile_name: profile.name,
+      profile_hash: profileHash(profile),
+      source_kind: "external",
+      import_ref: "snapshot-imported-payment-retry",
+    });
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+    const prepared = prepareWorkflowStateSource({
+      task: "Read-only external specification compatibility validation",
+      cwd: root,
+      branch: "main",
+      autonomous: false,
+      classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "spec-import" },
+      files: [],
+      issue: null,
+      feature_id: "imported-payment-retry",
+      run_key: "run-imported-payment-retry",
+    });
+    const state = {
+      ...prepared.state,
+      stage_cursor: "handoff",
+      pause: { kind: "done", reason: "" },
+      specification: {
+        ...prepared.state.specification,
+        status: "implementation_ready",
+        handoff_ref: "imported-payment-retry.handoff.v1",
+      },
+    };
+    const featureDir = join(root, ".work-state", "features", "imported-payment-retry");
+    writeFileSync(join(featureDir, "state.json"), JSON.stringify(state));
+    writeFileSync(join(root, ".work-state", ".active-feature"), "imported-payment-retry\n");
+    assert.deepEqual(
+      dodBackstop({}, { cwd: root }),
+      { continue: true },
+      "a pre-implementation imported handoff is a terminal stop without a DoD artifact",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1092,9 +1417,6 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
     writeFileSync(join(root, ".work-state", "artifacts", "result.json"), "{}");
     writeFileSync(join(root, ".work-state", "artifacts", "discovery.json"), JSON.stringify({ task: "capability test", branch: "feature/capability" }));
     writeFileSync(join(root, ".work-state", "artifacts", "implementation.json"), JSON.stringify({
-      ready: true,
-      validation_run: true,
-      validation_evidence: "focused durable capability test",
       files_touched: ["src/main.ts"],
     }));
     const replay = completeDispatch(root, {
@@ -1112,7 +1434,7 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
       dispatch_id: authorized.record.id,
       outcome: "succeeded",
       evidence: "explicit workflow evidence",
-      artifact_ids: ["result"],
+      artifact_ids: ["implementation"],
     });
     assert.equal(replay.ok, true);
 
@@ -1197,12 +1519,15 @@ test("beginCapability reissues secrets for an active dispatch without losing its
     assert.equal(stale.ok, false);
     assert.equal(stale.error, "invalid secret");
 
+    mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "artifacts", "implementation.json"), JSON.stringify({ files_touched: ["src/main.ts"] }));
     const recovered = completeDispatch(root, {
       ...auth,
       token: resumed.handoff.dispatch_token,
       dispatch_id: authorized.record.id,
       outcome: "succeeded",
       evidence: "resumed handoff completed the dispatch",
+      artifact_ids: ["implementation"],
     });
     assert.equal(recovered.ok, true, recovered.ok ? undefined : recovered.error);
   } finally {
@@ -1246,7 +1571,7 @@ test("native task hook leaves spawned and scheduled results pending", () => {
     assert.equal(authorizeDispatchTrusted(root, request.requests[0]!).ok, true);
 
     const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
-    registerTeamWorkflow({
+    registerTestTeamWorkflow(root, {
       setLabel() {},
       on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
         handlers.set(name, handler);
@@ -1313,6 +1638,10 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
       assert.equal(authorizeDispatchTrusted(root, authorization).ok, true);
     }
 
+    mkdirSync(join(root, ".work-state", "features", "feature-batch-capability", "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "features", "feature-batch-capability", "artifacts", "review.json"), JSON.stringify({ findings: [] }) + "\n");
+    mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "artifacts", "review.json"), JSON.stringify({ findings: [] }) + "\n");
     for (const authorization of request.requests) {
       const reconciled = reconcileTrustedTaskResult(root, {
         tool_call_id: authorization.tool_call_id,
@@ -1320,6 +1649,7 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
         task_id: authorization.task_id,
         outcome: "succeeded",
         evidence: `batch completed for ${authorization.slot_id}`,
+        artifact_ids: ["review"],
       });
       assert.equal(reconciled.ok, true);
     }
@@ -1372,9 +1702,6 @@ test("advance handoff resolves the next stage roster", () => {
     writeState(root, state, { featureSlug: "handoff" });
     mkdirSync(join(root, ".work-state", "features", "handoff", "artifacts"), { recursive: true });
     writeFileSync(join(root, ".work-state", "features", "handoff", "artifacts", "implementation.json"), JSON.stringify({
-      ready: true,
-      validation_run: true,
-      validation_evidence: "focused handoff test",
       files_touched: ["src/main.ts"],
     }));
     const authInput = {
@@ -1397,6 +1724,7 @@ test("advance handoff resolves the next stage roster", () => {
       dispatch_id: authorized.record.id,
       outcome: "succeeded",
       evidence: "task completed",
+      artifact_ids: ["implementation"],
     });
     assert.equal(completed.ok, true);
     recordTypedCheckpoint(root, "implementation", "approve_implementation");
@@ -1455,12 +1783,67 @@ test("workflow contract exposes the active feature artifact directory", () => {
       issue: null,
     });
     const contract = resolveWorkflowContract(root, { branch });
-    const expectedArtifactsDir = join(root, ".work-state", "features", "fix-artifact-path", "artifacts");
-
-    assert.equal(prepared.artifactsDir, expectedArtifactsDir);
+    const expectedArtifactsDir = realpathSync(join(root, ".work-state", "features", "fix-artifact-path", "artifacts"));
     assert.equal(contract.state.artifactsDir, expectedArtifactsDir);
     assert.equal(contract.state.path, prepared.statePath);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("strict orchestrator paths reject a symlinked work-state root and allow nested physical targets", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-work-state-symlink-"));
+  const outside = mkdtempSync(join(tmpdir(), "orchestrator-work-state-outside-"));
+  const outsideControlPlane = mkdtempSync(join(tmpdir(), "orchestrator-control-plane-outside-"));
+  const relocated = `${root}.work-state-real`;
+  const sentinel = join(outside, "sentinel.txt");
+  try {
+    const workState = join(root, ".work-state");
+    mkdirSync(workState, { recursive: true });
+    writeFileSync(join(workState, "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
+
+    const { orchestratorWriteGate } = await import("../src/gates/orchestrator-write.ts");
+    const nestedTarget = ".work-state/artifacts/not-yet-created/deep/result.json";
+    for (const actor of ["orchestrator", "lead"] as const) {
+      for (const toolName of ["write", "edit"] as const) {
+        assert.equal(
+          orchestratorWriteGate({ toolName, input: { path: nestedTarget } }, { cwd: root, actor, hasUI: true }),
+          undefined,
+          `${actor} may target nested paths below a physical .work-state root`,
+        );
+      }
+    }
+
+    writeFileSync(join(outside, "team-state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
+    writeFileSync(sentinel, "sentinel\n");
+    renameSync(workState, relocated);
+    symlinkSync(outside, workState, "dir");
+    symlinkSync(outsideControlPlane, join(root, ".omp"), "dir");
+
+    for (const actor of ["orchestrator", "lead"] as const) {
+      for (const toolName of ["write", "edit"] as const) {
+        const result = orchestratorWriteGate(
+          { toolName, input: { path: nestedTarget } },
+          { cwd: root, actor, hasUI: true },
+        );
+        assert.equal(result?.block, true, `${actor} ${toolName} must reject a symlinked .work-state root`);
+        assert.match(result?.reason ?? "", /may write only under \.work-state/);
+      }
+    }
+
+    for (const path of [".work-state/artifacts/worker.json", ".omp/commands/worker.json"]) {
+      const result = orchestratorWriteGate(
+        { toolName: "write", input: { path } },
+        { cwd: root, actor: "worker", hasUI: false },
+      );
+      assert.equal(result?.block, true, `worker must retain lexical authority-tree blocking for ${path}`);
+      assert.match(result?.reason ?? "", /engine-owned workflow authority tree/);
+    }
+    assert.equal(readFileSync(sentinel, "utf8"), "sentinel\n", "symlinked authority roots never authorize outside writes");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(relocated, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+    rmSync(outsideControlPlane, { recursive: true, force: true });
   }
 });

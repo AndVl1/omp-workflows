@@ -1,0 +1,63 @@
+{
+  "run": "validation-release",
+  "source_edits": false,
+  "change_under_validation": "external source root pin support",
+  "package_validation": {
+    "root_build": {
+      "command": "npm run build",
+      "status": "pass",
+      "exit_code": 0,
+      "evidence": "01-root-build.log"
+    },
+    "root_typecheck": {
+      "command": "npm run typecheck",
+      "status": "pass",
+      "exit_code": 0,
+      "evidence": "02-root-typecheck.log"
+    },
+    "core_tests": {
+      "command": "npm run test:core",
+      "status": "pass",
+      "exit_code": 0,
+      "tests": 1244,
+      "passed": 1244,
+      "failed": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "selected_ask_tests": 18,
+      "evidence": "03-test-core.log"
+    },
+    "fullstack_tests": {
+      "command": "npm run test:fullstack",
+      "status": "pass",
+      "exit_code": 0,
+      "tests": 412,
+      "passed": 412,
+      "failed": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "evidence": "04-test-fullstack.log"
+    },
+    "internal_tests": {
+      "command": "npm run test -w @andvl1/omp-workflows-internal",
+      "status": "pass",
+      "exit_code": 0,
+      "tests": 74,
+      "passed": 74,
+      "failed": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "evidence": "05-test-internal.log"
+    }
+  },
+  "totals": {
+    "package_tests": 1730,
+    "passed": 1730,
+    "failed": 0,
+    "selected_ask_tests": 18
+  },
+  "e2e": {
+    "status": "not_run",
+    "reason": "Explicitly excluded from this validation slice"
+  }
+}

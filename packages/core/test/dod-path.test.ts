@@ -13,21 +13,28 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  MAX_DOD_BYTES,
+  appendDoDItemPinned,
+  closeDoDItemPinned,
+  isRootCauseDocumentedPinned,
+  readDoDPinned,
   readDoDFile,
   readDoDFileSafe,
   resolveDodPath,
   type DodPathResolution,
   type DodSafeFileRead,
 } from "../src/engine/dod.js";
-import { teamDoDComplete } from "../src/cto/gates.js";
-import { validateSliceDoD } from "../src/cto/slice-gate.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
+import { canonicalCtoDoDDigest } from "../src/cto/dod.js";
+import { teamDoDComplete as teamDoDCompletePinned } from "../src/cto/gates.js";
+import { validateSliceDoD as validateSliceDoDPinned } from "../src/cto/slice-gate.js";
 import { buildSessionReport } from "../src/report/assemble.js";
 import { dodBackstop } from "../src/gates/dod-backstop.js";
 import { resolveCtoSource } from "../src/report/session-source.js";
@@ -36,6 +43,18 @@ import type { CtoState } from "../src/cto/types.js";
 
 function tmpRoot(): string {
   return mkdtempSync(join(tmpdir(), "dod-path-"));
+}
+
+function teamDoDComplete(state: CtoState, teamId: string, root: string) {
+  const pinned = PinnedProjectRoot.open(root);
+  if (!pinned) throw new Error("DoD test root cannot be pinned");
+  try { return teamDoDCompletePinned(state, teamId, pinned); } finally { pinned.close(); }
+}
+
+function validateSliceDoD(state: CtoState, teamId: string, root: string) {
+  const pinned = PinnedProjectRoot.open(root);
+  if (!pinned) throw new Error("DoD test root cannot be pinned");
+  try { return validateSliceDoDPinned(state, teamId, pinned); } finally { pinned.close(); }
 }
 
 function makeState(teams: CtoState["teams"], id = "run-1"): CtoState {
@@ -239,6 +258,7 @@ test("dod-path: integration gate accepts complete DoDs in both forms and rejects
 
     // Incomplete DoD names the pending item ids.
     writeFileSync(join(root, dirForm, "dod.json"), PENDING_DOD);
+    state.teams[0]!.dod_digest = canonicalCtoDoDDigest(JSON.parse(PENDING_DOD));
     const pending = teamDoDComplete(state, "frontend", root);
     assert.equal(pending.ok, false);
     if (!pending.ok) assert.match(pending.reason, /DoD: d1/);
@@ -277,20 +297,21 @@ test("dod-path: slice gate validates both forms and names path+cause for missing
     // Directory form (default location) — valid.
     mkdirSync(join(root, ".work-state", "artifacts", "lead"), { recursive: true });
     writeFileSync(join(root, ".work-state", "artifacts", "lead", "dod.json"), COMPLETE_DOD);
-    const state = makeState([{ id: "lead", status: "in_progress", escalations: {} }]);
+    const state = makeState([{ id: "lead", status: "in_progress", escalations: {}, dod_digest: canonicalCtoDoDDigest(JSON.parse(COMPLETE_DOD)) }]);
     assert.equal(validateSliceDoD(state, "lead", root), null, "directory form accepted");
 
     // File form — valid.
     const fileFormDir = join(root, ".work-state", "custom");
     mkdirSync(fileFormDir, { recursive: true });
     writeFileSync(join(fileFormDir, "dod.json"), COMPLETE_DOD);
+    state.teams[0]!.dod_digest = canonicalCtoDoDDigest(JSON.parse(COMPLETE_DOD));
     state.teams[0]!.dod_path = ".work-state/custom/dod.json";
     assert.equal(validateSliceDoD(state, "lead", root), null, "file form accepted");
 
     // Missing: names the resolved file path.
     rmSync(join(fileFormDir, "dod.json"));
     const missing = validateSliceDoD(state, "lead", root);
-    assert.match(missing ?? "", /slice DoD unreadable: no dod\.json at .+dod\.json$/);
+    assert.match(missing ?? "", /slice DoD unreadable: .*anchored path does not exist/);
 
     // Malformed: names the resolved file path + JSON cause.
     writeFileSync(join(fileFormDir, "dod.json"), "{ nope !!");
@@ -466,6 +487,144 @@ test("dod-path: W004-DOD-TOCTOU-004 the safe read returns fd-bound bytes/mtime a
       assert.equal(refused.kind, "symlink");
       assert.match(refused.reason, /is a symlink \(refusing to read\)/);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dod-path: bounded safe reads reject max+1 sparse files and malformed UTF-8", () => {
+  const root = tmpRoot();
+  try {
+    const file = join(root, "dod.json");
+    writeFileSync(file, Buffer.alloc(MAX_DOD_BYTES, 0x20));
+    const atLimit = readDoDFileSafe(root, file);
+    assert.equal(atLimit.ok, true, "a file exactly at the byte limit is eligible for bounded reading");
+    if (atLimit.ok) assert.equal(atLimit.bytes, MAX_DOD_BYTES);
+
+    // truncateSync creates a sparse max+1 file; the reader must reject from
+    // fstat before allocating a buffer proportional to its contents.
+    truncateSync(file, MAX_DOD_BYTES + 1);
+    assert.equal(statSync(file).size, MAX_DOD_BYTES + 1);
+    const overLimit = readDoDFileSafe(root, file);
+    assert.equal(overLimit.ok, false);
+    if (!overLimit.ok) {
+      assert.equal(overLimit.kind, "limit");
+      assert.match(overLimit.reason, /bounded DoD read limit|exceeds/i);
+    }
+
+    writeFileSync(file, Buffer.from([0xff, 0xfe, 0x7b]));
+    const malformedBefore = readFileSync(file);
+    const malformed = readDoDFileSafe(root, file);
+    assert.equal(malformed.ok, false);
+    if (!malformed.ok) {
+      assert.equal(malformed.kind, "unreadable");
+      assert.match(malformed.reason, /UTF-8/i);
+    }
+    assert.deepEqual(readFileSync(file), malformedBefore, "a malformed DoD read must not mutate the artifact");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+const DOD_TEXT_BYTES = 16 * 1024;
+
+function nearLimitDod(
+  build: (text: string) => Record<string, unknown>,
+): Buffer {
+  let low = 0;
+  let high = DOD_TEXT_BYTES;
+  let best = build("");
+  while (low <= high) {
+    const length = Math.floor((low + high) / 2);
+    const candidate = build("x".repeat(length));
+    const content = Buffer.from(`${JSON.stringify(candidate, null, 2)}\n`, "utf8");
+    if (content.byteLength <= MAX_DOD_BYTES) {
+      best = candidate;
+      low = length + 1;
+    } else {
+      high = length - 1;
+    }
+  }
+  return Buffer.from(`${JSON.stringify(best, null, 2)}\n`, "utf8");
+}
+
+test("dod-path: near-limit DoDs remain readable and append/close over-cap updates preserve prior bytes", () => {
+  const root = tmpRoot();
+  try {
+    const appendFixture = nearLimitDod((text) => ({
+      items: Array.from({ length: 63 }, (_, index) => ({
+        id: `item-${index}`,
+        source: "stage",
+        criterion: text,
+        verify_method: text,
+        status: "pending",
+        evidence: text,
+      })),
+      type_requirements_met: false,
+      updated_at: "2026-09-06T00:00:00.000Z",
+    }));
+    const appendPath = join(root, "dod.json");
+    writeFileSync(appendPath, appendFixture);
+    const pinned = PinnedProjectRoot.open(root);
+    assert.ok(pinned);
+    if (!pinned) return;
+    const rootRelative = "";
+    assert.ok(appendFixture.byteLength > MAX_DOD_BYTES - 1024);
+    assert.equal(readDoDFile(appendPath).ok, true, "near-limit append fixture is readable");
+    const appendBefore = readFileSync(appendPath);
+    assert.throws(
+      () => appendDoDItemPinned(pinned, rootRelative, "stage", "criterion", "verify", "agent"),
+      /DoD artifact exceeds the bounded/u,
+    );
+    assert.deepEqual(readFileSync(appendPath), appendBefore, "over-cap append leaves the prior artifact untouched");
+
+    const closeFixture = nearLimitDod((text) => ({
+      items: [
+        {
+          id: "target",
+          source: "stage",
+          criterion: text,
+          verify_method: text,
+          status: "pending",
+          evidence: "",
+        },
+        ...Array.from({ length: 62 }, (_, index) => ({
+          id: `item-${index}`,
+          source: "stage",
+          criterion: text,
+          verify_method: text,
+          status: "pending",
+          evidence: text,
+        })),
+      ],
+      type_requirements_met: false,
+      updated_at: "2026-09-06T00:00:00.000Z",
+    }));
+    writeFileSync(appendPath, closeFixture);
+    assert.ok(closeFixture.byteLength > MAX_DOD_BYTES - 1024);
+    const closeBefore = readFileSync(appendPath);
+    assert.throws(
+      () => closeDoDItemPinned(pinned, rootRelative, "target", "e".repeat(DOD_TEXT_BYTES), "agent"),
+      /DoD artifact exceeds the bounded/u,
+    );
+    assert.deepEqual(readFileSync(appendPath), closeBefore, "over-cap close leaves the prior artifact untouched");
+    pinned.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dod-path: incomplete typed DoD records fail closed through integration and slice gates", () => {
+  const root = tmpRoot();
+  try {
+    const directory = join(root, ".work-state", "artifacts", "lead");
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, "dod.json"), JSON.stringify({ items: [{}] }));
+    const state = makeState([{ id: "lead", status: "done", escalations: {}, dod_path: ".work-state/artifacts/lead" }]);
+    const integration = teamDoDComplete(state, "lead", root);
+    assert.equal(integration.ok, false);
+    if (!integration.ok) assert.match(integration.reason, /invalid typed DoD|DoD/i);
+    assert.match(validateSliceDoD(state, "lead", root) ?? "", /slice DoD unreadable|invalid typed DoD/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -848,3 +1007,58 @@ function writeRun(cwd: string, state: CtoState): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "state.json"), JSON.stringify(state, null, 2));
 }
+
+test("pinned DoD read and mutation reject a symlinked artifacts directory outside the root", () => {
+  const root = tmpRoot();
+  const outside = mkdtempSync(join(tmpdir(), "dod-pinned-outside-"));
+  const linked = join(root, "linked");
+  symlinkSync(outside, linked, "dir");
+  const pinned = PinnedProjectRoot.open(root);
+  assert.ok(pinned);
+  if (!pinned) return;
+  try {
+    assert.equal(readDoDPinned(pinned, "linked"), null);
+    assert.equal(isRootCauseDocumentedPinned(pinned, "linked").ok, false);
+    assert.throws(() => appendDoDItemPinned(pinned, "linked", "stage", "criterion", "verify", "agent"));
+    assert.deepEqual(readdirSync(outside), []);
+  } finally {
+    pinned.close();
+    rmSync(outside, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pinned DoD mutation rejects a parent replacement without writing outside the root", () => {
+  const root = tmpRoot();
+  const outside = mkdtempSync(join(tmpdir(), "dod-parent-outside-"));
+  const directory = join(root, "dod");
+  const moved = directory + ".opened";
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, "dod.json"), JSON.stringify({ items: [], type_requirements_met: false, updated_at: new Date().toISOString(), contributions: {} }));
+  let swapped = false;
+  const pinned = PinnedProjectRoot.open(root, {
+    beforeTempOpen: (relativePath) => {
+      if (swapped || !relativePath.endsWith("/dod.json")) return;
+      swapped = true;
+      renameSync(directory, moved);
+      symlinkSync(outside, directory, "dir");
+    },
+  });
+  assert.ok(pinned);
+  if (!pinned) return;
+  try {
+    assert.throws(() => appendDoDItemPinned(pinned, "dod", "stage", "criterion", "verify", "agent"));
+    assert.equal(swapped, true);
+    assert.deepEqual(readdirSync(outside), []);
+  } finally {
+    pinned.close();
+    if (swapped) {
+      rmSync(directory, { recursive: true, force: true });
+      renameSync(moved, directory);
+    }
+    rmSync(moved, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+

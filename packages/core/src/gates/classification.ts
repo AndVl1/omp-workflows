@@ -23,18 +23,14 @@
  *     skip the workflow-mismatch check, never the fail-closed autonomy gate.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { PinnedProjectRoot } from "../specification/pinned-root.js";
 import { isRegisteredWorkflow, loadProfile, matchesProfile, resolveWorkflow } from "../engine/profile.js";
 import { monotonicGate } from "./monotonic.js";
-import { isSafeStateSegment, resolveState } from "../engine/state.js";
-import { checkpointPolicyLegacyConflict } from "../engine/workflow-contract.js";
-import { validateTypedControlPlane } from "../engine/workflow-contract.js";
-import type { Classification, Complexity, TaskType, CheckpointPolicy } from "../engine/types.js";
-
+import { resolveActiveStatePinned } from "../engine/state.js";
+import { checkpointPolicyLegacyConflict, validateTypedControlPlane } from "../engine/workflow-contract.js";
+import type { Classification, Complexity, TaskType, CheckpointPolicy, TeamState } from "../engine/types.js";
+import { ctoSliceTaskGate, isActiveCtoExecutionTask } from "../cto/slice-gate.js";
 const WORK_STATE_DIR = ".work-state";
-const ACTIVE_FEATURE = ".active-feature";
-const LEGACY_STATE = "team-state.json";
 interface AgentStartEvent {
   /** Optional agent type/name. */
   agent?: string;
@@ -43,9 +39,9 @@ interface AgentStartEvent {
 interface AgentStartContext {
   cwd: string;
 }
-
 interface ToolCallEvent {
   toolName: string;
+  input?: unknown;
 }
 
 /**
@@ -55,33 +51,30 @@ interface ToolCallEvent {
  */
 export function classificationToolGate(event: ToolCallEvent, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
   if (event.toolName !== "task") return;
-  const wsDir = resolve(ctx.cwd, WORK_STATE_DIR);
-  if (!existsSync(wsDir)) return;
-  const active = join(wsDir, ACTIVE_FEATURE);
-  const legacy = join(wsDir, LEGACY_STATE);
-  if (!existsSync(active) && !existsSync(legacy)) return;
-  if (resolveState(ctx.cwd).invalid) {
-    return { block: true, reason: "BLOCK (P5): workflow state is malformed or unsafe; refusing task launch." };
-  }
-  if (!resolveStatePath(ctx.cwd)) {
-    return { block: true, reason: "BLOCK (P5): classification state is missing. Complete PHASE 0, write .work-state/team-state.json, then launch agents." };
-  }
-  // The complete classification contract is enforced pre-execution. The
-  // before_agent_start hook remains a reminder only (OMP cannot block there).
-  const classification = classificationGate(event as unknown as AgentStartEvent, ctx);
-  if (classification?.block) return classification;
-  return monotonicGate(event, ctx);
-}
-export function classificationGate(event: AgentStartEvent, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
-  const statePath = resolveStatePath(ctx.cwd);
-  if (!statePath) return;
-
-  let raw: string;
+  const pinnedRoot = PinnedProjectRoot.open(ctx.cwd);
+  if (!pinnedRoot) return;
   try {
-    raw = readFileSync(statePath, "utf8");
-  } catch {
-    return;
+    const hadWorkflowState = pinnedRoot.pathEntryExists(WORK_STATE_DIR);
+    const ctoSlice = ctoSliceTaskGate(event, ctx);
+    if (ctoSlice?.block) return ctoSlice;
+    if (isActiveCtoExecutionTask(event, ctx)) return;
+    if (!hadWorkflowState) return;
+    const resolved = resolveActiveStatePinned(ctx.cwd, pinnedRoot);
+    if (resolved.invalid) return { block: true, reason: "BLOCK (P5): workflow state is malformed or unsafe; refusing task launch." };
+    if (!resolved.state) return { block: true, reason: "BLOCK (P5): classification state is missing. Complete PHASE 0, write .work-state/team-state.json, then launch agents." };
+    const classification = classificationGate(event as unknown as AgentStartEvent, ctx, resolved.state);
+    if (classification?.block) return classification;
+    return monotonicGate(event, ctx, resolved.state);
+  } finally {
+    pinnedRoot.close();
   }
+}
+
+export function classificationGate(
+  event: AgentStartEvent,
+  ctx: AgentStartContext,
+  borrowedState?: TeamState,
+): { block?: boolean; reason?: string } | void {
   let state: {
     classification?: Partial<Classification>;
     autonomous?: boolean;
@@ -89,10 +82,18 @@ export function classificationGate(event: AgentStartEvent, ctx: AgentStartContex
     stage_cursor?: string;
     checkpoint_policy?: CheckpointPolicy;
   };
-  try {
-    state = JSON.parse(raw) as typeof state;
-  } catch {
-    return;
+  if (borrowedState) {
+    state = borrowedState;
+  } else {
+    const pinnedRoot = PinnedProjectRoot.open(ctx.cwd);
+    if (!pinnedRoot) return;
+    try {
+      const resolved = resolveActiveStatePinned(ctx.cwd, pinnedRoot);
+      if (!resolved.state) return;
+      state = resolved.state;
+    } finally {
+      pinnedRoot.close();
+    }
   }
 
   // Typed control-plane validation is deliberately first.  Legacy autonomy
@@ -184,21 +185,6 @@ export function classificationGate(event: AgentStartEvent, ctx: AgentStartContex
   }
 }
 
-function resolveStatePath(cwd: string): string | null {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  if (!existsSync(wsDir)) return null;
-  const active = join(wsDir, ".active-feature");
-  if (existsSync(active)) {
-    const slug = readFileSync(active, "utf8").trim();
-    if (isSafeStateSegment(slug)) {
-      const path = join(wsDir, "features", slug, "state.json");
-      if (existsSync(path)) return path;
-    }
-  }
-  const legacy = join(wsDir, "team-state.json");
-  if (existsSync(legacy)) return legacy;
-  return null;
-}
 
 /**
  * Resolve the routing/migration autonomy input for the P5 gate, fail-closed:

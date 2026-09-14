@@ -1,0 +1,208 @@
+{
+  "schema_version": 2,
+  "shutdown_completed_at": "2026-09-05T02:41:33.110Z",
+  "omp_log_binding": null,
+  "surface": "web",
+  "stopped_at": "2026-09-05T02:41:33.110Z",
+  "tty": {
+    "cols": 100,
+    "rows": 30,
+    "term": "xterm-256color"
+  },
+  "slug": "s07-cto-preparation",
+  "runtime_plugins": {
+    "schema_version": 1,
+    "extension_package": {
+      "name": "@andvl1/omp-workflows-fullstack",
+      "version": "0.27.0",
+      "package_path": "/tmp/omp-ux-e2e-readable-spec-workflow/s07-cto-preparation/node_modules/@andvl1/omp-workflows-fullstack",
+      "realpath": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/fullstack",
+      "entrypoint": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/fullstack/dist/index.js"
+    },
+    "core_package": {
+      "name": "@andvl1/omp-workflows-core",
+      "version": "0.27.0",
+      "package_path": "/tmp/omp-ux-e2e-readable-spec-workflow/s07-cto-preparation/node_modules/@andvl1/omp-workflows-core",
+      "realpath": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/core",
+      "entrypoint": "/Users/a.vladislavov/.herdr/worktrees/omp-workflows-monorepo/sdd-integration/packages/core/dist/index.js"
+    },
+    "configured_extensions": [
+      "/tmp/omp-ux-e2e-readable-spec-workflow/s07-cto-preparation/node_modules/@andvl1/omp-workflows-fullstack"
+    ],
+    "tool_names": [
+      "constitution_checkpoint_ask_selected",
+      "cto_checkpoint_ask_selected",
+      "cto_close_specification_execution_wave",
+      "cto_confirm",
+      "cto_dispatch",
+      "cto_preflight",
+      "cto_prepare",
+      "cto_specification_advance",
+      "cto_specification_conformance",
+      "cto_specification_decide",
+      "cto_specification_prepare",
+      "cto_specification_review",
+      "decide_constitution_checkpoint",
+      "do_work_claim",
+      "ensure_project_constitution",
+      "lecture_acquire",
+      "present_constitution_draft",
+      "workflow_advance",
+      "workflow_begin",
+      "workflow_begin_phase_validation",
+      "workflow_checkpoint",
+      "workflow_checkpoint_ask_selected",
+      "workflow_complete",
+      "workflow_complete_specification_execution",
+      "workflow_finalize_import_handoff",
+      "workflow_instructions",
+      "workflow_prepare",
+      "workflow_specification_conformance",
+      "workflow_status",
+      "workflow_validate_phase"
+    ],
+    "duplicate_tool_names": []
+  },
+  "pty_exit_observed": true,
+  "browser_code_expires_at": "2026-09-05T02:31:24.037Z",
+  "omp_log_snapshot": {
+    "relative_path": "omp-log.aa6d5c2dd055eadfbf1e3006f74b29d9052ba9323ab7062cfd06e3a41dc53cf1.log",
+    "size": 15590,
+    "sha256": "aa6d5c2dd055eadfbf1e3006f74b29d9052ba9323ab7062cfd06e3a41dc53cf1",
+    "source_dev": 16777234,
+    "source_ino": 96077356,
+    "generation": "eOjscAk0mR0dFrh9jz7sHV_2E_lBmkFW89PA5ZHW5Yo",
+    "process_start": "0YHRg9Cx0LHQvtGC0LAsICA1INGB0LXQvdGC0Y_QsdGA0Y8gMjAyNiDQsy4gMDU6MzA6MjU"
+  },
+  "finished_at": "2026-09-05T02:41:33.110Z",
+  "omp_version": "omp/18.0.6",
+  "scenario": {
+    "id": "spec-cto-preparation",
+    "title": "CTO preparation: independent features, same-feature facets, mixed decisions, blocked slices, queue limits, final hard stop",
+    "workspace": {
+      "documents": [
+        "specs/prep-atlas/status.md",
+        "specs/prep-atlas/spec.md",
+        "specs/prep-atlas/plan.md",
+        "specs/prep-atlas/tasks.md",
+        "specs/prep-borealis/status.md",
+        "specs/prep-borealis/spec.md",
+        "specs/prep-borealis/plan.md",
+        "specs/prep-borealis/tasks.md",
+        "specs/prep-meridian/status.md",
+        "specs/prep-meridian/spec.md",
+        "specs/prep-meridian/plan.md",
+        "specs/prep-meridian/tasks.md"
+      ],
+      "validation": [
+        "specs/prep-atlas/validation/specify.md",
+        "specs/prep-atlas/validation/plan.md",
+        "specs/prep-atlas/validation/tasks.md",
+        "specs/prep-borealis/validation/specify.md",
+        "specs/prep-borealis/validation/plan.md",
+        "specs/prep-borealis/validation/tasks.md",
+        "specs/prep-meridian/validation/specify.md",
+        "specs/prep-meridian/validation/plan.md",
+        "specs/prep-meridian/validation/tasks.md"
+      ],
+      "history": [
+        "specs/prep-atlas/history/specify",
+        "specs/prep-atlas/history/plan",
+        "specs/prep-atlas/history/tasks",
+        "specs/prep-borealis/history/specify",
+        "specs/prep-borealis/history/plan",
+        "specs/prep-borealis/history/tasks",
+        "specs/prep-meridian/history/specify",
+        "specs/prep-meridian/history/plan",
+        "specs/prep-meridian/history/tasks"
+      ],
+      "handoff": [
+        "specs/prep-atlas/handoff.md",
+        "specs/prep-borealis/handoff.md",
+        "specs/prep-meridian/handoff.md"
+      ],
+      "checkpoints": [
+        ".work-state/features/prep-atlas/state.json",
+        ".work-state/features/prep-borealis/state.json",
+        ".work-state/features/prep-meridian/state.json",
+        ".work-state/ux-e2e/transcript.jsonl",
+        ".work-state/ux-e2e/ask-state.jsonl"
+      ],
+      "evidence": [
+        ".work-state/features/prep-atlas/artifacts",
+        ".work-state/features/prep-borealis/artifacts",
+        ".work-state/features/prep-meridian/artifacts"
+      ]
+    },
+    "transcript": {
+      "checkpoints": [
+        "approve_continue",
+        "request_changes",
+        "approve_stop",
+        "trusted human proof",
+        "one decision per specification and phase",
+        "no CTO or team-lead self-approval"
+      ],
+      "workers": [
+        "Specify worker dispatch",
+        "Plan worker dispatch",
+        "Tasks worker dispatch",
+        "parallel only independent preparation",
+        "one phase writer",
+        "no parallel writes to the same phase",
+        "no nested CTO dispatch",
+        "no second CTO run"
+      ],
+      "validation": [
+        "same templates",
+        "same validation rules",
+        "revision remains on the affected phase",
+        "re-enter validation",
+        "no autonomous approval path"
+      ],
+      "history": [
+        "history/specify",
+        "history/plan",
+        "history/tasks",
+        "append-only history per workspace",
+        "approved phases untouched by revision"
+      ],
+      "handoff": [
+        "implementation_ready",
+        "handoff_id",
+        "handoff_digest",
+        "standard implementation-ready handoff",
+        "no execution wave started",
+        "no implementation evidence"
+      ],
+      "interruption": [
+        "facet-b blocked",
+        "no fabricated evidence",
+        "durable state retained",
+        "targeted resume",
+        "completed specifications remain reviewable"
+      ],
+      "resume": [
+        "only eligible specifications advance",
+        "targeted resume of the blocked facet",
+        "same feature identity",
+        "same run_key",
+        "revised Specify re-enters validation"
+      ],
+      "next_actions": [
+        "separate explicit execution wave",
+        "queued",
+        "team cap",
+        "decomposition depth",
+        "ownership",
+        "active phase",
+        "no nested CTO"
+      ]
+    }
+  },
+  "profile": null,
+  "spawn_error": null,
+  "started_at": "2026-09-05T02:30:24.040Z",
+  "status": "stopped",
+  "shutdown_error": null
+}

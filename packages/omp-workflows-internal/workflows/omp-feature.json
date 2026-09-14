@@ -4,7 +4,7 @@
   "description": "QUICK/MEDIUM features in this TypeScript monorepo. Discovery, scoped implementation by bundle generalists, parallel review with conditional security/QA/infra joiners.",
   "completion_intent": {
     "mode": "complete_outcome",
-    "acceptance": "dod_and_artifacts",
+    "acceptance": "quality_gates_and_artifacts",
     "source": "workflow_policy",
     "rationale": "Feature workflows complete the bounded outcome with durable artifacts and DoD evidence."
   },
