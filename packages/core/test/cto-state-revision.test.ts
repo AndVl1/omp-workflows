@@ -524,6 +524,188 @@ test("CTO state CAS preserves the winner and advances the passed candidate", () 
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("state CAS rejects same-revision inode replacement after journal publication", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-state-cas-replacement-"));
+  const runId = "cas-replacement";
+  try {
+    const initial = fixture(runId);
+    persistState(initial, root);
+    const candidate = readCtoState(runId, root);
+    assert.ok(candidate);
+    candidate!.integration.note = "candidate";
+    const statePath = join(root, ".work-state", "cto", runId, "state.json");
+    const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
+    const proofPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_PROOF_FILE);
+    const beforeIndex = readFileSync(indexPath);
+    const beforeProof = readFileSync(proofPath);
+    let injected = false;
+    assert.throws(
+      () => writeCtoState(candidate!, root, {
+        preCommit: ({ candidate: next }) => {
+          if (injected) return;
+          injected = true;
+          const original = readCtoState(runId, root);
+          assert.ok(original);
+          const replacement = { ...original, integration: { ...original.integration, note: "foreign replacement" } };
+          writeFileSync(statePath, `${JSON.stringify(replacement, null, 2)}\n`, "utf8");
+          assert.equal(next.state_revision, replacement.state_revision + 1);
+        },
+      }),
+      (error: unknown) => error instanceof PinnedRootError && error.code === "changed",
+    );
+    assert.equal(injected, true);
+    assert.match(readFileSync(statePath, "utf8"), /foreign replacement/u);
+    assert.deepEqual(readFileSync(indexPath), beforeIndex, "lost update must not rewrite delivery index");
+    assert.deepEqual(readFileSync(proofPath), beforeProof, "lost update must not rewrite index proof");
+    assert.equal(existsSync(join(root, ".work-state", "cto", ".active-run-index-journal", `${runId}.json`)), true, "journal remains for exact recovery");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function promoteStandbyForJournalCrash(root: string, runId: string, failPath: "state-proof" | "origin"): { statePath: string; originPath: string; indexPath: string; proofPath: string; journalPath: string } {
+  const standby = { ...fixture(runId), standby: true, owner_session: null };
+  persistState(standby, root);
+  const candidate = readCtoState(runId, root);
+  assert.ok(candidate);
+  candidate!.standby = false;
+  candidate!.owner_session = "promoted-session";
+  const statePath = join(root, ".work-state", "cto", runId, "state.json");
+  const originPath = join(root, ".work-state", "cto", runId, ".runtime-origin-proof.json");
+  const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
+  const proofPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_PROOF_FILE);
+  const journalPath = join(root, ".work-state", "cto", ".active-run-index-journal", `${runId}.json`);
+  const originalReplace = PinnedProjectRoot.prototype.replaceFileIfMatches;
+  let injected = false;
+  PinnedProjectRoot.prototype.replaceFileIfMatches = function(relativePath, expected, content) {
+    if (!injected && ((failPath === "state-proof" && relativePath.endsWith(".runtime-state-proof.json")) || (failPath === "origin" && relativePath.endsWith(".runtime-origin-proof.json")))) {
+      injected = true;
+      throw new PinnedRootError("changed", "injected promotion crash seam");
+    }
+    return originalReplace.call(this, relativePath, expected, content);
+  };
+  try {
+    assert.throws(
+      () => writeCtoState(candidate!, root, { originTransition: { ownerSession: "promoted-session" }, preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() }),
+      (error: unknown) => error instanceof PinnedRootError && error.code === "recovery_required",
+    );
+  } finally {
+    PinnedProjectRoot.prototype.replaceFileIfMatches = originalReplace;
+  }
+  assert.equal(injected, true, `${failPath} crash seam must execute`);
+  assert.equal(existsSync(journalPath), true, `${failPath} must retain authenticated transition journal`);
+  return { statePath, originPath, indexPath, proofPath, journalPath };
+}
+
+test("authenticated transition journal repairs promotion after state/proof crash boundaries", () => {
+  for (const failPath of ["state-proof", "origin"] as const) {
+    const root = mkdtempSync(join(tmpdir(), `cto-transition-crash-${failPath}-`));
+    try {
+      const paths = promoteStandbyForJournalCrash(root, `transition-${failPath}`, failPath);
+      const recoveredPage = readCtoRunDeliveryIndexPage(root);
+      assert.equal(recoveredPage.active_run_id, `transition-${failPath}`, `${failPath} recovery must admit promoted run`);
+      assert.equal(existsSync(paths.journalPath), false, `${failPath} recovery must consume journal`);
+      const replayedPage = readCtoRunDeliveryIndexPage(root);
+      assert.equal(replayedPage.active_run_id, `transition-${failPath}`, `${failPath} recovery must remain idempotent on retry`);
+      const state = readCtoState(`transition-${failPath}`, root);
+      assert.equal(state?.standby, false);
+      assert.equal(state?.owner_session, "promoted-session");
+      assert.equal(JSON.parse(readFileSync(paths.originPath, "utf8")).standby, false);
+      assert.equal(JSON.parse(readFileSync(paths.originPath, "utf8")).owner_session, "promoted-session");
+      const indexPin = PinnedProjectRoot.open(root);
+      assert.ok(indexPin);
+      if (indexPin) {
+        try {
+          const activeCandidates = readCtoRunDeliveryActiveCandidatesPinned(indexPin);
+          assert.equal(activeCandidates.ok, true, `${failPath} recovery must expose authenticated active candidates`);
+          if (activeCandidates.ok) assert.ok(activeCandidates.entries.some((entry) => entry.run_id === `transition-${failPath}`));
+        } finally {
+          indexPin.close();
+        }
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("authenticated transition journal rejects tampered proof, old origin, and non-exact state postimages", () => {
+  const scenarios = ["proof", "origin", "state", "index-swap", "proof-missing"] as const;
+  for (const scenario of scenarios) {
+    const root = mkdtempSync(join(tmpdir(), `cto-transition-tamper-${scenario}-`));
+    try {
+      const paths = promoteStandbyForJournalCrash(root, `transition-tamper-${scenario}`, "origin");
+      const beforeState = readFileSync(paths.statePath);
+      const beforeOrigin = readFileSync(paths.originPath);
+      const beforeIndex = readFileSync(paths.indexPath);
+      const beforeProof = readFileSync(paths.proofPath);
+      if (scenario === "proof") {
+        const journal = JSON.parse(readFileSync(paths.journalPath, "utf8")) as { origin_transition: { proof: string } };
+        journal.origin_transition.proof = "0".repeat(64);
+        writeFileSync(paths.journalPath, `${JSON.stringify(journal)}\n`, "utf8");
+      } else if (scenario === "origin") {
+        const origin = JSON.parse(readFileSync(paths.originPath, "utf8")) as { identity_sha256: string };
+        origin.identity_sha256 = "f".repeat(64);
+        writeFileSync(paths.originPath, `${JSON.stringify(origin)}\n`, "utf8");
+      } else if (scenario === "state") {
+        const state = JSON.parse(readFileSync(paths.statePath, "utf8")) as { integration: Record<string, unknown> };
+        state.integration = { ...state.integration, note: "non-exact postimage" };
+        writeFileSync(paths.statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+      } else if (scenario === "index-swap") {
+        const replacement = JSON.parse(readFileSync(paths.indexPath, "utf8")) as { entries: unknown[] };
+        replacement.entries = [...replacement.entries];
+        writeFileSync(paths.indexPath, `${JSON.stringify(replacement)}\n`, "utf8");
+      } else {
+        rmSync(paths.proofPath, { force: true });
+      }
+      const stateEvidence = readFileSync(paths.statePath);
+      const originEvidence = readFileSync(paths.originPath);
+      const indexEvidence = readFileSync(paths.indexPath);
+      const proofEvidence = existsSync(paths.proofPath) ? readFileSync(paths.proofPath) : null;
+      assert.throws(() => readCtoRunDeliveryIndexPage(root), /journal|origin|digest|authenticated|recovery|preimage/u, scenario);
+      assert.deepEqual(readFileSync(paths.statePath), stateEvidence, `${scenario} must not rewrite state evidence`);
+      assert.deepEqual(readFileSync(paths.originPath), originEvidence, `${scenario} must not rewrite origin evidence`);
+      assert.deepEqual(readFileSync(paths.indexPath), indexEvidence, `${scenario} must not rewrite index evidence`);
+      assert.deepEqual(existsSync(paths.proofPath) ? readFileSync(paths.proofPath) : null, proofEvidence, `${scenario} must not rewrite index proof evidence`);
+      assert.equal(existsSync(paths.journalPath), true, `${scenario} evidence remains for explicit recovery`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("promotion rejects missing index or proof preimages before state CAS", () => {
+  for (const missing of ["index", "proof"] as const) {
+    const root = mkdtempSync(join(tmpdir(), `cto-transition-missing-${missing}-`));
+    const runId = `transition-missing-${missing}`;
+    try {
+      const standby = { ...fixture(runId), standby: true, owner_session: null };
+      persistState(standby, root);
+      const candidate = readCtoState(runId, root);
+      assert.ok(candidate);
+      candidate!.standby = false;
+      candidate!.owner_session = "promoted-session";
+      const statePath = join(root, ".work-state", "cto", runId, "state.json");
+      const originPath = join(root, ".work-state", "cto", runId, ".runtime-origin-proof.json");
+      const indexPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_FILE);
+      const proofPath = join(root, ".work-state", "cto", CTO_RUN_DELIVERY_INDEX_PROOF_FILE);
+      const journalPath = join(root, ".work-state", "cto", ".active-run-index-journal", `${runId}.json`);
+      const beforeState = readFileSync(statePath);
+      const beforeOrigin = readFileSync(originPath);
+      rmSync(missing === "index" ? indexPath : proofPath, { force: true });
+      assert.throws(
+        () => writeCtoState(candidate!, root, { originTransition: { ownerSession: "promoted-session" }, preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() }),
+        (error: unknown) => error instanceof PinnedRootError && error.code === "recovery_required",
+      );
+      assert.deepEqual(readFileSync(statePath), beforeState, `${missing} absence must not publish candidate state`);
+      assert.deepEqual(readFileSync(originPath), beforeOrigin, `${missing} absence must not rewrite origin`);
+      assert.equal(existsSync(journalPath), false, `${missing} absence must fail before journal publication`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("terminal CTO runs reject wave append without mutating state or delivery authority", () => {
   for (const pauseKind of ["done", "failed"] as const) {
     const root = mkdtempSync(join(tmpdir(), `cto-wave-terminal-${pauseKind}-`));
