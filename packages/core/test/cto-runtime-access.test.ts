@@ -19,7 +19,7 @@ import {
   openCtoRuntimeAccess,
   registerCtoRuntimeAccessProvider,
 } from "../src/cto/runtime-access.js";
-import { issueCtoRuntimeSessionAuthority } from "../src/cto/session-authority.js";
+import { issueCtoRuntimeSessionAuthority, revokeCtoRuntimeSessionAuthority } from "../src/cto/session-authority.js";
 import { ctoRuntimeRunInitialIdentityDigest, mintCtoRuntimeRunOrigin, newCtoState, readCtoState, writeCtoRuntimeStateProof, writeCtoState } from "../src/cto/state.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import type { TeamPlan } from "../src/cto/types.js";
@@ -151,6 +151,38 @@ test("runtime scheduler rejects unsafe intervals, caps live timers, and reuses s
     }
     opened.access.close();
     releaseWorkflowOwners(opened.activation.release_token, ["workflow_registration", "workflow_tools"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("shared session authority isolates facade close and revokes attached peers", () => {
+  const root = makeProject();
+  try {
+    const activation = activationFor(root);
+    const pinnedRoot = PinnedProjectRoot.open(root);
+    assert.ok(pinnedRoot);
+    if (!pinnedRoot) throw new Error("test root could not be pinned");
+    try {
+      const authority = issueCtoRuntimeSessionAuthority(
+        activation.registry_context,
+        { canonical_root: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino },
+        { sessionManager: Object.freeze({}), sessionId: "shared-session" },
+        () => { requireRegistryContext(activation.registry_context, pinnedRoot!.canonical_root, "workflow_tools"); },
+      );
+      const first = openCtoRuntimeAccess(activation.registry_context, authority, root);
+      const second = openCtoRuntimeAccess(activation.registry_context, authority, root);
+      assert.equal(first.ok, true);
+      assert.equal(second.ok, true);
+      if (!first.ok || !second.ok) throw new Error("shared authority facade open failed");
+      first.access.close();
+      assert.doesNotThrow(() => second.access.assertLive());
+      revokeCtoRuntimeSessionAuthority(authority);
+      assertRevoked(() => second.access.assertLive());
+    } finally {
+      pinnedRoot.close();
+      releaseWorkflowOwners(activation.release_token, ["workflow_registration", "workflow_tools"]);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
