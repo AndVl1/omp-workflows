@@ -364,6 +364,7 @@ function claimRegistrarActivation(
 
 const teamActivationCells = new WeakMap<object, TeamActivationCell>();
 const pendingTeamActivationCleanups = new WeakMap<object, () => void>();
+const teamSessionBindingControllerRevokers = new WeakMap<object, () => void>();
 const dynamicTeamRegistrationCallbacks = new WeakSet<object>();
 
 type TeamActivationReservation = {
@@ -455,6 +456,7 @@ function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, bindi
   if (rebinding) {
     const next = binding;
     recordRegistryUndo(token, () => {
+      teamSessionBindingControllerRevokers.get(pi)?.();
       closeTeamBindingResources(next);
       const current = teamActivationCells.get(pi);
       if (current?.state === "active" && current.root === next.root && current.rootDev === next.rootDev && current.rootIno === next.rootIno) {
@@ -507,6 +509,7 @@ function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, bindi
     return;
   }
   recordRegistryUndo(token, () => {
+    teamSessionBindingControllerRevokers.get(pi)?.();
     if (binding) closeTeamBindingResources(binding);
     markTeamFailed(pi, "registration transaction rolled back");
   });
@@ -753,6 +756,12 @@ function guardedRegistrarHostApi(
   return wrapped;
 }
 
+/** Opaque host-session rebinding capability retained by an authenticated bundle. */
+export interface TeamSessionBindingController {
+  bind(ctx: unknown): void;
+  isLive(ctx: unknown): boolean;
+}
+
 export interface RegisterOptions {
   label?: string;
   roles?: RoleConfig["roles"];
@@ -788,6 +797,8 @@ export interface RegisterOptions {
   initialSession?: HostSessionIdentity;
   /** Actual host lifecycle context for synchronous static session binding. */
   initialSessionContext?: unknown;
+  /** Receives an opaque controller for synchronous session rebinds. */
+  onSessionBindingController?: (controller: TeamSessionBindingController) => void;
 }
 
 export type CommandId = "do-work" | "team" | "cto" | "init-team" | "interview" | "omp-model-roles";
@@ -1408,6 +1419,8 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
   let hostMountStarted = false;
   teamRoot?.close();
   const originalPi = pi;
+  teamSessionBindingControllerRevokers.get(originalPi as unknown as object)?.();
+  let revokeSessionBindingController: () => void = () => undefined;
   let liveOwnerGuard: LiveOwnerGuard | undefined;
   pi = guardedRegistrarHostApi(pi, teamActivationCells, true, ctx => liveOwnerGuard?.(ctx), teamBinding?.liveGuard);
   try {
@@ -1750,6 +1763,37 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
       throw error;
     }
   };
+  let sessionBindingControllerRevoked = false;
+  const revokeController = (): void => {
+    sessionBindingControllerRevoked = true;
+    if (teamSessionBindingControllerRevokers.get(originalPi as unknown as object) === revokeController) {
+      teamSessionBindingControllerRevokers.delete(originalPi as unknown as object);
+    }
+  };
+  revokeSessionBindingController = revokeController;
+  const sessionBindingController: TeamSessionBindingController = Object.freeze({
+    bind: (ctx: unknown): void => {
+      if (sessionBindingControllerRevoked) return;
+      bindSession(ctx);
+    },
+    isLive: (ctx: unknown): boolean => {
+      if (sessionBindingControllerRevoked) return false;
+      const current = teamActivationCells.get(originalPi as unknown as object);
+      const identity = hostSessionIdentity(ctx);
+      const currentSession = current ? teamCellSession(current) : null;
+      if (!current || current.state !== "active" || !identity || !currentSession || !sameHostSession(currentSession, identity)
+        || current.root === undefined || current.rootDev === undefined || current.rootIno === undefined
+        || hostContextRootIssue(ctx, current.root, current.rootDev, current.rootIno) !== null) return false;
+      try {
+        current.liveGuard?.();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
+  teamSessionBindingControllerRevokers.set(originalPi as unknown as object, revokeController);
+
   if (activation?.registryToken) {
     const runtimeRoot = registryRegistrationProjectRoot(activation.registryToken, "runtime_config");
     writeRuntimeConfig({ ...opts, registrationToken: activation.registryToken }, runtimeRoot);
@@ -1771,6 +1815,7 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
         || hostContextRootIssue(ctx, current.root, current.rootDev, current.rootIno) !== null) return;
       clearNativeTaskSelectors();
       clearHostContextIdentity(originalPi as unknown as object);
+      revokeSessionBindingController();
       // Replace the live cell with a recoverable tombstone before invoking
       // opaque cleanup. Keeping the authenticated root/principal lets the
       // next bindSession rebind through recordTeamLifecycle instead of
@@ -1784,6 +1829,7 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
         cleanup: undefined,
         registryContext: undefined,
         runtimeAuthority: undefined,
+        runtimeAccess: undefined,
         sessionManager: undefined,
         sessionId: undefined,
         sessionFile: undefined,
@@ -2087,44 +2133,47 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
     const initialSession = opts.initialSessionContext !== undefined
       ? hostSessionIdentity(opts.initialSessionContext)
       : opts.initialSession;
-    const initialRuntimeAuthority = activation.registryContext && teamBinding && initialSession
-      ? issueCtoRuntimeSessionAuthority(
-        activation.registryContext,
-        { canonical_root: teamBinding.root, dev: teamBinding.rootDev, ino: teamBinding.rootIno },
-        {
-          sessionManager: initialSession.sessionManager,
-          sessionId: initialSession.sessionId,
-          ...(initialSession.sessionFile !== undefined ? { sessionFile: initialSession.sessionFile } : {}),
-          ...(initialSession.sessionBasename !== undefined ? { sessionBasename: initialSession.sessionBasename } : {}),
-          ...(initialSession.generation !== undefined ? { generation: initialSession.generation } : {}),
-        },
-        teamBinding.liveGuard,
-      )
-      : undefined;
-    const initialRuntimeAccess = initialRuntimeAuthority && activation.registryContext && teamBinding
-      ? (() => {
+    let initialRuntimeAuthority: CtoRuntimeSessionAuthority | undefined;
+    let initialRuntimeAccess: CtoRuntimeAccessFacade | undefined;
+    try {
+      if (activation.registryContext && teamBinding && initialSession) {
+        initialRuntimeAuthority = issueCtoRuntimeSessionAuthority(
+          activation.registryContext,
+          { canonical_root: teamBinding.root, dev: teamBinding.rootDev, ino: teamBinding.rootIno },
+          {
+            sessionManager: initialSession.sessionManager,
+            sessionId: initialSession.sessionId,
+            ...(initialSession.sessionFile !== undefined ? { sessionFile: initialSession.sessionFile } : {}),
+            ...(initialSession.sessionBasename !== undefined ? { sessionBasename: initialSession.sessionBasename } : {}),
+            ...(initialSession.generation !== undefined ? { generation: initialSession.generation } : {}),
+          },
+          teamBinding.liveGuard,
+        );
         const opened = openCtoRuntimeAccess(activation.registryContext, initialRuntimeAuthority, teamBinding.root);
-        if (!opened.ok) {
-          revokeCtoRuntimeSessionAuthority(initialRuntimeAuthority);
-          throw new Error(`${opened.code}: ${opened.error}`);
-        }
-        return opened.access;
-      })()
-      : undefined;
-    const initialBinding = teamBinding
-      ? {
-        ...teamBinding,
-        ...(initialRuntimeAuthority ? { runtimeAuthority: initialRuntimeAuthority } : {}),
-        ...(initialRuntimeAccess ? { runtimeAccess: initialRuntimeAccess } : {}),
-        ...(initialSession ? { session: initialSession } : {}),
+        if (!opened.ok) throw new Error(`${opened.code}: ${opened.error}`);
+        initialRuntimeAccess = opened.access;
       }
-      : (current?.root !== undefined && current.rootDev !== undefined && current.rootIno !== undefined && current.principal !== undefined && current.principalFingerprint !== undefined && current.liveGuard !== undefined
-        ? { root: current.root, rootDev: current.rootDev, rootIno: current.rootIno, principal: current.principal, principalFingerprint: current.principalFingerprint, liveGuard: current.liveGuard, ...(initialSession ? { session: initialSession } : {}) }
-        : undefined);
-    recordTeamLifecycle(originalPi as unknown as object, activation.registryToken, initialBinding);
+      const initialBinding = teamBinding
+        ? {
+          ...teamBinding,
+          ...(initialRuntimeAuthority ? { runtimeAuthority: initialRuntimeAuthority } : {}),
+          ...(initialRuntimeAccess ? { runtimeAccess: initialRuntimeAccess } : {}),
+          ...(initialSession ? { session: initialSession } : {}),
+        }
+        : (current?.root !== undefined && current.rootDev !== undefined && current.rootIno !== undefined && current.principal !== undefined && current.principalFingerprint !== undefined && current.liveGuard !== undefined
+          ? { root: current.root, rootDev: current.rootDev, rootIno: current.rootIno, principal: current.principal, principalFingerprint: current.principalFingerprint, liveGuard: current.liveGuard, ...(initialSession ? { session: initialSession } : {}) }
+          : undefined);
+      recordTeamLifecycle(originalPi as unknown as object, activation.registryToken, initialBinding);
+      opts.onSessionBindingController?.(sessionBindingController);
+    } catch (error) {
+      if (initialRuntimeAccess) initialRuntimeAccess.close();
+      if (initialRuntimeAuthority) revokeCtoRuntimeSessionAuthority(initialRuntimeAuthority);
+      throw error;
+    }
   }
   return opts.deferConstitutionGate ? installConstitutionGate : undefined;
   } catch (error) {
+    revokeSessionBindingController();
     markTeamFailed(originalPi as unknown as object, error, !hostMountStarted);
     throw error;
   } finally {
@@ -2302,10 +2351,16 @@ function mountedCtoRuntimeForCreate(pi: object, ctx: unknown, cwd: string): Moun
   const identity = hostSessionIdentity(ctx);
   const current = teamActivationCells.get(pi);
   const currentSession = current ? teamCellSession(current) : null;
-  if (!identity || identity.sessionId.trim().length === 0 || !current?.registryContext || !current.runtimeAuthority
+  if (!identity || identity.sessionId.trim().length === 0 || !current?.runtimeAccess
     || !currentSession || !sameHostSession(currentSession, identity)) return null;
-  const opened = openCtoRuntimeAccess(current.registryContext, current.runtimeAuthority, cwd);
-  return opened.ok ? { runtimeAccess: opened.access, sessionId: identity.sessionId } : null;
+  try {
+    current.liveGuard?.();
+    current.runtimeAccess.assertProjectRoot(cwd);
+    current.runtimeAccess.assertLive();
+    return { runtimeAccess: current.runtimeAccess, sessionId: identity.sessionId };
+  } catch {
+    return null;
+  }
 }
 
 /** Resolve existing run authority and prove its authenticated state binding. */
