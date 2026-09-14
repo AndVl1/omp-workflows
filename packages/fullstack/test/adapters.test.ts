@@ -110,6 +110,7 @@ function createEscalationAdapter(config: Parameters<typeof createEscalationAdapt
 }
 
 import { HttpEscalationAdapter } from "../src/adapters/http.js";
+import { verifyTelegramMappingProof } from "../src/adapters/mapping-secret.js";
 import {
   MAX_TELEGRAM_IDEMPOTENCY_KEY_UTF8_BYTES,
   TelegramAnswerConflictError,
@@ -147,6 +148,7 @@ import {
   loadEscalationConfig as loadEscalationConfigRaw,
   createEscalationAdapter as createEscalationAdapterRaw,
   drainOutbox as drainOutboxRaw,
+  queueCtoDelivery as queueCtoDeliveryRaw,
   outboxDir,
 } from "../src/adapters/registry.js";
 
@@ -296,6 +298,44 @@ function writeTelegramMapFixture(root: string, runId: string, chatId: string, re
   writeFileSync(join(directory, "tg-map.meta.json"), JSON.stringify({ schema: 2, tenant: runId, chatId }));
   writeFileSync(join(directory, "tg-map.jsonl"), records.map((record) => JSON.stringify({ ...record, chatId })).join("\n") + "\n");
   return directory;
+}
+
+function assertAuthenticatedTelegramMapping(root: string, runId: string, chatId: string, expectedEscId: string, expectedMessageId: number, runtime: FullstackRuntime): void {
+  const mapPath = join(telegramPartitionDir(root, runId, chatId), "tg-map.jsonl");
+  const lines = readFileSync(mapPath, "utf8").trim().split("\n");
+  assert.equal(lines.length, 1, "one canonical Telegram mapping is durable");
+  const mapping = JSON.parse(lines[0]!) as Record<string, any>;
+  assert.equal(mapping.escId, expectedEscId);
+  assert.equal(mapping.messageId, expectedMessageId);
+  assert.equal(mapping.chatId, chatId);
+  const pin = RuntimePinnedProjectRoot.open(root);
+  assert.ok(pin, "mapping root can be pinned");
+  try {
+    assert.deepEqual(mapping.root, { canonical_path: pin.canonical_root, dev: pin.dev, ino: pin.ino });
+  } finally {
+    pin.close();
+  }
+  const snapshot = runtime.access.resolveEscalationChannelSnapshot();
+  assert.equal(snapshot.status, "valid", "mapping route uses a valid authenticated projection");
+  assert.equal(mapping.route?.projection_sha256, snapshot.config_sha256);
+  assert.equal(mapping.route?.channel, "telegram");
+  assert.equal(mapping.route?.target, chatId);
+  assert.equal(mapping.delivery?.receipt?.sent, true);
+  assert.equal(mapping.delivery?.receipt?.channelRef, `tg:${expectedMessageId}`);
+  for (const value of [mapping.delivery?.payload_digest, mapping.delivery?.delivery_digest, mapping.proof]) {
+    assert.equal(typeof value, "string");
+    assert.equal(value.length, 64);
+    assert.equal(/[^0-9a-f]/iu.test(value), false);
+  }
+  const proofPayload = JSON.stringify({
+    escId: mapping.escId,
+    messageId: mapping.messageId,
+    chatId: mapping.chatId,
+    root: mapping.root,
+    route: mapping.route,
+    delivery: mapping.delivery,
+  });
+  assert.equal(verifyTelegramMappingProof(runtime.proofAuthority, proofPayload, mapping.proof), true, "Telegram mapping proof authenticates its durable fields");
 }
 
 const INBOX_WORKER_SCRIPT = `
@@ -695,8 +735,7 @@ test("adapters: Telegram accepted send journals remote receipt before mapping an
     assert.equal(repaired.sent, true);
     assert.deepEqual(repaired, { sent: true, channelRef: "tg:77" });
     assert.equal(sends, 1, "mapping repair must not call Telegram again");
-    const map = readFileSync(join(telegramPartitionDir(root, "tg-run", "42"), "tg-map.jsonl"), "utf8").trim().split("\n");
-    assert.deepEqual(map.map((line) => JSON.parse(line)), [{ escId: esc.id, messageId: 77, chatId: "42" }]);
+    assertAuthenticatedTelegramMapping(root, "tg-run", "42", esc.id, 77, runtimeFor(root));
     assert.deepEqual(await adapter.sendWithIdempotency(esc, key), repaired);
     assert.equal(sends, 1, "delivered replay must remain suppressed after repair");
   } finally {
@@ -735,10 +774,7 @@ test("adapters: Telegram delivered_unmapped crash replay repairs mapping without
     assert.deepEqual(first, { sent: true, channelRef: "tg:91" });
     assert.deepEqual(replay, first);
     assert.equal(sends, 0, "a durable remote receipt must suppress every transport replay");
-    assert.deepEqual(
-      readFileSync(join(telegramPartitionDir(root, "tg-run", "42"), "tg-map.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line)),
-      [{ escId: esc.id, messageId: 91, chatId: "42" }],
-    );
+    assertAuthenticatedTelegramMapping(root, "tg-run", "42", esc.id, 91, runtimeFor(root));
     const delivered = JSON.parse(readFileSync(join(effects, marker), "utf8")) as { status: string };
     assert.equal(delivered.status, "delivered");
   } finally {
@@ -897,6 +933,10 @@ test("adapters: canonical answer replay is rejected after bounded seen-answer ev
       run_id: runId,
       answer: "approve_continue",
     }));
+    const answerBatches: Array<typeof answers> = [];
+    for (let offset = 0; offset < answers.length; offset += MAX_POLLED_ANSWER_BATCH_ENTRIES) {
+      answerBatches.push(answers.slice(offset, offset + MAX_POLLED_ANSWER_BATCH_ENTRIES));
+    }
     let pollCount = 0;
     let callbacks = 0;
     const adapter = {
@@ -904,12 +944,16 @@ test("adapters: canonical answer replay is rejected after bounded seen-answer ev
       send: async () => ({ sent: true }),
       sendWithIdempotency: async () => ({ sent: true }),
       cancel: async () => undefined,
-      pollOnce: async () => pollCount++ === 0 ? answers : [answers[0]],
+      pollOnce: async () => answerBatches[pollCount++] ?? [answers[0]],
     } as unknown as EscalationAdapter;
     const runtime = runtimeFor(root);
     assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "answer replay fixture has authenticated routing");
-    await pollInbox(root, adapter, undefined, () => { callbacks += 1; }, { idempotentWake: true });
-    assert.equal(callbacks, answers.length, "the first canonical batch reaches each answer callback once");
+    let delivered = 0;
+    for (const batch of answerBatches) {
+      await pollInbox(root, adapter, undefined, () => { callbacks += 1; }, { idempotentWake: true });
+      delivered += batch.length;
+      assert.equal(callbacks, delivered, "each bounded canonical answer batch reaches its callback once");
+    }
     await pollInbox(root, adapter, undefined, () => { callbacks += 1; }, { idempotentWake: true });
     assert.equal(callbacks, answers.length, "durable canonical checkpoint state rejects replay after in-memory eviction");
   } finally {
@@ -968,16 +1012,17 @@ test("adapters: no-lifecycle adapter send is bounded by the fixed operation time
   writeTelegramTestConfig(root, "token", "42");
   try {
     const runId = "adapter-timeout";
-    withIndexedRun(root, runId);
-    publishTestDelivery(root, runId, sampleEscalation({ id: `${runId}/team-a/timeout/1` }));
+    const runtime = runtimeFor(root);
     const adapter = {
       kind: "never-send",
       send: async () => new Promise<never>(() => undefined),
       sendWithIdempotency: async () => new Promise<never>(() => undefined),
       cancel: async () => undefined,
     } as unknown as EscalationAdapter;
-    const runtime = runtimeFor(root);
     assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "timeout fixture has authenticated routing");
+    withIndexedRun(root, runId);
+    const published = queueCtoDeliveryRaw(root, runId, sampleEscalation({ id: runId + "/team-a/timeout/1" }), undefined, undefined, runtime.access);
+    assert.ok(published, "canonical timeout delivery publication succeeds");
     const started = Date.now();
     const results = await drainOutbox(root, adapter, 1);
     const elapsed = Date.now() - started;
