@@ -1925,11 +1925,13 @@ describe("CTO specification preparation decisions", () => {
       const pendingFile = readdirSync(transactionDir).find((entry) => entry.endsWith(".json"));
       assert.ok(pendingFile);
       const pendingPath = join(transactionDir, pendingFile!);
-      const pendingTerminal = JSON.parse(readFileSync(pendingPath, "utf8")) as Record<string, unknown>;
-      pendingTerminal.status = "aborted"
+      const terminal = JSON.parse(readFileSync(pendingPath, "utf8")) as Record<string, unknown>;
+      terminal.status = "aborted";
       terminal.abort_reason = "decision_conflict";
-      pendingTerminal.aborted_at = new Date().toISOString();
-            writeFileSync(pendingPath, `${JSON.stringify(terminal, null, 2)}\n`, "utf8");
+      terminal.aborted_at = new Date().toISOString();
+      terminal.terminal_at = new Date().toISOString();
+      terminal.terminal_disposition = "preserved";
+      writeFileSync(pendingPath, `${JSON.stringify(terminal, null, 2)}\n`, "utf8");
 
       let replaced = false;
       setCtoSpecificationDecisionFailureInjector((point) => {
