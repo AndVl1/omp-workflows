@@ -482,7 +482,8 @@ function reviewPacketTransactionPath(root: string, ctoRunId: string): string {
   return path;
 }
 function reviewPacketTransactionContent(transaction: ReviewPacketPublicationTransaction): string {
-  const content = `${JSON.stringify(transaction, null, 2)}\r\n`;
+  const content = `${JSON.stringify(transaction, null, 2)}\r
+`;
   if (Buffer.byteLength(content, "utf8") > MAX_REVIEW_PACKET_TRANSACTION_BYTES) {
     throw new CtoSpecificationPreparationError("CTO_REVIEW_PACKET_INVALID", "review packet transaction exceeds its bounded size");
   }
@@ -984,6 +985,17 @@ function assertPreparationWorkspacesReady(
  * collision. A later implementation must be admitted as a new
  * `specification-execution` wave with a separately issued epoch.
  */
+function assertPreparationOwnerSession(state: CtoState | null, ctoRunId: string, sessionId: string): void {
+  if (!state) return;
+  const wave = activeWave(state);
+  if (state.owner_session !== sessionId || (wave !== null && wave.work_identity?.session_id !== sessionId)) {
+    throw new CtoSpecificationPreparationError(
+      "CTO_RUNTIME_ACCESS_INVALID",
+      `CTO run "${ctoRunId}" is owned by a different authenticated session`,
+    );
+  }
+}
+
 function advanceCtoSpecificationPreparationUnlocked(
   root: string,
   ctoRunId: string,
@@ -1425,14 +1437,15 @@ export function advanceCtoSpecificationPreparation(
     recoverReviewPacketTransaction(root, ctoRunId, pinnedRoot);
     assertRuntimeLive();
     try {
-      assertRuntimeLive();
       const projectedState = options.runtimeAccess.readState(ctoRunId) as unknown as CtoState | null;
       assertRuntimeLive();
+      assertPreparationOwnerSession(projectedState, ctoRunId, options.sessionId);
       ensurePreparationConstitutionBeforeRunLock(root, pinnedRoot, projectedState, assertRuntimeLive);
       assertRuntimeLive();
       return options.runtimeAccess.withRunTransaction(ctoRunId, (transaction) => {
         assertRuntimeLive();
         const state = transaction.readState();
+        assertPreparationOwnerSession(state, ctoRunId, options.sessionId);
         assertRuntimeLive();
         return advanceCtoSpecificationPreparationUnlocked(
           root,

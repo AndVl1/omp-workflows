@@ -169,15 +169,16 @@ const recordDecisions = recordCtoSpecificationDecisions as unknown as (
   input: { cto_run_id: string; decisions: unknown[] },
 ) => DecisionsResult;
 
-function openPreparationRuntime(root: string) {
-  const runtime = openTestCtoRuntime(root, "cto-spec-preparation-runtime-test-session", "cto-spec-preparation-runtime-test");
+const PREPARATION_RUNTIME_SESSION = "cto-spec-preparation-runtime-test-session";
+function openPreparationRuntime(root: string, sessionId = PREPARATION_RUNTIME_SESSION) {
+  const runtime = openTestCtoRuntime(root, sessionId, "cto-spec-preparation-runtime-test");
   return { access: runtime.access, release: runtime.close };
 }
 
-function advance(projectRoot: string, input: { cto_run_id: string }): AdvanceResult {
-  const runtime = openPreparationRuntime(projectRoot);
+function advance(projectRoot: string, input: { cto_run_id: string }, sessionId = PREPARATION_RUNTIME_SESSION): AdvanceResult {
+  const runtime = openPreparationRuntime(projectRoot, sessionId);
   try {
-    return advanceCtoSpecificationPreparation(projectRoot, input, { runtimeAccess: runtime.access }) as AdvanceResult;
+    return advanceCtoSpecificationPreparation(projectRoot, input, { runtimeAccess: runtime.access, sessionId }) as AdvanceResult;
   } finally {
     runtime.release();
   }
@@ -232,7 +233,7 @@ import { advanceCtoSpecificationPreparation, setCtoSpecificationPreparationFailu
 setCtoSpecificationPreparationFailureInjector((point) => {
   if (point === "after_artifact_write") process.exit(73);
 });
-advanceCtoSpecificationPreparation(root, { cto_run_id: process.env.REVIEW_PACKET_CRASH_RUN }, { runtimeAccess });
+advanceCtoSpecificationPreparation(root, { cto_run_id: process.env.REVIEW_PACKET_CRASH_RUN }, { runtimeAccess, sessionId });
 process.exit(92);`;
   return new Promise((resolveChild, rejectChild) => {
     const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
@@ -261,7 +262,7 @@ import { advanceCtoSpecificationPreparation, setCtoSpecificationPreparationFailu
 setCtoSpecificationPreparationFailureInjector((point) => {
   if (point === "before_packet_publish") process.exit(74);
 });
-advanceCtoSpecificationPreparation(root, { cto_run_id: process.env.REVIEW_PACKET_CRASH_RUN }, { runtimeAccess });
+advanceCtoSpecificationPreparation(root, { cto_run_id: process.env.REVIEW_PACKET_CRASH_RUN }, { runtimeAccess, sessionId });
 process.exit(92);`;
   return new Promise((resolveChild, rejectChild) => {
     const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
@@ -812,7 +813,7 @@ async function setupResidentPreparation(root: string): Promise<WorkIdentity> {
     run_id: CTO_RUN_ID,
     wave_id: "wave-cto-preparation",
     slice_id: "slice-cto-preparation",
-    session_id: "session-cto-preparation",
+    session_id: PREPARATION_RUNTIME_SESSION,
     workflow: "spec-preparation",
     stage_id: "preparation",
     stage_cursor: "preparation",
@@ -872,6 +873,7 @@ async function setupResidentPreparation(root: string): Promise<WorkIdentity> {
     autonomous: false,
     plan: { id: CTO_RUN_ID, task: "resident specification preparation", teams: [], created_at: new Date().toISOString() },
     standby: true,
+    owner_session: PREPARATION_RUNTIME_SESSION,
   });
   const preparationState = state as typeof state & {
     preparation_digest: string;

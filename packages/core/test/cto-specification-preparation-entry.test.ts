@@ -35,13 +35,13 @@ function project(): string {
 
 type PreparationRuntimeOptions = { runtimeAccess: CtoRuntimeAccessFacade; sessionId: string; cleanup: () => void };
 
-function preparationRuntimeOptions(root: string): PreparationRuntimeOptions {
-  const runtime = openTestCtoRuntime(root, "preparation-entry-test", "cto-preparation-entry-runtime");
-  return { runtimeAccess: runtime.access, sessionId: "preparation-entry-test", cleanup: runtime.close };
+function preparationRuntimeOptions(root: string, sessionId = "preparation-entry-test"): PreparationRuntimeOptions {
+  const runtime = openTestCtoRuntime(root, sessionId, "cto-preparation-entry-runtime");
+  return { runtimeAccess: runtime.access, sessionId, cleanup: runtime.close };
 }
 
-function prepareCtoSpecificationPreparationWithRuntime(root: string, preparationInput: Record<string, unknown>): ReturnType<typeof prepareCtoSpecificationPreparationRaw> {
-  const runtime = preparationRuntimeOptions(root);
+function prepareCtoSpecificationPreparationWithRuntime(root: string, preparationInput: Record<string, unknown>, sessionId = "preparation-entry-test"): ReturnType<typeof prepareCtoSpecificationPreparationRaw> {
+  const runtime = preparationRuntimeOptions(root, sessionId);
   try {
     return prepareCtoSpecificationPreparationRaw(root, preparationInput as never, runtime);
   } finally {
@@ -174,6 +174,45 @@ describe("engine-owned CTO specification preparation entry", () => {
       assert.deepEqual(replay.scheduled, first.scheduled);
       assert.deepEqual(replay.queued, first.queued);
       assert.equal(readFileSync(join(root, ".work-state", "cto", first.cto_run_id, "state.json"), "utf8").includes("active_wave_id"), true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  test("rejects foreign preparation sessions before any replay or decision mutation", () => {
+    const root = project();
+    try {
+      const first = prepareCtoSpecificationPreparationWithRuntime(root, input());
+      assert.equal(first.status, "ready", JSON.stringify(first));
+      if (first.status !== "ready") return;
+      const statePath = join(root, ".work-state", "cto", first.cto_run_id, "state.json");
+      const beforeState = readFileSync(statePath);
+      const beforeFeatureBytes = first.features.map((feature) => ({ path: join(root, feature.state_path), bytes: readFileSync(join(root, feature.state_path)) }));
+      const journalPath = join(root, ".work-state", "cto", first.cto_run_id, "specification-preparation.transaction.json");
+
+      const foreignRuntime = preparationRuntimeOptions(root, "foreign-preparation-session");
+      try {
+        const replay = prepareCtoSpecificationPreparationRaw(root, input() as never, foreignRuntime);
+        assert.equal(replay.status, "blocked", JSON.stringify(replay));
+        if (replay.status === "blocked") assert.match(replay.findings.join("\n"), /different authenticated session|owner session|recovery_required/u);
+
+        const reviewed = reviewCtoSpecificationPreparation(root, { cto_run_id: first.cto_run_id }, foreignRuntime);
+        assert.equal(reviewed.status, "blocked", JSON.stringify(reviewed));
+        if (reviewed.status === "blocked") assert.match(reviewed.findings.join("\n"), /different authenticated session|owner session|recovery_required/u);
+
+        const decided = decideCtoSpecificationPreparation(root, { cto_run_id: first.cto_run_id, decisions: [] }, foreignRuntime);
+        assert.equal(decided.status, "blocked", JSON.stringify(decided));
+        if (decided.status === "blocked") assert.match(decided.findings.join("\n"), /different authenticated session|owner session|recovery_required/u);
+      } finally {
+        foreignRuntime.cleanup();
+      }
+
+      assert.deepEqual(readFileSync(statePath), beforeState, "foreign preparation replay must not rewrite CTO state");
+      for (const feature of beforeFeatureBytes) assert.deepEqual(readFileSync(feature.path), feature.bytes, `foreign preparation replay must not rewrite ${feature.path}`);
+      assert.equal(existsSync(journalPath), false, "foreign preparation replay must not create a bootstrap journal");
+
+      const ownerReplay = prepareCtoSpecificationPreparationWithRuntime(root, input(), "preparation-entry-test");
+      assert.equal(ownerReplay.status, "ready", JSON.stringify(ownerReplay));
+      if (ownerReplay.status === "ready") assert.deepEqual(ownerReplay.features, first.features, "the authenticated owner may replay the exact preparation");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

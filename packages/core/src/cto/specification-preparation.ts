@@ -994,7 +994,9 @@ function replayFeatures(root: string, pinnedRoot: PinnedProjectRoot, state: Prep
   if (!Array.isArray(state.preparation_queued) || JSON.stringify(state.preparation_queued) !== JSON.stringify(schedule.queued)) return null;
   return features;
 }
-function replay(root: string, pinnedRoot: PinnedProjectRoot, state: PreparationState, input: NormalizedInput, profileName: string, profileHashValue: string, constitution: ConstitutionGateRecord): CtoSpecificationPreparationReady | null {
+function replay(root: string, pinnedRoot: PinnedProjectRoot, state: PreparationState, input: NormalizedInput, profileName: string, profileHashValue: string, constitution: ConstitutionGateRecord, sessionId: string): CtoSpecificationPreparationReady | null {
+  const ownerFinding = preparationOwnerFinding(state, input.ctoRunId, sessionId);
+  if (ownerFinding) return null;
   const wave = activeWave(state); if (!wave || wave.source !== WAVE_SOURCE || wave.id !== input.waveId || wave.source_id !== input.sourceId) return null;
   if (!wave.work_identity || state.work_identity === undefined || JSON.stringify(wave.work_identity) !== JSON.stringify(state.work_identity) || !validPreparationCapability(state, input, wave.work_identity, profileHashValue)) return null;
   const features = replayFeatures(root, pinnedRoot, state, input, profileName, profileHashValue); if (!features) return null;
@@ -1057,6 +1059,13 @@ export function prepareCtoSpecificationPreparation(projectRoot: string, input: C
       }
       const activeResident = indexAuthority.authenticated ? indexAuthority.index.active_run_id : null;
       if (activeResident && activeResident !== request.ctoRunId) return blocked(`active resident CTO run '${activeResident}' owns preparation; nested CTO '${request.ctoRunId}' is not admitted`);
+      let authenticatedState: Readonly<Record<string, unknown>> | null;
+      try { authenticatedState = runtimeAccess.readState(request.ctoRunId); }
+      catch (error) { return blocked(`recovery_required: authenticated CTO state proof is unavailable: ${error instanceof Error ? error.message : String(error)}`); }
+      const untrustedCurrent = readCtoStatePinned(request.ctoRunId, pinnedRoot) as PreparationState | null;
+      const ownerFinding = preparationOwnerFinding(untrustedCurrent, request.ctoRunId, sessionId);
+      if (ownerFinding) return blocked(ownerFinding);
+      if (untrustedCurrent && !authenticatedState) return blocked("recovery_required: existing CTO state lacks a valid live origin and full-state proof");
       const gateResult = ensureCtoPreparationPrerequisite(root, { origin_run_key: request.ctoRunId, pinnedRoot });
       if (!gateResult.ok) return blocked(`${gateResult.code}: ${gateResult.error}`);
       const constitution = gateResult.value;
@@ -1075,18 +1084,19 @@ export function prepareCtoSpecificationPreparation(projectRoot: string, input: C
           return blocked(`constitution prerequisite is ${featureGate.value.status} for feature '${candidate.feature_id}'; feature preparation is not admitted`);
         }
       }
-        let authenticatedState: Readonly<Record<string, unknown>> | null;
-        try { authenticatedState = runtimeAccess.readState(request.ctoRunId); }
-        catch (error) { return blocked(`recovery_required: authenticated CTO state proof is unavailable: ${error instanceof Error ? error.message : String(error)}`); }
-        const untrustedCurrent = readCtoStatePinned(request.ctoRunId, pinnedRoot) as PreparationState | null;
-        if (untrustedCurrent && !authenticatedState) return blocked("recovery_required: existing CTO state lacks a valid live origin and full-state proof");
-        assertRuntimeLive();
         const recovered = authenticatedState
-          ? runtimeAccess.withRunTransaction(request.ctoRunId, () => recoverBootstrapJournal(root, pinnedRoot, request, profileHashValue))
+          ? runtimeAccess.withRunTransaction(request.ctoRunId, () => {
+              const lockedCurrent = readCtoStatePinned(request.ctoRunId, pinnedRoot) as PreparationState | null;
+              const lockedOwnerFinding = preparationOwnerFinding(lockedCurrent, request.ctoRunId, sessionId);
+              if (lockedOwnerFinding) return { ok: false as const, error: lockedOwnerFinding };
+              return recoverBootstrapJournal(root, pinnedRoot, request, profileHashValue);
+            })
           : recoverBootstrapJournal(root, pinnedRoot, request, profileHashValue);
         if (!recovered.ok) return blocked(recovered.error);
         const current = authenticatedState ? readCtoStatePinned(request.ctoRunId, pinnedRoot) as PreparationState | null : null;
-        if (current) return replay(root, pinnedRoot, current, request, WORKFLOW, profileHashValue, constitution) ?? blocked("an existing CTO run has a different preparation identity or is not an active specification-preparation wave; takeover is not permitted");
+        const currentOwnerFinding = preparationOwnerFinding(current, request.ctoRunId, sessionId);
+        if (currentOwnerFinding) return blocked(currentOwnerFinding);
+        if (current) return replay(root, pinnedRoot, current, request, WORKFLOW, profileHashValue, constitution, sessionId) ?? blocked("an existing CTO run has a different preparation identity or is not an active specification-preparation wave; takeover is not permitted");
       for (const candidate of features) {
         const paths = [
           `specs/${candidate.feature_id}`,
@@ -1285,8 +1295,19 @@ export function prepareCtoSpecificationPreparation(projectRoot: string, input: C
   } finally { pinnedRoot.close(); }
 }
 
-function activePreparationLocked(ctoRunId: string, pinnedRoot: PinnedProjectRoot): ActivePreparationContext | CtoSpecificationPreparationBlocked {
+function preparationOwnerFinding(state: PreparationState | null, ctoRunId: string, sessionId: string): string | null {
+  if (!state) return null;
+  const wave = activeWave(state);
+  if (state.owner_session !== sessionId || (wave !== null && wave.work_identity?.session_id !== sessionId)) {
+    return "recovery_required: CTO run '" + ctoRunId + "' is owned by a different authenticated session";
+  }
+  return null;
+}
+
+function activePreparationLocked(ctoRunId: string, pinnedRoot: PinnedProjectRoot, sessionId: string): ActivePreparationContext | CtoSpecificationPreparationBlocked {
   const state = readCtoStatePinned(ctoRunId, pinnedRoot) as PreparationState | null; const wave = state && activeWave(state);
+  const ownerFinding = preparationOwnerFinding(state, ctoRunId, sessionId);
+  if (ownerFinding) return blocked(ownerFinding);
   if (!state || state.id !== ctoRunId || !wave || wave.source !== WAVE_SOURCE || wave.id !== state.active_wave_id || !isSafeStateSegment(wave.source_id)) return blocked(`CTO run '${ctoRunId}' is missing or has no active specification-preparation wave`);
   const identity = wave.work_identity; if (!identity || identity.run_id !== ctoRunId || identity.wave_id !== wave.id || identity.workflow !== WORKFLOW || !isSafeStateSegment(identity.capability_id) || !isSafeStateSegment(identity.capability_epoch) || !state.work_identity || JSON.stringify(identity) !== JSON.stringify(state.work_identity)) return blocked(`CTO run '${ctoRunId}' active preparation wave has no exact engine-issued identity`);
   if (!Array.isArray(state.preparation_features)) return blocked(`CTO run '${ctoRunId}' active preparation wave has no scheduled preparation_features`);
@@ -1312,8 +1333,10 @@ function activePreparationLocked(ctoRunId: string, pinnedRoot: PinnedProjectRoot
   if (JSON.stringify(wave.slice_ids) !== JSON.stringify(features.map((feature) => feature.phase_writer_id))) return blocked(`CTO run '${ctoRunId}' active preparation wave slices do not match scheduled preparation_features`);
   return { state, wave, features, pinnedRoot };
 }
-function ensureActivePreparationConstitutionsBeforeRunLock(root: string, ctoRunId: string, pinnedRoot: PinnedProjectRoot): CtoSpecificationPreparationBlocked | null {
+function ensureActivePreparationConstitutionsBeforeRunLock(root: string, ctoRunId: string, pinnedRoot: PinnedProjectRoot, sessionId: string): CtoSpecificationPreparationBlocked | null {
   const state = readCtoStatePinned(ctoRunId, pinnedRoot) as PreparationState | null;
+  const ownerFinding = preparationOwnerFinding(state, ctoRunId, sessionId);
+  if (ownerFinding) return blocked(ownerFinding);
   if (!state || !Array.isArray(state.preparation_features)) return null;
   for (const feature of state.preparation_features) {
     if (!validPreparedFeature(feature)) continue;
@@ -1349,10 +1372,10 @@ function withActivePreparation<T>(projectRoot: string, ctoRunId: string, options
   try {
     assertRuntimeLive();
     if (!pinnedRoot.isStable()) return blocked("project root changed before CTO preparation operation");
-    const constitution = ensureActivePreparationConstitutionsBeforeRunLock(root, ctoRunId, pinnedRoot);
+    const constitution = ensureActivePreparationConstitutionsBeforeRunLock(root, ctoRunId, pinnedRoot, options.sessionId);
     if (constitution) return constitution;
     assertRuntimeLive();
-    return withCtoRunLock(root, "__resident_cto__", () => { assertRuntimeLive(); const context = activePreparationLocked(ctoRunId, pinnedRoot); return "status" in context ? context : callback(context, root); }, { pinnedRoot });
+    return withCtoRunLock(root, "__resident_cto__", () => { assertRuntimeLive(); const context = activePreparationLocked(ctoRunId, pinnedRoot, options.sessionId); return "status" in context ? context : callback(context, root); }, { pinnedRoot });
   } catch (error) {
     return blocked(`CTO specification preparation operation failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally { pinnedRoot.close(); }
