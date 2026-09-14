@@ -186,6 +186,17 @@ function runKeyFor(featureId: string): string {
 }
 
 function persistSeeded(root: string, workspace: FeatureWorkspace): void {
+  if (workspace.constitution_binding !== null) {
+    const gate = ensureProjectConstitution(root, {
+      origin_kind: "do_work_nested",
+      origin_run_key: runKeyFor(workspace.feature_id),
+      origin_stage: "do_work",
+    }, { feature_id: workspace.feature_id });
+    assert.ok(gate.ok, gate.ok ? "seeded constitution gate established" : "seeded constitution rejected: " + gate.error);
+    if (!gate.ok || !gate.value.binding) return;
+    workspace.constitution_binding = gate.value.binding as unknown as FeatureWorkspace["constitution_binding"];
+    workspace.constitution_gate_ref = gate.value.gate_id;
+  }
   workspace.next_action = nextActionForWorkspace(workspace.phases, {
     status: workspace.status,
     hasConstitutionBinding: workspace.constitution_binding !== null,
