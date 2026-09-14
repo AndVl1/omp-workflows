@@ -42,6 +42,7 @@ import {
   assertCtoRuntimeProofAuthorityLive,
   isCtoRuntimeProofAuthority,
   type CtoRuntimeAccessFacade,
+  type CtoRuntimeBridgeRouteCandidate,
   type CtoRuntimeProofAuthority,
 } from "@andvl1/omp-workflows-core/cto-runtime";
 
@@ -104,6 +105,8 @@ export type TelegramRuntimeAccess = Pick<CtoRuntimeAccessFacade,
   | "readCompletedDeliveryIndexPage" | "hasValidStateProof" | "readState"
   | "readOutboxDeliveryObligations" | "currentOutboxDeliveryStatus"> & {
   readonly readStatus?: (runId: string) => Readonly<Record<string, unknown>> | null;
+  readonly resolveTelegramRoute?: () => CtoRuntimeBridgeRouteCandidate | null;
+  readonly withAuthenticatedDeliveryWrite?: <T>(candidate: CtoRuntimeBridgeRouteCandidate, callback: () => T) => T;
 };
 
 export interface TelegramAdapterOptions {
@@ -1113,7 +1116,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       if (sourceChatId === undefined) return null;
       const sourceChat = String(sourceChatId);
       const target = this.answerTargetOfMessage(callbackQuery.message.message_id, sourceChat, pinnedRoot);
-      if (target?.status === "done" || target?.status === "failed") return null;
+      if (target?.status === "standby" || target?.status === "done" || target?.status === "failed") return null;
       if (target && TELEGRAM_CALLBACK_TOKEN_RE.test(callbackData)) {
         const optionId = this.optionIdOfCallback(target.escId, callbackData, sourceChat, pinnedRoot);
         if (optionId) return { id: target.escId, run_id: target.runId, answer: optionId, at, by: "telegram:callback" };
@@ -1143,7 +1146,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       const replyTo = message.reply_to_message;
       const marker = parseTelegramCorrelationMarker(replyTo.text);
       const target = this.answerTargetOfMessage(replyTo.message_id, String(sourceChatId), pinnedRoot, marker ?? undefined);
-      if (target?.status === "done" || target?.status === "failed") return null;
+      if (target?.status === "standby" || target?.status === "done" || target?.status === "failed") return null;
       if (target && isSafeCtoInboundText(message.text)) {
         return { id: target.escId, run_id: target.runId, answer: message.text, at, by: "telegram:reply" };
       }
@@ -1180,55 +1183,70 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       throw new Error(`telegram: writeAnswer rejected unsafe answer identity "${String(answer.id)}"`);
     }
     this.assertLive(pinnedRoot, lifecycle);
-    const status = this.runtimeAccess?.readStatus?.(runId);
-    if (status) {
-      const terminal = status.status === "done" || status.status === "failed";
-      if (terminal) return null;
-    } else if (this.runtimeAccess?.readStatus) {
-      throw new TelegramMappingRecoveryRequiredError(0, `telegram answer target  requires mapping recovery`);
-    }
-    let queue;
-    try {
-      queue = openBoundedQueue(pinnedRoot.canonical_root, join(".work-state", "cto", runId, "answers"), { pinnedRoot });
-    } catch (error) {
-      if (error instanceof BoundedQueueError && error.code === "not_directory") {
-        throw new Error(`${error.message}; answer path is not a directory`);
+    const readStatus = this.runtimeAccess?.readStatus;
+    const routeResolver = this.runtimeAccess?.resolveTelegramRoute;
+    const routeWriter = this.runtimeAccess?.withAuthenticatedDeliveryWrite;
+    let routeCandidate: CtoRuntimeBridgeRouteCandidate | null = null;
+    if (routeResolver) {
+      routeCandidate = routeResolver();
+      if (!routeCandidate || routeCandidate.status !== "active" || routeCandidate.runId !== runId || !routeWriter) {
+        const status = readStatus?.(runId);
+        if (status?.status === "standby" || status?.status === "done" || status?.status === "failed") return null;
+        throw new TelegramMappingRecoveryRequiredError(0, `telegram answer target ${runId} requires mapping recovery`);
       }
-      throw error;
+    } else {
+      const status = readStatus?.(runId);
+      if (status?.status === "standby" || status?.status === "done" || status?.status === "failed") return null;
+      if (readStatus && !status) throw new TelegramMappingRecoveryRequiredError(0, `telegram answer target ${runId} requires mapping recovery`);
     }
-    if (!queue) throw new Error(`telegram: answer queue for run "${runId}" is unavailable or unsafe`);
-    try {
-      const fileName = canonicalDurableIdFileName(answer.id);
-      const serialized = JSON.stringify(answer, null, 2);
-      try {
-        this.assertLive(pinnedRoot, lifecycle);
-        queue.writeExclusive(fileName, serialized);
-      } catch (error) {
-        if (!(error instanceof BoundedQueueError && error.code === "exists")) throw error;
-        let existing: Partial<EscalationAnswer>;
-        try {
-          const observed = queue.read(fileName);
-          existing = JSON.parse(decodeTelegramUtf8(observed.bytes)) as Partial<EscalationAnswer>;
-        } catch {
-          throw error;
-        }
-        if (
-          existing.id !== answer.id
-          || existing.run_id !== answer.run_id
-          || typeof existing.answer !== "string"
-          || typeof existing.at !== "string"
-          || typeof existing.by !== "string"
-          || existing.answer !== answer.answer
-        ) {
-          throw new TelegramAnswerConflictError(answer.id);
-        }
-        return existing as EscalationAnswer;
-      }
+    const persist = (): EscalationAnswer | null => {
       this.assertLive(pinnedRoot, lifecycle);
-      return answer;
-    } finally {
-      queue.close();
-    }
+      let queue;
+      try {
+        queue = openBoundedQueue(pinnedRoot.canonical_root, join(".work-state", "cto", runId, "answers"), { pinnedRoot });
+      } catch (error) {
+        if (error instanceof BoundedQueueError && error.code === "not_directory") {
+          throw new Error(`${error.message}; answer path is not a directory`);
+        }
+        throw error;
+      }
+      if (!queue) throw new Error(`telegram: answer queue for run "${runId}" is unavailable or unsafe`);
+      try {
+        const fileName = canonicalDurableIdFileName(answer.id);
+        const serialized = JSON.stringify(answer, null, 2);
+        try {
+          this.assertLive(pinnedRoot, lifecycle);
+          queue.writeExclusive(fileName, serialized);
+        } catch (error) {
+          if (!(error instanceof BoundedQueueError && error.code === "exists")) throw error;
+          let existing: Partial<EscalationAnswer>;
+          try {
+            const observed = queue.read(fileName);
+            existing = JSON.parse(decodeTelegramUtf8(observed.bytes)) as Partial<EscalationAnswer>;
+          } catch {
+            throw error;
+          }
+          if (
+            existing.id !== answer.id
+            || existing.run_id !== answer.run_id
+            || typeof existing.answer !== "string"
+            || typeof existing.at !== "string"
+            || typeof existing.by !== "string"
+            || existing.answer !== answer.answer
+          ) {
+            throw new TelegramAnswerConflictError(answer.id);
+          }
+          return existing as EscalationAnswer;
+        }
+        this.assertLive(pinnedRoot, lifecycle);
+        return answer;
+      } finally {
+        queue.close();
+      }
+    };
+    return routeCandidate && routeWriter
+      ? routeWriter(routeCandidate, persist)
+      : persist();
   }
 
   // ── message_id <-> escId mapping (persisted, survives restarts) ──────────

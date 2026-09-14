@@ -43,7 +43,7 @@ function telegramAdapter(options: ConstructorParameters<typeof TelegramEscalatio
   return new TelegramEscalationAdapter({ ...options, runtimeAccess: options.runtimeAccess ?? fixture.access, proofAuthority: fixture.proofAuthority });
 }
 import { canonicalDurableIdFileName, PinnedProjectRoot, type Escalation, type EscalationAnswer, type EscalationReceipt } from "@andvl1/omp-workflows-core";
-import { ctoRuntimeRunInitialIdentityDigest, newCtoState } from "../../core/src/cto/state.js";
+import { ctoRuntimeRunInitialIdentityDigest, newCtoState, setCtoPause, writeCtoState, type CtoState } from "../../core/src/cto/state.js";
 
 /** Absolute path of the answer file the adapter writes for an escId. */
 function answerPath(root: string, escId: string): string {
@@ -473,6 +473,73 @@ test("auth: allowedChatIds extends the allowlist; configured chatId stays allowe
     const esc3 = JSON.parse(readFileSync(answerPath(root, "run-sec1/esc-3"), "utf8")) as { answer: string };
     assert.equal(esc2.answer, "yes", "extra allowlisted chat accepted");
     assert.equal(esc3.answer, "no", "configured chat still accepted");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("auth: terminal callback and reply redelivery advances offset without answer or marker", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-auth-terminal-"));
+  const runId = "run-sec-terminal";
+  const callbackEscId = `${runId}/team-a/callback`;
+  const replyEscId = `${runId}/team-a/reply`;
+  const offsets: number[] = [];
+  let round = 0;
+  try {
+    withIndexedMapping(root, runId, callbackEscId, 41);
+    withIndexedMapping(root, runId, replyEscId, 42);
+    const statePath = join(root, ".work-state", "cto", runId, "state.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as CtoState;
+    assert.ok(state);
+    setCtoPause(state, "done", "terminal before Telegram redelivery");
+    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+    const adapter = telegramAdapter({
+      token: "t",
+      chatId: CONFIGURED_CHAT,
+      cwd: root,
+      fetchImpl: mockFetch(() => round++ === 0 ? [
+        { update_id: 1, callback_query: { id: "cq-terminal", from: { id: 111 }, message: { message_id: 41, chat: { id: Number(CONFIGURED_CHAT) } }, data: `${callbackEscId}::yes` } },
+        { update_id: 2, message: { message_id: 43, text: "late reply", chat: { id: Number(CONFIGURED_CHAT) }, reply_to_message: { message_id: 42, chat: { id: Number(CONFIGURED_CHAT) } } } },
+      ] : [], (offset) => offsets.push(offset)),
+    });
+    const answers = await adapter.pollOnce();
+    assert.deepEqual(answers, [], "terminal callback/reply must be handled without answer wakes");
+    assert.equal(existsSync(answerPath(root, callbackEscId)), false, "terminal callback must not create an answer");
+    assert.equal(existsSync(answerPath(root, replyEscId)), false, "terminal reply must not create an answer");
+    await adapter.pollOnce();
+    assert.deepEqual(offsets, [0, 3], "handled terminal redeliveries advance the Telegram offset");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("auth: standby mapping is stale and later Telegram update still commits", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-auth-standby-"));
+  const offsets: number[] = [];
+  const tasks: string[] = [];
+  let round = 0;
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "telegram", telegram: { token: "fixture-token", chatId: CONFIGURED_CHAT } }));
+    const standbyRun = runtimeFor(root).ensureStandbyRun();
+    const escId = `${standbyRun}/team-a/standby`;
+    withIndexedMapping(root, standbyRun, escId, 51);
+    const adapter = telegramAdapter({
+      token: "t",
+      chatId: CONFIGURED_CHAT,
+      cwd: root,
+      fetchImpl: mockFetch(() => round++ === 0 ? [
+        { update_id: 1, callback_query: { id: "cq-standby", from: { id: 111 }, message: { message_id: 51, chat: { id: Number(CONFIGURED_CHAT) } }, data: `${escId}::yes` } },
+        { update_id: 2, message: { message_id: 52, text: "later task", chat: { id: Number(CONFIGURED_CHAT) } } },
+      ] : [], (offset) => offsets.push(offset)),
+      onPlainMessage: (message) => tasks.push(message.text),
+    });
+    const answers = await adapter.pollOnce();
+    assert.deepEqual(answers, [], "standby mapping cannot wake a checkpoint");
+    assert.equal(existsSync(answerPath(root, escId)), false, "standby mapping must not create an answer");
+    assert.deepEqual(tasks, ["later task"], "the later update is processed after stale standby callback");
+    await adapter.pollOnce();
+    assert.deepEqual(offsets, [0, 3], "stale standby callback is committed before later update");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

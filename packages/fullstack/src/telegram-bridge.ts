@@ -528,7 +528,7 @@ export function writeAnswerMarker(
     if (!active || active.runId !== runId) {
       if (bridgeRoute) {
         const terminal = bridgeRoute.readStatus(runId);
-        if (terminal?.status === "done" || terminal?.status === "failed") return null;
+        if (terminal?.status === "standby" || terminal?.status === "done" || terminal?.status === "failed") return null;
         throw new BridgeRetryableError("telegram active route changed before answer marker");
       }
       return null;
