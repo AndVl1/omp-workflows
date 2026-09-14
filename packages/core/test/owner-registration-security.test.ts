@@ -634,6 +634,19 @@ test("session binding release only closes the exact current generation", () => {
     const bindingA = controller.current(contextA);
     assert.ok(bindingA, "initial generation is current");
     if (!bindingA) return;
+
+    // A manager with a valid root but no authoritative session id must not
+    // create a no-runtime binding or disturb the current generation.
+    const malformedContext = { cwd: root, sessionManager: { getCwd: () => root } };
+    assert.equal(controller.bind(malformedContext), null, "malformed session identity is rejected before mutation");
+    const afterMalformed = controller.current(contextA);
+    assert.ok(afterMalformed, "malformed bind leaves the current generation mounted");
+    if (!afterMalformed) return;
+    assert.equal(afterMalformed.runtimeAuthority, bindingA.runtimeAuthority, "malformed bind preserves the current authority");
+    assert.equal(afterMalformed.runtimeAccess, bindingA.runtimeAccess, "malformed bind preserves the current runtime facade");
+    assert.equal(ctoRuntimeSessionAuthorityForContext(bindingA.registryContext), bindingA.runtimeAuthority, "malformed bind preserves the authority claim");
+    assert.doesNotThrow(() => bindingA.runtimeAccess.assertLive(), "malformed bind preserves the current facade");
+
     const bindingB = controller.bind(contextB);
     assert.ok(bindingB, "rebind publishes the replacement generation");
     if (!bindingB) return;

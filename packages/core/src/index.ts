@@ -756,7 +756,7 @@ function guardedRegistrarHostApi(
   return wrapped;
 }
 
-/** Exact current runtime binding retained by an authenticated bundle. */
+/** Exact current runtime binding retained by an active marker-bound registry owner. */
 export interface TeamSessionRuntimeBinding {
   readonly registryContext: RegistryRegistrationContext;
   readonly runtimeAuthority: CtoRuntimeSessionAuthority;
@@ -771,7 +771,7 @@ export interface TeamSessionRuntimeBinding {
   readonly generation?: string | number;
 }
 
-/** Opaque host-session rebinding capability retained by an authenticated bundle. */
+/** Opaque host-session rebinding capability retained by an active marker-bound registry owner; same-process loaded JavaScript is trusted, not cryptographically identified. */
 export interface TeamSessionBindingController {
   bind(ctx: unknown): TeamSessionRuntimeBinding | null;
   current(ctx: unknown): TeamSessionRuntimeBinding | null;
@@ -1838,6 +1838,7 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
   const sessionBindingController: TeamSessionBindingController = Object.freeze({
     bind: (ctx: unknown): TeamSessionRuntimeBinding | null => {
       if (sessionBindingControllerRevoked) return null;
+      if (!hostSessionIdentity(ctx)) return null;
       const current = teamActivationCells.get(originalPi as unknown as object);
       if (!current || (current.state !== "active" && current.state !== "failed")) return null;
       bindSession(ctx);
