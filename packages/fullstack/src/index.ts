@@ -62,8 +62,8 @@ import {
   type WorkflowActivationResult,
   type WorkflowOwnerIdentity,
 } from "@andvl1/omp-workflows-core/registry";
-import { createCtoRuntimeAccessGuardedView, ctoRuntimeSessionAuthorityForContext, openCtoRuntimeAccess, openCtoRuntimeProofAuthority, registerCtoRuntimeAccessProvider, revokeCtoRuntimeProofAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
-import type { CtoRuntimeAccessFacade, CtoRuntimeAccessSession, CtoRuntimeProofAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
+import { createCtoRuntimeAccessGuardedView, ctoRuntimeSessionAuthorityForContext, openCtoRuntimeAccess, openCtoRuntimeProofAuthority, openCtoRuntimeServiceMutationAuthority, registerCtoRuntimeAccessProvider, revokeCtoRuntimeProofAuthority, revokeCtoRuntimeServiceMutationAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
+import type { CtoRuntimeAccessFacade, CtoRuntimeAccessSession, CtoRuntimeProofAuthority, CtoRuntimeServiceMutationAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
 import { registerWorkflowCommands } from "./workflow-commands.js";
 import { defaultFullstackModelRoles, registerModelRolesCommand } from "./model-roles.js";
 export { defaultFullstackModelRoles } from "./model-roles.js";
@@ -1209,6 +1209,8 @@ interface FullstackActivation {
   readonly sessionBindingController: TeamSessionBindingController;
   readonly binding: TeamSessionRuntimeBinding;
   readonly proofAuthority: CtoRuntimeProofAuthority;
+  /** Private project-service capability for intentional cross-run dispatcher mutations. */
+  readonly serviceAuthority: CtoRuntimeServiceMutationAuthority;
   readonly liveGuard: FullstackActivationLiveGuard;
   readonly leases: readonly FullstackActivationLease[];
 }
@@ -1305,6 +1307,7 @@ function evictFullstackRoot(pi: ExtensionAPI, root: string, expected?: Fullstack
     evictRuntimeAccessSlot(pi, root, expectedSlot);
     try { record.runtimeAccess.close(); } catch { /* teardown is best-effort */ }
     revokeCtoRuntimeProofAuthority(record.proofAuthority);
+    revokeCtoRuntimeServiceMutationAuthority(record.serviceAuthority);
     for (const lease of record.leases) {
       try { closeWorkflowActivation(lease.activation); } catch { /* teardown is best-effort; context fencing still applies */ }
     }
@@ -1643,8 +1646,14 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string, initialSession
         const currentContexts = fullstackActivationContexts.get(pi as object);
         if (currentMap?.get(root) !== currentRecord || currentContexts?.get(root) !== currentRecord.context) throw new Error("activation record changed during session rebinding");
         const oldProofAuthority = currentRecord.proofAuthority;
+        const oldServiceAuthority = currentRecord.serviceAuthority;
         const nextProofAuthority = openCtoRuntimeProofAuthority(binding.registryContext, pinnedRoot);
         if (!nextProofAuthority) throw new Error("runtime proof authority is unavailable after session rebinding");
+        const nextServiceAuthority = openCtoRuntimeServiceMutationAuthority(binding.registryContext, pinnedRoot);
+        if (!nextServiceAuthority) {
+          revokeCtoRuntimeProofAuthority(nextProofAuthority);
+          throw new Error("runtime service mutation authority is unavailable after session rebinding");
+        }
         const rotated: FullstackActivation = {
           ...currentRecord,
           context: binding.registryContext,
@@ -1656,6 +1665,7 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string, initialSession
           ...(binding.sessionBasename !== undefined ? { sessionBasename: binding.sessionBasename } : {}),
           ...(binding.generation !== undefined ? { generation: binding.generation } : {}),
           proofAuthority: nextProofAuthority,
+          serviceAuthority: nextServiceAuthority,
         };
         if (currentMap?.get(root) !== currentRecord || currentContexts?.get(root) !== currentRecord.context) {
           const owner = currentMap?.get(root);
@@ -1665,6 +1675,7 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string, initialSession
           if (!bindingOwned) currentRecord.sessionBindingController.release(binding);
           transientBinding = undefined;
           revokeCtoRuntimeProofAuthority(nextProofAuthority);
+          revokeCtoRuntimeServiceMutationAuthority(nextServiceAuthority);
           throw new Error("activation record changed before session rebinding commit");
         }
         const rotatedRecord: FullstackActivation = { ...rotated, binding };
@@ -1673,6 +1684,7 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string, initialSession
         ownedRecord = rotatedRecord;
         transientBinding = undefined;
         revokeCtoRuntimeProofAuthority(oldProofAuthority);
+        revokeCtoRuntimeServiceMutationAuthority(oldServiceAuthority);
         const slots = fullstackRuntimeAccesses.get(pi as object);
         const oldSlot = slots?.get(root);
         if (oldSlot && oldSlot.access !== binding.runtimeAccess) {
@@ -1782,6 +1794,7 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string, initialSession
   let sessionBindingController: TeamSessionBindingController | undefined;
   let initialBinding: TeamSessionRuntimeBinding | undefined;
   let proofAuthority: CtoRuntimeProofAuthority | undefined;
+  let serviceAuthority: CtoRuntimeServiceMutationAuthority | undefined;
   try {
     registerNativeSpecificationAssets(transaction.token);
     const installConstitutionGate = registerTeamWorkflow(pi, {
@@ -1811,6 +1824,8 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string, initialSession
     const runtimeAccess = binding.runtimeAccess;
     proofAuthority = openCtoRuntimeProofAuthority(binding.registryContext, pinnedRoot) ?? undefined;
     if (!proofAuthority) throw new Error("activation_context_missing: fullstack runtime proof authority is unavailable");
+    serviceAuthority = openCtoRuntimeServiceMutationAuthority(binding.registryContext, pinnedRoot) ?? undefined;
+    if (!serviceAuthority) throw new Error("activation_context_missing: fullstack runtime service mutation authority is unavailable");
     registerWorkflowTools(pi, transaction.token);
     if (pi.zod) {
       const priorLectureMount = fullstackLectureMounts.get(pi as object);
@@ -1858,6 +1873,7 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string, initialSession
       sessionBindingController,
       binding,
       proofAuthority,
+      serviceAuthority,
       liveGuard: retainedLiveGuard,
       leases: [{ activation }],
     });
@@ -1870,6 +1886,7 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string, initialSession
     if (gateInstalled && gateKey) fullstackGateInstallations.delete(gateKey);
     if (initialBinding && sessionBindingController) sessionBindingController.release(initialBinding);
     if (proofAuthority) revokeCtoRuntimeProofAuthority(proofAuthority);
+    if (serviceAuthority) revokeCtoRuntimeServiceMutationAuthority(serviceAuthority);
     try { closeWorkflowActivation(activation); } catch { /* activation teardown is best-effort */ }
     console.warn("[omp-workflows-fullstack]", JSON.stringify({ code: "registration_failed", error: String(error instanceof Error ? error.message : error) }));
     return false;
@@ -2171,6 +2188,7 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
       const dispatcher = startChannelDispatcher(pinnedRoot.lexical_root, channelSet, 10_000, {
         pinnedRoot,
         runtimeAccess: guardedRuntimeAccess,
+        serviceAuthority: activationRecord.serviceAuthority,
         proofAuthority: activationRecord.proofAuthority,
         session_id: sessionId,
         liveGuard: activationLiveGuard,

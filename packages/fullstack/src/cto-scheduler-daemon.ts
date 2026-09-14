@@ -9,14 +9,16 @@
  * credentials, nothing wired into package.json bin — same as
  * telegram-bridge.ts).
  *
- * The daemon requires a marker-authenticated main-session runtime facade;
- * it never reads or mutates CTO state through raw root helpers.
+ * The daemon requires either a marker-authenticated owner facade or a private
+ * activation-bound service capability; it never reads or mutates CTO state
+ * through raw root helpers.
  */
 
 import { fileURLToPath } from "node:url";
-import type { CtoRuntimeAccessFacade } from "@andvl1/omp-workflows-core/cto-runtime";
+import { startCtoRuntimeServiceScheduler } from "@andvl1/omp-workflows-core/cto-runtime";
+import type { CtoRuntimeAccessFacade, CtoRuntimeServiceMutationAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
 
-export interface CtoSchedulerDaemonOpts {
+type CtoSchedulerDaemonBase = {
   /** CTO run id (`.work-state/cto/<runId>/`). */
   runId: string;
   /** Workspace root that contains `.work-state/`. */
@@ -25,9 +27,14 @@ export interface CtoSchedulerDaemonOpts {
   intervalMs: number;
   /** Invoked on each due wave (defaults to a no-op). */
   onWave?: () => void;
-  /** Authenticated main-session CTO capability. */
-  runtimeAccess: CtoRuntimeAccessFacade;
-}
+};
+
+export type CtoSchedulerDaemonOpts = CtoSchedulerDaemonBase & (
+  /** Exact owner path; service capability is deliberately unavailable here. */
+  { runtimeAccess: CtoRuntimeAccessFacade; serviceAuthority?: never }
+  /** Explicit project-service path for cross-run scheduling. */
+  | { runtimeAccess?: never; serviceAuthority: CtoRuntimeServiceMutationAuthority }
+);
 
 /**
  * Start the scheduler through the authenticated runtime facade. Returns
@@ -38,7 +45,11 @@ export function startCtoSchedulerDaemon(opts: CtoSchedulerDaemonOpts): { stop():
   // before touching the runtime facade so disabling a daemon cannot require
   // state, credentials, or an otherwise-live session.
   if (Number.isFinite(opts.intervalMs) && opts.intervalMs <= 0) return { stop: () => undefined };
-  const stop = opts.runtimeAccess.startScheduler(opts.runId, opts.intervalMs, opts.onWave ?? (() => {}));
+  if (opts.runtimeAccess !== undefined) {
+    const stop = opts.runtimeAccess.startScheduler(opts.runId, opts.intervalMs, opts.onWave ?? (() => {}));
+    return { stop };
+  }
+  const stop = startCtoRuntimeServiceScheduler(opts.serviceAuthority, opts.runId, opts.intervalMs, opts.onWave ?? (() => {}));
   return { stop };
 }
 

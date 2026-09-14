@@ -72,13 +72,13 @@ function createChannelSet(root: string, capabilities?: ChannelCapabilities, pinn
   return registry.createChannelSet(root, capabilities, pinnedRoot, runtimeFor(root).access, runtimeFor(root).proofAuthority);
 }
 function drainOutbox(root: string, adapter: Parameters<typeof registry.drainOutbox>[1], maxRetries = 3, options: DrainOptions = {}) {
-  return registry.drainOutbox(root, adapter, maxRetries, { ...retryDrainContext(root), ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access, proofAuthority: runtimeFor(root).proofAuthority });
+  return registry.drainOutbox(root, adapter, maxRetries, { ...retryDrainContext(root), ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access, serviceAuthority: options.serviceAuthority ?? runtimeFor(root).serviceAuthority, proofAuthority: runtimeFor(root).proofAuthority });
 }
 function queueCtoDelivery(root: string, runId: string, delivery: Parameters<typeof registry.queueCtoDelivery>[2], pinnedRoot?: DeliveryPinnedRoot, isOwned?: DeliveryOwner, runtimeAccess?: Parameters<typeof registry.queueCtoDelivery>[5]) {
   return registry.queueCtoDelivery(root, runId, delivery, pinnedRoot, isOwned, runtimeAccess ?? runtimeFor(root).access);
 }
 function handleInboxTask(root: string, task: Parameters<typeof registry.handleInboxTask>[1], onTask?: Parameters<typeof registry.handleInboxTask>[2], options: HandleOptions = {}) {
-  return registry.handleInboxTask(root, task, onTask, { ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access, proofAuthority: runtimeFor(root).proofAuthority });
+  return registry.handleInboxTask(root, task, onTask, { ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access, serviceAuthority: options.serviceAuthority ?? runtimeFor(root).serviceAuthority, proofAuthority: runtimeFor(root).proofAuthority });
 }
 function resolveInboxRunId(root: string, pinnedRoot?: Parameters<typeof registry.resolveInboxRunId>[1], runtimeAccess?: Parameters<typeof registry.resolveInboxRunId>[2]) {
   return registry.resolveInboxRunId(root, pinnedRoot, runtimeAccess ?? runtimeFor(root).access);

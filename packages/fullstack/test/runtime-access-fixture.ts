@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openCtoRuntimeAccess, openCtoRuntimeProofAuthority, revokeCtoRuntimeProofAuthority, type CtoRuntimeAccessFacade, type CtoRuntimeProofAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
+import { openCtoRuntimeAccess, openCtoRuntimeProofAuthority, openCtoRuntimeServiceMutationAuthority, revokeCtoRuntimeProofAuthority, revokeCtoRuntimeServiceMutationAuthority, type CtoRuntimeAccessFacade, type CtoRuntimeProofAuthority, type CtoRuntimeServiceMutationAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
 import {
   beginRegistryRegistration,
   closeWorkflowActivation,
@@ -24,6 +24,7 @@ export type FullstackRuntimeTestFixture = {
   readonly root: string;
   readonly access: CtoRuntimeAccessFacade;
   readonly proofAuthority: CtoRuntimeProofAuthority;
+  readonly serviceAuthority: CtoRuntimeServiceMutationAuthority;
   readonly activation: Extract<WorkflowActivationResult, { readonly ok: true }>;
   readonly sessionId: string;
   readonly activationSnapshot: RegistryContextSnapshot;
@@ -99,11 +100,21 @@ export function openFullstackRuntimeTest(
     rmSync(root, { recursive: true, force: true });
     throw new Error("proof authority unavailable");
   }
+  const serviceAuthority = openCtoRuntimeServiceMutationAuthority(activation.registry_context, pinnedRoot);
+  if (!serviceAuthority) {
+    revokeCtoRuntimeProofAuthority(proofAuthority);
+    pinnedRoot.close();
+    opened.access.close();
+    closeWorkflowActivation(activation);
+    rmSync(root, { recursive: true, force: true });
+    throw new Error("service mutation authority unavailable");
+  }
   let closed = false;
   return {
     root,
     access: opened.access,
     proofAuthority,
+    serviceAuthority,
     activation,
     sessionId,
     activationSnapshot: activationSnapshotGuard(),
@@ -112,6 +123,7 @@ export function openFullstackRuntimeTest(
       if (closed) return;
       closed = true;
       revokeCtoRuntimeProofAuthority(proofAuthority);
+      revokeCtoRuntimeServiceMutationAuthority(serviceAuthority);
       pinnedRoot.close();
       opened.access.close();
       closeWorkflowActivation(activation);

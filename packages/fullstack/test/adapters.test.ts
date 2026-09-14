@@ -31,7 +31,7 @@ import { finishWave } from "../../core/src/cto/waves.js";
 import { PinnedProjectRoot } from "../../core/src/specification/pinned-root.js";
 import { PinnedProjectRoot as RuntimePinnedProjectRoot } from "../../core/dist/specification/pinned-root.js";
 import { beginRegistryRegistration, commitRegistryRegistration, rollbackRegistryRegistration } from "@andvl1/omp-workflows-core/registry";
-import { signCtoRuntimeProof } from "@andvl1/omp-workflows-core/cto-runtime";
+import { revokeCtoRuntimeServiceMutationAuthority, signCtoRuntimeProof } from "@andvl1/omp-workflows-core/cto-runtime";
 import { openFullstackRuntimeTest } from "./runtime-access-fixture.js";
 import { bindAuthenticatedAdapterRouting } from "./routing-fixture.js";
 
@@ -81,11 +81,11 @@ function createChannelSet(root: string, capabilities?: Parameters<typeof createC
 
 function startDispatcher(root: string, adapter: Parameters<typeof startDispatcherRaw>[1], intervalMs = 10_000, options: Partial<DispatcherOptions> = {}) {
   const runtime = runtimeFor(root);
-  return startDispatcherRaw(root, adapter, intervalMs, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard } as DispatcherOptions);
+  return startDispatcherRaw(root, adapter, intervalMs, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard, serviceAuthority: options.serviceAuthority ?? runtime.serviceAuthority } as DispatcherOptions);
 }
 function pollInbox(root: string, adapter: Parameters<typeof pollInboxRaw>[1], onTask?: Parameters<typeof pollInboxRaw>[2], onAnswer?: Parameters<typeof pollInboxRaw>[3], options: Partial<PollOptions> = {}) {
   const runtime = runtimeFor(root);
-  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access } as PollOptions);
+  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access, serviceAuthority: options.serviceAuthority ?? runtime.serviceAuthority } as PollOptions);
 }
 function drainOutbox(root: string, adapter: Parameters<typeof drainOutboxRaw>[1], maxRetries = 3, options: Partial<DrainOptions> = {}) {
   const runtime = runtimeFor(root);
@@ -93,7 +93,7 @@ function drainOutbox(root: string, adapter: Parameters<typeof drainOutboxRaw>[1]
 }
 function handleInboxTask(root: string, task: Parameters<typeof handleInboxTaskRaw>[1], onTask: Parameters<typeof handleInboxTaskRaw>[2] = undefined, options: Partial<HandleOptions> = {}) {
   const runtime = runtimeFor(root);
-  return handleInboxTaskRaw(root, task, onTask, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access } as HandleOptions);
+  return handleInboxTaskRaw(root, task, onTask, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access, serviceAuthority: options.serviceAuthority ?? runtime.serviceAuthority } as HandleOptions);
 }
 function resolveInboxRunId(root: string, pinnedRoot?: Parameters<typeof resolveInboxRunIdRaw>[1], runtimeAccess?: Parameters<typeof resolveInboxRunIdRaw>[2]) {
   return resolveInboxRunIdRaw(root, pinnedRoot, runtimeAccess ?? runtimeFor(root).access);
@@ -246,6 +246,60 @@ function publishTestDelivery(root: string, runId: string, delivery: Record<strin
   assert.ok(published, "canonical obligation and publication succeed");
   return published as string;
 }
+test("dispatcher service authority admits and acknowledges a foreign-owner run only when root-bound and live", () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatcher-service-authority-"));
+  const wrongRoot = mkdtempSync(join(tmpdir(), "dispatcher-service-authority-wrong-"));
+  let wrongRuntime: FullstackRuntime | undefined;
+  try {
+    const runtime = runtimeFor(root);
+    wrongRuntime = openFullstackRuntimeTest(wrongRoot, "dispatcher-service-wrong-root");
+    const runId = "foreign-owner-run";
+    const state = newCtoState({
+      id: runId,
+      task: "foreign owner admission",
+      branch: "main",
+      autonomous: true,
+      owner_session: "other-session",
+      plan: { id: runId, task: "foreign owner admission", teams: [], created_at: new Date().toISOString() },
+    });
+    state.work_identity = {
+      run_id: runId,
+      wave_id: "wave-service-authority",
+      slice_id: "slice-service-authority",
+      session_id: "other-session",
+    };
+    const pin = PinnedProjectRoot.open(root);
+    assert.ok(pin);
+    if (!pin) throw new Error("service authority test root could not be pinned");
+    try {
+      writeCtoState(state, root, { pinnedRoot: pin, preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+      const task = { id: "service-authority-task", text: "foreign task", at: new Date().toISOString(), runId };
+      assert.throws(() => runtime.access.withRunTransaction(runId, () => undefined), /owner|session/i, "normal owner facade rejects the foreign run");
+      const beforeAbsent = readFileSync(join(root, ".work-state", "cto", runId, "state.json"));
+      assert.equal(handleInboxTaskRaw(root, task, undefined, { pinnedRoot: pin, runtimeAccess: runtime.access, proofAuthority: runtime.proofAuthority }), null, "absent service token blocks admission");
+      assert.deepEqual(readFileSync(join(root, ".work-state", "cto", runId, "state.json")), beforeAbsent, "absent token performs no state write");
+      assert.equal(handleInboxTaskRaw(root, task, undefined, { pinnedRoot: pin, runtimeAccess: runtime.access, serviceAuthority: wrongRuntime.serviceAuthority, proofAuthority: runtime.proofAuthority }), null, "wrong-root service token blocks admission");
+      assert.deepEqual(readFileSync(join(root, ".work-state", "cto", runId, "state.json")), beforeAbsent, "wrong-root token performs no state write");
+      const admitted = handleInboxTaskRaw(root, task, undefined, { pinnedRoot: pin, runtimeAccess: runtime.access, serviceAuthority: runtime.serviceAuthority, proofAuthority: runtime.proofAuthority });
+      assert.ok(admitted, "root-bound live service token admits the foreign-owner task");
+      const afterAdmission = runtime.access.readState(runId);
+      assert.equal(afterAdmission?.inbox_quarantine && Object.values(afterAdmission.inbox_quarantine).some((record) => record.id === task.id && record.wake_status === "delivered"), true, "service path acknowledges the wake through a second transaction");
+      const beforeRevoke = readFileSync(join(root, ".work-state", "cto", runId, "state.json"));
+      revokeCtoRuntimeServiceMutationAuthority(runtime.serviceAuthority);
+      assert.equal(handleInboxTaskRaw(root, { ...task, id: "revoked-service-authority-task" }, undefined, { pinnedRoot: pin, runtimeAccess: runtime.access, serviceAuthority: runtime.serviceAuthority, proofAuthority: runtime.proofAuthority }), null, "revoked service token blocks admission");
+      assert.deepEqual(readFileSync(join(root, ".work-state", "cto", runId, "state.json")), beforeRevoke, "revoked token performs no state write");
+    } finally {
+      pin.close();
+    }
+  } finally {
+    wrongRuntime?.close();
+    for (const runtime of runtimeFixtures.values()) runtime.close();
+    runtimeFixtures.clear();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(wrongRoot, { recursive: true, force: true });
+  }
+});
+
 function publishTestTerminalSummary(root: string, runId: string): string {
   const runtime = runtimeFor(root);
   const state = newCtoState({

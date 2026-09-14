@@ -50,13 +50,16 @@ test("cto-scheduler-daemon: start + stop round-trip fires onWave and stops", asy
   let runtime: ReturnType<typeof openFullstackRuntimeTest> | undefined;
   try {
     runtime = openFullstackRuntimeTest(root, "scheduler-session");
-    writeCtoState(newCtoState({
+    const ownerState = newCtoState({
       id: "daemon-run-1",
       task: "scheduler test",
       branch: "main",
       autonomous: false,
+      owner_session: "scheduler-session",
       plan: { id: "daemon-run-1", task: "scheduler test", teams: [], created_at: new Date().toISOString() },
-    }), root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+    });
+    ownerState.work_identity = { run_id: "daemon-run-1", wave_id: "daemon-wave", slice_id: "daemon-slice", session_id: "scheduler-session" };
+    writeCtoState(ownerState, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     let waves = 0;
     const { stop } = startCtoSchedulerDaemon({
       runId: "daemon-run-1",
@@ -103,6 +106,37 @@ test("cto-scheduler-daemon: interval <= 0 returns a no-op stop and writes nothin
     stop(); // idempotent
     assert.equal(existsSync(join(root, ".work-state")), false, "disabled scheduler does not write state");
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-scheduler-daemon: an owner conflict never escalates to a service scheduler", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-daemon-owner-conflict-"));
+  let runtime: ReturnType<typeof openFullstackRuntimeTest> | undefined;
+  try {
+    runtime = openFullstackRuntimeTest(root, "scheduler-session");
+    const foreignState = newCtoState({
+      id: "daemon-foreign-run",
+      task: "foreign scheduler test",
+      branch: "main",
+      autonomous: false,
+      owner_session: "other-session",
+      plan: { id: "daemon-foreign-run", task: "foreign scheduler test", teams: [], created_at: new Date().toISOString() },
+    });
+    foreignState.work_identity = { run_id: "daemon-foreign-run", wave_id: "foreign-wave", slice_id: "foreign-slice", session_id: "other-session" };
+    writeCtoState(foreignState, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+    const ownerFacade = {
+      startScheduler: (): never => { throw Object.assign(new Error("owner conflict"), { code: "owner_conflict" }); },
+    } as unknown as ReturnType<typeof openFullstackRuntimeTest>["access"];
+    assert.throws(() => startCtoSchedulerDaemon({
+      runId: "daemon-foreign-run",
+      root,
+      intervalMs: 30,
+      runtimeAccess: ownerFacade,
+      serviceAuthority: runtime.serviceAuthority,
+    } as unknown as Parameters<typeof startCtoSchedulerDaemon>[0]), /owner conflict/);
+  } finally {
+    runtime?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

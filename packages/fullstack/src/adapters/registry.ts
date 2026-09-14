@@ -81,14 +81,16 @@ import {
   assertCtoRuntimeAccessFacadeLive,
   assertCtoRuntimeProofAuthorityLive,
   assertCtoRuntimeProofAuthorityBound,
+  assertCtoRuntimeServiceMutationAuthorityBound,
   isCtoRuntimeAccessFacade,
+  withCtoRuntimeServiceTransaction,
   isCtoRuntimeProofAuthority,
   signCtoRuntimeProof,
   verifyCtoRuntimeProof,
   type CtoRuntimeBridgeRouteAccess,
   type CtoRuntimeProofAuthority,
 } from "@andvl1/omp-workflows-core/cto-runtime";
-import type { CtoRunDeliveryIndexEntry, CtoRuntimeAccessFacade, CtoRuntimeOutboxDeliveryInput, CtoRunTransactionFacade } from "@andvl1/omp-workflows-core/cto-runtime";
+import type { CtoRunDeliveryIndexEntry, CtoRuntimeAccessFacade, CtoRuntimeOutboxDeliveryInput, CtoRunTransactionFacade, CtoRuntimeServiceMutationAuthority } from "@andvl1/omp-workflows-core/cto-runtime";
 import type { RegistryContextSnapshot } from "@andvl1/omp-workflows-core/registry";
 import {
   createRegistryRegistrationLiveGuard,
@@ -102,6 +104,7 @@ import { HttpEscalationAdapter } from "./http.js";
 import { TelegramEscalationAdapter, type TelegramRuntimeAccess } from "./telegram.js";
 
 type RuntimeAccess = CtoRuntimeAccessFacade;
+type RuntimeServiceAuthority = CtoRuntimeServiceMutationAuthority;
 
 type RuntimeWaveView = {
   readonly id: string;
@@ -1864,7 +1867,7 @@ function isSummarizableWave(wave: unknown): wave is RuntimeWaveView {
  *
  * Returns the number of NEW deliveries queued (0 on re-runs). Never throws.
  */
-export function produceWaveDeliveries(root: string, opts: { isOwned?: () => boolean; runEntries?: readonly CtoRunDeliveryIndexEntry[]; pinnedRoot?: PinnedProjectRoot; runtimeAccess?: RuntimeAccess; proofAuthority: CtoRuntimeProofAuthority }): number {
+export function produceWaveDeliveries(root: string, opts: { isOwned?: () => boolean; runEntries?: readonly CtoRunDeliveryIndexEntry[]; pinnedRoot?: PinnedProjectRoot; runtimeAccess?: RuntimeAccess; serviceAuthority?: RuntimeServiceAuthority; proofAuthority: CtoRuntimeProofAuthority }): number {
   try {
     const channelSet = createChannelSet(root, undefined, opts.pinnedRoot, opts.runtimeAccess, opts.proofAuthority);
     if (channelSet.profiles.length === 0) return 0;
@@ -4452,6 +4455,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
         wakeEvidence: opts.wakeEvidence,
         pinnedRoot: callbackPin,
         runtimeAccess: opts.runtimeAccess,
+        serviceAuthority: opts.serviceAuthority,
         proofAuthority: opts.proofAuthority,
         isOwned: () => {
           if (stopped) return false;
@@ -4536,7 +4540,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
       // last tick is queued AND drained in this same tick. Both consumers
       // receive the exact same canonical run page; no directory discovery.
       assertDispatcherActivationLive(opts.runtimeAccess, tickPin, opts.liveGuard, lease.activation);
-      produceWaveDeliveries(context.root, { isOwned, runEntries: entries, pinnedRoot: context.pinnedRoot, runtimeAccess: opts.runtimeAccess, proofAuthority: opts.proofAuthority });
+      produceWaveDeliveries(context.root, { isOwned, runEntries: entries, pinnedRoot: context.pinnedRoot, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, proofAuthority: opts.proofAuthority });
       assertDispatcherActivationLive(opts.runtimeAccess, tickPin, opts.liveGuard, lease.activation);
       const drained = await drainOutbox(context.root, drainAdapter, 3, {
         roSinks,
@@ -4583,6 +4587,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
         wakeEvidence: opts.wakeEvidence,
         pinnedRoot: context.pinnedRoot,
         runtimeAccess: opts.runtimeAccess,
+        serviceAuthority: opts.serviceAuthority,
         proofAuthority: opts.proofAuthority,
         lifecycle: pollLifecycle,
         retryCursorStore,
@@ -4714,7 +4719,7 @@ async function dispatchInboxTask(
   root: string,
   task: InboxTask,
   onTask: ((task: InboxTask) => void | Promise<void>) | undefined,
-  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot: PinnedProjectRoot; isOwned?: () => boolean; runtimeAccess?: RuntimeAccess; proofAuthority: CtoRuntimeProofAuthority },
+  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot: PinnedProjectRoot; isOwned?: () => boolean; runtimeAccess?: RuntimeAccess; serviceAuthority?: RuntimeServiceAuthority; proofAuthority: CtoRuntimeProofAuthority },
 ): Promise<InboxTaskAdmissionOutcome> {
   const admitted = await handleInboxTask(root, task, onTask, opts);
   if (admitted !== null) return "accepted";
@@ -4776,8 +4781,10 @@ export interface DispatcherOptions {
   onAnswer?: (answer: Pick<EscalationAnswer, "id" | "run_id" | "answer">) => void | Promise<void>;
   /** Authoritative bounded session-history lookup for a stable wake identity. */
   wakeEvidence?: (identity: string) => boolean | undefined;
-  /** Authenticated main-session runtime authority for CTO state and locks. */
+  /** Authenticated main-session runtime authority for CTO reads and explicit delivery methods. */
   runtimeAccess?: RuntimeAccess;
+  /** Private activation-bound capability for intentional cross-run state mutations. */
+  serviceAuthority?: RuntimeServiceAuthority;
   /** Exact authoritative session owner bound into the dispatcher lease. */
   session_id?: string;
   /** Registry-issued live activation capability; required to claim a dispatcher lease. */
@@ -5839,12 +5846,15 @@ function recordQuarantine(
   reason?: string,
   suppliedPin?: PinnedProjectRoot,
   runtimeAccess?: RuntimeAccess,
+  serviceAuthority?: RuntimeServiceAuthority,
 ): void {
-  void root;
-  void suppliedPin;
-  if (!runtimeAccess) return;
+  void runtimeAccess;
+  if (!serviceAuthority) return;
+  const pin = suppliedPin ?? PinnedProjectRoot.open(root);
+  if (!pin) return;
   try {
-    runtimeAccess.withRunTransaction(runId, (transaction) => {
+    assertCtoRuntimeServiceMutationAuthorityBound(serviceAuthority, pin);
+    withCtoRuntimeServiceTransaction(serviceAuthority, runId, (transaction) => {
       const state = transaction.readState();
       if (state.id !== runId || terminalState(state)) return;
       setQuarantineRecord(state, task, hash, status, reason);
@@ -5852,6 +5862,8 @@ function recordQuarantine(
     });
   } catch {
     // best-effort — the rejection itself must never throw
+  } finally {
+    if (!suppliedPin) pin.close();
   }
 }
 
@@ -6322,20 +6334,26 @@ function releaseWakeEffect(root: string, runId: string, claim: WakeEffectClaim, 
 
 
 
-function acknowledgeInboxWake(root: string, runId: string, task: InboxTask, hash: string, suppliedPin?: PinnedProjectRoot, runtimeAccess?: RuntimeAccess): void {
-  void root;
-  void suppliedPin;
-  if (!runtimeAccess) throw new Error("inbox runtime access is unavailable");
-  runtimeAccess.withRunTransaction(runId, (transaction) => {
-    const state = transaction.readState();
-    const record = state.inbox_quarantine?.[hash];
-    if (!record || record.id !== task.id || record.status === "rejected") return;
-    if (record.wake_status === "delivered") return;
-    record.status = "admitted";
-    record.wake_status = "delivered";
-    delete (record as InboxWakeRecord).wake_claim;
-    transaction.writeState(state);
-  });
+function acknowledgeInboxWake(root: string, runId: string, task: InboxTask, hash: string, suppliedPin?: PinnedProjectRoot, runtimeAccess?: RuntimeAccess, serviceAuthority?: RuntimeServiceAuthority): void {
+  void runtimeAccess;
+  if (!serviceAuthority) throw new Error("inbox service mutation authority is unavailable");
+  const pin = suppliedPin ?? PinnedProjectRoot.open(root);
+  if (!pin) throw new Error("inbox service mutation root is unavailable");
+  try {
+    assertCtoRuntimeServiceMutationAuthorityBound(serviceAuthority, pin);
+    withCtoRuntimeServiceTransaction(serviceAuthority, runId, (transaction) => {
+      const state = transaction.readState();
+      const record = state.inbox_quarantine?.[hash];
+      if (!record || record.id !== task.id || record.status === "rejected") return;
+      if (record.wake_status === "delivered") return;
+      record.status = "admitted";
+      record.wake_status = "delivered";
+      delete (record as InboxWakeRecord).wake_claim;
+      transaction.writeState(state);
+    });
+  } finally {
+    if (!suppliedPin) pin.close();
+  }
 }
 
 /**
@@ -6352,7 +6370,7 @@ export function handleInboxTask(
   root: string,
   task: InboxTask,
   onTask: ((t: InboxTask) => void | Promise<void>) | undefined,
-  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; isOwned?: () => boolean; runtimeAccess?: RuntimeAccess; proofAuthority: CtoRuntimeProofAuthority },
+  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; isOwned?: () => boolean; runtimeAccess?: RuntimeAccess; serviceAuthority?: RuntimeServiceAuthority; proofAuthority: CtoRuntimeProofAuthority },
 ): string | null | Promise<string | null> {
   const suppliedPin = opts.pinnedRoot;
   const pinnedRoot = suppliedPin ?? PinnedProjectRoot.open(root);
@@ -6377,20 +6395,21 @@ export function handleInboxTask(
       const reason = normalized.length === 0 ? "empty text" : normalized.length > MAX_INBOX_TEXT_LENGTH ? "text exceeds MAX_INBOX_TEXT_LENGTH" : "text contains unsafe control characters";
       const quarantineFence: MutationFence = { pinnedRoot, runtimeAccess: opts.runtimeAccess };
       assertMutationLive(quarantineFence);
-      recordQuarantine(root, runId, task, hash, "rejected", reason, pinnedRoot, opts.runtimeAccess);
+      recordQuarantine(root, runId, task, hash, "rejected", reason, pinnedRoot, opts.runtimeAccess, opts.serviceAuthority);
       assertMutationLive(quarantineFence);
       return null;
     }
     const claim = currentWakeClaim();
-    if (!opts.runtimeAccess) return null;
-    const admission = opts.runtimeAccess.withRunTransaction(runId, (transaction) => admitInboxTaskUnderLock(root, runId, task, hash, claim, transaction, pinnedRoot));
+    if (!opts.runtimeAccess || !opts.serviceAuthority) return null;
+    try { assertCtoRuntimeServiceMutationAuthorityBound(opts.serviceAuthority, pinnedRoot); } catch { return null; }
+    const admission = withCtoRuntimeServiceTransaction(opts.serviceAuthority, runId, (transaction) => admitInboxTaskUnderLock(root, runId, task, hash, claim, transaction, pinnedRoot));
     if (!admission) return null;
     if (admission.deferred) return admission.path;
     let wakeEffect: WakeEffectClaim | undefined;
     const rollbackWake = (error: unknown): never => {
       if (wakeEffect) releaseWakeEffect(root, runId, wakeEffect, pinnedRoot);
       try {
-        opts.runtimeAccess?.withRunTransaction(runId, (transaction) => {
+        opts.serviceAuthority && (assertCtoRuntimeServiceMutationAuthorityBound(opts.serviceAuthority, pinnedRoot), withCtoRuntimeServiceTransaction(opts.serviceAuthority, runId, (transaction) => {
           const current = transaction.readState();
           const record = current.inbox_quarantine?.[hash];
           const wakeWasDelivered = record?.status === "admitted" && record.id === task.id && record.wake_status === "delivered";
@@ -6401,7 +6420,7 @@ export function handleInboxTask(
             transaction.writeState(current);
           }
           if (!wakeWasDelivered) removeInboxTaskFile(root, runId, task, pinnedRoot);
-        });
+        }));
       } catch {
         // The wake failure is primary; preserve durable evidence for recovery.
       }
@@ -6415,7 +6434,7 @@ export function handleInboxTask(
     }
     if (reservation?.alreadyDelivered) {
       if (reservation.claim) markWakeEffectDelivered(root, runId, reservation.claim, task.id, pinnedRoot, opts.proofAuthority, opts.runtimeAccess!);
-      acknowledgeInboxWake(root, runId, task, hash, pinnedRoot, opts.runtimeAccess);
+      acknowledgeInboxWake(root, runId, task, hash, pinnedRoot, opts.runtimeAccess, opts.serviceAuthority);
       return admission.path;
     }
     wakeEffect = reservation?.claim;
@@ -6423,7 +6442,7 @@ export function handleInboxTask(
       try {
         if (!pinnedRoot.isStable() || (opts.isOwned && !opts.isOwned())) throw new Error("messenger dispatcher lease lost before task acknowledgement");
         if (wakeEffect) markWakeEffectDelivered(root, runId, wakeEffect, task.id, pinnedRoot, opts.proofAuthority, opts.runtimeAccess!);
-        acknowledgeInboxWake(root, runId, task, hash, pinnedRoot, opts.runtimeAccess);
+        acknowledgeInboxWake(root, runId, task, hash, pinnedRoot, opts.runtimeAccess, opts.serviceAuthority);
       } catch (error) {
         if (isDispatcherActivationFailure(error)) throw error;
         throw new Error(`inbox task ${task.id} wake acknowledgement failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -6553,7 +6572,7 @@ async function deliverAnswerWake(
   root: string,
   answer: Pick<EscalationAnswer, "id" | "run_id" | "answer">,
   onAnswer: ((answer: Pick<EscalationAnswer, "id" | "run_id" | "answer">) => void | Promise<void>) | undefined,
-  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; activeRunId?: string; activeStateRevision?: number; isOwned?: () => boolean; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess; proofAuthority: CtoRuntimeProofAuthority },
+  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; activeRunId?: string; activeStateRevision?: number; isOwned?: () => boolean; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess; serviceAuthority?: RuntimeServiceAuthority; proofAuthority: CtoRuntimeProofAuthority },
 ): Promise<AnswerWakeOutcome> {
   const runId = answer.run_id;
   if (!safeRunId(runId)) return "stale";
@@ -6624,7 +6643,7 @@ async function deliverAnswerWake(
 async function replayPendingAnswerWakes(
   root: string,
   onAnswer: ((answer: Pick<EscalationAnswer, "id" | "run_id" | "answer">) => void | Promise<void>) | undefined,
-  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; isOwned?: () => boolean; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess; proofAuthority: CtoRuntimeProofAuthority },
+  opts: { idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; pinnedRoot?: PinnedProjectRoot; isOwned?: () => boolean; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess; serviceAuthority?: RuntimeServiceAuthority; proofAuthority: CtoRuntimeProofAuthority },
 ): Promise<void> {
   if (!opts.idempotentWake) return;
   const pinnedRoot = opts.pinnedRoot ?? PinnedProjectRoot.open(root);
@@ -6675,7 +6694,7 @@ export async function pollInbox(
   adapter: EscalationAdapter | null,
   onTask: ((t: InboxTask) => void) | undefined,
   onAnswer: ((a: Pick<EscalationAnswer, "id" | "run_id" | "answer">) => void | Promise<void>) | undefined,
-  opts: { isOwned?: () => boolean; idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; now?: RetryClock; pinnedRoot?: PinnedProjectRoot; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess; retryCursorStore?: Map<string, string | null>; proofAuthority: CtoRuntimeProofAuthority },
+  opts: { isOwned?: () => boolean; idempotentWake?: boolean; wakeEvidence?: (identity: string) => boolean | undefined; now?: RetryClock; pinnedRoot?: PinnedProjectRoot; lifecycle?: AdapterOperationContext; runtimeAccess?: RuntimeAccess; serviceAuthority?: RuntimeServiceAuthority; retryCursorStore?: Map<string, string | null>; proofAuthority: CtoRuntimeProofAuthority },
 ): Promise<void> {
   const suppliedPollPin = opts.pinnedRoot;
   const pollPin = suppliedPollPin ?? PinnedProjectRoot.open(root);
@@ -6818,7 +6837,7 @@ export async function pollInbox(
               } else {
                 const task: InboxTask = { id: verifiedRetry.source.id, text: verifiedRetry.source.text, at: verifiedRetry.source.at, by: verifiedRetry.source.by, runId: verifiedRetry.source.run_id };
                 assertPollLive();
-                const outcome = await dispatchInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, proofAuthority: opts.proofAuthority });
+                const outcome = await dispatchInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, proofAuthority: opts.proofAuthority });
                 assertPollLive();
                 if (outcome === "retryable") throw new InboxTaskRetryableError();
                 if (outcome === "rejected") { discardPollEntry(dropQueue, name, observed?.expectation, rejectedDirectory); continue; }
@@ -6872,7 +6891,7 @@ export async function pollInbox(
                 if (envelope.text.trim().length === 0 || envelope.text.length > MAX_INBOX_TEXT_LENGTH) {
                   try {
                     assertPollLive();
-                    await handleInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, proofAuthority: opts.proofAuthority });
+                    await handleInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, proofAuthority: opts.proofAuthority });
                     assertPollLive();
                   } catch (error) {
                     if (error instanceof InboxTaskRetryableError || !pollPin.isStable() || (opts.isOwned && !opts.isOwned())) throw error instanceof InboxTaskRetryableError ? error : new InboxTaskRetryableError();
@@ -6882,7 +6901,7 @@ export async function pollInbox(
                   continue;
                 }
                 assertPollLive();
-                const outcome = await dispatchInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, proofAuthority: opts.proofAuthority });
+                const outcome = await dispatchInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, proofAuthority: opts.proofAuthority });
                 assertPollLive();
                 if (outcome === "retryable") throw new InboxTaskRetryableError();
                 if (outcome === "rejected") { discardPollEntry(dropQueue, name, observed?.expectation, rejectedDirectory); continue; }

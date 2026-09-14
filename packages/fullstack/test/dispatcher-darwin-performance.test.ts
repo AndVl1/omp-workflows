@@ -51,6 +51,7 @@ test("Darwin dispatcher keeps the event loop responsive with two deferred tasks"
       proofAuthority: runtime.proofAuthority,
       session_id: runtime.sessionId,
       liveGuard: runtime.liveGuard,
+      serviceAuthority: runtime.serviceAuthority,
       onTask: () => {
         callbackCount += 1;
         if (callbackCount === 1) resolveReceipt?.();

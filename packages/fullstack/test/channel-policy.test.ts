@@ -93,7 +93,7 @@ function startChannelDispatcher(root: string, set: Parameters<typeof startChanne
     if (set.primary) assert.equal(bindAuthenticatedAdapterRouting(root, set.primary, runtimeAccess, pinnedRoot), true, "channel-policy primary has authenticated routing");
     for (const sink of options.roSinks ?? set.roSinks) assert.equal(bindAuthenticatedAdapterRouting(root, sink, runtimeAccess, pinnedRoot), true, "channel-policy RO sink has authenticated routing");
     const runtime = runtimeFor(root);
-    return startChannelDispatcherRaw(root, set, intervalMs, { ...options, proofAuthority: runtime.proofAuthority, pinnedRoot, runtimeAccess, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard } as DispatcherOptions);
+    return startChannelDispatcherRaw(root, set, intervalMs, { ...options, proofAuthority: runtime.proofAuthority, pinnedRoot, runtimeAccess, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard, serviceAuthority: options.serviceAuthority ?? runtime.serviceAuthority } as DispatcherOptions);
   } catch (error) {
     if (!options.pinnedRoot) pinnedRoot.close();
     throw error;
@@ -119,7 +119,7 @@ function isBidirectionalChannel(root: string, capabilities?: Parameters<typeof i
 }
 function handleInboxTask(root: string, task: Parameters<typeof handleInboxTaskRaw>[1], onTask: Parameters<typeof handleInboxTaskRaw>[2] = undefined, options: Partial<HandleOptions> = {}) {
   const runtime = runtimeFor(root);
-  return handleInboxTaskRaw(root, task, onTask, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access } as HandleOptions);
+  return handleInboxTaskRaw(root, task, onTask, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access, serviceAuthority: options.serviceAuthority ?? runtime.serviceAuthority } as HandleOptions);
 }
 function resolveInboxRunId(root: string, pinnedRoot?: Parameters<typeof resolveInboxRunIdRaw>[1], runtimeAccess?: Parameters<typeof resolveInboxRunIdRaw>[2]) {
   return resolveInboxRunIdRaw(root, pinnedRoot, runtimeAccess ?? runtimeFor(root).access);

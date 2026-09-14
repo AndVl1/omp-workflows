@@ -72,7 +72,7 @@ async function drainOutbox(...args: Parameters<typeof drainOutboxRaw>): ReturnTy
 }
 function pollInbox(...args: Parameters<typeof pollInboxRaw>): ReturnType<typeof pollInboxRaw> {
   const [root, adapter, onTask, onAnswer, options] = args;
-  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, proofAuthority: proofFor(root), runtimeAccess: runtimeFor(root) });
+  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, proofAuthority: proofFor(root), runtimeAccess: runtimeFor(root), serviceAuthority: runtimeFixtures.get(root)?.serviceAuthority });
 }
 function startDispatcher(...args: Parameters<typeof startDispatcherRaw>): ReturnType<typeof startDispatcherRaw> {
   const [root, adapter, intervalMs, options] = args;
@@ -82,7 +82,7 @@ function startDispatcher(...args: Parameters<typeof startDispatcherRaw>): Return
     if (adapter) assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtimeAccess, pinnedRoot), true, "retry dispatcher adapter has authenticated routing");
     const fixture = runtimeFixtures.get(root) ?? openFullstackRuntimeTest(root, "retry-lane-test");
     runtimeFixtures.set(root, fixture);
-    return startDispatcherRaw(root, adapter, intervalMs, { ...options, proofAuthority: fixture.proofAuthority, pinnedRoot, runtimeAccess, session_id: options?.session_id ?? fixture.sessionId, liveGuard: options?.liveGuard ?? fixture.liveGuard });
+    return startDispatcherRaw(root, adapter, intervalMs, { ...options, proofAuthority: fixture.proofAuthority, pinnedRoot, runtimeAccess, session_id: options?.session_id ?? fixture.sessionId, liveGuard: options?.liveGuard ?? fixture.liveGuard, serviceAuthority: options?.serviceAuthority ?? fixture.serviceAuthority });
   } catch (error) {
     if (!options?.pinnedRoot) pinnedRoot.close();
     throw error;

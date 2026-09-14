@@ -69,7 +69,7 @@ function resolveInboxRunId(root: string, pinnedRoot?: Parameters<typeof resolveI
   return resolveInboxRunIdRaw(root, pinnedRoot, runtimeFor(root).access);
 }
 function pollInbox(root: string, adapter: Parameters<typeof pollInboxRaw>[1], onTask?: Parameters<typeof pollInboxRaw>[2], onAnswer?: Parameters<typeof pollInboxRaw>[3], options: NonNullable<Parameters<typeof pollInboxRaw>[4]> = {}): ReturnType<typeof pollInboxRaw> {
-  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, runtimeAccess: runtimeFor(root).access, proofAuthority: runtimeFor(root).proofAuthority });
+  return pollInboxRaw(root, adapter, onTask, onAnswer, { ...options, runtimeAccess: runtimeFor(root).access, serviceAuthority: runtimeFor(root).serviceAuthority, proofAuthority: runtimeFor(root).proofAuthority });
 }
 async function drainOutbox(root: string, adapter: Parameters<typeof drainOutboxRaw>[1], maxRetries = 3, options: NonNullable<Parameters<typeof drainOutboxRaw>[3]> = {}): ReturnType<typeof drainOutboxRaw> {
   const runtimeAccess = runtimeFor(root).access;
@@ -87,14 +87,14 @@ function startDispatcher(root: string, adapter: Parameters<typeof startDispatche
   try {
     if (adapter) assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtimeAccess, pinnedRoot), true, "messaging dispatcher adapter has authenticated routing");
     const runtime = runtimeFor(root);
-    return startDispatcherRaw(root, adapter, intervalMs, { ...options, pinnedRoot, runtimeAccess, proofAuthority: runtime.proofAuthority, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard });
+    return startDispatcherRaw(root, adapter, intervalMs, { ...options, pinnedRoot, runtimeAccess, proofAuthority: runtime.proofAuthority, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard, serviceAuthority: options.serviceAuthority ?? runtime.serviceAuthority });
   } catch (error) {
     if (!options.pinnedRoot) pinnedRoot.close();
     throw error;
   }
 }
 function handleInboxTask(root: string, task: Parameters<typeof handleInboxTaskRaw>[1], onTask?: Parameters<typeof handleInboxTaskRaw>[2], options: NonNullable<Parameters<typeof handleInboxTaskRaw>[3]> = {}): ReturnType<typeof handleInboxTaskRaw> {
-  return handleInboxTaskRaw(root, task, onTask, { ...options, runtimeAccess: runtimeFor(root).access, proofAuthority: runtimeFor(root).proofAuthority });
+  return handleInboxTaskRaw(root, task, onTask, { ...options, runtimeAccess: runtimeFor(root).access, serviceAuthority: runtimeFor(root).serviceAuthority, proofAuthority: runtimeFor(root).proofAuthority });
 }
 function publishOutbox(root: string, runId: string, delivery: Parameters<typeof queueCtoDeliveryRaw>[2]): string {
   const path = queueCtoDeliveryRaw(root, runId, delivery, undefined, undefined, runtimeFor(root).access, runtimeFor(root).proofAuthority);

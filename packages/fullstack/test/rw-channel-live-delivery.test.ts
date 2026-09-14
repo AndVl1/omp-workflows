@@ -143,6 +143,7 @@ function startLiveDispatcher(
     proofAuthority: runtime.proofAuthority,
     session_id: runtime.sessionId,
     liveGuard: runtime.liveGuard,
+    serviceAuthority: runtime.serviceAuthority,
     onTask: (t) => tasks.push(t),
     onAnswer: (a) => answers.push(a),
   });
@@ -350,7 +351,7 @@ test("F: legacy single-adapter config unchanged — mock rw preserved, no fan-ou
     // rw inbound surface is wired and polled as before — unchanged by the
     // channel-set world.
     const fixture = runtimeFixtureFor(root);
-    const stop = startDispatcher(root, adapter, 50, { runtimeAccess: fixture.access, session_id: fixture.sessionId, liveGuard: fixture.liveGuard, onTask: (t) => tasks.push(t) });
+    const stop = startDispatcher(root, adapter, 50, { runtimeAccess: fixture.access, session_id: fixture.sessionId, liveGuard: fixture.liveGuard, serviceAuthority: fixture.serviceAuthority, onTask: (t) => tasks.push(t) });
     try {
       dropFile(join(root, "legacy", "inbound"), "task-1.json", {
         id: "t1",
