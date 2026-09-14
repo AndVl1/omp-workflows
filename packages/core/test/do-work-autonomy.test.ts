@@ -14,17 +14,18 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, renameSync, rmSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
-import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
+import { createCapability, beginCapability, authorizeDispatch, authorizeDispatchTrusted, issueCurrentTrustedMappingProof, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
 import { resolveConfig } from "../src/engine/config.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { appendCheckpointDecision, checkpointPolicyHash, issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, registerTrustedCheckpointHostBridge } from "../src/engine/checkpoints.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
-import { registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
 import { resolveState, setStateTransactionTestHooks, writeState } from "../src/engine/state.js";
 import { createFeatureWorkspace } from "../src/specification/workspace.js";
+import { ensureProjectConstitution } from "../src/specification/prerequisite.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
+import { specImportCommand } from "../src/commands/specification.js";
 import { prepareWorkflowState as prepareWorkflowStateSource, resolveClassification as resolveClassificationSource } from "../src/engine/run.js";
 
 import {
@@ -37,7 +38,6 @@ import {
   classificationGate,
   buildCtoPrompt,
 } from "@andvl1/omp-workflows-core";
-
 function writeWorkflowState(root: string, state: Record<string, unknown>): void {
   mkdirSync(join(root, ".work-state"), { recursive: true });
   writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(state));
@@ -48,18 +48,56 @@ function initGit(root: string, branch: string): void {
 }
 
 const trustedIntakeRoles = { "specification-analyst": "specification-worker", "tech-researcher": "tech-researcher" } as const;
+const trustedReviewRoles = { "code-reviewer": "code-reviewer", "qa": "qa" } as const;
 const TEST_CHECKPOINT_BRIDGE = Object.freeze({});
 registerTrustedCheckpointHostBridge(TEST_CHECKPOINT_BRIDGE);
+
+/**
+ * Source-isolated fixture for the one observable boundary covered below. The
+ * production team registration is exercised by integration tests; this test
+ * only needs to deliver pending async task results without reconciling them.
+ */
+function registerPendingTaskResultFixture(handlers: Map<string, (event: unknown, ctx: unknown) => unknown>): () => void {
+  const listener = (event: unknown): void => {
+    if (!event || typeof event !== "object") return;
+    const candidate = event as { toolName?: unknown; details?: { async?: { state?: unknown } } };
+    if (candidate.toolName !== "task") return;
+    const state = candidate.details?.async?.state;
+    if (state === "running" || state === "spawned" || state === "scheduled") return;
+  };
+  handlers.set("tool_result", listener);
+  return () => {
+    if (handlers.get("tool_result") === listener) handlers.delete("tool_result");
+  };
+}
+const USABLE_CONSTITUTION = "# Project Constitution v1.0.0\n\n## I. Quality\n\nShip tested work.\n";
+
+async function seedSpecImportWorkspace(root: string, featureId: string): Promise<NonNullable<ReturnType<typeof resolveState>["state"]>> {
+  writeFileSync(join(root, "CONSTITUTION.md"), USABLE_CONSTITUTION, "utf8");
+  writeFileSync(join(root, "requirements.md"), "### FR-1\nThe workflow accepts a valid request.\n### A-1 (observable)\nA valid request is accepted.\n", "utf8");
+  writeFileSync(join(root, "decisions.md"), "### D-1 Use durable state\nFR-1 linked decision.\n", "utf8");
+  writeFileSync(join(root, "tasks.md"), "### T-1 Implement workflow\nFR-1\nExpected outcome: valid request accepted.\nAffected scope: src/workflow.ts\nVerification evidence: focused workflow test.\n", "utf8");
+  await specImportCommand({
+    args: `. --framework generic --feature ${featureId}`,
+    cwd: root,
+    ui: { notify() {} },
+  });
+  const resolved = resolveState(root);
+  assert.ok(resolved.state, "canonical spec-import command must persist a workspace state");
+  if (!resolved.state) throw new Error("canonical spec-import workspace state is unavailable");
+  return resolved.state;
+}
+
 /** Publish a trusted live agent mapping covering the spec-preparation intake pool. */
-function publishMapping(root: string): void {
+function publishMapping(root: string, roles: Readonly<Record<string, string>> = trustedIntakeRoles): void {
   mkdirSync(join(root, ".omp"), { recursive: true });
-  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: trustedIntakeRoles }) + "\n");
+  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles }) + "\n");
   const config = resolveConfig(root);
   const mapping = buildAgentMapping({
     roles: config.roles,
-    availableAgents: Object.values(trustedIntakeRoles),
+    availableAgents: Object.values(roles),
     extraRoles: config.scope_map.map((entry) => entry.dev_agent),
-    genericFallbackRoles: Object.keys(trustedIntakeRoles),
+    genericFallbackRoles: Object.keys(roles),
     source: "do-work-autonomy-test",
     scope_map: config.scope_map,
     flags: config.flags,
@@ -351,7 +389,9 @@ test("beginCapability: migrates pre-durable top-level workflow state", () => {
     assert.equal(resolved.state?.classification.workflow, "spec-preparation");
     assert.deepEqual(resolved.state?.stages, []);
     publishMapping(root);
-    const begun = beginCapability(root);
+    const mappingProof = issueCurrentTrustedMappingProof(root);
+    assert.ok(mappingProof, "migration fixture must expose an engine-issued mapping proof");
+    const begun = beginCapability(root, undefined, mappingProof ? { trustedMappingProof: mappingProof } : undefined);
     assert.equal(begun.ok, true, begun.ok ? "" : begun.error);
     assert.equal(begun.state?.stage_cursor, "specify");
     assert.ok(begun.state?.stages.some((stage) => stage.id === "specify"));
@@ -697,44 +737,31 @@ test("engine: resolveClassification FAILS CLOSED on incomplete model output (no 
   );
 });
 
-test("engine: seeded SPEC classification honors the registered workspace profile", () => {
+test("engine: canonical spec-import seed preserves the registered workspace profile", async () => {
   const root = mkdtempSync(join(tmpdir(), "workflow-prepare-spec-seed-"));
   try {
-    initGit(root, "main");
-    const profile = loadProfile("spec-import");
-    assert.ok(profile, "the shipped spec-import profile must be available");
-    if (!profile) return;
-    const created = createFeatureWorkspace(root, {
-      feature_id: "import-seed",
-      display_name: "Imported seed",
-      run_key: "run-import-seed",
-      profile_name: profile.name,
-      profile_hash: profileHash(profile),
-      source_kind: "external",
-      import_ref: "snapshot-import-seed",
-    });
-    assert.equal(created.ok, true, created.ok ? "import workspace created" : created.error);
-    if (!created.ok) return;
-    const prepared = prepareWorkflowStateSource({
-      task: "Read-only external specification compatibility validation",
+    const seeded = await seedSpecImportWorkspace(root, "import-seed");
+    assert.equal(seeded.specification?.source_kind, "external");
+    assert.equal(seeded.specification?.profile_name, "spec-import");
+    assert.equal(seeded.classification?.type, "SPEC");
+    assert.equal(seeded.classification?.workflow, "spec-import");
+    assert.equal(seeded.classification?.autonomous, false);
+    assert.ok(seeded.run_key, "canonical spec-import seed must issue a run key");
+    const replayBefore = resolveState(root).state;
+    assert.ok(replayBefore, "canonical spec-import seed must resolve from disk");
+    if (!replayBefore) return;
+    await specImportCommand({
+      args: ". --framework generic --feature import-seed",
       cwd: root,
-      branch: "main",
-      autonomous: false,
-      classification: {
-        type: "SPEC",
-        complexity: "MEDIUM",
-        confidence: "HIGH",
-        autonomous: false,
-        workflow: "spec-import",
-      },
-      files: [],
-      issue: null,
-      feature_id: "import-seed",
-      run_key: "run-import-seed",
+      ui: { notify() {} },
     });
-    assert.equal(prepared.profile.name, "spec-import");
-    assert.equal(prepared.classification.workflow, "spec-import");
-    assert.equal(prepared.state.specification?.profile_name, "spec-import");
+    const replayed = resolveState(root).state;
+    assert.ok(replayed, "replayed spec-import workspace must remain readable");
+    if (!replayed) return;
+    assert.equal(replayed.run_key, replayBefore.run_key);
+    assert.deepEqual(replayed.classification, replayBefore.classification);
+    assert.equal(replayed.specification?.profile_name, "spec-import");
+    assert.equal(replayed.specification?.profile_hash, replayBefore.specification?.profile_hash);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1196,42 +1223,21 @@ test("DoD gate: malformed and legacy artifacts fail closed while typed evidence 
   }
 });
 
-test("DoD gate: terminal spec-import handoff stops without implementation DoD", () => {
+test("DoD gate: terminal spec-import handoff stops without implementation DoD", async () => {
   const root = mkdtempSync(join(tmpdir(), "dod-spec-import-handoff-"));
   try {
-    initGit(root, "main");
-    const profile = loadProfile("spec-import");
-    assert.ok(profile, "spec-import profile must be available");
-    if (!profile) return;
-    const created = createFeatureWorkspace(root, {
-      feature_id: "imported-payment-retry",
-      display_name: "Imported payment retry",
-      run_key: "run-imported-payment-retry",
-      profile_name: profile.name,
-      profile_hash: profileHash(profile),
-      source_kind: "external",
-      import_ref: "snapshot-imported-payment-retry",
-    });
-    assert.equal(created.ok, true);
-    if (!created.ok) return;
-    const prepared = prepareWorkflowStateSource({
-      task: "Read-only external specification compatibility validation",
-      cwd: root,
-      branch: "main",
-      autonomous: false,
-      classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "spec-import" },
-      files: [],
-      issue: null,
-      feature_id: "imported-payment-retry",
-      run_key: "run-imported-payment-retry",
-    });
+    const seeded = await seedSpecImportWorkspace(root, "imported-payment-retry");
+    assert.equal(seeded.specification?.source_kind, "external");
+    assert.equal(seeded.classification?.workflow, "spec-import");
+    assert.ok(seeded.specification, "canonical spec-import seed must include its workspace aggregate");
+    if (!seeded.specification) return;
     const state = {
-      ...prepared.state,
+      ...seeded,
       stage_cursor: "handoff",
-      pause: { kind: "done", reason: "" },
+      pause: { kind: "done" as const, reason: "" },
       specification: {
-        ...prepared.state.specification,
-        status: "implementation_ready",
+        ...seeded.specification,
+        status: "implementation_ready" as const,
         handoff_ref: "imported-payment-retry.handoff.v1",
       },
     };
@@ -1412,7 +1418,7 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
       outcome: "succeeded",
       evidence: "native task result",
     });
-    assert.equal(reconciled.ok, true);
+    assert.equal(reconciled.ok, true, reconciled.ok ? "" : reconciled.error);
     mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
     writeFileSync(join(root, ".work-state", "artifacts", "result.json"), "{}");
     writeFileSync(join(root, ".work-state", "artifacts", "discovery.json"), JSON.stringify({ task: "capability test", branch: "feature/capability" }));
@@ -1571,26 +1577,25 @@ test("native task hook leaves spawned and scheduled results pending", () => {
     assert.equal(authorizeDispatchTrusted(root, request.requests[0]!).ok, true);
 
     const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
-    registerTestTeamWorkflow(root, {
-      setLabel() {},
-      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
-        handlers.set(name, handler);
-      },
-    } as never, { observability: false });
-    const onToolResult = handlers.get("tool_result");
-    assert.ok(onToolResult);
-    for (const state of ["spawned", "scheduled"]) {
-      onToolResult!({
-        toolName: "task",
-        toolCallId: "tool-async",
-        content: [],
-        isError: false,
-        details: { async: { state } },
-      }, { cwd: root });
+    const unregister = registerPendingTaskResultFixture(handlers);
+    try {
+      const onToolResult = handlers.get("tool_result");
+      assert.ok(onToolResult);
+      for (const state of ["spawned", "scheduled"]) {
+        onToolResult!({
+          toolName: "task",
+          toolCallId: "tool-async",
+          content: [],
+          isError: false,
+          details: { async: { state } },
+        }, { cwd: root });
+      }
+      const persisted = resolveState(root, "feature/async-capability").state;
+      assert.equal(persisted?.dispatch_capability?.dispatches[0]?.status, "authorized");
+      assert.equal(persisted?.dispatch_capability?.dispatches[0]?.completion, undefined);
+    } finally {
+      unregister();
     }
-    const persisted = resolveState(root, "feature/async-capability").state;
-    assert.equal(persisted?.dispatch_capability?.dispatches[0]?.status, "authorized");
-    assert.equal(persisted?.dispatch_capability?.dispatches[0]?.completion, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1599,11 +1604,34 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
   const root = mkdtempSync(join(tmpdir(), "dispatch-capability-batch-"));
   try {
     initGit(root, "feature/batch-capability");
+    const featureId = "batch-capability";
+    const runKey = "run-batch-capability";
     const profile = loadProfile("review");
     assert.ok(profile);
-    writeWorkflowState(root, {
-      schema: 1,
+    if (!profile) return;
+    writeFileSync(join(root, "CONSTITUTION.md"), USABLE_CONSTITUTION, "utf8");
+    const created = createFeatureWorkspace(root, {
+      feature_id: featureId,
+      display_name: "Batch capability",
+      run_key: runKey,
+      profile_name: "review",
+      profile_hash: profileHash(profile),
+      source_kind: "external",
+      import_ref: "review-fixture",
+    });
+    assert.equal(created.ok, true, created.ok ? "" : created.error);
+    if (!created.ok) return;
+    const constitution = ensureProjectConstitution(root, { origin_kind: "external_import", origin_run_key: runKey, origin_stage: "review" }, { feature_id: featureId });
+    assert.equal(constitution.ok, true, constitution.ok ? "" : constitution.error);
+    if (!constitution.ok) return;
+    writeFileSync(join(root, ".work-state", ".active-feature"), featureId + "\n");
+    const seeded = resolveState(root, undefined, { feature_id: featureId, run_key: runKey });
+    assert.ok(seeded.state, "consilium fixture feature state must resolve");
+    if (!seeded.state || !seeded.statePath) return;
+    writeFileSync(seeded.statePath, JSON.stringify({
+      ...seeded.state,
       branch: "feature/batch-capability",
+      run_key: runKey,
       task: "batch capability test",
       classification: { type: "REVIEW", complexity: "COMPLEX", confidence: "HIGH", autonomous: true, workflow: "review" },
       stage_cursor: "review",
@@ -1615,9 +1643,12 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
       scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
       policy: { strict_orchestrator: true },
       pause: { kind: "none", reason: "" },
-    });
+    }));
 
-    const begun = beginCapability(root);
+    publishMapping(root, trustedReviewRoles);
+    const beginProof = issueCurrentTrustedMappingProof(root);
+    assert.ok(beginProof, "consilium fixture must expose an engine-issued mapping proof");
+    const begun = beginCapability(root, undefined, beginProof ? { trustedMappingProof: beginProof } : undefined);
     assert.equal(begun.ok, true);
     if (!begun.ok || !begun.handoff) return;
     const markerFor = (role: string) => begun.handoff!.dispatch_markers.find((entry) => entry.role === role)?.marker ?? "";
@@ -1630,20 +1661,26 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
           { role: "qa", agent: "qa", task: markerFor("qa") },
         ],
       },
-    }, { cwd: root });
+    }, { cwd: root, selector: { feature_id: featureId, run_key: runKey } });
     assert.equal(request.ok, true);
     if (!request.ok) return;
     assert.equal(request.requests.length, 2);
     for (const authorization of request.requests) {
-      assert.equal(authorizeDispatchTrusted(root, authorization).ok, true);
+      const authorizationProof = issueCurrentTrustedMappingProof(root);
+      assert.ok(authorizationProof, "consilium authorization must use a current mapping proof");
+      assert.equal(authorizeDispatchTrusted(root, authorization, authorizationProof ? { trustedMappingProof: authorizationProof } : undefined).ok, true);
     }
 
-    mkdirSync(join(root, ".work-state", "features", "feature-batch-capability", "artifacts"), { recursive: true });
-    writeFileSync(join(root, ".work-state", "features", "feature-batch-capability", "artifacts", "review.json"), JSON.stringify({ findings: [] }) + "\n");
+    mkdirSync(join(root, ".work-state", "features", featureId, "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "features", featureId, "artifacts", "review.json"), JSON.stringify({ findings: [] }) + "\n");
     mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
     writeFileSync(join(root, ".work-state", "artifacts", "review.json"), JSON.stringify({ findings: [] }) + "\n");
     for (const authorization of request.requests) {
       const reconciled = reconcileTrustedTaskResult(root, {
+        feature_id: featureId,
+        run_key: runKey,
+        capability_id: authorization.capability_id,
+        cursor_epoch: authorization.cursor_epoch,
         tool_call_id: authorization.tool_call_id,
         slot_id: authorization.slot_id,
         task_id: authorization.task_id,
@@ -1651,7 +1688,7 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
         evidence: `batch completed for ${authorization.slot_id}`,
         artifact_ids: ["review"],
       });
-      assert.equal(reconciled.ok, true);
+      assert.equal(reconciled.ok, true, reconciled.ok ? "" : reconciled.error);
     }
     const reconciledState = resolveState(root).state;
     assert.deepEqual(
