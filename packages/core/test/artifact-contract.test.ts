@@ -23,9 +23,33 @@ import {
   requiredFieldsOf,
   loadArtifactSchemas,
   type ArtifactContractPolicy,
+  type ConsumeValidationResult,
   type JsonSchemaDef,
 } from "../src/engine/artifact-contract.js";
-import type { StageDef, TeamState } from "../src/engine/types.js";
+import type { Profile, StageDef, TeamState } from "../src/engine/types.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
+
+function validateConsumedAtPinnedRoot(
+  stage: StageDef,
+  artifactsDir: string,
+  teamState: TeamState,
+  profile: Profile | null,
+  root: string,
+): ConsumeValidationResult {
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  assert.ok(pinnedRoot, "artifact fixture root must be pinnable");
+  if (!pinnedRoot) throw new Error("artifact fixture root cannot be pinned");
+  try {
+    const artifactsDirRelative = pinnedRoot.relativePath(artifactsDir);
+    assert.equal(artifactsDirRelative, "artifacts", "artifact fixture must use the canonical root-relative directory");
+    return validateConsumedArtifacts(stage, artifactsDir, teamState, profile, undefined, {
+      pinnedRoot,
+      artifactsDirRelative,
+    });
+  } finally {
+    pinnedRoot.close();
+  }
+}
 
 function state(overrides: Partial<TeamState> = {}): TeamState {
   return {
@@ -421,12 +445,12 @@ test("artifact contract: consumed artifacts are prevalidated; present-but-invali
     const stage: StageDef = { id: "architecture", title: "Architecture", type: "single", role: "architect", consumes: ["exploration", "clarifications"] };
     writeFileSync(join(artifactsDir, "exploration.json"), JSON.stringify({ files_to_read: [], summary: "s" }));
     writeFileSync(join(artifactsDir, "clarifications.json"), JSON.stringify({ questions: ["q"], answers: ["a"] }));
-    const ok = validateConsumedArtifacts(stage, artifactsDir, state(), profile);
+    const ok = validateConsumedAtPinnedRoot(stage, artifactsDir, state(), profile, root);
     assert.equal(ok.ok, true, "schema-valid consumed artifacts pass");
     if (ok.ok) assert.equal(ok.diagnostics.length, 2);
 
     writeFileSync(join(artifactsDir, "exploration.json"), JSON.stringify({ files_to_read: "not-an-array" }));
-    const invalid = validateConsumedArtifacts(stage, artifactsDir, state(), profile);
+    const invalid = validateConsumedAtPinnedRoot(stage, artifactsDir, state(), profile, root);
     assert.equal(invalid.ok, false);
     if (!invalid.ok) {
       assert.match(invalid.error, /exploration/);
@@ -449,7 +473,7 @@ test("artifact contract: consumed manual_qa enforces CONDITIONAL blocker semanti
       evidence: ["deterministic checks passed"],
     }));
     const stage: StageDef = { id: "qa_tests", title: "QA", type: "single", role: "qa", consumes: ["manual_qa"] };
-    const result = validateConsumedArtifacts(stage, artifactsDir, state(), profile);
+    const result = validateConsumedAtPinnedRoot(stage, artifactsDir, state(), profile, root);
     assert.equal(result.ok, false, "an unexplained CONDITIONAL must block consuming stages");
     if (!result.ok) assert.match(result.error, /blocked_prerequisites/);
   } finally {
@@ -471,7 +495,7 @@ test("artifact contract: missing consumed artifact blocks only when its producer
         { id: "manual_qa", status: "in_progress" },
       ],
     });
-    const blocked = validateConsumedArtifacts(stage, artifactsDir, withProducerDone, profile);
+    const blocked = validateConsumedAtPinnedRoot(stage, artifactsDir, withProducerDone, profile, root);
     assert.equal(blocked.ok, false, "missing consume with a done producer is a contract violation");
     if (!blocked.ok) assert.match(blocked.error, /while its producing stage is done/);
 
@@ -482,7 +506,7 @@ test("artifact contract: missing consumed artifact blocks only when its producer
         { id: "manual_qa", status: "in_progress" },
       ],
     });
-    const pending = validateConsumedArtifacts(stage, artifactsDir, withProducerPending, profile);
+    const pending = validateConsumedAtPinnedRoot(stage, artifactsDir, withProducerPending, profile, root);
     assert.equal(pending.ok, true, "missing consume with a pending producer is a legitimate absence");
     if (pending.ok) {
       const featureSpec = pending.diagnostics.find((d) => d.id === "feature_spec");
@@ -498,7 +522,7 @@ test("artifact contract: missing consumed artifact blocks only when its producer
       ],
     });
     const skippedProducer: StageDef = { id: "qa_tests", title: "QA", type: "single", role: "qa", consumes: ["manual_qa"] };
-    const skipped = validateConsumedArtifacts(skippedProducer, artifactsDir, withProducerSkipped, profile);
+    const skipped = validateConsumedAtPinnedRoot(skippedProducer, artifactsDir, withProducerSkipped, profile, root);
     assert.equal(skipped.ok, true, "missing consume of a skipped producer is a legitimate absence");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -534,7 +558,7 @@ test("artifact contract: structure limits reject deep, broad, and cyclic values 
     mkdirSync(artifactsDir, { recursive: true });
     writeFileSync(join(artifactsDir, "debug.json"), JSON.stringify(deep));
     const stage: StageDef = { id: "consumer", title: "Consumer", type: "single", role: "qa", consumes: ["debug"] };
-    const consumed = validateConsumedArtifacts(stage, artifactsDir, state(), null);
+    const consumed = validateConsumedAtPinnedRoot(stage, artifactsDir, state(), null, root);
     assert.equal(consumed.ok, false);
     if (!consumed.ok) assert.match(consumed.error, /could not be read: artifact structure limit exceeded/);
   } finally {
