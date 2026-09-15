@@ -656,7 +656,7 @@ test("do-work: declared stage description/checkpoint/gate/autonomous flow into p
     // Document stages carry their typed document contract verbatim —
     // metadata only, never rendered content.
     const renderPrd = report.stages.find((s) => s.id === "render_prd");
-    assert.deepEqual(renderPrd?.document, { format: "markdown", renderer: "product-prd", path: "documents/product-prd.md" });
+    assert.deepEqual(structuredClone(renderPrd?.document), { format: "markdown", renderer: "product-prd", path: "documents/product-prd.md" });
     assert.deepEqual(renderPrd?.outputs, ["product_prd"]);
 
     // Undeclared fields stay absent — even on a profile-backed stage.

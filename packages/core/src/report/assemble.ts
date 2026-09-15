@@ -1216,7 +1216,10 @@ export function writeReportPinned(
     pin.writeAtomic(targetRelative, html);
     ensureStable();
   } catch (error) {
-    if (error instanceof Error && error.message.startsWith("writeReport:")) throw error;
+    if (error instanceof Error && (
+      error.message.startsWith("writeReport:")
+      || (error instanceof PinnedRootError && error.code === "invalid" && /not valid UTF-8/u.test(error.message))
+    )) throw error;
     throw new Error("writeReport: report could not be written safely");
   }
   return target;

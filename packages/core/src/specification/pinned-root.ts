@@ -240,10 +240,14 @@ const DARWIN_PYTHON_CANDIDATES = ["/usr/bin/python3", "/usr/local/bin/python3", 
 const DARWIN_HELPER_MAX_OUTPUT = 24 * 1024 * 1024;
 /** Synchronous helper operations have one total deadline, including startup. */
 const DARWIN_HELPER_TIMEOUT_MS = 4_500;
-const DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS = 30_000;
+// Large framed writes must allow the complete bounded payload to cross the
+// synchronous FIFOs on slower Darwin hosts. Keep the allowance finite and
+// derive it from the validated frame size below; ordinary helper calls retain
+// the short default deadline.
+const DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS = 90_000;
 const DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS = 5_000;
 const DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES = 1 * 1024 * 1024;
-const DARWIN_HELPER_TRANSFER_BYTES_PER_MS = 2 * 1024;
+const DARWIN_HELPER_TRANSFER_BYTES_PER_MS = 1 * 1024;
 const DARWIN_HELPER_TRANSFER_OPERATIONS = new Set([
   "write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "batch", "batch_atomic", "replace_if_matches",
 ]);
@@ -3548,7 +3552,24 @@ function writeFlags(): number | null {
   return writeOnly | create | exclusive | noFollow;
 }
 
+function isWellFormedUtf16(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function contentByteLength(content: PinnedRootWriteContent): number {
+  if (typeof content === "string" && !isWellFormedUtf16(content)) {
+    throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
+  }
   const length = typeof content === "string" ? Buffer.byteLength(content, "utf8") : content.byteLength;
   if (!Number.isSafeInteger(length) || length < 0 || length > MAX_PINNED_ROOT_WRITE_BYTES) {
     throw new PinnedRootError("limit", "anchored write exceeds the bounded content limit");
@@ -5613,6 +5634,9 @@ export class PinnedProjectRoot {
       try { accessSync(candidate, constants.X_OK); executable = candidate; break; } catch { /* try next interpreter */ }
     }
     if (executable === null) throw new PinnedRootError("unsupported", "descriptor helper is unavailable");
+    if (typeof payload.text === "string" && !isWellFormedUtf16(payload.text)) {
+      throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
+    }
     const timeoutMs = this.hooks.helperTimeoutMs ?? DARWIN_HELPER_TIMEOUT_MS;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > DARWIN_HELPER_TIMEOUT_MS) {
       throw new PinnedRootError("invalid", `descriptor helper '${operation}' timeout is invalid`);
