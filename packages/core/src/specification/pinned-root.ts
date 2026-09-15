@@ -3717,6 +3717,20 @@ function pollDarwinChildExit(child: ChildProcess, timeoutMs: number): boolean {
   return child.exitCode !== null;
 }
 
+function terminateDarwinHelperChild(child: ChildProcess): void {
+  try { child.kill("SIGTERM"); } catch { /* preserve bounded teardown */ }
+  if (pollDarwinChildExit(child, DARWIN_HELPER_CLOSE_TIMEOUT_MS)) return;
+  try { child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
+  pollDarwinChildExit(child, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
+}
+
+function closeDarwinHelperSessionSynchronously(session: DarwinHelperSession): void {
+  closeQuietly(session.requestFd);
+  closeQuietly(session.responseFd);
+  terminateDarwinHelperChild(session.child);
+  try { rmSync(session.directory, { recursive: true, force: true }); } catch { /* preserve bounded teardown */ }
+}
+
 function cleanupDarwinHelpersOnExit(): void {
   for (const session of activeDarwinHelperSessions) {
     try { session.child.kill("SIGTERM"); } catch { /* preserve process shutdown */ }
@@ -3818,14 +3832,10 @@ export class PinnedProjectRoot {
 
   /** Close the pinned descriptor. Idempotent and safe in finally blocks. */
   close(): void {
-    if (this.closed) {
-      void this.darwinHelperClosePromise?.catch(() => undefined);
-      return;
-    }
+    if (this.closed) return;
     this.closed = true;
     this.closeDarwinHelper();
     closeQuietly(this.rootFd);
-    void this.darwinHelperClosePromise?.catch(() => undefined);
   }
 
   /** Close and await actual Darwin helper exit; idempotent with close(). */
@@ -5199,12 +5209,8 @@ export class PinnedProjectRoot {
     activeDarwinHelperSessions.delete(session);
     removeLiveDarwinHelperSession(session);
     session.closing = true;
-    try { session.child.kill("SIGTERM"); } catch { /* preserve primary failure */ }
-    closeQuietly(session.requestFd);
-    closeQuietly(session.responseFd);
-    try { rmSync(session.directory, { recursive: true, force: true }); } catch { /* preserve primary failure */ }
-    this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
-    void this.darwinHelperClosePromise.catch(() => undefined);
+    closeDarwinHelperSessionSynchronously(session);
+    this.darwinHelperClosePromise = session.exitPromise;
   }
 
   private writeDarwinFrame(session: DarwinHelperSession, frame: Buffer, deadline: number, operation: string): void {
@@ -5329,34 +5335,6 @@ export class PinnedProjectRoot {
     }
   }
 
-  private awaitDarwinHelperExit(session: DarwinHelperSession): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const finish = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        try { rmSync(session.directory, { recursive: true, force: true }); } catch { /* preserve exit result */ }
-        if (error) reject(error); else resolve();
-      };
-      if (session.exited || session.child.exitCode !== null) {
-        session.exited = true;
-        finish();
-        return;
-      }
-      const timer = setTimeout(() => {
-        if (session.exited || session.child.exitCode !== null) { finish(); return; }
-        try { session.child.kill("SIGTERM"); } catch { /* preserve bounded teardown */ }
-        const finalTimer = setTimeout(() => {
-          if (session.exited || session.child.exitCode !== null) finish();
-          else finish(new PinnedRootError("unsupported", "descriptor helper did not exit before bounded close"));
-        }, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
-        finalTimer.unref();
-      }, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
-      timer.unref();
-      session.exitPromise.then(() => finish(), () => finish(new PinnedRootError("unsupported", "descriptor helper exit could not be observed")));
-    });
-  }
-
   private closeDarwinHelper(): void {
     const session = this.darwinHelperSession;
     this.darwinHelperSession = null;
@@ -5364,27 +5342,8 @@ export class PinnedProjectRoot {
     activeDarwinHelperSessions.delete(session);
     removeLiveDarwinHelperSession(session);
     session.closing = true;
-    const requestId = randomUUID();
-    const closePayload: Record<string, unknown> = { op: "__close", _request_id: requestId, _session_id: session.sessionId, _nonce: ++session.nonce };
-    closePayload._mac = darwinHelperMac(closePayload, session.authKey);
-    const request = Buffer.from(JSON.stringify(closePayload) + "\n", "utf8");
-    try {
-      const deadline = Date.now() + DARWIN_HELPER_CLOSE_TIMEOUT_MS;
-      this.writeDarwinFrame(session, request, deadline, "__close");
-      const output = this.readDarwinFrame(session, deadline, "__close");
-      const result = JSON.parse(output) as Record<string, unknown>;
-      const responseMac = result._mac;
-      delete result._mac;
-      if (!verifyDarwinHelperMac(result, responseMac, session.authKey) || result._session_id !== session.sessionId || result._nonce !== closePayload._nonce || result.ok !== true || result.closed !== true || result._request_id !== requestId) throw new Error("close acknowledgement mismatch");
-    } catch {
-      // Closing either FIFO is an EOF signal; SIGTERM is the bounded fallback
-      // for a helper blocked in a malformed/runtime operation.
-    } finally {
-      try { session.child.kill("SIGTERM"); } catch { /* preserve teardown */ }
-      closeQuietly(session.requestFd);
-      closeQuietly(session.responseFd);
-    }
-    this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
+    closeDarwinHelperSessionSynchronously(session);
+    this.darwinHelperClosePromise = session.exitPromise;
   }
 
   private makeWriteReceipt(
