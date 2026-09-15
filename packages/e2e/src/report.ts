@@ -1708,6 +1708,14 @@ function generateSingleReport(
 
 const REPORT_LOCK_TIMEOUT_MS = 5000;
 const REPORT_LOCK_NAME = '.omp-ux-e2e-report.lock';
+function comparePinnedRoots(left: PinnedDirectory, right: PinnedDirectory): number {
+  if (left.physicalPath < right.physicalPath) return -1;
+  if (left.physicalPath > right.physicalPath) return 1;
+  if (left.identity.dev !== right.identity.dev) return left.identity.dev < right.identity.dev ? -1 : 1;
+  if (left.identity.ino !== right.identity.ino) return left.identity.ino < right.identity.ino ? -1 : 1;
+  return 0;
+}
+
 const MAX_SUITE_CHILDREN = 64;
 const MAX_SUITE_DIRECTORY_ENTRIES = 1024;
 
@@ -2111,7 +2119,7 @@ export function generateReport(
   const roots = [discovery.root, externalRoot];
   const targets = roots
     .filter((root, index, all) => all.findIndex(candidate => candidate.identity.dev === root.identity.dev && candidate.identity.ino === root.identity.ino) === index)
-    .sort((left, right) => left.physicalPath.localeCompare(right.physicalPath));
+    .sort(comparePinnedRoots);
   let closed = false;
   const closeDiscovery = (): void => {
     if (closed) return;
