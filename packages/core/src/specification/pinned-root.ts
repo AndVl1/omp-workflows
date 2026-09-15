@@ -249,7 +249,7 @@ const DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS = 5_000;
 const DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES = 1 * 1024 * 1024;
 const DARWIN_HELPER_TRANSFER_BYTES_PER_MS = 1 * 1024;
 const DARWIN_HELPER_TRANSFER_OPERATIONS = new Set([
-  "write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "lock_acquire", "batch", "batch_atomic", "replace_if_matches",
+  "write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "lock_acquire", "batch", "batch_atomic", "replace_if_matches",
 ]);
 const DARWIN_HELPER_MAX_INPUT = 96 * 1024 * 1024;
 const DARWIN_HELPER_START_TIMEOUT_MS = 1_000;
@@ -2427,6 +2427,102 @@ def abort_prepared_stage_exact(prepared):
     if not remove_exact_regular(prepared["parent"], stage, {"dev": expected.st_dev, "ino": expected.st_ino, "size": prepared["size"], "sha256": prepared["sha256"]}):
         raise RecoveryRequired("prepared write abort stage cleanup could not be proven")
 
+def rollback_prepared_write(payload):
+    token = payload.get("token")
+    prepared = prepared_writes.get(token)
+    if prepared is None:
+        return {"ok": True, "rolled_back": False}
+    parent = prepared["parent"]
+    try:
+        try:
+            lock_data, lock_info, owner = read_lock_observed(parent, prepared["lock_name"])
+        except FileNotFoundError as error:
+            raise RecoveryRequired("prepared write lease is unavailable during rollback") from error
+        if (not verify_signed_document(owner) or owner.get("token") != token
+                or owner.get("root_binding") != CURRENT_ROOT_BINDING):
+            raise RecoveryRequired("prepared write lease changed before rollback")
+        postimage = prepared.get("postimage")
+        expected = prepared.get("expected")
+        if (not isinstance(postimage, dict) or not isinstance(postimage.get("dev"), int)
+                or not isinstance(postimage.get("ino"), int) or not isinstance(postimage.get("size"), int)
+                or not isinstance(postimage.get("sha256"), str) or not isinstance(expected, dict)
+                or expected.get("kind") not in ("absent", "file")):
+            raise RecoveryRequired("prepared write rollback metadata is invalid")
+        if prepared.get("rolled_back") is True:
+            return {"ok": True, "rolled_back": True}
+        if expected.get("kind") == "absent":
+            try:
+                current, current_info = read_at(parent, prepared["name"])
+            except FileNotFoundError:
+                prepared["rolled_back"] = True
+                return {"ok": True, "rolled_back": True}
+            if not target_matches_descriptor(parent, prepared["name"], postimage):
+                raise RecoveryRequired("prepared write rollback target changed before exact removal")
+            if not remove_exact_regular(parent, prepared["name"], postimage):
+                raise RecoveryRequired("prepared write rollback removal could not be proven")
+        else:
+            encoded = expected.get("bytes")
+            if not isinstance(encoded, str):
+                raise RecoveryRequired("prepared write rollback preimage bytes are unavailable")
+            try:
+                before = base64.b64decode(encoded, validate=True)
+            except Exception as error:
+                raise RecoveryRequired("prepared write rollback preimage bytes are invalid") from error
+            if not target_matches_descriptor(parent, prepared["name"], postimage):
+                raise RecoveryRequired("prepared write rollback target changed before exact replacement")
+            stage = write_named_temp(parent, bounded_name("prepared-rollback", prepared["path"], ".tmp"), before)
+            try:
+                desired_sha = hashlib.sha256(before).hexdigest()
+                committed, _ = conditional_exchange_replace(parent, prepared["name"], stage, postimage, desired_sha, len(before))
+                if not committed:
+                    raise RecoveryRequired("prepared write rollback replacement was not committed")
+                stage = None
+            finally:
+                if stage is not None:
+                    cleanup_temp(parent, stage)
+        fsync_regular(parent)
+        prepared["rolled_back"] = True
+        return {"ok": True, "rolled_back": True}
+
+def finalize_prepared_write(payload):
+    token = payload.get("token")
+    prepared = prepared_writes.get(token)
+    if prepared is None:
+        return {"ok": True, "finalized": False}
+    parent = prepared["parent"]
+    try:
+        if prepared.get("rolled_back") is not True:
+            raise RecoveryRequired("prepared write finalization requires an exact rollback")
+        try:
+            lock_data, lock_info, owner = read_lock_observed(parent, prepared["lock_name"])
+        except FileNotFoundError as error:
+            raise RecoveryRequired("prepared write lease is unavailable during finalization") from error
+        if (not verify_signed_document(owner) or owner.get("token") != token
+                or owner.get("root_binding") != CURRENT_ROOT_BINDING):
+            raise RecoveryRequired("prepared write lease changed before finalization")
+        expected = prepared.get("expected")
+        if not isinstance(expected, dict) or expected.get("kind") not in ("absent", "file"):
+            raise RecoveryRequired("prepared write finalization metadata is invalid")
+        if expected.get("kind") == "absent":
+            try:
+                read_at(parent, prepared["name"])
+            except FileNotFoundError:
+                pass
+            else:
+                raise RecoveryRequired("prepared write finalization found an unexpected target")
+        elif not preimage_matches(parent, prepared["name"], expected):
+            raise RecoveryRequired("prepared write finalization found a changed preimage")
+        cleanup_temp(parent, prepared.get("backup"))
+        release_conditional_lock(parent, prepared["lock_name"], prepared["lock_token"])
+        fsync_regular(parent)
+        prepared_writes.pop(token, None)
+        if prepared.get("batch_id") is not None and not any(candidate.get("batch_id") == prepared.get("batch_id") for candidate in prepared_writes.values()):
+            remove_batch_journal(3, prepared["batch_journal"], prepared["batch_id"], True)
+        return {"ok": True, "finalized": True}
+    finally:
+        if token not in prepared_writes:
+            os.close(parent)
+
 def abort_prepared_write(payload):
     token = payload.get("token")
     prepared = prepared_writes.get(token)
@@ -2440,13 +2536,6 @@ def abort_prepared_write(payload):
                     rollback_prepared_publication(prepared)
                 except RuntimeError:
                     pass
-            if payload.get("release_published") is True:
-                cleanup_temp(parent, prepared.get("backup"))
-                release_conditional_lock(parent, prepared["lock_name"], prepared["lock_token"])
-                fsync_regular(parent)
-                prepared_writes.pop(token, None)
-                if prepared.get("batch_id") is not None and not any(candidate.get("batch_id") == prepared.get("batch_id") for candidate in prepared_writes.values()):
-                    remove_batch_journal(3, prepared["batch_journal"], prepared["batch_id"], True)
             return {"ok": True, "aborted": False, "quarantined": True}
         abort_prepared_stage_exact(prepared)
         cleanup_temp(parent, prepared.get("backup"))
@@ -2680,6 +2769,10 @@ def operation(payload):
         return ack_prepared_write(payload)
     if op == "abort_prepared_write":
         return abort_prepared_write(payload)
+    if op == "rollback_prepared_write":
+        return rollback_prepared_write(payload)
+    if op == "finalize_prepared_write":
+        return finalize_prepared_write(payload)
     if op == "recover_prepared_batch":
         batch_id = payload.get("batch_id")
         if not isinstance(batch_id, str):
@@ -3325,7 +3418,7 @@ def execute(payload):
         # remain path_unauthorized.  A kernel EACCES while mutating the
         # journal/projection is an ordinary persistence failure and must keep
         # its write_failed contract.
-        write_ops = ("ensure_directory", "write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "recover_prepared_batch", "batch_atomic", "replace_if_matches", "remove_if_matches", "remove_empty_directory_if_matches", "link_exclusive", "rename", "rename_noreplace", "rmdir", "remove_entry", "remove", "unlink", "lock_acquire", "lock_release")
+        write_ops = ("ensure_directory", "write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "recover_prepared_batch", "batch_atomic", "replace_if_matches", "remove_if_matches", "remove_empty_directory_if_matches", "link_exclusive", "rename", "rename_noreplace", "rmdir", "remove_entry", "remove", "unlink", "lock_acquire", "lock_release")
         batch_writes = op_name in ("batch", "batch_atomic") and isinstance(payload, dict) and isinstance(payload.get("operations"), list) and any(isinstance(item, dict) and item.get("op") in write_ops for item in payload["operations"])
         if getattr(exc, "errno", None) == 13 and (op_name in write_ops or batch_writes):
             return fail("write_failed", str(exc))
@@ -5592,12 +5685,32 @@ export class PinnedProjectRoot {
       let abortComplete = true;
       this.resetDarwinHelperForCompensation();
       for (const entry of prepared.slice().reverse()) {
+        if (entry.committed && entry.commit_confirmed) {
+          let rolledBack = false;
+          try {
+            const rollback = this.runDescriptorHelper<{ rolled_back?: unknown }>("rollback_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino });
+            rolledBack = rollback.rolled_back === true;
+          } catch {
+            abortComplete = false;
+          }
+          if (!rolledBack) {
+            rollbackComplete = false;
+            continue;
+          }
+          try {
+            const finalized = this.runDescriptorHelper<{ finalized?: unknown }>("finalize_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino });
+            if (finalized.finalized !== true) abortComplete = false;
+          } catch {
+            abortComplete = false;
+          }
+          continue;
+        }
         let aborted = false;
         try {
-          const abortResult = this.runDescriptorHelper<{ aborted?: unknown }>("abort_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino, ...(entry.commit_confirmed ? { release_published: true } : {}) });
+          const abortResult = this.runDescriptorHelper<{ aborted?: unknown }>("abort_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino });
           aborted = abortResult.aborted === true;
         } catch { abortComplete = false; /* stale lease recovery owns cleanup */ }
-        if (entry.committed && !this.rollbackPublishedDescriptor(entry.path, entry.descriptor, entry.preimage)) rollbackComplete = false;
+        if (entry.committed && !entry.commit_confirmed && !aborted) abortComplete = false;
       }
       if (durableBatch && abortComplete && rollbackComplete && batchId) removeLiveDarwinBatch(this.rootPathDigest, batchId);
       if (!rollbackComplete) {
