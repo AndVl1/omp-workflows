@@ -1619,8 +1619,7 @@ function generateSingleReport(
     if (opts.writeOutputs !== false && reportDestination === null) {
       throw new Error('ux-e2e: report destination root must be a stable non-symlink directory');
     }
-    try {
-      if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before evidence collection');
+    if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before evidence collection');
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before evidence collection');
       let evidence = collectEvidence(candidates);
       if (input.verdict === 'PASS') {
