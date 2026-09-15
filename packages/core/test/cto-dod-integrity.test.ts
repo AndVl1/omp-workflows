@@ -300,9 +300,8 @@ async function confirmPrepared(root: string, preparation: Preparation, featureId
       stage_id: "execution",
     };
     const askTool = mountedCtoAskTool(root, preparation.cto_run_id, runtime);
-    let asked: { details: unknown };
     try {
-      asked = await askTool.execute("fixture-host-ask", askInput, undefined, undefined, {
+      const asked = await askTool.execute("fixture-host-ask", askInput, undefined, undefined, {
         cwd: root,
         mode: "rpc",
         hasUI: true,
@@ -315,20 +314,20 @@ async function confirmPrepared(root: string, preparation: Preparation, featureId
           },
         },
       });
+      const askedDetails = asked.details as Json;
+      assert.equal(askedDetails.status, "answered", JSON.stringify(askedDetails));
+      const confirmed = await confirmCtoSpecificationMapping(root, {
+        cto_run_id: preparation.cto_run_id,
+        mapping_id: String(mapping.mapping_id),
+        mapping_hash: String(mapping.mapping_hash),
+        answer_id: String(askedDetails.trusted_answer_ref),
+      }, { runtimeAccess: runtime.access, sessionId: "integrity-session" });
+      assert.equal(confirmed.status, "confirmed", JSON.stringify(confirmed));
+      if (confirmed.status !== "confirmed") throw new Error(`confirmation failed: ${JSON.stringify(confirmed)}`);
+      return mapping;
     } finally {
       askTool.close();
     }
-    const askedDetails = asked.details as Json;
-    assert.equal(askedDetails.status, "answered", JSON.stringify(askedDetails));
-    const confirmed = await confirmCtoSpecificationMapping(root, {
-      cto_run_id: preparation.cto_run_id,
-      mapping_id: String(mapping.mapping_id),
-      mapping_hash: String(mapping.mapping_hash),
-      answer_id: String(askedDetails.trusted_answer_ref),
-    }, { runtimeAccess: runtime.access, sessionId: "integrity-session" });
-    assert.equal(confirmed.status, "confirmed", JSON.stringify(confirmed));
-    if (confirmed.status !== "confirmed") throw new Error(`confirmation failed: ${JSON.stringify(confirmed)}`);
-    return mapping;
   });
 }
 
