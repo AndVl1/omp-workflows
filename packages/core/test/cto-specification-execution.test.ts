@@ -5969,11 +5969,12 @@ test("pending mapping WAL remains recoverable and unapplied after constitution d
   try {
     writeFeature(root, featureId);
     const frozen = mapping(await preflight(root, [selection(featureId)]));
+    const confirmationInput = await prepareTrustedConfirmation(root, frozen);
     let injected = false;
     setCtoSpecificationMappingFailureInjector((point) => {
       if (point === "after_prepare" && !injected) { injected = true; throw new Error("constitution-drift-recovery"); }
     }, root);
-    const first = await confirmTrusted(root, frozen);
+    const first = await confirmCtoSpecificationMappingForTest(root, confirmationInput);
     assert.equal(first.status, "blocked", detail(first));
     assert.equal(injected, true, "confirmation must leave a pending WAL after the injected crash seam");
     setCtoSpecificationMappingFailureInjector(null, root);
@@ -6321,6 +6322,7 @@ test("state CAS abort recovery is idempotent across every abort boundary", async
       const feature = `mapping-abort-${failurePoint}`;
       writeFeature(root, feature);
       const frozen = mapping(await preflight(root, [selection(feature)]));
+      const confirmationInput = await prepareTrustedConfirmation(root, frozen);
       let mutated = false;
       let injected = false;
       setCtoSpecificationMappingFailureInjector((point) => {
@@ -6340,10 +6342,10 @@ test("state CAS abort recovery is idempotent across every abort boundary", async
           throw new Error(`injected ${point}`);
         }
       }, root);
-      const first = await confirmTrusted(root, frozen);
+      const first = await confirmCtoSpecificationMappingForTest(root, confirmationInput);
       assert.equal(first.status, "blocked", `${failurePoint} must fail before recovery`);
       setCtoSpecificationMappingFailureInjector(null, root);
-      const retry = await confirmTrusted(root, frozen);
+      const retry = await confirmCtoSpecificationMappingForTest(root, confirmationInput);
       assert.equal(retry.status, "confirmed", `${failurePoint} retry must converge: ${JSON.stringify(retry)}`);
       const transactionDir = join(root, ".work-state", "cto", RUN_ID, "specification-mapping-transactions");
       const files = readdirSync(transactionDir).filter((name) => name.endsWith(".json"));
