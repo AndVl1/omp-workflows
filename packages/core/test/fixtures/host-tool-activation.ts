@@ -1,10 +1,10 @@
-import { afterEach as nodeTestAfterEach } from "node:test";
 import { existsSync } from "node:fs";
 import { registerConstitutionTools, registerCtoTools, registerTeamWorkflow, registerWorkflowTools, type TeamSessionBindingController, type TeamSessionRuntimeBinding } from "../../src/index.js";
 import { closeRegistryRegistrationContext } from "../../src/registry/owner.js";
 import { revokeCtoRuntimeSessionAuthority } from "../../src/cto/session-authority.js";
 import { TEST_CONTEXT } from "./registrar-host.js";
 import {
+  registerRetainedTestTeardown,
   closeRetainedTestRegistrations,
   openTestRegistry,
   writeTestRegistryMarker,
@@ -200,7 +200,7 @@ function closeRetainedTestHelperRegistrations(): void {
   if (hasError) throw firstError;
 }
 
-nodeTestAfterEach(() => {
+registerRetainedTestTeardown(() => {
   let firstError: unknown;
   let hasError = false;
   try {

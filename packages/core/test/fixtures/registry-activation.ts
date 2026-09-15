@@ -56,6 +56,8 @@ type RetainedRegistryRegistration = {
   readonly leasedCapabilities: readonly WorkflowCapability[];
 };
 const retainedRegistryRegistrations = new Set<RetainedRegistryRegistration>();
+type RetainedTestTeardown = () => void;
+const retainedTestTeardowns = new Set<RetainedTestTeardown>();
 
 function closeReplacedRetainedTestRegistrations(): void {
   for (const registration of [...retainedRegistryRegistrations]) {
@@ -85,7 +87,25 @@ export function closeRetainedTestRegistrations(root?: string): void {
   }
 }
 
-nodeTestAfterEach(() => closeRetainedTestRegistrations());
+export function registerRetainedTestTeardown(teardown: RetainedTestTeardown): () => void {
+  if (typeof teardown !== "function") throw new TypeError("retained test teardown must be a function");
+  retainedTestTeardowns.add(teardown);
+  return () => { retainedTestTeardowns.delete(teardown); };
+}
+
+nodeTestAfterEach(() => {
+  let firstError: unknown;
+  let hasError = false;
+  for (const teardown of [...retainedTestTeardowns]) {
+    try { teardown(); } catch (error) {
+      if (!hasError) { firstError = error; hasError = true; }
+    }
+  }
+  try { closeRetainedTestRegistrations(); } catch (error) {
+    if (!hasError) { firstError = error; hasError = true; }
+  }
+  if (hasError) throw firstError;
+});
 nodeTestAfter(() => closeRetainedTestRegistrations());
 
 /** Open a marker-authenticated RuntimeAccess for tests that create CTO runs. */
