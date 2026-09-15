@@ -375,6 +375,42 @@ test('report suite: PASS rolls back when mandatory child evidence disappears aft
 });
 
 
+test('report: PASS accepts screenshot paths relative to the retained session root', () => {
+  const dir = makeSessionDir();
+  const screenshot = join(dir, 'screenshots', 'capture.png');
+  mkdirSync(dirname(screenshot), { recursive: true });
+  writeFileSync(screenshot, 'png fixture');
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-relative-screenshot-md-'));
+  try {
+    const result = generateReport(dir, inputWithScreenshot('screenshots/capture.png'), { mdDir });
+    const report = JSON.parse(readFileSync(result.jsonPath, 'utf8')) as UxE2eReport;
+    assert.ok(report.evidence.includes(screenshot));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+test('report: PASS rejects relative mandatory evidence that escapes the session root', () => {
+  const dir = makeSessionDir();
+  const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-relative-escape-'));
+  const screenshot = join(outside, 'capture.png');
+  writeFileSync(screenshot, 'png fixture');
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-relative-escape-md-'));
+  try {
+    assert.throws(
+      () => generateReport(dir, inputWithScreenshot(`../${basename(outside)}/capture.png`), { mdDir }),
+      /all declared screenshots/u,
+    );
+    assert.equal(existsSync(join(dir, '.work-state', 'ux-e2e', 'report.json')), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+
 test('report: PASS gates declared evidence at the pinned per-file maximum', () => {
   const atLimit = makeSessionDir();
   const atLimitPath = join(atLimit, 'specs', 'feature-a', 'spec.md');
