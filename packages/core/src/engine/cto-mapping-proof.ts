@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
+import { TextDecoder } from "node:util";
 import { canonicalJson, isSafeFeatureId, isSha256Hex, sha256Hex } from "../specification/validation.js";
 import { PinnedRootError, PinnedProjectRoot } from "../specification/pinned-root.js";
 import { isSafeCtoExecutionId, isSafeCtoRunId } from "../cto/state.js";
@@ -236,7 +237,11 @@ function proofWriteResult(
   content: string,
 ): { ok: true; content: string; digest: string; path: string; dev: number; ino: number } | { ok: false; error: string } {
   try {
+    const before = pinnedRoot.pathEntryInfo(relative);
+    if (!before || before.kind !== "file") return { ok: false, error: "mapping confirmation proof is not a regular file" };
     const current = pinnedRoot.readFile(relative, { maxBytes: MAX_BYTES });
+    const after = pinnedRoot.pathEntryInfo(relative);
+    if (!after || after.kind !== "file" || before.dev !== current.dev || before.ino !== current.ino || after.dev !== current.dev || after.ino !== current.ino || after.size !== current.bytes.byteLength) return { ok: false, error: "mapping confirmation proof changed while it was read" };
     const currentContent = Buffer.from(current.bytes).toString("utf8");
     if (currentContent !== content) return { ok: false, error: "mapping confirmation proof already exists with different bytes" };
     return { ok: true, content, digest: sha256Hex(content), path: relative, dev: current.dev, ino: current.ino };
@@ -246,15 +251,18 @@ function proofWriteResult(
   try {
     pinnedRoot.writeExclusive(relative, Buffer.from(content, "utf8"));
     const published = pinnedRoot.readFile(relative, { maxBytes: MAX_BYTES });
+    const publishedInfo = pinnedRoot.pathEntryInfo(relative);
     const publishedContent = Buffer.from(published.bytes).toString("utf8");
-    if (publishedContent !== content) return { ok: false, error: "mapping confirmation proof changed during publication" };
+    if (!publishedInfo || publishedInfo.kind !== "file" || publishedInfo.dev !== published.dev || publishedInfo.ino !== published.ino || publishedInfo.size !== published.bytes.byteLength || publishedContent !== content) return { ok: false, error: "mapping confirmation proof changed during publication" };
     return { ok: true, content, digest: sha256Hex(content), path: relative, dev: published.dev, ino: published.ino };
   } catch (error) {
     if (error instanceof PinnedRootError && error.code === "exists") {
       try {
+        const before = pinnedRoot.pathEntryInfo(relative);
         const current = pinnedRoot.readFile(relative, { maxBytes: MAX_BYTES });
+        const after = pinnedRoot.pathEntryInfo(relative);
         const currentContent = Buffer.from(current.bytes).toString("utf8");
-        if (currentContent === content) return { ok: true, content, digest: sha256Hex(content), path: relative, dev: current.dev, ino: current.ino };
+        if (before && after && before.kind === "file" && after.kind === "file" && before.dev === current.dev && before.ino === current.ino && after.dev === current.dev && after.ino === current.ino && after.size === current.bytes.byteLength && currentContent === content) return { ok: true, content, digest: sha256Hex(content), path: relative, dev: current.dev, ino: current.ino };
       } catch { /* report the original conflict below */ }
     }
     return { ok: false, error: `mapping confirmation proof publication failed: ${error instanceof Error ? error.message : String(error)}` };
@@ -289,10 +297,16 @@ export function readCtoMappingConfirmationProof(
   if (!relative) return { ok: false, code: "invalid", error: "mapping confirmation proof selector is unsafe" };
   try {
     if (!pinnedRoot.pathEntryExists(relative)) return { ok: false, code: "absent", error: "mapping confirmation proof is absent" };
-    const info = pinnedRoot.pathEntryInfo(relative);
-    if (!info || info.kind !== "file") return { ok: false, code: "invalid", error: "mapping confirmation proof is not a regular file" };
-    const bytes = pinnedRoot.readFile(relative, { maxBytes: MAX_BYTES }).bytes;
-    const content = Buffer.from(bytes).toString("utf8");
+    const before = pinnedRoot.pathEntryInfo(relative);
+    if (!before || before.kind !== "file") return { ok: false, code: "invalid", error: "mapping confirmation proof is not a regular file" };
+    const read = pinnedRoot.readFile(relative, { maxBytes: MAX_BYTES });
+    const after = pinnedRoot.pathEntryInfo(relative);
+    if (!after || after.kind !== "file" || before.dev !== read.dev || before.ino !== read.ino || after.dev !== read.dev || after.ino !== read.ino || after.size !== read.bytes.byteLength) return { ok: false, code: "invalid", error: "mapping confirmation proof changed while it was read" };
+    const info = after;
+    const bytes = read.bytes;
+    let content: string;
+    try { content = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+    catch { return { ok: false, code: "invalid", error: "mapping confirmation proof is not valid UTF-8" }; }
     let parsed: unknown;
     try { parsed = JSON.parse(content) as unknown; } catch { return { ok: false, code: "invalid", error: "mapping confirmation proof is not valid JSON" }; }
     if (!proofShape(parsed)) return { ok: false, code: "invalid", error: "mapping confirmation proof schema is invalid" };
