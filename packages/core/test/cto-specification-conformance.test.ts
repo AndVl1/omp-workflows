@@ -253,18 +253,16 @@ function canonicalPersistedRef(
   submitted: CompletionArtifactRef,
   bodyValue: unknown,
 ): CompletionArtifactRef {
-  const artifactsDir = join(root, ".work-state", "features", featureId, "artifacts");
-  const path = join(artifactsDir, `${submitted.artifact_id}.json`);
-  const body = JSON.stringify(bodyValue) + "\n";
-  mkdirSync(artifactsDir, { recursive: true });
-  writeFileSync(path, body, "utf8");
-  return {
-    ...submitted,
-    path: relative(root, path).split("/").join("/"),
-    sha256: sha256(body),
-    schema_status: "met",
-    quality_gate_status: "met",
-  };
+  return writeArtifactWithReference(
+    root,
+    join(root, ".work-state", "features", featureId, "artifacts"),
+    submitted.artifact_id,
+    bodyValue,
+    {
+      schema_status: submitted.schema_status,
+      quality_gate_status: submitted.quality_gate_status,
+    },
+  );
 }
 
 function seedCtoFeature(
@@ -1088,9 +1086,6 @@ test("direct CTO persistence gates pending, failed, wrong-run, and stale termina
 
   const staleDigest = makeFixture();
   try {
-    const canonicalRoot = realpathSync(staleDigest.root);
-    staleDigest.prepared.evidence = staleDigest.prepared.evidence.map((item) =>
-      persistedEvidence(canonicalRoot, staleDigest.feature.feature.feature_id, item));
     staleDigest.updateTeam((team) => { team.completion_envelope = { ...team.completion_envelope!, emitted_at: "2026-01-02T00:00:00.000Z" }; });
     const result = staleDigest.invoke();
     assert.equal(result.status, "blocked");
