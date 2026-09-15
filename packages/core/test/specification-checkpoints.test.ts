@@ -55,7 +55,9 @@ import { presentPhaseCheckpoint, renderCanonicalPhaseDocument, setSpecificationP
 import { resolveSpecificationTemplateSet, SHIPPED_SPECIFICATION_TEMPLATE_IDS } from "../src/specification/templates.js";
 import { materializeFeatureDocuments, materializePhaseValidation } from "../src/specification/materialize.js";
 import { digestOf, sha256Hex, validateNativePhase, type NativePhaseValidationInput } from "../src/specification/validation.js";
-import { advanceCursor, commitCheckpointAnswerSelected, createCapability, resolveNativePhaseCheckpointSubject } from "../src/engine/durable.js";
+import { advanceCursor, commitCheckpointAnswerSelected, createCapability, issueCurrentTrustedMappingProof, resolveNativePhaseCheckpointSubject } from "../src/engine/durable.js";
+import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
+import { resolveConfig } from "../src/engine/config.js";
 import { appendCheckpointDecision, checkpointPolicyHash, findCheckpointDecision, issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, registerTrustedCheckpointHostBridge, selectLatestValidCheckpointDecision, validateCheckpointForAdvance } from "../src/engine/checkpoints.js";
 import { resolveState, setStateTransactionTestHooks, writeState } from "../src/engine/state.js";
 import { readPinnedCurrentConstitution } from "../src/specification/constitution-identities.js";
@@ -93,6 +95,33 @@ function checkpointConstitutionBinding() {
 
 function makeProject(): string {
   return mkdtempSync(join(tmpdir(), "spec-checkpoints-"));
+}
+
+function publishCheckpointAgentMapping(root: string): void {
+  mkdirSync(join(root, ".omp"), { recursive: true });
+  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: { "specification-analyst": "specification-worker", "specification-architect": "specification-worker" } }) + "\n", "utf8");
+  const config = resolveConfig(root);
+  writeAgentMapping(root, buildAgentMapping({
+    roles: config.roles,
+    availableAgents: ["specification-worker"],
+    extraRoles: config.scope_map.map((entry) => entry.dev_agent),
+    scope_map: config.scope_map,
+    flags: config.flags,
+    roster: config.roster_overrides,
+    config_path: config.config_path,
+    config_source: config.config_source,
+    config_hash: config.config_hash,
+    config_version: config.config_version,
+    config_provenance: config.config_provenance,
+    genericFallbackRoles: [],
+  }));
+}
+
+function currentCheckpointMappingProof(root: string) {
+  const proof = issueCurrentTrustedMappingProof(root);
+  assert.ok(proof, "checkpoint fixture must expose an engine-issued mapping proof");
+  if (!proof) throw new Error("checkpoint fixture mapping proof is unavailable");
+  return proof;
 }
 
 function selector(): { feature_id: string; run_key: string } {
@@ -147,6 +176,9 @@ function runSelectedCheckpointDecisionContract(
   root: string,
   input: PhaseDecisionCall,
 ): PhaseCheckpointOutcome<PhaseDecisionValue> {
+  if (!EXACT_DECISIONS.some((decision) => decision === input.decision)) {
+    return { ok: false, code: "SPEC_DECISION_INVALID", error: "the selected phase checkpoint decision is not policy-allowed" };
+  }
   if (input.authorization !== "human" || input.actor_provenance.kind !== "user" || !input.actor_provenance.proof) {
     return { ok: false, code: "SPEC_PROOF_INVALID", error: "phase checkpoint decisions require a trusted selected host answer" };
   }
@@ -184,7 +216,7 @@ function runSelectedCheckpointDecisionContract(
     stage_cursor: input.phase,
     cursor_epoch: capability.issued_for?.cursor_epoch ?? persisted.cursor_epoch,
     evidence: "selected checkpoint answer committed by the trusted host Ask",
-  });
+  }, { trustedMappingProof: currentCheckpointMappingProof(root) });
   const status = input.decision === "request_changes" ? "revision_required" : "approved";
   const nextPhase = input.phase === "specify" ? "plan" : input.phase === "plan" ? "tasks" : null;
   return {
@@ -197,7 +229,7 @@ function runSelectedCheckpointDecisionContract(
       status,
       revision_feedback: input.feedback ?? null,
       resume_next_phase: nextPhase,
-      dispatched_next_phase: advanced.ok && input.decision === "approve_continue" ? nextPhase : null,
+      dispatched_next_phase: advanced.ok && input.decision === "approve_continue" && advanced.handoff ? nextPhase : null,
     },
   };
 }
@@ -290,8 +322,8 @@ function phaseState(root: string, specify: WorkspacePhaseRecord): TeamState {
     workflow: "spec-preparation",
     profile_hash: profileHash,
     stage_cursor: ORIGIN_STAGE,
-    kind: "single",
-    expected_roster: [{ role: "specification-analyst", agent: "specification-worker" }],
+    kind: "none",
+    expected_roster: [],
   });
   const workspace: FeatureWorkspaceRecord = {
     ...validFeatureWorkspace({ featureId: FEATURE_ID, constitutionBinding: checkpointConstitutionBinding() }),
@@ -556,6 +588,7 @@ function writeApprovedConstitutionFixture(root: string, state: TeamState): void 
 }
 
 function seedPhaseState(root: string, specify: WorkspacePhaseRecord = specifyRecord()): TeamState {
+  publishCheckpointAgentMapping(root);
   const state = phaseState(root, specify);
   writeApprovedConstitutionFixture(root, state);
   mkdirSync(join(root, "specs", FEATURE_ID), { recursive: true });
@@ -771,7 +804,7 @@ test("a passing specification phase exposes exactly the three valid decisions", 
 
 // ── Approve-and-continue / approve-and-stop ─────────────────────────────────
 
-test("approve_continue with a trusted human proof approves the phase and dispatches the exact next phase once", () => {
+test("approve_continue with a trusted human proof approves the phase and requires fresh next-phase preparation", () => {
   const root = makeProject();
   try {
     const seeded = seedPhaseState(root);
@@ -793,7 +826,7 @@ test("approve_continue with a trusted human proof approves the phase and dispatc
     assert.equal(outcome.value.version, 1);
     assert.equal(outcome.value.replay, false);
     assert.equal(outcome.value.resume_next_phase, "plan", "approve_continue resumes at the exact next phase");
-    assert.equal(outcome.value.dispatched_next_phase, "plan", "approve_continue dispatches the next phase in the same turn");
+    assert.equal(outcome.value.dispatched_next_phase, null, "approve_continue leaves roster selection to the next phase preparation");
 
     const after = loadPersisted(root).state;
     const records = typedDecisions(after);
@@ -813,19 +846,18 @@ test("approve_continue with a trusted human proof approves the phase and dispatc
     assert.equal(specify.approved_version, 1);
     assert.equal(specify.current_version, 1);
     assert.ok(specify.checkpoint_ref, "an approved phase records its checkpoint reference");
-    assert.equal(phaseOf(after, "plan").status, "generating", "the next phase is dispatched (capability issued, worker dispatched)");
+    assert.equal(phaseOf(after, "plan").status, "not_started", "the next roster phase remains pending until fresh preparation");
+    assert.equal(after.specification?.next_action.command, "/spec-plan --feature checkpoint-feature");
     assert.notEqual(after.stage_cursor, ORIGIN_STAGE, "approve_continue advances past the approved phase");
 
     const replayed = runSelectedCheckpointDecisionContract(root, decisionCall(actor, "approve_continue"));
-    assert.equal(replayed.ok, true, "exact idempotent replay returns the established result");
-    if (!replayed.ok) return;
-    assert.equal(replayed.value.replay, true);
-    assert.equal(replayed.value.dispatched_next_phase, null, "replay never re-dispatches");
+    assert.equal(replayed.ok, false, "the old selected capability cannot replay after the cursor advances");
+    if (!replayed.ok) assert.equal(replayed.code, "SPEC_PHASE_CONFLICT");
 
     const settled = loadPersisted(root).state;
     assert.equal(typedDecisions(settled).length, 1, "replay appends no duplicate decision");
     assert.equal(epochOf(settled), epochOf(after), "replay issues no new capability epoch");
-    assert.equal(phaseOf(settled, "plan").status, "generating", "replay does not duplicate the next-phase dispatch");
+    assert.equal(phaseOf(settled, "plan").status, "not_started", "replay does not arm the next roster phase");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -893,10 +925,8 @@ test("approve_stop records the same durable approval but returns without dispatc
     assert.equal(after.specification?.handoff_ref, null, "a stopped phase never leaves an implementation handoff");
 
     const replayed = runSelectedCheckpointDecisionContract(root, decisionCall(actor, "approve_stop"));
-    assert.equal(replayed.ok, true, "exact idempotent replay returns the established result");
-    if (!replayed.ok) return;
-    assert.equal(replayed.value.replay, true);
-    assert.equal(replayed.value.dispatched_next_phase, null, "a replayed stop still never dispatches");
+    assert.equal(replayed.ok, false, "the stopped phase no longer exposes the consumed capability");
+    if (!replayed.ok) assert.equal(replayed.code, "SPEC_PHASE_CONFLICT");
 
     const settled = loadPersisted(root).state;
     assert.equal(typedDecisions(settled).length, 1, "replay appends no duplicate decision");
@@ -1052,8 +1082,11 @@ test("revised content re-presents the same phase as a new version bound to the r
       validationRef: "validation.specify.v2",
       lastFeedback: REVISION_FEEDBACK,
     });
+    const revisionCapabilityState = phaseState(root, revised);
     const reworked: TeamState = {
       ...state,
+      cursor_epoch: revisionCapabilityState.cursor_epoch,
+      dispatch_capability: revisionCapabilityState.dispatch_capability,
       specification: {
         ...state.specification!,
         phases: [revised, phaseOf(state, "plan"), phaseOf(state, "tasks")],
@@ -1072,7 +1105,7 @@ test("revised content re-presents the same phase as a new version bound to the r
 
     const staleAttempt = runSelectedCheckpointDecisionContract(root, decisionCall(staleActor, "approve_continue"));
     assert.equal(staleAttempt.ok, false, "a proof issued under the superseded epoch cannot authorize the new checkpoint");
-    if (!staleAttempt.ok) assert.equal(staleAttempt.code, "SPEC_PROOF_INVALID");
+    if (!staleAttempt.ok) assert.equal(staleAttempt.code, "CHECKPOINT_INVALID");
     assert.equal(
       epochOf(loadPersisted(root).state),
       revisionEpoch,
@@ -1084,7 +1117,7 @@ test("revised content re-presents the same phase as a new version bound to the r
     assert.equal(approved.ok, true, "a fresh proof bound to the new epoch authorizes the revision");
     if (!approved.ok) return;
     assert.equal(approved.value.version, 2);
-    assert.equal(approved.value.dispatched_next_phase, "plan");
+    assert.equal(approved.value.dispatched_next_phase, null);
 
     const after = loadPersisted(root).state;
     const specify = specifyOf(after);
@@ -1094,7 +1127,7 @@ test("revised content re-presents the same phase as a new version bound to the r
     const decisions = typedDecisions(after).map((record) => record.decision);
     assert.ok(decisions.includes("request_changes"), "the revision-round decision remains in the ledger");
     assert.ok(decisions.includes("approve_continue"), "the new epoch permits a fresh decision for the same checkpoint");
-    assert.equal(phaseOf(after, "plan").status, "generating");
+    assert.equal(phaseOf(after, "plan").status, "not_started");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
