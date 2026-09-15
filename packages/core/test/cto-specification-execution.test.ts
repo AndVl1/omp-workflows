@@ -44,6 +44,7 @@ import {
   setCtoSpecificationMappingFailureInjector,
 } from "../src/commands/cto.js";
 import { completeSpecificationExecution, createCapability, MAX_ADVANCE_FIELD_BYTES, MAX_ADVANCE_EVIDENCE_BYTES, readTrustedTaskResultReceipt, verifyTrustedTaskResultReceipt } from "../src/engine/durable.js";
+import { ctoMappingConfirmationProofRelativePath } from "../src/engine/cto-mapping-proof.js";
 import { MAX_PREPARATION_HANDOFF_TASK_BYTES } from "../src/engine/preparation.js";
 import { writeArtifactWithReference } from "../src/engine/artifacts.js";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
@@ -5934,6 +5935,156 @@ test("mapping resume crash child replays the exact visible CAS postimage", async
     assert.equal(readFileSync(mappingPath, "utf8"), visible, "resume replay must preserve exact mapping postimage");
   } finally {
     setCtoSpecificationMappingFailureInjector(null, root);
+    executionContexts.delete(root);
+    projectFeatures.delete(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("invalid confirmed proof with a staged WAL reopens through fresh trusted Ask", async () => {
+  for (const corruption of ["missing", "tampered"] as const) {
+    const root = makeProject();
+    const featureId = `confirmed-proof-${corruption}`;
+    try {
+      writeFeature(root, featureId);
+      const frozen = mapping(await preflight(root, [selection(featureId)]));
+      const first = await confirmTrusted(root, frozen);
+      assert.equal(first.status, "confirmed", detail(first));
+      const mappingPath = join(root, ".work-state", "cto", RUN_ID, "specification-mappings", `${String(frozen.mapping_id)}.json`);
+      const confirmedBeforeCorruption = readFileSync(mappingPath, "utf8");
+      const confirmedRecord = JSON.parse(confirmedBeforeCorruption) as Json;
+      const proofRef = String(confirmedRecord.confirmation_proof_ref);
+      const proofRelativePath = ctoMappingConfirmationProofRelativePath(RUN_ID, String(frozen.mapping_id), proofRef);
+      assert.ok(proofRelativePath, "confirmed mapping must expose a safe proof sidecar path");
+      if (!proofRelativePath) continue;
+      const proofPath = join(root, proofRelativePath);
+      const proofContent = readFileSync(proofPath, "utf8");
+      if (corruption === "missing") unlinkSync(proofPath);
+      else writeFileSync(proofPath, `${proofContent} `, "utf8");
+
+      const reopened = resumeCtoSpecificationMappingForTest(root, {
+        cto_run_id: RUN_ID,
+        mapping_id: frozen.mapping_id,
+        mapping_hash: frozen.mapping_hash,
+        mapping_version: frozen.mapping_version,
+      });
+      assert.equal(reopened.status, "resumed", `${corruption} proof must support authenticated resume: ${detail(reopened)}`);
+      const awaiting = JSON.parse(readFileSync(mappingPath, "utf8")) as Json;
+      assert.equal((awaiting.mapping as Json).status, "awaiting_confirmation");
+      assert.equal(awaiting.confirmation_proof_ref, undefined, "resume must strip the invalid proof reference");
+      assert.equal(awaiting.trusted_answer_ref, null, "resume must strip the consumed answer reference");
+
+      const freshAsk = deriveCtoSpecificationMappingAskInput(root, {
+        cto_run_id: RUN_ID,
+        mapping_id: frozen.mapping_id,
+        mapping_hash: frozen.mapping_hash,
+      });
+      assert.equal(freshAsk.status, "ready", `${corruption} proof recovery must emit a fresh Ask: ${detail(freshAsk)}`);
+      const freshAnswer = await prepareTrustedConfirmation(root, frozen);
+      const stagedMap = JSON.parse(readFileSync(mappingPath, "utf8")) as Json;
+      assert.equal((stagedMap.mapping as Json).status, "awaiting_confirmation");
+
+      let injected = false;
+      setCtoSpecificationMappingFailureInjector((point) => {
+        if (!injected && point === "after_mapping_write") {
+          injected = true;
+          throw new Error(`staged ${corruption} proof WAL`);
+        }
+      }, root);
+      const interrupted = await confirmCtoSpecificationMappingForTest(root, freshAnswer);
+      assert.equal(interrupted.status, "blocked", detail(interrupted));
+      assert.equal(injected, true);
+      setCtoSpecificationMappingFailureInjector(null, root);
+
+      const stagedBytes = readFileSync(mappingPath, "utf8");
+      const transactionDir = join(root, ".work-state", "cto", RUN_ID, "specification-mapping-transactions");
+      const transactionFiles = readdirSync(transactionDir).filter((name) => name.endsWith(".json"));
+      assert.equal(transactionFiles.length, 1, "the staged confirmation must leave one pending WAL");
+      const transactionPath = join(transactionDir, transactionFiles[0]!);
+      const transactionRaw = readFileSync(transactionPath, "utf8");
+      const transaction = JSON.parse(transactionRaw) as Json;
+      assert.equal(transaction.operation, "confirm");
+      assert.equal(transaction.status, "pending");
+      const stagedProofRef = String((JSON.parse(stagedBytes) as Json).confirmation_proof_ref);
+      const stagedProofRelativePath = ctoMappingConfirmationProofRelativePath(RUN_ID, String(frozen.mapping_id), stagedProofRef);
+      assert.ok(stagedProofRelativePath);
+      if (!stagedProofRelativePath) continue;
+      const stagedProofPath = join(root, stagedProofRelativePath);
+      if (corruption === "missing") unlinkSync(stagedProofPath);
+      else writeFileSync(stagedProofPath, `${readFileSync(stagedProofPath, "utf8")} `, "utf8");
+
+      const recovery = await preflightCtoSpecificationExecutionForTest(root, { cto_run_id: RUN_ID, selections: [] });
+      assert.equal(recovery.status, "blocked", detail(recovery));
+      assert.match(detail(recovery), /RECOVERY_REQUIRED|proof/i);
+      assert.equal(readFileSync(mappingPath, "utf8"), stagedBytes, "invalid proof recovery must not mutate the canonical confirmed map");
+      assert.equal(existsSync(transactionPath), false, "invalid confirmation WAL must be archived, not replayed");
+      const quarantineDir = join(root, ".work-state", "cto", RUN_ID, "specification-mapping-quarantine");
+      const quarantineName = readdirSync(quarantineDir).find((name) => name.includes(String(transaction.transaction_id)) && name.endsWith("-confirm-proof-invalid.json"));
+      assert.ok(quarantineName, "invalid confirmation WAL must have an exact audit archive");
+      assert.equal(readFileSync(join(quarantineDir, quarantineName!), "utf8"), transactionRaw, "WAL archive must preserve exact bytes");
+
+      const resumed = resumeCtoSpecificationMappingForTest(root, {
+        cto_run_id: RUN_ID,
+        mapping_id: frozen.mapping_id,
+        mapping_hash: frozen.mapping_hash,
+        mapping_version: frozen.mapping_version,
+      });
+      assert.equal(resumed.status, "resumed", `${corruption} staged WAL must be recoverable by one authenticated resume: ${detail(resumed)}`);
+      const reopenedAfterWal = JSON.parse(readFileSync(mappingPath, "utf8")) as Json;
+      assert.equal((reopenedAfterWal.mapping as Json).status, "awaiting_confirmation");
+      const nextAsk = deriveCtoSpecificationMappingAskInput(root, {
+        cto_run_id: RUN_ID,
+        mapping_id: frozen.mapping_id,
+        mapping_hash: frozen.mapping_hash,
+      });
+      assert.equal(nextAsk.status, "ready", `${corruption} recovery must make a fresh Ask available: ${detail(nextAsk)}`);
+      const finalAnswer = await prepareTrustedConfirmation(root, frozen);
+      const confirmedAgain = await confirmCtoSpecificationMappingForTest(root, finalAnswer);
+      assert.equal(confirmedAgain.status, "confirmed", `${corruption} fresh answer must reconfirm: ${detail(confirmedAgain)}`);
+    } finally {
+      setCtoSpecificationMappingFailureInjector(null, root);
+      executionContexts.delete(root);
+      projectFeatures.delete(root);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("valid confirmed proof rejects resume without trusting forged confirmation WALs", async () => {
+  const root = makeProject();
+  const featureId = "confirmed-proof-valid";
+  try {
+    writeFeature(root, featureId);
+    const frozen = mapping(await preflight(root, [selection(featureId)]));
+    const confirmed = await confirmTrusted(root, frozen);
+    assert.equal(confirmed.status, "confirmed", detail(confirmed));
+    const mappingPath = join(root, ".work-state", "cto", RUN_ID, "specification-mappings", `${String(frozen.mapping_id)}.json`);
+    const beforeMapping = readFileSync(mappingPath, "utf8");
+    const transactionDir = join(root, ".work-state", "cto", RUN_ID, "specification-mapping-transactions");
+    mkdirSync(transactionDir, { recursive: true });
+    for (const [transactionId, mappingId] of [["forged-confirm-same", String(frozen.mapping_id)], ["forged-confirm-unrelated", "forged-unrelated-mapping"]] as const) {
+      writeFileSync(join(transactionDir, `${transactionId}.json`), JSON.stringify({
+        schema_version: 1,
+        transaction_id: transactionId,
+        cto_run_id: RUN_ID,
+        operation: "confirm",
+        mapping_id: mappingId,
+        confirmation_transaction_hmac: "forged",
+      }) + "\n", "utf8");
+    }
+    const rejected = resumeCtoSpecificationMappingForTest(root, {
+      cto_run_id: RUN_ID,
+      mapping_id: frozen.mapping_id,
+      mapping_hash: frozen.mapping_hash,
+      mapping_version: frozen.mapping_version,
+    });
+    assert.equal(rejected.status, "blocked", detail(rejected));
+    assert.match(detail(rejected), /valid durable proof|takeover/i);
+    assert.equal(readFileSync(mappingPath, "utf8"), beforeMapping, "valid confirmed mapping bytes must remain unchanged");
+    assert.equal(readdirSync(transactionDir).filter((name) => name.endsWith(".json")).length, 0, "forged WALs must not remain replayable");
+    const quarantineDir = join(root, ".work-state", "cto", RUN_ID, "specification-mapping-quarantine");
+    assert.equal(readdirSync(quarantineDir).filter((name) => name.endsWith("-confirm-invalid.json")).length, 2, "same and unrelated forged WALs must be archived");
+  } finally {
     executionContexts.delete(root);
     projectFeatures.delete(root);
     rmSync(root, { recursive: true, force: true });
