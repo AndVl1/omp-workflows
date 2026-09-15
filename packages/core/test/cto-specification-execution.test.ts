@@ -12,7 +12,7 @@
  *   expected_mapping_hash })
  */
 
-import { after, test } from "node:test";
+import { after, afterEach, test } from "node:test";
 import { TEST_CONTEXT, TEST_ON, TEST_SESSION_MANAGER } from "./fixtures/registrar-host.js";
 import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
@@ -141,6 +141,13 @@ function closeTestRuntime(root: string, sessionId: string): void {
   fixture.close();
   testRuntimeFixtures.delete(key);
 }
+
+afterEach(() => {
+  for (const [key, fixture] of [...testRuntimeFixtures]) {
+    fixture.close();
+    testRuntimeFixtures.delete(key);
+  }
+});
 
 after(() => {
   for (const fixture of testRuntimeFixtures.values()) fixture.close();
