@@ -2244,22 +2244,12 @@ export function generateReport(
   const targets = roots
     .filter((root, index, all) => all.findIndex(candidate => candidate.identity.dev === root.identity.dev && candidate.identity.ino === root.identity.ino) === index)
     .sort(comparePinnedRoots);
-  let closed = false;
-  const closeDiscovery = (): void => {
-    if (closed) return;
-    closed = true;
-    closeSuiteDiscovery(discovery);
-  };
   const execute = (): GenerateReportResult => {
-    try {
-      if (discovery.single) {
-        const result = generateSingleReport(suiteRoot, input, { ...opts, retainedReportRoot: externalRoot }, discovery);
-        return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings };
-      }
-      return generateSuiteReport(suiteRoot, discovery, input, { ...opts, retainedReportRoot: externalRoot });
-    } finally {
-      closeDiscovery();
+    if (discovery.single) {
+      const result = generateSingleReport(suiteRoot, input, { ...opts, retainedReportRoot: externalRoot }, discovery);
+      return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings };
     }
+    return generateSuiteReport(suiteRoot, discovery, input, { ...opts, retainedReportRoot: externalRoot });
   };
   const runLocked = (index: number): GenerateReportResult => {
     const root = targets[index];
@@ -2269,7 +2259,7 @@ export function generateReport(
   try {
     return runLocked(0);
   } finally {
-    closeDiscovery();
+    closeSuiteDiscovery(discovery);
     closePinnedDirectory(externalRoot);
   }
 }

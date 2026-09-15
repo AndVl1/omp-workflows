@@ -909,6 +909,39 @@ test('report: final directory identity is rechecked after the helper walk', () =
   assert.equal(existsSync(join(attackerDir, 'transcript.jsonl')), false);
 });
 
+test('report suite: all suite locks release after success and throw paths', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-lock-release-'));
+  const first = makeSessionDir();
+  const second = makeSessionDir();
+  renameSync(first, join(suite, 'session-a'));
+  renameSync(second, join(suite, 'session-b'));
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-lock-release-md-'));
+  let failOnce = true;
+  setEvidenceCopyTestHooks({
+    beforeSourceOpen() {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('injected suite failure');
+      }
+    },
+  });
+  try {
+    assert.throws(() => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }), /injected suite failure/u);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+  }
+  try {
+    const firstResult = generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir });
+    const secondResult = generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir });
+    assert.ok(existsSync(firstResult.jsonPath));
+    assert.ok(existsSync(secondResult.jsonPath));
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+
 test('report suite: child reporter contention is serialized by retained child root lock', () => {
   const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-child-lock-contention-'));
   const child = makeSessionDir();
