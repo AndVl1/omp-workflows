@@ -1310,7 +1310,14 @@ def lock_acquire(name, owner_pid, owner_start):
                     qmarker = os.read(qfd, 512).decode("utf-8").strip()
                 finally:
                     os.close(qfd)
-                if qinfo.st_dev != old.st_dev or qinfo.st_ino != old.st_ino or qmarker != marker:
+                if qinfo.st_dev != old.st_dev or qinfo.st_ino != old.st_ino:
+                    return None
+                if qmarker != marker:
+                    try:
+                        os.link(quarantine, name, src_dir_fd=3, dst_dir_fd=3, follow_symlinks=False)
+                    except FileExistsError:
+                        return None
+                    os.unlink(quarantine, dir_fd=3)
                     return None
                 os.unlink(quarantine, dir_fd=3)
             except OSError:
