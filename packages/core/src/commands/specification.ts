@@ -1203,7 +1203,7 @@ async function runSpecificationCommand(
     const stoppedNextPhaseCandidate = Boolean(
       transitionState.state
         && transitionState.state.stage_cursor !== phase
-        && transitionState.state.pause.kind === "done",
+        && transitionState.state.pause?.kind === "done",
     );
     if (hasResumableNativePhase(transitionState.state, selected.workspace, phase) || stoppedNextPhaseCandidate) {
       const resumed = resumeStoppedNativeSpecificationPhase(rootResult.root, {
