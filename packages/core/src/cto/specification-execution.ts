@@ -1781,7 +1781,11 @@ export function prepareCtoSpecificationExecution(
       transaction.status = "committing";
       transaction.updated_at = new Date().toISOString();
       transaction.feature_state.after = capturePreparationImage(pinnedRoot, input.cto_run_id, featureStatePath);
-      state = persistPreparationTransaction(runtimeAccess, state, pinnedRoot, transaction, assertAllSelectedConstitutionsCurrent);
+      // Journal the exact anchor postimage before re-validating every selected
+      // workspace. If a non-anchor workspace drifts during this final seam,
+      // recovery must know the anchor mutation it is responsible for undoing.
+      state = persistPreparationTransaction(runtimeAccess, state, pinnedRoot, transaction);
+      assertAllSelectedConstitutionsCurrent();
       injectPreparationFailure(root, pinnedRoot, "after_feature_capability_write", confirmationAnchor.feature_id);
       injectPreparationFailure(root, pinnedRoot, "before_wave_commit", confirmationAnchor.feature_id);
       if (borrowedPinnedRoot && (!pinnedRoot.isStable() || !pinnedTeamDefsMatch(pinnedRoot, defs))) {
