@@ -67,6 +67,7 @@ import {
 import { dodBackstop } from "../src/gates/dod-backstop.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 
 const COMPLEXITIES: Complexity[] = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"];
 const FLAGS: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
@@ -493,9 +494,15 @@ test("lecture-research: acquisition gate accepts succeeded/partial and rejects f
   assert.match(acquisition.prompt ?? "", /provider.*setup|installation/i);
   assert.match(acquisition.prompt ?? "", /do not ask the user for a transcript/i);
   const root = mkdtempSync(join(tmpdir(), "lecture-acquisition-gate-"));
+  let pinnedRoot: PinnedProjectRoot | null = null;
   try {
     const artifactsDir = join(root, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
+    pinnedRoot = PinnedProjectRoot.open(root);
+    assert.ok(pinnedRoot, "acquisition gate fixture root must be pinnable");
+    if (!pinnedRoot) return;
+    const artifactsDirRelative = pinnedRoot.relativePath(artifactsDir);
+    assert.equal(artifactsDirRelative, "artifacts", "acquisition artifacts must stay under the pinned root");
     const stageState = { ...minimalState(), stage_cursor: "acquisition", stages: [{ id: "acquisition", status: "in_progress" }] };
     const gate = acquisition.gate ?? "";
     assert.match(gate, /lecture_acquisition\.status == succeeded/);
@@ -503,18 +510,19 @@ test("lecture-research: acquisition gate accepts succeeded/partial and rejects f
     for (const status of ["succeeded", "partial"] as const) {
       writeFileSync(join(artifactsDir, "lecture_acquisition.json"), JSON.stringify(acquisitionArtifact(status)));
       assert.deepEqual(
-        evaluatePredicate(gate, { flags: FLAGS, artifactsDir, state: stageState, stage: acquisition }),
+        evaluatePredicate(gate, { flags: FLAGS, artifactsDir, artifactsDirRelative, pinnedRoot, state: stageState, stage: acquisition }),
         { ok: true, value: true },
         `acquisition gate must accept '${status}'`,
       );
     }
     writeFileSync(join(artifactsDir, "lecture_acquisition.json"), JSON.stringify(acquisitionArtifact("failed")));
     assert.deepEqual(
-      evaluatePredicate(gate, { flags: FLAGS, artifactsDir, state: stageState, stage: acquisition }),
+      evaluatePredicate(gate, { flags: FLAGS, artifactsDir, artifactsDirRelative, pinnedRoot, state: stageState, stage: acquisition }),
       { ok: true, value: false },
       "acquisition gate must reject failed status",
     );
   } finally {
+    pinnedRoot?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
