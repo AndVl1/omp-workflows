@@ -39,7 +39,7 @@ import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { setCanonicalHandoffReadTestHooks } from "../src/specification/canonical-reader.js";
 import { captureWorkspacePathBinding } from "../src/specification/workspace.js";
 import { ensureProjectConstitution } from "../src/specification/prerequisite.js";
-import { registerCtoTools, registerTeamWorkflow } from "../src/index.js";
+import { registerCtoTools, registerTeamWorkflow, type TeamSessionBindingController, type TeamSessionRuntimeBinding } from "../src/index.js";
 import { beginRegistryRegistration, commitRegistryRegistration, rollbackRegistryRegistration } from "../src/registry/index.js";
 import { digestOf } from "../src/specification/validation.js";
 import { readExecutionClaimStore } from "../src/specification/claims.js";
@@ -222,7 +222,7 @@ function preparedTeam(root: string, runId: string): { state: CtoState; team: Cto
   return { state, team, dodFile: join(root, team.dod_path, "dod.json") };
 }
 
-type MountedCtoTool = { name: string; execute: (...args: unknown[]) => Promise<{ details: unknown }>; sessionManager?: { cwd: string; getSessionId: () => string; getCwd: () => string } };
+type MountedCtoTool = { name: string; execute: (...args: unknown[]) => Promise<{ details: unknown }>; close: () => void; sessionManager?: { cwd: string; getSessionId: () => string; getCwd: () => string } };
 
 function mountedCtoAskTool(root: string, runId: string, runtime: ReturnType<typeof openTestCtoRuntime>): MountedCtoTool {
   const registered: MountedCtoTool[] = [];
@@ -238,23 +238,42 @@ function mountedCtoAskTool(root: string, runId: string, runtime: ReturnType<type
   const sessionContext = { cwd: root, mode: "rpc", hasUI: true, sessionManager, ui: { askDialog: async () => undefined } };
   const registration = beginRegistryRegistration(runtime.registryContext, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
   if (!registration.ok) throw new Error(`${registration.code}: ${registration.error}`);
+  let bindingController: TeamSessionBindingController | undefined;
+  let initialBinding: TeamSessionRuntimeBinding | undefined;
+  let closed = false;
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    const binding = initialBinding;
+    initialBinding = undefined;
+    if (binding && bindingController) bindingController.release(binding);
+  };
   try {
     registerTeamWorkflow(pi as never, {
       cwd: root,
       owner: () => runtime.owner,
       registrationToken: registration.token,
       initialSessionContext: sessionContext,
+      onSessionBindingController: (controller) => {
+        bindingController = controller;
+        initialBinding = controller.current(sessionContext);
+        if (!initialBinding) throw new Error("mounted CTO initial session binding is unavailable");
+      },
     });
     registerCtoTools(pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd, owner: () => runtime.owner, registrationToken: registration.token });
     commitRegistryRegistration(registration.token);
     runtime.refreshAccess();
   } catch (error) {
+    close();
     try { rollbackRegistryRegistration(registration.token); } catch { /* preserve original */ }
     throw error;
   }
   const tool = registered.find((candidate) => candidate.name === "cto_checkpoint_ask_selected");
-  if (!tool) throw new Error("mounted CTO selected Ask tool is unavailable");
-  return { ...tool, sessionManager };
+  if (!tool) {
+    close();
+    throw new Error("mounted CTO selected Ask tool is unavailable");
+  }
+  return { ...tool, close, sessionManager };
 }
 
 async function withAuthenticatedRuntime<T>(root: string, sessionId: string, run: (runtime: ReturnType<typeof openTestCtoRuntime>) => Promise<T> | T): Promise<T> {
@@ -281,19 +300,24 @@ async function confirmPrepared(root: string, preparation: Preparation, featureId
       stage_id: "execution",
     };
     const askTool = mountedCtoAskTool(root, preparation.cto_run_id, runtime);
-    const asked = await askTool.execute("fixture-host-ask", askInput, undefined, undefined, {
-      cwd: root,
-      mode: "rpc",
-      hasUI: true,
-      sessionManager: askTool.sessionManager,
-      ui: {
-        askDialog: async (questions: Array<{ id: string; question: string; header?: string; options: Array<{ label: string }> }>) => {
-          const question = questions[0];
-          if (!question) return undefined;
-          return { kind: "submit" as const, results: [{ id: question.id, question: question.question, header: question.header, options: question.options.map((option) => option.label), multi: false, selectedOptions: ["approve_continue"] }] };
+    let asked: { details: unknown };
+    try {
+      asked = await askTool.execute("fixture-host-ask", askInput, undefined, undefined, {
+        cwd: root,
+        mode: "rpc",
+        hasUI: true,
+        sessionManager: askTool.sessionManager,
+        ui: {
+          askDialog: async (questions: Array<{ id: string; question: string; header?: string; options: Array<{ label: string }> }>) => {
+            const question = questions[0];
+            if (!question) return undefined;
+            return { kind: "submit" as const, results: [{ id: question.id, question: question.question, header: question.header, options: question.options.map((option) => option.label), multi: false, selectedOptions: ["approve_continue"] }] };
+          },
         },
-      },
-    });
+      });
+    } finally {
+      askTool.close();
+    }
     const askedDetails = asked.details as Json;
     assert.equal(askedDetails.status, "answered", JSON.stringify(askedDetails));
     const confirmed = await confirmCtoSpecificationMapping(root, {
