@@ -89,163 +89,105 @@ export interface ObservabilityRecorderOwnerIdentity {
   readonly generation?: string | number;
 }
 
-export type RecorderLease = {
+export interface ObservabilityRecorderSession {
   readonly identity: ObservabilityRecorderOwnerIdentity;
-  readonly entries: Set<RecorderEntry>;
+  recorder: EventRecorder | undefined;
   disposed: boolean;
-};
-type RecorderEntry = {
-  readonly cwd: string;
-  readonly recorder: EventRecorder;
-  readonly canonicalRoot: string;
-  readonly rootDev: number;
-  readonly rootIno: number;
-  readonly owners: Set<RecorderLease>;
-};
-
-const recorderCache = new Map<string, RecorderEntry>();
-const MAX_CACHED_RECORDERS = 64;
-
-export function createObservabilityRecorderLease(identity: ObservabilityRecorderOwnerIdentity): RecorderLease {
-  return { identity, entries: new Set(), disposed: false };
+  closePromise: Promise<void> | undefined;
 }
 
-export function createObservabilityRecorderLeaseForCwd(cwd: string, session: Omit<ObservabilityRecorderOwnerIdentity, "canonicalRoot" | "rootDev" | "rootIno"> = {}): RecorderLease | undefined {
+export function createObservabilityRecorderSession(identity: ObservabilityRecorderOwnerIdentity): ObservabilityRecorderSession {
+  return { identity, recorder: undefined, disposed: false, closePromise: undefined };
+}
+
+export function createObservabilityRecorderSessionForCwd(cwd: string, session: Omit<ObservabilityRecorderOwnerIdentity, "canonicalRoot" | "rootDev" | "rootIno"> = {}): ObservabilityRecorderSession | undefined {
   const pinnedRoot = PinnedProjectRoot.open(cwd);
   if (!pinnedRoot) return undefined;
   const identity = { canonicalRoot: pinnedRoot.canonical_root, rootDev: pinnedRoot.dev, rootIno: pinnedRoot.ino, ...session };
   pinnedRoot.close();
-  return createObservabilityRecorderLease(identity);
+  return createObservabilityRecorderSession(identity);
 }
 
-export async function closeObservabilityRecorderLease(lease: RecorderLease): Promise<void> {
-  await closeRecorderLease(lease);
+const directPending = new Map<string, Set<Promise<void>>>();
+
+function trackDirect(cwd: string, operation: Promise<void>): void {
+  let pending = directPending.get(cwd);
+  if (!pending) { pending = new Set(); directPending.set(cwd, pending); }
+  pending.add(operation);
+  void operation.finally(() => { pending?.delete(operation); if (pending?.size === 0) directPending.delete(cwd); });
 }
 
-export async function closeObservabilityRecorderLeaseForCwd(lease: RecorderLease, cwd: string): Promise<boolean> {
-  return closeRecorderLeaseForCwd(lease, cwd);
+function exactRootFor(cwd: string): PinnedProjectRoot {
+  const pinnedRoot = PinnedProjectRoot.open(cwd);
+  if (!pinnedRoot) throw new PinnedRootError("unsupported", "project root could not be pinned for observability");
+  return pinnedRoot;
 }
 
-function closeRecorderForFailure(recorder: EventRecorder): void {
-  for (const entry of new Set(recorderCache.values())) {
-    if (entry.recorder === recorder) void closeRecorderEntry(entry);
-  }
+function assertSessionRoot(session: ObservabilityRecorderSession, pinnedRoot: PinnedProjectRoot): void {
+  if (session.identity.canonicalRoot !== pinnedRoot.canonical_root || session.identity.rootDev !== pinnedRoot.dev || session.identity.rootIno !== pinnedRoot.ino) throw new PinnedRootError("changed", "observability session root identity changed");
 }
 
-async function closeRecorderEntry(entry: RecorderEntry): Promise<void> {
-  for (const owner of entry.owners) owner.entries.delete(entry);
-  entry.owners.clear();
-  for (const [cwd, cached] of [...recorderCache.entries()]) {
-    if (cached === entry) recorderCache.delete(cwd);
-  }
-  await entry.recorder.closeAsync();
+async function closeSession(session: ObservabilityRecorderSession): Promise<void> {
+  if (session.closePromise) return session.closePromise;
+  session.disposed = true;
+  session.closePromise = session.recorder?.closeAsync() ?? Promise.resolve();
+  await session.closePromise;
 }
 
-function attachLease(entry: RecorderEntry, lease: RecorderLease | undefined): void {
-  if (!lease || lease.disposed) return;
-  if (entry.canonicalRoot !== lease.identity.canonicalRoot || entry.rootDev !== lease.identity.rootDev || entry.rootIno !== lease.identity.rootIno) return;
-  entry.owners.add(lease);
-  lease.entries.add(entry);
-}
+export async function closeObservabilityRecorderSession(session: ObservabilityRecorderSession): Promise<void> { await closeSession(session); }
 
-async function closeRecorderLease(lease: RecorderLease): Promise<void> {
-  if (lease.disposed) return;
-  lease.disposed = true;
-  const closing: Promise<void>[] = [];
-  for (const entry of [...lease.entries]) {
-    entry.owners.delete(lease);
-    lease.entries.delete(entry);
-    if (entry.owners.size === 0) closing.push(closeRecorderEntry(entry));
-  }
-  await Promise.all(closing);
-}
-
-async function closeRecorderLeaseForCwd(lease: RecorderLease, cwd: string): Promise<boolean> {
-  if (lease.disposed) return false;
+export async function closeObservabilityRecorderSessionForCwd(session: ObservabilityRecorderSession, cwd: string): Promise<boolean> {
   const pinnedRoot = PinnedProjectRoot.open(cwd);
   if (!pinnedRoot) return false;
-  const identity = { canonicalRoot: pinnedRoot.canonical_root, rootDev: pinnedRoot.dev, rootIno: pinnedRoot.ino };
-  const matches = lease.identity.canonicalRoot === identity.canonicalRoot
-    && lease.identity.rootDev === identity.rootDev
-    && lease.identity.rootIno === identity.rootIno;
+  const matches = session.identity.canonicalRoot === pinnedRoot.canonical_root && session.identity.rootDev === pinnedRoot.dev && session.identity.rootIno === pinnedRoot.ino;
   pinnedRoot.close();
   if (!matches) return false;
-  const closing: Promise<void>[] = [];
-  for (const entry of [...lease.entries]) {
-    if (entry.canonicalRoot !== identity.canonicalRoot || entry.rootDev !== identity.rootDev || entry.rootIno !== identity.rootIno) continue;
-    entry.owners.delete(lease);
-    lease.entries.delete(entry);
-    if (entry.owners.size === 0) closing.push(closeRecorderEntry(entry));
-  }
-  await Promise.all(closing);
+  await closeSession(session);
   return true;
 }
 
-function cacheRecorder(cwd: string, recorder: EventRecorder, pinnedRoot: PinnedProjectRoot): RecorderEntry {
-  const prior = recorderCache.get(cwd);
-  if (prior) void closeRecorderEntry(prior);
-  const entry: RecorderEntry = { cwd, recorder, canonicalRoot: pinnedRoot.canonical_root, rootDev: pinnedRoot.dev, rootIno: pinnedRoot.ino, owners: new Set() };
-  recorderCache.set(cwd, entry);
-  while (recorderCache.size > MAX_CACHED_RECORDERS) {
-    const oldest = recorderCache.entries().next().value as [string, RecorderEntry] | undefined;
-    if (!oldest) break;
-    void closeRecorderEntry(oldest[1]);
-  }
-  return entry;
-}
-
-function getRecorder(cwd: string, lease?: RecorderLease): EventRecorder {
-  const cached = recorderCache.get(cwd);
-  if (cached) {
-    attachLease(cached, lease);
-    return cached.recorder;
-  }
-  const pinnedRoot = PinnedProjectRoot.open(cwd);
-  if (!pinnedRoot) throw new PinnedRootError("unsupported", "project root could not be pinned for observability");
-  let retained = false;
+function appendDirect(cwd: string, ev: Omit<ObservabilityEvent, "id" | "branch"> & { kind: EventKind }): void {
+  let pinnedRoot: PinnedProjectRoot;
+  try { pinnedRoot = exactRootFor(cwd); } catch { return; }
   try {
-    const branch = currentBranch(cwd);
-    const featureSlug = activeFeatureSlug(pinnedRoot);
-    const rec = new EventRecorder({ cwd, branch, featureSlug, pinnedRoot });
-    const entry = cacheRecorder(cwd, rec, pinnedRoot);
-    attachLease(entry, lease);
-    retained = true;
-    return rec;
-  } finally {
-    if (!retained) pinnedRoot.close();
-  }
+    const recorder = new EventRecorder({ cwd, branch: currentBranch(cwd), featureSlug: activeFeatureSlug(pinnedRoot), pinnedRoot, ownsPinnedRoot: true });
+    const operation = recorder.append(ev).then(() => undefined).catch(() => undefined).finally(() => recorder.closeAsync());
+    trackDirect(cwd, operation);
+  } catch { pinnedRoot.close(); }
 }
 
-/**
- * Test helper: drain the in-memory write queue for a given cwd. Production
+function appendSession(session: ObservabilityRecorderSession, cwd: string, ev: Omit<ObservabilityEvent, "id" | "branch"> & { kind: EventKind }): void {
+  if (session.disposed) return;
+  let pinnedRoot: PinnedProjectRoot | undefined;
+  try {
+    pinnedRoot = exactRootFor(cwd);
+    assertSessionRoot(session, pinnedRoot);
+    if (!session.recorder) {
+      session.recorder = new EventRecorder({ cwd, branch: currentBranch(cwd), featureSlug: activeFeatureSlug(pinnedRoot), pinnedRoot, ownsPinnedRoot: true });
+      pinnedRoot = undefined;
+    } else {
+      pinnedRoot.close();
+    }
+    void session.recorder.append(ev).catch(() => closeSession(session));
+  } catch { pinnedRoot?.close(); }
+}
+
+/** Test helper: drain the in-memory write queue for a given cwd. Production
  * code never needs this; only tests use it to assert post-write state
  * without relying on real timers.
  */
 export async function flushRecorder(cwd: string): Promise<void> {
-  const entry = recorderCache.get(cwd);
-  if (entry) await entry.recorder.flush();
+  const pending = directPending.get(cwd);
+  if (pending) await Promise.all([...pending]);
 }
 
 function safeAppend(
   cwd: string,
   ev: Omit<ObservabilityEvent, "id" | "branch"> & { kind: EventKind },
-  lease?: RecorderLease,
+  session?: ObservabilityRecorderSession,
 ): void {
-  const reject = (error: unknown): void => {
-    const reason = error instanceof Error && error.message ? error.message : "telemetry write rejected";
-    console.warn(`[observability] ${reason}`);
-  };
-  let recorder: EventRecorder | undefined;
-  try {
-    recorder = getRecorder(cwd, lease);
-    void recorder.append(ev).catch((error) => {
-      closeRecorderForFailure(recorder!);
-      reject(error);
-    });
-  } catch (error) {
-    if (recorder) closeRecorderForFailure(recorder);
-    reject(error);
-  }
+  if (session) appendSession(session, cwd, ev);
+  else appendDirect(cwd, ev);
 }
 
 export function recordToolCallAttempt(
@@ -447,17 +389,17 @@ function sessionIdFrom(event: unknown, ctx: unknown): string | undefined {
 }
 
 export interface HookHandlers {
-  onBeforeAgentStart(event: unknown, ctx: unknown, lease?: RecorderLease): void;
-  onAgentStart(event: unknown, ctx: unknown, lease?: RecorderLease): void;
-  onAgentEnd(event: unknown, ctx: unknown, lease?: RecorderLease): void;
-  onToolCall(event: unknown, ctx: unknown, lease?: RecorderLease): void;
-  onToolResult(event: unknown, ctx: unknown, lease?: RecorderLease): void;
-  onSessionStart(event: unknown, ctx: unknown, lease?: RecorderLease): void;
-  onSessionStop(event: unknown, ctx: unknown, lease?: RecorderLease): void;
+  onBeforeAgentStart(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
+  onAgentStart(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
+  onAgentEnd(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
+  onToolCall(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
+  onToolResult(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
+  onSessionStart(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
+  onSessionStop(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
 }
 
 export const observabilityHooks: HookHandlers = {
-  onBeforeAgentStart(event, ctx, lease) {
+  onBeforeAgentStart(event, ctx, session) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { systemPrompt?: string[] } | undefined;
@@ -467,18 +409,18 @@ export const observabilityHooks: HookHandlers = {
       kind: "before_agent_start",
       ts: new Date().toISOString(),
       skills,
-    }, lease);
+    }, session);
   },
-  onAgentStart(event, ctx, lease) {
+  onAgentStart(event, ctx, session) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     safeAppend(cwd, {
       ...signalMetadata(event, ctx),
       kind: "agent_start",
       ts: new Date().toISOString(),
-    }, lease);
+    }, session);
   },
-  onAgentEnd(event, ctx, lease) {
+  onAgentEnd(event, ctx, session) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { messages?: unknown[] } | undefined;
@@ -487,9 +429,9 @@ export const observabilityHooks: HookHandlers = {
       kind: "agent_end",
       ts: new Date().toISOString(),
       messageCount: Array.isArray(e?.messages) ? e.messages.length : 0,
-    }, lease);
+    }, session);
   },
-  onToolCall(event, ctx, lease) {
+  onToolCall(event, ctx, session) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { toolName?: string; toolCallId?: string; input?: unknown } | undefined;
@@ -504,9 +446,9 @@ export const observabilityHooks: HookHandlers = {
       toolCallId: e?.toolCallId,
       subagent,
       subagentTaskChars: taskChars,
-    }, lease);
+    }, session);
   },
-  onToolResult(event, ctx, lease) {
+  onToolResult(event, ctx, session) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { toolName?: string; toolCallId?: string; isError?: boolean } | undefined;
@@ -518,9 +460,9 @@ export const observabilityHooks: HookHandlers = {
       toolName: e.toolName,
       toolCallId: e.toolCallId,
       isError: e?.isError === true,
-    }, lease);
+    }, session);
   },
-  onSessionStart(event, ctx, lease) {
+  onSessionStart(event, ctx, session) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     safeAppend(cwd, {
@@ -528,9 +470,9 @@ export const observabilityHooks: HookHandlers = {
       kind: "session_start",
       ts: new Date().toISOString(),
       sessionId: sessionIdFrom(event, ctx),
-    }, lease);
+    }, session);
   },
-  onSessionStop(event, ctx, lease) {
+  onSessionStop(event, ctx, session) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     safeAppend(cwd, {
@@ -538,7 +480,7 @@ export const observabilityHooks: HookHandlers = {
       kind: "session_stop",
       ts: new Date().toISOString(),
       sessionId: sessionIdFrom(event, ctx),
-    }, lease);
+    }, session);
   },
 };
 /** Re-export so consumers can read the pointer cheaply. */

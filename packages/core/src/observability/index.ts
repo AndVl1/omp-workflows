@@ -8,7 +8,7 @@
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { createObservabilityRecorderLease, createObservabilityRecorderLeaseForCwd, closeObservabilityRecorderLease, closeObservabilityRecorderLeaseForCwd, observabilityHooks, type ObservabilityRecorderOwnerIdentity, type RecorderLease } from "./hooks.js";
+import { createObservabilityRecorderSession, createObservabilityRecorderSessionForCwd, closeObservabilityRecorderSession, closeObservabilityRecorderSessionForCwd, observabilityHooks, type ObservabilityRecorderOwnerIdentity, type ObservabilityRecorderSession } from "./hooks.js";
 
 function sessionIdentityFromContext(ctx: unknown): { sessionId?: string; sessionFile?: string; generation?: string | number } {
   if (!ctx || typeof ctx !== "object") return {};
@@ -19,10 +19,10 @@ function sessionIdentityFromContext(ctx: unknown): { sessionId?: string; session
   return { ...(typeof sessionId === "string" ? { sessionId } : {}), ...(typeof sessionFile === "string" ? { sessionFile } : {}), ...(generation !== undefined ? { generation } : {}) };
 }
 
-function shutdownMatchesLease(ctx: unknown, lease: RecorderLease): boolean {
+function shutdownMatchesSession(ctx: unknown, session: ObservabilityRecorderSession): boolean {
   if (!ctx || typeof ctx !== "object") return false;
   const { sessionId, sessionFile, generation } = sessionIdentityFromContext(ctx);
-  const identity = lease.identity;
+  const identity = session.identity;
   if (identity.sessionId !== undefined && sessionId !== identity.sessionId) return false;
   if (identity.sessionFile !== undefined && sessionFile !== identity.sessionFile) return false;
   if (identity.generation !== undefined && generation !== identity.generation) return false;
@@ -48,46 +48,46 @@ export function registerObservabilityHooks(
   opts: ObservabilityRegisterOptions = {},
 ): (() => Promise<void>) | undefined {
   if (opts.enabled === false) return undefined;
-  let lease: RecorderLease | undefined = opts.owner ? createObservabilityRecorderLease(opts.owner) : undefined;
+  let session: ObservabilityRecorderSession | undefined = opts.owner ? createObservabilityRecorderSession(opts.owner) : undefined;
   pi.on("before_agent_start", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onBeforeAgentStart(event, ctx, lease);
+    observabilityHooks.onBeforeAgentStart(event, ctx, session);
   });
   pi.on("agent_start", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onAgentStart(event, ctx, lease);
+    observabilityHooks.onAgentStart(event, ctx, session);
   });
   pi.on("agent_end", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onAgentEnd(event, ctx, lease);
+    observabilityHooks.onAgentEnd(event, ctx, session);
   });
   if (opts.toolCall !== false) {
     pi.on("tool_call", (event: unknown, ctx: unknown) => {
-      observabilityHooks.onToolCall(event, ctx, lease);
+      observabilityHooks.onToolCall(event, ctx, session);
     });
   }
   pi.on("tool_result", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onToolResult(event, ctx, lease);
+    observabilityHooks.onToolResult(event, ctx, session);
   });
   pi.on("session_start", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onSessionStart(event, ctx, lease);
+    observabilityHooks.onSessionStart(event, ctx, session);
   });
   pi.on("session_stop", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onSessionStop(event, ctx, lease);
+    observabilityHooks.onSessionStop(event, ctx, session);
   });
   pi.on("session_switch", async (_event: unknown, ctx: unknown) => {
     const cwd = typeof ctx === "object" && ctx !== null && "cwd" in ctx ? (ctx as { cwd?: unknown }).cwd : undefined;
-    if (lease && typeof cwd === "string" && cwd.length > 0) {
-      await closeObservabilityRecorderLease(lease);
-      const next = createObservabilityRecorderLeaseForCwd(cwd, sessionIdentityFromContext(ctx));
-      if (next) lease = next;
+    if (session && typeof cwd === "string" && cwd.length > 0) {
+      await closeObservabilityRecorderSession(session);
+      const next = createObservabilityRecorderSessionForCwd(cwd, sessionIdentityFromContext(ctx));
+      if (next) session = next;
     }
   });
   pi.on("session_shutdown", async (_event: unknown, ctx: unknown) => {
-    if (!lease || !shutdownMatchesLease(ctx, lease)) return;
+    if (!session || !shutdownMatchesSession(ctx, session)) return;
     const cwd = typeof ctx === "object" && ctx !== null && "cwd" in ctx ? (ctx as { cwd?: unknown }).cwd : undefined;
     if (typeof cwd !== "string" || cwd.length === 0) return;
-    const matched = await closeObservabilityRecorderLeaseForCwd(lease, cwd);
-    if (matched) await closeObservabilityRecorderLease(lease);
+    const matched = await closeObservabilityRecorderSessionForCwd(session, cwd);
+    if (matched) await closeObservabilityRecorderSession(session);
   });
-  return lease ? (() => closeObservabilityRecorderLease(lease!)) : undefined;
+  return session ? (() => closeObservabilityRecorderSession(session!)) : undefined;
 }
 
 export { EventRecorder, rollupFromEvents, readObservabilityPointer } from "./recorder.js";

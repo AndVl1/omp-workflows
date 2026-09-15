@@ -1437,8 +1437,14 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
     ? requireRegistryContext(activation.registryContext, teamRoot.canonical_root, "workflow_registration").principal_fingerprint
     : undefined;
   let observabilityCleanup: (() => Promise<void>) | undefined;
+  let activationCleanupDone = false;
+  const releaseActivation = (): void => {
+    if (activationCleanupDone) return;
+    activationCleanupDone = true;
+    activation?.cleanup?.();
+  };
   const teamBinding = teamRoot && activation?.registryToken && teamPrincipal
-    ? { root: teamRoot.canonical_root, rootDev: teamRoot.dev, rootIno: teamRoot.ino, principal: registryRegistrationPrincipal(activation.registryToken, "constitution_gate"), principalFingerprint: teamPrincipal, liveGuard: createRegistryRegistrationLiveGuard(activation.registryToken, "constitution_gate"), ...(activation.registryContext ? { registryContext: activation.registryContext } : {}), ...(activation.cleanup ? { cleanup: () => { const close = observabilityCleanup?.(); if (close) return close.then(() => activation.cleanup?.()); activation.cleanup?.(); } } : {}) }
+    ? { root: teamRoot.canonical_root, rootDev: teamRoot.dev, rootIno: teamRoot.ino, principal: registryRegistrationPrincipal(activation.registryToken, "constitution_gate"), principalFingerprint: teamPrincipal, liveGuard: createRegistryRegistrationLiveGuard(activation.registryToken, "constitution_gate"), ...(activation.registryContext ? { registryContext: activation.registryContext } : {}), ...(activation.cleanup ? { cleanup: () => { try { releaseActivation(); } finally { const close = observabilityCleanup?.(); if (close) void close.catch(() => undefined); } } } : {}) }
     : undefined;
   const teamReservation = reserveTeamActivation(pi as unknown as object, activation?.registryToken === undefined, teamRoot, teamBinding?.principal, teamBinding?.principalFingerprint, teamBinding?.liveGuard);
   let hostMountStarted = false;

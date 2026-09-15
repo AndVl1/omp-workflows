@@ -618,8 +618,9 @@ export interface RecorderOptions {
   branch: string;
   /** Feature slug (under `.work-state/features/<slug>/`). */
   featureSlug?: string;
-  /** Borrow an already pinned root; ownership remains with the caller. */
+  /** Borrow an already pinned root; ownership remains with the caller unless explicitly transferred. */
   pinnedRoot?: PinnedProjectRoot;
+  ownsPinnedRoot?: boolean;
   /** Maximum encoded bytes for one event including its JSONL newline. */
   maxEventBytes?: number;
   /** Maximum encoded bytes retained in events.jsonl. */
@@ -672,7 +673,7 @@ export class EventRecorder {
     const openedRoot = suppliedRoot ?? PinnedProjectRoot.open(opts.cwd);
     if (!openedRoot) throw new PinnedRootError("unsupported", "project root could not be pinned for observability");
     this.pinnedRoot = openedRoot;
-    this.ownsPinnedRoot = suppliedRoot === undefined;
+    this.ownsPinnedRoot = suppliedRoot === undefined || opts.ownsPinnedRoot === true;
     this.eventsRelativePath = join(OBSERVABILITY_PATH, this.featureSlug, OBSERVABILITY_DIR, EVENTS_FILENAME);
     this.lockRelativePath = join(OBSERVABILITY_PATH, this.featureSlug, OBSERVABILITY_DIR, `.${EVENTS_FILENAME}.lock`);
     try {
