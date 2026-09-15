@@ -949,6 +949,22 @@ test('report suite: reserved lock name cannot hide a valid child directory', () 
   }
 });
 
+test('report suite: malformed dead-owner lock file is reclaimed by acquisition', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-malformed-lock-'));
+  const child = makeSessionDir();
+  renameSync(child, join(suite, 'session-a'));
+  const lockPath = join(suite, '.omp-ux-e2e-report.lock');
+  writeFileSync(lockPath, '999999:malformed-lock-marker\n');
+  try {
+    const result = generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' });
+    assert.ok(existsSync(result.jsonPath));
+    assert.equal(existsSync(lockPath), false, 'reclaimed stale lock is released after reporting');
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+  }
+});
+
+
 test('report suite: reserved lock name symlink is rejected instead of omitted', () => {
   const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-reserved-lock-link-'));
   const child = makeSessionDir();

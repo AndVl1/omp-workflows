@@ -1761,14 +1761,12 @@ function generateSingleReport(
 const REPORT_LOCK_TIMEOUT_MS = 5000;
 const REPORT_LOCK_NAME = '.omp-ux-e2e-report.lock';
 function verifiedReportLockEntry(root: PinnedDirectory): boolean {
-  const bytes = readPinnedFileFull(root, REPORT_LOCK_NAME, 512);
-  if (bytes === null) return false;
-  const marker = bytes.toString('utf8').trim();
-  const match = /^(\d+):([0-9a-f-]{36}):([^:]{1,128}):([0-9a-f]{64})$/u.exec(marker);
-  if (match === null || match[1] === undefined || match[2] === undefined || match[3] === undefined || match[4] === undefined) return false;
-  const pid = Number(match[1]);
-  return Number.isSafeInteger(pid) && pid > 0
-    && createHash('sha256').update(`${pid}:${match[2]}:${match[3]}`, 'utf8').digest('hex') === match[4];
+  try {
+    const info = lstatSync(join(root.lexicalPath, REPORT_LOCK_NAME));
+    return info.isFile() && !info.isSymbolicLink() && info.nlink === 1 && pinnedDirectoryIsStable(root);
+  } catch {
+    return false;
+  }
 }
 function comparePinnedRoots(left: PinnedDirectory, right: PinnedDirectory): number {
   if (left.physicalPath < right.physicalPath) return -1;
