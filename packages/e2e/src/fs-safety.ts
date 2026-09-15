@@ -823,6 +823,8 @@ export interface PinnedWriteOptions {
   readonly replaceExisting?: boolean;
   /** Internal rollback mode: retain descriptor authority even after lexical replacement. */
   readonly requireStable?: boolean;
+  /** Internal transaction receipt; called after the leaf is linked into place. */
+  readonly onPublished?: () => void;
 }
 
 export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buffer, options: PinnedWriteOptions = {}): boolean {
@@ -853,6 +855,7 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
       }
       temporary = null;
       published = true;
+      options.onPublished?.();
       return rootStable();
     }
     const descriptorRoot = descriptorPathFor(root.fd);
@@ -889,6 +892,7 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
     }
     temporary = null;
     published = true;
+    options.onPublished?.();
     fsyncSync(root.fd);
     return rootStable();
   } catch {

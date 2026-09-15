@@ -1534,3 +1534,24 @@ test('report: source root swap after first evidence copy rolls back every publis
     if (!swapped) rmSync(replacement, { recursive: true, force: true });
   }
 });
+
+
+test('report: oversized preexisting markdown fails before publication and preserves exact bytes', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-oversized-existing-'));
+  const expectedDate = new Date().toISOString().slice(0, 10);
+  const destination = join(mdDir, `my-feature-ux-e2e-${expectedDate}.md`);
+  const previous = Buffer.alloc(MAX_PINNED_READ_BYTES + 1, 0x5a);
+  writeFileSync(destination, previous);
+  try {
+    assert.throws(
+      () => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }),
+      /existing markdown exceeds the exact rollback snapshot bound/u,
+    );
+    assert.deepEqual(readFileSync(destination), previous, 'oversized markdown remains byte-exact');
+    assert.equal(existsSync(join(dir, '.work-state', 'ux-e2e', 'report.json')), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});

@@ -568,14 +568,28 @@ function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir
             closePinnedFile(existingFile);
           }
         }
-        if (!writePinnedFile(destinationRoot, filename, bytes, { replaceExisting: false })) continue;
-        const publishedPath = join(destinationDir, filename);
-        created?.set(publishedPath, bytes);
-        if (createdRoots !== undefined) {
-          createdRoots.set(publishedPath, destinationRoot);
-          retainDestinationRoot = true;
+        let published = false;
+        const enrollPublication = (): void => {
+          const publishedPath = join(destinationDir, filename);
+          created?.set(publishedPath, bytes);
+          if (createdRoots !== undefined) {
+            createdRoots.set(publishedPath, destinationRoot);
+            retainDestinationRoot = true;
+          }
+          copied.push(publishedPath);
+        };
+        const stable = writePinnedFile(destinationRoot, filename, bytes, {
+          replaceExisting: false,
+          onPublished: () => { published = true; },
+        });
+        if (!stable) {
+          if (published) {
+            enrollPublication();
+            throw new Error(`ux-e2e: evidence destination changed after publication: ${join(destinationDir, filename)}`);
+          }
+          continue;
         }
-        copied.push(publishedPath);
+        enrollPublication();
       } finally {
         if (ownsDestinationRoot && !retainDestinationRoot) closePinnedDirectory(destinationRoot);
       }
@@ -1595,6 +1609,16 @@ function generateSingleReport(
     if (opts.writeOutputs === false) {
       return { jsonPath, mdPath: '', warnings, report };
     }
+    const mdFilename = `${slug}-ux-e2e-${todayStamp()}.md`;
+    const mdPath = join(mdDir, mdFilename);
+    const previousMarkdown = readPinnedFileFull(reportDestination!, mdFilename);
+    if (previousMarkdown === null) {
+      const existingMarkdown = openPinnedFile(reportDestination!, mdFilename, fsConstants.O_RDONLY);
+      if (existingMarkdown !== null) {
+        closePinnedFile(existingMarkdown);
+        throw new Error('ux-e2e: existing markdown exceeds the exact rollback snapshot bound');
+      }
+    }
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before report JSON output');
       if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before report JSON output');
     let jsonBytes: Buffer | null = null;
@@ -1619,8 +1643,6 @@ function generateSingleReport(
         writePinnedFile(stateDestination, 'report.json', previousJson, { requireStable: false });
       }
     };
-    const mdFilename = `${slug}-ux-e2e-${todayStamp()}.md`;
-    const mdPath = join(mdDir, mdFilename);
     try {
       if (reportDestination === null) throw new Error('ux-e2e: report destination root is unavailable');
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before markdown output');
@@ -1630,15 +1652,15 @@ function generateSingleReport(
       throw error;
     }
     const markdownBytes = Buffer.from(renderMarkdown(report));
-      const previousMarkdown = readPinnedFile(reportDestination, mdFilename, MAX_PINNED_READ_BYTES, 0);
+      // previousMarkdown was captured before JSON publication with an exact-size read.
       try {
         if (!writePinnedFile(reportDestination, mdFilename, markdownBytes) || !pinnedDirectoryIsStable(scratchRoot)) {
           throw new Error('ux-e2e: failed to write markdown inside the report destination');
         }
         if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'after report output');
       } catch (error) {
-        if (unlinkPinnedFileIfExact(reportDestination, mdFilename, markdownBytes) && previousMarkdown !== null) {
-          writePinnedFile(reportDestination, mdFilename, previousMarkdown);
+        if (unlinkPinnedFileIfExact(reportDestination, mdFilename, markdownBytes, { requireStable: false }) && previousMarkdown !== null) {
+          writePinnedFile(reportDestination, mdFilename, previousMarkdown, { requireStable: false });
         }
         rollbackJson();
         throw error;
@@ -1872,10 +1894,10 @@ function writeSuiteReport(
   let mdFilename = '';
   const rollback = (): void => {
     if (markdownTouched && markdownBytes !== null) {
-      if (unlinkPinnedFileIfExact(reportRoot, mdFilename, markdownBytes) && previousMarkdown !== null) writePinnedFile(reportRoot, mdFilename, previousMarkdown);
+      if (unlinkPinnedFileIfExact(reportRoot, mdFilename, markdownBytes, { requireStable: false }) && previousMarkdown !== null) writePinnedFile(reportRoot, mdFilename, previousMarkdown, { requireStable: false });
     }
     if (stateRoot !== null && jsonTouched && jsonBytes !== null) {
-      if (unlinkPinnedFileIfExact(stateRoot, 'report.json', jsonBytes) && previousJson !== null) writePinnedFile(stateRoot, 'report.json', previousJson);
+      if (unlinkPinnedFileIfExact(stateRoot, 'report.json', jsonBytes, { requireStable: false }) && previousJson !== null) writePinnedFile(stateRoot, 'report.json', previousJson, { requireStable: false });
     }
   };
   try {
@@ -1887,6 +1909,13 @@ function writeSuiteReport(
     markdownBytes = Buffer.from(renderMarkdown(report));
     previousJson = readPinnedFileFull(stateRoot, 'report.json');
     previousMarkdown = readPinnedFileFull(reportRoot, mdFilename);
+    if (previousMarkdown === null) {
+      const existingMarkdown = openPinnedFile(reportRoot, mdFilename, fsConstants.O_RDONLY);
+      if (existingMarkdown !== null) {
+        closePinnedFile(existingMarkdown);
+        throw new Error('ux-e2e: existing markdown exceeds the exact rollback snapshot bound');
+      }
+    }
     assertSuiteDiscoveryStable(suiteRoot, discovery, 'before report JSON output');
     jsonTouched = true;
     if (!writePinnedFile(stateRoot, 'report.json', jsonBytes)) throw new Error('ux-e2e: failed to write suite report.json');
