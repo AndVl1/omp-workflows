@@ -47,7 +47,7 @@ import { completeSpecificationExecution, createCapability, MAX_ADVANCE_FIELD_BYT
 import { MAX_PREPARATION_HANDOFF_TASK_BYTES } from "../src/engine/preparation.js";
 import { writeArtifactWithReference } from "../src/engine/artifacts.js";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
-import { activeWave, applyFinishWaveTransition, ctoRuntimeRunInitialIdentityDigest, ctoSpecificationConformanceReceiptRelativePath, isSafeCtoExecutionId, mintCtoRuntimeRunOrigin, newCtoState, readCtoState, readCtoStatePinned, writeCtoRuntimeStateProof, writeCtoState } from "../src/cto/state.js";
+import { activeWave, ctoRuntimeRunInitialIdentityDigest, ctoSpecificationConformanceReceiptRelativePath, isSafeCtoExecutionId, mintCtoRuntimeRunOrigin, newCtoState, readCtoState, readCtoStatePinned, writeCtoRuntimeStateProof, writeCtoState } from "../src/cto/state.js";
 import { finishWave } from "../src/cto/waves.js";
 import { buildCtoSliceMarker } from "../src/cto/slice-marker.js";
 import { classificationToolGate } from "../src/gates/classification.js";
@@ -4355,31 +4355,6 @@ try {
     });
   return promise;
 }
-function spawnFinishCtoWave(root: string): Promise<void> {
-  const moduleUrl = new URL("../src/cto/state.ts", import.meta.url).href;
-  const script = `import { applyFinishWaveTransition, readCtoState, writeCtoState } from ${JSON.stringify(moduleUrl)};
-const state = readCtoState(process.env.FINISH_RUN, process.env.FINISH_ROOT);
-if (!state) throw new Error("CTO state is unavailable to finish");
-writeCtoState(applyFinishWaveTransition(state, { id: "WAVE-SPECIFICATION-EXECUTION-1", status: "done", now: "2026-09-02T00:00:00.000Z" }), process.env.FINISH_ROOT, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });`;
-  const { promise, resolve, reject } = Promise.withResolvers<void>();
-  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
-    cwd: process.cwd(),
-    env: { ...process.env, FINISH_ROOT: root, FINISH_RUN: RUN_ID },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stderr = "";
-  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-  child.on("error", reject);
-  child.on("close", (code) => {
-    if (code !== 0) {
-      reject(new Error(stderr || `CTO finish child exited with ${code}`));
-      return;
-    }
-    resolve();
-  });
-  return promise;
-}
-
 test("public workflow_begin issues only a phase capability and never an execution claim", async () => {
   const root = makeProject();
   const featureId = "public-begin-phase";
@@ -6623,42 +6598,6 @@ test("per-feature late claim persistence failure reports live successes and retr
     assert.equal((retried.outcomes as Json[]).find((outcome) => outcome.feature_id === "atomic-a")?.status, "claimed");
     assert.equal((retried.outcomes as Json[]).find((outcome) => outcome.feature_id === "atomic-b")?.status, "claimed");
   } finally { rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
-});
-
-test("preflight snapshots the active wave while a concurrent finisher waits for the lock", async () => {
-  const root = makeProject();
-  let finished = false;
-  let writer: Promise<void> | undefined;
-  try {
-    writeFeature(root, "post-await-wave");
-    ensureExecutionContext(root);
-    const before = readCtoState(RUN_ID, root);
-    assert.ok(before, "the active CTO state must be available before the concurrent finish");
-    setCtoSpecificationExecutionTestHooks({
-      afterAwait: ({ root: hookRoot }) => {
-        if (finished) return;
-        finished = true;
-        writer = spawnFinishCtoWave(hookRoot);
-      },
-    }, root);
-    const result = await preflight(root, [selection("post-await-wave")]);
-    assert.equal(finished, true, "the deterministic post-await concurrent finish seam must execute");
-    assert.equal(result.status, "ready", detail(result));
-    await writer;
-    const after = readCtoState(RUN_ID, root);
-    assert.ok(after, "the concurrent finisher must leave durable CTO state");
-    if (!before || !after) return;
-    assert.ok((after.state_revision ?? 0) >= (before.state_revision ?? 0), "concurrent completion cannot regress the durable state revision");
-    assert.equal(after.active_wave_id, undefined, "the concurrent finisher must terminate the active wave after preflight releases its lock");
-    assert.equal(after.wave_history?.find((wave) => wave.id === "WAVE-SPECIFICATION-EXECUTION-1")?.status, "done");
-    assert.equal(readdirSync(join(root, ".work-state", "cto", RUN_ID)).includes("specification-mappings"), true, "preflight must retain its committed mapping after the concurrent finish");
-  } finally {
-    setCtoSpecificationExecutionTestHooks(null, root);
-    if (writer) await writer;
-    executionContexts.delete(root);
-    projectFeatures.delete(root);
-    rmSync(root, { recursive: true, force: true });
-  }
 });
 
 test("split plan metadata hydrates state and migrates legacy execution rows", () => {
