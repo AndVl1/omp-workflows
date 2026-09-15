@@ -64,6 +64,10 @@ import {
   revalidateMaterializedDocuments,
 } from "../src/specification/materialize.js";
 import { MAX_PHASE_INPUT_BYTES } from "../src/specification/limits.js";
+import { readPinnedCurrentConstitution } from "../src/specification/constitution-identities.js";
+import { ensureProjectConstitution } from "../src/specification/prerequisite.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
+import type { ConstitutionBinding } from "../src/specification/types.js";
 
 import { requireDocumentRenderer, resolveSpecificationRenderer } from "../src/specification/registry.js";
 import { registerTestSpecificationRenderer, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
@@ -83,6 +87,7 @@ const CANONICAL_SPECIFICATION_SCHEMAS = [
 
 interface Project {
   root: string;
+  constitutionBinding: ConstitutionBinding;
   cleanup(): void;
 }
 
@@ -99,8 +104,20 @@ function projectWithWorkspace(): Project {
     rmSync(root, { recursive: true, force: true });
     throw new Error(`fixture workspace creation failed: ${created.error}`);
   }
+  const constitution = "# Project Constitution v1.0.0\n\nVersion: 1.0.0\n\n## I. Quality\n\nShip tested work.\n";
+  writeFileSync(join(root, "CONSTITUTION.md"), constitution, "utf8");
+  const ensured = ensureProjectConstitution(root, {
+    origin_kind: "native_direct",
+    origin_run_key: "run-artifacts-1",
+    origin_stage: "specify",
+  }, { feature_id: FIXED_FEATURE_ID });
+  if (!ensured.ok || !ensured.value.binding) {
+    rmSync(root, { recursive: true, force: true });
+    throw new Error(`fixture constitution bootstrap failed: ${ensured.ok ? ensured.value.status : ensured.error}`);
+  }
   return {
     root,
+    constitutionBinding: ensured.value.binding,
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
 }
@@ -121,6 +138,22 @@ function materializeRequest(version: number, content: string): MaterializeReques
     version,
     documents: [{ path: "spec.md", content }],
   };
+}
+
+/** Artifact fixtures must exercise the same live constitution precondition as production callers. */
+function materializeForTest(project: Project, request: MaterializeRequest) {
+  const pinnedRoot = PinnedProjectRoot.open(project.root);
+  if (!pinnedRoot) throw new Error("SPEC_PATH_UNAUTHORIZED: artifact fixture root cannot be pinned");
+  try {
+    return materializeFeatureDocuments(project.root, request, {
+      validateBeforeWrite: () => {
+        const current = readPinnedCurrentConstitution(project.root, pinnedRoot, project.constitutionBinding);
+        if (!current.ok) throw new Error(current.error);
+      },
+    });
+  } finally {
+    pinnedRoot.close();
+  }
 }
 
 // ── Executable strict schemas for canonical aggregates ───────────────────────
@@ -223,12 +256,12 @@ test("re-materializing a persisted phase version is rejected without overwriting
   const project = projectWithWorkspace();
   try {
     const content = "# Spec\n\n## Problem\n\nThe outcome must be readable.\n";
-    const first = materializeFeatureDocuments(project.root, materializeRequest(1, content));
+    const first = materializeForTest(project, materializeRequest(1, content));
     assert.ok(first.ok, first.ok ? "materialized" : `rejected: ${first.error}`);
     const currentPath = join(project.root, "specs", FIXED_FEATURE_ID, "spec.md");
     const before = readFileSync(currentPath, "utf8");
 
-    const replay = materializeFeatureDocuments(project.root, materializeRequest(1, content));
+    const replay = materializeForTest(project, materializeRequest(1, content));
     assert.equal(replay.ok, false, "artifact versions are immutable and never overwritten");
     assert.equal(readFileSync(currentPath, "utf8"), before, "current bytes unchanged by the rejected replay");
   } finally {
@@ -292,7 +325,7 @@ test("materialization captures exact content hashes and revalidation detects man
   const project = projectWithWorkspace();
   try {
     const content = "# Spec\n\n## Requirements\n\nFR-1 The thing works.\n";
-    const materialized = materializeFeatureDocuments(project.root, materializeRequest(1, content));
+    const materialized = materializeForTest(project, materializeRequest(1, content));
     assert.ok(materialized.ok);
     if (!materialized.ok) return;
     const hashes = materialized.value.document_hashes as Record<string, string>;
@@ -329,7 +362,7 @@ test("materialization captures exact content hashes and revalidation detects man
 test("revalidation rejects invalid UTF-8 current documents without mutation", () => {
   const project = projectWithWorkspace();
   try {
-    const materialized = materializeFeatureDocuments(project.root, materializeRequest(1, "# Spec\n"));
+    const materialized = materializeForTest(project, materializeRequest(1, "# Spec\n"));
     assert.ok(materialized.ok, materialized.ok ? "materialized" : materialized.error);
     const featureDir = join(project.root, "specs", FIXED_FEATURE_ID);
     const currentPath = join(featureDir, "spec.md");
@@ -359,7 +392,7 @@ test("revalidation rejects invalid UTF-8 current documents without mutation", ()
 test("revalidation rejects invalid UTF-8 manifests without mutation", () => {
   const project = projectWithWorkspace();
   try {
-    const materialized = materializeFeatureDocuments(project.root, materializeRequest(1, "# Spec\n"));
+    const materialized = materializeForTest(project, materializeRequest(1, "# Spec\n"));
     assert.ok(materialized.ok, materialized.ok ? "materialized" : materialized.error);
     const manifestPath = join(project.root, ".work-state", "features", FIXED_FEATURE_ID, "artifacts", "documents", "specify", "v1.json");
     const statePath = join(project.root, ".work-state", "features", FIXED_FEATURE_ID, "state.json");
@@ -395,12 +428,12 @@ test("changed document sets archive removed names before replacing the current p
       { path: "spec.md", content: "# Spec v1\n" },
       { path: "notes/removed.md", content: "# Removed v1\n" },
     ];
-    const v1 = materializeFeatureDocuments(project.root, v1Request);
+    const v1 = materializeForTest(project, v1Request);
     assert.ok(v1.ok, v1.ok ? "first version materialized" : v1.error);
 
     const v2Request = materializeRequest(2, "# Spec v2\n");
     v2Request.documents = [{ path: "spec.md", content: "# Spec v2\n" }];
-    const v2 = materializeFeatureDocuments(project.root, v2Request);
+    const v2 = materializeForTest(project, v2Request);
     assert.ok(v2.ok, v2.ok ? "changed document set materialized" : v2.error);
 
     const featureDir = join(project.root, "specs", FIXED_FEATURE_ID);
@@ -422,7 +455,7 @@ test("an archive collision for a removed name rejects the changed set before any
       { path: "spec.md", content: "# Spec v1\n" },
       { path: "notes/removed.md", content: "# Removed v1\n" },
     ];
-    assert.ok(materializeFeatureDocuments(project.root, v1Request).ok);
+    assert.ok(materializeForTest(project, v1Request).ok);
 
     const featureDir = join(project.root, "specs", FIXED_FEATURE_ID);
     const collision = join(featureDir, "history", "specify", "v1", "notes", "removed.md");
@@ -431,7 +464,7 @@ test("an archive collision for a removed name rejects the changed set before any
 
     const v2Request = materializeRequest(2, "# Spec v2\n");
     v2Request.documents = [{ path: "spec.md", content: "# Spec v2\n" }];
-    const rejected = materializeFeatureDocuments(project.root, v2Request);
+    const rejected = materializeForTest(project, v2Request);
     assert.equal(rejected.ok, false);
     if (!rejected.ok) assert.equal(rejected.code, "SPEC_ARTIFACT_IMMUTABLE");
     assert.equal(readFileSync(join(featureDir, "spec.md"), "utf8"), "# Spec v1\n");
@@ -447,7 +480,7 @@ test("an archive collision for a removed name rejects the changed set before any
 test("an unowned current-path collision aborts before archiving the previous projection", () => {
   const project = projectWithWorkspace();
   try {
-    assert.ok(materializeFeatureDocuments(project.root, materializeRequest(1, "# Spec v1\n")).ok);
+    assert.ok(materializeForTest(project, materializeRequest(1, "# Spec v1\n")).ok);
     const featureDir = join(project.root, "specs", FIXED_FEATURE_ID);
     writeFileSync(join(featureDir, "new.md"), "unowned current content\n", "utf8");
 
@@ -456,7 +489,7 @@ test("an unowned current-path collision aborts before archiving the previous pro
       { path: "spec.md", content: "# Spec v2\n" },
       { path: "new.md", content: "# Claimed\n" },
     ];
-    const rejected = materializeFeatureDocuments(project.root, v2Request);
+    const rejected = materializeForTest(project, v2Request);
     assert.equal(rejected.ok, false);
     if (!rejected.ok) assert.equal(rejected.code, "SPEC_ARTIFACT_IMMUTABLE");
     assert.equal(readFileSync(join(featureDir, "spec.md"), "utf8"), "# Spec v1\n");
@@ -472,11 +505,11 @@ test("replacing a version archives the previous readable projection under histor
   const project = projectWithWorkspace();
   try {
     const v1Content = "# Spec v1\n\n## Problem\n\nOne.\n";
-    const v1 = materializeFeatureDocuments(project.root, materializeRequest(1, v1Content));
+    const v1 = materializeForTest(project, materializeRequest(1, v1Content));
     assert.ok(v1.ok);
 
     const v2Content = "# Spec v2\n\n## Problem\n\nTwo.\n";
-    const v2 = materializeFeatureDocuments(project.root, materializeRequest(2, v2Content));
+    const v2 = materializeForTest(project, materializeRequest(2, v2Content));
     assert.ok(v2.ok, v2.ok ? "second version materialized" : `rejected: ${v2.error}`);
 
     const featureDir = join(project.root, "specs", FIXED_FEATURE_ID);
@@ -498,7 +531,7 @@ test("multi-document revisions preserve every prior document at distinct determi
     ];
     const v1Request = materializeRequest(1, v1Documents[0]!.content);
     v1Request.documents = v1Documents;
-    const v1 = materializeFeatureDocuments(project.root, v1Request);
+    const v1 = materializeForTest(project, v1Request);
     assert.ok(v1.ok, v1.ok ? "first version materialized" : `rejected: ${v1.error}`);
 
     const v2Documents = [
@@ -507,7 +540,7 @@ test("multi-document revisions preserve every prior document at distinct determi
     ];
     const v2Request = materializeRequest(2, v2Documents[0]!.content);
     v2Request.documents = v2Documents;
-    const v2 = materializeFeatureDocuments(project.root, v2Request);
+    const v2 = materializeForTest(project, v2Request);
     assert.ok(v2.ok, v2.ok ? "second version materialized" : `rejected: ${v2.error}`);
 
     const featureDir = join(project.root, "specs", FIXED_FEATURE_ID);
@@ -532,7 +565,7 @@ test("an archive collision rejects the whole multi-document revision before any 
       { path: "spec.md", content: "# Spec v1\n" },
       { path: "notes/decisions.md", content: "# Decisions v1\n" },
     ];
-    const v1 = materializeFeatureDocuments(project.root, v1Request);
+    const v1 = materializeForTest(project, v1Request);
     assert.ok(v1.ok);
 
     const featureDir = join(project.root, "specs", FIXED_FEATURE_ID);
@@ -545,7 +578,7 @@ test("an archive collision rejects the whole multi-document revision before any 
       { path: "spec.md", content: "# Spec v2\n" },
       { path: "notes/decisions.md", content: "# Decisions v2\n" },
     ];
-    const rejected = materializeFeatureDocuments(project.root, v2Request);
+    const rejected = materializeForTest(project, v2Request);
     assert.equal(rejected.ok, false);
     if (!rejected.ok) assert.equal(rejected.code, "SPEC_ARTIFACT_IMMUTABLE");
     assert.equal(readFileSync(join(featureDir, "spec.md"), "utf8"), "# Spec v1\n");
@@ -568,7 +601,7 @@ test("direct materialization enforces the canonical UTF-8 document cap atomicall
     const exactContent = "x".repeat(MAX_PHASE_INPUT_BYTES - Buffer.byteLength(multibyte, "utf8")) + multibyte;
     assert.equal(Buffer.byteLength(exactContent, "utf8"), MAX_PHASE_INPUT_BYTES);
     const exactRequest = materializeRequest(1, exactContent);
-    const accepted = materializeFeatureDocuments(project.root, exactRequest);
+    const accepted = materializeForTest(project, exactRequest);
     assert.equal(accepted.ok, true, accepted.ok ? "exact-cap document materialized" : accepted.error);
     const documentPath = join(project.root, "specs", FIXED_FEATURE_ID, "spec.md");
     assert.equal(Buffer.byteLength(readFileSync(documentPath), "utf8"), MAX_PHASE_INPUT_BYTES);
@@ -579,7 +612,7 @@ test("direct materialization enforces the canonical UTF-8 document cap atomicall
     const beforeArtifacts = readdirSync(artifactsPath).sort();
     const beforeFeature = readdirSync(featurePath).sort();
     const oversized = materializeRequest(2, exactContent + "x");
-    const rejected = materializeFeatureDocuments(project.root, oversized);
+    const rejected = materializeForTest(project, oversized);
     assert.equal(rejected.ok, false, "a document one UTF-8 byte over the cap must be rejected");
     if (!rejected.ok) {
       assert.equal(rejected.code, "SPEC_REQUEST_INVALID");
@@ -624,7 +657,7 @@ test("huge nested work identity is rejected before any document or manifest writ
         upstream_versions: [],
       },
     };
-    const rejected = materializeFeatureDocuments(project.root, request);
+    const rejected = materializeForTest(project, request);
     assert.equal(rejected.ok, false, "nested work identity data must be rejected");
     if (!rejected.ok) {
       assert.equal(rejected.code, "SPEC_REQUEST_INVALID");
@@ -650,7 +683,7 @@ test("document paths that escape the feature workspace fail closed and write not
     for (const escape of escapingPaths) {
       const request = materializeRequest(3, "# Should never land\n");
       request.documents = [{ path: escape, content: "# Should never land\n" }];
-      const result = materializeFeatureDocuments(project.root, request);
+      const result = materializeForTest(project, request);
       assert.equal(result.ok, false, `path ${JSON.stringify(escape)} must be rejected`);
       if (!result.ok) assert.equal(result.code, "SPEC_PATH_UNAUTHORIZED", `path ${JSON.stringify(escape)}`);
     }
@@ -664,7 +697,7 @@ test("document paths that escape the feature workspace fail closed and write not
       symlinkSync(outside, join(featureDir, "public", "out"), "dir");
       const symlinkRequest = materializeRequest(3, "# Symlink escape\n");
       symlinkRequest.documents = [{ path: "public/out/evil.md", content: "# Symlink escape\n" }];
-      const symlinkResult = materializeFeatureDocuments(project.root, symlinkRequest);
+      const symlinkResult = materializeForTest(project, symlinkRequest);
       assert.equal(symlinkResult.ok, false, "symlink realpath escapes are rejected");
       if (!symlinkResult.ok) assert.equal(symlinkResult.code, "SPEC_PATH_UNAUTHORIZED");
       assert.equal(readdirSync(outside).length, 0, "nothing written through the symlink");
@@ -684,7 +717,7 @@ test("manifest and archive writes reject symlinked directories outside the proje
     const artifacts = join(project.root, ".work-state", "features", FIXED_FEATURE_ID, "artifacts");
     rmSync(artifacts, { recursive: true, force: true });
     symlinkSync(outside, artifacts, "dir");
-    const manifestEscape = materializeFeatureDocuments(project.root, materializeRequest(1, "# Never written\n"));
+    const manifestEscape = materializeForTest(project, materializeRequest(1, "# Never written\n"));
     assert.equal(manifestEscape.ok, false);
     if (!manifestEscape.ok) assert.equal(manifestEscape.code, "SPEC_PATH_UNAUTHORIZED");
     assert.equal(readdirSync(outside).length, 0);
@@ -701,7 +734,7 @@ test("manifest and archive writes reject symlinked directories outside the proje
     const outsideManifest = join(manifestFinalOutside, "v1.json");
     writeFileSync(outsideManifest, "prior manifest\n", "utf8");
     symlinkSync(outsideManifest, manifestTarget, "file");
-    const manifestFinalEscape = materializeFeatureDocuments(manifestFinalProject.root, materializeRequest(1, "# Never written\n"));
+    const manifestFinalEscape = materializeForTest(manifestFinalProject, materializeRequest(1, "# Never written\n"));
     assert.equal(manifestFinalEscape.ok, false);
     if (!manifestFinalEscape.ok) assert.equal(manifestFinalEscape.code, "SPEC_PATH_UNAUTHORIZED");
     assert.equal(readFileSync(outsideManifest, "utf8"), "prior manifest\n");
@@ -714,11 +747,11 @@ test("manifest and archive writes reject symlinked directories outside the proje
   const archiveProject = projectWithWorkspace();
   const archiveOutside = mkdtempSync(join(tmpdir(), "spec-archive-escape-"));
   try {
-    const v1 = materializeFeatureDocuments(archiveProject.root, materializeRequest(1, "# Version one\n"));
+    const v1 = materializeForTest(archiveProject, materializeRequest(1, "# Version one\n"));
     assert.ok(v1.ok);
     const featureDir = join(archiveProject.root, "specs", FIXED_FEATURE_ID);
     symlinkSync(archiveOutside, join(featureDir, "history"), "dir");
-    const v2 = materializeFeatureDocuments(archiveProject.root, materializeRequest(2, "# Version two\n"));
+    const v2 = materializeForTest(archiveProject, materializeRequest(2, "# Version two\n"));
     assert.equal(v2.ok, false);
     if (!v2.ok) assert.equal(v2.code, "SPEC_PATH_UNAUTHORIZED");
     assert.equal(readFileSync(join(featureDir, "spec.md"), "utf8"), "# Version one\n");
@@ -731,7 +764,7 @@ test("manifest and archive writes reject symlinked directories outside the proje
   const archiveFinalProject = projectWithWorkspace();
   const archiveFinalOutside = mkdtempSync(join(tmpdir(), "spec-archive-final-escape-"));
   try {
-    const v1 = materializeFeatureDocuments(archiveFinalProject.root, materializeRequest(1, "# Version one\n"));
+    const v1 = materializeForTest(archiveFinalProject, materializeRequest(1, "# Version one\n"));
     assert.ok(v1.ok);
     const featureDir = join(archiveFinalProject.root, "specs", FIXED_FEATURE_ID);
     mkdirSync(join(featureDir, "history", "specify"), { recursive: true });
@@ -739,7 +772,7 @@ test("manifest and archive writes reject symlinked directories outside the proje
     const outsideArchive = join(archiveFinalOutside, "v1.md");
     writeFileSync(outsideArchive, "prior archive\n", "utf8");
     symlinkSync(outsideArchive, archiveTarget, "file");
-    const v2 = materializeFeatureDocuments(archiveFinalProject.root, materializeRequest(2, "# Version two\n"));
+    const v2 = materializeForTest(archiveFinalProject, materializeRequest(2, "# Version two\n"));
     assert.equal(v2.ok, false);
     if (!v2.ok) assert.equal(v2.code, "SPEC_PATH_UNAUTHORIZED");
     assert.equal(readFileSync(join(featureDir, "spec.md"), "utf8"), "# Version one\n");
@@ -753,7 +786,7 @@ test("manifest and archive writes reject symlinked directories outside the proje
 test("revalidation rejects traversal and malformed persisted manifest entries", () => {
   const project = projectWithWorkspace();
   try {
-    const materialized = materializeFeatureDocuments(project.root, materializeRequest(1, "# Spec\n"));
+    const materialized = materializeForTest(project, materializeRequest(1, "# Spec\n"));
     assert.ok(materialized.ok);
     const manifest = join(project.root, ".work-state", "features", FIXED_FEATURE_ID, "artifacts", "documents", "specify", "v1.json");
     writeFileSync(manifest, JSON.stringify({ schema_version: 1, feature_id: FIXED_FEATURE_ID, phase: "specify", version: 1, documents: [{ path: "../../outside.md", sha256: sha256("outside") }] }), "utf8");
