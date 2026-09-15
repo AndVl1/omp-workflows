@@ -74,6 +74,7 @@ import {
 } from "./validation.js";
 import { validateTypedControlPlane } from "../engine/workflow-contract.js";
 import { refreshCtoSpecificationConstitution } from "../cto/gates.js";
+import { recoverCtoSpecificationMappingTransactions } from "../commands/cto.js";
 import { readPinnedCurrentConstitution } from "./constitution-identities.js";
 import {
   ctoSpecificationConformanceReceiptRelativePath,
@@ -5148,7 +5149,21 @@ export function persistCtoSpecificationConformance(
     pinnedRoot.close();
     return conformanceRuntimeBlocked(input, error);
   }
-  const authority = resolveCtoConformanceAuthority(input?.binding, pinnedRoot.canonical_root, pinnedRoot);
+  let authority: Readonly<CtoSpecificationConformanceAuthority> | null;
+  try {
+    const encodedAuthority = resolveCtoConformanceAuthority(input?.binding, pinnedRoot.canonical_root, pinnedRoot);
+    if (!encodedAuthority || !isSafeCtoRunId(encodedAuthority.cto_run_id)) {
+      const result = conformanceRuntimeBlocked(input, new Error("confirmed conformance binding has no safe CTO run id"));
+      pinnedRoot.close();
+      return result;
+    }
+    recoverCtoSpecificationMappingTransactions(pinnedRoot.canonical_root, encodedAuthority.cto_run_id, pinnedRoot);
+    authority = resolveCtoConformanceAuthority(input?.binding, pinnedRoot.canonical_root, pinnedRoot);
+  } catch (error) {
+    const result = conformanceRuntimeBlocked(input, new Error(`mapping recovery failed: ${error instanceof Error ? error.message : String(error)}`));
+    pinnedRoot.close();
+    return result;
+  }
   const finish = (result: PersistedCtoSpecificationConformanceResult): PersistedCtoSpecificationConformanceResult => {
     try {
       assertCtoRuntimeAccessFacadeLive(options.runtimeAccess, pinnedRoot.canonical_root, options.sessionId);

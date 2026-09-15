@@ -3326,6 +3326,14 @@ function quarantineInvalidConfirmationTransactionPinned(
   throw new Error(`CTO_SPEC_MAPPING_RECOVERY_REQUIRED: quarantined confirmation WAL '${transaction.transaction_id}' (${reason}); fresh trusted Ask is required`);
 }
 
+export function recoverCtoSpecificationMappingTransactions(
+  root: string,
+  ctoRunId: string,
+  pinnedRoot: PinnedProjectRoot,
+): CtoSpecificationMappingTransaction[] {
+  return recoverPendingMappingTransactions(root, ctoRunId, pinnedRoot);
+}
+
 function recoverPendingMappingTransactions(root: string, ctoRunId: string, pinnedRoot: PinnedProjectRoot): CtoSpecificationMappingTransaction[] {
   const completed: CtoSpecificationMappingTransaction[] = [];
   let answerRecoveryRequired: string | null = null;
