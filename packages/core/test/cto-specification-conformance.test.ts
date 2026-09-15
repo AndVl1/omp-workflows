@@ -1010,13 +1010,13 @@ test("direct CTO persistence gates pending, failed, wrong-run, and stale termina
 
   const failed = makeFixture();
   try {
+    const binding = bindingFor(failed.mapping, failed.root, "cto-wave-1", failed.prepared.claims as unknown as CtoActiveClaimSummary[]);
     failed.prepared.evidence = failed.prepared.evidence.map((item) =>
       persistedEvidence(realpathSync(failed.root), failed.feature.feature.feature_id, item));
     failed.updateTeam((team) => {
       team.status = "failed";
       team.completion_envelope = { ...team.completion_envelope!, outcome: "failed", terminal_signal: "contract_failure" };
     });
-    const binding = bindingFor(failed.mapping, failed.root, "cto-wave-1", failed.prepared.claims as unknown as CtoActiveClaimSummary[]);
     const result = failed.invoke(binding);
     assert.equal(result.status, "blocked");
     assert.equal(result.persisted, false);
