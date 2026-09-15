@@ -1824,6 +1824,31 @@ function existingPath(path: string): { readonly isDirectory: boolean; readonly i
   }
 }
 
+interface SessionMarkerProbe {
+  readonly stateInfo: { readonly isDirectory: boolean; readonly isSymbolicLink: boolean; readonly isFile: boolean; readonly dev: number; readonly ino: number } | null;
+  readonly sessionInfo: { readonly isDirectory: boolean; readonly isSymbolicLink: boolean; readonly isFile: boolean; readonly dev: number; readonly ino: number } | null;
+}
+
+function probeSessionMarker(base: string, label: string): SessionMarkerProbe {
+  const workStatePath = join(base, '.work-state');
+  const workState = existingPath(workStatePath);
+  if (workState === null) return { stateInfo: null, sessionInfo: null };
+  if (workState.isSymbolicLink() || !workState.isDirectory) {
+    throw new Error(`ux-e2e: ${label} .work-state must be a real directory`);
+  }
+  const statePath = join(workStatePath, 'ux-e2e');
+  const stateInfo = existingPath(statePath);
+  if (stateInfo === null) return { stateInfo: null, sessionInfo: null };
+  if (stateInfo.isSymbolicLink() || !stateInfo.isDirectory) {
+    throw new Error(`ux-e2e: ${label} ux-e2e state directory must be real`);
+  }
+  const sessionInfo = existingPath(join(statePath, 'session.json'));
+  if (sessionInfo !== null && (sessionInfo.isSymbolicLink() || !sessionInfo.isFile)) {
+    throw new Error(`ux-e2e: ${label} session metadata must be a real file`);
+  }
+  return { stateInfo, sessionInfo };
+}
+
 function sessionDescriptor(sessionPath: string): { readonly dev: number; readonly ino: number; readonly digest: string } | null {
   const parent = pinDirectory(dirname(sessionPath));
   if (parent === null) return null;
@@ -1842,8 +1867,9 @@ function sessionDescriptor(sessionPath: string): { readonly dev: number; readonl
 
 function discoverSuiteChildren(suiteRoot: string): SuiteDiscovery | null {
   const rootSessionPath = join(suiteRoot, '.work-state', 'ux-e2e', 'session.json');
-  const rootSessionInfo = existingPath(rootSessionPath);
-  const rootDescriptor = rootSessionInfo !== null && rootSessionInfo.isFile && !rootSessionInfo.isSymbolicLink
+  const rootProbe = probeSessionMarker(suiteRoot, 'suite root');
+  const rootSessionInfo = rootProbe.sessionInfo;
+  const rootDescriptor = rootSessionInfo !== null
     ? sessionDescriptor(rootSessionPath)
     : null;
   const rootSession = rootDescriptor !== null && readSessionMeta(suiteRoot).schema_version === 2;
@@ -1888,15 +1914,16 @@ function discoverSuiteChildren(suiteRoot: string): SuiteDiscovery | null {
     for (const name of names) {
       const child = join(suiteRoot, name);
       const childState = join(child, '.work-state', 'ux-e2e');
-      const stateInfo = existingPath(childState);
+      const childProbe = probeSessionMarker(child, 'suite child ' + name);
+      const stateInfo = childProbe.stateInfo;
       // Ordinary real directories (for example .git or report output) do not
       // claim session ownership and are intentionally ignored.
       if (stateInfo === null) continue;
-      if (stateInfo.isSymbolicLink || !stateInfo.isDirectory) throw new Error('ux-e2e: malformed suite child ' + name + ' state directory');
+      if (childProbe.sessionInfo === null) throw new Error('ux-e2e: malformed suite child ' + name + ' session metadata');
       if (!safeFilenameSegment(name)) throw new Error('ux-e2e: suite child name is unsafe: ' + name);
       if (children.length >= MAX_SUITE_CHILDREN) throw new Error('ux-e2e: suite has more than ' + String(MAX_SUITE_CHILDREN) + ' child sessions');
       const sessionPath = join(childState, 'session.json');
-      const sessionInfo = existingPath(sessionPath);
+      const sessionInfo = childProbe.sessionInfo;
       if (sessionInfo === null || sessionInfo.isSymbolicLink || !sessionInfo.isFile) {
         throw new Error('ux-e2e: malformed suite child ' + name + ' session metadata');
       }

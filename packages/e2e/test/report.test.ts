@@ -965,6 +965,41 @@ test('report suite: unreadable child state probe fails closed instead of omittin
 });
 
 
+test('report suite: dangling child state ancestor is rejected instead of omitted', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-dangling-child-state-'));
+  const valid = makeSessionDir();
+  const malformed = makeSessionDir();
+  renameSync(valid, join(suite, 'valid'));
+  renameSync(malformed, join(suite, 'malformed'));
+  const workState = join(suite, 'malformed', '.work-state');
+  rmSync(workState, { recursive: true, force: true });
+  symlinkSync(join(suite, 'missing-work-state'), workState, 'dir');
+  try {
+    assert.throws(
+      () => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }),
+      /\.work-state must be a real directory/u,
+    );
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+  }
+});
+
+test('report suite: dangling root state ancestor is rejected instead of treated as absent', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-dangling-root-state-'));
+  const child = makeSessionDir();
+  renameSync(child, join(suite, 'session-a'));
+  symlinkSync(join(suite, 'missing-root-state'), join(suite, '.work-state'), 'dir');
+  try {
+    assert.throws(
+      () => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }),
+      /\.work-state must be a real directory/u,
+    );
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+  }
+});
+
+
 test('report suite: non-directory intermediate state is rejected instead of omitted', () => {
   const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-enotdir-child-state-'));
   const valid = makeSessionDir();
