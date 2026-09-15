@@ -2041,11 +2041,9 @@ function generateSuiteReport(
     }
     let childEvidence: string[];
     if (opts.copyEvidence === true) {
-      const targetRoot = opts.retainedEvidenceRoot !== undefined
-        ? pinChildDirectory(opts.retainedEvidenceRoot, [child.name])
-        : opts.retainedReportRoot !== undefined && opts.evidenceTargetDir === undefined
-          ? pinChildDirectory(opts.retainedReportRoot, ['evidence', child.name])
-          : pinOrCreateDirectory(join(mdDir, 'evidence', child.name));
+      const targetRoot = opts.retainedReportRoot !== undefined
+        ? pinChildDirectory(opts.retainedReportRoot, ['evidence', child.name])
+        : pinOrCreateDirectory(join(mdDir, 'evidence', child.name));
       if (targetRoot === null) throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
       retainedEvidenceRoots.push(targetRoot);
       childEvidence = copyEvidence(result.report.evidence, targetRoot.lexicalPath, child.scratchDir, MAX_SUITE_EVIDENCE_BYTES - aggregateEvidenceBytes, child.root, copiedEvidence, copiedEvidenceRoots, targetRoot, retainedEvidenceDestinationRoots);
@@ -2129,13 +2127,7 @@ export function generateReport(
     closeSuiteDiscovery(discovery);
     throw new Error('ux-e2e: report destination root must be a stable non-symlink directory');
   }
-  const customEvidenceRoot = opts.evidenceTargetDir === undefined ? null : pinOrCreateDirectory(resolve(opts.evidenceTargetDir));
-  if (opts.evidenceTargetDir !== undefined && customEvidenceRoot === null) {
-    closePinnedDirectory(externalRoot);
-    closeSuiteDiscovery(discovery);
-    throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
-  }
-  const roots = [discovery.root, externalRoot, ...(customEvidenceRoot === null ? [] : [customEvidenceRoot])];
+  const roots = [discovery.root, externalRoot];
   const targets = roots
     .filter((root, index, all) => all.findIndex(candidate => candidate.identity.dev === root.identity.dev && candidate.identity.ino === root.identity.ino) === index)
     .sort(comparePinnedRoots);
@@ -2148,10 +2140,10 @@ export function generateReport(
   const execute = (): GenerateReportResult => {
     try {
       if (discovery.single) {
-        const result = generateSingleReport(suiteRoot, input, { ...opts, retainedReportRoot: externalRoot, retainedEvidenceRoot: customEvidenceRoot ?? undefined }, discovery);
+        const result = generateSingleReport(suiteRoot, input, { ...opts, retainedReportRoot: externalRoot }, discovery);
         return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings };
       }
-      return generateSuiteReport(suiteRoot, discovery, input, { ...opts, retainedReportRoot: externalRoot, retainedEvidenceRoot: customEvidenceRoot ?? undefined });
+      return generateSuiteReport(suiteRoot, discovery, input, { ...opts, retainedReportRoot: externalRoot });
     } finally {
       closeDiscovery();
     }
@@ -2165,7 +2157,6 @@ export function generateReport(
     return runLocked(0);
   } finally {
     closeDiscovery();
-    if (customEvidenceRoot !== null) closePinnedDirectory(customEvidenceRoot);
     closePinnedDirectory(externalRoot);
   }
 }
