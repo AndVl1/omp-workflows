@@ -409,6 +409,21 @@ function ensureExecutionContext(root: string, options: { featureStateOnly?: bool
   assert.ok(runtime.readState(RUN_ID), "completion fixture runtime must authenticate its CTO state");
   executionContexts.set(root, { feature_id: firstFeature, run_key: runKey, capability_id: capabilityId, capability_epoch: capabilityEpoch });
 }
+function persistCtoFixtureState(root: string, state: CtoState): void {
+  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  assert.ok(pinnedRoot, "CTO fixture state root must remain pinnable");
+  if (!pinnedRoot) throw new Error("CTO fixture state root is unavailable");
+  try {
+    const persisted = readCtoState(state.id, root);
+    assert.ok(persisted, "CTO fixture state must remain readable after direct mutation");
+    if (!persisted) throw new Error("CTO fixture state disappeared after direct mutation");
+    assert.equal(writeCtoRuntimeStateProof(pinnedRoot, persisted), true, "CTO fixture state proof must follow direct mutation");
+  } finally {
+    pinnedRoot.close();
+  }
+}
+
 
 async function preflight(root: string, selections: Json[]): Promise<Result> {
   ensureExecutionContext(root);
@@ -4973,7 +4988,7 @@ test("CTO reconciliation and authorization reject missing or extra wave slices",
       if (!wave) return;
       if (label === "missing-team") state.teams.splice(0, 1);
       else wave.slice_ids.push("slice-foreign-cardinality");
-      testRuntimeAccess(root, DEFAULT_TEST_SESSION_ID).withRunTransaction(runId, (transaction) => { transaction.writeState(state); });
+      persistCtoFixtureState(root, state);
       const statePath = join(root, ".work-state", "cto", runId, "state.json");
       const before = readFileSync(statePath, "utf8");
       const reconciled = reconcileCtoSpecificationExecutionTeams(root, runId, preparationRuntimeOptions(root));
@@ -5632,7 +5647,10 @@ test("mapping Ask rejects constitution drift before its WAL write", async () => 
     const beforeMapping = readFileSync(mappingPath, "utf8");
     const beforeState = readFileSync(join(root, ".work-state", "features", featureId, "state.json"), "utf8");
     writeFileSync(join(root, "CONSTITUTION.md"), "# Project Constitution v2\n\nVersion: 2.0.0\n\n## I. Quality\n\nChanged policy.\n", "utf8");
-    const answered = recordCtoSpecificationMappingAsk(root, { ...ask, decision: "approve_continue" } as never);
+    const answered = recordCtoSpecificationMappingAsk(root, { ...ask, decision: "approve_continue" } as never, {
+      ...preparationRuntimeOptions(root),
+      trusted_host: { bridge: {}, question: "", options: [], session_id: DEFAULT_TEST_SESSION_ID },
+    });
     assert.equal(answered.status, "blocked", JSON.stringify(answered));
     assert.match(detail(answered), /constitution|impact|changed|pending/i);
     assert.equal(readFileSync(mappingPath, "utf8"), beforeMapping, "constitution drift must not publish a mapping Ask WAL or mapping mutation");
@@ -6031,7 +6049,7 @@ test("mapping WAL enforces serialized byte cap before publication", async () => 
     try {
       const featureId = "mapping-wal-size-" + answerCount;
       writeFeature(root, featureId);
-      testRuntimeAccess(root, sessionId);
+      testRuntimeAccess(root, DEFAULT_TEST_SESSION_ID);
       const frozen = mapping(await preflight(root, [selection(featureId)]));
       const confirmationInput = await prepareTrustedConfirmation(root, frozen);
       let selected = resolveState(root, undefined, selection(featureId));
@@ -6264,7 +6282,7 @@ test("mapping WAL quarantines a self-consistent unrelated staged state before an
       run_key: `run-${featureId}-1`,
       stage_id: "execution",
       decision: "approve_continue",
-    } as Json);
+    } as Json, preparationRuntimeOptions(root));
     assert.equal(recovery.status, "ready", detail(recovery));
     assert.equal(readFileSync(statePath, "utf8"), stateAfterInterruptedCommit, "invalid WAL recovery must not mutate feature state");
     const quarantineDir = join(root, ".work-state", "cto", RUN_ID, "specification-mapping-quarantine");
