@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { z as zod } from "zod";
-import { registerTestConstitutionGate } from "./fixtures/registry-activation.js";
+import { registerTestConstitutionGate, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import { registerTestWorkflowTools } from "./fixtures/host-tool-activation.js";
 import { validFeatureWorkspace } from "./fixtures/specification-fixtures.js";
 import { ensureProjectConstitution } from "../src/specification/prerequisite.js";
@@ -37,6 +37,7 @@ function setup(custom: boolean): { root: string; workspace: FeatureWorkspace; to
   const featureRoot = join(root, "specs", FEATURE_ID);
   mkdirSync(featureRoot, { recursive: true });
   writeFileSync(join(root, "CONSTITUTION.md"), "# Project Constitution v1.0.0\n\n## I. Quality\n\nShip tested work.\n", "utf8");
+  writeTestRegistryMarker(root);
   registerTestConstitutionGate(root, "public-phase-adapter-gate");
   mkdirSync(join(root, ".omp"), { recursive: true });
   writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: { "specification-analyst": "specification-worker" } }) + "\n", "utf8");

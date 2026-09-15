@@ -15,7 +15,7 @@ import { ensureProjectConstitution } from "../src/specification/prerequisite.js"
 import { readPinnedConstitutionPrincipleIdentities } from "../src/specification/constitution-identities.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { finalizeNativeSpecificationPhase, startNativeSpecificationPhase, type NativeSpecificationGenerationHandoff } from "../src/specification/phase.js";
-import { registerTestConstitutionGate } from "./fixtures/registry-activation.js";
+import { registerTestConstitutionGate, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import type { FeatureWorkspace } from "../src/specification/types.js";
 
 const profile = loadProfile("spec-preparation");
@@ -97,6 +97,7 @@ function setup(): { root: string; featureId: string; runKey: string } {
   publishAgentMapping();
   const featureId = "native-continuation-feature";
   const runKey = "native-continuation-run";
+  writeTestRegistryMarker(root);
   registerTestConstitutionGate(root, "native-continuation-gate");
   const created = createFeatureWorkspace(root, { feature_id: featureId, display_name: featureId, run_key: runKey, profile_name: "spec-preparation", profile_hash: profileHash(profile!), source_kind: "native" });
   assert.equal(created.ok, true, created.ok ? "" : created.error);
