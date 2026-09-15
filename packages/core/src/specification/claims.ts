@@ -2425,7 +2425,7 @@ export function acquireExecutionClaim(projectRoot: string, featureId: string, re
         return failure("SPEC_CLAIM_RECOVERY_REQUIRED", "claim preparation WAL is not bound to the canonical acquisition request");
       }
     }
-    let prepared = preparedCandidates[0];
+    let prepared: AcquireClaimPreparedWal | undefined = preparedCandidates[0];
     if (workspace.execution_claim_prepare_ref && (!prepared || workspace.execution_claim_prepare_ref !== prepared.transaction_id)) {
       return failure("SPEC_CLAIM_RECOVERY_REQUIRED", "feature has an unresolved claim preparation transaction");
     }
