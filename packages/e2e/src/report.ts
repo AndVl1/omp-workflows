@@ -1405,6 +1405,7 @@ function generateSingleReport(
   const scratchDir = resolve(sessionDir);
   const scratchRoot = expectedDiscovery?.root ?? pinDirectory(scratchDir);
   if (scratchRoot === null) throw new Error('ux-e2e: session root must be a stable directory');
+  let stateDestination: PinnedDirectory | null = null;
   try {
     const warnings: string[] = [];
   const rawSession = readSessionMeta(scratchDir);
@@ -1558,35 +1559,24 @@ function generateSingleReport(
       if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before report JSON output');
     let jsonBytes: Buffer | null = null;
     let previousJson: Buffer | null = null;
-    const stateDestination = pinOrCreateDirectory(stateDir);
+    stateDestination = pinOrCreateDirectory(stateDir);
       if (stateDestination === null) {
         throw new Error('ux-e2e: session report directory must be a stable non-symlink directory');
       }
-      try {
-        jsonBytes = Buffer.from(JSON.stringify(report, null, 2) + '\n');
-        previousJson = readPinnedFileFull(stateDestination, 'report.json');
-        if (!writePinnedFile(stateDestination, 'report.json', jsonBytes) || !pinnedDirectoryIsStable(scratchRoot)) {
-          unlinkPinnedFileIfExact(stateDestination, 'report.json', jsonBytes);
-          throw new Error('ux-e2e: failed to write report.json inside the session directory');
+      jsonBytes = Buffer.from(JSON.stringify(report, null, 2) + '\n');
+      previousJson = readPinnedFileFull(stateDestination, 'report.json');
+      if (!writePinnedFile(stateDestination, 'report.json', jsonBytes) || !pinnedDirectoryIsStable(scratchRoot)) {
+        if (unlinkPinnedFileIfExact(stateDestination, 'report.json', jsonBytes, { requireStable: false }) && previousJson !== null) {
+          writePinnedFile(stateDestination, 'report.json', previousJson, { requireStable: false });
         }
-    } finally {
-      try {
-        closeSync(stateDestination.fd);
-      } catch {
-        /* Ignore cleanup failures. */
+        throw new Error('ux-e2e: failed to write report.json inside the session directory');
       }
-    }
 
     const rollbackJson = (): void => {
       if (jsonBytes === null) return;
-      const destination = pinOrCreateDirectory(stateDir);
-      if (destination === null) return;
-      try {
-        if (unlinkPinnedFileIfExact(destination, 'report.json', jsonBytes) && previousJson !== null) {
-          writePinnedFile(destination, 'report.json', previousJson);
-        }
-      } finally {
-        closeSync(destination.fd);
+      if (stateDestination === null) return;
+      if (unlinkPinnedFileIfExact(stateDestination, 'report.json', jsonBytes, { requireStable: false }) && previousJson !== null) {
+        writePinnedFile(stateDestination, 'report.json', previousJson, { requireStable: false });
       }
     };
     const mdFilename = `${slug}-ux-e2e-${todayStamp()}.md`;
@@ -1617,6 +1607,7 @@ function generateSingleReport(
   } finally {
     try {
       if (reportDestination !== null) closeSync(reportDestination.fd);
+      if (stateDestination !== null) closeSync(stateDestination.fd);
     } catch {
       /* Ignore cleanup failures. */
     }

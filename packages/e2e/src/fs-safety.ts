@@ -49,8 +49,10 @@ export interface FsSafetyTestHooks {
   readonly beforeSourceOpen?: (path: string) => void;
   readonly beforeDirectoryComponent?: (path: string) => void;
   readonly beforeDirectoryOpen?: (path: string) => void;
+  readonly afterDirectoryOpen?: (path: string) => void;
   readonly beforeTargetOpen?: (path: string) => void;
   readonly beforeTargetRename?: (path: string) => void;
+  readonly beforeExactQuarantine?: (path: string) => void;
   /** Return undefined to run the real process identity probe. */
   readonly processStartIdentity?: (pid: number) => string | null | undefined;
 }
@@ -273,6 +275,7 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
   const canonicalPath = canonicalTargetDirectory(lexicalPath);
   testHooks?.beforeDirectoryOpen?.(lexicalPath);
   let fd: number | null = null;
+  let descriptorPhysicalPath: string | null = null;
   let pinned = false;
   try {
     if (process.platform === 'darwin') {
@@ -282,6 +285,11 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
       }
       if (!pathHasNoSymlinkAncestors(canonicalPath)) return null;
       fd = openSync(canonicalPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+      const opened = fstatSync(fd);
+      const descriptor = runDarwinHelper({ lexicalPath, physicalPath: canonicalPath, fd, identity: { dev: opened.dev, ino: opened.ino } }, 'descriptor_path');
+      if (typeof descriptor?.path !== 'string' || typeof descriptor.dev !== 'number' || typeof descriptor.ino !== 'number'
+        || descriptor.dev !== opened.dev || descriptor.ino !== opened.ino) return null;
+      descriptorPhysicalPath = descriptor.path;
     } else {
       let parentFd = root.fd;
       let parentPath = descriptorRoot;
@@ -311,12 +319,14 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
         if (parentPath.length === 0) return null;
       }
     }
-    if (fd === null || !pathHasNoSymlinkAncestors(canonicalPath)) return null;
+    if (fd === null) return null;
+    testHooks?.afterDirectoryOpen?.(lexicalPath);
+    if (!pathHasNoSymlinkAncestors(canonicalPath)) return null;
     const descriptorStat = fstatSync(fd);
     const pathStat = lstatSync(canonicalPath);
     if (!descriptorStat.isDirectory() || pathStat.isSymbolicLink() || !pathStat.isDirectory()
       || !sameIdentity(pathStat, descriptorStat) || !pinnedDirectoryIsStable(root)) return null;
-    const physicalPath = realpathSync(canonicalPath);
+    const physicalPath = descriptorPhysicalPath ?? realpathSync(canonicalPath);
     const withinRoot = relative(root.physicalPath, physicalPath);
     if (withinRoot === '' || withinRoot === '..' || withinRoot.startsWith(`..${sep}`) || withinRoot.startsWith(sep)) return null;
     pinned = true;
@@ -506,50 +516,84 @@ export function unlinkPinnedFile(root: PinnedDirectory, name: string): boolean {
   }
 }
 
-export function unlinkPinnedFileIfExact(root: PinnedDirectory, name: string, expected: Buffer): boolean {
-  if (!safeName(name) || expected.length > MAX_PINNED_WRITE_BYTES || !pinnedDirectoryIsStable(root)) return false;
+export interface PinnedExactUnlinkOptions {
+  /** Internal rollback mode: use only the retained descriptor after lexical replacement. */
+  readonly requireStable?: boolean;
+}
+
+export function unlinkPinnedFileIfExact(
+  root: PinnedDirectory,
+  name: string,
+  expected: Buffer,
+  options: PinnedExactUnlinkOptions = {},
+): boolean {
+  const requireStable = options.requireStable !== false;
+  const rootStable = (): boolean => requireStable ? pinnedDirectoryIsStable(root) : pinnedDescriptorIsStable(root);
+  if (!safeName(name) || expected.length > MAX_PINNED_WRITE_BYTES || !rootStable()) return false;
   const quarantine = '.omp-unlink-' + randomUUID().replace(/-/gu, '') + '.tmp';
   const digest = createHash('sha256').update(expected).digest('hex');
+  const descriptorRoot = descriptorPathFor(root.fd);
+  if (descriptorRoot === null) return false;
+  const restoreLinuxQuarantine = (): boolean => {
+    try {
+      linkSync(join(descriptorRoot, quarantine), join(descriptorRoot, name));
+      unlinkSync(join(descriptorRoot, quarantine));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const verifyDescriptorFile = (entry: string): boolean => {
+    let fd: number | null = null;
+    try {
+      fd = openSync(join(descriptorRoot, entry), fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+      const before = fstatSync(fd);
+      if (!before.isFile() || before.size !== expected.length) return false;
+      const bytes = Buffer.allocUnsafe(before.size);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
+        if (count <= 0) return false;
+        offset += count;
+      }
+      const after = fstatSync(fd);
+      return sameIdentity(before, after) && after.size === before.size && bytes.equals(expected);
+    } catch {
+      return false;
+    } finally {
+      if (fd !== null) {
+        try { closeSync(fd); } catch { /* best effort */ }
+      }
+    }
+  };
   if (process.platform === 'darwin') {
-    const moved = runDarwinHelper(root, 'quarantine_if_exact', { name, quarantine, size: expected.length, sha256: digest })?.quarantined === true;
-    if (!moved) return false;
+    testHooks?.beforeExactQuarantine?.(join(root.lexicalPath, name));
+    const moved = runDarwinHelper(root, 'quarantine_if_exact', { name, quarantine, size: expected.length, sha256: digest });
+    if (moved?.quarantined !== true) {
+      if (moved?.moved === true) runDarwinHelper(root, 'restore_quarantine', { quarantine, name });
+      return false;
+    }
     testHooks?.beforeTargetRename?.(join(root.lexicalPath, name));
     return runDarwinHelper(root, 'unlink_quarantine', { quarantine, size: expected.length, sha256: digest })?.removed === true;
   }
-  const descriptorRoot = descriptorPathFor(root.fd);
-  if (descriptorRoot === null) return false;
+  if (!verifyDescriptorFile(name)) return false;
+  testHooks?.beforeExactQuarantine?.(join(root.lexicalPath, name));
   try {
     renameSync(join(descriptorRoot, name), join(descriptorRoot, quarantine));
   } catch {
     return false;
   }
-  const file = openPinnedFile(root, quarantine, fsConstants.O_RDONLY);
-  if (file === null || file.size !== expected.length) {
-    if (file !== null) closePinnedFile(file);
+  if (!verifyDescriptorFile(quarantine)) {
+    restoreLinuxQuarantine();
     return false;
   }
-  let exact = false;
-  try {
-    const bytes = Buffer.allocUnsafe(file.size);
-    let offset = 0;
-    while (offset < bytes.length) {
-      const count = readSync(file.fd, bytes, offset, bytes.length - offset, offset);
-      if (count <= 0) return false;
-      offset += count;
-    }
-    const after = fstatSync(file.fd);
-    exact = sameIdentity(after, file.identity) && after.size === file.size && bytes.equals(expected) && pinnedDirectoryIsStable(root);
-  } catch {
-    exact = false;
-  } finally {
-    closePinnedFile(file);
-  }
-  if (!exact) return false;
   testHooks?.beforeTargetRename?.(join(root.lexicalPath, name));
-  if (process.platform === 'darwin') {
-    return runDarwinHelper(root, 'unlink_quarantine', { quarantine, size: expected.length, sha256: digest })?.removed === true;
+  try {
+    unlinkSync(join(descriptorRoot, quarantine));
+    return true;
+  } catch {
+    return false;
   }
-  return unlinkPinnedFile(root, quarantine);
 }
 export function processStartIdentity(pid: number): string | null {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
@@ -759,19 +803,32 @@ export async function withPinnedExclusiveLockAsync<T>(
 }
 
 
+function pinnedDescriptorIsStable(root: PinnedDirectory): boolean {
+  try {
+    const info = fstatSync(root.fd);
+    return info.isDirectory() && sameIdentity(info, root.identity);
+  } catch {
+    return false;
+  }
+}
+
 /** Atomic single-link replacement using the same destination primitive as reports. */
 export interface PinnedWriteOptions {
   /** Publish only when the destination is absent; never replace a concurrent leaf. */
   readonly replaceExisting?: boolean;
+  /** Internal rollback mode: retain descriptor authority even after lexical replacement. */
+  readonly requireStable?: boolean;
 }
 
 export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buffer, options: PinnedWriteOptions = {}): boolean {
   const replaceExisting = options.replaceExisting !== false;
+  const requireStable = options.requireStable !== false;
+  const rootStable = (): boolean => requireStable ? pinnedDirectoryIsStable(root) : pinnedDescriptorIsStable(root);
   if (!safeName(name) || bytes.length > MAX_PINNED_WRITE_BYTES) return false;
-  if (!pinnedDirectoryIsStable(root)) return false;
+  if (!rootStable()) return false;
   const destination = join(root.lexicalPath, name);
   testHooks?.beforeTargetOpen?.(destination);
-  if (!pinnedDirectoryIsStable(root)) return false;
+  if (!rootStable()) return false;
   let temporary: string | null = null;
   let descriptor: number | null = null;
   let published = false;
@@ -781,9 +838,9 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
       const stagedName = staged?.temporary;
       if (typeof stagedName !== 'string') return false;
       temporary = stagedName;
-      if (!pinnedDirectoryIsStable(root)) return false;
+      if (!rootStable()) return false;
       testHooks?.beforeTargetRename?.(destination);
-      if (!pinnedDirectoryIsStable(root)) return false;
+      if (!rootStable()) return false;
       if (replaceExisting) {
         if (runDarwinHelper(root, 'publish', { final: name, temporary }) === null) return false;
       } else {
@@ -791,12 +848,12 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
       }
       temporary = null;
       published = true;
-      return pinnedDirectoryIsStable(root);
+      return rootStable();
     }
     const descriptorRoot = descriptorPathFor(root.fd);
     if (descriptorRoot === null) return false;
     for (let attempt = 0; attempt < 32; attempt += 1) {
-      if (!pinnedDirectoryIsStable(root)) return false;
+      if (!rootStable()) return false;
       const candidate = join(descriptorRoot, `.${randomUUID()}.tmp`);
       try {
         descriptor = openSync(candidate, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | O_NOFOLLOW, 0o600);
@@ -816,9 +873,9 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
     fsyncSync(descriptor);
     const after = fstatSync(descriptor);
     if (!after.isFile() || after.nlink !== 1 || after.size !== bytes.length) return false;
-    if (!pinnedDirectoryIsStable(root)) return false;
+    if (!rootStable()) return false;
     testHooks?.beforeTargetRename?.(destination);
-    if (!pinnedDirectoryIsStable(root)) return false;
+    if (!rootStable()) return false;
     if (replaceExisting) {
       renameSync(temporary, join(descriptorRoot, name));
     } else {
@@ -828,7 +885,7 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
     temporary = null;
     published = true;
     fsyncSync(root.fd);
-    return pinnedDirectoryIsStable(root);
+    return rootStable();
   } catch {
     return false;
   } finally {
@@ -915,6 +972,7 @@ function isWithin(root: string, candidate: string): boolean {
  * retained directory as fd 3 and performs all destination operations using
  * dir_fd, while checking the retained inode before every operation. */
 const DARWIN_HELPER = String.raw`import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -941,6 +999,18 @@ def safe_name(value):
     if not isinstance(value, str) or not value or len(value.encode("utf-8")) > MAX_NAME: fail("entry name is invalid")
     if value in (".", "..") or "/" in value or "\\" in value or "\x00" in value: fail("entry name is invalid")
     return value
+
+def descriptor_path():
+    info = os.fstat(3)
+    if not stat.S_ISDIR(info.st_mode): fail("retained descriptor is not a directory")
+    buffer = ctypes.create_string_buffer(1024)
+    libc = ctypes.CDLL(None)
+    if libc.fcntl(3, 50, buffer) != 0:
+        fail("retained descriptor path is unavailable")
+    path = buffer.value.decode("utf-8")
+    if not path.startswith("/") or len(path.encode("utf-8")) > 4096:
+        fail("retained descriptor path is invalid")
+    return {"dev": info.st_dev, "ino": info.st_ino, "path": path}
 
 def ensure_directory(path):
     if not isinstance(path, str) or len(path.encode("utf-8")) > 4096 or path.startswith("/") or "\\" in path or "\x00" in path: fail("directory path is invalid")
@@ -1230,11 +1300,22 @@ def _verify_exact(name, size, digest):
 def quarantine_if_exact(name, quarantine, size, digest):
     name, quarantine = safe_name(name), safe_name(quarantine)
     if not isinstance(size, int) or size < 0 or size > MAX_WRITE or not isinstance(digest, str) or len(digest) != 64: fail("exact unlink bounds are invalid")
+    if not _verify_exact(name, size, digest): return {"quarantined": False, "moved": False}
     try:
         os.rename(name, quarantine, src_dir_fd=3, dst_dir_fd=3)
     except FileNotFoundError:
-        return {"quarantined": False}
-    return {"quarantined": _verify_exact(quarantine, size, digest)}
+        return {"quarantined": False, "moved": False}
+    return {"quarantined": _verify_exact(quarantine, size, digest), "moved": True}
+
+def restore_quarantine(quarantine, name):
+    quarantine, name = safe_name(quarantine), safe_name(name)
+    try:
+        os.link(quarantine, name, src_dir_fd=3, dst_dir_fd=3, follow_symlinks=False)
+    except FileExistsError:
+        return {"restored": False}
+    os.unlink(quarantine, dir_fd=3)
+    os.fsync(3)
+    return {"restored": True}
 
 def unlink_quarantine(quarantine, size, digest):
     quarantine = safe_name(quarantine)
@@ -1252,7 +1333,8 @@ try:
     payload = json.loads(sys.stdin.read())
     root_guard(payload)
     op = payload.get("op")
-    if op == "ensure_directory": result = {"ok": True, "directory": ensure_directory(payload.get("path"))}
+    if op == "descriptor_path": result = {"ok": True, **descriptor_path()}
+    elif op == "ensure_directory": result = {"ok": True, "directory": ensure_directory(payload.get("path"))}
     elif op == "write_temp": result = {"ok": True, "temporary": write_temp(base64.b64decode(payload.get("bytes", ""), validate=True))}
     elif op == "append_file": result = {"ok": True, **append_file(payload.get("name"), payload.get("bytes"))}
     elif op == "read_file": result = {"ok": True, **read_file(payload.get("name"), payload.get("max_bytes"), payload.get("tail_bytes"))}
@@ -1266,6 +1348,7 @@ try:
     elif op == "publish": publish(payload.get("final"), payload.get("temporary")); result = {"ok": True}
     elif op == "publish_noreplace": publish_noreplace(payload.get("final"), payload.get("temporary")); result = {"ok": True}
     elif op == "quarantine_if_exact": result = {"ok": True, **quarantine_if_exact(payload.get("name"), payload.get("quarantine"), payload.get("size"), payload.get("sha256"))}
+    elif op == "restore_quarantine": result = {"ok": True, **restore_quarantine(payload.get("quarantine"), payload.get("name"))}
     elif op == "unlink_quarantine": result = {"ok": True, **unlink_quarantine(payload.get("quarantine"), payload.get("size"), payload.get("sha256"))}
     elif op == "cleanup": cleanup(payload.get("temporary")); result = {"ok": True}
     else: fail("unsupported operation")

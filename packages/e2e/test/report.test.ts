@@ -16,7 +16,7 @@ import {
   type UxE2eReport,
   type ReportInput,
 } from '../src/report.js';
-import { MAX_PINNED_READ_BYTES } from '../src/fs-safety.js';
+import { closePinnedDirectory, MAX_PINNED_READ_BYTES, pinDirectory, setFsSafetyTestHooks, unlinkPinnedFileIfExact, writePinnedFile } from '../src/fs-safety.js';
 
 function makeSessionDir(options: { readonly completeEvidence?: boolean } = {}): string {
   const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-report-'));
@@ -1282,5 +1282,101 @@ test('report: single discovery binds root session content across publish fences'
     if (existsSync(moved)) renameSync(moved, sessionPath);
     rmSync(dir, { recursive: true, force: true });
     rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+
+test('report: exact rollback preserves a nonmatching replacement at its original name', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-exact-mismatch-'));
+  const root = pinDirectory(dir);
+  if (root === null) throw new Error('test root could not be pinned');
+  const expected = Buffer.from('expected bytes');
+  const target = join(dir, 'target.txt');
+  try {
+    assert.equal(writePinnedFile(root, 'target.txt', expected), true);
+    let replaced = false;
+    setFsSafetyTestHooks({
+      beforeExactQuarantine(path) {
+        if (path !== target || replaced) return;
+        replaced = true;
+        writeFileSync(path, 'foreign replacement');
+      },
+    });
+    try {
+      assert.equal(unlinkPinnedFileIfExact(root, 'target.txt', expected), false);
+    } finally {
+      setFsSafetyTestHooks(null);
+    }
+    assert.equal(replaced, true);
+    assert.equal(readFileSync(target, 'utf8'), 'foreign replacement');
+    assert.equal(readdirSync(dir).some(name => name.startsWith('.omp-unlink-')), false);
+  } finally {
+    closePinnedDirectory(root);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+test('report: retained state descriptor restores a preexisting JSON after root replacement', () => {
+  const dir = makeSessionDir();
+  const replacement = mkdtempSync(join(tmpdir(), 'ux-e2e-single-rollback-replacement-'));
+  const moved = `${dir}.moved`;
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-single-rollback-md-'));
+  const reportPath = join(dir, '.work-state', 'ux-e2e', 'report.json');
+  writeFileSync(reportPath, 'previous report bytes');
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeTargetOpen(destination) {
+      if (swapped || !destination.startsWith(mdDir + sep) || !destination.endsWith('.md')) return;
+      swapped = true;
+      renameSync(dir, moved);
+      renameSync(replacement, dir);
+    },
+  });
+  try {
+    assert.throws(() => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }), /membership changed|session root changed|failed to write markdown/u);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (swapped) {
+      rmSync(dir, { recursive: true, force: true });
+      renameSync(moved, dir);
+    }
+  }
+  assert.equal(readFileSync(reportPath, 'utf8'), 'previous report bytes');
+  assert.equal(existsSync(join(dir, '.work-state', 'ux-e2e', 'report.json')), true);
+  assert.equal(readdirSync(mdDir).length, 0);
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(mdDir, { recursive: true, force: true });
+  rmSync(replacement, { recursive: true, force: true });
+});
+
+test('report: post-open ancestor replacement is rejected before evidence publish', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-post-open-race-md-'));
+  const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-post-open-race-outside-'));
+  const targetRoot = join(mdDir, 'evidence', 'my-feature');
+  const moved = `${targetRoot}.moved`;
+  mkdirSync(targetRoot, { recursive: true });
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    afterDirectoryOpen(path) {
+      if (swapped || path !== join(targetRoot, 'ux-e2e')) return;
+      swapped = true;
+      renameSync(targetRoot, moved);
+      symlinkSync(outside, targetRoot, 'dir');
+    },
+  });
+  try {
+    const result = generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true });
+    assert.ok(existsSync(result.jsonPath));
+    assert.equal(swapped, true);
+    assert.equal(readdirSync(outside).length, 0, 'post-open replacement must not publish outside retained root');
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    rmSync(targetRoot, { recursive: true, force: true });
+    if (existsSync(moved)) renameSync(moved, targetRoot);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
   }
 });
