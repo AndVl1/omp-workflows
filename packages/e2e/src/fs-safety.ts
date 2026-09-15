@@ -311,7 +311,10 @@ export function pinOrCreateDirectory(directory: string, created?: PinnedDirector
         if (createdChild) {
           const parentStat = fstatSync(parentFd);
           const retainedParentFd = duplicateDirectoryDescriptor(parentFd);
-          if (retainedParentFd === null) return null;
+          if (retainedParentFd === null) {
+            closeSync(childFd);
+            return null;
+          }
           localCreated.push({
             parent: { lexicalPath: join(sep, ...components.slice(0, i)), physicalPath: realpathSync(descriptorPathFor(parentFd) ?? join(sep, ...components.slice(0, i))), fd: retainedParentFd, identity: { dev: parentStat.dev, ino: parentStat.ino } },
             name: component,
@@ -463,7 +466,10 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
         if (createdChild) {
           const parentStat = fstatSync(parentFd);
           const retainedParentFd = duplicateDirectoryDescriptor(parentFd);
-          if (retainedParentFd === null) return null;
+          if (retainedParentFd === null) {
+            closeSync(childFd);
+            return null;
+          }
           localCreated.push({
             parent: { lexicalPath: join(root.lexicalPath, ...components.slice(0, index)), physicalPath: realpathSync(parentPath), fd: retainedParentFd, identity: { dev: parentStat.dev, ino: parentStat.ino } },
             name: component,
