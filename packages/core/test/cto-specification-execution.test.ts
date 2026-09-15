@@ -6574,7 +6574,7 @@ test("replayed active claims survive a later admission failure", async () => {
     assert.equal(retry.status, "blocked", detail(retry));
     const retryOutcomes = retry.outcomes as Json[];
     assert.equal(retryOutcomes.find((outcome) => outcome.feature_id === activeFeature)?.status, "claimed");
-    assert.equal(retryOutcomes.find((outcome) => outcome.feature_id === failingFeature)?.status, "blocked");
+    assert.match(detail(retry), new RegExp(`${failingFeature}.*not pending dispatch.*failed`, "i"));
     const activeAfterReplay = readCurrentExecutionClaim(root, activeFeature);
     assert.equal(activeAfterReplay.ok, true, activeAfterReplay.ok ? "" : activeAfterReplay.error);
     if (activeAfterReplay.ok) assert.equal(activeAfterReplay.value?.status, "active", "exact replay must not be compensated");
