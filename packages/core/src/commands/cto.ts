@@ -1823,12 +1823,10 @@ interface CtoSpecificationMappingStateTransition {
   consumed_at?: string;
 }
 
-interface CtoSpecificationMappingTransaction {
+interface CtoSpecificationMappingTransactionBase {
   schema_version: 1;
-  transaction_id: string;
   status: CtoSpecificationMappingTransactionStatus;
-  /** WAL operation; legacy transactions are confirmations. */
-  operation?: "confirm" | "answer" | "preflight" | "resume";
+  transaction_id: string;
   cto_run_id: string;
   mapping_id: string;
   mapping_hash: string;
@@ -1849,21 +1847,36 @@ interface CtoSpecificationMappingTransaction {
   state_dir: string;
   artifacts_dir: string;
   is_legacy: boolean;
-  /** Exact source bytes whose raw digest is used by the state CAS. */
-  state_before_content: string;
   state_before_digest: string;
-  /** Canonical semantic source state supplied to the checkpoint transition. */
-  state_source_content: string;
   state_source_logical_digest: string;
   state_after_digest: string;
-  /** The only permitted state mutation, bound to the source state and mapping event. */
   state_transition: CtoSpecificationMappingStateTransition;
-  state: TeamState;
   abort_reason?: string;
   abort_started_at?: string;
   terminal_at?: string;
   terminal_disposition?: "aborted" | "quarantined";
   abort_observed_mapping_digest?: string | null;
+}
+interface CtoSpecificationMappingStatefulTransaction extends CtoSpecificationMappingTransactionBase {
+  /** WAL operation; legacy transactions are confirmations. */
+  operation?: "confirm" | "answer";
+  /** Exact source bytes and staged state used by the state CAS. */
+  state_before_content: string;
+  state_source_content: string;
+  state: TeamState;
+}
+interface CtoSpecificationMappingDirectTransaction extends CtoSpecificationMappingTransactionBase {
+  operation: "preflight" | "resume";
+}
+type CtoSpecificationMappingTransaction = CtoSpecificationMappingStatefulTransaction | CtoSpecificationMappingDirectTransaction;
+type CtoSpecificationMappingTransactionCandidate = Partial<CtoSpecificationMappingTransactionBase> & {
+  operation?: "confirm" | "answer" | "preflight" | "resume";
+  state_before_content?: string;
+  state_source_content?: string;
+  state?: TeamState;
+};
+function isDirectMappingTransaction(transaction: CtoSpecificationMappingTransaction): transaction is CtoSpecificationMappingDirectTransaction {
+  return transaction.operation === "preflight" || transaction.operation === "resume";
 }
 const MAX_MAPPING_TRANSACTIONS = 64;
 const MAX_MAPPING_TRANSACTION_FILE_BYTES = 512 * 1024;
@@ -1878,8 +1891,7 @@ const MAPPING_TRANSACTION_REQUIRED_KEYS = new Set([
   "feature_id", "run_key", "mapping_path", "mapping_before_disposition", "mapping_before_content",
   "mapping_before_digest", "staged_mapping_identity", "mapping_after_digest", "mapping_content",
   "mapping", "selections", "state_path", "state_dir", "artifacts_dir", "is_legacy",
-  "state_before_content", "state_before_digest", "state_source_content", "state_source_logical_digest",
-  "state_after_digest", "state_transition", "state",
+  "state_before_digest", "state_source_logical_digest", "state_after_digest", "state_transition",
 ]);
 const MAPPING_TRANSACTION_OPTIONAL_KEYS = new Set([
   "operation", "abort_reason", "abort_started_at", "terminal_at", "terminal_disposition",
@@ -2183,7 +2195,7 @@ function mappingStateSourceContentError(
     : "semantic source state is not derived from the exact raw source state";
 }
 
-function mappingTransactionStateValidationError(root: string, transaction: CtoSpecificationMappingTransaction): string | null {
+function mappingTransactionStateValidationError(root: string, transaction: CtoSpecificationMappingStatefulTransaction): string | null {
   let rawSource: TeamState;
   let source: TeamState;
   try {
@@ -2261,8 +2273,9 @@ function parseMappingTransaction(
   if (envelopeError) {
     throw new Error(`CTO_SPEC_MAPPING_TRANSACTION_INVALID: transaction at ${path} ${envelopeError}`);
   }
-  const candidate = parsed as Partial<CtoSpecificationMappingTransaction>;
+  const candidate = parsed as CtoSpecificationMappingTransactionCandidate;
   const status = candidate.status ?? "pending";
+  const directWAL = candidate.operation === "preflight" || candidate.operation === "resume";
   const mappingBeforeDisposition = candidate.mapping_before_disposition ?? "present";
   const mappingBeforeContent = candidate.mapping_before_content === undefined ? null : candidate.mapping_before_content;
   const stagedMappingIdentity = candidate.staged_mapping_identity ?? { mapping_id: candidate.mapping_id, mapping_hash: candidate.mapping_hash, content_digest: candidate.mapping_after_digest };
@@ -2294,19 +2307,21 @@ function parseMappingTransaction(
     || !candidate.mapping
     || !Array.isArray(candidate.selections)
     || typeof candidate.state_path !== "string"
-    || typeof candidate.state_dir !== "string"
     || typeof candidate.artifacts_dir !== "string"
-    || typeof candidate.state_before_content !== "string"
+    || typeof candidate.state_dir !== "string"
     || typeof candidate.state_before_digest !== "string"
     || !/^[a-f0-9]{64}$/.test(candidate.state_before_digest)
-    || typeof candidate.state_source_content !== "string"
     || typeof candidate.state_source_logical_digest !== "string"
     || !/^[a-f0-9]{64}$/.test(candidate.state_source_logical_digest)
     || typeof candidate.state_after_digest !== "string"
     || !/^[a-f0-9]{64}$/.test(candidate.state_after_digest)
-    || !candidate.state
-    || typeof candidate.state !== "object"
-    || Array.isArray(candidate.state)
+    || (directWAL
+      ? Object.hasOwn(candidate, "state_before_content") || Object.hasOwn(candidate, "state_source_content") || Object.hasOwn(candidate, "state")
+      : typeof candidate.state_before_content !== "string"
+        || typeof candidate.state_source_content !== "string"
+        || !candidate.state
+        || typeof candidate.state !== "object"
+        || Array.isArray(candidate.state))
     || !stateTransition
     || !["record_checkpoint_answer", "consume_checkpoint_answer"].includes(String(stateTransition.kind))
     || typeof stateTransition.answer_id !== "string"
@@ -2342,7 +2357,7 @@ function parseMappingTransaction(
   ) {
     throw new Error(`CTO_SPEC_MAPPING_TRANSACTION_INVALID: transaction at ${path} has inconsistent identity or content`);
   }
-  if (sha256Hex(candidate.state_before_content) !== candidate.state_before_digest) {
+  if (!directWAL && sha256Hex(candidate.state_before_content as string) !== candidate.state_before_digest) {
     throw new Error(`CTO_SPEC_MAPPING_TRANSACTION_INVALID: transaction at ${path} has an invalid source state digest`);
   }
   const stagedMapping = candidate.mapping as CtoSpecificationMapping;
@@ -2356,7 +2371,6 @@ function parseMappingTransaction(
     throw new Error(`CTO_SPEC_MAPPING_TRANSACTION_INVALID: transaction at ${path} has unreadable mapping content: ${String(error)}`);
   }
   const answerWAL = candidate.operation === "answer";
-  const directWAL = candidate.operation === "preflight" || candidate.operation === "resume";
   const selections = candidate.selections as CtoSpecificationExecutionSelection[];
   const validSelections = candidate.selections.every((selection) =>
     selection && typeof selection.feature_id === "string" && isSafeFeatureId(selection.feature_id)
@@ -2506,7 +2520,7 @@ function parseMappingTransaction(
     throw new Error(`CTO_SPEC_MAPPING_TRANSACTION_INVALID: transaction at ${path} is missing terminal abort metadata`);
   }
   return {
-    ...(candidate.operation === "confirm" || candidate.operation === "answer" || candidate.operation === "preflight" || candidate.operation === "resume" ? { operation: candidate.operation } : {}),
+    ...(candidate.operation === "preflight" || candidate.operation === "resume" ? { operation: candidate.operation as "preflight" | "resume" } : candidate.operation === "confirm" || candidate.operation === "answer" ? { operation: candidate.operation } : {}),
     schema_version: 1,
     transaction_id: transactionId,
     cto_run_id: ctoRunId,
@@ -2524,13 +2538,15 @@ function parseMappingTransaction(
     state_dir: stateDir,
     artifacts_dir: artifactsDir,
     is_legacy: isLegacy,
-    state_before_content: candidate.state_before_content,
     state_before_digest: candidate.state_before_digest,
-    state_source_content: candidate.state_source_content,
     state_source_logical_digest: candidate.state_source_logical_digest,
     state_after_digest: candidate.state_after_digest,
     state_transition: stateTransition as CtoSpecificationMappingStateTransition,
-    state: candidate.state as TeamState,
+    ...(directWAL ? {} : {
+      state_before_content: candidate.state_before_content as string,
+      state_source_content: candidate.state_source_content as string,
+      state: candidate.state as TeamState,
+    }),
     status,
     mapping_before_disposition: mappingBeforeDisposition as "present" | "absent",
     mapping_before_content: mappingBeforeContent,
@@ -2541,7 +2557,7 @@ function parseMappingTransaction(
     ...(candidate.terminal_disposition === "aborted" || candidate.terminal_disposition === "quarantined" ? { terminal_disposition: candidate.terminal_disposition } : {}),
     ...(candidate.abort_observed_mapping_digest === null || typeof candidate.abort_observed_mapping_digest === "string" ? { abort_observed_mapping_digest: candidate.abort_observed_mapping_digest } : {}),
     wal_receipt,
-  };
+  } as ParsedMappingTransaction;
 }
 
 
@@ -2993,7 +3009,7 @@ function commitDirectMappingTransactionPinned(root: string, transaction: Mapping
 
 function commitMappingTransactionPinned(root: string, transaction: MappingTransactionWithWalReceipt, pinnedRoot: PinnedProjectRoot): void {
   assertMappingTransactionWalReceiptPinned(transaction, transaction.wal_receipt, pinnedRoot);
-  if (transaction.operation === "preflight" || transaction.operation === "resume") {
+  if (isDirectMappingTransaction(transaction)) {
     commitDirectMappingTransactionPinned(root, transaction, pinnedRoot);
     return;
   }
@@ -3334,8 +3350,8 @@ function createDirectMappingTransaction(
 ): CtoSpecificationMappingTransaction {
   const selection = record.selections[0];
   if (!selection) throw new Error("CTO_SPEC_MAPPING_TRANSACTION_INVALID: direct mapping has no selection");
-  const stateContent = selected.bytes.toString("utf8");
-  const stateDigest = sha256Hex(stateContent);
+  const stateDigest = createHash("sha256").update(selected.bytes).digest("hex");
+  const stateLogicalDigest = mappingStateDigest(selected.state);
   return {
     schema_version: 1,
     transaction_id: randomUUID(),
@@ -3362,11 +3378,9 @@ function createDirectMappingTransaction(
     state_dir: selected.stateDir,
     artifacts_dir: selected.artifactsDir,
     is_legacy: selected.isLegacy,
-    state_before_content: stateContent,
     state_before_digest: stateDigest,
-    state_source_content: stateContent,
-    state_source_logical_digest: mappingStateDigest(selected.state),
-    state_after_digest: mappingStateDigest(selected.state),
+    state_source_logical_digest: stateLogicalDigest,
+    state_after_digest: stateLogicalDigest,
     state_transition: {
       kind: "record_checkpoint_answer",
       answer_id: `direct-mapping-${record.mapping.mapping_id}`,
@@ -3376,7 +3390,6 @@ function createDirectMappingTransaction(
       feature_id: selection.feature_id,
       run_key: selection.run_key,
     },
-    state: selected.state,
     status: "pending",
   };
 }
@@ -3500,6 +3513,14 @@ function ctoMappingTeamBindingsMatchExecution(mapping: CtoSpecificationMapping, 
       || identity.slice_id !== owner.slice_id || identity.task_id !== owner.task_id) return false;
   }
   return mapping.parallelization.every((decision) => ownersBySlice.has(decision.slice_id));
+}
+
+function mappingConfirmationRequired(record: Pick<CtoSpecificationMappingRecord, "mapping" | "checkpoint_ref" | "trusted_answer_ref" | "confirmation_context">): boolean {
+  return record.mapping.status !== "confirmed"
+    || !record.confirmation_context
+    || typeof record.checkpoint_ref !== "string"
+    || typeof record.trusted_answer_ref !== "string"
+    || record.mapping.checkpoint_ref !== record.checkpoint_ref;
 }
 
 function dispatchAdmissionError(
@@ -3661,8 +3682,8 @@ function readDispatchAdmissionSnapshot(
   const execution = activeCtoExecutionContext(root, runId, pinnedRoot, sessionId);
   if (!execution.ok) return execution;
   if (loaded.value.mapping.mapping_hash !== expectedMappingHash) return { ok: false, error: "expected mapping hash mismatch during dispatch admission" };
-  const context = loaded.value.confirmation_context;
-  if (!context || !loaded.value.checkpoint_ref || !loaded.value.trusted_answer_ref) return { ok: false, error: "mapping confirmation is required before execution dispatch" };
+  if (mappingConfirmationRequired(loaded.value)) return { ok: false, error: "mapping confirmation is required before execution dispatch" };
+  const context = loaded.value.confirmation_context!;
   const anchor = readPinnedFeatureState(root, context.feature_id, context.run_key, pinnedRoot);
   if (!anchor.ok) return anchor;
   const validationError = dispatchAdmissionError(loaded.value, execution.value, anchor.value, runId, { canonical_root: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino });
@@ -6033,6 +6054,7 @@ export async function dispatchCtoSpecificationMapping(
     const mapping = readMappingRecord(root, input.cto_run_id, input.mapping_id, pinnedRoot);
     if (!mapping.ok) return blockedExecution([mapping.error]);
     if (mapping.value.mapping.mapping_hash !== input.expected_mapping_hash) return blockedExecution(["mapping hash mismatch"]);
+    if (mappingConfirmationRequired(mapping.value)) return blockedExecution(["mapping confirmation is required before execution dispatch"]);
     const constitutionFindings = ensureCtoExecutionConstitutions(root, mapping.value.selections, pinnedRoot);
     if (constitutionFindings.length > 0) return blockedExecution(constitutionFindings);
     // Heal only authenticated terminal task receipts before taking the
