@@ -99,18 +99,18 @@ function answerShape(value: unknown): value is CtoMappingConfirmationProofAnswer
     || (value.channel !== "terminal" && value.channel !== "escalation")
     || !text(value.reference)
     || !segment(value.run_id)
-    || !SAFE_STAGE.test(String(value.stage_id))
+    || typeof value.stage_id !== "string" || !SAFE_STAGE.test(value.stage_id)
     || !text(value.checkpoint_id)
-    || !SAFE_PROOF.test(String(value.work_identity_hash))
+    || typeof value.work_identity_hash !== "string" || !SAFE_PROOF.test(value.work_identity_hash)
     || !segment(value.capability_id)
     || !segment(value.capability_epoch)
-    || !SAFE_PROOF.test(String(value.policy_hash))
+    || typeof value.policy_hash !== "string" || !SAFE_PROOF.test(value.policy_hash)
     || !isSafeFeatureId(value.feature_id)
-    || !SAFE_PROOF.test(String(value.subject_binding))
+    || typeof value.subject_binding !== "string" || !SAFE_PROOF.test(value.subject_binding)
     || !Number.isSafeInteger(value.subject_revision) || (value.subject_revision as number) < 1
     || !text(value.decision, 256)
     || (value.feedback !== undefined && !text(value.feedback, 16 * 1024))
-    || !SAFE_PROOF.test(String(value.binding))
+    || typeof value.binding !== "string" || !SAFE_PROOF.test(value.binding)
     || !text(value.authority_receipt)
     || !text(value.issued_at)
     || !text(value.consumed_at)) return false;
@@ -143,20 +143,28 @@ function proofShape(value: unknown, allowUnsigned = false): value is CtoMappingC
     || !exactKeys(value.confirmation_context, ["feature_id", "run_key", "stage_id", "decision", "capability_id", "capability_epoch", "policy_hash"])
     || !isSafeFeatureId(value.confirmation_context.feature_id)
     || !segment(value.confirmation_context.run_key)
-    || !SAFE_STAGE.test(String(value.confirmation_context.stage_id))
+    || typeof value.confirmation_context.stage_id !== "string" || !SAFE_STAGE.test(value.confirmation_context.stage_id)
     || value.confirmation_context.decision !== "approve_continue"
     || !segment(value.confirmation_context.capability_id)
     || !segment(value.confirmation_context.capability_epoch)
     || !isSha256Hex(value.confirmation_context.policy_hash)
     || !text(value.confirmed_at)
     || !answerShape(value.trusted_answer)
-    || (allowUnsigned ? value.proof_hmac !== "" && !SAFE_PROOF.test(String(value.proof_hmac)) : !SAFE_PROOF.test(String(value.proof_hmac)))) return false;
+    || (allowUnsigned ? value.proof_hmac !== "" && (typeof value.proof_hmac !== "string" || !SAFE_PROOF.test(value.proof_hmac)) : (typeof value.proof_hmac !== "string" || !SAFE_PROOF.test(value.proof_hmac)))) return false;
   return true;
 }
 
 function withoutHmac(proof: CtoMappingConfirmationProof): UnsignedProof {
   const { proof_hmac: _proofHmac, ...payload } = proof;
   return payload;
+}
+
+function canonicalRecordPath(proof: Pick<CtoMappingConfirmationProof, "cto_run_id" | "mapping_id">): string {
+  return `.work-state/cto/${proof.cto_run_id}/specification-mappings/${proof.mapping_id}.json`;
+}
+
+function canonicalStatePath(featureId: string): string {
+  return `.work-state/features/${featureId}/state.json`;
 }
 
 function proofHmac(pinnedRoot: PinnedProjectRoot, payload: UnsignedProof): string | null {
@@ -178,7 +186,12 @@ export function signCtoMappingConfirmationProof(
   payload: UnsignedProof,
 ): CtoMappingConfirmationProof | null {
   const proof = { ...payload, proof_hmac: "" } as CtoMappingConfirmationProof;
-  if (!proofShape(proof, true)) return null;
+  if (!proofShape(proof, true)
+    || proof.root_identity.canonical_path !== pinnedRoot.canonical_root
+    || proof.root_identity.dev !== pinnedRoot.dev
+    || proof.root_identity.ino !== pinnedRoot.ino
+    || proof.mapping_record_path !== canonicalRecordPath(proof)
+    || proof.state_path !== canonicalStatePath(proof.confirmation_context.feature_id)) return null;
   const signature = proofHmac(pinnedRoot, payload);
   return signature ? { ...proof, proof_hmac: signature } : null;
 }
@@ -186,15 +199,19 @@ export function signCtoMappingConfirmationProof(
 export function verifyCtoMappingConfirmationProof(
   pinnedRoot: PinnedProjectRoot,
   proof: CtoMappingConfirmationProof,
+  expected: CtoMappingConfirmationProofPayload,
 ): boolean {
   if (!proofShape(proof)
     || proof.root_identity.canonical_path !== pinnedRoot.canonical_root
     || proof.root_identity.dev !== pinnedRoot.dev
-    || proof.root_identity.ino !== pinnedRoot.ino) return false;
-  const expected = proofHmac(pinnedRoot, withoutHmac(proof));
-  if (!expected || !SAFE_PROOF.test(proof.proof_hmac)) return false;
+    || proof.root_identity.ino !== pinnedRoot.ino
+    || proof.mapping_record_path !== canonicalRecordPath(proof)
+    || proof.state_path !== canonicalStatePath(proof.confirmation_context.feature_id)
+    || canonicalJson(withoutHmac(proof)) !== canonicalJson(expected)) return false;
+  const expectedHmac = proofHmac(pinnedRoot, expected);
+  if (!expectedHmac || !SAFE_PROOF.test(proof.proof_hmac)) return false;
   const actualBytes = Buffer.from(proof.proof_hmac, "hex");
-  const expectedBytes = Buffer.from(expected, "hex");
+  const expectedBytes = Buffer.from(expectedHmac, "hex");
   return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
 }
 
@@ -202,7 +219,7 @@ export function writeCtoMappingConfirmationProof(
   pinnedRoot: PinnedProjectRoot,
   proof: CtoMappingConfirmationProof,
 ): { ok: true; content: string; digest: string; path: string } | { ok: false; error: string } {
-  if (!verifyCtoMappingConfirmationProof(pinnedRoot, proof)) return { ok: false, error: "mapping confirmation proof is malformed or authentication failed" };
+  if (!verifyCtoMappingConfirmationProof(pinnedRoot, proof, withoutHmac(proof))) return { ok: false, error: "mapping confirmation proof is malformed or authentication failed" };
   const relative = ctoMappingConfirmationProofRelativePath(proof.cto_run_id, proof.mapping_id, proof.proof_ref);
   if (!relative) return { ok: false, error: "mapping confirmation proof path is unsafe" };
   const content = `${JSON.stringify(proof, null, 2)}\r\n`;
@@ -233,6 +250,7 @@ export function readCtoMappingConfirmationProof(
   ctoRunId: string,
   mappingId: string,
   proofRef: string,
+  expected: CtoMappingConfirmationProofPayload,
 ): CtoMappingConfirmationProofReadResult {
   const relative = ctoMappingConfirmationProofRelativePath(ctoRunId, mappingId, proofRef);
   if (!relative) return { ok: false, code: "invalid", error: "mapping confirmation proof selector is unsafe" };
@@ -244,7 +262,7 @@ export function readCtoMappingConfirmationProof(
     let parsed: unknown;
     try { parsed = JSON.parse(content) as unknown; } catch { return { ok: false, code: "invalid", error: "mapping confirmation proof is not valid JSON" }; }
     if (!proofShape(parsed)) return { ok: false, code: "invalid", error: "mapping confirmation proof schema is invalid" };
-    if (!verifyCtoMappingConfirmationProof(pinnedRoot, parsed)) return { ok: false, code: "invalid", error: "mapping confirmation proof authentication failed" };
+    if (!verifyCtoMappingConfirmationProof(pinnedRoot, parsed, expected)) return { ok: false, code: "invalid", error: "mapping confirmation proof does not match the canonical confirmation image or authentication failed" };
     if (parsed.cto_run_id !== ctoRunId || parsed.mapping_id !== mappingId || parsed.proof_ref !== proofRef) return { ok: false, code: "invalid", error: "mapping confirmation proof identity is foreign" };
     return { ok: true, proof: parsed, content };
   } catch (error) {
