@@ -4348,6 +4348,7 @@ export function deriveCtoSpecificationMappingAskInput(
       return blockedCtoMappingAsk("mapping Ask requires an exact safe CTO run, mapping selector, and lowercase SHA-256 mapping hash");
     }
     return withCtoRunLock(root, base.cto_run_id, () => {
+      recoverPendingMappingTransactions(root, base.cto_run_id, pinnedRoot);
       const loaded = readMappingRecord(root, base.cto_run_id, base.mapping_id, pinnedRoot);
       if (!loaded.ok) return blockedCtoMappingAsk(loaded.error);
       const record = loaded.value;
@@ -4851,6 +4852,7 @@ export function resumeCtoSpecificationMapping(
     assertRuntimeLive();
     return withCtoRunLock(root, input.cto_run_id, () => {
       assertRuntimeLive();
+      recoverPendingMappingTransactions(root, input.cto_run_id, pinnedRoot);
       const loaded = readMappingRecord(root, input.cto_run_id, input.mapping_id, pinnedRoot);
       if (!loaded.ok) return blockedCtoMappingAsk(loaded.error);
       const record = loaded.value;
@@ -5202,6 +5204,7 @@ export async function confirmCtoSpecificationMapping(projectRoot: string, input:
     assertRuntimeLive();
     if (!pinnedRoot.isStable()) return blockedExecution(["project root changed before CTO confirmation"]);
     if (!input || !isSafeCtoRunId(input.cto_run_id)) return blockedExecution(["mapping identity must be explicit and non-blank"]);
+    recoverPendingMappingTransactions(root, input.cto_run_id, pinnedRoot);
     const ownerExecution = activeCtoExecutionContext(root, input.cto_run_id, pinnedRoot, options.sessionId);
     if (!ownerExecution.ok) return blockedExecution([ownerExecution.error]);
     const mapping = readMappingRecord(root, input.cto_run_id, input.mapping_id, pinnedRoot);
@@ -5812,6 +5815,7 @@ export function reconcileAndTerminalizeCtoSpecificationExecutionTeams(
     if (!isSafeCtoRunId(selectors?.cto_run_id) || !isSafeCtoExecutionId(selectors?.mapping_id) || !isSha256Hex(selectors?.mapping_hash)) {
       return { status: "blocked", terminalized_team_ids: [], failed_team_ids: [], findings: ["CTO conformance reconciliation selectors are invalid"] };
     }
+    recoverPendingMappingTransactions(root, selectors.cto_run_id, pinnedRoot);
     const mapping = readMappingRecord(root, selectors.cto_run_id, selectors.mapping_id, pinnedRoot);
     if (!mapping.ok) return { status: "blocked", terminalized_team_ids: [], failed_team_ids: [], findings: [mapping.error] };
     if (mapping.value.mapping.mapping_hash !== selectors.mapping_hash || mapping.value.mapping.status !== "confirmed") {
@@ -6765,6 +6769,7 @@ export function closeCtoSpecificationExecutionWave(
     assertCtoRuntimeAccessFacadeLive(runtimeAccess, root, options.sessionId);
     runtimeAccess.assertProjectRoot(root);
     runtimeAccess.assertLive();
+    recoverPendingMappingTransactions(root, input.cto_run_id, pinnedRoot);
     // Dependency/team reconciliation is a mutation for an active wave only.
     // Exact terminal replay must validate postimages without attempting to
     // re-enter the now-absent active wave.
