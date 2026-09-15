@@ -850,14 +850,20 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
       if (!rootStable()) return false;
       testHooks?.beforeTargetRename?.(destination);
       if (!rootStable()) return false;
-      if (replaceExisting) {
-        if (runDarwinHelper(root, 'publish', { final: name, temporary }) === null) return false;
-      } else {
-        if (runDarwinHelper(root, 'publish_noreplace', { final: name, temporary }) === null) return false;
+      const publishedResult = replaceExisting
+        ? runDarwinHelper(root, 'publish', { final: name, temporary })
+        : runDarwinHelper(root, 'publish_noreplace', { final: name, temporary });
+      if (publishedResult === null) {
+        const finalBytes = bytes.length <= MAX_PINNED_READ_BYTES ? readPinnedFileFull(root, name, bytes.length) : null;
+        if (finalBytes === null || !finalBytes.equals(bytes)) return false;
+      } else if (publishedResult.published !== true) {
+        return false;
       }
+      const cleanupTemporary = publishedResult === null || publishedResult.temporary_remaining === true ? temporary : null;
       temporary = null;
       published = true;
       options.onPublished?.();
+      if (cleanupTemporary !== null) runDarwinHelper(root, 'cleanup', { temporary: cleanupTemporary });
       return rootStable();
     }
     const descriptorRoot = descriptorPathFor(root.fd);
@@ -1277,27 +1283,25 @@ def publish(final, temporary):
     info = os.stat(temporary, dir_fd=3, follow_symlinks=False)
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: fail("temporary is unsafe")
     os.replace(temporary, final, src_dir_fd=3, dst_dir_fd=3)
-    os.fsync(3)
+    try: os.fsync(3)
+    except OSError: return {"published": True}
+    return {"published": True}
 
 def publish_noreplace(final, temporary):
     final, temporary = safe_name(final), safe_name(temporary)
     info = os.stat(temporary, dir_fd=3, follow_symlinks=False)
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: fail("temporary is unsafe")
-    linked = False
     try:
         os.link(temporary, final, src_dir_fd=3, dst_dir_fd=3, follow_symlinks=False)
-        linked = True
-        os.unlink(temporary, dir_fd=3)
     except Exception:
-        if linked:
-            try:
-                current = os.stat(final, dir_fd=3, follow_symlinks=False)
-                if current.st_dev == info.st_dev and current.st_ino == info.st_ino and current.st_nlink == 2:
-                    os.unlink(final, dir_fd=3)
-            except Exception:
-                pass
         raise
-    os.fsync(3)
+    try:
+        os.unlink(temporary, dir_fd=3)
+    except OSError:
+        return {"published": True, "temporary_remaining": True}
+    try: os.fsync(3)
+    except OSError: return {"published": True}
+    return {"published": True}
 
 def _verify_exact(name, size, digest, expected_dev=None, expected_ino=None):
     fd, info = open_regular(name, os.O_RDONLY)
@@ -1368,8 +1372,8 @@ try:
         result = {"ok": lease is not None, **(lease or {})}
     elif op == "lock_release":
         lock_release(payload.get("name"), payload.get("dev"), payload.get("ino"), payload.get("digest")); result = {"ok": True}
-    elif op == "publish": publish(payload.get("final"), payload.get("temporary")); result = {"ok": True}
-    elif op == "publish_noreplace": publish_noreplace(payload.get("final"), payload.get("temporary")); result = {"ok": True}
+    elif op == "publish": result = {"ok": True, **publish(payload.get("final"), payload.get("temporary"))}
+    elif op == "publish_noreplace": result = {"ok": True, **publish_noreplace(payload.get("final"), payload.get("temporary"))}
     elif op == "quarantine_if_exact": result = {"ok": True, **quarantine_if_exact(payload.get("name"), payload.get("quarantine"), payload.get("size"), payload.get("sha256"))}
     elif op == "restore_quarantine": result = {"ok": True, **restore_quarantine(payload.get("quarantine"), payload.get("name"))}
     elif op == "unlink_quarantine": result = {"ok": True, **unlink_quarantine(payload.get("quarantine"), payload.get("size"), payload.get("sha256"), payload.get("expected_dev"), payload.get("expected_ino"))}
