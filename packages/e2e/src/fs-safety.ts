@@ -575,10 +575,18 @@ export function unlinkPinnedFileIfExact(
   if (process.platform === 'darwin') {
     testHooks?.beforeExactQuarantine?.(join(root.lexicalPath, name));
     const moved = runDarwinHelper(root, 'quarantine_if_exact', { name, quarantine, size: expected.length, sha256: digest });
-    if (moved?.quarantined !== true) return false;
+    if (moved?.quarantined !== true) {
+      if (moved?.moved === true) {
+        runDarwinHelper(root, 'restore_quarantine', { quarantine, name, size: expected.length, sha256: digest });
+      }
+      return false;
+    }
     const quarantineDev = moved.dev;
     const quarantineIno = moved.ino;
-    if (!Number.isSafeInteger(quarantineDev) || !Number.isSafeInteger(quarantineIno)) return false;
+    if (!Number.isSafeInteger(quarantineDev) || !Number.isSafeInteger(quarantineIno)) {
+      runDarwinHelper(root, 'restore_quarantine', { quarantine, name, size: expected.length, sha256: digest });
+      return false;
+    }
     testHooks?.beforeTargetRename?.(join(root.lexicalPath, name));
     return runDarwinHelper(root, 'unlink_quarantine', { quarantine, size: expected.length, sha256: digest, expected_dev: quarantineDev, expected_ino: quarantineIno })?.removed === true;
   }
@@ -854,6 +862,7 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
         ? runDarwinHelper(root, 'publish', { final: name, temporary })
         : runDarwinHelper(root, 'publish_noreplace', { final: name, temporary });
       if (publishedResult === null) {
+        if (!replaceExisting) return false;
         const finalBytes = bytes.length <= MAX_PINNED_READ_BYTES ? readPinnedFileFull(root, name, bytes.length) : null;
         if (finalBytes === null || !finalBytes.equals(bytes)) return false;
       } else if (publishedResult.published !== true) {
@@ -1293,8 +1302,8 @@ def publish_noreplace(final, temporary):
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: fail("temporary is unsafe")
     try:
         os.link(temporary, final, src_dir_fd=3, dst_dir_fd=3, follow_symlinks=False)
-    except Exception:
-        raise
+    except FileExistsError:
+        return {"published": False, "collision": True}
     try:
         os.unlink(temporary, dir_fd=3)
     except OSError:
@@ -1334,8 +1343,10 @@ def quarantine_if_exact(name, quarantine, size, digest):
         return {"quarantined": False, "moved": True}
     return {"quarantined": True, "moved": True, "dev": info.st_dev, "ino": info.st_ino}
 
-def restore_quarantine(quarantine, name):
+def restore_quarantine(quarantine, name, size, digest):
     quarantine, name = safe_name(quarantine), safe_name(name)
+    if not isinstance(size, int) or size < 0 or size > MAX_WRITE or not isinstance(digest, str) or len(digest) != 64: fail("exact restore bounds are invalid")
+    if not _verify_exact(quarantine, size, digest): return {"restored": False}
     try:
         os.link(quarantine, name, src_dir_fd=3, dst_dir_fd=3, follow_symlinks=False)
     except FileExistsError:
@@ -1375,7 +1386,7 @@ try:
     elif op == "publish": result = {"ok": True, **publish(payload.get("final"), payload.get("temporary"))}
     elif op == "publish_noreplace": result = {"ok": True, **publish_noreplace(payload.get("final"), payload.get("temporary"))}
     elif op == "quarantine_if_exact": result = {"ok": True, **quarantine_if_exact(payload.get("name"), payload.get("quarantine"), payload.get("size"), payload.get("sha256"))}
-    elif op == "restore_quarantine": result = {"ok": True, **restore_quarantine(payload.get("quarantine"), payload.get("name"))}
+    elif op == "restore_quarantine": result = {"ok": True, **restore_quarantine(payload.get("quarantine"), payload.get("name"), payload.get("size"), payload.get("sha256"))}
     elif op == "unlink_quarantine": result = {"ok": True, **unlink_quarantine(payload.get("quarantine"), payload.get("size"), payload.get("sha256"), payload.get("expected_dev"), payload.get("expected_ino"))}
     elif op == "cleanup": cleanup(payload.get("temporary")); result = {"ok": True}
     else: fail("unsupported operation")

@@ -1900,6 +1900,7 @@ function writeSuiteReport(
   mdDir: string,
   report: UxE2eReport,
   warnings: readonly string[],
+  retainedEvidenceDestinationRoots: Iterable<PinnedDirectory>,
 ): GenerateReportResult {
   const suiteRootHandle = discovery.root;
   if (!pinnedDirectoryIsStable(suiteRootHandle)) throw new Error('ux-e2e: suite root changed before report output');
@@ -1913,6 +1914,11 @@ function writeSuiteReport(
   let previousJson: Buffer | null = null;
   let previousMarkdown: Buffer | null = null;
   let mdFilename = '';
+  const assertEvidenceDestinationsStable = (phase: string): void => {
+    for (const root of retainedEvidenceDestinationRoots) {
+      if (!pinnedDirectoryIsStable(root)) throw new Error(`ux-e2e: evidence destination changed ${phase}`);
+    }
+  };
   const rollback = (): void => {
     if (markdownTouched && markdownBytes !== null) {
       if (unlinkPinnedFileIfExact(reportRoot, mdFilename, markdownBytes, { requireStable: false }) && previousMarkdown !== null) writePinnedFile(reportRoot, mdFilename, previousMarkdown, { requireStable: false });
@@ -1945,13 +1951,17 @@ function writeSuiteReport(
       }
     }
     assertSuiteDiscoveryStable(suiteRoot, discovery, 'before report JSON output');
+    assertEvidenceDestinationsStable('before suite report JSON output');
     jsonTouched = true;
     if (!writePinnedFile(stateRoot, 'report.json', jsonBytes)) throw new Error('ux-e2e: failed to write suite report.json');
     assertSuiteDiscoveryStable(suiteRoot, discovery, 'after report JSON output');
+    assertEvidenceDestinationsStable('after suite report JSON output');
     assertSuiteDiscoveryStable(suiteRoot, discovery, 'before report markdown output');
+    assertEvidenceDestinationsStable('before suite report markdown output');
     markdownTouched = true;
     if (!writePinnedFile(reportRoot, mdFilename, markdownBytes)) throw new Error('ux-e2e: failed to write suite markdown report');
     assertSuiteDiscoveryStable(suiteRoot, discovery, 'after report output');
+    assertEvidenceDestinationsStable('after suite report markdown output');
     return { jsonPath: join(stateDir, 'report.json'), mdPath: join(mdDir, mdFilename), warnings: [...warnings] };
   } catch (error) {
     rollback();
@@ -2069,7 +2079,7 @@ function generateSuiteReport(
     evidence: aggregateEvidence,
     generated_at: new Date().toISOString(),
   }, '') as UxE2eReport;
-  return writeSuiteReport(suiteRoot, discovery, mdDir, report, warnings);
+  return writeSuiteReport(suiteRoot, discovery, mdDir, report, warnings, retainedEvidenceDestinationRoots);
   } catch (error) {
     rollbackCopiedEvidence();
     throw error;

@@ -1659,3 +1659,76 @@ test('fs safety: final quarantine replacement is preserved after identity rechec
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+test('report suite: destination swap during markdown output rolls back outputs and evidence', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-suite-output-target-race-'));
+  const first = makeSessionDir();
+  const second = makeSessionDir();
+  renameSync(first, join(suite, 'session-a'));
+  renameSync(second, join(suite, 'session-b'));
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-suite-output-target-md-'));
+  const evidenceRoot = join(mdDir, 'evidence', 'session-a');
+  const moved = `${evidenceRoot}.moved`;
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeTargetOpen(path) {
+      if (swapped || !path.startsWith(mdDir + sep) || !path.endsWith('.md')) return;
+      swapped = true;
+      renameSync(evidenceRoot, moved);
+      mkdirSync(evidenceRoot, { recursive: true });
+    },
+  });
+  try {
+    assert.throws(
+      () => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }),
+      /evidence destination changed/u,
+    );
+    assert.equal(swapped, true);
+    assert.equal(readdirSync(evidenceRoot).length, 0, 'replacement evidence root remains empty');
+    assert.equal(readdirSync(moved).length, 0, 'retained evidence is rolled back');
+    assert.equal(existsSync(join(suite, '.work-state', 'ux-e2e', 'report.json')), false, 'suite JSON is rolled back');
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    rmSync(suite, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+    rmSync(moved, { recursive: true, force: true });
+  }
+});
+
+
+test('report: identical preexisting evidence survives later transaction rollback', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-identical-collision-'));
+  const source = readFileSync(join(dir, '.work-state', 'ux-e2e', 'transcript.jsonl'));
+  const digest = createHash('sha256').update(source).digest('hex').slice(0, 16);
+  const destinationDir = join(mdDir, 'evidence', 'my-feature', 'ux-e2e');
+  const destination = join(destinationDir, `transcript.jsonl.${digest}`);
+  mkdirSync(destinationDir, { recursive: true });
+  writeFileSync(destination, source);
+  const moved = `${dir}.moved`;
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeTargetOpen(path) {
+      if (swapped || path !== join(dir, '.work-state', 'ux-e2e', 'report.json')) return;
+      swapped = true;
+      renameSync(dir, moved);
+      renameSync(mkdtempSync(join(tmpdir(), 'ux-e2e-identical-collision-replacement-')), dir);
+    },
+  });
+  try {
+    assert.throws(
+      () => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }),
+      /session root changed|membership changed|failed to write report/u,
+    );
+    assert.deepEqual(readFileSync(destination), source, 'identical preexisting destination remains owned by prior transaction');
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (swapped) {
+      rmSync(dir, { recursive: true, force: true });
+      renameSync(moved, dir);
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
