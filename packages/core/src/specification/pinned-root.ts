@@ -5203,6 +5203,7 @@ export class PinnedProjectRoot {
     session.closing = true;
     closeDarwinHelperSessionImmediately(session);
     this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
+    void this.darwinHelperClosePromise.catch(() => undefined);
   }
 
   private writeDarwinFrame(session: DarwinHelperSession, frame: Buffer, deadline: number, operation: string): void {
@@ -5330,10 +5331,14 @@ export class PinnedProjectRoot {
   private awaitDarwinHelperExit(session: DarwinHelperSession): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+      let finalTimer: NodeJS.Timeout | null = null;
       const childPid = session.child.pid;
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
+        if (timer !== null) { clearTimeout(timer); timer.unref(); timer = null; }
+        if (finalTimer !== null) { clearTimeout(finalTimer); finalTimer.unref(); finalTimer = null; }
         removeDarwinHelperDirectory(session.directory);
         if (error) reject(error); else resolve();
       };
@@ -5342,18 +5347,16 @@ export class PinnedProjectRoot {
         finish();
         return;
       }
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         if (session.exited || session.child.exitCode !== null) { finish(); return; }
         if (session.child.pid === childPid) {
           try { session.child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
         }
-        const finalTimer = setTimeout(() => {
+        finalTimer = setTimeout(() => {
           if (session.exited || session.child.exitCode !== null) finish();
           else finish(new PinnedRootError("unsupported", "descriptor helper did not exit before bounded close"));
         }, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
-        finalTimer.unref();
       }, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
-      timer.unref();
       session.exitPromise.then(() => finish(), () => finish(new PinnedRootError("unsupported", "descriptor helper exit could not be observed")));
     });
   }
@@ -5367,6 +5370,7 @@ export class PinnedProjectRoot {
     session.closing = true;
     closeDarwinHelperSessionImmediately(session);
     this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
+    void this.darwinHelperClosePromise.catch(() => undefined);
   }
 
   private makeWriteReceipt(
