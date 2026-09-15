@@ -4060,10 +4060,11 @@ export async function preflightCtoSpecificationExecution(projectRoot: string, in
       assertRuntimeLive();
       return preflightCtoSpecificationExecutionUnlocked(root, input, pinnedRoot, assertRuntimeLive, options.sessionId);
     }, { pinnedRoot });
-    assertRuntimeLive();
     if (!pinnedRoot.isStable()) return blockedExecution(["project root changed during CTO preflight"]);
+    assertRuntimeLive();
     return result;
   } catch (error) {
+    if (!pinnedRoot.isStable()) return blockedExecution(["project root changed during CTO preflight"]);
     return blockedExecution([`mapping transaction lock failed: ${error instanceof Error ? error.message : String(error)}`]);
   } finally {
     pinnedRoot.close();
