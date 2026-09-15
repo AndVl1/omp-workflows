@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { registerConstitutionTools, registerCtoTools, registerTeamWorkflow, registerWorkflowTools, type TeamSessionBindingController, type TeamSessionRuntimeBinding } from "../../src/index.js";
 import { closeRegistryRegistrationContext } from "../../src/registry/owner.js";
 import { revokeCtoRuntimeSessionAuthority } from "../../src/cto/session-authority.js";
+import { drainDarwinHelperClosePromisesForTesting } from "../../src/specification/pinned-root.js";
 import { TEST_CONTEXT } from "./registrar-host.js";
 import {
   registerRetainedTestTeardown,
@@ -200,22 +201,29 @@ function closeRetainedTestHelperRegistrations(): void {
   if (hasError) throw firstError;
 }
 
-registerRetainedTestTeardown(() => {
+registerRetainedTestTeardown(async () => {
   let firstError: unknown;
   let hasError = false;
-  try {
-    closeRetainedTestTeamSessions();
-  } catch (error) {
-    firstError = error;
-    hasError = true;
-  }
-  try {
-    closeRetainedTestHelperRegistrations();
-  } catch (error) {
+  const rememberError = (error: unknown): void => {
     if (!hasError) {
       firstError = error;
       hasError = true;
     }
+  };
+  try {
+    closeRetainedTestTeamSessions();
+  } catch (error) {
+    rememberError(error);
+  }
+  try {
+    await drainDarwinHelperClosePromisesForTesting();
+  } catch (error) {
+    rememberError(error);
+  }
+  try {
+    closeRetainedTestHelperRegistrations();
+  } catch (error) {
+    rememberError(error);
   }
   if (hasError) throw firstError;
 });

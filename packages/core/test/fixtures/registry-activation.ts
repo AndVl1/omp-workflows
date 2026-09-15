@@ -56,7 +56,7 @@ type RetainedRegistryRegistration = {
   readonly leasedCapabilities: readonly WorkflowCapability[];
 };
 const retainedRegistryRegistrations = new Set<RetainedRegistryRegistration>();
-type RetainedTestTeardown = () => void;
+type RetainedTestTeardown = () => void | Promise<void>;
 const retainedTestTeardowns = new Set<RetainedTestTeardown>();
 
 function closeReplacedRetainedTestRegistrations(): void {
@@ -93,16 +93,29 @@ export function registerRetainedTestTeardown(teardown: RetainedTestTeardown): ()
   return () => { retainedTestTeardowns.delete(teardown); };
 }
 
-nodeTestAfterEach(() => {
+nodeTestAfterEach(async () => {
   let firstError: unknown;
   let hasError = false;
+  const rememberError = (error: unknown): void => {
+    if (!hasError) { firstError = error; hasError = true; }
+  };
+  const pending: Promise<void>[] = [];
   for (const teardown of [...retainedTestTeardowns]) {
-    try { teardown(); } catch (error) {
-      if (!hasError) { firstError = error; hasError = true; }
+    try {
+      const result = teardown();
+      if (result) pending.push(Promise.resolve(result));
+    } catch (error) {
+      rememberError(error);
+    }
+  }
+  if (pending.length > 0) {
+    const settled = await Promise.allSettled(pending);
+    for (const result of settled) {
+      if (result.status === "rejected") rememberError(result.reason);
     }
   }
   try { closeRetainedTestRegistrations(); } catch (error) {
-    if (!hasError) { firstError = error; hasError = true; }
+    rememberError(error);
   }
   if (hasError) throw firstError;
 });
