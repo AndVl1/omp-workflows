@@ -5,6 +5,7 @@ import { closeRegistryRegistrationContext } from "../../src/registry/owner.js";
 import { revokeCtoRuntimeSessionAuthority } from "../../src/cto/session-authority.js";
 import { TEST_CONTEXT } from "./registrar-host.js";
 import {
+  closeRetainedTestRegistrations,
   openTestRegistry,
   writeTestRegistryMarker,
   type TestRegistryRegistration,
@@ -180,7 +181,25 @@ export function closeRetainedTestTeamSessions(): void {
   if (hasError) throw firstError;
 }
 
-nodeTestAfterEach(() => closeRetainedTestTeamSessions());
+nodeTestAfterEach(() => {
+  let firstError: unknown;
+  let hasError = false;
+  try {
+    closeRetainedTestTeamSessions();
+  } catch (error) {
+    firstError = error;
+    hasError = true;
+  }
+  try {
+    closeRetainedTestRegistrations();
+  } catch (error) {
+    if (!hasError) {
+      firstError = error;
+      hasError = true;
+    }
+  }
+  if (hasError) throw firstError;
+});
 
 export function registerTestWorkflowTools(
   root: string,
