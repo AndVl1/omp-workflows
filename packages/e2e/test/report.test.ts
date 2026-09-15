@@ -291,9 +291,9 @@ test('report: PASS rejects mandatory evidence that disappears after collection',
   const transcript = join(dir, '.work-state', 'ux-e2e', 'transcript.jsonl');
   const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-mandatory-evidence-md-'));
   let deleted = false;
-  setFsSafetyTestHooks({
-    beforeSourceOpen(path) {
-      if (!deleted && path === transcript) {
+  setEvidenceCopyTestHooks({
+    beforeMandatoryEvidenceCheck(path, phase) {
+      if (!deleted && phase === 'after evidence collection' && path === transcript) {
         deleted = true;
         unlinkSync(transcript);
       }
@@ -320,9 +320,9 @@ test('report suite: PASS rejects mandatory child evidence that disappears after 
   const transcript = join(suite, 'session-a', '.work-state', 'ux-e2e', 'transcript.jsonl');
   const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-mandatory-evidence-suite-md-'));
   let deleted = false;
-  setFsSafetyTestHooks({
-    beforeSourceOpen(path) {
-      if (!deleted && path === transcript) {
+  setEvidenceCopyTestHooks({
+    beforeMandatoryEvidenceCheck(path, phase) {
+      if (!deleted && phase === 'after evidence collection' && path === transcript) {
         deleted = true;
         unlinkSync(transcript);
       }

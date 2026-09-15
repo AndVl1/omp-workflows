@@ -527,6 +527,7 @@ function assertMandatoryEvidenceReadable(
   phase: string,
 ): void {
   for (const evidencePath of requiredEvidence) {
+    reportTestHooks?.beforeMandatoryEvidenceCheck?.(evidencePath, phase);
     const absolute = evidencePath.length === 0 ? null : normalizeEvidencePath(root, evidencePath);
     if (absolute === null || projectRelative(root.lexicalPath, absolute) === null || readPinnedEvidence(root, absolute) === null) {
       throw new Error(`ux-e2e: PASS mandatory evidence is missing or unsafe ${phase}`);
@@ -556,6 +557,7 @@ function mandatoryEvidencePaths(report: UxE2eReport): string[] {
 
 export interface EvidenceCopyTestHooks extends FsSafetyTestHooks {
   readonly beforeSuitePathStat?: (path: string) => void;
+  readonly beforeMandatoryEvidenceCheck?: (path: string, phase: string) => void;
 }
 
 let reportTestHooks: EvidenceCopyTestHooks | null = null;
