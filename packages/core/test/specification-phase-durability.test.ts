@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { resolveDoWorkSpecPreflight } from "../src/commands/do-work.js";
-import { registerTestConstitutionGate } from "./fixtures/registry-activation.js";
+import { registerTestConstitutionGate, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import { registerTestWorkflowTools } from "./fixtures/host-tool-activation.js";
 import { z as zod } from "zod";
 import { specPlanCommand, specifyCommand, specTasksCommand } from "../src/commands/specification.js";
@@ -149,6 +149,7 @@ function setup(): PhaseDurabilityRun {
   const root = mkdtempSync(join(tmpdir(), "spec-phase-durability-"));
   mkdirSync(join(root, "specs", FEATURE_ID), { recursive: true });
   writeFileSync(join(root, "CONSTITUTION.md"), "# Project Constitution v1.0.0\n\nVersion: 1.0.0\n\n## I. Quality\n\nShip tested work.\n", "utf8");
+  writeTestRegistryMarker(root);
   registerTestConstitutionGate(root, "phase-durability-gate");
   const constitution = ensureProjectConstitution(root, { origin_kind: "native_direct", origin_run_key: RUN_KEY, origin_stage: "specify" }, { feature_id: FEATURE_ID });
   assert.ok(constitution.ok && constitution.value.binding, constitution.ok ? "constitution binding must be available" : constitution.error);
