@@ -1,9 +1,33 @@
-import { registerConstitutionTools, registerCtoTools, registerTeamWorkflow, registerWorkflowTools } from "../../src/index.js";
+import { afterEach as nodeTestAfterEach } from "node:test";
+import { registerConstitutionTools, registerCtoTools, registerTeamWorkflow, registerWorkflowTools, type TeamSessionBindingController, type TeamSessionRuntimeBinding } from "../../src/index.js";
+import { closeRegistryRegistrationContext } from "../../src/registry/owner.js";
+import { revokeCtoRuntimeSessionAuthority } from "../../src/cto/session-authority.js";
+import { TEST_CONTEXT } from "./registrar-host.js";
 import {
   openTestRegistry,
   writeTestRegistryMarker,
   type TestRegistryRegistration,
 } from "./registry-activation.js";
+
+type RetainedTestTeamSession = {
+  readonly controller: TeamSessionBindingController;
+  readonly binding: TeamSessionRuntimeBinding;
+};
+const retainedTestTeamSessions = new Set<RetainedTestTeamSession>();
+
+/** Release exact mounted test-session runtime capabilities before registry fixtures close. */
+export function closeRetainedTestTeamSessions(): void {
+  for (const session of [...retainedTestTeamSessions]) {
+    if (!session.controller.release(session.binding)) {
+      session.binding.runtimeAccess.close();
+      revokeCtoRuntimeSessionAuthority(session.binding.runtimeAuthority);
+      closeRegistryRegistrationContext(session.binding.registryContext);
+    }
+    retainedTestTeamSessions.delete(session);
+  }
+}
+
+nodeTestAfterEach(() => closeRetainedTestTeamSessions());
 
 export function registerTestWorkflowTools(
   root: string,
@@ -53,7 +77,17 @@ export function registerTestTeamWorkflow(
   writeTestRegistryMarker(root);
   const registration = openTestRegistry(root, ["workflow_profiles", "constitution_gate", "runtime_config"], ownerId, ["workflow_registration", "config_writer"]);
   try {
-    const installGate = registerTeamWorkflow(pi, { ...options, cwd: root, owner: () => registration.owner, registrationToken: registration.token });
+    const installGate = registerTeamWorkflow(pi, {
+      ...options,
+      cwd: root,
+      owner: () => registration.owner,
+      registrationToken: registration.token,
+      onSessionBindingController: (controller) => {
+        const binding = controller.current(TEST_CONTEXT(root));
+        if (binding) retainedTestTeamSessions.add({ controller, binding });
+        options.onSessionBindingController?.(controller);
+      },
+    });
     if (installGate) installGate();
     registration.retain(true);
   } catch (error) {
