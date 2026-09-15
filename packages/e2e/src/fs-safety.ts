@@ -317,7 +317,8 @@ export function pinOrCreateDirectory(directory: string, created?: PinnedDirector
       || (helperIdentity !== null && !sameIdentity(helperIdentity, descriptorStat))
       || !pathHasNoSymlinkAncestors(canonicalPath)) return null;
     pinned = true;
-    created?.push(...localCreated);
+    if (created !== undefined) created.push(...localCreated);
+    else closePinnedDirectoryCreationReceipts(localCreated);
     return { lexicalPath, physicalPath: canonicalPath, fd, identity: { dev: descriptorStat.dev, ino: descriptorStat.ino } };
   } catch {
     return null;
@@ -439,7 +440,8 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
     const withinRoot = relative(root.physicalPath, physicalPath);
     if (withinRoot === '' || withinRoot === '..' || withinRoot.startsWith(`..${sep}`) || withinRoot.startsWith(sep)) return null;
     pinned = true;
-    created?.push(...localCreated);
+    if (created !== undefined) created.push(...localCreated);
+    else closePinnedDirectoryCreationReceipts(localCreated);
     return { lexicalPath, physicalPath, fd, identity: { dev: descriptorStat.dev, ino: descriptorStat.ino } };
   } catch {
     return null;
