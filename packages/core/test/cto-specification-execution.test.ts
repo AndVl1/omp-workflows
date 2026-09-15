@@ -6060,6 +6060,11 @@ test("valid confirmed proof rejects resume without trusting forged confirmation 
     assert.equal(confirmed.status, "confirmed", detail(confirmed));
     const mappingPath = join(root, ".work-state", "cto", RUN_ID, "specification-mappings", `${String(frozen.mapping_id)}.json`);
     const beforeMapping = readFileSync(mappingPath, "utf8");
+    const confirmedRecord = JSON.parse(beforeMapping) as Json;
+    const proofPath = ctoMappingConfirmationProofRelativePath(RUN_ID, String(frozen.mapping_id), String(confirmedRecord.confirmation_proof_ref));
+    assert.ok(proofPath, "valid confirmed mapping must expose a safe proof path");
+    if (!proofPath) return;
+    const beforeProof = readFileSync(join(root, proofPath), "utf8");
     const transactionDir = join(root, ".work-state", "cto", RUN_ID, "specification-mapping-transactions");
     mkdirSync(transactionDir, { recursive: true });
     for (const [transactionId, mappingId] of [["forged-confirm-same", String(frozen.mapping_id)], ["forged-confirm-unrelated", "forged-unrelated-mapping"]] as const) {
@@ -6081,6 +6086,7 @@ test("valid confirmed proof rejects resume without trusting forged confirmation 
     assert.equal(rejected.status, "blocked", detail(rejected));
     assert.match(detail(rejected), /valid durable proof|takeover/i);
     assert.equal(readFileSync(mappingPath, "utf8"), beforeMapping, "valid confirmed mapping bytes must remain unchanged");
+    assert.equal(readFileSync(join(root, proofPath), "utf8"), beforeProof, "forged WALs must not mutate a valid confirmation proof sidecar");
     assert.equal(readdirSync(transactionDir).filter((name) => name.endsWith(".json")).length, 0, "forged WALs must not remain replayable");
     const quarantineDir = join(root, ".work-state", "cto", RUN_ID, "specification-mapping-quarantine");
     assert.equal(readdirSync(quarantineDir).filter((name) => name.endsWith("-confirm-invalid.json")).length, 2, "same and unrelated forged WALs must be archived");
