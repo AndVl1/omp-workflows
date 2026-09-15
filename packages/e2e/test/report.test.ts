@@ -1815,3 +1815,33 @@ test('report: concurrent reporter cannot restore stale output over committed out
     rmSync(mdDir, { recursive: true, force: true });
   }
 });
+
+
+test('report: locked destination descriptor rejects pre-inner-pin lexical swap', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-preinner-swap-'));
+  const moved = `${mdDir}.moved`;
+  const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-md-preinner-outside-'));
+  const reportPath = join(dir, '.work-state', 'ux-e2e', 'report.json');
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeTargetOpen(path) {
+      if (swapped || path !== reportPath) return;
+      swapped = true;
+      renameSync(mdDir, moved);
+      symlinkSync(outside, mdDir, 'dir');
+    },
+  });
+  try {
+    assert.throws(() => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }), /report destination|failed to write markdown|evidence destination changed/u);
+    assert.equal(swapped, true);
+    assert.equal(readdirSync(outside).length, 0, 'replacement destination receives no report');
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    unlinkSync(mdDir);
+    renameSync(moved, mdDir);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
