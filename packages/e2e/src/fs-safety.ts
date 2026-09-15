@@ -11,6 +11,7 @@ import {
   readSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   statSync,
   unlinkSync,
   writeSync,
@@ -967,6 +968,23 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
   }
 }
 
+/** Remove an empty child directory through the retained parent descriptor. */
+export function removePinnedDirectoryIfEmpty(root: PinnedDirectory, components: readonly string[]): boolean {
+  if (components.length === 0 || components.some(component => !safeName(component)) || !pinnedDirectoryIsStable(root)) return false;
+  const relativePath = components.join(sep);
+  if (process.platform === 'darwin') {
+    return runDarwinHelper(root, 'remove_empty', { name: relativePath })?.removed === true;
+  }
+  const descriptorRoot = descriptorPathFor(root.fd);
+  if (descriptorRoot === null) return false;
+  try {
+    rmdirSync(join(descriptorRoot, ...components));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function sourceHasNoSymlinkAncestors(root: string, source: string): boolean {
   const rel = relative(root, source);
   if (rel.length === 0 || rel === '..' || rel.startsWith(`..${sep}`)) return false;
@@ -1456,6 +1474,11 @@ try:
     elif op == "read_file": result = {"ok": True, **read_file(payload.get("name"), payload.get("max_bytes"), payload.get("tail_bytes"))}
     elif op == "read_evidence": result = {"ok": True, **read_evidence(payload.get("path"), payload.get("max_bytes"))}
     elif op == "unlink_file": unlink_file(payload.get("name")); result = {"ok": True}
+    elif op == "remove_empty":
+        name = payload.get("name")
+        if not isinstance(name, str) or not name or any((not piece or piece in (".", "..") or "/" in piece or "\\" in piece or "\x00" in piece) for piece in name.split("/")): fail("directory path is invalid")
+        try: os.rmdir(name, dir_fd=3); result = {"ok": True, "removed": True}
+        except FileNotFoundError: result = {"ok": True, "removed": False}
     elif op == "lock_acquire":
         lease = lock_acquire(payload.get("name"), payload.get("owner_pid"), payload.get("owner_start"))
         result = {"ok": lease is not None, **(lease or {})}

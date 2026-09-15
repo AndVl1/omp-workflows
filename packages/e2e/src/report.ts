@@ -35,6 +35,7 @@ import {
   readPinnedEvidence,
   readPinnedFile,
   readPinnedFileFull,
+  removePinnedDirectoryIfEmpty,
   setFsSafetyTestHooks,
   writePinnedFile,
   withPinnedExclusiveLock,
@@ -563,7 +564,7 @@ export function setEvidenceCopyTestHooks(hooks: EvidenceCopyTestHooks | null): v
   reportTestHooks = hooks;
   setFsSafetyTestHooks(hooks);
 }
-function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir: string, maxBytes = MAX_EVIDENCE_BYTES, retainedSourceRoot?: PinnedDirectory, created?: Map<string, Buffer>, createdRoots?: Map<string, PinnedDirectory>, retainedTargetRoot?: PinnedDirectory, retainedDestinationRoots?: Set<PinnedDirectory>): string[] {
+function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir: string, maxBytes = MAX_EVIDENCE_BYTES, retainedSourceRoot?: PinnedDirectory, created?: Map<string, Buffer>, createdRoots?: Map<string, PinnedDirectory>, createdParents?: Map<PinnedDirectory, PinnedDirectory>, retainedTargetRoot?: PinnedDirectory, retainedDestinationRoots?: Set<PinnedDirectory>): string[] {
   notifyBeforeSourcePin(scratchDir);
   const sourceRoot = retainedSourceRoot ?? pinDirectory(scratchDir);
   const ownsSourceRoot = retainedSourceRoot === undefined;
@@ -596,6 +597,9 @@ function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir
         ? targetRoot
         : pinChildDirectory(targetRoot, directories);
       if (destinationRoot === null) continue;
+      if (createdParents !== undefined && destinationRoot !== targetRoot) {
+        createdParents.set(destinationRoot, { root: targetRoot, components: directories });
+      }
       const destinationDir = destinationRoot.lexicalPath;
       const ownsDestinationRoot = destinationRoot !== targetRoot;
       let retainDestinationRoot = false;
@@ -1502,6 +1506,7 @@ function generateSingleReport(
   let reportDestination: PinnedDirectory | null = null;
   const createdEvidence = new Map<string, Buffer>();
   const createdEvidenceRoots = new Map<string, PinnedDirectory>();
+  const createdEvidenceParents = new Map<PinnedDirectory, { readonly root: PinnedDirectory; readonly components: readonly string[] }>();
   const retainedEvidenceRoots: PinnedDirectory[] = [];
   const retainedEvidenceDestinationRoots = new Set<PinnedDirectory>();
   const rollbackEvidence = (): void => {
@@ -1514,6 +1519,11 @@ function generateSingleReport(
       const parent = pinDirectory(dirname(path));
       if (parent === null) continue;
       try { unlinkPinnedFileIfExact(parent, basename(path), bytes, { requireStable: false }); } finally { closePinnedDirectory(parent); }
+    }
+    const roots = [...new Set(createdEvidenceParents.keys())].sort((left, right) => right.lexicalPath.length - left.lexicalPath.length);
+    for (const child of roots) {
+      const parent = createdEvidenceParents.get(child);
+      if (parent !== undefined) removePinnedDirectoryIfEmpty(parent.root, parent.components);
     }
   };
   try {
@@ -1634,7 +1644,7 @@ function generateSingleReport(
           : pinOrCreateDirectory(evidenceTarget));
       if (evidenceTargetRoot === null) throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
       retainedEvidenceRoots.push(evidenceTargetRoot);
-      evidence = copyEvidence(evidence, evidenceTargetRoot.lexicalPath, scratchDir, MAX_EVIDENCE_BYTES, scratchRoot, createdEvidence, createdEvidenceRoots, evidenceTargetRoot, retainedEvidenceDestinationRoots);
+      evidence = copyEvidence(evidence, evidenceTargetRoot.lexicalPath, scratchDir, MAX_EVIDENCE_BYTES, scratchRoot, createdEvidence, createdEvidenceRoots, createdEvidenceParents, evidenceTargetRoot, retainedEvidenceDestinationRoots);
     }
     if ([...retainedEvidenceDestinationRoots].some(root => !pinnedDirectoryIsStable(root))) throw new Error('ux-e2e: evidence destination changed before report output');
     const report = sanitizeOutput({
@@ -2116,6 +2126,7 @@ function generateSuiteReport(
   }
   const copiedEvidence = new Map<string, Buffer>();
   const copiedEvidenceRoots = new Map<string, PinnedDirectory>();
+  const copiedEvidenceParents = new Map<PinnedDirectory, { readonly root: PinnedDirectory; readonly components: readonly string[] }>();
   const retainedEvidenceRoots: PinnedDirectory[] = [];
   const retainedEvidenceDestinationRoots = new Set<PinnedDirectory>();
   const rollbackCopiedEvidence = (): void => {
@@ -2128,6 +2139,11 @@ function generateSuiteReport(
       const parent = pinDirectory(dirname(path));
       if (parent === null) continue;
       try { unlinkPinnedFileIfExact(parent, basename(path), bytes, { requireStable: false }); } finally { closePinnedDirectory(parent); }
+    }
+    const roots = [...new Set(copiedEvidenceParents.keys())].sort((left, right) => right.lexicalPath.length - left.lexicalPath.length);
+    for (const child of roots) {
+      const parent = copiedEvidenceParents.get(child);
+      if (parent !== undefined) removePinnedDirectoryIfEmpty(parent.root, parent.components);
     }
   };
   try {
@@ -2157,7 +2173,7 @@ function generateSuiteReport(
         : pinOrCreateDirectory(join(mdDir, 'evidence', child.name));
       if (targetRoot === null) throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
       retainedEvidenceRoots.push(targetRoot);
-      childEvidence = copyEvidence(result.report.evidence, targetRoot.lexicalPath, child.scratchDir, MAX_SUITE_EVIDENCE_BYTES - aggregateEvidenceBytes, child.root, copiedEvidence, copiedEvidenceRoots, targetRoot, retainedEvidenceDestinationRoots);
+      childEvidence = copyEvidence(result.report.evidence, targetRoot.lexicalPath, child.scratchDir, MAX_SUITE_EVIDENCE_BYTES - aggregateEvidenceBytes, child.root, copiedEvidence, copiedEvidenceRoots, copiedEvidenceParents, targetRoot, retainedEvidenceDestinationRoots);
     } else {
       childEvidence = [...result.report.evidence];
     }
