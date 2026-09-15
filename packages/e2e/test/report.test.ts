@@ -873,6 +873,7 @@ test('report: final directory identity is rechecked after the helper walk', () =
   const targetDir = join(mdDir, 'evidence', 'my-feature');
   // Keep the final component present so the test can perform the same replacement
   // on every platform before the retained descriptor identity check.
+  mkdirSync(targetDir, { recursive: true });
   const movedTargetDir = `${targetDir}.moved`;
   let swapped = false;
   setEvidenceCopyTestHooks({
