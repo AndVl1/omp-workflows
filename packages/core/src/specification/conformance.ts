@@ -5180,6 +5180,10 @@ export function persistCtoSpecificationConformance(
     return result;
   }
   const finish = (result: PersistedCtoSpecificationConformanceResult): PersistedCtoSpecificationConformanceResult => {
+    // A blocked preflight has not published a conformance artifact/state
+    // postimage; preserve its domain-specific authority finding rather than
+    // replacing it with a secondary terminal-team selector diagnostic.
+    if (result.status === "blocked" && !result.persisted) return result;
     try {
       assertCtoRuntimeAccessFacadeLive(options.runtimeAccess, pinnedRoot.canonical_root, options.sessionId);
       if (authority) {

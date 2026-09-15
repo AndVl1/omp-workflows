@@ -3323,8 +3323,8 @@ export function recoverCtoSpecificationMappingTransactions(
   root: string,
   ctoRunId: string,
   pinnedRoot: PinnedProjectRoot,
-): CtoSpecificationMappingTransaction[] {
-  return recoverPendingMappingTransactions(root, ctoRunId, pinnedRoot);
+): void {
+  recoverPendingMappingTransactions(root, ctoRunId, pinnedRoot);
 }
 
 function recoverPendingMappingTransactions(root: string, ctoRunId: string, pinnedRoot: PinnedProjectRoot): CtoSpecificationMappingTransaction[] {
