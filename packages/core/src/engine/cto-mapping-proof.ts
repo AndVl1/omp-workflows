@@ -51,7 +51,8 @@ export type CtoMappingConfirmationProof = {
   proof_hmac: string;
 };
 
-type UnsignedProof = Omit<CtoMappingConfirmationProof, "proof_hmac">;
+export type CtoMappingConfirmationProofPayload = Omit<CtoMappingConfirmationProof, "proof_hmac">;
+type UnsignedProof = CtoMappingConfirmationProofPayload;
 
 export type CtoMappingConfirmationProofReadResult =
   | { ok: true; proof: CtoMappingConfirmationProof; content: string }
@@ -78,7 +79,7 @@ function text(value: unknown, max = MAX_TEXT_BYTES): value is string {
 }
 
 function segment(value: unknown): value is string {
-  return typeof value === "string" && SAFE_SEGMENT.test(value);
+  return typeof value === "string" && value !== "." && value !== ".." && SAFE_SEGMENT.test(value);
 }
 
 function relativePath(value: unknown): value is string {
@@ -118,7 +119,7 @@ function answerShape(value: unknown): value is CtoMappingConfirmationProofAnswer
   return true;
 }
 
-function proofShape(value: unknown): value is CtoMappingConfirmationProof {
+function proofShape(value: unknown, allowUnsigned = false): value is CtoMappingConfirmationProof {
   if (!plain(value)
     || !exactKeys(value, ["schema_version", "root_identity", "cto_run_id", "mapping_id", "mapping_hash", "mapping_version", "proof_ref", "mapping_record_path", "mapping_record_digest", "state_path", "state_after_digest", "checkpoint_ref", "trusted_answer_ref", "confirmation_context", "confirmed_at", "trusted_answer", "proof_hmac"])
     || value.schema_version !== SCHEMA_VERSION
@@ -149,7 +150,7 @@ function proofShape(value: unknown): value is CtoMappingConfirmationProof {
     || !isSha256Hex(value.confirmation_context.policy_hash)
     || !text(value.confirmed_at)
     || !answerShape(value.trusted_answer)
-    || !SAFE_PROOF.test(String(value.proof_hmac))) return false;
+    || (allowUnsigned ? value.proof_hmac !== "" && !SAFE_PROOF.test(String(value.proof_hmac)) : !SAFE_PROOF.test(String(value.proof_hmac)))) return false;
   return true;
 }
 
@@ -167,7 +168,9 @@ function proofHmac(pinnedRoot: PinnedProjectRoot, payload: UnsignedProof): strin
 
 export function ctoMappingConfirmationProofRelativePath(ctoRunId: string, mappingId: string, proofRef: string): string | null {
   if (!segment(ctoRunId) || !segment(mappingId) || !segment(proofRef)) return null;
-  return join(PROOF_DIRECTORY, ctoRunId, "artifacts", "mapping-confirmation-proofs", mappingId, `${proofRef}.json`);
+  const directory = join(PROOF_DIRECTORY, ctoRunId, "artifacts", "mapping-confirmation-proofs", mappingId);
+  const path = join(directory, `${proofRef}.json`);
+  return path.startsWith(`${directory}/`) ? path : null;
 }
 
 export function signCtoMappingConfirmationProof(
@@ -175,7 +178,7 @@ export function signCtoMappingConfirmationProof(
   payload: UnsignedProof,
 ): CtoMappingConfirmationProof | null {
   const proof = { ...payload, proof_hmac: "" } as CtoMappingConfirmationProof;
-  if (!proofShape(proof)) return null;
+  if (!proofShape(proof, true)) return null;
   const signature = proofHmac(pinnedRoot, payload);
   return signature ? { ...proof, proof_hmac: signature } : null;
 }
