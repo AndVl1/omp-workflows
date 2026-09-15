@@ -1954,7 +1954,7 @@ test('report: post-pin intermediate symlink swap leaves outside untouched and ro
   }
   assert.equal(swapped, true);
   assert.deepEqual(readdirSync(outside), ['outside-sentinel']);
-  assert.equal(readdirSync(join(intermediate, 'feature-a', 'nested')).length, 0, 'generated evidence bytes are rolled back');
+  assert.equal(readdirSync(intermediate).length, 0, 'generated evidence bytes are rolled back');
   assert.equal(existsSync(join(dir, '.work-state', 'ux-e2e', 'report.json')), false);
   rmSync(dir, { recursive: true, force: true });
   rmSync(mdDir, { recursive: true, force: true });
