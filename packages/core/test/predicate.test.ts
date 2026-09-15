@@ -15,7 +15,8 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadAllProfiles, loadProfile } from "../src/engine/profile.js";
-import { parseExpression, evaluatePredicate, validateProfileExpressions, deepEqual } from "../src/engine/predicate.js";
+import { parseExpression, evaluatePredicate, validateProfileExpressions, deepEqual, type PredicateContext } from "../src/engine/predicate.js";
+import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TeamState } from "../src/engine/types.js";
 
@@ -38,6 +39,25 @@ function state(overrides: Partial<TeamState> = {}): TeamState {
     updated_at: new Date().toISOString(),
     ...overrides,
   };
+}
+
+function evaluatePinned(
+  expression: string,
+  root: string,
+  artifactsDir: string,
+  context: Omit<PredicateContext, "artifactsDir" | "pinnedRoot" | "artifactsDirRelative">,
+): ReturnType<typeof evaluatePredicate> {
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  assert.ok(pinnedRoot, "predicate fixture root must be pinnable");
+  if (!pinnedRoot) return { ok: false, error: "predicate fixture root cannot be pinned" };
+  try {
+    const artifactsDirRelative = pinnedRoot.relativePath(artifactsDir);
+    assert.equal(artifactsDirRelative, "artifacts", "predicate fixture artifacts must be root-relative");
+    if (artifactsDirRelative === null) return { ok: false, error: "predicate artifacts escaped the pinned root" };
+    return evaluatePredicate(expression, { ...context, artifactsDir, pinnedRoot, artifactsDirRelative });
+  } finally {
+    pinnedRoot.close();
+  }
 }
 
 test("predicate: every shipped gate/skip_if/until/conditional expression parses", () => {
@@ -109,13 +129,13 @@ test("predicate: review_fixes artifact skip_if (review.findings == []) skips whe
     const stage = { id: "review_fixes", title: "Fixes", type: "single" as const, role: "dev", consumes: ["review"] };
     writeFileSync(join(artifactsDir, "review.json"), JSON.stringify({ verdict: "approve", findings: [] }));
     assert.deepEqual(
-      evaluatePredicate("review.findings == []", { flags: FLAGS, artifactsDir, state: state(), stage }),
+      evaluatePinned("review.findings == []", root, artifactsDir, { flags: FLAGS, state: state(), stage }),
       { ok: true, value: true },
       "empty findings must skip review_fixes",
     );
     writeFileSync(join(artifactsDir, "review.json"), JSON.stringify({ verdict: "needs_changes", findings: [{ title: "x", severity: "HIGH", confidence: 90, zone: "backend-kotlin" }] }));
     assert.deepEqual(
-      evaluatePredicate("review.findings == []", { flags: FLAGS, artifactsDir, state: state(), stage }),
+      evaluatePinned("review.findings == []", root, artifactsDir, { flags: FLAGS, state: state(), stage }),
       { ok: true, value: false },
       "non-empty findings must not skip",
     );
@@ -135,13 +155,13 @@ test("predicate: debug-cycle loop until (verdict == PASS) resolves the implicit 
     assert.ok(verify?.loop);
     writeFileSync(join(artifactsDir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 1 }));
     assert.deepEqual(
-      evaluatePredicate(verify!.loop!.until, { flags: FLAGS, artifactsDir, state: state(), stage: verify! }),
+      evaluatePinned(verify!.loop!.until, root, artifactsDir, { flags: FLAGS, state: state(), stage: verify! }),
       { ok: true, value: false },
       "FAIL verdict keeps the loop running",
     );
     writeFileSync(join(artifactsDir, "debug.json"), JSON.stringify({ verdict: "PASS", iterations: 2 }));
     assert.deepEqual(
-      evaluatePredicate(verify!.loop!.until, { flags: FLAGS, artifactsDir, state: state(), stage: verify! }),
+      evaluatePinned(verify!.loop!.until, root, artifactsDir, { flags: FLAGS, state: state(), stage: verify! }),
       { ok: true, value: true },
       "PASS verdict exits the loop",
     );
