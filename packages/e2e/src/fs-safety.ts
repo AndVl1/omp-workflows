@@ -724,7 +724,7 @@ function recoverStaleLock(root: PinnedDirectory, name: string): boolean {
     if (!sameIdentity(before, after) || after.size !== before.size || !pinnedDirectoryIsStable(root)) return false;
     const pathStat = lstatSync(join(root.lexicalPath, name));
     if (pathStat.isSymbolicLink() || !sameIdentity(pathStat, before)) return false;
-    return unlinkPinnedFile(root, name);
+    return unlinkPinnedFileIfExact(root, name, bytes);
   } catch {
     return false;
   } finally {
@@ -797,7 +797,12 @@ function acquirePinnedExclusiveLock(
     if (written !== marker.length) throw new Error('short lock marker write');
     fsyncSync(fd);
     const info = fstatSync(fd);
-    if (!info.isFile() || info.nlink !== 1 || !sameIdentity(info, lockIdentity) || !pinnedDirectoryIsStable(root)) {
+    const boundMarker = readPinnedFileFull(root, name, marker.length);
+    const pathStat = lstatSync(join(root.lexicalPath, name));
+    if (!info.isFile() || info.nlink !== 1 || !sameIdentity(info, lockIdentity)
+      || boundMarker === null || !boundMarker.equals(marker)
+      || pathStat.isSymbolicLink() || !sameIdentity(pathStat, info)
+      || !pinnedDirectoryIsStable(root)) {
       throw new Error('lock file changed during acquisition');
     }
   } catch (error) {
