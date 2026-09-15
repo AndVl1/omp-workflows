@@ -239,7 +239,7 @@ const descriptorPreimages = new WeakMap<PinnedRootWriteDescriptor, PinnedRootWri
 const DARWIN_PYTHON_CANDIDATES = ["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"] as const;
 const DARWIN_HELPER_MAX_OUTPUT = 24 * 1024 * 1024;
 /** Synchronous helper operations have one total deadline, including startup. */
-const DARWIN_HELPER_TIMEOUT_MS = 4_500;
+const DARWIN_HELPER_TIMEOUT_MS = 4_000;
 // Large framed writes must allow the complete bounded payload to cross the
 // synchronous FIFOs on slower Darwin hosts. Keep the allowance finite and
 // derive it from the validated frame size below; ordinary helper calls retain
