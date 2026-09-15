@@ -39,10 +39,10 @@ import { captureWorkspacePathBinding, workspacePathBindingDigest } from "./works
 import { readPinnedCurrentConstitution } from "./constitution-identities.js";
 import { PinnedProjectRoot, PinnedRootError, processStartIdentity, type PinnedRootFileExpectation, type PinnedRootWriteReceipt } from "./pinned-root.js";
 import type { CheckpointAnswerProof, TeamState } from "../engine/types.js";
-import { trustedCheckpointAnswerError } from "../engine/checkpoints.js";
+import { checkpointPolicyHash, trustedCheckpointAnswerError } from "../engine/checkpoints.js";
 import { MAX_PERSISTED_STATE_BYTES, normalizePersistedState, parseBoundedPersistedState, rollbackStateMutationReceipts, updateStateAtomically, type StateMutationReceipt, type StateSnapshot } from "../engine/state.js";
 import { readArtifactPinned } from "../engine/artifacts.js";
-import { ctoMappingConfirmationStateDigest, readCtoMappingConfirmationProof, type CtoMappingConfirmationProofAnswer, type CtoMappingConfirmationProofPayload } from "../engine/cto-mapping-proof.js";
+import { readCtoMappingConfirmationProof, type CtoMappingConfirmationProofAnswer, type CtoMappingConfirmationProofPayload } from "../engine/cto-mapping-proof.js";
 
 export type ExecutionClaimResultCode =
   | "SPEC_HANDOFF_NOT_READY"
@@ -1603,12 +1603,6 @@ function verifyClaimAdmissionBinding(
         : { expected_state_revision: admission.confirmation_state_revision },
     );
   if (!anchorStateResult.ok) return anchorStateResult.error;
-  if (verificationMode !== "terminal" && admission.confirmation_state_revision !== anchorStateResult.state_revision) {
-    return "confirmation anchor state revision changed before claim admission";
-  }
-  if (verificationMode !== "terminal" && admission.confirmation_state_digest !== anchorStateResult.state_digest) {
-    return "confirmation anchor state bytes changed before claim admission";
-  }
   const anchorState = anchorStateResult.state;
   if (admission.confirmation_ledger_digest !== anchorStateResult.ledger_digest) {
     return "confirmation anchor trusted-answer ledger changed before claim admission";
@@ -1619,6 +1613,9 @@ function verifyClaimAdmissionBinding(
   }
   const policy = anchorState.checkpoint_policy;
   if (!policy) return "confirmation anchor checkpoint policy is missing before claim admission";
+  if (checkpointPolicyHash(policy) !== admission.policy_hash) return "confirmation anchor checkpoint policy hash changed before claim admission";
+  const policyRule = policy.rules[admission.checkpoint_ref];
+  if (!policyRule || !policyRule.allowed_decisions.includes("approve_continue")) return "confirmation anchor checkpoint policy rule is unavailable or does not allow approval";
   const answer = anchorState.trusted_checkpoint_answers?.find((candidate) => candidate.answer_id === admission.trusted_answer_ref);
   if (!answer) return "confirmation anchor trusted answer is missing before claim admission";
   const confirmationContext = parsed.confirmation_context;
@@ -1690,9 +1687,6 @@ function verifyClaimAdmissionBinding(
   if (!durableProof.ok) return durableProof.code === "absent"
     ? "canonical mapping confirmation proof is absent; recovery is required"
     : `canonical mapping confirmation proof is invalid: ${durableProof.error}`;
-  if (verificationMode !== "terminal" && ctoMappingConfirmationStateDigest(anchorState) !== confirmationStateAfterDigest) {
-    return "confirmation anchor logical state changed before active claim admission";
-  }
   const proof: CheckpointAnswerProof = {
     answer_id: answer.answer_id,
     nonce: answer.nonce,
@@ -1711,7 +1705,7 @@ function verifyClaimAdmissionBinding(
     capability_id: admission.capability_id,
     capability_epoch: admission.capability_epoch,
     policy_hash: admission.policy_hash,
-    bind_active_context: verificationMode !== "terminal",
+    bind_active_context: false,
   });
   if (proofError) return `confirmation anchor proof changed before claim admission: ${proofError}`;
   const authorizationDigest = executionClaimAuthorizationProjectionDigest({
