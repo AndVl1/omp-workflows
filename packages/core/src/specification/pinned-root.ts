@@ -4110,7 +4110,7 @@ def main():
 main()
 `;const MAX_RELATIVE_PATH_LENGTH = 4096;const MAX_RELATIVE_PATH_SEGMENTS = 128;const MAX_BATCH_ROLLBACK_BYTES = 8 * 1024 * 1024;const DEFAULT_DIRECTORY_MAX_ENTRIES = 16384;const DEFAULT_DIRECTORY_MAX_NAME_BYTES = 4 * 1024 * 1024;type ConditionalOperation = "replace" | "remove";function darwinHelperTransferTimeout(operation: string, baseTimeoutMs: number, requestBytes: number): number {
 if (!DARWIN_HELPER_TRANSFER_OPERATIONS.has(operation) || requestBytes <= DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) return baseTimeoutMs;
-const transferMs = Math.ceil((requestBytes - DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) / DARWIN_HELPER_TRANSFER_BYTES_PER_MS);
+const transferMs = Math.ceil((requestBytes - DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) / DARWIN_HELPER_TRANSFER_BYTES_PER_MS) + 500;
 return baseTimeoutMs + Math.min(DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS, transferMs);}function errnoCode(error: unknown): string | undefined {
 return error && typeof error === "object" && "code" in error
 ? String((error as NodeJS.ErrnoException).code)
