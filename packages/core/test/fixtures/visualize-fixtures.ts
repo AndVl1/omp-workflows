@@ -363,6 +363,9 @@ export function ctoStateJson(opts: {
     integration: { status: opts.integrationStatus ?? "pending", note: "integration review pending" },
     pause: { kind: "none", reason: "" },
     updated_at: opts.updatedAt,
+    // Canonical schema-2 readers require an explicit wave authority record;
+    // an empty history denotes a run that has not entered a wave yet.
+    wave_history: [],
   };
   return JSON.stringify(state, null, 2);
 }
