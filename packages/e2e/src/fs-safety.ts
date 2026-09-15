@@ -291,10 +291,8 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
       if (!pathHasNoSymlinkAncestors(canonicalPath)) return null;
       fd = openSync(canonicalPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
       const opened = fstatSync(fd);
-      const descriptor = runDarwinHelper({ lexicalPath, physicalPath: canonicalPath, fd, identity: { dev: opened.dev, ino: opened.ino } }, 'descriptor_path');
-      if (typeof descriptor?.path !== 'string' || typeof descriptor.dev !== 'number' || typeof descriptor.ino !== 'number'
-        || descriptor.dev !== opened.dev || descriptor.ino !== opened.ino) return null;
-      descriptorPhysicalPath = descriptor.path;
+      if (!opened.isDirectory()) return null;
+      descriptorPhysicalPath = realpathSync(canonicalPath);
     } else {
       let parentFd = root.fd;
       let parentPath = descriptorRoot;
