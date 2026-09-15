@@ -61,57 +61,66 @@ function safeCaptureBinding(
   }
 }
 
-function interceptSessionStart(
+type HostOn = (event: unknown, handler: unknown, ...rest: unknown[]) => unknown;
+
+function installSessionStartInterceptor(
   pi: Parameters<typeof registerTeamWorkflow>[0],
   capture: (context: unknown) => void,
-): Parameters<typeof registerTeamWorkflow>[0] {
+): () => void {
   const target = pi as object;
-  return new Proxy(target, {
-    get(current, property, receiver) {
-      if (property !== "on") return Reflect.get(current, property, receiver);
-      const original = Reflect.get(current, property, receiver);
-      if (typeof original !== "function") return original;
-      return (event: unknown, handler: unknown, ...rest: unknown[]) => {
-        if (event !== "session_start" || typeof handler !== "function") {
-          return Reflect.apply(original, receiver, [event, handler, ...rest]);
-        }
-        const wrappedHandler = function (this: unknown, ...args: unknown[]): unknown {
-          const context = args[1];
-          let result: unknown;
-          try {
-            result = Reflect.apply(handler, this, args);
-          } catch (error) {
-            capture(context);
-            throw error;
-          }
-          if (result !== null && (typeof result === "object" || typeof result === "function")) {
-            let then: unknown;
-            try {
-              then = (result as { then?: unknown }).then;
-            } catch (error) {
-              capture(context);
-              throw error;
-            }
-            if (typeof then === "function") {
-              return Promise.resolve(result).then(
-                (value) => {
-                  capture(context);
-                  return value;
-                },
-                (error) => {
-                  capture(context);
-                  throw error;
-                },
-              );
-            }
-          }
+  const descriptor = Object.getOwnPropertyDescriptor(target, "on");
+  const originalOn = Reflect.get(target, "on") as unknown;
+  if (typeof originalOn !== "function") return () => undefined;
+  const wrappedOn: HostOn = function (this: unknown, event: unknown, handler: unknown, ...rest: unknown[]): unknown {
+    if (event !== "session_start" || typeof handler !== "function") {
+      return Reflect.apply(originalOn, this, [event, handler, ...rest]);
+    }
+    const wrappedHandler = function (this: unknown, ...args: unknown[]): unknown {
+      const context = args[1];
+      let result: unknown;
+      try {
+        result = Reflect.apply(handler, this, args);
+      } catch (error) {
+        capture(context);
+        throw error;
+      }
+      if (result !== null && (typeof result === "object" || typeof result === "function")) {
+        let then: unknown;
+        try {
+          then = (result as { then?: unknown }).then;
+        } catch {
           capture(context);
           return result;
-        };
-        return Reflect.apply(original, receiver, [event, wrappedHandler, ...rest]);
-      };
-    },
-  }) as Parameters<typeof registerTeamWorkflow>[0];
+        }
+        if (typeof then === "function") {
+          return Promise.resolve(result).then(
+            (value) => {
+              capture(context);
+              return value;
+            },
+            (error) => {
+              capture(context);
+              throw error;
+            },
+          );
+        }
+      }
+      capture(context);
+      return result;
+    };
+    return Reflect.apply(originalOn, this, [event, wrappedHandler, ...rest]);
+  };
+  Object.defineProperty(target, "on", {
+    ...(descriptor ?? {}),
+    configurable: descriptor?.configurable ?? true,
+    enumerable: descriptor?.enumerable ?? true,
+    writable: true,
+    value: wrappedOn,
+  });
+  return () => {
+    if (descriptor) Object.defineProperty(target, "on", descriptor);
+    else delete (target as { on?: unknown }).on;
+  };
 }
 
 /** Release exact mounted test-session runtime capabilities before registry fixtures close. */
@@ -178,9 +187,9 @@ export function registerTestTeamWorkflow(
   writeTestRegistryMarker(root);
   const registration = openTestRegistry(root, ["workflow_profiles", "constitution_gate", "runtime_config"], ownerId, ["workflow_registration", "config_writer"]);
   let controller: TeamSessionBindingController | undefined;
+  const restoreOn = installSessionStartInterceptor(pi, (context) => safeCaptureBinding(root, controller, context));
   try {
-    const interceptedPi = interceptSessionStart(pi, (context) => safeCaptureBinding(root, controller, context));
-    const installGate = registerTeamWorkflow(interceptedPi, {
+    const installGate = registerTeamWorkflow(pi, {
       ...options,
       cwd: root,
       owner: () => registration.owner,
@@ -196,6 +205,8 @@ export function registerTestTeamWorkflow(
   } catch (error) {
     try { registration.finish(false); } catch { /* preserve original */ }
     throw error;
+  } finally {
+    restoreOn();
   }
 }
 
