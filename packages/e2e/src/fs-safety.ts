@@ -1328,7 +1328,7 @@ def lock_acquire(name, owner_pid, owner_start):
             return None
     nonce = secrets.token_hex(16)
     digest = lock_digest(owner_pid, nonce, owner_start)
-    marker = ("%d:%s:%s:%s\\n" % (owner_pid, nonce, owner_start, digest)).encode("utf-8")
+    marker = ("%d:%s:%s:%s\n" % (owner_pid, nonce, owner_start, digest)).encode("utf-8")
     try:
         os.write(fd, marker)
         os.fsync(fd)
