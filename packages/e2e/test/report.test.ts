@@ -954,7 +954,7 @@ test('report suite: malformed dead-owner lock file is reclaimed by acquisition',
   const child = makeSessionDir();
   renameSync(child, join(suite, 'session-a'));
   const lockPath = join(suite, '.omp-ux-e2e-report.lock');
-  writeFileSync(lockPath, '999999:malformed-lock-marker\n');
+  writeFileSync(lockPath, '999999999:malformed-lock-marker\n');
   try {
     const result = generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' });
     assert.ok(existsSync(result.jsonPath));
