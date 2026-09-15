@@ -2132,7 +2132,7 @@ export function generateReport(
   const runLocked = (index: number): GenerateReportResult => {
     const root = targets[index];
     if (root === undefined) return execute();
-    return withPinnedExclusiveLock(root, REPORT_LOCK_NAME, REPORT_LOCK_TIMEOUT_MS, () => runLocked(index + 1));
+    return withPinnedExclusiveLock(root, REPORT_LOCK_NAME, () => runLocked(index + 1), REPORT_LOCK_TIMEOUT_MS);
   };
   try {
     return runLocked(0);
