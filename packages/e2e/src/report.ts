@@ -1434,6 +1434,7 @@ interface InternalGenerateReportOptions extends GenerateReportOptions {
   readonly writeOutputs?: boolean;
   readonly evidenceTargetDir?: string;
   readonly retainedRoot?: PinnedDirectory;
+  readonly retainedReportRoot?: PinnedDirectory;
 }
 
 interface InternalGenerateReportResult extends GenerateReportResult {
@@ -1449,6 +1450,7 @@ function generateSingleReport(
   const scratchDir = resolve(sessionDir);
   const scratchRoot = expectedDiscovery?.root ?? opts.retainedRoot ?? pinDirectory(scratchDir);
   const ownsScratchRoot = expectedDiscovery === undefined && opts.retainedRoot === undefined;
+  const ownsReportDestination = opts.retainedReportRoot === undefined;
   if (scratchRoot === null) throw new Error('ux-e2e: session root must be a stable directory');
   let stateDestination: PinnedDirectory | null = null;
   const createdEvidence = new Map<string, Buffer>();
@@ -1566,7 +1568,7 @@ function generateSingleReport(
     const mdDir = resolve(opts.mdDir ?? join(process.cwd(), 'vibe-report'));
     if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before report output');
     if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before report output');
-    const reportDestination = opts.writeOutputs === false ? null : pinOrCreateDirectory(mdDir);
+    const reportDestination = opts.writeOutputs === false ? null : opts.retainedReportRoot ?? pinOrCreateDirectory(mdDir);
     if (opts.writeOutputs !== false && reportDestination === null) {
       throw new Error('ux-e2e: report destination root must be a stable non-symlink directory');
     }
@@ -1576,7 +1578,9 @@ function generateSingleReport(
       let evidence = collectEvidence(candidates);
     if (opts.copyEvidence === true) {
       const evidenceTarget = opts.evidenceTargetDir ?? join(mdDir, 'evidence', slug);
-      const evidenceTargetRoot = pinOrCreateDirectory(evidenceTarget);
+      const evidenceTargetRoot = opts.retainedReportRoot !== undefined && opts.evidenceTargetDir === undefined
+        ? pinChildDirectory(opts.retainedReportRoot, ['evidence', slug])
+        : pinOrCreateDirectory(evidenceTarget);
       if (evidenceTargetRoot === null) throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
       retainedEvidenceRoots.push(evidenceTargetRoot);
       evidence = copyEvidence(evidence, evidenceTargetRoot.lexicalPath, scratchDir, MAX_EVIDENCE_BYTES, scratchRoot, createdEvidence, createdEvidenceRoots, evidenceTargetRoot, retainedEvidenceDestinationRoots);
@@ -1693,7 +1697,7 @@ function generateSingleReport(
     throw error;
   } finally {
     try {
-      if (reportDestination !== null) closeSync(reportDestination.fd);
+      if (reportDestination !== null && ownsReportDestination) closeSync(reportDestination.fd);
       if (stateDestination !== null) closeSync(stateDestination.fd);
     } catch {
       /* Ignore cleanup failures. */
@@ -1914,10 +1918,12 @@ function writeSuiteReport(
   report: UxE2eReport,
   warnings: readonly string[],
   retainedEvidenceDestinationRoots: Iterable<PinnedDirectory>,
+  retainedReportRoot?: PinnedDirectory,
 ): GenerateReportResult {
   const suiteRootHandle = discovery.root;
   if (!pinnedDirectoryIsStable(suiteRootHandle)) throw new Error('ux-e2e: suite root changed before report output');
-  const reportRoot = pinOrCreateDirectory(mdDir);
+  const reportRoot = retainedReportRoot ?? pinOrCreateDirectory(mdDir);
+  const ownsReportRoot = retainedReportRoot === undefined;
   if (reportRoot === null) throw new Error('ux-e2e: report destination root must be a stable non-symlink directory');
   let stateRoot: PinnedDirectory | null = null;
   let jsonTouched = false;
@@ -1981,7 +1987,7 @@ function writeSuiteReport(
     throw error;
   } finally {
     if (stateRoot !== null) closeSync(stateRoot.fd);
-    closeSync(reportRoot.fd);
+    if (ownsReportRoot) closeSync(reportRoot.fd);
   }
 }
 function generateSuiteReport(
@@ -2033,7 +2039,9 @@ function generateSuiteReport(
     }
     let childEvidence: string[];
     if (opts.copyEvidence === true) {
-      const targetRoot = pinOrCreateDirectory(join(mdDir, 'evidence', child.name));
+      const targetRoot = opts.retainedReportRoot !== undefined && opts.evidenceTargetDir === undefined
+        ? pinChildDirectory(opts.retainedReportRoot, ['evidence', child.name])
+        : pinOrCreateDirectory(join(mdDir, 'evidence', child.name));
       if (targetRoot === null) throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
       retainedEvidenceRoots.push(targetRoot);
       childEvidence = copyEvidence(result.report.evidence, targetRoot.lexicalPath, child.scratchDir, MAX_SUITE_EVIDENCE_BYTES - aggregateEvidenceBytes, child.root, copiedEvidence, copiedEvidenceRoots, targetRoot, retainedEvidenceDestinationRoots);
@@ -2092,7 +2100,7 @@ function generateSuiteReport(
     evidence: aggregateEvidence,
     generated_at: new Date().toISOString(),
   }, '') as UxE2eReport;
-  return writeSuiteReport(suiteRoot, discovery, mdDir, report, warnings, retainedEvidenceDestinationRoots);
+  return writeSuiteReport(suiteRoot, discovery, mdDir, report, warnings, retainedEvidenceDestinationRoots, opts.retainedReportRoot);
   } catch (error) {
     rollbackCopiedEvidence();
     throw error;
@@ -2130,10 +2138,10 @@ export function generateReport(
   const execute = (): GenerateReportResult => {
     try {
       if (discovery.single) {
-        const result = generateSingleReport(suiteRoot, input, opts, discovery);
+        const result = generateSingleReport(suiteRoot, input, { ...opts, retainedReportRoot: externalRoot }, discovery);
         return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings };
       }
-      return generateSuiteReport(suiteRoot, discovery, input, opts);
+      return generateSuiteReport(suiteRoot, discovery, input, { ...opts, retainedReportRoot: externalRoot });
     } finally {
       closeDiscovery();
     }
