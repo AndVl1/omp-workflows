@@ -871,9 +871,8 @@ test('report: final directory identity is rechecked after the helper walk', () =
   const attackerDir = mkdtempSync(join(tmpdir(), 'ux-e2e-report-helper-outside-'));
   writeFileSync(join(attackerDir, 'attacker-sentinel'), 'helper sentinel');
   const targetDir = join(mdDir, 'evidence', 'my-feature');
-  // The Linux walk opens the final component in this seam; keep it present
-  // there so the test can perform the same replacement on both platforms.
-  if (process.platform !== 'darwin') mkdirSync(targetDir, { recursive: true });
+  // Keep the final component present so the test can perform the same replacement
+  // on every platform before the retained descriptor identity check.
   const movedTargetDir = `${targetDir}.moved`;
   let swapped = false;
   setEvidenceCopyTestHooks({
@@ -1701,8 +1700,7 @@ test('report: post-open ancestor replacement is rejected before evidence publish
     },
   });
   try {
-    const result = generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true });
-    assert.ok(existsSync(result.jsonPath));
+    assert.throws(() => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }));
     assert.equal(swapped, true);
     assert.equal(readdirSync(outside).length, 0, 'post-open replacement must not publish outside retained root');
   } finally {
