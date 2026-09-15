@@ -1833,17 +1833,17 @@ function probeSessionMarker(base: string, label: string): SessionMarkerProbe {
   const workStatePath = join(base, '.work-state');
   const workState = existingPath(workStatePath);
   if (workState === null) return { stateInfo: null, sessionInfo: null };
-  if (workState.isSymbolicLink() || !workState.isDirectory) {
+  if (workState.isSymbolicLink || !workState.isDirectory) {
     throw new Error(`ux-e2e: ${label} .work-state must be a real directory`);
   }
   const statePath = join(workStatePath, 'ux-e2e');
   const stateInfo = existingPath(statePath);
   if (stateInfo === null) return { stateInfo: null, sessionInfo: null };
-  if (stateInfo.isSymbolicLink() || !stateInfo.isDirectory) {
+  if (stateInfo.isSymbolicLink || !stateInfo.isDirectory) {
     throw new Error(`ux-e2e: ${label} ux-e2e state directory must be real`);
   }
   const sessionInfo = existingPath(join(statePath, 'session.json'));
-  if (sessionInfo !== null && (sessionInfo.isSymbolicLink() || !sessionInfo.isFile)) {
+  if (sessionInfo !== null && (sessionInfo.isSymbolicLink || !sessionInfo.isFile)) {
     throw new Error(`ux-e2e: ${label} session metadata must be a real file`);
   }
   return { stateInfo, sessionInfo };
