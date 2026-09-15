@@ -1872,7 +1872,13 @@ function discoverSuiteChildren(suiteRoot: string): SuiteDiscovery | null {
   const rootDescriptor = rootSessionInfo !== null
     ? sessionDescriptor(rootSessionPath)
     : null;
+  if (rootSessionInfo !== null && rootDescriptor === null) {
+    throw new Error('ux-e2e: malformed suite root session metadata');
+  }
   const rootSession = rootDescriptor !== null && readSessionMeta(suiteRoot).schema_version === 2;
+  if (rootSessionInfo !== null && !rootSession) {
+    throw new Error('ux-e2e: malformed suite root session metadata');
+  }
   const rootSessionMarker: RootSessionMarker = {
     present: rootSessionInfo !== null,
     valid: rootSession,

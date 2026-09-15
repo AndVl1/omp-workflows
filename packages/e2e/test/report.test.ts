@@ -965,6 +965,27 @@ test('report suite: unreadable child state probe fails closed instead of omittin
 });
 
 
+test('report suite: hardlinked root session metadata is rejected instead of treated as suite', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-hardlinked-root-session-'));
+  const child = makeSessionDir();
+  const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-hardlinked-root-session-outside-'));
+  renameSync(child, join(suite, 'session-a'));
+  mkdirSync(join(suite, '.work-state', 'ux-e2e'), { recursive: true });
+  const outsideSession = join(outside, 'session.json');
+  writeFileSync(outsideSession, readFileSync(join(suite, 'session-a', '.work-state', 'ux-e2e', 'session.json')));
+  linkSync(outsideSession, join(suite, '.work-state', 'ux-e2e', 'session.json'));
+  try {
+    assert.throws(
+      () => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }),
+      /malformed suite root session metadata/u,
+    );
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+
 test('report suite: dangling child state ancestor is rejected instead of omitted', () => {
   const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-dangling-child-state-'));
   const valid = makeSessionDir();
