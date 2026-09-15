@@ -417,7 +417,7 @@ export function checkpointAnswerBinding(answer: AnswerBindingInput): string {
     .digest("hex");
 }
 
-function checkpointWorkIdentityHash(state: TeamState, stageId: string): string {
+export function checkpointWorkIdentityHash(state: TeamState, stageId: string): string {
   const binding = capabilityBinding(state);
   const identity = state.work_identity ?? {
     run_id: expectedRunId(state),

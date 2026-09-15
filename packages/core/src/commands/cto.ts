@@ -60,7 +60,7 @@ import { preflightCtoSpecificationExecution as domainPreflight, preflightCtoSpec
 import type { ExecutionClaim, ExecutionClaimAdmissionBinding, FeatureWorkspace, ImplementationConformanceResult, ImplementationHandoff } from "../specification/types.js";
 import type { CtoSpecificationMapping } from "../cto/types.js";
 import type { CheckpointAnswerProof, CheckpointActor, CompletionEnvelope, TeamState, WorkIdentity } from "../engine/types.js";
-import { consumeTrustedCheckpointAnswer, issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, nativeCheckpointPolicy, trustedCheckpointAnswerError, type TrustedCheckpointRootIdentity } from "../engine/checkpoints.js";
+import { checkpointWorkIdentityHash, consumeTrustedCheckpointAnswer, issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, nativeCheckpointPolicy, trustedCheckpointAnswerError, type TrustedCheckpointRootIdentity } from "../engine/checkpoints.js";
 import { withCtoRunLock, withCtoRunLockAsync } from "../cto/transaction-lock.js";
 import { computeCtoTerminalTeamsDigest, ctoConformanceClaimsDigest, ctoMandatoryQualityGateIssues, ctoMandatoryQualityGateSpecs, ctoMappingExecutionMatchesWave, issueCtoSpecificationConformanceBinding, readCtoSpecificationConformanceReceipt, readCtoSpecificationConformanceAuthority, terminalConformanceEvidenceError, type CtoActiveClaimSummary, type ConformanceEvidence, type CtoSpecificationConformanceHandoff, type CtoSpecificationConformanceBinding, type CtoSpecificationConformanceReceipt } from "../specification/conformance.js";
 import { PinnedProjectRoot, PinnedRootError } from "../specification/pinned-root.js";
@@ -3533,6 +3533,7 @@ function dispatchAdmissionError(
 ): string | null {
   const mapping = record.mapping as MappingWithExecution;
   const context = record.confirmation_context;
+  const firstSelection = record.selections[0];
   if (record.cto_run_id !== runId
     || mapping.mapping_id !== record.mapping.mapping_id
     || mapping.status !== "confirmed"
@@ -3560,9 +3561,20 @@ function dispatchAdmissionError(
   }
   if (!anchor.state.checkpoint_policy) return "confirmation anchor checkpoint policy is unavailable";
   if (!anchor.state.checkpoint_policy.rules[record.checkpoint_ref!]) return "confirmation anchor checkpoint policy rule is unavailable";
-  const firstSelection = record.selections[0];
   if (!firstSelection || firstSelection.feature_id !== context.feature_id || firstSelection.run_key !== context.run_key) {
     return "confirmation context feature/run must match the first exact frozen mapping selection";
+  }
+  const expectedCheckpointRef = ctoMappingCheckpoint({
+    cto_run_id: runId,
+    mapping_id: mapping.mapping_id,
+    mapping_hash: mapping.mapping_hash,
+    mapping_version: mapping.mapping_version,
+    feature_id: context.feature_id,
+    run_key: context.run_key,
+    stage_id: context.stage_id,
+  }, execution, context.decision);
+  if (record.checkpoint_ref !== expectedCheckpointRef || mapping.checkpoint_ref !== expectedCheckpointRef) {
+    return "confirmed mapping checkpoint reference is not the canonical mapping authorization";
   }
   const answer = anchor.state.trusted_checkpoint_answers?.find((candidate) => candidate.answer_id === record.trusted_answer_ref);
   if (!answer) return "confirmed mapping trusted-answer ledger is missing";
@@ -3571,7 +3583,12 @@ function dispatchAdmissionError(
     || answer.decision !== context.decision
     || answer.capability_id !== execution.capability_id
     || answer.capability_epoch !== execution.capability_epoch
-    || answer.policy_hash !== context.policy_hash) {
+    || answer.policy_hash !== context.policy_hash
+    || answer.subject_binding !== mapping.mapping_hash
+    || answer.subject_revision !== mapping.mapping_version
+    || typeof answer.authority_receipt !== "string"
+    || answer.authority_receipt.trim().length === 0
+    || answer.work_identity_hash !== checkpointWorkIdentityHash(anchor.state, context.stage_id)) {
     return "confirmed mapping trusted-answer ledger is stale or mismatched";
   }
   const proof: CheckpointAnswerProof = {
@@ -3601,24 +3618,24 @@ function dispatchAdmissionError(
     && context.capability_id === answer.capability_id
     && context.capability_epoch === answer.capability_epoch
     && context.policy_hash === answer.policy_hash
-    && (answer.subject_binding === undefined || answer.subject_binding === mapping.mapping_hash)
-    && (answer.subject_revision === undefined || answer.subject_revision === mapping.mapping_version);
-  const proofError = committedConfirmationReplay
-    ? null
-    : trustedCheckpointAnswerError(anchor.state, {
-      actor: { kind: "user", ref: answer.reference, proof },
-      run_id: anchor.state.run_key ?? "",
-      stage_id: context.stage_id,
-      checkpoint_id: record.checkpoint_ref,
-      decision: context.decision,
-      feature_id: context.feature_id,
-      capability_id: execution.capability_id,
-      capability_epoch: execution.capability_epoch,
-      policy_hash: context.policy_hash,
-      root_identity: rootIdentity,
-      bind_active_context: true,
-    });
-  if (proofError && !committedConfirmationReplay) return `confirmed mapping trusted-answer proof is invalid: ${proofError}`;
+    && answer.subject_binding === mapping.mapping_hash
+    && answer.subject_revision === mapping.mapping_version;
+  const proofError = trustedCheckpointAnswerError(anchor.state, {
+    actor: { kind: "user", ref: answer.reference, proof },
+    run_id: anchor.state.run_key ?? "",
+    stage_id: context.stage_id,
+    checkpoint_id: record.checkpoint_ref,
+    decision: context.decision,
+    feature_id: context.feature_id,
+    capability_id: execution.capability_id,
+    capability_epoch: execution.capability_epoch,
+    policy_hash: context.policy_hash,
+    subject_binding: mapping.mapping_hash,
+    subject_revision: mapping.mapping_version,
+    root_identity: rootIdentity,
+    bind_active_context: committedConfirmationReplay ? false : true,
+  });
+  if (proofError) return `confirmed mapping trusted-answer proof is invalid: ${proofError}`;
   if (!Number.isSafeInteger(mapping.mapping_version) || mapping.mapping_version < 1) return "confirmed mapping revision is invalid";
   return null;
 }
