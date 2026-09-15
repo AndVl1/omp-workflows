@@ -343,6 +343,38 @@ test('report suite: PASS rejects mandatory child evidence that disappears after 
 });
 
 
+test('report suite: PASS rolls back when mandatory child evidence disappears after aggregation', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-mandatory-evidence-fence-suite-'));
+  const child = makeSessionDir();
+  renameSync(child, join(suite, 'session-a'));
+  const transcript = join(suite, 'session-a', '.work-state', 'ux-e2e', 'transcript.jsonl');
+  const reportPath = join(suite, '.work-state', 'ux-e2e', 'report.json');
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-mandatory-evidence-fence-md-'));
+  let deleted = false;
+  setFsSafetyTestHooks({
+    beforeTargetOpen(path) {
+      if (!deleted && path === reportPath) {
+        deleted = true;
+        unlinkSync(transcript);
+      }
+    },
+  });
+  try {
+    assert.throws(
+      () => generateReport(suite, BASE_INPUT, { mdDir }),
+      /PASS mandatory evidence is missing or unsafe/u,
+    );
+    assert.equal(deleted, true);
+    assert.equal(existsSync(reportPath), false, 'suite JSON is rolled back');
+    assert.deepEqual(readdirSync(mdDir), [], 'suite markdown is not published');
+  } finally {
+    setFsSafetyTestHooks(null);
+    rmSync(suite, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+
 test('report: PASS gates declared evidence at the pinned per-file maximum', () => {
   const atLimit = makeSessionDir();
   const atLimitPath = join(atLimit, 'specs', 'feature-a', 'spec.md');
