@@ -1555,3 +1555,107 @@ test('report: oversized preexisting markdown fails before publication and preser
     rmSync(mdDir, { recursive: true, force: true });
   }
 });
+
+
+test('report: oversized prior JSON fails before publication and preserves exact bytes', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-oversized-json-'));
+  const reportPath = join(dir, '.work-state', 'ux-e2e', 'report.json');
+  const previous = Buffer.alloc(MAX_PINNED_READ_BYTES + 1, 0x4a);
+  writeFileSync(reportPath, previous);
+  try {
+    assert.throws(
+      () => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }),
+      /existing report\.json exceeds the exact rollback snapshot bound/u,
+    );
+    assert.deepEqual(readFileSync(reportPath), previous, 'oversized prior JSON remains byte-exact');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+test('report suite: oversized prior JSON fails before publication and preserves exact bytes', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-oversized-json-suite-'));
+  const child = makeSessionDir();
+  renameSync(child, join(suite, 'session-a'));
+  const reportPath = join(suite, '.work-state', 'ux-e2e', 'report.json');
+  mkdirSync(join(suite, '.work-state', 'ux-e2e'), { recursive: true });
+  const previous = Buffer.alloc(MAX_PINNED_READ_BYTES + 1, 0x4b);
+  writeFileSync(reportPath, previous);
+  try {
+    assert.throws(
+      () => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }),
+      /existing report\.json exceeds the exact rollback snapshot bound/u,
+    );
+    assert.deepEqual(readFileSync(reportPath), previous, 'oversized suite JSON remains byte-exact');
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+  }
+});
+
+test('report: destination root swap after final evidence copy rolls back evidence and outputs', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-target-after-copy-'));
+  const evidenceRoot = join(mdDir, 'evidence', 'my-feature');
+  const moved = `${evidenceRoot}.moved`;
+  const replacement = `${evidenceRoot}.replacement`;
+  let swapped = false;
+  const reportPath = join(dir, '.work-state', 'ux-e2e', 'report.json');
+  setEvidenceCopyTestHooks({
+    beforeTargetOpen(path) {
+      if (swapped || path !== reportPath) return;
+      swapped = true;
+      renameSync(evidenceRoot, moved);
+      mkdirSync(replacement, { recursive: true });
+      renameSync(replacement, evidenceRoot);
+    },
+  });
+  try {
+    assert.throws(
+      () => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }),
+      /evidence destination changed/u,
+    );
+    assert.equal(swapped, true);
+    assert.equal(readdirSync(evidenceRoot).length, 0, 'replacement evidence root remains empty');
+    assert.equal(readdirSync(moved).length, 0, 'published evidence is rolled back from retained root');
+    assert.equal(existsSync(reportPath), false, 'report JSON is rolled back');
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+    rmSync(moved, { recursive: true, force: true });
+  }
+});
+
+test('fs safety: final quarantine replacement is preserved after identity recheck', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-final-quarantine-race-'));
+  const target = join(dir, 'target.txt');
+  const replacement = Buffer.from('foreign replacement');
+  const original = Buffer.from('original bytes');
+  writeFileSync(target, original);
+  const root = pinDirectory(dir);
+  assert.ok(root);
+  let swapped = false;
+  setFsSafetyTestHooks({
+    beforeTargetRename(path) {
+      if (swapped || path !== target) return;
+      const quarantine = readdirSync(dir).find(name => name.startsWith('.omp-unlink-'));
+      if (quarantine === undefined) return;
+      swapped = true;
+      renameSync(join(dir, quarantine), `${join(dir, quarantine)}.moved`);
+      writeFileSync(join(dir, quarantine), replacement);
+    },
+  });
+  try {
+    assert.equal(unlinkPinnedFileIfExact(root, 'target.txt', original), false);
+    assert.equal(swapped, true);
+    const foreign = readdirSync(dir).find(name => name.startsWith('.omp-unlink-') && !name.endsWith('.moved'));
+    assert.ok(foreign, 'replacement quarantine remains visible');
+    assert.deepEqual(readFileSync(join(dir, foreign)), replacement);
+  } finally {
+    setFsSafetyTestHooks(null);
+    closePinnedDirectory(root);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

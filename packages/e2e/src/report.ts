@@ -516,7 +516,7 @@ export interface EvidenceCopyTestHooks extends FsSafetyTestHooks {}
 export function setEvidenceCopyTestHooks(hooks: EvidenceCopyTestHooks | null): void {
   setFsSafetyTestHooks(hooks);
 }
-function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir: string, maxBytes = MAX_EVIDENCE_BYTES, retainedSourceRoot?: PinnedDirectory, created?: Map<string, Buffer>, createdRoots?: Map<string, PinnedDirectory>, retainedTargetRoot?: PinnedDirectory): string[] {
+function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir: string, maxBytes = MAX_EVIDENCE_BYTES, retainedSourceRoot?: PinnedDirectory, created?: Map<string, Buffer>, createdRoots?: Map<string, PinnedDirectory>, retainedTargetRoot?: PinnedDirectory, retainedDestinationRoots?: Set<PinnedDirectory>): string[] {
   notifyBeforeSourcePin(scratchDir);
   const sourceRoot = retainedSourceRoot ?? pinDirectory(scratchDir);
   const ownsSourceRoot = retainedSourceRoot === undefined;
@@ -552,6 +552,10 @@ function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir
       const destinationDir = destinationRoot.lexicalPath;
       const ownsDestinationRoot = destinationRoot !== targetRoot;
       let retainDestinationRoot = false;
+      if (retainedDestinationRoots !== undefined) {
+        retainedDestinationRoots.add(destinationRoot);
+        retainDestinationRoot = true;
+      }
       try {
         const existingFile = openPinnedFile(destinationRoot, filename, fsConstants.O_RDONLY);
         if (existingFile !== null) {
@@ -594,7 +598,11 @@ function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir
         if (ownsDestinationRoot && !retainDestinationRoot) closePinnedDirectory(destinationRoot);
       }
     }
-    if (!pinnedDirectoryIsStable(sourceRoot)) throw new Error('ux-e2e: session root changed during evidence collection');
+    if (!pinnedDirectoryIsStable(sourceRoot)
+      || !pinnedDirectoryIsStable(targetRoot)
+      || [...(retainedDestinationRoots ?? [])].some(root => !pinnedDirectoryIsStable(root))) {
+      throw new Error('ux-e2e: evidence source or destination root changed during evidence collection');
+    }
     return copied;
   } finally {
     if (ownsSourceRoot) closePinnedDirectory(sourceRoot);
@@ -1444,6 +1452,7 @@ function generateSingleReport(
   const createdEvidence = new Map<string, Buffer>();
   const createdEvidenceRoots = new Map<string, PinnedDirectory>();
   const retainedEvidenceRoots: PinnedDirectory[] = [];
+  const retainedEvidenceDestinationRoots = new Set<PinnedDirectory>();
   const rollbackEvidence = (): void => {
     for (const [path, bytes] of createdEvidence) {
       const retainedParent = createdEvidenceRoots.get(path);
@@ -1568,8 +1577,9 @@ function generateSingleReport(
       const evidenceTargetRoot = pinOrCreateDirectory(evidenceTarget);
       if (evidenceTargetRoot === null) throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
       retainedEvidenceRoots.push(evidenceTargetRoot);
-      evidence = copyEvidence(evidence, evidenceTargetRoot.lexicalPath, scratchDir, MAX_EVIDENCE_BYTES, scratchRoot, createdEvidence, createdEvidenceRoots, evidenceTargetRoot);
+      evidence = copyEvidence(evidence, evidenceTargetRoot.lexicalPath, scratchDir, MAX_EVIDENCE_BYTES, scratchRoot, createdEvidence, createdEvidenceRoots, evidenceTargetRoot, retainedEvidenceDestinationRoots);
     }
+    if ([...retainedEvidenceDestinationRoots].some(root => !pinnedDirectoryIsStable(root))) throw new Error('ux-e2e: evidence destination changed before report output');
     const report = sanitizeOutput({
       type: 'ux-e2e',
       schema_version: 1,
@@ -1621,6 +1631,7 @@ function generateSingleReport(
     }
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before report JSON output');
       if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before report JSON output');
+      if ([...retainedEvidenceDestinationRoots].some(root => !pinnedDirectoryIsStable(root))) throw new Error('ux-e2e: evidence destination changed before report JSON output');
     let jsonBytes: Buffer | null = null;
     let previousJson: Buffer | null = null;
     stateDestination = pinChildDirectory(scratchRoot, ['.work-state', 'ux-e2e']);
@@ -1629,6 +1640,13 @@ function generateSingleReport(
       }
       jsonBytes = Buffer.from(JSON.stringify(report, null, 2) + '\n');
       previousJson = readPinnedFileFull(stateDestination, 'report.json');
+      if (previousJson === null) {
+        const existingJson = openPinnedFile(stateDestination, 'report.json', fsConstants.O_RDONLY);
+        if (existingJson !== null) {
+          closePinnedFile(existingJson);
+          throw new Error('ux-e2e: existing report.json exceeds the exact rollback snapshot bound');
+        }
+      }
       if (!writePinnedFile(stateDestination, 'report.json', jsonBytes) || !pinnedDirectoryIsStable(scratchRoot)) {
         if (unlinkPinnedFileIfExact(stateDestination, 'report.json', jsonBytes, { requireStable: false }) && previousJson !== null) {
           writePinnedFile(stateDestination, 'report.json', previousJson, { requireStable: false });
@@ -1647,6 +1665,7 @@ function generateSingleReport(
       if (reportDestination === null) throw new Error('ux-e2e: report destination root is unavailable');
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before markdown output');
       if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before markdown output');
+      if ([...retainedEvidenceDestinationRoots].some(root => !pinnedDirectoryIsStable(root))) throw new Error('ux-e2e: evidence destination changed before markdown output');
     } catch (error) {
       rollbackJson();
       throw error;
@@ -1658,6 +1677,7 @@ function generateSingleReport(
           throw new Error('ux-e2e: failed to write markdown inside the report destination');
         }
         if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'after report output');
+        if ([...retainedEvidenceDestinationRoots].some(root => !pinnedDirectoryIsStable(root))) throw new Error('ux-e2e: evidence destination changed after report output');
       } catch (error) {
         if (unlinkPinnedFileIfExact(reportDestination, mdFilename, markdownBytes, { requireStable: false }) && previousMarkdown !== null) {
           writePinnedFile(reportDestination, mdFilename, previousMarkdown, { requireStable: false });
@@ -1677,6 +1697,7 @@ function generateSingleReport(
       /* Ignore cleanup failures. */
     }
     for (const root of createdEvidenceRoots.values()) closePinnedDirectory(root);
+    for (const root of retainedEvidenceDestinationRoots) closePinnedDirectory(root);
     for (const root of retainedEvidenceRoots) closePinnedDirectory(root);
     if (ownsScratchRoot) closePinnedDirectory(scratchRoot);
   }
@@ -1908,6 +1929,13 @@ function writeSuiteReport(
     mdFilename = report.session.slug + '-ux-e2e-' + todayStamp() + '.md';
     markdownBytes = Buffer.from(renderMarkdown(report));
     previousJson = readPinnedFileFull(stateRoot, 'report.json');
+    if (previousJson === null) {
+      const existingJson = openPinnedFile(stateRoot, 'report.json', fsConstants.O_RDONLY);
+      if (existingJson !== null) {
+        closePinnedFile(existingJson);
+        throw new Error('ux-e2e: existing report.json exceeds the exact rollback snapshot bound');
+      }
+    }
     previousMarkdown = readPinnedFileFull(reportRoot, mdFilename);
     if (previousMarkdown === null) {
       const existingMarkdown = openPinnedFile(reportRoot, mdFilename, fsConstants.O_RDONLY);
@@ -1950,6 +1978,7 @@ function generateSuiteReport(
   const copiedEvidence = new Map<string, Buffer>();
   const copiedEvidenceRoots = new Map<string, PinnedDirectory>();
   const retainedEvidenceRoots: PinnedDirectory[] = [];
+  const retainedEvidenceDestinationRoots = new Set<PinnedDirectory>();
   const rollbackCopiedEvidence = (): void => {
     for (const [path, bytes] of copiedEvidence) {
       const retainedParent = copiedEvidenceRoots.get(path);
@@ -1984,7 +2013,7 @@ function generateSuiteReport(
       const targetRoot = pinOrCreateDirectory(join(mdDir, 'evidence', child.name));
       if (targetRoot === null) throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
       retainedEvidenceRoots.push(targetRoot);
-      childEvidence = copyEvidence(result.report.evidence, targetRoot.lexicalPath, child.scratchDir, MAX_SUITE_EVIDENCE_BYTES - aggregateEvidenceBytes, child.root, copiedEvidence, copiedEvidenceRoots, targetRoot);
+      childEvidence = copyEvidence(result.report.evidence, targetRoot.lexicalPath, child.scratchDir, MAX_SUITE_EVIDENCE_BYTES - aggregateEvidenceBytes, child.root, copiedEvidence, copiedEvidenceRoots, targetRoot, retainedEvidenceDestinationRoots);
     } else {
       childEvidence = [...result.report.evidence];
     }
@@ -2007,6 +2036,7 @@ function generateSuiteReport(
   } finally {
     closeSuiteDiscovery(currentDiscovery);
   }
+  if ([...retainedEvidenceDestinationRoots].some(root => !pinnedDirectoryIsStable(root))) throw new Error('ux-e2e: evidence destination changed before suite report output');
   const report = sanitizeOutput({
     type: 'ux-e2e',
     schema_version: 1,
@@ -2045,6 +2075,7 @@ function generateSuiteReport(
     throw error;
   } finally {
     for (const root of copiedEvidenceRoots.values()) closePinnedDirectory(root);
+    for (const root of retainedEvidenceDestinationRoots) closePinnedDirectory(root);
     for (const root of retainedEvidenceRoots) closePinnedDirectory(root);
   }
 }

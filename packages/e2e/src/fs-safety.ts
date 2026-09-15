@@ -540,6 +540,7 @@ export function unlinkPinnedFileIfExact(
   const descriptorRoot = descriptorPathFor(root.fd);
   if (descriptorRoot === null) return false;
   const restoreLinuxQuarantine = (): boolean => {
+    if (!verifyDescriptorFile(quarantine)) return false;
     try {
       linkSync(join(descriptorRoot, quarantine), join(descriptorRoot, name));
       unlinkSync(join(descriptorRoot, quarantine));
@@ -574,12 +575,12 @@ export function unlinkPinnedFileIfExact(
   if (process.platform === 'darwin') {
     testHooks?.beforeExactQuarantine?.(join(root.lexicalPath, name));
     const moved = runDarwinHelper(root, 'quarantine_if_exact', { name, quarantine, size: expected.length, sha256: digest });
-    if (moved?.quarantined !== true) {
-      if (moved?.moved === true) runDarwinHelper(root, 'restore_quarantine', { quarantine, name });
-      return false;
-    }
+    if (moved?.quarantined !== true) return false;
+    const quarantineDev = moved.dev;
+    const quarantineIno = moved.ino;
+    if (!Number.isSafeInteger(quarantineDev) || !Number.isSafeInteger(quarantineIno)) return false;
     testHooks?.beforeTargetRename?.(join(root.lexicalPath, name));
-    return runDarwinHelper(root, 'unlink_quarantine', { quarantine, size: expected.length, sha256: digest })?.removed === true;
+    return runDarwinHelper(root, 'unlink_quarantine', { quarantine, size: expected.length, sha256: digest, expected_dev: quarantineDev, expected_ino: quarantineIno })?.removed === true;
   }
   if (!verifyDescriptorFile(name)) return false;
   testHooks?.beforeExactQuarantine?.(join(root.lexicalPath, name));
@@ -593,6 +594,7 @@ export function unlinkPinnedFileIfExact(
     return false;
   }
   testHooks?.beforeTargetRename?.(join(root.lexicalPath, name));
+  if (!verifyDescriptorFile(quarantine)) return false;
   try {
     unlinkSync(join(descriptorRoot, quarantine));
     return true;
@@ -1297,17 +1299,18 @@ def publish_noreplace(final, temporary):
         raise
     os.fsync(3)
 
-def _verify_exact(name, size, digest):
+def _verify_exact(name, size, digest, expected_dev=None, expected_ino=None):
     fd, info = open_regular(name, os.O_RDONLY)
     try:
         if info.st_size != size: return False
+        if expected_dev is not None and (info.st_dev != expected_dev or info.st_ino != expected_ino): return False
         data = b""
         while len(data) < size:
             chunk = os.read(fd, size - len(data))
             if not chunk: return False
             data += chunk
         after = os.fstat(fd)
-        return after.st_dev == info.st_dev and after.st_ino == info.st_ino and after.st_size == info.st_size and hashlib.sha256(data).hexdigest() == digest
+        return after.st_dev == info.st_dev and after.st_ino == info.st_ino and after.st_size == info.st_size and (expected_dev is None or (after.st_dev == expected_dev and after.st_ino == expected_ino)) and hashlib.sha256(data).hexdigest() == digest
     finally:
         os.close(fd)
 
@@ -1319,7 +1322,13 @@ def quarantine_if_exact(name, quarantine, size, digest):
         os.rename(name, quarantine, src_dir_fd=3, dst_dir_fd=3)
     except FileNotFoundError:
         return {"quarantined": False, "moved": False}
-    return {"quarantined": _verify_exact(quarantine, size, digest), "moved": True}
+    if not _verify_exact(quarantine, size, digest): return {"quarantined": False, "moved": True}
+    try:
+        fd, info = open_regular(quarantine, os.O_RDONLY)
+        os.close(fd)
+    except OSError:
+        return {"quarantined": False, "moved": True}
+    return {"quarantined": True, "moved": True, "dev": info.st_dev, "ino": info.st_ino}
 
 def restore_quarantine(quarantine, name):
     quarantine, name = safe_name(quarantine), safe_name(name)
@@ -1331,10 +1340,10 @@ def restore_quarantine(quarantine, name):
     os.fsync(3)
     return {"restored": True}
 
-def unlink_quarantine(quarantine, size, digest):
+def unlink_quarantine(quarantine, size, digest, expected_dev, expected_ino):
     quarantine = safe_name(quarantine)
-    if not isinstance(size, int) or size < 0 or size > MAX_WRITE or not isinstance(digest, str) or len(digest) != 64: fail("exact unlink bounds are invalid")
-    if not _verify_exact(quarantine, size, digest): return {"removed": False}
+    if not isinstance(size, int) or size < 0 or size > MAX_WRITE or not isinstance(digest, str) or len(digest) != 64 or not isinstance(expected_dev, int) or not isinstance(expected_ino, int): fail("exact unlink bounds are invalid")
+    if not _verify_exact(quarantine, size, digest, expected_dev, expected_ino): return {"removed": False}
     os.unlink(quarantine, dir_fd=3)
     os.fsync(3)
     return {"removed": True}
@@ -1363,7 +1372,7 @@ try:
     elif op == "publish_noreplace": publish_noreplace(payload.get("final"), payload.get("temporary")); result = {"ok": True}
     elif op == "quarantine_if_exact": result = {"ok": True, **quarantine_if_exact(payload.get("name"), payload.get("quarantine"), payload.get("size"), payload.get("sha256"))}
     elif op == "restore_quarantine": result = {"ok": True, **restore_quarantine(payload.get("quarantine"), payload.get("name"))}
-    elif op == "unlink_quarantine": result = {"ok": True, **unlink_quarantine(payload.get("quarantine"), payload.get("size"), payload.get("sha256"))}
+    elif op == "unlink_quarantine": result = {"ok": True, **unlink_quarantine(payload.get("quarantine"), payload.get("size"), payload.get("sha256"), payload.get("expected_dev"), payload.get("expected_ino"))}
     elif op == "cleanup": cleanup(payload.get("temporary")); result = {"ok": True}
     else: fail("unsupported operation")
     sys.stdout.write(json.dumps(result, separators=(",", ":")))
