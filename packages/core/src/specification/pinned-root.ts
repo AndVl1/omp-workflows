@@ -249,7 +249,7 @@ const DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS = 5_000;
 const DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES = 1 * 1024 * 1024;
 const DARWIN_HELPER_TRANSFER_BYTES_PER_MS = 1 * 1024;
 const DARWIN_HELPER_TRANSFER_OPERATIONS = new Set([
-  "write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "batch", "batch_atomic", "replace_if_matches",
+  "write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "lock_acquire", "batch", "batch_atomic", "replace_if_matches",
 ]);
 const DARWIN_HELPER_MAX_INPUT = 96 * 1024 * 1024;
 const DARWIN_HELPER_START_TIMEOUT_MS = 1_000;
