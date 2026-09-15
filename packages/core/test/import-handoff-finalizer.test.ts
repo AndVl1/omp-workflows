@@ -687,7 +687,7 @@ test("import handoff finalizer rejects a post-advance snapshot replacement", asy
   try {
     const artifactsDir = join(fixture.root, ".work-state", "features", fixture.featureId, "artifacts");
     const snapshot = JSON.parse(readFileSync(join(artifactsDir, "import_snapshot.json"), "utf8")) as Record<string, unknown>;
-    writeTestArtifact(root, artifactsDir, "import_snapshot", { ...snapshot, source_revision: "post-advance-replacement" });
+    writeTestArtifact(fixture.root, artifactsDir, "import_snapshot", { ...snapshot, source_revision: "post-advance-replacement" });
     const result = await finalizeImportedHandoff(fixture.root, fixture.finalizerInput());
     assert.equal(result.ok, false);
     if (!result.ok) assert.match(result.code, /SOURCE_CHANGED|SNAPSHOT_INVALID|HANDOFF_REJECTED/u);
@@ -705,7 +705,7 @@ test("import handoff finalizer rejects a post-advance compatibility report repla
   try {
     const artifactsDir = join(fixture.root, ".work-state", "features", fixture.featureId, "artifacts");
     const report = JSON.parse(readFileSync(join(artifactsDir, "compatibility_report.json"), "utf8")) as Record<string, unknown>;
-    writeTestArtifact(root, artifactsDir, "compatibility_report", { ...report, evaluated_at: "2099-01-01T00:00:00.000Z" });
+    writeTestArtifact(fixture.root, artifactsDir, "compatibility_report", { ...report, evaluated_at: "2099-01-01T00:00:00.000Z" });
     const result = await finalizeImportedHandoff(fixture.root, fixture.finalizerInput());
     assert.equal(result.ok, false);
     if (!result.ok) assert.match(result.code, /SOURCE_CHANGED|COMPATIBILITY_INVALID|HANDOFF_REJECTED/u);
