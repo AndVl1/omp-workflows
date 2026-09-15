@@ -9,6 +9,7 @@ import {
   mkdirSync,
   openSync,
   readSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmdirSync,
@@ -31,7 +32,14 @@ export const MAX_PINNED_FILE_BYTES = MAX_PINNED_READ_BYTES * 8;
 export const RESERVED_TERMINAL_MARKER_BYTES = 4096;
 
 
-type FileIdentity = { readonly dev: number; readonly ino: number };
+export type FileIdentity = { readonly dev: number; readonly ino: number };
+
+export interface PinnedDirectoryCreationReceipt {
+  readonly parent: PinnedDirectory;
+  readonly name: string;
+  readonly identity: FileIdentity;
+  readonly path: string;
+}
 
 export interface PinnedDirectory {
   readonly lexicalPath: string;
@@ -126,6 +134,12 @@ function descriptorPathFor(fd: number): string | null {
   return null;
 }
 
+function duplicateDirectoryDescriptor(fd: number): number | null {
+  const path = descriptorPathFor(fd);
+  if (path === null) return null;
+  try { return openSync(path, fsConstants.O_RDONLY | O_DIRECTORY); } catch { return null; }
+}
+
 /** Open and retain a directory whose inode is the authority for all children. */
 export function pinDirectory(directory: string): PinnedDirectory | null {
   if (O_NOFOLLOW === 0 || typeof O_DIRECTORY !== 'number') return null;
@@ -159,6 +173,10 @@ export function pinDirectory(directory: string): PinnedDirectory | null {
 export function closePinnedDirectory(root: PinnedDirectory): void {
   try { closeSync(root.fd); } catch { /* best effort */ }
 }
+
+export function closePinnedDirectoryCreationReceipts(receipts: readonly PinnedDirectoryCreationReceipt[]): void {
+  for (const receipt of receipts) closePinnedDirectory(receipt.parent);
+}
 export function pinnedDirectoryIsStable(root: PinnedDirectory): boolean {
   try {
     const descriptorStat = fstatSync(root.fd);
@@ -172,7 +190,7 @@ export function pinnedDirectoryIsStable(root: PinnedDirectory): boolean {
 }
 
 /** Create and retain a directory using no-follow component operations. */
-export function pinOrCreateDirectory(directory: string): PinnedDirectory | null {
+export function pinOrCreateDirectory(directory: string, created?: PinnedDirectoryCreationReceipt[]): PinnedDirectory | null {
   if (O_NOFOLLOW === 0 || typeof O_DIRECTORY !== 'number') return null;
   const lexicalPath = resolve(directory);
   const canonicalPath = canonicalTargetDirectory(lexicalPath);
@@ -188,6 +206,7 @@ export function pinOrCreateDirectory(directory: string): PinnedDirectory | null 
   }
 
   let helperIdentity: FileIdentity | null = null;
+  const localCreated: PinnedDirectoryCreationReceipt[] = [];
   let fd: number | null = null;
   let auxiliaryFd: number | null = null;
   let pinned = false;
@@ -201,6 +220,17 @@ export function pinOrCreateDirectory(directory: string): PinnedDirectory | null 
         for (let i = 0; i < components.length; i += 1) {
           testHooks?.beforeDirectoryComponent?.(join(sep, ...components.slice(0, i + 1)));
         }
+        const missing = new Set<number>();
+        for (let index = 0; index < components.length; index += 1) {
+          const candidate = join(sep, ...components.slice(0, index + 1));
+          try {
+            const info = lstatSync(candidate);
+            if (info.isSymbolicLink() || !info.isDirectory()) return null;
+          } catch (error) {
+            if (errnoCode(error) !== 'ENOENT') return null;
+            missing.add(index);
+          }
+        }
         const ensured = runDarwinHelper(
           { lexicalPath: sep, physicalPath: sep, fd: trustedFd, identity: { dev: trustedStat.dev, ino: trustedStat.ino } },
           'ensure_directory',
@@ -210,6 +240,23 @@ export function pinOrCreateDirectory(directory: string): PinnedDirectory | null 
         if (!identity || typeof identity !== 'object' || !('dev' in identity) || !('ino' in identity)
           || typeof identity.dev !== 'number' || typeof identity.ino !== 'number') return null;
         helperIdentity = { dev: identity.dev, ino: identity.ino };
+        for (const index of missing) {
+          const parentPath = index === 0 ? sep : join(sep, ...components.slice(0, index));
+          const childPath = join(sep, ...components.slice(0, index + 1));
+          const parentFd = openSync(parentPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+          const parentStat = fstatSync(parentFd);
+          const childStat = lstatSync(childPath);
+          if (!parentStat.isDirectory() || childStat.isSymbolicLink() || !childStat.isDirectory()) {
+            closeSync(parentFd);
+            return null;
+          }
+          localCreated.push({
+            parent: { lexicalPath: parentPath, physicalPath: realpathSync(parentPath), fd: parentFd, identity: { dev: parentStat.dev, ino: parentStat.ino } },
+            name: components[index]!,
+            identity: { dev: childStat.dev, ino: childStat.ino },
+            path: childPath,
+          });
+        }
       } finally {
         closeSync(trustedFd);
       }
@@ -231,15 +278,28 @@ export function pinOrCreateDirectory(directory: string): PinnedDirectory | null 
         testHooks?.beforeDirectoryComponent?.(childLexicalPath);
         if (i === components.length - 1) testHooks?.beforeDirectoryOpen?.(lexicalPath);
         let childFd: number;
+        let createdChild = false;
         try {
           childFd = openSync(childPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
         } catch (error) {
           if (errnoCode(error) !== 'ENOENT') return null;
           mkdirSync(childPath, { mode: 0o700 });
+          createdChild = true;
           childFd = openSync(childPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
         }
         const childStat = fstatSync(childFd);
         if (!childStat.isDirectory()) { closeSync(childFd); return null; }
+        if (createdChild) {
+          const parentStat = fstatSync(parentFd);
+          const retainedParentFd = duplicateDirectoryDescriptor(parentFd);
+          if (retainedParentFd === null) return null;
+          localCreated.push({
+            parent: { lexicalPath: join(sep, ...components.slice(0, i)), physicalPath: realpathSync(descriptorPathFor(parentFd) ?? join(sep, ...components.slice(0, i))), fd: retainedParentFd, identity: { dev: parentStat.dev, ino: parentStat.ino } },
+            name: component,
+            identity: { dev: childStat.dev, ino: childStat.ino },
+            path: childLexicalPath,
+          });
+        }
         closeSync(parentFd);
         parentFd = childFd;
         auxiliaryFd = parentFd;
@@ -257,10 +317,12 @@ export function pinOrCreateDirectory(directory: string): PinnedDirectory | null 
       || (helperIdentity !== null && !sameIdentity(helperIdentity, descriptorStat))
       || !pathHasNoSymlinkAncestors(canonicalPath)) return null;
     pinned = true;
+    created?.push(...localCreated);
     return { lexicalPath, physicalPath: canonicalPath, fd, identity: { dev: descriptorStat.dev, ino: descriptorStat.ino } };
   } catch {
     return null;
   } finally {
+    if (!pinned) closePinnedDirectoryCreationReceipts(localCreated);
     if (fd !== null && !pinned) {
       try { closeSync(fd); } catch { /* best effort */ }
     }
@@ -271,7 +333,7 @@ export function pinOrCreateDirectory(directory: string): PinnedDirectory | null 
 }
 
 /** Pin a descendant using a retained descriptor for every component. */
-export function pinChildDirectory(root: PinnedDirectory, components: readonly string[]): PinnedDirectory | null {
+export function pinChildDirectory(root: PinnedDirectory, components: readonly string[], created?: PinnedDirectoryCreationReceipt[]): PinnedDirectory | null {
   if (components.length === 0 || components.some(component => !safeName(component))) return null;
   if (!pinnedDirectoryIsStable(root)) return null;
   const descriptorRoot = descriptorPathFor(root.fd);
@@ -280,12 +342,42 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
   const lexicalPath = join(root.lexicalPath, ...components);
   const canonicalPath = canonicalTargetDirectory(lexicalPath);
   testHooks?.beforeDirectoryOpen?.(lexicalPath);
+  const localCreated: PinnedDirectoryCreationReceipt[] = [];
   let fd: number | null = null;
   let descriptorPhysicalPath: string | null = null;
   let pinned = false;
   try {
     if (process.platform === 'darwin') {
+      const missing = new Set<number>();
+      for (let index = 0; index < components.length; index += 1) {
+        const candidate = join(root.physicalPath, ...components.slice(0, index + 1));
+        try {
+          const info = lstatSync(candidate);
+          if (info.isSymbolicLink() || !info.isDirectory()) return null;
+        } catch (error) {
+          if (errnoCode(error) !== 'ENOENT') return null;
+          missing.add(index);
+        }
+      }
       if (runDarwinHelper(root, 'ensure_directory', { path: relativePath }) === null) return null;
+      for (const index of missing) {
+        const parentPath = index === 0 ? root.physicalPath : join(root.physicalPath, ...components.slice(0, index));
+        const childPath = join(root.physicalPath, ...components.slice(0, index + 1));
+        const parentFd = index === 0 ? duplicateDirectoryDescriptor(root.fd) : openSync(parentPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        if (parentFd === null) return null;
+        const parentStat = fstatSync(parentFd);
+        const childStat = lstatSync(childPath);
+        if (!parentStat.isDirectory() || childStat.isSymbolicLink() || !childStat.isDirectory()) {
+          closeSync(parentFd);
+          return null;
+        }
+        localCreated.push({
+          parent: { lexicalPath: join(root.lexicalPath, ...components.slice(0, index)), physicalPath: realpathSync(parentPath), fd: parentFd, identity: { dev: parentStat.dev, ino: parentStat.ino } },
+          name: components[index]!,
+          identity: { dev: childStat.dev, ino: childStat.ino },
+          path: join(root.lexicalPath, ...components.slice(0, index + 1)),
+        });
+      }
       for (let index = 0; index < components.length; index += 1) {
         testHooks?.beforeDirectoryComponent?.(join(root.lexicalPath, ...components.slice(0, index + 1)));
       }
@@ -304,17 +396,30 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
         testHooks?.beforeDirectoryComponent?.(componentLexical);
         const childPath = join(parentPath, component);
         let childFd: number;
+        let createdChild = false;
         try {
           childFd = openSync(childPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
         } catch (error) {
           if (errnoCode(error) !== 'ENOENT') return null;
           mkdirSync(childPath, { mode: 0o700 });
+          createdChild = true;
           childFd = openSync(childPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
         }
         const childStat = fstatSync(childFd);
         if (!childStat.isDirectory()) {
           closeSync(childFd);
           return null;
+        }
+        if (createdChild) {
+          const parentStat = fstatSync(parentFd);
+          const retainedParentFd = duplicateDirectoryDescriptor(parentFd);
+          if (retainedParentFd === null) return null;
+          localCreated.push({
+            parent: { lexicalPath: join(root.lexicalPath, ...components.slice(0, index)), physicalPath: realpathSync(parentPath), fd: retainedParentFd, identity: { dev: parentStat.dev, ino: parentStat.ino } },
+            name: component,
+            identity: { dev: childStat.dev, ino: childStat.ino },
+            path: componentLexical,
+          });
         }
         if (fd !== null) closeSync(fd);
         fd = childFd;
@@ -334,10 +439,12 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
     const withinRoot = relative(root.physicalPath, physicalPath);
     if (withinRoot === '' || withinRoot === '..' || withinRoot.startsWith(`..${sep}`) || withinRoot.startsWith(sep)) return null;
     pinned = true;
+    created?.push(...localCreated);
     return { lexicalPath, physicalPath, fd, identity: { dev: descriptorStat.dev, ino: descriptorStat.ino } };
   } catch {
     return null;
   } finally {
+    if (!pinned) closePinnedDirectoryCreationReceipts(localCreated);
     if (fd !== null && !pinned) {
       try { closeSync(fd); } catch { /* best effort */ }
     }
@@ -968,20 +1075,33 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
   }
 }
 
-/** Remove an empty child directory through the retained parent descriptor. */
-export function removePinnedDirectoryIfEmpty(root: PinnedDirectory, components: readonly string[]): boolean {
-  if (components.length === 0 || components.some(component => !safeName(component))) return false;
-  const relativePath = components.join(sep);
+/** Remove one transaction-created empty child through its retained parent descriptor. */
+export function removePinnedDirectoryIfEmpty(receipt: PinnedDirectoryCreationReceipt): boolean {
+  const { parent, name, identity } = receipt;
+  if (!safeName(name) || !pinnedDescriptorIsStable(parent)) return false;
   if (process.platform === 'darwin') {
-    return runDarwinHelper(root, 'remove_empty', { name: relativePath })?.removed === true;
+    return runDarwinHelper(parent, 'remove_empty', { name, expected_dev: identity.dev, expected_ino: identity.ino })?.removed === true;
   }
-  const descriptorRoot = descriptorPathFor(root.fd);
+  const descriptorRoot = descriptorPathFor(parent.fd);
   if (descriptorRoot === null) return false;
+  const child = join(descriptorRoot, name);
+  let childFd: number | null = null;
   try {
-    rmdirSync(join(descriptorRoot, ...components));
+    const before = lstatSync(child);
+    if (before.isSymbolicLink() || !before.isDirectory() || !sameIdentity(before, identity)) return false;
+    childFd = openSync(child, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    const opened = fstatSync(childFd);
+    if (!opened.isDirectory() || !sameIdentity(opened, identity) || readdirSync(child).length !== 0) return false;
+    const after = lstatSync(child);
+    if (after.isSymbolicLink() || !after.isDirectory() || !sameIdentity(after, identity)) return false;
+    rmdirSync(child);
     return true;
   } catch {
     return false;
+  } finally {
+    if (childFd !== null) {
+      try { closeSync(childFd); } catch { /* best effort */ }
+    }
   }
 }
 
@@ -1477,7 +1597,12 @@ try:
     elif op == "remove_empty":
         name = payload.get("name")
         if not isinstance(name, str) or not name or any((not piece or piece in (".", "..") or "/" in piece or "\\" in piece or "\x00" in piece) for piece in name.split("/")): fail("directory path is invalid")
-        try: os.rmdir(name, dir_fd=3); result = {"ok": True, "removed": True}
+        expected_dev = payload.get("expected_dev")
+        expected_ino = payload.get("expected_ino")
+        try:
+            info = os.stat(name, dir_fd=3, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode) or info.st_dev != expected_dev or info.st_ino != expected_ino: fail("directory identity changed")
+            os.rmdir(name, dir_fd=3); result = {"ok": True, "removed": True}
         except FileNotFoundError: result = {"ok": True, "removed": False}
     elif op == "lock_acquire":
         lease = lock_acquire(payload.get("name"), payload.get("owner_pid"), payload.get("owner_start"))

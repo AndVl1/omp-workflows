@@ -1922,6 +1922,70 @@ test('report suite: oversized prior JSON fails before publication and preserves 
   }
 });
 
+test('report: post-pin intermediate symlink swap leaves outside untouched and rolls back bytes', () => {
+  const dir = makeSessionDir();
+  const sourceNested = join(dir, 'specs', 'feature-a', 'nested');
+  mkdirSync(sourceNested, { recursive: true });
+  const source = join(sourceNested, 'evidence.txt');
+  writeFileSync(source, 'generated source evidence\n');
+  setScenarioDocuments(dir, ['specs/feature-a/nested/evidence.txt']);
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-intermediate-cleanup-md-'));
+  const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-intermediate-cleanup-outside-'));
+  writeFileSync(join(outside, 'outside-sentinel'), 'must survive\n');
+  const targetRoot = join(mdDir, 'evidence', 'my-feature');
+  const intermediate = join(targetRoot, 'specs');
+  const moved = `${intermediate}.moved`;
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeMandatoryEvidenceCheck(_path, phase) {
+      if (swapped || phase !== 'after final publication') return;
+      swapped = true;
+      renameSync(intermediate, moved);
+      symlinkSync(outside, intermediate, 'dir');
+      throw new Error('injected post-pin intermediate swap');
+    },
+  });
+  try {
+    assert.throws(() => generateReport(dir, BASE_INPUT, { mdDir, copyEvidence: true }));
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (existsSync(intermediate)) unlinkSync(intermediate);
+    if (existsSync(moved)) renameSync(moved, intermediate);
+  }
+  assert.equal(swapped, true);
+  assert.deepEqual(readdirSync(outside), ['outside-sentinel']);
+  assert.equal(readdirSync(join(intermediate, 'feature-a', 'nested')).length, 0, 'generated evidence bytes are rolled back');
+  assert.equal(existsSync(join(dir, '.work-state', 'ux-e2e', 'report.json')), false);
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(mdDir, { recursive: true, force: true });
+  rmSync(outside, { recursive: true, force: true });
+});
+
+test('report: rollback preserves pre-existing empty evidence hierarchy', () => {
+  const dir = makeSessionDir();
+  const sourceNested = join(dir, 'specs', 'feature-a', 'nested');
+  mkdirSync(sourceNested, { recursive: true });
+  writeFileSync(join(sourceNested, 'evidence.txt'), 'pre-existing hierarchy source\n');
+  setScenarioDocuments(dir, ['specs/feature-a/nested/evidence.txt']);
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-preexisting-cleanup-md-'));
+  const targetNested = join(mdDir, 'evidence', 'my-feature', 'specs', 'feature-a', 'nested');
+  mkdirSync(targetNested, { recursive: true });
+  setEvidenceCopyTestHooks({
+    beforeMandatoryEvidenceCheck(_path, phase) {
+      if (phase === 'after final publication') throw new Error('injected rollback after copy');
+    },
+  });
+  try {
+    assert.throws(() => generateReport(dir, BASE_INPUT, { mdDir, copyEvidence: true }));
+  } finally {
+    setEvidenceCopyTestHooks(null);
+  }
+  assert.equal(existsSync(targetNested), true, 'caller-owned empty hierarchy remains');
+  assert.equal(readdirSync(targetNested).length, 0, 'transaction bytes are rolled back from caller-owned hierarchy');
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(mdDir, { recursive: true, force: true });
+});
+
 test('report: destination root swap after final evidence copy rolls back evidence and outputs', () => {
   const dir = makeSessionDir();
   const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-target-after-copy-'));
