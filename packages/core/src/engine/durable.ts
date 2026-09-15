@@ -975,7 +975,7 @@ function nativePreparationSourceError(
   if (source.policy_hash !== undefined && cap && source.policy_hash !== cap.policy_hash) return "native preparation source policy binding mismatch";
   const marker = state.preparation_start;
   if (!marker) return null;
-  if (marker.status !== "begun") return "native preparation begin marker is no longer retryable";
+  if (marker.status !== "begun" && marker.status !== "started") return "native preparation begin marker is no longer retryable";
   if (!cap || cap.capability_id !== marker.capability_id) return "native preparation begin capability is unavailable";
   if (marker.capability_epoch !== undefined && marker.capability_epoch !== cap.issued_for.cursor_epoch) return "native preparation begin marker capability epoch mismatch";
   const expectedRosterEntry = expectedRoster?.[0];
@@ -997,7 +997,7 @@ function nativePreparationSourceError(
     && dispatchedRecord?.work_identity?.capability_id === cap.capability_id
     && dispatchedRecord?.work_identity?.capability_epoch === cap.issued_for.cursor_epoch
     && (marker.dispatch_id === undefined || marker.dispatch_id === dispatchedRecord.id);
-  const readyEmpty = cap.status === "ready" && cap.dispatches.length === 0 && (cap.pending?.length ?? 0) === 0;
+  const readyEmpty = marker.status === "begun" && cap.status === "ready" && cap.dispatches.length === 0 && (cap.pending?.length ?? 0) === 0;
   if (!readyEmpty && !exactDispatched) return "native preparation begin marker no longer matches a ready empty or exact dispatched capability";
   if (marker.phase !== phase || marker.capability_id !== cap.capability_id || marker.request_id !== source.request_id || marker.preparation_digest !== source.preparation_handoff_digest || marker.preparation_state_revision !== source.preparation_state_revision || marker.profile_hash !== profileHashValue || canonicalJson(marker.expected_roster) !== canonicalJson(expectedRoster) || marker.policy_hash !== cap.policy_hash) return "native preparation begin marker binding mismatch";
   const expectedStateRevision = marker.expected_state_revision;

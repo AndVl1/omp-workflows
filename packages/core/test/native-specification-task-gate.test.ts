@@ -1152,6 +1152,8 @@ test("native start composes begin, instructions, and dispatch into one exact tas
     assert.equal(replay.ok, true, replay.ok ? "" : replay.error);
     if (replay.ok) {
       assert.equal(replay.replayed, true);
+      assert.equal(replay.value.handoff.capability_id, result.value.handoff.capability_id, "replay must retain the authenticated capability lineage");
+      assert.equal(replay.value.handoff.dispatch_id, result.value.handoff.dispatch_id, "replay must retain the authenticated dispatch lineage");
       assert.deepEqual(replay.value.required_next_tool, result.value.required_next_tool);
     }
   } finally {

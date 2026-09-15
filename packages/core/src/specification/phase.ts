@@ -4911,7 +4911,7 @@ function replayNativeStartPostimage(
   const record = capability?.dispatches?.find((candidate) => candidate.id === marker.dispatch_id);
   const workspace = state.specification;
   const phaseRecordValue = workspace?.phases.find((candidate) => candidate.phase === phase);
-  if (!capability || !record?.work_identity || !workspace?.constitution_binding || phaseRecordValue?.status !== "generating") return fail("SPEC_PHASE_STALE", "native start postimage is missing its current capability, dispatch, workspace binding, or generating phase");
+  if (!capability || !record?.work_identity || !workspace?.constitution_binding || !state.preparation_handoff || phaseRecordValue?.status !== "generating") return fail("SPEC_PHASE_STALE", "native start postimage is missing its current capability, dispatch, workspace binding, preparation handoff, or generating phase");
   const roster = capability.expected_roster?.find((candidate) => candidate.role === record.role);
   if (!roster || roster.agent !== record.agent) return fail("SPEC_PHASE_STALE", "native start postimage dispatch roster is no longer current");
   const liveConstitution = currentConstitutionGuard(projectRoot, workspace.constitution_binding);
@@ -4919,11 +4919,13 @@ function replayNativeStartPostimage(
 
   const nativeStartProof = issueCurrentTrustedMappingProof(projectRoot);
   const trustedMappingProof = options?.trustedMappingProof ?? nativeStartProof;
+  const source = nativePreparationSource(state, state.preparation_handoff!, phase, marker.request_id, marker.expected_roster, marker.policy_hash);
   const begun = beginCapability(projectRoot, selection, {
     feature_id: workspace.feature_id,
     run_key: state.run_key!,
     ...(trustedMappingProof === undefined ? {} : { trustedMappingProof }),
     consumeTrustedMappingProof: false,
+    native_preparation_source: source,
   });
   if (!begun.ok || !begun.handoff) return fail("SPEC_PHASE_FORBIDDEN", begun.ok ? "native phase capability handoff is unavailable" : begun.error);
   injectPhaseFailure("after_capability_begin");
