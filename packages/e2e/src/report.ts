@@ -513,6 +513,39 @@ function evidenceCandidates(
 function collectEvidence(candidates: readonly string[]): string[] {
   return candidates.filter(path => boundedReadableFile(path));
 }
+
+function assertMandatoryEvidenceReadable(
+  root: PinnedDirectory,
+  requiredEvidence: readonly string[],
+  phase: string,
+): void {
+  for (const evidencePath of requiredEvidence) {
+    if (evidencePath.length === 0 || readPinnedEvidence(root, evidencePath) === null) {
+      throw new Error(`ux-e2e: PASS mandatory evidence is missing or unsafe ${phase}`);
+    }
+  }
+}
+
+function mandatoryEvidencePaths(report: UxE2eReport): string[] {
+  const workspace = report.session.workspace;
+  const workspacePaths = workspace === undefined ? [] : [
+    ...workspace.documents,
+    ...workspace.validation,
+    ...workspace.history,
+    ...workspace.handoff,
+    ...workspace.artifacts,
+    ...workspace.checkpoints,
+    ...workspace.checkpoint_transcripts,
+    ...workspace.worker_attribution.map(worker => worker.evidence),
+    ...workspace.interruption_resume.map(marker => marker.evidence),
+  ];
+  return [...new Set([
+    report.session.transcript,
+    ...workspacePaths,
+    ...report.steps.flatMap(step => step.screenshots),
+  ].filter(path => path.length > 0))];
+}
+
 export interface EvidenceCopyTestHooks extends FsSafetyTestHooks {}
 
 export function setEvidenceCopyTestHooks(hooks: EvidenceCopyTestHooks | null): void {
@@ -1577,6 +1610,9 @@ function generateSingleReport(
       if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before evidence collection');
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before evidence collection');
       let evidence = collectEvidence(candidates);
+      if (input.verdict === 'PASS') {
+        assertMandatoryEvidenceReadable(scratchRoot, requiredEvidence, 'after evidence collection');
+      }
     if (opts.copyEvidence === true) {
       const evidenceTarget = opts.evidenceTargetDir ?? join(mdDir, 'evidence', slug);
       const evidenceTargetRoot = opts.retainedEvidenceRoot
@@ -1640,6 +1676,7 @@ function generateSingleReport(
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before report JSON output');
       if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before report JSON output');
       if ([...retainedEvidenceDestinationRoots].some(root => !pinnedDirectoryIsStable(root))) throw new Error('ux-e2e: evidence destination changed before report JSON output');
+      if (input.verdict === 'PASS') assertMandatoryEvidenceReadable(scratchRoot, requiredEvidence, 'before first publication');
     let jsonBytes: Buffer | null = null;
     let previousJson: Buffer | null = null;
     stateDestination = pinChildDirectory(scratchRoot, ['.work-state', 'ux-e2e']);
@@ -1686,6 +1723,7 @@ function generateSingleReport(
         }
         if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'after report output');
         if ([...retainedEvidenceDestinationRoots].some(root => !pinnedDirectoryIsStable(root))) throw new Error('ux-e2e: evidence destination changed after report output');
+        if (input.verdict === 'PASS') assertMandatoryEvidenceReadable(scratchRoot, requiredEvidence, 'after final publication');
       } catch (error) {
         if (unlinkPinnedFileIfExact(reportDestination, mdFilename, markdownBytes, { requireStable: false }) && previousMarkdown !== null) {
           writePinnedFile(reportDestination, mdFilename, previousMarkdown, { requireStable: false });
@@ -1920,6 +1958,7 @@ function writeSuiteReport(
   report: UxE2eReport,
   warnings: readonly string[],
   retainedEvidenceDestinationRoots: Iterable<PinnedDirectory>,
+  mandatoryEvidence: readonly { readonly root: PinnedDirectory; readonly paths: readonly string[] }[],
   retainedReportRoot?: PinnedDirectory,
 ): GenerateReportResult {
   const suiteRootHandle = discovery.root;
@@ -1939,6 +1978,9 @@ function writeSuiteReport(
     for (const root of retainedEvidenceDestinationRoots) {
       if (!pinnedDirectoryIsStable(root)) throw new Error(`ux-e2e: evidence destination changed ${phase}`);
     }
+  };
+  const assertMandatoryEvidenceStable = (phase: string): void => {
+    for (const entry of mandatoryEvidence) assertMandatoryEvidenceReadable(entry.root, entry.paths, phase);
   };
   const rollback = (): void => {
     if (markdownTouched && markdownBytes !== null) {
@@ -1973,6 +2015,7 @@ function writeSuiteReport(
     }
     assertSuiteDiscoveryStable(suiteRoot, discovery, 'before report JSON output');
     assertEvidenceDestinationsStable('before suite report JSON output');
+    if (report.verdict === 'PASS') assertMandatoryEvidenceStable('before first suite publication');
     jsonTouched = true;
     if (!writePinnedFile(stateRoot, 'report.json', jsonBytes)) throw new Error('ux-e2e: failed to write suite report.json');
     assertSuiteDiscoveryStable(suiteRoot, discovery, 'after report JSON output');
@@ -1983,6 +2026,7 @@ function writeSuiteReport(
     if (!writePinnedFile(reportRoot, mdFilename, markdownBytes)) throw new Error('ux-e2e: failed to write suite markdown report');
     assertSuiteDiscoveryStable(suiteRoot, discovery, 'after report output');
     assertEvidenceDestinationsStable('after suite report markdown output');
+    if (report.verdict === 'PASS') assertMandatoryEvidenceStable('after final suite publication');
     return { jsonPath: join(stateDir, 'report.json'), mdPath: join(mdDir, mdFilename), warnings: [...warnings] };
   } catch (error) {
     rollback();
@@ -2030,6 +2074,9 @@ function generateSuiteReport(
   let aggregateEvidenceFiles = 0;
   for (const { child, result } of childReports) {
     let childEvidenceBytes = 0;
+    if (input.verdict === 'PASS') {
+      assertMandatoryEvidenceReadable(child.root, mandatoryEvidencePaths(result.report), 'after suite evidence collection');
+    }
     if (result.report.evidence.length > MAX_SUITE_EVIDENCE_FILES - aggregateEvidenceFiles) throw new Error('ux-e2e: suite has too many evidence files');
     for (const evidencePath of result.report.evidence) {
       const size = boundedFileSize(evidencePath);
@@ -2102,7 +2149,9 @@ function generateSuiteReport(
     evidence: aggregateEvidence,
     generated_at: new Date().toISOString(),
   }, '') as UxE2eReport;
-  return writeSuiteReport(suiteRoot, discovery, mdDir, report, warnings, retainedEvidenceDestinationRoots, opts.retainedReportRoot);
+  return writeSuiteReport(suiteRoot, discovery, mdDir, report, warnings, retainedEvidenceDestinationRoots,
+    childReports.map(({ child, result }) => ({ root: child.root, paths: mandatoryEvidencePaths(result.report) })),
+    opts.retainedReportRoot);
   } catch (error) {
     rollbackCopiedEvidence();
     throw error;

@@ -286,6 +286,63 @@ test('report: PASS requires stopped lifecycle proof, no shutdown error, and decl
   writeSession(failed);
   assert.throws(() => generateReport(dir, BASE_INPUT), /PASS requires a stopped session/u);
 });
+test('report: PASS rejects mandatory evidence that disappears after collection', () => {
+  const dir = makeSessionDir();
+  const transcript = join(dir, '.work-state', 'ux-e2e', 'transcript.jsonl');
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-mandatory-evidence-md-'));
+  let deleted = false;
+  setFsSafetyTestHooks({
+    beforeSourceOpen(path) {
+      if (!deleted && path === transcript) {
+        deleted = true;
+        unlinkSync(transcript);
+      }
+    },
+  });
+  try {
+    assert.throws(
+      () => generateReport(dir, BASE_INPUT, { mdDir }),
+      /PASS mandatory evidence is missing or unsafe/u,
+    );
+    assert.equal(existsSync(join(dir, '.work-state', 'ux-e2e', 'report.json')), false);
+    assert.equal(deleted, true);
+  } finally {
+    setFsSafetyTestHooks(null);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+test('report suite: PASS rejects mandatory child evidence that disappears after collection', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-mandatory-evidence-suite-'));
+  const child = makeSessionDir();
+  renameSync(child, join(suite, 'session-a'));
+  const transcript = join(suite, 'session-a', '.work-state', 'ux-e2e', 'transcript.jsonl');
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-mandatory-evidence-suite-md-'));
+  let deleted = false;
+  setFsSafetyTestHooks({
+    beforeSourceOpen(path) {
+      if (!deleted && path === transcript) {
+        deleted = true;
+        unlinkSync(transcript);
+      }
+    },
+  });
+  try {
+    assert.throws(
+      () => generateReport(suite, BASE_INPUT, { mdDir }),
+      /PASS mandatory evidence is missing or unsafe/u,
+    );
+    assert.equal(existsSync(join(suite, '.work-state', 'ux-e2e', 'report.json')), false);
+    assert.equal(deleted, true);
+  } finally {
+    setFsSafetyTestHooks(null);
+    rmSync(suite, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+
 test('report: PASS gates declared evidence at the pinned per-file maximum', () => {
   const atLimit = makeSessionDir();
   const atLimitPath = join(atLimit, 'specs', 'feature-a', 'spec.md');
