@@ -1499,6 +1499,7 @@ function generateSingleReport(
   const ownsReportDestination = opts.retainedReportRoot === undefined;
   if (scratchRoot === null) throw new Error('ux-e2e: session root must be a stable directory');
   let stateDestination: PinnedDirectory | null = null;
+  let reportDestination: PinnedDirectory | null = null;
   const createdEvidence = new Map<string, Buffer>();
   const createdEvidenceRoots = new Map<string, PinnedDirectory>();
   const retainedEvidenceRoots: PinnedDirectory[] = [];
@@ -1615,7 +1616,7 @@ function generateSingleReport(
     const mdDir = resolve(opts.mdDir ?? join(process.cwd(), 'vibe-report'));
     if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before report output');
     if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before report output');
-    const reportDestination = opts.writeOutputs === false ? null : opts.retainedReportRoot ?? pinOrCreateDirectory(mdDir);
+    reportDestination = opts.writeOutputs === false ? null : opts.retainedReportRoot ?? pinOrCreateDirectory(mdDir);
     if (opts.writeOutputs !== false && reportDestination === null) {
       throw new Error('ux-e2e: report destination root must be a stable non-symlink directory');
     }
