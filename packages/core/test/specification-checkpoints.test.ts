@@ -17,10 +17,12 @@ import { writeTestArtifact } from "./fixtures/artifacts.js";
  *       open checkpoint replays the established record
  *     - the mounted selected checkpoint Ask records one trusted,
  *       attributable human decision and performs exactly one of:
- *         approve_continue -> durable approval + exact next-phase dispatch,
+ *         approve_continue -> durable approval + cursor advance; roster-gated
+ *                            next phase requires fresh preparation,
  *         approve_stop    -> durable approval + return without dispatch,
- *         request_changes -> same-phase re-dispatch with the captured
- *                            feedback, a new capability epoch/version
+ *         request_changes -> durable same-phase revision_required state with
+ *                            captured feedback; fresh preparation mints the new
+ *                            capability epoch/version
  *
  * This file is intentionally red until T041–T042 implement the named policy
  * and the phase checkpoint surface. Every case encodes observable contract:
@@ -28,7 +30,9 @@ import { writeTestArtifact } from "./fixtures/artifacts.js";
  *   - every human decision requires a durable terminal/escalation answer
  *     proof bound to run, stage, checkpoint, capability epoch, and policy
  *     hash; agent provenance and policy automation can never approve;
- *   - replaying the exact decision is idempotent and repeats no dispatch;
+ *   - replaying an exact decision on its current phase/cursor is idempotent;
+ *     an old capability cannot replay after cursor advancement, and no replay
+ *     dispatches a phase;
  *   - invalid or missing validation results suppress the checkpoint
  *     entirely (no open checkpoint, no authorizable answer);
  *   - request_changes requires non-empty feedback, keeps the workflow on
