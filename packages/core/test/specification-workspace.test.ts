@@ -141,6 +141,19 @@ test("minimal specification creation commits readable state and prepares without
     assert.equal(resolved.isStale, false, "an unclassified specification envelope is branch-neutral");
     assert.equal(resolved.state?.classification, undefined);
     assert.equal(resolved.state?.state_revision, 1);
+    const constitutionBody = "# Constitution v1.0.0\n\n## Quality\n\nTest every change.\n";
+    writeFileSync(join(root, "CONSTITUTION.md"), constitutionBody, "utf8");
+    const gate = ensureProjectConstitution(root, {
+      origin_kind: "native_direct",
+      origin_run_key: runKey,
+      origin_stage: "specify",
+    }, { feature_id: featureId });
+    assert.ok(gate.ok && gate.value.binding, gate.ok ? "constitution prerequisite is bound" : gate.error);
+    if (!gate.ok || !gate.value.binding) return;
+    const bound = resolveFeatureWorkspace(root, { feature_id: featureId, run_key: runKey });
+    assert.ok(bound.ok, bound.ok ? "workspace remains resolvable after constitution binding" : bound.error);
+    if (!bound.ok) return;
+    assert.deepEqual(bound.value.constitution_binding, gate.value.binding, "canonical prerequisite binds the exact approved constitution");
 
     const prepared = prepareWorkflowState({
       task: "Prepare the readable specification",
