@@ -22,7 +22,7 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { TextDecoder } from "node:util";
 import { findProfileDir } from "../engine/profile.js";
 import { MAX_CHECKPOINT_RATIONALE_BYTES } from "../engine/durable.js";
-import { ctoMappingConfirmationProofRelativePath, ctoMappingConfirmationStateDigest, readCtoMappingConfirmationProof, removeCtoMappingConfirmationProof, signCtoMappingConfirmationProof, writeCtoMappingConfirmationProof, type CtoMappingConfirmationProof, type CtoMappingConfirmationProofAnswer, type CtoMappingConfirmationProofPayload } from "../engine/cto-mapping-proof.js";
+import { ctoMappingConfirmationProofRelativePath, ctoMappingConfirmationStateDigest, readCtoMappingConfirmationProof, removeCtoMappingConfirmationProof, signCtoMappingConfirmationProof, signCtoMappingConfirmationTransaction, verifyCtoMappingConfirmationTransaction, writeCtoMappingConfirmationProof, type CtoMappingConfirmationProof, type CtoMappingConfirmationProofAnswer, type CtoMappingConfirmationProofPayload } from "../engine/cto-mapping-proof.js";
 import { buildCtoSpecificationMapping, loadTeamDefs } from "../cto/plan.js";
 import { resolveChannelProfile } from "../cto/channels.js";
 import {
@@ -1860,6 +1860,8 @@ interface CtoSpecificationMappingTransactionBase {
   confirmation_proof_path?: string;
   confirmation_proof_digest?: string;
   confirmation_proof_content?: string;
+  /** Root-secret HMAC over the complete persisted confirmation WAL envelope. */
+  confirmation_transaction_hmac?: string;
   abort_reason?: string;
   abort_started_at?: string;
   terminal_at?: string;
@@ -1904,7 +1906,7 @@ const MAPPING_TRANSACTION_REQUIRED_KEYS = new Set([
 ]);
 const MAPPING_TRANSACTION_OPTIONAL_KEYS = new Set([
   "state_before_content", "state_source_content", "state",
-  "confirmation_proof_path", "confirmation_proof_digest", "confirmation_proof_content",
+  "confirmation_proof_path", "confirmation_proof_digest", "confirmation_proof_content", "confirmation_transaction_hmac",
   "operation", "abort_reason", "abort_started_at", "terminal_at", "terminal_disposition",
   "abort_observed_mapping_digest",
 ]);
@@ -2343,7 +2345,8 @@ function parseMappingTransaction(
       : stateTransition.feedback !== undefined)
     || (confirmationWAL && (typeof candidate.confirmation_proof_path !== "string"
       || typeof candidate.confirmation_proof_digest !== "string" || !/^[a-f0-9]{64}$/.test(candidate.confirmation_proof_digest)
-      || typeof candidate.confirmation_proof_content !== "string"))
+      || typeof candidate.confirmation_proof_content !== "string"
+      || typeof candidate.confirmation_transaction_hmac !== "string" || !/^[a-f0-9]{64}$/.test(candidate.confirmation_transaction_hmac)))
   ) {
     throw new Error(`CTO_SPEC_MAPPING_TRANSACTION_INVALID: transaction at ${path} is incomplete`);
   }
@@ -2565,6 +2568,7 @@ function parseMappingTransaction(
     ...(typeof candidate.confirmation_proof_path === "string" ? { confirmation_proof_path: candidate.confirmation_proof_path } : {}),
     ...(typeof candidate.confirmation_proof_digest === "string" ? { confirmation_proof_digest: candidate.confirmation_proof_digest } : {}),
     ...(typeof candidate.confirmation_proof_content === "string" ? { confirmation_proof_content: candidate.confirmation_proof_content } : {}),
+    ...(typeof candidate.confirmation_transaction_hmac === "string" ? { confirmation_transaction_hmac: candidate.confirmation_transaction_hmac } : {}),
     ...(directWAL ? {} : {
       state_before_content: candidate.state_before_content as string,
       state_source_content: candidate.state_source_content as string,
@@ -2606,6 +2610,15 @@ function quarantineInvalidMappingTransactionPinned(
     const answerMappingId = typeof parsed.mapping_id === "string" && isSafeCtoExecutionId(parsed.mapping_id) ? parsed.mapping_id : "unknown";
     quarantineMappingTransactionDescriptorPinned(root, ctoRunId, transactionId, answerMappingId, mappingTransactionWalReceipt(sourceRead.bytes, sourceRead.dev, sourceRead.ino), pinnedRoot, "-answer-invalid");
     throw new Error("CTO_SPEC_MAPPING_ANSWER_RECOVERY_REQUIRED: quarantined malformed answer WAL '" + transactionId + "'; obtain a fresh trusted terminal Ask before continuing");
+  }
+  // Confirmation WAL authentication failure is never allowed to depend on
+  // its claimed preimage/postimage. Archive the exact descriptor regardless
+  // of the current mapping image; no canonical map/state/sidecar mutation is
+  // safe until an authenticated transaction is available.
+  if (parsed.operation === "confirm" && (typeof parsed.confirmation_transaction_hmac !== "string" || !/^[a-f0-9]{64}$/.test(parsed.confirmation_transaction_hmac) || /confirmation WAL authentication|transaction HMAC|authentication failed/i.test(reason))) {
+    const confirmationMappingId = typeof parsed.mapping_id === "string" && isSafeCtoExecutionId(parsed.mapping_id) ? parsed.mapping_id : "unknown";
+    quarantineMappingTransactionDescriptorPinned(root, ctoRunId, transactionId, confirmationMappingId, mappingTransactionWalReceipt(sourceRead.bytes, sourceRead.dev, sourceRead.ino), pinnedRoot, "-confirm-invalid");
+    return true;
   }
   const mappingId = parsed.mapping_id;
   const beforeDisposition = parsed.mapping_before_disposition;
@@ -2689,7 +2702,13 @@ function readPinnedMappingTransactions(root: string, ctoRunId: string, pinnedRoo
       throw new Error(`CTO_SPEC_MAPPING_TRANSACTION_INVALID: ${reason}`);
     }
     try {
-      const transaction = parseMappingTransaction(root, raw, path, ctoRunId, transactionId, mappingTransactionWalReceipt(read.bytes, read.dev, read.ino));
+      const transactionReceipt = mappingTransactionWalReceipt(read.bytes, read.dev, read.ino);
+      const transaction = parseMappingTransaction(root, raw, path, ctoRunId, transactionId, transactionReceipt);
+      if (transaction.operation === "confirm" && !verifyCtoMappingConfirmationTransaction(pinnedRoot, transaction as unknown as Record<string, unknown>, transaction.confirmation_transaction_hmac)) {
+        const reason = "confirmation WAL authentication failed";
+        if (quarantineInvalidMappingTransactionPinned(root, ctoRunId, transactionId, raw, read, pinnedRoot, reason)) continue;
+        throw new Error(`CTO_SPEC_MAPPING_TRANSACTION_INVALID: ${reason}`);
+      }
       transactions.push(transaction);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -2799,7 +2818,16 @@ function persistMappingTransactionPinned(
   const path = mappingTransactionPath(transaction, pinnedRoot);
   const relativePath = pinnedRelativePath(pinnedRoot, path);
   // wal_receipt is an in-memory anchor and must never become an on-disk field.
-  const { wal_receipt: _walReceipt, ...persistedTransaction } = transaction;
+  const { wal_receipt: _walReceipt, confirmation_transaction_hmac: _confirmationTransactionHmac, ...unsignedTransaction } = transaction;
+  const confirmationTransactionHmac = transaction.operation === "confirm"
+    ? signCtoMappingConfirmationTransaction(pinnedRoot, unsignedTransaction as unknown as Record<string, unknown>)
+    : null;
+  if (transaction.operation === "confirm" && !confirmationTransactionHmac) {
+    throw new Error("CTO_SPEC_MAPPING_RECOVERY_REQUIRED: confirmation WAL authentication could not be minted");
+  }
+  const persistedTransaction = transaction.operation === "confirm"
+    ? { ...unsignedTransaction, confirmation_transaction_hmac: confirmationTransactionHmac }
+    : unsignedTransaction;
   const content = `${JSON.stringify(persistedTransaction, null, 2)}\r\n`;
   const contentBytes = Buffer.byteLength(content, "utf8");
   if (contentBytes > MAX_MAPPING_TRANSACTION_FILE_BYTES) {
@@ -3094,8 +3122,40 @@ function mappingConfirmationTransactionProofError(
   return null;
 }
 
+function confirmationTransactionWalError(
+  root: string,
+  transaction: MappingTransactionWithWalReceipt,
+  pinnedRoot: PinnedProjectRoot,
+): string | null {
+  if (transaction.operation !== "confirm") return null;
+  const path = mappingTransactionPath(transaction, pinnedRoot);
+  const source = readPinnedRegularFile(pinnedRoot, path, MAX_MAPPING_TRANSACTION_FILE_BYTES);
+  if (!source.ok) return `confirmation WAL cannot be re-read for authentication: ${source.error}`;
+  const receipt = mappingTransactionWalReceipt(source.bytes, source.dev, source.ino);
+  let parsed: unknown;
+  try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(source.bytes)); }
+  catch (error) { return `confirmation WAL is not valid JSON: ${error instanceof Error ? error.message : String(error)}`; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "confirmation WAL authentication envelope is not an object";
+  const candidate = parsed as Record<string, unknown>;
+  if (candidate.transaction_id !== transaction.transaction_id) return "confirmation WAL authentication transaction id is mismatched";
+  if (!verifyCtoMappingConfirmationTransaction(pinnedRoot, candidate, candidate.confirmation_transaction_hmac)) return "confirmation WAL authentication failed";
+  const parsedWithoutMac = { ...candidate };
+  delete parsedWithoutMac.confirmation_transaction_hmac;
+  const expectedWithoutMac = { ...(transaction as unknown as Record<string, unknown>) };
+  delete expectedWithoutMac.confirmation_transaction_hmac;
+  delete expectedWithoutMac.wal_receipt;
+  if (canonicalJson(parsedWithoutMac) !== canonicalJson(expectedWithoutMac)) return "confirmation WAL authenticated content differs from the prepared transaction";
+  const expectedReceipt = transaction.wal_receipt;
+  if (receipt.dev !== expectedReceipt.dev || receipt.ino !== expectedReceipt.ino || receipt.sha256 !== expectedReceipt.sha256) return "confirmation WAL descriptor changed before authentication";
+  return null;
+}
+
 function commitMappingTransactionPinned(root: string, transaction: MappingTransactionWithWalReceipt, pinnedRoot: PinnedProjectRoot): void {
   assertMappingTransactionWalReceiptPinned(transaction, transaction.wal_receipt, pinnedRoot);
+  const confirmationTransactionError = confirmationTransactionWalError(root, transaction, pinnedRoot);
+  if (confirmationTransactionError) {
+    throw new Error(`CTO_SPEC_MAPPING_RECOVERY_REQUIRED: ${confirmationTransactionError}`);
+  }
   if (isDirectMappingTransaction(transaction)) {
     commitDirectMappingTransactionPinned(root, transaction, pinnedRoot);
     return;

@@ -5172,6 +5172,14 @@ export function persistCtoSpecificationConformance(
       pinnedRoot.close();
       return result;
     }
+    // RuntimeAccess binds both the canonical project root and the owning
+    // session/run before recovery is allowed to inspect or mutate WALs. This
+    // read-only transaction intentionally ends before recovery to avoid a
+    // nested run lock; a wrong-run token therefore cannot recover that run.
+    options.runtimeAccess.withRunTransaction(encodedAuthority.cto_run_id, (run) => {
+      const state = run.readState();
+      if (state.id !== encodedAuthority.cto_run_id) throw new Error("runtime run identity changed during conformance authorization");
+    });
     recoverCtoSpecificationMappingTransactions(pinnedRoot.canonical_root, encodedAuthority.cto_run_id, pinnedRoot);
     authority = resolveCtoConformanceAuthority(input?.binding, pinnedRoot.canonical_root, pinnedRoot);
   } catch (error) {

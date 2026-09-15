@@ -9,6 +9,7 @@ import type { TrustedCheckpointAnswer } from "./types.js";
 
 const SCHEMA_VERSION = 1 as const;
 const DOMAIN = "cto-mapping-confirmation-v1";
+const TRANSACTION_DOMAIN = "cto-mapping-confirmation-transaction-v1";
 const MAX_BYTES = 256 * 1024;
 const SAFE_PROOF = /^[a-f0-9]{64}$/u;
 const SAFE_STAGE = /^[A-Za-z0-9._:-]{1,128}$/u;
@@ -175,6 +176,38 @@ function canonicalRecordPath(proof: Pick<CtoMappingConfirmationProof, "cto_run_i
 
 function canonicalStatePath(featureId: string): string {
   return `.work-state/features/${featureId}/state.json`;
+}
+
+function transactionHmac(pinnedRoot: PinnedProjectRoot, transaction: Record<string, unknown>): string | null {
+  const master = readOrCreateRootRuntimeSecret(pinnedRoot);
+  const key = master ? deriveRuntimeSecretKey(master, TRANSACTION_DOMAIN) : null;
+  if (!key) return null;
+  const unsigned = { ...transaction };
+  delete unsigned.confirmation_transaction_hmac;
+  delete unsigned.wal_receipt;
+  try { return createHmac("sha256", key).update(canonicalJson(unsigned), "utf8").digest("hex"); } catch { return null; }
+}
+
+export function signCtoMappingConfirmationTransaction(
+  pinnedRoot: PinnedProjectRoot,
+  transaction: Record<string, unknown>,
+): string | null {
+  try { return transactionHmac(pinnedRoot, transaction); } catch { return null; }
+}
+
+export function verifyCtoMappingConfirmationTransaction(
+  pinnedRoot: PinnedProjectRoot,
+  transaction: Record<string, unknown>,
+  mac: unknown,
+): boolean {
+  try {
+    if (typeof mac !== "string" || !SAFE_PROOF.test(mac)) return false;
+    const expected = transactionHmac(pinnedRoot, transaction);
+    if (!expected) return false;
+    const actualBytes = Buffer.from(mac, "hex");
+    const expectedBytes = Buffer.from(expected, "hex");
+    return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
+  } catch { return false; }
 }
 
 function proofHmac(pinnedRoot: PinnedProjectRoot, payload: UnsignedProof): string | null {

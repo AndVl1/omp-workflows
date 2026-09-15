@@ -1600,7 +1600,7 @@ export function verifyClaimAdmissionBinding(
       context.run_key,
       verificationMode === "terminal"
         ? { allowUnstable: true }
-        : { expected_state_revision: admission.confirmation_state_revision },
+        : {},
     );
   if (!anchorStateResult.ok) return anchorStateResult.error;
   const anchorState = anchorStateResult.state;
