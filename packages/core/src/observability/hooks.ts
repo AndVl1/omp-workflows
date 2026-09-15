@@ -142,7 +142,7 @@ export function observabilitySessionGeneration(ctx: unknown): string | number | 
       const value = (manager as Record<string, unknown>)[key];
       if (valid(value)) return value;
     }
-    return undefined;
+    return valid(record.generation) ? record.generation : undefined;
   }
   return valid(record.generation) ? record.generation : undefined;
 }
