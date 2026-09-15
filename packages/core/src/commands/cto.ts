@@ -5062,7 +5062,7 @@ export function resumeCtoSpecificationMapping(
       assertRuntimeLive();
       injectMappingFailure(root, pinnedRoot, "before_mapping_write", transaction.transaction_id);
       assertRuntimeLive();
-      pinnedRoot.replaceFileIfMatches(mappingRelativePath, {
+      const publishedMapping = pinnedRoot.replaceFileIfMatchesWithDescriptor(mappingRelativePath, {
         dev: mappingRead.dev,
         ino: mappingRead.ino,
         sha256: mappingBeforeDigest,
@@ -5073,6 +5073,13 @@ export function resumeCtoSpecificationMapping(
       if (!pinnedRoot.isStable()) return blockedCtoMappingAsk("project root changed after mapping resume");
       const resumedMapping = readPinnedRegularFile(pinnedRoot, file, MAX_CTO_MAPPING_RECORD_BYTES);
       if (!resumedMapping.ok) return blockedCtoMappingAsk(`mapping resume could not be reread: ${resumedMapping.error}`);
+      const resumedContent = resumedMapping.bytes.toString("utf8");
+      if (resumedContent !== content
+        || sha256Hex(resumedContent) !== sha256Hex(content)
+        || resumedMapping.dev !== publishedMapping.dev
+        || resumedMapping.ino !== publishedMapping.ino) {
+        return blockedCtoMappingAsk("mapping resume postimage descriptor or content changed before WAL cleanup");
+      }
       const postWriteConstitutionError = refreshCtoMappingConstitutions(root, reopened, pinnedRoot);
       if (postWriteConstitutionError) {
         try {
