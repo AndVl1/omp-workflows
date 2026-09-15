@@ -2436,12 +2436,13 @@ def abort_prepared_write(payload):
                     rollback_prepared_publication(prepared)
                 except RuntimeError:
                     pass
-            cleanup_temp(parent, prepared.get("backup"))
-            release_conditional_lock(parent, prepared["lock_name"], prepared["lock_token"])
-            fsync_regular(parent)
-            prepared_writes.pop(token, None)
-            if prepared.get("batch_id") is not None and not any(candidate.get("batch_id") == prepared.get("batch_id") for candidate in prepared_writes.values()):
-                remove_batch_journal(3, prepared["batch_journal"], prepared["batch_id"], True)
+            if payload.get("release_published") is True:
+                cleanup_temp(parent, prepared.get("backup"))
+                release_conditional_lock(parent, prepared["lock_name"], prepared["lock_token"])
+                fsync_regular(parent)
+                prepared_writes.pop(token, None)
+                if prepared.get("batch_id") is not None and not any(candidate.get("batch_id") == prepared.get("batch_id") for candidate in prepared_writes.values()):
+                    remove_batch_journal(3, prepared["batch_journal"], prepared["batch_id"], True)
             return {"ok": True, "aborted": False, "quarantined": True}
         abort_prepared_stage_exact(prepared)
         cleanup_temp(parent, prepared.get("backup"))
@@ -5467,6 +5468,7 @@ export class PinnedProjectRoot {
       descriptor: PinnedRootWriteDescriptor;
       preimage: PinnedRootWritePreimage;
       committed: boolean;
+      commit_confirmed: boolean;
     };
     const prepared: PreparedBatchEntry[] = [];
     const batchId = durableBatch ? randomUUID() : undefined;
@@ -5498,7 +5500,7 @@ export class PinnedProjectRoot {
         }
         const preimage = preimageFromResponse(response);
         const descriptor = descriptorFromResponse(entry.path, this.anchorPath(entry.path), entry.content, response);
-        prepared.push({ path: entry.path, content: entry.content, token: response.token, descriptor, preimage, committed: false });
+        prepared.push({ path: entry.path, content: entry.content, token: response.token, descriptor, preimage, committed: false, commit_confirmed: false });
       }
       const receipts = prepared.map((entry) => this.makeWriteReceipt(entry.path, entry.descriptor, entry.preimage));
       options.beforePublish?.(receipts);
@@ -5518,6 +5520,7 @@ export class PinnedProjectRoot {
           throw new PinnedRootError("changed", "prepared batch postimage descriptor changed before acknowledgement");
         }
         if (response.ack_required !== true) throw new PinnedRootError("write_failed", "prepared batch write returned no acknowledgement requirement");
+        entry.commit_confirmed = true;
         if (this.hooks.batchFailureIndex === prepared.indexOf(entry)) throw new PinnedRootError("write_failed", "injected anchored atomic batch interruption");
       }
       for (const entry of prepared) {
@@ -5583,7 +5586,7 @@ export class PinnedProjectRoot {
       for (const entry of prepared.slice().reverse()) {
         let aborted = false;
         try {
-          const abortResult = this.runDescriptorHelper<{ aborted?: unknown }>("abort_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino });
+          const abortResult = this.runDescriptorHelper<{ aborted?: unknown }>("abort_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino, ...(entry.commit_confirmed ? { release_published: true } : {}) });
           aborted = abortResult.aborted === true;
         } catch { abortComplete = false; /* stale lease recovery owns cleanup */ }
         if (entry.committed && !this.rollbackPublishedDescriptor(entry.path, entry.descriptor, entry.preimage)) rollbackComplete = false;

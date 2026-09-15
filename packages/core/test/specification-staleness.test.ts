@@ -698,7 +698,12 @@ test("workspace staleness persists across an explicit-selector session boundary"
     assert.ok(authoritative.ok, authoritative.ok ? "authoritative workspace" : `rejected: ${authoritative.error}`);
     if (!authoritative.ok) throw new Error(authoritative.error);
     const expectedWorkspaceDigest = digestOf(authoritative.value);
-    const durable: FeatureWorkspace = { ...propagated.workspace, project_root: project.created.project_root };
+    const durable: FeatureWorkspace = {
+      ...propagated.workspace,
+      project_root: project.created.project_root,
+      constitution_binding: authoritative.value.constitution_binding,
+      constitution_gate_ref: authoritative.value.constitution_gate_ref,
+    };
     bindFeatureWorkspaceToRoot(durable, project.root);
     const persisted = persistFeatureWorkspace(project.root, durable, undefined, { expected_workspace_digest: expectedWorkspaceDigest });
     assert.ok(persisted.ok, persisted.ok ? "persisted" : `rejected: ${persisted.error}`);
