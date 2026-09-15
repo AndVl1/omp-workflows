@@ -21,7 +21,7 @@ import { MAX_PERSISTED_STATE_BYTES, updateStateAtomically, parseBoundedPersisted
 import { validateProducedArtifact } from "../engine/artifact-contract.js";
 import { PinnedProjectRoot } from "./pinned-root.js";
 import type { CompletionArtifactRef, CompletionEnvelope, WorkIdentity } from "../engine/types.js";
-import { readCurrentExecutionClaim, verifyExecutionClaimAdmissionBindingPinned } from "./claims.js";
+import { readCurrentExecutionClaim, verifyClaimAdmissionBinding, verifyExecutionClaimAdmissionBindingPinned } from "./claims.js";
 import { canonicalHandoffDigest } from "./handoff.js";
 import { readCanonicalHandoff } from "./canonical-reader.js";
 import {
@@ -4955,6 +4955,21 @@ function persistCtoSpecificationConformanceUnlocked(
           const artifactPath = `.work-state/features/${feature.feature_id}/artifacts/implementation_conformance/${matrix.conformance_id}.json`;
           if (previousRef === matrix.conformance_id && !pinnedRoot.pathEntryExists(artifactPath)) {
             return { op: "fail" as const, code: "state_conflict", error: "workspace points to a missing implementation conformance artifact" };
+          }
+          const currentAdmission = currentClaim.admission_binding;
+          if (!currentAdmission) {
+            return { op: "fail" as const, code: "state_conflict", error: "execution claim admission proof is unavailable before conformance publication" };
+          }
+          const currentAdmissionProofError = verifyClaimAdmissionBinding(
+            snapshot,
+            pinnedRoot,
+            feature.feature_id,
+            currentClaim.owner_run_id,
+            currentAdmission,
+            "terminal",
+          );
+          if (currentAdmissionProofError) {
+            return { op: "fail" as const, code: "state_conflict", error: `execution claim admission proof changed before conformance publication: ${currentAdmissionProofError}` };
           }
           const currentConstitutionError = ctoConstitutionErrorReadOnly(pinnedRoot, canonicalCurrent, currentHandoff.handoff);
           if (currentConstitutionError) {

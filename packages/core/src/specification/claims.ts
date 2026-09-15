@@ -1522,7 +1522,7 @@ export function readClaimAuthority(
   }
 }
 
-function verifyClaimAdmissionBinding(
+export function verifyClaimAdmissionBinding(
   snapshot: StateSnapshot,
   pinnedRoot: PinnedProjectRoot,
   featureId: string,

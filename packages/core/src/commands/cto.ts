@@ -3303,17 +3303,10 @@ function quarantineInvalidConfirmationTransactionPinned(
   // valid since the failed attempt, leave the transaction replayable rather
   // than quarantining a concurrently repaired confirmation.
   if (!mappingConfirmationTransactionProofError(transaction, pinnedRoot)) return false;
-  const state = readPinnedFeatureState(root, transaction.feature_id, transaction.run_key, pinnedRoot);
-  if (!state.ok) return false;
-  const stateCommitted = mappingStateDigest(state.value.state) === transaction.state_after_digest;
-  const identity = currentMappingIdentityPinned(pinnedRoot, root, transaction.mapping_path, transaction.cto_run_id, transaction.mapping_id);
-  if (!stateCommitted && isExactStagedMapping(identity, transaction)) {
-    // This is the only safe revocation case: the exact confirmed postimage is
-    // visible, but its proof-authenticated consumed state is not committed.
-    // quarantineMappingPinned performs receipt-bound CAS and never trusts a
-    // replacement mapping or WAL image.
-    quarantineMappingPinned(pinnedRoot, root, transaction);
-  }
+  // Invalid or unverifiable WAL bytes are audit evidence only. Never use
+  // their mapping/state postimages to revoke or overwrite a canonical record;
+  // a forged clone could otherwise delete a valid confirmed mapping. A safe
+  // reset is a separate canonical preflight/Ask operation, not WAL recovery.
   quarantineMappingTransactionDescriptorPinned(
     root,
     transaction.cto_run_id,
