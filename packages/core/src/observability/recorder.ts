@@ -651,6 +651,8 @@ export class EventRecorder {
   private readonly maxRecords: number;
   private readonly maxAggregateBytes: number;
   private queue: Promise<void> = Promise.resolve();
+  private closing = false;
+  private closePromise: Promise<void> | null = null;
 
   constructor(opts: RecorderOptions) {
     this.branch = opts.branch;
@@ -682,9 +684,18 @@ export class EventRecorder {
     }
   }
 
-  /** Close an owned root. Borrowed roots remain owned by the caller. */
+  /** Close after queued writes drain; borrowed roots remain owned by the caller. */
   close(): void {
-    if (this.ownsPinnedRoot) this.pinnedRoot.close();
+    if (this.closePromise) return;
+    this.closing = true;
+    this.closePromise = this.flush().then(() => {
+      if (this.ownsPinnedRoot) this.pinnedRoot.close();
+    });
+  }
+
+  async closeAsync(): Promise<void> {
+    this.close();
+    await this.closePromise;
   }
 
   /** Canonical root identity used for lifecycle-owned cache eviction. */
@@ -707,6 +718,7 @@ export class EventRecorder {
 
   /** Append a single event. Invalid lifecycle evidence rejects this promise. */
   append(event: Omit<ObservabilityEvent, "id" | "branch">): Promise<ObservabilityEvent> {
+    if (this.closing) return Promise.reject(new PinnedRootError("changed", "observability recorder is closed"));
     const normalized = sanitizeEvent(this.pinnedRoot, event);
     const fullEvent: ObservabilityEvent = {
       ...normalized,

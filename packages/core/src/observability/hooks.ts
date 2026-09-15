@@ -80,42 +80,126 @@ function activeFeatureSlug(pinnedRoot: PinnedProjectRoot): string {
   }
 }
 
-const recorderCache = new Map<string, EventRecorder>();
+export interface ObservabilityRecorderOwnerIdentity {
+  readonly canonicalRoot: string;
+  readonly rootDev: number;
+  readonly rootIno: number;
+  readonly sessionId?: string;
+  readonly sessionFile?: string;
+  readonly generation?: string | number;
+}
+
+export type RecorderLease = {
+  readonly identity: ObservabilityRecorderOwnerIdentity;
+  readonly entries: Set<RecorderEntry>;
+  disposed: boolean;
+};
+type RecorderEntry = {
+  readonly cwd: string;
+  readonly recorder: EventRecorder;
+  readonly canonicalRoot: string;
+  readonly rootDev: number;
+  readonly rootIno: number;
+  readonly owners: Set<RecorderLease>;
+};
+
+const recorderCache = new Map<string, RecorderEntry>();
 const MAX_CACHED_RECORDERS = 64;
 
-function closeRecorderInstance(recorder: EventRecorder): void {
-  let owned = false;
+export function createObservabilityRecorderLease(identity: ObservabilityRecorderOwnerIdentity): RecorderLease {
+  return { identity, entries: new Set(), disposed: false };
+}
+
+export function createObservabilityRecorderLeaseForCwd(cwd: string, session: Omit<ObservabilityRecorderOwnerIdentity, "canonicalRoot" | "rootDev" | "rootIno"> = {}): RecorderLease | undefined {
+  const pinnedRoot = PinnedProjectRoot.open(cwd);
+  if (!pinnedRoot) return undefined;
+  const identity = { canonicalRoot: pinnedRoot.canonical_root, rootDev: pinnedRoot.dev, rootIno: pinnedRoot.ino, ...session };
+  pinnedRoot.close();
+  return createObservabilityRecorderLease(identity);
+}
+
+export async function closeObservabilityRecorderLease(lease: RecorderLease): Promise<void> {
+  await closeRecorderLease(lease);
+}
+
+export async function closeObservabilityRecorderLeaseForCwd(lease: RecorderLease, cwd: string): Promise<boolean> {
+  return closeRecorderLeaseForCwd(lease, cwd);
+}
+
+function closeRecorderForFailure(recorder: EventRecorder): void {
+  for (const entry of new Set(recorderCache.values())) {
+    if (entry.recorder === recorder) void closeRecorderEntry(entry);
+  }
+}
+
+async function closeRecorderEntry(entry: RecorderEntry): Promise<void> {
+  for (const owner of entry.owners) owner.entries.delete(entry);
+  entry.owners.clear();
   for (const [cwd, cached] of [...recorderCache.entries()]) {
-    if (cached !== recorder) continue;
-    recorderCache.delete(cwd);
-    owned = true;
+    if (cached === entry) recorderCache.delete(cwd);
   }
-  if (owned) recorder.close();
+  await entry.recorder.closeAsync();
 }
 
-function cacheRecorder(cwd: string, recorder: EventRecorder): void {
+function attachLease(entry: RecorderEntry, lease: RecorderLease | undefined): void {
+  if (!lease || lease.disposed) return;
+  if (entry.canonicalRoot !== lease.identity.canonicalRoot || entry.rootDev !== lease.identity.rootDev || entry.rootIno !== lease.identity.rootIno) return;
+  entry.owners.add(lease);
+  lease.entries.add(entry);
+}
+
+async function closeRecorderLease(lease: RecorderLease): Promise<void> {
+  if (lease.disposed) return;
+  lease.disposed = true;
+  const closing: Promise<void>[] = [];
+  for (const entry of [...lease.entries]) {
+    entry.owners.delete(lease);
+    lease.entries.delete(entry);
+    if (entry.owners.size === 0) closing.push(closeRecorderEntry(entry));
+  }
+  await Promise.all(closing);
+}
+
+async function closeRecorderLeaseForCwd(lease: RecorderLease, cwd: string): Promise<boolean> {
+  if (lease.disposed) return false;
+  const pinnedRoot = PinnedProjectRoot.open(cwd);
+  if (!pinnedRoot) return false;
+  const identity = { canonicalRoot: pinnedRoot.canonical_root, rootDev: pinnedRoot.dev, rootIno: pinnedRoot.ino };
+  const matches = lease.identity.canonicalRoot === identity.canonicalRoot
+    && lease.identity.rootDev === identity.rootDev
+    && lease.identity.rootIno === identity.rootIno;
+  pinnedRoot.close();
+  if (!matches) return false;
+  const closing: Promise<void>[] = [];
+  for (const entry of [...lease.entries]) {
+    if (entry.canonicalRoot !== identity.canonicalRoot || entry.rootDev !== identity.rootDev || entry.rootIno !== identity.rootIno) continue;
+    entry.owners.delete(lease);
+    lease.entries.delete(entry);
+    if (entry.owners.size === 0) closing.push(closeRecorderEntry(entry));
+  }
+  await Promise.all(closing);
+  return true;
+}
+
+function cacheRecorder(cwd: string, recorder: EventRecorder, pinnedRoot: PinnedProjectRoot): RecorderEntry {
   const prior = recorderCache.get(cwd);
-  if (prior && prior !== recorder) prior.close();
-  recorderCache.set(cwd, recorder);
+  if (prior) void closeRecorderEntry(prior);
+  const entry: RecorderEntry = { cwd, recorder, canonicalRoot: pinnedRoot.canonical_root, rootDev: pinnedRoot.dev, rootIno: pinnedRoot.ino, owners: new Set() };
+  recorderCache.set(cwd, entry);
   while (recorderCache.size > MAX_CACHED_RECORDERS) {
-    const oldest = recorderCache.entries().next().value as [string, EventRecorder] | undefined;
+    const oldest = recorderCache.entries().next().value as [string, RecorderEntry] | undefined;
     if (!oldest) break;
-    recorderCache.delete(oldest[0]);
-    oldest[1].close();
+    void closeRecorderEntry(oldest[1]);
   }
+  return entry;
 }
 
-export function closeObservabilityRecorders(root?: string): void {
-  for (const [cwd, recorder] of [...recorderCache.entries()]) {
-    if (root !== undefined && recorder.canonicalRoot !== root && cwd !== root) continue;
-    recorderCache.delete(cwd);
-    recorder.close();
-  }
-}
-
-function getRecorder(cwd: string): EventRecorder {
+function getRecorder(cwd: string, lease?: RecorderLease): EventRecorder {
   const cached = recorderCache.get(cwd);
-  if (cached) return cached;
+  if (cached) {
+    attachLease(cached, lease);
+    return cached.recorder;
+  }
   const pinnedRoot = PinnedProjectRoot.open(cwd);
   if (!pinnedRoot) throw new PinnedRootError("unsupported", "project root could not be pinned for observability");
   let retained = false;
@@ -123,7 +207,8 @@ function getRecorder(cwd: string): EventRecorder {
     const branch = currentBranch(cwd);
     const featureSlug = activeFeatureSlug(pinnedRoot);
     const rec = new EventRecorder({ cwd, branch, featureSlug, pinnedRoot });
-    cacheRecorder(cwd, rec);
+    const entry = cacheRecorder(cwd, rec, pinnedRoot);
+    attachLease(entry, lease);
     retained = true;
     return rec;
   } finally {
@@ -137,13 +222,14 @@ function getRecorder(cwd: string): EventRecorder {
  * without relying on real timers.
  */
 export async function flushRecorder(cwd: string): Promise<void> {
-  const rec = recorderCache.get(cwd);
-  if (rec) await rec.flush();
+  const entry = recorderCache.get(cwd);
+  if (entry) await entry.recorder.flush();
 }
 
 function safeAppend(
   cwd: string,
   ev: Omit<ObservabilityEvent, "id" | "branch"> & { kind: EventKind },
+  lease?: RecorderLease,
 ): void {
   const reject = (error: unknown): void => {
     const reason = error instanceof Error && error.message ? error.message : "telemetry write rejected";
@@ -151,14 +237,13 @@ function safeAppend(
   };
   let recorder: EventRecorder | undefined;
   try {
-    recorder = getRecorder(cwd);
+    recorder = getRecorder(cwd, lease);
     void recorder.append(ev).catch((error) => {
-      closeRecorderInstance(recorder!);
+      closeRecorderForFailure(recorder!);
       reject(error);
     });
   } catch (error) {
-    if (recorder) closeRecorderInstance(recorder);
-    else closeObservabilityRecorders(cwd);
+    if (recorder) closeRecorderForFailure(recorder);
     reject(error);
   }
 }
@@ -362,17 +447,17 @@ function sessionIdFrom(event: unknown, ctx: unknown): string | undefined {
 }
 
 export interface HookHandlers {
-  onBeforeAgentStart(event: unknown, ctx: unknown): void;
-  onAgentStart(event: unknown, ctx: unknown): void;
-  onAgentEnd(event: unknown, ctx: unknown): void;
-  onToolCall(event: unknown, ctx: unknown): void;
-  onToolResult(event: unknown, ctx: unknown): void;
-  onSessionStart(event: unknown, ctx: unknown): void;
-  onSessionStop(event: unknown, ctx: unknown): void;
+  onBeforeAgentStart(event: unknown, ctx: unknown, lease?: RecorderLease): void;
+  onAgentStart(event: unknown, ctx: unknown, lease?: RecorderLease): void;
+  onAgentEnd(event: unknown, ctx: unknown, lease?: RecorderLease): void;
+  onToolCall(event: unknown, ctx: unknown, lease?: RecorderLease): void;
+  onToolResult(event: unknown, ctx: unknown, lease?: RecorderLease): void;
+  onSessionStart(event: unknown, ctx: unknown, lease?: RecorderLease): void;
+  onSessionStop(event: unknown, ctx: unknown, lease?: RecorderLease): void;
 }
 
 export const observabilityHooks: HookHandlers = {
-  onBeforeAgentStart(event, ctx) {
+  onBeforeAgentStart(event, ctx, lease) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { systemPrompt?: string[] } | undefined;
@@ -382,18 +467,18 @@ export const observabilityHooks: HookHandlers = {
       kind: "before_agent_start",
       ts: new Date().toISOString(),
       skills,
-    });
+    }, lease);
   },
-  onAgentStart(event, ctx) {
+  onAgentStart(event, ctx, lease) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     safeAppend(cwd, {
       ...signalMetadata(event, ctx),
       kind: "agent_start",
       ts: new Date().toISOString(),
-    });
+    }, lease);
   },
-  onAgentEnd(event, ctx) {
+  onAgentEnd(event, ctx, lease) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { messages?: unknown[] } | undefined;
@@ -402,9 +487,9 @@ export const observabilityHooks: HookHandlers = {
       kind: "agent_end",
       ts: new Date().toISOString(),
       messageCount: Array.isArray(e?.messages) ? e.messages.length : 0,
-    });
+    }, lease);
   },
-  onToolCall(event, ctx) {
+  onToolCall(event, ctx, lease) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { toolName?: string; toolCallId?: string; input?: unknown } | undefined;
@@ -419,9 +504,9 @@ export const observabilityHooks: HookHandlers = {
       toolCallId: e?.toolCallId,
       subagent,
       subagentTaskChars: taskChars,
-    });
+    }, lease);
   },
-  onToolResult(event, ctx) {
+  onToolResult(event, ctx, lease) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { toolName?: string; toolCallId?: string; isError?: boolean } | undefined;
@@ -433,9 +518,9 @@ export const observabilityHooks: HookHandlers = {
       toolName: e.toolName,
       toolCallId: e.toolCallId,
       isError: e?.isError === true,
-    });
+    }, lease);
   },
-  onSessionStart(event, ctx) {
+  onSessionStart(event, ctx, lease) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     safeAppend(cwd, {
@@ -443,9 +528,9 @@ export const observabilityHooks: HookHandlers = {
       kind: "session_start",
       ts: new Date().toISOString(),
       sessionId: sessionIdFrom(event, ctx),
-    });
+    }, lease);
   },
-  onSessionStop(event, ctx) {
+  onSessionStop(event, ctx, lease) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     safeAppend(cwd, {
@@ -453,7 +538,7 @@ export const observabilityHooks: HookHandlers = {
       kind: "session_stop",
       ts: new Date().toISOString(),
       sessionId: sessionIdFrom(event, ctx),
-    });
+    }, lease);
   },
 };
 /** Re-export so consumers can read the pointer cheaply. */

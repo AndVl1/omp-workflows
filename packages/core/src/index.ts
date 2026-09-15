@@ -28,7 +28,7 @@ import { safetyGuard } from "./gates/safety.js";
 import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { outboxEnforcementGate } from "./gates/outbox.js";
 import { ctoSliceTaskGate } from "./cto/slice-gate.js";
-import { closeObservabilityRecorders, registerObservabilityHooks, recordToolCallAttempt } from "./observability/index.js";
+import { registerObservabilityHooks, recordToolCallAttempt } from "./observability/index.js";
 import { authorizeDispatchTrusted, authorizeSpecificationPhaseValidationDispatch, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, completeSpecificationExecution, recordCheckpointDecision, setConstitutionContinuationGate, validateCheckpointAskSelected, commitCheckpointAnswerSelected, renderCheckpointCanonicalPacket, finalizeImportedHandoff, issueTrustedMappingProof, issueCurrentTrustedMappingProof, registerTrustedTaskResultHostBridge, issueTrustedTaskResultHostCapability, recordTrustedTaskResultFromHost, MAX_ADVANCE_FIELD_BYTES, MAX_ADVANCE_EVIDENCE_BYTES, MAX_COMPLETION_ARTIFACT_COUNT, MAX_COMPLETION_ARTIFACT_BYTES, MAX_ROSTER_SELECTION_COUNT, MAX_ROSTER_SELECTION_BYTES, MAX_CHECKPOINT_RATIONALE_BYTES, isBoundedLineInert, isSafeWorkflowIdentifier, type CheckpointAskSelectedRequest, type ImportedHandoffFinalizationInput, type CtoSpecificationCompletionEnvelope, type TrustedMappingProof, type TrustedTaskResultHostCapability } from "./engine/durable.js";
 import { registerWorkflowProfiles } from "./engine/profile.js";
 import { findCheckpointDecision, issueTrustedCheckpointAnswerCapability, registerTrustedCheckpointHostBridge } from "./engine/checkpoints.js";
@@ -444,7 +444,6 @@ function markTeamFailed(pi: object, error: unknown, recoverableSession = false):
 function closeTeamBindingResources(binding: TeamSessionBinding): void {
   if (binding.runtimeAccess) binding.runtimeAccess.close();
   if (binding.runtimeAuthority) revokeCtoRuntimeSessionAuthority(binding.runtimeAuthority);
-  closeObservabilityRecorders(binding.root);
   binding.cleanup?.();
 }
 
@@ -1437,8 +1436,9 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
   const teamPrincipal = activation?.registryContext && teamRoot
     ? requireRegistryContext(activation.registryContext, teamRoot.canonical_root, "workflow_registration").principal_fingerprint
     : undefined;
+  let observabilityCleanup: (() => Promise<void>) | undefined;
   const teamBinding = teamRoot && activation?.registryToken && teamPrincipal
-    ? { root: teamRoot.canonical_root, rootDev: teamRoot.dev, rootIno: teamRoot.ino, principal: registryRegistrationPrincipal(activation.registryToken, "constitution_gate"), principalFingerprint: teamPrincipal, liveGuard: createRegistryRegistrationLiveGuard(activation.registryToken, "constitution_gate"), ...(activation.registryContext ? { registryContext: activation.registryContext } : {}), ...(activation.cleanup ? { cleanup: activation.cleanup } : {}) }
+    ? { root: teamRoot.canonical_root, rootDev: teamRoot.dev, rootIno: teamRoot.ino, principal: registryRegistrationPrincipal(activation.registryToken, "constitution_gate"), principalFingerprint: teamPrincipal, liveGuard: createRegistryRegistrationLiveGuard(activation.registryToken, "constitution_gate"), ...(activation.registryContext ? { registryContext: activation.registryContext } : {}), ...(activation.cleanup ? { cleanup: () => { const close = observabilityCleanup?.(); if (close) return close.then(() => activation.cleanup?.()); activation.cleanup?.(); } } : {}) }
     : undefined;
   const teamReservation = reserveTeamActivation(pi as unknown as object, activation?.registryToken === undefined, teamRoot, teamBinding?.principal, teamBinding?.principalFingerprint, teamBinding?.liveGuard);
   let hostMountStarted = false;
@@ -2210,7 +2210,12 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
       console.warn(`omp workflow task reconciliation failed: ${reconciled.error}`);
     }
   });
-  registerObservabilityHooks(pi, { enabled: opts.observability, toolCall: false });
+  const initialObservabilitySession = opts.initialSession ?? (opts.initialSessionContext === undefined ? undefined : hostSessionIdentity(opts.initialSessionContext));
+  observabilityCleanup = registerObservabilityHooks(pi, {
+    enabled: opts.observability,
+    toolCall: false,
+    ...(teamBinding ? { owner: { canonicalRoot: teamBinding.root, rootDev: teamBinding.rootDev, rootIno: teamBinding.rootIno, ...(initialObservabilitySession?.sessionId !== undefined ? { sessionId: initialObservabilitySession.sessionId } : {}), ...(initialObservabilitySession?.sessionFile !== undefined ? { sessionFile: initialObservabilitySession.sessionFile } : {}), ...(initialObservabilitySession?.generation !== undefined ? { generation: initialObservabilitySession.generation } : {}) } } : {}),
+  });
   }
   if (!opts.deferConstitutionGate) installConstitutionGate?.();
   if (activation?.registryToken) {
