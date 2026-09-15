@@ -55,9 +55,6 @@ export function registerObservabilityHooks(
     const cwd = typeof ctx === "object" && ctx !== null && "cwd" in ctx ? (ctx as { cwd?: unknown }).cwd : undefined;
     if (typeof cwd === "string" && cwd.length > 0) closeObservabilityRecorders(cwd);
   });
-  pi.on("session_shutdown", () => {
-    closeObservabilityRecorders();
-  });
 }
 
 export { EventRecorder, rollupFromEvents, readObservabilityPointer } from "./recorder.js";

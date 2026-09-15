@@ -83,6 +83,16 @@ function activeFeatureSlug(pinnedRoot: PinnedProjectRoot): string {
 const recorderCache = new Map<string, EventRecorder>();
 const MAX_CACHED_RECORDERS = 64;
 
+function closeRecorderInstance(recorder: EventRecorder): void {
+  let owned = false;
+  for (const [cwd, cached] of [...recorderCache.entries()]) {
+    if (cached !== recorder) continue;
+    recorderCache.delete(cwd);
+    owned = true;
+  }
+  if (owned) recorder.close();
+}
+
 function cacheRecorder(cwd: string, recorder: EventRecorder): void {
   const prior = recorderCache.get(cwd);
   if (prior && prior !== recorder) prior.close();
@@ -143,11 +153,11 @@ function safeAppend(
   try {
     recorder = getRecorder(cwd);
     void recorder.append(ev).catch((error) => {
-      closeObservabilityRecorders(recorder!.canonicalRoot);
+      closeRecorderInstance(recorder!);
       reject(error);
     });
   } catch (error) {
-    if (recorder) closeObservabilityRecorders(recorder.canonicalRoot);
+    if (recorder) closeRecorderInstance(recorder);
     else closeObservabilityRecorders(cwd);
     reject(error);
   }
