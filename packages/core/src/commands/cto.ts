@@ -3054,9 +3054,10 @@ function mappingConfirmationTransactionProofError(
   try { record = JSON.parse(transaction.mapping_content) as CtoSpecificationMappingRecord; }
   catch { return "confirmation WAL final mapping record is unreadable"; }
   const proofRef = record.confirmation_proof_ref;
+  const transactionId = ctoMappingConfirmationTransactionId(String(proofRef ?? ""));
   const transition = transaction.state_transition;
   const consumedAnswer = transaction.state.trusted_checkpoint_answers?.find((candidate) => candidate.answer_id === transition.answer_id);
-  if (typeof proofRef !== "string" || !record.confirmation_context || typeof record.confirmed_at !== "string" || typeof record.confirmation_state_after_digest !== "string"
+  if (typeof proofRef !== "string" || !transactionId || transactionId !== transaction.transaction_id || proofRef !== `tx-${transaction.transaction_id}` || !record.confirmation_context || typeof record.confirmed_at !== "string" || typeof record.confirmation_state_after_digest !== "string"
     || !consumedAnswer?.consumed_at || typeof consumedAnswer.subject_binding !== "string" || typeof consumedAnswer.subject_revision !== "number" || typeof consumedAnswer.authority_receipt !== "string") {
     return "confirmation WAL final proof context is incomplete";
   }
@@ -3073,6 +3074,7 @@ function mappingConfirmationTransactionProofError(
     mapping_id: transaction.mapping_id,
     mapping_hash: transaction.mapping_hash,
     mapping_version: transaction.mapping.mapping_version,
+    transaction_id: transaction.transaction_id,
     proof_ref: proofRef,
     mapping_record_path: mappingRecordPath,
     mapping_record_digest: transaction.mapping_after_digest,
@@ -3617,6 +3619,12 @@ function mappingConfirmationRequired(record: Pick<CtoSpecificationMappingRecord,
     || record.mapping.checkpoint_ref !== record.checkpoint_ref;
 }
 
+function ctoMappingConfirmationTransactionId(proofRef: string): string | null {
+  if (!proofRef.startsWith("tx-")) return null;
+  const transactionId = proofRef.slice(3);
+  return isSafeCtoExecutionId(transactionId) && proofRef === `tx-${transactionId}` ? transactionId : null;
+}
+
 function ctoMappingConfirmationProofPayload(
   pinnedRoot: PinnedProjectRoot,
   record: CtoSpecificationMappingRecord & { record_digest: string; record_path: string },
@@ -3625,6 +3633,8 @@ function ctoMappingConfirmationProofPayload(
 ): CtoMappingConfirmationProofPayload | null {
   const context = record.confirmation_context;
   if (!context || typeof record.checkpoint_ref !== "string" || typeof record.trusted_answer_ref !== "string" || typeof record.confirmed_at !== "string" || typeof record.confirmation_state_after_digest !== "string" || typeof record.confirmation_proof_ref !== "string") return null;
+  const transactionId = ctoMappingConfirmationTransactionId(record.confirmation_proof_ref);
+  if (!transactionId) return null;
   const mappingRecordPath = pinnedRoot.relativePath(record.record_path);
   const statePath = pinnedRoot.relativePath(anchor.statePath);
   if (!mappingRecordPath || !statePath) return null;
@@ -3635,6 +3645,7 @@ function ctoMappingConfirmationProofPayload(
     mapping_id: record.mapping.mapping_id,
     mapping_hash: record.mapping.mapping_hash,
     mapping_version: record.mapping.mapping_version,
+    transaction_id: transactionId,
     proof_ref: record.confirmation_proof_ref,
     mapping_record_path: mappingRecordPath,
     mapping_record_digest: record.record_digest,
@@ -5105,6 +5116,7 @@ function confirmCtoSpecificationMappingUnlocked(projectRoot: string, input: CtoS
     mapping_id: input.mapping_id,
     mapping_hash: input.mapping_hash,
     mapping_version: record.mapping.mapping_version,
+    transaction_id: transactionId,
     proof_ref: confirmationProofRef,
     mapping_record_path: mappingRecordPath,
     mapping_record_digest: sha256Hex(serialized.content),

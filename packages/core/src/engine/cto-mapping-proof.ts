@@ -39,6 +39,7 @@ export type CtoMappingConfirmationProof = {
   mapping_id: string;
   mapping_hash: string;
   mapping_version: number;
+  transaction_id: string;
   proof_ref: string;
   mapping_record_path: string;
   mapping_record_digest: string;
@@ -123,7 +124,7 @@ function answerShape(value: unknown): value is CtoMappingConfirmationProofAnswer
 
 function proofShape(value: unknown, allowUnsigned = false): value is CtoMappingConfirmationProof {
   if (!plain(value)
-    || !exactKeys(value, ["schema_version", "root_identity", "cto_run_id", "mapping_id", "mapping_hash", "mapping_version", "proof_ref", "mapping_record_path", "mapping_record_digest", "state_path", "state_after_digest", "checkpoint_ref", "trusted_answer_ref", "confirmation_context", "confirmed_at", "trusted_answer", "proof_hmac"])
+    || !exactKeys(value, ["schema_version", "root_identity", "cto_run_id", "mapping_id", "mapping_hash", "mapping_version", "transaction_id", "proof_ref", "mapping_record_path", "mapping_record_digest", "state_path", "state_after_digest", "checkpoint_ref", "trusted_answer_ref", "confirmation_context", "confirmed_at", "trusted_answer", "proof_hmac"])
     || value.schema_version !== SCHEMA_VERSION
     || !plain(value.root_identity)
     || !exactKeys(value.root_identity, ["canonical_path", "dev", "ino"])
@@ -134,7 +135,9 @@ function proofShape(value: unknown, allowUnsigned = false): value is CtoMappingC
     || !isSafeCtoExecutionId(value.mapping_id)
     || !isSha256Hex(value.mapping_hash)
     || !Number.isSafeInteger(value.mapping_version) || (value.mapping_version as number) < 1
+    || !isSafeCtoExecutionId(value.transaction_id)
     || !isSafeCtoExecutionId(value.proof_ref)
+    || value.proof_ref !== `tx-${value.transaction_id}`
     || !relativePath(value.mapping_record_path)
     || !isSha256Hex(value.mapping_record_digest)
     || !relativePath(value.state_path)

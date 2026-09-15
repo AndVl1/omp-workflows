@@ -1622,6 +1622,7 @@ function verifyClaimAdmissionBinding(
   const confirmationProofRef = parsed.confirmation_proof_ref;
   const confirmationStateAfterDigest = parsed.confirmation_state_after_digest;
   const confirmedAt = parsed.confirmed_at;
+  const confirmationTransactionId = typeof confirmationProofRef === "string" && confirmationProofRef.startsWith("tx-") ? confirmationProofRef.slice(3) : null;
   if (!isRecord(confirmationContext)
     || typeof confirmationContext.feature_id !== "string"
     || typeof confirmationContext.run_key !== "string"
@@ -1646,6 +1647,9 @@ function verifyClaimAdmissionBinding(
     || confirmationContext.capability_epoch !== admission.capability_epoch
     || confirmationContext.policy_hash !== admission.policy_hash
     || confirmationProofRef.length === 0
+    || !confirmationTransactionId
+    || !isSafeCtoExecutionId(confirmationTransactionId)
+    || confirmationProofRef !== `tx-${confirmationTransactionId}`
     || answer.answer_id !== admission.trusted_answer_ref
     || answer.checkpoint_id !== admission.checkpoint_ref
     || answer.feature_id !== context.feature_id
@@ -1664,6 +1668,7 @@ function verifyClaimAdmissionBinding(
     mapping_id: admission.mapping_id,
     mapping_hash: admission.mapping_hash,
     mapping_version: admission.mapping_version,
+    transaction_id: confirmationTransactionId,
     proof_ref: confirmationProofRef,
     mapping_record_path: admission.mapping_record_path,
     mapping_record_digest: admission.mapping_record_digest,

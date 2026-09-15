@@ -122,7 +122,9 @@ export function validateCtoMappingRecord(parsed: unknown, ctoRunId: string, mapp
   if (record.confirmation_context !== undefined && !exact(record.confirmation_context, CONFIRMATION_KEYS)) return "mapping confirmation context has unknown or missing fields";
   if (record.confirmed_at !== undefined && !text(record.confirmed_at)) return "mapping confirmed_at is invalid";
   if (record.confirmation_state_after_digest !== undefined && !isSha256Hex(record.confirmation_state_after_digest)) return "mapping confirmation state digest is invalid";
-  if (record.confirmation_proof_ref !== undefined && !safeId(record.confirmation_proof_ref)) return "mapping confirmation proof reference is invalid";
+  if (record.confirmation_proof_ref !== undefined && (!safeId(record.confirmation_proof_ref)
+    || !record.confirmation_proof_ref.startsWith("tx-")
+    || !safeId(record.confirmation_proof_ref.slice(3)))) return "mapping confirmation proof reference is invalid";
 
   if (!exact(record.mapping, MAPPING_REQUIRED, MAPPING_OPTIONAL)) return "mapping has unknown or missing fields";
   const mapping = record.mapping;
