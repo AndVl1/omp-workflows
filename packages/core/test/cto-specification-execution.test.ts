@@ -6557,12 +6557,12 @@ test("replayed active claims survive a later admission failure", async () => {
       if (!state) return;
       writeCtoState({ ...state, teams: state.teams.map((team) => team.slice_id === sliceId ? { ...team, status } : team) }, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
     };
-    setSliceStatus(String(bOwner.slice_id), "done");
     const first = await dispatchCtoSpecificationMapping(root, { cto_run_id: RUN_ID, mapping_id: String(frozen.mapping_id), expected_mapping_hash: String(frozen.mapping_hash) }, preparationRuntimeOptions(root)) as unknown as Result;
     assert.equal(first.status, "dispatched", detail(first));
+    completeMountedCtoExecutionTeams(root, { featureIds: [failingFeature] });
     setSliceStatus(String(aOwner.slice_id), "pending");
     setSliceStatus(String(bOwner.slice_id), "pending");
-    assert.equal((first.admitted_slices as string[]).length, 1);
+    assert.equal((first.admitted_slices as string[]).length, 2, "the first dispatch admits both slices before the later failing admission");
     const firstClaims = readExecutionClaimStore(root, activeFeature);
     assert.equal(firstClaims.ok, true, firstClaims.ok ? "" : firstClaims.error);
     if (firstClaims.ok) assert.equal(firstClaims.value.at(-1)?.status, "active");
