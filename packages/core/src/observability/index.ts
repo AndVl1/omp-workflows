@@ -8,7 +8,7 @@
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { createObservabilityRecorderSession, createObservabilityRecorderSessionForCwd, closeObservabilityRecorderSession, closeObservabilityRecorderSessionForCwd, observabilityHooks, type ObservabilityRecorderOwnerIdentity, type ObservabilityRecorderSession } from "./hooks.js";
+import { createObservabilityRecorderSession, createObservabilityRecorderSessionForCwd, closeObservabilityRecorderSession, observabilityHooks, type ObservabilityRecorderOwnerIdentity, type ObservabilityRecorderSession } from "./hooks.js";
 
 function sessionIdentityFromContext(ctx: unknown): { sessionId?: string; sessionFile?: string; generation?: string | number } {
   if (!ctx || typeof ctx !== "object") return {};
@@ -99,10 +99,7 @@ export function registerObservabilityHooks(
   pi.on("session_shutdown", async (_event: unknown, ctx: unknown) => {
     await enqueueLifecycle(async () => {
       if (!session || !shutdownMatchesSession(ctx, session)) return;
-      const cwd = typeof ctx === "object" && ctx !== null && "cwd" in ctx ? (ctx as { cwd?: unknown }).cwd : undefined;
-      if (typeof cwd !== "string" || cwd.length === 0) return;
-      const matched = await closeObservabilityRecorderSessionForCwd(session, cwd);
-      if (matched) await closeObservabilityRecorderSession(session);
+      await closeObservabilityRecorderSession(session);
     });
   });
   if (!session) return undefined;
