@@ -5127,6 +5127,14 @@ test("legacy inline preparation preimages migrate to external refs during recove
       toLegacy((tx.feature_state as Json).before);
       for (const file of tx.dod_files as Json[]) toLegacy(file.before);
       writeFileSync(ctoPath, JSON.stringify(ctoState));
+      const proofRoot = PinnedProjectRoot.open(root);
+      assert.ok(proofRoot, "legacy inline recovery proof root must be pinnable");
+      if (!proofRoot) throw new Error("legacy inline recovery proof root is unavailable");
+      try {
+        assert.equal(writeCtoRuntimeStateProof(proofRoot, ctoState as unknown as CtoState), true, "legacy inline recovery must refresh the exact state proof");
+      } finally {
+        proofRoot.close();
+      }
       throw new Error("legacy-inline-recovery");
     } }, root);
     const failed = prepareCtoSpecificationExecution(root, preparationInput, { defs: [teamDef], ...preparationRuntimeOptions(root) });
