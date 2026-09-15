@@ -47,6 +47,7 @@ export interface PinnedFile {
 
 export interface FsSafetyTestHooks {
   readonly beforeSourceOpen?: (path: string) => void;
+  readonly beforeSourcePin?: (path: string) => void;
   readonly beforeDirectoryComponent?: (path: string) => void;
   readonly beforeDirectoryOpen?: (path: string) => void;
   readonly afterDirectoryOpen?: (path: string) => void;
@@ -61,6 +62,10 @@ let testHooks: FsSafetyTestHooks | null = null;
 
 export function setFsSafetyTestHooks(hooks: FsSafetyTestHooks | null): void {
   testHooks = hooks;
+}
+
+export function notifyBeforeSourcePin(path: string): void {
+  testHooks?.beforeSourcePin?.(path);
 }
 
 function sameIdentity(left: Pick<Stats, 'dev' | 'ino'>, right: Pick<Stats, 'dev' | 'ino'>): boolean {

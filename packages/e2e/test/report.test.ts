@@ -4,6 +4,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, sep } from 'node:path';
@@ -1344,7 +1345,7 @@ test('report: retained state descriptor restores a preexisting JSON after root r
   }
   assert.equal(readFileSync(reportPath, 'utf8'), 'previous report bytes');
   assert.equal(existsSync(join(dir, '.work-state', 'ux-e2e', 'report.json')), true);
-  assert.equal(readdirSync(mdDir).length, 0);
+  assert.equal(readdirSync(join(mdDir, 'evidence', 'my-feature')).length, 0);
   rmSync(dir, { recursive: true, force: true });
   rmSync(mdDir, { recursive: true, force: true });
   rmSync(replacement, { recursive: true, force: true });
@@ -1378,5 +1379,121 @@ test('report: post-open ancestor replacement is rejected before evidence publish
     rmSync(dir, { recursive: true, force: true });
     rmSync(mdDir, { recursive: true, force: true });
     rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+
+test('report: retained state child pin rejects root replacement before JSON publication', () => {
+  const dir = makeSessionDir();
+  const replacement = mkdtempSync(join(tmpdir(), 'ux-e2e-state-pin-replacement-'));
+  const moved = `${dir}.moved`;
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-state-pin-md-'));
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeDirectoryOpen(path) {
+      if (swapped || !path.endsWith(`${sep}.work-state${sep}ux-e2e`)) return;
+      swapped = true;
+      renameSync(dir, moved);
+      renameSync(replacement, dir);
+    },
+  });
+  try {
+    assert.throws(() => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }), /session root changed|failed to write report|membership changed/u);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (swapped) {
+      rmSync(dir, { recursive: true, force: true });
+      renameSync(moved, dir);
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+    if (!swapped) rmSync(replacement, { recursive: true, force: true });
+  }
+});
+
+test('report: retained source pin rejects root replacement before evidence copy', () => {
+  const dir = makeSessionDir();
+  const replacement = mkdtempSync(join(tmpdir(), 'ux-e2e-source-pin-replacement-'));
+  const moved = `${dir}.moved`;
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-source-pin-md-'));
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeSourcePin(path) {
+      if (swapped || path !== dir) return;
+      swapped = true;
+      renameSync(dir, moved);
+      renameSync(replacement, dir);
+    },
+  });
+  try {
+    assert.throws(() => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }), /session root changed|failed to write report|membership changed/u);
+    assert.equal(readdirSync(join(mdDir, 'evidence', 'my-feature')).length, 0);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (swapped) {
+      rmSync(dir, { recursive: true, force: true });
+      renameSync(moved, dir);
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+    if (!swapped) rmSync(replacement, { recursive: true, force: true });
+  }
+});
+
+test('report suite: retained child source pin rejects replacement before aggregate copy', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-retained-child-root-'));
+  const child = makeSessionDir();
+  renameSync(child, join(suite, 'session-a'));
+  const replacement = mkdtempSync(join(tmpdir(), 'ux-e2e-child-root-replacement-'));
+  const moved = `${join(suite, 'session-a')}.moved`;
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-child-root-md-'));
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeSourcePin(path) {
+      const childPath = join(suite, 'session-a');
+      if (swapped || path !== childPath) return;
+      swapped = true;
+      renameSync(childPath, moved);
+      renameSync(replacement, childPath);
+    },
+  });
+  try {
+    assert.throws(() => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }), /membership changed|session root changed/u);
+    assert.equal(readdirSync(join(mdDir, 'evidence', 'session-a')).length, 0);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (swapped) {
+      rmSync(join(suite, 'session-a'), { recursive: true, force: true });
+      renameSync(moved, join(suite, 'session-a'));
+    }
+    rmSync(suite, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+    if (!swapped) rmSync(replacement, { recursive: true, force: true });
+  }
+});
+
+
+test('report: oversized destination with matching prefix is a real evidence collision', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-oversized-collision-'));
+  const source = Buffer.alloc(MAX_PINNED_READ_BYTES, 0x61);
+  const sourcePath = 'specs/feature-a/max.bin';
+  writeFileSync(join(dir, sourcePath), source);
+  setScenarioDocuments(dir, [sourcePath]);
+  const digest = createHash('sha256').update(source).digest('hex').slice(0, 16);
+  const destinationDir = join(mdDir, 'evidence', 'my-feature', 'specs', 'feature-a');
+  mkdirSync(destinationDir, { recursive: true });
+  const destination = join(destinationDir, `max.bin.${digest}`);
+  const foreign = Buffer.concat([source, Buffer.from([0x62])]);
+  writeFileSync(destination, foreign);
+  try {
+    assert.throws(
+      () => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }),
+      /evidence destination collision/u,
+    );
+    assert.deepEqual(readFileSync(destination), foreign, 'foreign oversized destination is preserved');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
   }
 });
