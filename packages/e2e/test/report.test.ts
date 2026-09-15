@@ -899,6 +899,37 @@ test('report suite: deterministic child sessions aggregate and copy evidence per
   }
 });
 
+test('report suite: reserved lock name cannot hide a valid child directory', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-reserved-lock-child-'));
+  const child = makeSessionDir();
+  renameSync(child, join(suite, '.omp-ux-e2e-report.lock'));
+  try {
+    assert.throws(
+      () => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }),
+      /reserved report lock entry/u,
+    );
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+  }
+});
+
+test('report suite: reserved lock name symlink is rejected instead of omitted', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-reserved-lock-link-'));
+  const child = makeSessionDir();
+  const target = join(suite, 'real-child');
+  renameSync(child, target);
+  symlinkSync(target, join(suite, '.omp-ux-e2e-report.lock'), 'dir');
+  try {
+    assert.throws(
+      () => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }),
+      /reserved report lock entry/u,
+    );
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+  }
+});
+
+
 test('report suite: symlink and malformed children are rejected instead of omitted', () => {
   const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-readable-spec-workflow-'));
   const target = makeSessionDir();

@@ -15,7 +15,7 @@ import {
   realpathSync,
   type Dir,
 } from 'node:fs';
-import { basename, dirname, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type {
   ScenarioSelectors,
   ScenarioWorkspacePaths,
@@ -514,13 +514,20 @@ function collectEvidence(candidates: readonly string[]): string[] {
   return candidates.filter(path => boundedReadableFile(path));
 }
 
+function normalizeEvidencePath(root: PinnedDirectory, evidencePath: string): string {
+  return isAbsolute(evidencePath)
+    ? resolve(evidencePath)
+    : resolve(root.lexicalPath, evidencePath);
+}
+
 function assertMandatoryEvidenceReadable(
   root: PinnedDirectory,
   requiredEvidence: readonly string[],
   phase: string,
 ): void {
   for (const evidencePath of requiredEvidence) {
-    if (evidencePath.length === 0 || readPinnedEvidence(root, evidencePath) === null) {
+    const absolute = evidencePath.length === 0 ? null : normalizeEvidencePath(root, evidencePath);
+    if (absolute === null || projectRelative(root.lexicalPath, absolute) === null || readPinnedEvidence(root, absolute) === null) {
       throw new Error(`ux-e2e: PASS mandatory evidence is missing or unsafe ${phase}`);
     }
   }
@@ -1588,11 +1595,12 @@ function generateSingleReport(
   const nextAction = readNextAction(rawSession, resolvedState);
 
   const screenshots = clampedSteps.flatMap(s => s.screenshots);
+  const normalizedScreenshots = screenshots.map(path => normalizeEvidencePath(scratchRoot, path));
   const ompLog = ompLogForSession(scratchDir, rawSession);
-  const candidates = evidenceCandidates(scratchDir, screenshots, observedWorkspacePaths, ompLog);
-  const requiredEvidence = [transcript, ...observedWorkspacePaths, ...screenshots];
+  const candidates = evidenceCandidates(scratchDir, normalizedScreenshots, observedWorkspacePaths, ompLog);
+  const requiredEvidence = [transcript, ...observedWorkspacePaths, ...normalizedScreenshots];
   if (input.verdict === 'PASS') {
-    assertPassReadiness(scratchDir, rawSession, declaredEvidence, screenshots, candidates, requiredEvidence);
+    assertPassReadiness(scratchDir, rawSession, declaredEvidence, normalizedScreenshots, candidates, requiredEvidence);
   }
   const sessionStatus = rawSessionStatus(rawSession);
   const sessionStoppedAt = rawLifecycleTimestamp(rawSession, 'stopped_at');
@@ -1752,6 +1760,16 @@ function generateSingleReport(
 
 const REPORT_LOCK_TIMEOUT_MS = 5000;
 const REPORT_LOCK_NAME = '.omp-ux-e2e-report.lock';
+function verifiedReportLockEntry(root: PinnedDirectory): boolean {
+  const bytes = readPinnedFileFull(root, REPORT_LOCK_NAME, 512);
+  if (bytes === null) return false;
+  const marker = bytes.toString('utf8').trim();
+  const match = /^(\d+):([0-9a-f-]{36}):([^:]{1,128}):([0-9a-f]{64})$/u.exec(marker);
+  if (match === null || match[1] === undefined || match[2] === undefined || match[3] === undefined || match[4] === undefined) return false;
+  const pid = Number(match[1]);
+  return Number.isSafeInteger(pid) && pid > 0
+    && createHash('sha256').update(`${pid}:${match[2]}:${match[3]}`, 'utf8').digest('hex') === match[4];
+}
 function comparePinnedRoots(left: PinnedDirectory, right: PinnedDirectory): number {
   if (left.physicalPath < right.physicalPath) return -1;
   if (left.physicalPath > right.physicalPath) return 1;
@@ -1841,7 +1859,12 @@ function discoverSuiteChildren(suiteRoot: string): SuiteDiscovery | null {
       for (;;) {
         const entry = handle.readSync();
         if (entry === null) break;
-        if (entry.name === REPORT_LOCK_NAME) continue;
+        if (entry.name === REPORT_LOCK_NAME) {
+          if (!entry.isFile() || !verifiedReportLockEntry(root)) {
+            throw new Error('ux-e2e: reserved report lock entry is not a verified harness lock file');
+          }
+          continue;
+        }
         entryCount += 1;
         if (entryCount > MAX_SUITE_DIRECTORY_ENTRIES) throw new Error('ux-e2e: suite has too many immediate directory entries');
         if (entry.isSymbolicLink()) {
