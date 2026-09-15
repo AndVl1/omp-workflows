@@ -1258,7 +1258,7 @@ def lock_acquire(name, owner_pid, owner_start):
     name = safe_name(name)
     if not isinstance(owner_pid, int) or owner_pid <= 0 or not isinstance(owner_start, str) or not (0 < len(owner_start) <= 128) or ":" in owner_start:
         fail("invalid owner identity")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
         fd = os.open(name, flags, 0o600, dir_fd=3)
     except FileExistsError:
