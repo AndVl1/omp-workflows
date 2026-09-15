@@ -5962,7 +5962,13 @@ let inFlightPrepare: { path: string; index: number; token: string } | null = nul
 let prepareFailureRecovered = false;
 let publicationStarted = false;
 const batchId = durableBatch ? randomUUID() : undefined;
-const batchPreimages = entries.map((entry) => this.captureWritePreimage(entry.path));
+let batchPreimages: PinnedRootWritePreimage[];
+try {
+batchPreimages = entries.map((entry) => this.captureWritePreimage(entry.path));
+} catch (error) {
+if (this.darwinHelperPoisoned) this.resetDarwinHelperForCompensation();
+throw error;
+}
 const rollbackBytes = batchPreimages.reduce((total, preimage) => total + (preimage.kind === "file" ? preimage.bytes.byteLength : 0), 0);
 if (rollbackBytes > MAX_BATCH_ROLLBACK_BYTES) {
 throw new PinnedRootError("limit", "anchored atomic batch rollback snapshot exceeds its byte bound");
