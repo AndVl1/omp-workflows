@@ -926,13 +926,13 @@ test('report suite: all suite locks release after success and throw paths', () =
     },
   });
   try {
-    assert.throws(() => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }), /injected suite failure/u);
+    assert.throws(() => generateReport(suite, { ...BASE_INPUT, verdict: 'PASS' }, { mdDir }), /injected suite failure/u);
   } finally {
     setEvidenceCopyTestHooks(null);
   }
   try {
-    const firstResult = generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir });
-    const secondResult = generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir });
+    const firstResult = generateReport(suite, { ...BASE_INPUT, verdict: 'PASS' }, { mdDir });
+    const secondResult = generateReport(suite, { ...BASE_INPUT, verdict: 'PASS' }, { mdDir });
     assert.ok(existsSync(firstResult.jsonPath));
     assert.ok(existsSync(secondResult.jsonPath));
   } finally {
