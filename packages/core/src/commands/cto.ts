@@ -3380,7 +3380,7 @@ function quarantineInvalidConfirmationTransactionPinned(
     pinnedRoot,
     "-confirm-proof-invalid",
   );
-  throw new Error(`CTO_SPEC_MAPPING_RECOVERY_REQUIRED: quarantined confirmation WAL '${transaction.transaction_id}' (${reason}); fresh trusted Ask is required`);
+  throw new Error(`CTO_SPEC_MAPPING_RECOVERY_REQUIRED: quarantined confirmation WAL '${transaction.transaction_id}' (${reason}); explicit authenticated resume is required before a fresh Ask`);
 }
 
 export function recoverCtoSpecificationMappingTransactions(
@@ -4972,6 +4972,18 @@ export function resumeCtoSpecificationMapping(
       const record = loaded.value;
       if (record.mapping.mapping_hash !== input.mapping_hash) return blockedCtoMappingAsk("mapping hash mismatch");
       if (record.mapping.mapping_version !== input.mapping_version) return blockedCtoMappingAsk("mapping revision mismatch");
+      let invalidConfirmedRecovery = false;
+      if (record.mapping.status === "confirmed") {
+        const context = record.confirmation_context;
+        if (!context) return blockedCtoMappingAsk("confirmed mapping lacks its confirmation context");
+        const anchor = readPinnedFeatureState(root, context.feature_id, context.run_key, pinnedRoot);
+        if (!anchor.ok) return blockedCtoMappingAsk(anchor.error);
+        const proofError = mappingConfirmationProofError(pinnedRoot, record, anchor.value);
+        if (!proofError || !proofError.startsWith("durable mapping confirmation proof")) {
+          return blockedCtoMappingAsk(proofError ? `confirmed mapping proof is not safely recoverable: ${proofError}` : "confirmed mapping has a valid durable proof; takeover is not permitted");
+        }
+        invalidConfirmedRecovery = true;
+      }
       if (record.mapping.status === "awaiting_confirmation") {
         if (record.checkpoint_ref !== null || record.trusted_answer_ref !== null) {
           return blockedCtoMappingAsk("mapping already has a pending trusted answer; confirmation or explicit replay is required");
@@ -4992,11 +5004,11 @@ export function resumeCtoSpecificationMapping(
           stage_id: execution.value.stage_id,
         };
       }
-      if (record.mapping.status !== "revision_required" && record.mapping.status !== "stopped") {
+      if (!invalidConfirmedRecovery && record.mapping.status !== "revision_required" && record.mapping.status !== "stopped") {
         return blockedCtoMappingAsk(`mapping cannot be resumed from status '${record.mapping.status}'`);
       }
-      if (!record.review || (record.mapping.status === "revision_required" && record.review.decision !== "request_changes")
-        || (record.mapping.status === "stopped" && record.review.decision !== "approve_stop")) {
+      if (!invalidConfirmedRecovery && (!record.review || (record.mapping.status === "revision_required" && record.review.decision !== "request_changes")
+        || (record.mapping.status === "stopped" && record.review.decision !== "approve_stop"))) {
         return blockedCtoMappingAsk("mapping review outcome is missing or mismatched");
       }
       const file = mappingPath(root, input.cto_run_id, input.mapping_id, pinnedRoot);
@@ -5024,7 +5036,12 @@ export function resumeCtoSpecificationMapping(
       if (!pinnedRoot.isStable()) return blockedCtoMappingAsk("project root changed immediately before mapping resume write");
       const mappingRelativePath = pinnedRelativePath(pinnedRoot, file);
       const mappingBeforeDigest = sha256Hex(mappingRead.bytes.toString("utf8"));
-      const selectedState = readPinnedFeatureState(root, record.review.feature_id, record.review.run_key, pinnedRoot);
+      const resumeSelection = record.selections[0];
+      if (!resumeSelection) return blockedCtoMappingAsk("mapping has no exact frozen selection");
+      const resumeFeatureId = invalidConfirmedRecovery ? resumeSelection.feature_id : record.review!.feature_id;
+      const resumeRunKey = invalidConfirmedRecovery ? resumeSelection.run_key : record.review!.run_key;
+      const resumeStageId = invalidConfirmedRecovery ? record.confirmation_context!.stage_id : record.review!.stage_id;
+      const selectedState = readPinnedFeatureState(root, resumeFeatureId, resumeRunKey, pinnedRoot);
       if (!selectedState.ok) return blockedCtoMappingAsk(selectedState.error);
       const reopenedRecord: CtoSpecificationMappingRecord = reopened;
       const transaction = createDirectMappingTransaction(
@@ -5072,9 +5089,9 @@ export function resumeCtoSpecificationMapping(
         mapping_id: input.mapping_id,
         mapping_hash: input.mapping_hash,
         mapping_version: input.mapping_version,
-        feature_id: record.review.feature_id,
-        run_key: record.review.run_key,
-        stage_id: record.review.stage_id,
+        feature_id: resumeFeatureId,
+        run_key: resumeRunKey,
+        stage_id: resumeStageId,
       };
     }, { pinnedRoot });
   } catch (error) {
