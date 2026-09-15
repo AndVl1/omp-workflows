@@ -4953,7 +4953,10 @@ export function resumeCtoSpecificationMapping(
       assertRuntimeLive();
       recoverPendingMappingTransactions(root, input.cto_run_id, pinnedRoot);
     } catch (error) {
-      return blockedCtoMappingAsk(`mapping recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/quarantined confirmation WAL.*explicit authenticated resume|quarantined confirmation WAL.*fresh trusted Ask/i.test(message)) {
+        return blockedCtoMappingAsk(`mapping recovery failed: ${message}`);
+      }
     }
     assertRuntimeLive();
     const mapping = readMappingRecord(root, input.cto_run_id, input.mapping_id, pinnedRoot);
