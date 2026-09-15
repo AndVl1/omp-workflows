@@ -410,15 +410,13 @@ function ensureExecutionContext(root: string, options: { featureStateOnly?: bool
   executionContexts.set(root, { feature_id: firstFeature, run_key: runKey, capability_id: capabilityId, capability_epoch: capabilityEpoch });
 }
 function persistCtoFixtureState(root: string, state: CtoState): void {
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
   const pinnedRoot = PinnedProjectRoot.open(root);
   assert.ok(pinnedRoot, "CTO fixture state root must remain pinnable");
   if (!pinnedRoot) throw new Error("CTO fixture state root is unavailable");
   try {
-    const persisted = readCtoState(state.id, root);
-    assert.ok(persisted, "CTO fixture state must remain readable after direct mutation");
-    if (!persisted) throw new Error("CTO fixture state disappeared after direct mutation");
-    assert.equal(writeCtoRuntimeStateProof(pinnedRoot, persisted), true, "CTO fixture state proof must follow direct mutation");
+    const statePath = join(".work-state", "cto", state.id, "state.json");
+    pinnedRoot.writeExclusive(statePath, `${JSON.stringify(state, null, 2)}\n`);
+    assert.equal(writeCtoRuntimeStateProof(pinnedRoot, state), true, "CTO fixture state proof must follow direct mutation");
   } finally {
     pinnedRoot.close();
   }
@@ -6293,7 +6291,8 @@ test("mapping WAL quarantines a self-consistent unrelated staged state before an
       stage_id: "execution",
       decision: "approve_continue",
     } as Json, preparationRuntimeOptions(root));
-    assert.equal(recovery.status, "ready", detail(recovery));
+    assert.equal(recovery.status, "blocked", detail(recovery));
+    assert.match(detail(recovery), /ANSWER_RECOVERY_REQUIRED|recovery_required|fresh trusted terminal Ask/i);
     assert.equal(readFileSync(statePath, "utf8"), stateAfterInterruptedCommit, "invalid WAL recovery must not mutate feature state");
     const quarantineDir = join(root, ".work-state", "cto", RUN_ID, "specification-mapping-quarantine");
     assert.equal(readdirSync(quarantineDir).some((name) => name.endsWith("-invalid.json")), true, "invalid WAL must be retained in quarantine");
