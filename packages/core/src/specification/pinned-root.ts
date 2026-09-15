@@ -6066,10 +6066,18 @@ if (prepared.length > 0 && (prepareRequestDispatched || inFlightPrepare !== null
 this.resetDarwinHelperForCompensation();
 throw new PinnedRootError("recovery_required", "durable prepared batch prepare response was lost after a durable prefix; grouped recovery is required");
 }
+let prepareAbortConfirmed = false;
+if (!this.darwinHelperPoisoned && inFlightPrepare !== null) {
+try {
+const aborted = this.runDescriptorHelper<{ aborted?: unknown; rollback_required?: unknown }>("abort_prepared_write", { token: inFlightPrepare.token, root_dev: this.dev, root_ino: this.ino });
+prepareAbortConfirmed = aborted.aborted === true || aborted.rollback_required === true;
+} catch { /* retain the exact in-flight token for durable recovery */ }
+if (prepareAbortConfirmed) inFlightPrepare = null;
+}
 let prepareClean = false;
 this.resetDarwinHelperForCompensation();
 try {
-const recovery = this.runDescriptorHelper<{ recovered?: unknown; absent_clean?: unknown }>("recover_prepared_batch", { batch_id: batchId, entries: batchManifest ?? [], abort_prepared: true });
+const recovery = this.runDescriptorHelper<{ recovered?: unknown; absent_clean?: unknown }>("recover_prepared_batch", { batch_id: batchId, entries: batchManifest ?? [], ...(prepareAbortConfirmed ? {} : { abort_prepared: true }) });
 prepareClean = recovery.recovered === true || recovery.absent_clean === true;
 } catch { /* retain the live ID until durable cleanup is proven */ }
 if (!prepareClean) {
