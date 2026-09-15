@@ -114,7 +114,7 @@ function trackDirect(cwd: string, operation: Promise<void>): void {
   let pending = directPending.get(cwd);
   if (!pending) { pending = new Set(); directPending.set(cwd, pending); }
   pending.add(operation);
-  void operation.finally(() => { pending?.delete(operation); if (pending?.size === 0) directPending.delete(cwd); });
+  void operation.then(() => { pending?.delete(operation); if (pending?.size === 0) directPending.delete(cwd); }, () => { pending?.delete(operation); if (pending?.size === 0) directPending.delete(cwd); });
 }
 
 function exactRootFor(cwd: string): PinnedProjectRoot {
@@ -127,14 +127,14 @@ function assertSessionRoot(session: ObservabilityRecorderSession, pinnedRoot: Pi
   if (session.identity.canonicalRoot !== pinnedRoot.canonical_root || session.identity.rootDev !== pinnedRoot.dev || session.identity.rootIno !== pinnedRoot.ino) throw new PinnedRootError("changed", "observability session root identity changed");
 }
 
-async function closeSession(session: ObservabilityRecorderSession): Promise<void> {
+function closeSession(session: ObservabilityRecorderSession): Promise<void> {
   if (session.closePromise) return session.closePromise;
   session.disposed = true;
   session.closePromise = session.recorder?.closeAsync() ?? Promise.resolve();
-  await session.closePromise;
+  return session.closePromise;
 }
 
-export async function closeObservabilityRecorderSession(session: ObservabilityRecorderSession): Promise<void> { await closeSession(session); }
+export function closeObservabilityRecorderSession(session: ObservabilityRecorderSession): Promise<void> { return closeSession(session); }
 
 export async function closeObservabilityRecorderSessionForCwd(session: ObservabilityRecorderSession, cwd: string): Promise<boolean> {
   const pinnedRoot = PinnedProjectRoot.open(cwd);
@@ -151,7 +151,7 @@ function appendDirect(cwd: string, ev: Omit<ObservabilityEvent, "id" | "branch">
   try { pinnedRoot = exactRootFor(cwd); } catch { return; }
   try {
     const recorder = new EventRecorder({ cwd, branch: currentBranch(cwd), featureSlug: activeFeatureSlug(pinnedRoot), pinnedRoot, ownsPinnedRoot: true });
-    const operation = recorder.append(ev).then(() => undefined).catch(() => undefined).finally(() => recorder.closeAsync());
+    const operation = recorder.append(ev).then(() => recorder.closeAsync(), () => recorder.closeAsync()).catch(() => undefined);
     trackDirect(cwd, operation);
   } catch { pinnedRoot.close(); }
 }
@@ -168,7 +168,7 @@ function appendSession(session: ObservabilityRecorderSession, cwd: string, ev: O
     } else {
       pinnedRoot.close();
     }
-    void session.recorder.append(ev).catch(() => closeSession(session));
+    void session.recorder.append(ev).catch(() => { void closeSession(session).catch(() => undefined); });
   } catch { pinnedRoot?.close(); }
 }
 

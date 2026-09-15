@@ -19,6 +19,12 @@ function sessionIdentityFromContext(ctx: unknown): { sessionId?: string; session
   return { ...(typeof sessionId === "string" ? { sessionId } : {}), ...(typeof sessionFile === "string" ? { sessionFile } : {}), ...(generation !== undefined ? { generation } : {}) };
 }
 
+function previousSessionFileFromEvent(event: unknown): string | undefined {
+  if (!event || typeof event !== "object") return undefined;
+  const candidate = (event as { previousSessionFile?: unknown }).previousSessionFile;
+  return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+}
+
 function shutdownMatchesSession(ctx: unknown, session: ObservabilityRecorderSession): boolean {
   if (!ctx || typeof ctx !== "object") return false;
   const { sessionId, sessionFile, generation } = sessionIdentityFromContext(ctx);
@@ -49,6 +55,12 @@ export function registerObservabilityHooks(
 ): (() => Promise<void>) | undefined {
   if (opts.enabled === false) return undefined;
   let session: ObservabilityRecorderSession | undefined = opts.owner ? createObservabilityRecorderSession(opts.owner) : undefined;
+  let lifecycle = Promise.resolve();
+  const enqueueLifecycle = (operation: () => Promise<void> | void): Promise<void> => {
+    const run = lifecycle.then(operation, operation);
+    lifecycle = run.catch(() => undefined);
+    return run;
+  };
   pi.on("before_agent_start", (event: unknown, ctx: unknown) => {
     observabilityHooks.onBeforeAgentStart(event, ctx, session);
   });
@@ -72,22 +84,33 @@ export function registerObservabilityHooks(
   pi.on("session_stop", (event: unknown, ctx: unknown) => {
     observabilityHooks.onSessionStop(event, ctx, session);
   });
-  pi.on("session_switch", async (_event: unknown, ctx: unknown) => {
-    const cwd = typeof ctx === "object" && ctx !== null && "cwd" in ctx ? (ctx as { cwd?: unknown }).cwd : undefined;
-    if (session && typeof cwd === "string" && cwd.length > 0) {
-      await closeObservabilityRecorderSession(session);
-      const next = createObservabilityRecorderSessionForCwd(cwd, sessionIdentityFromContext(ctx));
-      if (next) session = next;
-    }
+  pi.on("session_switch", async (event: unknown, ctx: unknown) => {
+    await enqueueLifecycle(async () => {
+      if (!session || session.disposed) return;
+      const previousSessionFile = previousSessionFileFromEvent(event);
+      if (previousSessionFile !== undefined && session.identity.sessionFile !== previousSessionFile) return;
+      const cwd = typeof ctx === "object" && ctx !== null && "cwd" in ctx ? (ctx as { cwd?: unknown }).cwd : undefined;
+      if (typeof cwd !== "string" || cwd.length === 0) return;
+      const previous = session;
+      await closeObservabilityRecorderSession(previous);
+      session = createObservabilityRecorderSessionForCwd(cwd, sessionIdentityFromContext(ctx));
+    });
   });
   pi.on("session_shutdown", async (_event: unknown, ctx: unknown) => {
-    if (!session || !shutdownMatchesSession(ctx, session)) return;
-    const cwd = typeof ctx === "object" && ctx !== null && "cwd" in ctx ? (ctx as { cwd?: unknown }).cwd : undefined;
-    if (typeof cwd !== "string" || cwd.length === 0) return;
-    const matched = await closeObservabilityRecorderSessionForCwd(session, cwd);
-    if (matched) await closeObservabilityRecorderSession(session);
+    await enqueueLifecycle(async () => {
+      if (!session || !shutdownMatchesSession(ctx, session)) return;
+      const cwd = typeof ctx === "object" && ctx !== null && "cwd" in ctx ? (ctx as { cwd?: unknown }).cwd : undefined;
+      if (typeof cwd !== "string" || cwd.length === 0) return;
+      const matched = await closeObservabilityRecorderSessionForCwd(session, cwd);
+      if (matched) await closeObservabilityRecorderSession(session);
+    });
   });
-  return session ? (() => closeObservabilityRecorderSession(session!)) : undefined;
+  if (!session) return undefined;
+  let disposerPromise: Promise<void> | undefined;
+  return (): Promise<void> => {
+    if (!disposerPromise) disposerPromise = closeObservabilityRecorderSession(session!);
+    return disposerPromise;
+  };
 }
 
 export { EventRecorder, rollupFromEvents, readObservabilityPointer } from "./recorder.js";
