@@ -415,7 +415,12 @@ function persistCtoFixtureState(root: string, state: CtoState): void {
   if (!pinnedRoot) throw new Error("CTO fixture state root is unavailable");
   try {
     const statePath = join(".work-state", "cto", state.id, "state.json");
-    pinnedRoot.writeExclusive(statePath, `${JSON.stringify(state, null, 2)}\n`);
+    const current = pinnedRoot.readFile(statePath);
+    pinnedRoot.replaceFileIfMatches(statePath, {
+      dev: current.dev,
+      ino: current.ino,
+      sha256: sha256Hex(current.bytes),
+    }, `${JSON.stringify(state, null, 2)}\n`);
     assert.equal(writeCtoRuntimeStateProof(pinnedRoot, state), true, "CTO fixture state proof must follow direct mutation");
   } finally {
     pinnedRoot.close();
