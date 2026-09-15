@@ -194,7 +194,27 @@ runtimeError: Error | null;
 readonly authKey: Buffer;
 readonly sessionId: string;
 readonly rootPathDigest: string;
-nonce: number;}const activeDarwinHelperSessions = new Set<DarwinHelperSession>();const LIVE_DARWIN_HELPER_SESSION_IDS = new Map<string, Set<string>>();const MAX_LIVE_DARWIN_HELPER_SESSIONS_PER_ROOT = 64;function pruneLiveDarwinHelperSessions(rootPathDigest: string): Set<string> {
+nonce: number;}const activeDarwinHelperSessions = new Set<DarwinHelperSession>();
+const pendingDarwinHelperClosePromises = new Set<Promise<void>>();
+function trackDarwinHelperClosePromise(promise: Promise<void>): void {
+  let tracked: Promise<void>;
+  tracked = promise.finally(() => { pendingDarwinHelperClosePromises.delete(tracked); });
+  pendingDarwinHelperClosePromises.add(tracked);
+  void tracked.catch(() => undefined);
+}
+/** Internal test-only drain for asynchronously reaped Darwin helper children. */
+export async function drainDarwinHelperClosePromisesForTesting(): Promise<void> {
+  let firstError: unknown;
+  while (pendingDarwinHelperClosePromises.size > 0) {
+    const snapshot = [...pendingDarwinHelperClosePromises];
+    const settled = await Promise.allSettled(snapshot);
+    for (const result of settled) {
+      if (result.status === "rejected" && firstError === undefined) firstError = result.reason;
+    }
+  }
+  if (firstError !== undefined) throw firstError;
+}
+const LIVE_DARWIN_HELPER_SESSION_IDS = new Map<string, Set<string>>();const MAX_LIVE_DARWIN_HELPER_SESSIONS_PER_ROOT = 64;function pruneLiveDarwinHelperSessions(rootPathDigest: string): Set<string> {
 const active = new Set([...activeDarwinHelperSessions]
 .filter((session) => session.rootPathDigest === rootPathDigest && !session.exited && !session.closing)
 .map((session) => session.sessionId));
@@ -5720,6 +5740,7 @@ removeLiveDarwinHelperSession(session);
 session.closing = true;
 closeDarwinHelperSessionImmediately(session);
 this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
+trackDarwinHelperClosePromise(this.darwinHelperClosePromise);
 void this.darwinHelperClosePromise.catch(() => undefined);
 }
 private writeDarwinFrame(session: DarwinHelperSession, frame: Buffer, deadline: number, operation: string): void {
@@ -5882,6 +5903,7 @@ removeLiveDarwinHelperSession(session);
 session.closing = true;
 closeDarwinHelperSessionImmediately(session);
 this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
+trackDarwinHelperClosePromise(this.darwinHelperClosePromise);
 void this.darwinHelperClosePromise.catch(() => undefined);
 }
 private makeWriteReceipt(
