@@ -935,6 +935,36 @@ test('report suite: deterministic child sessions aggregate and copy evidence per
   }
 });
 
+test('report suite: unreadable child state probe fails closed instead of omitting child', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-unreadable-child-state-'));
+  const child = makeSessionDir();
+  const childPath = join(suite, 'session-a');
+  renameSync(child, childPath);
+  const stateDir = join(childPath, '.work-state', 'ux-e2e');
+  let injected = false;
+  setEvidenceCopyTestHooks({
+    beforeSuitePathStat(path) {
+      if (!injected && path === stateDir) {
+        injected = true;
+        const error = new Error('permission denied while probing child state') as Error & { code?: string };
+        error.code = 'EACCES';
+        throw error;
+      }
+    },
+  });
+  try {
+    assert.throws(
+      () => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }),
+      /permission denied while probing child state/u,
+    );
+    assert.equal(injected, true);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    rmSync(suite, { recursive: true, force: true });
+  }
+});
+
+
 test('report suite: reserved lock name cannot hide a valid child directory', () => {
   const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-reserved-lock-child-'));
   const child = makeSessionDir();

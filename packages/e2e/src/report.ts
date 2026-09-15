@@ -553,9 +553,14 @@ function mandatoryEvidencePaths(report: UxE2eReport): string[] {
   ].filter(path => path.length > 0))];
 }
 
-export interface EvidenceCopyTestHooks extends FsSafetyTestHooks {}
+export interface EvidenceCopyTestHooks extends FsSafetyTestHooks {
+  readonly beforeSuitePathStat?: (path: string) => void;
+}
+
+let reportTestHooks: EvidenceCopyTestHooks | null = null;
 
 export function setEvidenceCopyTestHooks(hooks: EvidenceCopyTestHooks | null): void {
+  reportTestHooks = hooks;
   setFsSafetyTestHooks(hooks);
 }
 function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir: string, maxBytes = MAX_EVIDENCE_BYTES, retainedSourceRoot?: PinnedDirectory, created?: Map<string, Buffer>, createdRoots?: Map<string, PinnedDirectory>, retainedTargetRoot?: PinnedDirectory, retainedDestinationRoots?: Set<PinnedDirectory>): string[] {
@@ -1807,10 +1812,15 @@ interface SuiteDiscovery {
 
 function existingPath(path: string): { readonly isDirectory: boolean; readonly isSymbolicLink: boolean; readonly isFile: boolean; readonly dev: number; readonly ino: number } | null {
   try {
+    reportTestHooks?.beforeSuitePathStat?.(path);
     const info = lstatSync(path);
     return { isDirectory: info.isDirectory(), isSymbolicLink: info.isSymbolicLink(), isFile: info.isFile(), dev: info.dev, ino: info.ino };
-  } catch {
-    return null;
+  } catch (error) {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? (error as { readonly code?: unknown }).code
+      : undefined;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    throw error;
   }
 }
 
