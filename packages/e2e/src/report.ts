@@ -30,12 +30,14 @@ import {
   pinDirectory,
   pinOrCreateDirectory,
   pinChildDirectory,
+  pinnedChildEntryExists,
   pinnedDirectoryIsStable,
   readPinnedEvidence,
   readPinnedFile,
   readPinnedFileFull,
   setFsSafetyTestHooks,
   writePinnedFile,
+  withPinnedExclusiveLock,
   unlinkPinnedFileIfExact,
   type FsSafetyTestHooks,
   type PinnedDirectory,
@@ -1624,9 +1626,9 @@ function generateSingleReport(
     const previousMarkdown = readPinnedFileFull(reportDestination!, mdFilename);
     if (previousMarkdown === null) {
       const existingMarkdown = openPinnedFile(reportDestination!, mdFilename, fsConstants.O_RDONLY);
-      if (existingMarkdown !== null) {
-        closePinnedFile(existingMarkdown);
-        throw new Error('ux-e2e: existing markdown exceeds the exact rollback snapshot bound');
+      if (existingMarkdown !== null || pinnedChildEntryExists(reportDestination!, mdFilename)) {
+        if (existingMarkdown !== null) closePinnedFile(existingMarkdown);
+        throw new Error('ux-e2e: existing markdown exceeds exact rollback snapshot bound or is unsafe');
       }
     }
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before report JSON output');
@@ -1642,9 +1644,9 @@ function generateSingleReport(
       previousJson = readPinnedFileFull(stateDestination, 'report.json');
       if (previousJson === null) {
         const existingJson = openPinnedFile(stateDestination, 'report.json', fsConstants.O_RDONLY);
-        if (existingJson !== null) {
-          closePinnedFile(existingJson);
-          throw new Error('ux-e2e: existing report.json exceeds the exact rollback snapshot bound');
+        if (existingJson !== null || pinnedChildEntryExists(stateDestination, 'report.json')) {
+          if (existingJson !== null) closePinnedFile(existingJson);
+          throw new Error('ux-e2e: existing report.json exceeds exact rollback snapshot bound or is unsafe');
         }
       }
       if (!writePinnedFile(stateDestination, 'report.json', jsonBytes) || !pinnedDirectoryIsStable(scratchRoot)) {
@@ -1704,6 +1706,8 @@ function generateSingleReport(
 }
 
 
+const REPORT_LOCK_TIMEOUT_MS = 5000;
+const REPORT_LOCK_NAME = '.omp-ux-e2e-report.lock';
 const MAX_SUITE_CHILDREN = 64;
 const MAX_SUITE_DIRECTORY_ENTRIES = 1024;
 
@@ -1937,17 +1941,17 @@ function writeSuiteReport(
     previousJson = readPinnedFileFull(stateRoot, 'report.json');
     if (previousJson === null) {
       const existingJson = openPinnedFile(stateRoot, 'report.json', fsConstants.O_RDONLY);
-      if (existingJson !== null) {
-        closePinnedFile(existingJson);
-        throw new Error('ux-e2e: existing report.json exceeds the exact rollback snapshot bound');
+      if (existingJson !== null || pinnedChildEntryExists(stateRoot, 'report.json')) {
+        if (existingJson !== null) closePinnedFile(existingJson);
+        throw new Error('ux-e2e: existing report.json exceeds exact rollback snapshot bound or is unsafe');
       }
     }
     previousMarkdown = readPinnedFileFull(reportRoot, mdFilename);
     if (previousMarkdown === null) {
       const existingMarkdown = openPinnedFile(reportRoot, mdFilename, fsConstants.O_RDONLY);
-      if (existingMarkdown !== null) {
-        closePinnedFile(existingMarkdown);
-        throw new Error('ux-e2e: existing markdown exceeds the exact rollback snapshot bound');
+      if (existingMarkdown !== null || pinnedChildEntryExists(reportRoot, mdFilename)) {
+        if (existingMarkdown !== null) closePinnedFile(existingMarkdown);
+        throw new Error('ux-e2e: existing markdown exceeds exact rollback snapshot bound or is unsafe');
       }
     }
     assertSuiteDiscoveryStable(suiteRoot, discovery, 'before report JSON output');
@@ -2098,17 +2102,42 @@ export function generateReport(
   const suiteRoot = resolve(sessionDir);
   const discovery = discoverSuiteChildren(suiteRoot);
   if (discovery === null) throw new Error('ux-e2e: failed to write report.json inside the session directory');
-  if (discovery.single) {
-    try {
-      const result = generateSingleReport(suiteRoot, input, opts, discovery);
-      return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings };
-    } finally {
-      closeSuiteDiscovery(discovery);
-    }
-  }
-  try {
-    return generateSuiteReport(suiteRoot, discovery, input, opts);
-  } finally {
+  const mdDir = resolve(opts.mdDir ?? join(process.cwd(), 'vibe-report'));
+  const externalRoot = pinOrCreateDirectory(mdDir);
+  if (externalRoot === null) {
     closeSuiteDiscovery(discovery);
+    throw new Error('ux-e2e: report destination root must be a stable non-symlink directory');
+  }
+  const roots = [discovery.root, externalRoot];
+  const targets = roots
+    .filter((root, index, all) => all.findIndex(candidate => candidate.identity.dev === root.identity.dev && candidate.identity.ino === root.identity.ino) === index)
+    .sort((left, right) => left.physicalPath.localeCompare(right.physicalPath));
+  let closed = false;
+  const closeDiscovery = (): void => {
+    if (closed) return;
+    closed = true;
+    closeSuiteDiscovery(discovery);
+  };
+  const execute = (): GenerateReportResult => {
+    try {
+      if (discovery.single) {
+        const result = generateSingleReport(suiteRoot, input, opts, discovery);
+        return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings };
+      }
+      return generateSuiteReport(suiteRoot, discovery, input, opts);
+    } finally {
+      closeDiscovery();
+    }
+  };
+  const runLocked = (index: number): GenerateReportResult => {
+    const root = targets[index];
+    if (root === undefined) return execute();
+    return withPinnedExclusiveLock(root, REPORT_LOCK_NAME, REPORT_LOCK_TIMEOUT_MS, () => runLocked(index + 1));
+  };
+  try {
+    return runLocked(0);
+  } finally {
+    closeDiscovery();
+    closePinnedDirectory(externalRoot);
   }
 }

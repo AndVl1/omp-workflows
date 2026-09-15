@@ -1762,3 +1762,56 @@ test('fs safety: final quarantine in-place mutation restores the moved inode', {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+test('report: hardlinked prior markdown is unsafe and remains byte-exact', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-hardlink-prior-'));
+  const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-md-hardlink-prior-outside-'));
+  const expectedDate = new Date().toISOString().slice(0, 10);
+  const destination = join(mdDir, `my-feature-ux-e2e-${expectedDate}.md`);
+  const outsideFile = join(outside, 'prior.md');
+  const previous = Buffer.from('prior hardlinked markdown');
+  writeFileSync(outsideFile, previous);
+  linkSync(outsideFile, destination);
+  try {
+    assert.throws(
+      () => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }),
+      /existing markdown exceeds exact rollback snapshot bound/u,
+    );
+    assert.deepEqual(readFileSync(destination), previous);
+    assert.deepEqual(readFileSync(outsideFile), previous);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('report: concurrent reporter cannot restore stale output over committed output', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-lock-'));
+  const reportPath = join(dir, '.work-state', 'ux-e2e', 'report.json');
+  let nested = false;
+  let nestedError: unknown = null;
+  setEvidenceCopyTestHooks({
+    beforeTargetOpen(path) {
+      if (nested || path !== reportPath) return;
+      nested = true;
+      try {
+        generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir });
+      } catch (error) {
+        nestedError = error;
+      }
+    },
+  });
+  try {
+    const result = generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir });
+    assert.ok(result.jsonPath);
+    assert.match(String(nestedError), /pinned lock is busy/u);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});

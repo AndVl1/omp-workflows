@@ -393,6 +393,22 @@ export function closePinnedFile(file: PinnedFile): void {
 }
 
 /** Read a bounded regular file, optionally taking only its final tail. */
+/** Detect any existing direct child without accepting unsafe link metadata. */
+export function pinnedChildEntryExists(root: PinnedDirectory, name: string): boolean {
+  if (!safeName(name)) return false;
+  if (process.platform === 'darwin') {
+    return runDarwinHelper(root, 'entry_exists', { name })?.exists === true;
+  }
+  const descriptorRoot = descriptorPathFor(root.fd);
+  if (descriptorRoot === null || !pinnedDescriptorIsStable(root)) return false;
+  try {
+    lstatSync(join(descriptorRoot, name));
+    return true;
+  } catch (error) {
+    return errnoCode(error) !== 'ENOENT';
+  }
+}
+
 export function readPinnedFile(
   root: PinnedDirectory,
   name: string,
@@ -1124,6 +1140,14 @@ def open_regular(name, flags, mode=0o600, directory_fd=3):
         fail("entry is not a regular single-link file")
     return fd, info
 
+def entry_exists(name):
+    name = safe_name(name)
+    try:
+        os.stat(name, dir_fd=3, follow_symlinks=False)
+        return {"exists": True}
+    except FileNotFoundError:
+        return {"exists": False}
+
 def read_file(name, max_bytes, tail_bytes):
     if not isinstance(max_bytes, int) or not isinstance(tail_bytes, int):
         fail("read bounds are invalid")
@@ -1400,6 +1424,7 @@ try:
     elif op == "ensure_directory": result = {"ok": True, "directory": ensure_directory(payload.get("path"))}
     elif op == "write_temp": result = {"ok": True, "temporary": write_temp(base64.b64decode(payload.get("bytes", ""), validate=True))}
     elif op == "append_file": result = {"ok": True, **append_file(payload.get("name"), payload.get("bytes"))}
+    elif op == "entry_exists": result = {"ok": True, **entry_exists(payload.get("name"))}
     elif op == "read_file": result = {"ok": True, **read_file(payload.get("name"), payload.get("max_bytes"), payload.get("tail_bytes"))}
     elif op == "read_evidence": result = {"ok": True, **read_evidence(payload.get("path"), payload.get("max_bytes"))}
     elif op == "unlink_file": unlink_file(payload.get("name")); result = {"ok": True}
