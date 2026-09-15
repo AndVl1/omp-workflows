@@ -1556,12 +1556,15 @@ function generateSingleReport(
     }
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before report JSON output');
       if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before report JSON output');
+    let jsonBytes: Buffer | null = null;
+    let previousJson: Buffer | null = null;
     const stateDestination = pinOrCreateDirectory(stateDir);
       if (stateDestination === null) {
         throw new Error('ux-e2e: session report directory must be a stable non-symlink directory');
       }
       try {
-        const jsonBytes = Buffer.from(JSON.stringify(report, null, 2) + '\n');
+        jsonBytes = Buffer.from(JSON.stringify(report, null, 2) + '\n');
+        previousJson = readPinnedFileFull(stateDestination, 'report.json');
         if (!writePinnedFile(stateDestination, 'report.json', jsonBytes) || !pinnedDirectoryIsStable(scratchRoot)) {
           unlinkPinnedFileIfExact(stateDestination, 'report.json', jsonBytes);
           throw new Error('ux-e2e: failed to write report.json inside the session directory');
@@ -1574,19 +1577,40 @@ function generateSingleReport(
       }
     }
 
+    const rollbackJson = (): void => {
+      if (jsonBytes === null) return;
+      const destination = pinOrCreateDirectory(stateDir);
+      if (destination === null) return;
+      try {
+        if (unlinkPinnedFileIfExact(destination, 'report.json', jsonBytes) && previousJson !== null) {
+          writePinnedFile(destination, 'report.json', previousJson);
+        }
+      } finally {
+        closeSync(destination.fd);
+      }
+    };
     const mdFilename = `${slug}-ux-e2e-${todayStamp()}.md`;
     const mdPath = join(mdDir, mdFilename);
     if (reportDestination === null) throw new Error('ux-e2e: report destination root is unavailable');
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before markdown output');
       if (!pinnedDirectoryIsStable(scratchRoot)) {
+        rollbackJson();
         throw new Error('ux-e2e: session root changed before markdown output');
       }
       const markdownBytes = Buffer.from(renderMarkdown(report));
-      if (!writePinnedFile(reportDestination, mdFilename, markdownBytes) || !pinnedDirectoryIsStable(scratchRoot)) {
-        unlinkPinnedFileIfExact(reportDestination, mdFilename, markdownBytes);
-        throw new Error('ux-e2e: failed to write markdown inside the report destination');
+      const previousMarkdown = readPinnedFile(reportDestination, mdFilename, MAX_PINNED_READ_BYTES, 0);
+      try {
+        if (!writePinnedFile(reportDestination, mdFilename, markdownBytes) || !pinnedDirectoryIsStable(scratchRoot)) {
+          throw new Error('ux-e2e: failed to write markdown inside the report destination');
+        }
+        if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'after report output');
+      } catch (error) {
+        if (unlinkPinnedFileIfExact(reportDestination, mdFilename, markdownBytes) && previousMarkdown !== null) {
+          writePinnedFile(reportDestination, mdFilename, previousMarkdown);
+        }
+        rollbackJson();
+        throw error;
       }
-      if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'after report output');
       return { jsonPath, mdPath, warnings, report };
   } finally {
     try {
@@ -1614,10 +1638,19 @@ interface SuiteChild {
   readonly sessionDigest: string;
 }
 
+interface RootSessionMarker {
+  readonly present: boolean;
+  readonly valid: boolean;
+  readonly dev: number;
+  readonly ino: number;
+  readonly digest: string;
+}
+
 interface SuiteDiscovery {
   readonly root: PinnedDirectory;
   readonly children: SuiteChild[];
   readonly single: boolean;
+  readonly rootSession: RootSessionMarker;
 }
 
 function existingPath(path: string): { readonly isDirectory: boolean; readonly isSymbolicLink: boolean; readonly isFile: boolean; readonly dev: number; readonly ino: number } | null {
@@ -1646,11 +1679,19 @@ function sessionDescriptor(sessionPath: string): { readonly dev: number; readonl
 }
 
 function discoverSuiteChildren(suiteRoot: string): SuiteDiscovery | null {
-  const rootSessionInfo = existingPath(join(suiteRoot, '.work-state', 'ux-e2e', 'session.json'));
-  const rootSession = rootSessionInfo !== null
-    && rootSessionInfo.isFile
-    && !rootSessionInfo.isSymbolicLink
-    && readSessionMeta(suiteRoot).schema_version === 2;
+  const rootSessionPath = join(suiteRoot, '.work-state', 'ux-e2e', 'session.json');
+  const rootSessionInfo = existingPath(rootSessionPath);
+  const rootDescriptor = rootSessionInfo !== null && rootSessionInfo.isFile && !rootSessionInfo.isSymbolicLink
+    ? sessionDescriptor(rootSessionPath)
+    : null;
+  const rootSession = rootDescriptor !== null && readSessionMeta(suiteRoot).schema_version === 2;
+  const rootSessionMarker: RootSessionMarker = {
+    present: rootSessionInfo !== null,
+    valid: rootSession,
+    dev: rootDescriptor?.dev ?? rootSessionInfo?.dev ?? 0,
+    ino: rootDescriptor?.ino ?? rootSessionInfo?.ino ?? 0,
+    digest: rootDescriptor?.digest ?? '',
+  };
   const root = pinDirectory(suiteRoot);
   if (root === null) return null;
   let retainRoot = false;
@@ -1701,10 +1742,10 @@ function discoverSuiteChildren(suiteRoot: string): SuiteDiscovery | null {
     if (rootSession && children.length > 0) throw new Error('ux-e2e: ambiguous suite root and child session ownership');
     if (children.length === 0) {
       retainRoot = true;
-      return { root, children, single: true };
+      return { root, children, single: true, rootSession: rootSessionMarker };
     }
     retainRoot = true;
-    return { root, children, single: false };
+    return { root, children, single: false, rootSession: rootSessionMarker };
   } finally {
     if (!retainRoot) closePinnedDirectory(root);
   }
@@ -1724,12 +1765,20 @@ function sameSuiteChildren(left: readonly SuiteChild[], right: readonly SuiteChi
   });
 }
 
+function sameRootSessionMarker(left: RootSessionMarker, right: RootSessionMarker): boolean {
+  return left.present === right.present
+    && left.valid === right.valid
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.digest === right.digest;
+}
+
 function assertSuiteDiscoveryStable(suiteRoot: string, expected: SuiteDiscovery, phase: string): void {
   if (!pinnedDirectoryIsStable(expected.root)) throw new Error(`ux-e2e: suite root changed ${phase}`);
   const current = discoverSuiteChildren(suiteRoot);
   if (current === null) throw new Error(`ux-e2e: suite child membership changed ${phase}`);
   try {
-    if (!pinnedDirectoryIsStable(expected.root) || expected.single !== current.single || !sameSuiteChildren(expected.children, current.children)) {
+    if (!pinnedDirectoryIsStable(expected.root) || expected.single !== current.single || !sameRootSessionMarker(expected.rootSession, current.rootSession) || !sameSuiteChildren(expected.children, current.children)) {
       throw new Error(`ux-e2e: suite child membership changed ${phase}`);
     }
   } finally {

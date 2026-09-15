@@ -1185,3 +1185,101 @@ test('report suite: total evidence file cap rejects many short files before root
     rmSync(suite, { recursive: true, force: true });
   }
 });
+
+
+test('report: exact rollback quarantine preserves a replacement created after verification', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-rollback-quarantine-md-'));
+  const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-rollback-quarantine-outside-'));
+  const moved = `${mdDir}.moved`;
+  const reportPath = join(dir, '.work-state', 'ux-e2e', 'report.json');
+  let swapped = false;
+  let replacementWritten = false;
+  setEvidenceCopyTestHooks({
+    beforeTargetOpen(destination) {
+      if (swapped || !destination.startsWith(mdDir + sep) || !destination.endsWith('.md')) return;
+      swapped = true;
+      renameSync(mdDir, moved);
+      symlinkSync(outside, mdDir, 'dir');
+    },
+    beforeTargetRename(destination) {
+      if (swapped && !replacementWritten && destination === reportPath) {
+        replacementWritten = true;
+        writeFileSync(destination, 'concurrent replacement');
+      }
+    },
+  });
+  try {
+    assert.throws(() => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }), /report destination root|failed to write markdown/u);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (swapped) {
+      unlinkSync(mdDir);
+      renameSync(moved, mdDir);
+    }
+  }
+  assert.equal(replacementWritten, true);
+  assert.equal(readFileSync(reportPath, 'utf8'), 'concurrent replacement');
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(mdDir, { recursive: true, force: true });
+  rmSync(outside, { recursive: true, force: true });
+});
+
+test('report: nested evidence pin rejects an intermediate ancestor symlink swap', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-intermediate-swap-md-'));
+  const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-intermediate-swap-outside-'));
+  const targetRoot = join(mdDir, 'evidence', 'my-feature', 'ux-e2e');
+  const intermediate = join(targetRoot, '.work-state');
+  const moved = `${intermediate}.moved`;
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeDirectoryComponent(path) {
+      if (swapped || path !== intermediate) return;
+      swapped = true;
+      renameSync(intermediate, moved);
+      symlinkSync(outside, intermediate, 'dir');
+    },
+  });
+  try {
+    const result = generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true });
+    const report = JSON.parse(readFileSync(result.jsonPath, 'utf8')) as UxE2eReport;
+    assert.equal(swapped, true);
+    assert.equal(report.evidence.some(path => path.includes(`${sep}evidence${sep}`)), false);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (existsSync(intermediate)) unlinkSync(intermediate);
+    if (existsSync(moved)) renameSync(moved, intermediate);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('report: single discovery binds root session content across publish fences', () => {
+  const dir = makeSessionDir();
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-single-session-marker-md-'));
+  const sessionPath = join(dir, '.work-state', 'ux-e2e', 'session.json');
+  const moved = `${sessionPath}.moved`;
+  let mutated = false;
+  setEvidenceCopyTestHooks({
+    beforeTargetOpen(destination) {
+      if (mutated || !destination.endsWith(`${sep}report.json`)) return;
+      mutated = true;
+      const session = readSessionRecord(dir);
+      session.status = 'running';
+      renameSync(sessionPath, moved);
+      writeSessionRecord(dir, session);
+    },
+  });
+  try {
+    assert.throws(() => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir }), /membership changed|session root changed|failed to write report/u);
+    assert.equal(existsSync(join(dir, '.work-state', 'ux-e2e', 'report.json')), false);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (existsSync(sessionPath)) unlinkSync(sessionPath);
+    if (existsSync(moved)) renameSync(moved, sessionPath);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
