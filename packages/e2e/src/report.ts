@@ -1797,6 +1797,7 @@ function discoverSuiteChildren(suiteRoot: string): SuiteDiscovery | null {
       for (;;) {
         const entry = handle.readSync();
         if (entry === null) break;
+        if (entry.name === REPORT_LOCK_NAME) continue;
         entryCount += 1;
         if (entryCount > MAX_SUITE_DIRECTORY_ENTRIES) throw new Error('ux-e2e: suite has too many immediate directory entries');
         if (entry.isSymbolicLink()) {
