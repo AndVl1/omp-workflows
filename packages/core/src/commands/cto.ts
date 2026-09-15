@@ -3292,6 +3292,40 @@ function quarantineRecoveredAnswerMappingTransactionPinned(
   );
 }
 
+function quarantineInvalidConfirmationTransactionPinned(
+  root: string,
+  transaction: ParsedMappingTransaction,
+  reason: string,
+  pinnedRoot: PinnedProjectRoot,
+): boolean {
+  if (transaction.operation !== "confirm") return false;
+  // Re-read the proof against the exact WAL-derived image. If it has become
+  // valid since the failed attempt, leave the transaction replayable rather
+  // than quarantining a concurrently repaired confirmation.
+  if (!mappingConfirmationTransactionProofError(transaction, pinnedRoot)) return false;
+  const state = readPinnedFeatureState(root, transaction.feature_id, transaction.run_key, pinnedRoot);
+  if (!state.ok) return false;
+  const stateCommitted = mappingStateDigest(state.value.state) === transaction.state_after_digest;
+  const identity = currentMappingIdentityPinned(pinnedRoot, root, transaction.mapping_path, transaction.cto_run_id, transaction.mapping_id);
+  if (!stateCommitted && isExactStagedMapping(identity, transaction)) {
+    // This is the only safe revocation case: the exact confirmed postimage is
+    // visible, but its proof-authenticated consumed state is not committed.
+    // quarantineMappingPinned performs receipt-bound CAS and never trusts a
+    // replacement mapping or WAL image.
+    quarantineMappingPinned(pinnedRoot, root, transaction);
+  }
+  quarantineMappingTransactionDescriptorPinned(
+    root,
+    transaction.cto_run_id,
+    transaction.transaction_id,
+    transaction.mapping_id,
+    transaction.wal_receipt,
+    pinnedRoot,
+    "-confirm-proof-invalid",
+  );
+  throw new Error(`CTO_SPEC_MAPPING_RECOVERY_REQUIRED: quarantined confirmation WAL '${transaction.transaction_id}' (${reason}); fresh trusted Ask is required`);
+}
+
 function recoverPendingMappingTransactions(root: string, ctoRunId: string, pinnedRoot: PinnedProjectRoot): CtoSpecificationMappingTransaction[] {
   const completed: CtoSpecificationMappingTransaction[] = [];
   let answerRecoveryRequired: string | null = null;
@@ -3316,6 +3350,10 @@ function recoverPendingMappingTransactions(root: string, ctoRunId: string, pinne
       commitMappingTransactionPinned(root, transaction, pinnedRoot);
       completed.push(transaction);
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (transaction.operation === "confirm" && /confirmation WAL proof|durable mapping confirmation proof|CTO_SPEC_MAPPING_RECOVERY_REQUIRED/.test(reason)) {
+        quarantineInvalidConfirmationTransactionPinned(root, transaction, reason, pinnedRoot);
+      }
       // A state conflict is reported to the operation that discovered it, but
       // recovery itself must not poison every later operation once the abort
       // WAL reached a terminal disposition.
