@@ -970,7 +970,7 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
 
 /** Remove an empty child directory through the retained parent descriptor. */
 export function removePinnedDirectoryIfEmpty(root: PinnedDirectory, components: readonly string[]): boolean {
-  if (components.length === 0 || components.some(component => !safeName(component)) || !pinnedDirectoryIsStable(root)) return false;
+  if (components.length === 0 || components.some(component => !safeName(component))) return false;
   const relativePath = components.join(sep);
   if (process.platform === 'darwin') {
     return runDarwinHelper(root, 'remove_empty', { name: relativePath })?.removed === true;
