@@ -17,7 +17,7 @@ import {
   type UxE2eReport,
   type ReportInput,
 } from '../src/report.js';
-import { closePinnedDirectory, MAX_PINNED_READ_BYTES, pinDirectory, setFsSafetyTestHooks, unlinkPinnedFileIfExact, writePinnedFile } from '../src/fs-safety.js';
+import { closePinnedDirectory, MAX_PINNED_READ_BYTES, pinDirectory, setFsSafetyTestHooks, unlinkPinnedFileIfExact, withPinnedExclusiveLock, writePinnedFile } from '../src/fs-safety.js';
 
 function makeSessionDir(options: { readonly completeEvidence?: boolean } = {}): string {
   const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-report-'));
@@ -1787,6 +1787,22 @@ test('report: hardlinked prior markdown is unsafe and remains byte-exact', () =>
     rmSync(outside, { recursive: true, force: true });
   }
 });
+
+test('fs safety: lock contention reports bounded busy error on every platform', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-lock-contention-'));
+  const root = pinDirectory(dir);
+  assert.notEqual(root, null);
+  try {
+    assert.throws(
+      () => withPinnedExclusiveLock(root, '.lock', () => withPinnedExclusiveLock(root, '.lock', () => undefined, 0), 0),
+      /pinned lock is busy/u,
+    );
+  } finally {
+    closePinnedDirectory(root);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 
 test('report: concurrent reporter cannot restore stale output over committed output', () => {
   const dir = makeSessionDir();

@@ -779,7 +779,8 @@ function acquirePinnedExclusiveLock(
       fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | O_NOFOLLOW | O_NONBLOCK, 0o600);
       break;
     } catch (error) {
-      if (errnoCode(error) !== 'EEXIST' || Date.now() >= deadline) throw error;
+      if (errnoCode(error) !== 'EEXIST') throw error;
+      if (Date.now() >= deadline) throw new Error('pinned lock is busy');
       if (recoverStaleLock(root, name)) continue;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
     }
