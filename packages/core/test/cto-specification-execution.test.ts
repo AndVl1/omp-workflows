@@ -718,7 +718,7 @@ function completeMountedCtoExecutionTeams(root: string, options: { concurrent?: 
   const terminal = readCtoState(RUN_ID, root);
   const terminalTeams = terminal?.teams.filter((team) => !selectedFeatureIds || selectedFeatureIds.has(team.feature_id ?? "")) ?? [];
   assert.ok(terminalTeams.length > 0, "completion fixture host results must target at least one mapped team");
-  assert.ok(terminalTeams.every((team) => team.status === "done"), "completion fixture host results must terminalize every selected mapped team");
+  assert.ok(terminalTeams.every((team) => (failedFeatureIds?.has(team.feature_id ?? "") ? team.status === "failed" : team.status === "done")), "completion fixture host results must terminalize every selected mapped team");
 }
 
 async function produceCtoCompletionConformance(root: string, mapping: Json, binding: Json): Promise<void> {
