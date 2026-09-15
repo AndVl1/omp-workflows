@@ -166,7 +166,27 @@ export function anchorEncode(value: string): string {
  * through untouched so the pinned `fragmentForArtifact` never throws.
  */
 function surrogateSafe(value: string): string {
-  return /[\uD800-\uDFFF]/.test(value) ? value.replace(/[\uD800-\uDFFF]/g, "\uFFFD") : value;
+  let sanitized: string | undefined;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    const high = code >= 0xD800 && code <= 0xDBFF;
+    const low = code >= 0xDC00 && code <= 0xDFFF;
+    if (high && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        if (sanitized !== undefined) sanitized += value[index]! + value[index + 1]!;
+        index += 1;
+        continue;
+      }
+    }
+    if (high || low) {
+      sanitized ??= value.slice(0, index);
+      sanitized += "\uFFFD";
+    } else if (sanitized !== undefined) {
+      sanitized += value[index];
+    }
+  }
+  return sanitized ?? value;
 }
 
 /**

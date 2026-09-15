@@ -392,6 +392,24 @@ test("html: anchors derive from stable identity and cannot collide across kinds"
 
 // ── Semantic section mapping ─────────────────────────────────────────────────
 
+test("html: astral artifact ids preserve pairs and resolve distinct anchors", () => {
+  const session = clone(buildExpectedSpecPreparationSession());
+  const base = session.artifacts[0]!;
+  const ids = ["artifact-😀", "artifact-😃"];
+  session.artifacts = ids.map((id, index) => ({
+    ...base,
+    id,
+    ...(base.source ? { source: { ...base.source, label: `artifacts/astral-${index}.json` } } : {}),
+  }));
+  const links = collectIdsAndHrefs(renderSessionHtml(session, { scope: "all" }));
+  const anchors = ids.map((id) => artifactAnchor(session.identity.pathKey, id));
+  assert.notEqual(anchors[0], anchors[1], "distinct astral ids must remain distinct");
+  for (const anchor of anchors) {
+    assert.ok(links.ids.includes(anchor), `rendered id ${anchor}`);
+    assert.ok(links.hrefs.includes(`#${anchor}`), `rendered href #${anchor}`);
+  }
+});
+
 test("html: semantic section mapping is total, deterministic and prototype-safe", () => {
   assert.equal(semanticSectionForArtifact({ id: "spec_requirements_edge_cases" }), "requirements");
   assert.equal(semanticSectionForArtifact({ id: "discovery" }), "requirements");
