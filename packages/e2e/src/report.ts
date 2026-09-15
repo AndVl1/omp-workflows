@@ -1819,7 +1819,7 @@ function existingPath(path: string): { readonly isDirectory: boolean; readonly i
     const code = typeof error === 'object' && error !== null && 'code' in error
       ? (error as { readonly code?: unknown }).code
       : undefined;
-    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    if (code === 'ENOENT') return null;
     throw error;
   }
 }

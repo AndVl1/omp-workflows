@@ -965,6 +965,27 @@ test('report suite: unreadable child state probe fails closed instead of omittin
 });
 
 
+test('report suite: non-directory intermediate state is rejected instead of omitted', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-enotdir-child-state-'));
+  const valid = makeSessionDir();
+  const malformed = makeSessionDir();
+  renameSync(valid, join(suite, 'valid'));
+  renameSync(malformed, join(suite, 'malformed'));
+  const malformedState = join(suite, 'malformed', '.work-state');
+  rmSync(malformedState, { recursive: true, force: true });
+  writeFileSync(malformedState, 'not a directory\n');
+  try {
+    assert.throws(
+      () => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }),
+      /ENOTDIR|malformed suite child/u,
+    );
+    assert.equal(existsSync(join(suite, '.work-state', 'ux-e2e', 'report.json')), false);
+  } finally {
+    rmSync(suite, { recursive: true, force: true });
+  }
+});
+
+
 test('report suite: reserved lock name cannot hide a valid child directory', () => {
   const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-reserved-lock-child-'));
   const child = makeSessionDir();
