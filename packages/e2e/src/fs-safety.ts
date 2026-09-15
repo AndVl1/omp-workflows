@@ -1299,7 +1299,22 @@ def lock_acquire(name, owner_pid, owner_start):
                     return None
             current = os.stat(name, dir_fd=3, follow_symlinks=False)
             if current.st_dev != old.st_dev or current.st_ino != old.st_ino: return None
-            os.unlink(name, dir_fd=3)
+            quarantine = ".omp-lock-unlink-" + secrets.token_hex(16) + ".tmp"
+            try:
+                os.rename(name, quarantine, src_dir_fd=3, dst_dir_fd=3)
+            except OSError:
+                return None
+            try:
+                qfd, qinfo = open_regular(quarantine, os.O_RDONLY)
+                try:
+                    qmarker = os.read(qfd, 512).decode("utf-8").strip()
+                finally:
+                    os.close(qfd)
+                if qinfo.st_dev != old.st_dev or qinfo.st_ino != old.st_ino or qmarker != marker:
+                    return None
+                os.unlink(quarantine, dir_fd=3)
+            except OSError:
+                return None
             return None
         except (ValueError, OSError):
             return None
@@ -1310,7 +1325,9 @@ def lock_acquire(name, owner_pid, owner_start):
         os.write(fd, marker)
         os.fsync(fd)
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: fail("lock is unsafe")
+        os.lseek(fd, 0, os.SEEK_SET)
+        bound = os.read(fd, 512)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or bound != marker: fail("lock is unsafe")
         return {"dev": info.st_dev, "ino": info.st_ino, "digest": digest}
     finally:
         os.close(fd)
