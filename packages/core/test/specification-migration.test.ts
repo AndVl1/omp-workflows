@@ -500,7 +500,7 @@ test("migrated state runs validator failure, native v2 revision, checkpoint, and
     const checkpointState = resolveState(root, undefined, { feature_id: featureId, run_key: runKey });
     assert.ok(checkpointState.state);
     if (!checkpointState.state || !checkpointState.state.dispatch_capability) return;
-    const checkpointHandoff = validatorAuth as Record<string, unknown>;
+    const checkpointHandoff = validatorV2 as Record<string, unknown>;
     const asked = await tool("workflow_checkpoint_ask_selected").execute("test", {
       feature_id: featureId,
       advance_token: checkpointHandoff.advance_token,
