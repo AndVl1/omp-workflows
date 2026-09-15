@@ -6062,7 +6062,7 @@ if (durableBatch && batchId && (!publicationStarted || prepareRequestDispatched 
 // Once a durable prefix exists, a lost in-flight prepare response may have
 // already persisted the suffix lease and stage. Do not abort the group
 // speculatively: retain every authenticated lease/journal for recovery.
-if (prepared.length > 0 && (prepareRequestDispatched || inFlightPrepare !== null)) {
+if (prepared.length > 0 && (prepareRequestDispatched || inFlightPrepare !== null) && this.darwinHelperPoisoned) {
 this.resetDarwinHelperForCompensation();
 throw new PinnedRootError("recovery_required", "durable prepared batch prepare response was lost after a durable prefix; grouped recovery is required");
 }
