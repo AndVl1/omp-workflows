@@ -76,6 +76,7 @@ export function registerObservabilityHooks(
   opts: ObservabilityRegisterOptions = {},
 ): (() => Promise<void>) | undefined {
   if (opts.enabled === false) return undefined;
+  const requiresOwnedSession = opts.owner !== undefined;
   let session: ObservabilityRecorderSession | undefined = opts.owner ? createObservabilityRecorderSession(opts.owner) : undefined;
   let lifecycle = Promise.resolve();
   const enqueueLifecycle = (operation: () => Promise<void> | void): Promise<void> => {
@@ -84,27 +85,27 @@ export function registerObservabilityHooks(
     return run;
   };
   pi.on("before_agent_start", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onBeforeAgentStart(event, ctx, session, true);
+    observabilityHooks.onBeforeAgentStart(event, ctx, session, requiresOwnedSession);
   });
   pi.on("agent_start", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onAgentStart(event, ctx, session, true);
+    observabilityHooks.onAgentStart(event, ctx, session, requiresOwnedSession);
   });
   pi.on("agent_end", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onAgentEnd(event, ctx, session, true);
+    observabilityHooks.onAgentEnd(event, ctx, session, requiresOwnedSession);
   });
   if (opts.toolCall !== false) {
     pi.on("tool_call", (event: unknown, ctx: unknown) => {
-      observabilityHooks.onToolCall(event, ctx, session, true);
+      observabilityHooks.onToolCall(event, ctx, session, requiresOwnedSession);
     });
   }
   pi.on("tool_result", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onToolResult(event, ctx, session, true);
+    observabilityHooks.onToolResult(event, ctx, session, requiresOwnedSession);
   });
   pi.on("session_start", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onSessionStart(event, ctx, session, true);
+    observabilityHooks.onSessionStart(event, ctx, session, requiresOwnedSession);
   });
   pi.on("session_stop", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onSessionStop(event, ctx, session, true);
+    observabilityHooks.onSessionStop(event, ctx, session, requiresOwnedSession);
   });
   pi.on("session_switch", async (event: unknown, ctx: unknown) => {
     await enqueueLifecycle(async () => {
