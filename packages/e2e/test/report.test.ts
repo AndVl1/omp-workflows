@@ -1956,7 +1956,6 @@ test('report: destination root swap after final evidence copy rolls back evidenc
   try {
     assert.throws(
       () => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }),
-      /,
     );
     assert.equal(swapped, true);
     assert.equal(readdirSync(evidenceRoot).length, 0, 'replacement evidence root remains empty');
@@ -2024,7 +2023,6 @@ test('report suite: destination swap during markdown output rolls back outputs a
   try {
     assert.throws(
       () => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }),
-      /,
     );
     assert.equal(swapped, true);
     assert.equal(readdirSync(evidenceRoot).length, 0, 'replacement evidence root remains empty');
