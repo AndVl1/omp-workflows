@@ -22,6 +22,7 @@ type RetainedTestTeamSession = {
 };
 const activeTestTeamCaptures = new Set<TeamSessionCaptureState>();
 const retainedTestTeamSessions = new Set<RetainedTestTeamSession>();
+const retainedTestRegistrationRoots = new Set<string>();
 const retainedBindingIdentities = new WeakMap<object, number>();
 let nextRetainedBindingIdentity = 0;
 
@@ -181,6 +182,24 @@ export function closeRetainedTestTeamSessions(): void {
   if (hasError) throw firstError;
 }
 
+function closeRetainedTestHelperRegistrations(): void {
+  const roots = [...retainedTestRegistrationRoots];
+  retainedTestRegistrationRoots.clear();
+  let firstError: unknown;
+  let hasError = false;
+  for (const root of roots) {
+    try {
+      closeRetainedTestRegistrations(root);
+    } catch (error) {
+      if (!hasError) {
+        firstError = error;
+        hasError = true;
+      }
+    }
+  }
+  if (hasError) throw firstError;
+}
+
 nodeTestAfterEach(() => {
   let firstError: unknown;
   let hasError = false;
@@ -191,7 +210,7 @@ nodeTestAfterEach(() => {
     hasError = true;
   }
   try {
-    closeRetainedTestRegistrations();
+    closeRetainedTestHelperRegistrations();
   } catch (error) {
     if (!hasError) {
       firstError = error;
@@ -212,6 +231,7 @@ export function registerTestWorkflowTools(
   try {
     registerWorkflowTools(pi, { ...options, cwd: root, owner: () => registration.owner, registrationToken: registration.token });
     registration.retain(true);
+    retainedTestRegistrationRoots.add(root);
   } catch (error) {
     try { registration.finish(false); } catch { /* preserve original */ }
     throw error;
@@ -234,6 +254,7 @@ export function registerTestCtoTools(
       registrationToken: registration.token,
     });
     registration.retain(true);
+    retainedTestRegistrationRoots.add(root);
   } catch (error) {
     try { registration.finish(false); } catch { /* preserve original */ }
     throw error;
@@ -266,6 +287,7 @@ export function registerTestTeamWorkflow(
     });
     if (installGate) installGate();
     registration.retain(true);
+    retainedTestRegistrationRoots.add(root);
   } catch (error) {
     try { registration.finish(false); } catch { /* preserve original */ }
     throw error;
@@ -285,6 +307,7 @@ export function registerTestConstitutionTools(
   try {
     registerConstitutionTools(pi, { ...options, cwd: root, owner: () => registration.owner, registrationToken: registration.token });
     registration.retain(true);
+    retainedTestRegistrationRoots.add(root);
   } catch (error) {
     try { registration.finish(false); } catch { /* preserve original */ }
     throw error;
