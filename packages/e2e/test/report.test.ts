@@ -909,6 +909,40 @@ test('report: final directory identity is rechecked after the helper walk', () =
   assert.equal(existsSync(join(attackerDir, 'transcript.jsonl')), false);
 });
 
+test('report suite: child reporter contention is serialized by retained child root lock', () => {
+  const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-child-lock-contention-'));
+  const child = makeSessionDir();
+  const childPath = join(suite, 'session-a');
+  renameSync(child, childPath);
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-child-lock-contention-md-'));
+  let nested = false;
+  let nestedError: unknown = null;
+  setEvidenceCopyTestHooks({
+    beforeSourceOpen(path) {
+      if (nested || !path.startsWith(childPath + sep)) return;
+      nested = true;
+      try {
+        generateReport(childPath, BASE_INPUT, { mdDir, copyEvidence: true });
+      } catch (error) {
+        nestedError = error;
+      }
+    },
+  });
+  try {
+    const result = generateReport(suite, BASE_INPUT, { mdDir, copyEvidence: true });
+    const report = JSON.parse(readFileSync(result.jsonPath, 'utf8')) as UxE2eReport;
+    assert.match(String(nestedError), /pinned lock is busy/u);
+    assert.equal(report.session.child_sessions?.length, 1);
+    assert.ok(report.session.child_sessions?.[0]?.evidence.length);
+    assert.equal(existsSync(result.mdPath), true);
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    rmSync(suite, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+  }
+});
+
+
 test('report suite: deterministic child sessions aggregate and copy evidence per child', () => {
   const suite = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-readable-spec-workflow-'));
   const first = makeSessionDir();

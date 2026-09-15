@@ -2240,7 +2240,7 @@ export function generateReport(
     closeSuiteDiscovery(discovery);
     throw new Error('ux-e2e: report destination root must be a stable non-symlink directory');
   }
-  const roots = [discovery.root, externalRoot];
+  const roots = [discovery.root, externalRoot, ...discovery.children.map(child => child.root)];
   const targets = roots
     .filter((root, index, all) => all.findIndex(candidate => candidate.identity.dev === root.identity.dev && candidate.identity.ino === root.identity.ino) === index)
     .sort(comparePinnedRoots);
