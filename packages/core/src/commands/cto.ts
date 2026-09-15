@@ -5427,6 +5427,30 @@ export function deriveCtoSpecificationConformanceInput(
       const admission = claim.admission_binding;
       if ((claim.status !== "active" && claim.status !== "completed" && claim.status !== "blocked") || claim.owner_kind !== "cto" || claim.owner_run_id !== selectors.cto_run_id || claim.handoff_digest !== loaded.handoff.handoff_digest || loaded.workspace.execution_claim_ref !== claim.claim_id
         || !admission || admission.mapping_id !== record.value.mapping.mapping_id || admission.mapping_hash !== record.value.mapping.mapping_hash || admission.wave_id !== execution.value.wave_id) return { ok: false, error: `feature '${selection.feature_id}' current claim is not the exact active CTO admission for the durable mapping wave` };
+      const claimAdmission = verifyExecutionClaimAdmissionBindingPinned(pinnedRoot, {
+        feature_id: selection.feature_id,
+        run_key: selection.run_key,
+        owner_run_id: selectors.cto_run_id,
+        workspace: loaded.workspace,
+        claim,
+        handoff: loaded.handoff,
+        mapping: {
+          selected_feature_id: selection.feature_id,
+          selected_run_key: selection.run_key,
+          mapping_record_path: admission.mapping_record_path,
+          mapping_record_digest: admission.mapping_record_digest,
+          mapping_id: admission.mapping_id,
+          mapping_hash: admission.mapping_hash,
+          mapping_version: admission.mapping_version,
+          checkpoint_ref: admission.checkpoint_ref,
+          trusted_answer_ref: admission.trusted_answer_ref,
+          wave_id: admission.wave_id,
+          capability_id: admission.capability_id,
+          capability_epoch: admission.capability_epoch,
+        },
+        verification_mode: conformanceWave?.status === "done" ? "terminal" : "active",
+      });
+      if (!claimAdmission.ok) return { ok: false, error: `feature '${selection.feature_id}' claim admission proof is invalid: ${claimAdmission.error}` };
       const artifacts = readCanonicalConformanceArtifacts(pinnedRoot, root, selection.feature_id, loaded.handoff.handoff_digest, claim.claim_id, loaded.workspace.profile_hash);
       if (!artifacts.ok) return { ...artifacts, feature_ids: record.value.selections.map((candidate) => candidate.feature_id) };
       handoffs.push({ feature_id: selection.feature_id, run_key: selection.run_key, handoff: loaded.handoff, quality_gates: artifacts.value.quality_gates });
