@@ -3692,6 +3692,22 @@ function closeQuietly(fd: number | null): void {
   try { closeSync(fd); } catch { /* preserve the primary operation result */ }
 }
 
+function removeDarwinHelperDirectory(directory: string): void {
+  try { rmSync(directory, { recursive: true, force: true }); } catch {
+    try { rmSync(directory, { recursive: true, force: true }); } catch { /* preserve the primary operation result */ }
+  }
+}
+
+function scheduleDarwinHelperHardKill(child: ChildProcess): void {
+  const childPid = child.pid;
+  if (childPid === undefined || !Number.isInteger(childPid) || childPid <= 0) return;
+  const timer = setTimeout(() => {
+    if (child.exitCode !== null || child.pid !== childPid) return;
+    try { child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
+  }, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
+  timer.unref();
+}
+
 function decodeDarwinHelperUtf8(decoder: TextDecoder, bytes: Uint8Array, stream: boolean, operation: string): string {
   try {
     return decoder.decode(bytes, { stream });
@@ -3700,35 +3716,11 @@ function decodeDarwinHelperUtf8(decoder: TextDecoder, bytes: Uint8Array, stream:
   }
 }
 
-function pollDarwinChildExit(child: ChildProcess, timeoutMs: number): boolean {
-  const childPid = child.pid;
-  if (childPid === undefined || !Number.isInteger(childPid) || childPid <= 0) return child.exitCode !== null;
-  const pid = childPid as number;
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() <= deadline) {
-    if (child.exitCode !== null) return true;
-    try {
-      process.kill(pid, 0);
-    } catch (error) {
-      if (errnoCode(error) === "ESRCH") return true;
-    }
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS);
-  }
-  return child.exitCode !== null;
-}
-
-function terminateDarwinHelperChild(child: ChildProcess): void {
-  try { child.kill("SIGTERM"); } catch { /* preserve bounded teardown */ }
-  if (pollDarwinChildExit(child, DARWIN_HELPER_CLOSE_TIMEOUT_MS)) return;
-  try { child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
-  pollDarwinChildExit(child, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
-}
-
-function closeDarwinHelperSessionSynchronously(session: DarwinHelperSession): void {
+function closeDarwinHelperSessionImmediately(session: DarwinHelperSession): void {
   closeQuietly(session.requestFd);
   closeQuietly(session.responseFd);
-  terminateDarwinHelperChild(session.child);
-  try { rmSync(session.directory, { recursive: true, force: true }); } catch { /* preserve bounded teardown */ }
+  try { session.child.kill("SIGTERM"); } catch { /* preserve bounded teardown */ }
+  removeDarwinHelperDirectory(session.directory);
 }
 
 function cleanupDarwinHelpersOnExit(): void {
@@ -5193,9 +5185,9 @@ export class PinnedProjectRoot {
       closeQuietly(responseFd);
       if (child && child.pid !== undefined) {
         try { child.kill("SIGTERM"); } catch { /* preserve primary failure */ }
-        pollDarwinChildExit(child, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
+        scheduleDarwinHelperHardKill(child);
       }
-      try { rmSync(directory, { recursive: true, force: true }); } catch { /* preserve primary failure */ }
+      removeDarwinHelperDirectory(directory);
       if (error instanceof PinnedRootError) throw error;
       throw new PinnedRootError("unsupported", `descriptor helper could not start: ${String(error)}`);
     }
@@ -5209,8 +5201,8 @@ export class PinnedProjectRoot {
     activeDarwinHelperSessions.delete(session);
     removeLiveDarwinHelperSession(session);
     session.closing = true;
-    closeDarwinHelperSessionSynchronously(session);
-    this.darwinHelperClosePromise = session.exitPromise;
+    closeDarwinHelperSessionImmediately(session);
+    this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
   }
 
   private writeDarwinFrame(session: DarwinHelperSession, frame: Buffer, deadline: number, operation: string): void {
@@ -5335,6 +5327,37 @@ export class PinnedProjectRoot {
     }
   }
 
+  private awaitDarwinHelperExit(session: DarwinHelperSession): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const childPid = session.child.pid;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        removeDarwinHelperDirectory(session.directory);
+        if (error) reject(error); else resolve();
+      };
+      if (session.exited || session.child.exitCode !== null) {
+        session.exited = true;
+        finish();
+        return;
+      }
+      const timer = setTimeout(() => {
+        if (session.exited || session.child.exitCode !== null) { finish(); return; }
+        if (session.child.pid === childPid) {
+          try { session.child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
+        }
+        const finalTimer = setTimeout(() => {
+          if (session.exited || session.child.exitCode !== null) finish();
+          else finish(new PinnedRootError("unsupported", "descriptor helper did not exit before bounded close"));
+        }, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
+        finalTimer.unref();
+      }, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
+      timer.unref();
+      session.exitPromise.then(() => finish(), () => finish(new PinnedRootError("unsupported", "descriptor helper exit could not be observed")));
+    });
+  }
+
   private closeDarwinHelper(): void {
     const session = this.darwinHelperSession;
     this.darwinHelperSession = null;
@@ -5342,8 +5365,8 @@ export class PinnedProjectRoot {
     activeDarwinHelperSessions.delete(session);
     removeLiveDarwinHelperSession(session);
     session.closing = true;
-    closeDarwinHelperSessionSynchronously(session);
-    this.darwinHelperClosePromise = session.exitPromise;
+    closeDarwinHelperSessionImmediately(session);
+    this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
   }
 
   private makeWriteReceipt(
