@@ -1996,7 +1996,7 @@ function generateSuiteReport(
   suiteRoot: string,
   discovery: SuiteDiscovery,
   input: ReportInput,
-  opts: GenerateReportOptions,
+  opts: InternalGenerateReportOptions,
 ): GenerateReportResult {
   const children = discovery.children;
   const childReports: Array<{ readonly child: SuiteChild; readonly result: InternalGenerateReportResult }> = [];
