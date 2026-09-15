@@ -7,7 +7,7 @@
  *
  */
 import { test } from "node:test";
-import { TEST_ON, TEST_OWNER, TEST_SESSION_MANAGER } from "./fixtures/registrar-host.js";
+import { TEST_CONTEXT, TEST_OWNER, TEST_SESSION_MANAGER } from "./fixtures/registrar-host.js";
 import { openTestRegistry, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -347,9 +347,12 @@ function mountedPrepareTool(root: string): MountedPrepareTool {
   writeTestRegistryMarker(root);
   const registration = openTestRegistry(root, ["workflow_tools"], "do-work-routing");
   const tools = new Map<string, MountedPrepareTool>();
+  const on = (event: string, handler: (event: unknown, ctx: unknown) => unknown): void => {
+    if (event === "session_start") handler({}, TEST_CONTEXT(root));
+  };
   registerWorkflowTools({
     zod: { z: zod },
-    on: TEST_ON,
+    on,
     registerTool(tool: unknown) {
       const mounted = tool as MountedPrepareTool;
       tools.set(mounted.name, mounted);
