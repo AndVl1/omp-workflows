@@ -687,6 +687,11 @@ export class EventRecorder {
     if (this.ownsPinnedRoot) this.pinnedRoot.close();
   }
 
+  /** Canonical root identity used for lifecycle-owned cache eviction. */
+  get canonicalRoot(): string {
+    return this.pinnedRoot.canonical_root;
+  }
+
   /** Absolute descriptor anchor for compatibility with existing readers/tests. */
   get path(): string {
     return this.eventsPath;

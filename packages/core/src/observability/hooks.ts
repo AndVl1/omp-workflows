@@ -81,6 +81,27 @@ function activeFeatureSlug(pinnedRoot: PinnedProjectRoot): string {
 }
 
 const recorderCache = new Map<string, EventRecorder>();
+const MAX_CACHED_RECORDERS = 64;
+
+function cacheRecorder(cwd: string, recorder: EventRecorder): void {
+  const prior = recorderCache.get(cwd);
+  if (prior && prior !== recorder) prior.close();
+  recorderCache.set(cwd, recorder);
+  while (recorderCache.size > MAX_CACHED_RECORDERS) {
+    const oldest = recorderCache.entries().next().value as [string, EventRecorder] | undefined;
+    if (!oldest) break;
+    recorderCache.delete(oldest[0]);
+    oldest[1].close();
+  }
+}
+
+export function closeObservabilityRecorders(root?: string): void {
+  for (const [cwd, recorder] of [...recorderCache.entries()]) {
+    if (root !== undefined && recorder.canonicalRoot !== root && cwd !== root) continue;
+    recorderCache.delete(cwd);
+    recorder.close();
+  }
+}
 
 function getRecorder(cwd: string): EventRecorder {
   const cached = recorderCache.get(cwd);
@@ -92,7 +113,7 @@ function getRecorder(cwd: string): EventRecorder {
     const branch = currentBranch(cwd);
     const featureSlug = activeFeatureSlug(pinnedRoot);
     const rec = new EventRecorder({ cwd, branch, featureSlug, pinnedRoot });
-    recorderCache.set(cwd, rec);
+    cacheRecorder(cwd, rec);
     retained = true;
     return rec;
   } finally {
@@ -118,9 +139,16 @@ function safeAppend(
     const reason = error instanceof Error && error.message ? error.message : "telemetry write rejected";
     console.warn(`[observability] ${reason}`);
   };
+  let recorder: EventRecorder | undefined;
   try {
-    void getRecorder(cwd).append(ev).catch(reject);
+    recorder = getRecorder(cwd);
+    void recorder.append(ev).catch((error) => {
+      closeObservabilityRecorders(recorder!.canonicalRoot);
+      reject(error);
+    });
   } catch (error) {
+    if (recorder) closeObservabilityRecorders(recorder.canonicalRoot);
+    else closeObservabilityRecorders(cwd);
     reject(error);
   }
 }

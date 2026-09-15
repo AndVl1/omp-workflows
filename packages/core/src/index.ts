@@ -28,7 +28,7 @@ import { safetyGuard } from "./gates/safety.js";
 import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { outboxEnforcementGate } from "./gates/outbox.js";
 import { ctoSliceTaskGate } from "./cto/slice-gate.js";
-import { registerObservabilityHooks, recordToolCallAttempt } from "./observability/index.js";
+import { closeObservabilityRecorders, registerObservabilityHooks, recordToolCallAttempt } from "./observability/index.js";
 import { authorizeDispatchTrusted, authorizeSpecificationPhaseValidationDispatch, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, completeSpecificationExecution, recordCheckpointDecision, setConstitutionContinuationGate, validateCheckpointAskSelected, commitCheckpointAnswerSelected, renderCheckpointCanonicalPacket, finalizeImportedHandoff, issueTrustedMappingProof, issueCurrentTrustedMappingProof, registerTrustedTaskResultHostBridge, issueTrustedTaskResultHostCapability, recordTrustedTaskResultFromHost, MAX_ADVANCE_FIELD_BYTES, MAX_ADVANCE_EVIDENCE_BYTES, MAX_COMPLETION_ARTIFACT_COUNT, MAX_COMPLETION_ARTIFACT_BYTES, MAX_ROSTER_SELECTION_COUNT, MAX_ROSTER_SELECTION_BYTES, MAX_CHECKPOINT_RATIONALE_BYTES, isBoundedLineInert, isSafeWorkflowIdentifier, type CheckpointAskSelectedRequest, type ImportedHandoffFinalizationInput, type CtoSpecificationCompletionEnvelope, type TrustedMappingProof, type TrustedTaskResultHostCapability } from "./engine/durable.js";
 import { registerWorkflowProfiles } from "./engine/profile.js";
 import { findCheckpointDecision, issueTrustedCheckpointAnswerCapability, registerTrustedCheckpointHostBridge } from "./engine/checkpoints.js";
@@ -444,6 +444,7 @@ function markTeamFailed(pi: object, error: unknown, recoverableSession = false):
 function closeTeamBindingResources(binding: TeamSessionBinding): void {
   if (binding.runtimeAccess) binding.runtimeAccess.close();
   if (binding.runtimeAuthority) revokeCtoRuntimeSessionAuthority(binding.runtimeAuthority);
+  closeObservabilityRecorders(binding.root);
   binding.cleanup?.();
 }
 

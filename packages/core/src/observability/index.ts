@@ -8,7 +8,7 @@
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { observabilityHooks } from "./hooks.js";
+import { closeObservabilityRecorders, observabilityHooks } from "./hooks.js";
 
 export interface ObservabilityRegisterOptions {
   /**
@@ -51,11 +51,18 @@ export function registerObservabilityHooks(
   pi.on("session_stop", (event: unknown, ctx: unknown) => {
     observabilityHooks.onSessionStop(event, ctx);
   });
+  pi.on("session_switch", (_event: unknown, ctx: unknown) => {
+    const cwd = typeof ctx === "object" && ctx !== null && "cwd" in ctx ? (ctx as { cwd?: unknown }).cwd : undefined;
+    if (typeof cwd === "string" && cwd.length > 0) closeObservabilityRecorders(cwd);
+  });
+  pi.on("session_shutdown", () => {
+    closeObservabilityRecorders();
+  });
 }
 
 export { EventRecorder, rollupFromEvents, readObservabilityPointer } from "./recorder.js";
 export { extractSkills } from "./skills.js";
-export { recordStageTransition, recordArtifactWritten } from "./hooks.js";
+export { closeObservabilityRecorders, recordStageTransition, recordArtifactWritten } from "./hooks.js";
 export { recordToolCallAttempt } from "./hooks.js";
 export type {
   ObservabilityEvent,
