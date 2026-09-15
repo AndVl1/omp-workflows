@@ -174,13 +174,33 @@ export interface CtoSpecificationExecutionMappingAuthority {
     };
   };
   wave_id: string;
+  confirmation: {
+    checkpoint_ref: string;
+    trusted_answer_ref: string;
+    confirmation_context: Record<string, unknown>;
+    confirmed_at: string;
+    trusted_answer: Record<string, unknown>;
+  };
 }
+
+export interface CtoSpecificationExecutionMappingAuthorityValidationInput {
+  record: Record<string, unknown>;
+  record_digest: string;
+  record_path: string;
+  state: CtoState;
+  pinnedRoot: PinnedProjectRoot;
+}
+
+export type CtoSpecificationExecutionMappingAuthorityValidator = (
+  input: CtoSpecificationExecutionMappingAuthorityValidationInput,
+) => string | null;
 
 export interface ReconcileCtoSpecificationExecutionTeamsOptions {
   runtimeAccess: CtoRuntimeAccessFacade;
   sessionId: string;
   pinnedRoot?: PinnedProjectRoot;
   expected_mapping_authority?: CtoSpecificationExecutionMappingAuthority;
+  validate_mapping_authority?: CtoSpecificationExecutionMappingAuthorityValidator;
 }
 
 export interface CtoSpecificationTaskAuthorizationEvent {
@@ -1240,6 +1260,7 @@ function ctoReconciliationMappingAuthorityError(
   ctoRunId: string,
   authority: CtoSpecificationExecutionMappingAuthority,
   state: CtoState,
+  validateAuthority?: CtoSpecificationExecutionMappingAuthorityValidator,
 ): string | null {
   if (!isSafeRelativePath(authority.mapping_record_path)
     || !isSha256Hex(authority.mapping_record_digest)
@@ -1256,15 +1277,25 @@ function ctoReconciliationMappingAuthorityError(
     || typeof authority.mapping.execution.source_id !== "string"
     || typeof authority.mapping.execution.capability_id !== "string"
     || typeof authority.mapping.execution.capability_epoch !== "string"
-    || !isSafeCtoExecutionId(authority.wave_id)) {
+    || !isSafeCtoExecutionId(authority.wave_id)
+    || !authority.confirmation
+    || typeof authority.confirmation.checkpoint_ref !== "string"
+    || typeof authority.confirmation.trusted_answer_ref !== "string"
+    || !authority.confirmation.confirmation_context
+    || typeof authority.confirmation.confirmed_at !== "string"
+    || !authority.confirmation.trusted_answer) {
     return "CTO reconciliation expected mapping authority is invalid";
   }
   const loaded = readPinnedCtoMappingRecord(pinnedRoot, authority.mapping_record_path, ctoRunId, authority.mapping_id);
   if (!loaded.ok) return `CTO reconciliation mapping authority is unreadable: ${loaded.error}`;
-  const record = loaded.value.record as { cto_run_id?: unknown; mapping?: unknown };
+  const record = loaded.value.record as { cto_run_id?: unknown; mapping?: unknown; checkpoint_ref?: unknown; trusted_answer_ref?: unknown; confirmation_context?: unknown; confirmed_at?: unknown };
   const mapping = record.mapping as CtoSpecificationExecutionMappingAuthority["mapping"] | undefined;
   if (record.cto_run_id !== ctoRunId
     || loaded.value.digest !== authority.mapping_record_digest
+    || record.checkpoint_ref !== authority.confirmation.checkpoint_ref
+    || record.trusted_answer_ref !== authority.confirmation.trusted_answer_ref
+    || canonicalJson(record.confirmation_context) !== canonicalJson(authority.confirmation.confirmation_context)
+    || record.confirmed_at !== authority.confirmation.confirmed_at
     || !mapping
     || mapping.mapping_id !== authority.mapping_id
     || mapping.mapping_hash !== authority.mapping_hash
@@ -1296,6 +1327,10 @@ function ctoReconciliationMappingAuthorityError(
       || identity.slice_id !== owner.slice_id || identity.task_id !== owner.task_id) {
       return `CTO reconciliation team binding is stale for slice ${owner.slice_id}`;
     }
+  }
+  if (validateAuthority) {
+    const validationError = validateAuthority({ record: loaded.value.record, record_digest: loaded.value.digest, record_path: loaded.value.path, state, pinnedRoot });
+    if (validationError) return validationError;
   }
   return null;
 }
@@ -1400,7 +1435,7 @@ export function reconcileCtoSpecificationExecutionTeams(projectRoot: string, cto
       if (updates.length > 0) {
         const authority = options.expected_mapping_authority;
         if (authority) {
-          const authorityError = ctoReconciliationMappingAuthorityError(pinnedRoot, ctoRunId, authority, state);
+          const authorityError = ctoReconciliationMappingAuthorityError(pinnedRoot, ctoRunId, authority, state, options.validate_mapping_authority);
           if (authorityError) return { status: "blocked", reconciled_team_ids: [], findings: [authorityError] };
         }
         transaction.writeState(state);
