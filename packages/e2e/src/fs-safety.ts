@@ -932,6 +932,7 @@ export function readPinnedEvidence(root: PinnedDirectory, sourcePath: string): B
     const encoded = result?.bytes;
     if (typeof encoded !== 'string') return null;
     const bytes = Buffer.from(encoded, 'base64');
+    if (!pinnedDirectoryIsStable(root)) return null;
     return bytes.length <= MAX_PINNED_READ_BYTES ? bytes : null;
   }
   let descriptor: number | null = null;

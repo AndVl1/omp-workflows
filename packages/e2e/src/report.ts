@@ -516,14 +516,15 @@ export interface EvidenceCopyTestHooks extends FsSafetyTestHooks {}
 export function setEvidenceCopyTestHooks(hooks: EvidenceCopyTestHooks | null): void {
   setFsSafetyTestHooks(hooks);
 }
-function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir: string, maxBytes = MAX_EVIDENCE_BYTES, retainedSourceRoot?: PinnedDirectory, created?: Map<string, Buffer>): string[] {
+function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir: string, maxBytes = MAX_EVIDENCE_BYTES, retainedSourceRoot?: PinnedDirectory, created?: Map<string, Buffer>, createdRoots?: Map<string, PinnedDirectory>, retainedTargetRoot?: PinnedDirectory): string[] {
   notifyBeforeSourcePin(scratchDir);
   const sourceRoot = retainedSourceRoot ?? pinDirectory(scratchDir);
   const ownsSourceRoot = retainedSourceRoot === undefined;
-  const targetRoot = pinOrCreateDirectory(targetDir);
+  const targetRoot = retainedTargetRoot ?? pinOrCreateDirectory(targetDir);
+  const ownsTargetRoot = retainedTargetRoot === undefined;
   if (sourceRoot === null || targetRoot === null) {
     if (sourceRoot !== null && ownsSourceRoot) closePinnedDirectory(sourceRoot);
-    if (targetRoot !== null) closePinnedDirectory(targetRoot);
+    if (targetRoot !== null && ownsTargetRoot) closePinnedDirectory(targetRoot);
     return [];
   }
   try {
@@ -550,6 +551,7 @@ function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir
       if (destinationRoot === null) continue;
       const destinationDir = destinationRoot.lexicalPath;
       const ownsDestinationRoot = destinationRoot !== targetRoot;
+      let retainDestinationRoot = false;
       try {
         const existingFile = openPinnedFile(destinationRoot, filename, fsConstants.O_RDONLY);
         if (existingFile !== null) {
@@ -569,16 +571,20 @@ function copyEvidence(evidence: readonly string[], targetDir: string, scratchDir
         if (!writePinnedFile(destinationRoot, filename, bytes, { replaceExisting: false })) continue;
         const publishedPath = join(destinationDir, filename);
         created?.set(publishedPath, bytes);
+        if (createdRoots !== undefined) {
+          createdRoots.set(publishedPath, destinationRoot);
+          retainDestinationRoot = true;
+        }
         copied.push(publishedPath);
       } finally {
-        if (ownsDestinationRoot) closePinnedDirectory(destinationRoot);
+        if (ownsDestinationRoot && !retainDestinationRoot) closePinnedDirectory(destinationRoot);
       }
     }
     if (!pinnedDirectoryIsStable(sourceRoot)) throw new Error('ux-e2e: session root changed during evidence collection');
     return copied;
   } finally {
     if (ownsSourceRoot) closePinnedDirectory(sourceRoot);
-    closePinnedDirectory(targetRoot);
+    if (ownsTargetRoot) closePinnedDirectory(targetRoot);
   }
 }
 type JsonRecord = Record<string, unknown>;
@@ -1421,6 +1427,21 @@ function generateSingleReport(
   const ownsScratchRoot = expectedDiscovery === undefined && opts.retainedRoot === undefined;
   if (scratchRoot === null) throw new Error('ux-e2e: session root must be a stable directory');
   let stateDestination: PinnedDirectory | null = null;
+  const createdEvidence = new Map<string, Buffer>();
+  const createdEvidenceRoots = new Map<string, PinnedDirectory>();
+  const retainedEvidenceRoots: PinnedDirectory[] = [];
+  const rollbackEvidence = (): void => {
+    for (const [path, bytes] of createdEvidence) {
+      const retainedParent = createdEvidenceRoots.get(path);
+      if (retainedParent !== undefined) {
+        unlinkPinnedFileIfExact(retainedParent, basename(path), bytes, { requireStable: false });
+        continue;
+      }
+      const parent = pinDirectory(dirname(path));
+      if (parent === null) continue;
+      try { unlinkPinnedFileIfExact(parent, basename(path), bytes, { requireStable: false }); } finally { closePinnedDirectory(parent); }
+    }
+  };
   try {
     const warnings: string[] = [];
   const rawSession = readSessionMeta(scratchDir);
@@ -1529,7 +1550,11 @@ function generateSingleReport(
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before evidence collection');
       let evidence = collectEvidence(candidates);
     if (opts.copyEvidence === true) {
-      evidence = copyEvidence(evidence, opts.evidenceTargetDir ?? join(mdDir, 'evidence', slug), scratchDir, MAX_EVIDENCE_BYTES, scratchRoot);
+      const evidenceTarget = opts.evidenceTargetDir ?? join(mdDir, 'evidence', slug);
+      const evidenceTargetRoot = pinOrCreateDirectory(evidenceTarget);
+      if (evidenceTargetRoot === null) throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
+      retainedEvidenceRoots.push(evidenceTargetRoot);
+      evidence = copyEvidence(evidence, evidenceTargetRoot.lexicalPath, scratchDir, MAX_EVIDENCE_BYTES, scratchRoot, createdEvidence, createdEvidenceRoots, evidenceTargetRoot);
     }
     const report = sanitizeOutput({
       type: 'ux-e2e',
@@ -1619,6 +1644,9 @@ function generateSingleReport(
         throw error;
       }
       return { jsonPath, mdPath, warnings, report };
+  } catch (error) {
+    rollbackEvidence();
+    throw error;
   } finally {
     try {
       if (reportDestination !== null) closeSync(reportDestination.fd);
@@ -1626,8 +1654,8 @@ function generateSingleReport(
     } catch {
       /* Ignore cleanup failures. */
     }
-  }
-  } finally {
+    for (const root of createdEvidenceRoots.values()) closePinnedDirectory(root);
+    for (const root of retainedEvidenceRoots) closePinnedDirectory(root);
     if (ownsScratchRoot) closePinnedDirectory(scratchRoot);
   }
 }
@@ -1891,11 +1919,18 @@ function generateSuiteReport(
     warnings.push(...result.warnings.map(warning => child.name + ': ' + warning));
   }
   const copiedEvidence = new Map<string, Buffer>();
+  const copiedEvidenceRoots = new Map<string, PinnedDirectory>();
+  const retainedEvidenceRoots: PinnedDirectory[] = [];
   const rollbackCopiedEvidence = (): void => {
     for (const [path, bytes] of copiedEvidence) {
+      const retainedParent = copiedEvidenceRoots.get(path);
+      if (retainedParent !== undefined) {
+        unlinkPinnedFileIfExact(retainedParent, basename(path), bytes, { requireStable: false });
+        continue;
+      }
       const parent = pinDirectory(dirname(path));
       if (parent === null) continue;
-      try { unlinkPinnedFileIfExact(parent, basename(path), bytes); } finally { closePinnedDirectory(parent); }
+      try { unlinkPinnedFileIfExact(parent, basename(path), bytes, { requireStable: false }); } finally { closePinnedDirectory(parent); }
     }
   };
   try {
@@ -1915,9 +1950,15 @@ function generateSuiteReport(
       }
       childEvidenceBytes += size;
     }
-    const childEvidence = opts.copyEvidence === true
-      ? copyEvidence(result.report.evidence, join(mdDir, 'evidence', child.name), child.scratchDir, MAX_SUITE_EVIDENCE_BYTES - aggregateEvidenceBytes, child.root, copiedEvidence)
-      : [...result.report.evidence];
+    let childEvidence: string[];
+    if (opts.copyEvidence === true) {
+      const targetRoot = pinOrCreateDirectory(join(mdDir, 'evidence', child.name));
+      if (targetRoot === null) throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
+      retainedEvidenceRoots.push(targetRoot);
+      childEvidence = copyEvidence(result.report.evidence, targetRoot.lexicalPath, child.scratchDir, MAX_SUITE_EVIDENCE_BYTES - aggregateEvidenceBytes, child.root, copiedEvidence, copiedEvidenceRoots, targetRoot);
+    } else {
+      childEvidence = [...result.report.evidence];
+    }
     aggregateEvidenceBytes += childEvidenceBytes;
     if (childEvidence.length > MAX_SUITE_EVIDENCE_FILES - aggregateEvidenceFiles) throw new Error('ux-e2e: suite has too many evidence files');
     aggregateEvidenceFiles += childEvidence.length;
@@ -1973,6 +2014,9 @@ function generateSuiteReport(
   } catch (error) {
     rollbackCopiedEvidence();
     throw error;
+  } finally {
+    for (const root of copiedEvidenceRoots.values()) closePinnedDirectory(root);
+    for (const root of retainedEvidenceRoots) closePinnedDirectory(root);
   }
 }
 
@@ -1985,8 +2029,12 @@ export function generateReport(
   const discovery = discoverSuiteChildren(suiteRoot);
   if (discovery === null) throw new Error('ux-e2e: failed to write report.json inside the session directory');
   if (discovery.single) {
-    const result = generateSingleReport(suiteRoot, input, opts, discovery);
-    return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings };
+    try {
+      const result = generateSingleReport(suiteRoot, input, opts, discovery);
+      return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings };
+    } finally {
+      closeSuiteDiscovery(discovery);
+    }
   }
   try {
     return generateSuiteReport(suiteRoot, discovery, input, opts);

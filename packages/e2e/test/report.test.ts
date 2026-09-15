@@ -1497,3 +1497,40 @@ test('report: oversized destination with matching prefix is a real evidence coll
     rmSync(mdDir, { recursive: true, force: true });
   }
 });
+
+
+test('report: source root swap after first evidence copy rolls back every published byte', () => {
+  const dir = makeSessionDir();
+  const replacement = mkdtempSync(join(tmpdir(), 'ux-e2e-source-after-copy-replacement-'));
+  const moved = `${dir}.moved`;
+  const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-source-after-copy-'));
+  let writes = 0;
+  let swapped = false;
+  setEvidenceCopyTestHooks({
+    beforeTargetRename(path) {
+      if (swapped || !path.includes(`${sep}evidence${sep}my-feature${sep}`)) return;
+      writes += 1;
+      if (writes !== 2) return;
+      swapped = true;
+      renameSync(dir, moved);
+      renameSync(replacement, dir);
+    },
+  });
+  try {
+    assert.throws(
+      () => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }),
+      /session root changed|failed to write report|membership changed/u,
+    );
+    assert.equal(swapped, true);
+    assert.equal(readdirSync(join(mdDir, 'evidence', 'my-feature')).length, 0, 'published evidence is rolled back');
+  } finally {
+    setEvidenceCopyTestHooks(null);
+    if (swapped) {
+      rmSync(dir, { recursive: true, force: true });
+      renameSync(moved, dir);
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(mdDir, { recursive: true, force: true });
+    if (!swapped) rmSync(replacement, { recursive: true, force: true });
+  }
+});
