@@ -137,7 +137,20 @@ function descriptorPathFor(fd: number): string | null {
 function duplicateDirectoryDescriptor(fd: number): number | null {
   const path = descriptorPathFor(fd);
   if (path === null) return null;
-  try { return openSync(path, fsConstants.O_RDONLY | O_DIRECTORY); } catch { return null; }
+  let duplicate: number | null = null;
+  try {
+    duplicate = openSync(path, fsConstants.O_RDONLY);
+    if (!fstatSync(duplicate).isDirectory()) {
+      closeSync(duplicate);
+      return null;
+    }
+    return duplicate;
+  } catch {
+    if (duplicate !== null) {
+      try { closeSync(duplicate); } catch { /* best effort */ }
+    }
+    return null;
+  }
 }
 
 /** Open and retain a directory whose inode is the authority for all children. */
