@@ -37,6 +37,7 @@ function makeCtoState(overrides: Partial<CtoState> = {}): CtoState {
     integration: { status: "failed", note: "verdict reject" },
     pause: { kind: "background_wait", reason: "waiting on beta answer" },
     updated_at: "2026-08-08T11:00:00.000Z",
+    wave_history: [],
     ...overrides,
   };
 }

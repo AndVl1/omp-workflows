@@ -49,6 +49,7 @@ function makeTeamState(overrides: Partial<TeamState> = {}): TeamState {
     artifacts: {},
     pause: { kind: "none", reason: "" },
     updated_at: "2026-08-08T10:00:00.000Z",
+    wave_history: [],
     ...overrides,
   };
 }
