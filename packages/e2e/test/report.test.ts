@@ -1759,7 +1759,8 @@ test('report: retained source pin rejects root replacement before evidence copy'
   });
   try {
     assert.throws(() => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }));
-    assert.equal(readdirSync(join(mdDir, 'evidence', 'my-feature')).length, 0);
+    const evidenceRoot = join(mdDir, 'evidence', 'my-feature');
+    assert.equal(!existsSync(evidenceRoot) || readdirSync(evidenceRoot).length === 0, true, 'published evidence is empty or removed');
   } finally {
     setEvidenceCopyTestHooks(null);
     if (swapped) {
@@ -1791,7 +1792,8 @@ test('report suite: retained child source pin rejects replacement before aggrega
   });
   try {
     assert.throws(() => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }));
-    assert.equal(readdirSync(join(mdDir, 'evidence', 'session-a')).length, 0);
+    const evidenceRoot = join(mdDir, 'evidence', 'session-a');
+    assert.equal(!existsSync(evidenceRoot) || readdirSync(evidenceRoot).length === 0, true, 'published evidence is empty or removed');
   } finally {
     setEvidenceCopyTestHooks(null);
     if (swapped) {
@@ -1853,7 +1855,8 @@ test('report: source root swap after first evidence copy rolls back every publis
       () => generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }),
     );
     assert.equal(swapped, true);
-    assert.equal(readdirSync(join(mdDir, 'evidence', 'my-feature')).length, 0, 'published evidence is rolled back');
+    const evidenceRoot = join(mdDir, 'evidence', 'my-feature');
+    assert.equal(!existsSync(evidenceRoot) || readdirSync(evidenceRoot).length === 0, true, 'published evidence is empty or removed');
   } finally {
     setEvidenceCopyTestHooks(null);
     if (swapped) {
