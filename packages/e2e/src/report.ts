@@ -1638,8 +1638,8 @@ function generateSingleReport(
       const evidenceTarget = opts.evidenceTargetDir ?? join(mdDir, 'evidence', slug);
       const evidenceTargetRoot = opts.retainedEvidenceRoot
         ?? (opts.retainedReportRoot !== undefined && opts.evidenceTargetDir === undefined
-          ? pinChildDirectory(opts.retainedReportRoot, ['evidence', slug])
-          : pinOrCreateDirectory(evidenceTarget));
+          ? pinChildDirectory(opts.retainedReportRoot, ['evidence', slug], createdEvidenceDirectories)
+          : pinOrCreateDirectory(evidenceTarget, createdEvidenceDirectories));
       if (evidenceTargetRoot === null) throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
       retainedEvidenceRoots.push(evidenceTargetRoot);
       evidence = copyEvidence(evidence, evidenceTargetRoot.lexicalPath, scratchDir, MAX_EVIDENCE_BYTES, scratchRoot, createdEvidence, createdEvidenceRoots, createdEvidenceDirectories, evidenceTargetRoot, retainedEvidenceDestinationRoots);
@@ -2165,8 +2165,8 @@ function generateSuiteReport(
     let childEvidence: string[];
     if (opts.copyEvidence === true) {
       const targetRoot = opts.retainedReportRoot !== undefined
-        ? pinChildDirectory(opts.retainedReportRoot, ['evidence', child.name])
-        : pinOrCreateDirectory(join(mdDir, 'evidence', child.name));
+        ? pinChildDirectory(opts.retainedReportRoot, ['evidence', child.name], copiedEvidenceDirectories)
+        : pinOrCreateDirectory(join(mdDir, 'evidence', child.name), copiedEvidenceDirectories);
       if (targetRoot === null) throw new Error('ux-e2e: report evidence destination root must be a stable non-symlink directory');
       retainedEvidenceRoots.push(targetRoot);
       childEvidence = copyEvidence(result.report.evidence, targetRoot.lexicalPath, child.scratchDir, MAX_SUITE_EVIDENCE_BYTES - aggregateEvidenceBytes, child.root, copiedEvidence, copiedEvidenceRoots, copiedEvidenceDirectories, targetRoot, retainedEvidenceDestinationRoots);
