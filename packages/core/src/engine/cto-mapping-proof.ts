@@ -251,7 +251,8 @@ function proofWriteResult(
 ): { ok: true; content: string; digest: string; path: string; dev: number; ino: number } | { ok: false; error: string } {
   try {
     const before = pinnedRoot.pathEntryInfo(relative);
-    if (!before || before.kind !== "file") return { ok: false, error: "mapping confirmation proof is not a regular file" };
+    if (before && before.kind !== "file") return { ok: false, error: "mapping confirmation proof is not a regular file" };
+    if (!before) throw new PinnedRootError("not_found", "mapping confirmation proof is absent");
     const current = pinnedRoot.readFile(relative, { maxBytes: MAX_BYTES });
     const after = pinnedRoot.pathEntryInfo(relative);
     if (!after || after.kind !== "file" || before.dev !== current.dev || before.ino !== current.ino || after.dev !== current.dev || after.ino !== current.ino || after.size !== current.bytes.byteLength) return { ok: false, error: "mapping confirmation proof changed while it was read" };
