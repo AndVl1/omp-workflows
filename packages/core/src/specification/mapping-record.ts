@@ -26,7 +26,7 @@ const MAX_TASKS = MAX_CTO_MAPPING_TASKS;
 const MAX_MAPPING_FEEDBACK_BYTES = 8192;
 
 const RECORD_REQUIRED = new Set(["schema_version", "cto_run_id", "mapping", "selections", "checkpoint_ref", "trusted_answer_ref"]);
-const RECORD_OPTIONAL = new Set(["review", "confirmation_context", "confirmed_at", "confirmation_proof_ref"]);
+const RECORD_OPTIONAL = new Set(["review", "confirmation_context", "confirmed_at", "confirmation_state_after_digest", "confirmation_proof_ref"]);
 const MAPPING_REQUIRED = new Set([
   "schema_version", "mapping_id", "mapping_version", "mapping_hash", "feature_ids", "selections",
   "execution_choice", "handoff_bindings", "task_to_slice", "shared_contracts", "parallelization",
@@ -121,6 +121,7 @@ export function validateCtoMappingRecord(parsed: unknown, ctoRunId: string, mapp
   if (record.review !== undefined && (!exact(record.review, REVIEW_KEYS, REVIEW_OPTIONAL) || (record.review.feedback !== undefined && (typeof record.review.feedback !== "string" || record.review.feedback.length === 0 || record.review.feedback !== record.review.feedback.trim() || Buffer.byteLength(record.review.feedback, "utf8") > MAX_MAPPING_FEEDBACK_BYTES || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(record.review.feedback))))) return "mapping review has unknown or invalid feedback fields";
   if (record.confirmation_context !== undefined && !exact(record.confirmation_context, CONFIRMATION_KEYS)) return "mapping confirmation context has unknown or missing fields";
   if (record.confirmed_at !== undefined && !text(record.confirmed_at)) return "mapping confirmed_at is invalid";
+  if (record.confirmation_state_after_digest !== undefined && !isSha256Hex(record.confirmation_state_after_digest)) return "mapping confirmation state digest is invalid";
   if (record.confirmation_proof_ref !== undefined && !safeId(record.confirmation_proof_ref)) return "mapping confirmation proof reference is invalid";
 
   if (!exact(record.mapping, MAPPING_REQUIRED, MAPPING_OPTIONAL)) return "mapping has unknown or missing fields";
@@ -143,8 +144,8 @@ export function validateCtoMappingRecord(parsed: unknown, ctoRunId: string, mapp
     || !Array.isArray(mapping.parallelization) || mapping.parallelization.length > MAX_CTO_MAPPING_PARALLELIZATION
     || (mapping.checkpoint_ref !== null && !text(mapping.checkpoint_ref))
     || !["candidate", "awaiting_confirmation", "confirmed", "revision_required", "stopped", "stale", "blocked", "aborted", "quarantined"].includes(String(mapping.status))) return "mapping envelope is invalid or exceeds domain bounds";
-  if (mapping.status === "confirmed" && typeof record.confirmation_proof_ref !== "string") return "confirmed mapping is missing its confirmation proof reference";
-  if (mapping.status !== "confirmed" && record.confirmation_proof_ref !== undefined) return "non-confirmed mapping must not retain a confirmation proof reference";
+  if (mapping.status === "confirmed" && (typeof record.confirmation_state_after_digest !== "string" || typeof record.confirmation_proof_ref !== "string")) return "confirmed mapping is missing its authenticated confirmation image";
+  if (mapping.status !== "confirmed" && (record.confirmation_state_after_digest !== undefined || record.confirmation_proof_ref !== undefined)) return "non-confirmed mapping must not retain a confirmation proof reference";
   if (digestOf(mappingHashBody(mapping)) !== mapping.mapping_hash) return "mapping content does not match its canonical hash";
   for (let i = 0; i < selections.length; i += 1) {
     const expected = selections[i] as Record<string, unknown>;

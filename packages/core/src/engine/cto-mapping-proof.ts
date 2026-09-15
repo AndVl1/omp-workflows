@@ -181,6 +181,19 @@ function proofHmac(pinnedRoot: PinnedProjectRoot, payload: UnsignedProof): strin
   try { return createHmac("sha256", key).update(canonicalJson(payload), "utf8").digest("hex"); } catch { return null; }
 }
 
+export function ctoMappingConfirmationStateDigest(value: unknown): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    const serialized = JSON.stringify(value);
+    return sha256Hex(typeof serialized === "string" ? serialized : "");
+  }
+  const copy = { ...(value as Record<string, unknown>) };
+  delete copy.updated_at;
+  delete copy.state_revision;
+  delete copy.control_plane_provenance;
+  delete copy.observability;
+  return sha256Hex(canonicalJson(copy));
+}
+
 export function ctoMappingConfirmationProofRelativePath(ctoRunId: string, mappingId: string, proofRef: string): string | null {
   if (!isSafeCtoRunId(ctoRunId) || !isSafeCtoExecutionId(mappingId) || !isSafeCtoExecutionId(proofRef)) return null;
   const directory = join(PROOF_DIRECTORY, ctoRunId, "artifacts", "mapping-confirmation-proofs", mappingId);

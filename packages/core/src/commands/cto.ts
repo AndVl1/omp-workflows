@@ -22,7 +22,7 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { TextDecoder } from "node:util";
 import { findProfileDir } from "../engine/profile.js";
 import { MAX_CHECKPOINT_RATIONALE_BYTES } from "../engine/durable.js";
-import { ctoMappingConfirmationProofRelativePath, readCtoMappingConfirmationProof, removeCtoMappingConfirmationProof, signCtoMappingConfirmationProof, verifyCtoMappingConfirmationProof, writeCtoMappingConfirmationProof, type CtoMappingConfirmationProof, type CtoMappingConfirmationProofAnswer, type CtoMappingConfirmationProofPayload } from "../engine/cto-mapping-proof.js";
+import { ctoMappingConfirmationProofRelativePath, ctoMappingConfirmationStateDigest, readCtoMappingConfirmationProof, removeCtoMappingConfirmationProof, signCtoMappingConfirmationProof, writeCtoMappingConfirmationProof, type CtoMappingConfirmationProof, type CtoMappingConfirmationProofAnswer, type CtoMappingConfirmationProofPayload } from "../engine/cto-mapping-proof.js";
 import { buildCtoSpecificationMapping, loadTeamDefs } from "../cto/plan.js";
 import { resolveChannelProfile } from "../cto/channels.js";
 import {
@@ -1361,6 +1361,8 @@ export interface CtoSpecificationMappingRecord {
     policy_hash: string;
   };
   confirmed_at?: string;
+  /** Logical consumed anchor state image authenticated by the mapping proof. */
+  confirmation_state_after_digest?: string;
   /** Immutable tx-scoped HMAC proof for a consumed mapping confirmation. */
   confirmation_proof_ref?: string;
 }
@@ -2021,20 +2023,7 @@ function mappingTransactionPath(
   return path;
 }
 function mappingStateDigest(value: unknown): string {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    const serialized = JSON.stringify(value);
-    return sha256Hex(typeof serialized === "string" ? serialized : "");
-  }
-  const copy = { ...(value as Record<string, unknown>) };
-  delete copy.updated_at;
-  delete copy.state_revision;
-  // Derived migration provenance is normalized while a checkpoint answer is
-  // prepared and is not part of the logical state transition image.
-  delete copy.control_plane_provenance;
-  // The observability pointer is a derived projection published alongside
-  // state.json; it is not part of the checkpoint state transition image.
-  delete copy.observability;
-  return sha256Hex(canonicalJson(copy));
+  return ctoMappingConfirmationStateDigest(value);
 }
 
 function mappingStateIdentityMatches(root: string, transaction: Pick<CtoSpecificationMappingTransaction, "feature_id" | "run_key" | "state_path">, state: TeamState): boolean {
@@ -2060,6 +2049,7 @@ function mappingStateTransitionError(
   transaction: Pick<CtoSpecificationMappingTransaction, "operation" | "feature_id" | "run_key" | "state_path" | "state_transition">,
   source: TeamState,
   candidate: TeamState,
+  verifyLiveAuthority = true,
 ): string | null {
   if (!mappingStateIdentityMatches(root, transaction, source) || !mappingStateIdentityMatches(root, transaction, candidate)) {
     return "state transition is not bound to the selected feature workspace";
@@ -2128,12 +2118,14 @@ function mappingStateTransitionError(
       binding: answer.binding,
       ...(answer.feedback !== undefined ? { feedback: answer.feedback } : {}),
     };
-    const proofError = trustedCheckpointAnswerError(candidate, {
-      actor: { kind: "user", ref: answer.reference, proof },
-      ...context,
-      bind_active_context: true,
-    });
-    if (proofError) return `checkpoint answer recording proof is invalid: ${proofError}`;
+    if (verifyLiveAuthority) {
+      const proofError = trustedCheckpointAnswerError(candidate, {
+        actor: { kind: "user", ref: answer.reference, proof },
+        ...context,
+        bind_active_context: true,
+      });
+      if (proofError) return `checkpoint answer recording proof is invalid: ${proofError}`;
+    }
     const expected = { ...source, trusted_checkpoint_answers: candidateAnswers };
     if (mappingStateDigest(expected) !== mappingStateDigest(candidate)) {
       return "checkpoint answer recording changed fields outside the answer ledger";
@@ -2166,12 +2158,14 @@ function mappingStateTransitionError(
     binding: sourceAnswer.binding,
     ...(sourceAnswer.feedback !== undefined ? { feedback: sourceAnswer.feedback } : {}),
   };
-  const proofError = trustedCheckpointAnswerError(source, {
-    actor: { kind: "user", ref: sourceAnswer.reference, proof },
-    ...context,
-    bind_active_context: true,
-  });
-  if (proofError) return `checkpoint answer consumption proof is invalid: ${proofError}`;
+  if (verifyLiveAuthority) {
+    const proofError = trustedCheckpointAnswerError(source, {
+      actor: { kind: "user", ref: sourceAnswer.reference, proof },
+      ...context,
+      bind_active_context: true,
+    });
+    if (proofError) return `checkpoint answer consumption proof is invalid: ${proofError}`;
+  }
   const expectedAnswers = sourceAnswers.map((answer) => answer.answer_id === transition.answer_id
     ? { ...answer, consumed_at: transition.consumed_at }
     : answer);
@@ -2222,7 +2216,7 @@ function mappingTransactionStateValidationError(root: string, transaction: CtoSp
   if (sourceContentError) return sourceContentError;
   if (mappingStateDigest(source) !== transaction.state_source_logical_digest) return "source state logical digest is invalid";
   if (mappingStateDigest(transaction.state) !== transaction.state_after_digest) return "staged state logical digest is invalid";
-  return mappingStateTransitionError(root, transaction, source, transaction.state);
+  return mappingStateTransitionError(root, transaction, source, transaction.state, transaction.operation !== "confirm");
 }
 
 type MappingTransactionJsonBudget = { nodes: number };
@@ -2919,15 +2913,23 @@ function abortMappingTransactionPinned(
     return transaction;
   }
   assertMappingTransactionWalReceiptPinned(aborting, walReceipt, pinnedRoot);
-  if (aborting.operation === "confirm" && aborting.confirmation_proof_path && aborting.confirmation_proof_content) {
-    const proofRecord = JSON.parse(aborting.confirmation_proof_content) as Pick<CtoMappingConfirmationProof, "cto_run_id" | "mapping_id" | "proof_ref">;
-    if (proofRecord.cto_run_id === aborting.cto_run_id && proofRecord.mapping_id === aborting.mapping_id) {
-      removeCtoMappingConfirmationProof(pinnedRoot, proofRecord, aborting.confirmation_proof_content);
-    }
-  }
-
   const identity = currentMappingIdentityPinned(pinnedRoot, root, aborting.mapping_path, aborting.cto_run_id, aborting.mapping_id);
   let disposition: "aborted" | "quarantined" = "aborted";
+  let cleanupProof = false;
+  if (aborting.operation === "confirm" && aborting.confirmation_proof_path && aborting.confirmation_proof_content) {
+    const proofError = mappingConfirmationTransactionProofError(aborting, pinnedRoot);
+    const state = readPinnedFeatureState(root, aborting.feature_id, aborting.run_key, pinnedRoot);
+    const stateCommitted = state.ok ? mappingStateDigest(state.value.state) === aborting.state_after_digest : true;
+    cleanupProof = !proofError && !stateCommitted && (isExactPriorMapping(identity, aborting) || isExactStagedMapping(identity, aborting));
+  }
+  if (cleanupProof && aborting.confirmation_proof_content) {
+    try {
+      const proofRecord = JSON.parse(aborting.confirmation_proof_content) as Pick<CtoMappingConfirmationProof, "cto_run_id" | "mapping_id" | "proof_ref">;
+      if (proofRecord.cto_run_id === aborting.cto_run_id && proofRecord.mapping_id === aborting.mapping_id) {
+        removeCtoMappingConfirmationProof(pinnedRoot, proofRecord, aborting.confirmation_proof_content);
+      }
+    } catch { /* malformed proof remains inert and is never overwritten */ }
+  }
   if (isExactStagedMapping(identity, aborting)) {
     const expected = mappingIdentityExpectation(identity);
     if (!expected) throw new Error("CTO_SPEC_MAPPING_CONFLICT: staged mapping identity is unavailable");
@@ -3054,7 +3056,7 @@ function mappingConfirmationTransactionProofError(
   const proofRef = record.confirmation_proof_ref;
   const transition = transaction.state_transition;
   const consumedAnswer = transaction.state.trusted_checkpoint_answers?.find((candidate) => candidate.answer_id === transition.answer_id);
-  if (typeof proofRef !== "string" || !record.confirmation_context || typeof record.confirmed_at !== "string"
+  if (typeof proofRef !== "string" || !record.confirmation_context || typeof record.confirmed_at !== "string" || typeof record.confirmation_state_after_digest !== "string"
     || !consumedAnswer?.consumed_at || typeof consumedAnswer.subject_binding !== "string" || typeof consumedAnswer.subject_revision !== "number" || typeof consumedAnswer.authority_receipt !== "string") {
     return "confirmation WAL final proof context is incomplete";
   }
@@ -3075,7 +3077,7 @@ function mappingConfirmationTransactionProofError(
     mapping_record_path: mappingRecordPath,
     mapping_record_digest: transaction.mapping_after_digest,
     state_path: statePath,
-    state_after_digest: transaction.state_after_digest,
+    state_after_digest: record.confirmation_state_after_digest,
     checkpoint_ref: transition.checkpoint_id,
     trusted_answer_ref: transition.answer_id,
     confirmation_context: { ...record.confirmation_context },
@@ -3103,14 +3105,9 @@ function commitMappingTransactionPinned(root: string, transaction: MappingTransa
   if (transaction.status === "aborted" || transaction.status === "quarantined") return;
   const confirmationProofError = mappingConfirmationTransactionProofError(transaction, pinnedRoot);
   if (confirmationProofError) {
-    if (transaction.operation === "confirm" && transaction.status === "pending") {
-      const current = currentMappingIdentityPinned(pinnedRoot, root, transaction.mapping_path, transaction.cto_run_id, transaction.mapping_id);
-      const state = readPinnedFeatureState(root, transaction.feature_id, transaction.run_key, pinnedRoot);
-      const stateCommitted = state.ok ? mappingStateDigest(state.value.state) === transaction.state_after_digest : false;
-      if (!stateCommitted && (isExactPriorMapping(current, transaction) || isExactStagedMapping(current, transaction))) {
-        abortMappingTransactionPinned(root, transaction, confirmationProofError, pinnedRoot);
-      }
-    }
+    // WAL bytes are not authority. A proof failure must never drive a
+    // compensating mapping mutation (a forged WAL could otherwise roll back a
+    // live canonical image); leave the descriptor for explicit recovery.
     throw new Error(`CTO_SPEC_MAPPING_RECOVERY_REQUIRED: ${confirmationProofError}`);
   }
   const precommitConstitutionError = refreshCtoMappingTransactionConstitutions(root, transaction, pinnedRoot);
@@ -3423,7 +3420,7 @@ function readMappingRecord(root: string, ctoRunId: string, mappingId: string, pi
         return { ok: false, error: "mapping review outcome is incomplete or mismatched" };
       }
     }
-    return { ok: true, value: { schema_version: 1, cto_run_id: ctoRunId, mapping, selections: record.selections.map((selection) => ({ ...selection })), checkpoint_ref: record.checkpoint_ref ?? null, trusted_answer_ref: record.trusted_answer_ref ?? null, ...(record.review ? { review: { ...record.review } } : {}), ...(record.confirmation_context ? { confirmation_context: { ...record.confirmation_context } } : {}), ...(record.confirmed_at ? { confirmed_at: record.confirmed_at } : {}), ...(record.confirmation_proof_ref ? { confirmation_proof_ref: record.confirmation_proof_ref } : {}), record_digest: recordDigest, record_path: file } };
+    return { ok: true, value: { schema_version: 1, cto_run_id: ctoRunId, mapping, selections: record.selections.map((selection) => ({ ...selection })), checkpoint_ref: record.checkpoint_ref ?? null, trusted_answer_ref: record.trusted_answer_ref ?? null, ...(record.review ? { review: { ...record.review } } : {}), ...(record.confirmation_context ? { confirmation_context: { ...record.confirmation_context } } : {}), ...(record.confirmed_at ? { confirmed_at: record.confirmed_at } : {}), ...(record.confirmation_state_after_digest ? { confirmation_state_after_digest: record.confirmation_state_after_digest } : {}), ...(record.confirmation_proof_ref ? { confirmation_proof_ref: record.confirmation_proof_ref } : {}), record_digest: recordDigest, record_path: file } };
   } catch (error) { return { ok: false, error: `mapping record is unreadable: ${error instanceof Error ? error.message : String(error)}` }; }
 }
 function mappingRecordContentError(record: CtoSpecificationMappingRecord, ctoRunId: string, mappingId: string): { content: string; error: string | null } {
@@ -3500,6 +3497,7 @@ function canonicalMappingRecord(record: CtoSpecificationMappingRecord): CtoSpeci
     ...(record.review ? { review: { ...record.review } } : {}),
     ...(record.confirmation_context ? { confirmation_context: { ...record.confirmation_context } } : {}),
     ...(record.confirmed_at ? { confirmed_at: record.confirmed_at } : {}),
+    ...(record.confirmation_state_after_digest ? { confirmation_state_after_digest: record.confirmation_state_after_digest } : {}),
     ...(record.confirmation_proof_ref ? { confirmation_proof_ref: record.confirmation_proof_ref } : {}),
   };
 }
@@ -3626,7 +3624,7 @@ function ctoMappingConfirmationProofPayload(
   answer: CtoMappingConfirmationProofAnswer,
 ): CtoMappingConfirmationProofPayload | null {
   const context = record.confirmation_context;
-  if (!context || typeof record.checkpoint_ref !== "string" || typeof record.trusted_answer_ref !== "string" || typeof record.confirmed_at !== "string" || typeof record.confirmation_proof_ref !== "string") return null;
+  if (!context || typeof record.checkpoint_ref !== "string" || typeof record.trusted_answer_ref !== "string" || typeof record.confirmed_at !== "string" || typeof record.confirmation_state_after_digest !== "string" || typeof record.confirmation_proof_ref !== "string") return null;
   const mappingRecordPath = pinnedRoot.relativePath(record.record_path);
   const statePath = pinnedRoot.relativePath(anchor.statePath);
   if (!mappingRecordPath || !statePath) return null;
@@ -3641,7 +3639,7 @@ function ctoMappingConfirmationProofPayload(
     mapping_record_path: mappingRecordPath,
     mapping_record_digest: record.record_digest,
     state_path: statePath,
-    state_after_digest: mappingStateDigest(anchor.state),
+    state_after_digest: record.confirmation_state_after_digest ?? "",
     checkpoint_ref: record.checkpoint_ref,
     trusted_answer_ref: record.trusted_answer_ref,
     confirmation_context: { ...context },
@@ -4575,7 +4573,7 @@ export function recordCtoSpecificationMappingAsk(
       if (!resolved.ok) return blockedCtoMappingAsk(resolved.error);
       const { record, execution, selected } = resolved.value;
       const canonicalRecord = canonicalMappingRecord(record);
-      const checkpointRef = ctoMappingCheckpoint(input, execution, input.decision);
+      const checkpointRef = ctoMappingCheckpoint({ ...input, mapping_version: record.mapping.mapping_version }, execution, input.decision);
       const existingRef = record.trusted_answer_ref ?? record.review?.trusted_answer_ref ?? null;
       const existingCheckpointRef = record.checkpoint_ref ?? record.review?.checkpoint_ref ?? null;
       if (existingCheckpointRef !== null || existingRef !== null) {
@@ -5009,7 +5007,7 @@ function confirmCtoSpecificationMappingUnlocked(projectRoot: string, input: CtoS
   if (matchingAnswers.length !== 1) return blockedExecution([matchingAnswers.length === 0 ? "trusted answer is missing from the canonical ledger" : "trusted answer id is duplicated in the canonical ledger"]);
   const answer = matchingAnswers[0]!;
   const stageId = answer.stage_id;
-  const canonicalCheckpoint = `cto-specification-mapping-${digestOf({ cto_run_id: input.cto_run_id, mapping_id: input.mapping_id, mapping_hash: input.mapping_hash, feature_id: featureId, run_key: runKey, stage_id: stageId, decision, capability_id: execution.value.capability_id, capability_epoch: execution.value.capability_epoch })}`;
+  const canonicalCheckpoint = `cto-specification-mapping-${digestOf({ cto_run_id: input.cto_run_id, mapping_id: input.mapping_id, mapping_hash: input.mapping_hash, mapping_version: record.mapping.mapping_version, feature_id: featureId, run_key: runKey, stage_id: stageId, decision, capability_id: execution.value.capability_id, capability_epoch: execution.value.capability_epoch })}`;
   if (answer.run_id !== runKey
     || answer.checkpoint_id !== canonicalCheckpoint
     || answer.decision !== decision
@@ -5086,6 +5084,7 @@ function confirmCtoSpecificationMappingUnlocked(projectRoot: string, input: CtoS
     trusted_answer_ref: trustedAnswerRef,
     confirmation_context: { feature_id: featureId, run_key: runKey, stage_id: stageId, decision: decision, capability_id: answer.capability_id, capability_epoch: answer.capability_epoch, policy_hash: answer.policy_hash },
     confirmed_at: confirmedAt,
+    confirmation_state_after_digest: mappingStateDigest(consumed),
     confirmation_proof_ref: confirmationProofRef,
   };
   const serialized = mappingRecordContentError(updated, input.cto_run_id, input.mapping_id);
@@ -5393,6 +5392,7 @@ export function deriveCtoSpecificationConformanceInput(
   const root = pinnedRoot.canonical_root;
   try {
     if (!isSafeCtoRunId(selectors?.cto_run_id) || !isSafeCtoExecutionId(selectors?.mapping_id) || !isSha256Hex(selectors?.mapping_hash)) return { ok: false, error: "conformance selectors require safe cto_run_id/mapping_id and exact mapping_hash" };
+    recoverPendingMappingTransactions(root, selectors.cto_run_id, pinnedRoot);
     const record = readMappingRecord(root, selectors.cto_run_id, selectors.mapping_id, pinnedRoot);
     if (!record.ok) return { ok: false, error: record.error };
     if (record.value.mapping.mapping_hash !== selectors.mapping_hash || record.value.mapping.status !== "confirmed") return { ok: false, error: "conformance selectors do not identify the exact confirmed mapping" };
@@ -5402,6 +5402,12 @@ export function deriveCtoSpecificationConformanceInput(
     const conformanceWave = execution.value.state.wave_history?.find((candidate) => candidate.id === execution.value.wave_id);
     if (!frozenExecution || !ctoMappingTeamBindingsMatchExecution(record.value.mapping, execution.value, record.value.selections) || !ctoMappingExecutionMatchesWave(frozenExecution, conformanceWave, selectors.cto_run_id, record.value.mapping.parallelization.map((decision) => decision.slice_id), execution.value.state.teams.map((team) => team.work_identity))) return { ok: false, error: "durable mapping is not bound to the CTO conformance execution wave" };
     if (selectors.wave_id !== undefined && selectors.wave_id !== execution.value.wave_id) return { ok: false, error: "conformance wave_id does not match the durable wave" };
+    const confirmationContext = record.value.confirmation_context;
+    if (!confirmationContext) return { ok: false, error: "confirmed mapping lacks its exact confirmation context" };
+    const anchor = readPinnedFeatureState(root, confirmationContext.feature_id, confirmationContext.run_key, pinnedRoot);
+    if (!anchor.ok) return anchor;
+    const admissionError = dispatchAdmissionError(record.value, execution.value, anchor.value, selectors.cto_run_id, { canonical_root: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino }, pinnedRoot);
+    if (admissionError) return { ok: false, error: admissionError };
     if (!record.value.checkpoint_ref || !record.value.trusted_answer_ref) return { ok: false, error: "confirmed mapping lacks its trusted checkpoint references" };
     const handoffs: CtoSpecificationConformanceHandoff[] = [];
     const claims: CtoActiveClaimSummary[] = [];

@@ -42,6 +42,7 @@ import type { CheckpointAnswerProof, TeamState } from "../engine/types.js";
 import { trustedCheckpointAnswerError } from "../engine/checkpoints.js";
 import { MAX_PERSISTED_STATE_BYTES, normalizePersistedState, parseBoundedPersistedState, rollbackStateMutationReceipts, updateStateAtomically, type StateMutationReceipt, type StateSnapshot } from "../engine/state.js";
 import { readArtifactPinned } from "../engine/artifacts.js";
+import { ctoMappingConfirmationStateDigest, readCtoMappingConfirmationProof, type CtoMappingConfirmationProofAnswer, type CtoMappingConfirmationProofPayload } from "../engine/cto-mapping-proof.js";
 
 export type ExecutionClaimResultCode =
   | "SPEC_HANDOFF_NOT_READY"
@@ -1612,14 +1613,86 @@ function verifyClaimAdmissionBinding(
   if (admission.confirmation_ledger_digest !== anchorStateResult.ledger_digest) {
     return "confirmation anchor trusted-answer ledger changed before claim admission";
   }
-  if (anchorState.dispatch_capability?.capability_id !== admission.capability_id
-    || anchorState.dispatch_capability?.issued_for?.cursor_epoch !== admission.capability_epoch) {
+  if (verificationMode !== "terminal" && (anchorState.dispatch_capability?.capability_id !== admission.capability_id
+    || anchorState.dispatch_capability?.issued_for?.cursor_epoch !== admission.capability_epoch)) {
     return "confirmation anchor capability changed before claim admission";
   }
   const policy = anchorState.checkpoint_policy;
   if (!policy) return "confirmation anchor checkpoint policy is missing before claim admission";
   const answer = anchorState.trusted_checkpoint_answers?.find((candidate) => candidate.answer_id === admission.trusted_answer_ref);
   if (!answer) return "confirmation anchor trusted answer is missing before claim admission";
+  const confirmationContext = parsed.confirmation_context;
+  const confirmationProofRef = parsed.confirmation_proof_ref;
+  const confirmationStateAfterDigest = parsed.confirmation_state_after_digest;
+  const confirmedAt = parsed.confirmed_at;
+  if (!isRecord(confirmationContext)
+    || typeof confirmationContext.feature_id !== "string"
+    || typeof confirmationContext.run_key !== "string"
+    || typeof confirmationContext.stage_id !== "string"
+    || typeof confirmationContext.capability_id !== "string"
+    || typeof confirmationContext.capability_epoch !== "string"
+    || typeof confirmationContext.policy_hash !== "string"
+    || typeof confirmationProofRef !== "string"
+    || !isSha256Hex(confirmationStateAfterDigest)
+    || typeof confirmedAt !== "string"
+    || typeof answer.consumed_at !== "string"
+    || typeof answer.subject_binding !== "string"
+    || !Number.isSafeInteger(answer.subject_revision)
+    || typeof answer.authority_receipt !== "string") {
+    return "canonical mapping confirmation proof fields are missing before claim admission";
+  }
+  if (confirmationContext.feature_id !== context.feature_id
+    || confirmationContext.run_key !== context.run_key
+    || confirmationContext.stage_id !== context.stage_id
+    || confirmationContext.decision !== "approve_continue"
+    || confirmationContext.capability_id !== admission.capability_id
+    || confirmationContext.capability_epoch !== admission.capability_epoch
+    || confirmationContext.policy_hash !== admission.policy_hash
+    || confirmationProofRef.length === 0
+    || answer.answer_id !== admission.trusted_answer_ref
+    || answer.checkpoint_id !== admission.checkpoint_ref
+    || answer.feature_id !== context.feature_id
+    || answer.run_id !== context.run_key
+    || answer.stage_id !== context.stage_id
+    || answer.decision !== "approve_continue"
+    || answer.subject_binding !== admission.mapping_hash
+    || answer.subject_revision !== admission.mapping_version) {
+    return "canonical mapping confirmation proof fields changed before claim admission";
+  }
+  const proofAnswer = { ...answer, subject_binding: answer.subject_binding, subject_revision: answer.subject_revision, authority_receipt: answer.authority_receipt, consumed_at: answer.consumed_at } as CtoMappingConfirmationProofAnswer;
+  const expectedMappingProof: CtoMappingConfirmationProofPayload = {
+    schema_version: 1,
+    root_identity: { canonical_path: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino },
+    cto_run_id: ownerRunId,
+    mapping_id: admission.mapping_id,
+    mapping_hash: admission.mapping_hash,
+    mapping_version: admission.mapping_version,
+    proof_ref: confirmationProofRef,
+    mapping_record_path: admission.mapping_record_path,
+    mapping_record_digest: admission.mapping_record_digest,
+    state_path: `.work-state/features/${context.feature_id}/state.json`,
+    state_after_digest: confirmationStateAfterDigest,
+    checkpoint_ref: admission.checkpoint_ref,
+    trusted_answer_ref: admission.trusted_answer_ref,
+    confirmation_context: {
+      feature_id: confirmationContext.feature_id,
+      run_key: confirmationContext.run_key,
+      stage_id: confirmationContext.stage_id,
+      decision: "approve_continue",
+      capability_id: confirmationContext.capability_id,
+      capability_epoch: confirmationContext.capability_epoch,
+      policy_hash: confirmationContext.policy_hash,
+    },
+    confirmed_at: confirmedAt,
+    trusted_answer: proofAnswer,
+  };
+  const durableProof = readCtoMappingConfirmationProof(pinnedRoot, ownerRunId, admission.mapping_id, confirmationProofRef, expectedMappingProof);
+  if (!durableProof.ok) return durableProof.code === "absent"
+    ? "canonical mapping confirmation proof is absent; recovery is required"
+    : `canonical mapping confirmation proof is invalid: ${durableProof.error}`;
+  if (verificationMode !== "terminal" && ctoMappingConfirmationStateDigest(anchorState) !== confirmationStateAfterDigest) {
+    return "confirmation anchor logical state changed before active claim admission";
+  }
   const proof: CheckpointAnswerProof = {
     answer_id: answer.answer_id,
     nonce: answer.nonce,
@@ -1638,7 +1711,7 @@ function verifyClaimAdmissionBinding(
     capability_id: admission.capability_id,
     capability_epoch: admission.capability_epoch,
     policy_hash: admission.policy_hash,
-    bind_active_context: true,
+    bind_active_context: verificationMode !== "terminal",
   });
   if (proofError) return `confirmation anchor proof changed before claim admission: ${proofError}`;
   const authorizationDigest = executionClaimAuthorizationProjectionDigest({
@@ -1663,7 +1736,7 @@ function verifyClaimAdmissionBinding(
     mapping_hash: String(mapping.mapping_hash),
     mapping_version: Number(mapping.mapping_version),
   });
-  if (authorizationDigest !== admission.confirmation_authorization_digest) {
+  if (verificationMode !== "terminal" && authorizationDigest !== admission.confirmation_authorization_digest) {
     return "confirmation anchor authorization projection changed before claim admission";
   }
   return null;
