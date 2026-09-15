@@ -178,8 +178,8 @@ readonly sha256: string;}const descriptorReceipts = new WeakMap<PinnedRootWriteD
 // synchronous FIFOs on slower Darwin hosts. Keep the allowance finite and
 // derive it from the validated frame size below; ordinary helper calls retain
 // the short default deadline.
-const DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS = 90_000;const DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS = 5_000;const DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES = 1 * 1024 * 1024;const DARWIN_HELPER_TRANSFER_BYTES_PER_MS = 1 * 1024;const DARWIN_HELPER_TRANSFER_OPERATIONS = new Set([
-"write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "lock_acquire", "batch", "batch_atomic", "replace_if_matches",]);const DARWIN_HELPER_MAX_INPUT = 96 * 1024 * 1024;const DARWIN_HELPER_START_TIMEOUT_MS = 1_000;const DARWIN_HELPER_CLOSE_TIMEOUT_MS = 1_000;const DARWIN_HELPER_POLL_MS = 2;const MAX_PINNED_ROOT_WRITE_BYTES = 64 * 1024 * 1024;interface DarwinHelperSession {
+const DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS = 90_000;const DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS = 5_000;const DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES = 1 * 1024 * 1024;const DARWIN_HELPER_TRANSFER_BYTES_PER_MS = 1 * 1024;const DARWIN_HELPER_READ_RESPONSE_ENVELOPE_BYTES = 4 * 1024;const DARWIN_HELPER_TRANSFER_OPERATIONS = new Set([
+"write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "lock_acquire", "batch", "batch_atomic", "replace_if_matches", "read",]);const DARWIN_HELPER_MAX_INPUT = 96 * 1024 * 1024;const DARWIN_HELPER_START_TIMEOUT_MS = 1_000;const DARWIN_HELPER_CLOSE_TIMEOUT_MS = 1_000;const DARWIN_HELPER_POLL_MS = 2;const MAX_PINNED_ROOT_WRITE_BYTES = 64 * 1024 * 1024;interface DarwinHelperSession {
 readonly directory: string;
 readonly requestPath: string;
 readonly responsePath: string;
@@ -4108,9 +4108,18 @@ def main():
 
 
 main()
-`;const MAX_RELATIVE_PATH_LENGTH = 4096;const MAX_RELATIVE_PATH_SEGMENTS = 128;const MAX_BATCH_ROLLBACK_BYTES = 8 * 1024 * 1024;const DEFAULT_DIRECTORY_MAX_ENTRIES = 16384;const DEFAULT_DIRECTORY_MAX_NAME_BYTES = 4 * 1024 * 1024;type ConditionalOperation = "replace" | "remove";function darwinHelperTransferTimeout(operation: string, baseTimeoutMs: number, requestBytes: number): number {
-if (!DARWIN_HELPER_TRANSFER_OPERATIONS.has(operation) || requestBytes <= DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) return baseTimeoutMs;
-const transferMs = Math.ceil((requestBytes - DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) / DARWIN_HELPER_TRANSFER_BYTES_PER_MS) + 500;
+`;const MAX_RELATIVE_PATH_LENGTH = 4096;const MAX_RELATIVE_PATH_SEGMENTS = 128;const MAX_BATCH_ROLLBACK_BYTES = 8 * 1024 * 1024;const DEFAULT_DIRECTORY_MAX_ENTRIES = 16384;const DEFAULT_DIRECTORY_MAX_NAME_BYTES = 4 * 1024 * 1024;type ConditionalOperation = "replace" | "remove";function darwinHelperReadResponseHint(operation: string, payload: Record<string, unknown>): number {
+if (operation !== "read") return 0;
+const maxRead = payload.max_read;
+if (typeof maxRead !== "number" || !Number.isSafeInteger(maxRead) || maxRead <= 0) return 0;
+const maxProduct = Math.floor((Number.MAX_SAFE_INTEGER - DARWIN_HELPER_READ_RESPONSE_ENVELOPE_BYTES) / 6);
+if (maxRead > maxProduct) return Number.MAX_SAFE_INTEGER;
+return maxRead * 6 + DARWIN_HELPER_READ_RESPONSE_ENVELOPE_BYTES;
+}function darwinHelperTransferTimeout(operation: string, baseTimeoutMs: number, requestBytes: number, responseBytes = 0): number {
+if (!DARWIN_HELPER_TRANSFER_OPERATIONS.has(operation)) return baseTimeoutMs;
+const effectiveBytes = Math.max(requestBytes, responseBytes);
+if (effectiveBytes <= DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) return baseTimeoutMs;
+const transferMs = Math.ceil((effectiveBytes - DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) / DARWIN_HELPER_TRANSFER_BYTES_PER_MS) + 500;
 return baseTimeoutMs + Math.min(DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS, transferMs);}function errnoCode(error: unknown): string | undefined {
 return error && typeof error === "object" && "code" in error
 ? String((error as NodeJS.ErrnoException).code)
@@ -5752,7 +5761,7 @@ const liveHelperSessionIds = liveDarwinHelperSessionIds(this.rootPathDigest);
 if (liveHelperSessionIds.length > 0) requestPayload._live_helper_session_ids = liveHelperSessionIds;
 const unsignedRequest = Buffer.from(JSON.stringify(requestPayload) + "\n", "utf8");
 if (unsignedRequest.byteLength > DARWIN_HELPER_MAX_INPUT) throw new PinnedRootError("limit", `descriptor helper '' request exceeds the bounded input limit`);
-const transferTimeoutMs = darwinHelperTransferTimeout(operation, timeoutMs, unsignedRequest.byteLength);
+const transferTimeoutMs = darwinHelperTransferTimeout(operation, timeoutMs, unsignedRequest.byteLength, darwinHelperReadResponseHint(operation, payload));
 const transferMarginMs = transferTimeoutMs > timeoutMs ? DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS : 0;
 const operationDeadline = Date.now() + transferTimeoutMs + transferMarginMs + DARWIN_HELPER_START_TIMEOUT_MS;
 if (!this.darwinHelperSession) {
