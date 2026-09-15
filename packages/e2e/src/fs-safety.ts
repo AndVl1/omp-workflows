@@ -392,9 +392,12 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
             identity: { dev: parentInfo.dev, ino: parentInfo.ino },
           };
           const ensured = runDarwinHelper(parentRoot, 'ensure_directory', { path: component });
-          const childDev = ensured?.child_dev;
-          const childIno = ensured?.child_ino;
-          if (typeof childDev !== 'number' || typeof childIno !== 'number' || typeof ensured?.created !== 'boolean') return null;
+          const ensuredDirectory = ensured?.directory;
+          if (typeof ensuredDirectory !== 'object' || ensuredDirectory === null) return null;
+          const ensuredDetails = ensuredDirectory as Record<string, unknown>;
+          const childDev = ensuredDetails.child_dev;
+          const childIno = ensuredDetails.child_ino;
+          if (typeof childDev !== 'number' || typeof childIno !== 'number' || typeof ensuredDetails.created !== 'boolean') return null;
           testHooks?.beforeDirectoryOpen?.(componentLexical);
           const childPath = join(currentPhysicalPath, component);
           const childFd = openSync(childPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
@@ -412,7 +415,7 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
             closeSync(childFd);
             return null;
           }
-          if (ensured.created === true) {
+          if (ensuredDetails.created === true) {
             const retainedParentFd = duplicateDirectoryDescriptor(currentFd);
             if (retainedParentFd === null) {
               closeSync(childFd);
