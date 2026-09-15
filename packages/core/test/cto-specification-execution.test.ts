@@ -7215,13 +7215,13 @@ test("CTO host terminal receipts clear pending lifecycle before successful and f
       const team = dispatchedState.teams.find((candidate) => candidate.feature_id === featureId);
       assert.ok(team?.slice_id && team.work_identity, "dispatched team must carry an execution identity");
       if (!team?.slice_id || !team.work_identity) continue;
-      const context = { cwd: root, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => sessionId, getCwd: () => root } } as never;
+      const context = TEST_CONTEXT(root);
       const hooks = mountedTaskHooks(root, sessionId);
       const toolCallId = `host-call-${testCase.suffix}`;
       const marker = buildCtoSliceMarker(runId, team.slice_id);
-      const call = hooks.toolCall({ toolName: "task", toolCallId, input: { task: marker } }, context);
+      const call = await hooks.toolCall({ toolName: "task", toolCallId, input: { task: marker } }, context);
       assert.equal((call as Json | undefined)?.block, undefined, `exact CTO marker must be admitted by the mounted host: ${JSON.stringify(call)}`);
-      hooks.toolResult({ toolName: "task", toolCallId, isError: testCase.isError, content: [{ type: "text", text: testCase.isError ? "worker failed" : "worker completed" }] }, context);
+      await hooks.toolResult({ toolName: "task", toolCallId, isError: testCase.isError, content: [{ type: "text", text: testCase.isError ? "worker failed" : "worker completed" }] }, context);
       const terminal = readCtoState(runId, root);
       assert.ok(terminal, "host result reconciliation must leave a readable CTO state");
       if (!terminal) continue;
