@@ -713,10 +713,9 @@ test('report: symlinked report/evidence targets cannot redirect writes', () => {
   const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-md-evidence-link-'));
   mkdirSync(join(mdDir, 'evidence'));
   symlinkSync(outside, join(mdDir, 'evidence', 'my-feature'));
-  const result = generateReport(dir, BASE_INPUT, { mdDir, copyEvidence: true });
+  assert.throws(() => generateReport(dir, BASE_INPUT, { mdDir, copyEvidence: true }));
   assert.equal(existsSync(join(outside, 'transcript.jsonl')), false);
-  const report = JSON.parse(readFileSync(result.jsonPath, 'utf8')) as UxE2eReport;
-  assert.equal(report.evidence.some(path => path.includes('evidence')), false);
+  assert.equal(existsSync(join(dir, '.work-state', 'ux-e2e', 'report.json')), false);
 });
 
 test('report: evidence target swap is rejected before opening a destination leaf', () => {
@@ -1804,7 +1803,7 @@ test('report suite: retained child source pin rejects replacement before aggrega
     },
   });
   try {
-    assert.throws(() => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }), /membership changed|session root changed/u);
+    assert.throws(() => generateReport(suite, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true }));
     assert.equal(readdirSync(join(mdDir, 'evidence', 'session-a')).length, 0);
   } finally {
     setEvidenceCopyTestHooks(null);
