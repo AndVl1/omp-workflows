@@ -1,4 +1,4 @@
-import { after as nodeTestAfter } from "node:test";
+import { after as nodeTestAfter, afterEach as nodeTestAfterEach } from "node:test";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -85,6 +85,7 @@ export function closeRetainedTestRegistrations(root?: string): void {
   }
 }
 
+nodeTestAfterEach(() => closeRetainedTestRegistrations());
 nodeTestAfter(() => closeRetainedTestRegistrations());
 
 /** Open a marker-authenticated RuntimeAccess for tests that create CTO runs. */
