@@ -2941,6 +2941,10 @@ function abortMappingTransactionPinned(
     return transaction;
   }
   assertMappingTransactionWalReceiptPinned(aborting, walReceipt, pinnedRoot);
+  const abortConfirmationTransactionError = confirmationTransactionWalError(root, aborting, pinnedRoot);
+  if (abortConfirmationTransactionError) {
+    throw new Error(`CTO_SPEC_MAPPING_RECOVERY_REQUIRED: ${abortConfirmationTransactionError}`);
+  }
   const identity = currentMappingIdentityPinned(pinnedRoot, root, aborting.mapping_path, aborting.cto_run_id, aborting.mapping_id);
   let disposition: "aborted" | "quarantined" = "aborted";
   let cleanupProof = false;
