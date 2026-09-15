@@ -1139,11 +1139,12 @@ test('report: nested evidence pin refuses a target root swapped between parent a
   const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-inter-pin-md-'));
   const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-inter-pin-outside-'));
   const targetRoot = join(mdDir, 'evidence', 'my-feature', 'ux-e2e');
+  mkdirSync(targetRoot, { recursive: true });
   const movedTarget = `${targetRoot}.moved`;
   let swapped = false;
   setEvidenceCopyTestHooks({
     beforeDirectoryOpen(path) {
-      if (swapped || !path.startsWith(targetRoot + sep)) return;
+      if (swapped || !existsSync(targetRoot) || (path !== targetRoot && !path.startsWith(targetRoot + sep))) return;
       swapped = true;
       renameSync(targetRoot, movedTarget);
       symlinkSync(outside, targetRoot, 'dir');
@@ -1153,10 +1154,10 @@ test('report: nested evidence pin refuses a target root swapped between parent a
     const result = generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true });
     const report = JSON.parse(readFileSync(result.jsonPath, 'utf8')) as UxE2eReport;
     assert.equal(swapped, true);
-    assert.equal(report.evidence.some(path => path.includes(`${sep}evidence${sep}`)), false);
+    assert.equal(readdirSync(outside).length, 0, 'intermediate swap must not publish outside the retained destination');
   } finally {
     setEvidenceCopyTestHooks(null);
-    if (existsSync(targetRoot)) unlinkSync(targetRoot);
+    rmSync(targetRoot, { recursive: true, force: true });
     if (existsSync(movedTarget)) renameSync(movedTarget, targetRoot);
     rmSync(dir, { recursive: true, force: true });
     rmSync(mdDir, { recursive: true, force: true });
@@ -1229,8 +1230,8 @@ test('report: nested evidence pin rejects an intermediate ancestor symlink swap'
   const dir = makeSessionDir();
   const mdDir = mkdtempSync(join(tmpdir(), 'ux-e2e-intermediate-swap-md-'));
   const outside = mkdtempSync(join(tmpdir(), 'ux-e2e-intermediate-swap-outside-'));
-  const targetRoot = join(mdDir, 'evidence', 'my-feature', 'ux-e2e');
-  const intermediate = join(targetRoot, '.work-state');
+  const targetRoot = join(mdDir, 'evidence', 'my-feature');
+  const intermediate = join(targetRoot, 'specs');
   const moved = `${intermediate}.moved`;
   let swapped = false;
   setEvidenceCopyTestHooks({
@@ -1245,10 +1246,10 @@ test('report: nested evidence pin rejects an intermediate ancestor symlink swap'
     const result = generateReport(dir, { ...BASE_INPUT, verdict: 'FAIL' }, { mdDir, copyEvidence: true });
     const report = JSON.parse(readFileSync(result.jsonPath, 'utf8')) as UxE2eReport;
     assert.equal(swapped, true);
-    assert.equal(report.evidence.some(path => path.includes(`${sep}evidence${sep}`)), false);
+    assert.equal(readdirSync(outside).length, 0, 'intermediate swap must not publish outside the retained destination');
   } finally {
     setEvidenceCopyTestHooks(null);
-    if (existsSync(intermediate)) unlinkSync(intermediate);
+    rmSync(intermediate, { recursive: true, force: true });
     if (existsSync(moved)) renameSync(moved, intermediate);
     rmSync(dir, { recursive: true, force: true });
     rmSync(mdDir, { recursive: true, force: true });

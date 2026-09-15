@@ -275,33 +275,41 @@ export function pinChildDirectory(root: PinnedDirectory, components: readonly st
   let fd: number | null = null;
   let pinned = false;
   try {
-    if (process.platform === 'darwin' && runDarwinHelper(root, 'ensure_directory', { path: relativePath }) === null) return null;
-    let parentFd = root.fd;
-    let parentPath = descriptorRoot;
-    for (let index = 0; index < components.length; index += 1) {
-      const component = components[index];
-      if (component === undefined) return null;
-      const componentLexical = join(root.lexicalPath, ...components.slice(0, index + 1));
-      testHooks?.beforeDirectoryComponent?.(componentLexical);
-      const childPath = join(parentPath, component);
-      let childFd: number;
-      try {
-        childFd = openSync(childPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-      } catch (error) {
-        if (errnoCode(error) !== 'ENOENT' || process.platform === 'darwin') return null;
-        mkdirSync(childPath, { mode: 0o700 });
-        childFd = openSync(childPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (process.platform === 'darwin') {
+      if (runDarwinHelper(root, 'ensure_directory', { path: relativePath }) === null) return null;
+      for (let index = 0; index < components.length; index += 1) {
+        testHooks?.beforeDirectoryComponent?.(join(root.lexicalPath, ...components.slice(0, index + 1)));
       }
-      const childStat = fstatSync(childFd);
-      if (!childStat.isDirectory()) {
-        closeSync(childFd);
-        return null;
+      if (!pathHasNoSymlinkAncestors(canonicalPath)) return null;
+      fd = openSync(canonicalPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    } else {
+      let parentFd = root.fd;
+      let parentPath = descriptorRoot;
+      for (let index = 0; index < components.length; index += 1) {
+        const component = components[index];
+        if (component === undefined) return null;
+        const componentLexical = join(root.lexicalPath, ...components.slice(0, index + 1));
+        testHooks?.beforeDirectoryComponent?.(componentLexical);
+        const childPath = join(parentPath, component);
+        let childFd: number;
+        try {
+          childFd = openSync(childPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        } catch (error) {
+          if (errnoCode(error) !== 'ENOENT') return null;
+          mkdirSync(childPath, { mode: 0o700 });
+          childFd = openSync(childPath, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        }
+        const childStat = fstatSync(childFd);
+        if (!childStat.isDirectory()) {
+          closeSync(childFd);
+          return null;
+        }
+        if (fd !== null) closeSync(fd);
+        fd = childFd;
+        parentFd = childFd;
+        parentPath = descriptorPathFor(parentFd) ?? '';
+        if (parentPath.length === 0) return null;
       }
-      if (fd !== null) closeSync(fd);
-      fd = childFd;
-      parentFd = childFd;
-      parentPath = descriptorPathFor(parentFd) ?? '';
-      if (parentPath.length === 0) return null;
     }
     if (fd === null || !pathHasNoSymlinkAncestors(canonicalPath)) return null;
     const descriptorStat = fstatSync(fd);
@@ -538,6 +546,9 @@ export function unlinkPinnedFileIfExact(root: PinnedDirectory, name: string, exp
   }
   if (!exact) return false;
   testHooks?.beforeTargetRename?.(join(root.lexicalPath, name));
+  if (process.platform === 'darwin') {
+    return runDarwinHelper(root, 'unlink_quarantine', { quarantine, size: expected.length, sha256: digest })?.removed === true;
+  }
   return unlinkPinnedFile(root, quarantine);
 }
 export function processStartIdentity(pid: number): string | null {
@@ -1254,8 +1265,8 @@ try:
         lock_release(payload.get("name"), payload.get("dev"), payload.get("ino"), payload.get("digest")); result = {"ok": True}
     elif op == "publish": publish(payload.get("final"), payload.get("temporary")); result = {"ok": True}
     elif op == "publish_noreplace": publish_noreplace(payload.get("final"), payload.get("temporary")); result = {"ok": True}
-    elif op == "quarantine_if_exact": result = quarantine_if_exact(payload.get("name"), payload.get("quarantine"), payload.get("size"), payload.get("sha256"))
-    elif op == "unlink_quarantine": result = unlink_quarantine(payload.get("quarantine"), payload.get("size"), payload.get("sha256"))
+    elif op == "quarantine_if_exact": result = {"ok": True, **quarantine_if_exact(payload.get("name"), payload.get("quarantine"), payload.get("size"), payload.get("sha256"))}
+    elif op == "unlink_quarantine": result = {"ok": True, **unlink_quarantine(payload.get("quarantine"), payload.get("size"), payload.get("sha256"))}
     elif op == "cleanup": cleanup(payload.get("temporary")); result = {"ok": True}
     else: fail("unsupported operation")
     sys.stdout.write(json.dumps(result, separators=(",", ":")))

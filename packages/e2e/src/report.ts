@@ -1591,13 +1591,15 @@ function generateSingleReport(
     };
     const mdFilename = `${slug}-ux-e2e-${todayStamp()}.md`;
     const mdPath = join(mdDir, mdFilename);
-    if (reportDestination === null) throw new Error('ux-e2e: report destination root is unavailable');
+    try {
+      if (reportDestination === null) throw new Error('ux-e2e: report destination root is unavailable');
       if (expectedDiscovery !== undefined) assertSuiteDiscoveryStable(scratchDir, expectedDiscovery, 'before markdown output');
-      if (!pinnedDirectoryIsStable(scratchRoot)) {
-        rollbackJson();
-        throw new Error('ux-e2e: session root changed before markdown output');
-      }
-      const markdownBytes = Buffer.from(renderMarkdown(report));
+      if (!pinnedDirectoryIsStable(scratchRoot)) throw new Error('ux-e2e: session root changed before markdown output');
+    } catch (error) {
+      rollbackJson();
+      throw error;
+    }
+    const markdownBytes = Buffer.from(renderMarkdown(report));
       const previousMarkdown = readPinnedFile(reportDestination, mdFilename, MAX_PINNED_READ_BYTES, 0);
       try {
         if (!writePinnedFile(reportDestination, mdFilename, markdownBytes) || !pinnedDirectoryIsStable(scratchRoot)) {
@@ -1951,7 +1953,7 @@ export function generateReport(
 ): GenerateReportResult {
   const suiteRoot = resolve(sessionDir);
   const discovery = discoverSuiteChildren(suiteRoot);
-  if (discovery === null) throw new Error('ux-e2e: suite root discovery failed');
+  if (discovery === null) throw new Error('ux-e2e: failed to write report.json inside the session directory');
   if (discovery.single) {
     const result = generateSingleReport(suiteRoot, input, opts, discovery);
     return { jsonPath: result.jsonPath, mdPath: result.mdPath, warnings: result.warnings };
