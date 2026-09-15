@@ -2247,6 +2247,17 @@ test("run-delivery index rejects oversized authority and rebuilds canonical targ
   const root = mkdtempSync(join(tmpdir(), "cto-run-delivery-cap-"));
   try {
     const target = fixture("zzzz-target");
+    target.wave_history = [{
+      id: "zzzz-target-wave",
+      source: "test",
+      source_id: "zzzz-target-source",
+      task: "target terminal",
+      slice_ids: [],
+      status: "done",
+      outcome: "pass",
+      started_at: new Date(0).toISOString(),
+      finished_at: new Date(1_000).toISOString(),
+    }];
     persistState(target, root);
     setCtoPause(target, "done", "target terminal");
     persistState(target, root);
