@@ -1894,6 +1894,7 @@ const MAPPING_TRANSACTION_REQUIRED_KEYS = new Set([
   "state_before_digest", "state_source_logical_digest", "state_after_digest", "state_transition",
 ]);
 const MAPPING_TRANSACTION_OPTIONAL_KEYS = new Set([
+  "state_before_content", "state_source_content", "state",
   "operation", "abort_reason", "abort_started_at", "terminal_at", "terminal_disposition",
   "abort_observed_mapping_digest",
 ]);
@@ -6448,10 +6449,12 @@ export function closeCtoSpecificationExecutionWave(
     const preflightTerminalWave = preflightState.wave_history?.find((candidate) => candidate.id === input.wave_id);
     const terminalReplayCandidate = preflightState?.active_wave_id === undefined && preflightTerminalWave?.status === "done";
     if (!terminalReplayCandidate) {
-      const reconciled = reconcileCtoSpecificationExecutionTeams(root, input.cto_run_id, { runtimeAccess, pinnedRoot, sessionId: options.sessionId });
-      if (reconciled.status === "blocked") return blockedCtoWaveClose(reconciled.findings);
       const mappingForTerminalization = readMappingRecord(root, input.cto_run_id, input.mapping_id, pinnedRoot);
       if (!mappingForTerminalization.ok) return blockedCtoWaveClose([mappingForTerminalization.error]);
+      if (mappingForTerminalization.value.record_digest !== input.mapping_digest) return blockedCtoWaveClose(["mapping_digest does not match the current immutable mapping-record bytes"]);
+      if (mappingConfirmationRequired(mappingForTerminalization.value)) return blockedCtoWaveClose(["mapping confirmation is required before execution wave close"]);
+      const reconciled = reconcileCtoSpecificationExecutionTeams(root, input.cto_run_id, { runtimeAccess, pinnedRoot, sessionId: options.sessionId });
+      if (reconciled.status === "blocked") return blockedCtoWaveClose(reconciled.findings);
       const executionForTerminalization = (mappingForTerminalization.value.mapping as CtoSpecificationMapping & { execution?: { wave_id?: unknown } }).execution;
       if (!executionForTerminalization || typeof executionForTerminalization.wave_id !== "string") return blockedCtoWaveClose(["CTO close requires the exact execution wave binding before dependency terminalization"]);
       const failedTerminalization = terminalizeCtoDependencyBlockedTeams(
