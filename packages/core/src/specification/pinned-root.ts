@@ -1,366 +1,249 @@
 import {
-  closeSync,
-  accessSync,
-  chmodSync,
-  constants,
-  fchmodSync,
-  fstatSync,
-  fsyncSync,
-  mkdtempSync,
-  rmSync,
-  lstatSync,
-  linkSync,
-  mkdirSync,
-  openSync,
-  opendirSync,
-  readSync,
-  readFileSync,
-  readdirSync,
-  realpathSync,
-  renameSync,
-  rmdirSync,
-  unlinkSync,
-  writeSync,
-  type Stats,
-} from "node:fs";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { TextDecoder } from "node:util";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { tmpdir } from "node:os";
-import { isSafeRelativePath } from "./validation.js";
-import { MAX_PINNED_ROOT_READ_BYTES } from "./limits.js";
-import { assertCurrentExecutionLiveness, ExecutionLivenessViolation, withoutCurrentExecutionLiveness } from "../execution-liveness.js";
-
-/** Return the operating-system process-start identity used to detect PID reuse. */
-let selfProcessStartIdentity: string | undefined;
-export function processStartIdentity(pid = process.pid): string | null {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
-  // The current process cannot be replaced while this module is running, so a
-  // successful self identity remains safe to reuse if the OS probe is later
-  // transiently unavailable. Foreign PIDs are always probed afresh for reuse
-  // fencing.
-  if (pid === process.pid && selfProcessStartIdentity !== undefined) return selfProcessStartIdentity;
-  if (process.platform === "linux") {
-    try {
-      const line = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const closing = line.lastIndexOf(")");
-      if (closing < 0) return null;
-      const fields = line.slice(closing + 2).trim().split(/\s+/u);
-      // The suffix starts at field 3 (state); starttime is field 22.
-      const identity = fields.length > 19 && fields[19] ? `linux:${fields[19]}` : null;
-      if (pid === process.pid && identity !== null) selfProcessStartIdentity = identity;
-      return identity;
-    } catch {
-      return null;
-    }
-  }
-  if (process.platform === "darwin") {
-    try {
-      const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
-        encoding: "utf8",
-        timeout: 1000,
-        killSignal: "SIGTERM",
-        maxBuffer: 4096,
-        env: { LC_ALL: "C", LANG: "C", TZ: "UTC" },
-      });
-      const output = typeof result.stdout === "string" ? result.stdout.trim() : "";
-      const identity = result.status === 0 && output.length > 0 ? `darwin:${output}` : null;
-      if (pid === process.pid && identity !== null) selfProcessStartIdentity = identity;
-      return identity;
-    } catch {
-      return null;
-    }
-  }
-  return null;
+closeSync,
+accessSync,
+chmodSync,
+constants,
+fchmodSync,
+fstatSync,
+fsyncSync,
+mkdtempSync,
+rmSync,
+lstatSync,
+linkSync,
+mkdirSync,
+openSync,
+opendirSync,
+readSync,
+readFileSync,
+readdirSync,
+realpathSync,
+renameSync,
+rmdirSync,
+unlinkSync,
+writeSync,
+type Stats,} from "node:fs";import { spawn, spawnSync, type ChildProcess } from "node:child_process";import { TextDecoder } from "node:util";import { dirname, isAbsolute, join, relative, resolve } from "node:path";import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";import { tmpdir } from "node:os";import { isSafeRelativePath } from "./validation.js";import { MAX_PINNED_ROOT_READ_BYTES } from "./limits.js";import { assertCurrentExecutionLiveness, ExecutionLivenessViolation, withoutCurrentExecutionLiveness } from "../execution-liveness.js";/** Return the operating-system process-start identity used to detect PID reuse. */let selfProcessStartIdentity: string | undefined;export function processStartIdentity(pid = process.pid): string | null {
+if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+// The current process cannot be replaced while this module is running, so a
+// successful self identity remains safe to reuse if the OS probe is later
+// transiently unavailable. Foreign PIDs are always probed afresh for reuse
+// fencing.
+if (pid === process.pid && selfProcessStartIdentity !== undefined) return selfProcessStartIdentity;
+if (process.platform === "linux") {
+try {
+const line = readFileSync(`/proc/${pid}/stat`, "utf8");
+const closing = line.lastIndexOf(")");
+if (closing < 0) return null;
+const fields = line.slice(closing + 2).trim().split(/\s+/u);
+// The suffix starts at field 3 (state); starttime is field 22.
+const identity = fields.length > 19 && fields[19] ? `linux:${fields[19]}` : null;
+if (pid === process.pid && identity !== null) selfProcessStartIdentity = identity;
+return identity;
+} catch {
+return null;
 }
-
-/**
+}
+if (process.platform === "darwin") {
+try {
+const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+encoding: "utf8",
+timeout: 1000,
+killSignal: "SIGTERM",
+maxBuffer: 4096,
+env: { LC_ALL: "C", LANG: "C", TZ: "UTC" },
+});
+const output = typeof result.stdout === "string" ? result.stdout.trim() : "";
+const identity = result.status === 0 && output.length > 0 ? `darwin:${output}` : null;
+if (pid === process.pid && identity !== null) selfProcessStartIdentity = identity;
+return identity;
+} catch {
+return null;
+}
+}
+return null;}/**
  * A failure from a descriptor-anchored project-root operation.  Callers map
  * every failure to their own typed, fail-closed result instead of falling
  * back to a pathname write.
- */
-export type PinnedRootErrorCode =
-  | "unsupported"
-  | "invalid"
-  | "limit"
-  | "changed"
-  | "recovery_required"
-  | "path_unauthorized"
-  | "not_found"
-  | "not_directory"
-  | "not_regular"
-  | "write_failed"
-  | "exists";
-
-export class PinnedRootError extends Error {
-  readonly code: PinnedRootErrorCode;
-
-  constructor(code: PinnedRootErrorCode, message: string) {
-    super(message);
-    this.name = "PinnedRootError";
-    this.code = code;
-  }
-}
-
-/** Internal deterministic seams used by migration path-race tests. */
-export interface PinnedRootWriteHooks {
-  /** Test-only fail-closed seam for Darwin helper availability. */
-  disableDarwinHelper?: boolean;
-  /** Test-only delay injected into the Darwin helper before dispatch. */
-  helperSleepMs?: number;
-  /** Test-only override for the bounded helper timeout. */
-  helperTimeoutMs?: number;
-  /** Test-only absolute executable override for spawn-error coverage. */
-  helperExecutable?: string;
-  /** Test-only deterministic response-channel fault. */
-  helperProtocolTest?: "short_write" | "epipe" | "eof" | "oversized_response" | "two_frames" | "invalid_utf8" | "invalid_json" | "truncated" | "valid_multibyte_control" | "forged_response" | "replay_response" | "cross_session_replay" | "forged_request" | "eof_after_prepared_commit" | "eof_after_prepared_ack";
-  /** Test-only seam immediately before opening a helper FIFO. */
-  beforeDarwinHelperOpen?: (channel: "request" | "response", path: string) => void;
-  /** Test-only seam immediately before a conditional target lock. */
-  beforeConditionalCommit?: (relativePath: string) => void;
-  /** Test-only seam after a deterministic conditional lock is acquired. */
-  afterConditionalLock?: (relativePath: string) => void;
-  /** Test-only seam after expected inode/digest verification. */
-  afterConditionalVerification?: (relativePath: string) => void;
-  /** Test-only seam after a replacement temp is durably staged. */
-  afterConditionalStage?: (relativePath: string) => void;
-  /** Test-only seam after canonical replacement/removal. */
-  afterConditionalReplace?: (relativePath: string) => void;
-  /** Test-only seam immediately before conditional lease cleanup. */
-  conditionalPostExchangeMutation?: boolean;
-  conditionalPreExchangeMutation?: boolean;
-  conditionalStagePreExchangeMutation?: boolean;
-  conditionalPreMoveMutation?: boolean;
-  conditionalPreMoveSymlink?: boolean;
-  conditionalPostExchangeStageMutation?: boolean;
-  beforeConditionalCleanup?: (relativePath: string) => void;
-  /** Test-only replacement of the prepared lease before its signed upgrade. */
-  preparedLeaseReplacement?: boolean;
-  /** Test-only same-inode mutation after ACK verification, before lease release. */
-  preparedPostVerifyMutation?: boolean;
-  /** Test-only helper/Node crash injection phase. */
-  conditionalFailurePhase?: "after_lock" | "after_verification" | "after_stage" | "after_replace" | "before_cleanup" | "after_prepared_publish_error" | "after_prepared_publication_before_lease" | "after_prepared_stage_before_journal" | "after_prepared_batch_journal" | "after_prepared_batch_first_lease_release";
-  /** Test-only seam: restrict a grouped helper crash to one prepared entry. */
-  preparedBatchJournalIndex?: number;
-  /** Test-only seam: fail a Darwin batch immediately after this operation. */
-  batchFailureIndex?: number;
-  beforeDirectoryCreate?: (relativePath: string) => void;
-  beforeTempOpen?: (relativePath: string) => void;
-  beforeRename?: (relativePath: string) => void;
-  /** Invoked after secure staging and before target visibility. */
-  beforePublish?: (receipt: PinnedRootWriteReceipt) => void;
-  /** Test-only seam immediately after portable link/rename publication. */
-  afterPublish?: (relativePath: string) => void;
-  /** Test-only seam after portable parent fsync and before liveness assertion. */
-  afterPublishLiveness?: (relativePath: string) => void;
-  beforeCleanup?: (relativePath: string) => void;
-}
-
-export interface PinnedRootIdentity {
-  canonical_root: string;
-  dev: number;
-  ino: number;
-}
-
-export interface PinnedRootReadResult {
-  path: string;
-  bytes: Uint8Array;
-  /** Device/inode observed from the opened regular-file descriptor. */
-  dev: number;
-  ino: number;
-  /** Metadata captured from the same descriptor operation when available. */
-  size?: number;
-  mtimeMs?: number;
-  ctimeMs?: number;
-}
-
-/** One stable lexicographic page of descriptor-anchored directory entries. */
-export interface PinnedRootDirectoryPage {
-  names: string[];
-  /** Last returned name, or null when the directory is exhausted. */
-  nextCursor: string | null;
-}
-
-/** Expected identity and canonical bytes for an anchored compare-and-swap. */
-export interface PinnedRootFileExpectation {
-  dev: number;
-  ino: number;
-  sha256: string;
-  /** Optional byte length used by exact rollback/CAS checks. */
-  size?: number;
-}
-
-export type PinnedRootWriteContent = string | Uint8Array;
-
-export type PinnedRootWritePreimage =
-  | { readonly kind: "absent" }
-  | { readonly kind: "file"; readonly bytes: Readonly<Uint8Array>; readonly expectation: PinnedRootFileExpectation };
-
-/** Descriptor plus the exact preimage captured before this operation published. */
-export interface PinnedRootWriteReceipt {
-  readonly path: string;
-  readonly relative_path: string;
-  readonly descriptor: PinnedRootWriteDescriptor;
-  readonly preimage: PinnedRootWritePreimage;
-  /** Exact CAS rollback; returns false when a concurrent winner owns the path. */
-  readonly rollback: () => boolean;
-}
-
-export interface PinnedRootWriteOptions {
-  /** Called after secure staging and before the target name becomes visible. */
-  readonly beforePublish?: (receipt: PinnedRootWriteReceipt) => void;
-}
-
-export interface PinnedRootBatchWriteOptions {
-  /** Called after every entry is staged and before any target becomes visible. */
-  readonly beforePublish?: (receipts: readonly PinnedRootWriteReceipt[]) => void;
-}
-
-/**
+ */export type PinnedRootErrorCode =
+| "unsupported"
+| "invalid"
+| "limit"
+| "changed"
+| "recovery_required"
+| "path_unauthorized"
+| "not_found"
+| "not_directory"
+| "not_regular"
+| "write_failed"
+| "exists";export class PinnedRootError extends Error {
+readonly code: PinnedRootErrorCode;
+constructor(code: PinnedRootErrorCode, message: string) {
+super(message);
+this.name = "PinnedRootError";
+this.code = code;
+}}/** Internal deterministic seams used by migration path-race tests. */export interface PinnedRootWriteHooks {
+/** Test-only fail-closed seam for Darwin helper availability. */
+disableDarwinHelper?: boolean;
+/** Test-only delay injected into the Darwin helper before dispatch. */
+helperSleepMs?: number;
+/** Test-only override for the bounded helper timeout. */
+helperTimeoutMs?: number;
+/** Test-only absolute executable override for spawn-error coverage. */
+helperExecutable?: string;
+/** Test-only deterministic response-channel fault. */
+helperProtocolTest?: "short_write" | "epipe" | "eof" | "oversized_response" | "two_frames" | "invalid_utf8" | "invalid_json" | "truncated" | "valid_multibyte_control" | "forged_response" | "replay_response" | "cross_session_replay" | "forged_request" | "eof_after_prepared_commit" | "eof_after_prepared_ack";
+/** Test-only seam immediately before opening a helper FIFO. */
+beforeDarwinHelperOpen?: (channel: "request" | "response", path: string) => void;
+/** Test-only seam immediately before a conditional target lock. */
+beforeConditionalCommit?: (relativePath: string) => void;
+/** Test-only seam after a deterministic conditional lock is acquired. */
+afterConditionalLock?: (relativePath: string) => void;
+/** Test-only seam after expected inode/digest verification. */
+afterConditionalVerification?: (relativePath: string) => void;
+/** Test-only seam after a replacement temp is durably staged. */
+afterConditionalStage?: (relativePath: string) => void;
+/** Test-only seam after canonical replacement/removal. */
+afterConditionalReplace?: (relativePath: string) => void;
+/** Test-only seam immediately before conditional lease cleanup. */
+conditionalPostExchangeMutation?: boolean;
+conditionalPreExchangeMutation?: boolean;
+conditionalStagePreExchangeMutation?: boolean;
+conditionalPreMoveMutation?: boolean;
+conditionalPreMoveSymlink?: boolean;
+conditionalPostExchangeStageMutation?: boolean;
+beforeConditionalCleanup?: (relativePath: string) => void;
+/** Test-only replacement of the prepared lease before its signed upgrade. */
+preparedLeaseReplacement?: boolean;
+/** Test-only same-inode mutation after ACK verification, before lease release. */
+preparedPostVerifyMutation?: boolean;
+/** Test-only helper/Node crash injection phase. */
+conditionalFailurePhase?: "after_lock" | "after_verification" | "after_stage" | "after_replace" | "before_cleanup" | "after_prepared_publish_error" | "after_prepared_publication_before_lease" | "after_prepared_stage_before_journal" | "after_prepared_batch_journal" | "after_prepared_batch_first_lease_release";
+/** Test-only seam: restrict a grouped helper crash to one prepared entry. */
+preparedBatchJournalIndex?: number;
+/** Test-only seam: fail a Darwin batch immediately after this operation. */
+batchFailureIndex?: number;
+beforeDirectoryCreate?: (relativePath: string) => void;
+beforeTempOpen?: (relativePath: string) => void;
+beforeRename?: (relativePath: string) => void;
+/** Invoked after secure staging and before target visibility. */
+beforePublish?: (receipt: PinnedRootWriteReceipt) => void;
+/** Test-only seam immediately after portable link/rename publication. */
+afterPublish?: (relativePath: string) => void;
+/** Test-only seam after portable parent fsync and before liveness assertion. */
+afterPublishLiveness?: (relativePath: string) => void;
+beforeCleanup?: (relativePath: string) => void;}export interface PinnedRootIdentity {
+canonical_root: string;
+dev: number;
+ino: number;}export interface PinnedRootReadResult {
+path: string;
+bytes: Uint8Array;
+/** Device/inode observed from the opened regular-file descriptor. */
+dev: number;
+ino: number;
+/** Metadata captured from the same descriptor operation when available. */
+size?: number;
+mtimeMs?: number;
+ctimeMs?: number;}/** One stable lexicographic page of descriptor-anchored directory entries. */export interface PinnedRootDirectoryPage {
+names: string[];
+/** Last returned name, or null when the directory is exhausted. */
+nextCursor: string | null;}/** Expected identity and canonical bytes for an anchored compare-and-swap. */export interface PinnedRootFileExpectation {
+dev: number;
+ino: number;
+sha256: string;
+/** Optional byte length used by exact rollback/CAS checks. */
+size?: number;}export type PinnedRootWriteContent = string | Uint8Array;export type PinnedRootWritePreimage =
+| { readonly kind: "absent" }
+| { readonly kind: "file"; readonly bytes: Readonly<Uint8Array>; readonly expectation: PinnedRootFileExpectation };/** Descriptor plus the exact preimage captured before this operation published. */export interface PinnedRootWriteReceipt {
+readonly path: string;
+readonly relative_path: string;
+readonly descriptor: PinnedRootWriteDescriptor;
+readonly preimage: PinnedRootWritePreimage;
+/** Exact CAS rollback; returns false when a concurrent winner owns the path. */
+readonly rollback: () => boolean;}export interface PinnedRootWriteOptions {
+/** Called after secure staging and before the target name becomes visible. */
+readonly beforePublish?: (receipt: PinnedRootWriteReceipt) => void;}export interface PinnedRootBatchWriteOptions {
+/** Called after every entry is staged and before any target becomes visible. */
+readonly beforePublish?: (receipts: readonly PinnedRootWriteReceipt[]) => void;}/**
  * Identity of the exact inode published by one anchored write operation.
  * `sha256` and `size` are the requested bytes, while `dev`/`ino` identify the
  * operation's temp inode after its atomic rename or exclusive link. Callers
  * must use this descriptor for ownership rollback rather than re-reading the
  * pathname, which could have been replaced by a concurrent writer.
- */
-export interface PinnedRootWriteDescriptor {
-  readonly path: string;
-  readonly relative_path: string;
-  readonly dev: number;
-  readonly ino: number;
-  readonly size: number;
-  readonly sha256: string;
-}
-
-const descriptorReceipts = new WeakMap<PinnedRootWriteDescriptor, PinnedRootWriteReceipt>();
-const descriptorPreimages = new WeakMap<PinnedRootWriteDescriptor, PinnedRootWritePreimage>();
-
-const DARWIN_PYTHON_CANDIDATES = ["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"] as const;
-const DARWIN_HELPER_MAX_OUTPUT = 24 * 1024 * 1024;
-/** Synchronous helper operations have one total deadline, including startup. */
-const DARWIN_HELPER_TIMEOUT_MS = 4_000;
-// Large framed writes must allow the complete bounded payload to cross the
+ */export interface PinnedRootWriteDescriptor {
+readonly path: string;
+readonly relative_path: string;
+readonly dev: number;
+readonly ino: number;
+readonly size: number;
+readonly sha256: string;}const descriptorReceipts = new WeakMap<PinnedRootWriteDescriptor, PinnedRootWriteReceipt>();const descriptorPreimages = new WeakMap<PinnedRootWriteDescriptor, PinnedRootWritePreimage>();const DARWIN_PYTHON_CANDIDATES = ["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"] as const;const DARWIN_HELPER_MAX_OUTPUT = 24 * 1024 * 1024;/** Synchronous helper operations have one total deadline, including startup. */const DARWIN_HELPER_TIMEOUT_MS = 4_000;// Large framed writes must allow the complete bounded payload to cross the
 // synchronous FIFOs on slower Darwin hosts. Keep the allowance finite and
 // derive it from the validated frame size below; ordinary helper calls retain
 // the short default deadline.
-const DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS = 90_000;
-const DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS = 5_000;
-const DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES = 1 * 1024 * 1024;
-const DARWIN_HELPER_TRANSFER_BYTES_PER_MS = 1 * 1024;
-const DARWIN_HELPER_TRANSFER_OPERATIONS = new Set([
-  "write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "lock_acquire", "batch", "batch_atomic", "replace_if_matches",
-]);
-const DARWIN_HELPER_MAX_INPUT = 96 * 1024 * 1024;
-const DARWIN_HELPER_START_TIMEOUT_MS = 1_000;
-const DARWIN_HELPER_CLOSE_TIMEOUT_MS = 1_000;
-const DARWIN_HELPER_POLL_MS = 2;
-const MAX_PINNED_ROOT_WRITE_BYTES = 64 * 1024 * 1024;
-
-interface DarwinHelperSession {
-  readonly directory: string;
-  readonly requestPath: string;
-  readonly responsePath: string;
-  readonly requestFd: number;
-  readonly responseFd: number;
-  readonly child: ChildProcess;
-  readonly exitPromise: Promise<void>;
-  readonly resolveExit: () => void;
-  exited: boolean;
-  closing: boolean;
-  runtimeError: Error | null;
-  readonly authKey: Buffer;
-  readonly sessionId: string;
-  readonly rootPathDigest: string;
-  nonce: number;
+const DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS = 90_000;const DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS = 5_000;const DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES = 1 * 1024 * 1024;const DARWIN_HELPER_TRANSFER_BYTES_PER_MS = 1 * 1024;const DARWIN_HELPER_TRANSFER_OPERATIONS = new Set([
+"write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "lock_acquire", "batch", "batch_atomic", "replace_if_matches",]);const DARWIN_HELPER_MAX_INPUT = 96 * 1024 * 1024;const DARWIN_HELPER_START_TIMEOUT_MS = 1_000;const DARWIN_HELPER_CLOSE_TIMEOUT_MS = 1_000;const DARWIN_HELPER_POLL_MS = 2;const MAX_PINNED_ROOT_WRITE_BYTES = 64 * 1024 * 1024;interface DarwinHelperSession {
+readonly directory: string;
+readonly requestPath: string;
+readonly responsePath: string;
+readonly requestFd: number;
+readonly responseFd: number;
+readonly child: ChildProcess;
+readonly exitPromise: Promise<void>;
+readonly resolveExit: () => void;
+exited: boolean;
+closing: boolean;
+runtimeError: Error | null;
+readonly authKey: Buffer;
+readonly sessionId: string;
+readonly rootPathDigest: string;
+nonce: number;}const activeDarwinHelperSessions = new Set<DarwinHelperSession>();const LIVE_DARWIN_HELPER_SESSION_IDS = new Map<string, Set<string>>();const MAX_LIVE_DARWIN_HELPER_SESSIONS_PER_ROOT = 64;function pruneLiveDarwinHelperSessions(rootPathDigest: string): Set<string> {
+const active = new Set([...activeDarwinHelperSessions]
+.filter((session) => session.rootPathDigest === rootPathDigest && !session.exited && !session.closing)
+.map((session) => session.sessionId));
+const known = LIVE_DARWIN_HELPER_SESSION_IDS.get(rootPathDigest);
+if (!known) return active;
+for (const sessionId of known) {
+if (!active.has(sessionId)) known.delete(sessionId);
 }
-
-const activeDarwinHelperSessions = new Set<DarwinHelperSession>();
-const LIVE_DARWIN_HELPER_SESSION_IDS = new Map<string, Set<string>>();
-const MAX_LIVE_DARWIN_HELPER_SESSIONS_PER_ROOT = 64;
-
-function pruneLiveDarwinHelperSessions(rootPathDigest: string): Set<string> {
-  const active = new Set([...activeDarwinHelperSessions]
-    .filter((session) => session.rootPathDigest === rootPathDigest && !session.exited && !session.closing)
-    .map((session) => session.sessionId));
-  const known = LIVE_DARWIN_HELPER_SESSION_IDS.get(rootPathDigest);
-  if (!known) return active;
-  for (const sessionId of known) {
-    if (!active.has(sessionId)) known.delete(sessionId);
-  }
-  if (known.size === 0) LIVE_DARWIN_HELPER_SESSION_IDS.delete(rootPathDigest);
-  return active;
-}
-
-function registerLiveDarwinHelperSession(session: DarwinHelperSession): void {
-  const active = pruneLiveDarwinHelperSessions(session.rootPathDigest);
-  if (active.size >= MAX_LIVE_DARWIN_HELPER_SESSIONS_PER_ROOT) throw new PinnedRootError("unsupported", "descriptor helper live-session registry is full");
-  let sessions = LIVE_DARWIN_HELPER_SESSION_IDS.get(session.rootPathDigest);
-  if (!sessions) { sessions = new Set<string>(); LIVE_DARWIN_HELPER_SESSION_IDS.set(session.rootPathDigest, sessions); }
-  sessions.add(session.sessionId);
-}
-
-function removeLiveDarwinHelperSession(session: DarwinHelperSession): void {
-  const sessions = LIVE_DARWIN_HELPER_SESSION_IDS.get(session.rootPathDigest);
-  if (!sessions) return;
-  sessions.delete(session.sessionId);
-  if (sessions.size === 0) LIVE_DARWIN_HELPER_SESSION_IDS.delete(session.rootPathDigest);
-}
-
-function liveDarwinHelperSessionIds(rootPathDigest: string): string[] {
-  const sessions = LIVE_DARWIN_HELPER_SESSION_IDS.get(rootPathDigest);
-  if (!sessions) return [];
-  pruneLiveDarwinHelperSessions(rootPathDigest);
-  return [...(LIVE_DARWIN_HELPER_SESSION_IDS.get(rootPathDigest) ?? [])];
-}
-
-/**
+if (known.size === 0) LIVE_DARWIN_HELPER_SESSION_IDS.delete(rootPathDigest);
+return active;}function registerLiveDarwinHelperSession(session: DarwinHelperSession): void {
+const active = pruneLiveDarwinHelperSessions(session.rootPathDigest);
+if (active.size >= MAX_LIVE_DARWIN_HELPER_SESSIONS_PER_ROOT) throw new PinnedRootError("unsupported", "descriptor helper live-session registry is full");
+let sessions = LIVE_DARWIN_HELPER_SESSION_IDS.get(session.rootPathDigest);
+if (!sessions) { sessions = new Set<string>(); LIVE_DARWIN_HELPER_SESSION_IDS.set(session.rootPathDigest, sessions); }
+sessions.add(session.sessionId);}function removeLiveDarwinHelperSession(session: DarwinHelperSession): void {
+const sessions = LIVE_DARWIN_HELPER_SESSION_IDS.get(session.rootPathDigest);
+if (!sessions) return;
+sessions.delete(session.sessionId);
+if (sessions.size === 0) LIVE_DARWIN_HELPER_SESSION_IDS.delete(session.rootPathDigest);}function liveDarwinHelperSessionIds(rootPathDigest: string): string[] {
+const sessions = LIVE_DARWIN_HELPER_SESSION_IDS.get(rootPathDigest);
+if (!sessions) return [];
+pruneLiveDarwinHelperSessions(rootPathDigest);
+return [...(LIVE_DARWIN_HELPER_SESSION_IDS.get(rootPathDigest) ?? [])];}/**
  * Darwin has no Node openat/*at bindings. This helper receives the already
  * opened root descriptor as fd 3 and serves a bounded, serialized FIFO
  * request stream using Python's dir_fd APIs. Every request re-validates the
  * pinned identity; it never accepts a project pathname or changes cwd.
- */
-const DARWIN_JOURNAL_AUTH_KEY = randomBytes(32);
-const DARWIN_HOST_INSTANCE_ID = randomUUID();
-const LIVE_DARWIN_BATCH_IDS = new Map<string, Set<string>>();
-
-function liveDarwinBatchSet(rootDigest: string): Set<string> {
-  let ids = LIVE_DARWIN_BATCH_IDS.get(rootDigest);
-  if (!ids) { ids = new Set<string>(); LIVE_DARWIN_BATCH_IDS.set(rootDigest, ids); }
-  return ids;
+ */const DARWIN_JOURNAL_AUTH_KEY = randomBytes(32);const DARWIN_HOST_INSTANCE_ID = randomUUID();const LIVE_DARWIN_BATCH_IDS = new Map<string, Set<string>>();function liveDarwinBatchSet(rootDigest: string): Set<string> {
+let ids = LIVE_DARWIN_BATCH_IDS.get(rootDigest);
+if (!ids) { ids = new Set<string>(); LIVE_DARWIN_BATCH_IDS.set(rootDigest, ids); }
+return ids;}function removeLiveDarwinBatch(rootDigest: string, batchId: string): void {
+const ids = LIVE_DARWIN_BATCH_IDS.get(rootDigest);
+if (!ids) return;
+ids.delete(batchId);
+if (ids.size === 0) LIVE_DARWIN_BATCH_IDS.delete(rootDigest);}function canonicalDarwinHelperJson(value: unknown): string {
+const encoded = JSON.stringify(value, (_key, nested) => {
+if (nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+const record = nested as Record<string, unknown>;
+return Object.fromEntries(Object.keys(record).sort().map((key) => [key, record[key]]));
 }
-
-function removeLiveDarwinBatch(rootDigest: string, batchId: string): void {
-  const ids = LIVE_DARWIN_BATCH_IDS.get(rootDigest);
-  if (!ids) return;
-  ids.delete(batchId);
-  if (ids.size === 0) LIVE_DARWIN_BATCH_IDS.delete(rootDigest);
-}
-
-function canonicalDarwinHelperJson(value: unknown): string {
-  const encoded = JSON.stringify(value, (_key, nested) => {
-    if (nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
-      const record = nested as Record<string, unknown>;
-      return Object.fromEntries(Object.keys(record).sort().map((key) => [key, record[key]]));
-    }
-    return nested;
-  });
-  if (encoded === undefined) throw new Error("helper authentication cannot encode undefined");
-  return encoded;
-}
-
-function darwinHelperMac(value: unknown, key: Buffer): string {
-  return createHmac("sha256", key).update(canonicalDarwinHelperJson(value), "utf8").digest("hex");
-}
-
-function verifyDarwinHelperMac(value: Record<string, unknown>, mac: unknown, key: Buffer): boolean {
-  if (typeof mac !== "string") return false;
-  const expected = Buffer.from(darwinHelperMac(value, key), "ascii");
-  const actual = Buffer.from(mac, "ascii");
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
-}
-
-const DARWIN_HELPER_SOURCE = String.raw`import base64
+return nested;
+});
+if (encoded === undefined) throw new Error("helper authentication cannot encode undefined");
+return encoded;}function darwinHelperMac(value: unknown, key: Buffer): string {
+return createHmac("sha256", key).update(canonicalDarwinHelperJson(value), "utf8").digest("hex");}function verifyDarwinHelperMac(value: Record<string, unknown>, mac: unknown, key: Buffer): boolean {
+if (typeof mac !== "string") return false;
+const expected = Buffer.from(darwinHelperMac(value, key), "ascii");
+const actual = Buffer.from(mac, "ascii");
+return actual.length === expected.length && timingSafeEqual(actual, expected);}const DARWIN_HELPER_SOURCE = String.raw`import base64
 import hashlib
 import hmac
 import ctypes
@@ -379,6 +262,7 @@ MAX_PATH = 4096
 MAX_SEGMENTS = 128
 MAX_WRITE = 64 * 1024 * 1024
 MAX_BATCH_ROLLBACK = 8 * 1024 * 1024
+MAX_JOURNAL_READ = 16 * 1024 * 1024
 MAX_REQUEST_BYTES = 96 * 1024 * 1024
 MAX_DIRECTORY_ENTRIES = 16384
 MAX_DIRECTORY_NAME_BYTES = 4 * 1024 * 1024
@@ -1102,7 +986,7 @@ def quarantine_dead_untrusted_lease(parent, root_fd, target, relative_path, lock
     if (isinstance(batch_id, str) and isinstance(journal_name, str) and len(batch_id) <= 128
         and journal_name == batch_journal_name(batch_id)):
         try:
-            journal_data, journal_info = read_at(root_fd, journal_name)
+            journal_data, journal_info = read_at(root_fd, journal_name, MAX_JOURNAL_READ)
         except FileNotFoundError:
             journal_data = journal_info = None
         except Exception:
@@ -1146,7 +1030,8 @@ def conditional_lock(parent, target, relative_path, expected, desired_sha, opera
     start_identity = process_start_identity(os.getpid())
     if start_identity is None:
         raise NotImplementedError("process start identity is unavailable")
-    metadata = signed_document({"schema_version": 2, "token": secrets.token_hex(16), "pid": os.getpid(), "start_identity": start_identity, "session_id": SESSION_ID, "host_instance_id": CURRENT_HOST_INSTANCE_ID, "operation": operation, "expected": expected, "desired_sha256": desired_sha, "stage": stage_name})
+    lease_expected = {key: value for key, value in expected.items() if key != "bytes"} if isinstance(expected, dict) else expected
+    metadata = signed_document({"schema_version": 2, "token": secrets.token_hex(16), "pid": os.getpid(), "start_identity": start_identity, "session_id": SESSION_ID, "host_instance_id": CURRENT_HOST_INSTANCE_ID, "operation": operation, "expected": lease_expected, "desired_sha256": desired_sha, "stage": stage_name})
     if isinstance(group, dict):
         metadata.update({"schema_version": 3, "batch_id": group.get("batch_id"), "batch_index": group.get("batch_index"), "batch_size": group.get("batch_size"), "batch_journal": group.get("batch_journal"), "path": relative_path, "root_binding": CURRENT_ROOT_BINDING})
         metadata = signed_document(metadata)
@@ -1399,7 +1284,7 @@ def quarantine_conditional_entry(parent, name, relative_path, prefix):
     raise RecoveryRequired("conditional replacement quarantine path could not be reserved")
 
 
-def conditional_exchange_replace(parent, target, stage, expected, desired_sha, desired_size, mutate_post_exchange=False, mutate_stage_after_exchange=False, mutate_pre_exchange=False, mutate_stage_pre_exchange=False):
+def conditional_exchange_replace(parent, target, stage, expected, desired_sha, desired_size, mutate_post_exchange=False, mutate_stage_after_exchange=False, mutate_pre_exchange=False, mutate_stage_pre_exchange=False, retain_displaced=False):
     """Atomically publish stage while preserving an exact target preimage."""
     try:
         observed, observed_info = read_at(parent, target)
@@ -1433,7 +1318,7 @@ def conditional_exchange_replace(parent, target, stage, expected, desired_sha, d
             displaced_current_expected = False
             displaced_receipt = stage_receipt
         if desired_current and displaced_current_expected:
-            if not remove_exact_regular(parent, displaced, displaced_receipt):
+            if not retain_displaced and not remove_exact_regular(parent, displaced, displaced_receipt):
                 raise RecoveryRequired("conditional replacement displaced cleanup could not be proven")
             fsync_regular(parent)
             return True, current_info
@@ -1736,13 +1621,15 @@ def update_prepared_lease(parent, prepared):
         "host_instance_id": CURRENT_HOST_INSTANCE_ID,
         "operation": "write_atomic" if prepared["operation"] == "prepare_write_atomic" else "write_exclusive",
         "path": "/".join(safe_segments(prepared["path"])),
-        "expected": prepared["expected"],
+        "expected": {key: value for key, value in prepared["expected"].items() if key != "bytes"},
         "desired_sha256": prepared["sha256"],
         "stage": prepared.get("stage") or prepared["temp"] or "",
         "published": prepared.get("published") is True,
         "quarantined": prepared.get("quarantined") is True,
         "recovery_policy": "quarantine_on_ambiguous_recovery",
         "postimage": prepared.get("postimage"),
+        "backup": prepared.get("backup"),
+        "backup_descriptor": prepared.get("backup_descriptor"),
         "batch_id": prepared.get("batch_id"),
         "batch_index": prepared.get("batch_index"),
         "batch_size": prepared.get("batch_size"),
@@ -1828,7 +1715,7 @@ def validate_batch_manifest(batch_id, manifest, path, data, index, size):
 def ensure_batch_journal(root_fd, batch_id, manifest, root_binding):
     name = batch_journal_name(batch_id)
     try:
-        existing, _ = read_at(root_fd, name)
+        existing, _ = read_at(root_fd, name, MAX_JOURNAL_READ)
         try:
             observed = json.loads(existing.decode("utf-8"))
         except Exception as error:
@@ -1895,7 +1782,7 @@ def ensure_batch_journal(root_fd, batch_id, manifest, root_binding):
 
 def read_batch_journal(root_fd, journal_name, batch_id):
     try:
-        data, info = read_at(root_fd, journal_name)
+        data, info = read_at(root_fd, journal_name, MAX_JOURNAL_READ)
     except FileNotFoundError as error:
         raise RecoveryRequired("prepared batch journal is missing") from error
     except Exception as error:
@@ -1909,11 +1796,13 @@ def read_batch_journal(root_fd, journal_name, batch_id):
     if not isinstance(document, dict) or document.get("root_binding") != CURRENT_ROOT_BINDING:
         raise RecoveryRequired("prepared batch journal root binding changed")
     if (not isinstance(document, dict) or document.get("schema_version") != 1
-        or document.get("batch_id") != batch_id or document.get("state") not in ("prepared", "finalizing") or not isinstance(document.get("entries"), list)
+        or document.get("batch_id") != batch_id or document.get("state") not in ("prepared", "rolling_back", "rolled_back", "finalizing") or not isinstance(document.get("entries"), list)
         or not (1 <= len(document["entries"]) <= 8)):
         raise RecoveryRequired("prepared batch journal identity or manifest is invalid")
     entries = document["entries"]
     seen = set()
+    rollback_snapshot_bytes = 0
+    rollback_schema = document.get("state") in ("rolling_back", "rolled_back") or (document.get("state") == "finalizing" and all(isinstance(candidate, dict) and "rollback_state" in candidate for candidate in entries))
     for index, entry in enumerate(entries):
         if (not isinstance(entry, dict) or entry.get("index") != index
             or not isinstance(entry.get("path"), str) or entry["path"] in seen
@@ -1927,6 +1816,50 @@ def read_batch_journal(root_fd, journal_name, batch_id):
                 or entry["postimage"].get("size") != entry["size"]
                 or entry["postimage"].get("sha256") != entry["sha256"]))):
             raise RecoveryRequired("prepared batch journal entry is invalid")
+        if rollback_schema:
+            if (not isinstance(entry.get("expected"), dict) or entry["expected"].get("kind") not in ("absent", "file")
+                or not isinstance(entry.get("postimage"), dict) or not isinstance(entry.get("token"), str)
+                or entry.get("rollback_state") not in ("pending", "aborting", "rolled_back")):
+                raise RecoveryRequired("prepared batch rollback journal entry is invalid")
+            if entry["expected"].get("kind") == "file":
+                encoded = entry["expected"].get("bytes")
+                if not isinstance(encoded, str):
+                    raise RecoveryRequired("prepared batch rollback preimage bytes are missing")
+                try:
+                    decoded_length = len(base64.b64decode(encoded, validate=True))
+                except Exception as error:
+                    raise RecoveryRequired("prepared batch rollback preimage bytes are invalid") from error
+                if decoded_length != entry["expected"].get("size"):
+                    raise RecoveryRequired("prepared batch rollback preimage size changed")
+                rollback_snapshot_bytes += decoded_length
+                if rollback_snapshot_bytes > MAX_BATCH_ROLLBACK:
+                    raise RecoveryRequired("prepared batch rollback journal exceeds its byte bound")
+            rollback_temp = entry.get("rollback_temp")
+            if rollback_temp is not None and (not isinstance(rollback_temp, str) or rollback_temp != bounded_name("cas-stage", entry["path"], ".tmp", nonce=False)):
+                raise RecoveryRequired("prepared batch rollback backup binding changed")
+            if entry["expected"].get("kind") == "file" and entry.get("rollback_state") == "pending" and not same_preimage_metadata(entry.get("rollback_temp_descriptor"), entry["expected"]):
+                raise RecoveryRequired("prepared batch rollback backup descriptor changed")
+            if entry.get("rollback_state") == "aborting":
+                descriptor = entry.get("rollback_temp_descriptor")
+                postimage = entry.get("postimage")
+                if (not isinstance(descriptor, dict) or not isinstance(postimage, dict)
+                        or descriptor.get("dev") != postimage.get("dev") or descriptor.get("ino") != postimage.get("ino")
+                        or descriptor.get("size") != postimage.get("size") or descriptor.get("sha256") != postimage.get("sha256")):
+                    raise RecoveryRequired("prepared batch aborting stage descriptor changed")
+            if entry["expected"].get("kind") == "file" and entry.get("rollback_state") in ("pending", "aborting") and (not isinstance(entry.get("rollback_postimage_descriptor"), dict) or entry.get("rollback_postimage_descriptor") != entry.get("postimage")):
+                raise RecoveryRequired("prepared batch rollback displaced descriptor changed")
+            if entry["expected"].get("kind") == "absent" and entry.get("rollback_state") in ("pending", "aborting"):
+                descriptor = entry.get("rollback_temp_descriptor")
+                postimage = entry.get("postimage")
+                if (rollback_temp != bounded_name("cas-stage", entry["path"], ".tmp", nonce=False)
+                        or not isinstance(descriptor, dict) or not isinstance(postimage, dict)
+                        or descriptor.get("dev") != postimage.get("dev") or descriptor.get("ino") != postimage.get("ino")
+                        or descriptor.get("size") != postimage.get("size") or descriptor.get("sha256") != postimage.get("sha256")):
+                    raise RecoveryRequired("prepared batch rollback absent-target backup changed")
+            if entry["expected"].get("kind") == "absent" and entry.get("rollback_state") == "rolled_back" and (rollback_temp is not None or entry.get("rollback_temp_descriptor") is not None or entry.get("rollback_postimage_descriptor") is not None):
+                raise RecoveryRequired("prepared batch rollback absent-target residue remains")
+            if entry.get("rollback_state") == "rolled_back" and not isinstance(entry.get("restored"), dict):
+                raise RecoveryRequired("prepared batch restored descriptor is missing")
         seen.add(entry["path"])
     return document, info, data
 
@@ -1964,19 +1897,22 @@ def release_batch_lease(parent, lock_name, token):
         data, info, owner = read_lock_observed(parent, lock_name)
     except Exception as error:
         raise RecoveryRequired("prepared batch lease is unavailable during recovery") from error
-    if not verify_signed_document(owner) or owner.get("token") != token:
+    if not isinstance(owner, dict) or not verify_signed_document(owner) or owner.get("token") != token:
         raise RecoveryRequired("prepared batch lease authentication changed during recovery")
     expected = {"dev": info.st_dev, "ino": info.st_ino, "sha256": hashlib.sha256(data).hexdigest()}
     if not remove_exact_regular(parent, lock_name, expected):
         raise RecoveryRequired("prepared batch lease cleanup could not be proven")
+    return {"token": token, "dev": info.st_dev, "ino": info.st_ino}
 
 
 def persist_batch_journal(root_fd, journal_name, expected_data, document):
     if not verify_signed_document(document):
         raise RecoveryRequired("prepared batch journal transition is unauthenticated")
     encoded = (json.dumps(document, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(encoded) > MAX_JOURNAL_READ:
+        raise RecoveryRequired("prepared batch journal exceeds its bounded size")
     try:
-        current, _ = read_at(root_fd, journal_name)
+        current, _ = read_at(root_fd, journal_name, MAX_JOURNAL_READ)
     except Exception as error:
         raise RecoveryRequired("prepared batch journal disappeared before transition") from error
     if current != expected_data:
@@ -1993,7 +1929,7 @@ def persist_batch_journal(root_fd, journal_name, expected_data, document):
             rename_exchange(root_fd, temp, journal_name)
             temp = None
             raise RecoveryRequired("prepared batch journal owner changed during transition")
-        observed, _ = read_at(root_fd, journal_name)
+        observed, _ = read_at(root_fd, journal_name, MAX_JOURNAL_READ)
         if observed != encoded:
             raise RecoveryRequired("prepared batch journal transition was not published exactly")
         os.unlink(temp, dir_fd=root_fd)
@@ -2010,6 +1946,379 @@ def persist_batch_journal(root_fd, journal_name, expected_data, document):
         cleanup_temp(root_fd, temp)
 
 
+def target_matches_preimage_content(parent, name, expected):
+    if not isinstance(expected, dict):
+        return False
+    if expected.get("kind") == "absent":
+        try:
+            stat_at(parent, name)
+            return False
+        except FileNotFoundError:
+            return True
+    if expected.get("kind") != "file":
+        return False
+    try:
+        data, _ = read_at(parent, name)
+    except FileNotFoundError:
+        return False
+    if expected.get("size") is not None and len(data) != expected.get("size"):
+        return False
+    if hashlib.sha256(data).hexdigest() != expected.get("sha256"):
+        return False
+    encoded = expected.get("bytes")
+    if isinstance(encoded, str):
+        try:
+            return data == base64.b64decode(encoded, validate=True)
+        except Exception:
+            return False
+    return True
+
+
+def same_preimage_metadata(left, right):
+    if not isinstance(left, dict) or not isinstance(right, dict) or left.get("kind") != right.get("kind"):
+        return False
+    keys = ("kind", "dev", "ino", "size", "sha256")
+    return all(left.get(key) == right.get(key) for key in keys)
+
+
+def restored_target_descriptor(parent, name, expected):
+    if expected.get("kind") == "absent":
+        if not target_matches_preimage_content(parent, name, expected):
+            raise RecoveryRequired("prepared batch rollback preimage is not restored")
+        return {"kind": "absent"}
+    try:
+        data, info = read_at(parent, name)
+    except FileNotFoundError as error:
+        raise RecoveryRequired("prepared batch rollback preimage is missing") from error
+    if not target_matches_preimage_content(parent, name, expected):
+        raise RecoveryRequired("prepared batch rollback preimage bytes changed")
+    return {"kind": "file", "dev": info.st_dev, "ino": info.st_ino, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def cleanup_rollback_temp(parent, name, expected, alternate=None):
+    if not isinstance(name, str):
+        return
+    try:
+        data, info = read_at(parent, name)
+    except FileNotFoundError:
+        return
+    if expected.get("kind") not in ("absent", "file"):
+        raise RecoveryRequired("prepared batch rollback found an unexpected temporary entry")
+    receipt = {"dev": info.st_dev, "ino": info.st_ino, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    expected_match = expected.get("kind") == "file" and same_identity(info, expected) and receipt["size"] == expected.get("size") and receipt["sha256"] == expected.get("sha256")
+    alternate_match = (isinstance(alternate, dict) and same_identity(info, alternate)
+        and receipt["size"] == alternate.get("size") and receipt["sha256"] == alternate.get("sha256"))
+    if not expected_match and not alternate_match:
+        raise RecoveryRequired("prepared batch rollback temporary entry changed")
+    if not remove_exact_regular(parent, name, receipt):
+        raise RecoveryRequired("prepared batch rollback temporary cleanup could not be proven")
+
+
+def mark_batch_rolling_back(root_fd, journal_name, batch_id):
+    document, _, raw = read_batch_journal(root_fd, journal_name, batch_id)
+    if document.get("state") in ("rolling_back", "rolled_back"):
+        return
+    if document.get("state") != "prepared":
+        raise RecoveryRequired("prepared batch rollback requires a prepared journal")
+    group = [candidate for candidate in prepared_writes.values() if candidate.get("batch_id") == batch_id and candidate.get("batch_journal") == journal_name]
+    if len(group) != len(document["entries"]):
+        raise RecoveryRequired("prepared batch rollback metadata is incomplete")
+    by_index = {candidate.get("batch_index"): candidate for candidate in group}
+    entries = []
+    for index, entry in enumerate(document["entries"]):
+        candidate = by_index.get(index)
+        if candidate is None or candidate.get("path") != entry.get("path") or not isinstance(candidate.get("lock_token"), str):
+            raise RecoveryRequired("prepared batch rollback binding changed")
+        expected = candidate.get("expected")
+        if not isinstance(expected, dict) or expected.get("kind") not in ("absent", "file"):
+            raise RecoveryRequired("prepared batch rollback preimage metadata is invalid")
+        backup = candidate.get("backup")
+        backup_descriptor = candidate.get("backup_descriptor")
+        temp = candidate.get("temp")
+        rollback_state = "pending"
+        rollback_temp = backup
+        rollback_temp_descriptor = backup_descriptor
+        if candidate.get("published") is not True and isinstance(temp, str):
+            rollback_state = "aborting"
+            rollback_temp = temp
+            rollback_temp_descriptor = candidate.get("postimage")
+        if expected.get("kind") == "file" and rollback_state == "pending" and (not isinstance(backup, str) or not same_preimage_metadata(backup_descriptor, expected)):
+            raise RecoveryRequired("prepared batch rollback backup is unavailable")
+        entries.append({
+            "path": entry["path"], "index": entry["index"], "size": entry["size"], "sha256": entry["sha256"],
+            "expected": expected, "postimage": candidate.get("postimage"), "token": candidate["lock_token"],
+            "rollback_state": rollback_state, "rollback_temp": rollback_temp, "rollback_temp_descriptor": rollback_temp_descriptor, "rollback_postimage_descriptor": candidate.get("postimage"),
+        })
+        if expected.get("kind") == "absent" and rollback_state == "pending":
+            entries[-1]["rollback_temp"] = bounded_name("cas-stage", candidate["path"], ".tmp", nonce=False)
+            entries[-1]["rollback_temp_descriptor"] = candidate.get("postimage")
+    next_document = signed_document({"schema_version": 1, "batch_id": batch_id, "state": "rolling_back", "root_binding": CURRENT_ROOT_BINDING, "entries": entries})
+    persist_batch_journal(root_fd, journal_name, raw, next_document)
+
+
+def mark_batch_entry_rolled_back(root_fd, journal_name, batch_id, token):
+    document, _, raw = read_batch_journal(root_fd, journal_name, batch_id)
+    if document.get("state") not in ("rolling_back", "rolled_back"):
+        raise RecoveryRequired("prepared batch rollback journal is not active")
+    entries = [dict(entry) for entry in document["entries"]]
+    found = False
+    for entry in entries:
+        if entry.get("token") == token:
+            expected = entry.get("expected")
+            postimage = entry.get("postimage")
+            parent, name = parent_for(root_fd, entry["path"], False)
+            try:
+                restored = restored_target_descriptor(parent, name, expected)
+            finally:
+                os.close(parent)
+            entry["restored"] = restored
+            entry["rollback_state"] = "rolled_back"
+            # Persist the restored descriptor while the displaced postimage is
+            # still tracked. A crash can then resume exact cleanup without
+            # accepting content-only or deletion-only evidence.
+            next_document = signed_document({"schema_version": 1, "batch_id": batch_id, "state": document.get("state"), "root_binding": CURRENT_ROOT_BINDING, "entries": entries})
+            persist_batch_journal(root_fd, journal_name, raw, next_document)
+            document, raw = next_document, json.dumps(next_document, separators=(",", ":")).encode("utf-8") + b"\n"
+            parent, name = parent_for(root_fd, entry["path"], False)
+            try:
+                cleanup_rollback_temp(parent, entry.get("rollback_temp"), expected, postimage)
+            finally:
+                os.close(parent)
+            entry["rollback_temp"] = None
+            entry["rollback_temp_descriptor"] = None
+            entry["rollback_postimage_descriptor"] = None
+            found = True
+            break
+    if not found:
+        raise RecoveryRequired("prepared batch rollback token is not bound to the journal")
+    next_document = signed_document({"schema_version": 1, "batch_id": batch_id, "state": document.get("state"), "root_binding": CURRENT_ROOT_BINDING, "entries": entries})
+    persist_batch_journal(root_fd, journal_name, raw, next_document)
+
+
+def mark_batch_rollback_complete(root_fd, journal_name, batch_id):
+    document, _, raw = read_batch_journal(root_fd, journal_name, batch_id)
+    if document.get("state") in ("rolled_back", "finalizing"):
+        return
+    if document.get("state") != "rolling_back" or any(entry.get("rollback_state") != "rolled_back" for entry in document["entries"]):
+        raise RecoveryRequired("prepared batch rollback is incomplete")
+    for entry in document["entries"]:
+        parent, name = parent_for(root_fd, entry["path"], False)
+        try:
+            if not target_matches_restored(parent, name, entry.get("expected"), entry.get("restored")):
+                raise RecoveryRequired("prepared batch rollback preimage changed before completion")
+            cleanup_rollback_temp(parent, entry.get("rollback_temp"), entry.get("expected"), entry.get("postimage"))
+        finally:
+            os.close(parent)
+    next_document = signed_document({"schema_version": 1, "batch_id": batch_id, "state": "rolled_back", "root_binding": CURRENT_ROOT_BINDING, "entries": document["entries"]})
+    persist_batch_journal(root_fd, journal_name, raw, next_document)
+
+
+def mark_batch_rollback_finalizing(root_fd, journal_name, batch_id):
+    document, _, raw = read_batch_journal(root_fd, journal_name, batch_id)
+    if document.get("state") == "finalizing":
+        return
+    if document.get("state") != "rolled_back":
+        raise RecoveryRequired("prepared batch finalization requires durable rollback")
+    entries = [dict(entry) for entry in document["entries"]]
+    for entry in entries:
+        if entry.get("rollback_state") != "rolled_back" or not isinstance(entry.get("restored"), dict):
+            raise RecoveryRequired("prepared batch finalization rollback proof is incomplete")
+        parent, name = parent_for(root_fd, entry["path"], False)
+        try:
+            if not target_matches_restored(parent, name, entry.get("expected"), entry.get("restored")):
+                raise RecoveryRequired("prepared batch finalization found a changed restored target")
+            cleanup_rollback_temp(parent, entry.get("rollback_temp"), entry.get("expected"), entry.get("postimage"))
+        finally:
+            os.close(parent)
+        entry["release_state"] = "pending"
+    next_document = signed_document({"schema_version": 1, "batch_id": batch_id, "state": "finalizing", "root_binding": CURRENT_ROOT_BINDING, "entries": entries})
+    persist_batch_journal(root_fd, journal_name, raw, next_document)
+
+
+def target_matches_restored(parent, name, expected, restored):
+    if not target_matches_preimage_content(parent, name, expected):
+        return False
+    if expected.get("kind") == "absent":
+        return isinstance(restored, dict) and restored.get("kind") == "absent"
+    if isinstance(restored, dict) and restored.get("kind") == "file":
+        return target_matches_descriptor(parent, name, restored)
+    return False
+
+
+def rollback_prepared_target(parent, name, path, expected, postimage, rollback_temp, rollback_temp_descriptor=None):
+    if not isinstance(expected, dict) or expected.get("kind") not in ("absent", "file") or not isinstance(postimage, dict):
+        raise RecoveryRequired("prepared write rollback metadata is invalid")
+    if expected.get("kind") == "absent":
+        if not target_matches_descriptor(parent, name, postimage):
+            raise RecoveryRequired("prepared write rollback target changed before exact removal")
+        if not isinstance(rollback_temp, str) or rollback_temp != bounded_name("cas-stage", path, ".tmp", nonce=False):
+            if not remove_exact_regular(parent, name, postimage):
+                raise RecoveryRequired("prepared write rollback removal could not be proven")
+            cleanup_rollback_temp(parent, rollback_temp, expected, postimage)
+            return
+        try:
+            rename_noreplace(parent, name, rollback_temp)
+        except FileExistsError as error:
+            raise RecoveryRequired("prepared write rollback stage changed before exact removal") from error
+        moved_data, moved_info = read_at(parent, rollback_temp)
+        if not same_identity(moved_info, postimage) or len(moved_data) != postimage.get("size") or hashlib.sha256(moved_data).hexdigest() != postimage.get("sha256"):
+            raise RecoveryRequired("prepared write rollback moved postimage changed")
+        fsync_regular(parent)
+        return
+    if not target_matches_descriptor(parent, name, postimage):
+        raise RecoveryRequired("prepared write rollback target changed before exact replacement")
+    stage = rollback_temp
+    if not isinstance(stage, str):
+        raise RecoveryRequired("prepared write rollback backup name is unavailable")
+    try:
+        try:
+            staged, stage_info = read_at(parent, stage)
+        except FileNotFoundError:
+            if rollback_temp_descriptor is not None:
+                raise RecoveryRequired("prepared write rollback backup is missing")
+            encoded = expected.get("bytes")
+            if not isinstance(encoded, str):
+                raise RecoveryRequired("prepared write rollback backup is missing")
+            try:
+                before = base64.b64decode(encoded, validate=True)
+            except Exception as error:
+                raise RecoveryRequired("prepared write rollback backup bytes are invalid") from error
+            write_named_temp(parent, stage, before)
+            staged, stage_info = read_at(parent, stage)
+        if (isinstance(rollback_temp_descriptor, dict) and not same_identity(stage_info, rollback_temp_descriptor)):
+            raise RecoveryRequired("prepared write rollback backup identity changed")
+        if (len(staged) != expected.get("size") or hashlib.sha256(staged).hexdigest() != expected.get("sha256")):
+
+
+            raise RecoveryRequired("prepared write rollback backup changed")
+        committed, _ = conditional_exchange_replace(parent, name, stage, postimage, expected.get("sha256"), expected.get("size"), retain_displaced=rollback_temp.startswith("cas-stage-"))
+        if not committed and not target_matches_preimage_content(parent, name, expected):
+            raise RecoveryRequired("prepared write rollback replacement was not committed")
+        stage = None
+    finally:
+        # Keep the tracked backup on any uncertain exchange result; recovery
+        # owns the durable residue and may retry its exact CAS.
+        pass
+    fsync_regular(parent)
+
+
+def recover_rolled_back_batch(root_fd, journal_name, batch_id, document):
+    entries = document["entries"]
+    finalizing = document.get("state") == "finalizing"
+    if finalizing and any(entry.get("rollback_state") != "rolled_back" for entry in entries):
+        raise RecoveryRequired("prepared batch finalizing rollback state is incomplete")
+    states = []
+    try:
+        for entry in entries:
+            path = entry.get("path")
+            expected = entry.get("expected")
+            postimage = entry.get("postimage")
+            token = entry.get("token")
+            if (not isinstance(path, str) or not isinstance(expected, dict) or expected.get("kind") not in ("absent", "file")
+                    or not isinstance(postimage, dict) or not isinstance(token, str)
+                    or entry.get("rollback_state") not in ("pending", "aborting", "rolled_back")):
+                raise RecoveryRequired("prepared batch rollback journal entry is invalid")
+            parent, name = parent_for(root_fd, path, False)
+            lock_name = bounded_name("cas-lock", path, ".lock", nonce=False)
+            stage_name = bounded_name("cas-stage", path, ".tmp", nonce=False)
+            try:
+                try:
+                    lock_data, lock_info, owner = read_lock_observed(parent, lock_name)
+                except FileNotFoundError:
+                    lock_data = lock_info = owner = None
+                if owner is not None:
+                    if (not verify_signed_document(owner) or owner.get("root_binding") != CURRENT_ROOT_BINDING
+                            or owner.get("token") != token or owner.get("batch_id") != batch_id
+                            or owner.get("batch_journal") != journal_name or owner.get("batch_index") != entry.get("index")
+                            or owner.get("batch_size") != len(entries) or owner.get("path") != path
+                            or owner.get("stage") != stage_name or owner.get("operation") != "write_atomic"
+                            or not same_preimage_metadata(owner.get("expected"), expected) or owner.get("postimage") != postimage):
+                        raise RecoveryRequired("prepared batch rollback lease identity changed")
+                elif not finalizing and entry.get("rollback_state") != "rolled_back":
+                    raise RecoveryRequired("prepared batch rollback lease is missing")
+                stage_exists = False
+                try:
+                    stage_data, stage_info = read_at(parent, stage_name)
+                    stage_exists = True
+                except FileNotFoundError:
+                    stage_data = stage_info = None
+                if stage_exists:
+                    stage_receipt = {"dev": stage_info.st_dev, "ino": stage_info.st_ino, "size": len(stage_data), "sha256": hashlib.sha256(stage_data).hexdigest()}
+                    backup_descriptor = entry.get("rollback_temp_descriptor")
+                    displaced_descriptor = entry.get("rollback_postimage_descriptor") or postimage
+                    target_restored = target_matches_preimage_content(parent, name, expected)
+                    stage_is_backup = (isinstance(backup_descriptor, dict) and same_identity(stage_info, backup_descriptor)
+                        and stage_receipt["size"] == backup_descriptor.get("size") and stage_receipt["sha256"] == backup_descriptor.get("sha256"))
+                    stage_is_backup_content = (backup_descriptor is None and expected.get("kind") == "file" and stage_receipt["size"] == expected.get("size")
+                        and stage_receipt["sha256"] == expected.get("sha256"))
+                    stage_is_backup = stage_is_backup or stage_is_backup_content
+                    stage_is_displaced = (isinstance(displaced_descriptor, dict) and same_identity(stage_info, displaced_descriptor)
+                        and stage_receipt["size"] == displaced_descriptor.get("size") and stage_receipt["sha256"] == displaced_descriptor.get("sha256"))
+                    if target_restored and stage_is_displaced:
+                        if entry.get("rollback_state") == "rolled_back":
+                            if not remove_exact_regular(parent, stage_name, stage_receipt):
+                                raise RecoveryRequired("prepared batch rollback displaced cleanup could not be proven")
+                            fsync_regular(parent)
+                    elif not target_restored and not stage_is_backup:
+                        raise RecoveryRequired("prepared batch rollback stage residue changed")
+                    elif finalizing:
+                        raise RecoveryRequired("prepared batch finalizing state has an unexpected backup")
+                else:
+                    target_restored = target_matches_preimage_content(parent, name, expected)
+                if entry.get("rollback_state") in ("pending", "aborting") and target_restored and not stage_exists:
+                    raise RecoveryRequired("prepared batch rollback target has no durable stage proof")
+                if entry.get("rollback_state") == "pending" and target_restored and stage_exists and not stage_is_displaced:
+                    raise RecoveryRequired("prepared batch rollback target has an unexpected stage proof")
+                rollback_expected = expected
+                if owner is not None and isinstance(owner.get("expected"), dict) and "bytes" in owner.get("expected"):
+                    rollback_expected = owner.get("expected")
+                if not same_preimage_metadata(rollback_expected, expected):
+                    raise RecoveryRequired("prepared batch rollback lease preimage metadata changed")
+                if entry.get("rollback_state") != "rolled_back":
+                    if not target_matches_preimage_content(parent, name, expected):
+                        if owner is None:
+                            raise RecoveryRequired("prepared batch rollback target is unavailable")
+                        rollback_prepared_target(parent, name, path, rollback_expected, postimage, entry.get("rollback_temp"), entry.get("rollback_temp_descriptor"))
+                    entry["restored"] = restored_target_descriptor(parent, name, expected)
+                    entry["rollback_state"] = "rolled_back"
+                    entry["rollback_temp"] = None
+                    entry["rollback_temp_descriptor"] = None
+                    entry["rollback_postimage_descriptor"] = None
+                    current, _ = read_at(root_fd, journal_name, MAX_JOURNAL_READ)
+                    next_document = signed_document({"schema_version": 1, "batch_id": batch_id, "state": document.get("state"), "root_binding": CURRENT_ROOT_BINDING, "entries": entries})
+                    persist_batch_journal(root_fd, journal_name, current, next_document)
+                    document = next_document
+                if not target_matches_restored(parent, name, expected, entry.get("restored")):
+                    raise RecoveryRequired("prepared batch rollback preimage changed")
+                cleanup_rollback_temp(parent, entry.get("rollback_temp"), expected, postimage)
+                if entry.get("rollback_temp") is not None or entry.get("rollback_temp_descriptor") is not None or entry.get("rollback_postimage_descriptor") is not None:
+                    entry["rollback_temp"] = None
+                    entry["rollback_temp_descriptor"] = None
+                    entry["rollback_postimage_descriptor"] = None
+                    current, _ = read_at(root_fd, journal_name, MAX_JOURNAL_READ)
+                    next_document = signed_document({"schema_version": 1, "batch_id": batch_id, "state": document.get("state"), "root_binding": CURRENT_ROOT_BINDING, "entries": entries})
+                    persist_batch_journal(root_fd, journal_name, current, next_document)
+                    document = next_document
+                states.append({"entry": entry, "parent": parent, "name": name, "lock": lock_name, "token": token if owner is not None else None})
+                parent = None
+            finally:
+                if parent is not None:
+                    os.close(parent)
+        if not finalizing:
+            mark_batch_rollback_complete(root_fd, journal_name, batch_id)
+            mark_batch_rollback_finalizing(root_fd, journal_name, batch_id)
+        for state in states:
+            if state["token"] is not None:
+                if not target_matches_restored(state["parent"], state["name"], state["entry"].get("expected"), state["entry"].get("restored")):
+                    raise RecoveryRequired("prepared batch rollback preimage changed before lease release")
+                release_batch_lease(state["parent"], state["lock"], state["token"])
+        remove_batch_journal(root_fd, journal_name, batch_id)
+        RECOVERED_BATCH_IDS.add(batch_id)
+        return {"ok": True, "recovered": True}
+    finally:
+        for state in states:
+            os.close(state["parent"])
+
 def mark_batch_finalizing(root_fd, journal_name, batch_id, states):
     document, _, raw = read_batch_journal(root_fd, journal_name, batch_id)
     if document.get("state") == "finalizing":
@@ -2018,14 +2327,22 @@ def mark_batch_finalizing(root_fd, journal_name, batch_id, states):
     for state in states:
         if not target_matches_descriptor(state["parent"], state["name"], state["postimage"]):
             raise RecoveryRequired("prepared batch cannot finalize before postimage verification")
-        try:
-            stat_at(state["parent"], state["stage"])
-        except FileNotFoundError:
-            pass
+        backup = state.get("backup")
+        if backup is not None:
+            if backup != state.get("stage") or not target_matches_descriptor(state["parent"], backup, state.get("backup_descriptor")):
+                raise RecoveryRequired("prepared batch backup changed before finalization")
         else:
-            raise RecoveryRequired("prepared batch cannot finalize with a live stage")
+            try:
+                stat_at(state["parent"], state["stage"])
+            except FileNotFoundError:
+                pass
+            else:
+                raise RecoveryRequired("prepared batch cannot finalize with a live stage")
         entry = dict(state["entry"])
         entry["postimage"] = state["postimage"]
+        if backup is not None:
+            entry["backup"] = backup
+            entry["backup_descriptor"] = state.get("backup_descriptor")
         entries.append(entry)
     if len(entries) != len(document["entries"]):
         raise RecoveryRequired("prepared batch finalization metadata is incomplete")
@@ -2037,16 +2354,20 @@ def mark_batch_finalizing(root_fd, journal_name, batch_id, states):
     persist_batch_journal(root_fd, journal_name, raw, next_document)
 
 
-def remove_batch_journal(root_fd, journal_name, batch_id, allow_prepared=False):
+def remove_batch_journal(root_fd, journal_name, batch_id, allow_prepared=False, allow_missing=False):
     try:
-        data, info = read_at(root_fd, journal_name)
+        data, info = read_at(root_fd, journal_name, MAX_JOURNAL_READ)
+    except FileNotFoundError:
+        if allow_missing:
+            return
+        raise RecoveryRequired("prepared batch journal is missing during cleanup")
     except Exception as error:
         raise RecoveryRequired("prepared batch journal is unavailable during cleanup") from error
     try:
         document = json.loads(data.decode("utf-8"))
     except Exception as error:
         raise RecoveryRequired("prepared batch journal became invalid") from error
-    if not verify_signed_document(document) or not isinstance(document, dict) or document.get("root_binding") != CURRENT_ROOT_BINDING or document.get("batch_id") != batch_id or document.get("state") not in ("prepared", "finalizing"):
+    if not verify_signed_document(document) or not isinstance(document, dict) or document.get("root_binding") != CURRENT_ROOT_BINDING or document.get("batch_id") != batch_id or document.get("state") not in ("prepared", "rolling_back", "rolled_back", "finalizing"):
         raise RecoveryRequired("prepared batch journal identity changed before cleanup")
     if document.get("state") == "prepared" and not allow_prepared:
         raise RecoveryRequired("prepared batch journal cannot be removed before finalization")
@@ -2065,6 +2386,71 @@ def remove_batch_journal(root_fd, journal_name, batch_id, allow_prepared=False):
                     except FileNotFoundError:
                         continue
                     raise RecoveryRequired("prepared batch journal still has owned residue")
+        finally:
+            for parent in parents:
+                os.close(parent)
+    rollback_journal = (document.get("state") in ("rolling_back", "rolled_back") or (document.get("state") == "finalizing" and all(isinstance(candidate, dict) and "rollback_state" in candidate for candidate in document.get("entries", []))))
+    if rollback_journal:
+        parents = []
+        try:
+            for entry in document.get("entries", []):
+                path = entry.get("path")
+                expected_preimage = entry.get("expected")
+                if not isinstance(path, str) or not isinstance(expected_preimage, dict):
+                    raise RecoveryRequired("prepared batch rollback journal entry is invalid during cleanup")
+                parent, name = parent_for(root_fd, path, False)
+                parents.append(parent)
+                if not target_matches_restored(parent, name, expected_preimage, entry.get("restored")):
+                    raise RecoveryRequired("prepared batch rollback target is not proven restored during cleanup")
+                for residue in (bounded_name("cas-lock", path, ".lock", nonce=False), bounded_name("cas-stage", path, ".tmp", nonce=False)):
+                    try:
+                        stat_at(parent, residue)
+                    except FileNotFoundError:
+                        continue
+                    raise RecoveryRequired("prepared batch rollback still has owned residue")
+                cleanup_rollback_temp(parent, entry.get("rollback_temp"), expected_preimage, entry.get("postimage"))
+        finally:
+            for parent in parents:
+                os.close(parent)
+    if document.get("state") == "finalizing" and not rollback_journal:
+        parents = []
+        try:
+            for entry in document.get("entries", []):
+                path = entry.get("path")
+                if not isinstance(path, str):
+                    raise RecoveryRequired("prepared batch finalizing entry path is invalid")
+                parent, name = parent_for(root_fd, path, False)
+                parents.append(parent)
+                lock_name = bounded_name("cas-lock", path, ".lock", nonce=False)
+                try:
+                    stat_at(parent, lock_name)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise RecoveryRequired("prepared batch finalizing lease remains present")
+                stage_name = bounded_name("cas-stage", path, ".tmp", nonce=False)
+                if not target_matches_descriptor(parent, name, entry.get("postimage")):
+                    raise RecoveryRequired("prepared batch finalizing target publication is not proven")
+                backup_name = entry.get("backup")
+                if backup_name is not None:
+                    if backup_name != stage_name:
+                        raise RecoveryRequired("prepared batch finalizing backup binding changed")
+                    try:
+                        backup_data, backup_info = read_at(parent, backup_name)
+                    except FileNotFoundError:
+                        backup_data = backup_info = None
+                    if backup_info is not None and not target_matches_descriptor(parent, backup_name, entry.get("backup_descriptor")):
+                        raise RecoveryRequired("prepared batch finalizing backup binding changed")
+                    if backup_info is not None and not remove_exact_regular(parent, backup_name, {"dev": backup_info.st_dev, "ino": backup_info.st_ino, "size": len(backup_data), "sha256": hashlib.sha256(backup_data).hexdigest()}):
+                        raise RecoveryRequired("prepared batch finalizing backup cleanup could not be proven")
+                    fsync_regular(parent)
+                else:
+                    try:
+                        stat_at(parent, stage_name)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise RecoveryRequired("prepared batch finalizing stage remains present")
         finally:
             for parent in parents:
                 os.close(parent)
@@ -2112,6 +2498,8 @@ def recover_prepared_batch(root_fd, journal_name, batch_id):
     if batch_id not in AUTHORIZED_BATCH_IDS:
         raise RecoveryRequired("prepared batch identity is not live in this host")
     document, _, _ = read_batch_journal(root_fd, journal_name, batch_id)
+    if document.get("state") in ("rolling_back", "rolled_back") or (document.get("state") == "finalizing" and all(isinstance(candidate, dict) and "rollback_state" in candidate for candidate in document.get("entries", []))):
+        return recover_rolled_back_batch(root_fd, journal_name, batch_id, document)
     entries = document["entries"]
     finalizing = document.get("state") == "finalizing"
     states = []
@@ -2125,6 +2513,8 @@ def recover_prepared_batch(root_fd, journal_name, batch_id):
                 lock_data, lock_info, owner = read_lock_observed(parent, lock_name)
             except FileNotFoundError:
                 lock_data = lock_info = owner = None
+            backup = entry.get("backup")
+            backup_descriptor = entry.get("backup_descriptor")
             if owner is not None:
                 if not verify_signed_document(owner):
                     raise RecoveryRequired("prepared batch lease authentication failed")
@@ -2148,6 +2538,10 @@ def recover_prepared_batch(root_fd, journal_name, batch_id):
                     raise RecoveryRequired("prepared batch postimage metadata changed")
                 if finalizing and (not isinstance(postimage, dict) or entry.get("postimage") != postimage):
                     raise RecoveryRequired("prepared batch finalizing postimage metadata changed")
+                backup = owner.get("backup") if owner is not None else entry.get("backup")
+                backup_descriptor = owner.get("backup_descriptor") if owner is not None else entry.get("backup_descriptor")
+                if finalizing and entry.get("backup") is not None and (backup != entry.get("backup") or backup_descriptor != entry.get("backup_descriptor")):
+                    raise RecoveryRequired("prepared batch finalizing backup metadata changed")
             else:
                 if not finalizing or not isinstance(entry.get("postimage"), dict):
                     # A durable prepared group must retain every exact owner
@@ -2170,11 +2564,20 @@ def recover_prepared_batch(root_fd, journal_name, batch_id):
             stage_expected = (stage_exists and expected is not None and expected.get("kind") == "file"
                 and same_identity(stage_info, expected) and (expected.get("size") is None or len(stage_data) == expected.get("size")) and same_digest(stage_data, expected))
             if finalizing and stage_exists:
-                raise RecoveryRequired("prepared batch finalizing state has an unexpected stage")
+                backup_name = entry.get("backup")
+                backup_descriptor = entry.get("backup_descriptor")
+                if (backup_name != stage_name or not target_published
+                        or not target_matches_descriptor(parent, stage_name, backup_descriptor)):
+                    raise RecoveryRequired("prepared batch finalizing state has an unexpected backup")
+                backup_data, backup_info = read_at(parent, stage_name)
+                if not remove_exact_regular(parent, stage_name, {"dev": backup_info.st_dev, "ino": backup_info.st_ino, "size": len(backup_data), "sha256": hashlib.sha256(backup_data).hexdigest()}):
+                    raise RecoveryRequired("prepared batch finalizing backup cleanup could not be proven")
+                fsync_regular(parent)
+                stage_exists = False
             if target_published:
                 if stage_exists and not stage_expected:
                     raise RecoveryRequired("prepared batch published target has an ambiguous stage")
-                states.append({"entry": entry, "parent": parent, "name": name, "lock": lock_name, "stage": stage_name, "token": token, "expected": expected, "postimage": postimage, "state": "published", "lock_data": lock_data, "lock_info": lock_info})
+                states.append({"entry": entry, "parent": parent, "name": name, "lock": lock_name, "stage": stage_name, "token": token, "expected": expected, "postimage": postimage, "backup": backup, "backup_descriptor": backup_descriptor, "state": "published", "lock_data": lock_data, "lock_info": lock_info})
             elif not finalizing and target_prepared and stage_desired and token is not None:
                 states.append({"entry": entry, "parent": parent, "name": name, "lock": lock_name, "stage": stage_name, "token": token, "expected": expected, "postimage": postimage, "state": "prepared", "lock_data": lock_data, "lock_info": lock_info})
             else:
@@ -2210,19 +2613,12 @@ def recover_prepared_batch(root_fd, journal_name, batch_id):
                         fsync_regular(state["parent"])
                         verify_recovery_target(state)
                     else:
-                        conditional_exchange_replace(state["parent"], state["name"], state["stage"], expected, state["postimage"]["sha256"], state["postimage"]["size"])
+                        conditional_exchange_replace(state["parent"], state["name"], state["stage"], expected, state["postimage"]["sha256"], state["postimage"]["size"], retain_displaced=True)
                         fsync_regular(state["parent"])
                     state["state"] = "published"
-                try:
-                    stat_at(state["parent"], state["stage"])
-                except FileNotFoundError:
-                    pass
-                else:
-                    if state["expected"] is None or state["expected"].get("kind") != "file":
-                        raise RecoveryRequired("prepared batch stage cleanup is ambiguous")
-                    if not remove_exact_regular(state["parent"], state["stage"], state["expected"]):
-                        raise RecoveryRequired("prepared batch stage cleanup could not be proven")
-                    fsync_regular(state["parent"])
+                    if expected.get("kind") == "file":
+                        state["backup"] = state["stage"]
+                        state["backup_descriptor"] = {"kind": "file", "dev": expected.get("dev"), "ino": expected.get("ino"), "size": expected.get("size"), "sha256": expected.get("sha256")}
             for state in states:
                 if not target_matches_descriptor(state["parent"], state["name"], state["postimage"]):
                     raise RecoveryRequired("prepared batch postimage verification failed")
@@ -2240,6 +2636,47 @@ def recover_prepared_batch(root_fd, journal_name, batch_id):
             os.close(state["parent"])
 
 
+def preimage_snapshot_size(expected):
+    if not isinstance(expected, dict) or expected.get("kind") == "absent":
+        return 0
+    encoded = expected.get("bytes")
+    if not isinstance(encoded, str):
+        raise LimitError("prepared batch rollback snapshot bytes are unavailable")
+    try:
+        return len(base64.b64decode(encoded, validate=True))
+    except Exception as error:
+        raise LimitError("prepared batch rollback snapshot bytes are invalid") from error
+
+def preflight_batch_preimages(root_fd, manifest):
+    if not isinstance(manifest, list) or not manifest:
+        raise ValueError("prepared batch manifest is invalid")
+    total = 0
+    for item in manifest:
+        path = item.get("path") if isinstance(item, dict) else None
+        if not isinstance(path, str):
+            raise ValueError("prepared batch manifest path is invalid")
+        parent = None
+        try:
+            try:
+                parent, name = parent_for(root_fd, path, False)
+                actual = preimage_snapshot(parent, name)
+            except FileNotFoundError:
+                actual = {"kind": "absent"}
+            declared = item.get("expected")
+            if not isinstance(declared, dict) or declared.get("kind") != actual.get("kind"):
+                raise RuntimeError("prepared batch target changed before preimage preflight")
+            if actual.get("kind") == "file":
+                if (actual.get("dev") != declared.get("dev") or actual.get("ino") != declared.get("ino")
+                        or actual.get("size") != declared.get("size") or actual.get("sha256") != declared.get("sha256")):
+                    raise RuntimeError("prepared batch target changed before preimage preflight")
+                total += actual.get("size", 0)
+                if total > MAX_BATCH_ROLLBACK:
+                    raise LimitError("prepared batch rollback snapshot exceeds its byte bound")
+        finally:
+            if parent is not None:
+                os.close(parent)
+    return total
+
 def prepare_write(payload):
     root_fd = 3
     op = payload.get("op")
@@ -2249,7 +2686,6 @@ def prepare_write(payload):
     path = payload.get("path")
     if not isinstance(path, str):
         raise ValueError("prepared write path is invalid")
-    parent, name = parent_for(root_fd, path, True)
     relative_path = "/".join(safe_segments(path))
     desired_sha = hashlib.sha256(data).hexdigest()
     batch_id = payload.get("batch_id")
@@ -2259,13 +2695,26 @@ def prepare_write(payload):
     grouped = batch_id is not None or batch_manifest is not None or batch_index is not None or batch_size is not None
     if grouped:
         validate_batch_manifest(batch_id, batch_manifest, path, data, batch_index, batch_size)
+        if batch_id is not None:
+            preflight_batch_preimages(root_fd, batch_manifest)
+    parent, name = parent_for(root_fd, path, True)
     # The lock is acquired before reading the target, so the returned preimage
     # and planned inode are one cooperating mutation transaction.
-    lock_expected = preimage_snapshot(parent, name)
-    lock_expected.pop("bytes", None)
+    try:
+        lock_expected = preimage_snapshot(parent, name)
+        lock_snapshot_bytes = preimage_snapshot_size(lock_expected)
+        lock_expected.pop("bytes", None)
+        if grouped and batch_id is not None:
+            prepared_snapshot_bytes = sum(preimage_snapshot_size(candidate.get("expected")) for candidate in prepared_writes.values() if candidate.get("batch_id") == batch_id)
+            if prepared_snapshot_bytes + lock_snapshot_bytes > MAX_BATCH_ROLLBACK:
+                raise LimitError("prepared batch rollback snapshot exceeds its byte bound")
+    except Exception:
+        os.close(parent)
+        raise
     lease = None
     temp_info = None
     lock_receipt = None
+    candidate_token = None
     try:
         lease, recovered, lock_name, stage_name = conditional_lock(
             parent, name, relative_path, lock_expected, desired_sha, "write_atomic" if op == "prepare_write_atomic" else "write_exclusive", {"batch_id": batch_id, "batch_index": batch_index, "batch_size": batch_size, "batch_journal": batch_journal_name(batch_id)} if grouped else None)
@@ -2273,7 +2722,12 @@ def prepare_write(payload):
             # Recovery may have published an earlier group prefix; capture the
             # exact post-recovery target before reacquiring this lease.
             lock_expected = preimage_snapshot(parent, name)
+            recovered_snapshot_bytes = preimage_snapshot_size(lock_expected)
             lock_expected.pop("bytes", None)
+            if grouped and batch_id is not None:
+                prepared_snapshot_bytes = sum(preimage_snapshot_size(candidate.get("expected")) for candidate in prepared_writes.values() if candidate.get("batch_id") == batch_id)
+                if prepared_snapshot_bytes + recovered_snapshot_bytes > MAX_BATCH_ROLLBACK:
+                    raise LimitError("prepared batch rollback snapshot exceeds its byte bound")
             lease, recovered, lock_name, stage_name = conditional_lock(
                 parent, name, relative_path, lock_expected, desired_sha, "write_atomic" if op == "prepare_write_atomic" else "write_exclusive", {"batch_id": batch_id, "batch_index": batch_index, "batch_size": batch_size, "batch_journal": batch_journal_name(batch_id)} if grouped else None)
             if recovered:
@@ -2319,6 +2773,7 @@ def prepare_write(payload):
         temp_info = stat_at(parent, temp)
         fsync_regular(parent)
         token = lease.get("token")
+        candidate_token = token
         prepared_writes[token] = {
             "parent": parent, "name": name, "path": path, "operation": op,
             "expected": expected, "temp": temp, "temp_info": temp_info,
@@ -2331,12 +2786,17 @@ def prepare_write(payload):
             "root_binding": CURRENT_ROOT_BINDING,
             "stage": stage_name,
             "postimage": {"dev": temp_info.st_dev, "ino": temp_info.st_ino, "size": len(data), "sha256": desired_sha},
+            "backup": stage_name if expected.get("kind") == "file" and grouped else None,
+            "backup_descriptor": {"kind": "file", "dev": expected.get("dev"), "ino": expected.get("ino"), "size": expected.get("size"), "sha256": expected.get("sha256")} if expected.get("kind") == "file" and grouped else None,
         }
         if grouped:
             conditional_kill(payload, "after_prepared_stage_before_journal")
             journal_manifest = [dict(item) for item in batch_manifest]
             journal_manifest[batch_index]["expected"] = {key: value for key, value in expected.items() if key != "bytes"}
             journal_manifest[batch_index]["postimage"] = prepared_writes[token]["postimage"]
+            if expected.get("kind") == "file":
+                journal_manifest[batch_index]["backup"] = stage_name
+                journal_manifest[batch_index]["backup_descriptor"] = {"kind": "file", "dev": expected.get("dev"), "ino": expected.get("ino"), "size": expected.get("size"), "sha256": expected.get("sha256")}
             ensure_batch_journal(root_fd, batch_id, journal_manifest, prepared_writes[token]["root_binding"])
             conditional_kill(payload, "after_prepared_batch_journal")
         # Persist the exact preimage and intended postimage while still
@@ -2352,6 +2812,8 @@ def prepare_write(payload):
                 except Exception: pass
             try: release_conditional_lock(parent, lock_name, lease.get("token"))
             except Exception: pass
+        if candidate_token is not None:
+            prepared_writes.pop(candidate_token, None)
         os.close(parent)
         raise
 
@@ -2377,11 +2839,18 @@ def ack_prepared_write(payload):
                 conditional_pre_ack_mutation(payload, candidate)
             finalizing_states = []
             for candidate in sorted(group, key=lambda item: item.get("batch_index", 0)):
-                finalizing_states.append({"entry": {"path": "/".join(safe_segments(candidate["path"])), "index": candidate["batch_index"], "size": candidate["size"], "sha256": candidate["sha256"]}, "parent": candidate["parent"], "name": candidate["name"], "stage": candidate["stage"], "postimage": candidate["postimage"]})
+                finalizing_states.append({"entry": {"path": "/".join(safe_segments(candidate["path"])), "index": candidate["batch_index"], "size": candidate["size"], "sha256": candidate["sha256"]}, "parent": candidate["parent"], "name": candidate["name"], "stage": candidate["stage"], "postimage": candidate["postimage"], "backup": candidate.get("backup"), "backup_descriptor": candidate.get("backup_descriptor")})
             mark_batch_finalizing(3, prepared["batch_journal"], batch_id, finalizing_states)
             for index, candidate in enumerate(finalizing_states):
                 owner = next(item for item in group if item.get("batch_index") == candidate["entry"]["index"])
                 verify_prepared_target(owner)
+                if owner.get("backup") is not None:
+                    if owner.get("backup") != owner.get("stage") or not target_matches_descriptor(owner["parent"], owner["backup"], owner.get("backup_descriptor")):
+                        raise RecoveryRequired("prepared batch ACK backup changed before cleanup")
+                    backup_data, backup_info = read_at(owner["parent"], owner["backup"])
+                    if not remove_exact_regular(owner["parent"], owner["backup"], {"dev": backup_info.st_dev, "ino": backup_info.st_ino, "size": len(backup_data), "sha256": hashlib.sha256(backup_data).hexdigest()}):
+                        raise RecoveryRequired("prepared batch ACK backup cleanup could not be proven")
+                    fsync_regular(owner["parent"])
                 release_batch_lease(candidate["parent"], owner["lock_name"], owner["lock_token"])
                 if index == 0:
                     conditional_kill(payload, "after_prepared_batch_first_lease_release")
@@ -2402,7 +2871,7 @@ def ack_prepared_write(payload):
         if owner.get("token") != token:
             raise RuntimeError("prepared write lease was replaced before acknowledgement")
         cleanup_temp(parent, prepared.get("backup"))
-        release_conditional_lock(parent, prepared["lock_name"], token)
+        release_batch_lease(parent, prepared["lock_name"], token)
         fsync_regular(parent)
         prepared_writes.pop(token, None)
         return {"ok": True, "acknowledged": True}
@@ -2448,41 +2917,35 @@ def rollback_prepared_write(payload):
                 or not isinstance(postimage.get("sha256"), str) or not isinstance(expected, dict)
                 or expected.get("kind") not in ("absent", "file")):
             raise RecoveryRequired("prepared write rollback metadata is invalid")
-        if prepared.get("rolled_back") is True:
+        batch_id = prepared.get("batch_id")
+        if batch_id is not None:
+            journal_name = prepared.get("batch_journal")
+            mark_batch_rolling_back(3, journal_name, batch_id)
+            document, _, _ = read_batch_journal(3, journal_name, batch_id)
+            entry = next((candidate for candidate in document["entries"] if candidate.get("token") == token), None)
+            if entry is None or entry.get("path") != prepared.get("path"):
+                raise RecoveryRequired("prepared write rollback token is not bound to the journal")
+            if entry.get("rollback_state") != "rolled_back":
+                rollback_prepared_target(parent, prepared["name"], prepared["path"], entry["expected"], entry["postimage"], entry.get("rollback_temp"), entry.get("rollback_temp_descriptor"))
+                fsync_regular(parent)
+                mark_batch_entry_rolled_back(3, journal_name, batch_id, token)
+            else:
+                if not target_matches_restored(parent, prepared["name"], entry.get("expected"), entry.get("restored")):
+                    raise RecoveryRequired("prepared write rollback restored target changed")
+            prepared["rolled_back"] = True
             return {"ok": True, "rolled_back": True}
-        if expected.get("kind") == "absent":
-            try:
-                current, current_info = read_at(parent, prepared["name"])
-            except FileNotFoundError:
-                prepared["rolled_back"] = True
-                return {"ok": True, "rolled_back": True}
-            if not target_matches_descriptor(parent, prepared["name"], postimage):
-                raise RecoveryRequired("prepared write rollback target changed before exact removal")
-            if not remove_exact_regular(parent, prepared["name"], postimage):
-                raise RecoveryRequired("prepared write rollback removal could not be proven")
-        else:
-            encoded = expected.get("bytes")
-            if not isinstance(encoded, str):
-                raise RecoveryRequired("prepared write rollback preimage bytes are unavailable")
-            try:
-                before = base64.b64decode(encoded, validate=True)
-            except Exception as error:
-                raise RecoveryRequired("prepared write rollback preimage bytes are invalid") from error
-            if not target_matches_descriptor(parent, prepared["name"], postimage):
-                raise RecoveryRequired("prepared write rollback target changed before exact replacement")
-            stage = write_named_temp(parent, bounded_name("prepared-rollback", prepared["path"], ".tmp"), before)
-            try:
-                desired_sha = hashlib.sha256(before).hexdigest()
-                committed, _ = conditional_exchange_replace(parent, prepared["name"], stage, postimage, desired_sha, len(before))
-                if not committed:
-                    raise RecoveryRequired("prepared write rollback replacement was not committed")
-                stage = None
-            finally:
-                if stage is not None:
-                    cleanup_temp(parent, stage)
+        if prepared.get("rolled_back") is True:
+            if not target_matches_preimage_content(parent, prepared["name"], expected):
+                raise RecoveryRequired("prepared write rollback restored target changed")
+            return {"ok": True, "rolled_back": True}
+        rollback_prepared_target(parent, prepared["name"], prepared["path"], expected, postimage, bounded_name("prepared-rollback", prepared["path"], ".tmp", nonce=False))
         fsync_regular(parent)
         prepared["rolled_back"] = True
         return {"ok": True, "rolled_back": True}
+    finally:
+        if token not in prepared_writes:
+            os.close(parent)
+
 
 def finalize_prepared_write(payload):
     token = payload.get("token")
@@ -2491,33 +2954,51 @@ def finalize_prepared_write(payload):
         return {"ok": True, "finalized": False}
     parent = prepared["parent"]
     try:
-        if prepared.get("rolled_back") is not True:
-            raise RecoveryRequired("prepared write finalization requires an exact rollback")
-        try:
-            lock_data, lock_info, owner = read_lock_observed(parent, prepared["lock_name"])
-        except FileNotFoundError as error:
-            raise RecoveryRequired("prepared write lease is unavailable during finalization") from error
-        if (not verify_signed_document(owner) or owner.get("token") != token
-                or owner.get("root_binding") != CURRENT_ROOT_BINDING):
-            raise RecoveryRequired("prepared write lease changed before finalization")
         expected = prepared.get("expected")
         if not isinstance(expected, dict) or expected.get("kind") not in ("absent", "file"):
             raise RecoveryRequired("prepared write finalization metadata is invalid")
-        if expected.get("kind") == "absent":
+        batch_id = prepared.get("batch_id")
+        if batch_id is not None:
+            journal_name = prepared.get("batch_journal")
+            document, _, _ = read_batch_journal(3, journal_name, batch_id)
+            if document.get("state") == "rolled_back":
+                mark_batch_rollback_finalizing(3, journal_name, batch_id)
+                document, _, _ = read_batch_journal(3, journal_name, batch_id)
+            if document.get("state") != "finalizing":
+                raise RecoveryRequired("prepared write finalization requires durable finalizing state")
+            entry = next((candidate for candidate in document["entries"] if candidate.get("token") == token), None)
+            if entry is None or entry.get("rollback_state") != "rolled_back":
+                raise RecoveryRequired("prepared write finalization rollback proof is missing")
+            if not target_matches_restored(parent, prepared["name"], entry.get("expected"), entry.get("restored")):
+                raise RecoveryRequired("prepared write finalization found a changed restored target")
             try:
-                read_at(parent, prepared["name"])
-            except FileNotFoundError:
-                pass
-            else:
-                raise RecoveryRequired("prepared write finalization found an unexpected target")
-        elif not preimage_matches(parent, prepared["name"], expected):
+                lock_data, lock_info, owner = read_lock_observed(parent, prepared["lock_name"])
+            except FileNotFoundError as error:
+                raise RecoveryRequired("prepared write lease is unavailable during finalization") from error
+            if (not verify_signed_document(owner) or owner.get("root_binding") != CURRENT_ROOT_BINDING
+                    or owner.get("token") != token or owner.get("batch_id") != batch_id
+                    or owner.get("batch_journal") != journal_name or owner.get("batch_index") != entry.get("index")
+                    or owner.get("batch_size") != len(document["entries"]) or owner.get("path") != entry.get("path")
+                    or not same_preimage_metadata(owner.get("expected"), entry.get("expected")) or owner.get("postimage") != entry.get("postimage")):
+                raise RecoveryRequired("prepared write lease changed before finalization")
+            cleanup_rollback_temp(parent, entry.get("rollback_temp"), entry.get("expected"), entry.get("postimage"))
+            release_batch_lease(parent, prepared["lock_name"], token)
+            fsync_regular(parent)
+            prepared_writes.pop(token, None)
+            if not any(candidate.get("batch_id") == batch_id for candidate in prepared_writes.values()):
+                remove_batch_journal(3, journal_name, batch_id)
+            return {"ok": True, "finalized": True}
+        if prepared.get("rolled_back") is not True:
+            raise RecoveryRequired("prepared write finalization requires an exact rollback")
+        if not target_matches_preimage_content(parent, prepared["name"], expected):
             raise RecoveryRequired("prepared write finalization found a changed preimage")
         cleanup_temp(parent, prepared.get("backup"))
-        release_conditional_lock(parent, prepared["lock_name"], prepared["lock_token"])
+        lock_data, lock_info, owner = read_lock_observed(parent, prepared["lock_name"])
+        if not verify_signed_document(owner) or owner.get("token") != token:
+            raise RecoveryRequired("prepared write lease changed before finalization")
+        release_batch_lease(parent, prepared["lock_name"], token)
         fsync_regular(parent)
         prepared_writes.pop(token, None)
-        if prepared.get("batch_id") is not None and not any(candidate.get("batch_id") == prepared.get("batch_id") for candidate in prepared_writes.values()):
-            remove_batch_journal(3, prepared["batch_journal"], prepared["batch_id"], True)
         return {"ok": True, "finalized": True}
     finally:
         if token not in prepared_writes:
@@ -2530,6 +3011,25 @@ def abort_prepared_write(payload):
         return {"ok": True, "aborted": False}
     parent = prepared["parent"]
     try:
+        if prepared.get("published") and prepared.get("batch_id") is not None and not prepared.get("quarantined"):
+            journal_name = prepared["batch_journal"]
+            try:
+                lock_data, lock_info, owner = read_lock_observed(parent, prepared["lock_name"])
+            except FileNotFoundError as error:
+                raise RecoveryRequired("prepared published lease is unavailable during rollback") from error
+            if (not verify_signed_document(owner) or owner.get("token") != token
+                    or owner.get("root_binding") != CURRENT_ROOT_BINDING):
+                raise RecoveryRequired("prepared published lease changed before rollback")
+            mark_batch_rolling_back(3, journal_name, prepared["batch_id"])
+            document, _, _ = read_batch_journal(3, journal_name, prepared["batch_id"])
+            entry = next((candidate for candidate in document["entries"] if candidate.get("token") == token), None)
+            if entry is None:
+                raise RecoveryRequired("prepared published rollback token is not bound to the journal")
+            if entry.get("rollback_state") != "rolled_back":
+                rollback_prepared_target(parent, prepared["name"], prepared["path"], entry["expected"], entry["postimage"], entry.get("rollback_temp"), entry.get("rollback_temp_descriptor"))
+                mark_batch_entry_rolled_back(3, journal_name, prepared["batch_id"], token)
+            prepared["rolled_back"] = True
+            return {"ok": True, "aborted": False, "rolled_back": True, "rollback_required": True}
         if prepared.get("published") or prepared.get("quarantined"):
             if not prepared.get("quarantined"):
                 try:
@@ -2539,7 +3039,11 @@ def abort_prepared_write(payload):
             return {"ok": True, "aborted": False, "quarantined": True}
         abort_prepared_stage_exact(prepared)
         cleanup_temp(parent, prepared.get("backup"))
-        release_conditional_lock(parent, prepared["lock_name"], prepared["lock_token"])
+        if prepared.get("batch_id") is not None:
+            rollback_document, _, _ = read_batch_journal(3, prepared["batch_journal"], prepared["batch_id"])
+            if rollback_document.get("state") in ("rolling_back", "rolled_back"):
+                mark_batch_entry_rolled_back(3, prepared["batch_journal"], prepared["batch_id"], prepared["lock_token"])
+        release_batch_lease(parent, prepared["lock_name"], prepared["lock_token"])
         fsync_regular(parent)
         prepared_writes.pop(token, None)
         if prepared.get("batch_id") is not None and not any(candidate.get("batch_id") == prepared.get("batch_id") for candidate in prepared_writes.values()):
@@ -2691,6 +3195,7 @@ def commit_prepared_write(payload):
                     prepared["expected"],
                     prepared["sha256"],
                     prepared["size"],
+                    retain_displaced=prepared.get("batch_id") is not None,
                 )
             except Exception:
                 # The exchange may have published before a later fsync/error;
@@ -2707,6 +3212,9 @@ def commit_prepared_write(payload):
         committed = True
         verify_prepared_target(prepared)
         conditional_kill(payload, "after_prepared_publication_before_lease")
+        if prepared.get("batch_id") is not None and prepared.get("expected", {}).get("kind") == "file":
+            prepared["backup"] = prepared.get("temp")
+            prepared["backup_descriptor"] = {"kind": "file", "dev": prepared["expected"].get("dev"), "ino": prepared["expected"].get("ino"), "size": prepared["expected"].get("size"), "sha256": prepared["expected"].get("sha256")}
         prepared["temp"] = None
         conditional_error(payload, "after_prepared_publish_error")
         fsync_regular(parent)
@@ -3579,3140 +4087,2959 @@ def main():
 
 
 main()
-`;
-
-const MAX_RELATIVE_PATH_LENGTH = 4096;
-const MAX_RELATIVE_PATH_SEGMENTS = 128;
-const MAX_BATCH_ROLLBACK_BYTES = 8 * 1024 * 1024;
-const DEFAULT_DIRECTORY_MAX_ENTRIES = 16384;
-const DEFAULT_DIRECTORY_MAX_NAME_BYTES = 4 * 1024 * 1024;
-
-type ConditionalOperation = "replace" | "remove";
-
-function darwinHelperTransferTimeout(operation: string, baseTimeoutMs: number, requestBytes: number): number {
-  if (!DARWIN_HELPER_TRANSFER_OPERATIONS.has(operation) || requestBytes <= DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) return baseTimeoutMs;
-  const transferMs = Math.ceil((requestBytes - DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) / DARWIN_HELPER_TRANSFER_BYTES_PER_MS);
-  return baseTimeoutMs + Math.min(DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS, transferMs);
+`;const MAX_RELATIVE_PATH_LENGTH = 4096;const MAX_RELATIVE_PATH_SEGMENTS = 128;const MAX_BATCH_ROLLBACK_BYTES = 8 * 1024 * 1024;const DEFAULT_DIRECTORY_MAX_ENTRIES = 16384;const DEFAULT_DIRECTORY_MAX_NAME_BYTES = 4 * 1024 * 1024;type ConditionalOperation = "replace" | "remove";function darwinHelperTransferTimeout(operation: string, baseTimeoutMs: number, requestBytes: number): number {
+if (!DARWIN_HELPER_TRANSFER_OPERATIONS.has(operation) || requestBytes <= DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) return baseTimeoutMs;
+const transferMs = Math.ceil((requestBytes - DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) / DARWIN_HELPER_TRANSFER_BYTES_PER_MS);
+return baseTimeoutMs + Math.min(DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS, transferMs);}function errnoCode(error: unknown): string | undefined {
+return error && typeof error === "object" && "code" in error
+? String((error as NodeJS.ErrnoException).code)
+: undefined;}function assertDarwinFifoDescriptor(fd: number, expected: Stats, label: string): void {
+const observed = fstatSync(fd);
+const uid = process.getuid?.();
+if (uid === undefined || !observed.isFIFO() || !sameIdentity(observed, expected)
+|| (observed.mode & 0o777) !== 0o600 || observed.uid !== uid) {
+throw new PinnedRootError("changed", `descriptor helper ${label} FIFO identity changed after open`);
+}}function sameIdentity(left: Stats, right: Stats): boolean {
+return left.dev === right.dev && left.ino === right.ino;}function descriptorPathFor(fd: number): string | null {
+if (process.platform === "darwin") return `/dev/fd/${fd}`;
+if (process.platform === "linux") return `/proc/self/fd/${fd}`;
+return null;}function descriptorFlags(): number | null {
+const readOnly = constants.O_RDONLY;
+const directory = constants.O_DIRECTORY;
+const noFollow = constants.O_NOFOLLOW;
+if (![readOnly, directory, noFollow].every((value) => Number.isInteger(value))) return null;
+return readOnly | directory | noFollow;}function readFlags(): number | null {
+const readOnly = constants.O_RDONLY;
+const noFollow = constants.O_NOFOLLOW;
+const nonBlock = constants.O_NONBLOCK;
+if (![readOnly, noFollow, nonBlock].every((value) => Number.isInteger(value))) return null;
+return readOnly | noFollow | nonBlock;}function writeFlags(): number | null {
+const writeOnly = constants.O_WRONLY;
+const create = constants.O_CREAT;
+const exclusive = constants.O_EXCL;
+const noFollow = constants.O_NOFOLLOW;
+if (![writeOnly, create, exclusive, noFollow].every((value) => Number.isInteger(value))) return null;
+return writeOnly | create | exclusive | noFollow;}function isWellFormedUtf16(value: string): boolean {
+for (let index = 0; index < value.length; index += 1) {
+const code = value.charCodeAt(index);
+if (code >= 0xd800 && code <= 0xdbff) {
+const next = value.charCodeAt(index + 1);
+if (next < 0xdc00 || next > 0xdfff) return false;
+index += 1;
+} else if (code >= 0xdc00 && code <= 0xdfff) {
+return false;
 }
-
-function errnoCode(error: unknown): string | undefined {
-  return error && typeof error === "object" && "code" in error
-    ? String((error as NodeJS.ErrnoException).code)
-    : undefined;
 }
-
-function assertDarwinFifoDescriptor(fd: number, expected: Stats, label: string): void {
-  const observed = fstatSync(fd);
-  const uid = process.getuid?.();
-  if (uid === undefined || !observed.isFIFO() || !sameIdentity(observed, expected)
-    || (observed.mode & 0o777) !== 0o600 || observed.uid !== uid) {
-    throw new PinnedRootError("changed", `descriptor helper ${label} FIFO identity changed after open`);
-  }
+return true;}function contentByteLength(content: PinnedRootWriteContent): number {
+if (typeof content === "string" && !isWellFormedUtf16(content)) {
+throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
 }
-
-function sameIdentity(left: Stats, right: Stats): boolean {
-  return left.dev === right.dev && left.ino === right.ino;
+const length = typeof content === "string" ? Buffer.byteLength(content, "utf8") : content.byteLength;
+if (!Number.isSafeInteger(length) || length < 0 || length > MAX_PINNED_ROOT_WRITE_BYTES) {
+throw new PinnedRootError("limit", "anchored write exceeds the bounded content limit");
 }
-
-function descriptorPathFor(fd: number): string | null {
-  if (process.platform === "darwin") return `/dev/fd/${fd}`;
-  if (process.platform === "linux") return `/proc/self/fd/${fd}`;
-  return null;
+return length;}function contentToBase64(content: PinnedRootWriteContent): string {
+contentByteLength(content);
+return Buffer.from(content).toString("base64");}function contentPayload(content: PinnedRootWriteContent, allowText = false): Record<string, string> {
+if (allowText && typeof content === "string") {
+contentByteLength(content);
+return { text: content };
 }
-
-function descriptorFlags(): number | null {
-  const readOnly = constants.O_RDONLY;
-  const directory = constants.O_DIRECTORY;
-  const noFollow = constants.O_NOFOLLOW;
-  if (![readOnly, directory, noFollow].every((value) => Number.isInteger(value))) return null;
-  return readOnly | directory | noFollow;
+return { bytes: contentToBase64(content) };}function contentSha256(content: PinnedRootWriteContent): string {
+return createHash("sha256").update(Buffer.from(content)).digest("hex");}type PinnedWriteDescriptorResponse = {
+ok?: unknown;
+recovered?: unknown;
+ack_required?: unknown;
+token?: unknown;
+preimage?: unknown;
+dev?: unknown;
+ino?: unknown;
+size?: unknown;
+sha256?: unknown;};function descriptorFromResponse(
+relativeFile: string,
+canonicalPath: string,
+content: PinnedRootWriteContent,
+response: PinnedWriteDescriptorResponse,): PinnedRootWriteDescriptor {
+const size = contentByteLength(content);
+const sha256 = contentSha256(content);
+if (
+response.ok !== true
+|| !Number.isSafeInteger(response.dev)
+|| (response.dev as number) < 0
+|| !Number.isSafeInteger(response.ino)
+|| (response.ino as number) < 0
+|| !Number.isSafeInteger(response.size)
+|| response.size !== size
+|| response.sha256 !== sha256
+) {
+throw new PinnedRootError("write_failed", "anchored write returned an invalid operation descriptor");
 }
-
-function readFlags(): number | null {
-  const readOnly = constants.O_RDONLY;
-  const noFollow = constants.O_NOFOLLOW;
-  const nonBlock = constants.O_NONBLOCK;
-  if (![readOnly, noFollow, nonBlock].every((value) => Number.isInteger(value))) return null;
-  return readOnly | noFollow | nonBlock;
+return {
+path: canonicalPath,
+relative_path: relativeFile,
+dev: response.dev as number,
+ino: response.ino as number,
+size,
+sha256,
+};}function preimageFromResponse(response: PinnedWriteDescriptorResponse): PinnedRootWritePreimage {
+const raw = response.preimage;
+if (!raw || typeof raw !== "object") throw new PinnedRootError("write_failed", "prepared write returned no exact preimage");
+const record = raw as Record<string, unknown>;
+if (record.kind === "absent") return { kind: "absent" };
+if (record.kind !== "file" || typeof record.bytes !== "string"
+|| !Number.isSafeInteger(record.dev) || (record.dev as number) < 0
+|| !Number.isSafeInteger(record.ino) || (record.ino as number) < 0
+|| !Number.isSafeInteger(record.size) || (record.size as number) < 0
+|| typeof record.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(record.sha256)) {
+throw new PinnedRootError("write_failed", "prepared write returned an invalid exact preimage");
 }
-
-function writeFlags(): number | null {
-  const writeOnly = constants.O_WRONLY;
-  const create = constants.O_CREAT;
-  const exclusive = constants.O_EXCL;
-  const noFollow = constants.O_NOFOLLOW;
-  if (![writeOnly, create, exclusive, noFollow].every((value) => Number.isInteger(value))) return null;
-  return writeOnly | create | exclusive | noFollow;
+let bytes: Buffer;
+try { bytes = Buffer.from(record.bytes, "base64"); } catch { throw new PinnedRootError("write_failed", "prepared write returned invalid preimage bytes"); }
+if (bytes.byteLength !== record.size || createHash("sha256").update(bytes).digest("hex") !== record.sha256) {
+throw new PinnedRootError("write_failed", "prepared write returned an inconsistent exact preimage");
 }
-
-function isWellFormedUtf16(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (next < 0xdc00 || next > 0xdfff) return false;
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return false;
-    }
-  }
-  return true;
+return {
+kind: "file",
+bytes,
+expectation: { dev: record.dev as number, ino: record.ino as number, size: record.size as number, sha256: record.sha256 },
+};}function safeRelativeSegments(value: unknown, allowEmpty = false): string[] {
+if (typeof value !== "string") throw new PinnedRootError("path_unauthorized", "anchored path must be a string");
+if (value.length > MAX_RELATIVE_PATH_LENGTH || value.includes("\\") || value.includes("\0") || isAbsolute(value) || /^[A-Za-z]:/u.test(value)) {
+throw new PinnedRootError("path_unauthorized", "anchored path must be a bounded relative POSIX path");
 }
-
-function contentByteLength(content: PinnedRootWriteContent): number {
-  if (typeof content === "string" && !isWellFormedUtf16(content)) {
-    throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
-  }
-  const length = typeof content === "string" ? Buffer.byteLength(content, "utf8") : content.byteLength;
-  if (!Number.isSafeInteger(length) || length < 0 || length > MAX_PINNED_ROOT_WRITE_BYTES) {
-    throw new PinnedRootError("limit", "anchored write exceeds the bounded content limit");
-  }
-  return length;
+if (value.length === 0) {
+if (allowEmpty) return [];
+throw new PinnedRootError("path_unauthorized", "anchored path cannot be empty");
 }
-
-function contentToBase64(content: PinnedRootWriteContent): string {
-  contentByteLength(content);
-  return Buffer.from(content).toString("base64");
+if (!isSafeRelativePath(value)) throw new PinnedRootError("path_unauthorized", "anchored path contains an unsafe component");
+const segments = value.split("/");
+if (segments.length > MAX_RELATIVE_PATH_SEGMENTS || segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+throw new PinnedRootError("path_unauthorized", "anchored path contains an unsafe component");
 }
-
-function contentPayload(content: PinnedRootWriteContent, allowText = false): Record<string, string> {
-  if (allowText && typeof content === "string") {
-    contentByteLength(content);
-    return { text: content };
-  }
-  return { bytes: contentToBase64(content) };
+return segments;}function boundedTemporaryComponent(domain: string, relativePath: string, suffix: string): string {
+const digest = createHash("sha256").update(relativePath, "utf8").digest("hex");
+return `.omp-${domain}-${digest}-${randomUUID()}${suffix}`;}function boundedDarwinSibling(domain: string, relativePath: string, suffix: string): string {
+const digest = createHash("sha256").update(relativePath, "utf8").digest("hex");
+return ".omp-" + domain + "-" + digest + suffix;}function closeQuietly(fd: number | null): void {
+if (fd === null) return;
+try { closeSync(fd); } catch { /* preserve the primary operation result */ }}function removeDarwinHelperDirectory(directory: string): void {
+try { rmSync(directory, { recursive: true, force: true }); } catch {
+try { rmSync(directory, { recursive: true, force: true }); } catch { /* preserve the primary operation result */ }
+}}function scheduleDarwinHelperHardKill(child: ChildProcess): void {
+const childPid = child.pid;
+if (childPid === undefined || !Number.isInteger(childPid) || childPid <= 0) return;
+const timer = setTimeout(() => {
+if (child.exitCode !== null || child.pid !== childPid) return;
+try { child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
+}, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
+timer.unref();}function decodeDarwinHelperUtf8(decoder: TextDecoder, bytes: Uint8Array, stream: boolean, operation: string): string {
+try {
+return decoder.decode(bytes, { stream });
+} catch (error) {
+throw new PinnedRootError("unsupported", `descriptor helper '${operation}' returned invalid UTF-8: ${String(error)}`);
+}}function closeDarwinHelperSessionImmediately(session: DarwinHelperSession): void {
+closeQuietly(session.requestFd);
+closeQuietly(session.responseFd);
+try { session.child.kill("SIGTERM"); } catch { /* preserve bounded teardown */ }
+try { session.child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
+removeDarwinHelperDirectory(session.directory);}function cleanupDarwinHelpersOnExit(): void {
+for (const session of activeDarwinHelperSessions) {
+try { session.child.kill("SIGTERM"); } catch { /* preserve process shutdown */ }
+closeQuietly(session.requestFd);
+closeQuietly(session.responseFd);
+try { rmSync(session.directory, { recursive: true, force: true }); } catch { /* preserve process shutdown */ }
 }
-
-function contentSha256(content: PinnedRootWriteContent): string {
-  return createHash("sha256").update(Buffer.from(content)).digest("hex");
-}
-
-type PinnedWriteDescriptorResponse = {
-  ok?: unknown;
-  recovered?: unknown;
-  ack_required?: unknown;
-  token?: unknown;
-  preimage?: unknown;
-  dev?: unknown;
-  ino?: unknown;
-  size?: unknown;
-  sha256?: unknown;
-};
-
-function descriptorFromResponse(
-  relativeFile: string,
-  canonicalPath: string,
-  content: PinnedRootWriteContent,
-  response: PinnedWriteDescriptorResponse,
-): PinnedRootWriteDescriptor {
-  const size = contentByteLength(content);
-  const sha256 = contentSha256(content);
-  if (
-    response.ok !== true
-    || !Number.isSafeInteger(response.dev)
-    || (response.dev as number) < 0
-    || !Number.isSafeInteger(response.ino)
-    || (response.ino as number) < 0
-    || !Number.isSafeInteger(response.size)
-    || response.size !== size
-    || response.sha256 !== sha256
-  ) {
-    throw new PinnedRootError("write_failed", "anchored write returned an invalid operation descriptor");
-  }
-  return {
-    path: canonicalPath,
-    relative_path: relativeFile,
-    dev: response.dev as number,
-    ino: response.ino as number,
-    size,
-    sha256,
-  };
-}
-
-function preimageFromResponse(response: PinnedWriteDescriptorResponse): PinnedRootWritePreimage {
-  const raw = response.preimage;
-  if (!raw || typeof raw !== "object") throw new PinnedRootError("write_failed", "prepared write returned no exact preimage");
-  const record = raw as Record<string, unknown>;
-  if (record.kind === "absent") return { kind: "absent" };
-  if (record.kind !== "file" || typeof record.bytes !== "string"
-    || !Number.isSafeInteger(record.dev) || (record.dev as number) < 0
-    || !Number.isSafeInteger(record.ino) || (record.ino as number) < 0
-    || !Number.isSafeInteger(record.size) || (record.size as number) < 0
-    || typeof record.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(record.sha256)) {
-    throw new PinnedRootError("write_failed", "prepared write returned an invalid exact preimage");
-  }
-  let bytes: Buffer;
-  try { bytes = Buffer.from(record.bytes, "base64"); } catch { throw new PinnedRootError("write_failed", "prepared write returned invalid preimage bytes"); }
-  if (bytes.byteLength !== record.size || createHash("sha256").update(bytes).digest("hex") !== record.sha256) {
-    throw new PinnedRootError("write_failed", "prepared write returned an inconsistent exact preimage");
-  }
-  return {
-    kind: "file",
-    bytes,
-    expectation: { dev: record.dev as number, ino: record.ino as number, size: record.size as number, sha256: record.sha256 },
-  };
-}
-
-function safeRelativeSegments(value: unknown, allowEmpty = false): string[] {
-  if (typeof value !== "string") throw new PinnedRootError("path_unauthorized", "anchored path must be a string");
-  if (value.length > MAX_RELATIVE_PATH_LENGTH || value.includes("\\") || value.includes("\0") || isAbsolute(value) || /^[A-Za-z]:/u.test(value)) {
-    throw new PinnedRootError("path_unauthorized", "anchored path must be a bounded relative POSIX path");
-  }
-  if (value.length === 0) {
-    if (allowEmpty) return [];
-    throw new PinnedRootError("path_unauthorized", "anchored path cannot be empty");
-  }
-  if (!isSafeRelativePath(value)) throw new PinnedRootError("path_unauthorized", "anchored path contains an unsafe component");
-  const segments = value.split("/");
-  if (segments.length > MAX_RELATIVE_PATH_SEGMENTS || segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
-    throw new PinnedRootError("path_unauthorized", "anchored path contains an unsafe component");
-  }
-  return segments;
-}
-
-function boundedTemporaryComponent(domain: string, relativePath: string, suffix: string): string {
-  const digest = createHash("sha256").update(relativePath, "utf8").digest("hex");
-  return `.omp-${domain}-${digest}-${randomUUID()}${suffix}`;
-}
-
-function boundedDarwinSibling(domain: string, relativePath: string, suffix: string): string {
-  const digest = createHash("sha256").update(relativePath, "utf8").digest("hex");
-  return ".omp-" + domain + "-" + digest + suffix;
-}
-
-function closeQuietly(fd: number | null): void {
-  if (fd === null) return;
-  try { closeSync(fd); } catch { /* preserve the primary operation result */ }
-}
-
-function removeDarwinHelperDirectory(directory: string): void {
-  try { rmSync(directory, { recursive: true, force: true }); } catch {
-    try { rmSync(directory, { recursive: true, force: true }); } catch { /* preserve the primary operation result */ }
-  }
-}
-
-function scheduleDarwinHelperHardKill(child: ChildProcess): void {
-  const childPid = child.pid;
-  if (childPid === undefined || !Number.isInteger(childPid) || childPid <= 0) return;
-  const timer = setTimeout(() => {
-    if (child.exitCode !== null || child.pid !== childPid) return;
-    try { child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
-  }, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
-  timer.unref();
-}
-
-function decodeDarwinHelperUtf8(decoder: TextDecoder, bytes: Uint8Array, stream: boolean, operation: string): string {
-  try {
-    return decoder.decode(bytes, { stream });
-  } catch (error) {
-    throw new PinnedRootError("unsupported", `descriptor helper '${operation}' returned invalid UTF-8: ${String(error)}`);
-  }
-}
-
-function closeDarwinHelperSessionImmediately(session: DarwinHelperSession): void {
-  closeQuietly(session.requestFd);
-  closeQuietly(session.responseFd);
-  try { session.child.kill("SIGTERM"); } catch { /* preserve bounded teardown */ }
-  try { session.child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
-  removeDarwinHelperDirectory(session.directory);
-}
-
-function cleanupDarwinHelpersOnExit(): void {
-  for (const session of activeDarwinHelperSessions) {
-    try { session.child.kill("SIGTERM"); } catch { /* preserve process shutdown */ }
-    closeQuietly(session.requestFd);
-    closeQuietly(session.responseFd);
-    try { rmSync(session.directory, { recursive: true, force: true }); } catch { /* preserve process shutdown */ }
-  }
-  activeDarwinHelperSessions.clear();
-}
-
-if (process.platform === "darwin") {
-  process.once("exit", cleanupDarwinHelpersOnExit);
-}
-
-/**
+activeDarwinHelperSessions.clear();}if (process.platform === "darwin") {
+process.once("exit", cleanupDarwinHelpersOnExit);}/**
  * A project root held open for the lifetime of a scoped operation.  All paths
  * exposed by this class are descriptor paths, never caller-controlled root
  * strings.  Keeping the descriptor open means a root rename cannot redirect
  * a later operation to a replacement pathname.
- */
-export interface PinnedRootPathEntryInfo {
-  kind: "file" | "directory" | "symlink" | "other";
-  size: number;
-  dev: number;
-  ino: number;
-  mtimeMs: number;
-  ctimeMs: number;
-  /** Permission bits observed from the same no-follow descriptor operation. */
-  mode: number;
+ */export interface PinnedRootPathEntryInfo {
+kind: "file" | "directory" | "symlink" | "other";
+size: number;
+dev: number;
+ino: number;
+mtimeMs: number;
+ctimeMs: number;
+/** Permission bits observed from the same no-follow descriptor operation. */
+mode: number;}export class PinnedProjectRoot {
+readonly lexical_root: string;
+readonly canonical_root: string;
+readonly dev: number;
+readonly ino: number;
+private readonly rootFd: number;
+private readonly rootDescriptorPath: string;
+private readonly hooks: PinnedRootWriteHooks;
+private readonly rootPathDigest: string;
+private darwinHelperSession: DarwinHelperSession | null = null;
+private darwinHelperClosePromise: Promise<void> | null = null;
+private darwinHelperPoisoned = false;
+private closed = false;
+private constructor(
+lexicalRoot: string,
+identity: PinnedRootIdentity,
+rootFd: number,
+rootDescriptorPath: string,
+hooks: PinnedRootWriteHooks,
+) {
+this.lexical_root = lexicalRoot;
+this.canonical_root = identity.canonical_root;
+this.dev = identity.dev;
+this.ino = identity.ino;
+this.rootPathDigest = createHash("sha256").update([identity.canonical_root, identity.dev, identity.ino].join("\0"), "utf8").digest("hex");
+this.rootFd = rootFd;
+this.rootDescriptorPath = rootDescriptorPath;
+this.hooks = hooks;
 }
-
-export class PinnedProjectRoot {
-  readonly lexical_root: string;
-  readonly canonical_root: string;
-  readonly dev: number;
-  readonly ino: number;
-
-  private readonly rootFd: number;
-  private readonly rootDescriptorPath: string;
-  private readonly hooks: PinnedRootWriteHooks;
-  private readonly rootPathDigest: string;
-  private darwinHelperSession: DarwinHelperSession | null = null;
-  private darwinHelperClosePromise: Promise<void> | null = null;
-  private darwinHelperPoisoned = false;
-  private closed = false;
-
-  private constructor(
-    lexicalRoot: string,
-    identity: PinnedRootIdentity,
-    rootFd: number,
-    rootDescriptorPath: string,
-    hooks: PinnedRootWriteHooks,
-  ) {
-    this.lexical_root = lexicalRoot;
-    this.canonical_root = identity.canonical_root;
-    this.dev = identity.dev;
-    this.ino = identity.ino;
-    this.rootPathDigest = createHash("sha256").update([identity.canonical_root, identity.dev, identity.ino].join("\0"), "utf8").digest("hex");
-    this.rootFd = rootFd;
-    this.rootDescriptorPath = rootDescriptorPath;
-    this.hooks = hooks;
-  }
-
-  /** Open and pin an existing canonical, non-symlink directory. */
-  static open(projectRoot: unknown, hooks: PinnedRootWriteHooks = {}): PinnedProjectRoot | null {
-    if (typeof projectRoot !== "string" || projectRoot.trim().length === 0) return null;
-    const flags = descriptorFlags();
-    if (flags === null || descriptorPathFor(0) === null) return null;
-    const lexicalRoot = resolve(projectRoot);
-    let fd: number | null = null;
-    let retained = false;
-    try {
-      const lexical = lstatSync(lexicalRoot);
-      if (lexical.isSymbolicLink() || !lexical.isDirectory()) return null;
-      fd = openSync(lexicalRoot, flags);
-      const descriptorPath = descriptorPathFor(fd);
-      if (descriptorPath === null) return null;
-      const descriptorIdentity = fstatSync(fd);
-      if (!descriptorIdentity.isDirectory() || !sameIdentity(lexical, descriptorIdentity)) return null;
-      const canonicalRoot = realpathSync(lexicalRoot);
-      const canonical = lstatSync(canonicalRoot);
-      if (canonical.isSymbolicLink() || !canonical.isDirectory()
-        || !sameIdentity(descriptorIdentity, canonical)) return null;
-      const pinned = new PinnedProjectRoot(
-        lexicalRoot,
-        { canonical_root: canonicalRoot, dev: descriptorIdentity.dev, ino: descriptorIdentity.ino },
-        fd,
-        descriptorPath,
-        hooks,
-      );
-      retained = true;
-      return pinned;
-    } catch {
-      return null;
-    } finally {
-      if (!retained) closeQuietly(fd);
-    }
-  }
-
-  /** Close the pinned descriptor. Idempotent and safe in finally blocks. */
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.closeDarwinHelper();
-    closeQuietly(this.rootFd);
-  }
-
-  /** Close and await actual Darwin helper exit; idempotent with close(). */
-  async closeAsync(): Promise<void> {
-    this.close();
-    await this.darwinHelperClosePromise;
-  }
-
-  /** Descriptor path suitable for APIs that require a cwd/path string. */
-  anchorPath(relativePath = ""): string {
-    this.assertOpen();
-    const segments = safeRelativeSegments(relativePath, true);
-    if (process.platform === "darwin") return segments.length === 0 ? this.canonical_root : join(this.canonical_root, ...segments);
-    return segments.length === 0 ? this.rootDescriptorPath : join(this.rootDescriptorPath, ...segments);
-  }
-
-  /** Convert an absolute lexical/canonical path into a safe root-relative path. */
-  relativePath(candidate: unknown): string | null {
-    if (typeof candidate !== "string" || this.closed) return null;
-    const absolute = resolve(candidate);
-    if (process.platform !== "darwin") {
-      const descriptorPrefix = this.rootDescriptorPath.slice(0, this.rootDescriptorPath.lastIndexOf("/") + 1);
-      if (absolute.startsWith(descriptorPrefix)) {
-        const ownedPrefix = `${this.rootDescriptorPath}/`;
-        if (candidate === this.rootDescriptorPath) return null;
-        if (!candidate.startsWith(ownedPrefix) || !this.isStable()) return null;
-        const rawRelative = candidate.slice(ownedPrefix.length);
-        const descriptorRelative = absolute.slice(ownedPrefix.length);
-        if (rawRelative !== descriptorRelative) return null;
-        try {
-          safeRelativeSegments(descriptorRelative);
-          return descriptorRelative;
-        } catch {
-          return null;
-        }
-      }
-    }
-    const candidates = [relative(this.lexical_root, absolute), relative(this.canonical_root, absolute)];
-    for (const candidateRelative of candidates) {
-      if (candidateRelative === "" || candidateRelative.startsWith("..") || isAbsolute(candidateRelative)) continue;
-      try {
-        safeRelativeSegments(candidateRelative);
-        return candidateRelative;
-      } catch {
-        // Try the canonical alias before rejecting the candidate.
-      }
-    }
-    return null;
-  }
-
-  /** Verify the pinned descriptor and its canonical pathname still name the original root inode. */
-  isStable(): boolean {
-    if (this.closed) return false;
-    try {
-      const descriptor = fstatSync(this.rootFd);
-      const canonical = lstatSync(this.canonical_root);
-      return descriptor.isDirectory()
-        && descriptor.dev === this.dev
-        && descriptor.ino === this.ino
-        && canonical.isDirectory()
-        && canonical.dev === descriptor.dev
-        && canonical.ino === descriptor.ino;
-    } catch {
-      return false;
-    }
-  }
-
-  /** Ensure every directory component exists, opened no-follow one at a time. */
-  ensureDirectory(relativeDirectory: string): void {
-    const segments = safeRelativeSegments(relativeDirectory, true);
-    assertCurrentExecutionLiveness();
-    if (process.platform === "darwin") {
-      this.hooks.beforeDirectoryCreate?.(relativeDirectory);
-      this.runDescriptorHelper("ensure_directory", { path: relativeDirectory });
-      return;
-    }
-    if (segments.length === 0) {
-      this.assertStable();
-      return;
-    }
-    let parentFd = this.rootFd;
-    let ownedParent: number | null = null;
-    try {
-      for (let index = 0; index < segments.length; index += 1) {
-        const segment = segments[index]!;
-        const path = segments.slice(0, index + 1).join("/");
-        const childFd = this.openDirectoryChild(parentFd, segment, path, true);
-        closeQuietly(ownedParent);
-        ownedParent = childFd;
-        parentFd = childFd;
-      }
-      this.assertStable();
-      assertCurrentExecutionLiveness();
-    } finally {
-      closeQuietly(ownedParent);
-    }
-  }
-
-  /** Remove one regular file through an anchored no-follow parent descriptor. */
-  unlink(relativeFile: string): void {
-    const segments = safeRelativeSegments(relativeFile);
-    assertCurrentExecutionLiveness();
-    if (process.platform === "darwin") {
-      this.runDescriptorHelper("unlink", { path: relativeFile });
-      return;
-    }
-    const finalName = segments.pop()!;
-    const parent = this.openParent(segments, false);
-    try {
-      const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
-      this.assertCanonicalDirectory(segments.join("/"));
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      let existing: Stats;
-      try {
-        existing = lstatSync(target);
-      } catch (error) {
-        if (errnoCode(error) === "ENOENT") throw new PinnedRootError("not_found", "anchored target does not exist");
-        throw error;
-      }
-      if (existing.isSymbolicLink()) throw new PinnedRootError("path_unauthorized", "anchored target is a symbolic link");
-      if (!existing.isFile()) throw new PinnedRootError("not_regular", "anchored target is not a regular file");
-      assertCurrentExecutionLiveness();
-      unlinkSync(target);
-      this.assertStable();
-      assertCurrentExecutionLiveness();
-    } catch (error) {
-      if (error instanceof ExecutionLivenessViolation) throw error;
-      if (error instanceof PinnedRootError) throw error;
-      const code = errnoCode(error);
-      if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored target does not exist");
-      throw new PinnedRootError("write_failed", `anchored target could not be removed safely: ${String(error)}`);
-    } finally {
-      parent.close();
-    }
-  }
+/** Open and pin an existing canonical, non-symlink directory. */
+static open(projectRoot: unknown, hooks: PinnedRootWriteHooks = {}): PinnedProjectRoot | null {
+if (typeof projectRoot !== "string" || projectRoot.trim().length === 0) return null;
+const flags = descriptorFlags();
+if (flags === null || descriptorPathFor(0) === null) return null;
+const lexicalRoot = resolve(projectRoot);
+let fd: number | null = null;
+let retained = false;
+try {
+const lexical = lstatSync(lexicalRoot);
+if (lexical.isSymbolicLink() || !lexical.isDirectory()) return null;
+fd = openSync(lexicalRoot, flags);
+const descriptorPath = descriptorPathFor(fd);
+if (descriptorPath === null) return null;
+const descriptorIdentity = fstatSync(fd);
+if (!descriptorIdentity.isDirectory() || !sameIdentity(lexical, descriptorIdentity)) return null;
+const canonicalRoot = realpathSync(lexicalRoot);
+const canonical = lstatSync(canonicalRoot);
+if (canonical.isSymbolicLink() || !canonical.isDirectory()
+|| !sameIdentity(descriptorIdentity, canonical)) return null;
+const pinned = new PinnedProjectRoot(
+lexicalRoot,
+{ canonical_root: canonicalRoot, dev: descriptorIdentity.dev, ino: descriptorIdentity.ino },
+fd,
+descriptorPath,
+hooks,
+);
+retained = true;
+return pinned;
+} catch {
+return null;
+} finally {
+if (!retained) closeQuietly(fd);
+}
+}
+/** Close the pinned descriptor. Idempotent and safe in finally blocks. */
+close(): void {
+if (this.closed) return;
+this.closed = true;
+this.closeDarwinHelper();
+closeQuietly(this.rootFd);
+}
+/** Close and await actual Darwin helper exit; idempotent with close(). */
+async closeAsync(): Promise<void> {
+this.close();
+await this.darwinHelperClosePromise;
+}
+/** Descriptor path suitable for APIs that require a cwd/path string. */
+anchorPath(relativePath = ""): string {
+this.assertOpen();
+const segments = safeRelativeSegments(relativePath, true);
+if (process.platform === "darwin") return segments.length === 0 ? this.canonical_root : join(this.canonical_root, ...segments);
+return segments.length === 0 ? this.rootDescriptorPath : join(this.rootDescriptorPath, ...segments);
+}
+/** Convert an absolute lexical/canonical path into a safe root-relative path. */
+relativePath(candidate: unknown): string | null {
+if (typeof candidate !== "string" || this.closed) return null;
+const absolute = resolve(candidate);
+if (process.platform !== "darwin") {
+const descriptorPrefix = this.rootDescriptorPath.slice(0, this.rootDescriptorPath.lastIndexOf("/") + 1);
+if (absolute.startsWith(descriptorPrefix)) {
+const ownedPrefix = `${this.rootDescriptorPath}/`;
+if (candidate === this.rootDescriptorPath) return null;
+if (!candidate.startsWith(ownedPrefix) || !this.isStable()) return null;
+const rawRelative = candidate.slice(ownedPrefix.length);
+const descriptorRelative = absolute.slice(ownedPrefix.length);
+if (rawRelative !== descriptorRelative) return null;
+try {
+safeRelativeSegments(descriptorRelative);
+return descriptorRelative;
+} catch {
+return null;
+}
+}
+}
+const candidates = [relative(this.lexical_root, absolute), relative(this.canonical_root, absolute)];
+for (const candidateRelative of candidates) {
+if (candidateRelative === "" || candidateRelative.startsWith("..") || isAbsolute(candidateRelative)) continue;
+try {
+safeRelativeSegments(candidateRelative);
+return candidateRelative;
+} catch {
+// Try the canonical alias before rejecting the candidate.
+}
+}
+return null;
+}
+/** Verify the pinned descriptor and its canonical pathname still name the original root inode. */
+isStable(): boolean {
+if (this.closed) return false;
+try {
+const descriptor = fstatSync(this.rootFd);
+const canonical = lstatSync(this.canonical_root);
+return descriptor.isDirectory()
+&& descriptor.dev === this.dev
+&& descriptor.ino === this.ino
+&& canonical.isDirectory()
+&& canonical.dev === descriptor.dev
+&& canonical.ino === descriptor.ino;
+} catch {
+return false;
+}
+}
+/** Ensure every directory component exists, opened no-follow one at a time. */
+ensureDirectory(relativeDirectory: string): void {
+const segments = safeRelativeSegments(relativeDirectory, true);
+assertCurrentExecutionLiveness();
+if (process.platform === "darwin") {
+this.hooks.beforeDirectoryCreate?.(relativeDirectory);
+this.runDescriptorHelper("ensure_directory", { path: relativeDirectory });
+return;
+}
+if (segments.length === 0) {
+this.assertStable();
+return;
+}
+let parentFd = this.rootFd;
+let ownedParent: number | null = null;
+try {
+for (let index = 0; index < segments.length; index += 1) {
+const segment = segments[index]!;
+const path = segments.slice(0, index + 1).join("/");
+const childFd = this.openDirectoryChild(parentFd, segment, path, true);
+closeQuietly(ownedParent);
+ownedParent = childFd;
+parentFd = childFd;
+}
+this.assertStable();
+assertCurrentExecutionLiveness();
+} finally {
+closeQuietly(ownedParent);
+}
+}
+/** Remove one regular file through an anchored no-follow parent descriptor. */
+unlink(relativeFile: string): void {
+const segments = safeRelativeSegments(relativeFile);
+assertCurrentExecutionLiveness();
+if (process.platform === "darwin") {
+this.runDescriptorHelper("unlink", { path: relativeFile });
+return;
+}
+const finalName = segments.pop()!;
+const parent = this.openParent(segments, false);
+try {
+const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+let existing: Stats;
+try {
+existing = lstatSync(target);
+} catch (error) {
+if (errnoCode(error) === "ENOENT") throw new PinnedRootError("not_found", "anchored target does not exist");
+throw error;
+}
+if (existing.isSymbolicLink()) throw new PinnedRootError("path_unauthorized", "anchored target is a symbolic link");
+if (!existing.isFile()) throw new PinnedRootError("not_regular", "anchored target is not a regular file");
+assertCurrentExecutionLiveness();
+unlinkSync(target);
+this.assertStable();
+assertCurrentExecutionLiveness();
+} catch (error) {
+if (error instanceof ExecutionLivenessViolation) throw error;
+if (error instanceof PinnedRootError) throw error;
+const code = errnoCode(error);
+if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored target does not exist");
+throw new PinnedRootError("write_failed", `anchored target could not be removed safely: ${String(error)}`);
+} finally {
+parent.close();
+}
+}
   /**
    * Move one bounded batch of queue entries to a durable rejected namespace.
    * Darwin performs all moves under one inherited root descriptor; portable
    * callers retain the same no-follow/no-replace contract on Linux.
    */
-  discardBatch(relativeDirectory: string, names: readonly string[], rejectedRelativeDirectory: string, options: { maxEntries?: number; maxNameBytes?: number } = {}): number {
-    safeRelativeSegments(relativeDirectory, true);
-    assertCurrentExecutionLiveness();
-    safeRelativeSegments(rejectedRelativeDirectory, true);
-    const maxEntries = options.maxEntries ?? 512;
-    const maxNameBytes = options.maxNameBytes ?? 64 * 1024;
-    if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0 || maxEntries > DEFAULT_DIRECTORY_MAX_ENTRIES || names.length > maxEntries || !Number.isSafeInteger(maxNameBytes) || maxNameBytes <= 0 || maxNameBytes > DEFAULT_DIRECTORY_MAX_NAME_BYTES) {
-      throw new PinnedRootError("invalid", "bounded discard batch limits are invalid");
-    }
-    const validNames = names.map((name) => {
-      const segments = safeRelativeSegments(name);
-      if (segments.length !== 1) throw new PinnedRootError("path_unauthorized", "discard batch entry must be one path segment");
-      return segments[0]!;
-    });
-    if (validNames.reduce((total, name) => total + Buffer.byteLength(name, "utf8"), 0) > maxNameBytes) {
-      throw new PinnedRootError("limit", "bounded discard batch exceeded name-byte limit");
-    }
-    if (validNames.length === 0) return 0;
-    if (process.platform === "darwin") {
-      const result = this.runDescriptorHelper<{ moved?: unknown }>("discard_batch", {
-        path: relativeDirectory,
-        names: validNames,
-        rejected: rejectedRelativeDirectory,
-        max_entries: maxEntries,
-        max_name_bytes: maxNameBytes,
-      });
-      if (!Number.isSafeInteger(result.moved) || (result.moved as number) < 0 || (result.moved as number) > validNames.length) {
-        throw new PinnedRootError("write_failed", "descriptor helper returned an invalid discard count");
-      }
-      return result.moved as number;
-    }
-    this.ensureDirectory(rejectedRelativeDirectory);
-    let moved = 0;
-    for (const name of validNames) {
-      for (let attempt = 0; attempt < 8; attempt += 1) {
-        try {
-          this.renameFileExclusive(join(relativeDirectory, name), join(rejectedRelativeDirectory, boundedTemporaryComponent("discard", join(rejectedRelativeDirectory, name), ".discarded")));
-          moved += 1;
-          break;
-        } catch (error) {
-          if (error instanceof PinnedRootError && error.code === "not_found") break;
-          if (error instanceof PinnedRootError && error.code === "exists") continue;
-          throw error;
-        }
-      }
-    }
-    return moved;
-  }
-
-
-  /** Remove one anchored regular file, optionally accepting an absent target. */
-  removeFile(relativeFile: string, options: { missingOk?: boolean } = {}): void {
-    try {
-      this.unlink(relativeFile);
-    } catch (error) {
-      if (options.missingOk && error instanceof PinnedRootError && error.code === "not_found") return;
-      throw error;
-    }
-  }
-
-  /** Remove one anchored file, symlink, or empty directory without following links. */
-  removeEntry(relativePath: string): void {
-    const segments = safeRelativeSegments(relativePath);
-    assertCurrentExecutionLiveness();
-    if (process.platform === "darwin") {
-      this.runDescriptorHelper("remove_entry", { path: relativePath });
-      return;
-    }
-    const finalName = segments.pop()!;
-    const parent = this.openParent(segments, false);
-    try {
-      const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
-      this.assertCanonicalDirectory(segments.join("/"));
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      const stat = lstatSync(target);
-      assertCurrentExecutionLiveness();
-      if (stat.isDirectory() && !stat.isSymbolicLink()) rmdirSync(target);
-      else unlinkSync(target);
-      this.assertStable();
-      assertCurrentExecutionLiveness();
-    } catch (error) {
-      if (error instanceof ExecutionLivenessViolation) throw error;
-      if (error instanceof PinnedRootError) throw error;
-      if (errnoCode(error) === "ENOENT") throw new PinnedRootError("not_found", "anchored target does not exist");
-      throw new PinnedRootError("write_failed", `anchored target could not be removed safely: ${String(error)}`);
-    } finally { parent.close(); }
-  }
-
-  /** Return whether one anchored entry exists, without following links. */
-  pathEntryExists(relativePath: string): boolean {
-    const segments = safeRelativeSegments(relativePath);
-    if (process.platform === "darwin") {
-      const result = this.runDescriptorHelper<{ exists: unknown }>("exists", { path: relativePath });
-      return result.exists === true;
-    }
-    const finalName = segments.pop()!;
-    let parent: { fd: number; identity: Stats; close: () => void };
-    try { parent = this.openParent(segments, false); }
-    catch (error) { if (error instanceof PinnedRootError && error.code === "not_found") return false; throw error; }
-    try {
-      const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
-      try { lstatSync(target); return true; } catch (error) { if (errnoCode(error) === "ENOENT") return false; throw error; }
-    } catch (error) {
-      if (error instanceof PinnedRootError) throw error;
-      throw new PinnedRootError("path_unauthorized", `anchored path could not be inspected safely: ${String(error)}`);
-    } finally { parent.close(); }
-  }
-
-  /** Return no-follow metadata for one anchored path, or null when absent. */
-  pathEntryInfo(relativePath: string): PinnedRootPathEntryInfo | null {
-    const segments = safeRelativeSegments(relativePath);
-    if (process.platform === "darwin") {
-      const result = this.runDescriptorHelper<{ exists: unknown; kind?: unknown; mode?: unknown; size?: unknown; dev?: unknown; ino?: unknown; mtime_ms?: unknown; ctime_ms?: unknown }>("exists", { path: relativePath });
-      if (result.exists !== true) return null;
-      if (result.kind !== "file" && result.kind !== "directory" && result.kind !== "symlink" && result.kind !== "other") throw new PinnedRootError("write_failed", "descriptor helper returned invalid path metadata");
-      if (typeof result.mode !== "number" || !Number.isSafeInteger(result.mode) || result.mode < 0 || typeof result.size !== "number" || typeof result.dev !== "number" || typeof result.ino !== "number" || typeof result.mtime_ms !== "number" || typeof result.ctime_ms !== "number") throw new PinnedRootError("write_failed", "descriptor helper returned incomplete path metadata");
-      return { kind: result.kind, mode: result.mode, size: result.size, dev: result.dev, ino: result.ino, mtimeMs: result.mtime_ms, ctimeMs: result.ctime_ms };
-    }
-    const finalName = segments.pop()!;
-    let parent: { fd: number; identity: Stats; close: () => void };
-    try { parent = this.openParent(segments, false); }
-    catch (error) { if (error instanceof PinnedRootError && error.code === "not_found") return null; throw error; }
-    try {
-      const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
-      this.assertCanonicalDirectory(segments.join("/"));
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      let stat: Stats;
-      try { stat = lstatSync(target); }
-      catch (error) { if (errnoCode(error) === "ENOENT") return null; throw error; }
-      const kind = stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other";
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      this.assertStable();
-      return { kind, mode: stat.mode & 0o777, size: stat.size, dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
-    } catch (error) {
-      if (error instanceof PinnedRootError) throw error;
-      throw new PinnedRootError("write_failed", `anchored path metadata could not be read safely: ${String(error)}`);
-    } finally { parent.close(); }
-  }
-  /** Return no-follow metadata for several anchored paths in one helper call. */
-  pathEntryInfoBatch(relativePaths: readonly string[]): Array<PinnedRootPathEntryInfo | null> {
-    relativePaths.forEach((relativePath) => safeRelativeSegments(relativePath));
-    if (relativePaths.length === 0) return [];
-    if (relativePaths.length > 16) throw new PinnedRootError("invalid", "too many entries in one anchored path metadata batch");
-    if (process.platform !== "darwin") return relativePaths.map((relativePath) => this.pathEntryInfo(relativePath));
-    const result = this.runDescriptorHelper<{ results?: unknown[] }>("batch", {
-      operations: relativePaths.map((path) => ({ op: "exists", path })),
-    });
-    if (!Array.isArray(result.results) || result.results.length !== relativePaths.length) {
-      throw new PinnedRootError("write_failed", "descriptor helper returned incomplete path metadata batch");
-    }
-    return result.results.map((entry) => {
-      if (!entry || typeof entry !== "object") throw new PinnedRootError("write_failed", "descriptor helper returned invalid path metadata batch");
-      const value = entry as { exists?: unknown; kind?: unknown; mode?: unknown; size?: unknown; dev?: unknown; ino?: unknown; mtime_ms?: unknown; ctime_ms?: unknown };
-      if (value.exists !== true) return null;
-      if (value.kind !== "file" && value.kind !== "directory" && value.kind !== "symlink" && value.kind !== "other") throw new PinnedRootError("write_failed", "descriptor helper returned invalid batched path kind");
-      if (typeof value.mode !== "number" || !Number.isSafeInteger(value.mode) || value.mode < 0 || typeof value.size !== "number" || typeof value.dev !== "number" || typeof value.ino !== "number" || typeof value.mtime_ms !== "number" || typeof value.ctime_ms !== "number") throw new PinnedRootError("write_failed", "descriptor helper returned incomplete batched path metadata");
-      return { kind: value.kind, mode: value.mode, size: value.size, dev: value.dev, ino: value.ino, mtimeMs: value.mtime_ms, ctimeMs: value.ctime_ms };
-    });
-  }
-
-  /** Create a hard link atomically, preserving an existing destination. */
-  linkExclusive(relativeSource: string, relativeDestination: string): void {
-    safeRelativeSegments(relativeSource); safeRelativeSegments(relativeDestination);
-    assertCurrentExecutionLiveness();
-    if (process.platform === "darwin") { this.runDescriptorHelper("link_exclusive", { source: relativeSource, destination: relativeDestination }); return; }
-    const sourceSegments = safeRelativeSegments(relativeSource), destinationSegments = safeRelativeSegments(relativeDestination);
-    const sourceName = sourceSegments.pop()!, destinationName = destinationSegments.pop()!;
-    const sourceParent = this.openParent(sourceSegments, false);
-    try {
-      const destinationParent = this.openParent(destinationSegments, false);
-      try {
-        this.assertStable();
-        assertCurrentExecutionLiveness();
-        linkSync(this.childPath(sourceParent.fd, sourceName, [...sourceSegments, sourceName].join("/")), this.childPath(destinationParent.fd, destinationName, [...destinationSegments, destinationName].join("/")));
-        this.assertStable();
-        assertCurrentExecutionLiveness();
-      } catch (error) {
-        if (error instanceof ExecutionLivenessViolation) throw error;
-        if (error instanceof PinnedRootError) throw error;
-        if (errnoCode(error) === "EEXIST") throw new PinnedRootError("exists", "anchored destination already exists");
-        throw new PinnedRootError("write_failed", `anchored hard link failed: ${String(error)}`);
-      } finally { destinationParent.close(); }
-    } finally { sourceParent.close(); }
-  }
-
-  /** Rename one anchored entry without resolving a caller pathname. */
-  renameFile(relativeSource: string, relativeDestination: string): void {
-    safeRelativeSegments(relativeSource); safeRelativeSegments(relativeDestination);
-    assertCurrentExecutionLiveness();
-    if (process.platform === "darwin") { this.runDescriptorHelper("rename", { source: relativeSource, destination: relativeDestination }); return; }
-    const sourceSegments = safeRelativeSegments(relativeSource), destinationSegments = safeRelativeSegments(relativeDestination);
-    const sourceName = sourceSegments.pop()!, destinationName = destinationSegments.pop()!;
-    const sourceParent = this.openParent(sourceSegments, false);
-    try {
-      const destinationParent = this.openParent(destinationSegments, false);
-      try {
-        this.assertStable();
-        assertCurrentExecutionLiveness();
-        renameSync(this.childPath(sourceParent.fd, sourceName, [...sourceSegments, sourceName].join("/")), this.childPath(destinationParent.fd, destinationName, [...destinationSegments, destinationName].join("/")));
-        this.assertStable();
-        assertCurrentExecutionLiveness();
-      } catch (error) {
-        if (error instanceof ExecutionLivenessViolation) throw error;
-        if (error instanceof PinnedRootError) throw error;
-        if (errnoCode(error) === "ENOENT") throw new PinnedRootError("not_found", "anchored source does not exist");
-        throw new PinnedRootError("write_failed", `anchored rename failed: ${String(error)}`);
-      } finally { destinationParent.close(); }
-    } finally { sourceParent.close(); }
-  }
-
-  /** Atomically rename one anchored entry without replacing an existing destination. */
-  renameFileExclusive(relativeSource: string, relativeDestination: string): void {
-    safeRelativeSegments(relativeSource); safeRelativeSegments(relativeDestination);
-    assertCurrentExecutionLiveness();
-    this.runDescriptorHelper("rename_noreplace", { source: relativeSource, destination: relativeDestination });
-  }
-
-  /** Remove one anchored directory only after no-follow emptiness verification. */
-  removeEmptyDirectory(relativeDirectory: string): void {
-    safeRelativeSegments(relativeDirectory);
-    assertCurrentExecutionLiveness();
-    this.runDescriptorHelper("remove_empty_directory", { path: relativeDirectory });
-  }
-
-  /** Remove an empty anchored directory only when its inode still matches. */
-  removeEmptyDirectoryIfMatches(relativeDirectory: string, expected: { dev: number; ino: number }): boolean {
-    safeRelativeSegments(relativeDirectory);
-    assertCurrentExecutionLiveness();
-    if (!Number.isSafeInteger(expected.dev) || !Number.isSafeInteger(expected.ino)) throw new PinnedRootError("invalid", "directory expectation is invalid");
-    const result = this.runDescriptorHelper<{ removed?: unknown }>("remove_empty_directory_if_matches", {
-      path: relativeDirectory,
-      expected,
-    });
-    if (typeof result.removed !== "boolean") throw new PinnedRootError("write_failed", "descriptor helper returned an invalid directory removal result");
-    return result.removed;
-  }
-
-  /** Remove one empty anchored directory. */
-  removeDirectory(relativeDirectory: string): void {
-    safeRelativeSegments(relativeDirectory);
-    assertCurrentExecutionLiveness();
-    if (process.platform === "darwin") { this.runDescriptorHelper("rmdir", { path: relativeDirectory }); return; }
-    const segments = safeRelativeSegments(relativeDirectory), finalName = segments.pop()!, parent = this.openParent(segments, false);
-    try {
-      assertCurrentExecutionLiveness();
-      rmdirSync(this.childPath(parent.fd, finalName, [...segments, finalName].join("/")));
-      this.assertStable();
-      assertCurrentExecutionLiveness();
-    } catch (error) {
-      if (error instanceof ExecutionLivenessViolation) throw error;
-        if (error instanceof PinnedRootError) throw error;
-      if (errnoCode(error) === "ENOENT") throw new PinnedRootError("not_found", "anchored directory does not exist");
-      throw new PinnedRootError("write_failed", `anchored directory could not be removed: ${String(error)}`);
-    } finally { parent.close(); }
-  }
-
-  /** Read one bounded regular file through an anchored no-follow descriptor. */
-  readFile(relativeFile: string, options: { maxBytes?: number } = {}): PinnedRootReadResult {
-    const segments = safeRelativeSegments(relativeFile);
-    const maxBytes = options.maxBytes ?? MAX_PINNED_ROOT_READ_BYTES;
-    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_PINNED_ROOT_READ_BYTES) throw new PinnedRootError("invalid", "bounded read limit is invalid");
-    if (process.platform === "darwin") {
-      const result = this.runDescriptorHelper<{ bytes: string; dev: number; ino: number; size: number; mtime_ms: number; ctime_ms: number }>("read", { path: relativeFile, max_read: maxBytes });
-      return { path: this.canonicalPath(relativeFile), bytes: Buffer.from(result.bytes, "base64"), dev: result.dev, ino: result.ino, size: result.size, mtimeMs: result.mtime_ms, ctimeMs: result.ctime_ms };
-    }
-    const finalName = segments.pop()!;
-    const parent = this.openParent(segments, false);
-    let fileFd: number | null = null;
-    try {
-      const flags = readFlags();
-      if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow reads are unavailable");
-      const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
-      this.assertCanonicalDirectory(segments.join("/"));
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      fileFd = openSync(target, flags);
-      const before = fstatSync(fileFd);
-      if (!before.isFile()) throw new PinnedRootError("not_regular", "anchored source must be a regular file");
-      if (!Number.isSafeInteger(before.size) || before.size < 0 || before.size > maxBytes) throw new PinnedRootError("write_failed", "anchored source exceeds the bounded read limit");
-      // Read one byte beyond the queue budget so a concurrent append is
-      // detected before any JSON parse. The initial fstat remains a fast fail
-      // for an already oversized file, while the bounded loop handles growth.
-      const bytes = Buffer.allocUnsafe(maxBytes + 1);
-      let offset = 0;
-      while (offset < maxBytes + 1) {
-        const count = readSync(fileFd, bytes, offset, maxBytes + 1 - offset, offset);
-        if (count === 0) break;
-        offset += count;
-      }
-      if (offset > maxBytes) throw new PinnedRootError("write_failed", "anchored source exceeds the bounded read limit");
-      const resultBytes = bytes.subarray(0, offset);
-      const after = fstatSync(fileFd);
-      if (offset !== before.size || !sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
-        throw new PinnedRootError("changed", "anchored source changed while it was being read");
-      }
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      const pathname = lstatSync(target);
-      if (pathname.isSymbolicLink() || !pathname.isFile() || !sameIdentity(pathname, after)) throw new PinnedRootError("changed", "anchored source pathname changed while it was being read");
-      this.assertStable();
-      return { path: this.canonicalPath(relativeFile), bytes: resultBytes, dev: after.dev, ino: after.ino, size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs };
-    } catch (error) {
-      if (error instanceof PinnedRootError) throw error;
-      const code = errnoCode(error);
-      if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored source does not exist");
-      throw new PinnedRootError("write_failed", `anchored source could not be read safely: ${String(error)}`);
-    } finally {
-      closeQuietly(fileFd);
-      parent.close();
-    }
-  }
-
-  /** Read only a bounded prefix of a regular file, allowing larger files. */
-  readFilePrefix(relativeFile: string, options: { maxBytes?: number } = {}): PinnedRootReadResult {
-    const segments = safeRelativeSegments(relativeFile);
-    const maxBytes = options.maxBytes ?? MAX_PINNED_ROOT_READ_BYTES;
-    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_PINNED_ROOT_READ_BYTES) throw new PinnedRootError("invalid", "bounded prefix read limit is invalid");
-    if (process.platform === "darwin") {
-      const result = this.runDescriptorHelper<{ bytes: string; dev: number; ino: number }>("read_prefix", { path: relativeFile, max_read: maxBytes });
-      return { path: this.canonicalPath(relativeFile), bytes: Buffer.from(result.bytes, "base64"), dev: result.dev, ino: result.ino };
-    }
-    const finalName = segments.pop()!;
-    const parent = this.openParent(segments, false);
-    let fileFd: number | null = null;
-    try {
-      const flags = readFlags();
-      if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow reads are unavailable");
-      const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
-      this.assertCanonicalDirectory(segments.join("/"));
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      fileFd = openSync(target, flags);
-      const before = fstatSync(fileFd);
-      if (!before.isFile()) throw new PinnedRootError("not_regular", "anchored source must be a regular file");
-      const bytes = Buffer.allocUnsafe(maxBytes);
-      let offset = 0;
-      while (offset < maxBytes) {
-        const count = readSync(fileFd, bytes, offset, maxBytes - offset, offset);
-        if (count === 0) break;
-        offset += count;
-      }
-      const after = fstatSync(fileFd);
-      if (!sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
-        throw new PinnedRootError("changed", "anchored source changed while it was being read");
-      }
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      const pathname = lstatSync(target);
-      if (pathname.isSymbolicLink() || !pathname.isFile() || !sameIdentity(pathname, after)) throw new PinnedRootError("changed", "anchored source pathname changed while it was being read");
-      this.assertStable();
-      return { path: this.canonicalPath(relativeFile), bytes: bytes.subarray(0, offset), dev: after.dev, ino: after.ino };
-    } catch (error) {
-      if (error instanceof PinnedRootError) throw error;
-      const code = errnoCode(error);
-      if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored source does not exist");
-      throw new PinnedRootError("write_failed", `anchored source prefix could not be read safely: ${String(error)}`);
-    } finally {
-      closeQuietly(fileFd);
-      parent.close();
-    }
-  }
-  /** Read one bounded regular-file batch under one anchored helper request. */
-  readBatch(
-    relativeDirectory: string,
-    names: readonly string[],
-    options: { maxEntries?: number; maxNameBytes?: number; maxBytes?: number; maxTotalBytes?: number } = {},
-  ): {
-    records: Array<{ name: string; bytes: Uint8Array; dev: number; ino: number }>;
-    failed: string[];
-    remaining: string[];
-  } {
-    safeRelativeSegments(relativeDirectory, true);
-    const maxEntries = options.maxEntries ?? 64;
-    const maxNameBytes = options.maxNameBytes ?? DEFAULT_DIRECTORY_MAX_NAME_BYTES;
-    const maxBytes = options.maxBytes ?? MAX_PINNED_ROOT_READ_BYTES;
-    const maxTotalBytes = options.maxTotalBytes ?? 2 * 1024 * 1024;
-    if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0 || maxEntries > DEFAULT_DIRECTORY_MAX_ENTRIES || names.length > maxEntries || !Number.isSafeInteger(maxNameBytes) || maxNameBytes <= 0 || maxNameBytes > DEFAULT_DIRECTORY_MAX_NAME_BYTES || !Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_PINNED_ROOT_READ_BYTES || !Number.isSafeInteger(maxTotalBytes) || maxTotalBytes <= 0 || maxTotalBytes > 2 * 1024 * 1024) {
-      throw new PinnedRootError("invalid", "bounded read batch limits are invalid");
-    }
-    const validNames = names.map((name) => {
-      const segments = safeRelativeSegments(name);
-      if (segments.length !== 1) throw new PinnedRootError("path_unauthorized", "read batch entry must be one path segment");
-      return segments[0]!;
-    });
-    if (validNames.reduce((total, name) => total + Buffer.byteLength(name, "utf8"), 0) > maxNameBytes) {
-      throw new PinnedRootError("limit", "bounded read batch exceeded name-byte limit");
-    }
-    if (validNames.length === 0) return { records: [], failed: [], remaining: [] };
-    if (process.platform === "darwin") {
-      const result = this.runDescriptorHelper<{ records?: unknown; failed?: unknown; remaining?: unknown }>("read_batch", {
-        path: relativeDirectory,
-        names: validNames,
-        max_entries: maxEntries,
-        max_name_bytes: maxNameBytes,
-        max_read: maxBytes,
-        max_total_bytes: maxTotalBytes,
-      });
-      if (!Array.isArray(result.records) || !Array.isArray(result.failed) || !Array.isArray(result.remaining)) {
-        throw new PinnedRootError("write_failed", "descriptor helper returned invalid read batch records");
-      }
-      const allowed = new Set(validNames);
-      const records = result.records.flatMap((record) => {
-        if (!record || typeof record !== "object") return [];
-        const value = record as { name?: unknown; bytes?: unknown; dev?: unknown; ino?: unknown };
-        if (typeof value.name !== "string" || !allowed.has(value.name) || typeof value.bytes !== "string" || !Number.isSafeInteger(value.dev) || !Number.isSafeInteger(value.ino)) return [];
-        return [{ name: value.name, bytes: Buffer.from(value.bytes, "base64"), dev: value.dev as number, ino: value.ino as number }];
-      });
-      const failed = result.failed.filter((name): name is string => typeof name === "string" && allowed.has(name));
-      const remaining = result.remaining.filter((name): name is string => typeof name === "string" && allowed.has(name));
-      return { records, failed, remaining };
-    }
-    const records: Array<{ name: string; bytes: Uint8Array; dev: number; ino: number }> = [];
-    const failed: string[] = [];
-    const remaining: string[] = [];
-    let totalBytes = 0;
-    for (let index = 0; index < validNames.length; index += 1) {
-      const name = validNames[index]!;
-      try {
-        const read = this.readFile(join(relativeDirectory, name), { maxBytes });
-        if (totalBytes + read.bytes.byteLength > maxTotalBytes) {
-          remaining.push(...validNames.slice(index));
-          break;
-        }
-        totalBytes += read.bytes.byteLength;
-        records.push({ name, bytes: read.bytes, dev: read.dev, ino: read.ino });
-      } catch {
-        failed.push(name);
-      }
-    }
-    return { records, failed, remaining };
-  }
-
-
+discardBatch(relativeDirectory: string, names: readonly string[], rejectedRelativeDirectory: string, options: { maxEntries?: number; maxNameBytes?: number } = {}): number {
+safeRelativeSegments(relativeDirectory, true);
+assertCurrentExecutionLiveness();
+safeRelativeSegments(rejectedRelativeDirectory, true);
+const maxEntries = options.maxEntries ?? 512;
+const maxNameBytes = options.maxNameBytes ?? 64 * 1024;
+if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0 || maxEntries > DEFAULT_DIRECTORY_MAX_ENTRIES || names.length > maxEntries || !Number.isSafeInteger(maxNameBytes) || maxNameBytes <= 0 || maxNameBytes > DEFAULT_DIRECTORY_MAX_NAME_BYTES) {
+throw new PinnedRootError("invalid", "bounded discard batch limits are invalid");
+}
+const validNames = names.map((name) => {
+const segments = safeRelativeSegments(name);
+if (segments.length !== 1) throw new PinnedRootError("path_unauthorized", "discard batch entry must be one path segment");
+return segments[0]!;
+});
+if (validNames.reduce((total, name) => total + Buffer.byteLength(name, "utf8"), 0) > maxNameBytes) {
+throw new PinnedRootError("limit", "bounded discard batch exceeded name-byte limit");
+}
+if (validNames.length === 0) return 0;
+if (process.platform === "darwin") {
+const result = this.runDescriptorHelper<{ moved?: unknown }>("discard_batch", {
+path: relativeDirectory,
+names: validNames,
+rejected: rejectedRelativeDirectory,
+max_entries: maxEntries,
+max_name_bytes: maxNameBytes,
+});
+if (!Number.isSafeInteger(result.moved) || (result.moved as number) < 0 || (result.moved as number) > validNames.length) {
+throw new PinnedRootError("write_failed", "descriptor helper returned an invalid discard count");
+}
+return result.moved as number;
+}
+this.ensureDirectory(rejectedRelativeDirectory);
+let moved = 0;
+for (const name of validNames) {
+for (let attempt = 0; attempt < 8; attempt += 1) {
+try {
+this.renameFileExclusive(join(relativeDirectory, name), join(rejectedRelativeDirectory, boundedTemporaryComponent("discard", join(rejectedRelativeDirectory, name), ".discarded")));
+moved += 1;
+break;
+} catch (error) {
+if (error instanceof PinnedRootError && error.code === "not_found") break;
+if (error instanceof PinnedRootError && error.code === "exists") continue;
+throw error;
+}
+}
+}
+return moved;
+}
+/** Remove one anchored regular file, optionally accepting an absent target. */
+removeFile(relativeFile: string, options: { missingOk?: boolean } = {}): void {
+try {
+this.unlink(relativeFile);
+} catch (error) {
+if (options.missingOk && error instanceof PinnedRootError && error.code === "not_found") return;
+throw error;
+}
+}
+/** Remove one anchored file, symlink, or empty directory without following links. */
+removeEntry(relativePath: string): void {
+const segments = safeRelativeSegments(relativePath);
+assertCurrentExecutionLiveness();
+if (process.platform === "darwin") {
+this.runDescriptorHelper("remove_entry", { path: relativePath });
+return;
+}
+const finalName = segments.pop()!;
+const parent = this.openParent(segments, false);
+try {
+const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+const stat = lstatSync(target);
+assertCurrentExecutionLiveness();
+if (stat.isDirectory() && !stat.isSymbolicLink()) rmdirSync(target);
+else unlinkSync(target);
+this.assertStable();
+assertCurrentExecutionLiveness();
+} catch (error) {
+if (error instanceof ExecutionLivenessViolation) throw error;
+if (error instanceof PinnedRootError) throw error;
+if (errnoCode(error) === "ENOENT") throw new PinnedRootError("not_found", "anchored target does not exist");
+throw new PinnedRootError("write_failed", `anchored target could not be removed safely: ${String(error)}`);
+} finally { parent.close(); }
+}
+/** Return whether one anchored entry exists, without following links. */
+pathEntryExists(relativePath: string): boolean {
+const segments = safeRelativeSegments(relativePath);
+if (process.platform === "darwin") {
+const result = this.runDescriptorHelper<{ exists: unknown }>("exists", { path: relativePath });
+return result.exists === true;
+}
+const finalName = segments.pop()!;
+let parent: { fd: number; identity: Stats; close: () => void };
+try { parent = this.openParent(segments, false); }
+catch (error) { if (error instanceof PinnedRootError && error.code === "not_found") return false; throw error; }
+try {
+const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
+try { lstatSync(target); return true; } catch (error) { if (errnoCode(error) === "ENOENT") return false; throw error; }
+} catch (error) {
+if (error instanceof PinnedRootError) throw error;
+throw new PinnedRootError("path_unauthorized", `anchored path could not be inspected safely: ${String(error)}`);
+} finally { parent.close(); }
+}
+/** Return no-follow metadata for one anchored path, or null when absent. */
+pathEntryInfo(relativePath: string): PinnedRootPathEntryInfo | null {
+const segments = safeRelativeSegments(relativePath);
+if (process.platform === "darwin") {
+const result = this.runDescriptorHelper<{ exists: unknown; kind?: unknown; mode?: unknown; size?: unknown; dev?: unknown; ino?: unknown; mtime_ms?: unknown; ctime_ms?: unknown }>("exists", { path: relativePath });
+if (result.exists !== true) return null;
+if (result.kind !== "file" && result.kind !== "directory" && result.kind !== "symlink" && result.kind !== "other") throw new PinnedRootError("write_failed", "descriptor helper returned invalid path metadata");
+if (typeof result.mode !== "number" || !Number.isSafeInteger(result.mode) || result.mode < 0 || typeof result.size !== "number" || typeof result.dev !== "number" || typeof result.ino !== "number" || typeof result.mtime_ms !== "number" || typeof result.ctime_ms !== "number") throw new PinnedRootError("write_failed", "descriptor helper returned incomplete path metadata");
+return { kind: result.kind, mode: result.mode, size: result.size, dev: result.dev, ino: result.ino, mtimeMs: result.mtime_ms, ctimeMs: result.ctime_ms };
+}
+const finalName = segments.pop()!;
+let parent: { fd: number; identity: Stats; close: () => void };
+try { parent = this.openParent(segments, false); }
+catch (error) { if (error instanceof PinnedRootError && error.code === "not_found") return null; throw error; }
+try {
+const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+let stat: Stats;
+try { stat = lstatSync(target); }
+catch (error) { if (errnoCode(error) === "ENOENT") return null; throw error; }
+const kind = stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other";
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+this.assertStable();
+return { kind, mode: stat.mode & 0o777, size: stat.size, dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
+} catch (error) {
+if (error instanceof PinnedRootError) throw error;
+throw new PinnedRootError("write_failed", `anchored path metadata could not be read safely: ${String(error)}`);
+} finally { parent.close(); }
+}
+/** Return no-follow metadata for several anchored paths in one helper call. */
+pathEntryInfoBatch(relativePaths: readonly string[]): Array<PinnedRootPathEntryInfo | null> {
+relativePaths.forEach((relativePath) => safeRelativeSegments(relativePath));
+if (relativePaths.length === 0) return [];
+if (relativePaths.length > 16) throw new PinnedRootError("invalid", "too many entries in one anchored path metadata batch");
+if (process.platform !== "darwin") return relativePaths.map((relativePath) => this.pathEntryInfo(relativePath));
+const result = this.runDescriptorHelper<{ results?: unknown[] }>("batch", {
+operations: relativePaths.map((path) => ({ op: "exists", path })),
+});
+if (!Array.isArray(result.results) || result.results.length !== relativePaths.length) {
+throw new PinnedRootError("write_failed", "descriptor helper returned incomplete path metadata batch");
+}
+return result.results.map((entry) => {
+if (!entry || typeof entry !== "object") throw new PinnedRootError("write_failed", "descriptor helper returned invalid path metadata batch");
+const value = entry as { exists?: unknown; kind?: unknown; mode?: unknown; size?: unknown; dev?: unknown; ino?: unknown; mtime_ms?: unknown; ctime_ms?: unknown };
+if (value.exists !== true) return null;
+if (value.kind !== "file" && value.kind !== "directory" && value.kind !== "symlink" && value.kind !== "other") throw new PinnedRootError("write_failed", "descriptor helper returned invalid batched path kind");
+if (typeof value.mode !== "number" || !Number.isSafeInteger(value.mode) || value.mode < 0 || typeof value.size !== "number" || typeof value.dev !== "number" || typeof value.ino !== "number" || typeof value.mtime_ms !== "number" || typeof value.ctime_ms !== "number") throw new PinnedRootError("write_failed", "descriptor helper returned incomplete batched path metadata");
+return { kind: value.kind, mode: value.mode, size: value.size, dev: value.dev, ino: value.ino, mtimeMs: value.mtime_ms, ctimeMs: value.ctime_ms };
+});
+}
+/** Create a hard link atomically, preserving an existing destination. */
+linkExclusive(relativeSource: string, relativeDestination: string): void {
+safeRelativeSegments(relativeSource); safeRelativeSegments(relativeDestination);
+assertCurrentExecutionLiveness();
+if (process.platform === "darwin") { this.runDescriptorHelper("link_exclusive", { source: relativeSource, destination: relativeDestination }); return; }
+const sourceSegments = safeRelativeSegments(relativeSource), destinationSegments = safeRelativeSegments(relativeDestination);
+const sourceName = sourceSegments.pop()!, destinationName = destinationSegments.pop()!;
+const sourceParent = this.openParent(sourceSegments, false);
+try {
+const destinationParent = this.openParent(destinationSegments, false);
+try {
+this.assertStable();
+assertCurrentExecutionLiveness();
+linkSync(this.childPath(sourceParent.fd, sourceName, [...sourceSegments, sourceName].join("/")), this.childPath(destinationParent.fd, destinationName, [...destinationSegments, destinationName].join("/")));
+this.assertStable();
+assertCurrentExecutionLiveness();
+} catch (error) {
+if (error instanceof ExecutionLivenessViolation) throw error;
+if (error instanceof PinnedRootError) throw error;
+if (errnoCode(error) === "EEXIST") throw new PinnedRootError("exists", "anchored destination already exists");
+throw new PinnedRootError("write_failed", `anchored hard link failed: ${String(error)}`);
+} finally { destinationParent.close(); }
+} finally { sourceParent.close(); }
+}
+/** Rename one anchored entry without resolving a caller pathname. */
+renameFile(relativeSource: string, relativeDestination: string): void {
+safeRelativeSegments(relativeSource); safeRelativeSegments(relativeDestination);
+assertCurrentExecutionLiveness();
+if (process.platform === "darwin") { this.runDescriptorHelper("rename", { source: relativeSource, destination: relativeDestination }); return; }
+const sourceSegments = safeRelativeSegments(relativeSource), destinationSegments = safeRelativeSegments(relativeDestination);
+const sourceName = sourceSegments.pop()!, destinationName = destinationSegments.pop()!;
+const sourceParent = this.openParent(sourceSegments, false);
+try {
+const destinationParent = this.openParent(destinationSegments, false);
+try {
+this.assertStable();
+assertCurrentExecutionLiveness();
+renameSync(this.childPath(sourceParent.fd, sourceName, [...sourceSegments, sourceName].join("/")), this.childPath(destinationParent.fd, destinationName, [...destinationSegments, destinationName].join("/")));
+this.assertStable();
+assertCurrentExecutionLiveness();
+} catch (error) {
+if (error instanceof ExecutionLivenessViolation) throw error;
+if (error instanceof PinnedRootError) throw error;
+if (errnoCode(error) === "ENOENT") throw new PinnedRootError("not_found", "anchored source does not exist");
+throw new PinnedRootError("write_failed", `anchored rename failed: ${String(error)}`);
+} finally { destinationParent.close(); }
+} finally { sourceParent.close(); }
+}
+/** Atomically rename one anchored entry without replacing an existing destination. */
+renameFileExclusive(relativeSource: string, relativeDestination: string): void {
+safeRelativeSegments(relativeSource); safeRelativeSegments(relativeDestination);
+assertCurrentExecutionLiveness();
+this.runDescriptorHelper("rename_noreplace", { source: relativeSource, destination: relativeDestination });
+}
+/** Remove one anchored directory only after no-follow emptiness verification. */
+removeEmptyDirectory(relativeDirectory: string): void {
+safeRelativeSegments(relativeDirectory);
+assertCurrentExecutionLiveness();
+this.runDescriptorHelper("remove_empty_directory", { path: relativeDirectory });
+}
+/** Remove an empty anchored directory only when its inode still matches. */
+removeEmptyDirectoryIfMatches(relativeDirectory: string, expected: { dev: number; ino: number }): boolean {
+safeRelativeSegments(relativeDirectory);
+assertCurrentExecutionLiveness();
+if (!Number.isSafeInteger(expected.dev) || !Number.isSafeInteger(expected.ino)) throw new PinnedRootError("invalid", "directory expectation is invalid");
+const result = this.runDescriptorHelper<{ removed?: unknown }>("remove_empty_directory_if_matches", {
+path: relativeDirectory,
+expected,
+});
+if (typeof result.removed !== "boolean") throw new PinnedRootError("write_failed", "descriptor helper returned an invalid directory removal result");
+return result.removed;
+}
+/** Remove one empty anchored directory. */
+removeDirectory(relativeDirectory: string): void {
+safeRelativeSegments(relativeDirectory);
+assertCurrentExecutionLiveness();
+if (process.platform === "darwin") { this.runDescriptorHelper("rmdir", { path: relativeDirectory }); return; }
+const segments = safeRelativeSegments(relativeDirectory), finalName = segments.pop()!, parent = this.openParent(segments, false);
+try {
+assertCurrentExecutionLiveness();
+rmdirSync(this.childPath(parent.fd, finalName, [...segments, finalName].join("/")));
+this.assertStable();
+assertCurrentExecutionLiveness();
+} catch (error) {
+if (error instanceof ExecutionLivenessViolation) throw error;
+if (error instanceof PinnedRootError) throw error;
+if (errnoCode(error) === "ENOENT") throw new PinnedRootError("not_found", "anchored directory does not exist");
+throw new PinnedRootError("write_failed", `anchored directory could not be removed: ${String(error)}`);
+} finally { parent.close(); }
+}
+/** Read one bounded regular file through an anchored no-follow descriptor. */
+readFile(relativeFile: string, options: { maxBytes?: number } = {}): PinnedRootReadResult {
+const segments = safeRelativeSegments(relativeFile);
+const maxBytes = options.maxBytes ?? MAX_PINNED_ROOT_READ_BYTES;
+if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_PINNED_ROOT_READ_BYTES) throw new PinnedRootError("invalid", "bounded read limit is invalid");
+if (process.platform === "darwin") {
+const result = this.runDescriptorHelper<{ bytes: string; dev: number; ino: number; size: number; mtime_ms: number; ctime_ms: number }>("read", { path: relativeFile, max_read: maxBytes });
+return { path: this.canonicalPath(relativeFile), bytes: Buffer.from(result.bytes, "base64"), dev: result.dev, ino: result.ino, size: result.size, mtimeMs: result.mtime_ms, ctimeMs: result.ctime_ms };
+}
+const finalName = segments.pop()!;
+const parent = this.openParent(segments, false);
+let fileFd: number | null = null;
+try {
+const flags = readFlags();
+if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow reads are unavailable");
+const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+fileFd = openSync(target, flags);
+const before = fstatSync(fileFd);
+if (!before.isFile()) throw new PinnedRootError("not_regular", "anchored source must be a regular file");
+if (!Number.isSafeInteger(before.size) || before.size < 0 || before.size > maxBytes) throw new PinnedRootError("write_failed", "anchored source exceeds the bounded read limit");
+// Read one byte beyond the queue budget so a concurrent append is
+// detected before any JSON parse. The initial fstat remains a fast fail
+// for an already oversized file, while the bounded loop handles growth.
+const bytes = Buffer.allocUnsafe(maxBytes + 1);
+let offset = 0;
+while (offset < maxBytes + 1) {
+const count = readSync(fileFd, bytes, offset, maxBytes + 1 - offset, offset);
+if (count === 0) break;
+offset += count;
+}
+if (offset > maxBytes) throw new PinnedRootError("write_failed", "anchored source exceeds the bounded read limit");
+const resultBytes = bytes.subarray(0, offset);
+const after = fstatSync(fileFd);
+if (offset !== before.size || !sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+throw new PinnedRootError("changed", "anchored source changed while it was being read");
+}
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+const pathname = lstatSync(target);
+if (pathname.isSymbolicLink() || !pathname.isFile() || !sameIdentity(pathname, after)) throw new PinnedRootError("changed", "anchored source pathname changed while it was being read");
+this.assertStable();
+return { path: this.canonicalPath(relativeFile), bytes: resultBytes, dev: after.dev, ino: after.ino, size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs };
+} catch (error) {
+if (error instanceof PinnedRootError) throw error;
+const code = errnoCode(error);
+if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored source does not exist");
+throw new PinnedRootError("write_failed", `anchored source could not be read safely: ${String(error)}`);
+} finally {
+closeQuietly(fileFd);
+parent.close();
+}
+}
+/** Read only a bounded prefix of a regular file, allowing larger files. */
+readFilePrefix(relativeFile: string, options: { maxBytes?: number } = {}): PinnedRootReadResult {
+const segments = safeRelativeSegments(relativeFile);
+const maxBytes = options.maxBytes ?? MAX_PINNED_ROOT_READ_BYTES;
+if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_PINNED_ROOT_READ_BYTES) throw new PinnedRootError("invalid", "bounded prefix read limit is invalid");
+if (process.platform === "darwin") {
+const result = this.runDescriptorHelper<{ bytes: string; dev: number; ino: number }>("read_prefix", { path: relativeFile, max_read: maxBytes });
+return { path: this.canonicalPath(relativeFile), bytes: Buffer.from(result.bytes, "base64"), dev: result.dev, ino: result.ino };
+}
+const finalName = segments.pop()!;
+const parent = this.openParent(segments, false);
+let fileFd: number | null = null;
+try {
+const flags = readFlags();
+if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow reads are unavailable");
+const target = this.childPath(parent.fd, finalName, [...segments, finalName].join("/"));
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+fileFd = openSync(target, flags);
+const before = fstatSync(fileFd);
+if (!before.isFile()) throw new PinnedRootError("not_regular", "anchored source must be a regular file");
+const bytes = Buffer.allocUnsafe(maxBytes);
+let offset = 0;
+while (offset < maxBytes) {
+const count = readSync(fileFd, bytes, offset, maxBytes - offset, offset);
+if (count === 0) break;
+offset += count;
+}
+const after = fstatSync(fileFd);
+if (!sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+throw new PinnedRootError("changed", "anchored source changed while it was being read");
+}
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+const pathname = lstatSync(target);
+if (pathname.isSymbolicLink() || !pathname.isFile() || !sameIdentity(pathname, after)) throw new PinnedRootError("changed", "anchored source pathname changed while it was being read");
+this.assertStable();
+return { path: this.canonicalPath(relativeFile), bytes: bytes.subarray(0, offset), dev: after.dev, ino: after.ino };
+} catch (error) {
+if (error instanceof PinnedRootError) throw error;
+const code = errnoCode(error);
+if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored source does not exist");
+throw new PinnedRootError("write_failed", `anchored source prefix could not be read safely: ${String(error)}`);
+} finally {
+closeQuietly(fileFd);
+parent.close();
+}
+}
+/** Read one bounded regular-file batch under one anchored helper request. */
+readBatch(
+relativeDirectory: string,
+names: readonly string[],
+options: { maxEntries?: number; maxNameBytes?: number; maxBytes?: number; maxTotalBytes?: number } = {},
+): {
+records: Array<{ name: string; bytes: Uint8Array; dev: number; ino: number }>;
+failed: string[];
+remaining: string[];
+} {
+safeRelativeSegments(relativeDirectory, true);
+const maxEntries = options.maxEntries ?? 64;
+const maxNameBytes = options.maxNameBytes ?? DEFAULT_DIRECTORY_MAX_NAME_BYTES;
+const maxBytes = options.maxBytes ?? MAX_PINNED_ROOT_READ_BYTES;
+const maxTotalBytes = options.maxTotalBytes ?? 2 * 1024 * 1024;
+if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0 || maxEntries > DEFAULT_DIRECTORY_MAX_ENTRIES || names.length > maxEntries || !Number.isSafeInteger(maxNameBytes) || maxNameBytes <= 0 || maxNameBytes > DEFAULT_DIRECTORY_MAX_NAME_BYTES || !Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_PINNED_ROOT_READ_BYTES || !Number.isSafeInteger(maxTotalBytes) || maxTotalBytes <= 0 || maxTotalBytes > 2 * 1024 * 1024) {
+throw new PinnedRootError("invalid", "bounded read batch limits are invalid");
+}
+const validNames = names.map((name) => {
+const segments = safeRelativeSegments(name);
+if (segments.length !== 1) throw new PinnedRootError("path_unauthorized", "read batch entry must be one path segment");
+return segments[0]!;
+});
+if (validNames.reduce((total, name) => total + Buffer.byteLength(name, "utf8"), 0) > maxNameBytes) {
+throw new PinnedRootError("limit", "bounded read batch exceeded name-byte limit");
+}
+if (validNames.length === 0) return { records: [], failed: [], remaining: [] };
+if (process.platform === "darwin") {
+const result = this.runDescriptorHelper<{ records?: unknown; failed?: unknown; remaining?: unknown }>("read_batch", {
+path: relativeDirectory,
+names: validNames,
+max_entries: maxEntries,
+max_name_bytes: maxNameBytes,
+max_read: maxBytes,
+max_total_bytes: maxTotalBytes,
+});
+if (!Array.isArray(result.records) || !Array.isArray(result.failed) || !Array.isArray(result.remaining)) {
+throw new PinnedRootError("write_failed", "descriptor helper returned invalid read batch records");
+}
+const allowed = new Set(validNames);
+const records = result.records.flatMap((record) => {
+if (!record || typeof record !== "object") return [];
+const value = record as { name?: unknown; bytes?: unknown; dev?: unknown; ino?: unknown };
+if (typeof value.name !== "string" || !allowed.has(value.name) || typeof value.bytes !== "string" || !Number.isSafeInteger(value.dev) || !Number.isSafeInteger(value.ino)) return [];
+return [{ name: value.name, bytes: Buffer.from(value.bytes, "base64"), dev: value.dev as number, ino: value.ino as number }];
+});
+const failed = result.failed.filter((name): name is string => typeof name === "string" && allowed.has(name));
+const remaining = result.remaining.filter((name): name is string => typeof name === "string" && allowed.has(name));
+return { records, failed, remaining };
+}
+const records: Array<{ name: string; bytes: Uint8Array; dev: number; ino: number }> = [];
+const failed: string[] = [];
+const remaining: string[] = [];
+let totalBytes = 0;
+for (let index = 0; index < validNames.length; index += 1) {
+const name = validNames[index]!;
+try {
+const read = this.readFile(join(relativeDirectory, name), { maxBytes });
+if (totalBytes + read.bytes.byteLength > maxTotalBytes) {
+remaining.push(...validNames.slice(index));
+break;
+}
+totalBytes += read.bytes.byteLength;
+records.push({ name, bytes: read.bytes, dev: read.dev, ino: read.ino });
+} catch {
+failed.push(name);
+}
+}
+return { records, failed, remaining };
+}
   /**
    * Return one stable lexicographic page of descriptor-anchored entries.
    * The directory is scanned once within explicit scan bounds; the cursor is
    * the last returned name and therefore remains monotonic across pages.
    */
-  listDirectoryPage(
-    relativeDirectory = "",
-    options: {
-      cursor?: string | null;
-      maxEntries?: number;
-      maxNameBytes?: number;
-      maxScanEntries?: number;
-      maxScanNameBytes?: number;
-    } = {},
-  ): PinnedRootDirectoryPage {
-    const segments = safeRelativeSegments(relativeDirectory, true);
-    const maxEntries = options.maxEntries ?? 64;
-    const maxNameBytes = options.maxNameBytes ?? DEFAULT_DIRECTORY_MAX_NAME_BYTES;
-    const maxScanEntries = options.maxScanEntries ?? DEFAULT_DIRECTORY_MAX_ENTRIES;
-    const maxScanNameBytes = options.maxScanNameBytes ?? DEFAULT_DIRECTORY_MAX_NAME_BYTES;
-    const cursor = options.cursor ?? null;
-    if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0 || maxEntries > DEFAULT_DIRECTORY_MAX_ENTRIES
-      || !Number.isSafeInteger(maxNameBytes) || maxNameBytes <= 0 || maxNameBytes > DEFAULT_DIRECTORY_MAX_NAME_BYTES
-      || !Number.isSafeInteger(maxScanEntries) || maxScanEntries <= 0 || maxScanEntries > DEFAULT_DIRECTORY_MAX_ENTRIES
-      || !Number.isSafeInteger(maxScanNameBytes) || maxScanNameBytes <= 0 || maxScanNameBytes > DEFAULT_DIRECTORY_MAX_NAME_BYTES
-      || (cursor !== null && (typeof cursor !== "string" || cursor.length > MAX_RELATIVE_PATH_LENGTH))) {
-      throw new PinnedRootError("invalid", "bounded directory pagination limits or cursor are invalid");
-    }
-    let allNames: string[];
-    if (process.platform === "darwin") {
-      const result = this.runDescriptorHelper<{ names: unknown }>("list", {
-        path: relativeDirectory,
-        max_entries: maxScanEntries,
-        max_name_bytes: maxScanNameBytes,
-      });
-      if (!Array.isArray(result.names) || result.names.some((name) => typeof name !== "string")) {
-        throw new PinnedRootError("write_failed", "descriptor helper returned invalid directory entries");
-      }
-      allNames = result.names as string[];
-    } else {
-      const parent = this.openParent(segments, false);
-      let directory: ReturnType<typeof opendirSync> | null = null;
-      try {
-        this.assertCanonicalDirectory(segments.join("/"));
-        this.assertParentPathIdentity(parent.fd, segments.join("/"));
-        const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
-        directory = opendirSync(parentPath);
-        allNames = [];
-        let scanWork = 0;
-        while (true) {
-          const entry = directory.readSync();
-          if (entry === null) break;
-          if (allNames.length >= maxScanEntries) throw new PinnedRootError("limit", "bounded directory enumeration exceeded entry limit");
-          const nameBytes = Buffer.byteLength(entry.name, "utf8");
-          if (scanWork + nameBytes > maxScanNameBytes) throw new PinnedRootError("limit", "bounded directory enumeration exceeded name-byte limit");
-          allNames.push(entry.name);
-          scanWork += nameBytes;
-        }
-        this.assertCanonicalDirectory(segments.join("/"));
-        this.assertParentPathIdentity(parent.fd, segments.join("/"));
-        this.assertStable();
-      } catch (error) {
-        if (error instanceof PinnedRootError) throw error;
-        const code = errnoCode(error);
-        if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored directory does not exist");
-        throw new PinnedRootError("write_failed", `anchored directory could not be listed safely: ${String(error)}`);
-      } finally {
-        try { directory?.closeSync(); } catch { /* preserve the primary listing result */ }
-        parent.close();
-      }
-    }
-    allNames.sort();
-    const start = cursor === null ? 0 : allNames.findIndex((name) => name > cursor);
-    if (start < 0) return { names: [], nextCursor: null };
-    const names: string[] = [];
-    let pageWork = 0;
-    for (let index = start; index < allNames.length && names.length < maxEntries; index += 1) {
-      const name = allNames[index]!;
-      const nameBytes = Buffer.byteLength(name, "utf8");
-      if (nameBytes > maxNameBytes || pageWork + nameBytes > maxNameBytes) {
-        if (names.length === 0) throw new PinnedRootError("limit", "bounded directory page exceeded name-byte limit");
-        break;
-      }
-      names.push(name);
-      pageWork += nameBytes;
-    }
-    if (names.length === 0 && start < allNames.length) throw new PinnedRootError("limit", "bounded directory page made no progress");
-    const last = names.at(-1) ?? null;
-    const nextCursor = last !== null && allNames.some((name) => name > last) ? last : null;
-    return { names, nextCursor };
-  }
-
+listDirectoryPage(
+relativeDirectory = "",
+options: {
+cursor?: string | null;
+maxEntries?: number;
+maxNameBytes?: number;
+maxScanEntries?: number;
+maxScanNameBytes?: number;
+} = {},
+): PinnedRootDirectoryPage {
+const segments = safeRelativeSegments(relativeDirectory, true);
+const maxEntries = options.maxEntries ?? 64;
+const maxNameBytes = options.maxNameBytes ?? DEFAULT_DIRECTORY_MAX_NAME_BYTES;
+const maxScanEntries = options.maxScanEntries ?? DEFAULT_DIRECTORY_MAX_ENTRIES;
+const maxScanNameBytes = options.maxScanNameBytes ?? DEFAULT_DIRECTORY_MAX_NAME_BYTES;
+const cursor = options.cursor ?? null;
+if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0 || maxEntries > DEFAULT_DIRECTORY_MAX_ENTRIES
+|| !Number.isSafeInteger(maxNameBytes) || maxNameBytes <= 0 || maxNameBytes > DEFAULT_DIRECTORY_MAX_NAME_BYTES
+|| !Number.isSafeInteger(maxScanEntries) || maxScanEntries <= 0 || maxScanEntries > DEFAULT_DIRECTORY_MAX_ENTRIES
+|| !Number.isSafeInteger(maxScanNameBytes) || maxScanNameBytes <= 0 || maxScanNameBytes > DEFAULT_DIRECTORY_MAX_NAME_BYTES
+|| (cursor !== null && (typeof cursor !== "string" || cursor.length > MAX_RELATIVE_PATH_LENGTH))) {
+throw new PinnedRootError("invalid", "bounded directory pagination limits or cursor are invalid");
+}
+let allNames: string[];
+if (process.platform === "darwin") {
+const result = this.runDescriptorHelper<{ names: unknown }>("list", {
+path: relativeDirectory,
+max_entries: maxScanEntries,
+max_name_bytes: maxScanNameBytes,
+});
+if (!Array.isArray(result.names) || result.names.some((name) => typeof name !== "string")) {
+throw new PinnedRootError("write_failed", "descriptor helper returned invalid directory entries");
+}
+allNames = result.names as string[];
+} else {
+const parent = this.openParent(segments, false);
+let directory: ReturnType<typeof opendirSync> | null = null;
+try {
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
+directory = opendirSync(parentPath);
+allNames = [];
+let scanWork = 0;
+while (true) {
+const entry = directory.readSync();
+if (entry === null) break;
+if (allNames.length >= maxScanEntries) throw new PinnedRootError("limit", "bounded directory enumeration exceeded entry limit");
+const nameBytes = Buffer.byteLength(entry.name, "utf8");
+if (scanWork + nameBytes > maxScanNameBytes) throw new PinnedRootError("limit", "bounded directory enumeration exceeded name-byte limit");
+allNames.push(entry.name);
+scanWork += nameBytes;
+}
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+this.assertStable();
+} catch (error) {
+if (error instanceof PinnedRootError) throw error;
+const code = errnoCode(error);
+if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored directory does not exist");
+throw new PinnedRootError("write_failed", `anchored directory could not be listed safely: ${String(error)}`);
+} finally {
+try { directory?.closeSync(); } catch { /* preserve the primary listing result */ }
+parent.close();
+}
+}
+allNames.sort();
+const start = cursor === null ? 0 : allNames.findIndex((name) => name > cursor);
+if (start < 0) return { names: [], nextCursor: null };
+const names: string[] = [];
+let pageWork = 0;
+for (let index = start; index < allNames.length && names.length < maxEntries; index += 1) {
+const name = allNames[index]!;
+const nameBytes = Buffer.byteLength(name, "utf8");
+if (nameBytes > maxNameBytes || pageWork + nameBytes > maxNameBytes) {
+if (names.length === 0) throw new PinnedRootError("limit", "bounded directory page exceeded name-byte limit");
+break;
+}
+names.push(name);
+pageWork += nameBytes;
+}
+if (names.length === 0 && start < allNames.length) throw new PinnedRootError("limit", "bounded directory page made no progress");
+const last = names.at(-1) ?? null;
+const nextCursor = last !== null && allNames.some((name) => name > last) ? last : null;
+return { names, nextCursor };
+}
   /**
    * Read one bounded, unsorted directory batch directly from the OS iterator.
    * This is for destructive queues: callers remove the returned entries and
    * request another batch on the next tick, so no whole-directory scan or
    * cursor is needed to make progress through large queues.
    */
-  listDirectoryBatch(
-    relativeDirectory = "",
-    options: { maxEntries?: number; maxNameBytes?: number } = {},
-  ): string[] {
-    const segments = safeRelativeSegments(relativeDirectory, true);
-    const maxEntries = options.maxEntries ?? 64;
-    const maxNameBytes = options.maxNameBytes ?? DEFAULT_DIRECTORY_MAX_NAME_BYTES;
-    if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0 || maxEntries > DEFAULT_DIRECTORY_MAX_ENTRIES
-      || !Number.isSafeInteger(maxNameBytes) || maxNameBytes <= 0 || maxNameBytes > DEFAULT_DIRECTORY_MAX_NAME_BYTES) {
-      throw new PinnedRootError("invalid", "bounded directory batch limits are invalid");
-    }
-    if (process.platform === "darwin") {
-      const result = this.runDescriptorHelper<{ names: unknown }>("list_batch", {
-        path: relativeDirectory,
-        max_entries: maxEntries,
-        max_name_bytes: maxNameBytes,
-      });
-      if (!Array.isArray(result.names) || result.names.some((name) => typeof name !== "string")) {
-        throw new PinnedRootError("write_failed", "descriptor helper returned invalid directory batch entries");
-      }
-      return result.names as string[];
-    }
-    const parent = this.openParent(segments, false);
-    let directory: ReturnType<typeof opendirSync> | null = null;
-    try {
-      this.assertCanonicalDirectory(segments.join("/"));
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
-      directory = opendirSync(parentPath);
-      const names: string[] = [];
-      let work = 0;
-      for (let index = 0; index < maxEntries; index += 1) {
-        const entry = directory.readSync();
-        if (entry === null) break;
-        const nameBytes = Buffer.byteLength(entry.name, "utf8");
-        if (nameBytes > maxNameBytes || work + nameBytes > maxNameBytes) {
-          if (names.length === 0) throw new PinnedRootError("limit", "bounded directory batch exceeded name-byte limit");
-          break;
-        }
-        names.push(entry.name);
-        work += nameBytes;
-      }
-      this.assertCanonicalDirectory(segments.join("/"));
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      this.assertStable();
-      return names;
-    } catch (error) {
-      if (error instanceof PinnedRootError) throw error;
-      const code = errnoCode(error);
-      if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored directory does not exist");
-      throw new PinnedRootError("write_failed", "anchored directory batch could not be listed safely: " + String(error));
-    } finally {
-      try { directory?.closeSync(); } catch { /* preserve the primary listing result */ }
-      parent.close();
-    }
-  }
-
-  /** List all entries only within an explicit bounded directory budget. */
-  listDirectory(
-    relativeDirectory = "",
-    options: { maxEntries?: number; maxNameBytes?: number } = {},
-  ): string[] {
-    const maxEntries = options.maxEntries ?? DEFAULT_DIRECTORY_MAX_ENTRIES;
-    const maxNameBytes = options.maxNameBytes ?? DEFAULT_DIRECTORY_MAX_NAME_BYTES;
-    const page = this.listDirectoryPage(relativeDirectory, {
-      maxEntries,
-      maxNameBytes,
-      maxScanEntries: maxEntries,
-      maxScanNameBytes: maxNameBytes,
-    });
-    if (page.nextCursor !== null) throw new PinnedRootError("limit", "bounded directory enumeration exceeded entry limit");
-    return page.names;
-  }
-
-  /** Replace one regular file only when its inode and SHA-256 still match. */
-  replaceFileIfMatches(relativeFile: string, expected: PinnedRootFileExpectation, content: PinnedRootWriteContent): void {
-    this.replaceFileIfMatchesWithDescriptor(relativeFile, expected, content);
-  }
-
-  /** Compare-and-swap replacement returning the inode published by this operation. */
-  replaceFileIfMatchesWithDescriptor(
-    relativeFile: string,
-    expected: PinnedRootFileExpectation,
-    content: PinnedRootWriteContent,
-    options: PinnedRootWriteOptions = {},
-  ): PinnedRootWriteDescriptor {
-    const preparedPlatform = options.beforePublish !== undefined && (process.platform === "darwin" || process.platform === "linux");
-    const capturedPreimage = preparedPlatform ? undefined : this.captureWritePreimage(relativeFile);
-    if (preparedPlatform) {
-      const prepared = this.writeDarwinPrepared("atomic", relativeFile, content, options, expected);
-      const published = this.finishPublishedDescriptor(relativeFile, prepared.descriptor, prepared.preimage, true);
-      descriptorPreimages.set(published, prepared.preimage);
-      descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, prepared.preimage));
-      return published;
-    }
-    const result = this.conditionalCommit(relativeFile, expected, content, "replace", (published) => {
-      if (published.recovered === true) return;
-      try {
-        const descriptor = descriptorFromResponse(relativeFile, this.anchorPath(relativeFile), content, published);
-        const preimage = preimageFromResponse(published);
-        if (!this.rollbackPublishedDescriptor(relativeFile, descriptor, preimage)) {
-          throw new PinnedRootError("changed", "conditional replacement rollback could not be proven");
-        }
-      } catch {
-        // Preserve the original conditional-operation failure; a malformed
-        // descriptor is not safe to adopt or use for rollback.
-      }
-    });
-    const descriptor = descriptorFromResponse(relativeFile, this.anchorPath(relativeFile), content, result);
-    const preimage = result.recovered === true
-      ? (capturedPreimage ?? (() => { throw new PinnedRootError("write_failed", "conditional replacement recovery lost its exact preimage"); })())
-      : preimageFromResponse(result);
-    const published = this.finishPublishedDescriptor(relativeFile, descriptor, preimage, result.recovered !== true);
-    descriptorPreimages.set(published, preimage);
-    descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, preimage));
-    return published;
-  }
-
-  /** Conditional replacement receipt retaining the exact replaced preimage. */
-  replaceFileIfMatchesWithReceipt(
-    relativeFile: string,
-    expected: PinnedRootFileExpectation,
-    content: PinnedRootWriteContent,
-    options: PinnedRootWriteOptions = {},
-  ): PinnedRootWriteReceipt {
-    // Receipt-producing conditional replacements must retain the helper's
-    // prepared lease through descriptor conversion even without a user hook;
-    // route through the same prepared protocol with an internal no-op marker.
-    const preparedOptions = options.beforePublish ? options : { ...options, beforePublish: () => {} };
-    const descriptor = this.replaceFileIfMatchesWithDescriptor(relativeFile, expected, content, preparedOptions);
-    const receipt = descriptorReceipts.get(descriptor);
-    if (receipt) return receipt;
-    const preimage = descriptorPreimages.get(descriptor);
-    if (!preimage) throw new PinnedRootError("write_failed", "conditional replacement returned no exact preimage");
-    const created = this.makeWriteReceipt(relativeFile, descriptor, preimage);
-    descriptorReceipts.set(descriptor, created);
-    return created;
-  }
-
-  /** Remove one regular file only when its inode and SHA-256 still match. */
-  removeFileIfMatches(relativeFile: string, expected: PinnedRootFileExpectation): void {
-    this.conditionalCommit(relativeFile, expected, null, "remove");
-  }
-
-  private conditionalCommit(
-    relativeFile: string,
-    expected: PinnedRootFileExpectation,
-    content: PinnedRootWriteContent | null,
-    operation: ConditionalOperation,
-    onPublishedFailure?: (result: PinnedWriteDescriptorResponse) => void,
-  ): PinnedWriteDescriptorResponse {
-    const segments = safeRelativeSegments(relativeFile);
-    if (operation === "replace") contentByteLength(content as PinnedRootWriteContent);
-    this.assertExpectation(expected);
-    if (process.platform === "darwin" || process.platform === "linux") {
-      let result: PinnedWriteDescriptorResponse | undefined;
-      try {
-        this.hooks.beforeConditionalCommit?.(relativeFile);
-        this.assertStable();
-        // mutation. These deterministic seams execute immediately before that
-        // request; the helper repeats every check, so an injected interloper
-        // is rejected without touching its bytes.
-        this.hooks.afterConditionalLock?.(relativeFile);
-        this.hooks.afterConditionalVerification?.(relativeFile);
-        this.hooks.afterConditionalStage?.(relativeFile);
-        this.hooks.beforeRename?.(relativeFile);
-        result = this.runDescriptorHelper<PinnedWriteDescriptorResponse>(operation === "replace" ? "replace_if_matches" : "remove_if_matches", {
-          path: relativeFile,
-          expected,
-          ...(operation === "replace" ? { bytes: contentToBase64(content as PinnedRootWriteContent) } : {}),
-          ...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}), ...(this.hooks.preparedPostVerifyMutation ? { test_prepared_post_verify_mutation: true } : {}), ...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}),
-          ...(operation === "replace" && this.hooks.conditionalPostExchangeMutation ? { test_post_exchange_mutation: true } : {}),
-          ...(operation === "replace" && this.hooks.conditionalPreExchangeMutation ? { test_pre_exchange_mutation: true } : {}),
-          ...(operation === "replace" && this.hooks.conditionalStagePreExchangeMutation ? { test_stage_pre_exchange_mutation: true } : {}),
-          ...(this.hooks.conditionalPostExchangeStageMutation ? { test_post_exchange_stage_mutation: true } : {}),
-          ...(operation === "remove" && this.hooks.conditionalPreMoveMutation ? { test_pre_move_mutation: true } : {}),
-          ...(operation === "remove" && this.hooks.conditionalPreMoveSymlink ? { test_pre_move_symlink: true } : {}),
-        });
-        this.hooks.afterConditionalReplace?.(relativeFile);
-        if (this.hooks.afterConditionalReplace) {
-          try {
-            if (operation === "replace") {
-              const observed = this.readFile(relativeFile, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
-              const desired = Buffer.from(content as PinnedRootWriteContent);
-              if (!Buffer.from(observed.bytes).equals(desired)) throw new PinnedRootError("changed", "anchored target changed after conditional replacement");
-            } else if (this.pathEntryExists(relativeFile)) {
-              throw new PinnedRootError("changed", "anchored target changed after conditional removal");
-            }
-          } catch (error) {
-            if (error instanceof PinnedRootError && error.code === "not_found" && operation === "replace") {
-              throw new PinnedRootError("changed", "anchored target disappeared after conditional replacement");
-            }
-            throw error;
-          }
-        }
-      } catch (error) {
-        if (result?.ok === true && result.recovered !== true) onPublishedFailure?.(result);
-        throw error;
-      } finally {
-        try { this.hooks.beforeConditionalCleanup?.(relativeFile); } catch { /* preserve the primary operation result */ }
-        try { this.hooks.beforeCleanup?.(relativeFile); } catch { /* preserve the primary operation result */ }
-      }
-      assertCurrentExecutionLiveness();
-      if (!result) throw new PinnedRootError("write_failed", "conditional operation completed without a result");
-      return result;
-    }
-    throw new PinnedRootError("unsupported", "conditional replace/remove is unsupported on this platform");
-  }
-
-  private assertConditionalExpectation(observed: PinnedRootReadResult, expected: PinnedRootFileExpectation, message: string): void {
-    const digest = createHash("sha256").update(observed.bytes).digest("hex");
-    if (observed.dev !== expected.dev || observed.ino !== expected.ino || digest !== expected.sha256) throw new PinnedRootError("changed", message);
-  }
-
-  /** Crash-durable exclusive temp-write/fsync/hard-link anchored to the pinned root. */
-  writeExclusive(relativeFile: string, content: PinnedRootWriteContent): void {
-    this.writeExclusiveWithDescriptor(relativeFile, content);
-  }
-
+listDirectoryBatch(
+relativeDirectory = "",
+options: { maxEntries?: number; maxNameBytes?: number } = {},
+): string[] {
+const segments = safeRelativeSegments(relativeDirectory, true);
+const maxEntries = options.maxEntries ?? 64;
+const maxNameBytes = options.maxNameBytes ?? DEFAULT_DIRECTORY_MAX_NAME_BYTES;
+if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0 || maxEntries > DEFAULT_DIRECTORY_MAX_ENTRIES
+|| !Number.isSafeInteger(maxNameBytes) || maxNameBytes <= 0 || maxNameBytes > DEFAULT_DIRECTORY_MAX_NAME_BYTES) {
+throw new PinnedRootError("invalid", "bounded directory batch limits are invalid");
+}
+if (process.platform === "darwin") {
+const result = this.runDescriptorHelper<{ names: unknown }>("list_batch", {
+path: relativeDirectory,
+max_entries: maxEntries,
+max_name_bytes: maxNameBytes,
+});
+if (!Array.isArray(result.names) || result.names.some((name) => typeof name !== "string")) {
+throw new PinnedRootError("write_failed", "descriptor helper returned invalid directory batch entries");
+}
+return result.names as string[];
+}
+const parent = this.openParent(segments, false);
+let directory: ReturnType<typeof opendirSync> | null = null;
+try {
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
+directory = opendirSync(parentPath);
+const names: string[] = [];
+let work = 0;
+for (let index = 0; index < maxEntries; index += 1) {
+const entry = directory.readSync();
+if (entry === null) break;
+const nameBytes = Buffer.byteLength(entry.name, "utf8");
+if (nameBytes > maxNameBytes || work + nameBytes > maxNameBytes) {
+if (names.length === 0) throw new PinnedRootError("limit", "bounded directory batch exceeded name-byte limit");
+break;
+}
+names.push(entry.name);
+work += nameBytes;
+}
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+this.assertStable();
+return names;
+} catch (error) {
+if (error instanceof PinnedRootError) throw error;
+const code = errnoCode(error);
+if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored directory does not exist");
+throw new PinnedRootError("write_failed", "anchored directory batch could not be listed safely: " + String(error));
+} finally {
+try { directory?.closeSync(); } catch { /* preserve the primary listing result */ }
+parent.close();
+}
+}
+/** List all entries only within an explicit bounded directory budget. */
+listDirectory(
+relativeDirectory = "",
+options: { maxEntries?: number; maxNameBytes?: number } = {},
+): string[] {
+const maxEntries = options.maxEntries ?? DEFAULT_DIRECTORY_MAX_ENTRIES;
+const maxNameBytes = options.maxNameBytes ?? DEFAULT_DIRECTORY_MAX_NAME_BYTES;
+const page = this.listDirectoryPage(relativeDirectory, {
+maxEntries,
+maxNameBytes,
+maxScanEntries: maxEntries,
+maxScanNameBytes: maxNameBytes,
+});
+if (page.nextCursor !== null) throw new PinnedRootError("limit", "bounded directory enumeration exceeded entry limit");
+return page.names;
+}
+/** Replace one regular file only when its inode and SHA-256 still match. */
+replaceFileIfMatches(relativeFile: string, expected: PinnedRootFileExpectation, content: PinnedRootWriteContent): void {
+this.replaceFileIfMatchesWithDescriptor(relativeFile, expected, content);
+}
+/** Compare-and-swap replacement returning the inode published by this operation. */
+replaceFileIfMatchesWithDescriptor(
+relativeFile: string,
+expected: PinnedRootFileExpectation,
+content: PinnedRootWriteContent,
+options: PinnedRootWriteOptions = {},
+): PinnedRootWriteDescriptor {
+const preparedPlatform = options.beforePublish !== undefined && (process.platform === "darwin" || process.platform === "linux");
+const capturedPreimage = preparedPlatform ? undefined : this.captureWritePreimage(relativeFile);
+if (preparedPlatform) {
+const prepared = this.writeDarwinPrepared("atomic", relativeFile, content, options, expected);
+const published = this.finishPublishedDescriptor(relativeFile, prepared.descriptor, prepared.preimage, true);
+descriptorPreimages.set(published, prepared.preimage);
+descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, prepared.preimage));
+return published;
+}
+const result = this.conditionalCommit(relativeFile, expected, content, "replace", (published) => {
+if (published.recovered === true) return;
+try {
+const descriptor = descriptorFromResponse(relativeFile, this.anchorPath(relativeFile), content, published);
+const preimage = preimageFromResponse(published);
+if (!this.rollbackPublishedDescriptor(relativeFile, descriptor, preimage)) {
+throw new PinnedRootError("changed", "conditional replacement rollback could not be proven");
+}
+} catch {
+// Preserve the original conditional-operation failure; a malformed
+// descriptor is not safe to adopt or use for rollback.
+}
+});
+const descriptor = descriptorFromResponse(relativeFile, this.anchorPath(relativeFile), content, result);
+const preimage = result.recovered === true
+? (capturedPreimage ?? (() => { throw new PinnedRootError("write_failed", "conditional replacement recovery lost its exact preimage"); })())
+: preimageFromResponse(result);
+const published = this.finishPublishedDescriptor(relativeFile, descriptor, preimage, result.recovered !== true);
+descriptorPreimages.set(published, preimage);
+descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, preimage));
+return published;
+}
+/** Conditional replacement receipt retaining the exact replaced preimage. */
+replaceFileIfMatchesWithReceipt(
+relativeFile: string,
+expected: PinnedRootFileExpectation,
+content: PinnedRootWriteContent,
+options: PinnedRootWriteOptions = {},
+): PinnedRootWriteReceipt {
+// Receipt-producing conditional replacements must retain the helper's
+// prepared lease through descriptor conversion even without a user hook;
+// route through the same prepared protocol with an internal no-op marker.
+const preparedOptions = options.beforePublish ? options : { ...options, beforePublish: () => {} };
+const descriptor = this.replaceFileIfMatchesWithDescriptor(relativeFile, expected, content, preparedOptions);
+const receipt = descriptorReceipts.get(descriptor);
+if (receipt) return receipt;
+const preimage = descriptorPreimages.get(descriptor);
+if (!preimage) throw new PinnedRootError("write_failed", "conditional replacement returned no exact preimage");
+const created = this.makeWriteReceipt(relativeFile, descriptor, preimage);
+descriptorReceipts.set(descriptor, created);
+return created;
+}
+/** Remove one regular file only when its inode and SHA-256 still match. */
+removeFileIfMatches(relativeFile: string, expected: PinnedRootFileExpectation): void {
+this.conditionalCommit(relativeFile, expected, null, "remove");
+}
+private conditionalCommit(
+relativeFile: string,
+expected: PinnedRootFileExpectation,
+content: PinnedRootWriteContent | null,
+operation: ConditionalOperation,
+onPublishedFailure?: (result: PinnedWriteDescriptorResponse) => void,
+): PinnedWriteDescriptorResponse {
+const segments = safeRelativeSegments(relativeFile);
+if (operation === "replace") contentByteLength(content as PinnedRootWriteContent);
+this.assertExpectation(expected);
+if (process.platform === "darwin" || process.platform === "linux") {
+let result: PinnedWriteDescriptorResponse | undefined;
+try {
+this.hooks.beforeConditionalCommit?.(relativeFile);
+this.assertStable();
+// mutation. These deterministic seams execute immediately before that
+// request; the helper repeats every check, so an injected interloper
+// is rejected without touching its bytes.
+this.hooks.afterConditionalLock?.(relativeFile);
+this.hooks.afterConditionalVerification?.(relativeFile);
+this.hooks.afterConditionalStage?.(relativeFile);
+this.hooks.beforeRename?.(relativeFile);
+result = this.runDescriptorHelper<PinnedWriteDescriptorResponse>(operation === "replace" ? "replace_if_matches" : "remove_if_matches", {
+path: relativeFile,
+expected,
+...(operation === "replace" ? { bytes: contentToBase64(content as PinnedRootWriteContent) } : {}),
+...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}), ...(this.hooks.preparedPostVerifyMutation ? { test_prepared_post_verify_mutation: true } : {}), ...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}),
+...(operation === "replace" && this.hooks.conditionalPostExchangeMutation ? { test_post_exchange_mutation: true } : {}),
+...(operation === "replace" && this.hooks.conditionalPreExchangeMutation ? { test_pre_exchange_mutation: true } : {}),
+...(operation === "replace" && this.hooks.conditionalStagePreExchangeMutation ? { test_stage_pre_exchange_mutation: true } : {}),
+...(this.hooks.conditionalPostExchangeStageMutation ? { test_post_exchange_stage_mutation: true } : {}),
+...(operation === "remove" && this.hooks.conditionalPreMoveMutation ? { test_pre_move_mutation: true } : {}),
+...(operation === "remove" && this.hooks.conditionalPreMoveSymlink ? { test_pre_move_symlink: true } : {}),
+});
+this.hooks.afterConditionalReplace?.(relativeFile);
+if (this.hooks.afterConditionalReplace) {
+try {
+if (operation === "replace") {
+const observed = this.readFile(relativeFile, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
+const desired = Buffer.from(content as PinnedRootWriteContent);
+if (!Buffer.from(observed.bytes).equals(desired)) throw new PinnedRootError("changed", "anchored target changed after conditional replacement");
+} else if (this.pathEntryExists(relativeFile)) {
+throw new PinnedRootError("changed", "anchored target changed after conditional removal");
+}
+} catch (error) {
+if (error instanceof PinnedRootError && error.code === "not_found" && operation === "replace") {
+throw new PinnedRootError("changed", "anchored target disappeared after conditional replacement");
+}
+throw error;
+}
+}
+} catch (error) {
+if (result?.ok === true && result.recovered !== true) onPublishedFailure?.(result);
+throw error;
+} finally {
+try { this.hooks.beforeConditionalCleanup?.(relativeFile); } catch { /* preserve the primary operation result */ }
+try { this.hooks.beforeCleanup?.(relativeFile); } catch { /* preserve the primary operation result */ }
+}
+assertCurrentExecutionLiveness();
+if (!result) throw new PinnedRootError("write_failed", "conditional operation completed without a result");
+return result;
+}
+throw new PinnedRootError("unsupported", "conditional replace/remove is unsupported on this platform");
+}
+private assertConditionalExpectation(observed: PinnedRootReadResult, expected: PinnedRootFileExpectation, message: string): void {
+const digest = createHash("sha256").update(observed.bytes).digest("hex");
+if (observed.dev !== expected.dev || observed.ino !== expected.ino || digest !== expected.sha256) throw new PinnedRootError("changed", message);
+}
+/** Crash-durable exclusive temp-write/fsync/hard-link anchored to the pinned root. */
+writeExclusive(relativeFile: string, content: PinnedRootWriteContent): void {
+this.writeExclusiveWithDescriptor(relativeFile, content);
+}
   /**
    * Exclusive write returning the inode published by this operation. The
    * descriptor is captured from the operation's own temp inode, not by
    * re-opening the final pathname after a concurrent writer can replace it.
    */
-  writeExclusiveWithDescriptor(relativeFile: string, content: PinnedRootWriteContent, options: PinnedRootWriteOptions = {}): PinnedRootWriteDescriptor {
-    contentByteLength(content);
-    const segments = safeRelativeSegments(relativeFile);
-    assertCurrentExecutionLiveness();
-    if (process.platform === "darwin") {
-      let prepared: { descriptor: PinnedRootWriteDescriptor; preimage: PinnedRootWritePreimage } | null = null;
-      try {
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          try {
-            this.hooks.beforeTempOpen?.(relativeFile);
-            this.hooks.beforeRename?.(relativeFile);
-            prepared = this.writeDarwinPrepared("exclusive", relativeFile, content, options);
-            break;
-          } catch (error) {
-            if (!(error instanceof PinnedRootError) || error.code !== "changed" || attempt === 1) throw error;
-          }
-        }
-      } finally {
-        try { this.hooks.beforeCleanup?.(relativeFile); } catch { /* preserve the primary operation result */ }
-      }
-      if (!prepared) throw new PinnedRootError("write_failed", "prepared exclusive write completed without an operation descriptor");
-      const published = this.finishPublishedDescriptor(relativeFile, prepared.descriptor, prepared.preimage, true);
-      descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, prepared.preimage));
-      return published;
-    }
-    const preimage = this.captureWritePreimage(relativeFile);
-    const finalName = segments.pop()!;
-    const parent = this.openParent(segments, true);
-    const relativeTarget = [...segments, finalName].join("/");
-    let tempFd: number | null = null;
-    let tempPath: string | null = null;
-    let descriptor: PinnedRootWriteDescriptor | null = null;
-    let publicationComplete = false;
-    try {
-      const flags = writeFlags();
-      if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow writes are unavailable");
-      const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
-      for (let attempt = 0; attempt < 32; attempt += 1) {
-        const tempName = boundedTemporaryComponent("write", relativeTarget, ".tmp");
-        const candidate = join(parentPath, tempName);
-        this.hooks.beforeTempOpen?.(relativeTarget);
-        this.assertCanonicalDirectory(segments.join("/"));
-        this.assertParentPathIdentity(parent.fd, segments.join("/"));
-        try {
-          tempFd = openSync(candidate, flags, 0o600);
-          tempPath = candidate;
-          break;
-        } catch (error) {
-          if (errnoCode(error) !== "EEXIST") throw error;
-        }
-      }
-      if (tempFd === null || tempPath === null) throw new PinnedRootError("write_failed", "unable to reserve an exclusive temp file");
-      const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
-      let offset = 0;
-      while (offset < bytes.length) {
-        const written = writeSync(tempFd, bytes, offset, bytes.length - offset);
-        if (written <= 0) throw new PinnedRootError("write_failed", "short anchored exclusive write");
-        offset += written;
-      }
-      fchmodSync(tempFd, 0o600);
-      fsyncSync(tempFd);
-      this.assertStable();
-      const parentAfter = fstatSync(parent.fd);
-      if (!sameIdentity(parentAfter, parent.identity)) throw new PinnedRootError("changed", "anchored parent changed during exclusive commit");
-      const target = join(parentPath, finalName);
-      try {
-        const existing = lstatSync(target);
-        if (existing.isSymbolicLink() || (!existing.isFile() && !existing.isDirectory())) throw new PinnedRootError("path_unauthorized", "anchored exclusive target is unsafe");
-        throw new PinnedRootError("exists", "anchored exclusive target already exists");
-      } catch (error) {
-        if (error instanceof PinnedRootError) throw error;
-        if (errnoCode(error) !== "ENOENT") throw error;
-      }
-      const source = fstatSync(tempFd);
-      const planned: PinnedRootWriteDescriptor = {
-        path: this.anchorPath(relativeFile),
-        relative_path: relativeFile,
-        dev: source.dev,
-        ino: source.ino,
-        size: contentByteLength(content),
-        sha256: contentSha256(content),
-      };
-      this.hooks.beforeRename?.(relativeTarget);
-      this.assertCanonicalDirectory(segments.join("/"));
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      this.assertStable();
-      assertCurrentExecutionLiveness();
-      const receipt = this.makeWriteReceipt(relativeFile, planned, preimage);
-      this.hooks.beforePublish?.(receipt);
-      options.beforePublish?.(receipt);
-      try {
-        linkSync(tempPath, target);
-      } catch (error) {
-        if (errnoCode(error) === "EEXIST") throw new PinnedRootError("exists", "anchored exclusive target already exists");
-        throw error;
-      }
-      descriptor = planned;
-      publicationComplete = true;
-      this.hooks.afterPublish?.(relativeTarget);
-      const committed = lstatSync(target);
-      if (committed.isSymbolicLink() || !committed.isFile() || !sameIdentity(committed, source)) throw new PinnedRootError("path_unauthorized", "anchored exclusive destination changed during commit");
-      closeQuietly(tempFd);
-      tempFd = null;
-      unlinkSync(tempPath);
-      tempPath = null;
-      try {
-        fsyncSync(parent.fd);
-      } catch (error) {
-        const code = errnoCode(error);
-        if (code !== "EINVAL" && code !== "ENOTSUP") throw error;
-      }
-      this.hooks.afterPublishLiveness?.(relativeTarget);
-      assertCurrentExecutionLiveness();
-    } catch (error) {
-      if (publicationComplete && descriptor !== null) {
-        let rolledBack = false;
-        try {
-          rolledBack = withoutCurrentExecutionLiveness(() => this.rollbackPublishedDescriptor(relativeFile, descriptor!, preimage));
-        } catch {
-          rolledBack = false;
-        }
-        if (!rolledBack) {
-          throw new PinnedRootError("changed", `anchored exclusive publication failed and its exact rollback could not be proven: ${String(error)}`);
-        }
-        publicationComplete = false;
-      }
-      if (error instanceof ExecutionLivenessViolation) throw error;
-      if (error instanceof PinnedRootError) throw error;
-      const code = errnoCode(error);
-      if (code === "ENOENT") throw new PinnedRootError("not_found", `anchored parent does not exist for '${relativeTarget}'`);
-      throw new PinnedRootError("write_failed", `anchored exclusive write failed: ${String(error)}`);
-    } finally {
-      try { this.hooks.beforeCleanup?.(relativeTarget); } catch { /* test seams cannot replace the primary result */ }
-      closeQuietly(tempFd);
-      if (tempPath !== null) {
-        let safeCleanup = true;
-        try { this.assertCanonicalDirectory(segments.join("/")); } catch { safeCleanup = false; }
-        if (safeCleanup) { try { unlinkSync(tempPath); } catch { } }
-      }
-      parent.close();
-    }
-    if (descriptor === null) throw new PinnedRootError("write_failed", "anchored exclusive write completed without an operation descriptor");
-    const published = this.finishPublishedDescriptor(relativeFile, descriptor, preimage);
-    descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, preimage));
-    return published;
-  }
-
-  /** Exact publication receipt with the preimage captured by the transaction. */
-  writeExclusiveWithReceipt(relativeFile: string, content: PinnedRootWriteContent, options: PinnedRootWriteOptions = {}): PinnedRootWriteReceipt {
-    const descriptor = this.writeExclusiveWithDescriptor(relativeFile, content, options);
-    const receipt = descriptorReceipts.get(descriptor);
-    if (receipt) return receipt;
-    return this.makeWriteReceipt(relativeFile, descriptor, this.captureWritePreimage(relativeFile));
-  }
-
-  /** Crash-durable temp-write/fsync/rename anchored to the pinned root. */
-  writeAtomic(relativeFile: string, content: PinnedRootWriteContent): void {
-    this.writeAtomicWithDescriptor(relativeFile, content);
-  }
-
-  /** Exact publication receipt with the preimage captured by the transaction. */
-  writeAtomicWithReceipt(relativeFile: string, content: PinnedRootWriteContent, options: PinnedRootWriteOptions = {}): PinnedRootWriteReceipt {
-    const descriptor = this.writeAtomicWithDescriptor(relativeFile, content, options);
-    const receipt = descriptorReceipts.get(descriptor);
-    if (receipt) return receipt;
-    return this.makeWriteReceipt(relativeFile, descriptor, this.captureWritePreimage(relativeFile));
-  }
-
-  /** Atomic write returning the inode published by this operation. */
-  writeAtomicWithDescriptor(relativeFile: string, content: PinnedRootWriteContent, options: PinnedRootWriteOptions = {}): PinnedRootWriteDescriptor {
-    contentByteLength(content);
-    const segments = safeRelativeSegments(relativeFile);
-    assertCurrentExecutionLiveness();
-    if (process.platform === "darwin") {
-      let prepared: { descriptor: PinnedRootWriteDescriptor; preimage: PinnedRootWritePreimage } | null = null;
-      try {
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          try {
-            this.hooks.beforeTempOpen?.(relativeFile);
-            this.hooks.beforeRename?.(relativeFile);
-            prepared = this.writeDarwinPrepared("atomic", relativeFile, content, options);
-            break;
-          } catch (error) {
-            if (!(error instanceof PinnedRootError) || error.code !== "changed" || attempt === 1) throw error;
-          }
-        }
-      } finally {
-        try { this.hooks.beforeCleanup?.(relativeFile); } catch { /* preserve the primary operation result */ }
-      }
-      if (!prepared) throw new PinnedRootError("write_failed", "prepared atomic write completed without an operation descriptor");
-      const published = this.finishPublishedDescriptor(relativeFile, prepared.descriptor, prepared.preimage, true);
-      descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, prepared.preimage));
-      return published;
-    }
-    const existingEntry = this.pathEntryInfo(relativeFile);
-    if (existingEntry !== null && process.platform === "linux") {
-      const expectedPreimage = this.captureWritePreimage(relativeFile);
-      if (expectedPreimage.kind !== "file") throw new PinnedRootError("changed", "anchored replacement target disappeared before CAS preparation");
-      const prepared = this.writeDarwinPrepared("atomic", relativeFile, content, options, expectedPreimage.expectation);
-      const published = this.finishPublishedDescriptor(relativeFile, prepared.descriptor, prepared.preimage, true);
-      descriptorPreimages.set(published, prepared.preimage);
-      descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, prepared.preimage));
-      return published;
-    }
-    if (existingEntry !== null) {
-      throw new PinnedRootError("unsupported", "anchored replacement requires a kernel compare-and-swap transaction");
-    }
-    const preimage = this.captureWritePreimage(relativeFile);
-    const finalName = segments.pop()!;
-    const parent = this.openParent(segments, true);
-    const relativeTarget = [
-      ...segments,
-      finalName,
-    ].join("/");
-    let tempFd: number | null = null;
-    let tempPath: string | null = null;
-    let descriptor: PinnedRootWriteDescriptor | null = null;
-    let committed = false;
-    try {
-      const flags = writeFlags();
-      if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow writes are unavailable");
-      const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
-      for (let attempt = 0; attempt < 32; attempt += 1) {
-        const tempName = boundedTemporaryComponent("write", relativeTarget, ".tmp");
-        const candidate = join(parentPath, tempName);
-        this.hooks.beforeTempOpen?.(relativeTarget);
-        this.assertCanonicalDirectory(segments.join("/"));
-        this.assertParentPathIdentity(parent.fd, segments.join("/"));
-        try {
-          tempFd = openSync(candidate, flags, 0o600);
-          tempPath = candidate;
-          break;
-        } catch (error) {
-          if (errnoCode(error) !== "EEXIST") throw error;
-        }
-      }
-      if (tempFd === null || tempPath === null) throw new PinnedRootError("write_failed", "unable to reserve an atomic temp file");
-      const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
-      let offset = 0;
-      while (offset < bytes.length) {
-        const written = writeSync(tempFd, bytes, offset, bytes.length - offset);
-        if (written <= 0) throw new PinnedRootError("write_failed", "short anchored atomic write");
-        offset += written;
-      }
-      fchmodSync(tempFd, 0o600);
-      fsyncSync(tempFd);
-      this.assertStable();
-      const parentAfter = fstatSync(parent.fd);
-      if (!sameIdentity(parentAfter, parent.identity)) throw new PinnedRootError("changed", "anchored parent changed during commit");
-      const target = join(parentPath, finalName);
-      let existing: Stats | null = null;
-      try { existing = lstatSync(target); } catch (error) { if (errnoCode(error) !== "ENOENT") throw error; }
-      if (existing && (existing.isSymbolicLink() || existing.isDirectory() || !existing.isFile())) throw new PinnedRootError("path_unauthorized", "anchored target is not a regular file");
-      const published = fstatSync(tempFd);
-      const planned: PinnedRootWriteDescriptor = {
-        path: this.anchorPath(relativeFile),
-        relative_path: relativeFile,
-        dev: published.dev,
-        ino: published.ino,
-        size: contentByteLength(content),
-        sha256: contentSha256(content),
-      };
-      this.hooks.beforeRename?.(relativeTarget);
-      this.assertCanonicalDirectory(segments.join("/"));
-      this.assertParentPathIdentity(parent.fd, segments.join("/"));
-      this.assertStable();
-      assertCurrentExecutionLiveness();
-      const receipt = this.makeWriteReceipt(relativeFile, planned, preimage);
-      this.hooks.beforePublish?.(receipt);
-      options.beforePublish?.(receipt);
-      try {
-        if (existing === null) {
-          linkSync(tempPath, target);
-          committed = true;
-          descriptor = planned;
-          unlinkSync(tempPath);
-        } else {
-          throw new PinnedRootError("unsupported", "anchored replacement requires a kernel compare-and-swap transaction");
-        }
-      } catch (error) {
-        if (error instanceof PinnedRootError) throw error;
-        if (errnoCode(error) === "EEXIST") throw new PinnedRootError("changed", "anchored create target changed before no-replace publication");
-        throw error;
-      }
-      tempPath = null;
-      this.hooks.afterPublish?.(relativeTarget);
-      try {
-        fsyncSync(parent.fd);
-      } catch (error) {
-        const code = errnoCode(error);
-        if (code !== "EINVAL" && code !== "ENOTSUP") throw error;
-      }
-      this.hooks.afterPublishLiveness?.(relativeTarget);
-      assertCurrentExecutionLiveness();
-    } catch (error) {
-      if (committed && descriptor !== null) {
-        let rolledBack = false;
-        try {
-          rolledBack = withoutCurrentExecutionLiveness(() => this.rollbackPublishedDescriptor(relativeFile, descriptor!, preimage));
-        } catch {
-          rolledBack = false;
-        }
-        if (!rolledBack) {
-          throw new PinnedRootError("changed", `anchored atomic publication failed and its exact rollback could not be proven: ${String(error)}`);
-        }
-        committed = false;
-      }
-      if (error instanceof ExecutionLivenessViolation) throw error;
-      if (error instanceof PinnedRootError) throw error;
-      const code = errnoCode(error);
-      if (code === "ENOENT") throw new PinnedRootError("not_found", `anchored parent does not exist for '${relativeTarget}'`);
-      throw new PinnedRootError("write_failed", `anchored atomic write failed: ${String(error)}`);
-    } finally {
-      try { this.hooks.beforeCleanup?.(relativeTarget); } catch { /* test seams cannot replace the primary result */ }
-      closeQuietly(tempFd);
-      if (!committed && tempPath !== null) {
-        let safeCleanup = true;
-        try { this.assertCanonicalDirectory(segments.join("/")); } catch { safeCleanup = false; }
-        if (safeCleanup) {
-          try { unlinkSync(tempPath); } catch { }
-        }
-      }
-      parent.close();
-    }
-    if (descriptor === null) throw new PinnedRootError("write_failed", "anchored atomic write completed without an operation descriptor");
-    const published = this.finishPublishedDescriptor(relativeFile, descriptor, preimage);
-    descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, preimage));
-    return published;
-  }
-
-  private startDarwinHelper(executable: string, deadline: number): DarwinHelperSession {
-    const directory = mkdtempSync(join(tmpdir(), ".omp-darwin-helper-"));
-    let requestFd: number | null = null;
-    let responseFd: number | null = null;
-    let child: ChildProcess | null = null;
-    let startupError: Error | null = null;
-    let sessionRef: DarwinHelperSession | null = null;
-    let resolveExit!: () => void;
-    let exited = false;
-    const exitPromise = new Promise<void>((resolve) => { resolveExit = resolve; });
-    try {
-      chmodSync(directory, 0o700);
-      const directoryInfo = lstatSync(directory);
-      if (!directoryInfo.isDirectory() || (directoryInfo.mode & 0o777) !== 0o700) throw new PinnedRootError("unsupported", "descriptor helper IPC directory is unsafe");
-      const requestPath = join(directory, "request.fifo");
-      const responsePath = join(directory, "response.fifo");
-      const readyNonce = randomUUID();
-      const helperAuthKey = randomBytes(32);
-      const helperSessionId = randomUUID();
-      child = spawn(executable, ["-I", "-c", DARWIN_HELPER_SOURCE], {
-        stdio: ["ignore", "ignore", "ignore", this.rootFd, "pipe"],
-        env: {
-          OMP_DARWIN_HELPER_REQUEST_FIFO: requestPath,
-          OMP_DARWIN_HELPER_RESPONSE_FIFO: responsePath,
-          OMP_DARWIN_HELPER_READY_NONCE: readyNonce,
-          LC_ALL: "C",
-          LANG: "C",
-          TZ: "UTC",
-        },
-      });
-      const authPipe = child.stdio[4];
-      const authWriter = authPipe as unknown as { end: (chunk: Buffer) => void };
-      if (!authPipe || typeof authWriter.end !== "function") throw new PinnedRootError("unsupported", "descriptor helper authentication pipe is unavailable");
-      const credentials = [helperAuthKey.toString("hex"), DARWIN_JOURNAL_AUTH_KEY.toString("hex"), helperSessionId].join("\n") + "\n";
-      authPipe.once("error", (error: Error) => { startupError ??= error; });
-      authWriter.end(Buffer.from(credentials, "ascii"));
-      // Register both handlers before any startup polling. A failed spawn is
-      // always observed and converted to a poisoned, fail-closed session.
-      child.once("error", (error) => {
-        const normalized = error instanceof Error ? error : new Error(String(error));
-        startupError ??= normalized;
-        if (sessionRef) {
-          sessionRef.runtimeError = normalized;
-          if (!sessionRef.closing) this.poisonDarwinHelper();
-        }
-      });
-      child.once("exit", (code, signal) => {
-        exited = true;
-        resolveExit();
-        if (sessionRef) {
-          sessionRef.exited = true;
-          removeLiveDarwinHelperSession(sessionRef);
-          if (!sessionRef.closing) {
-            sessionRef.runtimeError = new Error(`descriptor helper exited (${code ?? "null"}, ${signal ?? "null"})`);
-            this.poisonDarwinHelper();
-          }
-        }
-      });
-      const startupDeadline = Math.min(deadline, Date.now() + DARWIN_HELPER_START_TIMEOUT_MS);
-      const helperUid = process.getuid?.();
-      if (helperUid === undefined) throw new PinnedRootError("unsupported", "descriptor helper FIFO ownership cannot be verified");
-      let requestInfo: Stats | null = null;
-      let responseInfo: Stats | null = null;
-      while (Date.now() <= startupDeadline) {
-        if (startupError) throw new PinnedRootError("unsupported", `descriptor helper spawn failed: ${String(startupError)}`);
-        if (child.exitCode !== null || exited) throw new PinnedRootError("unsupported", "descriptor helper exited before opening its IPC channels");
-        try {
-          requestInfo = lstatSync(requestPath);
-          responseInfo = lstatSync(responsePath);
-          if (requestInfo.isFIFO() && responseInfo.isFIFO()
-            && (requestInfo.mode & 0o777) === 0o600 && (responseInfo.mode & 0o777) === 0o600
-            && requestInfo.uid === helperUid && responseInfo.uid === helperUid) break;
-          throw new PinnedRootError("unsupported", "descriptor helper IPC channel has unsafe identity or mode");
-        } catch (error) {
-          if (error instanceof PinnedRootError) throw error;
-          if (errnoCode(error) !== "ENOENT") throw error;
-        }
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS);
-      }
-      if (startupError) throw new PinnedRootError("unsupported", `descriptor helper spawn failed: ${String(startupError)}`);
-      if (!requestInfo || !responseInfo) throw new PinnedRootError("unsupported", "descriptor helper IPC channels did not appear");
-      const requestAfter = lstatSync(requestPath);
-      const responseAfter = lstatSync(responsePath);
-      if (requestAfter.dev !== requestInfo.dev || requestAfter.ino !== requestInfo.ino || !requestAfter.isFIFO()
-        || responseAfter.dev !== responseInfo.dev || responseAfter.ino !== responseInfo.ino || !responseAfter.isFIFO()) {
-        throw new PinnedRootError("changed", "descriptor helper IPC channel changed before open");
-      }
-      const nonblock = constants.O_NONBLOCK;
-      const nofollow = constants.O_NOFOLLOW;
-      if (!Number.isInteger(nonblock) || !Number.isInteger(nofollow)) throw new PinnedRootError("unsupported", "safe nonblocking FIFO operations are unavailable");
-      while (requestFd === null && Date.now() <= startupDeadline) {
-        this.hooks.beforeDarwinHelperOpen?.("request", requestPath);
-        try { requestFd = openSync(requestPath, constants.O_WRONLY | nonblock | nofollow); }
-        catch (error) { if (errnoCode(error) !== "ENXIO" && errnoCode(error) !== "ENOENT") throw error; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS); }
-      }
-      if (requestFd === null) throw new PinnedRootError("unsupported", "descriptor helper request channel did not open");
-      assertDarwinFifoDescriptor(requestFd, requestInfo, "request");
-      this.hooks.beforeDarwinHelperOpen?.("response", responsePath);
-      responseFd = openSync(responsePath, constants.O_RDONLY | nonblock | nofollow);
-      assertDarwinFifoDescriptor(responseFd, responseInfo, "response");
-      const requestOpened = lstatSync(requestPath);
-      const responseOpened = lstatSync(responsePath);
-      if (requestOpened.dev !== requestInfo.dev || requestOpened.ino !== requestInfo.ino || responseOpened.dev !== responseInfo.dev || responseOpened.ino !== responseInfo.ino) {
-        throw new PinnedRootError("changed", "descriptor helper IPC channel changed after open");
-      }
-      const session: DarwinHelperSession = {
-        directory, requestPath, responsePath, requestFd, responseFd, child, exitPromise, resolveExit,
-        exited, closing: false, runtimeError: null, authKey: helperAuthKey, sessionId: helperSessionId, rootPathDigest: this.rootPathDigest, nonce: 0,
-      };
-      sessionRef = session;
-      const readyOutput = this.readDarwinFrame(session, startupDeadline, "__ready", true);
-      let readyResult: unknown;
-      try { readyResult = JSON.parse(readyOutput); } catch (error) { throw new PinnedRootError("unsupported", `descriptor helper ready frame is invalid: ${String(error)}`); }
-      if (!readyResult || typeof readyResult !== "object") throw new PinnedRootError("unsupported", "descriptor helper ready frame is invalid");
-      const readyRecord = readyResult as Record<string, unknown>;
-      const readyMac = readyRecord._mac;
-      delete readyRecord._mac;
-      if (readyRecord._session_id !== helperSessionId || !verifyDarwinHelperMac(readyRecord, readyMac, helperAuthKey)) throw new PinnedRootError("unsupported", "descriptor helper ready frame authentication failed");
-      if (readyRecord.ok !== true || readyRecord.ready !== true || readyRecord._ready_nonce !== readyNonce) {
-        throw new PinnedRootError("unsupported", "descriptor helper ready frame correlation failed");
-      }
-      activeDarwinHelperSessions.add(session);
-      registerLiveDarwinHelperSession(session);
-      // Verified FIFO identity and ready frame establish the response writer;
-      // the child is then independent of Node event-loop liveness.
-      child.unref();
-      return session;
-    } catch (error) {
-      if (sessionRef) {
-        activeDarwinHelperSessions.delete(sessionRef);
-        removeLiveDarwinHelperSession(sessionRef);
-      }
-      closeQuietly(requestFd);
-      closeQuietly(responseFd);
-      if (child && child.pid !== undefined) {
-        try { child.kill("SIGTERM"); } catch { /* preserve primary failure */ }
-        scheduleDarwinHelperHardKill(child);
-      }
-      removeDarwinHelperDirectory(directory);
-      if (error instanceof PinnedRootError) throw error;
-      throw new PinnedRootError("unsupported", `descriptor helper could not start: ${String(error)}`);
-    }
-  }
-
-  private poisonDarwinHelper(): void {
-    this.darwinHelperPoisoned = true;
-    const session = this.darwinHelperSession;
-    this.darwinHelperSession = null;
-    if (!session) return;
-    activeDarwinHelperSessions.delete(session);
-    removeLiveDarwinHelperSession(session);
-    session.closing = true;
-    closeDarwinHelperSessionImmediately(session);
-    this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
-    void this.darwinHelperClosePromise.catch(() => undefined);
-  }
-
-  private writeDarwinFrame(session: DarwinHelperSession, frame: Buffer, deadline: number, operation: string): void {
-    let offset = 0;
-    while (offset < frame.byteLength) {
-      if (Date.now() > deadline) throw new PinnedRootError("unsupported", `descriptor helper '${operation}' timed out`);
-      try {
-        const written = writeSync(session.requestFd, frame, offset, frame.byteLength - offset);
-        if (written <= 0) throw new PinnedRootError("unsupported", "descriptor helper request channel closed");
-        offset += written;
-      } catch (error) {
-        if (errnoCode(error) !== "EAGAIN" && errnoCode(error) !== "EWOULDBLOCK") throw error;
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS);
-      }
-    }
-  }
-
-  private readDarwinFrame(session: DarwinHelperSession, deadline: number, operation: string, tolerateInitialEof = false): string {
-    const chunk = Buffer.allocUnsafe(64 * 1024);
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    const textParts: string[] = [];
-    let total = 0;
-    while (Date.now() <= deadline) {
-      try {
-        const read = readSync(session.responseFd, chunk, 0, chunk.byteLength, null);
-        if (read === 0) {
-          if (tolerateInitialEof) {
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS);
-            continue;
-          }
-          throw new PinnedRootError("unsupported", "descriptor helper response channel closed");
-        }
-        const bytes = chunk.subarray(0, read);
-        total += read;
-        if (total > DARWIN_HELPER_MAX_OUTPUT) throw new PinnedRootError("limit", "descriptor helper response exceeds its bounded output limit");
-        const newline = bytes.indexOf(0x0a);
-        if (newline >= 0) {
-          if (newline !== read - 1) throw new PinnedRootError("unsupported", `descriptor helper '${operation}' returned trailing frame bytes`);
-          textParts.push(decodeDarwinHelperUtf8(decoder, bytes.subarray(0, newline), false, operation));
-          return textParts.join("");
-        }
-        textParts.push(decodeDarwinHelperUtf8(decoder, bytes, true, operation));
-      } catch (error) {
-        if (errnoCode(error) !== "EAGAIN" && errnoCode(error) !== "EWOULDBLOCK") throw error;
-      }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS);
-    }
-    throw new PinnedRootError("unsupported", `descriptor helper '${operation}' timed out`);
-  }
-
-  private requestDarwinHelper<T extends Record<string, unknown>>(executable: string, operation: string, payload: Record<string, unknown>, timeoutMs: number): T {
-    if (this.darwinHelperPoisoned) throw new PinnedRootError("unsupported", "descriptor helper is poisoned after a failed operation");
-    const requestId = randomUUID();
-    const requestPayload: Record<string, unknown> = { ...payload, op: operation, root_dev: this.dev, root_ino: this.ino, _root_path_digest: this.rootPathDigest, _request_id: requestId };
-    if (this.hooks.helperSleepMs !== undefined) requestPayload.test_sleep_ms = this.hooks.helperSleepMs;
-    if (this.hooks.helperProtocolTest !== undefined) requestPayload._test_response_mode = this.hooks.helperProtocolTest;
-    const liveBatchIds = LIVE_DARWIN_BATCH_IDS.get(this.rootPathDigest);
-    if (liveBatchIds && liveBatchIds.size > 0) requestPayload._live_batch_ids = [...liveBatchIds];
-    const liveHelperSessionIds = liveDarwinHelperSessionIds(this.rootPathDigest);
-    if (liveHelperSessionIds.length > 0) requestPayload._live_helper_session_ids = liveHelperSessionIds;
-    const unsignedRequest = Buffer.from(JSON.stringify(requestPayload) + "\n", "utf8");
-    if (unsignedRequest.byteLength > DARWIN_HELPER_MAX_INPUT) throw new PinnedRootError("limit", `descriptor helper '' request exceeds the bounded input limit`);
-    const transferTimeoutMs = darwinHelperTransferTimeout(operation, timeoutMs, unsignedRequest.byteLength);
-    const transferMarginMs = transferTimeoutMs > timeoutMs ? DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS : 0;
-    const operationDeadline = Date.now() + transferTimeoutMs + transferMarginMs + DARWIN_HELPER_START_TIMEOUT_MS;
-    if (!this.darwinHelperSession) {
-      try {
-        this.darwinHelperSession = this.startDarwinHelper(executable, operationDeadline);
-      } catch (error) {
-        this.darwinHelperPoisoned = true;
-        throw error;
-      }
-    }
-    const session = this.darwinHelperSession;
-    if (session.runtimeError || session.exited || Date.now() > operationDeadline) {
-      this.poisonDarwinHelper();
-      throw new PinnedRootError("unsupported", "descriptor helper failed before request dispatch");
-    }
-    requestPayload._host_instance_id = DARWIN_HOST_INSTANCE_ID;
-    requestPayload._session_id = session.sessionId;
-    const authorizedHelperSessionIds = new Set(liveDarwinHelperSessionIds(this.rootPathDigest));
-    authorizedHelperSessionIds.add(session.sessionId);
-    requestPayload._live_helper_session_ids = [...authorizedHelperSessionIds];
-    requestPayload._nonce = ++session.nonce;
-    requestPayload._mac = darwinHelperMac(requestPayload, session.authKey);
-    const request = Buffer.from(JSON.stringify(requestPayload) + "\n", "utf8");
-    if (request.byteLength > DARWIN_HELPER_MAX_INPUT) throw new PinnedRootError("limit", `descriptor helper '' request exceeds the bounded input limit`);
-    const requestDeadline = Math.min(operationDeadline, Date.now() + transferTimeoutMs + transferMarginMs);
-    let responseReceived = false;
-    try {
-      this.writeDarwinFrame(session, request, requestDeadline, operation);
-      const output = this.readDarwinFrame(session, requestDeadline, operation);
-      let result: unknown;
-      try { result = JSON.parse(output); } catch (error) { throw new PinnedRootError("unsupported", `descriptor helper returned invalid output: ${String(error)}`); }
-      if (!result || typeof result !== "object") throw new PinnedRootError("unsupported", "descriptor helper returned an invalid result");
-      const record = result as Record<string, unknown>;
-      const responseMac = record._mac;
-      delete record._mac;
-      if (!verifyDarwinHelperMac(record, responseMac, session.authKey)) throw new PinnedRootError("unsupported", "descriptor helper response authentication failed");
-      if (record._session_id !== session.sessionId || record._nonce !== requestPayload._nonce) throw new PinnedRootError("unsupported", "descriptor helper response nonce failed");
-      if (record._request_id !== requestId) throw new PinnedRootError("unsupported", "descriptor helper response correlation failed");
-      responseReceived = true;
-      delete record._request_id;
-      delete record._nonce;
-      const recoveredIds = record._recovered_batch_ids;
-      if (recoveredIds !== undefined) {
-        if (!Array.isArray(recoveredIds) || recoveredIds.some((id) => typeof id !== "string")) throw new PinnedRootError("unsupported", "descriptor helper returned invalid recovered batch identities");
-        for (const id of recoveredIds) removeLiveDarwinBatch(this.rootPathDigest, id);
-        delete record._recovered_batch_ids;
-      }
-      if (record.ok !== true) {
-        const code = ["unsupported", "invalid", "limit", "changed", "recovery_required", "path_unauthorized", "not_found", "not_directory", "not_regular", "write_failed", "exists"].includes(String(record.code))
-          ? String(record.code) as PinnedRootErrorCode
-          : "write_failed";
-        throw new PinnedRootError(code, typeof record.message === "string" ? record.message : "descriptor helper operation failed");
-      }
-      return record as T;
-    } catch (error) {
-      if (!responseReceived) this.poisonDarwinHelper();
-      if (error instanceof PinnedRootError) throw error;
-      throw new PinnedRootError("unsupported", `descriptor helper '${operation}' failed: ${String(error)}`);
-    }
-  }
-
-  private awaitDarwinHelperExit(session: DarwinHelperSession): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      let settled = false;
-      let timer: NodeJS.Timeout | null = null;
-      let finalTimer: NodeJS.Timeout | null = null;
-      const childPid = session.child.pid;
-      const finish = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        if (timer !== null) { clearTimeout(timer); timer.unref(); timer = null; }
-        if (finalTimer !== null) { clearTimeout(finalTimer); finalTimer.unref(); finalTimer = null; }
-        removeDarwinHelperDirectory(session.directory);
-        if (error) reject(error); else resolve();
-      };
-      if (session.exited || session.child.exitCode !== null) {
-        session.exited = true;
-        finish();
-        return;
-      }
-      timer = setTimeout(() => {
-        if (session.exited || session.child.exitCode !== null) { finish(); return; }
-        if (session.child.pid === childPid) {
-          try { session.child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
-        }
-        finalTimer = setTimeout(() => {
-          if (session.exited || session.child.exitCode !== null) finish();
-          else finish(new PinnedRootError("unsupported", "descriptor helper did not exit before bounded close"));
-        }, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
-      }, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
-      session.exitPromise.then(() => finish(), () => finish(new PinnedRootError("unsupported", "descriptor helper exit could not be observed")));
-    });
-  }
-
-  private closeDarwinHelper(): void {
-    const session = this.darwinHelperSession;
-    this.darwinHelperSession = null;
-    if (!session) return;
-    activeDarwinHelperSessions.delete(session);
-    removeLiveDarwinHelperSession(session);
-    session.closing = true;
-    closeDarwinHelperSessionImmediately(session);
-    this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
-    void this.darwinHelperClosePromise.catch(() => undefined);
-  }
-
-  private makeWriteReceipt(
-    relativeFile: string,
-    descriptor: PinnedRootWriteDescriptor,
-    preimage: PinnedRootWritePreimage,
-  ): PinnedRootWriteReceipt {
-    return {
-      ...descriptor,
-      descriptor,
-      preimage,
-      rollback: () => this.rollbackPublishedDescriptor(relativeFile, descriptor, preimage),
-    };
-  }
-
-  private resetDarwinHelperForCompensation(): void {
-    // A malformed/EOF response poisons normal request reuse. Compensation is
-    // a separate exact-CAS transaction and may safely start a fresh helper;
-    // stale lease recovery protects any operation whose response was lost.
-    this.darwinHelperPoisoned = false;
-  }
-
-  private publishedDescriptorMatches(relativeFile: string, descriptor: PinnedRootWriteDescriptor): boolean {
-    try {
-      const observed = this.readFile(relativeFile, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
-      return observed.dev === descriptor.dev
-        && observed.ino === descriptor.ino
-        && observed.size === descriptor.size
-        && Buffer.from(observed.bytes).byteLength === descriptor.size
-        && createHash("sha256").update(Buffer.from(observed.bytes)).digest("hex") === descriptor.sha256;
-    } catch {
-      return false;
-    }
-  }
-
-  private writeDarwinPrepared(
-    operation: "exclusive" | "atomic",
-    relativeFile: string,
-    content: PinnedRootWriteContent,
-    options?: PinnedRootWriteOptions,
-    expected?: PinnedRootFileExpectation,
-  ): { descriptor: PinnedRootWriteDescriptor; preimage: PinnedRootWritePreimage } {
-    const prepOperation = operation === "exclusive" ? "prepare_write_exclusive" : "prepare_write_atomic";
-    const prep = this.runDescriptorHelper<PinnedWriteDescriptorResponse>(prepOperation, {
-      path: relativeFile,
-      ...contentPayload(content, operation === "atomic"),
-      ...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}),
-      ...(expected ? { expected } : {}),
-      ...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}),
-    });
-    if (typeof prep.token !== "string" || prep.token.length === 0) {
-      throw new PinnedRootError("write_failed", "prepared write returned no lease token");
-    }
-    const preimage = preimageFromResponse(prep);
-    const planned = descriptorFromResponse(relativeFile, this.anchorPath(relativeFile), content, prep);
-    const receipt = this.makeWriteReceipt(relativeFile, planned, preimage);
-    try {
-      this.hooks.beforePublish?.(receipt);
-      options?.beforePublish?.(receipt);
-      const result = this.runDescriptorHelper<PinnedWriteDescriptorResponse>("commit_prepared_write", {
-        token: prep.token,
-        root_dev: this.dev,
-        root_ino: this.ino,
-        ...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}), ...(this.hooks.preparedPostVerifyMutation ? { test_prepared_post_verify_mutation: true } : {}), ...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}),
-      });
-      const descriptor = descriptorFromResponse(relativeFile, this.anchorPath(relativeFile), content, result);
-      if (result.ack_required !== true) throw new PinnedRootError("write_failed", "prepared write returned no acknowledgement requirement");
-      try {
-        const acknowledged = this.runDescriptorHelper<{ acknowledged?: unknown; already?: unknown }>("ack_prepared_write", { token: prep.token, root_dev: this.dev, root_ino: this.ino, ...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}), ...(this.hooks.preparedPostVerifyMutation ? { test_prepared_post_verify_mutation: true } : {}), ...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}) });
-        if (acknowledged.acknowledged !== true && acknowledged.already !== true) throw new PinnedRootError("write_failed", "prepared write acknowledgement was not accepted");
-        if (!this.publishedDescriptorMatches(relativeFile, descriptor) || !this.isStable()) throw new PinnedRootError("changed", "prepared write post-ACK descriptor changed before receipt");
-      } catch (ackError) {
-        // A verified target mutation is an authenticated recovery condition;
-        // do not issue a competing CAS while the prepared lease remains live.
-        if (ackError instanceof PinnedRootError && ackError.code === "recovery_required") throw ackError;
-        // The helper may have committed and popped the lease immediately
-        // before its ACK frame was lost. The descriptor is an anchored proof
-        // of ownership; accept success when the exact postimage is present.
-        this.resetDarwinHelperForCompensation();
-        if (this.publishedDescriptorMatches(relativeFile, descriptor)) return { descriptor, preimage };
-        if (!this.rollbackPublishedDescriptor(relativeFile, descriptor, preimage)) {
-          throw new PinnedRootError("changed", `prepared write acknowledgement failed and rollback could not be proven: ${String(ackError)}`);
-        }
-        throw ackError;
-      }
-      return { descriptor, preimage };
-    } catch (error) {
-      try { this.runDescriptorHelper("abort_prepared_write", { token: prep.token, root_dev: this.dev, root_ino: this.ino }); } catch { /* dead helper leaves lease/stage for stale recovery */ }
-      throw error;
-    }
-  }
-
-  private writeDarwinPreparedBatch(
-    entries: readonly { path: string; content: PinnedRootWriteContent }[],
-    options: PinnedRootBatchWriteOptions,
-    durableBatch = false,
-  ): readonly { descriptor: PinnedRootWriteDescriptor; preimage: PinnedRootWritePreimage }[] {
-    type PreparedBatchEntry = {
-      path: string;
-      content: PinnedRootWriteContent;
-      token: string;
-      descriptor: PinnedRootWriteDescriptor;
-      preimage: PinnedRootWritePreimage;
-      committed: boolean;
-      commit_confirmed: boolean;
-    };
-    const prepared: PreparedBatchEntry[] = [];
-    const batchId = durableBatch ? randomUUID() : undefined;
-    if (batchId) liveDarwinBatchSet(this.rootPathDigest).add(batchId);
-    const batchPreimages = durableBatch ? entries.map((entry) => this.captureWritePreimage(entry.path)) : undefined;
-    const batchManifest = durableBatch ? entries.map((entry, index) => {
-      const bytes = Buffer.from(entry.content);
-      const preimage = batchPreimages?.[index];
-      return { path: safeRelativeSegments(entry.path).join("/"), index, size: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex"), expected: preimage?.kind === "file" ? { kind: "file", ...preimage.expectation } : { kind: "absent" } };
-    }) : undefined;
-    try {
-      for (const [index, entry] of entries.entries()) {
-        this.hooks.beforeTempOpen?.(entry.path);
-        this.assertStable();
-        this.hooks.beforeRename?.(entry.path);
-        if (batchManifest) {
-          const currentPreimage = this.captureWritePreimage(entry.path);
-          batchManifest[index]!.expected = currentPreimage.kind === "file" ? { kind: "file", ...currentPreimage.expectation } : { kind: "absent" };
-        }
-        const response = this.runDescriptorHelper<PinnedWriteDescriptorResponse>("prepare_write_atomic", {
-          path: entry.path,
-          ...contentPayload(entry.content, true),
-          ...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}),
-          ...(Number.isInteger(this.hooks.preparedBatchJournalIndex) ? { failure_batch_index: this.hooks.preparedBatchJournalIndex } : {}),
-          ...(batchId ? { batch_id: batchId, batch_index: index, batch_size: entries.length, batch_manifest: batchManifest } : {}),
-        });
-        if (typeof response.token !== "string" || response.token.length === 0) {
-          throw new PinnedRootError("write_failed", "prepared batch write returned no lease token");
-        }
-        const preimage = preimageFromResponse(response);
-        const descriptor = descriptorFromResponse(entry.path, this.anchorPath(entry.path), entry.content, response);
-        prepared.push({ path: entry.path, content: entry.content, token: response.token, descriptor, preimage, committed: false, commit_confirmed: false });
-      }
-      const receipts = prepared.map((entry) => this.makeWriteReceipt(entry.path, entry.descriptor, entry.preimage));
-      options.beforePublish?.(receipts);
-      for (const entry of prepared) {
-        // Once commit is requested this operation owns the target even if the
-        // response transport fails; the planned descriptor is the only safe
-        // postimage identity available for exact compensation.
-        entry.committed = true;
-        const response = this.runDescriptorHelper<PinnedWriteDescriptorResponse>("commit_prepared_write", {
-          token: entry.token,
-          root_dev: this.dev,
-          root_ino: this.ino,
-          ...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}), ...(this.hooks.preparedPostVerifyMutation ? { test_prepared_post_verify_mutation: true } : {}), ...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}),
-        });
-        const descriptor = descriptorFromResponse(entry.path, this.anchorPath(entry.path), entry.content, response);
-        if (descriptor.dev !== entry.descriptor.dev || descriptor.ino !== entry.descriptor.ino) {
-          throw new PinnedRootError("changed", "prepared batch postimage descriptor changed before acknowledgement");
-        }
-        if (response.ack_required !== true) throw new PinnedRootError("write_failed", "prepared batch write returned no acknowledgement requirement");
-        entry.commit_confirmed = true;
-        if (this.hooks.batchFailureIndex === prepared.indexOf(entry)) throw new PinnedRootError("write_failed", "injected anchored atomic batch interruption");
-      }
-      for (const entry of prepared) {
-        try {
-          const acknowledged = this.runDescriptorHelper<{ acknowledged?: unknown; already?: unknown }>("ack_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino, ...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}), ...(this.hooks.preparedPostVerifyMutation ? { test_prepared_post_verify_mutation: true } : {}), ...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}) });
-          if (acknowledged.acknowledged !== true && acknowledged.already !== true) throw new PinnedRootError("write_failed", "prepared batch acknowledgement was not accepted");
-        } catch (ackError) {
-          // A response can be lost after ACK has atomically released the
-          // lease. Verify all committed postimages before accepting success;
-          // otherwise the transaction remains compensable by exact CAS.
-          this.resetDarwinHelperForCompensation();
-          let cleanupConfirmed = false;
-          if (batchId) {
-            try {
-              const recovery = this.runDescriptorHelper<{ recovered?: unknown; absent_clean?: unknown }>("recover_prepared_batch", { batch_id: batchId, entries: prepared.map((candidate) => ({ path: safeRelativeSegments(candidate.path).join("/"), dev: candidate.descriptor.dev, ino: candidate.descriptor.ino, size: candidate.descriptor.size, sha256: candidate.descriptor.sha256 })) });
-              cleanupConfirmed = recovery.recovered === true || recovery.absent_clean === true;
-            } catch { /* retain the live ID until durable cleanup is proven */ }
-          }
-          if (cleanupConfirmed && prepared.every((candidate) => this.publishedDescriptorMatches(candidate.path, candidate.descriptor))) {
-            if (batchId) removeLiveDarwinBatch(this.rootPathDigest, batchId);
-            return prepared.map((candidate) => ({ descriptor: candidate.descriptor, preimage: candidate.preimage }));
-          }
-          throw ackError;
-        }
-      }
-      if (!this.isStable() || prepared.some((entry) => !this.publishedDescriptorMatches(entry.path, entry.descriptor))) {
-        throw new PinnedRootError("changed", "prepared batch post-ACK descriptor changed before receipt");
-      }
-      if (batchId) removeLiveDarwinBatch(this.rootPathDigest, batchId);
-      return prepared.map((entry) => ({ descriptor: entry.descriptor, preimage: entry.preimage }));
-    } catch (error) {
-      // A lost helper response leaves the grouped journal as the only durable
-      // authority. Do not run descriptor compensation here: it would issue a
-      // fresh helper request, observe the stale group, and prematurely finish
-      // or roll back a transaction whose progress is still unresolved. The
-      // next open/operation performs grouped classification and recovery.
-      if (durableBatch && prepared.length === 0) {
-        if (batchId) {
-          this.resetDarwinHelperForCompensation();
-          try {
-            const recovery = this.runDescriptorHelper<{ recovered?: unknown; absent_clean?: unknown }>("recover_prepared_batch", { batch_id: batchId, entries: batchManifest ?? [] });
-            if (recovery.recovered === true || recovery.absent_clean === true) removeLiveDarwinBatch(this.rootPathDigest, batchId);
-            else throw new PinnedRootError("recovery_required", "durable prepared batch cleanup was not proven");
-          } catch (recoveryError) {
-            let residueAbsent = false;
-            if (batchManifest) {
-              try { residueAbsent = this.durableBatchResidueAbsent(batchId, batchManifest); } catch { residueAbsent = false; }
-            }
-            if (residueAbsent) {
-              removeLiveDarwinBatch(this.rootPathDigest, batchId);
-              throw error;
-            }
-            if (recoveryError instanceof PinnedRootError && recoveryError.code === "recovery_required") throw recoveryError;
-            throw new PinnedRootError("recovery_required", "durable prepared batch cleanup could not be disproven after helper failure: " + String(error));
-          }
-        }
-        throw error;
-      }
-      if (durableBatch && prepared.length > 0 && error instanceof PinnedRootError && error.code === "unsupported") throw error;
-      let rollbackComplete = true;
-      let abortComplete = true;
-      this.resetDarwinHelperForCompensation();
-      for (const entry of prepared.slice().reverse()) {
-        if (entry.committed && entry.commit_confirmed) {
-          let rolledBack = false;
-          try {
-            const rollback = this.runDescriptorHelper<{ rolled_back?: unknown }>("rollback_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino });
-            rolledBack = rollback.rolled_back === true;
-          } catch {
-            abortComplete = false;
-          }
-          if (!rolledBack) {
-            rollbackComplete = false;
-            continue;
-          }
-          try {
-            const finalized = this.runDescriptorHelper<{ finalized?: unknown }>("finalize_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino });
-            if (finalized.finalized !== true) abortComplete = false;
-          } catch {
-            abortComplete = false;
-          }
-          continue;
-        }
-        let aborted = false;
-        try {
-          const abortResult = this.runDescriptorHelper<{ aborted?: unknown }>("abort_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino });
-          aborted = abortResult.aborted === true;
-        } catch { abortComplete = false; /* stale lease recovery owns cleanup */ }
-        if (entry.committed && !entry.commit_confirmed && !aborted) abortComplete = false;
-      }
-      if (durableBatch && abortComplete && rollbackComplete && batchId) removeLiveDarwinBatch(this.rootPathDigest, batchId);
-      if (!rollbackComplete) {
-        throw new PinnedRootError("changed", `prepared Darwin batch failed and rollback could not be proven: ${String(error)}`);
-      }
-      throw error;
-    } finally {
-      for (const entry of entries) {
-        try { this.hooks.beforeCleanup?.(entry.path); } catch { /* preserve primary result */ }
-      }
-    }
-  }
-
-  private runDescriptorHelper<T extends Record<string, unknown>>(operation: string, payload: Record<string, unknown> = {}): T {
-    this.assertOpen();
-    assertCurrentExecutionLiveness();
-    if (this.hooks.disableDarwinHelper) throw new PinnedRootError("unsupported", "descriptor helper is disabled");
-    let executable: string | null = this.hooks.helperExecutable ?? null;
-    for (const candidate of DARWIN_PYTHON_CANDIDATES) {
-      if (executable !== null) break;
-      try { accessSync(candidate, constants.X_OK); executable = candidate; break; } catch { /* try next interpreter */ }
-    }
-    if (executable === null) throw new PinnedRootError("unsupported", "descriptor helper is unavailable");
-    if (typeof payload.text === "string" && !isWellFormedUtf16(payload.text)) {
-      throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
-    }
-    const timeoutMs = this.hooks.helperTimeoutMs ?? DARWIN_HELPER_TIMEOUT_MS;
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > DARWIN_HELPER_TIMEOUT_MS) {
-      throw new PinnedRootError("invalid", `descriptor helper '${operation}' timeout is invalid`);
-    }
-    return this.requestDarwinHelper<T>(executable, operation, payload, timeoutMs);
-  }
-
-  /** Internal bounded batch used by state-lock transactions on Darwin. */
-  private runDarwinBatch(operations: readonly Record<string, unknown>[], failureIndex?: number): void {
-    if (operations.length === 0) return;
-    if (operations.length > 16) throw new PinnedRootError("invalid", "anchored state batch contains too many operations");
-    const result = this.runDescriptorHelper<{ results: unknown[] }>("batch", {
-      operations,
-      ...(Number.isInteger(failureIndex) ? { failure_index: failureIndex } : {}),
-    });
-    if (!Array.isArray(result.results) || result.results.length !== operations.length) {
-      throw new PinnedRootError("write_failed", "descriptor helper returned an incomplete state batch");
-    }
-  }
-
-  /** Ensure a bounded set of directories through one inherited-fd request. */
-  ensureDirectories(relativeDirectories: readonly string[]): void {
-    if (relativeDirectories.length === 0) return;
-    assertCurrentExecutionLiveness();
-    if (relativeDirectories.length > 16) throw new PinnedRootError("invalid", "too many directories in one anchored state batch");
-    if (process.platform !== "darwin") {
-      for (const path of relativeDirectories) this.ensureDirectory(path);
-      return;
-    }
-    for (const path of relativeDirectories) {
-      safeRelativeSegments(path, true);
-      this.hooks.beforeDirectoryCreate?.(path);
-    }
-    this.runDarwinBatch(relativeDirectories.map((path) => ({ op: "ensure_directory", path })));
-  }
-
-  /** Write a bounded ordered set of atomic files through one inherited-fd request. */
-  writeAtomicFiles(entries: readonly { path: string; content: PinnedRootWriteContent }[]): void {
-    this.writeAtomicFilesWithDescriptors(entries);
-  }
-
+writeExclusiveWithDescriptor(relativeFile: string, content: PinnedRootWriteContent, options: PinnedRootWriteOptions = {}): PinnedRootWriteDescriptor {
+contentByteLength(content);
+const segments = safeRelativeSegments(relativeFile);
+assertCurrentExecutionLiveness();
+if (process.platform === "darwin") {
+let prepared: { descriptor: PinnedRootWriteDescriptor; preimage: PinnedRootWritePreimage } | null = null;
+try {
+for (let attempt = 0; attempt < 2; attempt += 1) {
+try {
+this.hooks.beforeTempOpen?.(relativeFile);
+this.hooks.beforeRename?.(relativeFile);
+prepared = this.writeDarwinPrepared("exclusive", relativeFile, content, options);
+break;
+} catch (error) {
+if (!(error instanceof PinnedRootError) || error.code !== "changed" || attempt === 1) throw error;
+}
+}
+} finally {
+try { this.hooks.beforeCleanup?.(relativeFile); } catch { /* preserve the primary operation result */ }
+}
+if (!prepared) throw new PinnedRootError("write_failed", "prepared exclusive write completed without an operation descriptor");
+const published = this.finishPublishedDescriptor(relativeFile, prepared.descriptor, prepared.preimage, true);
+descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, prepared.preimage));
+return published;
+}
+const preimage = this.captureWritePreimage(relativeFile);
+const finalName = segments.pop()!;
+const parent = this.openParent(segments, true);
+const relativeTarget = [...segments, finalName].join("/");
+let tempFd: number | null = null;
+let tempPath: string | null = null;
+let descriptor: PinnedRootWriteDescriptor | null = null;
+let publicationComplete = false;
+try {
+const flags = writeFlags();
+if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow writes are unavailable");
+const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
+for (let attempt = 0; attempt < 32; attempt += 1) {
+const tempName = boundedTemporaryComponent("write", relativeTarget, ".tmp");
+const candidate = join(parentPath, tempName);
+this.hooks.beforeTempOpen?.(relativeTarget);
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+try {
+tempFd = openSync(candidate, flags, 0o600);
+tempPath = candidate;
+break;
+} catch (error) {
+if (errnoCode(error) !== "EEXIST") throw error;
+}
+}
+if (tempFd === null || tempPath === null) throw new PinnedRootError("write_failed", "unable to reserve an exclusive temp file");
+const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
+let offset = 0;
+while (offset < bytes.length) {
+const written = writeSync(tempFd, bytes, offset, bytes.length - offset);
+if (written <= 0) throw new PinnedRootError("write_failed", "short anchored exclusive write");
+offset += written;
+}
+fchmodSync(tempFd, 0o600);
+fsyncSync(tempFd);
+this.assertStable();
+const parentAfter = fstatSync(parent.fd);
+if (!sameIdentity(parentAfter, parent.identity)) throw new PinnedRootError("changed", "anchored parent changed during exclusive commit");
+const target = join(parentPath, finalName);
+try {
+const existing = lstatSync(target);
+if (existing.isSymbolicLink() || (!existing.isFile() && !existing.isDirectory())) throw new PinnedRootError("path_unauthorized", "anchored exclusive target is unsafe");
+throw new PinnedRootError("exists", "anchored exclusive target already exists");
+} catch (error) {
+if (error instanceof PinnedRootError) throw error;
+if (errnoCode(error) !== "ENOENT") throw error;
+}
+const source = fstatSync(tempFd);
+const planned: PinnedRootWriteDescriptor = {
+path: this.anchorPath(relativeFile),
+relative_path: relativeFile,
+dev: source.dev,
+ino: source.ino,
+size: contentByteLength(content),
+sha256: contentSha256(content),
+};
+this.hooks.beforeRename?.(relativeTarget);
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+this.assertStable();
+assertCurrentExecutionLiveness();
+const receipt = this.makeWriteReceipt(relativeFile, planned, preimage);
+this.hooks.beforePublish?.(receipt);
+options.beforePublish?.(receipt);
+try {
+linkSync(tempPath, target);
+} catch (error) {
+if (errnoCode(error) === "EEXIST") throw new PinnedRootError("exists", "anchored exclusive target already exists");
+throw error;
+}
+descriptor = planned;
+publicationComplete = true;
+this.hooks.afterPublish?.(relativeTarget);
+const committed = lstatSync(target);
+if (committed.isSymbolicLink() || !committed.isFile() || !sameIdentity(committed, source)) throw new PinnedRootError("path_unauthorized", "anchored exclusive destination changed during commit");
+closeQuietly(tempFd);
+tempFd = null;
+unlinkSync(tempPath);
+tempPath = null;
+try {
+fsyncSync(parent.fd);
+} catch (error) {
+const code = errnoCode(error);
+if (code !== "EINVAL" && code !== "ENOTSUP") throw error;
+}
+this.hooks.afterPublishLiveness?.(relativeTarget);
+assertCurrentExecutionLiveness();
+} catch (error) {
+if (publicationComplete && descriptor !== null) {
+let rolledBack = false;
+try {
+rolledBack = withoutCurrentExecutionLiveness(() => this.rollbackPublishedDescriptor(relativeFile, descriptor!, preimage));
+} catch {
+rolledBack = false;
+}
+if (!rolledBack) {
+throw new PinnedRootError("changed", `anchored exclusive publication failed and its exact rollback could not be proven: ${String(error)}`);
+}
+publicationComplete = false;
+}
+if (error instanceof ExecutionLivenessViolation) throw error;
+if (error instanceof PinnedRootError) throw error;
+const code = errnoCode(error);
+if (code === "ENOENT") throw new PinnedRootError("not_found", `anchored parent does not exist for '${relativeTarget}'`);
+throw new PinnedRootError("write_failed", `anchored exclusive write failed: ${String(error)}`);
+} finally {
+try { this.hooks.beforeCleanup?.(relativeTarget); } catch { /* test seams cannot replace the primary result */ }
+closeQuietly(tempFd);
+if (tempPath !== null) {
+let safeCleanup = true;
+try { this.assertCanonicalDirectory(segments.join("/")); } catch { safeCleanup = false; }
+if (safeCleanup) { try { unlinkSync(tempPath); } catch { } }
+}
+parent.close();
+}
+if (descriptor === null) throw new PinnedRootError("write_failed", "anchored exclusive write completed without an operation descriptor");
+const published = this.finishPublishedDescriptor(relativeFile, descriptor, preimage);
+descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, preimage));
+return published;
+}
+/** Exact publication receipt with the preimage captured by the transaction. */
+writeExclusiveWithReceipt(relativeFile: string, content: PinnedRootWriteContent, options: PinnedRootWriteOptions = {}): PinnedRootWriteReceipt {
+const descriptor = this.writeExclusiveWithDescriptor(relativeFile, content, options);
+const receipt = descriptorReceipts.get(descriptor);
+if (receipt) return receipt;
+return this.makeWriteReceipt(relativeFile, descriptor, this.captureWritePreimage(relativeFile));
+}
+/** Crash-durable temp-write/fsync/rename anchored to the pinned root. */
+writeAtomic(relativeFile: string, content: PinnedRootWriteContent): void {
+this.writeAtomicWithDescriptor(relativeFile, content);
+}
+/** Exact publication receipt with the preimage captured by the transaction. */
+writeAtomicWithReceipt(relativeFile: string, content: PinnedRootWriteContent, options: PinnedRootWriteOptions = {}): PinnedRootWriteReceipt {
+const descriptor = this.writeAtomicWithDescriptor(relativeFile, content, options);
+const receipt = descriptorReceipts.get(descriptor);
+if (receipt) return receipt;
+return this.makeWriteReceipt(relativeFile, descriptor, this.captureWritePreimage(relativeFile));
+}
+/** Atomic write returning the inode published by this operation. */
+writeAtomicWithDescriptor(relativeFile: string, content: PinnedRootWriteContent, options: PinnedRootWriteOptions = {}): PinnedRootWriteDescriptor {
+contentByteLength(content);
+const segments = safeRelativeSegments(relativeFile);
+assertCurrentExecutionLiveness();
+if (process.platform === "darwin") {
+let prepared: { descriptor: PinnedRootWriteDescriptor; preimage: PinnedRootWritePreimage } | null = null;
+try {
+for (let attempt = 0; attempt < 2; attempt += 1) {
+try {
+this.hooks.beforeTempOpen?.(relativeFile);
+this.hooks.beforeRename?.(relativeFile);
+prepared = this.writeDarwinPrepared("atomic", relativeFile, content, options);
+break;
+} catch (error) {
+if (!(error instanceof PinnedRootError) || error.code !== "changed" || attempt === 1) throw error;
+}
+}
+} finally {
+try { this.hooks.beforeCleanup?.(relativeFile); } catch { /* preserve the primary operation result */ }
+}
+if (!prepared) throw new PinnedRootError("write_failed", "prepared atomic write completed without an operation descriptor");
+const published = this.finishPublishedDescriptor(relativeFile, prepared.descriptor, prepared.preimage, true);
+descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, prepared.preimage));
+return published;
+}
+const existingEntry = this.pathEntryInfo(relativeFile);
+if (existingEntry !== null && process.platform === "linux") {
+const expectedPreimage = this.captureWritePreimage(relativeFile);
+if (expectedPreimage.kind !== "file") throw new PinnedRootError("changed", "anchored replacement target disappeared before CAS preparation");
+const prepared = this.writeDarwinPrepared("atomic", relativeFile, content, options, expectedPreimage.expectation);
+const published = this.finishPublishedDescriptor(relativeFile, prepared.descriptor, prepared.preimage, true);
+descriptorPreimages.set(published, prepared.preimage);
+descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, prepared.preimage));
+return published;
+}
+if (existingEntry !== null) {
+throw new PinnedRootError("unsupported", "anchored replacement requires a kernel compare-and-swap transaction");
+}
+const preimage = this.captureWritePreimage(relativeFile);
+const finalName = segments.pop()!;
+const parent = this.openParent(segments, true);
+const relativeTarget = [
+...segments,
+finalName,
+].join("/");
+let tempFd: number | null = null;
+let tempPath: string | null = null;
+let descriptor: PinnedRootWriteDescriptor | null = null;
+let committed = false;
+try {
+const flags = writeFlags();
+if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow writes are unavailable");
+const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
+for (let attempt = 0; attempt < 32; attempt += 1) {
+const tempName = boundedTemporaryComponent("write", relativeTarget, ".tmp");
+const candidate = join(parentPath, tempName);
+this.hooks.beforeTempOpen?.(relativeTarget);
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+try {
+tempFd = openSync(candidate, flags, 0o600);
+tempPath = candidate;
+break;
+} catch (error) {
+if (errnoCode(error) !== "EEXIST") throw error;
+}
+}
+if (tempFd === null || tempPath === null) throw new PinnedRootError("write_failed", "unable to reserve an atomic temp file");
+const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
+let offset = 0;
+while (offset < bytes.length) {
+const written = writeSync(tempFd, bytes, offset, bytes.length - offset);
+if (written <= 0) throw new PinnedRootError("write_failed", "short anchored atomic write");
+offset += written;
+}
+fchmodSync(tempFd, 0o600);
+fsyncSync(tempFd);
+this.assertStable();
+const parentAfter = fstatSync(parent.fd);
+if (!sameIdentity(parentAfter, parent.identity)) throw new PinnedRootError("changed", "anchored parent changed during commit");
+const target = join(parentPath, finalName);
+let existing: Stats | null = null;
+try { existing = lstatSync(target); } catch (error) { if (errnoCode(error) !== "ENOENT") throw error; }
+if (existing && (existing.isSymbolicLink() || existing.isDirectory() || !existing.isFile())) throw new PinnedRootError("path_unauthorized", "anchored target is not a regular file");
+const published = fstatSync(tempFd);
+const planned: PinnedRootWriteDescriptor = {
+path: this.anchorPath(relativeFile),
+relative_path: relativeFile,
+dev: published.dev,
+ino: published.ino,
+size: contentByteLength(content),
+sha256: contentSha256(content),
+};
+this.hooks.beforeRename?.(relativeTarget);
+this.assertCanonicalDirectory(segments.join("/"));
+this.assertParentPathIdentity(parent.fd, segments.join("/"));
+this.assertStable();
+assertCurrentExecutionLiveness();
+const receipt = this.makeWriteReceipt(relativeFile, planned, preimage);
+this.hooks.beforePublish?.(receipt);
+options.beforePublish?.(receipt);
+try {
+if (existing === null) {
+linkSync(tempPath, target);
+committed = true;
+descriptor = planned;
+unlinkSync(tempPath);
+} else {
+throw new PinnedRootError("unsupported", "anchored replacement requires a kernel compare-and-swap transaction");
+}
+} catch (error) {
+if (error instanceof PinnedRootError) throw error;
+if (errnoCode(error) === "EEXIST") throw new PinnedRootError("changed", "anchored create target changed before no-replace publication");
+throw error;
+}
+tempPath = null;
+this.hooks.afterPublish?.(relativeTarget);
+try {
+fsyncSync(parent.fd);
+} catch (error) {
+const code = errnoCode(error);
+if (code !== "EINVAL" && code !== "ENOTSUP") throw error;
+}
+this.hooks.afterPublishLiveness?.(relativeTarget);
+assertCurrentExecutionLiveness();
+} catch (error) {
+if (committed && descriptor !== null) {
+let rolledBack = false;
+try {
+rolledBack = withoutCurrentExecutionLiveness(() => this.rollbackPublishedDescriptor(relativeFile, descriptor!, preimage));
+} catch {
+rolledBack = false;
+}
+if (!rolledBack) {
+throw new PinnedRootError("changed", `anchored atomic publication failed and its exact rollback could not be proven: ${String(error)}`);
+}
+committed = false;
+}
+if (error instanceof ExecutionLivenessViolation) throw error;
+if (error instanceof PinnedRootError) throw error;
+const code = errnoCode(error);
+if (code === "ENOENT") throw new PinnedRootError("not_found", `anchored parent does not exist for '${relativeTarget}'`);
+throw new PinnedRootError("write_failed", `anchored atomic write failed: ${String(error)}`);
+} finally {
+try { this.hooks.beforeCleanup?.(relativeTarget); } catch { /* test seams cannot replace the primary result */ }
+closeQuietly(tempFd);
+if (!committed && tempPath !== null) {
+let safeCleanup = true;
+try { this.assertCanonicalDirectory(segments.join("/")); } catch { safeCleanup = false; }
+if (safeCleanup) {
+try { unlinkSync(tempPath); } catch { }
+}
+}
+parent.close();
+}
+if (descriptor === null) throw new PinnedRootError("write_failed", "anchored atomic write completed without an operation descriptor");
+const published = this.finishPublishedDescriptor(relativeFile, descriptor, preimage);
+descriptorReceipts.set(published, this.makeWriteReceipt(relativeFile, published, preimage));
+return published;
+}
+private startDarwinHelper(executable: string, deadline: number): DarwinHelperSession {
+const directory = mkdtempSync(join(tmpdir(), ".omp-darwin-helper-"));
+let requestFd: number | null = null;
+let responseFd: number | null = null;
+let child: ChildProcess | null = null;
+let startupError: Error | null = null;
+let sessionRef: DarwinHelperSession | null = null;
+let resolveExit!: () => void;
+let exited = false;
+const exitPromise = new Promise<void>((resolve) => { resolveExit = resolve; });
+try {
+chmodSync(directory, 0o700);
+const directoryInfo = lstatSync(directory);
+if (!directoryInfo.isDirectory() || (directoryInfo.mode & 0o777) !== 0o700) throw new PinnedRootError("unsupported", "descriptor helper IPC directory is unsafe");
+const requestPath = join(directory, "request.fifo");
+const responsePath = join(directory, "response.fifo");
+const readyNonce = randomUUID();
+const helperAuthKey = randomBytes(32);
+const helperSessionId = randomUUID();
+child = spawn(executable, ["-I", "-c", DARWIN_HELPER_SOURCE], {
+stdio: ["ignore", "ignore", "ignore", this.rootFd, "pipe"],
+env: {
+OMP_DARWIN_HELPER_REQUEST_FIFO: requestPath,
+OMP_DARWIN_HELPER_RESPONSE_FIFO: responsePath,
+OMP_DARWIN_HELPER_READY_NONCE: readyNonce,
+LC_ALL: "C",
+LANG: "C",
+TZ: "UTC",
+},
+});
+const authPipe = child.stdio[4];
+const authWriter = authPipe as unknown as { end: (chunk: Buffer) => void };
+if (!authPipe || typeof authWriter.end !== "function") throw new PinnedRootError("unsupported", "descriptor helper authentication pipe is unavailable");
+const credentials = [helperAuthKey.toString("hex"), DARWIN_JOURNAL_AUTH_KEY.toString("hex"), helperSessionId].join("\n") + "\n";
+authPipe.once("error", (error: Error) => { startupError ??= error; });
+authWriter.end(Buffer.from(credentials, "ascii"));
+// Register both handlers before any startup polling. A failed spawn is
+// always observed and converted to a poisoned, fail-closed session.
+child.once("error", (error) => {
+const normalized = error instanceof Error ? error : new Error(String(error));
+startupError ??= normalized;
+if (sessionRef) {
+sessionRef.runtimeError = normalized;
+if (!sessionRef.closing) this.poisonDarwinHelper();
+}
+});
+child.once("exit", (code, signal) => {
+exited = true;
+resolveExit();
+if (sessionRef) {
+sessionRef.exited = true;
+removeLiveDarwinHelperSession(sessionRef);
+if (!sessionRef.closing) {
+sessionRef.runtimeError = new Error(`descriptor helper exited (${code ?? "null"}, ${signal ?? "null"})`);
+this.poisonDarwinHelper();
+}
+}
+});
+const startupDeadline = Math.min(deadline, Date.now() + DARWIN_HELPER_START_TIMEOUT_MS);
+const helperUid = process.getuid?.();
+if (helperUid === undefined) throw new PinnedRootError("unsupported", "descriptor helper FIFO ownership cannot be verified");
+let requestInfo: Stats | null = null;
+let responseInfo: Stats | null = null;
+while (Date.now() <= startupDeadline) {
+if (startupError) throw new PinnedRootError("unsupported", `descriptor helper spawn failed: ${String(startupError)}`);
+if (child.exitCode !== null || exited) throw new PinnedRootError("unsupported", "descriptor helper exited before opening its IPC channels");
+try {
+requestInfo = lstatSync(requestPath);
+responseInfo = lstatSync(responsePath);
+if (requestInfo.isFIFO() && responseInfo.isFIFO()
+&& (requestInfo.mode & 0o777) === 0o600 && (responseInfo.mode & 0o777) === 0o600
+&& requestInfo.uid === helperUid && responseInfo.uid === helperUid) break;
+throw new PinnedRootError("unsupported", "descriptor helper IPC channel has unsafe identity or mode");
+} catch (error) {
+if (error instanceof PinnedRootError) throw error;
+if (errnoCode(error) !== "ENOENT") throw error;
+}
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS);
+}
+if (startupError) throw new PinnedRootError("unsupported", `descriptor helper spawn failed: ${String(startupError)}`);
+if (!requestInfo || !responseInfo) throw new PinnedRootError("unsupported", "descriptor helper IPC channels did not appear");
+const requestAfter = lstatSync(requestPath);
+const responseAfter = lstatSync(responsePath);
+if (requestAfter.dev !== requestInfo.dev || requestAfter.ino !== requestInfo.ino || !requestAfter.isFIFO()
+|| responseAfter.dev !== responseInfo.dev || responseAfter.ino !== responseInfo.ino || !responseAfter.isFIFO()) {
+throw new PinnedRootError("changed", "descriptor helper IPC channel changed before open");
+}
+const nonblock = constants.O_NONBLOCK;
+const nofollow = constants.O_NOFOLLOW;
+if (!Number.isInteger(nonblock) || !Number.isInteger(nofollow)) throw new PinnedRootError("unsupported", "safe nonblocking FIFO operations are unavailable");
+while (requestFd === null && Date.now() <= startupDeadline) {
+this.hooks.beforeDarwinHelperOpen?.("request", requestPath);
+try { requestFd = openSync(requestPath, constants.O_WRONLY | nonblock | nofollow); }
+catch (error) { if (errnoCode(error) !== "ENXIO" && errnoCode(error) !== "ENOENT") throw error; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS); }
+}
+if (requestFd === null) throw new PinnedRootError("unsupported", "descriptor helper request channel did not open");
+assertDarwinFifoDescriptor(requestFd, requestInfo, "request");
+this.hooks.beforeDarwinHelperOpen?.("response", responsePath);
+responseFd = openSync(responsePath, constants.O_RDONLY | nonblock | nofollow);
+assertDarwinFifoDescriptor(responseFd, responseInfo, "response");
+const requestOpened = lstatSync(requestPath);
+const responseOpened = lstatSync(responsePath);
+if (requestOpened.dev !== requestInfo.dev || requestOpened.ino !== requestInfo.ino || responseOpened.dev !== responseInfo.dev || responseOpened.ino !== responseInfo.ino) {
+throw new PinnedRootError("changed", "descriptor helper IPC channel changed after open");
+}
+const session: DarwinHelperSession = {
+directory, requestPath, responsePath, requestFd, responseFd, child, exitPromise, resolveExit,
+exited, closing: false, runtimeError: null, authKey: helperAuthKey, sessionId: helperSessionId, rootPathDigest: this.rootPathDigest, nonce: 0,
+};
+sessionRef = session;
+const readyOutput = this.readDarwinFrame(session, startupDeadline, "__ready", true);
+let readyResult: unknown;
+try { readyResult = JSON.parse(readyOutput); } catch (error) { throw new PinnedRootError("unsupported", `descriptor helper ready frame is invalid: ${String(error)}`); }
+if (!readyResult || typeof readyResult !== "object") throw new PinnedRootError("unsupported", "descriptor helper ready frame is invalid");
+const readyRecord = readyResult as Record<string, unknown>;
+const readyMac = readyRecord._mac;
+delete readyRecord._mac;
+if (readyRecord._session_id !== helperSessionId || !verifyDarwinHelperMac(readyRecord, readyMac, helperAuthKey)) throw new PinnedRootError("unsupported", "descriptor helper ready frame authentication failed");
+if (readyRecord.ok !== true || readyRecord.ready !== true || readyRecord._ready_nonce !== readyNonce) {
+throw new PinnedRootError("unsupported", "descriptor helper ready frame correlation failed");
+}
+activeDarwinHelperSessions.add(session);
+registerLiveDarwinHelperSession(session);
+// Verified FIFO identity and ready frame establish the response writer;
+// the child is then independent of Node event-loop liveness.
+child.unref();
+return session;
+} catch (error) {
+if (sessionRef) {
+activeDarwinHelperSessions.delete(sessionRef);
+removeLiveDarwinHelperSession(sessionRef);
+}
+closeQuietly(requestFd);
+closeQuietly(responseFd);
+if (child && child.pid !== undefined) {
+try { child.kill("SIGTERM"); } catch { /* preserve primary failure */ }
+scheduleDarwinHelperHardKill(child);
+}
+removeDarwinHelperDirectory(directory);
+if (error instanceof PinnedRootError) throw error;
+throw new PinnedRootError("unsupported", `descriptor helper could not start: ${String(error)}`);
+}
+}
+private poisonDarwinHelper(): void {
+this.darwinHelperPoisoned = true;
+const session = this.darwinHelperSession;
+this.darwinHelperSession = null;
+if (!session) return;
+activeDarwinHelperSessions.delete(session);
+removeLiveDarwinHelperSession(session);
+session.closing = true;
+closeDarwinHelperSessionImmediately(session);
+this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
+void this.darwinHelperClosePromise.catch(() => undefined);
+}
+private writeDarwinFrame(session: DarwinHelperSession, frame: Buffer, deadline: number, operation: string): void {
+let offset = 0;
+while (offset < frame.byteLength) {
+if (Date.now() > deadline) throw new PinnedRootError("unsupported", `descriptor helper '${operation}' timed out`);
+try {
+const written = writeSync(session.requestFd, frame, offset, frame.byteLength - offset);
+if (written <= 0) throw new PinnedRootError("unsupported", "descriptor helper request channel closed");
+offset += written;
+} catch (error) {
+if (errnoCode(error) !== "EAGAIN" && errnoCode(error) !== "EWOULDBLOCK") throw error;
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS);
+}
+}
+}
+private readDarwinFrame(session: DarwinHelperSession, deadline: number, operation: string, tolerateInitialEof = false): string {
+const chunk = Buffer.allocUnsafe(64 * 1024);
+const decoder = new TextDecoder("utf-8", { fatal: true });
+const textParts: string[] = [];
+let total = 0;
+while (Date.now() <= deadline) {
+try {
+const read = readSync(session.responseFd, chunk, 0, chunk.byteLength, null);
+if (read === 0) {
+if (tolerateInitialEof) {
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS);
+continue;
+}
+throw new PinnedRootError("unsupported", "descriptor helper response channel closed");
+}
+const bytes = chunk.subarray(0, read);
+total += read;
+if (total > DARWIN_HELPER_MAX_OUTPUT) throw new PinnedRootError("limit", "descriptor helper response exceeds its bounded output limit");
+const newline = bytes.indexOf(0x0a);
+if (newline >= 0) {
+if (newline !== read - 1) throw new PinnedRootError("unsupported", `descriptor helper '${operation}' returned trailing frame bytes`);
+textParts.push(decodeDarwinHelperUtf8(decoder, bytes.subarray(0, newline), false, operation));
+return textParts.join("");
+}
+textParts.push(decodeDarwinHelperUtf8(decoder, bytes, true, operation));
+} catch (error) {
+if (errnoCode(error) !== "EAGAIN" && errnoCode(error) !== "EWOULDBLOCK") throw error;
+}
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS);
+}
+throw new PinnedRootError("unsupported", `descriptor helper '${operation}' timed out`);
+}
+private requestDarwinHelper<T extends Record<string, unknown>>(executable: string, operation: string, payload: Record<string, unknown>, timeoutMs: number): T {
+if (this.darwinHelperPoisoned) throw new PinnedRootError("unsupported", "descriptor helper is poisoned after a failed operation");
+const requestId = randomUUID();
+const requestPayload: Record<string, unknown> = { ...payload, op: operation, root_dev: this.dev, root_ino: this.ino, _root_path_digest: this.rootPathDigest, _request_id: requestId };
+if (this.hooks.helperSleepMs !== undefined) requestPayload.test_sleep_ms = this.hooks.helperSleepMs;
+if (this.hooks.helperProtocolTest !== undefined) requestPayload._test_response_mode = this.hooks.helperProtocolTest;
+const liveBatchIds = LIVE_DARWIN_BATCH_IDS.get(this.rootPathDigest);
+if (liveBatchIds && liveBatchIds.size > 0) requestPayload._live_batch_ids = [...liveBatchIds];
+const liveHelperSessionIds = liveDarwinHelperSessionIds(this.rootPathDigest);
+if (liveHelperSessionIds.length > 0) requestPayload._live_helper_session_ids = liveHelperSessionIds;
+const unsignedRequest = Buffer.from(JSON.stringify(requestPayload) + "\n", "utf8");
+if (unsignedRequest.byteLength > DARWIN_HELPER_MAX_INPUT) throw new PinnedRootError("limit", `descriptor helper '' request exceeds the bounded input limit`);
+const transferTimeoutMs = darwinHelperTransferTimeout(operation, timeoutMs, unsignedRequest.byteLength);
+const transferMarginMs = transferTimeoutMs > timeoutMs ? DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS : 0;
+const operationDeadline = Date.now() + transferTimeoutMs + transferMarginMs + DARWIN_HELPER_START_TIMEOUT_MS;
+if (!this.darwinHelperSession) {
+try {
+this.darwinHelperSession = this.startDarwinHelper(executable, operationDeadline);
+} catch (error) {
+this.darwinHelperPoisoned = true;
+throw error;
+}
+}
+const session = this.darwinHelperSession;
+if (session.runtimeError || session.exited || Date.now() > operationDeadline) {
+this.poisonDarwinHelper();
+throw new PinnedRootError("unsupported", "descriptor helper failed before request dispatch");
+}
+requestPayload._host_instance_id = DARWIN_HOST_INSTANCE_ID;
+requestPayload._session_id = session.sessionId;
+const authorizedHelperSessionIds = new Set(liveDarwinHelperSessionIds(this.rootPathDigest));
+authorizedHelperSessionIds.add(session.sessionId);
+requestPayload._live_helper_session_ids = [...authorizedHelperSessionIds];
+requestPayload._nonce = ++session.nonce;
+requestPayload._mac = darwinHelperMac(requestPayload, session.authKey);
+const request = Buffer.from(JSON.stringify(requestPayload) + "\n", "utf8");
+if (request.byteLength > DARWIN_HELPER_MAX_INPUT) throw new PinnedRootError("limit", `descriptor helper '' request exceeds the bounded input limit`);
+const requestDeadline = Math.min(operationDeadline, Date.now() + transferTimeoutMs + transferMarginMs);
+let responseReceived = false;
+try {
+this.writeDarwinFrame(session, request, requestDeadline, operation);
+const output = this.readDarwinFrame(session, requestDeadline, operation);
+let result: unknown;
+try { result = JSON.parse(output); } catch (error) { throw new PinnedRootError("unsupported", `descriptor helper returned invalid output: ${String(error)}`); }
+if (!result || typeof result !== "object") throw new PinnedRootError("unsupported", "descriptor helper returned an invalid result");
+const record = result as Record<string, unknown>;
+const responseMac = record._mac;
+delete record._mac;
+if (!verifyDarwinHelperMac(record, responseMac, session.authKey)) throw new PinnedRootError("unsupported", "descriptor helper response authentication failed");
+if (record._session_id !== session.sessionId || record._nonce !== requestPayload._nonce) throw new PinnedRootError("unsupported", "descriptor helper response nonce failed");
+if (record._request_id !== requestId) throw new PinnedRootError("unsupported", "descriptor helper response correlation failed");
+responseReceived = true;
+delete record._request_id;
+delete record._nonce;
+const recoveredIds = record._recovered_batch_ids;
+if (recoveredIds !== undefined) {
+if (!Array.isArray(recoveredIds) || recoveredIds.some((id) => typeof id !== "string")) throw new PinnedRootError("unsupported", "descriptor helper returned invalid recovered batch identities");
+for (const id of recoveredIds) removeLiveDarwinBatch(this.rootPathDigest, id);
+delete record._recovered_batch_ids;
+}
+if (record.ok !== true) {
+const code = ["unsupported", "invalid", "limit", "changed", "recovery_required", "path_unauthorized", "not_found", "not_directory", "not_regular", "write_failed", "exists"].includes(String(record.code))
+? String(record.code) as PinnedRootErrorCode
+: "write_failed";
+throw new PinnedRootError(code, typeof record.message === "string" ? record.message : "descriptor helper operation failed");
+}
+return record as T;
+} catch (error) {
+if (!responseReceived) this.poisonDarwinHelper();
+if (error instanceof PinnedRootError) throw error;
+throw new PinnedRootError("unsupported", `descriptor helper '${operation}' failed: ${String(error)}`);
+}
+}
+private awaitDarwinHelperExit(session: DarwinHelperSession): Promise<void> {
+return new Promise<void>((resolve, reject) => {
+let settled = false;
+let timer: NodeJS.Timeout | null = null;
+let finalTimer: NodeJS.Timeout | null = null;
+const childPid = session.child.pid;
+const finish = (error?: Error) => {
+if (settled) return;
+settled = true;
+if (timer !== null) { clearTimeout(timer); timer.unref(); timer = null; }
+if (finalTimer !== null) { clearTimeout(finalTimer); finalTimer.unref(); finalTimer = null; }
+removeDarwinHelperDirectory(session.directory);
+if (error) reject(error); else resolve();
+};
+if (session.exited || session.child.exitCode !== null) {
+session.exited = true;
+finish();
+return;
+}
+timer = setTimeout(() => {
+if (session.exited || session.child.exitCode !== null) { finish(); return; }
+if (session.child.pid === childPid) {
+try { session.child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
+}
+finalTimer = setTimeout(() => {
+if (session.exited || session.child.exitCode !== null) finish();
+else finish(new PinnedRootError("unsupported", "descriptor helper did not exit before bounded close"));
+}, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
+}, DARWIN_HELPER_CLOSE_TIMEOUT_MS);
+session.exitPromise.then(() => finish(), () => finish(new PinnedRootError("unsupported", "descriptor helper exit could not be observed")));
+});
+}
+private closeDarwinHelper(): void {
+const session = this.darwinHelperSession;
+this.darwinHelperSession = null;
+if (!session) return;
+activeDarwinHelperSessions.delete(session);
+removeLiveDarwinHelperSession(session);
+session.closing = true;
+closeDarwinHelperSessionImmediately(session);
+this.darwinHelperClosePromise = this.awaitDarwinHelperExit(session);
+void this.darwinHelperClosePromise.catch(() => undefined);
+}
+private makeWriteReceipt(
+relativeFile: string,
+descriptor: PinnedRootWriteDescriptor,
+preimage: PinnedRootWritePreimage,
+): PinnedRootWriteReceipt {
+return {
+...descriptor,
+descriptor,
+preimage,
+rollback: () => this.rollbackPublishedDescriptor(relativeFile, descriptor, preimage),
+};
+}
+private resetDarwinHelperForCompensation(): void {
+// A malformed/EOF response poisons normal request reuse. Compensation is
+// a separate exact-CAS transaction and may safely start a fresh helper;
+// stale lease recovery protects any operation whose response was lost.
+this.darwinHelperPoisoned = false;
+}
+private publishedDescriptorMatches(relativeFile: string, descriptor: PinnedRootWriteDescriptor): boolean {
+try {
+const observed = this.readFile(relativeFile, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
+return observed.dev === descriptor.dev
+&& observed.ino === descriptor.ino
+&& observed.size === descriptor.size
+&& Buffer.from(observed.bytes).byteLength === descriptor.size
+&& createHash("sha256").update(Buffer.from(observed.bytes)).digest("hex") === descriptor.sha256;
+} catch {
+return false;
+}
+}
+private writeDarwinPrepared(
+operation: "exclusive" | "atomic",
+relativeFile: string,
+content: PinnedRootWriteContent,
+options?: PinnedRootWriteOptions,
+expected?: PinnedRootFileExpectation,
+): { descriptor: PinnedRootWriteDescriptor; preimage: PinnedRootWritePreimage } {
+const prepOperation = operation === "exclusive" ? "prepare_write_exclusive" : "prepare_write_atomic";
+const prep = this.runDescriptorHelper<PinnedWriteDescriptorResponse>(prepOperation, {
+path: relativeFile,
+...contentPayload(content, operation === "atomic"),
+...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}),
+...(expected ? { expected } : {}),
+...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}),
+});
+if (typeof prep.token !== "string" || prep.token.length === 0) {
+throw new PinnedRootError("write_failed", "prepared write returned no lease token");
+}
+const preimage = preimageFromResponse(prep);
+const planned = descriptorFromResponse(relativeFile, this.anchorPath(relativeFile), content, prep);
+const receipt = this.makeWriteReceipt(relativeFile, planned, preimage);
+try {
+this.hooks.beforePublish?.(receipt);
+options?.beforePublish?.(receipt);
+const result = this.runDescriptorHelper<PinnedWriteDescriptorResponse>("commit_prepared_write", {
+token: prep.token,
+root_dev: this.dev,
+root_ino: this.ino,
+...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}), ...(this.hooks.preparedPostVerifyMutation ? { test_prepared_post_verify_mutation: true } : {}), ...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}),
+});
+const descriptor = descriptorFromResponse(relativeFile, this.anchorPath(relativeFile), content, result);
+if (result.ack_required !== true) throw new PinnedRootError("write_failed", "prepared write returned no acknowledgement requirement");
+try {
+const acknowledged = this.runDescriptorHelper<{ acknowledged?: unknown; already?: unknown }>("ack_prepared_write", { token: prep.token, root_dev: this.dev, root_ino: this.ino, ...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}), ...(this.hooks.preparedPostVerifyMutation ? { test_prepared_post_verify_mutation: true } : {}), ...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}) });
+if (acknowledged.acknowledged !== true && acknowledged.already !== true) throw new PinnedRootError("write_failed", "prepared write acknowledgement was not accepted");
+if (!this.publishedDescriptorMatches(relativeFile, descriptor) || !this.isStable()) throw new PinnedRootError("changed", "prepared write post-ACK descriptor changed before receipt");
+} catch (ackError) {
+// A verified target mutation is an authenticated recovery condition;
+// do not issue a competing CAS while the prepared lease remains live.
+if (ackError instanceof PinnedRootError && ackError.code === "recovery_required") throw ackError;
+// The helper may have committed and popped the lease immediately
+// before its ACK frame was lost. The descriptor is an anchored proof
+// of ownership; accept success when the exact postimage is present.
+this.resetDarwinHelperForCompensation();
+if (this.publishedDescriptorMatches(relativeFile, descriptor)) return { descriptor, preimage };
+if (!this.rollbackPublishedDescriptor(relativeFile, descriptor, preimage)) {
+throw new PinnedRootError("changed", `prepared write acknowledgement failed and rollback could not be proven: ${String(ackError)}`);
+}
+throw ackError;
+}
+return { descriptor, preimage };
+} catch (error) {
+try { this.runDescriptorHelper("abort_prepared_write", { token: prep.token, root_dev: this.dev, root_ino: this.ino }); } catch { /* dead helper leaves lease/stage for stale recovery */ }
+throw error;
+}
+}
+private writeDarwinPreparedBatch(
+entries: readonly { path: string; content: PinnedRootWriteContent }[],
+options: PinnedRootBatchWriteOptions,
+durableBatch = false,
+): readonly { descriptor: PinnedRootWriteDescriptor; preimage: PinnedRootWritePreimage }[] {
+type PreparedBatchEntry = {
+path: string;
+content: PinnedRootWriteContent;
+token: string;
+descriptor: PinnedRootWriteDescriptor;
+preimage: PinnedRootWritePreimage;
+committed: boolean;
+commit_confirmed: boolean;
+};
+const prepared: PreparedBatchEntry[] = [];
+const batchId = durableBatch ? randomUUID() : undefined;
+const batchPreimages = entries.map((entry) => this.captureWritePreimage(entry.path));
+const rollbackBytes = batchPreimages.reduce((total, preimage) => total + (preimage.kind === "file" ? preimage.bytes.byteLength : 0), 0);
+if (rollbackBytes > MAX_BATCH_ROLLBACK_BYTES) {
+throw new PinnedRootError("limit", "anchored atomic batch rollback snapshot exceeds its byte bound");
+}
+const batchManifest = durableBatch ? entries.map((entry, index) => {
+const bytes = Buffer.from(entry.content);
+const preimage = batchPreimages?.[index];
+return { path: safeRelativeSegments(entry.path).join("/"), index, size: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex"), expected: preimage?.kind === "file" ? { kind: "file", ...preimage.expectation } : { kind: "absent" } };
+}) : undefined;
+if (batchId) liveDarwinBatchSet(this.rootPathDigest).add(batchId);
+try {
+for (const [index, entry] of entries.entries()) {
+this.hooks.beforeTempOpen?.(entry.path);
+this.assertStable();
+this.hooks.beforeRename?.(entry.path);
+if (batchManifest) {
+const currentPreimage = this.captureWritePreimage(entry.path);
+batchManifest[index]!.expected = currentPreimage.kind === "file" ? { kind: "file", ...currentPreimage.expectation } : { kind: "absent" };
+}
+const response = this.runDescriptorHelper<PinnedWriteDescriptorResponse>("prepare_write_atomic", {
+path: entry.path,
+...contentPayload(entry.content, true),
+...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}),
+...(Number.isInteger(this.hooks.preparedBatchJournalIndex) ? { failure_batch_index: this.hooks.preparedBatchJournalIndex } : {}),
+...(batchId ? { batch_id: batchId, batch_index: index, batch_size: entries.length, batch_manifest: batchManifest } : {}),
+});
+if (typeof response.token !== "string" || response.token.length === 0) {
+throw new PinnedRootError("write_failed", "prepared batch write returned no lease token");
+}
+const preimage = preimageFromResponse(response);
+const descriptor = descriptorFromResponse(entry.path, this.anchorPath(entry.path), entry.content, response);
+prepared.push({ path: entry.path, content: entry.content, token: response.token, descriptor, preimage, committed: false, commit_confirmed: false });
+}
+const receipts = prepared.map((entry) => this.makeWriteReceipt(entry.path, entry.descriptor, entry.preimage));
+options.beforePublish?.(receipts);
+for (const entry of prepared) {
+// Once commit is requested this operation owns the target even if the
+// response transport fails; the planned descriptor is the only safe
+// postimage identity available for exact compensation.
+entry.committed = true;
+const response = this.runDescriptorHelper<PinnedWriteDescriptorResponse>("commit_prepared_write", {
+token: entry.token,
+root_dev: this.dev,
+root_ino: this.ino,
+...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}), ...(this.hooks.preparedPostVerifyMutation ? { test_prepared_post_verify_mutation: true } : {}), ...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}),
+});
+const descriptor = descriptorFromResponse(entry.path, this.anchorPath(entry.path), entry.content, response);
+if (descriptor.dev !== entry.descriptor.dev || descriptor.ino !== entry.descriptor.ino) {
+throw new PinnedRootError("changed", "prepared batch postimage descriptor changed before acknowledgement");
+}
+if (response.ack_required !== true) throw new PinnedRootError("write_failed", "prepared batch write returned no acknowledgement requirement");
+entry.commit_confirmed = true;
+if (this.hooks.batchFailureIndex === prepared.indexOf(entry)) throw new PinnedRootError("write_failed", "injected anchored atomic batch interruption");
+}
+for (const entry of prepared) {
+try {
+const acknowledged = this.runDescriptorHelper<{ acknowledged?: unknown; already?: unknown }>("ack_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino, ...(this.hooks.conditionalFailurePhase ? { failure_phase: this.hooks.conditionalFailurePhase } : {}), ...(this.hooks.preparedPostVerifyMutation ? { test_prepared_post_verify_mutation: true } : {}), ...(this.hooks.preparedLeaseReplacement ? { test_prepared_lease_replacement: true } : {}) });
+if (acknowledged.acknowledged !== true && acknowledged.already !== true) throw new PinnedRootError("write_failed", "prepared batch acknowledgement was not accepted");
+} catch (ackError) {
+// A response can be lost after ACK has atomically released the
+// lease. Verify all committed postimages before accepting success;
+// otherwise the transaction remains compensable by exact CAS.
+this.resetDarwinHelperForCompensation();
+let cleanupConfirmed = false;
+if (batchId) {
+try {
+const recovery = this.runDescriptorHelper<{ recovered?: unknown; absent_clean?: unknown }>("recover_prepared_batch", { batch_id: batchId, entries: prepared.map((candidate) => ({ path: safeRelativeSegments(candidate.path).join("/"), dev: candidate.descriptor.dev, ino: candidate.descriptor.ino, size: candidate.descriptor.size, sha256: candidate.descriptor.sha256 })) });
+cleanupConfirmed = recovery.recovered === true || recovery.absent_clean === true;
+} catch { /* retain the live ID until durable cleanup is proven */ }
+}
+if (cleanupConfirmed && prepared.every((candidate) => this.publishedDescriptorMatches(candidate.path, candidate.descriptor))) {
+if (batchId) removeLiveDarwinBatch(this.rootPathDigest, batchId);
+return prepared.map((candidate) => ({ descriptor: candidate.descriptor, preimage: candidate.preimage }));
+}
+throw ackError;
+}
+}
+if (!this.isStable() || prepared.some((entry) => !this.publishedDescriptorMatches(entry.path, entry.descriptor))) {
+throw new PinnedRootError("changed", "prepared batch post-ACK descriptor changed before receipt");
+}
+if (batchId) removeLiveDarwinBatch(this.rootPathDigest, batchId);
+return prepared.map((entry) => ({ descriptor: entry.descriptor, preimage: entry.preimage }));
+} catch (error) {
+// A lost helper response leaves the grouped journal as the only durable
+// authority. Do not run descriptor compensation here: it would issue a
+// fresh helper request, observe the stale group, and prematurely finish
+// or roll back a transaction whose progress is still unresolved. The
+// next open/operation performs grouped classification and recovery.
+if (durableBatch && prepared.length === 0) {
+if (batchId) {
+this.resetDarwinHelperForCompensation();
+try {
+const recovery = this.runDescriptorHelper<{ recovered?: unknown; absent_clean?: unknown }>("recover_prepared_batch", { batch_id: batchId, entries: batchManifest ?? [] });
+if (recovery.recovered === true || recovery.absent_clean === true) removeLiveDarwinBatch(this.rootPathDigest, batchId);
+else throw new PinnedRootError("recovery_required", "durable prepared batch cleanup was not proven");
+} catch (recoveryError) {
+let residueAbsent = false;
+if (batchManifest) {
+try { residueAbsent = this.durableBatchResidueAbsent(batchId, batchManifest); } catch { residueAbsent = false; }
+}
+if (residueAbsent) {
+removeLiveDarwinBatch(this.rootPathDigest, batchId);
+throw error;
+}
+if (recoveryError instanceof PinnedRootError && recoveryError.code === "recovery_required") throw recoveryError;
+throw new PinnedRootError("recovery_required", "durable prepared batch cleanup could not be disproven after helper failure: " + String(error));
+}
+}
+throw error;
+}
+if (durableBatch && prepared.length > 0 && error instanceof PinnedRootError && error.code === "unsupported") throw error;
+let rollbackComplete = true;
+let abortComplete = true;
+this.resetDarwinHelperForCompensation();
+const rollbackCandidates = prepared.filter((entry) => entry.committed && entry.commit_confirmed);
+for (const entry of rollbackCandidates.slice().reverse()) {
+try {
+const rollback = this.runDescriptorHelper<{ rolled_back?: unknown }>("rollback_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino });
+if (rollback.rolled_back !== true) rollbackComplete = false;
+} catch {
+rollbackComplete = false;
+}
+}
+// Never release any lease from a mixed-success batch until every
+// confirmed publication has durable proof of exact restoration.
+if (rollbackComplete) {
+for (const entry of prepared.filter((candidate) => !candidate.committed || !candidate.commit_confirmed).slice().reverse()) {
+try {
+const abortResult = this.runDescriptorHelper<{ aborted?: unknown; rollback_required?: unknown }>("abort_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino });
+if (abortResult.rollback_required === true) rollbackCandidates.push(entry);
+else if (abortResult.aborted !== true && entry.committed) abortComplete = false;
+} catch { abortComplete = false; /* stale lease recovery owns cleanup */ }
+}
+if (abortComplete) {
+for (const entry of rollbackCandidates.slice().reverse()) {
+try {
+const finalized = this.runDescriptorHelper<{ finalized?: unknown }>("finalize_prepared_write", { token: entry.token, root_dev: this.dev, root_ino: this.ino });
+if (finalized.finalized !== true) abortComplete = false;
+} catch {
+abortComplete = false;
+}
+}
+}
+}
+if (durableBatch && abortComplete && rollbackComplete && batchId) removeLiveDarwinBatch(this.rootPathDigest, batchId);
+if (!rollbackComplete) {
+throw new PinnedRootError("changed", `prepared Darwin batch failed and rollback could not be proven: ${String(error)}`);
+}
+throw error;
+} finally {
+for (const entry of entries) {
+try { this.hooks.beforeCleanup?.(entry.path); } catch { /* preserve primary result */ }
+}
+}
+}
+private runDescriptorHelper<T extends Record<string, unknown>>(operation: string, payload: Record<string, unknown> = {}): T {
+this.assertOpen();
+assertCurrentExecutionLiveness();
+if (this.hooks.disableDarwinHelper) throw new PinnedRootError("unsupported", "descriptor helper is disabled");
+let executable: string | null = this.hooks.helperExecutable ?? null;
+for (const candidate of DARWIN_PYTHON_CANDIDATES) {
+if (executable !== null) break;
+try { accessSync(candidate, constants.X_OK); executable = candidate; break; } catch { /* try next interpreter */ }
+}
+if (executable === null) throw new PinnedRootError("unsupported", "descriptor helper is unavailable");
+if (typeof payload.text === "string" && !isWellFormedUtf16(payload.text)) {
+throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
+}
+const timeoutMs = this.hooks.helperTimeoutMs ?? DARWIN_HELPER_TIMEOUT_MS;
+if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > DARWIN_HELPER_TIMEOUT_MS) {
+throw new PinnedRootError("invalid", `descriptor helper '${operation}' timeout is invalid`);
+}
+return this.requestDarwinHelper<T>(executable, operation, payload, timeoutMs);
+}
+/** Internal bounded batch used by state-lock transactions on Darwin. */
+private runDarwinBatch(operations: readonly Record<string, unknown>[], failureIndex?: number): void {
+if (operations.length === 0) return;
+if (operations.length > 16) throw new PinnedRootError("invalid", "anchored state batch contains too many operations");
+const result = this.runDescriptorHelper<{ results: unknown[] }>("batch", {
+operations,
+...(Number.isInteger(failureIndex) ? { failure_index: failureIndex } : {}),
+});
+if (!Array.isArray(result.results) || result.results.length !== operations.length) {
+throw new PinnedRootError("write_failed", "descriptor helper returned an incomplete state batch");
+}
+}
+/** Ensure a bounded set of directories through one inherited-fd request. */
+ensureDirectories(relativeDirectories: readonly string[]): void {
+if (relativeDirectories.length === 0) return;
+assertCurrentExecutionLiveness();
+if (relativeDirectories.length > 16) throw new PinnedRootError("invalid", "too many directories in one anchored state batch");
+if (process.platform !== "darwin") {
+for (const path of relativeDirectories) this.ensureDirectory(path);
+return;
+}
+for (const path of relativeDirectories) {
+safeRelativeSegments(path, true);
+this.hooks.beforeDirectoryCreate?.(path);
+}
+this.runDarwinBatch(relativeDirectories.map((path) => ({ op: "ensure_directory", path })));
+}
+/** Write a bounded ordered set of atomic files through one inherited-fd request. */
+writeAtomicFiles(entries: readonly { path: string; content: PinnedRootWriteContent }[]): void {
+this.writeAtomicFilesWithDescriptors(entries);
+}
   /**
    * Atomic batch write returning ready exact rollback receipts. Preimages are
    * captured before publication and descriptor conversion is completed inside
    * this method; any conversion failure rolls back every positively-owned
    * publication before it escapes to the caller.
    */
-  writeAtomicFilesWithReceipts(entries: readonly { path: string; content: PinnedRootWriteContent }[], options: PinnedRootBatchWriteOptions = {}): readonly PinnedRootWriteReceipt[] {
-    if (entries.length === 0) return [];
-    let descriptors: readonly PinnedRootWriteDescriptor[] | undefined;
-    try {
-      // The descriptor writer captures the preimage at the same transaction
-      // boundary as publication and records it against each returned inode.
-      // Never capture a second, potentially stale, preimage here.
-      // Receipt-producing batches must retain the helper's durable prepared
-      // leases until the client has converted and acknowledged every result;
-      // an ordinary one-phase batch response cannot prove rollback ownership
-      // after transport loss. An empty callback is an internal routing marker.
-      const preparedOptions = options.beforePublish ? options : { ...options, beforePublish: () => {} };
-      descriptors = this.writeAtomicFilesWithDescriptors(entries, preparedOptions);
-      if (descriptors.length !== entries.length) throw new PinnedRootError("write_failed", "anchored atomic batch returned an incomplete descriptor set");
-      return descriptors.map((descriptor, index) => {
-        const relativePath = entries[index]!.path;
-        const preimage = descriptorPreimages.get(descriptor);
-        const receipt = descriptorReceipts.get(descriptor) ?? (preimage === undefined
-          ? undefined
-          : this.makeWriteReceipt(relativePath, descriptor, preimage));
-        if (!receipt
-          || receipt.relative_path !== relativePath
-          || receipt.path !== this.anchorPath(relativePath)
-          || receipt.descriptor !== descriptor) {
-          throw new PinnedRootError("write_failed", "anchored atomic batch returned an unbound publication receipt");
-        }
-        descriptorReceipts.set(descriptor, receipt);
-        return receipt;
-      });
-    } catch (error) {
-      // Descriptor conversion/root-stability failures roll back only the
-      // descriptors that this transaction actually published, using the
-      // preimages recorded by the descriptor writer itself.
-      if (descriptors !== undefined) {
-        const preimages = descriptors.map((descriptor) => descriptorPreimages.get(descriptor));
-        const owned = preimages.every((preimage): preimage is PinnedRootWritePreimage => preimage !== undefined);
-        if (owned && !this.rollbackBatchDescriptors(entries, descriptors, preimages)) {
-          throw new PinnedRootError("changed", `anchored batch receipt conversion failed and rollback could not be proven: ${String(error)}`);
-        }
-      }
-      throw error;
-    }
-  }
-
-  /** Atomic batch write returning one operation descriptor per published inode. */
-  writeAtomicFilesWithDescriptors(entries: readonly { path: string; content: PinnedRootWriteContent }[], options: PinnedRootBatchWriteOptions = {}): readonly PinnedRootWriteDescriptor[] {
-    if (entries.length === 0) return [];
-    assertCurrentExecutionLiveness();
-    if (entries.length > 8) throw new PinnedRootError("invalid", "too many files in one anchored state batch");
-    let totalBytes = 0;
-    for (const entry of entries) {
-      safeRelativeSegments(entry.path);
-      totalBytes += contentByteLength(entry.content);
-    }
-    if (totalBytes > MAX_BATCH_ROLLBACK_BYTES) throw new PinnedRootError("invalid", "anchored state batch exceeds its byte bound");
-    if (process.platform === "linux") {
-      // Linux existing-target replacement uses the helper's per-target
-      // prepared CAS transaction, which closes the non-cooperating writer
-      // window between a userspace precheck and rename. It also gives batch
-      // receipt callbacks one all-or-nothing preparation boundary.
-      const preparedBatch = this.writeDarwinPreparedBatch(entries, options);
-      const preparedDescriptors = preparedBatch.map((entry) => entry.descriptor);
-      const preparedPreimages = preparedBatch.map((entry) => entry.preimage);
-      const published = this.finishPublishedDescriptors(entries, preparedDescriptors, preparedPreimages);
-      this.rememberBatchPreimages(published, preparedPreimages);
-      return published;
-    }
-    if (process.platform !== "darwin") {
-      const portable = this.writeAtomicFilesPortable(entries, options);
-      const descriptors = portable.map((entry) => entry.descriptor);
-      const portablePreimages = portable.map((entry) => entry.preimage);
-      const published = this.finishPublishedDescriptors(entries, descriptors, portablePreimages);
-      try {
-        this.rememberBatchPreimages(published, portablePreimages);
-      } catch (error) {
-        if (!this.rollbackBatchDescriptors(entries, published, portablePreimages)) {
-          throw new PinnedRootError("changed", `anchored portable batch receipt publication failed and rollback could not be proven: ${String(error)}`);
-        }
-        throw error;
-      }
-      return published;
-    }
-    // Every normal Darwin batch uses per-entry durable prepared leases, even
-    // without a beforePublish callback. The legacy one-phase helper remains
-    // only behind the deterministic batchFailureIndex seam so its rollback
-    // regression can continue to exercise that injected path.
-    if (options.beforePublish || !Number.isInteger(this.hooks.batchFailureIndex)) {
-      const preparedBatch = this.writeDarwinPreparedBatch(entries, options, !options.beforePublish);
-      const preparedDescriptors = preparedBatch.map((entry) => entry.descriptor);
-      const preparedPreimages = preparedBatch.map((entry) => entry.preimage);
-      const published = this.finishPublishedDescriptors(entries, preparedDescriptors, preparedPreimages);
-      this.rememberBatchPreimages(published, preparedPreimages);
-      return published;
-    }
-    const operations: Record<string, unknown>[] = [];
-    let descriptors: readonly PinnedRootWriteDescriptor[] | null = null;
-    let helperPreimages: readonly PinnedRootWritePreimage[] | null = null;
-    try {
-      for (const entry of entries) {
-        this.hooks.beforeTempOpen?.(entry.path);
-        this.hooks.beforeRename?.(entry.path);
-        operations.push({ op: "write_atomic", path: entry.path, bytes: contentToBase64(entry.content) });
-      }
-      const response = this.runDescriptorHelper<{ results: PinnedWriteDescriptorResponse[] }>("batch_atomic", {
-        operations,
-        ...(Number.isInteger(this.hooks.batchFailureIndex) ? { failure_index: this.hooks.batchFailureIndex } : {}),
-      });
-      if (!Array.isArray(response.results) || response.results.length !== entries.length) {
-        throw new PinnedRootError("write_failed", "descriptor helper returned an incomplete atomic batch descriptor set");
-      }
-      helperPreimages = response.results.map((result) => preimageFromResponse(result));
-      descriptors = response.results.map((result, index) => descriptorFromResponse(entries[index]!.path, this.anchorPath(entries[index]!.path), entries[index]!.content, result));
-    } catch (error) {
-      // If response validation fails after helper publication, use the exact
-      // preimages returned by that same helper transaction. Never recapture a
-      // potentially changed target while compensating the batch.
-      if (descriptors !== null && helperPreimages !== null
-        && !this.rollbackBatchDescriptors(entries, descriptors, helperPreimages)) {
-        throw new PinnedRootError("changed", `anchored Darwin batch response validation failed and rollback could not be proven: ${String(error)}`);
-      }
-      throw error;
-    } finally {
-      for (const entry of entries) {
-        try { this.hooks.beforeCleanup?.(entry.path); } catch { /* preserve the primary batch result */ }
-      }
-    }
-    if (!descriptors || !helperPreimages) throw new PinnedRootError("write_failed", "anchored atomic batch completed without exact operation metadata");
-    const published = this.finishPublishedDescriptors(entries, descriptors, helperPreimages);
-    try {
-      this.rememberBatchPreimages(published, helperPreimages);
-    } catch (error) {
-      if (!this.rollbackBatchDescriptors(entries, published, helperPreimages)) {
-        throw new PinnedRootError("changed", `anchored Darwin batch receipt publication failed and rollback could not be proven: ${String(error)}`);
-      }
-      throw error;
-    }
-    return published;
-  }
-
-  private writeAtomicFilesPortable(
-    entries: readonly { path: string; content: PinnedRootWriteContent }[],
-    options: PinnedRootBatchWriteOptions = {},
-  ): readonly { descriptor: PinnedRootWriteDescriptor; preimage: PinnedRootWritePreimage }[] {
-    type BatchStage = {
-      path: string;
-      content: Buffer;
-      parent: { fd: number; identity: Stats; close: () => void };
-      finalName: string;
-      target: string;
-      beforeIdentity: Stats | null;
-      beforeBytes: Buffer | null;
-      backupPath: string | null;
-      tempPath: string | null;
-      tempIdentity: Stats | null;
-      descriptor: PinnedRootWriteDescriptor | null;
-      committed: boolean;
-      backupRestored: boolean;
-      quarantinePath: string | null;
-    };
-    const sizes = entries.map((entry) => {
-      safeRelativeSegments(entry.path);
-      return contentByteLength(entry.content);
-    });
-    let totalBytes = sizes.reduce((total, size) => total + size, 0);
-    if (totalBytes > MAX_BATCH_ROLLBACK_BYTES) throw new PinnedRootError("invalid", "anchored state batch exceeds its byte bound");
-    const prepared = entries.map((entry) => {
-      const segments = safeRelativeSegments(entry.path);
-      return {
-        path: segments.join("/"),
-        content: Buffer.from(entry.content),
-      };
-    });
-    const seen = new Set<string>();
-    totalBytes = 0;
-    for (const entry of prepared) {
-      if (seen.has(entry.path)) throw new PinnedRootError("invalid", `anchored state batch contains duplicate path '${entry.path}'`);
-      seen.add(entry.path);
-      totalBytes += entry.content.byteLength;
-    }
-    if (totalBytes > MAX_BATCH_ROLLBACK_BYTES) throw new PinnedRootError("invalid", "anchored state batch exceeds its byte bound");
-
-    type BatchPreflight = {
-      path: string;
-      content: Buffer;
-      beforeIdentity: Stats | null;
-    };
-    let snapshotBytes = 0;
-    const preflight: BatchPreflight[] = [];
-    for (const entry of prepared) {
-      const segments = safeRelativeSegments(entry.path);
-      const finalName = segments.pop()!;
-      let parent: { fd: number; identity: Stats; close: () => void } | null = null;
-      try {
-        try {
-          parent = this.openParent(segments, false);
-        } catch (error) {
-          if (error instanceof PinnedRootError && error.code === "not_found") {
-            preflight.push({ path: entry.path, content: entry.content, beforeIdentity: null });
-            continue;
-          }
-          throw error;
-        }
-        const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
-        let beforeIdentity: Stats | null = null;
-        try { beforeIdentity = lstatSync(join(parentPath, finalName)); }
-        catch (error) {
-          if (errnoCode(error) !== "ENOENT") throw error;
-        }
-        if (beforeIdentity !== null) {
-          if (beforeIdentity.isSymbolicLink() || !beforeIdentity.isFile()) {
-            throw new PinnedRootError("path_unauthorized", `anchored target '${entry.path}' is not a regular file`);
-          }
-          if (beforeIdentity.size > MAX_PINNED_ROOT_READ_BYTES) {
-            throw new PinnedRootError("limit", `anchored target '${entry.path}' exceeds the per-target rollback snapshot limit`);
-          }
-          snapshotBytes += beforeIdentity.size;
-          if (snapshotBytes > MAX_BATCH_ROLLBACK_BYTES) {
-            throw new PinnedRootError("limit", "anchored atomic batch rollback snapshot exceeds its byte bound");
-          }
-        }
-        preflight.push({ path: entry.path, content: entry.content, beforeIdentity });
-      } finally {
-        parent?.close();
-      }
-    }
-
-    if (process.platform !== "darwin" && process.platform !== "linux" && preflight.some((entry) => entry.beforeIdentity !== null)) {
-      throw new PinnedRootError("unsupported", "atomic replacement of an existing target is unsupported on this platform");
-    }
-
-    const stages: BatchStage[] = [];
-    let preserveBackups = false;
-    const syncParent = (parentFd: number): void => {
-      try { fsyncSync(parentFd); }
-      catch (error) {
-        const code = errnoCode(error);
-        if (code !== "EINVAL" && code !== "ENOTSUP") throw error;
-      }
-    };
-    const assertTargetUnchanged = (stage: BatchStage, phase: string): void => {
-      this.assertStable();
-      const parentAfter = fstatSync(stage.parent.fd);
-      if (!sameIdentity(parentAfter, stage.parent.identity)) throw new PinnedRootError("changed", `anchored batch parent changed during ${phase}`);
-      let current: Stats | null = null;
-      try { current = lstatSync(stage.target); }
-      catch (error) { if (errnoCode(error) !== "ENOENT") throw error; }
-      if ((stage.beforeIdentity === null) !== (current === null)
-        || (stage.beforeIdentity !== null && current !== null && !sameIdentity(stage.beforeIdentity, current))) {
-        throw new PinnedRootError("changed", `anchored target '${stage.path}' changed during ${phase}`);
-      }
-      if (current !== null && (current.isSymbolicLink() || !current.isFile())) {
-        throw new PinnedRootError("path_unauthorized", `anchored target '${stage.path}' is not a regular file`);
-      }
-      if (current !== null && stage.beforeBytes !== null && stage.beforeIdentity !== null) {
-        const observed = this.readFile(stage.path);
-        if (observed.dev !== stage.beforeIdentity.dev || observed.ino !== stage.beforeIdentity.ino || Buffer.compare(Buffer.from(observed.bytes), stage.beforeBytes) !== 0) {
-          throw new PinnedRootError("changed", `anchored target '${stage.path}' bytes changed during ${phase}`);
-        }
-      }
-    };
-    const restoreBackupBytes = (stage: BatchStage): void => {
-      if (stage.backupPath === null || stage.beforeBytes === null) return;
-      const flags = writeFlags();
-      if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow writes are unavailable");
-      const slash = stage.backupPath.lastIndexOf("/");
-      const directory = slash >= 0 ? stage.backupPath.slice(0, slash) : ".";
-      const restorePath = join(directory, boundedTemporaryComponent("batch-restore", stage.path, ".restore"));
-      let restoreFd: number | null = null;
-      try {
-        restoreFd = openSync(restorePath, flags, 0o600);
-        let offset = 0;
-        while (offset < stage.beforeBytes.byteLength) {
-          const written = writeSync(restoreFd, stage.beforeBytes, offset, stage.beforeBytes.byteLength - offset);
-          if (written <= 0) throw new PinnedRootError("write_failed", "short anchored rollback write");
-          offset += written;
-        }
-        fchmodSync(restoreFd, 0o600);
-        fsyncSync(restoreFd);
-        closeQuietly(restoreFd);
-        restoreFd = null;
-        renameSync(restorePath, stage.backupPath);
-        syncParent(stage.parent.fd);
-      } finally {
-        closeQuietly(restoreFd);
-        try { unlinkSync(restorePath); } catch { /* already renamed or absent */ }
-      }
-    };
-    const quarantineTarget = (stage: BatchStage): void => {
-      let quarantinePath: string | null = null;
-      for (let attempt = 0; attempt < 32; attempt += 1) {
-        const candidate = join(dirname(stage.target), boundedTemporaryComponent("batch-quarantine", stage.path, ".quarantined"));
-        try {
-          renameSync(stage.target, candidate);
-          quarantinePath = candidate;
-          break;
-        } catch (error) {
-          if (errnoCode(error) !== "EEXIST") throw error;
-        }
-      }
-      if (quarantinePath === null) throw new PinnedRootError("write_failed", "unable to reserve a portable batch quarantine path");
-      stage.quarantinePath = quarantinePath;
-    };
-    try {
-      const flags = writeFlags();
-      if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow writes are unavailable");
-      for (const entry of preflight) {
-        const segments = safeRelativeSegments(entry.path);
-        const finalName = segments.pop()!;
-        const parent = this.openParent(segments, true);
-        const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
-        const stage: BatchStage = {
-          path: entry.path,
-          content: entry.content,
-          parent,
-          finalName,
-          target: join(parentPath, finalName),
-          beforeIdentity: entry.beforeIdentity,
-          beforeBytes: null,
-          backupPath: null,
-          tempPath: null,
-          tempIdentity: null,
-          descriptor: null,
-          committed: false,
-          backupRestored: false,
-          quarantinePath: null,
-        };
-        stages.push(stage);
-        try {
-          this.assertStable();
-          const parentAfter = fstatSync(parent.fd);
-          if (!sameIdentity(parentAfter, parent.identity)) throw new PinnedRootError("changed", "anchored batch parent changed during validation");
-          let current: Stats | null = null;
-          try { current = lstatSync(stage.target); }
-          catch (error) {
-            if (errnoCode(error) !== "ENOENT") throw error;
-          }
-          if ((entry.beforeIdentity === null) !== (current === null)
-            || (entry.beforeIdentity !== null && current !== null && !sameIdentity(entry.beforeIdentity, current))) {
-            throw new PinnedRootError("changed", `anchored target '${entry.path}' changed before it was captured`);
-          }
-          if (current !== null && (current.isSymbolicLink() || !current.isFile())) {
-            throw new PinnedRootError("path_unauthorized", `anchored target '${entry.path}' is not a regular file`);
-          }
-          if (entry.beforeIdentity) {
-            const observed = this.readFile(entry.path);
-            if (observed.dev !== entry.beforeIdentity.dev || observed.ino !== entry.beforeIdentity.ino) throw new PinnedRootError("changed", `anchored target '${entry.path}' changed while being captured`);
-            stage.beforeBytes = Buffer.from(observed.bytes);
-          }
-          if (stage.beforeIdentity) {
-            const backupName = boundedTemporaryComponent("batch-backup", entry.path, ".bak");
-            stage.backupPath = join(parentPath, backupName);
-            linkSync(stage.target, stage.backupPath);
-            const backupIdentity = lstatSync(stage.backupPath);
-            if (!sameIdentity(backupIdentity, stage.beforeIdentity)) throw new PinnedRootError("changed", `anchored target '${entry.path}' changed while being backed up`);
-          }
-          this.hooks.beforeTempOpen?.(entry.path);
-          let tempFd: number | null = null;
-          for (let attempt = 0; attempt < 32; attempt += 1) {
-            const tempName = boundedTemporaryComponent("batch-write", entry.path, ".tmp");
-            const candidate = join(parentPath, tempName);
-            try {
-              stage.tempPath = candidate;
-              tempFd = openSync(candidate, flags, 0o600);
-              let offset = 0;
-              while (offset < entry.content.byteLength) {
-                const written = writeSync(tempFd, entry.content, offset, entry.content.byteLength - offset);
-                if (written <= 0) throw new PinnedRootError("write_failed", "short anchored batch write");
-                offset += written;
-              }
-              fchmodSync(tempFd, 0o600);
-              fsyncSync(tempFd);
-              stage.tempIdentity = fstatSync(tempFd);
-              closeQuietly(tempFd);
-              tempFd = null;
-              break;
-            } catch (error) {
-              closeQuietly(tempFd);
-              tempFd = null;
-              if (errnoCode(error) !== "EEXIST") throw error;
-              stage.tempPath = null;
-            }
-          }
-          if (!stage.tempPath || !stage.tempIdentity) throw new PinnedRootError("write_failed", "unable to reserve an anchored batch temporary file");
-        } catch (error) {
-          throw error;
-        }
-      }
-      for (const stage of stages) {
-        if (!stage.tempIdentity) throw new PinnedRootError("write_failed", "anchored batch staging returned no temporary inode");
-        stage.descriptor = {
-          path: this.anchorPath(stage.path),
-          relative_path: stage.path,
-          dev: stage.tempIdentity.dev,
-          ino: stage.tempIdentity.ino,
-          size: stage.content.byteLength,
-          sha256: contentSha256(stage.content),
-        };
-      }
-      if (options.beforePublish) {
-        options.beforePublish(stages.map((stage) => this.makeWriteReceipt(stage.path, stage.descriptor!, stage.beforeIdentity === null
-          ? { kind: "absent" as const }
-          : {
-            kind: "file" as const,
-            bytes: Buffer.from(stage.beforeBytes!),
-            expectation: {
-              dev: stage.beforeIdentity.dev,
-              ino: stage.beforeIdentity.ino,
-              size: stage.beforeBytes!.byteLength,
-              sha256: createHash("sha256").update(stage.beforeBytes!).digest("hex"),
-            },
-          })));
-      }
-      for (const [index, stage] of stages.entries()) {
-        assertTargetUnchanged(stage, "batch commit");
-        this.hooks.beforeRename?.(stage.path);
-        assertTargetUnchanged(stage, "batch commit");
-        assertCurrentExecutionLiveness();
-        linkSync(stage.tempPath!, stage.target);
-        stage.committed = true;
-        if (!stage.descriptor
-          || stage.descriptor.dev !== stage.tempIdentity!.dev
-          || stage.descriptor.ino !== stage.tempIdentity!.ino
-          || stage.descriptor.size !== stage.content.byteLength
-          || stage.descriptor.sha256 !== contentSha256(stage.content)) {
-          throw new PinnedRootError("write_failed", "anchored batch postimage descriptor changed before publication");
-        }
-        const published = this.readFile(stage.path, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
-        if (published.dev !== stage.tempIdentity!.dev
-          || published.ino !== stage.tempIdentity!.ino
-          || published.size !== stage.content.byteLength
-          || Buffer.compare(Buffer.from(published.bytes), stage.content) !== 0) {
-          throw new PinnedRootError("changed", "anchored target changed before portable batch cleanup");
-        }
-        unlinkSync(stage.tempPath!);
-        stage.tempPath = null;
-        syncParent(stage.parent.fd);
-        this.assertStable();
-        assertCurrentExecutionLiveness();
-        if (this.hooks.batchFailureIndex === index) throw new PinnedRootError("write_failed", "injected anchored batch failure");
-      }
-      assertCurrentExecutionLiveness();
-    } catch (error) {
-      const rollbackError = withoutCurrentExecutionLiveness(() => {
-        let failure: unknown = null;
-        for (const stage of stages.slice().reverse()) {
-        if (!stage.committed) continue;
-        try {
-          this.assertStable();
-          const parentAfter = fstatSync(stage.parent.fd);
-          if (!sameIdentity(parentAfter, stage.parent.identity)) throw new PinnedRootError("changed", "anchored batch parent changed during rollback");
-          const current = lstatSync(stage.target);
-          if (!stage.tempIdentity || !sameIdentity(current, stage.tempIdentity)) throw new PinnedRootError("changed", `anchored target '${stage.path}' changed during rollback`);
-          const postimage = this.readFile(stage.path, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
-          if (postimage.dev !== stage.tempIdentity.dev || postimage.ino !== stage.tempIdentity.ino
-            || postimage.size !== stage.content.byteLength
-            || Buffer.compare(Buffer.from(postimage.bytes), stage.content) !== 0) {
-            throw new PinnedRootError("changed", `anchored target '${stage.path}' bytes changed during rollback`);
-          }
-          if (stage.backupPath) {
-            restoreBackupBytes(stage);
-            // Publish the captured preimage without replacing a target that
-            // appeared after the rollback check. EEXIST preserves the winner
-            // and leaves the backup available for recovery.
-            linkSync(stage.backupPath, stage.target);
-            unlinkSync(stage.backupPath);
-            stage.backupRestored = true;
-          } else {
-            // Unknown platforms have no descriptor-relative CAS unlink. Move
-            // the exact postimage to a private quarantine instead of deleting
-            // a path after a separable read-check.
-            quarantineTarget(stage);
-          }
-          syncParent(stage.parent.fd);
-          this.assertStable();
-          stage.committed = false;
-        } catch (restoreError) {
-          failure = restoreError;
-          preserveBackups = true;
-          break;
-        }
-      }
-      return failure;
-      });
-      if (rollbackError && !(error instanceof ExecutionLivenessViolation)) throw new PinnedRootError("changed", `anchored batch rollback failed: ${String(rollbackError)}`);
-      throw error;
-    } finally {
-      for (const stage of stages) {
-        if (stage.tempPath) {
-          try { unlinkSync(stage.tempPath); } catch { /* best-effort cleanup */ }
-        }
-        if (stage.backupPath && !preserveBackups && !stage.backupRestored) {
-          try { unlinkSync(stage.backupPath); } catch { /* best-effort cleanup */ }
-        }
-        try { syncParent(stage.parent.fd); } catch { /* preserve primary result */ }
-        try { this.hooks.beforeCleanup?.(stage.path); } catch { /* preserve primary result */ }
-        stage.parent.close();
-      }
-    }
-    return stages
-      .filter((stage): stage is typeof stage & { descriptor: PinnedRootWriteDescriptor; beforeIdentity: Stats | null } => stage.descriptor !== null)
-      .map((stage) => ({
-        descriptor: stage.descriptor,
-        preimage: stage.beforeIdentity === null
-          ? { kind: "absent" as const }
-          : {
-            kind: "file" as const,
-            bytes: Buffer.from(stage.beforeBytes!),
-            expectation: {
-              dev: stage.beforeIdentity.dev,
-              ino: stage.beforeIdentity.ino,
-              size: stage.beforeBytes!.byteLength,
-              sha256: createHash("sha256").update(stage.beforeBytes!).digest("hex"),
-            },
-          },
-      }));
-  }
-
-  /** Check a bounded set of entries through one inherited-fd request. */
-  pathEntriesExist(relativePaths: readonly string[]): boolean[] {
-    if (relativePaths.length === 0) return [];
-    if (relativePaths.length > 16) throw new PinnedRootError("invalid", "too many entries in one anchored state batch");
-    if (process.platform !== "darwin") return relativePaths.map((path) => this.pathEntryExists(path));
-    for (const path of relativePaths) safeRelativeSegments(path);
-    const result = this.runDescriptorHelper<{ results: Array<{ exists?: unknown }> }>("batch", {
-      operations: relativePaths.map((path) => ({ op: "exists", path })),
-    });
-    if (!Array.isArray(result.results) || result.results.length !== relativePaths.length || result.results.some((entry) => !entry || typeof entry.exists !== "boolean")) {
-      throw new PinnedRootError("write_failed", "descriptor helper returned an incomplete existence batch");
-    }
-    return result.results.map((entry) => entry.exists === true);
-  }
-
-  /** Publish a complete state-lock owner and hard-link it atomically. */
-  tryAcquireExclusiveLock(relativeCandidate: string, relativeTarget: string, ownerContent: string, options: { ownerlessGraceMs?: number } = {}): boolean {
-    if (process.platform === "darwin") {
-      contentByteLength(ownerContent);
-      const bytes = Buffer.from(ownerContent, "utf8");
-      const result = this.runDescriptorHelper<{ acquired?: unknown }>("lock_acquire", {
-        candidate: relativeCandidate,
-        target: relativeTarget,
-        bytes: bytes.toString("base64"),
-        ...(options.ownerlessGraceMs === undefined ? {} : { ownerless_grace_ms: options.ownerlessGraceMs }),
-      });
-      if (typeof result.acquired !== "boolean") throw new PinnedRootError("write_failed", "descriptor helper returned an invalid lock result");
-      return result.acquired;
-    }
-    try {
-      this.writeExclusive(relativeCandidate, ownerContent);
-    } catch (error) {
-      if (error instanceof PinnedRootError && error.code === "exists") return false;
-      throw error;
-    }
-    try {
-      this.linkExclusive(relativeCandidate, relativeTarget);
-      return true;
-    } catch (error) {
-      if (error instanceof PinnedRootError && error.code === "exists") return false;
-      throw error;
-    } finally {
-      try { this.unlink(relativeCandidate); } catch { /* candidate cleanup is best effort */ }
-    }
-  }
-
-  /** Remove a state lock only when its owner token and file identity still match. */
-  releaseExclusiveLock(relativeTarget: string, token: string): boolean {
-    if (process.platform === "darwin") {
-      this.hooks.beforeConditionalCommit?.(relativeTarget);
-      try {
-        const result = this.runDescriptorHelper<{ released?: unknown }>("lock_release", { target: relativeTarget, token });
-        if (typeof result.released !== "boolean") throw new PinnedRootError("write_failed", "descriptor helper returned an invalid lock release result");
-        return result.released;
-      } catch (error) {
-        if (error instanceof PinnedRootError && error.code === "not_found") return false;
-        throw error;
-      }
-    }
-
-    // Non-Darwin uses the same descriptor-bound compare-and-swap primitive as
-    // state/CTO lock cleanup. Read the owner through the pinned root, require
-    // the caller token, then remove only the exact inode+bytes observed. A
-    // replacement lock can therefore never be unlinked by a stale releaser.
-    try {
-      const observed = this.readFile(relativeTarget, { maxBytes: 64 * 1024 });
-      let owner: unknown;
-      try {
-        owner = JSON.parse(Buffer.from(observed.bytes).toString("utf8")) as unknown;
-      } catch {
-        return false;
-      }
-      if (!owner || typeof owner !== "object" || Array.isArray(owner)
-        || (owner as { token?: unknown }).token !== token) return false;
-      const expected: PinnedRootFileExpectation = {
-        dev: observed.dev,
-        ino: observed.ino,
-        sha256: createHash("sha256").update(observed.bytes).digest("hex"),
-      };
-      this.removeFileIfMatches(relativeTarget, expected);
-      return true;
-    } catch (error) {
-      if (error instanceof PinnedRootError && ["not_found", "not_regular", "changed"].includes(error.code)) return false;
-      throw error;
-    }
-  }
-
-  private assertExpectation(expected: PinnedRootFileExpectation): void {
-    if (!expected || !Number.isSafeInteger(expected.dev) || !Number.isSafeInteger(expected.ino)
-      || (expected.size !== undefined && (!Number.isSafeInteger(expected.size) || expected.size < 0))
-      || typeof expected.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(expected.sha256)) {
-      throw new PinnedRootError("invalid", "conditional file expectation is invalid");
-    }
-  }
-
-  private assertOpen(): void {
-    if (this.closed) throw new PinnedRootError("changed", "pinned project root is closed");
-  }
-
-  /** Capture a bounded preimage for callers that need an exact publication receipt. */
-  captureWritePreimageForReceipt(relativeFile: string): PinnedRootWritePreimage {
-    return this.captureWritePreimage(relativeFile);
-  }
-
-  /** Roll back one receipt through this pinned descriptor, preserving replacements. */
-  rollbackWriteReceipt(receipt: PinnedRootWriteReceipt): boolean {
-    if (!receipt || receipt.path !== this.anchorPath(receipt.relative_path)
-      || receipt.descriptor.path !== receipt.path
-      || receipt.descriptor.relative_path !== receipt.relative_path) return false;
-    return this.rollbackPublishedDescriptor(receipt.relative_path, receipt.descriptor, receipt.preimage);
-  }
-
-  /** Capture a bounded preimage for rollback if publication loses root authority. */
-  private captureWritePreimage(relativeFile: string): PinnedRootWritePreimage {
-    if (!this.isStable()) throw new PinnedRootError("changed", "pinned project root changed before anchored write preimage capture");
-    const info = this.pathEntryInfo(relativeFile);
-    if (info === null) return { kind: "absent" };
-    if (info.kind !== "file") throw new PinnedRootError("path_unauthorized", "anchored write target is not a regular file");
-    const observed = this.readFile(relativeFile, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
-    const bytes = Buffer.from(observed.bytes);
-    if (
-      observed.dev !== info.dev
-      || observed.ino !== info.ino
-      || bytes.byteLength !== info.size
-      || (observed.mtimeMs !== undefined && observed.mtimeMs !== info.mtimeMs)
-      || (observed.ctimeMs !== undefined && observed.ctimeMs !== info.ctimeMs)
-      || !this.isStable()
-    ) {
-      throw new PinnedRootError("changed", "anchored write target changed while capturing its preimage");
-    }
-    return {
-      kind: "file",
-      bytes,
-      expectation: { dev: observed.dev, ino: observed.ino, size: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") },
-    };
-  }
-
-  private preimageMatchesAnchored(relativeFile: string, preimage: PinnedRootWritePreimage): boolean {
-    try {
-      const info = this.pathEntryInfo(relativeFile);
-      if (preimage.kind === "absent") return info === null;
-      if (info === null || info.kind !== "file") return false;
-      const observed = this.readFile(relativeFile, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
-      return observed.dev === preimage.expectation.dev
-        && observed.ino === preimage.expectation.ino
-        && (preimage.expectation.size === undefined || observed.size === preimage.expectation.size)
-        && createHash("sha256").update(Buffer.from(observed.bytes)).digest("hex") === preimage.expectation.sha256;
-    } catch {
-      return false;
-    }
-  }
-
-  /** Roll back through the inherited root descriptor even when its pathname was swapped away. */
-  private rollbackPublishedDescriptor(
-    relativeFile: string,
-    descriptor: PinnedRootWriteDescriptor,
-    preimage: PinnedRootWritePreimage,
-  ): boolean {
-    try {
-      const expected = { dev: descriptor.dev, ino: descriptor.ino, size: descriptor.size, sha256: descriptor.sha256 };
-      const operation = preimage.kind === "absent" ? "remove_if_matches" : "replace_if_matches";
-      const result = this.runDescriptorHelper<PinnedWriteDescriptorResponse>(operation, {
-        path: relativeFile,
-        expected,
-        ...(preimage.kind === "file" ? { bytes: contentToBase64(preimage.bytes) } : {}),
-      });
-      if (result.ok === true) return true;
-      return this.preimageMatchesAnchored(relativeFile, preimage);
-    } catch {
-      return this.preimageMatchesAnchored(relativeFile, preimage);
-    }
-  }
-
-  private rollbackBatchDescriptors(
-    entries: readonly { path: string }[],
-    descriptors: readonly PinnedRootWriteDescriptor[],
-    preimages: readonly PinnedRootWritePreimage[],
-  ): boolean {
-    let allRolledBack = true;
-    for (let index = descriptors.length - 1; index >= 0; index -= 1) {
-      const descriptor = descriptors[index];
-      const entry = entries[index];
-      const preimage = preimages[index];
-      if (!descriptor || !entry || !preimage || !this.rollbackPublishedDescriptor(entry.path, descriptor, preimage)) {
-        allRolledBack = false;
-      }
-    }
-    return allRolledBack;
-  }
-
-  private rememberBatchPreimages(
-    descriptors: readonly PinnedRootWriteDescriptor[],
-    preimages: readonly PinnedRootWritePreimage[],
-  ): void {
-    if (descriptors.length !== preimages.length) {
-      throw new PinnedRootError("write_failed", "anchored atomic batch preimage metadata is incomplete");
-    }
-    for (let index = 0; index < descriptors.length; index += 1) {
-      descriptorPreimages.set(descriptors[index]!, preimages[index]!);
-    }
-  }
-
-  /** Require root authority after publication; on loss, remove only owned descriptors. */
-  private finishPublishedDescriptor(
-    relativeFile: string,
-    descriptor: PinnedRootWriteDescriptor,
-    preimage: PinnedRootWritePreimage,
-    ownsPublication = true,
-  ): PinnedRootWriteDescriptor {
-    if (this.isStable()) return descriptor;
-    if (ownsPublication && !this.rollbackPublishedDescriptor(relativeFile, descriptor, preimage)) {
-      throw new PinnedRootError("changed", "pinned project root changed after anchored write publication and rollback could not be proven");
-    }
-    throw new PinnedRootError("changed", "pinned project root changed after anchored write publication");
-  }
-
-  private finishPublishedDescriptors(
-    entries: readonly { path: string }[],
-    descriptors: readonly PinnedRootWriteDescriptor[],
-    preimages: readonly PinnedRootWritePreimage[],
-  ): readonly PinnedRootWriteDescriptor[] {
-    if (this.isStable()) return descriptors;
-    if (!this.rollbackBatchDescriptors(entries, descriptors, preimages)) {
-      throw new PinnedRootError("changed", "pinned project root changed after anchored batch publication and rollback could not be proven");
-    }
-    throw new PinnedRootError("changed", "pinned project root changed after anchored batch publication");
-  }
-
-  private durableBatchResidueAbsent(batchId: string, manifest: readonly { path: string }[]): boolean {
-    if (process.platform !== "darwin" || !this.isStable()) return false;
-    const candidates = [
-      boundedDarwinSibling("batch-journal", batchId, ".json"),
-      ...manifest.flatMap((entry) => {
-        const path = safeRelativeSegments(entry.path).join("/");
-        const parent = safeRelativeSegments(path).slice(0, -1);
-        return [
-          [...parent, boundedDarwinSibling("cas-lock", path, ".lock")].join("/"),
-          [...parent, boundedDarwinSibling("cas-stage", path, ".tmp")].join("/"),
-        ];
-      }),
-    ];
-    for (const candidate of candidates) {
-      const segments = safeRelativeSegments(candidate);
-      let current = this.canonical_root;
-      for (let index = 0; index < segments.length; index += 1) {
-        current = join(current, segments[index]!);
-        try {
-          const info = lstatSync(current);
-          if (index === segments.length - 1) return false;
-          if (!info.isDirectory()) return false;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
-          return false;
-        }
-      }
-    }
-    return this.isStable();
-  }
-
-  public assertStable(): void {
-    if (!this.isStable()) throw new PinnedRootError("changed", "pinned project root identity changed");
-  }
-
-  private canonicalPath(relativeFile: string): string {
-    const segments = safeRelativeSegments(relativeFile);
-    return join(this.canonical_root, ...segments);
-  }
-
-  private openParent(segments: string[], create: boolean): { fd: number; identity: Stats; close: () => void } {
-    let parentFd = this.rootFd;
-    let ownedParent: number | null = null;
-    try {
-      for (let index = 0; index < segments.length; index += 1) {
-        const segment = segments[index]!;
-        const childFd = this.openDirectoryChild(parentFd, segment, segments.slice(0, index + 1).join("/"), create);
-        closeQuietly(ownedParent);
-        ownedParent = childFd;
-        parentFd = childFd;
-      }
-      const identity = fstatSync(parentFd);
-      if (!identity.isDirectory()) throw new PinnedRootError("not_directory", "anchored parent is not a directory");
-      const heldFd = parentFd;
-      return {
-        fd: heldFd,
-        identity,
-        close: () => closeQuietly(ownedParent),
-      };
-    } catch (error) {
-      closeQuietly(ownedParent);
-      if (error instanceof PinnedRootError) throw error;
-      const code = errnoCode(error);
-      if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored parent directory does not exist");
-      throw new PinnedRootError("path_unauthorized", `anchored parent could not be opened: ${String(error)}`);
-    }
-  }
-
-  private assertParentPathIdentity(parentFd: number, relativeDirectory: string): void {
-    if (process.platform !== "darwin") return;
-    const parentPath = relativeDirectory.length === 0 ? this.canonical_root : join(this.canonical_root, ...safeRelativeSegments(relativeDirectory));
-    try {
-      const pathname = lstatSync(parentPath);
-      const descriptor = fstatSync(parentFd);
-      if (pathname.isSymbolicLink() || !pathname.isDirectory() || !sameIdentity(pathname, descriptor)) {
-        throw new PinnedRootError("changed", "anchored parent pathname changed during the operation");
-      }
-    } catch (error) {
-      if (error instanceof PinnedRootError) throw error;
-      throw new PinnedRootError("changed", `anchored parent pathname could not be verified: ${String(error)}`);
-    }
-  }
-
-  private assertCanonicalDirectory(relativeDirectory: string): void {
-    if (process.platform !== "darwin") return;
-    const segments = safeRelativeSegments(relativeDirectory, true);
-    let probe = this.canonical_root;
-    const rootInfo = lstatSync(probe);
-    if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory() || rootInfo.dev !== this.dev || rootInfo.ino !== this.ino) throw new PinnedRootError("changed", "pinned project root pathname changed");
-    for (const segment of segments) {
-      probe = join(probe, segment);
-      const info = lstatSync(probe);
-      if (info.isSymbolicLink() || !info.isDirectory()) throw new PinnedRootError("path_unauthorized", "anchored directory contains an unsafe component");
-      if (realpathSync(probe) !== probe) throw new PinnedRootError("path_unauthorized", "anchored directory contains a symlink");
-    }
-  }
-
-  private parentDirectoryPath(parentFd: number, relativeDirectory: string): string {
-    if (process.platform === "darwin") {
-      const segments = safeRelativeSegments(relativeDirectory, true);
-      return segments.length === 0 ? this.canonical_root : join(this.canonical_root, ...segments);
-    }
-    const parentPath = descriptorPathFor(parentFd);
-    if (parentPath === null) throw new PinnedRootError("unsupported", "descriptor-anchored paths are unavailable");
-    return parentPath;
-  }
-
-  private childPath(parentFd: number, segment: string, relativeDirectory: string): string {
-    const parentPath = this.parentDirectoryPath(parentFd, relativeDirectory.split("/").slice(0, -1).join("/"));
-    return join(parentPath, segment);
-  }
-
-  private openDirectoryChild(parentFd: number, segment: string, relativeDirectory: string, create: boolean): number {
-    const flags = descriptorFlags();
-    if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow directories are unavailable");
-    const candidate = this.childPath(parentFd, segment, relativeDirectory);
-    const parentRelative = relativeDirectory.split("/").slice(0, -1).join("/");
-    this.assertCanonicalDirectory(parentRelative);
-    this.assertParentPathIdentity(parentFd, parentRelative);
-    let before: Stats | null = null;
-    try {
-      before = lstatSync(candidate);
-      if (before.isSymbolicLink() || !before.isDirectory()) throw new PinnedRootError("path_unauthorized", `anchored directory '${relativeDirectory}' is not a real directory`);
-    } catch (error) {
-      if (errnoCode(error) !== "ENOENT") throw error;
-      if (!create) throw new PinnedRootError("not_found", `anchored parent directory does not exist`);
-      this.hooks.beforeDirectoryCreate?.(relativeDirectory);
-      this.assertCanonicalDirectory(relativeDirectory.split("/").slice(0, -1).join("/"));
-      this.assertParentPathIdentity(parentFd, parentRelative);
-      try {
-        assertCurrentExecutionLiveness();
-      mkdirSync(candidate, { mode: 0o700 });
-      } catch (mkdirError) {
-        if (errnoCode(mkdirError) !== "EEXIST") throw mkdirError;
-      }
-      try {
-        before = lstatSync(candidate);
-      } catch (inspectError) {
-        if (errnoCode(inspectError) === "ENOENT") throw new PinnedRootError("not_found", `anchored directory '${relativeDirectory}' disappeared while being created`);
-        throw inspectError;
-      }
-      if (before.isSymbolicLink() || !before.isDirectory()) throw new PinnedRootError("path_unauthorized", `anchored directory '${relativeDirectory}' is not a real directory`);
-    }
-    let childFd: number;
-    try {
-      childFd = openSync(candidate, flags);
-    } catch (error) {
-      const code = errnoCode(error);
-      if (code === "ENOENT") throw new PinnedRootError("not_found", `anchored directory '${relativeDirectory}' does not exist`);
-      if (code === "ELOOP" || code === "ENOTDIR") throw new PinnedRootError("path_unauthorized", `anchored directory '${relativeDirectory}' is unsafe`);
-      throw error;
-    }
-    try {
-      const after = fstatSync(childFd);
-      if (!after.isDirectory() || before === null || !sameIdentity(before, after)) throw new PinnedRootError("changed", `anchored directory '${relativeDirectory}' changed while opening`);
-      const physicalRoot = process.platform === "darwin" ? this.canonical_root : realpathSync(this.rootDescriptorPath);
-      let physicalChild: string;
-      if (process.platform === "darwin") {
-        physicalChild = realpathSync(candidate);
-      } else {
-        const childPath = descriptorPathFor(childFd);
-        if (childPath === null) throw new PinnedRootError("unsupported", "descriptor-anchored paths are unavailable");
-        physicalChild = realpathSync(childPath);
-      }
-      const childRelative = relative(physicalRoot, physicalChild);
-      if (childRelative.startsWith("..") || isAbsolute(childRelative)) throw new PinnedRootError("path_unauthorized", `anchored directory '${relativeDirectory}' resolves outside the pinned root`);
-      this.assertStable();
-      assertCurrentExecutionLiveness();
-      return childFd;
-    } catch (error) {
-      closeQuietly(childFd);
-      if (error instanceof ExecutionLivenessViolation) throw error;
-      if (error instanceof PinnedRootError) throw error;
-      throw new PinnedRootError("path_unauthorized", `anchored directory '${relativeDirectory}' could not be verified: ${String(error)}`);
-    }
-  }
+writeAtomicFilesWithReceipts(entries: readonly { path: string; content: PinnedRootWriteContent }[], options: PinnedRootBatchWriteOptions = {}): readonly PinnedRootWriteReceipt[] {
+if (entries.length === 0) return [];
+let descriptors: readonly PinnedRootWriteDescriptor[] | undefined;
+try {
+// The descriptor writer captures the preimage at the same transaction
+// boundary as publication and records it against each returned inode.
+// Never capture a second, potentially stale, preimage here.
+// Receipt-producing batches must retain the helper's durable prepared
+// leases until the client has converted and acknowledged every result;
+// an ordinary one-phase batch response cannot prove rollback ownership
+// after transport loss. An empty callback is an internal routing marker.
+const preparedOptions = options.beforePublish ? options : { ...options, beforePublish: () => {} };
+descriptors = this.writeAtomicFilesWithDescriptors(entries, preparedOptions);
+if (descriptors.length !== entries.length) throw new PinnedRootError("write_failed", "anchored atomic batch returned an incomplete descriptor set");
+return descriptors.map((descriptor, index) => {
+const relativePath = entries[index]!.path;
+const preimage = descriptorPreimages.get(descriptor);
+const receipt = descriptorReceipts.get(descriptor) ?? (preimage === undefined
+? undefined
+: this.makeWriteReceipt(relativePath, descriptor, preimage));
+if (!receipt
+|| receipt.relative_path !== relativePath
+|| receipt.path !== this.anchorPath(relativePath)
+|| receipt.descriptor !== descriptor) {
+throw new PinnedRootError("write_failed", "anchored atomic batch returned an unbound publication receipt");
 }
-
-/** Shared exact rollback helper for state and other receipt-owning callers. */
-export function rollbackPinnedRootWriteReceipt(pinnedRoot: PinnedProjectRoot, receipt: PinnedRootWriteReceipt): boolean {
-  try { return pinnedRoot.rollbackWriteReceipt(receipt); } catch { return false; }
+descriptorReceipts.set(descriptor, receipt);
+return receipt;
+});
+} catch (error) {
+// Descriptor conversion/root-stability failures roll back only the
+// descriptors that this transaction actually published, using the
+// preimages recorded by the descriptor writer itself.
+if (descriptors !== undefined) {
+const preimages = descriptors.map((descriptor) => descriptorPreimages.get(descriptor));
+const owned = preimages.every((preimage): preimage is PinnedRootWritePreimage => preimage !== undefined);
+if (owned && !this.rollbackBatchDescriptors(entries, descriptors, preimages)) {
+throw new PinnedRootError("changed", `anchored batch receipt conversion failed and rollback could not be proven: ${String(error)}`);
 }
-
-/** Shared preimage capture helper for lock-owning transaction callers. */
-export function capturePinnedRootWritePreimage(pinnedRoot: PinnedProjectRoot, relativeFile: string): PinnedRootWritePreimage {
-  return pinnedRoot.captureWritePreimageForReceipt(relativeFile);
 }
+throw error;
+}
+}
+/** Atomic batch write returning one operation descriptor per published inode. */
+writeAtomicFilesWithDescriptors(entries: readonly { path: string; content: PinnedRootWriteContent }[], options: PinnedRootBatchWriteOptions = {}): readonly PinnedRootWriteDescriptor[] {
+if (entries.length === 0) return [];
+assertCurrentExecutionLiveness();
+if (entries.length > 8) throw new PinnedRootError("invalid", "too many files in one anchored state batch");
+let totalBytes = 0;
+for (const entry of entries) {
+safeRelativeSegments(entry.path);
+totalBytes += contentByteLength(entry.content);
+}
+if (totalBytes > MAX_BATCH_ROLLBACK_BYTES) throw new PinnedRootError("invalid", "anchored state batch exceeds its byte bound");
+if (process.platform === "linux") {
+// Linux existing-target replacement uses the helper's per-target
+// prepared CAS transaction, which closes the non-cooperating writer
+// window between a userspace precheck and rename. It also gives batch
+// receipt callbacks one all-or-nothing preparation boundary.
+const preparedBatch = this.writeDarwinPreparedBatch(entries, options);
+const preparedDescriptors = preparedBatch.map((entry) => entry.descriptor);
+const preparedPreimages = preparedBatch.map((entry) => entry.preimage);
+const published = this.finishPublishedDescriptors(entries, preparedDescriptors, preparedPreimages);
+this.rememberBatchPreimages(published, preparedPreimages);
+return published;
+}
+if (process.platform !== "darwin") {
+const portable = this.writeAtomicFilesPortable(entries, options);
+const descriptors = portable.map((entry) => entry.descriptor);
+const portablePreimages = portable.map((entry) => entry.preimage);
+const published = this.finishPublishedDescriptors(entries, descriptors, portablePreimages);
+try {
+this.rememberBatchPreimages(published, portablePreimages);
+} catch (error) {
+if (!this.rollbackBatchDescriptors(entries, published, portablePreimages)) {
+throw new PinnedRootError("changed", `anchored portable batch receipt publication failed and rollback could not be proven: ${String(error)}`);
+}
+throw error;
+}
+return published;
+}
+// Every normal Darwin batch uses per-entry durable prepared leases, even
+// without a beforePublish callback. The legacy one-phase helper remains
+// only behind the deterministic batchFailureIndex seam so its rollback
+// regression can continue to exercise that injected path.
+if (options.beforePublish || !Number.isInteger(this.hooks.batchFailureIndex)) {
+const preparedBatch = this.writeDarwinPreparedBatch(entries, options, !options.beforePublish);
+const preparedDescriptors = preparedBatch.map((entry) => entry.descriptor);
+const preparedPreimages = preparedBatch.map((entry) => entry.preimage);
+const published = this.finishPublishedDescriptors(entries, preparedDescriptors, preparedPreimages);
+this.rememberBatchPreimages(published, preparedPreimages);
+return published;
+}
+const operations: Record<string, unknown>[] = [];
+let descriptors: readonly PinnedRootWriteDescriptor[] | null = null;
+let helperPreimages: readonly PinnedRootWritePreimage[] | null = null;
+try {
+for (const entry of entries) {
+this.hooks.beforeTempOpen?.(entry.path);
+this.hooks.beforeRename?.(entry.path);
+operations.push({ op: "write_atomic", path: entry.path, bytes: contentToBase64(entry.content) });
+}
+const response = this.runDescriptorHelper<{ results: PinnedWriteDescriptorResponse[] }>("batch_atomic", {
+operations,
+...(Number.isInteger(this.hooks.batchFailureIndex) ? { failure_index: this.hooks.batchFailureIndex } : {}),
+});
+if (!Array.isArray(response.results) || response.results.length !== entries.length) {
+throw new PinnedRootError("write_failed", "descriptor helper returned an incomplete atomic batch descriptor set");
+}
+helperPreimages = response.results.map((result) => preimageFromResponse(result));
+descriptors = response.results.map((result, index) => descriptorFromResponse(entries[index]!.path, this.anchorPath(entries[index]!.path), entries[index]!.content, result));
+} catch (error) {
+// If response validation fails after helper publication, use the exact
+// preimages returned by that same helper transaction. Never recapture a
+// potentially changed target while compensating the batch.
+if (descriptors !== null && helperPreimages !== null
+&& !this.rollbackBatchDescriptors(entries, descriptors, helperPreimages)) {
+throw new PinnedRootError("changed", `anchored Darwin batch response validation failed and rollback could not be proven: ${String(error)}`);
+}
+throw error;
+} finally {
+for (const entry of entries) {
+try { this.hooks.beforeCleanup?.(entry.path); } catch { /* preserve the primary batch result */ }
+}
+}
+if (!descriptors || !helperPreimages) throw new PinnedRootError("write_failed", "anchored atomic batch completed without exact operation metadata");
+const published = this.finishPublishedDescriptors(entries, descriptors, helperPreimages);
+try {
+this.rememberBatchPreimages(published, helperPreimages);
+} catch (error) {
+if (!this.rollbackBatchDescriptors(entries, published, helperPreimages)) {
+throw new PinnedRootError("changed", `anchored Darwin batch receipt publication failed and rollback could not be proven: ${String(error)}`);
+}
+throw error;
+}
+return published;
+}
+private writeAtomicFilesPortable(
+entries: readonly { path: string; content: PinnedRootWriteContent }[],
+options: PinnedRootBatchWriteOptions = {},
+): readonly { descriptor: PinnedRootWriteDescriptor; preimage: PinnedRootWritePreimage }[] {
+type BatchStage = {
+path: string;
+content: Buffer;
+parent: { fd: number; identity: Stats; close: () => void };
+finalName: string;
+target: string;
+beforeIdentity: Stats | null;
+beforeBytes: Buffer | null;
+backupPath: string | null;
+tempPath: string | null;
+tempIdentity: Stats | null;
+descriptor: PinnedRootWriteDescriptor | null;
+committed: boolean;
+backupRestored: boolean;
+quarantinePath: string | null;
+};
+const sizes = entries.map((entry) => {
+safeRelativeSegments(entry.path);
+return contentByteLength(entry.content);
+});
+let totalBytes = sizes.reduce((total, size) => total + size, 0);
+if (totalBytes > MAX_BATCH_ROLLBACK_BYTES) throw new PinnedRootError("invalid", "anchored state batch exceeds its byte bound");
+const prepared = entries.map((entry) => {
+const segments = safeRelativeSegments(entry.path);
+return {
+path: segments.join("/"),
+content: Buffer.from(entry.content),
+};
+});
+const seen = new Set<string>();
+totalBytes = 0;
+for (const entry of prepared) {
+if (seen.has(entry.path)) throw new PinnedRootError("invalid", `anchored state batch contains duplicate path '${entry.path}'`);
+seen.add(entry.path);
+totalBytes += entry.content.byteLength;
+}
+if (totalBytes > MAX_BATCH_ROLLBACK_BYTES) throw new PinnedRootError("invalid", "anchored state batch exceeds its byte bound");
+type BatchPreflight = {
+path: string;
+content: Buffer;
+beforeIdentity: Stats | null;
+};
+let snapshotBytes = 0;
+const preflight: BatchPreflight[] = [];
+for (const entry of prepared) {
+const segments = safeRelativeSegments(entry.path);
+const finalName = segments.pop()!;
+let parent: { fd: number; identity: Stats; close: () => void } | null = null;
+try {
+try {
+parent = this.openParent(segments, false);
+} catch (error) {
+if (error instanceof PinnedRootError && error.code === "not_found") {
+preflight.push({ path: entry.path, content: entry.content, beforeIdentity: null });
+continue;
+}
+throw error;
+}
+const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
+let beforeIdentity: Stats | null = null;
+try { beforeIdentity = lstatSync(join(parentPath, finalName)); }
+catch (error) {
+if (errnoCode(error) !== "ENOENT") throw error;
+}
+if (beforeIdentity !== null) {
+if (beforeIdentity.isSymbolicLink() || !beforeIdentity.isFile()) {
+throw new PinnedRootError("path_unauthorized", `anchored target '${entry.path}' is not a regular file`);
+}
+if (beforeIdentity.size > MAX_PINNED_ROOT_READ_BYTES) {
+throw new PinnedRootError("limit", `anchored target '${entry.path}' exceeds the per-target rollback snapshot limit`);
+}
+snapshotBytes += beforeIdentity.size;
+if (snapshotBytes > MAX_BATCH_ROLLBACK_BYTES) {
+throw new PinnedRootError("limit", "anchored atomic batch rollback snapshot exceeds its byte bound");
+}
+}
+preflight.push({ path: entry.path, content: entry.content, beforeIdentity });
+} finally {
+parent?.close();
+}
+}
+if (process.platform !== "darwin" && process.platform !== "linux" && preflight.some((entry) => entry.beforeIdentity !== null)) {
+throw new PinnedRootError("unsupported", "atomic replacement of an existing target is unsupported on this platform");
+}
+const stages: BatchStage[] = [];
+let preserveBackups = false;
+const syncParent = (parentFd: number): void => {
+try { fsyncSync(parentFd); }
+catch (error) {
+const code = errnoCode(error);
+if (code !== "EINVAL" && code !== "ENOTSUP") throw error;
+}
+};
+const assertTargetUnchanged = (stage: BatchStage, phase: string): void => {
+this.assertStable();
+const parentAfter = fstatSync(stage.parent.fd);
+if (!sameIdentity(parentAfter, stage.parent.identity)) throw new PinnedRootError("changed", `anchored batch parent changed during ${phase}`);
+let current: Stats | null = null;
+try { current = lstatSync(stage.target); }
+catch (error) { if (errnoCode(error) !== "ENOENT") throw error; }
+if ((stage.beforeIdentity === null) !== (current === null)
+|| (stage.beforeIdentity !== null && current !== null && !sameIdentity(stage.beforeIdentity, current))) {
+throw new PinnedRootError("changed", `anchored target '${stage.path}' changed during ${phase}`);
+}
+if (current !== null && (current.isSymbolicLink() || !current.isFile())) {
+throw new PinnedRootError("path_unauthorized", `anchored target '${stage.path}' is not a regular file`);
+}
+if (current !== null && stage.beforeBytes !== null && stage.beforeIdentity !== null) {
+const observed = this.readFile(stage.path);
+if (observed.dev !== stage.beforeIdentity.dev || observed.ino !== stage.beforeIdentity.ino || Buffer.compare(Buffer.from(observed.bytes), stage.beforeBytes) !== 0) {
+throw new PinnedRootError("changed", `anchored target '${stage.path}' bytes changed during ${phase}`);
+}
+}
+};
+const restoreBackupBytes = (stage: BatchStage): void => {
+if (stage.backupPath === null || stage.beforeBytes === null) return;
+const flags = writeFlags();
+if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow writes are unavailable");
+const slash = stage.backupPath.lastIndexOf("/");
+const directory = slash >= 0 ? stage.backupPath.slice(0, slash) : ".";
+const restorePath = join(directory, boundedTemporaryComponent("batch-restore", stage.path, ".restore"));
+let restoreFd: number | null = null;
+try {
+restoreFd = openSync(restorePath, flags, 0o600);
+let offset = 0;
+while (offset < stage.beforeBytes.byteLength) {
+const written = writeSync(restoreFd, stage.beforeBytes, offset, stage.beforeBytes.byteLength - offset);
+if (written <= 0) throw new PinnedRootError("write_failed", "short anchored rollback write");
+offset += written;
+}
+fchmodSync(restoreFd, 0o600);
+fsyncSync(restoreFd);
+closeQuietly(restoreFd);
+restoreFd = null;
+renameSync(restorePath, stage.backupPath);
+syncParent(stage.parent.fd);
+} finally {
+closeQuietly(restoreFd);
+try { unlinkSync(restorePath); } catch { /* already renamed or absent */ }
+}
+};
+const quarantineTarget = (stage: BatchStage): void => {
+let quarantinePath: string | null = null;
+for (let attempt = 0; attempt < 32; attempt += 1) {
+const candidate = join(dirname(stage.target), boundedTemporaryComponent("batch-quarantine", stage.path, ".quarantined"));
+try {
+renameSync(stage.target, candidate);
+quarantinePath = candidate;
+break;
+} catch (error) {
+if (errnoCode(error) !== "EEXIST") throw error;
+}
+}
+if (quarantinePath === null) throw new PinnedRootError("write_failed", "unable to reserve a portable batch quarantine path");
+stage.quarantinePath = quarantinePath;
+};
+try {
+const flags = writeFlags();
+if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow writes are unavailable");
+for (const entry of preflight) {
+const segments = safeRelativeSegments(entry.path);
+const finalName = segments.pop()!;
+const parent = this.openParent(segments, true);
+const parentPath = this.parentDirectoryPath(parent.fd, segments.join("/"));
+const stage: BatchStage = {
+path: entry.path,
+content: entry.content,
+parent,
+finalName,
+target: join(parentPath, finalName),
+beforeIdentity: entry.beforeIdentity,
+beforeBytes: null,
+backupPath: null,
+tempPath: null,
+tempIdentity: null,
+descriptor: null,
+committed: false,
+backupRestored: false,
+quarantinePath: null,
+};
+stages.push(stage);
+try {
+this.assertStable();
+const parentAfter = fstatSync(parent.fd);
+if (!sameIdentity(parentAfter, parent.identity)) throw new PinnedRootError("changed", "anchored batch parent changed during validation");
+let current: Stats | null = null;
+try { current = lstatSync(stage.target); }
+catch (error) {
+if (errnoCode(error) !== "ENOENT") throw error;
+}
+if ((entry.beforeIdentity === null) !== (current === null)
+|| (entry.beforeIdentity !== null && current !== null && !sameIdentity(entry.beforeIdentity, current))) {
+throw new PinnedRootError("changed", `anchored target '${entry.path}' changed before it was captured`);
+}
+if (current !== null && (current.isSymbolicLink() || !current.isFile())) {
+throw new PinnedRootError("path_unauthorized", `anchored target '${entry.path}' is not a regular file`);
+}
+if (entry.beforeIdentity) {
+const observed = this.readFile(entry.path);
+if (observed.dev !== entry.beforeIdentity.dev || observed.ino !== entry.beforeIdentity.ino) throw new PinnedRootError("changed", `anchored target '${entry.path}' changed while being captured`);
+stage.beforeBytes = Buffer.from(observed.bytes);
+}
+if (stage.beforeIdentity) {
+const backupName = boundedTemporaryComponent("batch-backup", entry.path, ".bak");
+stage.backupPath = join(parentPath, backupName);
+linkSync(stage.target, stage.backupPath);
+const backupIdentity = lstatSync(stage.backupPath);
+if (!sameIdentity(backupIdentity, stage.beforeIdentity)) throw new PinnedRootError("changed", `anchored target '${entry.path}' changed while being backed up`);
+}
+this.hooks.beforeTempOpen?.(entry.path);
+let tempFd: number | null = null;
+for (let attempt = 0; attempt < 32; attempt += 1) {
+const tempName = boundedTemporaryComponent("batch-write", entry.path, ".tmp");
+const candidate = join(parentPath, tempName);
+try {
+stage.tempPath = candidate;
+tempFd = openSync(candidate, flags, 0o600);
+let offset = 0;
+while (offset < entry.content.byteLength) {
+const written = writeSync(tempFd, entry.content, offset, entry.content.byteLength - offset);
+if (written <= 0) throw new PinnedRootError("write_failed", "short anchored batch write");
+offset += written;
+}
+fchmodSync(tempFd, 0o600);
+fsyncSync(tempFd);
+stage.tempIdentity = fstatSync(tempFd);
+closeQuietly(tempFd);
+tempFd = null;
+break;
+} catch (error) {
+closeQuietly(tempFd);
+tempFd = null;
+if (errnoCode(error) !== "EEXIST") throw error;
+stage.tempPath = null;
+}
+}
+if (!stage.tempPath || !stage.tempIdentity) throw new PinnedRootError("write_failed", "unable to reserve an anchored batch temporary file");
+} catch (error) {
+throw error;
+}
+}
+for (const stage of stages) {
+if (!stage.tempIdentity) throw new PinnedRootError("write_failed", "anchored batch staging returned no temporary inode");
+stage.descriptor = {
+path: this.anchorPath(stage.path),
+relative_path: stage.path,
+dev: stage.tempIdentity.dev,
+ino: stage.tempIdentity.ino,
+size: stage.content.byteLength,
+sha256: contentSha256(stage.content),
+};
+}
+if (options.beforePublish) {
+options.beforePublish(stages.map((stage) => this.makeWriteReceipt(stage.path, stage.descriptor!, stage.beforeIdentity === null
+? { kind: "absent" as const }
+: {
+kind: "file" as const,
+bytes: Buffer.from(stage.beforeBytes!),
+expectation: {
+dev: stage.beforeIdentity.dev,
+ino: stage.beforeIdentity.ino,
+size: stage.beforeBytes!.byteLength,
+sha256: createHash("sha256").update(stage.beforeBytes!).digest("hex"),
+},
+})));
+}
+for (const [index, stage] of stages.entries()) {
+assertTargetUnchanged(stage, "batch commit");
+this.hooks.beforeRename?.(stage.path);
+assertTargetUnchanged(stage, "batch commit");
+assertCurrentExecutionLiveness();
+linkSync(stage.tempPath!, stage.target);
+stage.committed = true;
+if (!stage.descriptor
+|| stage.descriptor.dev !== stage.tempIdentity!.dev
+|| stage.descriptor.ino !== stage.tempIdentity!.ino
+|| stage.descriptor.size !== stage.content.byteLength
+|| stage.descriptor.sha256 !== contentSha256(stage.content)) {
+throw new PinnedRootError("write_failed", "anchored batch postimage descriptor changed before publication");
+}
+const published = this.readFile(stage.path, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
+if (published.dev !== stage.tempIdentity!.dev
+|| published.ino !== stage.tempIdentity!.ino
+|| published.size !== stage.content.byteLength
+|| Buffer.compare(Buffer.from(published.bytes), stage.content) !== 0) {
+throw new PinnedRootError("changed", "anchored target changed before portable batch cleanup");
+}
+unlinkSync(stage.tempPath!);
+stage.tempPath = null;
+syncParent(stage.parent.fd);
+this.assertStable();
+assertCurrentExecutionLiveness();
+if (this.hooks.batchFailureIndex === index) throw new PinnedRootError("write_failed", "injected anchored batch failure");
+}
+assertCurrentExecutionLiveness();
+} catch (error) {
+const rollbackError = withoutCurrentExecutionLiveness(() => {
+let failure: unknown = null;
+for (const stage of stages.slice().reverse()) {
+if (!stage.committed) continue;
+try {
+this.assertStable();
+const parentAfter = fstatSync(stage.parent.fd);
+if (!sameIdentity(parentAfter, stage.parent.identity)) throw new PinnedRootError("changed", "anchored batch parent changed during rollback");
+const current = lstatSync(stage.target);
+if (!stage.tempIdentity || !sameIdentity(current, stage.tempIdentity)) throw new PinnedRootError("changed", `anchored target '${stage.path}' changed during rollback`);
+const postimage = this.readFile(stage.path, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
+if (postimage.dev !== stage.tempIdentity.dev || postimage.ino !== stage.tempIdentity.ino
+|| postimage.size !== stage.content.byteLength
+|| Buffer.compare(Buffer.from(postimage.bytes), stage.content) !== 0) {
+throw new PinnedRootError("changed", `anchored target '${stage.path}' bytes changed during rollback`);
+}
+if (stage.backupPath) {
+restoreBackupBytes(stage);
+// Publish the captured preimage without replacing a target that
+// appeared after the rollback check. EEXIST preserves the winner
+// and leaves the backup available for recovery.
+linkSync(stage.backupPath, stage.target);
+unlinkSync(stage.backupPath);
+stage.backupRestored = true;
+} else {
+// Unknown platforms have no descriptor-relative CAS unlink. Move
+// the exact postimage to a private quarantine instead of deleting
+// a path after a separable read-check.
+quarantineTarget(stage);
+}
+syncParent(stage.parent.fd);
+this.assertStable();
+stage.committed = false;
+} catch (restoreError) {
+failure = restoreError;
+preserveBackups = true;
+break;
+}
+}
+return failure;
+});
+if (rollbackError && !(error instanceof ExecutionLivenessViolation)) throw new PinnedRootError("changed", `anchored batch rollback failed: ${String(rollbackError)}`);
+throw error;
+} finally {
+for (const stage of stages) {
+if (stage.tempPath) {
+try { unlinkSync(stage.tempPath); } catch { /* best-effort cleanup */ }
+}
+if (stage.backupPath && !preserveBackups && !stage.backupRestored) {
+try { unlinkSync(stage.backupPath); } catch { /* best-effort cleanup */ }
+}
+try { syncParent(stage.parent.fd); } catch { /* preserve primary result */ }
+try { this.hooks.beforeCleanup?.(stage.path); } catch { /* preserve primary result */ }
+stage.parent.close();
+}
+}
+return stages
+.filter((stage): stage is typeof stage & { descriptor: PinnedRootWriteDescriptor; beforeIdentity: Stats | null } => stage.descriptor !== null)
+.map((stage) => ({
+descriptor: stage.descriptor,
+preimage: stage.beforeIdentity === null
+? { kind: "absent" as const }
+: {
+kind: "file" as const,
+bytes: Buffer.from(stage.beforeBytes!),
+expectation: {
+dev: stage.beforeIdentity.dev,
+ino: stage.beforeIdentity.ino,
+size: stage.beforeBytes!.byteLength,
+sha256: createHash("sha256").update(stage.beforeBytes!).digest("hex"),
+},
+},
+}));
+}
+/** Check a bounded set of entries through one inherited-fd request. */
+pathEntriesExist(relativePaths: readonly string[]): boolean[] {
+if (relativePaths.length === 0) return [];
+if (relativePaths.length > 16) throw new PinnedRootError("invalid", "too many entries in one anchored state batch");
+if (process.platform !== "darwin") return relativePaths.map((path) => this.pathEntryExists(path));
+for (const path of relativePaths) safeRelativeSegments(path);
+const result = this.runDescriptorHelper<{ results: Array<{ exists?: unknown }> }>("batch", {
+operations: relativePaths.map((path) => ({ op: "exists", path })),
+});
+if (!Array.isArray(result.results) || result.results.length !== relativePaths.length || result.results.some((entry) => !entry || typeof entry.exists !== "boolean")) {
+throw new PinnedRootError("write_failed", "descriptor helper returned an incomplete existence batch");
+}
+return result.results.map((entry) => entry.exists === true);
+}
+/** Publish a complete state-lock owner and hard-link it atomically. */
+tryAcquireExclusiveLock(relativeCandidate: string, relativeTarget: string, ownerContent: string, options: { ownerlessGraceMs?: number } = {}): boolean {
+if (process.platform === "darwin") {
+contentByteLength(ownerContent);
+const bytes = Buffer.from(ownerContent, "utf8");
+const result = this.runDescriptorHelper<{ acquired?: unknown }>("lock_acquire", {
+candidate: relativeCandidate,
+target: relativeTarget,
+bytes: bytes.toString("base64"),
+...(options.ownerlessGraceMs === undefined ? {} : { ownerless_grace_ms: options.ownerlessGraceMs }),
+});
+if (typeof result.acquired !== "boolean") throw new PinnedRootError("write_failed", "descriptor helper returned an invalid lock result");
+return result.acquired;
+}
+try {
+this.writeExclusive(relativeCandidate, ownerContent);
+} catch (error) {
+if (error instanceof PinnedRootError && error.code === "exists") return false;
+throw error;
+}
+try {
+this.linkExclusive(relativeCandidate, relativeTarget);
+return true;
+} catch (error) {
+if (error instanceof PinnedRootError && error.code === "exists") return false;
+throw error;
+} finally {
+try { this.unlink(relativeCandidate); } catch { /* candidate cleanup is best effort */ }
+}
+}
+/** Remove a state lock only when its owner token and file identity still match. */
+releaseExclusiveLock(relativeTarget: string, token: string): boolean {
+if (process.platform === "darwin") {
+this.hooks.beforeConditionalCommit?.(relativeTarget);
+try {
+const result = this.runDescriptorHelper<{ released?: unknown }>("lock_release", { target: relativeTarget, token });
+if (typeof result.released !== "boolean") throw new PinnedRootError("write_failed", "descriptor helper returned an invalid lock release result");
+return result.released;
+} catch (error) {
+if (error instanceof PinnedRootError && error.code === "not_found") return false;
+throw error;
+}
+}
+// Non-Darwin uses the same descriptor-bound compare-and-swap primitive as
+// state/CTO lock cleanup. Read the owner through the pinned root, require
+// the caller token, then remove only the exact inode+bytes observed. A
+// replacement lock can therefore never be unlinked by a stale releaser.
+try {
+const observed = this.readFile(relativeTarget, { maxBytes: 64 * 1024 });
+let owner: unknown;
+try {
+owner = JSON.parse(Buffer.from(observed.bytes).toString("utf8")) as unknown;
+} catch {
+return false;
+}
+if (!owner || typeof owner !== "object" || Array.isArray(owner)
+|| (owner as { token?: unknown }).token !== token) return false;
+const expected: PinnedRootFileExpectation = {
+dev: observed.dev,
+ino: observed.ino,
+sha256: createHash("sha256").update(observed.bytes).digest("hex"),
+};
+this.removeFileIfMatches(relativeTarget, expected);
+return true;
+} catch (error) {
+if (error instanceof PinnedRootError && ["not_found", "not_regular", "changed"].includes(error.code)) return false;
+throw error;
+}
+}
+private assertExpectation(expected: PinnedRootFileExpectation): void {
+if (!expected || !Number.isSafeInteger(expected.dev) || !Number.isSafeInteger(expected.ino)
+|| (expected.size !== undefined && (!Number.isSafeInteger(expected.size) || expected.size < 0))
+|| typeof expected.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(expected.sha256)) {
+throw new PinnedRootError("invalid", "conditional file expectation is invalid");
+}
+}
+private assertOpen(): void {
+if (this.closed) throw new PinnedRootError("changed", "pinned project root is closed");
+}
+/** Capture a bounded preimage for callers that need an exact publication receipt. */
+captureWritePreimageForReceipt(relativeFile: string): PinnedRootWritePreimage {
+return this.captureWritePreimage(relativeFile);
+}
+/** Roll back one receipt through this pinned descriptor, preserving replacements. */
+rollbackWriteReceipt(receipt: PinnedRootWriteReceipt): boolean {
+if (!receipt || receipt.path !== this.anchorPath(receipt.relative_path)
+|| receipt.descriptor.path !== receipt.path
+|| receipt.descriptor.relative_path !== receipt.relative_path) return false;
+return this.rollbackPublishedDescriptor(receipt.relative_path, receipt.descriptor, receipt.preimage);
+}
+/** Capture a bounded preimage for rollback if publication loses root authority. */
+private captureWritePreimage(relativeFile: string): PinnedRootWritePreimage {
+if (!this.isStable()) throw new PinnedRootError("changed", "pinned project root changed before anchored write preimage capture");
+const info = this.pathEntryInfo(relativeFile);
+if (info === null) return { kind: "absent" };
+if (info.kind !== "file") throw new PinnedRootError("path_unauthorized", "anchored write target is not a regular file");
+const observed = this.readFile(relativeFile, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
+const bytes = Buffer.from(observed.bytes);
+if (
+observed.dev !== info.dev
+|| observed.ino !== info.ino
+|| bytes.byteLength !== info.size
+|| (observed.mtimeMs !== undefined && observed.mtimeMs !== info.mtimeMs)
+|| (observed.ctimeMs !== undefined && observed.ctimeMs !== info.ctimeMs)
+|| !this.isStable()
+) {
+throw new PinnedRootError("changed", "anchored write target changed while capturing its preimage");
+}
+return {
+kind: "file",
+bytes,
+expectation: { dev: observed.dev, ino: observed.ino, size: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") },
+};
+}
+private preimageMatchesAnchored(relativeFile: string, preimage: PinnedRootWritePreimage): boolean {
+try {
+const info = this.pathEntryInfo(relativeFile);
+if (preimage.kind === "absent") return info === null;
+if (info === null || info.kind !== "file") return false;
+const observed = this.readFile(relativeFile, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
+return observed.dev === preimage.expectation.dev
+&& observed.ino === preimage.expectation.ino
+&& (preimage.expectation.size === undefined || observed.size === preimage.expectation.size)
+&& createHash("sha256").update(Buffer.from(observed.bytes)).digest("hex") === preimage.expectation.sha256;
+} catch {
+return false;
+}
+}
+/** Roll back through the inherited root descriptor even when its pathname was swapped away. */
+private rollbackPublishedDescriptor(
+relativeFile: string,
+descriptor: PinnedRootWriteDescriptor,
+preimage: PinnedRootWritePreimage,
+): boolean {
+try {
+const expected = { dev: descriptor.dev, ino: descriptor.ino, size: descriptor.size, sha256: descriptor.sha256 };
+const operation = preimage.kind === "absent" ? "remove_if_matches" : "replace_if_matches";
+const result = this.runDescriptorHelper<PinnedWriteDescriptorResponse>(operation, {
+path: relativeFile,
+expected,
+...(preimage.kind === "file" ? { bytes: contentToBase64(preimage.bytes) } : {}),
+});
+if (result.ok === true) return true;
+return this.preimageMatchesAnchored(relativeFile, preimage);
+} catch {
+return this.preimageMatchesAnchored(relativeFile, preimage);
+}
+}
+private rollbackBatchDescriptors(
+entries: readonly { path: string }[],
+descriptors: readonly PinnedRootWriteDescriptor[],
+preimages: readonly PinnedRootWritePreimage[],
+): boolean {
+let allRolledBack = true;
+for (let index = descriptors.length - 1; index >= 0; index -= 1) {
+const descriptor = descriptors[index];
+const entry = entries[index];
+const preimage = preimages[index];
+if (!descriptor || !entry || !preimage || !this.rollbackPublishedDescriptor(entry.path, descriptor, preimage)) {
+allRolledBack = false;
+}
+}
+return allRolledBack;
+}
+private rememberBatchPreimages(
+descriptors: readonly PinnedRootWriteDescriptor[],
+preimages: readonly PinnedRootWritePreimage[],
+): void {
+if (descriptors.length !== preimages.length) {
+throw new PinnedRootError("write_failed", "anchored atomic batch preimage metadata is incomplete");
+}
+for (let index = 0; index < descriptors.length; index += 1) {
+descriptorPreimages.set(descriptors[index]!, preimages[index]!);
+}
+}
+/** Require root authority after publication; on loss, remove only owned descriptors. */
+private finishPublishedDescriptor(
+relativeFile: string,
+descriptor: PinnedRootWriteDescriptor,
+preimage: PinnedRootWritePreimage,
+ownsPublication = true,
+): PinnedRootWriteDescriptor {
+if (this.isStable()) return descriptor;
+if (ownsPublication && !this.rollbackPublishedDescriptor(relativeFile, descriptor, preimage)) {
+throw new PinnedRootError("changed", "pinned project root changed after anchored write publication and rollback could not be proven");
+}
+throw new PinnedRootError("changed", "pinned project root changed after anchored write publication");
+}
+private finishPublishedDescriptors(
+entries: readonly { path: string }[],
+descriptors: readonly PinnedRootWriteDescriptor[],
+preimages: readonly PinnedRootWritePreimage[],
+): readonly PinnedRootWriteDescriptor[] {
+if (this.isStable()) return descriptors;
+if (!this.rollbackBatchDescriptors(entries, descriptors, preimages)) {
+throw new PinnedRootError("changed", "pinned project root changed after anchored batch publication and rollback could not be proven");
+}
+throw new PinnedRootError("changed", "pinned project root changed after anchored batch publication");
+}
+private durableBatchResidueAbsent(batchId: string, manifest: readonly { path: string }[]): boolean {
+if (process.platform !== "darwin" || !this.isStable()) return false;
+const candidates = [
+boundedDarwinSibling("batch-journal", batchId, ".json"),
+...manifest.flatMap((entry) => {
+const path = safeRelativeSegments(entry.path).join("/");
+const parent = safeRelativeSegments(path).slice(0, -1);
+return [
+[...parent, boundedDarwinSibling("cas-lock", path, ".lock")].join("/"),
+[...parent, boundedDarwinSibling("cas-stage", path, ".tmp")].join("/"),
+];
+}),
+];
+for (const candidate of candidates) {
+const segments = safeRelativeSegments(candidate);
+let current = this.canonical_root;
+for (let index = 0; index < segments.length; index += 1) {
+current = join(current, segments[index]!);
+try {
+const info = lstatSync(current);
+if (index === segments.length - 1) return false;
+if (!info.isDirectory()) return false;
+} catch (error) {
+if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+return false;
+}
+}
+}
+return this.isStable();
+}
+public assertStable(): void {
+if (!this.isStable()) throw new PinnedRootError("changed", "pinned project root identity changed");
+}
+private canonicalPath(relativeFile: string): string {
+const segments = safeRelativeSegments(relativeFile);
+return join(this.canonical_root, ...segments);
+}
+private openParent(segments: string[], create: boolean): { fd: number; identity: Stats; close: () => void } {
+let parentFd = this.rootFd;
+let ownedParent: number | null = null;
+try {
+for (let index = 0; index < segments.length; index += 1) {
+const segment = segments[index]!;
+const childFd = this.openDirectoryChild(parentFd, segment, segments.slice(0, index + 1).join("/"), create);
+closeQuietly(ownedParent);
+ownedParent = childFd;
+parentFd = childFd;
+}
+const identity = fstatSync(parentFd);
+if (!identity.isDirectory()) throw new PinnedRootError("not_directory", "anchored parent is not a directory");
+const heldFd = parentFd;
+return {
+fd: heldFd,
+identity,
+close: () => closeQuietly(ownedParent),
+};
+} catch (error) {
+closeQuietly(ownedParent);
+if (error instanceof PinnedRootError) throw error;
+const code = errnoCode(error);
+if (code === "ENOENT") throw new PinnedRootError("not_found", "anchored parent directory does not exist");
+throw new PinnedRootError("path_unauthorized", `anchored parent could not be opened: ${String(error)}`);
+}
+}
+private assertParentPathIdentity(parentFd: number, relativeDirectory: string): void {
+if (process.platform !== "darwin") return;
+const parentPath = relativeDirectory.length === 0 ? this.canonical_root : join(this.canonical_root, ...safeRelativeSegments(relativeDirectory));
+try {
+const pathname = lstatSync(parentPath);
+const descriptor = fstatSync(parentFd);
+if (pathname.isSymbolicLink() || !pathname.isDirectory() || !sameIdentity(pathname, descriptor)) {
+throw new PinnedRootError("changed", "anchored parent pathname changed during the operation");
+}
+} catch (error) {
+if (error instanceof PinnedRootError) throw error;
+throw new PinnedRootError("changed", `anchored parent pathname could not be verified: ${String(error)}`);
+}
+}
+private assertCanonicalDirectory(relativeDirectory: string): void {
+if (process.platform !== "darwin") return;
+const segments = safeRelativeSegments(relativeDirectory, true);
+let probe = this.canonical_root;
+const rootInfo = lstatSync(probe);
+if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory() || rootInfo.dev !== this.dev || rootInfo.ino !== this.ino) throw new PinnedRootError("changed", "pinned project root pathname changed");
+for (const segment of segments) {
+probe = join(probe, segment);
+const info = lstatSync(probe);
+if (info.isSymbolicLink() || !info.isDirectory()) throw new PinnedRootError("path_unauthorized", "anchored directory contains an unsafe component");
+if (realpathSync(probe) !== probe) throw new PinnedRootError("path_unauthorized", "anchored directory contains a symlink");
+}
+}
+private parentDirectoryPath(parentFd: number, relativeDirectory: string): string {
+if (process.platform === "darwin") {
+const segments = safeRelativeSegments(relativeDirectory, true);
+return segments.length === 0 ? this.canonical_root : join(this.canonical_root, ...segments);
+}
+const parentPath = descriptorPathFor(parentFd);
+if (parentPath === null) throw new PinnedRootError("unsupported", "descriptor-anchored paths are unavailable");
+return parentPath;
+}
+private childPath(parentFd: number, segment: string, relativeDirectory: string): string {
+const parentPath = this.parentDirectoryPath(parentFd, relativeDirectory.split("/").slice(0, -1).join("/"));
+return join(parentPath, segment);
+}
+private openDirectoryChild(parentFd: number, segment: string, relativeDirectory: string, create: boolean): number {
+const flags = descriptorFlags();
+if (flags === null) throw new PinnedRootError("unsupported", "descriptor no-follow directories are unavailable");
+const candidate = this.childPath(parentFd, segment, relativeDirectory);
+const parentRelative = relativeDirectory.split("/").slice(0, -1).join("/");
+this.assertCanonicalDirectory(parentRelative);
+this.assertParentPathIdentity(parentFd, parentRelative);
+let before: Stats | null = null;
+try {
+before = lstatSync(candidate);
+if (before.isSymbolicLink() || !before.isDirectory()) throw new PinnedRootError("path_unauthorized", `anchored directory '${relativeDirectory}' is not a real directory`);
+} catch (error) {
+if (errnoCode(error) !== "ENOENT") throw error;
+if (!create) throw new PinnedRootError("not_found", `anchored parent directory does not exist`);
+this.hooks.beforeDirectoryCreate?.(relativeDirectory);
+this.assertCanonicalDirectory(relativeDirectory.split("/").slice(0, -1).join("/"));
+this.assertParentPathIdentity(parentFd, parentRelative);
+try {
+assertCurrentExecutionLiveness();
+mkdirSync(candidate, { mode: 0o700 });
+} catch (mkdirError) {
+if (errnoCode(mkdirError) !== "EEXIST") throw mkdirError;
+}
+try {
+before = lstatSync(candidate);
+} catch (inspectError) {
+if (errnoCode(inspectError) === "ENOENT") throw new PinnedRootError("not_found", `anchored directory '${relativeDirectory}' disappeared while being created`);
+throw inspectError;
+}
+if (before.isSymbolicLink() || !before.isDirectory()) throw new PinnedRootError("path_unauthorized", `anchored directory '${relativeDirectory}' is not a real directory`);
+}
+let childFd: number;
+try {
+childFd = openSync(candidate, flags);
+} catch (error) {
+const code = errnoCode(error);
+if (code === "ENOENT") throw new PinnedRootError("not_found", `anchored directory '${relativeDirectory}' does not exist`);
+if (code === "ELOOP" || code === "ENOTDIR") throw new PinnedRootError("path_unauthorized", `anchored directory '${relativeDirectory}' is unsafe`);
+throw error;
+}
+try {
+const after = fstatSync(childFd);
+if (!after.isDirectory() || before === null || !sameIdentity(before, after)) throw new PinnedRootError("changed", `anchored directory '${relativeDirectory}' changed while opening`);
+const physicalRoot = process.platform === "darwin" ? this.canonical_root : realpathSync(this.rootDescriptorPath);
+let physicalChild: string;
+if (process.platform === "darwin") {
+physicalChild = realpathSync(candidate);
+} else {
+const childPath = descriptorPathFor(childFd);
+if (childPath === null) throw new PinnedRootError("unsupported", "descriptor-anchored paths are unavailable");
+physicalChild = realpathSync(childPath);
+}
+const childRelative = relative(physicalRoot, physicalChild);
+if (childRelative.startsWith("..") || isAbsolute(childRelative)) throw new PinnedRootError("path_unauthorized", `anchored directory '${relativeDirectory}' resolves outside the pinned root`);
+this.assertStable();
+assertCurrentExecutionLiveness();
+return childFd;
+} catch (error) {
+closeQuietly(childFd);
+if (error instanceof ExecutionLivenessViolation) throw error;
+if (error instanceof PinnedRootError) throw error;
+throw new PinnedRootError("path_unauthorized", `anchored directory '${relativeDirectory}' could not be verified: ${String(error)}`);
+}
+}}/** Shared exact rollback helper for state and other receipt-owning callers. */export function rollbackPinnedRootWriteReceipt(pinnedRoot: PinnedProjectRoot, receipt: PinnedRootWriteReceipt): boolean {
+try { return pinnedRoot.rollbackWriteReceipt(receipt); } catch { return false; }}/** Shared preimage capture helper for lock-owning transaction callers. */export function capturePinnedRootWritePreimage(pinnedRoot: PinnedProjectRoot, relativeFile: string): PinnedRootWritePreimage {
+return pinnedRoot.captureWritePreimageForReceipt(relativeFile);}
