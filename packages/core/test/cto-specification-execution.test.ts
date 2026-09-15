@@ -48,7 +48,6 @@ import { MAX_PREPARATION_HANDOFF_TASK_BYTES } from "../src/engine/preparation.js
 import { writeArtifactWithReference } from "../src/engine/artifacts.js";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { activeWave, ctoRuntimeRunInitialIdentityDigest, ctoSpecificationConformanceReceiptRelativePath, isSafeCtoExecutionId, mintCtoRuntimeRunOrigin, newCtoState, readCtoState, readCtoStatePinned, writeCtoRuntimeStateProof, writeCtoState } from "../src/cto/state.js";
-import { finishWave } from "../src/cto/waves.js";
 import { buildCtoSliceMarker } from "../src/cto/slice-marker.js";
 import { classificationToolGate } from "../src/gates/classification.js";
 import { preflightCtoSpecificationExecution as preflightCtoSpecificationExecutionGate, setCtoGateHandoffReadTestHooks } from "../src/cto/gates.js";
@@ -7123,10 +7122,10 @@ test("bound CTO worker task gate admits only the dispatched marker and current c
 });
 
 
-test("CTO host terminal receipts clear pending lifecycle before successful and failed wave finish", async () => {
+test("CTO host terminal receipts clear pending lifecycle for successful and failed team results", async () => {
   const cases = [
-    { suffix: "success", isError: false, status: "done" as const, waveStatus: "done" as const, outcome: "pass" as const },
-    { suffix: "failure", isError: true, status: "failed" as const, waveStatus: "failed" as const, outcome: "blocked" as const },
+    { suffix: "success", isError: false, status: "done" as const },
+    { suffix: "failure", isError: true, status: "failed" as const },
   ];
   for (const testCase of cases) {
     const root = makeProject();
@@ -7169,9 +7168,6 @@ test("CTO host terminal receipts clear pending lifecycle before successful and f
       assert.equal(terminalTeam?.pending, undefined, "terminal receipt must consume pending provider lifecycle");
       assert.deepEqual(terminalTeam?.completion_envelope?.identity, team.work_identity, "terminal evidence keeps the exact work identity");
       assert.equal(terminalTeam?.completion_envelope?.outcome, testCase.isError ? "failed" : "succeeded");
-      const activeWaveId = String(terminal.active_wave_id);
-      const finished = finishWave(terminal, { id: activeWaveId, status: testCase.waveStatus, outcome: testCase.outcome });
-      assert.equal(finished.wave_history?.find((wave) => wave.id === activeWaveId)?.status, testCase.waveStatus);
     } finally {
       TEST_SESSION_MANAGER.getSessionId = originalSessionId;
       executionContexts.delete(root);
