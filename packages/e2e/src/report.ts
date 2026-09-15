@@ -1523,7 +1523,11 @@ function generateSingleReport(
     const roots = [...new Set(createdEvidenceParents.keys())].sort((left, right) => right.lexicalPath.length - left.lexicalPath.length);
     for (const child of roots) {
       const parent = createdEvidenceParents.get(child);
-      if (parent !== undefined) removePinnedDirectoryIfEmpty(parent.root, parent.components);
+      if (parent !== undefined) {
+        for (let depth = parent.components.length; depth > 0; depth -= 1) {
+          removePinnedDirectoryIfEmpty(parent.root, parent.components.slice(0, depth));
+        }
+      }
     }
   };
   try {
@@ -2143,7 +2147,11 @@ function generateSuiteReport(
     const roots = [...new Set(copiedEvidenceParents.keys())].sort((left, right) => right.lexicalPath.length - left.lexicalPath.length);
     for (const child of roots) {
       const parent = copiedEvidenceParents.get(child);
-      if (parent !== undefined) removePinnedDirectoryIfEmpty(parent.root, parent.components);
+      if (parent !== undefined) {
+        for (let depth = parent.components.length; depth > 0; depth -= 1) {
+          removePinnedDirectoryIfEmpty(parent.root, parent.components.slice(0, depth));
+        }
+      }
     }
   };
   try {
