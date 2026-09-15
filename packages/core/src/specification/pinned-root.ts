@@ -1856,10 +1856,15 @@ def read_batch_journal(root_fd, journal_name, batch_id):
                         or descriptor.get("dev") != postimage.get("dev") or descriptor.get("ino") != postimage.get("ino")
                         or descriptor.get("size") != postimage.get("size") or descriptor.get("sha256") != postimage.get("sha256")):
                     raise RecoveryRequired("prepared batch rollback absent-target backup changed")
-            if entry["expected"].get("kind") == "absent" and entry.get("rollback_state") == "rolled_back" and (rollback_temp is not None or entry.get("rollback_temp_descriptor") is not None or entry.get("rollback_postimage_descriptor") is not None):
-                raise RecoveryRequired("prepared batch rollback absent-target residue remains")
             if entry.get("rollback_state") == "rolled_back" and not isinstance(entry.get("restored"), dict):
                 raise RecoveryRequired("prepared batch restored descriptor is missing")
+            if entry.get("rollback_state") == "rolled_back":
+                if (rollback_temp is None) != (entry.get("rollback_temp_descriptor") is None):
+                    raise RecoveryRequired("prepared batch rollback tracked residue is incomplete")
+                if rollback_temp is not None:
+                    displaced = entry.get("rollback_postimage_descriptor")
+                    if not isinstance(entry.get("rollback_temp_descriptor"), dict) or not isinstance(displaced, dict) or displaced != entry.get("postimage"):
+                        raise RecoveryRequired("prepared batch rollback tracked residue descriptor changed")
         seen.add(entry["path"])
     return document, info, data
 
@@ -1918,7 +1923,10 @@ def persist_batch_journal(root_fd, journal_name, expected_data, document):
     if current != expected_data:
         raise RecoveryRequired("prepared batch journal changed before transition")
     temp = write_temp(root_fd, journal_name, encoded)
+    temp_info = stat_at(root_fd, temp)
+    temp_receipt = {"dev": temp_info.st_dev, "ino": temp_info.st_ino, "size": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest()}
     exchanged = False
+    foreign_restored = False
     try:
         rename_exchange(root_fd, temp, journal_name)
         exchanged = True
@@ -1927,6 +1935,9 @@ def persist_batch_journal(root_fd, journal_name, expected_data, document):
             # Restore the foreign journal and keep it authoritative for manual
             # recovery; never unlink bytes we did not authenticate.
             rename_exchange(root_fd, temp, journal_name)
+            foreign_restored = True
+            if not remove_exact_regular(root_fd, temp, temp_receipt):
+                raise RecoveryRequired("prepared batch journal owned temporary cleanup could not be proven")
             temp = None
             raise RecoveryRequired("prepared batch journal owner changed during transition")
         observed, _ = read_at(root_fd, journal_name, MAX_JOURNAL_READ)
@@ -1936,42 +1947,14 @@ def persist_batch_journal(root_fd, journal_name, expected_data, document):
         temp = None
         fsync_regular(root_fd)
     except RecoveryRequired:
-        if exchanged and temp is not None:
+        if exchanged and temp is not None and not foreign_restored:
             try:
                 rename_exchange(root_fd, temp, journal_name)
             except Exception:
                 pass
         raise
     finally:
-        cleanup_temp(root_fd, temp)
-
-
-def target_matches_preimage_content(parent, name, expected):
-    if not isinstance(expected, dict):
-        return False
-    if expected.get("kind") == "absent":
-        try:
-            stat_at(parent, name)
-            return False
-        except FileNotFoundError:
-            return True
-    if expected.get("kind") != "file":
-        return False
-    try:
-        data, _ = read_at(parent, name)
-    except FileNotFoundError:
-        return False
-    if expected.get("size") is not None and len(data) != expected.get("size"):
-        return False
-    if hashlib.sha256(data).hexdigest() != expected.get("sha256"):
-        return False
-    encoded = expected.get("bytes")
-    if isinstance(encoded, str):
-        try:
-            return data == base64.b64decode(encoded, validate=True)
-        except Exception:
-            return False
-    return True
+        cleanup_temp(root_fd, temp, temp_receipt)
 
 
 def same_preimage_metadata(left, right):
@@ -1983,14 +1966,14 @@ def same_preimage_metadata(left, right):
 
 def restored_target_descriptor(parent, name, expected):
     if expected.get("kind") == "absent":
-        if not target_matches_preimage_content(parent, name, expected):
+        if not target_matches_preimage(parent, name, expected):
             raise RecoveryRequired("prepared batch rollback preimage is not restored")
         return {"kind": "absent"}
     try:
         data, info = read_at(parent, name)
     except FileNotFoundError as error:
         raise RecoveryRequired("prepared batch rollback preimage is missing") from error
-    if not target_matches_preimage_content(parent, name, expected):
+    if not target_matches_preimage(parent, name, expected):
         raise RecoveryRequired("prepared batch rollback preimage bytes changed")
     return {"kind": "file", "dev": info.st_dev, "ino": info.st_ino, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
@@ -2093,6 +2076,9 @@ def mark_batch_entry_rolled_back(root_fd, journal_name, batch_id, token):
         raise RecoveryRequired("prepared batch rollback token is not bound to the journal")
     next_document = signed_document({"schema_version": 1, "batch_id": batch_id, "state": document.get("state"), "root_binding": CURRENT_ROOT_BINDING, "entries": entries})
     persist_batch_journal(root_fd, journal_name, raw, next_document)
+    if next_document.get("state") == "rolling_back" and all(entry.get("rollback_state") == "rolled_back" for entry in entries):
+        terminal = signed_document({"schema_version": 1, "batch_id": batch_id, "state": "rolled_back", "root_binding": CURRENT_ROOT_BINDING, "entries": entries})
+        persist_batch_journal(root_fd, journal_name, json.dumps(next_document, separators=(",", ":")).encode("utf-8") + b"\n", terminal)
 
 
 def mark_batch_rollback_complete(root_fd, journal_name, batch_id):
@@ -2136,7 +2122,7 @@ def mark_batch_rollback_finalizing(root_fd, journal_name, batch_id):
 
 
 def target_matches_restored(parent, name, expected, restored):
-    if not target_matches_preimage_content(parent, name, expected):
+    if not target_matches_preimage(parent, name, expected):
         return False
     if expected.get("kind") == "absent":
         return isinstance(restored, dict) and restored.get("kind") == "absent"
@@ -2145,7 +2131,7 @@ def target_matches_restored(parent, name, expected, restored):
     return False
 
 
-def rollback_prepared_target(parent, name, path, expected, postimage, rollback_temp, rollback_temp_descriptor=None):
+def rollback_prepared_target(parent, name, path, expected, postimage, rollback_temp, rollback_temp_descriptor=None, retain_displaced=False):
     if not isinstance(expected, dict) or expected.get("kind") not in ("absent", "file") or not isinstance(postimage, dict):
         raise RecoveryRequired("prepared write rollback metadata is invalid")
     if expected.get("kind") == "absent":
@@ -2173,26 +2159,16 @@ def rollback_prepared_target(parent, name, path, expected, postimage, rollback_t
     try:
         try:
             staged, stage_info = read_at(parent, stage)
-        except FileNotFoundError:
-            if rollback_temp_descriptor is not None:
-                raise RecoveryRequired("prepared write rollback backup is missing")
-            encoded = expected.get("bytes")
-            if not isinstance(encoded, str):
-                raise RecoveryRequired("prepared write rollback backup is missing")
-            try:
-                before = base64.b64decode(encoded, validate=True)
-            except Exception as error:
-                raise RecoveryRequired("prepared write rollback backup bytes are invalid") from error
-            write_named_temp(parent, stage, before)
-            staged, stage_info = read_at(parent, stage)
-        if (isinstance(rollback_temp_descriptor, dict) and not same_identity(stage_info, rollback_temp_descriptor)):
+        except FileNotFoundError as error:
+            raise RecoveryRequired("prepared write rollback backup is missing") from error
+        if not isinstance(rollback_temp_descriptor, dict) or not same_identity(stage_info, rollback_temp_descriptor):
             raise RecoveryRequired("prepared write rollback backup identity changed")
         if (len(staged) != expected.get("size") or hashlib.sha256(staged).hexdigest() != expected.get("sha256")):
 
 
             raise RecoveryRequired("prepared write rollback backup changed")
-        committed, _ = conditional_exchange_replace(parent, name, stage, postimage, expected.get("sha256"), expected.get("size"), retain_displaced=rollback_temp.startswith("cas-stage-"))
-        if not committed and not target_matches_preimage_content(parent, name, expected):
+        committed, _ = conditional_exchange_replace(parent, name, stage, postimage, expected.get("sha256"), expected.get("size"), retain_displaced=retain_displaced)
+        if not committed and not target_matches_preimage(parent, name, expected):
             raise RecoveryRequired("prepared write rollback replacement was not committed")
         stage = None
     finally:
@@ -2200,6 +2176,20 @@ def rollback_prepared_target(parent, name, path, expected, postimage, rollback_t
         # owns the durable residue and may retry its exact CAS.
         pass
     fsync_regular(parent)
+
+
+def forget_prepared_batch_candidates(batch_id, journal_name, protected_parents=()):
+    protected = set(protected_parents)
+    for token, candidate in list(prepared_writes.items()):
+        if candidate.get("batch_id") != batch_id or candidate.get("batch_journal") != journal_name:
+            continue
+        prepared_writes.pop(token, None)
+        candidate_parent = candidate.get("parent")
+        if candidate_parent not in protected:
+            try:
+                os.close(candidate_parent)
+            except (OSError, TypeError):
+                pass
 
 
 def recover_rolled_back_batch(root_fd, journal_name, batch_id, document):
@@ -2246,12 +2236,9 @@ def recover_rolled_back_batch(root_fd, journal_name, batch_id, document):
                     stage_receipt = {"dev": stage_info.st_dev, "ino": stage_info.st_ino, "size": len(stage_data), "sha256": hashlib.sha256(stage_data).hexdigest()}
                     backup_descriptor = entry.get("rollback_temp_descriptor")
                     displaced_descriptor = entry.get("rollback_postimage_descriptor") or postimage
-                    target_restored = target_matches_preimage_content(parent, name, expected)
+                    target_restored = target_matches_preimage(parent, name, expected)
                     stage_is_backup = (isinstance(backup_descriptor, dict) and same_identity(stage_info, backup_descriptor)
                         and stage_receipt["size"] == backup_descriptor.get("size") and stage_receipt["sha256"] == backup_descriptor.get("sha256"))
-                    stage_is_backup_content = (backup_descriptor is None and expected.get("kind") == "file" and stage_receipt["size"] == expected.get("size")
-                        and stage_receipt["sha256"] == expected.get("sha256"))
-                    stage_is_backup = stage_is_backup or stage_is_backup_content
                     stage_is_displaced = (isinstance(displaced_descriptor, dict) and same_identity(stage_info, displaced_descriptor)
                         and stage_receipt["size"] == displaced_descriptor.get("size") and stage_receipt["sha256"] == displaced_descriptor.get("sha256"))
                     if target_restored and stage_is_displaced:
@@ -2264,10 +2251,10 @@ def recover_rolled_back_batch(root_fd, journal_name, batch_id, document):
                     elif finalizing:
                         raise RecoveryRequired("prepared batch finalizing state has an unexpected backup")
                 else:
-                    target_restored = target_matches_preimage_content(parent, name, expected)
+                    target_restored = target_matches_preimage(parent, name, expected)
                 if entry.get("rollback_state") in ("pending", "aborting") and target_restored and not stage_exists:
                     raise RecoveryRequired("prepared batch rollback target has no durable stage proof")
-                if entry.get("rollback_state") == "pending" and target_restored and stage_exists and not stage_is_displaced:
+                if entry.get("rollback_state") in ("pending", "aborting") and target_restored and stage_exists and not stage_is_displaced:
                     raise RecoveryRequired("prepared batch rollback target has an unexpected stage proof")
                 rollback_expected = expected
                 if owner is not None and isinstance(owner.get("expected"), dict) and "bytes" in owner.get("expected"):
@@ -2275,15 +2262,14 @@ def recover_rolled_back_batch(root_fd, journal_name, batch_id, document):
                 if not same_preimage_metadata(rollback_expected, expected):
                     raise RecoveryRequired("prepared batch rollback lease preimage metadata changed")
                 if entry.get("rollback_state") != "rolled_back":
-                    if not target_matches_preimage_content(parent, name, expected):
+                    if not target_matches_preimage(parent, name, expected):
                         if owner is None:
                             raise RecoveryRequired("prepared batch rollback target is unavailable")
-                        rollback_prepared_target(parent, name, path, rollback_expected, postimage, entry.get("rollback_temp"), entry.get("rollback_temp_descriptor"))
+                        rollback_prepared_target(parent, name, path, rollback_expected, postimage, entry.get("rollback_temp"), entry.get("rollback_temp_descriptor"), retain_displaced=True)
                     entry["restored"] = restored_target_descriptor(parent, name, expected)
                     entry["rollback_state"] = "rolled_back"
-                    entry["rollback_temp"] = None
-                    entry["rollback_temp_descriptor"] = None
-                    entry["rollback_postimage_descriptor"] = None
+                    # Keep the exact displaced-stage receipt in the first
+                    # durable rolled_back record; clear it only after cleanup.
                     current, _ = read_at(root_fd, journal_name, MAX_JOURNAL_READ)
                     next_document = signed_document({"schema_version": 1, "batch_id": batch_id, "state": document.get("state"), "root_binding": CURRENT_ROOT_BINDING, "entries": entries})
                     persist_batch_journal(root_fd, journal_name, current, next_document)
@@ -2313,6 +2299,7 @@ def recover_rolled_back_batch(root_fd, journal_name, batch_id, document):
                     raise RecoveryRequired("prepared batch rollback preimage changed before lease release")
                 release_batch_lease(state["parent"], state["lock"], state["token"])
         remove_batch_journal(root_fd, journal_name, batch_id)
+        forget_prepared_batch_candidates(batch_id, journal_name, (state["parent"] for state in states))
         RECOVERED_BATCH_IDS.add(batch_id)
         return {"ok": True, "recovered": True}
     finally:
@@ -2504,9 +2491,10 @@ def recover_prepared_batch(root_fd, journal_name, batch_id):
     finalizing = document.get("state") == "finalizing"
     states = []
     for entry in entries:
-        path = entry["path"]
-        parent, name = parent_for(root_fd, path, False)
+        parent = None
         try:
+            path = entry["path"]
+            parent, name = parent_for(root_fd, path, False)
             lock_name = bounded_name("cas-lock", path, ".lock", nonce=False)
             stage_name = bounded_name("cas-stage", path, ".tmp", nonce=False)
             try:
@@ -2586,13 +2574,15 @@ def recover_prepared_batch(root_fd, journal_name, batch_id):
             for state in states:
                 try: os.close(state["parent"])
                 except OSError: pass
-            os.close(parent)
+            if parent is not None:
+                os.close(parent)
             raise
         except Exception as error:
             for state in states:
                 try: os.close(state["parent"])
                 except OSError: pass
-            os.close(parent)
+            if parent is not None:
+                os.close(parent)
             raise RecoveryRequired("prepared batch entry state is ambiguous") from error
     if not finalizing and any(state["state"] == "prepared" for state in states):
         first_prepared = next(index for index, state in enumerate(states) if state["state"] == "prepared")
@@ -2630,6 +2620,7 @@ def recover_prepared_batch(root_fd, journal_name, batch_id):
             if not target_matches_descriptor(state["parent"], state["name"], state["postimage"]):
                 raise RecoveryRequired("prepared batch postimage verification failed")
         remove_batch_journal(root_fd, journal_name, batch_id)
+        forget_prepared_batch_candidates(batch_id, journal_name, (state["parent"] for state in states))
         RECOVERED_BATCH_IDS.add(batch_id)
     finally:
         for state in states:
@@ -2786,8 +2777,8 @@ def prepare_write(payload):
             "root_binding": CURRENT_ROOT_BINDING,
             "stage": stage_name,
             "postimage": {"dev": temp_info.st_dev, "ino": temp_info.st_ino, "size": len(data), "sha256": desired_sha},
-            "backup": stage_name if expected.get("kind") == "file" and grouped else None,
-            "backup_descriptor": {"kind": "file", "dev": expected.get("dev"), "ino": expected.get("ino"), "size": expected.get("size"), "sha256": expected.get("sha256")} if expected.get("kind") == "file" and grouped else None,
+            "backup": stage_name if expected.get("kind") == "file" else None,
+            "backup_descriptor": {"kind": "file", "dev": expected.get("dev"), "ino": expected.get("ino"), "size": expected.get("size"), "sha256": expected.get("sha256")} if expected.get("kind") == "file" else None,
         }
         if grouped:
             conditional_kill(payload, "after_prepared_stage_before_journal")
@@ -2870,7 +2861,11 @@ def ack_prepared_write(payload):
         lock_data, lock_info, owner = read_lock_observed(parent, prepared["lock_name"])
         if owner.get("token") != token:
             raise RuntimeError("prepared write lease was replaced before acknowledgement")
-        cleanup_temp(parent, prepared.get("backup"))
+        backup = prepared.get("backup")
+        if backup is not None:
+            if backup != prepared.get("stage") or not isinstance(prepared.get("backup_descriptor"), dict):
+                raise RecoveryRequired("prepared write ACK backup binding changed")
+            cleanup_rollback_temp(parent, backup, {"kind": "file", **prepared["backup_descriptor"]})
         release_batch_lease(parent, prepared["lock_name"], token)
         fsync_regular(parent)
         prepared_writes.pop(token, None)
@@ -2926,7 +2921,7 @@ def rollback_prepared_write(payload):
             if entry is None or entry.get("path") != prepared.get("path"):
                 raise RecoveryRequired("prepared write rollback token is not bound to the journal")
             if entry.get("rollback_state") != "rolled_back":
-                rollback_prepared_target(parent, prepared["name"], prepared["path"], entry["expected"], entry["postimage"], entry.get("rollback_temp"), entry.get("rollback_temp_descriptor"))
+                rollback_prepared_target(parent, prepared["name"], prepared["path"], entry["expected"], entry["postimage"], entry.get("rollback_temp"), entry.get("rollback_temp_descriptor"), retain_displaced=True)
                 fsync_regular(parent)
                 mark_batch_entry_rolled_back(3, journal_name, batch_id, token)
             else:
@@ -2935,10 +2930,21 @@ def rollback_prepared_write(payload):
             prepared["rolled_back"] = True
             return {"ok": True, "rolled_back": True}
         if prepared.get("rolled_back") is True:
-            if not target_matches_preimage_content(parent, prepared["name"], expected):
+            if not target_matches_preimage(parent, prepared["name"], expected):
                 raise RecoveryRequired("prepared write rollback restored target changed")
             return {"ok": True, "rolled_back": True}
-        rollback_prepared_target(parent, prepared["name"], prepared["path"], expected, postimage, bounded_name("prepared-rollback", prepared["path"], ".tmp", nonce=False))
+        rollback_temp = None
+        rollback_descriptor = None
+        if expected.get("kind") == "file":
+            rollback_temp = prepared.get("backup")
+            rollback_descriptor = prepared.get("backup_descriptor")
+            if not isinstance(rollback_temp, str) or not isinstance(rollback_descriptor, dict):
+                raise RecoveryRequired("prepared write rollback has no authenticated original backup")
+        rollback_prepared_target(parent, prepared["name"], prepared["path"], expected, postimage, rollback_temp, rollback_descriptor, retain_displaced=True)
+        if expected.get("kind") == "file":
+            if not target_matches_preimage(parent, prepared["name"], expected):
+                raise RecoveryRequired("prepared write rollback restored target changed")
+            cleanup_rollback_temp(parent, rollback_temp, expected, postimage)
         fsync_regular(parent)
         prepared["rolled_back"] = True
         return {"ok": True, "rolled_back": True}
@@ -2990,9 +2996,15 @@ def finalize_prepared_write(payload):
             return {"ok": True, "finalized": True}
         if prepared.get("rolled_back") is not True:
             raise RecoveryRequired("prepared write finalization requires an exact rollback")
-        if not target_matches_preimage_content(parent, prepared["name"], expected):
+        if not target_matches_preimage(parent, prepared["name"], expected):
             raise RecoveryRequired("prepared write finalization found a changed preimage")
-        cleanup_temp(parent, prepared.get("backup"))
+        backup = prepared.get("backup")
+        if expected.get("kind") == "file":
+            if not isinstance(backup, str) or backup != prepared.get("stage") or not isinstance(prepared.get("backup_descriptor"), dict):
+                raise RecoveryRequired("prepared write finalization has no authenticated original backup")
+            cleanup_rollback_temp(parent, backup, expected, prepared.get("postimage"))
+        elif backup is not None:
+            raise RecoveryRequired("prepared write finalization has unexpected backup residue")
         lock_data, lock_info, owner = read_lock_observed(parent, prepared["lock_name"])
         if not verify_signed_document(owner) or owner.get("token") != token:
             raise RecoveryRequired("prepared write lease changed before finalization")
@@ -3026,7 +3038,7 @@ def abort_prepared_write(payload):
             if entry is None:
                 raise RecoveryRequired("prepared published rollback token is not bound to the journal")
             if entry.get("rollback_state") != "rolled_back":
-                rollback_prepared_target(parent, prepared["name"], prepared["path"], entry["expected"], entry["postimage"], entry.get("rollback_temp"), entry.get("rollback_temp_descriptor"))
+                rollback_prepared_target(parent, prepared["name"], prepared["path"], entry["expected"], entry["postimage"], entry.get("rollback_temp"), entry.get("rollback_temp_descriptor"), retain_displaced=True)
                 mark_batch_entry_rolled_back(3, journal_name, prepared["batch_id"], token)
             prepared["rolled_back"] = True
             return {"ok": True, "aborted": False, "rolled_back": True, "rollback_required": True}
@@ -3037,12 +3049,15 @@ def abort_prepared_write(payload):
                 except RuntimeError:
                     pass
             return {"ok": True, "aborted": False, "quarantined": True}
-        abort_prepared_stage_exact(prepared)
-        cleanup_temp(parent, prepared.get("backup"))
-        if prepared.get("batch_id") is not None:
-            rollback_document, _, _ = read_batch_journal(3, prepared["batch_journal"], prepared["batch_id"])
-            if rollback_document.get("state") in ("rolling_back", "rolled_back"):
-                mark_batch_entry_rolled_back(3, prepared["batch_journal"], prepared["batch_id"], prepared["lock_token"])
+        batch_id = prepared.get("batch_id")
+        if batch_id is not None:
+            # Transition the whole prepared group first. The entry transition
+            # persists its restored proof while the desired stage remains
+            # tracked, then performs exact stage cleanup.
+            mark_batch_rolling_back(3, prepared["batch_journal"], batch_id)
+            mark_batch_entry_rolled_back(3, prepared["batch_journal"], batch_id, prepared["lock_token"])
+        else:
+            abort_prepared_stage_exact(prepared)
         release_batch_lease(parent, prepared["lock_name"], prepared["lock_token"])
         fsync_regular(parent)
         prepared_writes.pop(token, None)
@@ -3195,7 +3210,7 @@ def commit_prepared_write(payload):
                     prepared["expected"],
                     prepared["sha256"],
                     prepared["size"],
-                    retain_displaced=prepared.get("batch_id") is not None,
+                    retain_displaced=True,
                 )
             except Exception:
                 # The exchange may have published before a later fsync/error;
@@ -3212,7 +3227,7 @@ def commit_prepared_write(payload):
         committed = True
         verify_prepared_target(prepared)
         conditional_kill(payload, "after_prepared_publication_before_lease")
-        if prepared.get("batch_id") is not None and prepared.get("expected", {}).get("kind") == "file":
+        if prepared.get("expected", {}).get("kind") == "file":
             prepared["backup"] = prepared.get("temp")
             prepared["backup_descriptor"] = {"kind": "file", "dev": prepared["expected"].get("dev"), "ino": prepared["expected"].get("ino"), "size": prepared["expected"].get("size"), "sha256": prepared["expected"].get("sha256")}
         prepared["temp"] = None
@@ -3286,6 +3301,8 @@ def operation(payload):
         if not isinstance(batch_id, str):
             raise ValueError("prepared batch identity is invalid")
         try:
+            if payload.get("abort_prepared") is True:
+                return recover_partial_prepared_batch(root_fd, batch_journal_name(batch_id), batch_id)
             recover_prepared_batch(root_fd, batch_journal_name(batch_id), batch_id)
         except RecoveryRequired as error:
             if str(error) == "prepared batch lease is missing":
@@ -3821,8 +3838,11 @@ def recover_missing_batch_residue(root_fd, journal_name, batch_id, entries):
         pass
     else:
         raise RecoveryRequired("prepared batch journal appeared before absent-clean return")
+    forget_prepared_batch_candidates(batch_id, journal_name)
 
 def recover_partial_prepared_batch(root_fd, journal_name, batch_id):
+    if batch_id not in AUTHORIZED_BATCH_IDS:
+        raise RecoveryRequired("prepared batch identity is not live in this host")
     document, _, _ = read_batch_journal(root_fd, journal_name, batch_id)
     if document.get("state") != "prepared":
         raise RecoveryRequired("prepared batch partial lease recovery requires prepared journal")
@@ -3844,10 +3864,12 @@ def recover_partial_prepared_batch(root_fd, journal_name, batch_id):
                 try:
                     stat_at(parent, stage_name)
                 except FileNotFoundError:
-                    clean = isinstance(journal_expected, dict) and target_matches_preimage(parent, name, journal_expected)
-                    published = isinstance(journal_postimage, dict) and target_matches_descriptor(parent, name, journal_postimage)
-                    if not clean and not published:
-                        raise RecoveryRequired("prepared batch partial recovery lacks exact target state")
+                    # Entries without durable preparation metadata are the
+                    # unprepared suffix. No matching lease/stage is the only
+                    # proof required; their target was never owned here.
+                    if isinstance(journal_expected, dict) or isinstance(journal_postimage, dict):
+                        if not isinstance(journal_expected, dict) or not target_matches_preimage(parent, name, journal_expected):
+                            raise RecoveryRequired("prepared batch partial recovery lacks exact prepared-prefix preimage")
                     states.append({"parent": parent, "name": name, "lock": lock_name, "stage": stage_name, "lock_data": None, "lock_info": None, "remove_stage": False})
                     continue
                 raise RecoveryRequired("prepared batch partial recovery found an unleased stage")
@@ -3869,10 +3891,8 @@ def recover_partial_prepared_batch(root_fd, journal_name, batch_id):
             try:
                 stage_data, stage_info = read_at(parent, stage_name)
             except FileNotFoundError:
-                clean = isinstance(expected, dict) and target_matches_preimage(parent, name, expected)
-                published = isinstance(postimage, dict) and target_matches_descriptor(parent, name, postimage)
-                if not clean and not published:
-                    raise RecoveryRequired("prepared batch partial recovery target is ambiguous")
+                if not isinstance(expected, dict) or not target_matches_preimage(parent, name, expected):
+                    raise RecoveryRequired("prepared batch partial recovery prepared-prefix preimage is unavailable")
                 states.append({"parent": parent, "name": name, "lock": lock_name, "stage": stage_name, "lock_data": lock_data, "lock_info": lock_info, "remove_stage": False})
                 continue
             except Exception as error:
@@ -3897,6 +3917,7 @@ def recover_partial_prepared_batch(root_fd, journal_name, batch_id):
         for parent in parents:
             os.close(parent)
     remove_batch_journal(root_fd, journal_name, batch_id, True)
+    forget_prepared_batch_candidates(batch_id, journal_name)
     return {"ok": True, "recovered": False, "absent_clean": True, "aborted": True, "batch_id": batch_id}
 
 def execute(payload):
@@ -5936,6 +5957,10 @@ committed: boolean;
 commit_confirmed: boolean;
 };
 const prepared: PreparedBatchEntry[] = [];
+let prepareRequestDispatched = false;
+let inFlightPrepare: { path: string; index: number; token: string } | null = null;
+let prepareFailureRecovered = false;
+let publicationStarted = false;
 const batchId = durableBatch ? randomUUID() : undefined;
 const batchPreimages = entries.map((entry) => this.captureWritePreimage(entry.path));
 const rollbackBytes = batchPreimages.reduce((total, preimage) => total + (preimage.kind === "file" ? preimage.bytes.byteLength : 0), 0);
@@ -5957,6 +5982,7 @@ if (batchManifest) {
 const currentPreimage = this.captureWritePreimage(entry.path);
 batchManifest[index]!.expected = currentPreimage.kind === "file" ? { kind: "file", ...currentPreimage.expectation } : { kind: "absent" };
 }
+prepareRequestDispatched = true;
 const response = this.runDescriptorHelper<PinnedWriteDescriptorResponse>("prepare_write_atomic", {
 path: entry.path,
 ...contentPayload(entry.content, true),
@@ -5964,12 +5990,17 @@ path: entry.path,
 ...(Number.isInteger(this.hooks.preparedBatchJournalIndex) ? { failure_batch_index: this.hooks.preparedBatchJournalIndex } : {}),
 ...(batchId ? { batch_id: batchId, batch_index: index, batch_size: entries.length, batch_manifest: batchManifest } : {}),
 });
-if (typeof response.token !== "string" || response.token.length === 0) {
-throw new PinnedRootError("write_failed", "prepared batch write returned no lease token");
+if (typeof response.token !== "string" || response.token.length === 0 || response.token.length > 128) {
+throw new PinnedRootError("write_failed", "prepared batch write returned no bounded lease token");
 }
+// Register the bounded token/path/index before validating response metadata;
+// a helper may have persisted the candidate even when this frame is malformed.
+inFlightPrepare = { path: safeRelativeSegments(entry.path).join("/"), index, token: response.token };
 const preimage = preimageFromResponse(response);
 const descriptor = descriptorFromResponse(entry.path, this.anchorPath(entry.path), entry.content, response);
 prepared.push({ path: entry.path, content: entry.content, token: response.token, descriptor, preimage, committed: false, commit_confirmed: false });
+inFlightPrepare = null;
+prepareRequestDispatched = false;
 }
 const receipts = prepared.map((entry) => this.makeWriteReceipt(entry.path, entry.descriptor, entry.preimage));
 options.beforePublish?.(receipts);
@@ -5977,6 +6008,7 @@ for (const entry of prepared) {
 // Once commit is requested this operation owns the target even if the
 // response transport fails; the planned descriptor is the only safe
 // postimage identity available for exact compensation.
+publicationStarted = true;
 entry.committed = true;
 const response = this.runDescriptorHelper<PinnedWriteDescriptorResponse>("commit_prepared_write", {
 token: entry.token,
@@ -6026,7 +6058,27 @@ return prepared.map((entry) => ({ descriptor: entry.descriptor, preimage: entry.
 // fresh helper request, observe the stale group, and prematurely finish
 // or roll back a transaction whose progress is still unresolved. The
 // next open/operation performs grouped classification and recovery.
-if (durableBatch && prepared.length === 0) {
+if (durableBatch && batchId && (!publicationStarted || prepareRequestDispatched || inFlightPrepare !== null)) {
+let prepareClean = false;
+this.resetDarwinHelperForCompensation();
+try {
+const recovery = this.runDescriptorHelper<{ recovered?: unknown; absent_clean?: unknown }>("recover_prepared_batch", { batch_id: batchId, entries: batchManifest ?? [], abort_prepared: true });
+prepareClean = recovery.recovered === true || recovery.absent_clean === true;
+} catch { /* retain the live ID until durable cleanup is proven */ }
+if (!prepareClean) {
+let residueAbsent = false;
+if (batchManifest) {
+try { residueAbsent = this.durableBatchResidueAbsent(batchId, batchManifest); } catch { residueAbsent = false; }
+}
+if (!residueAbsent) throw new PinnedRootError("recovery_required", "durable prepared batch cleanup could not be proven after prepare response failure");
+prepareClean = true;
+}
+if (prepareClean) removeLiveDarwinBatch(this.rootPathDigest, batchId);
+prepareFailureRecovered = true;
+prepareRequestDispatched = false;
+inFlightPrepare = null;
+}
+if (durableBatch && prepared.length === 0 && !prepareFailureRecovered) {
 if (batchId) {
 this.resetDarwinHelperForCompensation();
 try {
@@ -6048,6 +6100,7 @@ throw new PinnedRootError("recovery_required", "durable prepared batch cleanup c
 }
 throw error;
 }
+if (prepareFailureRecovered) throw error;
 if (durableBatch && prepared.length > 0 && error instanceof PinnedRootError && error.code === "unsupported") throw error;
 let rollbackComplete = true;
 let abortComplete = true;
