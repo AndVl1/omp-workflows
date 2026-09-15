@@ -886,13 +886,17 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
     if (!rootStable()) return false;
     if (replaceExisting) {
       renameSync(temporary, join(descriptorRoot, name));
+      temporary = null;
+      published = true;
+      options.onPublished?.();
     } else {
-      linkSync(temporary, join(descriptorRoot, name));
-      unlinkSync(temporary);
+      const linkedTemporary = temporary;
+      linkSync(linkedTemporary, join(descriptorRoot, name));
+      temporary = null;
+      published = true;
+      options.onPublished?.();
+      try { unlinkSync(linkedTemporary); } catch { /* final link is already published and receipt-owned */ }
     }
-    temporary = null;
-    published = true;
-    options.onPublished?.();
     fsyncSync(root.fd);
     return rootStable();
   } catch {
