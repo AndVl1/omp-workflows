@@ -127,12 +127,32 @@ function assertSessionRoot(session: ObservabilityRecorderSession, pinnedRoot: Pi
   if (session.identity.canonicalRoot !== pinnedRoot.canonical_root || session.identity.rootDev !== pinnedRoot.dev || session.identity.rootIno !== pinnedRoot.ino) throw new PinnedRootError("changed", "observability session root identity changed");
 }
 
+export function observabilitySessionGeneration(ctx: unknown): string | number | undefined {
+  if (!ctx || typeof ctx !== "object") return undefined;
+  const record = ctx as { sessionManager?: unknown; generation?: unknown };
+  const manager = record.sessionManager;
+  const valid = (value: unknown): value is string | number => (typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 4096 && !value.includes("\0") && !value.includes("\r") && !value.includes("\n")) || (typeof value === "number" && Number.isSafeInteger(value));
+  if (manager && typeof manager === "object") {
+    for (const methodName of ["getSessionGeneration", "getGeneration", "getSessionVersion"] as const) {
+      const method = (manager as Record<string, unknown>)[methodName];
+      if (typeof method !== "function") continue;
+      try { const value = method.call(manager); if (valid(value)) return value; } catch { return undefined; }
+    }
+    for (const key of ["sessionGeneration", "session_generation", "generation"] as const) {
+      const value = (manager as Record<string, unknown>)[key];
+      if (valid(value)) return value;
+    }
+    return undefined;
+  }
+  return valid(record.generation) ? record.generation : undefined;
+}
+
 function sessionContextMatches(session: ObservabilityRecorderSession, ctx: unknown): boolean {
   if (!ctx || typeof ctx !== "object") return session.identity.sessionId === undefined && session.identity.sessionFile === undefined && session.identity.generation === undefined;
   const record = ctx as { sessionId?: unknown; sessionFile?: unknown; generation?: unknown; sessionManager?: { getSessionId?: () => unknown; getSessionFile?: () => unknown } };
   const sessionId = typeof record.sessionId === "string" ? record.sessionId : typeof record.sessionManager?.getSessionId === "function" ? record.sessionManager.getSessionId() : undefined;
   const sessionFile = typeof record.sessionFile === "string" ? record.sessionFile : typeof record.sessionManager?.getSessionFile === "function" ? record.sessionManager.getSessionFile() : undefined;
-  const generation = typeof record.generation === "string" || typeof record.generation === "number" ? record.generation : undefined;
+  const generation = observabilitySessionGeneration(ctx);
   if (session.identity.sessionId !== undefined && sessionId !== session.identity.sessionId) return false;
   if (session.identity.sessionFile !== undefined && sessionFile !== session.identity.sessionFile) return false;
   if (session.identity.generation !== undefined && generation !== session.identity.generation) return false;

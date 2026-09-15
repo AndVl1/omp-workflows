@@ -8,14 +8,14 @@
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { createObservabilityRecorderSession, createObservabilityRecorderSessionForCwd, closeObservabilityRecorderSession, observabilityHooks, type ObservabilityRecorderOwnerIdentity, type ObservabilityRecorderSession } from "./hooks.js";
+import { createObservabilityRecorderSession, createObservabilityRecorderSessionForCwd, closeObservabilityRecorderSession, observabilityHooks, observabilitySessionGeneration, type ObservabilityRecorderOwnerIdentity, type ObservabilityRecorderSession } from "./hooks.js";
 
 function sessionIdentityFromContext(ctx: unknown): { sessionId?: string; sessionFile?: string; generation?: string | number } {
   if (!ctx || typeof ctx !== "object") return {};
   const record = ctx as { sessionId?: unknown; sessionFile?: unknown; generation?: unknown; sessionManager?: { getSessionId?: () => unknown; getSessionFile?: () => unknown } };
   const sessionId = typeof record.sessionId === "string" ? record.sessionId : typeof record.sessionManager?.getSessionId === "function" ? record.sessionManager.getSessionId() : undefined;
   const sessionFile = typeof record.sessionFile === "string" ? record.sessionFile : typeof record.sessionManager?.getSessionFile === "function" ? record.sessionManager.getSessionFile() : undefined;
-  const generation = typeof record.generation === "string" || typeof record.generation === "number" ? record.generation : undefined;
+  const generation = observabilitySessionGeneration(ctx);
   return { ...(typeof sessionId === "string" ? { sessionId } : {}), ...(typeof sessionFile === "string" ? { sessionFile } : {}), ...(generation !== undefined ? { generation } : {}) };
 }
 
