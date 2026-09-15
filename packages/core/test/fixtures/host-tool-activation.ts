@@ -10,10 +10,16 @@ import {
   type TestRegistryRegistration,
 } from "./registry-activation.js";
 
+type TeamSessionCaptureState = {
+  controller?: TeamSessionBindingController;
+  closed: boolean;
+};
 type RetainedTestTeamSession = {
+  readonly state: TeamSessionCaptureState;
   readonly controller: TeamSessionBindingController;
   readonly bindings: Map<string, TeamSessionRuntimeBinding>;
 };
+const activeTestTeamCaptures = new Set<TeamSessionCaptureState>();
 const retainedTestTeamSessions = new Set<RetainedTestTeamSession>();
 const retainedBindingIdentities = new WeakMap<object, number>();
 let nextRetainedBindingIdentity = 0;
@@ -31,30 +37,56 @@ function retainedBindingKey(binding: TeamSessionRuntimeBinding): string {
 }
 
 function retainBinding(
-  controller: TeamSessionBindingController,
-  binding: TeamSessionRuntimeBinding | null,
+  state: TeamSessionCaptureState,
+  binding: TeamSessionRuntimeBinding,
 ): void {
-  if (!binding) return;
-  const retained = [...retainedTestTeamSessions].find((candidate) => candidate.controller === controller);
+  if (state.closed) return;
+  const controller = state.controller;
+  if (!controller) return;
+  const retained = [...retainedTestTeamSessions].find((candidate) => candidate.state === state);
   if (retained) {
     retained.bindings.set(retainedBindingKey(binding), binding);
     return;
   }
   retainedTestTeamSessions.add({
+    state,
     controller,
     bindings: new Map([[retainedBindingKey(binding), binding]]),
   });
 }
 
+function releaseBinding(
+  controller: TeamSessionBindingController,
+  binding: TeamSessionRuntimeBinding,
+  onError?: (error: unknown) => void,
+): void {
+  let released = false;
+  try {
+    released = controller.release(binding);
+  } catch (error) {
+    onError?.(error);
+  }
+  if (released) return;
+  try { binding.runtimeAccess.close(); } catch (error) { onError?.(error); }
+  try { revokeCtoRuntimeSessionAuthority(binding.runtimeAuthority); } catch (error) { onError?.(error); }
+  try { closeRegistryRegistrationContext(binding.registryContext); } catch (error) { onError?.(error); }
+}
+
 function safeCaptureBinding(
   root: string,
-  controller: TeamSessionBindingController | undefined,
+  state: TeamSessionCaptureState,
   context: unknown,
 ): void {
-  if (!controller || !existsSync(root)) return;
+  const controller = state.controller;
+  if (!controller) return;
   try {
-    const binding = controller.current(context) ?? controller.current(TEST_CONTEXT(root));
-    retainBinding(controller, binding);
+    const binding = controller.current(context) ?? (existsSync(root) ? controller.current(TEST_CONTEXT(root)) : null);
+    if (!binding) return;
+    if (state.closed) {
+      releaseBinding(controller, binding);
+      return;
+    }
+    retainBinding(state, binding);
   } catch {
     // The session handler's result/throw semantics must not change because
     // fixture evidence capture is best-effort after the handler has run.
@@ -125,16 +157,27 @@ function installSessionStartInterceptor(
 
 /** Release exact mounted test-session runtime capabilities before registry fixtures close. */
 export function closeRetainedTestTeamSessions(): void {
-  for (const session of [...retainedTestTeamSessions]) {
-    for (const binding of [...session.bindings.values()].reverse()) {
-      if (!session.controller.release(binding)) {
-        binding.runtimeAccess.close();
-        revokeCtoRuntimeSessionAuthority(binding.runtimeAuthority);
-        closeRegistryRegistrationContext(binding.registryContext);
-      }
+  const captures = [...activeTestTeamCaptures];
+  for (const state of captures) state.closed = true;
+  activeTestTeamCaptures.clear();
+  const sessions = [...retainedTestTeamSessions];
+  retainedTestTeamSessions.clear();
+  let firstError: unknown;
+  let hasError = false;
+  const rememberError = (error: unknown): void => {
+    if (!hasError) {
+      firstError = error;
+      hasError = true;
     }
-    retainedTestTeamSessions.delete(session);
+  };
+  for (const session of sessions) {
+    for (const binding of [...session.bindings.values()].reverse()) {
+      releaseBinding(session.controller, binding, rememberError);
+    }
+    session.bindings.clear();
   }
+  retainedTestTeamSessions.clear();
+  if (hasError) throw firstError;
 }
 
 nodeTestAfterEach(() => closeRetainedTestTeamSessions());
@@ -186,18 +229,20 @@ export function registerTestTeamWorkflow(
 ): void {
   writeTestRegistryMarker(root);
   const registration = openTestRegistry(root, ["workflow_profiles", "constitution_gate", "runtime_config"], ownerId, ["workflow_registration", "config_writer"]);
-  let controller: TeamSessionBindingController | undefined;
-  const restoreOn = installSessionStartInterceptor(pi, (context) => safeCaptureBinding(root, controller, context));
+  const captureState: TeamSessionCaptureState = { closed: false };
+  activeTestTeamCaptures.add(captureState);
+  let restoreOn: () => void = () => undefined;
   try {
+    restoreOn = installSessionStartInterceptor(pi, (context) => safeCaptureBinding(root, captureState, context));
     const installGate = registerTeamWorkflow(pi, {
       ...options,
       cwd: root,
       owner: () => registration.owner,
       registrationToken: registration.token,
       onSessionBindingController: (candidate) => {
-        controller = candidate;
-        safeCaptureBinding(root, controller, TEST_CONTEXT(root));
-        options.onSessionBindingController?.(controller);
+        captureState.controller = candidate;
+        safeCaptureBinding(root, captureState, TEST_CONTEXT(root));
+        options.onSessionBindingController?.(candidate);
       },
     });
     if (installGate) installGate();
