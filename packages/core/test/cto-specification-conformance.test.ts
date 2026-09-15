@@ -1088,6 +1088,9 @@ test("direct CTO persistence gates pending, failed, wrong-run, and stale termina
 
   const staleDigest = makeFixture();
   try {
+    const canonicalRoot = realpathSync(staleDigest.root);
+    staleDigest.prepared.evidence = staleDigest.prepared.evidence.map((item) =>
+      persistedEvidence(canonicalRoot, staleDigest.feature.feature.feature_id, item));
     staleDigest.updateTeam((team) => { team.completion_envelope = { ...team.completion_envelope!, emitted_at: "2026-01-02T00:00:00.000Z" }; });
     const result = staleDigest.invoke();
     assert.equal(result.status, "blocked");
