@@ -37,7 +37,7 @@ import {
   writeCtoStateLocked,
 } from "../cto/state.js";
 import { isCtoSpecificationSafeId, MAX_CTO_SPECIFICATION_AGGREGATE_BYTES, MAX_CTO_SPECIFICATION_REQUESTS, MAX_CTO_SPECIFICATION_TEXT_BYTES, MAX_DECOMPOSITION_DEPTH, MAX_TEAMS, type CtoState, type TeamDef } from "../cto/types.js";
-import { reconcileCtoSpecificationExecutionTeams, type CtoSpecificationPreparationTeam } from "../cto/specification-execution.js";
+import { reconcileCtoSpecificationExecutionTeams, type CtoSpecificationExecutionMappingAuthority, type CtoSpecificationPreparationTeam } from "../cto/specification-execution.js";
 import type { ModelClassification } from "../engine/run.js";
 import { parseAutonomousDirective } from "./envelope.js";
 import { renderConstitutionImpactToolContract, renderConstitutionToolContract } from "./constitution.js";
@@ -5499,19 +5499,29 @@ export function reconcileAndTerminalizeCtoSpecificationExecutionTeams(
     if (mapping.value.mapping.mapping_hash !== selectors.mapping_hash || mapping.value.mapping.status !== "confirmed") {
       return { status: "blocked", terminalized_team_ids: [], failed_team_ids: [], findings: ["CTO conformance reconciliation requires the exact confirmed mapping record"] };
     }
+    const mappingRecordPath = pinnedRoot.relativePath(mapping.value.record_path);
+    const execution = (mapping.value.mapping as CtoSpecificationMapping & { execution?: { choice?: unknown; wave_id?: unknown } }).execution;
+    if (!mappingRecordPath || !execution || typeof execution.wave_id !== "string") {
+      return { status: "blocked", terminalized_team_ids: [], failed_team_ids: [], findings: ["CTO conformance reconciliation requires the exact execution wave binding"] };
+    }
+    const expectedMappingAuthority: CtoSpecificationExecutionMappingAuthority = {
+      mapping_record_path: mappingRecordPath,
+      mapping_record_digest: mapping.value.record_digest,
+      mapping_id: mapping.value.mapping.mapping_id,
+      mapping_hash: mapping.value.mapping.mapping_hash,
+      mapping: mapping.value.mapping,
+      wave_id: execution.wave_id,
+    };
     const reconciled = reconcileCtoSpecificationExecutionTeams(root, selectors.cto_run_id, {
       runtimeAccess: options.runtimeAccess,
       sessionId: options.sessionId,
       pinnedRoot,
+      expected_mapping_authority: expectedMappingAuthority,
     });
     if (reconciled.status === "blocked") {
       return { status: "blocked", terminalized_team_ids: [], failed_team_ids: [], findings: reconciled.findings };
     }
     assertCtoSpecificationRuntime(options, root, pinnedRoot);
-    const execution = (mapping.value.mapping as CtoSpecificationMapping & { execution?: { wave_id?: unknown } }).execution;
-    if (!execution || typeof execution.wave_id !== "string") {
-      return { status: "blocked", terminalized_team_ids: [], failed_team_ids: [], findings: ["CTO conformance reconciliation requires the exact execution wave binding"] };
-    }
     const terminalized = terminalizeCtoDependencyBlockedTeams(
       options.runtimeAccess,
       root,
@@ -6059,17 +6069,26 @@ export async function dispatchCtoSpecificationMapping(
     if (mappingConfirmationRequired(mapping.value)) return blockedExecution(["mapping confirmation is required before execution dispatch"]);
     const constitutionFindings = ensureCtoExecutionConstitutions(root, mapping.value.selections, pinnedRoot);
     if (constitutionFindings.length > 0) return blockedExecution(constitutionFindings);
+    const mappingRecordPath = pinnedRoot.relativePath(mapping.value.record_path);
+    const executionForTerminalization = (mapping.value.mapping as CtoSpecificationMapping & { execution?: { choice?: unknown; wave_id?: unknown } }).execution;
+    if (!mappingRecordPath || !executionForTerminalization || typeof executionForTerminalization.wave_id !== "string") return blockedExecution(["CTO dispatch requires the exact execution wave binding before dependency terminalization"]);
+    const expectedMappingAuthority: CtoSpecificationExecutionMappingAuthority = {
+      mapping_record_path: mappingRecordPath,
+      mapping_record_digest: mapping.value.record_digest,
+      mapping_id: mapping.value.mapping.mapping_id,
+      mapping_hash: mapping.value.mapping.mapping_hash,
+      mapping: mapping.value.mapping,
+      wave_id: executionForTerminalization.wave_id,
+    };
     // Heal only authenticated terminal task receipts before taking the
     // dispatch lock. The reconciler owns its RuntimeAccess transaction; the
     // dispatch transaction below rereads the resulting durable CTO state.
-    const reconciled = reconcileCtoSpecificationExecutionTeams(root, input.cto_run_id, { runtimeAccess, pinnedRoot, sessionId: options.sessionId });
+    const reconciled = reconcileCtoSpecificationExecutionTeams(root, input.cto_run_id, { runtimeAccess, pinnedRoot, sessionId: options.sessionId, expected_mapping_authority: expectedMappingAuthority });
     if (reconciled.status === "blocked") return blockedExecution(reconciled.findings);
     // Dependency terminalization owns a separate authenticated transaction and
     // must complete before the dispatch run lock is acquired. The locked
     // dispatch seam then rereads the exact postimage and cannot deadlock by
     // re-entering RuntimeAccess.withRunTransaction.
-    const executionForTerminalization = (mapping.value.mapping as CtoSpecificationMapping & { execution?: { wave_id?: unknown } }).execution;
-    if (!executionForTerminalization || typeof executionForTerminalization.wave_id !== "string") return blockedExecution(["CTO dispatch requires the exact execution wave binding before dependency terminalization"]);
     const failedTerminalization = terminalizeCtoDependencyBlockedTeams(
       runtimeAccess,
       root,
@@ -6473,7 +6492,22 @@ export function closeCtoSpecificationExecutionWave(
         )) {
         return blockedCtoWaveClose(["mapping is not the exact confirmed execution image for the requested wave"]);
       }
-      const reconciled = reconcileCtoSpecificationExecutionTeams(root, input.cto_run_id, { runtimeAccess, pinnedRoot, sessionId: options.sessionId });
+      const mappingRecordPath = pinnedRoot.relativePath(mappingForTerminalization.value.record_path);
+      if (!mappingRecordPath) return blockedCtoWaveClose(["canonical mapping record path is outside the pinned project root"]);
+      const expectedMappingAuthority: CtoSpecificationExecutionMappingAuthority = {
+        mapping_record_path: mappingRecordPath,
+        mapping_record_digest: mappingForTerminalization.value.record_digest,
+        mapping_id: mappingForExecution.mapping_id,
+        mapping_hash: mappingForExecution.mapping_hash,
+        mapping: mappingForExecution,
+        wave_id: executionForTerminalization.wave_id,
+      };
+      const reconciled = reconcileCtoSpecificationExecutionTeams(root, input.cto_run_id, {
+        runtimeAccess,
+        pinnedRoot,
+        sessionId: options.sessionId,
+        expected_mapping_authority: expectedMappingAuthority,
+      });
       if (reconciled.status === "blocked") return blockedCtoWaveClose(reconciled.findings);
       const failedTerminalization = terminalizeCtoDependencyBlockedTeams(
         runtimeAccess,

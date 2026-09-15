@@ -28,6 +28,7 @@ import {
 import type {
   CtoSpecificationPreparationFileImage,
   CtoSpecificationPreparationTransaction,
+  CtoSpecificationMapping,
   CtoState,
   TeamDef,
   WorktreeStrategy,
@@ -39,7 +40,8 @@ import type { FeatureWorkspace, ImplementationHandoff } from "../specification/t
 import { resolveFeatureWorkspace } from "../specification/workspace.js";
 import { readCurrentExecutionClaim } from "../specification/claims.js";
 import { readCanonicalHandoff } from "../specification/canonical-reader.js";
-import { canonicalJson, digestOf } from "../specification/validation.js";
+import { canonicalJson, digestOf, isSafeRelativePath, isSha256Hex } from "../specification/validation.js";
+import { readPinnedCtoMappingRecord } from "../specification/mapping-record.js";
 import { PinnedProjectRoot, PinnedRootError, type PinnedRootFileExpectation } from "../specification/pinned-root.js";
 import { readPinnedCurrentConstitution } from "../specification/constitution-identities.js";
 import { currentConstitutionPersistenceIssue } from "../specification/prerequisite.js";
@@ -156,10 +158,29 @@ export type CtoSpecificationExecutionTeamReconciliationResult = {
   status: "reconciled"; reconciled_team_ids: string[]; findings: string[];
 } | { status: "blocked"; reconciled_team_ids: string[]; findings: string[] };
 
+export interface CtoSpecificationExecutionMappingAuthority {
+  mapping_record_path: string;
+  mapping_record_digest: string;
+  mapping_id: string;
+  mapping_hash: string;
+  mapping: CtoSpecificationMapping & {
+    execution_choice?: string;
+    execution?: {
+      choice?: string;
+      wave_id?: string;
+      source_id?: string;
+      capability_id?: string;
+      capability_epoch?: string;
+    };
+  };
+  wave_id: string;
+}
+
 export interface ReconcileCtoSpecificationExecutionTeamsOptions {
   runtimeAccess: CtoRuntimeAccessFacade;
   sessionId: string;
   pinnedRoot?: PinnedProjectRoot;
+  expected_mapping_authority?: CtoSpecificationExecutionMappingAuthority;
 }
 
 export interface CtoSpecificationTaskAuthorizationEvent {
@@ -1214,6 +1235,71 @@ function replayResult(
   };
 }
 
+function ctoReconciliationMappingAuthorityError(
+  pinnedRoot: PinnedProjectRoot,
+  ctoRunId: string,
+  authority: CtoSpecificationExecutionMappingAuthority,
+  state: CtoState,
+): string | null {
+  if (!isSafeRelativePath(authority.mapping_record_path)
+    || !isSha256Hex(authority.mapping_record_digest)
+    || !isSafeCtoExecutionId(authority.mapping_id)
+    || !isSha256Hex(authority.mapping_hash)
+    || !authority.mapping
+    || authority.mapping.mapping_id !== authority.mapping_id
+    || authority.mapping.mapping_hash !== authority.mapping_hash
+    || authority.mapping.status !== "confirmed"
+    || authority.mapping.execution_choice !== "cto"
+    || !authority.mapping.execution
+    || authority.mapping.execution.choice !== "cto"
+    || authority.mapping.execution.wave_id !== authority.wave_id
+    || typeof authority.mapping.execution.source_id !== "string"
+    || typeof authority.mapping.execution.capability_id !== "string"
+    || typeof authority.mapping.execution.capability_epoch !== "string"
+    || !isSafeCtoExecutionId(authority.wave_id)) {
+    return "CTO reconciliation expected mapping authority is invalid";
+  }
+  const loaded = readPinnedCtoMappingRecord(pinnedRoot, authority.mapping_record_path, ctoRunId, authority.mapping_id);
+  if (!loaded.ok) return `CTO reconciliation mapping authority is unreadable: ${loaded.error}`;
+  const record = loaded.value.record as { cto_run_id?: unknown; mapping?: unknown };
+  const mapping = record.mapping as CtoSpecificationExecutionMappingAuthority["mapping"] | undefined;
+  if (record.cto_run_id !== ctoRunId
+    || loaded.value.digest !== authority.mapping_record_digest
+    || !mapping
+    || mapping.mapping_id !== authority.mapping_id
+    || mapping.mapping_hash !== authority.mapping_hash
+    || mapping.status !== "confirmed"
+    || mapping.execution_choice !== "cto"
+    || !mapping.execution
+    || mapping.execution.choice !== "cto"
+    || mapping.execution.wave_id !== authority.wave_id
+    || mapping.execution.source_id !== authority.mapping.execution.source_id
+    || mapping.execution.capability_id !== authority.mapping.execution.capability_id
+    || mapping.execution.capability_epoch !== authority.mapping.execution.capability_epoch
+    || canonicalJson(mapping) !== canonicalJson(authority.mapping)) {
+    return "CTO reconciliation mapping changed after outer authorization; retry with the current immutable mapping record";
+  }
+  const activeWave = state.wave_history?.find((candidate) => candidate.id === authority.wave_id && candidate.status === "active" && candidate.source === "specification-execution");
+  const execution = mapping.execution;
+  if (!activeWave || state.active_wave_id !== authority.wave_id
+    || execution.source_id !== activeWave.source_id
+    || execution.capability_id !== activeWave.work_identity?.capability_id
+    || execution.capability_epoch !== activeWave.work_identity?.capability_epoch) {
+    return "CTO reconciliation execution wave changed after outer authorization; retry with the current immutable mapping record";
+  }
+  const teamById = new Map(state.teams.map((team) => [team.id, team]));
+  for (const owner of authority.mapping.task_to_slice) {
+    const team = teamById.get(owner.team_id);
+    const identity = team?.work_identity;
+    if (!team || team.slice_id !== owner.slice_id || team.feature_id !== owner.feature_id || team.task_id !== owner.task_id
+      || !identity || identity.run_id !== state.id || identity.wave_id !== authority.wave_id
+      || identity.slice_id !== owner.slice_id || identity.task_id !== owner.task_id) {
+      return `CTO reconciliation team binding is stale for slice ${owner.slice_id}`;
+    }
+  }
+  return null;
+}
+
 /** Reconcile trusted terminal task receipts before dependency scheduling. */
 export function reconcileCtoSpecificationExecutionTeams(projectRoot: string, ctoRunId: string, options: ReconcileCtoSpecificationExecutionTeamsOptions): CtoSpecificationExecutionTeamReconciliationResult {
   const pinnedRoot = options?.pinnedRoot ?? PinnedProjectRoot.open(projectRoot);
@@ -1311,7 +1397,14 @@ export function reconcileCtoSpecificationExecutionTeams(projectRoot: string, cto
       }
       if (findings.length > 0) return { status: "blocked", reconciled_team_ids: [], findings };
       for (const update of updates) { update.team.completion_envelope = update.envelope; delete update.team.pending; setTeamStatus(state, update.team.id, update.status); }
-      if (updates.length > 0) transaction.writeState(state);
+      if (updates.length > 0) {
+        const authority = options.expected_mapping_authority;
+        if (authority) {
+          const authorityError = ctoReconciliationMappingAuthorityError(pinnedRoot, ctoRunId, authority, state);
+          if (authorityError) return { status: "blocked", reconciled_team_ids: [], findings: [authorityError] };
+        }
+        transaction.writeState(state);
+      }
       return { status: "reconciled", reconciled_team_ids: updates.map((update) => update.team.id), findings: [] };
     });
   } catch (error) {
