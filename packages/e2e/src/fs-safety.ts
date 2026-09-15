@@ -539,8 +539,24 @@ export function unlinkPinnedFileIfExact(
   const digest = createHash('sha256').update(expected).digest('hex');
   const descriptorRoot = descriptorPathFor(root.fd);
   if (descriptorRoot === null) return false;
-  const restoreLinuxQuarantine = (): boolean => {
-    if (!verifyDescriptorFile(quarantine)) return false;
+  const descriptorIdentity = (entry: string): { readonly dev: number; readonly ino: number } | null => {
+    let fd: number | null = null;
+    try {
+      fd = openSync(join(descriptorRoot, entry), fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+      const info = fstatSync(fd);
+      return info.isFile() && info.nlink === 1 ? { dev: info.dev, ino: info.ino } : null;
+    } catch {
+      return null;
+    } finally {
+      if (fd !== null) {
+        try { closeSync(fd); } catch { /* best effort */ }
+      }
+    }
+  };
+  const restoreLinuxQuarantine = (expectedIdentity: { readonly dev: number; readonly ino: number } | null): boolean => {
+    const currentIdentity = descriptorIdentity(quarantine);
+    if (expectedIdentity === null || currentIdentity === null
+      || currentIdentity.dev !== expectedIdentity.dev || currentIdentity.ino !== expectedIdentity.ino) return false;
     try {
       linkSync(join(descriptorRoot, quarantine), join(descriptorRoot, name));
       unlinkSync(join(descriptorRoot, quarantine));
@@ -576,17 +592,14 @@ export function unlinkPinnedFileIfExact(
     testHooks?.beforeExactQuarantine?.(join(root.lexicalPath, name));
     const moved = runDarwinHelper(root, 'quarantine_if_exact', { name, quarantine, size: expected.length, sha256: digest });
     if (moved?.quarantined !== true) {
-      if (moved?.moved === true) {
-        runDarwinHelper(root, 'restore_quarantine', { quarantine, name, size: expected.length, sha256: digest });
+      if (moved?.moved === true && Number.isSafeInteger(moved.dev) && Number.isSafeInteger(moved.ino)) {
+        runDarwinHelper(root, 'restore_quarantine', { quarantine, name, expected_dev: moved.dev, expected_ino: moved.ino });
       }
       return false;
     }
     const quarantineDev = moved.dev;
     const quarantineIno = moved.ino;
-    if (!Number.isSafeInteger(quarantineDev) || !Number.isSafeInteger(quarantineIno)) {
-      runDarwinHelper(root, 'restore_quarantine', { quarantine, name, size: expected.length, sha256: digest });
-      return false;
-    }
+    if (!Number.isSafeInteger(quarantineDev) || !Number.isSafeInteger(quarantineIno)) return false;
     testHooks?.beforeTargetRename?.(join(root.lexicalPath, name));
     return runDarwinHelper(root, 'unlink_quarantine', { quarantine, size: expected.length, sha256: digest, expected_dev: quarantineDev, expected_ino: quarantineIno })?.removed === true;
   }
@@ -597,12 +610,17 @@ export function unlinkPinnedFileIfExact(
   } catch {
     return false;
   }
+  const movedIdentity = descriptorIdentity(quarantine);
+  if (movedIdentity === null) return false;
   if (!verifyDescriptorFile(quarantine)) {
-    restoreLinuxQuarantine();
+    restoreLinuxQuarantine(movedIdentity);
     return false;
   }
   testHooks?.beforeTargetRename?.(join(root.lexicalPath, name));
-  if (!verifyDescriptorFile(quarantine)) return false;
+  if (!verifyDescriptorFile(quarantine)) {
+    restoreLinuxQuarantine(movedIdentity);
+    return false;
+  }
   try {
     unlinkSync(join(descriptorRoot, quarantine));
     return true;
@@ -1335,18 +1353,25 @@ def quarantine_if_exact(name, quarantine, size, digest):
         os.rename(name, quarantine, src_dir_fd=3, dst_dir_fd=3)
     except FileNotFoundError:
         return {"quarantined": False, "moved": False}
-    if not _verify_exact(quarantine, size, digest): return {"quarantined": False, "moved": True}
     try:
         fd, info = open_regular(quarantine, os.O_RDONLY)
         os.close(fd)
+        moved_dev, moved_ino = info.st_dev, info.st_ino
     except OSError:
         return {"quarantined": False, "moved": True}
-    return {"quarantined": True, "moved": True, "dev": info.st_dev, "ino": info.st_ino}
+    if not _verify_exact(quarantine, size, digest): return {"quarantined": False, "moved": True, "dev": moved_dev, "ino": moved_ino}
+    return {"quarantined": True, "moved": True, "dev": moved_dev, "ino": moved_ino}
 
-def restore_quarantine(quarantine, name, size, digest):
+def restore_quarantine(quarantine, name, expected_dev, expected_ino):
     quarantine, name = safe_name(quarantine), safe_name(name)
-    if not isinstance(size, int) or size < 0 or size > MAX_WRITE or not isinstance(digest, str) or len(digest) != 64: fail("exact restore bounds are invalid")
-    if not _verify_exact(quarantine, size, digest): return {"restored": False}
+    if not isinstance(expected_dev, int) or not isinstance(expected_ino, int): fail("exact restore identity is invalid")
+    try:
+        fd, info = open_regular(quarantine, os.O_RDONLY)
+        current = os.fstat(fd)
+        os.close(fd)
+        if info.st_dev != expected_dev or info.st_ino != expected_ino or current.st_dev != expected_dev or current.st_ino != expected_ino: return {"restored": False}
+    except OSError:
+        return {"restored": False}
     try:
         os.link(quarantine, name, src_dir_fd=3, dst_dir_fd=3, follow_symlinks=False)
     except FileExistsError:
@@ -1386,7 +1411,7 @@ try:
     elif op == "publish": result = {"ok": True, **publish(payload.get("final"), payload.get("temporary"))}
     elif op == "publish_noreplace": result = {"ok": True, **publish_noreplace(payload.get("final"), payload.get("temporary"))}
     elif op == "quarantine_if_exact": result = {"ok": True, **quarantine_if_exact(payload.get("name"), payload.get("quarantine"), payload.get("size"), payload.get("sha256"))}
-    elif op == "restore_quarantine": result = {"ok": True, **restore_quarantine(payload.get("quarantine"), payload.get("name"), payload.get("size"), payload.get("sha256"))}
+    elif op == "restore_quarantine": result = {"ok": True, **restore_quarantine(payload.get("quarantine"), payload.get("name"), payload.get("expected_dev"), payload.get("expected_ino"))}
     elif op == "unlink_quarantine": result = {"ok": True, **unlink_quarantine(payload.get("quarantine"), payload.get("size"), payload.get("sha256"), payload.get("expected_dev"), payload.get("expected_ino"))}
     elif op == "cleanup": cleanup(payload.get("temporary")); result = {"ok": True}
     else: fail("unsupported operation")

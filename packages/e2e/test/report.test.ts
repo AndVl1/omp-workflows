@@ -1732,3 +1732,33 @@ test('report: identical preexisting evidence survives later transaction rollback
     rmSync(mdDir, { recursive: true, force: true });
   }
 });
+
+
+test('fs safety: final quarantine in-place mutation restores the moved inode', { skip: process.platform === 'darwin' }, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-final-quarantine-mutation-'));
+  const target = join(dir, 'target.txt');
+  const original = Buffer.from('original bytes');
+  const mutated = Buffer.from('mutated bytes');
+  writeFileSync(target, original);
+  const root = pinDirectory(dir);
+  assert.ok(root);
+  let mutatedInPlace = false;
+  setFsSafetyTestHooks({
+    beforeTargetRename(path) {
+      if (mutatedInPlace || path !== target) return;
+      const quarantine = readdirSync(dir).find(name => name.startsWith('.omp-unlink-'));
+      if (quarantine === undefined) return;
+      mutatedInPlace = true;
+      writeFileSync(join(dir, quarantine), mutated);
+    },
+  });
+  try {
+    assert.equal(unlinkPinnedFileIfExact(root, 'target.txt', original), false);
+    assert.equal(mutatedInPlace, true);
+    assert.deepEqual(readFileSync(target), mutated, 'same moved inode is restored without deleting changed bytes');
+  } finally {
+    setFsSafetyTestHooks(null);
+    closePinnedDirectory(root);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
