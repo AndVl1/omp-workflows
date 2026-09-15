@@ -6059,6 +6059,13 @@ return prepared.map((entry) => ({ descriptor: entry.descriptor, preimage: entry.
 // or roll back a transaction whose progress is still unresolved. The
 // next open/operation performs grouped classification and recovery.
 if (durableBatch && batchId && (!publicationStarted || prepareRequestDispatched || inFlightPrepare !== null)) {
+// Once a durable prefix exists, a lost in-flight prepare response may have
+// already persisted the suffix lease and stage. Do not abort the group
+// speculatively: retain every authenticated lease/journal for recovery.
+if (prepared.length > 0 && (prepareRequestDispatched || inFlightPrepare !== null)) {
+this.resetDarwinHelperForCompensation();
+throw new PinnedRootError("recovery_required", "durable prepared batch prepare response was lost after a durable prefix; grouped recovery is required");
+}
 let prepareClean = false;
 this.resetDarwinHelperForCompensation();
 try {
