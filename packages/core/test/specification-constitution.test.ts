@@ -338,6 +338,7 @@ function trustedDecision(
       options: [decision],
       session_id: "constitution-test-session",
       actor_ref: reference,
+      feature_id: selector.feature_id,
       profile_hash: answerState.profile_hash,
     });
     const trusted = recordTrustedCheckpointAnswer(answerState, {
