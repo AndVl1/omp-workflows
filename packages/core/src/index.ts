@@ -1960,7 +1960,7 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
     const rawContext = ctx && typeof ctx === "object" ? ctx as Record<string, unknown> : {};
     return dodBackstop(event, { ...rawContext, cwd } as { cwd: string });
   });
-  pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
+  pi.on("tool_call", async (event: ToolCallEvent, ctx: unknown) => {
     const cwd = resolveHookCwd(ctx);
     if (!cwd) return { block: true, reason: "workflow cwd unavailable" };
     const rawContext = ctx && typeof ctx === "object" ? ctx as Record<string, unknown> : {};
@@ -2116,9 +2116,9 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
       }
     }
     if (!result && opts.observability !== false) {
-      recordToolCallAttempt(cwd, event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }, "allowed");
+      await recordToolCallAttempt(cwd, event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }, "allowed");
     } else if (opts.observability !== false) {
-      recordToolCallAttempt(cwd, event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }, "blocked", result?.reason);
+      await recordToolCallAttempt(cwd, event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }, "blocked", result?.reason);
     }
     return result;
   });

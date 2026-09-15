@@ -127,6 +127,18 @@ function assertSessionRoot(session: ObservabilityRecorderSession, pinnedRoot: Pi
   if (session.identity.canonicalRoot !== pinnedRoot.canonical_root || session.identity.rootDev !== pinnedRoot.dev || session.identity.rootIno !== pinnedRoot.ino) throw new PinnedRootError("changed", "observability session root identity changed");
 }
 
+function sessionContextMatches(session: ObservabilityRecorderSession, ctx: unknown): boolean {
+  if (!ctx || typeof ctx !== "object") return session.identity.sessionId === undefined && session.identity.sessionFile === undefined && session.identity.generation === undefined;
+  const record = ctx as { sessionId?: unknown; sessionFile?: unknown; generation?: unknown; sessionManager?: { getSessionId?: () => unknown; getSessionFile?: () => unknown } };
+  const sessionId = typeof record.sessionId === "string" ? record.sessionId : typeof record.sessionManager?.getSessionId === "function" ? record.sessionManager.getSessionId() : undefined;
+  const sessionFile = typeof record.sessionFile === "string" ? record.sessionFile : typeof record.sessionManager?.getSessionFile === "function" ? record.sessionManager.getSessionFile() : undefined;
+  const generation = typeof record.generation === "string" || typeof record.generation === "number" ? record.generation : undefined;
+  if (session.identity.sessionId !== undefined && sessionId !== session.identity.sessionId) return false;
+  if (session.identity.sessionFile !== undefined && sessionFile !== session.identity.sessionFile) return false;
+  if (session.identity.generation !== undefined && generation !== session.identity.generation) return false;
+  return true;
+}
+
 function closeSession(session: ObservabilityRecorderSession): Promise<void> {
   if (session.closePromise) return session.closePromise;
   session.disposed = true;
@@ -146,14 +158,15 @@ export async function closeObservabilityRecorderSessionForCwd(session: Observabi
   return true;
 }
 
-function appendDirect(cwd: string, ev: Omit<ObservabilityEvent, "id" | "branch"> & { kind: EventKind }): void {
+function appendDirect(cwd: string, ev: Omit<ObservabilityEvent, "id" | "branch"> & { kind: EventKind }): Promise<void> {
   let pinnedRoot: PinnedProjectRoot;
-  try { pinnedRoot = exactRootFor(cwd); } catch { return; }
+  try { pinnedRoot = exactRootFor(cwd); } catch { return Promise.resolve(); }
   try {
     const recorder = new EventRecorder({ cwd, branch: currentBranch(cwd), featureSlug: activeFeatureSlug(pinnedRoot), pinnedRoot, ownsPinnedRoot: true });
     const operation = recorder.append(ev).then(() => recorder.closeAsync(), () => recorder.closeAsync()).catch(() => undefined);
     trackDirect(cwd, operation);
-  } catch { pinnedRoot.close(); }
+    return operation;
+  } catch { pinnedRoot.close(); return Promise.resolve(); }
 }
 
 function appendSession(session: ObservabilityRecorderSession, cwd: string, ev: Omit<ObservabilityEvent, "id" | "branch"> & { kind: EventKind }): void {
@@ -185,9 +198,12 @@ function safeAppend(
   cwd: string,
   ev: Omit<ObservabilityEvent, "id" | "branch"> & { kind: EventKind },
   session?: ObservabilityRecorderSession,
-): void {
-  if (session) appendSession(session, cwd, ev);
-  else appendDirect(cwd, ev);
+  ctx?: unknown,
+  allowDirect = true,
+): Promise<void> | undefined {
+  if (session) { if (!sessionContextMatches(session, ctx)) return undefined; appendSession(session, cwd, ev); return undefined; }
+  if (!allowDirect) return undefined;
+  return appendDirect(cwd, ev);
 }
 
 export function recordToolCallAttempt(
@@ -195,11 +211,11 @@ export function recordToolCallAttempt(
   event: { toolName?: string; toolCallId?: string; input?: unknown } & Partial<ObservabilitySignalFields>,
   decision: "allowed" | "blocked",
   reason?: string,
-): void {
+): Promise<void> | undefined {
   const toolName = typeof event.toolName === "string" ? event.toolName : undefined;
   if (!toolName) return;
   const { subagent, taskChars } = toolName === "task" ? subagentFromTaskInput(event.input) : {};
-  safeAppend(cwd, {
+  return safeAppend(cwd, {
     ...signalMetadata(event, undefined),
     kind: "tool_call",
     ts: new Date().toISOString(),
@@ -389,17 +405,17 @@ function sessionIdFrom(event: unknown, ctx: unknown): string | undefined {
 }
 
 export interface HookHandlers {
-  onBeforeAgentStart(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
-  onAgentStart(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
-  onAgentEnd(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
-  onToolCall(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
-  onToolResult(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
-  onSessionStart(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
-  onSessionStop(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession): void;
+  onBeforeAgentStart(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession, sessionRequired?: boolean): void;
+  onAgentStart(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession, sessionRequired?: boolean): void;
+  onAgentEnd(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession, sessionRequired?: boolean): void;
+  onToolCall(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession, sessionRequired?: boolean): void;
+  onToolResult(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession, sessionRequired?: boolean): void;
+  onSessionStart(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession, sessionRequired?: boolean): void;
+  onSessionStop(event: unknown, ctx: unknown, session?: ObservabilityRecorderSession, sessionRequired?: boolean): void;
 }
 
 export const observabilityHooks: HookHandlers = {
-  onBeforeAgentStart(event, ctx, session) {
+  onBeforeAgentStart(event, ctx, session, sessionRequired) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { systemPrompt?: string[] } | undefined;
@@ -409,18 +425,18 @@ export const observabilityHooks: HookHandlers = {
       kind: "before_agent_start",
       ts: new Date().toISOString(),
       skills,
-    }, session);
+    }, session, ctx, !sessionRequired);
   },
-  onAgentStart(event, ctx, session) {
+  onAgentStart(event, ctx, session, sessionRequired) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     safeAppend(cwd, {
       ...signalMetadata(event, ctx),
       kind: "agent_start",
       ts: new Date().toISOString(),
-    }, session);
+    }, session, ctx, !sessionRequired);
   },
-  onAgentEnd(event, ctx, session) {
+  onAgentEnd(event, ctx, session, sessionRequired) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { messages?: unknown[] } | undefined;
@@ -429,9 +445,9 @@ export const observabilityHooks: HookHandlers = {
       kind: "agent_end",
       ts: new Date().toISOString(),
       messageCount: Array.isArray(e?.messages) ? e.messages.length : 0,
-    }, session);
+    }, session, ctx, !sessionRequired);
   },
-  onToolCall(event, ctx, session) {
+  onToolCall(event, ctx, session, sessionRequired) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { toolName?: string; toolCallId?: string; input?: unknown } | undefined;
@@ -446,9 +462,9 @@ export const observabilityHooks: HookHandlers = {
       toolCallId: e?.toolCallId,
       subagent,
       subagentTaskChars: taskChars,
-    }, session);
+    }, session, ctx, !sessionRequired);
   },
-  onToolResult(event, ctx, session) {
+  onToolResult(event, ctx, session, sessionRequired) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     const e = event as { toolName?: string; toolCallId?: string; isError?: boolean } | undefined;
@@ -460,9 +476,9 @@ export const observabilityHooks: HookHandlers = {
       toolName: e.toolName,
       toolCallId: e.toolCallId,
       isError: e?.isError === true,
-    }, session);
+    }, session, ctx, !sessionRequired);
   },
-  onSessionStart(event, ctx, session) {
+  onSessionStart(event, ctx, session, sessionRequired) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     safeAppend(cwd, {
@@ -470,9 +486,9 @@ export const observabilityHooks: HookHandlers = {
       kind: "session_start",
       ts: new Date().toISOString(),
       sessionId: sessionIdFrom(event, ctx),
-    }, session);
+    }, session, ctx, !sessionRequired);
   },
-  onSessionStop(event, ctx, session) {
+  onSessionStop(event, ctx, session, sessionRequired) {
     const cwd = ctxCwd(ctx);
     if (!cwd) return;
     safeAppend(cwd, {
@@ -480,7 +496,7 @@ export const observabilityHooks: HookHandlers = {
       kind: "session_stop",
       ts: new Date().toISOString(),
       sessionId: sessionIdFrom(event, ctx),
-    }, session);
+    }, session, ctx, !sessionRequired);
   },
 };
 /** Re-export so consumers can read the pointer cheaply. */

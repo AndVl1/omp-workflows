@@ -25,6 +25,28 @@ function previousSessionFileFromEvent(event: unknown): string | undefined {
   return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
 }
 
+function previousSessionIdFromEvent(event: unknown): string | undefined {
+  if (!event || typeof event !== "object") return undefined;
+  const candidate = (event as { previousSessionId?: unknown }).previousSessionId;
+  return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+}
+
+function previousGenerationFromEvent(event: unknown): string | number | undefined {
+  if (!event || typeof event !== "object") return undefined;
+  const candidate = (event as { previousGeneration?: unknown }).previousGeneration;
+  return typeof candidate === "string" || typeof candidate === "number" ? candidate : undefined;
+}
+
+function switchMatchesSession(event: unknown, session: ObservabilityRecorderSession): boolean {
+  const previousSessionFile = previousSessionFileFromEvent(event);
+  if (previousSessionFile !== undefined && session.identity.sessionFile !== undefined && previousSessionFile !== session.identity.sessionFile) return false;
+  const previousSessionId = previousSessionIdFromEvent(event);
+  if (previousSessionId !== undefined && session.identity.sessionId !== undefined && previousSessionId !== session.identity.sessionId) return false;
+  const previousGeneration = previousGenerationFromEvent(event);
+  if (previousGeneration !== undefined && session.identity.generation !== undefined && previousGeneration !== session.identity.generation) return false;
+  return true;
+}
+
 function shutdownMatchesSession(ctx: unknown, session: ObservabilityRecorderSession): boolean {
   if (!ctx || typeof ctx !== "object") return false;
   const { sessionId, sessionFile, generation } = sessionIdentityFromContext(ctx);
@@ -62,33 +84,31 @@ export function registerObservabilityHooks(
     return run;
   };
   pi.on("before_agent_start", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onBeforeAgentStart(event, ctx, session);
+    observabilityHooks.onBeforeAgentStart(event, ctx, session, true);
   });
   pi.on("agent_start", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onAgentStart(event, ctx, session);
+    observabilityHooks.onAgentStart(event, ctx, session, true);
   });
   pi.on("agent_end", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onAgentEnd(event, ctx, session);
+    observabilityHooks.onAgentEnd(event, ctx, session, true);
   });
   if (opts.toolCall !== false) {
     pi.on("tool_call", (event: unknown, ctx: unknown) => {
-      observabilityHooks.onToolCall(event, ctx, session);
+      observabilityHooks.onToolCall(event, ctx, session, true);
     });
   }
   pi.on("tool_result", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onToolResult(event, ctx, session);
+    observabilityHooks.onToolResult(event, ctx, session, true);
   });
   pi.on("session_start", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onSessionStart(event, ctx, session);
+    observabilityHooks.onSessionStart(event, ctx, session, true);
   });
   pi.on("session_stop", (event: unknown, ctx: unknown) => {
-    observabilityHooks.onSessionStop(event, ctx, session);
+    observabilityHooks.onSessionStop(event, ctx, session, true);
   });
   pi.on("session_switch", async (event: unknown, ctx: unknown) => {
     await enqueueLifecycle(async () => {
-      if (!session || session.disposed) return;
-      const previousSessionFile = previousSessionFileFromEvent(event);
-      if (previousSessionFile !== undefined && session.identity.sessionFile !== previousSessionFile) return;
+      if (!session || session.disposed || !switchMatchesSession(event, session)) return;
       const cwd = typeof ctx === "object" && ctx !== null && "cwd" in ctx ? (ctx as { cwd?: unknown }).cwd : undefined;
       if (typeof cwd !== "string" || cwd.length === 0) return;
       const previous = session;
@@ -105,7 +125,9 @@ export function registerObservabilityHooks(
   if (!session) return undefined;
   let disposerPromise: Promise<void> | undefined;
   return (): Promise<void> => {
-    if (!disposerPromise) disposerPromise = closeObservabilityRecorderSession(session!);
+    if (!disposerPromise) disposerPromise = enqueueLifecycle(async () => {
+      if (session) await closeObservabilityRecorderSession(session);
+    });
     return disposerPromise;
   };
 }
