@@ -5090,8 +5090,12 @@ export function resumeCtoSpecificationMapping(
         }
         return blockedCtoMappingAsk(postWriteConstitutionError);
       }
-      assertRuntimeLive();
-      removeMappingTransactionPinned(pinnedRoot, mappingTransactionPath(transaction, pinnedRoot), persistedTransaction.wal_receipt);
+      try {
+        assertRuntimeLive();
+        commitDirectMappingTransactionPinned(root, persistedTransaction, pinnedRoot);
+      } catch (error) {
+        return blockedCtoMappingAsk(error instanceof Error ? error.message : String(error));
+      }
       return {
         status: "resumed",
         dispatched: false,
