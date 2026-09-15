@@ -3720,6 +3720,7 @@ function closeDarwinHelperSessionImmediately(session: DarwinHelperSession): void
   closeQuietly(session.requestFd);
   closeQuietly(session.responseFd);
   try { session.child.kill("SIGTERM"); } catch { /* preserve bounded teardown */ }
+  try { session.child.kill("SIGKILL"); } catch { /* preserve bounded teardown */ }
   removeDarwinHelperDirectory(session.directory);
 }
 
