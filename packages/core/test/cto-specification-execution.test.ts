@@ -686,15 +686,16 @@ function cleanupMountedConformanceTest(root: string): void {
   rmSync(root, { recursive: true, force: true });
 }
 
-function completeMountedCtoExecutionTeams(root: string, options: { concurrent?: boolean; featureIds?: readonly string[] } = {}): void {
+function completeMountedCtoExecutionTeams(root: string, options: { concurrent?: boolean; featureIds?: readonly string[]; failedFeatureIds?: readonly string[] } = {}): void {
   const state = readCtoState(RUN_ID, root);
   assert.ok(state, "completion fixture CTO state must be readable before host worker completion");
   if (!state) throw new Error("completion fixture CTO state unavailable before host worker completion");
   const hooks = mountedTaskHooks(root, DEFAULT_TEST_SESSION_ID);
   const context = { cwd: root, mode: "rpc", hasUI: true, sessionManager: TEST_SESSION_MANAGER } as never;
   TEST_SESSION_MANAGER.cwd = root;
-  const calls: Array<{ toolCallId: string }> = [];
+  const calls: Array<{ toolCallId: string; failed: boolean }> = [];
   const selectedFeatureIds = options.featureIds ? new Set(options.featureIds) : null;
+  const failedFeatureIds = options.failedFeatureIds ? new Set(options.failedFeatureIds) : null;
   for (const team of state.teams) {
     if (selectedFeatureIds && !selectedFeatureIds.has(team.feature_id ?? "")) continue;
     if (team.status === "done" || team.status === "failed") continue;
@@ -704,14 +705,14 @@ function completeMountedCtoExecutionTeams(root: string, options: { concurrent?: 
     const marker = buildCtoSliceMarker(RUN_ID, team.slice_id);
     const call = hooks.toolCall({ toolName: "task", toolCallId, input: { task: marker } }, context);
     assert.equal((call as Json | undefined)?.block, undefined, `completion fixture host marker must be admitted: ${JSON.stringify(call)}`);
-    calls.push({ toolCallId });
+    calls.push({ toolCallId, failed: failedFeatureIds?.has(team.feature_id ?? "") ?? false });
     if (!options.concurrent) {
-      hooks.toolResult({ toolName: "task", toolCallId, isError: false, content: [{ type: "text", text: "worker completed" }] }, context);
+      hooks.toolResult({ toolName: "task", toolCallId, isError: failedFeatureIds?.has(team.feature_id ?? "") ?? false, content: [{ type: "text", text: "worker completed" }] }, context);
     }
   }
   if (options.concurrent) {
-    for (const { toolCallId } of [...calls].reverse()) {
-      hooks.toolResult({ toolName: "task", toolCallId, isError: false, content: [{ type: "text", text: "worker completed" }] }, context);
+    for (const { toolCallId, failed } of [...calls].reverse()) {
+      hooks.toolResult({ toolName: "task", toolCallId, isError: failed, content: [{ type: "text", text: "worker completed" }] }, context);
     }
   }
   const terminal = readCtoState(RUN_ID, root);
@@ -6559,9 +6560,8 @@ test("replayed active claims survive a later admission failure", async () => {
     };
     const first = await dispatchCtoSpecificationMapping(root, { cto_run_id: RUN_ID, mapping_id: String(frozen.mapping_id), expected_mapping_hash: String(frozen.mapping_hash) }, preparationRuntimeOptions(root)) as unknown as Result;
     assert.equal(first.status, "dispatched", detail(first));
-    completeMountedCtoExecutionTeams(root, { featureIds: [failingFeature] });
+    completeMountedCtoExecutionTeams(root, { featureIds: [failingFeature], failedFeatureIds: [failingFeature] });
     setSliceStatus(String(aOwner.slice_id), "pending");
-    setSliceStatus(String(bOwner.slice_id), "pending");
     assert.equal((first.admitted_slices as string[]).length, 2, "the first dispatch admits both slices before the later failing admission");
     const firstClaims = readExecutionClaimStore(root, activeFeature);
     assert.equal(firstClaims.ok, true, firstClaims.ok ? "" : firstClaims.error);
