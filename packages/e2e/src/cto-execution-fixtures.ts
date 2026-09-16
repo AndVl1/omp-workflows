@@ -771,6 +771,13 @@ function existingSetup(api: FixtureApi, root: string, manifest: Record<string, u
   const gate = resultValue(api.readProjectConstitutionGate(root), 'constitution fixture gate');
   if (gate['status'] !== 'usable' && gate['status'] !== 'approved') throw new Error(`constitution fixture gate is no longer usable: ${String(gate['status'])}`);
   const gateBinding = record(gate['binding'], 'constitution fixture binding');
+  if (gateBinding['path'] !== 'CONSTITUTION.md' || typeof gateBinding['content_sha256'] !== 'string' || !/^[a-f0-9]{64}$/u.test(gateBinding['content_sha256'])) {
+    throw new Error('constitution fixture gate binding path or digest is invalid');
+  }
+  const source = readPinnedFileFull(pinned, 'CONSTITUTION.md', 1_048_576);
+  if (source === null || sha256(source) !== gateBinding['content_sha256']) throw new Error('current constitution source/binding drifted after setup');
+  const evidencePath = `.work-state/specification/constitution/validation-${gateBinding['content_sha256']}.json`;
+  if (!existingDescendant(pinned, evidencePath.split('/'))) throw new Error('constitution fixture usability evidence is missing; refusing restart writes');
   const currentBinding = resultValue(api.resolveCurrentConstitutionBinding(root, { explicit_path: gateBinding['path'] }), 'current constitution binding');
   if (canonicalJson(currentBinding) !== canonicalJson(gateBinding)) throw new Error('current constitution source/binding drifted after setup');
   const selectors = expected['selectors'];
@@ -838,8 +845,8 @@ async function prepareCtoExecutionFixtureUnlocked(
     stale: setup.stale,
     claimed: setup.claimed,
   };
-  const prior = readManifest(runtimeApi, root);
-  if (prior !== null) return existingSetup(runtimeApi, root, prior, expectedManifest);
+  const prior = readManifest(pinned);
+  if (prior !== null) return existingSetup(api, root, prior, expectedManifest, pinned);
 
   const constitutionRoot = new api.PinnedProjectRoot(root);
   try {
@@ -857,7 +864,7 @@ async function prepareCtoExecutionFixtureUnlocked(
   if (gate['status'] !== 'usable' && gate['status'] !== 'approved') throw new Error(`constitution fixture gate is not usable: ${String(gate['status'])}`);
   if (gate['binding'] === null || gate['binding'] === undefined) throw new Error('constitution fixture gate has no binding');
 
-  const seeded = setupSelectors(setup).map(selector => materializeFeature(runtimeApi, root, selector.feature_id, selector.run_key, gate));
+  const seeded = setupSelectors(setup).map(selector => materializeFeature(api, root, selector.feature_id, selector.run_key, gate));
   const staleSpec = setup.stale;
   const stale = seeded.find(feature => feature.feature_id === staleSpec.feature_id && feature.run_key === staleSpec.run_key);
   if (!stale) throw new Error('stale fixture selector is not in the exact selector set');
@@ -878,7 +885,7 @@ async function prepareCtoExecutionFixtureUnlocked(
     owner_run_id: setup.claimed.owner_run_id,
   }), 'do_work fixture claim');
 
-  writeManifest(runtimeApi, root, expectedManifest);
+  writeManifest(pinned, expectedManifest);
   return { manifest: expectedManifest, features: seeded };
 }
 

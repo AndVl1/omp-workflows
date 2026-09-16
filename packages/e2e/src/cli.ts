@@ -69,7 +69,7 @@ import { prepareCtoExecutionFixture } from './cto-execution-fixtures.js';
 
 import { deferred } from './util.js';
 import { writeUxE2eOverlay } from './overlay.js';
-import { closePinnedDirectory, closePinnedDirectoryCreationReceipts, closePinnedFile, openPinnedFile, pinChildDirectory, pinDirectory, pinOrCreateDirectory, pinnedDirectoryIsStable, readPinnedFile, readPinnedFileFull, removePinnedDirectoryTreeIfExact, withPinnedExclusiveLock } from './fs-safety.js';
+import { closePinnedDirectory, closePinnedDirectoryCreationReceipts, closePinnedFile, openPinnedFile, pinChildDirectory, pinDirectory, pinOrCreateDirectory, pinnedDirectoryIsStable, readPinnedFile, readPinnedFileFull, removePinnedDirectoryTreeIfExact, withPinnedExclusiveLock, writePinnedFile } from './fs-safety.js';
 import type { PinnedDirectoryCreationReceipt } from './fs-safety.js';
 import { prepareRuntimeScratchProject, writeUxE2eBootstrapProvenance } from './runtime.js';
 const USAGE = `ux-e2e — interactive UX E2E test framework for omp + omp-workflows
@@ -269,28 +269,43 @@ function runBootstrapUnlocked(args: BootstrapArgs): string {
     closePinnedDirectoryCreationReceipts(createdScratch);
     throw new Error('ux-e2e bootstrap: scratch directory appeared after exact removal; refusing to initialize it');
   }
-  closePinnedDirectory(freshScratch);
-  closePinnedDirectoryCreationReceipts(createdScratch);
+  const assertFreshScratchStable = (operation: string): void => {
+    if (!pinnedDirectoryIsStable(freshScratch)) throw new Error(`ux-e2e bootstrap: scratch directory changed before/after ${operation}`);
+    let pathStat;
+    try { pathStat = lstatSync(freshScratch.physicalPath); } catch { throw new Error(`ux-e2e bootstrap: scratch directory disappeared during ${operation}`); }
+    if (pathStat.isSymbolicLink() || !pathStat.isDirectory() || pathStat.dev !== freshScratch.identity.dev || pathStat.ino !== freshScratch.identity.ino) {
+      throw new Error(`ux-e2e bootstrap: scratch directory was replaced during ${operation}; refusing writes`);
+    }
+  };
+  try {
+    assertFreshScratchStable('git init');
+    execSync('git init', { cwd: freshScratch.physicalPath, stdio: 'inherit' });
+    assertFreshScratchStable('git init');
+    execSync(`git checkout -b ${shellQuote(args.branch)}`, { cwd: freshScratch.physicalPath, stdio: 'inherit' });
+    assertFreshScratchStable('git checkout');
 
-  execSync('git init', { cwd: scratchDir, stdio: 'inherit' });
-  execSync(`git checkout -b ${shellQuote(args.branch)}`, { cwd: scratchDir, stdio: 'inherit' });
+    const packageBytes = Buffer.from(`${JSON.stringify({ name: `omp-ux-e2e-${args.slug}`, version: '0.0.0', private: true, type: 'module' }, null, 2)}\n`, 'utf8');
+    if (!writePinnedFile(freshScratch, 'package.json', packageBytes, { replaceExisting: false })) throw new Error('ux-e2e bootstrap: failed to publish private package manifest safely');
+    assertFreshScratchStable('package manifest');
 
-  writeFileSync(
-    join(scratchDir, 'package.json'),
-    JSON.stringify({ name: `omp-ux-e2e-${args.slug}`, version: '0.0.0', private: true, type: 'module' }, null, 2) + '\n',
-  );
+    prepareRuntimeScratchProject(freshScratch.physicalPath, monorepo);
+    assertFreshScratchStable('runtime package wiring');
+    writeUxE2eBootstrapProvenance(freshScratch.physicalPath, {
+      slug: args.slug,
+      branch: args.branch,
+      monorepoRoot: monorepo,
+      coreTarget: join(monorepo, 'packages', 'core'),
+    });
+    assertFreshScratchStable('bootstrap provenance');
+    writeUxE2eOverlay(freshScratch.physicalPath);
+    assertFreshScratchStable('overlay');
 
-  prepareRuntimeScratchProject(scratchDir, monorepo);
-  writeUxE2eBootstrapProvenance(scratchDir, {
-    slug: args.slug,
-    branch: args.branch,
-    monorepoRoot: monorepo,
-    coreTarget: join(monorepo, 'packages', 'core'),
-  });
-  writeUxE2eOverlay(scratchDir);
-
-  console.log(`ux-e2e bootstrap: scratch project ready at ${sanitizeCliError(scratchDir)}`);
-  return scratchDir;
+    console.log(`ux-e2e bootstrap: scratch project ready at ${sanitizeCliError(freshScratch.physicalPath)}`);
+    return freshScratch.physicalPath;
+  } finally {
+    closePinnedDirectory(freshScratch);
+    closePinnedDirectoryCreationReceipts(createdScratch);
+  }
 }
 
 /** Minimal POSIX single-quote shell escaping (no single quotes in branch names). */
