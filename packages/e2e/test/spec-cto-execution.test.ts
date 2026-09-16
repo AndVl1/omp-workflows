@@ -64,11 +64,11 @@ import { canonicalHandoffDigest, evaluateHandoffReadiness } from '../../core/src
 import { materializeImplementationHandoff } from '../../core/src/specification/materialize.js';
 import { createFeatureWorkspace, persistFeatureWorkspace, resolveFeatureWorkspace, applyManualEdits, featureArtifactsDir } from '../../core/src/specification/workspace.js';
 import { writeArtifact } from '../../core/src/engine/artifacts.js';
-import { readProjectConstitutionGate } from '../../core/src/specification/prerequisite.js';
+import { ensureProjectConstitution, readProjectConstitutionGate } from '../../core/src/specification/prerequisite.js';
 import { PinnedProjectRoot } from '../../core/src/specification/pinned-root.js';
 import { readPinnedCurrentConstitution } from '../../core/src/specification/constitution-identities.js';
 import type { ConstitutionBinding, FeatureWorkspace, ImplementationHandoff, WorkspacePhase, WorkspaceUpstreamVersion } from '../../core/src/specification/types.js';
-import { bindFeatureWorkspaceToRoot, validConstitutionBinding, validFeatureWorkspace, validImplementationHandoff, sha256 as fixtureSha256 } from '../../core/test/fixtures/specification-fixtures.js';
+import { bindFeatureWorkspaceToRoot, validFeatureWorkspace, validImplementationHandoff, sha256 as fixtureSha256 } from '../../core/test/fixtures/specification-fixtures.js';
 import { loadProfile, profileHash } from '../../core/src/engine/profile.js';
 import { loadTeamDefs } from '../../core/src/cto/plan.js';
 import { digestOf as canonicalDigestOf } from '../../core/src/specification/validation.js';
@@ -232,6 +232,25 @@ function exactBootstrappedScratch(): Scratch | null {
   assert.equal(lstatSync(coreLink).isSymbolicLink(), true, 'exact scratch core package is a bootstrap link');
   assert.equal(resolve(realpathSync(fullstackLink)), resolve(expectedMonorepo, 'packages', 'fullstack'));
   assert.equal(resolve(realpathSync(coreLink)), resolve(expectedMonorepo, 'packages', 'core'));
+  const staleStatePaths: string[] = [];
+  for (const relativePath of ['CONSTITUTION.md', join('.work-state', 'cto'), join('.work-state', 'features'), 'specs']) {
+    const candidate = join(canonical, relativePath);
+    try {
+      const candidateStat = lstatSync(candidate);
+      if (candidateStat.isSymbolicLink()) {
+        staleStatePaths.push(relativePath);
+      } else if (candidateStat.isDirectory()) {
+        if (readdirSync(candidate).length > 0) staleStatePaths.push(relativePath);
+      } else {
+        staleStatePaths.push(relativePath);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  if (staleStatePaths.length > 0) {
+    throw new Error(`exact scratch has stale state; expected a pristine bootstrap (${staleStatePaths.join(', ')})`);
+  }
   mkdirSync(join(canonical, '.work-state', 'cto'), { recursive: true });
   const teamsPath = join(canonical, '.omp', 'teams.json');
   let teamsPresent = false;
@@ -294,8 +313,8 @@ type WorkspaceSnapshot = {
 // ---------------------------------------------------------------------------
 
 
-function makeScratch(): Scratch {
-  const exact = exactBootstrappedScratch();
+function makeScratch(options: { allowExact?: boolean } = {}): Scratch {
+  const exact = options.allowExact === true ? exactBootstrappedScratch() : null;
   if (exact !== null) {
     const profile = loadProfile("spec-preparation");
     assert.ok(profile, "the shipped spec-preparation profile is available for exact scratch setup");
@@ -602,15 +621,6 @@ const PASSING_SOURCE = [
 ].join('\n');
 
 type SeededFeature = { workspace: FeatureWorkspace; handoff: ImplementationHandoff; snapshot: WorkspaceSnapshot };
-
-function bootstrapBinding(): ConstitutionBinding {
-  const contentSha = fixtureSha256(VALID_BOOTSTRAP_CONSTITUTION);
-  return validConstitutionBinding({
-    content_sha256: contentSha,
-    semantic_hash: fixtureSha256(VALID_BOOTSTRAP_CONSTITUTION.replace(/\r\n?/gu, "\n").replace(/\s+/gu, " ").trim()),
-    validation_ref: "constitution.validation." + contentSha,
-  });
-}
 
 function strictHandoffProjectionOptions(root: string, handoff: ImplementationHandoff): { beforeWrite: (path: string) => void } {
   return {
@@ -1714,8 +1724,15 @@ test('passing fixture: readable specification refs and executable deliverable ar
   try {
     const featureId = 'readable-cto-passing';
     const constitutionPath = join(scratch.root, 'CONSTITUTION.md');
-    if (!existsSync(constitutionPath)) writeFileSync(constitutionPath, VALID_BOOTSTRAP_CONSTITUTION);
-    const seeded = seedReadyFeature(scratch, featureId, 'fixture-passing-run', bootstrapBinding());
+    writeFileSync(constitutionPath, VALID_BOOTSTRAP_CONSTITUTION);
+    const constitution = ensureProjectConstitution(scratch.root, {
+      origin_kind: 'cto_preparation',
+      origin_run_key: 'fixture-passing-run',
+      origin_stage: 'cto',
+    });
+    assert.ok(constitution.ok && constitution.value.binding, constitution.ok ? 'fixture constitution binding must be available' : constitution.error);
+    if (!constitution.ok || constitution.value.binding === null) throw new Error('fixture constitution prerequisite failed');
+    const seeded = seedReadyFeature(scratch, featureId, 'fixture-passing-run', constitution.value.binding);
     assertPassingFixture(scratch.root, featureId, seeded.handoff);
   } finally {
     if (!scratch.exact) rmSync(scratch.parent, { recursive: true, force: true });
@@ -1833,7 +1850,7 @@ test('T094 runtime: one confirmed CTO wave executes the eligible passing/blocked
   assert.equal(param("shared_serial_tasks"), "T-SHARED-DEFAULTS-A,T-SHARED-DEFAULTS-B", "scenario names the shared-defaults pair");
   assert.equal(param("expected_admitted_task_count"), String(PASSING_TASK_GRAPH.length + 1), "scenario dispatch count covers passing graph plus blocked task");
   const ctoRequest = `/cto --spec ${passingId} --run-key ${passingRun} --spec ${blockedId} --run-key ${blockedRun} --spec ${staleId} --run-key ${staleRun} --spec ${claimedId} --run-key ${claimedRun} Execute the selected handoffs in one resident CTO wave. Preserve this exact immutable full selector array in the selector-only cto_prepare request; let the engine derive canonical task, DoD, and TeamDef candidates, obtain the mapping confirmation, and emit the eligible-only preflight descriptor. Keep stale and claimed selectors selected for readiness exclusion, report their blocked findings verbatim, and never claim either excluded selector. Execute the engine-issued eligible-only preflight descriptor without reconstructing selectors or repeating excluded rows. Report blocked findings and complete each admitted worker with real evidence before closing. The blocked handoff intentionally has no concrete observable contract and its src/blocked/** prerequisite is absent; do not invent behavior or repair that fixture. Give its implementation/QA workers one bounded attempt, record the unresolved blocker under FR-1/AC-1, and return one terminal blocked summary without rewriting DoD or re-dispatching repair workers. The admitted passing slices T-AUDIT-LOG and T-METRICS are independent and must dispatch in parallel; T-SCHEMA-VALIDATOR depends on T-LOADER; T-SHARED-DEFAULTS-A and T-SHARED-DEFAULTS-B share src/passing/shared-defaults.json and must serialize. Preserve every original FR-1/AC-1/V-1 task mapping, and require each lead to produce implementation and QA evidence before returning.`;
-  const scratch = makeScratch();
+  const scratch = makeScratch({ allowExact: true });
   let passing!: SeededFeature;
   let blocked!: SeededFeature;
   let stale!: SeededFeature;
