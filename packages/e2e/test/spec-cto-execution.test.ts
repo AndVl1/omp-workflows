@@ -35,6 +35,7 @@
 import assert from 'node:assert/strict';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -44,7 +45,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -183,7 +184,74 @@ type ConformanceArtifact = {
   blocking_findings?: Array<{ code?: string }>;
 };
 
-type Scratch = { root: string; parent: string; repository: ScratchRepositoryResult };
+type Scratch = { root: string; parent: string; repository: ScratchRepositoryResult; exact: boolean };
+const EXACT_SCRATCH_ENV = 'OMP_UX_E2E_EXACT_SCRATCH_ROOT';
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+function normalizedTmpAlias(path: string): string {
+  return process.platform === 'darwin' && (path === '/tmp' || path.startsWith('/tmp/')) ? `/private${path}` : path;
+}
+
+function exactBootstrappedScratch(): Scratch | null {
+  const configured = process.env[EXACT_SCRATCH_ENV];
+  if (configured === undefined) return null;
+  assert.ok(configured.length > 0, `${EXACT_SCRATCH_ENV} must not be empty`);
+  const lexical = resolve(configured);
+  const canonical = resolve(realpathSync(lexical));
+  assert.equal(normalizedTmpAlias(lexical), normalizedTmpAlias(canonical), 'exact scratch path must not use a symlinked ancestor');
+  const rootStat = lstatSync(canonical);
+  assert.equal(rootStat.isDirectory() && !rootStat.isSymbolicLink(), true, 'exact scratch root is a real directory');
+  const provenancePath = join(canonical, '.work-state', 'ux-e2e', 'bootstrap-provenance.json');
+  const provenance = JSON.parse(readFileSync(provenancePath, 'utf8')) as Record<string, unknown>;
+  assert.deepEqual(
+    Object.keys(provenance).sort(),
+    ['branch', 'canonical_root', 'core_target', 'kind', 'monorepo_root', 'nonce', 'root_basename', 'schema_version', 'slug'].sort(),
+    'exact scratch bootstrap provenance has the canonical bounded schema',
+  );
+  assert.equal(provenance.schema_version, 1);
+  assert.equal(provenance.kind, 'ux-e2e-bootstrap');
+  assert.equal(provenance.canonical_root, canonical);
+  assert.equal(provenance.root_basename, basename(canonical));
+  assert.equal(typeof provenance.slug, 'string');
+  assert.match(String(provenance.slug), /^[a-z0-9][a-z0-9-]{0,63}$/u);
+  assert.match(String(provenance.branch), /^[A-Za-z0-9._/-]{1,128}$/u);
+  assert.match(String(provenance.nonce), UUID_V4_RE);
+  const packageManifest = JSON.parse(readFileSync(join(canonical, 'package.json'), 'utf8')) as Record<string, unknown>;
+  assert.equal(packageManifest.private, true);
+  assert.equal(packageManifest.name, `omp-ux-e2e-${String(provenance.slug)}`);
+  const expectedMonorepo = resolve(HERE, '..', '..', '..');
+  assert.equal(provenance.monorepo_root, expectedMonorepo, 'exact scratch is bootstrapped by this checkout');
+  assert.equal(provenance.core_target, resolve(expectedMonorepo, 'packages', 'core'));
+  const head = readFileSync(join(canonical, '.git', 'HEAD'), 'utf8').trim();
+  assert.equal(head, `ref: refs/heads/${String(provenance.branch)}`, 'exact scratch is on the authenticated bootstrap branch');
+  const marker = lstatSync(join(canonical, '.omp', 'fullstack.activation.json'));
+  assert.equal(marker.isFile() && !marker.isSymbolicLink(), true, 'exact scratch has the authenticated activation marker');
+  const fullstackLink = join(canonical, 'node_modules', '@andvl1', 'omp-workflows-fullstack');
+  const coreLink = join(canonical, 'node_modules', '@andvl1', 'omp-workflows-core');
+  assert.equal(lstatSync(fullstackLink).isSymbolicLink(), true, 'exact scratch fullstack package is a bootstrap link');
+  assert.equal(lstatSync(coreLink).isSymbolicLink(), true, 'exact scratch core package is a bootstrap link');
+  assert.equal(resolve(realpathSync(fullstackLink)), resolve(expectedMonorepo, 'packages', 'fullstack'));
+  assert.equal(resolve(realpathSync(coreLink)), resolve(expectedMonorepo, 'packages', 'core'));
+  mkdirSync(join(canonical, '.work-state', 'cto'), { recursive: true });
+  const teamsPath = join(canonical, '.omp', 'teams.json');
+  let teamsPresent = false;
+  try {
+    const teamsStat = lstatSync(teamsPath);
+    if (teamsStat.isSymbolicLink() || !teamsStat.isFile() || teamsStat.nlink !== 1) throw new Error('exact scratch teams.json is not a regular single-link file');
+    teamsPresent = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (!teamsPresent) writeFileSync(teamsPath, JSON.stringify(CTO_TEAMS, null, 2) + '\n', { flag: 'wx' });
+  const repository = {
+    root: canonical,
+    slug: String(provenance.slug),
+    files: [],
+    bundles: [],
+    git: { initialized: true, branch: String(provenance.branch), committed: false },
+  } as unknown as ScratchRepositoryResult;
+  return { root: canonical, parent: canonical, repository, exact: true };
+}
 
 function assertRuntimePluginRegistry(session: TestSession, root: string): void {
   const raw = JSON.parse(readFileSync(session.sessionJsonPath, 'utf8')) as {
@@ -227,6 +295,24 @@ type WorkspaceSnapshot = {
 
 
 function makeScratch(): Scratch {
+  const exact = exactBootstrappedScratch();
+  if (exact !== null) {
+    const profile = loadProfile("spec-preparation");
+    assert.ok(profile, "the shipped spec-preparation profile is available for exact scratch setup");
+    if (!profile) throw new Error("spec-preparation profile is unavailable");
+    const bootstrap = createFeatureWorkspace(exact.root, {
+      feature_id: CONSTITUTION_BOOTSTRAP_FEATURE_ID,
+      display_name: "Native constitution bootstrap",
+      run_key: CONSTITUTION_BOOTSTRAP_RUN_KEY,
+      profile_name: "spec-preparation",
+      profile_hash: profileHash(profile),
+    });
+    assert.ok(bootstrap.ok, bootstrap.ok ? "" : bootstrap.error);
+    if (!bootstrap.ok) throw new Error(bootstrap.error);
+    const teams = loadTeamDefs(exact.root);
+    assert.equal(teams.length, CTO_TEAMS.length, 'loaded CTO teams match the exact scratch fixture');
+    return exact;
+  }
   const parent = mkdtempSync(join(tmpdir(), 'omp-spec-cto-exec-'));
   const repository = createScratchSpecificationRepository({
     workdir: parent,
@@ -254,7 +340,7 @@ function makeScratch(): Scratch {
   assert.ok(bootstrap.ok, bootstrap.ok ? "" : bootstrap.error);
   if (!bootstrap.ok) throw new Error(bootstrap.error);
   assert.deepEqual(teams.map(team => team.id), CTO_TEAMS.map(team => team.id), 'loaded CTO teams match the scenario fixture');
-  return { root: repository.root, parent, repository };
+  return { root: repository.root, parent, repository, exact: false };
 }
 
 function removeConstitutionBootstrapWorkspace(root: string): void {
@@ -1660,7 +1746,7 @@ test('passing fixture: readable specification refs and executable deliverable ar
     const seeded = seedReadyFeature(scratch, featureId, 'fixture-passing-run', bootstrapBinding());
     assertPassingFixture(scratch.root, featureId, seeded.handoff);
   } finally {
-    rmSync(scratch.parent, { recursive: true, force: true });
+    if (!scratch.exact) rmSync(scratch.parent, { recursive: true, force: true });
   }
 });
 
@@ -1976,11 +2062,13 @@ test('T094 runtime: one confirmed CTO wave executes the eligible passing/blocked
       lifecycleFailureObserved = true;
       lifecycleError = error;
     }
-    finalizeScratchDirectory(scratch.parent, {
-      preserveOnFailure: PRESERVE_ON_FAILURE,
-      testFailed: testFailureObserved,
-      lifecycleFailed: lifecycleFailureObserved,
-    });
+    if (!scratch.exact) {
+      finalizeScratchDirectory(scratch.parent, {
+        preserveOnFailure: PRESERVE_ON_FAILURE,
+        testFailed: testFailureObserved,
+        lifecycleFailed: lifecycleFailureObserved,
+      });
+    }
     if (!testFailureObserved && lifecycleFailureObserved) throw lifecycleError;
   }
 });
