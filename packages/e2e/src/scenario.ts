@@ -58,6 +58,32 @@ export interface ScenarioSelectors {
   readonly run_key: string;
 }
 
+export interface CtoExecutionScenarioSetupSelector {
+  readonly feature_id: string;
+  readonly run_key: string;
+}
+
+export interface CtoExecutionScenarioSetup {
+  readonly kind: 'cto-execution';
+  readonly schema_version: 1;
+  readonly selectors: readonly CtoExecutionScenarioSetupSelector[];
+  readonly stale: {
+    readonly feature_id: string;
+    readonly run_key: string;
+    readonly phase: 'plan';
+    readonly version: 1;
+    readonly expected_sha256: string;
+    readonly actual_sha256: string;
+    readonly reason: string;
+  };
+  readonly claimed: {
+    readonly feature_id: string;
+    readonly run_key: string;
+    readonly owner_kind: 'do_work';
+    readonly owner_run_id: string;
+  };
+}
+
 /**
  * Canonical generated workspace locations. Paths are project-relative and
  * may contain templates (for example `specs/{{feature_id}}/spec.md`).
@@ -106,6 +132,8 @@ export interface ScenarioDefinition {
   readonly params: Record<string, string>;
   /** Explicit feature/run selectors, when the scenario declares them. */
   readonly selectors?: ScenarioSelectors;
+  /** Optional strict setup executed before the OMP process starts. */
+  readonly setup?: CtoExecutionScenarioSetup;
   /** Generated feature workspace paths and extra evidence paths. */
   readonly workspace?: ScenarioWorkspacePaths;
   /** Durable transcript markers expected by the scenario. */
@@ -277,6 +305,75 @@ function validateScenario(raw: unknown): {
     params = r.params as Record<string, string>;
   }
 
+  let setup: CtoExecutionScenarioSetup | undefined;
+  if (r.setup !== undefined) {
+    if (typeof r.setup !== 'object' || r.setup === null) {
+      throw new ScenarioValidationError('setup', 'expected an object');
+    }
+    const setupValue = r.setup as Record<string, unknown>;
+    const setupKeys = new Set(['kind', 'schema_version', 'selectors', 'stale', 'claimed']);
+    for (const key of Object.keys(setupValue)) {
+      if (!setupKeys.has(key)) throw new ScenarioValidationError(`setup.${key}`, 'unknown field');
+    }
+    if (setupValue.kind !== 'cto-execution') {
+      throw new ScenarioValidationError('setup.kind', 'expected cto-execution');
+    }
+    if (setupValue.schema_version !== 1) {
+      throw new ScenarioValidationError('setup.schema_version', 'expected version 1');
+    }
+    if (!Array.isArray(setupValue.selectors) || setupValue.selectors.length !== 4) {
+      throw new ScenarioValidationError('setup.selectors', 'expected exactly four feature/run selectors');
+    }
+    const setupSelectors: CtoExecutionScenarioSetupSelector[] = setupValue.selectors.map((item, index) => {
+      if (typeof item !== 'object' || item === null) {
+        throw new ScenarioValidationError(`setup.selectors[${index}]`, 'expected an object');
+      }
+      const selector = item as Record<string, unknown>;
+      for (const key of Object.keys(selector)) {
+        if (key !== 'feature_id' && key !== 'run_key') throw new ScenarioValidationError(`setup.selectors[${index}].${key}`, 'unknown field');
+      }
+      const featureId = optionalString(selector.feature_id, `setup.selectors[${index}].feature_id`);
+      const runKey = optionalString(selector.run_key, `setup.selectors[${index}].run_key`);
+      if (featureId === undefined || runKey === undefined) {
+        throw new ScenarioValidationError(`setup.selectors[${index}]`, 'feature_id and run_key are both required');
+      }
+      return { feature_id: featureId, run_key: runKey };
+    });
+    const staleValue = setupValue.stale;
+    if (typeof staleValue !== 'object' || staleValue === null) throw new ScenarioValidationError('setup.stale', 'expected an object');
+    const staleRecord = staleValue as Record<string, unknown>;
+    for (const key of Object.keys(staleRecord)) {
+      if (!new Set(['feature_id', 'run_key', 'phase', 'version', 'expected_sha256', 'actual_sha256', 'reason']).has(key)) throw new ScenarioValidationError(`setup.stale.${key}`, 'unknown field');
+    }
+    const staleFeatureId = optionalString(staleRecord.feature_id, 'setup.stale.feature_id');
+    const staleRunKey = optionalString(staleRecord.run_key, 'setup.stale.run_key');
+    const staleExpected = optionalString(staleRecord.expected_sha256, 'setup.stale.expected_sha256');
+    const staleActual = optionalString(staleRecord.actual_sha256, 'setup.stale.actual_sha256');
+    const staleReason = optionalString(staleRecord.reason, 'setup.stale.reason');
+    if (!staleFeatureId || !staleRunKey || staleRecord.phase !== 'plan' || staleRecord.version !== 1 || !staleExpected || !staleActual || !staleReason) {
+      throw new ScenarioValidationError('setup.stale', 'expected plan v1 with bounded revision hashes and reason');
+    }
+    const claimedValue = setupValue.claimed;
+    if (typeof claimedValue !== 'object' || claimedValue === null) throw new ScenarioValidationError('setup.claimed', 'expected an object');
+    const claimedRecord = claimedValue as Record<string, unknown>;
+    for (const key of Object.keys(claimedRecord)) {
+      if (!new Set(['feature_id', 'run_key', 'owner_kind', 'owner_run_id']).has(key)) throw new ScenarioValidationError(`setup.claimed.${key}`, 'unknown field');
+    }
+    const claimedFeatureId = optionalString(claimedRecord.feature_id, 'setup.claimed.feature_id');
+    const claimedRunKey = optionalString(claimedRecord.run_key, 'setup.claimed.run_key');
+    const ownerRunId = optionalString(claimedRecord.owner_run_id, 'setup.claimed.owner_run_id');
+    if (!claimedFeatureId || !claimedRunKey || claimedRecord.owner_kind !== 'do_work' || !ownerRunId) {
+      throw new ScenarioValidationError('setup.claimed', 'expected do_work owner and feature/run selector');
+    }
+    setup = {
+      kind: 'cto-execution',
+      schema_version: 1,
+      selectors: setupSelectors,
+      stale: { feature_id: staleFeatureId, run_key: staleRunKey, phase: 'plan', version: 1, expected_sha256: staleExpected, actual_sha256: staleActual, reason: staleReason },
+      claimed: { feature_id: claimedFeatureId, run_key: claimedRunKey, owner_kind: 'do_work', owner_run_id: ownerRunId },
+    };
+  }
+
   let selectors: ScenarioSelectors | undefined;
   const selectorValue = r.selectors;
   if (selectorValue !== undefined) {
@@ -365,6 +462,7 @@ function validateScenario(raw: unknown): {
       task: taskValue,
       params,
       ...(selectors !== undefined ? { selectors } : {}),
+      ...(setup !== undefined ? { setup } : {}),
       ...(workspace !== undefined ? { workspace } : {}),
       ...(transcript !== undefined ? { transcript } : {}),
       stages,
@@ -540,6 +638,13 @@ export function loadScenario(path: string, params: Record<string, string> = {}):
       ? { feature_id: featureId, run_key: runKey }
       : undefined;
 
+  const expandedSetup = def.setup === undefined ? undefined : {
+    ...def.setup,
+    selectors: def.setup.selectors.map(selector => ({ feature_id: expandValue(selector.feature_id, ctx), run_key: expandValue(selector.run_key, ctx) })),
+    stale: { ...def.setup.stale, feature_id: expandValue(def.setup.stale.feature_id, ctx), run_key: expandValue(def.setup.stale.run_key, ctx), expected_sha256: expandValue(def.setup.stale.expected_sha256, ctx), actual_sha256: expandValue(def.setup.stale.actual_sha256, ctx), reason: expandValue(def.setup.stale.reason, ctx) },
+    claimed: { ...def.setup.claimed, feature_id: expandValue(def.setup.claimed.feature_id, ctx), run_key: expandValue(def.setup.claimed.run_key, ctx), owner_run_id: expandValue(def.setup.claimed.owner_run_id, ctx) },
+  };
+
   let taskText: string;
   if (typeof def.task === 'string') {
     taskText = def.task;
@@ -563,6 +668,7 @@ export function loadScenario(path: string, params: Record<string, string> = {}):
     task: expandValue(taskText, ctx),
     params: def.params,
     ...(selectors !== undefined ? { selectors } : {}),
+    ...(expandedSetup !== undefined ? { setup: expandedSetup } : {}),
     ...(def.workspace !== undefined || featureId !== undefined
       ? { workspace: expandWorkspace(def.workspace, ctx, featureId) }
       : {}),

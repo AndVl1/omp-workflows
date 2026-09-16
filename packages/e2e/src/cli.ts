@@ -67,6 +67,7 @@ import {
   type UxDimension,
 } from './report.js';
 import { loadScenario, type ScenarioDefinition } from './scenario.js';
+import { prepareCtoExecutionFixture } from './cto-execution-fixtures.js';
 
 import { deferred } from './util.js';
 import { writeUxE2eOverlay } from './overlay.js';
@@ -443,6 +444,10 @@ async function runStartForeground(args: StartArgs, startupRuntime?: DetachedStar
         max_time: formatMaxTimeArg(args.maxTimeSec),
       })
     : null;
+  if (scenario?.setup !== undefined) {
+    if (scenario.id !== 'spec-cto-execution') throw new Error(`ux-e2e start: unsupported scenario setup '${scenario.id}'`);
+    await prepareCtoExecutionFixture(args.scratchDir, scenario.setup);
+  }
   const taskPrompt = resolveTaskPrompt(args.task, scenario, args.taskMode);
   const session = await startTestSession({
     cwd: args.scratchDir,
@@ -773,6 +778,10 @@ async function runStartDetached(args: StartArgs): Promise<number> {
         max_time: formatMaxTimeArg(args.maxTimeSec),
       })
     : null;
+  if (scenario?.setup !== undefined) {
+    if (scenario.id !== 'spec-cto-execution') throw new Error(`ux-e2e start: unsupported scenario setup '${scenario.id}'`);
+    await prepareCtoExecutionFixture(args.scratchDir, scenario.setup);
+  }
   const logPath = detachLogPath(args.scratchDir);
   const stateDir = stateDirOf(args.scratchDir);
   const stateRoot = pinOrCreateDirectory(stateDir);
