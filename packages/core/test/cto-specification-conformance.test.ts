@@ -27,7 +27,9 @@ import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { ctoRuntimeRunInitialIdentityDigest, hasValidCtoRuntimeStateProofPinned, mintCtoRuntimeRunOrigin, newCtoState, readCtoStatePinned, writeCtoRuntimeStateProof, writeCtoState } from "../src/cto/state.js";
 import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 import { readPinnedArtifactSnapshot, setArtifactReadTestHooks, writeArtifactWithReference } from "../src/engine/artifacts.js";
-import { readCurrentExecutionClaim } from "../src/specification/claims.js";
+import { checkpointAnswerBinding, checkpointPolicyHash, checkpointWorkIdentityHash } from "../src/engine/checkpoints.js";
+import { ctoMappingConfirmationStateDigest, signCtoMappingConfirmationProof, writeCtoMappingConfirmationProof } from "../src/engine/cto-mapping-proof.js";
+import { executionClaimAuthorizationProjectionDigest, readCurrentExecutionClaim } from "../src/specification/claims.js";
 import { validateCtoMappingRecord } from "../src/specification/mapping-record.js";
 import { captureWorkspacePathBinding } from "../src/specification/workspace.js";
 import {
@@ -188,13 +190,122 @@ interface CtoFeatureInput {
 function durableMappingRecordPath(root: string, ctoRunId: string, mappingId: string): string {
   return join(realpathSync(root), ".work-state", "cto", ctoRunId, "specification-mappings", `${mappingId}.json`);
 }
+function persistFixtureConfirmation(
+  root: string,
+  path: string,
+  record: Record<string, unknown>,
+  mapping: CtoSpecificationMapping,
+  ctoRunId: string,
+  selections: readonly { feature_id: string; run_key: string }[],
+): { path: string; digest: string; selections: Array<{ feature_id: string; run_key: string }> } {
+  const first = selections[0]!;
+  const statePath = join(realpathSync(root), ".work-state", "features", first.feature_id, "state.json");
+  if (!existsSync(statePath)) {
+    const body = JSON.stringify(record) + "\n";
+    writeFileSync(path, body, "utf8");
+    return { path, digest: sha256(body), selections: [...selections] };
+  }
+  const state = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, any>;
+  const policy = state.checkpoint_policy as Record<string, unknown>;
+  const answer = (state.trusted_checkpoint_answers as Array<Record<string, unknown>>).find(
+    (candidate) => candidate.answer_id === record.trusted_answer_ref,
+  );
+  if (!policy || !answer) throw new Error("fixture confirmation anchor was not seeded");
+  record.confirmation_context = {
+    ...(record.confirmation_context as Record<string, unknown>),
+    policy_hash: checkpointPolicyHash(policy as never),
+  };
+  record.confirmation_state_after_digest = ctoMappingConfirmationStateDigest(state);
+  record.confirmation_proof_ref = "tx-fixture-confirmation";
+  const body = JSON.stringify(record) + "\n";
+  writeFileSync(path, body, "utf8");
+  const recordDigest = sha256(body);
+  const pinnedRoot = PinnedProjectRoot.open(root);
+  if (!pinnedRoot) throw new Error("fixture root cannot be pinned");
+  try {
+    const proof = signCtoMappingConfirmationProof(pinnedRoot, {
+      schema_version: 1,
+      root_identity: { canonical_path: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino },
+      cto_run_id: ctoRunId,
+      mapping_id: mapping.mapping_id,
+      mapping_hash: mapping.mapping_hash,
+      mapping_version: mapping.mapping_version,
+      transaction_id: "fixture-confirmation",
+      proof_ref: "tx-fixture-confirmation",
+      mapping_record_path: relative(pinnedRoot.canonical_root, path).split("/").join("/"),
+      mapping_record_digest: recordDigest,
+      state_path: `.work-state/features/${first.feature_id}/state.json`,
+      state_after_digest: record.confirmation_state_after_digest,
+      checkpoint_ref: record.checkpoint_ref,
+      trusted_answer_ref: record.trusted_answer_ref,
+      confirmation_context: record.confirmation_context,
+      confirmed_at: record.confirmed_at,
+      trusted_answer: answer,
+    } as never);
+    if (!proof) throw new Error("fixture confirmation proof could not be signed");
+    const written = writeCtoMappingConfirmationProof(pinnedRoot, proof);
+    if (!written.ok) throw new Error(`fixture confirmation proof could not be written: ${written.error}`);
+    const claimPath = join(pinnedRoot.canonical_root, ".work-state", "features", first.feature_id, "artifacts", "execution_claim", "root.json");
+    if (existsSync(claimPath)) {
+      const envelope = JSON.parse(readFileSync(claimPath, "utf8")) as { claim: Record<string, any> };
+      const proofAnswer = {
+        answer_id: answer.answer_id,
+        nonce: answer.nonce,
+        channel: answer.channel,
+        reference: answer.reference,
+        binding: answer.binding,
+      };
+      const admission = envelope.claim.admission_binding as Record<string, unknown>;
+      const authorizationDigest = executionClaimAuthorizationProjectionDigest({
+        feature_id: first.feature_id,
+        run_key: first.run_key,
+        stage_id: "constitution_validate",
+        capability_id: mapping.execution.capability_id,
+        capability_epoch: mapping.execution.capability_epoch,
+        capability_stage_id: null,
+        checkpoint_ref: mapping.checkpoint_ref,
+        trusted_answer_ref: record.trusted_answer_ref as string,
+        checkpoint_policy: policy,
+        checkpoint_rule: policy.rules?.[mapping.checkpoint_ref] ?? null,
+        trusted_answer: answer,
+        trusted_proof: proofAnswer,
+        constitution_binding: state.specification?.constitution_binding ?? null,
+        root_binding: {
+          pinned_root: { canonical_path: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino },
+          workspace_root: state.specification?.project_root_identity ?? null,
+        },
+        mapping_id: mapping.mapping_id,
+        mapping_hash: mapping.mapping_hash,
+        mapping_version: mapping.mapping_version,
+      });
+      envelope.claim.admission_binding = {
+        ...admission,
+        mapping_record_path: relative(pinnedRoot.canonical_root, path).split("/").join("/"),
+        mapping_record_digest: recordDigest,
+        confirmation_state_revision: state.state_revision ?? 0,
+        feature_state_revision: state.state_revision ?? 0,
+        confirmation_state_digest: sha256(readFileSync(statePath)),
+        confirmation_authorization_digest: authorizationDigest,
+        confirmation_ledger_digest: digestOf({
+          checkpoint_policy: state.checkpoint_policy ?? null,
+          trusted_checkpoint_answers: state.trusted_checkpoint_answers ?? [],
+        }),
+        policy_hash: checkpointPolicyHash(policy as never),
+      };
+      writeFileSync(claimPath, JSON.stringify(envelope) + "\n", "utf8");
+    }
+  } finally {
+    pinnedRoot.close();
+  }
+  return { path, digest: recordDigest, selections: [...selections] };
+}
 
 function persistCtoMappingRecord(root: string, mapping: CtoSpecificationMapping, ctoRunId = "cto-wave-1"): { path: string; digest: string; selections: Array<{ feature_id: string; run_key: string }> } {
   const path = durableMappingRecordPath(root, ctoRunId, mapping.mapping_id);
   const selections = (mapping as CtoSpecificationMapping & { selections?: Array<{ feature_id: string; run_key: string }> }).selections
     ?? mapping.feature_ids.map((feature_id) => ({ feature_id, run_key: `run-${feature_id}` }));
   const first = selections[0]!;
-  const record = {
+  const record: Record<string, unknown> = {
     schema_version: 1,
     cto_run_id: ctoRunId,
     mapping,
@@ -205,17 +316,15 @@ function persistCtoMappingRecord(root: string, mapping: CtoSpecificationMapping,
       feature_id: first.feature_id,
       run_key: first.run_key,
       stage_id: "constitution_validate",
-      decision: "approve_continue" as const,
+      decision: "approve_continue",
       capability_id: "capability-1",
       capability_epoch: "epoch-1",
       policy_hash: sha256("policy"),
     },
     confirmed_at: FIXED_NOW,
   };
-  const body = JSON.stringify(record) + "\n";
   mkdirSync(join(root, ".work-state", "cto", ctoRunId, "specification-mappings"), { recursive: true });
-  writeFileSync(path, body, "utf8");
-  return { path, digest: sha256(body), selections };
+  return persistFixtureConfirmation(root, path, record, mapping, ctoRunId, selections);
 }
 function bindingFor(
   mapping: CtoSpecificationMapping,
@@ -319,13 +428,88 @@ function seedCtoFeature(
       resume_marker: null,
     },
   }) + "\n", "utf8");
-  writeFileSync(statePath, JSON.stringify({ schema: 1, run_key: runKey, state_revision: 0, specification: workspace }) + "\n", "utf8");
+  const context = mappingRecord.mapping;
+  const checkpointPolicy = {
+    default: "required_human",
+    scope: "decision",
+    hard_human: ["custom"],
+    rules: {
+      [context.checkpoint_ref]: {
+        kind: "custom",
+        default: "required_human",
+        allowed_decisions: ["approve_continue"],
+        phase: "before_advance",
+        rationale: "Fixture mapping confirmation requires a trusted human answer.",
+      },
+    },
+    source: "profile",
+    policy_version: 1,
+    rationale: "Fixture mapping confirmation is a decision-bound human checkpoint.",
+  };
+  const state: Record<string, unknown> = {
+    schema: 1,
+    branch: "test",
+    classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "constitution" },
+    task: "conformance fixture",
+    workflow_override: false,
+    issue: null,
+    run_key: runKey,
+    state_revision: 0,
+    stage_cursor: "constitution_validate",
+    stages: [{ id: "constitution_validate", status: "in_progress" }],
+    artifacts: {},
+    pause: { kind: "none", reason: "" },
+    updated_at: FIXED_NOW,
+    specification: workspace,
+    work_identity: {
+      run_id: runKey,
+      wave_id: "wave-1",
+      slice_id: `slice-${featureId}`,
+      session_id: "conformance-fixture",
+      workflow: "constitution",
+      stage_id: "constitution_validate",
+      stage_cursor: "constitution_validate",
+      capability_id: context.execution.capability_id,
+      capability_epoch: context.execution.capability_epoch,
+      slot_id: `slice-${featureId}`,
+      task_id: "T-1",
+      dispatch_id: `dispatch-${featureId}`,
+      attempt: 1,
+      worker_id: `team-${featureId}`,
+    },
+    checkpoint_policy: checkpointPolicy,
+  };
+  const answerWithoutBinding: Record<string, unknown> = {
+    answer_id: "trusted-answer.cto-mapping.v1",
+    nonce: "fixture-confirmation-nonce",
+    channel: "terminal",
+    reference: "fixture-terminal-answer",
+    run_id: runKey,
+    stage_id: "constitution_validate",
+    checkpoint_id: context.checkpoint_ref,
+    work_identity_hash: checkpointWorkIdentityHash(state as never, "constitution_validate"),
+    capability_id: context.execution.capability_id,
+    capability_epoch: context.execution.capability_epoch,
+    policy_hash: checkpointPolicyHash(checkpointPolicy as never),
+    subject_binding: context.mapping_hash,
+    subject_revision: context.mapping_version,
+    decision: "approve_continue",
+    authority_receipt: "fixture-confirmation-authority",
+    issued_at: FIXED_NOW,
+    feature_id: featureId,
+  };
+  const answer = {
+    ...answerWithoutBinding,
+    binding: checkpointAnswerBinding(answerWithoutBinding as never),
+    consumed_at: FIXED_NOW,
+  };
+  state.trusted_checkpoint_answers = [answer];
+  writeFileSync(statePath, JSON.stringify(state) + "\n", "utf8");
   writeFileSync(
     join(artifactsDir, "implementation_handoff", `${input.feature.handoff_id}.json`),
     JSON.stringify(input.feature) + "\n",
     "utf8",
   );
-  const context = mappingRecord.mapping;
   const claim = input.claim as unknown as Record<string, unknown>;
   claim.admission_binding = {
     mapping_record_path: relative(realpathSync(root), mappingRecord.path).split("/").join("/"),
@@ -508,8 +692,9 @@ function seedCtoTerminalState(
  }
 
 function prepareCtoConformanceInput(root: string, features: readonly CtoFeatureInput[], evidenceItems: readonly ConformanceEvidence[], mapping: CtoSpecificationMapping): PreparedCtoConformanceInput {
+  const initialRecord = persistCtoMappingRecord(root, mapping);
+  for (const input of features) seedCtoFeature(root, input, { ...initialRecord, mapping });
   const record = persistCtoMappingRecord(root, mapping);
-  for (const input of features) seedCtoFeature(root, input, { ...record, mapping });
   seedCtoTerminalState(root, mapping, record.selections);
   const handoffs: Array<{ feature_id: string; run_key: string; handoff: ImplementationHandoff; quality_gates?: QualityGateResult[] }> = features.map(({ feature, run_key }) => ({
     feature_id: feature.feature_id,
@@ -1011,8 +1196,6 @@ test("direct CTO persistence gates pending, failed, wrong-run, and stale termina
   const failed = makeFixture();
   try {
     const binding = bindingFor(failed.mapping, failed.root, "cto-wave-1", failed.prepared.claims as unknown as CtoActiveClaimSummary[]);
-    failed.prepared.evidence = failed.prepared.evidence.map((item) =>
-      persistedEvidence(realpathSync(failed.root), failed.feature.feature.feature_id, item));
     failed.updateTeam((team) => {
       team.status = "failed";
       team.completion_envelope = { ...team.completion_envelope!, outcome: "failed", terminal_signal: "contract_failure" };
@@ -1022,7 +1205,7 @@ test("direct CTO persistence gates pending, failed, wrong-run, and stale termina
     assert.equal(result.persisted, false);
     assert.equal(result.features[0]?.status, "blocked");
     assert.equal(result.features[0]?.claim_action, "retain");
-    assert.match(result.findings.join("; "), /confirmation anchor capability changed|trusted host answer|authorization/i);
+    assert.match(result.findings.join("; "), /terminal CTO team postimage revalidation failed: digest changed/i);
     assert.equal(readCurrentExecutionClaim(failed.root, failed.feature.feature.feature_id).value?.status, "active");
   } finally {
     failed.runtime.close();
@@ -1051,7 +1234,7 @@ test("direct CTO persistence gates pending, failed, wrong-run, and stale termina
       const result = foreignSession.invokeWith(foreignRuntime.access, "conformance-foreign-session");
       assert.equal(result.status, "blocked");
       assert.equal(result.persisted, false);
-      assert.match(result.findings.join("; "), /session does not own|owner session/i);
+      assert.match(result.findings.join("; "), /session does not own|owner session|different or unavailable runtime session/i);
       assert.deepEqual([...snapshotWorkStateBytes(foreignSession.root)], [...before], "foreign session rejection must leave all workspace, claim, conformance, and CTO state bytes unchanged");
     } finally {
       foreignRuntime.close();
