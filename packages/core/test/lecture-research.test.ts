@@ -52,7 +52,6 @@ import {
   requiredFieldsOf,
   loadArtifactSchemas,
   buildAmendPrompt,
-  runCto,
   type Classification,
   type Complexity,
   type TeamDef,
@@ -65,6 +64,7 @@ import {
   type TimestampedTranscriptSegment,
 } from "@andvl1/omp-workflows-core";
 import { dodBackstop } from "../src/gates/dod-backstop.js";
+import { runCto } from "../src/cto/run.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
