@@ -46,7 +46,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import type { AskBlock, SelectedAskBlock } from '../src/driver.js';
@@ -65,7 +65,7 @@ import { materializeImplementationHandoff } from '../../core/src/specification/m
 import { createFeatureWorkspace, persistFeatureWorkspace, resolveFeatureWorkspace, applyManualEdits, featureArtifactsDir } from '../../core/src/specification/workspace.js';
 import { writeTestArtifact } from '../../core/test/fixtures/artifacts.js';
 import { ensureProjectConstitution, readProjectConstitutionGate } from '../../core/src/specification/prerequisite.js';
-import { PinnedProjectRoot } from '../../core/src/specification/pinned-root.js';
+import { drainDarwinHelperClosePromisesForTesting, PinnedProjectRoot } from '../../core/src/specification/pinned-root.js';
 import { readPinnedCurrentConstitution } from '../../core/src/specification/constitution-identities.js';
 import type { ConstitutionBinding, FeatureWorkspace, ImplementationHandoff, WorkspacePhase, WorkspaceUpstreamVersion } from '../../core/src/specification/types.js';
 import { bindFeatureWorkspaceToRoot, validFeatureWorkspace, validImplementationHandoff, sha256 as fixtureSha256 } from '../../core/test/fixtures/specification-fixtures.js';
@@ -85,6 +85,10 @@ const CTO_TEAMS = [
 ] as const;
 const STABILITY_WINDOW_MS = 10_000;
 /** Bounded real-time window for the wave to reach terminal conformance states. */
+
+afterEach(async () => {
+  await drainDarwinHelperClosePromisesForTesting();
+});
 const WAVE_WINDOW_MS = 3_600_000;
 const MAX_PROTOCOL_LOG_BYTES = 8 * 1024 * 1024;
 const MAX_PROTOCOL_LOG_FILES = 32;
@@ -192,6 +196,16 @@ function normalizedTmpAlias(path: string): string {
   return process.platform === 'darwin' && (path === '/tmp' || path.startsWith('/tmp/')) ? `/private${path}` : path;
 }
 
+function assertExactDirectory(root: string, relativePath: string): void {
+  const stat = lstatSync(join(root, relativePath));
+  assert.equal(stat.isDirectory() && !stat.isSymbolicLink(), true, `exact scratch ${relativePath} must be a real directory`);
+}
+
+function assertExactRegularSingleLink(root: string, relativePath: string, description: string): void {
+  const stat = lstatSync(join(root, relativePath));
+  assert.equal(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1, true, description);
+}
+
 function exactBootstrappedScratch(): Scratch | null {
   const configured = process.env[EXACT_SCRATCH_ENV];
   if (configured === undefined) return null;
@@ -201,7 +215,12 @@ function exactBootstrappedScratch(): Scratch | null {
   assert.equal(normalizedTmpAlias(lexical), normalizedTmpAlias(canonical), 'exact scratch path must not use a symlinked ancestor');
   const rootStat = lstatSync(canonical);
   assert.equal(rootStat.isDirectory() && !rootStat.isSymbolicLink(), true, 'exact scratch root is a real directory');
-  const provenancePath = join(canonical, '.work-state', 'ux-e2e', 'bootstrap-provenance.json');
+  assertExactDirectory(canonical, '.work-state');
+  assertExactDirectory(canonical, '.omp');
+  assertExactDirectory(canonical, join('.work-state', 'ux-e2e'));
+  const provenanceRelativePath = join('.work-state', 'ux-e2e', 'bootstrap-provenance.json');
+  assertExactRegularSingleLink(canonical, provenanceRelativePath, 'exact scratch bootstrap provenance must be a regular single-link file');
+  const provenancePath = join(canonical, provenanceRelativePath);
   const provenance = JSON.parse(readFileSync(provenancePath, 'utf8')) as Record<string, unknown>;
   assert.deepEqual(
     Object.keys(provenance).sort(),
@@ -224,8 +243,7 @@ function exactBootstrappedScratch(): Scratch | null {
   assert.equal(provenance.core_target, resolve(expectedMonorepo, 'packages', 'core'));
   const head = readFileSync(join(canonical, '.git', 'HEAD'), 'utf8').trim();
   assert.equal(head, `ref: refs/heads/${String(provenance.branch)}`, 'exact scratch is on the authenticated bootstrap branch');
-  const marker = lstatSync(join(canonical, '.omp', 'fullstack.activation.json'));
-  assert.equal(marker.isFile() && !marker.isSymbolicLink(), true, 'exact scratch has the authenticated activation marker');
+  assertExactRegularSingleLink(canonical, join('.omp', 'fullstack.activation.json'), 'exact scratch has the authenticated activation marker');
   const fullstackLink = join(canonical, 'node_modules', '@andvl1', 'omp-workflows-fullstack');
   const coreLink = join(canonical, 'node_modules', '@andvl1', 'omp-workflows-core');
   assert.equal(lstatSync(fullstackLink).isSymbolicLink(), true, 'exact scratch fullstack package is a bootstrap link');
@@ -233,7 +251,7 @@ function exactBootstrappedScratch(): Scratch | null {
   assert.equal(resolve(realpathSync(fullstackLink)), resolve(expectedMonorepo, 'packages', 'fullstack'));
   assert.equal(resolve(realpathSync(coreLink)), resolve(expectedMonorepo, 'packages', 'core'));
   const staleStatePaths: string[] = [];
-  for (const relativePath of ['CONSTITUTION.md', join('.work-state', 'cto'), join('.work-state', 'features'), join('.work-state', 'specification'), 'specs']) {
+  for (const relativePath of ['CONSTITUTION.md', 'src', join('.work-state', 'cto'), join('.work-state', 'features'), join('.work-state', 'specification'), 'specs']) {
     const candidate = join(canonical, relativePath);
     try {
       const candidateStat = lstatSync(candidate);
@@ -251,7 +269,6 @@ function exactBootstrappedScratch(): Scratch | null {
   if (staleStatePaths.length > 0) {
     throw new Error(`exact scratch has stale state; expected a pristine bootstrap (${staleStatePaths.join(', ')})`);
   }
-  mkdirSync(join(canonical, '.work-state', 'cto'), { recursive: true });
   const teamsPath = join(canonical, '.omp', 'teams.json');
   let teamsPresent = false;
   try {
@@ -262,6 +279,7 @@ function exactBootstrappedScratch(): Scratch | null {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
   if (!teamsPresent) writeFileSync(teamsPath, JSON.stringify(CTO_TEAMS, null, 2) + '\n', { flag: 'wx' });
+  mkdirSync(join(canonical, '.work-state', 'cto'), { recursive: true });
   const repository = {
     root: canonical,
     slug: String(provenance.slug),
