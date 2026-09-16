@@ -12,17 +12,21 @@ import { createHash } from 'node:crypto';
 import {
   existsSync,
   lstatSync,
-  mkdirSync,
   readFileSync,
   realpathSync,
-  writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { basename, dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import type { CtoExecutionScenarioSetup } from './scenario.js';
+import { UX_E2E_BOOTSTRAP_PROVENANCE_PATH } from './runtime.js';
+import { closePinnedDirectory, closePinnedDirectoryCreationReceipts, pinChildDirectory, pinDirectory, pinnedDirectoryIsStable, readPinnedFileFull, withPinnedExclusiveLockAsync, writePinnedFile, type PinnedDirectory, type PinnedDirectoryCreationReceipt } from './fs-safety.js';
+import { parseFullstackActivationMarker } from '@andvl1/omp-workflows-fullstack/activation-marker';
 
 const SETUP_SCHEMA_VERSION = 1;
+const SAFE_FEATURE_ID_RE = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
+const SAFE_RUN_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const CTO_FIXTURE_LOCK = '.cto-execution-fixture.lock';
 const MANIFEST_RELATIVE_PATH = '.work-state/ux-e2e/cto-execution-fixture.json';
 const ARTIFACTS_RELATIVE_PREFIX = '.work-state/features';
 const FIXTURE_CONSTITUTION = [
@@ -222,7 +226,6 @@ type FixtureApi = {
   readonly createFeatureWorkspace: CoreCall;
   readonly persistFeatureWorkspace: CoreCall;
   readonly resolveFeatureWorkspace: CoreCall;
-  readonly bindWorkspaceConstitution: CoreCall;
   readonly materializeImplementationHandoff: CoreCall;
   readonly writeArtifactPinned: CoreCall;
   readonly acquireExecutionClaim: CoreCall;
@@ -230,6 +233,7 @@ type FixtureApi = {
   readonly applyManualEdits: CoreCall;
   readonly ensureProjectConstitution: CoreCall;
   readonly readProjectConstitutionGate: CoreCall;
+  readonly resolveCurrentConstitutionBinding: CoreCall;
   readonly readPinnedCurrentConstitution: CoreCall;
   readonly canonicalHandoffDigest: CoreCall;
   readonly digestOf: CoreCall;
@@ -250,6 +254,21 @@ type FixtureApi = {
 function call(value: unknown, label: string): CoreCall {
   if (typeof value !== 'function') throw new Error(`CTO fixture core API is missing ${label}`);
   return value as CoreCall;
+}
+
+function guardFixtureApi(api: FixtureApi, pinned: PinnedDirectory): FixtureApi {
+  return new Proxy(api, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === 'PinnedProjectRoot' || typeof value !== 'function') return value;
+      return (...args: readonly unknown[]) => {
+        if (!pinnedDirectoryIsStable(pinned)) throw new Error(`CTO fixture scratch root changed before ${String(property)}`);
+        const returned = value(...args);
+        if (!pinnedDirectoryIsStable(pinned)) throw new Error(`CTO fixture scratch root changed after ${String(property)}`);
+        return returned;
+      };
+    },
+  });
 }
 
 async function importCoreModule(packageRoot: string, relativePath: string): Promise<Record<string, unknown>> {
@@ -273,6 +292,8 @@ export async function loadCtoExecutionFixtureApi(scratchDir: string): Promise<Fi
   try {
     const packageJson = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')) as { name?: unknown; version?: unknown };
     if (packageJson.name !== '@andvl1/omp-workflows-core' || packageJson.version !== '0.27.0') throw new Error('linked package identity/version mismatch');
+    const expectedCore = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'core'));
+    if (packageRoot !== expectedCore) throw new Error('scratch core symlink does not target the current E2E workspace core package');
   } catch (error) {
     throw new Error(`CTO fixture core package identity could not be verified: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -290,7 +311,6 @@ export async function loadCtoExecutionFixtureApi(scratchDir: string): Promise<Fi
     createFeatureWorkspace: call(workspace['createFeatureWorkspace'], 'createFeatureWorkspace'),
     persistFeatureWorkspace: call(workspace['persistFeatureWorkspace'], 'persistFeatureWorkspace'),
     resolveFeatureWorkspace: call(workspace['resolveFeatureWorkspace'], 'resolveFeatureWorkspace'),
-    bindWorkspaceConstitution: call(workspace['bindWorkspaceConstitution'], 'bindWorkspaceConstitution'),
     materializeImplementationHandoff: call(handoff['materializeImplementationHandoff'], 'materializeImplementationHandoff'),
     writeArtifactPinned: call(core['writeArtifactPinned'], 'writeArtifactPinned'),
     acquireExecutionClaim: call(claims['acquireExecutionClaim'], 'acquireExecutionClaim'),
@@ -298,6 +318,7 @@ export async function loadCtoExecutionFixtureApi(scratchDir: string): Promise<Fi
     applyManualEdits: call(workspace['applyManualEdits'], 'applyManualEdits'),
     ensureProjectConstitution: call(prerequisite['ensureProjectConstitution'], 'ensureProjectConstitution'),
     readProjectConstitutionGate: call(prerequisite['readProjectConstitutionGate'], 'readProjectConstitutionGate'),
+    resolveCurrentConstitutionBinding: call(prerequisite['resolveCurrentConstitutionBinding'], 'resolveCurrentConstitutionBinding'),
     readPinnedCurrentConstitution: call((await importCoreModule(packageRoot, 'specification/constitution-identities.js'))['readPinnedCurrentConstitution'], 'readPinnedCurrentConstitution'),
     canonicalHandoffDigest: call(handoff['canonicalHandoffDigest'], 'canonicalHandoffDigest'),
     digestOf: call(validation['digestOf'], 'digestOf'),
@@ -445,14 +466,30 @@ function adaptFeatureHandoff(featureId: string, binding: Record<string, unknown>
 }
 
 function materializePassing(root: string, featureId: string): void {
-  const dir = join(root, 'specs', featureId);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'spec.md'), PASSING_SPECIFICATION);
-  writeFileSync(join(dir, 'plan.md'), PASSING_PLAN);
-  writeFileSync(join(dir, 'tasks.md'), PASSING_TASKS);
-  const source = join(root, 'src', 'passing');
-  mkdirSync(source, { recursive: true });
-  writeFileSync(join(source, 'index.js'), PASSING_SOURCE);
+  const pinned = pinDirectory(root);
+  if (pinned === null) throw new Error('passing fixture root could not be pinned safely');
+  const created: PinnedDirectoryCreationReceipt[] = [];
+  try {
+    const specs = pinChildDirectory(pinned, ['specs', featureId], created);
+    const source = pinChildDirectory(pinned, ['src', 'passing'], created);
+    if (specs === null || source === null || !pinnedDirectoryIsStable(pinned)) {
+      throw new Error('passing fixture descendants are not stable regular directories');
+    }
+    for (const [directory, name, content] of [
+      [specs, 'spec.md', PASSING_SPECIFICATION],
+      [specs, 'plan.md', PASSING_PLAN],
+      [specs, 'tasks.md', PASSING_TASKS],
+      [source, 'index.js', PASSING_SOURCE],
+    ] as const) {
+      if (!writePinnedFile(directory, name, Buffer.from(content, 'utf8'), { replaceExisting: false })) {
+        throw new Error(`failed to publish passing fixture file ${name}`);
+      }
+    }
+    if (!pinnedDirectoryIsStable(pinned)) throw new Error('scratch root changed while publishing passing fixture');
+  } finally {
+    closePinnedDirectoryCreationReceipts(created);
+    closePinnedDirectory(pinned);
+  }
 }
 
 function approvedWorkspace(created: Record<string, unknown>, handoff: Record<string, unknown>): Record<string, unknown> {
@@ -529,47 +566,213 @@ function materializeFeature(api: FixtureApi, root: string, featureId: string, ru
   return { feature_id: featureId, run_key: runKey, handoff, workspace };
 }
 
-function readManifest(api: FixtureApi, root: string): Record<string, unknown> | null {
-  const pinned = new api.PinnedProjectRoot(root);
-  try {
-    if (!pinned.isStable()) throw new Error('scratch root changed while reading CTO fixture manifest');
-    if (!existsSync(join(root, MANIFEST_RELATIVE_PATH))) return null;
-    const content = new TextDecoder().decode(pinned.readFile(MANIFEST_RELATIVE_PATH, { maxBytes: 1_048_576 }).bytes);
-    return record(JSON.parse(content), 'CTO fixture manifest');
-  } finally {
-    pinned.close();
-  }
+function readManifest(pinned: PinnedDirectory): Record<string, unknown> | null {
+  if (!pinnedDirectoryIsStable(pinned)) throw new Error('scratch root changed while reading CTO fixture manifest');
+  const bytes = readPinnedDescendant(pinned, MANIFEST_RELATIVE_PATH.split('/'), 1_048_576);
+  if (bytes === null) return null;
+  return record(JSON.parse(new TextDecoder().decode(bytes)), 'CTO fixture manifest');
 }
-function writeManifest(api: FixtureApi, root: string, manifest: Record<string, unknown>): void {
-  const pinned = new api.PinnedProjectRoot(root);
+function writeManifest(pinned: PinnedDirectory, manifest: Record<string, unknown>): void {
+  if (!pinnedDirectoryIsStable(pinned)) throw new Error('CTO fixture scratch root changed before manifest commit');
+  const created: PinnedDirectoryCreationReceipt[] = [];
+  const parent = pinChildDirectory(pinned, ['.work-state', 'ux-e2e'], created);
+  if (parent === null) {
+    closePinnedDirectoryCreationReceipts(created);
+    throw new Error('CTO fixture manifest parent is not a stable regular directory');
+  }
   try {
-    pinned.ensureDirectory('.work-state/ux-e2e');
-    pinned.writeAtomic(MANIFEST_RELATIVE_PATH, `${JSON.stringify(manifest, null, 2)}\n`);
+    const content = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    if (!writePinnedFile(parent, 'cto-execution-fixture.json', content, { replaceExisting: false })) {
+      throw new Error('CTO fixture manifest already exists or could not be published atomically');
+    }
+    if (!pinnedDirectoryIsStable(pinned)) throw new Error('CTO fixture scratch root changed after manifest commit');
   } finally {
-    pinned.close();
+    closePinnedDirectory(parent);
+    closePinnedDirectoryCreationReceipts(created);
   }
 }
 
 function setupDigest(setup: CtoExecutionScenarioSetup): string {
   return sha256(canonicalJson(setup));
 }
+
+function assertSafeFixtureSelector(featureId: unknown, runKey: unknown, label: string): asserts featureId is string {
+  if (typeof featureId !== 'string' || !SAFE_FEATURE_ID_RE.test(featureId)) {
+    throw new Error(`${label} feature_id is unsafe`);
+  }
+  if (typeof runKey !== 'string' || !SAFE_RUN_KEY_RE.test(runKey)) {
+    throw new Error(`${label} run_key is unsafe`);
+  }
+}
+
+function pinExistingDescendant(root: PinnedDirectory, components: readonly string[]): PinnedDirectory | null {
+  if (components.length === 0 || !pinnedDirectoryIsStable(root)) return null;
+  let path = root.physicalPath;
+  for (const component of components) {
+    path = join(path, component);
+    let stat;
+    try { stat = lstatSync(path); } catch { return null; }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return null;
+  }
+  return pinDirectory(path);
+}
+
+function readPinnedDescendant(root: PinnedDirectory, components: readonly string[], maxBytes: number): Buffer | null {
+  if (components.length === 0) return null;
+  if (components.length === 1) return readPinnedFileFull(root, components[0]!, maxBytes);
+  const parent = pinExistingDescendant(root, components.slice(0, -1));
+  if (parent === null) return null;
+  try {
+    return readPinnedFileFull(parent, components[components.length - 1]!, maxBytes);
+  } finally {
+    closePinnedDirectory(parent);
+  }
+}
+
+function assertBootstrapProvenance(root: string, identity: { canonical_path: string; dev: number; ino: number }, retained?: PinnedDirectory): void {
+  const pinned = retained ?? pinDirectory(root);
+  const ownsPin = retained === undefined;
+  if (pinned === null) throw new Error('CTO fixture scratch root could not be pinned for bootstrap provenance');
+  try {
+    if (pinned.identity.dev !== identity.dev || pinned.identity.ino !== identity.ino) throw new Error('CTO fixture scratch root changed while authenticating bootstrap provenance');
+    const provenanceBytes = readPinnedDescendant(pinned, UX_E2E_BOOTSTRAP_PROVENANCE_PATH.split('/'), 64 * 1024);
+    if (provenanceBytes === null) throw new Error('CTO fixture requires bootstrap provenance');
+    const provenance = record(JSON.parse(new TextDecoder().decode(provenanceBytes)), 'bootstrap provenance');
+    const expectedKeys = ['schema_version', 'kind', 'canonical_root', 'root_basename', 'slug', 'branch', 'monorepo_root', 'core_target', 'nonce'];
+    const keys = Object.keys(provenance);
+    if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) throw new Error('bootstrap provenance keys are not exact');
+    if (provenance['schema_version'] !== 1 || provenance['kind'] !== 'ux-e2e-bootstrap'
+      || provenance['canonical_root'] !== identity.canonical_path || provenance['root_basename'] !== basename(identity.canonical_path)
+      || typeof provenance['slug'] !== 'string' || !/^[a-z0-9][a-z0-9-]*$/u.test(provenance['slug'])
+      || typeof provenance['branch'] !== 'string' || provenance['branch'].length === 0 || /[\u0000\r\n]/u.test(provenance['branch'])
+      || typeof provenance['nonce'] !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(provenance['nonce'])) {
+      throw new Error('bootstrap provenance identity is invalid');
+    }
+    const packageBytes = readPinnedFileFull(pinned, 'package.json', 64 * 1024);
+    if (packageBytes === null) throw new Error('bootstrap package manifest is missing');
+    const packageManifest = record(JSON.parse(new TextDecoder().decode(packageBytes)), 'bootstrap package manifest');
+    if (packageManifest['private'] !== true || packageManifest['name'] !== `omp-ux-e2e-${provenance['slug']}`) throw new Error('bootstrap package identity is not private and harness-owned');
+    const headBytes = readPinnedDescendant(pinned, ['.git', 'HEAD'], 4096);
+    if (headBytes === null) throw new Error('bootstrap git HEAD is missing');
+    const head = new TextDecoder().decode(headBytes).trim();
+    if (head !== `ref: refs/heads/${provenance['branch']}`) throw new Error('bootstrap git branch does not match provenance');
+    const monorepo = resolve(realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')));
+    const expectedCore = resolve(realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'core')));
+    if (provenance['monorepo_root'] !== monorepo || provenance['core_target'] !== expectedCore) throw new Error('bootstrap provenance package target drifted');
+  } catch (error) {
+    if (error instanceof Error && /CTO fixture|bootstrap/u.test(error.message)) throw error;
+    throw new Error(`CTO fixture bootstrap provenance is invalid: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    if (ownsPin) closePinnedDirectory(pinned);
+  }
+}
+
+function assertSetupPreflight(setup: CtoExecutionScenarioSetup): void {
+  if (setup === null || typeof setup !== 'object' || setup.kind !== 'cto-execution' || setup.schema_version !== SETUP_SCHEMA_VERSION) {
+    throw new Error('unsupported CTO execution fixture setup');
+  }
+  if (!Array.isArray(setup.selectors) || setup.selectors.length !== 4) {
+    throw new Error('CTO fixture requires exactly four selectors');
+  }
+  const selectors = setup.selectors as readonly unknown[];
+  const features = new Set<string>();
+  const pairs = new Set<string>();
+  for (const [index, raw] of selectors.entries()) {
+    const selector = record(raw, `CTO fixture selector ${index}`);
+    const featureId = selector['feature_id'];
+    const runKey = selector['run_key'];
+    assertSafeFixtureSelector(featureId, runKey, `CTO fixture selector ${index}`);
+    if (features.has(featureId)) throw new Error(`CTO fixture feature_id is duplicated: ${featureId}`);
+    features.add(featureId);
+    const pair = `${featureId}\u0000${runKey}`;
+    if (pairs.has(pair)) throw new Error(`CTO fixture selector is duplicated: ${featureId}/${runKey}`);
+    pairs.add(pair);
+  }
+  const stale = record(setup.stale, 'CTO fixture stale selector');
+  const claimed = record(setup.claimed, 'CTO fixture claimed selector');
+  assertSafeFixtureSelector(stale['feature_id'], stale['run_key'], 'CTO fixture stale selector');
+  assertSafeFixtureSelector(claimed['feature_id'], claimed['run_key'], 'CTO fixture claimed selector');
+  const stalePair = `${stale['feature_id']}\u0000${stale['run_key']}`;
+  const claimedPair = `${claimed['feature_id']}\u0000${claimed['run_key']}`;
+  if (!pairs.has(stalePair)) throw new Error('CTO fixture stale selector is not an exact member of selectors');
+  if (!pairs.has(claimedPair)) throw new Error('CTO fixture claimed selector is not an exact member of selectors');
+  if (stalePair === claimedPair) throw new Error('CTO fixture stale and claimed selectors must be distinct');
+  if (stale['phase'] !== 'plan' || stale['version'] !== 1) throw new Error('CTO fixture stale revision must target plan v1');
+  if (typeof stale['expected_sha256'] !== 'string' || !/^[a-f0-9]{64}$/u.test(stale['expected_sha256'])) throw new Error('CTO fixture stale expected_sha256 is invalid');
+  if (typeof stale['actual_sha256'] !== 'string' || !/^[a-f0-9]{64}$/u.test(stale['actual_sha256'])) throw new Error('CTO fixture stale actual_sha256 is invalid');
+  if (typeof stale['reason'] !== 'string' || stale['reason'].length === 0) throw new Error('CTO fixture stale reason is invalid');
+  if (claimed['owner_kind'] !== 'do_work' || typeof claimed['owner_run_id'] !== 'string' || claimed['owner_run_id'].length === 0) throw new Error('CTO fixture claimed owner is invalid');
+}
+
+function existingDescendant(root: PinnedDirectory, components: readonly string[]): boolean {
+  if (!pinnedDirectoryIsStable(root) || components.length === 0) return false;
+  let current = root.physicalPath;
+  for (const component of components) {
+    current = join(current, component);
+    let stat;
+    try { stat = lstatSync(current); } catch { return false; }
+    if (stat.isSymbolicLink()) throw new Error(`CTO fixture refuses a symlinked existing path: ${components.join('/')}`);
+    if (component !== components[components.length - 1] && !stat.isDirectory()) return false;
+  }
+  return true;
+}
+
+function assertNoPartialFixtureState(root: string, setup: CtoExecutionScenarioSetup, pinned: PinnedDirectory): void {
+  if (existingDescendant(pinned, MANIFEST_RELATIVE_PATH.split('/'))) return;
+  if (existingDescendant(pinned, ['.work-state', 'specification', 'constitution', 'gate.json'])) throw new Error('CTO fixture refuses to continue over an existing constitution gate without its manifest');
+  for (const selector of setup.selectors) {
+    const featureRoot = existingDescendant(pinned, [ARTIFACTS_RELATIVE_PREFIX, selector.feature_id]);
+    const specRoot = existingDescendant(pinned, ['specs', selector.feature_id]);
+    if (featureRoot || specRoot) throw new Error(`CTO fixture refuses to continue over partial state for ${selector.feature_id}`);
+  }
+  if (existingDescendant(pinned, ['CONSTITUTION.md'])) {
+    const bytes = readPinnedFileFull(pinned, 'CONSTITUTION.md', 1_048_576);
+    if (bytes === null || bytes.toString('utf8') !== FIXTURE_CONSTITUTION) throw new Error('CTO fixture refuses to replace an existing constitution document');
+  }
+}
 function setupSelectors(setup: CtoExecutionScenarioSetup): Array<{ feature_id: string; run_key: string }> {
   return setup.selectors.map(selector => ({ feature_id: selector.feature_id, run_key: selector.run_key }));
 }
+function normalizeDarwinTmpAlias(path: string): string {
+  if (process.platform === 'darwin' && (path === '/tmp' || path.startsWith('/tmp/'))) return `/private${path}`;
+  return path;
+}
+
 function rootIdentity(root: string): { canonical_path: string; dev: number; ino: number } {
-  const canonical = realpathSync(root);
+  const lexical = resolve(root);
+  const canonical = resolve(realpathSync(lexical));
+  if (normalizeDarwinTmpAlias(lexical) !== normalizeDarwinTmpAlias(canonical)) {
+    throw new Error('CTO fixture scratch root must not have a symlinked ancestor or root');
+  }
   const stat = lstatSync(canonical);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('CTO fixture scratch root is not a regular directory');
+  const pinned = pinDirectory(canonical);
+  if (pinned === null) throw new Error('CTO fixture scratch root could not be pinned safely');
+  try {
+    const omp = pinExistingDescendant(pinned, ['.omp']);
+    if (omp === null) throw new Error('CTO fixture bootstrap marker parent is not a stable regular directory');
+    try {
+      const marker = readPinnedFileFull(omp, 'fullstack.activation.json', 4096);
+      if (marker === null || parseFullstackActivationMarker(marker) === null) throw new Error('CTO fixture requires the authenticated fullstack bootstrap marker');
+    } finally {
+      closePinnedDirectory(omp);
+    }
+  } finally {
+    closePinnedDirectory(pinned);
+  }
   return { canonical_path: canonical, dev: stat.dev, ino: stat.ino };
 }
 function assertSameManifest(actual: Record<string, unknown>, expected: Record<string, unknown>): void {
   if (canonicalJson(actual) !== canonicalJson(expected)) throw new Error('CTO fixture manifest does not match the exact scenario selectors/setup; refusing to mutate existing claims');
 }
-function existingSetup(api: FixtureApi, root: string, manifest: Record<string, unknown>, expected: Record<string, unknown>): CtoExecutionFixtureResult {
+function existingSetup(api: FixtureApi, root: string, manifest: Record<string, unknown>, expected: Record<string, unknown>, pinned: PinnedDirectory): CtoExecutionFixtureResult {
   assertSameManifest(manifest, expected);
   const features: SeededCtoFeature[] = [];
   const gate = resultValue(api.readProjectConstitutionGate(root), 'constitution fixture gate');
   if (gate['status'] !== 'usable' && gate['status'] !== 'approved') throw new Error(`constitution fixture gate is no longer usable: ${String(gate['status'])}`);
   const gateBinding = record(gate['binding'], 'constitution fixture binding');
+  const currentBinding = resultValue(api.resolveCurrentConstitutionBinding(root, { explicit_path: gateBinding['path'] }), 'current constitution binding');
+  if (canonicalJson(currentBinding) !== canonicalJson(gateBinding)) throw new Error('current constitution source/binding drifted after setup');
   const selectors = expected['selectors'];
   if (!Array.isArray(selectors)) throw new Error('CTO fixture manifest selectors are malformed');
   for (const selector of selectors) {
@@ -577,17 +780,11 @@ function existingSetup(api: FixtureApi, root: string, manifest: Record<string, u
     const featureId = pair['feature_id'];
     const runKey = pair['run_key'];
     if (typeof featureId !== 'string' || typeof runKey !== 'string') throw new Error('CTO fixture selector is malformed');
-    const workspaceResult = resultValue(api.resolveFeatureWorkspace(root, { feature_id: featureId, run_key: runKey }), `${featureId} resolve workspace`);
+    const workspaceResult = resultValue(api.resolveFeatureWorkspace(root, { feature_id: featureId, run_key: runKey }, undefined, { persistMigration: false }), `${featureId} resolve workspace`);
     const handoffId = `${featureId}.handoff.v1`;
-    const handoffPath = join(root, artifactDirectory(featureId), `${handoffId}.json`);
-    if (!existsSync(handoffPath)) throw new Error(`${featureId} handoff artifact is missing`);
-    const handoffRoot = new api.PinnedProjectRoot(root);
-    let handoff: Record<string, unknown>;
-    try {
-      handoff = record(JSON.parse(new TextDecoder().decode(handoffRoot.readFile(join(artifactDirectory(featureId), `${handoffId}.json`), { maxBytes: 8 * 1024 * 1024 }).bytes)) as unknown, `${featureId} handoff`);
-    } finally {
-      handoffRoot.close();
-    }
+    const handoffBytes = readPinnedDescendant(pinned, [...artifactDirectory(featureId).split('/'), `${handoffId}.json`], 8 * 1024 * 1024);
+    if (handoffBytes === null) throw new Error(`${featureId} handoff artifact is missing`);
+    const handoff = record(JSON.parse(new TextDecoder().decode(handoffBytes)) as unknown, `${featureId} handoff`);
     const handoffDigest = handoff['handoff_digest'];
     if (typeof handoffDigest !== 'string') throw new Error(`${featureId} handoff digest is missing`);
     if (canonicalJson(handoff['constitution_binding']) !== canonicalJson(gateBinding)) throw new Error(`${featureId} handoff constitution binding changed after setup`);
@@ -621,14 +818,16 @@ function existingSetup(api: FixtureApi, root: string, manifest: Record<string, u
  * Re-running with the same root/setup is a read-only verification; a changed
  * selector/setup or partial conflicting state fails closed.
  */
-export async function prepareCtoExecutionFixture(
+async function prepareCtoExecutionFixtureUnlocked(
   root: string,
   setup: CtoExecutionScenarioSetup,
-  api?: FixtureApi,
+  runtimeApi: FixtureApi,
+  pinned: PinnedDirectory,
 ): Promise<CtoExecutionFixtureResult> {
-  const runtimeApi = api ?? await loadCtoExecutionFixtureApi(root);
-  if (setup.kind !== 'cto-execution' || setup.schema_version !== SETUP_SCHEMA_VERSION) throw new Error('unsupported CTO execution fixture setup');
-  const identity = rootIdentity(root);
+  assertNoPartialFixtureState(root, setup, pinned);
+  if (!pinnedDirectoryIsStable(pinned)) throw new Error('CTO fixture scratch root changed before setup');
+  const api = guardFixtureApi(runtimeApi, pinned);
+  const identity = { canonical_path: pinned.physicalPath, dev: pinned.identity.dev, ino: pinned.identity.ino };
   const expectedManifest: Record<string, unknown> = {
     schema_version: SETUP_SCHEMA_VERSION,
     kind: setup.kind,
@@ -642,19 +841,15 @@ export async function prepareCtoExecutionFixture(
   const prior = readManifest(runtimeApi, root);
   if (prior !== null) return existingSetup(runtimeApi, root, prior, expectedManifest);
 
-  const constitutionPath = join(root, 'CONSTITUTION.md');
-  const constitutionRoot = new runtimeApi.PinnedProjectRoot(root);
+  const constitutionRoot = new api.PinnedProjectRoot(root);
   try {
-    if (existsSync(constitutionPath)) {
-      const current = new TextDecoder().decode(constitutionRoot.readFile('CONSTITUTION.md', { maxBytes: 1_048_576 }).bytes);
-      if (current !== FIXTURE_CONSTITUTION) throw new Error('CTO fixture refuses to replace an existing constitution document');
-    } else {
+    if (!existingDescendant(pinned, ['CONSTITUTION.md'])) {
       constitutionRoot.writeAtomic('CONSTITUTION.md', FIXTURE_CONSTITUTION);
     }
   } finally {
     constitutionRoot.close();
   }
-  const gate = resultValue(runtimeApi.ensureProjectConstitution(root, {
+  const gate = resultValue(api.ensureProjectConstitution(root, {
     origin_kind: 'native_direct',
     origin_run_key: 'spec-cto-execution-fixture-bootstrap',
     origin_stage: 'specify',
@@ -666,17 +861,17 @@ export async function prepareCtoExecutionFixture(
   const staleSpec = setup.stale;
   const stale = seeded.find(feature => feature.feature_id === staleSpec.feature_id && feature.run_key === staleSpec.run_key);
   if (!stale) throw new Error('stale fixture selector is not in the exact selector set');
-  const staleResult = record(runtimeApi.applyManualEdits(stale.workspace, {
+  const staleResult = record(api.applyManualEdits(stale.workspace, {
     feature_id: stale.feature_id,
     phase: staleSpec.phase,
     version: staleSpec.version,
     documents: { 'plan.md': { expected_sha256: staleSpec.expected_sha256, actual_sha256: staleSpec.actual_sha256, matches: false } },
   }, staleSpec.reason), 'stale fixture revision');
-  result(runtimeApi.persistFeatureWorkspace(root, staleResult['workspace'], undefined, { expected_workspace_digest: digest(runtimeApi, stale.workspace, 'stale workspace') }), 'stale fixture persistence');
+  result(api.persistFeatureWorkspace(root, staleResult['workspace'], undefined, { expected_workspace_digest: digest(api, stale.workspace, 'stale workspace') }), 'stale fixture persistence');
 
   const claimed = seeded.find(feature => feature.feature_id === setup.claimed.feature_id && feature.run_key === setup.claimed.run_key);
   if (!claimed) throw new Error('claimed fixture selector is not in the exact selector set');
-  result(runtimeApi.acquireExecutionClaim(root, claimed.feature_id, {
+  result(api.acquireExecutionClaim(root, claimed.feature_id, {
     handoff: claimed.handoff,
     run_key: claimed.run_key,
     owner_kind: setup.claimed.owner_kind,
@@ -685,6 +880,27 @@ export async function prepareCtoExecutionFixture(
 
   writeManifest(runtimeApi, root, expectedManifest);
   return { manifest: expectedManifest, features: seeded };
+}
+
+export async function prepareCtoExecutionFixture(
+  root: string,
+  setup: CtoExecutionScenarioSetup,
+  api?: FixtureApi,
+): Promise<CtoExecutionFixtureResult> {
+  // Validate all caller-controlled selectors before creating a lock or joining any selector path.
+  assertSetupPreflight(setup);
+  const identity = rootIdentity(root);
+  const pinned = pinDirectory(identity.canonical_path);
+  if (pinned === null) throw new Error('CTO fixture scratch root could not be pinned safely');
+  try {
+    assertBootstrapProvenance(identity.canonical_path, identity, pinned);
+    return await withPinnedExclusiveLockAsync(pinned, CTO_FIXTURE_LOCK, async () => {
+      const runtimeApi = api ?? await loadCtoExecutionFixtureApi(identity.canonical_path);
+      return prepareCtoExecutionFixtureUnlocked(identity.canonical_path, setup, runtimeApi, pinned);
+    }, 10_000);
+  } finally {
+    closePinnedDirectory(pinned);
+  }
 }
 
 export function fixtureConstitutionContent(): string {

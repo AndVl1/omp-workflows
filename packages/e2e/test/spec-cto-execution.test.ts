@@ -61,6 +61,7 @@ import {
   fixturePassingSpecification,
   fixturePassingTasks,
   fixtureManifestPath,
+  fixtureConstitutionContent,
   prepareCtoExecutionFixture,
   PASSING_TASK_GRAPH as CTO_PASSING_TASK_GRAPH,
   type SeededCtoFeature,
@@ -1232,6 +1233,53 @@ test('passing fixture: readable specification refs and executable deliverable ar
     assert.ok(seeded !== undefined, 'shared CTO setup includes the passing feature');
     if (seeded === undefined) throw new Error('shared CTO setup is missing the passing feature');
     assertPassingFixture(scratch.root, featureId, seeded.handoff as ImplementationHandoff);
+  } finally {
+    rmSync(scratch.parent, { recursive: true, force: true });
+  }
+});
+
+test('CTO fixture rejects unsafe selectors and bad role relations before any write', async () => {
+  const scratch = makeScratch();
+  try {
+    const scenario = loadScenario(SCENARIO_PATH);
+    if (scenario.setup === undefined) throw new Error('spec-cto-execution declares its strict CTO fixture setup');
+    const unsafe = JSON.parse(JSON.stringify(scenario.setup)) as typeof scenario.setup;
+    (unsafe.selectors as Array<{ feature_id: string; run_key: string }>)[0]!.feature_id = '../escape';
+    await assert.rejects(() => prepareCtoExecutionFixture(scratch.root, unsafe), /unsafe/u);
+    assert.equal(existsSync(join(scratch.root, 'CONSTITUTION.md')), false, 'unsafe selectors write no constitution');
+    assert.equal(existsSync(join(scratch.root, fixtureManifestPath())), false, 'unsafe selectors write no manifest');
+    assert.equal(existsSync(join(scratch.root, '.work-state', 'features')), false, 'unsafe selectors write no feature state');
+    assert.equal(existsSync(join(scratch.parent, 'escape')), false, 'unsafe selector cannot escape scratch root');
+
+    const badRelation = {
+      ...scenario.setup,
+      claimed: {
+        ...scenario.setup.claimed,
+        feature_id: scenario.setup.stale.feature_id,
+        run_key: scenario.setup.stale.run_key,
+      },
+    };
+    await assert.rejects(() => prepareCtoExecutionFixture(scratch.root, badRelation), /distinct|exact member/u);
+    assert.equal(existsSync(join(scratch.root, 'CONSTITUTION.md')), false, 'invalid role relation writes no constitution');
+    assert.equal(existsSync(join(scratch.root, fixtureManifestPath())), false, 'invalid role relation writes no manifest');
+  } finally {
+    rmSync(scratch.parent, { recursive: true, force: true });
+  }
+});
+
+test('CTO fixture restart verifies current provenance and constitution source without writes', async () => {
+  const scratch = makeScratch();
+  try {
+    const scenario = loadScenario(SCENARIO_PATH);
+    if (scenario.setup === undefined) throw new Error('spec-cto-execution declares its strict CTO fixture setup');
+    const prepared = await prepareCtoExecutionFixture(scratch.root, scenario.setup);
+    const manifestPath = join(scratch.root, fixtureManifestPath());
+    const manifestBefore = readFileSync(manifestPath);
+    await prepareCtoExecutionFixture(scratch.root, scenario.setup);
+    assert.deepEqual(readFileSync(manifestPath), manifestBefore, 'idempotent setup keeps manifest bytes stable');
+    writeFileSync(join(scratch.root, 'CONSTITUTION.md'), `${fixtureConstitutionContent()}\n`);
+    await assert.rejects(() => prepareCtoExecutionFixture(scratch.root, scenario.setup), /constitution|drift/u);
+    assert.deepEqual(readFileSync(manifestPath), manifestBefore, 'constitution drift does not rewrite the manifest');
   } finally {
     rmSync(scratch.parent, { recursive: true, force: true });
   }

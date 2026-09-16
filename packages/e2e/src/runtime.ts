@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,11 +12,67 @@ import {
 } from '@andvl1/omp-workflows-fullstack/activation-marker';
 /** Project settings path consumed by OMP v18 extension discovery. */
 export const UX_E2E_PROJECT_SETTINGS_PATH = '.omp/settings.json';
+/** Root-bound provenance proving that a scratch was explicitly bootstrapped by this harness. */
+export const UX_E2E_BOOTSTRAP_PROVENANCE_PATH = '.work-state/ux-e2e/bootstrap-provenance.json';
+export interface UxE2eBootstrapProvenanceInput {
+  readonly slug: string;
+  readonly branch: string;
+  readonly monorepoRoot: string;
+  readonly coreTarget: string;
+}
+
 /** Relative linked package root whose manifest owns runtime registration. */
 export const UX_E2E_RUNTIME_EXTENSION_PACKAGE = 'node_modules/@andvl1/omp-workflows-fullstack';
 /** Resolve the absolute fullstack package root used by every real OMP child. */
 export function runtimeExtensionPackagePath(scratchDir: string): string {
   return resolve(scratchDir, UX_E2E_RUNTIME_EXTENSION_PACKAGE);
+}
+
+function normalizeDarwinTmpAlias(path: string): string {
+  if (process.platform === 'darwin' && (path === '/tmp' || path.startsWith('/tmp/'))) return `/private${path}`;
+  return path;
+}
+
+/**
+ * Persist explicit bootstrap provenance; scenario setup accepts only this record.
+ * The record is a local capability, not a credential: a same-UID actor able to
+ * copy and rewrite the entire scratch tree is inside the filesystem trust
+ * boundary, while accidental use of a production/ambient root is rejected.
+ */
+export function writeUxE2eBootstrapProvenance(
+  scratchDir: string,
+  input: UxE2eBootstrapProvenanceInput,
+): void {
+  const lexical = resolve(scratchDir);
+  const canonical = resolve(realpathSync(lexical));
+  if (normalizeDarwinTmpAlias(lexical) !== normalizeDarwinTmpAlias(canonical)) {
+    throw new Error('ux-e2e: bootstrap scratch root must not have a symlinked ancestor or root');
+  }
+  const packagePath = join(canonical, 'package.json');
+  const packageStat = lstatSync(packagePath);
+  if (!packageStat.isFile() || packageStat.isSymbolicLink() || packageStat.nlink !== 1) {
+    throw new Error('ux-e2e: bootstrap package manifest is not a private regular file');
+  }
+  const packageManifest = JSON.parse(readFileSync(packagePath, 'utf8')) as { name?: unknown; private?: unknown };
+  if (packageManifest.private !== true || packageManifest.name !== `omp-ux-e2e-${input.slug}`) {
+    throw new Error('ux-e2e: bootstrap package identity is not private and harness-owned');
+  }
+  const monorepo = resolve(realpathSync(input.monorepoRoot));
+  const core = resolve(realpathSync(input.coreTarget));
+  const expectedCore = resolve(monorepo, 'packages', 'core');
+  if (core !== expectedCore) throw new Error('ux-e2e: bootstrap core target is outside the selected monorepo');
+  const provenance = {
+    schema_version: 1,
+    kind: 'ux-e2e-bootstrap',
+    canonical_root: canonical,
+    root_basename: basename(canonical),
+    slug: input.slug,
+    branch: input.branch,
+    monorepo_root: monorepo,
+    core_target: core,
+    nonce: randomUUID(),
+  } as const;
+  writeJsonAtomically(canonical, UX_E2E_BOOTSTRAP_PROVENANCE_PATH, provenance, '.ux-e2e-bootstrap-provenance-');
 }
 
 

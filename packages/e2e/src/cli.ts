@@ -20,9 +20,7 @@ import {
   ftruncateSync,
   constants as fsConstants,
   lstatSync,
-  mkdirSync,
   readFileSync,
-  rmSync,
   statSync,
   writeFileSync,
   writeSync,
@@ -71,8 +69,9 @@ import { prepareCtoExecutionFixture } from './cto-execution-fixtures.js';
 
 import { deferred } from './util.js';
 import { writeUxE2eOverlay } from './overlay.js';
-import { closePinnedDirectory, closePinnedFile, openPinnedFile, pinDirectory, pinOrCreateDirectory, pinnedDirectoryIsStable, readPinnedFile, readPinnedFileFull, withPinnedExclusiveLock } from './fs-safety.js';
-import { prepareRuntimeScratchProject } from './runtime.js';
+import { closePinnedDirectory, closePinnedDirectoryCreationReceipts, closePinnedFile, openPinnedFile, pinChildDirectory, pinDirectory, pinOrCreateDirectory, pinnedDirectoryIsStable, readPinnedFile, readPinnedFileFull, removePinnedDirectoryTreeIfExact, withPinnedExclusiveLock } from './fs-safety.js';
+import type { PinnedDirectoryCreationReceipt } from './fs-safety.js';
+import { prepareRuntimeScratchProject, writeUxE2eBootstrapProvenance } from './runtime.js';
 const USAGE = `ux-e2e — interactive UX E2E test framework for omp + omp-workflows
 
 Usage: ux-e2e <subcommand> [options]
@@ -256,12 +255,22 @@ function runBootstrapUnlocked(args: BootstrapArgs): string {
       if (!args.force) {
         throw new Error(`ux-e2e bootstrap: ${scratchDir} already exists — pass --force to re-create`);
       }
+      if (!removePinnedDirectoryTreeIfExact(workRoot, basename(scratchDir), scratchRoot.identity)) {
+        throw new Error('ux-e2e bootstrap: scratch directory changed during --force removal; refusing deletion');
+      }
     } finally {
       closePinnedDirectory(scratchRoot);
     }
-    rmSync(scratchDir, { recursive: true, force: true });
   }
-  mkdirSync(scratchDir, { recursive: true });
+  const createdScratch: PinnedDirectoryCreationReceipt[] = [];
+  const freshScratch = pinChildDirectory(workRoot, [basename(scratchDir)], createdScratch);
+  if (freshScratch === null || !createdScratch.some(receipt => receipt.name === basename(scratchDir))) {
+    if (freshScratch !== null) closePinnedDirectory(freshScratch);
+    closePinnedDirectoryCreationReceipts(createdScratch);
+    throw new Error('ux-e2e bootstrap: scratch directory appeared after exact removal; refusing to initialize it');
+  }
+  closePinnedDirectory(freshScratch);
+  closePinnedDirectoryCreationReceipts(createdScratch);
 
   execSync('git init', { cwd: scratchDir, stdio: 'inherit' });
   execSync(`git checkout -b ${shellQuote(args.branch)}`, { cwd: scratchDir, stdio: 'inherit' });
@@ -272,6 +281,12 @@ function runBootstrapUnlocked(args: BootstrapArgs): string {
   );
 
   prepareRuntimeScratchProject(scratchDir, monorepo);
+  writeUxE2eBootstrapProvenance(scratchDir, {
+    slug: args.slug,
+    branch: args.branch,
+    monorepoRoot: monorepo,
+    coreTarget: join(monorepo, 'packages', 'core'),
+  });
   writeUxE2eOverlay(scratchDir);
 
   console.log(`ux-e2e bootstrap: scratch project ready at ${sanitizeCliError(scratchDir)}`);
@@ -778,10 +793,6 @@ async function runStartDetached(args: StartArgs): Promise<number> {
         max_time: formatMaxTimeArg(args.maxTimeSec),
       })
     : null;
-  if (scenario?.setup !== undefined) {
-    if (scenario.id !== 'spec-cto-execution') throw new Error(`ux-e2e start: unsupported scenario setup '${scenario.id}'`);
-    await prepareCtoExecutionFixture(args.scratchDir, scenario.setup);
-  }
   const logPath = detachLogPath(args.scratchDir);
   const stateDir = stateDirOf(args.scratchDir);
   const stateRoot = pinOrCreateDirectory(stateDir);

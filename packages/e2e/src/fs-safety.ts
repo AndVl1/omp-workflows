@@ -1148,6 +1148,54 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
   }
 }
 
+/** Remove an exact directory tree beneath a retained parent descriptor. */
+export function removePinnedDirectoryTreeIfExact(
+  parent: PinnedDirectory,
+  name: string,
+  expected: Pick<FileIdentity, 'dev' | 'ino'>,
+): boolean {
+  if (!safeName(name) || !pinnedDescriptorIsStable(parent)) return false;
+  if (process.platform === 'darwin') {
+    return runDarwinHelper(parent, 'remove_tree', { name, expected_dev: expected.dev, expected_ino: expected.ino })?.removed === true;
+  }
+  const descriptorRoot = descriptorPathFor(parent.fd);
+  if (descriptorRoot === null) return false;
+  const child = join(descriptorRoot, name);
+  const removeTree = (entry: string, expectedIdentity?: Pick<FileIdentity, 'dev' | 'ino'>): boolean => {
+    let fd: number | null = null;
+    try {
+      const before = lstatSync(entry);
+      if (before.isSymbolicLink() || !before.isDirectory()
+        || (expectedIdentity !== undefined && !sameIdentity(before, expectedIdentity))) return false;
+      fd = openSync(entry, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+      const opened = fstatSync(fd);
+      if (!opened.isDirectory() || !sameIdentity(opened, before)) return false;
+      for (const childName of readdirSync(entry)) {
+        const childPath = join(entry, childName);
+        const childInfo = lstatSync(childPath);
+        if (childInfo.isSymbolicLink()) {
+          unlinkSync(childPath);
+        } else if (childInfo.isDirectory()) {
+          if (!removeTree(childPath)) return false;
+        } else {
+          unlinkSync(childPath);
+        }
+      }
+      const after = lstatSync(entry);
+      if (after.isSymbolicLink() || !after.isDirectory() || !sameIdentity(after, before)) return false;
+      rmdirSync(entry);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (fd !== null) {
+        try { closeSync(fd); } catch { /* best effort */ }
+      }
+    }
+  };
+  return removeTree(child, expected);
+}
+
 /** Remove one transaction-created empty child through its retained parent descriptor. */
 export function removePinnedDirectoryIfEmpty(receipt: PinnedDirectoryCreationReceipt): boolean {
   const { parent, name, identity } = receipt;
@@ -1669,6 +1717,31 @@ try:
     elif op == "read_file": result = {"ok": True, **read_file(payload.get("name"), payload.get("max_bytes"), payload.get("tail_bytes"))}
     elif op == "read_evidence": result = {"ok": True, **read_evidence(payload.get("path"), payload.get("max_bytes"))}
     elif op == "unlink_file": unlink_file(payload.get("name")); result = {"ok": True}
+    elif op == "remove_tree":
+        name = payload.get("name")
+        expected_dev = payload.get("expected_dev")
+        expected_ino = payload.get("expected_ino")
+        if not isinstance(name, str) or not safe_name(name) or not isinstance(expected_dev, int) or not isinstance(expected_ino, int): fail("directory identity is invalid")
+        def remove_tree(parent_fd, child_name, expected=None):
+            info = os.stat(child_name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode) or (expected is not None and (info.st_dev != expected[0] or info.st_ino != expected[1])): return False
+            child_fd = os.open(child_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            try:
+                opened = os.fstat(child_fd)
+                if not stat.S_ISDIR(opened.st_mode) or opened.st_dev != info.st_dev or opened.st_ino != info.st_ino: return False
+                for entry in os.listdir(child_fd):
+                    entry_info = os.stat(entry, dir_fd=child_fd, follow_symlinks=False)
+                    if stat.S_ISDIR(entry_info.st_mode):
+                        if not remove_tree(child_fd, entry, None): return False
+                    else:
+                        os.unlink(entry, dir_fd=child_fd)
+                current = os.stat(child_name, dir_fd=parent_fd, follow_symlinks=False)
+                if current.st_dev != info.st_dev or current.st_ino != info.st_ino: return False
+                os.rmdir(child_name, dir_fd=parent_fd)
+                return True
+            finally:
+                os.close(child_fd)
+        result = {"ok": True, "removed": remove_tree(3, name, (expected_dev, expected_ino))}
     elif op == "remove_empty":
         name = payload.get("name")
         if not isinstance(name, str) or not name or any((not piece or piece in (".", "..") or "/" in piece or "\\" in piece or "\x00" in piece) for piece in name.split("/")): fail("directory path is invalid")

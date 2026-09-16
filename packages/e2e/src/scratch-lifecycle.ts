@@ -1,4 +1,6 @@
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync } from 'node:fs';
+import { basename, dirname, resolve } from 'node:path';
+import { closePinnedDirectory, pinDirectory, removePinnedDirectoryTreeIfExact } from './fs-safety.js';
 
 export interface ScratchLifecycleOutcome {
   readonly preserveOnFailure: boolean;
@@ -32,6 +34,23 @@ export function finalizeScratchDirectory(
     }
     return 'preserved';
   }
-  rmSync(scratchParent, { recursive: true, force: true });
+  const target = resolve(scratchParent);
+  let targetStat;
+  try {
+    targetStat = lstatSync(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'removed';
+    throw error;
+  }
+  if (targetStat.isSymbolicLink() || !targetStat.isDirectory()) throw new Error(`ux-e2e: refusing to remove non-directory scratch path ${target}`);
+  const parent = pinDirectory(dirname(target));
+  if (parent === null) throw new Error(`ux-e2e: refusing to remove scratch path beneath an unsafe parent ${dirname(target)}`);
+  try {
+    if (!removePinnedDirectoryTreeIfExact(parent, basename(target), targetStat)) {
+      throw new Error(`ux-e2e: scratch path changed during cleanup; refusing to remove ${target}`);
+    }
+  } finally {
+    closePinnedDirectory(parent);
+  }
   return 'removed';
 }

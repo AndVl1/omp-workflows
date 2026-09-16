@@ -151,6 +151,9 @@ export interface ScenarioDefinition {
 
 const VALID_SCREENSHOT_TRIGGERS: readonly string[] = ['stage_start', 'stage_end', 'ask_user', 'error'];
 const SHA256_RE = /^[0-9a-f]{64}$/u;
+const SAFE_FEATURE_ID_RE = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
+const SAFE_RUN_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const TEMPLATE_VALUE_RE = /^\{\{\s*[a-zA-Z0-9_]+\s*\}\}$/u;
 
 class ScenarioValidationError extends TypeError {
   constructor(field: string, problem: string) {
@@ -175,6 +178,48 @@ function requireTimerMs(value: unknown, field: string): asserts value is number 
 function requireNumber(value: unknown, field: string, problem: string): asserts value is number {
   if (typeof value !== 'number' || !Number.isFinite(value)) throw new ScenarioValidationError(field, problem);
 }
+function safeScenarioSelector(value: string, field: string, kind: 'feature_id' | 'run_key'): string {
+  const valid = kind === 'feature_id' ? SAFE_FEATURE_ID_RE.test(value) : SAFE_RUN_KEY_RE.test(value);
+  if (!valid && !TEMPLATE_VALUE_RE.test(value)) {
+    throw new ScenarioValidationError(field, `unsafe ${kind}; expected a safe literal or exact template placeholder`);
+  }
+  return value;
+}
+
+function safeExpandedSelector(value: string | undefined, field: string, kind: 'feature_id' | 'run_key'): void {
+  if (value === undefined) return;
+  const valid = kind === 'feature_id' ? SAFE_FEATURE_ID_RE.test(value) : SAFE_RUN_KEY_RE.test(value);
+  if (!valid) throw new ScenarioValidationError(field, `unsafe expanded ${kind}`);
+}
+
+function validateExpandedSetup(setup: CtoExecutionScenarioSetup): void {
+  if (setup.selectors.length !== 4) throw new ScenarioValidationError('setup.selectors', 'expected exactly four feature/run selectors');
+  const features = new Set<string>();
+  const pairs = new Set<string>();
+  for (const [index, selector] of setup.selectors.entries()) {
+    safeExpandedSelector(selector.feature_id, `setup.selectors[${index}].feature_id`, 'feature_id');
+    safeExpandedSelector(selector.run_key, `setup.selectors[${index}].run_key`, 'run_key');
+    if (features.has(selector.feature_id)) throw new ScenarioValidationError('setup.selectors', 'feature_id values must be unique after expansion');
+    features.add(selector.feature_id);
+    const pair = `${selector.feature_id}\u0000${selector.run_key}`;
+    if (pairs.has(pair)) throw new ScenarioValidationError('setup.selectors', 'selectors must be unique after expansion');
+    pairs.add(pair);
+  }
+  safeExpandedSelector(setup.stale.feature_id, 'setup.stale.feature_id', 'feature_id');
+  safeExpandedSelector(setup.stale.run_key, 'setup.stale.run_key', 'run_key');
+  safeExpandedSelector(setup.claimed.feature_id, 'setup.claimed.feature_id', 'feature_id');
+  safeExpandedSelector(setup.claimed.run_key, 'setup.claimed.run_key', 'run_key');
+  const stalePair = `${setup.stale.feature_id}\u0000${setup.stale.run_key}`;
+  const claimedPair = `${setup.claimed.feature_id}\u0000${setup.claimed.run_key}`;
+  if (!pairs.has(stalePair)) throw new ScenarioValidationError('setup.stale', 'stale selector must be an exact selector member after expansion');
+  if (!pairs.has(claimedPair)) throw new ScenarioValidationError('setup.claimed', 'claimed selector must be an exact selector member after expansion');
+  if (stalePair === claimedPair) throw new ScenarioValidationError('setup', 'stale and claimed selectors must be distinct after expansion');
+  if (setup.stale.phase !== 'plan' || setup.stale.version !== 1 || !SHA256_RE.test(setup.stale.expected_sha256) || !SHA256_RE.test(setup.stale.actual_sha256) || setup.stale.reason.length === 0) {
+    throw new ScenarioValidationError('setup.stale', 'expanded stale revision is invalid');
+  }
+  if (setup.claimed.owner_kind !== 'do_work' || setup.claimed.owner_run_id.length === 0) throw new ScenarioValidationError('setup.claimed', 'expanded claim owner is invalid');
+}
+
 function optionalString(value: unknown, field: string): string | undefined {
   if (value === undefined) return undefined;
   requireString(value, field, 'expected a non-empty string');
@@ -338,9 +383,12 @@ function validateScenario(raw: unknown): {
       if (featureId === undefined || runKey === undefined) {
         throw new ScenarioValidationError(`setup.selectors[${index}]`, 'feature_id and run_key are both required');
       }
-      return { feature_id: featureId, run_key: runKey };
+      return {
+        feature_id: safeScenarioSelector(featureId, `setup.selectors[${index}].feature_id`, 'feature_id'),
+        run_key: safeScenarioSelector(runKey, `setup.selectors[${index}].run_key`, 'run_key'),
+      };
     });
-    if (new Set(setupSelectors.map(selector => `${selector.feature_id}\u0000${selector.run_key}`)).size !== setupSelectors.length) {
+    if (new Set(setupSelectors.map(selector => selector.feature_id)).size !== setupSelectors.length) {
       throw new ScenarioValidationError('setup.selectors', 'selectors must be unique');
     }
     const staleValue = setupValue.stale;
@@ -354,6 +402,8 @@ function validateScenario(raw: unknown): {
     const staleExpected = optionalString(staleRecord.expected_sha256, 'setup.stale.expected_sha256');
     const staleActual = optionalString(staleRecord.actual_sha256, 'setup.stale.actual_sha256');
     const staleReason = optionalString(staleRecord.reason, 'setup.stale.reason');
+    if (staleFeatureId !== undefined) safeScenarioSelector(staleFeatureId, 'setup.stale.feature_id', 'feature_id');
+    if (staleRunKey !== undefined) safeScenarioSelector(staleRunKey, 'setup.stale.run_key', 'run_key');
     if (!staleFeatureId || !staleRunKey || staleRecord.phase !== 'plan' || staleRecord.version !== 1 || !staleExpected || !SHA256_RE.test(staleExpected) || !staleActual || !SHA256_RE.test(staleActual) || !staleReason) {
       throw new ScenarioValidationError('setup.stale', 'expected plan v1 with bounded revision hashes and reason');
     }
@@ -366,6 +416,8 @@ function validateScenario(raw: unknown): {
     const claimedFeatureId = optionalString(claimedRecord.feature_id, 'setup.claimed.feature_id');
     const claimedRunKey = optionalString(claimedRecord.run_key, 'setup.claimed.run_key');
     const ownerRunId = optionalString(claimedRecord.owner_run_id, 'setup.claimed.owner_run_id');
+    if (claimedFeatureId !== undefined) safeScenarioSelector(claimedFeatureId, 'setup.claimed.feature_id', 'feature_id');
+    if (claimedRunKey !== undefined) safeScenarioSelector(claimedRunKey, 'setup.claimed.run_key', 'run_key');
     if (!claimedFeatureId || !claimedRunKey || claimedRecord.owner_kind !== 'do_work' || !ownerRunId) {
       throw new ScenarioValidationError('setup.claimed', 'expected do_work owner and feature/run selector');
     }
@@ -390,14 +442,14 @@ function validateScenario(raw: unknown): {
     if (featureId === undefined || runKey === undefined) {
       throw new ScenarioValidationError('selectors', 'feature_id and run_key are both required');
     }
-    selectors = { feature_id: featureId, run_key: runKey };
+    selectors = { feature_id: safeScenarioSelector(featureId, 'selectors.feature_id', 'feature_id'), run_key: safeScenarioSelector(runKey, 'selectors.run_key', 'run_key') };
   } else if (r.feature_id !== undefined || r.run_key !== undefined) {
     const featureId = optionalString(r.feature_id, 'feature_id');
     const runKey = optionalString(r.run_key, 'run_key');
     if (featureId === undefined || runKey === undefined) {
       throw new ScenarioValidationError('selectors', 'feature_id and run_key are both required');
     }
-    selectors = { feature_id: featureId, run_key: runKey };
+    selectors = { feature_id: safeScenarioSelector(featureId, 'feature_id', 'feature_id'), run_key: safeScenarioSelector(runKey, 'run_key', 'run_key') };
   }
 
   let workspace: ScenarioWorkspacePaths | undefined;
@@ -635,8 +687,10 @@ export function loadScenario(path: string, params: Record<string, string> = {}):
       : {}),
     ...params,
   };
-  const featureId = ctx.feature_id;
-  const runKey = ctx.run_key;
+  const featureId = ctx.feature_id === undefined ? undefined : expandValue(ctx.feature_id, ctx);
+  const runKey = ctx.run_key === undefined ? undefined : expandValue(ctx.run_key, ctx);
+  safeExpandedSelector(featureId, 'feature_id', 'feature_id');
+  safeExpandedSelector(runKey, 'run_key', 'run_key');
   const selectors =
     featureId !== undefined && runKey !== undefined
       ? { feature_id: featureId, run_key: runKey }
@@ -648,6 +702,7 @@ export function loadScenario(path: string, params: Record<string, string> = {}):
     stale: { ...def.setup.stale, feature_id: expandValue(def.setup.stale.feature_id, ctx), run_key: expandValue(def.setup.stale.run_key, ctx), expected_sha256: expandValue(def.setup.stale.expected_sha256, ctx), actual_sha256: expandValue(def.setup.stale.actual_sha256, ctx), reason: expandValue(def.setup.stale.reason, ctx) },
     claimed: { ...def.setup.claimed, feature_id: expandValue(def.setup.claimed.feature_id, ctx), run_key: expandValue(def.setup.claimed.run_key, ctx), owner_run_id: expandValue(def.setup.claimed.owner_run_id, ctx) },
   };
+  if (expandedSetup !== undefined) validateExpandedSetup(expandedSetup);
 
   let taskText: string;
   if (typeof def.task === 'string') {

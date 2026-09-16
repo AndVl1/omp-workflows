@@ -91,6 +91,14 @@ test('scenario: missing/invalid fields throw with field names', () => {
     () => loadScenario(join(dir, 'does-not-exist.json')),
     /cannot read\/parse/u,
   );
+  assert.throws(
+    () => loadScenario(write('unsafe-selector.json', { ...valid, selectors: { feature_id: '../outside', run_key: 'run-1' } })),
+    /unsafe feature_id/u,
+  );
+  assert.throws(
+    () => loadScenario(write('unsafe-run.json', { ...valid, selectors: { feature_id: 'safe-feature', run_key: 'run/escape' } })),
+    /unsafe run_key/u,
+  );
 });
 
 test('scenario: {{param}} expansion covers task + stages; unknown keys stay literal', () => {
