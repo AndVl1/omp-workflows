@@ -562,7 +562,11 @@ function runConstitutionOperationInChild(
     if (released || failed || settled) return;
     released = true;
     try {
-      child.stdin.write("release\n");
+      if (operation === "presentation") {
+        child.stdin.end("release\n");
+      } else {
+        child.stdin.write("release\n");
+      }
     } catch (error) {
       fail(new Error(`constitution decision child barrier release failed: ${String(error)} (${diagnostics()})`));
     }
@@ -570,7 +574,7 @@ function runConstitutionOperationInChild(
   const releaseAnswer = (): void => {
     if (!barrier || operation !== "decision" || failed || settled) return;
     try {
-      child.stdin.write("release\n");
+      child.stdin.end("release\n");
     } catch (error) {
       fail(new Error(`constitution decision child Ask barrier release failed: ${String(error)} (${diagnostics()})`));
     }
@@ -1799,11 +1803,18 @@ test("cross-process constitution decisions repeat canonical Ask and consume one 
       assert.equal(durableDecision?.decision, "approve_continue");
       assert.equal(durableDecision?.feedback, null);
       assert.equal(durableDecision?.authorization, "human");
-      const winnerProof = durableDecision?.actor_provenance && typeof durableDecision.actor_provenance === "object"
-        ? (durableDecision.actor_provenance as { proof?: { answer_id?: string } }).proof
-        : undefined;
-      assert.ok(winnerProof?.answer_id, "the durable winner records the canonical gate proof");
-      assert.equal(winnerProof?.answer_id, trusted.actor_provenance.proof?.answer_id, "repeated canonical Asks may converge on one durable gate proof");
+      assert.deepEqual(
+        { ...durableDecision, at: "<committed-at>" },
+        {
+          checkpoint_id: presented.value.checkpoint_ref,
+          decision: "approve_continue",
+          feedback: null,
+          authorization: "human",
+          actor_provenance: trusted.actor_provenance,
+          at: "<committed-at>",
+        },
+        "the sole durable decision preserves the exact trusted actor proof",
+      );
       assert.ok(durableDecision && Number.isFinite(Date.parse(durableDecision.at)), "the durable decision timestamp is valid");
       assert.equal(envelope.gate.resume_marker, ensured.value.gate_id + ".resume.v1", "exactly one resume marker remains as the consumed decision identity");
       assert.equal(envelope.resume_marker_consumed, true, "the one resume marker is durably consumed");
