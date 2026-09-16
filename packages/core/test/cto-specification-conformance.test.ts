@@ -1195,17 +1195,20 @@ test("direct CTO persistence gates pending, failed, wrong-run, and stale termina
 
   const failed = makeFixture();
   try {
-    const binding = bindingFor(failed.mapping, failed.root, "cto-wave-1", failed.prepared.claims as unknown as CtoActiveClaimSummary[]);
     failed.updateTeam((team) => {
       team.status = "failed";
       team.completion_envelope = { ...team.completion_envelope!, outcome: "failed", terminal_signal: "contract_failure" };
     });
+    const binding = bindingFor(failed.mapping, failed.root, "cto-wave-1", failed.prepared.claims as unknown as CtoActiveClaimSummary[]);
     const result = failed.invoke(binding);
     assert.equal(result.status, "blocked");
-    assert.equal(result.persisted, false);
-    assert.equal(result.features[0]?.status, "blocked");
+    assert.equal(result.persisted, true);
+    assert.equal(result.features[0]?.overall_status, "blocked");
     assert.equal(result.features[0]?.claim_action, "retain");
-    assert.match(result.findings.join("; "), /terminal CTO team postimage revalidation failed: digest changed/i);
+    assert.deepEqual(result.blocked_feature_ids, [failed.feature.feature.feature_id]);
+    assert.deepEqual(result.passing_feature_ids, []);
+    assert.ok(result.findings.some((finding) => finding.startsWith(`Feature '${failed.feature.feature.feature_id}':`)));
+    assert.equal(existsSync(join(failed.root, result.features[0]!.artifact_ref.path)), true);
     assert.equal(readCurrentExecutionClaim(failed.root, failed.feature.feature.feature_id).value?.status, "active");
   } finally {
     failed.runtime.close();
