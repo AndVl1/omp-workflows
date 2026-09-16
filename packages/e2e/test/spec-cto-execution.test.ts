@@ -154,9 +154,9 @@ type MappingArtifact = {
   mapping_hash?: string;
   feature_ids?: string[];
   handoff_bindings?: Array<{ feature_id?: string; handoff_id?: string; handoff_digest?: string }>;
-  task_to_slice?: Array<{ feature_id?: string; task_id?: string; team_id?: string; slice_id?: string }>;
-  shared_contracts?: Array<{ contract_id?: string; requires_serialization?: boolean }>;
-  parallelization?: Array<{ slice_id?: string; decision?: string; reason?: string }>;
+  task_to_slice?: Array<{ feature_id?: string; task_id?: string; team_id?: string; slice_id?: string; requirement_ids?: string[]; verification_ids?: string[]; depends_on?: string[] }>;
+  shared_contracts?: Array<{ contract_id?: string; contract?: string; task_ids?: string[]; reason?: string; requires_serialization?: boolean }>;
+  parallelization?: Array<{ slice_id?: string; decision?: string; reason?: string; worktree?: string; depends_on_slice_ids?: string[]; shared_contract_ids?: string[] }>;
   checkpoint_ref?: string | null;
   status?: string;
 };
@@ -358,15 +358,15 @@ const PASSING_SPECIFICATION = [
   '',
   '## Problem',
   '',
-  'The execution wave must expose one deterministic, independently runnable outcome.',
+  'The execution wave must expose one deterministic, independently runnable outcome and a typed task graph.',
   '',
   '## Requirements',
   '',
-  '- FR-1: Running `node src/passing/index.js` with no arguments exits with code 0 and emits exactly `{"status":"completed","outcome":"requested outcome completed"}` followed by a newline.',
+  '- FR-1: Running `node src/passing/index.js` with no arguments exits with code 0 and emits exactly `{"status":"completed","outcome":"requested outcome completed"}` followed by a newline; every execution slice records evidence for FR-1.',
   '',
   '## Success Criteria',
   '',
-  '- AC-1: The command is runnable from the project root and produces the exact JSON output without reading or writing outside `src/passing/`.',
+  '- AC-1: The command is runnable from the project root and produces the exact JSON output without reading or writing outside `src/passing/`; independent JSON audit-log and metrics slices may run in parallel, loader precedes schema-validator, and shared-defaults writes are serialized.',
   '',
 ].join('\n');
 
@@ -379,27 +379,131 @@ const PASSING_PLAN = [
   '',
   '## Scope',
   '',
-  'Only `src/passing/index.js` may be changed for this outcome.',
+  'Only `src/passing/` may be changed for this outcome; audit-log and metrics are independent JSON slices, loader precedes schema-validator, and both shared-defaults tasks use one shared path.',
   '',
   '## Verification',
   '',
-  'Run `node src/passing/index.js`; require exit code 0 and the exact JSON line from the specification.',
+  'Run `node src/passing/index.js`; require exit code 0 and the exact JSON line from the specification, then retain one typed evidence record for every task.',
   '',
 ].join('\n');
 
 const PASSING_TASKS = [
   '# Readable CTO Passing Tasks',
   '',
-  '## T-1 — Implement deterministic outcome',
+  '## T-AUDIT-LOG — Record deterministic JSON audit log',
   '',
   '- Requirement: FR-1',
   '- Acceptance: AC-1',
   '- Verification: V-1',
-  '- Affected scope: `src/passing/index.js`',
-  '- Expected outcome: `node src/passing/index.js` emits the exact completed JSON line and exits 0.',
+  '- Affected scope: `src/passing/audit-log.json`',
+  '- Expected outcome: the audit-log JSON slice records the deterministic completed outcome.',
+  '',
+  '## T-METRICS — Record deterministic JSON metrics',
+  '',
+  '- Requirement: FR-1',
+  '- Acceptance: AC-1',
+  '- Verification: V-1',
+  '- Affected scope: `src/passing/metrics.json`',
+  '- Expected outcome: the metrics JSON slice records the deterministic completed count.',
+  '',
+  '## T-LOADER — Implement the deterministic loader',
+  '',
+  '- Requirement: FR-1',
+  '- Acceptance: AC-1',
+  '- Verification: V-1',
+  '- Affected scope: `src/passing/loader.js`',
+  '- Expected outcome: the loader returns the frozen passing outcome.',
+  '',
+  '## T-SCHEMA-VALIDATOR — Validate the loaded outcome',
+  '',
+  '- Requirement: FR-1',
+  '- Acceptance: AC-1',
+  '- Verification: V-1',
+  '- Depends on: T-LOADER',
+  '- Affected scope: `src/passing/schema-validator.js`',
+  '- Expected outcome: the validator accepts the loader output after T-LOADER completes.',
+  '',
+  '## T-SHARED-DEFAULTS-A — Write the baseline shared defaults',
+  '',
+  '- Requirement: FR-1',
+  '- Acceptance: AC-1',
+  '- Verification: V-1',
+  '- Affected scope: `src/passing/shared-defaults.json`',
+  '- Expected outcome: the baseline shared defaults are written through the shared contract.',
+  '',
+  '## T-SHARED-DEFAULTS-B — Write the verified shared defaults',
+  '',
+  '- Requirement: FR-1',
+  '- Acceptance: AC-1',
+  '- Verification: V-1',
+  '- Affected scope: `src/passing/shared-defaults.json`',
+  '- Expected outcome: the verified shared defaults replace the baseline only after T-SHARED-DEFAULTS-A.',
   '',
 ].join('\n');
 
+type PassingTaskFixture = ImplementationHandoff['tasks'][number];
+const PASSING_TASK_GRAPH: PassingTaskFixture[] = [
+  {
+    task_id: 'T-AUDIT-LOG',
+    title: 'Record deterministic JSON audit log',
+    requirement_ids: ['FR-1'],
+    depends_on: [],
+    expected_outcome: 'The audit-log JSON slice records the deterministic completed outcome.',
+    affected_scope: ['src/passing/audit-log.json'],
+    completion_evidence: ['Record the deterministic completed audit-log JSON envelope.'],
+    parallel_safe: true,
+  },
+  {
+    task_id: 'T-METRICS',
+    title: 'Record deterministic JSON metrics',
+    requirement_ids: ['FR-1'],
+    depends_on: [],
+    expected_outcome: 'The metrics JSON slice records the deterministic completed count.',
+    affected_scope: ['src/passing/metrics.json'],
+    completion_evidence: ['Record the deterministic completed metrics JSON envelope.'],
+    parallel_safe: true,
+  },
+  {
+    task_id: 'T-LOADER',
+    title: 'Implement the deterministic loader',
+    requirement_ids: ['FR-1'],
+    depends_on: [],
+    expected_outcome: 'The loader returns the frozen passing outcome.',
+    affected_scope: ['src/passing/loader.js'],
+    completion_evidence: ['Record loader evidence bound to FR-1.'],
+    parallel_safe: true,
+  },
+  {
+    task_id: 'T-SCHEMA-VALIDATOR',
+    title: 'Validate the loaded outcome',
+    requirement_ids: ['FR-1'],
+    depends_on: ['T-LOADER'],
+    expected_outcome: 'The validator accepts the loader output after T-LOADER completes.',
+    affected_scope: ['src/passing/schema-validator.js'],
+    completion_evidence: ['Record schema-validator evidence bound to FR-1 and T-LOADER.'],
+    parallel_safe: true,
+  },
+  {
+    task_id: 'T-SHARED-DEFAULTS-A',
+    title: 'Write the baseline shared defaults',
+    requirement_ids: ['FR-1'],
+    depends_on: [],
+    expected_outcome: 'The baseline shared defaults are written through the shared contract.',
+    affected_scope: ['src/passing/shared-defaults.json'],
+    completion_evidence: ['Record baseline shared-defaults evidence bound to FR-1.'],
+    parallel_safe: true,
+  },
+  {
+    task_id: 'T-SHARED-DEFAULTS-B',
+    title: 'Write the verified shared defaults',
+    requirement_ids: ['FR-1'],
+    depends_on: [],
+    expected_outcome: 'The verified shared defaults replace the baseline only after T-SHARED-DEFAULTS-A.',
+    affected_scope: ['src/passing/shared-defaults.json'],
+    completion_evidence: ['Record verified shared-defaults evidence bound to FR-1 and the shared path.'],
+    parallel_safe: true,
+  },
+];
 const PASSING_SOURCE = [
   'const OUTCOME = Object.freeze({ status: "completed", outcome: "requested outcome completed" });',
   '',
@@ -483,18 +587,22 @@ function seedReadyFeature(
   const handoff: ImplementationHandoff = { ...fixtureHandoff, schema_version: 1 };
   handoff.constitution_binding = binding;
   handoff.execution_choices = ["do-work", "cto"];
-  const scopePath = featureId.endsWith('-passing') ? 'src/passing/**'
-    : featureId.endsWith('-blocked') ? 'src/blocked/**'
+  const isPassingFeature = featureId.endsWith('-passing');
+  const isBlockedFeature = featureId.endsWith('-blocked');
+  const scopePath = isPassingFeature ? 'src/passing/**'
+    : isBlockedFeature ? 'src/blocked/**'
       : null;
+  const taskGraph = isPassingFeature
+    ? PASSING_TASK_GRAPH.map(task => ({ ...task, requirement_ids: [...task.requirement_ids], depends_on: [...task.depends_on], affected_scope: [...task.affected_scope], completion_evidence: [...task.completion_evidence] }))
+    : handoff.tasks;
   if (scopePath !== null) {
-    handoff.scope = { ...handoff.scope, in_scope: [scopePath] };
-    handoff.tasks = handoff.tasks.map(task => ({
+    handoff.scope = { ...handoff.scope, in_scope: [scopePath], constraints: isPassingFeature ? [] : [...handoff.scope.constraints] };
+    handoff.tasks = taskGraph.map(task => ({
       ...task,
-      title: "Implement the outcome and produce typed conformance evidence",
-      expected_outcome: featureId.endsWith('-passing')
-        ? "Running node src/passing/index.js with no arguments exits 0 and emits the exact completed JSON line; the lead passes the typed evidence contract verbatim to implementation and QA evidence workers."
-        : "The requested outcome is observable, and the lead passes the typed evidence contract verbatim to implementation and QA evidence workers.",
-      affected_scope: [scopePath],
+      ...(isPassingFeature ? {} : {
+        title: "Implement the outcome and produce typed conformance evidence",
+        expected_outcome: "The requested outcome is observable, and the lead passes the typed evidence contract verbatim to implementation and QA evidence workers.",
+      }),
       completion_evidence: [
         "focused test run proving the outcome",
         "Persist the canonical conformance_evidence envelope at .work-state/features/<feature_id>/artifacts/<artifact_id>.json and reference that exact feature-local path; do not use a team-level .work-state/artifacts mirror.",
@@ -505,6 +613,7 @@ function seedReadyFeature(
     }));
     handoff.verification = handoff.verification.map(verification => ({
       ...verification,
+      task_ids: isPassingFeature ? taskGraph.map(task => task.task_id) : [...verification.task_ids],
       expected_evidence: "The lead passes the exact conformance_evidence envelope schema guidance to implementation and QA evidence workers; the CTO conformance call wraps every entry with CompletionArtifactRef and every executed_test has test.evidence_ref: CompletionArtifactRef.",
     }));
   }
@@ -680,12 +789,29 @@ function assertPassingFixture(
     if (document === undefined) continue;
     assert.equal(artifact.sha256, fixtureSha256(document.contents), `${featureId} handoff digest matches ${artifact.kind} document`);
   }
-  const task = handoff.tasks.find(candidate => candidate.task_id === 'T-1');
-  assert.ok(task !== undefined, `${featureId} has an implementable seeded task`);
-  if (task !== undefined) {
-    assert.deepEqual(task.affected_scope, ['src/passing/**'], `${featureId} task scope is isolated to the passing deliverable`);
-    assert.match(task.expected_outcome, /node src\/passing\/index\.js/iu, `${featureId} task names the runnable passing deliverable`);
-    assert.match(task.completion_evidence.join('\n'), /exact JSON output/iu, `${featureId} task has deterministic acceptance evidence`);
+  assert.deepEqual(
+    handoff.tasks.map(task => task.task_id).sort(),
+    PASSING_TASK_GRAPH.map(task => task.task_id).sort(),
+    `${featureId} handoff preserves the complete typed execution graph`,
+  );
+  const auditLog = handoff.tasks.find(candidate => candidate.task_id === 'T-AUDIT-LOG');
+  const metrics = handoff.tasks.find(candidate => candidate.task_id === 'T-METRICS');
+  const loader = handoff.tasks.find(candidate => candidate.task_id === 'T-LOADER');
+  const validator = handoff.tasks.find(candidate => candidate.task_id === 'T-SCHEMA-VALIDATOR');
+  const sharedA = handoff.tasks.find(candidate => candidate.task_id === 'T-SHARED-DEFAULTS-A');
+  const sharedB = handoff.tasks.find(candidate => candidate.task_id === 'T-SHARED-DEFAULTS-B');
+  assert.ok(auditLog && metrics && loader && validator && sharedA && sharedB, `${featureId} has every serialization fixture task`);
+  if (auditLog && metrics && loader && validator && sharedA && sharedB) {
+    assert.deepEqual(auditLog.affected_scope, ['src/passing/audit-log.json']);
+    assert.deepEqual(metrics.affected_scope, ['src/passing/metrics.json']);
+    assert.deepEqual(loader.affected_scope, ['src/passing/loader.js']);
+    assert.deepEqual(validator.depends_on, ['T-LOADER']);
+    assert.deepEqual(sharedA.affected_scope, ['src/passing/shared-defaults.json']);
+    assert.deepEqual(sharedB.affected_scope, ['src/passing/shared-defaults.json']);
+    assert.ok(auditLog.parallel_safe && metrics.parallel_safe, `${featureId} JSON slices are parallel-safe`);
+    assert.match(auditLog.expected_outcome, /audit-log/iu);
+    assert.match(metrics.expected_outcome, /metrics/iu);
+    assert.match(validator.expected_outcome, /T-LOADER/iu);
   }
 }
 
@@ -781,16 +907,21 @@ function assertDurableProtocolEvidence(root: string): void {
 }
 
 function assertTypedConformanceEvidenceTask(handoff: ImplementationHandoff, featureId: string): void {
-  const task = handoff.tasks.find(candidate => candidate.task_id === "T-1");
-  assert.ok(task !== undefined, `${featureId} has the seeded execution task`);
-  if (task === undefined) return;
-  const taskText = JSON.stringify(task);
-  assert.match(taskText, /\.work-state\/features\/<feature_id>\/artifacts\/<artifact_id>\.json/iu, `${featureId} task requires feature-local canonical artifact storage`);
-  assert.match(taskText, /conformance_evidence envelope has exactly schema_version, artifact_id, and entries/iu, `${featureId} task states the canonical envelope keys`);
-  assert.match(taskText, /do not add top-level provenance/iu, `${featureId} task forbids provenance in the canonical envelope`);
-  assert.match(taskText, /wraps every submitted evidence entry with an artifact: CompletionArtifactRef/iu, `${featureId} task requires wrapper artifact references`);
-  assert.match(taskText, /every executed_test entry has test\.evidence_ref: CompletionArtifactRef/iu, `${featureId} task requires executed-test artifact references`);
-  assert.match(taskText, /lead.*verbatim.*implementation and QA evidence workers/iu, `${featureId} task requires evidence guidance handoff`);
+  const expectedTaskIds = featureId.endsWith('-passing')
+    ? PASSING_TASK_GRAPH.map(task => task.task_id)
+    : ['T-1'];
+  for (const taskId of expectedTaskIds) {
+    const task = handoff.tasks.find(candidate => candidate.task_id === taskId);
+    assert.ok(task !== undefined, `${featureId} has seeded execution task ${taskId}`);
+    if (task === undefined) continue;
+    const taskText = JSON.stringify(task);
+    assert.match(taskText, /\.work-state\/features\/<feature_id>\/artifacts\/<artifact_id>\.json/iu, `${featureId}/${taskId} requires feature-local canonical artifact storage`);
+    assert.match(taskText, /conformance_evidence envelope has exactly schema_version, artifact_id, and entries/iu, `${featureId}/${taskId} states the canonical envelope keys`);
+    assert.match(taskText, /do not add top-level provenance/iu, `${featureId}/${taskId} forbids provenance in the canonical envelope`);
+    assert.match(taskText, /wraps every submitted evidence entry with an artifact: CompletionArtifactRef/iu, `${featureId}/${taskId} requires wrapper artifact references`);
+    assert.match(taskText, /every executed_test entry has test\.evidence_ref: CompletionArtifactRef/iu, `${featureId}/${taskId} requires executed-test artifact references`);
+    assert.match(taskText, /lead.*verbatim.*implementation and QA evidence workers/iu, `${featureId}/${taskId} requires evidence guidance handoff`);
+  }
 }
 
 function persistWorkspace(root: string, workspace: FeatureWorkspace, runKey: string): FeatureWorkspace {
@@ -1409,6 +1540,8 @@ type CtoExecutionWaveSnapshot = {
   };
   teams: Array<{
     feature_id?: unknown;
+    task_id?: unknown;
+    slice_id?: unknown;
     work_identity?: { dispatch_id?: unknown };
   }>;
 };
@@ -1637,7 +1770,11 @@ test('T094 runtime: one confirmed CTO wave executes the eligible passing/blocked
   const blockedRun = param('run_key_blocked');
   const staleRun = param('run_key_stale');
   const claimedRun = param('run_key_claimed');
-  const ctoRequest = `/cto --spec ${passingId} --run-key ${passingRun} --spec ${blockedId} --run-key ${blockedRun} --spec ${staleId} --run-key ${staleRun} --spec ${claimedId} --run-key ${claimedRun} Execute the selected handoffs in one resident CTO wave. Preserve this exact immutable full selector array in the selector-only cto_prepare request; let the engine derive canonical task, DoD, and TeamDef candidates, obtain the mapping confirmation, and emit the eligible-only preflight descriptor. Keep stale and claimed selectors selected for readiness exclusion, report their blocked findings verbatim, and never claim either excluded selector. Execute the engine-issued eligible-only preflight descriptor without reconstructing selectors or repeating excluded rows. Report blocked findings and complete each admitted worker with real evidence before closing. The blocked handoff intentionally has no concrete observable contract and its src/blocked/** prerequisite is absent; do not invent behavior or repair that fixture. Give its implementation/QA workers one bounded attempt, record the unresolved blocker under FR-1/AC-1, and return one terminal blocked summary without rewriting DoD or re-dispatching repair workers. The two admitted scopes are independent; delegate both leads concurrently in one task batch, and require each lead to produce implementation and QA evidence before returning.`;
+  assert.equal(param("parallel_tasks"), "T-AUDIT-LOG,T-METRICS", "scenario names the independent JSON slices");
+  assert.equal(param("dependent_tasks"), "T-LOADER->T-SCHEMA-VALIDATOR", "scenario names the loader dependency");
+  assert.equal(param("shared_serial_tasks"), "T-SHARED-DEFAULTS-A,T-SHARED-DEFAULTS-B", "scenario names the shared-defaults pair");
+  assert.equal(param("expected_admitted_task_count"), String(PASSING_TASK_GRAPH.length + 1), "scenario dispatch count covers passing graph plus blocked task");
+  const ctoRequest = `/cto --spec ${passingId} --run-key ${passingRun} --spec ${blockedId} --run-key ${blockedRun} --spec ${staleId} --run-key ${staleRun} --spec ${claimedId} --run-key ${claimedRun} Execute the selected handoffs in one resident CTO wave. Preserve this exact immutable full selector array in the selector-only cto_prepare request; let the engine derive canonical task, DoD, and TeamDef candidates, obtain the mapping confirmation, and emit the eligible-only preflight descriptor. Keep stale and claimed selectors selected for readiness exclusion, report their blocked findings verbatim, and never claim either excluded selector. Execute the engine-issued eligible-only preflight descriptor without reconstructing selectors or repeating excluded rows. Report blocked findings and complete each admitted worker with real evidence before closing. The blocked handoff intentionally has no concrete observable contract and its src/blocked/** prerequisite is absent; do not invent behavior or repair that fixture. Give its implementation/QA workers one bounded attempt, record the unresolved blocker under FR-1/AC-1, and return one terminal blocked summary without rewriting DoD or re-dispatching repair workers. The admitted passing slices T-AUDIT-LOG and T-METRICS are independent and must dispatch in parallel; T-SCHEMA-VALIDATOR depends on T-LOADER; T-SHARED-DEFAULTS-A and T-SHARED-DEFAULTS-B share src/passing/shared-defaults.json and must serialize. Preserve every original FR-1/AC-1/V-1 task mapping, and require each lead to produce implementation and QA evidence before returning.`;
   const scratch = makeScratch();
   const binding = bootstrapBinding();
   const passing = seedReadyFeature(scratch, passingId, passingRun, binding);
@@ -1724,11 +1861,9 @@ test('T094 runtime: one confirmed CTO wave executes the eligible passing/blocked
     assert.deepEqual(terminalWave?.wave.blocked_feature_ids, [blockedId], 'terminal wave reports the blocked feature identity');
     assert.ok(terminalWave !== null, 'terminal CTO wave snapshot is readable');
     const admittedTeams = terminalWave?.teams.filter(team => [passingId, blockedId].includes(String(team.feature_id))) ?? [];
-    assert.equal(admittedTeams.length, 2, 'both engine-admitted passing and blocked features have terminal CTO team records');
-    for (const featureId of [passingId, blockedId]) {
-      const team = admittedTeams.find(candidate => candidate.feature_id === featureId);
-      assert.ok(typeof team?.work_identity?.dispatch_id === 'string' && team.work_identity.dispatch_id.length > 0, `${featureId} has a durable dispatch id`);
-    }
+    const expectedAdmittedTaskCount = Number(param('expected_admitted_task_count'));
+    assert.ok(Number.isSafeInteger(expectedAdmittedTaskCount) && expectedAdmittedTaskCount > 0, 'scenario declares a bounded admitted task count');
+    assert.equal(admittedTeams.length, expectedAdmittedTaskCount, 'terminal CTO teams cover every admitted execution task');
     assertDurableProtocolEvidence(scratch.root);
     assert.equal(ctoClaims(scratch.root, staleId).length, 0, 'stale selector remains a readiness exclusion and is never claimed by the public wave');
     const confirmed = confirmedMappings(scratch.root);
@@ -1740,6 +1875,68 @@ test('T094 runtime: one confirmed CTO wave executes the eligible passing/blocked
       [blockedId, passingId].sort(),
       'the confirmed mapping preserves the two admitted passing and blocked features after engine filtering of the immutable selector request',
     );
+    const admittedOwners = mappingArtifact?.task_to_slice?.filter(owner => [passingId, blockedId].includes(String(owner.feature_id))) ?? [];
+    assert.equal(admittedOwners.length, expectedAdmittedTaskCount, 'mapping owns exactly the admitted task count');
+    const passingOwners = admittedOwners.filter(owner => owner.feature_id === passingId);
+    const blockedOwners = admittedOwners.filter(owner => owner.feature_id === blockedId);
+    assert.deepEqual(
+      passingOwners.map(owner => owner.task_id).sort(),
+      PASSING_TASK_GRAPH.map(task => task.task_id).sort(),
+      'passing mapping preserves every original task identity',
+    );
+    assert.deepEqual(blockedOwners.map(owner => owner.task_id), ['T-1'], 'blocked feature remains isolated to its single frozen task');
+    for (const owner of admittedOwners) {
+      assert.deepEqual(owner.requirement_ids, ['FR-1'], `${owner.feature_id}/${owner.task_id} maps the original requirement`);
+      assert.deepEqual(owner.verification_ids, ['V-1'], `${owner.feature_id}/${owner.task_id} maps the original verification`);
+      const team = admittedTeams.find(candidate => candidate.feature_id === owner.feature_id && candidate.task_id === owner.task_id && candidate.slice_id === owner.slice_id);
+      assert.ok(team !== undefined, `${owner.feature_id}/${owner.task_id} has one canonical terminal team`);
+      assert.ok(typeof team?.work_identity?.dispatch_id === 'string' && team.work_identity.dispatch_id.length > 0, `${owner.feature_id}/${owner.task_id} has a durable dispatch id`);
+    }
+    const decisions = mappingArtifact?.parallelization ?? [];
+    const ownersByTask = new Map(admittedOwners.map(owner => [`${owner.feature_id}\u0000${owner.task_id}`, owner]));
+    const decisionFor = (featureId: string, taskId: string) => {
+      const owner = ownersByTask.get(`${featureId}\u0000${taskId}`);
+      assert.ok(owner !== undefined, `mapping contains ${featureId}/${taskId}`);
+      const decision = decisions.find(candidate => candidate.slice_id === owner?.slice_id);
+      assert.ok(decision !== undefined, `mapping contains a parallelization decision for ${featureId}/${taskId}`);
+      return { owner, decision };
+    };
+    const audit = decisionFor(passingId, 'T-AUDIT-LOG').decision;
+    const metrics = decisionFor(passingId, 'T-METRICS').decision;
+    assert.equal(audit?.decision, 'parallel', 'independent audit-log slice is parallelized');
+    assert.equal(metrics?.decision, 'parallel', 'independent metrics slice is parallelized');
+    assert.equal(audit?.worktree, 'separate_worktree');
+    assert.equal(metrics?.worktree, 'separate_worktree');
+    assert.deepEqual(audit?.depends_on_slice_ids, []);
+    assert.deepEqual(metrics?.depends_on_slice_ids, []);
+    assert.deepEqual(audit?.shared_contract_ids, []);
+    assert.deepEqual(metrics?.shared_contract_ids, []);
+    const loader = decisionFor(passingId, 'T-LOADER');
+    const validator = decisionFor(passingId, 'T-SCHEMA-VALIDATOR');
+    assert.equal(validator.decision?.decision, 'serial', 'schema-validator dependency is serialized');
+    assert.equal(validator.decision?.worktree, 'same_branch');
+    assert.deepEqual(validator.decision?.depends_on_slice_ids, [loader.owner?.slice_id]);
+    assert.deepEqual(loader.decision?.depends_on_slice_ids, []);
+    const sharedA = decisionFor(passingId, 'T-SHARED-DEFAULTS-A').decision;
+    const sharedB = decisionFor(passingId, 'T-SHARED-DEFAULTS-B').decision;
+    assert.equal(sharedA?.decision, 'serial', 'first shared-defaults task is serialized by the shared contract');
+    assert.equal(sharedB?.decision, 'serial', 'second shared-defaults task is serialized by the shared contract');
+    assert.equal(sharedA?.worktree, 'same_branch');
+    assert.equal(sharedB?.worktree, 'same_branch');
+    const sharedContractTaskIds = [
+      JSON.stringify({ feature_id: passingId, task_id: 'T-SHARED-DEFAULTS-A' }),
+      JSON.stringify({ feature_id: passingId, task_id: 'T-SHARED-DEFAULTS-B' }),
+    ];
+    const sharedContracts = (mappingArtifact?.shared_contracts ?? []).filter(contract =>
+      contract.requires_serialization === true
+      && sharedContractTaskIds.every(taskId => contract.task_ids?.includes(taskId))
+      && /shared-defaults\.json/iu.test(contract.contract ?? ''),
+    );
+    assert.equal(sharedContracts.length, 1, 'shared-defaults pair has exactly one canonical shared path contract');
+    const sharedContractId = sharedContracts[0]?.contract_id;
+    assert.ok(typeof sharedContractId === 'string' && sharedContractId.length > 0, 'shared-defaults contract is identified');
+    assert.ok(sharedA?.shared_contract_ids?.includes(sharedContractId ?? '') === true, 'first shared-defaults slice binds the shared contract');
+    assert.ok(sharedB?.shared_contract_ids?.includes(sharedContractId ?? '') === true, 'second shared-defaults slice binds the shared contract');
     const passingState = readState(scratch.root, passingId);
     const blockedState = readState(scratch.root, blockedId);
     assert.ok(['completed', 'completion_validating', 'completion_blocked'].includes(workspaceStatus(passingState)), `passing worker reached an execution state: ${workspaceStatus(passingState)}`);

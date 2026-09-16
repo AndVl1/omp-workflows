@@ -12,6 +12,10 @@
     "run_key_stale": "readable-cto-stale-run-001",
     "feature_claimed": "readable-cto-claimed",
     "run_key_claimed": "readable-cto-claimed-run-001",
+    "parallel_tasks": "T-AUDIT-LOG,T-METRICS",
+    "dependent_tasks": "T-LOADER->T-SCHEMA-VALIDATOR",
+    "shared_serial_tasks": "T-SHARED-DEFAULTS-A,T-SHARED-DEFAULTS-B",
+    "expected_admitted_task_count": "7",
     "execution_request": "Execute readable-cto-passing and readable-cto-blocked through one confirmed CTO wave: complete every task of readable-cto-passing with real evidence, and for readable-cto-blocked implement everything while leaving exactly one frozen verification obligation without evidence on this first pass"
   },
   "selectors": {
@@ -64,8 +68,10 @@
     ],
     "workers": [
       "CTO team dispatch",
-      "independent slices in parallel",
-      "shared-file pair serialized",
+      "independent JSON audit-log and metrics slices in parallel",
+      "loader -> schema-validator dependency serialized",
+      "shared-defaults pair serialized by one shared contract/path",
+      "every dispatch maps the original requirement and task id",
       "no worker before confirmation",
       "no nested CTO"
     ],
@@ -107,7 +113,7 @@
       "complete_feature"
     ]
   },
-  "task": "Coordinate one resident CTO execution wave over four prebuilt typed feature workspaces in the authorized scratch repository. The harness seeds current approved handoffs through production APIs, invalidates one workspace through production revision propagation, and acquires one do-work claim through the canonical claim CAS. Do not run native Specify, Plan, Tasks, import, or do-work commands. Select these exact feature/run pairs as one immutable full selector array: {{feature_passing}}/{{run_key}}, {{feature_blocked}}/{{run_key_blocked}}, {{feature_stale}}/{{run_key_stale}}, and {{feature_claimed}}/{{run_key_claimed}}. Call cto_prepare first in selector-only form with that full array. The engine derives canonical task, DoD, and TeamDef candidates from the frozen handoffs and presents the exact mapping choices for the human mapping confirmation; after that confirmation, the engine emits the eligible-only cto_preflight descriptor. Keep stale and claimed selectors in the immutable request for readiness exclusion, report every excluded finding verbatim, and never claim either excluded selector. Execute the engine-issued eligible-only preflight descriptor, then call cto_confirm followed by cto_dispatch. Dispatch only the two admitted passing and blocked slices with isolated claims and conformance evidence. The first explicit CTO request is held while the production constitution gate is approved once; a fresh session then submits the exact same CTO request once.",
+  "task": "Coordinate one resident CTO execution wave over four prebuilt typed feature workspaces in the authorized scratch repository. The harness seeds current approved handoffs through production APIs, invalidates one workspace through production revision propagation, and acquires one do-work claim through the canonical claim CAS. Do not run native Specify, Plan, Tasks, import, or do-work commands. Select these exact feature/run pairs as one immutable full selector array: {{feature_passing}}/{{run_key}}, {{feature_blocked}}/{{run_key_blocked}}, {{feature_stale}}/{{run_key_stale}}, and {{feature_claimed}}/{{run_key_claimed}}. Call cto_prepare first in selector-only form with that full array. The engine derives canonical task, DoD, and TeamDef candidates from the frozen handoffs and presents the exact mapping choices for the human mapping confirmation; after that confirmation, the engine emits the eligible-only cto_preflight descriptor. Keep stale and claimed selectors in the immutable request for readiness exclusion, report every excluded finding verbatim, and never claim either excluded selector. Execute the engine-issued eligible-only preflight descriptor, then call cto_confirm followed by cto_dispatch. Dispatch only the two admitted features with isolated claims and conformance evidence: run the JSON audit-log and metrics slices in parallel, serialize loader before schema-validator, and serialize the shared-defaults pair through its shared contract/path. Preserve every original requirement/task identity in each dispatch. The first explicit CTO request is held while the production constitution gate is approved once; a fresh session then submits the exact same CTO request once.",
   "stages": [
     {
       "id": "constitution",
