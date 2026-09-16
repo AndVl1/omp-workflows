@@ -340,6 +340,9 @@ function validateScenario(raw: unknown): {
       }
       return { feature_id: featureId, run_key: runKey };
     });
+    if (new Set(setupSelectors.map(selector => `${selector.feature_id}\u0000${selector.run_key}`)).size !== setupSelectors.length) {
+      throw new ScenarioValidationError('setup.selectors', 'selectors must be unique');
+    }
     const staleValue = setupValue.stale;
     if (typeof staleValue !== 'object' || staleValue === null) throw new ScenarioValidationError('setup.stale', 'expected an object');
     const staleRecord = staleValue as Record<string, unknown>;
