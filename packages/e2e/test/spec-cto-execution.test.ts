@@ -71,6 +71,7 @@ import type { ConstitutionBinding, FeatureWorkspace, ImplementationHandoff, Work
 import { bindFeatureWorkspaceToRoot, validFeatureWorkspace, validImplementationHandoff, sha256 as fixtureSha256 } from '../../core/test/fixtures/specification-fixtures.js';
 import { loadProfile, profileHash } from '../../core/src/engine/profile.js';
 import { loadTeamDefs } from '../../core/src/cto/plan.js';
+import { FULLSTACK_ACTIVATION_MARKER_BYTES } from '../../fullstack/src/activation-marker.js';
 import { digestOf as canonicalDigestOf } from '../../core/src/specification/validation.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -244,6 +245,7 @@ function exactBootstrappedScratch(): Scratch | null {
   const head = readFileSync(join(canonical, '.git', 'HEAD'), 'utf8').trim();
   assert.equal(head, `ref: refs/heads/${String(provenance.branch)}`, 'exact scratch is on the authenticated bootstrap branch');
   assertExactRegularSingleLink(canonical, join('.omp', 'fullstack.activation.json'), 'exact scratch has the authenticated activation marker');
+  assert.deepEqual(readFileSync(join(canonical, '.omp', 'fullstack.activation.json')), FULLSTACK_ACTIVATION_MARKER_BYTES, 'exact scratch activation marker bytes are canonical');
   const fullstackLink = join(canonical, 'node_modules', '@andvl1', 'omp-workflows-fullstack');
   const coreLink = join(canonical, 'node_modules', '@andvl1', 'omp-workflows-core');
   assert.equal(lstatSync(fullstackLink).isSymbolicLink(), true, 'exact scratch fullstack package is a bootstrap link');
