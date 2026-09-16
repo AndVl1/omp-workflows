@@ -493,6 +493,35 @@ test("malformed native feature directories fail closed for every broad event", (
   }
 });
 
+test("native context scans ignore only strict observability-only feature buckets", () => {
+  const f = fixture();
+  try {
+    const state = {
+      ...f.state,
+      specification: f.state.specification && {
+        ...f.state.specification,
+        phases: f.state.specification.phases.map((phase) => ({ ...phase, status: "not_started" as const })),
+      },
+    };
+    writeState(f.root, state, { featureSlug: f.workspace.feature_id });
+    for (const featureId of ["default", "legacy-feature"]) {
+      const observability = join(f.root, ".work-state", "features", featureId, "observability");
+      mkdirSync(observability, { recursive: true });
+      writeFileSync(join(observability, "events.jsonl"), "{\"kind\":\"session_start\"}\n");
+    }
+
+    assert.equal(nativeSpecificationGenerationActive(f.root), false, "auxiliary observability buckets are not native feature contexts");
+    assert.equal(nativeSpecificationTaskGate(event("read", { path: "README.md" }), { cwd: f.root }), undefined);
+
+    writeFileSync(join(f.root, ".work-state", "features", "default", "partial-workspace.json"), "{}\n");
+    const blocked = nativeSpecificationTaskGate(event("read", { path: "README.md" }), { cwd: f.root });
+    assert.equal(blocked?.block, true, "an observability bucket with any workspace-shaped sibling remains fail-closed");
+    assert.match(blocked?.reason ?? "", /context scan failed/iu);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test("bounded context scan stays inactive when all entries are non-generating", () => {
   const f = fixture();
   try {

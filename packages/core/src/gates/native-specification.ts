@@ -360,6 +360,20 @@ function nativeContextScanReason(kind: "scan_failure" | "overflow"): string {
     : "native specification context scan failed; generation is closed until the scan is safe";
 }
 
+function isObservabilityOnlyFeatureBucket(
+  pinnedRoot: PinnedProjectRoot,
+  featurePath: string,
+): boolean {
+  try {
+    const names = pinnedRoot.listDirectory(featurePath, { maxEntries: 2, maxNameBytes: 4096 });
+    if (names.length !== 1 || names[0] !== "observability") return false;
+    return pinnedRoot.pathEntryInfo(featurePath + "/observability")?.kind === "directory"
+      && pinnedRoot.isStable();
+  } catch {
+    return false;
+  }
+}
+
 function nativeSpecificationContexts(cwd: string): NativeSpecificationContextScan {
   let pinnedRoot: PinnedProjectRoot | null;
   try {
@@ -385,9 +399,20 @@ function nativeSpecificationContexts(cwd: string): NativeSpecificationContextSca
       const featurePath = featuresPath + "/" + feature_id;
       const featureInfo = pinnedRoot.pathEntryInfo(featurePath);
       if (!featureInfo || featureInfo.kind !== "directory") return { kind: "scan_failure" };
+      const statePath = featurePath + "/state.json";
+      const stateInfo = pinnedRoot.pathEntryInfo(statePath);
+      if (!stateInfo) {
+        // Observability may legitimately start before any feature is selected,
+        // producing features/<slug>/observability without a workflow state.
+        // Admit only that exact auxiliary shape; every partial or malformed
+        // feature workspace remains fail-closed.
+        if (isObservabilityOnlyFeatureBucket(pinnedRoot, featurePath)) continue;
+        return { kind: "scan_failure" };
+      }
+      if (stateInfo.kind !== "file") return { kind: "scan_failure" };
       let run_key: unknown;
       try {
-        const raw = new TextDecoder("utf-8", { fatal: true }).decode(pinnedRoot.readFile(featurePath + "/state.json", { maxBytes: MAX_PERSISTED_STATE_BYTES }).bytes);
+        const raw = new TextDecoder("utf-8", { fatal: true }).decode(pinnedRoot.readFile(statePath, { maxBytes: MAX_PERSISTED_STATE_BYTES }).bytes);
         run_key = (JSON.parse(raw) as Record<string, unknown>).run_key;
       } catch {
         return { kind: "scan_failure" };
