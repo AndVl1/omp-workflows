@@ -63,7 +63,7 @@ import { acquireExecutionClaim, readExecutionClaimStore } from '../../core/src/s
 import { canonicalHandoffDigest, evaluateHandoffReadiness } from '../../core/src/specification/handoff.js';
 import { materializeImplementationHandoff } from '../../core/src/specification/materialize.js';
 import { createFeatureWorkspace, persistFeatureWorkspace, resolveFeatureWorkspace, applyManualEdits, featureArtifactsDir } from '../../core/src/specification/workspace.js';
-import { writeArtifact } from '../../core/src/engine/artifacts.js';
+import { writeTestArtifact } from '../../core/test/fixtures/artifacts.js';
 import { ensureProjectConstitution, readProjectConstitutionGate } from '../../core/src/specification/prerequisite.js';
 import { PinnedProjectRoot } from '../../core/src/specification/pinned-root.js';
 import { readPinnedCurrentConstitution } from '../../core/src/specification/constitution-identities.js';
@@ -743,7 +743,7 @@ function seedReadyFeature(
   }
   handoff.handoff_digest = canonicalHandoffDigest(handoff);
   const handoffDir = join(featureArtifactsDir(scratch.root, featureId), "implementation_handoff");
-  writeArtifact(handoffDir, handoff.handoff_id, handoff);
+  writeTestArtifact(scratch.root, handoffDir, handoff.handoff_id, handoff);
   const projection = materializeImplementationHandoff(scratch.root, handoff, strictHandoffProjectionOptions(scratch.root, handoff));
   assert.ok(projection.ok, projection.ok ? "" : projection.error);
   if (!projection.ok) throw new Error(projection.error);
