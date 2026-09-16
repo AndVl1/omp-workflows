@@ -346,7 +346,7 @@ function digest(api: FixtureApi, value: unknown, label: string): string {
   if (typeof result !== 'string' || !/^[0-9a-f]{64}$/u.test(result)) throw new Error(`${label} did not produce a SHA-256 digest`);
   return result;
 }
-function sha256(value: string): string {
+function sha256(value: string | Uint8Array): string {
   return createHash('sha256').update(value).digest('hex');
 }
 function canonicalJson(value: unknown): string {
