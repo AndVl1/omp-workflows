@@ -1272,7 +1272,7 @@ test('CTO fixture restart verifies current provenance and constitution source wi
   try {
     const scenario = loadScenario(SCENARIO_PATH);
     if (scenario.setup === undefined) throw new Error('spec-cto-execution declares its strict CTO fixture setup');
-    const prepared = await prepareCtoExecutionFixture(scratch.root, scenario.setup);
+    await prepareCtoExecutionFixture(scratch.root, scenario.setup);
     const manifestPath = join(scratch.root, fixtureManifestPath());
     const manifestBefore = readFileSync(manifestPath);
     await prepareCtoExecutionFixture(scratch.root, scenario.setup);
