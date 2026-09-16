@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, sep } from 'node:path';
 import { test } from 'node:test';
@@ -17,7 +17,7 @@ import {
   type UxE2eReport,
   type ReportInput,
 } from '../src/report.js';
-import { closePinnedDirectory, MAX_PINNED_READ_BYTES, pinDirectory, setFsSafetyTestHooks, unlinkPinnedFileIfExact, withPinnedExclusiveLock, writePinnedFile } from '../src/fs-safety.js';
+import { closePinnedDirectory, MAX_PINNED_READ_BYTES, pinDirectory, removePinnedDirectoryTreeIfExact, setFsSafetyTestHooks, unlinkPinnedFileIfExact, withPinnedExclusiveLock, writePinnedFile } from '../src/fs-safety.js';
 
 function makeSessionDir(options: { readonly completeEvidence?: boolean } = {}): string {
   const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-report-'));
@@ -1650,6 +1650,38 @@ test('report: exact rollback preserves a nonmatching replacement at its original
   }
 });
 
+
+test('report: recursive quarantine restores a nested replacement without deleting it', { skip: process.platform === 'darwin' }, () => {
+  const parentPath = mkdtempSync(join(tmpdir(), 'ux-e2e-recursive-quarantine-'));
+  const target = join(parentPath, 'target');
+  const victim = join(target, 'victim.txt');
+  const movedOriginal = join(parentPath, 'victim-original.txt');
+  mkdirSync(target);
+  writeFileSync(victim, 'original');
+  const root = pinDirectory(parentPath);
+  if (root === null) throw new Error('test root could not be pinned');
+  let swapped = false;
+  setFsSafetyTestHooks({
+    beforeRecursiveQuarantine(path) {
+      if (swapped || basename(path) !== 'victim.txt') return;
+      swapped = true;
+      renameSync(victim, movedOriginal);
+      writeFileSync(victim, 'foreign replacement');
+    },
+  });
+  try {
+    const targetIdentity = lstatSync(target);
+    assert.equal(removePinnedDirectoryTreeIfExact(root, 'target', { dev: targetIdentity.dev, ino: targetIdentity.ino }), false);
+    assert.equal(swapped, true);
+    assert.equal(readFileSync(victim, 'utf8'), 'foreign replacement');
+    assert.equal(readFileSync(movedOriginal, 'utf8'), 'original');
+    assert.equal(existsSync(target), true, 'the original directory is restored after a nested identity mismatch');
+  } finally {
+    setFsSafetyTestHooks(null);
+    closePinnedDirectory(root);
+    rmSync(parentPath, { recursive: true, force: true });
+  }
+});
 
 test('report: retained state descriptor restores a preexisting JSON after root replacement', () => {
   const dir = makeSessionDir();

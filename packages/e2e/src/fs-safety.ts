@@ -65,6 +65,7 @@ export interface FsSafetyTestHooks {
   readonly beforeTargetOpen?: (path: string) => void;
   readonly beforeTargetRename?: (path: string) => void;
   readonly beforeExactQuarantine?: (path: string) => void;
+  readonly beforeRecursiveQuarantine?: (path: string) => void;
   /** Return undefined to run the real process identity probe. */
   readonly processStartIdentity?: (pid: number) => string | null | undefined;
 }
@@ -1216,12 +1217,12 @@ export function removePinnedDirectoryTreeIfExact(
     if (current === null || current.dev !== identity.dev || current.ino !== identity.ino) return false;
     try { renameSync(from, to); return true; } catch { return false; }
   };
-  const removeTreeAt = (directory: string): boolean => {
+  const removeTreeAt = (directory: string, expected?: FileIdentity): boolean => {
     let fd: number | null = null;
     try {
-      fd = openSync(directory, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+      fd = openSync(directory, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK);
       const info = fstatSync(fd);
-      if (!info.isDirectory()) return false;
+      if (!info.isDirectory() || (expected !== undefined && !sameIdentity(info, expected))) return false;
       const descriptor = descriptorPathFor(fd);
       if (descriptor === null) return false;
       for (const childName of readdirSync(descriptor)) {
@@ -1232,22 +1233,37 @@ export function removePinnedDirectoryTreeIfExact(
         const childQuarantine = `.omp-remove-${randomUUID().replace(/-/gu, '')}.tmp`;
         const childQuarantinePath = join(descriptor, childQuarantine);
         try {
+          testHooks?.beforeRecursiveQuarantine?.(childPath);
           renameSync(childPath, childQuarantinePath);
           const moved = identityOf(childQuarantinePath);
-          if (moved === null || moved.dev !== childInfo.dev || moved.ino !== childInfo.ino) {
-            restoreIfAbsent(childQuarantinePath, childPath, childInfo);
+          if (moved === null || !sameIdentity(moved, childInfo)) {
+            if (moved !== null) restoreIfAbsent(childQuarantinePath, childPath, moved);
             return false;
           }
           const movedStat = lstatSync(childQuarantinePath);
-          const removed = movedStat.isDirectory()
-            ? removeTreeAt(childQuarantinePath) && (() => { try { rmdirSync(childQuarantinePath); return true; } catch { return false; } })()
-            : (() => { try { unlinkSync(childQuarantinePath); return true; } catch { return false; } })();
-          if (!removed) {
-            restoreIfAbsent(childQuarantinePath, childPath, childInfo);
-            return false;
+          let childFd: number | null = null;
+          try {
+            childFd = openSync(childQuarantinePath, fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK | (movedStat.isDirectory() ? O_DIRECTORY : 0));
+            const opened = fstatSync(childFd);
+            if (!sameIdentity(opened, childInfo)) throw new Error('quarantined child identity changed');
+            if (opened.isDirectory()) {
+              if (!removeTreeAt(childQuarantinePath, childInfo)) throw new Error('recursive quarantine failed');
+              const after = identityOf(childQuarantinePath);
+              if (after === null || !sameIdentity(after, childInfo)) throw new Error('quarantined directory identity changed');
+              rmdirSync(childQuarantinePath);
+            } else {
+              const after = identityOf(childQuarantinePath);
+              if (after === null || !sameIdentity(after, childInfo)) throw new Error('quarantined file identity changed');
+              unlinkSync(childQuarantinePath);
+            }
+          } finally {
+            if (childFd !== null) {
+              try { closeSync(childFd); } catch { /* best effort */ }
+            }
           }
         } catch {
-          restoreIfAbsent(childQuarantinePath, childPath, childInfo);
+          const moved = identityOf(childQuarantinePath);
+          if (moved !== null) restoreIfAbsent(childQuarantinePath, childPath, moved);
           return false;
         }
       }
@@ -1270,10 +1286,10 @@ export function removePinnedDirectoryTreeIfExact(
   }
   const moved = identityOf(quarantinePath);
   if (moved === null || moved.dev !== expected.dev || moved.ino !== expected.ino) {
-    restoreIfAbsent(quarantinePath, rootPath, initial);
+    if (moved !== null) restoreIfAbsent(quarantinePath, rootPath, moved);
     return false;
   }
-  if (!removeTreeAt(quarantinePath)) {
+  if (!removeTreeAt(quarantinePath, initial)) {
     restoreIfAbsent(quarantinePath, rootPath, initial);
     return false;
   }
@@ -1847,7 +1863,7 @@ try:
                 os.rename(entry, quarantine, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 moved = identity(parent_fd, quarantine)
                 if moved is None or moved.st_dev != info.st_dev or moved.st_ino != info.st_ino:
-                    restore(parent_fd, quarantine, entry, info)
+                    if moved is not None: restore(parent_fd, quarantine, entry, moved)
                     return False
                 if stat.S_ISDIR(moved.st_mode):
                     child_fd = os.open(quarantine, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
@@ -1860,6 +1876,14 @@ try:
                         os.close(child_fd)
                     os.rmdir(quarantine, dir_fd=parent_fd)
                 else:
+                    file_fd = os.open(quarantine, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+                    try:
+                        opened = os.fstat(file_fd)
+                        if opened.st_dev != info.st_dev or opened.st_ino != info.st_ino: raise OSError("file identity changed")
+                        current = identity(parent_fd, quarantine)
+                        if current is None or current.st_dev != info.st_dev or current.st_ino != info.st_ino: raise OSError("file identity changed")
+                    finally:
+                        os.close(file_fd)
                     os.unlink(quarantine, dir_fd=parent_fd)
                 return True
             except OSError:
@@ -1873,7 +1897,7 @@ try:
                 os.rename(name, quarantine, src_dir_fd=3, dst_dir_fd=3)
                 moved = identity(3, quarantine)
                 if moved is None or moved.st_dev != expected_dev or moved.st_ino != expected_ino:
-                    restore(3, quarantine, name, initial)
+                    if moved is not None: restore(3, quarantine, name, moved)
                     result = {"ok": True, "removed": False}
                 else:
                     child_fd = os.open(quarantine, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=3)

@@ -227,7 +227,7 @@ type FixtureApi = {
   readonly createFeatureWorkspace: CoreCall;
   readonly persistFeatureWorkspace: CoreCall;
   readonly resolveFeatureWorkspace: CoreCall;
-  readonly materializeImplementationHandoff: CoreCall;
+  readonly materializeImplementationHandoffPinned: CoreCall;
   readonly writeArtifactPinned: CoreCall;
   readonly acquireExecutionClaim: CoreCall;
   readonly readExecutionClaimStore: CoreCall;
@@ -240,15 +240,17 @@ type FixtureApi = {
   readonly digestOf: CoreCall;
   readonly loadProfile: CoreCall;
   readonly profileHash: CoreCall;
-  readonly PinnedProjectRoot: new (root: string) => {
-    readonly canonical_root: string;
-    readonly dev: number;
-    readonly ino: number;
-    readonly isStable: () => boolean;
-    readonly ensureDirectory: (relativePath: string) => void;
-    readonly writeAtomic: (relativePath: string, content: string) => void;
-    readonly readFile: (relativePath: string, options: { maxBytes: number }) => { readonly bytes: Uint8Array };
-    readonly close: () => void;
+  readonly PinnedProjectRoot: {
+    readonly open: (root: string) => {
+      readonly canonical_root: string;
+      readonly dev: number;
+      readonly ino: number;
+      readonly isStable: () => boolean;
+      readonly ensureDirectory: (relativePath: string) => void;
+      readonly writeAtomic: (relativePath: string, content: string) => void;
+      readonly readFile: (relativePath: string, options: { maxBytes: number }) => { readonly bytes: Uint8Array };
+      readonly close: () => void;
+    } | null;
   };
 };
 
@@ -312,7 +314,7 @@ export async function loadCtoExecutionFixtureApi(scratchDir: string): Promise<Fi
     createFeatureWorkspace: call(workspace['createFeatureWorkspace'], 'createFeatureWorkspace'),
     persistFeatureWorkspace: call(workspace['persistFeatureWorkspace'], 'persistFeatureWorkspace'),
     resolveFeatureWorkspace: call(workspace['resolveFeatureWorkspace'], 'resolveFeatureWorkspace'),
-    materializeImplementationHandoff: call(handoff['materializeImplementationHandoff'], 'materializeImplementationHandoff'),
+    materializeImplementationHandoffPinned: call(handoff['materializeImplementationHandoffPinned'], 'materializeImplementationHandoffPinned'),
     writeArtifactPinned: call(core['writeArtifactPinned'], 'writeArtifactPinned'),
     acquireExecutionClaim: call(claims['acquireExecutionClaim'], 'acquireExecutionClaim'),
     readExecutionClaimStore: call(claims['readExecutionClaimStore'], 'readExecutionClaimStore'),
@@ -547,18 +549,16 @@ function artifactDirectory(featureId: string): string {
 function materializeFeature(api: FixtureApi, root: string, featureId: string, runKey: string, gate: Record<string, unknown>, outerPinned: PinnedDirectory): SeededCtoFeature {
   if (featureId.endsWith('-passing')) materializePassing(outerPinned, featureId);
   const handoff = adaptFeatureHandoff(featureId, record(gate['binding'], 'constitution binding'), api);
-  const productionPinned = new api.PinnedProjectRoot(root);
+  const productionPinned = api.PinnedProjectRoot.open(root);
+  if (productionPinned === null) throw new Error(`unable to pin project root for ${featureId} materialization`);
   try {
     api.writeArtifactPinned(productionPinned, artifactDirectory(featureId), String(handoff['handoff_id']), handoff);
-    result(api.materializeImplementationHandoff(root, handoff, {
+    result(api.materializeImplementationHandoffPinned(productionPinned, handoff, {
       beforeWrite: () => {
-        const guard = new api.PinnedProjectRoot(root);
-        try {
-          const checked = record(api.readPinnedCurrentConstitution(root, guard, handoff['constitution_binding']), 'constitution binding check');
-          if (checked['ok'] !== true) throw new Error(String(checked['error'] ?? 'current constitution binding is not usable'));
-        } finally {
-          guard.close();
-        }
+        if (!productionPinned.isStable()) throw new Error('project root changed before constitution binding check');
+        const checked = record(api.readPinnedCurrentConstitution(root, productionPinned, handoff['constitution_binding']), 'constitution binding check');
+        if (checked['ok'] !== true) throw new Error(String(checked['error'] ?? 'current constitution binding is not usable'));
+        if (!productionPinned.isStable()) throw new Error('project root changed after constitution binding check');
       },
     }), `${featureId} materialize handoff`);
   } finally {
