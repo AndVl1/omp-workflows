@@ -2690,14 +2690,16 @@ export function resumeNativeSpecificationValidationFromPersisted(
         if (!completed.ok || !completed.state) return { ok: false, code: "stale", error: completed.ok ? "native generation completion produced no state" : completed.error, state: rawState };
         state = completed.state;
         currentCap = activeCapability(state.dispatch_capability) ?? currentCap;
-        generationRecord = currentCap.dispatches.find((record) => record.id === input.generation_dispatch_id);
+        const completedGenerationRecord = currentCap.dispatches.find((record) => record.id === input.generation_dispatch_id);
+        if (!completedGenerationRecord) return { ok: false, code: "stale", error: "native generation completion did not produce a succeeded postimage", state };
+        generationRecord = completedGenerationRecord;
       }
       if (generationRecord && generationRecord.status !== "succeeded") return { ok: false, code: "stale", error: "native generation completion did not produce a succeeded postimage", state };
       if (existing?.status === "succeeded") {
-        if (!existing.completion || existing.completion.outcome !== "succeeded" || !existing.completion_envelope) return { ok: false, code: "stale", error: "native validator success receipt is incomplete", state };
-        return { ok: true, status: "succeeded", state, record: existing, completion: existing.completion, completion_envelope: existing.completion_envelope, capability_id: currentCap.capability_id, capability_epoch: currentCap.issued_for.cursor_epoch, phase_version: input.version };
+        const selected: DispatchRecord = existing;
+        if (!selected.completion || selected.completion.outcome !== "succeeded" || !selected.completion_envelope) return { ok: false, code: "stale", error: "native validator success receipt is incomplete", state };
+        return { ok: true, status: "succeeded", state, record: selected, completion: selected.completion, completion_envelope: selected.completion_envelope, capability_id: currentCap.capability_id, capability_epoch: currentCap.issued_for.cursor_epoch, phase_version: input.version };
       }
-      if (existing && (existing.status === "failed" || existing.status === "cancelled")) return { ok: false, code: "failed", error: "native validator dispatch is terminal without a successful receipt", state };
       if (existing) {
         if (existing.status !== "authorized" && existing.status !== "running" && existing.status !== "pending") return { ok: false, code: "stale", error: "native validator dispatch has an unsupported persisted status", state };
         const reissued = reissueActiveCapability(currentCap, rosterPolicyHash(loadProfile(input.workflow)?.stages.find((candidate) => candidate.id === input.phase)));
