@@ -219,6 +219,7 @@ export interface SeededCtoFeature {
 export interface CtoExecutionFixtureResult {
   readonly manifest: Record<string, unknown>;
   readonly features: readonly SeededCtoFeature[];
+  readonly root_identity: { readonly canonical_path: string; readonly dev: number; readonly ino: number };
 }
 
 type CoreCall = (...args: readonly unknown[]) => unknown;
@@ -465,13 +466,13 @@ function adaptFeatureHandoff(featureId: string, binding: Record<string, unknown>
   return handoff;
 }
 
-function materializePassing(root: string, featureId: string): void {
-  const pinned = pinDirectory(root);
-  if (pinned === null) throw new Error('passing fixture root could not be pinned safely');
+function materializePassing(pinned: PinnedDirectory, featureId: string): void {
   const created: PinnedDirectoryCreationReceipt[] = [];
+  let specs: PinnedDirectory | null = null;
+  let source: PinnedDirectory | null = null;
   try {
-    const specs = pinChildDirectory(pinned, ['specs', featureId], created);
-    const source = pinChildDirectory(pinned, ['src', 'passing'], created);
+    specs = pinChildDirectory(pinned, ['specs', featureId], created);
+    source = pinChildDirectory(pinned, ['src', 'passing'], created);
     if (specs === null || source === null || !pinnedDirectoryIsStable(pinned)) {
       throw new Error('passing fixture descendants are not stable regular directories');
     }
@@ -487,8 +488,9 @@ function materializePassing(root: string, featureId: string): void {
     }
     if (!pinnedDirectoryIsStable(pinned)) throw new Error('scratch root changed while publishing passing fixture');
   } finally {
+    if (specs !== null) closePinnedDirectory(specs);
+    if (source !== null) closePinnedDirectory(source);
     closePinnedDirectoryCreationReceipts(created);
-    closePinnedDirectory(pinned);
   }
 }
 
@@ -542,12 +544,12 @@ function artifactDirectory(featureId: string): string {
   return join(ARTIFACTS_RELATIVE_PREFIX, featureId, 'artifacts', 'implementation_handoff');
 }
 
-function materializeFeature(api: FixtureApi, root: string, featureId: string, runKey: string, gate: Record<string, unknown>): SeededCtoFeature {
-  if (featureId.endsWith('-passing')) materializePassing(root, featureId);
+function materializeFeature(api: FixtureApi, root: string, featureId: string, runKey: string, gate: Record<string, unknown>, outerPinned: PinnedDirectory): SeededCtoFeature {
+  if (featureId.endsWith('-passing')) materializePassing(outerPinned, featureId);
   const handoff = adaptFeatureHandoff(featureId, record(gate['binding'], 'constitution binding'), api);
-  const pinned = new api.PinnedProjectRoot(root);
+  const productionPinned = new api.PinnedProjectRoot(root);
   try {
-    api.writeArtifactPinned(pinned, artifactDirectory(featureId), String(handoff['handoff_id']), handoff);
+    api.writeArtifactPinned(productionPinned, artifactDirectory(featureId), String(handoff['handoff_id']), handoff);
     result(api.materializeImplementationHandoff(root, handoff, {
       beforeWrite: () => {
         const guard = new api.PinnedProjectRoot(root);
@@ -560,7 +562,7 @@ function materializeFeature(api: FixtureApi, root: string, featureId: string, ru
       },
     }), `${featureId} materialize handoff`);
   } finally {
-    pinned.close();
+    productionPinned.close();
   }
   const workspace = workspaceFor(api, root, featureId, runKey, gate, handoff);
   return { feature_id: featureId, run_key: runKey, handoff, workspace };
@@ -725,6 +727,9 @@ function assertNoPartialFixtureState(root: string, setup: CtoExecutionScenarioSe
     const specRoot = existingDescendant(pinned, ['specs', selector.feature_id]);
     if (featureRoot || specRoot) throw new Error(`CTO fixture refuses to continue over partial state for ${selector.feature_id}`);
   }
+  if (existingDescendant(pinned, ['src', 'passing', 'index.js'])) {
+    throw new Error('CTO fixture refuses to continue over an existing passing source output');
+  }
   if (existingDescendant(pinned, ['CONSTITUTION.md'])) {
     const bytes = readPinnedFileFull(pinned, 'CONSTITUTION.md', 1_048_576);
     if (bytes === null || bytes.toString('utf8') !== FIXTURE_CONSTITUTION) throw new Error('CTO fixture refuses to replace an existing constitution document');
@@ -771,13 +776,34 @@ function existingSetup(api: FixtureApi, root: string, manifest: Record<string, u
   const gate = resultValue(api.readProjectConstitutionGate(root), 'constitution fixture gate');
   if (gate['status'] !== 'usable' && gate['status'] !== 'approved') throw new Error(`constitution fixture gate is no longer usable: ${String(gate['status'])}`);
   const gateBinding = record(gate['binding'], 'constitution fixture binding');
-  if (gateBinding['path'] !== 'CONSTITUTION.md' || typeof gateBinding['content_sha256'] !== 'string' || !/^[a-f0-9]{64}$/u.test(gateBinding['content_sha256'])) {
-    throw new Error('constitution fixture gate binding path or digest is invalid');
+  if (gateBinding['path'] !== 'CONSTITUTION.md'
+    || typeof gateBinding['content_sha256'] !== 'string'
+    || !/^[a-f0-9]{64}$/u.test(gateBinding['content_sha256'])
+    || gateBinding['validation_ref'] !== `constitution.validation.${gateBinding['content_sha256']}`) {
+    throw new Error('constitution fixture gate binding path, digest, or validation reference is invalid');
   }
   const source = readPinnedFileFull(pinned, 'CONSTITUTION.md', 1_048_576);
   if (source === null || sha256(source) !== gateBinding['content_sha256']) throw new Error('current constitution source/binding drifted after setup');
   const evidencePath = `.work-state/specification/constitution/validation-${gateBinding['content_sha256']}.json`;
-  if (!existingDescendant(pinned, evidencePath.split('/'))) throw new Error('constitution fixture usability evidence is missing; refusing restart writes');
+  const evidenceBytes = readPinnedDescendant(pinned, evidencePath.split('/'), 16 * 1024);
+  if (evidenceBytes === null) throw new Error('constitution fixture usability evidence is missing or not a bounded regular file; refusing restart writes');
+  let evidence: Record<string, unknown>;
+  try {
+    evidence = record(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(evidenceBytes)) as unknown, 'constitution usability evidence');
+  } catch (error) {
+    throw new Error(`constitution fixture usability evidence is malformed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const evidenceKeys = Object.keys(evidence).sort();
+  if (canonicalJson(evidenceKeys) !== canonicalJson(['checked_at', 'document_sha256', 'ref', 'result', 'schema_version', 'validator'].sort())
+    || evidence['schema_version'] !== 1
+    || evidence['ref'] !== gateBinding['validation_ref']
+    || evidence['document_sha256'] !== gateBinding['content_sha256']
+    || evidence['result'] !== 'usable'
+    || evidence['validator'] !== 'constitution-usability@1'
+    || typeof evidence['checked_at'] !== 'string'
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(evidence['checked_at'])) {
+    throw new Error('constitution fixture usability evidence does not bind the exact current source; refusing restart writes');
+  }
   const currentBinding = resultValue(api.resolveCurrentConstitutionBinding(root, { explicit_path: gateBinding['path'] }), 'current constitution binding');
   if (canonicalJson(currentBinding) !== canonicalJson(gateBinding)) throw new Error('current constitution source/binding drifted after setup');
   const selectors = expected['selectors'];
@@ -817,7 +843,19 @@ function existingSetup(api: FixtureApi, root: string, manifest: Record<string, u
     }
     features.push({ feature_id: featureId, run_key: runKey, handoff, workspace: workspaceResult });
   }
-  return { manifest, features };
+  const projectRootIdentity = record(manifest['project_root_identity'], 'fixture project root identity');
+  if (typeof projectRootIdentity['canonical_path'] !== 'string' || typeof projectRootIdentity['dev'] !== 'number' || typeof projectRootIdentity['ino'] !== 'number') {
+    throw new Error('fixture project root identity is malformed after setup');
+  }
+  return {
+    manifest,
+    features,
+    root_identity: {
+      canonical_path: projectRootIdentity['canonical_path'],
+      dev: projectRootIdentity['dev'],
+      ino: projectRootIdentity['ino'],
+    },
+  };
 }
 
 /**
@@ -848,13 +886,11 @@ async function prepareCtoExecutionFixtureUnlocked(
   const prior = readManifest(pinned);
   if (prior !== null) return existingSetup(api, root, prior, expectedManifest, pinned);
 
-  const constitutionRoot = new api.PinnedProjectRoot(root);
-  try {
-    if (!existingDescendant(pinned, ['CONSTITUTION.md'])) {
-      constitutionRoot.writeAtomic('CONSTITUTION.md', FIXTURE_CONSTITUTION);
-    }
-  } finally {
-    constitutionRoot.close();
+  if (!existingDescendant(pinned, ['CONSTITUTION.md'])) {
+    const bytes = Buffer.from(FIXTURE_CONSTITUTION, 'utf8');
+    if (!writePinnedFile(pinned, 'CONSTITUTION.md', bytes, { replaceExisting: false })) throw new Error('CTO fixture constitution could not be published atomically');
+    const readback = readPinnedFileFull(pinned, 'CONSTITUTION.md', 1_048_576);
+    if (readback === null || !readback.equals(bytes)) throw new Error('CTO fixture constitution publication readback failed');
   }
   const gate = resultValue(api.ensureProjectConstitution(root, {
     origin_kind: 'native_direct',
@@ -864,7 +900,7 @@ async function prepareCtoExecutionFixtureUnlocked(
   if (gate['status'] !== 'usable' && gate['status'] !== 'approved') throw new Error(`constitution fixture gate is not usable: ${String(gate['status'])}`);
   if (gate['binding'] === null || gate['binding'] === undefined) throw new Error('constitution fixture gate has no binding');
 
-  const seeded = setupSelectors(setup).map(selector => materializeFeature(api, root, selector.feature_id, selector.run_key, gate));
+  const seeded = setupSelectors(setup).map(selector => materializeFeature(api, root, selector.feature_id, selector.run_key, gate, pinned));
   const staleSpec = setup.stale;
   const stale = seeded.find(feature => feature.feature_id === staleSpec.feature_id && feature.run_key === staleSpec.run_key);
   if (!stale) throw new Error('stale fixture selector is not in the exact selector set');
@@ -886,7 +922,15 @@ async function prepareCtoExecutionFixtureUnlocked(
   }), 'do_work fixture claim');
 
   writeManifest(pinned, expectedManifest);
-  return { manifest: expectedManifest, features: seeded };
+  return {
+    manifest: expectedManifest,
+    features: seeded,
+    root_identity: {
+      canonical_path: pinned.physicalPath,
+      dev: pinned.identity.dev,
+      ino: pinned.identity.ino,
+    },
+  };
 }
 
 export async function prepareCtoExecutionFixture(

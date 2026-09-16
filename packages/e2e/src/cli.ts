@@ -288,16 +288,16 @@ function runBootstrapUnlocked(args: BootstrapArgs): string {
     if (!writePinnedFile(freshScratch, 'package.json', packageBytes, { replaceExisting: false })) throw new Error('ux-e2e bootstrap: failed to publish private package manifest safely');
     assertFreshScratchStable('package manifest');
 
-    prepareRuntimeScratchProject(freshScratch.physicalPath, monorepo);
+    prepareRuntimeScratchProject(freshScratch.physicalPath, monorepo, freshScratch);
     assertFreshScratchStable('runtime package wiring');
     writeUxE2eBootstrapProvenance(freshScratch.physicalPath, {
       slug: args.slug,
       branch: args.branch,
       monorepoRoot: monorepo,
       coreTarget: join(monorepo, 'packages', 'core'),
-    });
+    }, freshScratch);
     assertFreshScratchStable('bootstrap provenance');
-    writeUxE2eOverlay(freshScratch.physicalPath);
+    writeUxE2eOverlay(freshScratch.physicalPath, freshScratch);
     assertFreshScratchStable('overlay');
 
     console.log(`ux-e2e bootstrap: scratch project ready at ${sanitizeCliError(freshScratch.physicalPath)}`);
@@ -474,13 +474,16 @@ async function runStartForeground(args: StartArgs, startupRuntime?: DetachedStar
         max_time: formatMaxTimeArg(args.maxTimeSec),
       })
     : null;
+  let fixtureRootIdentity: { readonly dev: number; readonly ino: number } | undefined;
   if (scenario?.setup !== undefined) {
     if (scenario.id !== 'spec-cto-execution') throw new Error(`ux-e2e start: unsupported scenario setup '${scenario.id}'`);
-    await prepareCtoExecutionFixture(args.scratchDir, scenario.setup);
+    const fixture = await prepareCtoExecutionFixture(args.scratchDir, scenario.setup);
+    fixtureRootIdentity = { dev: fixture.root_identity.dev, ino: fixture.root_identity.ino };
   }
   const taskPrompt = resolveTaskPrompt(args.task, scenario, args.taskMode);
   const session = await startTestSession({
     cwd: args.scratchDir,
+    ...(fixtureRootIdentity !== undefined ? { cwdIdentity: fixtureRootIdentity } : {}),
     surface: args.surface,
     port: args.port,
     cols: args.cols,

@@ -4,7 +4,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSyn
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeJsonAtomically } from './overlay.js';
-import { closePinnedDirectory, pinDirectory, pinOrCreateDirectory, pinnedDirectoryIsStable, readPinnedFileFull, writePinnedFile } from './fs-safety.js';
+import { closePinnedDirectory, pinChildDirectory, pinDirectory, pinOrCreateDirectory, pinnedDirectoryIsStable, readPinnedFileFull, writePinnedFile, type PinnedDirectory, type PinnedDirectoryCreationReceipt } from './fs-safety.js';
 import {
   FULLSTACK_ACTIVATION_MARKER_PATH,
   validateFullstackActivationMarkerDestination,
@@ -42,6 +42,7 @@ function normalizeDarwinTmpAlias(path: string): string {
 export function writeUxE2eBootstrapProvenance(
   scratchDir: string,
   input: UxE2eBootstrapProvenanceInput,
+  pinnedRoot?: PinnedDirectory,
 ): void {
   const lexical = resolve(scratchDir);
   const canonical = resolve(realpathSync(lexical));
@@ -72,7 +73,7 @@ export function writeUxE2eBootstrapProvenance(
     core_target: core,
     nonce: randomUUID(),
   } as const;
-  writeJsonAtomically(canonical, UX_E2E_BOOTSTRAP_PROVENANCE_PATH, provenance, '.ux-e2e-bootstrap-provenance-');
+  writeJsonAtomically(canonical, UX_E2E_BOOTSTRAP_PROVENANCE_PATH, provenance, '.ux-e2e-bootstrap-provenance-', pinnedRoot);
 }
 
 
@@ -223,6 +224,7 @@ function runtimePackagesLinked(
 export function prepareRuntimeScratchProject(
   scratchDir: string,
   projectRoot: string = DEFAULT_PROJECT_ROOT,
+  pinnedRoot?: PinnedDirectory,
 ): void {
   // Preflight before any scratch bootstrap side effect: a malformed, edited,
   // symlinked, or wrong-kind marker must preserve the project exactly.
@@ -252,8 +254,14 @@ export function prepareRuntimeScratchProject(
   }
 
   const ompDir = join(scratchDir, '.omp');
-  const ompRoot = pinOrCreateDirectory(ompDir);
-  if (ompRoot === null) throw new Error('ux-e2e: scratch .omp directory is not a stable non-symlink directory');
+  const created: PinnedDirectoryCreationReceipt[] = [];
+  const ompRoot = pinnedRoot === undefined
+    ? pinOrCreateDirectory(ompDir)
+    : pinChildDirectory(pinnedRoot, ['.omp'], created);
+  if (ompRoot === null) {
+    closePinnedDirectoryCreationReceipts(created);
+    throw new Error('ux-e2e: scratch .omp directory is not a stable non-symlink directory');
+  }
   try {
     if (!pinnedDirectoryIsStable(ompRoot)) throw new Error('ux-e2e: scratch .omp directory changed during setup');
     // OMP v18 does not treat arbitrary scratch `node_modules` entries as
@@ -265,6 +273,7 @@ export function prepareRuntimeScratchProject(
       UX_E2E_PROJECT_SETTINGS_PATH,
       { extensions: [UX_E2E_RUNTIME_EXTENSION_PACKAGE] },
       '.ux-e2e-settings-',
+      pinnedRoot,
     );
     const teamConfig = join(monorepo, '.omp', 'team.config.json');
     const targetTeamConfig = join(ompDir, 'team.config.json');
