@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import {
   existsSync,
   lstatSync,
@@ -56,7 +56,7 @@ import { withCtoRunLock } from "../src/cto/transaction-lock.js";
 import type { CtoTerminalSummaryEnvelope } from "../src/cto/state.js";
 import type { CompletionEnvelope, WorkIdentity } from "../src/engine/types.js";
 import type { CtoState, WaveRecord } from "../src/cto/types.js";
-import { PinnedProjectRoot, PinnedRootError, processStartIdentity } from "../src/specification/pinned-root.js";
+import { PinnedProjectRoot, PinnedRootError, drainDarwinHelperClosePromisesForTesting, processStartIdentity } from "../src/specification/pinned-root.js";
 import { canonicalDurableIdFileName, legacyDurableIdFileName } from "../src/cto/durable-id.js";
 import { findActiveCtoRun } from "../src/commands/cto.js";
 import { openWorkflowActivation, releaseWorkflowOwners, requireRegistryContext, type WorkflowOwnerIdentity } from "../src/registry/owner.js";
@@ -66,6 +66,9 @@ import { openCtoRuntimeAccess } from "../src/cto/runtime-access.js";
 const TEST_ACTIVATION_MARKER = '{"schema_version":1,"bundle_id":"@andvl1/omp-workflows-fullstack","entrypoint":"dist/index.js"}\n';
 const TEST_ACTIVATION_SHA256 = createHash("sha256").update(TEST_ACTIVATION_MARKER, "utf8").digest("hex");
 const CTO_RUN_DELIVERY_INDEX_PROOF_FILE = ".active-run-index.proof.json";
+afterEach(async () => {
+  await drainDarwinHelperClosePromisesForTesting();
+});
 function testOwner(root: string): WorkflowOwnerIdentity {
   return {
     owner_id: "core-state-revision-test",
