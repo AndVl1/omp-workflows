@@ -6012,11 +6012,17 @@ test("invalid confirmed proof with a staged WAL reopens through fresh trusted As
       const stagedProofPath = join(root, stagedProofRelativePath);
       if (corruption === "missing") unlinkSync(stagedProofPath);
       else writeFileSync(stagedProofPath, `${readFileSync(stagedProofPath, "utf8")} `, "utf8");
+      const statePath = join(root, ".work-state", "features", featureId, "state.json");
+      const stateBeforeRecovery = readFileSync(statePath, "utf8");
+      const proofBeforeRecovery = existsSync(stagedProofPath) ? readFileSync(stagedProofPath, "utf8") : null;
 
       const recovery = await preflightCtoSpecificationExecutionForTest(root, { cto_run_id: RUN_ID, selections: [] });
       assert.equal(recovery.status, "blocked", detail(recovery));
       assert.match(detail(recovery), /RECOVERY_REQUIRED|proof/i);
       assert.equal(readFileSync(mappingPath, "utf8"), stagedBytes, "invalid proof recovery must not mutate the canonical confirmed map");
+      assert.equal(readFileSync(statePath, "utf8"), stateBeforeRecovery, "invalid proof recovery must not mutate canonical feature state");
+      if (proofBeforeRecovery === null) assert.equal(existsSync(stagedProofPath), false, "deleted proof must remain absent after WAL archive");
+      else assert.equal(readFileSync(stagedProofPath, "utf8"), proofBeforeRecovery, "tampered proof bytes must remain unchanged after WAL archive");
       assert.equal(existsSync(transactionPath), false, "invalid confirmation WAL must be archived, not replayed");
       const quarantineDir = join(root, ".work-state", "cto", RUN_ID, "specification-mapping-quarantine");
       const quarantineName = readdirSync(quarantineDir).find((name) => name.includes(String(transaction.transaction_id)) && name.endsWith("-confirm-proof-invalid.json"));
