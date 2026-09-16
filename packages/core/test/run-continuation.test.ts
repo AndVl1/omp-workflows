@@ -238,8 +238,6 @@ test("lifecycle start rereads and preserves a concurrent generic state mutation"
       },
       taskTool,
       continuation: { feedback: "reopen raced stage", stageId: "reopened" },
-      feature_id: featureId,
-      run_key: runKey,
     }, root);
     const state = JSON.parse(readFileSync(result.statePath!, "utf8")) as TeamState & { state_revision?: number };
     assert.match(state.task, /concurrent-task-mutation/u);
