@@ -229,6 +229,7 @@ type FixtureApi = {
   readonly readExecutionClaimStore: CoreCall;
   readonly applyManualEdits: CoreCall;
   readonly ensureProjectConstitution: CoreCall;
+  readonly readProjectConstitutionGate: CoreCall;
   readonly readPinnedCurrentConstitution: CoreCall;
   readonly canonicalHandoffDigest: CoreCall;
   readonly digestOf: CoreCall;
@@ -296,6 +297,7 @@ export async function loadCtoExecutionFixtureApi(scratchDir: string): Promise<Fi
     readExecutionClaimStore: call(claims['readExecutionClaimStore'], 'readExecutionClaimStore'),
     applyManualEdits: call(workspace['applyManualEdits'], 'applyManualEdits'),
     ensureProjectConstitution: call(prerequisite['ensureProjectConstitution'], 'ensureProjectConstitution'),
+    readProjectConstitutionGate: call(prerequisite['readProjectConstitutionGate'], 'readProjectConstitutionGate'),
     readPinnedCurrentConstitution: call((await importCoreModule(packageRoot, 'specification/constitution-identities.js'))['readPinnedCurrentConstitution'], 'readPinnedCurrentConstitution'),
     canonicalHandoffDigest: call(handoff['canonicalHandoffDigest'], 'canonicalHandoffDigest'),
     digestOf: call(validation['digestOf'], 'digestOf'),
@@ -565,6 +567,9 @@ function assertSameManifest(actual: Record<string, unknown>, expected: Record<st
 function existingSetup(api: FixtureApi, root: string, manifest: Record<string, unknown>, expected: Record<string, unknown>): CtoExecutionFixtureResult {
   assertSameManifest(manifest, expected);
   const features: SeededCtoFeature[] = [];
+  const gate = resultValue(api.readProjectConstitutionGate(root), 'constitution fixture gate');
+  if (gate['status'] !== 'usable' && gate['status'] !== 'approved') throw new Error(`constitution fixture gate is no longer usable: ${String(gate['status'])}`);
+  const gateBinding = record(gate['binding'], 'constitution fixture binding');
   const selectors = expected['selectors'];
   if (!Array.isArray(selectors)) throw new Error('CTO fixture manifest selectors are malformed');
   for (const selector of selectors) {
@@ -585,6 +590,7 @@ function existingSetup(api: FixtureApi, root: string, manifest: Record<string, u
     }
     const handoffDigest = handoff['handoff_digest'];
     if (typeof handoffDigest !== 'string') throw new Error(`${featureId} handoff digest is missing`);
+    if (canonicalJson(handoff['constitution_binding']) !== canonicalJson(gateBinding)) throw new Error(`${featureId} handoff constitution binding changed after setup`);
     const canonicalDigest = api.canonicalHandoffDigest(handoff);
     if (canonicalDigest !== handoffDigest) throw new Error(`${featureId} handoff digest changed after setup`);
     const phases = workspaceResult['phases'];
