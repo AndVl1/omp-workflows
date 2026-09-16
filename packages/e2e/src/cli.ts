@@ -20,7 +20,9 @@ import {
   ftruncateSync,
   constants as fsConstants,
   lstatSync,
+  mkdirSync,
   readFileSync,
+  rmSync,
   statSync,
   writeFileSync,
   writeSync,
@@ -65,13 +67,11 @@ import {
   type UxDimension,
 } from './report.js';
 import { loadScenario, type ScenarioDefinition } from './scenario.js';
-import { prepareCtoExecutionFixture } from './cto-execution-fixtures.js';
 
 import { deferred } from './util.js';
 import { writeUxE2eOverlay } from './overlay.js';
-import { closePinnedDirectory, closePinnedDirectoryCreationReceipts, closePinnedFile, openPinnedFile, pinChildDirectory, pinDirectory, pinOrCreateDirectory, pinnedDirectoryIsStable, readPinnedFile, readPinnedFileFull, removePinnedDirectoryTreeIfExact, withPinnedExclusiveLock, writePinnedFile } from './fs-safety.js';
-import type { PinnedDirectoryCreationReceipt } from './fs-safety.js';
-import { prepareRuntimeScratchProject, writeUxE2eBootstrapProvenance } from './runtime.js';
+import { closePinnedDirectory, closePinnedFile, openPinnedFile, pinDirectory, pinOrCreateDirectory, pinnedDirectoryIsStable, readPinnedFile, readPinnedFileFull, withPinnedExclusiveLock } from './fs-safety.js';
+import { prepareRuntimeScratchProject } from './runtime.js';
 const USAGE = `ux-e2e — interactive UX E2E test framework for omp + omp-workflows
 
 Usage: ux-e2e <subcommand> [options]
@@ -255,57 +255,26 @@ function runBootstrapUnlocked(args: BootstrapArgs): string {
       if (!args.force) {
         throw new Error(`ux-e2e bootstrap: ${scratchDir} already exists — pass --force to re-create`);
       }
-      if (!removePinnedDirectoryTreeIfExact(workRoot, basename(scratchDir), scratchRoot.identity)) {
-        throw new Error('ux-e2e bootstrap: scratch directory changed during --force removal; refusing deletion');
-      }
     } finally {
       closePinnedDirectory(scratchRoot);
     }
+    rmSync(scratchDir, { recursive: true, force: true });
   }
-  const createdScratch: PinnedDirectoryCreationReceipt[] = [];
-  const freshScratch = pinChildDirectory(workRoot, [basename(scratchDir)], createdScratch);
-  if (freshScratch === null || !createdScratch.some(receipt => receipt.name === basename(scratchDir))) {
-    if (freshScratch !== null) closePinnedDirectory(freshScratch);
-    closePinnedDirectoryCreationReceipts(createdScratch);
-    throw new Error('ux-e2e bootstrap: scratch directory appeared after exact removal; refusing to initialize it');
-  }
-  const assertFreshScratchStable = (operation: string): void => {
-    if (!pinnedDirectoryIsStable(freshScratch)) throw new Error(`ux-e2e bootstrap: scratch directory changed before/after ${operation}`);
-    let pathStat;
-    try { pathStat = lstatSync(freshScratch.physicalPath); } catch { throw new Error(`ux-e2e bootstrap: scratch directory disappeared during ${operation}`); }
-    if (pathStat.isSymbolicLink() || !pathStat.isDirectory() || pathStat.dev !== freshScratch.identity.dev || pathStat.ino !== freshScratch.identity.ino) {
-      throw new Error(`ux-e2e bootstrap: scratch directory was replaced during ${operation}; refusing writes`);
-    }
-  };
-  try {
-    assertFreshScratchStable('git init');
-    execSync('git init', { cwd: freshScratch.physicalPath, stdio: 'inherit' });
-    assertFreshScratchStable('git init');
-    execSync(`git checkout -b ${shellQuote(args.branch)}`, { cwd: freshScratch.physicalPath, stdio: 'inherit' });
-    assertFreshScratchStable('git checkout');
+  mkdirSync(scratchDir, { recursive: true });
 
-    const packageBytes = Buffer.from(`${JSON.stringify({ name: `omp-ux-e2e-${args.slug}`, version: '0.0.0', private: true, type: 'module' }, null, 2)}\n`, 'utf8');
-    if (!writePinnedFile(freshScratch, 'package.json', packageBytes, { replaceExisting: false })) throw new Error('ux-e2e bootstrap: failed to publish private package manifest safely');
-    assertFreshScratchStable('package manifest');
+  execSync('git init', { cwd: scratchDir, stdio: 'inherit' });
+  execSync(`git checkout -b ${shellQuote(args.branch)}`, { cwd: scratchDir, stdio: 'inherit' });
 
-    prepareRuntimeScratchProject(freshScratch.physicalPath, monorepo, freshScratch);
-    assertFreshScratchStable('runtime package wiring');
-    writeUxE2eBootstrapProvenance(freshScratch.physicalPath, {
-      slug: args.slug,
-      branch: args.branch,
-      monorepoRoot: monorepo,
-      coreTarget: join(monorepo, 'packages', 'core'),
-    }, freshScratch);
-    assertFreshScratchStable('bootstrap provenance');
-    writeUxE2eOverlay(freshScratch.physicalPath, freshScratch);
-    assertFreshScratchStable('overlay');
+  writeFileSync(
+    join(scratchDir, 'package.json'),
+    JSON.stringify({ name: `omp-ux-e2e-${args.slug}`, version: '0.0.0', private: true, type: 'module' }, null, 2) + '\n',
+  );
 
-    console.log(`ux-e2e bootstrap: scratch project ready at ${sanitizeCliError(freshScratch.physicalPath)}`);
-    return freshScratch.physicalPath;
-  } finally {
-    closePinnedDirectory(freshScratch);
-    closePinnedDirectoryCreationReceipts(createdScratch);
-  }
+  prepareRuntimeScratchProject(scratchDir, monorepo);
+  writeUxE2eOverlay(scratchDir);
+
+  console.log(`ux-e2e bootstrap: scratch project ready at ${sanitizeCliError(scratchDir)}`);
+  return scratchDir;
 }
 
 /** Minimal POSIX single-quote shell escaping (no single quotes in branch names). */
@@ -474,16 +443,9 @@ async function runStartForeground(args: StartArgs, startupRuntime?: DetachedStar
         max_time: formatMaxTimeArg(args.maxTimeSec),
       })
     : null;
-  let fixtureRootIdentity: { readonly dev: number; readonly ino: number } | undefined;
-  if (scenario?.setup !== undefined) {
-    if (scenario.id !== 'spec-cto-execution') throw new Error(`ux-e2e start: unsupported scenario setup '${scenario.id}'`);
-    const fixture = await prepareCtoExecutionFixture(args.scratchDir, scenario.setup);
-    fixtureRootIdentity = { dev: fixture.root_identity.dev, ino: fixture.root_identity.ino };
-  }
   const taskPrompt = resolveTaskPrompt(args.task, scenario, args.taskMode);
   const session = await startTestSession({
     cwd: args.scratchDir,
-    ...(fixtureRootIdentity !== undefined ? { cwdIdentity: fixtureRootIdentity } : {}),
     surface: args.surface,
     port: args.port,
     cols: args.cols,

@@ -1,31 +1,25 @@
-import { basename, dirname, relative, resolve, sep } from 'node:path';
-import { closePinnedDirectory, closePinnedDirectoryCreationReceipts, pinChildDirectory, pinOrCreateDirectory, writePinnedFile, type PinnedDirectory, type PinnedDirectoryCreationReceipt } from './fs-safety.js';
+import { basename, dirname, join, resolve, sep } from 'node:path';
+import { closePinnedDirectory, pinOrCreateDirectory, writePinnedFile } from './fs-safety.js';
 
 function writeFileAtomically(
   scratchDir: string,
   relativePath: string,
   content: string,
   _stagingPrefix: string,
-  pinnedRoot?: PinnedDirectory,
 ): string {
   const root = resolve(scratchDir);
   const path = resolve(root, relativePath);
   if (path !== root && !path.startsWith(`${root}${sep}`)) {
     throw new Error(`ux-e2e: refusing to write outside scratch project: ${relativePath}`);
   }
-  const created: PinnedDirectoryCreationReceipt[] = [];
-  const components = relative(root, path).split(sep);
-  const parent = pinnedRoot !== undefined
-    ? (components.length > 1 ? pinChildDirectory(pinnedRoot, components.slice(0, -1), created) : pinnedRoot)
-    : pinOrCreateDirectory(dirname(path));
+  const parent = pinOrCreateDirectory(dirname(path));
   if (parent === null) throw new Error(`ux-e2e: refusing unsafe overlay parent: ${dirname(path)}`);
   try {
     if (!writePinnedFile(parent, basename(path), Buffer.from(content, 'utf8'))) {
       throw new Error(`ux-e2e: failed to publish overlay: ${relativePath}`);
     }
   } finally {
-    if (parent !== pinnedRoot) closePinnedDirectory(parent);
-    closePinnedDirectoryCreationReceipts(created);
+    closePinnedDirectory(parent);
   }
   return path;
 }
@@ -44,9 +38,8 @@ export function writeJsonAtomically(
   relativePath: string,
   value: unknown,
   stagingPrefix: string,
-  pinnedRoot?: PinnedDirectory,
 ): string {
-  return writeFileAtomically(scratchDir, relativePath, `${JSON.stringify(value, null, 2)}\n`, stagingPrefix, pinnedRoot);
+  return writeFileAtomically(scratchDir, relativePath, `${JSON.stringify(value, null, 2)}\n`, stagingPrefix);
 }
 
 /**
@@ -58,7 +51,7 @@ export function writeJsonAtomically(
  * place only after the complete JSON document has been written. omp therefore
  * never observes a partially-written overlay.
  */
-export function writeUxE2eOverlay(scratchDir: string, pinnedRoot?: PinnedDirectory): string {
-  return writeJsonAtomically(scratchDir, UX_E2E_OVERLAY_PATH, UX_E2E_OVERLAY, '.ux-e2e-overlay-', pinnedRoot);
+export function writeUxE2eOverlay(scratchDir: string): string {
+  return writeJsonAtomically(scratchDir, UX_E2E_OVERLAY_PATH, UX_E2E_OVERLAY, '.ux-e2e-overlay-');
 }
 

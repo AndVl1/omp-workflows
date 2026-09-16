@@ -20,7 +20,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
@@ -47,18 +47,12 @@ import {
   closePinnedDirectory,
   MAX_PINNED_READ_BYTES,
   pinDirectory,
-  pinChildDirectory,
+  pinOrCreateDirectory,
   processStartIdentity,
   readPinnedFileFull,
-  pinnedChildEntryExists,
-  readPinnedSymlinkTarget,
   withPinnedExclusiveLockAsync,
   unlinkPinnedFile,
   writePinnedFile,
-  writePinnedSymlink,
-  closePinnedDirectoryCreationReceipts,
-  type FileIdentity,
-  type PinnedDirectoryCreationReceipt,
   type PinnedDirectory,
 } from './fs-safety.js';
 function sanitizeServerText(value: unknown, maxBytes = 4096): string {
@@ -482,8 +476,6 @@ export interface ScenarioRef {
 export interface TestSessionOptions {
   /** PTY working directory (scratch project). Required. */
   readonly cwd: string;
-  /** Authenticated scratch directory identity captured during fixture/bootstrap setup. */
-  readonly cwdIdentity?: FileIdentity;
   /** Driving surface: 'web' (xterm in browser) or 'text' (WS transcript). Default 'web'. */
   readonly surface?: 'web' | 'text';
   /** Scenario reference stored in session.json for the report. */
@@ -1701,6 +1693,9 @@ function resolveOmpVersion(binary: string, owner: VersionProbeOwner = {}): Promi
   return probe;
 }
 
+function stateDirOf(scratchDir: string): string {
+  return join(scratchDir, '.work-state', 'ux-e2e');
+}
 /**
  * Ensure node-pty's Darwin helper is executable before the native spawn path
  * is used. Some package managers preserve the helper as 0644 even though it
@@ -1714,65 +1709,30 @@ function resolveOmpVersion(binary: string, owner: VersionProbeOwner = {}): Promi
  * state remains available while legacy extension shims cannot discover stale
  * user plugins. Explicit --config and --extension remain the source of truth.
  */
-function prepareOmpIsolationHome(
-  stateRoot: PinnedDirectory,
-): { readonly home: string; readonly agentDir: string; readonly close: () => void } {
-  const created: PinnedDirectoryCreationReceipt[] = [];
-  const homePinned = pinChildDirectory(stateRoot, ['omp-home'], created);
-  if (homePinned === null) throw new Error('ux-e2e: omp isolation home is not a stable directory');
-  const ompPinned = pinChildDirectory(homePinned, ['.omp'], created);
-  if (ompPinned === null) {
-    closePinnedDirectory(homePinned);
-    closePinnedDirectoryCreationReceipts(created);
-    throw new Error('ux-e2e: omp isolation .omp is not a stable non-symlink directory');
-  }
-  const home = homePinned.physicalPath;
-  const ompDir = ompPinned.physicalPath;
+function prepareOmpIsolationHome(scratchDir: string): { readonly home: string; readonly agentDir: string } {
+  const home = join(stateDirOf(scratchDir), 'omp-home');
+  const ompDir = join(home, '.omp');
   const agentDir = join(ompDir, 'agent');
+  mkdirSync(ompDir, { recursive: true, mode: SESSION_DIR_MODE });
   const hostOmpDir = join(homedir(), '.omp');
-  const ensureSymlink = (name: string, source: string): void => {
-    let sourceStat;
-    try {
-      sourceStat = lstatSync(source);
-      if (sourceStat.isSymbolicLink()) realpathSync(source);
-    } catch (error) {
-      throw new Error(`ux-e2e: OMP home source is unavailable: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    if (pinnedChildEntryExists(ompPinned, name)) {
-      if (readPinnedSymlinkTarget(ompPinned, name) !== source) {
-        throw new Error(`ux-e2e: OMP isolation entry ${name} is not the intended symlink`);
-      }
-      return;
-    }
-    if (!writePinnedSymlink(ompPinned, name, source)) {
-      throw new Error(`ux-e2e: cannot publish pinned OMP isolation entry ${name}`);
-    }
-    if (readPinnedSymlinkTarget(ompPinned, name) !== source) {
-      throw new Error(`ux-e2e: OMP isolation entry ${name} target verification failed`);
-    }
-  };
-  let released = false;
-  const release = (): void => {
-    if (released) return;
-    released = true;
-    closePinnedDirectory(ompPinned);
-    closePinnedDirectory(homePinned);
-    closePinnedDirectoryCreationReceipts(created);
-  };
   try {
     for (const entry of readdirSync(hostOmpDir, { withFileTypes: true })) {
       // This is the one ambient surface deliberately excluded. Every other
       // host state entry (auth, model DB, caches) remains available by
       // identity-preserving symlink under the isolated home.
       if (entry.name === 'plugins') continue;
-      ensureSymlink(entry.name, join(hostOmpDir, entry.name));
+      const source = join(hostOmpDir, entry.name);
+      const target = join(ompDir, entry.name);
+      if (existsSync(target)) continue;
+      symlinkSync(source, target, entry.isDirectory() ? 'dir' : 'file');
     }
-    ensureSymlink('agent', join(hostOmpDir, 'agent'));
-    return { home, agentDir, close: release };
+    if (!existsSync(agentDir)) {
+      symlinkSync(join(hostOmpDir, 'agent'), agentDir, 'dir');
+    }
   } catch (error) {
-    release();
     throw new Error(`ux-e2e: cannot isolate OMP home: ${error instanceof Error ? error.message : String(error)}`);
   }
+  return { home, agentDir };
 }
 
 function ensureDarwinPtyHelperExecutable(): void {
@@ -1848,45 +1808,8 @@ async function startTestSessionUnlocked(opts: TestSessionOptions): Promise<TestS
   const host = '127.0.0.1';
   const publicHost = host;
   const scratchDir = resolve(opts.cwd);
-  const scratchRoot = pinDirectory(scratchDir);
-  if (scratchRoot === null) throw new Error('ux-e2e: scratch directory must be a stable non-symlink directory');
-  if (opts.cwdIdentity !== undefined
-    && (opts.cwdIdentity.dev !== scratchRoot.identity.dev || opts.cwdIdentity.ino !== scratchRoot.identity.ino)) {
-    closePinnedDirectory(scratchRoot);
-    throw new Error('ux-e2e: scratch directory identity changed since fixture/bootstrap setup');
-  }
-  const createdState: PinnedDirectoryCreationReceipt[] = [];
-  const workStateRoot = pinChildDirectory(scratchRoot, ['.work-state'], createdState);
-  const stateRoot = workStateRoot === null ? null : pinChildDirectory(workStateRoot, ['ux-e2e'], createdState);
-  const createdOmp: PinnedDirectoryCreationReceipt[] = [];
-  const scratchOmpRoot = pinChildDirectory(scratchRoot, ['.omp'], createdOmp);
-  let ompIsolation: { readonly home: string; readonly agentDir: string; readonly close: () => void } | null = null;
-  if (workStateRoot === null || stateRoot === null || scratchOmpRoot === null) {
-    if (stateRoot !== null) closePinnedDirectory(stateRoot);
-    if (workStateRoot !== null) closePinnedDirectory(workStateRoot);
-    if (scratchOmpRoot !== null) closePinnedDirectory(scratchOmpRoot);
-    closePinnedDirectoryCreationReceipts(createdState);
-    closePinnedDirectoryCreationReceipts(createdOmp);
-    closePinnedDirectory(scratchRoot);
-    throw new Error('ux-e2e: session and OMP config directories must be stable non-symlink directories');
-  }
-  const closePinnedRoots = (): void => {
-    ompIsolation?.close();
-    ompIsolation = null;
-    closePinnedDirectory(stateRoot);
-    closePinnedDirectory(workStateRoot);
-    closePinnedDirectory(scratchOmpRoot);
-    closePinnedDirectoryCreationReceipts(createdState);
-    closePinnedDirectoryCreationReceipts(createdOmp);
-    closePinnedDirectory(scratchRoot);
-  };
-  const runtimeExtensionPath = runtimeExtensionPackagePath(scratchRoot.physicalPath);
-  try {
-    assertNoLiveSession(scratchRoot.physicalPath, false);
-  } catch (error) {
-    closePinnedRoots();
-    throw error;
-  }
+  const runtimeExtensionPath = runtimeExtensionPackagePath(scratchDir);
+  assertNoLiveSession(scratchDir, false);
   const surface = opts.surface ?? 'web';
   const cols = opts.cols ?? 100;
   const rows = opts.rows ?? 30;
@@ -1908,24 +1831,26 @@ async function startTestSessionUnlocked(opts: TestSessionOptions): Promise<TestS
   const bootstrapExpiresAt = Date.now() + 60_000;
   const serverStartIdentity = processStartIdentity(process.pid);
   if (serverStartIdentity === null) {
-    closePinnedRoots();
     throw new Error('ux-e2e: unable to capture server process identity');
   }
   const sessionId = mintToken();
   const controlNonce = mintToken();
   const serverStartNonce = opts.serverStartNonce ?? mintToken();
   if (boundedSessionString(serverStartNonce, 256) === null) {
-    closePinnedRoots();
     throw new Error('ux-e2e: invalid detached-start nonce');
   }
   const startedAt = new Date().toISOString();
 
-  const stateDir = stateRoot.physicalPath;
+  const stateDir = stateDirOf(scratchDir);
+  const stateRoot = pinOrCreateDirectory(stateDir);
+  if (stateRoot === null) {
+    throw new Error('ux-e2e: session directory must be a stable non-symlink directory');
+  }
   let stateRootClosed = false;
   const closeStateRoot = (): void => {
     if (stateRootClosed) return;
     stateRootClosed = true;
-    closePinnedRoots();
+    closePinnedDirectory(stateRoot);
   };
   const transcriptPath = join(stateDir, 'transcript.jsonl');
   const sessionJsonPath = join(stateDir, 'session.json');
@@ -1944,15 +1869,22 @@ async function startTestSessionUnlocked(opts: TestSessionOptions): Promise<TestS
   // Materialize the exact overlay passed below before any OMP startup.
   let configPath: string;
   try {
-    configPath = writeUxE2eOverlay(scratchRoot.physicalPath, scratchRoot);
+    configPath = writeUxE2eOverlay(scratchDir);
   } catch (error) {
     closeStateRoot();
     throw error;
   }
-  const userConfigDefaultPath = join(scratchOmpRoot.physicalPath, 'ux-e2e-overlay.user.json');
+  const userConfigDefaultPath = join(scratchDir, '.omp', 'ux-e2e-overlay.user.json');
+  const userConfigRoot = pinDirectory(join(scratchDir, '.omp'));
   let userConfigPath: string | null = null;
-  if (readPinnedFileFull(scratchOmpRoot, basename(userConfigDefaultPath), 8 * 1024 * 1024) !== null) {
-    userConfigPath = userConfigDefaultPath;
+  if (userConfigRoot !== null) {
+    try {
+      if (readPinnedFileFull(userConfigRoot, basename(userConfigDefaultPath), 8 * 1024 * 1024) !== null) {
+        userConfigPath = userConfigDefaultPath;
+      }
+    } finally {
+      closePinnedDirectory(userConfigRoot);
+    }
   }
 
 
@@ -2332,6 +2264,7 @@ async function startTestSessionUnlocked(opts: TestSessionOptions): Promise<TestS
   let ompLogBinding: Record<string, unknown> | null = null;
   let runtimePluginRegistry: RuntimePluginRegistry | null = null;
   let spawnError: string | null = null;
+  let ompIsolation: { readonly home: string; readonly agentDir: string } | null = null;
   const sessionJson = {
     schema_version: 2,
     session_id: sessionId,
@@ -2393,14 +2326,14 @@ async function startTestSessionUnlocked(opts: TestSessionOptions): Promise<TestS
 
   try {
     if (existsSync(join(runtimeExtensionPath, 'package.json'))) {
-      runtimePluginRegistry = inspectRuntimePluginRegistry(scratchRoot.physicalPath);
+      runtimePluginRegistry = inspectRuntimePluginRegistry(scratchDir);
     }
     if (opts.noPty !== true) {
       if (opts.startupAbortSignal?.aborted) throw new StartupAbortedError();
       ensureDarwinPtyHelperExecutable();
       const ptyMod = await import('node-pty');
       if (opts.startupAbortSignal?.aborted) throw new StartupAbortedError();
-      ompIsolation = prepareOmpIsolationHome(stateRoot);
+      ompIsolation = prepareOmpIsolationHome(scratchDir);
       const env = buildPtyEnv(process.env, {
         ...(opts.env ?? {}),
         HOME: ompIsolation.home,
@@ -2412,14 +2345,14 @@ async function startTestSessionUnlocked(opts: TestSessionOptions): Promise<TestS
         maxTimeSec,
         approvalMode,
         configPath,
-        sessionDir: join(scratchOmpRoot.physicalPath, 'agent'),
+        sessionDir: join(scratchDir, '.omp', 'agent'),
         userConfigDefaultPath,
         ...(hostConfig.path !== null ? { hostConfigPath: hostConfig.path } : {}),
         ...(userConfigPath !== null ? { userConfigPath } : {}),
       });
       if (opts.startupAbortSignal?.aborted) throw new StartupAbortedError();
       try {
-        ptyProc = ptyMod.spawn(ompBinary, args, { name: 'xterm-256color', cols, rows, cwd: scratchRoot.physicalPath, env });
+        ptyProc = ptyMod.spawn(ompBinary, args, { name: 'xterm-256color', cols, rows, cwd: scratchDir, env });
         ptyExited = false;
         ptyProc.onExit(({ exitCode, signal }) => {
           ptyExited = true;

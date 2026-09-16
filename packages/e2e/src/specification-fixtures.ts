@@ -52,7 +52,7 @@ import {
   withPinnedExclusiveLock,
 } from './fs-safety.js';
 import type { PinnedDirectory } from './fs-safety.js';
-import { prepareRuntimeScratchProject, writeUxE2eBootstrapProvenance } from './runtime.js';
+import { prepareRuntimeScratchProject } from './runtime.js';
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -1222,15 +1222,7 @@ function createScratchSpecificationRepositoryUnlocked(options: ScratchRepository
     renameSync(stagingRoot, plan.root);
     stagingRoot = undefined;
     rootInstalled = true;
-    if (options.runtime === true) {
-      prepareRuntimeScratchProject(plan.root);
-      writeUxE2eBootstrapProvenance(plan.root, {
-        slug: basename(plan.root),
-        branch: plan.git.branch,
-        monorepoRoot: SPECIFICATION_PROJECT_ROOT,
-        coreTarget: join(SPECIFICATION_PROJECT_ROOT, 'packages', 'core'),
-      });
-    }
+    if (options.runtime === true) prepareRuntimeScratchProject(plan.root);
 
     return {
       root: plan.root,

@@ -6,7 +6,6 @@ import {
   fsyncSync,
   lstatSync,
   linkSync,
-  readlinkSync,
   mkdirSync,
   openSync,
   readSync,
@@ -15,13 +14,12 @@ import {
   renameSync,
   rmdirSync,
   statSync,
-  symlinkSync,
   unlinkSync,
   writeSync,
   type Stats,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, join, relative, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
 export const O_NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0;
@@ -65,7 +63,6 @@ export interface FsSafetyTestHooks {
   readonly beforeTargetOpen?: (path: string) => void;
   readonly beforeTargetRename?: (path: string) => void;
   readonly beforeExactQuarantine?: (path: string) => void;
-  readonly beforeRecursiveQuarantine?: (path: string) => void;
   /** Return undefined to run the real process identity probe. */
   readonly processStartIdentity?: (pid: number) => string | null | undefined;
 }
@@ -576,42 +573,6 @@ export function closePinnedFile(file: PinnedFile): void {
 
 /** Read a bounded regular file, optionally taking only its final tail. */
 /** Detect any existing direct child without accepting unsafe link metadata. */
-/** Publish a symlink through a retained parent descriptor and verify its exact target. */
-export function writePinnedSymlink(root: PinnedDirectory, name: string, target: string): boolean {
-  if (!safeName(name) || !isAbsolute(target) || target.length > 4096 || target.includes('\0')) return false;
-  if (process.platform === 'darwin') {
-    return runDarwinHelper(root, 'symlink', { name, target })?.created === true;
-  }
-  const descriptorRoot = descriptorPathFor(root.fd);
-  if (descriptorRoot === null || !pinnedDescriptorIsStable(root)) return false;
-  const path = join(descriptorRoot, name);
-  try {
-    symlinkSync(target, path);
-    const link = lstatSync(path);
-    return link.isSymbolicLink() && readlinkSync(path) === target && pinnedDescriptorIsStable(root);
-  } catch {
-    return false;
-  }
-}
-
-/** Read a direct symlink target through a retained parent descriptor. */
-export function readPinnedSymlinkTarget(root: PinnedDirectory, name: string): string | null {
-  if (!safeName(name)) return null;
-  if (process.platform === 'darwin') {
-    const result = runDarwinHelper(root, 'readlink', { name });
-    return typeof result?.target === 'string' ? result.target : null;
-  }
-  const descriptorRoot = descriptorPathFor(root.fd);
-  if (descriptorRoot === null || !pinnedDescriptorIsStable(root)) return null;
-  try {
-    const path = join(descriptorRoot, name);
-    if (!lstatSync(path).isSymbolicLink()) return null;
-    return readlinkSync(path);
-  } catch {
-    return null;
-  }
-}
-
 export function pinnedChildEntryExists(root: PinnedDirectory, name: string): boolean {
   if (!safeName(name)) return false;
   if (process.platform === 'darwin') {
@@ -1187,121 +1148,6 @@ export function writePinnedFile(root: PinnedDirectory, name: string, bytes: Buff
   }
 }
 
-/** Remove an exact directory tree beneath a retained parent descriptor. */
-export function removePinnedDirectoryTreeIfExact(
-  parent: PinnedDirectory,
-  name: string,
-  expected: Pick<FileIdentity, 'dev' | 'ino'>,
-): boolean {
-  if (!safeName(name) || !pinnedDescriptorIsStable(parent)) return false;
-  if (process.platform === 'darwin') {
-    return runDarwinHelper(parent, 'remove_tree', { name, expected_dev: expected.dev, expected_ino: expected.ino })?.removed === true;
-  }
-  const descriptorRoot = descriptorPathFor(parent.fd);
-  if (descriptorRoot === null) return false;
-  const rootPath = join(descriptorRoot, name);
-  const quarantine = `.omp-remove-${randomUUID().replace(/-/gu, '')}.tmp`;
-  const quarantinePath = join(descriptorRoot, quarantine);
-  const identityOf = (path: string): FileIdentity | null => {
-    try {
-      const info = lstatSync(path);
-      return { dev: info.dev, ino: info.ino };
-    } catch {
-      return null;
-    }
-  };
-  const restoreIfAbsent = (from: string, to: string, identity: FileIdentity): boolean => {
-    const destination = identityOf(to);
-    if (destination !== null) return false;
-    const current = identityOf(from);
-    if (current === null || current.dev !== identity.dev || current.ino !== identity.ino) return false;
-    try { renameSync(from, to); return true; } catch { return false; }
-  };
-  const removeTreeAt = (directory: string, expected?: FileIdentity): boolean => {
-    let fd: number | null = null;
-    try {
-      fd = openSync(directory, fsConstants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK);
-      const info = fstatSync(fd);
-      if (!info.isDirectory() || (expected !== undefined && !sameIdentity(info, expected))) return false;
-      const descriptor = descriptorPathFor(fd);
-      if (descriptor === null) return false;
-      for (const childName of readdirSync(descriptor)) {
-        if (!safeName(childName)) return false;
-        const childPath = join(descriptor, childName);
-        const childInfo = identityOf(childPath);
-        if (childInfo === null) return false;
-        const childQuarantine = `.omp-remove-${randomUUID().replace(/-/gu, '')}.tmp`;
-        const childQuarantinePath = join(descriptor, childQuarantine);
-        try {
-          testHooks?.beforeRecursiveQuarantine?.(childPath);
-          renameSync(childPath, childQuarantinePath);
-          const moved = identityOf(childQuarantinePath);
-          if (moved === null || !sameIdentity(moved, childInfo)) {
-            if (moved !== null) restoreIfAbsent(childQuarantinePath, childPath, moved);
-            return false;
-          }
-          const movedStat = lstatSync(childQuarantinePath);
-          let childFd: number | null = null;
-          try {
-            childFd = openSync(childQuarantinePath, fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK | (movedStat.isDirectory() ? O_DIRECTORY : 0));
-            const opened = fstatSync(childFd);
-            if (!sameIdentity(opened, childInfo)) throw new Error('quarantined child identity changed');
-            if (opened.isDirectory()) {
-              if (!removeTreeAt(childQuarantinePath, childInfo)) throw new Error('recursive quarantine failed');
-              const after = identityOf(childQuarantinePath);
-              if (after === null || !sameIdentity(after, childInfo)) throw new Error('quarantined directory identity changed');
-              rmdirSync(childQuarantinePath);
-            } else {
-              const after = identityOf(childQuarantinePath);
-              if (after === null || !sameIdentity(after, childInfo)) throw new Error('quarantined file identity changed');
-              unlinkSync(childQuarantinePath);
-            }
-          } finally {
-            if (childFd !== null) {
-              try { closeSync(childFd); } catch { /* best effort */ }
-            }
-          }
-        } catch {
-          const moved = identityOf(childQuarantinePath);
-          if (moved !== null) restoreIfAbsent(childQuarantinePath, childPath, moved);
-          return false;
-        }
-      }
-      return true;
-    } catch {
-      return false;
-    } finally {
-      if (fd !== null) {
-        try { closeSync(fd); } catch { /* best effort */ }
-      }
-    }
-  };
-  const initial = identityOf(rootPath);
-  if (initial === null || initial.dev !== expected.dev || initial.ino !== expected.ino) return false;
-  testHooks?.beforeExactQuarantine?.(rootPath);
-  try {
-    renameSync(rootPath, quarantinePath);
-  } catch {
-    return false;
-  }
-  const moved = identityOf(quarantinePath);
-  if (moved === null || moved.dev !== expected.dev || moved.ino !== expected.ino) {
-    if (moved !== null) restoreIfAbsent(quarantinePath, rootPath, moved);
-    return false;
-  }
-  if (!removeTreeAt(quarantinePath, initial)) {
-    restoreIfAbsent(quarantinePath, rootPath, initial);
-    return false;
-  }
-  try {
-    rmdirSync(quarantinePath);
-    return true;
-  } catch {
-    restoreIfAbsent(quarantinePath, rootPath, initial);
-    return false;
-  }
-}
-
 /** Remove one transaction-created empty child through its retained parent descriptor. */
 export function removePinnedDirectoryIfEmpty(receipt: PinnedDirectoryCreationReceipt): boolean {
   const { parent, name, identity } = receipt;
@@ -1819,103 +1665,10 @@ try:
     elif op == "ensure_directory": result = {"ok": True, "directory": ensure_directory(payload.get("path"))}
     elif op == "write_temp": result = {"ok": True, "temporary": write_temp(base64.b64decode(payload.get("bytes", ""), validate=True))}
     elif op == "append_file": result = {"ok": True, **append_file(payload.get("name"), payload.get("bytes"))}
-    elif op == "symlink":
-        name = safe_name(payload.get("name"))
-        target = payload.get("target")
-        if not isinstance(target, str) or not target.startswith("/") or "\x00" in target or len(target.encode("utf-8")) > 4096: fail("symlink target is invalid")
-        os.symlink(target, name, dir_fd=3)
-        if os.readlink(name, dir_fd=3) != target: fail("symlink target changed")
-        result = {"ok": True, "created": True}
-    elif op == "readlink":
-        name = safe_name(payload.get("name"))
-        info = os.lstat(name, dir_fd=3)
-        if not stat.S_ISLNK(info.st_mode): fail("entry is not a symlink")
-        result = {"ok": True, "target": os.readlink(name, dir_fd=3)}
     elif op == "entry_exists": result = {"ok": True, **entry_exists(payload.get("name"))}
     elif op == "read_file": result = {"ok": True, **read_file(payload.get("name"), payload.get("max_bytes"), payload.get("tail_bytes"))}
     elif op == "read_evidence": result = {"ok": True, **read_evidence(payload.get("path"), payload.get("max_bytes"))}
     elif op == "unlink_file": unlink_file(payload.get("name")); result = {"ok": True}
-    elif op == "remove_tree":
-        name = payload.get("name")
-        expected_dev = payload.get("expected_dev")
-        expected_ino = payload.get("expected_ino")
-        if not isinstance(name, str) or not safe_name(name) or not isinstance(expected_dev, int) or not isinstance(expected_ino, int): fail("directory identity is invalid")
-        def identity(parent_fd, entry):
-            try:
-                info = os.stat(entry, dir_fd=parent_fd, follow_symlinks=False)
-                return info
-            except OSError:
-                return None
-        def restore(parent_fd, quarantine, entry, info):
-            if identity(parent_fd, entry) is not None: return False
-            current = identity(parent_fd, quarantine)
-            if current is None or current.st_dev != info.st_dev or current.st_ino != info.st_ino: return False
-            try:
-                os.rename(quarantine, entry, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                return True
-            except OSError:
-                return False
-        def remove_entry(parent_fd, entry):
-            info = identity(parent_fd, entry)
-            if info is None: return False
-            quarantine = ".omp-remove-" + secrets.token_hex(16) + ".tmp"
-            try:
-                os.rename(entry, quarantine, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                moved = identity(parent_fd, quarantine)
-                if moved is None or moved.st_dev != info.st_dev or moved.st_ino != info.st_ino:
-                    if moved is not None: restore(parent_fd, quarantine, entry, moved)
-                    return False
-                if stat.S_ISDIR(moved.st_mode):
-                    child_fd = os.open(quarantine, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
-                    try:
-                        opened = os.fstat(child_fd)
-                        if opened.st_dev != info.st_dev or opened.st_ino != info.st_ino: raise OSError("directory identity changed")
-                        for child in os.listdir(child_fd):
-                            if not safe_name(child) or not remove_entry(child_fd, child): raise OSError("recursive quarantine failed")
-                    finally:
-                        os.close(child_fd)
-                    os.rmdir(quarantine, dir_fd=parent_fd)
-                else:
-                    file_fd = os.open(quarantine, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
-                    try:
-                        opened = os.fstat(file_fd)
-                        if opened.st_dev != info.st_dev or opened.st_ino != info.st_ino: raise OSError("file identity changed")
-                        current = identity(parent_fd, quarantine)
-                        if current is None or current.st_dev != info.st_dev or current.st_ino != info.st_ino: raise OSError("file identity changed")
-                    finally:
-                        os.close(file_fd)
-                    os.unlink(quarantine, dir_fd=parent_fd)
-                return True
-            except OSError:
-                restore(parent_fd, quarantine, entry, info)
-                return False
-        initial = identity(3, name)
-        if initial is None or not stat.S_ISDIR(initial.st_mode) or initial.st_dev != expected_dev or initial.st_ino != expected_ino: result = {"ok": True, "removed": False}
-        else:
-            quarantine = ".omp-remove-" + secrets.token_hex(16) + ".tmp"
-            try:
-                os.rename(name, quarantine, src_dir_fd=3, dst_dir_fd=3)
-                moved = identity(3, quarantine)
-                if moved is None or moved.st_dev != expected_dev or moved.st_ino != expected_ino:
-                    if moved is not None: restore(3, quarantine, name, moved)
-                    result = {"ok": True, "removed": False}
-                else:
-                    child_fd = os.open(quarantine, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=3)
-                    try:
-                        opened = os.fstat(child_fd)
-                        if opened.st_dev != expected_dev or opened.st_ino != expected_ino: raise OSError("directory identity changed")
-                        removed = all(safe_name(child) and remove_entry(child_fd, child) for child in os.listdir(child_fd))
-                    finally:
-                        os.close(child_fd)
-                    if removed:
-                        os.rmdir(quarantine, dir_fd=3)
-                        result = {"ok": True, "removed": True}
-                    else:
-                        restore(3, quarantine, name, initial)
-                        result = {"ok": True, "removed": False}
-            except OSError:
-                restore(3, quarantine, name, initial)
-                result = {"ok": True, "removed": False}
     elif op == "remove_empty":
         name = payload.get("name")
         if not isinstance(name, str) or not name or any((not piece or piece in (".", "..") or "/" in piece or "\\" in piece or "\x00" in piece) for piece in name.split("/")): fail("directory path is invalid")

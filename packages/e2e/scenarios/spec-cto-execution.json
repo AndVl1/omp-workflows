@@ -51,7 +51,6 @@
       ".work-state/ux-e2e/ask-state.jsonl"
     ],
     "evidence": [
-      ".work-state/ux-e2e/cto-execution-fixture.json",
       ".work-state/features/{{feature_passing}}/artifacts",
       ".work-state/features/{{feature_blocked}}/artifacts",
       ".work-state/features/{{feature_stale}}/artifacts",
@@ -62,6 +61,7 @@
   },
   "transcript": {
     "checkpoints": [
+      "approve_continue",
       "mapping confirmation",
       "confirmation recorded",
       "checkpoint_ref"
@@ -113,8 +113,24 @@
       "complete_feature"
     ]
   },
-  "task": "Coordinate one resident CTO execution wave over four prebuilt typed feature workspaces in the authorized scratch repository. The harness seeds current approved handoffs through production APIs, invalidates one workspace through production revision propagation, and acquires one do-work claim through the canonical claim CAS. Do not run native Specify, Plan, Tasks, import, or do-work commands. Select these exact feature/run pairs as one immutable full selector array: {{feature_passing}}/{{run_key}}, {{feature_blocked}}/{{run_key_blocked}}, {{feature_stale}}/{{run_key_stale}}, and {{feature_claimed}}/{{run_key_claimed}}. Call cto_prepare first in selector-only form with that full array. The engine derives canonical task, DoD, and TeamDef candidates from the frozen handoffs and presents the exact mapping choices for the human mapping confirmation; after that confirmation, the engine emits the eligible-only cto_preflight descriptor. Keep stale and claimed selectors in the immutable request for readiness exclusion, report every excluded finding verbatim, and never claim either excluded selector. Execute the engine-issued eligible-only preflight descriptor, then call cto_confirm followed by cto_dispatch. Dispatch only the two admitted features with isolated claims and conformance evidence: run the JSON audit-log and metrics slices in parallel, serialize loader before schema-validator, and serialize the shared-defaults pair through its shared contract/path. Preserve every original requirement/task identity in each dispatch. The scratch setup pre-approves one production constitution gate; submit the exact CTO request once and resume through the public mapping confirmation Ask.",
+  "task": "Coordinate one resident CTO execution wave over four prebuilt typed feature workspaces in the authorized scratch repository. The harness seeds current approved handoffs through production APIs, invalidates one workspace through production revision propagation, and acquires one do-work claim through the canonical claim CAS. Do not run native Specify, Plan, Tasks, import, or do-work commands. Select these exact feature/run pairs as one immutable full selector array: {{feature_passing}}/{{run_key}}, {{feature_blocked}}/{{run_key_blocked}}, {{feature_stale}}/{{run_key_stale}}, and {{feature_claimed}}/{{run_key_claimed}}. Call cto_prepare first in selector-only form with that full array. The engine derives canonical task, DoD, and TeamDef candidates from the frozen handoffs and presents the exact mapping choices for the human mapping confirmation; after that confirmation, the engine emits the eligible-only cto_preflight descriptor. Keep stale and claimed selectors in the immutable request for readiness exclusion, report every excluded finding verbatim, and never claim either excluded selector. Execute the engine-issued eligible-only preflight descriptor, then call cto_confirm followed by cto_dispatch. Dispatch only the two admitted features with isolated claims and conformance evidence: run the JSON audit-log and metrics slices in parallel, serialize loader before schema-validator, and serialize the shared-defaults pair through its shared contract/path. Preserve every original requirement/task identity in each dispatch. The first explicit CTO request is held while the production constitution gate is approved once; a fresh session then submits the exact same CTO request once.",
   "stages": [
+    {
+      "id": "constitution",
+      "name": "Single production constitution gate approval",
+      "expect": [
+        "CONSTITUTION.md",
+        "constitution",
+        "approve_continue"
+      ],
+      "ask_user": [
+        {
+          "titlePattern": "[Cc]onstitution",
+          "answer": "1",
+          "count": 1
+        }
+      ]
+    },
     {
       "id": "mapping",
       "name": "One explicit mapping confirmation",
@@ -177,42 +193,5 @@
     ],
     "min": 1,
     "max": 5
-  },
-  "setup": {
-    "kind": "cto-execution",
-    "schema_version": 1,
-    "selectors": [
-      {
-        "feature_id": "{{feature_passing}}",
-        "run_key": "{{run_key}}"
-      },
-      {
-        "feature_id": "{{feature_blocked}}",
-        "run_key": "{{run_key_blocked}}"
-      },
-      {
-        "feature_id": "{{feature_stale}}",
-        "run_key": "{{run_key_stale}}"
-      },
-      {
-        "feature_id": "{{feature_claimed}}",
-        "run_key": "{{run_key_claimed}}"
-      }
-    ],
-    "stale": {
-      "feature_id": "{{feature_stale}}",
-      "run_key": "{{run_key_stale}}",
-      "phase": "plan",
-      "version": 1,
-      "expected_sha256": "e2322e7f94ca96a07f038ff0729660a2846ad8f87d7c83fa5fe8e095df254d28",
-      "actual_sha256": "d0427e804e3d715e4cde7364b1d378ae28e1be45e83ab7c17e902bf9172fa098",
-      "reason": "approved Plan changed after handoff"
-    },
-    "claimed": {
-      "feature_id": "{{feature_claimed}}",
-      "run_key": "{{run_key_claimed}}",
-      "owner_kind": "do_work",
-      "owner_run_id": "fixture-do-work-claimed"
-    }
   }
 }

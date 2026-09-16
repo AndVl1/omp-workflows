@@ -58,32 +58,6 @@ export interface ScenarioSelectors {
   readonly run_key: string;
 }
 
-export interface CtoExecutionScenarioSetupSelector {
-  readonly feature_id: string;
-  readonly run_key: string;
-}
-
-export interface CtoExecutionScenarioSetup {
-  readonly kind: 'cto-execution';
-  readonly schema_version: 1;
-  readonly selectors: readonly CtoExecutionScenarioSetupSelector[];
-  readonly stale: {
-    readonly feature_id: string;
-    readonly run_key: string;
-    readonly phase: 'plan';
-    readonly version: 1;
-    readonly expected_sha256: string;
-    readonly actual_sha256: string;
-    readonly reason: string;
-  };
-  readonly claimed: {
-    readonly feature_id: string;
-    readonly run_key: string;
-    readonly owner_kind: 'do_work';
-    readonly owner_run_id: string;
-  };
-}
-
 /**
  * Canonical generated workspace locations. Paths are project-relative and
  * may contain templates (for example `specs/{{feature_id}}/spec.md`).
@@ -132,8 +106,6 @@ export interface ScenarioDefinition {
   readonly params: Record<string, string>;
   /** Explicit feature/run selectors, when the scenario declares them. */
   readonly selectors?: ScenarioSelectors;
-  /** Optional strict setup executed before the OMP process starts. */
-  readonly setup?: CtoExecutionScenarioSetup;
   /** Generated feature workspace paths and extra evidence paths. */
   readonly workspace?: ScenarioWorkspacePaths;
   /** Durable transcript markers expected by the scenario. */
@@ -150,10 +122,6 @@ export interface ScenarioDefinition {
 /* ------------------------------------------------------------------ */
 
 const VALID_SCREENSHOT_TRIGGERS: readonly string[] = ['stage_start', 'stage_end', 'ask_user', 'error'];
-const SHA256_RE = /^[0-9a-f]{64}$/u;
-const SAFE_FEATURE_ID_RE = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
-const SAFE_RUN_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
-const TEMPLATE_VALUE_RE = /^\{\{\s*[a-zA-Z0-9_]+\s*\}\}$/u;
 
 class ScenarioValidationError extends TypeError {
   constructor(field: string, problem: string) {
@@ -178,48 +146,6 @@ function requireTimerMs(value: unknown, field: string): asserts value is number 
 function requireNumber(value: unknown, field: string, problem: string): asserts value is number {
   if (typeof value !== 'number' || !Number.isFinite(value)) throw new ScenarioValidationError(field, problem);
 }
-function safeScenarioSelector(value: string, field: string, kind: 'feature_id' | 'run_key'): string {
-  const valid = kind === 'feature_id' ? SAFE_FEATURE_ID_RE.test(value) : SAFE_RUN_KEY_RE.test(value);
-  if (!valid && !TEMPLATE_VALUE_RE.test(value)) {
-    throw new ScenarioValidationError(field, `unsafe ${kind}; expected a safe literal or exact template placeholder`);
-  }
-  return value;
-}
-
-function safeExpandedSelector(value: string | undefined, field: string, kind: 'feature_id' | 'run_key'): void {
-  if (value === undefined) return;
-  const valid = kind === 'feature_id' ? SAFE_FEATURE_ID_RE.test(value) : SAFE_RUN_KEY_RE.test(value);
-  if (!valid) throw new ScenarioValidationError(field, `unsafe expanded ${kind}`);
-}
-
-function validateExpandedSetup(setup: CtoExecutionScenarioSetup): void {
-  if (setup.selectors.length !== 4) throw new ScenarioValidationError('setup.selectors', 'expected exactly four feature/run selectors');
-  const features = new Set<string>();
-  const pairs = new Set<string>();
-  for (const [index, selector] of setup.selectors.entries()) {
-    safeExpandedSelector(selector.feature_id, `setup.selectors[${index}].feature_id`, 'feature_id');
-    safeExpandedSelector(selector.run_key, `setup.selectors[${index}].run_key`, 'run_key');
-    if (features.has(selector.feature_id)) throw new ScenarioValidationError('setup.selectors', 'feature_id values must be unique after expansion');
-    features.add(selector.feature_id);
-    const pair = `${selector.feature_id}\u0000${selector.run_key}`;
-    if (pairs.has(pair)) throw new ScenarioValidationError('setup.selectors', 'selectors must be unique after expansion');
-    pairs.add(pair);
-  }
-  safeExpandedSelector(setup.stale.feature_id, 'setup.stale.feature_id', 'feature_id');
-  safeExpandedSelector(setup.stale.run_key, 'setup.stale.run_key', 'run_key');
-  safeExpandedSelector(setup.claimed.feature_id, 'setup.claimed.feature_id', 'feature_id');
-  safeExpandedSelector(setup.claimed.run_key, 'setup.claimed.run_key', 'run_key');
-  const stalePair = `${setup.stale.feature_id}\u0000${setup.stale.run_key}`;
-  const claimedPair = `${setup.claimed.feature_id}\u0000${setup.claimed.run_key}`;
-  if (!pairs.has(stalePair)) throw new ScenarioValidationError('setup.stale', 'stale selector must be an exact selector member after expansion');
-  if (!pairs.has(claimedPair)) throw new ScenarioValidationError('setup.claimed', 'claimed selector must be an exact selector member after expansion');
-  if (stalePair === claimedPair) throw new ScenarioValidationError('setup', 'stale and claimed selectors must be distinct after expansion');
-  if (setup.stale.phase !== 'plan' || setup.stale.version !== 1 || !SHA256_RE.test(setup.stale.expected_sha256) || !SHA256_RE.test(setup.stale.actual_sha256) || setup.stale.reason.length === 0) {
-    throw new ScenarioValidationError('setup.stale', 'expanded stale revision is invalid');
-  }
-  if (setup.claimed.owner_kind !== 'do_work' || setup.claimed.owner_run_id.length === 0) throw new ScenarioValidationError('setup.claimed', 'expanded claim owner is invalid');
-}
-
 function optionalString(value: unknown, field: string): string | undefined {
   if (value === undefined) return undefined;
   requireString(value, field, 'expected a non-empty string');
@@ -351,85 +277,6 @@ function validateScenario(raw: unknown): {
     params = r.params as Record<string, string>;
   }
 
-  let setup: CtoExecutionScenarioSetup | undefined;
-  if (r.setup !== undefined) {
-    if (typeof r.setup !== 'object' || r.setup === null) {
-      throw new ScenarioValidationError('setup', 'expected an object');
-    }
-    const setupValue = r.setup as Record<string, unknown>;
-    const setupKeys = new Set(['kind', 'schema_version', 'selectors', 'stale', 'claimed']);
-    for (const key of Object.keys(setupValue)) {
-      if (!setupKeys.has(key)) throw new ScenarioValidationError(`setup.${key}`, 'unknown field');
-    }
-    if (setupValue.kind !== 'cto-execution') {
-      throw new ScenarioValidationError('setup.kind', 'expected cto-execution');
-    }
-    if (setupValue.schema_version !== 1) {
-      throw new ScenarioValidationError('setup.schema_version', 'expected version 1');
-    }
-    if (!Array.isArray(setupValue.selectors) || setupValue.selectors.length !== 4) {
-      throw new ScenarioValidationError('setup.selectors', 'expected exactly four feature/run selectors');
-    }
-    const setupSelectors: CtoExecutionScenarioSetupSelector[] = setupValue.selectors.map((item, index) => {
-      if (typeof item !== 'object' || item === null) {
-        throw new ScenarioValidationError(`setup.selectors[${index}]`, 'expected an object');
-      }
-      const selector = item as Record<string, unknown>;
-      for (const key of Object.keys(selector)) {
-        if (key !== 'feature_id' && key !== 'run_key') throw new ScenarioValidationError(`setup.selectors[${index}].${key}`, 'unknown field');
-      }
-      const featureId = optionalString(selector.feature_id, `setup.selectors[${index}].feature_id`);
-      const runKey = optionalString(selector.run_key, `setup.selectors[${index}].run_key`);
-      if (featureId === undefined || runKey === undefined) {
-        throw new ScenarioValidationError(`setup.selectors[${index}]`, 'feature_id and run_key are both required');
-      }
-      return {
-        feature_id: safeScenarioSelector(featureId, `setup.selectors[${index}].feature_id`, 'feature_id'),
-        run_key: safeScenarioSelector(runKey, `setup.selectors[${index}].run_key`, 'run_key'),
-      };
-    });
-    if (new Set(setupSelectors.map(selector => selector.feature_id)).size !== setupSelectors.length) {
-      throw new ScenarioValidationError('setup.selectors', 'selectors must be unique');
-    }
-    const staleValue = setupValue.stale;
-    if (typeof staleValue !== 'object' || staleValue === null) throw new ScenarioValidationError('setup.stale', 'expected an object');
-    const staleRecord = staleValue as Record<string, unknown>;
-    for (const key of Object.keys(staleRecord)) {
-      if (!new Set(['feature_id', 'run_key', 'phase', 'version', 'expected_sha256', 'actual_sha256', 'reason']).has(key)) throw new ScenarioValidationError(`setup.stale.${key}`, 'unknown field');
-    }
-    const staleFeatureId = optionalString(staleRecord.feature_id, 'setup.stale.feature_id');
-    const staleRunKey = optionalString(staleRecord.run_key, 'setup.stale.run_key');
-    const staleExpected = optionalString(staleRecord.expected_sha256, 'setup.stale.expected_sha256');
-    const staleActual = optionalString(staleRecord.actual_sha256, 'setup.stale.actual_sha256');
-    const staleReason = optionalString(staleRecord.reason, 'setup.stale.reason');
-    if (staleFeatureId !== undefined) safeScenarioSelector(staleFeatureId, 'setup.stale.feature_id', 'feature_id');
-    if (staleRunKey !== undefined) safeScenarioSelector(staleRunKey, 'setup.stale.run_key', 'run_key');
-    if (!staleFeatureId || !staleRunKey || staleRecord.phase !== 'plan' || staleRecord.version !== 1 || !staleExpected || !SHA256_RE.test(staleExpected) || !staleActual || !SHA256_RE.test(staleActual) || !staleReason) {
-      throw new ScenarioValidationError('setup.stale', 'expected plan v1 with bounded revision hashes and reason');
-    }
-    const claimedValue = setupValue.claimed;
-    if (typeof claimedValue !== 'object' || claimedValue === null) throw new ScenarioValidationError('setup.claimed', 'expected an object');
-    const claimedRecord = claimedValue as Record<string, unknown>;
-    for (const key of Object.keys(claimedRecord)) {
-      if (!new Set(['feature_id', 'run_key', 'owner_kind', 'owner_run_id']).has(key)) throw new ScenarioValidationError(`setup.claimed.${key}`, 'unknown field');
-    }
-    const claimedFeatureId = optionalString(claimedRecord.feature_id, 'setup.claimed.feature_id');
-    const claimedRunKey = optionalString(claimedRecord.run_key, 'setup.claimed.run_key');
-    const ownerRunId = optionalString(claimedRecord.owner_run_id, 'setup.claimed.owner_run_id');
-    if (claimedFeatureId !== undefined) safeScenarioSelector(claimedFeatureId, 'setup.claimed.feature_id', 'feature_id');
-    if (claimedRunKey !== undefined) safeScenarioSelector(claimedRunKey, 'setup.claimed.run_key', 'run_key');
-    if (!claimedFeatureId || !claimedRunKey || claimedRecord.owner_kind !== 'do_work' || !ownerRunId) {
-      throw new ScenarioValidationError('setup.claimed', 'expected do_work owner and feature/run selector');
-    }
-    setup = {
-      kind: 'cto-execution',
-      schema_version: 1,
-      selectors: setupSelectors,
-      stale: { feature_id: staleFeatureId, run_key: staleRunKey, phase: 'plan', version: 1, expected_sha256: staleExpected, actual_sha256: staleActual, reason: staleReason },
-      claimed: { feature_id: claimedFeatureId, run_key: claimedRunKey, owner_kind: 'do_work', owner_run_id: ownerRunId },
-    };
-  }
-
   let selectors: ScenarioSelectors | undefined;
   const selectorValue = r.selectors;
   if (selectorValue !== undefined) {
@@ -442,14 +289,14 @@ function validateScenario(raw: unknown): {
     if (featureId === undefined || runKey === undefined) {
       throw new ScenarioValidationError('selectors', 'feature_id and run_key are both required');
     }
-    selectors = { feature_id: safeScenarioSelector(featureId, 'selectors.feature_id', 'feature_id'), run_key: safeScenarioSelector(runKey, 'selectors.run_key', 'run_key') };
+    selectors = { feature_id: featureId, run_key: runKey };
   } else if (r.feature_id !== undefined || r.run_key !== undefined) {
     const featureId = optionalString(r.feature_id, 'feature_id');
     const runKey = optionalString(r.run_key, 'run_key');
     if (featureId === undefined || runKey === undefined) {
       throw new ScenarioValidationError('selectors', 'feature_id and run_key are both required');
     }
-    selectors = { feature_id: safeScenarioSelector(featureId, 'feature_id', 'feature_id'), run_key: safeScenarioSelector(runKey, 'run_key', 'run_key') };
+    selectors = { feature_id: featureId, run_key: runKey };
   }
 
   let workspace: ScenarioWorkspacePaths | undefined;
@@ -518,7 +365,6 @@ function validateScenario(raw: unknown): {
       task: taskValue,
       params,
       ...(selectors !== undefined ? { selectors } : {}),
-      ...(setup !== undefined ? { setup } : {}),
       ...(workspace !== undefined ? { workspace } : {}),
       ...(transcript !== undefined ? { transcript } : {}),
       stages,
@@ -687,22 +533,12 @@ export function loadScenario(path: string, params: Record<string, string> = {}):
       : {}),
     ...params,
   };
-  const featureId = ctx.feature_id === undefined ? undefined : expandValue(ctx.feature_id, ctx);
-  const runKey = ctx.run_key === undefined ? undefined : expandValue(ctx.run_key, ctx);
-  safeExpandedSelector(featureId, 'feature_id', 'feature_id');
-  safeExpandedSelector(runKey, 'run_key', 'run_key');
+  const featureId = ctx.feature_id;
+  const runKey = ctx.run_key;
   const selectors =
     featureId !== undefined && runKey !== undefined
       ? { feature_id: featureId, run_key: runKey }
       : undefined;
-
-  const expandedSetup = def.setup === undefined ? undefined : {
-    ...def.setup,
-    selectors: def.setup.selectors.map(selector => ({ feature_id: expandValue(selector.feature_id, ctx), run_key: expandValue(selector.run_key, ctx) })),
-    stale: { ...def.setup.stale, feature_id: expandValue(def.setup.stale.feature_id, ctx), run_key: expandValue(def.setup.stale.run_key, ctx), expected_sha256: expandValue(def.setup.stale.expected_sha256, ctx), actual_sha256: expandValue(def.setup.stale.actual_sha256, ctx), reason: expandValue(def.setup.stale.reason, ctx) },
-    claimed: { ...def.setup.claimed, feature_id: expandValue(def.setup.claimed.feature_id, ctx), run_key: expandValue(def.setup.claimed.run_key, ctx), owner_run_id: expandValue(def.setup.claimed.owner_run_id, ctx) },
-  };
-  if (expandedSetup !== undefined) validateExpandedSetup(expandedSetup);
 
   let taskText: string;
   if (typeof def.task === 'string') {
@@ -727,7 +563,6 @@ export function loadScenario(path: string, params: Record<string, string> = {}):
     task: expandValue(taskText, ctx),
     params: def.params,
     ...(selectors !== undefined ? { selectors } : {}),
-    ...(expandedSetup !== undefined ? { setup: expandedSetup } : {}),
     ...(def.workspace !== undefined || featureId !== undefined
       ? { workspace: expandWorkspace(def.workspace, ctx, featureId) }
       : {}),

@@ -57,8 +57,6 @@ export type {
   AskExpectation,
   ScreenshotTrigger,
   ScenarioSelectors,
-  CtoExecutionScenarioSetup,
-  CtoExecutionScenarioSetupSelector,
   ScenarioWorkspacePaths,
   ScenarioTranscriptExpectations,
 } from './scenario.js';
