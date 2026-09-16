@@ -1034,8 +1034,18 @@ test("mapping records require exact parallelization coverage and unique task own
   try {
     const features = twoFeatures();
     const mapping = mappingFor(features.map(({ feature }) => feature));
-    const persisted = persistCtoMappingRecord(root, mapping);
-    const base = JSON.parse(readFileSync(persisted.path, "utf8")) as Record<string, unknown>;
+    const base = {
+      schema_version: 1,
+      cto_run_id: "cto-wave-1",
+      mapping: {
+        ...structuredClone(mapping),
+        status: "awaiting_confirmation",
+        checkpoint_ref: null,
+      },
+      selections: structuredClone(mapping.selections),
+      checkpoint_ref: null,
+      trusted_answer_ref: null,
+    } as Record<string, unknown>;
     const rehash = (record: Record<string, unknown>): string => {
       const candidate = record.mapping as Record<string, unknown>;
       const { mapping_id: _id, mapping_hash: _hash, created_at: _created, updated_at: _updated, ...body } = candidate;
