@@ -150,6 +150,7 @@ export interface ScenarioDefinition {
 /* ------------------------------------------------------------------ */
 
 const VALID_SCREENSHOT_TRIGGERS: readonly string[] = ['stage_start', 'stage_end', 'ask_user', 'error'];
+const SHA256_RE = /^[0-9a-f]{64}$/u;
 
 class ScenarioValidationError extends TypeError {
   constructor(field: string, problem: string) {
@@ -350,7 +351,7 @@ function validateScenario(raw: unknown): {
     const staleExpected = optionalString(staleRecord.expected_sha256, 'setup.stale.expected_sha256');
     const staleActual = optionalString(staleRecord.actual_sha256, 'setup.stale.actual_sha256');
     const staleReason = optionalString(staleRecord.reason, 'setup.stale.reason');
-    if (!staleFeatureId || !staleRunKey || staleRecord.phase !== 'plan' || staleRecord.version !== 1 || !staleExpected || !staleActual || !staleReason) {
+    if (!staleFeatureId || !staleRunKey || staleRecord.phase !== 'plan' || staleRecord.version !== 1 || !staleExpected || !SHA256_RE.test(staleExpected) || !staleActual || !SHA256_RE.test(staleActual) || !staleReason) {
       throw new ScenarioValidationError('setup.stale', 'expected plan v1 with bounded revision hashes and reason');
     }
     const claimedValue = setupValue.claimed;
